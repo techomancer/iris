@@ -543,7 +543,7 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub sysad: Arc<dyn BusDevice>,
     pub tlb: T,
     pub cache: C,
-    in_delay_slot: bool,
+    pub(crate) in_delay_slot: bool,
     pub delay_slot_target: u64,
     #[cfg(feature = "developer")]
     undo_buffer: UndoBuffer,
@@ -584,9 +584,9 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub fpr_write_w: fn(&mut MipsCore, u32, u32),
     /// Local cycle counter — flushed to the shared atomic periodically to avoid
     /// a locked bus op on every instruction.
-    local_cycles: u64,
+    pub(crate) local_cycles: u64,
     /// Cached external interrupt word — reloaded every 16 instructions.
-    cached_pending: u64,
+    pub(crate) cached_pending: u64,
 }
 
 // ---- translate_fn slow-path wrappers (one per privilege × addressing-mode combination) ------
@@ -4865,10 +4865,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 
         *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).spawn(move || {
             let mut guard = executor.lock();
+
+            #[cfg(feature = "jit")]
+            {
+                crate::jit::dispatch::run_jit_dispatch(&mut *guard, &running);
+                return;
+            }
+
             // --- perf sampling (comment out to disable) ---
             //let mut last_cycles: u64 = guard.core.cycles.load(Ordering::Relaxed);
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
+            #[allow(unreachable_code)]
             while running.load(Ordering::Relaxed) {
                 #[cfg(feature = "lightning")]
                 for _ in 0..1000 {

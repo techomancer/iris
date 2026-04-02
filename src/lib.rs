@@ -46,3 +46,5 @@ pub mod hptimer_tests;
 pub mod vga_font;
 pub mod saa7191;
 pub mod vino;
+#[cfg(feature = "jit")]
+pub mod jit;

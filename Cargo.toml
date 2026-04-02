@@ -12,6 +12,8 @@ developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
 # Lightning: pedal-to-the-metal build — disables breakpoint checks and traceback buffer updates.
 # Incompatible with interactive debugging. For end-user / benchmarking builds only.
 lightning = []
+# Cranelift-based JIT compiler for MIPS → native translation.
+jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -31,6 +33,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0.3"
 parking_lot = "0.12"
 spin = "0.10.0"
+cranelift-codegen    = { version = "0.116", optional = true }
+cranelift-frontend   = { version = "0.116", optional = true }
+cranelift-jit        = { version = "0.116", optional = true }
+cranelift-module     = { version = "0.116", optional = true }
+cranelift-native     = { version = "0.116", optional = true }
+target-lexicon       = { version = "0.13",  optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
