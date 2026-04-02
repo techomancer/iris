@@ -33,12 +33,19 @@ toml = "1.0.3"
 parking_lot = "0.12"
 spin = "0.10.0"
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
 # Developer profile: release optimizations + debug symbols. Default build target.
 # Enables the "developer" feature flag for dev-only tooling.
 # Usage: cargo build  (or explicitly: cargo build --profile developer)
 [profile.developer]
 inherits = "release"
 debug = true
+lto = "fat"
+codegen-units = 1
 
 # Profiling profile: release optimizations + full debug info for flamegraph/perf.
 # Usage: cargo build --profile profiling && perf record ./target/profiling/iris

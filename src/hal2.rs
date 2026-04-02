@@ -183,11 +183,12 @@ struct CodecAState {
     nonzero_seen: bool,
     stream: Option<CodecStream>,
     timer_id: Option<TimerId>,
+    audio_failed: bool,
 }
 
 impl CodecAState {
     fn new() -> Self {
-        Self { prebuf: Vec::new(), dry: 0, nonzero_seen: false, stream: None, timer_id: None }
+        Self { prebuf: Vec::new(), dry: 0, nonzero_seen: false, stream: None, timer_id: None, audio_failed: false }
     }
     fn reset_audio(&mut self) {
         self.prebuf.clear();
@@ -416,7 +417,7 @@ impl Hal2 {
                         st.nonzero_seen = true;
                     }
 
-                    if st.stream.is_none() {
+                    if st.stream.is_none() && !st.audio_failed {
                         // Prebuf phase
                         st.prebuf.push(l);
                         st.prebuf.push(r);
@@ -434,9 +435,12 @@ impl Hal2 {
                                     sample_rate: rate, stream_rate,
                                     producer: prod, resampler, _stream: stream,
                                 });
+                            } else {
+                                st.audio_failed = true;
+                                st.prebuf.clear();
                             }
                         }
-                    } else {
+                    } else if st.stream.is_some() {
                         // Active — push to ring buffer (via resampler if rates differ)
                         if let Some(cs) = st.stream.as_mut() {
                             // Rebuild stream if codec rate changed
@@ -451,7 +455,7 @@ impl Hal2 {
                 }
                 None => {
                     st.dry += 1;
-                    if st.stream.is_none() && st.dry >= DRY_LIMIT && !st.prebuf.is_empty() {
+                    if st.stream.is_none() && !st.audio_failed && st.dry >= DRY_LIMIT && !st.prebuf.is_empty() {
                         // Open stream with whatever we buffered
                         if let Some((stream, mut prod, stream_rate)) = open_output_stream(rate) {
                             let mut resampler = Resampler::new(rate, stream_rate);
@@ -464,6 +468,9 @@ impl Hal2 {
                                 sample_rate: rate, stream_rate,
                                 producer: prod, resampler, _stream: stream,
                             });
+                        } else {
+                            st.audio_failed = true;
+                            st.prebuf.clear();
                         }
                         st.dry = 0;
                     } else if st.stream.is_some() && st.dry >= DRY_LIMIT {

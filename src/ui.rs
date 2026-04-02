@@ -105,10 +105,10 @@ impl GlRenderer {
             // viewport_info[1] = (0, window_y_base) — bottom pixel row of this quad in window coords
             // Y flip: tex_y = (tex_height - 1) - (gl_FragCoord.y - window_y_base)
             let vs_src = "
-                #version 120
-                attribute vec2 position;
-                attribute vec2 tex_coord;
-                varying vec2 v_tex_coord;
+                #version 150
+                in vec2 position;
+                in vec2 tex_coord;
+                out vec2 v_tex_coord;
                 void main() {
                     gl_Position = vec4(position, 0.0, 1.0);
                     v_tex_coord = tex_coord;
@@ -124,9 +124,9 @@ impl GlRenderer {
             }
 
             let fs = gl.create_shader(glow::FRAGMENT_SHADER).unwrap();
-            // Try GLSL 1.30 first (texelFetch)
+            // Try GLSL 1.50 first (texelFetch, Core Profile compatible)
             gl.shader_source(fs, "
-                #version 130
+                #version 150
                 in vec2 v_tex_coord;
                 out vec4 color;
                 uniform sampler2D tex;
@@ -153,13 +153,14 @@ impl GlRenderer {
             }
 
             if !linked {
-                // Fallback to GLSL 1.20 (UV-based, no texelFetch)
+                // Fallback (UV-based, no texelFetch)
                 gl.shader_source(fs, "
-                    #version 120
-                    varying vec2 v_tex_coord;
+                    #version 150
+                    in vec2 v_tex_coord;
+                    out vec4 color;
                     uniform sampler2D tex;
                     void main() {
-                        gl_FragColor = texture2D(tex, v_tex_coord);
+                        color = texture(tex, v_tex_coord);
                     }
                 ");
                 gl.compile_shader(fs);

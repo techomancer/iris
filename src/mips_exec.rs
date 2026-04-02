@@ -582,6 +582,12 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub fpr_write_l: fn(&mut MipsCore, u32, u64),
     pub fpr_read_w:  fn(&MipsCore, u32) -> u32,
     pub fpr_write_w: fn(&mut MipsCore, u32, u32),
+    /// Local cycle counter — flushed to the shared atomic periodically to avoid
+    /// a locked bus op on every instruction.
+    local_cycles: u64,
+    /// Cached external interrupt word — reloaded every 16 instructions.
+    cached_pending: u64,
+    interrupt_check_counter: u8,
 }
 
 // ---- translate_fn wrappers (one per privilege × addressing-mode combination) ---------------
@@ -773,6 +779,9 @@ For R4000SC/MC CPUs:
             fpr_write_l: crate::mips_core::write_fpr_l_fr0,
             fpr_read_w:  crate::mips_core::read_fpr_w_fr0,
             fpr_write_w: crate::mips_core::write_fpr_w_fr0,
+            local_cycles: 0,
+            cached_pending: 0,
+            interrupt_check_counter: 0,
         };
 
         executor.rebind_atomic_ptrs();
@@ -881,12 +890,26 @@ For R4000SC/MC CPUs:
     /// step (PC, fetch, and all data memory accesses) are suppressed.
     /// It is cleared automatically after the instruction completes.
     #[inline]
-    pub fn step(&mut self) -> ExecStatus {
-        // Single atomic load: bits 8..15 = IP, bit 63 = soft-reset
-        // Safety: interrupts_ptr/cycles_ptr point into Arcs owned by core, always valid.
-        let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
+    /// Flush local cycle counter to the shared atomic.
+    #[inline(always)]
+    pub fn flush_cycles(&mut self) {
+        if self.local_cycles > 0 {
+            unsafe { &*self.cycles_ptr }.fetch_add(self.local_cycles, Ordering::Relaxed);
+            self.local_cycles = 0;
+        }
+    }
 
-        unsafe { &*self.cycles_ptr }.fetch_add(1, Ordering::Relaxed);
+    pub fn step(&mut self) -> ExecStatus {
+        // Increment local cycle counter (flushed to atomic by outer loop)
+        self.local_cycles += 1;
+
+        // Reload external interrupt state every 16 instructions
+        self.interrupt_check_counter = self.interrupt_check_counter.wrapping_sub(1);
+        if self.interrupt_check_counter == 0 {
+            self.interrupt_check_counter = 16;
+            self.cached_pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
+        }
+        let pending = self.cached_pending;
 
         let pc = self.core.pc;
         #[cfg(not(feature = "lightning"))]
@@ -3091,6 +3114,8 @@ For R4000SC/MC CPUs:
     fn exec_mfc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
+        // CP0 Random (reg 1) derives from cycle count — flush local counter first
+        if rd_val == 1 { self.flush_cycles(); }
         let value = self.core.read_cp0(rd_val);
         // Sign-extend 32-bit value to 64 bits
         self.core.write_gpr(rt_reg, value as u32 as i32 as i64 as u64);
@@ -3101,6 +3126,7 @@ For R4000SC/MC CPUs:
     fn exec_dmfc0(&mut self, d: &DecodedInstr) -> ExecStatus {
         let rt_reg = d.rt as u32;
         let rd_val = d.rd as u32;
+        if rd_val == 1 { self.flush_cycles(); }
         let value = self.core.read_cp0(rd_val);
         self.core.write_gpr(rt_reg, value);
         EXEC_COMPLETE
@@ -3199,6 +3225,8 @@ For R4000SC/MC CPUs:
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to a random TLB entry
     // The random index is determined by CP0.Random register
     fn exec_tlbwr(&mut self) -> ExecStatus {
+        // Flush local cycle counter so update_random sees accurate cycle count
+        self.flush_cycles();
         self.core.update_random();
         let index = (self.core.cp0_random as usize) % self.tlb.num_entries();
         let entry = self.create_tlb_entry_from_cp0();
@@ -4244,7 +4272,16 @@ For R4000SC/MC CPUs:
         let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
         let status = f(self, d);
 
-        // Handle delay slot state machine
+        // Handle delay slot state machine — fast path for the common case
+        if status == EXEC_COMPLETE {
+            if self.in_delay_slot {
+                self.core.pc = self.delay_slot_target;
+                self.in_delay_slot = false;
+            } else {
+                self.core.pc = self.core.pc.wrapping_add(4);
+            }
+            return EXEC_COMPLETE;
+        }
         match status {
             EXEC_BRANCH_DELAY => {
                 if self.in_delay_slot {
@@ -4256,14 +4293,6 @@ For R4000SC/MC CPUs:
             }
             EXEC_BRANCH_LIKELY_SKIP => {
                 self.core.pc = self.core.pc.wrapping_add(8);
-            }
-            EXEC_COMPLETE => {
-                if self.in_delay_slot {
-                    self.core.pc = self.delay_slot_target;
-                    self.in_delay_slot = false;
-                    return EXEC_COMPLETE;
-                }
-                self.core.pc = self.core.pc.wrapping_add(4);
             }
             EXEC_COMPLETE_NO_INC => {
                 return EXEC_COMPLETE;
@@ -4806,6 +4835,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                 steps_since_yield += 1;
                 if steps_since_yield >= 500000 {
                     steps_since_yield = 0;
+                    exec.flush_cycles();
                     drop(exec);
                     thread::sleep(Duration::from_millis(1));
                     exec = executor.lock();
@@ -4816,6 +4846,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     }
                 }
             }
+            exec.flush_cycles();
 
             // Print next instruction
             let next_pc = exec.core.pc;
@@ -4876,6 +4907,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
         for _ in 0..cycles {
             exec.step();
         }
+        exec.flush_cycles();
     }
 
     fn stop(&self) {
@@ -4937,6 +4969,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         _ => {}
                     }
                 }
+                // Flush local cycle counter to shared atomic once per batch
+                guard.flush_cycles();
                 // --- perf sampling (comment out to disable) ---
                 //let cycles = guard.core.cycles.load(Ordering::Relaxed);
                 //if cycles.wrapping_sub(last_cycles) >= 100_000_000 {

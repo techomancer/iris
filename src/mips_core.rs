@@ -326,22 +326,17 @@ impl MipsCore {
         self.interrupts.store(0, Ordering::SeqCst);
     }
 
-    /// Read a GPR by index (ensures r0 always returns 0)
-    #[inline]
+    /// Read a GPR by index. gpr[0] is always kept at zero.
+    #[inline(always)]
     pub fn read_gpr(&self, reg: u32) -> u64 {
-        if reg == 0 {
-            0
-        } else {
-            self.gpr[reg as usize]
-        }
+        unsafe { *self.gpr.get_unchecked(reg as usize) }
     }
 
-    /// Write a GPR by index (writes to r0 are ignored)
-    #[inline]
+    /// Write a GPR by index. Unconditionally re-zeros gpr[0] to avoid a branch.
+    #[inline(always)]
     pub fn write_gpr(&mut self, reg: u32, value: u64) {
-        if reg != 0 && (reg as usize) < 32 {
-            self.gpr[reg as usize] = value;
-        }
+        unsafe { *self.gpr.get_unchecked_mut(reg as usize) = value; }
+        self.gpr[0] = 0;
     }
 
     /// Update Random register based on current cycle count
