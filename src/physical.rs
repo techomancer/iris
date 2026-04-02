@@ -610,6 +610,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).read8(addr) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             match result {
                 BusStatus::Data8(d) => println!("PHYS8 Read {:08x} -> Data8({:02x})", addr, d),
@@ -624,6 +625,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).write8(addr, val) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             println!("PHYS8 Write {:08x} val={:02x} -> {:?}", addr, val, result);
         }
@@ -635,6 +637,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).read16(addr) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             match result {
                 BusStatus::Data16(d) => println!("PHYS16 Read {:08x} -> Data16({:04x})", addr, d),
@@ -649,6 +652,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).write16(addr, val) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             println!("PHYS16 Write {:08x} val={:04x} -> {:?}", addr, val, result);
         }
@@ -660,6 +664,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).read32(addr) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             match result {
                 BusStatus::Data(d) => println!("PHYS32 Read {:08x} -> Data({:08x})", addr, d),
@@ -674,6 +679,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).write32(addr, val) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             println!("PHYS32 Write {:08x} val={:08x} -> {:?}", addr, val, result);
         }
@@ -685,6 +691,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).read64(addr) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             match result {
                 BusStatus::Data64(d) => println!("PHYS64 Read {:08x} -> Data64({:016x})", addr, d),
@@ -699,6 +706,7 @@ impl BusDevice for Physical {
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let result = unsafe { (*device_ptr).write64(addr, val) };
 
+        #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
             println!("PHYS64 Write {:08x} val={:016x} -> {:?}", addr, val, result);
         }
