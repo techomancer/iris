@@ -35,4 +35,4 @@ cdrom  = false
 [scsi.4]
 path   = "cdrom4.iso"
 cdrom  = true
-# discs = ["irix65.iso", "extras.iso", "patches.iso"]
+discs = ["second.iso", "cdrom4.iso", "patches.iso"]

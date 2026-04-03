@@ -27,7 +27,6 @@ socket2 = "0.5"
 crossbeam-utils = "0.8"
 bitfield = "0.14"
 cpal = "0.15"
-smoltcp = { version = "0.12", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp", "socket-raw"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0.3"
 parking_lot = "0.12"

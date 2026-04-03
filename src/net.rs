@@ -530,6 +530,7 @@ impl NatEngine {
         let ihl = ((ip[0] & 0xf) as usize) * 4;
         if frame.len() < 14 + ihl { return; }
         let proto  = ip[9];
+        let ttl    = ip[8];
         let src_ip = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
         let dst_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
         // ip_total is the total IP datagram length (header + data).
@@ -540,7 +541,7 @@ impl NatEngine {
         let ip_end = ip_total.min(frame.len() - 14);
         let payload = &ip[ihl..ip_end];
         match proto {
-            IP_PROTO_ICMP => self.handle_icmp(src_mac, src_ip, dst_ip, payload),
+            IP_PROTO_ICMP => self.handle_icmp(src_mac, src_ip, dst_ip, ttl, payload),
             IP_PROTO_UDP  => self.handle_udp(src_mac, src_ip, dst_ip, payload),
             IP_PROTO_TCP  => self.handle_tcp(src_mac, src_ip, dst_ip, payload),
             _ => {}
@@ -548,7 +549,7 @@ impl NatEngine {
     }
 
     // ── ICMP echo ─────────────────────────────────────────────────────────────
-    fn handle_icmp(&mut self, src_mac: &[u8; 6], src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
+    fn handle_icmp(&mut self, src_mac: &[u8; 6], src_ip: Ipv4Addr, dst_ip: Ipv4Addr, ttl: u8, payload: &[u8]) {
         if payload.len() < 8 || payload[0] != ICMP_ECHO_REQUEST { return; }
         let ident = r16(payload, 4);
         let seq   = r16(payload, 6);
@@ -567,24 +568,29 @@ impl NatEngine {
         }
 
         // Forward to external host via ICMP socket.
-        // Linux supports unprivileged SOCK_DGRAM+ICMPV4 (kernel ≥3.11).
-        // Windows requires SOCK_RAW+ICMPV4 (needs admin privileges) and returns
-        // replies with a prepended IP header that must be stripped on recv.
+        // Linux: unprivileged SOCK_DGRAM+ICMPV4 works (kernel ≥3.11) but Time Exceeded
+        //   replies are not delivered — traceroute sees * * * for intermediate hops.
+        // macOS: SOCK_DGRAM+ICMPV4 requires root; falls back gracefully if unavailable.
+        // Windows: SOCK_RAW+ICMPV4 requires admin; Time Exceeded IS delivered on recv,
+        //   so traceroute works correctly when running as Administrator.
         let is_new = !self.icmp_nat.contains_key(&(u32::from(dst_ip), ident));
-        dlog_dev!(LogModule::Net, "NAT ICMP {} → {} ident={} seq={}{}", src_ip, dst_ip, ident, seq,
+        dlog_dev!(LogModule::Net, "NAT ICMP {} → {} ident={} seq={} ttl={}{}", src_ip, dst_ip, ident, seq, ttl,
             if is_new { " [new]" } else { "" });
         if self.icmp_unavailable { return; }
         let key = (u32::from(dst_ip), ident);
         let entry = self.icmp_nat.entry(key).or_insert_with(|| {
-            #[cfg(not(windows))]
-            let sock_type = Type::DGRAM;
             #[cfg(windows)]
             let sock_type = Type::RAW;
+            #[cfg(not(windows))]
+            let sock_type = Type::DGRAM;
             let sock = match Socket::new(Domain::IPV4, sock_type, Some(Protocol::ICMPV4)) {
                 Ok(s) => { let _ = s.set_nonblocking(true); Some(s) }
                 Err(e) => {
+                    #[cfg(windows)]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out. \
-                        On Windows, run as Administrator to enable raw ICMP.", e);
+                        Run as Administrator to enable raw ICMP.", e);
+                    #[cfg(not(windows))]
+                    eprintln!("iris: ICMP unavailable ({}); ping will time out.", e);
                     None
                 }
             };
@@ -595,54 +601,96 @@ impl NatEngine {
             return;
         }
         entry.last_use = Instant::now();
+        let sock = entry.sock.as_ref().unwrap();
+        // Preserve the guest's TTL so intermediate routers respond with Time Exceeded
+        // at the right hop count.  On Windows (SOCK_RAW) those replies arrive back on
+        // this socket and we forward them to the guest.  On Linux/macOS (SOCK_DGRAM)
+        // they are silently dropped by the kernel — traceroute sees * * *.
+        let _ = sock.set_ttl(ttl as u32);
         let dest = SocketAddr::new(IpAddr::V4(dst_ip), 0);
-        let _ = entry.sock.as_ref().unwrap().send_to(payload, &dest.into());
+        let _ = sock.send_to(payload, &dest.into());
     }
 
     fn poll_icmp(&mut self) {
         let mut expired = Vec::new();
-        // (icmp_reply_bytes, key)
-        let mut replies: Vec<(Vec<u8>, (u32, u16))> = Vec::new();
+        // (icmp_payload, outer_src_ip_u32, key)
+        let mut replies: Vec<(Vec<u8>, u32, (u32, u16))> = Vec::new();
         for (&key, entry) in &mut self.icmp_nat {
             if entry.last_use.elapsed() > Duration::from_secs(30) {
                 expired.push(key); continue;
             }
             let Some(sock) = &mut entry.sock else { continue };
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
-            // Linux SOCK_DGRAM ICMP: kernel delivers ICMP payload only (no IP header).
-            // Windows SOCK_RAW ICMP: kernel prepends the IP header; strip it.
             while let Ok(n) = sock.recv(&mut buf) {
                 let raw: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
+                // On Linux SOCK_DGRAM the kernel delivers only the ICMP payload.
+                // On Windows SOCK_RAW the kernel prepends the outer IP header.
                 #[cfg(windows)]
-                let data = {
-                    // IP header length is in the low nibble of byte 0, in 32-bit words.
+                let (outer_src_u32, icmp) = {
                     let ihl = ((raw.first().copied().unwrap_or(0x45) & 0x0f) as usize) * 4;
-                    if raw.len() > ihl { raw[ihl..].to_vec() } else { continue }
+                    if raw.len() <= ihl { continue }
+                    let src = u32::from_be_bytes([raw[12], raw[13], raw[14], raw[15]]);
+                    (src, raw[ihl..].to_vec())
                 };
                 #[cfg(not(windows))]
-                let data = raw;
-                replies.push((data, key));
+                let (outer_src_u32, icmp) = (key.0, raw);
+                replies.push((icmp, outer_src_u32, key));
             }
         }
         for k in expired { self.icmp_nat.remove(&k); }
-        for (mut icmp, key) in replies {
+        for (mut icmp, outer_src_u32, key) in replies {
+            if icmp.len() < 8 { continue; }
             let (dst_ip_u32, ident) = key;
-            if let Some(entry) = self.icmp_nat.get(&key) {
-                let remote_ip = Ipv4Addr::from(dst_ip_u32);
-                let client_mac = entry.client_mac;
-                let client_ip  = entry.client_ip;
-                // Restore the original guest identifier (kernel may have rewritten it)
-                // and recompute the ICMP checksum.
-                if icmp.len() >= 8 {
-                    w16(&mut icmp, 4, ident);
+            let icmp_type = icmp[0];
+
+            // On Windows we may receive Time Exceeded (type 11) for traceroute hops.
+            // The payload of a Time Exceeded is: [unused 4B][original IP hdr][orig 8B].
+            // We match via the ident embedded in the original probe's first 8 bytes,
+            // rewrite the embedded src IP back to the guest IP, and forward to guest.
+            #[cfg(windows)]
+            if icmp_type == 11 {
+                // Time Exceeded: find the right NAT entry via ident in embedded probe.
+                // Embedded layout: icmp[8..] = original IP header + first 8 probe bytes.
+                let emb = &icmp[8..];
+                if emb.len() < 28 { continue; } // 20B IP hdr + 8B probe minimum
+                let emb_ihl = ((emb[0] & 0x0f) as usize) * 4;
+                if emb.len() < emb_ihl + 8 { continue; }
+                let emb_dst = u32::from_be_bytes([emb[16], emb[17], emb[18], emb[19]]);
+                let emb_ident = u16::from_be_bytes([emb[emb_ihl + 4], emb[emb_ihl + 5]]);
+                let te_key = (emb_dst, emb_ident);
+                if let Some(entry) = self.icmp_nat.get(&te_key) {
+                    let client_mac = entry.client_mac;
+                    let client_ip  = entry.client_ip;
+                    let router_ip  = Ipv4Addr::from(outer_src_u32);
+                    // Rewrite embedded src IP from host's real IP → guest IP.
+                    let guest_bytes = client_ip.octets();
+                    icmp[8 + 12] = guest_bytes[0]; icmp[8 + 13] = guest_bytes[1];
+                    icmp[8 + 14] = guest_bytes[2]; icmp[8 + 15] = guest_bytes[3];
+                    // Recompute ICMP checksum over the whole Time Exceeded message.
                     icmp[2] = 0; icmp[3] = 0;
                     let c = ip_checksum(&icmp);
                     w16(&mut icmp, 2, c);
+                    dlog_dev!(LogModule::Net, "NAT ICMP TimeExceeded {} → {} ident={}", router_ip, client_ip, emb_ident);
+                    let frame = ip_frame(&client_mac, &self.config.gateway_mac,
+                                         router_ip, client_ip, IP_PROTO_ICMP, &icmp);
+                    self.enqueue_rx(frame);
                 }
-                {
-                    let seq = if icmp.len() >= 8 { r16(&icmp, 6) } else { 0 };
-                    dlog_dev!(LogModule::Net, "NAT ICMP reply {} → {} ident={} seq={}", remote_ip, client_ip, ident, seq);
-                }
+                continue;
+            }
+
+            // Echo Reply (type 0): restore the original guest identifier
+            // (kernel/NAT may have rewritten it) and recompute checksum.
+            let _ = dst_ip_u32; // used via key above
+            if let Some(entry) = self.icmp_nat.get(&key) {
+                let remote_ip  = Ipv4Addr::from(outer_src_u32);
+                let client_mac = entry.client_mac;
+                let client_ip  = entry.client_ip;
+                w16(&mut icmp, 4, ident);
+                icmp[2] = 0; icmp[3] = 0;
+                let c = ip_checksum(&icmp);
+                w16(&mut icmp, 2, c);
+                let seq = r16(&icmp, 6);
+                dlog_dev!(LogModule::Net, "NAT ICMP reply {} → {} ident={} seq={}", remote_ip, client_ip, ident, seq);
                 let frame = ip_frame(&client_mac, &self.config.gateway_mac,
                                      remote_ip, client_ip, IP_PROTO_ICMP, &icmp);
                 self.enqueue_rx(frame);
