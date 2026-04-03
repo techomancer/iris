@@ -59,6 +59,10 @@ The emulator includes a built-in NAT gateway.  No host-side configuration is
 required — it works out of the box once an Ethernet MAC address is set (see
 above).
 
+## Keyboard
+
+Right control releases mouse grab.
+
 ### Addresses
 
 | Host | IP | Notes |

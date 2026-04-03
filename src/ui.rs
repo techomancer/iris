@@ -521,6 +521,14 @@ impl Ui {
                             }
                         }
                     }
+                    WindowEvent::Focused(false) => {
+                        if mouse_grabbed {
+                            mouse_grabbed = false;
+                            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                            window.set_cursor_visible(true);
+                            mouse_last = None;
+                        }
+                    }
                     WindowEvent::RedrawRequested => {
                         // Rendering is handled by Rex3 refresh thread
                     }
