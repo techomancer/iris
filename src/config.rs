@@ -30,6 +30,10 @@ pub struct MachineConfig {
     /// SCSI devices keyed by ID 1–7. Missing IDs are not attached.
     #[serde(default = "default_scsi")]
     pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
+
+    /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
+    #[serde(default = "default_scale")]
+    pub scale: u32,
 }
 
 fn default_prom() -> String {
@@ -39,6 +43,8 @@ fn default_prom() -> String {
 fn default_banks() -> [u32; 4] {
     [128, 128, 0, 0]
 }
+
+fn default_scale() -> u32 { 1 }
 
 fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
     let mut map = std::collections::HashMap::new();
@@ -61,6 +67,7 @@ impl Default for MachineConfig {
             prom: default_prom(),
             banks: default_banks(),
             scsi: default_scsi(),
+            scale: default_scale(),
         }
     }
 }
@@ -82,6 +89,9 @@ impl MachineConfig {
 
     /// Validate bank sizes, returns a description of any errors.
     pub fn validate(&self) -> Result<(), String> {
+        if self.scale != 1 && self.scale != 2 {
+            return Err(format!("scale {} is invalid (valid: 1, 2)", self.scale));
+        }
         for (i, &sz) in self.banks.iter().enumerate() {
             if !VALID_BANK_SIZES.contains(&sz) {
                 return Err(format!(
@@ -178,6 +188,10 @@ pub struct Cli {
     /// Additional ISO images for CD-ROM ID 6 (can be specified multiple times)
     #[arg(long = "cdrom6-extra", value_name = "ISO")]
     pub cdrom6_extra: Vec<String>,
+
+    /// 2× window scaling for HiDPI/4K monitors
+    #[arg(long = "2x", default_value_t = false)]
+    pub scale2x: bool,
 }
 
 impl Cli {
@@ -212,18 +226,22 @@ impl Cli {
         if let Some(p) = self.cdrom6.clone() { apply_scsi(&mut cfg.scsi, 6, p, true, self.cdrom6_extra.clone()); }
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
+        if self.scale2x { cfg.scale = 2; }
+
         cfg
     }
 }
 
 /// Parse CLI, load TOML, merge, and validate. Exits on error.
-pub fn load_config() -> MachineConfig {
+/// Returns (machine_config, window_scale) where window_scale is 1 or 2.
+pub fn load_config() -> (MachineConfig, u32) {
     let cli = Cli::parse();
     let toml_cfg = MachineConfig::load_toml(&cli.config);
     let cfg = cli.apply(toml_cfg);
+    let scale = cfg.scale;
     if let Err(e) = cfg.validate() {
         eprintln!("Configuration error: {}", e);
         std::process::exit(1);
     }
-    cfg
+    (cfg, scale)
 }

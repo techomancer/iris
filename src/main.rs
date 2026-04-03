@@ -4,7 +4,7 @@ use iris::ui::Ui;
 use winit::event_loop::EventLoop;
 
 fn main() {
-    let cfg = load_config();
+    let (cfg, scale) = load_config();
     let event_loop = EventLoop::new().unwrap();
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
@@ -20,7 +20,7 @@ fn main() {
         Machine::run_console_client();
     });
 
-    let ui = Ui::new(machine.get_ps2(), machine.get_rex3(), machine.get_timer_manager(), &event_loop);
+    let ui = Ui::new(machine.get_ps2(), machine.get_rex3(), machine.get_timer_manager(), &event_loop, scale);
     ui.run(event_loop);
     
     machine.stop();

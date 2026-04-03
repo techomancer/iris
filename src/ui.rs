@@ -36,6 +36,7 @@ struct GlState {
     // Single program used for all three passes (texelFetch y-flip via uniform)
     program: glow::Program,
     viewport_info_loc: Option<glow::UniformLocation>,
+    scale_factor_loc: Option<glow::UniformLocation>,
     // Shared VAO + two VBOs: one for the emulator quad, one for the statusbar quad
     vao: glow::VertexArray,
     main_vbo: glow::Buffer,    // quad covering top `height` px of window
@@ -49,6 +50,7 @@ struct GlRenderer {
     state: Option<GlState>,
     current_w: usize,
     current_h: usize,
+    scale: u32,
 }
 
 // Safety: GlRenderer is sent to the refresh thread where it initializes and uses the GL context.
@@ -85,7 +87,7 @@ impl GlRenderer {
         // Enable VSync
         let _ = gl_surface.set_swap_interval(&gl_context, SwapInterval::Wait(NonZeroU32::new(1).unwrap()));
 
-        let (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, vao, main_vbo, status_vbo) = unsafe {
+        let (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo) = unsafe {
             // Helper: allocate a 2D texture with NEAREST filtering
             let make_tex = |w: i32, h: i32| -> glow::Texture {
                 let t = gl.create_texture().unwrap();
@@ -131,11 +133,14 @@ impl GlRenderer {
                 out vec4 color;
                 uniform sampler2D tex;
                 uniform ivec2 viewport_info[2];
+                uniform int scale_factor;
                 void main() {
                     int tex_h      = viewport_info[0].y;
                     int win_y_base = viewport_info[1].y;
-                    int y = (tex_h - 1) - (int(gl_FragCoord.y) - win_y_base);
-                    color = texelFetch(tex, ivec2(int(gl_FragCoord.x), y), 0);
+                    int scale      = max(scale_factor, 1);
+                    int x = int(gl_FragCoord.x) / scale;
+                    int y = (tex_h - 1) - ((int(gl_FragCoord.y) - win_y_base) / scale);
+                    color = texelFetch(tex, ivec2(x, y), 0);
                 }
             ");
             gl.compile_shader(fs);
@@ -176,6 +181,7 @@ impl GlRenderer {
             }
 
             let viewport_info_loc = gl.get_uniform_location(program, "viewport_info");
+            let scale_factor_loc  = gl.get_uniform_location(program, "scale_factor");
 
             let vao = gl.create_vertex_array().unwrap();
             gl.bind_vertex_array(Some(vao));
@@ -194,7 +200,7 @@ impl GlRenderer {
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
             Self::bind_vbo_attribs(&gl, program, status_vbo);
 
-            (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, vao, main_vbo, status_vbo)
+            (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, scale_factor_loc, vao, main_vbo, status_vbo)
         };
 
         self.state = Some(GlState {
@@ -206,6 +212,7 @@ impl GlRenderer {
             statusbar_tex,
             program,
             viewport_info_loc,
+            scale_factor_loc,
             vao,
             main_vbo,
             status_vbo,
@@ -240,6 +247,13 @@ impl GlRenderer {
         gl.uniform_2_i32_slice(loc, &info);
     }
 
+    // Set scale_factor uniform. Guarded against None so optimized-out uniforms don't panic.
+    unsafe fn set_scale_factor(gl: &glow::Context, loc: Option<&glow::UniformLocation>, scale: u32) {
+        if let Some(loc) = loc {
+            gl.uniform_1_i32(Some(loc), scale as i32);
+        }
+    }
+
     // Bind the VAO and set up attribs for a given VBO (both share the same layout).
     unsafe fn bind_vbo_attribs(gl: &glow::Context, program: glow::Program, vbo: glow::Buffer) {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
@@ -272,7 +286,7 @@ impl Renderer for GlRenderer {
             unsafe { gl.viewport(0, 0, w as i32, h as i32); }
             h as usize
         } else {
-            height + STATUS_BAR_HEIGHT
+            (height + STATUS_BAR_HEIGHT) * self.scale as usize
         };
 
         unsafe {
@@ -290,8 +304,8 @@ impl Renderer for GlRenderer {
 
                 // NDC y of the boundary between emulator display and status bar.
                 // Window: y=0 (bottom) = status bar bottom, y=win_h (top) = display top.
-                // Status bar: bottom STATUS_BAR_HEIGHT px → NDC [-1 .. sb_ndc_top]
-                let sb_ndc_top = -1.0 + 2.0 * STATUS_BAR_HEIGHT as f32 / win_h as f32;
+                // Status bar: bottom STATUS_BAR_HEIGHT*scale px → NDC [-1 .. sb_ndc_top]
+                let sb_ndc_top = -1.0 + 2.0 * (STATUS_BAR_HEIGHT * self.scale as usize) as f32 / win_h as f32;
 
                 // Emulator quad: NDC [sb_ndc_top .. +1], full width
                 Self::upload_quad(gl, state.main_vbo,
@@ -310,7 +324,8 @@ impl Renderer for GlRenderer {
             Self::bind_vbo_attribs(gl, state.program, state.main_vbo);
             // win_y_base for main quad = STATUS_BAR_HEIGHT (bottom of emulator area in window coords)
             Self::set_viewport_info(gl, state.viewport_info_loc.as_ref(),
-                width as i32, height as i32, STATUS_BAR_HEIGHT as i32);
+                width as i32, height as i32, (STATUS_BAR_HEIGHT as u32 * self.scale) as i32);
+            Self::set_scale_factor(gl, state.scale_factor_loc.as_ref(), self.scale);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
             // swap_buffers called in render_overlay after all passes
@@ -332,7 +347,8 @@ impl Renderer for GlRenderer {
             Self::upload_tex(gl, state.overlay_tex, buffer, width as i32, height as i32);
             Self::bind_vbo_attribs(gl, state.program, state.main_vbo);
             Self::set_viewport_info(gl, state.viewport_info_loc.as_ref(),
-                width as i32, height as i32, STATUS_BAR_HEIGHT as i32);
+                width as i32, height as i32, (STATUS_BAR_HEIGHT as u32 * self.scale) as i32);
+            Self::set_scale_factor(gl, state.scale_factor_loc.as_ref(), self.scale);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
             gl.disable(glow::BLEND);
@@ -355,6 +371,7 @@ impl Renderer for GlRenderer {
             // win_y_base = 0: status bar sits at the very bottom of the window
             Self::set_viewport_info(gl, state.viewport_info_loc.as_ref(),
                 width as i32, STATUS_BAR_HEIGHT as i32, 0);
+            Self::set_scale_factor(gl, state.scale_factor_loc.as_ref(), self.scale);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 
             state.surface.swap_buffers(&state.context).unwrap();
@@ -362,10 +379,10 @@ impl Renderer for GlRenderer {
     }
 
     fn resize(&mut self, width: usize, height: usize) {
-        // Resize window to display + status bar
+        // Resize window to display + status bar, scaled for HiDPI
         let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(
-            width as u32,
-            (height + STATUS_BAR_HEIGHT) as u32,
+            width as u32 * self.scale,
+            (height + STATUS_BAR_HEIGHT) as u32 * self.scale,
         ));
     }
 
@@ -387,13 +404,17 @@ pub struct Ui {
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     timer_manager: Arc<TimerManager>,
+    scale: u32,
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32) -> Self {
+        let w = 1024 * scale;
+        let h = (768 + STATUS_BAR_HEIGHT as u32) * scale;
         let window_builder = WindowBuilder::new()
             .with_title("Irresponsible Rust IRIX Simulator")
-            .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 768.0 + STATUS_BAR_HEIGHT as f64));
+            .with_resizable(false)
+            .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
 
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
@@ -425,16 +446,17 @@ impl Ui {
             state: None,
             current_w: 0,
             current_h: 0,
+            scale,
         };
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, window, window_size, timer_manager }
+        Self { ps2, window, window_size, timer_manager, scale }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, window, window_size, timer_manager } = self;
+        let Ui { ps2, window, window_size, timer_manager, scale } = self;
 
         let mut mouse_grabbed = false;
         // Warp-to-center mouse handling: on each real CursorMoved, accumulate
@@ -508,8 +530,8 @@ impl Ui {
                             if position.x == center.x && position.y == center.y {
                                 mouse_last = Some(center);
                             } else if let Some(last) = mouse_last {
-                                let dx = position.x - last.x;
-                                let dy = position.y - last.y;
+                                let dx = (position.x - last.x) / scale as f64;
+                                let dy = (position.y - last.y) / scale as f64;
                                 mouse_delta.lock().accum.0 += dx;
                                 mouse_delta.lock().accum.1 += dy;
                                 let _ = window.set_cursor_position(center);

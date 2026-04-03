@@ -579,17 +579,22 @@ impl NatEngine {
         if self.icmp_unavailable { return; }
         let key = (u32::from(dst_ip), ident);
         let entry = self.icmp_nat.entry(key).or_insert_with(|| {
-            #[cfg(windows)]
-            let sock_type = Type::RAW;
-            #[cfg(not(windows))]
+            // Linux: unprivileged SOCK_DGRAM+ICMPV4 works (kernel ≥3.11).
+            // Windows/macOS: need SOCK_RAW+ICMPV4, which requires admin/root.
+            #[cfg(target_os = "linux")]
             let sock_type = Type::DGRAM;
+            #[cfg(not(target_os = "linux"))]
+            let sock_type = Type::RAW;
             let sock = match Socket::new(Domain::IPV4, sock_type, Some(Protocol::ICMPV4)) {
                 Ok(s) => { let _ = s.set_nonblocking(true); Some(s) }
                 Err(e) => {
                     #[cfg(windows)]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out. \
                         Run as Administrator to enable raw ICMP.", e);
-                    #[cfg(not(windows))]
+                    #[cfg(target_os = "macos")]
+                    eprintln!("iris: ICMP unavailable ({}); ping will time out. \
+                        Run as root (sudo) to enable raw ICMP.", e);
+                    #[cfg(target_os = "linux")]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out.", e);
                     None
                 }
@@ -603,9 +608,9 @@ impl NatEngine {
         entry.last_use = Instant::now();
         let sock = entry.sock.as_ref().unwrap();
         // Preserve the guest's TTL so intermediate routers respond with Time Exceeded
-        // at the right hop count.  On Windows (SOCK_RAW) those replies arrive back on
-        // this socket and we forward them to the guest.  On Linux/macOS (SOCK_DGRAM)
-        // they are silently dropped by the kernel — traceroute sees * * *.
+        // at the right hop count.  On Windows/macOS (SOCK_RAW) those replies arrive back
+        // on this socket and we forward them to the guest.  On Linux (SOCK_DGRAM) they
+        // are silently dropped by the kernel — traceroute sees * * *.
         let _ = sock.set_ttl(ttl as u32);
         let dest = SocketAddr::new(IpAddr::V4(dst_ip), 0);
         let _ = sock.send_to(payload, &dest.into());
@@ -624,15 +629,15 @@ impl NatEngine {
             while let Ok(n) = sock.recv(&mut buf) {
                 let raw: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
                 // On Linux SOCK_DGRAM the kernel delivers only the ICMP payload.
-                // On Windows SOCK_RAW the kernel prepends the outer IP header.
-                #[cfg(windows)]
+                // On Windows/macOS SOCK_RAW the kernel prepends the outer IP header.
+                #[cfg(not(target_os = "linux"))]
                 let (outer_src_u32, icmp) = {
                     let ihl = ((raw.first().copied().unwrap_or(0x45) & 0x0f) as usize) * 4;
                     if raw.len() <= ihl { continue }
                     let src = u32::from_be_bytes([raw[12], raw[13], raw[14], raw[15]]);
                     (src, raw[ihl..].to_vec())
                 };
-                #[cfg(not(windows))]
+                #[cfg(target_os = "linux")]
                 let (outer_src_u32, icmp) = (key.0, raw);
                 replies.push((icmp, outer_src_u32, key));
             }
@@ -643,11 +648,11 @@ impl NatEngine {
             let (dst_ip_u32, ident) = key;
             let icmp_type = icmp[0];
 
-            // On Windows we may receive Time Exceeded (type 11) for traceroute hops.
+            // On Windows/macOS (SOCK_RAW) we receive Time Exceeded (type 11) for traceroute hops.
             // The payload of a Time Exceeded is: [unused 4B][original IP hdr][orig 8B].
             // We match via the ident embedded in the original probe's first 8 bytes,
             // rewrite the embedded src IP back to the guest IP, and forward to guest.
-            #[cfg(windows)]
+            #[cfg(not(target_os = "linux"))]
             if icmp_type == 11 {
                 // Time Exceeded: find the right NAT entry via ident in embedded probe.
                 // Embedded layout: icmp[8..] = original IP header + first 8 probe bytes.

@@ -5,6 +5,10 @@
 # PROM ROM image (required).
 prom = "prom.bin"
 
+# Window scale factor: 1 = native resolution, 2 = 2× for HiDPI/4K monitors.
+# Can also be set with the --2x command-line flag (CLI takes precedence).
+# scale = 2
+
 # RAM bank sizes in MB.
 # Each bank must be 0 (absent), 8, 16, 32, 64, or 128.
 # The SGI Indy supports up to two populated banks; banks 2 and 3 are

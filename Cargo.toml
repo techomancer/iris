@@ -23,7 +23,7 @@ glutin-winit = "0.4"
 glow = "0.13"
 raw-window-handle = "0.5"
 rtrb = "0.3"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 crossbeam-utils = "0.8"
 bitfield = "0.14"
 cpal = "0.15"
