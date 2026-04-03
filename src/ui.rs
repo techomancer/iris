@@ -181,22 +181,18 @@ impl GlRenderer {
             gl.bind_vertex_array(Some(vao));
 
             gl.use_program(Some(program));
-            let pos_loc = gl.get_attrib_location(program, "position").unwrap();
-            let tex_loc = gl.get_attrib_location(program, "tex_coord").unwrap();
 
             // main_vbo: emulator quad
             let main_vbo = gl.create_buffer().unwrap();
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(main_vbo));
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
-            gl.enable_vertex_attrib_array(pos_loc);
-            gl.vertex_attrib_pointer_f32(pos_loc, 2, glow::FLOAT, false, 16, 0);
-            gl.enable_vertex_attrib_array(tex_loc);
-            gl.vertex_attrib_pointer_f32(tex_loc, 2, glow::FLOAT, false, 16, 8);
+            Self::bind_vbo_attribs(&gl, program, main_vbo);
 
             // status_vbo: status bar quad (separate buffer, same attrib layout)
             let status_vbo = gl.create_buffer().unwrap();
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(status_vbo));
             gl.buffer_data_size(glow::ARRAY_BUFFER, VBO_SIZE, glow::DYNAMIC_DRAW);
+            Self::bind_vbo_attribs(&gl, program, status_vbo);
 
             (main_tex, overlay_tex, statusbar_tex, program, viewport_info_loc, vao, main_vbo, status_vbo)
         };
@@ -248,11 +244,12 @@ impl GlRenderer {
     unsafe fn bind_vbo_attribs(gl: &glow::Context, program: glow::Program, vbo: glow::Buffer) {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         let pos_loc = gl.get_attrib_location(program, "position").unwrap();
-        let tex_loc = gl.get_attrib_location(program, "tex_coord").unwrap();
         gl.enable_vertex_attrib_array(pos_loc);
         gl.vertex_attrib_pointer_f32(pos_loc, 2, glow::FLOAT, false, 16, 0);
-        gl.enable_vertex_attrib_array(tex_loc);
-        gl.vertex_attrib_pointer_f32(tex_loc, 2, glow::FLOAT, false, 16, 8);
+        if let Some(tex_loc) = gl.get_attrib_location(program, "tex_coord") {
+            gl.enable_vertex_attrib_array(tex_loc);
+            gl.vertex_attrib_pointer_f32(tex_loc, 2, glow::FLOAT, false, 16, 8);
+        }
     }
 }
 
