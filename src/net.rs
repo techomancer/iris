@@ -64,7 +64,7 @@ struct NatUdpEntry {
 
 // Key: (dst_ip, icmp_identifier) — identifier plays the role of "port" for ICMP NAT.
 struct NatIcmpEntry {
-    sock:       Socket,
+    sock:       Option<Socket>,  // None if raw socket creation failed (e.g. not admin on Windows)
     client_mac: [u8; 6],
     client_ip:  Ipv4Addr,
     last_use:   Instant,
@@ -392,6 +392,7 @@ pub struct NatEngine {
     tcp_nat:   HashMap<(u32, u16, u16), NatTcpEntry>,
     tcp_tw:    HashMap<(u32, u16, u16), Instant>,  // TIME_WAIT: absorb final ACKs silently
     icmp_nat:  HashMap<(u32, u16), NatIcmpEntry>,  // key: (dst_ip, identifier)
+    icmp_unavailable: bool,  // true after first failed raw socket creation (Windows non-admin)
 }
 
 impl NatEngine {
@@ -404,7 +405,7 @@ impl NatEngine {
                ctl:     Arc<NatControl>) -> Self {
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
-               icmp_nat: HashMap::new() }
+               icmp_nat: HashMap::new(), icmp_unavailable: false }
     }
 
     pub fn run(&mut self) {
@@ -565,20 +566,37 @@ impl NatEngine {
             return;
         }
 
-        // Forward to external host via SOCK_DGRAM ICMP socket (unprivileged on Linux).
+        // Forward to external host via ICMP socket.
+        // Linux supports unprivileged SOCK_DGRAM+ICMPV4 (kernel ≥3.11).
+        // Windows requires SOCK_RAW+ICMPV4 (needs admin privileges) and returns
+        // replies with a prepended IP header that must be stripped on recv.
         let is_new = !self.icmp_nat.contains_key(&(u32::from(dst_ip), ident));
         dlog_dev!(LogModule::Net, "NAT ICMP {} → {} ident={} seq={}{}", src_ip, dst_ip, ident, seq,
             if is_new { " [new]" } else { "" });
+        if self.icmp_unavailable { return; }
         let key = (u32::from(dst_ip), ident);
         let entry = self.icmp_nat.entry(key).or_insert_with(|| {
-            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))
-                .expect("ICMP socket");
-            let _ = sock.set_nonblocking(true);
+            #[cfg(not(windows))]
+            let sock_type = Type::DGRAM;
+            #[cfg(windows)]
+            let sock_type = Type::RAW;
+            let sock = match Socket::new(Domain::IPV4, sock_type, Some(Protocol::ICMPV4)) {
+                Ok(s) => { let _ = s.set_nonblocking(true); Some(s) }
+                Err(e) => {
+                    eprintln!("iris: ICMP unavailable ({}); ping will time out. \
+                        On Windows, run as Administrator to enable raw ICMP.", e);
+                    None
+                }
+            };
             NatIcmpEntry { sock, client_mac: *src_mac, client_ip: src_ip, last_use: Instant::now() }
         });
+        if entry.sock.is_none() {
+            self.icmp_unavailable = true;
+            return;
+        }
         entry.last_use = Instant::now();
         let dest = SocketAddr::new(IpAddr::V4(dst_ip), 0);
-        let _ = entry.sock.send_to(payload, &dest.into());
+        let _ = entry.sock.as_ref().unwrap().send_to(payload, &dest.into());
     }
 
     fn poll_icmp(&mut self) {
@@ -589,10 +607,20 @@ impl NatEngine {
             if entry.last_use.elapsed() > Duration::from_secs(30) {
                 expired.push(key); continue;
             }
+            let Some(sock) = &mut entry.sock else { continue };
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
-            // SOCK_DGRAM ICMP: kernel delivers the ICMP payload (no IP header).
-            while let Ok(n) = entry.sock.recv(&mut buf) {
-                let data: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
+            // Linux SOCK_DGRAM ICMP: kernel delivers ICMP payload only (no IP header).
+            // Windows SOCK_RAW ICMP: kernel prepends the IP header; strip it.
+            while let Ok(n) = sock.recv(&mut buf) {
+                let raw: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
+                #[cfg(windows)]
+                let data = {
+                    // IP header length is in the low nibble of byte 0, in 32-bit words.
+                    let ihl = ((raw.first().copied().unwrap_or(0x45) & 0x0f) as usize) * 4;
+                    if raw.len() > ihl { raw[ihl..].to_vec() } else { continue }
+                };
+                #[cfg(not(windows))]
+                let data = raw;
                 replies.push((data, key));
             }
         }
