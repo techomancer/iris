@@ -1523,7 +1523,7 @@ For R4000SC/MC CPUs:
 
     /// Production data read (with breakpoints, updates CP0 state on exceptions).
     #[inline]
-    fn read_data<const SIZE: usize>(&mut self, virt_addr: u64) -> Result<u64, ExecStatus> {
+    pub(crate) fn read_data<const SIZE: usize>(&mut self, virt_addr: u64) -> Result<u64, ExecStatus> {
         self.read_data_impl::<false, SIZE>(virt_addr)
     }
 
@@ -1624,15 +1624,13 @@ For R4000SC/MC CPUs:
 
     /// Production data write (with breakpoints, undo tracking, updates CP0 state on exceptions).
     #[inline]
-    fn write_data<const SIZE: usize>(&mut self, virt_addr: u64, val: u64) -> ExecStatus {
+    pub(crate) fn write_data<const SIZE: usize>(&mut self, virt_addr: u64, val: u64) -> ExecStatus {
         self.write_data_impl::<false, SIZE>(virt_addr, val)
     }
 
     /// Partial masked doubleword write for SDL/SDR/SWL/SWR.
-    /// Only bytes where the corresponding mask byte is non-zero are written.
-    /// `virt_addr` must be 8-byte aligned; val/mask are in MIPS big-endian doubleword space.
     #[inline]
-    fn write_data64_masked(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
+    pub(crate) fn write_data64_masked(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
         self.write_data64_masked_impl::<false>(virt_addr, val, mask)
     }
 

@@ -1,28 +1,38 @@
 //! Block compiler: translates MIPS basic blocks to native code via Cranelift.
 
-use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{self, types, AbiParam, InstBuilder, MemFlags, Value, FuncRef};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{self, Context};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{Linkage, Module, FuncId};
 
 use crate::mips_exec::DecodedInstr;
 use crate::mips_isa::*;
 
 use super::cache::CompiledBlock;
-use super::context::{JitContext, EXIT_NORMAL, EXIT_INTERPRET};
+use super::context::{JitContext, EXIT_NORMAL, EXIT_INTERPRET, EXIT_EXCEPTION};
+use super::helpers::HelperPtrs;
 
 pub struct BlockCompiler {
     jit_module: JITModule,
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
     func_id_counter: u32,
+    // Declared function IDs for memory helpers (registered as imports)
+    fn_read_u8: FuncId,
+    fn_read_u16: FuncId,
+    fn_read_u32: FuncId,
+    fn_read_u64: FuncId,
+    fn_write_u8: FuncId,
+    fn_write_u16: FuncId,
+    fn_write_u32: FuncId,
+    fn_write_u64: FuncId,
 }
 
 impl BlockCompiler {
-    pub fn new() -> Self {
+    pub fn new(helpers: &HelperPtrs) -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("opt_level", "speed").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
@@ -30,14 +40,54 @@ impl BlockCompiler {
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
 
-        let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-        let jit_module = JITModule::new(jit_builder);
+        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+
+        // Register helper function symbols
+        jit_builder.symbol("jit_read_u8", helpers.read_u8);
+        jit_builder.symbol("jit_read_u16", helpers.read_u16);
+        jit_builder.symbol("jit_read_u32", helpers.read_u32);
+        jit_builder.symbol("jit_read_u64", helpers.read_u64);
+        jit_builder.symbol("jit_write_u8", helpers.write_u8);
+        jit_builder.symbol("jit_write_u16", helpers.write_u16);
+        jit_builder.symbol("jit_write_u32", helpers.write_u32);
+        jit_builder.symbol("jit_write_u64", helpers.write_u64);
+
+        let mut jit_module = JITModule::new(jit_builder);
+
+        // Declare helper function signatures: read(ctx_ptr, exec_ptr, virt_addr) -> u64
+        let ptr_type = jit_module.target_config().pointer_type();
+        let mut read_sig = jit_module.make_signature();
+        read_sig.params.push(AbiParam::new(ptr_type)); // ctx_ptr
+        read_sig.params.push(AbiParam::new(ptr_type)); // exec_ptr
+        read_sig.params.push(AbiParam::new(types::I64)); // virt_addr
+        read_sig.returns.push(AbiParam::new(types::I64)); // value
+        // Use the ISA's default calling convention (AppleAarch64 on macOS, SystemV on Linux)
+
+        // write(ctx_ptr, exec_ptr, virt_addr, value) -> u64
+        let mut write_sig = jit_module.make_signature();
+        write_sig.params.push(AbiParam::new(ptr_type));
+        write_sig.params.push(AbiParam::new(ptr_type));
+        write_sig.params.push(AbiParam::new(types::I64));
+        write_sig.params.push(AbiParam::new(types::I64)); // value
+        write_sig.returns.push(AbiParam::new(types::I64));
+        // Use default calling convention
+
+        let fn_read_u8  = jit_module.declare_function("jit_read_u8",  Linkage::Import, &read_sig).unwrap();
+        let fn_read_u16 = jit_module.declare_function("jit_read_u16", Linkage::Import, &read_sig).unwrap();
+        let fn_read_u32 = jit_module.declare_function("jit_read_u32", Linkage::Import, &read_sig).unwrap();
+        let fn_read_u64 = jit_module.declare_function("jit_read_u64", Linkage::Import, &read_sig).unwrap();
+        let fn_write_u8  = jit_module.declare_function("jit_write_u8",  Linkage::Import, &write_sig).unwrap();
+        let fn_write_u16 = jit_module.declare_function("jit_write_u16", Linkage::Import, &write_sig).unwrap();
+        let fn_write_u32 = jit_module.declare_function("jit_write_u32", Linkage::Import, &write_sig).unwrap();
+        let fn_write_u64 = jit_module.declare_function("jit_write_u64", Linkage::Import, &write_sig).unwrap();
 
         Self {
             ctx: jit_module.make_context(),
             jit_module,
             builder_ctx: FunctionBuilderContext::new(),
             func_id_counter: 0,
+            fn_read_u8, fn_read_u16, fn_read_u32, fn_read_u64,
+            fn_write_u8, fn_write_u16, fn_write_u32, fn_write_u64,
         }
     }
 
@@ -63,7 +113,7 @@ impl BlockCompiler {
         // Declare function signature: extern "C" fn(*mut JitContext)
         let ptr_type = self.jit_module.target_config().pointer_type();
         self.ctx.func.signature.params.push(AbiParam::new(ptr_type));
-        self.ctx.func.signature.call_conv = cranelift_codegen::isa::CallConv::SystemV;
+        // Use default calling convention (matches extern "C" on host)
 
         let func_id = self.jit_module
             .declare_function(&name, Linkage::Local, &self.ctx.func.signature)
@@ -78,6 +128,24 @@ impl BlockCompiler {
 
         let ctx_ptr = builder.block_params(entry_block)[0];
         let mem = MemFlags::trusted();
+
+        // Load executor pointer from JitContext
+        let exec_ptr = builder.ins().load(
+            ptr_type, mem, ctx_ptr,
+            ir::immediates::Offset32::new(JitContext::executor_ptr_offset()),
+        );
+
+        // Declare helper function references for this function
+        let helpers = EmitHelpers {
+            read_u8:  self.jit_module.declare_func_in_func(self.fn_read_u8,  &mut builder.func),
+            read_u16: self.jit_module.declare_func_in_func(self.fn_read_u16, &mut builder.func),
+            read_u32: self.jit_module.declare_func_in_func(self.fn_read_u32, &mut builder.func),
+            read_u64: self.jit_module.declare_func_in_func(self.fn_read_u64, &mut builder.func),
+            write_u8:  self.jit_module.declare_func_in_func(self.fn_write_u8,  &mut builder.func),
+            write_u16: self.jit_module.declare_func_in_func(self.fn_write_u16, &mut builder.func),
+            write_u32: self.jit_module.declare_func_in_func(self.fn_write_u32, &mut builder.func),
+            write_u64: self.jit_module.declare_func_in_func(self.fn_write_u64, &mut builder.func),
+        };
 
         // Load GPRs 1-31 from JitContext (gpr[0] is always 0)
         let mut gpr = [builder.ins().iconst(types::I64, 0); 32];
@@ -96,15 +164,41 @@ impl BlockCompiler {
 
         // Emit IR for each instruction
         let mut compiled_count = 0u32;
-        for (_, d) in instrs {
-            if !emit_instruction(&mut builder, ctx_ptr, &mut gpr, &mut hi, &mut lo, d) {
-                break;
+        let mut branch_exit_pc: Option<Value> = None;
+
+        let mut idx = 0;
+        while idx < instrs.len() {
+            let (_, d) = &instrs[idx];
+            let instr_pc = block_pc.wrapping_add(idx as u64 * 4);
+            let result = emit_instruction(
+                &mut builder, ctx_ptr, exec_ptr, &helpers,
+                &mut gpr, &mut hi, &mut lo, d, instr_pc,
+            );
+            match result {
+                EmitResult::Ok => { compiled_count += 1; idx += 1; }
+                EmitResult::Branch(target_val) => {
+                    compiled_count += 1;
+                    idx += 1;
+                    // Emit the delay slot instruction (next in the list, if present)
+                    if idx < instrs.len() {
+                        let (_, delay_d) = &instrs[idx];
+                        let delay_pc = block_pc.wrapping_add(idx as u64 * 4);
+                        let delay_result = emit_instruction(
+                            &mut builder, ctx_ptr, exec_ptr, &helpers,
+                            &mut gpr, &mut hi, &mut lo, delay_d, delay_pc,
+                        );
+                        if matches!(delay_result, EmitResult::Ok) {
+                            compiled_count += 1;
+                        }
+                    }
+                    branch_exit_pc = Some(target_val);
+                    break;
+                }
+                EmitResult::Stop => break,
             }
-            compiled_count += 1;
         }
 
         if compiled_count == 0 {
-            // Nothing was compilable — clean up and return None
             builder.ins().return_(&[]);
             builder.finalize();
             self.ctx.clear();
@@ -123,9 +217,13 @@ impl BlockCompiler {
         builder.ins().store(mem, lo, ctx_ptr,
             ir::immediates::Offset32::new(JitContext::lo_offset()));
 
-        // Set exit PC = block_pc + 4 * compiled_count
-        let exit_pc = block_pc.wrapping_add(compiled_count as u64 * 4);
-        let exit_pc_val = builder.ins().iconst(types::I64, exit_pc as i64);
+        // Set exit PC
+        let exit_pc_val = if let Some(target) = branch_exit_pc {
+            target
+        } else {
+            let fallthrough_pc = block_pc.wrapping_add(compiled_count as u64 * 4);
+            builder.ins().iconst(types::I64, fallthrough_pc as i64)
+        };
         builder.ins().store(mem, exit_pc_val, ctx_ptr,
             ir::immediates::Offset32::new(JitContext::pc_offset()));
 
@@ -160,16 +258,34 @@ impl BlockCompiler {
     }
 }
 
+/// Helper function references for memory operations within a compiled function.
+struct EmitHelpers {
+    read_u8: FuncRef, read_u16: FuncRef, read_u32: FuncRef, read_u64: FuncRef,
+    write_u8: FuncRef, write_u16: FuncRef, write_u32: FuncRef, write_u64: FuncRef,
+}
+
+/// Result of emitting a single instruction.
+enum EmitResult {
+    /// Instruction compiled normally.
+    Ok,
+    /// Instruction is a branch; the Value is the computed target PC.
+    Branch(Value),
+    /// Instruction is not compilable — terminate block before it.
+    Stop,
+}
+
 /// Emit Cranelift IR for a single MIPS instruction.
-/// Returns true if the instruction was compiled, false if it should terminate the block.
 fn emit_instruction(
     builder: &mut FunctionBuilder,
     ctx_ptr: Value,
+    exec_ptr: Value,
+    helpers: &EmitHelpers,
     gpr: &mut [Value; 32],
     hi: &mut Value,
     lo: &mut Value,
     d: &DecodedInstr,
-) -> bool {
+    instr_pc: u64,
+) -> EmitResult {
     let op = d.op as u32;
     let rs = d.rs as usize;
     let rt = d.rt as usize;
@@ -179,15 +295,41 @@ fn emit_instruction(
 
     match op {
         OP_SPECIAL => emit_special(builder, gpr, hi, lo, d, rs, rt, rd, sa, funct),
-        OP_ADDIU  => { emit_addiu(builder, gpr, rs, rt, d); true }
-        OP_DADDIU => { emit_daddiu(builder, gpr, rs, rt, d); true }
-        OP_SLTI   => { emit_slti(builder, gpr, rs, rt, d); true }
-        OP_SLTIU  => { emit_sltiu(builder, gpr, rs, rt, d); true }
-        OP_ANDI   => { emit_andi(builder, gpr, rs, rt, d); true }
-        OP_ORI    => { emit_ori(builder, gpr, rs, rt, d); true }
-        OP_XORI   => { emit_xori(builder, gpr, rs, rt, d); true }
-        OP_LUI    => { emit_lui(builder, gpr, rt, d); true }
-        _ => false, // Non-ALU instruction — terminate block
+        OP_ADDIU  => { emit_addiu(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_DADDIU => { emit_daddiu(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_SLTI   => { emit_slti(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_SLTIU  => { emit_sltiu(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_ANDI   => { emit_andi(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_ORI    => { emit_ori(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_XORI   => { emit_xori(builder, gpr, rs, rt, d); EmitResult::Ok }
+        OP_LUI    => { emit_lui(builder, gpr, rt, d); EmitResult::Ok }
+
+        // --- Loads ---
+        OP_LB  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u8,  gpr, rs, rt, d, LoadWidth::Byte, true, instr_pc),
+        OP_LBU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u8,  gpr, rs, rt, d, LoadWidth::Byte, false, instr_pc),
+        OP_LH  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u16, gpr, rs, rt, d, LoadWidth::Half, true, instr_pc),
+        OP_LHU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u16, gpr, rs, rt, d, LoadWidth::Half, false, instr_pc),
+        OP_LW  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u32, gpr, rs, rt, d, LoadWidth::Word, true, instr_pc),
+        OP_LWU => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u32, gpr, rs, rt, d, LoadWidth::Word, false, instr_pc),
+        OP_LD  => emit_load(builder, ctx_ptr, exec_ptr, helpers.read_u64, gpr, rs, rt, d, LoadWidth::Double, false, instr_pc),
+
+        // --- Stores ---
+        OP_SB => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u8,  gpr, rs, rt, d, instr_pc),
+        OP_SH => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u16, gpr, rs, rt, d, instr_pc),
+        OP_SW => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u32, gpr, rs, rt, d, instr_pc),
+        OP_SD => emit_store(builder, ctx_ptr, exec_ptr, helpers.write_u64, gpr, rs, rt, d, instr_pc),
+
+        // --- Branches ---
+        OP_BEQ   => emit_beq(builder, gpr, rs, rt, d, instr_pc, false),
+        OP_BNE   => emit_bne(builder, gpr, rs, rt, d, instr_pc, false),
+        OP_BLEZ  => emit_blez(builder, gpr, rs, d, instr_pc, false),
+        OP_BGTZ  => emit_bgtz(builder, gpr, rs, d, instr_pc, false),
+
+        // --- Jumps ---
+        OP_J   => emit_j(builder, gpr, d, instr_pc),
+        OP_JAL => emit_jal(builder, gpr, d, instr_pc),
+
+        _ => EmitResult::Stop,
     }
 }
 
@@ -198,70 +340,82 @@ fn emit_special(
     lo: &mut Value,
     d: &DecodedInstr,
     rs: usize, rt: usize, rd: usize, sa: u32, funct: u32,
-) -> bool {
+) -> EmitResult {
     match funct {
         // --- Shifts (immediate) ---
-        FUNCT_SLL  => { emit_sll(builder, gpr, rt, rd, sa); true }
-        FUNCT_SRL  => { emit_srl(builder, gpr, rt, rd, sa); true }
-        FUNCT_SRA  => { emit_sra(builder, gpr, rt, rd, sa); true }
+        FUNCT_SLL  => { emit_sll(builder, gpr, rt, rd, sa); EmitResult::Ok }
+        FUNCT_SRL  => { emit_srl(builder, gpr, rt, rd, sa); EmitResult::Ok }
+        FUNCT_SRA  => { emit_sra(builder, gpr, rt, rd, sa); EmitResult::Ok }
 
         // --- Shifts (variable) ---
-        FUNCT_SLLV => { emit_sllv(builder, gpr, rs, rt, rd); true }
-        FUNCT_SRLV => { emit_srlv(builder, gpr, rs, rt, rd); true }
-        FUNCT_SRAV => { emit_srav(builder, gpr, rs, rt, rd); true }
+        FUNCT_SLLV => { emit_sllv(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_SRLV => { emit_srlv(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_SRAV => { emit_srav(builder, gpr, rs, rt, rd); EmitResult::Ok }
 
         // --- 64-bit shifts (immediate) ---
-        FUNCT_DSLL   => { emit_dsll(builder, gpr, rt, rd, sa); true }
-        FUNCT_DSRL   => { emit_dsrl(builder, gpr, rt, rd, sa); true }
-        FUNCT_DSRA   => { emit_dsra(builder, gpr, rt, rd, sa); true }
-        FUNCT_DSLL32 => { emit_dsll(builder, gpr, rt, rd, sa + 32); true }
-        FUNCT_DSRL32 => { emit_dsrl(builder, gpr, rt, rd, sa + 32); true }
-        FUNCT_DSRA32 => { emit_dsra(builder, gpr, rt, rd, sa + 32); true }
+        FUNCT_DSLL   => { emit_dsll(builder, gpr, rt, rd, sa); EmitResult::Ok }
+        FUNCT_DSRL   => { emit_dsrl(builder, gpr, rt, rd, sa); EmitResult::Ok }
+        FUNCT_DSRA   => { emit_dsra(builder, gpr, rt, rd, sa); EmitResult::Ok }
+        FUNCT_DSLL32 => { emit_dsll(builder, gpr, rt, rd, sa + 32); EmitResult::Ok }
+        FUNCT_DSRL32 => { emit_dsrl(builder, gpr, rt, rd, sa + 32); EmitResult::Ok }
+        FUNCT_DSRA32 => { emit_dsra(builder, gpr, rt, rd, sa + 32); EmitResult::Ok }
 
         // --- 64-bit shifts (variable) ---
-        FUNCT_DSLLV => { emit_dsllv(builder, gpr, rs, rt, rd); true }
-        FUNCT_DSRLV => { emit_dsrlv(builder, gpr, rs, rt, rd); true }
-        FUNCT_DSRAV => { emit_dsrav(builder, gpr, rs, rt, rd); true }
+        FUNCT_DSLLV => { emit_dsllv(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_DSRLV => { emit_dsrlv(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_DSRAV => { emit_dsrav(builder, gpr, rs, rt, rd); EmitResult::Ok }
 
         // --- ALU register ops ---
-        FUNCT_ADDU => { emit_addu(builder, gpr, rs, rt, rd); true }
-        FUNCT_SUBU => { emit_subu(builder, gpr, rs, rt, rd); true }
-        FUNCT_AND  => { emit_and(builder, gpr, rs, rt, rd); true }
-        FUNCT_OR   => { emit_or(builder, gpr, rs, rt, rd); true }
-        FUNCT_XOR  => { emit_xor(builder, gpr, rs, rt, rd); true }
-        FUNCT_NOR  => { emit_nor(builder, gpr, rs, rt, rd); true }
-        FUNCT_SLT  => { emit_slt(builder, gpr, rs, rt, rd); true }
-        FUNCT_SLTU => { emit_sltu(builder, gpr, rs, rt, rd); true }
+        FUNCT_ADDU => { emit_addu(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_SUBU => { emit_subu(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_AND  => { emit_and(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_OR   => { emit_or(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_XOR  => { emit_xor(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_NOR  => { emit_nor(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_SLT  => { emit_slt(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_SLTU => { emit_sltu(builder, gpr, rs, rt, rd); EmitResult::Ok }
 
         // --- 64-bit ALU ---
-        FUNCT_DADDU => { emit_daddu(builder, gpr, rs, rt, rd); true }
-        FUNCT_DSUBU => { emit_dsubu(builder, gpr, rs, rt, rd); true }
+        FUNCT_DADDU => { emit_daddu(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_DSUBU => { emit_dsubu(builder, gpr, rs, rt, rd); EmitResult::Ok }
 
         // --- Multiply/Divide ---
-        FUNCT_MULT  => { emit_mult(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_MULTU => { emit_multu(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_DIV   => { emit_div(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_DIVU  => { emit_divu(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_DMULT  => { emit_dmult(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_DMULTU => { emit_dmultu(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_DDIV   => { emit_ddiv(builder, gpr, hi, lo, rs, rt); true }
-        FUNCT_DDIVU  => { emit_ddivu(builder, gpr, hi, lo, rs, rt); true }
+        FUNCT_MULT  => { emit_mult(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_MULTU => { emit_multu(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_DIV   => { emit_div(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_DIVU  => { emit_divu(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_DMULT  => { emit_dmult(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_DMULTU => { emit_dmultu(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_DDIV   => { emit_ddiv(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
+        FUNCT_DDIVU  => { emit_ddivu(builder, gpr, hi, lo, rs, rt); EmitResult::Ok }
 
         // --- HI/LO moves ---
-        FUNCT_MFHI => { gpr[rd] = *hi; true }
-        FUNCT_MTHI => { *hi = gpr[rs]; true }
-        FUNCT_MFLO => { gpr[rd] = *lo; true }
-        FUNCT_MTLO => { *lo = gpr[rs]; true }
+        FUNCT_MFHI => { gpr[rd] = *hi; EmitResult::Ok }
+        FUNCT_MTHI => { *hi = gpr[rs]; EmitResult::Ok }
+        FUNCT_MFLO => { gpr[rd] = *lo; EmitResult::Ok }
+        FUNCT_MTLO => { *lo = gpr[rs]; EmitResult::Ok }
 
         // --- Conditional moves ---
-        FUNCT_MOVZ => { emit_movz(builder, gpr, rs, rt, rd); true }
-        FUNCT_MOVN => { emit_movn(builder, gpr, rs, rt, rd); true }
+        FUNCT_MOVZ => { emit_movz(builder, gpr, rs, rt, rd); EmitResult::Ok }
+        FUNCT_MOVN => { emit_movn(builder, gpr, rs, rt, rd); EmitResult::Ok }
+
+        // --- JR / JALR ---
+        FUNCT_JR   => { let target = gpr[rs]; EmitResult::Branch(target) }
+        FUNCT_JALR => {
+            let target = gpr[rs];
+            let instr_pc_plus_8 = d.imm; // we'll handle this in dispatch; for now use rd
+            // JALR stores return address in rd (default $ra=31)
+            // But we don't know the PC here... pass it via a different mechanism.
+            // Actually: JALR rd, rs — stores PC+8 in rd.
+            // We don't have the PC as a value here. Let's defer JALR to interpreter.
+            EmitResult::Stop
+        }
 
         // --- SYNC (barrier, NOP for JIT) ---
-        FUNCT_SYNC => true,
+        FUNCT_SYNC => EmitResult::Ok,
 
         // Everything else terminates the block
-        _ => false,
+        _ => EmitResult::Stop,
     }
 }
 
@@ -556,4 +710,221 @@ fn emit_movn(builder: &mut FunctionBuilder, gpr: &mut [Value; 32], rs: usize, rt
     let zero = builder.ins().iconst(types::I64, 0);
     let is_nonzero = builder.ins().icmp(IntCC::NotEqual, gpr[rt], zero);
     gpr[rd] = builder.ins().select(is_nonzero, gpr[rs], gpr[rd]);
+}
+
+// ─── Load/Store emitters ─────────────────────────────────────────────────────
+
+/// Load width tag passed to emit_load so it applies the correct sign extension.
+#[derive(Clone, Copy)]
+enum LoadWidth { Byte, Half, Word, Double }
+
+/// Emit a load instruction. Calls the helper function, checks for exception,
+/// sign/zero-extends the result into the destination GPR.
+fn emit_load(
+    builder: &mut FunctionBuilder,
+    ctx_ptr: Value, exec_ptr: Value,
+    helper: FuncRef,
+    gpr: &mut [Value; 32],
+    rs: usize, rt: usize,
+    d: &DecodedInstr,
+    width: LoadWidth,
+    sign_extend: bool,
+    instr_pc: u64,
+) -> EmitResult {
+    let base = gpr[rs];
+    let offset = builder.ins().iconst(types::I64, d.imm as i32 as i64);
+    let virt_addr = builder.ins().iadd(base, offset);
+
+    // Store faulting PC to ctx BEFORE the helper call, so the dispatch loop
+    // knows which instruction caused the exception if one occurs.
+    let instr_pc_val = builder.ins().iconst(types::I64, instr_pc as i64);
+    builder.ins().store(MemFlags::trusted(), instr_pc_val, ctx_ptr,
+        ir::immediates::Offset32::new(JitContext::pc_offset()));
+
+    // Call helper: result = helper(ctx_ptr, exec_ptr, virt_addr)
+    let call = builder.ins().call(helper, &[ctx_ptr, exec_ptr, virt_addr]);
+    let raw_val = builder.inst_results(call)[0];
+
+    // Check ctx.exit_reason for exception.
+    // MUST use MemFlags::new() — helper may have written exit_reason through ctx_ptr.
+    let exit_reason = builder.ins().load(types::I32, MemFlags::new(), ctx_ptr,
+        ir::immediates::Offset32::new(JitContext::exit_reason_offset()));
+    let zero_i32 = builder.ins().iconst(types::I32, 0);
+    let is_exception = builder.ins().icmp(IntCC::NotEqual, exit_reason, zero_i32);
+
+    let ok_block = builder.create_block();
+    builder.append_block_param(ok_block, types::I64);
+    let exc_block = builder.create_block();
+    builder.ins().brif(is_exception, exc_block, &[], ok_block, &[raw_val]);
+
+    // Exception path: store all GPRs back to ctx so sync_to has current state
+    builder.switch_to_block(exc_block);
+    builder.seal_block(exc_block);
+    let mem = MemFlags::trusted();
+    for i in 1..32usize {
+        builder.ins().store(mem, gpr[i], ctx_ptr,
+            ir::immediates::Offset32::new(JitContext::gpr_offset(i)));
+    }
+    builder.ins().return_(&[]);
+
+    // Normal path — raw_val comes through as a block parameter
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
+    let val = builder.block_params(ok_block)[0];
+
+    // Apply correct sign/zero extension based on load width
+    gpr[rt] = match (width, sign_extend) {
+        (LoadWidth::Byte, true) => {
+            // i8 → i64: truncate to 8 bits, sign-extend
+            let narrow = builder.ins().ireduce(types::I8, val);
+            builder.ins().sextend(types::I64, narrow)
+        }
+        (LoadWidth::Half, true) => {
+            // i16 → i64: truncate to 16 bits, sign-extend
+            let narrow = builder.ins().ireduce(types::I16, val);
+            builder.ins().sextend(types::I64, narrow)
+        }
+        (LoadWidth::Word, true) => {
+            // i32 → i64: truncate to 32 bits, sign-extend
+            sext32(builder, val)
+        }
+        (_, false) | (LoadWidth::Double, _) => {
+            // Zero-extend or 64-bit: raw value is already correct
+            val
+        }
+    };
+
+    EmitResult::Ok
+}
+
+/// Emit a store instruction. Calls the helper function, checks for exception.
+fn emit_store(
+    builder: &mut FunctionBuilder,
+    ctx_ptr: Value, exec_ptr: Value,
+    helper: FuncRef,
+    gpr: &[Value; 32],
+    rs: usize, rt: usize,
+    d: &DecodedInstr,
+    instr_pc: u64,
+) -> EmitResult {
+    let base = gpr[rs];
+    let offset = builder.ins().iconst(types::I64, d.imm as i32 as i64);
+    let virt_addr = builder.ins().iadd(base, offset);
+    let value = gpr[rt];
+
+    // Store faulting PC before helper call
+    let instr_pc_val = builder.ins().iconst(types::I64, instr_pc as i64);
+    builder.ins().store(MemFlags::trusted(), instr_pc_val, ctx_ptr,
+        ir::immediates::Offset32::new(JitContext::pc_offset()));
+
+    let _call = builder.ins().call(helper, &[ctx_ptr, exec_ptr, virt_addr, value]);
+
+    // Check ctx.exit_reason — MUST use MemFlags::new()
+    let exit_reason = builder.ins().load(types::I32, MemFlags::new(), ctx_ptr,
+        ir::immediates::Offset32::new(JitContext::exit_reason_offset()));
+    let zero = builder.ins().iconst(types::I32, 0);
+    let is_exception = builder.ins().icmp(IntCC::NotEqual, exit_reason, zero);
+
+    let ok_block = builder.create_block();
+    let exc_block = builder.create_block();
+    builder.ins().brif(is_exception, exc_block, &[], ok_block, &[]);
+
+    // Exception path: store all GPRs back to ctx
+    builder.switch_to_block(exc_block);
+    builder.seal_block(exc_block);
+    let mem = MemFlags::trusted();
+    for i in 1..32usize {
+        builder.ins().store(mem, gpr[i], ctx_ptr,
+            ir::immediates::Offset32::new(JitContext::gpr_offset(i)));
+    }
+    builder.ins().return_(&[]);
+
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
+
+    EmitResult::Ok
+}
+
+// ─── Branch emitters ─────────────────────────────────────────────────────────
+// Branches compute the target PC and return EmitResult::Branch(target_value).
+// The compiled block stores this PC and returns. Delay slots are handled by
+// the dispatch loop (the next instruction after the branch is interpreted).
+
+fn emit_beq(
+    builder: &mut FunctionBuilder, gpr: &[Value; 32],
+    rs: usize, rt: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+) -> EmitResult {
+    let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
+    let not_taken_pc = instr_pc.wrapping_add(8); // skip delay slot
+    let taken = builder.ins().iconst(types::I64, taken_pc as i64);
+    let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
+    let cond = builder.ins().icmp(IntCC::Equal, gpr[rs], gpr[rt]);
+    let target = builder.ins().select(cond, taken, not_taken);
+    EmitResult::Branch(target)
+}
+
+fn emit_bne(
+    builder: &mut FunctionBuilder, gpr: &[Value; 32],
+    rs: usize, rt: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+) -> EmitResult {
+    let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
+    let not_taken_pc = instr_pc.wrapping_add(8);
+    let taken = builder.ins().iconst(types::I64, taken_pc as i64);
+    let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
+    let cond = builder.ins().icmp(IntCC::NotEqual, gpr[rs], gpr[rt]);
+    let target = builder.ins().select(cond, taken, not_taken);
+    EmitResult::Branch(target)
+}
+
+fn emit_blez(
+    builder: &mut FunctionBuilder, gpr: &[Value; 32],
+    rs: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+) -> EmitResult {
+    let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
+    let not_taken_pc = instr_pc.wrapping_add(8);
+    let taken = builder.ins().iconst(types::I64, taken_pc as i64);
+    let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let cond = builder.ins().icmp(IntCC::SignedLessThanOrEqual, gpr[rs], zero);
+    let target = builder.ins().select(cond, taken, not_taken);
+    EmitResult::Branch(target)
+}
+
+fn emit_bgtz(
+    builder: &mut FunctionBuilder, gpr: &[Value; 32],
+    rs: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+) -> EmitResult {
+    let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
+    let not_taken_pc = instr_pc.wrapping_add(8);
+    let taken = builder.ins().iconst(types::I64, taken_pc as i64);
+    let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let cond = builder.ins().icmp(IntCC::SignedGreaterThan, gpr[rs], zero);
+    let target = builder.ins().select(cond, taken, not_taken);
+    EmitResult::Branch(target)
+}
+
+fn emit_j(
+    builder: &mut FunctionBuilder, _gpr: &[Value; 32],
+    d: &DecodedInstr, instr_pc: u64,
+) -> EmitResult {
+    // Target = (PC+4)[63:28] | (target26 << 2) — but imm already has target26<<2 from decode
+    let region = instr_pc.wrapping_add(4) & 0xFFFF_FFFF_F000_0000;
+    let target_pc = region | (d.imm as u64);
+    let target = builder.ins().iconst(types::I64, target_pc as i64);
+    EmitResult::Branch(target)
+}
+
+fn emit_jal(
+    builder: &mut FunctionBuilder, gpr: &mut [Value; 32],
+    d: &DecodedInstr, instr_pc: u64,
+) -> EmitResult {
+    // JAL: $ra = PC + 8 (return address past delay slot)
+    let return_addr = instr_pc.wrapping_add(8);
+    gpr[31] = builder.ins().iconst(types::I64, return_addr as i64);
+
+    let region = instr_pc.wrapping_add(4) & 0xFFFF_FFFF_F000_0000;
+    let target_pc = region | (d.imm as u64);
+    let target = builder.ins().iconst(types::I64, target_pc as i64);
+    EmitResult::Branch(target)
 }

@@ -52,6 +52,12 @@ pub struct JitContext {
     // JIT dispatch state
     pub exit_reason: u32,
     pub block_instrs_executed: u32,
+
+    // Type-erased pointer to MipsExecutor — used by memory helper callouts
+    pub executor_ptr: u64,
+    // Exception status from failed memory access (set by helpers)
+    pub exception_status: u32,
+    _pad0: u32,
 }
 
 impl JitContext {
@@ -77,6 +83,9 @@ impl JitContext {
             local_cycles: 0,
             exit_reason: EXIT_NORMAL,
             block_instrs_executed: 0,
+            executor_ptr: 0,
+            exception_status: 0,
+            _pad0: 0,
         }
     }
 
@@ -90,6 +99,8 @@ impl JitContext {
     pub fn pc_offset() -> i32 { std::mem::offset_of!(JitContext, pc) as i32 }
     pub fn exit_reason_offset() -> i32 { std::mem::offset_of!(JitContext, exit_reason) as i32 }
     pub fn block_instrs_offset() -> i32 { std::mem::offset_of!(JitContext, block_instrs_executed) as i32 }
+    pub fn executor_ptr_offset() -> i32 { std::mem::offset_of!(JitContext, executor_ptr) as i32 }
+    pub fn exception_status_offset() -> i32 { std::mem::offset_of!(JitContext, exception_status) as i32 }
 
     /// Copy emulator state into JitContext.
     pub fn sync_from_executor<T: Tlb, C: MipsCache>(
@@ -117,27 +128,31 @@ impl JitContext {
     }
 
     /// Copy JitContext state back to the emulator.
+    ///
+    /// ONLY writes back fields that compiled blocks actually modify (GPRs, hi, lo, PC).
+    /// Fields managed by the interpreter or helpers (cp0_*, nanotlb, fpr) are NOT
+    /// written back — they're updated directly on the executor by helpers/interpreter.
     pub fn sync_to_executor<T: Tlb, C: MipsCache>(
         &self,
         exec: &mut MipsExecutor<T, C>,
     ) {
+        // These are modified by compiled code (stored in the block epilogue)
         exec.core.gpr = self.gpr;
         exec.core.pc = self.pc;
         exec.core.hi = self.hi;
         exec.core.lo = self.lo;
-        exec.core.fpr = self.fpr;
-        exec.core.fpu_fcsr = self.fpu_fcsr;
-        exec.core.cp0_status = self.cp0_status;
-        exec.core.cp0_cause = self.cp0_cause;
-        exec.core.cp0_epc = self.cp0_epc;
-        exec.core.cp0_count = self.cp0_count;
-        exec.core.cp0_compare = self.cp0_compare;
-        exec.core.count_step = self.count_step;
-        exec.core.cp0_badvaddr = self.cp0_badvaddr;
-        exec.core.nanotlb = self.nanotlb;
-        exec.in_delay_slot = self.in_delay_slot;
-        exec.delay_slot_target = self.delay_slot_target;
-        exec.cached_pending = self.cached_pending;
-        exec.local_cycles = self.local_cycles;
+
+        // Compiled blocks handle delay slots internally (the branch emitter
+        // computes the target, emits the delay slot, and sets the exit PC).
+        // Clear the interpreter's delay slot state so subsequent exec.step()
+        // calls don't jump to a stale target.
+        exec.in_delay_slot = false;
+        exec.delay_slot_target = 0;
+
+        // DO NOT write back: cp0_status, cp0_cause, cp0_epc, cp0_badvaddr,
+        // cp0_count, cp0_compare, count_step, nanotlb, fpr, fpu_fcsr —
+        // these are managed by the interpreter and memory helpers directly
+        // on the executor. Writing them back would clobber changes made by
+        // exception handlers and TLB fill operations.
     }
 }
