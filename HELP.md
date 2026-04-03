@@ -27,7 +27,7 @@ working.  Set it once from the PROM monitor before booting IRIX:
 2. At the `>>` prompt, set the address:
 
    ```
-   >> setenv eaddr -f 08:00:69:xx:xx:xx
+   >> setenv -f eaddr 08:00:69:xx:xx:xx
    ```
 
    Use any valid SGI MAC (OUI `08:00:69`) or any locally-administered address.
