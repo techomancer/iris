@@ -587,7 +587,6 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     local_cycles: u64,
     /// Cached external interrupt word — reloaded every 16 instructions.
     cached_pending: u64,
-    interrupt_check_counter: u8,
 }
 
 // ---- translate_fn wrappers (one per privilege × addressing-mode combination) ---------------
@@ -781,7 +780,6 @@ For R4000SC/MC CPUs:
             fpr_write_w: crate::mips_core::write_fpr_w_fr0,
             local_cycles: 0,
             cached_pending: 0,
-            interrupt_check_counter: 0,
         };
 
         executor.rebind_atomic_ptrs();
@@ -893,23 +891,22 @@ For R4000SC/MC CPUs:
     /// Flush local cycle counter to the shared atomic.
     #[inline(always)]
     pub fn flush_cycles(&mut self) {
-        if self.local_cycles > 0 {
-            unsafe { &*self.cycles_ptr }.fetch_add(self.local_cycles, Ordering::Relaxed);
-            self.local_cycles = 0;
-        }
+        unsafe { &*self.cycles_ptr }.store(self.local_cycles, Ordering::Relaxed);
     }
 
     pub fn step(&mut self) -> ExecStatus {
         // Increment local cycle counter (flushed to atomic by outer loop)
-        self.local_cycles += 1;
+        self.local_cycles = self.local_cycles.wrapping_add(1);
 
+        /*
         // Reload external interrupt state every 16 instructions
-        self.interrupt_check_counter = self.interrupt_check_counter.wrapping_sub(1);
-        if self.interrupt_check_counter == 0 {
-            self.interrupt_check_counter = 16;
+        if self.local_cycles & 0xF == 0 {
             self.cached_pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
         }
         let pending = self.cached_pending;
+        */
+        // this seems to be a wash or slightly better without a branch, relaxed atomic loads are essentially MOV
+        let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
 
         let pc = self.core.pc;
         #[cfg(not(feature = "lightning"))]
