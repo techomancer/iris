@@ -337,25 +337,28 @@ impl Seeq8003 {
             dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: in reset, dropping frame");
             return RxPumpResult::Nothing;
         }
-        let frame = match rx_cons.pop() {
+        let frame = match rx_cons.peek() {
             Ok(f) => f,
             Err(_) => return RxPumpResult::Nothing,
         };
 
         dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: got frame {} bytes", frame.len());
 
-        if !Self::address_filter(rx_cmd_snap, &station_addr_snap, &frame) {
-            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: address filter dropped {}", eth_summary(&frame));
+        if !Self::address_filter(rx_cmd_snap, &station_addr_snap, frame) {
+            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: address filter dropped {}", eth_summary(frame));
+            let _ = rx_cons.pop(); // discard filtered frame
             return RxPumpResult::Nothing;
         }
 
-        dlog_dev!(LogModule::Seeq, "SEEQ RX {} → guest DMA", eth_summary(&frame));
+        dlog_dev!(LogModule::Seeq, "SEEQ RX {} → guest DMA", eth_summary(frame));
 
         let (dst, _) = rx_dma.write(0, false); // pad[0]
         if dst.refused() {
-            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: DMA not ready ({:#x}), frame LOST: {}", dst.0, eth_summary(&frame));
-            return RxPumpResult::Refused;
+            dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: DMA not ready ({:#x}), will retry: {}", dst.0, eth_summary(frame));
+            return RxPumpResult::Refused; // frame stays in rx_cons for next iteration
         }
+        // DMA is committed (pad[0] written); pop the frame now and finish writing it.
+        let frame = rx_cons.pop().expect("peek succeeded so pop must succeed");
         let _ = rx_dma.write(0, false); // pad[1]
         for b in &frame {
             let _ = rx_dma.write(*b as u32, false);
@@ -628,7 +631,7 @@ impl Device for Seeq8003 {
                         dma_irq |= irq;
                     }
                     RxPumpResult::Refused => {
-                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX DMA refused", st.ts);
+                        dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ RX DMA refused, retrying next tick", st.ts);
                     }
                     RxPumpResult::Nothing => {}
                 }

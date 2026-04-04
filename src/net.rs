@@ -450,6 +450,9 @@ pub struct NatEngine {
     tcp_tw:    HashMap<(u32, u16, u16), Instant>,  // TIME_WAIT: absorb final ACKs silently
     icmp_nat:  HashMap<(u32, u16), NatIcmpEntry>,  // key: (dst_ip, identifier)
     icmp_unavailable: bool,  // true after first failed raw socket creation (Windows non-admin)
+    // Replies generated while draining TX frames are deferred to the next loop iteration
+    // so they don't race with the TX completion interrupt in IRIX's interrupt handler.
+    deferred_rx: Vec<Vec<u8>>,
 }
 
 impl NatEngine {
@@ -462,7 +465,7 @@ impl NatEngine {
                ctl:     Arc<NatControl>) -> Self {
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
-               icmp_nat: HashMap::new(), icmp_unavailable: false }
+               icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new() }
     }
 
     pub fn run(&mut self) {
@@ -472,7 +475,7 @@ impl NatEngine {
             {
                 let (lock, cvar) = &*self.tx_wake;
                 let mut guard = lock.lock();
-                let _ = cvar.wait_for(&mut guard, Duration::from_millis(10));
+                let _ = cvar.wait_for(&mut guard, Duration::from_millis(1));
             }
 
             // Machine reset: flush all NAT tables, close all host sockets.
@@ -481,6 +484,26 @@ impl NatEngine {
                 self.tcp_tw.clear();
                 self.udp_nat.clear();  // drops all UdpSockets
                 self.icmp_nat.clear(); // drops all ICMP raw sockets
+            }
+
+            // FIXME: investigate interrupt race between TX completion and RX delivery.
+            // When a gateway reply (e.g. ICMP echo) is generated synchronously while
+            // draining TX frames, it can arrive at IRIX while the TX completion interrupt
+            // handler is still running. IRIX writes CLRINT which clears *all* pending
+            // interrupts, silently dropping the RX interrupt. Deferring to the next loop
+            // iteration (after the tx_wake wait) gives IRIX time to exit the TX handler
+            // before we signal RX. This masks the symptom but the root cause — whether
+            // IRIX's driver should re-check for new RX after CLRINT, or whether we should
+            // hold the RX interrupt line asserted until explicitly cleared — is unclear.
+            // Flush replies deferred from the previous iteration; stop if ring is full.
+            let pending = std::mem::take(&mut self.deferred_rx);
+            for frame in pending {
+                if self.rx_prod.slots() == 0 {
+                    self.deferred_rx.push(frame);
+                } else {
+                    let _ = self.rx_prod.push(frame);
+                    self.rx_wake.1.notify_one();
+                }
             }
 
             // Drain all pending outbound frames
@@ -620,7 +643,7 @@ impl NatEngine {
             let c = ip_checksum(&icmp); w16(&mut icmp, 2, c);
             let frame = ip_frame(src_mac, &self.config.gateway_mac,
                                  self.config.gateway_ip, src_ip, IP_PROTO_ICMP, &icmp);
-            self.enqueue_rx(frame);
+            self.deferred_rx.push(frame);
             return;
         }
 
