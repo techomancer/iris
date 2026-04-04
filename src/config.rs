@@ -16,6 +16,26 @@ pub struct ScsiDeviceConfig {
     pub cdrom: bool,
 }
 
+/// NFS share configuration (requires unfsd on the host).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NfsConfig {
+    /// Directory to export over NFS.
+    pub shared_dir: String,
+    /// Path to the unfsd binary [default: "unfsd"].
+    #[serde(default = "default_unfsd")]
+    pub unfsd: String,
+    /// Host-side port unfsd listens on for NFS (high port, NAT'd to 2049 inside the VM).
+    #[serde(default = "default_nfs_host_port")]
+    pub nfs_host_port: u16,
+    /// Host-side port unfsd listens on for mountd (high port, NAT'd to 1234 inside the VM).
+    #[serde(default = "default_mountd_host_port")]
+    pub mountd_host_port: u16,
+}
+
+fn default_unfsd()          -> String { "unfsd".to_string() }
+fn default_nfs_host_port()  -> u16    { 12049 }
+fn default_mountd_host_port() -> u16  { 11234 }
+
 /// Top-level machine configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
@@ -34,6 +54,10 @@ pub struct MachineConfig {
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
     pub scale: u32,
+
+    /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
+    #[serde(default)]
+    pub nfs: Option<NfsConfig>,
 }
 
 fn default_prom() -> String {
@@ -68,6 +92,7 @@ impl Default for MachineConfig {
             banks: default_banks(),
             scsi: default_scsi(),
             scale: default_scale(),
+            nfs: None,
         }
     }
 }
@@ -192,6 +217,22 @@ pub struct Cli {
     /// 2× window scaling for HiDPI/4K monitors
     #[arg(long = "2x", default_value_t = false)]
     pub scale2x: bool,
+
+    /// Enable NFS share: path to the directory to export (enables NFS)
+    #[arg(long = "nfs-dir", value_name = "DIR")]
+    pub nfs_dir: Option<String>,
+
+    /// Path to unfsd binary [default: unfsd]
+    #[arg(long = "unfsd", value_name = "PATH")]
+    pub unfsd: Option<String>,
+
+    /// Host port for unfsd NFS listener [default: 12049]
+    #[arg(long = "nfs-port", value_name = "PORT")]
+    pub nfs_host_port: Option<u16>,
+
+    /// Host port for unfsd mountd listener [default: 11234]
+    #[arg(long = "mountd-port", value_name = "PORT")]
+    pub mountd_host_port: Option<u16>,
 }
 
 impl Cli {
@@ -227,6 +268,22 @@ impl Cli {
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
         if self.scale2x { cfg.scale = 2; }
+
+        // NFS: --nfs-dir enables NFS; other flags refine an existing [nfs] section or the defaults.
+        if let Some(dir) = &self.nfs_dir {
+            let base = cfg.nfs.get_or_insert_with(|| NfsConfig {
+                shared_dir:       dir.clone(),
+                unfsd:            default_unfsd(),
+                nfs_host_port:    default_nfs_host_port(),
+                mountd_host_port: default_mountd_host_port(),
+            });
+            base.shared_dir = dir.clone();
+        }
+        if let Some(ref mut nfs) = cfg.nfs {
+            if let Some(p) = &self.unfsd           { nfs.unfsd            = p.clone(); }
+            if let Some(p) = self.nfs_host_port    { nfs.nfs_host_port    = p; }
+            if let Some(p) = self.mountd_host_port { nfs.mountd_host_port = p; }
+        }
 
         cfg
     }

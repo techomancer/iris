@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use crate::config::NfsConfig;
 use crate::devlog::LogModule;
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -28,7 +29,18 @@ const ARP_OP_REPLY:   u16       = 2;
 const UDP_PORT_BOOTP_SERVER: u16 = 67;
 const UDP_PORT_BOOTP_CLIENT: u16 = 68;
 const UDP_PORT_DNS:          u16 = 53;
+const UDP_PORT_PORTMAP:      u16 = 111;
 const BOOTP_OP_REQUEST: u8      = 1;
+
+// NFS-visible ports (what IRIX thinks the server is on)
+const NFS_VM_PORT:    u16 = 2049;
+const MOUNTD_VM_PORT: u16 = 1234;
+
+// RPC program numbers
+const RPC_PROG_PORTMAP:  u32 = 100000;
+const RPC_PROG_NFS:      u32 = 100003;
+const RPC_PROG_MOUNTD:   u32 = 100005;
+const RPC_PORTMAP_GETPORT: u32 = 3;
 
 // ── Gateway configuration ─────────────────────────────────────────────────────
 #[derive(Clone)]
@@ -38,6 +50,8 @@ pub struct GatewayConfig {
     pub client_ip:   Ipv4Addr,
     pub netmask:     Ipv4Addr,
     pub dns_upstream: SocketAddr,
+    /// NFS configuration; if Some, portmap and NAT redirection for NFS/mountd are enabled.
+    pub nfs: Option<NfsConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -48,6 +62,7 @@ impl Default for GatewayConfig {
             client_ip:   Ipv4Addr::new(192, 168, 0, 2),
             netmask:     Ipv4Addr::new(255, 255, 255, 0),
             dns_upstream: "8.8.8.8:53".parse().unwrap(),
+            nfs: None,
         }
     }
 }
@@ -211,9 +226,8 @@ fn log_eth_frame(dir: &str, frame: &[u8]) {
               sport, dport, flags_str(flags), seq, ack, win, tcp[12], tcp.len(), plen);
     if plen > 0 && doff <= tcp.len() {
         let data = &tcp[doff..];
-        eprint!("     data:");
-        for b in data { eprint!(" {:02x}", b); }
-        dlog_dev!(LogModule::Net, "");
+        let hex: String = data.iter().map(|b| format!(" {:02x}", b)).collect();
+        dlog_dev!(LogModule::Net, "     data:{}", hex);
     }
 }
 
@@ -314,6 +328,49 @@ fn parse_dhcp_type(opts: &[u8]) -> Option<u8> {
         i += 2 + len;
     }
     None
+}
+
+// ── Portmap helpers ───────────────────────────────────────────────────────────
+
+/// Parse an RPC GETPORT request and return the VM-visible port, or 0 if unknown.
+fn portmap_lookup(payload: &[u8], nfs: &NfsConfig) -> u32 {
+    // Need at least 14 u32s = 56 bytes for a well-formed GETPORT call.
+    if payload.len() < 56 { return 0; }
+    let msg_type = r32(payload,  4);
+    let rpcvers  = r32(payload,  8);
+    let prog     = r32(payload, 12);
+    let proc_num = r32(payload, 20);
+    if msg_type != 0 || rpcvers != 2 { return 0; }
+    if prog != RPC_PROG_PORTMAP { return 0; }
+    if proc_num != RPC_PORTMAP_GETPORT { return 0; }
+    // cred: [24]=flavor [28]=len; verf: [32]=flavor [36]=len  (both len=0)
+    let cred_len = r32(payload, 28) as usize;
+    let verf_off = 32 + cred_len;
+    if payload.len() < verf_off + 8 + 16 { return 0; }
+    let verf_len = r32(payload, verf_off + 4) as usize;
+    let args_off = verf_off + 8 + verf_len;
+    if payload.len() < args_off + 16 { return 0; }
+    let req_prog = r32(payload, args_off);
+    let _ = nfs;
+    match req_prog {
+        RPC_PROG_NFS    => NFS_VM_PORT as u32,
+        RPC_PROG_MOUNTD => MOUNTD_VM_PORT as u32,
+        RPC_PROG_PORTMAP => UDP_PORT_PORTMAP as u32,
+        _ => 0,
+    }
+}
+
+/// Build an RPC PORTMAP GETPORT reply with the given xid and port value.
+fn portmap_reply(xid: u32, port: u32) -> Vec<u8> {
+    let mut r = vec![0u8; 28];
+    w32(&mut r,  0, xid);
+    w32(&mut r,  4, 1);    // REPLY
+    w32(&mut r,  8, 0);    // MSG_ACCEPTED
+    w32(&mut r, 12, 0);    // verf_flavor = AUTH_NULL
+    w32(&mut r, 16, 0);    // verf_len = 0
+    w32(&mut r, 20, 0);    // accept_stat = SUCCESS
+    w32(&mut r, 24, port);
+    r
 }
 
 // ── NAT debug/status control (shared between NatEngine thread and command handler) ─
@@ -712,8 +769,14 @@ impl NatEngine {
         dlog_dev!(LogModule::Net, "NAT UDP {}:{} → {}:{}", src_ip, sport, dst_ip, dport);
         match dport {
             UDP_PORT_BOOTP_SERVER => self.handle_bootp(src_mac, sport, payload),
-            UDP_PORT_DNS => self.forward_dns(src_mac, src_ip, sport, payload),
-            _ => self.nat_udp(src_mac, src_ip, dst_ip, sport, dport, payload),
+            UDP_PORT_DNS          => self.forward_dns(src_mac, src_ip, sport, payload),
+            UDP_PORT_PORTMAP if self.config.nfs.is_some()
+                              => self.handle_portmap_udp(src_mac, src_ip, sport, payload),
+            _ => {
+                // NFS/mountd: rewrite destination to localhost high port before NAT.
+                let real_dst = self.nfs_remap_dst(dst_ip, dport);
+                self.nat_udp(src_mac, src_ip, real_dst.0, sport, real_dst.1, payload);
+            }
         }
     }
 
@@ -792,6 +855,112 @@ impl NatEngine {
         }
     }
 
+    // ── NFS destination remapping ─────────────────────────────────────────────
+    //
+    // IRIX talks to 192.168.0.1 on VM-visible NFS/mountd ports.  Rewrite the
+    // destination to 127.0.0.1 on the high host-side ports where unfsd listens.
+    fn nfs_remap_dst(&self, dst_ip: Ipv4Addr, dport: u16) -> (Ipv4Addr, u16) {
+        let Some(nfs) = &self.config.nfs else { return (dst_ip, dport); };
+        if dst_ip != self.config.gateway_ip { return (dst_ip, dport); }
+        match dport {
+            NFS_VM_PORT    => (Ipv4Addr::LOCALHOST, nfs.nfs_host_port),
+            MOUNTD_VM_PORT => (Ipv4Addr::LOCALHOST, nfs.mountd_host_port),
+            _              => (dst_ip, dport),
+        }
+    }
+
+    // Reverse: translate (127.0.0.1, host_port) back to (192.168.0.1, vm_port)
+    // so replies to IRIX appear to come from the gateway on the standard NFS ports.
+    fn nfs_unmap_src(&self, src_ip: Ipv4Addr, sport: u16) -> (Ipv4Addr, u16) {
+        let Some(nfs) = &self.config.nfs else { return (src_ip, sport); };
+        if src_ip != Ipv4Addr::LOCALHOST { return (src_ip, sport); }
+        if sport == nfs.nfs_host_port    { return (self.config.gateway_ip, NFS_VM_PORT);    }
+        if sport == nfs.mountd_host_port { return (self.config.gateway_ip, MOUNTD_VM_PORT); }
+        (src_ip, sport)
+    }
+
+    // ── Portmap (port 111) — tiny inline RPC GETPORT responder ───────────────
+    //
+    // Parses an RPC GETPORT request (XDR) and replies with the VM-visible port
+    // for the requested program.  We only answer GETPORT calls; everything else
+    // gets a null reply with port=0.
+    //
+    // XDR layout of a GETPORT call (big-endian u32s):
+    //   [0]  xid
+    //   [1]  msg_type  = 0 (CALL)
+    //   [2]  rpcvers   = 2
+    //   [3]  prog      = 100000 (PORTMAP)
+    //   [4]  vers      = 2
+    //   [5]  proc      = 3 (GETPORT)
+    //   [6]  cred_flavor, [7] cred_len=0, [8] verf_flavor, [9] verf_len=0
+    //   [10] prog_to_query
+    //   [11] vers_to_query
+    //   [12] protocol (6=TCP / 17=UDP)
+    //   [13] port (ignored in request)
+    //
+    // Reply layout:
+    //   [0] xid  [1] 1 (REPLY)  [2] 0 (MSG_ACCEPTED)
+    //   [3] verf_flavor=0  [4] verf_len=0  [5] accept_stat=0 (SUCCESS)
+    //   [6] port
+    fn handle_portmap_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                          client_port: u16, payload: &[u8]) {
+        let Some(nfs) = self.config.nfs.clone() else { return };
+        let port = portmap_lookup(payload, &nfs);
+        let xid = if payload.len() >= 4 { r32(payload, 0) } else { 0 };
+        dlog_dev!(LogModule::Net, "NAT portmap UDP from {}:{} xid={:#010x} → port={}", client_ip, client_port, xid, port);
+        let reply = portmap_reply(xid, port);
+        let udp = udp_packet(self.config.gateway_ip, client_ip, UDP_PORT_PORTMAP, client_port, &reply);
+        let frame = ip_frame(client_mac, &self.config.gateway_mac,
+                             self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
+        self.enqueue_rx(frame);
+    }
+
+    // ── Portmap TCP — send a complete RPC record-marked reply then RST ────────
+    //
+    // TCP RPC wraps each message in a 4-byte record mark: high bit set + 3-byte length.
+    // We handle the full exchange in one shot: parse the first record from the SYN payload
+    // (or from the first data segment after the SYN), reply, and RST the connection so
+    // IRIX doesn't linger.  In practice mount sends a single GETPORT then closes anyway.
+    fn handle_portmap_tcp_data(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                               client_port: u16, client_seq: u32, payload: &[u8]) {
+        let Some(nfs) = self.config.nfs.clone() else { return };
+        // Strip the 4-byte record mark if present.
+        let rpc = if payload.len() >= 4 && (payload[0] & 0x80) != 0 {
+            &payload[4..]
+        } else {
+            payload
+        };
+        let port = portmap_lookup(rpc, &nfs);
+        let xid = if rpc.len() >= 4 { r32(rpc, 0) } else { 0 };
+        dlog_dev!(LogModule::Net, "NAT portmap TCP from {}:{} xid={:#010x} → port={}", client_ip, client_port, xid, port);
+        let rpc_reply = portmap_reply(xid, port);
+        // Wrap in record mark (last fragment, bit 31 set).
+        let rm_len = rpc_reply.len() as u32 | 0x8000_0000;
+        let mut body = vec![0u8; 4 + rpc_reply.len()];
+        w32(&mut body, 0, rm_len);
+        body[4..].copy_from_slice(&rpc_reply);
+
+        let gw   = self.config.gateway_ip;
+        let gmac = self.config.gateway_mac;
+        // SYN-ACK
+        let server_isn = 0x5000_0000u32;
+        let seg = tcp_segment(gw, client_ip, UDP_PORT_PORTMAP, client_port,
+                              server_isn, client_seq, 0x12, &[]);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+        // Data + PSH+ACK
+        let seg = tcp_segment(gw, client_ip, UDP_PORT_PORTMAP, client_port,
+                              server_isn.wrapping_add(1), client_seq, 0x18, &body);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+        // FIN+ACK
+        let seg = tcp_segment(gw, client_ip, UDP_PORT_PORTMAP, client_port,
+                              server_isn.wrapping_add(1 + body.len() as u32),
+                              client_seq, 0x11, &[]);
+        let frame = ip_frame(client_mac, &gmac, gw, client_ip, IP_PROTO_TCP, &seg);
+        self.enqueue_rx(frame);
+    }
+
     // ── UDP NAT ───────────────────────────────────────────────────────────────
     fn nat_udp(&mut self, client_mac: &[u8; 6], src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
                sport: u16, dport: u16, payload: &[u8]) {
@@ -827,12 +996,14 @@ impl NatEngine {
         for (data, key) in responses {
             let (dst_ip_u32, dst_port, client_port) = key;
             if let Some(entry) = self.udp_nat.get(&key) {
-                let remote_ip = Ipv4Addr::from(dst_ip_u32);
-                let udp = udp_packet(remote_ip, entry.client_ip, dst_port, client_port, &data);
+                // Reverse-map localhost high port back to gateway VM-visible port.
+                let (reply_ip, reply_port) = self.nfs_unmap_src(Ipv4Addr::from(dst_ip_u32), dst_port);
+                dlog_dev!(LogModule::Net, "NAT UDP reply → IRIX: {}:{} → {}:{} len={}", reply_ip, reply_port, entry.client_ip, client_port, data.len());
+                let udp = udp_packet(reply_ip, entry.client_ip, reply_port, client_port, &data);
                 let client_mac = entry.client_mac;
                 let client_ip = entry.client_ip;
                 let frame = ip_frame(&client_mac, &self.config.gateway_mac,
-                                     remote_ip, client_ip, IP_PROTO_UDP, &udp);
+                                     reply_ip, client_ip, IP_PROTO_UDP, &udp);
                 self.enqueue_rx(frame);
             }
         }
@@ -853,11 +1024,33 @@ impl NatEngine {
         let fin      = flags & 0x01 != 0;
         let rst      = flags & 0x04 != 0;
 
+        // Intercept portmap TCP (port 111) — handle inline, never hits the NAT table.
+        if dport == UDP_PORT_PORTMAP && self.config.nfs.is_some() {
+            if syn && !ack {
+                // SYN only — IRIX will send data in the next segment; we respond
+                // with SYN-ACK and wait for the data segment to arrive.
+                let gw   = self.config.gateway_ip;
+                let gmac = self.config.gateway_mac;
+                let server_isn = 0x5000_0000u32;
+                let seg = tcp_segment(gw, src_ip, UDP_PORT_PORTMAP, sport,
+                                      server_isn, seq.wrapping_add(1), 0x12, &[]);
+                let frame = ip_frame(client_mac, &gmac, gw, src_ip, IP_PROTO_TCP, &seg);
+                self.enqueue_rx(frame);
+            } else if !payload.is_empty() {
+                self.handle_portmap_tcp_data(client_mac, src_ip, sport, seq.wrapping_add(payload.len() as u32), payload);
+            }
+            return;
+        }
+
+        // NFS/mountd: rewrite destination to localhost high port.
+        let (dst_ip, dport) = self.nfs_remap_dst(dst_ip, dport);
 
         let key = (u32::from(dst_ip), dport, sport);
 
         if syn && !ack {
             dlog_dev!(LogModule::Net, "NAT TCP connect {}:{} → {}:{}", src_ip, sport, dst_ip, dport);
+            // visible_ip is the address IRIX sees as the remote end (gateway for NFS, dst otherwise).
+            let (visible_ip, _) = self.nfs_unmap_src(dst_ip, dport);
             let dest = SocketAddr::new(IpAddr::V4(dst_ip), dport);
             match TcpStream::connect_timeout(&dest, Duration::from_secs(5)) {
                 Ok(stream) => {
@@ -866,7 +1059,7 @@ impl NatEngine {
                     dlog_dev!(LogModule::Net, "NAT TCP connected {}:{} → {}:{}", src_ip, sport, dst_ip, dport);
                     self.tcp_nat.insert(key, NatTcpEntry {
                         stream, client_mac: *client_mac, client_ip: src_ip,
-                        client_port: sport, server_ip: dst_ip,
+                        client_port: sport, server_ip: visible_ip,
                         server_seq: server_seq.wrapping_add(1),
                         server_seq_acked: server_seq.wrapping_add(1),
                         client_win: r16(tcp, 14) as u32,
@@ -876,18 +1069,18 @@ impl NatEngine {
                         server_fin: false,
                         retransmit: VecDeque::new(),
                     });
-                    let seg = tcp_segment(dst_ip, src_ip, dport, sport,
+                    let seg = tcp_segment(visible_ip, src_ip, dport, sport,
                                          server_seq, seq.wrapping_add(1), 0x12, &[]);
                     let frame = ip_frame(client_mac, &self.config.gateway_mac,
-                                        dst_ip, src_ip, IP_PROTO_TCP, &seg);
+                                        visible_ip, src_ip, IP_PROTO_TCP, &seg);
                     self.enqueue_rx(frame);
                 }
                 Err(e) => {
                     dlog_dev!(LogModule::Net, "NAT TCP connect {}:{} failed: {}", dst_ip, dport, e);
-                    let seg = tcp_segment(dst_ip, src_ip, dport, sport,
+                    let seg = tcp_segment(visible_ip, src_ip, dport, sport,
                                          0, seq.wrapping_add(1), 0x14, &[]);
                     let frame = ip_frame(client_mac, &self.config.gateway_mac,
-                                        dst_ip, src_ip, IP_PROTO_TCP, &seg);
+                                        visible_ip, src_ip, IP_PROTO_TCP, &seg);
                     self.enqueue_rx(frame);
                 }
             }

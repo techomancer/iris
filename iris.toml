@@ -32,6 +32,12 @@ cdrom  = false
 path   = "scsi2.raw"
 cdrom  = false
 
+# NFS share — requires unfsd on the host.
+# The shared directory is exported to the VM at 192.168.0.1:/path (standard NFS port 2049).
+# From IRIX: mount 192.168.0.1:/absolute/path /mnt
+[nfs]
+shared_dir = "./shared"
+
 # Internal CD-ROM.
 # For a single disc, set path only.
 # For a changer (cycled with "scsi eject 4" in the monitor), list all

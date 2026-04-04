@@ -6,9 +6,11 @@ use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusStatus, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
+use crate::config::NfsConfig;
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::Ioc;
 use crate::ds1x86::Ds1x86;
+use crate::net::GatewayConfig;
 use crate::seeq8003::{Seeq8003, SeeqCallback};
 use crate::wd33c93a::{Wd33c93a, ScsiCallback};
 use crate::ioc::IocInterrupt;
@@ -962,6 +964,10 @@ pub struct Hpc3 {
 
 impl Hpc3 {
     pub fn new(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>) -> Self {
+        Self::with_nfs(eeprom, ioc, guinness, heartbeat, None)
+    }
+
+    pub fn with_nfs(eeprom: Arc<Mutex<Eeprom93c56>>, ioc: Ioc, guinness: bool, heartbeat: Arc<AtomicU64>, nfs: Option<NfsConfig>) -> Self {
         let rtc = Arc::new(Ds1x86::new(8192));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1018,7 +1024,8 @@ impl Hpc3 {
             hpc3_state: state.clone(),
             ioc:        ioc.clone(),
         });
-        let seeq = Arc::new(Seeq8003::new(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), heartbeat.clone()));
+        let gateway_cfg = GatewayConfig { nfs, ..GatewayConfig::default() };
+        let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());
         

@@ -1,5 +1,6 @@
 ignore/
 target/
+shared/
 .mcp.json
 launch.json
 tasks.json
