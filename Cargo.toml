@@ -47,6 +47,7 @@ libc = "0.2"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = 1
 
 # Developer profile: release optimizations + debug symbols. Default build target.
 # Enables the "developer" feature flag for dev-only tooling.

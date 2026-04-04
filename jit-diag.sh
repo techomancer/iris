@@ -33,9 +33,25 @@ case "$MODE" in
     echo "Running: cargo run --release --features lightning (no jit feature)" | tee -a "$OUTFILE"
     cargo run --release --features lightning 2>&1 | tee -a "$OUTFILE"
     ;;
+  flamegraph)
+    DURATION="${2:-30}"
+    OUTSVG="flamegraph-$(date +%Y%m%d-%H%M%S).svg"
+    echo "Running: cargo flamegraph --features lightning (${DURATION}s, no jit feature)" | tee -a "$OUTFILE"
+    echo "Output SVG: $OUTSVG" | tee -a "$OUTFILE"
+    timeout "$DURATION" cargo flamegraph --release --features lightning --output "$OUTSVG" 2>&1 | tee -a "$OUTFILE"
+    echo "Flamegraph saved to: $OUTSVG"
+    ;;
+  flamegraph-jit)
+    DURATION="${2:-30}"
+    OUTSVG="flamegraph-jit-$(date +%Y%m%d-%H%M%S).svg"
+    echo "Running: IRIS_JIT=1 cargo flamegraph --features jit,lightning (${DURATION}s)" | tee -a "$OUTFILE"
+    echo "Output SVG: $OUTSVG" | tee -a "$OUTFILE"
+    IRIS_JIT=1 timeout "$DURATION" cargo flamegraph --release --features jit,lightning --output "$OUTSVG" 2>&1 | tee -a "$OUTFILE"
+    echo "Flamegraph saved to: $OUTSVG"
+    ;;
   *)
     echo "Unknown mode: $MODE"
-    echo "Usage: $0 [jit|verify|nojit|interp]"
+    echo "Usage: $0 [jit|verify|nojit|interp|flamegraph [seconds]|flamegraph-jit [seconds]]"
     exit 1
     ;;
 esac
