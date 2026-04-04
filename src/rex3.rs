@@ -1743,7 +1743,7 @@ impl Rex3 {
     /// Non-dither compress variants ignore these bits.
     #[inline(always)]
     fn bayer_pack(color: u32, x: i32, y: i32) -> u32 {
-        color | (((y as u32 & 3) << 2 | (x as u32 & 3)) << 24)
+        (color & 0x00FFFFFF) | (((y as u32 & 3) << 2 | (x as u32 & 3)) << 24)
     }
 
     fn rgb24_to_rgb4_dither(val: u32) -> u32 {
