@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 use std::thread;
 use std::io::Write as IoWrite;
-use crate::traits::{BusStatus, Device, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::devlog::LogModule;
 
@@ -555,30 +555,30 @@ impl Z85c30 {
         ip_a | ip_b
     }
 
-    pub fn read(&self, addr: u32) -> BusStatus {
+    pub fn read(&self, addr: u32) -> BusRead8 {
         let val = match addr {
-            0 => BusStatus::Data8(self.read_b_control()),
-            1 => BusStatus::Data8(self.read_b_data()),
-            2 => BusStatus::Data8(self.read_a_control()),
-            3 => BusStatus::Data8(self.read_a_data()),
-            _ => BusStatus::Error,
+            0 => BusRead8::ok(self.read_b_control()),
+            1 => BusRead8::ok(self.read_b_data()),
+            2 => BusRead8::ok(self.read_a_control()),
+            3 => BusRead8::ok(self.read_a_data()),
+            _ => BusRead8::err(),
         };
-        if let BusStatus::Data8(v) = val {
-            crate::dlog_dev!(LogModule::Scc, "SCC({}): Read Reg {} -> {:02x}", if (addr & 2) != 0 { "A" } else { "B" }, addr, v);
+        if val.is_ok() {
+            crate::dlog_dev!(LogModule::Scc, "SCC({}): Read Reg {} -> {:02x}", if (addr & 2) != 0 { "A" } else { "B" }, addr, val.data);
         }
         val
     }
 
-    pub fn write(&self, addr: u32, val: u8) -> BusStatus {
+    pub fn write(&self, addr: u32, val: u8) -> u32 {
         crate::dlog_dev!(LogModule::Scc, "SCC({}): Write Reg {} = {:02x}", if (addr & 2) != 0 { "A" } else { "B" }, addr, val);
         match addr {
             0 => self.write_b_control(val),
             1 => self.write_b_data(val),
             2 => self.write_a_control(val),
             3 => self.write_a_data(val),
-            _ => return BusStatus::Error,
+            _ => return BUS_ERR,
         }
-        BusStatus::Ready
+        BUS_OK
     }
     pub fn register_locks(&self) {
         use crate::locks::register_lock_fn;

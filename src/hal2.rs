@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
-use crate::traits::{BusStatus, Device, DmaClient};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{RingBuffer, Producer};
@@ -855,7 +855,7 @@ impl Hal2 {
         }
     }
 
-    pub fn read(&self, addr: u32) -> BusStatus {
+    pub fn read(&self, addr: u32) -> BusRead16 {
         let offset = addr & 0xFF;
         let state = self.state.lock();
 
@@ -871,10 +871,10 @@ impl Hal2 {
         };
 
         dlog_dev!(LogModule::Hal2, "HAL2: Read offset {:02x} -> {:04x}", offset, val);
-        BusStatus::Data16(val)
+        BusRead16::ok(val)
     }
 
-    pub fn write(&self, addr: u32, val: u16) -> BusStatus {
+    pub fn write(&self, addr: u32, val: u16) -> u32 {
         let offset = addr & 0xFF;
 
         dlog_dev!(LogModule::Hal2, "HAL2: Write offset {:02x} <- {:04x}", offset, val);
@@ -920,7 +920,7 @@ impl Hal2 {
             HAL2_IDR3 => self.state.lock().idr[3] = val,
             _ => {}
         }
-        BusStatus::Ready
+        BUS_OK
     }
 
     pub fn register_locks(self: &Arc<Self>) {

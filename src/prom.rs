@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 
-use crate::traits::{BusStatus, BusDevice, Device};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
 
 const PROM_BASE: u32 = 0x1FC00000;
 const PROM_SIZE: u32 = 1024 * 1024; // 1MB
@@ -100,11 +100,11 @@ impl Device for Prom {
 }
 
 impl BusDevice for PromPort {
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
-            return BusStatus::Data8(0xFF);
+            return BusRead8::ok(0xFF);
         }
 
         let offset = (addr - PROM_BASE) as usize;
@@ -114,22 +114,22 @@ impl BusDevice for PromPort {
         if word_index < self.inner.data.len() {
             let word = self.inner.data[word_index];
             let byte = ((word >> (24 - byte_offset * 8)) & 0xFF) as u8;
-            BusStatus::Data8(byte)
+            BusRead8::ok(byte)
         } else {
-            BusStatus::Data8(0xFF)
+            BusRead8::ok(0xFF)
         }
     }
 
-    fn write8(&self, _addr: u32, _val: u8) -> BusStatus {
+    fn write8(&self, _addr: u32, _val: u8) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read16(&self, addr: u32) -> BusStatus {
+    fn read16(&self, addr: u32) -> BusRead16 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
-            return BusStatus::Data16(0xFFFF);
+            return BusRead16::ok(0xFFFF);
         }
 
         let offset = (addr - PROM_BASE) as usize;
@@ -139,58 +139,52 @@ impl BusDevice for PromPort {
         if word_index < self.inner.data.len() {
             let word = self.inner.data[word_index];
             let halfword = ((word >> (16 - byte_offset * 8)) & 0xFFFF) as u16;
-            BusStatus::Data16(halfword)
+            BusRead16::ok(halfword)
         } else {
-            BusStatus::Data16(0xFFFF)
+            BusRead16::ok(0xFFFF)
         }
     }
 
-    fn write16(&self, _addr: u32, _val: u16) -> BusStatus {
+    fn write16(&self, _addr: u32, _val: u16) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         if addr < PROM_BASE || addr >= PROM_BASE + PROM_SIZE {
-            return BusStatus::Data(0xFFFFFFFF);
+            return BusRead32::ok(0xFFFFFFFF);
         }
 
         let offset = (addr - PROM_BASE) as usize;
         let index = offset / 4;
 
         if index < self.inner.data.len() {
-            BusStatus::Data(self.inner.data[index])
+            BusRead32::ok(self.inner.data[index])
         } else {
-            BusStatus::Data(0xFFFFFFFF)
+            BusRead32::ok(0xFFFFFFFF)
         }
     }
 
-    fn write32(&self, _addr: u32, _val: u32) -> BusStatus {
+    fn write32(&self, _addr: u32, _val: u32) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusStatus {
+    fn read64(&self, addr: u32) -> BusRead64 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
 
         // Read two consecutive 32-bit words
-        let high = match self.read32(addr) {
-            BusStatus::Data(val) => val as u64,
-            _ => 0xFFFFFFFF,
-        };
-        let low = match self.read32(addr + 4) {
-            BusStatus::Data(val) => val as u64,
-            _ => 0xFFFFFFFF,
-        };
+        let high = { let _r = self.read32(addr); if _r.is_ok() { _r.data as u64 } else { 0xFFFFFFFF } };
+        let low = { let _r = self.read32(addr + 4); if _r.is_ok() { _r.data as u64 } else { 0xFFFFFFFF } };
 
-        BusStatus::Data64((high << 32) | low)
+        BusRead64::ok((high << 32) | low)
     }
 
-    fn write64(&self, _addr: u32, _val: u64) -> BusStatus {
+    fn write64(&self, _addr: u32, _val: u64) -> u32 {
         self.inner.clock.fetch_add(1, Ordering::Relaxed);
-        BusStatus::Ready
+        BUS_OK
     }
 }
 
@@ -206,30 +200,18 @@ mod tests {
         let port = prom.get_port();
 
         // 1. Check if [0] is F0 0B F0 00
-        match port.read32(PROM_BASE) {
-            BusStatus::Data(val) => assert_eq!(val, 0xF00BF000, "First word mismatch"),
-            _ => panic!("Expected BusStatus::Data"),
-        }
+        { let _r = port.read32(PROM_BASE); assert!(_r.is_ok(), "Expected ok read"); assert_eq!(_r.data, 0xF00BF000, "First word mismatch"); }
 
         // 2. Check reads outside range return 0xFFFFFFFF
         // Inside mapped range but outside data length
-        match port.read32(PROM_BASE + 4) {
-            BusStatus::Data(val) => assert_eq!(val, 0xFFFFFFFF, "Read past data end mismatch"),
-            _ => panic!("Expected BusStatus::Data"),
-        }
+        { let _r = port.read32(PROM_BASE + 4); assert!(_r.is_ok(), "Expected ok read"); assert_eq!(_r.data, 0xFFFFFFFF, "Read past data end mismatch"); }
         // Outside mapped range
-        match port.read32(PROM_BASE - 4) {
-            BusStatus::Data(val) => assert_eq!(val, 0xFFFFFFFF, "Read before base mismatch"),
-            _ => panic!("Expected BusStatus::Data"),
-        }
+        { let _r = port.read32(PROM_BASE - 4); assert!(_r.is_ok(), "Expected ok read"); assert_eq!(_r.data, 0xFFFFFFFF, "Read before base mismatch"); }
 
         // 3. Check writes do nothing
-        assert_eq!(port.write32(PROM_BASE, 0xDEADBEEF), BusStatus::Ready);
+        assert_eq!(port.write32(PROM_BASE, 0xDEADBEEF), BUS_OK);
         // Verify data is unchanged
-        match port.read32(PROM_BASE) {
-            BusStatus::Data(val) => assert_eq!(val, 0xF00BF000, "Write modified ROM data"),
-            _ => panic!("Expected BusStatus::Data"),
-        }
+        { let _r = port.read32(PROM_BASE); assert!(_r.is_ok(), "Expected ok read"); assert_eq!(_r.data, 0xF00BF000, "Write modified ROM data"); }
     }
 
     #[test]
@@ -249,14 +231,12 @@ mod tests {
             let phys_addr = PROM_BASE + (i * 4);
             let kseg1_addr = phys_addr + KSEG1_OFFSET; // 0xBFC00000 + offset
 
-            match port.read32(phys_addr) {
-                BusStatus::Data(word) => {
-                    let disasm = mips_dis::disassemble(word, kseg1_addr as u64, None);
-                    println!("0x{:08x}: 0x{:08x}: {}", kseg1_addr, word, disasm);
-                }
-                _ => {
-                    println!("0x{:08x}: ERROR reading", kseg1_addr);
-                }
+            let r = port.read32(phys_addr);
+            if r.is_ok() {
+                let disasm = mips_dis::disassemble(r.data, kseg1_addr as u64, None);
+                println!("0x{:08x}: 0x{:08x}: {}", kseg1_addr, r.data, disasm);
+            } else {
+                println!("0x{:08x}: ERROR reading", kseg1_addr);
             }
         }
     }

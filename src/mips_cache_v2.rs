@@ -6,7 +6,7 @@
 // - R4000-compliant tag format with PState bits
 // - L2 can signal back to L1 for evictions
 
-use crate::traits::{BusStatus, BusDevice, Resettable};
+use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
 use crate::mips_exec::DecodedInstr;
 use std::sync::Arc;
@@ -168,19 +168,22 @@ pub trait MipsCache: Send + Sync {
     /// The caller must call decode_into on the slot before use.
     fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchResult;
 
-    /// Read data using virtual and physical addresses
-    /// Uses virtual address for index, physical address for tag (VIPT)
-    /// Size must be 1, 2, 4, or 8 bytes
-    fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusStatus;
+    /// Read data using virtual and physical addresses.
+    /// Uses virtual address for index, physical address for tag (VIPT).
+    /// Size must be 1, 2, 4, or 8 bytes.
+    /// Returns BusRead64 with data zero-extended to u64 on success.
+    /// status may be BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE (cache only).
+    fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64;
 
-    /// Write 64-bit data using virtual and physical addresses with byte mask
-    /// Uses virtual address for index, physical address for tag (VIPT)
-    /// Mask indicates which bytes to write (bit mask for u64)
-    /// This is the core write operation - use helper methods for smaller writes
-    fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> BusStatus;
+    /// Write 64-bit data using virtual and physical addresses with byte mask.
+    /// Uses virtual address for index, physical address for tag (VIPT).
+    /// Mask indicates which bytes to write (bit mask for u64).
+    /// Returns BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE (cache only).
+    /// This is the core write operation — use helper methods for smaller writes.
+    fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32;
 
     /// Write 8-bit value
-    fn write8(&self, virt_addr: u64, phys_addr: u64, val: u8) -> BusStatus {
+    fn write8(&self, virt_addr: u64, phys_addr: u64, val: u8) -> u32 {
         let aligned_addr = phys_addr & !7;
         let offset = (phys_addr & 7) as usize;
         let shift = (7 - offset) * 8;
@@ -190,7 +193,7 @@ pub trait MipsCache: Send + Sync {
     }
 
     /// Write 16-bit value
-    fn write16(&self, virt_addr: u64, phys_addr: u64, val: u16) -> BusStatus {
+    fn write16(&self, virt_addr: u64, phys_addr: u64, val: u16) -> u32 {
         let aligned_addr = phys_addr & !7;
         let offset = (phys_addr & 7) as usize;
         let shift = (6 - offset) * 8;
@@ -200,7 +203,7 @@ pub trait MipsCache: Send + Sync {
     }
 
     /// Write 32-bit value
-    fn write32(&self, virt_addr: u64, phys_addr: u64, val: u32) -> BusStatus {
+    fn write32(&self, virt_addr: u64, phys_addr: u64, val: u32) -> u32 {
         let aligned_addr = phys_addr & !7;
         let offset = (phys_addr & 7) as usize;
         let shift = if offset == 0 { 32 } else { 0 };
@@ -210,7 +213,7 @@ pub trait MipsCache: Send + Sync {
     }
 
     /// Write 64-bit value
-    fn write64(&self, virt_addr: u64, phys_addr: u64, val: u64) -> BusStatus {
+    fn write64(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
         self.write64_masked(virt_addr, phys_addr, val, !0)
     }
 
@@ -310,36 +313,35 @@ impl From<(Arc<dyn BusDevice>, R4000CacheConfig)> for PassthroughCache {
 
 impl MipsCache for PassthroughCache {
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchResult {
-        match self.downstream.read32(phys_addr as u32) {
-            BusStatus::Data(raw) => {
-                let slot = unsafe { &mut *self.fetch_scratch.get() };
-                if slot.raw != raw { slot.decoded = false; }
-                slot.raw = raw;
-                FetchResult::Hit(slot as *const DecodedInstr)
-            }
-            BusStatus::Busy => FetchResult::Busy,
-            _ => FetchResult::Error,
+        let r = self.downstream.read32(phys_addr as u32);
+        if r.is_ok() {
+            let slot = unsafe { &mut *self.fetch_scratch.get() };
+            if slot.raw != r.data { slot.decoded = false; }
+            slot.raw = r.data;
+            FetchResult::Hit(slot as *const DecodedInstr)
+        } else if r.status == BUS_BUSY {
+            FetchResult::Busy
+        } else {
+            FetchResult::Error
         }
     }
 
-    fn read(&self, _virt_addr: u64, phys_addr: u64, size: usize) -> BusStatus {
+    fn read(&self, _virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64 {
         match size {
-            1 => self.downstream.read8(phys_addr as u32),
-            2 => self.downstream.read16(phys_addr as u32),
-            4 => self.downstream.read32(phys_addr as u32),
-            8 => self.downstream.read64(phys_addr as u32),
-            _ => BusStatus::Error,
+            1 => { let r = self.downstream.read8(phys_addr as u32);  BusRead64 { status: r.status, data: r.data as u64 } }
+            2 => { let r = self.downstream.read16(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
+            4 => { let r = self.downstream.read32(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
+            8 =>   self.downstream.read64(phys_addr as u32),
+            _ => BusRead64::err(),
         }
     }
 
-    fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> BusStatus {
+    fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         // For passthrough cache, just do a read-modify-write on the downstream device
         let aligned_addr = (phys_addr & !7) as u32;
-        let old_val = match self.downstream.read64(aligned_addr) {
-            BusStatus::Data64(v) => v,
-            other => return other,
-        };
-        let new_val = (old_val & !mask) | (val & mask);
+        let r = self.downstream.read64(aligned_addr);
+        if !r.is_ok() { return r.status; }
+        let new_val = (r.data & !mask) | (val & mask);
         self.downstream.write64(aligned_addr, new_val)
     }
 
@@ -1100,9 +1102,8 @@ impl R4000Cache {
             let chunk_addr = phys_addr + ((i as u64) << 3);
             let val = l2_data[start_chunk + i];
 
-            match self.downstream.write64(chunk_addr as u32, val) {
-                BusStatus::Ready => {},
-                _ => return false, // Writeback failed
+            if self.downstream.write64(chunk_addr as u32, val) != BUS_OK {
+                return false; // Writeback failed
             }
         }
 
@@ -1134,10 +1135,9 @@ impl R4000Cache {
         let instrs_start = l2_idx << self.l2.instr_shift;
         for i in 0..self.l2.chunks_per_line {
             let fetch_addr = line_base + ((i as u64) << 3);
-            let val = match self.downstream.read64(fetch_addr as u32) {
-                BusStatus::Data64(val) => val,
-                _ => return false,
-            };
+            let r = self.downstream.read64(fetch_addr as u32);
+            if !r.is_ok() { return false; }
+            let val = r.data;
             l2_data[start_chunk + i] = val;
             let r0 = (val >> 32) as u32;
             let r1 = val as u32;
@@ -1355,7 +1355,7 @@ impl MipsCache for R4000Cache {
         FetchResult::Hit(slot)
     }
 
-    fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusStatus {
+    fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64 {
         #[cfg(feature = "debug_cache")]
         {
             if self.is_tracking_addr(virt_addr, phys_addr) {
@@ -1381,29 +1381,24 @@ impl MipsCache for R4000Cache {
         if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != ptag {
             match self.fill_l1d_line(virt_addr, phys_addr) {
                 FillResult::Ok => {},
-                FillResult::Error => return BusStatus::Error,
-                FillResult::VirtualCoherencyException => return BusStatus::VirtualCoherencyException,
+                FillResult::Error => return BusRead64::err(),
+                FillResult::VirtualCoherencyException => return BusRead64::vce(),
             }
         }
 
         // Read from L1-D cache
         let data_idx = self.dc.get_data_index(virt_addr);
-        match size {
-            1 => BusStatus::Data8(
-                self.dc.data_as_bytes()[data_idx * 8 + ((phys_addr as usize & 7) ^ 7)]
-            ),
-            2 => BusStatus::Data16(
-                self.dc.data_as_halves()[data_idx * 4 + ((phys_addr as usize & 7) >> 1 ^ 3)]
-            ),
-            4 => BusStatus::Data(
-                self.dc.data_as_words()[data_idx * 2 + ((phys_addr as usize & 7) >> 2 ^ 1)]
-            ),
-            8 => BusStatus::Data64(self.dc.data.get()[data_idx]),
-            _ => BusStatus::Error,
-        }
+        let data = match size {
+            1 => self.dc.data_as_bytes()[data_idx * 8 + ((phys_addr as usize & 7) ^ 7)] as u64,
+            2 => self.dc.data_as_halves()[data_idx * 4 + ((phys_addr as usize & 7) >> 1 ^ 3)] as u64,
+            4 => self.dc.data_as_words()[data_idx * 2 + ((phys_addr as usize & 7) >> 2 ^ 1)] as u64,
+            8 => self.dc.data.get()[data_idx],
+            _ => return BusRead64::err(),
+        };
+        BusRead64::ok(data)
     }
 
-    fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> BusStatus {
+    fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         #[cfg(feature = "debug_cache")]
         {
             if self.is_tracking_addr(virt_addr, phys_addr) {
@@ -1429,8 +1424,8 @@ impl MipsCache for R4000Cache {
         if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != ptag {
             match self.fill_l1d_line(virt_addr, phys_addr) {
                 FillResult::Ok => {},
-                FillResult::Error => return BusStatus::Error,
-                FillResult::VirtualCoherencyException => return BusStatus::VirtualCoherencyException,
+                FillResult::Error => return BUS_ERR,
+                FillResult::VirtualCoherencyException => return BUS_VCE,
             }
         }
 
@@ -1448,7 +1443,7 @@ impl MipsCache for R4000Cache {
         }
         self.dc.set_tag(dc_idx, dc_tag);
 
-        BusStatus::Ready
+        BUS_OK
     }
 
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32 {

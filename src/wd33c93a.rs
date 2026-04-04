@@ -4,7 +4,7 @@ use std::thread;
 use std::sync::Arc;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::traits::{BusStatus, Device, FifoDevice, DmaClient, DmaStatus, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, FifoDevice, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog};
 use crate::snapshot::{get_field, toml_u8, toml_bool, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::scsi::{self, ScsiDevice, scsi_cmd, ScsiRequest, ScsiDataLength};
@@ -292,7 +292,7 @@ impl Wd33c93a {
         }
     }
 
-    pub fn read(&self, addr: u32) -> BusStatus {
+    pub fn read(&self, addr: u32) -> BusRead8 {
         let mut state = self.state.lock();
         
         if addr == 0 {
@@ -309,7 +309,7 @@ impl Wd33c93a {
                 state.last_read_asr = Some(val);
             }
             state.last_read_reg = None;
-            return BusStatus::Data8(val);
+            return BusRead8::ok(val);
         } else if addr == 1 {
             // Read register pointed to by AR
             let ar = state.ar & 0x1F;
@@ -319,7 +319,7 @@ impl Wd33c93a {
                 dlog!(LogModule::Scsi, "WD33C93A: Read FIFO -> {:02x}", val);
                 state.last_read_asr = None;
                 state.last_read_reg = None;
-                return BusStatus::Data8(val);
+                return BusRead8::ok(val);
             }
 
             if ar == regs::AUX_STATUS_DIRECT {
@@ -327,7 +327,7 @@ impl Wd33c93a {
                 if state.compute_dbr() {
                     val |= asr::DBR;
                 }
-                return BusStatus::Data8(val);
+                return BusRead8::ok(val);
             }
 
             let val = state.regs[ar as usize];
@@ -365,12 +365,12 @@ impl Wd33c93a {
                 }
                 state.last_read_asr = None;
             }
-            return BusStatus::Data8(val);
+            return BusRead8::ok(val);
         }
-        BusStatus::Error
+        BusRead8::err()
     }
 
-    pub fn write(&self, addr: u32, val: u8) -> BusStatus {
+    pub fn write(&self, addr: u32, val: u8) -> u32 {
         let mut state = self.state.lock();
 
         if addr == 0 {
@@ -379,7 +379,7 @@ impl Wd33c93a {
             dlog!(LogModule::Scsi, "WD33C93A: Write AR <- {:02x}", val);
             state.last_read_asr = None;
             state.last_read_reg = None;
-            return BusStatus::Ready;
+            return BUS_OK;
         } else if addr == 1 {
             // Write register pointed to by AR
             let ar = state.ar & 0x1F;
@@ -391,7 +391,7 @@ impl Wd33c93a {
             if ar == regs::DATA {
                 state.fifo.push_back(val);
                 self.cond.notify_one();
-                return BusStatus::Ready;
+                return BUS_OK;
             }
 
             state.regs[ar as usize] = val;
@@ -406,9 +406,9 @@ impl Wd33c93a {
                 state.ar = (ar + 1) & 0x1F;
             }
             
-            return BusStatus::Ready;
+            return BUS_OK;
         }
-        BusStatus::Error
+        BUS_ERR
     }
 
     pub fn register_locks(self: &Arc<Self>) {

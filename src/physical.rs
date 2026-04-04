@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::io::Write as IoWrite;
 
-use crate::traits::{BusStatus, BusDevice, Device};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, Device, BUS_OK};
 use crate::devlog::LogModule;
 use crate::exp::eval_const_expr;
 use crate::mips_dis;
@@ -31,53 +31,37 @@ impl ErrorBus {
 }
 
 impl BusDevice for ErrorBus {
-    fn read8(&self, addr: u32) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Read8 {:08x}", addr);
-        }
-        BusStatus::Error
+    fn read8(&self, addr: u32) -> BusRead8 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read8 {:08x}", addr); }
+        BusRead8::err()
     }
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Write8 {:08x} val {:02x}", addr, val);
-        }
-        BusStatus::Error
+    fn write8(&self, addr: u32, val: u8) -> u32 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write8 {:08x} val {:02x}", addr, val); }
+        crate::traits::BUS_ERR
     }
-    fn read16(&self, addr: u32) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Read16 {:08x}", addr);
-        }
-        BusStatus::Error
+    fn read16(&self, addr: u32) -> BusRead16 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read16 {:08x}", addr); }
+        BusRead16::err()
     }
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Write16 {:08x} val {:04x}", addr, val);
-        }
-        BusStatus::Error
+    fn write16(&self, addr: u32, val: u16) -> u32 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write16 {:08x} val {:04x}", addr, val); }
+        crate::traits::BUS_ERR
     }
-    fn read32(&self, addr: u32) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Read32 {:08x}", addr);
-        }
-        BusStatus::Error
+    fn read32(&self, addr: u32) -> BusRead32 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read32 {:08x}", addr); }
+        BusRead32::err()
     }
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Write32 {:08x} val {:08x}", addr, val);
-        }
-        BusStatus::Error
+    fn write32(&self, addr: u32, val: u32) -> u32 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write32 {:08x} val {:08x}", addr, val); }
+        crate::traits::BUS_ERR
     }
-    fn read64(&self, addr: u32) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Read64 {:08x}", addr);
-        }
-        BusStatus::Error
+    fn read64(&self, addr: u32) -> BusRead64 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Read64 {:08x}", addr); }
+        BusRead64::err()
     }
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
-        if self.debug.load(Ordering::Relaxed) {
-            println!("BusError: Write64 {:08x} val {:016x}", addr, val);
-        }
-        BusStatus::Error
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        if self.debug.load(Ordering::Relaxed) { println!("BusError: Write64 {:08x} val {:016x}", addr, val); }
+        crate::traits::BUS_ERR
     }
 }
 
@@ -97,30 +81,14 @@ impl AliasBus {
 }
 
 impl BusDevice for AliasBus {
-    fn read8(&self, addr: u32) -> BusStatus {
-        unsafe { (*self.target).read8(addr.wrapping_add(self.offset)) }
-    }
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
-        unsafe { (*self.target).write8(addr.wrapping_add(self.offset), val) }
-    }
-    fn read16(&self, addr: u32) -> BusStatus {
-        unsafe { (*self.target).read16(addr.wrapping_add(self.offset)) }
-    }
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
-        unsafe { (*self.target).write16(addr.wrapping_add(self.offset), val) }
-    }
-    fn read32(&self, addr: u32) -> BusStatus {
-        unsafe { (*self.target).read32(addr.wrapping_add(self.offset)) }
-    }
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
-        unsafe { (*self.target).write32(addr.wrapping_add(self.offset), val) }
-    }
-    fn read64(&self, addr: u32) -> BusStatus {
-        unsafe { (*self.target).read64(addr.wrapping_add(self.offset)) }
-    }
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
-        unsafe { (*self.target).write64(addr.wrapping_add(self.offset), val) }
-    }
+    fn read8(&self, addr: u32) -> BusRead8   { unsafe { (*self.target).read8(addr.wrapping_add(self.offset)) } }
+    fn write8(&self, addr: u32, val: u8) -> u32  { unsafe { (*self.target).write8(addr.wrapping_add(self.offset), val) } }
+    fn read16(&self, addr: u32) -> BusRead16  { unsafe { (*self.target).read16(addr.wrapping_add(self.offset)) } }
+    fn write16(&self, addr: u32, val: u16) -> u32 { unsafe { (*self.target).write16(addr.wrapping_add(self.offset), val) } }
+    fn read32(&self, addr: u32) -> BusRead32  { unsafe { (*self.target).read32(addr.wrapping_add(self.offset)) } }
+    fn write32(&self, addr: u32, val: u32) -> u32 { unsafe { (*self.target).write32(addr.wrapping_add(self.offset), val) } }
+    fn read64(&self, addr: u32) -> BusRead64  { unsafe { (*self.target).read64(addr.wrapping_add(self.offset)) } }
+    fn write64(&self, addr: u32, val: u64) -> u32 { unsafe { (*self.target).write64(addr.wrapping_add(self.offset), val) } }
 }
 
 /// CPU bus error sink: reports to MC then returns 0/Ready so the CPU doesn't also take
@@ -131,14 +99,14 @@ struct CpuBusErrorDevice {
 }
 
 impl BusDevice for CpuBusErrorDevice {
-    fn read8(&self, addr: u32) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Data8(0xFF) }
-    fn write8(&self, addr: u32, _v: u8) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Ready }
-    fn read16(&self, addr: u32) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Data16(0xFFFF) }
-    fn write16(&self, addr: u32, _v: u16) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Ready }
-    fn read32(&self, addr: u32) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Data(0xFFFFFFFF) }
-    fn write32(&self, addr: u32, _v: u32) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Ready }
-    fn read64(&self, addr: u32) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Data64(0xFFFFFFFFFFFFFFFF) }
-    fn write64(&self, addr: u32, _v: u64) -> BusStatus { self.mc.report_cpu_error(addr); BusStatus::Ready }
+    fn read8(&self, addr: u32) -> BusRead8   { self.mc.report_cpu_error(addr); BusRead8::ok(0xFF) }
+    fn write8(&self, addr: u32, _v: u8) -> u32  { self.mc.report_cpu_error(addr); BUS_OK }
+    fn read16(&self, addr: u32) -> BusRead16  { self.mc.report_cpu_error(addr); BusRead16::ok(0xFFFF) }
+    fn write16(&self, addr: u32, _v: u16) -> u32 { self.mc.report_cpu_error(addr); BUS_OK }
+    fn read32(&self, addr: u32) -> BusRead32  { self.mc.report_cpu_error(addr); BusRead32::ok(0xFFFFFFFF) }
+    fn write32(&self, addr: u32, _v: u32) -> u32 { self.mc.report_cpu_error(addr); BUS_OK }
+    fn read64(&self, addr: u32) -> BusRead64  { self.mc.report_cpu_error(addr); BusRead64::ok(0xFFFFFFFFFFFFFFFF) }
+    fn write64(&self, addr: u32, _v: u64) -> u32 { self.mc.report_cpu_error(addr); BUS_OK }
 }
 
 /// GIO bus timeout sink: reports to MC (GIO_ERROR_STAT bit 10 TIME) then returns 0/Ready.
@@ -148,14 +116,14 @@ struct GioBusErrorDevice {
 }
 
 impl BusDevice for GioBusErrorDevice {
-    fn read8(&self, addr: u32) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Data8(0xFF) }
-    fn write8(&self, addr: u32, _v: u8) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Ready }
-    fn read16(&self, addr: u32) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Data16(0xFFFF) }
-    fn write16(&self, addr: u32, _v: u16) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Ready }
-    fn read32(&self, addr: u32) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Data(0xFFFFFFFF) }
-    fn write32(&self, addr: u32, _v: u32) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Ready }
-    fn read64(&self, addr: u32) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Data64(0xFFFFFFFFFFFFFFFF) }
-    fn write64(&self, addr: u32, _v: u64) -> BusStatus { self.mc.report_gio_timeout(addr); BusStatus::Ready }
+    fn read8(&self, addr: u32) -> BusRead8   { self.mc.report_gio_timeout(addr); BusRead8::ok(0xFF) }
+    fn write8(&self, addr: u32, _v: u8) -> u32  { self.mc.report_gio_timeout(addr); BUS_OK }
+    fn read16(&self, addr: u32) -> BusRead16  { self.mc.report_gio_timeout(addr); BusRead16::ok(0xFFFF) }
+    fn write16(&self, addr: u32, _v: u16) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
+    fn read32(&self, addr: u32) -> BusRead32  { self.mc.report_gio_timeout(addr); BusRead32::ok(0xFFFFFFFF) }
+    fn write32(&self, addr: u32, _v: u32) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
+    fn read64(&self, addr: u32) -> BusRead64  { self.mc.report_gio_timeout(addr); BusRead64::ok(0xFFFFFFFFFFFFFFFF) }
+    fn write64(&self, addr: u32, _v: u64) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
 }
 
 // Address range constants per MC/Indy hardware specification
@@ -515,10 +483,9 @@ impl Device for Physical {
                 let addr = eval_const_expr(actual_args[0])
                     .map_err(|e| format!("mem: {}", e))?;
                 
-                match BusDevice::read32(self, addr as u32) {
-                    BusStatus::Data(val) => writeln!(writer, "{:08x}: {:08x}", addr, val).unwrap(),
-                    _ => writeln!(writer, "{:08x}: Error/Busy", addr).unwrap(),
-                }
+                let r = BusDevice::read32(self, addr as u32);
+                if r.is_ok() { writeln!(writer, "{:08x}: {:08x}", addr, r.data).unwrap(); }
+                else { writeln!(writer, "{:08x}: Error/Busy", addr).unwrap(); }
             }
             "dis" | "d" | "md" => {
                 if actual_args.is_empty() {
@@ -526,11 +493,10 @@ impl Device for Physical {
                 }
                 let addr = eval_const_expr(actual_args[0])
                     .map_err(|e| format!("dis: {}", e))?;
-                
-                match BusDevice::read32(self, addr as u32) {
-                    BusStatus::Data(instr) => writeln!(writer, "{}", mips_dis::disassemble(instr, addr, None)).unwrap(),
-                    _ => writeln!(writer, "Could not fetch instruction at {:016x}", addr).unwrap(),
-                }
+
+                let r = BusDevice::read32(self, addr as u32);
+                if r.is_ok() { writeln!(writer, "{}", mips_dis::disassemble(r.data, addr, None)).unwrap(); }
+                else { writeln!(writer, "Could not fetch instruction at {:016x}", addr).unwrap(); }
             }
             "error" => {
                 if actual_args.is_empty() {
@@ -581,7 +547,7 @@ impl Device for Physical {
                 let bench_start = crate::platform::get_host_ticks();
                 let mut error_count = 0;
                 for addr in (himem_base..himem_base + himem_size).step_by(4) {
-                    if matches!(self.write32(addr, 0), BusStatus::Error) {
+                    if self.write32(addr, 0) != BUS_OK {
                         error_count += 1;
                     }
                 }
@@ -606,110 +572,86 @@ impl Device for Physical {
 
 impl BusDevice for Physical {
     #[inline(always)]
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).read8(addr) };
-
+        let r = unsafe { (*device_ptr).read8(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
-            match result {
-                BusStatus::Data8(d) => println!("PHYS8 Read {:08x} -> Data8({:02x})", addr, d),
-                _ => println!("PHYS8 Read {:08x} -> {:?}", addr, result),
-            }
+            if r.is_ok() { println!("PHYS8 Read {:08x} -> {:02x}", addr, r.data); }
+            else { println!("PHYS8 Read {:08x} -> err {:08x}", addr, r.status); }
         }
-        result
+        r
     }
 
     #[inline(always)]
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).write8(addr, val) };
-
+        let ws = unsafe { (*device_ptr).write8(addr, val) };
         #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            println!("PHYS8 Write {:08x} val={:02x} -> {:?}", addr, val, result);
-        }
-        result
+        if self.trace.load(Ordering::Relaxed) { println!("PHYS8 Write {:08x} val={:02x} -> {:08x}", addr, val, ws); }
+        ws
     }
 
     #[inline(always)]
-    fn read16(&self, addr: u32) -> BusStatus {
+    fn read16(&self, addr: u32) -> BusRead16 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).read16(addr) };
-
+        let r = unsafe { (*device_ptr).read16(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
-            match result {
-                BusStatus::Data16(d) => println!("PHYS16 Read {:08x} -> Data16({:04x})", addr, d),
-                _ => println!("PHYS16 Read {:08x} -> {:?}", addr, result),
-            }
+            if r.is_ok() { println!("PHYS16 Read {:08x} -> {:04x}", addr, r.data); }
+            else { println!("PHYS16 Read {:08x} -> err {:08x}", addr, r.status); }
         }
-        result
+        r
     }
 
     #[inline(always)]
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
+    fn write16(&self, addr: u32, val: u16) -> u32 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).write16(addr, val) };
-
+        let ws = unsafe { (*device_ptr).write16(addr, val) };
         #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            println!("PHYS16 Write {:08x} val={:04x} -> {:?}", addr, val, result);
-        }
-        result
+        if self.trace.load(Ordering::Relaxed) { println!("PHYS16 Write {:08x} val={:04x} -> {:08x}", addr, val, ws); }
+        ws
     }
 
     #[inline(always)]
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).read32(addr) };
-
+        let r = unsafe { (*device_ptr).read32(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
-            match result {
-                BusStatus::Data(d) => println!("PHYS32 Read {:08x} -> Data({:08x})", addr, d),
-                _ => println!("PHYS32 Read {:08x} -> {:?}", addr, result),
-            }
+            if r.is_ok() { println!("PHYS32 Read {:08x} -> {:08x}", addr, r.data); }
+            else { println!("PHYS32 Read {:08x} -> err {:08x}", addr, r.status); }
         }
-        result
+        r
     }
 
     #[inline(always)]
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).write32(addr, val) };
-
+        let ws = unsafe { (*device_ptr).write32(addr, val) };
         #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            println!("PHYS32 Write {:08x} val={:08x} -> {:?}", addr, val, result);
-        }
-        result
+        if self.trace.load(Ordering::Relaxed) { println!("PHYS32 Write {:08x} val={:08x} -> {:08x}", addr, val, ws); }
+        ws
     }
 
     #[inline(always)]
-    fn read64(&self, addr: u32) -> BusStatus {
+    fn read64(&self, addr: u32) -> BusRead64 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).read64(addr) };
-
+        let r = unsafe { (*device_ptr).read64(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
-            match result {
-                BusStatus::Data64(d) => println!("PHYS64 Read {:08x} -> Data64({:016x})", addr, d),
-                _ => println!("PHYS64 Read {:08x} -> {:?}", addr, result),
-            }
+            if r.is_ok() { println!("PHYS64 Read {:08x} -> {:016x}", addr, r.data); }
+            else { println!("PHYS64 Read {:08x} -> err {:08x}", addr, r.status); }
         }
-        result
+        r
     }
 
     #[inline(always)]
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         let device_ptr = self.device_map[(addr >> 16) as usize];
-        let result = unsafe { (*device_ptr).write64(addr, val) };
-
+        let ws = unsafe { (*device_ptr).write64(addr, val) };
         #[cfg(not(feature = "lightning"))]
-        if self.trace.load(Ordering::Relaxed) {
-            println!("PHYS64 Write {:08x} val={:016x} -> {:?}", addr, val, result);
-        }
-        result
+        if self.trace.load(Ordering::Relaxed) { println!("PHYS64 Write {:08x} val={:016x} -> {:08x}", addr, val, ws); }
+        ws
     }
 }

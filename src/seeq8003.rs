@@ -21,7 +21,7 @@ use std::time::Duration;
 use rtrb::RingBuffer;
 
 use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NatEngine};
-use crate::traits::{BusDevice, BusStatus, Device, DmaClient, DmaStatus, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 
 // ── Register offsets (A2:A0) ──────────────────────────────────────────────────
@@ -431,7 +431,7 @@ impl Seeq8003 {
         self.deassert_reset();
     }
 
-    pub fn read(&self, addr: u32) -> BusStatus {
+    pub fn read(&self, addr: u32) -> BusRead8 {
         let mut st = lock_state!(self.state);
         let val = match addr {
             SEEQ_STATION_ADDR_0..=SEEQ_STATION_ADDR_5 => {
@@ -460,10 +460,10 @@ impl Seeq8003 {
             _ => 0,
         };
         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ R[{:x}] -> {:02x}", st.ts, addr, val);
-        BusStatus::Data8(val)
+        BusRead8::ok(val)
     }
 
-    pub fn write(&self, addr: u32, val: u8) -> BusStatus {
+    pub fn write(&self, addr: u32, val: u8) -> u32 {
         let mut st = lock_state!(self.state);
         dlog_dev!(LogModule::Seeq, "[ts={}] SEEQ W[{:x}] <- {:02x}", st.ts, addr, val);
         match addr {
@@ -504,7 +504,7 @@ impl Seeq8003 {
             }
             _ => {}
         }
-        BusStatus::Ready
+        BUS_OK
     }
 
     pub fn register_locks(self: &Arc<Self>) {

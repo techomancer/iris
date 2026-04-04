@@ -1,7 +1,7 @@
 use crate::devlog::LogModule;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::traits::{BusStatus, BusDevice, Device, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, u8_slice_to_toml, load_u8_slice};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::fs::File;
@@ -199,10 +199,10 @@ impl Ds1x86 {
         Ok(())
     }
 
-    fn read(&self, addr: u32) -> BusStatus {
+    fn read(&self, addr: u32) -> BusRead8 {
         let offset = addr as usize;
         if offset >= self.size {
-            return BusStatus::Error;
+            return BusRead8::err();
         }
 
         let mut rtc_data = self.data.lock();
@@ -218,13 +218,13 @@ impl Ds1x86 {
         if crate::devlog::devlog_is_active(LogModule::Rtc) {
             dlog!(LogModule::Rtc, "RTC Read offset {:04x} -> {:02x}", offset, val);
         }
-        BusStatus::Data8(val)
+        BusRead8::ok(val)
     }
 
-    fn write(&self, addr: u32, val: u8) -> BusStatus {
+    fn write(&self, addr: u32, val: u8) -> u32 {
         let offset = addr as usize;
         if offset >= self.size {
-            return BusStatus::Error;
+            return BUS_ERR;
         }
 
         if crate::devlog::devlog_is_active(LogModule::Rtc) {
@@ -263,7 +263,7 @@ impl Ds1x86 {
             }
         }
 
-        BusStatus::Ready
+        BUS_OK
     }
 }
 
@@ -327,42 +327,37 @@ impl Device for Ds1x86 {
  so it will have to do it themselves.
 */
 impl BusDevice for Ds1x86 {
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         Ds1x86::read(self, addr)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         Ds1x86::write(self, addr, val)
     }
 
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         // RTC is byte-addressable, 32-bit reads should read 4 consecutive bytes
         // in big-endian order
         let mut word = 0u32;
         for i in 0..4 {
-            match self.read8(addr + i) {
-                BusStatus::Data8(val) => {
-                    word |= (val as u32) << ((3 - i) * 8);
-                }
-                BusStatus::Error => return BusStatus::Error,
-                BusStatus::Busy => return BusStatus::Busy,
-                _ => return BusStatus::Error,
-            }
+            let r = self.read8(addr + i);
+            if !r.is_ok() { return BusRead32 { status: r.status, data: 0 }; }
+            word |= (r.data as u32) << ((3 - i) * 8);
         }
-        BusStatus::Data(word)
+        BusRead32::ok(word)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         // RTC is byte-addressable, 32-bit writes should write 4 consecutive bytes
         // in big-endian order
         for i in 0..4 {
             let byte_val = ((val >> ((3 - i) * 8)) & 0xFF) as u8;
             match self.write8(addr + i, byte_val) {
-                BusStatus::Ready => {},
+                BUS_OK => {},
                 other => return other,
             }
         }
-        BusStatus::Ready
+        BUS_OK
     }
 }
 

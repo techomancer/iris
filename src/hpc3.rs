@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::fs::File;
 use std::io::Write as IoWrite;
 use crate::devlog::{LogModule, devlog_mask};
-use crate::traits::{BusStatus, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::config::NfsConfig;
 use crate::eeprom_93c56::Eeprom93c56;
@@ -350,9 +350,9 @@ fn start_transaction(&mut self) {
                 // Word 0: Buffer Address (PADDR)
                 // Word 1: Byte Count & Flags (CNTINFO)
                 // Word 2: Next Descriptor (PNEXT)
-                let w_addr = match mem.read32(nbdp + PDMA_DESC_CBP_OFFSET) { BusStatus::Data(d) => d, _ => 0 };
-                let w_cnt = match mem.read32(nbdp + PDMA_DESC_BC_OFFSET) { BusStatus::Data(d) => d, _ => 0 };
-                let w_next = match mem.read32(nbdp + PDMA_DESC_NBP_OFFSET) { BusStatus::Data(d) => d, _ => 0 };
+                let w_addr = { let _r = mem.read32(nbdp + PDMA_DESC_CBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { 0 } };
+                let w_cnt = { let _r = mem.read32(nbdp + PDMA_DESC_BC_OFFSET); if _r.is_ok() { let d = _r.data; d } else { 0 } };
+                let w_next = { let _r = mem.read32(nbdp + PDMA_DESC_NBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { 0 } };
 
                 // Track current descriptor pointer for HPC3 writeback at interrupt time.
                 // RX (ch10): crbdp = address of descriptor currently being filled.
@@ -451,10 +451,7 @@ fn start_transaction(&mut self) {
         if self.id < 8 {
             let addr = self.cbp;
             let mem_val = if let Some(mem) = &self.sys_mem {
-                match mem.read32(addr) {
-                    BusStatus::Data(d) => d,
-                    _ => return None,
-                }
+                { let _r = mem.read32(addr); if _r.is_ok() { _r.data } else { return None } }
             } else {
                 return None;
             };
@@ -481,22 +478,18 @@ fn start_transaction(&mut self) {
 
         let val = if let Some(mem) = &self.sys_mem {
             if self.width_16 {
-                match mem.read16(addr) {
-                    BusStatus::Data16(d) => {
-                        let v = if swap { d.swap_bytes() } else { d };
-                        self.handle_dump(addr, &v.to_be_bytes(), true);
-                        Some(v as u32)
-                    },
-                    _ => None
-                }
+                let _r = mem.read16(addr);
+                if _r.is_ok() {
+                    let v = if swap { _r.data.swap_bytes() } else { _r.data };
+                    self.handle_dump(addr, &v.to_be_bytes(), true);
+                    Some(v as u32)
+                } else { None }
             } else {
-                match mem.read8(addr) {
-                    BusStatus::Data8(d) => {
-                        self.handle_dump(addr, &[d], true);
-                        Some(d as u32)
-                    },
-                    _ => None
-                }
+                let _r = mem.read8(addr);
+                if _r.is_ok() {
+                    self.handle_dump(addr, &[_r.data], true);
+                    Some(_r.data as u32)
+                } else { None }
             }
         } else {
             None
@@ -1192,9 +1185,9 @@ impl Device for Hpc3 {
                     writeln!(writer, "PDMA descriptor chain from {:08x}:", addr).unwrap();
                     let mut idx = 0usize;
                     loop {
-                        let cbp  = match mem.read32(addr + PDMA_DESC_CBP_OFFSET) { BusStatus::Data(d) => d, _ => break };
-                        let bc   = match mem.read32(addr + PDMA_DESC_BC_OFFSET)  { BusStatus::Data(d) => d, _ => break };
-                        let nbdp = match mem.read32(addr + PDMA_DESC_NBP_OFFSET) { BusStatus::Data(d) => d, _ => break };
+                        let cbp  = { let _r = mem.read32(addr + PDMA_DESC_CBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { break } };
+                        let bc   = { let _r = mem.read32(addr + PDMA_DESC_BC_OFFSET); if _r.is_ok() { let d = _r.data; d } else { break } };
+                        let nbdp = { let _r = mem.read32(addr + PDMA_DESC_NBP_OFFSET); if _r.is_ok() { let d = _r.data; d } else { break } };
                         let eox  = (bc & PDMA_DESC_EOX) != 0;
                         let eop  = (bc & PDMA_DESC_EOP) != 0;
                         let xie  = (bc & PDMA_DESC_XIE) != 0;
@@ -1239,7 +1232,7 @@ impl Device for Hpc3 {
 }
 
 impl BusDevice for Hpc3 {
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         let offset = addr - HPC3_BASE;
 
         // IOC (0x59800 - 0x598FF) - forward 8-bit access directly to IOC
@@ -1263,16 +1256,16 @@ impl BusDevice for Hpc3 {
         if (SCSI0_FIFO_BASE..MISC_BASE).contains(&offset) {
             if offset < SCSI1_FIFO_BASE {
                 // SCSI0 FIFO
-                return BusStatus::Data8(0); // Placeholder
+                return BusRead8::ok(0); // Placeholder
             } else if offset < ENET_RX_FIFO_BASE {
                 // SCSI1 FIFO
-                return BusStatus::Data8(0); // Placeholder
+                return BusRead8::ok(0); // Placeholder
             } else if offset < ENET_TX_FIFO_BASE {
                 // ENET RX FIFO
-                return BusStatus::Data8(0); // Placeholder
+                return BusRead8::ok(0); // Placeholder
             } else {
                 // ENET TX FIFO (Write Only)
-                return BusStatus::Data8(0);
+                return BusRead8::ok(0);
             }
         }
 
@@ -1284,9 +1277,9 @@ impl BusDevice for Hpc3 {
             dlog_dev!(LogModule::Hpc3, "HPC3: Read8 PBUS PIO Channel {} (offset {:05x})", channel, offset);
             let idx = ((offset - PBUS_PIO_BASE) >> 2) as usize;
             if idx < state.pbus_pio.len() {
-                return BusStatus::Data8(state.pbus_pio[idx] as u8);
+                return BusRead8::ok(state.pbus_pio[idx] as u8);
             }
-            return BusStatus::Data8(0);
+            return BusRead8::ok(0);
         }
 
         // PBUS BBRAM (RTC) - 8-bit access with sparse packing
@@ -1296,7 +1289,7 @@ impl BusDevice for Hpc3 {
             let rtc_offset = (offset - PBUS_BBRAM) as u32;
             // Check if this is the valid byte lane (bottom byte of dword in big-endian)
             if (rtc_offset & 3) != 3 {
-                return BusStatus::Data8(0);
+                return BusRead8::ok(0);
             }
             // Sparse decode: addr/4 gives actual byte index in RTC
             let byte_index = rtc_offset >> 2;
@@ -1305,10 +1298,10 @@ impl BusDevice for Hpc3 {
 
         // All other registers require 32-bit access
         dlog_dev!(LogModule::Hpc3, "HPC3: Unexpected read8 at offset {:05x} (addr {:08x})", offset, addr);
-        BusStatus::Data8(0)
+        BusRead8::ok(0)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         let offset = addr - HPC3_BASE;
 
         // IOC (0x59800 - 0x598FF) - forward 8-bit access directly to IOC
@@ -1339,7 +1332,7 @@ impl BusDevice for Hpc3 {
             } else {
                 // ENET TX FIFO - DMA only, no PIO path
             }
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // PBUS BBRAM (RTC) - 8-bit access with sparse packing
@@ -1347,7 +1340,7 @@ impl BusDevice for Hpc3 {
             let rtc_offset = (offset - PBUS_BBRAM) as u32;
             // Check if this is the valid byte lane (bottom byte of dword in big-endian)
             if (rtc_offset & 3) != 3 {
-                return BusStatus::Ready; // Ignore writes to invalid byte lanes
+                return BUS_OK; // Ignore writes to invalid byte lanes
             }
             // Sparse decode: addr/4 gives actual byte index in RTC
             let byte_index = rtc_offset >> 2;
@@ -1364,15 +1357,15 @@ impl BusDevice for Hpc3 {
             if idx < state.pbus_pio.len() {
                 state.pbus_pio[idx] = val as u32;
             }
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // All other registers require 32-bit access
         dlog_dev!(LogModule::Hpc3, "HPC3: Unexpected write8 at offset {:05x} (addr {:08x}) val={:02x}", offset, addr, val);
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         let offset = addr - HPC3_BASE;
 
         // IOC (0x59800 - 0x598FF) - should not use 32-bit access, but allow for legacy
@@ -1389,44 +1382,40 @@ impl BusDevice for Hpc3 {
 //            if idx == 0 {
                 //eprintln!("HPC3: PDMA[0] read reg={:04x} val={:08x}", reg, val);
             //}
-            return BusStatus::Data(val);
+            return BusRead32::ok(val);
         }
 
         // Enet extra registers (0x18000-0x1a007): crbdp, cpfxbdp, ppfxbdp
         match offset {
-            ENET_CRBDP   => return BusStatus::Data(self.pdma_channels[10].lock().crbdp),
-            ENET_CPFXBDP => return BusStatus::Data(self.pdma_channels[11].lock().cpfxbdp),
-            ENET_PPFXBDP => return BusStatus::Data(self.pdma_channels[11].lock().ppfxbdp),
+            ENET_CRBDP   => return BusRead32::ok(self.pdma_channels[10].lock().crbdp),
+            ENET_CPFXBDP => return BusRead32::ok(self.pdma_channels[11].lock().cpfxbdp),
+            ENET_PPFXBDP => return BusRead32::ok(self.pdma_channels[11].lock().ppfxbdp),
             _ => {}
         }
 
         // FIFOs (0x28000 - 0x2FFFF) - these should use 8-bit access but allow 32-bit for legacy
         if (SCSI0_FIFO_BASE..MISC_BASE).contains(&offset) {
-            return BusStatus::Data(0); // Placeholder
+            return BusRead32::ok(0); // Placeholder
         }
 
         // SCSI Registers (0x40000 - 0x40007) - 8-bit devices, convert to 32-bit
         if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset) {
-            match self.read8(addr) {
-                BusStatus::Data8(v) => return BusStatus::Data(v as u32),
-                other => return other,
-            }
+            let r = self.read8(addr);
+            return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
 
         // SEEQ8003 Ethernet Controller (0x54000 - 0x5401F) - 8-bit device, convert to 32-bit
         if (SEEQ_BASE..SEEQ_BASE + 0x20).contains(&offset) {
-            match self.read8(addr) {
-                BusStatus::Data8(v) => return BusStatus::Data(v as u32),
-                other => return other,
-            }
+            let r = self.read8(addr);
+            return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
 
         // Misc Registers (0x30000 - 0x30014)
         if (MISC_BASE..MISC_BASE + 0x1000).contains(&offset) {
             let state = self.state.lock();
             match offset - MISC_BASE {
-                MISC_INTSTAT => return BusStatus::Data(state.intstat),
-                MISC_GIO_MISC => return BusStatus::Data(state.gio_misc),
+                MISC_INTSTAT => return BusRead32::ok(state.intstat),
+                MISC_GIO_MISC => return BusRead32::ok(state.gio_misc),
                 MISC_EEPROM_DATA => {
                     let mut val = state.eeprom_reg;
                     if self.eeprom.lock().get_do() {
@@ -1434,16 +1423,16 @@ impl BusDevice for Hpc3 {
                     } else {
                         val &= !(1 << 4);
                     }
-                    return BusStatus::Data(val);
+                    return BusRead32::ok(val);
                 }
-                MISC_INTSTAT_BUG => return BusStatus::Data(state.intstat), // Mirror?
+                MISC_INTSTAT_BUG => return BusRead32::ok(state.intstat), // Mirror?
                 MISC_GIO_BUS_ERROR => {
                     dlog_dev!(LogModule::Hpc3, "HPC3: Read GIO_BUS_ERROR at {:08x}", addr);
-                    return BusStatus::Data(0);
+                    return BusRead32::ok(0);
                 }
                 _ => {
                     dlog_dev!(LogModule::Hpc3, "HPC3: Read Misc addr {:08x}", addr);
-                    return BusStatus::Data(0);
+                    return BusRead32::ok(0);
                 }
             }
         }
@@ -1452,22 +1441,20 @@ impl BusDevice for Hpc3 {
         if (PBUS_CFGPIO_BASE..PBUS_PROM_WE).contains(&offset) {
             let idx = (offset - PBUS_CFGPIO_BASE) / PBUS_CFGPIO_STRIDE;
             dlog_dev!(LogModule::Hpc3, "HPC3: Read PBUS PIO Config[{}] at {:08x}", idx, addr);
-            return BusStatus::Data(self.pdma_ops[idx as usize].read_piocfg(&mut self.pdma_channels[idx as usize].lock()));
+            return BusRead32::ok(self.pdma_ops[idx as usize].read_piocfg(&mut self.pdma_channels[idx as usize].lock()));
         }
 
         // PBUS DMA Config
         if (PBUS_CFGDMA_BASE..PBUS_CFGPIO_BASE).contains(&offset) {
             let idx = (offset - PBUS_CFGDMA_BASE) / PBUS_CFGDMA_STRIDE;
             dlog_dev!(LogModule::Hpc3, "HPC3: Read PBUS DMA Config[{}] at {:08x}", idx, addr);
-            return BusStatus::Data(self.pdma_ops[idx as usize].read_dmacfg(&mut self.pdma_channels[idx as usize].lock()));
+            return BusRead32::ok(self.pdma_ops[idx as usize].read_dmacfg(&mut self.pdma_channels[idx as usize].lock()));
         }
 
         // Channel 0: HAL2 (0x58000 - 0x583FF)
         if (HAL2_BASE..HAL2_BASE + 0x400).contains(&offset) {
-            match self.hal2.read(offset - HAL2_BASE) {
-                BusStatus::Data16(v) => return BusStatus::Data(v as u32),
-                other => return other,
-            }
+            let r = self.hal2.read(offset - HAL2_BASE);
+            return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
 
         // PBUS PIO (0x58000 - 0x5BFFF)
@@ -1477,9 +1464,9 @@ impl BusDevice for Hpc3 {
             dlog_dev!(LogModule::Hpc3, "HPC3: Read32 PBUS PIO Channel {} (offset {:05x})", channel, offset);
             let idx = ((offset - PBUS_PIO_BASE) >> 2) as usize;
             if idx < state.pbus_pio.len() {
-                return BusStatus::Data(state.pbus_pio[idx]);
+                return BusRead32::ok(state.pbus_pio[idx]);
             }
-            return BusStatus::Data(0);
+            return BusRead32::ok(0);
         }
 
         // PBUS BBRAM (RTC) - 32-bit access with sparse packing
@@ -1489,20 +1476,15 @@ impl BusDevice for Hpc3 {
             let rtc_offset = (offset - PBUS_BBRAM) as u32;
             // For 32-bit reads, only the bottom byte is valid
             let byte_index = rtc_offset >> 2;
-            match self.rtc.read8(byte_index) {
-                BusStatus::Data8(val) => {
-                    // Return byte in bottom position (big-endian)
-                    return BusStatus::Data(val as u32);
-                }
-                other => return other,
-            }
+            let r = self.rtc.read8(byte_index);
+            return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
 
         dlog_dev!(LogModule::Hpc3, "HPC3: Read addr {:08x}", addr);
-        BusStatus::Data(0)
+        BusRead32::ok(0)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         let offset = addr - HPC3_BASE;
 
         // IOC (0x59800 - 0x598FF) - should not use 32-bit access, but allow for legacy
@@ -1535,7 +1517,7 @@ impl BusDevice for Hpc3 {
             if (val & ENET_RX_RESET_CLRINT) != 0 {
                 self.seeq.reset_interrupt();
             }
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // PBUS DMA (0-7), SCSI (0-1), Ethernet RX/TX
@@ -1544,14 +1526,14 @@ impl BusDevice for Hpc3 {
             let idx = (offset / 0x2000) as usize;
             let reg = offset % 0x2000;
             self.pdma_ops[idx].write(&mut self.pdma_channels[idx].lock(), reg, val);
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // Enet extra registers (0x18000-0x1a007): crbdp, cpfxbdp, ppfxbdp
         match offset {
-            ENET_CRBDP   => { self.pdma_channels[10].lock().crbdp   = val; return BusStatus::Ready; }
-            ENET_CPFXBDP => { self.pdma_channels[11].lock().cpfxbdp = val; return BusStatus::Ready; }
-            ENET_PPFXBDP => { self.pdma_channels[11].lock().ppfxbdp = val; return BusStatus::Ready; }
+            ENET_CRBDP   => { self.pdma_channels[10].lock().crbdp   = val; return BUS_OK; }
+            ENET_CPFXBDP => { self.pdma_channels[11].lock().cpfxbdp = val; return BUS_OK; }
+            ENET_PPFXBDP => { self.pdma_channels[11].lock().ppfxbdp = val; return BUS_OK; }
             _ => {}
         }
 
@@ -1591,7 +1573,7 @@ impl BusDevice for Hpc3 {
                 }
                 _ => {}
             }
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // PBUS PIO Config
@@ -1599,7 +1581,7 @@ impl BusDevice for Hpc3 {
             let idx = (offset - PBUS_CFGPIO_BASE) / PBUS_CFGPIO_STRIDE;
             dlog_dev!(LogModule::Hpc3, "HPC3: PBUS PIO Config[{}] ({:08x}) = {:08x}", idx, addr, val);
             self.pdma_ops[idx as usize].write_piocfg(&mut self.pdma_channels[idx as usize].lock(), val);
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // PBUS DMA Config
@@ -1607,7 +1589,7 @@ impl BusDevice for Hpc3 {
             let idx = (offset - PBUS_CFGDMA_BASE) / PBUS_CFGDMA_STRIDE;
             dlog_dev!(LogModule::Hpc3, "HPC3: PBUS DMA Config[{}] ({:08x}) = {:08x}", idx, addr, val);
             self.pdma_ops[idx as usize].write_dmacfg(&mut self.pdma_channels[idx as usize].lock(), val);
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // Channel 0: HAL2 (0x58000 - 0x583FF)
@@ -1624,7 +1606,7 @@ impl BusDevice for Hpc3 {
             if idx < state.pbus_pio.len() {
                 state.pbus_pio[idx] = val;
             }
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         // PBUS BBRAM (RTC) - 32-bit access with sparse packing
@@ -1641,10 +1623,10 @@ impl BusDevice for Hpc3 {
         // Log other writes
         dlog_dev!(LogModule::Hpc3, "HPC3: Write addr {:08x} = {:08x}", addr, val);
 
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read16(&self, addr: u32) -> BusStatus {
+    fn read16(&self, addr: u32) -> BusRead16 {
         let offset = addr - HPC3_BASE;
 
         // HAL2 registers are 16-bit; forward directly
@@ -1652,10 +1634,10 @@ impl BusDevice for Hpc3 {
             return self.hal2.read(offset - HAL2_BASE);
         }
 
-        BusStatus::Data16(0)
+        BusRead16::ok(0)
     }
 
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
+    fn write16(&self, addr: u32, val: u16) -> u32 {
         let offset = addr - HPC3_BASE;
 
         // HAL2 registers are 16-bit; forward directly
@@ -1663,7 +1645,7 @@ impl BusDevice for Hpc3 {
             return self.hal2.write(offset - HAL2_BASE, val);
         }
 
-        BusStatus::Ready
+        BUS_OK
     }
 }
 

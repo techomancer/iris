@@ -17,7 +17,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use crate::traits::{BusStatus, BusDevice, Device};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
 use crate::saa7191::Saa7191;
 use crate::devlog::{LogModule, devlog_is_active};
 
@@ -483,9 +483,7 @@ impl Vino {
     fn descriptor_fetch(chan: &mut ChannelState, addr: u32, mem: &Arc<dyn BusDevice>) {
         for i in 0..4usize {
             let word_addr = addr.wrapping_add((i as u32) * 4);
-            let word = match mem.read32(word_addr) {
-                BusStatus::Data(v) => v,
-                _ => {
+            let word = { let _r = mem.read32(word_addr); if _r.is_ok() { _r.data } else {
                     eprintln!("VINO: descriptor_fetch read error at {:#010x}", word_addr);
                     0
                 }
@@ -859,28 +857,28 @@ impl Vino {
 // register (bit 2 is masked in read_reg/write_reg, matching mc.rs `& !4`).
 
 impl BusDevice for Vino {
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         let offset = addr.wrapping_sub(VINO_BASE);
-        BusStatus::Data(self.read_reg(offset))
+        BusRead32::ok(self.read_reg(offset))
     }
 
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         let offset = addr.wrapping_sub(VINO_BASE);
         self.write_reg(offset, val);
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusStatus {
+    fn read64(&self, addr: u32) -> BusRead64 {
         // GIO64 double-word: high word at addr, low word at addr+4.
-        let hi = match self.read32(addr)       { BusStatus::Data(v) => v, _ => 0 };
-        let lo = match self.read32(addr + 4)   { BusStatus::Data(v) => v, _ => 0 };
-        BusStatus::Data64(((hi as u64) << 32) | lo as u64)
+        let hi = { let _r = self.read32(addr); if _r.is_ok() { let v = _r.data; v } else { 0 } };
+        let lo = { let _r = self.read32(addr + 4); if _r.is_ok() { let v = _r.data; v } else { 0 } };
+        BusRead64::ok(((hi as u64) << 32) | lo as u64)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         self.write32(addr,     (val >> 32) as u32);
         self.write32(addr + 4, val as u32);
-        BusStatus::Ready
+        BUS_OK
     }
 }
 

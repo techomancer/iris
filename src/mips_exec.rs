@@ -410,10 +410,21 @@ pub const EXEC_IS_EXCEPTION:       ExecStatus = 1 << 27; // 0x0800_0000
 pub const EXEC_IS_TLB_REFILL:      ExecStatus = 1 << 28; // 0x1000_0000
 pub const EXEC_IS_XTLB_REFILL:     ExecStatus = 1 << 29; // 0x2000_0000
 
+// Bus error ExecStatus values — also exported as BUS_ERR / BUS_VCE in traits.rs.
+// The values MUST stay identical; enforced by compile-time asserts in traits.rs.
+pub const EXEC_BUS_ERR: ExecStatus = exec_exception_const(EXC_DBE);  // 0x0800_001C
+pub const EXEC_BUS_VCE: ExecStatus = exec_exception_const(EXC_VCED); // 0x0800_007C
+
+/// `const`-evaluable version of exec_exception (for use in const initializers).
+#[inline(always)]
+pub const fn exec_exception_const(code: u32) -> ExecStatus {
+    EXEC_IS_EXCEPTION | (code << crate::mips_core::CAUSE_EXCCODE_SHIFT)
+}
+
 /// Build an exception ExecStatus from an EXC_* code.
 #[inline(always)]
 pub fn exec_exception(code: u32) -> ExecStatus {
-    EXEC_IS_EXCEPTION | (code << crate::mips_core::CAUSE_EXCCODE_SHIFT)
+    exec_exception_const(code)
 }
 
 /// Build a TLB-refill ExecStatus from an EXC_* code (32-bit UTLB vector).
@@ -1515,14 +1526,16 @@ For R4000SC/MC CPUs:
 
             #[cfg(feature = "developer")]
             self.uncached_fetch_count.fetch_add(1, Ordering::Relaxed);
-            match self.sysad.read32(phys_addr) {
-                BusStatus::Data(raw) => {
-                    if self.ins.raw != raw { self.ins.decoded = false; }
-                    self.ins.raw = raw;
-                    Ok(&self.ins as *const DecodedInstr)
-                }
-                BusStatus::Busy => Err(EXEC_RETRY),
-                s => { eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:?}", virt_addr, phys_addr, s); Err(exec_exception(EXC_IBE)) }
+            let r = self.sysad.read32(phys_addr);
+            if r.is_ok() {
+                if self.ins.raw != r.data { self.ins.decoded = false; }
+                self.ins.raw = r.data;
+                Ok(&self.ins as *const DecodedInstr)
+            } else if r.status == BUS_BUSY {
+                Err(EXEC_RETRY)
+            } else {
+                eprintln!("Bus error on instruction fetch: PC={:016x} PA={:08x} status={:08x}", virt_addr, phys_addr, r.status);
+                Err(exec_exception(EXC_IBE))
             }
         }
     }
@@ -1573,51 +1586,13 @@ For R4000SC/MC CPUs:
                         return Err(EXEC_BREAKPOINT);
                     }
 
-                    match size {
-                        MemAccessSize::Byte => {
-                            match self.cache.read(virt_addr, phys_addr, 1) {
-                                BusStatus::Data8(val) => Ok(val as u64),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                _ => Err(exec_exception(EXC_DBE)),
-                            }
-                        }
-                        MemAccessSize::Half => {
-                            match self.cache.read(virt_addr, phys_addr, 2) {
-                                BusStatus::Data16(val) => Ok(val as u64),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                _ => Err(exec_exception(EXC_DBE)),
-                            }
-                        }
-                        MemAccessSize::Word => {
-                            match self.cache.read(virt_addr, phys_addr, 4) {
-                                BusStatus::Data(val) => Ok(val as u64),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                _ => Err(exec_exception(EXC_DBE)),
-                            }
-                        }
-                        MemAccessSize::Double => {
-                            match self.cache.read(virt_addr, phys_addr, 8) {
-                                BusStatus::Data64(val) => Ok(val),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                _ => Err(exec_exception(EXC_DBE)),
-                            }
-                        }
+                    let nbytes = size.bytes();
+                    let r = self.cache.read(virt_addr, phys_addr, nbytes);
+                    if r.is_ok() {
+                        Ok(r.data)
+                    } else {
+                        if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
+                        Err(r.status) // BUS_BUSY, BUS_VCE, or BUS_ERR — all valid ExecStatus
                     }
                 } else {
                     // Uncached access - use appropriate width
@@ -1626,50 +1601,21 @@ For R4000SC/MC CPUs:
                         return Err(EXEC_BREAKPOINT);
                     }
 
-                    let res = match size {
-                        MemAccessSize::Byte => {
-                            match self.sysad.read8(phys_addr as u32) {
-                                BusStatus::Data8(val) => Ok(val as u64),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                s => { eprintln!("Bus error on uncached read8:  PC={:016x} VA={:016x} PA={:016x} status={:?}", self.core.pc, virt_addr, phys_addr, s); Err(exec_exception(EXC_DBE)) }
+                    let res = {
+                        let r = match size {
+                            MemAccessSize::Byte   => { let r = self.sysad.read8(phys_addr as u32);  BusRead64 { status: r.status, data: r.data as u64 } }
+                            MemAccessSize::Half   => { let r = self.sysad.read16(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
+                            MemAccessSize::Word   => { let r = self.sysad.read32(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
+                            MemAccessSize::Double =>   self.sysad.read64(phys_addr as u32),
+                        };
+                        if r.is_ok() {
+                            Ok(r.data)
+                        } else {
+                            if r.status != BUS_BUSY {
+                                eprintln!("Bus error on uncached read{}: PC={:016x} VA={:016x} PA={:016x} status={:08x}", size.bytes()*8, self.core.pc, virt_addr, phys_addr, r.status);
+                                if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                             }
-                        }
-                        MemAccessSize::Half => {
-                            match self.sysad.read16(phys_addr as u32) {
-                                BusStatus::Data16(val) => Ok(val as u64),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                s => { eprintln!("Bus error on uncached read16: PC={:016x} VA={:016x} PA={:016x} status={:?}", self.core.pc, virt_addr, phys_addr, s); Err(exec_exception(EXC_DBE)) }
-                            }
-                        }
-                        MemAccessSize::Word => {
-                            match self.sysad.read32(phys_addr as u32) {
-                                BusStatus::Data(val) => Ok(val as u64),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                s => { eprintln!("Bus error on uncached read32: PC={:016x} VA={:016x} PA={:016x} status={:?}", self.core.pc, virt_addr, phys_addr, s); Err(exec_exception(EXC_DBE)) }
-                            }
-                        }
-                        MemAccessSize::Double => {
-                            match self.sysad.read64(phys_addr as u32) {
-                                BusStatus::Data64(val) => Ok(val),
-                                BusStatus::Busy => Err(EXEC_RETRY),
-                                BusStatus::VirtualCoherencyException => {
-                                    if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                                    Err(exec_exception(EXC_VCED))
-                                }
-                                s => { eprintln!("Bus error on uncached read64: PC={:016x} VA={:016x} PA={:016x} status={:?}", self.core.pc, virt_addr, phys_addr, s); Err(exec_exception(EXC_DBE)) }
-                            }
+                            Err(r.status) // BUS_BUSY or BUS_ERR — both valid ExecStatus
                         }
                     };
 
@@ -1780,15 +1726,11 @@ For R4000SC/MC CPUs:
                             self.cache.write64_masked(virt_addr, phys_addr, val, mask)
                         }
                     };
-                    match status {
-                        BusStatus::Ready => EXEC_COMPLETE,
-                        BusStatus::Busy => EXEC_RETRY,
-                        BusStatus::VirtualCoherencyException => {
-                            if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                            exec_exception(EXC_VCED)
-                        }
-                        _ => exec_exception(EXC_DBE),
+                    // status is already a valid ExecStatus (BUS_OK/BUSY/VCE/ERR)
+                    if status != BUS_OK && status != BUS_BUSY {
+                        if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     }
+                    status
                 } else {
                     // Uncached access - use appropriate width.
                     // For partial masked stores (SDL/SDR/SWL/SWR), decompose into
@@ -1802,18 +1744,18 @@ For R4000SC/MC CPUs:
 
                     if mask == full_mask {
                         // Fast path: normal full-width store
-                        let status = match size {
+                        let ws = match size {
                             MemAccessSize::Byte   => self.sysad.write8(phys_addr as u32, val as u8),
                             MemAccessSize::Half   => self.sysad.write16(phys_addr as u32, val as u16),
                             MemAccessSize::Word   => self.sysad.write32(phys_addr as u32, val as u32),
                             MemAccessSize::Double => self.sysad.write64(phys_addr as u32, val),
                         };
-                        match status {
-                            BusStatus::Ready => EXEC_COMPLETE,
-                            BusStatus::Busy => EXEC_RETRY,
-                            BusStatus::VirtualCoherencyException => exec_exception(EXC_VCED),
-                            s => { eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:?}", size.bytes()*8, self.core.pc, virt_addr, phys_addr, val, s); exec_exception(EXC_DBE) }
+                        if ws != BUS_OK {
+                            if ws != BUS_BUSY {
+                                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", size.bytes()*8, self.core.pc, virt_addr, phys_addr, val, ws);
+                            }
                         }
+                        ws // already a valid ExecStatus
                     } else {
                         // Slow path: partial masked store - decompose into byte writes.
                         // val and mask are in big-endian space for the given size:
@@ -1827,14 +1769,16 @@ For R4000SC/MC CPUs:
                             let byte_mask = (mask >> (bit * 8)) & 0xFF;
                             if byte_mask != 0 {
                                 let byte_val = (val >> (bit * 8)) as u8;
-                                match self.sysad.write8((phys_addr as u32) + i as u32, byte_val) {
-                                    BusStatus::Ready => {}
-                                    BusStatus::Busy => return EXEC_RETRY,
-                                    s => { eprintln!("Bus error on uncached write8 (masked): PC={:016x} VA={:016x} PA={:016x} byte[{}]={:02x} status={:?}", self.core.pc, virt_addr, phys_addr, i, byte_val, s); return exec_exception(EXC_DBE); }
+                                let ws = self.sysad.write8((phys_addr as u32) + i as u32, byte_val);
+                                if ws != BUS_OK {
+                                    if ws != BUS_BUSY {
+                                        eprintln!("Bus error on uncached write8 (masked): PC={:016x} VA={:016x} PA={:016x} byte[{}]={:02x} status={:08x}", self.core.pc, virt_addr, phys_addr, i, byte_val, ws);
+                                    }
+                                    return ws;
                                 }
                             }
                         }
-                        EXEC_COMPLETE
+                        BUS_OK
                     }
                 }
             }

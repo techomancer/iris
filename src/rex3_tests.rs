@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use crate::traits::BusStatus;
+use crate::traits::{BusRead32, BusRead64};
 use super::*;
 
 // ---------------------------------------------------------------------------
@@ -63,44 +63,34 @@ fn wait(rex: &Rex3) {
 
 /// Read a 32-bit context register.  Blocks until the GFIFO is idle first.
 fn read_reg(rex: &Rex3, offset: u32) -> u32 {
-    match rex.read32(set_addr(offset)) {
-        BusStatus::Data(v) => v,
-        _ => panic!("read_reg: bad status for offset {offset:#x}"),
-    }
+    let r: BusRead32 = rex.read32(set_addr(offset));
+    if r.is_ok() { r.data } else { panic!("read_reg: bad status for offset {offset:#x}") }
 }
 
 /// Read from HOSTRW0 GO space: returns current word, then triggers next batch.
 /// Use for all reads except the final one in a sequence.
 fn read_hostrw32(rex: &Rex3) -> u32 {
-    match rex.read32(go_addr(REX3_HOSTRW0)) {
-        BusStatus::Data(v) => v,
-        _ => panic!("read_hostrw32: bad status"),
-    }
+    let r: BusRead32 = rex.read32(go_addr(REX3_HOSTRW0));
+    if r.is_ok() { r.data } else { panic!("read_hostrw32: bad status") }
 }
 
 /// Read from HOSTRW0 SET space: returns current word, does NOT trigger next batch.
 /// Use for the final read in a HOSTR sequence.
 fn read_hostrw32_last(rex: &Rex3) -> u32 {
-    match rex.read32(set_addr(REX3_HOSTRW0)) {
-        BusStatus::Data(v) => v,
-        _ => panic!("read_hostrw32_last: bad status"),
-    }
+    let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW0));
+    if r.is_ok() { r.data } else { panic!("read_hostrw32_last: bad status") }
 }
 
 /// Read from HOSTRW0 GO space (64-bit): returns current word, triggers next batch.
 fn read_hostrw64(rex: &Rex3) -> u64 {
-    match rex.read64(go_addr(REX3_HOSTRW0)) {
-        BusStatus::Data64(v) => v,
-        _ => panic!("read_hostrw64: bad status"),
-    }
+    let r: BusRead64 = rex.read64(go_addr(REX3_HOSTRW0));
+    if r.is_ok() { r.data } else { panic!("read_hostrw64: bad status") }
 }
 
 /// Read from HOSTRW0 SET space (64-bit): returns current word, no next-batch trigger.
 fn read_hostrw64_last(rex: &Rex3) -> u64 {
-    match rex.read64(set_addr(REX3_HOSTRW0)) {
-        BusStatus::Data64(v) => v,
-        _ => panic!("read_hostrw64_last: bad status"),
-    }
+    let r: BusRead64 = rex.read64(set_addr(REX3_HOSTRW0));
+    if r.is_ok() { r.data } else { panic!("read_hostrw64_last: bad status") }
 }
 
 /// Write a 32-bit word to HOSTRW0 (CPU→REX draw path).
@@ -1000,10 +990,8 @@ fn test_hostrw_gio_bus_walking_ones_32bit() {
         let w = 1u32 << b;
         rex.write32(set_addr(REX3_HOSTRW0), w);
         // SET read flushes GFIFO and returns current hostrw register.
-        let got = match rex.read32(set_addr(REX3_HOSTRW0)) {
-            BusStatus::Data(v) => v,
-            _ => panic!("bad status"),
-        };
+        let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW0));
+        let got = if r.is_ok() { r.data } else { panic!("bad status") };
         assert_eq!(got, w, "HOSTRW0 SET loopback bit {b}: got {got:#010x} expected {w:#010x}");
     }
 }
@@ -1017,10 +1005,8 @@ fn test_hostrw_gio_bus_walking_ones_hostrw1() {
     for b in 0..32u32 {
         let w = 1u32 << b;
         rex.write32(set_addr(REX3_HOSTRW1), w);
-        let got = match rex.read32(set_addr(REX3_HOSTRW1)) {
-            BusStatus::Data(v) => v,
-            _ => panic!("bad status"),
-        };
+        let r: BusRead32 = rex.read32(set_addr(REX3_HOSTRW1));
+        let got = if r.is_ok() { r.data } else { panic!("bad status") };
         assert_eq!(got, w, "HOSTRW1 SET loopback bit {b}: got {got:#010x} expected {w:#010x}");
     }
 }

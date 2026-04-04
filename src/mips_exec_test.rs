@@ -7,7 +7,7 @@ mod tests {
     use crate::mips_isa::*;
     use crate::mips_tlb::PassthroughTlb;
     use crate::mips_cache_v2::{PassthroughCache, MipsCache, R4000Cache};
-    use crate::traits::{BusStatus, BusDevice};
+    use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BusDevice};
     use std::sync::Arc;
 
     // Mock Memory Interface
@@ -62,53 +62,53 @@ mod tests {
     }
 
     impl BusDevice for MockMemory {
-        fn read8(&self, addr: u32) -> BusStatus {
-            BusStatus::Data8(self.get_byte(addr as u64))
+        fn read8(&self, addr: u32) -> BusRead8 {
+            BusRead8::ok(self.get_byte(addr as u64))
         }
 
-        fn write8(&self, addr: u32, val: u8) -> BusStatus {
+        fn write8(&self, addr: u32, val: u8) -> u32 {
             self.set_byte(addr as u64, val);
-            BusStatus::Ready
+            BUS_OK
         }
 
-        fn read16(&self, addr: u32) -> BusStatus {
+        fn read16(&self, addr: u32) -> BusRead16 {
             let aligned_addr = (addr & !1) as u64;
             let mut bytes = [0u8; 2];
             for i in 0..2 {
                 bytes[i] = self.get_byte(aligned_addr + i as u64);
             }
-            BusStatus::Data16(u16::from_be_bytes(bytes))
+            BusRead16::ok(u16::from_be_bytes(bytes))
         }
 
-        fn write16(&self, addr: u32, val: u16) -> BusStatus {
+        fn write16(&self, addr: u32, val: u16) -> u32 {
             let aligned_addr = (addr & !1) as u64;
             let bytes = val.to_be_bytes();
             for i in 0..2 {
                 self.set_byte(aligned_addr + i as u64, bytes[i]);
             }
-            BusStatus::Ready
+            BUS_OK
         }
 
-        fn read32(&self, addr: u32) -> BusStatus {
+        fn read32(&self, addr: u32) -> BusRead32 {
             let aligned_addr = (addr & !3) as u64;
-            BusStatus::Data(self.get_word(aligned_addr))
+            BusRead32::ok(self.get_word(aligned_addr))
         }
 
-        fn write32(&self, addr: u32, val: u32) -> BusStatus {
+        fn write32(&self, addr: u32, val: u32) -> u32 {
             let aligned_addr = (addr & !3) as u64;
             self.set_word(aligned_addr, val);
-            BusStatus::Ready
+            BUS_OK
         }
 
-        fn read64(&self, addr: u32) -> BusStatus {
+        fn read64(&self, addr: u32) -> BusRead64 {
             let aligned_addr = (addr & !7) as u64;
-            BusStatus::Data64(self.get_double(aligned_addr))
+            BusRead64::ok(self.get_double(aligned_addr))
         }
 
-        fn write64(&self, addr: u32, val: u64) -> BusStatus {
+        fn write64(&self, addr: u32, val: u64) -> u32 {
             let aligned_addr = (addr & !7) as u64;
             self.set_double(aligned_addr, val);
-            BusStatus::Ready
+            BUS_OK
         }
     }
 
@@ -2712,7 +2712,7 @@ mod tests {
         use crate::mips_cache_v2::{R4000Cache, FetchResult};
         #[allow(unused_imports)]
         use crate::mips_core::STATUS_KX;
-        use crate::traits::BusStatus;
+        use crate::traits::{BUS_OK, BUS_VCE};
 
         let (exec, mem) = create_executor_with_r4000cache();
 
@@ -2731,7 +2731,8 @@ mod tests {
 
         // First access with virt1 - this fills L2 with PIdx=0
         let result = exec.cache.read(virt1, phys_addr, 4);
-        assert_eq!(result, BusStatus::Data(0xDEADBEEF), "First access should succeed");
+        assert_eq!(result.status, BUS_OK, "First access should succeed");
+        assert_eq!(result.data, 0xDEADBEEF, "First access should return correct data");
 
         // Second access with virt2 mapping to same phys_addr but different virt PIdx
         // This should trigger VCE because:
@@ -2739,7 +2740,7 @@ mod tests {
         // - L2 hit (same physical address)
         // - virt PIdx (1) != stored PIdx in L2 tag (0)
         let result = exec.cache.read(virt2, phys_addr, 4);
-        assert_eq!(result, BusStatus::VirtualCoherencyException,
+        assert_eq!(result.status, BUS_VCE,
                    "Second access with different virtual index should trigger VCE");
 
         // Test VCEI (instruction fetch)

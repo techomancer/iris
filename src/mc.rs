@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::devlog::LogModule;
 use std::sync::mpsc;
 use std::thread;
-use crate::traits::{BusStatus, BusDevice, Device, Signal, Resettable, Saveable, MachineEvent};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Signal, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::{Ioc, IocInterrupt};
@@ -396,15 +396,9 @@ impl MemoryController {
             if let Some(phys) = self.phys.get() {
                 // Read PTE — 4 or 8 bytes. For 8-byte PTEs, read64 and take the low word.
                 let pte_opt = if pte_8byte {
-                    match phys.read64(pte_addr) {
-                        BusStatus::Data64(d) => Some(d as u32),
-                        _ => None,
-                    }
+                    { let _r = phys.read64(pte_addr); if _r.is_ok() { Some(_r.data as u32) } else { None } }
                 } else {
-                    match phys.read32(pte_addr) {
-                        BusStatus::Data(d) => Some(d),
-                        _ => None,
-                    }
+                    { let _r = phys.read32(pte_addr); if _r.is_ok() { let d = _r.data as _; Some(d) } else { None } }
                 };
 
                 if let Some(pte) = pte_opt {
@@ -552,10 +546,7 @@ impl MemoryController {
                                     } else {
                                         // GIO -> Mem: read qword from GIO, unpack bytes to memory
                                         let length = byte_count.min(8);
-                                        let data = match phys.read64(gio_addr) {
-                                            BusStatus::Data64(d) => d,
-                                            _ => 0u64,
-                                        };
+                                        let data = { let _r = phys.read64(gio_addr); if _r.is_ok() { let d = _r.data as _; d } else { 0u64 } };
                                         let mut shift = 56u32;
                                         for _ in 0..length {
                                             let byte = (data >> shift) as u8;
@@ -584,10 +575,7 @@ impl MemoryController {
                                                 None => { exc = true; break 'dma_loop; }
                                             }
                                         } else { mem_vaddr };
-                                        let byte = match phys.read8(phys_addr) {
-                                            BusStatus::Data8(b) => b,
-                                            _ => 0,
-                                        };
+                                        let byte = { let _r = phys.read8(phys_addr); if _r.is_ok() { let b = _r.data as _; b } else { 0 } };
                                         data |= (byte as u64) << shift;
                                         if dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
                                         else       { mem_vaddr = mem_vaddr.wrapping_sub(1); }
@@ -715,11 +703,11 @@ impl MemoryControllerState {
 }
 
 impl BusDevice for MemoryController {
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         let offset = (addr - MC_BASE) as usize;
 
         if offset >= MC_SIZE as usize {
-            return BusStatus::Error;
+            return BusRead32::err();
         }
         
         let offset = offset & !4;
@@ -737,22 +725,22 @@ impl BusDevice for MemoryController {
                 } else {
                     val &= !(1 << 4);
                 }
-                BusStatus::Data(val)
+                BusRead32::ok(val)
             }
             REG_MEMCFG0 => {
                 let val = state.regs[(REG_MEMCFG0 / 4) as usize];
                 dlog_dev!(LogModule::Mc, "MC: Read MEMCFG0 = {:08x}", val);
-                BusStatus::Data(val)
+                BusRead32::ok(val)
             }
             REG_MEMCFG1 => {
                 let val = state.regs[(REG_MEMCFG1 / 4) as usize];
                 dlog_dev!(LogModule::Mc, "MC: Read MEMCFG1 = {:08x}", val);
-                BusStatus::Data(val)
+                BusRead32::ok(val)
             }
             REG_SYS_SEMAPHORE => {
                 let val = if state.sys_semaphore { 1 } else { 0 };
                 state.sys_semaphore = true;
-                BusStatus::Data(val)
+                BusRead32::ok(val)
             }
             off if off >= REG_SEMAPHORE_0 && off <= 0x1F000 => {
                 // User Semaphores 0-15 at 0x10000, 0x11000, ..., 0x1F000
@@ -760,40 +748,40 @@ impl BusDevice for MemoryController {
                     let idx = ((off - REG_SEMAPHORE_0) >> 12) as usize;
                     let val = if state.user_semaphores[idx] { 1 } else { 0 };
                     state.user_semaphores[idx] = true;
-                    BusStatus::Data(val)
+                    BusRead32::ok(val)
                 } else {
-                    BusStatus::Data(0)
+                    BusRead32::ok(0)
                 }
             }
-            REG_DMA_GIO_MASK => BusStatus::Data(self.giodma.state.lock().gio_mask),
-            REG_DMA_GIO_SUB => BusStatus::Data(self.giodma.state.lock().gio_sub),
-            REG_DMA_CAUSE => BusStatus::Data(self.giodma.state.lock().cause),
-            REG_DMA_CTL => BusStatus::Data(self.giodma.state.lock().ctl),
+            REG_DMA_GIO_MASK => BusRead32::ok(self.giodma.state.lock().gio_mask),
+            REG_DMA_GIO_SUB => BusRead32::ok(self.giodma.state.lock().gio_sub),
+            REG_DMA_CAUSE => BusRead32::ok(self.giodma.state.lock().cause),
+            REG_DMA_CTL => BusRead32::ok(self.giodma.state.lock().ctl),
             off if (0x180..0x1C0).contains(&off) => {
                 let idx = ((off - 0x180) / 0x10) as usize;
                 let is_lo = (off & 0x8) != 0;
                 let state = self.giodma.state.lock();
                 if idx < 4 {
                     if is_lo {
-                        BusStatus::Data(state.tlb_lo[idx])
+                        BusRead32::ok(state.tlb_lo[idx])
                     } else {
-                        BusStatus::Data(state.tlb_hi[idx])
+                        BusRead32::ok(state.tlb_hi[idx])
                     }
                 } else {
-                    BusStatus::Data(0)
+                    BusRead32::ok(0)
                 }
             }
             REG_RPSS_CTR => {
                 let val = state.regs[(REG_RPSS_CTR / 4) as usize];
                 dlog_dev!(LogModule::Mc, "MC: Read RPSS_CTR = {:08x}", val);
-                BusStatus::Data(val)
+                BusRead32::ok(val)
             }
-            REG_DMA_MEMADR => BusStatus::Data(self.giodma.state.lock().memadr),
-            REG_DMA_SIZE => BusStatus::Data(self.giodma.state.lock().size),
-            REG_DMA_STRIDE => BusStatus::Data(self.giodma.state.lock().stride),
-            REG_DMA_GIO_ADR => BusStatus::Data(self.giodma.state.lock().gio_adr),
-            REG_DMA_MODE => BusStatus::Data(self.giodma.state.lock().mode),
-            REG_DMA_COUNT => BusStatus::Data(self.giodma.state.lock().count),
+            REG_DMA_MEMADR => BusRead32::ok(self.giodma.state.lock().memadr),
+            REG_DMA_SIZE => BusRead32::ok(self.giodma.state.lock().size),
+            REG_DMA_STRIDE => BusRead32::ok(self.giodma.state.lock().stride),
+            REG_DMA_GIO_ADR => BusRead32::ok(self.giodma.state.lock().gio_adr),
+            REG_DMA_MODE => BusRead32::ok(self.giodma.state.lock().mode),
+            REG_DMA_COUNT => BusRead32::ok(self.giodma.state.lock().count),
             REG_DMA_RUN => {
                 let mut state = self.giodma.state.lock();
                 // Bit 6 is DMA Busy
@@ -801,26 +789,26 @@ impl BusDevice for MemoryController {
                 if !state.run_real {
                     state.run &= !DMA_RUN_RUN; // we stopped already
                 }
-                BusStatus::Data(val) // return latched value
+                BusRead32::ok(val) // return latched value
             }
             _ => {
                 let index = offset / 4;
-                BusStatus::Data(state.regs[index])
+                BusRead32::ok(state.regs[index])
             }
         };
 
-        if let BusStatus::Data(v) = val {
-            dlog_dev!(LogModule::Mc, "MC: Read addr {:08x} = {:08x}", addr, v);
+        if val.is_ok() {
+            dlog_dev!(LogModule::Mc, "MC: Read addr {:08x} = {:08x}", addr, val.data);
         }
         val
     }
 
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         let offset = (addr - MC_BASE) as usize;
         dlog_dev!(LogModule::Mc, "MC: Write addr {:04x} = {:08x}", addr, val);
 
         if offset >= MC_SIZE as usize {
-            return BusStatus::Error;
+            return BUS_ERR;
         }
 
         let offset = offset & !4;
@@ -855,101 +843,101 @@ impl BusDevice for MemoryController {
                     }
                 }
                 state.regs[(REG_CPUCTRL0 / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_CPUCTRL1 => {
                 state.regs[(REG_CPUCTRL1 / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_DOGC => {
                 state.regs[(REG_DOGC / 4) as usize] = 0;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_SYSID => {
                 // Read-only register, ignore writes
-                BusStatus::Ready
+                BUS_OK
             }
             REG_RPSS_DIVIDER => {
                 state.regs[(REG_RPSS_DIVIDER / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_CTRLD => {
                 state.regs[(REG_CTRLD / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_REF_CTR => {
                 state.regs[(REG_REF_CTR / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_GIO64_ARB => {
                 state.regs[(REG_GIO64_ARB / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_CPU_TIME => {
                 state.regs[(REG_CPU_TIME / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_LB_TIME => {
                 state.regs[(REG_LB_TIME / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_MEMCFG0 => {
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG0 = {:08x}", val);
                 state.regs[(REG_MEMCFG0 / 4) as usize] = val;
                 self.fire_memcfg_callback(&state);
-                BusStatus::Ready
+                BUS_OK
             }
             REG_MEMCFG1 => {
                 dlog_dev!(LogModule::Mc, "MC: Write MEMCFG1 = {:08x}", val);
                 state.regs[(REG_MEMCFG1 / 4) as usize] = val;
                 self.fire_memcfg_callback(&state);
-                BusStatus::Ready
+                BUS_OK
             }
             REG_CPU_MEMACC => {
                 state.regs[(REG_CPU_MEMACC / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_GIO_MEMACC => {
                 state.regs[(REG_GIO_MEMACC / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_CPU_ERROR_ADDR => {
                 state.regs[(REG_CPU_ERROR_ADDR / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_CPU_ERROR_STAT => {
                 // Write clears both status and address registers (write-to-clear per MC spec)
                 state.regs[(REG_CPU_ERROR_STAT / 4) as usize] = 0;
                 state.regs[(REG_CPU_ERROR_ADDR / 4) as usize] = 0;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_GIO_ERROR_ADDR => {
                 state.regs[(REG_GIO_ERROR_ADDR / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_GIO_ERROR_STAT => {
                 // Write clears both status and address registers (write-to-clear per MC spec)
                 state.regs[(REG_GIO_ERROR_STAT / 4) as usize] = 0;
                 state.regs[(REG_GIO_ERROR_ADDR / 4) as usize] = 0;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_SYS_SEMAPHORE => {
                 state.sys_semaphore = (val & 1) != 0;
-                BusStatus::Ready
+                BUS_OK
             }
             off if off >= REG_SEMAPHORE_0 && off <= 0x1F000 => {
                 // User Semaphores 0-15 at 0x10000, 0x11000, ..., 0x1F000
                 if (off & 0xFFF) == 0 {
                     let idx = ((off - REG_SEMAPHORE_0) >> 12) as usize;
                     state.user_semaphores[idx] = (val & 1) != 0;
-                    BusStatus::Ready
+                    BUS_OK
                 } else {
                     // Ignore writes to gaps between semaphores
-                    BusStatus::Ready
+                    BUS_OK
                 }
             }
-            REG_DMA_GIO_MASK => { self.giodma.state.lock().gio_mask = val; BusStatus::Ready }
-            REG_DMA_GIO_SUB => { self.giodma.state.lock().gio_sub = val; BusStatus::Ready }
+            REG_DMA_GIO_MASK => { self.giodma.state.lock().gio_mask = val; BUS_OK }
+            REG_DMA_GIO_SUB => { self.giodma.state.lock().gio_sub = val; BUS_OK }
             REG_DMA_CAUSE => {
                 let mut dma = self.giodma.state.lock();
                 dma.cause = val;
@@ -960,9 +948,9 @@ impl BusDevice for MemoryController {
                         ioc.set_interrupt(IocInterrupt::McDma, false);
                     }
                 }
-                BusStatus::Ready
+                BUS_OK
             }
-            REG_DMA_CTL => { self.giodma.state.lock().ctl = val; BusStatus::Ready }
+            REG_DMA_CTL => { self.giodma.state.lock().ctl = val; BUS_OK }
             off if (0x180..0x1C0).contains(&off) => {
                 let idx = ((off - 0x180) / 0x10) as usize;
                 let is_lo = (off & 0x8) != 0;
@@ -974,13 +962,13 @@ impl BusDevice for MemoryController {
                         state.tlb_hi[idx] = val;
                     }
                 }
-                BusStatus::Ready
+                BUS_OK
             }
             REG_RPSS_CTR => {
                 // Read-only register
-                BusStatus::Ready
+                BUS_OK
             }
-            REG_DMA_MEMADR => { self.giodma.state.lock().memadr = val; BusStatus::Ready }
+            REG_DMA_MEMADR => { self.giodma.state.lock().memadr = val; BUS_OK }
             REG_DMA_MEMADRD => {
                 let mut state = self.giodma.state.lock();
                 state.memadr = val;
@@ -993,21 +981,21 @@ impl BusDevice for MemoryController {
                 state.count = (0x01 << 16) | 0x000C;
                 // GIO MODE: Fill=1 (bit 2) -> 0x04
                 state.mode = DMA_MODE_FILL;
-                BusStatus::Ready
+                BUS_OK
             }
             REG_DMA_SIZE => {
                 let mut s = self.giodma.state.lock();
                 s.size = val;
                 s.count = (s.count & 0xffff0000) | (val & 0x0000ffff); // byte_count = line_width
-                BusStatus::Ready
+                BUS_OK
             }
             REG_DMA_STRIDE => {
                 let mut s = self.giodma.state.lock();
                 s.stride = val;
                 s.count = (s.count & 0x0000ffff) | (val & 0x03ff0000); // zoom_count = line_zoom
-                BusStatus::Ready
+                BUS_OK
             }
-            REG_DMA_GIO_ADR => { self.giodma.state.lock().gio_adr = val; BusStatus::Ready }
+            REG_DMA_GIO_ADR => { self.giodma.state.lock().gio_adr = val; BUS_OK }
             REG_DMA_GIO_ADRS => {
                 dlog_dev!(LogModule::Mc, "MC: DMA Start via GIO_ADRS write: {:08x}", val);
                 let mut state = self.giodma.state.lock();
@@ -1016,10 +1004,10 @@ impl BusDevice for MemoryController {
                 state.run_real = true; // set before releasing lock so CPU sees it immediately
                 drop(state);
                 self.giodma.cond.notify_all();
-                BusStatus::Ready
+                BUS_OK
             }
-            REG_DMA_MODE => { self.giodma.state.lock().mode = val; BusStatus::Ready }
-            REG_DMA_COUNT => { self.giodma.state.lock().count = val; BusStatus::Ready }
+            REG_DMA_MODE => { self.giodma.state.lock().mode = val; BUS_OK }
+            REG_DMA_COUNT => { self.giodma.state.lock().count = val; BUS_OK }
             REG_DMA_STDMA => {
                 let mut state = self.giodma.state.lock();
                 state.stdma = val;
@@ -1030,11 +1018,11 @@ impl BusDevice for MemoryController {
                     drop(state);
                     self.giodma.cond.notify_all();
                 }
-                BusStatus::Ready
+                BUS_OK
             }
             REG_DMA_RUN => {
                 // Read-only register
-                BusStatus::Ready
+                BUS_OK
             }
             REG_DMA_MEMADRDS => {
                 dlog_dev!(LogModule::Mc, "MC: DMA Start via MEMADRDS write: {:08x}", val);
@@ -1044,7 +1032,7 @@ impl BusDevice for MemoryController {
                 state.run_real = true;
                 drop(state);
                 self.giodma.cond.notify_all();
-                BusStatus::Ready
+                BUS_OK
             }
             REG_EEROM => {
                 {
@@ -1058,7 +1046,7 @@ impl BusDevice for MemoryController {
                 }
                 
                 state.regs[(REG_EEROM / 4) as usize] = val;
-                BusStatus::Ready
+                BUS_OK
             }
             _ => {
                 let index = offset / 4;
@@ -1067,48 +1055,42 @@ impl BusDevice for MemoryController {
                 // For now, just store
                 state.regs[index] = val;
 
-                BusStatus::Ready
+                BUS_OK
             }
         }
     }
 
     // MC is a 32-bit device - 8/16-bit accesses not supported
-    fn read8(&self, _addr: u32) -> BusStatus {
+    fn read8(&self, _addr: u32) -> BusRead8 {
         unimplemented!("MC does not support 8-bit reads");
     }
 
-    fn write8(&self, _addr: u32, _val: u8) -> BusStatus {
+    fn write8(&self, _addr: u32, _val: u8) -> u32 {
         unimplemented!("MC does not support 8-bit writes");
     }
 
-    fn read16(&self, _addr: u32) -> BusStatus {
+    fn read16(&self, _addr: u32) -> BusRead16 {
         unimplemented!("MC does not support 16-bit reads");
     }
 
-    fn write16(&self, _addr: u32, _val: u16) -> BusStatus {
+    fn write16(&self, _addr: u32, _val: u16) -> u32 {
         unimplemented!("MC does not support 16-bit writes");
     }
 
     // 64-bit access: implement by calling 32-bit ops twice
-    fn read64(&self, addr: u32) -> BusStatus {
-        let hi = match self.read32(addr) {
-            BusStatus::Data(v) => v,
-            other => return other,
-        };
-        let lo = match self.read32(addr + 4) {
-            BusStatus::Data(v) => v,
-            other => return other,
-        };
-        BusStatus::Data64(((hi as u64) << 32) | (lo as u64))
+    fn read64(&self, addr: u32) -> BusRead64 {
+        let r_hi = self.read32(addr);
+        if !r_hi.is_ok() { return BusRead64 { status: r_hi.status, data: 0 }; }
+        let r_lo = self.read32(addr + 4);
+        if !r_lo.is_ok() { return BusRead64 { status: r_lo.status, data: 0 }; }
+        BusRead64::ok(((r_hi.data as u64) << 32) | (r_lo.data as u64))
     }
 
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         let hi = (val >> 32) as u32;
         let lo = val as u32;
-        match self.write32(addr, hi) {
-            BusStatus::Ready => {},
-            other => return other,
-        }
+        let ws = self.write32(addr, hi);
+        if ws != BUS_OK { return ws; }
         self.write32(addr + 4, lo)
     }
 }
@@ -1338,12 +1320,9 @@ mod tests {
 
         // Write to CPUCTRL0 (offset 0) via BusDevice
         let val = 0x12345678;
-        assert_eq!(mc.write32(MC_BASE + REG_CPUCTRL0, val), BusStatus::Ready); // BusDevice implemented on MemoryController
+        assert_eq!(mc.write32(MC_BASE + REG_CPUCTRL0, val), BUS_OK); // BusDevice implemented on MemoryController
 
         // Read back via BusDevice
-        match mc.read32(MC_BASE + REG_CPUCTRL0) {
-            BusStatus::Data(read_val) => assert_eq!(read_val, val),
-            _ => panic!("Failed to read CPUCTRL0"),
-        }
+        { let _r = mc.read32(MC_BASE + REG_CPUCTRL0); assert!(_r.is_ok(), "Failed to read CPUCTRL0"); assert_eq!(_r.data, val); }
     }
 }

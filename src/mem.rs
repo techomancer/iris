@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::traits::{BusStatus, BusDevice, Resettable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK, BUS_ERR, Resettable};
 
 /// Memory Module with direct word access
 ///
@@ -93,122 +93,122 @@ impl Resettable for Memory {
 
 impl BusDevice for Memory {
     #[inline(always)]
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         unsafe {
             let data = self.data();
             let byte_ptr = data.as_ptr() as *const u8;
             let offset = (addr & self.addr_mask) as usize;
             let byte = *byte_ptr.add(offset ^ 3);
-            BusStatus::Data8(byte)
+            BusRead8::ok(byte)
         }
     }
 
     #[inline(always)]
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         unsafe {
             let data = self.data();
             let byte_ptr = data.as_mut_ptr() as *mut u8;
             let offset = (addr & self.addr_mask) as usize;
             *byte_ptr.add(offset ^ 3) = val;
-            BusStatus::Ready
+            BUS_OK
         }
     }
 
     #[inline(always)]
-    fn read16(&self, addr: u32) -> BusStatus {
+    fn read16(&self, addr: u32) -> BusRead16 {
         unsafe {
             let data = self.data();
             let half_ptr = data.as_ptr() as *const u16;
             let offset = ((addr & self.addr_mask) >> 1) as usize;
             let halfword = *half_ptr.add(offset ^ 1);
-            BusStatus::Data16(halfword)
+            BusRead16::ok(halfword)
         }
     }
 
     #[inline(always)]
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
+    fn write16(&self, addr: u32, val: u16) -> u32 {
         unsafe {
             let data = self.data();
             let half_ptr = data.as_mut_ptr() as *mut u16;
             let offset = ((addr & self.addr_mask) >> 1) as usize;
             *half_ptr.add(offset ^ 1) = val;
-            BusStatus::Ready
+            BUS_OK
         }
     }
 
     #[inline(always)]
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         unsafe {
             let data = self.data();
             let idx = ((addr & self.addr_mask) >> 2) as usize;
-            BusStatus::Data(*data.get_unchecked(idx))
+            BusRead32::ok(*data.get_unchecked(idx))
         }
     }
 
     #[inline(always)]
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         unsafe {
             let data = self.data();
             let idx = ((addr & self.addr_mask) >> 2) as usize;
             *data.get_unchecked_mut(idx) = val;
-            BusStatus::Ready
+            BUS_OK
         }
     }
 
     #[inline(always)]
-    fn read64(&self, addr: u32) -> BusStatus {
+    fn read64(&self, addr: u32) -> BusRead64 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_ptr() as *const u64;
             let offset = ((addr & self.addr_mask) >> 3) as usize;
             let qword = (*qword_ptr.add(offset)).rotate_left(32);
-            BusStatus::Data64(qword)
+            BusRead64::ok(qword)
         }
     }
 
     #[inline(always)]
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         unsafe {
             let data = self.data();
             let qword_ptr = data.as_mut_ptr() as *mut u64;
             let offset = ((addr & self.addr_mask) >> 3) as usize;
             *qword_ptr.add(offset) = val.rotate_left(32);
-            BusStatus::Ready
+            BUS_OK
         }
     }
 }
 
 // Implement BusDevice for Arc<Memory> to allow using Arc-wrapped memory directly
 impl BusDevice for Arc<Memory> {
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         (**self).read8(addr)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         (**self).write8(addr, val)
     }
 
-    fn read16(&self, addr: u32) -> BusStatus {
+    fn read16(&self, addr: u32) -> BusRead16 {
         (**self).read16(addr)
     }
 
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
+    fn write16(&self, addr: u32, val: u16) -> u32 {
         (**self).write16(addr, val)
     }
 
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         (**self).read32(addr)
     }
 
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         (**self).write32(addr, val)
     }
 
-    fn read64(&self, addr: u32) -> BusStatus {
+    fn read64(&self, addr: u32) -> BusRead64 {
         (**self).read64(addr)
     }
 
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         (**self).write64(addr, val)
     }
 }
@@ -234,56 +234,56 @@ impl BlackHoleRegion {
 }
 
 impl BusDevice for BlackHoleRegion {
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read8 {:08x}", addr);
         }
-        BusStatus::Data8(0xFF)
+        BusRead8::ok(0xFF)
     }
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write8 {:08x} val {:02x}", addr, val);
         }
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read16(&self, addr: u32) -> BusStatus {
+    fn read16(&self, addr: u32) -> BusRead16 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read16 {:08x}", addr);
         }
-        BusStatus::Data16(0xFFFF)
+        BusRead16::ok(0xFFFF)
     }
-    fn write16(&self, addr: u32, val: u16) -> BusStatus {
+    fn write16(&self, addr: u32, val: u16) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write16 {:08x} val {:04x}", addr, val);
         }
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read32 {:08x}", addr);
         }
-        BusStatus::Data(0xFFFFFFFF)
+        BusRead32::ok(0xFFFFFFFF)
     }
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write32 {:08x} val {:08x}", addr, val);
         }
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusStatus {
+    fn read64(&self, addr: u32) -> BusRead64 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Read64 {:08x}", addr);
         }
-        BusStatus::Data64(0xFFFFFFFFFFFFFFFF)
+        BusRead64::ok(0xFFFFFFFFFFFFFFFF)
     }
-    fn write64(&self, addr: u32, val: u64) -> BusStatus {
+    fn write64(&self, addr: u32, val: u64) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("BlackHole: Write64 {:08x} val {:016x}", addr, val);
         }
-        BusStatus::Ready
+        BUS_OK
     }
 }
 
@@ -292,12 +292,12 @@ impl BusDevice for BlackHoleRegion {
 pub struct UnmappedRam;
 
 impl BusDevice for UnmappedRam {
-    fn read8(&self, _addr: u32) -> BusStatus { BusStatus::Data8(0) }
-    fn write8(&self, _addr: u32, _v: u8) -> BusStatus { BusStatus::Ready }
-    fn read16(&self, _addr: u32) -> BusStatus { BusStatus::Data16(0) }
-    fn write16(&self, _addr: u32, _v: u16) -> BusStatus { BusStatus::Ready }
-    fn read32(&self, _addr: u32) -> BusStatus { BusStatus::Data(0) }
-    fn write32(&self, _addr: u32, _v: u32) -> BusStatus { BusStatus::Ready }
-    fn read64(&self, _addr: u32) -> BusStatus { BusStatus::Data64(0) }
-    fn write64(&self, _addr: u32, _v: u64) -> BusStatus { BusStatus::Ready }
+    fn read8(&self, _addr: u32) -> BusRead8 { BusRead8::ok(0) }
+    fn write8(&self, _addr: u32, _v: u8) -> u32 { BUS_OK }
+    fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::ok(0) }
+    fn write16(&self, _addr: u32, _v: u16) -> u32 { BUS_OK }
+    fn read32(&self, _addr: u32) -> BusRead32 { BusRead32::ok(0) }
+    fn write32(&self, _addr: u32, _v: u32) -> u32 { BUS_OK }
+    fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::ok(0) }
+    fn write64(&self, _addr: u32, _v: u64) -> u32 { BUS_OK }
 }

@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::devlog::LogModule;
 use std::sync::mpsc;
-use crate::traits::{BusStatus, BusDevice, Device, Resettable, Saveable, MachineEvent};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, toml_u8, hex_u8};
 use crate::z85c30::{Z85c30, IrqCallback};
 use crate::pit8254::{Pit8254, TimerCallback};
@@ -375,7 +375,7 @@ impl Device for Ioc {
 }
 
 impl BusDevice for Ioc {
-    fn read8(&self, addr: u32) -> BusStatus {
+    fn read8(&self, addr: u32) -> BusRead8 {
         let offset = (addr - IOC_BASE) & !3;
 
         // Lock state only for IOC registers, not for SCC/PIT passthrough
@@ -396,10 +396,10 @@ impl BusDevice for Ioc {
 
         // PS/2 Keyboard/Mouse - direct access to avoid lock inversion
         if offset == IOC_KBD_MOUSE_DATA {
-            return BusStatus::Data8(self.ps2.read_data());
+            return BusRead8::ok(self.ps2.read_data());
         }
         if offset == IOC_KBD_MOUSE_CMD {
-            return BusStatus::Data8(self.ps2.read_status());
+            return BusRead8::ok(self.ps2.read_status());
         }
 
         // IOC registers - all 8-bit
@@ -435,10 +435,10 @@ impl BusDevice for Ioc {
                 0
             }
         };
-        BusStatus::Data8(val)
+        BusRead8::ok(val)
     }
 
-    fn write8(&self, addr: u32, val: u8) -> BusStatus {
+    fn write8(&self, addr: u32, val: u8) -> u32 {
         let offset = (addr - IOC_BASE) & !3;
 
         // Serial ports (SCC) - direct 8-bit access
@@ -457,11 +457,11 @@ impl BusDevice for Ioc {
         // PS/2 Keyboard/Mouse - direct access to avoid lock inversion
         if offset == IOC_KBD_MOUSE_DATA {
             self.ps2.write_data(val);
-            return BusStatus::Ready;
+            return BUS_OK;
         }
         if offset == IOC_KBD_MOUSE_CMD {
             self.ps2.write_command(val);
-            return BusStatus::Ready;
+            return BUS_OK;
         }
 
         let mut state = self.state.lock();
@@ -528,24 +528,19 @@ impl BusDevice for Ioc {
         }
         // Update interrupts after any write that might affect masks or status
         state.update_interrupts();
-        BusStatus::Ready
+        BUS_OK
     }
 
-    fn read32(&self, addr: u32) -> BusStatus {
+    fn read32(&self, addr: u32) -> BusRead32 {
         //println!("IOC: Read32 addr {:08x}", addr);
         // IOC registers are accessed as 32-bit words with data in low 8 bits
         // Address should be word-aligned
         let aligned_addr = addr & !3;
-        match self.read8(aligned_addr) {
-            BusStatus::Data8(val) => {
-                // Data goes in low 8 bits (bits 7:0)
-                BusStatus::Data(val as u32)
-            }
-            other => other,
-        }
+        let r = self.read8(aligned_addr);
+        if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } }
     }
 
-    fn write32(&self, addr: u32, val: u32) -> BusStatus {
+    fn write32(&self, addr: u32, val: u32) -> u32 {
         //println!("IOC: Write32 addr {:08x} val {:08x}", addr, val);
         // IOC registers are accessed as 32-bit words with data in low 8 bits
         // Address should be word-aligned

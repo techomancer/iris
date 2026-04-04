@@ -2,7 +2,7 @@ use std::sync::Arc;
 use spin::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use crate::traits::{BusStatus, Device, Resettable, Saveable};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use std::io::Write;
@@ -311,20 +311,20 @@ impl Pit8254 {
         }
     }
 
-    pub fn read(&self, addr: u32) -> BusStatus {
+    pub fn read(&self, addr: u32) -> BusRead8 {
         let val = match addr {
             0 => self.read_channel(0),
             1 => self.read_channel(1),
             2 => self.read_channel(2),
-            _ => return BusStatus::Error,
+            _ => return BusRead8::err(),
         };
         if self.debug.load(Ordering::Relaxed) {
             println!("PIT: Read addr {} -> {:02x}", addr, val);
         }
-        BusStatus::Data8(val)
+        BusRead8::ok(val)
     }
 
-    pub fn write(&self, addr: u32, val: u8) -> BusStatus {
+    pub fn write(&self, addr: u32, val: u8) -> u32 {
         if self.debug.load(Ordering::Relaxed) {
             println!("PIT: Write addr {} val {:02x}", addr, val);
         }
@@ -333,9 +333,9 @@ impl Pit8254 {
             1 => self.write_channel(1, val),
             2 => self.write_channel(2, val),
             3 => self.write_control(val),
-            _ => return BusStatus::Error,
+            _ => return BUS_ERR,
         }
-        BusStatus::Ready
+        BUS_OK
     }
 }
 
@@ -493,15 +493,15 @@ mod tests {
         // Latch command: SC=ch, RW=0
         let ctrl = (ch << 6) | 0;
         pit.write(3, ctrl);
-        let lo = match pit.read(ch as u32) { BusStatus::Data8(v) => v, _ => panic!("bad read") };
-        let hi = match pit.read(ch as u32) { BusStatus::Data8(v) => v, _ => panic!("bad read") };
+        let lo = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
+        let hi = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
         (hi as u16) << 8 | lo as u16
     }
 
     // Read channel without latching (LSB+MSB mode 3).
     fn read16(pit: &Pit8254, ch: u8) -> u16 {
-        let lo = match pit.read(ch as u32) { BusStatus::Data8(v) => v, _ => panic!("bad read") };
-        let hi = match pit.read(ch as u32) { BusStatus::Data8(v) => v, _ => panic!("bad read") };
+        let lo = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
+        let hi = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
         (hi as u16) << 8 | lo as u16
     }
 
