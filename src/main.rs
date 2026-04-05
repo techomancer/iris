@@ -101,6 +101,7 @@ fn start_unfsd(nfs: &NfsConfig) -> UnfsdProc {
     let child = std::process::Command::new(&nfs.unfsd)
         .arg("-u")                                       // don't require root
         .arg("-p")                                       // don't register with host portmap
+        .arg("-3")                                       // truncate fileid/cookie to 32 bits (IRIX compat)
         .arg("-n").arg(nfs.nfs_host_port.to_string())
         .arg("-m").arg(nfs.mountd_host_port.to_string())
         .arg("-l").arg("127.0.0.1")
@@ -111,6 +112,8 @@ fn start_unfsd(nfs: &NfsConfig) -> UnfsdProc {
 
     eprintln!("iris: unfsd started (pid {}) nfs=127.0.0.1:{} mountd=127.0.0.1:{} dir={}",
               child.id(), nfs.nfs_host_port, nfs.mountd_host_port, abs_dir.display());
+    eprintln!("iris: to mount inside IRIX (rsize/wsize must be <=8192 due to UDP fragment limit):");
+    eprintln!("iris:   mount -o rsize=8192,wsize=8192 192.168.0.1:{} /shared", abs_dir.display());
 
     // On Unix, wait for the launcher to exit (it forks the daemon and quits).
     #[cfg(not(windows))]

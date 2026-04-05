@@ -267,6 +267,68 @@ fn ip_frame(dst_mac: &[u8; 6], gw_mac: &[u8; 6],
     eth_frame(dst_mac, gw_mac, ETHERTYPE_IP, &ip)
 }
 
+/// Build one IP fragment frame. `frag_offset` is in bytes (must be multiple of 8).
+fn ip_fragment_frame(dst_mac: &[u8; 6], gw_mac: &[u8; 6],
+                     src_ip: Ipv4Addr, dst_ip: Ipv4Addr, proto: u8,
+                     id: u16, frag_offset: usize, more_frags: bool,
+                     payload_chunk: &[u8]) -> Vec<u8> {
+    let mut h = [0u8; 20];
+    h[0] = 0x45;
+    w16(&mut h, 2, 20 + payload_chunk.len() as u16);
+    w16(&mut h, 4, id);
+    let offset_field = ((frag_offset / 8) as u16) | if more_frags { 0x2000 } else { 0 };
+    w16(&mut h, 6, offset_field);
+    h[8]  = 64;
+    h[9]  = proto;
+    h[12..16].copy_from_slice(&src_ip.octets());
+    h[16..20].copy_from_slice(&dst_ip.octets());
+    let c = ip_checksum(&h); w16(&mut h, 10, c);
+    let mut ip = h.to_vec();
+    ip.extend_from_slice(payload_chunk);
+    eth_frame(dst_mac, gw_mac, ETHERTYPE_IP, &ip)
+}
+
+/// Fragment a UDP datagram into ≤1500-byte Ethernet frames and return them all.
+/// `udp_payload` is the already-built UDP header+data (output of `udp_packet`).
+fn ip_frames_udp(dst_mac: &[u8; 6], gw_mac: &[u8; 6],
+                 src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
+                 id: u16, udp_payload: &[u8]) -> Vec<Vec<u8>> {
+    // Maximum IP payload per fragment: 1480 bytes (1500 MTU - 20 IP header), must be
+    // a multiple of 8 so subsequent fragment offsets are representable.
+    const MAX_FRAG: usize = 1480;
+    if udp_payload.len() <= MAX_FRAG {
+        // Fits in one frame — no fragmentation needed.
+        let mut h = [0u8; 20];
+        h[0] = 0x45;
+        w16(&mut h, 2, 20 + udp_payload.len() as u16);
+        w16(&mut h, 4, id);
+        h[8]  = 64;
+        h[9]  = IP_PROTO_UDP;
+        h[12..16].copy_from_slice(&src_ip.octets());
+        h[16..20].copy_from_slice(&dst_ip.octets());
+        let c = ip_checksum(&h); w16(&mut h, 10, c);
+        let mut ip = h.to_vec();
+        ip.extend_from_slice(udp_payload);
+        return vec![eth_frame(dst_mac, gw_mac, ETHERTYPE_IP, &ip)];
+    }
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while offset < udp_payload.len() {
+        let remaining = udp_payload.len() - offset;
+        // Chunk size must be a multiple of 8 unless it's the last fragment.
+        let chunk_size = if remaining <= MAX_FRAG {
+            remaining
+        } else {
+            MAX_FRAG // already a multiple of 8
+        };
+        let more = offset + chunk_size < udp_payload.len();
+        frames.push(ip_fragment_frame(dst_mac, gw_mac, src_ip, dst_ip, IP_PROTO_UDP,
+                                      id, offset, more, &udp_payload[offset..offset + chunk_size]));
+        offset += chunk_size;
+    }
+    frames
+}
+
 pub fn mac_str(m: &[u8; 6]) -> String {
     format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0],m[1],m[2],m[3],m[4],m[5])
 }
@@ -492,6 +554,8 @@ pub struct NatEngine {
     fwd_ephemeral_next: u16,
     // Guest MAC learned from any outbound frame (ARP SHA or Ethernet src).
     guest_mac: Option<[u8; 6]>,
+    // Monotonically increasing IP identification counter for fragmented datagrams.
+    ip_id: u16,
 }
 
 impl NatEngine {
@@ -553,7 +617,7 @@ impl NatEngine {
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners,
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
-               guest_mac: None }
+               guest_mac: None, ip_id: 1 }
     }
 
     pub fn run(&mut self) {
@@ -586,13 +650,16 @@ impl NatEngine {
             // hold the RX interrupt line asserted until explicitly cleared — is unclear.
             // Flush replies deferred from the previous iteration; stop if ring is full.
             let pending = std::mem::take(&mut self.deferred_rx);
-            for frame in pending {
+            let mut iter = pending.into_iter();
+            for frame in &mut iter {
                 if self.rx_prod.slots() == 0 {
+                    // Ring full — put this frame and all remaining back, preserving order.
                     self.deferred_rx.push(frame);
-                } else {
-                    let _ = self.rx_prod.push(frame);
-                    self.rx_wake.1.notify_one();
+                    self.deferred_rx.extend(iter);
+                    break;
                 }
+                let _ = self.rx_prod.push(frame);
+                self.rx_wake.1.notify_one();
             }
 
             // Drain all pending outbound frames
@@ -1119,7 +1186,7 @@ impl NatEngine {
                 dlog_dev!(LogModule::Net, "NAT UDP {}:{} expired", Ipv4Addr::from(key.0), key.1);
                 expired.push(key); continue;
             }
-            let mut buf = [0u8; 1500];
+            let mut buf = [0u8; 65536];
             while let Ok((n, from)) = entry.sock.recv_from(&mut buf) {
                 dlog_dev!(LogModule::Net, "NAT UDP reply {} → {}:{} len={}", from, entry.client_ip, key.2, n);
                 responses.push((buf[..n].to_vec(), key));
@@ -1135,9 +1202,9 @@ impl NatEngine {
                 let udp = udp_packet(reply_ip, entry.client_ip, reply_port, client_port, &data);
                 let client_mac = entry.client_mac;
                 let client_ip = entry.client_ip;
-                let frame = ip_frame(&client_mac, &self.config.gateway_mac,
-                                     reply_ip, client_ip, IP_PROTO_UDP, &udp);
-                self.enqueue_rx(frame);
+                let id = self.ip_id; self.ip_id = self.ip_id.wrapping_add(1);
+                self.deferred_rx.extend(ip_frames_udp(&client_mac, &self.config.gateway_mac,
+                                                      reply_ip, client_ip, id, &udp));
             }
         }
     }
@@ -1521,7 +1588,7 @@ impl NatEngine {
     fn poll_udp_fwd_listeners(&mut self) {
         let mut received: Vec<(Vec<u8>, SocketAddr, u16, u16)> = Vec::new();
         for fwd in &self.udp_fwd_listeners {
-            let mut buf = [0u8; 1500];
+            let mut buf = [0u8; 65536];
             loop {
                 match fwd.sock.recv_from(&mut buf) {
                     Ok((n, from)) => {
@@ -1549,8 +1616,8 @@ impl NatEngine {
             let gw_mac   = self.config.gateway_mac;
             // Inject as UDP: src=gateway_ip:host_port dst=guest_ip:guest_port
             let udp = udp_packet(gw_ip, guest_ip, host_port, guest_port, &data);
-            let frame = ip_frame(&guest_mac, &gw_mac, gw_ip, guest_ip, IP_PROTO_UDP, &udp);
-            self.enqueue_rx(frame);
+            let id = self.ip_id; self.ip_id = self.ip_id.wrapping_add(1);
+            self.deferred_rx.extend(ip_frames_udp(&guest_mac, &gw_mac, gw_ip, guest_ip, id, &udp));
         }
     }
 }
