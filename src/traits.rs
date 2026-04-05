@@ -79,6 +79,22 @@ pub trait BusDevice: Send + Sync {
     // 64-bit access
     fn read64 (&self, _addr: u32) -> BusRead64 { BusRead64::err() }
     fn write64(&self, _addr: u32, _val: u64) -> u32 { BUS_ERR }
+
+    /// Masked 64-bit write: only bytes where the corresponding mask byte is 0xFF are written.
+    /// `addr` must be 8-byte aligned; `val` and `mask` are in big-endian (MIPS) byte order.
+    /// Default: decompose into individual write8 calls for set bytes.
+    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+        for i in 0..8usize {
+            let bit = 7 - i;
+            let byte_mask = (mask >> (bit * 8)) & 0xFF;
+            if byte_mask != 0 {
+                let byte_val = (val >> (bit * 8)) as u8;
+                let ws = self.write8(addr + i as u32, byte_val);
+                if ws != BUS_OK { return ws; }
+            }
+        }
+        BUS_OK
+    }
 }
 
 pub trait FifoDevice: Send + Sync {

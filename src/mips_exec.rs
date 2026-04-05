@@ -887,7 +887,6 @@ For R4000SC/MC CPUs:
     /// If `self.skip_breakpoints` is set, all breakpoint checks for this one
     /// step (PC, fetch, and all data memory accesses) are suppressed.
     /// It is cleared automatically after the instruction completes.
-    #[inline]
     /// Flush local cycle counter to the shared atomic.
     #[inline(always)]
     pub fn flush_cycles(&mut self) {
@@ -1633,17 +1632,25 @@ For R4000SC/MC CPUs:
 
     /// Production data write (with breakpoints, undo tracking, updates CP0 state on exceptions).
     #[inline]
-    fn write_data<const SIZE: usize>(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
-        self.write_data_impl::<false, SIZE>(virt_addr, val, mask)
+    fn write_data<const SIZE: usize>(&mut self, virt_addr: u64, val: u64) -> ExecStatus {
+        self.write_data_impl::<false, SIZE>(virt_addr, val)
+    }
+
+    /// Partial masked doubleword write for SDL/SDR/SWL/SWR.
+    /// Only bytes where the corresponding mask byte is non-zero are written.
+    /// `virt_addr` must be 8-byte aligned; val/mask are in MIPS big-endian doubleword space.
+    #[inline]
+    fn write_data64_masked(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
+        self.write_data64_masked_impl::<false>(virt_addr, val, mask)
     }
 
     /// Debug data write: kernel-mode override, no breakpoints, no undo tracking, no CP0 side-effects.
     pub fn debug_write(&mut self, virt_addr: u64, val: u64, size: usize, mask: u64) -> ExecStatus {
         match size {
-            1 => self.write_data_impl::<true, 1>(virt_addr, val, mask),
-            2 => self.write_data_impl::<true, 2>(virt_addr, val, mask),
-            4 => self.write_data_impl::<true, 4>(virt_addr, val, mask),
-            8 => self.write_data_impl::<true, 8>(virt_addr, val, mask),
+            1 => self.write_data_impl::<true, 1>(virt_addr, val),
+            2 => self.write_data_impl::<true, 2>(virt_addr, val),
+            4 => self.write_data_impl::<true, 4>(virt_addr, val),
+            8 => self.write_data_impl::<true, 8>(virt_addr, val),
             _ => exec_exception(EXC_ADES),
         }
     }
@@ -1654,7 +1661,7 @@ For R4000SC/MC CPUs:
     /// - cp0_badvaddr is never written
     /// - Undo buffer tracking is skipped
     #[inline]
-    fn write_data_impl<const DEBUG: bool, const SIZE: usize>(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
+    fn write_data_impl<const DEBUG: bool, const SIZE: usize>(&mut self, virt_addr: u64, val: u64) -> ExecStatus {
         const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(not(feature = "lightning"))]
         if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::VirtWrite as u8 }>(virt_addr) {
@@ -1674,120 +1681,102 @@ For R4000SC/MC CPUs:
             (self.translate_fn)(self, virt_addr, access_type)
         };
         if translate_result.is_exception() { return translate_result.status; }
-        {
-            let phys_addr = translate_result.phys as u64;
-            let is_cached = translate_result.is_cached();
-            {
-                // Track memory write for undo if it's to lomem/himem (production only)
-                #[cfg(feature = "developer")]
-                if !DEBUG && self.undo_buffer.is_enabled() {
-                    let phys_addr_32 = phys_addr as u32;
-                    let is_main_memory = (phys_addr_32 >= LOMEM_BASE && phys_addr_32 < LOMEM_END) ||
-                                        (phys_addr_32 >= HIMEM_BASE && phys_addr_32 < HIMEM_END);
+        let phys_addr = translate_result.phys as u64;
+        let is_cached = translate_result.is_cached();
 
-                    if is_main_memory {
-                        // Read the old value before writing
-                        let old_value = match self.read_data::<SIZE>(virt_addr) {
-                            Ok(v) => v,
-                            Err(_) => 0, // If read fails, just record 0
-                        };
-                        self.track_memory_write(virt_addr, phys_addr, old_value, SIZE);
-                    }
-                }
-                if !DEBUG && !is_cached && mips_log(MIPS_LOG_MEM) {
-                    dlog_dev!(LogModule::Mips, "Uncached Write{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x} Mask={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, mask);
-                }
-
-                if is_cached {
-                    // Cached access uses D-Cache via write64_masked for all sizes.
-                    // write64_masked takes the val/mask in doubleword (64-bit) space
-                    // at the doubleword-aligned address.  For regular (full-mask) stores,
-                    // the cache helper methods (write8/16/32/64) already do this conversion.
-                    // For partial stores (SDL/SDR/SWL/SWR), we call write64_masked directly
-                    // so the mask is honoured without a redundant read-modify-write here.
-                    #[cfg(not(feature = "lightning"))]
-                    if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysWrite as u8 }>(phys_addr) {
-                        return EXEC_BREAKPOINT;
-                    }
-
-                    let status = if SIZE == 1 {
-                        self.cache.write8(virt_addr, phys_addr, val as u8)
-                    } else if SIZE == 2 {
-                        self.cache.write16(virt_addr, phys_addr, val as u16)
-                    } else if SIZE == 4 {
-                        // SWL/SWR pass a partial mask for a word-aligned address.
-                        // write32 computes its own internal mask; go through
-                        // write64_masked so the caller's mask is used directly.
-                        if mask == 0xFFFF_FFFFu64 {
-                            self.cache.write32(virt_addr, phys_addr, val as u32)
-                        } else {
-                            // Convert word mask to doubleword mask in the correct half
-                            let aligned8 = phys_addr & !7;
-                            let half = (phys_addr & 4) as usize; // 0 or 4
-                            let shift = (4 - half) << 3; // 32 for upper, 0 for lower
-                            self.cache.write64_masked(virt_addr, aligned8,
-                                val << shift, mask << shift)
-                        }
-                    } else {
-                        // SIZE == 8: SDL/SDR pass an arbitrary 64-bit mask.
-                        self.cache.write64_masked(virt_addr, phys_addr, val, mask)
-                    };
-                    // status is already a valid ExecStatus (BUS_OK/BUSY/VCE/ERR)
-                    if status != BUS_OK && status != BUS_BUSY {
-                        if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                    }
-                    status
-                } else {
-                    // Uncached access - use appropriate width.
-                    // For partial masked stores (SDL/SDR/SWL/SWR), decompose into
-                    // individual byte writes since BusDevice has no masked-write API.
-                    #[cfg(not(feature = "lightning"))]
-                    if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysWrite as u8 }>(phys_addr) {
-                        return EXEC_BREAKPOINT;
-                    }
-
-                    if mask == full_mask_for::<SIZE>() {
-                        // Fast path: normal full-width store
-                        let ws = if SIZE == 1 {
-                            self.sysad.write8(phys_addr as u32, val as u8)
-                        } else if SIZE == 2 {
-                            self.sysad.write16(phys_addr as u32, val as u16)
-                        } else if SIZE == 4 {
-                            self.sysad.write32(phys_addr as u32, val as u32)
-                        } else {
-                            self.sysad.write64(phys_addr as u32, val)
-                        };
-                        if ws != BUS_OK {
-                            if ws != BUS_BUSY {
-                                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws);
-                            }
-                        }
-                        ws // already a valid ExecStatus
-                    } else {
-                        // Slow path: partial masked store - decompose into byte writes.
-                        // val and mask are in big-endian space for the given size:
-                        //   Double: bit 63 = byte 0 (MSB), bit 0 = byte 7
-                        //   Word:   bit 31 = byte 0 (MSB), bit 0 = byte 3
-                        //   Half:   bit 15 = byte 0 (MSB), bit 0 = byte 1
-                        for i in 0..SIZE {
-                            // bit position of byte i within the size-wide value
-                            let bit = SIZE - 1 - i; // byte 0 -> bit SIZE-1, last byte -> bit 0
-                            let byte_mask = (mask >> (bit * 8)) & 0xFF;
-                            if byte_mask != 0 {
-                                let byte_val = (val >> (bit * 8)) as u8;
-                                let ws = self.sysad.write8((phys_addr as u32) + i as u32, byte_val);
-                                if ws != BUS_OK {
-                                    if ws != BUS_BUSY {
-                                        eprintln!("Bus error on uncached write8 (masked): PC={:016x} VA={:016x} PA={:016x} byte[{}]={:02x} status={:08x}", self.core.pc, virt_addr, phys_addr, i, byte_val, ws);
-                                    }
-                                    return ws;
-                                }
-                            }
-                        }
-                        BUS_OK
-                    }
-                }
+        // Track memory write for undo if it's to lomem/himem (production only)
+        #[cfg(feature = "developer")]
+        if !DEBUG && self.undo_buffer.is_enabled() {
+            let phys_addr_32 = phys_addr as u32;
+            let is_main_memory = (phys_addr_32 >= LOMEM_BASE && phys_addr_32 < LOMEM_END) ||
+                                 (phys_addr_32 >= HIMEM_BASE && phys_addr_32 < HIMEM_END);
+            if is_main_memory {
+                let old_value = match self.read_data::<SIZE>(virt_addr) {
+                    Ok(v) => v,
+                    Err(_) => 0,
+                };
+                self.track_memory_write(virt_addr, phys_addr, old_value, SIZE);
             }
+        }
+
+        #[cfg(not(feature = "lightning"))]
+        if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysWrite as u8 }>(phys_addr) {
+            return EXEC_BREAKPOINT;
+        }
+
+        if is_cached {
+            let status = if SIZE == 1 {
+                self.cache.write8(virt_addr, phys_addr, val as u8)
+            } else if SIZE == 2 {
+                self.cache.write16(virt_addr, phys_addr, val as u16)
+            } else if SIZE == 4 {
+                self.cache.write32(virt_addr, phys_addr, val as u32)
+            } else {
+                self.cache.write64(virt_addr, phys_addr, val)
+            };
+            if status != BUS_OK && status != BUS_BUSY {
+                if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
+            }
+            status
+        } else {
+            if !DEBUG && mips_log(MIPS_LOG_MEM) {
+                dlog_dev!(LogModule::Mips, "Uncached Write{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val);
+            }
+            let ws = if SIZE == 1 {
+                self.sysad.write8(phys_addr as u32, val as u8)
+            } else if SIZE == 2 {
+                self.sysad.write16(phys_addr as u32, val as u16)
+            } else if SIZE == 4 {
+                self.sysad.write32(phys_addr as u32, val as u32)
+            } else {
+                self.sysad.write64(phys_addr as u32, val)
+            };
+            if ws != BUS_OK && ws != BUS_BUSY {
+                eprintln!("Bus error on uncached write{}: PC={:016x} VA={:016x} PA={:016x} val={:016x} status={:08x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val, ws);
+            }
+            ws
+        }
+    }
+
+    /// Partial masked doubleword store: SDL/SDR/SWL/SWR.
+    /// `virt_addr` is 8-byte aligned; val/mask are in MIPS big-endian doubleword space.
+    fn write_data64_masked_impl<const DEBUG: bool>(&mut self, virt_addr: u64, val: u64, mask: u64) -> ExecStatus {
+        #[cfg(not(feature = "lightning"))]
+        if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::VirtWrite as u8 }>(virt_addr) {
+            return EXEC_BREAKPOINT;
+        }
+
+        // virt_addr is already doubleword-aligned (callers guarantee this)
+        let access_type = if DEBUG { AccessType::Debug } else { AccessType::Write };
+        let translate_result = if DEBUG {
+            self.translate_impl::<true>(virt_addr, access_type)
+        } else {
+            (self.translate_fn)(self, virt_addr, access_type)
+        };
+        if translate_result.is_exception() { return translate_result.status; }
+        let phys_addr = translate_result.phys as u64;
+        let is_cached = translate_result.is_cached();
+
+        #[cfg(not(feature = "lightning"))]
+        if !DEBUG && self.bp_enabled() && self.check_breakpoint::<{ BpType::PhysWrite as u8 }>(phys_addr) {
+            return EXEC_BREAKPOINT;
+        }
+
+        if is_cached {
+            let status = self.cache.write64_masked(virt_addr, phys_addr, val, mask);
+            if status != BUS_OK && status != BUS_BUSY {
+                if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
+            }
+            status
+        } else {
+            if !DEBUG && mips_log(MIPS_LOG_MEM) {
+                dlog_dev!(LogModule::Mips, "Uncached Write64Masked: PC={:016x} VA={:016x} PA={:016x} Val={:016x} Mask={:016x}", self.core.pc, virt_addr, phys_addr, val, mask);
+            }
+            let ws = self.sysad.write64_masked(phys_addr as u32, val, mask);
+            if ws != BUS_OK && ws != BUS_BUSY {
+                eprintln!("Bus error on uncached write64_masked: PC={:016x} VA={:016x} PA={:016x} val={:016x} mask={:016x} status={:08x}", self.core.pc, virt_addr, phys_addr, val, mask, ws);
+            }
+            ws
         }
     }
 
@@ -2594,7 +2583,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<1>(virt_addr, rt_val, 0xFF)
+        self.write_data::<1>(virt_addr, rt_val)
     }
 
     // SH - Store Halfword
@@ -2603,7 +2592,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<2>(virt_addr, rt_val, 0xFFFF)
+        self.write_data::<2>(virt_addr, rt_val)
     }
 
     // SW - Store Word
@@ -2612,7 +2601,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<4>(virt_addr, rt_val, 0xFFFFFFFF)
+        self.write_data::<4>(virt_addr, rt_val)
     }
 
     // SD - Store Doubleword (MIPS III, 64-bit)
@@ -2621,7 +2610,7 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32);
 
-        self.write_data::<8>(virt_addr, rt_val, 0xFFFFFFFFFFFFFFFF)
+        self.write_data::<8>(virt_addr, rt_val)
     }
 
     // LWL - Load Word Left
@@ -2706,20 +2695,20 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
 
-        // Align address to word boundary
-        let aligned_addr = virt_addr & !3;
         let byte_offset = (virt_addr & 3) as usize;
-
         // Big-endian byte offset to shift and mask:
         // offset 0: store all 4 bytes (mask 0xFFFFFFFF)
         // offset 1: store 3 bytes (mask 0x00FFFFFF)
         // offset 2: store 2 bytes (mask 0x0000FFFF)
         // offset 3: store 1 byte (mask 0x000000FF)
-        let shift = byte_offset * 8;
-        let mask = 0xFFFFFFFFu32 >> shift;
-        let value = rt_val >> shift;
-
-        self.write_data::<4>(aligned_addr, value as u64, mask as u64)
+        let word_shift = byte_offset * 8;
+        let word_mask = 0xFFFFFFFFu32 >> word_shift;
+        let word_val  = rt_val >> word_shift;
+        // Promote word mask/val into doubleword space at the dword-aligned address
+        let aligned8  = virt_addr & !7;
+        let half      = (virt_addr & 4) as usize; // 0 = upper dword half, 4 = lower
+        let dw_shift  = (4 - half) << 3;          // 32 for upper half, 0 for lower
+        self.write_data64_masked(aligned8, (word_val as u64) << dw_shift, (word_mask as u64) << dw_shift)
     }
 
     // SWR - Store Word Right
@@ -2730,20 +2719,20 @@ For R4000SC/MC CPUs:
         let virt_addr = base.wrapping_add(d.immu64());
         let rt_val = self.core.read_gpr(d.rt as u32) as u32;
 
-        // Align address to word boundary
-        let aligned_addr = virt_addr & !3;
         let byte_offset = (virt_addr & 3) as usize;
-
         // Big-endian byte offset to shift and mask:
         // offset 0: store 1 byte (mask 0xFF000000)
         // offset 1: store 2 bytes (mask 0xFFFF0000)
         // offset 2: store 3 bytes (mask 0xFFFFFF00)
         // offset 3: store all 4 bytes (mask 0xFFFFFFFF)
-        let shift = (3 - byte_offset) * 8;
-        let mask = 0xFFFFFFFFu32 << shift;
-        let value = rt_val << shift;
-
-        self.write_data::<4>(aligned_addr, value as u64, mask as u64)
+        let word_shift = (3 - byte_offset) * 8;
+        let word_mask  = 0xFFFFFFFFu32 << word_shift;
+        let word_val   = rt_val << word_shift;
+        // Promote word mask/val into doubleword space at the dword-aligned address
+        let aligned8  = virt_addr & !7;
+        let half      = (virt_addr & 4) as usize; // 0 = upper dword half, 4 = lower
+        let dw_shift  = (4 - half) << 3;          // 32 for upper half, 0 for lower
+        self.write_data64_masked(aligned8, (word_val as u64) << dw_shift, (word_mask as u64) << dw_shift)
     }
 
     // LDL - Load Doubleword Left (MIPS III)
@@ -2822,7 +2811,7 @@ For R4000SC/MC CPUs:
         let mask = 0xFFFFFFFFFFFFFFFFu64 >> shift;
         let value = rt_val >> shift;
 
-        self.write_data::<8>(aligned_addr, value, mask)
+        self.write_data64_masked(aligned_addr, value, mask)
     }
 
     // SDR - Store Doubleword Right (MIPS III)
@@ -2841,7 +2830,7 @@ For R4000SC/MC CPUs:
         let mask = 0xFFFFFFFFFFFFFFFFu64 << shift;
         let value = rt_val << shift;
 
-        self.write_data::<8>(aligned_addr, value, mask)
+        self.write_data64_masked(aligned_addr, value, mask)
     }
 
 
@@ -2948,7 +2937,7 @@ For R4000SC/MC CPUs:
         let ll_addr = (self.cache.get_lladdr() as u64) << 4;
         if (phys_addr & !0xF) == ll_addr {
             let value = self.core.read_gpr(rt_reg);
-            let status = self.write_data::<4>(virt_addr, value, 0xFFFFFFFF);
+            let status = self.write_data::<4>(virt_addr, value);
             if status == EXEC_COMPLETE {
                 self.core.write_gpr(rt_reg, 1);
                 self.cache.set_llbit(false);
@@ -3008,7 +2997,7 @@ For R4000SC/MC CPUs:
         if (phys_addr & !0xF) == ll_addr {
             // Attempt the store
             let value = self.core.read_gpr(rt_reg);
-            let status = self.write_data::<8>(virt_addr, value, 0xFFFFFFFFFFFFFFFF);
+            let status = self.write_data::<8>(virt_addr, value);
             if status == EXEC_COMPLETE {
                 self.core.write_gpr(rt_reg, 1);
                 self.cache.set_llbit(false);
@@ -3858,7 +3847,7 @@ For R4000SC/MC CPUs:
         let addr = base.wrapping_add(index);
         let fs_reg = d.rd as u32;
         let val = (self.fpr_read_w)(&self.core, fs_reg) as u64;
-        self.write_data::<4>(addr, val, 0xFFFFFFFF)
+        self.write_data::<4>(addr, val)
     }
     fn exec_sdxc1(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -3867,7 +3856,7 @@ For R4000SC/MC CPUs:
         let addr = base.wrapping_add(index);
         let fs_reg = d.rd as u32;
         let val = (self.fpr_read_l)(&self.core, fs_reg);
-        self.write_data::<8>(addr, val, 0xFFFFFFFFFFFFFFFF)
+        self.write_data::<8>(addr, val)
     }
     fn exec_prefx(&mut self, _d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -4014,7 +4003,7 @@ For R4000SC/MC CPUs:
         let value = (self.fpr_read_w)(&self.core, ft_reg) as u64;
 
         // Store word to memory (alignment check done by write_data)
-        self.write_data::<4>(addr, value, 0xFFFFFFFF)
+        self.write_data::<4>(addr, value)
     }
 
     // SDC1 - Store Doubleword from FPU
@@ -4031,7 +4020,7 @@ For R4000SC/MC CPUs:
         let value = (self.fpr_read_l)(&self.core, ft_reg);
 
         // Store doubleword to memory (alignment check done by write_data)
-        self.write_data::<8>(addr, value, 0xFFFFFFFF_FFFFFFFF)
+        self.write_data::<8>(addr, value)
     }
 
     // FPU single-precision comparison

@@ -176,6 +176,22 @@ impl BusDevice for Memory {
             BUS_OK
         }
     }
+
+    #[inline(always)]
+    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+        unsafe {
+            let data = self.data();
+            let qword_ptr = data.as_mut_ptr() as *mut u64;
+            let offset = ((addr & self.addr_mask) >> 3) as usize;
+            let stored = qword_ptr.add(offset);
+            // Memory stores qwords as rotate_left(32); apply same rotation to val/mask
+            let old = *stored;
+            let new_val = val.rotate_left(32);
+            let new_mask = mask.rotate_left(32);
+            *stored = (old & !new_mask) | (new_val & new_mask);
+            BUS_OK
+        }
+    }
 }
 
 // Implement BusDevice for Arc<Memory> to allow using Arc-wrapped memory directly
@@ -210,6 +226,10 @@ impl BusDevice for Arc<Memory> {
 
     fn write64(&self, addr: u32, val: u64) -> u32 {
         (**self).write64(addr, val)
+    }
+
+    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+        (**self).write64_masked(addr, val, mask)
     }
 }
 

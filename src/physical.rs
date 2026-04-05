@@ -654,4 +654,10 @@ impl BusDevice for Physical {
         if self.trace.load(Ordering::Relaxed) { println!("PHYS64 Write {:08x} val={:016x} -> {:08x}", addr, val, ws); }
         ws
     }
+
+    #[inline(always)]
+    fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).write64_masked(addr, val, mask) }
+    }
 }
