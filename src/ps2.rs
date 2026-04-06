@@ -323,11 +323,16 @@ impl Ps2Controller {
 
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
-        if !self.running.load(Ordering::Relaxed) { return; }
-        let mut state = self.state.lock();
-        if !state.scanning_enabled {
+        if !self.running.load(Ordering::Relaxed) {
+            eprintln!("PS2: push_kb({:?}, {}) DROPPED — not running", key, pressed);
             return;
         }
+        let mut state = self.state.lock();
+        if !state.scanning_enabled {
+            eprintln!("PS2: push_kb({:?}, {}) DROPPED — scanning disabled", key, pressed);
+            return;
+        }
+        eprintln!("PS2: push_kb({:?}, {}) — scanning set={}, queue_len={}", key, pressed, state.scancode_set, state.rx_queue.len());
 
         match state.scancode_set {
             1 => {
@@ -732,11 +737,16 @@ impl Ps2Controller {
     /// queue is congested (≥8 pending mouse packets) and the tail has the
     /// same button state.
     pub fn push_mouse_packet(&self, b0: u8, b1: u8, b2: u8) {
-        if !self.running.load(Ordering::Relaxed) { return; }
-        let mut state = self.state.lock();
-        if !state.mouse_enabled {
+        if !self.running.load(Ordering::Relaxed) {
+            eprintln!("PS2: mouse packet DROPPED — not running");
             return;
         }
+        let mut state = self.state.lock();
+        if !state.mouse_enabled {
+            eprintln!("PS2: mouse packet DROPPED — mouse disabled");
+            return;
+        }
+        eprintln!("PS2: mouse packet b0={:02x} b1={:02x} b2={:02x} queue_len={}", b0, b1, b2, state.rx_queue.len());
         let mouse_packets = state.mouse_queue_bytes / 3;
         let coalesced = if mouse_packets >= 8 {
             let len = state.rx_queue.len();
