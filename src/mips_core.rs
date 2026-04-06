@@ -499,15 +499,15 @@ impl MipsCore {
                     const TARGET_10MS: u64 = 10_000_000;
                     if dc > 0 {
                         let target_ns = delta.saturating_mul(dt_ns) / dc * 2;
-                        // If estimated target is under 5ms, treat as 1kHz tick, else 100Hz.
-                        let snapped_ns = if (target_ns >> 16) < 5_000_000 {
+                        // If estimated target is under 3ms, treat as 1kHz tick, else 100Hz.
+                        let snapped_ns = if (target_ns >> 16) < 3_000_000 {
                             TARGET_1MS
                         } else {
                             TARGET_10MS
                         };
                         let denom = dc.saturating_mul(snapped_ns);
                         self.count_step = (delta.saturating_mul(dt_ns) / denom)
-                            .clamp(1 << 14, 10 << 15);
+                            .clamp(1 << 12, 10 << 15);
                         #[cfg(feature = "developer_ip7")]
                         {
                             let total_samples: u32 = self.compare_delta_stats.values().sum();
