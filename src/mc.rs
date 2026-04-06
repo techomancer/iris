@@ -544,9 +544,16 @@ impl MemoryController {
                                         else       { mem_vaddr = mem_vaddr.wrapping_sub(4); }
                                         byte_count = byte_count.saturating_sub(4);
                                     } else {
-                                        // GIO -> Mem: read qword from GIO, unpack bytes to memory
+                                        // GIO -> Mem: read qword from GIO, unpack bytes to memory.
+                                        // Spin on BUS_BUSY (GRXDLY / pipeline not idle) — DMA worker
+                                        // thread has no EXEC_RETRY mechanism, so we busy-wait here.
                                         let length = byte_count.min(8);
-                                        let data = { let _r = phys.read64(gio_addr); if _r.is_ok() { let d = _r.data as _; d } else { 0u64 } };
+                                        let data = loop {
+                                            let r = phys.read64(gio_addr);
+                                            if r.is_ok() { break r.data; }
+                                            if r.status != crate::traits::BUS_BUSY { break 0u64; }
+                                            std::hint::spin_loop();
+                                        };
                                         let mut shift = 56u32;
                                         for _ in 0..length {
                                             let byte = (data >> shift) as u8;

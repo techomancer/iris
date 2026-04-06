@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use parking_lot::{Mutex, Condvar};
+use parking_lot::Mutex;
 use spin::Mutex as SpinMutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use rtrb::{Consumer, Producer, RingBuffer};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
@@ -780,12 +780,20 @@ impl Rex3Context {
     }
 }
 
-#[derive(Debug, Default)]
 pub struct Rex3Config {
-    pub config: u32,
-    pub status: u32,
-    pub user_status: u32,
-    pub backbusy_until: Option<std::time::Instant>,
+    pub config: AtomicU32,
+    /// VRINT bit written by refresh thread, cleared on STATUS read by CPU thread.
+    /// Benign race: worst case a VRINT is missed or double-cleared.
+    pub status: AtomicU32,
+}
+
+impl Default for Rex3Config {
+    fn default() -> Self {
+        Self {
+            config: AtomicU32::new(0),
+            status: AtomicU32::new(0),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -793,6 +801,8 @@ pub struct Rex3DcbState {
     pub dcbmode: u32,
     pub dcbdata0: u32,
     pub dcbdata1: u32,
+    /// Set by DCB addr=12 write/read. Read during STATUS read (CPU thread only — same thread as DCB).
+    pub backbusy_until: Option<std::time::Instant>,
 }
 
 impl Rex3DcbState {
@@ -816,6 +826,7 @@ impl Default for Rex3DcbState {
             dcbmode: 0xF << DCBMODE_DCBADDR_SHIFT, // DCBADDR init = 0xF per spec
             dcbdata0: 0,
             dcbdata1: 0,
+            backbusy_until: None,
         }
     }
 }
@@ -847,7 +858,7 @@ struct DebugState {
 }
 
 pub struct Rex3 {
-    pub config: Mutex<Rex3Config>,
+    pub config: Rex3Config,
     pub dcb: Mutex<Rex3DcbState>,
     pub context: UnsafeCell<Rex3Context>,
     // Framebuffer: 2048x1024 pixels, 32-bit per pixel.
@@ -877,10 +888,7 @@ pub struct Rex3 {
     pub host_shift: UnsafeCell<u32>,
     pub host_count: UnsafeCell<u32>,
     pub gfifo_producer: SpinMutex<Producer<GFIFOEntry>>,
-    pub gfifo_consumer: SpinMutex<Option<Consumer<GFIFOEntry>>>,
-    /// Condvar used to wake the processor thread when work is pushed to the GFIFO.
-    gfifo_ready: Mutex<bool>,
-    gfifo_condvar: Condvar,
+    pub gfifo_consumer: Mutex<Option<Consumer<GFIFOEntry>>>,
 
     pub vc2: Mutex<Vc2>,
     pub xmap0: Mutex<Xmap9>,
@@ -939,13 +947,13 @@ impl Rex3 {
     pub fn new(heartbeat: Arc<AtomicU64>, cycles: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
         let (producer, consumer) = RingBuffer::new(GFIFO_DEPTH);
 
-        let mut config = Rex3Config::default();
-        config.config = CONFIG_BUSWIDTH | CONFIG_EXTREGXCVR |
+        let config = Rex3Config::default();
+        config.config.store(CONFIG_BUSWIDTH | CONFIG_EXTREGXCVR |
                         (8 << CONFIG_BFIFODEPTH_SHIFT) |
                         CONFIG_BFIFOABOVEINT |
                         (16 << CONFIG_GFIFODEPTH_SHIFT) |
                         CONFIG_GFIFOABOVEINT |
-                        (1 << CONFIG_VREFRESH_SHIFT);
+                        (1 << CONFIG_VREFRESH_SHIFT), Ordering::Relaxed);
 
         // Initialize with random data (noise)
         let mut rng_state = 0xDEADBEEFu32;
@@ -990,7 +998,7 @@ impl Rex3 {
         }));
 
         Self {
-            config: Mutex::new(config),
+            config,
             dcb: Mutex::new(Rex3DcbState::default()),
             context: UnsafeCell::new(Rex3Context::default()),
             fb_rgb: UnsafeCell::new(fb_rgb),
@@ -1009,9 +1017,7 @@ impl Rex3 {
             host_shift: UnsafeCell::new(0),
             host_count: UnsafeCell::new(0),
             gfifo_producer: SpinMutex::new(producer),
-            gfifo_consumer: SpinMutex::new(Some(consumer)),
-            gfifo_ready: Mutex::new(false),
-            gfifo_condvar: Condvar::new(),
+            gfifo_consumer: Mutex::new(Some(consumer)),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
             xmap1: Mutex::new(Xmap9::new()),
@@ -2468,8 +2474,8 @@ impl Rex3 {
                 }
             }
             12 => {
+                dcb.backbusy_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
                 drop(dcb);
-                self.config.lock().backbusy_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
                 self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
                 return;
             }
@@ -2541,8 +2547,8 @@ impl Rex3 {
                 }
             }
             12 => {
+                dcb.backbusy_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
                 drop(dcb);
-                self.config.lock().backbusy_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(1));
                 self.diag.fetch_and(!Self::DIAG_LOCK_DCB, Ordering::Relaxed);
                 return 0;
             }
@@ -2707,22 +2713,19 @@ impl Rex3 {
         let mut producer = self.gfifo_producer.lock();
         loop {
             if producer.push(entry).is_ok() {
-                *self.gfifo_ready.lock() = true;
-                self.gfifo_condvar.notify_one();
                 return;
             }
-            // Buffer full — wake consumer to drain it, then retry.
-            *self.gfifo_ready.lock() = true;
-            self.gfifo_condvar.notify_one();
+            // Buffer full — consumer is spinning and will drain it; just yield.
             std::hint::spin_loop();
         }
     }
 
     fn wait_idle(&self) {
-        while self.gfxbusy.load(Ordering::Relaxed) || {
-            // Check if there are any pending commands in FIFO or being processed
-            self.gfifo_pending.load(Ordering::Relaxed) > 0
-        } {
+        loop {
+            // Acquire load: when gfxbusy goes false, all execute_go() writes become visible.
+            let busy = self.gfxbusy.load(Ordering::Acquire);
+            let pending = self.gfifo_pending.load(Ordering::Relaxed);
+            if !busy && pending == 0 { break; }
             if !self.running.load(Ordering::Relaxed) { break; }
             std::hint::spin_loop();
         }
@@ -2816,8 +2819,10 @@ impl Rex3 {
     }
 
     fn register_processor(&self, mut consumer: Consumer<GFIFOEntry>) -> Consumer<GFIFOEntry> {
+        let backoff = crossbeam_utils::Backoff::new();
         loop {
             if let Ok(entry) = consumer.pop() {
+                backoff.reset();
                 if entry.addr == GFIFO_EXIT {
                     break;
                 }
@@ -2856,18 +2861,17 @@ impl Rex3 {
                 if is_go {
                     self.gfxbusy.store(true, Ordering::Relaxed);
                     self.execute_go();
-                    self.gfxbusy.store(false, Ordering::Relaxed);
+                    // Release: all context/FB writes from execute_go() are visible to any
+                    // thread that subsequently does an Acquire load of gfxbusy (e.g. wait_idle
+                    // and STATUS read on the CPU thread).
+                    self.gfxbusy.store(false, Ordering::Release);
                 }
 
                 self.gfifo_pending.fetch_sub(1, Ordering::SeqCst);
             } else {
-                // Wait for the producer to push work. The condvar is notified by
-                // gfifo_push on every successful push and on buffer-full retries.
-                let mut ready = self.gfifo_ready.lock();
-                while !*ready {
-                    self.gfifo_condvar.wait(&mut ready);
-                }
-                *ready = false;
+                // Nothing in the ring — back off. Starts with spin_loop() hints,
+                // graduates to thread::yield_now() after sustained emptiness.
+                backoff.snooze();
             }
         }
         consumer
@@ -3208,13 +3212,7 @@ impl Rex3 {
             }
 
             // Assert VBLANK
-            {
-                self.diag.fetch_or(Self::DIAG_LOCK_CONFIG, Ordering::Relaxed);
-                let mut config = self.config.lock();
-                config.status |= STATUS_VRINT;
-                drop(config);
-                self.diag.fetch_and(!Self::DIAG_LOCK_CONFIG, Ordering::Relaxed);
-            }
+            self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
 
             // Update VC2 Working Cursor Y (at VBLANK)
             {
@@ -3235,13 +3233,7 @@ impl Rex3 {
 
             thread::sleep(std::time::Duration::from_millis(1));
 
-            {
-                self.diag.fetch_or(Self::DIAG_LOCK_CONFIG, Ordering::Relaxed);
-                let mut config = self.config.lock();
-                config.status &= !STATUS_VRINT;
-                drop(config);
-                self.diag.fetch_and(!Self::DIAG_LOCK_CONFIG, Ordering::Relaxed);
-            }
+            self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed);
             {
                 self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
                 let cb = self.vblank_cb.lock().clone();
@@ -3433,8 +3425,6 @@ impl Rex3 {
     pub fn register_locks(self: &Arc<Self>) {
         use crate::locks::register_lock_fn;
         let r = self.clone();
-        register_lock_fn("rex3::config",           move || r.config.is_locked());
-        let r = self.clone();
         register_lock_fn("rex3::dcb",              move || r.dcb.is_locked());
         let r = self.clone();
         register_lock_fn("rex3::gfifo_producer",   move || r.gfifo_producer.is_locked());
@@ -3541,7 +3531,6 @@ impl Device for Rex3 {
 
         if cmd == "rex" && args[0] == "status" {
             let ctx = unsafe { &*self.context.get() };
-            let config = self.config.lock();
 
             let x_win = ((ctx.xywin >> 16) & 0xFFFF) as i16;
             let y_win = (ctx.xywin & 0xFFFF) as i16;
@@ -3579,7 +3568,9 @@ impl Device for Rex3 {
             writeln!(writer, "SMASK3X   : {:08x}  SMASK3Y : {:08x}", ctx.smask3x, ctx.smask3y).unwrap();
             writeln!(writer, "SMASK4X   : {:08x}  SMASK4Y : {:08x}", ctx.smask4x, ctx.smask4y).unwrap();
             writeln!(writer, "TOPSCAN   : {:08x}", ctx.topscan).unwrap();
-            writeln!(writer, "STATUS    : {:08x}  CONFIG : {:08x}", config.status, config.config).unwrap();
+            writeln!(writer, "STATUS    : {:08x}  CONFIG : {:08x}",
+                self.config.status.load(Ordering::Relaxed),
+                self.config.config.load(Ordering::Relaxed)).unwrap();
             let gfxbusy = self.gfxbusy.load(Ordering::Relaxed);
             let gfifo_pending = self.gfifo_pending.load(Ordering::Relaxed);
             writeln!(writer, "DRAW BUSY : {}  GFIFO : {}/{} entries used",
@@ -3801,7 +3792,9 @@ impl BusDevice for Rex3 {
         //           trigger processing of the next pixel batch.
         if reg_offset == REX3_HOSTRW0 || reg_offset == REX3_HOSTRW1 {
             let is_go = (offset & 0x0800) != 0;
-            self.wait_idle();
+            if self.gfxbusy.load(Ordering::Acquire) || self.gfifo_pending.load(Ordering::Relaxed) > 0 {
+                return BusRead32::busy();
+            }
             let full = self.hostrw.load(Ordering::Relaxed);
             let val = if reg_offset == REX3_HOSTRW0 {
                 (full >> 32) as u32
@@ -3815,53 +3808,51 @@ impl BusDevice for Rex3 {
         }
 
         // Handle Config registers
-        let result = {
-            self.diag.fetch_or(Self::DIAG_LOCK_CONFIG, Ordering::Relaxed);
-            let mut config = self.config.lock();
-            let result = match reg_offset {
-                REX3_CONFIG => Some(BusRead32::ok(config.config & 0x1FFFFF)), // 21 bits
-                REX3_STATUS | REX3_USER_STATUS => {
-                    let mut val = config.status & 0xFFFFF; // 20 bits
-                    val |= 3 << STATUS_VERSION_SHIFT; // REX3 version=3 (Newport XL24)
-                    let pending = self.gfifo_pending.load(Ordering::Relaxed);
-
-                    if self.gfxbusy.load(Ordering::Relaxed) || pending > 0 {
-                        val |= STATUS_GFXBUSY;
-                    } else {
-                        val &= !STATUS_GFXBUSY;
-                    }
-                    
-                    // Map our large GFIFO onto the hardware 32-entry view:
-                    //   0              → 0  (empty)
-                    //   1 .. depth-32  → 1  (non-empty but plenty of room)
-                    //   depth-31 .. depth → 2..32  (last 31 entries, filling up)
-                    let level: u32 = if pending == 0 {
-                        0
-                    } else {
-                        let offset = pending.saturating_sub(GFIFO_DEPTH - GFIFO_HW_DEPTH);
-                        (offset as u32).max(1)
-                    };
-                    val &= !STATUS_GFIFOLEVEL_MASK;
-                    val |= (level << STATUS_GFIFOLEVEL_SHIFT) & STATUS_GFIFOLEVEL_MASK;
-
-                    if reg_offset == REX3_STATUS {
-                        config.status &= !STATUS_VRINT;
-                        if let Some(until) = config.backbusy_until {
-                            if std::time::Instant::now() < until {
-                                val |= STATUS_BACKBUSY;
-                            } else {
-                                config.backbusy_until = None;
-                            }
-                        }
-                    }
-                    Some(BusRead32::ok(val & 0xFFFFF)) // Ensure 20 bits on return
+        let result = match reg_offset {
+            REX3_CONFIG => Some(BusRead32::ok(self.config.config.load(Ordering::Relaxed) & 0x1FFFFF)), // 21 bits
+            REX3_STATUS | REX3_USER_STATUS => {
+                let mut val = self.config.status.load(Ordering::Relaxed) & 0xFFFFF; // 20 bits
+                val |= 3 << STATUS_VERSION_SHIFT; // REX3 version=3 (Newport XL24)
+                // gfxbusy: Acquire load — pairs with Release store(false) in draw loop,
+                // ensuring all context register writes by the draw thread are visible to us.
+                let pending = self.gfifo_pending.load(Ordering::Relaxed);
+                if self.gfxbusy.load(Ordering::Acquire) || pending > 0 {
+                    val |= STATUS_GFXBUSY;
+                } else {
+                    val &= !STATUS_GFXBUSY;
                 }
-                // DCBMODE and DCBDATA use self.dcb mutex, handled after config lock is released
-                _ => None,
-            };
-            drop(config);
-            self.diag.fetch_and(!Self::DIAG_LOCK_CONFIG, Ordering::Relaxed);
-            result
+
+                // Map our large GFIFO onto the hardware 32-entry view:
+                //   0              → 0  (empty)
+                //   1 .. depth-32  → 1  (non-empty but plenty of room)
+                //   depth-31 .. depth → 2..32  (last 31 entries, filling up)
+                let level: u32 = if pending == 0 {
+                    0
+                } else {
+                    let offset = pending.saturating_sub(GFIFO_DEPTH - GFIFO_HW_DEPTH);
+                    (offset as u32).max(1)
+                };
+                val &= !STATUS_GFIFOLEVEL_MASK;
+                val |= (level << STATUS_GFIFOLEVEL_SHIFT) & STATUS_GFIFOLEVEL_MASK;
+
+                if reg_offset == REX3_STATUS {
+                    // Clear VRINT on read (benign race with refresh thread's set).
+                    self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed);
+                    // backbusy_until is in dcb, CPU-thread-only — no lock needed.
+                    let dcb = self.dcb.lock();
+                    if let Some(until) = dcb.backbusy_until {
+                        if std::time::Instant::now() < until {
+                            val |= STATUS_BACKBUSY;
+                        }
+                        // Don't clear expired backbusy here — dcb is borrowed immutably.
+                        // The next DCB addr=12 access will overwrite it anyway.
+                    }
+                    drop(dcb);
+                }
+                Some(BusRead32::ok(val & 0xFFFFF)) // Ensure 20 bits on return
+            }
+            // DCBMODE and DCBDATA use self.dcb mutex, handled below
+            _ => None,
         };
 
         let result = if let Some(res) = result {
@@ -3878,8 +3869,11 @@ impl BusDevice for Rex3 {
                 REX3_DCBDATA0 => BusRead32::ok(self.dcb_read()),
                 REX3_DCBDATA1 => BusRead32::ok(self.dcb_read()),
                 _ => {
-                    // Handle Context registers
-                    self.wait_idle();
+                    // Context registers: stall (GRXDLY) until pipeline idle, modelled as EXEC_RETRY.
+                    // This lets cp0_count advance and interrupts fire between retries.
+                    if self.gfxbusy.load(Ordering::Acquire) || self.gfifo_pending.load(Ordering::Relaxed) > 0 {
+                        return BusRead32::busy();
+                    }
                     let context = unsafe { &*self.context.get() };
                     match reg_offset {
                         REX3_DRAWMODE1 => BusRead32::ok(context.drawmode1.0), // 32 bits
@@ -4114,7 +4108,7 @@ impl BusDevice for Rex3 {
             REX3_DCBRESET | REX3_DCBMODE | REX3_DCBDATA0 | REX3_DCBDATA1);
         if early_return {
             match reg_offset {
-                REX3_CONFIG => { self.config.lock().config = val; }
+                REX3_CONFIG => { self.config.config.store(val, Ordering::Relaxed); }
                 REX3_STATUS | REX3_USER_STATUS => {} // writes ignored
                 REX3_DCBMODE => {
                     self.diag.fetch_or(Self::DIAG_LOCK_DCB, Ordering::Relaxed);
@@ -4151,7 +4145,9 @@ impl BusDevice for Rex3 {
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
         if reg_offset64r == REX3_HOSTRW0 {
-            self.wait_idle();
+            if self.gfxbusy.load(Ordering::Acquire) || self.gfifo_pending.load(Ordering::Relaxed) > 0 {
+                return BusRead64::busy();
+            }
             let val = self.hostrw.load(Ordering::Relaxed);
             if is_go64r {
                 // Enqueue a pure-go entry: no register update, just trigger next pixel batch.
@@ -4203,7 +4199,8 @@ impl Resettable for Rex3 {
         // Reset drawing context
         unsafe { *self.context.get() = Rex3Context::default(); }
         // Reset config registers
-        *self.config.lock() = Rex3Config::default();
+        self.config.config.store(0, Ordering::Relaxed);
+        self.config.status.store(0, Ordering::Relaxed);
         *self.dcb.lock() = Rex3DcbState::default();
         // Clear framebuffers
         unsafe {
@@ -4300,15 +4297,13 @@ impl Saveable for Rex3 {
 
         // Config registers
         {
-            let cfg = self.config.lock();
             let dcb = self.dcb.lock();
             let mut ctbl = toml::map::Map::new();
-            ctbl.insert("config".into(),      hex_u32(cfg.config));
-            ctbl.insert("status".into(),      hex_u32(cfg.status));
-            ctbl.insert("user_status".into(), hex_u32(cfg.user_status));
-            ctbl.insert("dcbmode".into(),     hex_u32(dcb.dcbmode));
-            ctbl.insert("dcbdata0".into(),    hex_u32(dcb.dcbdata0));
-            ctbl.insert("dcbdata1".into(),    hex_u32(dcb.dcbdata1));
+            ctbl.insert("config".into(),  hex_u32(self.config.config.load(Ordering::Relaxed)));
+            ctbl.insert("status".into(),  hex_u32(self.config.status.load(Ordering::Relaxed)));
+            ctbl.insert("dcbmode".into(),  hex_u32(dcb.dcbmode));
+            ctbl.insert("dcbdata0".into(), hex_u32(dcb.dcbdata0));
+            ctbl.insert("dcbdata1".into(), hex_u32(dcb.dcbdata1));
             tbl.insert("config_regs".into(), toml::Value::Table(ctbl));
         }
 
@@ -4357,14 +4352,12 @@ impl Saveable for Rex3 {
         }
 
         if let Some(cfg_v) = get_field(v, "config_regs") {
-            let mut cfg = self.config.lock();
             let mut dcb = self.dcb.lock();
-            if let Some(x) = get_field(cfg_v, "config")      { cfg.config      = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "status")      { cfg.status      = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "user_status") { cfg.user_status = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "dcbmode")     { dcb.dcbmode     = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "dcbdata0")    { dcb.dcbdata0    = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "dcbdata1")    { dcb.dcbdata1    = toml_u32(x).unwrap_or(0); }
+            if let Some(x) = get_field(cfg_v, "config") { self.config.config.store(toml_u32(x).unwrap_or(0), Ordering::Relaxed); }
+            if let Some(x) = get_field(cfg_v, "status") { self.config.status.store(toml_u32(x).unwrap_or(0), Ordering::Relaxed); }
+            if let Some(x) = get_field(cfg_v, "dcbmode")  { dcb.dcbmode  = toml_u32(x).unwrap_or(0); }
+            if let Some(x) = get_field(cfg_v, "dcbdata0") { dcb.dcbdata0 = toml_u32(x).unwrap_or(0); }
+            if let Some(x) = get_field(cfg_v, "dcbdata1") { dcb.dcbdata1 = toml_u32(x).unwrap_or(0); }
         }
 
         if let Some(vv) = get_field(v, "vc2") {
