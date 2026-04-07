@@ -367,6 +367,7 @@ impl ShaderCompiler {
         if let Err(e) = self.jit_module.define_function(func_id, &mut self.ctx) {
             eprintln!("REX JIT: define_function failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}  -- {e}",
                 crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
+            eprintln!("--- Cranelift IR ---\n{}", self.ctx.func.display());
             self.jit_module.clear_context(&mut self.ctx);
             return None;
         }
@@ -836,50 +837,59 @@ fn emit_shader(
 
     // Pattern check: may replace raw_src with colorback (zpopaque/lsopaque)
     // or skip pixel entirely. We emit conditional branches.
+    // draw_block takes use_bg_flag as a block param so each predecessor can
+    // pass the correct value without SSA dominance violations.
     let draw_block = b.create_block();
-    let mut use_bg_flag: Value = b.ins().iconst(types::I8, 0);
+    b.append_block_param(draw_block, types::I8); // use_bg_flag
+
+    // Current use_bg value from the pre-pattern context (always 0 at entry).
+    let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
 
     if dm0.enzpattern() {
         let zp_block = b.create_block();
         let zp_pass  = b.create_block();
-        // bit = (zpattern >> zpat_bit) & 1
+        b.append_block_param(zp_pass, types::I8); // use_bg carried through
         let zpattern_v = ld32!(ctx_off!(zpattern));
         let zpat_bit32 = b.ins().uextend(types::I32, zpat_bit_v);
         let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
         let bit_v = b.ins().band_imm(zpat_shifted, 1);
         let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-        b.ins().brif(bit_set, zp_pass, &[], zp_block, &[]);
+        b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
         b.switch_to_block(zp_block); b.seal_block(zp_block);
         if dm0.zpopaque() {
-            use_bg_flag = b.ins().iconst(types::I8, 1);
-            b.ins().jump(zp_pass, &[]);
+            let bg1 = b.ins().iconst(types::I8, 1);
+            b.ins().jump(zp_pass, &[bg1]);
         } else {
             b.ins().jump(skip_block, &[]);
         }
         b.switch_to_block(zp_pass); b.seal_block(zp_pass);
+        cur_use_bg = b.block_params(zp_pass).to_vec()[0];
     }
 
     if dm0.enlspattern() {
         let ls_block = b.create_block();
         let ls_pass  = b.create_block();
+        b.append_block_param(ls_pass, types::I8); // use_bg carried through
         let lspattern_v = ld32!(ctx_off!(lspattern));
         let pat_bit32 = b.ins().uextend(types::I32, pat_bit_v);
         let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
         let bit_v = b.ins().band_imm(lspat_shifted, 1);
         let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
-        b.ins().brif(bit_set, ls_pass, &[], ls_block, &[]);
+        b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
         b.switch_to_block(ls_block); b.seal_block(ls_block);
         if dm0.lsopaque() {
-            use_bg_flag = b.ins().iconst(types::I8, 1);
-            b.ins().jump(ls_pass, &[]);
+            let bg1 = b.ins().iconst(types::I8, 1);
+            b.ins().jump(ls_pass, &[bg1]);
         } else {
             b.ins().jump(skip_block, &[]);
         }
         b.switch_to_block(ls_pass); b.seal_block(ls_pass);
+        cur_use_bg = b.block_params(ls_pass).to_vec()[0];
     }
 
-    b.ins().jump(draw_block, &[]);
+    b.ins().jump(draw_block, &[cur_use_bg]);
     b.switch_to_block(draw_block); b.seal_block(draw_block);
+    let use_bg_flag = b.block_params(draw_block).to_vec()[0];
 
     // Actual source: use_bg ? colorback : raw_src
     let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);

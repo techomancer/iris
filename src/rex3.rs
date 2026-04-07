@@ -928,6 +928,9 @@ pub struct Rex3 {
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
     #[cfg(feature = "rex-jit")]
     pub rex_jit: Option<std::sync::Arc<crate::rex3_jit::RexJit>>,
+    /// Whether the JIT is enabled for dispatch (can be toggled at runtime via `rex jit on/off`).
+    #[cfg(feature = "rex-jit")]
+    pub jit_enabled: AtomicBool,
     /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
     /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
     pub heartbeat: Arc<AtomicU64>,
@@ -1058,6 +1061,8 @@ impl Rex3 {
             renderer: Mutex::new(None),
             #[cfg(feature = "rex-jit")]
             rex_jit: Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new())),
+            #[cfg(feature = "rex-jit")]
+            jit_enabled: AtomicBool::new(true),
             heartbeat,
             cycles,
             fasttick_count,
@@ -3004,6 +3009,7 @@ impl Rex3 {
 
         #[cfg(feature = "rex-jit")]
         {
+            if self.jit_enabled.load(Ordering::Relaxed) {
             if let Some(ref jit) = self.rex_jit {
                 let dm0 = ctx.drawmode0.0;
                 let dm1 = ctx.drawmode1.0;
@@ -3026,6 +3032,7 @@ impl Rex3 {
                     }
                 }
             }
+            } // jit_enabled
         }
 
         if opcode != DRAWMODE0_OPCODE_NOOP {
@@ -3560,7 +3567,7 @@ impl Device for Rex3 {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("rex".to_string(), "REX3 commands: rex status (includes JIT stats) | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> (logs to rex3.log) [DEV]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status (includes JIT stats) | rex jit <on|off> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> (logs to rex3.log) [DEV]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 debug <on|off> [DEV]".to_string()),
             ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
@@ -3634,7 +3641,8 @@ impl Device for Rex3 {
             {
                 if let Some(ref jit) = self.rex_jit {
                     let pairs = jit.compiled_pairs();
-                    writeln!(writer, "--- JIT ---").unwrap();
+                    let enabled = self.jit_enabled.load(Ordering::Relaxed);
+                    writeln!(writer, "--- JIT : {} ---", if enabled { "enabled" } else { "DISABLED" }).unwrap();
                     writeln!(writer, "Compiled  : {}  Queued : {}",
                         pairs.len(), jit.queued_count()).unwrap();
                     if pairs.is_empty() {
@@ -3755,6 +3763,18 @@ impl Device for Rex3 {
                 *log = None;
                 writeln!(writer, "REX3 GFIFO logging disabled").unwrap();
             }
+            return Ok(());
+        }
+
+        #[cfg(feature = "rex-jit")]
+        if cmd == "rex" && args[0] == "jit" {
+            let val = match args.get(1).map(|s| *s) {
+                Some("on")  => true,
+                Some("off") => false,
+                _ => return Err("Usage: rex jit <on|off>".to_string()),
+            };
+            self.jit_enabled.store(val, Ordering::Relaxed);
+            writeln!(writer, "REX JIT dispatch: {}", if val { "enabled" } else { "disabled" }).unwrap();
             return Ok(());
         }
 

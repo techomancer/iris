@@ -2330,4 +2330,26 @@ mod jit_tests {
             dm0, dm1,
         );
     }
+
+    /// Line-stipple (enlspattern) span — the failing verifier case.
+    /// dm0=0x00022102: DRAW SPAN STOPONX ENLSPAT LSOPAQUE
+    /// dm1=0x3000f319: RGB 24bpp SRC
+    #[test]
+    fn jit_lspattern_span_rgb24() {
+        let dm0 = 0x00022102u32;
+        let dm1 = 0x3000f319u32;
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0xFF << 11);
+                reg(rex, REX3_LSPATTERN, 0xAAAA_AAAA); // alternating bits
+                // lsmode: lsrcount=0, lsrepeat=0, lsrcntsave=0, lslength=0 (length=17)
+                reg(rex, REX3_LSMODE,    0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
 }
