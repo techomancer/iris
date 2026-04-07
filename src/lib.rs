@@ -49,3 +49,5 @@ pub mod saa7191;
 pub mod vino;
 #[cfg(feature = "jit")]
 pub mod jit;
+#[cfg(feature = "rex-jit")]
+pub mod rex3_jit;

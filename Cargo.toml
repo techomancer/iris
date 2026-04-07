@@ -14,6 +14,8 @@ developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
 lightning = []
 # Cranelift-based JIT compiler for MIPS → native translation.
 jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]
+# Cranelift-based JIT compiler for REX3 graphics draw shaders.
+rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
 mouseabs = []

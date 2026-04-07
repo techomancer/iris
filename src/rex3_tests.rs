@@ -2012,3 +2012,255 @@ fn test_iline_line_loop_rect() {
         }
     }
 }
+
+// ============================================================================
+// JIT correctness tests — compare interpreter vs JIT framebuffer output
+// ============================================================================
+//
+// Pattern: run the same draw via interpreter (no JIT), then via JIT (with JIT enabled,
+// wait for compile), then assert the framebuffers are identical.
+
+#[cfg(feature = "rex-jit")]
+mod jit_tests {
+    use super::*;
+    use crate::rex3_jit::RexJit;
+
+    /// Build a Rex3 with JIT enabled.
+    fn make_rex3_jit() -> &'static Rex3 {
+        let rex = Box::leak(Box::new(Rex3::new(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )));
+        unsafe {
+            (*rex.fb_rgb.get()).fill(0);
+            (*rex.fb_aux.get()).fill(0);
+        }
+        rex.rex_jit = Some(std::sync::Arc::new(RexJit::new()));
+        rex.start();
+        rex
+    }
+
+    /// Dump fb_rgb pixels in region (x0,y0)..(x1,y1) inclusive.
+    fn dump_region(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                out.push(read_pixel(rex, x, y));
+            }
+        }
+        out
+    }
+
+    /// Clear fb_rgb in region to 0.
+    fn clear_region(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32) {
+        unsafe {
+            let fb = &mut *rex.fb_rgb.get();
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = 0;
+                }
+            }
+        }
+        unsafe {
+            let fb = &mut *rex.fb_aux.get();
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = 0;
+                }
+            }
+        }
+    }
+
+    /// Core JIT vs interpreter comparison helper.
+    /// `setup` writes all registers except the final GO (which calls the draw).
+    /// `dm0` is written as the GO trigger. `dm1` is written by setup.
+    /// Returns (interp_pixels, jit_pixels) for the given region.
+    fn compare_jit_interp(
+        x0: i32, y0: i32, x1: i32, y1: i32,
+        setup: impl Fn(&Rex3),
+        dm0: u32, dm1: u32,
+    ) {
+        // Interpreter run (no JIT — rex_jit is None)
+        let rex_interp = make_rex3();
+        rex3init(rex_interp);
+        setup(rex_interp);
+        reg_go(rex_interp, REX3_DRAWMODE0, dm0);
+        let fb_interp = dump_region(rex_interp, x0, y0, x1, y1);
+
+        // JIT run
+        let rex_jit = make_rex3_jit();
+        rex3init(rex_jit);
+        setup(rex_jit);
+        // First GO: triggers compile + interpreter fallback
+        reg_go(rex_jit, REX3_DRAWMODE0, dm0);
+        // Wait for JIT compile
+        let compiled = if let Some(ref jit) = rex_jit.rex_jit {
+            jit.wait_compiled(dm0, dm1)
+        } else { false };
+        assert!(compiled, "JIT compile failed for dm0={dm0:#010x} dm1={dm1:#010x}");
+
+        // Reset fb and re-run via JIT
+        clear_region(rex_jit, x0, y0, x1, y1);
+        rex3init(rex_jit);
+        setup(rex_jit);
+        reg_go(rex_jit, REX3_DRAWMODE0, dm0);
+        let fb_jit = dump_region(rex_jit, x0, y0, x1, y1);
+
+        assert_eq!(fb_interp, fb_jit,
+            "JIT/interp mismatch: dm0={dm0:#010x} dm1={dm1:#010x}");
+    }
+
+    /// RGB24 solid fill block — most common draw mode.
+    #[test]
+    fn jit_solid_fill_rgb24() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(10, 10, 25, 25,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_A0_50_80u32); // packed RGB24
+                reg(rex, REX3_XYENDI,    xy(25, 25));
+                reg(rex, REX3_XYSTARTI,  xy(10, 10));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// CI8 solid fill block — 8bpp palette mode.
+    #[test]
+    fn jit_solid_fill_ci8() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 15, 15,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFF);
+                reg(rex, REX3_COLORI,    0x42);
+                reg(rex, REX3_XYENDI,    xy(15, 15));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB24 XOR logic op block.
+    #[test]
+    fn jit_logicop_xor_rgb24() {
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_XOR;
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 15, 15,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_FF_00_FFu32);
+                reg(rex, REX3_XYENDI,    xy(15, 15));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB24 fastclear block.
+    #[test]
+    fn jit_fastclear_rgb24() {
+        // fastclear = DM1 bit 17; cidmatch must be 0xF for fastclear to activate in interpreter
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_LOGICOP_SRC | (1 << 17);
+        let dm0 = DM0_DRAW_BLOCK;
+        compare_jit_interp(0, 0, 31, 31,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_COLORVRAM, 0xABCDEF);
+                // cidmatch must be 0xF (bits [12:9] of CLIPMODE) for fastclear to fire
+                reg(rex, REX3_CLIPMODE,  0xF << 9);
+                reg(rex, REX3_XYENDI,    xy(31, 31));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// RGB24 solid fill span.
+    #[test]
+    fn jit_solid_fill_span_rgb24() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN;
+        compare_jit_interp(5, 5, 20, 5,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_12_34_56u32);
+                reg(rex, REX3_XYENDI,    xy(20, 5));
+                reg(rex, REX3_XYSTARTI,  xy(5, 5));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Gouraud shaded span — shade DDA path.
+    #[test]
+    fn jit_gouraud_shade_span() {
+        let dm1 = DM1_RGB24_SRC;
+        // DM0 with shade bit 18
+        let dm0 = DM0_DRAW_SPAN | (1 << 18);
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  10u32 << 11);   // start red=10
+                reg(rex, REX3_SLOPERED,  2u32 << 11);    // slope +2/pixel
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Z-pattern (stipple) block draw.
+    #[test]
+    fn jit_zpattern_block() {
+        let dm1 = DM1_RGB24_SRC;
+        // DM0 with enzpattern bit 12
+        let dm0 = DM0_DRAW_BLOCK | (1 << 12);
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0x00_FF_80_40u32);
+                reg(rex, REX3_ZPATTERN,  0xAAAA_AAAA);  // alternating bits
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Gouraud shade block — 2D gradient.
+    #[test]
+    fn jit_gouraud_shade_block() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_BLOCK | (1 << 18); // shade bit
+        compare_jit_interp(0, 0, 7, 7,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  0u32);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(7, 7));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+}

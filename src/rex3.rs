@@ -257,6 +257,7 @@ fn rex3_reg_name(offset: u32) -> &'static str {
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
+    #[repr(transparent)]
     pub struct DrawMode0(u32);
     impl Debug;
     pub opcode, _: 1, 0;
@@ -297,6 +298,7 @@ pub const DRAWMODE0_ADRMODE_A_LINE: u32 = 0x4 << 2;
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
+    #[repr(transparent)]
     pub struct DrawMode1(u32);
     impl Debug;
     pub planes, _: 2, 0;
@@ -412,6 +414,7 @@ pub const CLIPMODE_CIDMATCH_SHIFT: u32 = 9;
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
+    #[repr(transparent)]
     pub struct LsMode(u32);
     impl Debug;
     pub lsrcount, set_lsrcount: 7, 0;
@@ -427,6 +430,7 @@ pub const OCTANT_XMAJOR: u32 = 1 << 2;
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
+    #[repr(transparent)]
     pub struct BresOctInc1(u32);
     impl Debug;
     pub incr1, set_incr1: 19, 0;
@@ -435,6 +439,7 @@ bitfield! {
 
 bitfield! {
     #[derive(Clone, Copy, Default)]
+    #[repr(transparent)]
     pub struct BresRndInc2(u32);
     impl Debug;
     pub incr2, set_incr2: 20, 0;
@@ -664,6 +669,7 @@ impl DrawRingBuf {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub struct Rex3Context {
     pub drawmode1: DrawMode1,
     pub drawmode0: DrawMode0,
@@ -916,6 +922,8 @@ pub struct Rex3 {
     pub diag: AtomicU64,
     debug_state: Mutex<DebugState>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
+    #[cfg(feature = "rex-jit")]
+    pub rex_jit: Option<std::sync::Arc<crate::rex3_jit::RexJit>>,
     /// Shared activity heartbeat — set by all devices, polled+cleared by the refresh thread.
     /// bit 0 = enet TX, bit 1 = enet RX, bits 2-3 = red/green LED (persistent), bits 8-13 = SCSI IDs 0-5
     pub heartbeat: Arc<AtomicU64>,
@@ -1042,6 +1050,8 @@ impl Rex3 {
             debug_state: Mutex::new(DebugState::default()),
             diag: AtomicU64::new(0),
             renderer: Mutex::new(None),
+            #[cfg(feature = "rex-jit")]
+            rex_jit: None,
             heartbeat,
             cycles,
             fasttick_count,
@@ -2986,6 +2996,31 @@ impl Rex3 {
                 ctx.xend as f32 / 2048.0, ctx.yend as f32 / 2048.0);
         }
 
+        #[cfg(feature = "rex-jit")]
+        {
+            if let Some(ref jit) = self.rex_jit {
+                let dm0 = ctx.drawmode0.0;
+                let dm1 = ctx.drawmode1.0;
+                let adrmode = ctx.drawmode0.adrmode() << 2;
+                let is_jittable = opcode == DRAWMODE0_OPCODE_DRAW
+                    && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN)
+                    && !ctx.drawmode0.colorhost()
+                    && !ctx.drawmode0.alphahost();
+                if is_jittable {
+                    if let Some(entry) = jit.lookup(dm0, dm1) {
+                        let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
+                        let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
+                        unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
+                        self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
+                        return;
+                    } else {
+                        jit.request_compile(dm0, dm1);
+                        // fall through to interpreter
+                    }
+                }
+            }
+        }
+
         if opcode != DRAWMODE0_OPCODE_NOOP {
             let adrmode = ctx.drawmode0.adrmode() << 2;
             if adrmode == DRAWMODE0_ADRMODE_I_LINE
@@ -3469,6 +3504,11 @@ impl Device for Rex3 {
             if let Ok(consumer) = handle.join() {
                 *self.gfifo_consumer.lock() = Some(consumer);
             }
+        }
+
+        #[cfg(feature = "rex-jit")]
+        if let Some(ref jit) = self.rex_jit {
+            jit.save_profile();
         }
 
         if let Some(handle) = self.refresh_thread.lock().take() {
