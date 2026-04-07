@@ -8,7 +8,7 @@
 
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
-use crate::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_IBE};
+use crate::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::cell::UnsafeCell;
@@ -35,13 +35,6 @@ impl FetchInstrResult {
     }
 }
 
-/// Result of cache line fill operations
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum FillResult {
-    Ok,
-    Error,
-    VirtualCoherencyException,
-}
 
 // Re-export cache operation constants for convenience
 pub use crate::mips_isa::{
@@ -1188,7 +1181,9 @@ impl R4000Cache {
     /// Fill L1 instruction cache line
     /// Ensures data is in L2 first, then copies to L1-I
     /// For C_FILL operation, phys_addr is used for indexing
-    fn fill_l1i_line(&self, index_addr: u64, phys_addr: u64) -> FillResult {
+    /// Returns `EXEC_COMPLETE` on success, `exec_exception_const(EXC_VCEI)` on VCE,
+    /// or `exec_exception_const(EXC_IBE)` on bus error (instruction fetch → IBE, not DBE).
+    fn fill_l1i_line(&self, index_addr: u64, phys_addr: u64) -> ExecStatus {
         let ic_idx = self.ic.get_index(index_addr);
 
         // No writeback needed for I-cache (it's read-only)
@@ -1210,12 +1205,12 @@ impl R4000Cache {
             let stored_pidx = l2_tag.pidx();
 
             if virt_pidx != stored_pidx {
-                return FillResult::VirtualCoherencyException;
+                return exec_exception_const(EXC_VCEI);
             }
         } else {
             // L2 miss - fill from memory
             if !self.fill_l2_line(phys_addr, index_addr) {
-                return FillResult::Error;
+                return exec_exception_const(EXC_IBE);
             }
         }
 
@@ -1239,12 +1234,12 @@ impl R4000Cache {
         ic_tag.set_valid(true);
         self.ic.set_tag(ic_idx, ic_tag);
 
-        FillResult::Ok
+        EXEC_COMPLETE
     }
 
-    /// Fill L1 data cache line
-    /// Ensures data is in L2 first, then copies to L1-D
-    fn fill_l1d_line(&self, virt_addr: u64, phys_addr: u64) -> FillResult {
+    /// Fill L1 data cache line. Ensures data is in L2 first, then copies to L1-D.
+    /// Returns `BUS_OK` on success, `BUS_VCE` on VCE, or `BUS_ERR` on bus error.
+    fn fill_l1d_line(&self, virt_addr: u64, phys_addr: u64) -> u32 {
         let dc_idx = self.dc.get_index(virt_addr);
 
         // Writeback and invalidate the victim line (hardware fill — not a coherency action)
@@ -1266,12 +1261,12 @@ impl R4000Cache {
             let stored_pidx = l2_tag.pidx();
 
             if virt_pidx != stored_pidx {
-                return FillResult::VirtualCoherencyException;
+                return BUS_VCE;
             }
         } else {
             // L2 miss - fill from memory
             if !self.fill_l2_line(phys_addr, virt_addr) {
-                return FillResult::Error;
+                return BUS_ERR;
             }
         }
 
@@ -1295,7 +1290,7 @@ impl R4000Cache {
         dc_tag.set_cs(L1D_CS_CLEAN_EXCLUSIVE);
         self.dc.set_tag(dc_idx, dc_tag);
 
-        // println!("[CACHE DEBUG] fill_l1d_line: idx={}, virt_addr=0x{:016x}, phys_addr=0x{:08x}, ptag=0x{:06x}, state=CleanExclusive",
+        // println!("[CACHE DEBUG] fill_l1d_line: idx={}, virt_addr=0x{:016x}, phys_addr=0x{:08x}, ptag=0x{:06x}, state=CleanExclusive (BUS_OK)",
         //          dc_idx, virt_addr, phys_addr, ptag);
 
         #[cfg(feature = "debug_cache")]
@@ -1313,7 +1308,7 @@ impl R4000Cache {
             }
         }
 
-        FillResult::Ok
+        BUS_OK
     }
 }
 
@@ -1344,11 +1339,8 @@ impl MipsCache for R4000Cache {
         #[cfg(feature = "developer")]
         self.l1i_fetch_count.fetch_add(1, Ordering::Relaxed);
         if !ic_tag.valid() || ic_tag.ptag() != ptag {
-            match self.fill_l1i_line(virt_addr, phys_addr) {
-                FillResult::Ok => {},
-                FillResult::Error => return FetchInstrResult::exception(exec_exception_const(EXC_IBE)),
-                FillResult::VirtualCoherencyException => return FetchInstrResult::exception(exec_exception_const(EXC_VCEI)),
-            }
+            let s = self.fill_l1i_line(virt_addr, phys_addr);
+            if s != EXEC_COMPLETE { return FetchInstrResult::exception(s); }
         } else {
             #[cfg(feature = "developer")]
             self.l1i_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1388,11 +1380,8 @@ impl MipsCache for R4000Cache {
 
         // Fill if not valid or tag mismatch
         if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != ptag {
-            match self.fill_l1d_line(virt_addr, phys_addr) {
-                FillResult::Ok => {},
-                FillResult::Error => return BusRead64::err(),
-                FillResult::VirtualCoherencyException => return BusRead64::vce(),
-            }
+            let s = self.fill_l1d_line(virt_addr, phys_addr);
+            if s != BUS_OK { return BusRead64 { status: s, data: 0 }; }
         }
 
         // Read from L1-D cache
@@ -1431,11 +1420,8 @@ impl MipsCache for R4000Cache {
 
         // Fill if not valid or tag mismatch
         if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != ptag {
-            match self.fill_l1d_line(virt_addr, phys_addr) {
-                FillResult::Ok => {},
-                FillResult::Error => return BUS_ERR,
-                FillResult::VirtualCoherencyException => return BUS_VCE,
-            }
+            let s = self.fill_l1d_line(virt_addr, phys_addr);
+            if s != BUS_OK { return s; }
         }
 
         // Write to L1-D cache
