@@ -2223,6 +2223,73 @@ mod jit_tests {
         );
     }
 
+    /// Shade span with skipfirst: first pixel is skipped but shade still steps,
+    /// so pixel 1 (the first drawn) has color = start + slope.
+    #[test]
+    fn jit_shade_span_skipfirst() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18) | (1 << 10); // shade + skipfirst
+        compare_jit_interp(0, 0, 7, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  20u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  3u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(7, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade span with skiplast: last pixel is skipped, all others drawn.
+    #[test]
+    fn jit_shade_span_skiplast() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18) | (1 << 11); // shade + skiplast
+        compare_jit_interp(0, 0, 7, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  5u32 << 11);
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  4u32 << 11);
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(7, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Shade span that saturates: color ramps up and clamps at 0xFF.
+    #[test]
+    fn jit_shade_span_saturate() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_SPAN | (1 << 18); // shade
+        compare_jit_interp(0, 0, 15, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,    0xFFFFFF);
+                reg(rex, REX3_COLORRED,  240u32 << 11); // start near max
+                reg(rex, REX3_COLORGRN,  0u32);
+                reg(rex, REX3_COLORBLUE, 0u32);
+                reg(rex, REX3_SLOPERED,  10u32 << 11);  // large slope — wraps past 0xFF
+                reg(rex, REX3_SLOPEGRN,  0);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,    xy(15, 0));
+                reg(rex, REX3_XYSTARTI,  xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
     /// Z-pattern (stipple) block draw.
     #[test]
     fn jit_zpattern_block() {

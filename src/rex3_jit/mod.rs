@@ -39,6 +39,8 @@ pub struct ShaderStore {
     pub cache: RwLock<HashMap<(u32, u32), CompiledShader>>,
     /// Set of keys for which compilation has been requested (to avoid duplicate requests).
     pub queued: RwLock<HashSet<(u32, u32)>>,
+    /// Set of keys that failed to compile — never retried.
+    pub failed: RwLock<HashSet<(u32, u32)>>,
 }
 
 impl ShaderStore {
@@ -46,6 +48,7 @@ impl ShaderStore {
         Self {
             cache: RwLock::new(HashMap::new()),
             queued: RwLock::new(HashSet::new()),
+            failed: RwLock::new(HashSet::new()),
         }
     }
 }
@@ -84,18 +87,26 @@ impl RexJit {
                             match compiler.compile_shader(dm0, dm1) {
                                 Some(entry) => {
                                     let shader = CompiledShader { entry };
-                                    store_clone.cache.write().unwrap().insert((dm0, dm1), shader);
+                                    let count = {
+                                        let mut cache = store_clone.cache.write().unwrap();
+                                        cache.insert((dm0, dm1), shader);
+                                        cache.len()
+                                    };
+                                    store_clone.queued.write().unwrap().remove(&(dm0, dm1));
+                                    eprintln!("REX JIT: compiled dm0={dm0:#010x} dm1={dm1:#010x} (total: {count})");
                                 }
                                 None => {
-                                    // Compilation failed or skipped; remove from queued so
-                                    // future requests can retry.
+                                    // Compilation failed or not JIT-able; mark as permanently
+                                    // failed so request_compile() never re-queues it.
                                     store_clone.queued.write().unwrap().remove(&(dm0, dm1));
+                                    store_clone.failed.write().unwrap().insert((dm0, dm1));
                                 }
                             }
                         }
                         CompileRequest::Shutdown => break,
                     }
                 }
+                eprintln!("REX JIT: compiler thread exiting");
             })
             .expect("failed to spawn rex3-jit thread");
 
@@ -107,8 +118,14 @@ impl RexJit {
 
         // Warm-up: queue all profile pairs for pre-compilation.
         let profile = profile::load_profile();
+        let warmup_count = profile.len();
         for (dm0, dm1) in profile {
             jit.request_compile(dm0, dm1);
+        }
+        if warmup_count > 0 {
+            eprintln!("REX JIT: started, queued {warmup_count} shader(s) from profile for warm-up");
+        } else {
+            eprintln!("REX JIT: started (no profile — shaders will compile on first use)");
         }
 
         jit
@@ -125,10 +142,13 @@ impl RexJit {
     }
 
     /// Request background compilation for the given draw mode pair.
-    /// No-op if already compiled or already queued.
+    /// No-op if already compiled, permanently failed, or already queued.
     pub fn request_compile(&self, dm0: u32, dm1: u32) {
-        // Fast path: already compiled.
+        // Fast path: already compiled or known-bad.
         if self.store.cache.read().unwrap().contains_key(&(dm0, dm1)) {
+            return;
+        }
+        if self.store.failed.read().unwrap().contains(&(dm0, dm1)) {
             return;
         }
         // Check-and-set in queued set (write lock, brief).

@@ -183,6 +183,7 @@ impl Dm0 {
     fn shade(&self)       -> bool { self.val & (1 << 18) != 0 }
     fn lronly(&self)      -> bool { self.val & (1 << 19) != 0 }
     fn xyoffset(&self)    -> bool { self.val & (1 << 20) != 0 }
+    fn ciclamp(&self)     -> bool { self.val & (1 << 21) != 0 }
     fn ystride(&self)     -> bool { self.val & (1 << 23) != 0 }
     fn fastclear(&self)   -> bool { false } // fastclear is a dm1 bit
 }
@@ -308,7 +309,6 @@ impl ShaderCompiler {
         -> Option<unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>
     {
         let dm0 = Dm0 { val: dm0_val };
-        let dm1 = Dm1 { val: dm1_val };
 
         // Only DRAW opcode, SPAN or BLOCK adrmode (no host FIFO, no lines).
         let opcode = dm0.opcode();
@@ -316,6 +316,10 @@ impl ShaderCompiler {
         if opcode != DRAWMODE0_OPCODE_DRAW { return None; }
         if dm0.colorhost() || dm0.alphahost() { return None; }
         if adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK { return None; }
+
+        // fastclear takes priority over blend — hardware ignores blend when fastclear=1.
+        let dm1_val = if dm1_val & (1 << 17) != 0 { dm1_val & !(1 << 18) } else { dm1_val };
+        let dm1 = Dm1 { val: dm1_val };
 
         let name = format!("rex_shader_{:08x}_{:08x}_{}", dm0_val, dm1_val, self.counter);
         self.counter += 1;
@@ -355,12 +359,14 @@ impl ShaderCompiler {
         if !result {
             self.ctx.func.clear();
             self.jit_module.clear_context(&mut self.ctx);
-            eprintln!("REX JIT: emit_shader returned false for dm0={dm0_val:#010x} dm1={dm1_val:#010x}");
+            eprintln!("REX JIT: emit_shader returned false for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}",
+                crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
             return None;
         }
 
         if let Err(e) = self.jit_module.define_function(func_id, &mut self.ctx) {
-            eprintln!("REX JIT: define_function failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {e}");
+            eprintln!("REX JIT: define_function failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}  -- {e}",
+                crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
             self.jit_module.clear_context(&mut self.ctx);
             return None;
         }
@@ -626,19 +632,20 @@ fn emit_shader(
     let x_past_end_inc = b.ins().icmp(IntCC::SignedGreaterThan, xstart_next, xend_v);
     let x_end_reached  = b.ins().select(x_dec_v, x_past_end_dec, x_past_end_inc);
 
-    // do_pixel: I1 value (true = draw pixel)
+    // do_pixel: I8 (1 = draw pixel, 0 = skip).
+    // icmp returns I8 in Cranelift 0.116; brif treats any non-zero as true.
+    // Use icmp_imm Equal/NotEqual to get clean 0/1 rather than bnot (which gives 0xFE).
     // skip if: (skipfirst && first) || (skiplast && x_end_reached)
     let do_pixel: Value = if dm0.skipfirst() && dm0.skiplast() {
-        let first_nonzero = b.ins().icmp_imm(IntCC::NotEqual, first_v, 0);
-        let skip = b.ins().bor(first_nonzero, x_end_reached);
-        b.ins().bnot(skip)
+        let first_is_zero   = b.ins().icmp_imm(IntCC::Equal, first_v, 0);     // 1 if not-first
+        let not_x_end       = b.ins().icmp_imm(IntCC::Equal, x_end_reached, 0); // 1 if not-last
+        b.ins().band(first_is_zero, not_x_end)
     } else if dm0.skipfirst() {
-        let first_nonzero = b.ins().icmp_imm(IntCC::NotEqual, first_v, 0);
-        b.ins().bnot(first_nonzero)
+        b.ins().icmp_imm(IntCC::Equal, first_v, 0)    // 1 when first==0 (not the first pixel)
     } else if dm0.skiplast() {
-        b.ins().bnot(x_end_reached)
+        b.ins().icmp_imm(IntCC::Equal, x_end_reached, 0) // 1 when not at end
     } else {
-        b.ins().iconst(types::I8, 1) // always draw (using I8 as I1 for brif)
+        b.ins().iconst(types::I8, 1) // always draw
     };
 
     // lronly: skip if x_dec (right-to-left direction), handled by skipping entire primitive
@@ -1022,26 +1029,20 @@ fn emit_shader(
         let (ncr, ncg, ncb, nca) = if dm1.rgbmode() {
             (clamp_shade(&mut b, ncr), clamp_shade(&mut b, ncg),
              clamp_shade(&mut b, ncb), clamp_shade(&mut b, nca))
-        } else if dm0.ystride() /* ciclamp field is bit 21 */ {
-            // ciclamp: drawmode0 bit 21
-            let ciclamp = dm0.val & (1 << 21) != 0;
-            if ciclamp {
-                let depth = dm1.drawdepth();
-                let ncr2 = if depth == 1 { // 8bpp: clamp if bit 19
-                    let overflow = b.ins().band_imm(ncr, 1 << 19);
-                    let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
-                    let max8 = b.ins().iconst(types::I32, 0x0007_FFFFi64);
-                    b.ins().select(ov_set, max8, ncr)
-                } else if depth == 2 { // 12bpp: clamp if bit 21
-                    let overflow = b.ins().band_imm(ncr, 1 << 21);
-                    let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
-                    let max12 = b.ins().iconst(types::I32, 0x001F_FFFFi64);
-                    b.ins().select(ov_set, max12, ncr)
-                } else { ncr };
-                (ncr2, ncg, ncb, nca)
-            } else {
-                (ncr, ncg, ncb, nca)
-            }
+        } else if dm0.ciclamp() {
+            let depth = dm1.drawdepth();
+            let ncr2 = if depth == 1 { // 8bpp: clamp colorred if bit 19 set
+                let overflow = b.ins().band_imm(ncr, 1 << 19);
+                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let max8 = b.ins().iconst(types::I32, 0x0007_FFFFi64);
+                b.ins().select(ov_set, max8, ncr)
+            } else if depth == 2 { // 12bpp: clamp colorred if bit 21 set
+                let overflow = b.ins().band_imm(ncr, 1 << 21);
+                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let max12 = b.ins().iconst(types::I32, 0x001F_FFFFi64);
+                b.ins().select(ov_set, max12, ncr)
+            } else { ncr };
+            (ncr2, ncg, ncb, nca)
         } else {
             (ncr, ncg, ncb, nca)
         };

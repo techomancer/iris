@@ -122,7 +122,7 @@ pub const REX3_STATUS: u32 = 0x1338;
 pub const REX3_USER_STATUS: u32 = 0x133C;
 pub const REX3_DCBRESET: u32 = 0x1340;
 
-fn decode_dm0(v: u32) -> String {
+pub(crate) fn decode_dm0(v: u32) -> String {
     let dm = DrawMode0(v);
     let opcode = match dm.opcode() { 0=>"NOOP", 1=>"READ", 2=>"DRAW", 3=>"SCR2SCR", _=>"?" };
     let adrmode = match dm.adrmode() { 0=>"SPAN", 1=>"BLOCK", 2=>"ILINE", 3=>"FLINE", 4=>"ALINE", _=>"?" };
@@ -149,7 +149,7 @@ fn decode_dm0(v: u32) -> String {
     format!("{} {}{}", opcode, adrmode, flags)
 }
 
-fn decode_dm1(v: u32) -> String {
+pub(crate) fn decode_dm1(v: u32) -> String {
     let dm = DrawMode1(v);
     let planes = match dm.planes() { 0=>"NONE", 1=>"RGB", 2=>"RGBA", 4=>"OLAY", 5=>"PUP", 6=>"CID", _=>"?" };
     let depth  = match dm.drawdepth()  { 0=>"4bpp", 1=>"8bpp", 2=>"12bpp", 3=>"24bpp", _=>"?" };
@@ -917,6 +917,10 @@ pub struct Rex3 {
     #[cfg(feature = "developer")]
     pub gfifo_hwm: AtomicUsize,
     pub hostrw: AtomicU64,
+    /// Number of execute_go() calls dispatched via the JIT (compiled shader hit).
+    pub jit_go_count: AtomicU64,
+    /// Number of execute_go() calls dispatched via the interpreter (JIT miss or disabled).
+    pub interp_go_count: AtomicU64,
     /// Activity/lock diagnostic bits — set while holding a lock or inside a loop.
     /// Read at any time to see what the refresh/painter/processor threads are doing.
     pub diag: AtomicU64,
@@ -1047,11 +1051,13 @@ impl Rex3 {
             #[cfg(feature = "developer")]
             gfifo_hwm: AtomicUsize::new(0),
             hostrw: AtomicU64::new(0),
+            jit_go_count: AtomicU64::new(0),
+            interp_go_count: AtomicU64::new(0),
             debug_state: Mutex::new(DebugState::default()),
             diag: AtomicU64::new(0),
             renderer: Mutex::new(None),
             #[cfg(feature = "rex-jit")]
-            rex_jit: None,
+            rex_jit: Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new())),
             heartbeat,
             cycles,
             fasttick_count,
@@ -3011,6 +3017,7 @@ impl Rex3 {
                         let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
                         let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
                         unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
+                        self.jit_go_count.fetch_add(1, Ordering::Relaxed);
                         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                         return;
                     } else {
@@ -3036,6 +3043,7 @@ impl Rex3 {
                 self.draw_span(ctx);
             }
         }
+        self.interp_go_count.fetch_add(1, Ordering::Relaxed);
         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
     }
 
@@ -3616,6 +3624,12 @@ impl Device for Rex3 {
             writeln!(writer, "DRAW BUSY : {}  GFIFO : {}/{} entries used",
                 if gfxbusy { "YES" } else { "no" },
                 gfifo_pending, GFIFO_DEPTH).unwrap();
+            let jit_go   = self.jit_go_count.load(Ordering::Relaxed);
+            let interp_go = self.interp_go_count.load(Ordering::Relaxed);
+            let total_go  = jit_go + interp_go;
+            let jit_pct   = if total_go > 0 { jit_go * 100 / total_go } else { 0 };
+            writeln!(writer, "GO TOTAL  : {}  JIT : {} ({}%)  INTERP : {}",
+                total_go, jit_go, jit_pct, interp_go).unwrap();
             #[cfg(feature = "rex-jit")]
             {
                 if let Some(ref jit) = self.rex_jit {
