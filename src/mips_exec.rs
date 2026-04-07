@@ -827,10 +827,7 @@ For R4000SC/MC CPUs:
     pub fn exec(&mut self, instr: u32) -> ExecStatus {
         self.ins.raw = instr;
         self.ins.decoded = false;
-        if decode_into::<T, C>(&mut self.ins) {
-            #[cfg(feature = "developer")]
-            self.decoded_count.fetch_add(1, Ordering::Relaxed);
-        }
+        decode_into::<T, C>(&mut self.ins);
         let d: *const DecodedInstr = &self.ins;
         self.exec_decoded(unsafe { &*d })
     }
@@ -914,7 +911,10 @@ For R4000SC/MC CPUs:
         let fetch = self.fetch_instr(pc);
         let result = if fetch.status == EXEC_COMPLETE {
             let slot = fetch.instr as *mut DecodedInstr;
-            if decode_into::<T, C>(unsafe { &mut *slot }) {
+            let d = unsafe { &mut *slot };
+            if !d.decoded {
+                decode_into::<T, C>(d);
+            } else {
                 #[cfg(feature = "developer")]
                 self.decoded_count.fetch_add(1, Ordering::Relaxed);
             }
@@ -4204,12 +4204,8 @@ For R4000SC/MC CPUs:
 
 }
 
-/// Decode `raw` into `ins` if not already decoded.
-/// Returns `true` if the instruction was already decoded, `false` otherwise.
-pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) -> bool {
-    if ins.decoded {
-        return true;
-    }
+/// Decode `raw` into `ins`. Caller is responsible for checking `ins.decoded` first.
+pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
     let raw = ins.raw;
 
     let op    = ((raw >> 26) & 0x3F) as u8;
@@ -4450,7 +4446,6 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) -> bool {
     ins.funct   = funct;
     ins.handler = handler as usize;
     ins.decoded = true;
-    false
 }
 
 // Field extraction helpers have been replaced by DecodedInstr fields

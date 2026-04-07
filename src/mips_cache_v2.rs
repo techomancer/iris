@@ -433,22 +433,31 @@ impl<T> CacheVec<T> {
 /// `KIND` (a `CacheKind` discriminant cast to `u8`) controls whether the L2
 /// decoded-instruction array is allocated and which methods are meaningful.
 ///
-/// - `tags`: one u32 per cache line (use `get_tag`/`set_tag` for typed access)
-/// - `data`: entire cache as `SIZE/8` u64 chunks
-/// - `instrs`: L2 only — one DecodedInstr per 4-byte word (`SIZE/4` entries); empty otherwise
-struct Cache<const SIZE: usize, const LINE: usize, const KIND: u8> {
-    tags:   CacheVec<u32>,
-    data:   CacheVec<u64>,
-    /// L2 decoded-instruction slots (SIZE/4 entries). Empty for L1-I and L1-D.
+/// - `tags`: `TAGS` u32 tags inline in the struct (no heap indirection; TAGS = SIZE/LINE)
+/// - `data`: `DATA` u64 chunks inline in the struct (no heap indirection; DATA = SIZE/8)
+/// - `instrs`: L2 only — heap Vec of SIZE/4 DecodedInstr slots (6MB, contains fn ptrs)
+///
+/// `TAGS` and `DATA` are redundant with `SIZE`/`LINE` but required as explicit const generics
+/// because stable Rust cannot use arithmetic on generic params in array length positions.
+struct Cache<const SIZE: usize, const LINE: usize, const KIND: u8,
+             const TAGS: usize, const DATA: usize> {
+    /// Heap-allocated tag array — one u32 per cache line. Use `get_tag`/`set_tag` for typed access.
+    tags:   UnsafeCell<Box<[u32; TAGS]>>,
+    /// Heap-allocated data array — entire cache contents as u64 chunks.
+    data:   UnsafeCell<Box<[u64; DATA]>>,
+    /// L2 decoded-instruction slots (SIZE/4 entries). Empty Vec for L1-I and L1-D.
     instrs: CacheVec<DecodedInstr>,
     /// Signals the decode thread to stop (kept for Drop compatibility).
     stop:   Arc<AtomicBool>,
 }
 
-unsafe impl<const SIZE: usize, const LINE: usize, const KIND: u8> Send for Cache<SIZE, LINE, KIND> {}
-unsafe impl<const SIZE: usize, const LINE: usize, const KIND: u8> Sync for Cache<SIZE, LINE, KIND> {}
+unsafe impl<const SIZE: usize, const LINE: usize, const KIND: u8,
+            const TAGS: usize, const DATA: usize> Send for Cache<SIZE, LINE, KIND, TAGS, DATA> {}
+unsafe impl<const SIZE: usize, const LINE: usize, const KIND: u8,
+            const TAGS: usize, const DATA: usize> Sync for Cache<SIZE, LINE, KIND, TAGS, DATA> {}
 
-impl<const SIZE: usize, const LINE: usize, const KIND: u8> Cache<SIZE, LINE, KIND> {
+impl<const SIZE: usize, const LINE: usize, const KIND: u8,
+     const TAGS: usize, const DATA: usize> Cache<SIZE, LINE, KIND, TAGS, DATA> {
     // ---- Compile-time geometry constants ----
     const NUM_LINES:             usize = SIZE / LINE;
     const LINE_SHIFT:            u32   = ctz(LINE);
@@ -471,8 +480,10 @@ impl<const SIZE: usize, const LINE: usize, const KIND: u8> Cache<SIZE, LINE, KIN
             Vec::new()
         };
         Self {
-            tags:   CacheVec::new(vec![0u32; Self::NUM_LINES]),
-            data:   CacheVec::new(vec![0u64; SIZE / 8]),
+            // SAFETY: u32/u64 are valid at all-zero bit patterns. Box::new_zeroed avoids
+            // constructing the array on the stack before moving to the heap.
+            tags:   UnsafeCell::new(unsafe { Box::new_zeroed().assume_init() }),
+            data:   UnsafeCell::new(unsafe { Box::new_zeroed().assume_init() }),
             instrs: CacheVec::new(instrs),
             stop:   Arc::new(AtomicBool::new(false)),
         }
@@ -498,16 +509,25 @@ impl<const SIZE: usize, const LINE: usize, const KIND: u8> Cache<SIZE, LINE, KIN
         (line_idx << Self::CHUNKS_PER_LINE_SHIFT) + chunk_offset
     }
 
+    #[inline(always)]
+    fn tags(&self) -> &[u32; TAGS] { unsafe { &**self.tags.get() } }
+    #[inline(always)]
+    fn tags_mut(&self) -> &mut [u32; TAGS] { unsafe { &mut **self.tags.get() } }
+    #[inline(always)]
+    fn data(&self) -> &[u64; DATA] { unsafe { &**self.data.get() } }
+    #[inline(always)]
+    fn data_mut(&self) -> &mut [u64; DATA] { unsafe { &mut **self.data.get() } }
+
     /// Read the tag at `idx` as a typed bitfield struct.
     #[inline(always)]
     fn get_tag<T: From<u32>>(&self, idx: usize) -> T {
-        T::from(self.tags.get()[idx])
+        T::from(unsafe { *self.tags().get_unchecked(idx) })
     }
 
     /// Write a typed bitfield tag to `idx`.
     #[inline(always)]
     fn set_tag<T: Into<u32>>(&self, idx: usize, tag: T) {
-        self.tags.get_mut()[idx] = tag.into();
+        unsafe { *self.tags_mut().get_unchecked_mut(idx) = tag.into(); }
     }
 
     /// View cache data as a flat &[u32] (two per u64, big-endian word order).
@@ -515,24 +535,24 @@ impl<const SIZE: usize, const LINE: usize, const KIND: u8> Cache<SIZE, LINE, KIN
     /// Used by the I-cache to store l2.instrs slot indices.
     #[inline(always)]
     fn data_as_words(&self) -> &[u32] {
-        let slice = self.data.get();
-        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u32, slice.len() * 2) }
+        let arr = self.data();
+        unsafe { std::slice::from_raw_parts(arr.as_ptr() as *const u32, SIZE / 4) }
     }
 
     /// View cache data as a flat &[u16] (big-endian halfword order within each u64).
     /// XOR halfword index with 3 to convert MIPS big-endian address to host offset.
     #[inline(always)]
     fn data_as_halves(&self) -> &[u16] {
-        let slice = self.data.get();
-        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u16, slice.len() * 4) }
+        let arr = self.data();
+        unsafe { std::slice::from_raw_parts(arr.as_ptr() as *const u16, SIZE / 2) }
     }
 
     /// View cache data as a flat &[u8] (big-endian byte order within each u64).
     /// XOR byte index with 7 to convert MIPS big-endian address to host offset.
     #[inline(always)]
     fn data_as_bytes(&self) -> &[u8] {
-        let slice = self.data.get();
-        unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 8) }
+        let arr = self.data();
+        unsafe { std::slice::from_raw_parts(arr.as_ptr() as *const u8, SIZE) }
     }
 }
 
@@ -555,13 +575,13 @@ pub struct R4000Cache {
     downstream: Arc<dyn BusDevice>,
 
     // L1 Instruction Cache (16 KB, 16-byte lines)
-    ic: Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }>,
+    ic: ICache,
 
     // L1 Data Cache (16 KB, 16-byte lines)
-    dc: Cache<DC_SIZE, DC_LINE, { CacheKind::Data as u8 }>,
+    dc: DCache,
 
     // L2 Unified Cache (1 MB, 128-byte lines)
-    l2: Cache<L2_SIZE, L2_LINE, { CacheKind::L2 as u8 }>,
+    l2: L2Cache,
 
     // Load-Linked / Store-Conditional support
     llbit: UnsafeCell<bool>,
@@ -593,9 +613,10 @@ unsafe impl Send for R4000Cache {}
 unsafe impl Sync for R4000Cache {}
 
 // Type aliases for the concrete cache instances, for brevity in R4000Cache impls.
-type ICache = Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }>;
-type DCache = Cache<DC_SIZE, DC_LINE, { CacheKind::Data as u8 }>;
-type L2Cache = Cache<L2_SIZE, L2_LINE, { CacheKind::L2 as u8 }>;
+// TAGS = SIZE/LINE (one tag per cache line), DATA = SIZE/8 (one u64 per 8 bytes).
+type ICache  = Cache<IC_SIZE, IC_LINE, { CacheKind::Insn as u8 }, { IC_SIZE / IC_LINE }, { IC_SIZE / 8 }>;
+type DCache  = Cache<DC_SIZE, DC_LINE, { CacheKind::Data as u8 }, { DC_SIZE / DC_LINE }, { DC_SIZE / 8 }>;
+type L2Cache = Cache<L2_SIZE, L2_LINE, { CacheKind::L2   as u8 }, { L2_SIZE / L2_LINE }, { L2_SIZE / 8 }>;
 
 impl R4000Cache {
     pub fn new(downstream: Arc<dyn BusDevice>) -> Self {
@@ -778,16 +799,16 @@ impl R4000Cache {
     /// L2 line.  The caller iterates over `l1_lines_per_l2` indices starting here,
     /// stepping by 1 (indices wrap naturally via the cache mask).
     #[inline]
-    fn l2_idx_to_l1_base_idx<const L1_SIZE: usize, const L1_LINE: usize, const L1_KIND: u8>(
-        &self, l2_idx: usize, pidx: u32, _l1: &Cache<L1_SIZE, L1_LINE, L1_KIND>
+    fn l2_idx_to_l1_base_idx<const L1_SIZE: usize, const L1_LINE: usize, const L1_KIND: u8, const L1_TAGS: usize, const L1_DATA: usize>(
+        &self, l2_idx: usize, pidx: u32, _l1: &Cache<L1_SIZE, L1_LINE, L1_KIND, L1_TAGS, L1_DATA>
     ) -> usize {
         // Physical bits of the L2 line start address that are below bit 12 (page boundary)
         // These bits are the same in VA and PA, so we can derive them from the L2 index.
         let phys_sub_bits = (l2_idx << L2Cache::LINE_SHIFT as usize) & 0xFFF;
         // Reconstruct the virtual address bits used for L1 indexing
         let virt_index_bits = ((pidx as usize) << L2_PIDX_VADDR_SHIFT as usize) | phys_sub_bits;
-        (virt_index_bits >> Cache::<L1_SIZE, L1_LINE, L1_KIND>::LINE_SHIFT as usize)
-            & Cache::<L1_SIZE, L1_LINE, L1_KIND>::NUM_LINES_MASK
+        (virt_index_bits >> Cache::<L1_SIZE, L1_LINE, L1_KIND, L1_TAGS, L1_DATA>::LINE_SHIFT as usize)
+            & Cache::<L1_SIZE, L1_LINE, L1_KIND, L1_TAGS, L1_DATA>::NUM_LINES_MASK
     }
 
     /// Check if the given physical address overlaps with the Load Linked address.
@@ -945,8 +966,8 @@ impl R4000Cache {
         }
 
         // Write data from L1-D to L2
-        let dc_data = self.dc.data.get();
-        let l2_data = self.l2.data.get_mut();
+        let dc_data = self.dc.data();
+        let l2_data = self.l2.data_mut();
 
         let l1_start_chunk = l1_idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
@@ -1027,7 +1048,7 @@ impl R4000Cache {
             println!("[CACHE DEBUG] writeback_l2_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:05x}, cs={}, WRITING TO MEMORY",
                      self.tracking_label_l2_idx(idx), idx, phys_addr, tag.ptag(), cs);
             // Dump the L2 line data being written
-            let l2_data = self.l2.data.get();
+            let l2_data = self.l2.data();
             let start_chunk = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
             println!("  L2 line data being written (16 x u64):");
             for i in 0..L2Cache::CHUNKS_PER_LINE {
@@ -1040,7 +1061,7 @@ impl R4000Cache {
         // An L2 writeback/eviction is not a coherency action and must not break LL/SC.
 
         // Now write L2 data to memory
-        let l2_data = self.l2.data.get();
+        let l2_data = self.l2.data();
         let start_chunk = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
         for i in 0..L2Cache::CHUNKS_PER_LINE {
@@ -1074,7 +1095,7 @@ impl R4000Cache {
         let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
 
         // Fill line from memory
-        let l2_data = self.l2.data.get_mut();
+        let l2_data = self.l2.data_mut();
         let start_chunk = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
         let instrs_start = l2_idx << L2Cache::INSTR_SHIFT;
@@ -1163,7 +1184,7 @@ impl R4000Cache {
         let ic_line_base = phys_addr & !(ICache::LINE_MASK as u64);
         let l2_word_offset = ((ic_line_base as usize) & L2Cache::LINE_MASK) >> 2;
         let l2_instrs_base = (l2_idx << L2Cache::INSTR_SHIFT) + l2_word_offset;
-        let ic_data = self.ic.data.get_mut();
+        let ic_data = self.ic.data_mut();
         let ic_data_base = ic_idx * ICache::CHUNKS_PER_LINE;
         for i in 0..ICache::CHUNKS_PER_LINE {
             let idx0 = (l2_instrs_base + i * 2    ) as u32;
@@ -1219,8 +1240,8 @@ impl R4000Cache {
         let l2_line_base = l2_idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
         let offset_in_l2_line = ((dc_line_base & (L2Cache::LINE_MASK as u64)) >> 3) as usize;
 
-        let l2_data = self.l2.data.get();
-        let dc_data = self.dc.data.get_mut();
+        let l2_data = self.l2.data();
+        let dc_data = self.dc.data_mut();
         let dc_start_chunk = dc_idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
         for i in 0..DCache::CHUNKS_PER_LINE {
@@ -1333,7 +1354,7 @@ impl MipsCache for R4000Cache {
             1 => self.dc.data_as_bytes()[data_idx * 8 + ((phys_addr as usize & 7) ^ 7)] as u64,
             2 => self.dc.data_as_halves()[data_idx * 4 + ((phys_addr as usize & 7) >> 1 ^ 3)] as u64,
             4 => self.dc.data_as_words()[data_idx * 2 + ((phys_addr as usize & 7) >> 2 ^ 1)] as u64,
-            8 => self.dc.data.get()[data_idx],
+            8 => self.dc.data()[data_idx],
             _ => return BusRead64::err(),
         };
         BusRead64::ok(data)
@@ -1369,7 +1390,7 @@ impl MipsCache for R4000Cache {
 
         // Write to L1-D cache
         let data_idx = self.dc.get_data_index(virt_addr);
-        let dc_data = self.dc.data.get_mut();
+        let dc_data = self.dc.data_mut();
         let current = dc_data[data_idx];
         dc_data[data_idx] = (current & !mask) | (val & mask);
 
@@ -1763,7 +1784,7 @@ impl MipsCache for R4000Cache {
                     _ => "Unknown",
                 };
 
-                let dc_data = self.dc.data.get();
+                let dc_data = self.dc.data();
                 let start = idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
                 let mut s = format!("L1-D Line 0x{:x}: Tag=0x{:06x} CS={} ({}) D={}\n  Data:",
@@ -1790,7 +1811,7 @@ impl MipsCache for R4000Cache {
                     _ => "Reserved",
                 };
 
-                let l2_data = self.l2.data.get();
+                let l2_data = self.l2.data();
                 let start = idx << L2Cache::CHUNKS_PER_LINE_SHIFT;
 
                 let mut s = format!("L2 Line 0x{:x}: Tag=0x{:05x} CS={} ({})\n  Data:",
@@ -1808,12 +1829,12 @@ impl MipsCache for R4000Cache {
     }
 
     fn power_on(&self) {
-        self.ic.tags.get_mut().fill(0);
-        self.ic.data.get_mut().fill(0);
-        self.dc.tags.get_mut().fill(0);
-        self.dc.data.get_mut().fill(0);
-        self.l2.tags.get_mut().fill(0);
-        self.l2.data.get_mut().fill(0);
+        self.ic.tags_mut().fill(0);
+        self.ic.data_mut().fill(0);
+        self.dc.tags_mut().fill(0);
+        self.dc.data_mut().fill(0);
+        self.l2.tags_mut().fill(0);
+        self.l2.data_mut().fill(0);
         for s in self.l2.instrs.get_mut().iter_mut() {
             s.decoded = false;
             s.raw = 0;
@@ -1845,12 +1866,12 @@ impl Drop for R4000Cache {
 
 impl Resettable for R4000Cache {
     fn power_on(&self) {
-        self.ic.tags.get_mut().fill(0);
-        self.ic.data.get_mut().fill(0);
-        self.dc.tags.get_mut().fill(0);
-        self.dc.data.get_mut().fill(0);
-        self.l2.tags.get_mut().fill(0);
-        self.l2.data.get_mut().fill(0);
+        self.ic.tags_mut().fill(0);
+        self.ic.data_mut().fill(0);
+        self.dc.tags_mut().fill(0);
+        self.dc.data_mut().fill(0);
+        self.l2.tags_mut().fill(0);
+        self.l2.data_mut().fill(0);
         for s in self.l2.instrs.get_mut().iter_mut() {
             s.decoded = false;
             s.raw = 0;
@@ -1865,17 +1886,15 @@ impl Resettable for R4000Cache {
 // ---- snapshot helpers + MipsCache save/load override ----
 
 impl R4000Cache {
-    fn save_cache_inner<const S: usize, const L: usize, const K: u8>(c: &Cache<S, L, K>) -> (Vec<u32>, Vec<u64>) {
-        (c.tags.get().clone(), c.data.get().clone())
+    fn save_cache_inner<const S: usize, const L: usize, const K: u8, const TG: usize, const DA: usize>(c: &Cache<S, L, K, TG, DA>) -> (Vec<u32>, Vec<u64>) {
+        (c.tags().to_vec(), c.data().to_vec())
     }
 
-    fn load_cache_inner<const S: usize, const L: usize, const K: u8>(c: &Cache<S, L, K>, tags: &[u32], data: &[u64]) {
-        let t = c.tags.get_mut();
-        let tl = tags.len().min(t.len());
-        t[..tl].copy_from_slice(&tags[..tl]);
-        let d = c.data.get_mut();
-        let dl = data.len().min(d.len());
-        d[..dl].copy_from_slice(&data[..dl]);
+    fn load_cache_inner<const S: usize, const L: usize, const K: u8, const TG: usize, const DA: usize>(c: &Cache<S, L, K, TG, DA>, tags: &[u32], data: &[u64]) {
+        let tl = tags.len().min(TG);
+        c.tags_mut()[..tl].copy_from_slice(&tags[..tl]);
+        let dl = data.len().min(DA);
+        c.data_mut()[..dl].copy_from_slice(&data[..dl]);
     }
 
     pub fn save_cache_state(&self) -> toml::Value {
@@ -1919,7 +1938,7 @@ impl R4000Cache {
 
         // Rebuild l2.instrs from restored l2.data
         {
-            let l2_data_slice: Vec<u64> = self.l2.data.get().clone();
+            let l2_data_slice = self.l2.data();
             let l2_instrs = self.l2.instrs.get_mut();
             for line in 0..L2Cache::NUM_LINES {
                 let chunks_start = line << L2Cache::CHUNKS_PER_LINE_SHIFT;
