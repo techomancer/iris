@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <X11/X.h>
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <GL/gl.h>
 #include <GL/glx.h>
 #include <unistd.h>
+#include <time.h>
 
 float xRot = 0.0f;
 float yRot = 0.0f;
@@ -92,7 +94,67 @@ void drawOctahedron() {
     glEnd();
 }
 
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Draw one full-screen Gouraud-shaded quad.
+   Projection must already be set to ortho 0..w, 0..h. */
+static void bench_quad(int w, int h) {
+    glBegin(GL_QUADS);
+    glColor3f(1.0f, 0.0f, 0.0f); glVertex2i(0, 0);
+    glColor3f(0.0f, 1.0f, 0.0f); glVertex2i(w, 0);
+    glColor3f(0.0f, 0.0f, 1.0f); glVertex2i(w, h);
+    glColor3f(1.0f, 1.0f, 0.0f); glVertex2i(0, h);
+    glEnd();
+}
+
+static void run_bench(Display *dpy, Window win, GLXContext glc, int w, int h, int n) {
+    double t0, t1, elapsed;
+    long long total_px;
+    int i;
+
+    /* Set up orthographic projection matching window pixels */
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, w, 0, h, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    glDisable(GL_DEPTH_TEST);
+    glShadeModel(GL_SMOOTH);
+
+    /* Clear once so we start clean */
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
+
+    printf("Benchmark: %d x %d, %d quads\n", w, h, n);
+    fflush(stdout);
+
+    t0 = now_sec();
+    for (i = 0; i < n; i++) {
+        bench_quad(w, h);
+    }
+    glFinish();
+    t1 = now_sec();
+
+    elapsed = t1 - t0;
+    total_px = (long long)w * h * n;
+    printf("Time    : %.3f s\n", elapsed);
+    printf("Pixels  : %lld\n", total_px);
+    printf("Fill rate: %.1f Mpx/s\n", total_px / elapsed / 1e6);
+    fflush(stdout);
+
+    (void)dpy; (void)win; (void)glc;
+}
+
 int main(int argc, char *argv[]) {
+    int bench_n = 0; /* 0 = interactive mode */
+    int                     i;
     Display                 *dpy;
     Window                  root;
     GLint                   att[] = { GLX_RGBA, GLX_DEPTH_SIZE, 24, GLX_ALPHA_SIZE, 0, None };
@@ -105,6 +167,12 @@ int main(int argc, char *argv[]) {
     Window                  win;
     GLXContext              glc;
     XEvent                  xev;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--bench") == 0 && i + 1 < argc) {
+            bench_n = atoi(argv[++i]);
+        }
+    }
 
     dpy = XOpenDisplay(NULL);
     if(dpy == NULL) {
@@ -147,6 +215,15 @@ int main(int argc, char *argv[]) {
     glEnable(GL_DEPTH_TEST);
     glShadeModel(GL_SMOOTH);
     glClearColor(0.4f, 0.1f, 0.6f, 1.0f); // Purple background
+
+    if (bench_n > 0) {
+        run_bench(dpy, win, glc, 800, 600, bench_n);
+        glXMakeCurrent(dpy, None, NULL);
+        glXDestroyContext(dpy, glc);
+        XDestroyWindow(dpy, win);
+        XCloseDisplay(dpy);
+        return 0;
+    }
 
     while(1) {
         while(XPending(dpy)) {

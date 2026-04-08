@@ -11,8 +11,8 @@
 //!  - shade DDA iteration (if SHADE bit set)
 //!  - pattern advance (if ENZPATTERN or ENLSPATTERN bit set)
 //!
-//! Complex pure functions (compress, expand, dither, blend) are called as `extern "C"`
-//! helpers — they are stateless and trivially safe to call from JIT code.
+//! compress, expand, blend, and dither are all emitted as inline Cranelift IR —
+//! no extern "C" helper calls needed.
 
 use std::mem::offset_of;
 
@@ -22,7 +22,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{Linkage, Module};
 
 use crate::rex3::{
     Rex3Context,
@@ -37,130 +37,6 @@ use crate::rex3::{
 
 macro_rules! ctx_off {
     ($field:ident) => { offset_of!(Rex3Context, $field) as i32 }
-}
-
-// ── Helper functions callable from JIT (pure, no Rex3 pointer needed) ────────
-
-pub extern "C" fn helper_rgb24_to_rgb4(val: u32) -> u32 {
-    let r = (val >> 7) & 1;
-    let g = (val >> 14) & 3;
-    let b = (val >> 23) & 1;
-    (b << 3) | (g << 1) | r
-}
-pub extern "C" fn helper_rgb24_to_rgb8(val: u32) -> u32 {
-    let r = (val >> 5) & 7;
-    let g = (val >> 13) & 7;
-    let b = (val >> 22) & 3;
-    (b << 6) | (g << 3) | r
-}
-pub extern "C" fn helper_rgb24_to_rgb12(val: u32) -> u32 {
-    let r = (val >> 4) & 0xF;
-    let g = (val >> 12) & 0xF;
-    let b = (val >> 20) & 0xF;
-    (b << 8) | (g << 4) | r
-}
-pub extern "C" fn helper_rgb4_to_rgb24(val: u32) -> u32 {
-    let r = if (val & 1) != 0 { 0xFF } else { 0 };
-    let g_raw = (val >> 1) & 3;
-    let g = (g_raw << 6) | (g_raw << 4) | (g_raw << 2) | g_raw;
-    let b = if (val & 8) != 0 { 0xFF } else { 0 };
-    (b << 16) | (g << 8) | r
-}
-pub extern "C" fn helper_rgb8_to_rgb24(val: u32) -> u32 {
-    let r_raw = val & 7;
-    let r = (r_raw << 5) | (r_raw << 2) | (r_raw >> 1);
-    let g_raw = (val >> 3) & 7;
-    let g = (g_raw << 5) | (g_raw << 2) | (g_raw >> 1);
-    let b_raw = (val >> 6) & 3;
-    let b = (b_raw << 6) | (b_raw << 4) | (b_raw << 2) | b_raw;
-    (b << 16) | (g << 8) | r
-}
-pub extern "C" fn helper_rgb12_to_rgb24(val: u32) -> u32 {
-    let r_raw = val & 0xF;
-    let r = (r_raw << 4) | r_raw;
-    let g_raw = (val >> 4) & 0xF;
-    let g = (g_raw << 4) | g_raw;
-    let b_raw = (val >> 8) & 0xF;
-    let b = (b_raw << 4) | b_raw;
-    (b << 16) | (g << 8) | r
-}
-
-const BAYER: [u8; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-
-pub extern "C" fn helper_rgb24_to_rgb4_dither(val: u32) -> u32 {
-    let bayer = BAYER[(val >> 24) as usize];
-    let r = (val & 0xFF) as u8;
-    let g = ((val >> 8) & 0xFF) as u8;
-    let b = ((val >> 16) & 0xFF) as u8;
-    let sr = (r >> 3).wrapping_sub(r >> 4);
-    let sg = (g >> 2).wrapping_sub(g >> 4);
-    let sb = (b >> 3).wrapping_sub(b >> 4);
-    let mut dr = (sr >> 4) & 1;
-    let mut dg = (sg >> 4) & 3;
-    let mut db = (sb >> 4) & 1;
-    if (sr & 0xf) > bayer { dr = (dr + 1).min(1); }
-    if (sg & 0xf) > bayer { dg = (dg + 1).min(3); }
-    if (sb & 0xf) > bayer { db = (db + 1).min(1); }
-    ((db << 3) | (dg << 1) | dr) as u32
-}
-pub extern "C" fn helper_rgb24_to_rgb8_dither(val: u32) -> u32 {
-    let bayer = BAYER[(val >> 24) as usize];
-    let r = (val & 0xFF) as u8;
-    let g = ((val >> 8) & 0xFF) as u8;
-    let b = ((val >> 16) & 0xFF) as u8;
-    let sr = (r >> 1).wrapping_sub(r >> 4);
-    let sg = (g >> 1).wrapping_sub(g >> 4);
-    let sb = (b >> 2).wrapping_sub(b >> 4);
-    let mut dr = (sr >> 4) & 7;
-    let mut dg = (sg >> 4) & 7;
-    let mut db = (sb >> 4) & 3;
-    if (sr & 0xf) > bayer { dr = (dr + 1).min(7); }
-    if (sg & 0xf) > bayer { dg = (dg + 1).min(7); }
-    if (sb & 0xf) > bayer { db = (db + 1).min(3); }
-    ((db << 6) | (dg << 3) | dr) as u32
-}
-pub extern "C" fn helper_rgb24_to_rgb12_dither(val: u32) -> u32 {
-    let bayer = BAYER[(val >> 24) as usize];
-    let r = (val & 0xFF) as u32;
-    let g = ((val >> 8) & 0xFF) as u32;
-    let b = ((val >> 16) & 0xFF) as u32;
-    let sr = r - (r >> 4);
-    let sg = g - (g >> 4);
-    let sb = b - (b >> 4);
-    let mut dr = (sr >> 4) & 15;
-    let mut dg = (sg >> 4) & 15;
-    let mut db = (sb >> 4) & 15;
-    if (sr & 0xf) > bayer as u32 { dr = (dr + 1).min(15); }
-    if (sg & 0xf) > bayer as u32 { dg = (dg + 1).min(15); }
-    if (sb & 0xf) > bayer as u32 { db = (db + 1).min(15); }
-    (db << 8) | (dg << 4) | dr
-}
-
-/// Blend: src and dst are 32-bit RGBA (A in bits[31:24]), sfactor/dfactor are 3-bit.
-pub extern "C" fn helper_blend(src: u32, dst: u32, sfactor: u32, dfactor: u32) -> u32 {
-    let sa = (src >> 24) & 0xFF;
-    let get_factor = |sel: u32, c: u32, a: u32| -> u32 {
-        match sel {
-            0 => 0,
-            1 => 255,
-            2 => c,
-            3 => 255 - c,
-            4 => a,
-            5 => 255 - a,
-            _ => 0,
-        }
-    };
-    let mut res = 0u32;
-    for i in 0..4 {
-        let shift = i * 8;
-        let s_c = (src >> shift) & 0xFF;
-        let d_c = (dst >> shift) & 0xFF;
-        let sf = get_factor(sfactor, d_c, sa);
-        let df = get_factor(dfactor, s_c, sa);
-        let val = (s_c * sf + d_c * df) / 255;
-        res |= val.min(255) << shift;
-    }
-    res
 }
 
 // ── Draw mode bit extraction helpers (Rust-side, used during compilation) ────
@@ -204,14 +80,6 @@ impl Dm1 {
     fn logicop(&self)   -> u32  { (self.val >> 28) & 0xF }
 }
 
-// ── Helper IDs bundled together ───────────────────────────────────────────────
-
-struct Helpers {
-    compress:    FuncId, // fn(u32) -> u32
-    expand:      FuncId, // fn(u32) -> u32
-    blend:       FuncId, // fn(u32, u32, u32, u32) -> u32
-}
-
 // ── Compiler ──────────────────────────────────────────────────────────────────
 
 pub struct ShaderCompiler {
@@ -219,18 +87,6 @@ pub struct ShaderCompiler {
     ctx:         Context,
     builder_ctx: FunctionBuilderContext,
     counter:     u32,
-
-    // Helper FuncIds declared once, referenced in each compiled function.
-    fn_rgb24_to_rgb4:        FuncId,
-    fn_rgb24_to_rgb8:        FuncId,
-    fn_rgb24_to_rgb12:       FuncId,
-    fn_rgb4_to_rgb24:        FuncId,
-    fn_rgb8_to_rgb24:        FuncId,
-    fn_rgb12_to_rgb24:       FuncId,
-    fn_rgb24_to_rgb4_dither: FuncId,
-    fn_rgb24_to_rgb8_dither: FuncId,
-    fn_rgb24_to_rgb12_dither:FuncId,
-    fn_blend:                FuncId,
 }
 
 impl ShaderCompiler {
@@ -241,65 +97,14 @@ impl ShaderCompiler {
 
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
-        let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-
-        // Register helper symbols
-        macro_rules! sym {
-            ($b:ident, $name:expr, $fn:expr) => {
-                $b.symbol($name, $fn as *const u8);
-            }
-        }
-        sym!(jit_builder, "rex_rgb24_to_rgb4",         helper_rgb24_to_rgb4         as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb24_to_rgb8",         helper_rgb24_to_rgb8         as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb24_to_rgb12",        helper_rgb24_to_rgb12        as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb4_to_rgb24",         helper_rgb4_to_rgb24         as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb8_to_rgb24",         helper_rgb8_to_rgb24         as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb12_to_rgb24",        helper_rgb12_to_rgb24        as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb24_to_rgb4_dither",  helper_rgb24_to_rgb4_dither  as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb24_to_rgb8_dither",  helper_rgb24_to_rgb8_dither  as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_rgb24_to_rgb12_dither", helper_rgb24_to_rgb12_dither as extern "C" fn(u32) -> u32);
-        sym!(jit_builder, "rex_blend",                 helper_blend as extern "C" fn(u32, u32, u32, u32) -> u32);
-
-        let mut jit_module = JITModule::new(jit_builder);
-        let ptr_type = jit_module.target_config().pointer_type();
-
-        // u32→u32 helper signature
-        let mut sig_u32_u32 = jit_module.make_signature();
-        sig_u32_u32.params.push(AbiParam::new(types::I32));
-        sig_u32_u32.returns.push(AbiParam::new(types::I32));
-
-        // blend signature: (u32, u32, u32, u32) -> u32
-        let mut sig_blend = jit_module.make_signature();
-        for _ in 0..4 { sig_blend.params.push(AbiParam::new(types::I32)); }
-        sig_blend.returns.push(AbiParam::new(types::I32));
-
-        let _ = ptr_type; // may be unused in some configurations
-
-        macro_rules! decl {
-            ($m:ident, $name:literal, $sig:ident) => {
-                $m.declare_function($name, Linkage::Import, &$sig).unwrap()
-            }
-        }
-        let fn_rgb24_to_rgb4         = decl!(jit_module, "rex_rgb24_to_rgb4",         sig_u32_u32);
-        let fn_rgb24_to_rgb8         = decl!(jit_module, "rex_rgb24_to_rgb8",         sig_u32_u32);
-        let fn_rgb24_to_rgb12        = decl!(jit_module, "rex_rgb24_to_rgb12",        sig_u32_u32);
-        let fn_rgb4_to_rgb24         = decl!(jit_module, "rex_rgb4_to_rgb24",         sig_u32_u32);
-        let fn_rgb8_to_rgb24         = decl!(jit_module, "rex_rgb8_to_rgb24",         sig_u32_u32);
-        let fn_rgb12_to_rgb24        = decl!(jit_module, "rex_rgb12_to_rgb24",        sig_u32_u32);
-        let fn_rgb24_to_rgb4_dither  = decl!(jit_module, "rex_rgb24_to_rgb4_dither",  sig_u32_u32);
-        let fn_rgb24_to_rgb8_dither  = decl!(jit_module, "rex_rgb24_to_rgb8_dither",  sig_u32_u32);
-        let fn_rgb24_to_rgb12_dither = decl!(jit_module, "rex_rgb24_to_rgb12_dither", sig_u32_u32);
-        let fn_blend                 = decl!(jit_module, "rex_blend",                 sig_blend);
+        let jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let jit_module = JITModule::new(jit_builder);
 
         Self {
             ctx: jit_module.make_context(),
             jit_module,
             builder_ctx: FunctionBuilderContext::new(),
             counter: 0,
-            fn_rgb24_to_rgb4, fn_rgb24_to_rgb8, fn_rgb24_to_rgb12,
-            fn_rgb4_to_rgb24, fn_rgb8_to_rgb24, fn_rgb12_to_rgb24,
-            fn_rgb24_to_rgb4_dither, fn_rgb24_to_rgb8_dither, fn_rgb24_to_rgb12_dither,
-            fn_blend,
         }
     }
 
@@ -341,17 +146,9 @@ impl ShaderCompiler {
             Err(e) => { eprintln!("REX JIT: declare_function failed: {e}"); return None; }
         };
 
-        let helpers = Helpers {
-            compress: self.compress_func_id(&dm1),
-            expand:   self.expand_func_id(&dm1),
-            blend:    self.fn_blend,
-        };
-
         let result = emit_shader(
             &mut self.ctx.func,
             &mut self.builder_ctx,
-            &mut self.jit_module,
-            &helpers,
             &dm0, &dm1,
             ptr_type,
         );
@@ -382,41 +179,6 @@ impl ShaderCompiler {
             std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut Rex3Context, *mut u32, *mut u32)>(code_ptr)
         })
     }
-
-    fn compress_func_id(&self, dm1: &Dm1) -> FuncId {
-        if !dm1.rgbmode() {
-            // CI mode: identity — no compress func needed. We'll inline identity.
-            // Return a placeholder; caller checks rgbmode before using.
-            self.fn_rgb24_to_rgb8
-        } else if dm1.dither() {
-            match dm1.drawdepth() {
-                0 => self.fn_rgb24_to_rgb4_dither,
-                1 => self.fn_rgb24_to_rgb8_dither,
-                2 => self.fn_rgb24_to_rgb12_dither,
-                _ => self.fn_rgb24_to_rgb8, // 24bpp: identity (not called)
-            }
-        } else {
-            match dm1.drawdepth() {
-                0 => self.fn_rgb24_to_rgb4,
-                1 => self.fn_rgb24_to_rgb8,
-                2 => self.fn_rgb24_to_rgb12,
-                _ => self.fn_rgb24_to_rgb8, // 24bpp: identity (not called)
-            }
-        }
-    }
-
-    fn expand_func_id(&self, dm1: &Dm1) -> FuncId {
-        if !dm1.rgbmode() {
-            self.fn_rgb8_to_rgb24 // placeholder; not called in CI mode
-        } else {
-            match dm1.drawdepth() {
-                0 => self.fn_rgb4_to_rgb24,
-                1 => self.fn_rgb8_to_rgb24,
-                2 => self.fn_rgb12_to_rgb24,
-                _ => self.fn_rgb8_to_rgb24, // 24bpp: identity
-            }
-        }
-    }
 }
 
 // ── Shader IR emission ────────────────────────────────────────────────────────
@@ -425,8 +187,6 @@ impl ShaderCompiler {
 fn emit_shader(
     func: &mut ir::Function,
     builder_ctx: &mut FunctionBuilderContext,
-    module: &mut JITModule,
-    helpers: &Helpers,
     dm0: &Dm0,
     dm1: &Dm1,
     ptr_type: ir::Type,
@@ -445,28 +205,13 @@ fn emit_shader(
     let fb_rgb   = b.block_params(entry)[1];
     let fb_aux   = b.block_params(entry)[2];
 
-    // Declare helper refs for this function
-    let compress_ref = module.declare_func_in_func(helpers.compress, b.func);
-    let expand_ref   = module.declare_func_in_func(helpers.expand,   b.func);
-    let blend_ref    = module.declare_func_in_func(helpers.blend,    b.func);
-
     // ── Load loop-invariant ctx fields ────────────────────────────────────────
     macro_rules! ld32 { ($off:expr) => {
         b.ins().load(types::I32, mem, ctx_ptr, ir::immediates::Offset32::new($off as i32))
     }}
-    macro_rules! st32 { ($off:expr, $val:expr) => {
-        b.ins().store(mem, $val, ctx_ptr, ir::immediates::Offset32::new($off as i32))
-    }}
     macro_rules! ld8 { ($off:expr) => {
         b.ins().load(types::I8, mem, ctx_ptr, ir::immediates::Offset32::new($off as i32))
     }}
-    macro_rules! st8 { ($off:expr, $val:expr) => {
-        b.ins().store(mem, $val, ctx_ptr, ir::immediates::Offset32::new($off as i32))
-    }}
-    macro_rules! ld_bool { ($off:expr) => {{
-        let v: Value = b.ins().load(types::I8, mem, ctx_ptr, ir::immediates::Offset32::new($off as i32));
-        v
-    }}}
     macro_rules! st_bool { ($off:expr, $val:expr) => {
         b.ins().store(mem, $val, ctx_ptr, ir::immediates::Offset32::new($off as i32))
     }}
@@ -1031,23 +776,16 @@ fn emit_shader(
     } else if dm1.blend() {
         // Blend path: expand dst to 24-bit BGR, blend, compress back
         let dst_24 = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            let inst = b.ins().call(expand_ref, &[dst_plane]);
-            b.inst_results(inst)[0]
+            emit_expand_ir(&mut b, dst_plane, dm1.drawdepth())
         } else {
             dst_plane
         };
         let blend_dst = if dm1.backblend() { colorback_v } else { dst_24 };
-        let sf_v = b.ins().iconst(types::I32, dm1.sfactor() as i64);
-        let df_v = b.ins().iconst(types::I32, dm1.dfactor() as i64);
-        let blended = {
-            let inst = b.ins().call(blend_ref, &[src_color, blend_dst, sf_v, df_v]);
-            b.inst_results(inst)[0]
-        };
+        let blended = emit_blend_ir(&mut b, src_color, blend_dst, dm1.sfactor(), dm1.dfactor());
         // bayer_pack + compress + amplify
         let packed = bayer_pack_ir(&mut b, blended, x_v, y_v);
         let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            let inst = b.ins().call(compress_ref, &[packed]);
-            b.inst_results(inst)[0]
+            emit_compress_ir(&mut b, packed, dm1.drawdepth(), dm1.dither())
         } else {
             packed
         };
@@ -1063,8 +801,7 @@ fn emit_shader(
         // compress(bayer_pack(raw_src, x, y))
         let packed = bayer_pack_ir(&mut b, src_color, x_v, y_v);
         let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-            let inst = b.ins().call(compress_ref, &[packed]);
-            b.inst_results(inst)[0]
+            emit_compress_ir(&mut b, packed, dm1.drawdepth(), dm1.dither())
         } else {
             packed
         };
@@ -1435,4 +1172,337 @@ fn emit_writeback(
         st8w!(ctx_off!(pat_bit), pat_bit);
         st32w!(ctx_off!(lsmode), lsmode);
     }
+}
+
+// ── Inline IR: compress / expand / blend ─────────────────────────────────────
+//
+// All three are specialized on compile-time constants (drawdepth, dither, sfactor, dfactor)
+// so Cranelift sees only straight-line operations — no branches, no call overhead.
+
+/// Compress 24-bit RGB (BGR byte-packed, bits[23:0]) to packed drawdepth format.
+/// Input `val` has bayer index in bits[31:24] (packed by bayer_pack_ir).
+/// Mirrors helper_rgb24_to_rgb{4,8,12}[_dither].
+/// Bayer 4x4 ordered dither table lookup: index 0..15 → threshold 0..15.
+/// Table: [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+/// Packed as u64: nibble i = BAYER[i], so lookup = (packed >> (idx*4)) & 0xF.
+fn emit_bayer_lookup_ir(b: &mut FunctionBuilder, idx: Value) -> Value {
+    // packed: nibble 0 = 0, nibble 1 = 8, nibble 2 = 2, ... nibble 15 = 5
+    const BAYER_PACKED: i64 = 0x5D7F91B36E4CA280_u64 as i64;
+    let packed  = b.ins().iconst(types::I64, BAYER_PACKED);
+    let idx64   = b.ins().uextend(types::I64, idx);
+    let shift   = b.ins().ishl_imm(idx64, 2); // idx * 4
+    let shifted = b.ins().ushr(packed, shift);
+    let nibble  = b.ins().band_imm(shifted, 0xF);
+    b.ins().ireduce(types::I32, nibble)
+}
+
+fn emit_compress_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32, dither: bool) -> Value {
+    if dither {
+        // Bayer threshold: val bits[31:24] is the raw bayer index, look it up in the table
+        let idx   = b.ins().ushr_imm(val, 24);
+        let bayer = emit_bayer_lookup_ir(b, idx);
+        // Extract r/g/bv channels (bits[7:0], [15:8], [23:16])
+        let r = b.ins().band_imm(val, 0xFF);
+        let t8  = b.ins().ushr_imm(val, 8);
+        let g   = b.ins().band_imm(t8, 0xFF);
+        let t16 = b.ins().ushr_imm(val, 16);
+        let bv  = b.ins().band_imm(t16, 0xFF);
+        match drawdepth {
+            0 => {
+                // rgb24→rgb4 dither: sr = (r>>3)-(r>>4), etc.
+                let r3 = b.ins().ushr_imm(r, 3);
+                let r4 = b.ins().ushr_imm(r, 4);
+                let sr = b.ins().isub(r3, r4);
+                let g2 = b.ins().ushr_imm(g, 2);
+                let g4 = b.ins().ushr_imm(g, 4);
+                let sg = b.ins().isub(g2, g4);
+                let b3 = b.ins().ushr_imm(bv, 3);
+                let b4 = b.ins().ushr_imm(bv, 4);
+                let sb = b.ins().isub(b3, b4);
+                let sr4_v = b.ins().ushr_imm(sr, 4);
+                let sg4_v = b.ins().ushr_imm(sg, 4);
+                let sb4_v = b.ins().ushr_imm(sb, 4);
+                let mut dr = b.ins().band_imm(sr4_v, 1);
+                let mut dg = b.ins().band_imm(sg4_v, 3);
+                let mut db = b.ins().band_imm(sb4_v, 1);
+                let sr_lo = b.ins().band_imm(sr, 0xF);
+                let sg_lo = b.ins().band_imm(sg, 0xF);
+                let sb_lo = b.ins().band_imm(sb, 0xF);
+                let cond_r = b.ins().icmp(IntCC::UnsignedGreaterThan, sr_lo, bayer);
+                let cond_g = b.ins().icmp(IntCC::UnsignedGreaterThan, sg_lo, bayer);
+                let cond_b = b.ins().icmp(IntCC::UnsignedGreaterThan, sb_lo, bayer);
+                let c1i = b.ins().iconst(types::I32, 1);
+                let c3i = b.ins().iconst(types::I32, 3);
+                let dr1 = b.ins().iadd(dr, c1i);
+                let dg1 = b.ins().iadd(dg, c1i);
+                let db1 = b.ins().iadd(db, c1i);
+                let dr1_min = b.ins().umin(dr1, c1i);
+                let dg1_min = b.ins().umin(dg1, c3i);
+                let db1_min = b.ins().umin(db1, c1i);
+                dr = b.ins().select(cond_r, dr1_min, dr);
+                dg = b.ins().select(cond_g, dg1_min, dg);
+                db = b.ins().select(cond_b, db1_min, db);
+                let db3s = b.ins().ishl_imm(db, 3);
+                let dg1s = b.ins().ishl_imm(dg, 1);
+                let t = b.ins().bor(db3s, dg1s);
+                b.ins().bor(t, dr)
+            }
+            1 => {
+                // rgb24→rgb8 dither: sr = (r>>1)-(r>>4), etc.
+                let r1 = b.ins().ushr_imm(r, 1);
+                let r4 = b.ins().ushr_imm(r, 4);
+                let sr = b.ins().isub(r1, r4);
+                let g1 = b.ins().ushr_imm(g, 1);
+                let g4 = b.ins().ushr_imm(g, 4);
+                let sg = b.ins().isub(g1, g4);
+                let b2 = b.ins().ushr_imm(bv, 2);
+                let b4 = b.ins().ushr_imm(bv, 4);
+                let sb = b.ins().isub(b2, b4);
+                let sr4_v = b.ins().ushr_imm(sr, 4);
+                let sg4_v = b.ins().ushr_imm(sg, 4);
+                let sb4_v = b.ins().ushr_imm(sb, 4);
+                let mut dr = b.ins().band_imm(sr4_v, 7);
+                let mut dg = b.ins().band_imm(sg4_v, 7);
+                let mut db = b.ins().band_imm(sb4_v, 3);
+                let sr_lo = b.ins().band_imm(sr, 0xF);
+                let sg_lo = b.ins().band_imm(sg, 0xF);
+                let sb_lo = b.ins().band_imm(sb, 0xF);
+                let cond_r = b.ins().icmp(IntCC::UnsignedGreaterThan, sr_lo, bayer);
+                let cond_g = b.ins().icmp(IntCC::UnsignedGreaterThan, sg_lo, bayer);
+                let cond_b = b.ins().icmp(IntCC::UnsignedGreaterThan, sb_lo, bayer);
+                let c1i = b.ins().iconst(types::I32, 1);
+                let c7i = b.ins().iconst(types::I32, 7);
+                let c3i = b.ins().iconst(types::I32, 3);
+                let dr1 = b.ins().iadd(dr, c1i);
+                let dg1 = b.ins().iadd(dg, c1i);
+                let db1 = b.ins().iadd(db, c1i);
+                let dr1_min = b.ins().umin(dr1, c7i);
+                let dg1_min = b.ins().umin(dg1, c7i);
+                let db1_min = b.ins().umin(db1, c3i);
+                dr = b.ins().select(cond_r, dr1_min, dr);
+                dg = b.ins().select(cond_g, dg1_min, dg);
+                db = b.ins().select(cond_b, db1_min, db);
+                let db6 = b.ins().ishl_imm(db, 6);
+                let dg3 = b.ins().ishl_imm(dg, 3);
+                let t = b.ins().bor(db6, dg3);
+                b.ins().bor(t, dr)
+            }
+            _ => {
+                // rgb24→rgb12 dither: sr = r - (r>>4), etc.
+                let r4 = b.ins().ushr_imm(r, 4);
+                let sr = b.ins().isub(r, r4);
+                let g4 = b.ins().ushr_imm(g, 4);
+                let sg = b.ins().isub(g, g4);
+                let b4 = b.ins().ushr_imm(bv, 4);
+                let sb = b.ins().isub(bv, b4);
+                let sr4_v = b.ins().ushr_imm(sr, 4);
+                let sg4_v = b.ins().ushr_imm(sg, 4);
+                let sb4_v = b.ins().ushr_imm(sb, 4);
+                let mut dr = b.ins().band_imm(sr4_v, 15);
+                let mut dg = b.ins().band_imm(sg4_v, 15);
+                let mut db = b.ins().band_imm(sb4_v, 15);
+                let sr_lo = b.ins().band_imm(sr, 0xF);
+                let sg_lo = b.ins().band_imm(sg, 0xF);
+                let sb_lo = b.ins().band_imm(sb, 0xF);
+                let cond_r = b.ins().icmp(IntCC::UnsignedGreaterThan, sr_lo, bayer);
+                let cond_g = b.ins().icmp(IntCC::UnsignedGreaterThan, sg_lo, bayer);
+                let cond_b = b.ins().icmp(IntCC::UnsignedGreaterThan, sb_lo, bayer);
+                let c1i  = b.ins().iconst(types::I32, 1);
+                let c15i = b.ins().iconst(types::I32, 15);
+                let dr1 = b.ins().iadd(dr, c1i);
+                let dg1 = b.ins().iadd(dg, c1i);
+                let db1 = b.ins().iadd(db, c1i);
+                let dr1_min = b.ins().umin(dr1, c15i);
+                let dg1_min = b.ins().umin(dg1, c15i);
+                let db1_min = b.ins().umin(db1, c15i);
+                dr = b.ins().select(cond_r, dr1_min, dr);
+                dg = b.ins().select(cond_g, dg1_min, dg);
+                db = b.ins().select(cond_b, db1_min, db);
+                let db8 = b.ins().ishl_imm(db, 8);
+                let dg4 = b.ins().ishl_imm(dg, 4);
+                let t = b.ins().bor(db8, dg4);
+                b.ins().bor(t, dr)
+            }
+        }
+    } else {
+        // No dither — straight compress
+        match drawdepth {
+            0 => {
+                // rgb24→rgb4: r=bit7, g=bits[15:14], b=bit23
+                let rs = b.ins().ushr_imm(val,  7);
+                let r  = b.ins().band_imm(rs, 1);
+                let gs = b.ins().ushr_imm(val, 14);
+                let g  = b.ins().band_imm(gs, 3);
+                let bs = b.ins().ushr_imm(val, 23);
+                let bv = b.ins().band_imm(bs, 1);
+                let b3 = b.ins().ishl_imm(bv, 3);
+                let g1 = b.ins().ishl_imm(g,  1);
+                let t  = b.ins().bor(b3, g1);
+                b.ins().bor(t, r)
+            }
+            1 => {
+                // rgb24→rgb8: r=bits[7:5], g=bits[15:13], b=bits[23:22]
+                let rs = b.ins().ushr_imm(val,  5);
+                let r  = b.ins().band_imm(rs, 7);
+                let gs = b.ins().ushr_imm(val, 13);
+                let g  = b.ins().band_imm(gs, 7);
+                let bs = b.ins().ushr_imm(val, 22);
+                let bv = b.ins().band_imm(bs, 3);
+                let b6 = b.ins().ishl_imm(bv, 6);
+                let g3 = b.ins().ishl_imm(g,  3);
+                let t  = b.ins().bor(b6, g3);
+                b.ins().bor(t, r)
+            }
+            _ => {
+                // rgb24→rgb12: r=bits[7:4], g=bits[15:12], b=bits[23:20]
+                let rs = b.ins().ushr_imm(val,  4);
+                let r  = b.ins().band_imm(rs, 0xF);
+                let gs = b.ins().ushr_imm(val, 12);
+                let g  = b.ins().band_imm(gs, 0xF);
+                let bs = b.ins().ushr_imm(val, 20);
+                let bv = b.ins().band_imm(bs, 0xF);
+                let b8 = b.ins().ishl_imm(bv, 8);
+                let g4 = b.ins().ishl_imm(g,  4);
+                let t  = b.ins().bor(b8, g4);
+                b.ins().bor(t, r)
+            }
+        }
+    }
+}
+
+/// Expand packed drawdepth format to 24-bit RGB (BGR byte-packed, bits[23:0]).
+/// Mirrors helper_rgb{4,8,12}_to_rgb24.
+fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value {
+    match drawdepth {
+        0 => {
+            // rgb4→rgb24: r=bit0 → 0 or 0xFF; g=bits[2:1] → replicated; b=bit3 → 0 or 0xFF
+            let r_bit  = b.ins().band_imm(val, 1);
+            let r_set  = b.ins().icmp_imm(IntCC::NotEqual, r_bit, 0);
+            let c255   = b.ins().iconst(types::I32, 0xFF);
+            let c0     = b.ins().iconst(types::I32, 0);
+            let r      = b.ins().select(r_set, c255, c0);
+            let gs     = b.ins().ushr_imm(val, 1);
+            let g_raw  = b.ins().band_imm(gs, 3);
+            let g6 = b.ins().ishl_imm(g_raw, 6);
+            let g4 = b.ins().ishl_imm(g_raw, 4);
+            let g2 = b.ins().ishl_imm(g_raw, 2);
+            let t1 = b.ins().bor(g6, g4);
+            let t2 = b.ins().bor(g2, g_raw);
+            let g  = b.ins().bor(t1, t2);
+            let b_shr  = b.ins().ushr_imm(val, 3);
+            let b_bit  = b.ins().band_imm(b_shr, 1);
+            let b_set  = b.ins().icmp_imm(IntCC::NotEqual, b_bit, 0);
+            let bv     = b.ins().select(b_set, c255, c0);
+            let g8  = b.ins().ishl_imm(g,  8);
+            let b16 = b.ins().ishl_imm(bv, 16);
+            let t   = b.ins().bor(b16, g8);
+            b.ins().bor(t, r)
+        }
+        1 => {
+            // rgb8→rgb24: r=bits[2:0], g=bits[5:3], b=bits[7:6]
+            let r_raw = b.ins().band_imm(val, 7);
+            let r5 = b.ins().ishl_imm(r_raw, 5);
+            let r2 = b.ins().ishl_imm(r_raw, 2);
+            let r1 = b.ins().ushr_imm(r_raw, 1);
+            let t1 = b.ins().bor(r5, r2);
+            let r  = b.ins().bor(t1, r1);
+            let gs    = b.ins().ushr_imm(val, 3);
+            let g_raw = b.ins().band_imm(gs, 7);
+            let g5 = b.ins().ishl_imm(g_raw, 5);
+            let g2 = b.ins().ishl_imm(g_raw, 2);
+            let g1 = b.ins().ushr_imm(g_raw, 1);
+            let t2 = b.ins().bor(g5, g2);
+            let g  = b.ins().bor(t2, g1);
+            let bs    = b.ins().ushr_imm(val, 6);
+            let b_raw = b.ins().band_imm(bs, 3);
+            let b6 = b.ins().ishl_imm(b_raw, 6);
+            let b4 = b.ins().ishl_imm(b_raw, 4);
+            let b2 = b.ins().ishl_imm(b_raw, 2);
+            let t3 = b.ins().bor(b6, b4);
+            let t4 = b.ins().bor(b2, b_raw);
+            let bv = b.ins().bor(t3, t4);
+            let g8  = b.ins().ishl_imm(g,  8);
+            let b16 = b.ins().ishl_imm(bv, 16);
+            let t   = b.ins().bor(b16, g8);
+            b.ins().bor(t, r)
+        }
+        _ => {
+            // rgb12→rgb24: r=bits[3:0], g=bits[7:4], b=bits[11:8]
+            let r_raw = b.ins().band_imm(val, 0xF);
+            let r4  = b.ins().ishl_imm(r_raw, 4);
+            let r   = b.ins().bor(r4, r_raw);
+            let gs    = b.ins().ushr_imm(val, 4);
+            let g_raw = b.ins().band_imm(gs, 0xF);
+            let g4  = b.ins().ishl_imm(g_raw, 4);
+            let g   = b.ins().bor(g4, g_raw);
+            let bs    = b.ins().ushr_imm(val, 8);
+            let b_raw = b.ins().band_imm(bs, 0xF);
+            let bb4 = b.ins().ishl_imm(b_raw, 4);
+            let bv  = b.ins().bor(bb4, b_raw);
+            let g8  = b.ins().ishl_imm(g,  8);
+            let b16 = b.ins().ishl_imm(bv, 16);
+            let t   = b.ins().bor(b16, g8);
+            b.ins().bor(t, r)
+        }
+    }
+}
+
+/// Inline blend: src and dst are 24-bit BGR (alpha in bits[31:24] of src).
+/// sfactor/dfactor are compile-time constants (0..=5).
+/// Mirrors helper_blend but specialized — constant sfactor/dfactor let Cranelift
+/// fold all the factor-selection branches away.
+fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, dfactor: u32) -> Value {
+    let sa   = b.ins().ushr_imm(src, 24); // alpha from src bits[31:24]
+    let c255 = b.ins().iconst(types::I32, 255);
+
+    // Extract each 8-bit channel (no nesting)
+    let sr   = b.ins().band_imm(src, 0xFF);
+    let src8 = b.ins().ushr_imm(src,  8);
+    let sg   = b.ins().band_imm(src8, 0xFF);
+    let src16= b.ins().ushr_imm(src, 16);
+    let sb   = b.ins().band_imm(src16, 0xFF);
+    let dr   = b.ins().band_imm(dst, 0xFF);
+    let dst8 = b.ins().ushr_imm(dst,  8);
+    let dg   = b.ins().band_imm(dst8, 0xFF);
+    let dst16= b.ins().ushr_imm(dst, 16);
+    let db   = b.ins().band_imm(dst16, 0xFF);
+    let dst24= b.ins().ushr_imm(dst, 24);
+    let da   = b.ins().band_imm(dst24, 0xFF);
+
+    // get_factor_ir: sel is compile-time constant; comp_other and alpha are runtime Values
+    // Returns IR Value for the factor (0..255).
+    fn get_factor_ir(b: &mut FunctionBuilder, sel: u32, comp_other: Value, alpha: Value, c255: Value) -> Value {
+        match sel {
+            0 => b.ins().iconst(types::I32, 0),
+            1 => b.ins().iconst(types::I32, 255),
+            2 => comp_other,
+            3 => b.ins().isub(c255, comp_other),
+            4 => alpha,
+            5 => b.ins().isub(c255, alpha),
+            _ => b.ins().iconst(types::I32, 0),
+        }
+    }
+
+    // Blend one channel: (sc*sf + dc*df)/255, clamped to 255, shifted
+    macro_rules! blend_ch {
+        ($sc:expr, $dc:expr, $shift:literal) => {{
+            let sf = get_factor_ir(b, sfactor, $dc, sa, c255);
+            let df = get_factor_ir(b, dfactor, $sc, sa, c255);
+            let sc_sf = b.ins().imul($sc, sf);
+            let dc_df = b.ins().imul($dc, df);
+            let num   = b.ins().iadd(sc_sf, dc_df);
+            let val   = b.ins().udiv(num, c255);
+            let cl    = b.ins().umin(val, c255);
+            b.ins().ishl_imm(cl, $shift)
+        }}
+    }
+
+    let r_out = blend_ch!(sr, dr, 0);
+    let g_out = blend_ch!(sg, dg, 8);
+    let b_out = blend_ch!(sb, db, 16);
+    let a_out = blend_ch!(sa, da, 24);
+
+    let t1 = b.ins().bor(r_out, g_out);
+    let t2 = b.ins().bor(t1, b_out);
+    b.ins().bor(t2, a_out)
 }

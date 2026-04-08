@@ -1768,14 +1768,10 @@ impl Rex3 {
         (b << 8) | (g << 4) | r
     }
 
-    // Bayer 4x4 dither matrix, row-major [y][x], flat.
-    // Indexed by (y&3)<<2|(x&3) which matches bayer_pack() encoding.
-    const BAYER: [u8; 16] = [
-         0,  8,  2, 10,
-        12,  4, 14,  6,
-         3, 11,  1,  9,
-        15,  7, 13,  5,
-    ];
+    // Bayer 4x4 dither matrix packed as 16 nibbles in a u64.
+    // Indexed by (y&3)<<2|(x&3): threshold = (BAYER_PACKED >> (idx*4)) & 0xF.
+    // Table: [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+    const BAYER_PACKED: u64 = 0x5D7F91B36E4CA280;
 
     /// Pack bayer index into bits 27:24 of color value (top byte unused by 24-bit BGR).
     /// Encoding: bits[3:2] = y&3, bits[1:0] = x&3 → index = (y&3)<<2|(x&3).
@@ -1785,8 +1781,13 @@ impl Rex3 {
         (color & 0x00FFFFFF) | (((y as u32 & 3) << 2 | (x as u32 & 3)) << 24)
     }
 
+    #[inline(always)]
+    fn bayer_threshold(idx: u32) -> u32 {
+        ((Self::BAYER_PACKED >> (idx * 4)) & 0xF) as u32
+    }
+
     fn rgb24_to_rgb4_dither(val: u32) -> u32 {
-        let bayer = Self::BAYER[(val >> 24) as usize];
+        let bayer = Self::bayer_threshold(val >> 24);
         let r = (val & 0xFF) as u8;
         let g = ((val >> 8) & 0xFF) as u8;
         let b = ((val >> 16) & 0xFF) as u8;
@@ -1797,14 +1798,14 @@ impl Rex3 {
         let mut dr = (sr >> 4) & 1;
         let mut dg = (sg >> 4) & 3;
         let mut db = (sb >> 4) & 1;
-        if (sr & 0xf) > bayer { dr = (dr + 1).min(1); }
-        if (sg & 0xf) > bayer { dg = (dg + 1).min(3); }
-        if (sb & 0xf) > bayer { db = (db + 1).min(1); }
+        if (sr & 0xf) as u32 > bayer { dr = (dr + 1).min(1); }
+        if (sg & 0xf) as u32 > bayer { dg = (dg + 1).min(3); }
+        if (sb & 0xf) as u32 > bayer { db = (db + 1).min(1); }
         ((db << 3) | (dg << 1) | dr) as u32
     }
 
     fn rgb24_to_rgb8_dither(val: u32) -> u32 {
-        let bayer = Self::BAYER[(val >> 24) as usize];
+        let bayer = Self::bayer_threshold(val >> 24);
         let r = (val & 0xFF) as u8;
         let g = ((val >> 8) & 0xFF) as u8;
         let b = ((val >> 16) & 0xFF) as u8;
@@ -1815,14 +1816,14 @@ impl Rex3 {
         let mut dr = (sr >> 4) & 7;
         let mut dg = (sg >> 4) & 7;
         let mut db = (sb >> 4) & 3;
-        if (sr & 0xf) > bayer { dr = (dr + 1).min(7); }
-        if (sg & 0xf) > bayer { dg = (dg + 1).min(7); }
-        if (sb & 0xf) > bayer { db = (db + 1).min(3); }
+        if (sr & 0xf) as u32 > bayer { dr = (dr + 1).min(7); }
+        if (sg & 0xf) as u32 > bayer { dg = (dg + 1).min(7); }
+        if (sb & 0xf) as u32 > bayer { db = (db + 1).min(3); }
         ((db << 6) | (dg << 3) | dr) as u32
     }
 
     fn rgb24_to_rgb12_dither(val: u32) -> u32 {
-        let bayer = Self::BAYER[(val >> 24) as usize];
+        let bayer = Self::bayer_threshold(val >> 24);
         let r = (val & 0xFF) as u32;
         let g = ((val >> 8) & 0xFF) as u32;
         let b = ((val >> 16) & 0xFF) as u32;
@@ -1833,9 +1834,9 @@ impl Rex3 {
         let mut dr = (sr >> 4) & 15;
         let mut dg = (sg >> 4) & 15;
         let mut db = (sb >> 4) & 15;
-        if (sr & 0xf) > bayer as u32 { dr = (dr + 1).min(15); }
-        if (sg & 0xf) > bayer as u32 { dg = (dg + 1).min(15); }
-        if (sb & 0xf) > bayer as u32 { db = (db + 1).min(15); }
+        if (sr & 0xf) > bayer { dr = (dr + 1).min(15); }
+        if (sg & 0xf) > bayer { dg = (dg + 1).min(15); }
+        if (sb & 0xf) > bayer { db = (db + 1).min(15); }
         (db << 8) | (dg << 4) | dr
     }
 
