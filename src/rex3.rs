@@ -3027,8 +3027,11 @@ impl Rex3 {
                           else if opcode == DRAWMODE0_OPCODE_SCR2SCR { dm1_raw & !(1 << 16) } // scr2scr→no dither
                           else { dm1_raw };
                 let adrmode = ctx.drawmode0.adrmode() << 2;
+                let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
+                    || adrmode == DRAWMODE0_ADRMODE_F_LINE
+                    || adrmode == DRAWMODE0_ADRMODE_A_LINE;
                 let is_jittable = (opcode == DRAWMODE0_OPCODE_DRAW || opcode == DRAWMODE0_OPCODE_SCR2SCR)
-                    && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN)
+                    && (adrmode == DRAWMODE0_ADRMODE_BLOCK || adrmode == DRAWMODE0_ADRMODE_SPAN || is_line)
                     && !ctx.drawmode0.colorhost()
                     && !ctx.drawmode0.alphahost();
                 if is_jittable {

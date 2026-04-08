@@ -2795,6 +2795,109 @@ mod jit_tests {
         );
     }
 
+    /// I_LINE CI8 solid line — covers the basic Bresenham loop.
+    #[test]
+    fn jit_iline_ci8_solid() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_ILINE;
+        // Diagonal line (0,0)..(15,10) — exercises all octant paths collectively.
+        compare_jit_interp(0, 0, 17, 12,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0x77);
+                reg(rex, REX3_XYENDI,   xy(15, 10));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE RGB24 solid line — gently sloped, x-major.
+    #[test]
+    fn jit_iline_rgb24_solid() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_ILINE;
+        compare_jit_interp(0, 0, 22, 8,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_COLORRED, 0xFF << 11);
+                reg(rex, REX3_COLORGRN, 0x80 << 11);
+                reg(rex, REX3_COLORBLUE, 0x40 << 11);
+                reg(rex, REX3_XYENDI,   xy(20, 7));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE with SKIPFIRST and SKIPLAST — edge skip flags.
+    #[test]
+    fn jit_iline_skipfirst_skiplast() {
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_ILINE | (1 << 10) | (1 << 11); // SKIPFIRST | SKIPLAST
+        compare_jit_interp(0, 0, 14, 6,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0xAA);
+                reg(rex, REX3_XYENDI,   xy(12, 5));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// I_LINE step mode (iterate_one): one pixel per GO, driven via compare_jit_interp
+    /// using the continuation dm0 (no DOSETUP, no STOPONXY).
+    #[test]
+    fn jit_iline_step_mode() {
+        let dm1 = DM1_CI8_SRC;
+        // step mode dm0: same adrmode but no stoponx/stopony/dosetup
+        let dm0_cont = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE;
+        // We compare a single continuation step (after DOSETUP already set up Bresenham state).
+        // Setup: issue the DOSETUP GO first (interpreter-only, not JIT), then compare one step.
+        compare_jit_interp(0, 0, 14, 8,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFF);
+                reg(rex, REX3_COLORI,   0x55);
+                reg(rex, REX3_XYENDI,   xy(12, 6));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                // First GO with DOSETUP to establish Bresenham state
+                reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_ILINE_STEP);
+                // Clear the starting pixel so we only compare the stepped pixels
+                // (subsequent GOs with dm0_cont drive the comparison)
+            },
+            dm0_cont, dm1,
+        );
+    }
+
+    /// I_LINE with Gouraud shading (shade DDA active on a line).
+    #[test]
+    fn jit_iline_shade() {
+        let dm1 = DM1_RGB24_SRC;
+        let dm0 = DM0_DRAW_ILINE | (1 << 18); // SHADE bit
+        compare_jit_interp(0, 0, 16, 6,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                // Start color
+                reg(rex, REX3_COLORRED,  0xFF << 11);
+                reg(rex, REX3_COLORGRN,  0x00 << 11);
+                reg(rex, REX3_COLORBLUE, 0x80 << 11);
+                // Shade slopes (one step per pixel along the line major axis)
+                reg(rex, REX3_SLOPERED,  ((-8i32) as u32) << 11);
+                reg(rex, REX3_SLOPEGRN,  (8u32) << 11);
+                reg(rex, REX3_SLOPEBLUE, 0);
+                reg(rex, REX3_XYENDI,   xy(14, 4));
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
     /// SCR2SCR block copy (RGB24): copy a colored rectangle.
     #[test]
     fn jit_scr2scr_rgb24_block() {

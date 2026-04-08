@@ -26,10 +26,12 @@ use cranelift_module::{Linkage, Module};
 
 use crate::rex3::{
     Rex3Context,
-    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN,
+    DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR,
+    DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN,
+    DRAWMODE0_ADRMODE_I_LINE, DRAWMODE0_ADRMODE_F_LINE, DRAWMODE0_ADRMODE_A_LINE,
     DRAWMODE1_PLANES_RGB, DRAWMODE1_PLANES_RGBA,
     DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID,
-    OCTANT_XDEC, OCTANT_YDEC,
+    OCTANT_XDEC, OCTANT_YDEC, OCTANT_XMAJOR,
     REX3_COORD_BIAS, REX3_SCREEN_WIDTH, REX3_SCREEN_HEIGHT,
 };
 
@@ -115,13 +117,18 @@ impl ShaderCompiler {
     {
         let dm0 = Dm0 { val: dm0_val };
 
-        // Only DRAW/SCR2SCR opcodes, SPAN or BLOCK adrmode (no host FIFO, no lines).
+        // Only DRAW/SCR2SCR opcodes; SPAN, BLOCK, or I/F/A_LINE adrmode.
         let opcode = dm0.opcode();
         let adrmode = dm0.adrmode() << 2; // match the <<2 convention from rex3.rs
         let is_scr2scr = opcode == DRAWMODE0_OPCODE_SCR2SCR;
+        let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
+            || adrmode == DRAWMODE0_ADRMODE_F_LINE
+            || adrmode == DRAWMODE0_ADRMODE_A_LINE;
         if opcode != DRAWMODE0_OPCODE_DRAW && !is_scr2scr { return None; }
         if dm0.colorhost() || dm0.alphahost() { return None; }
-        if adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK { return None; }
+        if !is_line && adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK {
+            return None;
+        }
 
         // fastclear takes priority over blend — hardware ignores blend when fastclear=1.
         // SCR2SCR copies already-quantized pixels — dithering would corrupt them (matches execute_go).
@@ -150,18 +157,27 @@ impl ShaderCompiler {
             Err(e) => { eprintln!("REX JIT: declare_function failed: {e}"); return None; }
         };
 
-        let result = emit_shader(
-            &mut self.ctx.func,
-            &mut self.builder_ctx,
-            &dm0, &dm1,
-            is_scr2scr,
-            ptr_type,
-        );
+        let result = if is_line {
+            emit_draw_iline(
+                &mut self.ctx.func,
+                &mut self.builder_ctx,
+                &dm0, &dm1,
+                ptr_type,
+            )
+        } else {
+            emit_shader(
+                &mut self.ctx.func,
+                &mut self.builder_ctx,
+                &dm0, &dm1,
+                is_scr2scr,
+                ptr_type,
+            )
+        };
 
         if !result {
             self.ctx.func.clear();
             self.jit_module.clear_context(&mut self.ctx);
-            eprintln!("REX JIT: emit_shader returned false for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}",
+            eprintln!("REX JIT: emit failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x}: {}  {}",
                 crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
             return None;
         }
@@ -1145,6 +1161,594 @@ fn emit_shader(
     b.ins().return_(&[]);
     b.finalize();
 
+    true
+}
+
+/// Emit the Bresenham line shader IR. Mirrors draw_iline exactly.
+/// Handles I_LINE, F_LINE, and A_LINE (F_LINE/A_LINE re-use the same Bresenham loop).
+/// Returns false if the mode cannot be compiled.
+fn emit_draw_iline(
+    func:        &mut ir::Function,
+    builder_ctx: &mut FunctionBuilderContext,
+    dm0:         &Dm0,
+    dm1:         &Dm1,
+    ptr_type:    ir::Type,
+) -> bool {
+    // Bresenham octant table (mirrors BRES in draw_iline).
+    // Fields: (incrx1, incrx2, incry1, incry2, y_major)
+    // Note: MAME applies y as `y -= incry`, so positive incry moves y in negative direction.
+    #[rustfmt::skip]
+    const BRES: [(i32, i32, i32, i32, bool); 8] = [
+        ( 0,  1, -1, -1, true ),  // octant 0
+        ( 0,  1,  1,  1, true ),  // octant 1
+        ( 0, -1, -1, -1, true ),  // octant 2
+        ( 0, -1,  1,  1, true ),  // octant 3
+        ( 1,  1,  0, -1, false),  // octant 4
+        ( 1,  1,  0,  1, false),  // octant 5
+        (-1, -1,  0, -1, false),  // octant 6
+        (-1, -1,  0,  1, false),  // octant 7
+    ];
+
+    let mut b = FunctionBuilder::new(func, builder_ctx);
+    let mem  = MemFlags::trusted();
+    let memv = MemFlags::new();
+
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    b.seal_block(entry);
+
+    let ctx_ptr = b.block_params(entry)[0];
+    let fb_rgb  = b.block_params(entry)[1];
+    let fb_aux  = b.block_params(entry)[2];
+
+    macro_rules! ld32 { ($off:expr) => {
+        b.ins().load(types::I32, mem, ctx_ptr, ir::immediates::Offset32::new($off as i32))
+    }}
+    macro_rules! ld8 { ($off:expr) => {
+        b.ins().load(types::I8, mem, ctx_ptr, ir::immediates::Offset32::new($off as i32))
+    }}
+
+    // ── Load ctx fields ───────────────────────────────────────────────────────
+    let xstart_v  = ld32!(ctx_off!(xstart));
+    let ystart_v  = ld32!(ctx_off!(ystart));
+    let xend_v    = ld32!(ctx_off!(xend));
+    let yend_v    = ld32!(ctx_off!(yend));
+    let xywin_v   = ld32!(ctx_off!(xywin));
+    let xymove_v  = ld32!(ctx_off!(xymove));
+    let clipmode_v= ld32!(ctx_off!(clipmode));
+    let wrmask_v  = ld32!(ctx_off!(wrmask));
+    let colorback_v  = ld32!(ctx_off!(colorback));
+    let colorvram_v  = ld32!(ctx_off!(colorvram));
+    let smask0x_v = ld32!(ctx_off!(smask0x));
+    let smask0y_v = ld32!(ctx_off!(smask0y));
+    let smask1x_v = ld32!(ctx_off!(smask1x));
+    let smask1y_v = ld32!(ctx_off!(smask1y));
+    let smask2x_v = ld32!(ctx_off!(smask2x));
+    let smask2y_v = ld32!(ctx_off!(smask2y));
+    let smask3x_v = ld32!(ctx_off!(smask3x));
+    let smask3y_v = ld32!(ctx_off!(smask3y));
+    let smask4x_v = ld32!(ctx_off!(smask4x));
+    let smask4y_v = ld32!(ctx_off!(smask4y));
+
+    // Bresenham state from registers
+    let bres_v     = ld32!(ctx_off!(bresoctinc1));
+    let bres2_v    = ld32!(ctx_off!(bresrndinc2));
+    let bresd_raw  = ld32!(ctx_off!(bresd));
+
+    // octant = bresoctinc1[26:24]
+    let octant_v = {
+        let shifted = b.ins().ushr_imm(bres_v, 24);
+        b.ins().band_imm(shifted, 7)
+    };
+
+    // incr1: 20-bit, always positive
+    let incr1_v = b.ins().band_imm(bres_v, 0xFFFFF);
+
+    // incr2: 21-bit signed — sign-extend from bit 20
+    let incr2_v = {
+        let raw = b.ins().band_imm(bres2_v, 0x1FFFFF);
+        let bit20 = b.ins().band_imm(raw, 1 << 20);
+        let is_neg = b.ins().icmp_imm(IntCC::NotEqual, bit20, 0);
+        let sign_ext = b.ins().bor_imm(raw, 0xFFE0_0000u64 as i64);
+        b.ins().select(is_neg, sign_ext, raw)
+    };
+
+    // d: 27-bit signed — sign-extend from bit 26
+    let d_init_v = {
+        let raw = b.ins().band_imm(bresd_raw, 0x7FF_FFFF);
+        let bit26 = b.ins().band_imm(raw, 1 << 26);
+        let is_neg = b.ins().icmp_imm(IntCC::NotEqual, bit26, 0);
+        let sign_ext = b.ins().bor_imm(raw, 0xF800_0000u64 as i64);
+        b.ins().select(is_neg, sign_ext, raw)
+    };
+
+    // x2 = xend >> 11, y2 = yend >> 11
+    let c11       = b.ins().iconst(types::I32, 11);
+    let c0        = b.ins().iconst(types::I32, 0);
+    let c1        = b.ins().iconst(types::I32, 1);
+    let c31       = b.ins().iconst(types::I32, 31);
+    let c32       = b.ins().iconst(types::I32, 32);
+    let coord_bias = b.ins().iconst(types::I32, REX3_COORD_BIAS as i64);
+    let c2048     = b.ins().iconst(types::I32, 2048);
+
+    let x2_v = b.ins().sshr(xend_v, c11);
+    let y2_v = b.ins().sshr(yend_v, c11);
+    let x_init_v = b.ins().sshr(xstart_v, c11);
+    let y_init_v = b.ins().sshr(ystart_v, c11);
+
+    // y_major = (octant & OCTANT_XMAJOR) == 0  (OCTANT_XMAJOR = 4)
+    let xmajor_bit = b.ins().band_imm(octant_v, OCTANT_XMAJOR as i64);
+    let y_major_v  = b.ins().icmp_imm(IntCC::Equal, xmajor_bit, 0);
+
+    // major = y_major ? |y2-y| : |x2-x|
+    // pixel_count = major + 1; capped at 32 if length32
+    let dx_abs = {
+        let d = b.ins().isub(x2_v, x_init_v);
+        let neg = b.ins().ineg(d);
+        let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, d, 0);
+        b.ins().select(is_neg, neg, d)
+    };
+    let dy_abs = {
+        let d = b.ins().isub(y2_v, y_init_v);
+        let neg = b.ins().ineg(d);
+        let is_neg = b.ins().icmp_imm(IntCC::SignedLessThan, d, 0);
+        b.ins().select(is_neg, neg, d)
+    };
+    let major_v = b.ins().select(y_major_v, dy_abs, dx_abs);
+    let pixel_count_v = b.ins().iadd_imm(major_v, 1);
+
+    // iterate_one = !stoponx && !stopony (step-mode: always draw exactly 1 pixel)
+    let iterate_one = !dm0.stoponx() && !dm0.stopony();
+
+    // In step mode: pixel_count=1, skip_first=false, skip_last=false
+    let pixel_count_v = if iterate_one {
+        b.ins().iconst(types::I32, 1)
+    } else if dm0.length32() {
+        // length32: cap at 32
+        let long = b.ins().icmp(IntCC::SignedGreaterThan, pixel_count_v, c32);
+        b.ins().select(long, c32, pixel_count_v)
+    } else {
+        pixel_count_v
+    };
+
+    // For shade/pattern state we use the same block-param approach as emit_shader.
+    // Loop params: [x: i32, y: i32, d: i32, i: i32,  ...shade..., ...pattern...]
+    let loop_header = b.create_block();
+    let loop_end    = b.create_block();
+
+    b.append_block_param(loop_header, types::I32); // x
+    b.append_block_param(loop_header, types::I32); // y
+    b.append_block_param(loop_header, types::I32); // d
+    b.append_block_param(loop_header, types::I32); // i (pixel index 0..pixel_count)
+    if dm0.shade() {
+        b.append_block_param(loop_header, types::I32); // colorred
+        b.append_block_param(loop_header, types::I32); // colorgrn
+        b.append_block_param(loop_header, types::I32); // colorblue
+        b.append_block_param(loop_header, types::I32); // coloralpha
+    }
+    if dm0.enzpattern() {
+        b.append_block_param(loop_header, types::I8); // zpat_bit
+    }
+    if dm0.enlspattern() {
+        b.append_block_param(loop_header, types::I8);  // pat_bit
+        b.append_block_param(loop_header, types::I32); // lsmode
+    }
+
+    // Initial shade state
+    let mut init_args: Vec<Value> = vec![x_init_v, y_init_v, d_init_v,
+        b.ins().iconst(types::I32, 0)]; // i=0
+    if dm0.shade() {
+        init_args.extend([
+            ld32!(ctx_off!(colorred)),
+            ld32!(ctx_off!(colorgrn)),
+            ld32!(ctx_off!(colorblue)),
+            ld32!(ctx_off!(coloralpha)),
+        ]);
+    }
+    if dm0.enzpattern() {
+        init_args.push(ld8!(ctx_off!(zpat_bit)));
+    }
+    if dm0.enlspattern() {
+        init_args.push(ld8!(ctx_off!(pat_bit)));
+        init_args.push(ld32!(ctx_off!(lsmode)));
+    }
+
+    b.ins().jump(loop_header, &init_args);
+
+    // ── loop_header ───────────────────────────────────────────────────────────
+    b.switch_to_block(loop_header);
+    // DO NOT seal yet — back edge will be added later
+
+    let hp: Vec<Value> = b.block_params(loop_header).to_vec();
+    let x_v       = hp[0];
+    let y_v       = hp[1];
+    let d_v       = hp[2];
+    let i_v       = hp[3];
+    let mut pidx  = 4usize;
+    let (colorred_v, colorgrn_v, colorblue_v, coloralpha_v) = if dm0.shade() {
+        let r = hp[pidx]; let g = hp[pidx+1]; let bl = hp[pidx+2]; let a = hp[pidx+3];
+        pidx += 4;
+        (r, g, bl, a)
+    } else {
+        let z = b.ins().iconst(types::I32, 0);
+        (z, z, z, z)
+    };
+    let zpat_bit_v = if dm0.enzpattern() {
+        let v = hp[pidx]; pidx += 1; v
+    } else { b.ins().iconst(types::I8, 0) };
+    let (pat_bit_v, lsmode_v) = if dm0.enlspattern() {
+        let pb = hp[pidx]; let lsm = hp[pidx+1]; pidx += 2; (pb, lsm)
+    } else {
+        (b.ins().iconst(types::I8, 0), b.ins().iconst(types::I32, 0))
+    };
+    let _ = pidx; // suppress unused warning
+
+    // is_last = (i == pixel_count - 1)
+    let last_idx = b.ins().isub(pixel_count_v, c1);
+    let is_last_v  = b.ins().icmp(IntCC::Equal, i_v, last_idx);
+    let is_first_v = b.ins().icmp_imm(IntCC::Equal, i_v, 0);
+
+    // draw = (!is_first || !skipfirst) && (!is_last || !skiplast)
+    // iterate_one overrides both skip flags (draws the single step unconditionally)
+    let do_pixel: Value = if iterate_one {
+        b.ins().iconst(types::I8, 1)
+    } else if dm0.skipfirst() && dm0.skiplast() {
+        let not_first = b.ins().icmp_imm(IntCC::Equal, is_first_v, 0);
+        let not_last  = b.ins().icmp_imm(IntCC::Equal, is_last_v,  0);
+        b.ins().band(not_first, not_last)
+    } else if dm0.skipfirst() {
+        b.ins().icmp_imm(IntCC::Equal, is_first_v, 0)
+    } else if dm0.skiplast() {
+        b.ins().icmp_imm(IntCC::Equal, is_last_v, 0)
+    } else {
+        b.ins().iconst(types::I8, 1)
+    };
+
+    // ── pixel block ───────────────────────────────────────────────────────────
+    let pixel_block = b.create_block();
+    let skip_block  = b.create_block();
+
+    b.ins().brif(do_pixel, pixel_block, &[], skip_block, &[]);
+
+    b.switch_to_block(pixel_block);
+    b.seal_block(pixel_block);
+
+    let pctx = PixelCtx {
+        xywin_v, xymove_v, clipmode_v, wrmask_v, colorback_v, colorvram_v,
+        smask0x_v, smask0y_v, smask1x_v, smask1y_v,
+        smask2x_v, smask2y_v, smask3x_v, smask3y_v, smask4x_v, smask4y_v,
+        fb_rgb, fb_aux,
+    };
+
+    // Lines never use scr2scr (dst only, no xymove for draw; xyoffset still applies)
+    let (px_ptr, x_bayer, y_bayer) = emit_calculate_fb_address(
+        &mut b, x_v, y_v, &pctx, skip_block, dm0, dm1, /*is_scr2scr=*/false,
+        coord_bias, c0, c2048, ptr_type,
+    );
+
+    // Source color (same as emit_shader draw path — no scr2scr for lines)
+    let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+    let _ = depth_mask; // used indirectly via emit_pixel_write
+
+    let src_color: Value = {
+        let raw_src = if dm0.shade() {
+            let r  = clamp_color_component(&mut b, colorred_v);
+            let g  = clamp_color_component(&mut b, colorgrn_v);
+            let bl = clamp_color_component(&mut b, colorblue_v);
+            let g8   = b.ins().ishl_imm(g, 8);
+            let bl16 = b.ins().ishl_imm(bl, 16);
+            let rb   = b.ins().bor(r, g8);
+            b.ins().bor(rb, bl16)
+        } else {
+            if dm1.rgbmode() {
+                let r  = ld32!(ctx_off!(colorred));
+                let g  = ld32!(ctx_off!(colorgrn));
+                let bl = ld32!(ctx_off!(colorblue));
+                let r_c  = clamp_color_component(&mut b, r);
+                let g_c  = clamp_color_component(&mut b, g);
+                let b_c  = clamp_color_component(&mut b, bl);
+                let g8   = b.ins().ishl_imm(g_c, 8);
+                let bl16 = b.ins().ishl_imm(b_c, 16);
+                let rb   = b.ins().bor(r_c, g8);
+                b.ins().bor(rb, bl16)
+            } else {
+                let cr = ld32!(ctx_off!(colorred));
+                b.ins().sshr(cr, c11)
+            }
+        };
+
+        let draw_block2 = b.create_block();
+        b.append_block_param(draw_block2, types::I8);
+        let mut cur_use_bg: Value = b.ins().iconst(types::I8, 0);
+
+        if dm0.enzpattern() {
+            let zp_block = b.create_block();
+            let zp_pass  = b.create_block();
+            b.append_block_param(zp_pass, types::I8);
+            let zpattern_v   = ld32!(ctx_off!(zpattern));
+            let zpat_bit32   = b.ins().uextend(types::I32, zpat_bit_v);
+            let zpat_shifted = b.ins().ushr(zpattern_v, zpat_bit32);
+            let bit_v  = b.ins().band_imm(zpat_shifted, 1);
+            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
+            b.ins().brif(bit_set, zp_pass, &[cur_use_bg], zp_block, &[]);
+            b.switch_to_block(zp_block); b.seal_block(zp_block);
+            if dm0.zpopaque() {
+                let bg1 = b.ins().iconst(types::I8, 1);
+                b.ins().jump(zp_pass, &[bg1]);
+            } else {
+                b.ins().jump(skip_block, &[]);
+            }
+            b.switch_to_block(zp_pass); b.seal_block(zp_pass);
+            cur_use_bg = b.block_params(zp_pass).to_vec()[0];
+        }
+
+        if dm0.enlspattern() {
+            let ls_block = b.create_block();
+            let ls_pass  = b.create_block();
+            b.append_block_param(ls_pass, types::I8);
+            let lspattern_v  = ld32!(ctx_off!(lspattern));
+            let pat_bit32    = b.ins().uextend(types::I32, pat_bit_v);
+            let lspat_shifted = b.ins().ushr(lspattern_v, pat_bit32);
+            let bit_v  = b.ins().band_imm(lspat_shifted, 1);
+            let bit_set = b.ins().icmp_imm(IntCC::NotEqual, bit_v, 0);
+            b.ins().brif(bit_set, ls_pass, &[cur_use_bg], ls_block, &[]);
+            b.switch_to_block(ls_block); b.seal_block(ls_block);
+            if dm0.lsopaque() {
+                let bg1 = b.ins().iconst(types::I8, 1);
+                b.ins().jump(ls_pass, &[bg1]);
+            } else {
+                b.ins().jump(skip_block, &[]);
+            }
+            b.switch_to_block(ls_pass); b.seal_block(ls_pass);
+            cur_use_bg = b.block_params(ls_pass).to_vec()[0];
+        }
+
+        b.ins().jump(draw_block2, &[cur_use_bg]);
+        b.switch_to_block(draw_block2); b.seal_block(draw_block2);
+        let use_bg_flag = b.block_params(draw_block2).to_vec()[0];
+        let use_bg_bool = b.ins().icmp_imm(IntCC::NotEqual, use_bg_flag, 0);
+        b.ins().select(use_bg_bool, colorback_v, raw_src)
+    };
+
+    emit_pixel_write(&mut b, px_ptr, x_bayer, y_bayer, src_color, &pctx, &mem, &memv, dm1);
+    b.ins().jump(skip_block, &[]);
+
+    // ── skip_block: shade + pattern advance ──────────────────────────────────
+    b.switch_to_block(skip_block);
+    b.seal_block(skip_block);
+
+    // Shade DDA step (mirrors draw_iline calling shade_fn)
+    let (new_cr, new_cg, new_cb, new_ca) = if dm0.shade() {
+        let slopered_v   = ld32!(ctx_off!(slopered));
+        let slopegrn_v   = ld32!(ctx_off!(slopegrn));
+        let slopeblue_v  = ld32!(ctx_off!(slopeblue));
+        let slopealpha_v = ld32!(ctx_off!(slopealpha));
+        let ncr = b.ins().iadd(colorred_v,   slopered_v);
+        let ncg = b.ins().iadd(colorgrn_v,   slopegrn_v);
+        let ncb = b.ins().iadd(colorblue_v,  slopeblue_v);
+        let nca = b.ins().iadd(coloralpha_v, slopealpha_v);
+        let (ncr, ncg, ncb, nca) = if dm1.rgbmode() {
+            (clamp_shade(&mut b, ncr), clamp_shade(&mut b, ncg),
+             clamp_shade(&mut b, ncb), clamp_shade(&mut b, nca))
+        } else if dm0.ciclamp() {
+            let depth = dm1.drawdepth();
+            let ncr2 = if depth == 1 {
+                let overflow = b.ins().band_imm(ncr, 1 << 19);
+                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let max8 = b.ins().iconst(types::I32, 0x0007_FFFFi64);
+                b.ins().select(ov_set, max8, ncr)
+            } else if depth == 2 {
+                let overflow = b.ins().band_imm(ncr, 1 << 21);
+                let ov_set = b.ins().icmp_imm(IntCC::NotEqual, overflow, 0);
+                let max12 = b.ins().iconst(types::I32, 0x001F_FFFFi64);
+                b.ins().select(ov_set, max12, ncr)
+            } else { ncr };
+            (ncr2, ncg, ncb, nca)
+        } else { (ncr, ncg, ncb, nca) };
+        (ncr, ncg, ncb, nca)
+    } else {
+        (colorred_v, colorgrn_v, colorblue_v, coloralpha_v)
+    };
+
+    // Pattern advance (mirrors pattern_fn in draw_iline)
+    let new_zpat_bit = if dm0.enzpattern() {
+        let c1_i8 = b.ins().iconst(types::I8, 1);
+        let dec = b.ins().isub(zpat_bit_v, c1_i8);
+        b.ins().band_imm(dec, 31)
+    } else { zpat_bit_v };
+
+    let (new_pat_bit, new_lsmode) = if dm0.enlspattern() {
+        let lsrcount = b.ins().band_imm(lsmode_v, 0xFF);
+        let lsm_shr8 = b.ins().ushr_imm(lsmode_v, 8);
+        let lsrepeat_raw = b.ins().band_imm(lsm_shr8, 0xFF);
+        let lsrepeat = {
+            let is_zero = b.ins().icmp_imm(IntCC::Equal, lsrepeat_raw, 0);
+            b.ins().select(is_zero, c1, lsrepeat_raw)
+        };
+        let is_zero = b.ins().icmp_imm(IntCC::Equal, lsrcount, 0);
+        let reload_count = b.ins().isub(lsrepeat, c1);
+        let lsrcount_dec = b.ins().isub(lsrcount, c1);
+        let new_count = b.ins().select(is_zero, reload_count, lsrcount_dec);
+        let lsm_shr24 = b.ins().ushr_imm(lsmode_v, 24);
+        let lslength = b.ins().band_imm(lsm_shr24, 0xF);
+        let length_bits = b.ins().iadd_imm(lslength, 17);
+        let wrap_point = b.ins().isub(c32, length_bits);
+        let pat_bit32 = b.ins().uextend(types::I32, pat_bit_v);
+        let at_wrap = b.ins().icmp(IntCC::Equal, pat_bit32, wrap_point);
+        let pat_dec = b.ins().isub(pat_bit32, c1);
+        let dec_pat = b.ins().band_imm(pat_dec, 31);
+        let new_pat32 = b.ins().select(at_wrap, c31, dec_pat);
+        let new_pat32_masked = b.ins().select(is_zero, new_pat32, pat_bit32);
+        let new_pb = b.ins().ireduce(types::I8, new_pat32_masked);
+        let lsm_cleared = b.ins().band_imm(lsmode_v, !0xFF_i64);
+        let new_lsm = b.ins().bor(lsm_cleared, new_count);
+        (new_pb, new_lsm)
+    } else { (pat_bit_v, lsmode_v) };
+
+    // ── Bresenham step (mirrors bres_step! macro in draw_iline) ──────────────
+    // Step depends on both octant and d — both are runtime values.
+    // We emit an 8-way table lookup for (incrx1, incrx2, incry1, incry2) and
+    // a runtime branch on d < 0 to select which step to apply.
+    //
+    // The step emitted here is used when !is_last || iterate_one.
+    // When is_last && !iterate_one: skip step, write back x,y unchanged.
+    let step_block  = b.create_block(); // emit step
+    let noste_block = b.create_block(); // skip step (last pixel, full-line mode)
+    let after_step  = b.create_block(); // params: [x_new, y_new, d_new]
+    b.append_block_param(after_step, types::I32); // x_new
+    b.append_block_param(after_step, types::I32); // y_new
+    b.append_block_param(after_step, types::I32); // d_new
+
+    // In iterate_one mode: always step.
+    // In full-line mode: step unless is_last.
+    if iterate_one {
+        b.ins().jump(step_block, &[]);
+    } else {
+        b.ins().brif(is_last_v, noste_block, &[], step_block, &[]);
+    }
+
+    // step_block: apply Bresenham step
+    b.switch_to_block(step_block); b.seal_block(step_block);
+    {
+        // For each octant, emit a table of (incrx1, incrx2, incry1, incry2).
+        // We branch on octant at runtime to select the right step offsets.
+        // Then branch on d < 0 to select step 1 (straight) vs step 2 (diagonal).
+        //
+        // Build two arrays indexed by octant[2:0]:
+        //   incrx_straight[oct], incrx_diag[oct], incry_straight[oct], incry_diag[oct]
+        // Use a chain of select instructions to do the table lookup.
+
+        // Instead of a full 8-way table, use the octant bits directly:
+        //   incrx1 = f(octant), incrx2 = g(octant), ...
+        // From the BRES table:
+        //   oct 0: ( 0,  1, -1, -1, y_major)
+        //   oct 1: ( 0,  1,  1,  1, y_major)
+        //   oct 2: ( 0, -1, -1, -1, y_major)
+        //   oct 3: ( 0, -1,  1,  1, y_major)
+        //   oct 4: ( 1,  1,  0, -1, x_major)
+        //   oct 5: ( 1,  1,  0,  1, x_major)
+        //   oct 6: (-1, -1,  0, -1, x_major)
+        //   oct 7: (-1, -1,  0,  1, x_major)
+        //
+        // Patterns:
+        //   incrx1: 0 for oct 0-3, +1 for oct 4-5, -1 for oct 6-7
+        //   incrx2: +1 for oct 0-1,4-5; -1 for oct 2-3,6-7
+        //   incry1: -1 for oct 0,2; +1 for oct 1,3; 0 for oct 4-7
+        //   incry2: -1 for oct 0,2,4,6; +1 for oct 1,3,5,7
+
+        // Emit the 8 octant combos using a chain of select on octant bits.
+        // octant bits: bit0=YDEC, bit1=XDEC, bit2=XMAJOR
+
+        let cm1i = b.ins().iconst(types::I32, -1i64);
+        let cp1i = b.ins().iconst(types::I32,  1i64);
+        let c0i  = b.ins().iconst(types::I32,  0i64);
+
+        // XMAJOR bit (bit 2)
+        let xmajor_v = b.ins().icmp_imm(IntCC::NotEqual, xmajor_bit, 0);
+        // XDEC bit (bit 1)
+        let xdec_bit = b.ins().band_imm(octant_v, OCTANT_XDEC as i64);
+        let xdec_v   = b.ins().icmp_imm(IntCC::NotEqual, xdec_bit, 0);
+        // YDEC bit (bit 0)
+        let ydec_bit = b.ins().band_imm(octant_v, OCTANT_YDEC as i64);
+        let ydec_v   = b.ins().icmp_imm(IntCC::NotEqual, ydec_bit, 0);
+
+        // incrx1: 0 for y-major, ±1 for x-major (sign = XDEC)
+        let incrx1_xmaj = b.ins().select(xdec_v, cm1i, cp1i);
+        let incrx1 = b.ins().select(xmajor_v, incrx1_xmaj, c0i);
+
+        // incrx2: ±1 based on XDEC (same for y-major and x-major)
+        let incrx2 = b.ins().select(xdec_v, cm1i, cp1i);
+
+        // incry1: 0 for x-major; ±1 for y-major (sign = YDEC, but inverted: YDEC→+1 per BRES)
+        // Oct 0 (YDEC=0): incry1 = -1; Oct 1 (YDEC=1): incry1 = +1
+        // Oct 2 (YDEC=0): incry1 = -1; Oct 3 (YDEC=1): incry1 = +1
+        // So incry1 (y-major) = YDEC ? +1 : -1
+        let incry1_ymaj = b.ins().select(ydec_v, cp1i, cm1i);
+        let incry1 = b.ins().select(xmajor_v, c0i, incry1_ymaj);
+
+        // incry2: ±1 based on YDEC (inverted: YDEC=0→-1, YDEC=1→+1)
+        let incry2 = b.ins().select(ydec_v, cp1i, cm1i);
+
+        // Choose step 1 or step 2 based on d < 0
+        let d_neg   = b.ins().icmp_imm(IntCC::SignedLessThan, d_v, 0);
+        let dx_step = b.ins().select(d_neg, incrx1, incrx2);
+        let dy_step = b.ins().select(d_neg, incry1, incry2);
+        let d_incr  = b.ins().select(d_neg, incr1_v, incr2_v);
+
+        // x += dx_step,  y -= dy_step  (MAME convention: y -= incry)
+        let x_new = b.ins().iadd(x_v, dx_step);
+        let y_neg_step = b.ins().ineg(dy_step);
+        let y_new = b.ins().iadd(y_v, y_neg_step);
+        let d_new = b.ins().iadd(d_v, d_incr);
+
+        b.ins().jump(after_step, &[x_new, y_new, d_new]);
+    }
+
+    // noste_block: no step (last pixel, full-line mode) — pass x,y,d unchanged
+    if !iterate_one {
+        b.switch_to_block(noste_block); b.seal_block(noste_block);
+        b.ins().jump(after_step, &[x_v, y_v, d_v]);
+    }
+
+    // after_step: write back ctx and check if done
+    b.switch_to_block(after_step); b.seal_block(after_step);
+    let x_new = b.block_params(after_step)[0];
+    let y_new = b.block_params(after_step)[1];
+    let d_new = b.block_params(after_step)[2];
+
+    // i_next = i + 1; done = (i_next >= pixel_count)
+    let i_next = b.ins().iadd_imm(i_v, 1);
+    let done_v = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i_next, pixel_count_v);
+
+    let cont_block = b.create_block();
+    b.ins().brif(done_v, loop_end, &[], cont_block, &[]);
+    b.switch_to_block(cont_block); b.seal_block(cont_block);
+
+    // Loop back
+    let mut back_args: Vec<Value> = vec![x_new, y_new, d_new, i_next];
+    if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
+    if dm0.enzpattern() { back_args.push(new_zpat_bit); }
+    if dm0.enlspattern() { back_args.push(new_pat_bit); back_args.push(new_lsmode); }
+    b.ins().jump(loop_header, &back_args);
+
+    // ── loop_end: write back ctx state ───────────────────────────────────────
+    b.switch_to_block(loop_end);
+    b.seal_block(loop_end);
+    b.seal_block(loop_header);
+
+    // Write back xstart = x_new<<11, ystart = y_new<<11, bresd = d_new & mask
+    // (matches ctx.xstart = x<<11; ctx.ystart = y<<11; ctx.bresd = (d as u32) & 0x7FF_FFFF)
+    macro_rules! st32e { ($off:expr, $val:expr) => {
+        b.ins().store(mem, $val, ctx_ptr, ir::immediates::Offset32::new($off as i32));
+    }}
+    macro_rules! st8e { ($off:expr, $val:expr) => {
+        b.ins().store(mem, $val, ctx_ptr, ir::immediates::Offset32::new($off as i32));
+    }}
+
+    let c11_wb   = b.ins().iconst(types::I32, 11);
+    let xstart_wb = b.ins().ishl(x_new, c11_wb);
+    let ystart_wb = b.ins().ishl(y_new, c11_wb);
+    let bresd_wb  = b.ins().band_imm(d_new, 0x7FF_FFFFi64);
+    st32e!(ctx_off!(xstart), xstart_wb);
+    st32e!(ctx_off!(ystart), ystart_wb);
+    st32e!(ctx_off!(bresd),  bresd_wb);
+    if dm0.shade() {
+        st32e!(ctx_off!(colorred),   new_cr);
+        st32e!(ctx_off!(colorgrn),   new_cg);
+        st32e!(ctx_off!(colorblue),  new_cb);
+        st32e!(ctx_off!(coloralpha), new_ca);
+    }
+    if dm0.enzpattern() {
+        st8e!(ctx_off!(zpat_bit), new_zpat_bit);
+    }
+    if dm0.enlspattern() {
+        st8e!(ctx_off!(pat_bit), new_pat_bit);
+        st32e!(ctx_off!(lsmode), new_lsmode);
+    }
+
+    b.ins().return_(&[]);
+    b.finalize();
     true
 }
 
