@@ -14,6 +14,10 @@ pub struct ScsiDeviceConfig {
     pub discs: Vec<String>,
     /// true = CD-ROM, false = hard disk.
     pub cdrom: bool,
+    /// Enable copy-on-write overlay. Base image is never modified; writes go to
+    /// `{path}.overlay`. Delete the overlay file to reset to clean state.
+    #[serde(default)]
+    pub overlay: bool,
 }
 
 /// Protocol for port forwarding.
@@ -125,11 +129,13 @@ fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
         path: "scsi1.raw".to_string(),
         discs: vec![],
         cdrom: false,
+        overlay: false,
     });
     map.insert(4, ScsiDeviceConfig {
         path: "cdrom4.iso".to_string(),
         discs: vec![],
         cdrom: true,
+        overlay: false,
     });
     map
 }
@@ -312,6 +318,7 @@ impl Cli {
                 path: String::new(),
                 discs: vec![],
                 cdrom,
+                overlay: false,
             });
             entry.path = path;
             entry.cdrom = cdrom;

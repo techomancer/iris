@@ -1,5 +1,7 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+
+use crate::cow_disk::CowDisk;
 
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
@@ -59,8 +61,51 @@ pub struct ScsiResponse {
     pub data: Vec<u8>,   // Response data
 }
 
+/// Disk I/O backend: either direct file access or copy-on-write overlay.
+pub enum DiskBackend {
+    /// Direct read-write access to a single file (current default behavior).
+    Direct(File),
+    /// Copy-on-write: base image is read-only, writes go to overlay file.
+    Cow(CowDisk),
+}
+
+impl DiskBackend {
+    fn read_sectors(&mut self, lba: u64, count: usize) -> io::Result<Vec<u8>> {
+        match self {
+            DiskBackend::Direct(file) => {
+                let offset = lba * 512;
+                let total = count * 512;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut data = vec![0u8; total];
+                file.read_exact(&mut data)?;
+                Ok(data)
+            }
+            DiskBackend::Cow(cow) => cow.read_sectors(lba, count),
+        }
+    }
+
+    fn write_sectors(&mut self, lba: u64, data: &[u8]) -> io::Result<()> {
+        match self {
+            DiskBackend::Direct(file) => {
+                let offset = lba * 512;
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(data)?;
+                Ok(())
+            }
+            DiskBackend::Cow(cow) => cow.write_sectors(lba, data),
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            DiskBackend::Direct(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
+            DiskBackend::Cow(cow) => cow.size(),
+        }
+    }
+}
+
 pub struct ScsiDevice {
-    file: File,
+    backend: DiskBackend,
     size: u64,
     is_cdrom: bool,
     /// Path of the currently mounted image.
@@ -77,9 +122,9 @@ pub struct ScsiDevice {
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
 
 impl ScsiDevice {
-    pub fn new(file: File, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
+    pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
         Self {
-            file,
+            backend,
             size,
             is_cdrom,
             filename,
@@ -88,6 +133,36 @@ impl ScsiDevice {
             pending_sense: [0u8; 18],
             unit_attention: false,
         }
+    }
+
+    /// Commit the COW overlay to the base image. No-op if not using COW.
+    /// Returns the number of sectors committed, or 0 if direct mode.
+    pub fn cow_commit(&mut self) -> io::Result<usize> {
+        match &mut self.backend {
+            DiskBackend::Cow(cow) => cow.commit(),
+            DiskBackend::Direct(_) => Ok(0),
+        }
+    }
+
+    /// Reset the COW overlay (discard all writes). No-op if not using COW.
+    pub fn cow_reset(&mut self) -> io::Result<()> {
+        match &mut self.backend {
+            DiskBackend::Cow(cow) => cow.reset_overlay(),
+            DiskBackend::Direct(_) => Ok(()),
+        }
+    }
+
+    /// Number of dirty sectors in the COW overlay, or 0 if direct mode.
+    pub fn cow_dirty_count(&self) -> usize {
+        match &self.backend {
+            DiskBackend::Cow(cow) => cow.dirty_count(),
+            DiskBackend::Direct(_) => 0,
+        }
+    }
+
+    /// Whether this device is using COW overlay mode.
+    pub fn is_cow(&self) -> bool {
+        matches!(&self.backend, DiskBackend::Cow(_))
     }
 
     /// Advance to the next disc in the list (wraps around).
@@ -105,7 +180,7 @@ impl ScsiDevice {
         match OpenOptions::new().read(true).open(&next_path) {
             Ok(f) => {
                 let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-                self.file = f;
+                self.backend = DiskBackend::Direct(f);
                 self.size = size;
                 self.filename = next_path.clone();
                 self.unit_attention = true; // signal medium change on next command
@@ -284,13 +359,7 @@ impl ScsiDevice {
     }
 
     fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
-        let offset = lba * 512;
-        let total = count * 512;
-
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut data = vec![0u8; total];
-        self.file.read_exact(&mut data)?;
-
+        let data = self.backend.read_sectors(lba, count)?;
         Ok(ScsiResponse {
             status: 0x00,
             data,
@@ -332,9 +401,7 @@ impl ScsiDevice {
             });
         }
 
-        let offset = lba * 512;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(data)?;
+        self.backend.write_sectors(lba, data)?;
 
         Ok(ScsiResponse {
             status: 0x00,

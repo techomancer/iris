@@ -1066,8 +1066,8 @@ impl Hpc3 {
         self.seeq.set_phys(mem);
     }
 
-    pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>) -> std::io::Result<()> {
-        self.scsi_dev.add_device(id, path, is_cdrom, discs)
+    pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
+        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay)
     }
 
     pub fn ioc(&self) -> &Ioc {
@@ -1226,7 +1226,7 @@ impl Device for Hpc3 {
         if cmd == "seeq" || cmd == "net" {
              return self.seeq.execute_command(cmd, args, writer);
         }
-        if cmd == "scsi" {
+        if cmd == "scsi" || cmd == "cow" {
              return self.scsi_dev.execute_command(cmd, args, writer);
         }
         if cmd == "hal2" {

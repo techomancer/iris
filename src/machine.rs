@@ -105,7 +105,7 @@ impl Machine {
             } else {
                 (dev.path.clone(), vec![])
             };
-            if let Err(e) = hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs) {
+            if let Err(e) = hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay) {
                 println!("Note: Could not attach {} to SCSI ID {}: {}", path, id, e);
             }
         }

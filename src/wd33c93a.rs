@@ -234,19 +234,29 @@ impl Wd33c93a {
     /// For CD-ROMs, `discs` is the full ordered list of ISO paths; the first
     /// entry is mounted immediately.  For HDDs `discs` is ignored — only
     /// `path` is used.
-    pub fn add_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>) -> std::io::Result<()> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(!is_cdrom)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        let size = metadata.len();
+    pub fn add_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
+        use crate::cow_disk::CowDisk;
+        use crate::scsi::DiskBackend;
+
+        let (backend, size) = if overlay && !is_cdrom {
+            let overlay_path = format!("{}.overlay", path);
+            let cow = CowDisk::new(path, &overlay_path)?;
+            let sz = cow.size();
+            (DiskBackend::Cow(cow), sz)
+        } else {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(!is_cdrom)
+                .open(path)?;
+            let sz = file.metadata()?.len();
+            (DiskBackend::Direct(file), sz)
+        };
 
         let disc_list = if is_cdrom { discs } else { vec![] };
 
         let mut state = self.state.lock();
         if id < 8 {
-            state.devices[id] = Some(ScsiDevice::new(file, size, is_cdrom, path.to_string(), disc_list));
+            state.devices[id] = Some(ScsiDevice::new(backend, size, is_cdrom, path.to_string(), disc_list));
         }
         Ok(())
     }
@@ -486,6 +496,7 @@ impl Device for Wd33c93a {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("scsi".to_string(), "SCSI commands: scsi status | scsi eject <id> | scsi debug <on|off> [DEV]".to_string()),
+            ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
 
@@ -527,6 +538,57 @@ impl Device for Wd33c93a {
                     return Ok(());
                 }
                 _ => return Err("Usage: scsi debug <on|off> | scsi status | scsi eject <id>".to_string()),
+            }
+        }
+        if cmd == "cow" {
+            let mut state = self.state.lock();
+            match args.first().copied() {
+                Some("status") => {
+                    for (id, dev) in state.devices.iter().enumerate() {
+                        if let Some(d) = dev {
+                            if d.is_cow() {
+                                writeln!(writer, "SCSI {}: COW overlay, {} dirty sectors", id, d.cow_dirty_count()).unwrap();
+                            } else {
+                                writeln!(writer, "SCSI {}: direct (no overlay)", id).unwrap();
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Some("commit") => {
+                    let ids: Vec<usize> = if let Some(id_str) = args.get(1) {
+                        vec![id_str.parse().map_err(|_| "invalid SCSI ID".to_string())?]
+                    } else {
+                        (0..8).filter(|&i| state.devices[i].as_ref().map(|d| d.is_cow()).unwrap_or(false)).collect()
+                    };
+                    for id in ids {
+                        if let Some(dev) = &mut state.devices[id] {
+                            match dev.cow_commit() {
+                                Ok(n) if n > 0 => writeln!(writer, "SCSI {}: committed {} sectors to base image", id, n).unwrap(),
+                                Ok(_) => writeln!(writer, "SCSI {}: nothing to commit", id).unwrap(),
+                                Err(e) => writeln!(writer, "SCSI {}: commit failed: {}", id, e).unwrap(),
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Some("reset") => {
+                    let ids: Vec<usize> = if let Some(id_str) = args.get(1) {
+                        vec![id_str.parse().map_err(|_| "invalid SCSI ID".to_string())?]
+                    } else {
+                        (0..8).filter(|&i| state.devices[i].as_ref().map(|d| d.is_cow()).unwrap_or(false)).collect()
+                    };
+                    for id in ids {
+                        if let Some(dev) = &mut state.devices[id] {
+                            match dev.cow_reset() {
+                                Ok(()) => writeln!(writer, "SCSI {}: overlay reset (all writes discarded)", id).unwrap(),
+                                Err(e) => writeln!(writer, "SCSI {}: reset failed: {}", id, e).unwrap(),
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => return Err("Usage: cow status | cow commit [id] | cow reset [id]".to_string()),
             }
         }
         Err("Command not found".to_string())

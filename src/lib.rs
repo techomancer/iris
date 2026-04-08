@@ -28,6 +28,7 @@ pub mod locks;
 pub mod pit8254;
 pub mod net;
 pub mod seeq8003;
+pub mod cow_disk;
 pub mod scsi;
 pub mod wd33c93a;
 pub mod hal2;
