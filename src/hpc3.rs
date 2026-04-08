@@ -1226,7 +1226,7 @@ impl Device for Hpc3 {
         if cmd == "seeq" || cmd == "net" {
              return self.seeq.execute_command(cmd, args, writer);
         }
-        if cmd == "scsi" {
+        if cmd == "scsi" || cmd == "cow" {
              return self.scsi_dev.execute_command(cmd, args, writer);
         }
         if cmd == "hal2" {
