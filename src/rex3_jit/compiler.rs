@@ -565,6 +565,25 @@ fn emit_shader(
     let ystart_init = ld32!(ctx_off!(ystart));
     let first_init  = b.ins().iconst(types::I8, 1);
 
+    // length32: stop after 32 pixels if span_len >= 32.
+    // xstop = xstart + (32<<11), only active for span mode + length32 + span_len>=32.
+    // Computed once at shader entry; carried as a local (not a loop param — it's invariant).
+    // Emit as an Option<Value>: Some(xstop_val) when length32 is set and not a block.
+    let xstop_v: Option<Value> = if dm0.length32() && !is_block {
+        let c32_11 = b.ins().iconst(types::I32, 32 << 11);
+        let xstop_raw = b.ins().iadd(xstart_init, c32_11);
+        // Only use xstop when span_len >= 32: span_len = (xend - xstart) >> 11
+        let diff = b.ins().isub(xend_v, xstart_init);
+        let span_len_v = b.ins().sshr_imm(diff, 11);
+        let c32i = b.ins().iconst(types::I32, 32);
+        let long_enough = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, span_len_v, c32i);
+        // Select: if span_len >= 32 use xstop_raw, else use xend_v+1 (unreachable limit)
+        let xend_plus1 = b.ins().iadd_imm(xend_v, 1 << 11); // beyond xend → never triggers
+        Some(b.ins().select(long_enough, xstop_raw, xend_plus1))
+    } else {
+        None
+    };
+
     let mut init_args: Vec<Value> = vec![xstart_init, ystart_init, first_init];
     if dm0.shade() {
         let cr = ld32!(ctx_off!(colorred));
@@ -1229,13 +1248,31 @@ fn emit_shader(
             dm0, new_cr, new_cg, new_cb, new_ca, new_zpat_bit, new_pat_bit, new_lsmode);
         b.ins().jump(loop_end, &[]);
     } else {
-        // stoponx=1: continue x loop — jump back to loop_header
+        // stoponx=1: continue x loop — jump back to loop_header.
+        // But first check length32 xstop: if xstart_next >= xstop, stop the primitive.
         let new_first = b.ins().iconst(types::I8, 0);
         let mut back_args: Vec<Value> = vec![xstart_next, ystart_v, new_first];
         if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
         if dm0.enzpattern() { back_args.push(new_zpat_bit); }
         if dm0.enlspattern() { back_args.push(new_pat_bit); back_args.push(new_lsmode); }
-        b.ins().jump(loop_header, &back_args);
+
+        if let Some(xstop) = xstop_v {
+            // length32: stop if xstart_next >= xstop
+            let at_xstop = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, xstart_next, xstop);
+            let xstop_block = b.create_block();
+            let keep_going  = b.create_block();
+            b.ins().brif(at_xstop, xstop_block, &[], keep_going, &[]);
+
+            b.switch_to_block(xstop_block); b.seal_block(xstop_block);
+            emit_writeback(&mut b, ctx_ptr, &mem, xstart_next, ystart_v,
+                dm0, new_cr, new_cg, new_cb, new_ca, new_zpat_bit, new_pat_bit, new_lsmode);
+            b.ins().jump(loop_end, &[]);
+
+            b.switch_to_block(keep_going); b.seal_block(keep_going);
+            b.ins().jump(loop_header, &back_args);
+        } else {
+            b.ins().jump(loop_header, &back_args);
+        }
     }
 
     // ── loop_end ──────────────────────────────────────────────────────────────

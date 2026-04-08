@@ -2672,4 +2672,51 @@ mod jit_tests {
         for x in 0..=255i32 { unsafe { (*rex_j.fb_rgb.get())[(x as u32) as usize] = 0; } }
         check(rex_j, "jit");
     }
+
+    /// Exact octahedra blur mode: SPAN + SHADE + ENZPAT + DITHER + RGB12 + LEN32 + STOPONX + DOSETUP.
+    /// zpattern = 0x88888888 (every 4th pixel). Tests that zpat_bit resets to 31 each GO.
+    #[test]
+    fn jit_shade_enzpat_span_rgb12_dither() {
+        let dm0 = 0x00049122u32; // DRAW SPAN DOSETUP STOPONX ENZPAT LEN32 SHADE
+        let dm1 = 0x3009f011u32; // RGB 12bpp dither SRC
+        compare_jit_interp(0, 0, 40, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1,  dm1);
+                reg(rex, REX3_WRMASK,     0xFFFFFF);
+                reg(rex, REX3_ZPATTERN,   0x88888888);
+                reg(rex, REX3_COLORRED,   0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,   0x20u32 << 11);
+                reg(rex, REX3_COLORBLUE,  0x10u32 << 11);
+                reg(rex, REX3_SLOPERED,   2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE,  0u32);
+                reg(rex, REX3_XYSTARTI,   xy(0, 0));
+                reg(rex, REX3_XYENDI,     xy(40, 0));
+            },
+            dm0, dm1,
+        );
+    }
+
+    /// Same as above but DBLSRC variant (dm1=0x3009f031).
+    #[test]
+    fn jit_shade_enzpat_span_rgb12_dblsrc() {
+        let dm0 = 0x00049122u32;
+        let dm1 = 0x3009f031u32; // same + DBLSRC
+        compare_jit_interp(0, 0, 40, 0,
+            |rex| {
+                reg(rex, REX3_DRAWMODE1,  dm1);
+                reg(rex, REX3_WRMASK,     0xFFFFFF);
+                reg(rex, REX3_ZPATTERN,   0x88888888);
+                reg(rex, REX3_COLORRED,   0x80u32 << 11);
+                reg(rex, REX3_COLORGRN,   0x20u32 << 11);
+                reg(rex, REX3_COLORBLUE,  0x10u32 << 11);
+                reg(rex, REX3_SLOPERED,   2u32 << 11);
+                reg(rex, REX3_SLOPEGRN,   1u32 << 11);
+                reg(rex, REX3_SLOPEBLUE,  0u32);
+                reg(rex, REX3_XYSTARTI,   xy(0, 0));
+                reg(rex, REX3_XYENDI,     xy(40, 0));
+            },
+            dm0, dm1,
+        );
+    }
 }
