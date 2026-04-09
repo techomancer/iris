@@ -63,9 +63,81 @@ case "$MODE" in
     perf report --stdio --no-children -i perf.data > "$PERFREPORT" 2>&1
     echo "Perf report saved to: $PERFREPORT"
     ;;
+  smoke)
+    # Headless boot smoke test: boots IRIX with JIT, checks milestones, exits.
+    # Uses COW overlay to protect disk image. Exits 0 if all milestones pass.
+    TIMEOUT="${IRIS_SMOKE_TIMEOUT:-120}"
+    echo "Running: headless smoke test (timeout=${TIMEOUT}s)" | tee -a "$OUTFILE"
+
+    # Clean up stale overlays
+    rm -f scsi1.raw.overlay scsi2.raw.overlay
+
+    # Build
+    cargo build --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+
+    # Run headless with JIT, capture output, kill after timeout
+    IRIS_JIT=1 timeout "$TIMEOUT" cargo run --release --features jit,lightning -- --headless 2>&1 | tee -a "$OUTFILE" &
+    EMUPID=$!
+
+    # Wait for emulator to finish or timeout
+    wait $EMUPID 2>/dev/null
+    EXIT=$?
+
+    echo "" | tee -a "$OUTFILE"
+    echo "=== Smoke Test Results ===" | tee -a "$OUTFILE"
+
+    PASS=0
+    FAIL=0
+
+    check_milestone() {
+      local name="$1"
+      local pattern="$2"
+      if grep -q "$pattern" "$OUTFILE"; then
+        echo "  PASS: $name" | tee -a "$OUTFILE"
+        PASS=$((PASS + 1))
+      else
+        echo "  FAIL: $name (pattern '$pattern' not found)" | tee -a "$OUTFILE"
+        FAIL=$((FAIL + 1))
+      fi
+    }
+
+    check_milestone "JIT initialized"    "JIT: adaptive mode"
+    check_milestone "First compilation"  "JIT: compiled #1"
+    check_milestone "Blocks compiled"    "JIT:.*blocks,"
+
+    # Check for crashes
+    if grep -qiE "KERNEL FAULT|PANIC|TLBMISS.*KERNEL|SEGV" "$OUTFILE"; then
+      echo "  FAIL: kernel panic detected" | tee -a "$OUTFILE"
+      FAIL=$((FAIL + 1))
+    else
+      echo "  PASS: no kernel panic" | tee -a "$OUTFILE"
+      PASS=$((PASS + 1))
+    fi
+
+    # Check instruction count reached a reasonable level
+    LAST_TOTAL=$(grep -oP 'JIT: \K[0-9]+(?= total)' "$OUTFILE" | tail -1)
+    if [ -n "$LAST_TOTAL" ] && [ "$LAST_TOTAL" -gt 100000000 ] 2>/dev/null; then
+      echo "  PASS: reached ${LAST_TOTAL} instructions" | tee -a "$OUTFILE"
+      PASS=$((PASS + 1))
+    else
+      echo "  FAIL: instruction count too low (${LAST_TOTAL:-0})" | tee -a "$OUTFILE"
+      FAIL=$((FAIL + 1))
+    fi
+
+    echo "" | tee -a "$OUTFILE"
+    echo "Score: $PASS passed, $FAIL failed" | tee -a "$OUTFILE"
+
+    # Clean up overlay
+    rm -f scsi1.raw.overlay scsi2.raw.overlay
+
+    if [ "$FAIL" -gt 0 ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
   *)
     echo "Unknown mode: $MODE"
-    echo "Usage: $0 [jit|verify|nojit|interp|perf|perf-jit]"
+    echo "Usage: $0 [jit|verify|nojit|interp|perf|perf-jit|smoke]"
     exit 1
     ;;
 esac

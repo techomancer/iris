@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::mips_exec::{MipsExecutor, DecodedInstr, EXEC_BREAKPOINT, decode_into};
-use crate::mips_tlb::{Tlb, AccessType};
+use crate::mips_tlb::Tlb;
 use crate::mips_cache_v2::MipsCache;
 
 use super::cache::{BlockTier, CodeCache, TierConfig};
@@ -19,6 +19,7 @@ use super::context::{JitContext, EXIT_NORMAL, EXIT_EXCEPTION};
 use super::helpers::HelperPtrs;
 use super::profile::{self, ProfileEntry};
 use super::snapshot::CpuRollbackSnapshot;
+use super::trace::{TraceWriter, TraceRecord};
 
 const MAX_BLOCK_LEN: usize = 64;
 
@@ -146,6 +147,8 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     let mut ctx = JitContext::new();
     ctx.executor_ptr = exec_ptr as u64;
 
+    let mut trace_writer = TraceWriter::from_env();
+
     let mut total_jit_instrs: u64 = 0;
     let mut total_interp_steps: u64 = 0;
     let mut blocks_compiled: u64 = 0;
@@ -167,7 +170,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             if !instrs.is_empty() {
                 if let Some(mut block) = compiler.compile_block(&instrs, entry.virt_pc, tier) {
                     block.phys_addr = entry.phys_pc;
-                    cache.insert(entry.phys_pc, block);
+                    cache.insert(entry.phys_pc, entry.virt_pc, block);
                     blocks_compiled += 1;
                     profile_compiled += 1;
                 }
@@ -227,8 +230,9 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 }
             };
 
-            if let Some(block) = cache.lookup(phys_pc) {
+            if let Some(block) = cache.lookup(phys_pc, pc) {
                 probe.record_hit();
+
                 let block_len = block.len_mips;
                 let block_tier = block.tier;
                 let is_speculative = block.speculative;
@@ -265,7 +269,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 snap.restore(exec);
                                 rollbacks += 1;
 
-                                if let Some(block) = cache.lookup_mut(phys_pc) {
+                                if let Some(block) = cache.lookup_mut(phys_pc, pc) {
                                     block.hit_count += 1;
                                     block.exception_count += 1;
                                     block.stable_hits = 0;
@@ -396,35 +400,27 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         exec.core.cp0_count = prev.wrapping_add(count_advance);
                         if exec.core.cp0_compare.wrapping_sub(prev) <= count_advance {
                             exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                            exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
                         }
                         // Credit local_cycles so the stats display shows correct MHz
                         exec.core.local_cycles += n;
 
-                        // Check for pending interrupts — JIT blocks don't check per-
-                        // instruction like the interpreter does. If an external interrupt
-                        // arrived during the block, service it now via one interpreter step.
+                        // Merge external interrupt bits into cp0_cause so the
+                        // interpreter sees them on its next step. Don't call exec.step()
+                        // here — that would double-count cp0_count (the post-block
+                        // advancement above already accounted for all block instructions,
+                        // and step() would add yet another count_step tick per interrupt).
                         let pending = exec.core.interrupts.load(Ordering::Relaxed);
-                        if (pending | exec.core.cp0_cause as u64) != 0 {
-                            // Merge external IP bits (IP2-IP6) into Cause (same as step() does)
+                        if pending != 0 {
                             use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
                             let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
                             exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
                                 | (pending as u32 & ext_mask);
-                            if exec.core.interrupts_enabled() {
-                                let ip = exec.core.cp0_cause & crate::mips_core::CAUSE_IP_MASK;
-                                let im = exec.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
-                                if (ip & im) != 0 {
-                                    // Pending unmasked interrupt — let the interpreter handle it
-                                    exec.step();
-                                    total_interp_steps += 1;
-                                    steps_in_batch += 1;
-                                }
-                            }
                         }
                     }
 
                     // Update stats and check for promotion
-                    if let Some(block) = cache.lookup_mut(phys_pc) {
+                    if let Some(block) = cache.lookup_mut(phys_pc, pc) {
                         block.hit_count += 1;
                         block.stable_hits += 1;
                         block.exception_count = 0;
@@ -458,7 +454,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 if !instrs.is_empty() {
                     if let Some(mut block) = compiler.compile_block(&instrs, pc, BlockTier::Alu) {
                         block.phys_addr = phys_pc;
-                        cache.insert(phys_pc, block);
+                        cache.insert(phys_pc, pc, block);
                         blocks_compiled += 1;
                         probe.set_cache_size(cache.len() as u32);
                         if blocks_compiled <= 10 || blocks_compiled % 500 == 0 {
@@ -473,6 +469,28 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         {
             let exec = unsafe { &mut *exec_ptr };
             exec.flush_cycles();
+        }
+
+        // Write trace record at 100K instruction milestones.
+        // Both JIT and interpreter runs log at the same milestones so
+        // records align for offline comparison.
+        if let Some(tw) = &mut trace_writer {
+            let total = total_interp_steps + total_jit_instrs;
+            let prev_total = total.saturating_sub(BATCH_SIZE as u64);
+            let milestone = 100_000u64;
+            if total / milestone != prev_total / milestone {
+                let exec = unsafe { &*exec_ptr };
+                tw.write_record(&TraceRecord {
+                    insn_count: (total / milestone) * milestone,
+                    pc: exec.core.pc,
+                    cp0_count: exec.core.cp0_count,
+                    cp0_status: exec.core.cp0_status,
+                    cp0_cause: exec.core.cp0_cause,
+                    in_delay_slot: exec.in_delay_slot as u8,
+                    _pad: [0; 7],
+                    gpr_hash: TraceRecord::hash_gprs(&exec.core.gpr),
+                });
+            }
         }
 
         let total = total_interp_steps + total_jit_instrs;
@@ -504,7 +522,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     // Save profile: all blocks above Alu tier
     let profile_entries: Vec<ProfileEntry> = cache.iter()
         .filter(|(_, block)| block.tier > BlockTier::Alu)
-        .map(|(&phys_pc, block)| ProfileEntry {
+        .map(|(&(phys_pc, _virt_pc), block)| ProfileEntry {
             phys_pc,
             virt_pc: block.virt_addr,
             tier: block.tier,
@@ -531,7 +549,7 @@ fn recompile_block_at_tier<T: Tlb, C: MipsCache>(
     if !instrs.is_empty() {
         if let Some(mut block) = compiler.compile_block(&instrs, virt_pc, tier) {
             block.phys_addr = phys_pc;
-            cache.replace(phys_pc, block);
+            cache.replace(phys_pc, virt_pc, block);
             *blocks_compiled += 1;
         }
     }
@@ -541,6 +559,9 @@ fn interpreter_loop<T: Tlb, C: MipsCache>(
     exec: &mut MipsExecutor<T, C>,
     running: &AtomicBool,
 ) {
+    let mut trace_writer = TraceWriter::from_env();
+    let mut total_steps: u64 = 0;
+
     while running.load(Ordering::Relaxed) {
         #[cfg(feature = "lightning")]
         for _ in 0..1000 {
@@ -555,7 +576,25 @@ fn interpreter_loop<T: Tlb, C: MipsCache>(
                 break;
             }
         }
+        total_steps += 10000;
         exec.flush_cycles();
+
+        if let Some(tw) = &mut trace_writer {
+            let prev = total_steps.saturating_sub(10000);
+            let milestone = 100_000u64;
+            if total_steps / milestone != prev / milestone {
+                tw.write_record(&TraceRecord {
+                    insn_count: (total_steps / milestone) * milestone,
+                    pc: exec.core.pc,
+                    cp0_count: exec.core.cp0_count,
+                    cp0_status: exec.core.cp0_status,
+                    cp0_cause: exec.core.cp0_cause,
+                    in_delay_slot: exec.in_delay_slot as u8,
+                    _pad: [0; 7],
+                    gpr_hash: TraceRecord::hash_gprs(&exec.core.gpr),
+                });
+            }
+        }
     }
 }
 
@@ -563,7 +602,12 @@ fn translate_pc<T: Tlb, C: MipsCache>(
     exec: &mut MipsExecutor<T, C>,
     virt_pc: u64,
 ) -> Option<u64> {
-    let result = (exec.translate_fn)(exec, virt_pc, AccessType::Fetch);
+    // Use debug_translate (translate_impl::<true>) to avoid CP0 side effects.
+    // The non-debug path writes cp0_badvaddr, cp0_entryhi, cp0_context,
+    // cp0_xcontext on TLB miss — corrupting state that the next real TLB
+    // exception handler depends on. We only need the physical address for
+    // cache lookup; we don't want to touch CP0 state.
+    let result = exec.debug_translate(virt_pc);
     if result.is_exception() { None } else { Some(result.phys as u64) }
 }
 
