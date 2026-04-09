@@ -38,8 +38,10 @@ pub const GFIFO_DEPTH: usize = 65536;
 pub const GFIFO_HW_DEPTH: usize = 32;
 /// Special GFIFO command to trigger a GO without a register write.
 pub const GFIFO_PURE_GO: u32 = 0xFFFF_0800;
+/// GFIFO_PURE_GO with the GO bit stripped — the reg_offset seen by process_register.
+pub const GFIFO_PURE_GO_REG: u32 = GFIFO_PURE_GO & !0x0800;
 /// Special GFIFO command to signal the processor thread to exit.
-pub const GFIFO_EXIT: u32 = 0xFFFF_0000;
+pub const GFIFO_EXIT: u32 = 0xFFFF_0001;
 pub const REX3_COORD_BIAS: i32 = 4096; // Physical coordinate system offset.
 pub const REX3_SCREEN_WIDTH: i32 = 1344; // 1280 displayable + 64 off-screen.
 pub const REX3_SCREEN_HEIGHT: i32 = 1024; // Max displayable height.
@@ -2876,25 +2878,20 @@ impl Rex3 {
         loop {
             if let Ok(entry) = consumer.pop() {
                 backoff.reset();
-                if entry.addr == GFIFO_EXIT {
-                    break;
-                }
 
-                let is_go      = entry.addr & 0x0800 != 0;
-                let is_pure_go = entry.addr == GFIFO_PURE_GO;
-
-                if !is_pure_go {
-                    // Strip GO bit only; keep is_64bit (bit 0) for HOSTRW discrimination.
-                    let reg_offset = entry.addr & !0x0800;
-                    self.process_register(reg_offset, entry.val);
+                let is_go = entry.addr & 0x0800 != 0;
+                // Strip GO bit only; keep is_64bit (bit 0) for HOSTRW discrimination.
+                // process_register handles GFIFO_EXIT/GFIFO_PURE_GO sentinels directly.
+                let reg_offset = entry.addr & !0x0800;
+                if self.process_register(reg_offset, entry.val) {
+                    break; // GFIFO_EXIT
                 }
 
                 // Log to rex3_log after processing.
                 if let Some(f) = self.rex3_log.lock().as_mut() {
-                    if is_pure_go {
+                    if entry.addr == GFIFO_PURE_GO {
                         let _ = writeln!(f, "------- PURE_GO -------");
                     } else {
-                        let reg_offset = entry.addr & !0x0800;
                         let val32 = entry.val as u32;
                         let extra = match reg_offset {
                             REX3_DRAWMODE0 => format!("  ; {}", decode_dm0(val32)),
@@ -3365,13 +3362,22 @@ impl Rex3 {
     }
 
     /// Returns `true` if the register offset was recognized and updated state.
+    /// Process a register write from the GFIFO consumer.
+    /// `reg_offset` is `entry.addr & !0x0800` (GO bit stripped; is_64bit bit kept).
+    /// Returns `true` if the consumer loop should exit (GFIFO_EXIT sentinel received).
+    #[inline(always)]
     pub(crate) fn process_register(&self, reg_offset: u32, val64: u64) -> bool {
         let ctx = unsafe { &mut *self.context.get() };
         let val = val64 as u32;
         dlog_dev!(LogModule::Rex3, "REX3 Process: Offset {:04x} ({}) Val {:08x}", reg_offset, rex3_reg_name(reg_offset), val);
 
-        let mut matched = true;
+        let mut exit = false;
         match reg_offset {
+            // EXIT sentinel: signal the consumer loop to stop.
+            GFIFO_EXIT => { exit = true; }
+            // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is
+            // triggered by the GO bit in the loop.
+            GFIFO_PURE_GO_REG => {}
             // HOSTRW: store data port value; reset shift so the draw picks up pixels from MSB.
             // The actual draw/read is triggered by execute_go() when entry.go is set.
             // 64-bit write (REX3_HOSTRW0_64 = 0x0231): store full val64 directly.
@@ -3493,10 +3499,9 @@ impl Rex3 {
             REX3_CLIPMODE => ctx.clipmode = val,
             _ => {
                 eprintln!("REX3 Write: unhandled reg {:04x} ({}), val {:08x}", reg_offset, rex3_reg_name(reg_offset), val);
-                matched = false;
             }
         }
-        matched
+        exit
     }
 
     pub fn save_framebuffers(&self, dir: &std::path::Path) -> std::io::Result<()> {
