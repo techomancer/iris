@@ -42,6 +42,10 @@ pub const GFIFO_PURE_GO: u32 = 0xFFFF_0800;
 pub const GFIFO_PURE_GO_REG: u32 = GFIFO_PURE_GO & !0x0800;
 /// Special GFIFO command to signal the processor thread to exit.
 pub const GFIFO_EXIT: u32 = 0xFFFF_0001;
+/// Special GFIFO command: signals the display thread that all prior draws are done.
+/// Consumer advances gfifo_fence to the payload value when it processes this entry.
+/// No GO bit set, so process_register receives this value directly as reg_offset.
+pub const GFIFO_DISP_SYNC: u32 = 0xFFFF_0002;
 pub const REX3_COORD_BIAS: i32 = 4096; // Physical coordinate system offset.
 pub const REX3_SCREEN_WIDTH: i32 = 1344; // 1280 displayable + 64 off-screen.
 pub const REX3_SCREEN_HEIGHT: i32 = 1024; // Max displayable height.
@@ -810,8 +814,8 @@ impl Rex3Context {
 
 pub struct Rex3Config {
     pub config: AtomicU32,
-    /// VRINT bit written by refresh thread, cleared on STATUS read by CPU thread.
-    /// Benign race: worst case a VRINT is missed or double-cleared.
+    /// VRINT bit set by refresh thread on vblank assert, cleared when CPU reads STATUS.
+    /// Interrupt line follows: cb(true) on assert, cb(false) on STATUS read.
     pub status: AtomicU32,
 }
 
@@ -931,6 +935,12 @@ pub struct Rex3 {
     pub refresh_thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub screen: Arc<Mutex<Rex3Screen>>,
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
+    /// Payload of GFIFO_DISP_SYNC pushed to the GFIFO on each such write.
+    pub xmap_fence: AtomicU32,
+    /// Written by the GFIFO consumer when it processes GFIFO_DISP_SYNC.
+    /// Display thread spins until gfifo_fence >= sampled xmap_fence (wrapping).
+    pub gfifo_fence: AtomicU32,
     pub debug: Arc<AtomicBool>,
     pub block_debug: Arc<AtomicBool>,
     pub draw_debug: Arc<AtomicBool>,
@@ -1077,6 +1087,8 @@ impl Rex3 {
             refresh_thread: Mutex::new(None),
             screen,
             vblank_cb: Mutex::new(None),
+            xmap_fence: AtomicU32::new(0),
+            gfifo_fence: AtomicU32::new(0),
             debug: Arc::new(AtomicBool::new(false)),
             block_debug: Arc::new(AtomicBool::new(false)),
             draw_debug: Arc::new(AtomicBool::new(false)),
@@ -2491,6 +2503,12 @@ impl Rex3 {
                 let write_xmap = |crs: u8, v: u32| {
                     if addr == 4 || addr == 5 { self.xmap0.lock().write_crs(crs, v); }
                     if addr == 4 || addr == 6 { self.xmap1.lock().write_crs(crs, v); }
+                    // Mode table write (CRS 5) = buf_sel flip: push a DISP_SYNC fence
+                    // so the display thread waits for all prior draws before snapshotting.
+                    if crs == crate::xmap9::XMAP9_REG_MODE_TABLE_WRITE {
+                        let fence = self.xmap_fence.fetch_add(1, Ordering::Relaxed) + 1;
+                        self.gfifo_push(GFIFOEntry { addr: GFIFO_DISP_SYNC, val: fence as u64 });
+                    }
                 };
                 match data_width {
                     DCBMODE_DATAWIDTH_1 => { write_xmap(dcb.inc_crs(1), val & 0xFF); }
@@ -3262,7 +3280,27 @@ impl Rex3 {
                 count_step:   self.count_step_atomic.lock().load(Ordering::Relaxed),
                 #[cfg(not(feature = "developer"))]
                 count_step:   0,
+                gfifo_pending: self.gfifo_pending.load(Ordering::Relaxed),
             };
+
+            // Fence-based sync: wait until the GFIFO consumer has processed every
+            // GFIFO_DISP_SYNC pushed since the last frame.  Each XMAP mode table
+            // write increments xmap_fence and enqueues GFIFO_DISP_SYNC; the consumer
+            // advances gfifo_fence to match.  If no mode table writes happened this
+            // frame the fences are already equal and we fall through immediately —
+            // no stall on static scenes.
+            {
+                let target = self.xmap_fence.load(Ordering::Acquire);
+                let backoff = crossbeam_utils::Backoff::new();
+                loop {
+                    let current = self.gfifo_fence.load(Ordering::Acquire);
+                    // Wrapping comparison: current >= target
+                    if current.wrapping_sub(target) < 0x8000_0000 {
+                        break;
+                    }
+                    backoff.snooze();
+                }
+            }
 
             // Get unsafe access to framebuffers and context
             let fb_rgb = unsafe { &*self.fb_rgb.get() };
@@ -3295,6 +3333,24 @@ impl Rex3 {
                     &mut *renderer,
                     &self.diag,
                 );
+
+                // Pixel data is now copied into screen.rgba — assert VBLANK here so
+                // the CPU gets the maximum window (GL upload + sleep) to react before
+                // the next refresh() reads the framebuffer again.
+                self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
+                {
+                    self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
+                    let mut vc2 = self.vc2.lock();
+                    vc2.regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
+                    drop(vc2);
+                    self.diag.fetch_and(!Self::DIAG_LOCK_VC2, Ordering::Relaxed);
+                }
+                {
+                    self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
+                    let cb = self.vblank_cb.lock().clone();
+                    self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
+                    if let Some(cb) = cb { cb(true); }
+                }
 
                 let height = screen.height;
                 let width  = screen.width;
@@ -3329,34 +3385,12 @@ impl Rex3 {
                 thread::sleep(frame_duration - elapsed);
             }
 
-            // Assert VBLANK
-            self.config.status.fetch_or(STATUS_VRINT, Ordering::Relaxed);
-
-            // Update VC2 Working Cursor Y (at VBLANK)
-            {
-                self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
-                let mut vc2 = self.vc2.lock();
-                vc2.regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
-                drop(vc2);
-                self.diag.fetch_and(!Self::DIAG_LOCK_VC2, Ordering::Relaxed);
-            }
-
-            // Trigger Interrupt
-            {
-                self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                let cb = self.vblank_cb.lock().clone();
-                self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                if let Some(cb) = cb { cb(true); }
-            }
-
-            thread::sleep(std::time::Duration::from_millis(1));
-
-            self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed);
-            {
-                self.diag.fetch_or(Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                let cb = self.vblank_cb.lock().clone();
-                self.diag.fetch_and(!Self::DIAG_LOCK_VBLANK_CB, Ordering::Relaxed);
-                if let Some(cb) = cb { cb(false); }
+            // Sleep out the remainder of the frame. VBLANK stays asserted until
+            // the CPU reads STATUS, which clears STATUS_VRINT and deasserts the
+            // interrupt line (matching MAME newport behaviour).
+            let elapsed = start.elapsed();
+            if elapsed < frame_duration {
+                thread::sleep(frame_duration - elapsed);
             }
         }
     }
@@ -3375,6 +3409,11 @@ impl Rex3 {
         match reg_offset {
             // EXIT sentinel: signal the consumer loop to stop.
             GFIFO_EXIT => { exit = true; }
+            // DISP_SYNC sentinel: all prior draws are done — advance the fence.
+            // Display thread spins on gfifo_fence >= sampled xmap_fence.
+            GFIFO_DISP_SYNC => {
+                self.gfifo_fence.store(val64 as u32, Ordering::Release);
+            }
             // PURE_GO sentinel (GO-only, no register write): no-op here; execute_go() is
             // triggered by the GO bit in the loop.
             GFIFO_PURE_GO_REG => {}
@@ -4066,8 +4105,13 @@ impl BusDevice for Rex3 {
                 val |= (level << STATUS_GFIFOLEVEL_SHIFT) & STATUS_GFIFOLEVEL_MASK;
 
                 if reg_offset == REX3_STATUS {
-                    // Clear VRINT on read (benign race with refresh thread's set).
-                    self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed);
+                    // Clear VRINT on read and deassert interrupt line — matching MAME:
+                    // interrupt stays asserted until STATUS is read, not on a timer.
+                    let had_vrint = self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed) & STATUS_VRINT != 0;
+                    if had_vrint {
+                        let cb = self.vblank_cb.lock().clone();
+                        if let Some(cb) = cb { cb(false); }
+                    }
                     // backbusy_until is in dcb, CPU-thread-only — no lock needed.
                     let dcb = self.dcb.lock();
                     if let Some(until) = dcb.backbusy_until {
