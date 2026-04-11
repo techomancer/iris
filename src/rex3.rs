@@ -1,9 +1,8 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
-use spin::Mutex as SpinMutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use rtrb::{Consumer, Producer, RingBuffer};
+use crossbeam_utils::CachePadded;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog_is_active, devlog};
 use crate::snapshot::{get_field, u32_slice_to_toml, u16_slice_to_toml, load_u32_slice, load_u16_slice, toml_u32, toml_u64, hex_u32, hex_u64};
@@ -873,14 +872,121 @@ impl Default for Rex3DcbState {
 /// Special sentinel: `GFIFO_PURE_GO` encodes a "pure GO" — no register update,
 /// just trigger `execute_go()`.  The reg_offset is not a real register so
 /// `process_register` hits the `_ => {}` arm and is a no-op.
-
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// `ready` is set by the producer after writing `addr`/`val`, and cleared by the
+/// consumer after reading. It guards concurrent access in the MPSC ring buffer.
 pub struct GFIFOEntry {
     /// Raw bus offset with GO bit (0x800) and is_64bit bit (0x001) encoded.
-    pub addr: u32,
+    addr: UnsafeCell<u32>,
     /// Register value (low 32 bits for 32-bit writes; full 64 bits for 64-bit HOSTRW).
-    pub val: u64,
+    val:  UnsafeCell<u64>,
+    /// Set by producer after writing addr/val; cleared by consumer after reading.
+    ready: AtomicBool,
 }
+
+impl GFIFOEntry {
+    const fn new() -> Self {
+        GFIFOEntry { addr: UnsafeCell::new(0), val: UnsafeCell::new(0), ready: AtomicBool::new(false) }
+    }
+}
+
+// SAFETY: addr/val are only accessed under the ready handshake; AtomicBool is Sync.
+unsafe impl Sync for GFIFOEntry {}
+
+/// Lock-free MPSC ring buffer for the GFIFO.
+///
+/// Multiple producers (CPU thread, VDMA thread) claim slots via CAS on `tail`.
+/// Single consumer (painter thread) advances `head`.
+/// head and tail are on separate cache lines to avoid false sharing.
+/// Capacity is `GFIFO_DEPTH` entries; the buffer holds at most `GFIFO_DEPTH - 1`
+/// live entries (one slot is always reserved to distinguish full from empty).
+pub struct GFifo {
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
+    buf:  [GFIFOEntry; GFIFO_DEPTH],
+}
+
+const GFIFO_MASK: usize = GFIFO_DEPTH - 1;
+
+impl GFifo {
+    pub fn new() -> Self {
+        // SAFETY: GFifo is always heap-allocated (inside Rex3 behind Arc, or Arc<GFifo> in tests).
+        // Initializing ready to false via zeroed is valid — AtomicBool(false) == 0.
+        // UnsafeCell<u32/u64> fields are written before read, so zero init is fine.
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// Returns the approximate number of entries currently in the queue.
+    #[inline]
+    pub fn len(&self) -> usize {
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
+        tail.wrapping_sub(head) & GFIFO_MASK
+    }
+
+    /// Push an entry. Spins if the buffer is full. Safe to call from multiple producers.
+    #[inline]
+    pub fn push(&self, addr: u32, val: u64) {
+        loop {
+            let tail = self.tail.load(Ordering::Relaxed);
+            let next_tail = tail.wrapping_add(1) & GFIFO_MASK;
+            // Full when next_tail == head — spin and retry.
+            if next_tail == self.head.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+                continue;
+            }
+            // Atomically claim this slot. On failure another producer got it first — retry.
+            if self.tail.compare_exchange_weak(tail, next_tail, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                std::hint::spin_loop();
+                continue;
+            }
+            // Slot is ours. Write addr/val then mark ready for the consumer.
+            let slot = &self.buf[tail];
+            unsafe {
+                slot.addr.get().write(addr);
+                slot.val.get().write(val);
+            }
+            slot.ready.store(true, Ordering::Release);
+            return;
+        }
+    }
+
+    /// Peek at the next entry without advancing head. Returns `None` if empty.
+    /// Must be called from the consumer thread only.
+    #[inline]
+    pub fn peek(&self) -> Option<(u32, u64)> {
+        let head = self.head.load(Ordering::Relaxed);
+        if head == self.tail.load(Ordering::Acquire) {
+            return None;
+        }
+        // Spin until the producer at this slot has finished writing.
+        let slot = &self.buf[head];
+        while !slot.ready.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let addr = unsafe { slot.addr.get().read() };
+        let val  = unsafe { slot.val.get().read() };
+        Some((addr, val))
+    }
+
+    /// Advance head past the current entry after it has been processed.
+    /// Must be paired with a preceding successful `peek()`.
+    #[inline]
+    pub fn consume(&self) {
+        let head = self.head.load(Ordering::Relaxed);
+        self.buf[head].ready.store(false, Ordering::Release);
+        self.head.store(head.wrapping_add(1) & GFIFO_MASK, Ordering::Release);
+    }
+
+    /// True when no entries are pending.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+}
+
+unsafe impl Send for GFifo {}
+unsafe impl Sync for GFifo {}
 
 #[derive(Default)]
 struct DebugState {
@@ -919,8 +1025,7 @@ pub struct Rex3 {
     pub host_pack: UnsafeCell<fn(u64, u32) -> u64>,
     pub host_shift: UnsafeCell<u32>,
     pub host_count: UnsafeCell<u32>,
-    pub gfifo_producer: SpinMutex<Producer<GFIFOEntry>>,
-    pub gfifo_consumer: Mutex<Option<Consumer<GFIFOEntry>>>,
+    pub gfifo: GFifo,
 
     pub vc2: Mutex<Vc2>,
     pub xmap0: Mutex<Xmap9>,
@@ -931,7 +1036,7 @@ pub struct Rex3 {
     clock: AtomicU64,
     running: AtomicBool,
     pub gfxbusy: Arc<AtomicBool>,
-    pub processor_thread: Mutex<Option<thread::JoinHandle<Consumer<GFIFOEntry>>>>,
+    pub processor_thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub refresh_thread: Mutex<Option<thread::JoinHandle<()>>>,
     pub screen: Arc<Mutex<Rex3Screen>>,
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
@@ -945,7 +1050,6 @@ pub struct Rex3 {
     pub block_debug: Arc<AtomicBool>,
     pub draw_debug: Arc<AtomicBool>,
     pub draw_ring: Arc<Mutex<DrawRingBuf>>,
-    pub gfifo_pending: AtomicUsize,
     #[cfg(feature = "developer")]
     pub gfifo_hwm: AtomicUsize,
     pub hostrw: AtomicU64,
@@ -1001,8 +1105,6 @@ unsafe impl Sync for Rex3 {}
 
 impl Rex3 {
     pub fn new(heartbeat: Arc<AtomicU64>, cycles: Arc<AtomicU64>, fasttick_count: Arc<AtomicU64>, decoded_count: Arc<AtomicU64>, l1i_hit_count: Arc<AtomicU64>, l1i_fetch_count: Arc<AtomicU64>, uncached_fetch_count: Arc<AtomicU64>) -> Self {
-        let (producer, consumer) = RingBuffer::new(GFIFO_DEPTH);
-
         let config = Rex3Config::default();
         config.config.store(CONFIG_BUSWIDTH | CONFIG_EXTREGXCVR |
                         (8 << CONFIG_BFIFODEPTH_SHIFT) |
@@ -1072,8 +1174,7 @@ impl Rex3 {
             host_pack: UnsafeCell::new(Self::host_pack_nop),
             host_shift: UnsafeCell::new(0),
             host_count: UnsafeCell::new(0),
-            gfifo_producer: SpinMutex::new(producer),
-            gfifo_consumer: Mutex::new(Some(consumer)),
+            gfifo: GFifo::new(),
             vc2: Mutex::new(Vc2::new()),
             xmap0: Mutex::new(Xmap9::new()),
             xmap1: Mutex::new(Xmap9::new()),
@@ -1093,7 +1194,6 @@ impl Rex3 {
             block_debug: Arc::new(AtomicBool::new(false)),
             draw_debug: Arc::new(AtomicBool::new(false)),
             draw_ring: Arc::new(Mutex::new(DrawRingBuf::default())),
-            gfifo_pending: AtomicUsize::new(0),
             #[cfg(feature = "developer")]
             gfifo_hwm: AtomicUsize::new(0),
             hostrw: AtomicU64::new(0),
@@ -1146,7 +1246,6 @@ impl Rex3 {
     pub const DIAG_LOCK_SCREEN:       u64 = 1 << 6;
     pub const DIAG_LOCK_RENDERER:     u64 = 1 << 7;
     pub const DIAG_LOCK_VBLANK_CB:    u64 = 1 << 8;
-    pub const DIAG_LOCK_GFIFO_PROD:   u64 = 1 << 9;
     pub const DIAG_LOCK_DEBUG_STATE:  u64 = 1 << 11;
     pub const DIAG_LOCK_DCB:          u64 = 1 << 12;
     // Loop/section bits (set for the duration of a significant section)
@@ -2507,7 +2606,7 @@ impl Rex3 {
                     // so the display thread waits for all prior draws before snapshotting.
                     if crs == crate::xmap9::XMAP9_REG_MODE_TABLE_WRITE {
                         let fence = self.xmap_fence.fetch_add(1, Ordering::Relaxed) + 1;
-                        self.gfifo_push(GFIFOEntry { addr: GFIFO_DISP_SYNC, val: fence as u64 });
+                        self.gfifo_push(GFIFO_DISP_SYNC, fence as u64);
                     }
                 };
                 match data_width {
@@ -2772,33 +2871,22 @@ impl Rex3 {
 
     fn write_nop(_rex: &Rex3, _addr: u32, _val: u32) {}
 
-    fn gfifo_push(&self, entry: GFIFOEntry) {
-        let pending = self.gfifo_pending.fetch_add(1, Ordering::SeqCst) + 1;
+    fn gfifo_push(&self, addr: u32, val: u64) {
         #[cfg(feature = "developer")]
-        let _ = self.gfifo_hwm.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
-            if pending > hwm { Some(pending) } else { None }
-        });
-        #[cfg(not(feature = "developer"))]
-        let _ = pending;
-        // Hold the producer lock for the entire retry loop — dropping and
-        // re-acquiring between retries lets another caller interleave its own
-        // push and break write ordering for multi-entry sequences.
-        let mut producer = self.gfifo_producer.lock();
-        loop {
-            if producer.push(entry).is_ok() {
-                return;
-            }
-            // Buffer full — consumer is spinning and will drain it; just yield.
-            std::hint::spin_loop();
+        {
+            let len = self.gfifo.len() + 1;
+            let _ = self.gfifo_hwm.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
+                if len > hwm { Some(len) } else { None }
+            });
         }
+        self.gfifo.push(addr, val);
     }
 
     fn wait_idle(&self) {
         loop {
             // Acquire load: when gfxbusy goes false, all execute_go() writes become visible.
             let busy = self.gfxbusy.load(Ordering::Acquire);
-            let pending = self.gfifo_pending.load(Ordering::Relaxed);
-            if !busy && pending == 0 { break; }
+            if !busy && self.gfifo.is_empty() { break; }
             if !self.running.load(Ordering::Relaxed) { break; }
             std::hint::spin_loop();
         }
@@ -2891,26 +2979,24 @@ impl Rex3 {
         Some((y_phys as u32) * 2048 + (x_phys as u32))
     }
 
-    fn register_processor(&self, mut consumer: Consumer<GFIFOEntry>) -> Consumer<GFIFOEntry> {
+    fn register_processor(&self) {
         let backoff = crossbeam_utils::Backoff::new();
         loop {
-            if let Ok(entry) = consumer.pop() {
+            if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
 
-                let is_go = entry.addr & 0x0800 != 0;
+                let is_go = addr & 0x0800 != 0;
                 // Strip GO bit only; keep is_64bit (bit 0) for HOSTRW discrimination.
                 // process_register handles GFIFO_EXIT/GFIFO_PURE_GO sentinels directly.
-                let reg_offset = entry.addr & !0x0800;
-                if self.process_register(reg_offset, entry.val) {
-                    break; // GFIFO_EXIT
-                }
+                let reg_offset = addr & !0x0800;
+                let exit = self.process_register(reg_offset, val);
 
                 // Log to rex3_log after processing.
                 if let Some(f) = self.rex3_log.lock().as_mut() {
-                    if entry.addr == GFIFO_PURE_GO {
+                    if addr == GFIFO_PURE_GO {
                         let _ = writeln!(f, "------- PURE_GO -------");
                     } else {
-                        let val32 = entry.val as u32;
+                        let val32 = val as u32;
                         let extra = match reg_offset {
                             REX3_DRAWMODE0 => format!("  ; {}", decode_dm0(val32)),
                             REX3_DRAWMODE1 => format!("  ; {}", decode_dm1(val32)),
@@ -2918,13 +3004,18 @@ impl Rex3 {
                         };
                         if is_go {
                             let _ = writeln!(f, "------- GO reg={:04x}({}) val={:016x}{} -------",
-                                reg_offset, rex3_reg_name(reg_offset), entry.val, extra);
+                                reg_offset, rex3_reg_name(reg_offset), val, extra);
                         } else {
                             let _ = writeln!(f, "reg={:04x}({}) val={:016x}{}",
-                                reg_offset, rex3_reg_name(reg_offset), entry.val, extra);
+                                reg_offset, rex3_reg_name(reg_offset), val, extra);
                         }
                     }
                 }
+
+                // Advance head now — entry is fully processed and visible to the CPU thread.
+                self.gfifo.consume();
+
+                if exit { break; } // GFIFO_EXIT
 
                 if is_go {
                     self.gfxbusy.store(true, Ordering::Relaxed);
@@ -2934,15 +3025,12 @@ impl Rex3 {
                     // and STATUS read on the CPU thread).
                     self.gfxbusy.store(false, Ordering::Release);
                 }
-
-                self.gfifo_pending.fetch_sub(1, Ordering::SeqCst);
             } else {
                 // Nothing in the ring — back off. Starts with spin_loop() hints,
                 // graduates to thread::yield_now() after sustained emptiness.
                 backoff.snooze();
             }
         }
-        consumer
     }
 
     pub(crate) fn execute_go(&self) {
@@ -3280,7 +3368,7 @@ impl Rex3 {
                 count_step:   self.count_step_atomic.lock().load(Ordering::Relaxed),
                 #[cfg(not(feature = "developer"))]
                 count_step:   0,
-                gfifo_pending: self.gfifo_pending.load(Ordering::Relaxed),
+                gfifo_pending: self.gfifo.len(),
             };
 
             // Fence-based sync: wait until the GFIFO consumer has processed every
@@ -3592,10 +3680,6 @@ impl Rex3 {
         let r = self.clone();
         register_lock_fn("rex3::dcb",              move || r.dcb.is_locked());
         let r = self.clone();
-        register_lock_fn("rex3::gfifo_producer",   move || r.gfifo_producer.is_locked());
-        let r = self.clone();
-        register_lock_fn("rex3::gfifo_consumer",   move || r.gfifo_consumer.is_locked());
-        let r = self.clone();
         register_lock_fn("rex3::vc2",              move || r.vc2.is_locked());
         let r = self.clone();
         register_lock_fn("rex3::xmap0",            move || r.xmap0.is_locked());
@@ -3628,12 +3712,10 @@ impl Device for Rex3 {
         self.running.store(false, Ordering::SeqCst);
 
         // Send exit command to ensure processor thread wakes up and terminates.
-        self.gfifo_push(GFIFOEntry { addr: GFIFO_EXIT, val: 0 });
+        self.gfifo_push(GFIFO_EXIT, 0);
 
         if let Some(handle) = self.processor_thread.lock().take() {
-            if let Ok(consumer) = handle.join() {
-                *self.gfifo_consumer.lock() = Some(consumer);
-            }
+            let _ = handle.join();
         }
 
         #[cfg(feature = "rex-jit")]
@@ -3657,14 +3739,10 @@ impl Device for Rex3 {
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
 
-        let mut cons_guard = self.gfifo_consumer.lock();
-        let consumer = cons_guard.take().expect("GFIFO consumer missing");
-        drop(cons_guard);
-
         let rex3 = unsafe { std::mem::transmute::<&Rex3, &'static Rex3>(self) };
 
         *self.processor_thread.lock() = Some(thread::Builder::new().name("REX3-Processor".to_string()).spawn(move || {
-            rex3.register_processor(consumer)
+            rex3.register_processor()
         }).unwrap());
 
         *self.refresh_thread.lock() = Some(thread::Builder::new().name("REX3-Refresh".to_string()).spawn(move || {
@@ -3742,10 +3820,9 @@ impl Device for Rex3 {
                 self.config.status.load(Ordering::Relaxed),
                 self.config.config.load(Ordering::Relaxed)).unwrap();
             let gfxbusy = self.gfxbusy.load(Ordering::Relaxed);
-            let gfifo_pending = self.gfifo_pending.load(Ordering::Relaxed);
             writeln!(writer, "DRAW BUSY : {}  GFIFO : {}/{} entries used",
                 if gfxbusy { "YES" } else { "no" },
-                gfifo_pending, GFIFO_DEPTH).unwrap();
+                self.gfifo.len(), GFIFO_DEPTH).unwrap();
             let jit_go   = self.jit_go_count.load(Ordering::Relaxed);
             let interp_go = self.interp_go_count.load(Ordering::Relaxed);
             let total_go  = jit_go + interp_go;
@@ -3782,7 +3859,6 @@ impl Device for Rex3 {
                 (Self::DIAG_LOCK_SCREEN,      "screen"),
                 (Self::DIAG_LOCK_RENDERER,    "renderer"),
                 (Self::DIAG_LOCK_VBLANK_CB,   "vblank_cb"),
-                (Self::DIAG_LOCK_GFIFO_PROD,  "gfifo_prod"),
                 (Self::DIAG_LOCK_DEBUG_STATE, "debug_state"),
                 (Self::DIAG_LOCK_DCB,         "dcb"),
             ];
@@ -3810,7 +3886,7 @@ impl Device for Rex3 {
             writeln!(writer).unwrap();
             writeln!(writer, "  gfxbusy={} gfifo_pending={}",
                 self.gfxbusy.load(Ordering::Relaxed),
-                self.gfifo_pending.load(Ordering::Relaxed)).unwrap();
+                self.gfifo.len()).unwrap();
             return Ok(());
         }
 
@@ -4061,7 +4137,7 @@ impl BusDevice for Rex3 {
         //           trigger processing of the next pixel batch.
         if reg_offset == REX3_HOSTRW0 || reg_offset == REX3_HOSTRW1 {
             let is_go = (offset & 0x0800) != 0;
-            if self.gfxbusy.load(Ordering::Acquire) || self.gfifo_pending.load(Ordering::Relaxed) > 0 {
+            if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                 return BusRead32::busy();
             }
             let full = self.hostrw.load(Ordering::Relaxed);
@@ -4071,7 +4147,7 @@ impl BusDevice for Rex3 {
                 full as u32
             };
             if is_go {
-                self.gfifo_push(GFIFOEntry { addr: GFIFO_PURE_GO, val: 0 });
+                self.gfifo_push(GFIFO_PURE_GO, 0);
             }
             return BusRead32::ok(val);
         }
@@ -4084,7 +4160,7 @@ impl BusDevice for Rex3 {
                 val |= 3 << STATUS_VERSION_SHIFT; // REX3 version=3 (Newport XL24)
                 // gfxbusy: Acquire load — pairs with Release store(false) in draw loop,
                 // ensuring all context register writes by the draw thread are visible to us.
-                let pending = self.gfifo_pending.load(Ordering::Relaxed);
+                let pending = self.gfifo.len();
                 if self.gfxbusy.load(Ordering::Acquire) || pending > 0 {
                     val |= STATUS_GFXBUSY;
                 } else {
@@ -4145,7 +4221,7 @@ impl BusDevice for Rex3 {
                 _ => {
                     // Context registers: stall (GRXDLY) until pipeline idle, modelled as EXEC_RETRY.
                     // This lets cp0_count advance and interrupts fire between retries.
-                    if self.gfxbusy.load(Ordering::Acquire) || self.gfifo_pending.load(Ordering::Relaxed) > 0 {
+                    if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                         return BusRead32::busy();
                     }
                     let context = unsafe { &*self.context.get() };
@@ -4259,7 +4335,7 @@ impl BusDevice for Rex3 {
 
         // GO bit on a non-HOSTRW read still triggers a draw (HOSTRW handled above).
         if (offset & 0x0800) != 0 {
-            self.gfifo_push(GFIFOEntry { addr: GFIFO_PURE_GO, val: 0 });
+            self.gfifo_push(GFIFO_PURE_GO, 0);
         }
 
         result
@@ -4372,7 +4448,7 @@ impl BusDevice for Rex3 {
         // HOSTRW: route through GFIFO so the draw thread sees it in order.
         // 32-bit write: val64=val zero-extended. GO write triggers draw; SET write just loads.
         if is_hostrw {
-            self.gfifo_push(GFIFOEntry { addr: offset, val: val as u64 });
+            self.gfifo_push(offset, val as u64);
             return BUS_OK;
         }
 
@@ -4399,12 +4475,12 @@ impl BusDevice for Rex3 {
                 REX3_DCBRESET => { *self.dcb.lock() = Rex3DcbState::default(); }
                 _ => {}
             }
-            if is_go { self.gfifo_push(GFIFOEntry { addr: GFIFO_PURE_GO, val: 0 }); }
+            if is_go { self.gfifo_push(GFIFO_PURE_GO, 0); }
             return BUS_OK;
         }
 
         // Pack into GFIFO
-        self.gfifo_push(GFIFOEntry { addr: offset, val: val as u64 });
+        self.gfifo_push(offset, val as u64);
 
         BUS_OK
     }
@@ -4419,13 +4495,13 @@ impl BusDevice for Rex3 {
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
         if reg_offset64r == REX3_HOSTRW0 {
-            if self.gfxbusy.load(Ordering::Acquire) || self.gfifo_pending.load(Ordering::Relaxed) > 0 {
+            if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                 return BusRead64::busy();
             }
             let val = self.hostrw.load(Ordering::Relaxed);
             if is_go64r {
                 // Enqueue a pure-go entry: no register update, just trigger next pixel batch.
-                self.gfifo_push(GFIFOEntry { addr: GFIFO_PURE_GO, val: 0 });
+                self.gfifo_push(GFIFO_PURE_GO, 0);
             }
             return BusRead64::ok(val);
         }
@@ -4450,7 +4526,7 @@ impl BusDevice for Rex3 {
         if reg_offset64 == REX3_HOSTRW0 {
             // Encode as REX3_HOSTRW64 (0x0231) + GO bit if present.
             // addr bit 0 = is_64bit, bit 11 = GO.
-            self.gfifo_push(GFIFOEntry { addr: REX3_HOSTRW64 | (offset & 0x0800), val });
+            self.gfifo_push(REX3_HOSTRW64 | (offset & 0x0800), val);
             return BUS_OK;
         }
 

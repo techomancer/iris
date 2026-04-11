@@ -3200,3 +3200,109 @@ mod jit_tests {
             "RGB24 HOSTR JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// GFifo ring buffer tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod gfifo_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Helper: construct a standalone GFifo (not attached to a Rex3).
+    /// Uses Box::new directly to avoid materializing the ~3MB struct on the stack.
+    fn make_gfifo() -> Arc<GFifo> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<GFifo>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut GFifo;
+            Arc::from_raw(ptr)
+        }
+    }
+
+    /// SPSC: one producer thread pushes N items, one consumer thread pops them.
+    /// Verifies ordering, value integrity, and that the queue drains completely.
+    #[test]
+    fn gfifo_spsc() {
+        const N: u64 = 4096;
+        let q = make_gfifo();
+
+        let qp = q.clone();
+        let producer = thread::spawn(move || {
+            for i in 0..N {
+                qp.push(i as u32, i.wrapping_mul(0xDEAD_BEEF_0000_0001));
+            }
+        });
+
+        let qc = q.clone();
+        let consumer = thread::spawn(move || {
+            let mut received = 0u64;
+            while received < N {
+                if let Some((addr, val)) = qc.peek().map(|e| { qc.consume(); e }) {
+                    assert_eq!(addr as u64, received,
+                        "wrong addr at position {received}: got {addr}");
+                    assert_eq!(val, received.wrapping_mul(0xDEAD_BEEF_0000_0001),
+                        "wrong val at position {received}: got {val:#x}");
+                    received += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            // Queue must be empty after draining all items.
+            assert!(qc.is_empty(), "queue not empty after full drain");
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    }
+
+    /// MPSC: multiple producer threads push disjoint ranges; one consumer collects
+    /// all values and verifies every expected value arrived exactly once.
+    #[test]
+    fn gfifo_mpsc() {
+        const PRODUCERS: u32 = 4;
+        const PER_PRODUCER: u32 = 1024;
+        const TOTAL: u32 = PRODUCERS * PER_PRODUCER;
+
+        let q = make_gfifo();
+
+        // Each producer pushes addr = producer_id * PER_PRODUCER + i, val = addr as u64.
+        let producers: Vec<_> = (0..PRODUCERS).map(|pid| {
+            let qp = q.clone();
+            thread::spawn(move || {
+                let base = pid * PER_PRODUCER;
+                for i in 0..PER_PRODUCER {
+                    let v = base + i;
+                    qp.push(v, v as u64);
+                }
+            })
+        }).collect();
+
+        let qc = q.clone();
+        let consumer = thread::spawn(move || {
+            let mut seen = vec![false; TOTAL as usize];
+            let mut count = 0u32;
+            while count < TOTAL {
+                if let Some((addr, val)) = qc.peek().map(|e| { qc.consume(); e }) {
+                    assert!((addr as usize) < TOTAL as usize,
+                        "addr {addr} out of range");
+                    assert_eq!(val, addr as u64,
+                        "val mismatch for addr {addr}: got {val}");
+                    assert!(!seen[addr as usize],
+                        "duplicate entry for addr {addr}");
+                    seen[addr as usize] = true;
+                    count += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            assert!(qc.is_empty(), "queue not empty after full drain");
+            // Every slot must have been seen exactly once.
+            assert!(seen.iter().all(|&s| s), "some entries were never received");
+        });
+
+        for p in producers { p.join().unwrap(); }
+        consumer.join().unwrap();
+    }
+}
