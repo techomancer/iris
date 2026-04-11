@@ -862,45 +862,25 @@ impl Default for Rex3DcbState {
     }
 }
 
-/// A GFIFO entry encodes a register write as a raw bus address + 64-bit value.
-///
-/// Encoding of `addr`:
-///   bit 11 (0x800): GO flag — set when the bus write used the GO address space
-///   bit  0 (0x001): is_64bit flag — set for 64-bit HOSTRW writes (free bit: regs are 4-byte aligned)
-///   bits 10:1 (with bit 0 cleared): `reg_offset` — the register being written
-///
-/// Special sentinel: `GFIFO_PURE_GO` encodes a "pure GO" — no register update,
-/// just trigger `execute_go()`.  The reg_offset is not a real register so
-/// `process_register` hits the `_ => {}` arm and is a no-op.
-///
-/// `ready` is set by the producer after writing `addr`/`val`, and cleared by the
-/// consumer after reading. It guards concurrent access in the MPSC ring buffer.
+/// A GFIFO entry: plain addr + val, no synchronization fields.
+/// Ordering is guaranteed by the push spinlock (producers) and the
+/// tail Release store / head Acquire load (consumer).
+#[derive(Clone, Copy)]
 pub struct GFIFOEntry {
-    /// Raw bus offset with GO bit (0x800) and is_64bit bit (0x001) encoded.
-    addr: UnsafeCell<u32>,
-    /// Register value (low 32 bits for 32-bit writes; full 64 bits for 64-bit HOSTRW).
-    val:  UnsafeCell<u64>,
-    /// Set by producer after writing addr/val; cleared by consumer after reading.
-    ready: AtomicBool,
+    pub addr: u32,
+    pub val:  u64,
 }
 
-impl GFIFOEntry {
-    const fn new() -> Self {
-        GFIFOEntry { addr: UnsafeCell::new(0), val: UnsafeCell::new(0), ready: AtomicBool::new(false) }
-    }
-}
-
-// SAFETY: addr/val are only accessed under the ready handshake; AtomicBool is Sync.
-unsafe impl Sync for GFIFOEntry {}
-
-/// Lock-free MPSC ring buffer for the GFIFO.
+/// MPSC ring buffer for the GFIFO.
 ///
-/// Multiple producers (CPU thread, VDMA thread) claim slots via CAS on `tail`.
+/// Multiple producers are serialized by `lock` (an atomic spinlock).
+/// The lock ensures only one producer writes at a time, so tail can be
+/// updated atomically after the write — no per-slot ready flag needed.
 /// Single consumer (painter thread) advances `head`.
-/// head and tail are on separate cache lines to avoid false sharing.
-/// Capacity is `GFIFO_DEPTH` entries; the buffer holds at most `GFIFO_DEPTH - 1`
-/// live entries (one slot is always reserved to distinguish full from empty).
+/// `head` and `tail` are on separate cache lines to avoid false sharing.
+/// Capacity is `GFIFO_DEPTH` entries; holds at most `GFIFO_DEPTH - 1` live entries.
 pub struct GFifo {
+    lock: AtomicBool,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
     buf:  [GFIFOEntry; GFIFO_DEPTH],
@@ -908,11 +888,14 @@ pub struct GFifo {
 
 const GFIFO_MASK: usize = GFIFO_DEPTH - 1;
 
+// SAFETY: GFifo is always heap-allocated. buf access is serialized:
+// producers via lock, consumer via exclusive head ownership.
+unsafe impl Send for GFifo {}
+unsafe impl Sync for GFifo {}
+
 impl GFifo {
     pub fn new() -> Self {
-        // SAFETY: GFifo is always heap-allocated (inside Rex3 behind Arc, or Arc<GFifo> in tests).
-        // Initializing ready to false via zeroed is valid — AtomicBool(false) == 0.
-        // UnsafeCell<u32/u64> fields are written before read, so zero init is fine.
+        // SAFETY: always heap-allocated; zeroed GFIFOEntry (u32+u64) is valid.
         unsafe { std::mem::zeroed() }
     }
 
@@ -924,31 +907,31 @@ impl GFifo {
         tail.wrapping_sub(head) & GFIFO_MASK
     }
 
-    /// Push an entry. Spins if the buffer is full. Safe to call from multiple producers.
+    /// Push an entry. Spins if full. Safe to call from multiple producers concurrently.
     #[inline]
     pub fn push(&self, addr: u32, val: u64) {
+        // Acquire the spinlock — uncontested in the common case (one active producer).
+        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        // Spin if full — consumer will drain it.
         loop {
             let tail = self.tail.load(Ordering::Relaxed);
             let next_tail = tail.wrapping_add(1) & GFIFO_MASK;
-            // Full when next_tail == head — spin and retry.
-            if next_tail == self.head.load(Ordering::Acquire) {
-                std::hint::spin_loop();
-                continue;
+            if next_tail != self.head.load(Ordering::Acquire) {
+                // SAFETY: we hold the lock; no other producer touches this slot.
+                unsafe {
+                    let slot = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
+                    (*slot).addr = addr;
+                    (*slot).val  = val;
+                }
+                // Release: consumer's Acquire on tail sees the slot write above.
+                self.tail.store(next_tail, Ordering::Release);
+                break;
             }
-            // Atomically claim this slot. On failure another producer got it first — retry.
-            if self.tail.compare_exchange_weak(tail, next_tail, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-                std::hint::spin_loop();
-                continue;
-            }
-            // Slot is ours. Write addr/val then mark ready for the consumer.
-            let slot = &self.buf[tail];
-            unsafe {
-                slot.addr.get().write(addr);
-                slot.val.get().write(val);
-            }
-            slot.ready.store(true, Ordering::Release);
-            return;
+            std::hint::spin_loop();
         }
+        self.lock.store(false, Ordering::Release);
     }
 
     /// Peek at the next entry without advancing head. Returns `None` if empty.
@@ -959,22 +942,17 @@ impl GFifo {
         if head == self.tail.load(Ordering::Acquire) {
             return None;
         }
-        // Spin until the producer at this slot has finished writing.
-        let slot = &self.buf[head];
-        while !slot.ready.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-        let addr = unsafe { slot.addr.get().read() };
-        let val  = unsafe { slot.val.get().read() };
-        Some((addr, val))
+        // SAFETY: consumer owns head; no producer touches a slot before tail is published,
+        // and our Acquire on tail pairs with the producer's Release store.
+        let slot = unsafe { &*self.buf.as_ptr().add(head) };
+        Some((slot.addr, slot.val))
     }
 
-    /// Advance head past the current entry after it has been processed.
-    /// Must be paired with a preceding successful `peek()`.
+    /// Advance head past the current entry after it has been fully processed.
+    /// Must follow a successful `peek()`.
     #[inline]
     pub fn consume(&self) {
         let head = self.head.load(Ordering::Relaxed);
-        self.buf[head].ready.store(false, Ordering::Release);
         self.head.store(head.wrapping_add(1) & GFIFO_MASK, Ordering::Release);
     }
 
@@ -984,9 +962,6 @@ impl GFifo {
         self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
     }
 }
-
-unsafe impl Send for GFifo {}
-unsafe impl Sync for GFifo {}
 
 #[derive(Default)]
 struct DebugState {
@@ -2985,6 +2960,11 @@ impl Rex3 {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
 
+                // Signal busy for the entire duration — covers plain register writes too.
+                // CPU thread checks gfxbusy || !is_empty(); holding busy here ensures
+                // context reads stall until process_register AND execute_go are both done.
+                self.gfxbusy.store(true, Ordering::Relaxed);
+
                 let is_go = addr & 0x0800 != 0;
                 // Strip GO bit only; keep is_64bit (bit 0) for HOSTRW discrimination.
                 // process_register handles GFIFO_EXIT/GFIFO_PURE_GO sentinels directly.
@@ -3012,19 +2992,17 @@ impl Rex3 {
                     }
                 }
 
-                // Advance head now — entry is fully processed and visible to the CPU thread.
+                if is_go {
+                    self.execute_go();
+                }
+
+                // Advance head and release busy atomically — CPU thread sees all writes
+                // (context registers + FB) only after both process_register and execute_go
+                // have completed.
                 self.gfifo.consume();
+                self.gfxbusy.store(false, Ordering::Release);
 
                 if exit { break; } // GFIFO_EXIT
-
-                if is_go {
-                    self.gfxbusy.store(true, Ordering::Relaxed);
-                    self.execute_go();
-                    // Release: all context/FB writes from execute_go() are visible to any
-                    // thread that subsequently does an Acquire load of gfxbusy (e.g. wait_idle
-                    // and STATUS read on the CPU thread).
-                    self.gfxbusy.store(false, Ordering::Release);
-                }
             } else {
                 // Nothing in the ring — back off. Starts with spin_loop() hints,
                 // graduates to thread::yield_now() after sustained emptiness.
