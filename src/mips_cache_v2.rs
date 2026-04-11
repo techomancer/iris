@@ -203,47 +203,16 @@ pub trait MipsCache: Send + Sync {
     /// status may be BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE (cache only).
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64;
 
-    /// Write 64-bit data using virtual and physical addresses with byte mask.
-    /// Uses virtual address for index, physical address for tag (VIPT).
-    /// Mask indicates which bytes to write (bit mask for u64).
-    /// Returns BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE (cache only).
-    /// This is the core write operation — use helper methods for smaller writes.
+    /// Write SIZE bytes directly — no RMW, no mask computation.
+    /// SIZE must be 1, 2, 4, or 8 (const generic).
+    /// val is zero-extended; only the low SIZE*8 bits are used.
+    /// phys_addr must be SIZE-aligned. Returns BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE.
+    fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32;
+
+    /// Arbitrary-mask doubleword write — escape hatch for SDL/SDR partial stores.
+    /// phys_addr must be 8-byte aligned. val/mask are in MIPS big-endian doubleword space.
+    /// Returns BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE.
     fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32;
-
-    /// Write 8-bit value
-    fn write8(&self, virt_addr: u64, phys_addr: u64, val: u8) -> u32 {
-        let aligned_addr = phys_addr & !7;
-        let offset = (phys_addr & 7) as usize;
-        let shift = (7 - offset) * 8;
-        let mask = 0xFF_u64 << shift;
-        let val64 = (val as u64) << shift;
-        self.write64_masked(virt_addr, aligned_addr, val64, mask)
-    }
-
-    /// Write 16-bit value
-    fn write16(&self, virt_addr: u64, phys_addr: u64, val: u16) -> u32 {
-        let aligned_addr = phys_addr & !7;
-        let offset = (phys_addr & 7) as usize;
-        let shift = (6 - offset) * 8;
-        let mask = 0xFFFF_u64 << shift;
-        let val64 = (val as u64) << shift;
-        self.write64_masked(virt_addr, aligned_addr, val64, mask)
-    }
-
-    /// Write 32-bit value
-    fn write32(&self, virt_addr: u64, phys_addr: u64, val: u32) -> u32 {
-        let aligned_addr = phys_addr & !7;
-        let offset = (phys_addr & 7) as usize;
-        let shift = if offset == 0 { 32 } else { 0 };
-        let mask = 0xFFFFFFFF_u64 << shift;
-        let val64 = (val as u64) << shift;
-        self.write64_masked(virt_addr, aligned_addr, val64, mask)
-    }
-
-    /// Write 64-bit value
-    fn write64(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
-        self.write64_masked(virt_addr, phys_addr, val, !0)
-    }
 
     /// Execute a cache operation (CACHE instruction)
     ///
@@ -361,8 +330,17 @@ impl MipsCache for PassthroughCache {
         else               { self.downstream.read64(phys_addr as u32) }
     }
 
+    fn write<const SIZE: usize>(&self, _virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
+        const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
+        let addr = phys_addr as u32;
+        if SIZE == 1      { self.downstream.write8(addr, val as u8) }
+        else if SIZE == 2 { self.downstream.write16(addr, val as u16) }
+        else if SIZE == 4 { self.downstream.write32(addr, val as u32) }
+        else              { self.downstream.write64(addr, val) }
+    }
+
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
-        // For passthrough cache, just do a read-modify-write on the downstream device
+        // SDL/SDR only — read-modify-write on the downstream device
         let aligned_addr = (phys_addr & !7) as u32;
         let r = self.downstream.read64(aligned_addr);
         if !r.is_ok() { return r.status; }
@@ -551,6 +529,24 @@ impl<const SIZE: usize, const LINE: usize, const KIND: u8,
     fn data_as_bytes(&self) -> &[u8] {
         let arr = self.data();
         unsafe { std::slice::from_raw_parts(arr.as_ptr() as *const u8, SIZE) }
+    }
+
+    #[inline(always)]
+    fn data_as_words_mut(&self) -> &mut [u32] {
+        let arr = self.data_mut();
+        unsafe { std::slice::from_raw_parts_mut(arr.as_mut_ptr() as *mut u32, SIZE / 4) }
+    }
+
+    #[inline(always)]
+    fn data_as_halves_mut(&self) -> &mut [u16] {
+        let arr = self.data_mut();
+        unsafe { std::slice::from_raw_parts_mut(arr.as_mut_ptr() as *mut u16, SIZE / 2) }
+    }
+
+    #[inline(always)]
+    fn data_as_bytes_mut(&self) -> &mut [u8] {
+        let arr = self.data_mut();
+        unsafe { std::slice::from_raw_parts_mut(arr.as_mut_ptr() as *mut u8, SIZE) }
     }
 }
 
@@ -1272,6 +1268,32 @@ impl R4000Cache {
 
         BUS_OK
     }
+
+    /// Ensure the L1-D line covering `virt_addr`/`phys_addr` is valid and tag-matched.
+    /// Returns BUS_OK if the line is already present or was successfully filled,
+    /// BUS_VCE on a virtual coherency exception, or BUS_ERR on a bus error.
+    #[inline(always)]
+    fn ensure_l1d_line(&self, virt_addr: u64, phys_addr: u64) -> u32 {
+        let dc_idx = self.dc.get_index(virt_addr);
+        let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
+        if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != self.l1_ptag(phys_addr) {
+            self.fill_l1d_line(virt_addr, phys_addr)
+        } else {
+            BUS_OK
+        }
+    }
+
+    /// Mark the L1-D line covering `virt_addr` as dirty. Called after every write.
+    #[inline(always)]
+    fn mark_l1d_dirty(&self, virt_addr: u64) {
+        let dc_idx = self.dc.get_index(virt_addr);
+        let mut dc_tag: L1DTag = self.dc.get_tag(dc_idx);
+        dc_tag.set_dirty(true);
+        if dc_tag.cs() == L1D_CS_CLEAN_EXCLUSIVE {
+            dc_tag.set_cs(L1D_CS_DIRTY_EXCLUSIVE);
+        }
+        self.dc.set_tag(dc_idx, dc_tag);
+    }
 }
 
 impl MipsCache for R4000Cache {
@@ -1337,15 +1359,8 @@ impl MipsCache for R4000Cache {
         }
 
         // Ensure line is in L1-D cache
-        let dc_idx = self.dc.get_index(virt_addr);
-        let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
-        let ptag = self.l1_ptag(phys_addr);
-
-        // Fill if not valid or tag mismatch
-        if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != ptag {
-            let s = self.fill_l1d_line(virt_addr, phys_addr);
-            if s != BUS_OK { return BusRead64 { status: s, data: 0 }; }
-        }
+        let s = self.ensure_l1d_line(virt_addr, phys_addr);
+        if s != BUS_OK { return BusRead64 { status: s, data: 0 }; }
 
         // Read from L1-D cache
         let data_idx = self.dc.get_data_index(virt_addr);
@@ -1361,14 +1376,54 @@ impl MipsCache for R4000Cache {
         BusRead64::ok(data)
     }
 
+    fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
+        const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
+        #[cfg(feature = "debug_cache")]
+        {
+            if self.is_tracking_addr(virt_addr, phys_addr) {
+                println!("[CACHE DEBUG] write{}: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}, val 0x{:016x}",
+                         SIZE * 8, self.tracking_label(phys_addr), virt_addr, phys_addr, val);
+            } else {
+                let l2_idx = self.l2.get_index(phys_addr);
+                if self.is_tracking_l2_idx(l2_idx) {
+                    let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
+                    println!("[CACHE DEBUG] write{} (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, val 0x{:016x}",
+                             SIZE * 8, l2_idx, line_base, virt_addr, phys_addr, val);
+                }
+            }
+        }
+
+        // Ensure line is in L1-D cache (write-allocate)
+        let s = self.ensure_l1d_line(virt_addr, phys_addr);
+        if s != BUS_OK { return s; }
+
+        // Write directly into the typed view — no RMW, no mask
+        let data_idx = self.dc.get_data_index(virt_addr);
+        if SIZE == 8 {
+            self.dc.data_mut()[data_idx] = val;
+        } else if SIZE == 4 {
+            let slot = (phys_addr as usize & 7) >> 2 ^ 1; // big-endian word within u64
+            self.dc.data_as_words_mut()[data_idx * 2 + slot] = val as u32;
+        } else if SIZE == 2 {
+            let slot = (phys_addr as usize & 7) >> 1 ^ 3; // big-endian half within u64
+            self.dc.data_as_halves_mut()[data_idx * 4 + slot] = val as u16;
+        } else {
+            let slot = (phys_addr as usize & 7) ^ 7;      // big-endian byte within u64
+            self.dc.data_as_bytes_mut()[data_idx * 8 + slot] = val as u8;
+        }
+
+        self.mark_l1d_dirty(virt_addr);
+        BUS_OK
+    }
+
     fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
+        // SDL/SDR only — arbitrary sub-doubleword mask, always a RMW on the full u64 slot
         #[cfg(feature = "debug_cache")]
         {
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] write64_masked: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}, val 0x{:016x}, mask 0x{:016x}",
                          self.tracking_label(phys_addr), virt_addr, phys_addr, val, mask);
             } else {
-                // Also track writes that will hit the same L2 index (cache line aliasing)
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
                     let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
@@ -1379,30 +1434,14 @@ impl MipsCache for R4000Cache {
         }
 
         // Ensure line is in L1-D cache (write-allocate)
-        let dc_idx = self.dc.get_index(virt_addr);
-        let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
-        let ptag = self.l1_ptag(phys_addr);
+        let s = self.ensure_l1d_line(virt_addr, phys_addr);
+        if s != BUS_OK { return s; }
 
-        // Fill if not valid or tag mismatch
-        if dc_tag.cs() == L1D_CS_INVALID || dc_tag.ptag() != ptag {
-            let s = self.fill_l1d_line(virt_addr, phys_addr);
-            if s != BUS_OK { return s; }
-        }
-
-        // Write to L1-D cache
         let data_idx = self.dc.get_data_index(virt_addr);
         let dc_data = self.dc.data_mut();
-        let current = dc_data[data_idx];
-        dc_data[data_idx] = (current & !mask) | (val & mask);
+        dc_data[data_idx] = (dc_data[data_idx] & !mask) | (val & mask);
 
-        // Mark line as dirty and update state
-        let mut dc_tag: L1DTag = self.dc.get_tag(dc_idx);
-        dc_tag.set_dirty(true);
-        if dc_tag.cs() == L1D_CS_CLEAN_EXCLUSIVE {
-            dc_tag.set_cs(L1D_CS_DIRTY_EXCLUSIVE);
-        }
-        self.dc.set_tag(dc_idx, dc_tag);
-
+        self.mark_l1d_dirty(virt_addr);
         BUS_OK
     }
 

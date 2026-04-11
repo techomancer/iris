@@ -1667,15 +1667,7 @@ For R4000SC/MC CPUs:
         }
 
         if is_cached {
-            let status = if SIZE == 1 {
-                self.cache.write8(virt_addr, phys_addr, val as u8)
-            } else if SIZE == 2 {
-                self.cache.write16(virt_addr, phys_addr, val as u16)
-            } else if SIZE == 4 {
-                self.cache.write32(virt_addr, phys_addr, val as u32)
-            } else {
-                self.cache.write64(virt_addr, phys_addr, val)
-            };
+            let status = self.cache.write::<SIZE>(virt_addr, phys_addr, val);
             if status != BUS_OK && status != BUS_BUSY {
                 if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
             }
