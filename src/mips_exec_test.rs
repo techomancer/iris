@@ -2730,7 +2730,7 @@ mod tests {
         mem.set_word(phys_addr, 0xDEADBEEF);
 
         // First access with virt1 - this fills L2 with PIdx=0
-        let result = exec.cache.read(virt1, phys_addr, 4);
+        let result = exec.cache.read::<4>(virt1, phys_addr);
         assert_eq!(result.status, BUS_OK, "First access should succeed");
         assert_eq!(result.data, 0xDEADBEEF, "First access should return correct data");
 
@@ -2739,7 +2739,7 @@ mod tests {
         // - L1 miss (different virtual index)
         // - L2 hit (same physical address)
         // - virt PIdx (1) != stored PIdx in L2 tag (0)
-        let result = exec.cache.read(virt2, phys_addr, 4);
+        let result = exec.cache.read::<4>(virt2, phys_addr);
         assert_eq!(result.status, BUS_VCE,
                    "Second access with different virtual index should trigger VCE");
 

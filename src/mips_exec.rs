@@ -1546,7 +1546,7 @@ For R4000SC/MC CPUs:
                         return Err(EXEC_BREAKPOINT);
                     }
 
-                    let r = self.cache.read(virt_addr, phys_addr, SIZE);
+                    let r = self.cache.read::<SIZE>(virt_addr, phys_addr);
                     if r.is_ok() {
                         Ok(r.data)
                     } else {

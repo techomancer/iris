@@ -198,10 +198,10 @@ pub trait MipsCache: Send + Sync {
 
     /// Read data using virtual and physical addresses.
     /// Uses virtual address for index, physical address for tag (VIPT).
-    /// Size must be 1, 2, 4, or 8 bytes.
+    /// SIZE must be 1, 2, 4, or 8 bytes (const generic, zero runtime branch).
     /// Returns BusRead64 with data zero-extended to u64 on success.
     /// status may be BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE (cache only).
-    fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64;
+    fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64;
 
     /// Write 64-bit data using virtual and physical addresses with byte mask.
     /// Uses virtual address for index, physical address for tag (VIPT).
@@ -353,14 +353,12 @@ impl MipsCache for PassthroughCache {
         }
     }
 
-    fn read(&self, _virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64 {
-        match size {
-            1 => { let r = self.downstream.read8(phys_addr as u32);  BusRead64 { status: r.status, data: r.data as u64 } }
-            2 => { let r = self.downstream.read16(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
-            4 => { let r = self.downstream.read32(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
-            8 =>   self.downstream.read64(phys_addr as u32),
-            _ => BusRead64::err(),
-        }
+    fn read<const SIZE: usize>(&self, _virt_addr: u64, phys_addr: u64) -> BusRead64 {
+        const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
+        if SIZE == 1 { let r = self.downstream.read8(phys_addr as u32);  BusRead64 { status: r.status, data: r.data as u64 } }
+        else if SIZE == 2 { let r = self.downstream.read16(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
+        else if SIZE == 4 { let r = self.downstream.read32(phys_addr as u32); BusRead64 { status: r.status, data: r.data as u64 } }
+        else               { self.downstream.read64(phys_addr as u32) }
     }
 
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
@@ -1320,19 +1318,20 @@ impl MipsCache for R4000Cache {
         FetchInstrResult::hit(slot)
     }
 
-    fn read(&self, virt_addr: u64, phys_addr: u64, size: usize) -> BusRead64 {
+    fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
+        const { assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE") };
         #[cfg(feature = "debug_cache")]
         {
             if self.is_tracking_addr(virt_addr, phys_addr) {
                 println!("[CACHE DEBUG] read: {} virt_addr 0x{:016x}, phys_addr 0x{:016x}, size {}",
-                         self.tracking_label(phys_addr), virt_addr, phys_addr, size);
+                         self.tracking_label(phys_addr), virt_addr, phys_addr, SIZE);
             } else {
                 // Also track reads that will hit the same L2 index (cache line aliasing)
                 let l2_idx = self.l2.get_index(phys_addr);
                 if self.is_tracking_l2_idx(l2_idx) {
                     let line_base = phys_addr & !(L2Cache::LINE_MASK as u64);
                     println!("[CACHE DEBUG] read (L2 alias): idx={}, line 0x{:08x}, virt 0x{:016x}, phys 0x{:016x}, size {}",
-                             l2_idx, line_base, virt_addr, phys_addr, size);
+                             l2_idx, line_base, virt_addr, phys_addr, SIZE);
                 }
             }
         }
@@ -1350,12 +1349,14 @@ impl MipsCache for R4000Cache {
 
         // Read from L1-D cache
         let data_idx = self.dc.get_data_index(virt_addr);
-        let data = match size {
-            1 => self.dc.data_as_bytes()[data_idx * 8 + ((phys_addr as usize & 7) ^ 7)] as u64,
-            2 => self.dc.data_as_halves()[data_idx * 4 + ((phys_addr as usize & 7) >> 1 ^ 3)] as u64,
-            4 => self.dc.data_as_words()[data_idx * 2 + ((phys_addr as usize & 7) >> 2 ^ 1)] as u64,
-            8 => self.dc.data()[data_idx],
-            _ => return BusRead64::err(),
+        let data = if SIZE == 1 {
+            self.dc.data_as_bytes()[data_idx * 8 + ((phys_addr as usize & 7) ^ 7)] as u64
+        } else if SIZE == 2 {
+            self.dc.data_as_halves()[data_idx * 4 + ((phys_addr as usize & 7) >> 1 ^ 3)] as u64
+        } else if SIZE == 4 {
+            self.dc.data_as_words()[data_idx * 2 + ((phys_addr as usize & 7) >> 2 ^ 1)] as u64
+        } else {
+            self.dc.data()[data_idx]
         };
         BusRead64::ok(data)
     }
