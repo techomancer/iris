@@ -2,11 +2,16 @@ use iris::config::{load_config, NfsConfig};
 use iris::machine::Machine;
 
 fn main() {
-    let (cfg, scale) = load_config();
+    let (mut cfg, scale) = load_config();
     let headless = cfg.headless;
 
     // Start unfsd before the machine so NFS is ready when IRIX boots.
+    // If start_unfsd returns None (directory missing/uncreatable, or binary not found),
+    // clear cfg.nfs so the network layer doesn't try to route to a non-running server.
     let nfs_proc = cfg.nfs.as_ref().and_then(|nfs| start_unfsd(nfs));
+    if cfg.nfs.is_some() && nfs_proc.is_none() {
+        cfg.nfs = None;
+    }
 
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
@@ -84,8 +89,23 @@ fn start_unfsd(nfs: &NfsConfig) -> Option<UnfsdProc> {
     use std::io::Write as _;
 
     // NFS requires an absolute path in the exports file.
-    let abs_dir = std::fs::canonicalize(&nfs.shared_dir)
-        .unwrap_or_else(|e| panic!("NFS shared_dir '{}': {}", nfs.shared_dir, e));
+    // Try to create the directory if it doesn't exist yet.
+    let shared_path = std::path::Path::new(&nfs.shared_dir);
+    if !shared_path.exists() {
+        if let Err(e) = std::fs::create_dir_all(shared_path) {
+            eprintln!("iris: warning: NFS shared_dir '{}' does not exist and could not be created: {} (NFS sharing disabled)",
+                      nfs.shared_dir, e);
+            return None;
+        }
+        eprintln!("iris: created NFS shared_dir '{}'", nfs.shared_dir);
+    }
+    let abs_dir = match std::fs::canonicalize(shared_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("iris: warning: NFS shared_dir '{}': {} (NFS sharing disabled)", nfs.shared_dir, e);
+            return None;
+        }
+    };
     let exports_path = std::env::temp_dir().join("iris_nfs.exports");
     {
         let mut f = std::fs::File::create(&exports_path)
