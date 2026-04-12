@@ -606,8 +606,8 @@ fn emit_shader(
     dm0: &Dm0,
     dm1: &Dm1,
     is_scr2scr: bool,
-    is_hostw: bool,    // DRAW + colorhost/alphahost: read pixels from ctx.hostrw_val
-    is_hostr: bool,    // READ opcode: pack fb pixels into ctx.hostrw_val
+    is_hostw: bool,    // DRAW + colorhost/alphahost: read pixels from ctx.hostrw
+    is_hostr: bool,    // READ opcode: pack fb pixels into ctx.hostrw
     ptr_type: ir::Type,
 ) -> bool {
     let mut b = FunctionBuilder::new(func, builder_ctx);
@@ -777,13 +777,12 @@ fn emit_shader(
         None
     };
 
-    // Initial host shifter: for HOSTW load hostrw_val; for HOSTR start at 0.
-    // Note: hostrw_val was populated by execute_go from self.hostrw before calling us.
+    // Initial host shifter: for HOSTW load ctx.hostrw; for HOSTR start at 0.
     // Apply swapendian at shader entry if needed (compile-time constant from dm1).
     let host_shifter_init: Value = if is_hostw {
         let raw = {
             let hi = b.ins().load(types::I64, mem, ctx_ptr,
-                ir::immediates::Offset32::new(ctx_off!(hostrw_val) as i32));
+                ir::immediates::Offset32::new(ctx_off!(hostrw) as i32));
             hi
         };
         if dm1.swapendian() {
@@ -1256,9 +1255,9 @@ fn emit_shader(
         // Span / block without stopony: primitive done after one row
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
-        // For HOSTR: flush accumulated shifter to ctx.hostrw_val before returning.
+        // For HOSTR: flush accumulated shifter to ctx.hostrw before returning.
         if is_hostr {
-            emit_store_hostrw_val(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+            emit_store_hostrw(&mut b, ctx_ptr, &mem, current_shifter, dm1);
         }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
@@ -1277,7 +1276,7 @@ fn emit_shader(
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
         if is_hostr {
-            emit_store_hostrw_val(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+            emit_store_hostrw(&mut b, ctx_ptr, &mem, current_shifter, dm1);
         }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
@@ -1349,7 +1348,7 @@ fn emit_shader(
 
             b.switch_to_block(stop_block); b.seal_block(stop_block);
             if is_hostr {
-                emit_store_hostrw_val(&mut b, ctx_ptr, &mem, current_shifter, dm1);
+                emit_store_hostrw(&mut b, ctx_ptr, &mem, current_shifter, dm1);
             }
             emit_writeback(&mut b, ctx_ptr, &mem, xstart_next, ystart_v,
                 dm0, new_cr, new_cg, new_cb, new_ca, new_zpat_bit, new_pat_bit, new_lsmode);
@@ -2591,10 +2590,10 @@ fn emit_pack_host_pixel_ir(
     }
 }
 
-/// Emit IR to apply send_host_word semantics and store to ctx.hostrw_val.
+/// Emit IR to apply send_host_word semantics and store to ctx.hostrw.
 /// Mirrors Rex3::send_host_word: if swapendian → swap_bytes; else if !rwdouble → shift left 32.
 /// Used at loop exit for HOSTR mode.
-fn emit_store_hostrw_val(
+fn emit_store_hostrw(
     b:       &mut FunctionBuilder,
     ctx_ptr: Value,
     mem:     &MemFlags,
@@ -2610,5 +2609,5 @@ fn emit_store_hostrw_val(
         shifter
     };
     b.ins().store(*mem, val, ctx_ptr,
-        ir::immediates::Offset32::new(ctx_off!(hostrw_val) as i32));
+        ir::immediates::Offset32::new(ctx_off!(hostrw) as i32));
 }

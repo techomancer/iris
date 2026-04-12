@@ -743,11 +743,9 @@ pub struct Rex3Context {
     pub topscan: u32,
     pub xywin: u32,
     pub clipmode: u32,
+    pub hostrw: u64,
     pub host_shifter: u64,
     pub hostcnt: u32,
-    /// Bridge for JIT shaders: copy of Rex3::hostrw loaded before JIT dispatch (HOSTW/READ).
-    /// For READ, the JIT writes packed pixels here; execute_go copies it back to Rex3::hostrw.
-    pub hostrw_val: u64,
     /// Bit index (31..=0) for lspattern with lsmode repeat/length; reset to 31 at GO start and each new row.
     pub pat_bit: u8,
     /// Bit index (31..=0) for zpattern; always 32-bit repeating, reset to 31 at GO start and each new row.
@@ -1027,7 +1025,6 @@ pub struct Rex3 {
     pub draw_ring: Arc<Mutex<DrawRingBuf>>,
     #[cfg(feature = "developer")]
     pub gfifo_hwm: AtomicUsize,
-    pub hostrw: AtomicU64,
     /// Number of execute_go() calls dispatched via the JIT (compiled shader hit).
     pub jit_go_count: AtomicU64,
     /// Number of execute_go() calls dispatched via the interpreter (JIT miss or disabled).
@@ -1171,7 +1168,6 @@ impl Rex3 {
             draw_ring: Arc::new(Mutex::new(DrawRingBuf::default())),
             #[cfg(feature = "developer")]
             gfifo_hwm: AtomicUsize::new(0),
-            hostrw: AtomicU64::new(0),
             jit_go_count: AtomicU64::new(0),
             interp_go_count: AtomicU64::new(0),
             debug_state: Mutex::new(DebugState::default()),
@@ -2171,7 +2167,7 @@ impl Rex3 {
 
         if ctx.hostcnt == 0 {
             // 32-bit writes land in the high half [63:32] via HOSTRW0, so data is already at MSB.
-            ctx.host_shifter = self.hostrw.load(Ordering::Relaxed);
+            ctx.host_shifter = ctx.hostrw;
             if swapendian {
                 ctx.host_shifter = if rwdouble {
                     ctx.host_shifter.swap_bytes()
@@ -2207,7 +2203,7 @@ impl Rex3 {
             val <<= 32;
         }
 
-        self.hostrw.store(val, Ordering::Relaxed);
+        ctx.hostrw = val;
     }
 
     fn store_host_pixel(&self, ctx: &mut Rex3Context, pixel: u32) {
@@ -3088,13 +3084,7 @@ impl Rex3 {
                     if let Some(entry) = entry {
                         let fb_rgb = unsafe { (*self.fb_rgb.get()).as_mut_ptr() };
                         let fb_aux = unsafe { (*self.fb_aux.get()).as_mut_ptr() };
-                        // Bridge hostrw: populate ctx.hostrw_val before call so HOSTW shaders
-                        // can fetch pixels from it; copy back after for READ shaders.
-                        ctx.hostrw_val = self.hostrw.load(Ordering::Relaxed);
                         unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
-                        if opcode == DRAWMODE0_OPCODE_READ {
-                            self.hostrw.store(ctx.hostrw_val, Ordering::Relaxed);
-                        }
                         self.jit_go_count.fetch_add(1, Ordering::Relaxed);
                         self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                         return;
@@ -3487,7 +3477,7 @@ impl Rex3 {
             // The actual draw/read is triggered by execute_go() when entry.go is set.
             // 64-bit write (REX3_HOSTRW0_64 = 0x0231): store full val64 directly.
             REX3_HOSTRW64 => {
-                self.hostrw.store(val64, Ordering::Relaxed);
+                ctx.hostrw = val64;
                 ctx.hostcnt = 0;
                 if self.draw_debug.load(Ordering::Relaxed) { self.draw_ring.lock().on_hostrw_write(); }
                 if let Some(f) = self.block_log.lock().as_mut() {
@@ -3496,9 +3486,8 @@ impl Rex3 {
             }
             REX3_HOSTRW0 => {
                 // 32-bit write to HOSTRW0: update high 32 bits [63:32].
-                let old = self.hostrw.load(Ordering::Relaxed);
-                let new_val = (old & 0x0000_0000_FFFF_FFFF) | ((val64 & 0xFFFF_FFFF) << 32);
-                self.hostrw.store(new_val, Ordering::Relaxed);
+                let new_val = (ctx.hostrw & 0x0000_0000_FFFF_FFFF) | ((val64 & 0xFFFF_FFFF) << 32);
+                ctx.hostrw = new_val;
                 ctx.hostcnt = 0;
                 if self.draw_debug.load(Ordering::Relaxed) { self.draw_ring.lock().on_hostrw_write(); }
                 if let Some(f) = self.block_log.lock().as_mut() {
@@ -3507,9 +3496,8 @@ impl Rex3 {
             }
             REX3_HOSTRW1 => {
                 // 32-bit write to HOSTRW1: update low 32 bits [31:0].
-                let old = self.hostrw.load(Ordering::Relaxed);
-                let new_val = (old & 0xFFFF_FFFF_0000_0000) | (val64 & 0xFFFF_FFFF);
-                self.hostrw.store(new_val, Ordering::Relaxed);
+                let new_val = (ctx.hostrw & 0xFFFF_FFFF_0000_0000) | (val64 & 0xFFFF_FFFF);
+                ctx.hostrw = new_val;
                 ctx.hostcnt = 0;
                 if self.draw_debug.load(Ordering::Relaxed) { self.draw_ring.lock().on_hostrw_write(); }
                 if let Some(f) = self.block_log.lock().as_mut() {
@@ -4163,13 +4151,12 @@ impl BusDevice for Rex3 {
             }
             REX3_DCBDATA0 | REX3_DCBDATA1 => BusRead32::ok(self.dcb_read()),
 
-            REX3_HOSTRW0 => busy_or_val!((self.hostrw.load(Ordering::Relaxed) >> 32) as u32),
-            REX3_HOSTRW1 => busy_or_val!(self.hostrw.load(Ordering::Relaxed) as u32),
-
             // Context registers: stall until pipeline idle.
             _ => {
                 let ctx = unsafe { &*self.context.get() };
                 match reg_offset {
+                    REX3_HOSTRW0      => busy_or_val!((ctx.hostrw >> 32) as u32),
+                    REX3_HOSTRW1      => busy_or_val!(ctx.hostrw as u32),
                     REX3_DRAWMODE1    => busy_or_val!(ctx.drawmode1.0),
                     REX3_DRAWMODE0    => busy_or_val!(ctx.drawmode0.0 & 0xFFFFFF),
                     REX3_LSMODE       => busy_or_val!(ctx.lsmode.0 & 0x0FFFFFFF),
@@ -4417,7 +4404,7 @@ impl BusDevice for Rex3 {
             if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                 return BusRead64::busy();
             }
-            let val = self.hostrw.load(Ordering::Relaxed);
+            let val = unsafe { (*self.context.get()).hostrw };
             if is_go64r {
                 // Enqueue a pure-go entry: no register update, just trigger next pixel batch.
                 self.gfifo_push(GFIFO_PURE_GO, 0);

@@ -21,22 +21,31 @@ use super::*;
 /// Build a running Rex3 with the GFIFO processor thread started.
 /// Uses Box::leak to get a 'static reference — memory is reclaimed by the OS after the test
 /// process exits. The processor thread also holds a 'static ref via start()'s transmute.
+/// Construction runs on a thread with an 8MB stack because Rex3 is large enough to overflow
+/// the default Rust test thread stack (2MB).
 fn make_rex3() -> &'static Rex3 {
-    let rex = Box::leak(Box::new(Rex3::new(
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-    )));
-    unsafe {
-        (*rex.fb_rgb.get()).fill(0);
-        (*rex.fb_aux.get()).fill(0);
-    }
-    rex.start();
-    rex
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let rex = Box::leak(Box::new(Rex3::new(
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            )));
+            unsafe {
+                (*rex.fb_rgb.get()).fill(0);
+                (*rex.fb_aux.get()).fill(0);
+            }
+            rex.start();
+            rex
+        })
+        .expect("spawn")
+        .join()
+        .expect("make_rex3 thread panicked")
 }
 
 // Compute the SET address (no GO bit) for a register offset.
