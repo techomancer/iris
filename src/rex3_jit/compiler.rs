@@ -264,6 +264,7 @@ struct PixelCtx {
 /// Source address for scr2scr: just xywin applied (no xymove, no smask clipping).
 /// On OOB: branches to `src_oob` block (caller puts 0 color there).
 /// On hit: falls through and returns `src_px_ptr`.
+/// `use_aux`: when true, pointer is into fb_aux (planes=OLAY/PUP/CID).
 fn emit_calculate_src_address(
     b:          &mut FunctionBuilder,
     x_v:        Value,
@@ -271,6 +272,7 @@ fn emit_calculate_src_address(
     pctx:       &PixelCtx,
     src_oob:    ir::Block,
     dm1:        &Dm1,
+    use_aux:    bool,
     coord_bias: Value,
     c0:         Value,
     c2048:      Value,
@@ -311,8 +313,9 @@ fn emit_calculate_src_address(
     let c4        = b.ins().iconst(types::I32, 4);
     let byte_off  = b.ins().imul(addr_i32, c4);
     let byte_off64 = b.ins().uextend(types::I64, byte_off);
-    // src always reads from fb_rgb (scr2scr doesn't copy aux planes)
-    b.ins().iadd(pctx.fb_rgb, byte_off64)
+    // Use fb_aux for aux planes (OLAY/PUP/CID), fb_rgb for RGB planes.
+    let fb_ptr = if use_aux { pctx.fb_aux } else { pctx.fb_rgb };
+    b.ins().iadd(fb_ptr, byte_off64)
 }
 
 /// Mirrors Rex3::calculate_fb_address.
@@ -996,17 +999,33 @@ fn emit_shader(
     } else {
         // ── Source color ──────────────────────────────────────────────────────
         let src_color = if is_scr2scr {
+            let use_aux = matches!(dm1.planes(),
+                p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
+            let (aux_read_shift0, aux_read_shift1, aux_read_mask): (i64, i64, i64) = match dm1.planes() {
+                p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
+                p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
+                p if p == DRAWMODE1_PLANES_PUP  => (2,  6,  0x3),
+                _                               => (0,  0,  0),
+            };
             let src_oob    = b.create_block();
             let src_valid  = b.create_block();
             b.append_block_param(src_valid, types::I32);
             let src_ptr = emit_calculate_src_address(
-                &mut b, x_v, y_v, &pctx, src_oob, dm1, coord_bias, c0, c2048,
+                &mut b, x_v, y_v, &pctx, src_oob, dm1, use_aux, coord_bias, c0, c2048,
             );
             let src_raw = b.ins().load(types::I32, memv, src_ptr, ir::immediates::Offset32::new(0));
-            let src_masked = b.ins().band_imm(src_raw, depth_mask as i64);
-            let src_expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
-                emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
-            } else { src_masked };
+            let src_expanded = if use_aux {
+                // Aux plane: extract the plane bits with shift+mask (mirrors rd_fn in interpreter).
+                let read_shift = if dm1.dblsrc() { aux_read_shift1 } else { aux_read_shift0 };
+                let extracted  = if read_shift > 0 { b.ins().ushr_imm(src_raw, read_shift) } else { src_raw };
+                b.ins().band_imm(extracted, aux_read_mask)
+            } else {
+                // RGB plane: mask to depth bits then expand to 24-bit if needed.
+                let src_masked = b.ins().band_imm(src_raw, depth_mask as i64);
+                if dm1.rgbmode() && dm1.drawdepth() != 3 {
+                    emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
+                } else { src_masked }
+            };
             b.ins().jump(src_valid, &[src_expanded]);
             b.switch_to_block(src_oob); b.seal_block(src_oob);
             let zero = b.ins().iconst(types::I32, 0);
