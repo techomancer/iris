@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
-use crate::vc2::{Vc2, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_DID_EN, VC2_REG_DID_ENTRY_PTR, VC2_REG_SCANLINE_LEN, VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_CURSOR_ENTRY_PTR, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_REG_VIDEO_ENTRY_PTR, VC2_CTRL_BLACKOUT, VC2_CTRL_VIDEO_TIMING_EN, VT_VIS_LN_VC_N, VT_DSPLY_EN_RO_N, VT_CBLANK_XMAP_N};
+use crate::vc2::{Vc2, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_DID_EN, VC2_REG_DID_ENTRY_PTR, VC2_REG_SCANLINE_LEN, VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_CURSOR_ENTRY_PTR, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_REG_VIDEO_ENTRY_PTR, VC2_CTRL_BLACKOUT, VC2_CTRL_VIDEO_TIMING_EN, VT_VIS_LN_VC_N, VT_DSPLY_EN_RO_N, VT_CBLANK_XMAP_N, VT_HPOS_VC_N};
 use crate::xmap9::Xmap9;
 use crate::cmap::Cmap;
 use crate::bt445::Bt445;
@@ -44,8 +44,8 @@ pub struct Rex3Screen {
     pub topscan: usize,
 
     // Cursor X correction: added to (cursor_x_reg - 31) to align hot spot with display pixels.
-    // 0 for standard resolutions (1024, 1280); ~11 when the decoded width is wider than nominal
-    // (e.g. X11 reports ~1038 instead of 1024 due to timing slack).
+    // Derived from VT timing: hpos_to_visible_delta - 31 (VC2 doc: HPOS asserts 31px before
+    // first visible cursor pixel).
     pub cursor_x_adjust: i32,
 
     // Debug: overlay all 8192 CMAP entries as 8x8 swatches in a 128x64 grid
@@ -161,13 +161,22 @@ impl Rex3Screen {
 
     // Returns (width, height, cursor_x_adjust).
     // cursor_x_adjust is added to (cursor_x_reg - 31) to align the hot spot with display pixels.
-    // Empirically 11 pixels works across all resolutions and modes.
+    //
+    // The VC2 doc states: "the assertion of HPOS must precede the first visible pixel cursor
+    // by 31 pixels".  So the cursor register counts pixels from HPOS assertion, and display
+    // column 0 is reached at register value (hpos_to_visible_delta).  The formula
+    //   cursor_x_hot = cursor_x_reg - 31 + cursor_x_adjust
+    // means cursor_x_adjust = hpos_to_visible_delta - 31.
+    // We derive hpos_to_visible_delta by walking the first visible line's VT entries and
+    // measuring the pixel distance from HPOS assertion to the first visible pixel.
     fn decode_video_timings(&self) -> (usize, usize, i32) {
         let frame_ptr = self.vc2_regs[VC2_REG_VIDEO_ENTRY_PTR as usize] as usize;
         let ram = &self.vc2_ram;
 
         let mut max_visible_width = 0usize;
         let mut total_visible_lines = 0usize;
+        // Pixel distance from HPOS assertion to visible area start, from first visible line.
+        let mut hpos_to_visible: Option<usize> = None;
 
         let mut curr_frame_ptr = frame_ptr;
         let mut loop_safety = 0usize;
@@ -185,6 +194,13 @@ impl Rex3Screen {
                 let mut eol = false;
                 let mut line_loop_safety = 0usize;
                 let mut state_c = 0u8;
+                // Track HPOS→visible delta for this line.
+                // VT_HPOS_VC_N is active-low: bit CLEAR = asserted (pin driven low).
+                // We want the leading edge: first entry where bit is clear, after seeing it set.
+                let mut pixel_offset = 0usize;
+                let mut hpos_pixel: Option<usize> = None;
+                let mut visible_pixel: Option<usize> = None;
+                let mut hpos_seen_deasserted = false;
 
                 while !eol {
                     if curr_line_ptr >= ram.len() { break; }
@@ -208,12 +224,26 @@ impl Rex3Screen {
                     eol = eol_bit;
                     let pixels = duration * 2;
 
+                    // HPOS is active-low (_N): bit set = deasserted, bit clear = asserted.
+                    // Latch leading edge: first entry with bit clear after seeing it set.
+                    if hpos_pixel.is_none() {
+                        if (state_a & VT_HPOS_VC_N) != 0 {
+                            hpos_seen_deasserted = true;
+                        } else if hpos_seen_deasserted {
+                            hpos_pixel = Some(pixel_offset);
+                        }
+                    }
+
                     let visible = (state_c & VT_CBLANK_XMAP_N) != 0 && (state_a & VT_VIS_LN_VC_N) == 0 && (state_a & VT_DSPLY_EN_RO_N) == 0;
 
                     if visible {
+                        if visible_pixel.is_none() {
+                            visible_pixel = Some(pixel_offset);
+                        }
                         line_visible_width += pixels;
                     }
 
+                    pixel_offset += pixels;
                     line_loop_safety += 1;
                     if line_loop_safety > 1000 { break; }
                 }
@@ -222,6 +252,14 @@ impl Rex3Screen {
                     total_visible_lines += 1;
                     if line_visible_width > max_visible_width {
                         max_visible_width = line_visible_width;
+                    }
+                    // Latch HPOS→visible delta from the first visible line where both are seen.
+                    if hpos_to_visible.is_none() {
+                        if let (Some(h), Some(v)) = (hpos_pixel, visible_pixel) {
+                            if v >= h {
+                                hpos_to_visible = Some(v - h);
+                            }
+                        }
                     }
                 }
 
@@ -238,10 +276,27 @@ impl Rex3Screen {
         if max_visible_width > 0 && total_visible_lines > 0 {
             let w = max_visible_width.min(2048);
             let h = total_visible_lines.min(1024);
-            // Cursor adjustment heuristic: standard resolutions need no correction.
-            // A decoded width wider than the nominal resolution indicates the cursor
-            // register counts from before the active area — correct by the overshoot.
-            let cursor_x_adjust = 11i32;
+            // cursor_x_adjust = hpos_to_visible_delta - 31.
+            // The VC2 doc says HPOS asserts 31 pixels before the first visible cursor pixel,
+            // so the cursor register value at display column 0 is hpos_to_visible_delta,
+            // and subtracting 31 (already in the hot-spot formula) leaves the remainder.
+            // Sanity check: delta must be < 31 (HPOS must precede visible by exactly 31px
+            // per spec); if it's >= 31 the edge detection misfired — fall back to empirical 11.
+            let cursor_x_adjust = match hpos_to_visible {
+                Some(d) => {
+                    let adj = d as i32 - 31;
+                    if adj < 0 || adj > 64 {
+                        println!("Rex3: WARNING: hpos_to_visible={} gives cursor_x_adjust={}, out of range, falling back to 11", d, adj);
+                        11
+                    } else {
+                        adj
+                    }
+                }
+                None => {
+                    println!("Rex3: WARNING: HPOS leading edge not found in VT, falling back to cursor_x_adjust=11");
+                    11
+                }
+            };
             (w, h, cursor_x_adjust)
         } else {
             (0, 0, 0)
