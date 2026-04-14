@@ -305,16 +305,35 @@ fn open_persistent_output() -> Option<AudioOut> {
             buffer_size: cpal::BufferSize::Default,
         };
         let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
-        let (producer, mut consumer) = RingBuffer::<i16>::new(ring_size);
-        let err_fn = |err| { eprintln!("HAL2: cpal stream error: {:?}", err); };
-        let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-            for sample in data.iter_mut() {
-                *sample = consumer.pop().unwrap_or(0);
+        let err_fn = |err: cpal::StreamError| { eprintln!("HAL2: cpal stream error: {:?}", err); };
+
+        // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
+        let (producer, stream) = {
+            let (p, mut c) = RingBuffer::<i16>::new(ring_size);
+            let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for sample in data.iter_mut() {
+                    *sample = c.pop().unwrap_or(0) as f32 / 32768.0;
+                }
+            };
+            match device.build_output_stream(&config, data_fn, err_fn.clone(), None) {
+                Ok(s) => (p, s),
+                Err(_) => {
+                    // f32 failed, try i16
+                    let (p, mut c) = RingBuffer::<i16>::new(ring_size);
+                    let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        for sample in data.iter_mut() {
+                            *sample = c.pop().unwrap_or(0);
+                        }
+                    };
+                    match device.build_output_stream(&config, data_fn, err_fn.clone(), None) {
+                        Ok(s) => (p, s),
+                        Err(e) => {
+                            eprintln!("HAL2: cpal build_output_stream failed at {}Hz: {:?}", rate, e);
+                            continue;
+                        }
+                    }
+                }
             }
-        };
-        let stream = match device.build_output_stream(&config, data_fn, err_fn, None) {
-            Ok(s) => s,
-            Err(_) => continue,
         };
         if stream.play().is_err() { continue; }
         println!("HAL2: audio output: {:?} via {:?} at {}Hz",
@@ -417,10 +436,14 @@ impl Hal2 {
         let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
             let mut st = ca_state.lock();
 
-            // No audio output — nothing to do.
+            // No audio output — still drain DMA so the kernel doesn't hang
+            // waiting for PDMA_CTRL_ACT to clear.
             let stream_rate = match st.out.as_ref() {
                 Some(o) => o.stream_rate,
-                None => return TimerReturn::Continue,
+                None => {
+                    let _ = read_frame_from(&dma_client, mode);
+                    return TimerReturn::Continue;
+                }
             };
 
             // (Re)build resampler if codec rate changed.

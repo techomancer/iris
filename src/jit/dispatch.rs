@@ -156,29 +156,14 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     let mut demotions: u64 = 0;
     let mut rollbacks: u64 = 0;
 
-    // Load saved profile and eagerly compile hot blocks
+    // Load saved profile — but DON'T eagerly compile above-Alu blocks.
+    // trace_block calls debug_fetch_instr which reads memory at kernel
+    // addresses that haven't been loaded yet during startup. Those reads
+    // hit CpuBusErrorDevice → MC CPU Error registers get set → PROM sees
+    // the error status during its hardware check and enters a retry loop.
+    // Blocks will compile on first cache hit during execution instead.
     {
-        let exec = unsafe { &mut *exec_ptr };
-        let profile_entries = profile::load_profile();
-        let mut profile_compiled = 0u64;
-        for entry in &profile_entries {
-            let tier = if entry.tier > max_tier { max_tier } else { entry.tier };
-            if tier == BlockTier::Alu {
-                continue;
-            }
-            let instrs = trace_block(exec, entry.virt_pc, tier);
-            if !instrs.is_empty() {
-                if let Some(mut block) = compiler.compile_block(&instrs, entry.virt_pc, tier) {
-                    block.phys_addr = entry.phys_pc;
-                    cache.insert(entry.phys_pc, entry.virt_pc, block);
-                    blocks_compiled += 1;
-                    profile_compiled += 1;
-                }
-            }
-        }
-        if profile_compiled > 0 {
-            eprintln!("JIT profile: pre-compiled {} blocks from profile", profile_compiled);
-        }
+        let _profile_entries = profile::load_profile();
     }
 
     while running.load(Ordering::Relaxed) {
@@ -616,10 +601,18 @@ fn trace_block<T: Tlb, C: MipsCache>(
     start_pc: u64,
     tier: BlockTier,
 ) -> Vec<(u32, DecodedInstr)> {
-    let mut instrs = Vec::with_capacity(MAX_BLOCK_LEN);
+    // Loads-tier blocks are capped shorter to reduce interrupt delivery
+    // latency. The interpreter checks interrupts before every instruction;
+    // the JIT defers to block exit. Shorter blocks keep the maximum delay
+    // small enough that IRIX's interrupt handlers don't notice.
+    let max_len = match tier {
+        BlockTier::Loads => MAX_BLOCK_LEN,
+        _ => MAX_BLOCK_LEN,
+    };
+    let mut instrs = Vec::with_capacity(max_len);
     let mut pc = start_pc;
 
-    for _ in 0..MAX_BLOCK_LEN {
+    for _ in 0..max_len {
         let raw = match exec.debug_fetch_instr(pc) {
             Ok(w) => w,
             Err(_) => break,
@@ -632,14 +625,14 @@ fn trace_block<T: Tlb, C: MipsCache>(
         if !is_compilable_for_tier(&d, tier) { break; }
 
         let is_branch = is_branch_or_jump(&d);
-        // Terminate Full-tier blocks after each store to keep blocks short.
-        // Long blocks with multiple load/store helper calls create complex CFG
-        // (ok_block/exc_block diamonds) that triggers Cranelift regalloc2 issues
-        // on x86_64, causing rare but fatal codegen corruption.
-        let is_store = tier == BlockTier::Full && is_compilable_store(&d);
+        // Terminate Full-tier blocks after each load or store to keep blocks
+        // short. Multiple helper calls create complex CFG (ok_block/exc_block
+        // diamonds) that triggers Cranelift regalloc2 issues on x86_64.
+        let has_helper = tier == BlockTier::Full
+            && (is_compilable_store(&d) || is_compilable_load(&d));
         instrs.push((raw, d));
 
-        if is_store {
+        if has_helper {
             break;
         }
 
@@ -650,11 +643,13 @@ fn trace_block<T: Tlb, C: MipsCache>(
                 let mut delay_d = DecodedInstr::default();
                 delay_d.raw = delay_raw;
                 decode_into::<T, C>(&mut delay_d);
-                // Exclude stores from delay slots: if the delay slot faults,
-                // the JIT exception path loses delay-slot context (sync_to clears
-                // in_delay_slot), so handle_exception sets wrong cp0_epc/BD bit,
-                // and on ERET the branch is permanently skipped → crash.
-                if is_compilable_for_tier(&delay_d, tier) && !is_compilable_store(&delay_d) {
+                // Exclude loads AND stores from delay slots: if the delay slot
+                // faults (TLB miss, bus error), the JIT exception path loses
+                // delay-slot context (sync_to clears in_delay_slot), so
+                // handle_exception sets wrong cp0_epc/BD bit, and on ERET
+                // the branch is permanently skipped → crash.
+                let delay_can_fault = is_compilable_load(&delay_d) || is_compilable_store(&delay_d);
+                if is_compilable_for_tier(&delay_d, tier) && !delay_can_fault {
                     instrs.push((delay_raw, delay_d));
                     delay_ok = true;
                 }

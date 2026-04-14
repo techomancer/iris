@@ -1,19 +1,56 @@
 #!/bin/bash
 # JIT diagnostic launcher — runs emulator and captures output for analysis
-# Usage: ./jit-diag.sh [mode]
+# Usage: ./jit-diag.sh [-f|--features <list>] [mode]
 #   mode: "jit"      — JIT enabled (default)
 #         "verify"   — JIT with verification
 #         "nojit"    — interpreter only through JIT dispatch
 #         "interp"   — pure interpreter (no JIT feature, baseline)
 #         "perf"     — perf profile, interpreter only (text report for analysis)
 #         "perf-jit" — perf profile with JIT enabled
+#         "smoke"    — headless boot smoke test
+#
+#   -f / --features <list>  comma-separated extra features appended to the
+#                           mode's base feature list (e.g. "developer" to
+#                           enable dlog_dev! macros for IRIS_DEBUG_LOG tracing)
 #
 # All IRIS_JIT_* env vars are passed through automatically:
 #   IRIS_JIT_MAX_TIER=0 ./jit-diag.sh jit
 #   IRIS_JIT_PROBE=500 IRIS_JIT_PROBE_MIN=100 ./jit-diag.sh jit
+#   IRIS_DEBUG_LOG=mc ./jit-diag.sh -f developer interp
+
+EXTRA_FEATURES=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--features)
+            EXTRA_FEATURES="$2"
+            shift 2
+            ;;
+        -h|--help)
+            sed -n '2,20p' "$0"
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 MODE="${1:-jit}"
 OUTFILE="jit-diag-$(date +%Y%m%d-%H%M%S)-${MODE}.log"
+
+# Use the ncargo wrapper so we hit the rustup-pinned nightly toolchain
+# (rust-toolchain.toml) regardless of any homebrew rust on PATH.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CARGO="${SCRIPT_DIR}/ncargo"
+
+features() {
+    local base="$1"
+    if [[ -n "$EXTRA_FEATURES" ]]; then
+        echo "${base},${EXTRA_FEATURES}"
+    else
+        echo "$base"
+    fi
+}
 
 # Collect all IRIS_JIT_* env vars for display and passthrough
 JIT_VARS=$(env | grep '^IRIS_JIT_' | tr '\n' ' ')
@@ -22,31 +59,36 @@ echo "=== IRIS JIT Diagnostic ===" | tee "$OUTFILE"
 echo "Mode: $MODE" | tee -a "$OUTFILE"
 echo "Date: $(date)" | tee -a "$OUTFILE"
 echo "Host: $(uname -m) $(uname -s) $(uname -r)" | tee -a "$OUTFILE"
-echo "Rust: $(rustc --version)" | tee -a "$OUTFILE"
+RUSTC_BIN="$("$HOME/.cargo/bin/rustup" which rustc 2>/dev/null || command -v rustc)"
+echo "Rust: $("$RUSTC_BIN" --version)" | tee -a "$OUTFILE"
 [ -n "$JIT_VARS" ] && echo "Env: $JIT_VARS" | tee -a "$OUTFILE"
 echo "" | tee -a "$OUTFILE"
 
 case "$MODE" in
   jit)
-    echo "Running: IRIS_JIT=1 ${JIT_VARS}cargo run --release --features jit,lightning" | tee -a "$OUTFILE"
-    IRIS_JIT=1 cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    F="$(features jit,lightning)"
+    echo "Running: IRIS_JIT=1 ${JIT_VARS}${CARGO} run --release --features ${F}" | tee -a "$OUTFILE"
+    IRIS_JIT=1 "$CARGO" run --release --features "$F" 2>&1 | tee -a "$OUTFILE"
     ;;
   verify)
-    echo "Running: IRIS_JIT=1 IRIS_JIT_VERIFY=1 ${JIT_VARS}cargo run --release --features jit,lightning" | tee -a "$OUTFILE"
-    IRIS_JIT=1 IRIS_JIT_VERIFY=1 cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    F="$(features jit,lightning)"
+    echo "Running: IRIS_JIT=1 IRIS_JIT_VERIFY=1 ${JIT_VARS}${CARGO} run --release --features ${F}" | tee -a "$OUTFILE"
+    IRIS_JIT=1 IRIS_JIT_VERIFY=1 "$CARGO" run --release --features "$F" 2>&1 | tee -a "$OUTFILE"
     ;;
   nojit)
-    echo "Running: cargo run --release --features jit,lightning (no IRIS_JIT)" | tee -a "$OUTFILE"
-    cargo run --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    F="$(features jit,lightning)"
+    echo "Running: ${CARGO} run --release --features ${F} (no IRIS_JIT)" | tee -a "$OUTFILE"
+    "$CARGO" run --release --features "$F" 2>&1 | tee -a "$OUTFILE"
     ;;
   interp)
-    echo "Running: cargo run --release --features lightning (no jit feature)" | tee -a "$OUTFILE"
-    cargo run --release --features lightning 2>&1 | tee -a "$OUTFILE"
+    F="$(features lightning)"
+    echo "Running: ${CARGO} run --release --features ${F} (no jit feature)" | tee -a "$OUTFILE"
+    "$CARGO" run --release --features "$F" 2>&1 | tee -a "$OUTFILE"
     ;;
   perf)
     PERFREPORT="perf-report-$(date +%Y%m%d-%H%M%S).txt"
     echo "Building (profiling profile, no jit feature)..." | tee -a "$OUTFILE"
-    cargo build --profile profiling --features lightning 2>&1 | tee -a "$OUTFILE"
+    "$CARGO" build --profile profiling --features lightning 2>&1 | tee -a "$OUTFILE"
     echo "--- Press Ctrl-C when you have enough samples ---"
     perf record -F 99 --call-graph dwarf -o perf.data -- ./target/profiling/iris
     echo "Processing perf data..." | tee -a "$OUTFILE"
@@ -56,7 +98,7 @@ case "$MODE" in
   perf-jit)
     PERFREPORT="perf-report-jit-$(date +%Y%m%d-%H%M%S).txt"
     echo "Building (profiling profile, jit feature)..." | tee -a "$OUTFILE"
-    cargo build --profile profiling --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    "$CARGO" build --profile profiling --features jit,lightning 2>&1 | tee -a "$OUTFILE"
     echo "--- Press Ctrl-C when you have enough samples ---"
     IRIS_JIT=1 perf record -F 99 --call-graph dwarf -o perf.data -- ./target/profiling/iris
     echo "Processing perf data..." | tee -a "$OUTFILE"
@@ -73,10 +115,10 @@ case "$MODE" in
     rm -f scsi1.raw.overlay scsi2.raw.overlay
 
     # Build
-    cargo build --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
+    "$CARGO" build --release --features jit,lightning 2>&1 | tee -a "$OUTFILE"
 
     # Run headless with JIT, capture output, kill after timeout
-    IRIS_JIT=1 timeout "$TIMEOUT" cargo run --release --features jit,lightning -- --headless 2>&1 | tee -a "$OUTFILE" &
+    IRIS_JIT=1 timeout "$TIMEOUT" "$CARGO" run --release --features jit,lightning -- --headless 2>&1 | tee -a "$OUTFILE" &
     EMUPID=$!
 
     # Wait for emulator to finish or timeout

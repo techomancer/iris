@@ -22,6 +22,32 @@ fn main() {
         .join()
         .unwrap();
     machine.register_system_controller();
+
+    // DIAG: optionally enable verbose logging from startup via IRIS_DEBUG_LOG.
+    // IRIS_DEBUG_LOG="mc,mips" enables those modules. "all" enables everything.
+    // Output is broadcast to a stderr sink so jit-diag.sh's tee captures it inline.
+    if let Ok(spec) = std::env::var("IRIS_DEBUG_LOG") {
+        if let Some(dl) = iris::devlog::DEVLOG.get() {
+            // Register stderr as a sink so dlog output reaches our captured log.
+            let stderr_sink: iris::devlog::DevLogWriter = std::sync::Arc::new(
+                parking_lot::Mutex::new(std::io::stderr()),
+            );
+            dl.add_sink(stderr_sink);
+
+            for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if name == "all" {
+                    for m in iris::devlog::LogModule::all() { dl.enable(*m); }
+                    eprintln!("DIAG: enabled all log modules -> stderr");
+                } else if let Some(m) = iris::devlog::LogModule::from_str(name) {
+                    dl.enable(m);
+                    eprintln!("DIAG: enabled log module {} -> stderr", m.name());
+                } else {
+                    eprintln!("DIAG: unknown log module '{}'", name);
+                }
+            }
+        }
+    }
+
     machine.start();
     std::thread::spawn(|| {
         Machine::run_console_client();

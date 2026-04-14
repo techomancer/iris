@@ -179,12 +179,17 @@ impl ModuleLog {
 
 // ── DevLog ───────────────────────────────────────────────────────────────────
 
+/// Generic write+send sink used by DevLog. Holds either a TCP monitor connection
+/// or a host stream like stderr (for diagnostic mode).
+pub type DevLogWriter = Arc<Mutex<dyn Write + Send>>;
+
 pub struct DevLog {
     /// Fast-path gate: true if any module is enabled or any file sink is open.
     /// Checked before taking any lock. When false, dlog! is a two-load no-op.
     any_active: AtomicBool,
-    /// All currently connected monitor clients. Entries are pruned on write error.
-    writers: Mutex<Vec<Arc<Mutex<BufWriter<TcpStream>>>>>,
+    /// All currently connected monitor clients (and any host sinks like stderr).
+    /// Entries are pruned on write error.
+    writers: Mutex<Vec<DevLogWriter>>,
     modules: [ModuleLog; LogModule::COUNT],
 }
 
@@ -210,6 +215,11 @@ impl DevLog {
         self.writers.lock().push(w);
         // Writers alone don't activate log output — a module must be enabled too.
         // any_active is set when a module is enabled.
+    }
+
+    /// Register a generic Write+Send sink (e.g. stderr for diagnostic runs).
+    pub fn add_sink(&self, sink: DevLogWriter) {
+        self.writers.lock().push(sink);
     }
 
     /// Enable a module. Output will go to all connected monitor clients.
