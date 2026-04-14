@@ -7,7 +7,56 @@
 //! The probe interval adapts dynamically: frequent cache hits → shorter interval
 //! (probe more often), frequent misses → longer interval (less overhead).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+// Diagnostic: counts how many times a specific (non-compilable) instruction
+// type caused trace_block to terminate. Key encoding:
+//   bits 31..26: op
+//   bits 25..20: funct (for OP_SPECIAL) or rt (for OP_REGIMM), 0 otherwise
+//   bits 19..14: tier (0=Alu, 1=Loads, 2=Full)
+// Values are occurrence counts. Printed at shutdown to guide which
+// instructions to add next for the biggest block-length wins.
+static TERMINATION_STATS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
+
+fn record_termination(d: &DecodedInstr, tier: BlockTier) {
+    let op = d.op as u32;
+    let secondary = if op == crate::mips_isa::OP_SPECIAL {
+        d.funct as u32
+    } else if op == crate::mips_isa::OP_REGIMM {
+        d.rt as u32
+    } else {
+        0
+    };
+    let tier_bits = match tier {
+        BlockTier::Alu => 0,
+        BlockTier::Loads => 1,
+        BlockTier::Full => 2,
+    };
+    let key = (op << 26) | ((secondary & 0x3F) << 20) | (tier_bits << 14);
+    if let Ok(mut guard) = TERMINATION_STATS.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        *map.entry(key).or_insert(0) += 1;
+    }
+}
+
+fn dump_termination_stats() {
+    let Ok(guard) = TERMINATION_STATS.lock() else { return; };
+    let Some(map) = guard.as_ref() else { return; };
+    if map.is_empty() { return; }
+    let mut entries: Vec<(u32, u64)> = map.iter().map(|(k, v)| (*k, *v)).collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("JIT: top block-termination causes (op/secondary/tier → count):");
+    for (key, count) in entries.iter().take(20) {
+        let op = (key >> 26) & 0x3F;
+        let secondary = (key >> 20) & 0x3F;
+        let tier = (key >> 14) & 0x3;
+        let tier_name = match tier { 0 => "Alu", 1 => "Loads", 2 => "Full", _ => "?" };
+        eprintln!("  op={:#04x} secondary={:#04x} tier={} count={}",
+            op, secondary, tier_name, count);
+    }
+}
 
 use crate::mips_exec::{MipsExecutor, DecodedInstr, EXEC_BREAKPOINT, decode_into};
 use crate::mips_tlb::Tlb;
@@ -52,7 +101,7 @@ impl ProbeController {
         let base = std::env::var("IRIS_JIT_PROBE").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(200u32);
         let min = std::env::var("IRIS_JIT_PROBE_MIN").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(100u32);
+            .and_then(|v| v.parse().ok()).unwrap_or(50u32);
         let max = std::env::var("IRIS_JIT_PROBE_MAX").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(2000u32);
         Self {
@@ -155,6 +204,15 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     let mut promotions: u64 = 0;
     let mut demotions: u64 = 0;
     let mut rollbacks: u64 = 0;
+
+    // Chain diagnostics: how often does the chain break, and why?
+    let mut chain_starts: u64 = 0;     // times we entered the chain loop
+    let mut chain_blocks_run: u64 = 0; // total chained block executions
+    let mut chain_break_excluded: u64 = 0; // PROM/exc/delay at next_pc
+    let mut chain_break_translate: u64 = 0; // translate_pc failed
+    let mut chain_break_miss: u64 = 0;  // cache miss
+    let mut chain_break_exc: u64 = 0;   // exception in chained block
+    let mut chain_break_limit: u64 = 0; // hit MAX_CHAIN_INSTRS
 
     // Load saved profile — but DON'T eagerly compile above-Alu blocks.
     // trace_block calls debug_fetch_instr which reads memory at kernel
@@ -430,6 +488,176 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
 
                     total_jit_instrs += block_len as u64;
                     steps_in_batch += block_len;
+
+                    // Block chaining: after a normal JIT exit, try to run more
+                    // cached blocks without returning to the interpreter burst.
+                    // Skip in verify mode (per-block verification needed) and
+                    // for speculative blocks (snapshot/rollback adds complexity).
+                    // Break chain on: cache miss, exception, pending interrupt,
+                    // PROM/exc-vector/delay-slot PC, or max cumulative instrs.
+                    if !verify_mode {
+                        let mut chain_instrs: u32 = 0;
+                        const MAX_CHAIN_INSTRS: u32 = 32;
+                        chain_starts += 1;
+
+                        loop {
+                            if chain_instrs >= MAX_CHAIN_INSTRS {
+                                chain_break_limit += 1;
+                                break;
+                            }
+                            let (next_pc, next_delay) = (exec.core.pc, exec.in_delay_slot);
+                            let next_pc32 = next_pc as u32;
+                            let in_prom = (next_pc32 >= 0x9FC00000 && next_pc32 < 0xA0000000)
+                                || (next_pc32 >= 0xBFC00000);
+                            let in_exc = next_pc32 >= 0x80000000 && next_pc32 < 0x80000400;
+                            if in_prom || in_exc || next_delay {
+                                chain_break_excluded += 1;
+                                break;
+                            }
+
+                            // NOTE: No interrupt check here. IRIX's device
+                            // interrupts (IP2-IP6) are level-triggered and
+                            // frequently asserted; checking "enabled+pending"
+                            // would break nearly every chain immediately.
+                            // MAX_CHAIN_INSTRS caps worst-case interrupt
+                            // delivery latency.
+
+                            let next_phys = match translate_pc(exec, next_pc) {
+                                Some(p) => p,
+                                None => { chain_break_translate += 1; break; }
+                            };
+
+                            let (next_entry, next_block_len, next_is_speculative) =
+                                match cache.lookup(next_phys, next_pc) {
+                                    Some(b) => (b.entry, b.len_mips, b.speculative),
+                                    None => {
+                                        // Compile on miss at max_tier (not Alu).
+                                        // The main path always starts at Alu, but
+                                        // that fails if the first instruction is
+                                        // a load/store — leaving these PCs forever
+                                        // uncached. Compile at max_tier directly
+                                        // since Loads/Full tiers are proven stable.
+                                        let instrs = trace_block(exec, next_pc, max_tier);
+                                        if !instrs.is_empty() {
+                                            if let Some(mut block) = compiler.compile_block(&instrs, next_pc, max_tier) {
+                                                block.phys_addr = next_phys;
+                                                cache.insert(next_phys, next_pc, block);
+                                                blocks_compiled += 1;
+                                                probe.set_cache_size(cache.len() as u32);
+                                            }
+                                        }
+                                        chain_break_miss += 1;
+                                        break;
+                                    }
+                                };
+
+                            probe.record_hit();
+                            chain_blocks_run += 1;
+
+                            // Snapshot for speculative chained blocks (same
+                            // as main path). Non-speculative: no snapshot.
+                            let next_snapshot = if next_is_speculative {
+                                exec.tlb.clone_as_mips_tlb().map(|tlb| {
+                                    CpuRollbackSnapshot::capture(exec, tlb)
+                                })
+                            } else {
+                                None
+                            };
+
+                            ctx.sync_from_executor(exec);
+                            ctx.exit_reason = 0;
+                            let entry: extern "C" fn(*mut JitContext) = unsafe {
+                                std::mem::transmute(next_entry)
+                            };
+                            entry(&mut ctx);
+                            ctx.sync_to_executor(exec);
+
+                            if ctx.exit_reason == EXIT_EXCEPTION {
+                                // Exception in chained block. Speculative: roll
+                                // back and update demotion tracking. Either way:
+                                // advance cp0_count for instructions before the
+                                // fault, step the interpreter once, break chain.
+                                if let Some(snap) = &next_snapshot {
+                                    if next_is_speculative {
+                                        snap.restore(exec);
+                                        rollbacks += 1;
+                                        if let Some(blk) = cache.lookup_mut(next_phys, next_pc) {
+                                            blk.hit_count += 1;
+                                            blk.exception_count += 1;
+                                            blk.stable_hits = 0;
+                                            if blk.exception_count >= tier_cfg.demote {
+                                                if let Some(lower) = blk.tier.demote() {
+                                                    demotions += 1;
+                                                    eprintln!("JIT: demote {:016x} {:?}→{:?} ({}exc)",
+                                                        next_pc, blk.tier, lower, blk.exception_count);
+                                                    recompile_block_at_tier(
+                                                        &mut compiler, &mut cache, exec,
+                                                        next_phys, next_pc, lower,
+                                                        &mut blocks_compiled,
+                                                    );
+                                                } else {
+                                                    blk.speculative = false;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let instrs_before_fault = ctx.pc.wrapping_sub(next_pc) / 4;
+                                if instrs_before_fault > 0 {
+                                    let advance = exec.core.count_step.wrapping_mul(instrs_before_fault);
+                                    let prev = exec.core.cp0_count;
+                                    exec.core.cp0_count = prev.wrapping_add(advance) & 0x0000_FFFF_FFFF_FFFF;
+                                    if exec.core.cp0_compare != 0
+                                        && prev < exec.core.cp0_compare
+                                        && exec.core.cp0_count >= exec.core.cp0_compare
+                                    {
+                                        exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                                    }
+                                    exec.local_cycles += instrs_before_fault;
+                                }
+                                exec.step();
+                                total_interp_steps += 1;
+                                steps_in_batch += 1;
+                                chain_break_exc += 1;
+                                break;
+                            }
+
+                            // Normal exit: post-block bookkeeping (identical to
+                            // the main path's cp0_count advance + interrupt merge).
+                            let n = next_block_len as u64;
+                            let count_advance = exec.core.count_step.wrapping_mul(n);
+                            let prev = exec.core.cp0_count;
+                            exec.core.cp0_count = prev.wrapping_add(count_advance) & 0x0000_FFFF_FFFF_FFFF;
+                            if exec.core.cp0_compare != 0
+                                && prev < exec.core.cp0_compare
+                                && exec.core.cp0_count >= exec.core.cp0_compare
+                            {
+                                exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                                exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            exec.local_cycles += n;
+                            let pending = exec.core.interrupts.load(Ordering::Relaxed);
+                            if pending != 0 {
+                                use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
+                                let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
+                                exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
+                                    | (pending as u32 & ext_mask);
+                            }
+
+                            // Update block stats (no promotion in chain path —
+                            // the block already went through promotion checks
+                            // on its main-path execution).
+                            if let Some(blk) = cache.lookup_mut(next_phys, next_pc) {
+                                blk.hit_count += 1;
+                                blk.stable_hits += 1;
+                                blk.exception_count = 0;
+                            }
+
+                            total_jit_instrs += next_block_len as u64;
+                            steps_in_batch += next_block_len;
+                            chain_instrs += next_block_len;
+                        }
+                    }
                 }
             } else {
                 probe.record_miss();
@@ -503,6 +731,14 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     eprintln!("JIT: shutdown. {} blocks, {} jit / {} interp / {} total ({:.1}% jit), {}↑ {}↓ {}⟲, final_probe={}",
         blocks_compiled, total_jit_instrs, total_interp_steps, total,
         jit_pct, promotions, demotions, rollbacks, probe.interval);
+    let chain_avg = if chain_starts > 0 {
+        chain_blocks_run as f64 / chain_starts as f64
+    } else { 0.0 };
+    eprintln!("JIT: chains: {} starts, {} blocks run (avg {:.2}/chain), breaks: excluded={} translate={} miss={} exc={} limit={}",
+        chain_starts, chain_blocks_run, chain_avg,
+        chain_break_excluded, chain_break_translate, chain_break_miss,
+        chain_break_exc, chain_break_limit);
+    dump_termination_stats();
 
     // Save profile: all blocks above Alu tier
     let profile_entries: Vec<ProfileEntry> = cache.iter()
@@ -601,16 +837,18 @@ fn trace_block<T: Tlb, C: MipsCache>(
     start_pc: u64,
     tier: BlockTier,
 ) -> Vec<(u32, DecodedInstr)> {
-    // Loads-tier blocks are capped shorter to reduce interrupt delivery
-    // latency. The interpreter checks interrupts before every instruction;
-    // the JIT defers to block exit. Shorter blocks keep the maximum delay
-    // small enough that IRIX's interrupt handlers don't notice.
-    let max_len = match tier {
-        BlockTier::Loads => MAX_BLOCK_LEN,
-        _ => MAX_BLOCK_LEN,
-    };
+    let max_len = MAX_BLOCK_LEN;
     let mut instrs = Vec::with_capacity(max_len);
     let mut pc = start_pc;
+
+    // Full-tier blocks accumulate up to max_helpers load/store helper calls
+    // before terminating. Each helper emits an ok_block/exc_block CFG diamond.
+    // Too many chained diamonds trip Cranelift's regalloc2 and produce wrong
+    // code (confirmed by IRIS_JIT_VERIFY catching real GPR mismatches). The
+    // safe ceiling was empirically determined: aarch64 tolerates 3, x86_64
+    // only 1. Bumping past this threshold produces silent miscompilations.
+    let max_helpers: u32 = if cfg!(target_arch = "aarch64") { 3 } else { 1 };
+    let mut helper_count: u32 = 0;
 
     for _ in 0..max_len {
         let raw = match exec.debug_fetch_instr(pc) {
@@ -622,18 +860,21 @@ fn trace_block<T: Tlb, C: MipsCache>(
         d.raw = raw;
         decode_into::<T, C>(&mut d);
 
-        if !is_compilable_for_tier(&d, tier) { break; }
+        if !is_compilable_for_tier(&d, tier) {
+            record_termination(&d, tier);
+            break;
+        }
 
         let is_branch = is_branch_or_jump(&d);
-        // Terminate Full-tier blocks after each load or store to keep blocks
-        // short. Multiple helper calls create complex CFG (ok_block/exc_block
-        // diamonds) that triggers Cranelift regalloc2 issues on x86_64.
-        let has_helper = tier == BlockTier::Full
+        let is_helper_instr = tier == BlockTier::Full
             && (is_compilable_store(&d) || is_compilable_load(&d));
         instrs.push((raw, d));
 
-        if has_helper {
-            break;
+        if is_helper_instr {
+            helper_count += 1;
+            if helper_count >= max_helpers {
+                break;
+            }
         }
 
         if is_branch {
@@ -693,6 +934,12 @@ fn is_compilable_alu(d: &DecodedInstr) -> bool {
         ),
         OP_ADDIU | OP_DADDIU | OP_SLTI | OP_SLTIU |
         OP_ANDI | OP_ORI | OP_XORI | OP_LUI => true,
+        // MFC0/DMFC0 are read-only CP0 accesses — safe at Alu tier.
+        // MTC0/DMTC0 have side effects (Status→translate_fn, Compare→timer
+        // recalibration, Count writes, TLB ASID). Tested once and caused OOM
+        // during boot — needs deeper investigation. Emitters exist but gate
+        // stays off until we understand the failure mode.
+        OP_COP0 => matches!(d.rs as u32, RS_MFC0 | RS_DMFC0),
         _ => false,
     }
 }
@@ -716,7 +963,8 @@ fn is_branch_or_jump(d: &DecodedInstr) -> bool {
     match d.op as u32 {
         OP_BEQ | OP_BNE | OP_BLEZ | OP_BGTZ => true,
         OP_J | OP_JAL => true,
-        OP_SPECIAL => matches!(d.funct as u32, FUNCT_JR),
+        OP_SPECIAL => matches!(d.funct as u32, FUNCT_JR | FUNCT_JALR),
+        OP_REGIMM => matches!(d.rt as u32, RT_BLTZ | RT_BGEZ | RT_BLTZAL | RT_BGEZAL),
         _ => false,
     }
 }

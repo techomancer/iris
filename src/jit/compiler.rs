@@ -30,6 +30,10 @@ pub struct BlockCompiler {
     fn_write_u32: FuncId,
     fn_write_u64: FuncId,
     fn_interp_step: FuncId,
+    fn_mfc0: FuncId,
+    fn_dmfc0: FuncId,
+    fn_mtc0: FuncId,
+    fn_dmtc0: FuncId,
 }
 
 impl BlockCompiler {
@@ -53,6 +57,10 @@ impl BlockCompiler {
         jit_builder.symbol("jit_write_u32", helpers.write_u32);
         jit_builder.symbol("jit_write_u64", helpers.write_u64);
         jit_builder.symbol("jit_interp_step", helpers.interp_step);
+        jit_builder.symbol("jit_mfc0", helpers.mfc0);
+        jit_builder.symbol("jit_dmfc0", helpers.dmfc0);
+        jit_builder.symbol("jit_mtc0", helpers.mtc0);
+        jit_builder.symbol("jit_dmtc0", helpers.dmtc0);
 
         let mut jit_module = JITModule::new(jit_builder);
 
@@ -90,6 +98,13 @@ impl BlockCompiler {
         step_sig.returns.push(AbiParam::new(types::I64));
         let fn_interp_step = jit_module.declare_function("jit_interp_step", Linkage::Import, &step_sig).unwrap();
 
+        // mfc0/dmfc0(ctx_ptr, exec_ptr, rd) -> u64 — same shape as a read
+        let fn_mfc0 = jit_module.declare_function("jit_mfc0", Linkage::Import, &read_sig).unwrap();
+        let fn_dmfc0 = jit_module.declare_function("jit_dmfc0", Linkage::Import, &read_sig).unwrap();
+        // mtc0/dmtc0(ctx_ptr, exec_ptr, rd, value) -> u64 — same shape as a write
+        let fn_mtc0 = jit_module.declare_function("jit_mtc0", Linkage::Import, &write_sig).unwrap();
+        let fn_dmtc0 = jit_module.declare_function("jit_dmtc0", Linkage::Import, &write_sig).unwrap();
+
         Self {
             ctx: jit_module.make_context(),
             jit_module,
@@ -98,6 +113,8 @@ impl BlockCompiler {
             fn_read_u8, fn_read_u16, fn_read_u32, fn_read_u64,
             fn_write_u8, fn_write_u16, fn_write_u32, fn_write_u64,
             fn_interp_step,
+            fn_mfc0, fn_dmfc0,
+            fn_mtc0, fn_dmtc0,
         }
     }
 
@@ -157,6 +174,10 @@ impl BlockCompiler {
             write_u32: self.jit_module.declare_func_in_func(self.fn_write_u32, &mut builder.func),
             write_u64: self.jit_module.declare_func_in_func(self.fn_write_u64, &mut builder.func),
             interp_step: self.jit_module.declare_func_in_func(self.fn_interp_step, &mut builder.func),
+            mfc0:  self.jit_module.declare_func_in_func(self.fn_mfc0,  &mut builder.func),
+            dmfc0: self.jit_module.declare_func_in_func(self.fn_dmfc0, &mut builder.func),
+            mtc0:  self.jit_module.declare_func_in_func(self.fn_mtc0,  &mut builder.func),
+            dmtc0: self.jit_module.declare_func_in_func(self.fn_dmtc0, &mut builder.func),
         };
 
         // Load GPRs 1-31 from JitContext (gpr[0] is always 0)
@@ -314,6 +335,8 @@ struct EmitHelpers {
     read_u8: FuncRef, read_u16: FuncRef, read_u32: FuncRef, read_u64: FuncRef,
     write_u8: FuncRef, write_u16: FuncRef, write_u32: FuncRef, write_u64: FuncRef,
     interp_step: FuncRef,
+    mfc0: FuncRef, dmfc0: FuncRef,
+    mtc0: FuncRef, dmtc0: FuncRef,
 }
 
 /// Result of emitting a single instruction.
@@ -349,7 +372,7 @@ fn emit_instruction(
 
     match op {
         OP_SPECIAL => {
-            let result = emit_special(builder, gpr, hi, lo, d, rs, rt, rd, sa, funct);
+            let result = emit_special(builder, gpr, hi, lo, d, rs, rt, rd, sa, funct, instr_pc);
             // Conservative: mark rd modified for all SPECIAL ops that return Ok.
             // Harmless for ops that don't write rd (JR, MTHI, MTLO) since flush
             // will simply store the still-valid value that was loaded at block entry.
@@ -400,9 +423,62 @@ fn emit_instruction(
         OP_BLEZ  => emit_blez(builder, gpr, rs, d, instr_pc, false),
         OP_BGTZ  => emit_bgtz(builder, gpr, rs, d, instr_pc, false),
 
+        // --- REGIMM: BLTZ / BGEZ / BLTZAL / BGEZAL ---
+        OP_REGIMM => {
+            let rt_code = d.rt as u32;
+            match rt_code {
+                RT_BLTZ => emit_bltz(builder, gpr, rs, d, instr_pc),
+                RT_BGEZ => emit_bgez(builder, gpr, rs, d, instr_pc),
+                RT_BLTZAL => {
+                    // Link address written to $ra ($31) regardless of taken.
+                    let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
+                    gpr[31] = link;
+                    *modified_gprs |= 1u32 << 31;
+                    emit_bltz(builder, gpr, rs, d, instr_pc)
+                }
+                RT_BGEZAL => {
+                    let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
+                    gpr[31] = link;
+                    *modified_gprs |= 1u32 << 31;
+                    emit_bgez(builder, gpr, rs, d, instr_pc)
+                }
+                _ => EmitResult::Stop,
+            }
+        }
+
         // --- Jumps ---
         OP_J   => emit_j(builder, gpr, d, instr_pc),
         OP_JAL => { *modified_gprs |= 1 << 31; emit_jal(builder, gpr, d, instr_pc) }
+
+        // --- COP0: MFC0 / DMFC0 / MTC0 / DMTC0 ---
+        // CFC0/CTC0/TLB*/ERET still fall through to Stop.
+        OP_COP0 => {
+            let sub = rs as u32;  // rs field encodes the COP0 operation
+            match sub {
+                RS_MFC0 | RS_DMFC0 => {
+                    let helper = if sub == RS_MFC0 { helpers.mfc0 } else { helpers.dmfc0 };
+                    flush_modified_gprs(builder, gpr, ctx_ptr, modified_gprs);
+                    let rd_val = builder.ins().iconst(types::I64, rd as i64);
+                    let call = builder.ins().call(helper, &[ctx_ptr, exec_ptr, rd_val]);
+                    let result = builder.inst_results(call)[0];
+                    gpr[rt] = result;
+                    *modified_gprs |= 1u32 << rt;
+                    EmitResult::Ok
+                }
+                RS_MTC0 | RS_DMTC0 => {
+                    let helper = if sub == RS_MTC0 { helpers.mtc0 } else { helpers.dmtc0 };
+                    // Flush dirty GPRs so write_cp0 side effects (which may re-
+                    // derive translation state from full register context) see
+                    // a consistent picture.
+                    flush_modified_gprs(builder, gpr, ctx_ptr, modified_gprs);
+                    let rd_val = builder.ins().iconst(types::I64, rd as i64);
+                    let value = gpr[rt];
+                    let _ = builder.ins().call(helper, &[ctx_ptr, exec_ptr, rd_val, value]);
+                    EmitResult::Ok
+                }
+                _ => EmitResult::Stop,
+            }
+        }
 
         _ => EmitResult::Stop,
     }
@@ -415,6 +491,7 @@ fn emit_special(
     lo: &mut Value,
     d: &DecodedInstr,
     rs: usize, rt: usize, rd: usize, sa: u32, funct: u32,
+    instr_pc: u64,
 ) -> EmitResult {
     match funct {
         // --- Shifts (immediate) ---
@@ -477,13 +554,12 @@ fn emit_special(
         // --- JR / JALR ---
         FUNCT_JR   => { let target = gpr[rs]; EmitResult::Branch(target) }
         FUNCT_JALR => {
+            // JALR rd, rs: jump to gpr[rs], link PC+8 into gpr[rd].
+            // rd defaults to $ra ($31) when not specified in assembly.
             let target = gpr[rs];
-            let instr_pc_plus_8 = d.imm; // we'll handle this in dispatch; for now use rd
-            // JALR stores return address in rd (default $ra=31)
-            // But we don't know the PC here... pass it via a different mechanism.
-            // Actually: JALR rd, rs — stores PC+8 in rd.
-            // We don't have the PC as a value here. Let's defer JALR to interpreter.
-            EmitResult::Stop
+            let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
+            gpr[rd] = link;
+            EmitResult::Branch(target)
         }
 
         // --- SYNC (barrier, NOP for JIT) ---
@@ -998,6 +1074,34 @@ fn emit_bgtz(
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let zero = builder.ins().iconst(types::I64, 0);
     let cond = builder.ins().icmp(IntCC::SignedGreaterThan, gpr[rs], zero);
+    let target = builder.ins().select(cond, taken, not_taken);
+    EmitResult::Branch(target)
+}
+
+fn emit_bltz(
+    builder: &mut FunctionBuilder, gpr: &[Value; 32],
+    rs: usize, d: &DecodedInstr, instr_pc: u64,
+) -> EmitResult {
+    let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
+    let not_taken_pc = instr_pc.wrapping_add(8);
+    let taken = builder.ins().iconst(types::I64, taken_pc as i64);
+    let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let cond = builder.ins().icmp(IntCC::SignedLessThan, gpr[rs], zero);
+    let target = builder.ins().select(cond, taken, not_taken);
+    EmitResult::Branch(target)
+}
+
+fn emit_bgez(
+    builder: &mut FunctionBuilder, gpr: &[Value; 32],
+    rs: usize, d: &DecodedInstr, instr_pc: u64,
+) -> EmitResult {
+    let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
+    let not_taken_pc = instr_pc.wrapping_add(8);
+    let taken = builder.ins().iconst(types::I64, taken_pc as i64);
+    let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let cond = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, gpr[rs], zero);
     let target = builder.ins().select(cond, taken, not_taken);
     EmitResult::Branch(target)
 }

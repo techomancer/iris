@@ -129,6 +129,50 @@ pub extern "C" fn jit_interp_one_step<T: Tlb, C: MipsCache>(
     0
 }
 
+// ─── CP0 helpers ─────────────────────────────────────────────────────────────
+
+/// MFC0: read CP0 register `rd` as 32-bit sign-extended to 64.
+/// Random (rd=1) depends on cycle count; flush before read.
+pub extern "C" fn jit_mfc0<T: Tlb, C: MipsCache>(
+    _ctx_ptr: *mut JitContext, exec_ptr: *mut u8, rd: u64,
+) -> u64 {
+    let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
+    let rd_u32 = rd as u32;
+    if rd_u32 == 1 { exec.flush_cycles(); }
+    let v = exec.core.read_cp0(rd_u32);
+    // sign-extend 32→64 to match interpreter exec_mfc0
+    v as u32 as i32 as i64 as u64
+}
+
+/// DMFC0: read CP0 register `rd` as full 64-bit value.
+pub extern "C" fn jit_dmfc0<T: Tlb, C: MipsCache>(
+    _ctx_ptr: *mut JitContext, exec_ptr: *mut u8, rd: u64,
+) -> u64 {
+    let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
+    let rd_u32 = rd as u32;
+    if rd_u32 == 1 { exec.flush_cycles(); }
+    exec.core.read_cp0(rd_u32)
+}
+
+/// MTC0: write low 32 bits of `value` (sign-extended) into CP0 register `rd`.
+/// write_cp0 handles side effects (Status→translate_fn, Compare→timer, etc.).
+pub extern "C" fn jit_mtc0<T: Tlb, C: MipsCache>(
+    _ctx_ptr: *mut JitContext, exec_ptr: *mut u8, rd: u64, value: u64,
+) -> u64 {
+    let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
+    exec.core.write_cp0(rd as u32, value as u32 as i32 as i64 as u64);
+    0
+}
+
+/// DMTC0: write full 64-bit `value` into CP0 register `rd`.
+pub extern "C" fn jit_dmtc0<T: Tlb, C: MipsCache>(
+    _ctx_ptr: *mut JitContext, exec_ptr: *mut u8, rd: u64, value: u64,
+) -> u64 {
+    let exec = unsafe { &mut *opaque_exec::<T, C>(exec_ptr) };
+    exec.core.write_cp0(rd as u32, value);
+    0
+}
+
 /// Collection of monomorphized helper function pointers.
 pub struct HelperPtrs {
     pub read_u8:  *const u8,
@@ -140,6 +184,10 @@ pub struct HelperPtrs {
     pub write_u32: *const u8,
     pub write_u64: *const u8,
     pub interp_step: *const u8,
+    pub mfc0: *const u8,
+    pub dmfc0: *const u8,
+    pub mtc0: *const u8,
+    pub dmtc0: *const u8,
 }
 
 impl HelperPtrs {
@@ -154,6 +202,10 @@ impl HelperPtrs {
             write_u32: jit_write_u32::<T, C> as *const u8,
             write_u64: jit_write_u64::<T, C> as *const u8,
             interp_step: jit_interp_one_step::<T, C> as *const u8,
+            mfc0:  jit_mfc0::<T, C>  as *const u8,
+            dmfc0: jit_dmfc0::<T, C> as *const u8,
+            mtc0:  jit_mtc0::<T, C>  as *const u8,
+            dmtc0: jit_dmtc0::<T, C> as *const u8,
         }
     }
 }
