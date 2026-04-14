@@ -295,14 +295,14 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         if instrs_before_fault > 0 {
                             let advance = exec.core.count_step.wrapping_mul(instrs_before_fault);
                             let prev = exec.core.cp0_count;
-                            exec.core.cp0_count = prev.wrapping_add(advance) & 0x0000_FFFF_FFFF_FFFF;
+                            exec.core.cp0_count = prev.wrapping_add(advance);
                             if exec.core.cp0_compare != 0
                                 && prev < exec.core.cp0_compare
                                 && exec.core.cp0_count >= exec.core.cp0_compare
                             {
                                 exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                             }
-                            exec.local_cycles += instrs_before_fault;
+                            exec.core.local_cycles += instrs_before_fault;
                         }
                         exec.step();
                         total_interp_steps += 1;
@@ -396,7 +396,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         // Advance cp0_count by block_len * count_step
                         let count_advance = exec.core.count_step.wrapping_mul(n);
                         let prev = exec.core.cp0_count;
-                        exec.core.cp0_count = prev.wrapping_add(count_advance) & 0x0000_FFFF_FFFF_FFFF;
+                        exec.core.cp0_count = prev.wrapping_add(count_advance);
                         if exec.core.cp0_compare != 0
                             && prev < exec.core.cp0_compare
                             && exec.core.cp0_count >= exec.core.cp0_compare
@@ -404,7 +404,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                         }
                         // Credit local_cycles so the stats display shows correct MHz
-                        exec.local_cycles += n;
+                        exec.core.local_cycles += n;
 
                         // Check for pending interrupts — JIT blocks don't check per-
                         // instruction like the interpreter does. If an external interrupt

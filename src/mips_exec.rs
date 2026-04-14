@@ -568,9 +568,6 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub fpr_write_l: fn(&mut MipsCore, u32, u64),
     pub fpr_read_w:  fn(&MipsCore, u32) -> u32,
     pub fpr_write_w: fn(&mut MipsCore, u32, u32),
-    /// Local cycle counter — flushed to the shared atomic periodically to avoid
-    /// a locked bus op on every instruction.
-    pub(crate) local_cycles: u64,
     /// Cached external interrupt word — reloaded every 16 instructions.
     pub(crate) cached_pending: u64,
 }
@@ -726,7 +723,6 @@ For R4000SC/MC CPUs:
             fpr_write_l: crate::mips_core::write_fpr_l_fr0,
             fpr_read_w:  crate::mips_core::read_fpr_w_fr0,
             fpr_write_w: crate::mips_core::write_fpr_w_fr0,
-            local_cycles: 0,
             cached_pending: 0,
         };
 
@@ -852,16 +848,16 @@ For R4000SC/MC CPUs:
     /// Flush local cycle counter to the shared atomic.
     #[inline(always)]
     pub fn flush_cycles(&mut self) {
-        unsafe { &*self.cycles_ptr }.store(self.local_cycles, Ordering::Relaxed);
+        unsafe { &*self.cycles_ptr }.store(self.core.local_cycles, Ordering::Relaxed);
     }
 
     pub fn step(&mut self) -> ExecStatus {
         // Increment local cycle counter (flushed to atomic by outer loop)
-        self.local_cycles = self.local_cycles.wrapping_add(1);
+        self.core.local_cycles = self.core.local_cycles.wrapping_add(1);
 
         /*
         // Reload external interrupt state every 16 instructions
-        if self.local_cycles & 0xF == 0 {
+        if self.core.local_cycles & 0xF == 0 {
             self.cached_pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
         }
         let pending = self.cached_pending;
@@ -876,10 +872,11 @@ For R4000SC/MC CPUs:
         }
 
         // Advance cp0_count at calibrated wall-clock rate.
-        // cp0_count bits[47:16] are the hardware 32-bit count; bits[15:0] are the fraction.
-        // count_step is the per-instruction increment in the same 16.16 representation.
+        // cp0_count bits[63:32] are the hardware 32-bit count; bits[31:0] are the fraction (32.32 fp).
+        // count_step is the per-instruction increment in the same 32.32 representation.
+        // Plain wrapping_add gives free 32-bit wrap of the hardware count portion.
         let prev = self.core.cp0_count;
-        self.core.cp0_count = prev.wrapping_add(self.core.count_step) & 0x0000_FFFF_FFFF_FFFF;
+        self.core.cp0_count = prev.wrapping_add(self.core.count_step);
         if self.core.cp0_compare != 0 && prev < self.core.cp0_compare && self.core.cp0_count >= self.core.cp0_compare {
             self.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
             unsafe { &*self.fasttick_ptr }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5213,10 +5210,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                 let slow = exec.core.compare_delta_slow;
                 let fast = exec.core.compare_delta_fast;
                 let prev = exec.core.compare_delta_prev;
-                writeln!(writer, "  count_step={:#010x} ({:.4} hw/instr)",
-                    cs, cs as f64 / 65536.0).unwrap();
-                writeln!(writer, "  compare_delta_slow={:#010x} ({} hw-counts)  compare_delta_fast={:#010x} ({} hw-counts)  compare_delta_prev={:#010x} ({} hw-counts)",
-                    slow, slow >> 16, fast, fast >> 16, prev, prev >> 16).unwrap();
+                writeln!(writer, "  count_step={:#018x} ({:.4} hw/instr)",
+                    cs, cs as f64 / (1u64 << 32) as f64).unwrap();
+                writeln!(writer, "  compare_delta_slow={:#018x} ({} hw-counts)  compare_delta_fast={:#018x} ({} hw-counts)  compare_delta_prev={:#018x} ({} hw-counts)",
+                    slow, slow >> 32, fast, fast >> 32, prev, prev >> 32).unwrap();
                 Ok(())
             }
             "run" | "c" | "cont" => {

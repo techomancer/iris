@@ -69,12 +69,12 @@ pub struct MipsCore {
     pub cp0_pagemask: u64,    // 5: TLB Page Mask (64-bit, truncated in 32-bit mode)
     pub cp0_wired: u32,       // 6: TLB Wired boundary
     pub cp0_badvaddr: u64,    // 8: Bad Virtual Address
-    pub cp0_count: u64,       // 9: Timer Count — bits[47:16]=hardware count, bits[15:0]=fraction
+    pub cp0_count: u64,       // 9: Timer Count — bits[63:32]=hardware count, bits[31:0]=fraction (32.32 fp)
     pub cp0_entryhi: u64,     // 10: TLB Entry High (64-bit, truncated in 32-bit mode)
-    pub cp0_compare: u64,     // 11: Timer Compare — bits[47:16]=hardware compare, bits[15:0]=0
-    /// Per-instruction cp0_count increment in 16.16 fixed-point (same format as cp0_count).
+    pub cp0_compare: u64,     // 11: Timer Compare — bits[63:32]=hardware compare, bits[31:0]=0 (32.32 fp)
+    /// Per-instruction cp0_count increment in 32.32 fixed-point (same format as cp0_count).
     /// Calibrated on every cp0_compare write to hit the programmed interval in real time.
-    /// Default 1<<15 = 0.5 hardware counts per instruction (R4400: Count runs at half CPU clock).
+    /// Default 1<<31 = 0.5 hardware counts per instruction (R4400: Count runs at half CPU clock).
     pub count_step: u64,
     /// Atomic shadow of `count_step` — updated whenever count_step changes.
     /// Shared with the display refresh thread for status bar display.
@@ -87,13 +87,13 @@ pub struct MipsCore {
     /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences.
     #[cfg(feature = "developer_ip7")]
     pub compare_delta_stats: std::collections::HashMap<u32, u32>,
-    /// Learned slow-tick CP0 delta in hardware counts (16.16 fixed-point, >> 16 = integer counts).
+    /// Learned slow-tick CP0 delta in hardware counts (32.32 fixed-point, >> 32 = integer counts).
     /// Initialised to 0 (unknown). First delta seen is assumed to be the 100 Hz (slow) tick.
     pub compare_delta_slow: u64,
-    /// Learned fast-tick CP0 delta in hardware counts.
+    /// Learned fast-tick CP0 delta in hardware counts (32.32 fixed-point).
     /// Initialised to 0 (unknown). Set once we see a delta ~10x smaller than delta_slow.
     pub compare_delta_fast: u64,
-    /// The raw 16.16 fixed-point delta programmed in the *previous* Compare write.
+    /// The raw 32.32 fixed-point delta programmed in the *previous* Compare write.
     /// Used for calibration: dt_ns/dc measure the old interval, so count_step must be
     /// computed against the old delta, not the new one.  Zero = no previous write yet.
     pub compare_delta_prev: u64,
@@ -122,6 +122,10 @@ pub struct MipsCore {
     pub fpu_fexr: u32,        // 26: FP Exceptions
     pub fpu_fenr: u32,        // 28: FP Enables
     pub fpu_fcsr: u32,        // 31: FP Control/Status
+
+    /// Local (non-atomic) cycle counter — incremented every instruction by MipsExecutor::step().
+    /// Used by write_cp0 calibration to get an accurate dc without waiting for the atomic flush.
+    pub local_cycles: u64,
 
     // Interrupt handling
     // Bits 8..15 = IP0..IP7 (mirror CAUSE.IP layout).  Bit 63 = soft-reset request.
@@ -236,8 +240,8 @@ impl MipsCore {
             cp0_count: 0,
             cp0_entryhi: 0,
             cp0_compare: 0,
-            count_step: 1 << 15,
-            count_step_atomic: Arc::new(AtomicU64::new(1 << 15)),
+            count_step: 1 << 31,
+            count_step_atomic: Arc::new(AtomicU64::new(1 << 31)),
             compare_last_cycles: 0,
             compare_last_instant: std::time::Instant::now(),
             #[cfg(feature = "developer_ip7")]
@@ -267,6 +271,7 @@ impl MipsCore {
             fpu_fexr: 0,
             fpu_fenr: 0,
             fpu_fcsr: 0,
+            local_cycles: 0,
             interrupts: Arc::new(AtomicU64::new(0)),
             cycles: Arc::new(AtomicU64::new(0)),
             fasttick_count: Arc::new(AtomicU64::new(0)),
@@ -297,8 +302,9 @@ impl MipsCore {
             self.cp0_count = 0;
             self.cp0_entryhi = 0;
             self.cp0_compare = 0;
-            self.count_step = 1 << 15;
-            self.count_step_atomic.store(1 << 15, Ordering::Relaxed);
+            self.count_step = 1 << 31;
+            self.count_step_atomic.store(1 << 31, Ordering::Relaxed);
+            self.local_cycles = 0;
             self.compare_last_cycles = 0;
             self.compare_last_instant = std::time::Instant::now();
             self.cp0_random = self.tlb_entries - 1;
@@ -402,9 +408,9 @@ impl MipsCore {
             5 => self.cp0_pagemask & 0x01FFE000, // PageMask: only bits 24:13 are valid
             6 => self.cp0_wired as u64,
             8 => self.cp0_badvaddr,
-            9 => (self.cp0_count >> 16) & 0xFFFFFFFF,
+            9 => self.cp0_count >> 32,
             10 => self.cp0_entryhi,
-            11 => (self.cp0_compare >> 16) & 0xFFFFFFFF,
+            11 => self.cp0_compare >> 32,
             12 => self.cp0_status as u64,
             13 => self.cp0_cause as u64,
             14 => self.cp0_epc,
@@ -434,9 +440,9 @@ impl MipsCore {
             5 => self.cp0_pagemask & 0x01FFE000,
             6 => self.cp0_wired as u64,
             8 => self.cp0_badvaddr,
-            9 => (self.cp0_count >> 16) & 0xFFFFFFFF,
+            9 => self.cp0_count >> 32,
             10 => self.cp0_entryhi,
-            11 => (self.cp0_compare >> 16) & 0xFFFFFFFF,
+            11 => self.cp0_compare >> 32,
             12 => self.cp0_status as u64,
             13 => self.cp0_cause as u64,
             14 => self.cp0_epc,
@@ -458,7 +464,7 @@ impl MipsCore {
     /// Bin a CP0 Compare delta into a target tick period in nanoseconds
     /// (1_000_000 for 1 kHz, 10_000_000 for 100 Hz).
     ///
-    /// `delta` may be in any consistent unit (e.g. raw 16.16 fixed-point) — only the
+    /// `delta` may be in any consistent unit (e.g. raw 32.32 fixed-point) — only the
     /// ratios between slow and fast buckets matter.  Maintains two learned buckets:
     /// `compare_delta_slow` (100 Hz, seeded on first call) and `compare_delta_fast`
     /// (~10x smaller, 1 kHz).  All comparisons use ±5% fuzzy equality.
@@ -488,7 +494,8 @@ impl MipsCore {
         }
 
         // Check if d ≈ slow/10 (i.e. ~10x smaller → fast tick).
-        if fuzzy_eq(d * 10, self.compare_delta_slow) {
+        // Use division to avoid overflow; guard ensures slow has a meaningful integer part.
+        if self.compare_delta_slow >= (10 << 32) && fuzzy_eq(d, self.compare_delta_slow / 10) {
             self.compare_delta_fast = d;
             return Some(1_000_000);
         }
@@ -522,12 +529,12 @@ impl MipsCore {
                 self.cp0_random_cycle = self.cycles.load(Ordering::Relaxed);
             }
             8 => { /* BadVAddr is read-only */ }
-            9 => self.cp0_count = (value & 0xFFFFFFFF) << 16,
+            9 => self.cp0_count = value << 32,
             10 => { // always use 64bit mask because the entries need to be valid in 64 bit mode even when they were set from 32 bit mode
                 self.cp0_entryhi = value & 0xC000_00FF_FFFF_E0FF;
             },
             11 => {
-                self.cp0_compare = (value & 0xFFFFFFFF) << 16;
+                self.cp0_compare = value << 32;
                 // Clear timer interrupt when Compare is written
                 self.cp0_cause &= !CAUSE_IP7;
 
@@ -542,16 +549,21 @@ impl MipsCore {
                 // Only calibrate for ~1ms timer intervals (IRIX 1000 Hz scheduler);
                 // leave count_step unchanged for other timer uses (one-shot, low-freq).
                 let now = std::time::Instant::now();
-                let cycles_now = self.cycles.load(Ordering::Relaxed);
-                if self.compare_last_cycles != 0 {
+                let cycles_now = self.local_cycles;
+                // Compute new_delta before the calibration block so we can guard on it.
+                // Top bit set means cp0_count > cp0_compare — counter hasn't wrapped correctly
+                // or the kernel is writing a compare in the past. Skip calibration entirely.
+                let new_delta = self.cp0_compare.wrapping_sub(self.cp0_count);
+                if new_delta >> 63 != 0 {
+                    self.compare_last_cycles = cycles_now;
+                    self.compare_last_instant = now;
+                } else if self.compare_last_cycles != 0 {
                     let dc = cycles_now.wrapping_sub(self.compare_last_cycles);
                     let dt_ns = now.duration_since(self.compare_last_instant).as_nanos() as u64;
-                    // New delta being programmed (what the *next* interval will fire at),
-                    // stored as raw 16.16 fixed-point for use in the next calibration.
-                    let new_delta = self.cp0_compare.wrapping_sub(self.cp0_count);
+                    // new_delta: what the *next* interval will fire at, stored as 32.32 fp.
                     #[cfg(feature = "developer_ip7")]
                     {
-                        let bucket = ((new_delta >> 16) as u32 / 100) * 100;
+                        let bucket = ((new_delta >> 32) as u32 / 100) * 100;
                         *self.compare_delta_stats.entry(bucket).or_insert(0) += 1;
                     }
                     // dt_ns/dc measure the interval since the last Compare write, which
@@ -562,24 +574,24 @@ impl MipsCore {
                     if prev_delta != 0 {
                         if let Some(snapped_ns) = self.bin_compare_delta(prev_delta) {
                             if dc > 0 {
-                                let denom = dc.saturating_mul(snapped_ns);
-                                self.count_step = (prev_delta.saturating_mul(dt_ns) / denom)
-                                    .clamp(1 << 12, 10 << 15);
+                                let denom = (dc as u128).saturating_mul(snapped_ns.into());
+                                self.count_step = ((prev_delta as u128).saturating_mul(dt_ns.into()) / denom)
+                                    .clamp(1 << 30, 10 << 31) as u64;
                                 #[cfg(feature = "developer_ip7")]
                                 {
                                     let total_samples: u32 = self.compare_delta_stats.values().sum();
                                     if total_samples <= 10 {
                                         eprintln!("compare calib: prev_d={} new_d={} dt_ns={} dc={} \
                                             snapped={}ms slow={} fast={} count_step={}",
-                                            prev_delta >> 16, new_delta >> 16, dt_ns, dc,
+                                            prev_delta >> 32, new_delta >> 32, dt_ns, dc,
                                             snapped_ns / 1_000_000,
-                                            self.compare_delta_slow >> 16,
-                                            self.compare_delta_fast >> 16,
+                                            self.compare_delta_slow >> 32,
+                                            self.compare_delta_fast >> 32,
                                             self.count_step);
                                     }
                                 }
                             } else {
-                                self.count_step = 1 << 15;
+                                self.count_step = 1 << 31;
                             }
                             self.count_step_atomic.store(self.count_step, Ordering::Relaxed);
                         }

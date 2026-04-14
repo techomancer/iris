@@ -124,7 +124,7 @@ impl JitContext {
         self.in_delay_slot = exec.in_delay_slot;
         self.delay_slot_target = exec.delay_slot_target;
         self.cached_pending = exec.cached_pending;
-        self.local_cycles = exec.local_cycles;
+        self.local_cycles = exec.core.local_cycles;
     }
 
     /// Copy JitContext state back to the emulator.

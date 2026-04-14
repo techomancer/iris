@@ -984,7 +984,7 @@ impl StatusBar {
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:05x} g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_step, stats.gfifo_pending);
+        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cs:{:08x} g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_step >> 32, stats.gfifo_pending);
         #[cfg(not(feature = "developer"))]
         let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.fasthz);
 
