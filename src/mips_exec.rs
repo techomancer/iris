@@ -924,7 +924,10 @@ For R4000SC/MC CPUs:
         } else {
             fetch.status
         };
-        self.skip_breakpoints = false;
+
+        if cfg!(not(feature = "lightning")) {
+            self.skip_breakpoints = false;
+        }
         result
     }
 
