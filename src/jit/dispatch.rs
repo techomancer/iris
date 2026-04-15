@@ -7,7 +7,7 @@
 //! The probe interval adapts dynamically: frequent cache hits → shorter interval
 //! (probe more often), frequent misses → longer interval (less overhead).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -214,12 +214,21 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
     let mut chain_break_exc: u64 = 0;   // exception in chained block
     let mut chain_break_limit: u64 = 0; // hit MAX_CHAIN_INSTRS
 
-    // Load saved profile but DON'T pre-compile. Two attempts at pre-
-    // compilation (upfront and incremental) both triggered IRIX UTLB-miss
-    // panics after PROM exit. Likely the I-cache side effects of many
-    // debug_fetch_instr calls during pre-compile evict L2/D-cache lines the
-    // kernel depends on, or something subtler. Blocks compile on-demand.
-    let _profile_entries = profile::load_profile();
+    // Load saved profile. Bulk pre-compilation at startup evicts L2/D-cache
+    // lines the kernel depends on (caused UTLB panics in prior attempts).
+    // Instead, replay drip-feeds one entry per probe — but only after the
+    // kernel reaches userspace, so PROM/early-kernel boot is completely
+    // unaffected. Entries arrive sorted by hit_count descending (hottest first).
+    let mut profile_queue: VecDeque<ProfileEntry> =
+        VecDeque::from(profile::load_profile());
+    let profile_total: u64 = profile_queue.len() as u64;
+    // Phase 1 state: detect boot has settled (kernel has reached userspace).
+    let mut saw_userspace = false;
+    let mut boot_settled_count: u32 = 0;
+    const BOOT_SETTLE_THRESHOLD: u32 = 100;
+    let mut profile_replay_active = false;
+    let mut profile_replayed: u64 = 0;
+    let mut profile_stale: u64 = 0;
 
     while running.load(Ordering::Relaxed) {
         let mut steps_in_batch: u32 = 0;
@@ -260,6 +269,25 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             if in_prom || in_exc || in_delay_slot {
                 probe.record_miss();
                 continue;
+            }
+
+            // Boot-settle detection (Phase 1 of deferred profile replay).
+            // Wait for the first userspace PC (pc32 < 0x80000000 = kuseg),
+            // then count 100 more probes before activating replay. This
+            // ensures the kernel is past init, running init(1M) or later
+            // user processes, before we start re-compiling saved blocks.
+            if !profile_replay_active && !profile_queue.is_empty() {
+                if !saw_userspace && pc32 < 0x80000000 {
+                    saw_userspace = true;
+                }
+                if saw_userspace {
+                    boot_settled_count += 1;
+                    if boot_settled_count >= BOOT_SETTLE_THRESHOLD {
+                        profile_replay_active = true;
+                        eprintln!("JIT profile: boot settled, replaying {} saved blocks",
+                            profile_queue.len());
+                    }
+                }
             }
 
 
@@ -675,6 +703,31 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                     }
                 }
             }
+
+            // Phase 2 of deferred profile replay: drip-feed one saved block
+            // per probe as background work. The normal probe logic above
+            // already ran (including compile-current-PC on miss), so this
+            // is purely additive. Saved entries are sorted by hit_count
+            // descending, so the hottest blocks replay first.
+            if profile_replay_active {
+                if let Some(entry) = profile_queue.pop_front() {
+                    let exec = unsafe { &mut *exec_ptr };
+                    replay_one_profile_entry(
+                        &entry, &mut compiler, &mut cache, exec,
+                        &mut blocks_compiled, &mut profile_replayed,
+                        &mut profile_stale,
+                    );
+                    probe.set_cache_size(cache.len() as u32);
+                    if profile_replayed > 0 && profile_replayed % 1000 == 0 {
+                        eprintln!("JIT profile: replayed {}/{} ({} stale)",
+                            profile_replayed, profile_total, profile_stale);
+                    }
+                    if profile_queue.is_empty() {
+                        eprintln!("JIT profile: replay complete, {} compiled / {} stale",
+                            profile_replayed, profile_stale);
+                    }
+                }
+            }
         }
 
         {
@@ -738,19 +791,93 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         chain_break_exc, chain_break_limit);
     dump_termination_stats();
 
-    // Save profile: all blocks above Alu tier
+    // Save profile: kernel-space blocks above Alu tier only. Userspace blocks
+    // are per-process and ephemeral — a saved userspace VA may belong to a
+    // completely different process next session, or to nothing. Kernel code
+    // (kseg0/kseg1, pc32 >= 0x80000000) is shared and stable, so replay is
+    // meaningful. Without this filter the profile grows unboundedly with
+    // ephemeral process blocks and replay causes post-login corruption.
     let profile_entries: Vec<ProfileEntry> = cache.iter()
         .filter(|(_, block)| block.tier > BlockTier::Alu)
+        .filter(|(_, block)| (block.virt_addr as u32) >= 0x80000000)
         .map(|(&(phys_pc, _virt_pc), block)| ProfileEntry {
             phys_pc,
             virt_pc: block.virt_addr,
             tier: block.tier,
+            len_mips: block.len_mips,
+            content_hash: block.content_hash,
+            hit_count: block.hit_count,
         })
         .collect();
     if !profile_entries.is_empty() {
         if let Err(e) = profile::save_profile(&profile_entries) {
             eprintln!("JIT profile: save failed: {}", e);
         }
+    }
+}
+
+/// Replay one profile entry: re-derive physical address from saved virt_pc,
+/// re-trace the block, validate content hash, and insert into the cache if
+/// everything still matches. Enters as speculative with zeroed counters —
+/// the profile is a hint, not a guarantee, and each replayed block must
+/// re-prove stability this session before being trusted.
+///
+/// Silently discards entries that can't be validated (unmapped pages,
+/// different code at the saved VA, already-cached blocks).
+fn replay_one_profile_entry<T: Tlb, C: MipsCache>(
+    entry: &ProfileEntry,
+    compiler: &mut BlockCompiler,
+    cache: &mut CodeCache,
+    exec: &mut MipsExecutor<T, C>,
+    blocks_compiled: &mut u64,
+    profile_replayed: &mut u64,
+    profile_stale: &mut u64,
+) {
+    // Re-derive phys_pc — saved phys_pc is for diagnostics only. TLB state
+    // differs between sessions, so the same virt_pc may map elsewhere now.
+    let phys_pc = match translate_pc(exec, entry.virt_pc) {
+        Some(p) => p,
+        None => { *profile_stale += 1; return; } // page not mapped this session
+    };
+
+    // Skip if a block already exists at this (phys_pc, virt_pc). This can
+    // happen if normal compilation beat us to it, or a prior replay already
+    // processed this entry (defensive).
+    if cache.contains(phys_pc, entry.virt_pc) {
+        return;
+    }
+
+    let instrs = trace_block(exec, entry.virt_pc, entry.tier);
+    if instrs.is_empty() {
+        *profile_stale += 1;
+        return;
+    }
+
+    // Cheap length check first, then definitive hash check. Either mismatch
+    // means the code at this VA is different from what we saw last session.
+    if instrs.len() as u32 != entry.len_mips {
+        *profile_stale += 1;
+        return;
+    }
+    let content_hash = super::compiler::hash_block_instrs(&instrs);
+    if content_hash != entry.content_hash {
+        *profile_stale += 1;
+        return;
+    }
+
+    if let Some(mut block) = compiler.compile_block(&instrs, entry.virt_pc, entry.tier) {
+        block.phys_addr = phys_pc;
+        // Zero all counters — no penalty baggage from prior session.
+        // speculative is left as compile_block set it: Full-tier is NOT
+        // speculative because rollback can't un-do stores (memory diverges
+        // from CPU state). Alu/Loads tiers are speculative and will re-prove
+        // stability via the normal snapshot/rollback path this session.
+        block.hit_count = 0;
+        block.stable_hits = 0;
+        block.exception_count = 0;
+        cache.insert(phys_pc, entry.virt_pc, block);
+        *blocks_compiled += 1;
+        *profile_replayed += 1;
     }
 }
 

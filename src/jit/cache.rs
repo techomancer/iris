@@ -74,6 +74,9 @@ pub struct CompiledBlock {
     pub stable_hits:     u32,
     /// True when this block is in a trial period (not yet fully trusted at current tier).
     pub speculative:     bool,
+    /// FNV-1a hash of the raw instruction words; used to detect stale profile
+    /// entries when a different DSO is loaded at the same virtual address.
+    pub content_hash:    u32,
 }
 
 // Safety: CompiledBlock is only accessed from the CPU thread.
@@ -100,6 +103,10 @@ impl CodeCache {
 
     pub fn lookup(&self, phys_pc: u64, virt_pc: u64) -> Option<&CompiledBlock> {
         self.blocks.get(&(phys_pc, virt_pc))
+    }
+
+    pub fn contains(&self, phys_pc: u64, virt_pc: u64) -> bool {
+        self.blocks.contains_key(&(phys_pc, virt_pc))
     }
 
     pub fn lookup_mut(&mut self, phys_pc: u64, virt_pc: u64) -> Option<&mut CompiledBlock> {

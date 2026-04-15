@@ -316,6 +316,8 @@ impl BlockCompiler {
         let code_ptr = self.jit_module.get_finalized_function(func_id);
         let code_size = 0u32; // JITModule doesn't expose size easily; not critical
 
+        let content_hash = hash_block_instrs(instrs);
+
         Some(CompiledBlock {
             entry: code_ptr,
             phys_addr: 0, // filled in by caller
@@ -332,8 +334,23 @@ impl BlockCompiler {
             hit_count: 0,
             exception_count: 0,
             stable_hits: 0,
+            content_hash,
         })
     }
+}
+
+/// FNV-1a 32-bit hash of raw instruction words. Used to detect stale profile
+/// entries: a different DSO loaded at the same virtual address will have the
+/// same length but different instruction bytes.
+pub fn hash_block_instrs(instrs: &[(u32, DecodedInstr)]) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for (raw, _) in instrs {
+        for byte in raw.to_le_bytes() {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+    }
+    hash
 }
 
 /// Helper function references for memory operations within a compiled function.
