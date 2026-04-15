@@ -877,7 +877,7 @@ For R4000SC/MC CPUs:
         // Plain wrapping_add gives free 32-bit wrap of the hardware count portion.
         let prev = self.core.cp0_count;
         self.core.cp0_count = prev.wrapping_add(self.core.count_step);
-        if self.core.cp0_compare != 0 && prev < self.core.cp0_compare && self.core.cp0_count >= self.core.cp0_compare {
+        if self.core.cp0_compare.wrapping_sub(prev) <= self.core.count_step {
             self.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
             unsafe { &*self.fasttick_ptr }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

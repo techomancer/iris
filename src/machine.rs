@@ -45,8 +45,8 @@ pub fn emulator_name() -> &'static str {
             return "Irresponsible Rust IRIX Simulator".to_string();
         }
 
-        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive"];
-        let thirds = ["IRIX", "Indy", "Iris"];
+        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable"];
+        let thirds = ["IRIX", "Indy", "Iris", "IP22"];
         let fourths = ["Simulator", "System", "Substitute", "Sandbox"];
 
         let first = firsts[((now / 4) % firsts.len() as u64) as usize];

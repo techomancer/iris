@@ -296,10 +296,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             let advance = exec.core.count_step.wrapping_mul(instrs_before_fault);
                             let prev = exec.core.cp0_count;
                             exec.core.cp0_count = prev.wrapping_add(advance);
-                            if exec.core.cp0_compare != 0
-                                && prev < exec.core.cp0_compare
-                                && exec.core.cp0_count >= exec.core.cp0_compare
-                            {
+                            if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
                                 exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                             }
                             exec.core.local_cycles += instrs_before_fault;
@@ -397,10 +394,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                         let count_advance = exec.core.count_step.wrapping_mul(n);
                         let prev = exec.core.cp0_count;
                         exec.core.cp0_count = prev.wrapping_add(count_advance);
-                        if exec.core.cp0_compare != 0
-                            && prev < exec.core.cp0_compare
-                            && exec.core.cp0_count >= exec.core.cp0_compare
-                        {
+                        if exec.core.cp0_compare.wrapping_sub(prev) <= count_advance {
                             exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                         }
                         // Credit local_cycles so the stats display shows correct MHz
