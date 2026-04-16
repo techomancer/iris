@@ -190,6 +190,23 @@ pub struct HelperPtrs {
     pub dmtc0: *const u8,
 }
 
+// These are stable monomorphized function pointers, safe to send across threads.
+unsafe impl Send for HelperPtrs {}
+
+impl Clone for HelperPtrs {
+    fn clone(&self) -> Self {
+        Self {
+            read_u8: self.read_u8, read_u16: self.read_u16,
+            read_u32: self.read_u32, read_u64: self.read_u64,
+            write_u8: self.write_u8, write_u16: self.write_u16,
+            write_u32: self.write_u32, write_u64: self.write_u64,
+            interp_step: self.interp_step,
+            mfc0: self.mfc0, dmfc0: self.dmfc0,
+            mtc0: self.mtc0, dmtc0: self.dmtc0,
+        }
+    }
+}
+
 impl HelperPtrs {
     pub fn new<T: Tlb, C: MipsCache>() -> Self {
         Self {

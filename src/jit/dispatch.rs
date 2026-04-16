@@ -11,6 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use super::async_compiler::{AsyncCompiler, CompileRequest, CompileKind};
+
 // Diagnostic: counts how many times a specific (non-compilable) instruction
 // type caused trace_block to terminate. Key encoding:
 //   bits 31..26: op
@@ -63,7 +65,6 @@ use crate::mips_tlb::Tlb;
 use crate::mips_cache_v2::MipsCache;
 
 use super::cache::{BlockTier, CodeCache, TierConfig};
-use super::compiler::BlockCompiler;
 use super::context::{JitContext, EXIT_NORMAL, EXIT_EXCEPTION};
 use super::helpers::HelperPtrs;
 use super::profile::{self, ProfileEntry};
@@ -191,7 +192,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         max_tier, verify_mode, probe.interval, probe.min_interval, probe.max_interval,
         tier_cfg.stable, tier_cfg.promote, tier_cfg.demote);
     let helpers = HelperPtrs::new::<T, C>();
-    let mut compiler = BlockCompiler::new(&helpers);
+    let mut async_comp = AsyncCompiler::new(helpers.clone());
     let mut cache = CodeCache::new();
     let mut ctx = JitContext::new();
     ctx.executor_ptr = exec_ptr as u64;
@@ -256,6 +257,33 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             total_interp_steps += burst as u64;
 
             if !running.load(Ordering::Relaxed) { break; }
+
+            // Drain completed compilations from background thread
+            while let Some(result) = async_comp.try_recv() {
+                match result.kind {
+                    CompileKind::New => {
+                        if !cache.contains(result.phys_pc, result.virt_pc) {
+                            cache.insert(result.phys_pc, result.virt_pc, result.block);
+                            blocks_compiled += 1;
+                            probe.set_cache_size(cache.len() as u32);
+                        }
+                    }
+                    CompileKind::Recompile => {
+                        cache.replace(result.phys_pc, result.virt_pc, result.block);
+                        blocks_compiled += 1;
+                    }
+                    CompileKind::ProfileReplay { content_hash } => {
+                        if !cache.contains(result.phys_pc, result.virt_pc)
+                            && result.block.content_hash == content_hash
+                        {
+                            cache.insert(result.phys_pc, result.virt_pc, result.block);
+                            blocks_compiled += 1;
+                            profile_replayed += 1;
+                            probe.set_cache_size(cache.len() as u32);
+                        }
+                    }
+                }
+            }
 
             // Probe the JIT code cache
             let (pc, in_delay_slot) = {
@@ -345,14 +373,18 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
 
                                     if block.exception_count >= tier_cfg.demote {
                                         if let Some(lower) = block.tier.demote() {
+                                            let old_tier = block.tier;
                                             demotions += 1;
                                             eprintln!("JIT: demote {:016x} {:?}→{:?} ({}exc)",
-                                                pc, block.tier, lower, block.exception_count);
-                                            recompile_block_at_tier(
-                                                &mut compiler, &mut cache, exec,
-                                                phys_pc, pc, lower,
-                                                &mut blocks_compiled,
-                                            );
+                                                pc, old_tier, lower, block.exception_count);
+                                            cache.invalidate_range(phys_pc, phys_pc + 4);
+                                            let instrs = trace_block(exec, pc, lower);
+                                            if !instrs.is_empty() {
+                                                async_comp.submit(CompileRequest {
+                                                    instrs, block_pc: pc, phys_pc,
+                                                    tier: lower, kind: CompileKind::Recompile,
+                                                });
+                                            }
                                         } else {
                                             block.speculative = false;
                                         }
@@ -503,11 +535,13 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 promotions += 1;
                                 eprintln!("JIT: promote {:016x} {:?}→{:?} ({}hits)",
                                     pc, block.tier, next, block.hit_count);
-                                recompile_block_at_tier(
-                                    &mut compiler, &mut cache, exec,
-                                    phys_pc, pc, next,
-                                    &mut blocks_compiled,
-                                );
+                                let instrs = trace_block(exec, pc, next);
+                                if !instrs.is_empty() {
+                                    async_comp.submit(CompileRequest {
+                                        instrs, block_pc: pc, phys_pc,
+                                        tier: next, kind: CompileKind::Recompile,
+                                    });
+                                }
                             }
                         }
                     }
@@ -557,19 +591,13 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 match cache.lookup(next_phys, next_pc) {
                                     Some(b) => (b.entry, b.len_mips, b.speculative),
                                     None => {
-                                        // Compile on miss at max_tier (not Alu).
-                                        // The main path always starts at Alu, but
-                                        // that fails if the first instruction is
-                                        // a load/store — leaving these PCs forever
-                                        // uncached. Compile at max_tier directly
-                                        // since Loads/Full tiers are proven stable.
-                                        let instrs = trace_block(exec, next_pc, max_tier);
-                                        if !instrs.is_empty() {
-                                            if let Some(mut block) = compiler.compile_block(&instrs, next_pc, max_tier) {
-                                                block.phys_addr = next_phys;
-                                                cache.insert(next_phys, next_pc, block);
-                                                blocks_compiled += 1;
-                                                probe.set_cache_size(cache.len() as u32);
+                                        if !async_comp.pending.contains(&(next_phys, next_pc)) {
+                                            let instrs = trace_block(exec, next_pc, max_tier);
+                                            if !instrs.is_empty() {
+                                                async_comp.submit(CompileRequest {
+                                                    instrs, block_pc: next_pc, phys_pc: next_phys,
+                                                    tier: max_tier, kind: CompileKind::New,
+                                                });
                                             }
                                         }
                                         chain_break_miss += 1;
@@ -613,14 +641,18 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                             blk.stable_hits = 0;
                                             if blk.exception_count >= tier_cfg.demote {
                                                 if let Some(lower) = blk.tier.demote() {
+                                                    let old_tier = blk.tier;
                                                     demotions += 1;
                                                     eprintln!("JIT: demote {:016x} {:?}→{:?} ({}exc)",
-                                                        next_pc, blk.tier, lower, blk.exception_count);
-                                                    recompile_block_at_tier(
-                                                        &mut compiler, &mut cache, exec,
-                                                        next_phys, next_pc, lower,
-                                                        &mut blocks_compiled,
-                                                    );
+                                                        next_pc, old_tier, lower, blk.exception_count);
+                                                    cache.invalidate_range(next_phys, next_phys + 4);
+                                                    let instrs = trace_block(exec, next_pc, lower);
+                                                    if !instrs.is_empty() {
+                                                        async_comp.submit(CompileRequest {
+                                                            instrs, block_pc: next_pc, phys_pc: next_phys,
+                                                            tier: lower, kind: CompileKind::Recompile,
+                                                        });
+                                                    }
                                                 } else {
                                                     blk.speculative = false;
                                                 }
@@ -681,19 +713,14 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 }
             } else {
                 probe.record_miss();
-                // Cache miss — compile at Alu tier
-                let exec = unsafe { &mut *exec_ptr };
-                let instrs = trace_block(exec, pc, BlockTier::Alu);
-                if !instrs.is_empty() {
-                    if let Some(mut block) = compiler.compile_block(&instrs, pc, BlockTier::Alu) {
-                        block.phys_addr = phys_pc;
-                        cache.insert(phys_pc, pc, block);
-                        blocks_compiled += 1;
-                        probe.set_cache_size(cache.len() as u32);
-                        if blocks_compiled <= 10 || blocks_compiled % 500 == 0 {
-                            eprintln!("JIT: compiled #{} at {:016x} ({} instrs, tier=Alu, cache={})",
-                                blocks_compiled, pc, instrs.len(), cache.len());
-                        }
+                if !async_comp.pending.contains(&(phys_pc, pc)) {
+                    let exec = unsafe { &mut *exec_ptr };
+                    let instrs = trace_block(exec, pc, BlockTier::Alu);
+                    if !instrs.is_empty() {
+                        async_comp.submit(CompileRequest {
+                            instrs, block_pc: pc, phys_pc,
+                            tier: BlockTier::Alu, kind: CompileKind::New,
+                        });
                     }
                 }
             }
@@ -706,15 +733,27 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             if profile_replay_active {
                 if let Some(entry) = profile_queue.pop_front() {
                     let exec = unsafe { &mut *exec_ptr };
-                    replay_one_profile_entry(
-                        &entry, &mut compiler, &mut cache, exec,
-                        &mut blocks_compiled, &mut profile_replayed,
-                        &mut profile_stale,
-                    );
-                    probe.set_cache_size(cache.len() as u32);
-                    if profile_replayed > 0 && profile_replayed % 1000 == 0 {
-                        eprintln!("JIT profile: replayed {}/{} ({} stale)",
-                            profile_replayed, profile_total, profile_stale);
+                    let phys = translate_pc(exec, entry.virt_pc);
+                    if let Some(phys_pc) = phys {
+                        if !cache.contains(phys_pc, entry.virt_pc)
+                            && !async_comp.pending.contains(&(phys_pc, entry.virt_pc))
+                        {
+                            let instrs = trace_block(exec, entry.virt_pc, entry.tier);
+                            if !instrs.is_empty() {
+                                let content_hash = super::compiler::hash_block_instrs(&instrs);
+                                if instrs.len() as u32 == entry.len_mips
+                                    && content_hash == entry.content_hash
+                                {
+                                    async_comp.submit(CompileRequest {
+                                        instrs, block_pc: entry.virt_pc, phys_pc,
+                                        tier: entry.tier,
+                                        kind: CompileKind::ProfileReplay { content_hash },
+                                    });
+                                } else {
+                                    profile_stale += 1;
+                                }
+                            }
+                        }
                     }
                     if profile_queue.is_empty() {
                         eprintln!("JIT profile: replay complete, {} compiled / {} stale",
@@ -764,6 +803,23 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             eprintln!("JIT: {} total ({:.1}% jit), {} blocks, {}↑ {}↓ {}⟲, probe={}(eff {}), pc={:016x}",
                 total, jit_pct, blocks_compiled, promotions, demotions, rollbacks,
                 probe.interval, effective_probe, exec.core.pc);
+        }
+    }
+
+    // Shut down background compiler and drain remaining results
+    async_comp.shutdown();
+    while let Some(result) = async_comp.try_recv() {
+        match result.kind {
+            CompileKind::New | CompileKind::ProfileReplay { .. } => {
+                if !cache.contains(result.phys_pc, result.virt_pc) {
+                    cache.insert(result.phys_pc, result.virt_pc, result.block);
+                    blocks_compiled += 1;
+                }
+            }
+            CompileKind::Recompile => {
+                cache.replace(result.phys_pc, result.virt_pc, result.block);
+                blocks_compiled += 1;
+            }
         }
     }
 
@@ -818,83 +874,6 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
 ///
 /// Silently discards entries that can't be validated (unmapped pages,
 /// different code at the saved VA, already-cached blocks).
-fn replay_one_profile_entry<T: Tlb, C: MipsCache>(
-    entry: &ProfileEntry,
-    compiler: &mut BlockCompiler,
-    cache: &mut CodeCache,
-    exec: &mut MipsExecutor<T, C>,
-    blocks_compiled: &mut u64,
-    profile_replayed: &mut u64,
-    profile_stale: &mut u64,
-) {
-    // Re-derive phys_pc — saved phys_pc is for diagnostics only. TLB state
-    // differs between sessions, so the same virt_pc may map elsewhere now.
-    let phys_pc = match translate_pc(exec, entry.virt_pc) {
-        Some(p) => p,
-        None => { *profile_stale += 1; return; } // page not mapped this session
-    };
-
-    // Skip if a block already exists at this (phys_pc, virt_pc). This can
-    // happen if normal compilation beat us to it, or a prior replay already
-    // processed this entry (defensive).
-    if cache.contains(phys_pc, entry.virt_pc) {
-        return;
-    }
-
-    let instrs = trace_block(exec, entry.virt_pc, entry.tier);
-    if instrs.is_empty() {
-        *profile_stale += 1;
-        return;
-    }
-
-    // Cheap length check first, then definitive hash check. Either mismatch
-    // means the code at this VA is different from what we saw last session.
-    if instrs.len() as u32 != entry.len_mips {
-        *profile_stale += 1;
-        return;
-    }
-    let content_hash = super::compiler::hash_block_instrs(&instrs);
-    if content_hash != entry.content_hash {
-        *profile_stale += 1;
-        return;
-    }
-
-    if let Some(mut block) = compiler.compile_block(&instrs, entry.virt_pc, entry.tier) {
-        block.phys_addr = phys_pc;
-        // Zero all counters — no penalty baggage from prior session.
-        // speculative is left as compile_block set it: Full-tier is NOT
-        // speculative because rollback can't un-do stores (memory diverges
-        // from CPU state). Alu/Loads tiers are speculative and will re-prove
-        // stability via the normal snapshot/rollback path this session.
-        block.hit_count = 0;
-        block.stable_hits = 0;
-        block.exception_count = 0;
-        cache.insert(phys_pc, entry.virt_pc, block);
-        *blocks_compiled += 1;
-        *profile_replayed += 1;
-    }
-}
-
-/// Recompile a block at a different tier, replacing the existing cache entry.
-fn recompile_block_at_tier<T: Tlb, C: MipsCache>(
-    compiler: &mut BlockCompiler,
-    cache: &mut CodeCache,
-    exec: &mut MipsExecutor<T, C>,
-    phys_pc: u64,
-    virt_pc: u64,
-    tier: BlockTier,
-    blocks_compiled: &mut u64,
-) {
-    let instrs = trace_block(exec, virt_pc, tier);
-    if !instrs.is_empty() {
-        if let Some(mut block) = compiler.compile_block(&instrs, virt_pc, tier) {
-            block.phys_addr = phys_pc;
-            cache.replace(phys_pc, virt_pc, block);
-            *blocks_compiled += 1;
-        }
-    }
-}
-
 fn interpreter_loop<T: Tlb, C: MipsCache>(
     exec: &mut MipsExecutor<T, C>,
     running: &AtomicBool,
