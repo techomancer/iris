@@ -1,30 +1,43 @@
 # JIT Store Compilation Rules
 
-## Full-tier blocks must be non-speculative
+## Full-tier blocks must terminate BEFORE the first store
 
-Set `speculative: tier != BlockTier::Full` in the compiler.
-
-**Why:** Snapshot rollback restores CPU+TLB but NOT memory. If a store block
-does read-modify-write (LW, ADDIU, SW) and then hits an exception, rollback
-rewinds CPU to pre-block state but memory has the modified value. The
-interpreter re-runs from block entry, reads the modified value, modifies it
-again. Counters become N+2 instead of N+1. This corrupts kernel data structures.
-
-## Full-tier blocks must terminate at the first store
-
-In trace_block, break after pushing the first store instruction at Full tier:
+In trace_block, break BEFORE pushing a store instruction at Full tier:
 ```rust
 if tier == BlockTier::Full && is_compilable_store(&d) {
+    record_termination(&d, tier);
     break;
 }
 ```
 
-**Why:** Long blocks with multiple load/store helper calls create complex CFG
-(ok_block/exc_block diamond patterns per helper). This triggers Cranelift
-regalloc2 codegen issues on x86_64 — rare but fatal corruption that manifests
-after millions of block executions. Short blocks (~3-10 instructions) work
-perfectly. Confirmed empirically: short blocks = stable with 5K+ Full
-promotions; long blocks = crash at 780M instructions.
+**Why:** This ensures all Full-tier blocks are load-only → always speculative →
+self-healing via rollback+demotion. Cranelift regalloc2 produces occasional
+codegen errors in blocks with multiple ok_block/exc_block helper-call diamonds.
+At Loads tier, speculative rollback catches these errors and demotes bad blocks.
+Non-speculative blocks (which store-containing blocks must be) have no safety
+net — codegen errors persist permanently, corrupting state silently.
+
+By terminating before stores, all compiled blocks stay load-only, all get the
+speculative safety net, and stores execute via the interpreter where they're
+always correct.
+
+Confirmed via systematic isolation matrix (2026-04-16):
+- Loads tier (speculative): 3/3 clean
+- Full tier with stores compiled (non-speculative): 0/3 clean (hang, broken, broken)
+- Full tier store-free but non-speculative: 3/3 broken
+- Full tier store-free and speculative: 3/3 clean
+
+## Speculative flag must be based on store presence, not tier
+
+```rust
+speculative: !block_has_stores(instrs)
+```
+
+**NOT** `speculative: tier != BlockTier::Full`. The old rule was overly broad —
+it made ALL Full-tier blocks non-speculative, including load-only blocks that
+are safe to roll back. The correct rule: only blocks containing stores
+(SB/SH/SW/SD) need to be non-speculative, because rollback can't undo memory
+writes.
 
 ## Write helpers must use status != EXEC_COMPLETE
 
@@ -42,21 +55,22 @@ uncached writes (MMIO stores to device registers), causing slow corruption.
 Verify mode snapshots CPU/TLB but NOT memory. After a JIT block with stores
 modifies memory, the interpreter re-run reads the JIT-modified values.
 Read-modify-write sequences get double-applied. Verify mode is only valid
-for ALU and Load tiers.
+for ALU and Load tiers. Running VERIFY with Full-tier store blocks causes
+kernel panics (confirmed 3/3 kernel panic in isolation matrix).
 
 ## Delay-slot stores should be excluded from compilation
 
 In trace_block, when checking the delay slot instruction for a branch, exclude
-stores:
+stores (and loads — any faulting instruction):
 ```rust
-if is_compilable_for_tier(&delay_d, tier) && !is_compilable_store(&delay_d) {
+let delay_can_fault = is_compilable_load(&delay_d) || is_compilable_store(&delay_d);
+if is_compilable_for_tier(&delay_d, tier) && !delay_can_fault {
     instrs.push((delay_raw, delay_d));
     delay_ok = true;
 }
 ```
 
-**Why:** If a delay-slot store faults, sync_to_executor clears in_delay_slot.
-exec.step() re-executes the store as a non-delay-slot instruction.
-handle_exception sets cp0_epc to the store PC (not the branch PC) and doesn't
-set the BD bit. On ERET, the branch is permanently skipped, corrupting control
-flow. This is defensive — the block length fix is the primary fix for stores.
+**Why:** If a delay-slot instruction faults, sync_to_executor clears
+in_delay_slot. exec.step() re-executes as a non-delay-slot instruction.
+handle_exception sets cp0_epc to the instruction PC (not the branch PC) and
+doesn't set the BD bit. On ERET, the branch is permanently skipped.

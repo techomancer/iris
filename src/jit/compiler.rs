@@ -264,6 +264,45 @@ impl BlockCompiler {
                     branch_exit_pc = Some(target_val);
                     break;
                 }
+                EmitResult::BranchLikely { taken, not_taken, cond } => {
+                    compiled_count += 1;
+                    idx += 1;
+                    if idx < instrs.len() {
+                        let old_gpr = gpr;
+                        let old_hi = hi;
+                        let old_lo = lo;
+                        let old_modified = modified_gprs;
+                        let (_, delay_d) = &instrs[idx];
+                        let delay_pc = block_pc.wrapping_add(idx as u64 * 4);
+                        let delay_result = emit_instruction(
+                            &mut builder, ctx_ptr, exec_ptr, &helpers,
+                            &mut gpr, &mut hi, &mut lo, &mut modified_gprs, delay_d, delay_pc, tier,
+                        );
+                        match delay_result {
+                            EmitResult::Ok => {
+                                for i in 1..32usize {
+                                    if gpr[i] != old_gpr[i] {
+                                        gpr[i] = builder.ins().select(cond, gpr[i], old_gpr[i]);
+                                    }
+                                }
+                                if hi != old_hi { hi = builder.ins().select(cond, hi, old_hi); }
+                                if lo != old_lo { lo = builder.ins().select(cond, lo, old_lo); }
+                                compiled_count += 1;
+                            }
+                            _ => {
+                                gpr = old_gpr;
+                                hi = old_hi;
+                                lo = old_lo;
+                                modified_gprs = old_modified;
+                                compiled_count -= 1;
+                                break;
+                            }
+                        }
+                    }
+                    let target = builder.ins().select(cond, taken, not_taken);
+                    branch_exit_pc = Some(target);
+                    break;
+                }
                 EmitResult::Stop => break,
             }
         }
@@ -378,6 +417,9 @@ enum EmitResult {
     Ok,
     /// Instruction is a branch; the Value is the computed target PC.
     Branch(Value),
+    /// Branch-likely: delay slot only executes when taken. The compile loop
+    /// uses `select` to conditionally apply delay-slot side effects.
+    BranchLikely { taken: Value, not_taken: Value, cond: Value },
     /// Instruction is not compilable — terminate block before it.
     Stop,
 }
@@ -456,24 +498,43 @@ fn emit_instruction(
         OP_BLEZ  => emit_blez(builder, gpr, rs, d, instr_pc, false),
         OP_BGTZ  => emit_bgtz(builder, gpr, rs, d, instr_pc, false),
 
-        // --- REGIMM: BLTZ / BGEZ / BLTZAL / BGEZAL ---
+        // --- Branch-likely ---
+        OP_BEQL  => emit_beq(builder, gpr, rs, rt, d, instr_pc, true),
+        OP_BNEL  => emit_bne(builder, gpr, rs, rt, d, instr_pc, true),
+        OP_BLEZL => emit_blez(builder, gpr, rs, d, instr_pc, true),
+        OP_BGTZL => emit_bgtz(builder, gpr, rs, d, instr_pc, true),
+
+        // --- REGIMM: BLTZ / BGEZ / BLTZAL / BGEZAL + likely variants ---
         OP_REGIMM => {
             let rt_code = d.rt as u32;
             match rt_code {
-                RT_BLTZ => emit_bltz(builder, gpr, rs, d, instr_pc),
-                RT_BGEZ => emit_bgez(builder, gpr, rs, d, instr_pc),
+                RT_BLTZ => emit_bltz(builder, gpr, rs, d, instr_pc, false),
+                RT_BGEZ => emit_bgez(builder, gpr, rs, d, instr_pc, false),
+                RT_BLTZL => emit_bltz(builder, gpr, rs, d, instr_pc, true),
+                RT_BGEZL => emit_bgez(builder, gpr, rs, d, instr_pc, true),
                 RT_BLTZAL => {
-                    // Link address written to $ra ($31) regardless of taken.
                     let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
                     gpr[31] = link;
                     *modified_gprs |= 1u32 << 31;
-                    emit_bltz(builder, gpr, rs, d, instr_pc)
+                    emit_bltz(builder, gpr, rs, d, instr_pc, false)
                 }
                 RT_BGEZAL => {
                     let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
                     gpr[31] = link;
                     *modified_gprs |= 1u32 << 31;
-                    emit_bgez(builder, gpr, rs, d, instr_pc)
+                    emit_bgez(builder, gpr, rs, d, instr_pc, false)
+                }
+                RT_BLTZALL => {
+                    let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
+                    gpr[31] = link;
+                    *modified_gprs |= 1u32 << 31;
+                    emit_bltz(builder, gpr, rs, d, instr_pc, true)
+                }
+                RT_BGEZALL => {
+                    let link = builder.ins().iconst(types::I64, instr_pc.wrapping_add(8) as i64);
+                    gpr[31] = link;
+                    *modified_gprs |= 1u32 << 31;
+                    emit_bgez(builder, gpr, rs, d, instr_pc, true)
                 }
                 _ => EmitResult::Stop,
             }
@@ -1057,35 +1118,44 @@ fn emit_store(
 // The compiled block stores this PC and returns. Delay slots are handled by
 // the dispatch loop (the next instruction after the branch is interpreted).
 
+fn emit_branch_result(
+    builder: &mut FunctionBuilder, taken: Value, not_taken: Value, cond: Value, likely: bool,
+) -> EmitResult {
+    if likely {
+        EmitResult::BranchLikely { taken, not_taken, cond }
+    } else {
+        let target = builder.ins().select(cond, taken, not_taken);
+        EmitResult::Branch(target)
+    }
+}
+
 fn emit_beq(
     builder: &mut FunctionBuilder, gpr: &[Value; 32],
-    rs: usize, rt: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+    rs: usize, rt: usize, d: &DecodedInstr, instr_pc: u64, likely: bool,
 ) -> EmitResult {
     let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
-    let not_taken_pc = instr_pc.wrapping_add(8); // skip delay slot
+    let not_taken_pc = instr_pc.wrapping_add(8);
     let taken = builder.ins().iconst(types::I64, taken_pc as i64);
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let cond = builder.ins().icmp(IntCC::Equal, gpr[rs], gpr[rt]);
-    let target = builder.ins().select(cond, taken, not_taken);
-    EmitResult::Branch(target)
+    emit_branch_result(builder, taken, not_taken, cond, likely)
 }
 
 fn emit_bne(
     builder: &mut FunctionBuilder, gpr: &[Value; 32],
-    rs: usize, rt: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+    rs: usize, rt: usize, d: &DecodedInstr, instr_pc: u64, likely: bool,
 ) -> EmitResult {
     let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
     let not_taken_pc = instr_pc.wrapping_add(8);
     let taken = builder.ins().iconst(types::I64, taken_pc as i64);
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let cond = builder.ins().icmp(IntCC::NotEqual, gpr[rs], gpr[rt]);
-    let target = builder.ins().select(cond, taken, not_taken);
-    EmitResult::Branch(target)
+    emit_branch_result(builder, taken, not_taken, cond, likely)
 }
 
 fn emit_blez(
     builder: &mut FunctionBuilder, gpr: &[Value; 32],
-    rs: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+    rs: usize, d: &DecodedInstr, instr_pc: u64, likely: bool,
 ) -> EmitResult {
     let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
     let not_taken_pc = instr_pc.wrapping_add(8);
@@ -1093,13 +1163,12 @@ fn emit_blez(
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let zero = builder.ins().iconst(types::I64, 0);
     let cond = builder.ins().icmp(IntCC::SignedLessThanOrEqual, gpr[rs], zero);
-    let target = builder.ins().select(cond, taken, not_taken);
-    EmitResult::Branch(target)
+    emit_branch_result(builder, taken, not_taken, cond, likely)
 }
 
 fn emit_bgtz(
     builder: &mut FunctionBuilder, gpr: &[Value; 32],
-    rs: usize, d: &DecodedInstr, instr_pc: u64, _likely: bool,
+    rs: usize, d: &DecodedInstr, instr_pc: u64, likely: bool,
 ) -> EmitResult {
     let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
     let not_taken_pc = instr_pc.wrapping_add(8);
@@ -1107,13 +1176,12 @@ fn emit_bgtz(
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let zero = builder.ins().iconst(types::I64, 0);
     let cond = builder.ins().icmp(IntCC::SignedGreaterThan, gpr[rs], zero);
-    let target = builder.ins().select(cond, taken, not_taken);
-    EmitResult::Branch(target)
+    emit_branch_result(builder, taken, not_taken, cond, likely)
 }
 
 fn emit_bltz(
     builder: &mut FunctionBuilder, gpr: &[Value; 32],
-    rs: usize, d: &DecodedInstr, instr_pc: u64,
+    rs: usize, d: &DecodedInstr, instr_pc: u64, likely: bool,
 ) -> EmitResult {
     let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
     let not_taken_pc = instr_pc.wrapping_add(8);
@@ -1121,13 +1189,12 @@ fn emit_bltz(
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let zero = builder.ins().iconst(types::I64, 0);
     let cond = builder.ins().icmp(IntCC::SignedLessThan, gpr[rs], zero);
-    let target = builder.ins().select(cond, taken, not_taken);
-    EmitResult::Branch(target)
+    emit_branch_result(builder, taken, not_taken, cond, likely)
 }
 
 fn emit_bgez(
     builder: &mut FunctionBuilder, gpr: &[Value; 32],
-    rs: usize, d: &DecodedInstr, instr_pc: u64,
+    rs: usize, d: &DecodedInstr, instr_pc: u64, likely: bool,
 ) -> EmitResult {
     let taken_pc = instr_pc.wrapping_add(4).wrapping_add(d.imm as i32 as i64 as u64);
     let not_taken_pc = instr_pc.wrapping_add(8);
@@ -1135,8 +1202,7 @@ fn emit_bgez(
     let not_taken = builder.ins().iconst(types::I64, not_taken_pc as i64);
     let zero = builder.ins().iconst(types::I64, 0);
     let cond = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, gpr[rs], zero);
-    let target = builder.ins().select(cond, taken, not_taken);
-    EmitResult::Branch(target)
+    emit_branch_result(builder, taken, not_taken, cond, likely)
 }
 
 fn emit_j(

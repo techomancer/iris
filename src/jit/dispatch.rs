@@ -1112,9 +1112,12 @@ fn is_branch_or_jump(d: &DecodedInstr) -> bool {
     use crate::mips_isa::*;
     match d.op as u32 {
         OP_BEQ | OP_BNE | OP_BLEZ | OP_BGTZ => true,
+        OP_BEQL | OP_BNEL | OP_BLEZL | OP_BGTZL => true,
         OP_J | OP_JAL => true,
         OP_SPECIAL => matches!(d.funct as u32, FUNCT_JR | FUNCT_JALR),
-        OP_REGIMM => matches!(d.rt as u32, RT_BLTZ | RT_BGEZ | RT_BLTZAL | RT_BGEZAL),
+        OP_REGIMM => matches!(d.rt as u32,
+            RT_BLTZ | RT_BGEZ | RT_BLTZAL | RT_BGEZAL |
+            RT_BLTZL | RT_BGEZL | RT_BLTZALL | RT_BGEZALL),
         _ => false,
     }
 }
