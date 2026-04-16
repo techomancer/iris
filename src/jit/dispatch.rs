@@ -632,14 +632,11 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 if instrs_before_fault > 0 {
                                     let advance = exec.core.count_step.wrapping_mul(instrs_before_fault);
                                     let prev = exec.core.cp0_count;
-                                    exec.core.cp0_count = prev.wrapping_add(advance) & 0x0000_FFFF_FFFF_FFFF;
-                                    if exec.core.cp0_compare != 0
-                                        && prev < exec.core.cp0_compare
-                                        && exec.core.cp0_count >= exec.core.cp0_compare
-                                    {
+                                    exec.core.cp0_count = prev.wrapping_add(advance);
+                                    if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
                                         exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                                     }
-                                    exec.local_cycles += instrs_before_fault;
+                                    exec.core.local_cycles += instrs_before_fault;
                                 }
                                 exec.step();
                                 total_interp_steps += 1;
@@ -653,15 +650,12 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             let n = next_block_len as u64;
                             let count_advance = exec.core.count_step.wrapping_mul(n);
                             let prev = exec.core.cp0_count;
-                            exec.core.cp0_count = prev.wrapping_add(count_advance) & 0x0000_FFFF_FFFF_FFFF;
-                            if exec.core.cp0_compare != 0
-                                && prev < exec.core.cp0_compare
-                                && exec.core.cp0_count >= exec.core.cp0_compare
-                            {
+                            exec.core.cp0_count = prev.wrapping_add(count_advance);
+                            if exec.core.cp0_compare.wrapping_sub(prev) <= count_advance {
                                 exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
                                 exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
                             }
-                            exec.local_cycles += n;
+                            exec.core.local_cycles += n;
                             let pending = exec.core.interrupts.load(Ordering::Relaxed);
                             if pending != 0 {
                                 use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
