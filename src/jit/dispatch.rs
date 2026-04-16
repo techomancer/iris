@@ -991,8 +991,18 @@ fn trace_block<T: Tlb, C: MipsCache>(
         }
 
         let is_branch = is_branch_or_jump(&d);
-        let is_helper_instr = tier == BlockTier::Full
-            && (is_compilable_store(&d) || is_compilable_load(&d));
+
+        // Full-tier: terminate BEFORE stores. Store-containing blocks must be
+        // non-speculative (can't rollback memory), which disables the
+        // self-healing safety net (rollback + demotion on codegen error).
+        // By excluding stores, all Full-tier blocks stay load-only → speculative
+        // → self-healing. Stores go to interpreter, where they're always correct.
+        if tier == BlockTier::Full && is_compilable_store(&d) && !jit_no_stores() {
+            record_termination(&d, tier);
+            break;
+        }
+
+        let is_helper_instr = tier == BlockTier::Full && is_compilable_load(&d);
         instrs.push((raw, d));
 
         if is_helper_instr {
@@ -1030,11 +1040,26 @@ fn trace_block<T: Tlb, C: MipsCache>(
     instrs
 }
 
+// IRIS_JIT_NO_STORES=1 disables store compilation in Full tier for diagnostic
+// bisection. Full tier still compiles loads (behaves like a faster Loads tier
+// with higher promotion priority). If this flag fixes the 4dwm glitch, the
+// bug is specifically in store compilation, not in the promotion/chaining path.
+static JIT_NO_STORES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn jit_no_stores() -> bool {
+    *JIT_NO_STORES.get_or_init(|| std::env::var("IRIS_JIT_NO_STORES").map(|v| v == "1").unwrap_or(false))
+}
+
 fn is_compilable_for_tier(d: &DecodedInstr, tier: BlockTier) -> bool {
     if is_compilable_alu(d) || is_branch_or_jump(d) { return true; }
     match tier {
         BlockTier::Alu => false,
         BlockTier::Loads => is_compilable_load(d),
+        // Full tier accepts loads + stores in the compilable check, but stores
+        // are terminated before inclusion in trace_block (they trigger a break
+        // before being pushed). This keeps the block load-only → speculative →
+        // self-healing. The NO_STORES diagnostic flag skips even the termination
+        // check (stores just aren't compilable at all).
         BlockTier::Full => is_compilable_load(d) || is_compilable_store(d),
     }
 }

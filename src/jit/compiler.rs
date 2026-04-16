@@ -325,18 +325,28 @@ impl BlockCompiler {
             len_mips: compiled_count,
             len_native: code_size,
             tier,
-            // Full-tier blocks contain stores that modify memory. Speculative
-            // rollback restores CPU/TLB state but NOT memory, so read-modify-write
-            // sequences get double-applied on rollback. Non-speculative blocks skip
-            // snapshot/rollback — on exception, the store emitter's flushed GPRs and
-            // faulting PC (already in executor via sync_to) are used directly.
-            speculative: tier != BlockTier::Full,
+            // Speculative blocks get snapshot/rollback on exception, providing
+            // self-healing: codegen errors cause exceptions → rollback to correct
+            // state → demotion after 3 failures → bad block replaced.
+            //
+            // Non-speculative is ONLY safe when the block contains stores, because
+            // rollback can't undo memory writes (RMW double-apply). Load-only blocks
+            // at any tier should always be speculative for the safety net.
+            speculative: !block_has_stores(instrs),
             hit_count: 0,
             exception_count: 0,
             stable_hits: 0,
             content_hash,
         })
     }
+}
+
+/// Check if a block contains any store instructions (SB/SH/SW/SD).
+/// Store-containing blocks must be non-speculative because rollback can't undo
+/// memory writes. Load-only blocks should be speculative for codegen safety.
+fn block_has_stores(instrs: &[(u32, DecodedInstr)]) -> bool {
+    use crate::mips_isa::*;
+    instrs.iter().any(|(_, d)| matches!(d.op as u32, OP_SB | OP_SH | OP_SW | OP_SD))
 }
 
 /// FNV-1a 32-bit hash of raw instruction words. Used to detect stale profile
