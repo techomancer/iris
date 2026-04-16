@@ -1082,7 +1082,7 @@ fn is_compilable_alu(d: &DecodedInstr) -> bool {
             FUNCT_DSLLV | FUNCT_DSRLV | FUNCT_DSRAV |
             FUNCT_SYNC
         ),
-        OP_ADDIU | OP_DADDIU | OP_SLTI | OP_SLTIU |
+        OP_ADDI | OP_ADDIU | OP_DADDI | OP_DADDIU | OP_SLTI | OP_SLTIU |
         OP_ANDI | OP_ORI | OP_XORI | OP_LUI => true,
         // MFC0/DMFC0 are read-only CP0 accesses — safe at Alu tier.
         // MTC0/DMTC0 have side effects (Status→translate_fn, Compare→timer

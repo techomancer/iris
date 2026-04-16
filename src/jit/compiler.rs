@@ -456,8 +456,8 @@ fn emit_instruction(
             }
             result
         }
-        OP_ADDIU  => { emit_addiu(builder, gpr, rs, rt, d);  *modified_gprs |= 1 << rt; EmitResult::Ok }
-        OP_DADDIU => { emit_daddiu(builder, gpr, rs, rt, d); *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_ADDI | OP_ADDIU  => { emit_addiu(builder, gpr, rs, rt, d);  *modified_gprs |= 1 << rt; EmitResult::Ok }
+        OP_DADDI | OP_DADDIU => { emit_daddiu(builder, gpr, rs, rt, d); *modified_gprs |= 1 << rt; EmitResult::Ok }
         OP_SLTI   => { emit_slti(builder, gpr, rs, rt, d);   *modified_gprs |= 1 << rt; EmitResult::Ok }
         OP_SLTIU  => { emit_sltiu(builder, gpr, rs, rt, d);  *modified_gprs |= 1 << rt; EmitResult::Ok }
         OP_ANDI   => { emit_andi(builder, gpr, rs, rt, d);   *modified_gprs |= 1 << rt; EmitResult::Ok }
