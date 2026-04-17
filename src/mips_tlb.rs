@@ -201,19 +201,34 @@ pub trait Tlb {
     fn restore_from_mips_tlb(&mut self, _src: &MipsTlb) {}
 }
 
-/// Sentinel: end of MRU list.
+/// Sentinel: end of MRU list / invalid vmap entry.
 const MRU_NONE: u8 = 0xFF;
 /// One MRU list per AccessType discriminant (Fetch=0, Read=1, Write=2, Debug=3).
 const MRU_LISTS: usize = 4;
+
+/// Number of slots in the 32-bit vmap: 4GB / 8KB = 524288.
+/// Each slot stores a TLB entry index (0..47) or VMAP_MISS (0xFF).
+const VMAP_SIZE: usize = 524288; // 2^19
+const VMAP_MISS: u8 = 0xFF;
 
 /// Real R4000 TLB implementation
 ///
 /// Implements a fully associative JTLB (Joint TLB) with 48 dual-entries.
 ///
+/// **32-bit mode (and 64-bit sign-extended ±2GB) fast path**: a 512KB `vmap`
+/// array indexed by VA[31:13] gives O(1) lookup.  Each slot holds the TLB
+/// entry index (0-47) or VMAP_MISS.  After the index is found we still verify
+/// ASID/Global and the valid/dirty bits — but the linear scan over 48 entries
+/// is eliminated.
+///
+/// For 64-bit VAs that are sign-extended 32-bit values (upper 32 bits all-zero
+/// or all-ones), the same vmap applies: we use VA[31:13] as the key.
+///
+/// Full 64-bit addresses (xuseg, xsseg, etc.) fall back to the MRU-ordered
+/// linear scan.
+///
 /// Each access type (Fetch/Read/Write/Debug) has its own MRU-ordered
-/// permutation of the 48 slots. All 48 slots are always present in every
-/// list. On a hit the matching slot is moved to the front of that list
-/// so the next lookup for that access type finds it in O(1).
+/// permutation of the 48 slots for the fallback path.
 /// Debug lookups never disturb the Fetch/Read/Write ordering.
 #[derive(Clone)]
 pub struct MipsTlb {
@@ -222,6 +237,9 @@ pub struct MipsTlb {
     mru_head: [u8; MRU_LISTS],
     /// `mru_next[list][slot]` — next slot in that list, or MRU_NONE.
     mru_next: [[u8; TLB_NUM_ENTRIES]; MRU_LISTS],
+    /// O(1) lookup for 32-bit (and sign-extended 64-bit) VAs.
+    /// Indexed by VA[31:13] (19 bits).  Value = entry index or VMAP_MISS.
+    vmap: Box<[u8; VMAP_SIZE]>,
 }
 
 impl MipsTlb {
@@ -232,6 +250,7 @@ impl MipsTlb {
             entries: [TlbEntry::new(); TLB_NUM_ENTRIES],
             mru_head: [0u8; MRU_LISTS],
             mru_next: [[MRU_NONE; TLB_NUM_ENTRIES]; MRU_LISTS],
+            vmap: Box::new([VMAP_MISS; VMAP_SIZE]),
         };
         // Initialise all four lists as 0 → 1 → … → 47 → NONE.
         for list in 0..MRU_LISTS {
@@ -259,6 +278,44 @@ impl MipsTlb {
         self.mru_next[list][target as usize] = self.mru_head[list];
         self.mru_head[list] = target;
     }
+
+    /// Erase all vmap slots that currently point to `entry_idx`.
+    /// Called before overwriting a TLB entry.
+    /// The vmap is keyed on VA[31:13] only, so we use entry_hi[31:13] regardless
+    /// of the R field / upper bits (those only matter in full 64-bit mode, which
+    /// bypasses the vmap entirely).
+    #[inline]
+    fn vmap_erase(&mut self, entry_idx: usize) {
+        let old = &self.entries[entry_idx];
+        let tag = entry_idx as u8;
+        let mask = old.page_mask | 0x1FFF;
+        let count = ((mask + 1) >> 13).max(1) as usize;
+        let vpn2 = ((old.entry_hi as u32) >> 13) as usize; // VA[31:13] of even page
+        for i in 0..count {
+            let slot = vpn2.wrapping_add(i);
+            if slot < VMAP_SIZE && self.vmap[slot] == tag {
+                self.vmap[slot] = VMAP_MISS;
+            }
+        }
+    }
+
+    /// Populate vmap slots for `entry_idx` using the entry now stored at that index.
+    /// Always uses entry_hi[31:13] as the key — the upper bits (R field) are only
+    /// relevant for full 64-bit VAs which skip the vmap anyway.
+    #[inline]
+    fn vmap_fill(&mut self, entry_idx: usize) {
+        let entry = &self.entries[entry_idx];
+        let mask = entry.page_mask | 0x1FFF;
+        let count = ((mask + 1) >> 13).max(1) as usize;
+        let vpn2 = ((entry.entry_hi as u32) >> 13) as usize;
+        let tag = entry_idx as u8;
+        for i in 0..count {
+            let slot = vpn2.wrapping_add(i);
+            if slot < VMAP_SIZE {
+                self.vmap[slot] = tag;
+            }
+        }
+    }
 }
 
 impl Default for MipsTlb {
@@ -269,11 +326,60 @@ impl Default for MipsTlb {
 
 impl Tlb for MipsTlb {
     fn translate(&mut self, virt_addr: u64, asid: u8, access_type: AccessType, is_64bit: bool) -> TlbResult {
-        let list = access_type as usize;
+        // Fast path: O(1) vmap lookup for 32-bit VAs and 64-bit sign-extended ±2GB VAs.
+        // A 64-bit VA is sign-extended 32-bit when upper 32 bits are all-zero (user/kuseg)
+        // or all-ones (kernel kseg0/kseg1/kseg2/kseg3 in 64-bit compatibility mode).
+        let upper32 = (virt_addr >> 32) as u32;
+        if !is_64bit || upper32 == 0 || upper32 == 0xFFFF_FFFF {
+            let vmap_idx = ((virt_addr as u32) >> 13) as usize;
+            let entry_idx = self.vmap[vmap_idx];
+            if entry_idx != VMAP_MISS {
+                let entry = &self.entries[entry_idx as usize];
 
-        // Pre-compute the VPN comparison mask (same for all entries given is_64bit).
-        // PageMask is per-entry so we refine it below, but the mode-based upper mask
-        // is constant for this call.
+                // Verify ASID / Global match.
+                // On mismatch we must fall through to linear scan: a different entry
+                // for the same VPN but a different ASID may exist (TLB aliasing).
+                if entry.is_global() || entry.asid() == asid {
+                    let mask = entry.page_mask | 0x1FFF;
+                    let selector_bit = (mask + 1) >> 1;
+                    let lo_entry = if (virt_addr & selector_bit) != 0 { entry.entry_lo1 } else { entry.entry_lo0 };
+
+                    // Valid bit.
+                    if (lo_entry & 0x2) == 0 {
+                        return TlbResult::Invalid { vpn2: virt_addr >> 13 };
+                    }
+
+                    // Dirty bit for writes.
+                    let dirty = (lo_entry & 0x4) != 0;
+                    if access_type == AccessType::Write && !dirty {
+                        return TlbResult::Modified { vpn2: virt_addr >> 13 };
+                    }
+
+                    // Physical address.
+                    let pfn = (lo_entry >> 6) & 0xFF_FFFF_FFFF;
+                    let offset_mask = selector_bit - 1;
+                    let effective_pfn = pfn & !(offset_mask >> 12);
+                    let phys_addr = (effective_pfn << 12) | (virt_addr & offset_mask);
+
+                    let cache_attr = match (lo_entry >> 3) & 0x7 {
+                        2 => CacheAttr::Uncached,
+                        3 => CacheAttr::Cacheable,
+                        5 => CacheAttr::CacheableCoherent,
+                        _ => CacheAttr::Uncached,
+                    };
+
+                    return TlbResult::Hit { phys_addr, cache_attr, dirty };
+                }
+                // ASID mismatch on a non-global entry — fall through to linear scan
+                // to check if another entry exists for this VA+ASID combination.
+            } else {
+                // vmap says no entry for this VA — definite miss.
+                return TlbResult::Miss { vpn2: virt_addr >> 13 };
+            }
+        }
+
+        // Slow path: full 64-bit VA (or ASID-aliased 32-bit VA), MRU linear scan.
+        let list = access_type as usize;
         let mode_mask: u64 = if is_64bit {
             0xC000_00FF_FFFF_E000
         } else {
@@ -346,7 +452,9 @@ impl Tlb for MipsTlb {
 
     fn write(&mut self, index: usize, entry: TlbEntry) {
         if index < self.entries.len() {
+            self.vmap_erase(index);
             self.entries[index] = entry;
+            self.vmap_fill(index);
         }
     }
 
@@ -480,6 +588,7 @@ impl Tlb for MipsTlb {
             }
             self.mru_next[list][TLB_NUM_ENTRIES - 1] = MRU_NONE;
         }
+        self.vmap.fill(VMAP_MISS);
     }
 
     fn save_state(&self) -> toml::Value {
@@ -504,6 +613,11 @@ impl Tlb for MipsTlb {
                     entry_lo1: words[3],
                 };
             }
+        }
+        // Rebuild vmap from loaded entries.
+        self.vmap.fill(VMAP_MISS);
+        for i in 0..TLB_NUM_ENTRIES {
+            self.vmap_fill(i);
         }
         Ok(())
     }
