@@ -237,20 +237,28 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         while steps_in_batch < BATCH_SIZE {
             let burst = probe.next_interval();
 
-            // Interpreter burst
+            // Interpreter burst — use step_lite (no cp0/interrupt overhead),
+            // then do bookkeeping in bulk, same as post-JIT-block.
             {
                 let exec = unsafe { &mut *exec_ptr };
-                #[cfg(feature = "lightning")]
                 for _ in 0..burst {
-                    exec.step();
+                    exec.step_lite();
                 }
-                #[cfg(not(feature = "lightning"))]
-                for _ in 0..burst {
-                    let status = exec.step();
-                    if status == EXEC_BREAKPOINT {
-                        running.store(false, Ordering::SeqCst);
-                        break;
-                    }
+                let n = burst as u64;
+                exec.core.local_cycles += n;
+                let advance = exec.core.count_step.wrapping_mul(n);
+                let prev = exec.core.cp0_count;
+                exec.core.cp0_count = prev.wrapping_add(advance);
+                if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
+                    exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                    exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
+                }
+                let pending = exec.core.interrupts.load(Ordering::Relaxed);
+                if pending != 0 {
+                    use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
+                    let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
+                    exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
+                        | (pending as u32 & ext_mask);
                 }
             }
             steps_in_batch += burst;

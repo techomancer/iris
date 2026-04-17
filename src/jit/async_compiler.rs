@@ -1,14 +1,16 @@
-//! Background JIT compilation thread. Moves Cranelift work off the
+//! Background JIT compilation thread pool. Moves Cranelift work off the
 //! interpreter's hot path so compilation never stalls execution.
 
 use std::collections::HashSet;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::mips_exec::DecodedInstr;
 use super::cache::{BlockTier, CompiledBlock};
 use super::compiler::BlockCompiler;
 use super::helpers::HelperPtrs;
+
+const NUM_COMPILER_THREADS: usize = 1;
 
 pub enum CompileKind {
     New,
@@ -34,7 +36,7 @@ pub struct CompileResult {
 pub struct AsyncCompiler {
     tx: Option<mpsc::Sender<CompileRequest>>,
     rx: mpsc::Receiver<CompileResult>,
-    handle: Option<thread::JoinHandle<()>>,
+    handles: Vec<thread::JoinHandle<()>>,
     pub pending: HashSet<(u64, u64)>,
 }
 
@@ -42,29 +44,48 @@ impl AsyncCompiler {
     pub fn new(helpers: HelperPtrs) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<CompileRequest>();
         let (res_tx, res_rx) = mpsc::sync_channel::<CompileResult>(64);
+        let req_rx = Arc::new(Mutex::new(req_rx));
 
-        let handle = thread::Builder::new()
-            .name("jit-compiler".into())
-            .spawn(move || {
-                let mut compiler = BlockCompiler::new(&helpers);
-                while let Ok(req) = req_rx.recv() {
-                    if let Some(mut block) = compiler.compile_block(&req.instrs, req.block_pc, req.tier) {
-                        block.phys_addr = req.phys_pc;
-                        let _ = res_tx.send(CompileResult {
-                            block,
-                            phys_pc: req.phys_pc,
-                            virt_pc: req.block_pc,
-                            kind: req.kind,
-                        });
+        let mut handles = Vec::with_capacity(NUM_COMPILER_THREADS);
+        for i in 0..NUM_COMPILER_THREADS {
+            let rx = Arc::clone(&req_rx);
+            let tx = res_tx.clone();
+            let h = helpers.clone();
+            let handle = thread::Builder::new()
+                .name(format!("jit-compiler-{}", i))
+                .spawn(move || {
+                    let mut compiler = BlockCompiler::new(&h);
+                    loop {
+                        let req = {
+                            let guard = rx.lock().unwrap();
+                            guard.recv()
+                        };
+                        match req {
+                            Ok(req) => {
+                                if let Some(mut block) = compiler.compile_block(&req.instrs, req.block_pc, req.tier) {
+                                    block.phys_addr = req.phys_pc;
+                                    let _ = tx.send(CompileResult {
+                                        block,
+                                        phys_pc: req.phys_pc,
+                                        virt_pc: req.block_pc,
+                                        kind: req.kind,
+                                    });
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
-                }
-            })
-            .expect("failed to spawn JIT compiler thread");
+                })
+                .expect("failed to spawn JIT compiler thread");
+            handles.push(handle);
+        }
+
+        eprintln!("JIT: {} background compiler threads", NUM_COMPILER_THREADS);
 
         Self {
             tx: Some(req_tx),
             rx: res_rx,
-            handle: Some(handle),
+            handles,
             pending: HashSet::new(),
         }
     }
@@ -91,8 +112,8 @@ impl AsyncCompiler {
     }
 
     pub fn shutdown(&mut self) {
-        self.tx.take(); // drop sender, background thread will exit
-        if let Some(handle) = self.handle.take() {
+        self.tx.take();
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
