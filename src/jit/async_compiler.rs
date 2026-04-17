@@ -41,7 +41,7 @@ pub struct AsyncCompiler {
 }
 
 impl AsyncCompiler {
-    pub fn new(helpers: HelperPtrs) -> Self {
+    pub fn new(helpers: HelperPtrs, capture_ir: bool) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<CompileRequest>();
         let (res_tx, res_rx) = mpsc::sync_channel::<CompileResult>(64);
         let req_rx = Arc::new(Mutex::new(req_rx));
@@ -55,6 +55,7 @@ impl AsyncCompiler {
                 .name(format!("jit-compiler-{}", i))
                 .spawn(move || {
                     let mut compiler = BlockCompiler::new(&h);
+                    compiler.capture_ir = capture_ir;
                     loop {
                         let req = {
                             let guard = rx.lock().unwrap();

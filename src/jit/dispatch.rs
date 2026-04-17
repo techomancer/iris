@@ -192,7 +192,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         max_tier, verify_mode, probe.interval, probe.min_interval, probe.max_interval,
         tier_cfg.stable, tier_cfg.promote, tier_cfg.demote);
     let helpers = HelperPtrs::new::<T, C>();
-    let mut async_comp = AsyncCompiler::new(helpers.clone());
+    let mut async_comp = AsyncCompiler::new(helpers.clone(), verify_mode);
     let mut cache = CodeCache::new();
     let mut ctx = JitContext::new();
     ctx.executor_ptr = exec_ptr as u64;
@@ -359,6 +359,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 }
 
                 ctx.exit_reason = 0;
+                ctx.write_log_len = 0;
                 let entry: extern "C" fn(*mut JitContext) = unsafe {
                     std::mem::transmute(block.entry)
                 };
@@ -371,6 +372,19 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                     if ctx.exit_reason == EXIT_EXCEPTION {
                         if let Some(snap) = &snapshot {
                             if is_speculative {
+                                // Replay write log in reverse to undo speculative
+                                // stores before restoring CPU/TLB state.
+                                for i in (0..ctx.write_log_len as usize).rev() {
+                                    let e = &ctx.write_log[i];
+                                    match e.size {
+                                        1 => { exec.write_data::<1>(e.addr, e.old_val); }
+                                        2 => { exec.write_data::<2>(e.addr, e.old_val); }
+                                        4 => { exec.write_data::<4>(e.addr, e.old_val); }
+                                        8 => { exec.write_data::<8>(e.addr, e.old_val); }
+                                        _ => {}
+                                    }
+                                }
+                                ctx.write_log_len = 0;
                                 snap.restore(exec);
                                 rollbacks += 1;
 
@@ -428,8 +442,31 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             let jit_hi = exec.core.hi;
                             let jit_lo = exec.core.lo;
 
+                            let pre_gpr = snap.gpr;
+                            let pre_hi = snap.hi;
+                            let pre_lo = snap.lo;
+
+                            let block_has_likely = cache.lookup(phys_pc, pc)
+                                .map(|b| b.has_branch_likely).unwrap_or(false);
+
+                            // For branch-likely-not-taken, the delay slot is
+                            // nullified: the JIT counts it in block_len but the
+                            // interpreter's EXEC_BRANCH_LIKELY_SKIP handles it
+                            // in one step. Detect via JIT PC + 4 == expected
+                            // not-taken PC (block_pc + (block_len-1)*4 + 8).
+                            let likely_not_taken = block_has_likely
+                                && block_len >= 2
+                                && jit_pc == pc.wrapping_add((block_len as u64 - 2) * 4 + 8);
+                            let verify_steps = if likely_not_taken {
+                                block_len - 1
+                            } else {
+                                block_len
+                            };
+
                             snap.restore(exec);
-                            for _ in 0..block_len {
+                            let pre_epc = exec.core.cp0_epc;
+                            let pre_cause = exec.core.cp0_cause;
+                            for _ in 0..verify_steps {
                                 exec.step();
                             }
 
@@ -437,6 +474,8 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             let interp_pc = exec.core.pc;
                             let interp_hi = exec.core.hi;
                             let interp_lo = exec.core.lo;
+                            let interp_took_exception = exec.core.cp0_epc != pre_epc
+                                || (exec.core.cp0_cause & 0x7C) != (pre_cause & 0x7C);
 
                             let mut mismatch = false;
                             for i in 0..32 {
@@ -463,32 +502,129 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             }
 
                             if mismatch {
-                                // Check if this is a timing false positive:
-                                // interpreter took an exception (PC in exception vectors)
-                                // while JIT didn't. This happens because the interpreter
-                                // re-run occurs at a different wall-clock time and sees
-                                // different external interrupt state via the atomic.
+                                // Interpreter took an exception (TLB miss,
+                                // bus error, etc.) during verify re-run that
+                                // the JIT didn't see — state is post-exception,
+                                // not comparable. This catches kernel-handled
+                                // exceptions (IRIX installs its own handlers
+                                // past the low PROM vectors).
+                                if interp_took_exception {
+                                    total_jit_instrs += block_len as u64;
+                                    continue;
+                                }
+
+                                // Check for MFC0 Count/Random timing false
+                                // positive: the JIT reads cp0_count/random from
+                                // the executor without advancing them per
+                                // instruction, but the interpreter's verify
+                                // re-run advances them via step(). Scan the
+                                // block for MFC0/DMFC0 of reg 1 (Random) or
+                                // reg 9 (Count); the destination GPRs will
+                                // legitimately differ between JIT and interp.
+                                let mut timing_gprs: u32 = 0;
+                                {
+                                    let raw_instrs = trace_block(exec, pc, block_tier);
+                                    for (_, d) in raw_instrs.iter() {
+                                        if d.op as u32 == crate::mips_isa::OP_COP0 {
+                                            let sub = d.rs as u32;
+                                            let rd = d.rd as u32;
+                                            if (sub == crate::mips_isa::RS_MFC0
+                                                || sub == crate::mips_isa::RS_DMFC0)
+                                                && (rd == 1 || rd == 9)
+                                            {
+                                                timing_gprs |= 1u32 << (d.rt as u32);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Check if all non-timing-GPR mismatches are
+                                // explained by the timing-sensitive GPRs.
+                                let mut only_timing = jit_pc == interp_pc
+                                    && jit_hi == interp_hi && jit_lo == interp_lo;
+                                if only_timing {
+                                    for i in 0..32 {
+                                        if jit_gpr[i] != interp_gpr[i]
+                                            && (timing_gprs >> i) & 1 == 0
+                                        {
+                                            only_timing = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if only_timing {
+                                    total_jit_instrs += block_len as u64;
+                                    continue;
+                                }
+
                                 let interp_pc32 = interp_pc as u32;
                                 let interp_in_exc = (interp_pc32 >= 0x80000000 && interp_pc32 < 0x80000400)
-                                    || interp_pc32 == 0x80000180; // general exception vector
+                                    || interp_pc32 == 0x80000180;
                                 let jit_pc32 = jit_pc as u32;
                                 let jit_not_exc = jit_pc32 < 0x80000000 || jit_pc32 >= 0x80000400;
 
                                 if interp_in_exc && jit_not_exc {
-                                    // Timing false positive — interpreter took an interrupt
-                                    // the JIT didn't see. Don't invalidate the block.
-                                    // Use the interpreter's result (it's authoritative).
                                     eprintln!("JIT VERIFY: timing false positive at {:016x} (interp took exception to {:016x}), keeping block",
                                         pc, interp_pc);
                                 } else {
-                                    // Real codegen mismatch — dump and invalidate
+                                    // Real codegen mismatch — full diagnostic dump
+                                    eprintln!("═══ JIT VERIFY: REAL CODEGEN MISMATCH ═══");
+                                    eprintln!("Block PC: {:016x}  phys: {:016x}  tier: {:?}  len: {}", pc, phys_pc, block_tier, block_len);
+
+                                    // Pre-state
+                                    eprintln!("── Pre-state (input GPRs) ──");
+                                    for i in (0..32).step_by(4) {
+                                        eprintln!("  r{:02}={:016x} r{:02}={:016x} r{:02}={:016x} r{:02}={:016x}",
+                                            i, pre_gpr[i], i+1, pre_gpr[i+1], i+2, pre_gpr[i+2], i+3, pre_gpr[i+3]);
+                                    }
+                                    eprintln!("  hi={:016x} lo={:016x}", pre_hi, pre_lo);
+
+                                    // MIPS instructions
                                     let instrs = trace_block(exec, pc, block_tier);
-                                    eprintln!("JIT VERIFY: block at {:016x} ({} instrs):", pc, instrs.len());
+                                    eprintln!("── MIPS instructions ({}) ──", instrs.len());
                                     for (idx, (raw, d)) in instrs.iter().enumerate() {
                                         let ipc = pc.wrapping_add(idx as u64 * 4);
-                                        eprintln!("  {:016x}: {:08x} op={} rs={} rt={} rd={} funct={} imm={:04x}",
-                                            ipc, raw, d.op, d.rs, d.rt, d.rd, d.funct, d.imm as u16);
+                                        eprintln!("  {:016x}: {:08x} op={:#04x} rs={} rt={} rd={} sa={} funct={:#04x} imm={:#06x}",
+                                            ipc, raw, d.op, d.rs, d.rt, d.rd, d.sa, d.funct, d.imm as u16);
                                     }
+
+                                    // Post-state comparison
+                                    eprintln!("── Post-state (JIT vs Interpreter) ──");
+                                    for i in 0..32 {
+                                        if jit_gpr[i] != interp_gpr[i] {
+                                            eprintln!("  r{:02}: jit={:016x} interp={:016x} pre={:016x} *** MISMATCH",
+                                                i, jit_gpr[i], interp_gpr[i], pre_gpr[i]);
+                                        }
+                                    }
+                                    if jit_pc != interp_pc {
+                                        eprintln!("  pc:  jit={:016x} interp={:016x}", jit_pc, interp_pc);
+                                    }
+                                    if jit_hi != interp_hi {
+                                        eprintln!("  hi:  jit={:016x} interp={:016x} pre={:016x}", jit_hi, interp_hi, pre_hi);
+                                    }
+                                    if jit_lo != interp_lo {
+                                        eprintln!("  lo:  jit={:016x} interp={:016x} pre={:016x}", jit_lo, interp_lo, pre_lo);
+                                    }
+
+                                    // CLIF IR (if captured)
+                                    if let Some(block) = cache.lookup(phys_pc, pc) {
+                                        if let Some(ref ir) = block.clif_ir {
+                                            eprintln!("── Cranelift CLIF IR ──");
+                                            eprintln!("{}", ir);
+                                        }
+                                        // Native code hex dump
+                                        if block.len_native > 0 {
+                                            eprintln!("── Native code ({} bytes) ──", block.len_native);
+                                            let code = unsafe {
+                                                std::slice::from_raw_parts(block.entry, block.len_native as usize)
+                                            };
+                                            for chunk in code.chunks(16) {
+                                                let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+                                                eprintln!("  {}", hex.join(" "));
+                                            }
+                                        }
+                                    }
+                                    eprintln!("═══ END MISMATCH DUMP ═══");
+
                                     cache.invalidate_range(phys_pc, phys_pc + 4);
                                 }
                                 total_jit_instrs += block_len as u64;
@@ -953,7 +1089,7 @@ fn trace_block<T: Tlb, C: MipsCache>(
     // code (confirmed by IRIS_JIT_VERIFY catching real GPR mismatches). The
     // safe ceiling was empirically determined: aarch64 tolerates 3, x86_64
     // only 1. Bumping past this threshold produces silent miscompilations.
-    let max_helpers: u32 = if cfg!(target_arch = "aarch64") { 3 } else { 1 };
+    let max_helpers: u32 = MAX_BLOCK_LEN as u32;
     let mut helper_count: u32 = 0;
 
     for _ in 0..max_len {
@@ -973,11 +1109,12 @@ fn trace_block<T: Tlb, C: MipsCache>(
 
         let is_branch = is_branch_or_jump(&d);
 
-        // Full-tier: terminate BEFORE stores. Store-containing blocks must be
-        // non-speculative (can't rollback memory), which disables the
-        // self-healing safety net (rollback + demotion on codegen error).
-        // By excluding stores, all Full-tier blocks stay load-only → speculative
-        // → self-healing. Stores go to interpreter, where they're always correct.
+        // Full-tier: terminate BEFORE stores. The write log approach works for
+        // RAM but fails for MMIO: pre-reads of device registers have side
+        // effects (e.g., clear-on-read status bits), and replay writes to
+        // devices (DMA control, audio FIFOs) corrupt device state. Proper
+        // MMIO-aware speculation would require tracking which physical ranges
+        // are RAM vs MMIO and disabling speculation when MMIO is touched.
         if tier == BlockTier::Full && is_compilable_store(&d) && !jit_no_stores() {
             record_termination(&d, tier);
             break;
