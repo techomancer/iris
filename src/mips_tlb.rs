@@ -146,11 +146,11 @@ pub trait Tlb {
     /// * `virt_addr` - Full virtual address (including segment/region bits)
     /// * `asid` - Current Address Space Identifier from EntryHi
     /// * `access_type` - Type of access (Fetch, Read, Write)
-    /// * `is_64bit` - True if CPU is in 64-bit addressing mode
+    /// * `IS_64BIT` - 0 for 32-bit addressing mode, 1 for 64-bit (xtlb)
     ///
     /// # Returns
     /// TlbResult indicating hit, miss, invalid, or modified
-    fn translate(&mut self, virt_addr: u64, asid: u8, access_type: AccessType, is_64bit: bool) -> TlbResult;
+    fn translate<const IS_64BIT: u8>(&mut self, virt_addr: u64, asid: u8, access_type: AccessType) -> TlbResult;
 
     /// Write a TLB entry at the specified index
     ///
@@ -239,7 +239,7 @@ pub struct MipsTlb {
     mru_next: [[u8; TLB_NUM_ENTRIES]; MRU_LISTS],
     /// O(1) lookup for 32-bit (and sign-extended 64-bit) VAs.
     /// Indexed by VA[31:13] (19 bits).  Value = entry index or VMAP_MISS.
-    vmap: Box<[u8; VMAP_SIZE]>,
+    vmap: [u8; VMAP_SIZE],
 }
 
 impl MipsTlb {
@@ -250,7 +250,7 @@ impl MipsTlb {
             entries: [TlbEntry::new(); TLB_NUM_ENTRIES],
             mru_head: [0u8; MRU_LISTS],
             mru_next: [[MRU_NONE; TLB_NUM_ENTRIES]; MRU_LISTS],
-            vmap: Box::new([VMAP_MISS; VMAP_SIZE]),
+            vmap: [VMAP_MISS; VMAP_SIZE],
         };
         // Initialise all four lists as 0 → 1 → … → 47 → NONE.
         for list in 0..MRU_LISTS {
@@ -325,12 +325,13 @@ impl Default for MipsTlb {
 }
 
 impl Tlb for MipsTlb {
-    fn translate(&mut self, virt_addr: u64, asid: u8, access_type: AccessType, is_64bit: bool) -> TlbResult {
+    #[inline]
+    fn translate<const IS_64BIT: u8>(&mut self, virt_addr: u64, asid: u8, access_type: AccessType) -> TlbResult {
         // Fast path: O(1) vmap lookup for 32-bit VAs and 64-bit sign-extended ±2GB VAs.
         // A 64-bit VA is sign-extended 32-bit when upper 32 bits are all-zero (user/kuseg)
         // or all-ones (kernel kseg0/kseg1/kseg2/kseg3 in 64-bit compatibility mode).
         let upper32 = (virt_addr >> 32) as u32;
-        if !is_64bit || upper32 == 0 || upper32 == 0xFFFF_FFFF {
+        if IS_64BIT == 0 || upper32 == 0 || upper32 == 0xFFFF_FFFF {
             let vmap_idx = ((virt_addr as u32) >> 13) as usize;
             let entry_idx = self.vmap[vmap_idx];
             if entry_idx != VMAP_MISS {
@@ -380,7 +381,7 @@ impl Tlb for MipsTlb {
 
         // Slow path: full 64-bit VA (or ASID-aliased 32-bit VA), MRU linear scan.
         let list = access_type as usize;
-        let mode_mask: u64 = if is_64bit {
+        let mode_mask: u64 = if IS_64BIT != 0 {
             0xC000_00FF_FFFF_E000
         } else {
             0x0000_0000_FFFF_E000
@@ -653,7 +654,7 @@ impl PassthroughTlb {
 }
 
 impl Tlb for PassthroughTlb {
-    fn translate(&mut self, virt_addr: u64, _asid: u8, _access_type: AccessType, _is_64bit: bool) -> TlbResult {
+    fn translate<const IS_64BIT: u8>(&mut self, virt_addr: u64, _asid: u8, _access_type: AccessType) -> TlbResult {
         // Identity map addresses below max_identity_addr.
         // We mask the address to 29 bits (512MB) to simulate physical offset behavior,
         // allowing it to work with both masked and full virtual addresses.

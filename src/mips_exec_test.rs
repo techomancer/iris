@@ -529,6 +529,14 @@ mod tests {
 
     #[test]
     fn test_tlb_instructions() {
+        // MipsExecutor<MipsTlb> is ~512KB due to the inline vmap; spawn with a
+        // larger stack to avoid overflow in the default test thread.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| { test_tlb_instructions_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_tlb_instructions_inner() {
         use crate::mips_tlb::MipsTlb;
 
         let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
@@ -2116,6 +2124,12 @@ mod tests {
 
     #[test]
     fn test_tlb_random_write() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| { test_tlb_random_write_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_tlb_random_write_inner() {
         use crate::mips_tlb::Tlb;
         let (mut exec, _) = create_executor_with_tlb(crate::mips_tlb::MipsTlb::default());
 

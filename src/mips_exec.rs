@@ -1215,8 +1215,8 @@ For R4000SC/MC CPUs:
                 if (self.core.cp0_status & crate::mips_core::STATUS_ERL) != 0 {
                     return TranslateResult::ok(virt_addr32 as u64, TR_UNCACHED);
                 }
-                // 32-bit mode: xtlb=false → UTLB vector on miss
-                self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, false)
+                // 32-bit mode: XTLB=0 → UTLB vector on miss
+                self.tlb_translate_impl::<DEBUG, 0>(virt_addr, access_type)
             }
 
             // KSEG0: 0x80000000 - 0x9FFFFFFF (kernel unmapped, cached)
@@ -1242,7 +1242,7 @@ For R4000SC/MC CPUs:
             // KSSEG: 0xC0000000 - 0xDFFFFFFF (supervisor segment, TLB mapped)
             6 => {
                 if PRIV == PRIV_KERNEL || PRIV == PRIV_SUPERVISOR {
-                    self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, false)
+                    self.tlb_translate_impl::<DEBUG, 0>(virt_addr, access_type)
                 } else {
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     TranslateResult::exc(addr_exc(access_type == AccessType::Write))
@@ -1252,7 +1252,7 @@ For R4000SC/MC CPUs:
             // KSEG3: 0xE0000000 - 0xFFFFFFFF (kernel segment, TLB mapped)
             7 => {
                 if PRIV == PRIV_KERNEL {
-                    self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, false)
+                    self.tlb_translate_impl::<DEBUG, 0>(virt_addr, access_type)
                 } else {
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     TranslateResult::exc(addr_exc(access_type == AccessType::Write))
@@ -1289,13 +1289,13 @@ For R4000SC/MC CPUs:
                 }
 
                 // xuseg: true 64-bit address → xtlb=true
-                self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, true)
+                self.tlb_translate_impl::<DEBUG, 1>(virt_addr, access_type)
             }
 
             // xsseg: 0x4000_0000_0000_0000 - 0x7FFF_FFFF_FFFF_FFFF (supervisor segment)
             1 => {
                 if PRIV == PRIV_KERNEL || PRIV == PRIV_SUPERVISOR {
-                    self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, true)
+                    self.tlb_translate_impl::<DEBUG, 1>(virt_addr, access_type)
                 } else {
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }))
@@ -1331,11 +1331,11 @@ For R4000SC/MC CPUs:
                             4 => return TranslateResult::ok((addr_32 & 0x1FFFFFFF) as u64, TR_CACHEABLE),
                             5 => return TranslateResult::ok((addr_32 & 0x1FFFFFFF) as u64, TR_UNCACHED),
                             // KSSEG/KSEG3 compat: TLB mapped, 32-bit compat → xtlb=false
-                            _ => return self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, false),
+                            _ => return self.tlb_translate_impl::<DEBUG, 0>(virt_addr, access_type),
                         }
                     }
                     // True 64-bit xkseg: xtlb=true
-                    self.tlb_translate_impl::<DEBUG>(virt_addr, access_type, true)
+                    self.tlb_translate_impl::<DEBUG, 1>(virt_addr, access_type)
                 } else {
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }))
@@ -1350,38 +1350,38 @@ For R4000SC/MC CPUs:
     /// not written on miss/invalid/modified — the exception result is still
     /// returned so the caller knows the translation failed.
     #[inline]
-    fn tlb_translate_impl<const DEBUG: bool>(&mut self, virt_addr: u64, access_type: AccessType, xtlb: bool) -> TranslateResult {
+    fn tlb_translate_impl<const DEBUG: bool, const XTLB: u8>(&mut self, virt_addr: u64, access_type: AccessType) -> TranslateResult {
         use crate::mips_tlb::TlbResult;
 
         // Get current ASID from EntryHi register
         let asid = (self.core.cp0_entryhi & 0xFF) as u8;
 
-        // Query the TLB — xtlb=true uses 64-bit VPN comparison mask
-        let result = self.tlb.translate(virt_addr, asid, access_type, xtlb);
+        // Query the TLB — XTLB=1 uses 64-bit VPN comparison mask
+        let result = self.tlb.translate::<XTLB>(virt_addr, asid, access_type);
 
         let tlb_miss_code = if access_type == AccessType::Write { EXC_TLBS } else { EXC_TLBL };
 
         match result {
             TlbResult::Hit { phys_addr, cache_attr, dirty } => {
                 if access_type == AccessType::Write && !dirty {
-                    if !DEBUG { self.update_tlb_exception_registers(virt_addr, xtlb); }
+                    if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                     TranslateResult::exc(exec_exception(EXC_MOD))
                 } else {
                     TranslateResult::ok(phys_addr, cache_attr as u32)
                 }
             }
             TlbResult::Miss { .. } => {
-                if !DEBUG { self.update_tlb_exception_registers(virt_addr, xtlb); }
+                if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                 // Miss: XTLB vector (0x080) for 64-bit extended addresses, UTLB vector (0x000) otherwise
-                TranslateResult::exc(if xtlb { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
+                TranslateResult::exc(if XTLB != 0 { exec_xtlb_miss(tlb_miss_code) } else { exec_tlb_miss(tlb_miss_code) })
             }
             TlbResult::Invalid { .. } => {
-                if !DEBUG { self.update_tlb_exception_registers(virt_addr, xtlb); }
+                if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                 // Invalid: always general vector (0x180)
                 TranslateResult::exc(exec_exception(tlb_miss_code))
             }
             TlbResult::Modified { .. } => {
-                if !DEBUG { self.update_tlb_exception_registers(virt_addr, xtlb); }
+                if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                 TranslateResult::exc(exec_exception(EXC_MOD))
             }
         }
@@ -1393,8 +1393,9 @@ For R4000SC/MC CPUs:
     }
 
     /// Update CP0 BadVAddr, EntryHi, Context, XContext for any TLB exception.
-    /// `xtlb`: true for extended (64-bit) translations — uses 64-bit VPN mask for EntryHi.
-    fn update_tlb_exception_registers(&mut self, virt_addr: u64, xtlb: bool) {
+    /// `XTLB=1` for extended (64-bit) translations — uses 64-bit VPN mask for EntryHi.
+    #[inline]
+    fn update_tlb_exception_registers<const XTLB: u8>(&mut self, virt_addr: u64) {
         const EH_VPN2_32: u64 = 0x0000_0000_FFFF_E000;
         const EH_VPN2_64: u64 = 0x0000_00FF_FFFF_E000;
         const EH_REGION:  u64 = 0xC000_0000_0000_0000;
@@ -1403,7 +1404,7 @@ For R4000SC/MC CPUs:
 
         // EntryHi: VPN from address masked per translation mode, ASID preserved.
         let asid = self.core.cp0_entryhi & 0xFF;
-        let vpn_mask = if xtlb { EH_REGION | EH_VPN2_64 } else { EH_VPN2_32 };
+        let vpn_mask = if XTLB != 0 { EH_REGION | EH_VPN2_64 } else { EH_VPN2_32 };
         self.core.cp0_entryhi = (virt_addr & vpn_mask) | asid;
 
         // Context: PTEBase[63:23] preserved, BadVPN2 = virt_addr[31:13] in bits [22:4].

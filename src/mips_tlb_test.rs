@@ -46,7 +46,7 @@ mod tests {
         let mut tlb = PassthroughTlb::new(0x20000000); // 512MB
 
         // Test identity mapping for low addresses
-        match tlb.translate(0x1000, 0, AccessType::Read, false) {
+        match tlb.translate::<0>(0x1000, 0, AccessType::Read) {
             TlbResult::Hit { phys_addr, cache_attr, dirty } => {
                 assert_eq!(phys_addr, 0x1000);
                 assert_eq!(cache_attr, CacheAttr::Uncached);
@@ -56,7 +56,7 @@ mod tests {
         }
 
         // Test identity mapping at upper boundary
-        match tlb.translate(0x1FFFFFFF, 0, AccessType::Read, false) {
+        match tlb.translate::<0>(0x1FFFFFFF, 0, AccessType::Read) {
             TlbResult::Hit { phys_addr, cache_attr, dirty } => {
                 assert_eq!(phys_addr, 0x1FFFFFFF);
                 assert_eq!(cache_attr, CacheAttr::Uncached);
@@ -66,7 +66,7 @@ mod tests {
         }
 
         // Test TLB miss for addresses beyond 512MB
-        match tlb.translate(0x20000000, 0, AccessType::Read, false) {
+        match tlb.translate::<0>(0x20000000, 0, AccessType::Read) {
             TlbResult::Miss { vpn2 } => {
                 assert_eq!(vpn2, 0x20000000 >> 13); // VPN2 should be address >> 13
             }
@@ -103,7 +103,7 @@ mod tests {
 
         // Test 1: Even page translation
         let va_even = 0x00200000;
-        match tlb.translate(va_even, asid, AccessType::Read, false) {
+        match tlb.translate::<0>(va_even, asid, AccessType::Read) {
             TlbResult::Hit { phys_addr, cache_attr, dirty } => {
                 assert_eq!(phys_addr, 0x50000);
                 assert_eq!(cache_attr, CacheAttr::Cacheable);
@@ -114,7 +114,7 @@ mod tests {
 
         // Test 2: Odd page translation
         let va_odd = 0x00201000;
-        match tlb.translate(va_odd, asid, AccessType::Read, false) {
+        match tlb.translate::<0>(va_odd, asid, AccessType::Read) {
             TlbResult::Hit { phys_addr, cache_attr, dirty } => {
                 assert_eq!(phys_addr, 0x51000);
                 assert_eq!(cache_attr, CacheAttr::Uncached);
@@ -125,7 +125,7 @@ mod tests {
 
         // Test 3: TLB Miss (Unmapped address)
         let va_miss = 0x00300000;
-        match tlb.translate(va_miss, asid, AccessType::Read, false) {
+        match tlb.translate::<0>(va_miss, asid, AccessType::Read) {
             TlbResult::Miss { vpn2 } => {
                 assert_eq!(vpn2, va_miss >> 13);
             }
@@ -133,7 +133,7 @@ mod tests {
         }
 
         // Test 4: TLB Miss (Wrong ASID)
-        match tlb.translate(va_even, asid + 1, AccessType::Read, false) {
+        match tlb.translate::<0>(va_even, asid + 1, AccessType::Read) {
             TlbResult::Miss { vpn2 } => {
                 assert_eq!(vpn2, va_even >> 13);
             }
@@ -167,7 +167,7 @@ mod tests {
 
         // Test: Translation should succeed despite ASID mismatch because it is Global
         let va = 0x00400000;
-        match tlb.translate(va, request_asid, AccessType::Read, false) {
+        match tlb.translate::<0>(va, request_asid, AccessType::Read) {
             TlbResult::Hit { phys_addr, .. } => {
                 assert_eq!(phys_addr, 0x60000);
             }
@@ -228,7 +228,7 @@ mod tests {
 
         // Test 32-bit mode translation - should match on bits 31:13 only
         let va_32bit = 0x00200000; // VPN2=0x100 in bits 31:13
-        match tlb.translate(va_32bit, asid, AccessType::Read, false) {
+        match tlb.translate::<0>(va_32bit, asid, AccessType::Read) {
             TlbResult::Hit { phys_addr, .. } => {
                 assert_eq!(phys_addr, 0x50000);
             }
@@ -237,7 +237,7 @@ mod tests {
 
         // Test 64-bit mode translation - should match R field and extended VPN2
         let va_64bit = (2u64 << 62) | 0x00200000; // R=2, VPN2=0x100
-        match tlb.translate(va_64bit, asid, AccessType::Read, true) {
+        match tlb.translate::<1>(va_64bit, asid, AccessType::Read) {
             TlbResult::Hit { phys_addr, .. } => {
                 assert_eq!(phys_addr, 0x50000);
             }
@@ -246,7 +246,7 @@ mod tests {
 
         // Test 64-bit mode with wrong R field - should miss
         let va_wrong_r = (1u64 << 62) | 0x00200000; // R=1 instead of R=2
-        match tlb.translate(va_wrong_r, asid, AccessType::Read, true) {
+        match tlb.translate::<1>(va_wrong_r, asid, AccessType::Read) {
             TlbResult::Miss { .. } => {
                 // Expected - R field doesn't match
             }
