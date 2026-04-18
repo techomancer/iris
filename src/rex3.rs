@@ -6,7 +6,7 @@ use crossbeam_utils::CachePadded;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
 use crate::devlog::{LogModule, devlog_is_active, devlog};
 use crate::snapshot::{get_field, u32_slice_to_toml, u16_slice_to_toml, load_u32_slice, load_u16_slice, toml_u32, toml_u64, hex_u32, hex_u64};
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use crate::vc2::Vc2;
 use crate::xmap9::Xmap9;
 use crate::cmap::Cmap;
@@ -881,6 +881,9 @@ pub struct GFifo {
     lock: AtomicBool,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
+    shadow_head: CachePadded<Cell<usize>>,
+    shadow_tail: CachePadded<Cell<usize>>,
+    local_head: CachePadded<Cell<usize>>,
     buf:  [GFIFOEntry; GFIFO_DEPTH],
 }
 
@@ -910,25 +913,31 @@ impl GFifo {
     pub fn push(&self, addr: u32, val: u64) {
         // Acquire the spinlock — uncontested in the common case (one active producer).
         while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            std::hint::spin_loop();
+            while self.lock.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
         }
         // Spin if full — consumer will drain it.
-        loop {
-            let tail = self.tail.load(Ordering::Relaxed);
-            let next_tail = tail.wrapping_add(1) & GFIFO_MASK;
-            if next_tail != self.head.load(Ordering::Acquire) {
-                // SAFETY: we hold the lock; no other producer touches this slot.
-                unsafe {
-                    let slot = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
-                    (*slot).addr = addr;
-                    (*slot).val  = val;
-                }
-                // Release: consumer's Acquire on tail sees the slot write above.
-                self.tail.store(next_tail, Ordering::Release);
-                break;
+        let tail = self.tail.load(Ordering::Relaxed);
+        let next_tail = tail.wrapping_add(1) & GFIFO_MASK;
+        let mut cached_head = self.shadow_head.get();
+        if next_tail == cached_head {
+            cached_head = self.head.load(Ordering::Acquire);
+            self.shadow_head.set(cached_head);
+            while next_tail == cached_head {
+                std::hint::spin_loop();
+                cached_head = self.head.load(Ordering::Acquire);
+                self.shadow_head.set(cached_head);
             }
-            std::hint::spin_loop();
         }
+        // SAFETY: we hold the lock; no other producer touches this slot.
+        unsafe {
+            let slot = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
+            (*slot).addr = addr;
+            (*slot).val  = val;
+        }
+        // Release: consumer's Acquire on tail sees the slot write above.
+        self.tail.store(next_tail, Ordering::Release);
         self.lock.store(false, Ordering::Release);
     }
 
@@ -936,9 +945,14 @@ impl GFifo {
     /// Must be called from the consumer thread only.
     #[inline]
     pub fn peek(&self) -> Option<(u32, u64)> {
-        let head = self.head.load(Ordering::Relaxed);
-        if head == self.tail.load(Ordering::Acquire) {
-            return None;
+        let head = self.local_head.get();
+        let mut cached_tail = self.shadow_tail.get();
+        if head == cached_tail {
+            cached_tail = self.tail.load(Ordering::Acquire);
+            self.shadow_tail.set(cached_tail);
+            if head == cached_tail {
+                return None;
+            }
         }
         // SAFETY: consumer owns head; no producer touches a slot before tail is published,
         // and our Acquire on tail pairs with the producer's Release store.
@@ -950,8 +964,18 @@ impl GFifo {
     /// Must follow a successful `peek()`.
     #[inline]
     pub fn consume(&self) {
-        let head = self.head.load(Ordering::Relaxed);
-        self.head.store(head.wrapping_add(1) & GFIFO_MASK, Ordering::Release);
+        let head = self.local_head.get();
+        let next_head = head.wrapping_add(1) & GFIFO_MASK;
+        self.local_head.set(next_head);
+        // Publish every 64 entries to massively reduce cache line invalidations
+        if next_head & 63 == 0 {
+            self.head.store(next_head, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub fn flush_head(&self) {
+        self.head.store(self.local_head.get(), Ordering::Release);
     }
 
     /// True when no entries are pending.
@@ -2952,14 +2976,15 @@ impl Rex3 {
 
     fn register_processor(&self) {
         let backoff = crossbeam_utils::Backoff::new();
+        let mut is_busy = false;
         loop {
             if let Some((addr, val)) = self.gfifo.peek() {
                 backoff.reset();
 
-                // Signal busy for the entire duration — covers plain register writes too.
-                // CPU thread checks gfxbusy || !is_empty(); holding busy here ensures
-                // context reads stall until process_register AND execute_go are both done.
-                self.gfxbusy.store(true, Ordering::Relaxed);
+                if !is_busy {
+                    self.gfxbusy.store(true, Ordering::Relaxed);
+                    is_busy = true;
+                }
 
                 let is_go = addr & 0x0800 != 0;
                 // Strip GO bit only; keep is_64bit (bit 0) for HOSTRW discrimination.
@@ -2996,10 +3021,18 @@ impl Rex3 {
                 // (context registers + FB) only after both process_register and execute_go
                 // have completed.
                 self.gfifo.consume();
-                self.gfxbusy.store(false, Ordering::Release);
 
-                if exit { break; } // GFIFO_EXIT
+                if exit { 
+                    self.gfxbusy.store(false, Ordering::Release);
+                    self.gfifo.flush_head();
+                    break; 
+                } // GFIFO_EXIT
             } else {
+                if is_busy {
+                    self.gfxbusy.store(false, Ordering::Release);
+                    is_busy = false;
+                }
+                self.gfifo.flush_head();
                 // Nothing in the ring — back off. Starts with spin_loop() hints,
                 // graduates to thread::yield_now() after sustained emptiness.
                 backoff.snooze();
