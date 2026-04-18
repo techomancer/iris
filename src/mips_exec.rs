@@ -556,6 +556,7 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     cycles_ptr:       *const AtomicU64,
     interrupts_ptr:   *const AtomicU64,
     fasttick_ptr:     *const AtomicU64,
+    local_fasttick:   u32,
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
     /// Always the non-debug variant; selects the correct 32/64-bit × privilege specialisation.
     pub translate_fn: fn(&mut Self, u64, AccessType) -> TranslateResult,
@@ -714,6 +715,7 @@ For R4000SC/MC CPUs:
             cycles_ptr:     std::ptr::null(),
             interrupts_ptr: std::ptr::null(),
             fasttick_ptr:   std::ptr::null(),
+            local_fasttick: 0,
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
             // Placeholder — overwritten immediately by update_fpr_mode below.
@@ -849,6 +851,8 @@ For R4000SC/MC CPUs:
     #[inline(always)]
     pub fn flush_cycles(&mut self) {
         unsafe { &*self.cycles_ptr }.store(self.core.local_cycles, Ordering::Relaxed);
+        unsafe { &*self.fasttick_ptr }.fetch_add(self.local_fasttick as u64, Ordering::Relaxed);
+        self.local_fasttick = 0;
     }
 
     pub fn step(&mut self) -> ExecStatus {
@@ -877,10 +881,9 @@ For R4000SC/MC CPUs:
         // Plain wrapping_add gives free 32-bit wrap of the hardware count portion.
         let prev = self.core.cp0_count;
         self.core.cp0_count = prev.wrapping_add(self.core.count_step);
-        if self.core.cp0_compare.wrapping_sub(prev) <= self.core.count_step {
-            self.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
-            unsafe { &*self.fasttick_ptr }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let timer_fired = (self.core.cp0_compare.wrapping_sub(prev) <= self.core.count_step) as u32;
+        self.core.cp0_cause |= crate::mips_core::CAUSE_IP7.wrapping_mul(timer_fired);
+        self.local_fasttick = self.local_fasttick.wrapping_add(timer_fired);
         // Fast path: skip all signal/interrupt handling when nothing is pending
         if (pending | self.core.cp0_cause as u64) != 0 {
             // Soft reset (bit 63)
