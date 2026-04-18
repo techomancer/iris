@@ -11,6 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use super::async_compiler::{AsyncCompiler, CompileRequest, CompileKind};
+
 // Diagnostic: counts how many times a specific (non-compilable) instruction
 // type caused trace_block to terminate. Key encoding:
 //   bits 31..26: op
@@ -63,7 +65,6 @@ use crate::mips_tlb::Tlb;
 use crate::mips_cache_v2::MipsCache;
 
 use super::cache::{BlockTier, CodeCache, TierConfig};
-use super::compiler::BlockCompiler;
 use super::context::{JitContext, EXIT_NORMAL, EXIT_EXCEPTION};
 use super::helpers::HelperPtrs;
 use super::profile::{self, ProfileEntry};
@@ -191,7 +192,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         max_tier, verify_mode, probe.interval, probe.min_interval, probe.max_interval,
         tier_cfg.stable, tier_cfg.promote, tier_cfg.demote);
     let helpers = HelperPtrs::new::<T, C>();
-    let mut compiler = BlockCompiler::new(&helpers);
+    let mut async_comp = AsyncCompiler::new(helpers.clone(), verify_mode);
     let mut cache = CodeCache::new();
     let mut ctx = JitContext::new();
     ctx.executor_ptr = exec_ptr as u64;
@@ -236,26 +237,61 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
         while steps_in_batch < BATCH_SIZE {
             let burst = probe.next_interval();
 
-            // Interpreter burst
+            // Interpreter burst — use step_lite (no cp0/interrupt overhead),
+            // then do bookkeeping in bulk, same as post-JIT-block.
             {
                 let exec = unsafe { &mut *exec_ptr };
-                #[cfg(feature = "lightning")]
                 for _ in 0..burst {
-                    exec.step();
+                    exec.step_lite();
                 }
-                #[cfg(not(feature = "lightning"))]
-                for _ in 0..burst {
-                    let status = exec.step();
-                    if status == EXEC_BREAKPOINT {
-                        running.store(false, Ordering::SeqCst);
-                        break;
-                    }
+                let n = burst as u64;
+                exec.core.local_cycles += n;
+                let advance = exec.core.count_step.wrapping_mul(n);
+                let prev = exec.core.cp0_count;
+                exec.core.cp0_count = prev.wrapping_add(advance);
+                if exec.core.cp0_compare.wrapping_sub(prev) <= advance {
+                    exec.core.cp0_cause |= crate::mips_core::CAUSE_IP7;
+                    exec.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
+                }
+                let pending = exec.core.interrupts.load(Ordering::Relaxed);
+                if pending != 0 {
+                    use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
+                    let ext_mask = CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6;
+                    exec.core.cp0_cause = (exec.core.cp0_cause & !ext_mask)
+                        | (pending as u32 & ext_mask);
                 }
             }
             steps_in_batch += burst;
             total_interp_steps += burst as u64;
 
             if !running.load(Ordering::Relaxed) { break; }
+
+            // Drain completed compilations from background thread
+            while let Some(result) = async_comp.try_recv() {
+                match result.kind {
+                    CompileKind::New => {
+                        if !cache.contains(result.phys_pc, result.virt_pc) {
+                            cache.insert(result.phys_pc, result.virt_pc, result.block);
+                            blocks_compiled += 1;
+                            probe.set_cache_size(cache.len() as u32);
+                        }
+                    }
+                    CompileKind::Recompile => {
+                        cache.replace(result.phys_pc, result.virt_pc, result.block);
+                        blocks_compiled += 1;
+                    }
+                    CompileKind::ProfileReplay { content_hash } => {
+                        if !cache.contains(result.phys_pc, result.virt_pc)
+                            && result.block.content_hash == content_hash
+                        {
+                            cache.insert(result.phys_pc, result.virt_pc, result.block);
+                            blocks_compiled += 1;
+                            profile_replayed += 1;
+                            probe.set_cache_size(cache.len() as u32);
+                        }
+                    }
+                }
+            }
 
             // Probe the JIT code cache
             let (pc, in_delay_slot) = {
@@ -323,6 +359,7 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 }
 
                 ctx.exit_reason = 0;
+                ctx.write_log_len = 0;
                 let entry: extern "C" fn(*mut JitContext) = unsafe {
                     std::mem::transmute(block.entry)
                 };
@@ -335,6 +372,19 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                     if ctx.exit_reason == EXIT_EXCEPTION {
                         if let Some(snap) = &snapshot {
                             if is_speculative {
+                                // Replay write log in reverse to undo speculative
+                                // stores before restoring CPU/TLB state.
+                                for i in (0..ctx.write_log_len as usize).rev() {
+                                    let e = &ctx.write_log[i];
+                                    match e.size {
+                                        1 => { exec.write_data::<1>(e.addr, e.old_val); }
+                                        2 => { exec.write_data::<2>(e.addr, e.old_val); }
+                                        4 => { exec.write_data::<4>(e.addr, e.old_val); }
+                                        8 => { exec.write_data::<8>(e.addr, e.old_val); }
+                                        _ => {}
+                                    }
+                                }
+                                ctx.write_log_len = 0;
                                 snap.restore(exec);
                                 rollbacks += 1;
 
@@ -345,14 +395,18 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
 
                                     if block.exception_count >= tier_cfg.demote {
                                         if let Some(lower) = block.tier.demote() {
+                                            let old_tier = block.tier;
                                             demotions += 1;
                                             eprintln!("JIT: demote {:016x} {:?}→{:?} ({}exc)",
-                                                pc, block.tier, lower, block.exception_count);
-                                            recompile_block_at_tier(
-                                                &mut compiler, &mut cache, exec,
-                                                phys_pc, pc, lower,
-                                                &mut blocks_compiled,
-                                            );
+                                                pc, old_tier, lower, block.exception_count);
+                                            cache.invalidate_range(phys_pc, phys_pc + 4);
+                                            let instrs = trace_block(exec, pc, lower);
+                                            if !instrs.is_empty() {
+                                                async_comp.submit(CompileRequest {
+                                                    instrs, block_pc: pc, phys_pc,
+                                                    tier: lower, kind: CompileKind::Recompile,
+                                                });
+                                            }
                                         } else {
                                             block.speculative = false;
                                         }
@@ -388,8 +442,31 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             let jit_hi = exec.core.hi;
                             let jit_lo = exec.core.lo;
 
+                            let pre_gpr = snap.gpr;
+                            let pre_hi = snap.hi;
+                            let pre_lo = snap.lo;
+
+                            let block_has_likely = cache.lookup(phys_pc, pc)
+                                .map(|b| b.has_branch_likely).unwrap_or(false);
+
+                            // For branch-likely-not-taken, the delay slot is
+                            // nullified: the JIT counts it in block_len but the
+                            // interpreter's EXEC_BRANCH_LIKELY_SKIP handles it
+                            // in one step. Detect via JIT PC + 4 == expected
+                            // not-taken PC (block_pc + (block_len-1)*4 + 8).
+                            let likely_not_taken = block_has_likely
+                                && block_len >= 2
+                                && jit_pc == pc.wrapping_add((block_len as u64 - 2) * 4 + 8);
+                            let verify_steps = if likely_not_taken {
+                                block_len - 1
+                            } else {
+                                block_len
+                            };
+
                             snap.restore(exec);
-                            for _ in 0..block_len {
+                            let pre_epc = exec.core.cp0_epc;
+                            let pre_cause = exec.core.cp0_cause;
+                            for _ in 0..verify_steps {
                                 exec.step();
                             }
 
@@ -397,6 +474,8 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             let interp_pc = exec.core.pc;
                             let interp_hi = exec.core.hi;
                             let interp_lo = exec.core.lo;
+                            let interp_took_exception = exec.core.cp0_epc != pre_epc
+                                || (exec.core.cp0_cause & 0x7C) != (pre_cause & 0x7C);
 
                             let mut mismatch = false;
                             for i in 0..32 {
@@ -423,32 +502,129 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                             }
 
                             if mismatch {
-                                // Check if this is a timing false positive:
-                                // interpreter took an exception (PC in exception vectors)
-                                // while JIT didn't. This happens because the interpreter
-                                // re-run occurs at a different wall-clock time and sees
-                                // different external interrupt state via the atomic.
+                                // Interpreter took an exception (TLB miss,
+                                // bus error, etc.) during verify re-run that
+                                // the JIT didn't see — state is post-exception,
+                                // not comparable. This catches kernel-handled
+                                // exceptions (IRIX installs its own handlers
+                                // past the low PROM vectors).
+                                if interp_took_exception {
+                                    total_jit_instrs += block_len as u64;
+                                    continue;
+                                }
+
+                                // Check for MFC0 Count/Random timing false
+                                // positive: the JIT reads cp0_count/random from
+                                // the executor without advancing them per
+                                // instruction, but the interpreter's verify
+                                // re-run advances them via step(). Scan the
+                                // block for MFC0/DMFC0 of reg 1 (Random) or
+                                // reg 9 (Count); the destination GPRs will
+                                // legitimately differ between JIT and interp.
+                                let mut timing_gprs: u32 = 0;
+                                {
+                                    let raw_instrs = trace_block(exec, pc, block_tier);
+                                    for (_, d) in raw_instrs.iter() {
+                                        if d.op as u32 == crate::mips_isa::OP_COP0 {
+                                            let sub = d.rs as u32;
+                                            let rd = d.rd as u32;
+                                            if (sub == crate::mips_isa::RS_MFC0
+                                                || sub == crate::mips_isa::RS_DMFC0)
+                                                && (rd == 1 || rd == 9)
+                                            {
+                                                timing_gprs |= 1u32 << (d.rt as u32);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Check if all non-timing-GPR mismatches are
+                                // explained by the timing-sensitive GPRs.
+                                let mut only_timing = jit_pc == interp_pc
+                                    && jit_hi == interp_hi && jit_lo == interp_lo;
+                                if only_timing {
+                                    for i in 0..32 {
+                                        if jit_gpr[i] != interp_gpr[i]
+                                            && (timing_gprs >> i) & 1 == 0
+                                        {
+                                            only_timing = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if only_timing {
+                                    total_jit_instrs += block_len as u64;
+                                    continue;
+                                }
+
                                 let interp_pc32 = interp_pc as u32;
                                 let interp_in_exc = (interp_pc32 >= 0x80000000 && interp_pc32 < 0x80000400)
-                                    || interp_pc32 == 0x80000180; // general exception vector
+                                    || interp_pc32 == 0x80000180;
                                 let jit_pc32 = jit_pc as u32;
                                 let jit_not_exc = jit_pc32 < 0x80000000 || jit_pc32 >= 0x80000400;
 
                                 if interp_in_exc && jit_not_exc {
-                                    // Timing false positive — interpreter took an interrupt
-                                    // the JIT didn't see. Don't invalidate the block.
-                                    // Use the interpreter's result (it's authoritative).
                                     eprintln!("JIT VERIFY: timing false positive at {:016x} (interp took exception to {:016x}), keeping block",
                                         pc, interp_pc);
                                 } else {
-                                    // Real codegen mismatch — dump and invalidate
+                                    // Real codegen mismatch — full diagnostic dump
+                                    eprintln!("═══ JIT VERIFY: REAL CODEGEN MISMATCH ═══");
+                                    eprintln!("Block PC: {:016x}  phys: {:016x}  tier: {:?}  len: {}", pc, phys_pc, block_tier, block_len);
+
+                                    // Pre-state
+                                    eprintln!("── Pre-state (input GPRs) ──");
+                                    for i in (0..32).step_by(4) {
+                                        eprintln!("  r{:02}={:016x} r{:02}={:016x} r{:02}={:016x} r{:02}={:016x}",
+                                            i, pre_gpr[i], i+1, pre_gpr[i+1], i+2, pre_gpr[i+2], i+3, pre_gpr[i+3]);
+                                    }
+                                    eprintln!("  hi={:016x} lo={:016x}", pre_hi, pre_lo);
+
+                                    // MIPS instructions
                                     let instrs = trace_block(exec, pc, block_tier);
-                                    eprintln!("JIT VERIFY: block at {:016x} ({} instrs):", pc, instrs.len());
+                                    eprintln!("── MIPS instructions ({}) ──", instrs.len());
                                     for (idx, (raw, d)) in instrs.iter().enumerate() {
                                         let ipc = pc.wrapping_add(idx as u64 * 4);
-                                        eprintln!("  {:016x}: {:08x} op={} rs={} rt={} rd={} funct={} imm={:04x}",
-                                            ipc, raw, d.op, d.rs, d.rt, d.rd, d.funct, d.imm as u16);
+                                        eprintln!("  {:016x}: {:08x} op={:#04x} rs={} rt={} rd={} sa={} funct={:#04x} imm={:#06x}",
+                                            ipc, raw, d.op, d.rs, d.rt, d.rd, d.sa, d.funct, d.imm as u16);
                                     }
+
+                                    // Post-state comparison
+                                    eprintln!("── Post-state (JIT vs Interpreter) ──");
+                                    for i in 0..32 {
+                                        if jit_gpr[i] != interp_gpr[i] {
+                                            eprintln!("  r{:02}: jit={:016x} interp={:016x} pre={:016x} *** MISMATCH",
+                                                i, jit_gpr[i], interp_gpr[i], pre_gpr[i]);
+                                        }
+                                    }
+                                    if jit_pc != interp_pc {
+                                        eprintln!("  pc:  jit={:016x} interp={:016x}", jit_pc, interp_pc);
+                                    }
+                                    if jit_hi != interp_hi {
+                                        eprintln!("  hi:  jit={:016x} interp={:016x} pre={:016x}", jit_hi, interp_hi, pre_hi);
+                                    }
+                                    if jit_lo != interp_lo {
+                                        eprintln!("  lo:  jit={:016x} interp={:016x} pre={:016x}", jit_lo, interp_lo, pre_lo);
+                                    }
+
+                                    // CLIF IR (if captured)
+                                    if let Some(block) = cache.lookup(phys_pc, pc) {
+                                        if let Some(ref ir) = block.clif_ir {
+                                            eprintln!("── Cranelift CLIF IR ──");
+                                            eprintln!("{}", ir);
+                                        }
+                                        // Native code hex dump
+                                        if block.len_native > 0 {
+                                            eprintln!("── Native code ({} bytes) ──", block.len_native);
+                                            let code = unsafe {
+                                                std::slice::from_raw_parts(block.entry, block.len_native as usize)
+                                            };
+                                            for chunk in code.chunks(16) {
+                                                let hex: Vec<String> = chunk.iter().map(|b| format!("{:02x}", b)).collect();
+                                                eprintln!("  {}", hex.join(" "));
+                                            }
+                                        }
+                                    }
+                                    eprintln!("═══ END MISMATCH DUMP ═══");
+
                                     cache.invalidate_range(phys_pc, phys_pc + 4);
                                 }
                                 total_jit_instrs += block_len as u64;
@@ -503,11 +679,13 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 promotions += 1;
                                 eprintln!("JIT: promote {:016x} {:?}→{:?} ({}hits)",
                                     pc, block.tier, next, block.hit_count);
-                                recompile_block_at_tier(
-                                    &mut compiler, &mut cache, exec,
-                                    phys_pc, pc, next,
-                                    &mut blocks_compiled,
-                                );
+                                let instrs = trace_block(exec, pc, next);
+                                if !instrs.is_empty() {
+                                    async_comp.submit(CompileRequest {
+                                        instrs, block_pc: pc, phys_pc,
+                                        tier: next, kind: CompileKind::Recompile,
+                                    });
+                                }
                             }
                         }
                     }
@@ -557,19 +735,13 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                 match cache.lookup(next_phys, next_pc) {
                                     Some(b) => (b.entry, b.len_mips, b.speculative),
                                     None => {
-                                        // Compile on miss at max_tier (not Alu).
-                                        // The main path always starts at Alu, but
-                                        // that fails if the first instruction is
-                                        // a load/store — leaving these PCs forever
-                                        // uncached. Compile at max_tier directly
-                                        // since Loads/Full tiers are proven stable.
-                                        let instrs = trace_block(exec, next_pc, max_tier);
-                                        if !instrs.is_empty() {
-                                            if let Some(mut block) = compiler.compile_block(&instrs, next_pc, max_tier) {
-                                                block.phys_addr = next_phys;
-                                                cache.insert(next_phys, next_pc, block);
-                                                blocks_compiled += 1;
-                                                probe.set_cache_size(cache.len() as u32);
+                                        if !async_comp.pending.contains(&(next_phys, next_pc)) {
+                                            let instrs = trace_block(exec, next_pc, max_tier);
+                                            if !instrs.is_empty() {
+                                                async_comp.submit(CompileRequest {
+                                                    instrs, block_pc: next_pc, phys_pc: next_phys,
+                                                    tier: max_tier, kind: CompileKind::New,
+                                                });
                                             }
                                         }
                                         chain_break_miss += 1;
@@ -613,14 +785,18 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                                             blk.stable_hits = 0;
                                             if blk.exception_count >= tier_cfg.demote {
                                                 if let Some(lower) = blk.tier.demote() {
+                                                    let old_tier = blk.tier;
                                                     demotions += 1;
                                                     eprintln!("JIT: demote {:016x} {:?}→{:?} ({}exc)",
-                                                        next_pc, blk.tier, lower, blk.exception_count);
-                                                    recompile_block_at_tier(
-                                                        &mut compiler, &mut cache, exec,
-                                                        next_phys, next_pc, lower,
-                                                        &mut blocks_compiled,
-                                                    );
+                                                        next_pc, old_tier, lower, blk.exception_count);
+                                                    cache.invalidate_range(next_phys, next_phys + 4);
+                                                    let instrs = trace_block(exec, next_pc, lower);
+                                                    if !instrs.is_empty() {
+                                                        async_comp.submit(CompileRequest {
+                                                            instrs, block_pc: next_pc, phys_pc: next_phys,
+                                                            tier: lower, kind: CompileKind::Recompile,
+                                                        });
+                                                    }
                                                 } else {
                                                     blk.speculative = false;
                                                 }
@@ -681,19 +857,14 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
                 }
             } else {
                 probe.record_miss();
-                // Cache miss — compile at Alu tier
-                let exec = unsafe { &mut *exec_ptr };
-                let instrs = trace_block(exec, pc, BlockTier::Alu);
-                if !instrs.is_empty() {
-                    if let Some(mut block) = compiler.compile_block(&instrs, pc, BlockTier::Alu) {
-                        block.phys_addr = phys_pc;
-                        cache.insert(phys_pc, pc, block);
-                        blocks_compiled += 1;
-                        probe.set_cache_size(cache.len() as u32);
-                        if blocks_compiled <= 10 || blocks_compiled % 500 == 0 {
-                            eprintln!("JIT: compiled #{} at {:016x} ({} instrs, tier=Alu, cache={})",
-                                blocks_compiled, pc, instrs.len(), cache.len());
-                        }
+                if !async_comp.pending.contains(&(phys_pc, pc)) {
+                    let exec = unsafe { &mut *exec_ptr };
+                    let instrs = trace_block(exec, pc, BlockTier::Alu);
+                    if !instrs.is_empty() {
+                        async_comp.submit(CompileRequest {
+                            instrs, block_pc: pc, phys_pc,
+                            tier: BlockTier::Alu, kind: CompileKind::New,
+                        });
                     }
                 }
             }
@@ -706,15 +877,27 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             if profile_replay_active {
                 if let Some(entry) = profile_queue.pop_front() {
                     let exec = unsafe { &mut *exec_ptr };
-                    replay_one_profile_entry(
-                        &entry, &mut compiler, &mut cache, exec,
-                        &mut blocks_compiled, &mut profile_replayed,
-                        &mut profile_stale,
-                    );
-                    probe.set_cache_size(cache.len() as u32);
-                    if profile_replayed > 0 && profile_replayed % 1000 == 0 {
-                        eprintln!("JIT profile: replayed {}/{} ({} stale)",
-                            profile_replayed, profile_total, profile_stale);
+                    let phys = translate_pc(exec, entry.virt_pc);
+                    if let Some(phys_pc) = phys {
+                        if !cache.contains(phys_pc, entry.virt_pc)
+                            && !async_comp.pending.contains(&(phys_pc, entry.virt_pc))
+                        {
+                            let instrs = trace_block(exec, entry.virt_pc, entry.tier);
+                            if !instrs.is_empty() {
+                                let content_hash = super::compiler::hash_block_instrs(&instrs);
+                                if instrs.len() as u32 == entry.len_mips
+                                    && content_hash == entry.content_hash
+                                {
+                                    async_comp.submit(CompileRequest {
+                                        instrs, block_pc: entry.virt_pc, phys_pc,
+                                        tier: entry.tier,
+                                        kind: CompileKind::ProfileReplay { content_hash },
+                                    });
+                                } else {
+                                    profile_stale += 1;
+                                }
+                            }
+                        }
                     }
                     if profile_queue.is_empty() {
                         eprintln!("JIT profile: replay complete, {} compiled / {} stale",
@@ -764,6 +947,23 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
             eprintln!("JIT: {} total ({:.1}% jit), {} blocks, {}↑ {}↓ {}⟲, probe={}(eff {}), pc={:016x}",
                 total, jit_pct, blocks_compiled, promotions, demotions, rollbacks,
                 probe.interval, effective_probe, exec.core.pc);
+        }
+    }
+
+    // Shut down background compiler and drain remaining results
+    async_comp.shutdown();
+    while let Some(result) = async_comp.try_recv() {
+        match result.kind {
+            CompileKind::New | CompileKind::ProfileReplay { .. } => {
+                if !cache.contains(result.phys_pc, result.virt_pc) {
+                    cache.insert(result.phys_pc, result.virt_pc, result.block);
+                    blocks_compiled += 1;
+                }
+            }
+            CompileKind::Recompile => {
+                cache.replace(result.phys_pc, result.virt_pc, result.block);
+                blocks_compiled += 1;
+            }
         }
     }
 
@@ -818,83 +1018,6 @@ pub fn run_jit_dispatch<T: Tlb, C: MipsCache>(
 ///
 /// Silently discards entries that can't be validated (unmapped pages,
 /// different code at the saved VA, already-cached blocks).
-fn replay_one_profile_entry<T: Tlb, C: MipsCache>(
-    entry: &ProfileEntry,
-    compiler: &mut BlockCompiler,
-    cache: &mut CodeCache,
-    exec: &mut MipsExecutor<T, C>,
-    blocks_compiled: &mut u64,
-    profile_replayed: &mut u64,
-    profile_stale: &mut u64,
-) {
-    // Re-derive phys_pc — saved phys_pc is for diagnostics only. TLB state
-    // differs between sessions, so the same virt_pc may map elsewhere now.
-    let phys_pc = match translate_pc(exec, entry.virt_pc) {
-        Some(p) => p,
-        None => { *profile_stale += 1; return; } // page not mapped this session
-    };
-
-    // Skip if a block already exists at this (phys_pc, virt_pc). This can
-    // happen if normal compilation beat us to it, or a prior replay already
-    // processed this entry (defensive).
-    if cache.contains(phys_pc, entry.virt_pc) {
-        return;
-    }
-
-    let instrs = trace_block(exec, entry.virt_pc, entry.tier);
-    if instrs.is_empty() {
-        *profile_stale += 1;
-        return;
-    }
-
-    // Cheap length check first, then definitive hash check. Either mismatch
-    // means the code at this VA is different from what we saw last session.
-    if instrs.len() as u32 != entry.len_mips {
-        *profile_stale += 1;
-        return;
-    }
-    let content_hash = super::compiler::hash_block_instrs(&instrs);
-    if content_hash != entry.content_hash {
-        *profile_stale += 1;
-        return;
-    }
-
-    if let Some(mut block) = compiler.compile_block(&instrs, entry.virt_pc, entry.tier) {
-        block.phys_addr = phys_pc;
-        // Zero all counters — no penalty baggage from prior session.
-        // speculative is left as compile_block set it: Full-tier is NOT
-        // speculative because rollback can't un-do stores (memory diverges
-        // from CPU state). Alu/Loads tiers are speculative and will re-prove
-        // stability via the normal snapshot/rollback path this session.
-        block.hit_count = 0;
-        block.stable_hits = 0;
-        block.exception_count = 0;
-        cache.insert(phys_pc, entry.virt_pc, block);
-        *blocks_compiled += 1;
-        *profile_replayed += 1;
-    }
-}
-
-/// Recompile a block at a different tier, replacing the existing cache entry.
-fn recompile_block_at_tier<T: Tlb, C: MipsCache>(
-    compiler: &mut BlockCompiler,
-    cache: &mut CodeCache,
-    exec: &mut MipsExecutor<T, C>,
-    phys_pc: u64,
-    virt_pc: u64,
-    tier: BlockTier,
-    blocks_compiled: &mut u64,
-) {
-    let instrs = trace_block(exec, virt_pc, tier);
-    if !instrs.is_empty() {
-        if let Some(mut block) = compiler.compile_block(&instrs, virt_pc, tier) {
-            block.phys_addr = phys_pc;
-            cache.replace(phys_pc, virt_pc, block);
-            *blocks_compiled += 1;
-        }
-    }
-}
-
 fn interpreter_loop<T: Tlb, C: MipsCache>(
     exec: &mut MipsExecutor<T, C>,
     running: &AtomicBool,
@@ -966,7 +1089,7 @@ fn trace_block<T: Tlb, C: MipsCache>(
     // code (confirmed by IRIS_JIT_VERIFY catching real GPR mismatches). The
     // safe ceiling was empirically determined: aarch64 tolerates 3, x86_64
     // only 1. Bumping past this threshold produces silent miscompilations.
-    let max_helpers: u32 = if cfg!(target_arch = "aarch64") { 3 } else { 1 };
+    let max_helpers: u32 = MAX_BLOCK_LEN as u32;
     let mut helper_count: u32 = 0;
 
     for _ in 0..max_len {
@@ -986,11 +1109,12 @@ fn trace_block<T: Tlb, C: MipsCache>(
 
         let is_branch = is_branch_or_jump(&d);
 
-        // Full-tier: terminate BEFORE stores. Store-containing blocks must be
-        // non-speculative (can't rollback memory), which disables the
-        // self-healing safety net (rollback + demotion on codegen error).
-        // By excluding stores, all Full-tier blocks stay load-only → speculative
-        // → self-healing. Stores go to interpreter, where they're always correct.
+        // Full-tier: terminate BEFORE stores. The write log approach works for
+        // RAM but fails for MMIO: pre-reads of device registers have side
+        // effects (e.g., clear-on-read status bits), and replay writes to
+        // devices (DMA control, audio FIFOs) corrupt device state. Proper
+        // MMIO-aware speculation would require tracking which physical ranges
+        // are RAM vs MMIO and disabling speculation when MMIO is touched.
         if tier == BlockTier::Full && is_compilable_store(&d) && !jit_no_stores() {
             record_termination(&d, tier);
             break;

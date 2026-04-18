@@ -20,6 +20,7 @@ pub struct BlockCompiler {
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
     func_id_counter: u32,
+    pub capture_ir: bool,
     // Declared function IDs for memory helpers (registered as imports)
     fn_read_u8: FuncId,
     fn_read_u16: FuncId,
@@ -116,6 +117,7 @@ impl BlockCompiler {
             jit_module,
             builder_ctx: FunctionBuilderContext::new(),
             func_id_counter: 0,
+            capture_ir: false,
             fn_read_u8, fn_read_u16, fn_read_u32, fn_read_u64,
             fn_write_u8, fn_write_u16, fn_write_u32, fn_write_u64,
             fn_interp_step,
@@ -207,6 +209,7 @@ impl BlockCompiler {
         // Emit IR for each instruction
         let mut compiled_count = 0u32;
         let mut branch_exit_pc: Option<Value> = None;
+        let mut has_branch_likely = false;
 
         let mut idx = 0;
         while idx < instrs.len() {
@@ -265,6 +268,7 @@ impl BlockCompiler {
                     break;
                 }
                 EmitResult::BranchLikely { taken, not_taken, cond } => {
+                    has_branch_likely = true;
                     compiled_count += 1;
                     idx += 1;
                     if idx < instrs.len() {
@@ -347,13 +351,20 @@ impl BlockCompiler {
         builder.ins().return_(&[]);
         builder.finalize();
 
+        // Capture CLIF IR before define_function consumes it (for verify diagnostics)
+        let clif_ir = if self.capture_ir {
+            Some(format!("{}", self.ctx.func.display()))
+        } else {
+            None
+        };
+
         // Compile to native code
         self.jit_module.define_function(func_id, &mut self.ctx).unwrap();
+        let code_size = self.ctx.compiled_code().unwrap().code_info().total_size;
         self.jit_module.clear_context(&mut self.ctx);
         self.jit_module.finalize_definitions().unwrap();
 
         let code_ptr = self.jit_module.get_finalized_function(func_id);
-        let code_size = 0u32; // JITModule doesn't expose size easily; not critical
 
         let content_hash = hash_block_instrs(instrs);
 
@@ -362,20 +373,18 @@ impl BlockCompiler {
             phys_addr: 0, // filled in by caller
             virt_addr: block_pc,
             len_mips: compiled_count,
-            len_native: code_size,
+            len_native: code_size as u32,
             tier,
-            // Speculative blocks get snapshot/rollback on exception, providing
-            // self-healing: codegen errors cause exceptions → rollback to correct
-            // state → demotion after 3 failures → bad block replaced.
-            //
-            // Non-speculative is ONLY safe when the block contains stores, because
-            // rollback can't undo memory writes (RMW double-apply). Load-only blocks
-            // at any tier should always be speculative for the safety net.
+            // Speculative blocks get snapshot/rollback on exception. Store-
+            // containing blocks are non-speculative because the write log
+            // approach is incompatible with MMIO writes.
             speculative: !block_has_stores(instrs),
             hit_count: 0,
             exception_count: 0,
             stable_hits: 0,
             content_hash,
+            has_branch_likely,
+            clif_ir,
         })
     }
 }
@@ -386,6 +395,11 @@ impl BlockCompiler {
 fn block_has_stores(instrs: &[(u32, DecodedInstr)]) -> bool {
     use crate::mips_isa::*;
     instrs.iter().any(|(_, d)| matches!(d.op as u32, OP_SB | OP_SH | OP_SW | OP_SD))
+}
+
+fn block_store_count(instrs: &[(u32, DecodedInstr)]) -> u32 {
+    use crate::mips_isa::*;
+    instrs.iter().filter(|(_, d)| matches!(d.op as u32, OP_SB | OP_SH | OP_SW | OP_SD)).count() as u32
 }
 
 /// FNV-1a 32-bit hash of raw instruction words. Used to detect stale profile
@@ -981,6 +995,20 @@ fn flush_modified_gprs(
     *modified = 0;
 }
 
+fn reload_all_gprs(
+    builder: &mut FunctionBuilder,
+    gpr: &mut [Value; 32],
+    ctx_ptr: Value,
+) {
+    let mem = MemFlags::new();
+    for i in 1..32usize {
+        gpr[i] = builder.ins().load(
+            types::I64, mem, ctx_ptr,
+            ir::immediates::Offset32::new(JitContext::gpr_offset(i)),
+        );
+    }
+}
+
 // ─── Load/Store emitters ─────────────────────────────────────────────────────
 
 /// Load width tag passed to emit_load so it applies the correct sign extension.
@@ -1040,6 +1068,10 @@ fn emit_load(
     builder.seal_block(ok_block);
     let val = builder.block_params(ok_block)[0];
 
+    // Reload ALL GPRs from ctx after helper call. This resets SSA live-value
+    // pressure so regalloc2 never sees accumulated diamonds from multiple helpers.
+    reload_all_gprs(builder, gpr, ctx_ptr);
+
     // Apply correct sign/zero extension based on load width
     gpr[rt] = match (width, sign_extend) {
         (LoadWidth::Byte, true) => {
@@ -1071,7 +1103,7 @@ fn emit_store(
     builder: &mut FunctionBuilder,
     ctx_ptr: Value, exec_ptr: Value,
     helper: FuncRef,
-    gpr: &[Value; 32],
+    gpr: &mut [Value; 32],
     rs: usize, rt: usize,
     d: &DecodedInstr,
     instr_pc: u64,
@@ -1109,6 +1141,8 @@ fn emit_store(
 
     builder.switch_to_block(ok_block);
     builder.seal_block(ok_block);
+
+    reload_all_gprs(builder, gpr, ctx_ptr);
 
     EmitResult::Ok
 }
