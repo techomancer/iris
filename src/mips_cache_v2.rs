@@ -1113,9 +1113,11 @@ impl R4000Cache {
         l2_tag.set_cs(new_cs);
         self.l2.set_tag(l2_idx, l2_tag);
 
-        // Clear L1 dirty bit after successful writeback
+        // Clear dirty bit and demote cs to CleanExclusive after successful writeback.
+        // DirtyExclusive→CleanExclusive; Shared stays Shared (no promotion occurred).
         let mut dc_tag: L1DTag = self.dc.get_tag(l1_idx);
         dc_tag.dirty = false;
+        if dc_tag.cs == L1D_CS_DIRTY_EXCLUSIVE as u8 { dc_tag.cs = L1D_CS_CLEAN_EXCLUSIVE as u8; }
         self.dc.set_tag(l1_idx, dc_tag);
 
         true
@@ -1385,15 +1387,13 @@ impl R4000Cache {
     }
 
     /// Mark the L1-D line covering `virt_addr` as dirty. Called after every write.
-    /// Blindly sets dirty=true and promotes CleanExclusive→DirtyExclusive.
-    /// No branch on dirty check — just overwrite both fields unconditionally.
+    /// Sets dirty=true only — no cs promotion. CleanExclusive→DirtyExclusive transition
+    /// is deferred to C_ILT (TagLo serialization) so the write hot path is branch-free.
     #[inline(always)]
     fn mark_l1d_dirty(&self, virt_addr: u64) {
         let dc_idx = self.dc.get_index(virt_addr);
         let mut dc_tag: L1DTag = self.dc.get_tag(dc_idx);
         dc_tag.dirty = true;
-        // CleanExclusive(2) → DirtyExclusive(3); all other states unchanged
-        if dc_tag.cs == L1D_CS_CLEAN_EXCLUSIVE as u8 { dc_tag.cs = L1D_CS_DIRTY_EXCLUSIVE as u8; }
         self.dc.set_tag(dc_idx, dc_tag);
     }
 }
@@ -1584,10 +1584,11 @@ impl MipsCache for R4000Cache {
                     // L1-D TagLo format:  [31:8] raw_ptag   [7:6] pstate
                     let tag: L1DTag = self.dc.get_tag(idx);
                     let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
+                    // dirty=true promotes CleanExclusive→DirtyExclusive in TagLo output
                     let pstate = match tag.cs as u32 {
                         L1D_CS_INVALID => 0u32,
                         L1D_CS_SHARED => 1u32,
-                        L1D_CS_CLEAN_EXCLUSIVE => 2u32,
+                        L1D_CS_CLEAN_EXCLUSIVE => if tag.dirty { 3u32 } else { 2u32 },
                         L1D_CS_DIRTY_EXCLUSIVE => 3u32,
                         _ => 0u32,
                     };
@@ -1641,7 +1642,7 @@ impl MipsCache for R4000Cache {
                         // Writeback dirty data before overwriting the tag.
                         self.writeback_l1d_line(idx);
                         self.invalidate_l1d_line(idx, true);
-                        self.dc.set_tag(idx, if cs != 0 { L1DTag::valid(ptag_line, cs, false) } else { L1DTag::default() });
+                        self.dc.set_tag(idx, if cs != 0 { L1DTag::valid(ptag_line, cs, cs == L1D_CS_DIRTY_EXCLUSIVE as u8) } else { L1DTag::default() });
                     }
                 }
                 0
