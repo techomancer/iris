@@ -931,6 +931,50 @@ For R4000SC/MC CPUs:
         result
     }
 
+    /// Lightweight step for JIT interpreter bursts. Skips cp0_count
+    /// advancement and local_cycles — the JIT dispatch loop does those
+    /// in bulk after the burst. Keeps interrupt checking because the
+    /// kernel depends on per-instruction interrupt delivery.
+    #[inline(always)]
+    pub fn step_lite(&mut self) -> ExecStatus {
+        let pending = unsafe { &*self.interrupts_ptr }.load(Ordering::Relaxed);
+
+        let pc = self.core.pc;
+
+        if (pending | self.core.cp0_cause as u64) != 0 {
+            if pending & SOFT_RESET_BIT != 0 {
+                self.core.reset(true);
+                self.in_delay_slot = false;
+                self.delay_slot_target = 0;
+                return EXEC_COMPLETE;
+            }
+            self.core.cp0_cause = (self.core.cp0_cause & !EXT_INT_MASK) | (pending as u32 & EXT_INT_MASK);
+            if self.core.interrupts_enabled() {
+                let ip = self.core.cp0_cause & crate::mips_core::CAUSE_IP_MASK;
+                let im = self.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+                if (ip & im) != 0 {
+                    let s = exec_exception(EXC_INT);
+                    return self.handle_exception(s);
+                }
+            }
+        }
+
+        let fetch = self.fetch_instr(pc);
+        if fetch.status != EXEC_COMPLETE {
+            return if fetch.status & EXEC_IS_EXCEPTION != 0 {
+                self.handle_exception(fetch.status)
+            } else {
+                fetch.status
+            };
+        }
+        let slot = fetch.instr as *mut DecodedInstr;
+        let d = unsafe { &mut *slot };
+        if !d.decoded {
+            decode_into::<T, C>(d);
+        }
+        self.exec_decoded(unsafe { &*slot })
+    }
+
     #[inline(always)]
     fn check_breakpoint<const KIND: u8>(&mut self, addr: u64) -> bool {
         if KIND == BpType::Pc as u8 {

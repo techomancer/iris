@@ -77,6 +77,12 @@ pub struct CompiledBlock {
     /// FNV-1a hash of the raw instruction words; used to detect stale profile
     /// entries when a different DSO is loaded at the same virtual address.
     pub content_hash:    u32,
+    /// Block ends with a branch-likely instruction (BEQL/BNEL/etc). Verify mode
+    /// needs this to adjust step count when the branch is not taken (delay slot
+    /// nullified = one fewer interpreter step).
+    pub has_branch_likely: bool,
+    /// Cranelift CLIF IR captured at compile time (only when IRIS_JIT_VERIFY=1).
+    pub clif_ir:         Option<String>,
 }
 
 // Safety: CompiledBlock is only accessed from the CPU thread.

@@ -15,6 +15,27 @@ pub const EXIT_EXCEPTION: u32 = 2;
 pub const EXIT_INTERRUPT_CHECK: u32 = 3;
 pub const EXIT_HALT: u32 = 4;
 
+/// Max stores we can speculatively track per block. Exceeding this forces the
+/// block to be non-speculative (disables rollback for stores past this limit).
+pub const WRITE_LOG_CAP: usize = 128;
+
+/// Single entry in the speculative store write log. Records the pre-store
+/// value at `addr` so rollback can restore it if the block exceptions.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct WriteLogEntry {
+    pub addr: u64,
+    pub old_val: u64,
+    pub size: u8,
+    pub _pad: [u8; 7],
+}
+
+impl WriteLogEntry {
+    pub const fn empty() -> Self {
+        Self { addr: 0, old_val: 0, size: 0, _pad: [0; 7] }
+    }
+}
+
 #[repr(C)]
 pub struct JitContext {
     // General purpose registers
@@ -58,6 +79,13 @@ pub struct JitContext {
     // Exception status from failed memory access (set by helpers)
     pub exception_status: u32,
     _pad0: u32,
+
+    // Speculative store write log. Each entry records the pre-store value at
+    // an address. On block rollback (speculative exception), replay in reverse
+    // to restore memory. On normal exit, reset write_log_len to 0.
+    pub write_log_len: u32,
+    _pad1: u32,
+    pub write_log: [WriteLogEntry; WRITE_LOG_CAP],
 }
 
 impl JitContext {
@@ -86,6 +114,9 @@ impl JitContext {
             executor_ptr: 0,
             exception_status: 0,
             _pad0: 0,
+            write_log_len: 0,
+            _pad1: 0,
+            write_log: [WriteLogEntry::empty(); WRITE_LOG_CAP],
         }
     }
 

@@ -12,6 +12,7 @@ pub mod profile;
 pub mod snapshot;
 pub mod trace;
 pub mod codegen_test;
+pub mod async_compiler;
 
 pub use context::JitContext;
 pub use cache::{CodeCache, CompiledBlock};
