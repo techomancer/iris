@@ -72,55 +72,124 @@ pub use crate::mips_isa::{
 // R4000 Cache Tag Format (per MIPS R4000 book)
 // =============================================================================
 
-// L1 Instruction Cache Tag — unpacked for zero-cost field access on hot path.
-//   ptag  = physical address bits [35:12] (raw 24-bit value, same as l1_ptag() output)
-//   valid = valid bit
+// L1 Instruction Cache Tag — single u64 encodes both address and valid state.
 //
-// On-wire (CP0 TagLo) format:  [31:8] ptag   [7:6] pstate
-// Conversion: From<u32>/Into<u32> for snapshot save/load only.
+// Encoding:
+//   ptag = 0                          → invalid (Default)
+//   ptag = (phys_addr & !0xFFF) | 1  → valid; line base address in bits [35:1], valid flag in bit 0
+//
+// Bit 0 of a page-aligned physical address is always 0, so it is free to use as a valid sentinel.
+// This lets matches_phys() be a single branchless compare with no separate bool load:
+//   self.ptag == (phys_addr & !0xFFF) | 1
+//
+// On-wire (CP0 TagLo) format:  [31:8] raw_ptag   [7:6] pstate
+// Conversion: From<u32>/Into<u32> for snapshot save/load only (shifts happen there, not on hot path).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct L1ITag {
-    pub ptag: u32,
-    pub valid: bool,
+    /// Encoded tag: 0 = invalid; `(phys_line_base & !0xFFF) | 1` = valid.
+    pub ptag: u64,
+}
+
+impl L1ITag {
+    /// Construct a valid tag for the given physical address.
+    #[inline(always)]
+    pub fn valid(phys_addr: u64) -> Self { Self { ptag: (phys_addr & !0xFFF) | 1 } }
+
+    /// True iff this tag is valid and covers the same physical line as `phys_addr`.
+    /// Branchless: one AND+OR on phys_addr, one 64-bit compare. No separate bool load or branch.
+    #[inline(always)]
+    pub fn matches_phys(&self, phys_addr: u64) -> bool {
+        self.ptag == (phys_addr & !0xFFF) | 1
+    }
+
+    /// True iff this tag is valid (for non-hot-path use only).
+    #[inline(always)]
+    pub fn is_valid(&self) -> bool { self.ptag & 1 != 0 }
+
+    /// Physical line base address (bits [11:0] are zero). Only meaningful if is_valid().
+    #[inline(always)]
+    pub fn line_addr(&self) -> u64 { self.ptag & !0xFFF }
 }
 
 impl From<u32> for L1ITag {
+    // Deserialize from CP0 TagLo wire format: raw_ptag in bits [31:8], pstate in [7:6].
     fn from(v: u32) -> Self {
-        Self { ptag: v & 0x00FF_FFFF, valid: (v >> 24) & 1 != 0 }
+        let raw_ptag = (v >> 8) & L1_PTAG_MASK;
+        let valid = (v >> 6) & 3 != 0;
+        let line = (raw_ptag as u64) << L1_PTAG_SHIFT;
+        Self { ptag: if valid { line | 1 } else { 0 } }
     }
 }
 impl From<L1ITag> for u32 {
-    fn from(t: L1ITag) -> Self { (t.ptag & 0x00FF_FFFF) | (if t.valid { 1 << 24 } else { 0 }) }
+    fn from(t: L1ITag) -> Self {
+        let raw_ptag = (t.line_addr() >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
+        (raw_ptag << 8) | (if t.is_valid() { 2 << 6 } else { 0 })
+    }
 }
 
-// L1 Data Cache Tag — unpacked for zero-cost field access on hot path.
-//   ptag  = physical address bits [35:12] (raw 24-bit value)
-//   cs    = Cache State byte: 0=Invalid, 1=Shared, 2=CleanExclusive, 3=DirtyExclusive
-//   dirty = write-back (dirty) bit — stored separately for branch-free promotion on write
+// L1 Data Cache Tag — ptag encodes both address and validity, cs/dirty are cold-path fields.
 //
-// On-wire (CP0 TagLo) format:  [23:0] ptag  [25:24] cs  [27] dirty
+// Encoding:
+//   ptag = 0                          → invalid (Default)
+//   ptag = (phys_addr & !0xFFF) | 1  → valid; line base in bits [35:1], valid sentinel in bit 0
+//
+// Bit 0 of a page-aligned address is always 0, so it is free as a valid sentinel.
+// matches_phys() is a single branchless compare — no cs load, no branch.
+// cs is only read on cold paths (writeback decisions, CACHE instruction, debug).
+// cs and ptag validity are kept in sync: both set on fill, both cleared on invalidate.
+//
+//   cs    = Cache State byte: 0=Invalid, 1=Shared, 2=CleanExclusive, 3=DirtyExclusive
+//   dirty = write-back bit — separate byte for branch-free set on every write
+//
+// On-wire (CP0 TagLo) format:  [31:8] raw_ptag  [7:6] cs  (dirty not in TagLo)
 // Conversion: From<u32>/Into<u32> for snapshot save/load only.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct L1DTag {
-    pub ptag: u32,
+    /// Encoded tag: 0 = invalid; `(phys_line_base & !0xFFF) | 1` = valid.
+    pub ptag: u64,
     pub cs:   u8,
     pub dirty: bool,
 }
 
+impl L1DTag {
+    /// Construct a valid tag for the given physical address and cache state.
+    #[inline(always)]
+    pub fn valid(phys_addr: u64, cs: u8, dirty: bool) -> Self {
+        Self { ptag: (phys_addr & !0xFFF) | 1, cs, dirty }
+    }
+
+    /// True iff this tag is valid and covers the same physical line as `phys_addr`.
+    /// Branchless: one AND+OR on phys_addr, one 64-bit compare. No cs load, no branch.
+    #[inline(always)]
+    pub fn matches_phys(&self, phys_addr: u64) -> bool {
+        self.ptag == (phys_addr & !0xFFF) | 1
+    }
+
+    /// True iff this tag is valid (for non-hot-path use only).
+    #[inline(always)]
+    pub fn is_valid(&self) -> bool { self.ptag & 1 != 0 }
+
+    /// Physical line base address (bits [11:0] are zero). Only meaningful if is_valid().
+    #[inline(always)]
+    pub fn line_addr(&self) -> u64 { self.ptag & !0xFFF }
+}
+
 impl From<u32> for L1DTag {
     fn from(v: u32) -> Self {
+        let raw_ptag = (v >> 8) & L1_PTAG_MASK;
+        let cs = ((v >> 6) & 0x3) as u8;
+        let line = (raw_ptag as u64) << L1_PTAG_SHIFT;
         Self {
-            ptag:  v & 0x00FF_FFFF,
-            cs:    ((v >> 24) & 0x3) as u8,
+            ptag:  if cs != 0 { line | 1 } else { 0 },
+            cs,
             dirty: (v >> 27) & 1 != 0,
         }
     }
 }
 impl From<L1DTag> for u32 {
     fn from(t: L1DTag) -> Self {
-        (t.ptag & 0x00FF_FFFF)
-            | ((t.cs as u32 & 0x3) << 24)
-            | (if t.dirty { 1 << 27 } else { 0 })
+        let raw_ptag = (t.line_addr() >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
+        (raw_ptag << 8) | ((t.cs as u32 & 0x3) << 6) | (if t.dirty { 1 << 27 } else { 0 })
     }
 }
 
@@ -166,18 +235,17 @@ pub const L2_CS_DIRTY_EXCLUSIVE: u32 = 5;
 pub const L2_CS_SHARED: u32 = 6;
 pub const L2_CS_DIRTY_SHARED: u32 = 7;
 
-/// Reconstruct the physical base address from an L1 cache tag and the address used to index
-/// the cache line.  `index_addr` contributes the low 12 bits.
+/// Reconstruct the physical base address from an L1I cache tag and an address in the same line.
+/// Uses `line_addr()` to strip the valid sentinel bit before OR-ing in the offset.
 #[inline]
 pub fn l1_tag_to_phys(tag: L1ITag, index_addr: u64) -> u64 {
-    (tag.ptag as u64) << L1_PTAG_SHIFT | (index_addr & L1_INDEX_MASK)
+    tag.line_addr() | (index_addr & L1_INDEX_MASK)
 }
 
-/// Reconstruct the physical base address from an L1D cache tag and the address used to index
-/// the cache line.  `index_addr` contributes the low 12 bits.
+/// Same as `l1_tag_to_phys` for the L1D tag.
 #[inline]
 pub fn l1d_tag_to_phys(tag: L1DTag, index_addr: u64) -> u64 {
-    (tag.ptag as u64) << L1_PTAG_SHIFT | (index_addr & L1_INDEX_MASK)
+    tag.line_addr() | (index_addr & L1_INDEX_MASK)
 }
 
 /// Reconstruct the physical base address from an L2 cache tag and the address used to index
@@ -814,12 +882,6 @@ impl R4000Cache {
         }
     }
 
-    /// Extract physical tag bits [35:12] from physical address for L1 cache
-    #[inline]
-    fn l1_ptag(&self, phys_addr: u64) -> u32 {
-        ((phys_addr >> L1_PTAG_SHIFT) & L1_PTAG_MASK as u64) as u32
-    }
-
     /// Extract physical tag bits [35:17] from physical address for L2 cache
     #[inline]
     fn l2_ptag(&self, phys_addr: u64) -> u32 {
@@ -881,11 +943,11 @@ impl R4000Cache {
         #[cfg(feature = "debug_cache")]
         {
             let tag: L1ITag = self.ic.get_tag(idx);
-            if tag.valid {
+            if tag.is_valid() {
                 let phys_addr = l1_tag_to_phys(tag, (idx << ICache::LINE_SHIFT) as u64);
                 if self.is_tracking_l1d(phys_addr) {
-                    println!("[CACHE DEBUG] invalidate_l1i_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:06x}",
-                             self.tracking_label(phys_addr), idx, phys_addr, tag.ptag);
+                    println!("[CACHE DEBUG] invalidate_l1i_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:010x}",
+                             self.tracking_label(phys_addr), idx, phys_addr, tag.line_addr());
                 }
             }
         }
@@ -903,8 +965,8 @@ impl R4000Cache {
         if self.is_tracking_l1d_idx(idx) {
             if tag.cs != L1D_CS_INVALID as u8 {
                 let phys_addr = l1d_tag_to_phys(tag, (idx << DCache::LINE_SHIFT) as u64);
-                println!("[CACHE DEBUG] invalidate_l1d_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:06x}, cs={}, coherent={}",
-                         self.tracking_label(phys_addr), idx, phys_addr, tag.ptag, tag.cs, coherent);
+                println!("[CACHE DEBUG] invalidate_l1d_line: {} idx={}, phys_addr=0x{:08x}, ptag=0x{:010x}, cs={}, coherent={}",
+                         self.tracking_label(phys_addr), idx, phys_addr, tag.line_addr(), tag.cs, coherent);
             } else {
                 println!("[CACHE DEBUG] invalidate_l1d_line: idx={} (already invalid)", idx);
             }
@@ -958,7 +1020,7 @@ impl R4000Cache {
             let ic_idx = (ic_base_idx + i) & ICache::NUM_LINES_MASK;
             let phys_addr = phys_base + ((i as u64) << ICache::LINE_SHIFT);
             let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
-            if ic_tag.valid && ic_tag.ptag == self.l1_ptag(phys_addr) {
+            if ic_tag.matches_phys(phys_addr) {
                 self.invalidate_l1i_line(ic_idx);
             }
         }
@@ -972,7 +1034,7 @@ impl R4000Cache {
             let phys_addr = phys_base + ((i as u64) << DCache::LINE_SHIFT);
             let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
 
-            if dc_tag.cs != L1D_CS_INVALID as u8 && dc_tag.ptag == self.l1_ptag(phys_addr) {
+            if dc_tag.matches_phys(phys_addr) {
                 self.invalidate_l1d_line(dc_idx, false); // hardware cascade, not coherent
             }
         }
@@ -997,8 +1059,8 @@ impl R4000Cache {
 
         #[cfg(feature = "debug_cache")]
         if self.is_tracking_l1d(phys_addr) {
-            println!("[CACHE DEBUG] writeback_l1d_line: {} l1_idx={}, phys_addr=0x{:08x}, ptag=0x{:06x}, DIRTY",
-                     self.tracking_label(phys_addr), l1_idx, phys_addr, tag.ptag);
+            println!("[CACHE DEBUG] writeback_l1d_line: {} l1_idx={}, phys_addr=0x{:08x}, ptag=0x{:010x}, DIRTY",
+                     self.tracking_label(phys_addr), l1_idx, phys_addr, tag.line_addr());
         }
 
         // Find the line in L2 using physical address
@@ -1078,7 +1140,7 @@ impl R4000Cache {
             let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
 
             // Check if this L1-D line matches and is dirty
-            if dc_tag.cs != L1D_CS_INVALID as u8 && dc_tag.ptag == self.l1_ptag(phys_addr_l1) {
+            if dc_tag.matches_phys(phys_addr_l1) {
                 self.writeback_l1d_line(dc_idx);
             }
         }
@@ -1232,7 +1294,7 @@ impl R4000Cache {
         }
 
         // Set tag with Valid bit
-        self.ic.set_tag(ic_idx, L1ITag { ptag: self.l1_ptag(phys_addr), valid: true });
+        self.ic.set_tag(ic_idx, L1ITag::valid(phys_addr));
 
         EXEC_COMPLETE
     }
@@ -1285,7 +1347,7 @@ impl R4000Cache {
         }
 
         // Set tag with CleanExclusive state
-        self.dc.set_tag(dc_idx, L1DTag { ptag: self.l1_ptag(phys_addr), cs: L1D_CS_CLEAN_EXCLUSIVE as u8, dirty: false });
+        self.dc.set_tag(dc_idx, L1DTag::valid(phys_addr, L1D_CS_CLEAN_EXCLUSIVE as u8, false));
 
         // println!("[CACHE DEBUG] fill_l1d_line: idx={}, virt_addr=0x{:016x}, phys_addr=0x{:08x}, ptag=0x{:06x}, state=CleanExclusive (BUS_OK)",
         //          dc_idx, virt_addr, phys_addr, ptag);
@@ -1315,7 +1377,7 @@ impl R4000Cache {
     fn ensure_l1d_line(&self, virt_addr: u64, phys_addr: u64) -> u32 {
         let dc_idx = self.dc.get_index(virt_addr);
         let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
-        if dc_tag.cs == L1D_CS_INVALID as u8 || dc_tag.ptag != self.l1_ptag(phys_addr) {
+        if !dc_tag.matches_phys(phys_addr) {
             self.fill_l1d_line(virt_addr, phys_addr)
         } else {
             BUS_OK
@@ -1357,12 +1419,11 @@ impl MipsCache for R4000Cache {
         // Ensure line is in L1-I cache
         let ic_idx = self.ic.get_index(virt_addr);
         let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
-        let ptag = self.l1_ptag(phys_addr);
 
         // Fill if not valid or tag mismatch
         #[cfg(feature = "developer")]
         self.l1i_fetch_count.fetch_add(1, Ordering::Relaxed);
-        if !ic_tag.valid || ic_tag.ptag != ptag {
+        if !ic_tag.matches_phys(phys_addr) {
             let s = self.fill_l1i_line(virt_addr, phys_addr);
             if s != EXEC_COMPLETE { return FetchInstrResult::exception(s); }
         } else {
@@ -1514,13 +1575,15 @@ impl MipsCache for R4000Cache {
                     };
                     (tag.ptag() << 13) | (state << 10) | (tag.pidx() << 7)
                 } else if is_icache {
-                    // L1-I TagLo format:  [31:8] ptag   [7:6] pstate (2=valid, 0=invalid)
+                    // L1-I TagLo format:  [31:8] raw_ptag   [7:6] pstate (2=valid, 0=invalid)
                     let tag: L1ITag = self.ic.get_tag(idx);
-                    let pstate = if tag.valid { 2u32 } else { 0u32 };
-                    (tag.ptag << 8) | (pstate << 6)
+                    let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
+                    let pstate = if tag.is_valid() { 2u32 } else { 0u32 };
+                    (raw_ptag << 8) | (pstate << 6)
                 } else {
-                    // L1-D TagLo format:  [31:8] ptag   [7:6] pstate
+                    // L1-D TagLo format:  [31:8] raw_ptag   [7:6] pstate
                     let tag: L1DTag = self.dc.get_tag(idx);
+                    let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
                     let pstate = match tag.cs as u32 {
                         L1D_CS_INVALID => 0u32,
                         L1D_CS_SHARED => 1u32,
@@ -1528,7 +1591,7 @@ impl MipsCache for R4000Cache {
                         L1D_CS_DIRTY_EXCLUSIVE => 3u32,
                         _ => 0u32,
                     };
-                    (tag.ptag << 8) | (pstate << 6)
+                    (raw_ptag << 8) | (pstate << 6)
                 }
             }
 
@@ -1558,14 +1621,15 @@ impl MipsCache for R4000Cache {
                     t.set_pidx(pidx);
                     self.l2.set_tag(idx, t);
                 } else {
-                    // L1 TagLo format:  [31:8] ptag   [7:6] pstate
-                    let ptag = (tag_lo >> 8) & L1_PTAG_MASK;
+                    // L1 TagLo format:  [31:8] raw_ptag   [7:6] pstate
+                    let raw_ptag = (tag_lo >> 8) & L1_PTAG_MASK;
+                    let ptag_line = (raw_ptag as u64) << L1_PTAG_SHIFT; // convert to line-base form
                     let pstate = (tag_lo >> 6) & 0x3;
 
                     if is_icache {
                         // Evict existing line first to maintain L1I data pointer integrity.
                         self.invalidate_l1i_line(idx);
-                        self.ic.set_tag(idx, L1ITag { ptag, valid: pstate != 0 });
+                        self.ic.set_tag(idx, if pstate != 0 { L1ITag::valid(ptag_line) } else { L1ITag::default() });
                     } else {
                         let cs = match pstate {
                             0 => L1D_CS_INVALID as u8,
@@ -1577,7 +1641,7 @@ impl MipsCache for R4000Cache {
                         // Writeback dirty data before overwriting the tag.
                         self.writeback_l1d_line(idx);
                         self.invalidate_l1d_line(idx, true);
-                        self.dc.set_tag(idx, L1DTag { ptag, cs, dirty: false });
+                        self.dc.set_tag(idx, if cs != 0 { L1DTag::valid(ptag_line, cs, false) } else { L1DTag::default() });
                     }
                 }
                 0
@@ -1599,7 +1663,7 @@ impl MipsCache for R4000Cache {
                     t.set_pidx(self.pidx(virt_addr));
                     self.l2.set_tag(idx, t);
                 } else {
-                    self.dc.set_tag(idx, L1DTag { ptag: self.l1_ptag(phys_addr), cs: L1D_CS_DIRTY_EXCLUSIVE as u8, dirty: true });
+                    self.dc.set_tag(idx, L1DTag::valid(phys_addr, L1D_CS_DIRTY_EXCLUSIVE as u8, true));
                 }
                 0
             }
@@ -1611,10 +1675,10 @@ impl MipsCache for R4000Cache {
                     tag.ptag() == self.l2_ptag(phys_addr)
                 } else if is_icache {
                     let tag: L1ITag = self.ic.get_tag(idx);
-                    tag.ptag == self.l1_ptag(phys_addr)
+                    tag.matches_phys(phys_addr)
                 } else {
                     let tag: L1DTag = self.dc.get_tag(idx);
-                    tag.ptag == self.l1_ptag(phys_addr)
+                    tag.matches_phys(phys_addr)
                 };
 
                 if hit {
@@ -1640,7 +1704,7 @@ impl MipsCache for R4000Cache {
                         tag.ptag() == self.l2_ptag(phys_addr)
                     } else {
                         let tag: L1DTag = self.dc.get_tag(idx);
-                        tag.ptag == self.l1_ptag(phys_addr)
+                        tag.matches_phys(phys_addr)
                     };
 
                     if hit {
@@ -1664,7 +1728,7 @@ impl MipsCache for R4000Cache {
                         tag.ptag() == self.l2_ptag(phys_addr)
                     } else {
                         let tag: L1DTag = self.dc.get_tag(idx);
-                        tag.ptag == self.l1_ptag(phys_addr)
+                        tag.matches_phys(phys_addr)
                     };
 
                     if hit {
@@ -1741,18 +1805,18 @@ impl MipsCache for R4000Cache {
                 // L1I is virtually indexed (use virt_addr for index)
                 let idx = self.ic.get_index(virt_addr);
                 let tag: L1ITag = self.ic.get_tag(idx);
-                let wanted_tag = self.l1_ptag(phys_addr);
-                let status = if tag.valid && tag.ptag == wanted_tag { "HIT" } else { "MISS" };
+                let wanted_line = phys_addr & !0xFFF;
+                let status = if tag.matches_phys(phys_addr) { "HIT" } else { "MISS" };
 
-                format!("{} at index 0x{:x} (virt 0x{:016x})\n  Tag: 0x{:06x} (Wanted: 0x{:06x})\n  Valid: {}",
-                    status, idx, virt_addr, tag.ptag, wanted_tag, tag.valid)
+                format!("{} at index 0x{:x} (virt 0x{:016x})\n  Tag: 0x{:010x} (Wanted: 0x{:010x})\n  Valid: {}",
+                    status, idx, virt_addr, tag.line_addr(), wanted_line, tag.is_valid())
             }
             "l1d" => {
                 // L1D is virtually indexed (use virt_addr for index)
                 let idx = self.dc.get_index(virt_addr);
                 let tag: L1DTag = self.dc.get_tag(idx);
-                let wanted_tag = self.l1_ptag(phys_addr);
-                let status = if tag.cs != L1D_CS_INVALID as u8 && tag.ptag == wanted_tag { "HIT" } else { "MISS" };
+                let wanted_line = phys_addr & !0xFFF;
+                let status = if tag.matches_phys(phys_addr) { "HIT" } else { "MISS" };
 
                 let cs_str = match tag.cs as u32 {
                     L1D_CS_INVALID => "Invalid",
@@ -1762,8 +1826,8 @@ impl MipsCache for R4000Cache {
                     _ => "Unknown",
                 };
 
-                format!("{} at index 0x{:x} (virt 0x{:016x})\n  Tag: 0x{:06x} (Wanted: 0x{:06x})\n  CS: {} ({})\n  Dirty: {}",
-                    status, idx, virt_addr, tag.ptag, wanted_tag, tag.cs, cs_str, tag.dirty)
+                format!("{} at index 0x{:x} (virt 0x{:016x})\n  Tag: 0x{:010x} (Wanted: 0x{:010x})\n  CS: {} ({})\n  Dirty: {}",
+                    status, idx, virt_addr, tag.line_addr(), wanted_line, tag.cs, cs_str, tag.dirty)
             }
             "l2" => {
                 // L2 is physically indexed
@@ -1805,10 +1869,10 @@ impl MipsCache for R4000Cache {
                 let instrs_per_ic_line = ICache::INSTRS_PER_LINE;
                 let ic_instrs = self.l2.instrs.get();
                 let l2_data = self.l2.data();
-                let phys_base = ((tag.ptag as usize) << ICache::CACHE_SIZE_SHIFT)
-                    | (idx << ICache::LINE_SHIFT);
+                // line_addr() strips the valid sentinel bit to get the physical line base.
+                let phys_base = tag.line_addr() as usize;
                 let l2_slot_base = (phys_base & (L2_SIZE - 1)) >> 2;
-                let mut s = format!("L1-I Line 0x{:x}: Tag=0x{:06x} V={}\n  Instrs:", idx, tag.ptag, tag.valid);
+                let mut s = format!("L1-I Line 0x{:x}: Tag=0x{:010x} V={}\n  Instrs:", idx, tag.line_addr(), tag.is_valid());
                 for i in 0..instrs_per_ic_line {
                     if i % 4 == 0 { s.push_str("\n    "); }
                     let l2_slot_idx = l2_slot_base + i;
@@ -1842,7 +1906,7 @@ impl MipsCache for R4000Cache {
                 let dc_data = self.dc.data();
                 let start = idx << DCache::CHUNKS_PER_LINE_SHIFT;
 
-                let mut s = format!("L1-D Line 0x{:x}: Tag=0x{:06x} CS={} ({}) D={}\n  Data:",
+                let mut s = format!("L1-D Line 0x{:x}: Tag=0x{:010x} CS={} ({}) D={}\n  Data:",
                     idx, tag.ptag, tag.cs, cs_str, tag.dirty);
                 for i in 0..DCache::CHUNKS_PER_LINE {
                     if i % 4 == 0 { s.push_str("\n    "); }
