@@ -67,11 +67,11 @@ cargo run --release
 
 Build variants:
 ```
-cargo run --release --features lightning             # disable breakpoints for ~10% more speed
+cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
 cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
-cargo run --release --features jit,rex-jit           # both JITs
-cargo run --release --features lightning,rex-jit     # recommended for best speed right now
+cargo run --release --features tlbvmap               # enable 8k slot to tlb entry map (increases cache use but may help depending on host cpu arch)
+cargo run --release --features lightning,rex-jit,tlbvmap     # recommended for best speed right now
 ```
 
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
@@ -92,19 +92,6 @@ interval is adaptive. Hot block profiles persist across sessions.
 ```
 IRIS_JIT=1 cargo run --release --features jit
 ```
-
-### REX3 graphics JIT (`--features rex-jit`)
-
-Cranelift-based JIT for the REX3 graphics chip draw pipeline. Compiles a
-specialized native shader per unique (DrawMode0, DrawMode1) pair, inlining the
-entire draw loop — coordinate stepping, clipping, shade DDA, pattern advance —
-into a single function. Shaders compile in the background on first use; compiled
-profiles persist across sessions for instant warm-up on next boot.
-
-```
-cargo run --release --features rex-jit
-```
-
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `IRIS_JIT` | 0 | Enable JIT (1) or interpreter-only (0) |
@@ -112,6 +99,17 @@ cargo run --release --features rex-jit
 | `IRIS_JIT_VERIFY` | 0 | Run each block through interpreter and compare (debug) |
 | `IRIS_JIT_PROBE` | 200 | Base probe interval (steps between cache checks) |
 
+### REX3 graphics JIT (`--features rex-jit`)
+
+Cranelift-based JIT for the REX3 graphics chip draw pipeline. Compiles a
+specialized native "shader" per unique (DrawMode0, DrawMode1) pair, inlining the
+entire draw loop — coordinate stepping, clipping, shade DDA, pattern advance —
+into a single function. Shaders compile in the background on first use; compiled
+profiles persist across sessions for instant warm-up on next boot.
+
+```
+cargo run --release --features rex-jit
+```
 
 ## Copy-on-write disk overlay
 
