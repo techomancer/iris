@@ -150,13 +150,13 @@ pub struct MipsCore {
 
 /// Single nano-TLB entry.
 ///
-/// `va_tag`     — bits [63:12] of the virtual address (page-aligned VA >> 12).
+/// `va_tag`     — `(va & !0xFFF) | 1`: page-aligned VA with bit 0 as valid sentinel.
+///                Zero (default) = invalid. Single compare suffices for both validity and VA match.
 /// `pa_encoded` — bits [63:12] = physical page base (PA & !0xFFF),
-///                bit   [3]    = valid flag (1 = entry is live),
 ///                bits  [2:0]  = hardware C-field cache attr (2=Uncached, 3=Cacheable, 5=CacheableCoherent).
 ///
-/// C-field stored directly in bits [2:0] so cache_attr_raw() is a plain mask,
-/// and fill_raw() needs no shift or table lookup for the cache attribute.
+/// C-field stored directly in bits [2:0] so cache_attr_raw() is a plain mask.
+/// Validity is encoded in va_tag bit 0 — no separate valid flag needed.
 #[derive(Clone, Copy, Default)]
 pub struct NanoTlbEntry {
     pub va_tag:     u64,
@@ -164,15 +164,13 @@ pub struct NanoTlbEntry {
 }
 
 impl NanoTlbEntry {
-    pub const VALID_BIT: u64 = 0x8;
-
-    // Invalidation always zeroes pa_encoded, so nonzero implies VALID_BIT is set.
     #[inline(always)]
-    pub fn is_valid(&self) -> bool { self.pa_encoded != 0 }
+    pub fn is_valid(&self) -> bool { self.va_tag != 0 }
 
+    /// Single-comparison hot-path match: checks valid + VA in one 64-bit compare.
     #[inline(always)]
-    pub fn matches(&self, va: u64) -> bool {
-        self.pa_encoded != 0 && self.va_tag == (va >> 12)
+    pub fn matches(&self, va_page: u64) -> bool {
+        self.va_tag == va_page | 1
     }
 
     /// Decode the physical address (page base + page offset).
@@ -202,20 +200,20 @@ impl NanoTlbEntry {
     /// Fill entry from a successful translation.
     #[inline(always)]
     pub fn fill(&mut self, va: u64, phys_addr: u64, attr: crate::mips_exec::CacheAttr) {
-        self.va_tag     = va >> 12;
-        self.pa_encoded = (phys_addr & !0xFFF) | Self::VALID_BIT | (attr as u64);
+        self.va_tag     = (va & !0xFFF) | 1;
+        self.pa_encoded = (phys_addr & !0xFFF) | (attr as u64);
     }
 
     /// Fill entry from a raw C-field value (2=Uncached, 3=Cacheable, 5=CacheableCoherent).
     /// Used by nanotlb_translate to avoid re-converting through CacheAttr enum.
     #[inline(always)]
-    pub fn fill_raw(&mut self, va: u64, phys_addr: u64, c_field: u32) {
-        self.va_tag     = va >> 12;
-        self.pa_encoded = (phys_addr & !0xFFF) | Self::VALID_BIT | c_field as u64;
+    pub fn fill_raw(&mut self, va_page: u64, phys_addr: u64, c_field: u32) {
+        self.va_tag     = va_page | 1;
+        self.pa_encoded = (phys_addr & !0xFFF) | c_field as u64;
     }
 
     #[inline(always)]
-    pub fn invalidate(&mut self) { self.pa_encoded = 0; }
+    pub fn invalidate(&mut self) { self.va_tag = 0; }
 }
 
 // SAFETY: The raw pointer in status_changed_cb is only accessed from the CPU thread.

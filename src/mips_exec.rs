@@ -755,14 +755,15 @@ For R4000SC/MC CPUs:
     /// On miss: calls `translate_fn` (the slow path) and fills the slot on success.
     #[inline(always)]
     fn nanotlb_translate<const AT: u8>(&mut self, va: u64) -> TranslateResult {
+        let va_page = va & !0xFFF;
         let slot = &self.core.nanotlb[AT as usize];
-        if slot.matches(va) {
+        if slot.matches(va_page) {
             return TranslateResult::ok(slot.phys_addr(va), slot.cache_attr_raw());
         }
         let at = unsafe { std::mem::transmute::<u8, AccessType>(AT) };
         let result = (self.translate_fn)(self, va, at);
         if !result.is_exception() {
-            self.core.nanotlb[AT as usize].fill_raw(va, result.phys as u64, result.status & 0x7);
+            self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys as u64, result.status & 0x7);
         }
         result
     }
