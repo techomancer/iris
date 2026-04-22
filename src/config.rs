@@ -111,6 +111,10 @@ pub struct MachineConfig {
     /// Disable audio emulation (no HAL2). Independent of headless/graphics.
     #[serde(default)]
     pub no_audio: bool,
+
+    /// If Some(port), start the GDB RSP stub on that TCP port.
+    #[serde(default)]
+    pub gdb_port: Option<u16>,
 }
 
 fn default_prom() -> String {
@@ -151,6 +155,7 @@ impl Default for MachineConfig {
             port_forward: vec![],
             headless: false,
             no_audio: false,
+            gdb_port: None,
         }
     }
 }
@@ -300,6 +305,11 @@ pub struct Cli {
     /// Host port for unfsd mountd listener [default: 11234]
     #[arg(long = "mountd-port", value_name = "PORT")]
     pub mountd_host_port: Option<u16>,
+
+    /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
+    /// Connect with: target remote localhost:<port>
+    #[arg(long = "gdb-port", value_name = "PORT")]
+    pub gdb_port: Option<u16>,
 }
 
 impl Cli {
@@ -354,6 +364,8 @@ impl Cli {
             if let Some(p) = self.nfs_host_port    { nfs.nfs_host_port    = p; }
             if let Some(p) = self.mountd_host_port { nfs.mountd_host_port = p; }
         }
+
+        if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
 
         cfg
     }

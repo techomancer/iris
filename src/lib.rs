@@ -41,6 +41,7 @@ pub mod cmap;
 pub mod bt445;
 pub mod disp;
 pub mod exp;
+pub mod gdb_stub;
 pub mod snapshot;
 pub mod hptimer;
 pub mod hptimer_tests;

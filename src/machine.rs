@@ -24,7 +24,8 @@ use crate::mem::Memory;
 use crate::prom::Prom;
 use crate::mc::MemoryController;
 use crate::mips_tlb::MipsTlb;
-use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig};
+use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
+use crate::gdb_stub::CpuDebug;
 use crate::mips_cache_v2::R4000Cache;
 use crate::hpc3::Hpc3;
 use crate::ioc::Ioc;
@@ -416,6 +417,11 @@ impl Machine {
 
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
         self.timer_manager.clone()
+    }
+
+    /// Return a type-erased CpuDebug handle for the GDB stub.
+    pub fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
+        MipsCpuDebugAdapter::new(self.cpu.clone())
     }
 
     /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.

@@ -216,7 +216,148 @@ Serial ports are on 8880 (port A) and 8881 (port B / IRIX serial terminal).
 
 ---
 
-## 8. Reference
+## 8. GDB Stub
+
+Iris includes a GDB Remote Serial Protocol stub (`src/gdb_stub.rs`) that lets you
+connect GDB to the running emulator and debug IRIX/guest code with a real debugger.
+
+### Starting the GDB stub
+
+Pass `--gdb-port <port>` on the command line:
+
+```sh
+# Developer build — CPU starts paused, GDB can set breakpoints before first instruction
+cargo run --profile developer -- --gdb-port 1234
+
+# Release build — CPU starts running; GDB attaches to a live system
+cargo run --release -- --gdb-port 1234
+```
+
+The stub binds `127.0.0.1:<port>`. One client at a time; breakpoints set by GDB are
+automatically removed when the client disconnects.
+
+### Connecting GDB
+
+With `mips64-unknown-linux-gnu-gdb` (recommended):
+
+```
+set architecture mips:isa64
+set mips abi n64
+set mips mask-address off
+set heuristic-fence-post 0
+set backtrace past-main on
+set backtrace limit 0
+target remote localhost:1234
+```
+
+- `set architecture mips:isa64` — selects the 64-bit MIPS BFD target.
+- `set mips abi n64` — required; without it GDB uses 32-bit o32 ABI and GPRs display
+  as 32-bit even though the g-packet contains 64-bit values.
+- `set mips mask-address off` — prevents GDB from sign-masking 64-bit kernel addresses
+  (e.g. `0xffffffff80010000`) down to 32-bit when sending Z0 breakpoint packets.
+- `set heuristic-fence-post 0` — suppresses "can't find start of function" warnings
+  when stepping without symbol information.
+
+With `gdb-multiarch`:
+
+```
+(gdb) set architecture mips:isa64
+(gdb) set mips abi n64
+(gdb) set mips mask-address off
+(gdb) target remote localhost:1234
+```
+
+### Debugging tips
+
+Enable GDB's remote protocol log to see every RSP packet exchanged:
+
+```
+(gdb) set debug remote 1
+```
+
+This is invaluable for diagnosing register layout mismatches, breakpoint address
+truncation (Z0 packets), and g-packet size errors.
+
+To set a breakpoint at a 64-bit kernel address (e.g. after IRIX boots):
+
+```
+(gdb) break *0xffffffff80010000
+```
+
+`set mips mask-address off` is required for this to work — without it GDB strips the
+upper 32 bits and sends `0x0000000080010000` in the Z0 packet, which won't match the
+kernel virtual address.
+
+### Supported operations
+
+| GDB command | What it does |
+|---|---|
+| `info registers` | Read all 72 MIPS registers (GPRs, CP0 Status/Cause/BadVAddr, FPRs, FCSR/FIR) |
+| `p $pc`, `p $sp` | Read single register |
+| `set $pc = 0x...` | Write single register |
+| `x/Ni $pc` | Disassemble N instructions at PC |
+| `x/Nw 0x...` | Read memory (handles unaligned, byte-granular) |
+| `set {int}0x... = N` | Write memory |
+| `break *0x<addr>` | Software breakpoint at virtual address |
+| `delete` | Remove breakpoint |
+| `continue` (or `c`) | Resume execution |
+| `stepi` (or `si`) | Single-step one instruction |
+| `watch *0x<addr>` | Write watchpoint on virtual address |
+| `rwatch *0x<addr>` | Read watchpoint |
+| Ctrl-C | Interrupt a running CPU |
+
+### How execution control works
+
+The GDB stub uses `run_debug_loop` (the same path as the monitor's `run`/`step`
+commands) for both `continue` and `stepi`. This means:
+
+- Breakpoints set via both GDB and the monitor console coexist — they use separate
+  ID ranges (monitor IDs start at 1, GDB IDs start at 10000).
+- Single-step is synchronous and blocking: GDB waits for the step to complete before
+  returning a response.
+- Continue is asynchronous: the CPU runs in a background thread; the event loop polls
+  `is_running()` every millisecond, and returns a stop event when the CPU halts.
+- Ctrl-C calls `cpu.stop()` immediately.
+
+### CPU locking
+
+The executor mutex (`Arc<Mutex<MipsExecutor>>`) is the single serialisation point:
+
+- Normal run (`start()`): CPU thread holds the mutex continuously, drops it briefly
+  every 500K instructions to allow monitor commands.
+- Debug run (`run_debug_loop`): same, but with breakpoint checks and instruction
+  tracing enabled.
+- GDB operations (register read/write, memory access, add breakpoint): acquire the
+  executor mutex via `try_lock()` — only safe when the CPU is stopped.
+- **Always call `stop()` (or use `stepi`) before reading/writing registers/memory.**
+  In developer mode the CPU does not auto-start, so GDB can connect and inspect state
+  freely before issuing `continue`.
+
+### Architecture notes for GDB
+
+The g-packet contains 72 registers (576 bytes). A 73rd pseudo-register `fp` is
+declared in the `org.gnu.gdb.mips.linux` XML feature to suppress GDB's stack-frame
+heuristic, but it is not included in the g-packet.
+
+| GDB reg # | Name | Source |
+|---|---|---|
+| 0–31 | r0–r31 | GPRs |
+| 32 | status | CP0 Status |
+| 33 | lo | LO |
+| 34 | hi | HI |
+| 35 | badvaddr | CP0 BadVAddr |
+| 36 | cause | CP0 Cause |
+| 37 | pc | PC |
+| 38–69 | f0–f31 | FPRs |
+| 70 | fcsr | FPU Control/Status |
+| 71 | fir | FPU Implementation |
+
+Memory reads/writes are byte-granular via `debug_read`/`debug_write` (kernel privilege
+override, no cache side-effects, no breakpoints triggered).
+
+---
+
+## 9. Reference
 
 - SGI Indy hardware manuals see docs/
 - [SGI driver programmer's guide — address spaces](https://tqd1.physik.uni-freiburg.de/library/SGI_bookshelves/SGI_Developer/books/DevDriver_PG/sgi_html/ch01.html)

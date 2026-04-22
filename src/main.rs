@@ -4,6 +4,7 @@ use iris::machine::Machine;
 fn main() {
     let (mut cfg, scale) = load_config();
     let headless = cfg.headless;
+    let gdb_port = cfg.gdb_port;
 
     // Start unfsd before the machine so NFS is ready when IRIX boots.
     // If start_unfsd returns None (directory missing/uncreatable, or binary not found),
@@ -46,6 +47,13 @@ fn main() {
                 }
             }
         }
+    }
+
+    // Start GDB stub before starting the CPU so that in developer mode (CPU not
+    // auto-started), GDB can connect and set breakpoints before running.
+    if let Some(port) = gdb_port {
+        let cpu_debug = machine.get_cpu_debug();
+        iris::gdb_stub::start_gdb_server(port, cpu_debug);
     }
 
     machine.start();
