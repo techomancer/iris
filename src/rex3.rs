@@ -1091,6 +1091,10 @@ pub struct Rex3 {
     pub show_cmap: AtomicBool,
     /// When true, overlay decoded DID/XMAP mode info near the bottom of the screen.
     pub show_disp_debug: AtomicBool,
+    /// Set by UI when RightCtrl+PrintScreen is pressed; cleared by refresh thread after saving.
+    pub screenshot_pending: AtomicBool,
+    /// Monotonically incrementing screenshot counter for unique filenames.
+    pub screenshot_counter: AtomicU32,
     /// Atomic shadow of MipsCore::count_step — updated by CPU thread, read by refresh thread.
     /// Wrapped in Mutex so machine.rs can swap in the real Arc from MipsCore after construction.
     #[cfg(feature = "developer")]
@@ -1215,6 +1219,8 @@ impl Rex3 {
             rex3_log: Mutex::new(None),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
+            screenshot_pending: AtomicBool::new(false),
+            screenshot_counter: AtomicU32::new(0),
             #[cfg(feature = "developer")]
             count_step_atomic: Mutex::new(Arc::new(AtomicU64::new(1 << 15))),
         }
@@ -3422,6 +3428,21 @@ impl Rex3 {
                     &mut *renderer,
                     &self.diag,
                 );
+
+                // Screenshot: snapshot rgba into a new Vec and save in a background thread.
+                if self.screenshot_pending.swap(false, Ordering::Relaxed) {
+                    let n = self.screenshot_counter.fetch_add(1, Ordering::Relaxed);
+                    let path = format!("screenshot_{:04}.png", n);
+                    let width = screen.width;
+                    let height = screen.height;
+                    let pixels = screen.rgba.clone();
+                    thread::spawn(move || {
+                        match crate::disp::save_screenshot(&path, &pixels, width, height) {
+                            Ok(()) => println!("iris: screenshot saved to {}", path),
+                            Err(e) => println!("iris: screenshot failed: {}", e),
+                        }
+                    });
+                }
 
                 // Pixel data is now copied into screen.rgba — assert VBLANK here so
                 // the CPU gets the maximum window (GL upload + sleep) to react before

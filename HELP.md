@@ -63,6 +63,8 @@ above).
 
 Right control releases mouse grab.
 
+**Right Ctrl + Print Screen** takes a screenshot (saved as `screenshot_NNNN.png` in the working directory).
+
 ### Addresses
 
 | Host | IP | Notes |
@@ -491,6 +493,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `rex buslog <on\|off>` | Log all GIO bus accesses to `rex3.log` **[DEV]** |
 | `rex cmap <on\|off>` | CMAP access trace |
 | `vc2 status` | Dump VC2 (video timing) state |
+| `vc2 ramdump` | Dump VC2 RAM (for use with `tools/decode_vc2_ram.py`) |
 | `vc2 debug <on\|off>` | VC2 trace **[DEV]** |
 | `xmap status` | Dump XMAP9 state |
 | `xmap debug <on\|off>` | XMAP9 trace **[DEV]** |

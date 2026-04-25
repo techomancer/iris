@@ -1144,3 +1144,24 @@ impl StatusBar {
         }
     }
 }
+
+/// Save the emulator rgba buffer as a PNG file.
+/// `rgba` uses 0xFFBBGGRR (GL internal format); swap R and B when writing PNG.
+pub fn save_screenshot(path: &str, rgba: &[u32], width: usize, height: usize) -> Result<(), String> {
+    use std::io::BufWriter;
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(BufWriter::new(file), width as u32, height as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
+    let mut rows: Vec<u8> = Vec::with_capacity(height * width * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let px = rgba[y * 2048 + x];
+            rows.push(( px        & 0xFF) as u8); // R (was in blue lane)
+            rows.push(((px >>  8) & 0xFF) as u8); // G
+            rows.push(((px >> 16) & 0xFF) as u8); // B (was in red lane)
+        }
+    }
+    writer.write_image_data(&rows).map_err(|e| e.to_string())
+}

@@ -401,6 +401,7 @@ struct MouseDelta {
 /// UI Manager handling Window, OpenGL context, and Input
 pub struct Ui {
     ps2: Arc<Ps2Controller>,
+    rex3: Arc<Rex3>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     timer_manager: Arc<TimerManager>,
@@ -452,14 +453,15 @@ impl Ui {
 
         *rex3.renderer.lock() = Some(Box::new(renderer));
 
-        Self { ps2, window, window_size, timer_manager, scale }
+        Self { ps2, rex3, window, window_size, timer_manager, scale }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, window, window_size, timer_manager, scale } = self;
+        let Ui { ps2, rex3, window, window_size, timer_manager, scale } = self;
 
         let mut mouse_grabbed = false;
+        let mut rctrl_held = false;
         // Warp-to-center mouse handling: on each real CursorMoved, accumulate
         // delta into shared MouseDelta. A 10ms timer flushes it to PS/2.
         let mut mouse_last: Option<PhysicalPosition<f64>> = None;
@@ -491,7 +493,7 @@ impl Ui {
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
-                        Self::handle_keyboard(&ps2, event, &mut mouse_grabbed, &window);
+                        Self::handle_keyboard(&ps2, &rex3, event, &mut mouse_grabbed, &mut rctrl_held, &window);
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
                         if mouse_grabbed {
@@ -589,11 +591,15 @@ impl Ui {
         Self::send_mouse_packet(ps2, (dx as f64, dy as f64), buttons);
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, input: KeyEvent, grabbed: &mut bool, window: &Window) {
+    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window) {
+        use std::sync::atomic::Ordering;
         if let PhysicalKey::Code(keycode) = input.physical_key {
-            // Right Ctrl: ungrab mouse — consumed, not forwarded to PS/2
+            let pressed = input.state == ElementState::Pressed;
+
+            // Right Ctrl: ungrab mouse — consumed, not forwarded to PS/2.
             if keycode == KeyCode::ControlRight {
-                if input.state == ElementState::Pressed && !input.repeat && *grabbed {
+                *rctrl_held = pressed;
+                if pressed && !input.repeat && *grabbed {
                     *grabbed = false;
                     let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
                     window.set_cursor_visible(true);
@@ -601,8 +607,13 @@ impl Ui {
                 return;
             }
 
+            // RightCtrl+PrintScreen: request screenshot on next frame.
+            if keycode == KeyCode::PrintScreen && pressed && !input.repeat && *rctrl_held {
+                rex3.screenshot_pending.store(true, Ordering::Relaxed);
+                return;
+            }
+
             // Pass to PS/2
-            let pressed = input.state == ElementState::Pressed;
             ps2.push_kb(keycode, pressed);
         }
     }

@@ -40,6 +40,7 @@ cpal = "0.15"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.0.3"
 parking_lot = "0.12"
+png = "0.17"
 spin = "0.10.0"
 gdbstub = { version = "0.7", features = ["std"] }
 gdbstub_arch = "0.3"
