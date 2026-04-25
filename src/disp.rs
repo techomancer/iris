@@ -80,8 +80,10 @@ impl Rex3Screen {
         let ram = &self.vc2_ram;
         let did_buf = &mut self.did;
 
-        // Default to full width if scan_len is 0 or invalid
-        let effective_len = if scan_len > 0 && scan_len <= width { scan_len } else { width };
+        // Use scan_len directly; cap only against the buffer row stride (2048).
+        // Do NOT cap at display width — DID may extend beyond display width to cover
+        // fb columns shifted by fb_x_offset (e.g. scan_len=1028, display width=1024).
+        let effective_len = if scan_len > 0 && scan_len <= 2048 { scan_len } else { width };
 
         let mut y = 0;
         let mut table_idx = did_ptr as usize;
@@ -410,9 +412,16 @@ impl Rex3Screen {
         let cursor_w = if cursor_size_64 { 64 } else { 32 };
         let cursor_h = if cursor_size_64 { 64 } else { 32 };
         
+        // XYWIN.x is typically 0x1002 at runtime (2 above the 0x1000 base), so IRIX
+        // draws into fb columns starting at 2, leaving columns 0-1 blank.  Shift the
+        // display read window right by 2 so display column 0 = fb column 2.
+        // TODO: derive from XYWIN register rather than hardcoding.
+        let fb_x_offset = 2i32;
+
         // Cursor X register is in screen coordinates (0 = first visible pixel).
         // cursor_x_adjust compensates for decoded-width overshoot vs nominal resolution.
-        let cursor_x_hot = (cursor_x_reg as i32) - 31 + self.cursor_x_adjust;
+        // Subtract fb_x_offset so the cursor tracks the shifted display window.
+        let cursor_x_hot = (cursor_x_reg as i32) - 31 + self.cursor_x_adjust - fb_x_offset;
         let cursor_y_hot = (cursor_y_reg as i32) - 31;
         
         let cursor_cmap_msb = self.xmap_cursor_cmap;
@@ -433,13 +442,15 @@ impl Rex3Screen {
         }
 
         let topscan = self.topscan + 1;
+        let fb_x_offset_u = fb_x_offset as usize;
         diag.fetch_or(Rex3::DIAG_LOOP_PIXEL_CONV, Ordering::Relaxed);
         for y in 0..height {
             let fb_y = (topscan + y) & 0x3FF;
             for x in 0..width {
-                let idx = fb_y * 2048 + x;
+                let fb_x = x + fb_x_offset_u;
+                let idx = fb_y * 2048 + fb_x;
                 let out_idx = y * 2048 + x;
-                let did = did_buf[out_idx] as usize;
+                let did = did_buf[y * 2048 + fb_x] as usize;
                 let did5 = (did & 0x1F) as u8;
                 let mode_entry = ModeEntry(xmap_mode[did5 as usize]); // 32 entries
 
@@ -577,7 +588,7 @@ impl Rex3Screen {
         // Cached cursor position from last refresh() call.
         let cursor_x_reg = self.vc2_regs[VC2_REG_CURRENT_CURSOR_X as usize];
         let cursor_y_reg = self.vc2_regs[VC2_REG_WORKING_CURSOR_Y as usize];
-        let cursor_x_hot = (cursor_x_reg as i32) - 31 + self.cursor_x_adjust;
+        let cursor_x_hot = (cursor_x_reg as i32) - 31 + self.cursor_x_adjust - 2;
         let cursor_y_hot = (cursor_y_reg as i32) - 31;
         let cursor_cmap_msb = self.xmap_cursor_cmap;
         let popup_cmap_msb  = self.xmap_popup_cmap;

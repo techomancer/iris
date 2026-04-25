@@ -3764,7 +3764,7 @@ impl Device for Rex3 {
         vec![
             ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
-            ("vc2".to_string(), "VC2 commands: vc2 status | vc2 debug <on|off> [DEV]".to_string()),
+            ("vc2".to_string(), "VC2 commands: vc2 status | vc2 ramdump | vc2 debug <on|off> [DEV]".to_string()),
             ("block".to_string(), "Block draw logging: block debug <on|off> [DEV]".to_string()),
             ("draw".to_string(), "Draw debug overlay: draw debug <on|off>".to_string()),
             ("xmap".to_string(), "XMAP commands: xmap status | xmap debug <on|off> [DEV]".to_string()),
@@ -4051,6 +4051,11 @@ impl Device for Rex3 {
 
         if cmd == "vc2" && args[0] == "status" {
             self.vc2.lock().print_status(&mut writer);
+            return Ok(());
+        }
+
+        if cmd == "vc2" && args[0] == "ramdump" {
+            self.vc2.lock().dump_ram(&mut writer);
             return Ok(());
         }
 

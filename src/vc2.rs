@@ -258,6 +258,29 @@ impl Vc2 {
         }
     }
 
+    /// Dump the VC2 RAM as hex words, 16 per line, for offline decoding.
+    pub fn dump_ram(&self, writer: &mut dyn std::io::Write) {
+        let regs = &self.regs;
+        // Print key register pointers first so the decoder knows where to start.
+        writeln!(writer, "# VC2 RAM dump").unwrap();
+        writeln!(writer, "# VIDEO_ENTRY_PTR  = {:04x}", regs[VC2_REG_VIDEO_ENTRY_PTR as usize]).unwrap();
+        writeln!(writer, "# VT_FRAME_PTR     = {:04x}", regs[VC2_REG_VT_FRAME_PTR as usize]).unwrap();
+        writeln!(writer, "# DID_ENTRY_PTR    = {:04x}", regs[VC2_REG_DID_ENTRY_PTR as usize]).unwrap();
+        writeln!(writer, "# DID_FRAME_PTR    = {:04x}", regs[VC2_REG_DID_FRAME_PTR as usize]).unwrap();
+        writeln!(writer, "# SCANLINE_LEN     = {:04x}  (scan_len={})", regs[VC2_REG_SCANLINE_LEN as usize], (regs[VC2_REG_SCANLINE_LEN as usize] >> 5) as usize).unwrap();
+        writeln!(writer, "# CURSOR_ENTRY_PTR = {:04x}", regs[VC2_REG_CURSOR_ENTRY_PTR as usize]).unwrap();
+        writeln!(writer, "# DISPLAY_CONTROL  = {:04x}", regs[VC2_REG_DISPLAY_CONTROL as usize]).unwrap();
+        // Only dump through the last non-zero word to keep output compact.
+        let last_nonzero = self.ram.iter().rposition(|&w| w != 0).unwrap_or(0);
+        let dump_len = (last_nonzero + 16) & !15; // round up to 16-word boundary
+        writeln!(writer, "# words: {} (dumping 0..{:04x})", self.ram.len(), dump_len).unwrap();
+        for (i, chunk) in self.ram[..dump_len].chunks(16).enumerate() {
+            let addr = i * 16;
+            let hex: Vec<String> = chunk.iter().map(|w| format!("{:04x}", w)).collect();
+            writeln!(writer, "{:04x}: {}", addr, hex.join(" ")).unwrap();
+        }
+    }
+
     pub fn print_status(&self, writer: &mut dyn std::io::Write) {
         let regs: &[(u8, &str)] = &[
             (VC2_REG_VIDEO_ENTRY_PTR,  "VideoEntryPtr "),
