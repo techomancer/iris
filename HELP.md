@@ -304,6 +304,10 @@ cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]
 ```
 
+Looks like we have some problems automounting hybrid ISO9660 CDs like Hot Mix 19 while efs formatted ones and pure iso9660 seem to work fine.
+mount -t iso9660 /dev/rdsk/dks0d4vol /CDROM seems to work though.
+Somehow mediad and kernel are stepping on each other setting block size while the other does reads?
+
 ### SCSI ID conventions
 
 | ID | Typical use |

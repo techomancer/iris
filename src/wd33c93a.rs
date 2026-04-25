@@ -278,13 +278,14 @@ impl Wd33c93a {
     }
 
     /// Return disc info for all attached CD-ROM devices.
-    pub fn disc_status(&self) -> Vec<(usize, String, Vec<String>)> {
+    pub fn disc_status(&self) -> Vec<(usize, String, Vec<String>, u64, u64)> {
         let state = self.state.lock();
         state.devices.iter().enumerate()
             .filter_map(|(id, d)| {
                 let dev = d.as_ref()?;
                 if !dev.is_cdrom() { return None; }
-                Some((id, dev.current_disc().to_string(), dev.disc_list().to_vec()))
+                let (phys, logical) = dev.block_sizes();
+                Some((id, dev.current_disc().to_string(), dev.disc_list().to_vec(), phys, logical))
             })
             .collect()
     }
@@ -518,8 +519,9 @@ impl Device for Wd33c93a {
                     if discs.is_empty() {
                         writeln!(writer, "No CD-ROM devices attached").unwrap();
                     } else {
-                        for (id, active, list) in discs {
-                            writeln!(writer, "SCSI ID {}: {} ({} disc(s))", id, active, list.len()).unwrap();
+                        for (id, active, list, phys, logical) in discs {
+                            writeln!(writer, "SCSI ID {}: {} ({} disc(s))  phys_block={} logical_block={}",
+                                id, active, list.len(), phys, logical).unwrap();
                             for (i, d) in list.iter().enumerate() {
                                 writeln!(writer, "  [{}] {}{}", i, d, if i == 0 { " <active>" } else { "" }).unwrap();
                             }

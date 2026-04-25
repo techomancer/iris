@@ -70,17 +70,22 @@ pub enum DiskBackend {
 }
 
 impl DiskBackend {
-    fn read_sectors(&mut self, lba: u64, count: usize) -> io::Result<Vec<u8>> {
+    /// Read `count` blocks at `lba`, where each block is `block_size` bytes.
+    /// Translates directly to a byte offset: `lba * block_size`.
+    /// COW always uses 512-byte sectors (HDD only, never CD-ROM).
+    fn read_blocks(&mut self, lba: u64, count: usize, block_size: u64) -> io::Result<Vec<u8>> {
+        let byte_offset = lba * block_size;
+        let byte_count = count as u64 * block_size;
         match self {
             DiskBackend::Direct(file) => {
-                let offset = lba * 512;
-                let total = count * 512;
-                file.seek(SeekFrom::Start(offset))?;
-                let mut data = vec![0u8; total];
-                file.read_exact(&mut data)?;
-                Ok(data)
+                file.seek(SeekFrom::Start(byte_offset))?;
+                let mut buf = vec![0u8; byte_count as usize];
+                file.read_exact(&mut buf)?;
+                Ok(buf)
             }
-            DiskBackend::Cow(cow) => cow.read_sectors(lba, count),
+            DiskBackend::Cow(cow) => {
+                cow.read_sectors(lba, count)
+            }
         }
     }
 
@@ -117,6 +122,12 @@ pub struct ScsiDevice {
     pending_sense: [u8; 18],  // Stored sense data, served on REQUEST_SENSE
     /// Unit Attention pending — set after disc change, cleared on next command.
     unit_attention: bool,
+    /// Physical sector size: always 2048 for CD-ROM (Yellow Book), 512 for HDD.
+    /// Used for TOC lead-out LBA (CD spec requires TOC in physical sectors).
+    phys_block_size: u64,
+    /// Logical block size: LBA→byte offset = lba * logical_block_size.
+    /// Defaults to 512. IRIX switches via MODE SELECT (512↔2048). Persists across disc changes.
+    logical_block_size: u64,
 }
 
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
@@ -132,6 +143,10 @@ impl ScsiDevice {
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
             pending_sense: [0u8; 18],
             unit_attention: false,
+            phys_block_size: if is_cdrom { 2048 } else { 512 },
+            // CD-ROM drives default to 2048-byte logical blocks (Sony CDU-76S behaviour).
+            // HDD defaults to 512. dksc switches CD-ROM to 512 for EFS, back to 2048 for ISO.
+            logical_block_size: if is_cdrom { 2048 } else { 512 },
         }
     }
 
@@ -182,6 +197,9 @@ impl ScsiDevice {
                 let size = f.metadata().map(|m| m.len()).unwrap_or(0);
                 self.backend = DiskBackend::Direct(f);
                 self.size = size;
+                // phys_block_size never changes — CD-ROM physical sectors are always 2048.
+                // Do NOT reset logical_block_size — MODE SELECT is a controller setting
+                // that persists across disc changes, just like on real hardware.
                 self.filename = next_path.clone();
                 self.unit_attention = true; // signal medium change on next command
                 Some(next_path)
@@ -203,6 +221,11 @@ impl ScsiDevice {
     /// All discs in the changer list.
     pub fn disc_list(&self) -> &[String] {
         &self.discs
+    }
+
+    /// (physical_block_size, logical_block_size)
+    pub fn block_sizes(&self) -> (u64, u64) {
+        (self.phys_block_size, self.logical_block_size)
     }
 
     fn set_sense(&mut self, key: u8, asc: u8, ascq: u8) {
@@ -255,7 +278,7 @@ impl ScsiDevice {
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
-            scsi_cmd::MODE_SELECT_6 => ScsiResponse { status: 0x00, data: vec![] },
+            scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
             scsi_cmd::SGI_EJECT => self.exec_sgi_eject(&req.cdb)?,
@@ -309,10 +332,15 @@ impl ScsiDevice {
             data[2] = 0x02; // ANSI SCSI-2
             data[3] = 0x02; // SCSI-2 response format
             data[4] = 31;   // Additional length (36 - 5)
-            let vendor = b"SGI     ";
-            data[8..16].copy_from_slice(vendor);
-            let product = b"IRIS EMUL DISK  ";
-            data[16..32].copy_from_slice(product);
+            if self.is_cdrom {
+                // Match Sony CDU-76S — SGI Indy shipped with this drive and IRIX mediad
+                // uses the vendor/product strings for feature detection (volume control, eject).
+                data[8..16].copy_from_slice(b"Sony    ");
+                data[16..32].copy_from_slice(b"CDU-76S         ");
+            } else {
+                data[8..16].copy_from_slice(b"SGI     ");
+                data[16..32].copy_from_slice(b"IRIS EMUL DISK  ");
+            }
             let rev = b"1.0 ";
             data[32..36].copy_from_slice(rev);
 
@@ -333,8 +361,9 @@ impl ScsiDevice {
     }
 
     fn exec_read_capacity_10(&self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        let block_size = 512u32;
-        let last_lba = (self.size / block_size as u64).saturating_sub(1) as u32;
+        let block_size = self.logical_block_size as u32;
+        let last_lba = (self.size / self.logical_block_size).saturating_sub(1) as u32;
+        //eprintln!("SCSI READ CAPACITY: block_size={} last_lba={}", block_size, last_lba);
 
         let mut data = vec![0u8; 8];
         data[0..4].copy_from_slice(&last_lba.to_be_bytes());
@@ -359,7 +388,19 @@ impl ScsiDevice {
     }
 
     fn perform_read(&mut self, lba: u64, count: usize) -> Result<ScsiResponse, std::io::Error> {
-        let data = self.backend.read_sectors(lba, count)?;
+        // Check LBA bounds before attempting I/O
+        let last_lba = self.size / self.logical_block_size;
+        if count > 0 && (lba >= last_lba || lba + count as u64 > last_lba) {
+            return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
+        }
+        let data = self.backend.read_blocks(lba, count, self.logical_block_size)?;
+        let expected = count as u64 * self.logical_block_size;
+        if data.len() as u64 != expected {
+            eprintln!(
+                "SCSI READ mismatch: lba={} count={} block_size={} expected {} bytes got {} bytes",
+                lba, count, self.logical_block_size, expected, data.len()
+            );
+        }
         Ok(ScsiResponse {
             status: 0x00,
             data,
@@ -393,14 +434,15 @@ impl ScsiDevice {
             });
         };
 
-        let expected_len = count * 512;
-        if data.len() != expected_len {
+        let expected_len = count as u64 * self.logical_block_size;
+        if data.len() as u64 != expected_len {
             return Ok(ScsiResponse {
                 status: 0x02,
                 data: vec![],
             });
         }
 
+        // Writes always go through as 512-byte sectors (HDD path only, phys=logical=512)
         self.backend.write_sectors(lba, data)?;
 
         Ok(ScsiResponse {
@@ -424,18 +466,35 @@ impl ScsiDevice {
 
     fn exec_mode_sense_6(&self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
         let page_code = cdb[2] & 0x3F;
+        let dbd      = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
         let alloc_len = cdb[4] as usize;
 
-        // Synthesize geometry from disk size
-        let block_size = 512u32;
-        let total_blocks = self.size / block_size as u64;
+        let lbs = self.logical_block_size as u32;
+
+        // Block descriptor (8 bytes) — omitted if DBD set
+        let block_desc: Vec<u8> = if dbd {
+            vec![]
+        } else {
+            let total_blocks = (self.size / self.logical_block_size) as u32;
+            vec![
+                0x00,                               // density code
+                (total_blocks >> 16) as u8,
+                (total_blocks >> 8)  as u8,
+                (total_blocks)       as u8,
+                0x00,                               // reserved
+                (lbs >> 16) as u8,
+                (lbs >> 8)  as u8,
+                (lbs)       as u8,
+            ]
+        };
+
+        // Synthesize geometry from disk size (HDD pages only)
         let heads: u32 = 16;
-        let spt: u32 = 63; // sectors per track
-        let cylinders = ((total_blocks + (heads * spt - 1) as u64) / (heads * spt) as u64) as u32;
+        let spt: u32 = 63;
+        let total_blocks_u64 = self.size / self.logical_block_size;
+        let cylinders = ((total_blocks_u64 + (heads * spt - 1) as u64) / (heads * spt) as u64) as u32;
 
-        // Build pages to include based on page_code request
         let mut pages: Vec<u8> = Vec::new();
-
         let want_page = |pc: u8| page_code == 0x3F || page_code == pc;
 
         // Page 0x01: Error Recovery Parameters
@@ -450,11 +509,29 @@ impl ScsiDevice {
             ]);
         }
 
+        // Page 0x0e: CD Audio Control (CD-ROM only) — required by IRIX mediad
+        if self.is_cdrom && want_page(0x0e) {
+            pages.extend_from_slice(&[
+                0x0e, 0x0e,         // page code, length
+                0x04,               // IMMED=1
+                0x00,               // reserved
+                0x00, 0x00,         // reserved
+                0x00, 0x4b,         // logical blocks per second of audio (75)
+                // Port 0: channel select=1 (left), volume=0xff
+                0x01, 0xff,
+                // Port 1: channel select=2 (right), volume=0xff
+                0x02, 0xff,
+                // Port 2 & 3: muted
+                0x00, 0x00,
+                0x00, 0x00,
+            ]);
+        }
+
         // Pages 0x03/0x04 are HDD-only (rigid disk geometry)
         if !self.is_cdrom {
             // Page 0x03: Format Parameters
             if want_page(0x03) {
-                let bps = block_size as u16;
+                let bps = lbs as u16;
                 pages.extend_from_slice(&[
                     0x03, 0x16, // page code, length
                     0x00, 0x00, // tracks per zone
@@ -491,22 +568,48 @@ impl ScsiDevice {
             }
         }
 
-        // Mode Parameter Header (4 bytes) + pages
-        let total_len = 4 + pages.len();
+        // Mode Parameter Header (4 bytes) + block descriptor + pages
+        let bd_len = block_desc.len();
+        let total_len = 4 + bd_len + pages.len();
         let mut data = vec![0u8; total_len];
         data[0] = (total_len - 1) as u8; // Mode Data Length (excludes byte 0)
         data[1] = if self.is_cdrom { 0x01 } else { 0x00 }; // Medium type (0x01 = 120mm optical for CD-ROM)
-        data[2] = 0x00; // Device-specific parameter
-        data[3] = 0x00; // Block descriptor length (0 = no block descriptors)
-        data[4..].copy_from_slice(&pages);
+        data[2] = if self.is_cdrom { 0x80 } else { 0x00 }; // WP bit for CD-ROM (read-only media)
+        data[3] = bd_len as u8;
+        data[4..4 + bd_len].copy_from_slice(&block_desc);
+        data[4 + bd_len..].copy_from_slice(&pages);
 
-        // Truncate to allocation length
         data.truncate(alloc_len);
+        Ok(ScsiResponse { status: 0x00, data })
+    }
 
-        Ok(ScsiResponse {
-            status: 0x00,
-            data,
-        })
+    fn exec_mode_select_6(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
+        // Byte 1: SP (Save Pages) bit — we ignore it
+        // Parameter list length is in byte 4
+        let param_len = cdb[4] as usize;
+        let Some(data) = data_in else {
+            return Ok(ScsiResponse { status: 0x00, data: vec![] });
+        };
+        if data.len() < param_len || param_len < 4 {
+            return Ok(ScsiResponse { status: 0x00, data: vec![] });
+        }
+
+        // Header: byte 0 = mode data length (ignored on SELECT), byte 3 = block descriptor length
+        let bd_len = data[3] as usize;
+        if bd_len >= 8 && data.len() >= 4 + bd_len {
+            // 8-byte block descriptor layout (starts at data[4]):
+            //   [0]    density code
+            //   [1..3] number of blocks (0 = whole medium)
+            //   [4]    reserved
+            //   [5..7] block length (24-bit big-endian)
+            let desc = &data[4..4 + bd_len];
+            let new_lbs = ((desc[5] as u64) << 16) | ((desc[6] as u64) << 8) | (desc[7] as u64);
+            if new_lbs == 512 || new_lbs == 2048 {
+                self.logical_block_size = new_lbs;
+            }
+        }
+
+        Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
     fn exec_write_buffer(&mut self, cdb: &[u8], data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
@@ -650,7 +753,10 @@ impl ScsiDevice {
         let msf    = (cdb[1] & 0x02) != 0;
         let format = cdb[2] & 0x0F;
 
-        let total_lba = (self.size / 512) as u32;
+        // TOC LBAs are always in physical CD sectors (2048 bytes each).
+        let total_lba = (self.size / self.phys_block_size) as u32;
+        //eprintln!("SCSI READ TOC: format={} msf={} total_lba={} (current block_size={})",
+        //    format, msf, total_lba, self.logical_block_size);
 
         match format {
             0 => {
@@ -723,10 +829,11 @@ impl ScsiDevice {
     }
 
     /// SGI vendor command 0xC9 — HD-to-CD-ROM mode switch.
-    /// On real hardware this switches the drive to 512-byte block mode for
-    /// reading CD-ROMs formatted with 512-byte logical blocks (SGI CDs).
-    /// We already serve everything at 512 bytes/block, so this is a no-op.
-    fn exec_sgi_hd2cdrom(&self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+    /// On real SGI drives this switches the INQUIRY response from HDD to CD-ROM
+    /// (drives power on as HDD to support older SGI systems that can't boot from CD).
+    /// Block size is NOT changed — that is controlled by MODE SELECT only.
+    fn exec_sgi_hd2cdrom(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        //eprintln!("SCSI SGI_HD2CDROM: no-op");
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
