@@ -481,10 +481,16 @@ nc 127.0.0.1 8888
 
 | Command | Description |
 |---------|-------------|
-| `scsi status` | Show attached CD-ROMs and disc lists |
+| `scsi status` | Show attached CD-ROMs, disc lists, and queue positions |
 | `scsi eject <id>` | Cycle to next disc on CD-ROM `id` |
+| `scsi add <id> <path>` | Add disc image to queue (inserted as next after current) |
+| `scsi list <id>` | List all discs in queue with ordinal numbers |
+| `scsi del <id> <ord>` | Remove disc at ordinal `ord` from queue (does not eject active disc) |
+| `scsi next <id> <ord>` | Move disc at ordinal `ord` to next position (position 1) |
 | `scsi debug <on\|off>` | Per-command SCSI trace logging **[DEV]** |
 
+Queue positions: `[0]` = active (currently mounted), `[1]` = next on eject, higher = queued.
+`scsi add` verifies the file exists before inserting.
 Disc change signals IRIX via SCSI Unit Attention (sense 06/28/00 "Medium
 Changed") on the next `TEST UNIT READY` poll — no restart required.
 

@@ -223,6 +223,55 @@ impl ScsiDevice {
         &self.discs
     }
 
+    /// Insert a new disc path at position 1 (next after current).
+    /// Returns Err if this is not a CD-ROM or the path doesn't exist.
+    pub fn add_disc(&mut self, path: String) -> Result<(), String> {
+        if !self.is_cdrom {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        if !std::path::Path::new(&path).exists() {
+            return Err(format!("File not found: {}", path));
+        }
+        // Insert at index 1 so it becomes the next disc after eject.
+        let insert_pos = if self.discs.is_empty() { 0 } else { 1 };
+        self.discs.insert(insert_pos, path);
+        Ok(())
+    }
+
+    /// Remove disc at the given ordinal index.
+    /// Removing index 0 (current) does not eject — it only removes the path.
+    /// Returns Err if index is out of range.
+    pub fn remove_disc(&mut self, ordinal: usize) -> Result<String, String> {
+        if !self.is_cdrom {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        if ordinal >= self.discs.len() {
+            return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
+        }
+        Ok(self.discs.remove(ordinal))
+    }
+
+    /// Move disc at `ordinal` to index 1 (next after current).
+    /// If ordinal is 0 (active), returns Err.
+    pub fn move_disc_next(&mut self, ordinal: usize) -> Result<(), String> {
+        if !self.is_cdrom {
+            return Err("Not a CD-ROM device".to_string());
+        }
+        if ordinal == 0 {
+            return Err("Ordinal 0 is the active disc; use 'scsi eject' to advance".to_string());
+        }
+        if ordinal >= self.discs.len() {
+            return Err(format!("Ordinal {} out of range (0..{})", ordinal, self.discs.len()));
+        }
+        if self.discs.len() < 2 {
+            return Ok(()); // already only entry
+        }
+        let path = self.discs.remove(ordinal);
+        // Insert at position 1 (right after the active disc at 0).
+        self.discs.insert(1, path);
+        Ok(())
+    }
+
     /// (physical_block_size, logical_block_size)
     pub fn block_sizes(&self) -> (u64, u64) {
         (self.phys_block_size, self.logical_block_size)

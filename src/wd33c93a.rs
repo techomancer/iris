@@ -277,6 +277,33 @@ impl Wd33c93a {
         }
     }
 
+    /// Add a disc path at position 1 (next-after-eject) for a CD-ROM device.
+    pub fn add_disc(&self, id: usize, path: String) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) => dev.add_disc(path),
+        }
+    }
+
+    /// Remove a disc by ordinal from a CD-ROM device's queue.
+    pub fn remove_disc(&self, id: usize, ordinal: usize) -> Result<String, String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) => dev.remove_disc(ordinal),
+        }
+    }
+
+    /// Move a disc by ordinal to position 1 (next-after-eject).
+    pub fn move_disc_next(&self, id: usize, ordinal: usize) -> Result<(), String> {
+        let mut state = self.state.lock();
+        match state.devices.get_mut(id).and_then(|d| d.as_mut()) {
+            None => Err(format!("No device at SCSI ID {}", id)),
+            Some(dev) => dev.move_disc_next(ordinal),
+        }
+    }
+
     /// Return disc info for all attached CD-ROM devices.
     pub fn disc_status(&self) -> Vec<(usize, String, Vec<String>, u64, u64)> {
         let state = self.state.lock();
@@ -496,7 +523,7 @@ impl Device for Wd33c93a {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("scsi".to_string(), "SCSI commands: scsi status | scsi eject <id> | scsi debug <on|off> [DEV]".to_string()),
+            ("scsi".to_string(), "SCSI: scsi status | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV]".to_string()),
             ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
@@ -523,7 +550,8 @@ impl Device for Wd33c93a {
                             writeln!(writer, "SCSI ID {}: {} ({} disc(s))  phys_block={} logical_block={}",
                                 id, active, list.len(), phys, logical).unwrap();
                             for (i, d) in list.iter().enumerate() {
-                                writeln!(writer, "  [{}] {}{}", i, d, if i == 0 { " <active>" } else { "" }).unwrap();
+                                let tag = if i == 0 { " <active>" } else if i == 1 { " <next>" } else { "" };
+                                writeln!(writer, "  [{}] {}{}", i, d, tag).unwrap();
                             }
                         }
                     }
@@ -539,7 +567,65 @@ impl Device for Wd33c93a {
                     }
                     return Ok(());
                 }
-                _ => return Err("Usage: scsi debug <on|off> | scsi status | scsi eject <id>".to_string()),
+                Some("add") => {
+                    let id: usize = args.get(1)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "Usage: scsi add <id> <path>".to_string())?;
+                    let path = args.get(2)
+                        .ok_or_else(|| "Usage: scsi add <id> <path>".to_string())?
+                        .to_string();
+                    match self.add_disc(id, path.clone()) {
+                        Ok(()) => writeln!(writer, "SCSI ID {}: added {} as next disc", id, path).unwrap(),
+                        Err(e) => writeln!(writer, "Error: {}", e).unwrap(),
+                    }
+                    return Ok(());
+                }
+                Some("list") => {
+                    let id: usize = args.get(1)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "Usage: scsi list <id>".to_string())?;
+                    let state = self.state.lock();
+                    match state.devices.get(id).and_then(|d| d.as_ref()) {
+                        None => writeln!(writer, "No device at SCSI ID {}", id).unwrap(),
+                        Some(dev) if !dev.is_cdrom() => writeln!(writer, "SCSI ID {} is not a CD-ROM", id).unwrap(),
+                        Some(dev) => {
+                            let list = dev.disc_list();
+                            writeln!(writer, "SCSI ID {} queue ({} disc(s)):", id, list.len()).unwrap();
+                            for (i, d) in list.iter().enumerate() {
+                                writeln!(writer, "  [{}] {}{}", i, d,
+                                    if i == 0 { " <active>" } else if i == 1 { " <next>" } else { "" }).unwrap();
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                Some("del") => {
+                    let id: usize = args.get(1)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "Usage: scsi del <id> <ordinal>".to_string())?;
+                    let ordinal: usize = args.get(2)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "Usage: scsi del <id> <ordinal>".to_string())?;
+                    match self.remove_disc(id, ordinal) {
+                        Ok(path) => writeln!(writer, "SCSI ID {}: removed [{}] {}", id, ordinal, path).unwrap(),
+                        Err(e)   => writeln!(writer, "Error: {}", e).unwrap(),
+                    }
+                    return Ok(());
+                }
+                Some("next") => {
+                    let id: usize = args.get(1)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "Usage: scsi next <id> <ordinal>".to_string())?;
+                    let ordinal: usize = args.get(2)
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "Usage: scsi next <id> <ordinal>".to_string())?;
+                    match self.move_disc_next(id, ordinal) {
+                        Ok(()) => writeln!(writer, "SCSI ID {}: [{}] moved to next position", id, ordinal).unwrap(),
+                        Err(e) => writeln!(writer, "Error: {}", e).unwrap(),
+                    }
+                    return Ok(());
+                }
+                _ => return Err("Usage: scsi status | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off>".to_string()),
             }
         }
         if cmd == "cow" {
