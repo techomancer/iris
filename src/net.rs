@@ -131,6 +131,16 @@ fn ip_checksum(data: &[u8]) -> u16 {
     !(s as u16)
 }
 
+fn icmp_socket() -> std::io::Result<Socket> {
+    let new = |t| Socket::new(Domain::IPV4, t, Some(Protocol::ICMPV4));
+    #[cfg(target_os = "linux")]
+    { new(Type::DGRAM) }
+    #[cfg(target_os = "macos")]
+    { new(Type::DGRAM).or_else(|_| new(Type::RAW)) }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    { new(Type::RAW) }
+}
+
 fn ipv4_header(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload_len: u16) -> [u8; 20] {
     let mut h = [0u8; 20];
     h[0] = 0x45;
@@ -540,7 +550,7 @@ pub struct NatEngine {
     tcp_nat:   HashMap<(u32, u16, u16), NatTcpEntry>,
     tcp_tw:    HashMap<(u32, u16, u16), Instant>,  // TIME_WAIT: absorb final ACKs silently
     icmp_nat:  HashMap<(u32, u16), NatIcmpEntry>,  // key: (dst_ip, identifier)
-    icmp_unavailable: bool,  // true after first failed raw socket creation (Windows non-admin)
+    icmp_unavailable: bool,  // true after first failed ICMP socket creation
     // Replies generated while draining TX frames are deferred to the next loop iteration
     // so they don't race with the TX completion interrupt in IRIX's interrupt handler.
     deferred_rx: Vec<Vec<u8>>,
@@ -812,7 +822,9 @@ impl NatEngine {
         // Forward to external host via ICMP socket.
         // Linux: unprivileged SOCK_DGRAM+ICMPV4 works (kernel ≥3.11) but Time Exceeded
         //   replies are not delivered — traceroute sees * * * for intermediate hops.
-        // macOS: SOCK_DGRAM+ICMPV4 requires root; falls back gracefully if unavailable.
+        // macOS: unprivileged SOCK_DGRAM+ICMPV4 works for any user and — unlike Linux —
+        //   recv yields the full IP header and delivers Time Exceeded, so it behaves like
+        //   SOCK_RAW; falls back to SOCK_RAW (root) only if DGRAM is unavailable.
         // Windows: SOCK_RAW+ICMPV4 requires admin; Time Exceeded IS delivered on recv,
         //   so traceroute works correctly when running as Administrator.
         let is_new = !self.icmp_nat.contains_key(&(u32::from(dst_ip), ident));
@@ -821,22 +833,13 @@ impl NatEngine {
         if self.icmp_unavailable { return; }
         let key = (u32::from(dst_ip), ident);
         let entry = self.icmp_nat.entry(key).or_insert_with(|| {
-            // Linux: unprivileged SOCK_DGRAM+ICMPV4 works (kernel ≥3.11).
-            // Windows/macOS: need SOCK_RAW+ICMPV4, which requires admin/root.
-            #[cfg(target_os = "linux")]
-            let sock_type = Type::DGRAM;
-            #[cfg(not(target_os = "linux"))]
-            let sock_type = Type::RAW;
-            let sock = match Socket::new(Domain::IPV4, sock_type, Some(Protocol::ICMPV4)) {
+            let sock = match icmp_socket() {
                 Ok(s) => { let _ = s.set_nonblocking(true); Some(s) }
                 Err(e) => {
                     #[cfg(windows)]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out. \
                         Run as Administrator to enable raw ICMP.", e);
-                    #[cfg(target_os = "macos")]
-                    eprintln!("iris: ICMP unavailable ({}); ping will time out. \
-                        Run as root (sudo) to enable raw ICMP.", e);
-                    #[cfg(target_os = "linux")]
+                    #[cfg(not(windows))]
                     eprintln!("iris: ICMP unavailable ({}); ping will time out.", e);
                     None
                 }
@@ -850,8 +853,8 @@ impl NatEngine {
         entry.last_use = Instant::now();
         let sock = entry.sock.as_ref().unwrap();
         // Preserve the guest's TTL so intermediate routers respond with Time Exceeded
-        // at the right hop count.  On Windows/macOS (SOCK_RAW) those replies arrive back
-        // on this socket and we forward them to the guest.  On Linux (SOCK_DGRAM) they
+        // at the right hop count.  On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) those
+        // replies arrive back on this socket and we forward them to the guest.  On Linux they
         // are silently dropped by the kernel — traceroute sees * * *.
         let _ = sock.set_ttl(ttl as u32);
         let dest = SocketAddr::new(IpAddr::V4(dst_ip), 0);
@@ -870,8 +873,8 @@ impl NatEngine {
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1500];
             while let Ok(n) = sock.recv(&mut buf) {
                 let raw: Vec<u8> = buf[..n].iter().map(|b| unsafe { b.assume_init() }).collect();
-                // On Linux SOCK_DGRAM the kernel delivers only the ICMP payload.
-                // On Windows/macOS SOCK_RAW the kernel prepends the outer IP header.
+                // On Linux (SOCK_DGRAM) the kernel delivers only the ICMP payload.
+                // On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) it prepends the outer IP header.
                 #[cfg(not(target_os = "linux"))]
                 let (outer_src_u32, icmp) = {
                     let ihl = ((raw.first().copied().unwrap_or(0x45) & 0x0f) as usize) * 4;
@@ -890,7 +893,7 @@ impl NatEngine {
             let (dst_ip_u32, ident) = key;
             let icmp_type = icmp[0];
 
-            // On Windows/macOS (SOCK_RAW) we receive Time Exceeded (type 11) for traceroute hops.
+            // On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) we receive Time Exceeded (type 11) for traceroute hops.
             // The payload of a Time Exceeded is: [unused 4B][original IP hdr][orig 8B].
             // We match via the ident embedded in the original probe's first 8 bytes,
             // rewrite the embedded src IP back to the guest IP, and forward to guest.
