@@ -246,6 +246,22 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
     });
+
+    // N64 development board (Ultra64). A single runtime toggle — the GIO device
+    // and POSIX shm bridge (/iris_n64_bridge) are only created when this is on,
+    // read once at VM start. Hidden in App Store builds: the sandbox can't open
+    // the named shm or run the external gopher64 process it talks to.
+    #[cfg(not(feature = "appstore"))]
+    {
+        ui.separator();
+        ui.checkbox(&mut cfg.ultra64.enabled, "N64 development board (Ultra64)")
+            .on_hover_text(
+                "Emulate the SGI Indy N64 development board. Requires the gopher64 \
+                 'ultra64' fork running alongside IRIS; load ROMs with `gload` from \
+                 IRIX. Applies on next Start. See docs/ultra64.md.",
+            );
+    }
+
     action
 }
 

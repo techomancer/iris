@@ -9,6 +9,9 @@ pub mod build_features {
     pub const PCAP:      bool = cfg!(feature = "pcap");
     pub const JIT:       bool = cfg!(feature = "jit");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
+    /// N64 development board (Ultra64 GIO card) + POSIX shm bridge to an
+    /// external gopher64. The GUI gates the "Enable dev board" toggle on this.
+    pub const ULTRA64:   bool = cfg!(feature = "ultra64");
     /// Lightning build strips breakpoint checks and the traceback buffer
     /// from the MIPS executor hot path. Interactive debugging (GDB stub,
     /// monitor breakpoints) is non-functional in this build.

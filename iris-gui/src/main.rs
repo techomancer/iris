@@ -255,6 +255,8 @@ struct App {
     show_help_info: bool,
     /// Whether the "Mount the shared folder in IRIX" Help window is open.
     show_nfs_help: bool,
+    /// Whether the "N64 development board (Ultra64)" Help window is open.
+    show_ultra64_help: bool,
     /// Whether the License / Privacy Help windows are open.
     show_license: bool,
     show_privacy: bool,
@@ -484,6 +486,7 @@ impl App {
             serial_input: String::new(),
             show_help_info: false,
             show_nfs_help: false,
+            show_ultra64_help: false,
             show_license: false,
             show_privacy: false,
             syncing: None,
@@ -1213,6 +1216,17 @@ impl App {
                     self.show_nfs_help = true;
                     ui.close_menu();
                 }
+                // N64 dev board getting-started guide. Hidden in App Store
+                // builds, where the board can't run (sandbox blocks the POSIX
+                // shm bridge and there's no way to run the external gopher64).
+                #[cfg(not(feature = "appstore"))]
+                if ui.button("🎮 N64 development board (Ultra64)…")
+                    .on_hover_text("How to set up the N64 devkit and run ROMs with gload")
+                    .clicked()
+                {
+                    self.show_ultra64_help = true;
+                    ui.close_menu();
+                }
                 ui.separator();
                 ui.label(RichText::new("Legal").strong());
                 if ui.button("Licenses…")
@@ -1254,6 +1268,13 @@ impl App {
                 ui.label(format!("  jit:       {}", jit_state(bf::JIT)));
                 ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
+                // ultra64 (N64 dev board) is compiled in, but the App Store
+                // sandbox can't open its POSIX shm bridge — report the runtime
+                // reality there, matching the jit/rex-jit treatment above.
+                let ultra64_state = if cfg!(feature = "appstore") {
+                    "off (sandbox)"
+                } else if bf::ULTRA64 { "on" } else { "off" };
+                ui.label(format!("  ultra64:   {}", ultra64_state));
             });
         });
     }
@@ -2391,6 +2412,106 @@ impl App {
         }
     }
 
+    /// Help → "N64 development board (Ultra64)" — a getting-started guide for the
+    /// devkit. IRIS only emulates the Indy side (the GIO card + a shared-memory
+    /// bridge); the N64 itself is the external gopher64 fork, so the guide is
+    /// mostly about wiring the two processes together. Never reachable in App
+    /// Store builds (the menu item that opens it is compiled out there).
+    fn ultra64_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_ultra64_help {
+            return;
+        }
+        let enabled = self.cfg.ultra64.enabled;
+
+        let mut open = true;
+        egui::Window::new("N64 development board (Ultra64)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_max_width(540.0);
+                egui::ScrollArea::vertical().max_height(580.0).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.label(
+                        "IRIS can emulate the SGI Indy N64 development board — the GIO card \
+                         Nintendo used to build and test N64 games. IRIS provides the Indy side \
+                         (the card plus a 16 MB shared-memory \"RAMROM\"); the N64 itself runs in \
+                         a separate emulator, gopher64, which maps that RAMROM as its cartridge \
+                         and connects over the bridge.");
+                    ui.add_space(8.0);
+
+                    // Step 1 — turn the board on. Reflect the live config so the
+                    // user knows whether they still need to flip it.
+                    ui.label(RichText::new("1. Enable the board in IRIS").strong());
+                    if enabled {
+                        ui.label(RichText::new("✔ Already enabled on the General tab. It takes \
+                                                effect the next time you Start the machine.").weak());
+                    } else {
+                        ui.label(RichText::new(
+                            "Tick \"N64 development board (Ultra64)\" on the General tab, then \
+                             Start (or restart) the machine — it's read once at boot.")
+                            .color(Color32::from_rgb(0xd9, 0x9a, 0x2d)));
+                    }
+                    ui.add_space(8.0);
+
+                    // Step 2 — the external emulator. It can be launched any
+                    // time; it waits for IRIS to create the shm region.
+                    ui.label(RichText::new("2. Build and run the N64 emulator").strong());
+                    ui.label(RichText::new(
+                        "You need the IRIS-compatible gopher64 fork (branch \"ultra64\"). Build it \
+                         once, then run it alongside IRIS — it waits for IRIS to create the bridge, \
+                         so the order doesn't matter:").weak());
+                    ui.code(
+                        "git clone -b ultra64 https://github.com/techomancer/gopher64\n\
+                         cd gopher64\n\
+                         cargo run --features ultra64 --no-default-features");
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Fork:").weak());
+                        ui.hyperlink_to("techomancer/gopher64", "https://github.com/techomancer/gopher64");
+                    });
+                    ui.add_space(8.0);
+
+                    // Step 3 — load a ROM from inside IRIX.
+                    ui.label(RichText::new("3. Load a ROM from IRIX").strong());
+                    ui.label(RichText::new(
+                        "Boot IRIX, open a shell, and load a .n64/.z64 ROM with gload. A gopher64 \
+                         window opens and boots the game:").weak());
+                    ui.code("gload /path/to/game.n64");
+                    ui.label(RichText::new(
+                        "Run gload again with another ROM to switch games — the N64 resets and \
+                         reinitializes cleanly.").weak());
+
+                    ui.separator();
+                    ui.collapsing("Monitor console commands", |ui| {
+                        ui.label(RichText::new(
+                            "From the PROM monitor / serial console (Help » Serial console…):").weak());
+                        let cmd = |ui: &mut egui::Ui, c: &str, d: &str| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.code(c);
+                                ui.label(RichText::new(d).weak());
+                            });
+                        };
+                        cmd(ui, "ultra status", "dev board state (reset, page, interrupt, RDB)");
+                        cmd(ui, "ultra reset", "assert N64 reset");
+                        cmd(ui, "ultra load <path> [off]", "load a binary straight into RAMROM");
+                        cmd(ui, "ultra dump <off> <size>", "hex-dump RAMROM");
+                        cmd(ui, "ultra disasm <off> <n>", "disassemble RAMROM (MIPS)");
+                    });
+
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(
+                        "This is a developer feature for N64 homebrew and reverse-engineering — \
+                         IRIS ships no ROMs. Full hardware notes are in docs/ultra64.md.").weak());
+                });
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.show_ultra64_help = false;
+                }
+            });
+        if !open {
+            self.show_ultra64_help = false;
+        }
+    }
+
     /// The "Synchronizing disks…" modal shown while a clean exit folds pending
     /// CHD `.diff.chd` sidecars back into their bases. Driven by `self.syncing`,
     /// updated from `Evt::SyncProgress`; closes the app on `Evt::SyncDone`.
@@ -2771,6 +2892,9 @@ impl eframe::App for App {
 
         // Help → "Mount the shared folder in IRIX" — the NFS mount command.
         self.nfs_help_window(ctx);
+
+        // Help → "N64 development board (Ultra64)" — devkit getting-started guide.
+        self.ultra64_help_window(ctx);
 
         // "Synchronizing disks…" modal during the exit-time CHD fold-back.
         self.sync_modal(ctx);
