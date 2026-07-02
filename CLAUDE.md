@@ -16,6 +16,9 @@ and 5.3 to a usable system (shell, networking, X11). It is **not** cycle-accurat
   (`jit/`, `snapshot/`, `irix/`, `testing/`). Check here before re-deriving a
   gotcha; when you confirm a non-obvious fix, write it up here as a short
   markdown note so the next session doesn't relearn it.
+- `rules/git/contributing-workflow.md` — **Cursor git workflow**: read before any
+  commit, push, or PR so changes stay tracked (branch from `main`, push to `fork`,
+  PR to techomancer/iris, one change at a time).
 
 ## Build & run
 
