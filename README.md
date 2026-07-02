@@ -9,36 +9,26 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
 ![IRIS running IRIX 6.5](screen.png)
 
 
-## About this fork
+## Platform support
 
-**This repo ([chronic8000/iris](https://github.com/chronic8000/iris)) is actively maintained and
-runs well ahead of the upstream project it was forked from
-([techomancer/iris](https://github.com/techomancer/iris)).** If you landed here from an older
-clone or a third-party release build, check the commit date and the sections below — a lot of
-hardware, GUI, and Windows workflow work lives only on this fork today.
+IRIS began as an Indy IP24 emulator and now also targets **Indigo2 IP22** (fullhouse MC/IOC,
+dual GIO64, Newport XL on GIO). Scaffolds for XZ/Elan and IMPACT/MGRAS graphics are in tree but
+not daily-driver ready.
 
-Upstream IRIS is an excellent Indy-focused baseline. **This fork adds:**
-
-| Area | What's new |
-|------|------------|
-| **Platforms** | **Indigo2 IP22** (fullhouse MC/IOC, dual GIO64, Newport XL on GIO) alongside Indy IP24; dual-head GUI preview; IMPACT/MGRAS + XZ/Elan scaffolds |
-| **iris-gui** | Machine profiles, premiere build profile, framebuffer compositor fixes, partial frame upload, serial-console reconnect after Stop→Start, config autosave, extended RAM presets (384/512 MB) |
-| **Graphics / IRQ** | Fullhouse vblank via extio `SG_RETRACE`, VC2 bootstrap for Indigo2, REX3 GFIFO/Graphics IRQ routing, tile dirty rects |
-| **Performance** | HAL2 dedicated pump thread, idle-pause, REX3 SIMD paths, JIT store-isolation branch, status-bar-only idle refresh |
-| **Windows 11** | One-click `.bat` launchers, premiere/JIT workflow, smoke tests, crash capture — see [wsl/README.md](wsl/README.md) |
+| Area | Notes |
+|------|-------|
+| **Indy IP24** | Primary daily driver — IRIX desktop, X11, networking, JIT |
+| **Indigo2 IP22** | Boots to serial console; framebuffer/desktop path still maturing — see [docs/indigo2-ip22.md](docs/indigo2-ip22.md) |
+| **iris-gui** | Machine profiles, dual-head preview, serial-console reconnect after Stop→Start, config autosave, extended RAM presets |
+| **Graphics** | Fullhouse vblank via extio `SG_RETRACE`, VC2 bootstrap for Indigo2, REX3 fractional/AA lines, SIMD hot paths |
+| **Windows** | One-click `.bat` launchers, premiere/JIT workflow, smoke tests — see [wsl/README.md](wsl/README.md) |
 | **CI / configs** | `irix-install/*.toml` smoke configs, Indigo2 headless smoke, `tools/tests/indigo2-prom-smoke.yaml` |
-| **Docs / rules** | [docs/indigo2-ip22.md](docs/indigo2-ip22.md), [rules/perf/hardware-profiles.md](rules/perf/hardware-profiles.md), accumulated JIT/irix/snapshot notes under `rules/` |
+| **Docs / rules** | [docs/indigo2-ip22.md](docs/indigo2-ip22.md), [rules/perf/hardware-profiles.md](rules/perf/hardware-profiles.md), notes under `rules/` |
 
-**Status snapshot (this fork):**
-
-- **Indy IP24** — primary daily-driver; IRIX desktop, X11, networking, JIT all work.
-- **Indigo2 IP22** — boots to serial console; framebuffer/desktop path still in progress (use `console=d` + serial for debugging; see Indigo2 doc).
-- **Upstream** — merge/rebase from `techomancer/iris` as needed; fork-specific work is on `main` here.
-
-Pre-built binaries and the Mac App Store GUI remain at
-[danifunker/iris releases](https://github.com/danifunker/iris/releases) (upstream packaging).
-For **this fork's** latest code, build from source or watch
-[chronic8000/iris](https://github.com/chronic8000/iris).
+Pre-built binaries and the Mac App Store GUI are at
+[danifunker/iris releases](https://github.com/danifunker/iris/releases).
+This repo ([techomancer/iris](https://github.com/techomancer/iris)) is the canonical source —
+build from here for the latest code.
 
 
 ## Q&A
