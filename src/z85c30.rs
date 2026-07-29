@@ -1115,11 +1115,12 @@ impl Saveable for Z85c30 {
 // CiSerialBackend — in-process serial backend used by --ci mode.
 // ============================================================================
 
-/// Serial backend that the CI control socket reads from and writes to. The
-/// guest sees this as channel A (the IRIX console). Host pushes bytes into
-/// `host_to_guest` via `push_host`; the existing RX thread drains them into
-/// `channel_a.rx_queue`. Guest output reaches `send_byte`, which pushes into
-/// `guest_to_host` and wakes anyone waiting in `wait_for`.
+/// Serial backend that the CI control socket reads from and writes to.
+/// `Machine::new` installs it on channel B, which is tty1, the PROM and IRIX
+/// serial console. Host pushes bytes into `host_to_guest` via `push_host`; the
+/// existing RX thread drains them into `channel_b.rx_queue`. Guest output
+/// reaches `send_byte`, which pushes into `guest_to_host` and wakes anyone
+/// waiting in `wait_for`.
 pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     guest_to_host: Mutex<Vec<u8>>,
