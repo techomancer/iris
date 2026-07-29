@@ -159,17 +159,18 @@ compute the live chunk set.
   use `new_null()` instead so two test instances don't race on the same
   ports. Also the right choice for CI mode (which already used it).
 - **SCC restore left rr0 contradicting the emptied FIFOs**: `channel_from_toml`
-  cleared both queues but kept `status` verbatim, so a snapshot taken mid-burst
-  restored `TX_BUFFER_EMPTY` clear over an empty `tx_queue`. IRIX polls RR0 on
-  the console path, reads that as "transmitter busy" and stops writing for good.
-  Neither bit heals itself. Now sets `TX_BUFFER_EMPTY`, clears
-  `RX_CHAR_AVAILABLE`, re-arms `tx_int_pending` when WR1 has `TX_INT_EN` set,
-  and calls `update_ip` so the SCC and the IOC's `map_stat` agree after
-  `Ioc::load_state` restores it wholesale. Measured on an IRIX 6.5 guest: the
-  rr0 half is what unblocks the console, and a build with only the interrupt
-  half stays silent. Restore still leaves the kernel damaged for unrelated
-  reasons, so `iris-ci run` does not yet survive one. See
-  `rules/snapshot/scc-tx-int-pending-destroyed-on-restore.md`.
+  cleared both queues but kept `status` verbatim, so a snapshot taken with the
+  TX FIFO full restored `TX_BUFFER_EMPTY` clear over an empty `tx_queue`. A
+  guest that gates its write on the bit then deadlocks against a device waiting
+  to be written to. `RX_CHAR_AVAILABLE` restored over an empty `rx_queue` is
+  worse, having no reachable setter at all. Now sets `TX_BUFFER_EMPTY`, clears
+  `RX_CHAR_AVAILABLE`, re-arms `tx_int_pending` when WR1 has `TX_INT_EN` and
+  WR5 has `TX_ENABLE`, and calls `update_ip` so the SCC and the IOC's
+  `map_stat` agree after `Ioc::load_state` restores it wholesale. Reproducing
+  it on IRIX 6.5 needed a doctored snapshot; four organic saves never reached
+  the state. Restore still leaves the kernel damaged for unrelated reasons, so
+  `iris-ci run` does not yet survive one. See
+  `rules/snapshot/scc-restore-rr0-contradicts-the-emptied-fifos.md`.
 - **CHD snapshots captured no disk state**, recorded but not fixed:
   `cow_export` and `cow_import` match only `DiskBackend::Cow`, while `is_cow`
   reports true for a `ChdHd` with a diff. RAM is restored while the disk stays
