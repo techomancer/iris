@@ -1070,10 +1070,17 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     if let Some(r) = get_field(v, "regs")    { load_u8_slice(r, &mut ch.regs); }
     if let Some(x) = get_field(v, "reg_ptr") { if let Some(n) = toml_u8(x) { ch.reg_ptr = n; } }
     if let Some(x) = get_field(v, "status")  { if let Some(n) = toml_u8(x) { ch.status = n; } }
-    // Clear transient state — in-flight data and interrupt latches are lost on restore.
     ch.rx_queue.clear();
     ch.tx_queue.clear();
-    ch.tx_int_pending = false;
+    // The queue is now empty. Reflect that in status so rr0, tx_queue and
+    // tx_int_pending stay mutually consistent.
+    ch.status |= rr0::TX_BUFFER_EMPTY;
+    // Re-assert the TX latch when the channel has TX interrupts enabled.
+    // After restore the queue is empty, which is exactly the condition
+    // notify_tx_empty reports. Without this, a driver mid-write blocks on a
+    // TX interrupt that can never fire.
+    let wr1 = ch.regs[scc_regs::WR1 as usize];
+    ch.tx_int_pending = (wr1 & wr1::TX_INT_EN) != 0;
     ch.update_tx_delay();
 }
 
@@ -1236,7 +1243,7 @@ mod tests {
             ch.regs[3]  = 0xc1;
             ch.regs[5]  = 0xea;
             ch.reg_ptr  = 7;
-            ch.status   = 0x40;
+            ch.status   = 0x40 | rr0::TX_BUFFER_EMPTY;
         }
         {
             let mut ch = src.channel_b.0.lock();
@@ -1244,7 +1251,7 @@ mod tests {
             ch.regs[2]  = 0x10;
             ch.regs[15] = 0x05;
             ch.reg_ptr  = 3;
-            ch.status   = 0x80;
+            ch.status   = 0x80 | rr0::TX_BUFFER_EMPTY;
         }
         let v1 = src.save_state();
 
@@ -1308,5 +1315,75 @@ mod tests {
         assert_eq!(received.len(), line.len(),
             "expected {} bytes, got {} (lossy rx_queue?)", line.len(), received.len());
         assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
+    }
+
+    /// Restore must leave the TX interrupt path functional. Before the fix,
+    /// `channel_from_toml` cleared `tx_int_pending` unconditionally, so a
+    /// driver mid-write (TX int enabled, char queued, latch false) could
+    /// never get another TX interrupt after restore.
+    #[test]
+    fn restore_rearms_tx_interrupt() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.tx_queue.push_back(b'X');
+            ch.tx_int_pending = false;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        let ch = dst.channel_a.0.lock();
+        assert!(ch.tx_int_pending,
+            "tx_int_pending must be re-asserted on restore when TX ints enabled");
+        assert_eq!(ch.get_ip(), 1 << 1,
+            "TX interrupt bit must be raised after restore");
+    }
+
+    /// Restore with TX interrupts disabled must not arm the latch.
+    #[test]
+    fn restore_no_tx_int_when_disabled() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = 0;
+            ch.tx_queue.push_back(b'X');
+            ch.tx_int_pending = false;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        let ch = dst.channel_a.0.lock();
+        assert!(!ch.tx_int_pending,
+            "tx_int_pending must stay false when TX ints disabled");
+        assert_eq!(ch.get_ip(), 0,
+            "no TX interrupt when WR1 TX_INT_EN is clear");
+    }
+
+    /// After restore, rr0::TX_BUFFER_EMPTY must agree with the (now empty)
+    /// tx_queue. A save taken while the FIFO was full must not restore a
+    /// stale "buffer full" status.
+    #[test]
+    fn restore_sets_tx_buffer_empty_status() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            for _ in 0..4 { ch.tx_queue.push_back(b'Z'); }
+            ch.status &= !rr0::TX_BUFFER_EMPTY;
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        let ch = dst.channel_a.0.lock();
+        assert!(ch.tx_queue.is_empty(), "tx_queue must be empty after restore");
+        assert!(ch.status & rr0::TX_BUFFER_EMPTY != 0,
+            "TX_BUFFER_EMPTY must be set when tx_queue is empty");
     }
 }

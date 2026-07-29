@@ -158,6 +158,11 @@ compute the live chunk set.
 - **Z85c30 default constructor binds TCP** 8880/8881 on `new()`; tests
   use `new_null()` instead so two test instances don't race on the same
   ports. Also the right choice for CI mode (which already used it).
+- **SCC TX interrupt wedged after restore**: `channel_from_toml` cleared
+  `tx_int_pending` unconditionally, so a driver mid-write (TX int enabled,
+  char queued) could never get another TX interrupt after restore. Now
+  re-asserts the latch when WR1 has TX_INT_EN set and the queue is empty.
+  Also sets `TX_BUFFER_EMPTY` in restored `status` to match the empty queue.
 
 ### Deprecated / Descoped
 
