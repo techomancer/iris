@@ -44,12 +44,16 @@ cow.toml       328.4K
 scsi1 = [ 266240, 266241, ... ]
 ```
 
-## Not the whole cause of restore corruption
+## Not the cause of the restore panic
 
-A raw-image run still panicked on restore, with `PANIC: KERNEL FAULT / PC: 0x0
-ep: 0x929a2750 / EXC code:128, 'Software detected SEGV'`, so something in the CPU
-or TLB restore is wrong independently of this. `NOTICE - cpu 0 has duplicate tlb
-entries` appears on both substrates.
+Worth fixing on its own terms, but it was chased as the likely cause of the
+kernel panic after `iris-ci restore` and it is not:
 
-Fixing `cow_export`/`cow_import` for `ChdHd`, or running snapshot-dependent work
-on raw images, is the first thing to try before debugging the rest.
+- A raw image extracted with `chd_extract` **did** capture `scsi1.overlay` with a
+  real dirty list in `cow.toml`, and restore still panicked. n=2.
+- An in-place `save` then `restore` seconds later, same process, moves the disk
+  by milliseconds and panics anyway.
+
+So the disk being stale cannot be what kills the guest. See
+`scc-restore-rr0-contradicts-the-emptied-fifos.md` for what else has been ruled
+out and what is left.

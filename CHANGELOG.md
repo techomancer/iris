@@ -159,17 +159,20 @@ compute the live chunk set.
   use `new_null()` instead so two test instances don't race on the same
   ports. Also the right choice for CI mode (which already used it).
 - **SCC restore left rr0 contradicting the emptied FIFOs**: `channel_from_toml`
-  cleared both queues but kept `status` verbatim, so a snapshot taken with the
-  TX FIFO full restored `TX_BUFFER_EMPTY` clear over an empty `tx_queue`. A
-  guest that gates its write on the bit then deadlocks against a device waiting
-  to be written to. `RX_CHAR_AVAILABLE` restored over an empty `rx_queue` is
-  worse, having no reachable setter at all. Now sets `TX_BUFFER_EMPTY`, clears
-  `RX_CHAR_AVAILABLE`, re-arms `tx_int_pending` when WR1 has `TX_INT_EN` and
-  WR5 has `TX_ENABLE`, and calls `update_ip` so the SCC and the IOC's
-  `map_stat` agree after `Ioc::load_state` restores it wholesale. Reproducing
-  it on IRIX 6.5 needed a doctored snapshot; four organic saves never reached
-  the state. Restore still leaves the kernel damaged for unrelated reasons, so
-  `iris-ci run` does not yet survive one. See
+  cleared both queues but kept `status` verbatim. `RX_CHAR_AVAILABLE` restored
+  over an empty `rx_queue` has no reachable setter, since `read_data` returns 0
+  without touching the bit, so a guest polling RR0 spins on zeroes for good.
+  Measured at roughly 1 save in 10 when input is injected shortly beforehand,
+  which is the shape of any `iris-ci run` followed by `iris-ci save`.
+  `TX_BUFFER_EMPTY` restored clear deadlocks a guest that gates its write on the
+  bit, though `save_snapshot` cannot produce that state: the TX thread drains
+  the FIFO during the 3.7 to 8.4 ms between `cpu.stop()` and the SCC join.
+  Now sets `TX_BUFFER_EMPTY`, clears `RX_CHAR_AVAILABLE`, re-arms
+  `tx_int_pending` when WR1 has `TX_INT_EN` and WR5 has `TX_ENABLE`, and calls
+  `update_ip` so the SCC and the IOC's `map_stat` agree after `Ioc::load_state`
+  restores it wholesale. Restore still leaves the kernel damaged for an
+  unrelated and undiagnosed reason, and the panic is byte-identical with and
+  without this change, so `iris-ci run` does not yet survive one. See
   `rules/snapshot/scc-restore-rr0-contradicts-the-emptied-fifos.md`.
 - **CHD snapshots captured no disk state**, recorded but not fixed:
   `cow_export` and `cow_import` match only `DiskBackend::Cow`, while `is_cow`

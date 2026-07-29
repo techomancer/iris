@@ -5,11 +5,15 @@
 
 ## Scope
 
-This is a latent defect found while chasing a different failure. The reported
-symptom, a guest that survives `iris-ci restore` alive but silent, is **not**
-cured by anything here: that has a separate and still undiagnosed cause, see the
-last section. What is recorded here is a real state-consistency bug in
-`channel_from_toml`, reproducible only from a doctored snapshot.
+Two rr0 bits, and their reachability is not the same. **`RX_CHAR_AVAILABLE` is
+hit by ordinary use, in roughly 1 save in 10.** `TX_BUFFER_EMPTY` cannot be
+reached through `save_snapshot` at all; forcing it is defensive hardening.
+Measurements for both are below.
+
+Neither fixes the failure this was found while chasing, a guest that survives
+`iris-ci restore` alive but silent. That has a separate cause, still undiagnosed,
+and it is **not** the SCC: the panic is byte-identical on the fixed and unfixed
+trees. See the last section.
 
 ## What `channel_from_toml` got wrong
 
@@ -65,25 +69,47 @@ console interrupt-driven, was seen only after doctoring a snapshot. Do not read
 the two values as "panic printer" versus "normal tty": the data does not support
 that split.
 
-## How often it bites: rarely, on four samples, with no mechanism
+## Reachability: RX yes, TX no
 
-Four snapshots taken organically with `iris-ci save`, two at a login prompt, one
-at an idle root shell, one two seconds into a console burst, all captured
-channel B as `wr1 = 0x11`, `status = 0x2c`. TX interrupts disabled,
-`TX_BUFFER_EMPTY` already set, `RX_CHAR_AVAILABLE` already clear: **all three
-arms of the fix are no-ops there**, and the fixed and unfixed trees produced
-byte-identical `scc.bin`. Reaching the state the fix targets required doctoring
-a real snapshot to `wr1 = 0x13` / `status = 0x28`.
+**RX, about 1 save in 10.** `iris-ci serial-send` immediately followed by
+`iris-ci save`, at a root shell, nothing doctored:
 
-Do not explain that rarity by saving being quiescent. `save_snapshot` and
-`capture_rollback_checkpoint` do both open with `Machine::stop()`, and no save
-path skips it, but `stop()` **freezes** the FIFO rather than draining it: the TX
-thread breaks out of its wait and exits without popping, so a queue of 4 with
-`TX_BUFFER_EMPTY` clear is preserved verbatim. Stopping also kills the one
-thread that would have set the bit back. The FIFO is 4 deep and the TX thread
-paces at `tx_delay` per character while the CPU fills it in nanoseconds, so
-during sustained output the bit is clear for a real fraction of each character
-time. Four samples is the whole of the evidence for rarity.
+| sequence | `ch_b status` |
+|---|---|
+| no injection (control) | `0x2c` |
+| 2000 chars, `--no-cr`, then save | `0x2d` |
+| 100 chars, `--no-cr`, then save | `0x2d` |
+| 10 trials, 100 chars no-CR | `0x2d` in 1 |
+| 10 trials, 30 chars with CR | `0x2d` in 1 |
+
+Bit 0 is `RX_CHAR_AVAILABLE`. Nothing drains `rx_queue` except the guest calling
+`read_data`, and `Machine::stop()` halts the CPU first, so any host input the
+guest has not consumed is queued at save time with the bit set. `iris-ci login`
+and `iris-ci run` both inject through `serial-send`, so a script that runs a
+command and then snapshots is exactly this shape.
+
+**TX, never, and there is a mechanism.** `Machine::stop()` calls `cpu.stop()`
+first and only reaches the SCC join several milliseconds later, and in that
+window the TX thread drains with nothing refilling it. Instrumented over five
+`save` calls:
+
+```
+cpu.stop() done at 115 us, scc joined by 3818 us; window = 3703 us
+cpu.stop() done at  81 us, scc joined by 8452 us; window = 8371 us
+cpu.stop() done at  21 us, scc joined by 8046 us; window = 8025 us
+cpu.stop() done at  37 us, scc joined by 7560 us; window = 7523 us
+cpu.stop() done at  42 us, scc joined by 8204 us; window = 8162 us
+tx_delay: channel A 192 us, channel B 384 us
+```
+
+A full 4-deep FIFO drains in 4 x 384 = 1536 us and the bit is set on the first
+pop, so the narrowest observed window still clears it with 2.4x margin. Reaching
+the TX state needed a snapshot edited by hand to `wr1 = 0x13` / `status = 0x28`.
+
+Earlier drafts of this note explained the TX rarity by saving being quiescent.
+That was wrong twice over: `stop()` freezes the FIFO rather than draining it *at
+the moment it runs*, and the reason the state does not survive is the join delay
+afterwards, not quiescence.
 
 ## Why `update_ip` is still right
 
@@ -144,13 +170,49 @@ kernel dead on both trees:
 The panic PC is stable for a given guest state and varies between states, so it
 tracks what was running rather than being random. Quiescence does not help: an
 idle root shell snapshotted after `sync; sync` and 10 s of quiet panicked like
-the rest. On a doctored mid-write snapshot the fix makes that panic audible
-instead of silent, but on organic snapshots both trees emit the same bytes, so
-it changes nothing about how the failure presents in practice.
+the rest.
 
-One contributing cause is recorded separately in
-`chd-snapshots-do-not-capture-the-disk.md`. A raw-image run panicked too, so
-that is not the whole story.
+**The SCC is not the cause.** Restoring one snapshot on three binaries, fixed
+tree, `main`, and fixed plus a CPU re-derivation patch, produced a
+byte-identical panic each time. That snapshot's channel B has `wr1 = 0x11` and
+`status = 0x2c`, so every arm of the fix is an arithmetic no-op on it.
+
+**The restore machinery works below the OS.** At the PROM `Option?` menu,
+`save prom1` then `restore prom1` then `serial-send 5` gives a live Command
+Monitor prompt. Whatever is broken is specific to a booted IRIX.
+
+Ruled out, each with a measurement:
+
+- **The CHD disk-capture hole**, recorded in
+  `chd-snapshots-do-not-capture-the-disk.md`. A raw image did capture
+  `scsi1.overlay` with a real dirty list and still panicked, n=2, and an
+  in-place restore seconds after the save moves the disk by milliseconds and
+  panics anyway. The hole is real but it is not this.
+- **The JIT.** `[jit] enabled = false` gives a byte-identical panic, same PC,
+  same bad address.
+- **`power_on_devices()` on restore.** Gated off: byte-identical panic.
+- **CPU dispatch re-derivation.** Instrumented as `changed=false`, because IRIX
+  6.5 on IP22 runs the kernel with KX=0 and FR=0, so the reset-derived state
+  already matches. A latent hole all the same, see below.
+- **`wd33c93a` in-flight transfer state**, which `load_state` clears in the same
+  invisible way the SCC did. `asr = 0x00` in the snapshot, so the controller was
+  idle and the clears are no-ops.
+- **Cache tag serialization** and **RAM restore**, both lossless at this size.
+
+What is left is state that is **not in the snapshot at all**, which is why a
+round-trip diff cannot see it: re-saving immediately after
+`load_snapshot_inner` and running `iris-ci diff` reports every device unchanged
+except `rtc`, and 0 of 4128 memory chunks changed. Untested candidates:
+`core.cycles` and `cp0_random_cycle`, which feed `update_random` and therefore
+which entry `TLBWR` replaces, and `duplicate tlb entries` is a
+TLB-replacement symptom; the HPC3 `PdmaChannel` fields `eox`, `eop`, `xie`,
+`rown`, `last_rx_ctrl`, `transaction_id`, `bytes_transferred`; and RTC time
+re-anchoring.
+
+A component bisect was attempted and is inconclusive by construction.
+"Restore only X" wedges the guest whatever X is, because registers from time T
+against RAM from T+delta is inherently inconsistent. The valid form is "restore
+everything except X", at one 7-minute boot per fatal arm.
 
 ## Two things that will waste your time
 
@@ -162,3 +224,12 @@ that is not the whole story.
   one.
 - `iris-ci` flakes under load with `connect ...: Resource temporarily unavailable
   (os error 11)`, which aborts `boot` early and looks like a boot failure. Retry.
+- `PANIC: stack underflow/overflow` after a restore has been blamed on having an
+  NFS export mounted in the guest. It is not NFS. The same panic appeared on a
+  raw image with no NFS mount anywhere, so it is the general restore bug wearing
+  a different hat.
+- `chd_extract` writes `<base>.chd.diff.chd` beside the image and ignores
+  `IRIS_CHD_DIFF_DIR`, so it can leave a sibling overlay that silently changes
+  the next run's guest state.
+- `cp -a` of a live `.diff.chd` gives a torn copy. One reused disk state booted
+  straight into `Error during dump: i/o error`. Stop the emulator first.
