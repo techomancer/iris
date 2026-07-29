@@ -1072,21 +1072,24 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     if let Some(x) = get_field(v, "status")  { if let Some(n) = toml_u8(x) { ch.status = n; } }
     ch.rx_queue.clear();
     ch.tx_queue.clear();
-    // Both FIFOs are empty now and rr0 has to agree. A stale RX_CHAR_AVAILABLE
-    // never clears itself: read_data only drops the bit when it pops a byte,
-    // and there is nothing left to pop.
+    // Both FIFOs are empty now and rr0 has to agree. This is the part that
+    // actually unblocks the guest: IRIX polls RR0 on the console path, and a
+    // restored status without TX_BUFFER_EMPTY reads as "still busy", after
+    // which the driver never writes again. Neither bit heals itself, since
+    // write_data only clears TX_BUFFER_EMPTY at a full FIFO and read_data only
+    // clears RX_CHAR_AVAILABLE when it pops the last byte.
     ch.status |= rr0::TX_BUFFER_EMPTY;
     ch.status &= !rr0::RX_CHAR_AVAILABLE;
-    // An empty tx_queue is the condition notify_tx_empty reports, so re-arm
-    // the latch here. Clearing the queue destroyed the char whose completion
-    // would have set it, and nothing else ever does.
+    // Clearing tx_queue destroyed the character whose completion would have
+    // set the latch, and notify_tx_empty only fires when a transmit finishes,
+    // so nothing else ever would.
     let wr1 = ch.regs[scc_regs::WR1 as usize];
     ch.tx_int_pending = (wr1 & wr1::TX_INT_EN) != 0;
     ch.update_tx_delay();
-    // The latch on its own delivers nothing; only update_ip publishes ip_num
-    // and drives the line into the IOC. Machine::load_snapshot runs
-    // Ioc::load_state first, which restores map_stat wholesale, so this has to
-    // come after it. Lock order (channel then IOC state) matches the RX thread.
+    // power_on_devices cleared map_stat SERIAL and Ioc::load_state then put it
+    // back wholesale, so publish ip_num and redrive the line to keep the two
+    // agreeing. Lock order (channel then IOC state) matches write_a_control,
+    // which holds both channel locks across update_ip.
     ch.update_ip();
 }
 
@@ -1324,10 +1327,9 @@ mod tests {
         assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
     }
 
-    /// A driver mid-write sits with TX interrupts enabled and the latch false,
-    /// waiting for the char it queued to complete. Restore throws that char
-    /// away, so unless the latch is re-armed here nothing can ever set it.
-    /// Only `regs` is serialized; the queue state is implicit in the restore.
+    /// Restore clears `tx_queue`, which destroys the character whose
+    /// completion would have set the latch. Asserted through RR3, which is how
+    /// a guest ISR sees it: `read_a_control` recomputes channel A's IP live.
     #[test]
     fn restore_rearms_tx_interrupt() {
         let src = Z85c30::new_null(None);
@@ -1339,12 +1341,10 @@ mod tests {
 
         let dst = Z85c30::new_null(None);
         dst.load_state(&saved).expect("load_state");
+        dst.channel_a.0.lock().reg_ptr = 3;
 
-        let ch = dst.channel_a.0.lock();
-        assert!(ch.tx_int_pending,
-            "tx_int_pending must be re-asserted on restore when TX ints enabled");
-        assert_eq!(ch.get_ip(), 1 << 1,
-            "TX interrupt bit must be raised after restore");
+        assert_eq!(dst.read_a_control(), (1 << 1) << 3,
+            "RR3 must report a channel A TX interrupt after restore");
     }
 
     /// Guard on the re-arm above: a channel whose driver never enabled TX
@@ -1361,17 +1361,44 @@ mod tests {
 
         let dst = Z85c30::new_null(None);
         dst.load_state(&saved).expect("load_state");
+        dst.channel_a.0.lock().reg_ptr = 3;
 
-        let ch = dst.channel_a.0.lock();
-        assert!(!ch.tx_int_pending,
-            "tx_int_pending must stay false when TX ints disabled");
-        assert_eq!(ch.get_ip(), 0,
+        assert_eq!(dst.read_a_control(), 0,
             "no TX interrupt when WR1 TX_INT_EN is clear");
     }
 
-    /// `status` is serialized but `tx_queue` is not, so a save taken with the
-    /// FIFO full carries a "buffer full" rr0 that contradicts the empty queue
-    /// it restores into.
+    struct Recorder(AtomicBool);
+    impl IrqCallback for Recorder {
+        fn set_level(&self, level: bool) { self.0.store(level, Ordering::SeqCst); }
+    }
+
+    /// Channel B is the CI console (`machine.rs` installs `CiSerialBackend`
+    /// with `set_backend_b`), and it is not symmetric with A: `read_b_control`
+    /// returns 0 for RR3, so B's IP reaches the guest only through A's RR3 via
+    /// the shared `ip_other` atomic.
+    #[test]
+    fn restore_rearms_tx_interrupt_channel_b() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_b.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+        }
+        let saved = src.save_state();
+
+        let irq = Arc::new(Recorder(AtomicBool::new(false)));
+        let dst = Z85c30::new_null(Some(irq.clone()));
+        dst.load_state(&saved).expect("load_state");
+        dst.channel_a.0.lock().reg_ptr = 3;
+
+        assert_eq!(dst.read_a_control(), 1 << 1,
+            "RR3 must report a channel B TX interrupt in its low bits");
+        assert!(irq.0.load(Ordering::SeqCst),
+            "restore must raise the IRQ line for channel B");
+    }
+
+    /// The operative fix. A restored `status` without TX_BUFFER_EMPTY reads as
+    /// "still busy" to a guest polling RR0, and `write_data` only ever clears
+    /// that bit at a full FIFO, so the driver stops writing for good.
     #[test]
     fn restore_sets_tx_buffer_empty_status() {
         let src = Z85c30::new_null(None);
@@ -1392,16 +1419,9 @@ mod tests {
 
     /// Setting the latch is not delivery. `get_ip` is a pure read of the
     /// channel's own fields; the IRQ only reaches the IOC through `update_ip`,
-    /// which stores `ip_num` and calls `set_level`. A restore that arms the
-    /// latch without calling it leaves the guest's driver blocked exactly as
-    /// before.
+    /// which stores `ip_num` and calls `set_level`.
     #[test]
     fn restore_drives_irq_line_to_parent() {
-        struct Recorder(AtomicBool);
-        impl IrqCallback for Recorder {
-            fn set_level(&self, level: bool) { self.0.store(level, Ordering::SeqCst); }
-        }
-
         let src = Z85c30::new_null(None);
         {
             let mut ch = src.channel_a.0.lock();
@@ -1413,8 +1433,10 @@ mod tests {
         let dst = Z85c30::new_null(Some(irq.clone()));
         dst.load_state(&saved).expect("load_state");
 
+        // ip_num is channel B's ip_other, which B's update_ip ORs when it
+        // computes the line level. RR3 for A is recomputed live, not read here.
         assert_eq!(dst.channel_a.0.lock().ip_num.load(Ordering::SeqCst), 1 << 1,
-            "restore must publish the TX IP so RR3 and the IOC agree");
+            "restore must publish the TX IP for the other channel to see");
         assert!(irq.0.load(Ordering::SeqCst),
             "restore must raise the IRQ line into the IOC");
     }

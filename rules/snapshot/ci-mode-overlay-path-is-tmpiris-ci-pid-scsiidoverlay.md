@@ -5,7 +5,34 @@
 
 # CI Mode Overlay Path is /tmp-Based, Not Image-Sibling
 
+**Raw images only. CHD ignores all of this, see the carve-out below.**
+
 When iris is invoked with `--ci`, the COW overlay file does NOT live next to the base image (`<base>.overlay`). It goes to `/tmp/iris-ci-<pid>-scsi<id>.overlay`. This isolates concurrent CI runs from each other and from any interactive session sharing the same base image.
+
+## Carve-out: CHD images are not isolated
+
+`Wd33c93a::add_device` (`src/wd33c93a.rs:372`) applies `overlay_path_override`
+only in the `else if overlay && !is_cdrom` raw-image branch. The CHD branch calls
+`ChdHd::open(path, overlay)` and never sees the override, so the diff lands at
+`chd_disk::diff_path_for()`, which is `<base>.chd.diff.chd` beside the image, and
+it is **not per-pid**.
+
+Confirmed with `lsof` on a running `ci = true` emulator:
+
+```
+iris ... /home/mach/workspace/irix-actions-runner/Indy-IRIX65_dev.chd
+iris ... /home/mach/workspace/irix-actions-runner/Indy-IRIX65_dev.chd.diff.chd
+```
+
+No `/tmp/iris-ci-*` file exists in that run. The same config against a raw image
+does produce `/tmp/iris-ci-<pid>-scsi1.overlay`.
+
+Consequences: concurrent `--ci` runs on one CHD share a single overlay, and
+consecutive runs inherit each other's guest state. An A/B comparison that does
+not isolate the overlay is worthless, since a guest that panicked in one run
+boots into `savecore` in the next. Set `IRIS_CHD_DIFF_DIR` (`src/chd_disk.rs:307`)
+to redirect the diff to a directory of your choice, which is cleaner than
+deleting the file between runs.
 
 ## Where it's set
 `src/machine.rs:197`:

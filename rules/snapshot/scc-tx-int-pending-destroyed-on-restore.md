@@ -1,76 +1,119 @@
-# SCC restore drops the TX latch and never redrives the IRQ line
+# SCC restore leaves rr0 contradicting the emptied FIFOs
 
-**Keywords:** snapshot,restore,scc,z85c30,tx_int_pending,update_ip,rr0,serial,console
+**Keywords:** snapshot,restore,scc,z85c30,rr0,tx_buffer_empty,tx_int_pending,update_ip,serial,console
 **Category:** snapshot
+
+## Symptom
+
+After `iris-ci restore` the guest is alive but the serial console emits nothing.
+`serial-wait` times out on every pattern while the emulator answers `ping`.
 
 ## What `channel_from_toml` got wrong
 
-`channel_from_toml` in `src/z85c30.rs` restores `regs`, `reg_ptr` and `status`,
-then clears both FIFOs. Three things did not follow from that:
+It restores `regs`, `reg_ptr` and `status`, then clears both FIFOs. Three things
+did not follow from that:
 
-- `tx_int_pending` was forced false. `Channel::get_ip` gates the TX bit on it
-  and the only setter is `notify_tx_empty`, called by the TX thread after it
-  drains a queued char. Clearing `tx_queue` removes the char whose completion
-  would have set the latch, so nothing sets it again.
-- `status` was taken from the snapshot verbatim. A save with the TX FIFO full
-  restored `TX_BUFFER_EMPTY` clear over an empty `tx_queue`; a save with a byte
-  in the RX FIFO restored `RX_CHAR_AVAILABLE` set over an empty `rx_queue`.
-  The RX case does not recover on its own: `read_data` only drops the bit when
-  it pops a byte, and there is nothing to pop.
-- Nothing called `update_ip`. That is the only thing that publishes `ip_num`
-  (what `read_a_control` reports as RR3 for the other channel) and calls
-  `IrqCallback::set_level` to drive the IOC's `map_stat` SERIAL bit. Arming the
-  latch without it changes a field nobody reads.
+- `status` was taken from the snapshot verbatim, so it can contradict the queues
+  it restores into. Neither bit heals itself: `write_data` clears
+  `TX_BUFFER_EMPTY` only when the FIFO reaches 4 entries, and `read_data` clears
+  `RX_CHAR_AVAILABLE` only when a pop empties the queue.
+- `tx_int_pending` was forced false. `Channel::get_ip` gates the TX bit on it and
+  the only setter is `notify_tx_empty`, which the TX thread calls after a
+  character finishes transmitting. Clearing `tx_queue` removes the character
+  whose completion would have set the latch, so nothing sets it again.
+- Nothing called `update_ip`, the only thing that publishes `ip_num` and calls
+  `IrqCallback::set_level` to drive the IOC's `map_stat` SERIAL bit.
 
-Ordering matters for the `update_ip` call: `Machine::load_snapshot` runs
-`Ioc::load_state` before `scc().load_state`, and `Ioc::load_state` restores
-`map_stat` wholesale, so the SCC has to drive the line afterwards. Lock order
-is channel then IOC state, same as the RX thread at `src/z85c30.rs:982`.
+## rr0 is what unblocks the console, not the interrupt
 
-## Measured on an IRIX 6.5 Indy guest
+Measured by decomposing the change and restoring one doctored snapshot on each
+variant build, fresh overlay per run:
 
-Boot to a root shell, `iris-ci save`, `iris-ci restore`, then sit for 45 s
-sending nothing. Fresh `.diff.chd` overlay for each run, one run per tree.
+| tree | rr0 at restore | IRQ raised | guest's first act | console |
+|---|---|---|---|---|
+| unfixed | `0x28` | no | `rd RR0 -> 28`, stop | silent |
+| unfixed | `0x2c` | no | `write_data` | alive |
+| latch and `update_ip` only | `0x28` | yes | `rd L0_STAT`, `rd RR0 -> 28`, stop | silent |
+| full fix | `0x2c` | yes | `rd L0_STAT`, `write_data` | alive |
 
-- Unfixed tree: no bytes at all. Injecting a newline and waiting 15 s produced
-  no bytes either.
-- Fixed tree: the console immediately carried `PANIC: KERNEL FAULT / EXC
-  code:128, 'Software detected SEGV'` and the whole crash-dump progress.
+A build carrying only the latch re-arm and the `update_ip` call raises the
+interrupt and the guest ISR takes it, reads RR0, sees the stale busy bit and
+gives up. rr0 is necessary and sufficient. The interrupt is neither.
 
-So the fix does restore console output across a snapshot load. It does not make
-restore usable, because of the next section.
+IRIX drives the console two ways, which is why. The PROM console and the kernel
+panic printer are **polled**, `wr1` being `0x00` and `0x11` respectively. Only
+the normal tty path enables TX interrupts, with `wr1 = 0x13`.
 
-## Restore corrupts the guest, and that is a different bug
+## The mid-write window is rare in practice
 
-Every restore observed on this image left IRIX damaged, on both trees.
-`iris-ci run` times out afterwards because the shell it is talking to is gone,
-not because the SCC is wedged. Symptoms seen across runs:
+`save_snapshot` and `capture_rollback_checkpoint` both open with
+`Machine::stop()`, which joins the TX thread and lets the driver's ISR settle.
+Four snapshots taken organically with `iris-ci save`, two at a login prompt, one
+at an idle root shell, one two seconds into a console burst, all captured
+channel B as `wr1 = 0x11`, `status = 0x2c`. TX interrupts disabled,
+`TX_BUFFER_EMPTY` already set, `RX_CHAR_AVAILABLE` already clear: **all three
+arms of the fix are no-ops there**, and the fixed and unfixed trees produced
+byte-identical `scc.bin`. Reaching the state the fix targets required doctoring
+a real snapshot to `wr1 = 0x13` / `status = 0x28`.
 
-- `PANIC: KERNEL FAULT ... Software detected SEGV`
-- `ALERT: Process [sysevent] ... process or stack limit exceeded`
-- `ALERT: XFS internal error XFS_WANT_CORRUPTED_GOTO at ... xfs_alloc.c`
-- `NOTICE - cpu 0 has duplicate tlb entries (13, 24)`
+## Why `update_ip` is still right
 
-Two further facts worth knowing before debugging that:
+`load_snapshot_inner` calls `power_on_devices()`, which reaches `Channel::reset()`
+and drops `map_stat` SERIAL. `Ioc::load_state` then restores `map_stat` wholesale
+and can re-assert it, leaving the IOC holding the line while both channels report
+`get_ip() == 0`.
 
-- Restoring into a process that was never `start`ed gives total silence and a
-  CPU thread spinning at 100 %. `iris-ci start` first, even only as far as the
-  PROM `Option?` menu, and the same snapshot comes back to a working shell.
-  Identical on both trees.
-- The guest state is sticky across runs. With CHD images the COW overlay is
-  `<base>.chd.diff.chd` beside the image, not the `/tmp/iris-ci-<pid>-scsi<id>`
-  path the raw-image rule describes, and it is not per-pid. A guest that
-  panicked in one run boots into `savecore` in the next and behaves differently.
-  Delete the `.diff.chd` between A/B runs or the comparison is worthless.
+That disagreement was tested directly by doctoring `ioc.bin` `map_stat` to `0x20`
+with `scc.bin` untouched. It yields **one** spurious interrupt, not a storm: the
+guest's first SCC register write calls `update_ip`, which calls `set_level(false)`
+and clears SERIAL by itself. `rd RR3` after restore was 0 on every unfixed-tree
+run traced.
+
+Ordering therefore matters. `Machine::load_snapshot` runs `Ioc::load_state`
+before `scc().load_state`, so the SCC drives the line afterwards. Lock order is
+channel then IOC state, matching `write_a_control`, which holds both channel
+locks across `update_ip`.
 
 ## Why the round-trip test could not catch any of it
 
 `save_load_round_trip` asserts `save_state == load_state -> save_state`.
-`tx_int_pending`, `rx_queue` and `tx_queue` are not in `save_state` at all, so
-destroying them on load is invisible to it. Nor does the shape reach anything
-outside the device: `ip_num` and the IRQ callback are not serialized either.
+`channel_to_toml` serializes only `regs`, `reg_ptr` and `status`, and the v2
+`.bin` path is postcard over the same `toml::Value`, so no second serialization
+carries the queues. Clearing a field on load is symmetric under that comparison,
+and a status bit contradicting a queue is invisible because the queues are never
+compared.
 
-A round-trip test proves serialization is self-consistent. Proving the restored
-device still works needs a functional test: load into a device built with a
-recording `IrqCallback` and assert on delivery, not on field equality. See
-`restore_drives_irq_line_to_parent` in `src/z85c30.rs`.
+**That shape cannot catch a cleared-field bug or a state-consistency bug.** Use a
+functional restore test that asserts observable behaviour after load: RR3 as a
+guest ISR would read it, or delivery into a recording `IrqCallback`. See
+`restore_rearms_tx_interrupt` and `restore_drives_irq_line_to_parent`.
+
+## Restore is still unusable on IRIX 6.5
+
+Fixing this does not make snapshots work. Every restore traced left the guest
+kernel dead on both trees:
+
+- `PANIC: KERNEL FAULT`, variously `Software detected SEGV`, `Read Address Error`
+  and `Read TLB Miss`
+- `ALERT: XFS internal error XFS_WANT_CORRUPTED_GOTO`
+- `NOTICE - cpu 0 has duplicate tlb entries`
+
+The panic PC is stable for a given guest state and varies between states, so it
+tracks what was running rather than being random. Quiescence does not help: an
+idle root shell snapshotted after `sync; sync` and 10 s of quiet panicked like
+the rest. The fix makes the panic audible rather than silent.
+
+One contributing cause is recorded separately in
+`chd-snapshots-do-not-capture-the-disk.md`. A raw-image run panicked too, so
+that is not the whole story.
+
+## Two things that will waste your time
+
+- Restoring into a process that was never `start`ed gives silence and a pinned
+  CPU thread, with **zero** SCC and IOC register accesses in the window. It is
+  not an ISR storm, it is spinning somewhere else. Note also that `idle-pause` is
+  off by default, so `MIPS-CPU` sits at 100% at a healthy idle shell too: use
+  register-access counts, not CPU percentage, to tell a wedged guest from a live
+  one.
+- `iris-ci` flakes under load with `connect ...: Resource temporarily unavailable
+  (os error 11)`, which aborts `boot` early and looks like a boot failure. Retry.
