@@ -1251,6 +1251,10 @@ impl Device for MemoryController {
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
+        // A stale anchor makes the first update_timers bill the guest for the
+        // pause. Catches every mc.stop()/start() pair; a CPU-only pause is
+        // still billed, since it never stops the MC.
+        self.state.lock().last_host_ticks = crate::platform::get_host_ticks();
         let mc = self.clone();
         self.threads.lock().push(thread::Builder::new().name("MC-DMA".to_string()).spawn(move || {
             mc.dma_worker();
@@ -1542,6 +1546,26 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "MemoryController save_state mismatch after load_state round-trip");
+    }
+
+    /// Fails at 1.5e9 counts without the re-anchor in `start()`.
+    #[test]
+    fn start_reanchors_timebase() {
+        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let mc = MemoryController::new(eeprom, true, [0u32; 4]);
+
+        let freq = crate::platform::get_host_tick_frequency();
+        mc.state.lock().last_host_ticks =
+            crate::platform::get_host_ticks().wrapping_sub(freq * 100);
+
+        mc.start();
+        let rpss = mc.read32(MC_BASE + REG_RPSS_CTR).data;
+        mc.stop();
+
+        // The 100 s stale interval is 1.5e9 counts at 50 MHz through DIV=10
+        // INC=3. 15e6 is one second at that same rate.
+        assert!(rpss < 15_000_000,
+            "RPSS_CTR advanced {rpss} counts across a stopped interval");
     }
 
     #[test]
