@@ -262,6 +262,18 @@ impl L1DTag {
     pub fn line_addr(&self) -> u64 { self.ptag & !0xFFF }
 }
 
+/// On-disk encoding of the `dc_tags` words. Format 1 had no marker key and put
+/// `dirty` in bit 27; format 2 puts it in bit 0. Bumped independently of
+/// `SCHEMA_VERSION` because the migration is local to this file.
+pub const DC_TAG_FORMAT: u32 = 2;
+
+/// Move `dirty` from bit 27 to bit 0. Lossless in this direction: bit 27 is
+/// raw_ptag bit 19, so a real address would need physical bit 31 set, and the
+/// machine's highest mapped address is `HIMEM_END` at 0x3000_0000.
+fn migrate_dc_tag_word(w: u32) -> u32 {
+    (w & !(1 << 27)) | ((w >> 27) & 1)
+}
+
 // dirty lives in bit 0, not bit 27. Bit 27 of this word is raw_ptag bit 19,
 // which is physical address bit 31, so a dirty line used to deserialize with
 // its tag 2 GB too high. It then matched nothing, was never written back, and
@@ -275,7 +287,10 @@ impl From<u32> for L1DTag {
         Self {
             ptag:  if cs != 0 { line | 1 } else { 0 },
             cs,
-            dirty: v & 1 != 0,
+            // Gated on cs because writeback_l1d_line checks dirty without
+            // checking validity, so an invalid line decoding as dirty would be
+            // written back from nowhere.
+            dirty: cs != 0 && v & 1 != 0,
         }
     }
 }
@@ -2789,6 +2804,7 @@ impl R4000Cache {
         let mut t = toml::value::Table::new();
         t.insert("ic_tags".into(),  u32_slice_to_toml(&ic_tags));
         t.insert("dc_tags".into(),  u32_slice_to_toml(&dc_tags));
+        t.insert("dc_tag_format".into(), toml::Value::Integer(DC_TAG_FORMAT as i64));
         t.insert("dc_data".into(),  u64_slice_to_toml(&dc_data));
         t.insert("l2_tags".into(),  u32_slice_to_toml(&l2_tags));
         t.insert("l2_data".into(),  u64_slice_to_toml(&l2_data));
@@ -2825,6 +2841,14 @@ impl R4000Cache {
 
         if let Some(f) = get_field(v, "ic_tags") { load_u32_slice(f, &mut ic_tags); }
         if let Some(f) = get_field(v, "dc_tags") { load_u32_slice(f, &mut dc_tags); }
+        // Snapshots written before dc_tag_format existed put dirty in bit 27,
+        // which is raw_ptag bit 19 and so physical address bit 31. Migrate them
+        // rather than misread them: reaching bit 31 needs 2 GB and the machine's
+        // highest mapped physical address is HIMEM_END at 0x3000_0000, so an old
+        // word with bit 27 set can only be a dirty line, never a real address.
+        if get_field(v, "dc_tag_format").and_then(toml_u32).unwrap_or(1) < DC_TAG_FORMAT {
+            for w in dc_tags.iter_mut() { *w = migrate_dc_tag_word(*w); }
+        }
         if let Some(f) = get_field(v, "dc_data") { load_u64_slice(f, &mut dc_data); }
         if let Some(f) = get_field(v, "l2_tags") { load_u32_slice(f, &mut l2_tags); }
         if let Some(f) = get_field(v, "l2_data") { load_u64_slice(f, &mut l2_data); }
@@ -2894,28 +2918,62 @@ mod l1dtag_tests {
 
     /// A dirty line must deserialize to the address it was serialized from.
     /// Serializing dirty into bit 27 aliased physical address bit 31, so this
-    /// asserted 0x0d34_6000 and got 0x8d34_6000.
+    /// asserted 0x0 and got 0x8000_0000.
     #[test]
     fn dirty_l1d_tag_keeps_its_address() {
-        for &phys in &[0x0000_0000u64, 0x0d34_6000, 0x1f00_0000, 0x0fff_f000] {
-            for &dirty in &[false, true] {
-                let t = L1DTag::valid(phys, 3, dirty);
-                let round: L1DTag = u32::from(t).into();
-                assert_eq!(round.line_addr(), phys,
-                    "L1DTag address changed: phys={:#x} dirty={}", phys, dirty);
-                assert_eq!(round.dirty, dirty, "dirty lost: phys={:#x}", phys);
-                assert_eq!(round.cs, 3, "cs lost: phys={:#x}", phys);
-                assert!(round.matches_phys(phys),
-                    "restored tag no longer matches its own line: phys={:#x} dirty={}", phys, dirty);
+        // 0x2000_0000 is himem, real memory per physical.rs HIMEM_BASE.
+        // 0x8000_0000 is the address whose bit 31 the old encoding aliased: a
+        // clean line there used to come back dirty and get written over RAM.
+        for &phys in &[0x0000_0000u64, 0x0d34_6000, 0x1f00_0000, 0x0fff_f000,
+                       0x2000_0000, 0x2fff_f000, 0x8000_0000] {
+            // cs 2 with dirty set is the dominant real state: mark_l1d_dirty
+            // sets dirty without touching cs.
+            for cs in 1u8..=3 {
+                for &dirty in &[false, true] {
+                    let t = L1DTag::valid(phys, cs, dirty);
+                    let round: L1DTag = u32::from(t).into();
+                    assert_eq!(round.line_addr(), phys,
+                        "L1DTag address changed: phys={:#x} cs={} dirty={}", phys, cs, dirty);
+                    assert_eq!(round.dirty, dirty,
+                        "dirty lost: phys={:#x} cs={}", phys, cs);
+                    assert_eq!(round.cs, cs, "cs lost: phys={:#x}", phys);
+                    assert!(round.matches_phys(phys),
+                        "restored tag no longer matches its own line: phys={:#x} cs={} dirty={}",
+                        phys, cs, dirty);
+                }
             }
         }
     }
 
-    /// An invalid tag must stay invalid, and must not acquire a dirty bit.
+    /// An invalid tag must stay invalid, and a bare dirty bit must not conjure a
+    /// valid one. `writeback_l1d_line` checks `dirty` without checking validity,
+    /// so a `{cs: 0, dirty: true}` tag would be written back from nowhere.
     #[test]
     fn invalid_l1d_tag_round_trips() {
         let round: L1DTag = u32::from(L1DTag::default()).into();
         assert_eq!(round, L1DTag::default());
+
+        let bare_dirty: L1DTag = 1u32.into();
+        assert!(!bare_dirty.is_valid(), "cs=0 word decoded as valid");
+        assert!(!bare_dirty.dirty, "invalid line must not decode as dirty");
+    }
+
+    /// A format-1 snapshot put dirty in bit 27, which aliased physical address
+    /// bit 31. Migration must recover both the address and the flag.
+    #[test]
+    fn format1_dc_tag_word_migrates() {
+        for &phys in &[0x0000_0000u64, 0x0d34_6000, 0x2fff_f000] {
+            for &dirty in &[false, true] {
+                let raw_ptag = (phys >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
+                let old = (raw_ptag << 8) | (3 << 6) | (if dirty { 1 << 27 } else { 0 });
+                let migrated: L1DTag = migrate_dc_tag_word(old).into();
+                assert_eq!(migrated.line_addr(), phys,
+                    "migration lost the address: phys={:#x} dirty={}", phys, dirty);
+                assert_eq!(migrated.dirty, dirty,
+                    "migration lost dirty: phys={:#x}", phys);
+                assert_eq!(migrated.cs, 3, "migration lost cs: phys={:#x}", phys);
+            }
+        }
     }
 }
 

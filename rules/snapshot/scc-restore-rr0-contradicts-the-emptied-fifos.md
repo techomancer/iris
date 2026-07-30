@@ -11,9 +11,9 @@ reached through `save_snapshot` at all; forcing it is defensive hardening.
 Measurements for both are below.
 
 Neither fixes the failure this was found while chasing, a guest that survives
-`iris-ci restore` alive but silent. That has a separate cause, still undiagnosed,
-and it is **not** the SCC: the panic is byte-identical on the fixed and unfixed
-trees. See the last section.
+`iris-ci restore` alive but silent. That had a separate cause, since fixed and
+recorded in `l1d-dirty-bit-aliased-physical-address-bit-31.md`. It was never the
+SCC: the panic was byte-identical on the fixed and unfixed trees.
 
 ## What `channel_from_toml` got wrong
 
@@ -157,62 +157,29 @@ it. Dropping the queues is defensible, because in-flight console bytes are not
 worth persisting. Deriving `tx_int_pending` from WR1 and WR5 is a guess at a
 field that could simply have been saved.
 
-## Restore is still unusable on IRIX 6.5
+## The panic that led here was something else, and it is fixed
 
-Fixing this does not make snapshots work. Every restore traced left the guest
-kernel dead on both trees:
+**Nothing in this note is the cause of the post-restore kernel panic.** That was
+`dirty` serialized into bit 27 of the L1D tag word, which aliased physical
+address bit 31. See
+`l1d-dirty-bit-aliased-physical-address-bit-31.md`, which also carries the dead
+ends and the oracle guidance from this investigation.
 
-- `PANIC: KERNEL FAULT`, variously `Software detected SEGV`, `Read Address Error`
-  and `Read TLB Miss`
-- `ALERT: XFS internal error XFS_WANT_CORRUPTED_GOTO`
-- `NOTICE - cpu 0 has duplicate tlb entries`
+Two results from here are worth keeping because they bound the search:
 
-The panic PC is stable for a given guest state and varies between states, so it
-tracks what was running rather than being random. Quiescence does not help: an
-idle root shell snapshotted after `sync; sync` and 10 s of quiet panicked like
-the rest.
+- **The SCC is not the cause.** One snapshot restored on three binaries, `main`,
+  the fixed tree, and the fixed tree plus a CPU re-derivation patch, produced a
+  byte-identical panic each time. That snapshot's channel B has `wr1 = 0x11` and
+  `status = 0x2c`, so every arm of the SCC fix is an arithmetic no-op on it.
+- **The restore machinery works below the OS.** At the PROM `Option?` menu,
+  `save prom1` then `restore prom1` then `serial-send 5` gives a live Command
+  Monitor prompt, so whatever was broken was specific to a booted IRIX.
 
-**The SCC is not the cause.** Restoring one snapshot on three binaries, fixed
-tree, `main`, and fixed plus a CPU re-derivation patch, produced a
-byte-identical panic each time. That snapshot's channel B has `wr1 = 0x11` and
-`status = 0x2c`, so every arm of the fix is an arithmetic no-op on it.
-
-**The restore machinery works below the OS.** At the PROM `Option?` menu,
-`save prom1` then `restore prom1` then `serial-send 5` gives a live Command
-Monitor prompt. Whatever is broken is specific to a booted IRIX.
-
-Ruled out, each with a measurement:
-
-- **The CHD disk-capture hole**, recorded in
-  `chd-snapshots-do-not-capture-the-disk.md`. A raw image did capture
-  `scsi1.overlay` with a real dirty list and still panicked, n=2, and an
-  in-place restore seconds after the save moves the disk by milliseconds and
-  panics anyway. The hole is real but it is not this.
-- **The JIT.** `[jit] enabled = false` gives a byte-identical panic, same PC,
-  same bad address.
-- **`power_on_devices()` on restore.** Gated off: byte-identical panic.
-- **CPU dispatch re-derivation.** Instrumented as `changed=false`, because IRIX
-  6.5 on IP22 runs the kernel with KX=0 and FR=0, so the reset-derived state
-  already matches. A latent hole all the same, see below.
-- **`wd33c93a` in-flight transfer state**, which `load_state` clears in the same
-  invisible way the SCC did. `asr = 0x00` in the snapshot, so the controller was
-  idle and the clears are no-ops.
-- **Cache tag serialization** and **RAM restore**, both lossless at this size.
-
-What is left is state that is **not in the snapshot at all**, which is why a
-round-trip diff cannot see it: re-saving immediately after
-`load_snapshot_inner` and running `iris-ci diff` reports every device unchanged
-except `rtc`, and 0 of 4128 memory chunks changed. Untested candidates:
-`core.cycles` and `cp0_random_cycle`, which feed `update_random` and therefore
-which entry `TLBWR` replaces, and `duplicate tlb entries` is a
-TLB-replacement symptom; the HPC3 `PdmaChannel` fields `eox`, `eop`, `xie`,
-`rown`, `last_rx_ctrl`, `transaction_id`, `bytes_transferred`; and RTC time
-re-anchoring.
-
-A component bisect was attempted and is inconclusive by construction.
-"Restore only X" wedges the guest whatever X is, because registers from time T
-against RAM from T+delta is inherently inconsistent. The valid form is "restore
-everything except X", at one 7-minute boot per fatal arm.
+An earlier revision of this note listed "cache tag serialization, lossless at
+this size" among the things ruled out with a measurement. That was wrong: the
+argument was static, about the tag types not being lossy, and it missed the bit
+aliasing entirely. Left recorded here because a confident static exclusion that
+turns out to be the bug is worth remembering.
 
 ## Two things that will waste your time
 
@@ -226,10 +193,13 @@ everything except X", at one 7-minute boot per fatal arm.
   (os error 11)`, which aborts `boot` early and looks like a boot failure. Retry.
 - `PANIC: stack underflow/overflow` after a restore has been blamed on having an
   NFS export mounted in the guest. It is not NFS. The same panic appeared on a
-  raw image with no NFS mount anywhere, so it is the general restore bug wearing
-  a different hat.
-- `chd_extract` writes `<base>.chd.diff.chd` beside the image and ignores
-  `IRIS_CHD_DIFF_DIR`, so it can leave a sibling overlay that silently changes
-  the next run's guest state.
+  raw image with no NFS mount anywhere, so it was the L1D bug wearing a
+  different hat.
+- A sibling `<base>.chd.diff.chd` was observed appearing during an extraction
+  run, which silently changes the next run's guest state. An earlier draft
+  blamed `chd_extract` for ignoring `IRIS_CHD_DIFF_DIR`, and that is wrong:
+  `diff_path_for` (`src/chd_disk.rs:305`) does honour it, and `chd_extract`
+  opens with COW off so it creates no diff at all. Cause not established. Check
+  for a sibling before trusting an A/B.
 - `cp -a` of a live `.diff.chd` gives a torn copy. One reused disk state booted
   straight into `Error during dump: i/o error`. Stop the emulator first.

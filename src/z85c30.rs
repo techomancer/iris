@@ -1072,11 +1072,11 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     if let Some(x) = get_field(v, "status")  { if let Some(n) = toml_u8(x) { ch.status = n; } }
     ch.rx_queue.clear();
     ch.tx_queue.clear();
-    // Both FIFOs are empty now and rr0 has to agree. The model would recover
-    // on its own, since the TX thread sets TX_BUFFER_EMPTY as soon as anything
-    // lands in tx_queue, but the guest never gets that far: IRIX gates its
-    // write on the bit, so a restored status without it deadlocks the driver
-    // against a device waiting to be written to.
+    // Both FIFOs are empty now and rr0 has to agree. IRIX gates its write on
+    // TX_BUFFER_EMPTY, so a restored status without it deadlocks the driver
+    // against a device waiting to be written to. The model cannot rescue it:
+    // the TX thread only sets the bit after popping a character, and only while
+    // WR5 TX_ENABLE is set, so with the FIFO empty nothing ever sets it.
     ch.status |= rr0::TX_BUFFER_EMPTY;
     // RX has no such escape. read_data returns 0 without touching the bit when
     // the queue is empty, so a guest polling a stale RX_CHAR_AVAILABLE spins
@@ -1095,8 +1095,9 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     ch.update_tx_delay();
     // power_on_devices cleared map_stat SERIAL and Ioc::load_state then put it
     // back wholesale, so publish ip_num and redrive the line to keep the two
-    // agreeing. Lock order (channel then IOC state) matches write_a_control,
-    // which holds both channel locks across update_ip.
+    // agreeing. Safe under the channel lock: Ioc::read8 and write8 dispatch to
+    // the SCC before taking ioc::state, deliberately, so the reverse order does
+    // not exist.
     ch.update_ip();
 }
 
@@ -1250,6 +1251,12 @@ mod tests {
     /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
     /// re-serialize byte-identically. Use new_null so the test doesn't bind any
     /// TCP ports.
+    ///
+    /// The fixtures carry TX_BUFFER_EMPTY because restore is deliberately no
+    /// longer an identity on `status`: it forces that bit set and
+    /// RX_CHAR_AVAILABLE clear to match the emptied FIFOs. These values are
+    /// fixed points of that normalization. Do not "fix" the normalization to
+    /// make an arbitrary status round-trip.
     #[test]
     fn save_load_round_trip() {
         let src = Z85c30::new_null(None);
@@ -1358,6 +1365,11 @@ mod tests {
     /// Guard on the re-arm above: a channel whose driver never enabled TX
     /// interrupts must not come back from a restore asserting one. Passes on
     /// the unfixed tree too, which forced the latch false unconditionally.
+    ///
+    /// Asserts the latch directly rather than through RR3. `get_ip` gates the TX
+    /// bit on WR1 independently, so RR3 cannot observe the latch while
+    /// `TX_INT_EN` is clear and an RR3 assertion here would hold even with the
+    /// WR1 conjunct deleted from `channel_from_toml`.
     #[test]
     fn restore_no_tx_int_when_disabled() {
         let src = Z85c30::new_null(None);
@@ -1369,9 +1381,11 @@ mod tests {
 
         let dst = Z85c30::new_null(None);
         dst.load_state(&saved).expect("load_state");
-        dst.channel_a.0.lock().reg_ptr = 3;
 
-        assert_eq!(dst.read_a_control(), 0,
+        let ch = dst.channel_a.0.lock();
+        assert!(!ch.tx_int_pending,
+            "latch must stay clear when WR1 TX_INT_EN is clear");
+        assert_eq!(ch.get_ip(), 0,
             "no TX interrupt when WR1 TX_INT_EN is clear");
     }
 

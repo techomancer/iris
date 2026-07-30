@@ -1251,6 +1251,14 @@ impl Device for MemoryController {
 
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
+        // Re-anchor the refresh/watchdog/RPSS timebase before the guest runs
+        // again. last_host_ticks is a raw host tick count, so any interval the
+        // machine spent stopped is otherwise credited to the guest on the first
+        // MC read: update_timers steps RPSS_CTR forward by that whole interval
+        // at once. Doing it here rather than in load_state covers every pause,
+        // including the bulk memory restore that runs after load_state and the
+        // monitor and gdb-stub stops.
+        self.state.lock().last_host_ticks = crate::platform::get_host_ticks();
         let mc = self.clone();
         self.threads.lock().push(thread::Builder::new().name("MC-DMA".to_string()).spawn(move || {
             mc.dma_worker();
@@ -1463,16 +1471,6 @@ impl Saveable for MemoryController {
             if let Some(r) = get_field(d, "tlb_lo") { load_u32_slice(r, &mut dma.tlb_lo); }
             if let Some(x) = get_field(d, "run_real") { dma.run_real = toml_bool(x).unwrap_or(false); }
         }
-
-        // Re-anchor the refresh/watchdog/RPSS timebase. last_host_ticks is a raw
-        // host tick count, so leaving it at the pre-restore value charges the
-        // guest for every host tick spent inside load_snapshot: the first MC
-        // read after restore credits update_timers with the whole save and load
-        // wall time at once, which wraps REF_CTR thousands of times, blows the
-        // 20-bit watchdog, and steps RPSS_CTR forward by billions of counts.
-        state.last_host_ticks = crate::platform::get_host_ticks();
-        state.cpu_cycle_acc = 0;
-        state.rpss_cycle_acc = 0;
 
         Ok(())
     }

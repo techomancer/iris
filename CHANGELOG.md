@@ -165,23 +165,17 @@ compute the live chunk set.
   again, and was never written back, so every store still in L1D at save time
   silently reverted to the value in RAM. `dirty` now lives in bit 0, outside both
   the ptag and `cs` fields. Restore survival went from 0 of 22 to 20 of 20 across
-  two independent guests, reproduced on a second harness at 7 of 7. **The
-  on-disk `dc_tags` encoding changes: existing snapshots are not repaired and
-  must be retaken.** See
+  two independent guests, reproduced on a second harness at 7 of 7. The on-disk
+  `dc_tags` encoding changes, so `save_cache_state` writes a `dc_tag_format` key
+  and older snapshots are migrated on load rather than misread. See
   `rules/snapshot/l1d-dirty-bit-aliased-physical-address-bit-31.md`.
-- **HPC3 PDMA channel flags were dropped on restore**: `eox`, `eop`, `xie` and
-  `rown` are latched copies of bits in `bc`, and `power_on` cleared them, so
-  `load_pdma_channel` now re-derives them along with `width_16`, `even_high` and
-  `endian` from the restored `bc`, `dmacfg` and `ctrl`. Channels 8, 10 and 11
-  were measured non-default in a live snapshot: `xie=false` means DMA completion
-  raises no IOC line, `eox=false` walks a descriptor chain past its terminator,
-  and `rown=false` hard-refuses RX.
-- **The memory controller charged the guest for the restore itself**:
-  `last_host_ticks` is a raw host tick count that neither `save_state` nor
-  `power_on` reset, so the first MC read after a load credited `update_timers`
-  with the entire save and load wall time. Observed as a single step of
-  `cpu_cycles=16630691385`, `RPSS_CTR` jumping to `0xc88ead47` and the 20-bit
-  watchdog wrapping. Now re-anchored on both reset and load.
+- **The memory controller charged the guest for time it spent stopped**:
+  `last_host_ticks` is a raw host tick count that nothing re-anchored, so the
+  first MC read after any pause credited `update_timers` with the whole interval
+  and stepped `RPSS_CTR` forward by billions of counts. Observed as a single step
+  of `cpu_cycles=16630691385` after a restore, which is 332 s at 50 MHz. Now
+  re-anchored in `MemoryController::start()`, which covers restore, the monitor
+  and the gdb stub.
 - **SCC restore left rr0 contradicting the emptied FIFOs**: `channel_from_toml`
   cleared both queues but kept `status` verbatim. `RX_CHAR_AVAILABLE` restored
   over an empty `rx_queue` has no reachable setter, since `read_data` returns 0
@@ -194,9 +188,8 @@ compute the live chunk set.
   Now sets `TX_BUFFER_EMPTY`, clears `RX_CHAR_AVAILABLE`, re-arms
   `tx_int_pending` when WR1 has `TX_INT_EN` and WR5 has `TX_ENABLE`, and calls
   `update_ip` so the SCC and the IOC's `map_stat` agree after `Ioc::load_state`
-  restores it wholesale. Restore still leaves the kernel damaged for an
-  unrelated and undiagnosed reason, and the panic is byte-identical with and
-  without this change, so `iris-ci run` does not yet survive one. See
+  restores it wholesale. Independent of the L1D tag fix above: the post-restore
+  panic was byte-identical with and without this change. See
   `rules/snapshot/scc-restore-rr0-contradicts-the-emptied-fifos.md`.
 - **CHD snapshots captured no disk state**, recorded but not fixed:
   `cow_export` and `cow_import` match only `DiskBackend::Cow`, while `is_cow`

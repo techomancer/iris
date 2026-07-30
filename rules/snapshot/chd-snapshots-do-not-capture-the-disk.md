@@ -4,8 +4,8 @@
 **Category:** snapshot
 
 With a CHD image, `save` writes no disk state and `restore` rolls none back. RAM
-and device state go back in time while the disk stays in the present, which is a
-plausible contributor to the guest kernel corruption seen after every restore.
+and device state go back in time while the disk stays in the present. Unfixed,
+and a real correctness hole for anything that writes to disk across a snapshot.
 
 ## Where it goes wrong
 
@@ -54,6 +54,5 @@ kernel panic after `iris-ci restore` and it is not:
 - An in-place `save` then `restore` seconds later, same process, moves the disk
   by milliseconds and panics anyway.
 
-So the disk being stale cannot be what kills the guest. See
-`scc-restore-rr0-contradicts-the-emptied-fifos.md` for what else has been ruled
-out and what is left.
+So the disk being stale was not what killed the guest. That was the L1D tag
+aliasing recorded in `l1d-dirty-bit-aliased-physical-address-bit-31.md`.
