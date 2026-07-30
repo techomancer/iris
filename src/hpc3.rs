@@ -1875,18 +1875,46 @@ fn save_pdma_channel(chan: &PdmaChannel) -> toml::Value {
     tbl.insert("cpfxbdp".into(), hex_u32(chan.cpfxbdp));
     tbl.insert("ppfxbdp".into(), hex_u32(chan.ppfxbdp));
     tbl.insert("tx_new_packet".into(), toml::Value::Boolean(chan.tx_new_packet));
+    // Latched. `fetch_descriptor` does derive eox/eop/xie/rown from `bc`, but a
+    // raw BC register write updates only eox and xie and leaves eop and rown
+    // stale, so `bc` alone does not reconstruct them.
+    //
+    // The other three are not derivable at all. `PDMA_CTRL_LITTLE` and
+    // `PDMA_CTRL_ACT` are both `1 << 1`, and `PbusDmaOps::write` folds the
+    // written CTRL value into `endian` without ever storing `ctrl`, so on
+    // channels 0-7 a derivation of `endian` from `ctrl` is just `is_active()`.
+    // `width_16` has the same problem on 8-9: the `SCSI_DMACFG` register write
+    // path updates `dmacfg` alone, only `write_dmacfg` also updates `width_16`.
+    tbl.insert("eox".into(),       toml::Value::Boolean(chan.eox));
+    tbl.insert("eop".into(),       toml::Value::Boolean(chan.eop));
+    tbl.insert("xie".into(),       toml::Value::Boolean(chan.xie));
+    tbl.insert("rown".into(),      toml::Value::Boolean(chan.rown));
+    tbl.insert("width_16".into(),  toml::Value::Boolean(chan.width_16));
+    tbl.insert("even_high".into(), toml::Value::Boolean(chan.even_high));
+    tbl.insert("endian".into(),    toml::Value::Boolean(chan.endian));
     toml::Value::Table(tbl)
 }
 
 /// Restore one PdmaChannel's transfer-state registers from a TOML table.
+///
+/// The seven latched booleans are newer than the record, so a snapshot taken
+/// before them has no such keys and each field keeps the value it already has:
+/// `false` for `eox`/`eop`/`xie`/`rown`, which `power_on` clears ahead of the
+/// restore, and the pre-restore run's value for `width_16`/`even_high`/`endian`,
+/// which `power_on` leaves alone.
 fn load_pdma_channel(chan: &mut PdmaChannel, v: &toml::Value) {
     macro_rules! ldu32 { ($f:ident) => {
         if let Some(x) = get_field(v, stringify!($f)) { chan.$f = toml_u32(x).unwrap_or(chan.$f); }
+    }}
+    macro_rules! ldbool { ($f:ident) => {
+        if let Some(x) = get_field(v, stringify!($f)) { chan.$f = toml_bool(x).unwrap_or(chan.$f); }
     }}
     ldu32!(cbp); ldu32!(nbdp); ldu32!(bc); ldu32!(ctrl);
     ldu32!(gio); ldu32!(dev); ldu32!(dmacfg); ldu32!(piocfg);
     ldu32!(crbdp); ldu32!(cpfxbdp); ldu32!(ppfxbdp);
     if let Some(x) = get_field(v, "tx_new_packet") { chan.tx_new_packet = toml_bool(x).unwrap_or(true); }
+    ldbool!(eox); ldbool!(eop); ldbool!(xie); ldbool!(rown);
+    ldbool!(width_16); ldbool!(even_high); ldbool!(endian);
 }
 
 impl Saveable for Hpc3 {
@@ -1922,5 +1950,113 @@ impl Saveable for Hpc3 {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One channel per ops group: PBUS, SCSI, enet RX, enet TX. All twelve go
+    /// through the same record, so a group-specific field such as `even_high`
+    /// still has to survive on every channel.
+    const SAMPLED: [usize; 4] = [0, 8, 10, 11];
+
+    fn hpc3_for_test() -> Hpc3 {
+        Hpc3::with_net(
+            Arc::new(Mutex::new(Eeprom93c56::new())),
+            Ioc::new_ci(true),
+            true,
+            Arc::new(AtomicU64::new(0)),
+            NetworkConfig::default(),
+            true,
+            AudioConfig::default(),
+            // Empty path: nothing on disk to load, and nothing written back.
+            String::new(),
+            Arc::new(AtomicU64::new(0)),
+            true,
+        )
+    }
+
+    fn set_latched_flags(hpc3: &Hpc3) {
+        for &i in SAMPLED.iter() {
+            let mut c = hpc3.pdma_channels[i].lock();
+            c.eox = true;
+            c.eop = true;
+            c.xie = true;
+            c.rown = true;
+            c.width_16 = true;
+            c.even_high = true;
+            c.endian = true;
+        }
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = hpc3_for_test();
+        {
+            let mut st = src.state.lock();
+            st.intstat = HPC3_INTSTAT_SCSI0_DMA | HPC3_INTSTAT_ENET_RX_DMA;
+            st.gio_misc = 0x0000_0003;
+            st.eeprom_reg = 0x0000_00a5;
+            st.pbus_pio[0] = 0xdead_beef;
+            st.pbus_pio[0xfff] = 0x1234_5678;
+        }
+        for (n, &i) in SAMPLED.iter().enumerate() {
+            let mut c = src.pdma_channels[i].lock();
+            let b = 0x1000_0000u32 * (n as u32 + 1);
+            c.cbp = b | 0x40;
+            c.nbdp = b | 0x80;
+            c.bc = 0x0000_0200;
+            c.ctrl = 0x0000_0011;
+            c.gio = b | 0xc0;
+            c.dev = b | 0xd0;
+            c.dmacfg = PBUS_DMACFG_DS16 | PBUS_DMACFG_EVEN_HIGH;
+            c.piocfg = 0x0000_1357;
+            c.crbdp = b | 0x100;
+            c.cpfxbdp = b | 0x110;
+            c.ppfxbdp = b | 0x120;
+            c.tx_new_packet = false;
+        }
+        set_latched_flags(&src);
+        let v1 = src.save_state();
+
+        let dst = hpc3_for_test();
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Hpc3 save_state mismatch after load_state round-trip");
+    }
+
+    /// The round trip above passes even when a field is dropped from both
+    /// halves, which is how these seven went missing. Restoring into a device
+    /// whose flags sit at their defaults is the direction that notices.
+    #[test]
+    fn latched_flags_reach_a_fresh_device() {
+        let src = hpc3_for_test();
+        set_latched_flags(&src);
+        let saved = src.save_state();
+
+        let dst = hpc3_for_test();
+        // The real restore path calls this before load_state.
+        dst.power_on();
+        for &i in SAMPLED.iter() {
+            let c = dst.pdma_channels[i].lock();
+            assert!(!c.eox && !c.eop && !c.xie && !c.rown, "chan {} latches not at default", i);
+            assert!(!c.width_16 && !c.even_high && !c.endian, "chan {} config not at default", i);
+        }
+
+        dst.load_state(&saved).expect("load_state");
+
+        for &i in SAMPLED.iter() {
+            let c = dst.pdma_channels[i].lock();
+            assert!(c.eox, "chan {} lost eox", i);
+            assert!(c.eop, "chan {} lost eop", i);
+            assert!(c.xie, "chan {} lost xie", i);
+            assert!(c.rown, "chan {} lost rown", i);
+            assert!(c.width_16, "chan {} lost width_16", i);
+            assert!(c.even_high, "chan {} lost even_high", i);
+            assert!(c.endian, "chan {} lost endian", i);
+        }
     }
 }
