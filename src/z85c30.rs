@@ -1070,11 +1070,22 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     if let Some(r) = get_field(v, "regs")    { load_u8_slice(r, &mut ch.regs); }
     if let Some(x) = get_field(v, "reg_ptr") { if let Some(n) = toml_u8(x) { ch.reg_ptr = n; } }
     if let Some(x) = get_field(v, "status")  { if let Some(n) = toml_u8(x) { ch.status = n; } }
-    // Clear transient state — in-flight data and interrupt latches are lost on restore.
     ch.rx_queue.clear();
     ch.tx_queue.clear();
-    ch.tx_int_pending = false;
+    // A stale RX_CHAR_AVAILABLE has no setter left over an empty queue: read_data
+    // returns 0 without touching it, so a guest polling RR0 spins forever.
+    ch.status &= !rr0::RX_CHAR_AVAILABLE;
+    ch.status |= rr0::TX_BUFFER_EMPTY;
+    // notify_tx_empty is the only setter and its character went out with tx_queue.
+    // Gated on WR5 as well because the TX thread only ever latches while
+    // TX_ENABLE is set, so a latch without it is a state the model cannot reach.
+    let wr1_val = ch.regs[scc_regs::WR1 as usize];
+    let wr5_val = ch.regs[scc_regs::WR5 as usize];
+    ch.tx_int_pending = (wr1_val & wr1::TX_INT_EN) != 0 && (wr5_val & wr5::TX_ENABLE) != 0;
     ch.update_tx_delay();
+    // Ioc::load_state restores map_stat wholesale after power_on_devices cleared
+    // SERIAL, so the SCC redrives the line last.
+    ch.update_ip();
 }
 
 impl Saveable for Z85c30 {
@@ -1226,6 +1237,10 @@ mod tests {
     /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
     /// re-serialize byte-identically. Use new_null so the test doesn't bind any
     /// TCP ports.
+    ///
+    /// The `status` fixtures below are already normalized against empty FIFOs
+    /// (`TX_BUFFER_EMPTY` set, `RX_CHAR_AVAILABLE` clear) because restore is
+    /// deliberately not an identity on that field; do not "fix" them back.
     #[test]
     fn save_load_round_trip() {
         let src = Z85c30::new_null(None);
@@ -1236,7 +1251,7 @@ mod tests {
             ch.regs[3]  = 0xc1;
             ch.regs[5]  = 0xea;
             ch.reg_ptr  = 7;
-            ch.status   = 0x40;
+            ch.status   = 0x44;
         }
         {
             let mut ch = src.channel_b.0.lock();
@@ -1244,7 +1259,7 @@ mod tests {
             ch.regs[2]  = 0x10;
             ch.regs[15] = 0x05;
             ch.reg_ptr  = 3;
-            ch.status   = 0x80;
+            ch.status   = 0x84;
         }
         let v1 = src.save_state();
 
@@ -1308,5 +1323,127 @@ mod tests {
         assert_eq!(received.len(), line.len(),
             "expected {} bytes, got {} (lossy rx_queue?)", line.len(), received.len());
         assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
+    }
+
+    #[test]
+    fn restore_clears_rx_char_available() {
+        let src = Z85c30::new_null(None);
+        src.channel_a.0.lock().status |= rr0::RX_CHAR_AVAILABLE;
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        assert_eq!(dst.channel_a.0.lock().status & rr0::RX_CHAR_AVAILABLE, 0,
+            "restore emptied rx_queue, and `read_data` leaves the bit alone on an \
+             empty queue, so a guest polling RR0 would never see it drop");
+    }
+
+    #[test]
+    fn restore_forces_tx_buffer_empty() {
+        let src = Z85c30::new_null(None);
+        src.channel_a.0.lock().status &= !rr0::TX_BUFFER_EMPTY;
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        assert_ne!(dst.channel_a.0.lock().status & rr0::TX_BUFFER_EMPTY, 0,
+            "a guest that gates its write on TX_BUFFER_EMPTY would wait on a \
+             transmitter whose queue restore already emptied");
+    }
+
+    #[test]
+    fn restore_rearms_tx_int_pending() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        assert!(dst.channel_a.0.lock().tx_int_pending,
+            "clearing tx_queue destroyed the character whose completion would \
+             have driven the only setter, `notify_tx_empty`");
+    }
+
+    /// Mutation guard. The assertion has to be on the field, not on RR3:
+    /// `get_ip` gates the Tx bit on WR1 independently, so an RR3 assertion
+    /// stays green even with the WR1 conjunct deleted from `channel_from_toml`.
+    #[test]
+    fn restore_leaves_latch_disarmed_when_tx_int_disabled() {
+        let src = Z85c30::new_null(None);
+        src.channel_a.0.lock().regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        assert!(!dst.channel_a.0.lock().tx_int_pending,
+            "WR1 has TX_INT_EN clear, so nothing should be latched");
+    }
+
+    /// The other half of the gate. `get_ip` ignores WR5, so this is unobservable
+    /// through RR3 and has to assert the latch itself.
+    #[test]
+    fn restore_leaves_latch_disarmed_when_transmitter_disabled() {
+        let src = Z85c30::new_null(None);
+        src.channel_a.0.lock().regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        assert!(!dst.channel_a.0.lock().tx_int_pending,
+            "WR5 has TX_ENABLE clear, so the TX thread could never have latched");
+    }
+
+    /// `read_b_control` returns 0 for RR3, so B's interrupt reaches the guest
+    /// only through A's RR3 via the shared `ip_other` atomic that `update_ip`
+    /// publishes. `machine.rs` puts the CI console on B.
+    #[test]
+    fn restore_channel_b_tx_int_reaches_rr3_via_a() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_b.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        dst.channel_a.0.lock().reg_ptr = scc_regs::RR3;
+        assert_eq!(dst.read_a_control() & (1 << 1), 1 << 1,
+            "B's Tx IP occupies bits 2..0 of A's RR3");
+    }
+
+    #[test]
+    fn restore_redrives_irq_line() {
+        struct Line(AtomicBool);
+        impl IrqCallback for Line {
+            fn set_level(&self, level: bool) { self.0.store(level, Ordering::SeqCst); }
+        }
+
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let line = Arc::new(Line(AtomicBool::new(false)));
+        let dst = Z85c30::new_null(Some(line.clone()));
+        dst.load_state(&saved).expect("load_state");
+
+        assert!(line.0.load(Ordering::SeqCst),
+            "`power_on_devices` cleared map_stat SERIAL and `Ioc::load_state` \
+             restored it wholesale, so only the SCC can put the line back up");
     }
 }
