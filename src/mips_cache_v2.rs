@@ -262,6 +262,11 @@ impl L1DTag {
     pub fn line_addr(&self) -> u64 { self.ptag & !0xFFF }
 }
 
+// dirty lives in bit 0, not bit 27. Bit 27 of this word is raw_ptag bit 19,
+// which is physical address bit 31, so a dirty line used to deserialize with
+// its tag 2 GB too high. It then matched nothing, was never written back, and
+// every store still sitting in L1D at snapshot time silently reverted to the
+// value in RAM. Bits [5:0] are outside both the ptag and cs fields.
 impl From<u32> for L1DTag {
     fn from(v: u32) -> Self {
         let raw_ptag = (v >> 8) & L1_PTAG_MASK;
@@ -270,14 +275,14 @@ impl From<u32> for L1DTag {
         Self {
             ptag:  if cs != 0 { line | 1 } else { 0 },
             cs,
-            dirty: (v >> 27) & 1 != 0,
+            dirty: v & 1 != 0,
         }
     }
 }
 impl From<L1DTag> for u32 {
     fn from(t: L1DTag) -> Self {
         let raw_ptag = (t.line_addr() >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
-        (raw_ptag << 8) | ((t.cs as u32 & 0x3) << 6) | (if t.dirty { 1 << 27 } else { 0 })
+        (raw_ptag << 8) | ((t.cs as u32 & 0x3) << 6) | (t.dirty as u32)
     }
 }
 
@@ -2883,6 +2888,37 @@ impl R4000Cache {
 // =============================================================================
 // Cache correctness tests
 // =============================================================================
+#[cfg(test)]
+mod l1dtag_tests {
+    use super::*;
+
+    /// A dirty line must deserialize to the address it was serialized from.
+    /// Serializing dirty into bit 27 aliased physical address bit 31, so this
+    /// asserted 0x0d34_6000 and got 0x8d34_6000.
+    #[test]
+    fn dirty_l1d_tag_keeps_its_address() {
+        for &phys in &[0x0000_0000u64, 0x0d34_6000, 0x1f00_0000, 0x0fff_f000] {
+            for &dirty in &[false, true] {
+                let t = L1DTag::valid(phys, 3, dirty);
+                let round: L1DTag = u32::from(t).into();
+                assert_eq!(round.line_addr(), phys,
+                    "L1DTag address changed: phys={:#x} dirty={}", phys, dirty);
+                assert_eq!(round.dirty, dirty, "dirty lost: phys={:#x}", phys);
+                assert_eq!(round.cs, 3, "cs lost: phys={:#x}", phys);
+                assert!(round.matches_phys(phys),
+                    "restored tag no longer matches its own line: phys={:#x} dirty={}", phys, dirty);
+            }
+        }
+    }
+
+    /// An invalid tag must stay invalid, and must not acquire a dirty bit.
+    #[test]
+    fn invalid_l1d_tag_round_trips() {
+        let round: L1DTag = u32::from(L1DTag::default()).into();
+        assert_eq!(round, L1DTag::default());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
