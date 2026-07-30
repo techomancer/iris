@@ -36,7 +36,11 @@ use toml::Value;
 /// writes a tiny `chunks.bin` manifest of per-bank/per-framebuffer chunk
 /// hashes. Two snapshots from the same parent share 95–99% of chunks, so a
 /// fresh save-after-bundle-install costs only the bytes that changed.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// v3 → v4: the L1D cache tag moved to the Figure 11-4 field positions. A v3
+/// reader would take a v4 tag as clean and drop the line without writing it
+/// back, so the bump is what makes it refuse the snapshot instead.
+pub const SCHEMA_VERSION: u32 = 4;
 
 const MANIFEST_FILE: &str = "snapshot.toml";
 

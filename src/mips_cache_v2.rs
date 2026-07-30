@@ -229,7 +229,9 @@ impl From<L1ITag> for u32 {
 //   cs    = Cache State byte: 0=Invalid, 1=Shared, 2=CleanExclusive, 3=DirtyExclusive
 //   dirty = write-back bit — separate byte for branch-free set on every write
 //
-// On-wire (CP0 TagLo) format:  [31:8] raw_ptag  [7:6] cs  (dirty not in TagLo)
+// On-wire format is the physical D-cache line tag, R4400 manual Figure 11-4:
+//   [27] W (write-back)  [25:24] CS  [23:0] PTag
+// W' and P are parity over fields we do not model, so they stay zero.
 // Conversion: From<u32>/Into<u32> for snapshot save/load only.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct L1DTag {
@@ -264,21 +266,34 @@ impl L1DTag {
 
 impl From<u32> for L1DTag {
     fn from(v: u32) -> Self {
-        let raw_ptag = (v >> 8) & L1_PTAG_MASK;
-        let cs = ((v >> 6) & 0x3) as u8;
+        let raw_ptag = v & L1_PTAG_MASK;
+        let cs = ((v >> L1D_TAG_CS_SHIFT) & 0x3) as u8;
         let line = (raw_ptag as u64) << L1_PTAG_SHIFT;
         Self {
             ptag:  if cs != 0 { line | 1 } else { 0 },
             cs,
-            dirty: (v >> 27) & 1 != 0,
+            dirty: (v >> L1D_TAG_W_SHIFT) & 1 != 0,
         }
     }
 }
 impl From<L1DTag> for u32 {
     fn from(t: L1DTag) -> Self {
         let raw_ptag = (t.line_addr() >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
-        (raw_ptag << 8) | ((t.cs as u32 & 0x3) << 6) | (if t.dirty { 1 << 27 } else { 0 })
+        raw_ptag | ((t.cs as u32 & 0x3) << L1D_TAG_CS_SHIFT)
+            | ((t.dirty as u32) << L1D_TAG_W_SHIFT)
     }
+}
+
+/// Convert a tag word from before `dc_tag_format`, which put `PTag` at `[31:8]`
+/// so that `W` overlapped its bit 19, physical address bit 31. A v0 word is
+/// ambiguous there, `phys_bit31 | dirty`, and this resolves it in favour of
+/// dirty: no cacheable mapping exists at or above `0x8000_0000`, since the
+/// highest range in `device_map` is `HIMEM_END` at `0x3000_0000`.
+pub fn migrate_l1d_tag_word_v0(word: u32) -> u32 {
+    let raw_ptag = (word >> 8) & L1_PTAG_MASK & !(1 << 19);
+    let cs = (word >> 6) & 0x3;
+    let w = (word >> 27) & 1;
+    raw_ptag | (cs << L1D_TAG_CS_SHIFT) | (w << L1D_TAG_W_SHIFT)
 }
 
 // L2 Cache Tag
@@ -300,6 +315,11 @@ bitfield! {
 pub const L1_PTAG_SHIFT: u32 = 12;
 pub const L1_PTAG_MASK: u32 = 0x00FF_FFFF; // 24-bit field
 pub const L1_INDEX_MASK: u64 = 0xFFF;
+
+/// Serialized L1D tag field positions, R4400 manual Figure 11-4. PTag occupies
+/// [23:0], so CS and W sit above it and nothing overlaps.
+pub const L1D_TAG_CS_SHIFT: u32 = 24;
+pub const L1D_TAG_W_SHIFT: u32 = 27;
 
 /// PTag for L2 covers phys addr bits [35:17]; index supplies bits [16:0]
 pub const L2_PTAG_SHIFT: u32 = 17;
@@ -2784,6 +2804,8 @@ impl R4000Cache {
         let mut t = toml::value::Table::new();
         t.insert("ic_tags".into(),  u32_slice_to_toml(&ic_tags));
         t.insert("dc_tags".into(),  u32_slice_to_toml(&dc_tags));
+        // Absence of this key means dc_tags carries dirty in bit 27. See migrate_l1d_tag_word_v0.
+        t.insert("dc_tag_format".into(), toml::Value::Integer(1));
         t.insert("dc_data".into(),  u64_slice_to_toml(&dc_data));
         t.insert("l2_tags".into(),  u32_slice_to_toml(&l2_tags));
         t.insert("l2_data".into(),  u64_slice_to_toml(&l2_data));
@@ -2823,6 +2845,14 @@ impl R4000Cache {
         if let Some(f) = get_field(v, "dc_data") { load_u64_slice(f, &mut dc_data); }
         if let Some(f) = get_field(v, "l2_tags") { load_u32_slice(f, &mut l2_tags); }
         if let Some(f) = get_field(v, "l2_data") { load_u64_slice(f, &mut l2_data); }
+
+        match get_field(v, "dc_tag_format").and_then(|f| f.as_integer()) {
+            None | Some(0) => {
+                for w in dc_tags.iter_mut() { *w = migrate_l1d_tag_word_v0(*w); }
+            }
+            Some(1) => {}
+            Some(n) => return Err(format!("unknown dc_tag_format {}", n)),
+        }
 
         Self::load_tags_from_u32(self.ic.tags_mut(), &ic_tags);
         Self::load_tags_from_u32(self.dc.tags_mut(), &dc_tags);
@@ -3440,5 +3470,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A dirty L1D tag must round-trip to its own address. Dirty used to be packed
+    /// into bit 27, which is `raw_ptag` bit 19, i.e. physical address bit 31, so
+    /// every dirty line came back 2 GB up. Assert on the XOR so a failure names the
+    /// bit that moved.
+    #[test]
+    fn l1d_tag_dirty_round_trips_address() {
+        // 0x2000_0000 is himem; 0x8000_0000 is the address that owns the aliased bit.
+        for &addr in &[0x0000_1000u64, 0x0400_0000, 0x2000_0000, 0x8000_0000] {
+            // cs 2 with dirty set is the dominant real state: mark_l1d_dirty sets
+            // dirty and leaves cs alone.
+            for cs in 1u8..=3 {
+                let word: u32 = L1DTag::valid(addr, cs, true).into();
+                let back = L1DTag::from(word);
+                assert_eq!(back.line_addr() ^ addr, 0,
+                    "cs={} addr={:#x} round-tripped to {:#x}", cs, addr, back.line_addr());
+                assert!(back.dirty, "cs={} addr={:#x} lost the dirty flag", cs, addr);
+            }
+        }
+    }
+
+    #[test]
+    fn l1d_tag_invalid_stays_invalid() {
+        let word: u32 = L1DTag::default().into();
+        assert_eq!(word, 0);
+        let back = L1DTag::from(word);
+        assert!(!back.is_valid());
+        assert!(!back.dirty);
+    }
+
+    #[test]
+    fn l1d_tag_v0_word_migrates() {
+        let addr = 0x2000_1000u64;
+        let raw_ptag = (addr >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
+
+        // The v0 word carried CS and W independently, so migration keeps both.
+        let dirty_v0 = (raw_ptag << 8) | (L1D_CS_CLEAN_EXCLUSIVE << 6) | (1 << 27);
+        let t = L1DTag::from(migrate_l1d_tag_word_v0(dirty_v0));
+        assert_eq!(t.line_addr(), addr);
+        assert!(t.dirty);
+        assert_eq!(t.cs as u32, L1D_CS_CLEAN_EXCLUSIVE);
+
+        let clean_v0 = (raw_ptag << 8) | (L1D_CS_CLEAN_EXCLUSIVE << 6);
+        let t = L1DTag::from(migrate_l1d_tag_word_v0(clean_v0));
+        assert_eq!(t.line_addr(), addr);
+        assert!(!t.dirty);
+        assert_eq!(t.cs as u32, L1D_CS_CLEAN_EXCLUSIVE);
     }
 }
