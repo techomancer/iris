@@ -1394,6 +1394,7 @@ impl Resettable for MemoryController {
         state.user_semaphores = [false; 16];
         state.cpu_cycle_acc = 0;
         state.rpss_cycle_acc = 0;
+        state.last_host_ticks = crate::platform::get_host_ticks();
 
         let mut dma = self.giodma.state.lock();
         *dma = GioDmaState {
@@ -1462,6 +1463,16 @@ impl Saveable for MemoryController {
             if let Some(r) = get_field(d, "tlb_lo") { load_u32_slice(r, &mut dma.tlb_lo); }
             if let Some(x) = get_field(d, "run_real") { dma.run_real = toml_bool(x).unwrap_or(false); }
         }
+
+        // Re-anchor the refresh/watchdog/RPSS timebase. last_host_ticks is a raw
+        // host tick count, so leaving it at the pre-restore value charges the
+        // guest for every host tick spent inside load_snapshot: the first MC
+        // read after restore credits update_timers with the whole save and load
+        // wall time at once, which wraps REF_CTR thousands of times, blows the
+        // 20-bit watchdog, and steps RPSS_CTR forward by billions of counts.
+        state.last_host_ticks = crate::platform::get_host_ticks();
+        state.cpu_cycle_acc = 0;
+        state.rpss_cycle_acc = 0;
 
         Ok(())
     }
