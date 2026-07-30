@@ -1879,13 +1879,6 @@ fn save_pdma_channel(chan: &PdmaChannel) -> toml::Value {
 }
 
 /// Restore one PdmaChannel's transfer-state registers from a TOML table.
-///
-/// eox/eop/xie/rown, width_16, even_high and endian are latched copies of bits
-/// in bc, dmacfg and ctrl, so they are re-derived rather than serialized.
-/// Exact, not approximate: fetch_descriptor stores the whole descriptor word in
-/// bc, and advance only ever touches its low 14 bits. power_on leaves width_16,
-/// even_high and endian at the pre-restore run's values, so without this a
-/// snapshot loaded into a fresh process disagrees with one loaded in place.
 fn load_pdma_channel(chan: &mut PdmaChannel, v: &toml::Value) {
     macro_rules! ldu32 { ($f:ident) => {
         if let Some(x) = get_field(v, stringify!($f)) { chan.$f = toml_u32(x).unwrap_or(chan.$f); }
@@ -1894,27 +1887,6 @@ fn load_pdma_channel(chan: &mut PdmaChannel, v: &toml::Value) {
     ldu32!(gio); ldu32!(dev); ldu32!(dmacfg); ldu32!(piocfg);
     ldu32!(crbdp); ldu32!(cpfxbdp); ldu32!(ppfxbdp);
     if let Some(x) = get_field(v, "tx_new_packet") { chan.tx_new_packet = toml_bool(x).unwrap_or(true); }
-
-    chan.eox  = (chan.bc & PDMA_DESC_EOX)  != 0;
-    chan.eop  = (chan.bc & PDMA_DESC_EOP)  != 0;
-    chan.xie  = (chan.bc & PDMA_DESC_XIE)  != 0;
-    chan.rown = (chan.bc & PDMA_DESC_ROWN) != 0;
-
-    // dmacfg and ctrl bit meanings differ per channel group: 0-7 PBUS,
-    // 8-9 SCSI, 10-11 ethernet.
-    match chan.id {
-        8 | 9 => {
-            chan.width_16 = (chan.dmacfg & SCSI_DMACFG_DMA16) != 0;
-            chan.endian   = (chan.ctrl & SCSI_CTRL_ENDIAN) != 0;
-        }
-        10 => chan.endian = (chan.ctrl & ENET_RX_CTRL_ENDIAN) != 0,
-        11 => chan.endian = (chan.ctrl & ENET_TX_CTRL_ENDIAN) != 0,
-        _ => {
-            chan.width_16  = (chan.dmacfg & PBUS_DMACFG_DS16) != 0;
-            chan.even_high = (chan.dmacfg & PBUS_DMACFG_EVEN_HIGH) != 0;
-            chan.endian    = (chan.ctrl & PDMA_CTRL_LITTLE) != 0;
-        }
-    }
 }
 
 impl Saveable for Hpc3 {
