@@ -158,6 +158,30 @@ compute the live chunk set.
 - **Z85c30 default constructor binds TCP** 8880/8881 on `new()`; tests
   use `new_null()` instead so two test instances don't race on the same
   ports. Also the right choice for CI mode (which already used it).
+- **Snapshot restore killed a booted IRIX 6.5 guest**: `impl From<L1DTag> for u32`
+  (`src/mips_cache_v2.rs:277`) packed `dirty` into bit 27 of the tag word, which
+  is `raw_ptag` bit 19 and therefore physical address bit 31. Every dirty L1
+  D-cache line deserialized `0x8000_0000` off its own address, never matched
+  again, and was never written back, so every store still in L1D at save time
+  silently reverted to the value in RAM. `dirty` now lives in bit 0, outside both
+  the ptag and `cs` fields. Restore survival went from 0 of 22 to 20 of 20 across
+  two independent guests, reproduced on a second harness at 7 of 7. **The
+  on-disk `dc_tags` encoding changes: existing snapshots are not repaired and
+  must be retaken.** See
+  `rules/snapshot/l1d-dirty-bit-aliased-physical-address-bit-31.md`.
+- **HPC3 PDMA channel flags were dropped on restore**: `eox`, `eop`, `xie` and
+  `rown` are latched copies of bits in `bc`, and `power_on` cleared them, so
+  `load_pdma_channel` now re-derives them along with `width_16`, `even_high` and
+  `endian` from the restored `bc`, `dmacfg` and `ctrl`. Channels 8, 10 and 11
+  were measured non-default in a live snapshot: `xie=false` means DMA completion
+  raises no IOC line, `eox=false` walks a descriptor chain past its terminator,
+  and `rown=false` hard-refuses RX.
+- **The memory controller charged the guest for the restore itself**:
+  `last_host_ticks` is a raw host tick count that neither `save_state` nor
+  `power_on` reset, so the first MC read after a load credited `update_timers`
+  with the entire save and load wall time. Observed as a single step of
+  `cpu_cycles=16630691385`, `RPSS_CTR` jumping to `0xc88ead47` and the 20-bit
+  watchdog wrapping. Now re-anchored on both reset and load.
 - **SCC restore left rr0 contradicting the emptied FIFOs**: `channel_from_toml`
   cleared both queues but kept `status` verbatim. `RX_CHAR_AVAILABLE` restored
   over an empty `rx_queue` has no reachable setter, since `read_data` returns 0
