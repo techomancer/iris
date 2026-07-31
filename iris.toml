@@ -82,7 +82,7 @@ cdrom  = false
 # Change this if 192.168.0.x conflicts with your local network.
 #nat_subnet = "192.168.0.0/24"
 
-# NFS share — requires unfsd on the host.
+# NFS share
 # The shared directory is exported to the VM at <gateway_ip>:/path (standard NFS port 2049).
 # From IRIX: mount <gateway_ip>:/absolute/path /mnt  (default gateway: 192.168.0.1)
 [nfs]

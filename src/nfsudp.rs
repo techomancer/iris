@@ -126,9 +126,27 @@ impl NfsBacking {
         Some(self.attr_from(id, &md))
     }
 
+    /// The fileid of `id`'s parent, clamped at the export root so `..` can never
+    /// walk out of the share.
+    fn parent_id(&mut self, id: u64) -> Option<u64> {
+        let mut rel = self.rel_of(id)?.clone();
+        if !rel.pop() {
+            return Some(ROOT_ID);
+        }
+        Some(self.intern(rel))
+    }
+
     /// Resolve `name` within directory `dirid`, interning the child and
-    /// returning its fileid. Rejects names that could escape the export.
+    /// returning its fileid. `.` and `..` resolve to the directory and its
+    /// parent — clients send `..` over the wire on every DNLC miss, so refusing
+    /// it breaks relative-path navigation. Other escaping names are rejected.
     pub fn lookup(&mut self, dirid: u64, name: &[u8]) -> Option<u64> {
+        if name == b"." || name == b".." {
+            if !self.is_dir(dirid) {
+                return None;
+            }
+            return if name == b"." { Some(dirid) } else { self.parent_id(dirid) };
+        }
         let comp = valid_component(name)?;
         let rel = self.rel_of(dirid)?.join(&comp);
         let abs = self.root.join(&rel);
@@ -138,12 +156,18 @@ impl NfsBacking {
         Some(self.intern(rel))
     }
 
-    /// List `dirid`, returning `(name, fileid, attr)` for each entry. `.` / `..`
-    /// are not included (the wire layer synthesizes them if a client needs them).
+    /// List `dirid`, returning `(name, fileid, attr)` for each entry, `.` and
+    /// `..` first — POSIX readdir includes them and getcwd-style walks need the
+    /// `..` fileid to match what LOOKUP interns.
     pub fn readdir(&mut self, dirid: u64) -> Option<Vec<(Vec<u8>, u64, Attr)>> {
         let dir_rel = self.rel_of(dirid)?.clone();
         let abs = self.root.join(&dir_rel);
         let mut out = Vec::new();
+        for (name, id) in [(b".".to_vec(), dirid), (b"..".to_vec(), self.parent_id(dirid)?)] {
+            if let Some(attr) = self.attr(id) {
+                out.push((name, id, attr));
+            }
+        }
         for ent in std::fs::read_dir(&abs).ok()? {
             let ent = ent.ok()?;
             let name = name_bytes(&ent.file_name());
@@ -1498,7 +1522,42 @@ mod tests {
         let mut b = NfsBacking::new(&root);
         let mut names: Vec<Vec<u8>> = b.readdir(ROOT_ID).unwrap().into_iter().map(|(n, _, _)| n).collect();
         names.sort();
-        assert_eq!(names, vec![b"a".to_vec(), b"b".to_vec(), b"d".to_vec()]);
+        assert_eq!(
+            names,
+            vec![b".".to_vec(), b"..".to_vec(), b"a".to_vec(), b"b".to_vec(), b"d".to_vec()]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dot_and_dotdot_navigate_without_escaping() {
+        let root = temp_export();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let mut b = NfsBacking::new(&root);
+        let a_id = b.lookup(ROOT_ID, b"a").unwrap();
+        let ab_id = b.lookup(a_id, b"b").unwrap();
+
+        assert_eq!(b.lookup(ab_id, b"."), Some(ab_id));
+        assert_eq!(b.lookup(ab_id, b".."), Some(a_id), "`..` is the id LOOKUP interned");
+        assert_eq!(b.lookup(a_id, b".."), Some(ROOT_ID));
+        assert_eq!(b.lookup(ROOT_ID, b".."), Some(ROOT_ID), "`..` stops at the export root");
+
+        // `..` in a listing must carry the parent's fileid — getcwd walks up by
+        // matching the child's fileid against the parent's entries.
+        let ents = b.readdir(ab_id).unwrap();
+        for (_, id, at) in &ents {
+            assert_eq!(at.fileid, *id, "entry fileid must match its attr");
+        }
+        let named: Vec<(Vec<u8>, u64)> = ents.into_iter().map(|(n, id, _)| (n, id)).collect();
+        assert!(named.contains(&(b".".to_vec(), ab_id)));
+        assert!(named.contains(&(b"..".to_vec(), a_id)));
+
+        // A non-directory has neither, and the mutating ops still refuse both.
+        let f = b.create(ROOT_ID, b"f").unwrap();
+        assert!(b.lookup(f, b".").is_none());
+        assert!(b.mkdir(ROOT_ID, b"..").is_none());
+        assert!(!b.rmdir(ROOT_ID, b".."));
+        assert!(!b.rename(ROOT_ID, b"..", ROOT_ID, b"z"));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1527,10 +1586,11 @@ mod tests {
         assert!(valid_component(b"a\\b").is_none());
         assert!(valid_component(b"ok.txt").is_some());
 
-        // lookup must refuse to escape the export root.
+        // lookup must refuse to escape the export root: `..` at the root is the
+        // root itself, and no name resolves through a separator.
         let root = temp_export();
         let mut b = NfsBacking::new(&root);
-        assert!(b.lookup(ROOT_ID, b"..").is_none());
+        assert_eq!(b.lookup(ROOT_ID, b".."), Some(ROOT_ID));
         assert!(b.lookup(ROOT_ID, b"../etc").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1887,7 +1947,7 @@ mod tests {
         assert!(pages > 1, "the listing should have needed multiple pages");
         all.sort();
         all.dedup();
-        assert_eq!(all.len(), n, "every entry returned exactly once across pages");
+        assert_eq!(all.len(), n + 2, "every entry (plus . and ..) returned exactly once");
         std::fs::remove_dir_all(&root).ok();
     }
 
