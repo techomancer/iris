@@ -233,7 +233,17 @@ fn main() {
             3
         }
         Err(Error::Connection(e)) => {
-            eprintln!("iris-ci: connect {}: {}", opts.socket.display(), e);
+            // A read timeout is not a failure to connect, and saying so sends
+            // the reader looking at the wrong end. The socket was fine; the
+            // command outlived the read deadline.
+            match e.kind() {
+                std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::TimedOut => eprintln!(
+                    "iris-ci: timed out waiting for {} to answer: {}",
+                    opts.socket.display(), e),
+                _ => eprintln!(
+                    "iris-ci: connect {}: {}", opts.socket.display(), e),
+            }
             1
         }
         Err(Error::Iris(e)) => {
@@ -320,6 +330,17 @@ struct Opts {
 
 // ---- socket client -----------------------------------------------------------
 
+/// Read timeout for commands that answer promptly.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Grace on top of a guest deadline, so the server's own timeout fires first
+/// and reports which pattern was missed rather than the client giving up.
+const READ_TIMEOUT_GRACE: Duration = Duration::from_secs(30);
+
+fn read_timeout_for(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms) + READ_TIMEOUT_GRACE
+}
+
 /// Send one JSON command, return the parsed response data on `ok:true`,
 /// or an Error on connection failure or `ok:false`.
 ///
@@ -329,13 +350,23 @@ struct Opts {
 /// terminated response line, then drop the stream — the server's reader
 /// loop sees EOF and exits cleanly.
 fn send(opts: &Opts, cmd: &str, args: Value) -> Result<Value> {
+    send_until(opts, cmd, args, DEFAULT_READ_TIMEOUT)
+}
+
+/// Same, with the read timeout the caller needs.
+///
+/// `wait-serial` blocks on the server for as long as the caller asked, so a
+/// fixed client-side read timeout silently caps every command that uses it.
+/// At 300s that made any guest command over five minutes fail with EAGAIN
+/// while the guest carried on working, and `--timeout` appeared to do nothing.
+fn send_until(opts: &Opts, cmd: &str, args: Value, read_timeout: Duration) -> Result<Value> {
     let addr = opts.socket.to_string_lossy();
     if iris::config::ci_socket_is_tcp(&addr) {
-        send_tcp(&iris::config::ci_socket_tcp_addr(&addr), cmd, args)
+        send_tcp(&iris::config::ci_socket_tcp_addr(&addr), cmd, args, read_timeout)
     } else {
         #[cfg(unix)]
         {
-            send_unix(&opts.socket, cmd, args)
+            send_unix(&opts.socket, cmd, args, read_timeout)
         }
         #[cfg(not(unix))]
         {
@@ -347,18 +378,18 @@ fn send(opts: &Opts, cmd: &str, args: Value) -> Result<Value> {
     }
 }
 
-fn send_tcp(addr: &str, cmd: &str, args: Value) -> Result<Value> {
+fn send_tcp(addr: &str, cmd: &str, args: Value, read_timeout: Duration) -> Result<Value> {
     let s = TcpStream::connect(addr)?;
-    s.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    s.set_read_timeout(Some(read_timeout)).ok();
     let mut writer = s.try_clone()?;
     let mut reader = BufReader::new(s);
     exchange(&mut reader, &mut writer, cmd, args)
 }
 
 #[cfg(unix)]
-fn send_unix(socket: &PathBuf, cmd: &str, args: Value) -> Result<Value> {
+fn send_unix(socket: &PathBuf, cmd: &str, args: Value, read_timeout: Duration) -> Result<Value> {
     let s = UnixStream::connect(socket)?;
-    s.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    s.set_read_timeout(Some(read_timeout)).ok();
     let mut writer = s.try_clone()?;
     let mut reader = BufReader::new(s);
     exchange(&mut reader, &mut writer, cmd, args)
@@ -524,7 +555,12 @@ fn cmd_serial_read(opts: &Opts) -> Result<()> {
 }
 
 fn cmd_serial_wait(opts: &Opts, pattern: &str, timeout_ms: u64) -> Result<()> {
-    let data = send(opts, "wait-serial", json!({"pattern": pattern, "timeout_ms": timeout_ms}))?;
+    let data = send_until(
+        opts,
+        "wait-serial",
+        json!({"pattern": pattern, "timeout_ms": timeout_ms}),
+        read_timeout_for(timeout_ms),
+    )?;
     if let Some(s) = data.as_str() {
         if !opts.quiet {
             print!("{}", s.replace("\r\n", "\n").replace('\r', "\n"));
@@ -554,7 +590,9 @@ fn cmd_login(opts: &Opts, user: &str, password: Option<&str>) -> Result<()> {
     // IRIX presents `TERM = (vt100)` after the username; pressing enter accepts.
     std::thread::sleep(Duration::from_millis(2000));
     if let Some(p) = password {
-        send(opts, "wait-serial", json!({"pattern": "Password:", "timeout_ms": 5000}))?;
+        send_until(opts, "wait-serial",
+        json!({"pattern": "Password:", "timeout_ms": 5000}),
+        read_timeout_for(5000))?;
         send(opts, "serial-send", json!({"data": format!("{}\r", p)}))?;
     }
     send(opts, "serial-send", json!({"data": "\r"}))?;
@@ -586,10 +624,11 @@ fn run_capture(opts: &Opts, command: &str, shell: &str, timeout_ms: u64) -> Resu
     // output line (the typed-input echo line has `IRIS-CI-RC=$status` inline,
     // so it has no preceding newline immediately before the marker).
     let pat = format!("\n{}", RC_MARKER);
-    let captured = send(
+    let captured = send_until(
         opts,
         "wait-serial",
         json!({"pattern": pat, "timeout_ms": timeout_ms}),
+        read_timeout_for(timeout_ms),
     )?;
     let raw = captured.as_str().unwrap_or("").to_string();
     // Drain trailing chars (rc digits + next prompt).
@@ -616,7 +655,9 @@ fn detect_guest_shell(opts: &Opts) -> &'static str {
     }
     // Wait for the value line (the typed echo also contains the sentinel; read a
     // bit more so the rsplit lands on the command's actual output).
-    let _ = send(opts, "wait-serial", json!({"pattern": SENTINEL, "timeout_ms": 8000}));
+    let _ = send_until(opts, "wait-serial",
+        json!({"pattern": SENTINEL, "timeout_ms": 8000}),
+        read_timeout_for(8000));
     std::thread::sleep(Duration::from_millis(250));
     let more = send(opts, "serial-read", json!({})).ok();
     let buf = more.as_ref().and_then(|v| v.as_str()).unwrap_or("");
@@ -685,8 +726,13 @@ fn wait_with_deadline(opts: &Opts, pattern: &str, deadline: Instant) -> Result<(
         return Err(Error::Iris(format!("wait {}: deadline already passed", pattern)));
     }
     let timeout_ms = (deadline - now).as_millis() as u64;
-    send(opts, "wait-serial", json!({"pattern": pattern, "timeout_ms": timeout_ms}))
-        .map(|_| ())
+    send_until(
+        opts,
+        "wait-serial",
+        json!({"pattern": pattern, "timeout_ms": timeout_ms}),
+        read_timeout_for(timeout_ms),
+    )
+    .map(|_| ())
 }
 
 // ---- put / get (the bs=512 foot-gun killers) --------------------------------
