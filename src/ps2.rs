@@ -465,6 +465,7 @@ impl Ps2Controller {
             KeyCode::BracketLeft => Some(ScancodeSet2::LBracket),
             KeyCode::BracketRight => Some(ScancodeSet2::RBracket),
             KeyCode::Backslash => Some(ScancodeSet2::Backslash),
+            KeyCode::IntlBackslash => Some(ScancodeSet2::IntlBackslash),
             KeyCode::Semicolon => Some(ScancodeSet2::Semicolon),
             KeyCode::Quote => Some(ScancodeSet2::Quote),
             KeyCode::Comma => Some(ScancodeSet2::Comma),
@@ -572,6 +573,7 @@ impl Ps2Controller {
             KeyCode::BracketLeft => Some(ScancodeSet1::LBracket),
             KeyCode::BracketRight => Some(ScancodeSet1::RBracket),
             KeyCode::Backslash => Some(ScancodeSet1::Backslash),
+            KeyCode::IntlBackslash => Some(ScancodeSet1::IntlBackslash),
             KeyCode::Semicolon => Some(ScancodeSet1::Semicolon),
             KeyCode::Quote => Some(ScancodeSet1::Quote),
             KeyCode::Comma => Some(ScancodeSet1::Comma),
@@ -679,6 +681,7 @@ impl Ps2Controller {
             KeyCode::BracketLeft => Some(ScancodeSet3::LBracket),
             KeyCode::BracketRight => Some(ScancodeSet3::RBracket),
             KeyCode::Backslash => Some(ScancodeSet3::Backslash),
+            KeyCode::IntlBackslash => Some(ScancodeSet3::IntlBackslash),
             KeyCode::Semicolon => Some(ScancodeSet3::Semicolon),
             KeyCode::Quote => Some(ScancodeSet3::Quote),
             KeyCode::Comma => Some(ScancodeSet3::Comma),
@@ -1176,6 +1179,7 @@ pub enum ScancodeSet1 {
     Keypad3 = 0x51,
     Keypad0 = 0x52,
     KeypadPeriod = 0x53,
+    IntlBackslash = 0x56, // ISO 102nd key (< > |), left of Z on European keyboards
     F11 = 0x57,
     F12 = 0x58,
 
@@ -1267,6 +1271,7 @@ pub enum ScancodeSet2 {
     Enter = 0x5A,
     RBracket = 0x5B,
     Backslash = 0x5D,
+    IntlBackslash = 0x61, // ISO 102nd key (< > |), left of Z on European keyboards
     Backspace = 0x66,
     Keypad1 = 0x69,
     Keypad4 = 0x6B,
@@ -1351,6 +1356,7 @@ pub enum ScancodeSet3 {
     Minus = 0x4E,
     Equals = 0x55,
     Backslash = 0x5C,
+    IntlBackslash = 0x13, // ISO 102nd key (< > |), left of Z on European keyboards
     Backspace = 0x66,
     Space = 0x29,
     Tab = 0x0D,

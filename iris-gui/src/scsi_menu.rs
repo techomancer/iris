@@ -32,24 +32,24 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         if let Some(p) = pick_disk("Attach HDD") {
                             action = ScsiAction::AttachHdd { id, path: p };
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     // Attaching a CD-ROM gives an empty drive by default; the
                     // user loads media afterwards via "Insert disc…". Mirrors
                     // real hardware and avoids an upfront file prompt.
                     if ui.button("Attach CD-ROM drive (empty)").clicked() {
                         action = ScsiAction::AttachEmptyCdrom { id };
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Attach CD-ROM with disc…").clicked() {
                         if let Some(p) = pick_iso("Attach CD-ROM with disc") {
                             action = ScsiAction::AttachCdromWithDisc { id, path: p };
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Create blank HDD image…").clicked() {
                         action = ScsiAction::CreateBlank { id };
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
                 Some(d) if d.cdrom => {
@@ -57,7 +57,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                     if has_media {
                         if ui.button("Eject (tray empty)").clicked() {
                             action = ScsiAction::Eject { id };
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     let insert_label = if has_media { "Swap disc…" } else { "Insert disc…" };
@@ -65,18 +65,18 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         if let Some(p) = pick_iso("Insert disc") {
                             action = ScsiAction::InsertDisc { id, path: p };
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if has_media {
                         if ui.button("Mount /CDROM in IRIX…").clicked() {
                             action = ScsiAction::RemountInIrix { id };
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     ui.separator();
                     if ui.button("Detach CD-ROM drive").clicked() {
                         action = ScsiAction::Detach { id };
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
                 Some(d) => {
@@ -88,18 +88,18 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                     };
                     if ui.button(overlay_label).clicked() {
                         action = ScsiAction::ToggleOverlay { id };
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Replace image…").clicked() {
                         if let Some(p) = pick_disk("Replace HDD image") {
                             action = ScsiAction::AttachHdd { id, path: p };
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Detach hard drive").clicked() {
                         action = ScsiAction::Detach { id };
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
             }

@@ -5,7 +5,7 @@ use winit::{
     event::{ElementState, Event, KeyEvent, WindowEvent, MouseButton},
     event_loop::{ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowBuilder},
+    window::{Window, WindowAttributes},
 };
 use glow::HasContext;
 use crate::ps2::Ps2Controller;
@@ -96,7 +96,7 @@ impl GlRenderer {
         let not_current_gl_context = self.not_current_context.take()
             .expect("GL context missing — init_gl() called more than once");
 
-        let attrs = self.window.build_surface_attributes(Default::default());
+        let attrs = self.window.build_surface_attributes(Default::default()).expect("surface attributes");
         let gl_surface = unsafe {
             gl_display
                 .create_window_surface(&self.gl_config, &attrs)
@@ -607,7 +607,7 @@ impl Ui {
         // via resize() once the PROM/IRIX programs its actual mode.
         let w = 1280 * scale;
         let h = (1024 + STATUS_BAR_HEIGHT as u32) * scale;
-        let window_builder = WindowBuilder::new()
+        let window_builder = WindowAttributes::default()
             .with_title(crate::machine::emulator_name())
             .with_resizable(true)
             .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
@@ -616,7 +616,7 @@ impl Ui {
             .with_alpha_size(8)
             .with_transparency(false);
 
-        let display_builder = DisplayBuilder::new().with_window_builder(Some(window_builder));
+        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
 
         let (window, gl_config) = display_builder
             .build(event_loop, template, |configs| {
@@ -634,7 +634,7 @@ impl Ui {
         // that created the window/display above. The refresh thread only
         // makes it current later (in GlRenderer::init_gl); it never calls
         // create_context itself. See the not_current_context field comment.
-        let raw_window_handle = window.raw_window_handle();
+        let raw_window_handle = window.raw_window_handle().expect("no raw window handle");
         let gl_display = gl_config.display();
 
         // Try, in order: (1) explicit GL 3.2 core — what GlCompositor and the

@@ -23,8 +23,12 @@ So iris-gui uses the standard emulator model (mirroring `src/ui.rs`):
   (`eframe .../glow_integration.rs` → `egui_winit::on_mouse_motion`). We read
   those deltas and feed them straight to the PS/2 controller — natural 1:1
   feel, no scaling, no warp-to-center, no edge-piling.
-- **Ctrl+Alt+Esc (or focus loss) releases** — Alt is the Option key on macOS;
-  a chord so plain Esc still reaches the guest. Input is gated on capture: while captured,
+- **Left Ctrl+Alt — left Option+Cmd on macOS — (or focus loss) releases.** Hold
+  both and press nothing else; it fires on key-up so Ctrl+Alt+F11 still works.
+  Ctrl+Alt+Esc remains as an explicit fallback. Needs egui ≥ 0.35 for discrete
+  left/right modifier keys — see
+  [keyboard-layout-send-physical-keys-not-logical.md](keyboard-layout-send-physical-keys-not-logical.md).
+  Input is gated on capture: while captured,
   keyboard + mouse go to the guest; while not, they stay with egui (so menu
   clicks and config-side-panel typing don't leak into IRIX).
 

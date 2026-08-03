@@ -77,10 +77,9 @@ forward it — otherwise it would both toggle fullscreen *and* reach the guest.
 fullscreen handler is gated with `!(ctrl && alt)`, and `pump` detects the chord
 on the press edge and sends a **bare** F11. Because the modifier diff has already
 pressed the chord's Ctrl+Alt in the guest, `pump` lifts whatever modifiers are
-held (`state.last_mods`), taps F11, then re-presses them — so IRIX sees an
-unmodified F11 — and leaves `last_mods` untouched so the next frame's diff stays
-consistent. The hint lives on the capture status block (`capture_controls`)
-alongside the Ctrl+Alt+Esc release hint.
+held (`state.held_mods`), taps F11, then re-presses them — so IRIX sees an
+unmodified F11. The hint lives on the capture status block (`capture_controls`)
+alongside the release-chord hint (`input::RELEASE_HINT`).
 
 ## What is NOT fixable at this layer
 
@@ -89,3 +88,8 @@ numpad keys reach the guest only as their main-row equivalents, and there are no
 egui keys for NumLock/ScrollLock/CapsLock/PrintScreen/ContextMenu — even though
 `ps2.rs` has scancodes for some. Distinguishing them would require reading raw
 winit `KeyEvent.physical_key`/`location` instead of egui events.
+
+Re-verified against **egui 0.35** (2026-08-03): still true. 0.35 *did* add
+`Key::IntlBackslash` and discrete `ShiftLeft/Right`, `ControlLeft/Right`,
+`AltLeft/Right`, `SuperLeft/Right` (all now mapped), but no numpad and none of
+the lock/menu keys. `map_key` in `input.rs` covers everything egui can express.

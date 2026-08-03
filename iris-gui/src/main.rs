@@ -926,7 +926,7 @@ impl App {
                     self.syncing = Some(SyncJob { disk: 0, total: 1, fraction: 0.0 });
                 }
                 self.emu.send(Cmd::CowCommit { base: base.clone(), chd: is_chd });
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("    ↩ Discard changes (roll back)")
                 .on_hover_text("Throw away this session's overlay and revert to the disk as it was")
@@ -934,7 +934,7 @@ impl App {
             {
                 // Destructive — confirm before discarding.
                 self.cow_discard_confirm = Some(CowDiscard { id, base: base.clone(), chd: is_chd });
-                ui.close_menu();
+                ui.close();
             }
         }
     }
@@ -1025,7 +1025,7 @@ impl App {
                 ui.set_min_width(220.0);
                 if ui.button("New machine…").clicked() {
                     self.new_machine.open();
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.menu_button("Switch to machine", |ui| {
                     ui.set_min_width(200.0);
@@ -1041,7 +1041,7 @@ impl App {
                         let is_active = active.as_deref() == Some(name.as_str());
                         if ui.selectable_label(is_active, name.as_str()).clicked() {
                             want_switch = Some(name);
-                            ui.close_menu();
+                            ui.close();
                         }
                     }
                     if let Some(n) = want_switch { self.switch_to(&n); }
@@ -1055,7 +1055,7 @@ impl App {
                     // text box inside the menu can't work — the menu closure
                     // re-runs each frame and would reset the buffer.)
                     self.rename_buffer = self.prefs.active_machine.clone();
-                    ui.close_menu();
+                    ui.close();
                 }
                 let active = self.prefs.active_machine.clone();
                 if ui.add_enabled(active.is_some(), egui::Button::new("Delete current machine")).clicked() {
@@ -1071,7 +1071,7 @@ impl App {
                         let _ = self.prefs.save();
                         self.toast(format!("deleted '{name}'"));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
                 // iris.toml import/export is a source-build affordance for users
                 // who also run the standalone `iris` CLI; the GUI's own gui.json
@@ -1091,17 +1091,17 @@ impl App {
                             self.flush_machine();
                             self.toast(format!("imported as '{name}'"));
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Export current to iris.toml…").clicked() {
                         if let Some(path) = native_save_dialog("Export iris.toml", &[("TOML", &["toml"])]) {
                             self.save_config(path);
                         }
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Prepare for premiere…").clicked() {
                         self.prepare_for_premiere();
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
                 // App Store sandbox: grant a whole folder (recursive) so the
@@ -1118,7 +1118,7 @@ impl App {
                         .clicked()
                     {
                         self.grant_disk_folder();
-                        ui.close_menu();
+                        ui.close();
                     }
                     let folders = self.prefs.disk_folders.clone();
                     if folders.is_empty() {
@@ -1159,16 +1159,16 @@ impl App {
                 let running = self.emu.is_running();
                 if ui.add_enabled(!running, egui::Button::new("Start")).clicked() {
                     self.start_emulator();
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
                     self.request_stop();
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new("Reset")).clicked() {
                     self.emu.send(Cmd::Stop);
                     self.start_emulator();
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.add_enabled(!running, egui::Button::new("Reset NVRAM (fresh PRAM)"))
                     .on_hover_text(format!(
@@ -1185,7 +1185,7 @@ impl App {
                         }
                         Err(e) => self.toast(format!("NVRAM reset failed: {e}")),
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1207,14 +1207,14 @@ impl App {
                     if let Some(p) = native_save_dialog("Save screenshot", &[("PNG", &["png"])]) {
                         self.emu.send(Cmd::Screenshot(p));
                     }
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new("Serial console…"))
                     .on_hover_text("View the IRIX serial console (ttyd1) over the loopback serial server")
                     .clicked()
                 {
                     self.open_serial_console();
-                    ui.close_menu();
+                    ui.close();
                 }
             });
             ui.menu_button("Memory  ▶", |ui| {
@@ -1255,7 +1255,7 @@ impl App {
                         self.cfg.banks = distribute_ram(p);
                         self.mark_dirty();
                         self.toast(format!("RAM set to {} ({:?})", ram_summary(&self.cfg.banks), self.cfg.banks));
-                        ui.close_menu();
+                        ui.close();
                     }
                 }
                 ui.separator();
@@ -1270,7 +1270,7 @@ impl App {
                             {
                                 self.cfg.banks[i] = sz;
                                 self.mark_dirty();
-                                ui.close_menu();
+                                ui.close();
                             }
                         }
                     });
@@ -1344,7 +1344,7 @@ impl App {
                 if ui.button(if self.fullscreen { "Exit fullscreen (F11)" } else { "Fullscreen (F11)" }).clicked() {
                     self.fullscreen = !self.fullscreen;
                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.horizontal(|ui| {
                     ui.label("UI scale");
@@ -1388,7 +1388,7 @@ impl App {
                     .clicked()
                 {
                     self.open_camera_test();
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new("Serial console…"))
                     .on_hover_text("Connect to the emulator's loopback serial server (127.0.0.1:8881)")
@@ -1396,18 +1396,18 @@ impl App {
                     .clicked()
                 {
                     self.open_serial_console();
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("ℹ How camera & networking work…").clicked() {
                     self.show_help_info = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("📂 Mount the shared folder in IRIX…")
                     .on_hover_text("The exact mount command for the NFS share")
                     .clicked()
                 {
                     self.show_nfs_help = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 // N64 dev board getting-started guide. Hidden in App Store
                 // builds, where the board can't run (sandbox blocks the POSIX
@@ -1418,7 +1418,7 @@ impl App {
                     .clicked()
                 {
                     self.show_ultra64_help = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 ui.label(RichText::new("Legal").strong());
@@ -1427,11 +1427,11 @@ impl App {
                     .clicked()
                 {
                     self.show_license = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 if ui.button("Privacy policy…").clicked() {
                     self.show_privacy = true;
-                    ui.close_menu();
+                    ui.close();
                 }
                 ui.separator();
                 ui.label(RichText::new("Authors").strong());
@@ -1523,15 +1523,11 @@ impl App {
         }
     }
 
-    /// Mouse/keyboard capture state for the control column, sitting between the
-    /// config controls and the status footer. Only the *capture* action is a
-    /// button — releasing stays the Ctrl+Alt+Esc hotkey, because while captured
-    /// the host pointer is grabbed by the guest and can't click anything.
-    /// Caller renders this only while the machine is running.
+    /// Capture state for the control column; only *capture* is a button, since while captured the grabbed pointer can't click anything.
     fn capture_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.input_state.captured {
             ui.label(RichText::new("Mouse/Keyboard Captured").color(Color32::LIGHT_GREEN));
-            ui.label(RichText::new("To disable: Ctrl+Alt+Esc").weak());
+            ui.label(RichText::new(format!("To disable: {}", input::RELEASE_HINT)).weak());
             ui.label(RichText::new("Send F11 to IRIX: Ctrl+Alt+F11").weak());
         } else {
             ui.label(RichText::new("Mouse/Keyboard Capture Disabled").weak());
@@ -1804,10 +1800,8 @@ impl App {
     /// footer readout reports the scale actually achieved.
     fn snap_window_to_fb(ctx: &egui::Context, fb_px: egui::Vec2, central_avail: egui::Vec2, vm_scale: f32) {
         if fb_px.x < 1.0 || fb_px.y < 1.0 { return; }
-        // egui-winit reports screen_rect / available_size / monitor_size *and*
-        // interprets ViewportCommand::InnerSize all in the same (zoom-scaled)
-        // point space, so chrome math stays in egui points.
-        let screen = ctx.screen_rect().size();
+        // egui-winit reports viewport_rect / available_size / monitor_size and interprets ViewportCommand::InnerSize in the same (zoom-scaled) point space, so chrome math stays in egui points.
+        let screen = ctx.viewport_rect().size();
         let chrome_w = (screen.x - central_avail.x).max(0.0);
         let chrome_h = (screen.y - central_avail.y).max(0.0);
         let zoom = ctx.zoom_factor().max(0.1);
@@ -2325,7 +2319,7 @@ impl App {
                     // it at ~4:3 by drawing into a fixed-size rect.
                     ui.add(egui::Image::new(&*tex)
                         .fit_to_exact_size(egui::vec2(480.0, 360.0))
-                        .rounding(4.0));
+                        .corner_radius(4.0));
                 } else {
                     ui.add_space(110.0);
                     ui.label("Starting capture…");
@@ -3041,8 +3035,8 @@ impl App {
     /// bottom. This replaces the old top menu bar + toolbar + bottom status bar,
     /// freeing vertical space for the (tall, 5:4) emulated display.
     fn control_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("ctl_status")
-            .show_inside(ui, |ui| self.status_block(ui));
+        egui::Panel::bottom("ctl_status")
+            .show(ui, |ui| self.status_block(ui));
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(4.0);
@@ -3062,7 +3056,9 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // egui 0.35 replaced `App::update(ctx)` with `App::ui(ui)`; panels now attach to a `Ui`.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.handle_events(ctx);
         self.maybe_autosave();
 
@@ -3129,10 +3125,10 @@ impl eframe::App for App {
 
         // The control column lives on the left, always visible (even in
         // fullscreen) — the VM screen sits to its right and never hides it.
-        egui::SidePanel::left("control_panel")
+        egui::Panel::left("control_panel")
             .resizable(false)
-            .exact_width(186.0)
-            .show(ctx, |ui| self.control_panel(ui, ctx));
+            .exact_size(186.0)
+            .show(ui, |ui| self.control_panel(ui, ctx));
         self.network_check_window(ctx);
 
         // Config editor placement depends on whether a machine is running:
@@ -3141,26 +3137,26 @@ impl eframe::App for App {
         //  - IDLE: it takes the WHOLE central area instead (below), hiding the
         //    welcome/info screen — no cramped split when there's nothing to
         //    watch. The toolbar's "Edit config…" toggle drives both.
-        let config_in_side_panel = self.show_config_editor && self.emu.is_running();
-        egui::SidePanel::right("config_editor")
+        let mut config_in_side_panel = self.show_config_editor && self.emu.is_running();
+        egui::Panel::right("config_editor")
             .resizable(true)
-            .default_width(420.0)
-            .show_animated(ctx, config_in_side_panel, |ui| self.config_editor_panel(ui));
+            .default_size(420.0)
+            .show_collapsible(ui, &mut config_in_side_panel, |ui| self.config_editor_panel(ui));
 
         // Zero the central panel's inner margin so the emulated display reaches
         // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
         // a little bigger. Keep the dark panel fill so the aspect-ratio
         // letterbox bars stay black.
-        let central_frame = egui::Frame::central_panel(&ctx.style())
+        let central_frame = egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::ZERO);
-        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
             if self.show_config_editor && !self.emu.is_running() {
                 // Idle + editing: config fills the whole pane (welcome hidden).
                 // A small margin gives it breathing room (the central frame is
                 // edge-to-edge for the framebuffer).
                 input::force_release(ui.ctx(), &mut self.input_state);
-                egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| self.config_editor_panel(ui));
             } else if self.emu.is_running() {
                 self.framebuffer_panel(ui);

@@ -18,3 +18,13 @@ release without a matching press.
 **Status:** Pre-existing emulator issue, not introduced by any recent changes.
 Proper fix would require filtering or suppressing stale modifier key events
 in the UI event handler when focus is regained.
+
+**Possibly addressed in iris-gui (2026-08-03, UNVERIFIED).** `pump()` no longer
+synthesises modifiers from `egui::Modifiers` diffs; it forwards real
+press/release key events and tracks `held_mods`, and `release_capture()` lifts
+exactly what it recorded as pressed — so an orphan release without a matching
+press should no longer be generated on focus loss. **Not tested against IRIX X11**
+— if you can reproduce the original alt-tab corruption, check whether it still
+happens before spending time here. Note this applies to iris-gui only; the CLI
+(`src/ui.rs`) always forwarded real key events.
+See [../gui/keyboard-layout-send-physical-keys-not-logical.md](../gui/keyboard-layout-send-physical-keys-not-logical.md).

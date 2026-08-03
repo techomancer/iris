@@ -972,25 +972,25 @@ fn show_network(
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2323, guest_port: 23, bind: ForwardBind::Localhost });
-            ui.close_menu();
+            ui.close();
         }
         if ui.add_enabled(!has_port(21), egui::Button::new("FTP (host 2121 to guest 21)"))
             .on_hover_text("Reach the guest's FTP server. Forwards the control port; file transfer also needs the data channel (see docs).")
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2121, guest_port: 21, bind: ForwardBind::Localhost });
-            ui.close_menu();
+            ui.close();
         }
         if ui.add_enabled(!has_port(177), egui::Button::new("XDMCP (host 11177 to guest 177, UDP)"))
             .on_hover_text("Remote X login: an X server XDMCP-queries the guest's xdm. Binds all interfaces (LAN X servers OK). Stock X servers use UDP 177 — redirect 177→11177 on the X-server host, or use a chooser that accepts host:port.")
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Udp, host_port: 11177, guest_port: 177, bind: ForwardBind::Any });
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Custom (empty row)").clicked() {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 0, guest_port: 0, bind: ForwardBind::Localhost });
-            ui.close_menu();
+            ui.close();
         }
     });
     if let Some(pf) = add { cfg.port_forward.push(pf); out.changed = true; out.forwards_changed = true; }
@@ -1594,7 +1594,7 @@ struct PathEdit {
 /// A TextEdit + 📁 Browse button that updates `value` in place. See [`PathEdit`].
 fn path_row(
     ui: &mut Ui,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug, // egui 0.35 push_id needs AsIdSalt (Hash + Debug)
     value: &mut String,
     mode: Pick,
     filters: &[(&str, &[&str])],
@@ -1649,7 +1649,7 @@ fn path_row(
 /// the user can clear by emptying the text.
 fn path_row_opt(
     ui: &mut Ui,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     value: &mut Option<String>,
     mode: Pick,
     filters: &[(&str, &[&str])],

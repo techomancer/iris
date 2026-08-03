@@ -10,9 +10,7 @@
 //! and lock it in place (`CursorGrab::Locked`); raw motion then arrives as
 //! `egui::Event::MouseMoved` deltas (eframe forwards `DeviceEvent::MouseMotion`
 //! regardless of grab), which we feed straight to the guest. Only the guest's
-//! own pointer is visible, so there is nothing to misalign. **Ctrl+Alt+Esc
-//! releases** (Alt is the Option key on macOS); a chord rather than bare Esc
-//! so plain Esc still reaches the guest.
+//! own pointer is visible, so there is nothing to misalign. `RELEASE_CHORD` releases.
 //!
 //! While captured we also forward keyboard input to the guest; while *not*
 //! captured we forward nothing, so menu clicks and typing into the config
@@ -24,12 +22,15 @@
 //! hit-testing already routed clicks on open menus / popups to those widgets,
 //! so navigating menus over the display never gets "eaten" into a capture.
 
-use egui::{CursorGrab, Event, Key, Modifiers, MouseWheelUnit, PointerButton, ViewportCommand};
+use egui::{CursorGrab, Event, Key, MouseWheelUnit, PointerButton, ViewportCommand};
 use iris::ps2::Ps2Controller;
 use winit::keyboard::KeyCode;
 
 pub struct InputState {
-    last_mods: Modifiers,
+    /// Modifier keys currently held down in the guest, so they can be lifted on release.
+    held_mods: Vec<KeyCode>,
+    /// Set when another key is pressed while the release chord is held, so the chord sends its modifiers to the guest instead of releasing capture.
+    chord_consumed: bool,
     last_buttons: u8,         // bit0=L, bit1=R, bit2=M, bit3=B4, bit4=B5
     /// True while the host cursor is grabbed and input is routed to the guest.
     pub captured: bool,
@@ -42,8 +43,25 @@ pub struct InputState {
 
 impl Default for InputState {
     fn default() -> Self {
-        Self { last_mods: Modifiers::NONE, last_buttons: 0, captured: false, unfocused_since: None }
+        Self { held_mods: Vec::new(), chord_consumed: false, last_buttons: 0, captured: false, unfocused_since: None }
     }
+}
+
+/// Hold these two together (and press nothing else) to release capture.
+#[cfg(target_os = "macos")]
+const RELEASE_CHORD: [KeyCode; 2] = [KeyCode::AltLeft, KeyCode::SuperLeft];
+#[cfg(not(target_os = "macos"))]
+const RELEASE_CHORD: [KeyCode; 2] = [KeyCode::ControlLeft, KeyCode::AltLeft];
+
+/// Human-readable name of `RELEASE_CHORD`, for the capture hint in the control column.
+#[cfg(target_os = "macos")]
+pub const RELEASE_HINT: &str = "Left Option+Cmd";
+#[cfg(not(target_os = "macos"))]
+pub const RELEASE_HINT: &str = "Left Ctrl+Alt";
+
+fn is_modifier(kc: KeyCode) -> bool {
+    matches!(kc, KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::ControlLeft | KeyCode::ControlRight
+        | KeyCode::AltLeft | KeyCode::AltRight | KeyCode::SuperLeft | KeyCode::SuperRight)
 }
 
 /// How long the window must stay unfocused before a capture is released. Long
@@ -62,7 +80,6 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
     let mut dy = 0.0f32;
     let mut dz = 0.0f32;
     let mut buttons = state.last_buttons;
-    let mut mods = state.last_mods;
     let mut keys: Vec<(KeyCode, bool)> = Vec::new();
     let mut f11_to_guest = false;
 
@@ -76,31 +93,23 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
             return;
         }
 
-        // Captured. Ctrl+Alt+Esc (Alt == Option on macOS) is the release chord;
-        // a real focus loss (alt-tab) also releases, but only after a grace
-        // period (decided below) so a one-frame `focused=false` flicker doesn't
-        // drop capture while you're typing. A chord rather than bare Esc lets
-        // plain Esc reach the guest. Keep reading events even on a flicker frame
-        // so typing keeps flowing to the guest.
+        // Captured. RELEASE_CHORD releases (see below); Ctrl+Alt+Esc still works as an explicit fallback, and a real focus loss (alt-tab) releases after a grace period so a one-frame flicker doesn't drop capture mid-typing.
         esc_chord = i.key_pressed(Key::Escape) && i.modifiers.ctrl && i.modifiers.alt;
         focused = i.focused;
-
-        mods = i.modifiers;
 
         for ev in &i.events {
             match ev {
                 // Raw relative motion (eframe → DeviceEvent::MouseMotion).
                 Event::MouseMoved(d) => { dx += d.x; dy += d.y; }
-                Event::Key { key, pressed, repeat, .. } => {
-                    if *key == Key::F11 {
-                        // Plain F11 is the GUI's fullscreen toggle and is never
-                        // forwarded. Ctrl+Alt+F11 is the escape hatch that delivers
-                        // a real F11 to IRIX — recorded here on the press edge and
-                        // sent (as a bare F11) after the modifier diff below.
+                // Prefer the physical position: `key` is already layout-translated by the host, and the guest applies its own `keybd=` layout on top, which mangles every non-US layout.
+                Event::Key { key, physical_key, pressed, repeat, .. } => {
+                    let k = physical_key.unwrap_or(*key);
+                    if k == Key::F11 {
+                        // Plain F11 is the GUI's fullscreen toggle; Ctrl+Alt+F11 is the escape hatch that sends a bare F11 to IRIX.
                         if *pressed && !*repeat && i.modifiers.ctrl && i.modifiers.alt {
                             f11_to_guest = true;
                         }
-                    } else if let Some(kc) = map_key(*key) {
+                    } else if let Some(kc) = map_key(k) {
                         keys.push((kc, *pressed));
                     }
                 }
@@ -164,39 +173,38 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
         return;
     }
 
-    // ---- modifiers: diff previous → current, synth press/release. ----
-    let m = mods;
-    if m.shift && !state.last_mods.shift { ps2.push_kb(KeyCode::ShiftLeft, true); }
-    if !m.shift && state.last_mods.shift { ps2.push_kb(KeyCode::ShiftLeft, false); }
-    if m.ctrl  && !state.last_mods.ctrl  { ps2.push_kb(KeyCode::ControlLeft, true); }
-    if !m.ctrl  && state.last_mods.ctrl  { ps2.push_kb(KeyCode::ControlLeft, false); }
-    if m.alt   && !state.last_mods.alt   { ps2.push_kb(KeyCode::AltLeft, true); }
-    if !m.alt   && state.last_mods.alt   { ps2.push_kb(KeyCode::AltLeft, false); }
-    if m.mac_cmd && !state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, true); }
-    if !m.mac_cmd && state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
-    state.last_mods = m;
+    // Modifiers arrive as real L/R key events (egui 0.35), so forward them like any other key and track what's held.
+    if f11_to_guest { state.chord_consumed = true; }
+    let mut chord_release = false;
+    for (kc, pressed) in keys {
+        let was_chord = RELEASE_CHORD.iter().all(|k| state.held_mods.contains(k));
+        if is_modifier(kc) {
+            if pressed {
+                if !state.held_mods.contains(&kc) { state.held_mods.push(kc); }
+            } else {
+                state.held_mods.retain(|k| *k != kc);
+            }
+        } else if pressed && was_chord {
+            state.chord_consumed = true;
+        }
+        let now_chord = RELEASE_CHORD.iter().all(|k| state.held_mods.contains(k));
+        if now_chord && !was_chord { state.chord_consumed = false; }
+        if was_chord && !now_chord && !state.chord_consumed { chord_release = true; }
+        ps2.push_kb(kc, pressed);
+    }
 
-    // ---- key events ----
-    for (kc, pressed) in keys { ps2.push_kb(kc, pressed); }
-
-    // Ctrl+Alt+F11 → a *bare* F11 to the guest. Plain F11 is swallowed by the
-    // GUI's fullscreen toggle, so this chord is the only path for F11 into IRIX.
-    // The modifier diff above has left the chord's Ctrl+Alt (and any Shift/Cmd)
-    // pressed in the guest, so lift whatever is held, tap F11, then re-press —
-    // IRIX sees an unmodified F11. `state.last_mods` is left untouched, so the
-    // next frame's diff stays consistent (no spurious modifier press/release).
+    // Ctrl+Alt+F11 → a *bare* F11 to the guest: plain F11 is the GUI's fullscreen toggle, so this chord is the only path for F11 into IRIX.
     if f11_to_guest {
-        let held = state.last_mods;
-        if held.shift   { ps2.push_kb(KeyCode::ShiftLeft, false); }
-        if held.ctrl    { ps2.push_kb(KeyCode::ControlLeft, false); }
-        if held.alt     { ps2.push_kb(KeyCode::AltLeft, false); }
-        if held.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
+        let held = state.held_mods.clone();
+        for kc in &held { ps2.push_kb(*kc, false); }
         ps2.push_kb(KeyCode::F11, true);
         ps2.push_kb(KeyCode::F11, false);
-        if held.shift   { ps2.push_kb(KeyCode::ShiftLeft, true); }
-        if held.ctrl    { ps2.push_kb(KeyCode::ControlLeft, true); }
-        if held.alt     { ps2.push_kb(KeyCode::AltLeft, true); }
-        if held.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, true); }
+        for kc in &held { ps2.push_kb(*kc, true); }
+    }
+
+    if chord_release {
+        release_capture(ctx, ps2, state);
+        return;
     }
 
     // ---- mouse: raw per-frame delta + button diff + scroll. ----
@@ -241,9 +249,9 @@ fn grab_mode() -> CursorGrab {
 pub fn engage_capture(ctx: &egui::Context, state: &mut InputState) {
     if state.captured { return; }
     state.captured = true;
-    // Anchor modifier/button state so we don't synth a spurious press for a
-    // key/button already held at capture time.
-    state.last_mods = ctx.input(|i| i.modifiers);
+    // Anchor modifier/button state so we don't leave a stale key held from before capture.
+    state.held_mods.clear();
+    state.chord_consumed = false;
     state.last_buttons = 0;
     state.unfocused_since = None;
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(false));
@@ -256,12 +264,9 @@ pub fn engage_capture(ctx: &egui::Context, state: &mut InputState) {
 /// stops while the framebuffer still had the grab.
 pub fn release_capture(ctx: &egui::Context, ps2: &Ps2Controller, state: &mut InputState) {
     if !state.captured { return; }
-    if state.last_mods.shift   { ps2.push_kb(KeyCode::ShiftLeft, false); }
-    if state.last_mods.ctrl    { ps2.push_kb(KeyCode::ControlLeft, false); }
-    if state.last_mods.alt     { ps2.push_kb(KeyCode::AltLeft, false); }
-    if state.last_mods.mac_cmd { ps2.push_kb(KeyCode::SuperLeft, false); }
+    for kc in state.held_mods.drain(..) { ps2.push_kb(kc, false); }
     state.captured = false;
-    state.last_mods = Modifiers::NONE;
+    state.chord_consumed = false;
     state.last_buttons = 0;
     state.unfocused_since = None;
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(true));
@@ -274,7 +279,8 @@ pub fn release_capture(ctx: &egui::Context, ps2: &Ps2Controller, state: &mut Inp
 pub fn force_release(ctx: &egui::Context, state: &mut InputState) {
     if !state.captured { return; }
     state.captured = false;
-    state.last_mods = Modifiers::NONE;
+    state.held_mods.clear();
+    state.chord_consumed = false;
     state.last_buttons = 0;
     state.unfocused_since = None;
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(true));
@@ -282,9 +288,7 @@ pub fn force_release(ctx: &egui::Context, state: &mut InputState) {
 }
 
 
-/// egui::Key → winit::keyboard::KeyCode. Returns None for keys iris's
-/// scancode mapper doesn't recognise (we just drop them rather than
-/// inventing a fallback).
+/// egui::Key (a physical position, per the caller) → winit KeyCode; None for keys iris's scancode mapper doesn't recognise.
 fn map_key(k: Key) -> Option<KeyCode> {
     Some(match k {
         // Letters
@@ -333,13 +337,17 @@ fn map_key(k: Key) -> Option<KeyCode> {
         Key::OpenBracket  => KeyCode::BracketLeft,
         Key::CloseBracket => KeyCode::BracketRight,
         Key::Backtick     => KeyCode::Backquote,
-        // egui reports the *shifted* symbol as its own Key; these two share a
-        // physical key with Backslash/Slash (Shift is sent separately, so the
-        // guest forms '|' and '?'). Without them those keys send nothing.
+        // Only reachable on the logical fallback (no physical_key): shifted symbols sharing a key with Backslash/Slash.
         Key::Pipe         => KeyCode::Backslash,
         Key::Questionmark => KeyCode::Slash,
-        // F-keys. F11 is reserved by the GUI (fullscreen toggle), so it isn't
-        // forwarded; iris's PS/2 scancode set stops at F12, so F13+ are dropped.
+        // ISO 102nd key (< > |), left of Z on European keyboards — new in egui 0.35.
+        Key::IntlBackslash => KeyCode::IntlBackslash,
+        // Modifiers as real L/R keys (egui 0.35); AltRight is AltGr, which the guest needs for @ \ | { } [ ] ~ on DE/de_CH.
+        Key::ShiftLeft   => KeyCode::ShiftLeft,   Key::ShiftRight   => KeyCode::ShiftRight,
+        Key::ControlLeft => KeyCode::ControlLeft, Key::ControlRight => KeyCode::ControlRight,
+        Key::AltLeft     => KeyCode::AltLeft,     Key::AltRight     => KeyCode::AltRight,
+        Key::SuperLeft   => KeyCode::SuperLeft,   Key::SuperRight   => KeyCode::SuperRight,
+        // F11 is reserved by the GUI (fullscreen); iris's scancode sets stop at F12, so F13+ are dropped.
         Key::F1 => KeyCode::F1, Key::F2 => KeyCode::F2, Key::F3  => KeyCode::F3,
         Key::F4 => KeyCode::F4, Key::F5 => KeyCode::F5, Key::F6  => KeyCode::F6,
         Key::F7 => KeyCode::F7, Key::F8 => KeyCode::F8, Key::F9  => KeyCode::F9,

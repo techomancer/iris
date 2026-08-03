@@ -13,7 +13,7 @@ use glutin::surface::{GlSurface, Surface, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
 use raw_window_handle::HasRawWindowHandle;
 use winit::event_loop::EventLoop;
-use winit::window::WindowBuilder;
+use winit::window::WindowAttributes;
 
 /// Hidden 1×1 window + GL context for offscreen GlCompositor use.
 pub struct HeadlessGl {
@@ -28,7 +28,7 @@ impl HeadlessGl {
     /// Create a hidden GL context. Returns None if the platform cannot init GL.
     pub fn new() -> Option<Self> {
         let event_loop = EventLoop::new().ok()?;
-        let window_builder = WindowBuilder::new()
+        let window_builder = WindowAttributes::default()
             .with_title("iris-headless-gl")
             .with_visible(false)
             .with_inner_size(winit::dpi::LogicalSize::new(1u32, 1u32));
@@ -37,7 +37,7 @@ impl HeadlessGl {
             .with_alpha_size(8)
             .with_transparency(true);
 
-        let display_builder = DisplayBuilder::new().with_window_builder(Some(window_builder));
+        let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_builder));
         let (window, gl_config) = display_builder
             .build(&event_loop, template, |configs| {
                 configs.reduce(|accum, config| {
@@ -47,7 +47,7 @@ impl HeadlessGl {
             .ok()?;
 
         let window = window?;
-        let raw_window_handle = window.raw_window_handle();
+        let raw_window_handle = window.raw_window_handle().ok()?;
         let gl_display = gl_config.display();
 
         let context_attributes = ContextAttributesBuilder::new().build(Some(raw_window_handle));
@@ -55,7 +55,7 @@ impl HeadlessGl {
             gl_display.create_context(&gl_config, &context_attributes).ok()?
         };
 
-        let attrs = window.build_surface_attributes(Default::default());
+        let attrs = window.build_surface_attributes(Default::default()).ok()?;
         let gl_surface = unsafe {
             gl_display.create_window_surface(&gl_config, &attrs).ok()?
         };

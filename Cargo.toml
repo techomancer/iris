@@ -98,11 +98,11 @@ ultra64 = ["dep:shared_memory", "dep:raw_sync"]
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.10"
-winit = "0.29"
-glutin = "0.31"
-glutin-winit = "0.4"
+winit = "0.30"
+glutin = "0.32"
+glutin-winit = "0.5"
 glow = "0.13"
-raw-window-handle = "0.5"
+raw-window-handle = "0.6"
 rtrb = "0.3"
 socket2 = { version = "0.5", features = ["all"] }
 crossbeam-utils = "0.8"
