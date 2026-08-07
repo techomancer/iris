@@ -20,9 +20,9 @@ use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, PossiblyCurrentContext, Version};
 use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
-use glutin::surface::{GlSurface, SwapInterval, WindowSurface, Surface};
-use glutin_winit::{DisplayBuilder, GlWindow};
-use raw_window_handle::HasRawWindowHandle;
+use glutin::surface::{GlSurface, SurfaceAttributesBuilder, SwapInterval, WindowSurface, Surface};
+use glutin_winit::DisplayBuilder;
+use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 use std::num::NonZeroU32;
 use std::ffi::CString;
 
@@ -67,6 +67,10 @@ struct GlRenderer {
     // that validate against the drawable/FBConfig being issued from a thread
     // other than the one that created the X11 connection/window.
     not_current_context: Option<NotCurrentContext>,
+    // Captured on the main thread in Ui::new(): winit 0.30 macOS returns
+    // HandleError::Unavailable from window_handle() on any other thread, and
+    // init_gl() runs on the refresh thread.
+    raw_window_handle: RawWindowHandle,
     gl_tier: GlTier,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
     scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
@@ -96,7 +100,12 @@ impl GlRenderer {
         let not_current_gl_context = self.not_current_context.take()
             .expect("GL context missing — init_gl() called more than once");
 
-        let attrs = self.window.build_surface_attributes(Default::default()).expect("surface attributes");
+        let size = self.window.inner_size();
+        let attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            self.raw_window_handle,
+            NonZeroU32::new(size.width.max(1)).unwrap(),
+            NonZeroU32::new(size.height.max(1)).unwrap(),
+        );
         let gl_surface = unsafe {
             gl_display
                 .create_window_surface(&self.gl_config, &attrs)
@@ -685,6 +694,7 @@ impl Ui {
             window:      window.clone(),
             gl_config,
             not_current_context: Some(not_current_context),
+            raw_window_handle,
             gl_tier,
             window_size: window_size.clone(),
             scale_snap:  scale_snap.clone(),
