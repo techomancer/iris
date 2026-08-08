@@ -1524,7 +1524,7 @@ impl NatEngine {
         // at the right hop count.  On Windows (SOCK_RAW) and macOS (SOCK_DGRAM) those
         // replies arrive back on this socket and we forward them to the guest.  On Linux they
         // are silently dropped by the kernel — traceroute sees * * *.
-        let _ = sock.set_ttl(ttl as u32);
+        let _ = sock.set_ttl_v4(ttl as u32);
         let dest = SocketAddr::new(IpAddr::V4(dst_ip), 0);
         let _ = sock.send_to(payload, &dest.into());
     }

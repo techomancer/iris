@@ -93,19 +93,21 @@ parking_lot = "0.12"
 # Match iris's winit version — Ps2Controller::push_kb takes
 # winit::keyboard::KeyCode.
 winit = "0.30"
-png = "0.17"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+png = "0.18"
+# rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
+# pulls its own `pollster` executor to block on the portal's async D-Bus calls.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-dirs = "5"
+toml = "1"
+dirs = "6"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 # Read the host's own interface addresses (Networking tab: first-free subnet
 # presets + overlap warnings). Reads addresses via getifaddrs — no entitlement,
 # and it does not trigger the macOS 15 Local Network prompt (that's for talking
 # *to* LAN peers, not enumerating your own NICs).
-if-addrs = "0.13"
+if-addrs = "0.15"
 
 # macOS App Sandbox: NSURL security-scoped bookmarks let the App Store build
 # reopen user-selected disk images / PROMs / ISOs across launches. These crates

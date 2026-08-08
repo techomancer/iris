@@ -97,26 +97,28 @@ ultra64 = ["dep:shared_memory", "dep:raw_sync"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 winit = "0.30"
 glutin = "0.32"
 glutin-winit = "0.5"
 glow = "0.13"
 raw-window-handle = "0.6"
 rtrb = "0.3"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 crossbeam-utils = "0.8"
-bitfield = "0.14"
-cpal = "0.15"
+bitfield = "0.19"
+cpal = "0.18"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.0.3"
 postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
-png = "0.17"
+png = "0.18"
 parking_lot = "0.12"
-spin = "0.10.0"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+spin = "0.12"
+# rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
+# pulls its own `pollster` executor to block on the portal's async D-Bus calls.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 gdbstub = { version = "0.7", features = ["std"] }
 gdbstub_arch = "0.3"
 cranelift-codegen    = { version = "0.134", optional = true }
@@ -125,11 +127,16 @@ cranelift-jit        = { version = "0.134", optional = true }
 cranelift-module     = { version = "0.134", optional = true }
 cranelift-native     = { version = "0.134", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
-libchdman-rs = { version = "0.288.9", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }
-windows-sys = { version = "0.52", features = ["Win32_System_Threading"] }
+# thread_affinity.rs calls SetThreadAffinityMask/GetCurrentThread, whose
+# signatures name Foundation::HANDLE — so Win32_Foundation is required on top of
+# Win32_System_Threading. It used to arrive by feature unification from rfd /
+# socket2 / anstyle-wincon; declare it so the Windows build doesn't depend on
+# who else happens to be in the graph.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }

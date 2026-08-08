@@ -37,7 +37,7 @@ fn load_icon() -> egui::IconData {
     const ICON_PNG: &[u8] = include_bytes!("../assets/icons/icon-256.png");
     let decoder = png::Decoder::new(std::io::Cursor::new(ICON_PNG));
     let mut reader = decoder.read_info().expect("decode icon PNG header");
-    let mut rgba = vec![0u8; reader.output_buffer_size()];
+    let mut rgba = vec![0u8; reader.output_buffer_size().expect("icon PNG size fits usize")];
     let info = reader.next_frame(&mut rgba).expect("decode icon PNG pixels");
     rgba.truncate(info.buffer_size());
     egui::IconData {

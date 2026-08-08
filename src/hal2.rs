@@ -311,11 +311,11 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
     for &rate in PREFERRED_RATES {
         let config = cpal::StreamConfig {
             channels: 2,
-            sample_rate: cpal::SampleRate(rate),
+            sample_rate: rate,
             buffer_size: cpal::BufferSize::Default,
         };
         let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
-        let err_fn = |err: cpal::StreamError| { eprintln!("HAL2: cpal stream error: {:?}", err); };
+        let err_fn = |err: cpal::Error| { eprintln!("HAL2: cpal stream error: {:?}", err); };
 
         // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
         let (producer, stream) = {
@@ -335,7 +335,7 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
                     };
                 }
             };
-            match device.build_output_stream(&config, data_fn, err_fn.clone(), None) {
+            match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
                 Ok(s) => (p, s),
                 Err(_) => {
                     // f32 failed, try i16
@@ -355,7 +355,7 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
                             };
                         }
                     };
-                    match device.build_output_stream(&config, data_fn, err_fn.clone(), None) {
+                    match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
                         Ok(s) => (p, s),
                         Err(e) => {
                             eprintln!("HAL2: cpal build_output_stream failed at {}Hz: {:?}", rate, e);
@@ -366,8 +366,8 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
             }
         };
         if stream.play().is_err() { continue; }
-        println!("HAL2: audio output: {:?} via {:?} at {}Hz",
-            device.name().unwrap_or_default(), host.id(), rate);
+        // cpal 0.18 dropped DeviceTrait::name(); a Device's Display impl is its name.
+        println!("HAL2: audio output: {} via {:?} at {}Hz", device, host.id(), rate);
         return Some(AudioOut {
             stream_rate: rate,
             producer,
