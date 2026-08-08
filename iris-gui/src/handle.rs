@@ -314,7 +314,7 @@ fn worker_loop(
     // the delta by wall-clock between ticks. Mirrors the status-bar math in
     // src/disp.rs, but driven here since the GUI never runs REX3's own
     // refresh/status-bar loop. `None` until a machine is up.
-    let mut cycles: Option<std::sync::Arc<std::sync::atomic::AtomicU64>> = None;
+    let mut cycles: Option<iris::mips_core::CyclesPtr> = None;
     let mut prev_cycles: u64 = 0;
     let mut prev_tick = std::time::Instant::now();
     // Tick cadence for the status poll while idle on the command channel.
@@ -323,11 +323,11 @@ fn worker_loop(
         match cmd_rx.recv_timeout(STATUS_TICK) {
             // Periodic tick (no command pending): refresh the MIPS estimate.
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if let Some(c) = &cycles {
+                if let Some(c) = cycles {
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(prev_tick).as_secs_f64();
                     if dt >= 0.1 {
-                        let cur = c.load(std::sync::atomic::Ordering::Relaxed);
+                        let cur = c.get();
                         let dc = cur.wrapping_sub(prev_cycles);
                         let mips = (dc as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
                         prev_cycles = cur;
@@ -406,11 +406,8 @@ fn worker_loop(
                                 .into_iter().map(|h| (h.network, h.prefix)).collect());
                         *ps2_slot.lock() = Some(m.get_ps2());
                         // Latch REX3's cycle counter for the live MIPS estimate.
-                        cycles = m.get_rex3().map(|r| r.cycles.clone());
-                        prev_cycles = cycles
-                            .as_ref()
-                            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                            .unwrap_or(0);
+                        cycles = m.get_rex3().map(|r| r.cycles.get());
+                        prev_cycles = cycles.map(|c| c.get()).unwrap_or(0);
                         prev_tick = std::time::Instant::now();
                         machine = Some(m);
                         let _ = evt_tx.send(Evt::Started);
