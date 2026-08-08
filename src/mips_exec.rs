@@ -744,7 +744,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         // Build unified cache hierarchy. Cache geometry is fixed at compile time;
         // IC_SIZE/IC_LINE/DC_SIZE/DC_LINE/L2_SIZE/L2_LINE are consts from mips_cache_v2.
-        let cache = C::from(sysad.clone());
+        // `mut` is only used by the Triton L2-enable sync below.
+        #[cfg_attr(not(feature = "r5ksc_triton"), allow(unused_mut))]
+        let mut cache = C::from(sysad.clone());
 
         // Build CP0 Config register from architecture constants.
         let mut config = 0u32;
@@ -5846,6 +5848,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             // iteration, so its state never repeats — we must NOT park it or
             // boot stalls. The state-repeat test distinguishes the two.
             #[cfg(feature = "idle-pause")]
+            // Unreachable when the JIT dispatch above returns; harmless.
+            #[allow(unreachable_code)]
             let mut idle_state = crate::idle_park::IdleParkState::default();
 
             #[allow(unreachable_code)]
