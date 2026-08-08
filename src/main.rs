@@ -4,6 +4,8 @@ use iris::machine::Machine;
 fn main() {
     print_build_features();
 
+    // `mut` is only used by the pcap interface prompt below.
+    #[cfg_attr(not(feature = "pcap"), allow(unused_mut))]
     let (mut cfg, scale) = load_config();
 
     // If PCAP networking is selected but no interface was configured, prompt the

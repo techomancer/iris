@@ -1583,7 +1583,9 @@ impl R4000Cache {
             // Fast path: single pass over source — rotate into l2.data and fill l2.instrs.
             #[cfg(not(feature = "r5k"))]
             let l2_instrs = self.l2.instrs.get_mut();
+            // Only fuse_pair! mutates prev_s1, and it is a no-op without opcodefusion.
             #[cfg(not(feature = "r5k"))]
+            #[cfg_attr(not(feature = "opcodefusion"), allow(unused_mut))]
             let mut prev_s1: Option<usize> = None;
             for i in 0..L2Cache::CHUNKS_PER_LINE {
                 let val = unsafe { (*src.add(i)).rotate_left(32) };
@@ -1610,6 +1612,7 @@ impl R4000Cache {
             #[cfg(not(feature = "r5k"))]
             {
                 let l2_instrs = self.l2.instrs.get_mut();
+                #[cfg_attr(not(feature = "opcodefusion"), allow(unused_mut))]
                 let mut prev_s1: Option<usize> = None;
                 for i in 0..L2Cache::CHUNKS_PER_LINE {
                     let val = dest[i];

@@ -112,6 +112,8 @@ struct Hdrr {
 }
 
 // File Descriptor Record (FDR)
+// Mirrors the on-disk record: every field is parsed, only some are printed.
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 struct Fdr {
     adr: u32,
@@ -136,6 +138,8 @@ struct Fdr {
 }
 
 // Procedure Descriptor Record (PDR)
+// Mirrors the on-disk record: every field is parsed, only some are printed.
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 struct Pdr {
     adr: u32,

@@ -2,10 +2,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent, MouseButton},
-    event_loop::{ControlFlow, EventLoop},
+    application::ApplicationHandler,
+    event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent, MouseButton},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowAttributes},
+    window::{Window, WindowAttributes, WindowId},
 };
 use glow::HasContext;
 use crate::ps2::Ps2Controller;
@@ -22,7 +23,7 @@ use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{GlSurface, SurfaceAttributesBuilder, SwapInterval, WindowSurface, Surface};
 use glutin_winit::DisplayBuilder;
-use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::num::NonZeroU32;
 use std::ffi::CString;
 
@@ -711,7 +712,7 @@ impl Ui {
         // that created the window/display above. The refresh thread only
         // makes it current later (in GlRenderer::ensure_init); it never calls
         // create_context itself. See the not_current_context field comment.
-        let raw_window_handle = window.raw_window_handle().expect("no raw window handle");
+        let raw_window_handle = window.window_handle().expect("no raw window handle").as_raw();
         let gl_display = gl_config.display();
 
         // Try, in order: (1) explicit GL 3.2 core — what GlCompositor and the
@@ -786,11 +787,7 @@ impl Ui {
         let Ui { ps2, rex3, scsi, window, window_size, scale_snap, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
-        let mut mouse_grabbed = false;
-        let mut rctrl_held = false;
-        // Last window size we accepted, used to tell which edge the user is
-        // dragging when locking the aspect ratio.
-        let mut last_win_size = {
+        let last_win_size = {
             let s = window.inner_size();
             (s.width, s.height)
         };
@@ -811,97 +808,12 @@ impl Ui {
         }
 
         event_loop.set_control_flow(ControlFlow::Wait);
-        event_loop.run(move |event, elwt| {
-            match event {
-                Event::WindowEvent { event, .. } => match event {
-                    WindowEvent::CloseRequested => { elwt.exit() },
-                    WindowEvent::Resized(size) => {
-                        if size.width != 0 && size.height != 0 {
-                            let mut new_size = (size.width, size.height);
-                            // Lock the window to the display's aspect ratio so the
-                            // picture fills it without letterbox bars. Skipped when
-                            // fullscreen or maximized (aspect can't be honoured there)
-                            // and when disabled by config.
-                            if lock_aspect_ratio
-                                && window.fullscreen().is_none()
-                                && !window.is_maximized()
-                            {
-                                let (dw, dh) = *display_res.lock();
-                                if let Some(fixed) = Self::aspect_fit(
-                                    size.width, size.height, last_win_size, dw, dh)
-                                {
-                                    new_size = match window.request_inner_size(
-                                        winit::dpi::PhysicalSize::new(fixed.0, fixed.1))
-                                    {
-                                        // Some => applied synchronously, no further
-                                        // Resized event; use the actual granted size.
-                                        Some(actual) => (actual.width, actual.height),
-                                        None => fixed,
-                                    };
-                                }
-                            }
-                            last_win_size = new_size;
-                            *window_size.lock() = Some(new_size);
-                        }
-                    }
-                    WindowEvent::KeyboardInput { event, .. } => {
-                        Self::handle_keyboard(&ps2, &rex3, &scsi, &scale_snap, event, &mut mouse_grabbed, &mut rctrl_held, &window);
-                    }
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        if mouse_grabbed {
-                            let pressed = state == ElementState::Pressed;
-                            let mask = match button {
-                                MouseButton::Left   => 1,
-                                MouseButton::Right  => 2,
-                                MouseButton::Middle => 4,
-                                _ => 0,
-                            };
-                            if mask != 0 {
-                                let mut md = mouse_delta.lock();
-                                if pressed { md.buttons |= mask; } else { md.buttons &= !mask; }
-                                drop(md);
-                                Self::flush_mouse_delta(&ps2, &mouse_delta, false);
-                            }
-                        } else if state == ElementState::Pressed && button == MouseButton::Left {
-                            mouse_grabbed = true;
-                            if window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
-                                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
-                            }
-                            window.set_cursor_visible(false);
-                            mouse_delta.lock().accum = (0.0, 0.0);
-                        }
-                    }
-                    WindowEvent::MouseWheel { delta, .. } => {
-                        if mouse_grabbed {
-                            let lines = match delta {
-                                winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
-                                winit::event::MouseScrollDelta::PixelDelta(p)  => p.y / scroll_pixels_per_line,
-                            };
-                            mouse_delta.lock().wheel += lines;
-                        }
-                    }
-                    WindowEvent::Focused(false) => {
-                        if mouse_grabbed {
-                            mouse_grabbed = false;
-                            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
-                            window.set_cursor_visible(true);
-                        }
-                    }
-                    WindowEvent::RedrawRequested => {
-                        // Rendering is driven by the Rex3 refresh thread
-                    }
-                    _ => (),
-                },
-                Event::DeviceEvent { event: winit::event::DeviceEvent::MouseMotion { delta }, .. } => {
-                    if mouse_grabbed {
-                        let mut md = mouse_delta.lock();
-                        md.accum.0 += delta.0 / scale as f64;
-                        md.accum.1 += delta.1 / scale as f64;
-                    }
-                },
-                _ => (),
-            }
-        }).unwrap();
+        let mut app = UiApp {
+            ps2, rex3, scsi, window, window_size, scale_snap, display_res, mouse_delta,
+            scale, scroll_pixels_per_line, lock_aspect_ratio,
+            mouse_grabbed: false, rctrl_held: false, last_win_size,
+        };
+        event_loop.run_app(&mut app).unwrap();
     }
 
     fn flush_mouse_delta(ps2: &Ps2Controller, mouse_delta: &Mutex<MouseDelta>, require_motion: bool) {
@@ -1023,6 +935,123 @@ impl Ui {
             }
 
             ps2.push_kb(keycode, pressed);
+        }
+    }
+}
+
+/// `Ui::run`'s event-loop state: `run_app` takes the old closure's captures as a struct.
+struct UiApp {
+    ps2:         Arc<Ps2Controller>,
+    rex3:        Arc<Rex3>,
+    scsi:        Arc<Wd33c93a>,
+    window:      Arc<Window>,
+    window_size: Arc<Mutex<Option<(u32, u32)>>>,
+    scale_snap:  Arc<Mutex<Option<ScaleSnap>>>,
+    display_res: Arc<Mutex<(u32, u32)>>,
+    mouse_delta: Arc<Mutex<MouseDelta>>,
+    scale: u32,
+    scroll_pixels_per_line: f64,
+    lock_aspect_ratio: bool,
+    mouse_grabbed: bool,
+    rctrl_held: bool,
+    // Last accepted window size: tells which edge is being dragged when locking the aspect ratio.
+    last_win_size: (u32, u32),
+}
+
+impl ApplicationHandler for UiApp {
+    // Window and GL context are created up front in Ui::new — nothing to (re)create here.
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => { event_loop.exit() },
+            WindowEvent::Resized(size) => {
+                if size.width != 0 && size.height != 0 {
+                    let mut new_size = (size.width, size.height);
+                    // Lock the window to the display's aspect ratio so the
+                    // picture fills it without letterbox bars. Skipped when
+                    // fullscreen or maximized (aspect can't be honoured there)
+                    // and when disabled by config.
+                    if self.lock_aspect_ratio
+                        && self.window.fullscreen().is_none()
+                        && !self.window.is_maximized()
+                    {
+                        let (dw, dh) = *self.display_res.lock();
+                        if let Some(fixed) = Ui::aspect_fit(
+                            size.width, size.height, self.last_win_size, dw, dh)
+                        {
+                            new_size = match self.window.request_inner_size(
+                                winit::dpi::PhysicalSize::new(fixed.0, fixed.1))
+                            {
+                                // Some => applied synchronously, no further
+                                // Resized event; use the actual granted size.
+                                Some(actual) => (actual.width, actual.height),
+                                None => fixed,
+                            };
+                        }
+                    }
+                    self.last_win_size = new_size;
+                    *self.window_size.lock() = Some(new_size);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                Ui::handle_keyboard(&self.ps2, &self.rex3, &self.scsi, &self.scale_snap, event,
+                    &mut self.mouse_grabbed, &mut self.rctrl_held, &self.window);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.mouse_grabbed {
+                    let pressed = state == ElementState::Pressed;
+                    let mask = match button {
+                        MouseButton::Left   => 1,
+                        MouseButton::Right  => 2,
+                        MouseButton::Middle => 4,
+                        _ => 0,
+                    };
+                    if mask != 0 {
+                        let mut md = self.mouse_delta.lock();
+                        if pressed { md.buttons |= mask; } else { md.buttons &= !mask; }
+                        drop(md);
+                        Ui::flush_mouse_delta(&self.ps2, &self.mouse_delta, false);
+                    }
+                } else if state == ElementState::Pressed && button == MouseButton::Left {
+                    self.mouse_grabbed = true;
+                    if self.window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
+                        let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+                    }
+                    self.window.set_cursor_visible(false);
+                    self.mouse_delta.lock().accum = (0.0, 0.0);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.mouse_grabbed {
+                    let lines = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+                        winit::event::MouseScrollDelta::PixelDelta(p)  => p.y / self.scroll_pixels_per_line,
+                    };
+                    self.mouse_delta.lock().wheel += lines;
+                }
+            }
+            WindowEvent::Focused(false) => {
+                if self.mouse_grabbed {
+                    self.mouse_grabbed = false;
+                    let _ = self.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                    self.window.set_cursor_visible(true);
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                // Rendering is driven by the Rex3 refresh thread
+            }
+            _ => (),
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if self.mouse_grabbed {
+                let mut md = self.mouse_delta.lock();
+                md.accum.0 += delta.0 / self.scale as f64;
+                md.accum.1 += delta.1 / self.scale as f64;
+            }
         }
     }
 }

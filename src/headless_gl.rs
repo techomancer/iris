@@ -11,7 +11,7 @@ use glutin::display::GetGlDisplay;
 use glutin::prelude::*;
 use glutin::surface::{GlSurface, Surface, SwapInterval, WindowSurface};
 use glutin_winit::{DisplayBuilder, GlWindow};
-use raw_window_handle::HasRawWindowHandle;
+use raw_window_handle::HasWindowHandle;
 use winit::event_loop::EventLoop;
 use winit::window::WindowAttributes;
 
@@ -47,7 +47,7 @@ impl HeadlessGl {
             .ok()?;
 
         let window = window?;
-        let raw_window_handle = window.raw_window_handle().ok()?;
+        let raw_window_handle = window.window_handle().ok()?.as_raw();
         let gl_display = gl_config.display();
 
         let context_attributes = ContextAttributesBuilder::new().build(Some(raw_window_handle));

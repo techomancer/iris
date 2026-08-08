@@ -1668,5 +1668,4 @@ const DISK_FILTERS:   &[(&str, &[&str])] = &[
     ("All",         &["*"]),
 ];
 const ANY_FILTERS:    &[(&str, &[&str])] = &[("All", &["*"])];
-const SOCKET_FILTERS: &[(&str, &[&str])] = &[("Unix socket", &["sock"]), ("All", &["*"])];
 
