@@ -345,11 +345,14 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
 
     // N64 development board (Ultra64). A single runtime toggle — the GIO device
     // and POSIX shm bridge (/iris_n64_bridge) are only created when this is on,
-    // read once at VM start. Hidden in App Store builds: the sandbox can't open
-    // the named shm or run the external gopher64 process it talks to.
+    // read once at VM start. The toggle exists only in builds that carry the
+    // board (source builds with --features ultra64; shipped builds don't), and
+    // never in App Store builds: the sandbox can't open the named shm or run the
+    // external gopher64 process it talks to.
     #[cfg(not(feature = "appstore"))]
     {
         ui.separator();
+        #[cfg(feature = "ultra64")]
         ui.checkbox(&mut cfg.ultra64.enabled, "N64 development board (Ultra64)")
             .on_hover_text(
                 "Emulate the SGI Indy N64 development board. Requires the gopher64 \
@@ -357,10 +360,13 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
                  IRIX. Applies on next Start. See docs/ultra64.md.",
             );
         ui.label(
-            RichText::new(
+            RichText::new(if cfg!(feature = "ultra64") {
                 "Settings autosave ~600 ms after edits (watch for * next to the machine name). \
-                 Platform, resolution, and Ultra64 apply on the next Stop → Start.",
-            )
+                 Platform, resolution, and Ultra64 apply on the next Stop → Start."
+            } else {
+                "Settings autosave ~600 ms after edits (watch for * next to the machine name). \
+                 Platform and resolution apply on the next Stop → Start."
+            })
             .weak()
             .small(),
         );
@@ -1405,7 +1411,13 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             .small(),
     );
     ui.separator();
-    ui.label("JIT (requires `cargo build --features jit`)");
+    // The v1 MIPS JIT is an opt-in build feature, so these knobs do nothing
+    // unless this binary was built with iris-gui's `jit` passthrough.
+    ui.label(if build_features::JIT {
+        "JIT"
+    } else {
+        "JIT (inert — this build has no JIT; rebuild with `cargo build -p iris-gui --features jit`)"
+    });
     Grid::new("jit_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Enable JIT (IRIS_JIT=1)");
         ui.checkbox(&mut cfg.jit.enabled, "");

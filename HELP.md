@@ -691,8 +691,12 @@ development board IPC bridge.  The IRIS-compatible fork lives at:
    enabled = true
    ```
 
+   The dev board is an opt-in build feature — without `ultra64` the `[ultra64]`
+   section is ignored and no board appears in GIO slot 0:
+
    ```bash
-   cargo run --release --features lightning,rex-jit
+   cargo run --release --features lightning,rex-jit,ultra64          # CLI
+   cargo run --release -p iris-gui --features ultra64                # GUI
    ```
 
 2. Build and run the N64 emulator (it can be started at any time — it will

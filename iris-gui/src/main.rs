@@ -262,6 +262,7 @@ struct App {
     /// Whether the "Mount the shared folder in IRIX" Help window is open.
     show_nfs_help: bool,
     /// Whether the "N64 development board (Ultra64)" Help window is open.
+    #[cfg(feature = "ultra64")]
     show_ultra64_help: bool,
     /// Whether the License / Privacy Help windows are open.
     show_license: bool,
@@ -494,6 +495,7 @@ impl App {
             serial_input: String::new(),
             show_help_info: false,
             show_nfs_help: false,
+            #[cfg(feature = "ultra64")]
             show_ultra64_help: false,
             show_license: false,
             show_privacy: false,
@@ -1409,10 +1411,11 @@ impl App {
                     self.show_nfs_help = true;
                     ui.close();
                 }
-                // N64 dev board getting-started guide. Hidden in App Store
-                // builds, where the board can't run (sandbox blocks the POSIX
-                // shm bridge and there's no way to run the external gopher64).
-                #[cfg(not(feature = "appstore"))]
+                // N64 dev board getting-started guide. Only in builds that carry
+                // the board (source builds with --features ultra64), and never in
+                // App Store builds, where it can't run anyway (sandbox blocks the
+                // POSIX shm bridge and there's no way to run the external gopher64).
+                #[cfg(all(feature = "ultra64", not(feature = "appstore")))]
                 if ui.button("🎮 N64 development board (Ultra64)…")
                     .on_hover_text("How to set up the N64 devkit and run ROMs with gload")
                     .clicked()
@@ -1454,20 +1457,19 @@ impl App {
                 // jit/rex-jit are compile-time features, but the sandbox (App
                 // Store) build forces interpreter-only at runtime via IRIS_NO_JIT
                 // (Cranelift's non-MAP_JIT pages get killed under the sandbox).
-                // Report the runtime reality so a compiled-in "jit: on" doesn't
-                // read as "the JIT is running" when it can't be.
+                // Report the runtime reality so a compiled-in "on" doesn't read
+                // as "the JIT is running" when it can't be. Not-compiled-in is
+                // plain "off" — shipped builds carry rex-jit but not the v1 jit,
+                // so "off (sandbox)" there would name the wrong reason.
                 let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
-                let jit_state = |feat: bool| if jit_off { "off (sandbox)" } else if feat { "on" } else { "off" };
+                let jit_state = |feat: bool| if !feat { "off" } else if jit_off { "off (sandbox)" } else { "on" };
                 ui.label(format!("  jit:       {}", jit_state(bf::JIT)));
                 ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
-                // ultra64 (N64 dev board) is compiled in, but the App Store
-                // sandbox can't open its POSIX shm bridge — report the runtime
-                // reality there, matching the jit/rex-jit treatment above.
-                let ultra64_state = if cfg!(feature = "appstore") {
-                    "off (sandbox)"
-                } else if bf::ULTRA64 { "on" } else { "off" };
-                ui.label(format!("  ultra64:   {}", ultra64_state));
+                // ultra64 (N64 dev board) is a source-build opt-in; shipped builds
+                // don't carry it, and the App Store sandbox couldn't open its
+                // POSIX shm bridge even if they did.
+                ui.label(format!("  ultra64:   {}", if bf::ULTRA64 { "on" } else { "off" }));
             });
         });
     }
@@ -2754,6 +2756,7 @@ impl App {
     /// bridge); the N64 itself is the external gopher64 fork, so the guide is
     /// mostly about wiring the two processes together. Never reachable in App
     /// Store builds (the menu item that opens it is compiled out there).
+    #[cfg(feature = "ultra64")]
     fn ultra64_help_window(&mut self, ctx: &egui::Context) {
         if !self.show_ultra64_help {
             return;
@@ -3256,6 +3259,7 @@ impl eframe::App for App {
         self.nfs_help_window(ctx);
 
         // Help → "N64 development board (Ultra64)" — devkit getting-started guide.
+        #[cfg(feature = "ultra64")]
         self.ultra64_help_window(ctx);
 
         // "Synchronizing disks…" modal during the exit-time CHD fold-back.

@@ -76,16 +76,24 @@ r5k = ["iris/r5k"]
 # YouTube / max in-process perf: lightning (no GDB hot-path) + idle-pause on the
 # embedded iris core. Build with: cargo build -p iris-gui --release --features premiere
 premiere = ["iris/lightning", "iris/idle-pause"]
+# v1 MIPS JIT, then armed at runtime with IRIS_JIT=1. Off by default, so the
+# Debug tab's JIT section is inert unless you build with this.
+# Build with: cargo build -p iris-gui --features jit
+jit = ["iris/jit"]
+# N64 development board (Ultra64) — GIO slot 0 + POSIX shm bridge to an external
+# gopher64. Gates both the core device and this crate's toggle/help window (the
+# `ultra64` field on iris's Config only exists with the core feature on).
+# Build with: cargo build -p iris-gui --features ultra64
+ultra64 = ["iris/ultra64"]
 
 [dependencies]
-# Group A (additive) features are always on for iris-gui so the user can
-# enable them at runtime via the config UI: chd (.chd disk paths), camera
-# (vino source), jit (IRIS_JIT toggle), rex-jit, ultra64 (N64 dev board IPC
-# bridge). They add code paths and native dependencies (ultra64: shared_memory
-# + raw_sync, both cross-platform) but no runtime cost when unused — the
-# ultra64 GIO device + POSIX shm bridge are only created when the user enables
-# the board on the General tab. The toggle itself is hidden in App Store builds.
-iris = { path = "..", features = ["chd", "camera", "jit", "rex-jit", "ultra64"] }
+# Group A (additive) features are always on for iris-gui so the user can enable
+# them at runtime via the config UI: chd (.chd disk paths), camera (vino source),
+# rex-jit (REX3 draw-shader compiler). They add code paths and native deps but no
+# runtime cost when unused. `jit` and `ultra64` used to be here too; they are now
+# opt-in passthrough features (above), since neither is usable without extra
+# setup — IRIS_JIT=1 for the one, an external gopher64 for the other.
+iris = { path = "..", features = ["chd", "camera", "rex-jit"] }
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.35"
 crossbeam-channel = "0.5"
