@@ -38,14 +38,26 @@
   #define ArchIdentifier "x64compatible"
 #endif
 
-#define MyAppName "IRIS"
+; CPU variant of the bundled iris-gui.exe. CI passes /DR5000=1 for the R5000
+; build; without it this is the default R4400 build. The two get distinct AppIds,
+; names, and default folders so both can be installed side by side — same binary
+; layout, different emulated CPU (a compile-time choice, so they can't be one
+; installer with a switch).
+#ifdef R5000
+  #define MyAppName "IRIS (R5000)"
+  #define MyAppId "{{2B6E5D74-9C41-4A83-B7F0-5E1C8D2A64B9}"
+#else
+  #define MyAppName "IRIS"
+  #define MyAppId "{{A7F2C91E-3D8B-4F5A-8E2C-1B9D6A3E8F42}"
+#endif
 #define MyAppPublisher "Dani Sarfati"
 #define MyAppURL "https://github.com/danifunker/iris"
 #define MyAppExeName "iris-gui.exe"
 
 [Setup]
-; Stable AppId — do not change across releases.
-AppId={{A7F2C91E-3D8B-4F5A-8E2C-1B9D6A3E8F42}
+; Stable AppIds — do not change across releases (an AppId change orphans the
+; previous install's uninstall entry instead of upgrading it).
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
