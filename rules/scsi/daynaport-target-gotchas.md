@@ -2,10 +2,11 @@
 
 Added 2026-08-12 with `--features daynaport` (`src/daynaport.rs`). Protocol per
 SLINKCMD.TXT rev 1.20, cross-checked against `dp_do_rx()` in
-[irixdayna](https://github.com/techomancer/irixdayna). Verified so far: unit
-tests in `src/daynaport.rs`, and the PROM bus scan finding the target
-(`hinv -v` → `SCSI Device: Controller 0 ID 3`). The full `dp0` ladder (ARP →
-ping → TCP) needs the guest driver and has **not** been run yet.
+[irixdayna](https://github.com/techomancer/irixdayna). **Verified end to end
+2026-08-13** against both IRIX drivers, with no IRIS changes needed: 6.5 walks
+the whole ladder (attach → MAC → ARP → ping → TCP), 5.3 reaches rung 2 before
+hitting driver bugs of its own. Details and the per-rung evidence are in
+`docs/daynaport.md`.
 
 ## 1. `0x08`/`0x0A` are READ(6)/WRITE(6) — dispatch on device kind first
 

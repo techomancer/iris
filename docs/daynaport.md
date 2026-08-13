@@ -157,8 +157,47 @@ cd ../irixdayna
 scripts/iris-build.sh --release 5.3 --boot-test
 ```
 
-The acceptance ladder, in order — each rung isolates a different part of the
-protocol:
+### Verified 2026-08-13, against both IRIX drivers
+
+Run against `irixdayna` on an emulated Indy, with no changes to IRIS itself:
+
+| Rung | IRIX 6.5 | IRIX 5.3 |
+|---|---|---|
+| 1 Detected | ✅ `dp0: DaynaPort SCSI/Link at SCSI id 3` | ✅ `dp0: … at scsi(0) target 3 lun 0` |
+| 2 MAC read | ✅ | ✅ `dp0: MAC 0:80:19:44:50:3` |
+| 3 ARP | ✅ `? (192.168.10.1) at 2:0:de:ad:da:3` | ✅ |
+| 4 Ping | ✅ replies valid, `0 bad checksums` | ✅ **4/4, 0% loss** |
+| 5 TCP | ✅ RST received and parsed | ✅ RST → `Connection refused` |
+
+`ether_attach()` is reached on both, with the driver's `DP_CHECK_ETHERIF`
+canary clean — so the record format, the CRC accounting, RETRIEVE STATS,
+ENABLE / SET INTERFACE MODE and the WRITE path are all confirmed against an
+independent implementation of the other end.
+
+Two caveats, both on the guest side:
+
+- **6.5 must be built with `-DDP_BUILTIN`** (`smake BUILTIN=1`) when it is
+  linked into the kernel rather than loaded as a module. Without it,
+  `dp_scan_invent()` is compiled out, the driver registers for SCSI type 3 and
+  then never attaches — indistinguishable from an absent device.
+- **5.3 needs driver fixes** (all in `irixdayna`, commits `3b9ab26` and
+  `c4b328d`): its `dp_init()` scanned the bus before the SCSI layer had cached
+  any INQUIRY, and its watchdog used `ifptoeif()` — a raw cast that yields a
+  bogus `etherif` on 5.3 and panicked the kernel on `ifconfig up`. With those
+  fixed the full ladder passes. One 5.3 driver bug remains: its periodic poll
+  calls `psema()` from an `itimeout()` callback, which is not legal on 5.3, so
+  the ping above was measured with the poll compiled out
+  (`-DDP_NO_POLL_TIMER`, RX piggybacked on transmits). That is a guest-driver
+  issue — the emulated target behaves identically either way.
+
+Ping loss on 6.5 (1 of 3 matched, ~290 ms RTT, though the kernel counted all
+three replies as valid) is the driver's 10 ms poll plus SCSI round-trip
+latency on an emulated Indy, not a protocol error — `ifconfig up` alone takes
+tens of seconds there. 5.3 with TX-driven RX loses nothing (101–520 ms RTT).
+
+### The ladder
+
+Each rung isolates a different part of the protocol:
 
 1. **Detected** — `dp0: DaynaPort SCSI/Link at scsi(0) target N lun 0`
    (INQUIRY + type-3 dispatch).

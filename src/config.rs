@@ -1064,11 +1064,15 @@ impl MachineConfig {
 // CLI — all fields optional; presence overrides the TOML/default value.
 // ---------------------------------------------------------------------------
 
+/// Config file used when `--config` is not given. A missing one is not an
+/// error (defaults are used); a missing *explicit* one is — see `load_config`.
+pub const DEFAULT_CONFIG: &str = "iris.toml";
+
 #[derive(Parser, Debug)]
 #[command(name = "iris", about = "SGI Indy (MIPS R4400) emulator")]
 pub struct Cli {
     /// Path to iris.toml config file [default: iris.toml]
-    #[arg(long, default_value = "iris.toml")]
+    #[arg(long, default_value = DEFAULT_CONFIG)]
     pub config: String,
 
     /// Path to PROM image
@@ -1288,6 +1292,17 @@ pub fn load_config() -> (MachineConfig, u32) {
             eprintln!("iris: --list-net-interfaces requires a build with --features pcap");
             std::process::exit(1);
         }
+    }
+
+    // A missing `iris.toml` is fine — that's the "just run it" path, and
+    // load_toml falls back to defaults. But a config the user *named* on the
+    // command line and that isn't there is a typo or a relative path resolved
+    // against the wrong cwd, and silently booting a default machine instead
+    // (different disks, no DaynaPort, whatever they configured) wastes a run
+    // before anyone notices.
+    if cli.config != DEFAULT_CONFIG && !std::path::Path::new(&cli.config).exists() {
+        eprintln!("Configuration error: --config {} does not exist", cli.config);
+        std::process::exit(1);
     }
 
     let toml_cfg = MachineConfig::load_toml(&cli.config);
