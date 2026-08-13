@@ -51,6 +51,7 @@ pub fn evaluate(status: &Status, cfg: &MachineConfig) -> UnsafeReasons {
         let persists_to_base = !dev.cdrom
             && !dev.overlay
             && !dev.scratch
+            && !dev.is_daynaport() // no image behind a network adapter
             && !dev.path.ends_with(".chd");
         if persists_to_base {
             r.writable_disks.push(*id);

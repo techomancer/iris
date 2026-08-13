@@ -790,6 +790,8 @@ impl App {
         let mut out = Vec::new();
         for (&id, dev) in &self.cfg.scsi {
             if dev.scratch { continue; }
+            // A DaynaPort is a network adapter — no image to be missing.
+            if dev.is_daynaport() { continue; }
             // Empty CD-ROM (no path, no changer entries) means "drive present,
             // tray empty" — a valid configured state, not missing.
             if dev.cdrom && dev.path.is_empty() && dev.discs.is_empty() {
@@ -2967,6 +2969,10 @@ impl App {
                 }
                 for id in ids {
                     let d = &self.cfg.scsi[&id];
+                    if d.is_daynaport() {
+                        ui.label(format!("scsi{id} DaynaPort (Ethernet)"));
+                        continue;
+                    }
                     let kind = if d.cdrom { "CD" } else { "HDD" };
                     ui.label(format!("scsi{id} {kind}: {}", abs_path(&d.path)));
                 }
@@ -3234,8 +3240,7 @@ impl eframe::App for App {
         if let Some(result) = self.create_disk.take_result() {
             let path_str = result.path.to_string_lossy().into_owned();
             self.cfg.scsi.insert(result.scsi_id, iris::config::ScsiDeviceConfig {
-                path: path_str.clone(), discs: vec![], cdrom: false,
-                overlay: false, scratch: false, size_mb: None,
+                path: path_str.clone(), ..Default::default()
             });
             self.mark_dirty();
             self.toast(format!("created {path_str} and attached at scsi{}", result.scsi_id));

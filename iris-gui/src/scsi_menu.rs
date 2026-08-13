@@ -52,7 +52,16 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         ui.close();
                     }
                 }
-                Some(d) if d.cdrom => {
+                Some(d) if d.is_daynaport() => {
+                    ui.label("DaynaPort SCSI/Link (Ethernet). Configure its MAC and \
+                              subnet on the Config tab.");
+                    ui.separator();
+                    if ui.button("Detach DaynaPort").clicked() {
+                        action = ScsiAction::Detach { id };
+                        ui.close();
+                    }
+                }
+                Some(d) if d.is_cdrom() => {
                     let has_media = !d.path.is_empty() && Path::new(&d.path).exists();
                     if has_media {
                         if ui.button("Eject (tray empty)").clicked() {
@@ -116,7 +125,8 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
 fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
     match dev {
         None => format!("SCSI #{id}: (empty)"),
-        Some(d) if d.cdrom => {
+        Some(d) if d.is_daynaport() => format!("SCSI #{id}: DaynaPort (Ethernet)"),
+        Some(d) if d.is_cdrom() => {
             if d.path.is_empty() {
                 format!("SCSI #{id}: CD (no media)")
             } else if !Path::new(&d.path).exists() {
@@ -167,22 +177,16 @@ pub fn apply(cfg: &mut MachineConfig, action: ScsiAction) -> Option<String> {
     match action {
         ScsiAction::None => None,
         ScsiAction::AttachHdd { id, path } => {
-            cfg.scsi.insert(id, ScsiDeviceConfig {
-                path, discs: vec![], cdrom: false, overlay: false, scratch: false, size_mb: None,
-            });
+            cfg.scsi.insert(id, ScsiDeviceConfig { path, ..Default::default() });
             Some(format!("scsi{id}: HDD attached"))
         }
         ScsiAction::AttachEmptyCdrom { id } => {
-            cfg.scsi.insert(id, ScsiDeviceConfig {
-                path: String::new(), discs: vec![], cdrom: true,
-                overlay: false, scratch: false, size_mb: None,
-            });
+            cfg.scsi.insert(id, ScsiDeviceConfig { cdrom: true, ..Default::default() });
             Some(format!("scsi{id}: empty CD-ROM drive attached (Stop→Start if VM is running)"))
         }
         ScsiAction::AttachCdromWithDisc { id, path } => {
             cfg.scsi.insert(id, ScsiDeviceConfig {
-                path: path.clone(), discs: vec![], cdrom: true,
-                overlay: false, scratch: false, size_mb: None,
+                path: path.clone(), cdrom: true, ..Default::default()
             });
             Some(format!("scsi{id}: CD-ROM attached with disc"))
         }

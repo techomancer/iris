@@ -69,6 +69,13 @@ appstore = ["bundled"]
 # interfaces in a dropdown and the in-process VM can actually bridge onto them.
 # Build with: cargo build -p iris-gui --features pcap
 pcap = ["iris/pcap"]
+# DaynaPort SCSI/Link target — Ethernet over the SCSI bus, selectable per SCSI
+# id on the Disks tab. Off by default: it is only useful with a guest driver
+# (IRIX: github.com/techomancer/irixdayna), and without one the device just sits
+# on the bus. The Disks tab still shows the option in a build without it, with a
+# "rebuild with --features daynaport" warning, so a config stays editable.
+# Build with: cargo build -p iris-gui --features daynaport
+daynaport = ["iris/daynaport"]
 # Emulate an R5000 CPU instead of the default R4400 (compile-time: the cache
 # model differs deeply). Surfaced read-only on the Memory tab via
 # iris::build_features::CPU. Build with: cargo build -p iris-gui --features r5k

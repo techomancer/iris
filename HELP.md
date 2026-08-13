@@ -371,6 +371,15 @@ cdrom = true
 # cdrom = true
 # discs = ["irix65.iso", "extras.iso", "patches.iso"]
 
+# DaynaPort SCSI/Link — Ethernet over the SCSI bus. Needs a build with
+# --features daynaport and a driver in the guest (IRIX: irixdayna -> dp0).
+# It has no disk image; mac and subnet are optional (defaults derived from the
+# SCSI id / 192.168.10.0/24). See docs/daynaport.md.
+# [scsi.3]
+# kind   = "daynaport"
+# mac    = "00:80:19:12:34:56"
+# subnet = "192.168.10.0/24"
+
 # VINO video-in (IndyCam emulation).
 # source:   "test_pattern" | "camera" | "black"
 # standard: "ntsc" | "pal"

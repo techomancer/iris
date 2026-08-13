@@ -291,6 +291,34 @@ impl Machine {
         let mut scratch_path: Option<std::path::PathBuf> = None;
         for id in scsi_ids {
             let dev = &cfg.scsi[&id];
+            // DaynaPort SCSI/Link: a network adapter, not storage. None of the
+            // scratch / changer / overlay handling below applies — it has no
+            // image at all.
+            if dev.is_daynaport() {
+                let params = match dev.daynaport_params(id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("iris: fatal: SCSI ID {}: {}", id, e);
+                        std::process::exit(1);
+                    }
+                };
+                match hpc3.add_scsi_daynaport(id as usize, params) {
+                    Ok(()) => println!(
+                        "iris: DaynaPort SCSI/Link at SCSI ID {} — MAC {}, gateway {} (guest {}/{})",
+                        id, crate::net::mac_str(&params.mac),
+                        params.subnet.gateway_ip, params.subnet.client_ip, params.subnet.netmask),
+                    Err(e) => {
+                        let msg = format!("could not attach DaynaPort to SCSI ID {id}: {e}");
+                        if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
+                            eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
+                        } else {
+                            eprintln!("iris: fatal: {msg}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                continue;
+            }
             // Scratch volume: pre-create a raw file with a minimal SGI Volume
             // Header if it doesn't exist. Refuse cdrom/overlay combinations —
             // scratch must be a host-writable raw file. Default size 64 MB.
@@ -378,10 +406,12 @@ impl Machine {
         // Disk + nvram provenance for snapshot manifests. Captured here while
         // the MachineConfig `cfg` is still in scope (it is shadowed by the CPU
         // config below). Identity is the configured path + host file size.
-        let mut disk_provenance: Vec<DiskRef> = cfg.scsi.iter().map(|(&id, dev)| {
-            let size_bytes = std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0);
-            DiskRef { id, path: dev.path.clone(), size_bytes }
-        }).collect();
+        let mut disk_provenance: Vec<DiskRef> = cfg.scsi.iter()
+            .filter(|(_, dev)| !dev.is_daynaport()) // no image behind a DaynaPort
+            .map(|(&id, dev)| {
+                let size_bytes = std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0);
+                DiskRef { id, path: dev.path.clone(), size_bytes }
+            }).collect();
         disk_provenance.sort_by_key(|d| d.id);
         let nvram_provenance = cfg.nvram.clone();
 

@@ -132,13 +132,28 @@ impl DiskBackend {
     }
 }
 
+/// What kind of target sits at this SCSI id.
+///
+/// `Disk` and `Cdrom` share the storage command set below and differ only in
+/// behaviour (block size, TOC, write protection). `DaynaPort` shares nothing
+/// with them: it is a type-3 Processor device whose vendor command set reuses
+/// the READ(6)/WRITE(6) opcodes for packet RX/TX, so it is dispatched *before*
+/// the storage opcodes in `request()` and must never reach them.
+pub enum DeviceKind {
+    Disk,
+    Cdrom,
+    #[cfg(feature = "daynaport")]
+    DaynaPort(Box<crate::daynaport::DaynaPort>),
+}
+
 pub struct ScsiDevice {
-    /// None = no media loaded (CD-ROM drive present but tray is empty).
+    /// None = no media loaded (CD-ROM drive present but tray is empty), or a
+    /// device with no storage behind it at all (DaynaPort).
     /// HDDs are never None in practice.
     backend: Option<DiskBackend>,
     /// Capacity in bytes of the loaded media. 0 when `backend` is None.
     size: u64,
-    is_cdrom: bool,
+    kind: DeviceKind,
     /// Path of the currently mounted image. Empty string when no media.
     filename: String,
     /// Full disc list for CD-ROM changers. Index 0 is always the active disc.
@@ -163,7 +178,7 @@ impl ScsiDevice {
         Self {
             backend: Some(backend),
             size,
-            is_cdrom,
+            kind: if is_cdrom { DeviceKind::Cdrom } else { DeviceKind::Disk },
             filename,
             discs,
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
@@ -183,7 +198,7 @@ impl ScsiDevice {
         Self {
             backend: None,
             size: 0,
-            is_cdrom: true,
+            kind: DeviceKind::Cdrom,
             filename: String::new(),
             discs: vec![],
             buffer: vec![0u8; SCSI_BUFFER_SIZE],
@@ -192,6 +207,52 @@ impl ScsiDevice {
             phys_block_size: 2048,
             logical_block_size: 2048,
         }
+    }
+
+    /// Construct a DaynaPort SCSI/Link target — a type-3 Processor device with
+    /// no storage backing at all (no image, no CHD, no overlay).
+    #[cfg(feature = "daynaport")]
+    pub fn new_daynaport(dp: crate::daynaport::DaynaPort) -> Self {
+        Self {
+            backend: None,
+            size: 0,
+            kind: DeviceKind::DaynaPort(Box::new(dp)),
+            filename: String::new(),
+            discs: vec![],
+            buffer: Vec::new(),
+            pending_sense: [0u8; 18],
+            unit_attention: false,
+            phys_block_size: 512,
+            logical_block_size: 512,
+        }
+    }
+
+    /// The DaynaPort behind this target, if it is one.
+    #[cfg(feature = "daynaport")]
+    pub fn daynaport_mut(&mut self) -> Option<&mut crate::daynaport::DaynaPort> {
+        match &mut self.kind {
+            DeviceKind::DaynaPort(dp) => Some(dp),
+            _ => None,
+        }
+    }
+
+    /// The DaynaPort behind this target, if it is one.
+    #[cfg(feature = "daynaport")]
+    pub fn daynaport(&self) -> Option<&crate::daynaport::DaynaPort> {
+        match &self.kind {
+            DeviceKind::DaynaPort(dp) => Some(dp),
+            _ => None,
+        }
+    }
+
+    /// True for a DaynaPort SCSI/Link target. Callers on the storage path use
+    /// this to skip block-oriented handling (the controller, for instance, must
+    /// not read a WRITE(6) byte count as `blocks × 512`).
+    pub fn is_daynaport(&self) -> bool {
+        #[cfg(feature = "daynaport")]
+        { matches!(self.kind, DeviceKind::DaynaPort(_)) }
+        #[cfg(not(feature = "daynaport"))]
+        { false }
     }
 
     /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
@@ -345,7 +406,7 @@ impl ScsiDevice {
     /// Returns the newly-active disc path, or None when the tray is emptied or
     /// this is not a CD-ROM.
     pub fn eject_next(&mut self) -> Option<String> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return None;
         }
         // 0 or 1 disc: eject empties the tray entirely.
@@ -383,7 +444,7 @@ impl ScsiDevice {
         }
     }
 
-    pub fn is_cdrom(&self) -> bool { self.is_cdrom }
+    pub fn is_cdrom(&self) -> bool { matches!(self.kind, DeviceKind::Cdrom) }
 
     /// Current active disc path (for display / status).
     pub fn current_disc(&self) -> &str {
@@ -411,7 +472,7 @@ impl ScsiDevice {
     ///   - 2+ discs: the new disc is placed at index 0 (active); if it was
     ///     already queued it is moved to the front rather than duplicated.
     pub fn load_disc(&mut self, path: String) -> Result<String, String> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return Err("Not a CD-ROM device".to_string());
         }
         let f = OpenOptions::new().read(true).open(&path)
@@ -448,7 +509,7 @@ impl ScsiDevice {
     /// Insert a new disc path at position 1 (next after current).
     /// Returns Err if this is not a CD-ROM or the path doesn't exist.
     pub fn add_disc(&mut self, path: String) -> Result<(), String> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return Err("Not a CD-ROM device".to_string());
         }
         if !std::path::Path::new(&path).exists() {
@@ -464,7 +525,7 @@ impl ScsiDevice {
     /// Removing index 0 (current) does not eject — it only removes the path.
     /// Returns Err if index is out of range.
     pub fn remove_disc(&mut self, ordinal: usize) -> Result<String, String> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return Err("Not a CD-ROM device".to_string());
         }
         if ordinal >= self.discs.len() {
@@ -476,7 +537,7 @@ impl ScsiDevice {
     /// Move disc at `ordinal` to index 1 (next after current).
     /// If ordinal is 0 (active), returns Err.
     pub fn move_disc_next(&mut self, ordinal: usize) -> Result<(), String> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return Err("Not a CD-ROM device".to_string());
         }
         if ordinal == 0 {
@@ -532,6 +593,20 @@ impl ScsiDevice {
         {
             self.unit_attention = false;
             return Ok(self.check_condition(0x06, 0x28, 0x00));
+        }
+
+        // A DaynaPort answers its own vendor command set, which reuses the
+        // READ(6) (0x08) and WRITE(6) (0x0a) opcodes for packet RX/TX. Dispatch
+        // it here, ahead of the storage match below, or those two would be
+        // read as disk block transfers. It answers no storage command at all —
+        // not READ CAPACITY, not MODE SENSE, not READ TOC.
+        #[cfg(feature = "daynaport")]
+        if let DeviceKind::DaynaPort(dp) = &mut self.kind {
+            let mut response = dp.request(req)?;
+            if let ScsiDataLength::Fixed(max_len) = req.data_len {
+                response.data.truncate(max_len.min(response.data.len()));
+            }
+            return Ok(response);
         }
 
         let mut response = match req.cdb[0] {
@@ -602,12 +677,12 @@ impl ScsiDevice {
         let lun = (cdb[1] >> 5) & 0x7;
 
         if lun == 0 {
-            data[0] = if self.is_cdrom { 0x05 } else { 0x00 };
-            data[1] = if self.is_cdrom { 0x80 } else { 0x00 }; // RMB (Removable)
+            data[0] = if self.is_cdrom() { 0x05 } else { 0x00 };
+            data[1] = if self.is_cdrom() { 0x80 } else { 0x00 }; // RMB (Removable)
             data[2] = 0x02; // ANSI SCSI-2
             data[3] = 0x02; // SCSI-2 response format
             data[4] = 31;   // Additional length (36 - 5)
-            if self.is_cdrom {
+            if self.is_cdrom() {
                 // Match Sony CDU-76S — SGI Indy shipped with this drive and IRIX mediad
                 // uses the vendor/product strings for feature detection (volume control, eject).
                 data[8..16].copy_from_slice(b"Sony    ");
@@ -702,7 +777,7 @@ impl ScsiDevice {
     }
 
     fn perform_write(&mut self, lba: u64, count: usize, data_in: Option<&Vec<u8>>) -> Result<ScsiResponse, std::io::Error> {
-        if self.is_cdrom {
+        if self.is_cdrom() {
             return Ok(ScsiResponse {
                 status: 0x02, // Check Condition
                 data: vec![],
@@ -740,7 +815,7 @@ impl ScsiDevice {
         // Byte 4: bit1=LOEJ, bit0=START
         let loej  = (cdb[4] & 0x02) != 0;
         let start = (cdb[4] & 0x01) != 0;
-        if loej && !start && self.is_cdrom {
+        if loej && !start && self.is_cdrom() {
             // Eject requested. eject_next() handles the count-driven cases:
             // 0/1 disc empties the tray; 2+ discs cycle to the next.
             self.eject_next();
@@ -758,7 +833,7 @@ impl ScsiDevice {
         // Returning a page-8-incompatible response triggers the noisy
         // "Got wrong page" path; CHECK CONDITION with ASC 0x24 hits the
         // clean "Cache data unavailable" / "bad_sense" path instead.
-        if self.is_cdrom && matches!(page_code, 0x08 | 0x03 | 0x04) {
+        if self.is_cdrom() && matches!(page_code, 0x08 | 0x03 | 0x04) {
             return Ok(self.check_condition(0x05, 0x24, 0x00)); // Illegal Request: Invalid field in CDB
         }
 
@@ -805,7 +880,7 @@ impl ScsiDevice {
         // Page 0x2a: CD Capabilities and Mechanical Status (MMC, CD-ROM only)
         // sr.c reads this to determine drive speed and capabilities.
         // Return minimal read-only CD-ROM capabilities at 4x speed.
-        if self.is_cdrom && want_page(0x2a) {
+        if self.is_cdrom() && want_page(0x2a) {
             pages.extend_from_slice(&[
                 0x2a, 0x12,             // page code, length (18 bytes follow)
                 0x00, 0x00,             // methods 1/2 not supported
@@ -823,7 +898,7 @@ impl ScsiDevice {
         }
 
         // Page 0x0e: CD Audio Control (CD-ROM only) — required by IRIX mediad
-        if self.is_cdrom && want_page(0x0e) {
+        if self.is_cdrom() && want_page(0x0e) {
             pages.extend_from_slice(&[
                 0x0e, 0x0e,         // page code, length
                 0x04,               // IMMED=1
@@ -841,7 +916,7 @@ impl ScsiDevice {
         }
 
         // Pages 0x03/0x04 are HDD-only (rigid disk geometry)
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             // Page 0x03: Format Parameters
             if want_page(0x03) {
                 let bps = lbs as u16;
@@ -886,8 +961,8 @@ impl ScsiDevice {
         let total_len = 4 + bd_len + pages.len();
         let mut data = vec![0u8; total_len];
         data[0] = (total_len - 1) as u8; // Mode Data Length (excludes byte 0)
-        data[1] = if self.is_cdrom { 0x01 } else { 0x00 }; // Medium type (0x01 = 120mm optical for CD-ROM)
-        data[2] = if self.is_cdrom { 0x80 } else { 0x00 }; // WP bit for CD-ROM (read-only media)
+        data[1] = if self.is_cdrom() { 0x01 } else { 0x00 }; // Medium type (0x01 = 120mm optical for CD-ROM)
+        data[2] = if self.is_cdrom() { 0x80 } else { 0x00 }; // WP bit for CD-ROM (read-only media)
         data[3] = bd_len as u8;
         data[4..4 + bd_len].copy_from_slice(&block_desc);
         data[4 + bd_len..].copy_from_slice(&pages);
@@ -1133,7 +1208,7 @@ impl ScsiDevice {
     /// count-driven cases: 0/1 disc empties the tray; 2+ discs cycle to the
     /// next and raise Unit Attention so IRIX re-reads the TOC.
     fn exec_sgi_eject(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid command for HDD
         }
         self.eject_next();
@@ -1150,7 +1225,7 @@ impl ScsiDevice {
     }
 
     fn exec_get_configuration(&mut self, _cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        if !self.is_cdrom {
+        if !self.is_cdrom() {
             return Ok(self.check_condition(0x05, 0x20, 0x00)); // Invalid Command
         }
         // Minimal response: header + Feature 0x0000 (Profile List) with CD-ROM profile

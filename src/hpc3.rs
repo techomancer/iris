@@ -1008,6 +1008,10 @@ pub struct Hpc3 {
     scsi_dev: Arc<Wd33c93a>,
     hal2: Option<Arc<Hal2>>,
     pdma_dump: Arc<AtomicU32>,
+    /// The machine's gateway settings, kept so a DaynaPort SCSI target can be
+    /// given its own `NatEngine` sharing the backend selection (NAT vs PCAP)
+    /// and the NFS export, but with its own subnet and MAC.
+    net_base: GatewayConfig,
     /// Indy (Guinness) vs Indigo2 (fullhouse). No HPC3 register divergence from
     /// Indy today — retained for future fullhouse paths (EISA pbus, dual INT2).
     #[allow(dead_code)]
@@ -1102,6 +1106,7 @@ impl Hpc3 {
             nfs_pcap_ip,
             ..GatewayConfig::default()
         };
+        let net_base = gateway_cfg.clone();
         let seeq = Arc::new(Seeq8003::with_config(Some(seeq_irq), Some(enet_rx_dma), Some(enet_tx_dma), gateway_cfg, heartbeat.clone()));
         // Publish seeq to both the DMA ops (CTRL reads) and the irq (status checks in set_interrupt)
         let _ = enet_seeq_lock.set(seeq.clone());
@@ -1131,6 +1136,7 @@ impl Hpc3 {
             scsi_dev,
             hal2,
             pdma_dump,
+            net_base,
             guinness,
         }
     }
@@ -1148,6 +1154,28 @@ impl Hpc3 {
 
     pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
         self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay, None)
+    }
+
+    /// Attach a DaynaPort SCSI/Link (SCSI-attached Ethernet) at `id`.
+    ///
+    /// Each DaynaPort gets its **own** `NatEngine` on its own subnet, separate
+    /// from the onboard SEEQ's — so `dp0` and `ec0` land on different networks
+    /// and traffic through the DaynaPort is unmistakable. Backend selection
+    /// (NAT vs PCAP) and the NFS export are inherited from `[network]`/`[nfs]`;
+    /// host port forwards are **not**, since only one engine can own a host
+    /// listening port.
+    pub fn add_scsi_daynaport(&self, id: usize, params: crate::config::DaynaportParams) -> std::io::Result<()> {
+        let gateway = GatewayConfig {
+            // A distinct gateway MAC per target: same 02:00:DE:AD prefix as the
+            // SEEQ's, then DA ("Dayna") and the SCSI id.
+            gateway_mac: [0x02, 0x00, 0xDE, 0xAD, 0xDA, id as u8],
+            gateway_ip:  params.subnet.gateway_ip,
+            client_ip:   params.subnet.client_ip,
+            netmask:     params.subnet.netmask,
+            port_forwards: vec![],
+            ..self.net_base.clone()
+        };
+        self.scsi_dev.add_daynaport(id, params.mac, gateway)
     }
 
     /// Same as `add_scsi_device` but lets the caller specify where the COW

@@ -91,6 +91,7 @@ cargo run --release --features ci_clock              # synthetic deterministic C
 cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
 cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
 cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
+cargo run --release --features daynaport             # DaynaPort SCSI/Link: Ethernet over the SCSI bus, selectable per SCSI id. Needs a guest driver. See docs/daynaport.md.
 ```
 
 ### CHD image support (`--features chd`)
@@ -193,6 +194,28 @@ Caveats:
 Without `--features pcap`, selecting `mode = "pcap"` logs a warning and falls
 back to the NAT gateway, and `--list-net-interfaces` reports that the feature
 is missing.
+
+
+## DaynaPort SCSI/Link (`--features daynaport`)
+
+A SCSI-attached Ethernet adapter (SCSI type 3, Processor) selectable on any
+SCSI id — a second network path for the guest that goes over the SCSI bus
+instead of the onboard SEEQ. Off by default, because it is only useful with a
+guest driver; IRIX has none in the box (see
+[irixdayna](https://github.com/techomancer/irixdayna), where it appears as
+`dp0`).
+
+```toml
+[scsi.3]
+kind = "daynaport"            # default "disk"; "cdrom" / cdrom = true unchanged
+mac  = "00:80:19:12:34:56"    # optional; default derived from the SCSI id
+subnet = "192.168.10.0/24"    # optional; this target's own NAT subnet
+```
+
+Each DaynaPort runs its own NAT gateway (or PCAP bridge, in a `--features pcap`
+build) on its own subnet, so `dp0` and `ec0` never share a network. `scsi dayna`
+in the monitor shows its MAC, addresses and counters. Full protocol and
+verification notes: [docs/daynaport.md](docs/daynaport.md).
 
 
 ## R5000 CPU (`--features r5k`)

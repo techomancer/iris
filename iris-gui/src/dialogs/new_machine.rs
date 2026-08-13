@@ -243,21 +243,14 @@ impl NewMachineDialog {
                         if !self.scsi1_path.is_empty() {
                             cfg.scsi.insert(1, ScsiDeviceConfig {
                                 path: self.scsi1_path.clone(),
-                                discs: vec![],
-                                cdrom: false,
-                                overlay: false,
-                                scratch: false,
-                                size_mb: None,
+                                ..Default::default()
                             });
                         }
                         if self.attach_cdrom && !self.cdrom4_path.is_empty() {
                             cfg.scsi.insert(4, ScsiDeviceConfig {
                                 path: self.cdrom4_path.clone(),
-                                discs: vec![],
                                 cdrom: true,
-                                overlay: false,
-                                scratch: false,
-                                size_mb: None,
+                                ..Default::default()
                             });
                         }
                         let name = if self.name.trim().is_empty() { "indy".to_string() } else { self.name.trim().to_string() };

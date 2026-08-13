@@ -446,6 +446,42 @@ impl Wd33c93a {
         Ok(())
     }
 
+    /// Attach a DaynaPort SCSI/Link target — a SCSI-attached Ethernet adapter.
+    /// Unlike every other target it has no file backing at all, so none of the
+    /// image/CHD/overlay path above runs. Its backend thread (NAT gateway, or
+    /// PCAP bridge) is started here, before the device becomes visible on the
+    /// bus, so the first INQUIRY already finds a live interface.
+    #[cfg(feature = "daynaport")]
+    pub fn add_daynaport(
+        &self,
+        id: usize,
+        mac: [u8; 6],
+        gateway: crate::net::GatewayConfig,
+    ) -> std::io::Result<()> {
+        if id >= 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput, "SCSI ID out of range"));
+        }
+        let mut dp = crate::daynaport::DaynaPort::new(id, mac, gateway, self.heartbeat.clone());
+        dp.start();
+        let mut state = self.state.lock();
+        state.devices[id] = Some(ScsiDevice::new_daynaport(dp));
+        Ok(())
+    }
+
+    #[cfg(not(feature = "daynaport"))]
+    pub fn add_daynaport(
+        &self,
+        _id: usize,
+        _mac: [u8; 6],
+        _gateway: crate::net::GatewayConfig,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "DaynaPort support not compiled in (rebuild with --features daynaport)",
+        ))
+    }
+
     /// Mount media on a CD-ROM device (newly inserts or swaps existing).
     /// Errors if the slot is empty, is not a CD-ROM, or the file can't open.
     pub fn insert_disc(&self, id: usize, path: &str) -> Result<(), String> {
@@ -1002,9 +1038,27 @@ impl Device for Wd33c93a {
         if let Some(t) = self.thread.lock().take() {
             let _ = t.join();
         }
+        // Any DaynaPort target owns a backend thread of its own; stop it too
+        // (after the worker is joined, so nothing is mid-command).
+        #[cfg(feature = "daynaport")]
+        {
+            let mut state = self.state.lock();
+            for dev in state.devices.iter_mut().flatten() {
+                if let Some(dp) = dev.daynaport_mut() { dp.stop(); }
+            }
+        }
     }
     fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) { return; }
+        // Re-arm any DaynaPort backend a previous stop() shut down. No-op on
+        // first boot — add_daynaport() already started them.
+        #[cfg(feature = "daynaport")]
+        {
+            let mut st = self.state.lock();
+            for dev in st.devices.iter_mut().flatten() {
+                if let Some(dp) = dev.daynaport_mut() { dp.start(); }
+            }
+        }
         let state = self.state.clone();
         let cond = self.cond.clone();
         let running = self.running.clone();
@@ -1061,7 +1115,7 @@ impl Device for Wd33c93a {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV] | scsi defer <on|off>".to_string()),
+            ("scsi".to_string(), "SCSI: scsi regs | scsi status | scsi dayna | scsi wdt [N] | scsi wdt file <path> | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off> [DEV] | scsi defer <on|off>".to_string()),
             ("cow".to_string(), "COW overlay: cow status | cow commit [id] | cow reset [id]".to_string()),
         ]
     }
@@ -1175,7 +1229,37 @@ impl Device for Wd33c93a {
                     writeln!(writer, "SCSI deferred interrupts {}", if val { "enabled" } else { "disabled" }).unwrap();
                     return Ok(());
                 }
+                Some("dayna") => {
+                    #[cfg(feature = "daynaport")]
+                    {
+                        let state = self.state.lock();
+                        let mut found = false;
+                        for dev in state.devices.iter().flatten() {
+                            if let Some(dp) = dev.daynaport() {
+                                found = true;
+                                for line in dp.status_lines() {
+                                    writeln!(writer, "{}", line).unwrap();
+                                }
+                            }
+                        }
+                        if !found {
+                            writeln!(writer, "No DaynaPort targets attached").unwrap();
+                        }
+                    }
+                    #[cfg(not(feature = "daynaport"))]
+                    writeln!(writer, "DaynaPort support not built in (rebuild with --features daynaport)").unwrap();
+                    return Ok(());
+                }
                 Some("status") => {
+                    #[cfg(feature = "daynaport")]
+                    {
+                        let state = self.state.lock();
+                        for dev in state.devices.iter().flatten() {
+                            if let Some(dp) = dev.daynaport() {
+                                writeln!(writer, "{}", dp.status_lines()[0]).unwrap();
+                            }
+                        }
+                    }
                     let discs = self.disc_status();
                     if discs.is_empty() {
                         writeln!(writer, "No CD-ROM devices attached").unwrap();
@@ -1259,7 +1343,7 @@ impl Device for Wd33c93a {
                     }
                     return Ok(());
                 }
-                _ => return Err("Usage: scsi status | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off>".to_string()),
+                _ => return Err("Usage: scsi status | scsi dayna | scsi eject <id> | scsi add <id> <path> | scsi list <id> | scsi del <id> <ord> | scsi next <id> <ord> | scsi debug <on|off>".to_string()),
             }
         }
         if cmd == "cow" {
@@ -1354,6 +1438,13 @@ impl Resettable for Wd33c93a {
         state.regs[regs::COMMAND as usize] = 0;
         state.advanced_mode = false;
         state.regs[regs::SCSI_STATUS as usize] = scsi_status::RESET;
+        // A DaynaPort comes up disabled with empty queues, and its NAT tables
+        // are flushed on the backend thread's next loop — the same answer
+        // Seeq8003::power_on gives for the onboard Ethernet.
+        #[cfg(feature = "daynaport")]
+        for dev in state.devices.iter_mut().flatten() {
+            if let Some(dp) = dev.daynaport_mut() { dp.power_on(); }
+        }
     }
 }
 
@@ -1824,8 +1915,15 @@ impl Wd33c93aState {
                 _ => "UNKNOWN",
             };
 
+            let is_dayna = self.devices[self.target_id].as_ref()
+                .map(|d| d.is_daynaport()).unwrap_or(false);
             let mut extra = String::new();
             match cdb[0] {
+                // On a DaynaPort these two are packet RX/TX, not block I/O.
+                scsi_cmd::READ_6 | scsi_cmd::WRITE_6 if is_dayna => {
+                    let len = ((cdb[3] as usize) << 8) | cdb[4] as usize;
+                    extra = format!(" [DaynaPort] Bytes=0x{:x} flags={:02x}", len, cdb[5]);
+                }
                 scsi_cmd::READ_6 | scsi_cmd::WRITE_6 => {
                     let lba = (((cdb[1] & 0x1F) as u64) << 16) | ((cdb[2] as u64) << 8) | (cdb[3] as u64);
                     let count = if cdb[4] == 0 { 256 } else { cdb[4] as usize };
@@ -1863,8 +1961,25 @@ impl Wd33c93aState {
             _ => ScsiDataLength::Unlimited,
         };
 
+        // A DaynaPort reuses WRITE(6) to transmit one Ethernet frame, so its
+        // data-out length is a plain byte count in CDB 3..4 — not `blocks × 512`.
+        let dayna = self.devices[self.target_id].as_ref()
+            .map(|d| d.is_daynaport()).unwrap_or(false);
+
         // For WRITE commands, receive data first (data out from host to target)
         let data_in = match cdb[0] {
+            scsi_cmd::WRITE_6 if dayna => {
+                self.data_direction_in = false;
+                let len = ((cdb[3] as usize) << 8) | cdb[4] as usize;
+                if len > 0 {
+                    match self.receive_data_chunked(len, dma) {
+                        None => return, // paused; will resume on SELECT_ATN_XFER
+                        data => data,
+                    }
+                } else {
+                    None
+                }
+            }
             scsi_cmd::WRITE_6 => {
                 self.data_direction_in = false;
                 let count = if cdb[4] == 0 { 256 } else { cdb[4] as usize };

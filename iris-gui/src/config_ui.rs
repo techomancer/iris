@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use iris::config::{
     ForwardBind, ForwardProto, GraphicsBoard, JitConfig, MachineConfig, MachineProfile, NetMode,
-    NfsConfig, PortForwardConfig, ScsiDeviceConfig, VinoSource, VinoStandard, VALID_BANK_SIZES,
+    NfsConfig, PortForwardConfig, ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard,
+    VALID_BANK_SIZES,
 };
 use iris::nfsudp::NfsVersion;
 use iris::vc2_timings::NewportResolution;
@@ -553,15 +554,53 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
             } else if ui.button("Attach…").clicked() {
                 cfg.scsi.insert(id, ScsiDeviceConfig {
                     path: format!("scsi{id}.raw"),
-                    discs: vec![],
-                    cdrom: false,
-                    overlay: false,
-                    scratch: false,
-                    size_mb: None,
+                    ..Default::default()
                 });
             }
         });
         if let Some(dev) = cfg.scsi.get_mut(&id) {
+            // A DaynaPort has no image, no media and no overlay — it is an
+            // Ethernet adapter on the SCSI bus. Show its own short form
+            // instead of the storage rows below.
+            if dev.is_daynaport() {
+                Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
+                    ui.label("Type");
+                    scsi_type_combo(ui, id, dev, &mut edit);
+                    ui.end_row();
+
+                    if !build_features::DAYNAPORT {
+                        ui.label("");
+                        ui.label(RichText::new(
+                            "⚠ this build lacks DaynaPort support — rebuild with --features daynaport")
+                            .color(Color32::from_rgb(230, 140, 70)));
+                        ui.end_row();
+                    }
+
+                    ui.label("MAC address")
+                        .on_hover_text("Blank = derived from the SCSI id (00:80:19:44:50:<id>).");
+                    let mut mac = dev.mac.clone().unwrap_or_default();
+                    if ui.add(TextEdit::singleline(&mut mac).hint_text("00:80:19:44:50:03")).changed() {
+                        dev.mac = if mac.trim().is_empty() { None } else { Some(mac) };
+                        edit.changed = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("NAT subnet")
+                        .on_hover_text("This target runs its own NAT gateway, separate from ec0's. \
+                                        Gateway gets .1, the guest gets .2. Blank = 192.168.10.0/24.");
+                    let mut subnet = dev.subnet.clone().unwrap_or_default();
+                    if ui.add(TextEdit::singleline(&mut subnet).hint_text("192.168.10.0/24")).changed() {
+                        dev.subnet = if subnet.trim().is_empty() { None } else { Some(subnet) };
+                        edit.changed = true;
+                    }
+                    ui.end_row();
+                });
+                ui.label(RichText::new(
+                    "DaynaPort SCSI/Link — Ethernet over the SCSI bus. The guest needs a driver \
+                     for it (IRIX: github.com/techomancer/irixdayna); IRIX sees it as dp0, separate \
+                     from the onboard ec0.").weak().small());
+                continue;
+            }
             Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
                 ui.label("Image path");
                 let e = path_row(ui, ("scsi_path", id), &mut dev.path,
@@ -610,21 +649,14 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
 
                 ui.label("Type");
                 let was_cd = dev.cdrom;
-                let mut is_cd = dev.cdrom;
-                ComboBox::from_id_salt(("type", id))
-                    .selected_text(if is_cd { "CD-ROM" } else { "HDD" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut is_cd, false, "HDD");
-                        ui.selectable_value(&mut is_cd, true, "CD-ROM");
-                    });
+                scsi_type_combo(ui, id, dev, &mut edit);
                 // Switching to CD-ROM defaults to an empty drive (no media):
                 // clear the auto-generated HDD placeholder path so it doesn't
                 // look like a (missing) disc. Load media via "Insert disc…" in
                 // the SCSI menu, or just type a path here.
-                if is_cd && !was_cd && dev.path == format!("scsi{id}.raw") {
+                if dev.cdrom && !was_cd && dev.path == format!("scsi{id}.raw") {
                     dev.path.clear();
                 }
-                dev.cdrom = is_cd;
                 ui.end_row();
                 if dev.cdrom && dev.path.is_empty() {
                     ui.label("");
@@ -1589,6 +1621,40 @@ pub fn reveal_in_file_manager(path: &str) {
 struct PathEdit {
     changed: bool,
     picked: bool,
+}
+
+/// SCSI target-type picker. `kind`/`cdrom` are two spellings of the same
+/// setting in the config, so write both from one place: a DaynaPort must not
+/// keep a stale `cdrom = true`, and a disk/CD-ROM must not keep
+/// `kind = "daynaport"`. DaynaPort is offered even in a build without the
+/// feature — with a warning next to it — so an existing config stays editable.
+fn scsi_type_combo(ui: &mut Ui, id: u8, dev: &mut ScsiDeviceConfig, edit: &mut PathEdit) {
+    let mut kind = dev.kind();
+    let before = kind;
+    ComboBox::from_id_salt(("type", id))
+        .selected_text(match kind {
+            ScsiKind::Disk => "HDD",
+            ScsiKind::Cdrom => "CD-ROM",
+            ScsiKind::Daynaport => "DaynaPort (Ethernet)",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut kind, ScsiKind::Disk, "HDD");
+            ui.selectable_value(&mut kind, ScsiKind::Cdrom, "CD-ROM");
+            ui.selectable_value(&mut kind, ScsiKind::Daynaport, "DaynaPort (Ethernet)");
+        });
+    if kind != before {
+        edit.changed = true;
+        if kind == ScsiKind::Daynaport {
+            // No image, no media, no overlay behind a network adapter — and
+            // leaving them set makes the config fail validation at Start.
+            dev.path.clear();
+            dev.discs.clear();
+            dev.overlay = false;
+            dev.scratch = false;
+        }
+    }
+    dev.kind_field = kind;
+    dev.cdrom = kind == ScsiKind::Cdrom;
 }
 
 /// A TextEdit + 📁 Browse button that updates `value` in place. See [`PathEdit`].

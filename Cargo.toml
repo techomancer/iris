@@ -111,6 +111,14 @@ camera = ["dep:nokhwa", "dep:v4l"]
 pcap = ["dep:pcap"]
 # N64 development board (Ultra64) — GIO slot 0 + shm IPC.
 ultra64 = ["dep:shared_memory", "dep:raw_sync"]
+# DaynaPort SCSI/Link target: a SCSI-attached Ethernet adapter (type 3
+# Processor device) selectable per SCSI id, giving the guest a second network
+# path that does not go through the onboard SEEQ. Needs a guest driver — see
+# github.com/techomancer/irixdayna for the IRIX one. Each target runs its own
+# NAT gateway (or PCAP bridge with --features pcap) on its own subnet.
+# Off by default — enable with `cargo build --features daynaport`, then select
+# it at runtime with `kind = "daynaport"` in an `[scsi.N]` section.
+daynaport = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

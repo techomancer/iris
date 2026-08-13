@@ -20,6 +20,10 @@ pub mod build_features {
     /// N64 development board (Ultra64 GIO card) + POSIX shm bridge to an
     /// external gopher64. The GUI gates the "Enable dev board" toggle on this.
     pub const ULTRA64:   bool = cfg!(feature = "ultra64");
+    /// DaynaPort SCSI/Link target — a SCSI-attached Ethernet adapter that can
+    /// be configured on any SCSI id. The GUI gates the "DaynaPort" device kind
+    /// on this.
+    pub const DAYNAPORT: bool = cfg!(feature = "daynaport");
     /// Lightning build strips breakpoint checks and the traceback buffer
     /// from the MIPS executor hot path. Interactive debugging (GDB stub,
     /// monitor breakpoints) is non-functional in this build.
@@ -77,6 +81,8 @@ pub mod xdmcp;
 #[cfg(feature = "pcap")]
 pub mod net_pcap;
 pub mod seeq8003;
+#[cfg(feature = "daynaport")]
+pub mod daynaport;
 pub mod cow_disk;
 #[cfg(feature = "chd")]
 pub mod chd_disk;

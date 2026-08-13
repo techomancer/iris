@@ -5,6 +5,33 @@ use std::net::Ipv4Addr;
 /// Valid memory bank sizes in MB.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128];
 
+/// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
+/// `kind = "cdrom"`; either works and they mean the same thing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScsiKind {
+    /// Hard disk (raw image, CHD, or COW overlay).
+    #[default]
+    Disk,
+    /// CD-ROM drive (may start with an empty tray).
+    Cdrom,
+    /// DaynaPort SCSI/Link — a SCSI-attached Ethernet adapter. Has no disk
+    /// image at all. Requires a build with `--features daynaport`.
+    Daynaport,
+}
+
+impl ScsiKind {
+    fn is_default(&self) -> bool { *self == ScsiKind::Disk }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disk => "Hard disk",
+            Self::Cdrom => "CD-ROM",
+            Self::Daynaport => "DaynaPort SCSI/Link",
+        }
+    }
+}
+
 /// Configuration for a single SCSI device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScsiDeviceConfig {
@@ -16,8 +43,26 @@ pub struct ScsiDeviceConfig {
     /// Additional ISO images for CD-ROM changers (ignored for HDD).
     #[serde(default)]
     pub discs: Vec<String>,
-    /// true = CD-ROM, false = hard disk.
+    /// true = CD-ROM, false = hard disk. Kept for compatibility: it is the
+    /// original spelling of `kind = "cdrom"` and every existing config uses it.
+    /// Use `kind` for anything that is not a disk or a CD-ROM.
+    #[serde(default)]
     pub cdrom: bool,
+    /// Target type. Defaults to `disk`; `cdrom = true` still selects a CD-ROM
+    /// on its own. Read it through [`ScsiDeviceConfig::kind`] rather than
+    /// directly, so the two spellings stay reconciled.
+    #[serde(default, rename = "kind", skip_serializing_if = "ScsiKind::is_default")]
+    pub kind_field: ScsiKind,
+    /// DaynaPort only: explicit MAC address, e.g. `"00:80:19:12:34:56"`.
+    /// Default is derived from the SCSI id so two targets never collide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// DaynaPort only: NAT subnet in CIDR notation for *this* target's gateway,
+    /// e.g. `"192.168.10.0/24"`. Each DaynaPort runs its own NAT engine, so
+    /// this must differ from the machine-wide `nat_subnet` used by `ec0`.
+    /// Gateway gets host .1, the guest gets host .2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
     /// Enable copy-on-write overlay. Base image is never modified; writes go to
     /// `{path}.overlay`. Delete the overlay file to reset to clean state.
     #[serde(default)]
@@ -35,6 +80,82 @@ pub struct ScsiDeviceConfig {
     /// already exists or `scratch=false`.
     #[serde(default)]
     pub size_mb: Option<u32>,
+}
+
+impl Default for ScsiDeviceConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            discs: vec![],
+            cdrom: false,
+            kind_field: ScsiKind::Disk,
+            mac: None,
+            subnet: None,
+            overlay: false,
+            scratch: false,
+            size_mb: None,
+        }
+    }
+}
+
+impl ScsiDeviceConfig {
+    /// The target type, reconciling the `kind` key with the older `cdrom` bool.
+    /// An explicit `kind` wins; `cdrom = true` alone still means CD-ROM.
+    pub fn kind(&self) -> ScsiKind {
+        match self.kind_field {
+            ScsiKind::Disk if self.cdrom => ScsiKind::Cdrom,
+            k => k,
+        }
+    }
+
+    pub fn is_cdrom(&self) -> bool { self.kind() == ScsiKind::Cdrom }
+    pub fn is_daynaport(&self) -> bool { self.kind() == ScsiKind::Daynaport }
+
+    /// A DaynaPort target for this SCSI id, with defaults filled in.
+    /// Errors describe a bad `mac` / `subnet`; `validate()` catches those first.
+    pub fn daynaport_params(&self, id: u8) -> Result<DaynaportParams, String> {
+        let mac = match &self.mac {
+            Some(s) => parse_mac(s)?,
+            None => [0x00, 0x80, 0x19, 0x44, 0x50, id],
+        };
+        let subnet = match &self.subnet {
+            Some(cidr) => {
+                let (gateway_ip, client_ip, netmask) = parse_nat_subnet(cidr)?;
+                NatSubnet { gateway_ip, client_ip, netmask }
+            }
+            None => NatSubnet {
+                gateway_ip: Ipv4Addr::new(192, 168, 10, 1),
+                client_ip:  Ipv4Addr::new(192, 168, 10, 2),
+                netmask:    Ipv4Addr::new(255, 255, 255, 0),
+            },
+        };
+        Ok(DaynaportParams { mac, subnet })
+    }
+}
+
+/// Resolved DaynaPort settings for one SCSI target.
+#[derive(Debug, Clone, Copy)]
+pub struct DaynaportParams {
+    pub mac: [u8; 6],
+    pub subnet: NatSubnet,
+}
+
+/// Parse `"00:80:19:12:34:56"` (or `-` separated) into six octets.
+pub fn parse_mac(s: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = s.split(|c| c == ':' || c == '-').collect();
+    if parts.len() != 6 {
+        return Err(format!("\"{}\" is not a MAC address (expected six octets)", s));
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(p, 16)
+            .map_err(|_| format!("\"{}\" is not a MAC address (bad octet \"{}\")", s, p))?;
+    }
+    if mac[0] & 0x01 != 0 {
+        return Err(format!("{} is a multicast address; a station MAC must have bit 0 of the \
+                            first octet clear", s));
+    }
+    Ok(mac)
 }
 
 /// Protocol for port forwarding.
@@ -744,19 +865,12 @@ fn default_scsi() -> std::collections::HashMap<u8, ScsiDeviceConfig> {
     let mut map = std::collections::HashMap::new();
     map.insert(1, ScsiDeviceConfig {
         path: "scsi1.raw".to_string(),
-        discs: vec![],
-        cdrom: false,
-        overlay: false,
-        scratch: false,
-        size_mb: None,
+        ..Default::default()
     });
     map.insert(4, ScsiDeviceConfig {
         path: "cdrom4.iso".to_string(),
-        discs: vec![],
         cdrom: true,
-        overlay: false,
-        scratch: false,
-        size_mb: None,
+        ..Default::default()
     });
     map
 }
@@ -887,7 +1001,36 @@ impl MachineConfig {
             // A CD-ROM may legitimately start with an empty tray (no path, no
             // discs) and have media loaded at runtime; any discs list is valid
             // as a changer queue. So there is nothing CD-ROM-specific to check.
-            let _ = dev;
+            if dev.is_daynaport() {
+                if dev.cdrom || dev.overlay || dev.scratch {
+                    return Err(format!(
+                        "SCSI ID {}: kind = \"daynaport\" has no disk image, so cdrom / \
+                         overlay / scratch don't apply", id));
+                }
+                if let Some(mac) = &dev.mac {
+                    parse_mac(mac).map_err(|e| format!("SCSI ID {}: mac: {}", id, e))?;
+                }
+                if let Some(cidr) = &dev.subnet {
+                    parse_nat_subnet(cidr)
+                        .map_err(|e| format!("SCSI ID {}: subnet \"{}\": {}", id, cidr, e))?;
+                }
+                // Each DaynaPort runs its own NAT gateway. Sharing a subnet with
+                // ec0 gives the guest two interfaces on one network and nothing
+                // routes predictably.
+                let dp = dev.daynaport_params(*id)
+                    .map_err(|e| format!("SCSI ID {}: {}", id, e))?;
+                let main = self.nat_subnet.as_deref()
+                    .map(|c| parse_nat_subnet(c).map(|(g, c2, n)| NatSubnet {
+                        gateway_ip: g, client_ip: c2, netmask: n }))
+                    .transpose()?
+                    .unwrap_or_default();
+                if dp.subnet.gateway_ip == main.gateway_ip {
+                    return Err(format!(
+                        "SCSI ID {}: DaynaPort subnet {} collides with the machine's NAT subnet \
+                         (ec0). Give the DaynaPort its own, e.g. subnet = \"192.168.10.0/24\".",
+                        id, dp.subnet.gateway_ip));
+                }
+            }
         }
         Ok(())
     }
@@ -1071,12 +1214,8 @@ impl Cli {
         let apply_scsi = |map: &mut std::collections::HashMap<u8, ScsiDeviceConfig>,
                           id: u8, path: String, cdrom: bool, extra: Vec<String>| {
             let entry = map.entry(id).or_insert_with(|| ScsiDeviceConfig {
-                path: String::new(),
-                discs: vec![],
                 cdrom,
-                overlay: false,
-                scratch: false,
-                size_mb: None,
+                ..Default::default()
             });
             entry.path = path;
             entry.cdrom = cdrom;
@@ -1194,8 +1333,7 @@ mod export_tests {
     fn toml_export_roundtrips() {
         let mut cfg = MachineConfig::default();
         cfg.scsi.insert(4, ScsiDeviceConfig {
-            path: "/abs/cd.chd".into(), discs: vec![], cdrom: true,
-            overlay: false, scratch: false, size_mb: None,
+            path: "/abs/cd.chd".into(), cdrom: true, ..Default::default()
         });
         let s = toml::to_string_pretty(&cfg).expect("serialize");
         let back: MachineConfig = toml::from_str(&s).expect("deserialize");
@@ -1203,6 +1341,86 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    #[test]
+    fn scsi_kind_daynaport_parses_and_round_trips() {
+        let cfg: MachineConfig = toml::from_str(r#"
+            [scsi.3]
+            kind = "daynaport"
+            mac = "00:80:19:aa:bb:cc"
+            subnet = "192.168.7.0/24"
+        "#).expect("parse");
+        let dev = &cfg.scsi[&3];
+        assert!(dev.is_daynaport());
+        assert!(!dev.is_cdrom());
+        cfg.validate().expect("validate");
+
+        let params = dev.daynaport_params(3).expect("params");
+        assert_eq!(params.mac, [0x00, 0x80, 0x19, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(params.subnet.gateway_ip, Ipv4Addr::new(192, 168, 7, 1));
+        assert_eq!(params.subnet.client_ip,  Ipv4Addr::new(192, 168, 7, 2));
+
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert!(back.scsi[&3].is_daynaport(), "kind must survive export:\n{s}");
+    }
+
+    /// `cdrom = true` predates `kind`; it must keep working, and a plain disk
+    /// must not start serializing a redundant `kind = "disk"`.
+    #[test]
+    fn cdrom_bool_still_selects_a_cdrom() {
+        let cfg: MachineConfig = toml::from_str(r#"
+            [scsi.4]
+            path = "cd.iso"
+            cdrom = true
+            [scsi.1]
+            path = "disk.raw"
+        "#).expect("parse");
+        assert!(cfg.scsi[&4].is_cdrom());
+        assert_eq!(cfg.scsi[&1].kind(), ScsiKind::Disk);
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(!s.contains("kind"), "default kind should not be emitted:\n{s}");
+    }
+
+    #[test]
+    fn daynaport_defaults_to_its_own_subnet_and_a_derived_mac() {
+        let cfg: MachineConfig = toml::from_str("[scsi.5]\nkind = \"daynaport\"\n").expect("parse");
+        cfg.validate().expect("validate");
+        let p = cfg.scsi[&5].daynaport_params(5).expect("params");
+        assert_eq!(p.mac, [0x00, 0x80, 0x19, 0x44, 0x50, 5]);
+        // Not the driver's own 00:80:19:00:00:NN placeholder, or the acceptance
+        // test can't tell a real MAC read from a made-up one.
+        assert_ne!(p.mac, [0x00, 0x80, 0x19, 0x00, 0x00, 5]);
+        assert_eq!(p.subnet.gateway_ip, Ipv4Addr::new(192, 168, 10, 1));
+        assert_ne!(p.subnet.gateway_ip, NatSubnet::default().gateway_ip);
+    }
+
+    #[test]
+    fn daynaport_rejects_a_subnet_that_collides_with_ec0() {
+        let cfg: MachineConfig = toml::from_str(r#"
+            nat_subnet = "192.168.10.0/24"
+            [scsi.3]
+            kind = "daynaport"
+        "#).expect("parse");
+        let err = cfg.validate().expect_err("subnet collision must be rejected");
+        assert!(err.contains("collides"), "{err}");
+    }
+
+    #[test]
+    fn daynaport_rejects_disk_only_options() {
+        let cfg: MachineConfig = toml::from_str(
+            "[scsi.3]\nkind = \"daynaport\"\noverlay = true\n").expect("parse");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parse_mac_accepts_both_separators_and_rejects_junk() {
+        assert_eq!(parse_mac("00:80:19:12:34:56").unwrap(), [0, 0x80, 0x19, 0x12, 0x34, 0x56]);
+        assert_eq!(parse_mac("00-80-19-12-34-56").unwrap(), [0, 0x80, 0x19, 0x12, 0x34, 0x56]);
+        assert!(parse_mac("00:80:19:12:34").is_err());
+        assert!(parse_mac("zz:80:19:12:34:56").is_err());
+        assert!(parse_mac("01:80:19:12:34:56").is_err(), "multicast bit must be rejected");
     }
 
     #[test]

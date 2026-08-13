@@ -77,6 +77,19 @@ cdrom  = false
 #scratch = true
 #size_mb = 64
 
+# DaynaPort SCSI/Link — Ethernet over the SCSI bus (SCSI type 3, Processor).
+# Requires a build with `--features daynaport` AND a driver in the guest; IRIX
+# has none in the box (see github.com/techomancer/irixdayna, where it shows up
+# as dp0). Has no disk image: path/discs/overlay/scratch don't apply.
+#   mac    — optional; default 00:80:19:44:50:<scsi-id>
+#   subnet — optional; this target's own NAT subnet (gateway .1, guest .2).
+#            Must differ from nat_subnet (ec0's). Default 192.168.10.0/24.
+# See docs/daynaport.md.
+#[scsi.3]
+#kind   = "daynaport"
+#mac    = "00:80:19:12:34:56"
+#subnet = "192.168.10.0/24"
+
 # NAT subnet for the internal network (CIDR notation).
 # The gateway gets host .1 and IRIX gets host .2.
 # Change this if 192.168.0.x conflicts with your local network.
