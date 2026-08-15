@@ -356,6 +356,36 @@ impl Ps2Controller {
                 }
                 state.next_write_is_mouse = true;
             }
+            0xA7 => {
+                // Disable AUX (mouse) port: CTR bit 5 = 1.
+                if crate::devlog::devlog_is_active(LogModule::Ps2) {
+                    dlog!(LogModule::Ps2, "PS2: Command Disable AUX Port (A7)");
+                }
+                state.config |= 0x20;
+                state.next_write_is_mouse = false;
+            }
+            0xA8 => {
+                // Enable AUX (mouse) port: CTR bit 5 = 0.
+                if crate::devlog::devlog_is_active(LogModule::Ps2) {
+                    dlog!(LogModule::Ps2, "PS2: Command Enable AUX Port (A8)");
+                }
+                state.config &= !0x20;
+            }
+            0xAD => {
+                // Disable keyboard port: CTR bit 4 = 1.
+                if crate::devlog::devlog_is_active(LogModule::Ps2) {
+                    dlog!(LogModule::Ps2, "PS2: Command Disable Keyboard Port (AD)");
+                }
+                state.config |= 0x10;
+                state.next_write_is_mouse = false;
+            }
+            0xAE => {
+                // Enable keyboard port: CTR bit 4 = 0.
+                if crate::devlog::devlog_is_active(LogModule::Ps2) {
+                    dlog!(LogModule::Ps2, "PS2: Command Enable Keyboard Port (AE)");
+                }
+                state.config &= !0x10;
+            }
             0xD3 => {
                 // AUX Loopback: no active multiplexing supported here, so the
                 // next byte written to the data port is echoed straight back
@@ -383,7 +413,7 @@ impl Ps2Controller {
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
         if !self.running.load(Ordering::Relaxed) { return; }
         let mut state = self.state.lock();
-        if !state.scanning_enabled {
+        if !state.scanning_enabled || state.config & 0x10 != 0 {
             return;
         }
 
@@ -784,7 +814,7 @@ impl Ps2Controller {
     pub fn push_mouse_input(&self, buttons: u8, dx: i32, dy: i32, dz: i32) {
         if !self.running.load(Ordering::Relaxed) { return; }
         let mut state = self.state.lock();
-        if !state.mouse_enabled { return; }
+        if !state.mouse_enabled || state.config & 0x20 != 0 { return; }
 
         let ps2_dy = -dy; // PS/2 Y is up-positive
         let sx = dx.clamp(-256, 255);
@@ -1143,6 +1173,59 @@ mod tests {
             let echoed = ps2.read_data();
             assert_eq!(echoed, probe, "0xD3 must echo the written byte verbatim");
         }
+    }
+
+    /// Linux's i8042_toggle_aux() (i8042.c) probes AUX-port disable/enable by
+    /// sending 0xA7, reading CTR back via 0x20 and checking bit 5 (AUXDIS) is
+    /// set, then sending 0xA8 and checking bit 5 clears. If either check
+    /// fails, i8042_check_aux() aborts with -ENODEV and mouse support is
+    /// disabled outright — so the bit must actually track the command, not
+    /// just be a fixed/ignored part of the config byte.
+    #[test]
+    fn aux_port_disable_enable_toggles_ctr_bit5() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+
+        ps2.write_command(0xA7);
+        ps2.write_command(0x20);
+        assert_eq!(ps2.read_data() & 0x20, 0x20, "CTR bit 5 must be set after 0xA7 (AUX disable)");
+
+        ps2.write_command(0xA8);
+        ps2.write_command(0x20);
+        assert_eq!(ps2.read_data() & 0x20, 0, "CTR bit 5 must clear after 0xA8 (AUX enable)");
+    }
+
+    /// Same toggle for the keyboard port: 0xAD sets CTR bit 4 (KBDDIS), 0xAE
+    /// clears it.
+    #[test]
+    fn kbd_port_disable_enable_toggles_ctr_bit4() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+
+        ps2.write_command(0xAD);
+        ps2.write_command(0x20);
+        assert_eq!(ps2.read_data() & 0x10, 0x10, "CTR bit 4 must be set after 0xAD (KBD disable)");
+
+        ps2.write_command(0xAE);
+        ps2.write_command(0x20);
+        assert_eq!(ps2.read_data() & 0x10, 0, "CTR bit 4 must clear after 0xAE (KBD enable)");
+    }
+
+    /// A disabled AUX port must actually stop motion packets from reaching
+    /// the queue, not just report the CTR bit for the boot-time probe.
+    #[test]
+    fn disabled_aux_port_blocks_mouse_packets() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        { ps2.state.lock().mouse_enabled = true; }
+
+        ps2.write_command(0xA7); // disable AUX port
+        ps2.push_mouse_input(0, 5, 5, 0);
+        assert_eq!(ps2.state.lock().rx_queue.len(), 0, "mouse packet must be dropped while AUX port disabled");
+
+        ps2.write_command(0xA8); // re-enable AUX port
+        ps2.push_mouse_input(0, 5, 5, 0);
+        assert!(ps2.state.lock().rx_queue.len() > 0, "mouse packet should be queued once AUX port re-enabled");
     }
 }
 
