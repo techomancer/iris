@@ -275,9 +275,13 @@ cargo run --release --features jitv2,rex-jit
 ```
 
 Extra features: `jitv2_lockstep` (shadow-compiles and cross-checks every
-dispatch against the interpreter — slow, diagnostic only) and
+dispatch against the interpreter — slow, diagnostic only),
 `jitv2_corpus_dump` (dumps compile-request page snapshots to `jitv2_corpus/`
-instead of compiling, for building an offline test corpus).
+instead of compiling, for building an offline test corpus), and
+`jitv2_opcodefusion` (LUI+ORI/ADDIU and branch/jump+NOP delay-slot fusion,
+jitv2's counterparts to the interpreter's `opcodefusion` — OFF by default,
+unlike the interpreter's own fusion, due to a history of live-boot bugs; see
+`rules/jit/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 
 ### REX3 graphics JIT (`--features rex-jit`)
 

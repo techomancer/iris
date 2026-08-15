@@ -76,6 +76,19 @@ rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 # Unconditionally-correct-at-publish redesign, replacing the speculative v1
 # tiered JIT. Built incrementally behind this flag; does not imply `jit`.
 jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
+# jitv2 opcode fusion: LUI+ORI/ADDIU (32-bit immediate materialization) and
+# branch/jump+NOP delay-slot collapsing, jitv2's counterparts to the
+# interpreter's `opcodefusion` feature. OFF by default (unlike the
+# interpreter's own fusion) — the LUI+ORI/ADDIU fuse in particular shipped
+# with a live bug (silently corrupting a register and dropping a pending
+# foreign delay-slot transfer whenever the standalone-compiled LUI word was
+# actually running as someone else's delay slot at runtime; see
+# rules/jit/jitv2_lui_fusion_foreign_delay_slot_hazard.md) that was hit on
+# real IRIX boot/shutdown traces even after a first fix landed. Not worth the
+# debuggability/complexity cost for the perf it buys in the jitv2 pipeline
+# specifically; opt in with --features jitv2_opcodefusion once it's earned
+# more confidence.
+jitv2_opcodefusion = ["jitv2"]
 # jitv2 dev tool: dump every compile-request's 4KB page snapshot to
 # jitv2_corpus/ instead of (alongside) actually compiling. Used to build a
 # corpus for offline analyzer/codegen development; off by default so normal

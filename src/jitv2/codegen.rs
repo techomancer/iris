@@ -4132,14 +4132,14 @@ fn emit_target_edge(
 /// at all — there is no block-terminating case here, unlike that function,
 /// so callers don't need to check for early-return the way they do for its
 /// `bool` result), `false` if the slot needs the normal path.
-#[cfg_attr(any(feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
+#[cfg_attr(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
 fn try_emit_fused_nop_slot(ctx: &mut EmitCtx, slot_raw: u32) -> bool {
-    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"))]
     {
         let _ = slot_raw;
         false
     }
-    #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+    #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer"))))]
     {
         if slot_raw != 0 {
             return false;
@@ -6058,14 +6058,14 @@ fn fused_lui_imm32(lui_raw: u32, next_raw: u32) -> Option<i64> {
 ///   make the fused LUI conditionally skip only for non-branch-target
 ///   arrivals (impossible — block choice is a single static edge, not a
 ///   per-arrival runtime branch).
-#[cfg_attr(any(feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
+#[cfg_attr(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
 fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> u16 {
-    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"))]
     {
         let _ = (instrs, word);
         0
     }
-    #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
+    #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer"))))]
     {
         if word == ctx.entry_word || instrs[word as usize].is_branch_fallback_successor {
             return 0;
