@@ -32,6 +32,7 @@ pub mod scsi_cmd {
     pub const WRITE_10: u8 = 0x2a;
     pub const VERIFY_10: u8 = 0x2f;
     pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
+    pub const MODE_SENSE_10: u8 = 0x5a;
     pub const WRITE_BUFFER: u8 = 0x3b;
     pub const READ_BUFFER: u8 = 0x3c;
     pub const READ_SUB_CHANNEL: u8 = 0x42;
@@ -620,10 +621,13 @@ impl ScsiDevice {
             scsi_cmd::WRITE_10 => self.exec_write_10(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::START_STOP_UNIT => self.exec_start_stop_unit(&req.cdb)?,
             scsi_cmd::MODE_SENSE_6 => self.exec_mode_sense_6(&req.cdb)?,
+            scsi_cmd::MODE_SENSE_10 => self.exec_mode_sense_10(&req.cdb)?,
             scsi_cmd::WRITE_BUFFER => self.exec_write_buffer(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::READ_BUFFER => self.exec_read_buffer(&req.cdb)?,
             scsi_cmd::SEND_DIAGNOSTIC => self.exec_send_diagnostic(&req.cdb)?,
             scsi_cmd::PREVENT_ALLOW_MEDIUM_REMOVAL => ScsiResponse { status: 0x00, data: vec![] },
+            // No write-back cache to flush — our backend writes are already synchronous.
+            scsi_cmd::SYNCHRONIZE_CACHE_10 => ScsiResponse { status: 0x00, data: vec![] },
             scsi_cmd::MODE_SELECT_6 => self.exec_mode_select_6(&req.cdb, req.data_in.as_ref())?,
             scsi_cmd::READ_TOC_PMA_ATIP => self.exec_read_toc_pma_atip(&req.cdb)?,
             scsi_cmd::GET_CONFIGURATION => self.exec_get_configuration(&req.cdb)?,
@@ -700,8 +704,14 @@ impl ScsiDevice {
                 String::from_utf8_lossy(&data[16..32]),
                 String::from_utf8_lossy(&data[32..36]))*/
         } else {
+            // SPC-2 8.2.5: PQ=011b (device server not capable of supporting a physical
+            // device on this LUN), PDT=0x1F (unknown/no device type). Linux's
+            // scsi_scan.c treats this as SCSI_SCAN_TARGET_PRESENT and stops probing
+            // further LUNs on this target instead of registering a phantom disk.
             data[0] = 0x7F;
-            //println!("SCSI: INQUIRY LUN={} AllcLen={} - Invalid LUN (returning 0x7F)", lun, alloc_len);
+            data[2] = 0x02; // ANSI SCSI-2
+            data[3] = 0x02; // SCSI-2 response format
+            data[4] = 31;   // Additional length (36 - 5)
         }
 
         data.truncate(alloc_len);
@@ -823,18 +833,17 @@ impl ScsiDevice {
         Ok(ScsiResponse { status: 0x00, data: vec![] })
     }
 
-    fn exec_mode_sense_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        let page_code = cdb[2] & 0x3F;
-        let dbd      = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
-        let alloc_len = cdb[4] as usize;
-
+    /// Builds the block descriptor and concatenated mode pages shared by
+    /// MODE SENSE (6) and MODE SENSE (10) — only the header framing differs
+    /// between the two commands.
+    fn build_mode_sense_pages(&mut self, page_code: u8, dbd: bool) -> Result<(Vec<u8>, Vec<u8>), ScsiResponse> {
         // Reject HDD-only pages when operating as CDROM.
         // sd.c asks for page 8 (Caching) — CDROMs don't support it.
         // Returning a page-8-incompatible response triggers the noisy
         // "Got wrong page" path; CHECK CONDITION with ASC 0x24 hits the
         // clean "Cache data unavailable" / "bad_sense" path instead.
         if self.is_cdrom() && matches!(page_code, 0x08 | 0x03 | 0x04) {
-            return Ok(self.check_condition(0x05, 0x24, 0x00)); // Illegal Request: Invalid field in CDB
+            return Err(self.check_condition(0x05, 0x24, 0x00)); // Illegal Request: Invalid field in CDB
         }
 
         let lbs = self.logical_block_size as u32;
@@ -954,7 +963,39 @@ impl ScsiDevice {
                     0x00, 0x00, // reserved
                 ]);
             }
+
+            // Page 0x08: Caching Parameters (SBC-2 / SCSI-2). Without this, sd.c logs
+            // "No Caching mode page found" / "Assuming drive cache: write through".
+            if want_page(0x08) {
+                pages.extend_from_slice(&[
+                    0x08, 0x12, // page code, length (18 bytes follow)
+                    0x04,       // WCE=1 (write-back), RCD=0 (read cache enabled)
+                    0x00,       // demand read/write retention priority
+                    0x00, 0x00, // disable pre-fetch transfer length
+                    0x00, 0x00, // minimum pre-fetch
+                    0xff, 0xff, // maximum pre-fetch
+                    0xff, 0xff, // maximum pre-fetch ceiling
+                    0x00,       // FSW/LBCSS/DRA
+                    0x00,       // number of cache segments
+                    0x00, 0x00, // cache segment size
+                    0x00,       // reserved
+                    0x00, 0x00, 0x00, // non-cache segment size
+                ]);
+            }
         }
+
+        Ok((block_desc, pages))
+    }
+
+    fn exec_mode_sense_6(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let page_code = cdb[2] & 0x3F;
+        let dbd       = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
+        let alloc_len = cdb[4] as usize;
+
+        let (block_desc, pages) = match self.build_mode_sense_pages(page_code, dbd) {
+            Ok(v) => v,
+            Err(response) => return Ok(response),
+        };
 
         // Mode Parameter Header (4 bytes) + block descriptor + pages
         let bd_len = block_desc.len();
@@ -966,6 +1007,35 @@ impl ScsiDevice {
         data[3] = bd_len as u8;
         data[4..4 + bd_len].copy_from_slice(&block_desc);
         data[4 + bd_len..].copy_from_slice(&pages);
+
+        data.truncate(alloc_len);
+        Ok(ScsiResponse { status: 0x00, data })
+    }
+
+    fn exec_mode_sense_10(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
+        let page_code = cdb[2] & 0x3F;
+        let dbd       = (cdb[1] & 0x08) != 0; // Disable Block Descriptor
+        let alloc_len = (((cdb[7] as usize) << 8) | (cdb[8] as usize)).min(65535);
+
+        let (block_desc, pages) = match self.build_mode_sense_pages(page_code, dbd) {
+            Ok(v) => v,
+            Err(response) => return Ok(response),
+        };
+
+        // Mode Parameter Header (8 bytes) + block descriptor + pages
+        let bd_len = block_desc.len();
+        let total_len = 8 + bd_len + pages.len();
+        let mut data = vec![0u8; total_len];
+        let mode_data_len = (total_len - 2) as u16; // excludes the length field itself
+        data[0] = (mode_data_len >> 8) as u8;
+        data[1] = (mode_data_len & 0xFF) as u8;
+        data[2] = if self.is_cdrom() { 0x01 } else { 0x00 }; // Medium type
+        data[3] = if self.is_cdrom() { 0x80 } else { 0x00 }; // WP bit for CD-ROM (read-only media)
+        // data[4..6] = 0 (reserved / LONGLBA)
+        data[6] = (bd_len >> 8) as u8;
+        data[7] = (bd_len & 0xFF) as u8;
+        data[8..8 + bd_len].copy_from_slice(&block_desc);
+        data[8 + bd_len..].copy_from_slice(&pages);
 
         data.truncate(alloc_len);
         Ok(ScsiResponse { status: 0x00, data })

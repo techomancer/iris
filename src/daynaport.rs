@@ -325,7 +325,14 @@ impl DaynaPort {
             data[16..32].copy_from_slice(b"SCSI/Link       ");
             data[32..36].copy_from_slice(b"1.4a");
         } else {
+            // SPC-2 8.2.5: PQ=011b, PDT=0x1F. data[4] must still report the standard
+            // 31-byte additional length or Linux's scsi_scan.c computes response_len
+            // = data[4]+5 = 5, clamps inquiry_len to 5, and logs "INQUIRY result too
+            // short (5), using 36" even though the short response was intentional.
             data[0] = 0x7F; // LUN not present
+            data[2] = 0x02; // ANSI SCSI-2
+            data[3] = 0x02; // SCSI-2 response format
+            data[4] = 31;   // additional length (36 - 5)
         }
         data.truncate(alloc_len.min(data.len()));
         ScsiResponse { status: 0x00, data }

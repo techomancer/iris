@@ -237,6 +237,12 @@ struct Wd33c93aState {
     // Data direction flag for computing DBR (true = data in from target to host)
     data_direction_in: bool,
     target_id: usize,
+    // Shadow of the last LUN the host wrote to TARGET_LUN (reg 0x0F), updated
+    // only on host writes (see the write() handler). regs[TARGET_LUN] itself
+    // is dual-purpose on real WD33C93A hardware — it also holds the status
+    // byte for host readback once a command concludes (STATUS_RECEIVED) — so
+    // it can't be read back after the fact to recover the LUN the host set.
+    target_lun: u8,
     pending_status: u8,
     pending_msg: u8,
     // Data staged from SCSI device response, waiting for driver to issue TRANSFER_INFO.
@@ -321,6 +327,7 @@ impl Wd33c93a {
                 fifo: VecDeque::new(),
                 data_direction_in: false,
                 target_id: 0,
+                target_lun: 0,
                 pending_status: 0,
                 pending_msg: 0,
                 pending_data: Vec::new(),
@@ -965,6 +972,16 @@ impl Wd33c93a {
 
             state.regs[ar as usize] = val;
 
+            // TARGET_LUN (0x0F) is dual-purpose on real hardware: the host writes
+            // it before SELECT to set the LUN for the auto-generated IDENTIFY
+            // message, but the chip later overwrites the same register with the
+            // status byte for host readback once a command concludes. Shadow the
+            // host's write separately so the LUN survives past that point — see
+            // target_lun's field comment and its use in process_scsi_command.
+            if ar == regs::TARGET_LUN {
+                state.target_lun = val & 0x7;
+            }
+
             // QUEUE_TAG (0x1A) is not implemented on WD33C93A — the register
             // doesn't latch. OpenBSD probes by writing 0x55 and reading back;
             // returning 0 here makes it detect us as WD33C93A, not B.
@@ -1457,6 +1474,7 @@ impl Saveable for Wd33c93a {
         tbl.insert("asr".into(),               hex_u8(state.asr));
         tbl.insert("data_direction_in".into(), toml::Value::Boolean(state.data_direction_in));
         tbl.insert("target_id".into(),         hex_u8(state.target_id as u8));
+        tbl.insert("target_lun".into(),        hex_u8(state.target_lun));
         tbl.insert("pending_status".into(),    hex_u8(state.pending_status));
         tbl.insert("pending_msg".into(),       hex_u8(state.pending_msg));
         tbl.insert("advanced_mode".into(),     toml::Value::Boolean(state.advanced_mode));
@@ -1470,6 +1488,7 @@ impl Saveable for Wd33c93a {
         if let Some(x) = get_field(v, "asr")              { if let Some(n) = toml_u8(x)   { state.set_asr(n); } }
         if let Some(x) = get_field(v, "data_direction_in"){ if let Some(b) = toml_bool(x) { state.data_direction_in = b; } }
         if let Some(x) = get_field(v, "target_id")        { if let Some(n) = toml_u8(x)   { state.target_id = n as usize; } }
+        if let Some(x) = get_field(v, "target_lun")       { if let Some(n) = toml_u8(x)   { state.target_lun = n; } }
         if let Some(x) = get_field(v, "pending_status")   { if let Some(n) = toml_u8(x)   { state.pending_status = n; } }
         if let Some(x) = get_field(v, "pending_msg")      { if let Some(n) = toml_u8(x)   { state.pending_msg = n; } }
         if let Some(x) = get_field(v, "advanced_mode")    { if let Some(b) = toml_bool(x) { state.advanced_mode = b; } }
@@ -1610,6 +1629,7 @@ impl Wd33c93aState {
             self.regs[regs::COMMAND_PHASE as usize] = command_phase::DISCONNECTED;
             self.set_asr(asr::INT);
             self.target_id = 0;
+            self.target_lun = 0;
             self.pending_status = 0;
             self.pending_msg = 0;
             self.advanced_mode = false;
@@ -1673,6 +1693,9 @@ impl Wd33c93aState {
                         let mut cdb = Vec::with_capacity(cdb_len);
                         for i in 0..cdb_len {
                             cdb.push(self.regs[(regs::CDB_1 as usize) + i]);
+                        }
+                        if cdb.len() > 1 && (cdb[1] >> 5) & 0x7 == 0 && self.target_lun != 0 {
+                            cdb[1] |= self.target_lun << 5;
                         }
                         let request = ScsiRequest {
                             cdb,
@@ -1877,6 +1900,16 @@ impl Wd33c93aState {
     }
 
     fn process_scsi_command(&mut self, cdb: &[u8], auto_mode: bool, dma: Option<&dyn DmaClient>) {
+        // SCSI-2 initiators (Linux's wd33c93 driver included) address the LUN via the
+        // IDENTIFY message — i.e. TARGET_LUN — and leave the legacy CDB LUN field
+        // (cdb[1] bits 5-7) at 0. Fold target_lun in here so scsi.rs, which only looks
+        // at cdb[1], sees the real LUN. If firmware/PROM ever does put a nonzero LUN
+        // directly in the CDB, that takes precedence.
+        let mut cdb = cdb.to_vec();
+        if !cdb.is_empty() && (cdb[1] >> 5) & 0x7 == 0 && self.target_lun != 0 {
+            cdb[1] |= self.target_lun << 5;
+        }
+        let cdb = cdb.as_slice();
         if cdb.is_empty() {
             dlog!(LogModule::Scsi, "WD33C93A: Empty CDB!");
             self.update_asr(0, asr::LCI);
@@ -1894,6 +1927,7 @@ impl Wd33c93aState {
                 scsi_cmd::INQUIRY => "INQUIRY",
                 scsi_cmd::MODE_SELECT_6 => "MODE_SELECT_6",
                 scsi_cmd::MODE_SENSE_6 => "MODE_SENSE_6",
+                scsi_cmd::MODE_SENSE_10 => "MODE_SENSE_10",
                 scsi_cmd::START_STOP_UNIT => "START_STOP_UNIT",
                 scsi_cmd::RECEIVE_DIAGNOSTIC_RESULTS => "RECEIVE_DIAGNOSTIC_RESULTS",
                 scsi_cmd::SEND_DIAGNOSTIC => "SEND_DIAGNOSTIC",
@@ -1938,6 +1972,10 @@ impl Wd33c93aState {
                     let len = cdb[4] as usize;
                     extra = format!(" Bytes=0x{:x}", len);
                 }
+                scsi_cmd::MODE_SENSE_10 => {
+                    let len = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
+                    extra = format!(" Bytes=0x{:x}", len);
+                }
                 _ => {}
             }
             dlog!(LogModule::Scsi, "WD33C93A: SCSI Command {:02x} ({}) Target {}{}", cdb[0], cmd_name, self.target_id, extra);
@@ -1953,7 +1991,7 @@ impl Wd33c93aState {
                 let len = ((cdb[6] as usize) << 16) | ((cdb[7] as usize) << 8) | (cdb[8] as usize);
                 ScsiDataLength::Fixed(len)
             }
-            scsi_cmd::READ_TOC_PMA_ATIP | scsi_cmd::GET_CONFIGURATION => {
+            scsi_cmd::READ_TOC_PMA_ATIP | scsi_cmd::GET_CONFIGURATION | scsi_cmd::MODE_SENSE_10 => {
                 // Allocation length in bytes 7-8
                 let len = ((cdb[7] as usize) << 8) | (cdb[8] as usize);
                 ScsiDataLength::Fixed(len)
