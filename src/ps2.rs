@@ -28,6 +28,7 @@ enum CommandState {
     WriteConfig,
     SetTypematic,
     MouseData,  // consuming one data byte for a mouse command (e.g. F3 sample rate, E8 resolution)
+    AuxLoop,    // 0xD3: next data-port byte is echoed back as an AUX (mouse-source) byte
 }
 
 struct Ps2State {
@@ -109,6 +110,14 @@ impl Ps2Controller {
     pub fn write_data(&self, val: u8) {
         let mut state = self.state.lock();
         let dbg = crate::devlog::devlog_is_active(LogModule::Ps2);
+        if state.command_state == CommandState::AuxLoop {
+            if dbg { dlog!(LogModule::Ps2, "PS2: AUX Loopback (0xD3) echo <- {:02x}", val); }
+            state.rx_queue.push_back((val, Ps2Source::MouseCmd));
+            state.command_state = CommandState::Idle;
+            drop(state);
+            self.update_interrupt();
+            return;
+        }
         if state.next_write_is_mouse {
             if state.command_state == CommandState::MouseData {
                 if dbg { dlog!(LogModule::Ps2, "PS2: Mouse data <- {:02x}", val); }
@@ -287,6 +296,7 @@ impl Ps2Controller {
                     state.rx_queue.push_back((0xFA, Ps2Source::Mouse));
                     state.command_state = CommandState::Idle;
                 }
+                CommandState::AuxLoop => unreachable!("handled earlier in write_data"),
             }
         }
         drop(state);
@@ -299,7 +309,12 @@ impl Ps2Controller {
         let mut status = 0;
         if let Some((_, source)) = state.rx_queue.front() {
             status |= 0x01; // OBF (Output Buffer Full)
-            if let Ps2Source::Mouse = source {
+            // AUX bit reflects the port a byte arrived from, not whether it's
+            // a motion packet — real hardware sets it for mouse command
+            // responses (ACK/BAT/ID) too. Command responses (MouseCmd) share
+            // this with generalized motion bytes (Mouse) but aren't counted
+            // in mouse_queue_bytes, see the Ps2Source doc comments.
+            if matches!(source, Ps2Source::Mouse | Ps2Source::MouseCmd) {
                 status |= 0x20; // AUX (Mouse Data)
             }
         }
@@ -340,6 +355,18 @@ impl Ps2Controller {
                     dlog!(LogModule::Ps2, "PS2: Command Write Mouse");
                 }
                 state.next_write_is_mouse = true;
+            }
+            0xD3 => {
+                // AUX Loopback: no active multiplexing supported here, so the
+                // next byte written to the data port is echoed straight back
+                // tagged as AUX/mouse data. This is what i8042_check_mux()'s
+                // mux probe actually tests for; leaving it unhandled means the
+                // probe byte never comes back and the controller looks wedged.
+                if crate::devlog::devlog_is_active(LogModule::Ps2) {
+                    dlog!(LogModule::Ps2, "PS2: Command AUX Loopback (D3)");
+                }
+                state.command_state = CommandState::AuxLoop;
+                state.next_write_is_mouse = false;
             }
             _ => {
                 if crate::devlog::devlog_is_active(LogModule::Ps2) {
@@ -990,6 +1017,7 @@ impl Saveable for Ps2Controller {
             CommandState::WriteConfig => 3,
             CommandState::SetTypematic => 4,
             CommandState::MouseData => 5,
+            CommandState::AuxLoop => 6,
         };
         tbl.insert("command_state".into(), toml::Value::Integer(cmd_state));
         
@@ -1038,6 +1066,7 @@ impl Saveable for Ps2Controller {
                 3 => CommandState::WriteConfig,
                 4 => CommandState::SetTypematic,
                 5 => CommandState::MouseData,
+                6 => CommandState::AuxLoop,
                 _ => CommandState::Idle,
             };
         }
@@ -1090,6 +1119,30 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Ps2Controller save_state mismatch after load_state round-trip");
+    }
+
+    /// Linux's i8042_check_mux() (i8042.c) probes for active multiplexing by
+    /// issuing 0xD3 (I8042_CMD_AUX_LOOP) before each of three magic bytes and
+    /// expecting an exact echo back through the AUX/mouse data path. The third
+    /// probe byte (0xA4) must come back unchanged too — that's specifically
+    /// what tells Linux no mux is present and to fall back cleanly, instead of
+    /// hanging (no response queued) or being misread as MUXERR.
+    #[test]
+    fn aux_loopback_probe_echoes_verbatim() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+
+        for probe in [0xF0u8, 0x56, 0xA4] {
+            ps2.write_command(0xD3);
+            ps2.write_data(probe);
+
+            let status = ps2.read_status();
+            assert_eq!(status & 0x01, 0x01, "OBF should be set after AUX loopback echo");
+            assert_eq!(status & 0x20, 0x20, "echoed byte must be tagged as AUX/mouse source");
+
+            let echoed = ps2.read_data();
+            assert_eq!(echoed, probe, "0xD3 must echo the written byte verbatim");
+        }
     }
 }
 
