@@ -1499,6 +1499,69 @@ mod tests {
         assert_eq!(jit.gpr[4], 3, "word 1 (the ORI) must run exactly once per loop pass, not be silently skipped or double-applied");
     }
 
+    /// Correctness guard for `try_emit_fused_lui`'s foreign-delay-slot
+    /// exclusion — mirrors the interpreter's own `exec_lui_imm32`/
+    /// `exec_lui_simm32` guard (`if self.core.in_delay_slot { ...don't
+    /// fuse... }`, mips_exec.rs) and `standalone_compile_of_a_foreign_delay_slot_honors_pending_transfer`'s
+    /// model above, but with the standalone entry word itself being a LUI
+    /// that would otherwise fuse with its own word+1.
+    ///
+    /// `exec_decoded`'s dispatch gate can probe *any* word for standalone
+    /// compilation — including one that, at this particular arrival, is
+    /// actually running as some other, outside-the-region branch's delay
+    /// slot (`core.in_delay_slot`/`core.delay_slot_target` pre-armed by that
+    /// branch, not visible to this region's own analysis). If the entry
+    /// word happens to look like `lui r2,hi` and word+1 happens to look like
+    /// a same-register `ori r2,r2,lo` — coincidentally, since they belong to
+    /// unrelated control-flow paths — fusion must not fire: word+1 has
+    /// nothing to do with this LUI, and the real next PC is
+    /// `delay_slot_target`, decided only at runtime, not word+2.
+    ///
+    /// Before the entry/branch-fallback-successor guard was added to
+    /// `try_emit_fused_lui`, this would have unconditionally run the
+    /// unrelated word+1 as if it were the ORI half of the pair (corrupting
+    /// r2) and jumped to word+2 instead of honoring the pending transfer.
+    #[test]
+    fn lui_not_fused_when_entry_word_is_a_foreign_delay_slot() {
+        let pc_word0 = 0xFFFF_FFFF_BFC0_0000u64;
+        let target = 0xFFFF_FFFF_BFC0_03C0u64; // arbitrary foreign delay-slot target
+        let page = vec![
+            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::mips_isa::OP_ORI, 2, 2, 0x5678)), // unrelated at runtime; must NOT be folded in
+        ];
+
+        let page_base = 0x1FC0_0000u32;
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, r) in &page { page_words[word as usize] = r; }
+        let mut analyzer = Analyzer::new();
+        // budget=2 so word 1 (the would-be ORI fusion partner) is actually
+        // visited/compiled as part of this region — with budget=1 it stays
+        // `!visited` and `try_emit_fused_lui`'s existing "next not visited"
+        // check alone would already suppress fusion, defeating the point of
+        // this test.
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 2);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
+            .expect("standalone word-0 region must compile");
+
+        let (mut jit_exec, jit_mem) = seeded_executor([0u64; 32], pc_word0);
+        for &(word, r) in &page { jit_mem.set_word(pc_word0 + (word as u64) * 4, r); }
+        jit_exec.core.in_delay_slot = true;
+        jit_exec.core.delay_slot_target = target;
+
+        let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
+        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+
+        assert_eq!(jit_exec.core.pc, target,
+            "a standalone-compiled LUI that's actually running as a foreign delay slot must exit via delay_slot_target (0x{:x}), not a fused fallthrough to word+2 (got 0x{:x})",
+            target, jit_exec.core.pc);
+        assert!(!jit_exec.core.in_delay_slot, "in_delay_slot must be cleared once the pending transfer is honored");
+        assert_eq!(jit_exec.core.gpr[2], 0x1234_0000u64 as i32 as i64 as u64,
+            "unfused-LUI semantics only (rt = hi16<<16, sign-extended) — the unrelated word+1 ORI must never have been folded in");
+    }
+
     #[test]
     fn lw_matches_interpreter_basic() {
         let mut gpr = [0u64; 32];

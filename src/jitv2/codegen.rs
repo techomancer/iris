@@ -6028,6 +6028,23 @@ fn fused_lui_imm32(lui_raw: u32, next_raw: u32) -> Option<i64> {
 /// - `word + 1` is off the end of the page (`entries_per_page` boundary):
 ///   nothing to peek at, and 0xFFC-adjacent words have their own hazards
 ///   this function doesn't need to reason about — just don't fuse.
+/// - **`word` can be arrived at as a foreign delay slot at runtime**
+///   (`word == entry_word`, or `instrs[word].is_branch_fallback_successor`):
+///   mirrors the interpreter's own `exec_lui_imm32`/`exec_lui_simm32` guard
+///   (`if self.core.in_delay_slot { ...don't fuse... }`, mips_exec.rs). Such
+///   an arrival means *this* LUI may actually be some other, outside-the-
+///   region branch's delay slot — `core.delay_slot_target`, not `word + 1`,
+///   is the real next PC, decided only at runtime (the foreign-slot check
+///   emitted right after this word's semantics, see `needs_foreign_slot_check`
+///   below). Fusing would unconditionally execute word+1's ORI/ADDIU and
+///   jump to word+2 before that runtime check ever runs, corrupting rt with
+///   a combine against an instruction that has nothing to do with this LUI
+///   and silently discarding the pending foreign transfer. A plain interior
+///   head can never carry a live `in_delay_slot` into itself this way (every
+///   in-region edge that lands here is a compile-time-known plain
+///   fallthrough or branch/jump target, never a delay-slot handoff), so
+///   fusion stays safe for the ordinary case — only these two arrival kinds
+///   need the exclusion.
 /// - **`instrs[word + 1].is_branch_target`**: the ORI/ADDIU is independently
 ///   reachable — something in this region branches/jumps directly to it,
 ///   skipping the LUI. That arrival needs the real, un-fused ORI/ADDIU to
@@ -6050,6 +6067,9 @@ fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PA
     }
     #[cfg(not(any(feature = "jitv2_lockstep", feature = "developer")))]
     {
+        if word == ctx.entry_word || instrs[word as usize].is_branch_fallback_successor {
+            return 0;
+        }
         let next_word = word + 1;
         if next_word as usize >= ENTRIES_PER_PAGE {
             return 0;
