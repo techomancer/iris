@@ -80,6 +80,12 @@ pub struct ScsiDeviceConfig {
     /// already exists or `scratch=false`.
     #[serde(default)]
     pub size_mb: Option<u32>,
+    /// Which HPC3 SCSI chip this target lives on: 0 (default) or 1. Indigo2
+    /// (IP22 fullhouse) has two independent WD33C93A controllers; Indy
+    /// (IP24 guinness) only has controller 0, so `controller = 1` is
+    /// rejected outside the Indigo2 profile — see `MachineConfig::validate`.
+    #[serde(default)]
+    pub controller: u8,
 }
 
 impl Default for ScsiDeviceConfig {
@@ -94,6 +100,7 @@ impl Default for ScsiDeviceConfig {
             overlay: false,
             scratch: false,
             size_mb: None,
+            controller: 0,
         }
     }
 }
@@ -1030,6 +1037,17 @@ impl MachineConfig {
             );
         }
         self.impact.validate()?;
+        for (&id, dev) in &self.scsi {
+            if dev.controller != 0 && self.machine.profile != MachineProfile::Indigo2Ip22 {
+                return Err(format!(
+                    "scsi.{}: controller {} is only valid on Indigo2 (machine.profile = indigo2_ip22) — Indy has a single SCSI controller (0)",
+                    id, dev.controller
+                ));
+            }
+            if dev.controller > 1 {
+                return Err(format!("scsi.{}: controller {} is invalid (valid: 0, 1)", id, dev.controller));
+            }
+        }
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }

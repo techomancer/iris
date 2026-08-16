@@ -85,6 +85,12 @@ pub const MISC_GIO_BUS_ERROR: u32 = 0x0010;
 // Both map to the same WD33C93A chip.
 pub const SCSI_REG_BASE: u32  = 0x40000;
 pub const SCSI_REG_BASE2: u32 = 0x44000;
+/// Fullhouse only: second WD33C93A register window (MAME's hpc3_device
+/// maps controller 1 at 0x48000-0x4ffff, controller 0 at 0x40000-0x47fff).
+/// Unlike SCSI_REG_BASE/SCSI_REG_BASE2, there is no second "spec alias" for
+/// this controller — that dual-addressing was specific to controller 0's
+/// historical IRIX-vs-spec address mismatch.
+pub const SCSI1_REG_BASE: u32 = 0x48000;
 pub const SEEQ_BASE: u32 = 0x54000;
 
 // PBUS PIO
@@ -1013,6 +1019,9 @@ pub struct Hpc3 {
     pdma_channels: Vec<Arc<Mutex<PdmaChannel>>>,
     pdma_ops: Vec<Arc<dyn PdmaChannelOps>>,
     scsi_dev: Arc<Wd33c93a>,
+    /// Fullhouse (Indigo2) only — second, independent WD33C93A. `None` on
+    /// guinness (Indy). See `SCSI1_REG_BASE`'s doc comment.
+    scsi_dev1: Option<Arc<Wd33c93a>>,
     hal2: Option<Arc<Hal2>>,
     pdma_dump: Arc<AtomicU32>,
     /// The machine's gateway settings, kept so a DaynaPort SCSI target can be
@@ -1053,6 +1062,12 @@ impl Hpc3 {
 
         // Shared OnceLock so ScsiDmaOps can call power_on() on the WD33C93A reset falling edge.
         let scsi_wd_lock: Arc<OnceLock<Arc<Wd33c93a>>> = Arc::new(OnceLock::new());
+        // Fullhouse only: second, independent WD33C93A on PDMA channel 9 /
+        // register window SCSI1_REG_BASE. Indy (guinness) has no second
+        // physical chip, so channel 9 there just keeps pointing at
+        // controller 0's lock (unreachable in practice — nothing maps to
+        // its register window on guinness).
+        let scsi1_wd_lock: Arc<OnceLock<Arc<Wd33c93a>>> = Arc::new(OnceLock::new());
 
         // Shared OnceLock so EnetRx/TxDmaOps can pull SEEQ status on CTRL read.
         // Populated after seeq creation below.
@@ -1086,8 +1101,12 @@ impl Hpc3 {
             dma_clients.push(Arc::new(PdmaClientImpl { channel: pdma_channels.last().unwrap().clone() }));
             if i <= HPC3_PDMA_CHAN_GENERIC as usize {
                 pdma_ops.push(Arc::new(PbusDmaOps));
-            } else if i <= HPC3_PDMA_CHAN_SCSI1 as usize {
+            } else if i == HPC3_PDMA_CHAN_SCSI0 as usize {
                 pdma_ops.push(Arc::new(ScsiDmaOps { wd: scsi_wd_lock.clone() }));
+            } else if i == HPC3_PDMA_CHAN_SCSI1 as usize {
+                pdma_ops.push(Arc::new(ScsiDmaOps {
+                    wd: if guinness { scsi_wd_lock.clone() } else { scsi1_wd_lock.clone() },
+                }));
             } else if i == HPC3_PDMA_CHAN_ENET_RX as usize {
                 pdma_ops.push(Arc::new(EnetRxDmaOps { seeq: enet_seeq_lock.clone() }));
             } else {
@@ -1126,8 +1145,22 @@ impl Hpc3 {
             pdma_paired: Some((pdma_channels[8].clone(), HPC3_INTSTAT_SCSI0_DMA)),
         });
 
-        let scsi_dev = Arc::new(Wd33c93a::new_with_config(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), scsi_deferred_int));
+        let scsi_dev = Arc::new(Wd33c93a::new_with_id(Some(scsi0_dma), Some(scsi0_irq), heartbeat.clone(), scsi_deferred_int, 0));
         let _ = scsi_wd_lock.set(scsi_dev.clone());
+
+        // Fullhouse's second WD33C93A — see scsi1_wd_lock's doc comment above.
+        let scsi_dev1 = if !guinness {
+            let scsi1_dma = Arc::new(PdmaClientImpl { channel: pdma_channels[9].clone() });
+            let scsi1_irq = Arc::new(Hpc3Irq {
+                state: state.clone(), ioc: ioc.clone(), bit: HPC3_INTSTAT_SCSI1_DEV, ioc_line: IocInterrupt::Scsi1,
+                pdma_paired: Some((pdma_channels[9].clone(), HPC3_INTSTAT_SCSI1_DMA)),
+            });
+            let dev = Arc::new(Wd33c93a::new_with_id(Some(scsi1_dma), Some(scsi1_irq), heartbeat.clone(), scsi_deferred_int, 1));
+            let _ = scsi1_wd_lock.set(dev.clone());
+            Some(dev)
+        } else {
+            None
+        };
 
         let _ = audio;
         let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec()))) };
@@ -1141,6 +1174,7 @@ impl Hpc3 {
             pdma_channels,
             pdma_ops,
             scsi_dev,
+            scsi_dev1,
             hal2,
             pdma_dump,
             net_base,
@@ -1159,8 +1193,21 @@ impl Hpc3 {
         self.seeq.set_phys(mem);
     }
 
-    pub fn add_scsi_device(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
-        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay, None)
+    /// Pick controller 0 or 1's chip. `controller == 1` on guinness (Indy,
+    /// no second chip) is a config-validation error — see
+    /// `MachineConfig::validate` — so this panics rather than silently
+    /// falling back, to catch that class of bug immediately instead of
+    /// quietly wiring a disk to the wrong (or a nonexistent) controller.
+    fn scsi_controller(&self, controller: u8) -> &Arc<Wd33c93a> {
+        match controller {
+            0 => &self.scsi_dev,
+            1 => self.scsi_dev1.as_ref().expect("scsi controller 1 requested but not present (guinness profile?)"),
+            _ => panic!("invalid SCSI controller {} (valid: 0, 1)", controller),
+        }
+    }
+
+    pub fn add_scsi_device(&self, controller: u8, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool) -> std::io::Result<()> {
+        self.scsi_controller(controller).add_device(id, path, is_cdrom, discs, overlay, None)
     }
 
     /// Attach a DaynaPort SCSI/Link (SCSI-attached Ethernet) at `id`.
@@ -1171,7 +1218,7 @@ impl Hpc3 {
     /// (NAT vs PCAP) and the NFS export are inherited from `[network]`/`[nfs]`;
     /// host port forwards are **not**, since only one engine can own a host
     /// listening port.
-    pub fn add_scsi_daynaport(&self, id: usize, params: crate::config::DaynaportParams) -> std::io::Result<()> {
+    pub fn add_scsi_daynaport(&self, controller: u8, id: usize, params: crate::config::DaynaportParams) -> std::io::Result<()> {
         let gateway = GatewayConfig {
             // A distinct gateway MAC per target: same 02:00:DE:AD prefix as the
             // SEEQ's, then DA ("Dayna") and the SCSI id.
@@ -1182,15 +1229,15 @@ impl Hpc3 {
             port_forwards: vec![],
             ..self.net_base.clone()
         };
-        self.scsi_dev.add_daynaport(id, params.mac, gateway)
+        self.scsi_controller(controller).add_daynaport(id, params.mac, gateway)
     }
 
     /// Same as `add_scsi_device` but lets the caller specify where the COW
     /// overlay file lives. Used by `--ci` mode to keep per-process overlays
     /// in `/tmp` so parallel `--ci` instances (and an interactive session)
     /// don't race on the same file.
-    pub fn add_scsi_device_with_overlay(&self, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool, overlay_path: &str) -> std::io::Result<()> {
-        self.scsi_dev.add_device(id, path, is_cdrom, discs, overlay, Some(overlay_path))
+    pub fn add_scsi_device_with_overlay(&self, controller: u8, id: usize, path: &str, is_cdrom: bool, discs: Vec<String>, overlay: bool, overlay_path: &str) -> std::io::Result<()> {
+        self.scsi_controller(controller).add_device(id, path, is_cdrom, discs, overlay, Some(overlay_path))
     }
 
     pub fn ioc(&self) -> &Ioc {
@@ -1217,6 +1264,11 @@ impl Hpc3 {
         &self.scsi_dev
     }
 
+    /// Fullhouse (Indigo2) only — `None` on guinness (Indy).
+    pub fn scsi1(&self) -> Option<&Arc<Wd33c93a>> {
+        self.scsi_dev1.as_ref()
+    }
+
     pub fn register_locks(&self) {
         use crate::locks::register_lock_fn;
         let state = self.state.clone();
@@ -1230,6 +1282,7 @@ impl Hpc3 {
         // Delegate to child components
         self.seeq.register_locks();
         self.scsi_dev.register_locks();
+        if let Some(dev) = &self.scsi_dev1 { dev.register_locks(); }
         if let Some(hal2) = &self.hal2 { hal2.register_locks(); }
         self.ioc.register_locks();
     }
@@ -1243,6 +1296,7 @@ impl Device for Hpc3 {
     fn stop(&self) {
         self.seeq.stop();
         self.scsi_dev.stop();
+        if let Some(dev) = &self.scsi_dev1 { dev.stop(); }
         self.rtc.stop();
         self.ioc.stop();
         if let Some(hal2) = &self.hal2 { hal2.stop(); }
@@ -1253,6 +1307,7 @@ impl Device for Hpc3 {
         self.ioc.start();
         self.rtc.start();
         self.scsi_dev.start();
+        if let Some(dev) = &self.scsi_dev1 { dev.start(); }
         self.seeq.start();
     }
     fn is_running(&self) -> bool { self.ioc.is_running() }
@@ -1265,6 +1320,13 @@ impl Device for Hpc3 {
         cmds.extend(self.rtc.register_commands());
         cmds.extend(self.seeq.register_commands());
         cmds.extend(self.scsi_dev.register_commands());
+        // "scsi"/"cow" above already cover controller 0; scsi0 is an
+        // explicit alias for the same, and scsi1 (fullhouse only) targets
+        // the second controller — see execute_command's dispatch.
+        cmds.push(("scsi0".to_string(), "Alias for `scsi` (controller 0)".to_string()));
+        if self.scsi_dev1.is_some() {
+            cmds.push(("scsi1".to_string(), "Second SCSI controller (fullhouse only) — same subcommands as `scsi`".to_string()));
+        }
         if let Some(hal2) = &self.hal2 { cmds.extend(hal2.register_commands()); }
         cmds
     }
@@ -1372,8 +1434,14 @@ impl Device for Hpc3 {
         if cmd == "seeq" || cmd == "net" {
              return self.seeq.execute_command(cmd, args, writer);
         }
-        if cmd == "scsi" || cmd == "cow" {
+        if cmd == "scsi" || cmd == "scsi0" || cmd == "cow" {
              return self.scsi_dev.execute_command(cmd, args, writer);
+        }
+        if cmd == "scsi1" {
+            return match &self.scsi_dev1 {
+                Some(dev) => dev.execute_command(cmd, args, writer),
+                None => Err("scsi1: not available (guinness/Indy profile has a single SCSI controller)".to_string()),
+            };
         }
         if cmd == "hal2" {
             if let Some(hal2) = &self.hal2 {
@@ -1411,6 +1479,15 @@ impl BusDevice for Hpc3 {
             let base = if offset >= SCSI_REG_BASE2 { SCSI_REG_BASE2 } else { SCSI_REG_BASE };
             let idx = (offset - base) >> 2;
             return self.scsi_dev.read(idx);
+        }
+
+        // Fullhouse only: second WD33C93A at SCSI1_REG_BASE
+        if !self.guinness && (SCSI1_REG_BASE..SCSI1_REG_BASE + 8).contains(&offset) {
+            let idx = (offset - SCSI1_REG_BASE) >> 2;
+            if let Some(dev) = &self.scsi_dev1 {
+                return dev.read(idx);
+            }
+            return BusRead8::ok(0);
         }
 
         // SEEQ8003 Ethernet Controller (0x54000 - 0x5401F) - 8-bit device
@@ -1488,6 +1565,15 @@ impl BusDevice for Hpc3 {
             let base = if offset >= SCSI_REG_BASE2 { SCSI_REG_BASE2 } else { SCSI_REG_BASE };
             let idx = (offset - base) >> 2;
             return self.scsi_dev.write(idx, val);
+        }
+
+        // Fullhouse only: second WD33C93A at SCSI1_REG_BASE
+        if !self.guinness && (SCSI1_REG_BASE..SCSI1_REG_BASE + 8).contains(&offset) {
+            let idx = (offset - SCSI1_REG_BASE) >> 2;
+            if let Some(dev) = &self.scsi_dev1 {
+                return dev.write(idx, val);
+            }
+            return BUS_OK;
         }
 
         // SEEQ8003 Ethernet Controller (0x54000 - 0x5401F) - 8-bit device
@@ -1580,9 +1666,11 @@ impl BusDevice for Hpc3 {
             return BusRead32::ok(0); // Placeholder
         }
 
-        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD)
+        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD);
+        // 0x48000 is fullhouse's second controller (SCSI1_REG_BASE)
         if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset)
-            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset) {
+            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset)
+            || (!self.guinness && (SCSI1_REG_BASE..SCSI1_REG_BASE + 8).contains(&offset)) {
             let r = self.read8(addr);
             return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
@@ -1735,9 +1823,11 @@ impl BusDevice for Hpc3 {
             return self.write8(addr, val as u8);
         }
 
-        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD)
+        // SCSI Registers — two aliases: 0x40000 (IRIX) and 0x44000 (HPC3 spec/OpenBSD);
+        // 0x48000 is fullhouse's second controller (SCSI1_REG_BASE)
         if (SCSI_REG_BASE..SCSI_REG_BASE + 8).contains(&offset)
-            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset) {
+            || (SCSI_REG_BASE2..SCSI_REG_BASE2 + 8).contains(&offset)
+            || (!self.guinness && (SCSI1_REG_BASE..SCSI1_REG_BASE + 8).contains(&offset)) {
             return self.write8(addr, val as u8);
         }
 

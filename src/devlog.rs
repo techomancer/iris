@@ -36,6 +36,12 @@ pub enum LogModule {
     L1d    = 21,  // L1 data cache: read/write hit/miss, fill, cache ops
     L2c    = 22,  // L2 unified cache: fill, writeback, invalidate, cache ops
     Ultra  = 23,  // N64 dev board: shm reads/writes, interrupts, register traffic
+    /// Second WD33C93A (fullhouse/Indigo2 SCSI controller 1). Kept as a
+    /// distinct module (rather than folding into `Scsi`) so `scsi1 debug`
+    /// can be toggled independently of controller 0's `scsi debug`; bare
+    /// `scsi debug` toggles both — see wd33c93a.rs's `scsi`/`scsi1` command
+    /// handling.
+    Scsi1  = 24,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -44,7 +50,7 @@ pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
 impl LogModule {
-    pub const COUNT: usize = 24;
+    pub const COUNT: usize = 25;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -57,6 +63,7 @@ impl LogModule {
             "mips" => Some(Self::Mips),
             "ioc"  => Some(Self::Ioc),
             "scsi" => Some(Self::Scsi),
+            "scsi1" => Some(Self::Scsi1),
             "pdma" => Some(Self::Pdma),
             "vino" => Some(Self::Vino),
             "dcb"  => Some(Self::Dcb),
@@ -87,6 +94,7 @@ impl LogModule {
             Self::Mips => "mips",
             Self::Ioc  => "ioc",
             Self::Scsi => "scsi",
+            Self::Scsi1 => "scsi1",
             Self::Pdma => "pdma",
             Self::Vino => "vino",
             Self::Dcb  => "dcb",
@@ -111,7 +119,7 @@ impl LogModule {
             Self::Rex3, Self::Mips, Self::Ioc, Self::Scsi, Self::Pdma,
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
-            Self::L1i, Self::L1d, Self::L2c, Self::Ultra,
+            Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
         ]
     }
 
@@ -246,6 +254,7 @@ impl DevLog {
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // Ps2, Rtc, Eeprom
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // L1i, L1d, L2c
                 ModuleLog::new(), // Ultra
+                ModuleLog::new(), // Scsi1
             ],
         }
     }

@@ -109,6 +109,10 @@ struct RollbackCheckpoint {
     overlay_dir: std::path::PathBuf,
     /// Per-SCSI-id dirty sector lists from cow.toml at the time of restore.
     overlay_sets: Vec<(usize, Vec<u64>)>,
+    /// Same, for the second (fullhouse) SCSI controller — kept in a
+    /// separate list/subdirectory (see `capture_rollback_checkpoint`) since
+    /// controller 0 and controller 1 can each have a device at the same id.
+    overlay_sets1: Vec<(usize, Vec<u64>)>,
 
     /// Native-endian RAM bank words. `bank_words[i].len() ==
     /// banks[i].size_bytes / 4` for present banks; populated for all four.
@@ -128,10 +132,42 @@ struct RollbackCheckpoint {
     rtc: toml::Value,
     eeprom: toml::Value,
     scsi: toml::Value,
+    /// Second SCSI controller's state — fullhouse only. `None` on guinness.
+    scsi1: Option<toml::Value>,
     seeq: toml::Value,
     hpc3: toml::Value,
     rex3: Option<toml::Value>,
     rex3_head1: Option<toml::Value>,
+}
+
+/// Parse a `cow.toml`/`cow1.toml`-shaped table (`{"scsi<id>": [dirty
+/// sectors...]}`) into `(id, dirty_sectors)` pairs. Shared by rollback
+/// capture and snapshot load so the two paths can't drift.
+/// Inverse of `parse_cow_table`: build a `{"scsi<id>": [dirty sectors...]}`
+/// table from `export_overlays`'s output.
+fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
+    let mut tbl = toml::map::Map::new();
+    for (id, dirty) in overlays {
+        let arr: Vec<toml::Value> = dirty.into_iter().map(|v| toml::Value::Integer(v as i64)).collect();
+        tbl.insert(format!("scsi{}", id), toml::Value::Array(arr));
+    }
+    toml::Value::Table(tbl)
+}
+
+fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
+    let mut sets = Vec::new();
+    if let Some(tbl) = cow_toml.as_table() {
+        for (k, v) in tbl {
+            let Some(id_str) = k.strip_prefix("scsi") else { continue };
+            let Ok(id) = id_str.parse::<usize>() else { continue };
+            let Some(arr) = v.as_array() else { continue };
+            let dirty: Vec<u64> = arr.iter()
+                .filter_map(|x| x.as_integer().map(|i| i as u64))
+                .collect();
+            sets.push((id, dirty));
+        }
+    }
+    sets
 }
 
 /// Full-machine in-memory checkpoint captured from *live* running state
@@ -311,7 +347,7 @@ impl Machine {
                         std::process::exit(1);
                     }
                 };
-                match hpc3.add_scsi_daynaport(id as usize, params) {
+                match hpc3.add_scsi_daynaport(dev.controller, id as usize, params) {
                     Ok(()) => println!(
                         "iris: DaynaPort SCSI/Link at SCSI ID {} — MAC {}, gateway {} (guest {}/{})",
                         id, crate::net::mac_str(&params.mac),
@@ -383,9 +419,9 @@ impl Machine {
             };
             let result = if ci_enabled && dev.overlay && !dev.cdrom {
                 let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
-                hpc3.add_scsi_device_with_overlay(id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
+                hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
             } else {
-                hpc3.add_scsi_device(id as usize, &path, dev.cdrom, discs, dev.overlay)
+                hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
                 // A configured disk that won't attach (a CHD path when built
@@ -1253,6 +1289,7 @@ impl Machine {
         let rtc = self.hpc3.rtc().save_state();
         let eeprom = self.hpc3.eeprom().lock().save_state_owned();
         let scsi = self.hpc3.scsi().save_state();
+        let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
         let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
@@ -1268,25 +1305,14 @@ impl Machine {
         let framebuffers = self._phys.rex3.as_ref()
             .map(|r| r.snapshot_framebuffers_inmem());
 
-        // Re-read cow.toml so rollback knows which dirty sectors to import
-        // back. The file was just consumed by load_snapshot but it's tiny and
-        // re-reading from page cache is cheap (~µs).
+        // Re-read cow.toml (and cow1.toml, for controller 1) so rollback
+        // knows which dirty sectors to import back. The files were just
+        // consumed by load_snapshot but they're tiny and re-reading from
+        // page cache is cheap (~µs).
         let overlay_dir = std::path::PathBuf::from("saves").join(name);
         let snap = Snapshot::new(&overlay_dir);
-        let mut overlay_sets: Vec<(usize, Vec<u64>)> = Vec::new();
-        if let Ok(cow_toml) = snap.read_toml("cow.toml") {
-            if let Some(tbl) = cow_toml.as_table() {
-                for (k, v) in tbl {
-                    let Some(id_str) = k.strip_prefix("scsi") else { continue };
-                    let Ok(id) = id_str.parse::<usize>() else { continue };
-                    let Some(arr) = v.as_array() else { continue };
-                    let dirty: Vec<u64> = arr.iter()
-                        .filter_map(|x| x.as_integer().map(|i| i as u64))
-                        .collect();
-                    overlay_sets.push((id, dirty));
-                }
-            }
-        }
+        let overlay_sets = snap.read_toml("cow.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
+        let overlay_sets1 = snap.read_toml("cow1.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
 
         self.restart_peripherals();
         self.cpu.start();
@@ -1294,9 +1320,10 @@ impl Machine {
         Ok(RollbackCheckpoint {
             overlay_dir,
             overlay_sets,
+            overlay_sets1,
             bank_words,
             framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, seeq, hpc3, rex3, rex3_head1,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, rex3, rex3_head1,
         })
     }
 
@@ -1315,6 +1342,9 @@ impl Machine {
         self.hpc3.rtc().load_state(&cp.rtc)?;
         self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
         self.hpc3.scsi().load_state(&cp.scsi)?;
+        if let (Some(dev), Some(scsi1_toml)) = (self.hpc3.scsi1(), &cp.scsi1) {
+            dev.load_state(scsi1_toml)?;
+        }
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
         if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
@@ -1336,6 +1366,13 @@ impl Machine {
         // can re-import directly.
         self.hpc3.scsi().import_overlays(&cp.overlay_dir, &cp.overlay_sets)
             .map_err(|e| format!("rollback: COW overlay import: {}", e))?;
+        if let Some(dev) = self.hpc3.scsi1() {
+            // Controller 1's overlays live in a "ctrl1" subdirectory so a
+            // device at the same id on both controllers never collides on
+            // the same scsi<id>.overlay filename.
+            dev.import_overlays(&cp.overlay_dir.join("ctrl1"), &cp.overlay_sets1)
+                .map_err(|e| format!("rollback: COW overlay import (controller 1): {}", e))?;
+        }
 
         self.restart_peripherals();
         self.cpu.start();
@@ -1460,6 +1497,7 @@ impl Machine {
         self.hpc3.eeprom().lock().power_on();
         // SCSI: execute hardware reset sequence.
         self.hpc3.scsi().power_on();
+        if let Some(dev) = self.hpc3.scsi1() { dev.power_on(); }
         // Seeq/Ethernet: reset regs + signal NAT flush.
         self.hpc3.seeq().power_on();
         // HAL2: reset all audio registers and channel state (timers already stopped).
@@ -1513,6 +1551,9 @@ impl Machine {
         snap.write_state("rtc",    &self.hpc3.rtc().save_state(),                  sv).map_err(|e| e.to_string())?;
         snap.write_state("eeprom", &self.hpc3.eeprom().lock().save_state_owned(),  sv).map_err(|e| e.to_string())?;
         snap.write_state("scsi",   &self.hpc3.scsi().save_state(),                 sv).map_err(|e| e.to_string())?;
+        if let Some(dev) = self.hpc3.scsi1() {
+            snap.write_state("scsi1", &dev.save_state(), sv).map_err(|e| e.to_string())?;
+        }
         snap.write_state("seeq",   &self.hpc3.seeq().save_state(),                 sv).map_err(|e| e.to_string())?;
         snap.write_state("hpc3",   &self.hpc3.save_state(),                        sv).map_err(|e| e.to_string())?;
 
@@ -1571,15 +1612,18 @@ impl Machine {
         // consistent with the captured RAM.
         let overlays = self.hpc3.scsi().export_overlays(&snap.dir)
             .map_err(|e| format!("COW overlay export: {}", e))?;
-        let mut cow_tbl = toml::map::Map::new();
-        for (id, dirty) in overlays {
-            let arr: Vec<toml::Value> = dirty.into_iter()
-                .map(|v| toml::Value::Integer(v as i64))
-                .collect();
-            cow_tbl.insert(format!("scsi{}", id), toml::Value::Array(arr));
-        }
-        snap.write_toml("cow.toml", &toml::Value::Table(cow_tbl))
+        snap.write_toml("cow.toml", &build_cow_table(overlays))
             .map_err(|e| e.to_string())?;
+        if let Some(dev) = self.hpc3.scsi1() {
+            // Own subdirectory + cow1.toml so controller 1 never collides
+            // with controller 0's scsi<id>.overlay filenames.
+            let ctrl1_dir = snap.dir.join("ctrl1");
+            std::fs::create_dir_all(&ctrl1_dir).map_err(|e| e.to_string())?;
+            let overlays1 = dev.export_overlays(&ctrl1_dir)
+                .map_err(|e| format!("COW overlay export (controller 1): {}", e))?;
+            snap.write_toml("cow1.toml", &build_cow_table(overlays1))
+                .map_err(|e| e.to_string())?;
+        }
 
         self.restart_peripherals();
         // Resume execution so the session feels like it never paused.
@@ -1752,6 +1796,15 @@ impl Machine {
         let scsi = snap.read_state("scsi", schema_version).map_err(|e| e.to_string())?;
         self.hpc3.scsi().load_state(&scsi)?;
 
+        // scsi1.* is absent from snapshots saved before the second SCSI
+        // controller existed, and from guinness machines — both are
+        // legitimate "leave controller 1 untouched" cases, not errors.
+        if let Some(dev) = self.hpc3.scsi1() {
+            if let Ok(scsi1) = snap.read_state("scsi1", schema_version) {
+                dev.load_state(&scsi1)?;
+            }
+        }
+
         let seeq = snap.read_state("seeq", schema_version).map_err(|e| e.to_string())?;
         self.hpc3.seeq().load_state(&seeq)?;
 
@@ -1812,20 +1865,16 @@ impl Machine {
         // COW overlays — best-effort for backward compatibility with
         // snapshots saved before overlay capture was added.
         if let Ok(cow_toml) = snap.read_toml("cow.toml") {
-            let mut sets: Vec<(usize, Vec<u64>)> = Vec::new();
-            if let Some(tbl) = cow_toml.as_table() {
-                for (k, v) in tbl {
-                    let Some(id_str) = k.strip_prefix("scsi") else { continue };
-                    let Ok(id) = id_str.parse::<usize>() else { continue };
-                    let Some(arr) = v.as_array() else { continue };
-                    let dirty: Vec<u64> = arr.iter()
-                        .filter_map(|x| x.as_integer().map(|i| i as u64))
-                        .collect();
-                    sets.push((id, dirty));
-                }
-            }
+            let sets = parse_cow_table(&cow_toml);
             self.hpc3.scsi().import_overlays(&snap.dir, &sets)
                 .map_err(|e| format!("COW overlay import: {}", e))?;
+            if let Some(dev) = self.hpc3.scsi1() {
+                if let Ok(cow1_toml) = snap.read_toml("cow1.toml") {
+                    let sets1 = parse_cow_table(&cow1_toml);
+                    dev.import_overlays(&snap.dir.join("ctrl1"), &sets1)
+                        .map_err(|e| format!("COW overlay import (controller 1): {}", e))?;
+                }
+            }
         } else {
             eprintln!("load_snapshot: no cow.toml in snapshot — overlays left unchanged");
         }

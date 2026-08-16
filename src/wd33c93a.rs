@@ -225,6 +225,11 @@ pub mod command_phase {
 }
 
 struct Wd33c93aState {
+    /// Which HPC3 SCSI controller this chip is (0 or 1) — Indigo2 fullhouse
+    /// has two independent WD33C93A instances; embedded in every dlog! line
+    /// (`"WD33C93A({}): ..."`) so their logs are distinguishable, matching
+    /// Z85c30's Channel::name convention for its two channels.
+    id: u8,
     // Indirectly accessed registers
     regs: [u8; 32],
     // Address Register (selects one of the 32 regs)
@@ -317,9 +322,16 @@ impl Wd33c93a {
     }
 
     pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
+        Self::new_with_id(dma, callback, heartbeat, deferred_int, 0)
+    }
+
+    /// Same as `new_with_config`, but tags every log line with `id` (the
+    /// HPC3 SCSI controller number) — see `Wd33c93aState.id`'s doc comment.
+    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
         let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
         Self {
             state: Arc::new(Mutex::new(Wd33c93aState {
+                id,
                 regs: [0; 32],
                 ar: 0,
                 asr: 0, // Initially not busy, no interrupt
@@ -715,7 +727,7 @@ impl Wd33c93a {
                 let val = state.fifo.pop_front().unwrap_or(0);
                 wdt!("R FIFO -> {:02x} (fifo_remaining={})",
                     val, state.fifo.len());
-                dlog!(LogModule::Scsi, "WD33C93A: Read FIFO -> {:02x}", val);
+                dlog!(state.log_module(), "WD33C93A({}): Read FIFO -> {:02x}", state.id, val);
 
                 // DBR-based PIO delivery: when DBR was set (data/status/msg byte ready),
                 // each DATA read decrements TC and advances phase on fifo drain.
@@ -883,7 +895,7 @@ impl Wd33c93a {
             }
 
             if ar == regs::TARGET_LUN || ar == regs::SCSI_STATUS {
-                dlog!(LogModule::Scsi, "WD33C93A: Read Reg {:02x} ({}) -> {:02x}",
+                dlog!(state.log_module(), "WD33C93A({}): Read Reg {:02x} ({}) -> {:02x}", state.id,
                     ar,
                     if ar == regs::TARGET_LUN { "TARGET_LUN" } else { "SCSI_STATUS" },
                     val);
@@ -895,7 +907,7 @@ impl Wd33c93a {
                     Some((last_reg, last_val)) => last_reg != ar || last_val != val,
                 };
                 if should_print {
-                    dlog!(LogModule::Scsi, "WD33C93A: Read Reg {:02x} -> {:02x}", ar, val);
+                    dlog!(state.log_module(), "WD33C93A({}): Read Reg {:02x} -> {:02x}", state.id, ar, val);
                     state.last_read_reg = Some((ar, val));
                 }
                 state.last_read_asr = None;
@@ -912,7 +924,7 @@ impl Wd33c93a {
             // Write AR (Address Register)
             state.ar = val & 0x1F;
             wdt!("W AR  <- {:02x}", val);
-            dlog!(LogModule::Scsi, "WD33C93A: Write AR <- {:02x}", val);
+            dlog!(state.log_module(), "WD33C93A({}): Write AR <- {:02x}", state.id, val);
             state.last_read_asr = None;
             state.last_read_reg = None;
             return BUS_OK;
@@ -930,7 +942,7 @@ impl Wd33c93a {
                 wdt!("W {}[{:02x}] <- {:02x} (phase={:02x})",
                     label, ar, val, state.regs[regs::COMMAND_PHASE as usize]);
             }
-            dlog!(LogModule::Scsi, "WD33C93A: Write Reg {:02x} <- {:02x}", ar, val);
+            dlog!(state.log_module(), "WD33C93A({}): Write Reg {:02x} <- {:02x}", state.id, ar, val);
             state.last_read_asr = None;
             state.last_read_reg = None;
 
@@ -950,7 +962,7 @@ impl Wd33c93a {
                             || cmd_phase == command_phase::COMMAND_START
                         {
                             // All PIO outbound phases: fifo full, wake worker to process.
-                            dlog!(LogModule::Scsi, "WD33C93A: PIO xfer complete phase=0x{:02x}, waking worker ({} bytes)", cmd_phase, state.fifo.len());
+                            dlog!(state.log_module(), "WD33C93A({}): PIO xfer complete phase=0x{:02x}, waking worker ({} bytes)", state.id, cmd_phase, state.fifo.len());
                             state.update_asr(asr::DBR, 0);
                             state.pending_command = Some(state.regs[regs::COMMAND as usize]);
                             drop(state);
@@ -1012,7 +1024,7 @@ impl Wd33c93a {
                 {
                     let tc = state.get_transfer_count();
                     let tc = if tc == 0 { state.set_transfer_count(1); 1 } else { tc };
-                    dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO PIO deferred phase=0x{:02x} tc={}", phase, tc);
+                    dlog!(state.log_module(), "WD33C93A({}): XFER_INFO PIO deferred phase=0x{:02x} tc={}", state.id, phase, tc);
                     state.fifo.clear();
                     state.update_asr(asr::CIP | asr::INT, asr::DBR);
                     return BUS_OK;
@@ -1093,7 +1105,7 @@ impl Device for Wd33c93a {
 
                 // Process command if one was queued.
                 if let Some(cmd_reg) = state_guard.pending_command.take() {
-                    dlog!(LogModule::Scsi, "WD33C93A: Processing Command {:02x}", cmd_reg);
+                    dlog!(state_guard.log_module(), "WD33C93A({}): Processing Command {:02x}", state_guard.id, cmd_reg);
                     state_guard.process_wd_command(cmd_reg, dma.as_deref());
 
                     let tid = state_guard.target_id;
@@ -1138,7 +1150,7 @@ impl Device for Wd33c93a {
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
-        if cmd == "scsi" {
+        if cmd == "scsi" || cmd == "scsi0" || cmd == "scsi1" {
             match args.first().copied() {
                 Some("wdt") => {
                     #[cfg(feature = "developer")] {
@@ -1232,8 +1244,18 @@ impl Device for Wd33c93a {
                         Some("off") => false,
                         _ => return Err("Usage: scsi debug <on|off>".to_string()),
                     };
-                    if val { devlog().enable(LogModule::Scsi); } else { devlog().disable(LogModule::Scsi); }
-                    writeln!(writer, "SCSI debug {}", if val { "enabled" } else { "disabled" }).unwrap();
+                    // Bare `scsi debug` toggles both controllers' logging;
+                    // `scsi0 debug`/`scsi1 debug` toggle only their own —
+                    // see LogModule::Scsi1's doc comment.
+                    let modules: &[LogModule] = match cmd {
+                        "scsi1" => &[LogModule::Scsi1],
+                        "scsi0" => &[LogModule::Scsi],
+                        _       => &[LogModule::Scsi, LogModule::Scsi1],
+                    };
+                    for m in modules {
+                        if val { devlog().enable(*m); } else { devlog().disable(*m); }
+                    }
+                    writeln!(writer, "SCSI debug {} ({})", if val { "enabled" } else { "disabled" }, cmd).unwrap();
                     return Ok(());
                 }
                 Some("defer") => {
@@ -1504,6 +1526,13 @@ impl Saveable for Wd33c93a {
 }
 
 impl Wd33c93aState {
+    /// LogModule::Scsi for controller 0, LogModule::Scsi1 for controller 1 —
+    /// lets `scsi debug`/`scsi1 debug` toggle each chip's logging
+    /// independently. See `id`'s doc comment.
+    fn log_module(&self) -> LogModule {
+        if self.id == 0 { LogModule::Scsi } else { LogModule::Scsi1 }
+    }
+
     fn use_dma(&self) -> bool {
         let mode = (self.regs[regs::CONTROL as usize] >> 5) & 0x7;
         mode != 0
@@ -1512,7 +1541,7 @@ impl Wd33c93aState {
     fn read_asr(&mut self) -> u8 {
         let val = self.asr;
         if self.last_read_asr.is_none() || self.last_read_asr.unwrap() != val {
-            dlog!(LogModule::Scsi, "WD33C93A: Read ASR -> {:02x}", val);
+            dlog!(self.log_module(), "WD33C93A({}): Read ASR -> {:02x}", self.id, val);
             self.last_read_asr = Some(val);
         }
         self.last_read_reg = None;
@@ -1581,12 +1610,12 @@ impl Wd33c93aState {
 
         if old_phase != phase || old_status != status {
             if old_phase != phase && old_status != status {
-                dlog!(LogModule::Scsi, "WD33C93A: Phase {:02x}->{:02x} Status {:02x}->{:02x}",
+                dlog!(self.log_module(), "WD33C93A({}): Phase {:02x}->{:02x} Status {:02x}->{:02x}", self.id,
                     old_phase, phase, old_status, status);
             } else if old_phase != phase {
-                dlog!(LogModule::Scsi, "WD33C93A: Phase {:02x}->{:02x} (Status={:02x})", old_phase, phase, status);
+                dlog!(self.log_module(), "WD33C93A({}): Phase {:02x}->{:02x} (Status={:02x})", self.id, old_phase, phase, status);
             } else {
-                dlog!(LogModule::Scsi, "WD33C93A: Status {:02x}->{:02x} (Phase={:02x})", old_status, status, phase);
+                dlog!(self.log_module(), "WD33C93A({}): Status {:02x}->{:02x} (Phase={:02x})", self.id, old_status, status, phase);
             }
         }
     }
@@ -1600,7 +1629,7 @@ impl Wd33c93aState {
     }
 
     fn queue_interrupt_ex(&mut self, phase: Option<u8>, status: u8, deferred: bool) {
-        dlog!(LogModule::Scsi, "WD33C93A: queue_interrupt phase={:02x?} status={:02x} deferred={}", phase, status, deferred);
+        dlog!(self.log_module(), "WD33C93A({}): queue_interrupt phase={:02x?} status={:02x} deferred={}", self.id, phase, status, deferred);
         self.irq_fifo.push_back((status, phase, deferred));
     }
 
@@ -1617,9 +1646,9 @@ impl Wd33c93aState {
         }
         {
             let cmd_phase = self.regs[regs::COMMAND_PHASE as usize];
-            dlog!(LogModule::Scsi, "WD33C93A: Command {:02x} (CmdPhase: {:02x}, Tgt: {}, ASR: {:02x})",
+            dlog!(self.log_module(), "WD33C93A({}): Command {:02x} (CmdPhase: {:02x}, Tgt: {}, ASR: {:02x})", self.id,
                 cmd, cmd_phase, self.target_id, self.asr);
-            dlog!(LogModule::Scsi, "          Regs: CTRL={:02x} DST_ID={:02x} SRC_ID={:02x}",
+            dlog!(self.log_module(), "WD33C93A({}):           Regs: CTRL={:02x} DST_ID={:02x} SRC_ID={:02x}", self.id,
                 self.regs[regs::CONTROL as usize], self.regs[regs::DESTINATION_ID as usize], self.regs[regs::SOURCE_ID as usize]);
         }
 
@@ -1659,7 +1688,7 @@ impl Wd33c93aState {
             && self.regs[regs::COMMAND_PHASE as usize] == command_phase::TRANSFER_COUNT
             && self.xfer_data.is_empty()
         {
-            dlog!(LogModule::Scsi, "WD33C93A: SELECT_ATN_XFER conclude (PH_DATA=0x46)");
+            dlog!(self.log_module(), "WD33C93A({}): SELECT_ATN_XFER conclude (PH_DATA=0x46)", self.id);
             wdt!("CONCLUDE tgt={} status={:02x} pending_data={} xfer_data={} phase={:02x}", self.target_id, self.pending_status, self.pending_data.len(), self.xfer_data.len(), self.regs[regs::COMMAND_PHASE as usize]);
             self.regs[regs::TARGET_LUN as usize] = self.pending_status;
             self.queue_interrupt(Some(command_phase::COMPLETE_MSG), scsi_status::SELECT_TRANSFER_SUCCESS);
@@ -1668,7 +1697,7 @@ impl Wd33c93aState {
 
         // Resume mid-transfer if SELECT_ATN_XFER arrives while a chunked transfer is paused
         if cmd == cmd::SELECT_ATN_XFER && !self.xfer_data.is_empty() {
-            dlog!(LogModule::Scsi, "WD33C93A: SELECT_ATN_XFER resume: dir_in={} offset=0x{:x}/0x{:x}",
+            dlog!(self.log_module(), "WD33C93A({}): SELECT_ATN_XFER resume: dir_in={} offset=0x{:x}/0x{:x}", self.id,
                 self.xfer_direction_in, self.xfer_offset, self.xfer_data.len());
             if self.xfer_direction_in {
                 // Resuming a send (READ cmd): continue from xfer_offset
@@ -1718,7 +1747,7 @@ impl Wd33c93aState {
         }
 
         if self.devices[self.target_id].is_none() {
-            dlog!(LogModule::Scsi, "WD33C93A: No device at target {}, timing out", self.target_id);
+            dlog!(self.log_module(), "WD33C93A({}): No device at target {}, timing out", self.id, self.target_id);
             wdt!("SEL_TIMEO tgt={} cmd={:02x} asr={:02x}", self.target_id, cmd, self.asr);
             // First interrupt (0x42): consumed by selectbus's SBIC_WAIT(INT) poll.
             // Second interrupt (0x41 DISC): consumed by wd33c93_poll's wd33c93_loop
@@ -1750,7 +1779,7 @@ impl Wd33c93aState {
                 self.set_status(command_phase::SELECTED, status);
 
                 if cmd == cmd::SELECT_ATN_XFER || cmd == cmd::SELECT_XFER {
-                    dlog!(LogModule::Scsi, "WD33C93A: SELECT_XFER/SELECT_ATN_XFER");
+                    dlog!(self.log_module(), "WD33C93A({}): SELECT_XFER/SELECT_ATN_XFER", self.id);
                     // CDB is stored in registers starting at CDB_1 (0x03)
                     let opcode = self.regs[regs::CDB_1 as usize];
                     let len = self.get_cdb_length(opcode);
@@ -1765,12 +1794,12 @@ impl Wd33c93aState {
                     //   2nd: REQ_SEND_MSG_OUT (0x8E) — bus requesting MESG_OUT
                     // SELECT (no ATN) goes straight to CMD phase in one interrupt.
                     if cmd == cmd::SELECT_ATN {
-                        dlog!(LogModule::Scsi, "WD33C93A: SELECT_ATN → 0x11 then 0x8E");
+                        dlog!(self.log_module(), "WD33C93A({}): SELECT_ATN → 0x11 then 0x8E", self.id);
                         wdt!("SEL_ATN tgt={}", self.target_id);
                         self.queue_interrupt(Some(command_phase::SELECTED), scsi_status::SELECT_SUCCESS);
                         self.queue_interrupt(None, scsi_status::REQ_SEND_MSG_OUT);
                     } else {
-                        dlog!(LogModule::Scsi, "WD33C93A: SELECT → 0x8A (CMD phase)");
+                        dlog!(self.log_module(), "WD33C93A({}): SELECT → 0x8A (CMD phase)", self.id);
                         self.queue_interrupt(Some(command_phase::SELECTED), scsi_status::REQ_CMD_PHASE);
                     }
                 }
@@ -1778,7 +1807,7 @@ impl Wd33c93aState {
             cmd::TRANSFER_INFO => {
                 let scsi_st = self.regs[regs::SCSI_STATUS as usize];
                 let cmd_phase = self.regs[regs::COMMAND_PHASE as usize];
-                dlog!(LogModule::Scsi, "WD33C93A: TRANSFER_INFO scsi_status={:02x} cmd_phase={:02x}",
+                dlog!(self.log_module(), "WD33C93A({}): TRANSFER_INFO scsi_status={:02x} cmd_phase={:02x}", self.id,
                     scsi_st, cmd_phase);
 
                 match cmd_phase {
@@ -1790,7 +1819,7 @@ impl Wd33c93aState {
                         } else {
                             self.fifo.len()
                         };
-                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO MESG_OUT count={} dma={}", count, dma.is_some());
+                        dlog!(self.log_module(), "WD33C93A({}): XFER_INFO MESG_OUT count={} dma={}", self.id, count, dma.is_some());
                         let _msg = self.receive_data(count, dma);
                         self.queue_interrupt(Some(command_phase::IDENTIFY_SENT), scsi_status::REQ_CMD_PHASE);
                     }
@@ -1814,7 +1843,7 @@ impl Wd33c93aState {
                         self.xfer_offset = 0;
                         let cdb_bytes = self.receive_data(count, dma);
                         let opcode = cdb_bytes.first().copied().unwrap_or(0);
-                        dlog!(LogModule::Scsi, "WD33C93A: CMD phase CDB 0x{:02x} count={} dma={}", opcode, count, dma.is_some());
+                        dlog!(self.log_module(), "WD33C93A({}): CMD phase CDB 0x{:02x} count={} dma={}", self.id, opcode, count, dma.is_some());
                         let is_write = matches!(opcode,
                             scsi_cmd::WRITE_6 | scsi_cmd::WRITE_10 | scsi_cmd::WRITE_BUFFER |
                             scsi_cmd::MODE_SELECT_6 | scsi_cmd::FORMAT_UNIT | scsi_cmd::SEND_DIAGNOSTIC);
@@ -1833,7 +1862,7 @@ impl Wd33c93aState {
                             //    data.len(), self.regs[regs::CONTROL as usize], self.use_dma(), dma.is_some());
                             if self.use_dma() {
                                 // DMA path: CONTROL register now valid, driver has set up DMA.
-                                dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO DATA_IN DMA, {} bytes", data.len());
+                                dlog!(self.log_module(), "WD33C93A({}): XFER_INFO DATA_IN DMA, {} bytes", self.id, data.len());
                                 if !self.send_data_chunked(data, 0, dma) {
                                     eprintln!("WD33C93A: send_data_chunked paused");
                                     return; // paused mid-chunk, interrupt already raised
@@ -1842,13 +1871,13 @@ impl Wd33c93aState {
                                 self.queue_interrupt_ex(Some(command_phase::RECEIVE_STATUS), scsi_status::TRANSFER_STATUS_IN, true);
                             } else {
                                 // PIO path: load fifo, arm DBR for byte-by-byte delivery.
-                                dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO DATA_IN PIO, {} bytes, arming DBR", data.len());
+                                dlog!(self.log_module(), "WD33C93A({}): XFER_INFO DATA_IN PIO, {} bytes, arming DBR", self.id, data.len());
                                 self.fifo.extend(data);
                                 self.update_asr(asr::CIP | asr::INT, asr::DBR);
                             }
                         } else {
                             // No data (or fifo already drained): target now asserting STATUS phase.
-                            dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO → STATUS phase");
+                            dlog!(self.log_module(), "WD33C93A({}): XFER_INFO → STATUS phase", self.id);
                             self.regs[regs::TARGET_LUN as usize] = self.pending_status;
                             self.queue_interrupt_ex(Some(command_phase::RECEIVE_STATUS), scsi_status::TRANSFER_STATUS_IN, true);
                         }
@@ -1859,7 +1888,7 @@ impl Wd33c93aState {
                         self.regs[regs::TARGET_LUN as usize] = self.pending_status;
                         self.set_transfer_count(1);
                         self.fifo.push_back(self.pending_status);
-                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO RECEIVE_STATUS → DBR status={:02x}", self.pending_status);
+                        dlog!(self.log_module(), "WD33C93A({}): XFER_INFO RECEIVE_STATUS → DBR status={:02x}", self.id, self.pending_status);
                         self.update_asr(asr::CIP | asr::INT, asr::DBR);
                     }
                     command_phase::STATUS_RECEIVED => {
@@ -1867,11 +1896,11 @@ impl Wd33c93aState {
                         // Push msg byte to fifo, arm DBR. DATA read handler fires DISCONNECT when drained.
                         self.set_transfer_count(1);
                         self.fifo.push_back(self.pending_msg);
-                        dlog!(LogModule::Scsi, "WD33C93A: XFER_INFO STATUS_RECEIVED → DBR msg={:02x}", self.pending_msg);
+                        dlog!(self.log_module(), "WD33C93A({}): XFER_INFO STATUS_RECEIVED → DBR msg={:02x}", self.id, self.pending_msg);
                         self.update_asr(asr::CIP | asr::INT, asr::DBR);
                     }
                     _ => {
-                        dlog!(LogModule::Scsi, "WD33C93A: TRANSFER_INFO in unexpected state scsi_st={:02x} cmd_phase={:02x}",
+                        dlog!(self.log_module(), "WD33C93A({}): TRANSFER_INFO in unexpected state scsi_st={:02x} cmd_phase={:02x}", self.id,
                             scsi_st, cmd_phase);
                         self.update_asr(asr::CIP, 0);
                     }
@@ -1888,7 +1917,7 @@ impl Wd33c93aState {
                 }
             }
             _ => {
-                dlog!(LogModule::Scsi, "WD33C93A: Unimplemented WD command {:02x}", cmd);
+                dlog!(self.log_module(), "WD33C93A({}): Unimplemented WD command {:02x}", self.id, cmd);
                 self.update_asr(asr::CIP, 0);
             }
         }
@@ -1911,7 +1940,7 @@ impl Wd33c93aState {
         }
         let cdb = cdb.as_slice();
         if cdb.is_empty() {
-            dlog!(LogModule::Scsi, "WD33C93A: Empty CDB!");
+            dlog!(self.log_module(), "WD33C93A({}): Empty CDB!", self.id);
             self.update_asr(0, asr::LCI);
             self.queue_interrupt(Some(command_phase::DISCONNECTED), scsi_status::INVALID_COMMAND);
             return;
@@ -1978,7 +2007,7 @@ impl Wd33c93aState {
                 }
                 _ => {}
             }
-            dlog!(LogModule::Scsi, "WD33C93A: SCSI Command {:02x} ({}) Target {}{}", cdb[0], cmd_name, self.target_id, extra);
+            dlog!(self.log_module(), "WD33C93A({}): SCSI Command {:02x} ({}) Target {}{}", self.id, cdb[0], cmd_name, self.target_id, extra);
         }
 
         // Determine data_len based on command
@@ -2112,7 +2141,7 @@ impl Wd33c93aState {
                         }
                         self.pending_data = response.data;
                         self.set_transfer_count(self.pending_data.len() as u32);
-                        dlog!(LogModule::Scsi, "WD33C93A: DATA_IN 0x{:x} bytes staged, raising TRANSFER_DATA_IN", self.pending_data.len());
+                        dlog!(self.log_module(), "WD33C93A({}): DATA_IN 0x{:x} bytes staged, raising TRANSFER_DATA_IN", self.id, self.pending_data.len());
                         wdt!("STAGE tgt={} pending_data=0x{:x} bytes tc=0x{:x}", self.target_id, self.pending_data.len(), self.get_transfer_count());
                         self.queue_interrupt(Some(command_phase::TRANSFER_COUNT), scsi_status::TRANSFER_DATA_IN);
                         return;
@@ -2157,7 +2186,7 @@ impl Wd33c93aState {
     /// On pause: stores remaining data in `self.xfer_data`/`self.xfer_offset` and raises
     /// UNEXPECTED_RECV_DATA interrupt so IRIX's unex_info() can re-arm for the next chunk.
     fn send_data_chunked(&mut self, data: Vec<u8>, offset: usize, dma: Option<&dyn DmaClient>) -> bool {
-        dlog!(LogModule::Scsi, "WD33C93A: Sending 0x{:x} bytes via DMA (offset=0x{:x})", data.len() - offset, offset);
+        dlog!(self.log_module(), "WD33C93A({}): Sending 0x{:x} bytes via DMA (offset=0x{:x})", self.id, data.len() - offset, offset);
         wdt!("DMA_OUT start: 0x{:x} bytes (offset=0x{:x})", data.len() - offset, offset);
         if let Some(dma_dev) = dma {
             let total = data.len();
@@ -2177,7 +2206,7 @@ impl Wd33c93aState {
                         (st, _) = dma_dev.write(data[i] as u32, is_last);
                     }
                     if st.not_active() {
-                        dlog!(LogModule::Scsi, "WD33C93A: DMA channel still not active after 1ms — pausing");
+                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 1ms — pausing", self.id);
                         //eprintln!("WD33C93A: DMA channel still not active after 1ms — pausing");
                     }
                 }
@@ -2194,7 +2223,7 @@ impl Wd33c93aState {
                 if pause {
                     //eprintln!("WD33C93A: send_data_chunked pause: EOX={} XIE={} refused={} offset=0x{:x} remaining=0x{:x}",
                     //    st.eox(), st.irq(), st.refused(), i, total - i);
-                    dlog!(LogModule::Scsi, "WD33C93A: EOX={} XIE={} refused={} at offset=0x{:x}, remaining=0x{:x} — pausing",
+                    dlog!(self.log_module(), "WD33C93A({}): EOX={} XIE={} refused={} at offset=0x{:x}, remaining=0x{:x} — pausing", self.id,
                         st.eox(), st.irq(), st.refused(), i, total - i);
                     self.xfer_data = data;
                     self.xfer_offset = i;
@@ -2218,7 +2247,7 @@ impl Wd33c93aState {
     }
 
     fn receive_data_chunked_from(&mut self, total: usize, mut data: Vec<u8>, dma: Option<&dyn DmaClient>) -> Option<Vec<u8>> {
-        dlog!(LogModule::Scsi, "WD33C93A: Receiving 0x{:x} bytes via DMA (have=0x{:x})", total - data.len(), data.len());
+        dlog!(self.log_module(), "WD33C93A({}): Receiving 0x{:x} bytes via DMA (have=0x{:x})", self.id, total - data.len(), data.len());
         wdt!("DMA_IN start: 0x{:x} bytes (have=0x{:x})", total - data.len(), data.len());
         if let Some(dma_dev) = dma {
             while data.len() < total {
@@ -2231,7 +2260,7 @@ impl Wd33c93aState {
                         // EOX mid-transfer: chain exhausted before all bytes received — pause for IRIX resume.
                         let pause = st.eox() && data.len() < total;
                         if pause {
-                            dlog!(LogModule::Scsi, "WD33C93A: EOX at offset=0x{:x}, remaining=0x{:x} — pausing", data.len(), total - data.len());
+                            dlog!(self.log_module(), "WD33C93A({}): EOX at offset=0x{:x}, remaining=0x{:x} — pausing", self.id, data.len(), total - data.len());
                             wdt!("DMA_IN pause(EOX): at offset=0x{:x} remaining=0x{:x}", data.len(), total - data.len());
                             self.xfer_data = data;
                             self.xfer_offset = total; // store total as sentinel; xfer_data.len() is progress
@@ -2269,7 +2298,7 @@ impl Wd33c93aState {
                                     }
                                 }
                                 if !got {
-                                    dlog!(LogModule::Scsi, "WD33C93A: DMA channel still not active after 100ms — giving up");
+                                    dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — giving up", self.id);
                                     //eprintln!("WD33C93A: receive_data_chunked: DMA not active after 100ms");
                                     wdt!("DMA_IN spin-wait TIMEOUT: channel never became active");
                                     break;
@@ -2277,7 +2306,7 @@ impl Wd33c93aState {
                                 // Successfully got first byte — continue outer loop
                             } else {
                                 // Mid-transfer: chain exhausted early — pause for IRIX resume
-                                dlog!(LogModule::Scsi, "WD33C93A: EOX at offset=0x{:x}, remaining=0x{:x} — pausing", data.len(), remaining);
+                                dlog!(self.log_module(), "WD33C93A({}): EOX at offset=0x{:x}, remaining=0x{:x} — pausing", self.id, data.len(), remaining);
                                 wdt!("DMA_IN pause(inactive mid-xfer): offset=0x{:x} remaining=0x{:x}", data.len(), remaining);
                                 self.xfer_data = data;
                                 self.xfer_offset = total;
@@ -2304,9 +2333,9 @@ impl Wd33c93aState {
     fn send_data(&mut self, data: &[u8], dma: Option<&dyn DmaClient>) {
         if !data.is_empty() {
             if self.use_dma() {
-                dlog!(LogModule::Scsi, "WD33C93A: Sending 0x{:x} bytes via DMA", data.len());
+                dlog!(self.log_module(), "WD33C93A({}): Sending 0x{:x} bytes via DMA", self.id, data.len());
             } else {
-                dlog!(LogModule::Scsi, "WD33C93A: Pushing 0x{:x} bytes to FIFO", data.len());
+                dlog!(self.log_module(), "WD33C93A({}): Pushing 0x{:x} bytes to FIFO", self.id, data.len());
             }
         }
         if self.use_dma() {
