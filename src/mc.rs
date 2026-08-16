@@ -202,16 +202,21 @@ impl MemoryController {
         // Initialize CPUCTRL1: MC_HWM=0xC
         regs[(REG_CPUCTRL1 / 4) as usize] = 0x0000000C;
 
-        // Initialize SYSID. Rev C (3) in the low nibble. Bit 4 is documented
-        // as "EISA bus present" in docs/mc.pdf — on Indy that's clear per the
-        // spec — but the IRIX 5.3 vino driver's vino_init() checks bit 4 of
-        // SYSID at 0xBFA0001C as a gate before any further probing, and
-        // silently bails if it's clear (see
+        // Initialize SYSID. Rev C (3) in the low nibble on both profiles —
+        // MAME's mc.cpp hardcodes sys_id=0x03 ("rev. C MC") unconditionally,
+        // no guinness/fullhouse split. Indigo2 fullhouse PROM's SCSI
+        // diagnostic reads this and demands "rev B or greater" (fails hard
+        // with "Check or replace: CPU base board" otherwise) — we previously
+        // reported Rev A (0) here for fullhouse, which fails that check.
+        // Bit 4 is documented as "EISA bus present" in docs/mc.pdf — on Indy
+        // that's clear per the spec — but the IRIX 5.3 vino driver's
+        // vino_init() checks bit 4 of SYSID at 0xBFA0001C as a gate before
+        // any further probing, and silently bails if it's clear (see
         // rules/irix/vino-attach-via-sysid-bit4.md). Setting bit 4
         // unconditionally lets vino_init proceed; with it set, `vlinfo`
         // reports `vino 0` with 5 nodes (digital input = IndyCam, analog
         // input, two memory drains, controls).
-        regs[(REG_SYSID / 4) as usize] = if guinness { 0x00000013 } else { 0x00000010 };
+        regs[(REG_SYSID / 4) as usize] = 0x00000013;
 
         // Initialize RPSS_DIVIDER: DIV=9, INC=3 (for 33MHz)
         // 33MHz: Divide by 10 (9+1), Increment by 3 -> 300ns per tick
@@ -1486,7 +1491,7 @@ mod tests {
 
         let fullhouse = MemoryController::new(eeprom, false, [0u32; 4]);
         let sysid = fullhouse.read32(MC_BASE + REG_SYSID).data;
-        assert_eq!(sysid, 0x0000_0010, "Indigo2-class (fullhouse) SYSID");
+        assert_eq!(sysid, 0x0000_0013, "Indigo2-class (fullhouse) SYSID — Rev C on both profiles, see MAME mc.cpp");
         let gio_arb = fullhouse.read32(MC_BASE + REG_GIO64_ARB).data;
         assert_eq!(gio_arb & 0x400, 0, "fullhouse dual GIO — ONE_GIO clear");
     }
