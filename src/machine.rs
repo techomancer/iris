@@ -431,8 +431,8 @@ impl Machine {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
-                // Vertical retrace → L1 VERTICAL_RETRACE on Indy; on fullhouse the IOC
-                // fans extio SG_RETRACE into the same L1 bit (see apply_extio_fanout).
+                // Vertical retrace → L1 VERTICAL_RETRACE, same bit on both profiles
+                // (see ioc.rs's IocInterrupt::VerticalRetrace doc comment).
                 // GfxDrain0/1 are MAP FIFO-drain feedback — not vblank.
                 ioc_clone.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, active);
             }));
@@ -465,7 +465,7 @@ impl Machine {
                 if guinness {
                     ioc_clone.set_interrupt(crate::ioc::IocInterrupt::GioExp1, active);
                 } else {
-                    // Second Newport @ GIO slot 1: retrace via extio S0 (gc_select=1).
+                    // Second Newport @ GIO slot 1: shares the L1 VERTICAL_RETRACE bit.
                     ioc_clone.set_interrupt(crate::ioc::IocInterrupt::GioExp0Retrace, active);
                 }
             }));

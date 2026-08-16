@@ -93,19 +93,35 @@ pub mod map_regs {
     pub const GFX_DRAIN1: u8 = 1 << 7;
 }
 
-/// IP22 fullhouse EXTIO register (Linux `sgioc->extio`). Shared GIO interrupt
-/// lines from the graphics slot (SG) and expansion slot 0 (S0) are latched here;
-/// `gc_select` bit 0 chooses which slot feeds L0/L1 FIFO/GFX/retrace bits.
-pub mod extio_regs {
-    pub const SG_RETRACE: u32 = 1 << 8;
-    pub const SG_IRQ_1: u32   = 1 << 9;  // gfx.int → L0 GRAPHICS
-    pub const SG_IRQ_2: u32   = 1 << 10; // gfx.fifofull → L0 FIFO_FULL
-    pub const S0_RETRACE: u32 = 1 << 12;
-    pub const S0_IRQ_1: u32   = 1 << 13;
-    pub const S0_IRQ_2: u32   = 1 << 14;
-    pub const SG_MASK: u32    = SG_RETRACE | SG_IRQ_1 | SG_IRQ_2;
-    pub const S0_MASK: u32    = S0_RETRACE | S0_IRQ_1 | S0_IRQ_2;
-}
+/// IP22 fullhouse exposes the *same* INT3-shaped interrupt registers
+/// (`l0_stat`/`l0_mask`/`l1_stat`/`l1_mask`/`map_stat`/`map_mask0`/
+/// `map_mask1`, plus the embedded PIT) as Indy, just at a second, more
+/// compact address — HPC3 PBUS PIO channel 4 (`crate::hpc3::HPC3_INT2_BASE`)
+/// — instead of PIO channel 6 (`IOC_BASE`). Confirmed against MAME's
+/// `src/mame/sgi/ioc2.cpp`: `ioc2_guinness_device` and
+/// `ioc2_full_house_device` both derive from the same `ioc2_device` base
+/// and share identical `INT3_LOCAL0_*`/`INT3_LOCAL1_*` bit assignments and
+/// IRQ source wiring (gio_int0/1/2_w, scsi0/1_int_w, enet_int_w,
+/// mc_dma_done_w, hpc_dma_done_w, video_int_w — none of these differ by
+/// profile). `int2_map` (fullhouse's PIO4 layout) is
+/// `local_status/mask<0,1>`, `map_status`, `map_mask<0,1>`,
+/// `timer_int_clear`, and the PIT, omitting `map_pol`/`error_status`
+/// (fullhouse has no registers for those) that guinness exposes at PIO6.
+/// `Ioc::int2_read8`/`int2_write8` take a *register index* (0-based, one
+/// per dword-aligned PBUS PIO slot — matching the stride hpc3.rs already
+/// uses for every other PBUS PIO channel) so hpc3.rs doesn't need to
+/// replicate IOC_BASE's address math for a second base address.
+/// Register index = compact byte offset from MAME's `int2_map`, matching
+/// the dword-per-register packing hpc3.rs uses for every PBUS PIO channel
+/// (idx = byte_offset >> 2): 0=l0_stat 1=l0_mask 2=l1_stat 3=l1_mask
+/// 4=map_stat 5=map_mask0 6=map_mask1 (7 unused — int2_map has no register
+/// at compact offset 0x07) 8=tmr_clr (9-11 unused) 12-15=PIT channel
+/// 0/1/2/control (same `Pit8254` instance guinness's INT3 timers use at
+/// PIO6 — one chip, two address windows, per `ioc2_device`'s single
+/// `m_pit` in MAME).
+pub const INT2_REG_COUNT: u32 = 16;
+const INT2_TMR_CLR_IDX: u32 = 8;
+const INT2_PIT_BASE_IDX: u32 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IocInterrupt {
@@ -132,7 +148,8 @@ pub enum IocInterrupt {
     KbMouse,
     GioExp0,    // LIO_GIO_EXP0 = bit 6 — GIO expansion slot 0 (Indy IP24)
     GioExp1,    // LIO_GIO_EXP1 = bit 7 — GIO expansion slot 1
-    /// IP22 fullhouse: vertical retrace from expansion slot 0 (extio S0_RETRACE).
+    /// IP22 fullhouse second head (GIO slot 1) vertical retrace — shares the
+    /// same L1 VERTICAL_RETRACE bit as the primary head.
     GioExp0Retrace,
     GfxDrain0,  // LIO_DRAIN0 = bit 6 — GFX FIFO drain (Indigo2 fullhouse)
     GfxDrain1,  // LIO_DRAIN1 = bit 7 — second head drain (Indigo2 fullhouse)
@@ -158,10 +175,6 @@ struct IocState {
 
     // Misc Registers
     gc_select: u8,
-    /// Fullhouse EXTIO shadow — shared GIO IRQ latch before gc_select mux.
-    extio: u32,
-    /// IP22 fullhouse (Indigo2) — enables EXTIO/gc_select IRQ mux.
-    fullhouse: bool,
     gen_cntl: u8,
     panel: u8,
     read_reg: u8,
@@ -264,8 +277,6 @@ impl Ioc {
             map_pol: 0,
             err_stat: 0,
             gc_select: 0,
-            extio: 0,
-            fullhouse: !guinness,
             gen_cntl: 0,
             panel: 1, // Power State (Bit 0) = 1 (On)
             read_reg: 0x70, // Ethernet/SCSI Power Good (Bits 6,5,4 = 1)
@@ -333,6 +344,15 @@ impl Ioc {
         self.state.lock().interrupts = Some(interrupts);
     }
 
+    /// Bit assignments and IRQ source wiring are identical for guinness
+    /// (Indy) and fullhouse (Indigo2) — confirmed against MAME's
+    /// `ioc2_guinness_device`/`ioc2_full_house_device`, which both derive
+    /// from the same `ioc2_device` base with the same `INT3_LOCAL0_*`/
+    /// `INT3_LOCAL1_*` bits and the same `gio_int0/1/2_w`, `scsi0/1_int_w`,
+    /// `enet_int_w`, `mc_dma_done_w`, `hpc_dma_done_w`, `video_int_w`
+    /// handlers (see INT2_BASE's doc comment). Only the register
+    /// *addresses* differ by profile (PIO4 int2_map vs PIO6 base_map's
+    /// upper half), handled in hpc3.rs's PIO dispatch — not here.
     pub fn set_interrupt(&self, source: IocInterrupt, active: bool) {
         // Note: map_pol (polarity) register is currently ignored.
         // We assume active-high logic internally for now.
@@ -343,34 +363,16 @@ impl Ioc {
         let mut state = self.state.lock();
         match source {
             // Local 0
-            IocInterrupt::Graphics => {
-                if self.guinness {
-                    if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS }
-                } else {
-                    state.set_extio_sg(extio_regs::SG_IRQ_1, active);
-                }
-            }
+            IocInterrupt::Graphics => if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS },
             IocInterrupt::Parallel => if active { state.l0_stat |= l0_regs::PARALLEL } else { state.l0_stat &= !l0_regs::PARALLEL },
             IocInterrupt::McDma => if active { state.l0_stat |= l0_regs::MC_DMA } else { state.l0_stat &= !l0_regs::MC_DMA },
             IocInterrupt::Ethernet => if active { state.l0_stat |= l0_regs::ETHERNET } else { state.l0_stat &= !l0_regs::ETHERNET },
             IocInterrupt::Scsi1 => if active { state.l0_stat |= l0_regs::SCSI1 } else { state.l0_stat &= !l0_regs::SCSI1 },
             IocInterrupt::Scsi0 => if active { state.l0_stat |= l0_regs::SCSI0 } else { state.l0_stat &= !l0_regs::SCSI0 },
-            IocInterrupt::FifoFull => {
-                if self.guinness {
-                    if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL }
-                } else {
-                    state.set_extio_sg(extio_regs::SG_IRQ_2, active);
-                }
-            }
+            IocInterrupt::FifoFull => if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL },
 
             // Local 1
-            IocInterrupt::VerticalRetrace => {
-                if self.guinness {
-                    if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE }
-                } else {
-                    state.set_extio_sg(extio_regs::SG_RETRACE, active);
-                }
-            }
+            IocInterrupt::VerticalRetrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
             IocInterrupt::VideoVsync => if active { state.l1_stat |= l1_regs::VIDEO_VSYNC } else { state.l1_stat &= !l1_regs::VIDEO_VSYNC },
             IocInterrupt::AcFail => if active { state.l1_stat |= l1_regs::AC_FAIL } else { state.l1_stat &= !l1_regs::AC_FAIL },
             IocInterrupt::HpcDma => if active { state.l1_stat |= l1_regs::HPC_DMA } else { state.l1_stat &= !l1_regs::HPC_DMA },
@@ -381,33 +383,19 @@ impl Ioc {
             // Mappable (LIO_2 on IP24)
             IocInterrupt::Serial  => if active { state.map_stat |= map_regs::SERIAL    } else { state.map_stat &= !map_regs::SERIAL    },
             IocInterrupt::KbMouse => if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE },
-            IocInterrupt::GioExp0 => {
-                if self.guinness {
-                    if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 }
-                } else {
-                    state.set_extio_s0(extio_regs::S0_IRQ_1, active);
-                }
+            // GioExp0/GfxDrain0 and GioExp1/GfxDrain0Retrace share the same MAP bits 6/7 —
+            // callers (machine.rs) already pick the profile-appropriate variant for what's
+            // actually wired to that GIO slot; this just writes the shared bit either way.
+            IocInterrupt::GioExp0 | IocInterrupt::GfxDrain0 => {
+                if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 }
             }
-            IocInterrupt::GioExp0Retrace => {
-                if !self.guinness {
-                    state.set_extio_s0(extio_regs::S0_RETRACE, active);
-                }
+            IocInterrupt::GioExp1 | IocInterrupt::GfxDrain1 => {
+                if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 }
             }
-            IocInterrupt::GioExp1 => {
-                if self.guinness {
-                    if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 }
-                }
-            }
-            IocInterrupt::GfxDrain0 => {
-                if !self.guinness {
-                    if active { state.map_stat |= map_regs::GFX_DRAIN0 } else { state.map_stat &= !map_regs::GFX_DRAIN0 }
-                }
-            }
-            IocInterrupt::GfxDrain1 => {
-                if !self.guinness {
-                    if active { state.map_stat |= map_regs::GFX_DRAIN1 } else { state.map_stat &= !map_regs::GFX_DRAIN1 }
-                }
-            }
+            // Second-head retrace on fullhouse's GIO slot 1 — same L1 VERTICAL_RETRACE bit
+            // guinness's primary head uses (INT3_LOCAL1_RETRACE is not per-head on real
+            // hardware either; a second Newport head shares the one retrace line).
+            IocInterrupt::GioExp0Retrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
             IocInterrupt::Mappable0 => if active { state.map_stat |= 1 << 0 } else { state.map_stat &= !(1 << 0) },
             IocInterrupt::Mappable1 => if active { state.map_stat |= 1 << 1 } else { state.map_stat &= !(1 << 1) },
             IocInterrupt::Mappable2 => if active { state.map_stat |= 1 << 2 } else { state.map_stat &= !(1 << 2) },
@@ -514,8 +502,8 @@ impl Device for Ioc {
             let _ = writeln!(writer, "  MAP_POL={:02x}  ERR_STAT={:02x}", s.map_pol, s.err_stat);
             let _ = writeln!(writer, "  CPU IP lines: IP2={} IP3={} IP4=TMR0:{} IP5=TMR1:{} IP6=ERR:{}",
                 ip2, ip3, ip4, ip5, ip6);
-            let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} extio={:08x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
-                s.sys_id, s.gc_select, s.extio, s.gen_cntl, s.panel, s.read_reg, s.dma_sel, s.reset_reg, s.write_reg);
+            let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
+                s.sys_id, s.gc_select, s.gen_cntl, s.panel, s.read_reg, s.dma_sel, s.reset_reg, s.write_reg);
             // Safety: see IocState.interrupts's doc comment.
             if let Some(ints) = s.interrupts.map(|p| unsafe { &*p }) {
                 let raw = ints.load(Ordering::SeqCst);
@@ -651,10 +639,7 @@ impl BusDevice for Ioc {
                 state.map_stat &= !(val & 0x3);
             }
 
-            IOC_GC_SELECT => {
-                state.gc_select = val;
-                state.apply_extio_fanout();
-            }
+            IOC_GC_SELECT => state.gc_select = val,
             IOC_GEN_CNTL => state.gen_cntl = val,
             IOC_PANEL => {
                 // Bits 6, 4, 1 are W1C (Write 1 to Clear)
@@ -725,42 +710,51 @@ impl BusDevice for Ioc {
     }
 }
 
+impl Ioc {
+    /// Fullhouse-only: read one of the compact INT2 registers at HPC3 PBUS
+    /// PIO channel 4 by dword-aligned register index (see `INT2_REG_COUNT`'s
+    /// doc comment). Callers (hpc3.rs) only reach this when `!guinness`.
+    pub fn int2_read8(&self, idx: u32) -> BusRead8 {
+        if idx >= INT2_PIT_BASE_IDX {
+            return self.pit.read(idx - INT2_PIT_BASE_IDX);
+        }
+        let state = self.state.lock();
+        let val = match idx {
+            0 => { dlog_dev!(LogModule::Ioc, "INT2: rd L0_STAT  → {:#04x}", state.l0_stat);  state.l0_stat }
+            1 => { dlog_dev!(LogModule::Ioc, "INT2: rd L0_MASK  → {:#04x}", state.l0_mask);  state.l0_mask }
+            2 => { dlog_dev!(LogModule::Ioc, "INT2: rd L1_STAT  → {:#04x}", state.l1_stat);  state.l1_stat }
+            3 => { dlog_dev!(LogModule::Ioc, "INT2: rd L1_MASK  → {:#04x}", state.l1_mask);  state.l1_mask }
+            4 => { dlog_dev!(LogModule::Ioc, "INT2: rd MAP_STAT → {:#04x}", state.map_stat); state.map_stat }
+            5 => { dlog_dev!(LogModule::Ioc, "INT2: rd MAP_MASK0 → {:#04x}", state.map_mask0); state.map_mask0 }
+            6 => { dlog_dev!(LogModule::Ioc, "INT2: rd MAP_MASK1 → {:#04x}", state.map_mask1); state.map_mask1 }
+            _ => 0, // 7, 9-11: unused (int2_map has no register there); 8 (tmr_clr) is write-only
+        };
+        BusRead8::ok(val)
+    }
+
+    /// Fullhouse-only: write one of the compact INT2 registers. See `int2_read8`.
+    pub fn int2_write8(&self, idx: u32, val: u8) -> u32 {
+        if idx >= INT2_PIT_BASE_IDX {
+            return self.pit.write(idx - INT2_PIT_BASE_IDX, val);
+        }
+        let mut state = self.state.lock();
+        match idx {
+            1 => { dlog_dev!(LogModule::Ioc, "INT2: L0_MASK  = {:#04x}", val); state.l0_mask = val; }
+            3 => { dlog_dev!(LogModule::Ioc, "INT2: L1_MASK  = {:#04x}", val); state.l1_mask = val; }
+            5 => { dlog_dev!(LogModule::Ioc, "INT2: MAP_MASK0 = {:#04x}", val); state.map_mask0 = val; }
+            6 => { dlog_dev!(LogModule::Ioc, "INT2: MAP_MASK1 = {:#04x}", val); state.map_mask1 = val; }
+            idx if idx == INT2_TMR_CLR_IDX => {
+                dlog_dev!(LogModule::Ioc, "INT2: Timer Clear val {:02x}", val);
+                state.map_stat &= !(val & 0x3);
+            }
+            _ => dlog_dev!(LogModule::Ioc, "INT2: Write8 idx {} val {:02x} (RO or unmapped)", idx, val),
+        }
+        state.update_interrupts();
+        BUS_OK
+    }
+}
+
 impl IocState {
-    fn set_extio_sg(&mut self, mask: u32, active: bool) {
-        if active { self.extio |= mask; } else { self.extio &= !mask; }
-        self.apply_extio_fanout();
-    }
-
-    fn set_extio_s0(&mut self, mask: u32, active: bool) {
-        if active { self.extio |= mask; } else { self.extio &= !mask; }
-        self.apply_extio_fanout();
-    }
-
-    /// Route shared GIO IRQ lines through gc_select (bit 0: 0 = SG/gfx slot, 1 = S0).
-    fn apply_extio_fanout(&mut self) {
-        if !self.fullhouse {
-            return;
-        }
-        let sel = self.extio
-            & if self.gc_select & 1 == 0 { extio_regs::SG_MASK } else { extio_regs::S0_MASK };
-
-        if sel & (extio_regs::SG_IRQ_2 | extio_regs::S0_IRQ_2) != 0 {
-            self.l0_stat |= l0_regs::FIFO_FULL;
-        } else {
-            self.l0_stat &= !l0_regs::FIFO_FULL;
-        }
-        if sel & (extio_regs::SG_IRQ_1 | extio_regs::S0_IRQ_1) != 0 {
-            self.l0_stat |= l0_regs::GRAPHICS;
-        } else {
-            self.l0_stat &= !l0_regs::GRAPHICS;
-        }
-        if sel & (extio_regs::SG_RETRACE | extio_regs::S0_RETRACE) != 0 {
-            self.l1_stat |= l1_regs::VERTICAL_RETRACE;
-        } else {
-            self.l1_stat &= !l1_regs::VERTICAL_RETRACE;
-        }
-    }
-
     fn update_interrupts(&mut self) {
         // 1. Update Mappable Interrupts (MAP_INT0, MAP_INT1)
         let map_int0 = (self.map_stat & self.map_mask0) != 0;
@@ -844,7 +838,6 @@ impl Resettable for Ioc {
         state.map_pol = 0;
         state.err_stat = 0;
         state.gc_select = 0;
-        state.extio = 0;
         state.gen_cntl = 0;
         state.panel = 1;        // power-on: power state bit = 1
         state.read_reg = 0x70;  // ethernet/SCSI power good
@@ -867,7 +860,7 @@ impl Saveable for Ioc {
         macro_rules! u8f { ($f:ident) => { tbl.insert(stringify!($f).into(), hex_u8(state.$f)); } }
         u8f!(l0_stat); u8f!(l0_mask); u8f!(l1_stat); u8f!(l1_mask);
         u8f!(map_stat); u8f!(map_mask0); u8f!(map_mask1); u8f!(map_pol); u8f!(err_stat);
-        u8f!(gc_select); tbl.insert("extio".into(), toml::Value::String(format!("0x{:08x}", state.extio)));
+        u8f!(gc_select);
         u8f!(gen_cntl); u8f!(panel); u8f!(read_reg);
         u8f!(dma_sel); u8f!(reset_reg); u8f!(write_reg);
         toml::Value::Table(tbl)
@@ -881,16 +874,8 @@ impl Saveable for Ioc {
         ldu8!(l0_stat); ldu8!(l0_mask); ldu8!(l1_stat); ldu8!(l1_mask);
         ldu8!(map_stat); ldu8!(map_mask0); ldu8!(map_mask1); ldu8!(map_pol); ldu8!(err_stat);
         ldu8!(gc_select);
-        if let Some(x) = get_field(v, "extio") {
-            if let Some(s) = x.as_str() {
-                state.extio = u32::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(state.extio);
-            } else if let Some(n) = x.as_integer() {
-                state.extio = n as u32;
-            }
-        }
         ldu8!(gen_cntl); ldu8!(panel); ldu8!(read_reg);
         ldu8!(dma_sel); ldu8!(reset_reg); ldu8!(write_reg);
-        state.apply_extio_fanout();
         state.update_interrupts();
         Ok(())
     }
