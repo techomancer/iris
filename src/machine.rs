@@ -184,6 +184,7 @@ impl Machine {
         let jitv2_threads = cfg.jitv2.threads;
         let display_resolution = cfg.graphics.resolution;
         let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
+        let clock_fixed_mhz = cfg.clock.fixed_mhz;
 
         if !cfg.machine.profile.supported() {
             eprintln!(
@@ -618,6 +619,14 @@ impl Machine {
             if let Ok(count) = symbols.load("unix.map") {
                 println!("Loaded {} symbols from unix.map", count);
             }
+        }
+
+        // Pin the CP0 Count frequency if the user asked for a fixed clock
+        // (guests like Linux/MIPS whose periodic tick doesn't fit IRIX's
+        // slow/fast two-bucket auto-inference model). Must happen before the
+        // core starts executing.
+        if let Some(mhz) = clock_fixed_mhz {
+            executor.core.set_fixed_clock_hz((mhz * 1_000_000.0) as u64);
         }
 
         // Inject the shared fasttick_count Arc into the executor core before wrapping in MipsCpu.

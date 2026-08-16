@@ -596,6 +596,27 @@ impl Default for Jitv2Config {
     }
 }
 
+/// `[clock]` section — CP0 Count/Compare timer frequency.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClockConfig {
+    /// Pin the virtual CP0 Count frequency at this fixed value (MHz) instead
+    /// of auto-inferring it from the guest's Compare-write cadence. The
+    /// auto-inference assumes an IRIX-shaped two-bucket periodic tick (100 Hz
+    /// "slow" / 1 kHz "fast", both at a guessed real MIPS clock); guests that
+    /// don't fit that model (e.g. Linux/MIPS) can otherwise get misclassified
+    /// or chased as a moving target. None = auto-infer (default, matches
+    /// real hardware detection behavior IRIX expects).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_mhz: Option<f64>,
+}
+
+impl Default for ClockConfig {
+    fn default() -> Self {
+        Self { fixed_mhz: None }
+    }
+}
+
 /// Host-side performance tuning (`[perf]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -829,6 +850,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub perf: PerfConfig,
 
+    /// CP0 Count/Compare clock tuning (`[clock]` section).
+    #[serde(default)]
+    pub clock: ClockConfig,
+
     /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
     #[cfg(feature = "ultra64")]
     #[serde(default)]
@@ -930,6 +955,7 @@ impl Default for MachineConfig {
             jit: JitConfig::default(),
             jitv2: Jitv2Config::default(),
             perf: PerfConfig::default(),
+            clock: ClockConfig::default(),
             #[cfg(feature = "ultra64")]
             ultra64: Ultra64Config::default(),
         }
@@ -1056,6 +1082,11 @@ impl MachineConfig {
                          (ec0). Give the DaynaPort its own, e.g. subnet = \"192.168.10.0/24\".",
                         id, dp.subnet.gateway_ip));
                 }
+            }
+        }
+        if let Some(mhz) = self.clock.fixed_mhz {
+            if !(mhz > 0.0) || !mhz.is_finite() {
+                return Err(format!("clock.fixed_mhz {} is invalid (must be a positive number)", mhz));
             }
         }
         if self.jitv2.threads == 0 {
@@ -1237,6 +1268,13 @@ pub struct Cli {
     /// console) to this file. Useful for live tailing during an install.
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
+
+    /// Pin the virtual CP0 Count frequency at this fixed value (MHz) instead
+    /// of auto-inferring it from the guest's periodic timer tick. Use for
+    /// guests (e.g. Linux/MIPS) whose tick doesn't fit IRIX's slow/fast
+    /// two-bucket model, e.g. --clock-fixed-mhz 33.
+    #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
+    pub clock_fixed_mhz: Option<f64>,
 }
 
 impl Cli {
@@ -1281,6 +1319,7 @@ impl Cli {
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
+        if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
 

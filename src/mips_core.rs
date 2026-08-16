@@ -577,7 +577,16 @@ pub struct MipsCore {
     /// Inferred CP0 Count frequency in Hz. Default 33 MHz (user-facing
     /// assumption for an uncalibrated core); replaced as soon as a Compare
     /// delta matches a recognized slow (100 Hz) or fast (1 kHz) tick.
+    /// Left alone (never overwritten) once `count_hz_fixed` is set.
     pub count_hz: u64,
+    /// When set, `count_hz` stays pinned at this value forever and
+    /// `infer_count_hz`'s slow/fast tick pattern-matching is skipped
+    /// entirely. Set from `[clock] fixed_mhz` (`iris.toml`) / `--clock-fixed-mhz`
+    /// for guests (e.g. Linux) whose periodic tick doesn't fit IRIX's
+    /// two-bucket (100 Hz slow / 1 kHz fast) model — the inference would
+    /// either misclassify their tick or chase a moving target. None = the
+    /// default IRIX-oriented auto-inference behavior.
+    pub count_hz_fixed: Option<u64>,
     /// True while the CPU thread is stopped (`on_cpu_stop`): the virtual
     /// count is latched at `cp0_count` (reads don't advance it) and the
     /// compare timer is silenced, so monitor `cpu stop` / debugger stepping
@@ -892,6 +901,7 @@ impl MipsCore {
             count_anchor_instant: std::time::Instant::now(),
             count_read_cycle: 0,
             count_hz: DEFAULT_COUNT_HZ,
+            count_hz_fixed: None,
             count_paused: false,
             compare_delta_slow: 0,
             compare_delta_fast: 0,
@@ -1176,6 +1186,12 @@ impl MipsCore {
     /// row), which means the guest genuinely retuned its periodic tick, so
     /// the slow bucket is re-seeded from it.
     fn infer_count_hz(&mut self, d: u64) {
+        // A fixed clock (`[clock] fixed_mhz`) opts out of this entirely:
+        // count_hz was pinned at construction and must never move, so skip
+        // the pattern-matching (and its `compare_delta_*` bookkeeping) below.
+        if self.count_hz_fixed.is_some() {
+            return;
+        }
         // Bound `d` against the full plausible range of real MIPS Count
         // clocks (Count = CPU_clock/2), roughly 10 MHz to 300 MHz for any
         // guest this emulator targets: a 1 kHz tick spans at least
@@ -1357,6 +1373,17 @@ impl MipsCore {
                 },
             ));
         }
+    }
+
+    /// Pin `count_hz` at `hz` forever: `infer_count_hz` becomes a no-op (see
+    /// its own doc comment) and this value is used as-is for both
+    /// `count_now`/`count_peek` materialization and compare-timer scheduling.
+    /// Must be called before the core starts executing (construction time) —
+    /// it does not re-anchor or re-arm an already-running timer.
+    pub fn set_fixed_clock_hz(&mut self, hz: u64) {
+        self.count_hz_fixed = Some(hz);
+        self.count_hz = hz;
+        self.count_hz_atomic.store(hz, Ordering::Relaxed);
     }
 
     /// Cancel any armed Count==Compare interrupt source.
