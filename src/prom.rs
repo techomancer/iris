@@ -56,6 +56,30 @@ impl Prom {
         }
     }
 
+    /// IP22 (Indigo2) variant: try `cfg_path` (as configured via `[machine].prom`
+    /// / `--prom`), then the default `070-1367-012.bin` in the current directory,
+    /// then fall back to the embedded PROM0701367012 image.
+    pub fn from_file_or_embedded_ip22(cfg_path: &str) -> Self {
+        const IP22_DEFAULT: &str = "070-1367-012.bin";
+        let mut paths = vec![cfg_path];
+        if cfg_path != IP22_DEFAULT {
+            paths.push(IP22_DEFAULT);
+        }
+        for path in paths {
+            match fs::read(path) {
+                Ok(bytes) => {
+                    println!("Loaded PROM from {}", path);
+                    return Self::from_bytes(&bytes);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Could not read PROM file '{}': {}", path, e);
+                }
+            }
+        }
+        eprintln!("Warning: falling back to embedded IP22 PROM");
+        Self::from_bytes(&crate::prombini2::PROM0701367012)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Self {
         // Pack bytes into u32 (Big Endian)
         let mut data = Vec::with_capacity((bytes.len() + 3) / 4);

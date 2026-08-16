@@ -1141,6 +1141,11 @@ pub struct Cli {
     #[arg(long)]
     pub prom: Option<String>,
 
+    /// Emulate an SGI Indigo2 (IP22) instead of the default Indy (IP24).
+    /// Overrides `[machine].profile` in the config file.
+    #[arg(long, default_value_t = false)]
+    pub ip22: bool,
+
     /// Path to NVRAM file (default: nvram.bin in cwd)
     #[arg(long)]
     pub nvram: Option<String>,
@@ -1281,6 +1286,7 @@ impl Cli {
     /// Merge CLI overrides into a base `MachineConfig`.
     pub fn apply(&self, mut cfg: MachineConfig) -> MachineConfig {
         if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
+        if self.ip22 { cfg.machine.profile = MachineProfile::Indigo2Ip22; }
         if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }
         if let Some(v) = self.bank1    { cfg.banks[1] = v; }

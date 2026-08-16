@@ -221,8 +221,14 @@ impl Machine {
             Memory::new(cfg.banks[3].max(1) as usize),
         ];
 
-        // PROM (1MB at 0x1FC00000)
-        let prom = Prom::from_file_or_embedded(&cfg.prom);
+        // PROM (1MB at 0x1FC00000). IP22 (Indigo2) uses a different PROM image
+        // than Indy: try cfg.prom, then 070-1367-012.bin in cwd, then fall back
+        // to the embedded PROM0701367012 (see prombini2.rs) rather than Indy's PROM.
+        let prom = if guinness {
+            Prom::from_file_or_embedded(&cfg.prom)
+        } else {
+            Prom::from_file_or_embedded_ip22(&cfg.prom)
+        };
         let prom_port = prom.get_port();
 
         // Shared atomics — created first so all devices and the display thread use the same Arc.

@@ -52,6 +52,7 @@ pub mod devlog;
 pub mod timer;
 pub mod prom;
 pub mod prombin;
+pub mod prombini2;
 pub mod mips_isa;
 pub mod mips_dis;
 pub mod mips_core;

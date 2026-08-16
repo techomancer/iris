@@ -127,6 +127,12 @@ fn build_mode_ram(width: u16, height: u16, h_blank_lead: u16) -> ([u16; 32], Vec
         ram[seq + 1] = words[1];
         seq += 2;
     }
+    // Gap between the HPOS leading edge and the start of active video. decode_vc2_timings
+    // computes cursor_x_adjust = (visible_pixel - hpos_pixel) - 31, valid over [0, 64];
+    // without this gap the two land right next to each other and the result is negative
+    // (out of range), so the decoder falls back to a hardcoded default. 36 pixels here
+    // yields hpos_to_visible=40 -> cursor_x_adjust=9, comfortably in range.
+    push_pixels(&mut ram, &mut seq, 36, 0, 0, false);
     // Active video: composite blank deasserted to XMAP.
     push_pixels(&mut ram, &mut seq, width, 0, VT_CBLANK_XMAP_N, true);
 
@@ -187,6 +193,45 @@ mod tests {
                 mode,
                 w,
                 ew
+            );
+        }
+    }
+
+    #[test]
+    fn presets_hpos_to_visible_gap_stays_in_range() {
+        // build_mode_ram lays out: [h_blank_lead][HPOS pulse: 4px][gap][active video].
+        // decode_vc2_timings computes hpos_to_visible as the pixel distance from the
+        // HPOS falling edge to the first active-video pixel, then cursor_x_adjust =
+        // hpos_to_visible - 31, which must land in [0, 64] or the decoder falls back
+        // to a hardcoded default (see disp.rs). That distance is fixed by the HPOS
+        // pulse width (4px) plus the gap below, independent of h_blank_lead/mode.
+        const HPOS_PULSE_PIXELS: i32 = 4;
+        const GAP_PIXELS: i32 = 36;
+        let hpos_to_visible = HPOS_PULSE_PIXELS + GAP_PIXELS;
+        let cursor_x_adjust = hpos_to_visible - 31;
+        assert!(
+            (0..=64).contains(&cursor_x_adjust),
+            "hpos_to_visible={} gives out-of-range cursor_x_adjust={}",
+            hpos_to_visible,
+            cursor_x_adjust
+        );
+
+        // Cross-check against the real decoder for every preset mode.
+        use crate::disp::decode_vc2_timings;
+        for mode in [
+            NewportResolution::Res1024x768,
+            NewportResolution::Res1280x960,
+            NewportResolution::Res1280x1024,
+        ] {
+            let (width, height, h_blank) = mode.geometry().unwrap();
+            let (regs, ram) = build_mode_ram(width, height, h_blank);
+            let (_, _, decoded_adjust) = decode_vc2_timings(&regs, &ram);
+            assert_eq!(
+                decoded_adjust,
+                cursor_x_adjust - 2, // decode_vc2_timings applies a further -2 bias
+                "mode {:?}: cursor_x_adjust {} did not match expected in-range value",
+                mode,
+                decoded_adjust
             );
         }
     }
