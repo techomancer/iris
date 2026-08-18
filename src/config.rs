@@ -147,6 +147,11 @@ pub struct DaynaportParams {
     pub subnet: NatSubnet,
 }
 
+/// Default Ethernet station address for `ec0` when `[network] mac` is unset.
+/// SGI's registered OUI (08:00:69) plus an arbitrary host part; matches the
+/// address used throughout `rules/irix/networking.md` and CI test fixtures.
+pub const DEFAULT_MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
+
 /// Parse `"00:80:19:12:34:56"` (or `-` separated) into six octets.
 pub fn parse_mac(s: &str) -> Result<[u8; 6], String> {
     let parts: Vec<&str> = s.split(|c| c == ':' || c == '-').collect();
@@ -251,7 +256,7 @@ impl Default for NetMode {
 }
 
 /// Networking parameters extracted from `MachineConfig` for the NAT engine and HPC3.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct NetworkConfig {
     pub nfs:          Option<NfsConfig>,
     pub port_forward: Vec<PortForwardConfig>,
@@ -265,6 +270,24 @@ pub struct NetworkConfig {
     /// PCAP-only virtual IP for the in-process NFS server (so a bridged guest can
     /// mount it). None = NFS-in-PCAP not configured.
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
+    /// Ethernet station address for `ec0`, backdoor-injected into NVRAM
+    /// (Indy) / serial EEPROM (Indigo2) before boot. Defaults to
+    /// [`DEFAULT_MAC`] when `[network] mac` is unset.
+    pub mac: [u8; 6],
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            nfs: None,
+            port_forward: Vec::new(),
+            nat_subnet: None,
+            mode: NetMode::default(),
+            pcap_interface: None,
+            nfs_pcap_ip: None,
+            mac: DEFAULT_MAC,
+        }
+    }
 }
 
 /// `[network]` section: backend selection and PCAP options.
@@ -284,6 +307,17 @@ pub struct NetworkSection {
     /// this and serves NFS at the gateway IP instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs_pcap_ip: Option<std::net::Ipv4Addr>,
+    /// Ethernet station address for the built-in SEEQ controller (`ec0`), e.g.
+    /// "08:00:69:12:34:56" (SGI's registered OUI). Defaults to
+    /// `08:00:69:12:34:56` when unset. Real hardware has no way to leave this
+    /// unset — every SGI ships with a MAC burned into NVRAM (Indy) or a serial
+    /// EEPROM (Indigo2) — so iris backdoor-injects it into the emulated
+    /// NVRAM/EEPROM before boot rather than requiring a guest-side `setenv`.
+    /// On Indy this only patches NVRAM if the `eaddr` slot is still blank
+    /// (00:00:00:00:00:00), so it never clobbers a value you've already set
+    /// from the PROM monitor and saved with `rtc save`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -741,6 +775,14 @@ pub struct MachineConfig {
     #[serde(default = "default_nvram")]
     pub nvram: String,
 
+    /// Path to the Indigo2 (IP22) motherboard EEPROM file (93CS56 — NVRAM
+    /// env vars + MAC, see `nveeprom` monitor command). Loaded at startup
+    /// if the file exists; `nveeprom save` writes back to it by default.
+    /// Ignored on Indy (no such chip). Per-config files avoid the same
+    /// cross-install footgun as `nvram`.
+    #[serde(default = "default_nveeprom")]
+    pub nveeprom: String,
+
     /// RAM bank sizes in MB. Valid values: 0 (absent), 8, 16, 32, 64, 128.
     #[serde(default = "default_banks")]
     pub banks: [u32; 4],
@@ -912,6 +954,10 @@ fn default_nvram() -> String {
     "nvram.bin".to_string()
 }
 
+fn default_nveeprom() -> String {
+    "nveeprom.bin".to_string()
+}
+
 fn default_banks() -> [u32; 4] {
     [128, 128, 0, 0]
 }
@@ -937,6 +983,7 @@ impl Default for MachineConfig {
         Self {
             prom: default_prom(),
             nvram: default_nvram(),
+            nveeprom: default_nveeprom(),
             banks: default_banks(),
             scsi: default_scsi(),
             scale: default_scale(),
@@ -1064,6 +1111,9 @@ impl MachineConfig {
                 return Err(format!("nat_subnet \"{}\": {}", s, e));
             }
         }
+        if let Some(ref mac) = self.network.mac {
+            parse_mac(mac).map_err(|e| format!("network.mac: {}", e))?;
+        }
         for (id, dev) in &self.scsi {
             if *id == 0 || *id > 7 {
                 return Err(format!("SCSI ID {} is out of range (1–7)", id));
@@ -1123,6 +1173,9 @@ impl MachineConfig {
                 .expect("nat_subnet: validate() should have caught this");
             NatSubnet { gateway_ip, client_ip, netmask }
         });
+        let mac = self.network.mac.as_deref()
+            .map(|s| parse_mac(s).expect("network.mac: validate() should have caught this"))
+            .unwrap_or(DEFAULT_MAC);
         NetworkConfig {
             nfs:          self.nfs.clone(),
             port_forward: self.port_forward.clone(),
@@ -1130,6 +1183,7 @@ impl MachineConfig {
             mode:         self.network.mode,
             pcap_interface: self.network.pcap_interface.clone(),
             nfs_pcap_ip:  self.network.nfs_pcap_ip,
+            mac,
         }
     }
 
@@ -1167,6 +1221,10 @@ pub struct Cli {
     /// Path to NVRAM file (default: nvram.bin in cwd)
     #[arg(long)]
     pub nvram: Option<String>,
+
+    /// Path to Indigo2 motherboard EEPROM file (default: nveeprom.bin in cwd)
+    #[arg(long)]
+    pub nveeprom: Option<String>,
 
     /// RAM bank 0 size in MB (0/8/16/32/64/128)
     #[arg(long)]
@@ -1306,6 +1364,7 @@ impl Cli {
         if let Some(p) = &self.prom    { cfg.prom = p.clone(); }
         if self.ip22 { cfg.machine.profile = MachineProfile::Indigo2Ip22; }
         if let Some(p) = &self.nvram   { cfg.nvram = p.clone(); }
+        if let Some(p) = &self.nveeprom { cfg.nveeprom = p.clone(); }
         if let Some(v) = self.bank0    { cfg.banks[0] = v; }
         if let Some(v) = self.bank1    { cfg.banks[1] = v; }
         if let Some(v) = self.bank2    { cfg.banks[2] = v; }

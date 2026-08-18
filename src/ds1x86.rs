@@ -12,6 +12,15 @@ use std::path::Path;
 const CMD_REG_OFFSET: usize = 0xB;
 const TE_BIT: u8 = 0x80; // Transfer Enable bit (when 0, time updates disabled)
 
+// PROM's `eaddr`/MAC recovery region. On real IP22 hardware, SGI's documented
+// "RTC forgot its ethernet address" recovery procedure pokes 6 bytes with
+// `fill -w -v` at virtual (kseg1) addresses 0xbfbe04e8..0xbfbe04fc, spaced 4
+// bytes apart (physical 0x1fbe04e8..0x1fbe04fc). HPC3's PBUS_BBRAM window
+// sparse-packs one live NVRAM byte per 32-bit-aligned word
+// (byte_index = (addr - 0x1fbe0000) >> 2; see hpc3.rs's PBUS_BBRAM decode),
+// so those 6 physical addresses land on regs[314..=319].
+const MAC_REGS_OFFSET: usize = 314;
+
 struct RtcData {
     regs: Vec<u8>,
     // Base time in centiseconds since epoch
@@ -210,6 +219,24 @@ impl Ds1x86 {
         Ok(())
     }
 
+    /// Backdoor-inject an Ethernet station address into the PROM's `eaddr`
+    /// NVRAM slot (see `MAC_REGS_OFFSET`), mimicking SGI's `fill -w -v`
+    /// RTC-recovery procedure. Only patches when the slot is still blank
+    /// (00:00:00:00:00:00 — the zeroed power-on/erased state), so it never
+    /// overwrites a MAC the guest already `setenv`'d and `rtc save`d.
+    /// Returns true if the slot was patched.
+    pub fn backdoor_set_mac_if_blank(&self, mac: [u8; 6]) -> bool {
+        let mut data = self.data.lock();
+        let slot = &data.regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6];
+        if slot != [0u8; 6] {
+            return false;
+        }
+        data.regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6].copy_from_slice(&mac);
+        dlog!(LogModule::Rtc, "RTC: backdoor-injected eaddr {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        true
+    }
+
     fn read(&self, addr: u32) -> BusRead8 {
         let offset = addr as usize;
         if offset >= self.size {
@@ -286,13 +313,13 @@ impl Device for Ds1x86 {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("rtc".to_string(), "RTC commands: rtc status | rtc save [file] | rtc debug <on|off> [DEV]".to_string())]
+        vec![("rtc".to_string(), "RTC commands: rtc status | rtc save [file] | rtc debug <on|off> | rtc dump | rtc r <offset> | rtc w <offset> <val> [DEV]".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn IoWrite + Send>) -> Result<(), String> {
         if cmd == "rtc" {
             if args.is_empty() {
-                return Err("Usage: rtc <debug|status> ...".to_string());
+                return Err("Usage: rtc <debug|status|save|dump|r|w> ...".to_string());
             }
             match args[0] {
                 "debug" => {
@@ -326,7 +353,45 @@ impl Device for Ds1x86 {
                         Err(e) => return Err(format!("Failed to save NVRAM: {}", e)),
                     }
                 }
-                _ => return Err("Usage: rtc <debug|status> ...".to_string()),
+                "dump" => {
+                    let data = self.data.lock();
+                    for (i, chunk) in data.regs.chunks(16).enumerate() {
+                        let mut line = format!("  {:04X}:", i * 16);
+                        for byte in chunk { line.push_str(&format!(" {:02X}", byte)); }
+                        writeln!(writer, "{}", line).unwrap();
+                    }
+                    return Ok(());
+                }
+                "r" => {
+                    let off_str = args.get(1).ok_or_else(|| format!("Usage: rtc r <offset 0-{:#x}>", self.size - 1))?;
+                    let offset: usize = usize::from_str_radix(off_str.trim_start_matches("0x"), 16)
+                        .or_else(|_| off_str.parse())
+                        .map_err(|_| format!("rtc r: \"{}\" is not a number", off_str))?;
+                    let data = self.data.lock();
+                    if offset >= data.regs.len() {
+                        return Err(format!("rtc r: offset {:#x} out of range (0-{:#x})", offset, data.regs.len() - 1));
+                    }
+                    writeln!(writer, "{:04X}: {:02X}", offset, data.regs[offset]).unwrap();
+                    return Ok(());
+                }
+                "w" => {
+                    let off_str = args.get(1).ok_or_else(|| format!("Usage: rtc w <offset 0-{:#x}> <val>", self.size - 1))?;
+                    let val_str = args.get(2).ok_or_else(|| "Usage: rtc w <offset> <val>".to_string())?;
+                    let offset: usize = usize::from_str_radix(off_str.trim_start_matches("0x"), 16)
+                        .or_else(|_| off_str.parse())
+                        .map_err(|_| format!("rtc w: \"{}\" is not a number", off_str))?;
+                    let val: u8 = u8::from_str_radix(val_str.trim_start_matches("0x"), 16)
+                        .or_else(|_| val_str.parse())
+                        .map_err(|_| format!("rtc w: \"{}\" is not a number", val_str))?;
+                    let mut data = self.data.lock();
+                    if offset >= data.regs.len() {
+                        return Err(format!("rtc w: offset {:#x} out of range (0-{:#x})", offset, data.regs.len() - 1));
+                    }
+                    data.regs[offset] = val;
+                    writeln!(writer, "{:04X}: {:02X}", offset, val).unwrap();
+                    return Ok(());
+                }
+                _ => return Err("Usage: rtc <debug|status|save|dump|r|w> ...".to_string()),
             }
         }
         Err("Command not found".to_string())
@@ -439,5 +504,29 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Ds1x86 save_state mismatch after load_state round-trip");
+    }
+
+    /// The MAC backdoor must land on the exact bytes SGI's documented
+    /// `fill -w -v 0xbfbe04e8 ...` RTC-recovery procedure pokes: physical
+    /// 0x1fbe04e8..0x1fbe04fc, i.e. HPC3 PBUS_BBRAM offset 0x4e8, byte_index
+    /// 0x4e8>>2 = 0x13a = 314 (see hpc3.rs's PBUS_BBRAM sparse-packing decode).
+    #[test]
+    fn backdoor_mac_offset_matches_prom_fill_addresses() {
+        let rtc = Ds1x86::new(8192, "test_backdoor_mac_offset.bin".to_string());
+        let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        assert!(rtc.backdoor_set_mac_if_blank(mac));
+        let regs = &rtc.data.lock().regs;
+        assert_eq!(&regs[314..320], &mac, "MAC bytes must land at regs[314..320] (0x13a), matching physical 0x1fbe04e8..0x1fbe04fc");
+    }
+
+    #[test]
+    fn backdoor_mac_does_not_clobber_existing_eaddr() {
+        let rtc = Ds1x86::new(8192, "test_backdoor_mac_no_clobber.bin".to_string());
+        let guest_mac = [0x08, 0x00, 0x69, 0xde, 0xad, 0x01];
+        rtc.data.lock().regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6].copy_from_slice(&guest_mac);
+
+        let patched = rtc.backdoor_set_mac_if_blank([0x08, 0x00, 0x69, 0x12, 0x34, 0x56]);
+        assert!(!patched, "backdoor must not overwrite a non-blank eaddr slot");
+        assert_eq!(&rtc.data.lock().regs[MAC_REGS_OFFSET..MAC_REGS_OFFSET + 6], &guest_mac);
     }
 }

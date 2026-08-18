@@ -232,21 +232,26 @@ impl Machine {
         }
         let guinness = cfg.machine.profile.guinness();
 
-        // 0. Shared EEPROM
-        let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
+        // 0. EEPROMs. Real IP22 hardware has two distinct 93-series serial
+        // EEPROM chips, not one shared part: a CPU-daughtercard chip wired to
+        // the MC (REG_EEROM @ 0x1fa00030 — CPU boot config, incl. CACHSZ_REG),
+        // and a motherboard chip wired to HPC3 (MISC_EEPROM_DATA @
+        // 0x1fbb0008 — NVRAM/env vars/MAC, see Eeprom93c56::backdoor_set_mac).
+        let eeprom_mc = Arc::new(Mutex::new(Eeprom93c56::new()));
+        let eeprom_hpc3 = Arc::new(Mutex::new(Eeprom93c56::with_path(crate::devlog::LogModule::Nveeprom, cfg.nveeprom.clone())));
         // CACHSZ_REG (word 0x11): secondary cache size in 4KB pages.
         // PROM reads this when SC=1 (size_2nd_cache probe returns 0) to determine L2 size.
         // r5ksc without r5ksc_triton: external SC sized via EEPROM. 256 = 1MB (256 × 4KB).
         // r5ksc_triton: Triton reports L2 size via CONFIG_TR_SS — EEPROM word left 0.
         // r5k without r5ksc: no L2 — leave 0 so PROM sees no secondary cache.
         #[cfg(all(feature = "r5ksc", not(feature = "r5ksc_triton")))]
-        eeprom.lock().set_cachsz((crate::mips_cache_v2::L2_SIZE / 4096) as u16);
+        eeprom_mc.lock().set_cachsz((crate::mips_cache_v2::L2_SIZE / 4096) as u16);
         #[cfg(all(feature = "r5k", not(feature = "r5ksc")))]
-        eeprom.lock().set_cachsz(0);
+        eeprom_mc.lock().set_cachsz(0);
 
         // 1. Create all devices first
         // Memory Controller
-        let mc = MemoryController::new(eeprom.clone(), guinness, cfg.banks);
+        let mc = MemoryController::new(eeprom_mc.clone(), guinness, cfg.banks);
 
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
         // remap_banks() updates it via set_addr_mask() when MEMCFG0/1 are written during POST.
@@ -320,8 +325,22 @@ impl Machine {
         let timer_manager = Arc::new(TimerManager::new());
         ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
-        let hpc3 = Hpc3::with_net(eeprom.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.scsi_deferred_int);
+        let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.scsi_deferred_int);
         hpc3.set_timer_manager(timer_manager.clone());
+
+        // Backdoor-inject the configured (or default) Ethernet station
+        // address before the CPU ever runs, since real hardware always has
+        // one burned in and there is no user-facing way to set one. Both
+        // NVRAM (Indy) and the motherboard EEPROM (Indigo2) are persisted to
+        // disk (see cfg.nvram / cfg.nveeprom), so both only patch while the
+        // `eaddr` slot is still blank — never clobbers a MAC the guest
+        // already `setenv`'d (Indy) or that a prior run already saved
+        // (Indigo2).
+        if guinness {
+            hpc3.rtc().backdoor_set_mac_if_blank(cfg.network().mac);
+        } else {
+            eeprom_hpc3.lock().backdoor_set_mac_if_blank(cfg.network().mac);
+        }
 
         // Attach SCSI devices from config (IDs 1–7).
         let mut scsi_ids: Vec<u8> = cfg.scsi.keys().copied().collect();
@@ -784,7 +803,7 @@ impl Machine {
         // Register lock monitor device and all component locks
         {
             use crate::locks::register_lock_fn;
-            let ep = eeprom.clone();
+            let ep = eeprom_mc.clone();
             register_lock_fn("mc::eeprom", move || ep.is_locked());
             mc.register_locks();
             hpc3.register_locks();

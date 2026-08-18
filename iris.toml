@@ -191,6 +191,10 @@ mode           = "nat"
 #pcap_interface = "1"                                          # by index (recommended)
 #pcap_interface = "wlan0"                                     # by name (Linux/macOS)
 #pcap_interface = '\Device\NPF_{385F30D0-9166-45D3-BBC6-F1D9C5300AF9}'  # Windows (literal '...' string!)
+# Ethernet station address for ec0. Defaults to 08:00:69:12:34:56 (SGI's OUI)
+# when unset. Backdoor-injected into NVRAM (Indy) / serial EEPROM (Indigo2)
+# before boot — no need to `setenv eaddr` by hand at the PROM monitor.
+#mac            = "08:00:69:12:34:56"
 
 #[ultra64]
 #enabled = true

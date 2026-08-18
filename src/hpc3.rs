@@ -1318,6 +1318,7 @@ impl Device for Hpc3 {
         cmds.push(("pdma".to_string(), "PDMA commands: pdma status | pdma chain <addr> | pdma dump <on|off|hal|scsi|enet|MASK> [DEV]".to_string()));
         cmds.extend(self.ioc.register_commands());
         cmds.extend(self.rtc.register_commands());
+        cmds.push(("nveeprom".to_string(), "NVRAM EEPROM commands (93CS56 @ 0x1fbb0008, stores env vars + MAC @ words 0x7D-0x7F — NOT the CPU/MC chip, see `eeprom`): nveeprom <on|off> | nveeprom dump | nveeprom r <word> | nveeprom w <word> <val> | nveeprom save [file]".to_string()));
         cmds.extend(self.seeq.register_commands());
         cmds.extend(self.scsi_dev.register_commands());
         // "scsi"/"cow" above already cover controller 0; scsi0 is an
@@ -1453,7 +1454,72 @@ impl Device for Hpc3 {
         if cmd == "rtc" {
              return self.rtc.execute_command(cmd, args, writer);
         }
-        
+        if cmd == "nveeprom" {
+            if args.is_empty() {
+                return Err("Usage: nveeprom <on|off|dump|r|w|save> ...".to_string());
+            }
+            match args[0] {
+                "on" | "1" | "off" | "0" => {
+                    let debug = matches!(args[0], "on" | "1");
+                    self.eeprom.lock().set_debug(debug);
+                    writeln!(writer, "NVRAM EEPROM debug {}", if debug { "enabled" } else { "disabled" }).unwrap();
+                    return Ok(());
+                }
+                "dump" => {
+                    let eeprom = self.eeprom.lock();
+                    for (i, chunk) in eeprom.get_data().chunks(8).enumerate() {
+                        let mut line = format!("  {:02X}:", i * 8);
+                        for word in chunk { line.push_str(&format!(" {:04X}", word)); }
+                        writeln!(writer, "{}", line).unwrap();
+                    }
+                    return Ok(());
+                }
+                "r" => {
+                    let addr_str = args.get(1).ok_or_else(|| "Usage: nveeprom r <word 0-127>".to_string())?;
+                    let addr: usize = usize::from_str_radix(addr_str.trim_start_matches("0x"), 16)
+                        .or_else(|_| addr_str.parse())
+                        .map_err(|_| format!("nveeprom r: \"{}\" is not a number", addr_str))?;
+                    let eeprom = self.eeprom.lock();
+                    let data = eeprom.get_data();
+                    if addr >= data.len() {
+                        return Err(format!("nveeprom r: word {} out of range (0-{})", addr, data.len() - 1));
+                    }
+                    writeln!(writer, "{:02X}: {:04X}", addr, data[addr]).unwrap();
+                    return Ok(());
+                }
+                "w" => {
+                    let addr_str = args.get(1).ok_or_else(|| "Usage: nveeprom w <word 0-127> <val>".to_string())?;
+                    let val_str = args.get(2).ok_or_else(|| "Usage: nveeprom w <word 0-127> <val>".to_string())?;
+                    let addr: usize = usize::from_str_radix(addr_str.trim_start_matches("0x"), 16)
+                        .or_else(|_| addr_str.parse())
+                        .map_err(|_| format!("nveeprom w: \"{}\" is not a number", addr_str))?;
+                    let val: u16 = u16::from_str_radix(val_str.trim_start_matches("0x"), 16)
+                        .or_else(|_| val_str.parse())
+                        .map_err(|_| format!("nveeprom w: \"{}\" is not a number", val_str))?;
+                    if addr >= 128 {
+                        return Err(format!("nveeprom w: word {} out of range (0-127)", addr));
+                    }
+                    self.eeprom.lock().set_word(addr, val);
+                    writeln!(writer, "{:02X}: {:04X}", addr, val).unwrap();
+                    return Ok(());
+                }
+                "save" => {
+                    let eeprom = self.eeprom.lock();
+                    let filename = match args.get(1) {
+                        Some(f) => f.to_string(),
+                        None => match eeprom.path() {
+                            Some(p) => p.to_string(),
+                            None => return Err("nveeprom save: no default path (pass a filename)".to_string()),
+                        },
+                    };
+                    match eeprom.save(&filename) {
+                        Ok(_) => { writeln!(writer, "Saved NVRAM EEPROM to {}", filename).unwrap(); return Ok(()); },
+                        Err(e) => return Err(format!("Failed to save NVRAM EEPROM: {}", e)),
+                    }
+                }
+                _ => return Err("Usage: nveeprom <on|off|dump|r|w|save> ...".to_string()),
+            }
+        }
         Err("Command not found".to_string())
     }
 }
@@ -1513,19 +1579,6 @@ impl BusDevice for Hpc3 {
             }
         }
 
-        let state = self.state.lock();
-
-        // PBUS PIO (0x58000 - 0x5BFFF)
-        if (PBUS_PIO_BASE..PBUS_CFGDMA_BASE).contains(&offset) {
-            let channel = (offset - PBUS_PIO_BASE) / PBUS_PIO_STRIDE;
-            dlog_dev!(LogModule::Hpc3, "HPC3: Read8 PBUS PIO Channel {} (offset {:05x})", channel, offset);
-            let idx = ((offset - PBUS_PIO_BASE) >> 2) as usize;
-            if idx < state.pbus_pio.len() {
-                return BusRead8::ok(state.pbus_pio[idx] as u8);
-            }
-            return BusRead8::ok(0);
-        }
-
         // PBUS BBRAM (RTC) - 8-bit access with sparse packing
         // RTC range: 0x60000-0x7ffff (128KB for 32K RTC, or 0x60000-0x67fff for 8K RTC)
         // Sparse packing: one byte per dword, only bottom byte lane is valid (offset & 3 == 3)
@@ -1538,6 +1591,33 @@ impl BusDevice for Hpc3 {
             // Sparse decode: addr/4 gives actual byte index in RTC
             let byte_index = rtc_offset >> 2;
             return self.rtc.read8(byte_index);
+        }
+
+        // MISC_EEPROM_DATA, byte lane (PROM bit-bangs this register 8 bits
+        // at a time, not just via 32-bit access — offset & 3 == 3 is the
+        // bottom byte of the big-endian word, same convention as RTC above).
+        if (MISC_BASE..MISC_BASE + 0x1000).contains(&offset) && offset - MISC_BASE == MISC_EEPROM_DATA + 3 {
+            let state = self.state.lock();
+            let mut val = state.eeprom_reg as u8;
+            if self.eeprom.lock().get_do() {
+                val |= 1 << 4;
+            } else {
+                val &= !(1 << 4);
+            }
+            return BusRead8::ok(val);
+        }
+
+        let state = self.state.lock();
+
+        // PBUS PIO (0x58000 - 0x5BFFF)
+        if (PBUS_PIO_BASE..PBUS_CFGDMA_BASE).contains(&offset) {
+            let channel = (offset - PBUS_PIO_BASE) / PBUS_PIO_STRIDE;
+            dlog_dev!(LogModule::Hpc3, "HPC3: Read8 PBUS PIO Channel {} (offset {:05x})", channel, offset);
+            let idx = ((offset - PBUS_PIO_BASE) >> 2) as usize;
+            if idx < state.pbus_pio.len() {
+                return BusRead8::ok(state.pbus_pio[idx] as u8);
+            }
+            return BusRead8::ok(0);
         }
 
         // All other registers require 32-bit access
@@ -1606,6 +1686,17 @@ impl BusDevice for Hpc3 {
             // Sparse decode: addr/4 gives actual byte index in RTC
             let byte_index = rtc_offset >> 2;
             return self.rtc.write8(byte_index, val);
+        }
+
+        // MISC_EEPROM_DATA, byte lane — see matching comment in read8.
+        if (MISC_BASE..MISC_BASE + 0x1000).contains(&offset) && offset - MISC_BASE == MISC_EEPROM_DATA + 3 {
+            let mut state = self.state.lock();
+            state.eeprom_reg = (state.eeprom_reg & !0xFF) | val as u32;
+            let mut eeprom = self.eeprom.lock();
+            eeprom.set_cs((val & (1 << 1)) != 0);
+            eeprom.set_di((val & (1 << 3)) != 0);
+            eeprom.set_sk((val & (1 << 2)) != 0);
+            return BUS_OK;
         }
 
         let mut state = self.state.lock();

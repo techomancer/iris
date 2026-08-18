@@ -42,6 +42,11 @@ pub enum LogModule {
     /// `scsi debug` toggles both — see wd33c93a.rs's `scsi`/`scsi1` command
     /// handling.
     Scsi1  = 24,
+    /// HPC3-side motherboard EEPROM (NVRAM/env vars/MAC @ words 0x7D-0x7F,
+    /// `nveeprom` command). Kept distinct from `Eeprom` (MC-side CPU
+    /// daughtercard chip, `eeprom` command) — the two are separate physical
+    /// parts on real hardware, see machine.rs's `eeprom_mc`/`eeprom_hpc3`.
+    Nveeprom = 25,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -50,7 +55,7 @@ pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
 impl LogModule {
-    pub const COUNT: usize = 25;
+    pub const COUNT: usize = 26;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -75,6 +80,7 @@ impl LogModule {
             "ps2"    => Some(Self::Ps2),
             "rtc"    => Some(Self::Rtc),
             "eeprom" => Some(Self::Eeprom),
+            "nveeprom" => Some(Self::Nveeprom),
             "l1i"    => Some(Self::L1i),
             "l1d"    => Some(Self::L1d),
             "l2c"    => Some(Self::L2c),
@@ -106,6 +112,7 @@ impl LogModule {
             Self::Ps2    => "ps2",
             Self::Rtc    => "rtc",
             Self::Eeprom => "eeprom",
+            Self::Nveeprom => "nveeprom",
             Self::L1i    => "l1i",
             Self::L1d    => "l1d",
             Self::L2c    => "l2c",
@@ -120,6 +127,7 @@ impl LogModule {
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
+            Self::Nveeprom,
         ]
     }
 
@@ -255,6 +263,7 @@ impl DevLog {
                 ModuleLog::new(), ModuleLog::new(), ModuleLog::new(), // L1i, L1d, L2c
                 ModuleLog::new(), // Ultra
                 ModuleLog::new(), // Scsi1
+                ModuleLog::new(), // Nveeprom
             ],
         }
     }

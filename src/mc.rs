@@ -126,7 +126,7 @@ impl GioDma {
 
 struct MemoryControllerState {
     regs: Vec<u32>,
-    eeprom: Arc<Mutex<Eeprom93c56>>, // mutex because it is shared with HPC3
+    eeprom: Arc<Mutex<Eeprom93c56>>, // CPU daughtercard EEPROM (REG_EEROM @ 0x1fa00030) — a separate chip from HPC3's motherboard EEPROM
     sys_semaphore: bool,
     user_semaphores: [bool; 16],
     
@@ -1271,7 +1271,7 @@ impl Device for MemoryController {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
             ("mc".to_string(), "Memory Controller commands: mc dma, mc regs, mc vdma <on|off>".to_string()),
-            ("eeprom".to_string(), "Enable/disable EEPROM debug: eeprom <on|off>".to_string()),
+            ("eeprom".to_string(), "CPU/MC EEPROM commands (93C56 @ 0x1fa00030, CPU boot config incl. CACHSZ_REG @ word 0x11 — NOT the NVRAM/MAC chip, see `nveeprom`): eeprom <on|off> | eeprom dump | eeprom r <word> | eeprom w <word> <val>".to_string()),
         ]
     }
 
@@ -1374,16 +1374,55 @@ impl Device for MemoryController {
             }
             "eeprom" => {
                 if args.is_empty() {
-                    return Err("Usage: eeprom <on|off>".to_string());
+                    return Err("Usage: eeprom <on|off|dump|r|w> ...".to_string());
                 }
-                let debug = match args[0] {
-                    "on" | "1" => true,
-                    "off" | "0" => false,
-                    _ => return Err("Usage: eeprom <on|off>".to_string()),
-                };
-                let state = self.state.lock();
-                state.eeprom.lock().set_debug(debug);
-                writeln!(writer, "EEPROM debug {}", if debug { "enabled" } else { "disabled" }).unwrap();
+                match args[0] {
+                    "on" | "1" | "off" | "0" => {
+                        let debug = matches!(args[0], "on" | "1");
+                        let state = self.state.lock();
+                        state.eeprom.lock().set_debug(debug);
+                        writeln!(writer, "EEPROM debug {}", if debug { "enabled" } else { "disabled" }).unwrap();
+                    }
+                    "dump" => {
+                        let state = self.state.lock();
+                        let eeprom = state.eeprom.lock();
+                        for (i, chunk) in eeprom.get_data().chunks(8).enumerate() {
+                            let mut line = format!("  {:02X}:", i * 8);
+                            for word in chunk { line.push_str(&format!(" {:04X}", word)); }
+                            writeln!(writer, "{}", line).unwrap();
+                        }
+                    }
+                    "r" => {
+                        let addr_str = args.get(1).ok_or_else(|| "Usage: eeprom r <word 0-127>".to_string())?;
+                        let addr: usize = usize::from_str_radix(addr_str.trim_start_matches("0x"), 16)
+                            .or_else(|_| addr_str.parse())
+                            .map_err(|_| format!("eeprom r: \"{}\" is not a number", addr_str))?;
+                        let state = self.state.lock();
+                        let eeprom = state.eeprom.lock();
+                        let data = eeprom.get_data();
+                        if addr >= data.len() {
+                            return Err(format!("eeprom r: word {} out of range (0-{})", addr, data.len() - 1));
+                        }
+                        writeln!(writer, "{:02X}: {:04X}", addr, data[addr]).unwrap();
+                    }
+                    "w" => {
+                        let addr_str = args.get(1).ok_or_else(|| "Usage: eeprom w <word 0-127> <val>".to_string())?;
+                        let val_str = args.get(2).ok_or_else(|| "Usage: eeprom w <word 0-127> <val>".to_string())?;
+                        let addr: usize = usize::from_str_radix(addr_str.trim_start_matches("0x"), 16)
+                            .or_else(|_| addr_str.parse())
+                            .map_err(|_| format!("eeprom w: \"{}\" is not a number", addr_str))?;
+                        let val: u16 = u16::from_str_radix(val_str.trim_start_matches("0x"), 16)
+                            .or_else(|_| val_str.parse())
+                            .map_err(|_| format!("eeprom w: \"{}\" is not a number", val_str))?;
+                        if addr >= 128 {
+                            return Err(format!("eeprom w: word {} out of range (0-127)", addr));
+                        }
+                        let state = self.state.lock();
+                        state.eeprom.lock().set_word(addr, val);
+                        writeln!(writer, "{:02X}: {:04X}", addr, val).unwrap();
+                    }
+                    _ => return Err("Usage: eeprom <on|off|dump|r|w> ...".to_string()),
+                }
             }
             _ => return Err(format!("Unknown MC command: {}", cmd)),
         }
@@ -1443,6 +1482,7 @@ impl Saveable for MemoryController {
         d.insert("stdma".into(),    hex_u32(dma.stdma));
         d.insert("run_real".into(), toml::Value::Boolean(dma.run_real));
         tbl.insert("giodma".into(), toml::Value::Table(d));
+        tbl.insert("eeprom".into(), state.eeprom.lock().save_state_owned());
 
         toml::Value::Table(tbl)
     }
@@ -1470,6 +1510,10 @@ impl Saveable for MemoryController {
             if let Some(r) = get_field(d, "tlb_hi") { load_u32_slice(r, &mut dma.tlb_hi); }
             if let Some(r) = get_field(d, "tlb_lo") { load_u32_slice(r, &mut dma.tlb_lo); }
             if let Some(x) = get_field(d, "run_real") { dma.run_real = toml_bool(x).unwrap_or(false); }
+        }
+
+        if let Some(e) = get_field(v, "eeprom") {
+            state.eeprom.lock().load_state_mut(e)?;
         }
 
         Ok(())
