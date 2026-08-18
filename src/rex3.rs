@@ -1169,10 +1169,12 @@ pub struct Rex3 {
     /// Rows filled via rex3_simd fastclear path (monitor `perf snapshot`).
     pub simd_fill_rows: AtomicU64,
     pub screen: Arc<Mutex<Rex3Screen>>,
+    /// Drives the real REX3 `VV_INT_N` pin (vertical retrace / Kaleidoscope).
     pub vblank_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    /// Drives the real REX3 `FIFO_INT_N` pin (GFIFO/BFIFO above/below
+    /// interrupt — one physical pin for both directions, selected by
+    /// `CONFIG_GFIFOABOVEINT`; see `update_gfifo_irqs`).
     pub fifo_full_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
-    pub graphics_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
-    pub gfx_drain_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
     /// Payload of GFIFO_DISP_SYNC pushed to the GFIFO on each such write.
     pub xmap_fence: AtomicU32,
@@ -1321,8 +1323,6 @@ impl Rex3 {
             screen,
             vblank_cb: Mutex::new(None),
             fifo_full_cb: Mutex::new(None),
-            graphics_cb: Mutex::new(None),
-            gfx_drain_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
             gfifo_fence: AtomicU32::new(0),
             debug: Arc::new(AtomicBool::new(false)),
@@ -1427,14 +1427,6 @@ impl Rex3 {
         *self.fifo_full_cb.lock() = Some(cb);
     }
 
-    pub fn set_graphics_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
-        *self.graphics_cb.lock() = Some(cb);
-    }
-
-    pub fn set_gfx_drain_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
-        *self.gfx_drain_cb.lock() = Some(cb);
-    }
-
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
     pub fn apply_display_resolution(&self, mode: crate::vc2_timings::NewportResolution) {
         if mode.is_guest() {
@@ -1470,7 +1462,10 @@ impl Rex3 {
         }
     }
 
-    /// Recompute GFIFO threshold interrupts and drive IOC callback lines.
+    /// Recompute the GFIFO threshold condition and drive the real REX3
+    /// `FIFO_INT_N` pin (one physical pin for both above- and
+    /// below-threshold crossings — `CONFIG_GFIFOABOVEINT` just selects which
+    /// direction triggers it; see `fifo_full_cb`'s doc comment).
     fn update_gfifo_irqs(&self) {
         let pending = self.gfifo.len();
         let level = Self::gfifo_hw_level(pending);
@@ -1478,23 +1473,15 @@ impl Rex3 {
         let threshold = (cfg >> CONFIG_GFIFODEPTH_SHIFT) & 0x1F;
         let above_int = cfg & CONFIG_GFIFOABOVEINT != 0;
 
-        let above = above_int && level >= threshold;
-        if above {
+        let crossed = if above_int { level >= threshold } else { level < threshold };
+        if crossed {
             self.config.status.fetch_or(STATUS_GFIFO_INT, Ordering::Relaxed);
         } else {
             self.config.status.fetch_and(!STATUS_GFIFO_INT, Ordering::Relaxed);
         }
 
         if let Some(cb) = self.fifo_full_cb.lock().clone() {
-            cb(above);
-        }
-        if let Some(cb) = self.gfx_drain_cb.lock().clone() {
-            // Drain interrupt: FIFO has dropped below the high-water threshold.
-            cb(above_int && !above);
-        }
-        let gfx_idle = !self.gfxbusy.load(Ordering::Acquire) && pending == 0;
-        if let Some(cb) = self.graphics_cb.lock().clone() {
-            cb(gfx_idle);
+            cb(crossed);
         }
     }
 

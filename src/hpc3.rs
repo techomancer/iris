@@ -115,6 +115,15 @@ pub const PBUS_PIO_STRIDE: u32 = 0x400;
 pub const HPC3_INT2_BASE: u32 = PBUS_PIO_BASE + 4 * PBUS_PIO_STRIDE;
 pub const HPC3_INT2_SIZE: u32 = crate::ioc::INT2_REG_COUNT * 4;
 
+/// IP22 fullhouse only: Full House's "extended register" (PBUS PIO channel
+/// 5). `kern/sys/hpc3.h`: "Address of Full House's extended register. PX at
+/// 0x1fbd9400. (IP22 Only)" — sits right before `HPC3_EXT_IO_ADDR`
+/// (`0x1fbd9900`, PIO channel 6 offset 0x100) in that header, but is itself
+/// unimplemented here; not yet reverse-engineered, so accesses are only
+/// logged (see `read8`/`write8`/`read16`/`write16`/`read32`/`write32`), not
+/// backed by real register state.
+pub const HPC3_EXT_PX_BASE: u32 = PBUS_PIO_BASE + 5 * PBUS_PIO_STRIDE;
+
 // PBUS DMA Config
 pub const PBUS_CFGDMA_BASE: u32 = 0x5C000;
 pub const PBUS_CFGDMA_STRIDE: u32 = 0x200;
@@ -1528,14 +1537,14 @@ impl BusDevice for Hpc3 {
     fn read8(&self, addr: u32) -> BusRead8 {
         let offset = addr - HPC3_BASE;
 
-        // INT2 (fullhouse only, PBUS PIO channel 4)
+        // INT2 (fullhouse only, PBUS PIO channel 4) — forwarded to Ioc's
+        // BusDevice::read8, which detects the INT2 window itself.
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
-            let idx = (offset - HPC3_INT2_BASE) >> 2;
-            return self.ioc.int2_read8(idx);
+            return self.ioc.read8(addr);
         }
 
         // IOC (0x59800 - 0x598FF) - forward 8-bit access directly to IOC
-        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x100).contains(&offset) {
+        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x104).contains(&offset) {
             return self.ioc.read8(addr);
         }
 
@@ -1628,14 +1637,14 @@ impl BusDevice for Hpc3 {
     fn write8(&self, addr: u32, val: u8) -> u32 {
         let offset = addr - HPC3_BASE;
 
-        // INT2 (fullhouse only, PBUS PIO channel 4)
+        // INT2 (fullhouse only, PBUS PIO channel 4) — forwarded to Ioc's
+        // BusDevice::write8, which detects the INT2 window itself.
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
-            let idx = (offset - HPC3_INT2_BASE) >> 2;
-            return self.ioc.int2_write8(idx, val);
+            return self.ioc.write8(addr, val);
         }
 
         // IOC (0x59800 - 0x598FF) - forward 8-bit access directly to IOC
-        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x100).contains(&offset) {
+        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x104).contains(&offset) {
             return self.ioc.write8(addr, val);
         }
 
@@ -1722,13 +1731,12 @@ impl BusDevice for Hpc3 {
 
         // INT2 (fullhouse only, PBUS PIO channel 4) - should not use 32-bit access, but allow for legacy
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
-            let idx = (offset - HPC3_INT2_BASE) >> 2;
-            let r = self.ioc.int2_read8(idx);
+            let r = self.ioc.read8(addr);
             return if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } };
         }
 
         // IOC (0x59800 - 0x598FF) - should not use 32-bit access, but allow for legacy
-        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x100).contains(&offset) {
+        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x104).contains(&offset) {
             return self.ioc.read32(addr);
         }
 
@@ -1854,12 +1862,11 @@ impl BusDevice for Hpc3 {
 
         // INT2 (fullhouse only, PBUS PIO channel 4) - should not use 32-bit access, but allow for legacy
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
-            let idx = (offset - HPC3_INT2_BASE) >> 2;
-            return self.ioc.int2_write8(idx, (val & 0xFF) as u8);
+            return self.ioc.write8(addr, (val & 0xFF) as u8);
         }
 
         // IOC (0x59800 - 0x598FF) - should not use 32-bit access, but allow for legacy
-        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x100).contains(&offset) {
+        if (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x104).contains(&offset) {
             return self.ioc.write32(addr, val);
         }
 
@@ -2043,6 +2050,11 @@ impl BusDevice for Hpc3 {
             return BusRead16::ok(hal2_absent_read(offset - HAL2_BASE));
         }
 
+        // IOC EXT_IO (fullhouse only, 0x59900 = HPC3_IOC_BASE + 0x100)
+        if !self.guinness && (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x104).contains(&offset) {
+            return self.ioc.read16(addr);
+        }
+
         BusRead16::ok(0)
     }
 
@@ -2055,6 +2067,11 @@ impl BusDevice for Hpc3 {
                 return hal2.write(offset - HAL2_BASE, val);
             }
             return BUS_OK;
+        }
+
+        // IOC EXT_IO (fullhouse only, 0x59900 = HPC3_IOC_BASE + 0x100)
+        if !self.guinness && (HPC3_IOC_BASE..HPC3_IOC_BASE + 0x104).contains(&offset) {
+            return self.ioc.write16(addr, val);
         }
 
         BUS_OK

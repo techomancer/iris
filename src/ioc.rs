@@ -15,6 +15,15 @@ use std::io::Write;
 pub const IOC_BASE: u32 = 0x1FBD9800;
 pub const IOC_SIZE: u32 = 0x100;
 
+/// Fullhouse-only: real physical base of the INT2 register block (HPC3 PBUS
+/// PIO channel 4 — same address `crate::hpc3::HPC3_BASE + HPC3_INT2_BASE`
+/// resolves to). Lower than `IOC_BASE` (PIO channel 6), so `read8`/`write8`
+/// check this window *before* computing `addr - IOC_BASE`, letting callers
+/// (hpc3.rs) forward whichever real address they received to the same
+/// `BusDevice` methods instead of a separate accessor.
+pub const IOC_INT2_BASE: u32 = 0x1FBD9000;
+pub const IOC_INT2_SIZE: u32 = INT2_REG_COUNT * 4;
+
 // Register Offsets
 pub const IOC_PL_DATA: u32 = 0x00;
 pub const IOC_PL_CNTL: u32 = 0x04;
@@ -59,6 +68,11 @@ pub const IOC_TIMER_CNT1: u32 = 0xB4;
 pub const IOC_TIMER_CNT2: u32 = 0xB8;
 pub const IOC_TIMER_CTL: u32 = 0xBC;
 
+/// Fullhouse-only `HPC3_EXT_IO_ADDR` (`0x1FBD9900` = `IOC_BASE + 0x100`),
+/// one byte past `IOC_SIZE`'s original window — see `IocState.ext_io`'s doc
+/// comment. 16-bit hardware register, but IRIX reads it as a 32-bit `uint`.
+pub const IOC_EXT_IO: u32 = 0x100;
+
 pub mod l0_regs {
     pub const MAP_INT0: u8 = 1 << 7;
     pub const GRAPHICS: u8 = 1 << 6;
@@ -93,6 +107,41 @@ pub mod map_regs {
     pub const GFX_DRAIN1: u8 = 1 << 7;
 }
 
+/// Fullhouse-only PORT_CONFIG bits (`IP22.h`'s `PCON_*`). All reset/clear
+/// lines are active-low (`_N` suffix): 0 = asserted, 1 = deasserted/normal.
+pub mod pcon_regs {
+    pub const DMA_SYNC_SEL: u8       = 1 << 0; // 1=slot1 0=slot0
+    pub const SG_RESET_N: u8         = 1 << 1; // reset GFX slot
+    pub const S0_RESET_N: u8         = 1 << 2; // reset EXP0 slot
+    pub const CLR_SG_RETRACE_N: u8   = 1 << 3; // clear GFX slot retrace latch
+    pub const CLR_S0_RETRACE_N: u8   = 1 << 4; // clear EXP0 slot retrace latch
+}
+
+/// Fullhouse-only `HPC3_EXT_IO_ADDR` bits (`kern/sys/hpc3.h`'s `EXTIO_*`).
+/// All active-low: 0 = interrupt/condition pending, 1 = idle. `IRQ_1` =
+/// graphics (`GIO_INTERRUPT_1`), `IRQ_2` = fifo (`GIO_INTERRUPT_0`), `IRQ_3`
+/// = video vsync (unrelated to the 3 GIO vectors — `VECTOR_VIDEO`).
+pub mod ext_io_regs {
+    pub const SG_STAT_0: u16    = 1 << 0;
+    pub const SG_STAT_1: u16    = 1 << 1;
+    pub const SG_RETRACE: u16   = 1 << 8;  // GioSgRetrace
+    pub const SG_IRQ_1: u16     = 1 << 9;  // GioSgGraphics
+    pub const SG_IRQ_2: u16     = 1 << 10; // GioSgFifo
+    pub const SG_IRQ_3: u16     = 1 << 11; // vid.vsync
+    pub const S0_STAT_0: u16    = 1 << 2;
+    pub const S0_STAT_1: u16    = 1 << 3;
+    pub const S0_RETRACE: u16   = 1 << 12; // GioS0Retrace
+    pub const S0_IRQ_1: u16     = 1 << 13; // GioS0Graphics
+    pub const S0_IRQ_2: u16     = 1 << 14; // GioS0Fifo
+    pub const S0_IRQ_3: u16     = 1 << 15; // vid.vsync
+    pub const GIO_33MHZ: u16    = 1 << 7;
+    pub const EISA_BUSERR: u16  = 1 << 6;
+    pub const MC_BUSERR: u16    = 1 << 5;
+    pub const HPC3_BUSERR: u16  = 1 << 4;
+    /// All-idle reset value: every active-low bit deasserted (1).
+    pub const IDLE: u16 = 0xFFFF;
+}
+
 /// IP22 fullhouse exposes the *same* INT3-shaped interrupt registers
 /// (`l0_stat`/`l0_mask`/`l1_stat`/`l1_mask`/`map_stat`/`map_mask0`/
 /// `map_mask1`, plus the embedded PIT) as Indy, just at a second, more
@@ -105,8 +154,18 @@ pub mod map_regs {
 /// mc_dma_done_w, hpc_dma_done_w, video_int_w — none of these differ by
 /// profile). `int2_map` (fullhouse's PIO4 layout) is
 /// `local_status/mask<0,1>`, `map_status`, `map_mask<0,1>`,
-/// `timer_int_clear`, and the PIT, omitting `map_pol`/`error_status`
-/// (fullhouse has no registers for those) that guinness exposes at PIO6.
+/// `timer_int_clear`, and the PIT.
+/// MAME's `ioc2_full_house_device::int2_map` (`ioc2.cpp:591-602`) has no
+/// entry at compact offset 0x1C (dword index 7), but real IRIX's
+/// `ip22_newportRetrace` (disassembly, confirmed live at
+/// 0xffffffff882aa5f0) does a read-modify-write on phys 0x1FBD901F
+/// (= HPC3_INT2_BASE index 7) on every vertical retrace. This is
+/// `PORT_CONFIG` (`kern/sys/IP22.h`: `PORT_CONFIG = HPC3_INT2_ADDR +
+/// IP22BOFF(0x1c)`; `IP22BOFF(x) = x|0x3` is the `_MIPSEB` byte-lane
+/// adjustment for byte-wide registers, so the dword index is still
+/// `0x1c>>2 = 7` — MAME's map for this one register is simply incomplete).
+/// PORT_CONFIG is fullhouse-only — no equivalent on guinness, which has no
+/// GIO-slot reset/retrace-clear register at all (see `pcon_regs`).
 /// `Ioc::int2_read8`/`int2_write8` take a *register index* (0-based, one
 /// per dword-aligned PBUS PIO slot — matching the stride hpc3.rs already
 /// uses for every other PBUS PIO channel) so hpc3.rs doesn't need to
@@ -114,8 +173,8 @@ pub mod map_regs {
 /// Register index = compact byte offset from MAME's `int2_map`, matching
 /// the dword-per-register packing hpc3.rs uses for every PBUS PIO channel
 /// (idx = byte_offset >> 2): 0=l0_stat 1=l0_mask 2=l1_stat 3=l1_mask
-/// 4=map_stat 5=map_mask0 6=map_mask1 (7 unused — int2_map has no register
-/// at compact offset 0x07) 8=tmr_clr (9-11 unused) 12-15=PIT channel
+/// 4=map_stat 5=map_mask0 6=map_mask1 7=port_config 8=tmr_clr (9-11 unused)
+/// 12-15=PIT channel
 /// 0/1/2/control (same `Pit8254` instance guinness's INT3 timers use at
 /// PIO6 — one chip, two address windows, per `ioc2_device`'s single
 /// `m_pit` in MAME).
@@ -148,15 +207,113 @@ pub enum IocInterrupt {
     KbMouse,
     GioExp0,    // LIO_GIO_EXP0 = bit 6 — GIO expansion slot 0 (Indy IP24)
     GioExp1,    // LIO_GIO_EXP1 = bit 7 — GIO expansion slot 1
-    /// IP22 fullhouse second head (GIO slot 1) vertical retrace — shares the
-    /// same L1 VERTICAL_RETRACE bit as the primary head.
-    GioExp0Retrace,
-    GfxDrain0,  // LIO_DRAIN0 = bit 6 — GFX FIFO drain (Indigo2 fullhouse)
-    GfxDrain1,  // LIO_DRAIN1 = bit 7 — second head drain (Indigo2 fullhouse)
     Mappable0,  // Timer 0
     Mappable1,  // Timer 1
     Mappable2,
     Mappable3,
+
+    /// IP22 fullhouse only: the 9 per-slot GIO interrupt sources (3 slots ×
+    /// fifo/graphics/retrace). All 3 slots on real Indigo2 hardware share the
+    /// same 3 physical IOC2 pins/bits (`LIO_FIFO`/`LIO_GIO_1`/`LIO_GIO_2` —
+    /// same `L0_STAT`/`L1_STAT` bits `FifoFull`/`Graphics`/`VerticalRetrace`
+    /// already use), so each of these also sets that shared bit. What makes
+    /// them distinct is the 16-bit `HPC3_EXT_IO_ADDR` register (`ext_io_*` in
+    /// `IocState`): each variant additionally clears its own active-low
+    /// `EXTIO_*` bit there, which is what `ip22_gio0/1/2_intr`
+    /// (`kern/ml/IP22.c`) reads to decide which slot's ISR to actually call.
+    /// Naming matches IRIX's own SG (GIO_SLOT_GFX) / S0 (GIO_SLOT_0) / S1
+    /// (GIO_SLOT_1) convention from `kern/sys/hpc3.h`'s `EXTIO_*` defines.
+    GioSgFifo,      // EXTIO_SG_IRQ_2 = 0x0400, sets L0_STAT FIFO_FULL
+    GioSgGraphics,  // EXTIO_SG_IRQ_1 = 0x0200, sets L0_STAT GRAPHICS
+    GioSgRetrace,   // EXTIO_SG_RETRACE = 0x0100, sets L1_STAT VERTICAL_RETRACE
+    GioS0Fifo,      // EXTIO_S0_IRQ_2 = 0x4000, sets L0_STAT FIFO_FULL
+    GioS0Graphics,  // EXTIO_S0_IRQ_1 = 0x2000, sets L0_STAT GRAPHICS
+    GioS0Retrace,   // EXTIO_S0_RETRACE = 0x1000, sets L1_STAT VERTICAL_RETRACE
+    GioS1Fifo,      // EXTIO_S1_IRQ_2 = 0x0004, sets L0_STAT FIFO_FULL
+    GioS1Graphics,  // EXTIO_S1_IRQ_1 = 0x0002, sets L0_STAT GRAPHICS
+    GioS1Retrace,   // EXTIO_S1_RETRACE = 0x0001, sets L1_STAT VERTICAL_RETRACE
+}
+
+/// The 3 GIO64 bus slots, indexed as MAME's `gio64_slot_device::slot_type_t`
+/// (`GIO64_SLOT_GFX`/`EXP0`/`EXP1` = 0/1/2 — see `$HOME/gits/mame/src/devices/bus/gio64/gio64.h`).
+/// Physically present on both Indy and Indigo2 (`indy_indigo2.cpp` instantiates
+/// all 3 slots for either profile) — Indy's PROM/kernel just never populates a
+/// card in EXP1, and Newport is wired to GFX by convention on Indy but can sit
+/// in any slot on Indigo2's physically larger case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GioSlot {
+    Gfx = 0,
+    Exp0 = 1,
+    Exp1 = 2,
+}
+
+/// Physical base address of each GIO64 slot (`0x1F000000` GFX / `0x1F400000`
+/// EXP0 / `0x1F600000` EXP1 — see physical.rs's `NEWPORT_BASE`/`GIO_SLOT0_BASE`/
+/// `GIO_SLOT1_BASE`, and MAME's `indy_indigo2.cpp:21-23`), indexed by `GioSlot as usize`.
+pub const GIO_SLOT_BASES: [u32; 3] = [0x1F00_0000, 0x1F40_0000, 0x1F60_0000];
+
+/// Which `IocInterrupt` sources a card in a given GIO slot drives, for one
+/// IOC2 profile. Newport only has 2 real interrupt pins — `FIFO_INT_N`
+/// (`fifo_full`) and `VV_INT_N` (vertical retrace/Kaleidoscope) — there is no
+/// separate "graphics" signal on Newport (that's XZ/Elan's GE11-done pin,
+/// which never fires from a real Newport board).
+#[derive(Debug, Clone, Copy)]
+pub struct GioSlotWiring {
+    pub retrace: IocInterrupt,
+    pub fifo_full: IocInterrupt,
+}
+
+/// Per-profile slot → interrupt-source wiring, indexed `[profile_idx(guinness)][GioSlot as usize]`.
+/// Row 0 = guinness (Indy), row 1 = fullhouse (Indigo2).
+///
+/// GFX slot: guinness dedicates 2 direct pins to it — `FifoFull` (L0_STAT)
+/// and `VerticalRetrace` (L1_STAT bit 7) — matching MAME's `gio_int0/2_w`.
+///
+/// Fullhouse's `VECTOR_GIO2`/`ip22_gio2_intr` fan-out (`L1_STAT` bit 7 +
+/// `HPC3_EXT_IO_ADDR` disambiguation, `kern/ml/IP22.c`) is real and
+/// implemented (`GioSg/S0/S1Retrace`, `Ioc::read16`/`write16`'s `IOC_EXT_IO`
+/// branch) but is **not what IRIX's fullhouse Newport driver actually uses**:
+/// `ng1_init` never calls `setgiovector(GIO_INTERRUPT_2, ...)` for Newport at
+/// all (confirmed via disassembly — only levels 0 and 1 are registered, both
+/// pointing at `ip22_newportInterrupt`). That handler polls REX3's `STATUS`
+/// register directly for `STATUS_VRINT` (bit 5) whenever it's entered via
+/// GIO_INTERRUPT_0 (fifo) or GIO_INTERRUPT_1, and calls `ip22_newportRetrace`
+/// from there — so vblank has to be delivered through the *fifo/graphics*
+/// EXT_IO fan-out (`GioSg/S0/S1Graphics`, GIO_INTERRUPT_1), not the retrace
+/// one, or `ip22_newportInterrupt` is never entered and VRINT is never
+/// checked. Confirmed working live: routing the GFX slot's `retrace` field
+/// through `GioSgGraphics` instead of `GioSgRetrace` unblocks the screensaver.
+///
+/// EXP0 slot: guinness's Exp0 is the Ultra64 (N64 dev board) → `GioExp0`
+/// (see ultra64.rs) — a real MAP-bank interrupt, unrelated to GIO_INT_2.
+/// Fullhouse's Exp0 (second Newport head) uses the `GioS0*` variants.
+///
+/// EXP1 slot: guinness's Exp1 has no physical card by convention on Indy;
+/// `GioExp1` is reserved here for symmetry with fullhouse's second-head path.
+/// Fullhouse's Exp1 has no IRIS device wired yet, but uses `GioS1*` for
+/// consistency (matches `EXTIO_S1_*`, "original IP22 does not set
+/// EXTIO_S1_IRQ_2"/etc. per IP22.c's comments, so real hardware treats it as
+/// permanently absent — IRIS doesn't drive these bits from any callback).
+pub const GIO_SLOT_MAP: [[GioSlotWiring; 3]; 2] = [
+    // guinness (Indy)
+    [
+        GioSlotWiring { retrace: IocInterrupt::VerticalRetrace, fifo_full: IocInterrupt::FifoFull },
+        GioSlotWiring { retrace: IocInterrupt::GioExp1, fifo_full: IocInterrupt::FifoFull },
+        GioSlotWiring { retrace: IocInterrupt::GioExp1, fifo_full: IocInterrupt::FifoFull },
+    ],
+    // fullhouse (Indigo2) — retrace routed through the *graphics* EXT_IO fan-out
+    // (GIO_INTERRUPT_1), not the retrace one — see this const's doc comment.
+    [
+        GioSlotWiring { retrace: IocInterrupt::GioSgGraphics, fifo_full: IocInterrupt::GioSgFifo },
+        GioSlotWiring { retrace: IocInterrupt::GioS0Graphics, fifo_full: IocInterrupt::GioS0Fifo },
+        GioSlotWiring { retrace: IocInterrupt::GioS1Graphics, fifo_full: IocInterrupt::GioS1Fifo },
+    ],
+];
+
+/// Row index into `GIO_SLOT_MAP` for a given profile.
+#[inline]
+pub fn profile_idx(guinness: bool) -> usize {
+    if guinness { 0 } else { 1 }
 }
 
 struct IocState {
@@ -172,6 +329,27 @@ struct IocState {
     map_mask1: u8,
     map_pol: u8,
     err_stat: u8,
+    /// Fullhouse-only PORT_CONFIG register (`IP22.h`'s `PORT_CONFIG`, INT2
+    /// compact index 7 / byte offset `0x1C`-aligned/`0x1F` BE-lane). Controls
+    /// GIO slot reset (`PCON_SG_RESET_N`/`PCON_S0_RESET_N`) and per-slot
+    /// retrace-clear strobes (`PCON_CLR_SG_RETRACE_N`/`PCON_CLR_S0_RETRACE_N`)
+    /// on IP22. Not present on guinness (IP24), which has no equivalent
+    /// register — retrace there is acked via IOC1 LOCAL1 status/mask only.
+    port_config: u8,
+    /// Fullhouse-only `HPC3_EXT_IO_ADDR` (`0x1FBD9900`, 16-bit register read
+    /// as a 32-bit `uint` by IRIX — see `ext_io_regs`). All bits active-low;
+    /// idle/no-interrupt state is all-1s. `EXTIO_S1_*` (3rd GIO slot) bits
+    /// numerically collide with `EXTIO_SG_STAT_*` in this same word — real
+    /// IRIX (`kern/sys/hpc3.h`: "IP22-006 splits EXTIO into two registers to
+    /// support 3rd gio slot") implies a second physical register for that
+    /// case, but no second address is defined anywhere in IP22.c/IP26.c/
+    /// IP28.c, and it's gated behind a special medical-equipment board
+    /// revision (`kern/ml/IP22.c`'s `SPECIAL_GIO_RESET` comment) that no
+    /// config IRIS emulates has. IRIS therefore doesn't drive S1 bits from
+    /// any callback; they stay permanently deasserted (matching stock
+    /// hardware, where `ip22_gio0_intr` et al. explicitly comment "original
+    /// IP22 does not set EXTIO_S1_IRQ_2").
+    ext_io: u16,
 
     // Misc Registers
     gc_select: u8,
@@ -276,6 +454,8 @@ impl Ioc {
             map_mask1: 0,
             map_pol: 0,
             err_stat: 0,
+            port_config: 0,
+            ext_io: ext_io_regs::IDLE,
             gc_select: 0,
             gen_cntl: 0,
             panel: 1, // Power State (Bit 0) = 1 (On)
@@ -383,23 +563,48 @@ impl Ioc {
             // Mappable (LIO_2 on IP24)
             IocInterrupt::Serial  => if active { state.map_stat |= map_regs::SERIAL    } else { state.map_stat &= !map_regs::SERIAL    },
             IocInterrupt::KbMouse => if active { state.map_stat |= map_regs::KBD_MOUSE } else { state.map_stat &= !map_regs::KBD_MOUSE },
-            // GioExp0/GfxDrain0 and GioExp1/GfxDrain0Retrace share the same MAP bits 6/7 —
-            // callers (machine.rs) already pick the profile-appropriate variant for what's
-            // actually wired to that GIO slot; this just writes the shared bit either way.
-            IocInterrupt::GioExp0 | IocInterrupt::GfxDrain0 => {
-                if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 }
-            }
-            IocInterrupt::GioExp1 | IocInterrupt::GfxDrain1 => {
-                if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 }
-            }
-            // Second-head retrace on fullhouse's GIO slot 1 — same L1 VERTICAL_RETRACE bit
-            // guinness's primary head uses (INT3_LOCAL1_RETRACE is not per-head on real
-            // hardware either; a second Newport head shares the one retrace line).
-            IocInterrupt::GioExp0Retrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
+            IocInterrupt::GioExp0 => if active { state.map_stat |= map_regs::GIO_EXP0 } else { state.map_stat &= !map_regs::GIO_EXP0 },
+            IocInterrupt::GioExp1 => if active { state.map_stat |= map_regs::GIO_EXP1 } else { state.map_stat &= !map_regs::GIO_EXP1 },
             IocInterrupt::Mappable0 => if active { state.map_stat |= 1 << 0 } else { state.map_stat &= !(1 << 0) },
             IocInterrupt::Mappable1 => if active { state.map_stat |= 1 << 1 } else { state.map_stat &= !(1 << 1) },
             IocInterrupt::Mappable2 => if active { state.map_stat |= 1 << 2 } else { state.map_stat &= !(1 << 2) },
             IocInterrupt::Mappable3 => if active { state.map_stat |= 1 << 3 } else { state.map_stat &= !(1 << 3) },
+
+            // Fullhouse GIO slot fan-out (see GIO_SLOT_MAP's doc comment):
+            // each sets the one shared L0/L1 bit every slot's signal uses,
+            // and clears (active) / sets (idle) its own active-low EXT_IO
+            // bit so ip22_gio0/1/2_intr can tell which slot fired.
+            IocInterrupt::GioSgFifo => {
+                if active { state.l0_stat |= l0_regs::FIFO_FULL; state.ext_io &= !ext_io_regs::SG_IRQ_2; }
+                else { state.l0_stat &= !l0_regs::FIFO_FULL; state.ext_io |= ext_io_regs::SG_IRQ_2; }
+            }
+            IocInterrupt::GioSgGraphics => {
+                if active { state.l0_stat |= l0_regs::GRAPHICS; state.ext_io &= !ext_io_regs::SG_IRQ_1; }
+                else { state.l0_stat &= !l0_regs::GRAPHICS; state.ext_io |= ext_io_regs::SG_IRQ_1; }
+            }
+            IocInterrupt::GioSgRetrace => {
+                if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE; state.ext_io &= !ext_io_regs::SG_RETRACE; }
+                else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE; state.ext_io |= ext_io_regs::SG_RETRACE; }
+            }
+            IocInterrupt::GioS0Fifo => {
+                if active { state.l0_stat |= l0_regs::FIFO_FULL; state.ext_io &= !ext_io_regs::S0_IRQ_2; }
+                else { state.l0_stat &= !l0_regs::FIFO_FULL; state.ext_io |= ext_io_regs::S0_IRQ_2; }
+            }
+            IocInterrupt::GioS0Graphics => {
+                if active { state.l0_stat |= l0_regs::GRAPHICS; state.ext_io &= !ext_io_regs::S0_IRQ_1; }
+                else { state.l0_stat &= !l0_regs::GRAPHICS; state.ext_io |= ext_io_regs::S0_IRQ_1; }
+            }
+            IocInterrupt::GioS0Retrace => {
+                if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE; state.ext_io &= !ext_io_regs::S0_RETRACE; }
+                else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE; state.ext_io |= ext_io_regs::S0_RETRACE; }
+            }
+            // GioS1* bits have no second EXT_IO register modeled (see
+            // IocState.ext_io's doc comment) — still set the shared L0/L1
+            // bit so callers routing through this slot don't silently drop
+            // the interrupt, but the EXT_IO side is a no-op.
+            IocInterrupt::GioS1Fifo => if active { state.l0_stat |= l0_regs::FIFO_FULL } else { state.l0_stat &= !l0_regs::FIFO_FULL },
+            IocInterrupt::GioS1Graphics => if active { state.l0_stat |= l0_regs::GRAPHICS } else { state.l0_stat &= !l0_regs::GRAPHICS },
+            IocInterrupt::GioS1Retrace => if active { state.l1_stat |= l1_regs::VERTICAL_RETRACE } else { state.l1_stat &= !l1_regs::VERTICAL_RETRACE },
         }
         state.update_interrupts();
     }
@@ -462,6 +667,11 @@ impl Device for Ioc {
                 for (b, n) in names { if v & b != 0 { out.push(*n); } }
                 if out.is_empty() { "-".into() } else { out.join("|") }
             }
+            fn bits16(v: u16, names: &[(u16, &str)]) -> String {
+                let mut out = Vec::new();
+                for (b, n) in names { if v & b != 0 { out.push(*n); } }
+                if out.is_empty() { "-".into() } else { out.join("|") }
+            }
             let l0_names: &[(u8, &str)] = &[
                 (l0_regs::MAP_INT0, "MAP_INT0"), (l0_regs::GRAPHICS, "GRAPHICS"),
                 (l0_regs::PARALLEL, "PARALLEL"), (l0_regs::MC_DMA, "MC_DMA"),
@@ -481,6 +691,16 @@ impl Device for Ioc {
                 (map_regs::KBD_MOUSE, "KBD_MOUSE"),
                 (1 << 1, "TIMER1"), (1 << 0, "TIMER0"),
             ];
+            // Named by which slot/signal is PENDING, i.e. the bit is CLEAR
+            // (all EXT_IO bits are active-low — see ext_io_regs).
+            let ext_io_pending_names: &[(u16, &str)] = &[
+                (ext_io_regs::SG_RETRACE, "SG_RETRACE"), (ext_io_regs::SG_IRQ_1, "SG_GRAPHICS"), (ext_io_regs::SG_IRQ_2, "SG_FIFO"), (ext_io_regs::SG_IRQ_3, "SG_VSYNC"),
+                (ext_io_regs::S0_RETRACE, "S0_RETRACE"), (ext_io_regs::S0_IRQ_1, "S0_GRAPHICS"), (ext_io_regs::S0_IRQ_2, "S0_FIFO"), (ext_io_regs::S0_IRQ_3, "S0_VSYNC"),
+                (ext_io_regs::GIO_33MHZ, "GIO_33MHZ"), (ext_io_regs::EISA_BUSERR, "EISA_BUSERR"),
+                (ext_io_regs::MC_BUSERR, "MC_BUSERR"), (ext_io_regs::HPC3_BUSERR, "HPC3_BUSERR"),
+                (ext_io_regs::SG_STAT_0, "SG_STAT_0"), (ext_io_regs::SG_STAT_1, "SG_STAT_1"),
+                (ext_io_regs::S0_STAT_0, "S0_STAT_0"), (ext_io_regs::S0_STAT_1, "S0_STAT_1"),
+            ];
             let l0_eff = s.l0_stat & s.l0_mask;
             let l1_eff = s.l1_stat & s.l1_mask;
             let map_eff0 = s.map_stat & s.map_mask0;
@@ -499,7 +719,8 @@ impl Device for Ioc {
                 s.map_stat, bits8(s.map_stat, map_names),
                 s.map_mask0, map_eff0, bits8(map_eff0, map_names),
                 s.map_mask1, map_eff1, bits8(map_eff1, map_names));
-            let _ = writeln!(writer, "  MAP_POL={:02x}  ERR_STAT={:02x}", s.map_pol, s.err_stat);
+            let _ = writeln!(writer, "  MAP_POL={:02x}  ERR_STAT={:02x}  PORT_CONFIG={:02x}", s.map_pol, s.err_stat, s.port_config);
+            let _ = writeln!(writer, "  EXT_IO={:04x}  pending(bit=0)=[{}]", s.ext_io, bits16(!s.ext_io, ext_io_pending_names));
             let _ = writeln!(writer, "  CPU IP lines: IP2={} IP3={} IP4=TMR0:{} IP5=TMR1:{} IP6=ERR:{}",
                 ip2, ip3, ip4, ip5, ip6);
             let _ = writeln!(writer, "  Misc: sys_id={:02x} gc_select={:02x} gen_cntl={:02x} panel={:02x} read_reg={:02x} dma_sel={:02x} reset_reg={:02x} write_reg={:02x}",
@@ -535,6 +756,14 @@ impl Device for Ioc {
 
 impl BusDevice for Ioc {
     fn read8(&self, addr: u32) -> BusRead8 {
+        // Fullhouse-only INT2 window (PBUS PIO channel 4) — lower address
+        // than IOC_BASE (PIO channel 6), checked first so it isn't caught by
+        // the addr-IOC_BASE subtraction below. See IOC_INT2_BASE's doc
+        // comment.
+        if (IOC_INT2_BASE..IOC_INT2_BASE + IOC_INT2_SIZE).contains(&addr) {
+            return self.int2_read8(addr - IOC_INT2_BASE);
+        }
+
         let offset = (addr - IOC_BASE) & !3;
 
         // Lock state only for IOC registers, not for SCC/PIT passthrough
@@ -598,6 +827,10 @@ impl BusDevice for Ioc {
     }
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
+        if (IOC_INT2_BASE..IOC_INT2_BASE + IOC_INT2_SIZE).contains(&addr) {
+            return self.int2_write8(addr - IOC_INT2_BASE, val);
+        }
+
         let offset = (addr - IOC_BASE) & !3;
 
         // Serial ports (SCC) - direct 8-bit access
@@ -690,20 +923,56 @@ impl BusDevice for Ioc {
         BUS_OK
     }
 
+    fn read16(&self, addr: u32) -> BusRead16 {
+        let offset = (addr - IOC_BASE) & !1;
+        if offset == IOC_EXT_IO {
+            let state = self.state.lock();
+            dlog_dev!(LogModule::Ioc, "IOC: rd EXT_IO → {:#06x}", state.ext_io);
+            return BusRead16::ok(state.ext_io);
+        }
+        BusRead16::err()
+    }
+
+    fn write16(&self, addr: u32, val: u16) -> u32 {
+        let offset = (addr - IOC_BASE) & !1;
+        if offset == IOC_EXT_IO {
+            let mut state = self.state.lock();
+            dlog_dev!(LogModule::Ioc, "IOC: EXT_IO = {:#06x}", val);
+            state.ext_io = val;
+            return BUS_OK;
+        }
+        BUS_ERR
+    }
+
     fn read32(&self, addr: u32) -> BusRead32 {
         //println!("IOC: Read32 addr {:08x}", addr);
+        let aligned_addr = addr & !3;
+        let offset = aligned_addr - IOC_BASE;
+        // HPC3_EXT_IO_ADDR: IRIX reads this specific register as a 32-bit
+        // `uint` despite the hardware register being 16 bits wide (comment
+        // in kern/ml/IP22.c: "HPC3_EXT_IO_ADDR is 16 bits wide") — zero-
+        // extend rather than truncate through the generic read8 byte path.
+        if offset == IOC_EXT_IO {
+            let state = self.state.lock();
+            return BusRead32::ok(state.ext_io as u32);
+        }
         // IOC registers are accessed as 32-bit words with data in low 8 bits
         // Address should be word-aligned
-        let aligned_addr = addr & !3;
         let r = self.read8(aligned_addr);
         if r.is_ok() { BusRead32::ok(r.data as u32) } else { BusRead32 { status: r.status, data: 0 } }
     }
 
     fn write32(&self, addr: u32, val: u32) -> u32 {
         //println!("IOC: Write32 addr {:08x} val {:08x}", addr, val);
+        let aligned_addr = addr & !3;
+        let offset = aligned_addr - IOC_BASE;
+        if offset == IOC_EXT_IO {
+            let mut state = self.state.lock();
+            state.ext_io = (val & 0xFFFF) as u16;
+            return BUS_OK;
+        }
         // IOC registers are accessed as 32-bit words with data in low 8 bits
         // Address should be word-aligned
-        let aligned_addr = addr & !3;
         // Extract low 8 bits (bits 7:0)
         let val8 = (val & 0xFF) as u8;
         self.write8(aligned_addr, val8)
@@ -711,10 +980,13 @@ impl BusDevice for Ioc {
 }
 
 impl Ioc {
-    /// Fullhouse-only: read one of the compact INT2 registers at HPC3 PBUS
-    /// PIO channel 4 by dword-aligned register index (see `INT2_REG_COUNT`'s
-    /// doc comment). Callers (hpc3.rs) only reach this when `!guinness`.
-    pub fn int2_read8(&self, idx: u32) -> BusRead8 {
+    /// Fullhouse-only: read one of the compact INT2 registers. `rel` is the
+    /// address relative to `IOC_INT2_BASE` — called only from `read8`'s
+    /// INT2-window branch, which is what hpc3.rs actually reaches through
+    /// the normal `BusDevice` `read8`/`write8`/`read32`/`write32` methods
+    /// (see `INT2_REG_COUNT`'s doc comment for the index layout).
+    fn int2_read8(&self, rel: u32) -> BusRead8 {
+        let idx = (rel >> 2) & 0xF;
         if idx >= INT2_PIT_BASE_IDX {
             return self.pit.read(idx - INT2_PIT_BASE_IDX);
         }
@@ -727,13 +999,16 @@ impl Ioc {
             4 => { dlog_dev!(LogModule::Ioc, "INT2: rd MAP_STAT → {:#04x}", state.map_stat); state.map_stat }
             5 => { dlog_dev!(LogModule::Ioc, "INT2: rd MAP_MASK0 → {:#04x}", state.map_mask0); state.map_mask0 }
             6 => { dlog_dev!(LogModule::Ioc, "INT2: rd MAP_MASK1 → {:#04x}", state.map_mask1); state.map_mask1 }
-            _ => 0, // 7, 9-11: unused (int2_map has no register there); 8 (tmr_clr) is write-only
+            7 => { dlog_dev!(LogModule::Ioc, "INT2: rd PORT_CONFIG → {:#04x}", state.port_config); state.port_config }
+            _ => 0, // 9-11: unused; 8 (tmr_clr) is write-only
         };
         BusRead8::ok(val)
     }
 
-    /// Fullhouse-only: write one of the compact INT2 registers. See `int2_read8`.
-    pub fn int2_write8(&self, idx: u32, val: u8) -> u32 {
+    /// Fullhouse-only: write one of the compact INT2 registers. `rel` is
+    /// relative to `IOC_INT2_BASE` — see `int2_read8`.
+    fn int2_write8(&self, rel: u32, val: u8) -> u32 {
+        let idx = (rel >> 2) & 0xF;
         if idx >= INT2_PIT_BASE_IDX {
             return self.pit.write(idx - INT2_PIT_BASE_IDX, val);
         }
@@ -743,6 +1018,18 @@ impl Ioc {
             3 => { dlog_dev!(LogModule::Ioc, "INT2: L1_MASK  = {:#04x}", val); state.l1_mask = val; }
             5 => { dlog_dev!(LogModule::Ioc, "INT2: MAP_MASK0 = {:#04x}", val); state.map_mask0 = val; }
             6 => { dlog_dev!(LogModule::Ioc, "INT2: MAP_MASK1 = {:#04x}", val); state.map_mask1 = val; }
+            7 => {
+                dlog_dev!(LogModule::Ioc, "INT2: PORT_CONFIG = {:#04x}", val);
+                // CLR_SG_RETRACE_N / CLR_S0_RETRACE_N are active-low strobes: a
+                // 0 bit clears the shared LIO_GIO_2/VERTICAL_RETRACE latch (one
+                // physical retrace line fanned out to both GFX and EXP0 slots
+                // via ip22_gio2_intr's EXTIO dispatch — see IP22.h's PCON_*).
+                if val & (pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N)
+                    != (pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N) {
+                    state.l1_stat &= !l1_regs::VERTICAL_RETRACE;
+                }
+                state.port_config = val;
+            }
             idx if idx == INT2_TMR_CLR_IDX => {
                 dlog_dev!(LogModule::Ioc, "INT2: Timer Clear val {:02x}", val);
                 state.map_stat &= !(val & 0x3);
@@ -752,6 +1039,7 @@ impl Ioc {
         state.update_interrupts();
         BUS_OK
     }
+
 }
 
 impl IocState {
@@ -837,6 +1125,8 @@ impl Resettable for Ioc {
         state.map_mask1 = 0;
         state.map_pol = 0;
         state.err_stat = 0;
+        state.port_config = 0;
+        state.ext_io = ext_io_regs::IDLE; // active-low: all-1s = nothing pending
         state.gc_select = 0;
         state.gen_cntl = 0;
         state.panel = 1;        // power-on: power state bit = 1
@@ -860,6 +1150,7 @@ impl Saveable for Ioc {
         macro_rules! u8f { ($f:ident) => { tbl.insert(stringify!($f).into(), hex_u8(state.$f)); } }
         u8f!(l0_stat); u8f!(l0_mask); u8f!(l1_stat); u8f!(l1_mask);
         u8f!(map_stat); u8f!(map_mask0); u8f!(map_mask1); u8f!(map_pol); u8f!(err_stat);
+        u8f!(port_config);
         u8f!(gc_select);
         u8f!(gen_cntl); u8f!(panel); u8f!(read_reg);
         u8f!(dma_sel); u8f!(reset_reg); u8f!(write_reg);
@@ -873,6 +1164,7 @@ impl Saveable for Ioc {
         }}
         ldu8!(l0_stat); ldu8!(l0_mask); ldu8!(l1_stat); ldu8!(l1_mask);
         ldu8!(map_stat); ldu8!(map_mask0); ldu8!(map_mask1); ldu8!(map_pol); ldu8!(err_stat);
+        ldu8!(port_config);
         ldu8!(gc_select);
         ldu8!(gen_cntl); ldu8!(panel); ldu8!(read_reg);
         ldu8!(dma_sel); ldu8!(reset_reg); ldu8!(write_reg);

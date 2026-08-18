@@ -28,7 +28,7 @@ use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter
 use crate::gdb_stub::CpuDebug;
 use crate::mips_cache_v2::R4000Cache;
 use crate::hpc3::Hpc3;
-use crate::ioc::Ioc;
+use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
 use crate::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
@@ -484,29 +484,14 @@ impl Machine {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
-                // Vertical retrace → L1 VERTICAL_RETRACE, same bit on both profiles
-                // (see ioc.rs's IocInterrupt::VerticalRetrace doc comment).
-                // GfxDrain0/1 are MAP FIFO-drain feedback — not vblank.
-                ioc_clone.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, active);
+                ioc_clone.set_interrupt(wiring.retrace, active);
             }));
             let ioc_ff = ioc.clone();
             r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(crate::ioc::IocInterrupt::FifoFull, active);
-            }));
-            let ioc_gfx = ioc.clone();
-            r.set_graphics_callback(Arc::new(move |active| {
-                ioc_gfx.set_interrupt(crate::ioc::IocInterrupt::Graphics, active);
-            }));
-            let ioc_drain = ioc.clone();
-            r.set_gfx_drain_callback(Arc::new(move |active| {
-                if guinness {
-                    // Indy integrated Newport: drain feedback unused on MAP (guinness).
-                    let _ = active;
-                } else {
-                    ioc_drain.set_interrupt(crate::ioc::IocInterrupt::GfxDrain0, active);
-                }
+                ioc_ff.set_interrupt(wiring.fifo_full, active);
             }));
             Some(r)
         };
@@ -515,22 +500,14 @@ impl Machine {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat, fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
-                if guinness {
-                    ioc_clone.set_interrupt(crate::ioc::IocInterrupt::GioExp1, active);
-                } else {
-                    // Second Newport @ GIO slot 1: shares the L1 VERTICAL_RETRACE bit.
-                    ioc_clone.set_interrupt(crate::ioc::IocInterrupt::GioExp0Retrace, active);
-                }
+                ioc_clone.set_interrupt(wiring.retrace, active);
             }));
             let ioc_ff = ioc.clone();
             r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(crate::ioc::IocInterrupt::FifoFull, active);
-            }));
-            let ioc_gfx = ioc.clone();
-            r.set_graphics_callback(Arc::new(move |active| {
-                ioc_gfx.set_interrupt(crate::ioc::IocInterrupt::Graphics, active);
+                ioc_ff.set_interrupt(wiring.fifo_full, active);
             }));
             Some(r)
         };

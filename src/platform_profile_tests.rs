@@ -115,18 +115,6 @@ mod tests {
     }
 
     #[test]
-    fn fullhouse_gfx_drain_does_not_assert_l1_vblank() {
-        let ioc = Ioc::new_ci(false);
-        ioc.set_interrupt(crate::ioc::IocInterrupt::GfxDrain0, true);
-        let l1 = ioc.read32(IOC_BASE + IOC_INT3_L1_STAT).data as u8;
-        assert_eq!(
-            l1 & l1_regs::VERTICAL_RETRACE,
-            0,
-            "MAP GFX_DRAIN0 must not masquerade as vertical retrace"
-        );
-    }
-
-    #[test]
     fn ioc_fullhouse_gc_select_read_write() {
         let ioc = Ioc::new_ci(false);
         let gc = IOC_BASE + crate::ioc::IOC_GC_SELECT;
