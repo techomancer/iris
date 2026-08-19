@@ -10,10 +10,14 @@
 
 DECLARE_GROUP(group_identity);
 DECLARE_GROUP(group_alu);
+DECLARE_GROUP(group_muldiv);
+DECLARE_GROUP(group_mem);
 
 const struct test_group *const all_groups[] = {
     &group_identity,
     &group_alu,
+    &group_muldiv,
+    &group_mem,
 };
 
 const unsigned n_groups = sizeof(all_groups) / sizeof(all_groups[0]);

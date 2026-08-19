@@ -23,7 +23,7 @@ static void t_addu_sign_extends(void)
     u32 a = OPAQUE(0x7FFFFFFFu), b = OPAQUE(1u);
     /* 0x7fffffff + 1 = 0x80000000: bit 31 set, so the 64-bit register must
      * read 0xffffffff80000000, not 0x0000000080000000. */
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "addu %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0xFFFFFFFF80000000ull);
@@ -33,7 +33,7 @@ static void t_addiu_sign_extends(void)
 {
     u64 r;
     u32 a = OPAQUE(0x7FFFFFFFu);
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "addiu %0, %1, 1\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0xFFFFFFFF80000000ull);
@@ -44,7 +44,7 @@ static void t_subu_sign_extends(void)
     u64 r;
     u32 a = OPAQUE(0u), b = OPAQUE(0x80000000u);
     /* 0 - 0x80000000 = 0x80000000 in 32 bits — again bit 31 set. */
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "subu %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0xFFFFFFFF80000000ull);
@@ -54,7 +54,7 @@ static void t_sll_sign_extends(void)
 {
     u64 r;
     u32 a = OPAQUE(1u);
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "sll %0, %1, 31\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0xFFFFFFFF80000000ull);
@@ -67,7 +67,7 @@ static void t_srl_uses_low32(void)
 {
     u64 r;
     u64 a = OPAQUE(0xFFFFFFFF80000000ull);
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "srl %0, %1, 4\n\t.set pop"
                          : "=r"(r) : "r"(a));
     /* low 32 = 0x80000000, >> 4 = 0x08000000, bit 31 clear → zero-extended. */
@@ -78,7 +78,7 @@ static void t_sra_uses_low32(void)
 {
     u64 r;
     u64 a = OPAQUE(0xFFFFFFFF80000000ull);
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "sra %0, %1, 4\n\t.set pop"
                          : "=r"(r) : "r"(a));
     /* 0x80000000 >>a 4 = 0xf8000000, bit 31 set → sign-extended. */
@@ -91,13 +91,13 @@ static void t_variable_shift_masks_to_5_bits(void)
     u64 r;
     u32 a = OPAQUE(0x00000001u);
     u32 s = OPAQUE(33u);              /* 33 & 31 == 1 */
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "sllv %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(s));
     CHECK_EQ(r, 2ull);
 
     s = OPAQUE(64u);                  /* 64 & 31 == 0: no shift */
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "sllv %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(s));
     CHECK_EQ(r, 1ull);
@@ -108,16 +108,16 @@ static void t_variable_shift_masks_to_5_bits(void)
 static void t_dsll_dsrl_dsra(void)
 {
     u64 r, a = OPAQUE(1ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tdsll %0, %1, 31\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsll %0, %1, 31\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x0000000080000000ull);   /* no sign extension: it is 64-bit */
 
     a = OPAQUE(0x8000000000000000ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tdsrl %0, %1, 4\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsrl %0, %1, 4\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x0800000000000000ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tdsra %0, %1, 4\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsra %0, %1, 4\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0xF800000000000000ull);
 }
@@ -127,20 +127,20 @@ static void t_dsll_dsrl_dsra(void)
 static void t_dshift32_variants(void)
 {
     u64 r, a = OPAQUE(1ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tdsll32 %0, %1, 0\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsll32 %0, %1, 0\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x0000000100000000ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tdsll32 %0, %1, 31\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsll32 %0, %1, 31\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x8000000000000000ull);
 
     a = OPAQUE(0x8000000000000000ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tdsrl32 %0, %1, 0\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsrl32 %0, %1, 0\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x0000000080000000ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tdsra32 %0, %1, 0\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsra32 %0, %1, 0\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0xFFFFFFFF80000000ull);
 }
@@ -149,7 +149,7 @@ static void t_dsllv_masks_to_6_bits(void)
 {
     u64 r, a = OPAQUE(1ull);
     u32 s = OPAQUE(65u);              /* 65 & 63 == 1 */
-    __asm__ __volatile__(".set push; .set mips3\n\tdsllv %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdsllv %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(s));
     CHECK_EQ(r, 2ull);
 }
@@ -162,7 +162,7 @@ static void t_add_overflow_traps(void)
     u32 a = OPAQUE(0x7FFFFFFFu), b = OPAQUE(1u);
 
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "add %0, %1, %2\n\t.set pop"
                          : "+r"(r) : "r"(a), "r"(b));
     CHECK_EXC(EXC_OV);
@@ -176,7 +176,7 @@ static void t_addu_does_not_trap(void)
     u64 r;
     u32 a = OPAQUE(0x7FFFFFFFu), b = OPAQUE(1u);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "addu %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_NO_EXC();
@@ -188,7 +188,7 @@ static void t_addi_overflow_traps(void)
     u64 r = OPAQUE(0x1234ull);
     u32 a = OPAQUE(0x7FFFFFFFu);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "addi %0, %1, 1\n\t.set pop"
                          : "+r"(r) : "r"(a));
     CHECK_EXC(EXC_OV);
@@ -202,7 +202,7 @@ static void t_add_overflow_negative_side(void)
     u64 r = OPAQUE(7ull);
     u32 a = OPAQUE(0x80000000u), b = OPAQUE(0x80000000u);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "add %0, %1, %2\n\t.set pop"
                          : "+r"(r) : "r"(a), "r"(b));
     CHECK_EXC(EXC_OV);
@@ -216,7 +216,7 @@ static void t_add_no_overflow_on_mixed_signs(void)
     u64 r;
     u32 a = OPAQUE(0x80000000u), b = OPAQUE(0x7FFFFFFFu);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "add %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_NO_EXC();
@@ -228,7 +228,7 @@ static void t_sub_overflow_traps(void)
     u64 r = OPAQUE(0x99ull);
     u32 a = OPAQUE(0x80000000u), b = OPAQUE(1u);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "sub %0, %1, %2\n\t.set pop"
                          : "+r"(r) : "r"(a), "r"(b));
     CHECK_EXC(EXC_OV);
@@ -240,7 +240,7 @@ static void t_dadd_overflow_traps(void)
     u64 r = OPAQUE(0x55ull);
     u64 a = OPAQUE(0x7FFFFFFFFFFFFFFFull), b = OPAQUE(1ull);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "dadd %0, %1, %2\n\t.set pop"
                          : "+r"(r) : "r"(a), "r"(b));
     CHECK_EXC(EXC_OV);
@@ -254,7 +254,7 @@ static void t_dadd_no_overflow_at_32bit_boundary(void)
     u64 r;
     u64 a = OPAQUE(0x000000007FFFFFFFull), b = OPAQUE(1ull);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "dadd %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_NO_EXC();
@@ -266,7 +266,7 @@ static void t_daddu_does_not_trap(void)
     u64 r;
     u64 a = OPAQUE(0x7FFFFFFFFFFFFFFFull), b = OPAQUE(1ull);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "daddu %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_NO_EXC();
@@ -278,7 +278,7 @@ static void t_dsub_overflow_traps(void)
     u64 r = OPAQUE(0x11ull);
     u64 a = OPAQUE(0x8000000000000000ull), b = OPAQUE(1ull);
     exc_clear();
-    __asm__ __volatile__(".set push; .set mips3\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                          "dsub %0, %1, %2\n\t.set pop"
                          : "+r"(r) : "r"(a), "r"(b));
     CHECK_EXC(EXC_OV);
@@ -292,19 +292,19 @@ static void t_logical_ops_are_64bit(void)
     u64 r;
     u64 a = OPAQUE(0xF0F0F0F0F0F0F0F0ull), b = OPAQUE(0xFF00FF00FF00FF00ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tand %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tand %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0xF000F000F000F000ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tor %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tor %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0xFFF0FFF0FFF0FFF0ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\txor %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\txor %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0x0FF00FF00FF00FF0ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tnor %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tnor %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0x000F000F000F000Full);
 }
@@ -316,16 +316,16 @@ static void t_immediate_logic_zero_extends(void)
     u64 r;
     u64 a = OPAQUE(0xFFFFFFFFFFFFFFFFull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tandi %0, %1, 0xFFFF\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tandi %0, %1, 0xFFFF\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x000000000000FFFFull);
 
     a = OPAQUE(0ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tori %0, %1, 0xFFFF\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tori %0, %1, 0xFFFF\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x000000000000FFFFull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\txori %0, %1, 0x8000\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\txori %0, %1, 0x8000\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0x0000000000008000ull);
 }
@@ -336,7 +336,7 @@ static void t_addiu_immediate_sign_extends(void)
     u64 a = OPAQUE(0ull);
     /* -1 as a 16-bit immediate, sign-extended to 32, then the 32-bit result
      * sign-extended to 64. */
-    __asm__ __volatile__(".set push; .set mips3\n\taddiu %0, %1, -1\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\taddiu %0, %1, -1\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0xFFFFFFFFFFFFFFFFull);
 }
@@ -345,7 +345,7 @@ static void t_daddiu_immediate_sign_extends(void)
 {
     u64 r;
     u64 a = OPAQUE(0ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tdaddiu %0, %1, -1\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tdaddiu %0, %1, -1\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0xFFFFFFFFFFFFFFFFull);
 }
@@ -355,11 +355,11 @@ static void t_daddiu_immediate_sign_extends(void)
 static void t_lui_sign_extends(void)
 {
     u64 r;
-    __asm__ __volatile__(".set push; .set mips3\n\tlui %0, 0x8000\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tlui %0, 0x8000\n\t.set pop"
                          : "=r"(r));
     CHECK_EQ(r, 0xFFFFFFFF80000000ull);
 
-    __asm__ __volatile__(".set push; .set mips3\n\tlui %0, 0x7FFF\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tlui %0, 0x7FFF\n\t.set pop"
                          : "=r"(r));
     CHECK_EQ(r, 0x000000007FFF0000ull);
 }
@@ -371,10 +371,10 @@ static void t_slt_is_signed_64bit(void)
     u64 r;
     u64 a = OPAQUE(0xFFFFFFFFFFFFFFFFull);   /* -1 */
     u64 b = OPAQUE(1ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tslt %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tslt %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 1ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tslt %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tslt %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(b), "r"(a));
     CHECK_EQ(r, 0ull);
 }
@@ -384,10 +384,10 @@ static void t_sltu_is_unsigned_64bit(void)
     u64 r;
     u64 a = OPAQUE(0xFFFFFFFFFFFFFFFFull);
     u64 b = OPAQUE(1ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tsltu %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tsltu %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(a), "r"(b));
     CHECK_EQ(r, 0ull);               /* 0xffff... is huge, not -1 */
-    __asm__ __volatile__(".set push; .set mips3\n\tsltu %0, %1, %2\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tsltu %0, %1, %2\n\t.set pop"
                          : "=r"(r) : "r"(b), "r"(a));
     CHECK_EQ(r, 1ull);
 }
@@ -398,12 +398,12 @@ static void t_sltiu_sign_extends_then_compares_unsigned(void)
 {
     u64 r;
     u64 a = OPAQUE(1ull);
-    __asm__ __volatile__(".set push; .set mips3\n\tsltiu %0, %1, -1\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tsltiu %0, %1, -1\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 1ull);
 
     a = OPAQUE(0xFFFFFFFFFFFFFFFFull);
-    __asm__ __volatile__(".set push; .set mips3\n\tsltiu %0, %1, -1\n\t.set pop"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tsltiu %0, %1, -1\n\t.set pop"
                          : "=r"(r) : "r"(a));
     CHECK_EQ(r, 0ull);               /* equal, not less */
 }
@@ -413,9 +413,9 @@ static void t_sltiu_sign_extends_then_compares_unsigned(void)
 static void t_zero_register_stays_zero(void)
 {
     u64 r;
-    __asm__ __volatile__(".set push; .set mips3; .set noat\n\t"
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat; .set noat\n\t"
                          "daddiu $zero, $zero, 1234\n\t"
-                         "move %0, $zero\n\t"
+                         "daddu %0, $zero, $zero\n\t"
                          ".set pop" : "=r"(r));
     CHECK_EQ(r, 0ull);
 }
