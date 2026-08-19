@@ -612,15 +612,17 @@ impl Wd33c93a {
         state.devices.iter().flatten().filter(|d| d.pending_chd_sync().is_some()).count()
     }
 
-    /// Fold every pending CHD diff back into its base ("sync"), preserving the
-    /// base's compression. Releases each disk backend first (closing the CHD),
-    /// then rebuilds outside the device lock since recompression is slow.
+    /// Fold pending CHD diffs back into their bases ("sync"), preserving the
+    /// base's compression. `only` limits it to one SCSI id; `None` means all.
+    /// Releases each disk backend first (closing the CHD), then rebuilds
+    /// outside the device lock since recompression is slow.
     /// `progress(done, total, fraction)` reports per-disk progress; `cancel()`
     /// stops before the next disk (the in-flight rebuild also honours it),
     /// leaving every un-synced base+diff intact. Returns the count synced.
     #[cfg(feature = "chd")]
     pub fn sync_chd_disks(
         &self,
+        only: Option<usize>,
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
@@ -631,6 +633,7 @@ impl Wd33c93a {
             let mut state = self.state.lock();
             let mut v = Vec::new();
             for id in 0..8 {
+                if only.is_some_and(|o| o != id) { continue; }
                 if let Some(dev) = &mut state.devices[id] {
                     if let Some(pair) = dev.take_pending_chd_sync() {
                         v.push(pair);
@@ -656,6 +659,7 @@ impl Wd33c93a {
     #[cfg(not(feature = "chd"))]
     pub fn sync_chd_disks(
         &self,
+        _only: Option<usize>,
         _progress: &mut dyn FnMut(usize, usize, f32),
         _cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {

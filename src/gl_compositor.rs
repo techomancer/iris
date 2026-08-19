@@ -21,7 +21,7 @@ void main() {
 ";
 
 // Lookup tables (cmap/ramdac/xmap) are 2D textures with height=1 since
-// glow 0.13 does not expose tex_sub_image_1d. Use texelFetch(..., ivec2(addr, 0), 0).
+// glow does not expose tex_sub_image_1d. Use texelFetch(..., ivec2(addr, 0), 0).
 const FRAG_SRC: &str = "
 #version 150
 
@@ -268,7 +268,7 @@ impl GlCompositor {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::R32UI as i32, w, h, 0,
-                glow::RED_INTEGER, glow::UNSIGNED_INT, None);
+                glow::RED_INTEGER, glow::UNSIGNED_INT, glow::PixelUnpackData::Slice(None));
             t
         }
     }
@@ -282,7 +282,7 @@ impl GlCompositor {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::R8UI as i32, w, h, 0,
-                glow::RED_INTEGER, glow::UNSIGNED_BYTE, None);
+                glow::RED_INTEGER, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             t
         }
     }
@@ -303,7 +303,7 @@ impl GlCompositor {
             self.tex_aux    = Some(Self::make_2d_tex_r32ui(gl, FB_W, FB_H));
             self.tex_did    = Some(Self::make_2d_tex_r8ui (gl, FB_W, FB_H));
             self.tex_cursor = Some(Self::make_2d_tex_r8ui (gl, CURSOR_TEX_SIZE, CURSOR_TEX_SIZE));
-            // Lookup tables: height=1, width=N (since tex_sub_image_1d is not in glow 0.13)
+            // Lookup tables: height=1, width=N (since tex_sub_image_1d is not in glow)
             self.tex_cmap   = Some(Self::make_2d_tex_r32ui(gl, 8192, 1));
             self.tex_ramdac = Some(Self::make_2d_tex_r32ui(gl, 256,  1));
             self.tex_xmap   = Some(Self::make_2d_tex_r32ui(gl, 32,   1));
@@ -314,7 +314,7 @@ impl GlCompositor {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                FB_W, FB_H, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
+                FB_W, FB_H, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             self.tex_out = Some(tex_out);
 
             let fbo = gl.create_framebuffer().unwrap();
@@ -342,7 +342,7 @@ impl GlCompositor {
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D, 0, 0, 0, w, h,
                 glow::RED_INTEGER, glow::UNSIGNED_INT,
-                glow::PixelUnpackData::Slice(bytes),
+                glow::PixelUnpackData::Slice(Some(bytes)),
             );
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         }
@@ -355,7 +355,7 @@ impl GlCompositor {
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D, 0, 0, 0, w, h,
                 glow::RED_INTEGER, glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(data),
+                glow::PixelUnpackData::Slice(Some(data)),
             );
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         }
@@ -368,7 +368,7 @@ impl GlCompositor {
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D, 0, 0, 0, data.len() as i32, 1,
                 glow::RED_INTEGER, glow::UNSIGNED_INT,
-                glow::PixelUnpackData::Slice(bytes),
+                glow::PixelUnpackData::Slice(Some(bytes)),
             );
         }
     }
@@ -505,7 +505,7 @@ impl Compositor for GlCompositor {
                         glow::TEXTURE_2D, 0, 0, 0,
                         CURSOR_TEX_SIZE, CURSOR_TEX_SIZE,
                         glow::RED_INTEGER, glow::UNSIGNED_BYTE,
-                        glow::PixelUnpackData::Slice(&glyph),
+                        glow::PixelUnpackData::Slice(Some(&glyph)),
                     );
                 }
                 self.last_cursor_hash = ch;
@@ -630,7 +630,7 @@ impl Compositor for GlCompositor {
                     height as i32,
                     glow::RGBA,
                     glow::UNSIGNED_BYTE,
-                    glow::PixelPackData::Slice(&mut tight),
+                    glow::PixelPackData::Slice(Some(&mut tight)),
                 );
                 if pbo_guard.is_none() {
                     if let Ok(pbo) = gl.create_buffer() {

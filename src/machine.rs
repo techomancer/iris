@@ -1091,16 +1091,18 @@ impl Machine {
         self.hpc3.scsi().pending_chd_sync_count()
     }
 
-    /// Fold every pending CHD diff back into its base, preserving compression.
+    /// Fold pending CHD diffs back into their bases, preserving compression.
+    /// `only` limits it to one SCSI id; `None` means all.
     /// Call only after the guest has stopped (so disk I/O is quiesced).
     /// `progress(done, total, fraction)` drives a UI; `cancel()` aborts cleanly,
     /// leaving un-synced bases+diffs intact. Returns the count synced.
     pub fn sync_chd_disks(
         &self,
+        only: Option<usize>,
         progress: &mut dyn FnMut(usize, usize, f32),
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
-        self.hpc3.scsi().sync_chd_disks(progress, cancel)
+        self.hpc3.scsi().sync_chd_disks(only, progress, cancel)
     }
 
     /// Cumulative count of guest-originated Ethernet frames the NAT engine has

@@ -559,7 +559,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 }
             } else if ui.button("Attach…").clicked() {
                 cfg.scsi.insert(id, ScsiDeviceConfig {
-                    path: format!("scsi{id}.raw"),
+                    path: crate::settings::GuiSettings::default_disk_path(id),
                     ..Default::default()
                 });
             }
@@ -1017,6 +1017,20 @@ fn show_network(
             .clicked()
         {
             add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2121, guest_port: 21, bind: ForwardBind::Localhost });
+            ui.close();
+        }
+        if ui.add_enabled(!has_port(22), egui::Button::new("SSH (host 2222 to guest 22)"))
+            .on_hover_text("Log in with: ssh -p 2222 user@localhost. IRIX ships no sshd — install OpenSSH in the guest first.")
+            .clicked()
+        {
+            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 2222, guest_port: 22, bind: ForwardBind::Localhost });
+            ui.close();
+        }
+        if ui.add_enabled(!has_port(5900), egui::Button::new("VNC (host 5901 to guest 5900)"))
+            .on_hover_text("Reach a VNC server on the guest's display :0. Host side is 5901 because macOS Screen Sharing already owns 5900.")
+            .clicked()
+        {
+            add = Some(PortForwardConfig { proto: ForwardProto::Tcp, host_port: 5901, guest_port: 5900, bind: ForwardBind::Localhost });
             ui.close();
         }
         if ui.add_enabled(!has_port(177), egui::Button::new("XDMCP (host 11177 to guest 177, UDP)"))
@@ -1683,18 +1697,13 @@ fn path_row(
             out.changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
             if ui.button("📁").on_hover_text("Browse…").clicked() {
                 let mut d = rfd::FileDialog::new();
-                // Start the dialog in the existing path's directory if any.
-                if !value.is_empty() {
-                    let p = Path::new(value);
-                    if let Some(parent) = p.parent() {
-                        if parent.as_os_str().len() > 0 && parent.exists() {
-                            d = d.set_directory(parent);
-                        }
-                    }
-                    if let Some(name) = p.file_name() {
-                        d = d.set_file_name(name.to_string_lossy());
-                    }
-                }
+                // Start in the existing path's folder, else the managed disks dir.
+                let p = Path::new(value.as_str());
+                let dir = p.parent().filter(|d| !d.as_os_str().is_empty() && d.is_dir())
+                    .map(|d| d.to_path_buf())
+                    .or_else(|| crate::settings::GuiSettings::disks_dir().filter(|d| d.is_dir()));
+                if let Some(dir) = dir { d = d.set_directory(dir); }
+                if let Some(name) = p.file_name() { d = d.set_file_name(name.to_string_lossy()); }
                 if matches!(mode, Pick::OpenFile | Pick::SaveFile) {
                     for (label, exts) in filters {
                         d = d.add_filter(*label, exts);

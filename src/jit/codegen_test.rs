@@ -107,6 +107,7 @@ mod tests {
         let mem = Arc::new(MockMemory::new());
         let bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
+        #[cfg_attr(not(feature = "jitv2"), allow(unused_mut))] // only the jitv2 block below mutates it
         let mut exec = MipsExecutor::new(bus, PassthroughTlb::default(), &cfg);
         // This file predates jitv2 and never calls `install_jit_hooks` — a
         // jitv2 dispatch gate variant that intercepted a dispatch here would

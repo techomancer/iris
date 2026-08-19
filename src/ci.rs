@@ -252,7 +252,7 @@ fn handle_client_tcp(server: Arc<CiServer>, stream: TcpStream) {
 fn dispatch(server: &CiServer, req: &Request) -> Response {
     match req.cmd.as_str() {
         "ping" => Response::ok(),
-        "quit" => cmd_quit(),
+        "quit" => cmd_quit(server, &req.args),
         "start" => cmd_start(server),
         "save" => cmd_save(server, &req.args),
         "restore" => cmd_restore(server, &req.args),
@@ -277,6 +277,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "rtc-save"      => cmd_rtc_save(server, &req.args),
         "cdrom-eject"   => cmd_cdrom_eject(server, &req.args),
         "cdrom-load"    => cmd_cdrom_load(server, &req.args),
+        "chd-sync"      => cmd_chd_sync(server, &req.args),
         other => Response::err(format!("unknown command: {}", other)),
     }
 }
@@ -326,7 +327,53 @@ fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
     }
 }
 
-fn cmd_quit() -> Response {
+/// Parse a SCSI target selector: absent, null or "all" mean every disk.
+fn scsi_selector(v: Option<&Value>) -> Result<Option<usize>, String> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) if v.as_str() == Some("all") => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n < 8 => Ok(Some(n as usize)),
+            _ => Err(format!("bad scsi id {v} (expected 0-7 or \"all\")")),
+        },
+    }
+}
+
+/// Fold pending CHD diffs into their bases. The guest must be stopped: folding
+/// releases the disk backend, so a running IRIX would lose the drive mid-flight.
+fn cmd_chd_sync(server: &CiServer, args: &Value) -> Response {
+    let only = match scsi_selector(args.get("id")) {
+        Ok(v) => v,
+        Err(e) => return Response::err(e),
+    };
+    if server.with_machine(|m| m.cpu_is_running()) {
+        return Response::err("CPU is running — stop the guest first \
+                              (folding releases the disk backend)");
+    }
+    match server.with_machine(|m| m.sync_chd_disks(only, &mut |_, _, _| {}, &|| false)) {
+        Ok(n) => Response::data(serde_json::json!({ "synced": n })),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
+fn cmd_quit(server: &CiServer, args: &Value) -> Response {
+    // `sync_chd` present => fold before exiting. Stop the machine first so the
+    // fold is quiesced, mirroring the GUI's "Synchronizing disks…" exit step.
+    let mut synced = serde_json::Value::Null;
+    if args.get("sync_chd").is_some() {
+        let only = match scsi_selector(args.get("sync_chd")) {
+            Ok(v) => v,
+            Err(e) => return Response::err(e),
+        };
+        let r = server.with_machine(|m| {
+            m.stop();
+            m.sync_chd_disks(only, &mut |_, _, _| {}, &|| false)
+        });
+        match r {
+            Ok(n) => synced = serde_json::json!(n),
+            Err(e) => return Response::err(format!("chd sync failed: {e}")),
+        }
+    }
     // Schedule process exit after a brief delay so the response flushes.
     thread::spawn(|| {
         thread::sleep(Duration::from_millis(50));
@@ -340,7 +387,7 @@ fn cmd_quit() -> Response {
             std::process::exit(0);
         }
     });
-    Response::ok()
+    Response::data(serde_json::json!({ "synced": synced }))
 }
 
 fn cmd_start(server: &CiServer) -> Response {
