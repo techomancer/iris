@@ -1059,6 +1059,7 @@ impl Hpc3 {
         let net_mode = net.mode;
         let pcap_interface = net.pcap_interface;
         let nfs_pcap_ip = net.nfs_pcap_ip;
+        let tftp_dir = net.tftp_dir.clone();
         let rtc = Arc::new(Ds1x86::new(8192, nvram_path));
         let pdma_dump = Arc::new(AtomicU32::new(0));
         
@@ -1139,6 +1140,7 @@ impl Hpc3 {
             mode:       net_mode,
             pcap_interface,
             nfs_pcap_ip,
+            tftp_dir,
             ..GatewayConfig::default()
         };
         let net_base = gateway_cfg.clone();

@@ -77,6 +77,8 @@ pub mod locks;
 pub mod pit8254;
 pub mod net;
 pub mod nfsudp;
+pub mod tftp;
+pub mod testdev;
 pub mod xdmcp;
 #[cfg(feature = "pcap")]
 pub mod net_pcap;
