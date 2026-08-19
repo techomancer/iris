@@ -1,0 +1,20 @@
+# Minimal machine for bare-metal CPU tests: RAM, no disks, no graphics.
+#
+# The suite touches nothing but RAM, the SCC, and the test device, so every
+# SCSI target is left unconfigured — attaching disks would only add failure
+# modes (a missing scsi1.raw is fatal at startup).
+#
+# 128 MB in two banks. The suite links at 0x80200000 and its scratch area ends
+# well under 8 MB, so this is far more than it needs.
+
+banks = [128, 128, 0, 0]
+headless = true
+no_audio = true
+
+[machine]
+profile = "indy_ip24"
+
+# No SCSI at all. The `scsi` key must be present-but-empty: when it is
+# missing entirely, serde falls back to default_scsi(), which attaches
+# scsi1.raw and cdrom4.iso and makes startup fatal if they are absent.
+[scsi]
