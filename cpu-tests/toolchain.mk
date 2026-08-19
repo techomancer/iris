@@ -6,14 +6,27 @@
 # Search order:
 #   1. $CROSS if set
 #   2. mips-linux-gnu- on PATH (Debian/Ubuntu: gcc-mips-linux-gnu)
-#   3. ~/.local/opt/mips-linux-gnu — a rootless `dpkg -x` install, which is
+#   3. mips-unknown-linux-gnu- on PATH (Gentoo crossdev, 32-bit target)
+#   4. mips64-unknown-linux-gnu- on PATH (Gentoo crossdev, 64-bit target —
+#      still produces n32/o32 output via ARCHFLAGS, since -mabi is explicit)
+#   5. ~/.local/opt/mips-linux-gnu — a rootless `dpkg -x` install, which is
 #      what an unattended session without sudo ends up with. See docs/toolchain.md.
+#
+# A candidate is accepted only if `$(name)gcc --version` actually runs — a
+# broken/dangling shim on PATH (crossdev leaves these behind sometimes) must
+# not shadow a working toolchain further down the list.
 
 LOCAL_TC := $(HOME)/.local/opt/mips-linux-gnu
 
+cc_works = $(shell $(1)gcc --version >/dev/null 2>&1 && echo yes)
+
 ifeq ($(origin CROSS), undefined)
-  ifneq ($(shell command -v mips-linux-gnu-gcc 2>/dev/null),)
+  ifeq ($(call cc_works,mips-linux-gnu-),yes)
     CROSS := mips-linux-gnu-
+  else ifeq ($(call cc_works,mips-unknown-linux-gnu-),yes)
+    CROSS := mips-unknown-linux-gnu-
+  else ifeq ($(call cc_works,mips64-unknown-linux-gnu-),yes)
+    CROSS := mips64-unknown-linux-gnu-
   else ifneq ($(wildcard $(LOCAL_TC)/usr/bin/mips-linux-gnu-gcc),)
     CROSS := $(LOCAL_TC)/usr/bin/mips-linux-gnu-
     # binutils from the .deb links against its own libbfd/libopcodes.
@@ -35,6 +48,7 @@ toolchain-check:
 	@command -v $(CC) >/dev/null 2>&1 || { \
 	  echo "error: $(CC) not found."; \
 	  echo "  Debian/Ubuntu:  sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu"; \
+	  echo "  Gentoo:         crossdev --target mips64-unknown-linux-gnu"; \
 	  echo "  No root:        make -C cpu-tests toolchain-local"; \
 	  exit 1; }
 	@echo "toolchain: $$($(CC) --version | head -1)"
