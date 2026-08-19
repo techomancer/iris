@@ -42,11 +42,26 @@ way: `(d.raw >> 8) & 0x7`.
 bits 10:6 are always zero, where `sa & 0x7` and `sa >> 2` agree. So the bug is
 invisible to R4400 code and to every MIPS III binary — including all of IRIX —
 and bites only MIPS IV code that actually uses a condition code other than 0.
-IRIS's own unit test `test_fpu_cc1_7_visible_via_fcsr_readback` did not catch it
-because it calls `set_fpu_cc()` directly rather than executing a `c.cond.fmt`
-with a non-zero `cc`.
+**Why the existing tests did not catch it.** Two reasons, and the second is the
+interesting one:
 
-This is the case the whole R4400-vs-R5000 axis exists for.
+- `test_fpu_cc1_7_visible_via_fcsr_readback` calls `set_fpu_cc()` directly
+  rather than executing a `c.cond.fmt`, so it never exercised the field being
+  decoded.
+- `test_fpu_multi_cc_compare_and_branch` *does* execute the instruction — but
+  its `make_compare_s` helper encoded `cc` as `(cc << 6)`, putting it at the
+  bottom of the 5-bit `sa` field instead of at bits 10:8. That is the **same
+  off-by-two**, and it cancelled the executor's. The test passed because both
+  halves were wrong in the same direction, and it started failing the moment
+  the executor was fixed. Its own comment said "cc in fd field [10:8]" all
+  along.
+
+The helper is fixed too. This is the failure mode a hand-written encoder cannot
+catch on its own: only running the real assembler's output — where `c.eq.s
+$fcc3` is encoded by GAS, not by the test — puts an independent second opinion
+on the encoding.
+
+This is also the case the whole R4400-vs-R5000 axis exists for.
 
 ---
 

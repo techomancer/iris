@@ -441,22 +441,40 @@ cpu-tests/
 
 ---
 
-## 12. Phases
+## 12. Phases — status
 
-| Phase | Deliverable | Rough size |
+| Phase | Deliverable | Status |
 |---|---|---|
-| **0** | *(blocked on `EMULATOR-SUPPORT-PROMPT.md`)* Toolchain pinned; `hello.elf` builds, loads, prints over serial, halts. Load address and `boot -f` syntax confirmed. | 1 sitting |
-| **1** | Harness (vectors, CHECK macros, summary, DONE token) + `alu`, `muldiv`, `mem`, `branch`. Local runner script. | biggest single chunk |
-| **2** | `excep`, `cp0`, `tlb`, interrupts. | high bug-yield |
-| **3** | `fpu` + `gen/fpvectors.py`, then `mips4` with the R4400-must-RI differential. | large but mechanical |
-| **4** | `cache`; JIT-vs-interp matrix wired into CI. | |
-| **5** | Volume-header writer → bootable disk → **EFS CD image**; IRIX-side mount; optional `cheritest` external runner. | the CD goal |
+| **0** | Toolchain, `hello.elf`, load address, boot syntax | **done** — n32 cross GCC, links and relocates to `0x88200000` |
+| **1** | Harness + `alu`, `muldiv`, `mem`, `branch` | **done** — 85 tests green |
+| **2** | `excep`, `cp0`, `tlb` | **done** |
+| **3** | `fpu`, `mips4` with the R4400-must-RI differential | **done** — the differential found two bugs |
+| **4** | `cache`; JIT-vs-interp matrix in CI | **done** — `run/matrix.sh`, `.github/workflows/cpu-tests.yml` |
+| **5** | Volume header → bootable disk → **EFS CD** | **partly** — `mkvh` image boots through the PROM end to end; the EFS partition is the remaining piece |
 
-Phase 5's CD is the end goal, but Phases 0–1 should use Tier 0/1 loading —
-building a CD image on every edit would make the loop miserable, and the CD
-packaging is independent of the test content.
+### Where Phase 5 stands
 
----
+`boot -f dksc(0,2,8)cputest` at the PROM prompt loads the ELF out of the volume
+header and runs the whole suite — verified, 784 checks, via `run/run-prom.sh`.
+That is the mechanism the CD needs, proven on a disk image.
+
+What remains for the CD proper:
+
+1. **An EFS writer.** No host tool exists. `tools/mkefs` (~600 lines) is the
+   plan; Linux's read-only `fs/efs` driver and IRIX itself are two independent
+   ways to check its output. The fallback is to bootstrap one image inside the
+   guest with `mkfs_efs` on a scratch volume and pull it out with
+   `iris-ci scratch-read`, then diff against it.
+   Remember partition 7 is type **5 (`PT_SYSV`)** on real SGI media, not type 7.
+2. **The 2048/512 block-size dance.** `src/scsi.rs` already switches the drive
+   between 2048- and 512-byte logical blocks, which is what lets the PROM read
+   an SGI volume header off a CD at all. The image just needs writing at the
+   size the PROM asks for.
+3. **Optional**: an ISO9660 view of the same files so the disc is readable on a
+   modern host.
+
+The voldir holds 15 entries of ≤8-char names, so several separately bootable
+per-area binaries fit without EFS at all — the useful fallback if `mkefs` slips.
 
 ## 13. Decisions made (2026-08-18)
 
