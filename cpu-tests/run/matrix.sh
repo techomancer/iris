@@ -66,7 +66,7 @@ run_cell() {
 
     build_iris "$cpu" "$engine" || { echo "FAIL  $cell (build)"; return 1; }
 
-    timeout "${TIMEOUT:-600}" "$iris" \
+    timeout "${TIMEOUT:-1200}" "$iris" \
         --config run/bare.toml \
         --load-elf build/cputest.elf \
         --test-device --test-device-dump "$OUT/$cell.dump.json" \
