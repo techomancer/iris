@@ -107,6 +107,7 @@ pub mod exp;
 pub mod gdb_stub;
 pub mod snapshot;
 pub mod sgi_vh;
+pub mod elf;
 pub mod chunk_store;
 pub mod validate;
 pub mod registry;

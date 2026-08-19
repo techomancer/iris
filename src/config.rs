@@ -804,6 +804,11 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdb_port: Option<u16>,
 
+    /// If Some(path), load this static ELF32 MSB binary into RAM at startup and
+    /// set PC to its entry point (bare-metal test binaries; see --load-elf).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_elf: Option<String>,
+
     /// NAT subnet in CIDR notation (e.g. "192.168.5.0/24").
     /// The gateway gets host .1 and the guest (IRIX) gets host .2.
     /// Defaults to "192.168.0.0/24" if not set.
@@ -992,6 +997,7 @@ impl Default for MachineConfig {
             headless: false,
             no_audio: false,
             gdb_port: None,
+            load_elf: None,
             nat_subnet: None,
             ci: false,
             ci_socket: default_ci_socket(),
@@ -1331,6 +1337,12 @@ pub struct Cli {
     #[arg(long = "gdb-port", value_name = "PORT")]
     pub gdb_port: Option<u16>,
 
+    /// Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the
+    /// CPU starts and set PC to its entry point, instead of booting the PROM.
+    /// For bare-metal test binaries; see also the monitor's `loadelf`.
+    #[arg(long = "load-elf", value_name = "FILE")]
+    pub load_elf: Option<String>,
+
     /// CI mode: enable the control socket and apply speed-favoring fidelity
     /// shortcuts. Implies --headless unless --ci-display is also set.
     #[arg(long, default_value_t = false)]
@@ -1416,6 +1428,7 @@ impl Cli {
         }
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
+        if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref s) = self.nat_subnet { cfg.nat_subnet = Some(s.clone()); }
 
         if let Some(m) = self.net_mode { cfg.network.mode = m; }
