@@ -553,6 +553,26 @@ impl Machine {
         }
 
         // 2. Create Physical Bus with devices
+        // `cfg` is shadowed by MipsCpuConfig further down; grab this first.
+        let cheritest_hook = cfg.cheritest_dump_hook;
+
+        // Bare-metal test device (--test-device): default off, and refused
+        // alongside the ultra64 dev board, which claims the same GIO slot.
+        let testdev = if cfg.test_device {
+            #[cfg(feature = "ultra64")]
+            if ultra64.is_some() {
+                eprintln!("iris: fatal: --test-device and the ultra64 dev board both claim GIO slot 0");
+                std::process::exit(1);
+            }
+            let path = cfg.test_device_dump.clone()
+                .unwrap_or_else(|| crate::testdev::DEFAULT_DUMP_PATH.to_string());
+            eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
+                      crate::testdev::TEST_DEV_BASE, path);
+            Some(Arc::new(crate::testdev::TestDevice::new(path)))
+        } else {
+            None
+        };
+
         let phys_raw = Physical::new(
             banks,
             rex3.clone(),
@@ -561,6 +581,7 @@ impl Machine {
             mgras.clone(),
             #[cfg(feature = "ultra64")]
             ultra64,
+            testdev,
             vino,
             mc.clone(),
             hpc3.clone(),
@@ -703,6 +724,14 @@ impl Machine {
         // Machine::start) actually spawns the worker thread that reads it.
         if let Some(rex3) = &phys.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
         if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(td) = &phys.testdev { td.attach_core(cpu.core_ptr()); }
+        if cheritest_hook {
+            if phys.testdev.is_none() {
+                eprintln!("iris: --cheritest-dump-hook needs --test-device; ignoring");
+            } else {
+                cpu.set_cheritest_dump_hook(true);
+            }
+        }
         hpc3.scsi().set_cpu_cycles(cpu.cycles_ptr());
 
         // Inject the CPU/self handles jitv2's compile-thread worker needs to
@@ -763,6 +792,7 @@ impl Machine {
         monitor.register_device(phys.clone());
         if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
         if let Some(rex3) = &phys.rex3_head1 { monitor.register_device(rex3.clone()); }
+        if let Some(td) = &phys.testdev { monitor.register_device(td.clone()); }
         if let Some(xz) = &phys.xz { monitor.register_device(xz.clone()); }
         if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
         #[cfg(feature = "ultra64")]
@@ -1513,6 +1543,7 @@ impl Machine {
         self.hpc3.power_on();
         if let Some(rex3) = &self._phys.rex3 { rex3.power_on(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.power_on(); }
+        if let Some(td) = &self._phys.testdev { td.power_on(); }
         self.apply_host_display_resolution();
     }
 
@@ -1573,6 +1604,9 @@ impl Machine {
             if sv < 3 {
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
+        }
+        if let Some(td) = &self._phys.testdev {
+            snap.write_state("testdev", &td.save_state(), sv).map_err(|e| e.to_string())?;
         }
         if let Some(rex3) = &self._phys.rex3_head1 {
             snap.write_state("rex3_head1", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
@@ -1824,6 +1858,11 @@ impl Machine {
             rex3.load_state(&rex3_v)?;
             if schema_version < 3 {
                 rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(td) = &self._phys.testdev {
+            if let Ok(v) = snap.read_state("testdev", schema_version) {
+                td.load_state(&v)?;
             }
         }
         if let Some(rex3) = &self._phys.rex3_head1 {
