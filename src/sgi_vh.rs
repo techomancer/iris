@@ -203,6 +203,14 @@ impl VolumeHeader {
 
     pub fn as_bytes(&self) -> &[u8; SECTOR_SIZE as usize] { &self.raw }
 
+    /// `vh_rootpt` / `vh_swappt`: default root and swap partition numbers.
+    pub fn root_swap_parts(&self) -> (u16, u16) {
+        (
+            u16::from_be_bytes(self.raw[4..6].try_into().unwrap()),
+            u16::from_be_bytes(self.raw[6..8].try_into().unwrap()),
+        )
+    }
+
     /// Default boot file (`vh_bootfile`), NUL-trimmed.
     pub fn bootfile(&self) -> String {
         trim_nul(&self.raw[BOOTFILE_OFFSET..BOOTFILE_OFFSET + BOOTFILE_LEN])
@@ -309,10 +317,14 @@ fn trim_nul(bytes: &[u8]) -> String {
 }
 
 /// One partition-table slot in an image description, with optional raw contents.
+///
+/// `first_block: None` places the partition immediately after the volume-header
+/// partition, the way SGI's own media does — on the 6.5.22 Installation Tools CD
+/// partition 7 starts at block 48736, exactly partition 8's length.
 #[derive(Clone, Debug)]
 pub struct PartitionSpec {
     pub slot: usize,
-    pub first_block: u32,
+    pub first_block: Option<u32>,
     pub nblks: u32,
     pub ptype: u32,
     pub content: Option<std::path::PathBuf>,
@@ -353,18 +365,32 @@ pub fn build_image(path: &Path, spec: &ImageSpec) -> io::Result<Vec<VolDirEntry>
     let bootfile = spec.bootfile.clone().or_else(|| spec.files.first().map(|(n, _)| n.clone()));
     if let Some(name) = bootfile { vh.set_bootfile(&name)?; }
 
-    // Slot 8 is the volume header partition by SGI convention; size it to cover the files.
-    if !spec.partitions.iter().any(|p| p.slot == 8) {
-        vh.set_partition(8, lbn.max(VH_SECTORS as u32), 0, PT_VOLHDR)?;
-    }
-    for p in &spec.partitions {
-        vh.set_partition(p.slot, p.nblks, p.first_block, p.ptype)?;
+    // Slot 8 is the volume header partition by SGI convention, and it must span
+    // every file the voldir points at — the 6.5.22 Installation Tools CD gives it
+    // 48736 blocks for ~24 MB of sash/miniroot, not the 8-block scratch minimum.
+    let vh_blocks = lbn.max(VH_SECTORS as u32);
+    let vh_blocks = spec
+        .partitions
+        .iter()
+        .find(|p| p.slot == 8)
+        .map_or(vh_blocks, |p| p.nblks.max(vh_blocks));
+    vh.set_partition(8, vh_blocks, 0, PT_VOLHDR)?;
+
+    // A partition with no explicit first_block starts right after the header.
+    let placed_parts: Vec<(usize, u32, u32, u32, Option<&std::path::PathBuf>)> = spec
+        .partitions
+        .iter()
+        .filter(|p| p.slot != 8)
+        .map(|p| (p.slot, p.first_block.unwrap_or(vh_blocks), p.nblks, p.ptype, p.content.as_ref()))
+        .collect();
+    for (slot, first, nblks, ptype, _) in &placed_parts {
+        vh.set_partition(*slot, *nblks, *first, *ptype)?;
     }
 
     // End of the last byte any partition or file claims, rounded up to a sector.
-    let mut end_blocks = lbn as u64;
-    for p in &spec.partitions {
-        end_blocks = end_blocks.max(p.first_block as u64 + p.nblks as u64);
+    let mut end_blocks = vh_blocks as u64;
+    for (_, first, nblks, _, _) in &placed_parts {
+        end_blocks = end_blocks.max(*first as u64 + *nblks as u64);
     }
     let total_bytes = if spec.total_bytes == 0 {
         end_blocks * SECTOR_SIZE
@@ -385,7 +411,7 @@ pub fn build_image(path: &Path, spec: &ImageSpec) -> io::Result<Vec<VolDirEntry>
     };
 
     // Slot 10 ("vol") covers the whole disk, as create_scratch_image does.
-    if !spec.partitions.iter().any(|p| p.slot == 10) {
+    if !placed_parts.iter().any(|(slot, ..)| *slot == 10) {
         vh.set_partition(10, (total_bytes / SECTOR_SIZE) as u32, 0, PT_VOLUME)?;
     }
 
@@ -396,17 +422,17 @@ pub fn build_image(path: &Path, spec: &ImageSpec) -> io::Result<Vec<VolDirEntry>
         f.seek(SeekFrom::Start(*block as u64 * SECTOR_SIZE))?;
         f.write_all(data)?;
     }
-    for p in &spec.partitions {
-        let Some(src) = &p.content else { continue };
+    for (slot, first, nblks, _, content) in &placed_parts {
+        let Some(src) = content else { continue };
         let data = std::fs::read(src)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {}", src.display(), e)))?;
-        if data.len() as u64 > p.nblks as u64 * SECTOR_SIZE {
+        if data.len() as u64 > *nblks as u64 * SECTOR_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{} ({} bytes) does not fit partition {} ({} blocks)", src.display(), data.len(), p.slot, p.nblks),
+                format!("{} ({} bytes) does not fit partition {} ({} blocks)", src.display(), data.len(), slot, nblks),
             ));
         }
-        f.seek(SeekFrom::Start(p.first_block as u64 * SECTOR_SIZE))?;
+        f.seek(SeekFrom::Start(*first as u64 * SECTOR_SIZE))?;
         f.write_all(&data)?;
     }
     f.sync_all()?;
@@ -572,7 +598,7 @@ mod tests {
             total_bytes: 1024 * 1024,
             bootfile: None,
             files: vec![("cputest".into(), payload.clone())],
-            partitions: vec![PartitionSpec { slot: 7, first_block: 64, nblks: 128, ptype: PT_RAW, content: None }],
+            partitions: vec![PartitionSpec { slot: 7, first_block: Some(64), nblks: 128, ptype: PT_RAW, content: None }],
         };
         let placed = build_image(&p, &spec).expect("build");
         assert_eq!(placed.len(), 1);
@@ -597,6 +623,34 @@ mod tests {
 
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&payload);
+    }
+
+    #[test]
+    fn volume_header_partition_spans_the_voldir_payload() {
+        // The 6.5.22 Installation Tools CD gives slot 8 48736 blocks to cover
+        // sash/miniroot; 8 blocks is only right for a header with no files.
+        let p = unique_tmp_path("vhspan");
+        let big = unique_tmp_path("vhspan-file");
+        std::fs::write(&big, vec![0x55u8; 100 * SECTOR_SIZE as usize + 3]).unwrap();
+        let spec = ImageSpec {
+            files: vec![("sash".into(), big.clone())],
+            partitions: vec![PartitionSpec { slot: 7, first_block: None, nblks: 64, ptype: 5, content: None }],
+            ..Default::default()
+        };
+        let placed = build_image(&p, &spec).expect("build");
+        let vh = VolumeHeader::from_bytes(&std::fs::read(&p).unwrap()).unwrap();
+
+        let part8 = vh.partitions().into_iter().find(|e| e.slot == 8).expect("slot 8");
+        let file_end = placed[0].lbn + placed[0].nbytes.div_ceil(SECTOR_SIZE as u32);
+        assert!(part8.nblks >= file_end, "slot 8 ({} blocks) must span the voldir payload (ends at {})", part8.nblks, file_end);
+
+        // first_block: None starts the filesystem right after the header, as the CD does.
+        let part7 = vh.partitions().into_iter().find(|e| e.slot == 7).expect("slot 7");
+        assert_eq!(part7.first_block, part8.nblks, "partition 7 must begin where partition 8 ends");
+        assert_eq!(part7.ptype, 5, "SGI ships EFS filesystems as PT_SYSV");
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&big);
     }
 
     #[test]
