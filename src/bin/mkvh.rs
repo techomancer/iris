@@ -25,7 +25,10 @@ build options:
   --bootfile NAME   vh_bootfile; default: the first file
   --part SPEC       partition entry, repeatable:
                     slot:type:first:nblks[=file]  (decimal, or 0x-prefixed)
-                    e.g. --part 7:4:1024:2048=efs.img  (type 4 = PT_EFS)
+                    first may be `+` = start right after the volume header
+                    e.g. --part 7:5:+:1283016=efs.img
+                    NB: SGI ships an EFS filesystem as type 5 (PT_SYSV), not
+                    type 7 — that is what the 6.5.22 install CD emits.
 ";
 
 fn main() {
@@ -87,6 +90,8 @@ fn dump(args: &[String]) -> Result<(), String> {
 
     println!("{}:", path);
     println!("  magic     0x0BE5A941 (ok)");
+    let (rootpt, swappt) = vh.root_swap_parts();
+    println!("  rootpt    {}   swappt {}", rootpt, swappt);
     println!("  bootfile  {:?}", vh.bootfile());
     println!("  checksum  {}", if vh.csum_valid() { "valid" } else { "INVALID" });
 
@@ -142,10 +147,14 @@ fn parse_part(s: &str) -> Result<PartitionSpec, String> {
     if v.len() != 4 {
         return Err(format!("--part '{}' must be slot:type:first:nblks[=file]", s));
     }
+    let first_block = match v[2] {
+        "+" | "auto" => None,
+        n => Some(parse_num(n)? as u32),
+    };
     Ok(PartitionSpec {
         slot: parse_num(v[0])? as usize,
         ptype: parse_num(v[1])? as u32,
-        first_block: parse_num(v[2])? as u32,
+        first_block,
         nblks: parse_num(v[3])? as u32,
         content,
     })
@@ -158,7 +167,7 @@ fn ptype_name(t: u32) -> &'static str {
         2 => "PT_SECREPL",
         3 => "PT_RAW",
         4 => "PT_BSD",
-        5 => "PT_SYSV",
+        5 => "PT_SYSV", // what SGI media uses for an EFS filesystem
         6 => "PT_VOLUME",
         7 => "PT_EFS",
         8 => "PT_LVOL",
