@@ -235,8 +235,45 @@ no_fpu:
     nop
     .end exc_dispatch
 
+/*
+ * exl_resume_handler — a handler for tests that deliberately break the normal
+ * resume path.
+ *
+ * Taking an exception while Status.EXL is already set does NOT update EPC (the
+ * first exception's EPC has to survive). The default handler resumes via EPC,
+ * so with EXL pre-set it would ERET to whatever EPC happened to hold — looping
+ * forever. A test that wants to observe the EPC-preservation rule installs
+ * this instead, and says where to continue by setting exl_resume_pc.
+ *
+ * Entered from exc_dispatch with $k0/$k1 free and $at/$v0/$v1 already saved.
+ */
+    .globl exl_resume_handler
+    .ent exl_resume_handler
+exl_resume_handler:
+    lui     $k0, %hi(exl_resume_pc)
+    addiu   $k0, $k0, %lo(exl_resume_pc)
+    ld      $k0, 0($k0)
+    dmtc0   $k0, $14                 /* EPC = the caller's resume point */
+    nop
+    nop
+    lui     $k0, %hi(exc_save)
+    addiu   $k0, $k0, %lo(exc_save)
+    ld      $at, 0($k0)
+    ld      $v0, 8($k0)
+    ld      $v1, 16($k0)
+    ssnop
+    ssnop
+    ssnop
+    ssnop
+    eret                             /* also clears EXL */
+    nop
+    .end exl_resume_handler
+
     .section .bss
     .align 4
     .globl exc_save
 exc_save:
     .space 32
+    .globl exl_resume_pc
+exl_resume_pc:
+    .space 8
