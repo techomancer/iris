@@ -51,7 +51,7 @@ extern u32 tramp_general[], tramp_general_end[];
 
 static void install_one(u32 vec, const u32 *src, const u32 *end)
 {
-    volatile u32 *dst = (volatile u32 *)(unsigned long)vec;
+    volatile u32 *dst = (volatile u32 *)SEXT_PTR(vec);
     unsigned n = (unsigned)(end - src);
     unsigned i;
     if (n > 32) panic("vector trampoline too long");
@@ -66,24 +66,70 @@ void exc_install(void)
 
     /* The stores above went through the D-cache; instruction fetch at the
      * vectors must see them. */
-    dcache_wb_invalidate_range(VEC_TLB_REFILL, 0x200);
-    icache_invalidate_range(VEC_TLB_REFILL, 0x200);
+    dcache_wb_invalidate_range(SEXT_PTR(VEC_TLB_REFILL), 0x200);
+    icache_invalidate_range(SEXT_PTR(VEC_TLB_REFILL), 0x200);
     SYNC();
 }
 
 /* ── cache maintenance ────────────────────────────────────────────────────── */
-/* Step by 16: the R4400 line size, and a correct (if redundant) step for the
- * R5000's 32-byte lines. */
-void icache_invalidate_range(u32 addr, u32 len)
+/*
+ * Step by 16: the R4400 line size, and a correct (if redundant) step for the
+ * R5000's 32-byte lines.
+ *
+ * Everything here works on `char *`, never on a u32. A `cache` instruction
+ * given a zero-extended 0x0000000088218000 instead of the sign-extended
+ * 0xffffffff88218000 addresses xkuseg, misses, and does nothing at all —
+ * silently, since a missing Hit_* operation is architecturally a no-op.
+ */
+/* Distinct names: CACHE_OP has its own __a, and shadowing it here would
+ * silently apply the operation to an uninitialised address. */
+#define RANGE_LOOP(op, addr, len)                                          \
+    do {                                                                   \
+        char *__rl_p = (char *)((unsigned long)(addr) & ~15ul);            \
+        char *__rl_e = (char *)(((unsigned long)(addr) + (len) + 15)       \
+                                & ~15ul);                                  \
+        for (; __rl_p != __rl_e; __rl_p += 16) CACHE_OP(op, __rl_p);       \
+    } while (0)
+
+/*
+ * Whether a secondary cache is present, from Config.SC (0 = present).
+ *
+ * This is not cosmetic. On a machine with an L2, a primary-cache writeback
+ * lands in the SECONDARY cache, not in memory. Reaching memory — which is what
+ * an uncached KSEG1 read sees — takes a second operation against the SD
+ * target. Flushing only the primary and then reading through KSEG1 returns
+ * stale data, and looks exactly like a broken writeback in the emulator.
+ */
+int have_l2;
+
+void cache_detect(void)
 {
-    u32 a = addr & ~15u, e = (addr + len + 15) & ~15u;
-    for (; a != e; a += 16) CACHE_OP(CACHE_I | CACHE_OP_HIT_INV, a);
+    have_l2 = (cp0_config() & CFG_SC) == 0;
 }
 
-void dcache_wb_invalidate_range(u32 addr, u32 len)
+void icache_invalidate_range(volatile void *addr, u32 len)
 {
-    u32 a = addr & ~15u, e = (addr + len + 15) & ~15u;
-    for (; a != e; a += 16) CACHE_OP(CACHE_D | CACHE_OP_HIT_WB_INV, a);
+    RANGE_LOOP(CACHE_I | CACHE_OP_HIT_INV, addr, len);
+    if (have_l2) RANGE_LOOP(CACHE_SD | CACHE_OP_HIT_WB_INV, addr, len);
+}
+
+/* Push dirty lines all the way out to memory, then drop them. Use before
+ * reading the same bytes through KSEG1. */
+void dcache_wb_invalidate_range(volatile void *addr, u32 len)
+{
+    RANGE_LOOP(CACHE_D | CACHE_OP_HIT_WB_INV, addr, len);
+    if (have_l2) RANGE_LOOP(CACHE_SD | CACHE_OP_HIT_WB_INV, addr, len);
+}
+
+/*
+ * Drop lines WITHOUT writing them back, at every level. Use after writing
+ * through KSEG1: a writeback here would push the stale cached copy over the
+ * value that just went straight to memory.
+ */
+void dcache_invalidate_range(volatile void *addr, u32 len)
+{
+    RANGE_LOOP(CACHE_D | CACHE_OP_HIT_INV, addr, len);
+    if (have_l2) RANGE_LOOP(CACHE_SD | CACHE_OP_HIT_INV, addr, len);
 }
 
 /* ── failure reporting ────────────────────────────────────────────────────── */
@@ -155,6 +201,7 @@ int main(void)
     con_init();
     testdev_probe();
     identify();
+    cache_detect();
     exc_clear();
     exc_install();
 
@@ -162,8 +209,8 @@ int main(void)
     con_puts("========================================================\n");
     con_printf(" IRIS CPU test suite   cpu=%s\n", cpu_name());
     con_printf("   PRId   %x    FIR    %x\n", cpu_prid, cpu_fir);
-    con_printf("   Config %x    testdev %s\n", cpu_config,
-               have_testdev ? "yes" : "no");
+    con_printf("   Config %x    testdev %s   L2 %s\n", cpu_config,
+               have_testdev ? "yes" : "no", have_l2 ? "yes" : "no");
     con_puts("========================================================\n");
 
     if (cpu_kind == 0) {

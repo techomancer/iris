@@ -14,7 +14,7 @@
  * alone. */
 #define CP0_R32(reg) ({                                                    \
     u32 __v;                                                               \
-    __asm__ __volatile__(".set push; .set mips3\n\t"                       \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"                       \
                          "mfc0 %0, $" #reg "\n\t"                          \
                          "nop; nop\n\t"                                    \
                          ".set pop" : "=r"(__v));                          \
@@ -22,7 +22,7 @@
 
 #define CP0_W32(reg, val) do {                                             \
     u32 __v = (u32)(val);                                                  \
-    __asm__ __volatile__(".set push; .set mips3\n\t"                       \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"                       \
                          "mtc0 %0, $" #reg "\n\t"                          \
                          "nop; nop; nop\n\t"                               \
                          ".set pop" :: "r"(__v));                          \
@@ -32,7 +32,7 @@
  * registers to be meaningful, which start.S sets. */
 #define CP0_R64(reg) ({                                                    \
     u64 __v;                                                               \
-    __asm__ __volatile__(".set push; .set mips3; .set noat\n\t"            \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat; .set noat\n\t"            \
                          "dmfc0 %0, $" #reg "\n\t"                         \
                          "nop; nop\n\t"                                    \
                          ".set pop" : "=r"(__v));                          \
@@ -40,7 +40,7 @@
 
 #define CP0_W64(reg, val) do {                                             \
     u64 __v = (u64)(val);                                                  \
-    __asm__ __volatile__(".set push; .set mips3; .set noat\n\t"            \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat; .set noat\n\t"            \
                          "dmtc0 %0, $" #reg "\n\t"                         \
                          "nop; nop; nop\n\t"                               \
                          ".set pop" :: "r"(__v));                          \
@@ -92,26 +92,26 @@
 #define cp0_errorepc()       CP0_R64(30)
 
 /* TLB instructions. */
-#define tlb_probe()   __asm__ __volatile__(".set push; .set mips3\n\t"     \
+#define tlb_probe()   __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"     \
                         "tlbp\n\tnop; nop; nop; nop\n\t.set pop" ::: "memory")
-#define tlb_read()    __asm__ __volatile__(".set push; .set mips3\n\t"     \
+#define tlb_read()    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"     \
                         "tlbr\n\tnop; nop; nop; nop\n\t.set pop" ::: "memory")
-#define tlb_write_indexed() __asm__ __volatile__(".set push; .set mips3\n\t" \
+#define tlb_write_indexed() __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t" \
                         "tlbwi\n\tnop; nop; nop; nop\n\t.set pop" ::: "memory")
-#define tlb_write_random()  __asm__ __volatile__(".set push; .set mips3\n\t" \
+#define tlb_write_random()  __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t" \
                         "tlbwr\n\tnop; nop; nop; nop\n\t.set pop" ::: "memory")
 
 /* CP1 control registers. */
 #define fcr_read(n) ({                                                     \
     u32 __v;                                                               \
-    __asm__ __volatile__(".set push; .set mips3\n\t"                       \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"                       \
                          "cfc1 %0, $" #n "\n\tnop\n\t.set pop"             \
                          : "=r"(__v));                                     \
     __v; })
 
 #define fcr_write(n, val) do {                                             \
     u32 __v = (u32)(val);                                                  \
-    __asm__ __volatile__(".set push; .set mips3\n\t"                       \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"                       \
                          "ctc1 %0, $" #n "\n\tnop\n\t.set pop"             \
                          :: "r"(__v));                                     \
 } while (0)
@@ -123,13 +123,13 @@
 /* CACHE instruction with a compile-time op and a runtime address. */
 #define CACHE_OP(op, addr) do {                                            \
     void *__a = (void *)(unsigned long)(addr);                             \
-    __asm__ __volatile__(".set push; .set mips3\n\t"                       \
+    __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"                       \
                          "cache %0, 0(%1)\n\t"                             \
                          ".set pop" :: "i"(op), "r"(__a) : "memory");      \
 } while (0)
 
 /* Ordering barrier for the caches / write buffer. */
-#define SYNC()  __asm__ __volatile__(".set push; .set mips3\n\tsync\n\t.set pop" \
+#define SYNC()  __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\tsync\n\t.set pop" \
                                      ::: "memory")
 
 #endif /* CP0_H */

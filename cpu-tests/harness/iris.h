@@ -124,6 +124,21 @@
 #define K1_TO_K0(a)       (((a) & 0x1FFFFFFFu) | KSEG0_BASE)
 #define PHYS(a)           ((a) & 0x1FFFFFFFu)
 
+/*
+ * Turn a 32-bit compatibility-segment address into a pointer.
+ *
+ * In 64-bit mode KSEG0/KSEG1 are the *sign-extended* ranges
+ * 0xffffffff80000000..0xffffffffbfffffff. A `u32` such as 0x88218000 held in a
+ * 64-bit register is zero-extended to 0x0000000088218000, which is xkuseg —
+ * TLB-mapped, and nothing like the address intended. Passing one of those to
+ * `cache` makes the operation a silent no-op (or a TLB refill), which is
+ * exactly the kind of failure that looks like a cache bug in the emulator.
+ * Casting through s32 forces the sign extension.
+ */
+#define SEXT_PTR(a)       ((void *)(long)(s32)(a))
+#define K1_PTR(p)         ((volatile void *)(long)(s32)K0_TO_K1((u32)(unsigned long)(p)))
+#define K0_PTR(p)         ((volatile void *)(long)(s32)K1_TO_K0((u32)(unsigned long)(p)))
+
 /* Physical RAM base on IP22/IP24 (src/physical.rs:136). Only the bottom 512 KB
  * of the physical map is RAM, as an alias of 0x08000000..0x0807ffff; the span
  * from 0x00080000 to 0x08000000 is unmapped and swallows writes silently. */

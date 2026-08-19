@@ -176,8 +176,16 @@ u32  fpu_fir_read(void);
 u32  fpu_fcsr_read(void);
 void fpu_fcsr_write(u32 v);
 
-void icache_invalidate_range(u32 addr, u32 len);
-void dcache_wb_invalidate_range(u32 addr, u32 len);
+/* Set by cache_detect(): a secondary cache is present (Config.SC == 0). */
+extern int have_l2;
+void cache_detect(void);
+
+/* Cache maintenance over a range. These take a pointer rather than a u32 so
+ * the address reaches the `cache` instruction sign-extended — see SEXT_PTR in
+ * iris.h for why that matters. */
+void icache_invalidate_range(volatile void *addr, u32 len);
+void dcache_wb_invalidate_range(volatile void *addr, u32 len);
+void dcache_invalidate_range(volatile void *addr, u32 len);
 
 /* Halt with a message — unrecoverable harness failure. */
 void panic(const char *msg) __attribute__((noreturn));

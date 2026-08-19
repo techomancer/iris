@@ -16,7 +16,7 @@ static void t_prid(void)
      * because there is no cp0_prid_set — that is the point. */
     {
         u32 before = prid;
-        __asm__ __volatile__(".set push; .set mips3\n\t"
+        __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"
                              "mtc0 %0, $15\n\tnop; nop; nop\n\t"
                              ".set pop" :: "r"(0xDEADBEEFu));
         CHECK_EQ(cp0_prid(), before);
