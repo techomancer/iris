@@ -311,40 +311,49 @@ static void t_compare_round_trip(void)
 
 /*
  * A Count/Compare match sets Cause.IP7. With IE clear it must NOT be delivered
- * as an exception — it just becomes pending. Writing Compare clears the pending
- * bit, which is the documented acknowledge mechanism.
+ * as an exception — it just becomes pending. Writing Compare clears the
+ * pending bit, which is the documented acknowledge mechanism.
  *
- * The spin is bounded, and the two failure modes are kept apart: "Count never
- * reached Compare inside the budget" is a slow clock, not a broken interrupt,
- * so it is reported rather than asserted. IRIS's Count is wallclock-anchored by
- * default (src/mips_core.rs, and the `ci_clock` feature exists to make it
- * deterministic), so how many loop iterations a given Compare delta takes is
- * not a property of the guest program at all.
+ * Compare is set relative to a freshly-read Count, which is what a kernel
+ * actually does and what this architecture requires. IP7 fires on Count
+ * becoming *equal* to Compare, not on Count exceeding it — so a Compare
+ * written "in the past" does not fire until Count wraps all the way through
+ * 2^32 and climbs back. IRIS models that faithfully (see
+ * schedule_compare_timer in src/mips_core.rs). An earlier version of this test
+ * set Count to 0 and Compare to a small constant, which raced against the
+ * wallclock-anchored counter: it passed from a cold --load-elf start and
+ * failed after a PROM boot, where Count had already run far ahead.
+ *
+ * The spin is bounded, and "the deadline never arrived" is reported rather
+ * than asserted — how many loop iterations a Count delta takes is a property
+ * of the host, not of the guest program.
  */
 static void t_compare_sets_ip7_and_write_clears_it(void)
 {
     unsigned i;
-    u32 fired = 0, reached = 0, last = 0;
-    const u32 target = 2000;
+    u32 fired = 0, start, deadline, last = 0;
+    const u32 delta = 20000;
 
     exc_clear();
-    cp0_count_set(0);
-    cp0_compare_set(target);
+    start = cp0_count();
+    deadline = start + delta;
+    cp0_compare_set(deadline);
 
     for (i = 0; i < 4000000; i++) {
         if (cp0_cause() & 0x8000u) { fired = 1; break; }   /* IP7 */
         last = cp0_count();
-        if (last >= target) { reached = 1; if (i > 1000) break; }
+        /* Stop once Count has demonstrably gone past the deadline: waiting
+         * longer would only be waiting for a 2^32 wrap. */
+        if ((u32)(last - deadline) < 0x80000000u && last != deadline) break;
     }
 
-    if (!reached && !fired) {
-        con_printf("\n      [timer inconclusive: Count only reached %u of %u"
-                   " in %u iterations]", last, target, i);
+    if (!fired) {
+        con_printf("\n      [timer did not fire: Count %x -> %x, deadline %x,"
+                   " %u iterations]", start, last, deadline, i);
         CHECK(1);
         return;
     }
 
-    CHECK_EQ(fired, 1u);
     CHECK_NO_EXC();                  /* IE is clear: pending, never taken */
 
     /* Writing Compare acknowledges the interrupt. */

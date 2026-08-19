@@ -57,3 +57,32 @@ link address, flushes I and D, and jumps. From then on:
   the KSEG0/KSEG1 views are deliberate rather than accidental;
 - the suite is independent of *how* it was loaded — `--load-elf`,
   `boot -f dksc(...)` and `boot -f bootp()` all converge on the same layout.
+
+## Booting through the PROM
+
+`run/run-prom.sh` builds a disk image with `mkvh`, attaches it at a SCSI ID,
+and drives the PROM to `boot -f dksc(0,<id>,8)cputest`. This is the path the
+bootable CD will use, and the only one that proves the image is genuinely
+bootable rather than merely well-formed.
+
+The image `mkvh` produces for a single file looks like:
+
+```
+block 0        SGI volume header
+                 magic 0x0BE5A941, bootfile "cputest", checksum valid
+                 voldir[0] = cputest, lbn 8, <size> bytes
+                 pt[8]  = PT_VOLHDR, first 0, nblks <enough to span the file>
+                 pt[10] = PT_VOLUME, whole image
+block 8..       the ELF itself
+```
+
+Note `pt[8]` spans the *whole file*, not 8 sectors. That is what the IRIX
+6.5.22 install CD does — its partition 8 is 48736 blocks, covering `sgilabel`,
+`mr`, `sash64` and `sashARCS` — and `mkvh` sizes it the same way. A volume
+header partition of the conventional 8 sectors is correct only for a header
+with no files in it.
+
+For the CD, partition 7 gains an EFS filesystem (type 5 / `PT_SYSV` on real
+SGI media, not type 7 — again what the install CD emits), and the whole thing
+is written as a 512-byte-per-sector image the drive reports in the block size
+the PROM asks for.
