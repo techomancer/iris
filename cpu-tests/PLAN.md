@@ -152,7 +152,7 @@ Secondary path (debugging + the external `cheritest` corpus): the IRIS **test
 device** — a signature register the guest probes for, plus `PUTC`, a full
 machine-state `DUMP`, and an `EXIT` that sets the process exit code. Absent on
 real hardware, so the suite probes for it and falls back to SCC-only output.
-Specified in `EMULATOR-SUPPORT-PROMPT.md` (Feature D).
+Landed as `--test-device` (`src/testdev.rs`).
 
 ### 4.2 Console
 
@@ -485,10 +485,9 @@ per-area binaries fit without EFS at all — the useful fallback if `mkefs` slip
    path (portable to real hardware, works from the CD, no host parsing); a
    machine-state dump hook is the debugging path and the enabler for running
    the external `cheritest` corpus.
-3. **Emulator changes** — all of them, but done **first and separately**:
-   volume-directory writer, direct ELF load, TFTP server, and the test device
-   that the dump hook needs. Specified in
-   [`EMULATOR-SUPPORT-PROMPT.md`](EMULATOR-SUPPORT-PROMPT.md) for a separate
-   IRIS session. **No suite work starts until that lands.**
+3. **Emulator changes** — all of them, done first and separately in another
+   session. All four landed: the volume-directory writer and `mkvh`, direct ELF
+   load (`--load-elf`, monitor `loadelf`/`loadbin`), a TFTP server in the NAT
+   gateway, and the test device (`--test-device`).
 4. **cheritest** — external and optional, referenced by path. `cpu-tests/`
    stays BSD-3-Clause like the rest of IRIS.

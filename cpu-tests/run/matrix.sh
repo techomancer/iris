@@ -7,10 +7,10 @@
 #
 #   R4400 vs R5000   the MIPS IV opcodes must compute on one and raise
 #                    Reserved Instruction on the other
-#   interp vs JIT    a guest-visible ISA suite is the cleanest possible JIT
+#   interp vs jitv2  a guest-visible ISA suite is the cleanest possible JIT
 #                    differential test. rules/jit/verify-mode.md notes that
-#                    JIT verify mode is structurally invalid for blocks
-#                    containing stores, so this covers ground it cannot.
+#                    verify mode is structurally invalid for blocks containing
+#                    stores, so this covers ground it cannot.
 #
 # Each cell needs its own IRIS build, because the CPU is a compile-time cargo
 # feature (see rules/perf/hardware-profiles.md). Builds are cached in
@@ -25,7 +25,7 @@ ROOT=..
 OUT=build/matrix
 mkdir -p "$OUT"
 
-ALL_CELLS="r4400-interp r5000-interp r4400-jit r5000-jit"
+ALL_CELLS="r4400-interp r5000-interp r4400-jitv2 r5000-jitv2"
 CELLS="${*:-${CELLS:-$ALL_CELLS}}"
 
 feature_for() {
@@ -39,9 +39,11 @@ feature_for() {
 }
 
 build_iris() {
-    local cpu="$1" feats target
+    local cpu="$1" engine="$2" feats target
     feats="$(feature_for "$cpu")"
-    target="build/iris-$cpu"
+    # jitv2 needs no runtime switch — it is active as soon as it is compiled in.
+    [[ "$engine" == "jitv2" ]] && feats="${feats:+$feats,}jitv2"
+    target="build/iris-$cpu-$engine"
     if [[ -x "$target" ]] && [[ -z "${FORCE_BUILD:-}" ]]; then
         echo "  (reusing $target)"
         return 0
@@ -56,24 +58,15 @@ build_iris() {
 }
 
 run_cell() {
-    local cell="$1" cpu engine iris log rc jitenv=()
+    local cell="$1" cpu engine iris log rc
     cpu="${cell%%-*}"
     engine="${cell##*-}"
-    iris="build/iris-$cpu"
+    iris="build/iris-$cpu-$engine"
     log="$OUT/$cell.log"
 
-    build_iris "$cpu" || { echo "FAIL  $cell (build)"; return 1; }
+    build_iris "$cpu" "$engine" || { echo "FAIL  $cell (build)"; return 1; }
 
-    if [[ "$engine" == "jit" ]]; then
-        # The jit feature has to be compiled in as well; skip the cell rather
-        # than silently running the interpreter and reporting it as a JIT pass.
-        if ! "$iris" --help >/dev/null 2>&1; then
-            echo "SKIP  $cell (iris not runnable)"; return 0
-        fi
-        jitenv=(IRIS_JIT=1)
-    fi
-
-    env "${jitenv[@]}" timeout "${TIMEOUT:-600}" "$iris" \
+    timeout "${TIMEOUT:-600}" "$iris" \
         --config run/bare.toml \
         --load-elf build/cputest.elf \
         --test-device --test-device-dump "$OUT/$cell.dump.json" \
