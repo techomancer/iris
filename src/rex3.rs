@@ -664,6 +664,26 @@ fn to_slope(val: i32) -> u32 {
     (val as u32) & 0xFFFFF
 }
 
+/// Write an 8-bit grayscale PNG (used by `rex fbdump`'s ci.png).
+fn write_png_gray(path: &std::path::Path, rows: &[u8], width: usize, height: usize) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    writer.write_image_data(rows).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+/// Write a 24-bit RGB PNG (used by `rex fbdump`'s rgb.png).
+fn write_png_rgb(path: &std::path::Path, rows: &[u8], width: usize, height: usize) -> std::io::Result<()> {
+    let file = std::fs::File::create(path)?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    writer.write_image_data(rows).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
 /// Compact snapshot of one block/span draw for the draw-debug overlay.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DrawRecord {
@@ -4345,6 +4365,47 @@ impl Rex3 {
         self.load_framebuffers_named(dir, "rex3")
     }
 
+    /// Dump the full 2048x1024 VRAM for offline inspection: raw rgb/aux/did
+    /// planes plus ci.png (low 8 bits of rgb) and rgb.png (full 24-bit rgb).
+    /// Unlike `save_framebuffers_named`, this also captures the decoded DID
+    /// plane and renders PNG previews — for `rex fbdump`, not snapshotting.
+    pub fn dump_framebuffer_debug(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        const W: usize = 2048;
+        const H: usize = 1024;
+
+        let rgb = unsafe { &*self.fb_rgb.get() };
+        let aux = unsafe { &*self.fb_aux.get() };
+
+        let mut bytes = Vec::with_capacity(rgb.len() * 4);
+        for &word in rgb.iter() { bytes.extend_from_slice(&word.to_be_bytes()); }
+        std::fs::write(dir.join("rgb.bin"), &bytes)?;
+
+        bytes.clear();
+        for &word in aux.iter() { bytes.extend_from_slice(&word.to_be_bytes()); }
+        std::fs::write(dir.join("aux.bin"), &bytes)?;
+
+        let did = self.screen.lock().did.clone();
+        std::fs::write(dir.join("did.bin"), &did)?;
+
+        // ci.png: low 8 bits of rgb (CI/plane-depth index) as grayscale.
+        let mut ci_rows = Vec::with_capacity(W * H);
+        for &word in rgb.iter() {
+            ci_rows.push((word & 0xFF) as u8);
+        }
+        write_png_gray(&dir.join("ci.png"), &ci_rows, W, H)?;
+
+        // rgb.png: full 24-bit rgb (word is 24-bit BGR: bits[7:0]=B [15:8]=G [23:16]=R).
+        let mut rgb_rows = Vec::with_capacity(W * H * 3);
+        for &word in rgb.iter() {
+            rgb_rows.push(((word >> 16) & 0xFF) as u8); // R
+            rgb_rows.push(((word >>  8) & 0xFF) as u8); // G
+            rgb_rows.push(( word        & 0xFF) as u8); // B
+        }
+        write_png_rgb(&dir.join("rgb.png"), &rgb_rows, W, H)?;
+
+        Ok(())
+    }
+
     pub fn load_framebuffers_named(&self, dir: &std::path::Path, prefix: &str) -> std::io::Result<()> {
         let path_rgb = dir.join(format!("{prefix}_rgb.bin"));
         if path_rgb.exists() {
@@ -4456,7 +4517,7 @@ impl Device for Rex3 {
     fn register_commands(&self) -> Vec<(String, String)> {
         #[allow(unused_mut)]
         let mut cmds = vec![
-            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV] | rex fbdump [DIR]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 ramdump | vc2 debug <on|off> [DEV]".to_string()),
             ("xmap".to_string(), "XMAP commands: xmap status | xmap debug <on|off> [DEV]".to_string()),
@@ -4562,6 +4623,19 @@ impl Device for Rex3 {
             }
             #[cfg(not(feature = "rex-jit"))]
             writeln!(writer, "JIT       : not compiled in").unwrap();
+            return Ok(());
+        }
+
+        if cmd == "rex" && args[0] == "fbdump" {
+            let dir = std::path::Path::new(args.get(1).map(|s| *s).unwrap_or("."));
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            self.dump_framebuffer_debug(dir).map_err(|e| e.to_string())?;
+            writeln!(writer, "REX3 framebuffer dump written to {}", dir.display()).unwrap();
+            writeln!(writer, "  rgb.bin (2048x1024 x u32 BE, 24-bit BGR)").unwrap();
+            writeln!(writer, "  aux.bin (2048x1024 x u32 BE, raw aux plane)").unwrap();
+            writeln!(writer, "  did.bin (2048x1024 x u8, decoded DID)").unwrap();
+            writeln!(writer, "  ci.png  (low 8 bits of rgb, grayscale)").unwrap();
+            writeln!(writer, "  rgb.png (full 24-bit rgb)").unwrap();
             return Ok(());
         }
 
@@ -5076,7 +5150,7 @@ impl BusDevice for Rex3 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
-            let val = (self.dcb_read() >> ((offset & 3) << 3)) as u8;
+            let val = (self.dcb_read() >> 24) as u8;
             dlog_dev!(LogModule::Dcb, "DCB Read8: Offset {:04x} -> {:02x}", offset, val);
             BusRead8::ok(val)
         } else {
@@ -5099,7 +5173,7 @@ impl BusDevice for Rex3 {
 
         if is_dcb {
             dlog_dev!(LogModule::Dcb, "DCB Write8: Offset {:04x} Val {:02x} -> dcb_write({:08x})", offset, val, val as u32);
-            self.dcb_write((val as u32) << ((offset & 3) << 3));
+            self.dcb_write((val as u32) << 24);
             return BUS_OK;
         }
         eprintln!("REX3 Write8: unhandled offset {:04x} val {:02x}", offset, val);
