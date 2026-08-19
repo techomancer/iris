@@ -241,6 +241,10 @@ path = "src/bin/chd_extract.rs"
 required-features = ["chd"]
 
 [[bin]]
+name = "mkvh"
+path = "src/bin/mkvh.rs"
+
+[[bin]]
 name = "jitv2_analyze"
 path = "src/bin/jitv2_analyze.rs"
 required-features = ["jitv2"]
