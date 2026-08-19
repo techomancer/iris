@@ -1,6 +1,6 @@
 # Status
 
-*Last full run: 2026-08-19, commit `98db5bb`.*
+*Last full run: 2026-08-19, tests-only branch (no emulator changes).*
 
 ## Coverage
 
@@ -21,29 +21,39 @@
 
 ## Results
 
-| cell | pass | fail |
-|---|---:|---:|
-| R4400, interpreter, `--load-elf` | 783 | 19 |
-| R5000, interpreter, `--load-elf` | 801 | 2 |
-| R4400, interpreter, PROM boot from a `mkvh` image | 784 | 20 |
+Measured on this branch, which carries **tests only** — no emulator changes, so
+the suite reports every finding rather than hiding any.
 
-Every failure is a recorded finding, not an unknown — see
-[findings.md](findings.md):
+| cell | pass | fail | failing tests |
+|---|---:|---:|---|
+| R4400, interpreter | 783 | 19 | 7 |
+| R5000, interpreter | 802 | 3 | 3 |
+| R4400, PROM boot from a `mkvh` image | 784 | 20 | 7 |
 
-- **17 of the 19 R4400 failures are a single finding**: MIPS IV instructions
-  execute instead of raising Reserved Instruction. The whole `mips4/` group
-  fails on R4400 and passes on R5000, which is exactly the asymmetry the
-  two-CPU axis was built to measure.
-- **The remaining 2, on both CPUs**, are reserved-bit masking in `Wired` and
-  `FCSR` — documented requirements with no practical consequence.
+Every failure is a recorded finding — see [findings.md](findings.md):
 
-The R5000 column is the useful one for judging the emulator: 801 of 803 checks
-pass, and both failures are the same cosmetic masking issue.
+| failing test | finding | CPUs |
+|---|---|---|
+| `mips4/movn_movz`, `pref`, `recip_rsqrt`, `movci`, `cop1x` | MIPS IV executes instead of raising RI | R4400 only |
+| `mips4/multi_fp_cc` | `c.cond.fmt` writes the wrong condition code | R5000 only |
+| `cp0/wired_reserved_bits` | reserved bits do not read as zero | both |
+| `fpu/fcsr_reserved` | reserved bits do not read as zero | both |
 
-One bug the suite found is **fixed**: `c.cond.fmt` wrote the wrong FP condition
-code (`bdb00c8`), along with the matching off-by-two in IRIS's own test encoder
-that had been cancelling it (`4f1d4a1`). `mips4/multi_fp_cc` now passes on
-R5000, and `cargo test --lib mips_exec_test` is 95/95.
+**17 of the R4400's 19 failing checks are the single MIPS IV finding.** The
+whole `mips4/` group fails on R4400 and passes on R5000 — apart from
+`multi_fp_cc`, which is the mirror image: it passes on R4400 (where the test
+only reports, since a non-zero `cc` is not a defined MIPS III encoding) and
+fails on R5000, where the instruction actually executes. That inversion is
+precisely what the two-CPU axis was built to expose.
+
+A fix for `multi_fp_cc` exists on branch **`fix/fp-condition-code`** (three
+commits, `src/` only). With it applied, R5000 goes to **801/2** and
+`cargo test --lib mips_exec_test` stays green at 95/95. It is deliberately not
+on this branch.
+
+> The total check count drifts by one or two between runs. `cp0/compare_sets_ip7`
+> executes two checks when the timer fires and one when it reports a skip, and
+> whether it fires depends on the wallclock-anchored counter — see finding 5.
 
 ## Not yet done
 

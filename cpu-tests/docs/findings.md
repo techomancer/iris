@@ -9,9 +9,14 @@ in [gotchas.md](gotchas.md) instead. Telling the two apart is most of the work.
 
 ---
 
-## 1. `c.cond.fmt` wrote the wrong FP condition code — **fixed**
+## 1. `c.cond.fmt` wrote the wrong FP condition code — **open here; fix on a branch**
 
-*Found by `mips4/multi_fp_cc`. Fixed in `src/mips_exec.rs`.*
+*Found by `mips4/multi_fp_cc`.*
+
+> This branch carries tests only. The fix lives on **`fix/fp-condition-code`**
+> (two commits, `src/mips_exec.rs` and `src/mips_exec_test.rs`), so
+> `mips4/multi_fp_cc` fails here — which is what the suite should be reporting
+> until the fix lands.
 
 MIPS IV widened the FP condition from a single bit to eight codes, and
 `C.cond.fmt` gained a `cc` field at **bits 10:8** of the instruction word:
@@ -56,10 +61,10 @@ interesting one:
   the executor was fixed. Its own comment said "cc in fd field [10:8]" all
   along.
 
-The helper is fixed too. This is the failure mode a hand-written encoder cannot
-catch on its own: only running the real assembler's output — where `c.eq.s
-$fcc3` is encoded by GAS, not by the test — puts an independent second opinion
-on the encoding.
+The helper is fixed on the same branch. This is the failure mode a hand-written
+encoder cannot catch on its own: only running the real assembler's output —
+where `c.eq.s $fcc3` is encoded by GAS, not by the test — puts an independent
+second opinion on the encoding.
 
 This is also the case the whole R4400-vs-R5000 axis exists for.
 

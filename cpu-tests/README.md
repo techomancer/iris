@@ -56,3 +56,9 @@ The two are complementary. The FP condition-code bug in
 [docs/findings.md](docs/findings.md) is an example of something only this side
 could find: IRIS's own unit test set the condition code through a helper, so it
 never exercised the instruction field that was being decoded wrongly.
+
+## Scope of this branch
+
+**Tests only — no emulator changes.** Findings are reported, not fixed, so the
+suite keeps showing them. The one fix written so far lives on its own branch,
+`fix/fp-condition-code`; see [docs/findings.md](docs/findings.md) §1.
