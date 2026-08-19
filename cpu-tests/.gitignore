@@ -1,3 +1,7 @@
 # Build products: the guest binary and its objects, the bootable image, the
 # per-cell IRIS builds the matrix runner caches, and run logs.
 build/
+
+# The generator is run in place; its bytecode cache is not a build product
+# anyone wants.
+__pycache__/

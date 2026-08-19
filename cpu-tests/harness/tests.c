@@ -17,8 +17,16 @@ DECLARE_GROUP(group_excep);
 DECLARE_GROUP(group_cp0);
 DECLARE_GROUP(group_tlb);
 DECLARE_GROUP(group_fpu);
+DECLARE_GROUP(group_fpu_trap);
+DECLARE_GROUP(group_fpu_denorm);
+DECLARE_GROUP(group_fpu_compare);
+DECLARE_GROUP(group_fpu_vectors);
+DECLARE_GROUP(group_fpu_double);
+DECLARE_GROUP(group_fpu_fr0);
+DECLARE_GROUP(group_fpu_breadth);
 DECLARE_GROUP(group_cache);
 DECLARE_GROUP(group_mips4);
+DECLARE_GROUP(group_mips4_fp);
 
 const struct test_group *const all_groups[] = {
     &group_identity,
@@ -30,8 +38,16 @@ const struct test_group *const all_groups[] = {
     &group_cp0,
     &group_tlb,
     &group_fpu,
+    &group_fpu_trap,
+    &group_fpu_denorm,
+    &group_fpu_compare,
+    &group_fpu_vectors,
+    &group_fpu_double,
+    &group_fpu_fr0,
+    &group_fpu_breadth,
     &group_cache,
     &group_mips4,
+    &group_mips4_fp,
 };
 
 const unsigned n_groups = sizeof(all_groups) / sizeof(all_groups[0]);

@@ -448,7 +448,7 @@ cpu-tests/
 | **0** | Toolchain, `hello.elf`, load address, boot syntax | **done** — n32 cross GCC, links and relocates to `0x88200000` |
 | **1** | Harness + `alu`, `muldiv`, `mem`, `branch` | **done** — 85 tests green |
 | **2** | `excep`, `cp0`, `tlb` | **done** |
-| **3** | `fpu`, `mips4` with the R4400-must-RI differential | **done** — the differential found two bugs |
+| **3** | `fpu`, `mips4` with the R4400-must-RI differential | **done** — the differential found two bugs; `fpu` has since grown to 88 tests across eight files and `gen/fpvectors.py` now generates its expectation tables, which is where findings 6-10 came from |
 | **4** | `cache`; JIT-vs-interp matrix in CI | **done** — `run/matrix.sh`, `.github/workflows/cpu-tests.yml` |
 | **5** | Volume header → bootable disk → **EFS CD** | **partly** — `mkvh` image boots through the PROM end to end; the EFS partition is the remaining piece |
 

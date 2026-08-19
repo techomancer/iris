@@ -260,6 +260,7 @@ int main(void)
     {
         u32 rc = n_fail > 100 ? 100 : n_fail;
         con_printf("\nIRIS-CPUTEST-DONE rc=%u\n", rc);
+        con_flush();          /* or the machine stops mid-line — see console.c */
         testdev_exit(rc);
     }
     return 0;

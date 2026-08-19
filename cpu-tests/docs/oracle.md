@@ -41,12 +41,68 @@ requirement the architecture does not make. The suite marks these explicitly and
 - MTC0 into a 64-bit CP0 register — the manual's Operation section is just
   `CPR[0,rd] <- GPR[rt]` and says nothing about the width, so the suite
   deliberately does **not** assert sign-extension.
+- `fpu/fr0_odd_undefined` and `fpu/fr_mode_switch` — Appendix B says a format
+  operation naming an odd register with FR=0 has an "undefined result", and
+  says nothing at all about what the paired view shows after FR=1 code wrote
+  the two registers separately. Both are printed.
+- `fpu/cvt_out_of_range` and `fpu/cvt_infinity` — see below.
+
+### Which CPU an expectation applies to
+
+`docs/R4000_um2.pdf` is in this repository; NEC's VR5000 manual is not. Where
+a rule is one that two implementations of the same architecture may legitimately
+differ on, the suite therefore asserts it for the R4400 and **reports** it for
+the R5000, rather than assuming the R5000 inherited it.
+
+The whole `fpu/denorm_*` group works this way. Denormal handling is the
+canonical example of an implementation-defined escape hatch: the R4400 punts
+denormals to software with an Unimplemented Operation, and whether the R5000
+does the same is not something this repository can establish. The reports still
+carry their weight — they show up in the log next to the R4400 assertions, so
+the two cells can be compared by eye.
+
+### Two documents that disagree
+
+`cvt.w.s` of a value with no integer representation is the one case where the
+two applicable specifications conflict outright. The R4000 manual's Table 7-2
+makes "Overflow on convert" an Unimplemented Operation (E) whether or not the
+trap is enabled; the MIPS IV ISA makes it an Invalid Operation whose untrapped
+default result is the largest representable integer. Both are defensible for
+these parts, so `fpu/cvt_out_of_range` accepts either — and then insists on the
+whole of whichever it gets: an E must come with an untouched destination, a V
+must come with a saturated result. A silently wrong number matches neither.
 
 ## 3. Host-computed values
 
 FP expectations are IEEE-754 bit patterns computed on the host rather than
-worked out by hand — `0.25f` is `0x3E800000`, not "whatever came out". This is
-what `gen/` is for as the `fpu` group grows.
+worked out by hand — `0.25f` is `0x3E800000`, not "whatever came out".
+
+`gen/fpvectors.py` is where that happens for anything larger than a handful of
+constants. It computes with **exact rational arithmetic** (`fractions.Fraction`)
+and rounds to the destination format by hand, so the expectations follow from
+the definition of IEEE 754 rather than from any floating-point unit — not the
+host's, and certainly not the emulated one. `make vectors` regenerates
+`tests/fpu/fpvectors.{c,h}`; the generated files are checked in so that building
+the suite still needs nothing but the cross toolchain.
+
+Two properties are worth keeping if it is ever rewritten:
+
+- **`--check` cross-checks against the host FPU** before writing anything,
+  which is §4 of this document applied to the generator itself: a disagreement
+  is a reason to go back to the standard, not to copy the host's answer. Every
+  vector currently agrees. (Double rounding is not a hazard here — a
+  single-precision result computed in double and then rounded to single is
+  correctly rounded, since a double has more than the 2p+2 = 50 bits that
+  requires.)
+- **Operands are rounded through the destination format first.** Computing an
+  expectation from a value the register cannot hold produces a table no correct
+  implementation can match; see [gotchas.md](gotchas.md).
+
+The tables deliberately contain no NaN results (the payload is
+implementation-defined) and no denormal or underflowing results (on an R4400
+those are Unimplemented Operation traps rather than arithmetic at all).
+`fpu_double.c` and `fpu_denorm.c` cover those by hand, with the manual quoted
+next to each expectation.
 
 ## 4. Cross-checking against another implementation
 

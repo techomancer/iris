@@ -42,6 +42,9 @@ void con_dec(long long v);
 void con_udec(unsigned long long v);
 /* Minimal printf: %s %c %d %u %x (32-bit), %X/%lx (64-bit), %% */
 void con_printf(const char *fmt, ...);
+/* Wait for the serial transmitter to drain. Call before anything that stops
+ * the machine, or the tail of the last line is lost. */
+void con_flush(void);
 
 /* ── Test device (absent on real hardware; probed at startup) ─────────────── */
 extern int have_testdev;

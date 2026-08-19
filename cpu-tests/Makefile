@@ -60,8 +60,16 @@ DEPS   := $(OBJS:.o=.d)
 # ever does appear, the link fails loudly rather than pulling in the wrong ABI.
 LIBGCC :=
 
-.PHONY: all clean run dis syms image check-size
+.PHONY: all clean run dis syms image check-size vectors
 all: $(TARGET)
+
+# Regenerate the IEEE-754 expectation tables in tests/fpu/. Needs python3, and
+# nothing else does — the generated files are checked in so that building the
+# suite stays a cross-toolchain-only affair. --check cross-checks the exact
+# rational arithmetic against the host FPU before anything is written.
+vectors:
+	cd $(CURDIR) && python3 gen/fpvectors.py --check
+	cd $(CURDIR) && python3 gen/fpvectors.py
 
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)

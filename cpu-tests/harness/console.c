@@ -49,6 +49,31 @@ void testdev_dump(u32 tag)
     if (have_testdev) WR32(TESTDEV_DUMP, tag);
 }
 
+/*
+ * Let the SCC finish shifting out what has been handed to it.
+ *
+ * scc_putc waits for the transmit *buffer* to empty before handing over each
+ * byte, which says nothing about the byte already in the shift register. The
+ * test device then terminates the machine the instant it is written, so the
+ * tail of the last line is simply lost: booted through the PROM, where serial
+ * output actually works, "IRIS-CPUTEST-DONE rc=100" arrived as
+ * "IRIS-CPUTEST-DONE rc=" — and run/run-prom.sh decides pass or fail by
+ * matching on that line.
+ *
+ * The spin is bounded and runs exactly once, at the end of a run that already
+ * took minutes.
+ */
+void con_flush(void)
+{
+    int spins = 0;
+
+    while (!(RD8(SCC_CHB_CMD) & SCC_RR0_TX_EMPTY)) {
+        if (++spins > TX_SPIN_LIMIT) break;
+    }
+    for (spins = 0; spins < 20000000; spins++)
+        __asm__ __volatile__("" ::: "memory");
+}
+
 void testdev_exit(u32 code)
 {
     if (have_testdev) WR32(TESTDEV_EXIT, code);
