@@ -588,14 +588,13 @@ impl App {
         }
     }
 
-    /// Export config + enable premiere JIT defaults for CLI recording workflow.
+    /// Export config for the premiere CLI recording workflow.
     fn prepare_for_premiere(&mut self) {
         if self.emu.is_running() {
             self.toast("Stop the VM first — premiere CLI uses its own iris.exe process");
             return;
         }
         self.cfg.scale = 1;
-        self.cfg.jit = iris::config::JitConfig::premiere_defaults();
         self.mark_dirty();
         if self.cfg_dirty { self.flush_machine(); }
         let path = PathBuf::from("irix-install/iris-windows.toml");
@@ -730,7 +729,7 @@ impl App {
         if !std::path::Path::new(&self.cfg.prom).exists() {
             self.toast(format!("'{}' not found — using embedded PROM", self.cfg.prom));
         }
-        self.cfg.jit.apply_env();
+        self.cfg.debug.apply_env();
         // Latch the networking backend the machine is being started with, so the
         // running status footer can report PCAP vs NAT (and which interface)
         // independent of any later edits to the config editor. On a build without
@@ -1456,16 +1455,13 @@ impl App {
                 use iris::build_features as bf;
                 ui.label(format!("  chd:       {}", if bf::CHD { "on" } else { "off" }));
                 ui.label(format!("  camera:    {}", if bf::CAMERA { "on" } else { "off" }));
-                // jit/rex-jit are compile-time features, but the sandbox (App
+                // rex-jit is a compile-time feature, but the sandbox (App
                 // Store) build forces interpreter-only at runtime via IRIS_NO_JIT
                 // (Cranelift's non-MAP_JIT pages get killed under the sandbox).
                 // Report the runtime reality so a compiled-in "on" doesn't read
-                // as "the JIT is running" when it can't be. Not-compiled-in is
-                // plain "off" — shipped builds carry rex-jit but not the v1 jit,
-                // so "off (sandbox)" there would name the wrong reason.
+                // as "the JIT is running" when it can't be.
                 let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
                 let jit_state = |feat: bool| if !feat { "off" } else if jit_off { "off (sandbox)" } else { "on" };
-                ui.label(format!("  jit:       {}", jit_state(bf::JIT)));
                 ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
                 // ultra64 (N64 dev board) is a source-build opt-in; shipped builds
@@ -2196,7 +2192,7 @@ impl App {
         }
 
         let banks_before = self.cfg.banks;
-        let jit_before = self.cfg.jit.clone();
+        let debug_before = self.cfg.debug.clone();
         let cfg_before = toml::to_string(&self.cfg).unwrap_or_default();
         let out = show_tab(
             ui,
@@ -2233,7 +2229,7 @@ impl App {
         if self.cfg.banks != banks_before {
             self.mark_dirty();
         }
-        if self.cfg.jit != jit_before {
+        if self.cfg.debug != debug_before {
             self.mark_dirty();
         }
         // A disk image was just picked: check up front whether its folder is

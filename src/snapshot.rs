@@ -63,12 +63,11 @@ pub struct DiskRef {
 
 /// Build the list of cargo features enabled in this binary. Recorded in the
 /// manifest and required to match on restore, since features such as `ci_clock`
-/// (synthetic clock) and `jit` change CPU/timer semantics that the captured
+/// (synthetic clock) change CPU/timer semantics that the captured
 /// state assumes. Sorted for stable comparison.
 pub fn enabled_features() -> Vec<String> {
     let mut f: Vec<String> = Vec::new();
     macro_rules! push_if { ($name:literal) => { if cfg!(feature = $name) { f.push($name.to_string()); } } }
-    push_if!("jit");
     push_if!("rex-jit");
     push_if!("lightning");
     push_if!("ci_clock");

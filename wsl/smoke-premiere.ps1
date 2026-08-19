@@ -20,11 +20,6 @@ if (-not (Test-Path $Config)) {
 & wsl\ensure-build.bat cli
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$env:IRIS_JIT = "1"
-$env:IRIS_JIT_PROBE = "500"
-$env:IRIS_JIT_PROBE_MIN = "100"
-$env:IRIS_JIT_MAX_TIER = "1"
-
 Write-Host "Starting iris headless CI..."
 $iris = Start-Process -FilePath "target\release\iris.exe" -ArgumentList @("--config", $Config) -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 8

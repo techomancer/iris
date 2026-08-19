@@ -1,13 +1,9 @@
 # Capture host stderr + print checklist when IRIX apps quit silently.
 # Usage:
-#   wsl\capture-app-crash.ps1                    # JIT on, default config
-#   wsl\capture-app-crash.ps1 -NoJit             # interpreter A/B
-#   wsl\capture-app-crash.ps1 -Verify            # IRIS_JIT_VERIFY=1
+#   wsl\capture-app-crash.ps1
 #   wsl\capture-app-crash.ps1 -Config irix-install\iris-windows-384.toml
 param(
     [string]$Config = "irix-install\iris-windows.toml",
-    [switch]$NoJit,
-    [switch]$Verify,
     [string]$LogFile = "premiere-debug.log"
 )
 
@@ -40,30 +36,10 @@ Write-Host ""
 & wsl\ensure-build.bat cli
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$env:IRIS_JIT_PROBE = "500"
-$env:IRIS_JIT_PROBE_MIN = "100"
-$env:IRIS_JIT_MAX_TIER = "1"
-
-if ($NoJit) {
-    $env:IRIS_JIT = "0"
-    Remove-Item Env:IRIS_JIT_VERIFY -ErrorAction SilentlyContinue
-    Write-Host "Mode: NO JIT (interpreter only)" -ForegroundColor Magenta
-} else {
-    $env:IRIS_JIT = "1"
-    if ($Verify) {
-        $env:IRIS_JIT_VERIFY = "1"
-        Write-Host "Mode: JIT + VERIFY (slow, catches codegen mismatches)" -ForegroundColor Magenta
-    } else {
-        Remove-Item Env:IRIS_JIT_VERIFY -ErrorAction SilentlyContinue
-        Write-Host "Mode: JIT (premiere default)" -ForegroundColor Magenta
-    }
-}
-
 $logPath = Join-Path $root $LogFile
 $header = @"
 === IRIS capture session $(Get-Date -Format o) ===
 Config: $Config
-NoJit: $NoJit  Verify: $Verify
 Banks: $(if (Test-Path $Config) { (Select-String -Path $Config -Pattern '^banks\s*=').Line } else { 'n/a' })
 ===
 "@

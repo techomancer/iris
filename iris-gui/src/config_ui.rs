@@ -1,9 +1,8 @@
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, Ui};
 use iris::build_features;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use iris::config::{
-    ForwardBind, ForwardProto, GraphicsBoard, JitConfig, MachineConfig, MachineProfile, NetMode,
+    ForwardBind, ForwardProto, GraphicsBoard, MachineConfig, MachineProfile, NetMode,
     NfsConfig, PortForwardConfig, ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard,
     VALID_BANK_SIZES,
 };
@@ -97,8 +96,8 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Tabs to show for the active build. The Debug/JIT tab is hidden in
-    /// lightning builds (the JIT debug paths it drives are compiled out), and
+    /// Tabs to show for the active build. The Debug tab is hidden in
+    /// lightning builds (the debug paths it drives are compiled out), and
     /// the CI/Automation tab is hidden in App Store builds (the iris-ci socket
     /// is a developer automation feature, not something a sandboxed end user
     /// can use). Both fall back to the full set for ordinary builds.
@@ -123,77 +122,9 @@ impl Tab {
             Tab::Memory  => "Memory",
             Tab::Display => "Display",
             Tab::VideoIn => "Video-In",
-            Tab::Debug   => "Debug / JIT",
+            Tab::Debug   => "Debug",
             Tab::Ci      => "CI / Automation",
         }
-    }
-}
-
-/// Legacy GUI JIT wrapper — maps to [`JitConfig`] in `MachineConfig`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct JitEnv {
-    pub iris_jit: bool,
-    pub max_tier: Option<u8>,
-    pub verify: bool,
-    pub no_stores: bool,
-    #[serde(default)]
-    pub probe: String,
-    #[serde(default)]
-    pub trace_file: String,
-    #[serde(default)]
-    pub profile_file: String,
-    pub no_idle: bool,
-    #[serde(default)]
-    pub debug_log: String,
-    #[serde(default)]
-    pub gui_gl_capture: bool,
-}
-
-impl From<&JitConfig> for JitEnv {
-    fn from(c: &JitConfig) -> Self {
-        Self {
-            iris_jit: c.enabled,
-            max_tier: Some(c.max_tier),
-            verify: c.verify,
-            no_stores: !c.compile_stores,
-            probe: c.probe.to_string(),
-            trace_file: c.trace_file.clone(),
-            profile_file: c.profile_file.clone(),
-            no_idle: c.no_idle,
-            debug_log: c.debug_log.clone(),
-            gui_gl_capture: c.gui_gl_capture,
-        }
-    }
-}
-
-impl From<&JitEnv> for JitConfig {
-    fn from(e: &JitEnv) -> Self {
-        let mut c = JitConfig {
-            enabled: e.iris_jit,
-            max_tier: e.max_tier.unwrap_or(2),
-            verify: e.verify,
-            compile_stores: !e.no_stores,
-            no_idle: e.no_idle,
-            gui_gl_capture: e.gui_gl_capture,
-            trace_file: e.trace_file.clone(),
-            profile_file: e.profile_file.clone(),
-            debug_log: e.debug_log.clone(),
-            ..JitConfig::default()
-        };
-        if let Ok(p) = e.probe.parse::<u32>() {
-            c.probe = p;
-        }
-        c
-    }
-}
-
-impl JitEnv {
-    pub fn export(&self) {
-        JitConfig::from(self).apply_env();
-    }
-
-    pub fn premiere_defaults() -> Self {
-        JitEnv::from(&JitConfig::premiere_defaults())
     }
 }
 
@@ -1396,9 +1327,6 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.label("CPU");
         ui.label(build_features::CPU);
         ui.end_row();
-        ui.label("MIPS JIT");
-        ui.label(if build_features::JIT { "enabled at compile time" } else { "not built" });
-        ui.end_row();
         ui.label("REX3 JIT");
         ui.label(if build_features::REX_JIT { "enabled at compile time" } else { "not built" });
         ui.end_row();
@@ -1426,7 +1354,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         .small(),
     );
     ui.separator();
-    ui.heading("Debug / JIT");
+    ui.heading("Debug");
     if build_features::LIGHTNING {
         ui.label(RichText::new(
             "⚡ Lightning build — interactive debugging is disabled \
@@ -1447,7 +1375,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.label("Capture (iris-gui framebuffer path)");
     Grid::new("capture_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("OpenGL capture (IRIS_GUI_GL)");
-        ui.checkbox(&mut cfg.jit.gui_gl_capture, "")
+        ui.checkbox(&mut cfg.debug.gui_gl_capture, "")
             .on_hover_text("Use GlCompositor on the refresh thread (faster GL demos in GUI). CLI iris.exe is still fastest for recording.");
         ui.end_row();
     });
@@ -1457,70 +1385,25 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             .small(),
     );
     ui.separator();
-    // The v1 MIPS JIT is an opt-in build feature, so these knobs do nothing
-    // unless this binary was built with iris-gui's `jit` passthrough.
-    ui.label(if build_features::JIT {
-        "JIT"
-    } else {
-        "JIT (inert — this build has no JIT; rebuild with `cargo build -p iris-gui --features jit`)"
-    });
-    Grid::new("jit_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("Enable JIT (IRIS_JIT=1)");
-        ui.checkbox(&mut cfg.jit.enabled, "");
-        ui.end_row();
-
-        ui.label("Max tier (0=ALU, 1=Loads, 2=Full)");
-        let mut t = cfg.jit.max_tier;
-        if ui.add(DragValue::new(&mut t).range(0..=2)).changed() {
-            cfg.jit.max_tier = t;
-        }
-        ui.end_row();
-
-        ui.label("Verify against interpreter");
-        ui.checkbox(&mut cfg.jit.verify, "");
-        ui.end_row();
-
-        ui.label("Compile JIT stores (experimental)");
-        ui.checkbox(&mut cfg.jit.compile_stores, "")
-            .on_hover_text("When enabled, MIPS JIT may compile stores (write-log rollback path)");
-        ui.end_row();
-
-        ui.label("Probe interval");
-        ui.add(DragValue::new(&mut cfg.jit.probe).range(50..=5000).speed(10));
-        ui.end_row();
-
-        ui.label("Probe min");
-        ui.add(DragValue::new(&mut cfg.jit.probe_min).range(10..=1000).speed(5));
-        ui.end_row();
-
-        ui.label("Trace file");
-        path_row(ui, "jit_trace", &mut cfg.jit.trace_file, Pick::SaveFile, ANY_FILTERS);
-        ui.end_row();
-
-        ui.label("Profile file");
-        path_row(ui, "jit_profile", &mut cfg.jit.profile_file, Pick::SaveFile, ANY_FILTERS);
-        ui.end_row();
-    });
-    ui.separator();
     Grid::new("misc_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Disable idle park (IRIS_NO_IDLE)");
-        ui.checkbox(&mut cfg.jit.no_idle, "");
+        ui.checkbox(&mut cfg.debug.no_idle, "");
         ui.end_row();
         ui.label("Devlog spec (IRIS_DEBUG_LOG)");
-        ui.add(TextEdit::singleline(&mut cfg.jit.debug_log).hint_text("all, or e.g. mc,mips").desired_width(280.0));
+        ui.add(TextEdit::singleline(&mut cfg.debug.debug_log).hint_text("all, or e.g. mc,mips").desired_width(280.0));
         ui.end_row();
     });
     ui.separator();
     ui.label(RichText::new("Build profiles (from repo root):").strong());
     ui.horizontal(|ui| {
-        if ui.button("Rebuild Premiere CLI…").on_hover_text("lightning,rex-jit,jit,idle-pause").clicked() {
+        if ui.button("Rebuild Premiere CLI…").on_hover_text("lightning,rex-jit,idle-pause").clicked() {
             action = ConfigAction::RebuildProfile { gui: false };
         }
         if ui.button("Rebuild Premiere GUI…").on_hover_text("--features premiere").clicked() {
             action = ConfigAction::RebuildProfile { gui: true };
         }
     });
-    ui.monospace("cargo build --release --bin iris --features lightning,rex-jit,jit,idle-pause");
+    ui.monospace("cargo build --release --bin iris --features lightning,rex-jit,idle-pause");
     ui.monospace("cargo build -p iris-gui --release --features premiere");
     ui.monospace("cargo build -p iris-gui --release --features iris/r5k,iris/r5ksc  # R5000SC");
     ui.separator();

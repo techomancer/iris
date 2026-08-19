@@ -68,8 +68,6 @@ r5ksc_triton = ["r5ksc"]
 # off keeps deterministic-clock and raw-benchmark builds simple.
 idle-pause = []
 default = ["tlbvmap"]
-# Cranelift-based JIT compiler for MIPS → native translation.
-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).

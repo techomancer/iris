@@ -17,13 +17,6 @@ profile = "indigo2_ip22"
 [graphics]
 heads = 1
 
-[jit]
-enabled = true
-probe = 500
-probe_min = 100
-max_tier = 2
-compile_stores = false
-
 [perf]
 thread_affinity = false
 

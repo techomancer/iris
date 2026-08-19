@@ -6,13 +6,11 @@ This folder is the **Windows 11 daily-driver guide** for this repo copy (`CURSOR
 
 | Script | What it does |
 |--------|----------------|
-| `run-iris-premiere.bat` | **Recording:** full-feature `iris.exe` CLI + JIT env (best 3D/X11 perf) |
-| `run-iris-premiere-nojit.bat` | **A/B:** same config, `IRIS_JIT=0` (interpreter — test silent app quits) |
-| `run-iris-premiere-verify.bat` | JIT + `IRIS_JIT_VERIFY=1` (slow; catches codegen mismatches) |
+| `run-iris-premiere.bat` | **Recording:** full-feature `iris.exe` CLI (lightning+rex-jit+idle-pause; best 3D/X11 perf) |
 | `capture-app-crash.ps1` | Tee stderr to `premiere-debug.log` + on-screen capture checklist |
-| `run-iris-windows.bat` | IRIS CLI with full performance features + JIT env |
+| `run-iris-windows.bat` | IRIS CLI with full performance features (lightning+rex-jit+idle-pause) |
 | `run-iris-gui-windows.bat` | iris-gui launcher (configure machines in the UI) |
-| `run-iris-gui-premiere.bat` | **Premiere GUI:** `premiere` feature (lightning+idle-pause) + JIT + `IRIS_GUI_GL=1` |
+| `run-iris-gui-premiere.bat` | **Premiere GUI:** `premiere` feature (lightning+idle-pause) + `IRIS_GUI_GL=1` |
 | `run-iris-ci.bat` | Headless CI with `iris-windows.toml` (TCP `127.0.0.1:19851`) |
 | `run-iris.bat` | IRIS CLI via WSL (iris-ci, Linux tools) |
 | `run-iris-gui.bat` | iris-gui via WSL |
@@ -29,11 +27,12 @@ Changes beyond upstream IRIS that affect how you run and configure the Indy:
 
 | Area | What |
 |------|------|
-| **Launch scripts** | `run-iris-premiere.bat` / `run-iris-windows.bat` set `IRIS_JIT`, probe 500/min 100, **tier 1** (Loads); **feature stamp** rebuild via `ensure-build.bat` |
+| **Launch scripts** | `run-iris-premiere.bat` / `run-iris-windows.bat` build with `lightning,rex-jit,idle-pause`; **feature stamp** rebuild via `ensure-build.bat` |
 | **Premiere GUI** | `cargo build -p iris-gui --features premiere` — embedded `lightning` + `idle-pause`; `run-iris-gui-premiere.bat` |
-| **GUI prefs** | JIT + OpenGL capture persisted in `gui.json`; **File → Prepare for premiere…** exports TOML |
+| **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in `gui.json`; **File → Prepare for premiere…** exports TOML |
 | **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [rules/perf/gui-idle-refresh.md](../rules/perf/gui-idle-refresh.md) |
 | **Audio** | hptimer late-fire catch-up; Display tab `[audio]` prebuf / cpal buffer |
+| **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); tuning via `--features jitv2_lockstep,jitv2_corpus_dump,jitv2_opcodefusion` and `[jitv2] threads` in TOML |
 
 See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 
@@ -56,41 +55,36 @@ See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 | Status bar **MIPS** | Instructions per wall-clock second on your PC |
 | Status bar **Hz** | CP0 Compare tick rate — **not** CPU MHz |
 
-Enabling JIT raises MIPS; hinv MHz stays the same. That is expected.
+Enabling `rex-jit`/`jitv2` raises MIPS; hinv MHz stays the same. That is expected.
 
 ---
 
 ## Native Windows build (recommended for daily use)
 
 ```powershell
-cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,jit,idle-pause
+cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,idle-pause
 cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release
 ```
 
 Runtime (CLI):
 
 ```powershell
-$env:IRIS_JIT = "1"
-$env:IRIS_JIT_PROBE = "500"
-$env:IRIS_JIT_PROBE_MIN = "100"
-$env:IRIS_JIT_MAX_TIER = "2"
 .\target\release\iris.exe --config irix-install\iris-windows.toml
 ```
 
-Or use `wsl\run-iris-premiere.bat` (sets env vars automatically).
+Or use `wsl\run-iris-premiere.bat` (builds with the right features automatically).
 
 Close `iris-gui.exe` before rebuilding if the linker reports “Access is denied”.
 
-### JIT warm-up (do this before recording)
+### REX3 JIT warm-up (do this before recording)
 
-Both JITs learn across sessions. **First boot after install is always the slowest.**
+The REX3 draw-mode JIT learns across sessions. **First boot after install is always the slowest.**
 
 | Profile | Path | Purpose |
 |---------|------|---------|
-| MIPS JIT | `%USERPROFILE%\.iris\jit-profile.bin` | Hot kernel/userspace blocks |
 | REX3 JIT | `%USERPROFILE%\.iris\rex-jit-profile.bin` | Draw-mode shaders |
 
-**Before recording:** boot IRIX once, open a GL app (`glxgears`, 4Dwm), interact for 5–10 minutes, quit cleanly. The second boot replays saved profiles and is dramatically smoother.
+**Before recording:** boot IRIX once, open a GL app (`glxgears`, 4Dwm), interact for 5–10 minutes, quit cleanly. The second boot replays the saved profile and is smoother.
 
 Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 status` (cpal underrun counter; codec A dedicated pump).
 
@@ -100,11 +94,9 @@ Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 stat
 
 ### Phase 3 unified config
 
-Export from iris-gui includes `[jit]`, `[perf]`, and `[machine]` sections. See [rules/perf/phase3-platform.md](../rules/perf/phase3-platform.md).
+Export from iris-gui includes `[perf]` and `[machine]` sections (plus `[jitv2]` if built with the `jitv2` feature). See [rules/perf/phase3-platform.md](../rules/perf/phase3-platform.md).
 
 Windows CI default socket: `127.0.0.1:19851` (TCP). Unix: `/tmp/iris.sock`.
-
-**Warm-up script:** `wsl\warm-jit-profiles.ps1` — launches premiere iris and prints the checklist.
 
 **A/B recording script:** `wsl\premiere-ab-checklist.ps1` — Take A (slow) vs Take B (premiere CLI) commands.
 
@@ -122,7 +114,7 @@ The `premiere` feature enables `lightning` + `idle-pause` on the embedded iris c
 | Path | Best for |
 |------|----------|
 | `run-iris-premiere.bat` (CLI) | **Max 3D/X11** — native OpenGL + vsync |
-| `run-iris-gui-premiere.bat` | In-process demo with JIT + GL capture |
+| `run-iris-gui-premiere.bat` | In-process demo with GL capture |
 | `run-iris-gui-windows.bat` | Daily config (lighter build) |
 
 ### Optional: GPU capture in iris-gui
@@ -171,9 +163,8 @@ For **IRIX 6.5**, prefer **384 MB** over 512 MB. The 512 MB preset is documented
 
 See [rules/testing/silent-app-quit-debug.md](../rules/testing/silent-app-quit-debug.md).
 
-1. **JIT A/B:** `wsl\run-iris-premiere-nojit.bat` vs `wsl\run-iris-premiere.bat`
-2. **Capture log:** `wsl\capture-app-crash.ps1` (add `-Verify` if JIT-on reproduces the quit)
-3. **RAM A/B:** `--config irix-install\iris-windows-384.toml` if you were on 512 MB
+1. **Capture log:** `wsl\capture-app-crash.ps1`
+2. **RAM A/B:** `--config irix-install\iris-windows-384.toml` if you were on 512 MB
 
 Send `premiere-debug.log`, monitor `status`/`bt`/`dt 80`, and `hinv -t memory` after a quit.
 
@@ -183,7 +174,7 @@ Compile-time CPU — rebuild **both** CLI and GUI:
 
 ```powershell
 cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release --features iris/r5k,iris/r5ksc
-cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,jit,idle-pause,iris/r5k,iris/r5ksc
+cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,idle-pause,iris/r5k,iris/r5ksc
 ```
 
 ```toml
@@ -203,7 +194,7 @@ The GUI and CLI use the same **`MachineConfig`** schema but **different files** 
 |-------|--------|
 | **iris-gui** | `%APPDATA%\iris\gui.json` |
 | **iris CLI** | `iris.toml` via `--config` |
-| **JIT env** | **Not in TOML** — GUI Debug tab sets `IRIS_JIT*` at Start; CLI uses bat/shell env |
+| **Debug settings** | `[debug]` TOML section (`gui_gl_capture`, `no_idle`, `debug_log`) — GUI Debug tab edits it; maps to `IRIS_GUI_GL`/`IRIS_NO_IDLE`/`IRIS_DEBUG_LOG` at Start |
 | **iris-ci** | Nothing (socket client only) |
 
 ### Recommended: one canonical TOML
@@ -236,18 +227,15 @@ GUI edits  →  File → Export  →  iris-windows.toml  →  premiere.bat / iri
 1. **File → Import iris.toml…** → pick `irix-install/iris-windows.toml`.
 2. **Stop → Start** so guest RAM matches imported `banks`.
 
-### JIT parity (GUI vs CLI)
+### Debug parity (GUI vs CLI)
 
-Mirror the GUI **Debug / JIT** tab in your launch script:
+Mirror the GUI **Debug** tab (`gui_gl_capture`, `no_idle`, `debug_log`) in your launch script if you need the same env at CLI:
 
 ```powershell
-$env:IRIS_JIT = "1"
-$env:IRIS_JIT_PROBE = "500"
-$env:IRIS_JIT_PROBE_MIN = "100"
-$env:IRIS_JIT_MAX_TIER = "2"
+$env:IRIS_GUI_GL = "1"
+$env:IRIS_NO_IDLE = "1"
+$env:IRIS_DEBUG_LOG = "all"
 ```
-
-(`run-iris-premiere.bat` already sets these.)
 
 ### CI (`iris-ci`)
 
@@ -266,7 +254,7 @@ See [rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md](../rules/sn
 - [ ] Same `banks` in exported TOML and GUI Memory tab
 - [ ] Same `nvram`, `scsi.*.path`, `prom` paths (run from repo root or use absolute paths)
 - [ ] **Stop → Start** in GUI after RAM changes
-- [ ] Same JIT env for CLI as GUI Debug tab
+- [ ] Same Debug env for CLI as GUI Debug tab
 - [ ] `mc status` shows expected MEMCFG for extended RAM
 - [ ] Re-export after GUI changes you want CLI/CI to keep
 
@@ -277,7 +265,7 @@ See [rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md](../rules/sn
 1. Run `run-iris-gui-windows.bat`
 2. **File → Import iris.toml…** → `irix-install/iris-windows.toml` (or create a machine and configure)
 3. **Memory** tab: pick **256 MB** (authentic) or **384 MB** (IRIX 6.5 extended)
-4. **Debug / JIT** tab: enable **IRIS_JIT=1**, probe **500** / min **100**
+4. **Debug** tab: set GL capture / no-idle / debug-log if needed (defaults are fine for normal use)
 5. **Start**
 6. After further edits: **File → Export** so CLI/premiere.bat stay aligned
 
@@ -299,7 +287,7 @@ chmod +x wsl/run-iris.sh wsl/run-iris-gui.sh
 **Windows (native):**
 
 ```powershell
-cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,jit,idle-pause
+cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,idle-pause
 cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release
 ```
 
@@ -307,9 +295,11 @@ cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release
 
 ```bash
 cd ~/iris-wsl-build
-cargo build --release --bin iris --features lightning,rex-jit,jit,idle-pause
+cargo build --release --bin iris --features lightning,rex-jit,idle-pause
 cargo build -p iris-gui --release
 ```
+
+Add `,jitv2` to try the experimental region JIT instead of (or alongside) `rex-jit`.
 
 ---
 

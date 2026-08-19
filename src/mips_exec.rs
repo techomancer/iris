@@ -8419,12 +8419,6 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             // before the CPU was last stopped).
             crate::platform::set_fpu_mode((guard.core.fpu_fcsr & 0x3) as u8);
 
-            #[cfg(feature = "jit")]
-            {
-                crate::jit::dispatch::run_jit_dispatch(&mut *guard, &running);
-                return;
-            }
-
             // --- perf sampling (comment out to disable) ---
             //let mut last_cycles: u64 = guard.core.hot.cycles;
             //let mut last_time = std::time::Instant::now();
@@ -8443,11 +8437,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             // iteration, so its state never repeats — we must NOT park it or
             // boot stalls. The state-repeat test distinguishes the two.
             #[cfg(feature = "idle-pause")]
-            // Unreachable when the JIT dispatch above returns; harmless.
-            #[allow(unreachable_code)]
             let mut idle_state = crate::idle_park::IdleParkState::default();
 
-            #[allow(unreachable_code)]
             while running.load(Ordering::Relaxed) {
                 #[cfg(feature = "lightning")]
                 for _ in 0..1000 {

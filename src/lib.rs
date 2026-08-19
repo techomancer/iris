@@ -14,7 +14,6 @@ pub mod build_features {
     pub const CHD:       bool = cfg!(feature = "chd");
     pub const CAMERA:    bool = cfg!(feature = "camera");
     pub const PCAP:      bool = cfg!(feature = "pcap");
-    pub const JIT:       bool = cfg!(feature = "jit");
     pub const JITV2:     bool = cfg!(feature = "jitv2");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
     /// N64 development board (Ultra64 GIO card) + POSIX shm bridge to an
@@ -131,8 +130,6 @@ pub mod xz;
 pub mod mgras;
 pub mod ultra_proto;
 pub mod ultra64;
-#[cfg(feature = "jit")]
-pub mod jit;
 #[cfg(feature = "rex-jit")]
 pub mod rex3_jit;
 #[cfg(feature = "jitv2")]

@@ -524,83 +524,36 @@ impl Default for MachineSection {
     }
 }
 
-/// MIPS / REX3 JIT runtime tuning (`[jit]` section). Applied to process env at Start.
+/// Misc debug/capture runtime tuning (`[debug]` section). Applied to process
+/// env at Start. These knobs are independent of any particular JIT engine —
+/// gui_gl_capture picks iris-gui's framebuffer capture renderer, no_idle
+/// disables the interpreter's idle-park path, and debug_log seeds the devlog
+/// module spec — see their respective `IRIS_*` env var readers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct JitConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_jit_probe")]
-    pub probe: u32,
-    #[serde(default = "default_jit_probe_min")]
-    pub probe_min: u32,
-    #[serde(default = "default_jit_max_tier")]
-    pub max_tier: u8,
+pub struct DebugConfig {
     /// iris-gui only: use GlCompositor capture path (IRIS_GUI_GL=1).
     #[serde(default)]
     pub gui_gl_capture: bool,
-    /// Allow Full-tier store compilation (uses write-log rollback). Off by default.
-    #[serde(default)]
-    pub compile_stores: bool,
-    #[serde(default)]
-    pub verify: bool,
     #[serde(default)]
     pub no_idle: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub trace_file: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub profile_file: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub debug_log: String,
 }
 
-fn default_jit_probe() -> u32 { 500 }
-fn default_jit_probe_min() -> u32 { 100 }
-fn default_jit_max_tier() -> u8 { 2 }
-
-impl Default for JitConfig {
+impl Default for DebugConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            probe: default_jit_probe(),
-            probe_min: default_jit_probe_min(),
-            max_tier: default_jit_max_tier(),
             gui_gl_capture: false,
-            compile_stores: false,
-            verify: false,
             no_idle: false,
-            trace_file: String::new(),
-            profile_file: String::new(),
             debug_log: String::new(),
         }
     }
 }
 
-impl JitConfig {
-    pub fn premiere_defaults() -> Self {
-        Self { enabled: true, max_tier: 1, ..Default::default() }
-    }
-
+impl DebugConfig {
     /// Apply to current process environment (CLI and iris-gui before Machine::new).
     pub fn apply_env(&self) {
-        if self.enabled {
-            std::env::set_var("IRIS_JIT", "1");
-        } else {
-            std::env::remove_var("IRIS_JIT");
-        }
-        std::env::set_var("IRIS_JIT_PROBE", self.probe.to_string());
-        std::env::set_var("IRIS_JIT_PROBE_MIN", self.probe_min.to_string());
-        std::env::set_var("IRIS_JIT_MAX_TIER", self.max_tier.to_string());
-        if self.verify {
-            std::env::set_var("IRIS_JIT_VERIFY", "1");
-        } else {
-            std::env::remove_var("IRIS_JIT_VERIFY");
-        }
-        if self.compile_stores {
-            std::env::remove_var("IRIS_JIT_NO_STORES");
-        } else {
-            std::env::set_var("IRIS_JIT_NO_STORES", "1");
-        }
         if self.no_idle {
             std::env::set_var("IRIS_NO_IDLE", "1");
         } else {
@@ -611,8 +564,6 @@ impl JitConfig {
         } else {
             std::env::remove_var("IRIS_GUI_GL");
         }
-        set_or_remove_env("IRIS_JIT_TRACE", &self.trace_file);
-        set_or_remove_env("IRIS_JIT_PROFILE", &self.profile_file);
         set_or_remove_env("IRIS_DEBUG_LOG", &self.debug_log);
     }
 }
@@ -625,11 +576,10 @@ fn set_or_remove_env(key: &str, val: &str) {
     }
 }
 
-/// jitv2 compile-pool tuning (`[jitv2]` section) — unrelated to the legacy
-/// `[jit]`/`JitConfig` above (that's the older MIPS/REX3 JIT engine); this
-/// is the new jitv2 engine's one tunable today, its compile-pool thread
-/// count. Fixed at process startup, never changed at runtime — see
-/// `CompileQueue::set_thread_count`'s own doc comment for why.
+/// jitv2 compile-pool tuning (`[jitv2]` section) — its one tunable today,
+/// the compile-pool thread count. Fixed at process startup, never changed
+/// at runtime — see `CompileQueue::set_thread_count`'s own doc comment for
+/// why.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
@@ -916,12 +866,11 @@ pub struct MachineConfig {
     #[serde(default)]
     pub impact: ImpactSection,
 
-    /// JIT runtime tuning (`[jit]` section).
+    /// Misc debug/capture runtime tuning (`[debug]` section).
     #[serde(default)]
-    pub jit: JitConfig,
+    pub debug: DebugConfig,
 
-    /// jitv2 compile-pool tuning (`[jitv2]` section) — distinct from the
-    /// legacy `jit` section above, see `Jitv2Config`'s own doc comment.
+    /// jitv2 compile-pool tuning (`[jitv2]` section).
     #[serde(default)]
     pub jitv2: Jitv2Config,
 
@@ -1040,7 +989,7 @@ impl Default for MachineConfig {
             machine: MachineSection::default(),
             graphics: GraphicsSection::default(),
             impact: ImpactSection::default(),
-            jit: JitConfig::default(),
+            debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),

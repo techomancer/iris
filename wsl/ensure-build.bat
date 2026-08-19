@@ -12,7 +12,7 @@ exit /b 1
 :cli
 set BIN=target\release\iris.exe
 set STAMP=target\release\.iris-cli-premiere.stamp
-set WANT=lightning,rex-jit,jit,idle-pause
+set WANT=lightning,rex-jit,idle-pause
 set BUILD=cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features %WANT%
 goto :check
 

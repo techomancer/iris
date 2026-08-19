@@ -35,8 +35,8 @@ fn main() {
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
 
-    // Apply [jit] from TOML (env vars still override if set externally).
-    cfg.jit.apply_env();
+    // Apply [debug] from TOML (env vars still override if set externally).
+    cfg.debug.apply_env();
 
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.
@@ -145,7 +145,6 @@ fn main() {
 /// the interpreter's idle-park path, so an idle guest spins the host CPU).
 fn print_build_features() {
     const FEATURES: &[(&str, bool)] = &[
-        ("jit", cfg!(feature = "jit")),
         ("rex-jit", cfg!(feature = "rex-jit")),
         ("lightning", cfg!(feature = "lightning")),
         ("tlbvmap", cfg!(feature = "tlbvmap")),

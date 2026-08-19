@@ -39,8 +39,11 @@ idle-loop candidate: 0x88011704..=0x88011748 (72 bytes) — ~57% of samples, int
   `write_cp0(Compare)` (`mips_core.rs:538+`) so guest time tracks real time.
 - Production CPU run loop: `MipsCpu::start()` (`mips_exec.rs:~4983`) spawns the
   `MIPS-CPU` thread running `step()` in batches of 1000, holding the executor
-  lock for the whole run. (JIT path: `jit/dispatch.rs`, only used with
-  `--features jit` + `IRIS_JIT=1`.)
+  lock for the whole run. (This is the interpreter run loop; the v1 Cranelift JIT
+  that used to bypass it — `--features jit` + `IRIS_JIT=1` — has since been
+  removed. The current `jitv2` region compiler, `--features jitv2`, is
+  architecturally different and its interaction with idle-pause has not been
+  re-investigated.)
 
 ## 3. Tools/code added so far
 
@@ -52,7 +55,8 @@ CPU is never paused to enable it.
 - Workflow: `idleprof on` → let guest idle → `stop` (once) → `idleprof report`.
 - Report flags the contiguous interrupts-enabled PC window (the idle loop) and
   shows per-PC `ie%`.
-- **Build without `--features jit`** so `step()` sees every instruction.
+- Works against the interpreter run loop so `step()` sees every instruction
+  (the old `--features jit` build that bypassed `step()` no longer exists).
 
 ### Snapshot provenance (in `src/snapshot.rs` + `src/machine.rs`)
 The manifest (`saves/<name>/snapshot.toml`) now records and validates **features**,
@@ -137,10 +141,12 @@ means we can stop executing and let real time pass.
 - **Safety net:** never sleep past the next `Compare` tick (~10 ms), so a
   false-positive idle detection costs ≤1 tick of latency and can't deadlock.
 - **Caveats:** keep the per-step detector cheap (gate on a backward branch +
-  `interrupts_enabled()` before any expensive tracking). For the JIT path the loop
-  is compiled and chains skip interrupt checks (`jit/dispatch.rs:705`) — hook at the
-  burst boundary, not mid-chain. Validate by watching host CPU drop to ~0 at the
-  idle prompt while the clock and interactivity stay correct.
+  `interrupts_enabled()` before any expensive tracking). The removed v1 JIT
+  compiled chains that skipped interrupt checks mid-chain, so idle detection had
+  to hook at the burst boundary, not mid-chain; `jitv2` is a different, region-based
+  design and this constraint has not been re-examined for it. Validate by watching
+  host CPU drop to ~0 at the idle prompt while the clock and interactivity stay
+  correct.
 
 ### Implemented so far (`src/mips_exec.rs`, in the `MIPS-CPU` run loop in `start()`)
 
@@ -192,5 +198,6 @@ correctly at the getty prompt. The lesson: high idle CPU may be a busy *guest*
 process (here xdm-on-headless), distinct from the kernel idle loop the detector
 targets.
 
-**Other TODO:** the JIT path (`--features jit`) bypasses this run loop entirely
-(`jit/dispatch.rs`); idle park there is not yet implemented.
+**Other TODO:** the v1 JIT path that bypassed this run loop entirely has been
+removed. Whether/how `jitv2` (`--features jitv2`, a from-scratch region compiler)
+needs its own idle-park hook has not yet been investigated.

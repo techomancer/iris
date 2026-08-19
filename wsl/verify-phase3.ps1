@@ -51,11 +51,6 @@ if (-not (Test-Path $Config)) { throw "Missing $Config" }
 if (-not (Test-Path "target\release\iris.exe")) { throw "Build iris first" }
 if (-not (Test-Path "target\release\iris-ci.exe")) { throw "Build iris-ci first" }
 
-$env:IRIS_JIT = "1"
-$env:IRIS_JIT_PROBE = "500"
-$env:IRIS_JIT_PROBE_MIN = "100"
-$env:IRIS_JIT_MAX_TIER = "2"
-
 $logOut = Join-Path $env:TEMP "iris-smoke-out.log"
 $logErr = Join-Path $env:TEMP "iris-smoke-err.log"
 Write-Host "Starting iris (logs: $logOut)..."

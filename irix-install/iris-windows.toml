@@ -18,14 +18,6 @@ scale    = 1
 [machine]
 profile = "indy_ip24"
 
-[jit]
-enabled         = true
-probe           = 500
-probe_min       = 100
-max_tier        = 1
-compile_stores  = false
-gui_gl_capture  = false
-
 [perf]
 thread_affinity = false
 # cpu_core = 0

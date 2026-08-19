@@ -13,7 +13,7 @@ and 5.3 to a usable system (shell, networking, X11). It is **not** cycle-accurat
 - `README.md` — overview, feature flags, current status.
 - `docs/` — per-device notes (hal2, rex3, irix-install, …).
 - `rules/` — accumulated, hard-won findings about emulator behaviour
-  (`jit/`, `snapshot/`, `irix/`, `testing/`). Check here before re-deriving a
+  (`jitv2/`, `snapshot/`, `irix/`, `testing/`). Check here before re-deriving a
   gotcha; when you confirm a non-obvious fix, write it up here as a short
   markdown note so the next session doesn't relearn it.
 
@@ -22,12 +22,11 @@ and 5.3 to a usable system (shell, networking, X11). It is **not** cycle-accurat
 ```
 cargo run --release                                       # interpreter
 cargo run --release --features lightning,rex-jit          # recommended for speed
-IRIS_JIT=1 cargo run --release --features jit             # enable MIPS JIT
+cargo run --release --features jitv2,rex-jit              # enable MIPS JIT v2 (experimental)
 ```
 
 Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
-`coffdump`, `chd_extract`. Feature flags and `IRIS_JIT_*` env vars are
-documented in `README.md`.
+`coffdump`, `chd_extract`. Feature flags are documented in `README.md`.
 
 ## Hard invariants (from HACKING.md)
 

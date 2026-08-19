@@ -169,7 +169,7 @@ detect → **open the npcap.com page in the browser** → user installs it → r
 ### B1 — release.yml pcap build variant (Phase 1)
 - [ ] **[main]** Mirror the `lightning` step across every job, adding a 3rd `pcap`
   build. GUI features `iris/lightning,iris/pcap,bundled`; CLI features
-  `chd,camera,jit,rex-jit,lightning,pcap` (keep `chd` explicit on CLI).
+  `chd,camera,rex-jit,lightning,pcap` (keep `chd` explicit on CLI).
 - [ ] **[main]** Native build deps per job: Linux packages `libpcap-dev` (apt);
   Linux AppImage `libpcap` (pacman) + quick-sharun bundles `libpcap.so`; Windows
   **WinPcap Developer Pack** (BSD) on the runner + `LIB`/`rustc-link-search` so

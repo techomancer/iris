@@ -22,7 +22,7 @@ cargo run -p iris-gui --release
 
 The first build is slow because iris-gui forces several heavyweight
 *additive* iris features on so they're available at runtime: `chd`
-(libchdman-rs), `camera` (nokhwa / AVFoundation), `jit` and `rex-jit`
+(libchdman-rs), `camera` (nokhwa / AVFoundation), and `rex-jit`
 (cranelift). Subsequent builds are fast.
 
 A debug build (`cargo run -p iris-gui` without `--release`) is fine for
@@ -44,7 +44,7 @@ Notable Group-B features:
 - `iris/lightning` — strips breakpoint checks + traceback for ~5% speed.
   Interactive debugging (GDB stub) is non-functional in this build. The
   GUI detects this at runtime (`iris::build_features::LIGHTNING`) and
-  greys out the GDB port input on the Debug/JIT tab.
+  greys out the GDB port input on the Debug tab.
 - `iris/r5k`, `iris/r5ksc`, `iris/r5ksc_triton` — switch the emulated CPU
   to an R5000 with 2-way caches (default is R4400 direct-mapped).
 - `iris/tlbstats`, `iris/ci_clock`, `iris/gdc`, `iris/mouseabs`,
@@ -110,7 +110,7 @@ drives. Each ID shows its current state inline:
 - **💾 Save state** / **↶ Restore state** — calls `Machine::save_snapshot` / `Machine::ci_restore` against `saves/<name>/`
 - **Edit config… / Hide config editor** — toggles the collapsible config
   side panel (see Central panel below) for advanced settings that aren't
-  surfaced as menu actions (Network, Video-In, Debug/JIT, CI)
+  surfaced as menu actions (Network, Video-In, Debug, CI)
 - Right side: status pill (PROM / IRIX running / halted / stopped) and
   MIPS counter
 
@@ -126,7 +126,7 @@ Start button.
 
 The **Edit config… / Hide config editor** toolbar toggle slides in a
 collapsible **right-hand side panel** with the tabbed editor (Network /
-Video-In / Debug/JIT / CI). It no longer covers the central panel, so you
+Video-In / Debug / CI). It no longer covers the central panel, so you
 can change settings while watching the emulator screen. The panel is
 resizable — drag its left edge to trade width with the screen — and is
 dismissed with either the toolbar toggle or the **✕** in its header. It
@@ -299,7 +299,7 @@ iris/
 ├── Cargo.toml         [workspace] { members = ["iris-gui"] }
 ├── src/               iris library + CLI (unchanged)
 └── iris-gui/
-    ├── Cargo.toml     depends on iris with chd, camera, jit, rex-jit on
+    ├── Cargo.toml     depends on iris with chd, camera, rex-jit on
     └── src/
         ├── main.rs            App, menu bar, toolbar, modals, update loop
         ├── handle.rs          EmulatorHandle: worker thread, command/event channels
@@ -370,7 +370,7 @@ status accessors (see Phase C notes).
 pub mod build_features {
     pub const CHD:       bool = cfg!(feature = "chd");
     pub const CAMERA:    bool = cfg!(feature = "camera");
-    pub const JIT:       bool = cfg!(feature = "jit");
+    pub const JITV2:     bool = cfg!(feature = "jitv2");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
     pub const LIGHTNING: bool = cfg!(feature = "lightning");
 }
@@ -380,7 +380,7 @@ iris-gui reads these to:
 - Surface the active feature set in **Help → Build features**.
 - Warn on the **Disks** form when a `.chd` path is entered into a
   non-CHD build (currently always on for iris-gui).
-- Hide the GDB stub port input on the Debug/JIT tab under a lightning
+- Hide the GDB stub port input on the Debug tab under a lightning
   build (interactive debugging is non-functional there).
 - Adjust the "camera" label on the Video-In tab.
 

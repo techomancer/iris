@@ -1,5 +1,4 @@
 use iris::config::MachineConfig;
-use iris::config::JitConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,10 +55,6 @@ pub struct GuiSettings {
     /// Store build. See [`crate::macos_sandbox`].
     #[serde(default)]
     pub disk_folders: Vec<String>,
-
-    /// Persisted JIT / capture settings (Debug tab). Applied via env at Start.
-    #[serde(default)]
-    pub jit: crate::config_ui::JitEnv,
 }
 
 /// Byte offset of the Indy's 6-byte Ethernet MAC inside the NVRAM. The PROM
@@ -273,16 +268,6 @@ impl GuiSettings {
         // next save).
         for m in s.machines.values_mut() {
             Self::migrate_nvram_path(&mut m.nvram);
-        }
-        // Legacy top-level jit → active machine [jit] section.
-        if !s.jit.iris_jit && s.jit == crate::config_ui::JitEnv::default() {
-            // nothing to migrate
-        } else if let Some(name) = s.active_machine.clone() {
-            if let Some(m) = s.machines.get_mut(&name) {
-                if m.jit == JitConfig::default() {
-                    m.jit = JitConfig::from(&s.jit);
-                }
-            }
         }
         s
     }

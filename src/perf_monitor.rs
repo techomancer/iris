@@ -105,18 +105,6 @@ impl PerfMonitor {
             writeln!(writer, "HAL2: disabled (no_audio)").map_err(|e| e.to_string())?;
         }
 
-        #[cfg(feature = "jit")]
-        {
-            let jit_on = std::env::var("IRIS_JIT").ok().as_deref() == Some("1");
-            let no_stores = std::env::var("IRIS_JIT_NO_STORES").ok().as_deref() == Some("1");
-            writeln!(
-                writer,
-                "MIPS JIT: {}  compile_stores: {}",
-                if jit_on { "on" } else { "off" },
-                if no_stores { "disabled (interpreter stores)" } else { "enabled" },
-            ).map_err(|e| e.to_string())?;
-        }
-
         Ok(())
     }
 }

@@ -56,7 +56,7 @@ boots to a usable system: shell, networking, X11, the works.
 - IRIX 5.3 works too
 - **Indy IP24:** X11 / Newport (REX3) graphics works, with mouse and keyboard input
 - **Indigo2 IP22:** hardware emulation + serial boot (see [docs/indigo2-ip22.md](docs/indigo2-ip22.md)); GUI framebuffer still maturing
-- Cranelift JIT compiler for MIPS to x86_64 translation (optional)
+- Cranelift JIT compiler for MIPS to x86_64 translation (`jitv2`, optional)
 - Copy-on-write disk overlay. Crash all day, base image stays clean
 - Headless mode for CI/automation
 - Port forwarding into the guest
@@ -86,7 +86,6 @@ Build variants:
 cargo run --release --features lightning,rex-jit     # recommended for best speed right now
 cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
 cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
-cargo run --release --features jit                   # enable Cranelift MIPS JIT compiler
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Compare clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
 cargo run --release --features camera                # use host camera as the IndyCam video source (macOS AVFoundation via nokhwa). See [vino] in iris.toml.
@@ -237,38 +236,14 @@ cargo run --release --features r5k
 
 ## JIT compilers
 
-### MIPS JIT (`--features jit`)
-
-Optional Cranelift-based JIT. Compiles hot MIPS basic blocks to native x86_64.
-Enable with `--features jit` at build time and `IRIS_JIT=1` at runtime.
-
-Three tiers: blocks start ALU-only (registers + branches), promote to
-Loads (+ memory reads), then Full (+ stores) based on stable execution. Probe
-interval is adaptive. Hot block profiles persist across sessions.
-
-```
-IRIS_JIT=1 cargo run --release --features jit
-```
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `IRIS_JIT` | 0 | Enable JIT (1) or interpreter-only (0) |
-| `IRIS_JIT_MAX_TIER` | 2 | Cap tier: 0=ALU, 1=Loads, 2=Full |
-| `IRIS_JIT_VERIFY` | 0 | Run each block through interpreter and compare (debug) |
-| `IRIS_JIT_PROBE` | 200 | Base probe interval (steps between cache checks) |
-
 ### MIPS JIT v2 (`--features jitv2`) — experimental
 
-Not a port of the JIT above — a new design built on different principles.
-The original JIT is a speculative, tiered block compiler with rollback (a
-compiled block can be wrong and gets caught/undone later); v2 deletes that
-failure mode instead of managing it: it compiles whole physical-page regions
-(not single basic blocks) to native code via Cranelift, with memory-resident
+A physical-page region compiler built on Cranelift, with memory-resident
 registers and no speculation — a compiled region is either exactly
 equivalent to the interpreter or it never gets published. Not the default
-engine yet — build it in alongside `jit` to compare, or on its own to try it
-standalone. Enabled automatically at runtime once the feature is compiled in
-(no `IRIS_JIT=1` needed). See `rules/jitv2/jit-v2-design.md` for the full
-design and `HACKING.md`'s JIT v2 section for tuning.
+engine yet. Enabled automatically at runtime once the feature is compiled in.
+See `rules/jitv2/jit-v2-design.md` for the full design and `HACKING.md`'s
+JIT v2 section for tuning.
 
 ```
 cargo run --release --features jitv2,rex-jit
@@ -281,7 +256,7 @@ instead of compiling, for building an offline test corpus), and
 `jitv2_opcodefusion` (LUI+ORI/ADDIU and branch/jump+NOP delay-slot fusion,
 jitv2's counterparts to the interpreter's `opcodefusion` — OFF by default,
 unlike the interpreter's own fusion, due to a history of live-boot bugs; see
-`rules/jit/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
+`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 
 ### REX3 graphics JIT (`--features rex-jit`)
 
@@ -447,12 +422,12 @@ The `rules/` directory contains hard-won lessons from debugging the JIT and
 getting IRIX running. These are meant for both humans and AI assistants working
 on the codebase.
 
-- `rules/jit/` - dispatch architecture, store compilation, sync, verify mode, probe tuning
+- `rules/jitv2/` - jitv2 region compiler design, codegen gotchas, fusion hazards
 - `rules/irix/` - networking config, keyboard quirks, csh + scratch raw-device gotchas
 - `rules/testing/` - disk image handling, avoiding filesystem corruption
 - `rules/snapshot/` - snapshot binary format, scratch-volume conventions, round-trip tests, CI overlay paths, **iris-ci as the canonical CI interface**
 
-If you're about to touch the JIT dispatch loop, read `rules/jit/dispatch-architecture.md`
+If you're about to touch the jitv2 compiler, read `rules/jitv2/jit-v2-design.md`
 first. It'll save you a few days.
 
 

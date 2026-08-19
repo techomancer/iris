@@ -23,7 +23,7 @@ emulating the Indy.
 
 The **iris-gui status bar MIPS** figure (or the CLI window title `MIPS` readout)
 is **real throughput**: MIPS instructions executed per wall-clock second on the
-host. Enable the JIT stack (`IRIS_JIT=1`, `--features jit,rex-jit`) for higher
+host. Enable the JIT stack (`--features jitv2,rex-jit`) for higher
 MIPS; the hinv MHz string stays the same.
 
 The status bar **Hz** value is the CP0 Compare tick rate (kernel scheduler
