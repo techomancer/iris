@@ -110,6 +110,22 @@ silently depend on the state being changed. The side effect is that GAS rejects
 `mfc1` and friends outright. Any asm block containing an FP instruction needs
 an explicit `.set hardfloat`; the test files define an `AF` prologue for it.
 
+## `(u64)(unsigned long)ptr` zero-extends under n32 — twice bitten
+
+The same mistake as the `cache` one, in a different disguise. `unsigned long`
+is **32 bits** under n32, so `(u64)(unsigned long)p` truncates the pointer and
+then *zero*-extends it. `0xffffffff88228000` becomes `0x0000000088228000` —
+xkuseg, not KSEG0.
+
+In `mips4/cop1x` that produced a TLB-miss-on-store at
+`BadVAddr=0x000000008822800c`, which reads exactly like a broken `LWXC1` and is
+really a broken cast. The fix is to pass the **pointer** as the asm operand:
+pointers are sign-extended by the ABI, so they are correct by construction.
+
+The rule for this suite: never route an address through an integer type on the
+way into asm. Use the pointer, or `SEXT_PTR` / `K1_PTR` when a numeric address
+is genuinely needed.
+
 ## o32 splits a 64-bit value across two registers
 
 See [toolchain.md](toolchain.md). `"=r"(u64)` under o32 binds only the first

@@ -1,0 +1,132 @@
+# Bare-metal CPU test suite (cpu-tests/).
+#
+# Builds the guest binary once with the MIPS cross toolchain, then runs it
+# against IRIS built for each CPU. The same binary in every cell is the point:
+# any disagreement between cells is an emulator bug rather than a test bug.
+#
+#   R4400 vs R5000 — the mips4/ group requires each MIPS IV instruction to
+#                    compute on R5000 and raise Reserved Instruction on R4400.
+#   interp vs JIT  — a guest-visible ISA suite is the cleanest JIT differential
+#                    available, and covers ground rules/jit/verify-mode.md says
+#                    verify mode structurally cannot (blocks containing stores).
+
+name: CPU tests
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'cpu-tests/**'
+      - 'src/mips_*.rs'
+      - 'src/elf.rs'
+      - 'src/testdev.rs'
+      - '.github/workflows/cpu-tests.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'cpu-tests/**'
+      - 'src/mips_*.rs'
+      - 'src/elf.rs'
+      - 'src/testdev.rs'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-guest:
+    name: Build the guest binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the MIPS cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mips-linux-gnu binutils-mips-linux-gnu
+
+      - name: Build cputest.elf
+        run: make -C cpu-tests
+
+      # One binary for every cell below — that is what makes the matrix a
+      # differential test rather than four independent runs.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cputest-elf
+          path: cpu-tests/build/cputest.elf
+          if-no-files-found: error
+
+  run:
+    name: ${{ matrix.cpu }} / ${{ matrix.engine }}
+    needs: build-guest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [r4400, r5000]
+        engine: [interp, jit]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cputest-elf
+          path: cpu-tests/build
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The CPU is a compile-time cargo feature, not a runtime switch — see
+      # rules/perf/hardware-profiles.md. r5ksc_triton gives the R5000 the on-die
+      # secondary cache an Indy R5000 actually has; without it Config.SC reports
+      # no L2 and the cache group would be testing a machine that never shipped.
+      - name: Build IRIS
+        run: |
+          FEATURES=""
+          [ "${{ matrix.cpu }}" = "r5000" ] && FEATURES="r5k,r5ksc_triton"
+          [ "${{ matrix.engine }}" = "jit" ] && FEATURES="${FEATURES:+$FEATURES,}jit"
+          if [ -n "$FEATURES" ]; then
+            cargo build --release --features "$FEATURES"
+          else
+            cargo build --release
+          fi
+
+      - name: Run the suite
+        env:
+          # IRIS_JIT is what actually turns the compiled-in JIT on at runtime.
+          IRIS_JIT: ${{ matrix.engine == 'jit' && '1' || '0' }}
+        run: |
+          cd cpu-tests
+          timeout 900 ../target/release/iris \
+            --config run/bare.toml \
+            --load-elf build/cputest.elf \
+            --test-device --test-device-dump build/dump.json \
+            --headless --noaudio 2>&1 | tee build/run.log
+          rc=${PIPESTATUS[0]}
+          echo "iris exit code: $rc"
+          # The suite's exit code is its failure count, delivered through the
+          # test device. A timeout (124) is reported separately so a hang is
+          # never mistaken for a large number of failures.
+          if [ "$rc" = "124" ]; then echo "::error::suite timed out"; exit 1; fi
+          exit "$rc"
+
+      - name: Verify the run reached the end
+        if: always()
+        run: |
+          cd cpu-tests
+          grep -q 'IRIS-CPUTEST-DONE' build/run.log \
+            || { echo "::error::suite never printed its DONE token"; exit 1; }
+          grep -E '^ RESULT:' build/run.log
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: cputest-${{ matrix.cpu }}-${{ matrix.engine }}-logs
+          path: |
+            cpu-tests/build/run.log
+            cpu-tests/build/dump.json
+          if-no-files-found: ignore

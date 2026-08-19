@@ -38,3 +38,24 @@ toolchain-check:
 	  echo "  No root:        make -C cpu-tests toolchain-local"; \
 	  exit 1; }
 	@echo "toolchain: $$($(CC) --version | head -1)"
+
+# Rootless install: unpack the Debian cross-toolchain .debs into a prefix.
+# What an unattended session without sudo has to do, and what the CI job does
+# with apt-get instead. The binutils from these packages link against their own
+# libbfd/libopcodes, which are not on the default loader path in a rootless
+# install — hence the LD_LIBRARY_PATH export above and in env.sh.
+TC_DEBS := binutils-mips-linux-gnu binutils-common libbinutils \
+           gcc-12-mips-linux-gnu cpp-12-mips-linux-gnu libgcc-12-dev-mips-cross
+
+.PHONY: toolchain-local
+toolchain-local:
+	@mkdir -p $(LOCAL_TC)/.debs
+	cd $(LOCAL_TC)/.debs && apt-get download $(TC_DEBS)
+	cd $(LOCAL_TC)/.debs && for d in *.deb; do dpkg -x "$$d" $(LOCAL_TC); done
+	@printf '%s\n' \
+	  '# Source this to put the local mips-linux-gnu cross toolchain on PATH.' \
+	  '_MIPS_PFX="$$(cd "$$(dirname "$${BASH_SOURCE[0]}")" && pwd)"' \
+	  'export PATH="$$_MIPS_PFX/usr/bin:$$PATH"' \
+	  'export LD_LIBRARY_PATH="$$_MIPS_PFX/usr/lib/x86_64-linux-gnu:$$LD_LIBRARY_PATH"' \
+	  > $(LOCAL_TC)/env.sh
+	@echo "installed into $(LOCAL_TC) — the Makefile finds it automatically"
