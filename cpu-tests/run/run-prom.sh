@@ -18,7 +18,9 @@ cd "$(dirname "$0")/.."
 
 ID="${1:-2}"
 NAME="${2:-cputest}"
-IRIS="${IRIS:-build/iris-r4400}"
+# The per-cell binaries matrix.sh caches are named <cpu>-<engine>; this default
+# tracks that naming. Override IRIS= to boot any other cell through the PROM.
+IRIS="${IRIS:-build/iris-r4400-interp}"
 CI="${CI:-../target/release/iris-ci}"
 SOCK="/tmp/iris-cputest-prom.sock"
 LOG="build/prom.log"
@@ -57,6 +59,16 @@ echo "run-prom: boot -f dksc(0,$ID,8)$NAME"
 ci serial-send "boot -f dksc(0,$ID,8)$NAME" >/dev/null 2>&1
 
 if ci serial-wait "IRIS-CPUTEST-DONE" --timeout 300 >/dev/null 2>&1; then
+    # serial-wait returns on the token, which is several characters short of the
+    # end of the line — at the PROM's baud rate the rc digits are still in
+    # flight. Deciding anything from the log at this instant reads
+    # "IRIS-CPUTEST-DONE rc=" and calls a green run a failure. Wait for the
+    # whole line. (The guest's side of the same race is con_flush(), which stops
+    # it from halting the machine before the SCC has drained at all.)
+    for _ in $(seq 1 50); do
+        grep -qE "IRIS-CPUTEST-DONE rc=[0-9]+" "$LOG" && break
+        sleep 0.2
+    done
     grep -E "RESULT:|IRIS-CPUTEST-DONE" "$LOG" | tail -3
     grep -q "IRIS-CPUTEST-DONE rc=0" "$LOG" && { echo "run-prom: PASS"; exit 0; }
     echo "run-prom: suite reported failures"; exit 1

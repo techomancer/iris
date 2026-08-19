@@ -501,12 +501,12 @@ static void t_overflow_flag(void)
     }
 }
 
-/* FCSR's reserved bits must not stick. Bits 24 and 22:18 are unimplemented on
- * these parts. */
+/* FCSR's reserved bits must not stick: Figure 6-4 gives bits 22:18 as a
+ * reserved zero field. Bit 24 is NOT one of them — it is FS, which is
+ * implemented and writable, and fpu_denorm.c is about what it does. */
 static void t_fcsr_reserved_bits(void)
 {
     fcsr_set(0xFFFFFFFFu);
-    /* Bit 24 (FO on later parts) and bits 22:18 are not implemented here. */
     CHECK_EQ(fcsr() & 0x007C0000u, 0u);
     fcsr_reset();
     CHECK_EQ(fcsr(), 0u);

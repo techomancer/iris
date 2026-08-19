@@ -29,17 +29,20 @@ cargo build --release       # in the repo root, first
 make run                    # loads the ELF straight into RAM and runs it
 ```
 
-`make run` takes about a minute. You get a line per test and a summary:
+`make run` takes a few minutes — 240 tests, some of which take real exceptions
+or sweep the caches. You get a line per test and a summary:
 
 ```
 alu/addu_sign_extends ...................... PASS
 ...
- RESULT: 783 checks passed, 19 failed  (172 tests)
-IRIS-CPUTEST-DONE rc=19
+ RESULT: 2041 checks passed, 121 failed  (240 tests)
+IRIS-CPUTEST-DONE rc=100
 ```
 
-The exit code **is** the failure count. `IRIS-CPUTEST-DONE` is the token to
-match on if you are scripting it.
+The exit code **is** the failure count, saturated at 100 so that it can never
+collide with the harness's own 127 ("unknown CPU, refusing to run"). The R4400
+cell exceeds that today, so read the `RESULT:` line for the real number.
+`IRIS-CPUTEST-DONE` is the token to match on if you are scripting it.
 
 ### Other CPUs and engines
 
@@ -72,8 +75,8 @@ the ELF, and jumps to it. This is what the bootable CD will use.
 
 | | pass | fail | failing tests |
 |---|---:|---:|---|
-| R4400 | 783 | 19 | 7 |
-| R5000 | 802 | 3 | 3 |
+| R4400 | 2041 | 121 | 29 |
+| R5000 | 2095 | 37 | 13 |
 
 Every failure is a known finding, listed in [docs/findings.md](docs/findings.md).
 Anything else is new — start with [docs/gotchas.md](docs/gotchas.md), which
@@ -106,14 +109,35 @@ use them, or the assembler will quietly rewrite your instructions (see
 A whole new area also needs a `struct test_group` and one line in
 `harness/tests.c`.
 
+FP tests have their own conventions — `AF` rather than `A` for any block with
+an FP instruction, never a `$f*` clobber, values crossing through memory — all
+of them collected in `tests/fpu/fpu_common.h`, which also provides the
+`observe_s`/`observe_d` helpers that run one operation and report what the FPU
+and the CPU each did about it.
+
 ## Layout
 
 ```
 harness/   startup, exception vectors, CHECK macros, console
 tests/     identity alu muldiv mem branch excep cp0 tlb fpu cache mips4
+gen/       fpvectors.py — computes the FP expectation tables
 run/       run-local.sh  matrix.sh  run-prom.sh  bare.toml  boot.toml
 docs/      findings gotchas status oracle memory-map toolchain
 ```
+
+`tests/fpu/` is eight files rather than one — arithmetic, traps, denormals,
+comparisons, generated vectors, double precision, the FR=0 register file, and
+the odd corners — sharing `fpu_common.h` for the conventions that make FP tests
+work at all under `-msoft-float`. [docs/status.md](docs/status.md) has the
+breakdown.
+
+### Generated expectations
+
+`make vectors` regenerates `tests/fpu/fpvectors.{c,h}` from `gen/fpvectors.py`,
+which computes IEEE-754 results with exact rational arithmetic and cross-checks
+them against the host FPU before writing anything. The generated files are
+checked in, so building the suite needs only the cross toolchain; python3 is
+needed only to change them.
 
 ## More
 

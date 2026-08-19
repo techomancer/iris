@@ -133,3 +133,79 @@ register of an even/odd pair, so a 64-bit result comes back half-read — and on
 a big-endian target the half you get is the high word, which made `addu`
 producing `0x80000000` read back as `0x8000000000000000` and look like a
 sign-extension bug in the CPU. The suite builds n32.
+
+## A generated expectation must use the value the register can hold
+
+`gen/fpvectors.py` writes each test vector's operands as exact rationals and
+computes the answer from them. `2^30 - 1` needs thirty significand bits; a
+single-precision register has twenty-four. So the table said
+
+    cvt.w.s(1073741823.0) = 1073741823
+
+while the machine was necessarily converting `1073741824.0` — the operand as
+stored — and answering `1073741824`. Two tests failed against a table that no
+correct implementation could have matched.
+
+The fix is one function, `roundtrip()`, applied to every operand before it
+reaches either the table or the expectation: encode it to the target format,
+decode it back, and compute from *that*. The same trap is waiting in any
+generated FP suite, and it fails in the most misleading possible way — the
+emulator looks wrong by exactly one ulp.
+
+The generator's `--check` mode exists for the same reason. It recomputes every
+vector with the host's own IEEE arithmetic — a completely separate
+implementation from the exact-rational one — and refuses to write the tables if
+the two disagree. It caught nothing on the first run and would have caught
+this, had the conversion tables been part of what it checks.
+
+## `make run` needs the bare machine config
+
+`run/run-local.sh` invoked IRIS without `--config run/bare.toml`, so the default
+configuration applied: `default_scsi()` attaches `scsi1.raw` and `cdrom4.iso`,
+neither of which exists anywhere in this tree, and startup is fatal when a
+configured disk is missing. `make run` failed before the guest ran a single
+instruction, while `run/matrix.sh` — which passes the config — worked fine.
+
+## Under `--load-elf` the SCC produces nothing, and `--serial-log` is empty
+
+The same script also asked for `--serial-log FILE`, and the file was always
+zero bytes. The reason is not the logging: it is that **the SCC has never been
+programmed**. `con_init()` does nothing because "the PROM leaves the console
+configured" — true when booting through the PROM, and false under `--load-elf`,
+which is precisely the path that skips it. An unprogrammed channel has
+`WR5.TX_ENABLE` clear, so the byte is queued and the TX thread never latches
+it, and nothing reaches the backend to be teed
+(`rules/testing/scc-serial-output-from-bare-metal-code.md` §2).
+
+Confirmed by running with `--serial-log` and *without* `--test-device`: the log
+is still empty and the machine sits there, so the SCC really is the silent one
+rather than the tee.
+
+So under `--load-elf` the test device is the only working output path, and
+headless IRIS prints it to its own stdout. `run/run-local.sh` now tees that,
+which is what `matrix.sh` and the CI workflow always did. Making the serial
+path work in this mode means programming WR5 (and probably WR4/WR9/WR11-14) in
+`con_init()`; the hook is already there, with a comment saying so.
+
+## The last line printed is not the last line to arrive
+
+`IRIS-CPUTEST-DONE rc=100` reached the PROM-boot log as `IRIS-CPUTEST-DONE rc=`,
+which matters more than it looks: `run/run-prom.sh` decides pass or fail by
+matching `rc=0` on that line, so a completely green run would have been reported
+as a failure.
+
+Two independent races, both of which had to be fixed:
+
+1. **The guest halts the machine mid-transmission.** `scc_putc` waits for the
+   transmit *buffer* before handing over each byte, which says nothing about the
+   byte already in the shift register — and `testdev_exit` stops the machine
+   immediately after. `con_flush()` in `harness/console.c`, called before the
+   exit, drains it.
+
+2. **`iris-ci serial-wait` returns on the token, not on the line.** The rc
+   digits are still in flight when it returns, so a `grep` at that instant reads
+   an incomplete line. The script now waits for `rc=[0-9]+` before reading
+   anything out of the log.
+
+The first one loses the bytes for good; the second only reads too early. Both
+produce the same symptom, which is why fixing one of them was not enough.
