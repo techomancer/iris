@@ -114,12 +114,21 @@ jobs:
           if [ "$rc" = "124" ]; then echo "::error::suite timed out"; exit 1; fi
           exit "$rc"
 
-      - name: Verify the run reached the end
+      # Two things that would otherwise fail silently: a truncated run that
+      # never reached its summary, and a build whose cargo features did not
+      # take — in which case an "r4400" cell would run an R5000 and every
+      # mips4 expectation would invert with no indication anything was wrong.
+      # The banner is authoritative: the guest reads the CPU out of PRId.
+      - name: Verify the run reached the end, on the CPU it claims
         if: always()
         run: |
           cd cpu-tests
           grep -q 'IRIS-CPUTEST-DONE' build/run.log \
             || { echo "::error::suite never printed its DONE token"; exit 1; }
+          want=$(echo '${{ matrix.cpu }}' | tr 'a-z' 'A-Z')
+          got=$(grep -o 'cpu=[A-Za-z0-9]*' build/run.log | head -1)
+          [ "$got" = "cpu=$want" ] \
+            || { echo "::error::ran $got, expected cpu=$want"; exit 1; }
           grep -E '^ RESULT:' build/run.log
 
       - uses: actions/upload-artifact@v4

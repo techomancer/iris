@@ -144,6 +144,39 @@ is a documented requirement.
 
 ---
 
+## 5. `Count` can skip past `Compare` without IP7 firing — **observation**
+
+*Seen by `cp0/compare_sets_ip7`, which reports rather than asserts.*
+
+IP7 fires when `Count` becomes numerically **equal** to `Compare` — not when it
+exceeds it. IRIS models that faithfully and says so
+(`schedule_compare_timer` in `src/mips_core.rs`): a `Compare` written "in the
+past" correctly does not fire until `Count` wraps through 2^32.
+
+But `Count` is wallclock-anchored by default, so it advances in jumps rather
+than one tick at a time, and a jump can step over the match:
+
+```
+[timer did not fire: Count 0x023b76fa -> 0x023bc51d, deadline 0x023bc51a,
+ 2253 iterations]
+```
+
+`Count` passed the deadline by 3 and no interrupt became pending. On real
+hardware `Count` increments by one per tick, so the equality is never missed.
+
+**Why this is filed as an observation rather than a bug.** It is a consequence
+of the timing model, not of the Count/Compare logic, and the `ci_clock` cargo
+feature exists precisely to make the clock deterministic for cases that need
+it. It is recorded because the consequence is real: a kernel that arms its
+timer with `Compare = Count + delta` and relies on the interrupt can, in
+principle, have one silently swallowed. Whether that ever happens to IRIX under
+a normal workload is not something this suite can answer.
+
+The test now sets `Compare` relative to a freshly-read `Count` — the way a
+kernel does — and reports the skip instead of failing on it.
+
+---
+
 ## Handled correctly
 
 Worth stating, since these are the same shape as the two findings above and
