@@ -73,6 +73,43 @@ target. `Config.SC == 0` says a secondary cache is present, which
 This is why IRIX flushes both levels rather than just the primary, and it is a
 trap any cache test on this family will fall into exactly once.
 
+## `0xFC000000` is not a reserved opcode — it is `SD`
+
+The first reserved-instruction test used primary opcode 0x3F on the assumption
+that the top of the map was unassigned. It is `SD`: `.word 0xFC000000` is
+`sd $zero, 0($zero)`, which stores to virtual address 0, misses in the TLB, and
+reports **TLBS through the XTLB refill vector** rather than RI. A perfectly
+good TLB test, and a useless RI test.
+
+The genuine holes on R4400/R5000 are primary opcodes **0x1C..0x1F**. (Later
+MIPS32 revisions claimed 0x1C and 0x1F as SPECIAL2/SPECIAL3; neither of these
+parts implements them.) The suite uses 0x1C, 0x1D and 0x1F, and deliberately
+skips **0x1E** — IRIS's own jitv2 uses that as a region-boundary sentinel
+(`src/mips_isa.rs:64`), so testing it would measure the JIT's tooling rather
+than the CPU.
+
+## An exception taken with EXL set has nowhere to return to
+
+`t_exception_with_exl_set_preserves_epc` hung the whole suite on first run.
+The rule under test is that an exception taken while `Status.EXL` is already
+set does **not** update EPC — the first exception's EPC has to survive. But the
+harness's default handler resumes *through* EPC, so with EXL pre-set it ERETs
+to whatever EPC happened to hold (in that test, a deliberate sentinel) and
+faults again forever.
+
+Fixed by `exl_resume_handler` in `start.S`: a handler a test can install via
+`exc_user_handler` that resumes at a caller-supplied `exl_resume_pc` instead of
+at EPC. Any future test that deliberately corrupts the normal resume path needs
+the same treatment.
+
+## `-msoft-float` makes the assembler refuse FP mnemonics
+
+The suite is built `-msoft-float` so GCC never emits FP code of its own — the
+FPU tests change `FR` and `FCSR` underneath it, and compiler-generated FP would
+silently depend on the state being changed. The side effect is that GAS rejects
+`mfc1` and friends outright. Any asm block containing an FP instruction needs
+an explicit `.set hardfloat`; the test files define an `AF` prologue for it.
+
 ## o32 splits a 64-bit value across two registers
 
 See [toolchain.md](toolchain.md). `"=r"(u64)` under o32 binds only the first

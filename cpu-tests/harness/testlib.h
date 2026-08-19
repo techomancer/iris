@@ -129,9 +129,18 @@ void exc_install(void);          /* write the vectors and flush I-cache */
 extern volatile u32 exc_resume_mode;
 
 /* A handler hook: when non-zero, the general handler jumps here (in kernel
- * mode, with $k0/$k1 free) instead of its default record-and-skip. Used by the
- * TLB tests to install a refill that actually fills. */
+ * mode, with $k0/$k1 free) instead of its default record-and-skip. It owns the
+ * ERET and the restore of $at/$v0/$v1 from exc_save. */
 extern volatile u32 exc_user_handler;
+
+/*
+ * A ready-made hook for tests that break the normal resume path: it resumes at
+ * `exl_resume_pc` rather than at EPC. Needed when an exception is taken with
+ * Status.EXL already set, since EPC is then not updated and returning through
+ * it would loop forever.
+ */
+void exl_resume_handler(void);
+extern volatile u64 exl_resume_pc;
 
 /* ── Assertions about a captured exception ────────────────────────────────── */
 #define CHECK_EXC(code)                                                    \

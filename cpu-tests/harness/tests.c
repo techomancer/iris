@@ -12,12 +12,16 @@ DECLARE_GROUP(group_identity);
 DECLARE_GROUP(group_alu);
 DECLARE_GROUP(group_muldiv);
 DECLARE_GROUP(group_mem);
+DECLARE_GROUP(group_branch);
+DECLARE_GROUP(group_excep);
 
 const struct test_group *const all_groups[] = {
     &group_identity,
     &group_alu,
     &group_muldiv,
     &group_mem,
+    &group_branch,
+    &group_excep,
 };
 
 const unsigned n_groups = sizeof(all_groups) / sizeof(all_groups[0]);
