@@ -204,6 +204,8 @@ pub struct Physical {
     pub mgras: Option<Arc<Mgras>>,
     #[cfg(feature = "ultra64")]
     pub ultra64: Option<Arc<Ultra64>>,
+    /// Bare-metal test device (`--test-device`), in GIO expansion slot 0.
+    pub testdev: Option<Arc<crate::testdev::TestDevice>>,
     pub vino: Vino,
     mc: MemoryController,
     hpc3: Hpc3,
@@ -272,6 +274,7 @@ impl Physical {
         mgras: Option<Arc<Mgras>>,
         #[cfg(feature = "ultra64")]
         ultra64: Option<Arc<Ultra64>>,
+        testdev: Option<Arc<crate::testdev::TestDevice>>,
         vino: Vino,
         mc: MemoryController,
         hpc3: Hpc3,
@@ -310,6 +313,7 @@ impl Physical {
             mgras,
             #[cfg(feature = "ultra64")]
             ultra64,
+            testdev,
             vino,
             mc,
             hpc3,
@@ -440,6 +444,16 @@ impl Physical {
             }
         }
         // GIO expansion slot 1 — second Newport when rex3_head1 absent: GIO timeout remains
+
+        // Test device (--test-device): GIO expansion slot 0, which is empty on a
+        // stock Indy and otherwise answers with a GIO timeout. See testdev.rs.
+        if let Some(td) = self.testdev.as_deref() {
+            let td_ptr: *const dyn BusDevice = td;
+            use crate::testdev::{TEST_DEV_BASE, TEST_DEV_SIZE};
+            for i in (TEST_DEV_BASE >> 16)..((TEST_DEV_BASE + TEST_DEV_SIZE - 1) >> 16) + 1 {
+                self.device_map[i as usize] = td_ptr;
+            }
+        }
 
         // Map MC registers (128KB at 0x1FA00000)
         for i in (MC_BASE >> 16)..((MC_END - 1) >> 16) + 1 {

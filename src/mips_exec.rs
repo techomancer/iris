@@ -852,6 +852,10 @@ impl MipsCpuConfig {
 pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
+    /// cheritest convention (`--cheritest-dump-hook`): a guest write to CP0 26
+    /// dumps machine state via the test device. Off unless asked for — CP0 26
+    /// is ECC on a real R4400 and the PROM writes it during cache init.
+    cheritest_dump_hook: bool,
     pub tlb: T,
     pub cache: C,
     #[cfg(feature = "developer")]
@@ -1623,6 +1627,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let mut executor = Self {
             core,
             sysad,
+            cheritest_dump_hook: false,
             tlb,
             cache,
             #[cfg(feature = "developer")]
@@ -4798,6 +4803,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     }
 
     fn handle_cp0_side_effects(&mut self, reg: u32) {
+        // cheritest: a write to CP0 26 triggers the test device's dump. Routed
+        // over the bus, so with no test device mapped it's an ignored GIO access.
+        if reg == 26 && self.cheritest_dump_hook {
+            self.sysad.write32(crate::testdev::TEST_DEV_BASE + crate::testdev::REG_DUMP,
+                               self.core.cp0_ecc);
+        }
         #[cfg(feature = "r5ksc_triton")]
         if reg == 16 {
             // CONFIG_SE (bit 12): wire L2 enable/disable to cache.
@@ -7734,6 +7745,18 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     /// cloneable `Arc`). Same process-lifetime validity argument as
     /// `interrupts_ptr` (fixed for the life of this `MipsCpu`, set once in
     /// `new()` after the executor reached its final address).
+    /// Enable the cheritest CP0-26 dump hook (`--cheritest-dump-hook`).
+    pub fn set_cheritest_dump_hook(&self, on: bool) {
+        self.executor.lock().cheritest_dump_hook = on;
+    }
+
+    /// Pointer to the executor's `MipsCore`, for devices that report CPU state
+    /// from the CPU thread itself (the test device's DUMP). Same
+    /// process-lifetime validity argument as `cycles_ptr`.
+    pub fn core_ptr(&self) -> *const crate::mips_core::MipsCore {
+        &self.executor.lock().core as *const crate::mips_core::MipsCore
+    }
+
     pub fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr {
         self.cycles_ptr
     }
