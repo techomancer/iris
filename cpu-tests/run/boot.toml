@@ -1,0 +1,18 @@
+# Machine for PROM-booting the suite from a disk image.
+#
+# The image is attached at SCSI ID 2 rather than 1 so nothing is tempted to
+# treat it as a system disk, and so the PROM's `boot -f dksc(0,2,8)cputest`
+# reads naturally.
+
+banks = [128, 128, 0, 0]
+headless = true
+no_audio = true
+
+[machine]
+profile = "indy_ip24"
+
+[scsi]
+
+[scsi.2]
+path  = "build/cputest.img"
+cdrom = false

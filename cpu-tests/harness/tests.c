@@ -14,6 +14,11 @@ DECLARE_GROUP(group_muldiv);
 DECLARE_GROUP(group_mem);
 DECLARE_GROUP(group_branch);
 DECLARE_GROUP(group_excep);
+DECLARE_GROUP(group_cp0);
+DECLARE_GROUP(group_tlb);
+DECLARE_GROUP(group_fpu);
+DECLARE_GROUP(group_cache);
+DECLARE_GROUP(group_mips4);
 
 const struct test_group *const all_groups[] = {
     &group_identity,
@@ -22,6 +27,11 @@ const struct test_group *const all_groups[] = {
     &group_mem,
     &group_branch,
     &group_excep,
+    &group_cp0,
+    &group_tlb,
+    &group_fpu,
+    &group_cache,
+    &group_mips4,
 };
 
 const unsigned n_groups = sizeof(all_groups) / sizeof(all_groups[0]);
