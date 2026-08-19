@@ -950,6 +950,111 @@ mod ftp_alg_tests {
     }
 }
 
+#[cfg(test)]
+mod tftp_nat_tests {
+    use super::*;
+
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("iris-nat-tftp-{}-{}", tag, nanos));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A NAT engine serving `root` over TFTP, with the rings a real one uses.
+    fn engine(root: &std::path::Path) -> (NatEngine, rtrb::Consumer<Vec<u8>>) {
+        let (_tx_prod, tx_cons) = rtrb::RingBuffer::new(8);
+        let (rx_prod, rx_cons) = rtrb::RingBuffer::new(8);
+        let config = GatewayConfig { tftp_dir: Some(root.to_path_buf()), ..GatewayConfig::default() };
+        let e = NatEngine::new(
+            config, tx_cons, rx_prod,
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new(AtomicBool::new(true)),
+            NatControl::new(),
+        );
+        (e, rx_cons)
+    }
+
+    /// Guest → gateway UDP 69 frame carrying `payload`.
+    fn guest_frame(e: &NatEngine, guest_mac: &[u8; 6], sport: u16, payload: &[u8]) -> Vec<u8> {
+        let guest_ip = e.config.client_ip;
+        let gw_ip = e.config.gateway_ip;
+        let udp = udp_packet(guest_ip, gw_ip, sport, UDP_PORT_TFTP, payload);
+        ip_frame(&e.config.gateway_mac, guest_mac, guest_ip, gw_ip, IP_PROTO_UDP, &udp)
+    }
+
+    /// The reply's (src_port, dst_port, payload).
+    fn parse_reply(frame: &[u8]) -> (u16, u16, Vec<u8>) {
+        let ihl = ((frame[14] & 0x0F) as usize) * 4;
+        let udp = &frame[14 + ihl..];
+        (r16(udp, 0), r16(udp, 2), udp[8..].to_vec())
+    }
+
+    #[test]
+    fn rrq_through_the_nat_returns_data_from_the_gateway() {
+        let root = tmp_root("rrq");
+        let data: Vec<u8> = (0..700u32).map(|i| (i * 7) as u8).collect();
+        std::fs::write(root.join("cputest"), &data).unwrap();
+        let (mut e, _rx) = engine(&root);
+        let guest_mac = [0x08, 0x00, 0x69, 0x11, 0x22, 0x33];
+
+        let mut rrq = vec![0, 1];
+        rrq.extend_from_slice(b"cputest\0octet\0");
+        e.process(&guest_frame(&e, &guest_mac, 4242, &rrq));
+
+        assert_eq!(e.deferred_rx.len(), 1, "one DATA datagram back");
+        let (sport, dport, payload) = parse_reply(&e.deferred_rx[0]);
+        assert_eq!(sport, UDP_PORT_TFTP, "reply comes from the gateway's TFTP port");
+        assert_eq!(dport, 4242, "reply goes back to the client's TID");
+        assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 3, "opcode DATA");
+        assert_eq!(u16::from_be_bytes([payload[2], payload[3]]), 1, "block 1");
+        assert_eq!(&payload[4..], &data[..512]);
+        // Frame is addressed to the guest, from the gateway.
+        assert_eq!(&e.deferred_rx[0][0..6], &guest_mac);
+        assert_eq!(&e.deferred_rx[0][6..12], &e.config.gateway_mac);
+
+        // ACK 1 draws the short final block, which ends the transfer.
+        e.deferred_rx.clear();
+        e.process(&guest_frame(&e, &guest_mac, 4242, &[0, 4, 0, 1]));
+        let (_, _, payload) = parse_reply(&e.deferred_rx[0]);
+        assert_eq!(u16::from_be_bytes([payload[2], payload[3]]), 2, "block 2");
+        assert_eq!(&payload[4..], &data[512..], "188 remaining bytes");
+
+        e.deferred_rx.clear();
+        e.process(&guest_frame(&e, &guest_mac, 4242, &[0, 4, 0, 2]));
+        assert!(e.deferred_rx.is_empty(), "final ACK ends the transfer silently");
+        // The per-client MAC is dropped by the poll tick that follows, which is
+        // also the retransmit path — and it must have nothing left to resend.
+        e.poll_tftp();
+        assert!(e.tftp_macs.is_empty(), "client bookkeeping is dropped with the transfer");
+        assert!(e.deferred_rx.is_empty(), "a completed transfer never retransmits");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tftp_is_inert_when_no_directory_is_configured() {
+        let (_tx_prod, tx_cons) = rtrb::RingBuffer::new(8);
+        let (rx_prod, _rx_cons) = rtrb::RingBuffer::new(8);
+        let mut e = NatEngine::new(
+            GatewayConfig::default(), tx_cons, rx_prod,
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new(AtomicBool::new(true)),
+            NatControl::new(),
+        );
+        let guest_mac = [0x08, 0x00, 0x69, 0x11, 0x22, 0x33];
+        let mut rrq = vec![0, 1];
+        rrq.extend_from_slice(b"anything\0octet\0");
+        e.process(&guest_frame(&e, &guest_mac, 4242, &rrq));
+        assert!(e.tftp.is_none());
+        // Falls through to the generic NAT path, so no reply is generated here.
+        assert!(e.deferred_rx.is_empty());
+    }
+}
+
 #[cfg(all(test, feature = "pcap"))]
 mod nfs_pcap_tests {
     use super::*;

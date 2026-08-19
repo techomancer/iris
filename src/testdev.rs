@@ -16,6 +16,10 @@
 //! that does claim this slot is the `ultra64` dev board, which is why enabling
 //! both is refused.
 //!
+//! The PROM's own slot-0 probe was measured at physical `0x1F46A07C`, outside
+//! the 64 KB this device decodes, so POST still sees a GIO timeout there even
+//! with the device enabled.
+//!
 //! The guest detects the device by reading `SIGNATURE`; on real hardware the
 //! empty slot times out, so a suite falls back to SCC-only output.
 

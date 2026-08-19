@@ -37,7 +37,8 @@ fn save_load_round_trip() {
 
 ## What's covered
 
-eeprom_93c56, ds1x86, ioc, pit8254, mc, mips_tlb, ps2, z85c30, wd33c93a, seeq8003.
+eeprom_93c56, ds1x86, ioc, pit8254, mc, mips_tlb, ps2, z85c30, wd33c93a, seeq8003,
+testdev.
 
 ## What's not (yet) covered
 
