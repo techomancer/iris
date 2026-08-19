@@ -65,8 +65,12 @@ enum Cmd {
     Ping,
     /// Start the CPU thread (no-op if already running).
     Start,
-    /// Cleanly shut down iris.
-    Quit,
+    /// Cleanly shut down iris. `--sync-chd [ID|all]` folds pending CHD diffs
+    /// back into their bases first (default: all disks).
+    Quit {
+        #[arg(long, num_args = 0..=1, default_missing_value = "all", value_name = "ID|all")]
+        sync_chd: Option<String>,
+    },
 
     /// Save the current machine state to saves/<name>/.
     Save {
@@ -187,6 +191,13 @@ enum Cmd {
 
     /// Load an arbitrary CD image into a SCSI ID and make it the active disc.
     CdromLoad { id: u64, path: String },
+
+    /// Fold pending CHD diffs back into their bases (guest must be stopped).
+    ChdSync {
+        /// SCSI id to consolidate, or "all" (default).
+        #[arg(default_value = "all", value_name = "ID|all")]
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -258,7 +269,15 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Ping        => simple(opts, "ping", json!({}), "ok"),
         Cmd::Start       => simple(opts, "start", json!({}), "started"),
-        Cmd::Quit        => simple(opts, "quit", json!({}), "quit"),
+        Cmd::Quit { sync_chd } => match sync_chd {
+            // A fold recompresses the whole base, so it can far outrun the 300s default.
+            Some(sel) => {
+                let data = send_until(opts, "quit", json!({"sync_chd": scsi_sel(&sel)?}), FOLD_TIMEOUT)?;
+                print_response(opts, "quit", &data);
+                Ok(())
+            }
+            None => simple(opts, "quit", json!({}), "quit"),
+        },
         Cmd::Save { name, description } => {
             let mut args = json!({"name": name});
             if let Some(d) = description { args["description"] = Value::String(d); }
@@ -306,6 +325,11 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         }
         Cmd::CdromEject { id } => simple(opts, "cdrom-eject", json!({"id": id}), "ejected"),
         Cmd::CdromLoad { id, path } => simple(opts, "cdrom-load", json!({"id": id, "path": path}), "loaded"),
+        Cmd::ChdSync { id } => {
+            let data = send_until(opts, "chd-sync", json!({"id": scsi_sel(&id)?}), FOLD_TIMEOUT)?;
+            print_response(opts, "synced", &data);
+            Ok(())
+        }
     }
 }
 
@@ -332,6 +356,17 @@ struct Opts {
 
 /// Read timeout for commands that answer promptly.
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// CHD folds recompress a whole base image, which can take far longer than the default.
+const FOLD_TIMEOUT: Duration = Duration::from_secs(3 * 3600);
+
+/// `"all"` stays a string; anything else must be a SCSI id 0-7.
+fn scsi_sel(s: &str) -> Result<Value> {
+    if s.eq_ignore_ascii_case("all") { return Ok(json!("all")); }
+    match s.parse::<u64>() {
+        Ok(n) if n < 8 => Ok(json!(n)),
+        _ => Err(Error::Iris(format!("bad scsi id '{s}' (expected 0-7 or \"all\")"))),
+    }
+}
 
 /// Grace on top of a guest deadline, so the server's own timeout fires first
 /// and reports which pattern was missed rather than the client giving up.

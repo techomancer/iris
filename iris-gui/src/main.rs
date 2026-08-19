@@ -3107,7 +3107,8 @@ impl eframe::App for App {
                     .map(|(id, _)| *id);
 
                 if let Some(id) = cdrom_id {
-                    if let Some(path) = scsi_menu::pick_iso("Load CD-ROM disc") {
+                    let cur = self.cfg.scsi.get(&id).map(|d| d.path.clone()).unwrap_or_default();
+                    if let Some(path) = scsi_menu::pick_iso("Load CD-ROM disc", &cur) {
                         self.emu.send(Cmd::LoadDisc { id, path, remount: true });
                     }
                 } else {

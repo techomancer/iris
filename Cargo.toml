@@ -146,9 +146,9 @@ env_logger = "0.11"
 winit = "0.30"
 glutin = "0.32"
 glutin-winit = "0.5"
-glow = "0.13"
+glow = "0.17"
 raw-window-handle = "0.6"
-rtrb = "0.3"
+rtrb = "0.4"
 socket2 = { version = "0.6", features = ["all"] }
 crossbeam-utils = "0.8"
 crossbeam-queue = "0.3"
@@ -161,7 +161,7 @@ postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
 png = "0.18"
 parking_lot = "0.12"
-spin = "0.12"
+spin = "0.9"
 # rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now
 # pulls its own `pollster` executor to block on the portal's async D-Bus calls.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
@@ -260,6 +260,11 @@ required-features = ["jitv2"]
 # is dead-stripped. See rules/macos/appstore-private-api.md.
 [patch.crates-io]
 winit = { path = "third_party/winit-0.30.13" }
+# block 0.1.6 is that crate's final release (2016) and declares a static of an
+# uninhabited type, a future hard error (rust#74840). Reached only on macOS, via
+# nokhwa -> cocoa/metal. The vendored copy makes `Class` opaque-but-inhabited, as
+# its maintained successor block2 does. Drop when nokhwa stops pulling `block`.
+block = { path = "third_party/block-0.1.6" }
 
 
 

@@ -7,6 +7,7 @@ pub struct CreateDiskDialog {
     scsi_id: u8,
     filename: String,
     size_mb: f64,
+    overwrite: bool,
     result: Option<CreateDiskResult>,
 }
 
@@ -17,7 +18,7 @@ pub struct CreateDiskResult {
 
 impl Default for CreateDiskDialog {
     fn default() -> Self {
-        Self { open: false, scsi_id: 1, filename: String::new(), size_mb: 1024.0, result: None }
+        Self { open: false, scsi_id: 1, filename: String::new(), size_mb: 1024.0, overwrite: false, result: None }
     }
 }
 
@@ -28,6 +29,7 @@ impl CreateDiskDialog {
         // sandbox too) so a new disk never lands in the working dir.
         self.filename = crate::settings::GuiSettings::default_disk_path(scsi_id);
         self.size_mb = 1024.0;
+        self.overwrite = false;
         self.result = None;
         self.open = true;
     }
@@ -70,10 +72,24 @@ impl CreateDiskDialog {
                 ui.label(RichText::new("The image will be created as a zero-filled file. \
                     Reset the machine after attaching new drives.")
                     .color(Color32::GRAY).small());
+                // File::create truncates: without this gate, Create silently wipes an
+                // existing image (the default filename is the disk already at this ID).
+                let exists = std::path::Path::new(&self.filename).is_file();
+                if exists {
+                    let mb = std::fs::metadata(&self.filename).map(|m| m.len()).unwrap_or(0) as f64
+                        / (1024.0 * 1024.0);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!(
+                        "⚠ {} already exists ({mb:.0} MB). Creating will erase it.", self.filename))
+                        .color(Color32::from_rgb(230, 140, 70)));
+                    ui.checkbox(&mut self.overwrite, "Erase the existing image");
+                } else {
+                    self.overwrite = false;
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() { close = true; }
-                    if ui.add(egui::Button::new("Create")
+                    if ui.add_enabled(!exists || self.overwrite, egui::Button::new("Create")
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         // Create file on disk now (making the parent dir first,

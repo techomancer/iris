@@ -397,7 +397,7 @@ impl DebugOverlay {
                 glow::TEXTURE_2D, 0,
                 0, 0, src.width as i32, src.height as i32,
                 glow::RGBA, glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(u8_slice),
+                glow::PixelUnpackData::Slice(Some(u8_slice)),
             );
             gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         }
@@ -418,7 +418,7 @@ impl DebugOverlay {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                2048, 1024, 0, glow::RGBA, glow::UNSIGNED_BYTE, None);
+                2048, 1024, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             t
         };
         self.tex = Some(t);

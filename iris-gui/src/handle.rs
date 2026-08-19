@@ -464,6 +464,7 @@ fn worker_loop(
                     cycles = None;
                     m.stop();
                     synced = match m.sync_chd_disks(
+                        None,
                         &mut |disk, total, fraction| {
                             let _ = evt_tx.send(Evt::SyncProgress { disk, total, fraction });
                         },

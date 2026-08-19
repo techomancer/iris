@@ -29,7 +29,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
             match dev {
                 None => {
                     if ui.button("Attach HDD…").clicked() {
-                        if let Some(p) = pick_disk("Attach HDD") {
+                        if let Some(p) = pick_disk("Attach HDD", "") {
                             action = ScsiAction::AttachHdd { id, path: p };
                         }
                         ui.close();
@@ -42,7 +42,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         ui.close();
                     }
                     if ui.button("Attach CD-ROM with disc…").clicked() {
-                        if let Some(p) = pick_iso("Attach CD-ROM with disc") {
+                        if let Some(p) = pick_iso("Attach CD-ROM with disc", "") {
                             action = ScsiAction::AttachCdromWithDisc { id, path: p };
                         }
                         ui.close();
@@ -71,7 +71,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                     }
                     let insert_label = if has_media { "Swap disc…" } else { "Insert disc…" };
                     if ui.button(insert_label).clicked() {
-                        if let Some(p) = pick_iso("Insert disc") {
+                        if let Some(p) = pick_iso("Insert disc", &d.path) {
                             action = ScsiAction::InsertDisc { id, path: p };
                         }
                         ui.close();
@@ -100,7 +100,7 @@ pub fn draw(ui: &mut Ui, cfg: &MachineConfig) -> ScsiAction {
                         ui.close();
                     }
                     if ui.button("Replace image…").clicked() {
-                        if let Some(p) = pick_disk("Replace HDD image") {
+                        if let Some(p) = pick_disk("Replace HDD image", &d.path) {
                             action = ScsiAction::AttachHdd { id, path: p };
                         }
                         ui.close();
@@ -154,18 +154,32 @@ fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
     }
 }
 
-fn pick_disk(title: &str) -> Option<String> {
-    rfd::FileDialog::new()
-        .set_title(title)
+// Seed the picker at `cur`'s folder, else the managed disks dir — never the OS default.
+fn dialog_at(title: &str, cur: &str) -> rfd::FileDialog {
+    let mut d = rfd::FileDialog::new().set_title(title);
+    let p = Path::new(cur);
+    match p.parent().filter(|d| !d.as_os_str().is_empty() && d.is_dir()) {
+        Some(dir) => {
+            d = d.set_directory(dir);
+            if let Some(n) = p.file_name() { d = d.set_file_name(n.to_string_lossy()); }
+        }
+        None => if let Some(dir) = crate::settings::GuiSettings::disks_dir().filter(|d| d.is_dir()) {
+            d = d.set_directory(dir);
+        }
+    }
+    d
+}
+
+fn pick_disk(title: &str, cur: &str) -> Option<String> {
+    dialog_at(title, cur)
         .add_filter("Disk images", &["raw", "img", "chd"])
         .add_filter("All", &["*"])
         .pick_file()
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-pub fn pick_iso(title: &str) -> Option<String> {
-    rfd::FileDialog::new()
-        .set_title(title)
+pub fn pick_iso(title: &str, cur: &str) -> Option<String> {
+    dialog_at(title, cur)
         .add_filter("ISO images", &["iso", "chd"])
         .add_filter("All", &["*"])
         .pick_file()

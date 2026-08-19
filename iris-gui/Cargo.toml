@@ -101,8 +101,8 @@ ultra64 = ["iris/ultra64"]
 # opt-in passthrough features (above), since neither is usable without extra
 # setup — IRIS_JIT=1 for the one, an external gopher64 for the other.
 iris = { path = "..", features = ["chd", "camera", "rex-jit"] }
-eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.35"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 # Match iris's winit version — Ps2Controller::push_kb takes
