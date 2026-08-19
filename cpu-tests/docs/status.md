@@ -1,6 +1,6 @@
 # Status
 
-*Last full run: 2026-08-19, commit `68eb7f2`.*
+*Last full run: 2026-08-19, commit `98db5bb`.*
 
 ## Coverage
 
@@ -21,24 +21,29 @@
 
 ## Results
 
-| cell | result |
-|---|---|
-| R4400, interpreter, `--load-elf` | 783 pass / 21 fail |
-| R5000, interpreter, `--load-elf` | 802 pass / 3 fail |
-| R4400, interpreter, PROM boot from image | 784 pass / 20 fail |
+| cell | pass | fail |
+|---|---:|---:|
+| R4400, interpreter, `--load-elf` | 783 | 19 |
+| R5000, interpreter, `--load-elf` | 801 | 2 |
+| R4400, interpreter, PROM boot from a `mkvh` image | 784 | 20 |
 
 Every failure is a recorded finding, not an unknown — see
 [findings.md](findings.md):
 
-- **19** of the R4400 failures are one finding: MIPS IV instructions execute
-  instead of raising Reserved Instruction.
-- **2** are the reserved-bit masking of `Wired` and `FCSR`, on both CPUs.
-- The third R5000 failure is the same `Wired`/`FCSR` pair plus the timer test,
-  which has since been rewritten to stop racing the wallclock-anchored counter.
+- **17 of the 19 R4400 failures are a single finding**: MIPS IV instructions
+  execute instead of raising Reserved Instruction. The whole `mips4/` group
+  fails on R4400 and passes on R5000, which is exactly the asymmetry the
+  two-CPU axis was built to measure.
+- **The remaining 2, on both CPUs**, are reserved-bit masking in `Wired` and
+  `FCSR` — documented requirements with no practical consequence.
 
-One bug found by the suite is **fixed**: `c.cond.fmt` wrote the wrong FP
-condition code (`bdb00c8`), along with the matching off-by-two in IRIS's own
-test encoder that had been cancelling it (`4f1d4a1`).
+The R5000 column is the useful one for judging the emulator: 801 of 803 checks
+pass, and both failures are the same cosmetic masking issue.
+
+One bug the suite found is **fixed**: `c.cond.fmt` wrote the wrong FP condition
+code (`bdb00c8`), along with the matching off-by-two in IRIS's own test encoder
+that had been cancelling it (`4f1d4a1`). `mips4/multi_fp_cc` now passes on
+R5000, and `cargo test --lib mips_exec_test` is 95/95.
 
 ## Not yet done
 
