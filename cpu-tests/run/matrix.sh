@@ -85,6 +85,20 @@ run_cell() {
         return 1
     fi
 
+    # Confirm the binary that ran is actually the CPU this cell names. Earlier
+    # in this suite's history an --features r5k build overwrote
+    # target/release/iris between the copy and the run, and an "R4400" cell
+    # silently exercised an R5000 — every mips4 expectation inverted, with no
+    # indication anything was wrong. The banner is authoritative because the
+    # guest reads it out of PRId.
+    local want_cpu banner
+    want_cpu="$(echo "$cpu" | tr 'a-z' 'A-Z')"
+    banner="$(grep -o 'cpu=[A-Za-z0-9]*' "$log" | head -1)"
+    if [[ "$banner" != "cpu=$want_cpu" ]]; then
+        echo "FAIL  $cell — binary reports $banner, expected cpu=$want_cpu"
+        return 1
+    fi
+
     local summary
     summary="$(grep -E '^ RESULT:' "$log" | head -1)"
     if [[ $rc -eq 0 ]]; then
