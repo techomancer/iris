@@ -6,7 +6,7 @@
 #
 #   R4400 vs R5000 — the mips4/ group requires each MIPS IV instruction to
 #                    compute on R5000 and raise Reserved Instruction on R4400.
-#   interp vs JIT  — a guest-visible ISA suite is the cleanest JIT differential
+#   interp vs jitv2 — a guest-visible ISA suite is the cleanest JIT differential
 #                    available, and covers ground rules/jit/verify-mode.md says
 #                    verify mode structurally cannot (blocks containing stores).
 
@@ -64,7 +64,7 @@ jobs:
       fail-fast: false
       matrix:
         cpu: [r4400, r5000]
-        engine: [interp, jit]
+        engine: [interp, jitv2]
     steps:
       - uses: actions/checkout@v4
 
@@ -84,11 +84,15 @@ jobs:
       # rules/perf/hardware-profiles.md. r5ksc_triton gives the R5000 the on-die
       # secondary cache an Indy R5000 actually has; without it Config.SC reports
       # no L2 and the cache group would be testing a machine that never shipped.
+      #
+      # jitv2, not the v1 jit: v1 is the speculative tiered block compiler being
+      # replaced, and is not what this project runs. jitv2 needs no runtime
+      # switch — it is active as soon as the feature is compiled in.
       - name: Build IRIS
         run: |
           FEATURES=""
           [ "${{ matrix.cpu }}" = "r5000" ] && FEATURES="r5k,r5ksc_triton"
-          [ "${{ matrix.engine }}" = "jit" ] && FEATURES="${FEATURES:+$FEATURES,}jit"
+          [ "${{ matrix.engine }}" = "jitv2" ] && FEATURES="${FEATURES:+$FEATURES,}jitv2"
           if [ -n "$FEATURES" ]; then
             cargo build --release --features "$FEATURES"
           else
@@ -96,9 +100,6 @@ jobs:
           fi
 
       - name: Run the suite
-        env:
-          # IRIS_JIT is what actually turns the compiled-in JIT on at runtime.
-          IRIS_JIT: ${{ matrix.engine == 'jit' && '1' || '0' }}
         run: |
           cd cpu-tests
           timeout 900 ../target/release/iris \
