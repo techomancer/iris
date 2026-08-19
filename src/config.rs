@@ -274,6 +274,9 @@ pub struct NetworkConfig {
     /// (Indy) / serial EEPROM (Indigo2) before boot. Defaults to
     /// [`DEFAULT_MAC`] when `[network] mac` is unset.
     pub mac: [u8; 6],
+    /// Directory served read-only over TFTP at the gateway, for PROM network
+    /// boot. None (the default) disables the TFTP server.
+    pub tftp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for NetworkConfig {
@@ -285,6 +288,7 @@ impl Default for NetworkConfig {
             mode: NetMode::default(),
             pcap_interface: None,
             nfs_pcap_ip: None,
+            tftp_dir: None,
             mac: DEFAULT_MAC,
         }
     }
@@ -318,6 +322,10 @@ pub struct NetworkSection {
     /// from the PROM monitor and saved with `rtc save`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// Directory served read-only over TFTP (UDP 69) at the gateway address, so
+    /// the PROM can `boot -f bootp()<file>`. Unset disables TFTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tftp_dir: Option<String>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -809,6 +817,23 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_elf: Option<String>,
 
+    /// Map the bare-metal test device (guest console, machine-state dump, exit
+    /// code) into GIO expansion slot 0. Off by default; see src/testdev.rs.
+    #[serde(default)]
+    pub test_device: bool,
+
+    /// Where the test device's DUMP register writes its JSON. Defaults to
+    /// `iris-testdev-dump.json` in the working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_device_dump: Option<String>,
+
+    /// cheritest convention: a guest write to CP0 register 26 triggers the same
+    /// dump as the test device's DUMP register. Off by default and must stay
+    /// that way for a normal boot — CP0 26 is ECC on a real R4400 and the PROM
+    /// writes it during cache initialisation.
+    #[serde(default)]
+    pub cheritest_dump_hook: bool,
+
     /// NAT subnet in CIDR notation (e.g. "192.168.5.0/24").
     /// The gateway gets host .1 and the guest (IRIX) gets host .2.
     /// Defaults to "192.168.0.0/24" if not set.
@@ -998,6 +1023,9 @@ impl Default for MachineConfig {
             no_audio: false,
             gdb_port: None,
             load_elf: None,
+            test_device: false,
+            test_device_dump: None,
+            cheritest_dump_hook: false,
             nat_subnet: None,
             ci: false,
             ci_socket: default_ci_socket(),
@@ -1190,6 +1218,7 @@ impl MachineConfig {
             pcap_interface: self.network.pcap_interface.clone(),
             nfs_pcap_ip:  self.network.nfs_pcap_ip,
             mac,
+            tftp_dir:     self.network.tftp_dir.as_ref().map(std::path::PathBuf::from),
         }
     }
 
@@ -1337,6 +1366,27 @@ pub struct Cli {
     #[arg(long = "gdb-port", value_name = "PORT")]
     pub gdb_port: Option<u16>,
 
+    /// Map the bare-metal test device into GIO expansion slot 0: SIGNATURE,
+    /// PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT
+    /// (terminate with the guest's exit code). Off by default.
+    #[arg(long = "test-device", default_value_t = false)]
+    pub test_device: bool,
+
+    /// Where the test device writes its machine-state dump.
+    #[arg(long = "test-device-dump", value_name = "FILE")]
+    pub test_device_dump: Option<String>,
+
+    /// cheritest convention: a guest write to CP0 register 26 dumps machine
+    /// state. Needs --test-device. Never enable for a normal boot — CP0 26 is
+    /// ECC on a real R4400 and the PROM writes it during cache init.
+    #[arg(long = "cheritest-dump-hook", default_value_t = false)]
+    pub cheritest_dump_hook: bool,
+
+    /// Serve this directory read-only over TFTP at the gateway address, so the
+    /// PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset.
+    #[arg(long = "tftp-dir", value_name = "DIR")]
+    pub tftp_dir: Option<String>,
+
     /// Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the
     /// CPU starts and set PC to its entry point, instead of booting the PROM.
     /// For bare-metal test binaries; see also the monitor's `loadelf`.
@@ -1429,6 +1479,10 @@ impl Cli {
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
+        if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
+        if self.test_device { cfg.test_device = true; }
+        if let Some(ref p) = self.test_device_dump { cfg.test_device_dump = Some(p.clone()); }
+        if self.cheritest_dump_hook { cfg.cheritest_dump_hook = true; }
         if let Some(ref s) = self.nat_subnet { cfg.nat_subnet = Some(s.clone()); }
 
         if let Some(m) = self.net_mode { cfg.network.mode = m; }

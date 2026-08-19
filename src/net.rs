@@ -32,6 +32,7 @@ const UDP_PORT_DNS:          u16 = 53;
 const UDP_PORT_PORTMAP:      u16 = 111;
 const UDP_PORT_TIME:         u16 = 37;
 const UDP_PORT_NTP:          u16 = 123;
+const UDP_PORT_TFTP:         u16 = 69;
 const XDMCP_GUEST_PORT:      u16 = 177;  // XDMCP control channel inside the guest
 const X11_BASE_PORT:         u16 = 6000; // X11 display N's TCP port = 6000 + N
 const TCP_PORT_TIME:         u16 = 37;
@@ -69,6 +70,9 @@ pub struct GatewayConfig {
     /// PCAP-only: virtual LAN IP the in-process NFS server answers on. `Some`
     /// together with `nfs` enables the bridged NFS responder ([`NfsVirtualHost`]).
     pub nfs_pcap_ip: Option<Ipv4Addr>,
+    /// Root directory served read-only over TFTP at the gateway, for PROM
+    /// network boot (`boot -f bootp()<file>`). None disables TFTP entirely.
+    pub tftp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -85,6 +89,7 @@ impl Default for GatewayConfig {
             mode:         NetMode::Nat,
             pcap_interface: None,
             nfs_pcap_ip:  None,
+            tftp_dir:     None,
         }
     }
 }
@@ -1068,6 +1073,11 @@ pub struct NatEngine {
     // real X server recorded here instead of the generic loopback. Populated by
     // the XDMCP UDP-forward hook in poll_udp_fwd_listeners.
     xdmcp_sessions: HashMap<u16, Ipv4Addr>,
+    // Read-only TFTP server for PROM network boot. Some when tftp_dir is set.
+    tftp: Option<crate::tftp::TftpServer>,
+    // MAC to reply to per TFTP client, so a retransmit can be addressed without
+    // relying on the last-learned guest MAC.
+    tftp_macs: HashMap<crate::tftp::ClientId, [u8; 6]>,
 }
 
 /// Reassembly state for one fragmented inbound IP datagram.
@@ -1154,6 +1164,10 @@ impl NatEngine {
             eprintln!("iris: in-core NFS server exporting {}", c.shared_dir);
             crate::nfsudp::NfsServer::new(c.shared_dir.clone(), c.version)
         });
+        let tftp = config.tftp_dir.as_ref().map(|dir| {
+            eprintln!("iris: TFTP server (read-only) serving {}", dir.display());
+            crate::tftp::TftpServer::new(dir.clone())
+        });
         Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
@@ -1161,7 +1175,8 @@ impl NatEngine {
                tcp_fwd_pending: HashMap::new(), fwd_ephemeral_next: 49152,
                fwd_reserved_next: 512,
                guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new(),
-               xdmcp_sessions: HashMap::new() }
+               xdmcp_sessions: HashMap::new(),
+               tftp, tftp_macs: HashMap::new() }
     }
 
     /// Rebind the static port-forward listeners from a new rule set, live (no
@@ -1259,6 +1274,7 @@ impl NatEngine {
             self.poll_icmp();
             self.poll_tcp_fwd_listeners();
             self.poll_udp_fwd_listeners();
+            self.poll_tftp();
             self.update_snapshot();
         }
     }
@@ -1649,6 +1665,8 @@ impl NatEngine {
                               => self.handle_time_udp(src_mac, src_ip, sport),
             UDP_PORT_NTP  if dst_ip == self.config.gateway_ip
                               => self.handle_ntp_udp(src_mac, src_ip, sport, payload),
+            UDP_PORT_TFTP if self.tftp.is_some() && dst_ip == self.config.gateway_ip
+                              => self.handle_tftp_udp(src_mac, src_ip, sport, payload),
             _ => {
                 // NFS/mountd: rewrite destination to localhost high port before NAT.
                 let real_dst = self.nfs_remap_dst(dst_ip, dport);
@@ -1673,6 +1691,40 @@ impl NatEngine {
         self.ip_id = self.ip_id.wrapping_add(1);
         self.deferred_rx.extend(ip_frames_udp(
             client_mac, &self.config.gateway_mac, self.config.gateway_ip, client_ip, id, &udp));
+    }
+
+    // ── TFTP (read-only, PROM network boot) ───────────────────────────────────
+    /// Hand a guest TFTP datagram to the in-core server and inject its reply.
+    /// A reply always fits one 516-byte datagram, so no fragmentation is needed.
+    fn handle_tftp_udp(&mut self, client_mac: &[u8; 6], client_ip: Ipv4Addr,
+                       client_port: u16, payload: &[u8]) {
+        let client = (client_ip, client_port);
+        let Some(reply) = self.tftp.as_mut().and_then(|s| s.handle(client, payload, Instant::now()))
+        else { return };
+        dlog_dev!(LogModule::Net, "NAT TFTP {}:{} ← {} bytes", client_ip, client_port, reply.len());
+        self.tftp_macs.insert(client, *client_mac);
+        self.send_tftp(client, *client_mac, &reply);
+    }
+
+    /// Retransmit TFTP data the guest hasn't ACKed, and forget clients whose
+    /// transfer the server has given up on.
+    fn poll_tftp(&mut self) {
+        let Some(server) = self.tftp.as_mut() else { return };
+        let due = server.tick(Instant::now());
+        for (client, packet) in due {
+            let Some(mac) = self.tftp_macs.get(&client).copied() else { continue };
+            dlog_dev!(LogModule::Net, "NAT TFTP retransmit → {}:{}", client.0, client.1);
+            self.send_tftp(client, mac, &packet);
+        }
+        let server = self.tftp.as_ref().unwrap();
+        self.tftp_macs.retain(|client, _| server.has_transfer(client));
+    }
+
+    fn send_tftp(&mut self, client: crate::tftp::ClientId, mac: [u8; 6], packet: &[u8]) {
+        let udp = udp_packet(self.config.gateway_ip, client.0, UDP_PORT_TFTP, client.1, packet);
+        let frame = ip_frame(&mac, &self.config.gateway_mac,
+                             self.config.gateway_ip, client.0, IP_PROTO_UDP, &udp);
+        self.deferred_rx.push(frame);
     }
 
     // ── BOOTP / DHCP ──────────────────────────────────────────────────────────
