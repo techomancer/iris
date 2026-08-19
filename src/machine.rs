@@ -1029,6 +1029,16 @@ impl Machine {
         MipsCpuDebugAdapter::new(self.cpu.clone())
     }
 
+    /// Load a static ELF32 MSB binary into RAM and set PC to its entry point
+    /// (`--load-elf`, and the monitor's `loadelf`). CPU must be stopped.
+    pub fn load_elf(&self, path: &str) -> Result<String, String> {
+        // Before POST every bank is invalid (MEMCFG0/1 = 0) and writes to RAM
+        // addresses go to UnmappedRam, so map the banks as POST would first.
+        let mapped = self.mc.post_map_banks();
+        let out = self.cpu.load_elf(path)?;
+        Ok(if mapped { format!("  (mapped RAM banks; POST has not run)\n{}", out) } else { out })
+    }
+
     /// The in-process serial backend used by `--ci` mode. `None` in
     /// interactive mode.
     pub fn get_ci_serial(&self) -> Option<Arc<crate::z85c30::CiSerialBackend>> {

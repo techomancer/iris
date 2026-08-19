@@ -33,6 +33,7 @@ fn main() {
     let ci_enabled = cfg.ci;
     let ci_display = cfg.ci_display;
     let ci_socket_path = cfg.ci_socket.clone();
+    let load_elf = cfg.load_elf.clone();
 
     // Apply [jit] from TOML (env vars still override if set externally).
     cfg.jit.apply_env();
@@ -46,6 +47,20 @@ fn main() {
         .join()
         .unwrap();
     machine.register_system_controller();
+
+    // --load-elf: load before the CPU starts, so the binary runs instead of the
+    // PROM's boot path. RAM is already mapped at this point (Machine::new fires
+    // an initial remap_banks with the MC's power-on MEMCFG), so this lands in
+    // real RAM without POST having run.
+    if let Some(path) = &load_elf {
+        match machine.load_elf(path) {
+            Ok(summary) => eprint!("iris: loaded {}\n{}", path, summary),
+            Err(e) => {
+                eprintln!("iris: --load-elf {}: {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // CI control socket: started after Machine::new so it can hand out the
     // machine pointer + CiSerialBackend to command handlers.

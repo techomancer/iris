@@ -350,6 +350,26 @@ impl MemoryController {
         Some((base, addr_mask, limit))
     }
 
+    /// Map the RAM banks at their conventional bases exactly as the PROM's POST
+    /// does, for running code with no PROM involved (`--load-elf`). Banks 2/3
+    /// are synthesized at HIMEM by the MEMCFG0 write itself. No-op once any
+    /// bank is valid, so this never overrides what POST decided.
+    pub fn post_map_banks(&self) -> bool {
+        use crate::physical::{BANK_SIZE, LOMEM_BASE};
+        let (m0, m1) = self.get_memcfg();
+        if m0 != 0 || m1 != 0 {
+            return false;
+        }
+        let half = |i: usize, base: u32| {
+            Self::encode_memcfg_half(base, self.ram_sizes[i]).unwrap_or(0) as u32
+        };
+        let memcfg0 = (half(0, LOMEM_BASE) << 16) | half(1, LOMEM_BASE + BANK_SIZE);
+        if memcfg0 == 0 {
+            return false;
+        }
+        self.write32(MC_BASE + REG_MEMCFG0, memcfg0) == BUS_OK
+    }
+
     /// Parse MEMCFG0/1 registers into 4 bank (base, addr_mask, limit) triples using the
     /// configured ram_sizes. Returns None for invalid/empty banks.
     pub fn parse_memcfg(&self, memcfg0: u32, memcfg1: u32) -> [Option<(u32, u32, u32)>; 4] {

@@ -7454,6 +7454,113 @@ fn parse_reg_name(arg: &str) -> Option<usize> {
     }
 }
 
+/// Copy `data` to `vaddr` and zero-fill out to `memsz`. Writes go through the
+/// CPU's virtual-address path, so KSEG0/KSEG1 mapping, the MC address mask and
+/// bank remapping all apply — never poke `Memory` behind the bus.
+fn load_range<T: Tlb, C: MipsCache>(
+    exec: &mut MipsExecutor<T, C>,
+    vaddr: u64,
+    data: &[u8],
+    memsz: u64,
+) -> Result<(), String> {
+    if memsz == 0 {
+        return Ok(());
+    }
+    probe_mapped(exec, vaddr)?;
+    probe_mapped(exec, vaddr.wrapping_add(memsz - 1))?;
+
+    let mut off = 0u64;
+    while off < memsz {
+        let addr = vaddr.wrapping_add(off);
+        let byte = |k: u64| *data.get((off + k) as usize).unwrap_or(&0) as u64;
+        let (size, val) = if memsz - off >= 4 && addr % 4 == 0 {
+            (4usize, (byte(0) << 24) | (byte(1) << 16) | (byte(2) << 8) | byte(3))
+        } else {
+            (1usize, byte(0))
+        };
+        let status = exec.debug_write(addr, val, size, full_mask_for_usize(size));
+        if status != EXEC_COMPLETE {
+            return Err(format!(
+                "write failed at {:#018x} (status {:#010x}) — is RAM mapped and addressable there?",
+                addr, status
+            ));
+        }
+        off += size as u64;
+    }
+    invalidate_loaded_range(exec, vaddr, memsz);
+    Ok(())
+}
+
+/// Unmapped physical addresses are backed by `UnmappedRam`, which accepts every
+/// write and reads back zero — so a write into the void is completely silent.
+/// Probe with a non-zero pattern before committing an image.
+///
+/// The probe goes to the bus, not through `debug_write`: KSEG0 is cacheable, so
+/// a cached write is absorbed by L1D and reads back fine with nothing behind it.
+/// The original word is put back, so this leaves no trace.
+fn probe_mapped<T: Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>, vaddr: u64) -> Result<(), String> {
+    let tr = exec.debug_translate(vaddr);
+    if tr.is_exception() {
+        return Err(format!("{:#018x} does not translate (status {:#010x})", vaddr, tr.status));
+    }
+    let phys = tr.phys;
+    let unmapped = || {
+        Err(format!(
+            "nothing is mapped at {:#018x} (physical {:#010x}) — writes there go nowhere. \
+             The PROM maps RAM during POST: boot to the PROM prompt first, or use --load-elf, \
+             which maps the banks itself",
+            vaddr, phys
+        ))
+    };
+
+    const PATTERN: u32 = 0x5A5A_A5A5;
+    if phys % 4 == 0 {
+        let saved = exec.sysad.read32(phys);
+        if !saved.is_ok() || exec.sysad.write32(phys, PATTERN) != BUS_OK {
+            return unmapped();
+        }
+        let got = exec.sysad.read32(phys);
+        exec.sysad.write32(phys, saved.data);
+        if !got.is_ok() || got.data != PATTERN {
+            return unmapped();
+        }
+    } else {
+        let saved = exec.sysad.read8(phys);
+        if !saved.is_ok() || exec.sysad.write8(phys, PATTERN as u8) != BUS_OK {
+            return unmapped();
+        }
+        let got = exec.sysad.read8(phys);
+        exec.sysad.write8(phys, saved.data);
+        if !got.is_ok() || got.data != PATTERN as u8 {
+            return unmapped();
+        }
+    }
+    Ok(())
+}
+
+/// Drop stale cache copies of a just-loaded range: writeback+invalidate L1D and
+/// L2 so the new bytes reach memory, then invalidate L1I so a stale decoded
+/// instruction can never execute. The v1 JIT needs no explicit flush (its
+/// CodeCache dies with the CPU thread, and loading requires a stopped CPU);
+/// jitv2 self-invalidates from the per-page generation counter the writes bump.
+fn invalidate_loaded_range<T: Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>, vaddr: u64, len: u64) {
+    let (_, iline) = exec.cache.get_config(CACH_PI);
+    let (_, dline) = exec.cache.get_config(CACH_PD);
+    let step = (iline.min(dline).max(4)) as u64;
+    let mut addr = vaddr & !(step - 1);
+    let end = vaddr.wrapping_add(len);
+    while addr < end {
+        let tr = exec.debug_translate(addr);
+        if !tr.is_exception() {
+            let phys = tr.phys as u64;
+            exec.cache.cache_op(C_HWBINV | CACH_PD, addr, phys);
+            exec.cache.cache_op(C_HWBINV | CACH_SD, addr, phys);
+            exec.cache.cache_op(C_HINV | CACH_PI, addr, phys);
+        }
+        addr = addr.wrapping_add(step);
+    }
+}
+
 fn parse_cpu_arg(arg: &str, core: &MipsCore, symbols: Option<&SymbolTable>) -> Result<u64, String> {
     exp::parse_and_eval(arg, core, symbols)
 }
@@ -7859,6 +7966,45 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
 
     fn try_lock_executor(&self) -> Result<parking_lot::MutexGuard<'_, MipsExecutor<T, C>>, String> {
         self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
+    }
+
+    /// Load a static ELF32 MSB image: copy each `PT_LOAD` to its `p_vaddr`,
+    /// zero-fill to `p_memsz`, set PC to `e_entry`. Returns a segment summary.
+    pub fn load_elf(&self, path: &str) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+        let elf = crate::elf::parse(&bytes).map_err(|e| format!("{}: {}", path, e))?;
+        self.check_stopped()?;
+        let mut exec = self.try_lock_executor()?;
+        let mut out = String::new();
+        for s in &elf.segments {
+            load_range(&mut exec, s.vaddr, &bytes[s.offset..s.offset + s.filesz], s.memsz)?;
+            out.push_str(&format!(
+                "  {:#018x}  filesz {:#x}  memsz {:#x}  {}\n",
+                s.vaddr, s.filesz, s.memsz, crate::elf::flag_str(s.flags)
+            ));
+        }
+        exec.core.pc = elf.entry;
+        out.push_str(&format!("  entry {:#018x}\n", elf.entry));
+        Ok(out)
+    }
+
+    /// Load raw bytes at a virtual address. PC is not touched.
+    pub fn load_bin(&self, path: &str, vaddr: u64) -> Result<String, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+        self.check_stopped()?;
+        let mut exec = self.try_lock_executor()?;
+        load_range(&mut exec, vaddr, &bytes, bytes.len() as u64)?;
+        Ok(format!("  {:#018x}  {} bytes\n", vaddr, bytes.len()))
+    }
+
+    /// Loading over live code races the running dispatch loop, and the v1 JIT's
+    /// CodeCache (owned by `run_jit_dispatch`, dropped when the CPU thread exits)
+    /// would keep translations of the code we just replaced.
+    fn check_stopped(&self) -> Result<(), String> {
+        if self.is_running() {
+            return Err("CPU is running — 'cpu stop' first".to_string());
+        }
+        Ok(())
     }
 
     /// Step the executor `n` times in-line on the calling thread. Caller must
@@ -8408,6 +8554,8 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
             ("u".to_string(), "Alias for undo [DEV]".to_string()),
             ("sym".to_string(), "Lookup symbol: sym <addr>".to_string()),
             ("loadsym".to_string(), "Load symbols from file: loadsym <file>".to_string()),
+            ("loadelf".to_string(), "Load a static ELF32 MSB binary and set PC to its entry: loadelf <file>".to_string()),
+            ("loadbin".to_string(), "Load raw bytes at a virtual address: loadbin <file> <addr>".to_string()),
             ("proc".to_string(), "IRIX kernel introspection: proc info  (requires `loadsym` first)".to_string()),
             ("l1i".to_string(), "L1 Instruction Cache commands: l1i <check|dump> <addr|index>".to_string()),
             ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index>".to_string()),
@@ -9057,6 +9205,22 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
                         Err(_) => writeln!(writer, "{:#018x}: Could not fetch", curr_addr).unwrap(),
                     }
                 }
+                Ok(())
+            }
+            "loadelf" => {
+                if actual_args.is_empty() { return Err("Usage: loadelf <file>".to_string()); }
+                write!(writer, "{}", self.load_elf(actual_args[0])?).unwrap();
+                Ok(())
+            }
+            "loadbin" => {
+                if actual_args.len() < 2 { return Err("Usage: loadbin <file> <addr>".to_string()); }
+                let addr = {
+                    let exec = self.try_lock_executor()?;
+                    let symbols_arc = exec.symbols.clone();
+                    let symbols = symbols_arc.lock();
+                    parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?
+                };
+                write!(writer, "{}", self.load_bin(actual_args[0], addr)?).unwrap();
                 Ok(())
             }
             "jump" => {
