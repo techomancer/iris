@@ -1085,6 +1085,21 @@ pub(crate) const HW_READ_FIXUP_ADDRS: &[u64] = &[
     0x1fbd98bc, 0x1fbd98bd, 0x1fbd98be, 0x1fbd98bf, // IOC_TIMER_CTL
 ];
 
+/// Comparison key for breakpoint addresses (see `check_breakpoint`): word-aligns,
+/// and folds the unmapped kseg0/kseg1 windows onto the physical address they alias
+/// so either window hits. Every other address keeps all of its bits.
+#[inline]
+fn bp_match_key(addr: u64) -> u64 {
+    let hi = addr >> 32;
+    if hi == 0 || hi == 0xFFFF_FFFF {
+        let lo = addr & 0xFFFF_FFFF;
+        if (0x8000_0000..0xC000_0000).contains(&lo) {
+            return (lo & 0x1FFF_FFFF) & !3;
+        }
+    }
+    addr & !3
+}
+
 // ---- translate_fn slow-path wrappers (one per privilege × addressing-mode combination) ------
 // These are free functions so they can be stored as bare fn pointers in MipsExecutor.
 // They are only called on a nanotlb miss — the nanotlb probe happens before the fn-pointer call.
@@ -2365,12 +2380,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let mut hit = false;
         for bp in &self.breakpoints {
             if bp.enabled && bp.kind as u8 == KIND {
-                // Normalize to physical: strip sign-extension and kseg bits (top 3 of
-                // low 32), then mask bottom 2 for word alignment.  This makes a bp set
-                // on physical 0x1fbb0010 hit whether the CPU access came through kseg0
-                // (0x9fbb0010) or kseg1 (0xbfbb0010).
-                const PHYS_MASK: u64 = 0x1FFF_FFF8;
-                if (bp.addr & PHYS_MASK) == (addr & PHYS_MASK) {
+                // Normalize kseg0/kseg1 to physical so a bp on physical
+                // 0x1fbb0010 hits through kseg0 (0x9fbb0010) or kseg1
+                // (0xbfbb0010), then word-align. Never mask below bit 2.
+                if bp_match_key(bp.addr) == bp_match_key(addr) {
                     // Check optional register condition
                     if let Some(expr) = &bp.condition {
                         let symbols = self.symbols.lock();
