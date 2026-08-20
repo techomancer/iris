@@ -1732,9 +1732,11 @@ impl R4000Cache {
                 let line_base = phys_addr & !(ICache::LINE_MASK as u64);
                 if let Some(src) = self.downstream.mem_ptr(line_base as u32) {
                     // Fast path: read word pairs directly from backing store.
-                    // mem_ptr points to rotate_left(32) u64s: high word = first instr.
+                    // mem_ptr's raw u64s are host-native pairs of little-endian-loaded
+                    // words; rotate_left(32) puts them in MIPS big-endian word order
+                    // (high word = first instr), matching read_block's behavior.
                     for i in 0..ICache::INSTRS_PER_LINE / 2 {
-                        let chunk = unsafe { *src.add(i) };
+                        let chunk = unsafe { (*src.add(i)).rotate_left(32) };
                         let w0 = (chunk >> 32) as u32;
                         let w1 = chunk as u32;
                         let d0 = &mut ic_instrs[ic_slot_base + i * 2];
