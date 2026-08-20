@@ -3839,6 +3839,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn movz_matches_interpreter_taken_and_not_taken() {
         let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_MOVZ);
         for rt in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF] {
@@ -3851,6 +3852,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn movn_matches_interpreter_taken_and_not_taken() {
         let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_MOVN);
         for rt in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF] {
@@ -3863,6 +3865,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn movz_writing_r0_is_a_noop() {
         let mut gpr = [0u64; 32];
         gpr[1] = 5;
@@ -3872,6 +3875,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn movci_matches_interpreter_across_all_cc_and_tf_combinations() {
         for cc in 0u32..8 {
             for tf in [false, true] {
@@ -3928,6 +3932,7 @@ mod tests {
     /// of a GPR write, and exercised across both FR modes since fs/fd
     /// register addressing differs between them (see `emit_read_fpr_l`/
     /// `emit_write_fpr_l`'s FrMode handling).
+    #[cfg(feature = "mips4")]
     fn fmovcf_case(fmt: u32, fr1: bool) {
         for cc in 0u32..8 {
             for tf in [false, true] {
@@ -3976,12 +3981,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn fmovcf_s_matches_interpreter_across_all_cc_and_tf_combinations() {
         fmovcf_case(crate::mips_isa::RS_S, false);
         fmovcf_case(crate::mips_isa::RS_S, true);
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn fmovcf_d_matches_interpreter_across_all_cc_and_tf_combinations() {
         fmovcf_case(crate::mips_isa::RS_D, false);
         fmovcf_case(crate::mips_isa::RS_D, true);
@@ -4112,6 +4119,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn pref_is_a_true_noop_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;

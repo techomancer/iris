@@ -2405,6 +2405,12 @@ fn core_offset_of_fpu_get_status_fn() -> i32 { std::mem::offset_of!(MipsCore, fp
 fn core_offset_of_fpu_clear_status_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_clear_status_fn) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_fpu_set_mode_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_set_mode_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_cvt_to_int_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_to_int_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_cvt_int_to_float_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_int_to_float_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_fpu_cvt_d_to_s_fn() -> i32 { std::mem::offset_of!(MipsCore, fpu_cvt_d_to_s_fn) as i32 }
 fn core_offset_of_fpu_fir() -> i32 { std::mem::offset_of!(MipsCore, fpu_fir) as i32 }
 fn core_offset_of_fpu_fexr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fexr) as i32 }
 fn core_offset_of_fpu_fenr() -> i32 { std::mem::offset_of!(MipsCore, fpu_fenr) as i32 }
@@ -2955,20 +2961,23 @@ fn emit_ctc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
     }
 }
 
-/// After an FP arithmetic/conversion op: read host exception flags (already
-/// translated to MIPS FCSR bit positions [6:2] by `fpu_get_status_fn`),
-/// clear them again for the next op, fold them into `core.fpu_fcsr`'s
-/// Cause/Flag bits, and raise `EXC_FPE` if warranted — mirrors
-/// `MipsExecutor::fpu_update_fcsr` exactly (same bit math, same underflow-
-/// trap-punts-to-CE special case, same enabled-cause check). Must be called
-/// with `builder` positioned in the block holding the FP op just emitted,
-/// after its result has been written (matches the interpreter calling this
-/// only as the handler's terminal action). Leaves `builder` positioned in a
-/// new, sealed continuation block if no exception fired — callers continue
-/// emitting there (their block's fallthrough/exit wiring happens exactly
-/// like a plain `Sequential` instruction's, from the caller's perspective).
-fn emit_fpu_update_fcsr(ctx: &mut EmitCtx) {
-    emit_fpu_update_fcsr_with_inexact_override(ctx, None);
+/// After an FP arithmetic/conversion op has computed its result but *before*
+/// it is committed: read host exception flags (already translated to MIPS
+/// FCSR bit positions [6:2] by `fpu_get_status_fn`), clear them again for the
+/// next op, update `core.fpu_fcsr`'s Cause bits (rewritten every instruction,
+/// never OR'd — R4000/VR5000 manuals: "the results of only one instruction"),
+/// and either commit the result via `write_result` and raise `EXC_FPE` if any
+/// enabled exception fired, or — if trapping — leave the destination
+/// register and the sticky Flag field untouched, mirroring
+/// `MipsExecutor::fpu_update_fcsr`/`fpu_update_fcsr_full` exactly (same bit
+/// math, same commit-only-if-not-trapping shape). Must be called with
+/// `builder` positioned in the block holding the FP op just computed, before
+/// its result has been written. Leaves `builder` positioned in a new, sealed
+/// continuation block if no exception fired — callers continue emitting
+/// there (their block's fallthrough/exit wiring happens exactly like a plain
+/// `Sequential` instruction's, from the caller's perspective).
+fn emit_fpu_update_fcsr(ctx: &mut EmitCtx, write_result: impl Fn(&mut EmitCtx)) {
+    emit_fpu_update_fcsr_with_inexact_override(ctx, None, write_result);
 }
 
 /// `inexact_override`: when `Some(bool_val)` (an `I8` SSA value, 0 or 1),
@@ -2984,7 +2993,11 @@ fn emit_fpu_update_fcsr(ctx: &mut EmitCtx) {
 /// overall MIPS conversion's own inexactness — `emit_round_and_convert`
 /// computes the real answer by comparing the converted-back-to-float result
 /// against the original source value and passes it in here).
-fn emit_fpu_update_fcsr_with_inexact_override(ctx: &mut EmitCtx, inexact_override: Option<Value>) {
+fn emit_fpu_update_fcsr_with_inexact_override(
+    ctx: &mut EmitCtx,
+    inexact_override: Option<Value>,
+    write_result: impl Fn(&mut EmitCtx),
+) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
     let i32t = ir::types::I32;
@@ -3014,62 +3027,47 @@ fn emit_fpu_update_fcsr_with_inexact_override(ctx: &mut EmitCtx, inexact_overrid
         }
     };
 
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_EM: i64 = 0x0000_0f80;
+    const FCSR_FM: i64 = 0x0000_007c;
+
+    // Cause holds only the last instruction's exceptions and is rewritten
+    // every FP instruction, unlike the sticky Flag field — clear it
+    // unconditionally, even when this instruction raised nothing.
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr0 = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let fcsr_cause_cleared = ctx.builder.ins().band_imm_s(fcsr0, !FCSR_CM);
+
     let zero = ctx.builder.ins().iconst(i32t, 0);
     let has_flags = ctx.builder.ins().icmp(IntCC::NotEqual, flags, zero);
 
     let update_block = ctx.builder.create_block();
+    let no_flags_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(has_flags, update_block, &[], continue_block, &[]);
+    ctx.builder.ins().brif(has_flags, update_block, &[], no_flags_block, &[]);
+
+    // No exception this instruction: Cause is still rewritten to zero above,
+    // just commit the result and continue.
+    ctx.builder.switch_to_block(no_flags_block);
+    ctx.builder.seal_block(no_flags_block);
+    ctx.builder.ins().store(mem, fcsr_cause_cleared, ctx.core_ptr, fcsr_off);
+    write_result(ctx);
+    ctx.builder.ins().jump(continue_block, &[]);
 
     ctx.builder.switch_to_block(update_block);
     ctx.builder.seal_block(update_block);
 
-    const FCSR_CU: i64 = 0x0000_2000;
-    const FCSR_CE: i64 = 0x0002_0000;
-    const FCSR_EM: i64 = 0x0000_0f80;
-    const FCSR_FM: i64 = 0x0000_007c;
-
-    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
-    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
-
     // causes = (flags & FCSR_FM) << 10
     let flags_fm = ctx.builder.ins().band_imm_s(flags, FCSR_FM);
     let causes = ctx.builder.ins().ishl_imm_s(flags_fm, 10);
+    let fcsr1 = ctx.builder.ins().bor(fcsr_cause_cleared, causes);
+    ctx.builder.ins().store(mem, fcsr1, ctx.core_ptr, fcsr_off);
 
-    // fcsr |= causes; fcsr |= flags & FCSR_FM
-    let fcsr1 = ctx.builder.ins().bor(fcsr, causes);
-    let fcsr2 = ctx.builder.ins().bor(fcsr1, flags_fm);
-    ctx.builder.ins().store(mem, fcsr2, ctx.core_ptr, fcsr_off);
-
-    // Underflow-trap-punts-to-CE: (causes & FCSR_CU) != 0 && (fcsr2 & 0x100) != 0
-    let causes_cu = ctx.builder.ins().band_imm_s(causes, FCSR_CU);
-    let cu_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, causes_cu, 0);
-    let fcsr2_underflow_trap_bit = ctx.builder.ins().band_imm_s(fcsr2, 0x100);
-    let underflow_trap_enabled = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fcsr2_underflow_trap_bit, 0);
-    let underflow_punt = ctx.builder.ins().band(cu_set, underflow_trap_enabled);
-
-    let underflow_block = ctx.builder.create_block();
-    let check_enabled_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(underflow_punt, underflow_block, &[], check_enabled_block, &[]);
-
-    // Cold: this underflow-trap-punts-to-CE case is rare — most FP ops
-    // don't underflow at all, and of those that do, most don't have the
-    // underflow trap enabled.
-    ctx.builder.switch_to_block(underflow_block);
-    ctx.builder.set_cold_block(underflow_block);
-    ctx.builder.seal_block(underflow_block);
-    let fcsr3 = ctx.builder.ins().bor_imm_s(fcsr2, FCSR_CE);
-    ctx.builder.ins().store(mem, fcsr3, ctx.core_ptr, fcsr_off);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
-    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
-    emit_exception_exit(ctx, status_val);
-
-    ctx.builder.switch_to_block(check_enabled_block);
-    ctx.builder.seal_block(check_enabled_block);
-    // (causes >> 5) & (fcsr2 & FCSR_EM) != 0
+    // Raise FPE if any cause bit has its corresponding enable bit set.
+    // Causes are 5 bits above enables: (causes >> 5) aligns them with enables.
     let causes_shifted = ctx.builder.ins().ushr_imm_s(causes, 5);
-    let fcsr2_em = ctx.builder.ins().band_imm_s(fcsr2, FCSR_EM);
-    let enabled_cause = ctx.builder.ins().band(causes_shifted, fcsr2_em);
+    let fcsr1_em = ctx.builder.ins().band_imm_s(fcsr1, FCSR_EM);
+    let enabled_cause = ctx.builder.ins().band(causes_shifted, fcsr1_em);
     let has_enabled_cause = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, enabled_cause, 0);
 
     let raise_block = ctx.builder.create_block();
@@ -3080,11 +3078,278 @@ fn emit_fpu_update_fcsr_with_inexact_override(ctx: &mut EmitCtx, inexact_overrid
     ctx.builder.switch_to_block(raise_block);
     ctx.builder.set_cold_block(raise_block);
     ctx.builder.seal_block(raise_block);
-    let status_val2 = ctx.builder.ins().iconst(i32t, status as i64);
-    emit_exception_exit(ctx, status_val2);
+    // Trapped: neither the destination register nor the sticky Flag field
+    // are touched — only Cause (already set above).
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val);
 
+    // Not trapping: commit the result and accumulate the sticky Flag field.
     ctx.builder.switch_to_block(no_raise_block);
     ctx.builder.seal_block(no_raise_block);
+    write_result(ctx);
+    let fcsr2 = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let fcsr3 = ctx.builder.ins().bor(fcsr2, flags_fm);
+    ctx.builder.ins().store(mem, fcsr3, ctx.core_ptr, fcsr_off);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// Unimplemented Operation (Cause.E): R4000/VR5000 manuals — no Enable or
+/// Flag bit, always traps, destination register untouched. Mirrors
+/// `MipsExecutor::fpu_unimplemented`. Terminates the current block; caller
+/// does not get control back (matches `emit_exception_exit`'s shape).
+fn emit_fpu_unimplemented(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_CE: i64 = 0x0002_0000;
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let fcsr_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    let fcsr_with_e = ctx.builder.ins().bor_imm_s(fcsr_cleared, FCSR_CE);
+    ctx.builder.ins().store(mem, fcsr_with_e, ctx.core_ptr, fcsr_off);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val);
+}
+
+/// ABS.fmt/NEG.fmt: unlike a MOV, these are arithmetic operations (R4000
+/// manual: "absolute value (ABS) and negate (NEG) ... cause this exception
+/// if one or both operands is a signaling NaN") — mirrors
+/// `MipsExecutor::fpu_check_snan_operand` exactly: sets Cause.V always on a
+/// signalling operand, traps (destination/Flag untouched) if EV is enabled,
+/// otherwise commits `write_result` and sets sticky Flag.V too.
+fn emit_check_snan_operand(ctx: &mut EmitCtx, bits: Value, is_d: bool, write_result: impl Fn(&mut EmitCtx)) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_CV: i64 = 0x0001_0000;
+    let is_snan = if is_d { emit_is_snan_d(ctx, bits) } else { emit_is_snan_s(ctx, bits) };
+
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let fcsr_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    let cv_bit = ctx.builder.ins().uextend(i32t, is_snan);
+    let cv_bit = ctx.builder.ins().ishl_imm_s(cv_bit, 16); // FCSR_CV = 1<<16
+    let fcsr_with_cause = ctx.builder.ins().bor(fcsr_cleared, cv_bit);
+    ctx.builder.ins().store(mem, fcsr_with_cause, ctx.core_ptr, fcsr_off);
+
+    let snap_block = ctx.builder.create_block();
+    let no_snan_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_snan, snap_block, &[], no_snan_block, &[]);
+
+    // Cold: a signalling-NaN operand to ABS/NEG is a rare edge case.
+    ctx.builder.switch_to_block(snap_block);
+    ctx.builder.set_cold_block(snap_block);
+    ctx.builder.seal_block(snap_block);
+    let ev_set = ctx.builder.ins().band_imm_s(fcsr_with_cause, 0x800);
+    let ev_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ev_set, 0);
+    let raise_block = ctx.builder.create_block();
+    let untrapped_snan_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(ev_nonzero, raise_block, &[], untrapped_snan_block, &[]);
+
+    ctx.builder.switch_to_block(raise_block);
+    ctx.builder.seal_block(raise_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    let continue_block = ctx.builder.create_block();
+
+    ctx.builder.switch_to_block(untrapped_snan_block);
+    ctx.builder.seal_block(untrapped_snan_block);
+    write_result(ctx);
+    let fcsr2 = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let fcsr3 = ctx.builder.ins().bor_imm_s(fcsr2, 0x40); // sticky Flag V
+    ctx.builder.ins().store(mem, fcsr3, ctx.core_ptr, fcsr_off);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(no_snan_block);
+    ctx.builder.seal_block(no_snan_block);
+    write_result(ctx);
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// `bits` is a signalling NaN: exponent all-1s, mantissa nonzero, mantissa
+/// MSB (the "is quiet" bit) clear. Mirrors `mips_exec.rs`'s `is_snan_s`/`_d`.
+fn emit_is_snan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let b = &mut ctx.builder;
+    let exp_is_max = b.ins().band_imm_s(bits, 0x7F80_0000);
+    let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp_is_max, 0x7F80_0000);
+    let mantissa_nonzero = b.ins().band_imm_s(bits, 0x007F_FFFF);
+    let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
+    let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
+    let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+    let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
+    b.ins().band(is_nan, quiet_bit_clear)
+}
+fn emit_is_snan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let b = &mut ctx.builder;
+    let exp_is_max = b.ins().band_imm_s(bits, 0x7FF0_0000_0000_0000u64 as i64);
+    let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp_is_max, 0x7FF0_0000_0000_0000u64 as i64);
+    let mantissa_nonzero = b.ins().band_imm_s(bits, 0x000F_FFFF_FFFF_FFFFu64 as i64);
+    let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
+    let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
+    let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+    let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
+    b.ins().band(is_nan, quiet_bit_clear)
+}
+
+/// R4000/VR5000 manuals: a denormalized or quiet-NaN operand to a
+/// computational instruction is Unimplemented Operation (excepting Compare
+/// and Moves). Mirrors `MipsExecutor::fpu_check_denorm_operand_s`/`_d`. Call
+/// once per source operand before computing; if this returns and leaves
+/// `ctx.builder` in a new block, the check passed and computation may
+/// proceed there — callers should structure the two-operand case as
+/// sequential checks (fs then ft), each potentially terminating the region.
+fn emit_check_denorm_operand(ctx: &mut EmitCtx, bits: Value, is_d: bool) {
+    let is_denorm = if is_d {
+        emit_is_subnormal_or_qnan_d(ctx, bits)
+    } else {
+        emit_is_subnormal_or_qnan_s(ctx, bits)
+    };
+    let bad_block = ctx.builder.create_block();
+    let ok_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_denorm, bad_block, &[], ok_block, &[]);
+
+    // Cold: a denormal/qNaN operand is a rare edge case.
+    ctx.builder.switch_to_block(bad_block);
+    ctx.builder.set_cold_block(bad_block);
+    ctx.builder.seal_block(bad_block);
+    emit_fpu_unimplemented(ctx);
+
+    ctx.builder.switch_to_block(ok_block);
+    ctx.builder.seal_block(ok_block);
+}
+
+/// `bits` is subnormal-nonzero or a quiet NaN, single precision. `is_snan_s`
+/// mirrors `mips_exec.rs`'s bit-pattern helper; subnormal is exponent==0 and
+/// mantissa!=0 (zero itself, exponent==0 mantissa==0, is explicitly not
+/// denormal and must compute normally — e.g. `0.0 + 0.0`).
+fn emit_is_subnormal_or_qnan_s(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let b = &mut ctx.builder;
+    let exp = b.ins().band_imm_s(bits, 0x7F80_0000);
+    let exp_is_zero = b.ins().icmp_imm_s(IntCC::Equal, exp, 0);
+    let mantissa = b.ins().band_imm_s(bits, 0x007F_FFFF);
+    let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa, 0);
+    let is_subnormal = b.ins().band(exp_is_zero, mantissa_nonzero);
+
+    let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp, 0x7F80_0000);
+    let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
+    let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+    let quiet_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, quiet_bit, 0);
+    let is_qnan = b.ins().band(is_nan, quiet_bit_set);
+
+    b.ins().bor(is_subnormal, is_qnan)
+}
+fn emit_is_subnormal_or_qnan_d(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let b = &mut ctx.builder;
+    let exp = b.ins().band_imm_s(bits, 0x7FF0_0000_0000_0000u64 as i64);
+    let exp_is_zero = b.ins().icmp_imm_s(IntCC::Equal, exp, 0);
+    let mantissa = b.ins().band_imm_s(bits, 0x000F_FFFF_FFFF_FFFFu64 as i64);
+    let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa, 0);
+    let is_subnormal = b.ins().band(exp_is_zero, mantissa_nonzero);
+
+    let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp, 0x7FF0_0000_0000_0000u64 as i64);
+    let is_nan = b.ins().band(exp_is_max, mantissa_nonzero);
+    let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+    let quiet_bit_set = b.ins().icmp_imm_s(IntCC::NotEqual, quiet_bit, 0);
+    let is_qnan = b.ins().band(is_nan, quiet_bit_set);
+
+    b.ins().bor(is_subnormal, is_qnan)
+}
+
+/// Result-only half: subnormal-and-nonzero, no NaN check (a computed
+/// arithmetic result's denormal-ness is what finding 7's Table 9-1 gates on;
+/// zero itself, exponent==0 mantissa==0, is explicitly not denormal).
+fn emit_is_subnormal_s(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let b = &mut ctx.builder;
+    let exp = b.ins().band_imm_s(bits, 0x7F80_0000);
+    let exp_is_zero = b.ins().icmp_imm_s(IntCC::Equal, exp, 0);
+    let mantissa = b.ins().band_imm_s(bits, 0x007F_FFFF);
+    let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa, 0);
+    b.ins().band(exp_is_zero, mantissa_nonzero)
+}
+fn emit_is_subnormal_d(ctx: &mut EmitCtx, bits: Value) -> Value {
+    let b = &mut ctx.builder;
+    let exp = b.ins().band_imm_s(bits, 0x7FF0_0000_0000_0000u64 as i64);
+    let exp_is_zero = b.ins().icmp_imm_s(IntCC::Equal, exp, 0);
+    let mantissa = b.ins().band_imm_s(bits, 0x000F_FFFF_FFFF_FFFFu64 as i64);
+    let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa, 0);
+    b.ins().band(exp_is_zero, mantissa_nonzero)
+}
+
+/// Result-side half of finding 7: after computing (not yet writing) an
+/// ADD/SUB/MUL/DIV/SQRT result, check whether it's a denormalized nonzero
+/// value and apply the R4000/VR5000 manuals' Table 9-1/7-1 Underflow rule —
+/// mirrors `MipsExecutor::fpu_update_fcsr_full`'s `result_is_denorm` handling
+/// exactly (FS clear, or FS set with U/I enabled: Unimplemented Operation,
+/// untouched destination; FS set with neither enabled: flush to a signed
+/// zero of `result_is_negative` and force Cause.U+I, no trap). When the
+/// result is not denormal, falls through to the ordinary
+/// `emit_fpu_update_fcsr` host-flags path. `write_result`/`write_zero` are
+/// each called on exactly one path — the real result when not flushing, a
+/// signed zero of the given width when flushing.
+fn emit_fpu_update_fcsr_arith(
+    ctx: &mut EmitCtx,
+    result_is_denorm: Value,
+    result_is_negative: Value,
+    write_result: impl Fn(&mut EmitCtx),
+    write_zero: impl Fn(&mut EmitCtx, Value),
+) {
+    let mem = MemFlagsData::trusted();
+    let i32t = ir::types::I32;
+    const FCSR_FS: i64 = 0x0100_0000;
+    const FCSR_UM_IM: i64 = 0x0000_0180; // Enable: U (bit 8) | I (bit 7)
+    const FCSR_CU_CI: i64 = 0x0000_3000; // Cause: U (bit 13) | I (bit 12)
+    const FCSR_FU_FI: i64 = 0x0000_000c; // Flag: U (bit 3) | I (bit 2)
+    const FCSR_CM: i64 = 0x0001_f000;
+
+    let denorm_block = ctx.builder.create_block();
+    let normal_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(result_is_denorm, denorm_block, &[], normal_block, &[]);
+
+    // Cold: a denormalized/underflowed result is a rare edge case.
+    ctx.builder.switch_to_block(denorm_block);
+    ctx.builder.set_cold_block(denorm_block);
+    ctx.builder.seal_block(denorm_block);
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+    let fs_set = ctx.builder.ins().band_imm_s(fcsr, FCSR_FS);
+    let fs_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fs_set, 0);
+    let ui_enabled = ctx.builder.ins().band_imm_s(fcsr, FCSR_UM_IM);
+    let ui_enabled = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ui_enabled, 0);
+    let fs_clear = ctx.builder.ins().bnot(fs_set);
+    let must_trap = ctx.builder.ins().bor(fs_clear, ui_enabled);
+
+    let trap_block = ctx.builder.create_block();
+    let flush_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(must_trap, trap_block, &[], flush_block, &[]);
+
+    ctx.builder.switch_to_block(trap_block);
+    ctx.builder.seal_block(trap_block);
+    emit_fpu_unimplemented(ctx);
+
+    ctx.builder.switch_to_block(flush_block);
+    ctx.builder.seal_block(flush_block);
+    let fcsr_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    let fcsr_with_cause = ctx.builder.ins().bor_imm_s(fcsr_cleared, FCSR_CU_CI);
+    ctx.builder.ins().store(mem, fcsr_with_cause, ctx.core_ptr, fcsr_off);
+    write_zero(ctx, result_is_negative);
+    let fcsr_with_flag = ctx.builder.ins().bor_imm_s(fcsr_with_cause, FCSR_FU_FI);
+    ctx.builder.ins().store(mem, fcsr_with_flag, ctx.core_ptr, fcsr_off);
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().jump(continue_block, &[]);
+
+    ctx.builder.switch_to_block(normal_block);
+    ctx.builder.seal_block(normal_block);
+    emit_fpu_update_fcsr(ctx, &write_result);
     ctx.builder.ins().jump(continue_block, &[]);
 
     ctx.builder.switch_to_block(continue_block);
@@ -4563,15 +4828,28 @@ fn emit_fbinop_s(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder
     let ft = field_rt(raw);
     let fd = field_sa(raw);
 
-    emit_fpu_clear_status(ctx);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let ft_bits = emit_read_fpr_w(ctx, ft, fr_mode);
+    emit_check_denorm_operand(ctx, fs_bits, false);
+    emit_check_denorm_operand(ctx, ft_bits, false);
+    emit_fpu_clear_status(ctx);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), ft_bits);
     let result = op(ctx.builder, fs_val, ft_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
-    emit_fpu_update_fcsr(ctx);
+    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    emit_fpu_update_fcsr_arith(
+        ctx, is_denorm, is_negative,
+        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| {
+            let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
+            let neg32 = ctx.builder.ins().uextend(ir::types::I32, neg);
+            let sign = ctx.builder.ins().ishl_imm_s(neg32, 31);
+            let signed_zero = ctx.builder.ins().bor(zero, sign);
+            emit_write_fpr_w(ctx, fd, signed_zero, fr_mode)
+        },
+    );
 }
 fn emit_fbinop_d(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder, Value, Value) -> Value) {
     let raw = ctx.raw;
@@ -4579,15 +4857,28 @@ fn emit_fbinop_d(ctx: &mut EmitCtx, fr_mode: FrMode, op: fn(&mut FunctionBuilder
     let ft = field_rt(raw);
     let fd = field_sa(raw);
 
-    emit_fpu_clear_status(ctx);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
     let ft_bits = emit_read_fpr_l(ctx, ft, fr_mode);
+    emit_check_denorm_operand(ctx, fs_bits, true);
+    emit_check_denorm_operand(ctx, ft_bits, true);
+    emit_fpu_clear_status(ctx);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let ft_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), ft_bits);
     let result = op(ctx.builder, fs_val, ft_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
-    emit_fpu_update_fcsr(ctx);
+    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    emit_fpu_update_fcsr_arith(
+        ctx, is_denorm, is_negative,
+        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| {
+            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+            let neg64 = ctx.builder.ins().uextend(ir::types::I64, neg);
+            let sign = ctx.builder.ins().ishl_imm_s(neg64, 63);
+            let signed_zero = ctx.builder.ins().bor(zero, sign);
+            emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
+        },
+    );
 }
 
 fn fop_add(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value { builder.ins().fadd(a, b) }
@@ -4610,24 +4901,48 @@ fn emit_fdiv_d(ctx: &mut EmitCtx, fr_mode: FrMode) { emit_fbinop_d(ctx, fr_mode,
 fn emit_fsqrt_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    emit_fpu_clear_status(ctx);
     let fs_bits = emit_read_fpr_w(ctx, fs, fr_mode);
+    emit_check_denorm_operand(ctx, fs_bits, false);
+    emit_fpu_clear_status(ctx);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().sqrt(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
-    emit_fpu_update_fcsr(ctx);
+    let is_denorm = emit_is_subnormal_s(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    emit_fpu_update_fcsr_arith(
+        ctx, is_denorm, is_negative,
+        |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| {
+            let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
+            let neg32 = ctx.builder.ins().uextend(ir::types::I32, neg);
+            let sign = ctx.builder.ins().ishl_imm_s(neg32, 31);
+            let signed_zero = ctx.builder.ins().bor(zero, sign);
+            emit_write_fpr_w(ctx, fd, signed_zero, fr_mode)
+        },
+    );
 }
 fn emit_fsqrt_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    emit_fpu_clear_status(ctx);
     let fs_bits = emit_read_fpr_l(ctx, fs, fr_mode);
+    emit_check_denorm_operand(ctx, fs_bits, true);
+    emit_fpu_clear_status(ctx);
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().sqrt(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
-    emit_fpu_update_fcsr(ctx);
+    let is_denorm = emit_is_subnormal_d(ctx, result_bits);
+    let is_negative = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, result_bits, 0);
+    emit_fpu_update_fcsr_arith(
+        ctx, is_denorm, is_negative,
+        |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode),
+        |ctx, neg| {
+            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
+            let neg64 = ctx.builder.ins().uextend(ir::types::I64, neg);
+            let sign = ctx.builder.ins().ishl_imm_s(neg64, 63);
+            let signed_zero = ctx.builder.ins().bor(zero, sign);
+            emit_write_fpr_l(ctx, fd, signed_zero, fr_mode)
+        },
+    );
 }
 
 /// ABS.S/D, NEG.S/D, MOV.S/D fd, fs: unlike ADD/SUB/MUL/DIV/SQRT, these
@@ -4645,7 +4960,7 @@ fn emit_fabs_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fabs(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+    emit_check_snan_operand(ctx, fs_bits, false, |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
 }
 fn emit_fabs_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
@@ -4654,7 +4969,7 @@ fn emit_fabs_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fabs(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+    emit_check_snan_operand(ctx, fs_bits, true, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
 }
 fn emit_fneg_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
@@ -4663,7 +4978,7 @@ fn emit_fneg_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fneg(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
+    emit_check_snan_operand(ctx, fs_bits, false, |ctx| emit_write_fpr_w(ctx, fd, result_bits, fr_mode));
 }
 fn emit_fneg_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
@@ -4672,7 +4987,7 @@ fn emit_fneg_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs_val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), fs_bits);
     let result = ctx.builder.ins().fneg(fs_val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+    emit_check_snan_operand(ctx, fs_bits, true, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
 }
 fn emit_fmov_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
@@ -4916,123 +5231,157 @@ enum RoundMode { Fixed(i64), Dynamic }
 
 /// Shared body for every float-source rounding conversion (ROUND/TRUNC/
 /// CEIL/FLOOR/CVT.W/CVT.L, source format S or D, dest width W(i32) or
-/// L(i64)). Mirrors `exec_fround_l_s` et al.'s common shape, including its
-/// value-based Inexact computation: convert `result` back to the source's
-/// float type and compare against the original `src_val` — this is what
-/// MIPS (and MAME's SoftFloat reference, `f32_to_i32`'s own
-/// `softfloat_flag_inexact`) actually specifies as Inexact for this
-/// instruction family, and is the only way to get it right without a full
-/// SoftFloat port (host MXCSR state, even read carefully, answers a
-/// different question — see `emit_round_to_int_mode`'s doc comment).
+/// L(i64)). Unlike the old Cranelift-IR-side rounding/saturation, this is a
+/// single `call_indirect` into `core.fpu_cvt_to_int_fn`
+/// (`mips_exec.rs::jit_cvt_to_int`, which calls the same
+/// `cvt_to_int_and_commit` the interpreter's `fpu_cvt_to_int` calls) — no
+/// Cranelift-side rounding math, no host MXCSR/FPSR read at all. See
+/// `cvt_to_int_and_commit`'s doc comment for the full rationale: reading
+/// host FP status after a hardware conversion instruction races the flag
+/// write against the read on out-of-order hardware (found live via this
+/// file's own equivalence tests), and this also fixes the result itself to
+/// real MIPS saturation (always the largest-magnitude representable
+/// integer, e.g. 0x7FFFFFFF for a negative overflow too) instead of
+/// Rust/Cranelift's own saturate-toward-sign convention. The function reads/
+/// writes `core.fpr`/`core.fpu_fcsr` directly, so nothing computed here
+/// needs to survive across the call as a cached `Value` — only the plain
+/// scalar register indices and mode flags are passed in.
 fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: bool, mode: RoundMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    emit_fpu_clear_status(ctx);
-
-    let float_ty = if src_f64 { ir::types::F64 } else { ir::types::F32 };
-    let src_val = if src_f64 {
-        let bits = emit_read_fpr_l(ctx, fs, fr_mode);
-        ctx.builder.ins().bitcast(float_ty, MemFlagsData::new(), bits)
-    } else {
-        let bits = emit_read_fpr_w(ctx, fs, fr_mode);
-        ctx.builder.ins().bitcast(float_ty, MemFlagsData::new(), bits)
-    };
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i32t = ir::types::I32;
 
     let rm = match mode {
-        RoundMode::Fixed(rm) => ctx.builder.ins().iconst(ir::types::I8, rm),
+        RoundMode::Fixed(rm) => ctx.builder.ins().iconst(i32t, rm),
         RoundMode::Dynamic => {
-            let mem = MemFlagsData::trusted();
             let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
-            let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
-            let rm32 = ctx.builder.ins().band_imm_s(fcsr, 0x3);
-            ctx.builder.ins().ireduce(ir::types::I8, rm32)
+            let fcsr = ctx.builder.ins().load(i32t, mem, ctx.core_ptr, fcsr_off);
+            ctx.builder.ins().band_imm_s(fcsr, 0x3)
         }
     };
-    let rounded = emit_round_to_int_mode(ctx.builder, src_val, rm);
+    let fs_val = ctx.builder.ins().iconst(i32t, fs as i64);
+    let fd_val = ctx.builder.ins().iconst(i32t, fd as i64);
+    let fr1_val = ctx.builder.ins().iconst(i32t, matches!(fr_mode, FrMode::Fr1) as i64);
+    let src_f64_val = ctx.builder.ins().iconst(i32t, src_f64 as i64);
+    let dst_i64_val = ctx.builder.ins().iconst(i32t, dst_i64 as i64);
 
-    // Cranelift's floor/ceil/trunc/nearest (used by the old, replaced
-    // implementation of `emit_round_to_int_mode`) lower to real SSE
-    // ROUNDSS/ROUNDSD-family instructions on x86_64, which set MXCSR's
-    // Precision (Inexact) flag as a side effect whenever *that intermediate
-    // rounding step* wasn't a no-op — not whenever the overall MIPS
-    // conversion was inexact. `emit_round_to_int_mode` no longer uses any
-    // hardware rounding instruction (pure bit manipulation), so this is now
-    // moot for that specific concern — but the `fcvt_to_sint_sat` below is
-    // still a real hardware instruction that could set its own flags, so
-    // status is still cleared here and Inexact is still computed by value
-    // (comparing the result back to the source) rather than trusted from
-    // hardware — matching `mips_exec.rs`'s interpreter-side approach exactly.
-    emit_fpu_clear_status(ctx);
-    let int_ty = if dst_i64 { ir::types::I64 } else { ir::types::I32 };
-    let result = ctx.builder.ins().fcvt_to_sint_sat(int_ty, rounded);
-
-    // Inexact iff converting `result` back to the source's float type
-    // doesn't reproduce `src_val` exactly — see this function's own doc
-    // comment.
-    use cranelift_codegen::ir::condcodes::FloatCC;
-    let result_as_float = ctx.builder.ins().fcvt_from_sint(float_ty, result);
-    let inexact = ctx.builder.ins().fcmp(FloatCC::NotEqual, result_as_float, src_val);
-
-    if dst_i64 {
-        emit_write_fpr_l(ctx, fd, result, fr_mode);
-    } else {
-        emit_write_fpr_w(ctx, fd, result, fr_mode);
-    }
-    emit_fpu_update_fcsr_with_inexact_override(ctx, Some(inexact));
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_to_int_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty)); // ctx (the MipsExecutor pointer)
+    sig.params.push(AbiParam::new(i32t)); // fs_reg
+    sig.params.push(AbiParam::new(i32t)); // fd_reg
+    sig.params.push(AbiParam::new(i32t)); // fr1
+    sig.params.push(AbiParam::new(i32t)); // src_f64
+    sig.params.push(AbiParam::new(i32t)); // dst_i64
+    sig.params.push(AbiParam::new(i32t)); // rm
+    sig.returns.push(AbiParam::new(i32t)); // trapped (nonzero) or not (0)
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[ctx.core_ptr, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
+    let trapped = ctx.builder.inst_results(call)[0];
+    emit_trap_if_nonzero(ctx, trapped);
 }
 
 /// Shared body for int-source-to-float conversions (CVT.S.W/D.W/S.L/D.L):
-/// plain signed int->float, no rounding choice. Mirrors `exec_fcvt_s_w` et al.
+/// a single `call_indirect` into `core.fpu_cvt_int_to_float_fn`
+/// (`mips_exec.rs::jit_cvt_int_to_float`, calling the same
+/// `cvt_int_to_float_and_commit` the interpreter's `fpu_cvt_int_to_float`
+/// calls) — no Cranelift-side `fcvt_from_sint` + host MXCSR/FPSR read, same
+/// race-avoidance shape as `emit_fcvt_to_int`/`cvt_to_int_and_commit`.
 fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64: bool) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    emit_fpu_clear_status(ctx);
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i32t = ir::types::I32;
 
-    let src_int = if src_i64 {
-        emit_read_fpr_l(ctx, fs, fr_mode)
-    } else {
-        emit_read_fpr_w(ctx, fs, fr_mode)
-    };
+    let fs_val = ctx.builder.ins().iconst(i32t, fs as i64);
+    let fd_val = ctx.builder.ins().iconst(i32t, fd as i64);
+    let fr1_val = ctx.builder.ins().iconst(i32t, matches!(fr_mode, FrMode::Fr1) as i64);
+    let src_i64_val = ctx.builder.ins().iconst(i32t, src_i64 as i64);
+    let dst_f64_val = ctx.builder.ins().iconst(i32t, dst_f64 as i64);
 
-    let float_ty = if dst_f64 { ir::types::F64 } else { ir::types::F32 };
-    let result = ctx.builder.ins().fcvt_from_sint(float_ty, src_int);
-
-    if dst_f64 {
-        let bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-        emit_write_fpr_l(ctx, fd, bits, fr_mode);
-    } else {
-        let bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-        emit_write_fpr_w(ctx, fd, bits, fr_mode);
-    }
-    emit_fpu_update_fcsr(ctx);
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_int_to_float_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i32t));
+    sig.returns.push(AbiParam::new(i32t));
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[ctx.core_ptr, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
+    let trapped = ctx.builder.inst_results(call)[0];
+    emit_trap_if_nonzero(ctx, trapped);
 }
 
-/// CVT.D.S / CVT.S.D: plain float<->float widen/narrow, no rounding choice
-/// for the widen (D.S); the narrow (S.D) uses Cranelift's `fdemote`, which
-/// rounds to nearest-even on precision loss — matches Rust's `as f32` cast
-/// (also round-to-nearest-even, the IEEE-754-mandated narrowing behavior,
-/// unlike the away-from-zero integer rounding case above).
+/// CVT.D.S: widening float<->float, always exact per the R4000/VR5000
+/// manuals (Table 7-2/9-1 list no exception CVT.D.S can raise) — no FCSR
+/// interaction and so no host-status-read race to avoid; safe to keep as a
+/// plain Cranelift `fpromote`.
 fn emit_fcvt_d_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    emit_fpu_clear_status(ctx);
     let bits = emit_read_fpr_w(ctx, fs, fr_mode);
     let val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), bits);
     let result = ctx.builder.ins().fpromote(ir::types::F64, val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
     emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
-    emit_fpu_update_fcsr(ctx);
 }
+/// CVT.S.D: single `call_indirect` into `core.fpu_cvt_d_to_s_fn`
+/// (`mips_exec.rs::jit_cvt_d_to_s`, calling `cvt_d_to_s_and_commit`) — same
+/// race-avoidance shape as `emit_fcvt_from_int`/`emit_fcvt_to_int`; unlike
+/// the widen direction, narrowing can raise Inexact or Overflow.
 fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
-    emit_fpu_clear_status(ctx);
-    let bits = emit_read_fpr_l(ctx, fs, fr_mode);
-    let val = ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), bits);
-    let result = ctx.builder.ins().fdemote(ir::types::F32, val);
-    let result_bits = ctx.builder.ins().bitcast(ir::types::I32, MemFlagsData::new(), result);
-    emit_write_fpr_w(ctx, fd, result_bits, fr_mode);
-    emit_fpu_update_fcsr(ctx);
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i32t = ir::types::I32;
+
+    let fs_val = ctx.builder.ins().iconst(i32t, fs as i64);
+    let fd_val = ctx.builder.ins().iconst(i32t, fd as i64);
+    let fr1_val = ctx.builder.ins().iconst(i32t, matches!(fr_mode, FrMode::Fr1) as i64);
+
+    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_d_to_s_fn());
+    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i32t));
+    sig.params.push(AbiParam::new(i32t));
+    sig.returns.push(AbiParam::new(i32t));
+    let sig_ref = ctx.builder.import_signature(sig);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[ctx.core_ptr, fs_val, fd_val, fr1_val]);
+    let trapped = ctx.builder.inst_results(call)[0];
+    emit_trap_if_nonzero(ctx, trapped);
+}
+
+/// Shared tail for the `fpu_cvt_*_fn` family: `trapped` is the nonzero-if-
+/// trapped `I32` a call just returned. Raises `EXC_FPE` via
+/// `emit_exception_exit` on trap; otherwise leaves `ctx.builder` positioned
+/// in a new, sealed continuation block, same contract as
+/// `emit_fpu_update_fcsr`.
+fn emit_trap_if_nonzero(ctx: &mut EmitCtx, trapped: Value) {
+    let i32t = ir::types::I32;
+    let trapped_bool = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, trapped, 0);
+    let raise_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(trapped_bool, raise_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(raise_block);
+    ctx.builder.set_cold_block(raise_block);
+    ctx.builder.seal_block(raise_block);
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(i32t, status as i64);
+    emit_exception_exit(ctx, status_val);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
 }
 
 fn emit_fcvt_w_s(ctx: &mut EmitCtx, f: FrMode) { emit_fcvt_to_int(ctx, f, false, false, RoundMode::Dynamic); }
@@ -5120,77 +5469,121 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
     let raw = ctx.raw;
     let fs = field_rd(raw);
     let ft = field_rt(raw);
-    let fd = field_sa(raw);
     let funct = raw & 0x3F;
     let mem = MemFlagsData::trusted();
 
+    let (a_bits, b_bits) = if is_d {
+        (emit_read_fpr_l(ctx, fs, fr_mode), emit_read_fpr_l(ctx, ft, fr_mode))
+    } else {
+        (emit_read_fpr_w(ctx, fs, fr_mode), emit_read_fpr_w(ctx, ft, fr_mode))
+    };
     let (a, b) = if is_d {
-        let a_bits = emit_read_fpr_l(ctx, fs, fr_mode);
-        let b_bits = emit_read_fpr_l(ctx, ft, fr_mode);
         (ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), a_bits),
          ctx.builder.ins().bitcast(ir::types::F64, MemFlagsData::new(), b_bits))
     } else {
-        let a_bits = emit_read_fpr_w(ctx, fs, fr_mode);
-        let b_bits = emit_read_fpr_w(ctx, ft, fr_mode);
         (ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), a_bits),
          ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), b_bits))
     };
 
-    // Signaling-compare NaN check (funct bit 3): compile-time-known whether
-    // this instruction is signaling at all, but the NaN-ness of the
-    // operands is runtime — so the check itself is only emitted for
-    // signaling condition codes, matching the interpreter's `funct_val &
-    // 0x8 != 0` guard exactly (a non-signaling compare never touches
-    // FCSR.V here, same as the interpreter never entering that `if`).
-    if funct & 0x8 != 0 {
+    // Invalid is raised whenever either operand is a signalling NaN
+    // (unconditional on the predicate), and additionally for the eight
+    // signalling predicates (funct bit 3) whenever either operand is any
+    // NaN — mirrors `exec_fcc_s`/`exec_fcc_d`'s `invalid` computation
+    // exactly. `is_snan`: exponent all-1s, mantissa nonzero, mantissa MSB
+    // (the "is quiet" bit) clear.
+    let is_snan = |b: &mut cranelift_frontend::FunctionBuilder, bits: ir::Value, is_d: bool| -> ir::Value {
+        if is_d {
+            let exp_mantissa_nonzero = {
+                let masked = b.ins().band_imm_s(bits, 0x7FFF_FFFF_FFFF_FFFFu64 as i64);
+                let exp_is_max = b.ins().band_imm_s(bits, 0x7FF0_0000_0000_0000u64 as i64);
+                let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp_is_max, 0x7FF0_0000_0000_0000u64 as i64);
+                let mantissa_nonzero = b.ins().band_imm_s(masked, 0x000F_FFFF_FFFF_FFFFu64 as i64);
+                let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
+                b.ins().band(exp_is_max, mantissa_nonzero)
+            };
+            let quiet_bit_clear = {
+                let quiet_bit = b.ins().band_imm_s(bits, 0x0008_0000_0000_0000u64 as i64);
+                b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0)
+            };
+            b.ins().band(exp_mantissa_nonzero, quiet_bit_clear)
+        } else {
+            let exp_is_max = b.ins().band_imm_s(bits, 0x7F80_0000);
+            let exp_is_max = b.ins().icmp_imm_s(IntCC::Equal, exp_is_max, 0x7F80_0000);
+            let mantissa_nonzero = b.ins().band_imm_s(bits, 0x007F_FFFF);
+            let mantissa_nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, mantissa_nonzero, 0);
+            let exp_mantissa_nonzero = b.ins().band(exp_is_max, mantissa_nonzero);
+            let quiet_bit = b.ins().band_imm_s(bits, 0x0040_0000);
+            let quiet_bit_clear = b.ins().icmp_imm_s(IntCC::Equal, quiet_bit, 0);
+            b.ins().band(exp_mantissa_nonzero, quiet_bit_clear)
+        }
+    };
+    let a_snan = is_snan(ctx.builder, a_bits, is_d);
+    let b_snan = is_snan(ctx.builder, b_bits, is_d);
+    let has_snan = ctx.builder.ins().bor(a_snan, b_snan);
+
+    let invalid = if funct & 0x8 != 0 {
         use cranelift_codegen::ir::condcodes::FloatCC;
         let a_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, a, a);
         let b_nan = ctx.builder.ins().fcmp(FloatCC::Unordered, b, b);
         let either_nan = ctx.builder.ins().bor(a_nan, b_nan);
+        ctx.builder.ins().bor(has_snan, either_nan)
+    } else {
+        has_snan
+    };
+    let invalid = ctx.builder.ins().uextend(ir::types::I32, invalid);
 
-        let raise_v_block = ctx.builder.create_block();
-        let after_v_block = ctx.builder.create_block();
-        ctx.builder.ins().brif(either_nan, raise_v_block, &[], after_v_block, &[]);
+    // Cause reflects only the last instruction (rewritten every compare,
+    // not just when this one raises Invalid), matching the interpreter.
+    const FCSR_CM: i64 = 0x0001_f000;
+    const FCSR_CV: i64 = 0x0001_0000;
+    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
+    let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
+    let fcsr_cause_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
+    let cv_bit = ctx.builder.ins().ishl_imm_s(invalid, 16); // FCSR_CV = 1<<16
+    let fcsr_with_cause = ctx.builder.ins().bor(fcsr_cause_cleared, cv_bit);
+    ctx.builder.ins().store(mem, fcsr_with_cause, ctx.core_ptr, fcsr_off);
 
-        // Cold: a signaling-NaN operand on a compare is a rare edge case.
-        ctx.builder.switch_to_block(raise_v_block);
-        ctx.builder.set_cold_block(raise_v_block);
-        ctx.builder.seal_block(raise_v_block);
-        let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
-        let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
-        const FCSR_CV: i64 = 0x0001_0000;
-        let fcsr_with_v = ctx.builder.ins().bor_imm_s(fcsr, FCSR_CV | 0x40);
-        ctx.builder.ins().store(mem, fcsr_with_v, ctx.core_ptr, fcsr_off);
+    let invalid_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, invalid, 0);
+    let raise_v_block = ctx.builder.create_block();
+    let after_v_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(invalid_nonzero, raise_v_block, &[], after_v_block, &[]);
 
-        let ev_set = ctx.builder.ins().band_imm_s(fcsr_with_v, 0x800);
-        let ev_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ev_set, 0);
-        let raise_fpe_block = ctx.builder.create_block();
-        let no_raise_block = ctx.builder.create_block();
-        ctx.builder.ins().brif(ev_nonzero, raise_fpe_block, &[], no_raise_block, &[]);
+    // Cold: a signaling-NaN operand on a compare is a rare edge case.
+    ctx.builder.switch_to_block(raise_v_block);
+    ctx.builder.set_cold_block(raise_v_block);
+    ctx.builder.seal_block(raise_v_block);
+    let ev_set = ctx.builder.ins().band_imm_s(fcsr_with_cause, 0x800);
+    let ev_nonzero = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ev_set, 0);
+    let raise_fpe_block = ctx.builder.create_block();
+    let no_raise_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(ev_nonzero, raise_fpe_block, &[], no_raise_block, &[]);
 
-        // Cold: reached only after the already-rare signaling-NaN case above.
-        ctx.builder.switch_to_block(raise_fpe_block);
-        ctx.builder.set_cold_block(raise_fpe_block);
-        ctx.builder.seal_block(raise_fpe_block);
-        let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
-        let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
-        emit_exception_exit(ctx, status_val);
+    // Cold: reached only after the already-rare signaling-NaN case above.
+    ctx.builder.switch_to_block(raise_fpe_block);
+    ctx.builder.set_cold_block(raise_fpe_block);
+    ctx.builder.seal_block(raise_fpe_block);
+    // Trapped: Cause is already set above, but the sticky Flag field is
+    // not — R4000 manual: flag bits are not set when an exception is taken.
+    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    emit_exception_exit(ctx, status_val);
 
-        ctx.builder.switch_to_block(no_raise_block);
-        ctx.builder.seal_block(no_raise_block);
-        ctx.builder.ins().jump(after_v_block, &[]);
+    ctx.builder.switch_to_block(no_raise_block);
+    ctx.builder.seal_block(no_raise_block);
+    // Untrapped: also set the sticky Flag.V bit.
+    let fcsr_with_flag = ctx.builder.ins().bor_imm_s(fcsr_with_cause, FCSR_CV >> 10);
+    ctx.builder.ins().store(mem, fcsr_with_flag, ctx.core_ptr, fcsr_off);
+    ctx.builder.ins().jump(after_v_block, &[]);
 
-        ctx.builder.switch_to_block(after_v_block);
-        ctx.builder.seal_block(after_v_block);
-    }
+    ctx.builder.switch_to_block(after_v_block);
+    ctx.builder.seal_block(after_v_block);
 
     let cond_result = emit_fpu_compare(ctx.builder, a, b, funct);
     let cond_i32 = ctx.builder.ins().uextend(ir::types::I32, cond_result);
 
-    // set_fpu_cc: cc = fd & 0x7; bit = if cc==0 {23} else {24+cc}.
-    let cc = fd & 0x7;
+    // set_fpu_cc: cc = (raw >> 8) & 0x7; bit = if cc==0 {23} else {24+cc}.
+    let cc = (raw >> 8) & 0x7;
     let bit = if cc == 0 { 23 } else { 24 + cc };
-    let fcsr_off = ir::immediates::Offset32::new(core_offset_of_fpu_fcsr());
     let fcsr = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, fcsr_off);
     let cleared = ctx.builder.ins().band_imm_s(fcsr, !(1i64 << bit));
     let bit_val = ctx.builder.ins().ishl_imm_s(cond_i32, bit as i64);
@@ -5252,7 +5645,11 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FABS => Some(emit_fabs_s),
             FUNCT_FNEG => Some(emit_fneg_s),
             FUNCT_FMOV => Some(emit_fmov_s),
+            // MOVF.fmt/MOVT.fmt is MIPS IV; gate like MOVZ/MOVN/MOVCI above.
+            #[cfg(feature = "mips4")]
             FUNCT_FMOVCF => Some(emit_fmovcf_s),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FMOVCF => None,
             FUNCT_FCVT_D => Some(emit_fcvt_d_s),
             FUNCT_FCVT_W => Some(emit_fcvt_w_s),
             FUNCT_FCVT_L => Some(emit_fcvt_l_s),
@@ -5276,7 +5673,10 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FABS => Some(emit_fabs_d),
             FUNCT_FNEG => Some(emit_fneg_d),
             FUNCT_FMOV => Some(emit_fmov_d),
+            #[cfg(feature = "mips4")]
             FUNCT_FMOVCF => Some(emit_fmovcf_d),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FMOVCF => None,
             FUNCT_FCVT_S => Some(emit_fcvt_s_d),
             FUNCT_FCVT_W => Some(emit_fcvt_w_d),
             FUNCT_FCVT_L => Some(emit_fcvt_l_d),
@@ -6663,9 +7063,17 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             FUNCT_DSLLV => Some(emit_dsllv),
             FUNCT_DSRLV => Some(emit_dsrlv),
             FUNCT_DSRAV => Some(emit_dsrav),
+            // MOVZ/MOVN/MOVCI are MIPS IV; without the feature they must not
+            // be compiled here so the analyzer/interpreter fallback can
+            // raise Reserved Instruction (mirrors mips_exec.rs's decode gate).
+            #[cfg(feature = "mips4")]
             FUNCT_MOVZ => Some(emit_movz),
+            #[cfg(feature = "mips4")]
             FUNCT_MOVN => Some(emit_movn),
+            #[cfg(feature = "mips4")]
             FUNCT_MOVCI => Some(emit_movci),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_MOVZ | FUNCT_MOVN | FUNCT_MOVCI => None,
             FUNCT_TGE => Some(emit_tge),
             FUNCT_TGEU => Some(emit_tgeu),
             FUNCT_TLT => Some(emit_tlt),
@@ -6684,7 +7092,12 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
             RT_TNEI => Some(emit_tnei),
             _ => None,
         },
+        // PREF is MIPS IV; without the feature it must not be compiled here
+        // so the interpreter fallback can raise Reserved Instruction.
+        #[cfg(feature = "mips4")]
         OP_PREF => Some(emit_nop),
+        #[cfg(not(feature = "mips4"))]
+        OP_PREF => None,
         OP_ADDI => Some(emit_addi),
         OP_ADDIU => Some(emit_addiu),
         OP_DADDI => Some(emit_daddi),

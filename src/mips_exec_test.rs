@@ -1622,6 +1622,147 @@ mod tests {
         assert_eq!(exec.core.read_fpr_s(5), 5.5);
     }
 
+    /// R4000/VR5000 manuals: a denormalized operand to a computational
+    /// instruction is Unimplemented Operation (Cause.E) — the hardware never
+    /// computes an answer, so the destination is left untouched. See
+    /// rules/testing/fpu-exception-model-vs-r4400.md.
+    #[test]
+    fn test_fpu_denorm_operand_is_unimplemented() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_w(1, 0x0000_0001); // smallest denormal single
+        exec.core.write_fpr_s(2, 1.0);
+        exec.core.write_fpr_w(0, 0x5a5a5a5a); // sentinel, must survive a trap untouched
+
+        let add_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD);
+        let s = exec.exec(add_s);
+        assert!(s & EXEC_IS_EXCEPTION != 0, "denormal operand must trap");
+        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0002_0000, 0x0002_0000, "Cause.E must be set");
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// Same rule for a quiet NaN operand — the surprising half of the table:
+    /// an R4400/R5000 does not propagate NaN through ADD in hardware.
+    #[test]
+    fn test_fpu_qnan_operand_is_unimplemented() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_w(1, 0x7FC0_0000); // quiet NaN
+        exec.core.write_fpr_s(2, 1.0);
+        exec.core.write_fpr_w(0, 0x5a5a5a5a);
+
+        let add_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD);
+        let s = exec.exec(add_s);
+        assert!(s & EXEC_IS_EXCEPTION != 0, "qNaN operand must trap");
+        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// Denormalized result, FS clear: Unimplemented Operation, destination
+    /// untouched. 2^-126 * 0.5 = 2^-127, denormal in single precision.
+    #[test]
+    fn test_fpu_denorm_result_without_fs_is_unimplemented() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_s(1, f32::from_bits(0x0080_0000)); // 2^-126, smallest normal
+        exec.core.write_fpr_s(2, 0.5);
+        exec.core.write_fpr_w(0, 0x5a5a5a5a);
+        exec.core.fpu_fcsr &= !0x0100_0000; // FS clear
+
+        let mul_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FMUL);
+        let s = exec.exec(mul_s);
+        assert!(s & EXEC_IS_EXCEPTION != 0, "denormal result without FS must trap");
+        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0002_0000, 0x0002_0000, "Cause.E must be set");
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// Denormalized result, FS set, neither U nor I trap enabled: flushed to
+    /// a signed zero (sign of the intermediate result) and Cause.U+I set —
+    /// no trap.
+    #[test]
+    fn test_fpu_denorm_result_flushed_with_fs() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_s(1, f32::from_bits(0x0080_0000)); // 2^-126
+        exec.core.write_fpr_s(2, 0.5);
+        exec.core.fpu_fcsr = 0x0100_0000; // FS set, no enables
+
+        let mul_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FMUL);
+        assert_eq!(exec.exec(mul_s), EXEC_COMPLETE, "flush-to-zero must not trap");
+        assert_eq!(exec.core.read_fpr_s(0), 0.0);
+        assert!(exec.core.read_fpr_s(0).is_sign_positive());
+        let fcsr = exec.core.read_fpu_control(31);
+        assert_eq!(fcsr & 0x0000_3000, 0x0000_3000, "Cause.U and Cause.I must both be set");
+        assert_eq!(fcsr & 0x0000_000c, 0x0000_000c, "Flag.U and Flag.I must both be set");
+
+        // Sign of the intermediate result survives the flush.
+        exec.core.write_fpr_s(1, f32::from_bits(0x8080_0000)); // -2^-126
+        exec.core.fpu_fcsr = 0x0100_0000;
+        assert_eq!(exec.exec(mul_s), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_fpr_s(0), 0.0);
+        assert!(exec.core.read_fpr_s(0).is_sign_negative());
+    }
+
+    /// FS alone is not enough: with Underflow trapping enabled, the same
+    /// multiply reverts to Unimplemented Operation instead of flushing.
+    #[test]
+    fn test_fpu_underflow_enable_forces_unimplemented() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_s(1, f32::from_bits(0x0080_0000));
+        exec.core.write_fpr_s(2, 0.5);
+        exec.core.write_fpr_w(0, 0x5a5a5a5a);
+        exec.core.fpu_fcsr = 0x0100_0000 | 0x0000_0100; // FS set, U enable set
+
+        let mul_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FMUL);
+        let s = exec.exec(mul_s);
+        assert!(s & EXEC_IS_EXCEPTION != 0, "underflow-enable must force Unimplemented, not flush");
+        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0002_0000, 0x0002_0000, "Cause.E must be set");
+        assert_eq!(exec.core.read_fpu_control(31) & 0x0000_2000, 0, "Cause.U must NOT be set — this is E, not U");
+        assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
+    }
+
+    /// Compare is explicitly exempt from the denormal-operand rule.
+    #[test]
+    fn test_fpu_denorm_compare_does_not_trap() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_w(1, 0x0000_0001); // smallest denormal
+        exec.core.write_fpr_s(2, 1.0);
+        let c_lt_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FC_LT);
+        assert_eq!(exec.exec(c_lt_s), EXEC_COMPLETE, "compare must not trap on a denormal operand");
+        assert!(exec.core.get_fpu_cc(0), "denorm < 1.0 must be true");
+    }
+
+    /// MOV is exempt from the denormal-operand rule too — it's a bit copy,
+    /// not an arithmetic operation.
+    #[test]
+    fn test_fpu_denorm_move_does_not_trap() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
+        exec.update_fpr_mode();
+
+        exec.core.write_fpr_w(1, 0x0000_0001);
+        let mov_s = make_cop1_compute(RS_S, 0, 1, 2, FUNCT_FMOV);
+        assert_eq!(exec.exec(mov_s), EXEC_COMPLETE, "MOV must not trap on a denormal operand");
+        assert_eq!(exec.core.read_fpr_w(2), 0x0000_0001);
+    }
+
     #[test]
     fn test_fpu_mul_div_single() {
         let (mut exec, _) = create_executor();
@@ -2259,6 +2400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_conditional_moves() {
         let (mut exec, _) = create_executor();
 
@@ -2404,7 +2546,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_pref() {
+    fn test_cache() {
         let (mut exec, _) = create_executor();
         // CACHE 0, 0(r1)
         exec.core.write_gpr(1, 0x1000);
@@ -2412,7 +2554,13 @@ mod tests {
         // Requires CP0 usable
         exec.core.cp0_status |= crate::mips_core::STATUS_CU0;
         assert_eq!(exec.exec(instr_cache), EXEC_COMPLETE);
+    }
 
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn test_pref() {
+        let (mut exec, _) = create_executor();
+        exec.core.write_gpr(1, 0x1000);
         // PREF 0, 0(r1)
         let instr_pref = make_i(OP_PREF, 1, 0, 0);
         assert_eq!(exec.exec(instr_pref), EXEC_COMPLETE);
@@ -2618,6 +2766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_fpu_mov_cond() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2651,6 +2800,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_fpu_recip_rsqrt() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2670,6 +2820,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_cop1x_load_store() {
         let (mut exec, mem) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2725,6 +2876,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_cop1x_madd() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2757,6 +2909,7 @@ mod tests {
     // Covers the remaining MIPS IV COP1X fused ops not exercised by test_cop1x_madd
     // (MADD.D, MSUB.S, NMADD.S/D, NMSUB.S/D) — fd = fs*ft +/- fr, negated for NMADD/NMSUB.
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_cop1x_madd_remaining_variants() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2814,6 +2967,7 @@ mod tests {
     // Covers SDXC1 (missing from test_cop1x_load_store, which only checks LWXC1/SWXC1/LDXC1)
     // and PREFX (COP1X prefetch — architecturally a hint/no-op).
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_cop1x_sdxc1_and_prefx() {
         let (mut exec, mem) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2866,6 +3020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_movci() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2920,6 +3075,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn test_fpu_movcf() {
         let (mut exec, _) = create_executor();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
@@ -2984,9 +3140,9 @@ mod tests {
 
         // Helper to create FPU compare with CC field
         // c.eq.s $cc, fs, ft
-        // Format: op=COP1, rs=S, ft=ft, fs=fs, cc in fd field [10:8], funct=FC_EQ
+        // Format: op=COP1, rs=S, ft=ft, fs=fs, cc in bits [10:8], funct=FC_EQ
         fn make_compare_s(cc: u32, fs: u32, ft: u32, cond: u32) -> u32 {
-            (OP_COP1 << 26) | (RS_S << 21) | (ft << 16) | (fs << 11) | (cc << 6) | cond
+            (OP_COP1 << 26) | (RS_S << 21) | (ft << 16) | (fs << 11) | ((cc & 0x7) << 8) | cond
         }
 
         // Helper to create BC1T/BC1F with CC field

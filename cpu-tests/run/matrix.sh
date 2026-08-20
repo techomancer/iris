@@ -31,10 +31,15 @@ CELLS="${*:-${CELLS:-$ALL_CELLS}}"
 feature_for() {
     case "$1" in
         r4400) echo "" ;;
-        # r5ksc_triton gives the R5000 its on-die secondary cache, which is
-        # what an Indy R5000 actually has. Without it Config.SC reports no L2
-        # and the cache tests would be exercising a machine that never shipped.
-        r5000) echo "r5k,r5ksc_triton" ;;
+        # An Indy R5000 board has the external R4600SC-style secondary cache
+        # (r5ksc) — NOT Triton, which is the O2's on-die R5000 L2 and isn't a
+        # machine this suite (or IRIS) targets. Neither r5ksc nor
+        # r5ksc_triton currently work (both fail mips_cache_v2's L1I tests;
+        # src/lib.rs refuses to build either) and there is no known-working
+        # R5000 secondary-cache config right now — see
+        # rules/testing/r5k-l1i-cache-bugs.md. Plain r5k (R5000 CPU/FPU
+        # semantics, no secondary cache) is what actually builds today.
+        r5000) echo "r5k" ;;
     esac
 }
 

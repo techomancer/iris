@@ -66,6 +66,40 @@ const FCSR_CE: u32 = 0x00020000;  // Cause: unimplemented operation
 const FCSR_CM: u32 = 0x0001f000;  // Cause mask (V,Z,O,U,I — excludes CE)
 const FCSR_EM: u32 = 0x00000f80;  // Enable mask (V,Z,O,U,I)
 const FCSR_FM: u32 = 0x0000007c;  // Flag mask (V,Z,O,U,I — sticky)
+const FCSR_FU: u32 = 0x00000008;  // Flag: underflow (sticky)
+const FCSR_FI: u32 = 0x00000004;  // Flag: inexact (sticky)
+const FCSR_UM: u32 = 0x00000100;  // Enable: underflow
+const FCSR_IM: u32 = 0x00000080;  // Enable: inexact
+const FCSR_FS: u32 = 0x01000000;  // Flush denormalized results to zero
+
+/// True if `bits` (an IEEE-754 single-precision pattern) is a signalling NaN:
+/// exponent all-1s, mantissa nonzero, and the mantissa's MSB (the "is quiet"
+/// bit) clear. A quiet NaN has that bit set.
+#[inline]
+fn is_snan_s(bits: u32) -> bool {
+    (bits & 0x7F80_0000) == 0x7F80_0000 && (bits & 0x007F_FFFF) != 0 && (bits & 0x0040_0000) == 0
+}
+
+/// Same as `is_snan_s`, for IEEE-754 double-precision bit patterns.
+#[inline]
+fn is_snan_d(bits: u64) -> bool {
+    (bits & 0x7FF0_0000_0000_0000) == 0x7FF0_0000_0000_0000
+        && (bits & 0x000F_FFFF_FFFF_FFFF) != 0
+        && (bits & 0x0008_0000_0000_0000) == 0
+}
+
+/// True if `bits` is a quiet NaN (any NaN that is not a signalling NaN).
+#[inline]
+fn is_qnan_s(bits: u32) -> bool {
+    f32::from_bits(bits).is_nan() && !is_snan_s(bits)
+}
+
+/// Same as `is_qnan_s`, for double precision.
+#[inline]
+fn is_qnan_d(bits: u64) -> bool {
+    f64::from_bits(bits).is_nan() && !is_snan_d(bits)
+}
+
 pub const EXC_WATCH: u32 = 23;    // Reference to WatchHi/WatchLo address
 pub const EXC_VCEI: u32 = 14;     // Virtual Coherency Exception (Instruction)
 pub const EXC_VCED: u32 = 31;     // Virtual Coherency Exception (Data)
@@ -1335,6 +1369,53 @@ unsafe extern "C" fn jit_fpu_set_mode(_ctx: *mut core::ffi::c_void, rm: u32) {
     crate::platform::set_fpu_mode(rm as u8)
 }
 
+/// Single-implementation CVT.W/L.S/D (§4.2 shape, same as `jit_handle_exception`):
+/// `ctx` is the `MipsExecutor<T, C>` pointer, so this reads/writes
+/// `exec.core` directly — the JIT hands over `fs_reg`/`fd_reg`/format/width/
+/// rounding-mode as plain scalars and gets back whether the conversion
+/// trapped, exactly mirroring `MipsExecutor::fpu_cvt_to_int`'s own call into
+/// `cvt_to_int_and_commit`. See that function's doc comment (and
+/// `cvt_f32_to_int_by_value`'s) for why CVT-to-int needs a by-value, no-host-
+/// FPU-status-read path at all: reading MXCSR/FPSR after a hardware
+/// conversion instruction races the flag write against the read on
+/// out-of-order hardware.
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: MipsCache>(
+    ctx: *mut core::ffi::c_void,
+    fs_reg: u32,
+    fd_reg: u32,
+    fr1: u32,
+    src_f64: u32,
+    dst_i64: u32,
+    rm: u32,
+) -> u32 {
+    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
+}
+
+/// Single-implementation CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s
+/// doc comment. Same `ctx`-is-`MipsExecutor<T,C>` shape as `jit_cvt_to_int`.
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: MipsCache>(
+    ctx: *mut core::ffi::c_void,
+    fs_reg: u32,
+    fd_reg: u32,
+    fr1: u32,
+    src_i64: u32,
+    dst_f64: u32,
+) -> u32 {
+    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    cvt_int_to_float_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, src_i64 != 0, dst_f64 != 0) as u32
+}
+
+/// Single-implementation CVT.S.D — see `cvt_d_to_s_and_commit`'s doc
+/// comment. Same `ctx`-is-`MipsExecutor<T,C>` shape as `jit_cvt_to_int`.
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
+    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    cvt_d_to_s_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0) as u32
+}
+
 /// Inline lockstep step hook (`core.lockstep_step_fn`), called by compiled code
 /// at the START of every JIT instruction with its synthesized `pc`/`raw`/`bd`.
 /// Establishes the true per-instruction starting state, runs the instruction
@@ -1532,6 +1613,218 @@ fn round_f32_to_int_mode(x: f32, rm: u8) -> f32 {
     } else {
         f32::from_bits(truncated_bits)
     }
+}
+
+/// Portable (no host FPU status reads) CVT.W/L.S/D result + FCSR-cause
+/// computation, shared by both engines: the interpreter calls it directly,
+/// jitv2 calls it through a `core.fpu_cvt_to_int_*_fn` pointer exactly like
+/// `fpr_read_w`/`write_fpr_w` are shared today. Exists because reading host
+/// MXCSR/FPSR after a hardware conversion instruction (Rust's `as iN` cast,
+/// or Cranelift's `fcvt_to_sint_sat`) races the flag write against the read
+/// on out-of-order hardware — traced live via jitv2's equivalence tests
+/// (`cvt_to_int_nan_matches_interpreter` et al. in equiv_test.rs) after a
+/// codegen restructuring exposed a case where the JIT observed 0 flags
+/// immediately after a conversion the interpreter, with different
+/// instruction spacing, correctly saw as Invalid/Inexact. See
+/// rules/testing/fpu-exception-model-vs-r4400.md.
+///
+/// `x` must already be rounded to an integral value via
+/// `round_f32_to_int_mode`/`round_f64_to_int_mode` — this only classifies
+/// and saturates. Two competing specs exist for NaN/out-of-range CVT (R4000
+/// manual: Unimplemented Operation, destination untouched; MIPS IV ISA:
+/// Invalid Operation, result saturates to the largest representable
+/// magnitude) — this implements the MIPS IV ISA route (Invalid, not
+/// Unimplemented) since it's expressible without a caller-side branch on
+/// whether to skip the write, matching `fpu/cvt_out_of_range`'s accepted
+/// second branch (`cpu-tests/tests/fpu/fpu_breadth.c`).
+///
+/// Returns `(result_bits, invalid, inexact)`. `result_bits` is the raw
+/// destination bit pattern (already reinterpreted as unsigned, sign-extended
+/// by the caller through the usual GPR/FPR write path); `dst_bits` selects
+/// 32- vs 64-bit destination width (`CVT.W` vs `CVT.L`).
+fn cvt_f32_to_int_by_value(x: f32, dst_bits: u32) -> (u64, bool, bool) {
+    let (max_pos, max_neg): (i64, i64) = if dst_bits == 32 {
+        (i32::MAX as i64, i32::MIN as i64)
+    } else {
+        (i64::MAX, i64::MIN)
+    };
+    if x.is_nan() {
+        return (max_pos as u64, true, false);
+    }
+    // x is already integral (post-rounding); out-of-range iff it can't fit
+    // in the destination width at all.
+    let in_range = if dst_bits == 32 {
+        x >= i32::MIN as f32 && x <= i32::MAX as f32
+    } else {
+        // i64::MAX isn't exactly representable in f32/f64; compare against
+        // 2^63 (exact in both formats) the same way real hardware's range
+        // check works, rather than against a rounded i64::MAX as f32/f64.
+        x >= -(9223372036854775808.0f32) && x < 9223372036854775808.0f32
+    };
+    if !in_range {
+        let result = if x.is_sign_negative() { max_neg } else { max_pos };
+        return (result as u64, true, false);
+    }
+    let result = if dst_bits == 32 { x as i32 as i64 } else { x as i64 };
+    let inexact = (result as f32) != x;
+    (result as u64, false, inexact)
+}
+
+/// `f64` counterpart of `cvt_f32_to_int_by_value` — see that function's doc
+/// comment for the full design rationale.
+fn cvt_f64_to_int_by_value(x: f64, dst_bits: u32) -> (u64, bool, bool) {
+    let (max_pos, max_neg): (i64, i64) = if dst_bits == 32 {
+        (i32::MAX as i64, i32::MIN as i64)
+    } else {
+        (i64::MAX, i64::MIN)
+    };
+    if x.is_nan() {
+        return (max_pos as u64, true, false);
+    }
+    let in_range = if dst_bits == 32 {
+        x >= i32::MIN as f64 && x <= i32::MAX as f64
+    } else {
+        x >= -(9223372036854775808.0f64) && x < 9223372036854775808.0f64
+    };
+    if !in_range {
+        let result = if x.is_sign_negative() { max_neg } else { max_pos };
+        return (result as u64, true, false);
+    }
+    let result = if dst_bits == 32 { x as i32 as i64 } else { x as i64 };
+    let inexact = (result as f64) != x;
+    (result as u64, false, inexact)
+}
+
+/// CVT.W/L.S/D, all in one: reads the source FPR, rounds via
+/// `round_f32/64_to_int_mode`, classifies/saturates via
+/// `cvt_f32/64_to_int_by_value`, and commits the result and FCSR Cause/Flag
+/// bits directly against `core` — mirroring `MipsExecutor::fpu_commit_cvt_to_int`
+/// exactly, just operating on `&mut MipsCore` instead of `&mut Self` so a
+/// free function (not a `MipsExecutor<T, C>` method) can call it. This is
+/// the single function both engines share: the interpreter calls it
+/// directly from `exec_fcvt_w_s` et al.; jitv2 calls it through
+/// `core.fpu_cvt_to_int_fn` — one `call_indirect` that reads/writes `core`
+/// itself, so the JIT never has to carry a partially-computed result or
+/// Invalid/Inexact `Value` across the call boundary (Cranelift only needs
+/// to know the call may have touched `core.fpr`/`core.fpu_fcsr`, which every
+/// access already re-`load`s fresh — no stale cached `Value` risk). Returns
+/// `true` if the conversion trapped (Cause set, destination/Flag untouched,
+/// caller must raise `EXC_FPE`), `false` if it committed normally.
+///
+/// `fr1`: FR=1 (paired-64) vs FR=0 register addressing — see
+/// `read_fpr_w_fr0`/`write_fpr_w_fr0`. `src_f64`/`dst_i64`: source is
+/// D-format (else S); destination is L (else W). `rm`: MIPS FCSR.RM
+/// encoding (0=nearest-even, 1=toward-zero, 2=toward+inf, 3=toward-inf) —
+/// callers pass a fixed mode for ROUND/TRUNC/CEIL/FLOOR or FCSR's live low
+/// 2 bits for plain CVT.W/CVT.L.
+fn cvt_to_int_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, src_f64: bool, dst_i64: bool, rm: u8) -> bool {
+    let dst_bits = if dst_i64 { 64 } else { 32 };
+    let (result, invalid, inexact) = if src_f64 {
+        let bits = if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) };
+        let x = f64::from_bits(bits);
+        let rounded = round_f64_to_int_mode(x, rm);
+        cvt_f64_to_int_by_value(rounded, dst_bits)
+    } else {
+        let bits = if fr1 { core.read_fpr_w(fs_reg) } else { read_fpr_w_fr0(core, fs_reg) };
+        let x = f32::from_bits(bits);
+        let rounded = round_f32_to_int_mode(x, rm);
+        cvt_f32_to_int_by_value(rounded, dst_bits)
+    };
+
+    core.fpu_fcsr &= !FCSR_CM;
+    let write_result = |core: &mut MipsCore| {
+        if dst_i64 {
+            if fr1 { core.write_fpr_l(fd_reg, result) } else { write_fpr_l_fr0(core, fd_reg, result) }
+        } else if fr1 {
+            core.write_fpr_w(fd_reg, result as u32)
+        } else {
+            write_fpr_w_fr0(core, fd_reg, result as u32)
+        }
+    };
+    if !invalid && !inexact {
+        write_result(core);
+        return false;
+    }
+    let cause = if invalid { FCSR_CV } else { FCSR_CI };
+    core.fpu_fcsr |= cause;
+    let enable_bit = if invalid { 0x800 } else { FCSR_IM };
+    if (core.fpu_fcsr & enable_bit) != 0 {
+        return true;
+    }
+    write_result(core);
+    core.fpu_fcsr |= if invalid { 0x40 } else { FCSR_FI };
+    false
+}
+
+/// CVT.S.W/D.W/S.L/D.L (int source): a MIPS integer converted to float can
+/// only ever be Inexact (the source is always exactly representable as an
+/// integer; loss can only occur fitting it into the destination float's
+/// mantissa) — never Invalid, never Overflow. Computed by value: convert,
+/// then compare the converted-back-to-int value against the original
+/// source, the same "did round-tripping change it" test
+/// `round_f32/64_to_int_mode`'s callers already use, avoiding the host
+/// MXCSR/FPSR race `cvt_to_int_and_commit`'s doc comment describes (found
+/// live in the opposite conversion direction; the same hazard applies here
+/// since `fcvt_from_sint` is just as real a hardware instruction).
+fn cvt_int_to_float_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool, src_i64: bool, dst_f64: bool) -> bool {
+    let src: i64 = if src_i64 {
+        (if fr1 { core.read_fpr_l(fs_reg) } else { read_fpr_l_fr0(core, fs_reg) }) as i64
+    } else {
+        (if fr1 { core.read_fpr_w(fs_reg) } else { read_fpr_w_fr0(core, fs_reg) }) as i32 as i64
+    };
+    let inexact = if dst_f64 {
+        let result = src as f64;
+        let bits = result.to_bits();
+        if fr1 { core.write_fpr_l(fd_reg, bits) } else { write_fpr_l_fr0(core, fd_reg, bits) }
+        (result as i64) != src
+    } else {
+        let result = src as f32;
+        let bits = result.to_bits();
+        if fr1 { core.write_fpr_w(fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+        (result as i64) != src
+    };
+    core.fpu_fcsr &= !FCSR_CM;
+    if !inexact {
+        return false;
+    }
+    core.fpu_fcsr |= FCSR_CI;
+    if (core.fpu_fcsr & FCSR_IM) != 0 {
+        return true;
+    }
+    core.fpu_fcsr |= FCSR_FI;
+    false
+}
+
+/// CVT.S.D (narrowing, D source only — the widening CVT.D.S can never raise
+/// any FCSR condition and skips this machinery entirely): Rust's `as f32`
+/// narrowing cast is round-to-nearest-even, matching the MIPS-mandated
+/// narrowing behavior, but (same hazard as
+/// `cvt_int_to_float_and_commit`/`cvt_to_int_and_commit`) computed by value
+/// rather than trusted from a host MXCSR read after the cast. Inexact: the
+/// narrowed result doesn't widen back to the original bit-for-bit. Overflow:
+/// the magnitude exceeds `f32::MAX`, in which case the destination is
+/// infinity with the source's sign — matches Rust's own narrowing behavior
+/// for this case, so no manual saturation is needed, just cause reporting.
+fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: bool) -> bool {
+    let src = if fr1 { core.read_fpr_d(fs_reg) } else { read_fpr_d_fr0(core, fs_reg) };
+    let result = src as f32;
+    let overflow = result.is_infinite() && !src.is_infinite();
+    let inexact = !overflow && (result as f64) != src;
+    let bits = result.to_bits();
+    core.fpu_fcsr &= !FCSR_CM;
+    if !overflow && !inexact {
+        if fr1 { core.write_fpr_w(fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+        return false;
+    }
+    let cause = if overflow { FCSR_CO } else { FCSR_CI };
+    core.fpu_fcsr |= cause;
+    let enable_bit = if overflow { 0x400 } else { FCSR_IM }; // EO = bit 10
+    if (core.fpu_fcsr & enable_bit) != 0 {
+        return true;
+    }
+    if fr1 { core.write_fpr_w(fd_reg, bits) } else { write_fpr_w_fr0(core, fd_reg, bits) }
+    core.fpu_fcsr |= if overflow { 0x20 } else { FCSR_FI }; // Flag.O = bit 5
+    false
 }
 
 impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
@@ -1788,6 +2081,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.core.fpu_get_status_fn = jit_fpu_get_status;
         self.core.fpu_clear_status_fn = jit_fpu_clear_status;
         self.core.fpu_set_mode_fn = jit_fpu_set_mode;
+        self.core.fpu_cvt_to_int_fn = jit_cvt_to_int::<T, C>;
+        self.core.fpu_cvt_int_to_float_fn = jit_cvt_int_to_float::<T, C>;
+        self.core.fpu_cvt_d_to_s_fn = jit_cvt_d_to_s::<T, C>;
         #[cfg(feature = "jitv2_lockstep")]
         {
             self.core.lockstep_step_fn = jit_lockstep_step::<T, C>;
@@ -4985,15 +5281,22 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         self.handle_exception(s)
     }
 
-    /// After a FPU arithmetic op: read host exception flags, update FCSR cause+flag bits,
-    /// and raise EXC_FPE if any enabled exception fired, otherwise EXEC_COMPLETE.
-    /// Must be called after the result is written; host FP flags are cleared by this call.
+    /// After a FPU arithmetic op has computed its result but *before* it is
+    /// committed: read host exception flags, update FCSR cause bits, and
+    /// either commit the result (calling `write_result`) and raise EXC_FPE
+    /// if any enabled exception fired, or — if trapping — leave the
+    /// destination register and the sticky Flag field untouched. R4000
+    /// manual: "When a floating-point exception is taken, no results are
+    /// stored, and the only state affected is the Cause bit" and "the flag
+    /// bits are not set by the hardware" on a taken exception. Host FP flags
+    /// are cleared by this call. `write_result` must be idempotent-free of
+    /// side effects other than the register write itself (it may not run).
     #[inline]
     /// Always used as the terminal tail call of an FPU arithmetic exec_*
-    /// handler (`self.fpu_update_fcsr()`, nothing runs after), so this is the
-    /// terminal action itself: completes normally or dispatches EXC_FPE.
-    fn fpu_update_fcsr(&mut self) -> ExecStatus {
-        self.fpu_update_fcsr_with_inexact_override(None)
+    /// handler (`self.fpu_update_fcsr(|e| ...)`, nothing runs after), so this
+    /// is the terminal action itself: completes normally or dispatches EXC_FPE.
+    fn fpu_update_fcsr(&mut self, write_result: impl FnOnce(&mut Self)) -> ExecStatus {
+        self.fpu_update_fcsr_with_inexact_override(None, write_result)
     }
 
     /// `inexact_override`: when `Some(bool)`, replaces whatever the host
@@ -5010,33 +5313,136 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// replaces the host's bit with it, rather than merging the two (an OR
     /// would still let a spurious host-set bit through if the computed
     /// answer were `false` but the host happened to report `true` anyway).
-    fn fpu_update_fcsr_with_inexact_override(&mut self, inexact_override: Option<bool>) -> ExecStatus {
+    fn fpu_update_fcsr_with_inexact_override(
+        &mut self,
+        inexact_override: Option<bool>,
+        write_result: impl FnOnce(&mut Self),
+    ) -> ExecStatus {
+        self.fpu_update_fcsr_full(inexact_override, None, move |exec, _flush| write_result(exec))
+    }
+
+    /// `result_is_denorm`: `Some(result_is_negative)` when the (already-
+    /// computed, not-yet-written) result is a denormalized nonzero value —
+    /// checked by the caller via `result.is_subnormal()` before calling in,
+    /// since only the caller knows the result's type/width. Implements the
+    /// R4000/VR5000 manuals' full Table 9-1/7-1 Underflow rule (both manuals
+    /// are word-for-word identical here — see
+    /// rules/testing/fpu-exception-model-vs-r4400.md): a denormalized result
+    /// is never delivered by hardware. With FS clear, or with FS set but
+    /// Underflow/Inexact trapping enabled, it is an Unimplemented Operation
+    /// (E) instead — E has no Enable/Flag bit and always traps, and per the
+    /// manual "the result register is not modified". Only with FS set and
+    /// neither U nor I enabled does hardware flush the result to a signed
+    /// zero (sign of the *unrounded* result) and set Cause.U and Cause.I —
+    /// not whatever the host FPU happened to report. `write_result`'s `bool`
+    /// argument is `true` exactly on that flush path — the real, non-denormal
+    /// result should be written when `false`, a signed zero of the given sign
+    /// when `true` (the value itself, not just the sign, is the caller's job
+    /// since S/D width and the FPR write function differ per call site).
+    fn fpu_update_fcsr_full(
+        &mut self,
+        inexact_override: Option<bool>,
+        result_is_denorm: Option<bool>,
+        write_result: impl FnOnce(&mut Self, bool),
+    ) -> ExecStatus {
         let mut flags = crate::platform::get_fpu_status(); // bits [6:2]: FV,FZ,FO,FU,FI
         crate::platform::clear_fpu_status();
         if let Some(inexact) = inexact_override {
             flags = (flags & !(1 << 2)) | ((inexact as u32) << 2);
         }
+        // Cause holds only the last instruction's exceptions (R4000 manual:
+        // "the results of only one instruction") and is rewritten every FP
+        // instruction, unlike the sticky Flag field. Clear it unconditionally,
+        // even when this instruction raised nothing.
+        self.core.fpu_fcsr &= !FCSR_CM;
+
+        if result_is_denorm.is_some() {
+            let fs_set = (self.core.fpu_fcsr & FCSR_FS) != 0;
+            let ui_enabled = (self.core.fpu_fcsr & (FCSR_UM | FCSR_IM)) != 0;
+            if !fs_set || ui_enabled {
+                return self.fpu_unimplemented();
+            }
+            // FS set, neither U nor I enabled: flush to the signed zero of
+            // the intermediate result and force Cause.U+I — regardless of
+            // what the host's own underflow/inexact flags said.
+            self.core.fpu_fcsr |= FCSR_CU | FCSR_CI;
+            write_result(self, true);
+            self.core.fpu_fcsr |= FCSR_FU | FCSR_FI;
+            return self.handle_exec_complete();
+        }
+
         if flags == 0 {
+            write_result(self, false);
             return self.handle_exec_complete();
         }
         // Promote flag bits [6:2] → cause bits [16:12] (shift up by 10)
         let causes = (flags & FCSR_FM) << 10;
-        // OR causes and sticky flags into FCSR (software clears explicitly via SetFPSR)
         self.core.fpu_fcsr |= causes;
+        // Raise FPE if any cause bit has its corresponding enable bit set.
+        // Causes are 5 bits above enables: (causes >> 5) aligns them with enables.
+        let traps = ((causes >> 5) & (self.core.fpu_fcsr & FCSR_EM)) != 0;
+        if traps {
+            // Trapped: neither the destination register nor the sticky Flag
+            // field are touched — only Cause (already set above).
+            let s = exec_exception(EXC_FPE);
+            return self.handle_exception(s);
+        }
+        // Not trapping: commit the result and accumulate the sticky Flag
+        // field (cleared explicitly by software via SetFPSR/CTC1).
+        write_result(self, false);
         self.core.fpu_fcsr |= flags & FCSR_FM;
-        // If underflow occurred and underflow trapping is enabled, set CE (unimplemented)
-        // to match real R4400 hardware behavior (hardware punts to software on underflow trap)
-        if (causes & FCSR_CU) != 0 && (self.core.fpu_fcsr & 0x100) != 0 {
-            self.core.fpu_fcsr |= FCSR_CE;
-            let s = exec_exception(EXC_FPE);
-            return self.handle_exception(s);
+        self.handle_exec_complete()
+    }
+
+    /// Unimplemented Operation (Cause.E): R4000/VR5000 manuals, ch 7/9.4.6 —
+    /// "no Enable bit and no Flag bit; whenever this exception occurs, an
+    /// unimplemented exception trap is taken" and "the result register is
+    /// not modified". Shared terminal helper for every E-raising site
+    /// (denormal/qNaN operand, denormal/underflowed result without the FS
+    /// escape hatch).
+    #[inline]
+    fn fpu_unimplemented(&mut self) -> ExecStatus {
+        self.core.fpu_fcsr = (self.core.fpu_fcsr & !FCSR_CM) | FCSR_CE;
+        let s = exec_exception(EXC_FPE);
+        self.handle_exception(s)
+    }
+
+    /// R4000/VR5000 manuals: "Denormalized operand" and "Quiet Not a Number
+    /// operand" are Unimplemented Operation for any convert or computational
+    /// instruction (explicitly excepting Compare, and Moves which "do not
+    /// trap if their operands are either denormalized or NaNs"). Call before
+    /// computing on either operand of ADD/SUB/MUL/DIV/SQRT; returns `Some`
+    /// (the terminal ExecStatus, already dispatched) when the operand check
+    /// itself must end the instruction, `None` to proceed to computation.
+    #[inline]
+    fn fpu_check_denorm_operand_s(&mut self, bits: u32) -> Option<ExecStatus> {
+        let v = f32::from_bits(bits);
+        (v.is_subnormal() || is_qnan_s(bits)).then(|| self.fpu_unimplemented())
+    }
+    #[inline]
+    fn fpu_check_denorm_operand_d(&mut self, bits: u64) -> Option<ExecStatus> {
+        let v = f64::from_bits(bits);
+        (v.is_subnormal() || is_qnan_d(bits)).then(|| self.fpu_unimplemented())
+    }
+
+    /// ABS.fmt/NEG.fmt: unlike a MOV, these are arithmetic operations (R4000
+    /// manual: "absolute value (ABS) and negate (NEG) are considered to be
+    /// arithmetic operations and cause this exception if one or both
+    /// operands is a signaling NaN") but they never invoke the host FPU, so
+    /// there's no `platform::get_fpu_status()` to read — just the one
+    /// possible cause, checked against the source operand directly. Same
+    /// commit-only-if-not-trapping shape as `fpu_update_fcsr`.
+    #[inline]
+    fn fpu_check_snan_operand(&mut self, is_snan: bool, write_result: impl FnOnce(&mut Self)) -> ExecStatus {
+        self.core.fpu_fcsr = (self.core.fpu_fcsr & !FCSR_CM) | if is_snan { FCSR_CV } else { 0 };
+        if is_snan {
+            if (self.core.fpu_fcsr & 0x800) != 0 { // EV enable bit
+                let s = exec_exception(EXC_FPE);
+                return self.handle_exception(s);
+            }
+            self.core.fpu_fcsr |= 0x40; // untrapped: set sticky Flag V too
         }
-        // Raise FPE if any cause bit has its corresponding enable bit set
-        // Causes are 5 bits above enables: (causes >> 5) aligns them with enables
-        if ((causes >> 5) & (self.core.fpu_fcsr & FCSR_EM)) != 0 {
-            let s = exec_exception(EXC_FPE);
-            return self.handle_exception(s);
-        }
+        write_result(self);
         self.handle_exec_complete()
     }
 
@@ -5129,54 +5535,74 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_fadd_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let ft_bits = (self.fpr_read_w)(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_s(fs_bits).or_else(|| self.fpu_check_denorm_operand_s(ft_bits)) { return s; }
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)) + f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        let result = f32::from_bits(fs_bits) + f32::from_bits(ft_bits);
+        let write_w = self.fpr_write_w;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_w(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { 0x8000_0000 } else { 0 } } else { (result).to_bits() }))
     }
     fn exec_fsub_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let ft_bits = (self.fpr_read_w)(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_s(fs_bits).or_else(|| self.fpu_check_denorm_operand_s(ft_bits)) { return s; }
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)) - f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        let result = f32::from_bits(fs_bits) - f32::from_bits(ft_bits);
+        let write_w = self.fpr_write_w;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_w(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { 0x8000_0000 } else { 0 } } else { (result).to_bits() }))
     }
     fn exec_fmul_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let ft_bits = (self.fpr_read_w)(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_s(fs_bits).or_else(|| self.fpu_check_denorm_operand_s(ft_bits)) { return s; }
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)) * f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        let result = f32::from_bits(fs_bits) * f32::from_bits(ft_bits);
+        let write_w = self.fpr_write_w;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_w(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { 0x8000_0000 } else { 0 } } else { (result).to_bits() }))
     }
     fn exec_fdiv_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let ft_bits = (self.fpr_read_w)(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_s(fs_bits).or_else(|| self.fpu_check_denorm_operand_s(ft_bits)) { return s; }
         crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let ft_val = f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
+        let fs_val = f32::from_bits(fs_bits);
+        let ft_val = f32::from_bits(ft_bits);
         let result = fs_val / ft_val;
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU div.s PC={:016x} {} / {} = {}", self.core.pc, fs_val, ft_val, result);
         }
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_w(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { 0x8000_0000 } else { 0 } } else { (result).to_bits() }))
     }
     fn exec_fsqrt_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_s(fs_bits) { return s; }
         crate::platform::clear_fpu_status();
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)).sqrt();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        let result = f32::from_bits(fs_bits).sqrt();
+        let write_w = self.fpr_write_w;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_w(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { 0x8000_0000 } else { 0 } } else { (result).to_bits() }))
     }
     fn exec_fabs_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)).abs();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.handle_exec_complete()
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let result = f32::from_bits(fs_bits).abs();
+        let write_w = self.fpr_write_w;
+        self.fpu_check_snan_operand(is_snan_s(fs_bits), |exec| write_w(&mut exec.core, fd_reg, (result).to_bits()))
     }
     fn exec_fmov_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5188,9 +5614,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_fneg_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        let result = -f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.handle_exec_complete()
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let result = -f32::from_bits(fs_bits);
+        let write_w = self.fpr_write_w;
+        self.fpu_check_snan_operand(is_snan_s(fs_bits), |exec| write_w(&mut exec.core, fd_reg, (result).to_bits()))
     }
     /// Every ROUND/TRUNC/CEIL/FLOOR/CVT.W/CVT.L handler in this file (all 20:
     /// S/D source × W/L dest × the four rounding modes, plus plain CVT) needs
@@ -5251,78 +5678,40 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     /// it's the same "don't trust ad-hoc host rounding" root cause.
     fn exec_fround_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_NEAREST_EVEN) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, true, RM_NEAREST_EVEN)
     }
     fn exec_ftrunc_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_TOWARD_ZERO) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, true, RM_TOWARD_ZERO)
     }
     fn exec_fceil_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_TOWARD_POS_INF) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, true, RM_TOWARD_POS_INF)
     }
     fn exec_ffloor_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_TOWARD_NEG_INF) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, true, RM_TOWARD_NEG_INF)
     }
     fn exec_fround_w_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_NEAREST_EVEN) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, false, RM_NEAREST_EVEN)
     }
     fn exec_ftrunc_w_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_TOWARD_ZERO) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
         if mips_log(MIPS_LOG_FPU) {
-            dlog_dev!(LogModule::Mips, "FPU trunc.w.s PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+            let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+            dlog_dev!(LogModule::Mips, "FPU trunc.w.s PC={:016x} {}", self.core.pc, fs_val);
         }
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(fs_reg, fd_reg, false, false, RM_TOWARD_ZERO)
     }
     fn exec_fceil_w_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_TOWARD_POS_INF) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, false, RM_TOWARD_POS_INF)
     }
     fn exec_ffloor_w_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, RM_TOWARD_NEG_INF) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, false, false, RM_TOWARD_NEG_INF)
     }
     fn exec_fmovcf_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5365,66 +5754,113 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         crate::platform::clear_fpu_status();
         let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
         let result = 1.0 / fs_val;
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU recip.s PC={:016x} 1 / {} = {}", self.core.pc, fs_val, result);
         }
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        self.fpu_update_fcsr(|exec| write_w(&mut exec.core, fd_reg, (result).to_bits()))
     }
     fn exec_frsqrt_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
         let result = 1.0 / f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)).sqrt();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        self.fpu_update_fcsr(|exec| write_w(&mut exec.core, fd_reg, (result).to_bits()))
     }
     fn exec_fcvt_d_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
         let result = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg)) as f64;
-        (self.fpr_write_d)(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        let write_d = self.fpr_write_d;
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, result))
     }
+    /// Shared tail for every ROUND/TRUNC/CEIL/FLOOR/CVT.W/CVT.L handler
+    /// (S or D source, W or L dest, fixed or FCSR-dynamic rounding mode):
+    /// call the portable `cvt_to_int_and_commit` and turn its trap/no-trap
+    /// result into the usual `ExecStatus`. `fpu_fcsr` is only read for
+    /// Cause, so no destructuring/write-closure dance is needed here — the
+    /// shared function commits (or doesn't) directly against `self.core`.
+    #[inline]
+    fn fpu_cvt_to_int(&mut self, fs_reg: u32, fd_reg: u32, src_f64: bool, dst_i64: bool, rm: u8) -> ExecStatus {
+        let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
+        if cvt_to_int_and_commit(&mut self.core, fs_reg, fd_reg, fr1, src_f64, dst_i64, rm) {
+            let s = exec_exception(EXC_FPE);
+            self.handle_exception(s)
+        } else {
+            self.handle_exec_complete()
+        }
+    }
+    /// CVT.S.W/D.W/S.L/D.L: shared tail calling `cvt_int_to_float_and_commit`.
+    #[inline]
+    fn fpu_cvt_int_to_float(&mut self, fs_reg: u32, fd_reg: u32, src_i64: bool, dst_f64: bool) -> ExecStatus {
+        let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
+        if cvt_int_to_float_and_commit(&mut self.core, fs_reg, fd_reg, fr1, src_i64, dst_f64) {
+            let s = exec_exception(EXC_FPE);
+            self.handle_exception(s)
+        } else {
+            self.handle_exec_complete()
+        }
+    }
+    /// CVT.S.D: shared tail calling `cvt_d_to_s_and_commit`.
+    #[inline]
+    fn fpu_cvt_d_to_s(&mut self, fs_reg: u32, fd_reg: u32) -> ExecStatus {
+        let fr1 = (self.core.cp0_status & STATUS_FR) != 0;
+        if cvt_d_to_s_and_commit(&mut self.core, fs_reg, fd_reg, fr1) {
+            let s = exec_exception(EXC_FPE);
+            self.handle_exception(s)
+        } else {
+            self.handle_exec_complete()
+        }
+    }
+
     fn exec_fcvt_w_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, (self.core.fpu_fcsr & 0x3) as u8) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
         if mips_log(MIPS_LOG_FPU) {
-            dlog_dev!(LogModule::Mips, "FPU cvt.w.s PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+            let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
+            dlog_dev!(LogModule::Mips, "FPU cvt.w.s PC={:016x} {}", self.core.pc, fs_val);
         }
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(fs_reg, fd_reg, false, false, (self.core.fpu_fcsr & 0x3) as u8)
     }
     fn exec_fcvt_l_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let result = round_f32_to_int_mode(fs_val, (self.core.fpu_fcsr & 0x3) as u8) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f32 != fs_val))
+        self.fpu_cvt_to_int(fs_reg, fd_reg, false, true, (self.core.fpu_fcsr & 0x3) as u8)
     }
     // S-format compare (all 16 conditions share one handler; funct 0x30-0x3F)
     fn exec_fcc_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
+        let fs_reg = d.rd as u32; let ft_reg = d.rt as u32;
         let funct_val = d.funct as u32;
-        let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, fs_reg));
-        let ft_val = f32::from_bits((self.fpr_read_w)(&self.core, ft_reg));
-        // Signaling comparisons (cond 0x8–0xF) raise V (invalid) if operands are unordered (NaN)
-        if (funct_val & 0x8) != 0 && (fs_val.is_nan() || ft_val.is_nan()) {
-            self.core.fpu_fcsr |= FCSR_CV | 0x40; // set Cause V + Flag V
+        let fs_bits = (self.fpr_read_w)(&self.core, fs_reg);
+        let ft_bits = (self.fpr_read_w)(&self.core, ft_reg);
+        let fs_val = f32::from_bits(fs_bits);
+        let ft_val = f32::from_bits(ft_bits);
+        // Invalid is raised whenever either operand is a signalling NaN
+        // (Table 7-2, "Comparison ... on a signaling NaN"), and additionally
+        // for the eight signalling predicates (cond 0x8-0xF, funct bit 3)
+        // whenever either operand is any NaN.
+        let is_signaling_predicate = (funct_val & 0x8) != 0;
+        let has_nan = fs_val.is_nan() || ft_val.is_nan();
+        let has_snan = is_snan_s(fs_bits) || is_snan_s(ft_bits);
+        let invalid = has_snan || (is_signaling_predicate && has_nan);
+        // Cause reflects only the last instruction (R4000 manual), so it is
+        // rewritten every compare, not just when this one raises Invalid.
+        self.core.fpu_fcsr = (self.core.fpu_fcsr & !FCSR_CM) | if invalid { FCSR_CV } else { 0 };
+        if invalid {
             if (self.core.fpu_fcsr & 0x800) != 0 { // EV enable bit
+                // Trapped: Cause is set above, but the Flag field is not —
+                // R4000 manual: "the flag bits are not set by the hardware"
+                // when a floating-point exception is taken.
                 let s = exec_exception(EXC_FPE);
                 return self.handle_exception(s);
             }
+            self.core.fpu_fcsr |= 0x40; // untrapped: set sticky Flag V too
         }
         let cond = self.fpu_compare_s(fs_val, ft_val, funct_val);
-        let cc = fd_reg & 0x7;
+        let cc = (d.raw >> 8) & 0x7;
         self.core.set_fpu_cc(cc, cond);
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU c.{:x}.s PC={:016x} cc{}={} fs={} ft={}",
@@ -5438,60 +5874,69 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     fn exec_fadd_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = read_d(&self.core, fs_reg) + read_d(&self.core, ft_reg);
-        write_d(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        let fs_val = read_d(&self.core, fs_reg); let ft_val = read_d(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_d(fs_val.to_bits()).or_else(|| self.fpu_check_denorm_operand_d(ft_val.to_bits())) { return s; }
+        crate::platform::clear_fpu_status();
+        let result = fs_val + ft_val;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_d(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { -0.0 } else { 0.0 } } else { result }))
     }
     fn exec_fsub_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = read_d(&self.core, fs_reg) - read_d(&self.core, ft_reg);
-        write_d(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        let fs_val = read_d(&self.core, fs_reg); let ft_val = read_d(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_d(fs_val.to_bits()).or_else(|| self.fpu_check_denorm_operand_d(ft_val.to_bits())) { return s; }
+        crate::platform::clear_fpu_status();
+        let result = fs_val - ft_val;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_d(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { -0.0 } else { 0.0 } } else { result }))
     }
     fn exec_fmul_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = read_d(&self.core, fs_reg) * read_d(&self.core, ft_reg);
-        write_d(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        let fs_val = read_d(&self.core, fs_reg); let ft_val = read_d(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_d(fs_val.to_bits()).or_else(|| self.fpu_check_denorm_operand_d(ft_val.to_bits())) { return s; }
+        crate::platform::clear_fpu_status();
+        let result = fs_val * ft_val;
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_d(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { -0.0 } else { 0.0 } } else { result }))
     }
     fn exec_fdiv_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
         let fs_val = read_d(&self.core, fs_reg);
         let ft_val = read_d(&self.core, ft_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_d(fs_val.to_bits()).or_else(|| self.fpu_check_denorm_operand_d(ft_val.to_bits())) { return s; }
+        crate::platform::clear_fpu_status();
         let result = fs_val / ft_val;
-        write_d(&mut self.core, fd_reg, result);
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU div.d PC={:016x} {} / {} = {}", self.core.pc, fs_val, ft_val, result);
         }
-        self.fpu_update_fcsr()
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_d(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { -0.0 } else { 0.0 } } else { result }))
     }
     fn exec_fsqrt_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = read_d(&self.core, fs_reg).sqrt();
-        write_d(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        let fs_val = read_d(&self.core, fs_reg);
+        if let Some(s) = self.fpu_check_denorm_operand_d(fs_val.to_bits()) { return s; }
+        crate::platform::clear_fpu_status();
+        let result = fs_val.sqrt();
+        let denorm = result.is_subnormal().then(|| result.is_sign_negative());
+        self.fpu_update_fcsr_full(None, denorm, |exec, flush| write_d(&mut exec.core, fd_reg, if flush { if result.is_sign_negative() { -0.0 } else { 0.0 } } else { result }))
     }
     fn exec_fabs_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = read_d(&self.core, fs_reg).abs();
-        write_d(&mut self.core, fd_reg, result);
-        self.handle_exec_complete()
+        let fs_val = read_d(&self.core, fs_reg);
+        let result = fs_val.abs();
+        self.fpu_check_snan_operand(is_snan_d(fs_val.to_bits()), |exec| write_d(&mut exec.core, fd_reg, result))
     }
     fn exec_fmov_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5504,84 +5949,46 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
-        let result = -read_d(&self.core, fs_reg);
-        write_d(&mut self.core, fd_reg, result);
-        self.handle_exec_complete()
+        let fs_val = read_d(&self.core, fs_reg);
+        let result = -fs_val;
+        self.fpu_check_snan_operand(is_snan_d(fs_val.to_bits()), |exec| write_d(&mut exec.core, fd_reg, result))
     }
     fn exec_fround_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_NEAREST_EVEN) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, true, RM_NEAREST_EVEN)
     }
     fn exec_ftrunc_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_TOWARD_ZERO) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, true, RM_TOWARD_ZERO)
     }
     fn exec_fceil_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_TOWARD_POS_INF) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, true, RM_TOWARD_POS_INF)
     }
     fn exec_ffloor_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_TOWARD_NEG_INF) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, true, RM_TOWARD_NEG_INF)
     }
     fn exec_fround_w_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_NEAREST_EVEN) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, false, RM_NEAREST_EVEN)
     }
     fn exec_ftrunc_w_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_TOWARD_ZERO) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
         if mips_log(MIPS_LOG_FPU) {
-            dlog_dev!(LogModule::Mips, "FPU trunc.w.d PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+            let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
+            dlog_dev!(LogModule::Mips, "FPU trunc.w.d PC={:016x} {}", self.core.pc, fs_val);
         }
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(fs_reg, fd_reg, true, false, RM_TOWARD_ZERO)
     }
     fn exec_fceil_w_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_TOWARD_POS_INF) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, false, RM_TOWARD_POS_INF)
     }
     fn exec_ffloor_w_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, RM_TOWARD_NEG_INF) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(d.rd as u32, d.sa as u32, true, false, RM_TOWARD_NEG_INF)
     }
     fn exec_fmovcf_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5628,11 +6035,10 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
         let fs_val = read_d(&self.core, fs_reg);
         let result = 1.0 / fs_val;
-        write_d(&mut self.core, fd_reg, result);
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU recip.d PC={:016x} 1 / {} = {}", self.core.pc, fs_val, result);
         }
-        self.fpu_update_fcsr()
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, result))
     }
     fn exec_frsqrt_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5640,56 +6046,57 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         crate::platform::clear_fpu_status();
         let read_d = self.fpr_read_d; let write_d = self.fpr_write_d;
         let result = 1.0 / read_d(&self.core, fs_reg).sqrt();
-        write_d(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, result))
     }
     fn exec_fcvt_s_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_d)(&self.core, fs_reg) as f32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        self.fpu_cvt_d_to_s(d.rd as u32, d.sa as u32)
     }
     fn exec_fcvt_w_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, (self.core.fpu_fcsr & 0x3) as u8) as i32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, result as u32);
         if mips_log(MIPS_LOG_FPU) {
-            dlog_dev!(LogModule::Mips, "FPU cvt.w.d PC={:016x} {} -> {}", self.core.pc, fs_val, result);
+            let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
+            dlog_dev!(LogModule::Mips, "FPU cvt.w.d PC={:016x} {}", self.core.pc, fs_val);
         }
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(fs_reg, fd_reg, true, false, (self.core.fpu_fcsr & 0x3) as u8)
     }
     fn exec_fcvt_l_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let fs_val = (self.fpr_read_d)(&self.core, fs_reg);
-        let result = round_f64_to_int_mode(fs_val, (self.core.fpu_fcsr & 0x3) as u8) as i64;
-        (self.fpr_write_l)(&mut self.core, fd_reg, result as u64);
-        self.fpu_update_fcsr_with_inexact_override(Some(result as f64 != fs_val))
+        self.fpu_cvt_to_int(fs_reg, fd_reg, true, true, (self.core.fpu_fcsr & 0x3) as u8)
     }
     // D-format compare (all 16 conditions share one handler; funct 0x30-0x3F)
     fn exec_fcc_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let ft_reg = d.rt as u32; let fd_reg = d.sa as u32;
+        let fs_reg = d.rd as u32; let ft_reg = d.rt as u32;
         let funct_val = d.funct as u32;
         let read_d = self.fpr_read_d;
         let fs_val = read_d(&self.core, fs_reg);
         let ft_val = read_d(&self.core, ft_reg);
-        // Signaling comparisons (cond 0x8–0xF) raise V (invalid) if operands are unordered (NaN)
-        if (funct_val & 0x8) != 0 && (fs_val.is_nan() || ft_val.is_nan()) {
-            self.core.fpu_fcsr |= FCSR_CV | 0x40; // set Cause V + Flag V
+        // Invalid is raised whenever either operand is a signalling NaN
+        // (Table 7-2, "Comparison ... on a signaling NaN"), and additionally
+        // for the eight signalling predicates (cond 0x8-0xF, funct bit 3)
+        // whenever either operand is any NaN.
+        let is_signaling_predicate = (funct_val & 0x8) != 0;
+        let has_nan = fs_val.is_nan() || ft_val.is_nan();
+        let has_snan = is_snan_d(fs_val.to_bits()) || is_snan_d(ft_val.to_bits());
+        let invalid = has_snan || (is_signaling_predicate && has_nan);
+        // Cause reflects only the last instruction (R4000 manual), so it is
+        // rewritten every compare, not just when this one raises Invalid.
+        self.core.fpu_fcsr = (self.core.fpu_fcsr & !FCSR_CM) | if invalid { FCSR_CV } else { 0 };
+        if invalid {
             if (self.core.fpu_fcsr & 0x800) != 0 { // EV enable bit
+                // Trapped: Cause is set above, but the Flag field is not —
+                // R4000 manual: "the flag bits are not set by the hardware"
+                // when a floating-point exception is taken.
                 let s = exec_exception(EXC_FPE);
                 return self.handle_exception(s);
             }
+            self.core.fpu_fcsr |= 0x40; // untrapped: set sticky Flag V too
         }
         let cond = self.fpu_compare_d(fs_val, ft_val, funct_val);
-        let cc = fd_reg & 0x7;
+        let cc = (d.raw >> 8) & 0x7;
         self.core.set_fpu_cc(cc, cond);
         if mips_log(MIPS_LOG_FPU) {
             dlog_dev!(LogModule::Mips, "FPU c.{:x}.d PC={:016x} cc{}={} fs={} ft={}",
@@ -5702,38 +6109,22 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
     fn exec_fcvt_s_w(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_w)(&self.core, fs_reg) as i32 as f32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        self.fpu_cvt_int_to_float(d.rd as u32, d.sa as u32, false, false)
     }
     fn exec_fcvt_d_w(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_w)(&self.core, fs_reg) as i32 as f64;
-        (self.fpr_write_d)(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        self.fpu_cvt_int_to_float(d.rd as u32, d.sa as u32, false, true)
     }
 
     // ===== COP1 L-format (Long fixed-point → float, MIPS III) =====
 
     fn exec_fcvt_s_l(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_l)(&self.core, fs_reg) as i64 as f32;
-        (self.fpr_write_w)(&mut self.core, fd_reg, (result).to_bits());
-        self.fpu_update_fcsr()
+        self.fpu_cvt_int_to_float(d.rd as u32, d.sa as u32, true, false)
     }
     fn exec_fcvt_d_l(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
-        let fs_reg = d.rd as u32; let fd_reg = d.sa as u32;
-        crate::platform::clear_fpu_status();
-        let result = (self.fpr_read_l)(&self.core, fs_reg) as i64 as f64;
-        (self.fpr_write_d)(&mut self.core, fd_reg, result);
-        self.fpu_update_fcsr()
+        self.fpu_cvt_int_to_float(d.rd as u32, d.sa as u32, true, true)
     }
 
     // ===== COP1X (MIPS IV FPU extended) =====
@@ -5791,8 +6182,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, d.rd as u32));
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (fs_val.mul_add(ft_val, fr_val)).to_bits());
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        self.fpu_update_fcsr(|exec| write_w(&mut exec.core, fd_reg, (fs_val.mul_add(ft_val, fr_val)).to_bits()))
     }
     fn exec_madd_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5802,8 +6193,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        write_d(&mut self.core, fd_reg, fs_val.mul_add(ft_val, fr_val));
-        self.fpu_update_fcsr()
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, fs_val.mul_add(ft_val, fr_val)))
     }
     fn exec_msub_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5812,8 +6202,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, d.rd as u32));
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (fs_val.mul_add(ft_val, -fr_val)).to_bits());
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        self.fpu_update_fcsr(|exec| write_w(&mut exec.core, fd_reg, (fs_val.mul_add(ft_val, -fr_val)).to_bits()))
     }
     fn exec_msub_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5823,8 +6213,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        write_d(&mut self.core, fd_reg, fs_val.mul_add(ft_val, -fr_val));
-        self.fpu_update_fcsr()
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, fs_val.mul_add(ft_val, -fr_val)))
     }
     fn exec_nmadd_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5833,8 +6222,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, d.rd as u32));
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (-fs_val.mul_add(ft_val, fr_val)).to_bits());
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        self.fpu_update_fcsr(|exec| write_w(&mut exec.core, fd_reg, (-fs_val.mul_add(ft_val, fr_val)).to_bits()))
     }
     fn exec_nmadd_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5844,8 +6233,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        write_d(&mut self.core, fd_reg, -fs_val.mul_add(ft_val, fr_val));
-        self.fpu_update_fcsr()
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, -fs_val.mul_add(ft_val, fr_val)))
     }
     fn exec_nmsub_s(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5854,8 +6242,8 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = f32::from_bits((self.fpr_read_w)(&self.core, d.rd as u32));
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        (self.fpr_write_w)(&mut self.core, fd_reg, (-fs_val.mul_add(ft_val, -fr_val)).to_bits());
-        self.fpu_update_fcsr()
+        let write_w = self.fpr_write_w;
+        self.fpu_update_fcsr(|exec| write_w(&mut exec.core, fd_reg, (-fs_val.mul_add(ft_val, -fr_val)).to_bits()))
     }
     fn exec_nmsub_d(&mut self, d: &DecodedInstr) -> ExecStatus {
         if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
@@ -5865,8 +6253,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let fs_val = read_d(&self.core, d.rd as u32);
         let fd_reg = d.sa as u32;
         crate::platform::clear_fpu_status();
-        write_d(&mut self.core, fd_reg, -fs_val.mul_add(ft_val, -fr_val));
-        self.fpu_update_fcsr()
+        self.fpu_update_fcsr(|exec| write_d(&mut exec.core, fd_reg, -fs_val.mul_add(ft_val, -fr_val)))
     }
 
     // LWC1 - Load Word to FPU
@@ -7134,7 +7521,11 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
     let handler: Fn<T, C> = match op as u32 {
         OP_SPECIAL => match funct as u32 {
             FUNCT_SLL     => MipsExecutor::<T,C>::exec_sll,
+            // MOVCI is MIPS IV (MOVF/MOVT); an R4400 (MIPS III) must raise RI.
+            #[cfg(feature = "mips4")]
             FUNCT_MOVCI   => MipsExecutor::<T,C>::exec_movci,
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_MOVCI   => MipsExecutor::<T,C>::exec_reserved,
             FUNCT_SRL     => MipsExecutor::<T,C>::exec_srl,
             FUNCT_SRA     => MipsExecutor::<T,C>::exec_sra,
             FUNCT_SLLV    => MipsExecutor::<T,C>::exec_sllv,
@@ -7145,8 +7536,15 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             #[cfg(not(feature = "opcodefusion"))]
             FUNCT_JR      => MipsExecutor::<T,C>::exec_jr,
             FUNCT_JALR    => MipsExecutor::<T,C>::exec_jalr,
+            // MOVZ/MOVN are MIPS IV; an R4400 (MIPS III) must raise RI.
+            #[cfg(feature = "mips4")]
             FUNCT_MOVZ    => MipsExecutor::<T,C>::exec_movz,
+            #[cfg(feature = "mips4")]
             FUNCT_MOVN    => MipsExecutor::<T,C>::exec_movn,
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_MOVZ    => MipsExecutor::<T,C>::exec_reserved,
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_MOVN    => MipsExecutor::<T,C>::exec_reserved,
             FUNCT_SYSCALL => MipsExecutor::<T,C>::exec_syscall,
             FUNCT_BREAK   => MipsExecutor::<T,C>::exec_break,
             FUNCT_SYNC    => MipsExecutor::<T,C>::exec_sync,
@@ -7335,11 +7733,21 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
                 FUNCT_FTRUNC_W => MipsExecutor::<T,C>::exec_ftrunc_w_s,
                 FUNCT_FCEIL_W  => MipsExecutor::<T,C>::exec_fceil_w_s,
                 FUNCT_FFLOOR_W => MipsExecutor::<T,C>::exec_ffloor_w_s,
+                // MOVF.fmt/MOVT.fmt/MOVZ.fmt/MOVN.fmt/RECIP.fmt/RSQRT.fmt are
+                // MIPS IV; an R4400 (MIPS III) must raise RI for all five.
+                #[cfg(feature = "mips4")]
                 FUNCT_FMOVCF   => MipsExecutor::<T,C>::exec_fmovcf_s,
+                #[cfg(feature = "mips4")]
                 FUNCT_FMOVZ    => MipsExecutor::<T,C>::exec_fmovz_s,
+                #[cfg(feature = "mips4")]
                 FUNCT_FMOVN    => MipsExecutor::<T,C>::exec_fmovn_s,
+                #[cfg(feature = "mips4")]
                 FUNCT_FRECIP   => MipsExecutor::<T,C>::exec_frecip_s,
+                #[cfg(feature = "mips4")]
                 FUNCT_FRSQRT   => MipsExecutor::<T,C>::exec_frsqrt_s,
+                #[cfg(not(feature = "mips4"))]
+                FUNCT_FMOVCF | FUNCT_FMOVZ | FUNCT_FMOVN | FUNCT_FRECIP | FUNCT_FRSQRT
+                               => MipsExecutor::<T,C>::exec_reserved,
                 FUNCT_FCVT_D   => MipsExecutor::<T,C>::exec_fcvt_d_s,
                 FUNCT_FCVT_W   => MipsExecutor::<T,C>::exec_fcvt_w_s,
                 FUNCT_FCVT_L   => MipsExecutor::<T,C>::exec_fcvt_l_s,
@@ -7363,11 +7771,21 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
                 FUNCT_FTRUNC_W => MipsExecutor::<T,C>::exec_ftrunc_w_d,
                 FUNCT_FCEIL_W  => MipsExecutor::<T,C>::exec_fceil_w_d,
                 FUNCT_FFLOOR_W => MipsExecutor::<T,C>::exec_ffloor_w_d,
+                // MOVF.fmt/MOVT.fmt/MOVZ.fmt/MOVN.fmt/RECIP.fmt/RSQRT.fmt are
+                // MIPS IV; an R4400 (MIPS III) must raise RI for all five.
+                #[cfg(feature = "mips4")]
                 FUNCT_FMOVCF   => MipsExecutor::<T,C>::exec_fmovcf_d,
+                #[cfg(feature = "mips4")]
                 FUNCT_FMOVZ    => MipsExecutor::<T,C>::exec_fmovz_d,
+                #[cfg(feature = "mips4")]
                 FUNCT_FMOVN    => MipsExecutor::<T,C>::exec_fmovn_d,
+                #[cfg(feature = "mips4")]
                 FUNCT_FRECIP   => MipsExecutor::<T,C>::exec_frecip_d,
+                #[cfg(feature = "mips4")]
                 FUNCT_FRSQRT   => MipsExecutor::<T,C>::exec_frsqrt_d,
+                #[cfg(not(feature = "mips4"))]
+                FUNCT_FMOVCF | FUNCT_FMOVZ | FUNCT_FMOVN | FUNCT_FRECIP | FUNCT_FRSQRT
+                               => MipsExecutor::<T,C>::exec_reserved,
                 FUNCT_FCVT_S   => MipsExecutor::<T,C>::exec_fcvt_s_d,
                 FUNCT_FCVT_W   => MipsExecutor::<T,C>::exec_fcvt_w_d,
                 FUNCT_FCVT_L   => MipsExecutor::<T,C>::exec_fcvt_l_d,
@@ -7386,6 +7804,10 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             },
             _ => MipsExecutor::<T,C>::exec_reserved,
         },
+        // The entire COP1X opcode (LWXC1/LDXC1/SWXC1/SDXC1/PREFX and the
+        // MADD/MSUB/NMADD/NMSUB family) is a MIPS IV addition — no MIPS III
+        // encoding uses it, so an R4400 must raise RI for the whole opcode.
+        #[cfg(feature = "mips4")]
         OP_COP1X => match funct as u32 {
             FUNCT_LWXC1   => MipsExecutor::<T,C>::exec_lwxc1,
             FUNCT_LDXC1   => MipsExecutor::<T,C>::exec_ldxc1,
@@ -7402,6 +7824,8 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             FUNCT_NMSUB_D => MipsExecutor::<T,C>::exec_nmsub_d,
             _             => MipsExecutor::<T,C>::exec_reserved,
         },
+        #[cfg(not(feature = "mips4"))]
+        OP_COP1X => MipsExecutor::<T,C>::exec_reserved,
         OP_LB     => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lb }
         OP_LH     => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lh }
         OP_LWL    => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lwl }
@@ -7428,7 +7852,11 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
         OP_SWC1   => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_swc1 }
         OP_SDC1   => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_sdc1 }
         OP_SD     => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_sd }
+        // PREF is MIPS IV; an R4400 (MIPS III) must raise RI.
+        #[cfg(feature = "mips4")]
         OP_PREF   => MipsExecutor::<T,C>::exec_pref,
+        #[cfg(not(feature = "mips4"))]
+        OP_PREF   => MipsExecutor::<T,C>::exec_reserved,
         OP_LLD    => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lld }
         OP_SCD    => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_scd }
         _         => MipsExecutor::<T,C>::exec_reserved,

@@ -257,6 +257,16 @@ impl InstrKind {
     /// for everything else.
     pub fn has_jitv2_emitter(self) -> bool {
         use InstrKind::*;
+        // Movz/Movn/Movci/Pref/Fmovcf_s/Fmovcf_d are MIPS IV — real jitv2
+        // emitters exist (`lookup_semantics`), but on a non-`mips4` build
+        // they must be excluded here so they fall back to the interpreter,
+        // which raises Reserved Instruction (see `mips_exec.rs`'s decode
+        // table). Keep this arm list in sync with that gate.
+        if !cfg!(feature = "mips4")
+            && matches!(self, Movz | Movn | Movci | Pref | Fmovcf_s | Fmovcf_d)
+        {
+            return false;
+        }
         matches!(self,
             // Integer ALU (mirrors has_integer_emitter's OP_SPECIAL/OP_REGIMM/immediate list)
             Add | Addu | Sub | Subu | And | Or | Xor | Nor | Slt | Sltu

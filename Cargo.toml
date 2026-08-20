@@ -58,9 +58,15 @@ tlbcheck = []
 # jitv2::opcode_support depends on it unconditionally for its own
 # emitter-coverage gating. See mips_instr_stats.rs.
 instr_stats = []
+# MIPS IV ISA additions (MOVN/MOVZ, PREF, RECIP/RSQRT, MOVF/MOVT, COP1X,
+# MADD/MSUB/NMADD/NMSUB): decode gate only, independent of cache/PRId model.
+# Off by default so an R4400 (MIPS III) build correctly raises Reserved
+# Instruction on these encodings instead of executing them. Implied by r5k,
+# since every R5000-family CPU IRIS emulates is MIPS IV.
+mips4 = []
 # R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
 # Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
-r5k = []
+r5k = ["mips4"]
 # Secondary cache present. Without this flag the CPU reports SC=1 (no secondary cache)
 # and the L2 is bypassed entirely. Use alone for external R4600SC-style cache sized via
 # EEPROM, or together with r5ksc_triton for Triton on-die L2.

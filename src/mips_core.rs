@@ -436,6 +436,28 @@ pub struct MipsCore {
     /// above — `jit_ctx` unused.
     #[cfg(feature = "jitv2")]
     pub fpu_set_mode_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
+    /// Portable (no host FPU status read) CVT.W/L.S/D: reads `fs_reg`,
+    /// rounds, classifies/saturates, and commits the result plus FCSR
+    /// Cause/Flag bits directly against `core` — see `mips_exec.rs`'s
+    /// `cvt_to_int_and_commit`/`cvt_f32_to_int_by_value` doc comments for
+    /// why: reading host MXCSR/FPSR after a hardware conversion instruction
+    /// races the flag write against the read on out-of-order hardware.
+    /// Single-implementation shape like `handle_exception_fn` (`ctx` is the
+    /// `MipsExecutor<T, C>` pointer, not host-arch-free) since it needs real
+    /// `&mut MipsCore` access, not just scalar args. Args after `ctx`:
+    /// `fs_reg, fd_reg, fr1 (bool as u32), src_f64 (bool as u32), dst_i64
+    /// (bool as u32), rm`. Returns nonzero if the conversion trapped.
+    #[cfg(feature = "jitv2")]
+    pub fpu_cvt_to_int_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, u32, u32, u32, u32) -> u32,
+    /// CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s doc
+    /// comment. Args after `ctx`: `fs_reg, fd_reg, fr1, src_i64, dst_f64`
+    /// (all bools as u32). Returns nonzero if trapped.
+    #[cfg(feature = "jitv2")]
+    pub fpu_cvt_int_to_float_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, u32, u32, u32) -> u32,
+    /// CVT.S.D — see `cvt_d_to_s_and_commit`'s doc comment. Args after
+    /// `ctx`: `fs_reg, fd_reg, fr1` (bool as u32). Returns nonzero if trapped.
+    #[cfg(feature = "jitv2")]
+    pub fpu_cvt_d_to_s_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u32, u32) -> u32,
     /// `jitv2_lockstep` load/store verification scratch (see
     /// `MipsExecutor::lockstep_check_load_store`): records the real
     /// interpreter dispatch's virtual address, translated physical address,
@@ -785,6 +807,18 @@ unsafe extern "C" fn jit_hooks_not_installed_fpu_clear_status(_ctx: *mut core::f
 unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::c_void, _rm: u32) {
     panic!("jitv2: fpu_set_mode hook called before MipsExecutor::install_jit_hooks");
 }
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_to_int(_ctx: *mut core::ffi::c_void, _fs: u32, _fd: u32, _fr1: u32, _src_f64: u32, _dst_i64: u32, _rm: u32) -> u32 {
+    panic!("jitv2: fpu_cvt_to_int hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_int_to_float(_ctx: *mut core::ffi::c_void, _fs: u32, _fd: u32, _fr1: u32, _src_i64: u32, _dst_f64: u32) -> u32 {
+    panic!("jitv2: fpu_cvt_int_to_float hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_fpu_cvt_d_to_s(_ctx: *mut core::ffi::c_void, _fs: u32, _fd: u32, _fr1: u32) -> u32 {
+    panic!("jitv2: fpu_cvt_d_to_s hook called before MipsExecutor::install_jit_hooks");
+}
 
 // SAFETY: The raw pointer in status_changed_cb is only accessed from the CPU thread.
 unsafe impl Send for MipsCore {}
@@ -861,6 +895,12 @@ impl MipsCore {
             fpu_clear_status_fn: jit_hooks_not_installed_fpu_clear_status,
             #[cfg(feature = "jitv2")]
             fpu_set_mode_fn: jit_hooks_not_installed_fpu_set_mode,
+            #[cfg(feature = "jitv2")]
+            fpu_cvt_to_int_fn: jit_hooks_not_installed_fpu_cvt_to_int,
+            #[cfg(feature = "jitv2")]
+            fpu_cvt_int_to_float_fn: jit_hooks_not_installed_fpu_cvt_int_to_float,
+            #[cfg(feature = "jitv2")]
+            fpu_cvt_d_to_s_fn: jit_hooks_not_installed_fpu_cvt_d_to_s,
             #[cfg(feature = "jitv2_lockstep")]
             lockstep_step_fn: jit_hooks_not_installed_lockstep_step,
             #[cfg(feature = "jitv2_lockstep")]
@@ -1063,7 +1103,7 @@ impl MipsCore {
             3 => self.cp0_entrylo1 & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
             4 => self.cp0_context,
             5 => self.cp0_pagemask & 0x01FFE000, // PageMask: only bits 24:13 are valid
-            6 => self.cp0_wired as u64,
+            6 => self.cp0_wired as u64 & 0x3F, // Wired: only bits 5:0 are valid, R4000 manual Table 4-10
             8 => self.cp0_badvaddr,
             9 => self.count_now() as u64,
             10 => self.cp0_entryhi,
@@ -1095,7 +1135,7 @@ impl MipsCore {
             3 => self.cp0_entrylo1 & 0x3FFFFFFF,
             4 => self.cp0_context,
             5 => self.cp0_pagemask & 0x01FFE000,
-            6 => self.cp0_wired as u64,
+            6 => self.cp0_wired as u64 & 0x3F,
             8 => self.cp0_badvaddr,
             9 => self.count_peek() as u64,
             10 => self.cp0_entryhi,
@@ -1769,7 +1809,9 @@ impl MipsCore {
             25 => Self::fccr_from_fcsr(self.fpu_fcsr),
             26 => self.fpu_fexr,
             28 => self.fpu_fenr,
-            31 => self.fpu_fcsr,
+            // FCSR bits 22:18 are reserved and read as zero (R4000 manual Figure 6-4).
+            // Bits 31:25 are FCC7..FCC1 on MIPS IV and stay readable.
+            31 => self.fpu_fcsr & !0x007C0000,
             _ => 0, // Undefined registers read as 0
         }
     }

@@ -235,8 +235,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mips4")]
     fn movz_has_emitter() {
         assert!(has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ)));
+    }
+
+    #[test]
+    #[cfg(not(feature = "mips4"))]
+    fn movz_has_no_emitter_without_mips4() {
+        // MOVZ is MIPS IV; without the feature it must fall back to the
+        // interpreter so Reserved Instruction can be raised (see
+        // has_jitv2_emitter's mips4 gate in mips_instr_stats.rs).
+        assert!(!has_emitter(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVZ)));
     }
 
     #[test]

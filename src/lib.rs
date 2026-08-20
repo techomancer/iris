@@ -7,6 +7,34 @@ compile_error!(
      switching, etc.) while developer exists specifically to add it back — pick one"
 );
 
+#[cfg(feature = "r5ksc_triton")]
+compile_error!(
+    "`r5ksc_triton` models the O2's on-die R5000 L2, not a machine IRIS \
+     emulates (IRIS targets Indy/Indigo2; an Indy R5000 board has the \
+     external R4600SC-style secondary cache instead — that's `r5ksc`, which \
+     is ALSO currently broken and separately refused below). It's also \
+     unfinished on its own terms: `cargo test --features r5k,r5ksc_triton` \
+     fails mips_cache_v2::tests::cache_op_index_inv_l1i. Refusing to build \
+     rather than silently shipping a broken cache model for a machine this \
+     emulator doesn't target. See src/mips_cache_v2.rs and \
+     rules/testing/r5k-l1i-cache-bugs.md."
+);
+
+#[cfg(feature = "r5ksc")]
+compile_error!(
+    "`r5ksc` (external R4600SC-style secondary cache — what a real Indy \
+     R5000 board has) does not currently work: `cargo test --features \
+     r5k,r5ksc` fails mips_cache_v2's L1I tests. Plain `r5k` with no \
+     secondary-cache feature at all also fails l1i_fetch_stress/ \
+     l1i_l1d_coherence — there is currently no working R5000 \
+     secondary-cache configuration. Refusing to build rather than silently \
+     shipping a broken cache model. See src/mips_cache_v2.rs and \
+     rules/testing/r5k-l1i-cache-bugs.md; `r5k` alone still builds (R5000 \
+     CPU/FPU semantics are unaffected — only the L1I model under a \
+     secondary-cache config is implicated) and is what \
+     cpu-tests/run/matrix.sh's R5000 cell uses until this is fixed."
+);
+
 /// Compile-time feature flags exposed for tooling (e.g. iris-gui) so it can
 /// surface "CHD support required" / "camera support required" hints without
 /// duplicating the cargo feature set.
