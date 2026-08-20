@@ -315,4 +315,129 @@ mod tests {
             .join()
             .expect("thread panicked");
     }
+
+    #[cfg(feature = "tlbcheck")]
+    #[test]
+    fn tlbcheck_clean_tlb_passes() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                for slot in 0..TLB_NUM_ENTRIES {
+                    let mut e = TlbEntry::new();
+                    e.entry_hi = ((slot as u64) << 13) | 3; // distinct VPN2 per slot, ASID=3
+                    e.entry_lo[0] = (0x100 << 6) | (3 << 3) | 0x6; // V|D
+                    e.entry_lo[1] = (0x101 << 6) | (3 << 3) | 0x6;
+                    tlb.write(slot, e);
+                }
+                let violations = tlb.find_consistency_violations();
+                assert!(violations.is_empty(), "expected no violations on a clean TLB, got: {:?}", violations);
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
+    }
+
+    #[cfg(feature = "tlbcheck")]
+    #[test]
+    fn tlbcheck_detects_duplicate_entries() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                let mut e = TlbEntry::new();
+                e.entry_hi = (0x100u64 << 13) | 3; // ASID=3
+                e.entry_lo[0] = (0x50 << 6) | (3 << 3) | 0x6;
+                e.entry_lo[1] = (0x51 << 6) | (3 << 3) | 0x6;
+                tlb.write(1, e);
+                tlb.write(2, e); // same VPN2+ASID written to a second slot
+                let violations = tlb.find_consistency_violations();
+                assert!(
+                    violations.iter().any(|v| v.contains("duplicate/overlapping entries 1 and 2")),
+                    "expected a duplicate-entry violation, got: {:?}", violations
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
+    }
+
+    #[cfg(feature = "tlbcheck")]
+    #[test]
+    fn tlbcheck_detects_corrupted_mru() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                // Break list 0 (Fetch): point slot 0's successor at itself,
+                // forming a cycle that drops the rest of the list.
+                tlb.mru_next[0][0] = 0;
+                let violations = tlb.find_consistency_violations();
+                assert!(
+                    violations.iter().any(|v| v.contains("MRU list 0") && v.contains("cycle")),
+                    "expected an MRU cycle violation, got: {:?}", violations
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
+    }
+
+    #[cfg(all(feature = "tlbcheck", feature = "tlbvmap"))]
+    #[test]
+    fn tlbcheck_detects_corrupted_vmap() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                let mut e = TlbEntry::new();
+                e.entry_hi = (0x200u64 << 13) | 3;
+                e.entry_lo[0] = (0x50 << 6) | (3 << 3) | 0x6;
+                tlb.write(4, e);
+                // Corrupt the vmap slot for this VPN2 to point at the wrong entry.
+                tlb.vmap[0x200] = 9;
+                let violations = tlb.find_consistency_violations();
+                assert!(
+                    violations.iter().any(|v| v.contains("vmap[00200]")),
+                    "expected a vmap-mismatch violation, got: {:?}", violations
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
+    }
+
+    // Regression test for a false positive found live during early PROM boot:
+    // a "clear all TLB entries" loop that writes indices 0..N-1 (V=0, whatever
+    // stale EntryHi happens to be sitting around) but never touches the last
+    // index leaves that slot holding TlbEntry::new()'s all-zero default,
+    // which "covers" VPN2=0 by coincidence — but was never vmap_fill()'d, so
+    // it has no real vmap claim. Before `written` tracking was added, check 4
+    // treated it as owning vmap[0] anyway and flagged a phantom mismatch.
+    #[cfg(all(feature = "tlbcheck", feature = "tlbvmap"))]
+    #[test]
+    fn tlbcheck_untouched_entry_is_not_a_vmap_owner() {
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let mut tlb = MipsTlb::new(TLB_NUM_ENTRIES);
+                // Simulate PROM's clear loop: write indices 0..TLB_NUM_ENTRIES-1
+                // with a fixed, unrelated VPN2 and V=0, but leave the very last
+                // entry (index 47) untouched at its all-zero power-on default.
+                for slot in 0..TLB_NUM_ENTRIES - 1 {
+                    let mut e = TlbEntry::new();
+                    e.entry_hi = 0x7fc0000u64 << 13; // stale reset-garbage VPN2, V=0 throughout
+                    tlb.write(slot, e);
+                }
+                let violations = tlb.find_consistency_violations();
+                assert!(
+                    violations.is_empty(),
+                    "untouched entry 47 (all-zero default) must not be treated as owning vmap[0]: {:?}",
+                    violations
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("thread panicked");
+    }
 }

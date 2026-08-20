@@ -731,6 +731,116 @@ mod tests {
         assert_eq!(exec.core.cp0_index & 0x80000000, 0x80000000);
     }
 
+    #[cfg(feature = "tlbcheck")]
+    #[test]
+    fn test_tlbwi_breaks_on_duplicate_entry() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_tlbwi_breaks_on_duplicate_entry_inner(); })
+            .unwrap().join().unwrap();
+    }
+    #[cfg(feature = "tlbcheck")]
+    fn test_tlbwi_breaks_on_duplicate_entry_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
+        let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+
+        // Write a valid entry at index 5: VPN2=0x100, ASID=10.
+        exec.core.cp0_index = 5;
+        exec.core.cp0_pagemask = 0;
+        exec.core.cp0_entryhi = (0x100 << 13) | 10;
+        exec.core.cp0_entrylo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        exec.core.cp0_entrylo1 = (0x51 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_COMPLETE);
+
+        // Write the exact same VPN2/ASID at a different index (6): this is
+        // precisely the "duplicate TLB entry" condition IRIX itself panics
+        // on. tlbcheck should catch it right here and return EXEC_BREAKPOINT
+        // instead of silently continuing, with PC already retired past the
+        // TLBWI (matching how other breakpoints leave PC at the next instr).
+        let pc_before = exec.core.pc;
+        exec.core.cp0_index = 6;
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_BREAKPOINT);
+        assert_eq!(exec.core.pc, pc_before.wrapping_add(4));
+
+        // The checker re-scans the whole TLB on every write, so the 5/6
+        // duplicate keeps tripping EXEC_BREAKPOINT on any further write until
+        // it's actually resolved — confirming it isn't a one-shot fluke.
+        //
+        // Note there is no way to *resolve* this duplicate from here without
+        // hitting the separate vmap-dangling bug covered by
+        // test_tlbcheck_detects_vmap_left_dangling_by_overlap_repair: any
+        // further write to index 6 (moving it to a new VPN2, or clearing it
+        // to invalid) calls vmap_erase(6), which wipes vmap[0x100] back to
+        // VMAP_MISS and orphans index 5's still-valid claim — so this test
+        // stops at "detected and not a one-shot fluke" rather than also
+        // trying to demonstrate a clean recovery.
+        exec.core.cp0_index = 7;
+        exec.core.cp0_entryhi = (0x200 << 13) | 10;
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_BREAKPOINT);
+    }
+
+    // Regression test for a real vmap bug tlbcheck surfaced (now fixed via
+    // MipsTlb::vmap_replace, see rules/testing/tlbcheck-vmap-dangling-slot-bug.md):
+    // when two entries transiently share a VPN2 (e.g. mid TLBWR churn picks a
+    // colliding victim index) and the later one then moves to a new VPN2,
+    // the vmap must NOT simply blank the shared slot — it needs to re-derive
+    // whether some *other* entry still legitimately covers it and restore
+    // that claim. This drives exactly that sequence and confirms the TLB
+    // ends up fully consistent again (no lingering EXEC_BREAKPOINT) once the
+    // real duplicate is resolved, with entry 5's original mapping intact.
+    #[cfg(feature = "tlbcheck")]
+    #[test]
+    fn test_tlbcheck_vmap_survives_overlap_repair() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_tlbcheck_vmap_survives_overlap_repair_inner(); })
+            .unwrap().join().unwrap();
+    }
+    #[cfg(feature = "tlbcheck")]
+    fn test_tlbcheck_vmap_survives_overlap_repair_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
+        let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+
+        // Index 5: VPN2=0x100, ASID=10 (valid).
+        exec.core.cp0_index = 5;
+        exec.core.cp0_pagemask = 0;
+        exec.core.cp0_entryhi = (0x100 << 13) | 10;
+        exec.core.cp0_entrylo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        exec.core.cp0_entrylo1 = (0x51 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_COMPLETE);
+
+        // Index 6: same VPN2/ASID — a transient overlap, as ordinary TLBWR
+        // replacement could produce. tlbcheck flags it (see the duplicate-
+        // detection test); here we drive past it to observe the vmap fallout.
+        exec.core.cp0_index = 6;
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_BREAKPOINT);
+
+        // Index 6 moves on to a fresh VPN2, as a real replacement algorithm
+        // would do on its next victim pick — index 5's still-valid mapping at
+        // VPN2=0x100 is never touched. This resolves the duplicate, and with
+        // vmap_replace's restore step, entry 5 correctly reclaims its slot
+        // instead of being left dangling at VMAP_MISS — no more violations.
+        exec.core.cp0_index = 6;
+        exec.core.cp0_entryhi = (0x300 << 13) | 10;
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_COMPLETE);
+
+        // Confirm entry 5 is genuinely still reachable through the vmap fast
+        // path, not just "no violation reported" — translate() must still
+        // find it.
+        use crate::mips_tlb::{AccessType, Tlb, TlbResult};
+        let va = 0x100u64 << 13;
+        match exec.tlb.translate::<0>(va, 10, AccessType::Read) {
+            TlbResult::Hit { phys_addr, .. } => {
+                assert_eq!(phys_addr, 0x50 << 12, "expected entry 5's PFN, got phys_addr={:#x}", phys_addr);
+            }
+            other => panic!("expected Hit against entry 5's still-valid mapping, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_mfc0_mtc0() {
         let (mut exec, _) = create_executor();

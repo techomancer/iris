@@ -37,6 +37,15 @@ tlbvmap = []
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
+# TLB consistency checker: after every TLBWI/TLBWR, walk the whole JTLB and
+# verify there are no duplicate/overlapping entries, that the shadow array
+# matches the architectural entries, that each MRU list visits every valid
+# entry exactly once, and (with tlbvmap) that vmap agrees with a full scan.
+# Diagnostic only — O(entries^2) per write, far too slow for normal use.
+# Exists because bogus "duplicate TLB entry" IRIX panics turned out to be
+# emulator TLB-management bugs; this catches them at the moment they occur
+# instead of many instructions later at a confusing kernel panic.
+tlbcheck = []
 # Per-instruction decode and execution frequency counters (all ~205 MIPS
 # III/IV opcodes), printed at emulator exit with a MIPS III/IV usage rollup,
 # plus diffable instr_used.txt/instr_counts.txt dumps. Diagnostic only —

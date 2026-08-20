@@ -4822,11 +4822,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         let funct_val = d.funct as u32;
 
         match funct_val {
-            // exec_tlbr/wi/wr/p always return bare EXEC_COMPLETE (no other
-            // status possible), so run them for effect then finish here.
+            // exec_tlbr/p always return bare EXEC_COMPLETE (no other status
+            // possible — they don't mutate the TLB), so run them for effect
+            // then finish here. exec_tlbwi/wr retire PC themselves and may
+            // return EXEC_BREAKPOINT (feature = "tlbcheck" found a bad write),
+            // so their return value is passed straight through.
             FUNCT_TLBR => { self.exec_tlbr(); self.handle_exec_complete() }
-            FUNCT_TLBWI => { self.exec_tlbwi(); self.handle_exec_complete() }
-            FUNCT_TLBWR => { self.exec_tlbwr(); self.handle_exec_complete() }
+            FUNCT_TLBWI => self.exec_tlbwi(),
+            FUNCT_TLBWR => self.exec_tlbwr(),
             FUNCT_TLBP => { self.exec_tlbp(); self.handle_exec_complete() }
             FUNCT_ERET => self.exec_eret(), // PC set directly, terminal as-is
             FUNCT_WAIT => self.handle_exec_complete(), // phi opcode: invalid but not RI on R4000 (NOP)
@@ -4891,7 +4894,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWI: Write Index {}\n{}", index, self.tlb.format_entry(index)); }
 
-        EXEC_COMPLETE
+        #[cfg(feature = "tlbcheck")]
+        {
+            let bad = self.tlb.consistency_check(&format!("TLBWI idx={} pc={:#010x}", index, self.core.pc));
+            self.handle_exec_complete();
+            return if bad { EXEC_BREAKPOINT } else { EXEC_COMPLETE };
+        }
+        #[cfg(not(feature = "tlbcheck"))]
+        self.handle_exec_complete()
     }
 
     // TLBWR - Write Random TLB Entry
@@ -4906,7 +4916,14 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWR: Write Random Index {}\n{}", index, self.tlb.format_entry(index)); }
 
-        EXEC_COMPLETE
+        #[cfg(feature = "tlbcheck")]
+        {
+            let bad = self.tlb.consistency_check(&format!("TLBWR idx={} pc={:#010x}", index, self.core.pc));
+            self.handle_exec_complete();
+            return if bad { EXEC_BREAKPOINT } else { EXEC_COMPLETE };
+        }
+        #[cfg(not(feature = "tlbcheck"))]
+        self.handle_exec_complete()
     }
 
     // TLBP - Probe TLB for Matching Entry

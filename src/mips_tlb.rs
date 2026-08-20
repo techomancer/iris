@@ -331,10 +331,31 @@ pub trait Tlb {
     /// Restore TLB state from a `MipsTlb` snapshot (used by JIT rollback).
     /// Default no-op for implementations that don't support rollback.
     fn restore_from_mips_tlb(&mut self, _src: &MipsTlb) {}
+
+    /// Run internal consistency checks (feature = "tlbcheck" only).
+    /// Default no-op; overridden by `MipsTlb`. Violations are printed via
+    /// `eprintln!`; the caller is expected to stop execution (return
+    /// `EXEC_BREAKPOINT`) when this returns `true`, so a bogus TLBWI/TLBWR is
+    /// caught right where it happens instead of many instructions later at a
+    /// confusing IRIX "duplicate TLB entry" panic.
+    ///
+    /// Returns `true` if any violation was found.
+    #[cfg(feature = "tlbcheck")]
+    fn consistency_check(&self, _context: &str) -> bool { false }
 }
 
 const VMAP_SIZE: usize = 524288; // 4GB / 8KB = 2^19 slots
 const VMAP_MISS: u8 = 0xFF;
+/// Set on a vmap slot when more than one TLB entry's VPN2 range covers it
+/// (aliasing — e.g. two 64-bit VAs sharing bits 13..31 but differing in
+/// R-field/upper bits, or genuinely overlapping entries). A slot with this
+/// bit set can't be trusted for the O(1) fast path; translate() must fall
+/// back to the linear MRU scan. Low 7 bits hold the entry index (0-47) when
+/// this bit is set, so it's always ORed onto a real index, never combined
+/// with VMAP_MISS (0xFF is checked as a whole byte before masking).
+const VMAP_MULTI: u8 = 0x80;
+/// Mask to recover the raw entry index from a vmap slot (strips VMAP_MULTI).
+const VMAP_IDX_MASK: u8 = 0x7F;
 
 /// Sentinel: end of MRU list / invalid slot index.
 const MRU_NONE: u8 = 0xFF;
@@ -450,6 +471,16 @@ pub struct MipsTlb {
     /// O(1) lookup for 32-bit (and sign-extended 64-bit) VAs.
     /// Indexed by VA[31:13] (19 bits).  Value = entry index or VMAP_MISS.
     vmap: [u8; VMAP_SIZE],
+    /// Every VPN2 slot `vmap_fill_range`/`vmap_clear` has ever touched (across the
+    /// whole session, union — never shrinks except on power_on/load_state).
+    /// `vmap` starts as `[VMAP_MISS; VMAP_SIZE]` and nothing but those two
+    /// functions ever mutates it, so any slot NOT in this set is guaranteed
+    /// still VMAP_MISS without needing to read it. Lets
+    /// `find_consistency_violations`'s vmap check examine only the slots
+    /// that could possibly be wrong instead of walking all 524288 of them on
+    /// every single TLBWI/TLBWR (~800us/call measured, dominating boot time).
+    #[cfg(feature = "tlbcheck")]
+    vmap_touched: std::collections::HashSet<usize>,
     #[cfg(feature = "tlbstats")]
     pub stats: TlbStats,
 }
@@ -464,6 +495,8 @@ impl MipsTlb {
             mru_head: [0u8; MRU_LISTS],
             mru_next: [[MRU_NONE; TLB_NUM_ENTRIES]; MRU_LISTS],
             vmap: [VMAP_MISS; VMAP_SIZE],
+            #[cfg(feature = "tlbcheck")]
+            vmap_touched: std::collections::HashSet::new(),
             #[cfg(feature = "tlbstats")]
             stats: TlbStats::default(),
         };
@@ -490,46 +523,301 @@ impl MipsTlb {
         self.mru_head[list] = target;
     }
 
-    /// Erase all vmap slots that currently point to `entry_idx`.
-    /// Called before overwriting a TLB entry.
-    /// The vmap is keyed on VA[31:13] only, so we use entry_hi[31:13] regardless
-    /// of the R field / upper bits (those only matter in full 64-bit mode, which
-    /// bypasses the vmap entirely).
+    /// The [start, start+count) VPN2 slot range `entries[entry_idx]` covers.
+    /// The vmap is keyed on VA[31:13] only (bits 13..31), so this uses
+    /// entry_hi[31:13] regardless of the R field / upper bits — those only
+    /// distinguish VAs that alias within this same range, which is exactly
+    /// what VMAP_MULTI (and the post-lookup VPN verify in translate()) is for.
     #[inline]
-    fn vmap_erase(&mut self, entry_idx: usize) {
-        let old = &self.entries[entry_idx];
-        let tag = entry_idx as u8;
-        let mask = old.page_mask | 0x1FFF;
+    fn vmap_range(entry: &TlbEntry) -> (usize, usize) {
+        let mask = entry.page_mask | 0x1FFF;
         let count = ((mask + 1) >> 13).max(1) as usize;
         // Align down: entry_hi bits [14:13] are offset bits for large pages and may
         // be non-zero (MIPS spec doesn't require software to clear them).
-        let vpn2 = (((old.entry_hi as u32) >> 13) as usize) & !(count - 1);
+        let start = (((entry.entry_hi as u32) >> 13) as usize) & !(count - 1);
+        (start, count)
+    }
+
+    /// Unconditionally blank every slot in `[start, start+count)` to VMAP_MISS.
+    #[inline]
+    fn vmap_clear(&mut self, start: usize, count: usize) {
+        #[cfg(feature = "tlbcheck")]
         for i in 0..count {
-            let slot = vpn2.wrapping_add(i);
-            if slot < VMAP_SIZE && self.vmap[slot] == tag {
+            let slot = start.wrapping_add(i);
+            if slot < VMAP_SIZE { self.vmap_touched.insert(slot); }
+        }
+        for i in 0..count {
+            let slot = start.wrapping_add(i);
+            if slot < VMAP_SIZE {
                 self.vmap[slot] = VMAP_MISS;
             }
         }
     }
 
-    /// Populate vmap slots for `entry_idx` using the entry now stored at that index.
-    /// Always uses entry_hi[31:13] as the key — the upper bits (R field) are only
-    /// relevant for full 64-bit VAs which skip the vmap anyway.
+    /// Claim every slot in `[start, start+count)` for `entry_idx`: a slot
+    /// currently VMAP_MISS is set to `entry_idx` outright; a slot already
+    /// claimed by another entry is set to `entry_idx | VMAP_MULTI` (an
+    /// existing VMAP_MULTI slot stays VMAP_MULTI, now naming `entry_idx` as
+    /// its "most recent" index — translate() must fall back to the linear
+    /// scan for it regardless of which index is recorded).
     #[inline]
-    fn vmap_fill(&mut self, entry_idx: usize) {
-        let entry = &self.entries[entry_idx];
-        let mask = entry.page_mask | 0x1FFF;
-        let count = ((mask + 1) >> 13).max(1) as usize;
-        // Align down: entry_hi bits [14:13] are offset bits for large pages and may
-        // be non-zero (MIPS spec doesn't require software to clear them).
-        let vpn2 = (((entry.entry_hi as u32) >> 13) as usize) & !(count - 1);
+    fn vmap_fill_range(&mut self, entry_idx: usize, start: usize, count: usize) {
         let tag = entry_idx as u8;
+        #[cfg(feature = "tlbcheck")]
         for i in 0..count {
-            let slot = vpn2.wrapping_add(i);
+            let slot = start.wrapping_add(i);
+            if slot < VMAP_SIZE { self.vmap_touched.insert(slot); }
+        }
+        for i in 0..count {
+            let slot = start.wrapping_add(i);
             if slot < VMAP_SIZE {
-                self.vmap[slot] = tag;
+                self.vmap[slot] = if self.vmap[slot] == VMAP_MISS { tag } else { tag | VMAP_MULTI };
             }
         }
+    }
+
+    /// Replace the vmap's claim on TLB slot `index` with the entry now
+    /// stored there (`write()` has already updated `self.entries[index]`).
+    /// Algorithm (see rules/testing/ for the bug this replaces a simpler,
+    /// broken erase+fill with): the entry being overwritten may have been
+    /// the sole owner of some VPN2 slots that *other* still-valid entries
+    /// also cover — naive erase-by-tag left those slots dangling at
+    /// VMAP_MISS forever. So:
+    ///   1. Compute the range the *old* entry at `index` covered.
+    ///   2. Unconditionally clear that whole range (not just slots tagged
+    ///      `index` — a slot may already show a different tag from an
+    ///      earlier aliasing write, but it's still being vacated here).
+    ///   3. Walk every *other* entry and re-fill any of its coverage that
+    ///      falls inside the vacated range, so a still-valid aliasing entry
+    ///      reclaims its slot instead of being left at VMAP_MISS.
+    ///   4. Finally fill the *new* entry's own (possibly different) range —
+    ///      unbounded, i.e. its full range regardless of what was vacated —
+    ///      so it gets priority (and VMAP_MULTI) over anything restored in
+    ///      step 3 that it now also aliases.
+    #[inline]
+    fn vmap_replace(&mut self, index: usize, old_range: (usize, usize)) {
+        let (old_start, old_count) = old_range;
+        self.vmap_clear(old_start, old_count);
+        let old_end = old_start + old_count;
+        for i in 0..TLB_NUM_ENTRIES {
+            if i == index {
+                continue;
+            }
+            let (start, count) = Self::vmap_range(&self.entries[i]);
+            let end = start + count;
+            // Intersect [start, end) with the vacated [old_start, old_end).
+            let lo = start.max(old_start);
+            let hi = end.min(old_end);
+            if lo < hi {
+                self.vmap_fill_range(i, lo, hi - lo);
+            }
+        }
+        let (new_start, new_count) = Self::vmap_range(&self.entries[index]);
+        self.vmap_fill_range(index, new_start, new_count);
+    }
+
+    /// Full internal consistency check (feature = "tlbcheck").
+    /// Returns a list of human-readable violation descriptions (empty if the
+    /// TLB is consistent).
+    ///
+    /// Checks, in order:
+    /// 1. No two valid entries overlap the same VPN2+region for an
+    ///    ASID/global combination that could both match a lookup (this is
+    ///    the condition IRIX itself detects and panics on as "duplicate TLB
+    ///    entry").
+    /// 2. `shadow[i]` is bit-for-bit the re-derivation of `entries[i]`.
+    /// 3. Each MRU list is a permutation of all TLB_NUM_ENTRIES slots with
+    ///    no cycle and no dropped/duplicated entry.
+    /// 4. (feature = "tlbvmap") Every vmap slot either correctly names the
+    ///    unique entry covering that VPN2, or is VMAP_MISS if none does.
+    #[cfg(feature = "tlbcheck")]
+    fn find_consistency_violations(&self) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut report = |msg: String| violations.push(msg);
+
+        // 1. Duplicate/overlapping entries.
+        // Two entries conflict if their VPN2 ranges intersect (after masking
+        // by the wider of the two page masks) and they'd both be visible to
+        // the same lookup: either entry is global, or both share an ASID.
+        for i in 0..TLB_NUM_ENTRIES {
+            let a = &self.entries[i];
+            if !a.is_valid_even() && !a.is_valid_odd() {
+                continue; // fully-invalid entries can't conflict
+            }
+            for j in (i + 1)..TLB_NUM_ENTRIES {
+                let b = &self.entries[j];
+                if !b.is_valid_even() && !b.is_valid_odd() {
+                    continue;
+                }
+                if a.region() != b.region() {
+                    continue;
+                }
+                if !(a.is_global() || b.is_global() || a.asid() == b.asid()) {
+                    continue;
+                }
+                let mask = a.page_mask | b.page_mask | 0x1FFF;
+                if (a.entry_hi & !mask) == (b.entry_hi & !mask) {
+                    report(format!(
+                        "duplicate/overlapping entries {} and {} (VPN2 {:07x} / {:07x}, ASID {:02x}/{:02x}, G {}/{})",
+                        i, j, a.vpn2(), b.vpn2(), a.asid(), b.asid(), a.is_global() as u8, b.is_global() as u8
+                    ));
+                }
+            }
+        }
+
+        // 2. Shadow vs architectural entries.
+        // Skip the VPN/pfn/offset comparison for a page that's invalid on
+        // both sides: ShadowEntry::invalid() (used by new()/power_on() for
+        // untouched slots) fills vpn_hi32/64 with the sentinel !0 so a VA of
+        // 0 never matches, while ShadowEntry::from_entry(&TlbEntry::new())
+        // (an all-zero architectural entry) derives 0 for the same fields.
+        // Both are correctly unmatchable — the bit patterns just differ by
+        // construction — so comparing them here would be a false positive.
+        for i in 0..TLB_NUM_ENTRIES {
+            let expected = ShadowEntry::from_entry(&self.entries[i]);
+            let s = &self.shadow[i];
+            if s.valid_dirty != expected.valid_dirty || s.asid != expected.asid
+                || s.global != expected.global || s.selector_bit_shift != expected.selector_bit_shift {
+                report(format!("shadow[{}] does not match entries[{}] (valid/asid/global/shift)", i, i));
+                continue;
+            }
+            let page_dead = expected.valid_dirty[0] & 0x1 == 0 && expected.valid_dirty[1] & 0x1 == 0;
+            if page_dead {
+                continue;
+            }
+            let mismatch = s.vcmp32 != expected.vcmp32
+                || s.vpn_hi32 != expected.vpn_hi32
+                || s.vcmp64 != expected.vcmp64
+                || s.vpn_hi64 != expected.vpn_hi64
+                || s.pfn_base != expected.pfn_base
+                || s.offset_mask != expected.offset_mask;
+            if mismatch {
+                report(format!("shadow[{}] does not match entries[{}] (vpn/pfn/offset)", i, i));
+            }
+        }
+
+        // 3. MRU list integrity: each list must visit every slot exactly once.
+        for list in 0..MRU_LISTS {
+            let mut seen = [false; TLB_NUM_ENTRIES];
+            let mut cur = self.mru_head[list];
+            let mut count = 0usize;
+            while cur != MRU_NONE {
+                let slot = cur as usize;
+                if slot >= TLB_NUM_ENTRIES {
+                    report(format!("MRU list {} contains out-of-range slot {}", list, slot));
+                    break;
+                }
+                if seen[slot] {
+                    report(format!("MRU list {} has a cycle at slot {}", list, slot));
+                    break;
+                }
+                seen[slot] = true;
+                count += 1;
+                cur = self.mru_next[list][slot];
+            }
+            let missing: Vec<usize> = (0..TLB_NUM_ENTRIES).filter(|&i| !seen[i]).collect();
+            if !missing.is_empty() {
+                report(format!("MRU list {} is missing slot(s) {:?} (visited {} of {})", list, missing, count, TLB_NUM_ENTRIES));
+            }
+        }
+
+        // 4. vmap vs full scan (only meaningful with tlbvmap, but the vmap
+        // array and vmap_replace are unconditional in this codebase, so we
+        // can always check it).
+        // Note: vmap_replace runs unconditionally on every write(),
+        // independent of the V bit — an entry written with V=0 still claims
+        // its VPN2 slots (translate()'s vmap fast path relies on this to
+        // return Invalid rather than falling through to Miss). Entries never
+        // touched by write() still hold TlbEntry::new()'s all-zero default
+        // and so "cover" VPN2=0 in this re-derivation too, exactly matching
+        // vmap_replace's real behavior — see its doc comment: a never-written
+        // entry claiming VPN2=0 just costs one VMAP_MULTI fallback-to-scan
+        // until every entry is written, which happens almost immediately in
+        // practice, so all TLB_NUM_ENTRIES entries are considered here
+        // unconditionally, with no separate "was this written" tracking.
+        //
+        // Iterates TLB_NUM_ENTRIES entries (each covering `count` VPN2
+        // slots) instead of the naive VMAP_SIZE(524288) x
+        // TLB_NUM_ENTRIES(48) double loop — the naive version made every
+        // TLBWI/TLBWR cost ~25M iterations, dominating emulated boot time by
+        // orders of magnitude. `self.vmap_touched` (maintained by
+        // vmap_clear/vmap_fill_range) is the set of every slot that could
+        // possibly be non-default — nothing outside it needs checking, since
+        // `vmap` starts at `[VMAP_MISS; VMAP_SIZE]` and only those two
+        // functions ever mutate it.
+        #[cfg(feature = "tlbvmap")]
+        {
+            use std::collections::HashMap;
+            let mut owners: HashMap<usize, (usize, bool)> = HashMap::new(); // vpn2 -> (most_recent_entry_idx, multiple)
+            for i in 0..TLB_NUM_ENTRIES {
+                let (start, count) = Self::vmap_range(&self.entries[i]);
+                for k in 0..count {
+                    let vpn2 = start.wrapping_add(k);
+                    if vpn2 >= VMAP_SIZE {
+                        continue;
+                    }
+                    owners.entry(vpn2)
+                        .and_modify(|(owner, multiple)| { *owner = i; *multiple = true; })
+                        .or_insert((i, false));
+                }
+            }
+            // Every slot that could possibly be non-VMAP_MISS is in
+            // vmap_touched; check each against its expected owner (or lack
+            // thereof) in one pass instead of walking the full vmap array.
+            for &vpn2 in &self.vmap_touched {
+                let slot_val = self.vmap[vpn2];
+                match owners.get(&vpn2) {
+                    None => {
+                        if slot_val != VMAP_MISS {
+                            report(format!("vmap[{:05x}] = {:#04x} but no entry covers this VPN2", vpn2, slot_val));
+                        }
+                    }
+                    Some(&(_owner, multiple)) => {
+                        let slot_multi = slot_val & VMAP_MULTI != 0;
+                        if multiple {
+                            if !slot_multi {
+                                report(format!("vmap[{:05x}] = {:#04x} (no VMAP_MULTI) but multiple entries cover this VPN2", vpn2, slot_val));
+                            }
+                        } else {
+                            // Exactly one covering entry: VMAP_MULTI must be
+                            // clear and the index must be that entry. (A stale
+                            // VMAP_MULTI left over from an entry that moved
+                            // away is exactly the class of bug this check
+                            // exists to catch.)
+                            if slot_multi {
+                                report(format!("vmap[{:05x}] = {:#04x} has stale VMAP_MULTI but only one entry covers this VPN2", vpn2, slot_val));
+                            } else if slot_val as usize != _owner {
+                                report(format!("vmap[{:05x}] = {} but entry {} covers this VPN2", vpn2, slot_val, _owner));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+
+    /// Run `find_consistency_violations` and print any findings, tagged with
+    /// `context` (e.g. "TLBWI idx=3 pc=...") so the offending write is easy
+    /// to find in logs. Returns `true` if any violation was found, so the
+    /// caller can stop execution right at the offending TLBWI/TLBWR instead
+    /// of running on to a confusing IRIX "duplicate TLB entry" panic many
+    /// instructions later.
+    #[cfg(feature = "tlbcheck")]
+    fn do_consistency_check(&self, context: &str) -> bool {
+        let violations = self.find_consistency_violations();
+        if violations.is_empty() {
+            return false;
+        }
+        for msg in &violations {
+            eprintln!("TLBCHECK VIOLATION [{}]: {}", context, msg);
+        }
+        eprintln!("TLBCHECK: dumping full TLB state for [{}]:", context);
+        for i in 0..TLB_NUM_ENTRIES {
+            eprintln!("{}", self.format_entry(i));
+        }
+        true
     }
 }
 
@@ -549,21 +837,33 @@ impl Tlb for MipsTlb {
             self.stats.by_type[access_type as usize].addr64 += 1;
         }
 
-        // Fast path: O(1) vmap lookup for 32-bit VAs and 64-bit sign-extended ±2GB VAs.
-        // A 64-bit VA is sign-extended 32-bit when upper 32 bits are all-zero (user/kuseg)
-        // or all-ones (kernel kseg0/kseg1/kseg2/kseg3 in 64-bit compatibility mode).
-        let upper32 = (virt_addr >> 32) as u32;
-        if IS_64BIT == 0 || upper32 == 0 || upper32 == 0xFFFF_FFFF {
-
+        // Fast path: O(1) vmap lookup, keyed on VA bits 13..31 regardless of
+        // IS_64BIT — two VAs sharing those bits but differing in R-field /
+        // upper bits (true 64-bit aliasing) can share a vmap slot; that's
+        // resolved below either by VMAP_MULTI forcing the linear scan, or by
+        // the explicit vcmp/vpn_hi verify against the candidate entry.
+        {
             let vmap_idx = ((virt_addr as u32) >> 13) as usize;
-            let entry_idx = self.vmap[vmap_idx];
-            if entry_idx != VMAP_MISS {
+            let slot = self.vmap[vmap_idx];
+            if slot != VMAP_MISS {
+                // Always try the recorded candidate first, multi or not —
+                // when several entries alias this VPN2 slot the recorded
+                // index is merely "most recent, not guaranteed to match,"
+                // but if it DOES match there's no need to pay for the linear
+                // scan.
+                let multi = slot & VMAP_MULTI != 0;
+                let entry_idx = slot & VMAP_IDX_MASK;
                 let s = &self.shadow[entry_idx as usize];
+                let (vcmp, vpn_hi) = if IS_64BIT != 0 {
+                    (s.vcmp64, s.vpn_hi64)
+                } else {
+                    (s.vcmp32, s.vpn_hi32)
+                };
 
-                // Verify ASID / Global match.
-                // On mismatch we must fall through to linear scan: a different entry
-                // for the same VPN but a different ASID may exist (TLB aliasing).
-                if s.global || s.asid == asid {
+                // Verify the candidate entry actually matches this VA (not
+                // just bits 13..31 — the vmap key).
+                let vpn_match = (virt_addr & vcmp) == vpn_hi;
+                if vpn_match && (s.global || s.asid == asid) {
                     let idx = ((virt_addr >> s.selector_bit_shift) & 1) as usize;
                     let vd = s.valid_dirty[idx];
 
@@ -588,12 +888,25 @@ impl Tlb for MipsTlb {
                         dirty,
                     };
                 }
-                // ASID mismatch on a non-global entry — fall through to linear scan
-                // to check if another entry exists for this VA+ASID combination.
+                // Mismatch (VPN or ASID/global). If nothing else aliases
+                // this VPN2 slot (!multi), this candidate was the *only*
+                // entry in the whole TLB covering VA bits 13..31 at all — if
+                // it doesn't match (wrong VPN, or right VPN but wrong ASID
+                // and not global), no other entry could possibly match
+                // either, since a second claimant on this slot (of any ASID)
+                // would have set VMAP_MULTI when it was written. Definite
+                // miss, no need to pay for the scan. With multi set, another
+                // aliasing candidate wasn't even checked here — only the
+                // scan can tell if one of them matches.
+                if !multi {
+                    #[cfg(feature = "tlbstats")]
+                    { self.stats.by_type[access_type as usize].vmap_miss += 1; }
+                    return TlbResult::Miss { vpn2: virt_addr >> 13 };
+                }
                 #[cfg(feature = "tlbstats")]
                 { self.stats.by_type[access_type as usize].vmap_asid_fall += 1; }
             } else {
-                // vmap says no entry for this VA — definite miss.
+                // vmap says no entry covers VA bits 13..31 at all — definite miss.
                 #[cfg(feature = "tlbstats")]
                 { self.stats.by_type[access_type as usize].vmap_miss += 1; }
                 return TlbResult::Miss { vpn2: virt_addr >> 13 };
@@ -676,10 +989,10 @@ impl Tlb for MipsTlb {
                 (entry.entry_lo[0] << 6) & pfn_mask,
                 (entry.entry_lo[1] << 6) & pfn_mask,
             ];
-            self.vmap_erase(index);
+            let old_range = Self::vmap_range(&self.entries[index]);
             self.entries[index] = entry;
             self.shadow[index] = ShadowEntry::from_entry(&entry);
-            self.vmap_fill(index);
+            self.vmap_replace(index, old_range);
         }
     }
 
@@ -806,6 +1119,8 @@ impl Tlb for MipsTlb {
             self.mru_next[list][TLB_NUM_ENTRIES - 1] = MRU_NONE;
         }
         self.vmap.fill(VMAP_MISS);
+        #[cfg(feature = "tlbcheck")]
+        { self.vmap_touched.clear(); }
     }
 
     fn save_state(&self) -> toml::Value {
@@ -859,7 +1174,8 @@ impl Tlb for MipsTlb {
         }
         self.vmap.fill(VMAP_MISS);
         for i in 0..TLB_NUM_ENTRIES {
-            self.vmap_fill(i);
+            let (start, count) = Self::vmap_range(&self.entries[i]);
+            self.vmap_fill_range(i, start, count);
         }
         Ok(())
     }
@@ -880,6 +1196,11 @@ impl Tlb for MipsTlb {
     fn clone_as_mips_tlb(&self) -> Option<MipsTlb> { Some(self.clone()) }
 
     fn restore_from_mips_tlb(&mut self, src: &MipsTlb) { *self = src.clone(); }
+
+    #[cfg(feature = "tlbcheck")]
+    fn consistency_check(&self, context: &str) -> bool {
+        self.do_consistency_check(context)
+    }
 }
 
 /// Passthrough TLB implementation for testing

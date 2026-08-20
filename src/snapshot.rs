@@ -77,6 +77,7 @@ pub fn enabled_features() -> Vec<String> {
     push_if!("developer");
     push_if!("developer_ip7");
     push_if!("tlbstats");
+    push_if!("tlbcheck");
     push_if!("instr_stats");
     push_if!("debug_cache");
     f.sort();
