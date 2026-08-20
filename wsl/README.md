@@ -170,11 +170,16 @@ Send `premiere-debug.log`, monitor `status`/`bt`/`dt 80`, and `hinv -t memory` a
 
 ### Authentic max Indy (R5000SC, 256 MB)
 
-Compile-time CPU — rebuild **both** CLI and GUI:
+**Currently unavailable.** `iris/r5ksc` (the R5000's external secondary
+cache) doesn't build — the memory-mapped L2 control transactions it needs
+aren't implemented, and the plain R5000 L1I model has separate open bugs.
+See `rules/testing/r5k-l1i-cache-bugs.md`. Use `iris/r5k` alone (no
+secondary cache) if you need R5000 CPU/FPU behavior without the cache
+profile:
 
 ```powershell
-cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release --features iris/r5k,iris/r5ksc
-cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,idle-pause,iris/r5k,iris/r5ksc
+cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release --features iris/r5k
+cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,idle-pause,iris/r5k
 ```
 
 ```toml

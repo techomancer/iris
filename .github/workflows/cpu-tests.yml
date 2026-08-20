@@ -93,9 +93,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The CPU is a compile-time cargo feature, not a runtime switch — see
-      # rules/perf/hardware-profiles.md. r5ksc_triton gives the R5000 the on-die
-      # secondary cache an Indy R5000 actually has; without it Config.SC reports
-      # no L2 and the cache group would be testing a machine that never shipped.
+      # rules/perf/hardware-profiles.md. Plain r5k only: r5ksc (the external
+      # R4600SC-style secondary cache a real Indy R5000 board has) and
+      # r5ksc_triton (the O2's on-die L2, not a machine this emulator targets
+      # anyway) both fail mips_cache_v2's L1I tests and are refused at compile
+      # time (src/lib.rs) — see rules/testing/r5k-l1i-cache-bugs.md. Plain r5k
+      # reports Config.SC as no-L2, so the cache group tests a real R5000
+      # minus its secondary cache rather than a machine that never shipped;
+      # CPU/FPU correctness (what this suite actually exercises) doesn't
+      # depend on the secondary cache working.
       #
       # jitv2, not the v1 jit: v1 is the speculative tiered block compiler being
       # replaced, and is not what this project runs. jitv2 needs no runtime
@@ -103,7 +109,7 @@ jobs:
       - name: Build IRIS
         run: |
           FEATURES=""
-          [ "${{ matrix.cpu }}" = "r5000" ] && FEATURES="r5k,r5ksc_triton"
+          [ "${{ matrix.cpu }}" = "r5000" ] && FEATURES="r5k"
           [ "${{ matrix.engine }}" = "jitv2" ] && FEATURES="${FEATURES:+$FEATURES,}jitv2"
           if [ -n "$FEATURES" ]; then
             cargo build --release --features "$FEATURES"

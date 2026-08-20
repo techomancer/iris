@@ -45,8 +45,10 @@ Notable Group-B features:
   Interactive debugging (GDB stub) is non-functional in this build. The
   GUI detects this at runtime (`iris::build_features::LIGHTNING`) and
   greys out the GDB port input on the Debug tab.
-- `iris/r5k`, `iris/r5ksc`, `iris/r5ksc_triton` — switch the emulated CPU
-  to an R5000 with 2-way caches (default is R4400 direct-mapped).
+- `iris/r5k` — switch the emulated CPU to an R5000 with 2-way caches
+  (default is R4400 direct-mapped). `iris/r5ksc`/`iris/r5ksc_triton` (the
+  secondary-cache variants) don't currently build — see
+  rules/testing/r5k-l1i-cache-bugs.md.
 - `iris/tlbstats`, `iris/ci_clock`, `iris/gdc`, `iris/mouseabs`,
   `iris/developer*`, `iris/debug_cache` — various core tweaks.
 

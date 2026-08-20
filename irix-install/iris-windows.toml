@@ -7,7 +7,8 @@
 # IRIX 5.3 only:      banks = [128, 128, 128, 128]  (512 MB — NOT for IRIX 6.5)
 # After changing banks: Stop iris completely, then cold-start (not hot reload).
 # Verify in monitor: mc status  |  in IRIX: hinv -t memory
-# R5000SC build: see wsl/README.md (requires --features iris/r5k,iris/r5ksc rebuild)
+# R5000SC build: currently unavailable — see wsl/README.md and
+# rules/testing/r5k-l1i-cache-bugs.md
 
 headless = false
 no_audio = false

@@ -409,7 +409,9 @@ the PROM's network stack (which nothing currently tests).
 apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu
 make -C cpu-tests            # build the ELF + image
 matrix:
-  cpu:  [r4400, r5000]       # cargo features: "" vs "r5k" (± r5ksc_triton)
+  cpu:  [r4400, r5000]       # cargo features: "" vs "r5k" (r5ksc/r5ksc_triton
+                             # both refuse to build — see
+                             # rules/testing/r5k-l1i-cache-bugs.md)
   exec: [interp, jit]        # IRIS_JIT=1 --features jit
 run: iris --ci --headless … ; iris-ci …; expect "IRIS-CPUTEST-DONE rc=0"
 ```

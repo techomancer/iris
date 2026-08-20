@@ -51,7 +51,7 @@ its own IRIS build:
 
 ```sh
 cargo build --release                                # R4400, interpreter
-cargo build --release --features r5k,r5ksc_triton    # R5000
+cargo build --release --features r5k                 # R5000
 cargo build --release --features jitv2               # jitv2 (no env var needed)
 ```
 
