@@ -7810,6 +7810,11 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
         let task = move || {
             let mut exec = executor.lock();
 
+            // Clear any breakpoint id left from a previous run/step, or a stop
+            // caused by something else (retry, exception_mask) is reported by
+            // run_blocking() — and to GDB — as a phantom breakpoint hit.
+            exec.last_bp_hit = None;
+
             // Same reasoning as MipsCpu::start(): this closure runs on its own
             // fresh OS thread ("MIPS-Debug"), so the host FPU rounding mode
             // needs to be re-synced from the guest's tracked FCSR.RM rather
