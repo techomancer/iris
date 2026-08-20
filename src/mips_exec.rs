@@ -10840,6 +10840,13 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> CpuDebug
             self.stop_state.set(StopReason::Interrupted);
             return StopReason::Interrupted;
         }
+        if status == EXEC_BREAKPOINT {
+            // Sitting on an active breakpoint: step() matches before it
+            // dispatches, so without a one-shot skip every later single-step
+            // re-detects it (as run_debug_loop's first_step does for `cont`).
+            exec.skip_breakpoints = true;
+            status = exec.step();
+        }
         //eprintln!("GDB: step_one: after step status={:#010x} PC={:#018x}", status, exec.core.pc);
         let reason = if status == EXEC_BREAKPOINT {
             drop(exec);
