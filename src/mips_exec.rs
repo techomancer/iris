@@ -8276,6 +8276,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
 
             let mut first_step = true;
             let mut steps_since_yield = 0;
+            // Consecutive EXEC_RETRY count for the instruction currently being
+            // attempted (see the EXEC_RETRY arm); reset once anything retires.
+            let mut retry_count: u32 = 0;
+            const MAX_RUN_RETRIES: u32 = 100_000;
 
             loop {
                 if !running.load(Ordering::Relaxed) {
@@ -8359,8 +8363,19 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                 let pc = exec.core.pc;
                 match status {
                     EXEC_RETRY => {
-                        writeln!(writer, "PC={:016x}: Retry (Bus Busy)", pc).unwrap();
-                        break;
+                        // Nothing retired, so the same PC must be attempted
+                        // again (validate.rs documents the same contract);
+                        // breaking out made a transient bus-busy a real stop.
+                        retry_count += 1;
+                        if retry_count > MAX_RUN_RETRIES {
+                            writeln!(writer, "PC={:016x}: Retry (Bus Busy) — still busy after {} attempts, giving up", pc, MAX_RUN_RETRIES).unwrap();
+                            break;
+                        }
+                        // Refund the step budget: a retry retires no
+                        // instruction, so `step N` must still retire N.
+                        if let Some(c) = count { count = Some(c + 1); }
+                        std::hint::spin_loop();
+                        continue;
                     }
                     s if s & EXEC_IS_EXCEPTION != 0 && s & EXEC_IS_TLB_REFILL == 0 => {
                         let code = (s >> crate::mips_core::CAUSE_EXCCODE_SHIFT) & 0x1F;
@@ -8390,6 +8405,10 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
                     }
                     _ => {}
                 }
+
+                // Something retired: the retry budget is per instruction
+                // attempt, not cumulative over a long run.
+                retry_count = 0;
 
                 steps_since_yield += 1;
                 if steps_since_yield >= 500000 {
@@ -11221,10 +11240,15 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> CpuDebug
     }
 
     fn step_one(&self) -> StopReason {
-        use crate::mips_exec::EXEC_BREAKPOINT;
+        use crate::mips_exec::{EXEC_BREAKPOINT, EXEC_RETRY};
         self.cpu.stop(); // ensure no thread is running
         let mut exec = self.cpu.executor.lock();
         exec.last_bp_hit = None;
+
+        // EXEC_RETRY means the instruction did not retire and PC is unmoved, so
+        // the same PC must be stepped again — bounded like validate.rs's
+        // MAX_RETRIES_PER_INSTRUCTION so a stuck device can't spin here.
+        const MAX_STEP_RETRIES: u32 = 100_000;
 
         // Execute one instruction. If it's a branch, also execute the delay
         // slot, so a single GDB-visible step lands past it rather than
@@ -11234,7 +11258,20 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> CpuDebug
         // yet — status codes carry no PC-related information of their own
         // (every handler sets core.pc itself before returning).
         //eprintln!("GDB: step_one: PC={:#018x}", exec.core.pc);
-        let status = exec.step();
+        let mut status = exec.step();
+        let mut retries = 0u32;
+        while status == EXEC_RETRY && retries < MAX_STEP_RETRIES {
+            retries += 1;
+            std::hint::spin_loop();
+            status = exec.step();
+        }
+        if status == EXEC_RETRY {
+            // Still busy after the cap: a device is stuck, not transiently
+            // busy. Report a stop rather than a phantom "step completed".
+            drop(exec);
+            self.stop_state.set(StopReason::Interrupted);
+            return StopReason::Interrupted;
+        }
         //eprintln!("GDB: step_one: after step status={:#010x} PC={:#018x}", status, exec.core.pc);
         let reason = if status == EXEC_BREAKPOINT {
             drop(exec);
