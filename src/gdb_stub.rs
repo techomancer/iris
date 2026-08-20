@@ -356,9 +356,12 @@ impl SingleThreadBase for IrisTarget {
     }
 
     fn read_addrs(&mut self, start_addr: u64, data: &mut [u8]) -> TargetResult<usize, Self> {
-        if self.cpu.read_mem(mips_sign_extend(start_addr), data).is_err() {
-            data.fill(0);
-        }
+        // Fail the read instead of returning zeros with an OK: GDB decodes
+        // zeroed bytes as a valid `nop` and would plan its software
+        // single-step from that fabricated code instead of reporting a fault.
+        self.cpu
+            .read_mem(mips_sign_extend(start_addr), data)
+            .map_err(|_| TargetError::NonFatal)?;
         Ok(data.len())
     }
 
