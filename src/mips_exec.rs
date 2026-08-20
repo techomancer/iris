@@ -2199,7 +2199,15 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 
         #[cfg(not(feature = "lightning"))]
         if self.bp_enabled() && self.check_breakpoint::<{ BpType::Pc as u8 }>(pc) {
-            return EXEC_BREAKPOINT;
+            // This runs before the fetch, so only honor the breakpoint once the
+            // instruction is fetchable: an instruction whose fetch takes a TLB
+            // miss never executes, and a debugger can't read that page either.
+            if !self.debug_translate(pc).is_exception() {
+                return EXEC_BREAKPOINT;
+            }
+            // Not taken: drop the id check_breakpoint() just recorded, or the
+            // next stop is misreported as this breakpoint.
+            self.last_bp_hit = None;
         }
 
         // No per-instruction CP0 Count work: Count is virtual (materialized
