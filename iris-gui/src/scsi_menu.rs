@@ -158,7 +158,8 @@ fn render_label(id: u8, dev: Option<&ScsiDeviceConfig>) -> String {
 // default. See `crate::filedialog`, which is where the "else" used to be a
 // silent no-op and the panel opened at whatever the user last browsed.
 fn dialog_at(title: &str, cur: &str) -> rfd::FileDialog {
-    crate::filedialog::dialog(title, cur, crate::filedialog::Anchor::Disks)
+    crate::filedialog::dialog(title, cur, crate::filedialog::Anchor::Disks,
+                              crate::filedialog::Purpose::Open)
 }
 
 fn pick_disk(title: &str, cur: &str) -> Option<String> {

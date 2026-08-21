@@ -117,6 +117,7 @@ impl NewMachineDialog {
                             if let Some(p) = crate::filedialog::dialog_with(
                                 "PROM image", &self.prom_path,
                                 crate::filedialog::Anchor::Data,
+                                crate::filedialog::Purpose::Open,
                                 &[("PROM image", &["bin"])]).pick_file()
                             {
                                 self.prom_path = p.to_string_lossy().into_owned();
@@ -135,6 +136,7 @@ impl NewMachineDialog {
                             if let Some(p) = crate::filedialog::dialog_with(
                                 "NVRAM file", &self.nvram_path,
                                 crate::filedialog::Anchor::Data,
+                                crate::filedialog::Purpose::Save,
                                 &[("NVRAM", &["bin"])]).save_file()
                             {
                                 self.nvram_path = p.to_string_lossy().into_owned();
@@ -185,6 +187,7 @@ impl NewMachineDialog {
                             if let Some(p) = crate::filedialog::dialog_with(
                                 "Hard disk image", &self.scsi1_path,
                                 crate::filedialog::Anchor::Disks,
+                                crate::filedialog::Purpose::Open,
                                 &[("Disk image", &["raw", "img", "chd"])]).pick_file()
                             {
                                 self.scsi1_path = p.to_string_lossy().into_owned();
@@ -205,6 +208,7 @@ impl NewMachineDialog {
                             if let Some(p) = crate::filedialog::dialog_with(
                                 "CD-ROM image", &self.cdrom4_path,
                                 crate::filedialog::Anchor::Disks,
+                                crate::filedialog::Purpose::Open,
                                 &[("ISO", &["iso"]), ("CD image", &["iso", "chd"])]).pick_file()
                             {
                                 self.cdrom4_path = p.to_string_lossy().into_owned();

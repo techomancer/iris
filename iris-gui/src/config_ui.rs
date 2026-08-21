@@ -1596,7 +1596,11 @@ fn path_row_in(
             if ui.button("📁").on_hover_text("Browse…").clicked() {
                 // Open where this file lives, or is headed — never the OS's
                 // remembered folder. See `crate::filedialog`.
-                let mut d = crate::filedialog::dialog("Browse", value.as_str(), anchor);
+                let purpose = match mode {
+                    Pick::SaveFile => crate::filedialog::Purpose::Save,
+                    Pick::OpenFile | Pick::Dir => crate::filedialog::Purpose::Open,
+                };
+                let mut d = crate::filedialog::dialog("Browse", value.as_str(), anchor, purpose);
                 if matches!(mode, Pick::OpenFile | Pick::SaveFile) {
                     for (label, exts) in filters {
                         d = d.add_filter(*label, exts);
