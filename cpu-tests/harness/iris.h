@@ -20,6 +20,18 @@
 #define TESTDEV_PUTC      (TESTDEV_BASE + 0x04)
 #define TESTDEV_DUMP      (TESTDEV_BASE + 0x08)
 #define TESTDEV_EXIT      (TESTDEV_BASE + 0x0C)
+/* Host monotonic nanoseconds and retired-guest-instruction count. Reading the
+ * LO half latches the whole 64-bit value; the HI half then reads that same
+ * latch, so LO-then-HI cannot tear. Present only when TESTDEV_CAPS has
+ * TESTDEV_CAP_TIMEBASE — older emulator builds decode only 16 bytes here and
+ * alias these back onto SIGNATURE/PUTC/DUMP/EXIT, so probe before you use it,
+ * and never *write* an unprobed offset (0x0C aliases EXIT). */
+#define TESTDEV_HOST_NS_LO (TESTDEV_BASE + 0x10)
+#define TESTDEV_HOST_NS_HI (TESTDEV_BASE + 0x14)
+#define TESTDEV_ICOUNT_LO  (TESTDEV_BASE + 0x18)
+#define TESTDEV_ICOUNT_HI  (TESTDEV_BASE + 0x1C)
+#define TESTDEV_CAPS       (TESTDEV_BASE + 0x20)
+#define TESTDEV_CAP_TIMEBASE 0x00000001u
 #define TESTDEV_MAGIC     0x49524953u            /* 'I','R','I','S' */
 
 /* ── CPU identity (src/mips_core.rs:348-364) ──────────────────────────────── */

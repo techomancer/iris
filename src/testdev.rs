@@ -39,9 +39,33 @@ pub const REG_SIGNATURE: u32 = 0x00;
 pub const REG_PUTC: u32 = 0x04;
 pub const REG_DUMP: u32 = 0x08;
 pub const REG_EXIT: u32 = 0x0C;
+/// Host monotonic nanoseconds since the device was created. Reading LO latches
+/// the whole 64-bit value; HI returns the high word of that same latch, so a
+/// guest doing LO-then-HI never sees a torn count. Benchmarks need a time base
+/// the emulator cannot distort: CP0 Count is a *virtual* clock derived from a
+/// calibrated `count_hz` (mips_core.rs), so timing anything with it measures
+/// the timer model as much as the workload.
+pub const REG_HOST_NS_LO: u32 = 0x10;
+pub const REG_HOST_NS_HI: u32 = 0x14;
+/// Guest instructions retired (`MipsCore::hot.cycles`), same latch protocol.
+/// Advanced once per retired instruction by both the interpreter and jitv2
+/// (`emit_increment_cycles`), so it is directly comparable across engines —
+/// which is what makes "guest MIPS" a meaningful per-kernel number.
+pub const REG_ICOUNT_LO: u32 = 0x18;
+pub const REG_ICOUNT_HI: u32 = 0x1C;
+/// Capability bitmask, so a guest built against a newer header can still run
+/// on an older emulator: read it, and only use what it advertises.
+pub const REG_CAPS: u32 = 0x20;
+
+/// Registers decode within this many bytes and the window repeats across the
+/// whole 64 KB the device claims. Was 16 before the clock/icount registers.
+pub const REG_WINDOW: u32 = 0x40;
 
 /// Reads back at `REG_SIGNATURE` — "IRIS" in ASCII.
 pub const SIGNATURE: u32 = 0x4952_4953;
+
+/// `REG_CAPS` bit 0: `REG_HOST_NS_*` and `REG_ICOUNT_*` are present.
+pub const CAP_TIMEBASE: u32 = 1 << 0;
 
 /// Where `REG_DUMP` writes go when no path is configured.
 pub const DEFAULT_DUMP_PATH: &str = "iris-testdev-dump.json";
@@ -59,6 +83,12 @@ pub struct TestDevice {
     last_tag: AtomicU64,
     chars: AtomicU64,
     running: AtomicBool,
+    /// Origin for `REG_HOST_NS_*`. Only deltas are meaningful to the guest, so
+    /// where zero lands does not matter — only that it never moves.
+    epoch: std::time::Instant,
+    /// Latched 64-bit values, published by a read of the LO half.
+    host_ns_latch: AtomicU64,
+    icount_latch: AtomicU64,
 }
 
 /// Raw pointer to the executor's `MipsCore`, valid for the process lifetime.
@@ -77,6 +107,9 @@ impl TestDevice {
             last_tag: AtomicU64::new(0),
             chars: AtomicU64::new(0),
             running: AtomicBool::new(false),
+            epoch: std::time::Instant::now(),
+            host_ns_latch: AtomicU64::new(0),
+            icount_latch: AtomicU64::new(0),
         }
     }
 
@@ -194,16 +227,50 @@ pub fn dump_json(core: &MipsCore, tag: u32) -> String {
     s
 }
 
+impl TestDevice {
+    /// Nanoseconds since `epoch`, latched so the HI read that follows sees the
+    /// same sample.
+    fn latch_host_ns(&self) -> u64 {
+        let ns = self.epoch.elapsed().as_nanos() as u64;
+        self.host_ns_latch.store(ns, Ordering::Relaxed);
+        ns
+    }
+
+    /// Retired guest instructions, latched the same way. Zero when no core is
+    /// attached (a guest reading a flat zero learns the counter is unusable
+    /// rather than getting a plausible-looking wrong number).
+    fn latch_icount(&self) -> u64 {
+        let guard = self.core.lock();
+        let n = match guard.as_ref() {
+            // SAFETY: see CorePtr — the CPU thread is the one issuing this load.
+            Some(CorePtr(ptr)) => unsafe { (**ptr).hot.cycles },
+            None => 0,
+        };
+        drop(guard);
+        self.icount_latch.store(n, Ordering::Relaxed);
+        n
+    }
+
+    fn read_reg(&self, off: u32) -> u32 {
+        match off {
+            REG_SIGNATURE => SIGNATURE,
+            REG_HOST_NS_LO => self.latch_host_ns() as u32,
+            REG_HOST_NS_HI => (self.host_ns_latch.load(Ordering::Relaxed) >> 32) as u32,
+            REG_ICOUNT_LO => self.latch_icount() as u32,
+            REG_ICOUNT_HI => (self.icount_latch.load(Ordering::Relaxed) >> 32) as u32,
+            REG_CAPS => CAP_TIMEBASE,
+            _ => 0,
+        }
+    }
+}
+
 impl BusDevice for TestDevice {
     fn read32(&self, addr: u32) -> BusRead32 {
-        match (addr - TEST_DEV_BASE) & 0xF {
-            REG_SIGNATURE => BusRead32::ok(SIGNATURE),
-            _ => BusRead32::ok(0),
-        }
+        BusRead32::ok(self.read_reg((addr - TEST_DEV_BASE) & (REG_WINDOW - 1) & !3))
     }
 
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        match (addr - TEST_DEV_BASE) & 0xF {
+        match (addr - TEST_DEV_BASE) & (REG_WINDOW - 1) & !3 {
             REG_PUTC => self.putc(val as u8),
             REG_DUMP => self.dump(val),
             REG_EXIT => self.exit(val),
@@ -213,18 +280,18 @@ impl BusDevice for TestDevice {
     }
 
     fn read8(&self, addr: u32) -> BusRead8 {
-        // Byte reads of SIGNATURE, big-endian: byte 0 is the high byte.
-        let off = (addr - TEST_DEV_BASE) & 0xF;
-        if off < 4 {
-            return BusRead8::ok((SIGNATURE >> (8 * (3 - off))) as u8);
-        }
-        BusRead8::ok(0)
+        // Big-endian lane select within the containing word: byte 0 is the high
+        // byte. Reading the low byte of a latching register still latches, since
+        // the whole word is materialized to pick the lane out of.
+        let off = (addr - TEST_DEV_BASE) & (REG_WINDOW - 1);
+        let word = self.read_reg(off & !3);
+        BusRead8::ok((word >> (8 * (3 - (off & 3)))) as u8)
     }
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
         // A byte store to any lane of a register acts on that register, so
         // `sb` to PUTC works without the guest building a whole word.
-        match (addr - TEST_DEV_BASE) & 0xC {
+        match (addr - TEST_DEV_BASE) & (REG_WINDOW - 1) & !3 {
             REG_PUTC => self.putc(val),
             REG_DUMP => self.dump(val as u32),
             REG_EXIT => self.exit(val as u32),
@@ -263,6 +330,8 @@ impl Resettable for TestDevice {
         self.dumps.store(0, Ordering::Relaxed);
         self.last_tag.store(0, Ordering::Relaxed);
         self.chars.store(0, Ordering::Relaxed);
+        self.host_ns_latch.store(0, Ordering::Relaxed);
+        self.icount_latch.store(0, Ordering::Relaxed);
     }
 }
 
@@ -292,10 +361,62 @@ mod tests {
     fn signature_reads_back_word_and_byte_wise() {
         let d = TestDevice::new("unused");
         assert_eq!(d.read32(TEST_DEV_BASE).data, SIGNATURE);
-        // Repeats every 16 bytes across the decoded window.
-        assert_eq!(d.read32(TEST_DEV_BASE + 0x10).data, SIGNATURE);
+        // Repeats every REG_WINDOW bytes across the decoded window. (It was
+        // every 16 until the clock/icount registers claimed 0x10..0x20.)
+        assert_eq!(d.read32(TEST_DEV_BASE + REG_WINDOW).data, SIGNATURE);
         let bytes: Vec<u8> = (0..4).map(|i| d.read8(TEST_DEV_BASE + i).data).collect();
         assert_eq!(&bytes, b"IRIS", "signature is big-endian ASCII");
+    }
+
+    #[test]
+    fn caps_advertises_the_timebase() {
+        let d = TestDevice::new("unused");
+        assert_eq!(d.read32(TEST_DEV_BASE + REG_CAPS).data & CAP_TIMEBASE, CAP_TIMEBASE);
+    }
+
+    #[test]
+    fn host_ns_latches_so_lo_then_hi_cannot_tear() {
+        let d = TestDevice::new("unused");
+        let lo = d.read32(TEST_DEV_BASE + REG_HOST_NS_LO).data;
+        let hi = d.read32(TEST_DEV_BASE + REG_HOST_NS_HI).data;
+        let first = ((hi as u64) << 32) | lo as u64;
+        // HI on its own never re-samples: read it again and it is the same half
+        // of the same latch, however much time has passed in between.
+        assert_eq!(d.read32(TEST_DEV_BASE + REG_HOST_NS_HI).data, hi);
+
+        // A fresh LO read advances (the clock is monotonic and this is not
+        // instantaneous, but do not assume it ticked — assert non-regression).
+        let lo2 = d.read32(TEST_DEV_BASE + REG_HOST_NS_LO).data;
+        let hi2 = d.read32(TEST_DEV_BASE + REG_HOST_NS_HI).data;
+        let second = ((hi2 as u64) << 32) | lo2 as u64;
+        assert!(second >= first, "host clock went backwards: {} -> {}", first, second);
+    }
+
+    #[test]
+    fn icount_reports_retired_instructions_and_zero_with_no_core() {
+        let d = TestDevice::new("unused");
+        // No core attached: a flat zero, not a plausible-looking wrong number.
+        assert_eq!(d.read32(TEST_DEV_BASE + REG_ICOUNT_LO).data, 0);
+        assert_eq!(d.read32(TEST_DEV_BASE + REG_ICOUNT_HI).data, 0);
+
+        let mut core = MipsCore::new();
+        core.hot.cycles = 0x1_2345_6789;
+        d.attach_core(&core as *const MipsCore);
+        let lo = d.read32(TEST_DEV_BASE + REG_ICOUNT_LO).data;
+        let hi = d.read32(TEST_DEV_BASE + REG_ICOUNT_HI).data;
+        assert_eq!(((hi as u64) << 32) | lo as u64, 0x1_2345_6789);
+    }
+
+    #[test]
+    fn byte_reads_pick_the_big_endian_lane_of_any_register() {
+        let d = TestDevice::new("unused");
+        let mut core = MipsCore::new();
+        core.hot.cycles = 0x0000_0000_AABB_CCDD;
+        d.attach_core(&core as *const MipsCore);
+        let bytes: Vec<u8> = (0..4)
+            .map(|i| d.read8(TEST_DEV_BASE + REG_ICOUNT_LO + i).data)
+            .collect();
+        assert_eq!(&bytes, &[0xAA, 0xBB, 0xCC, 0xDD]);
     }
 
     #[test]

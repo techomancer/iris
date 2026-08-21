@@ -145,6 +145,20 @@ fn main() {
 /// the interpreter's idle-park path, so an idle guest spins the host CPU).
 fn print_build_features() {
     const FEATURES: &[(&str, bool)] = &[
+        // CPU model and execution engine first: these change what the guest
+        // sees, not just how fast it sees it, and a benchmark result is
+        // meaningless without them. `r5k` in particular was missing here long
+        // enough that an R5000 build could report "build features: tlbvmap"
+        // and be taken for an R4400 — cpu-tests/run/matrix.sh has a whole
+        // guard against exactly that confusion.
+        ("r5k", cfg!(feature = "r5k")),
+        ("r5ksc", cfg!(feature = "r5ksc")),
+        ("r5ksc_triton", cfg!(feature = "r5ksc_triton")),
+        ("mips4", cfg!(feature = "mips4")),
+        ("jitv2", cfg!(feature = "jitv2")),
+        ("jitv2_opcodefusion", cfg!(feature = "jitv2_opcodefusion")),
+        ("opcodefusion", cfg!(feature = "opcodefusion")),
+        ("idle-pause", cfg!(feature = "idle-pause")),
         ("rex-jit", cfg!(feature = "rex-jit")),
         ("lightning", cfg!(feature = "lightning")),
         ("tlbvmap", cfg!(feature = "tlbvmap")),
