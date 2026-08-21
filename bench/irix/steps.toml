@@ -1,0 +1,175 @@
+# Guest-level benchmark steps — the other half of the suite.
+#
+# bench/ measures the emulated CPU with no operating system in the way. This
+# measures the machine as a *user* meets it: a filesystem on an emulated SCSI
+# disk, IRIX's own buffer cache and syscall path, the tools that shipped in the
+# box, and the X server driving REX3. None of that is visible to a bare-metal
+# kernel, and all of it is what "is the emulator fast enough to use" actually
+# means.
+#
+# Every step is timed by the HOST, around one `iris-ci run`, with the measured
+# no-op round trip subtracted — so nothing here depends on the guest having a
+# usable clock. Keep each step above a second of work or the subtraction is
+# doing more than the measurement.
+#
+# Commands run as `sh -c '<cmd>'` regardless of the login shell, so behaviour
+# does not depend on whether the account uses csh. Consequence: **no single
+# quotes in a command**, and no unescaped newlines.
+#
+# `requires` names a program that must be on PATH; the step is skipped (not
+# failed) when it is absent, because IRIX installs vary enormously and a
+# missing x11perf is not a benchmark result.
+
+# ── storage ─────────────────────────────────────────────────────────────────
+# 16 MB is comfortably larger than the buffer cache will hold onto across a
+# sync, so the write really does reach the emulated disk.
+
+[[step]]
+name = "disk/write"
+unit = "B"
+work = 16777216
+setup = "rm -f /tmp/irisbench.dat"
+cmd = "dd if=/dev/zero of=/tmp/irisbench.dat bs=64k count=256 >/dev/null 2>&1; sync"
+requires = "dd"
+
+[[step]]
+name = "disk/read_cold"
+unit = "B"
+work = 16777216
+# umount/mount would be cleaner but needs the filesystem idle; reading a second
+# 16 MB file first is enough to push the first one out of a small buffer cache.
+setup = "dd if=/dev/zero of=/tmp/irisbench2.dat bs=64k count=256 >/dev/null 2>&1; sync"
+cmd = "dd if=/tmp/irisbench.dat of=/dev/null bs=64k >/dev/null 2>&1"
+requires = "dd"
+
+[[step]]
+name = "disk/read_warm"
+unit = "B"
+work = 16777216
+cmd = "dd if=/tmp/irisbench.dat of=/dev/null bs=64k >/dev/null 2>&1"
+requires = "dd"
+
+[[step]]
+name = "disk/copy"
+unit = "B"
+work = 33554432
+cmd = "cp /tmp/irisbench.dat /tmp/irisbench3.dat; sync; rm -f /tmp/irisbench3.dat"
+requires = "cp"
+
+# ── filesystem metadata ─────────────────────────────────────────────────────
+# Thousands of small inode operations: the path an unpack, a build or a backup
+# actually spends its time on, and nothing like a streaming read.
+
+[[step]]
+name = "fs/create_files"
+unit = "file"
+work = 500
+setup = "rm -rf /tmp/irisbench.d; mkdir /tmp/irisbench.d"
+cmd = "i=0; while [ $i -lt 500 ]; do echo x > /tmp/irisbench.d/f$i; i=`expr $i + 1`; done; sync"
+
+[[step]]
+name = "fs/stat_files"
+unit = "file"
+work = 500
+cmd = "ls -l /tmp/irisbench.d > /dev/null"
+requires = "ls"
+
+[[step]]
+name = "fs/remove_files"
+unit = "file"
+work = 500
+cmd = "rm -f /tmp/irisbench.d/f*; sync"
+
+[[step]]
+name = "fs/walk_usr"
+unit = "file"
+# Not a fixed count — /usr differs per install — so the rate is only comparable
+# between runs on the SAME disk image. iris-bench flags work=0 as unscored.
+work = 0
+cmd = "find /usr/bin -type f -print | wc -l"
+requires = "find"
+
+# ── CPU, through IRIX's own tools ───────────────────────────────────────────
+
+[[step]]
+name = "cpu/checksum"
+unit = "B"
+work = 16777216
+cmd = "sum /tmp/irisbench.dat > /dev/null"
+requires = "sum"
+
+[[step]]
+name = "cpu/compress"
+unit = "B"
+work = 16777216
+cmd = "compress -c /tmp/irisbench.dat > /dev/null"
+requires = "compress"
+
+[[step]]
+name = "cpu/gzip"
+unit = "B"
+work = 16777216
+cmd = "gzip -c -6 /tmp/irisbench.dat > /dev/null"
+requires = "gzip"
+
+[[step]]
+name = "cpu/tar"
+unit = "B"
+work = 0
+cmd = "tar cf /dev/null /usr/bin"
+requires = "tar"
+
+# ── memory and syscalls ─────────────────────────────────────────────────────
+# No disk in the path at all: 256 MB through the read/write syscall pair, which
+# is IRIX's own copy loop plus the emulator's memory model.
+
+[[step]]
+name = "mem/syscall_copy"
+unit = "B"
+work = 268435456
+cmd = "dd if=/dev/zero of=/dev/null bs=1m count=256 >/dev/null 2>&1"
+requires = "dd"
+
+# ── networking ──────────────────────────────────────────────────────────────
+
+[[step]]
+name = "net/loopback_ping"
+unit = "pkt"
+work = 100
+cmd = "ping -c 100 -i 0 127.0.0.1 > /dev/null 2>&1"
+requires = "ping"
+
+# ── graphics ────────────────────────────────────────────────────────────────
+# Only meaningful with X running and DISPLAY set. xwd reads the whole root
+# window back out of the framebuffer, which is a real REX3 read path rather
+# than a synthetic one; x11perf, when the install has it, is the standard.
+
+[[step]]
+name = "gfx/xwd_root"
+unit = "grab"
+work = 20
+cmd = "i=0; while [ $i -lt 20 ]; do xwd -root -silent > /dev/null; i=`expr $i + 1`; done"
+requires = "xwd"
+
+[[step]]
+name = "gfx/x11perf_rects"
+unit = "op"
+work = 0
+cmd = "x11perf -reps 3 -rect500 2>&1 | tail -2"
+requires = "x11perf"
+
+[[step]]
+name = "gfx/x11perf_scroll"
+unit = "op"
+work = 0
+cmd = "x11perf -reps 3 -scroll500 2>&1 | tail -2"
+requires = "x11perf"
+
+# ── cleanup ─────────────────────────────────────────────────────────────────
+
+[[step]]
+name = "cleanup"
+unit = "op"
+work = 0
+skip_timing = true
+cmd = "rm -rf /tmp/irisbench.dat /tmp/irisbench2.dat /tmp/irisbench3.dat /tmp/irisbench.d"

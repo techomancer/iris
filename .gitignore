@@ -17,3 +17,9 @@ screenshot_*.png
 IRIS.app/
 *.log
 .DS_Store
+
+# Benchmark build products: the guest ELF, the native oracle and baseline, the
+# per-cell emulator copies, and the JSON results. golden/golden.h is generated
+# but deliberately checked in — building the suite must need nothing but the
+# MIPS cross toolchain.
+bench/build/

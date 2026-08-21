@@ -1,0 +1,19 @@
+# Bare-metal machine for the benchmark suite.
+#
+# 256 MB in two banks: the suite probes for up to 24 MB of working set above
+# its image, and the DRAM-latency and stream kernels are only measuring DRAM if
+# the buffers genuinely do not fit in any cache.
+#
+# No SCSI, no graphics, no audio. The `scsi` key must be present-but-empty:
+# when it is missing entirely serde falls back to default_scsi(), which
+# attaches scsi1.raw and makes startup fatal when that file is absent — which
+# it always is here.
+
+banks = [128, 128, 0, 0]
+headless = true
+no_audio = true
+
+[machine]
+profile = "indy_ip24"
+
+[scsi]
