@@ -24,6 +24,9 @@ on:
       - 'src/mips_*.rs'
       - 'src/jitv2/**'
       - 'src/testdev.rs'
+      - 'src/bench_report.rs'
+      - 'src/bench_runner.rs'
+      - 'src/benchsuite.rs'
       - 'src/bin/iris_bench.rs'
       - '.github/workflows/bench.yml'
   pull_request:
@@ -34,6 +37,9 @@ on:
       - 'src/mips_*.rs'
       - 'src/jitv2/**'
       - 'src/testdev.rs'
+      - 'src/bench_report.rs'
+      - 'src/bench_runner.rs'
+      - 'src/benchsuite.rs'
       - 'src/bin/iris_bench.rs'
   workflow_dispatch:
 
@@ -67,6 +73,22 @@ jobs:
 
       - name: Build irisbench.elf
         run: make -C bench
+
+      # bench/prebuilt/irisbench.elf is linked into `iris` with include_bytes!
+      # so the benchmark runs on a machine with no cross toolchain — a released
+      # app, a sandboxed one, or anyone who just wants the number. A checked-in
+      # build product that can drift is worse than no build product, and this
+      # one drifts dangerously: accuracy is scored against golden checksums
+      # compiled *into* the image, so a stale image against fresh goldens
+      # reports failures to users that are not real.
+      - name: The checked-in guest binary must match what we just built
+        run: |
+          make -C bench prebuilt
+          if ! git diff --exit-code bench/prebuilt/; then
+            echo "::error::bench/prebuilt/irisbench.elf is stale."
+            echo "::error::Run 'make -C bench prebuilt' and commit the result."
+            exit 1
+          fi
 
       # One binary for every cell below — same as cpu-tests, and for the same
       # reason: a differential comparison needs the guest side held constant.
@@ -136,10 +158,14 @@ jobs:
           fi
           cargo build --release --bin iris-bench
 
+      # --iris is required, not decorative: without it `run` measures this
+      # process, and iris-bench is built with default features rather than the
+      # cell's. The cell is the binary built in the step above, so name it.
       - name: Run the suite
         run: |
           chmod +x bench/build/irisbench.elf
           ./target/release/iris-bench run \
+            --iris ./target/release/iris \
             --label "${{ matrix.cpu }}-${{ matrix.engine }}" \
             --timeout 2400 \
             2>&1 | tee bench/build/run.log
@@ -176,6 +202,15 @@ jobs:
                 f"{mips:.1f} guest MIPS, {run['total_ns']/1e9:.1f} s timed")
           sys.exit(1 if bad or exc else 0)
           PY
+
+      # The path a released application actually takes: no subprocess, no ELF on
+      # disk, the guest image read straight out of the binary. Quick mode so it
+      # costs about half a minute on top of the full run above. Only on the
+      # default cell — the embedded runner is the same code in every cell, and
+      # what it exercises is the plumbing, not the CPU model.
+      - name: The embedded runner must work too
+        if: matrix.cpu == 'r4400' && matrix.engine == 'interp'
+        run: cargo test --release --lib bench_runner -- --ignored --nocapture
 
       - uses: actions/upload-artifact@v4
         if: always()

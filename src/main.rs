@@ -143,40 +143,8 @@ fn main() {
 /// Print which compile-time feature flags this binary was built with. Handy
 /// when diagnosing behaviour that depends on the build (e.g. MIPS `jit` bypasses
 /// the interpreter's idle-park path, so an idle guest spins the host CPU).
+/// The list itself lives in the library — see `iris::build_features::enabled`.
 fn print_build_features() {
-    const FEATURES: &[(&str, bool)] = &[
-        // CPU model and execution engine first: these change what the guest
-        // sees, not just how fast it sees it, and a benchmark result is
-        // meaningless without them. `r5k` in particular was missing here long
-        // enough that an R5000 build could report "build features: tlbvmap"
-        // and be taken for an R4400 — cpu-tests/run/matrix.sh has a whole
-        // guard against exactly that confusion.
-        ("r5k", cfg!(feature = "r5k")),
-        ("r5ksc", cfg!(feature = "r5ksc")),
-        ("r5ksc_triton", cfg!(feature = "r5ksc_triton")),
-        ("mips4", cfg!(feature = "mips4")),
-        ("jitv2", cfg!(feature = "jitv2")),
-        ("jitv2_opcodefusion", cfg!(feature = "jitv2_opcodefusion")),
-        ("opcodefusion", cfg!(feature = "opcodefusion")),
-        ("idle-pause", cfg!(feature = "idle-pause")),
-        ("rex-jit", cfg!(feature = "rex-jit")),
-        ("lightning", cfg!(feature = "lightning")),
-        ("tlbvmap", cfg!(feature = "tlbvmap")),
-        ("tlbstats", cfg!(feature = "tlbstats")),
-        ("tlbcheck", cfg!(feature = "tlbcheck")),
-        ("instr_stats", cfg!(feature = "instr_stats")),
-        ("chd", cfg!(feature = "chd")),
-        ("camera", cfg!(feature = "camera")),
-        ("pcap", cfg!(feature = "pcap")),
-        ("ci_clock", cfg!(feature = "ci_clock")),
-        ("developer", cfg!(feature = "developer")),
-        ("developer_ip7", cfg!(feature = "developer_ip7")),
-        ("debug_cache", cfg!(feature = "debug_cache")),
-    ];
-    let on: Vec<&str> = FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect();
-    eprintln!(
-        "iris: build features: {}",
-        if on.is_empty() { "(none)".to_string() } else { on.join(" ") }
-    );
+    eprintln!("iris: build features: {}", iris::build_features::banner());
 }
 

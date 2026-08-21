@@ -69,6 +69,51 @@ pub mod build_features {
     } else {
         "MIPS R4400"
     };
+
+    /// Every compile-time flag this binary was built with, in a fixed order.
+    ///
+    /// CPU model and execution engine come first: these change what the guest
+    /// sees, not just how fast it sees it, and a benchmark result is meaningless
+    /// without them. `r5k` in particular was missing from this list long enough
+    /// that an R5000 build could report "build features: tlbvmap" and be taken
+    /// for an R4400 — cpu-tests/run/matrix.sh has a whole guard against exactly
+    /// that confusion.
+    ///
+    /// In the library rather than in `main.rs` because a saved benchmark result
+    /// records this list, and the in-process runner has no startup banner to
+    /// read it back out of.
+    pub fn enabled() -> Vec<&'static str> {
+        const FEATURES: &[(&str, bool)] = &[
+            ("r5k", cfg!(feature = "r5k")),
+            ("r5ksc", cfg!(feature = "r5ksc")),
+            ("r5ksc_triton", cfg!(feature = "r5ksc_triton")),
+            ("mips4", cfg!(feature = "mips4")),
+            ("jitv2", cfg!(feature = "jitv2")),
+            ("jitv2_opcodefusion", cfg!(feature = "jitv2_opcodefusion")),
+            ("opcodefusion", cfg!(feature = "opcodefusion")),
+            ("idle-pause", cfg!(feature = "idle-pause")),
+            ("rex-jit", cfg!(feature = "rex-jit")),
+            ("lightning", cfg!(feature = "lightning")),
+            ("tlbvmap", cfg!(feature = "tlbvmap")),
+            ("tlbstats", cfg!(feature = "tlbstats")),
+            ("tlbcheck", cfg!(feature = "tlbcheck")),
+            ("instr_stats", cfg!(feature = "instr_stats")),
+            ("chd", cfg!(feature = "chd")),
+            ("camera", cfg!(feature = "camera")),
+            ("pcap", cfg!(feature = "pcap")),
+            ("ci_clock", cfg!(feature = "ci_clock")),
+            ("developer", cfg!(feature = "developer")),
+            ("developer_ip7", cfg!(feature = "developer_ip7")),
+            ("debug_cache", cfg!(feature = "debug_cache")),
+        ];
+        FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect()
+    }
+
+    /// `enabled()` as the emulator prints it at startup.
+    pub fn banner() -> String {
+        let on = enabled();
+        if on.is_empty() { "(none)".to_string() } else { on.join(" ") }
+    }
 }
 
 pub mod config;
@@ -106,6 +151,9 @@ pub mod net;
 pub mod nfsudp;
 pub mod tftp;
 pub mod testdev;
+pub mod bench_report;
+pub mod benchsuite;
+pub mod bench_runner;
 pub mod xdmcp;
 #[cfg(feature = "pcap")]
 pub mod net_pcap;

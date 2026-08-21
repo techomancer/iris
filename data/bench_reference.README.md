@@ -9,9 +9,8 @@ static file updated by hand when someone measures a machine worth recording.
 ## Adding a row
 
 ```sh
-make -C bench                      # build the guest binary
 cargo build --release --bin iris-bench
-./target/release/iris-bench run --label my-machine
+./target/release/iris-bench run --label my-machine     # NOT --quick
 
 ./target/release/iris-bench reference \
     --id m1-max-interp \
@@ -43,3 +42,10 @@ them cannot be compared with anything. Note the Mac App Store build forces
 `IRIS_NO_JIT=1` (`iris-gui/src/main.rs`) — the sandbox only permits `MAP_JIT`
 pages and Cranelift does not use them — so rows meant for comparison against a
 store build must be `"engine": "interp"`.
+
+## Full runs only
+
+`reference` refuses a result recorded with `--quick`. A shortened run is still
+accurate — every kernel ran and verified — but its rates come from a single
+timed pass at 30% of the usual target time, and this table is what every other
+machine gets compared against. Re-run without `--quick`.

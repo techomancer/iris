@@ -22,6 +22,13 @@
 //!
 //! The guest detects the device by reading `SIGNATURE`; on real hardware the
 //! empty slot times out, so a suite falls back to SCC-only output.
+//!
+//! **Two output modes.** `new()` is the `iris --test-device` process: bytes to
+//! stdout, dumps to a file, `EXIT` ends the process. `new_embedded()` is for a
+//! host that links IRIS as a library and runs a bare-metal image in-process
+//! (`crate::bench_runner`, and the GUI behind it): bytes to a buffer the
+//! embedder drains, no dump file, and `EXIT` calls a hook instead of killing
+//! the host application.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -56,6 +63,12 @@ pub const REG_ICOUNT_HI: u32 = 0x1C;
 /// Capability bitmask, so a guest built against a newer header can still run
 /// on an older emulator: read it, and only use what it advertises.
 pub const REG_CAPS: u32 = 0x20;
+/// Run configuration, read once at guest startup. A bare-metal image loaded
+/// with `--load-elf` has no argv and no environment, so this register is how
+/// the host asks for a shorter run: see `RunConfig`. Zero — the value an
+/// emulator without the capability returns — means "everything, full length",
+/// so a guest that reads it unconditionally still behaves.
+pub const REG_RUN_CONFIG: u32 = 0x24;
 
 /// Registers decode within this many bytes and the window repeats across the
 /// whole 64 KB the device claims. Was 16 before the clock/icount registers.
@@ -66,15 +79,84 @@ pub const SIGNATURE: u32 = 0x4952_4953;
 
 /// `REG_CAPS` bit 0: `REG_HOST_NS_*` and `REG_ICOUNT_*` are present.
 pub const CAP_TIMEBASE: u32 = 1 << 0;
+/// `REG_CAPS` bit 1: `REG_RUN_CONFIG` is present and meaningful.
+pub const CAP_RUN_CONFIG: u32 = 1 << 1;
+
+/// What `REG_RUN_CONFIG` carries, packed into one word:
+///
+/// ```text
+///   31            16 15   12 11             0
+///   +---------------+-------+---------------+
+///   |     groups    |repeats|    time_pct   |
+///   +---------------+-------+---------------+
+/// ```
+///
+/// **Every field means "unrestricted" when zero**, so the word reading back as
+/// 0 — on an emulator that predates the register, or on a run that never set
+/// it — is exactly the behaviour the suite had before it existed. That is the
+/// whole reason for the encoding: a guest can read it unconditionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunConfig {
+    /// The suite's own group mask — `BG_INT`, `BG_FPU`, … from
+    /// `bench/harness/benchlib.h`, which the guest ANDs against each kernel's
+    /// declared group. 0 selects all of them.
+    pub groups: u16,
+    /// Per-kernel target time as a percentage of the harness default. 0 means
+    /// unchanged; the guest clamps against its own floor. Capped at 12 bits.
+    pub time_pct: u16,
+    /// Timed passes per kernel. 0 means the harness default (best of two —
+    /// the slow sample is host scheduling noise, since the guest does a fixed
+    /// amount of work either way). Capped at 4 bits.
+    pub repeats: u8,
+}
+
+impl RunConfig {
+    pub const ALL: Self = Self { groups: 0, time_pct: 0, repeats: 0 };
+
+    pub const fn to_word(self) -> u32 {
+        ((self.groups as u32) << 16)
+            | (((self.repeats as u32) & 0xF) << 12)
+            | (self.time_pct as u32 & 0xFFF)
+    }
+
+    pub const fn from_word(w: u32) -> Self {
+        Self {
+            groups: (w >> 16) as u16,
+            repeats: ((w >> 12) & 0xF) as u8,
+            time_pct: (w & 0xFFF) as u16,
+        }
+    }
+}
 
 /// Where `REG_DUMP` writes go when no path is configured.
 pub const DEFAULT_DUMP_PATH: &str = "iris-testdev-dump.json";
 
+/// Called on `REG_EXIT` in embedded mode, on the CPU thread, from inside the
+/// guest's store. It must not block on anything that thread owns — signal and
+/// return; see `TestDevice::exit`.
+pub type ExitHook = Box<dyn Fn(u32) + Send + Sync>;
+
+/// Where `PUTC` bytes go.
+enum Console {
+    /// The process's own stdout, flushed per line.
+    Stdout,
+    /// A buffer the embedder drains. Unbounded: a bare-metal image prints
+    /// kilobytes, and truncating the guest's own report to save memory would
+    /// lose the part the host is there to parse.
+    Buffer(std::sync::Arc<Mutex<Vec<u8>>>),
+}
+
 pub struct TestDevice {
-    /// Dump file path. Never defaults to a bare CWD-relative name in a
-    /// sandboxed app, where the CWD is `/` and unwritable — the caller passes
-    /// an absolute path there.
-    dump_path: std::path::PathBuf,
+    /// Dump file path, or `None` in embedded mode, where `DUMP` is a counted
+    /// no-op — a sandboxed host has nowhere to put the file and the embedded
+    /// users (benchmarks) never ask for one. Never defaults to a bare
+    /// CWD-relative name in a sandboxed app, where the CWD is `/` and
+    /// unwritable — the caller passes an absolute path there.
+    dump_path: Option<std::path::PathBuf>,
+    out: Console,
+    on_exit: Option<ExitHook>,
+    /// Published to the guest at `REG_RUN_CONFIG`.
+    run_config: AtomicU32,
     /// Set by `attach_core`. Only read from the CPU thread, which is the thread
     /// that issues the store that lands here, so there is no race — the same
     /// process-lifetime argument as `MipsCpu`'s `cycles_ptr`/`interrupts_ptr`.
@@ -100,8 +182,30 @@ unsafe impl Sync for CorePtr {}
 
 impl TestDevice {
     pub fn new(dump_path: impl Into<std::path::PathBuf>) -> Self {
+        Self::build(Some(dump_path.into()), Console::Stdout, None, RunConfig::ALL)
+    }
+
+    /// In-process mode: guest console into `sink`, `EXIT` into `on_exit`, no
+    /// dump file, and `cfg` published at `REG_RUN_CONFIG`.
+    pub fn new_embedded(
+        sink: std::sync::Arc<Mutex<Vec<u8>>>,
+        on_exit: ExitHook,
+        cfg: RunConfig,
+    ) -> Self {
+        Self::build(None, Console::Buffer(sink), Some(on_exit), cfg)
+    }
+
+    fn build(
+        dump_path: Option<std::path::PathBuf>,
+        out: Console,
+        on_exit: Option<ExitHook>,
+        cfg: RunConfig,
+    ) -> Self {
         Self {
-            dump_path: dump_path.into(),
+            dump_path,
+            out,
+            on_exit,
+            run_config: AtomicU32::new(cfg.to_word()),
             core: Mutex::new(None),
             dumps: AtomicU32::new(0),
             last_tag: AtomicU64::new(0),
@@ -118,8 +222,8 @@ impl TestDevice {
         *self.core.lock() = Some(CorePtr(core));
     }
 
-    pub fn dump_path(&self) -> &std::path::Path {
-        &self.dump_path
+    pub fn dump_path(&self) -> Option<&std::path::Path> {
+        self.dump_path.as_deref()
     }
 
     pub fn dumps_written(&self) -> u32 {
@@ -127,11 +231,18 @@ impl TestDevice {
     }
 
     fn putc(&self, byte: u8) {
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(&[byte]);
-        // Flush per line so a hung test still shows everything it printed.
-        if byte == b'\n' {
-            let _ = out.flush();
+        match &self.out {
+            Console::Stdout => {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(&[byte]);
+                // Flush per line so a hung test still shows everything it printed.
+                if byte == b'\n' {
+                    let _ = out.flush();
+                }
+            }
+            // No per-line flush to do: the embedder reads the buffer whenever
+            // it likes, and a partial line is visible the moment it lands.
+            Console::Buffer(buf) => buf.lock().push(byte),
         }
         self.chars.fetch_add(1, Ordering::Relaxed);
     }
@@ -140,6 +251,12 @@ impl TestDevice {
     /// a test can dump more than once; the file is overwritten each time.
     fn dump(&self, tag: u32) {
         self.last_tag.store(tag as u64, Ordering::Relaxed);
+        // Embedded: nothing to write to. Still counted, so `testdev` and the
+        // save state report what the guest asked for.
+        let Some(path) = self.dump_path.clone() else {
+            self.dumps.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let guard = self.core.lock();
         let Some(CorePtr(ptr)) = guard.as_ref() else {
             eprintln!("test device: DUMP with no CPU attached");
@@ -150,18 +267,31 @@ impl TestDevice {
         let json = dump_json(core, tag);
         drop(guard);
 
-        match std::fs::write(&self.dump_path, json) {
+        match std::fs::write(&path, json) {
             Ok(()) => {
                 self.dumps.fetch_add(1, Ordering::Relaxed);
-                eprintln!("test device: dump {} → {}", tag, self.dump_path.display());
+                eprintln!("test device: dump {} → {}", tag, path.display());
             }
-            Err(e) => eprintln!("test device: dump {} to {}: {}", tag, self.dump_path.display(), e),
+            Err(e) => eprintln!("test device: dump {} to {}: {}", tag, path.display(), e),
         }
     }
 
-    /// Terminate the emulator with the guest's exit code. Stdout is flushed
-    /// first so buffered `PUTC` output is never lost.
-    fn exit(&self, code: u32) -> ! {
+    /// The guest is done. Standalone, that means ending the process with its
+    /// exit code; embedded, it means telling the host and *returning*.
+    ///
+    /// Returning is safe, and is the reason this needs no parking or signalling
+    /// on the CPU thread: every guest that has a test device reaches this
+    /// through `testdev_exit()`, which spins forever afterwards
+    /// (`cpu-tests/harness/console.c`) precisely because a bare-metal image has
+    /// nowhere to return to. So the store completes, the CPU thread carries on
+    /// looping in guest code that does nothing, and the host stops the machine
+    /// from its own thread whenever it gets to it. A hook that blocked here
+    /// instead would deadlock `Machine::stop`, which joins this thread.
+    fn exit(&self, code: u32) {
+        if let Some(hook) = &self.on_exit {
+            hook(code);
+            return;
+        }
         let _ = std::io::stdout().flush();
         eprintln!("test device: guest requested exit({})", code as u8);
         std::process::exit(code as u8 as i32)
@@ -258,7 +388,8 @@ impl TestDevice {
             REG_HOST_NS_HI => (self.host_ns_latch.load(Ordering::Relaxed) >> 32) as u32,
             REG_ICOUNT_LO => self.latch_icount() as u32,
             REG_ICOUNT_HI => (self.icount_latch.load(Ordering::Relaxed) >> 32) as u32,
-            REG_CAPS => CAP_TIMEBASE,
+            REG_CAPS => CAP_TIMEBASE | CAP_RUN_CONFIG,
+            REG_RUN_CONFIG => self.run_config.load(Ordering::Relaxed),
             _ => 0,
         }
     }
@@ -317,7 +448,10 @@ impl Device for TestDevice {
             return Err("Command not found".to_string());
         }
         writeln!(writer, "test device @ {:#010x}  signature {:#010x}", TEST_DEV_BASE, SIGNATURE).unwrap();
-        writeln!(writer, "  dump file : {}", self.dump_path.display()).unwrap();
+        match &self.dump_path {
+            Some(p) => writeln!(writer, "  dump file : {}", p.display()).unwrap(),
+            None => writeln!(writer, "  dump file : (embedded — DUMP is a no-op)").unwrap(),
+        }
         writeln!(writer, "  dumps     : {}  (last tag {})",
                  self.dumps.load(Ordering::Relaxed), self.last_tag.load(Ordering::Relaxed)).unwrap();
         writeln!(writer, "  chars out : {}", self.chars.load(Ordering::Relaxed)).unwrap();
@@ -372,6 +506,66 @@ mod tests {
     fn caps_advertises_the_timebase() {
         let d = TestDevice::new("unused");
         assert_eq!(d.read32(TEST_DEV_BASE + REG_CAPS).data & CAP_TIMEBASE, CAP_TIMEBASE);
+    }
+
+    #[test]
+    fn run_config_round_trips_and_defaults_to_unrestricted() {
+        // The property the guest depends on: a zero word is "run everything,
+        // full length", so reading the register unconditionally is safe.
+        assert_eq!(RunConfig::from_word(0), RunConfig::ALL);
+        assert_eq!(RunConfig::ALL.to_word(), 0);
+
+        for c in [
+            RunConfig { groups: 0xBEEF, time_pct: 30, repeats: 1 },
+            RunConfig { groups: 1, time_pct: 4095, repeats: 15 },
+            RunConfig { groups: 0, time_pct: 100, repeats: 2 },
+        ] {
+            assert_eq!(RunConfig::from_word(c.to_word()), c, "{:?} did not round-trip", c);
+        }
+
+        // Fields must not bleed into each other.
+        let c = RunConfig { groups: 0xFFFF, time_pct: 0, repeats: 0 };
+        assert_eq!(c.to_word(), 0xFFFF_0000);
+    }
+
+    #[test]
+    fn the_run_config_register_reads_back_what_it_was_built_with() {
+        let want = RunConfig { groups: 0b101, time_pct: 30, repeats: 1 };
+        let d = TestDevice::new_embedded(
+            std::sync::Arc::new(Mutex::new(Vec::new())),
+            Box::new(|_| {}),
+            want,
+        );
+        assert_eq!(d.read32(TEST_DEV_BASE + REG_CAPS).data & CAP_RUN_CONFIG, CAP_RUN_CONFIG);
+        assert_eq!(RunConfig::from_word(d.read32(TEST_DEV_BASE + REG_RUN_CONFIG).data), want);
+    }
+
+    #[test]
+    fn embedded_mode_captures_output_and_reports_exit_without_killing_the_process() {
+        let sink = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::new(AtomicU32::new(u32::MAX));
+        let d = {
+            let seen = seen.clone();
+            TestDevice::new_embedded(
+                sink.clone(),
+                Box::new(move |c| seen.store(c, Ordering::Relaxed)),
+                RunConfig::ALL,
+            )
+        };
+
+        for b in b"hi\n" { d.write32(TEST_DEV_BASE + REG_PUTC, *b as u32); }
+        assert_eq!(&*sink.lock(), b"hi\n");
+
+        // DUMP has nowhere to go and must not try: still counted, no file, and
+        // above all no panic on a device with no dump path.
+        d.write32(TEST_DEV_BASE + REG_DUMP, 3);
+        assert_eq!(d.dumps_written(), 1);
+        assert!(d.dump_path().is_none());
+
+        // The point of the whole exercise: EXIT returns instead of ending the
+        // host process, so this test can observe it at all.
+        d.write32(TEST_DEV_BASE + REG_EXIT, 7);
+        assert_eq!(seen.load(Ordering::Relaxed), 7);
     }
 
     #[test]
