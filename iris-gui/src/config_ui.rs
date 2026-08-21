@@ -93,6 +93,7 @@ pub enum Tab {
     VideoIn,
     Debug,
     Ci,
+    Bench,
 }
 
 impl Tab {
@@ -111,6 +112,10 @@ impl Tab {
         }
         if !cfg!(feature = "appstore") {
             tabs.push(Tab::Ci);
+            // Benchmarking spawns cargo and a second emulator; that is a
+            // developer workflow, and a sandboxed App Store build can do
+            // neither. Same reasoning as the CI tab it sits next to.
+            tabs.push(Tab::Bench);
         }
         tabs
     }
@@ -124,6 +129,7 @@ impl Tab {
             Tab::VideoIn => "Video-In",
             Tab::Debug   => "Debug",
             Tab::Ci      => "CI / Automation",
+            Tab::Bench   => "Benchmark",
         }
     }
 }
@@ -178,6 +184,7 @@ pub fn show_tab(
     disk_folders: &[String],
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
     mem_ctx: MemoryUiContext,
+    bench: &mut crate::bench_ui::BenchState,
 ) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
         Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
@@ -190,7 +197,8 @@ pub fn show_tab(
         Tab::Display => { show_display(ui, cfg, mem_ctx.running); TabOutcome::default() }
         Tab::VideoIn => TabOutcome { action: show_vino(ui, cfg), ..Default::default() },
         Tab::Debug   => TabOutcome { action: show_debug(ui, cfg), ..Default::default() },
-        Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() }
+        Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() },
+        Tab::Bench   => { crate::bench_ui::show(ui, bench); TabOutcome::default() }
     }).inner
 }
 
