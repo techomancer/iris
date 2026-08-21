@@ -586,11 +586,9 @@ fn save_report(run: &Run) {
     // An explicit save panel, so the only place this ever lands outside the
     // app's own container is one the user picked. Nothing is uploaded.
     let name = format!("iris-benchmark-{}.json", run.cell.replace(['/', ' '], "-"));
-    let Some(path) = rfd::FileDialog::new()
-        .set_title("Save benchmark report")
-        .set_file_name(&name)
-        .add_filter("JSON", &["json"])
-        .save_file()
+    let Some(path) = crate::filedialog::dialog_with(
+        "Save benchmark report", &name, crate::filedialog::Anchor::Data,
+        &[("JSON", &["json"])]).save_file()
     else {
         return;
     };

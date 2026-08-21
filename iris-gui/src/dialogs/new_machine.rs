@@ -114,9 +114,10 @@ impl NewMachineDialog {
                         ui.add_enabled(!self.use_embedded_prom,
                             TextEdit::singleline(&mut self.prom_path).desired_width(260.0));
                         if ui.add_enabled(!self.use_embedded_prom, egui::Button::new("📁")).clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("PROM image", &["bin"])
-                                .pick_file()
+                            if let Some(p) = crate::filedialog::dialog_with(
+                                "PROM image", &self.prom_path,
+                                crate::filedialog::Anchor::Data,
+                                &[("PROM image", &["bin"])]).pick_file()
                             {
                                 self.prom_path = p.to_string_lossy().into_owned();
                             }
@@ -131,8 +132,10 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.nvram_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("NVRAM", &["bin"]).save_file()
+                            if let Some(p) = crate::filedialog::dialog_with(
+                                "NVRAM file", &self.nvram_path,
+                                crate::filedialog::Anchor::Data,
+                                &[("NVRAM", &["bin"])]).save_file()
                             {
                                 self.nvram_path = p.to_string_lossy().into_owned();
                             }
@@ -179,9 +182,10 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.scsi1_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("Disk image", &["raw", "img", "chd"])
-                                .pick_file()
+                            if let Some(p) = crate::filedialog::dialog_with(
+                                "Hard disk image", &self.scsi1_path,
+                                crate::filedialog::Anchor::Disks,
+                                &[("Disk image", &["raw", "img", "chd"])]).pick_file()
                             {
                                 self.scsi1_path = p.to_string_lossy().into_owned();
                                 self.create_blank_scsi1 = false;
@@ -198,9 +202,10 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.cdrom4_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("ISO", &["iso"])
-                                .pick_file()
+                            if let Some(p) = crate::filedialog::dialog_with(
+                                "CD-ROM image", &self.cdrom4_path,
+                                crate::filedialog::Anchor::Disks,
+                                &[("ISO", &["iso"]), ("CD image", &["iso", "chd"])]).pick_file()
                             {
                                 self.cdrom4_path = p.to_string_lossy().into_owned();
                                 self.attach_cdrom = true;

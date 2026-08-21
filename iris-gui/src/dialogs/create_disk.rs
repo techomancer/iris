@@ -49,15 +49,13 @@ impl CreateDiskDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.filename).desired_width(220.0));
                         if ui.button("📁").clicked() {
-                            let cur = std::path::Path::new(&self.filename);
-                            let mut dlg = rfd::FileDialog::new().add_filter("Disk image", &["raw", "img"]);
-                            if let Some(dir) = cur.parent().filter(|d| !d.as_os_str().is_empty()) {
-                                let _ = std::fs::create_dir_all(dir);
-                                dlg = dlg.set_directory(dir);
-                            }
-                            if let Some(name) = cur.file_name().and_then(|s| s.to_str()) {
-                                dlg = dlg.set_file_name(name);
-                            }
+                            // Opens where this image is destined for, walking up
+                            // to the nearest folder that exists rather than
+                            // creating one the user has not asked for yet.
+                            let dlg = crate::filedialog::dialog_with(
+                                "New disk image", &self.filename,
+                                crate::filedialog::Anchor::Disks,
+                                &[("Disk image", &["raw", "img"])]);
                             if let Some(p) = dlg.save_file() {
                                 self.filename = p.to_string_lossy().into_owned();
                             }
