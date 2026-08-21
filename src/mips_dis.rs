@@ -437,6 +437,7 @@ fn disasm_cop0(instr: u32) -> String {
             FUNCT_TLBWR => "tlbwr".to_string(),
             FUNCT_TLBP => "tlbp".to_string(),
             FUNCT_ERET => "eret".to_string(),
+            FUNCT_WAIT => "wait".to_string(),
             _ => format!("unknown_cop0_tlb 0x{:08x}", instr),
         },
         _ => format!("unknown_cop0 0x{:08x}", instr),
