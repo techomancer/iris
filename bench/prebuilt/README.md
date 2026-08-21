@@ -9,7 +9,7 @@ copy of a known-good one.
 A checked-in build product that can drift is worse than no build product, and
 this one drifts dangerously: accuracy is scored against golden checksums
 compiled *into* the image, so a stale image against fresh goldens reports
-failures that are not real. `.github/workflows/bench.yml` rebuilds it and fails
+failures that are not real. `.github/workflows/suites.yml` rebuilds it and fails
 on any difference.
 
 Refresh it with `make -C bench prebuilt` after changing anything the guest is

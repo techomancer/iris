@@ -174,7 +174,7 @@ the binary it is.
 
 **Drift is the danger, and CI is the answer.** Accuracy is scored against golden
 checksums compiled *into* the image, so a stale image against fresh goldens
-reports failures to users that are not real. `bench.yml` rebuilds it and fails
+reports failures to users that are not real. `suites.yml` rebuilds it and fails
 on any difference; `make -C bench prebuilt` refreshes it.
 
 ### Quick mode (`TESTDEV_RUN_CONFIG`)
