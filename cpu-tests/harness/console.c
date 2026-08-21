@@ -8,7 +8,7 @@
  *     empty GIO slot times out), which is why we probe rather than assume.
  */
 
-#include "testlib.h"
+#include "console.h"
 
 #define RD8(a)      (*(volatile u8  *)(unsigned long)(a))
 #define WR8(a, v)   (*(volatile u8  *)(unsigned long)(a) = (u8)(v))
