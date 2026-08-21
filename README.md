@@ -416,6 +416,48 @@ terminal apps. Use `telnet 127.0.0.1 2323` (with port forwarding configured)
 for a clean terminal instead.
 
 
+## Testing and benchmarking
+
+Two bare-metal MIPS suites run on the emulated CPU with no operating system in
+the way. They answer different questions and neither replaces the other.
+
+**`cpu-tests/`** — is this instruction correct? ~240 self-checking tests over
+ALU, FPU, TLB, caches, exceptions and the MIPS IV additions, one instruction at
+a time with clean state.
+
+```sh
+sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu   # or: make -C cpu-tests toolchain-local
+make -C cpu-tests && make -C cpu-tests run
+cpu-tests/run/matrix.sh                 # R4400/R5000 x interp/jitv2
+```
+
+**`bench/`** — how fast is this build, and is it still right after ten million
+of them? 46 kernels covering integer, FPU, the cache hierarchy, image and video
+editing inner loops, compression, and the emulator-only paths (TLB refill,
+exception round trip, cache maintenance, uncached I/O). Every kernel checksums
+its result against a golden value computed by building the same C natively, so
+each run reports an accuracy percentage next to its throughput — and per-kernel
+**guest instructions per host second**, which is directly comparable between the
+interpreter and jitv2.
+
+```sh
+make -C bench && make -C bench hostbench
+cargo build --release --bin iris-bench
+./target/release/iris-bench matrix      # builds and runs every CPU x engine cell
+./target/release/iris-bench host        # the same kernels, natively, for the ratio
+```
+
+Includes Dhrystone 2.1 (DMIPS) and LINPACK 100x100 (MFLOPS), so an emulated
+Indy can be put next to published figures for a real one, plus a Whetstone mix
+(reported in passes/s — see bench/README.md for why not MWIPS). See
+[bench/README.md](bench/README.md) — and
+[rules/testing/benchmark-suite-gotchas.md](rules/testing/benchmark-suite-gotchas.md)
+before adding a kernel.
+
+`bench/irix/` is the other half: real workloads under a booted IRIX (filesystem,
+buffer cache, IRIX's own tools, X on REX3), driven over `iris-ci`.
+
+
 ## Rules
 
 The `rules/` directory contains hard-won lessons from debugging the JIT and
@@ -424,7 +466,7 @@ on the codebase.
 
 - `rules/jitv2/` - jitv2 region compiler design, codegen gotchas, fusion hazards
 - `rules/irix/` - networking config, keyboard quirks, csh + scratch raw-device gotchas
-- `rules/testing/` - disk image handling, avoiding filesystem corruption
+- `rules/testing/` - disk image handling, avoiding filesystem corruption, benchmark-kernel gotchas
 - `rules/snapshot/` - snapshot binary format, scratch-volume conventions, round-trip tests, CI overlay paths, **iris-ci as the canonical CI interface**
 
 If you're about to touch the jitv2 compiler, read `rules/jitv2/jit-v2-design.md`
