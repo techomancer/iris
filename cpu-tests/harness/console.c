@@ -20,6 +20,9 @@ int have_testdev = 0;
 /* Bounded so a wedged SCC can't hang the whole suite. */
 #define TX_SPIN_LIMIT 100000
 
+/* Latched once the SCC has proved it is not transmitting — see scc_putc. */
+static int scc_dead = 0;
+
 void con_init(void)
 {
     /* The PROM leaves the console configured. Nothing to do; kept as a hook
@@ -27,11 +30,34 @@ void con_init(void)
      * /12/13/14/3/5 itself. */
 }
 
+/*
+ * Write one byte to the serial console, giving up on the port for good once it
+ * has demonstrated that it is not going to transmit.
+ *
+ * The transmitter is enabled by WR5, which the PROM programs — so booting an
+ * image with `--load-elf` (no PROM, straight into RAM) leaves it disabled. The
+ * SCC's four-byte holding queue then fills, TX_BUFFER_EMPTY goes low and never
+ * comes back, and every subsequent character burns the whole spin limit. That
+ * is not a small cost: it was about 78 seconds of a 117-second bare-metal
+ * benchmark run, spent waiting on a port with nothing on the other end.
+ *
+ * Latching only when `have_testdev` is what keeps this from silently dropping
+ * output: with a test device the host is reading that instead and serial is
+ * redundant, and without one serial is the only sink there is, so a slow port
+ * still beats no output. A PROM-booted run has a working SCC, never trips the
+ * limit, and is unaffected either way — which matters, because run-prom.sh
+ * decides pass or fail by grepping the serial log.
+ */
 static void scc_putc(int c)
 {
     int spins = 0;
+
+    if (scc_dead) return;
     while (!(RD8(SCC_CHB_CMD) & SCC_RR0_TX_EMPTY)) {
-        if (++spins > TX_SPIN_LIMIT) return;
+        if (++spins > TX_SPIN_LIMIT) {
+            if (have_testdev) scc_dead = 1;
+            return;
+        }
     }
     WR8(SCC_CHB_DATA, (u8)c);
 }
@@ -66,6 +92,9 @@ void testdev_dump(u32 tag)
 void con_flush(void)
 {
     int spins = 0;
+
+    /* Nothing was ever handed to the SCC, so there is nothing in flight. */
+    if (scc_dead) return;
 
     while (!(RD8(SCC_CHB_CMD) & SCC_RR0_TX_EMPTY)) {
         if (++spins > TX_SPIN_LIMIT) break;
