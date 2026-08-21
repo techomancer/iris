@@ -21,7 +21,14 @@ make -C bench hostbench       # build the host baseline
 make -C bench bench           # run once against ../target/release/iris
 make -C bench matrix          # build and run every CPU x engine cell
 make -C bench report          # turn the saved results into markdown
+make -C bench prebuilt        # refresh the guest binary that `iris` links in
 ```
+
+**You do not need any of this to run the suite.** A known-good guest binary is
+checked in at `prebuilt/` and linked into `iris` with `include_bytes!`, so
+`iris-bench run` and the GUI's Benchmark tab work on a machine with no MIPS
+cross toolchain at all. The Makefile is for changing the suite, not for using
+it — see [The checked-in guest binary](#the-checked-in-guest-binary).
 
 ---
 
@@ -206,15 +213,106 @@ has a real printf.
 
 ---
 
+## What the machine says it is
+
+Before it measures anything, the suite reads the machine out of the machine and
+prints it:
+
+```
+ IRIS benchmark suite
+   CPU        R4400 rev 4.0   (PRId 0x00000440)
+   FPU        R4010 rev 0.0   (FIR 0x00000500)
+   L1 cache   16 KB I (16 B lines) / 16 KB D (16 B lines)
+   L2 cache   present, 128 B lines, size not reported by the architecture
+   Memory     256 MB   bank0 128 MB @ 0x08000000 bank1 128 MB @ 0x10000000
+   Board      SYSID 0x00000013   Config 0x00c08483
+   Devices    test device yes, host time base yes
+   Work area  0x88300000 .. 0x89b00000  (24 MB)
+   CP0 Count  33.000 MHz (measured against the host clock)
+```
+
+Every line comes from the hardware, not from what the runner was told: CP0
+Config for the CPU identity and the cache geometry, the memory controller's
+MEMCFG registers for the bank layout. That works with no PROM and no POST,
+because `--load-elf` programs MEMCFG exactly as POST would before the image
+starts — so this is as true of a bare-metal run as of a PROM-booted one.
+
+It is provenance, not decoration. The `mem/` kernels are a direct readout of
+the cache hierarchy, so two results whose L1 sizes differ are not measuring the
+same thing however close their rates look — and until this existed, nothing in
+a saved result said so. The same fields go into the machine block as `#cache`
+and `#memory`, so every stored result carries them.
+
+**The L2 size is reported as unknown, deliberately.** Only a Triton R5000
+encodes it (Config TR_SS), there is no runtime way to tell a Triton from a plain
+R5000, and on an R4400 those same bits mean something else entirely — so
+decoding them would invent a 512 KB cache out of two zero bits. The PROM knows
+the real size because it reads the EEPROM; the architecture does not expose it.
+
+---
+
+## The checked-in guest binary
+
+`prebuilt/irisbench.elf` is a copy of a known-good `build/irisbench.elf`,
+checked in and linked into `iris` with `include_bytes!` (`src/benchsuite.rs`).
+It is what makes the benchmark a product feature rather than a developer tool:
+a released application has no cross toolchain, and a sandboxed one has no
+writable path to unpack an image to either.
+
+**Refresh it with `make -C bench prebuilt` whenever you change anything the
+guest is built from** — the kernels, `harness/`, `cpu-tests/harness/`, the link
+script, the compiler flags — and commit it alongside the source change.
+`.github/workflows/bench.yml` rebuilds it and fails on any difference, because
+this is a build product that drifts dangerously: accuracy is scored against
+golden checksums compiled *into* the image, so a stale image against fresh
+goldens reports failures to users that are not real.
+
+---
+
+## Asking for a shorter run
+
+A bare-metal image loaded with `--load-elf` has no argv and no environment, so
+the host leaves its request in a test-device register the guest reads at
+startup (`TESTDEV_RUN_CONFIG`, `src/testdev.rs`):
+
+```
+  31            16 15   12 11             0
+  +---------------+-------+---------------+
+  |     groups    |repeats|    time_pct   |
+  +---------------+-------+---------------+
+```
+
+Every field means "unrestricted" when zero — which is what an emulator
+predating the register returns — so the guest reads it unconditionally and an
+older emulator simply runs everything. `iris-bench run --quick` sets
+`time_pct=30, repeats=1`: about half the wall clock, the same numbers to within
+a couple of percent.
+
+**Quick mode never runs fewer kernels.** Accuracy is the number this suite
+exists to report, and a short run that quietly checked less would report the
+same 100% over less ground. It gives up measurement precision and nothing else.
+The effective configuration is echoed back on the `#run` line and stored on
+every result, so a shortened run cannot be mistaken for a full one —
+`iris-bench reference` refuses to put one in the reference table.
+
+---
+
 ## iris-bench
 
 ```
-iris-bench run     [--iris PATH] [--elf PATH] [--label NAME]
+iris-bench run     [--quick] [--label NAME] [--iris PATH [--elf PATH]]
 iris-bench host    # measure this machine with the same kernels
 iris-bench matrix  [--cells r4400-interp,r5000-jitv2] [--force-build]
 iris-bench report  [--baseline CELL] [--format md|json|text]
+iris-bench reference --id ID [--into data/bench_reference.json]
 iris-bench cells   # what matrix knows how to build
 ```
+
+`run` is **in-process by default**: `iris-bench` is itself an emulator and the
+guest image is linked into it, so there is no subprocess, no ELF on disk and
+nothing platform-specific. Pass `--iris` to measure a *different* emulator
+binary in a subprocess instead — which is what `matrix` does, and what CI does
+for each cell, because a cell's features live in its binary.
 
 `matrix` builds a **separate emulator per cell**, because the CPU model and the
 JIT are compile-time cargo features and there is no runtime switch to flip:
@@ -294,9 +392,34 @@ reference number that is not an emulator's opinion of itself. There is no test
 device on real hardware, so results come back over serial with CP0 Count as the
 time base; the header says so.
 
-**Filtering.** There is no runtime selector — a bare-metal binary loaded with
-`--load-elf` has nowhere to take arguments from. Comment out a group in
-`harness/groups.c` and rebuild, or filter in the report.
+**On which SGI machines?** The suite identifies any MIPS CPU by name from PRId
+— R4000, R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, RM5200,
+RM7000 — and an implementation it has no name for prints as `MIPS-imp-0xNN`
+rather than refusing. That is safe to do because **nothing here is
+CPU-specific**: the kernels are ordinary compiled MIPS III, and `golden.h` is
+one flat table computed natively rather than a per-CPU one, so an unfamiliar
+CPU is a labelling problem and not a correctness one. (cpu-tests is the
+opposite, and keeps its two-value `CPU_*` for exactly that reason.)
+
+What is *not* portable off an Indy or Indigo2 is the machine around the CPU:
+the image links and self-relocates to a fixed address chosen because IP22/IP24
+RAM begins at `0x08000000`, the console is the SCC via IOC2 at `0x1FBD9800`,
+and the memory inventory comes from the MC at `0x1FA00000`. The load address is
+what stops it first, not the console.
+
+So: **any CPU an Indy or Indigo2 will take, on real hardware or emulated.**
+Another SGI family needs a small platform layer, and the sane way to write one
+is against ARCS firmware rather than per-machine drivers — that is one path for
+the whole family, and it can be developed under emulation because IRIS runs a
+real PROM.
+
+Full detail, including which parts of that were tested and which are reasoning:
+[`rules/testing/bare-metal-harness-platform-assumptions.md`](../rules/testing/bare-metal-harness-platform-assumptions.md).
+None of it touches the measurement, which is already platform-independent.
+
+**Filtering.** `--quick` aside, there is no runtime kernel selector beyond the
+group mask in `TESTDEV_RUN_CONFIG`, and that needs a host to set it. Comment
+out a group in `harness/groups.c` and rebuild, or filter in the report.
 
 ---
 
@@ -309,6 +432,7 @@ harness/     benchlib (time base, work area, checksums), main (the runner),
 kernels/     integer fpu memory imaging codec sys
 gen/         golden.c (the oracle) + hostplat.c (the host platform layer)
 golden/      golden.h — generated, checked in
+prebuilt/    irisbench.elf — generated, checked in, linked into `iris`
 run/         bare.toml, run-local.sh, run-prom.sh
 ```
 

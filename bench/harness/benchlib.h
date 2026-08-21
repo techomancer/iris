@@ -132,6 +132,72 @@ void *memmove(void *dst, const void *src, unsigned long n);
 int   memcmp(const void *a, const void *b, unsigned long n);
 #endif
 
+/* ── machine inventory ────────────────────────────────────────────────────── */
+
+/*
+ * What the machine actually is, at the moment the suite runs.
+ *
+ * Every field comes from the hardware itself — CP0 Config for the cache
+ * geometry, the memory controller's MEMCFG registers for the bank layout — so
+ * this is as true under `--load-elf` (no PROM, no POST) as it is on a
+ * PROM-booted or real machine. Nothing here is passed in by the host or taken
+ * from a build-time constant, which is the point: a result that recorded what
+ * the *runner* believed rather than what the guest found would be worth
+ * nothing when the two disagreed, and the disagreements are the interesting
+ * cases.
+ *
+ * It matters for comparison, not just for display. The `mem/` kernels are a
+ * direct readout of the cache hierarchy, so two results from machines with
+ * different L1 sizes are not measuring the same thing — and until this existed,
+ * nothing in a saved result said so.
+ */
+struct hwinv {
+    u32 prid, fir, config, sysid;
+    u32 cpu_rev_major, cpu_rev_minor;      /* PRId 7:4 / 3:0 */
+    u32 fpu_imp, fpu_rev_major, fpu_rev_minor;
+    u32 l1i_bytes, l1i_line;
+    u32 l1d_bytes, l1d_line;
+    int l2_present;
+    u32 l2_line;
+    /* 0 when the architecture does not report it — true on the R4400 and on a
+     * non-Triton R5000, where the PROM reads the size out of the EEPROM
+     * instead. Reported as unknown rather than guessed. */
+    u32 l2_bytes;
+    u32 ram_mb;                            /* total across valid banks */
+    u32 bank_mb[4], bank_base[4];
+    unsigned banks;                        /* count of valid banks */
+};
+
+extern struct hwinv hw;
+
+/* Fill `hw`. Called by bench_init(); safe to call before the work area exists. */
+void bench_probe_hw(void);
+
+/* ── run configuration ────────────────────────────────────────────────────── */
+
+/*
+ * What the host asked for, read once at startup from TESTDEV_RUN_CONFIG — the
+ * only channel there is, since a bare-metal image loaded with --load-elf has no
+ * argv and no environment. All three are set to their defaults when the host
+ * asked for nothing, which is also what an emulator without the register gives
+ * us, so nothing downstream needs to know whether it was there.
+ *
+ * Note what is *not* configurable: whether a kernel verifies itself. Accuracy
+ * is scored against golden checksums compiled into this binary, and a shorter
+ * run that quietly checked less would report the same 100% while covering less
+ * ground. Only the timed measurement gets cheaper.
+ */
+extern u32 bench_groups;     /* BG_* mask of groups to run; BG_ALL by default */
+extern u32 bench_time_pct;   /* per-kernel target time, percent of default */
+extern u32 bench_repeats;    /* timed passes per kernel */
+
+/* Best of two. The slow sample is host scheduling noise, not the emulator: the
+ * guest performs a fixed amount of work either way. */
+#define BENCH_REPEATS_DEFAULT  2
+/* Below this the ~30 ns Count granularity and the two uncached device reads on
+ * each side of a timed region stop being noise and start being the measurement. */
+#define BENCH_TIME_PCT_MIN     10
+
 /* ── benchmark registration ───────────────────────────────────────────────── */
 
 #define BG_INT    0x01
@@ -142,10 +208,26 @@ int   memcmp(const void *a, const void *b, unsigned long n);
 #define BG_SYS    0x20
 #define BG_ALL    0x3F
 
-/* CPU applicability, same convention as cpu-tests. */
+/*
+ * CPU applicability. Same first two bits as cpu-tests, plus one that suite
+ * deliberately does not have.
+ *
+ * BCPU_OTHER covers every MIPS III-or-later CPU that is not one of the two the
+ * emulator models — an R4000, R4600, R8000, R10000, a real machine's RM7000.
+ * Those can run this suite and get a *meaningful* score, because unlike
+ * cpu-tests nothing here is CPU-specific: the kernels are ordinary compiled
+ * MIPS III, and golden.h is one flat table computed natively rather than a
+ * per-CPU one. So an unrecognised CPU is a labelling problem, not a
+ * correctness problem, and the suite runs and says what it found.
+ *
+ * cpu-tests is the opposite and keeps its own two-value CPU_* — its tests
+ * check R4400-versus-R5000 behaviour by construction, so "some other CPU"
+ * genuinely has no expected answer there.
+ */
 #define BCPU_R4400  0x1
 #define BCPU_R5000  0x2
-#define BCPU_ALL    (BCPU_R4400 | BCPU_R5000)
+#define BCPU_OTHER  0x4
+#define BCPU_ALL    (BCPU_R4400 | BCPU_R5000 | BCPU_OTHER)
 
 /* A kernel that is *supposed* to take exceptions. Everything else taking one
  * is a bug: the shared dispatcher records and steps over the faulting

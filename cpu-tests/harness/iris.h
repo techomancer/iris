@@ -14,6 +14,30 @@
 #define SCC_CHA_DATA      (IOC_BASE + 0x3C)   /* IOC_SERIAL2_DATA */
 #define SCC_RR0_TX_EMPTY  0x04u               /* RR0 bit 2: Tx buffer empty */
 
+/* ── Memory controller (src/mc.rs: MC_BASE 0x1FA00000) ────────────────────── */
+#define MC_BASE           0xBFA00000u
+#define MC_SYSID          (MC_BASE + 0x0018)  /* board revision / system id */
+#define MC_MEMCFG0        (MC_BASE + 0x00C0)  /* bank 0 in 31:16, bank 1 in 15:0 */
+#define MC_MEMCFG1        (MC_BASE + 0x00C8)  /* bank 2 in 31:16, bank 3 in 15:0 */
+
+/*
+ * One MEMCFG half-word. Valid whether or not the PROM ran: POST programs these
+ * on a real boot, and `--load-elf` gets the same values from
+ * MemoryController::post_map_banks, which maps the banks exactly as POST would
+ * before the image is loaded.
+ *
+ *   15   14    13   12         8 7            0
+ *   +----+-----+----+-----------+-------------+
+ *   |    |rank | VLD|   size    |  base >> 22 |
+ *   +----+-----+----+-----------+-------------+
+ *
+ * A dual-rank SIMM stores the size of *one* rank, so the installed total is
+ * doubled — see MemoryController::encode_memcfg_half for the table this mirrors.
+ */
+#define MEMCFG_VALID(h)   (((h) >> 13) & 1u)
+#define MEMCFG_BASE(h)    (((h) & 0xFFu) << 22)
+#define MEMCFG_MB(h)      (((((h) >> 8) & 0x1Fu) + 1u) * 4u << (((h) >> 14) & 1u))
+
 /* ── IRIS test device, GIO64 expansion slot 0 (src/testdev.rs) ────────────── */
 #define TESTDEV_BASE      0xBF400000u
 #define TESTDEV_SIGNATURE (TESTDEV_BASE + 0x00)  /* reads "IRIS" */
@@ -32,6 +56,22 @@
 #define TESTDEV_ICOUNT_HI  (TESTDEV_BASE + 0x1C)
 #define TESTDEV_CAPS       (TESTDEV_BASE + 0x20)
 #define TESTDEV_CAP_TIMEBASE 0x00000001u
+/* Run configuration, set by the host before the guest starts. A bare-metal
+ * image loaded with --load-elf has no argv and no environment, so this register
+ * is the only way to ask it for a shorter run. Every field is "unrestricted"
+ * when zero, which is what an emulator without TESTDEV_CAP_RUN_CONFIG returns,
+ * so it can be read unconditionally. See src/testdev.rs's RunConfig.
+ *
+ *   31            16 15   12 11             0
+ *   +---------------+-------+---------------+
+ *   |     groups    |repeats|    time_pct   |
+ *   +---------------+-------+---------------+
+ */
+#define TESTDEV_RUN_CONFIG (TESTDEV_BASE + 0x24)
+#define TESTDEV_CAP_RUN_CONFIG 0x00000002u
+#define TESTDEV_RC_GROUPS(w)   (((w) >> 16) & 0xFFFFu)
+#define TESTDEV_RC_REPEATS(w)  (((w) >> 12) & 0xFu)
+#define TESTDEV_RC_TIME_PCT(w) ((w) & 0xFFFu)
 #define TESTDEV_MAGIC     0x49524953u            /* 'I','R','I','S' */
 
 /* ── CPU identity (src/mips_core.rs:348-364) ──────────────────────────────── */
@@ -40,8 +80,38 @@
 #define FIR_R4000         0x00000500u
 #define FIR_R5000         0x00002300u
 #define PRID_IMP(p)       (((p) >> 8) & 0xFF)
+#define PRID_REV_MAJOR(p) (((p) >> 4) & 0xF)
+#define PRID_REV_MINOR(p) ((p) & 0xF)
+
+/*
+ * PRId implementation numbers for the MIPS CPUs SGI shipped. The architectural
+ * ones (imp) are stable across vendors; which machine took which is the SGI
+ * part:
+ *
+ *   IP20 Indigo          R4000
+ *   IP22/IP24 Indy       R4000, R4400, R4600, R5000
+ *   IP22 Indigo2         R4400, R4600, R8000, R10000
+ *   IP32 O2              R5000, RM5200, RM7000, R10000, R12000
+ *   IP30 Octane          R10000, R12000, R14000
+ *   IP27/IP35 Origin     R10000, R12000, R14000
+ *
+ * R4000 and R4400 share imp 0x04 and are told apart by revision — major >= 4
+ * is an R4400, which is the same rule IRIX and Linux use, and is why IRIS
+ * reports PRId 0x0440.
+ */
+#define IMP_R4000         0x04   /* R4400 too — see PRID_REV_MAJOR */
 #define IMP_R4400         0x04
+#define IMP_R10000        0x09
+#define IMP_R4300         0x0B
+#define IMP_R12000        0x0E
+#define IMP_R14000        0x0F
+#define IMP_R8000         0x10
+#define IMP_R4600         0x20
+#define IMP_R4700         0x21
+#define IMP_R4650         0x22
 #define IMP_R5000         0x23
+#define IMP_RM7000        0x27
+#define IMP_RM5200        0x28
 
 /* ── CP0 Status ───────────────────────────────────────────────────────────── */
 #define ST_IE             0x00000001u
@@ -103,7 +173,11 @@
 #define CFG_IB            0x00000020u   /* icache line: 0=16B 1=32B */
 #define CFG_DC_SHIFT      6
 #define CFG_IC_SHIFT      9
+#define CFG_SE            0x00001000u   /* R5K/Triton: L2 enable    */
 #define CFG_SC            0x00020000u   /* 1 = no secondary cache   */
+#define CFG_SB_SHIFT      22            /* L2 line: 4<<SB words     */
+#define CFG_TR_SS_SHIFT   20            /* Triton only: L2 size     */
+#define CFG_BE            0x00008000u   /* 1 = big endian           */
 #define CFG_EC_SHIFT      28
 
 /* ── FPU FCSR ─────────────────────────────────────────────────────────────── */

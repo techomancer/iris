@@ -60,8 +60,28 @@ DEPS := $(OBJS:.o=.d)
 # instruction. If a helper reference ever appears the link fails loudly.
 LIBGCC :=
 
-.PHONY: all clean run dis syms image golden hostbench matrix bench report check-size
+PREBUILT := prebuilt/irisbench.elf
+
+.PHONY: all clean run dis syms image golden hostbench matrix bench report check-size prebuilt
 all: $(TARGET)
+
+# Refresh the copy of the guest binary that `iris` links in with include_bytes!
+# (src/benchsuite.rs), so the benchmark runs on a machine with no MIPS cross
+# toolchain — a released app, a sandboxed one, or anyone who just wants the
+# number. Run this after changing anything the guest is built from and commit
+# the result alongside the source change: CI rebuilds it and fails on a diff,
+# because a stale image against fresh goldens reports accuracy failures that
+# are not real.
+prebuilt: $(TARGET)
+	@mkdir -p prebuilt
+	cp $(TARGET) $(PREBUILT)
+	@python3 -c "import hashlib,os; \
+	  h=lambda p: hashlib.sha256(open(p,'rb').read()).hexdigest(); \
+	  open('prebuilt/PROVENANCE','w').write( \
+	    '# What the checked-in guest binary hashes to. See README.md.\n' + \
+	    'irisbench.elf     sha256 %s  %d bytes\n' % (h('$(PREBUILT)'), os.path.getsize('$(PREBUILT)')) + \
+	    'golden/golden.h   sha256 %s  %d bytes\n' % (h('golden/golden.h'), os.path.getsize('golden/golden.h')))"
+	@echo "prebuilt: $(PREBUILT) refreshed — commit it with the change that caused it"
 
 $(BUILD)/%.o: harness/%.c
 	@mkdir -p $(dir $@)
