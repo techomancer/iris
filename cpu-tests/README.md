@@ -71,6 +71,28 @@ run/run-prom.sh             # PROM: boot -f dksc(0,2,8)cputest
 Slower, but it exercises the real path: the PROM reads the volume header, loads
 the ELF, and jumps to it. This is what the bootable CD will use.
 
+### Which machines this runs on
+
+**An SGI Indy or Indigo2 (IP22/IP24), and nothing else** — on real hardware or
+emulated. The harness is written for that machine: it links and self-relocates
+to a fixed KSEG0 address chosen because IP22/IP24 RAM begins at `0x08000000`
+(`harness/link.ld` explains why at length), it drives the console through the
+Z85C30 SCC via IOC2 at `0x1FBD9800`, and the exception vectors and TLB work
+assume that map. Under IRIS none of that costs anything, because IP22/IP24 is
+what IRIS emulates.
+
+Unlike `bench/`, this suite also **legitimately refuses an unrecognised CPU**
+(exit 127). That is not the same limitation and should not be "fixed" the same
+way: these tests check R4400-versus-R5000 behaviour by construction — cache
+geometry, MIPS IV availability, FPU quirks — so a third CPU genuinely has no
+expected answer here. `bench/` has no CPU-specific anything and does run on any
+MIPS III-or-later part.
+
+The assumptions, which of them were tested, and what a port to another SGI
+family would actually involve, are written up once in
+[`rules/testing/bare-metal-harness-platform-assumptions.md`](../rules/testing/bare-metal-harness-platform-assumptions.md)
+— the harness is shared with `bench/`, so the limitations are shared too.
+
 ## Expected results
 
 | | pass | fail | failing tests |

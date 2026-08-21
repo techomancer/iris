@@ -7,6 +7,10 @@
 u32 cpu_kind, cpu_prid, cpu_fir, cpu_config;
 int have_l2;
 int have_timebase;
+struct hwinv hw;
+u32 bench_groups   = BG_ALL;
+u32 bench_time_pct = 100;
+u32 bench_repeats  = BENCH_REPEATS_DEFAULT;
 u64 count_hz_measured = BENCH_COUNT_HZ_ASSUMED;
 
 unsigned char *work;
@@ -94,6 +98,101 @@ static int probe_timebase(void)
     have_timebase = 0;
 
     return b > a;
+}
+
+/*
+ * Read the machine out of the machine.
+ *
+ * CP0 Config carries the L1 geometry architecturally: IC/DC are log2 sizes
+ * biased by 12, IB/DB pick a 16- or 32-byte line, SC says whether a secondary
+ * cache exists (0 = present, inverted from what you would expect) and SB gives
+ * its line size. What Config does *not* carry on an R4400 or a non-Triton
+ * R5000 is the L2 *size* — the PROM reads that from the EEPROM — so it is
+ * reported as unknown rather than guessed at.
+ *
+ * The RAM layout comes from the memory controller's MEMCFG registers, which
+ * are populated whether or not the PROM ran: POST programs them on a real
+ * boot, and IRIS's post_map_banks does the same before an --load-elf image
+ * starts. Reads go through KSEG1 so they bypass the caches, like every other
+ * device access in this suite.
+ */
+void bench_probe_hw(void)
+{
+    unsigned i;
+    u32 cfg;
+
+    hw.prid   = cpu_prid;
+    hw.fir    = cpu_fir;
+    hw.config = cfg = cpu_config;
+    hw.sysid  = RD32(MC_SYSID);
+
+    hw.cpu_rev_major = (hw.prid >> 4) & 0xF;
+    hw.cpu_rev_minor = hw.prid & 0xF;
+    hw.fpu_imp       = (hw.fir >> 8) & 0xFF;
+    hw.fpu_rev_major = (hw.fir >> 4) & 0xF;
+    hw.fpu_rev_minor = hw.fir & 0xF;
+
+    /* size = 2^(12 + field) */
+    hw.l1i_bytes = 1u << (12 + ((cfg >> CFG_IC_SHIFT) & 0x7));
+    hw.l1d_bytes = 1u << (12 + ((cfg >> CFG_DC_SHIFT) & 0x7));
+    hw.l1i_line  = (cfg & CFG_IB) ? 32 : 16;
+    hw.l1d_line  = (cfg & CFG_DB) ? 32 : 16;
+
+    hw.l2_present = (cfg & CFG_SC) == 0;
+    hw.l2_line    = hw.l2_present ? (4u << ((cfg >> CFG_SB_SHIFT) & 0x3)) * 4u : 0;
+    /*
+     * Deliberately not decoded from Config, and deliberately not guessed.
+     *
+     * Only Triton encodes an L2 size, in TR_SS (bits 21:20) — and there is no
+     * runtime way to tell a Triton from a plain R5000, both of which report
+     * PRId imp 0x23. On an R4400 those same bits are SS (split-cache mode) and
+     * SW (port width), so reading them as a size invents a 512 KB L2 out of two
+     * zero bits. The PROM knows the real figure because it reads the EEPROM;
+     * the architecture does not expose it, so this stays 0 and the report says
+     * "size not reported" instead of lying with a plausible number.
+     */
+    hw.l2_bytes = 0;
+
+    hw.ram_mb = 0;
+    hw.banks  = 0;
+    for (i = 0; i < 4; i++) {
+        u32 word = RD32(i < 2 ? MC_MEMCFG0 : MC_MEMCFG1);
+        u32 half = (i & 1) ? (word & 0xFFFFu) : ((word >> 16) & 0xFFFFu);
+        hw.bank_mb[i] = 0;
+        hw.bank_base[i] = 0;
+        if (!MEMCFG_VALID(half)) continue;
+        hw.bank_mb[i]   = MEMCFG_MB(half);
+        hw.bank_base[i] = MEMCFG_BASE(half);
+        hw.ram_mb += hw.bank_mb[i];
+        hw.banks++;
+    }
+}
+
+/*
+ * Take the host's run configuration, if it left one.
+ *
+ * Guarded the same way probe_timebase() is: an emulator that decodes only the
+ * first 16 bytes of the device aliases every register back to SIGNATURE, so a
+ * CAPS read that returns the magic means "no capabilities register", not "every
+ * capability". Without CAP_RUN_CONFIG the defaults stand.
+ */
+static void read_run_config(void)
+{
+    u32 caps, w, pct;
+
+    if (!have_testdev) return;
+    caps = RD32(TESTDEV_CAPS);
+    if (caps == TESTDEV_MAGIC) return;
+    if (!(caps & TESTDEV_CAP_RUN_CONFIG)) return;
+
+    w = RD32(TESTDEV_RUN_CONFIG);
+    if (TESTDEV_RC_GROUPS(w))  bench_groups  = TESTDEV_RC_GROUPS(w) & BG_ALL;
+    if (TESTDEV_RC_REPEATS(w)) bench_repeats = TESTDEV_RC_REPEATS(w);
+
+    /* A target of zero would make every kernel run its base iteration count and
+     * measure nothing but timer granularity, so clamp rather than trust. */
+    pct = TESTDEV_RC_TIME_PCT(w);
+    if (pct) bench_time_pct = pct < BENCH_TIME_PCT_MIN ? BENCH_TIME_PCT_MIN : pct;
 }
 
 /*
@@ -237,15 +336,20 @@ void bench_init(void)
     cpu_prid   = cp0_prid();
     cpu_config = cp0_config();
     cpu_fir    = fir();
+    /* Only two CPUs get their own bit, because only two of them are ever asked
+     * a CPU-specific question. Everything else is MIPS III and runs the same
+     * kernels against the same goldens — see BCPU_OTHER. */
     switch (PRID_IMP(cpu_prid)) {
     case IMP_R4400: cpu_kind = BCPU_R4400; break;
     case IMP_R5000: cpu_kind = BCPU_R5000; break;
-    default:        cpu_kind = 0; break;
+    default:        cpu_kind = BCPU_OTHER; break;
     }
     have_l2 = (cpu_config & CFG_SC) == 0;
 
     testdev_probe();
     have_timebase = have_testdev && probe_timebase();
+    read_run_config();
+    bench_probe_hw();
 
     exc_clear();
     exc_install();

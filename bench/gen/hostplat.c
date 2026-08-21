@@ -27,6 +27,19 @@ u32 cpu_kind, cpu_prid, cpu_fir, cpu_config;
 int have_l2;
 int have_timebase = 1;
 int have_testdev;
+/*
+ * No CP0 and no memory controller to read an inventory out of, and no portable
+ * way to get one: /proc/cpuinfo, sysctl and GetSystemInfo are three different
+ * answers on three platforms and none of them is what this suite is for. Left
+ * zeroed, and print_inventory says so rather than showing a machine of zeroes.
+ */
+struct hwinv hw;
+void bench_probe_hw(void) { }
+/* No test device to read a configuration from: the golden generator and the
+ * native baseline always run everything, full length. */
+u32 bench_groups   = BG_ALL;
+u32 bench_time_pct = 100;
+u32 bench_repeats  = BENCH_REPEATS_DEFAULT;
 u64 count_hz_measured = 1000000000ull;   /* the host clock is the time base */
 
 void work_reset(void) { pool_used = 0; }

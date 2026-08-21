@@ -1,0 +1,3 @@
+# What the checked-in guest binary hashes to. See README.md.
+irisbench.elf     sha256 6b49cf9fc97e82b2ac305a8fbf4e8b8e84a64ab68c2863e6d169431b1d1b7209  299168 bytes
+golden/golden.h   sha256 c26eda9c1d331b5925b1339132a63320b4663315739ba103794e6304662144cb  2289 bytes
