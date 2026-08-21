@@ -112,11 +112,13 @@ impl Tab {
         }
         if !cfg!(feature = "appstore") {
             tabs.push(Tab::Ci);
-            // Benchmarking spawns cargo and a second emulator; that is a
-            // developer workflow, and a sandboxed App Store build can do
-            // neither. Same reasoning as the CI tab it sits next to.
-            tabs.push(Tab::Bench);
         }
+        // The benchmark runs entirely inside this process — the guest image is
+        // linked in and the emulated machine is one this app builds itself — so
+        // unlike the CI tab it works in a sandbox and ships to everyone. Its
+        // developer half (the matrix runner, which builds one emulator per
+        // cell) is hidden inside the tab instead.
+        tabs.push(Tab::Bench);
         tabs
     }
     pub fn label(self) -> &'static str {
@@ -198,7 +200,7 @@ pub fn show_tab(
         Tab::VideoIn => TabOutcome { action: show_vino(ui, cfg), ..Default::default() },
         Tab::Debug   => TabOutcome { action: show_debug(ui, cfg), ..Default::default() },
         Tab::Ci      => TabOutcome { action: show_ci(ui, cfg), ..Default::default() },
-        Tab::Bench   => { crate::bench_ui::show(ui, bench); TabOutcome::default() }
+        Tab::Bench   => { crate::bench_ui::show(ui, bench, mem_ctx.running); TabOutcome::default() }
     }).inner
 }
 

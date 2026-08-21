@@ -441,11 +441,20 @@ each run reports an accuracy percentage next to its throughput — and per-kerne
 interpreter and jitv2.
 
 ```sh
-make -C bench && make -C bench hostbench
 cargo build --release --bin iris-bench
+./target/release/iris-bench run         # ~60 s; --quick for about half that
+./target/release/iris-bench run --quick
+
+make -C bench && make -C bench hostbench            # only to change the suite
 ./target/release/iris-bench matrix      # builds and runs every CPU x engine cell
 ./target/release/iris-bench host        # the same kernels, natively, for the ratio
 ```
+
+`run` needs **no MIPS toolchain and no build step**: a known-good guest binary
+is checked in at `bench/prebuilt/` and linked into `iris`, and the run happens
+in-process on a headless machine the emulator builds for itself. That is also
+what the GUI's **Benchmark tab** does, on every platform and inside the App
+Store sandbox — one button, and the accuracy score sits next to the speed.
 
 Includes Dhrystone 2.1 (DMIPS) and LINPACK 100x100 (MFLOPS), so an emulated
 Indy can be put next to published figures for a real one, plus a Whetstone mix
