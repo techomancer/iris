@@ -26,7 +26,21 @@ cargo run --release --features jitv2,rex-jit              # enable MIPS JIT v2 (
 ```
 
 Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
-`coffdump`, `chd_extract`. Feature flags are documented in `README.md`.
+`iris-bench` (benchmark driver), `coffdump`, `chd_extract`. Feature flags are
+documented in `README.md`.
+
+## Testing and benchmarking
+
+- `cpu-tests/` — bare-metal MIPS III/IV correctness suite. "Is this instruction
+  right", one instruction at a time. `make -C cpu-tests run`.
+- `bench/` — bare-metal benchmark suite. "How fast is this build, and is it
+  still right after ten million of them." Reports throughput, guest MIPS and an
+  accuracy score per kernel; `iris-bench matrix` sweeps R4400/R5000 x
+  interpreter/jitv2. Read `rules/testing/benchmark-suite-gotchas.md` before
+  adding a kernel — the accuracy check catches endianness, uninitialised
+  memory and out-of-bounds reads, and every one of those has already happened.
+- Both share `cpu-tests/harness` (toolchain probe, SCC console, startup and
+  exception dispatch). Changing those files affects both suites.
 
 ## Hard invariants (from HACKING.md)
 
