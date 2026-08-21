@@ -42,6 +42,20 @@
 //! separate fields and is unaffected, so it still gets the pre-filled name on
 //! a save panel. Hence [`Purpose`], and hence the platform split — which is
 //! deliberate and load-bearing, not an oversight to be tidied away.
+//!
+//! # Under the App Sandbox
+//!
+//! Three kinds of location, and they behave differently:
+//!
+//! - **The managed folder** (`<container>/…/iris/disks`). `dirs::config_dir()`
+//!   is redirected into the container, so this is ours, always readable and
+//!   always creatable. Nothing special needed.
+//! - **A folder the user granted.** `macos_sandbox::restore` asserts every
+//!   stored bookmark at startup and holds it for the process lifetime, so by
+//!   the time a picker opens we can stat it like any other path.
+//! - **An absolute path we hold no bookmark for** — typed in, or carried over
+//!   in `gui.json` from another machine. We cannot stat it, and that is the
+//!   case `nearest_existing` has to get right; see there.
 
 use std::path::{Path, PathBuf};
 
@@ -134,16 +148,36 @@ fn start_dir_in(current: &str, managed: Option<PathBuf>) -> PathBuf {
     managed.filter(|d| d.is_dir()).unwrap_or_else(last_resort)
 }
 
-/// The nearest ancestor of `dir` that exists — `dir` itself when it does.
+/// The nearest ancestor of `dir` we should point the panel at.
 ///
 /// Walking up is what makes a not-yet-created destination useful: a disk bound
 /// for `~/VMs/indy/disks/root.raw` opens at `~/VMs/indy` if that is as far as
 /// the tree goes, which is one folder from where the user is aiming rather than
 /// wherever they last browsed.
+///
+/// **"Cannot see it" is not "not there."** Under the App Sandbox a path outside
+/// the container that we hold no bookmark for fails to stat with
+/// `PermissionDenied`, not `NotFound` — the folder is very likely present, we
+/// are simply not allowed to look. Walking past it would send the panel
+/// somewhere unrelated in exactly the case where the user is browsing *because*
+/// they need to re-grant access to it. The panel is not us: it is the
+/// powerbox, running out of process, and showing folders the app cannot read is
+/// its entire purpose. So a denial is treated as "point at it and let the panel
+/// decide", which is what makes the sandboxed build behave like the plain one.
 fn nearest_existing(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors()
-        .find(|a| !a.as_os_str().is_empty() && a.is_dir())
-        .map(PathBuf::from)
+    for a in dir.ancestors() {
+        if a.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::metadata(a) {
+            Ok(m) if m.is_dir() => return Some(a.to_path_buf()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Some(a.to_path_buf())
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn last_resort() -> PathBuf {
@@ -379,10 +413,54 @@ mod tests {
         std::fs::remove_dir_all(&disks).ok();
     }
 
+    /// The sandbox case: a folder we are not allowed to look at must still be
+    /// where the panel opens, because the panel can see it and we cannot.
+    ///
+    /// Reproduced with a parent directory stripped of `+x`, which makes
+    /// `metadata` on its child fail with `PermissionDenied` exactly as a
+    /// sandbox denial does. Skipped when the precondition does not hold — as
+    /// root, which bypasses the check entirely.
+    // Manufactures the denial with Unix directory permissions. macOS is the
+    // platform that matters here and is covered; Windows has no App Sandbox and
+    // no equivalent to reproduce.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_we_cannot_look_at_is_still_where_the_panel_should_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tmp("denied");
+        let locked = root.join("locked");
+        let inner = locked.join("disks");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let denied = std::fs::metadata(&inner)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        if denied {
+            // Not "walk up to `root`" — point at the folder itself and let the
+            // panel, which is not sandboxed with us, do the rest.
+            assert_eq!(nearest_existing(&inner).unwrap(), inner,
+                       "a denied folder must not be walked past");
+            let img = inner.join("scsi1.raw");
+            assert_eq!(start_dir_in(&img.to_string_lossy(), Some(root.clone())), inner);
+        }
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        if !denied {
+            eprintln!("skipped: could not produce a PermissionDenied (running as root?)");
+        }
+    }
+
     /// The invariant the whole module exists for. Whatever it is handed —
     /// including a managed directory that could not be created — it must name a
-    /// real directory, because handing the panel nothing is what made it open
-    /// in the wrong place.
+    /// directory the panel can use, because handing the panel nothing is what
+    /// made it open in the wrong place.
+    ///
+    /// "Can use" rather than "exists": a sandbox denial deliberately returns a
+    /// path we cannot stat (see `nearest_existing`). None of the inputs here
+    /// produce one, so `is_dir` is the right assertion for these cases.
     #[test]
     fn the_result_is_always_a_directory_that_exists() {
         let cases = ["", "   ", "scsi1.raw", "/nonexistent/deep/path/x.raw", "relative/x.raw"];
