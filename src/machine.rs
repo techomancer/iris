@@ -210,8 +210,35 @@ pub(crate) struct LiveCheckpoint {
     rex3_head1: Option<toml::Value>,
 }
 
+/// The test device and the ultra64 dev board both decode GIO expansion slot 0,
+/// so only one of them can exist. Panics rather than exiting: `Machine::new`
+/// already panics on bad input, and a host that embeds IRIS catches that
+/// (`iris-gui`'s worker wraps construction in `catch_unwind`) — killing the
+/// application over a configuration mistake is not a choice a library gets to
+/// make for its caller.
+fn check_testdev_slot_free(#[cfg(feature = "ultra64")] ultra64_present: bool) {
+    #[cfg(feature = "ultra64")]
+    if ultra64_present {
+        panic!("--test-device and the ultra64 dev board both claim GIO slot 0");
+    }
+}
+
 impl Machine {
     pub fn new(cfg: MachineConfig) -> Self {
+        Self::new_with_testdev(cfg, None)
+    }
+
+    /// `new`, with the bare-metal test device supplied by the caller rather
+    /// than built from `cfg.test_device_dump`. Passing one enables it — the
+    /// device *is* the request, so `cfg.test_device` need not also be set.
+    ///
+    /// Exists for hosts that link IRIS as a library and need the guest's
+    /// console and exit code delivered in-process instead of to stdout and
+    /// `process::exit` (`crate::bench_runner`, `TestDevice::new_embedded`).
+    pub fn new_with_testdev(
+        cfg: MachineConfig,
+        testdev_override: Option<Arc<crate::testdev::TestDevice>>,
+    ) -> Self {
         // Capture config flags that are needed after the local `cfg` binding
         // is shadowed later in this function.
         let ci_enabled = cfg.ci;
@@ -558,12 +585,17 @@ impl Machine {
 
         // Bare-metal test device (--test-device): default off, and refused
         // alongside the ultra64 dev board, which claims the same GIO slot.
-        let testdev = if cfg.test_device {
-            #[cfg(feature = "ultra64")]
-            if ultra64.is_some() {
-                eprintln!("iris: fatal: --test-device and the ultra64 dev board both claim GIO slot 0");
-                std::process::exit(1);
-            }
+        let testdev = if let Some(dev) = testdev_override {
+            check_testdev_slot_free(
+                #[cfg(feature = "ultra64")]
+                ultra64.is_some(),
+            );
+            Some(dev)
+        } else if cfg.test_device {
+            check_testdev_slot_free(
+                #[cfg(feature = "ultra64")]
+                ultra64.is_some(),
+            );
             let path = cfg.test_device_dump.clone()
                 .unwrap_or_else(|| crate::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
@@ -1066,7 +1098,19 @@ impl Machine {
         // addresses go to UnmappedRam, so map the banks as POST would first.
         let mapped = self.mc.post_map_banks();
         let out = self.cpu.load_elf(path)?;
-        Ok(if mapped { format!("  (mapped RAM banks; POST has not run)\n{}", out) } else { out })
+        Ok(Self::note_banks(mapped, out))
+    }
+
+    /// `load_elf` for an image already in memory — see
+    /// `MipsCpu::load_elf_bytes`. `name` only labels errors.
+    pub fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String> {
+        let mapped = self.mc.post_map_banks();
+        let out = self.cpu.load_elf_bytes(bytes, name)?;
+        Ok(Self::note_banks(mapped, out))
+    }
+
+    fn note_banks(mapped: bool, out: String) -> String {
+        if mapped { format!("  (mapped RAM banks; POST has not run)\n{}", out) } else { out }
     }
 
     /// The in-process serial backend used by `--ci` mode. `None` in

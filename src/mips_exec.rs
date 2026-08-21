@@ -8440,7 +8440,16 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
     /// zero-fill to `p_memsz`, set PC to `e_entry`. Returns a segment summary.
     pub fn load_elf(&self, path: &str) -> Result<String, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
-        let elf = crate::elf::parse(&bytes).map_err(|e| format!("{}: {}", path, e))?;
+        self.load_elf_bytes(&bytes, path)
+    }
+
+    /// `load_elf` on an image already in memory. `name` only labels errors —
+    /// nothing here touches the filesystem, which is what lets a host embedding
+    /// IRIS as a library run a bare-metal image it carries in its own binary
+    /// (`crate::benchsuite`) without writing a temporary file. A sandboxed app
+    /// has nowhere to write one.
+    pub fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String> {
+        let elf = crate::elf::parse(bytes).map_err(|e| format!("{}: {}", name, e))?;
         self.check_stopped()?;
         let mut exec = self.try_lock_executor()?;
         let mut out = String::new();

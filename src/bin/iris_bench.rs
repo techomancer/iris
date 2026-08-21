@@ -16,272 +16,22 @@
 //! the CPU model and the JIT are compile-time cargo features — comparing them
 //! means comparing binaries, not flags.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-const BEGIN: &str = "IRIS-BENCH-BEGIN";
-const END: &str = "IRIS-BENCH-END";
-
-/// Kernels whose whole point is to take exceptions. Everywhere else a nonzero
-/// count is a defect — see BF_TAKES_EXC in bench/harness/benchlib.h.
-const EXPECT_EXC: &[&str] = &["sys/exception", "sys/tlb_miss"];
-
-/// Dhrystones per second per DMIPS, by the VAX 11/780 convention every
-/// published Dhrystone figure since 1988 uses.
-const DHRY_PER_DMIPS: f64 = 1757.0;
-
-// ─── data model ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Row {
-    pub name: String,
-    pub unit: String,
-    pub iters: u64,
-    pub work: u64,
-    pub ns: u64,
-    pub icount: u64,
-    pub count: u64,
-    /// Exceptions taken during the timed run. Nonzero for a kernel that is not
-    /// meant to take any means it measured something other than what it
-    /// claims — the harness flags those on the line, and the report repeats it.
-    pub exc: u64,
-    pub checksum: String,
-    pub golden: String,
-    pub status: String,
-}
-
-impl Row {
-    /// Work units per second. The unit is the kernel's own, so this is only
-    /// comparable across cells for the same kernel — which is exactly how the
-    /// report uses it.
-    pub fn rate(&self) -> f64 {
-        if self.ns == 0 { 0.0 } else { self.work as f64 * 1e9 / self.ns as f64 }
-    }
-    /// Guest instructions retired per host second. Zero when there is no
-    /// instruction counter (host runs, or an emulator without the test
-    /// device's timebase registers).
-    pub fn mips(&self) -> f64 {
-        if self.ns == 0 || self.icount == 0 { 0.0 } else { self.icount as f64 * 1e3 / self.ns as f64 }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Machine {
-    pub cpu: String,
-    pub prid: String,
-    pub fir: String,
-    pub config: String,
-    pub l2: bool,
-    pub testdev: bool,
-    pub timebase: bool,
-    pub count_hz: u64,
-    pub count_hz_measured: bool,
-    pub work_bytes: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct HostInfo {
-    pub os: String,
-    pub arch: String,
-    pub cpu_model: String,
-    pub cores: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Run {
-    /// Cell label: "r4400-interp", "r5000-jitv2", "host", …
-    pub cell: String,
-    /// Cargo features the emulator was built with, from its own banner.
-    pub features: Vec<String>,
-    pub machine: Machine,
-    pub host: HostInfo,
-    pub rows: Vec<Row>,
-    pub checked: usize,
-    pub matched: usize,
-    pub total_ns: u64,
-    pub total_icount: u64,
-    /// Wall clock for the whole process, including emulator startup — always
-    /// larger than total_ns, which counts only timed regions.
-    pub wall_s: f64,
-    /// Hash of the guest binary this result came from. Reference numbers only
-    /// mean anything against the exact suite that produced them: add or change
-    /// a kernel and every stored figure silently becomes a comparison between
-    /// two different workloads. Empty for a host run (no guest binary).
-    /// `default` so results recorded before this field existed still load.
-    #[serde(default)]
-    pub suite_id: String,
-}
-
-impl Run {
-    pub fn accuracy(&self) -> f64 {
-        if self.checked == 0 { 0.0 } else { self.matched as f64 * 100.0 / self.checked as f64 }
-    }
-    pub fn mips(&self) -> f64 {
-        if self.total_ns == 0 || self.total_icount == 0 { 0.0 }
-        else { self.total_icount as f64 * 1e3 / self.total_ns as f64 }
-    }
-    pub fn row(&self, name: &str) -> Option<&Row> {
-        self.rows.iter().find(|r| r.name == name)
-    }
-    /// Dhrystone 2.1 DMIPS.
-    pub fn dmips(&self) -> Option<f64> {
-        self.row("int/dhrystone").map(|r| r.rate() / DHRY_PER_DMIPS)
-    }
-    /// Whetstone passes per second. Deliberately not converted to MWIPS: that
-    /// needs a "Whetstone instructions per loop" constant taken from a
-    /// reference implementation, and a figure resting on an unverified factor
-    /// of a thousand would look authoritative without being so. Passes per
-    /// second is exact and is what cell-to-cell comparison uses.
-    pub fn whet_loops(&self) -> Option<f64> {
-        self.row("fpu/whetstone").map(|r| r.rate())
-    }
-    /// LINPACK 100x100 MFLOPS.
-    pub fn linpack_mflops(&self) -> Option<f64> {
-        self.row("fpu/linpack").map(|r| r.rate() / 1e6)
-    }
-}
-
-// ─── parsing the suite's machine block ───────────────────────────────────────
-
-fn parse_block(text: &str) -> Result<(Machine, Vec<Row>, usize, usize, u64, u64), String> {
-    let begin = text.find(BEGIN).ok_or_else(|| {
-        "no IRIS-BENCH-BEGIN in the output — the suite did not reach its report".to_string()
-    })?;
-    let end = text[begin..].find(END).ok_or_else(|| {
-        "output ends before IRIS-BENCH-END — the suite died partway through".to_string()
-    })? + begin;
-
-    let mut machine = Machine::default();
-    let mut rows = Vec::new();
-    let (mut checked, mut matched, mut total_ns, mut total_ic) = (0usize, 0usize, 0u64, 0u64);
-
-    for line in text[begin..end].lines().skip(1) {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if let Some(rest) = line.strip_prefix('#') {
-            let mut it = rest.split_whitespace();
-            let kind = it.next().unwrap_or("");
-            let kv: BTreeMap<&str, &str> = it
-                .filter_map(|tok| tok.split_once('='))
-                .collect();
-            let num = |k: &str| -> u64 {
-                kv.get(k).and_then(|v| parse_u64(v)).unwrap_or(0)
-            };
-            match kind {
-                "machine" => {
-                    machine.cpu = kv.get("cpu").unwrap_or(&"unknown").to_string();
-                    machine.prid = kv.get("prid").unwrap_or(&"").to_string();
-                    machine.fir = kv.get("fir").unwrap_or(&"").to_string();
-                    machine.config = kv.get("config").unwrap_or(&"").to_string();
-                    machine.l2 = num("l2") != 0;
-                    machine.testdev = num("testdev") != 0;
-                    machine.timebase = num("timebase") != 0;
-                }
-                "timebase" => {
-                    machine.count_hz = num("count_hz");
-                    machine.count_hz_measured = num("measured") != 0;
-                }
-                "work" => machine.work_bytes = num("bytes"),
-                "totals" => {
-                    checked = num("checked") as usize;
-                    matched = num("matched") as usize;
-                    total_ns = num("ns");
-                    total_ic = num("icount");
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() != 11 { continue; }
-        rows.push(Row {
-            name: f[0].to_string(),
-            unit: f[1].to_string(),
-            iters: parse_u64(f[2]).unwrap_or(0),
-            work: parse_u64(f[3]).unwrap_or(0),
-            ns: parse_u64(f[4]).unwrap_or(0),
-            icount: parse_u64(f[5]).unwrap_or(0),
-            count: parse_u64(f[6]).unwrap_or(0),
-            exc: parse_u64(f[7]).unwrap_or(0),
-            checksum: f[8].to_string(),
-            golden: f[9].to_string(),
-            status: f[10].to_string(),
-        });
-    }
-
-    if rows.is_empty() {
-        return Err("the report block held no benchmark rows".to_string());
-    }
-    Ok((machine, rows, checked, matched, total_ns, total_ic))
-}
-
-fn parse_u64(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x") {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        s.parse().ok()
-    }
-}
-
-/// Pull the feature list out of the emulator's own startup banner, so a saved
-/// result records what produced it rather than what the caller believed.
-fn parse_features(stderr: &str) -> Vec<String> {
-    for line in stderr.lines() {
-        if let Some(rest) = line.strip_prefix("iris: build features: ") {
-            let rest = rest.trim();
-            if rest == "(none)" { return Vec::new(); }
-            return rest.split_whitespace().map(str::to_string).collect();
-        }
-    }
-    Vec::new()
-}
-
-// ─── host identification ─────────────────────────────────────────────────────
-
-fn host_info() -> HostInfo {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
-    HostInfo {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        cpu_model: cpu_model(),
-        cores,
-    }
-}
-
-fn cpu_model() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(s) = std::fs::read_to_string("/proc/cpuinfo") {
-            for line in s.lines() {
-                if let Some((k, v)) = line.split_once(':') {
-                    if k.trim() == "model name" || k.trim() == "Model" {
-                        return v.trim().to_string();
-                    }
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(out) = Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() { return s; }
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(s) = std::env::var("PROCESSOR_IDENTIFIER") { return s; }
-    }
-    "unknown".to_string()
-}
+// The report's data model, its parser and the reference table live in the
+// library: this binary, the in-process runner and the GUI all need them, and
+// "what accuracy means" should have exactly one definition.
+use iris::bench_report::{
+    fmt_rate, host_info, parse_block, reference_entry, MachineInfo, ReferenceTable, Row, Run,
+    RunSettings, EXPECT_EXC,
+};
+use iris::bench_runner::{self, BenchOptions};
 
 // ─── running ─────────────────────────────────────────────────────────────────
 
@@ -339,31 +89,29 @@ fn run_guest(
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    let (machine, rows, checked, matched, total_ns, total_icount) =
-        parse_block(&stdout).map_err(|e| {
-            format!("{}\n--- last 20 lines of emulator output ---\n{}", e, tail(&stdout, 20))
-        })?;
+    let p = parse_block(&stdout).map_err(|e| {
+        format!("{}\n--- last 20 lines of emulator output ---\n{}", e, tail(&stdout, 20))
+    })?;
 
     Ok(Run {
         cell: label.to_string(),
-        features: parse_features(&stderr),
-        machine,
+        features: iris::bench_report::parse_features(&stderr),
+        machine: p.machine,
         host: host_info(),
-        rows,
-        checked,
-        matched,
-        total_ns,
-        total_icount,
+        rows: p.rows,
+        checked: p.checked,
+        matched: p.matched,
+        total_ns: p.total_ns,
+        total_icount: p.total_icount,
         wall_s,
         suite_id,
+        settings: p.settings,
     })
 }
 
-/// Short blake3 of the guest binary. Short because it is an identity tag a
-/// human pastes into a JSON file, not a security digest.
 fn suite_id_of(elf: &Path) -> Result<String, String> {
     let bytes = std::fs::read(elf).map_err(|e| format!("{}: {}", elf.display(), e))?;
-    Ok(format!("blake3:{}", &blake3::hash(&bytes).to_hex()[..16]))
+    Ok(iris::benchsuite::suite_id_of(&bytes))
 }
 
 fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
@@ -374,20 +122,42 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
     let out = run_with_timeout(Command::new(exe), timeout_s)?;
     let wall_s = started.elapsed().as_secs_f64();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let (mut machine, rows, checked, matched, total_ns, total_icount) = parse_block(&stdout)?;
-    machine.cpu = "host".to_string();
+    let mut p = parse_block(&stdout)?;
+    p.machine.cpu = "host".to_string();
     Ok(Run {
         cell: "host".to_string(),
         features: Vec::new(),
-        machine,
+        machine: p.machine,
         host: host_info(),
-        rows,
-        checked,
-        matched,
-        total_ns,
-        total_icount,
+        rows: p.rows,
+        checked: p.checked,
+        matched: p.matched,
+        total_ns: p.total_ns,
+        total_icount: p.total_icount,
         wall_s,
         suite_id: String::new(),
+        settings: p.settings,
+    })
+}
+
+/// Run the suite inside this process, streaming the guest's console as it
+/// arrives.
+///
+/// The guest prints its table a row at a time so that a run which shows nothing
+/// for a minute is not mistaken for a hang, and that property is worth keeping
+/// at the command line — so this echoes every line rather than waiting for the
+/// end and printing the parsed summary.
+fn run_embedded(label: &str, timeout_s: u64, quick: bool) -> Result<Run, String> {
+    let opts = BenchOptions {
+        quick,
+        label: label.to_string(),
+        timeout: Duration::from_secs(timeout_s),
+        ..Default::default()
+    };
+    bench_runner::run(&opts, |p| {
+        if let bench_runner::Progress::Line(l) = p {
+            println!("{}", l);
+        }
     })
 }
 
@@ -688,7 +458,7 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
     Ok(Run {
         cell: label.to_string(),
         features: Vec::new(),
-        machine: Machine { cpu, ..Default::default() },
+        machine: MachineInfo { cpu, ..Default::default() },
         host: host_info(),
         rows,
         checked: 0,
@@ -700,18 +470,12 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
         // so there is no suite hash and its numbers never join the reference
         // table — they are only comparable against runs on the same disk image.
         suite_id: String::new(),
+        // Not the bare-metal harness, so its run configuration does not apply.
+        settings: RunSettings::default(),
     })
 }
 
 // ─── reports ─────────────────────────────────────────────────────────────────
-
-fn fmt_rate(v: f64) -> String {
-    if v <= 0.0 { return "-".into(); }
-    if v >= 1e9 { format!("{:.2} G", v / 1e9) }
-    else if v >= 1e6 { format!("{:.2} M", v / 1e6) }
-    else if v >= 1e3 { format!("{:.2} k", v / 1e3) }
-    else { format!("{:.1}", v) }
-}
 
 fn fmt_ratio(a: f64, b: f64) -> String {
     if b <= 0.0 || a <= 0.0 { return "-".into(); }
@@ -901,91 +665,6 @@ fn text_summary(runs: &[Run]) -> String {
 }
 
 
-// ─── reference rows ──────────────────────────────────────────────────────────
-//
-// `data/bench_reference.json` is the table the GUI compares a user's result
-// against. It ships checked in and **starts empty** — a machine with no row is
-// the normal case, not an error, and the GUI says "reference statistics not
-// gathered for this platform" rather than inventing one. Rows are added by
-// running the suite on a machine and pasting what this subcommand prints.
-//
-// Deliberately a static file updated by hand: the alternative (a user-writable
-// override, an import/export pair, a fetch) is a lot of machinery for a table
-// that changes when someone gets a new Mac.
-
-/// One machine's numbers, as they appear in `data/bench_reference.json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReferenceEntry {
-    pub id: String,
-    pub label: String,
-    /// Emulated CPU (`R4400`/`R5000`) and execution engine (`interp`/`jitv2`).
-    /// Both matter: the two engines differ by about 4x, so a row without them
-    /// cannot be compared with anything.
-    pub cpu: String,
-    pub engine: String,
-    pub host: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub measured: Option<String>,
-    pub guest_mips: f64,
-    pub dmips: f64,
-    pub accuracy: f64,
-    /// Work units per second, per kernel.
-    pub kernels: BTreeMap<String, f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReferenceTable {
-    pub schema: u32,
-    /// The guest binary these numbers were measured against. A result whose own
-    /// `suite_id` differs is not comparable — treat the table as empty rather
-    /// than comparing across two different workloads.
-    pub suite_id: String,
-    pub entries: Vec<ReferenceEntry>,
-}
-
-/// `interp` unless the emulator's own feature banner says otherwise. Read from
-/// the banner rather than inferred, so a mislabelled row is impossible.
-fn engine_of(run: &Run) -> &'static str {
-    if run.features.iter().any(|f| f == "jitv2") { "jitv2" } else { "interp" }
-}
-
-/// Today as `YYYY-MM-DD`, from the system clock. Hinnant's civil-from-days.
-fn today() -> String {
-    let days = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => (d.as_secs() / 86_400) as i64,
-        Err(_) => return "unknown".into(),
-    };
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{:04}-{:02}-{:02}", if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-fn reference_entry(run: &Run, id: &str, label: Option<&str>, measured: Option<&str>) -> ReferenceEntry {
-    ReferenceEntry {
-        id: id.to_string(),
-        label: label.map(str::to_string).unwrap_or_else(|| {
-            format!("{} — {}", run.host.cpu_model, engine_of(run))
-        }),
-        cpu: run.machine.cpu.clone(),
-        engine: engine_of(run).to_string(),
-        host: run.host.cpu_model.clone(),
-        measured: Some(measured.map(str::to_string).unwrap_or_else(today)),
-        guest_mips: (run.mips() * 10.0).round() / 10.0,
-        dmips: run.dmips().map(|v| (v * 10.0).round() / 10.0).unwrap_or(0.0),
-        accuracy: (run.accuracy() * 10.0).round() / 10.0,
-        kernels: run.rows.iter()
-            .filter(|r| r.status != "SKIP" && r.work > 0)
-            .map(|r| (r.name.clone(), (r.rate() * 100.0).round() / 100.0))
-            .collect(),
-    }
-}
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -1002,15 +681,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run the suite once under one emulator binary.
+    /// Run the suite once.
+    ///
+    /// In-process by default: this binary *is* an emulator, and the guest image
+    /// is linked into it, so there is no subprocess, no ELF on disk and nothing
+    /// platform-specific. Pass `--iris` to measure a different emulator binary
+    /// instead, which is what `matrix` does.
     Run {
-        /// Emulator to run. Defaults to target/release/iris.
+        /// Measure this emulator binary in a subprocess instead of this one
+        /// in-process. Needs --elf too, or a built bench/build/irisbench.elf.
         #[arg(long)]
         iris: Option<PathBuf>,
-        /// Suite binary. Defaults to bench/build/irisbench.elf.
+        /// Suite binary for --iris. Defaults to bench/build/irisbench.elf.
         #[arg(long)]
         elf: Option<PathBuf>,
-        /// Machine config. Defaults to bench/run/bare.toml.
+        /// Machine config for --iris. Defaults to bench/run/bare.toml.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Name this result. Defaults to "local".
@@ -1020,7 +705,13 @@ enum Cmd {
         out: Option<PathBuf>,
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
-        /// Extra arguments passed through to the emulator.
+        /// Shorter timed runs and one pass per kernel instead of best of two.
+        /// Every kernel still runs and still verifies, so accuracy means the
+        /// same thing; only the rates are noisier. Not accepted with --iris —
+        /// the register that carries it is set at machine construction.
+        #[arg(long)]
+        quick: bool,
+        /// Extra arguments passed through to --iris.
         #[arg(last = true)]
         extra: Vec<String>,
     },
@@ -1141,12 +832,38 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Run { iris, elf, config, label, out, timeout, extra } => {
-            let iris = iris.unwrap_or_else(|| repo_relative("target/release/iris"));
-            let elf = elf.unwrap_or_else(|| repo_relative("bench/build/irisbench.elf"));
-            let config = config.unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
+        Cmd::Run { iris, elf, config, label, out, timeout, quick, extra } => {
             let out = out.unwrap_or_else(default_out);
-            let run = run_guest(&iris, &elf, &config, &label, timeout, &extra)?;
+            let run = match iris {
+                Some(iris) => {
+                    if quick {
+                        return Err("--quick needs the in-process runner; drop --iris".into());
+                    }
+                    let elf = elf.unwrap_or_else(|| repo_relative("bench/build/irisbench.elf"));
+                    let config = config.unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
+                    run_guest(&iris, &elf, &config, &label, timeout, &extra)?
+                }
+                None => {
+                    // Silently ignoring these would be worse than refusing:
+                    // they all describe a subprocess that is not being started,
+                    // and a run that quietly measured the wrong thing is the
+                    // failure mode this whole suite exists to avoid.
+                    let stray = [
+                        elf.is_some().then_some("--elf"),
+                        config.is_some().then_some("--config"),
+                        (!extra.is_empty()).then_some("trailing emulator arguments"),
+                    ];
+                    let stray: Vec<&str> = stray.into_iter().flatten().collect();
+                    if !stray.is_empty() {
+                        let (verb, obj) = if stray.len() == 1 { ("applies", "it") }
+                                          else { ("apply", "them") };
+                        return Err(format!(
+                            "{} only {} to --iris, and `run` is in-process by default. \
+                             Add --iris PATH, or drop {}.", stray.join(" and "), verb, obj));
+                    }
+                    run_embedded(&label, timeout, quick)?
+                }
+            };
             let path = save(&run, &out)?;
             print!("{}", text_summary(std::slice::from_ref(&run)));
             println!("wrote {}", path.display());
@@ -1268,6 +985,14 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                 return Err(format!(
                     "{} has no suite_id — it predates the field, or it is a host run. \
                      Re-run the suite to record one.", path.display()));
+            }
+            // A shortened run is accurate but imprecise, and the table is what
+            // every other machine gets compared against. Refuse rather than
+            // quietly enshrine a noisy row.
+            if let Some(why) = run.settings.shortened_because() {
+                return Err(format!(
+                    "{} was not a full run ({}). Reference rows must be full runs — \
+                     re-run without --quick.", path.display(), why));
             }
             let entry = reference_entry(&run, &id, label.as_deref(), measured.as_deref());
 
