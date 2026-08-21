@@ -1156,6 +1156,16 @@ impl Jitv2 {
         hist
     }
 
+    /// Every claimed page in the pool (`pages[..next_free]`) — same live
+    /// extent `code_bytes_used`/`code_size_by_instr_count` scan, exposed as a
+    /// borrow rather than folded into an aggregate for callers (`j2 html`)
+    /// that need the raw per-page detail instead of a summary statistic.
+    /// `pages` itself stays private (index stability, see the field's own
+    /// doc comment, is an invariant only this module should rely on).
+    pub fn claimed_pages(&self) -> &[PhysicalCodePage] {
+        &self.pages[..self.next_free]
+    }
+
     /// Reset the JIT to its initial state: drop every compiled artifact and
     /// every tracked page, and reset the pool allocator. The MAME-style
     /// "flush the world" response to running out of any bump-allocated JIT
