@@ -11,6 +11,60 @@ produces deterministic results.
 
 ### Added
 
+#### Benchmark, for everyone
+
+- **The benchmark runs in-process, on every platform.** `iris-bench run` and
+  the GUI's Benchmark tab no longer spawn anything: the guest binary is linked
+  into `iris` (`bench/prebuilt/`, `src/benchsuite.rs`) and runs on a headless
+  machine the emulator builds for itself (`iris::bench_runner`). No MIPS cross
+  toolchain, no ELF on disk, no subprocess, and nothing written outside the
+  application container — so the Benchmark tab now ships in App Store builds
+  instead of being hidden. `iris-bench run --iris PATH` still measures a
+  separate binary in a subprocess, which is what `matrix` needs.
+- **The bare-metal suite got 2.5x faster** (117 s → 46 s for a full r4400
+  lightning run, same 40/40 accuracy). `--load-elf` skips the PROM, so the
+  SCC's transmitter is never enabled and every character the guest printed
+  burned a 100,000-iteration spin waiting for a TX-empty bit that would never
+  come. `cpu-tests` was paying the same tax and gets the same speedup. See
+  `rules/testing/scc-serial-output-from-bare-metal-code.md`.
+- **Quick mode** (`iris-bench run --quick`, and the GUI's default): about half
+  the wall clock for the same numbers to within a couple of percent. It never
+  runs fewer kernels — accuracy would then mean less while still reading 100% —
+  it only shortens the timed passes. Requested through a new test-device
+  register (`TESTDEV_RUN_CONFIG`), since a bare-metal image has no argv; every
+  field means "unrestricted" when zero, so older emulators are unaffected.
+  Recorded on every result, and refused by `iris-bench reference`.
+- **Every result records the machine it measured.** The suite now reads the
+  hardware out of the hardware before it starts — CPU identity and revision and
+  the L1/L2 geometry from CP0 Config, the RAM banks from the memory
+  controller's MEMCFG registers — and prints it as a header and as `#cache` /
+  `#memory` lines in the machine block. Works with no PROM and no POST, since
+  `--load-elf` programs MEMCFG exactly as POST would. This is provenance that
+  matters: the `mem/` kernels are a direct readout of the cache hierarchy, and
+  nothing in a saved result previously said whether two results even had the
+  same one. The GUI shows it under "Machine measured"; the exported report
+  carries it.
+- **Any MIPS CPU is identified and runs.** The suite named only the R4400 and
+  R5000 and *refused to run* on anything else, on the stated grounds that "the
+  golden checksums are selected by PRId" — which was not true: `golden.h` is one
+  flat, CPU-independent table and no kernel is CPU-gated. It now names R4000,
+  R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, RM5200 and RM7000
+  from PRId (R4000 and R4400 split on revision, the standard rule), prints an
+  unrecognised implementation as `MIPS-imp-0xNN`, and runs either way. Verified
+  by presenting an R10000 and an unknown implementation to the guest: both
+  identify correctly and score 40/40.
+- **Platform limits documented.** The bare-metal harness both suites share is
+  written for an Indy or Indigo2 (IP22/IP24): the load address, the console and
+  the memory inventory all assume that machine, and the load address is what
+  stops a port first, not the console. Recorded once in
+  `rules/testing/bare-metal-harness-platform-assumptions.md` — including which
+  claims were tested and which are reasoning, and why an ARCS-based port would
+  be one path for the whole SGI family rather than one per machine.
+- `iris::bench_report` — the report parser, data model and reference table
+  moved out of `src/bin/iris_bench.rs` so the CLI, the runner and the GUI share
+  one definition of what "accuracy" means.
+
+
 #### Snapshot system
 
 - **Save/restore/rollback** (`save_snapshot` / `load_snapshot` /
