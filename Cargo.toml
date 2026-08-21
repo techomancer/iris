@@ -248,6 +248,12 @@ path = "src/coffdump.rs"
 name = "iris-ci"
 path = "src/iris_ci_main.rs"
 
+# Benchmark driver. Named with a hyphen to match `iris-ci`, so the path has to
+# be spelled out — cargo's own bin autodiscovery would call it `iris_bench`.
+[[bin]]
+name = "iris-bench"
+path = "src/bin/iris_bench.rs"
+
 [[bin]]
 name = "chd_extract"
 path = "src/bin/chd_extract.rs"
