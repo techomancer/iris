@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bench_ui;
 mod camera_test;
 mod capture_access;
 mod config_ui;
@@ -158,6 +159,10 @@ struct App {
     /// Banks passed to the last `Cmd::Start` (guest-visible RAM is fixed until Stop).
     started_banks: Option<[u32; 4]>,
     tab: Tab,
+    /// Benchmark tab state: the child process, its streamed output, and the
+    /// last outcome. Lives here rather than in the tab function because a run
+    /// outlives many frames.
+    bench: bench_ui::BenchState,
     emu: EmulatorHandle,
     toast: Option<(String, std::time::Instant)>,
     fullscreen: bool,
@@ -460,6 +465,7 @@ impl App {
             cfg_dirty_since: None,
             started_banks: None,
             tab: Tab::General,
+            bench: bench_ui::BenchState::default(),
             emu: EmulatorHandle::spawn(),
             toast: None,
             stop_modal: None,
@@ -2205,6 +2211,7 @@ impl App {
                 running: self.emu.is_running(),
                 started_banks: self.started_banks,
             },
+            &mut self.bench,
         );
         match out.action {
             ConfigAction::RequestEmbeddedProm => self.confirm_embedded_prom = true,
