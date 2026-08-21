@@ -588,7 +588,7 @@ fn save_report(run: &Run) {
     let name = format!("iris-benchmark-{}.json", run.cell.replace(['/', ' '], "-"));
     let Some(path) = crate::filedialog::dialog_with(
         "Save benchmark report", &name, crate::filedialog::Anchor::Data,
-        &[("JSON", &["json"])]).save_file()
+        crate::filedialog::Purpose::Save, &[("JSON", &["json"])]).save_file()
     else {
         return;
     };

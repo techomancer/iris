@@ -3641,10 +3641,12 @@ impl eframe::App for App {
 // location — see `crate::filedialog`. These handle iris.toml import/export and
 // screenshots, none of which are disk images.
 fn native_open_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
-    filedialog::dialog_with(title, "", filedialog::Anchor::Data, filters).pick_file()
+    filedialog::dialog_with(title, "", filedialog::Anchor::Data,
+                            filedialog::Purpose::Open, filters).pick_file()
 }
 fn native_save_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
-    filedialog::dialog_with(title, "", filedialog::Anchor::Data, filters).save_file()
+    filedialog::dialog_with(title, "", filedialog::Anchor::Data,
+                            filedialog::Purpose::Save, filters).save_file()
 }
 
 #[cfg(test)]

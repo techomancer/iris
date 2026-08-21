@@ -55,6 +55,7 @@ impl CreateDiskDialog {
                             let dlg = crate::filedialog::dialog_with(
                                 "New disk image", &self.filename,
                                 crate::filedialog::Anchor::Disks,
+                                crate::filedialog::Purpose::Save,
                                 &[("Disk image", &["raw", "img"])]);
                             if let Some(p) = dlg.save_file() {
                                 self.filename = p.to_string_lossy().into_owned();
