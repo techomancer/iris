@@ -550,7 +550,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
             }
             Grid::new(("scsi_grid", id)).num_columns(2).striped(true).show(ui, |ui| {
                 ui.label("Image path");
-                let e = path_row(ui, ("scsi_path", id), &mut dev.path,
+                let e = path_row_disk(ui, ("scsi_path", id), &mut dev.path,
                     if dev.scratch { Pick::SaveFile } else { Pick::OpenFile },
                     DISK_FILTERS);
                 edit.changed |= e.changed;
@@ -641,7 +641,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 let mut drop_idx: Option<usize> = None;
                 for (i, disc) in dev.discs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
-                        let e = path_row(ui, ("disc", id, i), disc, Pick::OpenFile, DISK_FILTERS);
+                        let e = path_row_disk(ui, ("disc", id, i), disc, Pick::OpenFile, DISK_FILTERS);
                         edit.changed |= e.changed;
                         edit.picked |= e.picked;
                         if ui.button("×").clicked() { drop_idx = Some(i); }
@@ -1577,26 +1577,26 @@ fn scsi_type_combo(ui: &mut Ui, id: u8, dev: &mut ScsiDeviceConfig, edit: &mut P
 }
 
 /// A TextEdit + 📁 Browse button that updates `value` in place. See [`PathEdit`].
-fn path_row(
+///
+/// Browsing opens at the folder `value` names — or, when it names nothing yet,
+/// the managed folder for `anchor`. It never opens at the OS's last-used
+/// location; `crate::filedialog` explains why that mattered.
+fn path_row_in(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug, // egui 0.35 push_id needs AsIdSalt (Hash + Debug)
     value: &mut String,
     mode: Pick,
     filters: &[(&str, &[&str])],
+    anchor: crate::filedialog::Anchor,
 ) -> PathEdit {
     let mut out = PathEdit::default();
     ui.push_id(id, |ui| {
         ui.horizontal(|ui| {
             out.changed |= ui.add(TextEdit::singleline(value).desired_width(320.0)).changed();
             if ui.button("📁").on_hover_text("Browse…").clicked() {
-                let mut d = rfd::FileDialog::new();
-                // Start in the existing path's folder, else the managed disks dir.
-                let p = Path::new(value.as_str());
-                let dir = p.parent().filter(|d| !d.as_os_str().is_empty() && d.is_dir())
-                    .map(|d| d.to_path_buf())
-                    .or_else(|| crate::settings::GuiSettings::disks_dir().filter(|d| d.is_dir()));
-                if let Some(dir) = dir { d = d.set_directory(dir); }
-                if let Some(name) = p.file_name() { d = d.set_file_name(name.to_string_lossy()); }
+                // Open where this file lives, or is headed — never the OS's
+                // remembered folder. See `crate::filedialog`.
+                let mut d = crate::filedialog::dialog("Browse", value.as_str(), anchor);
                 if matches!(mode, Pick::OpenFile | Pick::SaveFile) {
                     for (label, exts) in filters {
                         d = d.add_filter(*label, exts);
@@ -1623,6 +1623,30 @@ fn path_row(
         });
     });
     out
+}
+
+/// `path_row_in` anchored on the app's data folder: PROM, NVRAM, logs, shares.
+fn path_row(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    value: &mut String,
+    mode: Pick,
+    filters: &[(&str, &[&str])],
+) -> PathEdit {
+    path_row_in(ui, id, value, mode, filters, crate::filedialog::Anchor::Data)
+}
+
+/// `path_row_in` anchored on the managed disks folder — every hard disk, CD
+/// image and disc in the changer. Browsing one of these opens where that image
+/// actually is, or where a not-yet-created one is destined for.
+fn path_row_disk(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    value: &mut String,
+    mode: Pick,
+    filters: &[(&str, &[&str])],
+) -> PathEdit {
+    path_row_in(ui, id, value, mode, filters, crate::filedialog::Anchor::Disks)
 }
 
 /// Same as `path_row` but for `Option<String>` — Browse populates Some,

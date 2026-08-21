@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bench_ui;
+mod filedialog;
 mod camera_test;
 mod capture_access;
 mod config_ui;
@@ -834,10 +835,14 @@ impl App {
     /// already pointed at `start_dir` (e.g. the folder of a CHD that needs a
     /// grant), so the user just confirms it.
     fn grant_disk_folder_at(&mut self, start_dir: Option<&str>) {
-        let mut dialog = rfd::FileDialog::new();
-        if let Some(d) = start_dir {
-            if !d.is_empty() { dialog = dialog.set_directory(d); }
-        }
+        // `start_dir` is itself the folder that needs granting, so open *at*
+        // it — the caller's whole point is that the user just confirms. With
+        // none, the managed disks folder beats wherever rfd last was.
+        let dialog = filedialog::dialog_at_dir(
+            "Grant access to a disk folder",
+            start_dir.unwrap_or(""),
+            filedialog::Anchor::Disks,
+        );
         if let Some(dir) = dialog.pick_folder() {
             let path = dir.to_string_lossy().into_owned();
             if !self.prefs.disk_folders.contains(&path) {
@@ -3632,15 +3637,14 @@ impl eframe::App for App {
 // We avoid `rfd` as a dependency for now to keep the dep tree slim. Use
 // `zenity` / `osascript` if available; otherwise return None and let the
 // caller paste a path into the recent-files / save-state fields.
+// Anchored on the app's data folder rather than left to the OS's remembered
+// location — see `crate::filedialog`. These handle iris.toml import/export and
+// screenshots, none of which are disk images.
 fn native_open_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
-    let mut d = rfd::FileDialog::new().set_title(title);
-    for (name, exts) in filters { d = d.add_filter(*name, exts); }
-    d.pick_file()
+    filedialog::dialog_with(title, "", filedialog::Anchor::Data, filters).pick_file()
 }
 fn native_save_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
-    let mut d = rfd::FileDialog::new().set_title(title);
-    for (name, exts) in filters { d = d.add_filter(*name, exts); }
-    d.save_file()
+    filedialog::dialog_with(title, "", filedialog::Anchor::Data, filters).save_file()
 }
 
 #[cfg(test)]
