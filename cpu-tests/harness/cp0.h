@@ -7,7 +7,7 @@
 #ifndef CP0_H
 #define CP0_H
 
-#include "testlib.h"
+#include "console.h"
 
 /* 32-bit CP0 read/write (mfc0/mtc0). `sel` is not used on R4400/R5000 — the
  * select field arrived with MIPS32r1 — so these take the register number
