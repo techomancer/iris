@@ -2215,26 +2215,26 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if same_page {
             return;
         }
-        // Landing on a genuinely different physical page than the one this
-        // executor was just tracking is itself compile-worthy, regardless of
-        // which word within that page pc happens to be at — a strictly more
-        // accurate and more general replacement for exec_decoded's old
-        // `entry_offset == 0` proxy (which only caught this for the specific
-        // case of a sequential fallthrough landing exactly on word 0).
-        // Notably, this closes a real gap `entry_offset == 0` missed:
-        // exception/TLB-refill vector entry — `deliver_exception`
-        // (mips_core.rs) writes `core.pc` directly to a fixed vector address
-        // and has no reason to know about jit_trigger (shared, non-jitv2-aware
-        // exception delivery logic) — the general-exception vector in
-        // particular (0x...80000180) lands at word-offset 0x60 within its
-        // page, not 0, so it was never probed by the old check unless that
-        // word happened to already be published from some earlier arrival.
-        // A harmless, bounded over-trigger case: nanotlb_invalidate nulls
-        // self.pcp unconditionally, so the next dispatch after any TLB
-        // invalidate always takes this branch even if it lands back on an
-        // already-tracked physical page — is_entry_valid still short-circuits
-        // correctly either way, this just costs one redundant probe.
-        self.core.jit_trigger = true;
+        // A page crossing landing exactly on word 0 (the exception/TLB-refill
+        // vector case included — `deliver_exception` in mips_core.rs writes
+        // `core.pc` straight to a fixed vector address, no reason to know
+        // about jit_trigger) is compile-worthy: it's the start of a region
+        // and worth probing/requesting fresh. Any other offset within the
+        // new page is not — treating every page crossing as a trigger
+        // (regardless of landing offset) was tried and reverted: it fires on
+        // ordinary sequential fallthrough across a page boundary just as
+        // readily as on a real region entry, which both flags whole-page
+        // in-progress regions for a redundant recompile on every fallthrough
+        // arrival and, in the steady state, sets up overlapping compiles of
+        // the same page from two different offsets. `entry_offset == 0`
+        // (checked below via `phys_addr`, before pfn/page_base rounding
+        // throws the low bits away) is the actual proxy exec_decoded's gate
+        // wants; `page.is_published`/`is_entry_valid` still handle every
+        // other arrival at an already-compiled offset without needing this
+        // flag at all.
+        if phys_addr & (crate::jitv2::PAGE_SIZE - 1) == 0 {
+            self.core.jit_trigger = true;
+        }
         let page_base = pfn * crate::jitv2::PAGE_SIZE;
         let mut jit = self.jitv2.lock();
         match jit.page_for(pfn, page_base, self.sysad.as_ref()) {
@@ -2918,12 +2918,73 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // Clear LLBit on any exception
         self.cache.set_llbit(false);
 
+        // Every other exception delivered before a syscall's matching ERET
+        // (a fault inside the syscall handler, or an interrupt landing on
+        // top of it) clears syscall_pending: that ERET returns into the
+        // handler, not out of the syscall, so the eventual real
+        // syscall-return ERET must no longer count as one either —
+        // deliberately conservative (misses a trigger) rather than firing on
+        // the wrong ERET. See MipsCore::syscall_pending's doc comment and
+        // handle_exception_syscall (the EXC_SYS-only counterpart of this
+        // function, which sets it instead).
+        #[cfg(feature = "jitv2")]
+        { self.core.syscall_pending = false; }
+
         // Architectural effect (Cause/EPC/Status/vector) — the portable part
         // shared with jitv2_verify (§4.2 single-implementation delivery).
         crate::mips_core::deliver_exception(&mut self.core, status);
 
         self.nanotlb_invalidate();
         // Reset delay slot state as we are jumping to a new context
+        self.core.in_delay_slot = false;
+        status
+    }
+
+    /// `handle_exception`'s exact twin, used only by `exec_syscall`: sets
+    /// `syscall_pending` instead of clearing it (see that field's doc
+    /// comment). A dedicated copy rather than a parameter on the shared
+    /// function because every other call site (~40 of them: TLB faults,
+    /// overflow, trap, address error, FPU exceptions, the JIT's own
+    /// exception callback...) is unconditionally the non-syscall case and
+    /// shouldn't carry a branch or an argument for a distinction that never
+    /// varies for them.
+    #[cfg(feature = "jitv2")]
+    fn handle_exception_syscall(&mut self, status: ExecStatus) -> ExecStatus {
+        #[cfg(feature = "developerx")]
+        {
+            let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;
+            let epc = if was_exl {
+                self.core.cp0_epc
+            } else if self.core.in_delay_slot {
+                self.core.pc.wrapping_sub(4)
+            } else {
+                self.core.pc
+            };
+            let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
+            if exc_code == EXC_IBE || exc_code == EXC_DBE {
+                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
+                    if exc_code == EXC_IBE { "IBE" } else { "DBE" },
+                    self.core.pc, epc);
+                return EXEC_BREAKPOINT;
+            }
+            if exc_code == EXC_ADEL || exc_code == EXC_ADES {
+                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
+                    if exc_code == EXC_ADEL { "ADEL" } else { "ADES" },
+                    self.core.pc, epc, self.core.cp0_badvaddr);
+                return EXEC_BREAKPOINT;
+            }
+            if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
+                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
+                    if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
+                    self.core.pc, epc, self.core.cp0_badvaddr);
+                return EXEC_BREAKPOINT;
+            }
+        }
+
+        self.cache.set_llbit(false);
+        self.core.syscall_pending = true;
+        crate::mips_core::deliver_exception(&mut self.core, status);
+        self.nanotlb_invalidate();
         self.core.in_delay_slot = false;
         status
     }
@@ -3694,8 +3755,17 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.branch_delay(target)
     }
     fn exec_syscall(&mut self, _d: &DecodedInstr) -> ExecStatus {
+        // Compile-worthy on entry too, symmetric with exec_eret's
+        // syscall_pending-gated trigger on return — see MipsCore's own doc
+        // comment on that field for why neither can rely on the general
+        // exception-vector arrival being probed automatically.
+        #[cfg(feature = "jitv2")]
+        { self.core.jit_trigger = true; }
         let s = exec_exception(EXC_SYS);
-        self.handle_exception(s)
+        #[cfg(feature = "jitv2")]
+        { self.handle_exception_syscall(s) }
+        #[cfg(not(feature = "jitv2"))]
+        { self.handle_exception(s) }
     }
     fn exec_break(&mut self, _d: &DecodedInstr) -> ExecStatus {
         let s = exec_exception(EXC_BP);
@@ -5336,9 +5406,23 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // ERET jumps immediately without delay slot
         self.core.pc = target;
 
-        // PC already set — exec_complete_pc_set marks the target as a
-        // compile-worthy arrival.
-        self.exec_complete_pc_set()
+        // Unlike every other exec_complete_pc_set caller, ERET's target is
+        // compile-worthy only when it's actually returning from a syscall —
+        // an ordinary exception return (TLB refill, interrupt, ...) lands
+        // back on whatever PC it interrupted, which the interpreter was
+        // already happily running before the exception hit, so retriggering
+        // there is pure waste (and for a frequent interrupt source, a
+        // standing one: same over-trigger shape jitv2_track_pcp's own doc
+        // comment describes for page crossings). See
+        // MipsCore::syscall_pending's doc comment.
+        #[cfg(feature = "jitv2")]
+        {
+            self.core.jit_trigger = self.core.syscall_pending;
+            self.core.syscall_pending = false;
+            EXEC_COMPLETE
+        }
+        #[cfg(not(feature = "jitv2"))]
+        EXEC_COMPLETE
     }
 
     // ===== COP1 (FPU) Instructions =====
@@ -6699,19 +6783,27 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // `core.jit_trigger` (a branch/jump just committed this PC — set by
         // the interpreter's handle_exec_complete/exec_complete_pc_set, by
         // JIT-compiled code's own jump/branch exit stubs
-        // (emit_absolute_pc_exit/emit_runtime_pc_exit in codegen.rs), *and*
-        // by jitv2_track_pcp itself whenever this dispatch's physical page
-        // differs from the one previously tracked — covering every way pc
-        // can land on a fresh page, not just branch/jump commits: sequential
-        // page-crossing fallthrough, and — the case the old, narrower
-        // "entry_offset == 0" proxy this replaced actually missed —
-        // exception/TLB-refill vector entry, since `deliver_exception`
-        // (mips_core.rs) writes `core.pc` directly to a fixed vector address
-        // with no reason to know about jit_trigger, and the general-exception
-        // vector in particular lands at word-offset 0x60 within its page, not
-        // 0), or the offset's valid bit already being set (worth re-probing
-        // even without a fresh trigger, e.g. loop back-edges within an
-        // already-hot region).
+        // (emit_absolute_pc_exit/emit_runtime_pc_exit in codegen.rs), and by
+        // jitv2_track_pcp itself when this dispatch's physical page differs
+        // from the one previously tracked *and* lands exactly on word 0 of
+        // the new page — deliberately narrower than "any page crossing":
+        // that used to fire the trigger on ordinary sequential fallthrough
+        // across a page boundary too, which both flagged whole in-progress
+        // regions for a redundant recompile on every such fallthrough and,
+        // in the steady state, set up overlapping compiles of the same page
+        // from two different offsets (see jitv2_track_pcp's own doc
+        // comment)), or the offset's valid bit already being set (worth
+        // re-probing even without a fresh trigger, e.g. loop back-edges
+        // within an already-hot region). One known gap this narrowing
+        // reopens: `deliver_exception` (mips_core.rs) writes `core.pc`
+        // directly to a fixed vector address with no reason to know about
+        // jit_trigger, and the general-exception vector in particular lands
+        // at word-offset 0x60 within its page, not 0 — so a first arrival
+        // there no longer force-probes as a compile-worthy entry. It still
+        // compiles and dispatches normally once `is_published`/
+        // `is_entry_valid` catches up (e.g. via a later branch landing
+        // there with jit_trigger set, or the call-count threshold), just
+        // not synchronously on the very first exception delivery.
         //
         // Word 0 was refused as an entry offset entirely until this point
         // (§6.1.4's "total entry predicate," original rationale: a page's

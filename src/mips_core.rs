@@ -526,6 +526,23 @@ pub struct MipsCore {
     /// dispatch-time check, which is the only reader.
     #[cfg(feature = "jitv2")]
     pub jit_trigger: bool,
+    /// Set by `exec_syscall` when the exception it raises is delivered,
+    /// cleared by `handle_exception` on delivery of any *other* exception
+    /// (so a syscall handler that itself faults, or gets interrupted, before
+    /// reaching its own ERET doesn't leave this stale). Consumed — checked
+    /// and cleared — by `exec_eret`, which is the only reader: MIPS gives no
+    /// way to tell "this ERET is returning from a syscall" from the ERET
+    /// instruction itself (it's architecturally identical to a TLB-refill or
+    /// interrupt return), so entry has to stash the fact for return to read
+    /// back. Exists so ERET's `jit_trigger` set (a real compile-worthy
+    /// signal for the syscall-return case: dispatch is landing back on
+    /// caller code, e.g. libc's syscall wrapper, that's worth probing fresh)
+    /// doesn't fire on every ERET regardless of origin — an interrupt or TLB
+    /// refill returning to the exact same hot PC many times over would
+    /// otherwise force a redundant probe on each return, mirroring the
+    /// page-crossing over-trigger `jit_trigger`'s own doc comment describes.
+    #[cfg(feature = "jitv2")]
+    pub syscall_pending: bool,
 
     // --- everything below is cold: not touched on the common per-instruction path ---
 
@@ -885,6 +902,8 @@ impl MipsCore {
             lockstep_mem: None,
             #[cfg(feature = "jitv2")]
             jit_trigger: false,
+            #[cfg(feature = "jitv2")]
+            syscall_pending: false,
             cp0_index: 0,
             cp0_random: 0,
             cp0_entrylo0: 0,
