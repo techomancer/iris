@@ -5106,23 +5106,43 @@ mod tests {
 
     #[test]
     fn cvt_to_int_overflow_saturates_matches_interpreter() {
-        // Rust's `as i32`/`as i64` saturates on out-of-range float values
-        // (since Rust 1.45) rather than wrapping or producing MIPS's
-        // canonical 0x7FFFFFFF pattern — the interpreter inherits Rust's
-        // saturating behavior, so the JIT (via fcvt_to_sint_sat) must match
-        // THAT, not real MIPS hardware.
+        // MIPS's fixed poison pattern on float->int overflow: INT_MAX
+        // (0x7FFFFFFF/0x7FFFFFFFFFFFFFFF) for positive overflow, INT_MIN for
+        // negative — see `cvt_f32/64_to_int_by_value` in mips_exec.rs, the
+        // single function both engines call through `cvt_to_int_and_commit`.
+        // Also sets FCSR.V/Cause, which `cvt_to_int_case`'s snapshot compare
+        // covers alongside the destination register value.
         cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_S, 1.0e20);
         cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_S, -1.0e20);
+
+        // cvt_to_int_case only checks JIT == interpreter, which a shared bug
+        // in cvt_to_int_and_commit would pass right through — pin the actual
+        // MIPS poison values against the interpreter directly too.
+        let mut fpr = [0u64; 32];
+        fpr[1] = (1.0e20f32).to_bits() as u64;
+        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_W);
+        let pos = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
+        assert_eq!(pos.fpr[2] as u32, i32::MAX as u32, "positive overflow must poison to INT_MAX");
+        assert_ne!(pos.fpu_fcsr & 0x0001_0000, 0, "overflow must raise FCSR Cause.V (bit 16)");
+
+        fpr[1] = (-1.0e20f32).to_bits() as u64;
+        let neg = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
+        assert_eq!(neg.fpr[2] as u32, i32::MIN as u32, "negative overflow must poison to INT_MIN");
+        assert_ne!(neg.fpu_fcsr & 0x0001_0000, 0, "overflow must raise FCSR Cause.V (bit 16)");
     }
 
     #[test]
     fn cvt_to_int_nan_matches_interpreter() {
-        // Rust's `as iN` on NaN produces 0 (since Rust 1.45) — bug-for-bug
-        // parity check against real MIPS (which would produce 0x7FFFFFFF).
+        // MIPS's poison pattern for NaN input is INT_MAX (same as positive
+        // overflow) — see `cvt_to_int_overflow_saturates_matches_interpreter`.
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
         let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_W);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
+
+        let nan = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
+        assert_eq!(nan.fpr[2] as u32, i32::MAX as u32, "NaN must poison to INT_MAX");
+        assert_ne!(nan.fpu_fcsr & 0x0001_0000, 0, "NaN input must raise FCSR Cause.V (bit 16)");
     }
 
     fn cvt_from_int_case(funct: u32, fmt: u32, val: i64) {

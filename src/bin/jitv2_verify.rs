@@ -48,19 +48,15 @@ use iris::jitv2::{JitFn, ENTRIES_PER_PAGE};
 use iris::mips_core::MipsCore;
 use iris::trace::{CoreState, TraceReader, TraceRecord};
 
-/// `MipsCore`'s FPU status hooks (`fpu_get_status_fn`/`fpu_clear_status_fn`/
-/// `fpu_set_mode_fn`) are pure host-arch functions with no executor
-/// dependency (see `mips_exec.rs`'s own `jit_fpu_*` trampolines, which these
-/// mirror exactly) — safe to wire up directly here without a real
-/// `MipsExecutor`. `MipsCore::new()` otherwise leaves them at
-/// panic-on-call placeholders, since compiled code isn't supposed to run
-/// before `MipsExecutor::install_jit_hooks` in the real emulator.
-unsafe extern "C" fn verify_fpu_get_status(_ctx: *mut core::ffi::c_void) -> u32 {
-    iris::platform::get_fpu_status()
-}
-unsafe extern "C" fn verify_fpu_clear_status(_ctx: *mut core::ffi::c_void) {
-    iris::platform::clear_fpu_status()
-}
+/// `MipsCore`'s FPU rounding-mode hook (`fpu_set_mode_fn`) is a pure
+/// host-arch function with no executor dependency (see `mips_exec.rs`'s own
+/// `jit_fpu_set_mode` trampoline, which this mirrors exactly) — safe to wire
+/// up directly here without a real `MipsExecutor`. `MipsCore::new()`
+/// otherwise leaves it at a panic-on-call placeholder, since compiled code
+/// isn't supposed to run before `MipsExecutor::install_jit_hooks` in the
+/// real emulator. (FP arithmetic's exception flags are computed from
+/// operand/result bit patterns in the compiled IR itself now, not read from
+/// the host FPU, so there's no corresponding status hook left to wire.)
 unsafe extern "C" fn verify_fpu_set_mode(_ctx: *mut core::ffi::c_void, rm: u32) {
     iris::platform::set_fpu_mode(rm as u8)
 }
@@ -126,10 +122,8 @@ fn seed_core(state: &CoreState) -> MipsCore {
     core.in_delay_slot = state.in_delay_slot;
     // jit_ctx is set by the caller once core has its final, stable address
     // (needed by verify_handle_exception, which reinterprets it back to
-    // *mut MipsCore) — the FPU hooks below ignore ctx entirely, so leaving
+    // *mut MipsCore) — the FPU hook below ignores ctx entirely, so leaving
     // it briefly unset here (until the caller assigns it) is harmless.
-    core.fpu_get_status_fn = verify_fpu_get_status;
-    core.fpu_clear_status_fn = verify_fpu_clear_status;
     core.fpu_set_mode_fn = verify_fpu_set_mode;
     core.handle_exception_fn = verify_handle_exception;
     core

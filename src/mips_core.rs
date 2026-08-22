@@ -414,21 +414,6 @@ pub struct MipsCore {
     /// doc comment above for the full contract.
     #[cfg(feature = "jitv2")]
     pub jit_mem_exc: u32,
-    /// FPU host-status hooks, mirroring `MipsExecutor::fpu_update_fcsr`'s
-    /// `platform::clear_fpu_status`/`platform::get_fpu_status` calls so
-    /// compiled FP arithmetic can update FCSR's Cause/Flag bits and raise
-    /// `EXC_FPE` exactly like the interpreter — these are plain host-arch
-    /// free functions (no executor/generic context needed, unlike the
-    /// memory/exception hooks), so `jit_ctx` is passed but unused; kept for
-    /// signature uniformity with the other hooks rather than a special case.
-    /// `fpu_get_status_fn` returns host FP exception flags already
-    /// translated into MIPS FCSR bit positions [6:2] (V,Z,O,U,I) — see
-    /// `platform::get_fpu_status`'s doc comment. `fpu_clear_status_fn`
-    /// clears the host's sticky flags for the next op.
-    #[cfg(feature = "jitv2")]
-    pub fpu_get_status_fn: unsafe extern "C" fn(*mut core::ffi::c_void) -> u32,
-    #[cfg(feature = "jitv2")]
-    pub fpu_clear_status_fn: unsafe extern "C" fn(*mut core::ffi::c_void),
     /// Reprogram the host FPU rounding mode, mirroring
     /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
     /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
@@ -796,14 +781,6 @@ unsafe extern "C" fn jit_hooks_not_installed_lockstep_step(_ctx: *mut core::ffi:
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::mips_exec::EXEC_COMPLETE }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_hooks_not_installed_fpu_get_status(_ctx: *mut core::ffi::c_void) -> u32 {
-    panic!("jitv2: fpu_get_status hook called before MipsExecutor::install_jit_hooks");
-}
-#[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_hooks_not_installed_fpu_clear_status(_ctx: *mut core::ffi::c_void) {
-    panic!("jitv2: fpu_clear_status hook called before MipsExecutor::install_jit_hooks");
-}
-#[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::c_void, _rm: u32) {
     panic!("jitv2: fpu_set_mode hook called before MipsExecutor::install_jit_hooks");
 }
@@ -889,10 +866,6 @@ impl MipsCore {
             dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
             #[cfg(feature = "jitv2")]
             jit_mem_exc: 0,
-            #[cfg(feature = "jitv2")]
-            fpu_get_status_fn: jit_hooks_not_installed_fpu_get_status,
-            #[cfg(feature = "jitv2")]
-            fpu_clear_status_fn: jit_hooks_not_installed_fpu_clear_status,
             #[cfg(feature = "jitv2")]
             fpu_set_mode_fn: jit_hooks_not_installed_fpu_set_mode,
             #[cfg(feature = "jitv2")]
