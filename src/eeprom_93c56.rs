@@ -326,6 +326,11 @@ impl Eeprom93c56 {
         }
     }
 
+    /// Read the secondary cache size register (CACHSZ_REG = word 0x11).
+    pub fn cachsz(&self) -> u16 {
+        self.data[0x11]
+    }
+
     /// Set the secondary cache size register (CACHSZ_REG = word 0x11).
     /// `pages` = L2 size in 4KB pages (e.g. 256 for 1MB, 128 for 512KB).
     /// Used by R5K/R4600SC/R4700 PROM to determine secondary cache size.
@@ -597,4 +602,17 @@ mod tests {
         assert!(!patched, "backdoor must not overwrite a non-blank eaddr slot");
         assert_eq!(eeprom.get_data()[0x7D..=0x7F], [0x0800, 0x69de, 0xad01]);
     }
+    /// The trap behind the R5000 boot hang: a fresh EEPROM is *erased*, not zeroed,
+    /// so CACHSZ reads as 0xFFFF — 65535 pages, i.e. 256 MB of secondary cache. A
+    /// machine whose CPU has no L2 must write 0 explicitly; leaving the default is
+    /// not "no cache", it is "an impossibly large cache".
+    #[test]
+    fn a_fresh_eeprom_claims_an_absurd_secondary_cache_until_told_otherwise() {
+        let mut e = Eeprom93c56::new();
+        assert_eq!(e.cachsz(), 0xFFFF, "erased state, not zero");
+        assert!(e.cachsz() as u32 * 4096 > 64 * 1024 * 1024, "and it is not a plausible size");
+        e.set_cachsz(0);
+        assert_eq!(e.cachsz(), 0, "a model with no L2 must say so explicitly");
+    }
+
 }

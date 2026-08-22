@@ -3639,4 +3639,15 @@ mod tests {
         assert!(!t.dirty);
         assert_eq!(t.cs as u32, L1D_CS_CLEAN_EXCLUSIVE);
     }
+    /// A CPU model with no secondary cache must be distinguishable from one that
+    /// has it, because the PROM decides whether to trust the EEPROM's CACHSZ word
+    /// on exactly that. Getting this wrong does not fail any unit test or either
+    /// bare-metal suite — it fails when IRIX boots and starts managing a cache
+    /// that is not there. See Machine::new's CACHSZ handling.
+    #[test]
+    fn only_the_model_with_a_secondary_cache_reports_one() {
+        assert!(<R4400Cache as MipsCache>::L2_SIZE > 0, "R4400 has a 1 MB L2");
+        assert_eq!(<R5000Cache as MipsCache>::L2_SIZE, 0, "R5000 (Indy) has no secondary cache");
+    }
+
 }

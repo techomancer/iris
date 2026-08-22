@@ -267,15 +267,20 @@ impl Machine {
         // 0x1fbb0008 — NVRAM/env vars/MAC, see Eeprom93c56::backdoor_set_mac).
         let eeprom_mc = Arc::new(Mutex::new(Eeprom93c56::new()));
         let eeprom_hpc3 = Arc::new(Mutex::new(Eeprom93c56::with_path(crate::devlog::LogModule::Nveeprom, cfg.nveeprom.clone())));
-        // CACHSZ_REG (word 0x11): secondary cache size in 4KB pages.
-        // PROM reads this when SC=1 (size_2nd_cache probe returns 0) to determine L2 size.
-        // r5ksc without r5ksc_triton: external SC sized via EEPROM. 256 = 1MB (256 × 4KB).
-        // r5ksc_triton: Triton reports L2 size via CONFIG_TR_SS — EEPROM word left 0.
-        // r5k without r5ksc: no L2 — leave 0 so PROM sees no secondary cache.
-        #[cfg(all(feature = "r5ksc", not(feature = "r5ksc_triton")))]
-        eeprom_mc.lock().set_cachsz((<SelectedCache as crate::mips_cache_v2::MipsCache>::L2_SIZE / 4096) as u16);
-        #[cfg(all(feature = "r5k", not(feature = "r5ksc")))]
-        eeprom_mc.lock().set_cachsz(0);
+        // CACHSZ_REG (word 0x11): secondary cache size in 4KB pages. The PROM reads
+        // it when Config.SC reports no probed L2, which is exactly the case for a
+        // model that has no secondary cache. The EEPROM powers up erased (0xFFFF),
+        // so such a model MUST write 0 here — otherwise the PROM believes in a
+        // 256 MB L2 and IRIX spends the boot flushing a cache that does not exist.
+        // Keyed on the configured CPU, not on a cargo feature: the model is a
+        // runtime choice, so a feature gate here silently stopped firing.
+        let model_has_l2 = match cfg_cpu_model {
+            crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
+        };
+        if !model_has_l2 {
+            eeprom_mc.lock().set_cachsz(0);
+        }
 
         // 1. Create all devices first
         // Memory Controller
