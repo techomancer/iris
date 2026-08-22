@@ -555,6 +555,9 @@ pub struct MipsCore {
     pub cp0_errorepc: u64,    // 30: Error Exception PC
 
     pub tlb_entries: u32,     // Total TLB entries
+    /// CP0 PRId / CP1 FIR reset values, supplied by the CPU model at construction.
+    pub reset_prid: u32,
+    pub reset_fir: u32,
     pub cp0_random_cycle: u64, // Cycle count of last Random update
 
     /// Counts every CP0 Count==Compare match (i.e. every fastick interrupt).
@@ -906,6 +909,8 @@ impl MipsCore {
             cp0_taghi: 0,
             cp0_errorepc: 0,
             tlb_entries: 48,
+            reset_prid: 0x0000_0440,
+            reset_fir: 0x0000_0500,
             cp0_random_cycle: 0,
             fasttick_count: Arc::new(AtomicU64::new(0)),
             running: false,
@@ -967,10 +972,7 @@ impl MipsCore {
             self.disarm_compare_timer();
             self.cp0_random = self.tlb_entries - 1;
             self.cp0_random_cycle = 0;
-            #[cfg(not(feature = "r5k"))]
-            { self.cp0_prid = 0x00000440; } // R4400, imp=0x04, majrev=4, minrev=0
-            #[cfg(feature = "r5k")]
-            { self.cp0_prid = 0x00002321; } // R5000, imp=0x23, rev=2.1
+            self.cp0_prid = self.reset_prid;
             self.cp0_watchlo = 0;
             self.cp0_watchhi = 0;
             self.cp0_xcontext = 0;
@@ -980,10 +982,7 @@ impl MipsCore {
             self.cp0_taghi = 0;
 
             // CP1 registers
-            #[cfg(not(feature = "r5k"))]
-            { self.fpu_fir = 0x00000500; } // R4000 FPU: imp=0x05, rev=0
-            #[cfg(feature = "r5k")]
-            { self.fpu_fir = 0x00002300; } // R5000 FPU: imp=0x23, rev=0
+            self.fpu_fir = self.reset_fir;
             self.fpu_fccr = 0;
             self.fpu_fexr = 0;
             self.fpu_fenr = 0;

@@ -6,7 +6,7 @@ mod tests {
     use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_BREAKPOINT, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
     use crate::mips_isa::*;
     use crate::mips_tlb::PassthroughTlb;
-    use crate::mips_cache_v2::{PassthroughCache, MipsCache, R4000Cache};
+    use crate::mips_cache_v2::{PassthroughCache, PassthroughCacheM4, MipsCache, R4400Cache, CpuModel};
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BusDevice};
     use std::sync::Arc;
 
@@ -147,17 +147,26 @@ mod tests {
     /// see `MockMemory::gen_ptr`'s doc comment for why this, not a null
     /// `gen_ptr`, is what actually keeps jitv2 out of this file's tests now.
     #[cfg(feature = "jitv2")]
-    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>) {
+    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: CpuModel>(exec: &mut MipsExecutor<T, C>) {
         // jitv2_dispatch_enabled=false turns the whole JIT dispatch gate off,
         // which is what drives lockstep now — so this alone keeps jitv2 (and its
         // lockstep instrumentation) out of these interpreter-only tests.
         exec.jitv2_dispatch_enabled = false;
     }
     #[cfg(not(feature = "jitv2"))]
-    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: MipsCache>(_exec: &mut MipsExecutor<T, C>) {}
+    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: CpuModel>(_exec: &mut MipsExecutor<T, C>) {}
 
     // Helper to create executor with mock memory
     fn create_executor() -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
+        let mem = Arc::new(MockMemory::new());
+        let mem_bus: Arc<dyn BusDevice> = mem.clone();
+        let cfg = MipsCpuConfig::indy();
+        let mut exec = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        disable_jitv2(&mut exec);
+        (exec, mem)
+    }
+
+    fn create_executor_m4() -> (MipsExecutor<PassthroughTlb, PassthroughCacheM4>, Arc<MockMemory>) {
         let mem = Arc::new(MockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
@@ -176,8 +185,8 @@ mod tests {
         (exec, mem)
     }
 
-    // Helper to create executor with R4000Cache for VCE testing
-    fn create_executor_with_r4000cache() -> (MipsExecutor<PassthroughTlb, R4000Cache>, Arc<MockMemory>) {
+    // Helper to create executor with R4400Cache for VCE testing
+    fn create_executor_with_r4000cache() -> (MipsExecutor<PassthroughTlb, R4400Cache>, Arc<MockMemory>) {
         let mem = Arc::new(MockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
@@ -2400,9 +2409,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_conditional_moves() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
 
         // MOVZ r3, r1, r2 (Move r1 to r3 if r2 == 0)
         exec.core.write_gpr(1, 0xDEADBEEF);
@@ -2557,9 +2565,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_pref() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.write_gpr(1, 0x1000);
         // PREF 0, 0(r1)
         let instr_pref = make_i(OP_PREF, 1, 0, 0);
@@ -2766,9 +2773,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_fpu_mov_cond() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -2800,9 +2806,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_fpu_recip_rsqrt() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -2820,9 +2825,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_cop1x_load_store() {
-        let (mut exec, mem) = create_executor();
+        let (mut exec, mem) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -2876,9 +2880,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_cop1x_madd() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -2909,9 +2912,8 @@ mod tests {
     // Covers the remaining MIPS IV COP1X fused ops not exercised by test_cop1x_madd
     // (MADD.D, MSUB.S, NMADD.S/D, NMSUB.S/D) — fd = fs*ft +/- fr, negated for NMADD/NMSUB.
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_cop1x_madd_remaining_variants() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -2967,9 +2969,8 @@ mod tests {
     // Covers SDXC1 (missing from test_cop1x_load_store, which only checks LWXC1/SWXC1/LDXC1)
     // and PREFX (COP1X prefetch — architecturally a hint/no-op).
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_cop1x_sdxc1_and_prefx() {
-        let (mut exec, mem) = create_executor();
+        let (mut exec, mem) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -3020,9 +3021,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_movci() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -3075,9 +3075,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn test_fpu_movcf() {
-        let (mut exec, _) = create_executor();
+        let (mut exec, _) = create_executor_m4();
         exec.core.cp0_status |= STATUS_CU1 | STATUS_FR;
         exec.update_fpr_mode();
 
@@ -3332,7 +3331,7 @@ mod tests {
     #[test]
     #[cfg(feature = "jitv2")]
     fn test_r4000cache_step_sequence() {
-        // Exercise the full R4000Cache path: kseg0 fetch → L2 fill → L1I fill → exec_decoded.
+        // Exercise the full R4400Cache path: kseg0 fetch → L2 fill → L1I fill → exec_decoded.
         // PC 0x80000000 → phys 0x00000000 (kseg0, cacheable). Uses
         // JitCapableMockMemory (not the shared MockMemory) plus
         // install_jit_hooks specifically so jitv2 dispatch is exercisable
@@ -3340,7 +3339,7 @@ mod tests {
         let mem = Arc::new(JitCapableMockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
-        let mut exec: MipsExecutor<PassthroughTlb, R4000Cache> = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
+        let mut exec: MipsExecutor<PassthroughTlb, R4400Cache> = MipsExecutor::new(mem_bus, PassthroughTlb::default(), &cfg);
         exec.install_jit_hooks();
 
         // Write instructions into memory as big-endian u32s packed into u64 chunks.
@@ -3724,7 +3723,7 @@ mod tests {
         use crate::mips_exec::{MipsExecutor, MipsCpuConfig, EXC_VCED, EXC_VCEI};
         use crate::mips_tlb::PassthroughTlb;
         #[allow(unused_imports)]
-        use crate::mips_cache_v2::R4000Cache;
+        use crate::mips_cache_v2::R4400Cache;
         #[allow(unused_imports)]
         use crate::mips_core::STATUS_KX;
         use crate::traits::{BUS_OK, BUS_VCE};

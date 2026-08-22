@@ -26,7 +26,11 @@ use crate::mc::MemoryController;
 use crate::mips_tlb::MipsTlb;
 use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::mips_cache_v2::R4000Cache;
+// Step 1 keeps the cargo feature as the selector; step 3 makes this a runtime choice.
+#[cfg(not(feature = "r5k"))]
+use crate::mips_cache_v2::R4400Cache as SelectedCache;
+#[cfg(feature = "r5k")]
+use crate::mips_cache_v2::R5000Cache as SelectedCache;
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -60,7 +64,7 @@ pub fn emulator_name() -> &'static str {
 }
 
 pub struct Machine {
-    cpu: Arc<MipsCpu<MipsTlb, R4000Cache>>,
+    cpu: Arc<MipsCpu<MipsTlb, SelectedCache>>,
     _phys: Arc<Physical>, // Keep reference to Physical Bus
     mc: MemoryController,
     hpc3: Hpc3,
@@ -272,7 +276,7 @@ impl Machine {
         // r5ksc_triton: Triton reports L2 size via CONFIG_TR_SS — EEPROM word left 0.
         // r5k without r5ksc: no L2 — leave 0 so PROM sees no secondary cache.
         #[cfg(all(feature = "r5ksc", not(feature = "r5ksc_triton")))]
-        eeprom_mc.lock().set_cachsz((crate::mips_cache_v2::L2_SIZE / 4096) as u16);
+        eeprom_mc.lock().set_cachsz((<SelectedCache as crate::mips_cache_v2::MipsCache>::L2_SIZE / 4096) as u16);
         #[cfg(all(feature = "r5k", not(feature = "r5ksc")))]
         eeprom_mc.lock().set_cachsz(0);
 
@@ -699,7 +703,7 @@ impl Machine {
         let cfg = MipsCpuConfig::indy();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let sysad: Arc<dyn BusDevice> = phys.clone();
-        let mut executor: MipsExecutor<MipsTlb, R4000Cache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut executor: MipsExecutor<MipsTlb, SelectedCache> = MipsExecutor::new(sysad, tlb, &cfg);
 
         // Load default symbol maps if they exist
         {
