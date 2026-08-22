@@ -1950,8 +1950,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
 
         core.cp0_config = config;
         core.tlb_entries = C::TLB_ENTRIES as u32;
+        // MipsCore::new already ran reset_registers, so set both the reset value
+        // and the live register — otherwise the model's identity only appears
+        // after the next power_on.
         core.reset_prid = C::PRID;
         core.reset_fir = C::FIR;
+        core.cp0_prid = C::PRID;
+        core.fpu_fir = C::FIR;
 
         // Triton: sync initial L2 enabled state from Config SE bit (starts 0 = disabled).
         #[cfg(feature = "r5ksc_triton")]
@@ -11692,6 +11697,69 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
 // ============================================================================
 // Resettable + Saveable for MipsCpu (CPU core + TLB)
 // ============================================================================
+
+/// Type-erased CPU handle. The CPU thread runs inside the implementor, so every
+/// call here is setup, control or debug — never the instruction hot path.
+pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
+    fn as_device(self: Arc<Self>) -> Arc<dyn Device>;
+    fn debug_adapter(self: Arc<Self>) -> Arc<dyn crate::gdb_stub::CpuDebug>;
+    fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr;
+    fn interrupts_ptr(&self) -> *const AtomicU64;
+    fn core_ptr(&self) -> *const crate::mips_core::MipsCore;
+    fn register_locks(&self);
+    fn load_elf(&self, path: &str) -> Result<String, String>;
+    fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
+    fn step_n_inline(&self, n: u64) -> Result<u64, String>;
+    fn step_one_inline_counting_instructions(&self) -> Result<usize, String>;
+    fn state_digest(&self) -> Result<CpuStateDigest, String>;
+    fn restore_state_digest(&self, d: &CpuStateDigest) -> Result<(), String>;
+    fn fixup_cp0_count(&self, d: &CpuStateDigest) -> Result<(), String>;
+    fn set_jitv2_dispatch_enabled(&self, on: bool) -> Result<bool, String>;
+    fn set_hw_read_fixup_recording(&self, on: bool) -> Result<(), String>;
+    fn set_hw_read_fixup_replay(&self, f: Option<Vec<(u64, u8, u64)>>) -> Result<(), String>;
+    /// CPU model name, as the guest and the benchmark report see it.
+    fn model_name(&self) -> &'static str;
+    fn set_cheritest_dump_hook(&self, on: bool);
+    fn running_flag(&self) -> Arc<AtomicBool>;
+    fn fasttick_count(&self) -> Arc<AtomicU64>;
+    fn count_hz_atomic(&self) -> Arc<AtomicU64>;
+    #[cfg(feature = "jitv2")]
+    fn jitv2(&self) -> Arc<Mutex<crate::jitv2::Jitv2>>;
+}
+
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCpu<T, C> {
+    fn as_device(self: Arc<Self>) -> Arc<dyn Device> { self }
+    fn debug_adapter(self: Arc<Self>) -> Arc<dyn crate::gdb_stub::CpuDebug> {
+        MipsCpuDebugAdapter::new(self)
+    }
+    fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
+    fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
+    fn core_ptr(&self) -> *const crate::mips_core::MipsCore { MipsCpu::core_ptr(self) }
+    fn register_locks(&self) { MipsCpu::register_locks(self) }
+    fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
+    fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
+    fn step_n_inline(&self, n: u64) -> Result<u64, String> { MipsCpu::step_n_inline(self, n) }
+    fn step_one_inline_counting_instructions(&self) -> Result<usize, String> {
+        MipsCpu::step_one_inline_counting_instructions(self)
+    }
+    fn state_digest(&self) -> Result<CpuStateDigest, String> { MipsCpu::state_digest(self) }
+    fn restore_state_digest(&self, d: &CpuStateDigest) -> Result<(), String> { MipsCpu::restore_state_digest(self, d) }
+    fn fixup_cp0_count(&self, d: &CpuStateDigest) -> Result<(), String> { MipsCpu::fixup_cp0_count(self, d) }
+    fn set_jitv2_dispatch_enabled(&self, on: bool) -> Result<bool, String> { MipsCpu::set_jitv2_dispatch_enabled(self, on) }
+    fn set_hw_read_fixup_recording(&self, on: bool) -> Result<(), String> { MipsCpu::set_hw_read_fixup_recording(self, on) }
+    fn set_hw_read_fixup_replay(&self, f: Option<Vec<(u64, u8, u64)>>) -> Result<(), String> {
+        MipsCpu::set_hw_read_fixup_replay(self, f)
+    }
+    fn model_name(&self) -> &'static str { C::NAME }
+    fn set_cheritest_dump_hook(&self, on: bool) { MipsCpu::set_cheritest_dump_hook(self, on) }
+    fn running_flag(&self) -> Arc<AtomicBool> { MipsCpu::running_flag(self) }
+    fn fasttick_count(&self) -> Arc<AtomicU64> { Arc::clone(&self.fasttick_count) }
+    fn count_hz_atomic(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.executor.lock().core.count_hz_atomic)
+    }
+    #[cfg(feature = "jitv2")]
+    fn jitv2(&self) -> Arc<Mutex<crate::jitv2::Jitv2>> { MipsCpu::jitv2(self) }
+}
 
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsCpu<T, C> {
     fn power_on(&self) {

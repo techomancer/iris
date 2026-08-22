@@ -26,11 +26,7 @@ use crate::mc::MemoryController;
 use crate::mips_tlb::MipsTlb;
 use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-// Step 1 keeps the cargo feature as the selector; step 3 makes this a runtime choice.
-#[cfg(not(feature = "r5k"))]
-use crate::mips_cache_v2::R4400Cache as SelectedCache;
-#[cfg(feature = "r5k")]
-use crate::mips_cache_v2::R5000Cache as SelectedCache;
+use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -64,7 +60,7 @@ pub fn emulator_name() -> &'static str {
 }
 
 pub struct Machine {
-    cpu: Arc<MipsCpu<MipsTlb, SelectedCache>>,
+    cpu: Arc<dyn crate::mips_exec::CpuDevice>,
     _phys: Arc<Physical>, // Keep reference to Physical Bus
     mc: MemoryController,
     hpc3: Hpc3,
@@ -252,6 +248,7 @@ impl Machine {
         let display_resolution = cfg.graphics.resolution;
         let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
         let clock_fixed_mhz = cfg.clock.fixed_mhz;
+        let cfg_cpu_model = cfg.machine.cpu;
 
         if !cfg.machine.profile.supported() {
             eprintln!(
@@ -699,11 +696,13 @@ impl Machine {
             phys.vino.start();
         }
 
-        // 5. CPU config + TLB + Executor
+        // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
+        //    arm below monomorphises its own CPU — no per-model branch on the hot path.
+        let sysad: Arc<dyn BusDevice> = phys.clone();
+        macro_rules! build_cpu { ($cache:ty) => {{
         let cfg = MipsCpuConfig::indy();
         let tlb = MipsTlb::new(cfg.tlb_entries);
-        let sysad: Arc<dyn BusDevice> = phys.clone();
-        let mut executor: MipsExecutor<MipsTlb, SelectedCache> = MipsExecutor::new(sysad, tlb, &cfg);
+        let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
 
         // Load default symbol maps if they exist
         {
@@ -729,14 +728,9 @@ impl Machine {
         executor.core.fasttick_count = fasttick_count;
         executor.decoded_count       = decoded_count;
         executor.uncached_fetch_count = Arc::clone(&uncached_fetch_count);
-        executor.cache.l1i_hit_count   = Arc::clone(&l1i_hit_count);
-        executor.cache.l1i_fetch_count = Arc::clone(&l1i_fetch_count);
+        executor.cache.set_l1i_counters(Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count));
         // Re-sync raw pointers after Arc injection (the Arcs above replaced the ones captured in new()).
         executor.rebind_atomic_ptrs();
-
-        // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
-        #[cfg(feature = "developer")]
-        if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(Arc::clone(&executor.core.count_hz_atomic)); }
 
         // Give the core the machine's hptimer manager: CP0 Compare writes
         // arm a one-shot on it that raises IP7 from the timer thread. Safe
@@ -746,10 +740,20 @@ impl Machine {
         // inside the executor's Arc<Mutex<..>>.
         executor.core.set_timer_manager(timer_manager.clone());
 
-        let cpu = Arc::new(MipsCpu::new(executor));
+        Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::mips_exec::CpuDevice>
+        }}}
+
+        let cpu: Arc<dyn crate::mips_exec::CpuDevice> = match cfg_cpu_model {
+            crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
+            crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
+        };
+
+        // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
+        #[cfg(feature = "developer")]
+        if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
 
         // Connect CPU to MC and IOC for signaling
-        let cpu_device: Arc<dyn Device> = cpu.clone();
+        let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));
         ioc.set_interrupts(cpu.interrupts_ptr());
 
@@ -837,7 +841,7 @@ impl Machine {
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
             cpu.running_flag(),
             cpu.cycles_ptr(),
-            cpu.fasttick_count.clone(),
+            cpu.fasttick_count(),
             phys.rex3.clone(),
             hpc3.hal2().cloned(),
         ));
@@ -1092,7 +1096,7 @@ impl Machine {
 
     /// Return a type-erased CpuDebug handle for the GDB stub.
     pub fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> {
-        MipsCpuDebugAdapter::new(self.cpu.clone())
+        self.cpu.clone().debug_adapter()
     }
 
     /// Load a static ELF32 MSB binary into RAM and set PC to its entry point

@@ -195,6 +195,35 @@ mod tests {
         (exec, mem)
     }
 
+    /// A model's identity must be live the moment the executor exists — MipsCore::new
+    /// runs reset_registers before the model is known, so the constructor has to set
+    /// both the reset value and the live register. Caught a real bug: the guest read
+    /// R4400 out of an R5000 machine because only the reset value had been updated.
+    #[test]
+    fn cpu_model_identity_is_live_at_construction() {
+        fn build<C: crate::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>()
+            -> MipsExecutor<PassthroughTlb, C> {
+            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            MipsExecutor::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy())
+        }
+        let e4 = build::<R4400Cache>();
+        assert_eq!(e4.core.cp0_prid, 0x0000_0440, "R4400 PRId at construction");
+        assert_eq!(e4.core.fpu_fir,  0x0000_0500, "R4400 FIR at construction");
+        assert!(!R4400Cache::MIPS4, "R4400 is MIPS III");
+
+        let e5 = build::<crate::mips_cache_v2::R5000Cache>();
+        assert_eq!(e5.core.cp0_prid, 0x0000_2321, "R5000 PRId at construction");
+        assert_eq!(e5.core.fpu_fir,  0x0000_2300, "R5000 FIR at construction");
+        assert!(crate::mips_cache_v2::R5000Cache::MIPS4, "R5000 is MIPS IV");
+
+        // and they must survive a power_on, which re-derives from the reset values
+        let e5b = build::<crate::mips_cache_v2::R5000Cache>();
+        let mut core = e5b.core;
+        core.reset(false);
+        assert_eq!(core.cp0_prid, 0x0000_2321, "R5000 PRId after reset");
+        assert_eq!(core.fpu_fir,  0x0000_2300, "R5000 FIR after reset");
+    }
+
     // Instruction builders
     fn make_r(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | ((rs & 0x1F) << 21) | ((rt & 0x1F) << 16) | ((rd & 0x1F) << 11) | ((sa & 0x1F) << 6) | (funct & 0x3F)
