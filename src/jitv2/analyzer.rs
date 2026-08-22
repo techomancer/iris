@@ -423,6 +423,77 @@ pub struct CompiledInstr {
     /// never-independently-targeted delay slot" — a branch target is the
     /// opposite case, explicitly and independently reachable.
     pub is_branch_target: bool,
+    /// The on-page word the fallthrough (not-taken/sequential) edge
+    /// continues to, when that edge does *not* exit the region — mirrors
+    /// `fallthrough_exit`'s "one of these two is set, never both" split
+    /// (see this struct's own doc comment on why a `Branch`'s two edges
+    /// each need independent bookkeeping): `None` whenever
+    /// `fallthrough_exit` is `Some` (the edge exits instead) or the
+    /// instruction has no fallthrough edge at all (`RegJump`/`Jump`).
+    /// Filled in by the same `finish_visit`/`visit` call sites that
+    /// already resolve `fallthrough_exit` — exists purely so
+    /// `compute_cycles_flush` (a separate post-pass — see its own doc
+    /// comment for why it can't run inline during the walk) can look up
+    /// "what word does this edge land on" without re-deriving branch/jump
+    /// target arithmetic a second time. Meaningless when `visited` is
+    /// `false`.
+    pub continues_to_fallthrough: Option<WordOffset>,
+    /// The on-page word the taken (branch/jump) edge continues to, when
+    /// that edge does *not* exit the region — the `taken_exit` counterpart
+    /// to `continues_to_fallthrough`, same rationale. `None` whenever
+    /// `taken_exit` is `Some` or the instruction has no taken edge
+    /// (`Sequential`).
+    pub continues_to_taken: Option<WordOffset>,
+    /// `true` iff this word is a `Branch`/`Jump`/`RegJump` head with a real,
+    /// on-page mandatory delay slot inlined at `word + 1` (§6.1.4) — `false`
+    /// for `Sequential`/`is_fallback` heads (no slot at all) and for the
+    /// 0xFFC foreign-page-slot case (`finish_visit_foreign_page_slot`'s
+    /// callers — a branch/jump/regjump whose slot is on the *next*,
+    /// unwalkable page, so there's no `instrs[word+1]` on this page to
+    /// inline). Exists purely for `compute_cycles_flush`: emission order
+    /// puts the slot's own `emit_account_for_cycles` call strictly after
+    /// the head's (the head is accounted for in the pass-2 loop; the slot
+    /// is accounted for down inside whichever branch/jump emitter
+    /// processes it, called afterward) — so a flush decided for the head
+    /// itself would fire *before* the slot's own +1 ever accrues, silently
+    /// losing it (found live: a one-instruction `JR`+NOP region reported
+    /// `cycles` advancing by 1, not 2). `compute_cycles_flush` uses this
+    /// flag to push a would-be head flush onto the slot word instead,
+    /// since the slot is always the true last-to-retire word of the pair.
+    pub has_inline_slot: bool,
+    /// Always 1 — every visited word (a real head or a delay-slot-only
+    /// word alike) retires exactly one architectural instruction. Kept as
+    /// an explicit field rather than codegen using a bare literal so "how
+    /// much does this word contribute to the pending cycles count" and
+    /// "does this word flush that pending count to memory"
+    /// (`cycles_flush`) stay visibly independent concerns. See the
+    /// cycles-batching design: `rules/jitv2/` (or this module's own
+    /// `compute_cycles_flush` doc comment) for the full rationale — in
+    /// short, `Hot::cycles` must be current at every region exit and at
+    /// every loop re-entry point (for cross-thread observability of a
+    /// long-running compiled loop that never exits), but a straight-line
+    /// run of instructions between two such points can defer the store to
+    /// wherever the run ends instead of paying one store per instruction.
+    pub cycles_delta: u32,
+    /// `true` iff `core.hot.cycles` must be stored (flushed with whatever
+    /// has accrued since the previous flush) on this instruction's
+    /// outgoing edge, before control leaves along it. Computed by
+    /// `compute_cycles_flush`, a separate pass run after the reachability
+    /// walk completes (`is_branch_target` can be set on a word *later* in
+    /// the walk than the word itself was visited, so this can't be decided
+    /// inline during `visit`/`finish_visit`). `true` for every region-exit
+    /// word (`is_region_exit()`) and every instruction with a continuing
+    /// edge (`continues_to_fallthrough`/`continues_to_taken`) that lands on
+    /// an `is_branch_target` word or on `entry_word` itself (loop re-entry,
+    /// including the case where the
+    /// region's own entry word is the loop head) — both need cycles fresh
+    /// on arrival for the same cross-thread-observability reason exits do.
+    /// `false` for a plain interior word whose only edge continues
+    /// straight into another compiled instruction with no other
+    /// predecessor — codegen defers that word's `cycles_delta` into
+    /// whichever later word's flush eventually covers it. Meaningless when
+    /// `visited` is `false`.
+    pub cycles_flush: bool,
 }
 
 impl CompiledInstr {
@@ -437,7 +508,10 @@ impl CompiledInstr {
 
 impl Default for CompiledInstr {
     fn default() -> Self {
-        Self { visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false, is_branch_target: false }
+        Self {
+            visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false, is_branch_target: false,
+            continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 0, cycles_flush: false,
+        }
     }
 }
 
@@ -497,16 +571,40 @@ impl Analyzer {
     /// genuine excluded-instruction boundary.
     pub fn walk_bounded(&mut self, page: &[u32; ENTRIES_PER_PAGE], entry_word: WordOffset, page_base: u32, max_instrs: usize) -> (&[CompiledInstr; ENTRIES_PER_PAGE], bool) {
         self.instrs.fill(CompiledInstr::default());
-        let mut budget = Budget { remaining: max_instrs };
+        let mut budget = Budget::new(max_instrs, entry_word);
         let non_empty = visit(&mut self.instrs, page, page_base, entry_word, &mut budget);
+        if non_empty {
+            compute_cycles_flush(&mut self.instrs, entry_word, budget.min, budget.max);
+        }
         (&self.instrs, non_empty)
     }
 }
 
-/// Remaining instruction-visit budget for a bounded walk (`Analyzer::walk_bounded`).
-/// Threaded through `visit`/`visit_slot` by `&mut` alongside `instrs`/`page`.
+/// Remaining instruction-visit budget for a bounded walk (`Analyzer::walk_bounded`),
+/// plus the min/max word offsets visited so far. Threaded through
+/// `visit`/`visit_slot` by `&mut` alongside `instrs`/`page` — `min`/`max`
+/// piggyback on the same threading `remaining` already needs, rather than a
+/// separate parameter, since every "mark visited" site already has a
+/// `&mut Budget` in scope. Used after the walk completes
+/// (`Analyzer::walk_bounded`) to bound `compute_cycles_flush`'s post-pass to
+/// `min..=max` instead of scanning the full page.
 struct Budget {
     remaining: usize,
+    min: WordOffset,
+    max: WordOffset,
+}
+
+impl Budget {
+    fn new(remaining: usize, entry_word: WordOffset) -> Self {
+        Self { remaining, min: entry_word, max: entry_word }
+    }
+
+    /// Record `offset` as freshly marked visited — call from every site that
+    /// sets `instrs[offset].visited = true` for the first time.
+    fn mark_visited(&mut self, offset: WordOffset) {
+        self.min = self.min.min(offset);
+        self.max = self.max.max(offset);
+    }
 }
 
 /// Collect every visited instruction from a walked buffer, ascending by word
@@ -549,7 +647,7 @@ pub fn instrs_linear(instrs: &[CompiledInstr; ENTRIES_PER_PAGE]) -> impl Iterato
 /// slot-chain) is excluded or off-page — a slot (or slot-chain) that can't
 /// complete disqualifies the outermost branch exactly like an excluded slot
 /// always did.
-fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PER_PAGE], page_base: u32, offset: WordOffset) -> bool {
+fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PER_PAGE], page_base: u32, offset: WordOffset, budget: &mut Budget) -> bool {
     if offset >= WORDS_PER_PAGE {
         return false;
     }
@@ -588,8 +686,9 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: Some(StopReason::ForeignPageSlot),
             is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
-            is_branch_target: false,
+            is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false,
         };
+        budget.mark_visited(offset);
         return true;
     }
 
@@ -600,7 +699,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
     // has no further chain and stops here immediately.
     if !matches!(class, Classify::Sequential) {
         let next_slot = offset + 1;
-        if !visit_slot(instrs, page, page_base, next_slot) {
+        if !visit_slot(instrs, page, page_base, next_slot, budget) {
             return false;
         }
     }
@@ -608,8 +707,9 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
         fallthrough_exit: None, taken_exit: None, is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
-        is_branch_target: false,
+        is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false,
     };
+    budget.mark_visited(offset);
     true
 }
 
@@ -689,9 +789,10 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: None, is_slot_only: false,
             is_fallback: true, is_branch_fallback_successor: false,
-            is_branch_target: false,
+            is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false,
         };
         budget.remaining -= 1;
+        budget.mark_visited(offset);
         // Same fall-through recursion as Sequential (finish_visit's Sequential
         // arm), inlined here so finish_visit's `class` stays a real
         // (non-Excluded) Classify and its `unreachable!` on Excluded holds.
@@ -699,7 +800,10 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
         if !successor_in_region {
             let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
             instrs[offset as usize].fallthrough_exit = Some(reason);
-        } else if is_fallback_branch(raw) {
+        } else {
+            instrs[offset as usize].continues_to_fallthrough = Some(offset + 1);
+        }
+        if successor_in_region && is_fallback_branch(raw) {
             // A branch fallback (BC1) arms a delay slot when run: its successor
             // is that slot and, on a taken/not-taken-non-likely arm, is reached
             // with core.in_delay_slot=true + a pending delay_slot_target. Mark
@@ -758,16 +862,24 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     // a delay slot was never a truncation candidate (§6.1.4). Skipped
     // entirely for a 0xFFC branch/jump/regjump — there is no slot to walk.
     let slot = offset + 1;
-    if !is_0xffc_branch && !matches!(class, Classify::Sequential) && !visit_slot(instrs, page, page_base, slot) {
+    if !is_0xffc_branch && !matches!(class, Classify::Sequential) && !visit_slot(instrs, page, page_base, slot, budget) {
         return false;
     }
+
+    // This word has a real, on-page inline slot iff it's a Branch/Jump/
+    // RegJump AND not the 0xFFC foreign-slot case (whose mandatory slot is
+    // on the next, unwalkable page — nothing at `instrs[offset+1]` on this
+    // page belongs to it). See `has_inline_slot`'s doc comment for why
+    // `compute_cycles_flush` needs this.
+    let has_inline_slot = !is_0xffc_branch && !matches!(class, Classify::Sequential);
 
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
         fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false,
-        is_branch_target: false,
+        is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot, cycles_delta: 1, cycles_flush: false,
     };
     budget.remaining -= 1;
+    budget.mark_visited(offset);
 
     if is_0xffc_branch {
         return finish_visit_foreign_page_slot(instrs, offset, class);
@@ -794,6 +906,8 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
             if !visit(instrs, page, page_base, offset + 1, budget) {
                 let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
                 instrs[offset as usize].fallthrough_exit = Some(reason);
+            } else {
+                instrs[offset as usize].continues_to_fallthrough = Some(offset + 1);
             }
         }
         Classify::Excluded | Classify::RegionBoundary => unreachable!("handled above"),
@@ -812,6 +926,8 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
             if !visit(instrs, page, page_base, offset + 2, budget) {
                 let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
                 instrs[offset as usize].fallthrough_exit = Some(reason);
+            } else {
+                instrs[offset as usize].continues_to_fallthrough = Some(offset + 2);
             }
             match target {
                 Some(t) => {
@@ -823,6 +939,7 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
                         // instrs[t], which would silently clobber this
                         // flag if it were set beforehand.
                         instrs[t as usize].is_branch_target = true;
+                        instrs[offset as usize].continues_to_taken = Some(t);
                     } else {
                         let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
                         instrs[offset as usize].taken_exit = Some(reason);
@@ -839,6 +956,7 @@ fn finish_visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENT
                         // See the Branch arm above for why this is set
                         // after visit() returns, not before.
                         instrs[t as usize].is_branch_target = true;
+                        instrs[offset as usize].continues_to_taken = Some(t);
                     } else {
                         let reason = if budget.remaining == 0 { StopReason::Truncated } else { StopReason::Excluded };
                         instrs[offset as usize].taken_exit = Some(reason);
@@ -878,6 +996,76 @@ fn finish_visit_foreign_page_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE]
         Classify::Sequential | Classify::Excluded | Classify::RegionBoundary => unreachable!("is_0xffc_branch guarantees a branch/jump/regjump class"),
     }
     true
+}
+
+/// Second pass over an already-`visit`ed buffer: fills in `cycles_flush` for
+/// every visited word now that every `is_branch_target` bit is final (a
+/// word can be visited before some *later* branch in the walk marks it as a
+/// target, so `cycles_flush` can't be decided inline during
+/// `visit`/`finish_visit` the way `cycles_delta` — a pure function of the
+/// word's own class — can be). Called once by `Analyzer::walk_bounded`
+/// right after `visit` returns, bounded to `min_visited..=max_visited`
+/// (tracked incrementally during the walk via `Budget::mark_visited`) so it
+/// never scans more of the 1024-entry page than the walk actually touched.
+///
+/// A linear word-offset-ascending scan is sufficient here — no need to
+/// re-walk edges in chain order — because every field this reads
+/// (`is_region_exit()`, `continues_to_fallthrough`/`continues_to_taken`,
+/// `is_branch_target`) is already final for the whole buffer by the time
+/// this runs; `cycles_flush` is a pure per-instruction/per-edge fact, not
+/// an accumulated distance, so there is no ordering dependency between
+/// words to respect.
+///
+/// Sets `cycles_flush = true` for:
+/// - every region-exit word (`is_region_exit()`) — cycles must be current
+///   before control leaves the compiled unit, unconditionally;
+/// - every word whose continuing fallthrough or taken edge lands on an
+///   `is_branch_target` word, or on `entry_word` itself — a loop
+///   re-entering there (whether an ordinary in-region back-edge, or the
+///   case where the region's own entry word doubles as the loop head)
+///   must have cycles fresh on arrival, so a busy-wait spinning on another
+///   thread (see `Hot::cycles`'s doc comment) keeps observing it advance
+///   even if this compiled unit never otherwise exits.
+///
+/// `entry_word` deliberately never gets `cycles_flush` set on its *own*
+/// row for this reason — the flush obligation lands on whichever
+/// predecessor's edge targets it, exactly like any other branch-target
+/// arrival; entry_word's block is shared between external dispatch
+/// (cycles already current, nothing pending) and internal back-edge
+/// arrival (predecessor already flushed before jumping in), so both modes
+/// see a body that starts counting fresh from zero pending, uniformly.
+fn compute_cycles_flush(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], entry_word: WordOffset, min_visited: WordOffset, max_visited: WordOffset) {
+    for word in min_visited..=max_visited {
+        if !instrs[word as usize].visited {
+            continue;
+        }
+        let mut flush = instrs[word as usize].is_region_exit();
+        if let Some(t) = instrs[word as usize].continues_to_fallthrough {
+            flush |= instrs[t as usize].is_branch_target || t == entry_word;
+        }
+        if let Some(t) = instrs[word as usize].continues_to_taken {
+            flush |= instrs[t as usize].is_branch_target || t == entry_word;
+        }
+        if !flush {
+            continue;
+        }
+        // A word with a real inline slot (`has_inline_slot`) is never the
+        // last one to retire for its own edge — codegen always emits its
+        // slot's `emit_account_for_cycles` call strictly after the head's
+        // (`emit_slot_semantics`, invoked from within whichever
+        // branch/jump/regjump emitter processes this word). Deciding the
+        // flush *here*, on the head, would fire before the slot's own
+        // pending contribution ever accrues, silently losing it — push the
+        // obligation onto the slot word (`word + 1`, always the real
+        // on-page slot per `has_inline_slot`'s doc comment) instead; the
+        // head keeps `cycles_flush = false` and just contributes its
+        // `cycles_delta` like any other batched word.
+        if instrs[word as usize].has_inline_slot {
+            instrs[(word + 1) as usize].cycles_flush = true;
+        } else {
+            instrs[word as usize].cycles_flush = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1335,5 +1523,139 @@ mod tests {
         assert!(non_empty, "excluded entry is now a compilable fallback region");
         assert_eq!(instrs_linear(result).count(), 1);
         assert!(result[0].visited && result[0].is_fallback);
+    }
+
+    // --- cycles_delta / cycles_flush ---
+
+    #[test]
+    fn cycles_delta_is_always_one_for_every_visited_word() {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop
+        page[1] = 0; // nop
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra
+        page[3] = 0; // delay slot
+        let mut a = Analyzer::new();
+        let (result, _) = a.walk(&page, 0, 0);
+        for i in instrs_linear(result) {
+            assert_eq!(i.cycles_delta, 1, "word {} should contribute exactly 1", i.word);
+        }
+    }
+
+    #[test]
+    fn cycles_flush_straight_line_only_flushes_at_the_exit() {
+        // A plain straight-line region with no internal branch target: only
+        // the exit should flush. Every interior word batches into it. The
+        // regjump's own flush is deliberately pushed onto its delay slot
+        // (word 4), not the regjump itself (word 3) -- codegen emits the
+        // slot's own emit_account_for_cycles call strictly after the
+        // head's, so flushing at the head would fire before the slot's own
+        // +1 ever accrues (see has_inline_slot's doc comment).
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop
+        page[1] = 0; // nop
+        page[2] = 0; // nop
+        page[3] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra
+        page[4] = 0; // delay slot
+        let mut a = Analyzer::new();
+        let (result, _) = a.walk(&page, 0, 0);
+        assert!(!result[0].cycles_flush, "word 0 has no branch target/exit on its edge");
+        assert!(!result[1].cycles_flush);
+        assert!(!result[2].cycles_flush);
+        assert!(!result[3].cycles_flush, "the regjump's flush is deferred to its own delay slot");
+        assert!(result[4].cycles_flush, "the delay slot is the true last-to-retire word of the pair");
+    }
+
+    #[test]
+    fn cycles_flush_forward_branch_target_flushes_the_branch_but_not_the_straight_run() {
+        // word 0: BEQ r1,r2, +3 -> taken target = 0+1+3 = 4 (word 4, marked
+        // is_branch_target). Not-taken (fallthrough) arm runs straight
+        // through word 2 (nop) to word 3 (another nop) before reaching word
+        // 4 too -- both paths converge on word 4, so both the branch's own
+        // taken edge (word 0, pushed onto its own slot at word 1 --
+        // has_inline_slot) AND the last fallthrough hop into it (word 3)
+        // must flush; only the interior word 2, whose edge lands on
+        // non-branch-target word 3, gets to batch. Word 4 (jr ra) is itself
+        // a region exit, but that flush is likewise deferred to its own
+        // slot (word 5).
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = i_type(OP_BEQ, 1, 2, 3);
+        page[1] = 0; // delay slot -- branch's flush lands here (has_inline_slot)
+        page[2] = 0; // not-taken arm: nop, falls through to word 3 (not a branch target)
+        page[3] = 0; // another nop, falls through to word 4 (a branch target) -- must flush
+        page[4] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // branch target AND fallthrough landing, then exits
+        page[5] = 0; // delay slot -- word 4's own exit-flush lands here
+        let mut a = Analyzer::new();
+        let (result, _) = a.walk(&page, 0, 0);
+        assert!(result[4].is_branch_target, "word 4 is BEQ's taken target");
+        assert!(!result[0].cycles_flush, "branch's own flush is deferred to its slot (word 1)");
+        assert!(result[1].cycles_flush, "branch's taken edge lands on a branch-target word, flush pushed to the slot");
+        assert!(!result[2].cycles_flush, "word 2's edge lands on word 3, which is not a branch target");
+        assert!(result[3].cycles_flush, "word 3's fallthrough edge lands on branch-target word 4");
+        assert!(!result[4].cycles_flush, "word 4's own exit-flush is deferred to its slot (word 5)");
+        assert!(result[5].cycles_flush, "word 4's delay slot is the true last-to-retire word for its exit");
+    }
+
+    #[test]
+    fn cycles_flush_back_edge_loop_flushes_at_the_branch_targeting_the_loop_head() {
+        // word 0: nop (loop head, also entry_word)
+        // word 1: BEQ r1,r2, -2 -> target = 1+1+(-2) = 0 (back-edge to entry_word)
+        // word 2: delay slot -- branch's flush (targeting entry_word) lands here
+        // word 3: jr ra (not-taken arm falls through here and exits)
+        // word 4: jr ra's own delay slot -- its exit-flush lands here
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop, entry_word and loop head
+        page[1] = i_type(OP_BEQ, 1, 2, (-2i16) as u16);
+        page[2] = 0; // delay slot
+        page[3] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // not-taken arm exits here
+        page[4] = 0; // delay slot
+        let mut a = Analyzer::new();
+        let (result, _) = a.walk(&page, 0, 0);
+        assert_eq!(result[0].word, 0);
+        assert!(!result[0].cycles_flush, "entry_word's own row is never independently a flush trigger");
+        assert!(!result[1].cycles_flush, "the branch's own flush is deferred to its slot (word 2)");
+        assert!(result[2].cycles_flush, "the branch's taken edge targets entry_word -- flush pushed to the slot, the true last-to-retire word");
+        assert!(!result[3].cycles_flush, "not-taken arm's exit-flush is deferred to its own slot (word 4)");
+        assert!(result[4].cycles_flush, "jr ra's delay slot is the true last-to-retire word for its exit");
+    }
+
+    #[test]
+    fn cycles_flush_single_instruction_regjump_region_flushes_at_the_slot_not_the_head() {
+        // Regression test for a real bug: a one-head region (entry_word ==
+        // the regjump itself, e.g. `jr ra` with a real NOP slot,
+        // max_instrs=1) must flush at word 1 (the slot), not word 0 (the
+        // regjump). Getting this wrong meant codegen's pass-2 loop flushed
+        // `cycles_pending` right after accounting for the head (before the
+        // slot's own emit_account_for_cycles call ever ran), storing 1
+        // instead of 2 -- caught by
+        // equiv_test::tests::jr_with_nop_slot_fuses_and_still_advances_cycles_by_two.
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra
+        page[1] = 0; // real NOP delay slot
+        let mut a = Analyzer::new();
+        let (result, _) = a.walk_bounded(&page, 0, 0, 1);
+        assert!(result[0].has_inline_slot);
+        assert!(!result[0].cycles_flush, "the regjump's own flush must be deferred to its slot");
+        assert!(result[1].cycles_flush, "the slot is the true last-to-retire word for this region's only exit");
+    }
+
+    #[test]
+    fn cycles_flush_post_pass_is_bounded_by_min_max_visited() {
+        // Regression guard for the min/max bound compute_cycles_flush is
+        // scanned over: entry_word starts mid-page, so words before it (and
+        // far beyond the walked region) must never have cycles_flush set --
+        // if the post-pass scanned the whole page instead of
+        // [min_visited, max_visited], unvisited words would still read
+        // false (they default to it), so this mostly guards against a
+        // panic/out-of-bounds if the bound were ever wrong, and documents
+        // the intent.
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[10] = 0; // nop
+        page[11] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra
+        page[12] = 0; // delay slot
+        let mut a = Analyzer::new();
+        let (result, _) = a.walk(&page, 10, 0);
+        assert!(!result[0].visited);
+        assert!(!result[0].cycles_flush);
+        assert!(result[12].cycles_flush, "jr ra's exit-flush is deferred to its own slot (word 12)");
     }
 }

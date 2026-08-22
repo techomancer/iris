@@ -183,6 +183,25 @@ struct EmitCtx<'a, 'b> {
     exception_call_block: Block,
     exception_entry_word_block: Block,
     exception_other_word_block: Block,
+    /// Compile-time-only running total of retired-but-not-yet-stored
+    /// instructions since the last `core.hot.cycles` flush — see the
+    /// analyzer's `CompiledInstr::cycles_delta`/`cycles_flush` doc comments
+    /// for the full design (batching `emit_increment_cycles`'s old
+    /// per-instruction store into one store per flush point). Lives outside
+    /// `EmitCtx` itself, in `compile_region_uncommitted`'s pass-2 loop —
+    /// this is a `&mut` borrow of it, not owned state, because a fresh
+    /// `EmitCtx` is constructed every loop iteration (one per head
+    /// instruction) but the pending count must survive across iterations
+    /// until a flush resets it to 0. Threaded via `EmitCtx` rather than as
+    /// a plain function parameter because `emit_slot_semantics`/
+    /// `try_emit_fused_nop_slot` (which also need to add to it) are called
+    /// from several different call chains several frames below the pass-2
+    /// loop (`emit_branch_or_jump`, `emit_regjump`,
+    /// `emit_nested_branch_slot`, `emit_nested_regjump_slot`) — `EmitCtx`
+    /// is already threaded through every one of those as `&mut ctx`, so
+    /// this rides along for free instead of widening every signature on
+    /// the path.
+    cycles_pending: &'a mut u32,
 }
 
 /// Result of the block-allocation first pass: every visited instruction's
@@ -941,7 +960,12 @@ impl Codegen {
         // own body, emitted before its terminating jump to entry_word_block.
         let has_fpu = instrs_linear(instrs).any(|i| lookup_cp1_semantics(i.raw).is_some());
         if has_fpu {
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: entry_word, entry_word, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+            // Not part of any head instruction's own retirement — this
+            // guard runs (at most) once in entry_block, before any
+            // instruction's cycles_delta/cycles_flush bookkeeping begins,
+            // so a throwaway local is correct here (never read back).
+            let mut unused_cycles_pending = 0u32;
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: entry_word, entry_word, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
             emit_fpu_entry_guard(&mut guard_ctx, entry_word, compiled_for_fr1);
         }
         // Skip straight to entry_word_body_block (bypassing the preamble)
@@ -988,6 +1012,14 @@ impl Codegen {
         // Nothing is sealed here — a block's predecessor set (especially a
         // backward branch target's) isn't complete until this whole pass
         // finishes.
+        //
+        // Compile-time-only running total of retired-but-unflushed
+        // instructions, threaded into each iteration's `ctx` via
+        // `cycles_pending` — see `EmitCtx::cycles_pending`'s doc comment.
+        // Declared once, outside the loop, specifically because it must
+        // survive across iterations (only a `cycles_flush` word resets it)
+        // even though a fresh `ctx` is constructed every iteration.
+        let mut cycles_pending: u32 = 0;
         for &(word, block) in &instr_blocks {
             builder.switch_to_block(block);
 
@@ -999,7 +1031,7 @@ impl Codegen {
             // this word's emission (including a faulting slot instruction) picks
             // the right exception outer stage.
             let trust_live_pc_bd_on_exc = word == entry_word || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, entry_word, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, entry_word, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
 
             if word == entry_word && entry_word_body_block.is_some() {
                 // entry_word_block is reached only by internal in-region
@@ -1102,12 +1134,12 @@ impl Codegen {
             // Past the preamble: this instruction is actually going to
             // execute (the preamble didn't bail to the interpreter for this
             // word), matching step()'s per-instruction cycle count exactly —
-            // see emit_increment_cycles's doc comment for why this
+            // see emit_account_for_cycles's doc comment for why this
             // can't go before the preamble (a bail here falls through to
             // the interpreter's step() re-entering at this same PC within
             // the *same* step() call, which already incremented once at its
             // own entry; incrementing here too would double-count).
-            emit_increment_cycles(&mut ctx);
+            emit_account_for_cycles(&mut ctx, instrs, word);
 
             if word == entry_word {
                 if let Some(body_block) = entry_word_body_block {
@@ -2360,22 +2392,50 @@ fn core_offset_of_cycles() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, cycles)) as i32
 }
 
-/// Increment `core.hot.cycles` by one — the JIT-compiled-code counterpart to
-/// the interpreter's `step()` incrementing it once per `step()` call
-/// (`src/mips_exec.rs`: a real, direct, per-instruction write — see
-/// `Hot::cycles`'s own doc comment for why this must never be a batched
-/// local shadow). A compiled unit never calls the interpreter's `step()` for
-/// the instructions it covers, so without this, `cycles` — and everything
-/// that depends on it being visibly live while a hot guest loop runs
-/// entirely inside JIT-compiled code (e.g. `Wd33c93a`'s BSD SCSI
-/// deferred-interrupt spin-wait, on a completely different thread) — would
-/// silently stop advancing for however many instructions ran under real JIT
-/// dispatch. Called once per head instruction (the per-instruction emission
-/// loop in `compile_region`) and once per inlined delay slot
+/// Account for one retiring architectural instruction against
+/// `core.hot.cycles` — the JIT-compiled-code counterpart to the
+/// interpreter's `step()` incrementing it once per `step()` call
+/// (`src/mips_exec.rs`: a real, direct write — see `Hot::cycles`'s own doc
+/// comment for why it must never silently stop advancing). A compiled unit
+/// never calls the interpreter's `step()` for the instructions it covers, so
+/// without this, `cycles` — and everything that depends on it being visibly
+/// live while a hot guest loop runs entirely inside JIT-compiled code (e.g.
+/// `Wd33c93a`'s BSD SCSI deferred-interrupt spin-wait, on a completely
+/// different thread) — would silently stop advancing for however many
+/// instructions ran under real JIT dispatch.
+///
+/// Batched, not a store per instruction: adds `word`'s
+/// `CompiledInstr::cycles_delta` (always 1 — see that field's doc comment)
+/// to `*ctx.cycles_pending` unconditionally, then stores the running total
+/// to memory — resetting it to 0 — only when `word`'s `cycles_flush` is
+/// set. The analyzer's `compute_cycles_flush` post-pass guarantees this is
+/// safe: `cycles_flush` is true at every region exit and at every loop
+/// re-entry point (ordinary back-edge target, or the region's own
+/// `entry_word` when it doubles as a loop head), which is exactly
+/// everywhere `Hot::cycles`'s cross-thread-observability contract requires
+/// a fresh value in memory — see that field's doc comment for the full
+/// reasoning. A plain interior word between two such points has
+/// `cycles_flush = false` and just grows the pending count, no store at
+/// all.
+///
+/// Called once per head instruction (the per-instruction emission loop in
+/// `compile_region_uncommitted`) and once per inlined delay slot
 /// (`emit_slot_semantics`) — a branch/jump's delay slot is a second,
 /// separate architectural instruction retiring, even though it has no
 /// head-instruction loop iteration of its own (it's always inlined into its
-/// branch's compiled body, §6.1.4).
+/// branch's compiled body, §6.1.4). Both call sites pass the word whose
+/// `cycles_delta`/`cycles_flush` apply — the head's own `word` for the
+/// first, the slot's own word for the second.
+///
+/// A branch/jump/regjump head with a real inline slot never has
+/// `cycles_flush = true` on its own row, even when it's a region exit —
+/// `compute_cycles_flush` deliberately pushes that decision onto the slot
+/// word (`has_inline_slot`'s doc comment). This function doesn't need to
+/// know that; it just trusts whatever `cycles_flush` says for the exact
+/// `word` it's given, which is already correct by construction as long as
+/// every call site passes the *actually retiring* word (the head's own for
+/// the head-loop call, the slot's own for the slot call) rather than
+/// assuming the head "speaks for" its slot.
 ///
 /// Plain load/store here, not `ptr::read_volatile`/`write_volatile` the way
 /// the interpreter's own increment site does it in Rust: Cranelift's
@@ -2384,12 +2444,18 @@ fn core_offset_of_cycles() -> i32 {
 /// are dead and elides them" risk inside a single compiled unit the way
 /// there theoretically is for a pure-Rust unbounded loop) — the volatile
 /// requirement is specific to the interpreter's own increment, not this one.
-fn emit_increment_cycles(ctx: &mut EmitCtx) {
+fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) {
+    let instr = &instrs[word as usize];
+    *ctx.cycles_pending += instr.cycles_delta;
+    if !instr.cycles_flush {
+        return;
+    }
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_cycles());
     let prev = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
-    let next = ctx.builder.ins().iadd_imm_s(prev, 1);
+    let next = ctx.builder.ins().iadd_imm_s(prev, *ctx.cycles_pending as i64);
     ctx.builder.ins().store(mem, next, ctx.core_ptr, off);
+    *ctx.cycles_pending = 0;
 }
 fn core_offset_of_interrupts() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, interrupts)) as i32
@@ -3653,7 +3719,7 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
     }
 
     let slot_raw = instrs[slot_word as usize].raw;
-    if !try_emit_fused_nop_slot(ctx, slot_raw) {
+    if !try_emit_fused_nop_slot(ctx, instrs, slot_word, slot_raw) {
         // Recurse into the slot's own emission with ctx.raw/ctx.word switched
         // to the slot's — restored after, mirroring emit_slot_semantics' own
         // core.pc save/restore around the same call.
@@ -4143,7 +4209,7 @@ fn emit_branch_or_jump(
     // likewise arms the slot's target before the branch's own commit,
     // using whichever destination the condition resolved to).
     let emit_slot = |ctx: &mut EmitCtx, target: Value| -> bool {
-        if try_emit_fused_nop_slot(ctx, slot_raw) {
+        if try_emit_fused_nop_slot(ctx, instrs, slot_word, slot_raw) {
             return false;
         }
         ctx.raw = slot_raw;
@@ -4443,12 +4509,14 @@ fn emit_target_edge(
 /// flag, no `core.pc` save/store/restore, no BD bookkeeping, no dev-trace/bp
 /// hook — since a NOP has no architectural effect and (being `raw == 0`) can
 /// never itself be a nested branch/jump/regjump, never raises an exception,
-/// and is never worth single-stepping to. Only `emit_increment_cycles` runs
-/// here, once more, to keep `core.hot.cycles` advancing by one per retired
-/// instruction — the branch/jump itself already got its own increment from
-/// `compile_region`'s per-head-instruction loop (line ~1110) before this
-/// runs, so this call accounts for the fused slot only, giving the pair a
-/// combined +2 without this function double-counting the branch's own +1.
+/// and is never worth single-stepping to. Only `emit_account_for_cycles`
+/// runs here, once more, to keep `core.hot.cycles` bookkeeping current for
+/// the fused slot's own retirement — the branch/jump itself already
+/// accounted for its own retirement from `compile_region_uncommitted`'s
+/// per-head-instruction loop before this runs, so this call accounts for
+/// the fused slot only, giving the pair a combined pending-count
+/// contribution of 2 without this function double-counting the branch's
+/// own share.
 ///
 /// This compiled unit's `opt_level = "none"` (see
 /// `rules/jit/cranelift-opt-levelnone-is-the-right-trade-for-throughput-jits.md`)
@@ -4470,10 +4538,10 @@ fn emit_target_edge(
 /// so callers don't need to check for early-return the way they do for its
 /// `bool` result), `false` if the slot needs the normal path.
 #[cfg_attr(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
-fn try_emit_fused_nop_slot(ctx: &mut EmitCtx, slot_raw: u32) -> bool {
+fn try_emit_fused_nop_slot(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], slot_word: WordOffset, slot_raw: u32) -> bool {
     #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"))]
     {
-        let _ = slot_raw;
+        let _ = (instrs, slot_word, slot_raw);
         false
     }
     #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer"))))]
@@ -4481,7 +4549,7 @@ fn try_emit_fused_nop_slot(ctx: &mut EmitCtx, slot_raw: u32) -> bool {
         if slot_raw != 0 {
             return false;
         }
-        emit_increment_cycles(ctx);
+        emit_account_for_cycles(ctx, instrs, slot_word);
         true
     }
 }
@@ -4546,8 +4614,8 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     // nested-branch-in-delay-slot case too (this call's own slot instruction
     // still retires before `emit_nested_branch_slot` recurses into whatever
     // *that* slot's own delay slot is, which gets its own separate
-    // `emit_slot_semantics` call and its own increment).
-    emit_increment_cycles(ctx);
+    // `emit_slot_semantics` call and its own accounting).
+    emit_account_for_cycles(ctx, instrs, slot_word);
 
     // Developer per-instruction hook (dt traceback + PC breakpoints), same
     // as the head-instruction loop's own emit_dev_trace_bp call — without
@@ -7354,7 +7422,10 @@ mod tests {
             let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
 
             {
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, entry_word: word_offset, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block };
+                // Test harness for preamble emitters only (see this
+                // function's doc comment) — never touches cycles bookkeeping.
+                let mut unused_cycles_pending = 0u32;
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, entry_word: word_offset, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
