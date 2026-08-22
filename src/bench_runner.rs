@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 
 use crate::bench_report::{host_info, parse_block, Run};
 use crate::benchsuite;
-use crate::config::MachineConfig;
+use crate::config::{CpuModel, MachineConfig};
 use crate::machine::Machine;
 use crate::testdev::{RunConfig, TestDevice};
 
@@ -57,6 +57,9 @@ pub struct BenchOptions {
     pub banks: [u32; 4],
     /// A hang detector, not a performance budget.
     pub timeout: Duration,
+    /// Emulated CPU. Runtime config since 96e5ddd, so the in-process runner picks
+    /// it like any other machine setting rather than needing its own build.
+    pub cpu: CpuModel,
     /// Set this to abort. The machine is stopped and `run` returns an error —
     /// there is no partial report, because the suite prints its block only at
     /// the end. Exists so an interactive caller's Stop button does something
@@ -70,6 +73,7 @@ impl Default for BenchOptions {
             quick: false,
             label: "local".to_string(),
             banks: BENCH_BANKS,
+            cpu: CpuModel::default(),
             timeout: Duration::from_secs(1800),
             cancel: None,
         }
@@ -139,7 +143,7 @@ fn run_inner(
 
     let started = Instant::now();
     let mut machine = Box::new(Machine::new_with_testdev(
-        bench_config(opts.banks),
+        bench_config(opts.banks, opts.cpu),
         Some(testdev),
     ));
     // Deliberately no `register_system_controller`: it hands a raw pointer to
@@ -290,7 +294,7 @@ impl Table {
 /// The bare-metal machine the suite runs on: RAM, a test device, and nothing
 /// else. No SCSI (there is no disk image and no filesystem to find one on), no
 /// graphics, no audio.
-pub fn bench_config(banks: [u32; 4]) -> MachineConfig {
+pub fn bench_config(banks: [u32; 4], cpu: CpuModel) -> MachineConfig {
     let mut cfg = MachineConfig {
         banks,
         headless: true,
@@ -301,6 +305,7 @@ pub fn bench_config(banks: [u32; 4]) -> MachineConfig {
     // when the file is absent — and here it always is. Same reason
     // bench/run/bare.toml carries a present-but-empty `[scsi]`.
     cfg.scsi.clear();
+    cfg.machine.cpu = cpu;
     cfg
 }
 
@@ -382,7 +387,7 @@ mod tests {
 
     #[test]
     fn the_bench_machine_has_no_disks() {
-        let cfg = bench_config(BENCH_BANKS);
+        let cfg = bench_config(BENCH_BANKS, CpuModel::default());
         assert!(cfg.scsi.is_empty(), "a bench machine must not try to open a disk image");
         assert!(cfg.headless && cfg.no_audio);
     }

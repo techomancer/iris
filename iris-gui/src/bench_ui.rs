@@ -42,6 +42,8 @@ pub struct BenchState {
     /// worker is gone.
     last: Option<Result<Box<Run>, String>>,
     quick: bool,
+    /// Which CPU to benchmark. Runtime config, so this needs no separate build.
+    cpu: iris::config::CpuModel,
     /// Parsed once. Normally empty — see `iris::bench_report::bundled_reference`.
     reference: Option<ReferenceTable>,
     dev: DevRunner,
@@ -59,6 +61,7 @@ impl Default for BenchState {
             // number, and is required before a result can go in the reference
             // table.
             quick: true,
+            cpu: iris::config::CpuModel::default(),
             reference: None,
             dev: DevRunner::default(),
         }
@@ -98,7 +101,7 @@ impl BenchState {
         self.live.is_some() || self.dev.is_running()
     }
 
-    fn start(&mut self, quick: bool) {
+    fn start(&mut self, quick: bool, cpu: iris::config::CpuModel) {
         if self.is_running() { return; }
 
         let lines = Arc::new(Mutex::new(Vec::new()));
@@ -108,6 +111,7 @@ impl BenchState {
 
         let opts = BenchOptions {
             quick,
+            cpu,
             label: iris::bench_report::cpu_model(),
             cancel: Some(cancel.clone()),
             ..Default::default()
@@ -228,9 +232,28 @@ fn controls(ui: &mut Ui, st: &mut BenchState, machine_running: bool) {
                 .on_hover_text(format!("About {secs} seconds. Runs entirely inside this app."))
                 .clicked()
             {
-                let quick = st.quick;
-                st.start(quick);
+                let (quick, cpu) = (st.quick, st.cpu);
+                st.start(quick, cpu);
             }
+        });
+
+        ui.add_enabled_ui(!busy, |ui| {
+            // The CPU is a machine setting, not a build, so the suite can measure
+            // either one from this binary. IRIX-visible: different PRId, cache
+            // geometry and ISA level, so treat the two scores as different machines.
+            egui::ComboBox::from_id_salt("bench_cpu")
+                .selected_text(st.cpu.label())
+                .show_ui(ui, |ui| {
+                    for m in iris::config::CpuModel::ALL {
+                        ui.selectable_value(&mut st.cpu, m, m.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Which CPU to benchmark. R4400 is 16 KB direct-mapped L1s with a \
+                     secondary cache and MIPS III; R5000 is 2-way 32 KB L1s, no \
+                     secondary cache and MIPS IV. Scores are not comparable between them.",
+                );
         });
 
         ui.add_enabled_ui(!busy, |ui| {
