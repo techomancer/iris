@@ -106,14 +106,14 @@ jobs:
       # one drifts dangerously: accuracy is scored against golden checksums
       # compiled *into* the image, so a stale image against fresh goldens
       # reports failures to users that are not real.
-      - name: bench — checked-in guest binary matches what we just built
-        run: |
-          make -C bench prebuilt
-          if ! git diff --exit-code bench/prebuilt/; then
-            echo "::error::bench/prebuilt/irisbench.elf is stale."
-            echo "::error::Run 'make -C bench prebuilt' and commit the result."
-            exit 1
-          fi
+      #
+      # Compares a digest of the *sources* rather than the image bytes. Byte
+      # comparison against a fresh build does not work and this job proved it:
+      # the guest is compiled with -g, so DWARF records the build directory, and
+      # a runner's path is never a developer's. Two correct builds of identical
+      # source differ. See bench/prebuilt-stamp.py.
+      - name: bench — checked-in guest binary matches its sources
+        run: make -C bench check-prebuilt
 
       # One binary of each for every cell below — that is what makes the matrix
       # a differential test rather than N independent runs.

@@ -62,7 +62,7 @@ LIBGCC :=
 
 PREBUILT := prebuilt/irisbench.elf
 
-.PHONY: all clean run dis syms image golden hostbench matrix bench report check-size prebuilt
+.PHONY: all clean run dis syms image golden hostbench matrix bench report check-size prebuilt check-prebuilt
 all: $(TARGET)
 
 # Refresh the copy of the guest binary that `iris` links in with include_bytes!
@@ -75,13 +75,14 @@ all: $(TARGET)
 prebuilt: $(TARGET)
 	@mkdir -p prebuilt
 	cp $(TARGET) $(PREBUILT)
-	@python3 -c "import hashlib,os; \
-	  h=lambda p: hashlib.sha256(open(p,'rb').read()).hexdigest(); \
-	  open('prebuilt/PROVENANCE','w').write( \
-	    '# What the checked-in guest binary hashes to. See README.md.\n' + \
-	    'irisbench.elf     sha256 %s  %d bytes\n' % (h('$(PREBUILT)'), os.path.getsize('$(PREBUILT)')) + \
-	    'golden/golden.h   sha256 %s  %d bytes\n' % (h('golden/golden.h'), os.path.getsize('golden/golden.h')))"
+	@python3 prebuilt-stamp.py --write
 	@echo "prebuilt: $(PREBUILT) refreshed — commit it with the change that caused it"
+
+# Is the checked-in image still the one these sources build? Needs no cross
+# toolchain and no compile — it hashes the inputs. See prebuilt-stamp.py for why
+# this is not a byte comparison against a fresh build.
+check-prebuilt:
+	@python3 prebuilt-stamp.py --check
 
 $(BUILD)/%.o: harness/%.c
 	@mkdir -p $(dir $@)
