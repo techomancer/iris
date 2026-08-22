@@ -217,21 +217,43 @@ in the monitor shows its MAC, addresses and counters. Full protocol and
 verification notes: [docs/daynaport.md](docs/daynaport.md).
 
 
-## R5000 CPU (`--features r5k`)
+## Emulated CPU
 
-Switches the emulated CPU from R4400 to R5000:
+R4400 (the default) or R5000, chosen per machine at runtime — not at build time.
+Both cache models are compiled into every binary and the machine picks between
+them when it starts, so there is no separate R5000 build or download.
 
-- 32KB 2-way set-associative L1I and L1D (32B lines) instead of 16KB direct-mapped (16B lines)
-- PRID `0x00002321` (R5000 rev 2.1), FPU FIR `0x00002300` (imp 0x23)
-- CP0 Config reports `SC=1` (no secondary cache); PROM uses the 2-way index-flush path
+| | R4400 | R5000 |
+|---|---|---|
+| L1 I/D | 16KB direct-mapped, 16B lines | 32KB 2-way, 32B lines |
+| Secondary cache | 1MB unified L2 | none (Config `SC=1`) |
+| ISA | MIPS III | MIPS IV |
+| PRId / FPU FIR | `0x00000440` / `0x00000500` | `0x00002321` / `0x00002300` |
 
-The 2-way associativity requires probing both ways on every fetch/read/write, which
-carries a small performance cost compared to the R4K direct-mapped path — expect
-roughly 5% lower instruction throughput.
+This is a different machine to the guest, not a speed knob: IRIX reads PRId and
+configures itself from it, and an R4400 raises Reserved Instruction on the MIPS IV
+opcodes an R5000 executes.
+
+Which one is faster depends on the engine, so don't compare scores across CPUs.
+On the bare-metal suite the R5000 is about 17% slower under the interpreter —
+2-way associativity means probing both ways on every fetch, read and write — but
+about 10% faster under jitv2, where the larger cache and 32-byte lines pay off
+and the probe is not on the critical path.
+
+Pick it in the GUI (Machine menu, or the General tab of the configuration area),
+in a config file, or on the command line:
 
 ```
-cargo run --release --features r5k
+cargo run --release -- --cpu r5000        # or r4400, the default
 ```
+
+```toml
+[machine]
+cpu = "r5000"
+```
+
+A snapshot records the CPU it was taken on and refuses to restore onto the other
+one, since the captured state assumes that machine.
 
 
 ## JIT compilers

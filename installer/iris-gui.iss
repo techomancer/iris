@@ -38,18 +38,15 @@
   #define ArchIdentifier "x64compatible"
 #endif
 
-; CPU variant of the bundled iris-gui.exe. CI passes /DR5000=1 for the R5000
-; build; without it this is the default R4400 build. The two get distinct AppIds,
-; names, and default folders so both can be installed side by side — same binary
-; layout, different emulated CPU (a compile-time choice, so they can't be one
-; installer with a switch).
-#ifdef R5000
-  #define MyAppName "IRIS (R5000)"
-  #define MyAppId "{{2B6E5D74-9C41-4A83-B7F0-5E1C8D2A64B9}"
-#else
-  #define MyAppName "IRIS"
-  #define MyAppId "{{A7F2C91E-3D8B-4F5A-8E2C-1B9D6A3E8F42}"
-#endif
+; One installer, both CPUs. There used to be a separate "IRIS (R5000)" product
+; with its own AppId, because the emulated CPU was a compile-time cargo feature
+; and the two builds genuinely were different programs. It stopped being one:
+; both cache models are compiled into every binary and the machine picks between
+; them from its config, so a second installer would ship an identical exe under
+; a different name. Choose the CPU in the app (Machine menu, or the General tab)
+; or on the command line with `--cpu r4400|r5000`.
+#define MyAppName "IRIS"
+#define MyAppId "{{A7F2C91E-3D8B-4F5A-8E2C-1B9D6A3E8F42}"
 #define MyAppPublisher "Dani Sarfati"
 #define MyAppURL "https://github.com/danifunker/iris"
 #define MyAppExeName "iris-gui.exe"
