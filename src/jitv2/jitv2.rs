@@ -942,8 +942,8 @@ impl PhysicalCodePage {
         // Relaxed CAS loop: this is a diagnostic counter with no ordering
         // relationship to any other state, and contention is effectively nil
         // (compiles for a given page are serialized), so a plain
-        // fetch_update-style saturating add is all that's needed.
-        let _ = c.fetch_update(
+        // try_update-style saturating add is all that's needed.
+        let _ = c.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
             |v| Some(v.saturating_add(1)),
