@@ -3076,10 +3076,23 @@ impl App {
         ui.separator();
         let name = self.prefs.active_machine.as_deref().unwrap_or("(unsaved)");
         let profile = self.cfg.machine.profile.label();
+        // While running, name the CPU the guest actually booted on — the config
+        // may already have been changed to one that only takes effect next Start.
+        let running_cpu = if self.emu.is_running() { self.started_cpu } else { None };
+        let cpu = running_cpu.unwrap_or(self.cfg.machine.cpu);
         ui.label(format!(
-            "Machine: {name} · {profile}{}",
+            "Machine: {name} · {profile} · {}{}",
+            cpu.label(),
             if self.cfg_dirty { " *" } else { "" }
         ));
+        if let Some(started) = running_cpu {
+            if started != self.cfg.machine.cpu {
+                ui.label(
+                    RichText::new(format!("{} pending (Stop to apply)", self.cfg.machine.cpu.label()))
+                        .color(Color32::YELLOW).small(),
+                );
+            }
+        }
         ui.label(format!("Dirty COW: {}", self.emu.status.dirty_cow));
         if let Some((msg, when)) = self.toast.clone() {
             if when.elapsed().as_secs() < 5 {
