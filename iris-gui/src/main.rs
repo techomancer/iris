@@ -159,6 +159,8 @@ struct App {
     cfg_dirty_since: Option<std::time::Instant>,
     /// Banks passed to the last `Cmd::Start` (guest-visible RAM is fixed until Stop).
     started_banks: Option<[u32; 4]>,
+    /// The CPU the running guest booted on — see `MemoryUiContext::started_cpu`.
+    started_cpu: Option<iris::config::CpuModel>,
     tab: Tab,
     /// Benchmark tab state: the child process, its streamed output, and the
     /// last outcome. Lives here rather than in the tab function because a run
@@ -465,6 +467,7 @@ impl App {
             cfg_dirty: false,
             cfg_dirty_since: None,
             started_banks: None,
+            started_cpu: None,
             tab: Tab::General,
             bench: bench_ui::BenchState::default(),
             emu: EmulatorHandle::spawn(),
@@ -748,6 +751,7 @@ impl App {
             (iris::config::NetMode::Nat, None)
         });
         self.started_banks = Some(self.cfg.banks);
+        self.started_cpu = Some(self.cfg.machine.cpu);
         self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
         // Don't resize the window when the VM launches — its size is latched at
         // app load (the saved window size, or the first-launch fit to vm_scale)
@@ -2215,6 +2219,7 @@ impl App {
             MemoryUiContext {
                 running: self.emu.is_running(),
                 started_banks: self.started_banks,
+                started_cpu: self.started_cpu,
             },
             &mut self.bench,
         );

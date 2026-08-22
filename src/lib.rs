@@ -56,19 +56,14 @@ pub mod build_features {
     /// monitor breakpoints) is non-functional in this build.
     pub const LIGHTNING: bool = cfg!(feature = "lightning");
     pub const IDLE_PAUSE: bool = cfg!(feature = "idle-pause");
-    /// The emulated CPU, fixed at build time (the cache model differs deeply
-    /// between the R4400 and R5000, so it's a compile-time choice, not a runtime
-    /// setting). `r5k` selects the R5000; `r5ksc`/`r5ksc_triton` add a secondary
-    /// cache. The GUI surfaces this read-only on the Memory tab.
-    pub const CPU: &str = if cfg!(feature = "r5ksc_triton") {
-        "MIPS R5000 (Triton on-die L2)"
-    } else if cfg!(all(feature = "r5k", feature = "r5ksc")) {
-        "MIPS R5000 (external L2)"
-    } else if cfg!(feature = "r5k") {
-        "MIPS R5000"
-    } else {
-        "MIPS R4400"
-    };
+    // There is deliberately no `CPU` constant here any more. The emulated CPU
+    // stopped being a build-time property in 96e5ddd: both cache models are
+    // monomorphised into every binary and `Machine::new` picks between them
+    // from `cfg.machine.cpu`. A constant derived from cargo features could only
+    // report how the binary was compiled, which is no longer the same question
+    // as which CPU is running — and it was being displayed to users as though
+    // it were. Ask the config (`MachineConfig::machine.cpu`), or the guest,
+    // which reads PRId.
 
     /// Every compile-time flag this binary was built with, in a fixed order.
     ///

@@ -71,8 +71,12 @@ run_cell() {
 
     build_iris "$cpu" "$engine" || { echo "FAIL  $cell (build)"; return 1; }
 
+    # --cpu, not the r5k cargo feature: since 96e5ddd both cache models are
+    # compiled into every build and the model is chosen at construction, so
+    # building with --features r5k no longer produces an R5000 machine.
     timeout "${TIMEOUT:-1200}" "$iris" \
         --config run/bare.toml \
+        --cpu "$cpu" \
         --load-elf build/cputest.elf \
         --test-device --test-device-dump "$OUT/$cell.dump.json" \
         --headless --noaudio > "$log" 2>&1
