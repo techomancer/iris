@@ -965,11 +965,30 @@ pub struct MipsExecutor<T: Tlb, C: MipsCache> {
     /// thread to deadlock on. The mutex here is coarse (whole-struct, not
     /// per-field) since `page_for`/`page_ptr`/`mega_flush` are already
     /// CPU-thread-only by design contract (§6.1.3) and
-    /// `compile_queue.send/start/stop` are never called concurrently from
-    /// both sides by contract — this isn't a hot-path lock, just ordinary
-    /// exclusion for infrequent pool/queue management calls.
+    /// `compile_queue.start/stop` (pool lifecycle) is never called
+    /// concurrently from both sides by contract — fine for those infrequent
+    /// management calls. The one genuinely hot per-dispatch operation,
+    /// pushing a compile request, does *not* go through this lock — see
+    /// `jitv2_compile_queue`/`jitv2_stats` below.
     #[cfg(feature = "jitv2")]
     pub jitv2: std::sync::Arc<Mutex<crate::jitv2::Jitv2>>,
+    /// Cheap handle to `jitv2.lock().compile_queue`'s underlying push queue,
+    /// cloned once at construction (`CompileQueue::queue_handle`) — lets the
+    /// per-dispatch compile-request send (`exec_decoded`'s JIT gate) skip
+    /// `jitv2.lock()` entirely. Same `Arc<ArrayQueue<CompileRequest>>` the
+    /// worker threads pop from, so this is exactly as sound as the clones
+    /// `CompileQueue::start_inner` already hands each worker; it's just one
+    /// more clone, held here instead of re-derived through the mutex on
+    /// every dispatch.
+    #[cfg(feature = "jitv2")]
+    pub jitv2_compile_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::jitv2::CompileRequest>>,
+    /// Cheap handle to `jitv2.lock().stats`, cloned once at construction —
+    /// same reasoning as `jitv2_compile_queue_handle`: `JitStats` is already
+    /// `Arc`-shared internally (see `Jitv2::stats`'s own doc comment), so
+    /// there is no reason a per-dispatch send should reacquire `jitv2.lock()`
+    /// just to read this field.
+    #[cfg(feature = "jitv2")]
+    pub jitv2_stats: std::sync::Arc<crate::jitv2::JitStats>,
     /// Pointer to the `PhysicalCodePage` for the page the fetch-side nanotlb last
     /// resolved to. Updated only on a page change (§2.1 — physical page, not VA);
     /// null until the first fetch translation after construction/reset. Owned and
@@ -1931,6 +1950,18 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             l2_size / 1024, l2_line,
             config);*/
 
+        // Built before `jitv2` moves into its `Arc<Mutex<_>>` below, so the
+        // hot dispatch-gate path (`exec_decoded`'s compile_queue.send) can
+        // hold these two `Arc` handles directly and never has to take
+        // `jitv2.lock()` just to push a compile request or bump a stats
+        // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
+        // doc comments on the struct fields.
+        #[cfg(feature = "jitv2")]
+        let jitv2 = crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        #[cfg(feature = "jitv2")]
+        let jitv2_compile_queue_handle = jitv2.compile_queue.queue_handle();
+        #[cfg(feature = "jitv2")]
+        let jitv2_stats = jitv2.stats.clone();
 
         let mut executor = Self {
             core,
@@ -1991,7 +2022,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
             // through `Machine` at all) still gets a fully functional,
             // self-contained jitv2 pool with no special-casing.
             #[cfg(feature = "jitv2")]
-            jitv2: std::sync::Arc::new(Mutex::new(crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY))),
+            jitv2: std::sync::Arc::new(Mutex::new(jitv2)),
+            #[cfg(feature = "jitv2")]
+            jitv2_compile_queue_handle,
+            #[cfg(feature = "jitv2")]
+            jitv2_stats,
             #[cfg(feature = "jitv2")]
             pcp: std::ptr::null_mut(),
             #[cfg(feature = "jitv2_lockstep")]
@@ -6866,11 +6901,12 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
                     // the first request is still queued/compiling),
                     // skip sending a redundant duplicate; still falls
                     // through to the interpreter the same as if we had.
-                    {
-                        let mut jit = self.jitv2.lock();
-                        let stats = jit.stats.clone();
-                        jit.compile_queue.send(req, &stats);
-                    }
+                    // No `self.jitv2.lock()` here: both handles below are
+                    // `Arc` clones taken once at construction (see their doc
+                    // comments on the struct), so this send never contends
+                    // the whole-`Jitv2` mutex the pool/codegen management
+                    // calls elsewhere in this function actually need.
+                    crate::jitv2::jitv2::push_compile_request(&self.jitv2_compile_queue_handle, req, &self.jitv2_stats);
                 }
                 } // !below_call_threshold
             }

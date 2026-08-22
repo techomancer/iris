@@ -1456,6 +1456,35 @@ impl BarrierState {
 /// `CompileRequest::page` in flight or still queued points into the `Vec`
 /// `mega_flush` is about to clear, so every worker must be fully joined,
 /// and the queue drained, before that clear happens).
+/// Shared body of `CompileQueue::send`: push `req` onto the raw queue,
+/// recording `stats` counters under `developer`. Free function (not a
+/// `CompileQueue` method) so `MipsExecutor` can call it directly through a
+/// bare `Arc<ArrayQueue<CompileRequest>>` (`CompileQueue::queue_handle`)
+/// without going through `Jitv2`'s outer mutex at all — the hot dispatch-gate
+/// path only ever needs this one push, never the pool/codegen state that
+/// mutex actually protects.
+pub(crate) fn push_compile_request(
+    queue: &crossbeam_queue::ArrayQueue<CompileRequest>,
+    req: CompileRequest,
+    #[allow(unused_variables)] stats: &JitStats,
+) -> bool {
+    #[cfg(feature = "developer")]
+    {
+        // len() before push(): occupancy right now, not after this one
+        // lands — matches "depth the compile pool is running at" rather
+        // than counting this dispatch's own contribution to it.
+        let occupancy = queue.len();
+        stats.compile_queue_dispatches.fetch_add(1, Ordering::Relaxed);
+        stats.compile_queue_depth_sum.fetch_add(occupancy as u64, Ordering::Relaxed);
+    }
+    let accepted = queue.push(req).is_ok();
+    #[cfg(feature = "developer")]
+    if !accepted {
+        stats.compile_queue_full.fetch_add(1, Ordering::Relaxed);
+    }
+    accepted
+}
+
 pub struct CompileQueue {
     /// The one shared bounded MPMC ring: the CPU thread pushes
     /// (`CompileQueue::send`), every worker thread pops from the same
@@ -1603,6 +1632,18 @@ impl CompileQueue {
         self.queue.len()
     }
 
+    /// Clone of the underlying `Arc<ArrayQueue<CompileRequest>>` — lets a
+    /// caller that only ever needs to `push` (the CPU thread's dispatch-gate
+    /// `send`) hold a handle directly, bypassing `Jitv2`'s outer mutex
+    /// entirely on the hot path. Safe to hand out freely: the queue is
+    /// already the shared, `&self`-only primitive every worker thread pops
+    /// from (see the `queue` field's own doc comment), so an extra clone
+    /// here is exactly as sound as the ones `start_inner` already makes per
+    /// worker.
+    pub fn queue_handle(&self) -> Arc<crossbeam_queue::ArrayQueue<CompileRequest>> {
+        self.queue.clone()
+    }
+
     /// Inject the CPU device handle — see the `cpu` field's doc comment for
     /// why this is a separate setter rather than a constructor parameter.
     /// Safe to call at any time (even while the worker is running); takes
@@ -1632,22 +1673,16 @@ impl CompileQueue {
     /// feature combinations; the instrumentation work inside is what's
     /// gated, to keep the extra `slots()`/atomic touches off this
     /// per-dispatch-gate-miss hot path outside a diagnostics build.
-    pub fn send(&mut self, req: CompileRequest, #[allow(unused_variables)] stats: &JitStats) -> bool {
-        #[cfg(feature = "developer")]
-        {
-            // len() before push(): occupancy right now, not after this one
-            // lands — matches "depth the compile pool is running at" rather
-            // than counting this dispatch's own contribution to it.
-            let occupancy = self.queue.len();
-            stats.compile_queue_dispatches.fetch_add(1, Ordering::Relaxed);
-            stats.compile_queue_depth_sum.fetch_add(occupancy as u64, Ordering::Relaxed);
-        }
-        let accepted = self.queue.push(req).is_ok();
-        #[cfg(feature = "developer")]
-        if !accepted {
-            stats.compile_queue_full.fetch_add(1, Ordering::Relaxed);
-        }
-        accepted
+    ///
+    /// Takes `&self`, not `&mut self`: `self.queue` is an `Arc<ArrayQueue>`
+    /// whose own `push`/`len` only need `&self`, and every counter this
+    /// touches is an atomic — nothing here actually needs exclusive access.
+    /// This lets a caller send through a bare `&CompileQueue`/`queue_handle`
+    /// obtained once at construction instead of relocking the whole `Jitv2`
+    /// mutex on every dispatch just to reach this one `Arc`-backed field
+    /// (see `MipsExecutor::jitv2_compile_queue`/`jitv2_stats`).
+    pub fn send(&self, req: CompileRequest, stats: &JitStats) -> bool {
+        push_compile_request(&self.queue, req, stats)
     }
 
     /// Discard every `CompileRequest` currently sitting in the shared queue
