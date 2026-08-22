@@ -909,7 +909,7 @@ impl MipsCpuConfig {
 }
 
 /// MIPS Execution Engine - combines CPU core with memory interface and TLB
-pub struct MipsExecutor<T: Tlb, C: MipsCache> {
+pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
     /// cheritest convention (`--cheritest-dump-hook`): a guest write to CP0 26
@@ -1182,22 +1182,22 @@ fn bp_match_key(addr: u64) -> u64 {
 // ---- translate_fn slow-path wrappers (one per privilege × addressing-mode combination) ------
 // These are free functions so they can be stored as bare fn pointers in MipsExecutor.
 // They are only called on a nanotlb miss — the nanotlb probe happens before the fn-pointer call.
-fn translate_32_kernel<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+fn translate_32_kernel<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_32bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at)
 }
-fn translate_32_supervisor<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+fn translate_32_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_32bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at)
 }
-fn translate_32_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+fn translate_32_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_32bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at)
 }
-fn translate_64_kernel<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+fn translate_64_kernel<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_64bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at)
 }
-fn translate_64_supervisor<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+fn translate_64_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_64bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at)
 }
-fn translate_64_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
+fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
     e.translate_64bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at)
 }
 
@@ -1205,10 +1205,10 @@ fn translate_64_user<T: Tlb, C: MipsCache>(e: &mut MipsExecutor<T,C>, va: u64, a
 /// Rust does not allow `Self` inside a nested fn, so the generic trampoline lives here.
 // Safety: the executor's raw pointers point into allocations owned by
 // MipsCore which outlive the executor. The executor is only accessed from the CPU thread.
-unsafe impl<T: Tlb, C: MipsCache> Send for MipsExecutor<T, C> {}
-unsafe impl<T: Tlb, C: MipsCache> Sync for MipsExecutor<T, C> {}
+unsafe impl<T: Tlb, C: CpuModel> Send for MipsExecutor<T, C> {}
+unsafe impl<T: Tlb, C: CpuModel> Sync for MipsExecutor<T, C> {}
 
-fn mips_executor_status_cb<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, old: u32, new: u32) {
+fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, old: u32, new: u32) {
     // SAFETY: ctx is `&mut MipsExecutor<T,C>` cast to void, alive for the executor's lifetime,
     // and only ever called from the CPU thread that exclusively owns the executor.
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
@@ -1224,7 +1224,7 @@ fn mips_executor_status_cb<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, ol
 // executor's own address, established by `install_jit_hooks` — same safety
 // argument as `mips_executor_status_cb` above.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read8<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<1>(va); }
@@ -1235,7 +1235,7 @@ unsafe extern "C" fn jit_read8<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read16<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<2>(va); }
@@ -1246,7 +1246,7 @@ unsafe extern "C" fn jit_read16<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_voi
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read32<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<4>(va); }
@@ -1257,7 +1257,7 @@ unsafe extern "C" fn jit_read32<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_voi
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read64<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<8>(va); }
@@ -1268,7 +1268,7 @@ unsafe extern "C" fn jit_read64<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_voi
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_write8<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
+unsafe extern "C" fn jit_write8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     let val = val as u8; // mask to the real width ourselves — see write8_fn's doc comment on why the FFI parameter is u64
     #[cfg(feature = "jitv2_lockstep")]
@@ -1277,7 +1277,7 @@ unsafe extern "C" fn jit_write8<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_voi
     { let status = exec.write_data::<1>(va, val as u64); exec.core.jit_mem_exc = status; status }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_write16<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
+unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     let val = val as u16; // mask to the real width ourselves — see write16_fn's doc comment
     #[cfg(feature = "jitv2_lockstep")]
@@ -1286,7 +1286,7 @@ unsafe extern "C" fn jit_write16<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_vo
     { let status = exec.write_data::<2>(va, val as u64); exec.core.jit_mem_exc = status; status }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_write32<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
+unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     let val = val as u32; // mask to the real width ourselves — see write32_fn's doc comment
     #[cfg(feature = "jitv2_lockstep")]
@@ -1295,7 +1295,7 @@ unsafe extern "C" fn jit_write32<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_vo
     { let status = exec.write_data::<4>(va, val as u64); exec.core.jit_mem_exc = status; status }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_write64<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
+unsafe extern "C" fn jit_write64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<8>(va, val); }
@@ -1314,7 +1314,7 @@ unsafe extern "C" fn jit_write64<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_vo
 /// the normal dispatch path, so this always goes straight through
 /// `write_data64_masked` regardless of that feature.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_write64_masked<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, va: u64, val: u64, mask: u64) -> u32 {
+unsafe extern "C" fn jit_write64_masked<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64, mask: u64) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     let status = exec.write_data64_masked(va, val, mask);
     exec.core.jit_mem_exc = status;
@@ -1324,7 +1324,7 @@ unsafe extern "C" fn jit_write64_masked<T: Tlb, C: MipsCache>(ctx: *mut core::ff
 /// own `handle_exception` — the only place EPC/Cause/BD/vectoring are ever
 /// computed, for both engines.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_handle_exception<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, status: u32) -> u32 {
+unsafe extern "C" fn jit_handle_exception<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, status: u32) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     // handle_exception reads self.core.in_delay_slot — a single MipsCore
     // field shared by both engines (no separate JIT-only copy or sync step
@@ -1345,7 +1345,7 @@ unsafe extern "C" fn jit_handle_exception<T: Tlb, C: MipsCache>(ctx: *mut core::
 /// can't tell "please retry me through the interpreter" apart from a real
 /// retirement, since both return `EXEC_COMPLETE`).
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_interp_fallback<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void) -> u32 {
+unsafe extern "C" fn jit_interp_fallback<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     exec.interp_dispatch_one()
 }
@@ -1361,7 +1361,7 @@ unsafe extern "C" fn jit_interp_fallback<T: Tlb, C: MipsCache>(ctx: *mut core::f
 /// semantics) — `jitv2_track_pcp` only re-derives `self.pcp` on a Fetch
 /// nanotlb miss, which a same-page guard check can't trigger.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_kill_entry<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, offset: u32) {
+unsafe extern "C" fn jit_kill_entry<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, offset: u32) {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     assert!(!exec.pcp.is_null(), "jit_kill_entry reached with no tracked PhysicalCodePage");
     let page = unsafe { &*exec.pcp };
@@ -1393,7 +1393,7 @@ unsafe extern "C" fn jit_kill_entry<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c
 pub static DEV_TRACE_BP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(feature = "jitv2", feature = "developer"))]
-unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, origin: u32) -> u32 {
+unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, origin: u32) -> u32 {
     DEV_TRACE_BP_CALLS.fetch_add(1, Ordering::Relaxed);
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     #[cfg(not(feature = "lightning"))]
@@ -1431,7 +1431,7 @@ unsafe extern "C" fn jit_fpu_set_mode(_ctx: *mut core::ffi::c_void, rm: u32) {
 /// conversion instruction races the flag write against the read on
 /// out-of-order hardware.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: MipsCache>(
+unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: CpuModel>(
     ctx: *mut core::ffi::c_void,
     fs_reg: u32,
     fd_reg: u32,
@@ -1447,7 +1447,7 @@ unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: MipsCache>(
 /// Single-implementation CVT.S.W/D.W/S.L/D.L — see `cvt_int_to_float_and_commit`'s
 /// doc comment. Same `ctx`-is-`MipsExecutor<T,C>` shape as `jit_cvt_to_int`.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: MipsCache>(
+unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
     ctx: *mut core::ffi::c_void,
     fs_reg: u32,
     fd_reg: u32,
@@ -1462,7 +1462,7 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: MipsCache>(
 /// Single-implementation CVT.S.D — see `cvt_d_to_s_and_commit`'s doc
 /// comment. Same `ctx`-is-`MipsExecutor<T,C>` shape as `jit_cvt_to_int`.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
+unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     cvt_d_to_s_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0) as u32
 }
@@ -1475,7 +1475,7 @@ unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c
 /// `MipsCore::lockstep_step_fn`. No-op (returns without comparing) for a
 /// `LockstepClass` that can't be compared per-dispatch (Branch/Other).
 #[cfg(feature = "jitv2_lockstep")]
-unsafe extern "C" fn jit_lockstep_step<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, bd: u32) {
+unsafe extern "C" fn jit_lockstep_step<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, bd: u32) {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     exec.lockstep_step(pc, raw, bd);
 }
@@ -1488,7 +1488,7 @@ unsafe extern "C" fn jit_lockstep_step<T: Tlb, C: MipsCache>(ctx: *mut core::ffi
 /// Returns `EXEC_COMPLETE` when equal or when there was nothing to compare
 /// (disabled class / non-retiring reference).
 #[cfg(feature = "jitv2_lockstep")]
-unsafe extern "C" fn jit_lockstep_compare<T: Tlb, C: MipsCache>(ctx: *mut core::ffi::c_void) -> u32 {
+unsafe extern "C" fn jit_lockstep_compare<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> u32 {
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
     if exec.lockstep_compare() { EXEC_BREAKPOINT } else { EXEC_COMPLETE }
 }
@@ -1878,7 +1878,7 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
     false
 }
 
-impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
+impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
     pub fn new(sysad: Arc<dyn BusDevice>, tlb: T, cfg: &MipsCpuConfig) -> Self
@@ -1887,8 +1887,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
     {
         let mut core = MipsCore::new();
 
-        // Build unified cache hierarchy. Cache geometry is fixed at compile time;
-        // IC_SIZE/IC_LINE/DC_SIZE/DC_LINE/L2_SIZE/L2_LINE are consts from mips_cache_v2.
+        // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
         #[cfg_attr(not(feature = "r5ksc_triton"), allow(unused_mut))]
         let mut cache = C::from(sysad.clone());
@@ -1900,16 +1899,16 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         config |= 3 << CONFIG_K0;
 
         // DB (bit 4): Primary D-cache line size. 0=16B, 1=32B.
-        config |= (if DC_LINE >= 32 { 1 } else { 0 }) << CONFIG_DB;
+        config |= (if C::DC_LINE >= 32 { 1 } else { 0 }) << CONFIG_DB;
 
         // IB (bit 5): Primary I-cache line size. 0=16B, 1=32B.
-        config |= (if IC_LINE >= 32 { 1 } else { 0 }) << CONFIG_IB;
+        config |= (if C::IC_LINE >= 32 { 1 } else { 0 }) << CONFIG_IB;
 
         // DC (bits 8:6): Primary D-cache size. size = 2^(12+DC)
-        config |= DC_SIZE.trailing_zeros().saturating_sub(12) << CONFIG_DC;
+        config |= C::DC_SIZE.trailing_zeros().saturating_sub(12) << CONFIG_DC;
 
         // IC (bits 11:9): Primary I-cache size. size = 2^(12+IC)
-        config |= IC_SIZE.trailing_zeros().saturating_sub(12) << CONFIG_IC;
+        config |= C::IC_SIZE.trailing_zeros().saturating_sub(12) << CONFIG_IC;
 
         // BE (bit 15): Big Endian. 1 for Indy.
         config |= 1 << CONFIG_BE;
@@ -1923,16 +1922,11 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // r5k without r5ksc: SC=1 — no L2 present; PROM uses 2-way index flush.
         // r5k + r5ksc (external): SC=1 — external cache sized via EEPROM; 2-way flush.
         // R4K: SC=0 when L2 present, SC=1 when absent.
-        #[cfg(feature = "r5ksc_triton")]
-        { config |= 0 << CONFIG_SC; } // Triton: SC=0, integrated L2 present
-        #[cfg(all(feature = "r5k", not(feature = "r5ksc_triton")))]
-        { config |= 1 << CONFIG_SC; } // R5K non-Triton: SC=1, PROM uses 2-way index flush
-        #[cfg(not(feature = "r5k"))]
-        { config |= (if L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC; }
+        config |= (if C::L2_SIZE > 0 { 0 } else { 1 }) << CONFIG_SC;
 
         // SB (bits 23:22): Secondary cache block size.
         // 00=4 words (16B), 01=8 words (32B), 10=16 words (64B), 11=32 words (128B).
-        config |= (match L2_LINE {
+        config |= (match C::L2_LINE {
             16  => 0b00,
             32  => 0b01,
             64  => 0b10,
@@ -1945,7 +1939,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         // IP32 (O2) reads CONFIG[21:20] directly — must match for correct L2 detection.
         #[cfg(feature = "r5ksc_triton")]
         {
-            let ss: u32 = match L2_SIZE {
+            let ss: u32 = match C::L2_SIZE {
                 524288  => 0b00,  // 512 KB
                 1048576 => 0b01,  // 1 MB
                 2097152 => 0b10,  // 2 MB
@@ -1955,7 +1949,9 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
         }
 
         core.cp0_config = config;
-        core.tlb_entries = cfg.tlb_entries as u32;
+        core.tlb_entries = C::TLB_ENTRIES as u32;
+        core.reset_prid = C::PRID;
+        core.reset_fir = C::FIR;
 
         // Triton: sync initial L2 enabled state from Config SE bit (starts 0 = disabled).
         #[cfg(feature = "r5ksc_triton")]
@@ -7480,7 +7476,7 @@ impl LockstepSnapshot {
     /// to restore real state after the JIT probe (before the interpreter
     /// re-run) and, implicitly, is never needed for the interpreter's own
     /// post-run state since that's just left live for the final compare.
-    fn restore_into<T: Tlb, C: MipsCache>(&self, exec: &mut MipsExecutor<T, C>, delay_slot_target: u64) {
+    fn restore_into<T: Tlb, C: CpuModel>(&self, exec: &mut MipsExecutor<T, C>, delay_slot_target: u64) {
         exec.core.gpr = self.gpr;
         exec.core.hi = self.hi;
         exec.core.lo = self.lo;
@@ -7637,7 +7633,7 @@ fn is_fusable_load_store(next_raw: u32, addr_reg: u8) -> bool {
 /// left holding the load/store's raw word permanently (not transient) — the
 /// fused handler needs it at execution time to decode the load/store's own
 /// rt/offset fields.
-pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
+pub fn decode_into<T: Tlb, C: CpuModel>(ins: &mut DecodedInstr) {
     let raw = ins.raw;
 
     let op    = ((raw >> 26) & 0x3F) as u8;
@@ -7653,10 +7649,7 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
         OP_SPECIAL => match funct as u32 {
             FUNCT_SLL     => MipsExecutor::<T,C>::exec_sll,
             // MOVCI is MIPS IV (MOVF/MOVT); an R4400 (MIPS III) must raise RI.
-            #[cfg(feature = "mips4")]
-            FUNCT_MOVCI   => MipsExecutor::<T,C>::exec_movci,
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_MOVCI   => MipsExecutor::<T,C>::exec_reserved,
+            FUNCT_MOVCI => if C::MIPS4 { MipsExecutor::<T,C>::exec_movci } else { MipsExecutor::<T,C>::exec_reserved },
             FUNCT_SRL     => MipsExecutor::<T,C>::exec_srl,
             FUNCT_SRA     => MipsExecutor::<T,C>::exec_sra,
             FUNCT_SLLV    => MipsExecutor::<T,C>::exec_sllv,
@@ -7668,14 +7661,8 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
             FUNCT_JR      => MipsExecutor::<T,C>::exec_jr,
             FUNCT_JALR    => MipsExecutor::<T,C>::exec_jalr,
             // MOVZ/MOVN are MIPS IV; an R4400 (MIPS III) must raise RI.
-            #[cfg(feature = "mips4")]
-            FUNCT_MOVZ    => MipsExecutor::<T,C>::exec_movz,
-            #[cfg(feature = "mips4")]
-            FUNCT_MOVN    => MipsExecutor::<T,C>::exec_movn,
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_MOVZ    => MipsExecutor::<T,C>::exec_reserved,
-            #[cfg(not(feature = "mips4"))]
-            FUNCT_MOVN    => MipsExecutor::<T,C>::exec_reserved,
+            FUNCT_MOVZ => if C::MIPS4 { MipsExecutor::<T,C>::exec_movz } else { MipsExecutor::<T,C>::exec_reserved },
+            FUNCT_MOVN => if C::MIPS4 { MipsExecutor::<T,C>::exec_movn } else { MipsExecutor::<T,C>::exec_reserved },
             FUNCT_SYSCALL => MipsExecutor::<T,C>::exec_syscall,
             FUNCT_BREAK   => MipsExecutor::<T,C>::exec_break,
             FUNCT_SYNC    => MipsExecutor::<T,C>::exec_sync,
@@ -7866,19 +7853,11 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
                 FUNCT_FFLOOR_W => MipsExecutor::<T,C>::exec_ffloor_w_s,
                 // MOVF.fmt/MOVT.fmt/MOVZ.fmt/MOVN.fmt/RECIP.fmt/RSQRT.fmt are
                 // MIPS IV; an R4400 (MIPS III) must raise RI for all five.
-                #[cfg(feature = "mips4")]
-                FUNCT_FMOVCF   => MipsExecutor::<T,C>::exec_fmovcf_s,
-                #[cfg(feature = "mips4")]
-                FUNCT_FMOVZ    => MipsExecutor::<T,C>::exec_fmovz_s,
-                #[cfg(feature = "mips4")]
-                FUNCT_FMOVN    => MipsExecutor::<T,C>::exec_fmovn_s,
-                #[cfg(feature = "mips4")]
-                FUNCT_FRECIP   => MipsExecutor::<T,C>::exec_frecip_s,
-                #[cfg(feature = "mips4")]
-                FUNCT_FRSQRT   => MipsExecutor::<T,C>::exec_frsqrt_s,
-                #[cfg(not(feature = "mips4"))]
-                FUNCT_FMOVCF | FUNCT_FMOVZ | FUNCT_FMOVN | FUNCT_FRECIP | FUNCT_FRSQRT
-                               => MipsExecutor::<T,C>::exec_reserved,
+                FUNCT_FMOVCF => if C::MIPS4 { MipsExecutor::<T,C>::exec_fmovcf_s } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FMOVZ => if C::MIPS4 { MipsExecutor::<T,C>::exec_fmovz_s } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FMOVN => if C::MIPS4 { MipsExecutor::<T,C>::exec_fmovn_s } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FRECIP => if C::MIPS4 { MipsExecutor::<T,C>::exec_frecip_s } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FRSQRT => if C::MIPS4 { MipsExecutor::<T,C>::exec_frsqrt_s } else { MipsExecutor::<T,C>::exec_reserved },
                 FUNCT_FCVT_D   => MipsExecutor::<T,C>::exec_fcvt_d_s,
                 FUNCT_FCVT_W   => MipsExecutor::<T,C>::exec_fcvt_w_s,
                 FUNCT_FCVT_L   => MipsExecutor::<T,C>::exec_fcvt_l_s,
@@ -7904,19 +7883,11 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
                 FUNCT_FFLOOR_W => MipsExecutor::<T,C>::exec_ffloor_w_d,
                 // MOVF.fmt/MOVT.fmt/MOVZ.fmt/MOVN.fmt/RECIP.fmt/RSQRT.fmt are
                 // MIPS IV; an R4400 (MIPS III) must raise RI for all five.
-                #[cfg(feature = "mips4")]
-                FUNCT_FMOVCF   => MipsExecutor::<T,C>::exec_fmovcf_d,
-                #[cfg(feature = "mips4")]
-                FUNCT_FMOVZ    => MipsExecutor::<T,C>::exec_fmovz_d,
-                #[cfg(feature = "mips4")]
-                FUNCT_FMOVN    => MipsExecutor::<T,C>::exec_fmovn_d,
-                #[cfg(feature = "mips4")]
-                FUNCT_FRECIP   => MipsExecutor::<T,C>::exec_frecip_d,
-                #[cfg(feature = "mips4")]
-                FUNCT_FRSQRT   => MipsExecutor::<T,C>::exec_frsqrt_d,
-                #[cfg(not(feature = "mips4"))]
-                FUNCT_FMOVCF | FUNCT_FMOVZ | FUNCT_FMOVN | FUNCT_FRECIP | FUNCT_FRSQRT
-                               => MipsExecutor::<T,C>::exec_reserved,
+                FUNCT_FMOVCF => if C::MIPS4 { MipsExecutor::<T,C>::exec_fmovcf_d } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FMOVZ => if C::MIPS4 { MipsExecutor::<T,C>::exec_fmovz_d } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FMOVN => if C::MIPS4 { MipsExecutor::<T,C>::exec_fmovn_d } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FRECIP => if C::MIPS4 { MipsExecutor::<T,C>::exec_frecip_d } else { MipsExecutor::<T,C>::exec_reserved },
+                FUNCT_FRSQRT => if C::MIPS4 { MipsExecutor::<T,C>::exec_frsqrt_d } else { MipsExecutor::<T,C>::exec_reserved },
                 FUNCT_FCVT_S   => MipsExecutor::<T,C>::exec_fcvt_s_d,
                 FUNCT_FCVT_W   => MipsExecutor::<T,C>::exec_fcvt_w_d,
                 FUNCT_FCVT_L   => MipsExecutor::<T,C>::exec_fcvt_l_d,
@@ -7938,25 +7909,24 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
         // The entire COP1X opcode (LWXC1/LDXC1/SWXC1/SDXC1/PREFX and the
         // MADD/MSUB/NMADD/NMSUB family) is a MIPS IV addition — no MIPS III
         // encoding uses it, so an R4400 must raise RI for the whole opcode.
-        #[cfg(feature = "mips4")]
-        OP_COP1X => match funct as u32 {
-            FUNCT_LWXC1   => MipsExecutor::<T,C>::exec_lwxc1,
-            FUNCT_LDXC1   => MipsExecutor::<T,C>::exec_ldxc1,
-            FUNCT_SWXC1   => MipsExecutor::<T,C>::exec_swxc1,
-            FUNCT_SDXC1   => MipsExecutor::<T,C>::exec_sdxc1,
-            FUNCT_PREFX   => MipsExecutor::<T,C>::exec_prefx,
-            FUNCT_MADD_S  => MipsExecutor::<T,C>::exec_madd_s,
-            FUNCT_MADD_D  => MipsExecutor::<T,C>::exec_madd_d,
-            FUNCT_MSUB_S  => MipsExecutor::<T,C>::exec_msub_s,
-            FUNCT_MSUB_D  => MipsExecutor::<T,C>::exec_msub_d,
-            FUNCT_NMADD_S => MipsExecutor::<T,C>::exec_nmadd_s,
-            FUNCT_NMADD_D => MipsExecutor::<T,C>::exec_nmadd_d,
-            FUNCT_NMSUB_S => MipsExecutor::<T,C>::exec_nmsub_s,
-            FUNCT_NMSUB_D => MipsExecutor::<T,C>::exec_nmsub_d,
-            _             => MipsExecutor::<T,C>::exec_reserved,
-        },
-        #[cfg(not(feature = "mips4"))]
-        OP_COP1X => MipsExecutor::<T,C>::exec_reserved,
+        OP_COP1X => if C::MIPS4 {
+                match funct as u32 {
+                FUNCT_LWXC1   => MipsExecutor::<T,C>::exec_lwxc1,
+                FUNCT_LDXC1   => MipsExecutor::<T,C>::exec_ldxc1,
+                FUNCT_SWXC1   => MipsExecutor::<T,C>::exec_swxc1,
+                FUNCT_SDXC1   => MipsExecutor::<T,C>::exec_sdxc1,
+                FUNCT_PREFX   => MipsExecutor::<T,C>::exec_prefx,
+                FUNCT_MADD_S  => MipsExecutor::<T,C>::exec_madd_s,
+                FUNCT_MADD_D  => MipsExecutor::<T,C>::exec_madd_d,
+                FUNCT_MSUB_S  => MipsExecutor::<T,C>::exec_msub_s,
+                FUNCT_MSUB_D  => MipsExecutor::<T,C>::exec_msub_d,
+                FUNCT_NMADD_S => MipsExecutor::<T,C>::exec_nmadd_s,
+                FUNCT_NMADD_D => MipsExecutor::<T,C>::exec_nmadd_d,
+                FUNCT_NMSUB_S => MipsExecutor::<T,C>::exec_nmsub_s,
+                FUNCT_NMSUB_D => MipsExecutor::<T,C>::exec_nmsub_d,
+                _             => MipsExecutor::<T,C>::exec_reserved,
+            }
+        } else { MipsExecutor::<T,C>::exec_reserved },
         OP_LB     => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lb }
         OP_LH     => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lh }
         OP_LWL    => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lwl }
@@ -7984,10 +7954,7 @@ pub fn decode_into<T: Tlb, C: MipsCache>(ins: &mut DecodedInstr) {
         OP_SDC1   => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_sdc1 }
         OP_SD     => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_sd }
         // PREF is MIPS IV; an R4400 (MIPS III) must raise RI.
-        #[cfg(feature = "mips4")]
-        OP_PREF   => MipsExecutor::<T,C>::exec_pref,
-        #[cfg(not(feature = "mips4"))]
-        OP_PREF   => MipsExecutor::<T,C>::exec_reserved,
+        OP_PREF => if C::MIPS4 { MipsExecutor::<T,C>::exec_pref } else { MipsExecutor::<T,C>::exec_reserved },
         OP_LLD    => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_lld }
         OP_SCD    => { ins.set_imm_se(raw); MipsExecutor::<T,C>::exec_scd }
         _         => MipsExecutor::<T,C>::exec_reserved,
@@ -8044,7 +8011,7 @@ fn parse_reg_name(arg: &str) -> Option<usize> {
 /// Copy `data` to `vaddr` and zero-fill out to `memsz`. Writes go through the
 /// CPU's virtual-address path, so KSEG0/KSEG1 mapping, the MC address mask and
 /// bank remapping all apply — never poke `Memory` behind the bus.
-fn load_range<T: Tlb, C: MipsCache>(
+fn load_range<T: Tlb, C: CpuModel>(
     exec: &mut MipsExecutor<T, C>,
     vaddr: u64,
     data: &[u8],
@@ -8085,7 +8052,7 @@ fn load_range<T: Tlb, C: MipsCache>(
 /// The probe goes to the bus, not through `debug_write`: KSEG0 is cacheable, so
 /// a cached write is absorbed by L1D and reads back fine with nothing behind it.
 /// The original word is put back, so this leaves no trace.
-fn probe_mapped<T: Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>, vaddr: u64) -> Result<(), String> {
+fn probe_mapped<T: Tlb, C: CpuModel>(exec: &mut MipsExecutor<T, C>, vaddr: u64) -> Result<(), String> {
     let tr = exec.debug_translate(vaddr);
     if tr.is_exception() {
         return Err(format!("{:#018x} does not translate (status {:#010x})", vaddr, tr.status));
@@ -8130,7 +8097,7 @@ fn probe_mapped<T: Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>, vaddr: u64)
 /// instruction can never execute. The v1 JIT needs no explicit flush (its
 /// CodeCache dies with the CPU thread, and loading requires a stopped CPU);
 /// jitv2 self-invalidates from the per-page generation counter the writes bump.
-fn invalidate_loaded_range<T: Tlb, C: MipsCache>(exec: &mut MipsExecutor<T, C>, vaddr: u64, len: u64) {
+fn invalidate_loaded_range<T: Tlb, C: CpuModel>(exec: &mut MipsExecutor<T, C>, vaddr: u64, len: u64) {
     let (_, iline) = exec.cache.get_config(CACH_PI);
     let (_, dline) = exec.cache.get_config(CACH_PD);
     let step = (iline.min(dline).max(4)) as u64;
@@ -8677,7 +8644,7 @@ fn decode_cause(val: u32) -> String {
 }
 
 /// MipsCpu wrapper for threaded execution and monitor control
-pub struct MipsCpu<T: Tlb, C: MipsCache> {
+pub struct MipsCpu<T: Tlb, C: CpuModel> {
     executor: Arc<Mutex<MipsExecutor<T, C>>>,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
@@ -8705,10 +8672,10 @@ pub struct MipsCpu<T: Tlb, C: MipsCache> {
 // might read this pointer — the whole struct is already Send/Sync via its
 // other Arc fields; this one raw pointer needs the same guarantee spelled
 // out explicitly since raw pointers don't get it automatically.
-unsafe impl<T: Tlb, C: MipsCache> Send for MipsCpu<T, C> {}
-unsafe impl<T: Tlb, C: MipsCache> Sync for MipsCpu<T, C> {}
+unsafe impl<T: Tlb, C: CpuModel> Send for MipsCpu<T, C> {}
+unsafe impl<T: Tlb, C: CpuModel> Sync for MipsCpu<T, C> {}
 
-impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpu<T, C> {
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     pub fn new(executor: MipsExecutor<T, C>) -> Self {
         let fasttick_count = executor.core.fasttick_count.clone();
         #[cfg(feature = "idle-pause")]
@@ -9350,7 +9317,7 @@ fn is_call_instruction(instr: u32) -> bool {
     }
 }
 
-impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<T, C> {
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T, C> {
     fn step(&self, cycles: u64) {
         let mut exec = self.executor.lock();
         for _ in 0..cycles {
@@ -11513,7 +11480,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Device for MipsCpu<
 
 }
 
-impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
+impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// Dump the hottest sampled PCs and flag a likely idle-loop region: the
     /// smallest contiguous PC window (<=256 bytes) of always-interrupts-enabled
     /// samples that together account for the bulk of execution.
@@ -11726,7 +11693,7 @@ impl<T: Tlb, C: MipsCache> MipsExecutor<T, C> {
 // Resettable + Saveable for MipsCpu (CPU core + TLB)
 // ============================================================================
 
-impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Resettable for MipsCpu<T, C> {
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsCpu<T, C> {
     fn power_on(&self) {
         let mut exec = self.executor.lock();
         exec.core.reset(false);
@@ -11745,7 +11712,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Resettable for Mips
     }
 }
 
-impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> Saveable for MipsCpu<T, C> {
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu<T, C> {
     fn save_state(&self) -> toml::Value {
         let exec = self.executor.lock();
         let c = &exec.core;
@@ -11904,14 +11871,14 @@ impl StopState {
 }
 
 /// Wraps `Arc<MipsCpu<T,C>>` to implement `CpuDebug`.
-pub struct MipsCpuDebugAdapter<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> {
+pub struct MipsCpuDebugAdapter<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> {
     cpu: Arc<MipsCpu<T, C>>,
     stop_state: Arc<StopState>,
     // Allocator for GDB-owned breakpoint IDs (starts at 10000).
     next_gdb_bp_id: parking_lot::Mutex<usize>,
 }
 
-impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpuDebugAdapter<T, C> {
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpuDebugAdapter<T, C> {
     pub fn new(cpu: Arc<MipsCpu<T, C>>) -> Arc<Self> {
         Arc::new(Self {
             cpu,
@@ -11921,7 +11888,7 @@ impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> MipsCpuDebugAdapter
     }
 }
 
-impl<T: Tlb + Send + 'static, C: MipsCache + Send + 'static> CpuDebug
+impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
     for MipsCpuDebugAdapter<T, C>
 {
     fn stop(&self) {
