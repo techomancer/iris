@@ -192,7 +192,7 @@ pub fn show_tab(
     bench: &mut crate::bench_ui::BenchState,
 ) -> TabOutcome {
     ScrollArea::vertical().show(ui, |ui| match tab {
-        Tab::General => TabOutcome { action: show_general(ui, cfg), ..Default::default() },
+        Tab::General => TabOutcome { action: show_general(ui, cfg, mem_ctx), ..Default::default() },
         Tab::Disks   => { let (e, a) = show_disks(ui, cfg); TabOutcome { action: a, disks_changed: e.changed, disk_picked: e.picked, ..Default::default() } }
         Tab::Network => {
             let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces);
@@ -207,7 +207,7 @@ pub fn show_tab(
     }).inner
 }
 
-fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
+fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) -> ConfigAction {
     let mut action = ConfigAction::None;
     ui.heading("General");
     ui.label(format!("Platform: {}", cfg.machine.profile.label()));
@@ -245,6 +245,48 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             .small(),
         );
     }
+        ui.heading("Processor");
+    Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("CPU");
+        // A real setting, not a read-out of how this binary was built. Both
+        // cache models are compiled in and `Machine::new` picks between them at
+        // construction, so the choice belongs to the machine's config the same
+        // way its RAM does.
+        ui.add_enabled_ui(!mem_ctx.running, |ui| {
+            ComboBox::from_id_salt("cpu_model")
+                .selected_text(cfg.machine.cpu.label())
+                .show_ui(ui, |ui| {
+                    for c in CpuModel::ALL {
+                        ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
+                    }
+                });
+        });
+        ui.end_row();
+    });
+
+    if mem_ctx.running {
+        ui.label(
+            RichText::new("Stop the VM to change the CPU — it is chosen when the machine starts.")
+                .color(Color32::from_rgb(220, 170, 90)),
+        );
+        if let Some(started) = mem_ctx.started_cpu {
+            if started != cfg.machine.cpu {
+                ui.label(format!("Running guest: {} · Config (pending): {}",
+                                 started.label(), cfg.machine.cpu.label()));
+            }
+        }
+    } else {
+        ui.label(RichText::new("Applied at next Start").weak());
+    }
+    ui.label(RichText::new(
+        "The R4400 has 16 KB direct-mapped caches and is MIPS III. The R5000 has \
+         2-way 32 KB caches, no secondary cache, and adds the MIPS IV instructions — \
+         so an R4400 raises Reserved Instruction on the ones an R5000 executes. IRIX \
+         reads the CPU from PRId and configures itself accordingly, so switching is a \
+         different machine to the guest, not a speed knob.")
+        .weak().small());
+    ui.separator();
+
     ui.horizontal(|ui| {
         ui.label("Newport heads");
         ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -296,7 +338,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     // external gopher64 process it talks to.
     #[cfg(not(feature = "appstore"))]
     {
-        ui.separator();
+
+    ui.separator();
         #[cfg(feature = "ultra64")]
         ui.checkbox(&mut cfg.ultra64.enabled, "N64 development board (Ultra64)")
             .on_hover_text(
@@ -360,48 +403,6 @@ fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 }
 
 fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
-    ui.heading("Processor");
-    Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("CPU");
-        // A real setting, not a read-out of how this binary was built. Both
-        // cache models are compiled in and `Machine::new` picks between them at
-        // construction, so the choice belongs to the machine's config the same
-        // way its RAM does.
-        ui.add_enabled_ui(!mem_ctx.running, |ui| {
-            ComboBox::from_id_salt("cpu_model")
-                .selected_text(cfg.machine.cpu.label())
-                .show_ui(ui, |ui| {
-                    for c in CpuModel::ALL {
-                        ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
-                    }
-                });
-        });
-        ui.end_row();
-    });
-
-    if mem_ctx.running {
-        ui.label(
-            RichText::new("Stop the VM to change the CPU — it is chosen when the machine starts.")
-                .color(Color32::from_rgb(220, 170, 90)),
-        );
-        if let Some(started) = mem_ctx.started_cpu {
-            if started != cfg.machine.cpu {
-                ui.label(format!("Running guest: {} · Config (pending): {}",
-                                 started.label(), cfg.machine.cpu.label()));
-            }
-        }
-    } else {
-        ui.label(RichText::new("Applied at next Start").weak());
-    }
-    ui.label(RichText::new(
-        "The R4400 has 16 KB direct-mapped caches and is MIPS III. The R5000 has \
-         2-way 32 KB caches, no secondary cache, and adds the MIPS IV instructions — \
-         so an R4400 raises Reserved Instruction on the ones an R5000 executes. IRIX \
-         reads the CPU from PRId and configures itself accordingly, so switching is a \
-         different machine to the guest, not a speed knob.")
-        .weak().small());
-    ui.separator();
-
     ui.heading("Memory");
     if mem_ctx.running {
         ui.label(
