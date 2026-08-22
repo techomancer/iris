@@ -28,8 +28,104 @@ use crate::mips_core::MipsCore;
 use crate::mips_exec::ExecStatus;
 use crate::traits::{BusDevice, Device};
 
-/// Physical frame number. Physical addresses are keyed by PFN, never by VA (§2.1).
-pub type Pfn = u32;
+// ============================================================================
+// Tunables & initial settings
+//
+// Every knob that shapes JIT v2's steady-state behavior — page geometry,
+// pool/queue capacities, and the thresholds that decide when to flush or
+// force-seal — lives in this block so they can be reviewed and retuned
+// together instead of hunting through the file. See each constant's doc
+// comment for the reasoning behind its specific value.
+// ============================================================================
+
+/// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
+/// used throughout the codebase. Canonical home for this constant; `mem.rs`
+/// re-exports it as `JITV2_PAGE_SIZE` for its own generation-counter indexing.
+pub const PAGE_SIZE: u32 = 4096;
+
+/// Number of possible entry offsets per page: one per 4-byte-aligned word
+/// (MIPS instructions are always word-aligned), i.e. `PAGE_SIZE / 4` (§2.4:
+/// `entry_bits` 16×u64 = 1024 bits, `entry_table` 1024 entries).
+pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
+
+/// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
+pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
+
+/// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
+/// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
+/// epoch"); `mega_flush` absorbs it being wrong in either direction. Now that
+/// the whole pool is a single array allocated once at this capacity (see
+/// `Jitv2::new`'s doc comment — `PhysicalCodePage` is no longer boxed inside,
+/// so a larger capacity is a real memory cost, not just reserved address
+/// space), 4096 is a deliberately modest working-set size rather than a
+/// generous upper bound — `mega_flush`'s cost of getting this wrong low
+/// (a pool-exhaustion flush) is cheap relative to permanently carrying a much
+/// larger array.
+pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
+
+/// Depth of the compile-request SPSC ring (§6.4 "bounded queue; drop on full —
+/// hot pages re-trigger"). A starting guess, like `JITV2_INITIAL_PAGE_CAPACITY`
+/// — doubled from 1024 after a live `j2 status` reading showed the compile
+/// thread genuinely falling behind at that size (20.9% of dispatches
+/// dropped for a full queue, average depth at dispatch 248.6/1024, out of
+/// 1,166,218 total dispatches during one session) rather than the queue
+/// mostly sitting near-empty.
+pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
+
+/// Flush threshold for the shared `Codegen`'s Cranelift arena, in bytes
+/// actually reserved (`Codegen::packing_stats()`'s `reserved` — real
+/// host-page-rounded arena footprint, not the function-count proxy this
+/// constant used before batching landed). `cranelift_jit::Memory` never
+/// frees on drop/replace (`Codegen::reset`'s own doc comment), so nothing
+/// else bounds arena growth — a long-enough-running compile (real IRIX boot,
+/// not just PROM) will otherwise exhaust the whole `Codegen::ARENA_RESERVE_SIZE`
+/// reservation.
+///
+/// Function count stopped being a good proxy for arena growth once
+/// deferred-finalize batching (`j2 batch`) started letting many small
+/// functions pack into a shared host-page segment instead of each getting
+/// its own — the byte size actually reserved is now directly measurable
+/// (`PagedArenaState`), so there's no reason to keep estimating it from a
+/// count. 128MiB leaves comfortable headroom under `Codegen::ARENA_RESERVE_SIZE`
+/// (512MiB) for the batch that happens to be in flight when this trips (a
+/// batch isn't finalized/counted until it flushes, so the real reservation
+/// can run slightly ahead of this threshold between checks) while still
+/// flushing well before the arena's own exhaustion error could ever fire —
+/// that error path (`comp::handle_request`'s exhaustion match arm) stays as
+/// a belt-and-suspenders backstop, not the primary trigger.
+pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Force-seal trigger for a continuously busy batching worker — see
+/// `worker_loop`'s own comment at its call site. `handle_request_deferred`
+/// finalizes every compile immediately, but a non-forced finalize only
+/// seals a page the bump cursor has already moved past, so `pending` can
+/// otherwise grow without bound while the queue never goes empty long
+/// enough to reach the idle-timeout sweep. Small and arbitrary — this only
+/// needs to be "small enough that pending never grows unbounded," not tuned
+/// to any particular page size (unlike the old page-cross trigger it
+/// replaces, this one has no reason to line up with `ENTRIES_PER_PAGE`).
+const PENDING_FORCE_SEAL_THRESHOLD: usize = 64;
+
+/// Queue-drain fallback: how long the compile-request queue must stay
+/// continuously empty (wall-clock, tracked across repeated empty polls, not
+/// "first empty poll") before `worker_loop` force-seals whatever's left
+/// rather than waiting for a page to fill on its own — see `worker_loop`'s
+/// own comment at its call site for the two-phase (non-forced then forced)
+/// sealing design this backstops.
+const IDLE_FORCE_SEAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Backoff between empty-queue polls in `worker_loop`. Short enough that
+/// `IDLE_FORCE_SEAL_THRESHOLD`'s wall-clock idle window still resolves in a
+/// handful of ticks, long enough not to spin the compile thread on cycles
+/// while genuinely idle.
+const WORKER_IDLE_POLL_BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
+
+/// Bounded re-check interval for a leader waiting on followers to park at the
+/// compile-pool flush barrier (`wait_for_followers_or_abandon`). Not on any
+/// latency-sensitive path — only needs to be short enough that `stop()`
+/// racing a quiesce cycle doesn't feel hung; see that closure's own comment
+/// for why an unbounded `cv.wait` would be unsafe here.
+const BARRIER_FOLLOWER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Minimum interpreter dispatches an offset must accumulate before
 /// `exec_decoded`'s dispatch gate (`mips_exec.rs`) will send its first
@@ -61,18 +157,12 @@ pub fn min_calls_before_compile() -> u64 {
     MIN_CALLS_BEFORE_COMPILE.load(Ordering::Relaxed)
 }
 
-/// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
-/// used throughout the codebase. Canonical home for this constant; `mem.rs`
-/// re-exports it as `JITV2_PAGE_SIZE` for its own generation-counter indexing.
-pub const PAGE_SIZE: u32 = 4096;
+// ============================================================================
+// End tunables
+// ============================================================================
 
-/// Number of possible entry offsets per page: one per 4-byte-aligned word
-/// (MIPS instructions are always word-aligned), i.e. `PAGE_SIZE / 4` (§2.4:
-/// `entry_bits` 16×u64 = 1024 bits, `entry_table` 1024 entries).
-pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
-
-/// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
-pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
+/// Physical frame number. Physical addresses are keyed by PFN, never by VA (§2.1).
+pub type Pfn = u32;
 
 /// Compiled-function ABI (§6.1.2's "handler ABI", simplified for this storage
 /// pass — no `DecodedInstr`/state-struct plumbing yet, just direct MipsCore
@@ -422,52 +512,6 @@ impl JitStats {
         }
     }
 }
-
-/// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
-/// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
-/// epoch"); `mega_flush` absorbs it being wrong in either direction. Now that
-/// the whole pool is a single array allocated once at this capacity (see
-/// `Jitv2::new`'s doc comment — `PhysicalCodePage` is no longer boxed inside,
-/// so a larger capacity is a real memory cost, not just reserved address
-/// space), 4096 is a deliberately modest working-set size rather than a
-/// generous upper bound — `mega_flush`'s cost of getting this wrong low
-/// (a pool-exhaustion flush) is cheap relative to permanently carrying a much
-/// larger array.
-pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
-
-/// Flush threshold for the shared `Codegen`'s Cranelift arena, in bytes
-/// actually reserved (`Codegen::packing_stats()`'s `reserved` — real
-/// host-page-rounded arena footprint, not the function-count proxy this
-/// constant used before batching landed). `cranelift_jit::Memory` never
-/// frees on drop/replace (`Codegen::reset`'s own doc comment), so nothing
-/// else bounds arena growth — a long-enough-running compile (real IRIX boot,
-/// not just PROM) will otherwise exhaust the whole `Codegen::ARENA_RESERVE_SIZE`
-/// reservation.
-///
-/// Function count stopped being a good proxy for arena growth once
-/// deferred-finalize batching (`j2 batch`) started letting many small
-/// functions pack into a shared host-page segment instead of each getting
-/// its own — the byte size actually reserved is now directly measurable
-/// (`PagedArenaState`), so there's no reason to keep estimating it from a
-/// count. 128MiB leaves comfortable headroom under `Codegen::ARENA_RESERVE_SIZE`
-/// (512MiB) for the batch that happens to be in flight when this trips (a
-/// batch isn't finalized/counted until it flushes, so the real reservation
-/// can run slightly ahead of this threshold between checks) while still
-/// flushing well before the arena's own exhaustion error could ever fire —
-/// that error path (`comp::handle_request`'s exhaustion match arm) stays as
-/// a belt-and-suspenders backstop, not the primary trigger.
-pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Force-seal trigger for a continuously busy batching worker — see
-/// `worker_loop`'s own comment at its call site. `handle_request_deferred`
-/// finalizes every compile immediately, but a non-forced finalize only
-/// seals a page the bump cursor has already moved past, so `pending` can
-/// otherwise grow without bound while the queue never goes empty long
-/// enough to reach the idle-timeout sweep. Small and arbitrary — this only
-/// needs to be "small enough that pending never grows unbounded," not tuned
-/// to any particular page size (unlike the old page-cross trigger it
-/// replaces, this one has no reason to line up with `ENTRIES_PER_PAGE`).
-const PENDING_FORCE_SEAL_THRESHOLD: usize = 64;
 
 /// A compile request pushed from the mips exec thread to the compile thread
 /// over the SPSC fifo (§6.4). Carries the page pointer rather than a snapshotted
@@ -1339,15 +1383,6 @@ impl Jitv2 {
     }
 }
 
-/// Depth of the compile-request SPSC ring (§6.4 "bounded queue; drop on full —
-/// hot pages re-trigger"). A starting guess, like `JITV2_INITIAL_PAGE_CAPACITY`
-/// — doubled from 1024 after a live `j2 status` reading showed the compile
-/// thread genuinely falling behind at that size (20.9% of dispatches
-/// dropped for a full queue, average depth at dispatch 248.6/1024, out of
-/// 1,166,218 total dispatches during one session) rather than the queue
-/// mostly sitting near-empty.
-pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
-
 /// Shared state behind the compile-pool's flush barrier — see
 /// `CompileQueue::park_at_barrier`/`run_leader_flush` for the protocol this
 /// drives. Wrapped as `Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>`,
@@ -1907,7 +1942,7 @@ impl CompileQueue {
                 // already exited instead). The timeout only needs to be
                 // short enough that `stop()` doesn't feel hung — it is not
                 // on any latency-sensitive path otherwise.
-                cv.wait_for(&mut state, std::time::Duration::from_millis(20));
+                cv.wait_for(&mut state, BARRIER_FOLLOWER_POLL_INTERVAL);
             }
             true
         };
@@ -2216,14 +2251,14 @@ impl CompileQueue {
                     // never grows into a full page still gets published
                     // eventually, but a genuinely busy queue that's just
                     // between two back-to-back bursts doesn't pay for a
-                    // premature forced seal on every 200µs backoff tick.
+                    // premature forced seal on every backoff tick
+                    // (`WORKER_IDLE_POLL_BACKOFF`).
                     // At N=1 this is behaviorally a no-op relative to
                     // today (nothing here can ever actually be blocked on
                     // another worker), but it's real, reachable machinery —
                     // this is where the same idle-sweep this worker will
                     // need once a real multi-worker pool shares one arena
                     // gets exercised and proven first.
-                    const IDLE_FORCE_SEAL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(100);
                     if pending > 0 {
                         crate::jitv2::comp::publish_ready_nonforced(&mut codegen, &mut pending);
                         if pending > 0 {
@@ -2246,7 +2281,7 @@ impl CompileQueue {
                     } else {
                         idle_since = None;
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(200));
+                    std::thread::sleep(WORKER_IDLE_POLL_BACKOFF);
                 }
             }
         }
