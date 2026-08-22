@@ -147,11 +147,12 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
 /// for a minute is not mistaken for a hang, and that property is worth keeping
 /// at the command line — so this echoes every line rather than waiting for the
 /// end and printing the parsed summary.
-fn run_embedded(label: &str, timeout_s: u64, quick: bool) -> Result<Run, String> {
+fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: iris::config::CpuModel) -> Result<Run, String> {
     let opts = BenchOptions {
         quick,
         label: label.to_string(),
         timeout: Duration::from_secs(timeout_s),
+        cpu,
         ..Default::default()
     };
     bench_runner::run(&opts, |p| {
@@ -243,12 +244,16 @@ fn load_all(dir: &Path) -> Result<Vec<Run>, String> {
 
 // ─── the matrix ──────────────────────────────────────────────────────────────
 
-/// A cell is a cargo feature set plus the CPU the guest must report. The CPU
-/// model and the JIT are compile-time features, so each cell is a separate
-/// build of the emulator — there is no runtime switch to flip.
+/// A cell is a cargo feature set plus a CPU. Only the feature set needs a build:
+/// the CPU is a runtime setting, so the r4400 and r5000 cells of an engine share
+/// one binary. `expect_cpu` is still checked, because a cell silently running
+/// the wrong CPU is a mistake this repo has made before.
 struct Cell {
     name: &'static str,
     features: &'static str,
+    /// Passed as `--cpu`. Runtime since 96e5ddd, so cells that differ only by
+    /// CPU share one emulator binary instead of each needing its own build.
+    cpu: &'static str,
     /// What the guest must print in `#machine cpu=`. Checked, because an
     /// overwritten target/release/iris silently turning an "R4400" cell into
     /// an R5000 run is a mistake this repo has made before — see
@@ -257,16 +262,19 @@ struct Cell {
 }
 
 const CELLS: &[Cell] = &[
-    Cell { name: "r4400-interp",    features: "",                   expect_cpu: "R4400" },
-    Cell { name: "r5000-interp",    features: "r5k",                expect_cpu: "R5000" },
-    Cell { name: "r4400-jitv2",     features: "jitv2",              expect_cpu: "R4400" },
-    Cell { name: "r5000-jitv2",     features: "r5k,jitv2",          expect_cpu: "R5000" },
-    Cell { name: "r4400-lightning", features: "lightning",          expect_cpu: "R4400" },
-    Cell { name: "r4400-jitv2-lightning", features: "jitv2,lightning", expect_cpu: "R4400" },
+    Cell { name: "r4400-interp",    features: "",           cpu: "r4400", expect_cpu: "R4400" },
+    Cell { name: "r5000-interp",    features: "",           cpu: "r5000", expect_cpu: "R5000" },
+    Cell { name: "r4400-jitv2",     features: "jitv2",      cpu: "r4400", expect_cpu: "R4400" },
+    Cell { name: "r5000-jitv2",     features: "jitv2",      cpu: "r5000", expect_cpu: "R5000" },
+    Cell { name: "r4400-lightning", features: "lightning",  cpu: "r4400", expect_cpu: "R4400" },
+    Cell { name: "r4400-jitv2-lightning", features: "jitv2,lightning", cpu: "r4400", expect_cpu: "R4400" },
 ];
 
 fn build_cell(cell: &Cell, root: &Path, force: bool) -> Result<PathBuf, String> {
-    let dest = root.join("bench/build").join(format!("iris-{}", cell.name));
+    // Keyed by feature set: cells differing only in --cpu share a binary.
+    let slug = if cell.features.is_empty() { "default".to_string() }
+               else { cell.features.replace(',', "-") };
+    let dest = root.join("bench/build").join(format!("iris-{}", slug));
     if dest.exists() && !force {
         println!("  reusing {}", dest.display());
         return Ok(dest);
@@ -711,6 +719,10 @@ enum Cmd {
         /// the register that carries it is set at machine construction.
         #[arg(long)]
         quick: bool,
+        /// Emulated CPU for the in-process run. With --iris, forward it to the
+        /// emulator instead: `-- --cpu r5000`.
+        #[arg(long, default_value = "r4400")]
+        cpu: iris::config::CpuModel,
         /// Extra arguments passed through to --iris.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -824,15 +836,15 @@ fn main() {
 fn dispatch(cmd: Cmd) -> Result<(), String> {
     match cmd {
         Cmd::Cells => {
-            println!("{:<24} {}", "cell", "cargo features");
+            println!("{:<24} {:<22} {}", "cell", "cargo features", "--cpu");
             for c in CELLS {
-                println!("{:<24} {}", c.name,
-                         if c.features.is_empty() { "(default)" } else { c.features });
+                println!("{:<24} {:<22} {}", c.name,
+                         if c.features.is_empty() { "(default)" } else { c.features }, c.cpu);
             }
             Ok(())
         }
 
-        Cmd::Run { iris, elf, config, label, out, timeout, quick, extra } => {
+        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, extra } => {
             let out = out.unwrap_or_else(default_out);
             let run = match iris {
                 Some(iris) => {
@@ -861,7 +873,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                             "{} only {} to --iris, and `run` is in-process by default. \
                              Add --iris PATH, or drop {}.", stray.join(" and "), verb, obj));
                     }
-                    run_embedded(&label, timeout, quick)?
+                    run_embedded(&label, timeout, quick, cpu)?
                 }
             };
             let path = save(&run, &out)?;
@@ -915,7 +927,8 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                     Ok(p) => p,
                     Err(e) => { eprintln!("  {}", e); failures.push(cell.name); continue; }
                 };
-                match run_guest(&iris, &elf, &config, cell.name, timeout, &[]) {
+                let cpu_arg = ["--cpu".to_string(), cell.cpu.to_string()];
+                match run_guest(&iris, &elf, &config, cell.name, timeout, &cpu_arg) {
                     Ok(run) => {
                         // The guest reads PRId, so its banner is the authority
                         // on which CPU actually ran.
