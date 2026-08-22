@@ -61,6 +61,19 @@ pub struct DiskRef {
     pub size_bytes: u64,
 }
 
+/// Reject a restore whose CPU model differs from the running machine's.
+/// `None` from the snapshot means a legacy manifest — the model was a build
+/// flag then, so there is nothing to compare and the restore is allowed.
+pub fn cpu_model_mismatch(snapshot: Option<&str>, current: &str) -> Option<String> {
+    match snapshot {
+        Some(sn) if sn != current => Some(format!(
+            "CPU model differs: snapshot {} vs current {} — set [machine] cpu = \"{}\"",
+            sn, current, sn.to_lowercase()
+        )),
+        _ => None,
+    }
+}
+
 /// Build the list of cargo features enabled in this binary. Recorded in the
 /// manifest and required to match on restore, since features such as `ci_clock`
 /// (synthetic clock) change CPU/timer semantics that the captured
@@ -70,6 +83,10 @@ pub fn enabled_features() -> Vec<String> {
     macro_rules! push_if { ($name:literal) => { if cfg!(feature = $name) { f.push($name.to_string()); } } }
     push_if!("rex-jit");
     push_if!("lightning");
+    push_if!("jitv2");
+    push_if!("jitv2_opcodefusion");
+    push_if!("opcodefusion");
+    push_if!("idle-pause");
     push_if!("ci_clock");
     push_if!("tlbvmap");
     push_if!("chd");
@@ -103,6 +120,9 @@ pub struct Manifest {
     pub disks: Vec<DiskRef>,
     /// Configured nvram file path at capture time. None for legacy manifests.
     pub nvram: Option<String>,
+    /// Emulated CPU at capture time. None for legacy manifests, and for those
+    /// the check is skipped — the model was a build flag before it was config.
+    pub cpu_model: Option<String>,
 }
 
 impl Manifest {
@@ -126,6 +146,7 @@ impl Manifest {
             // configured disks and nvram path.
             disks: Vec::new(),
             nvram: None,
+            cpu_model: None,
         }
     }
 
@@ -161,6 +182,9 @@ impl Manifest {
                 Value::Table(dt)
             }).collect();
             tbl.insert("disks".into(), Value::Array(disks));
+        }
+        if let Some(cm) = &self.cpu_model {
+            tbl.insert("cpu_model".into(), Value::String(cm.clone()));
         }
         if let Some(nv) = &self.nvram {
             tbl.insert("nvram".into(), Value::String(nv.clone()));
@@ -206,6 +230,7 @@ impl Manifest {
             }).collect())
             .unwrap_or_default();
         let nvram = tbl.get("nvram").and_then(|x| x.as_str()).map(String::from);
+        let cpu_model = tbl.get("cpu_model").and_then(|x| x.as_str()).map(String::from);
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -217,6 +242,7 @@ impl Manifest {
             features,
             disks,
             nvram,
+            cpu_model,
         })
     }
 }
@@ -585,6 +611,7 @@ mod tests {
             features: vec!["jit".into(), "tlbvmap".into()],
             disks: vec![DiskRef { id: 1, path: "irix53.raw".into(), size_bytes: 4294967296 }],
             nvram: Some("nvram-irix53.bin".into()),
+            cpu_model: Some("R5000".into()),
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -598,6 +625,7 @@ mod tests {
         assert_eq!(m2.features, m.features);
         assert_eq!(m2.disks, m.disks);
         assert_eq!(m2.nvram, m.nvram);
+        assert_eq!(m2.cpu_model, m.cpu_model);
     }
 
     #[test]
@@ -613,6 +641,7 @@ mod tests {
             features: vec![],
             disks: vec![],
             nvram: None,
+            cpu_model: None,
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -623,6 +652,47 @@ mod tests {
         assert!(m2.features.is_empty());
         assert!(m2.disks.is_empty());
         assert!(m2.nvram.is_none());
+        assert!(m2.cpu_model.is_none(), "legacy manifest has no cpu_model");
+    }
+
+    #[test]
+    fn a_snapshot_only_restores_onto_the_cpu_it_was_taken_on() {
+        // same model: fine
+        assert!(cpu_model_mismatch(Some("R4400"), "R4400").is_none());
+        assert!(cpu_model_mismatch(Some("R5000"), "R5000").is_none());
+        // legacy manifest: nothing recorded, so nothing to refuse
+        assert!(cpu_model_mismatch(None, "R5000").is_none());
+        // crossed models: refused, and the message says how to fix it
+        let e = cpu_model_mismatch(Some("R4400"), "R5000").expect("must refuse");
+        assert!(e.contains("R4400") && e.contains("R5000"), "{}", e);
+        assert!(e.contains(r#"cpu = "r4400""#), "must name the config fix: {}", e);
+        assert!(cpu_model_mismatch(Some("R5000"), "R4400").is_some());
+    }
+
+    /// The CPU model must survive a manifest round trip, and a legacy manifest
+    /// (written before the model was config) must still parse as "unknown" so
+    /// old snapshots keep loading instead of being refused outright.
+    #[test]
+    fn cpu_model_round_trips_and_legacy_stays_unknown() {
+        let mut m = Manifest::for_current_save();
+        m.cpu_model = Some("R5000".into());
+        let back = Manifest::from_toml(&m.to_toml()).expect("round trip");
+        assert_eq!(back.cpu_model.as_deref(), Some("R5000"));
+
+        // a manifest with no cpu_model key at all
+        let mut t = m.to_toml();
+        t.as_table_mut().unwrap().remove("cpu_model");
+        let legacy = Manifest::from_toml(&t).expect("legacy parses");
+        assert!(legacy.cpu_model.is_none(), "absent cpu_model must read as unknown, not error");
+
+        // and the execution-affecting flags are now recorded
+        let f = enabled_features();
+        for name in ["jitv2", "opcodefusion", "idle-pause"] {
+            assert_eq!(f.contains(&name.to_string()), cfg!(feature = "jitv2") && name == "jitv2"
+                || cfg!(feature = "opcodefusion") && name == "opcodefusion"
+                || cfg!(feature = "idle-pause") && name == "idle-pause",
+                "{} recorded iff enabled", name);
+        }
     }
 
     #[test]

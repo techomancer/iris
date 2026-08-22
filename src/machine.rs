@@ -1627,6 +1627,8 @@ impl Machine {
         // filled by for_current_save.)
         manifest.disks = self.disks.clone();
         manifest.nvram = Some(self.nvram_path.clone());
+        // The CPU is a runtime choice now, so it is state the restore must match.
+        manifest.cpu_model = Some(self.cpu.model_name().to_string());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
 
@@ -1818,6 +1820,10 @@ impl Machine {
                             m.features.join(","), cur_features.join(",")
                         ));
                     }
+                    // The CPU model is guest-visible (PRId/FIR, cache geometry) and
+                    // no longer a build flag, so a mismatch is as fatal as a feature one.
+                    if let Some(e) = crate::snapshot::cpu_model_mismatch(
+                        m.cpu_model.as_deref(), self.cpu.model_name()) { fatal.push(e); }
                     // Every recorded disk must still be configured at the same SCSI
                     // id with the same size. The host *path* is only where the file
                     // happens to live (it moves when disks are relocated, e.g. into a
