@@ -16,6 +16,13 @@ Refresh it with `make -C bench prebuilt` after changing anything the guest is
 built from — the kernels, the harness, `cpu-tests/harness/`, the link script,
 the compiler flags — and commit the result alongside the source change.
 
-`PROVENANCE` records what the checked-in bytes hash to. It is written by the
-`prebuilt` target; nothing reads it, but a reviewer can check it by hand and a
-`git log` on it shows every time the image moved.
+`PROVENANCE` records a digest of every source the image is built from, written
+by the `prebuilt` target and verified by `make -C bench check-prebuilt` (which
+CI runs). It is a *source* digest, not an image one, because two correct builds
+of identical source do not produce identical bytes — the image is compiled with
+`-g`, so DWARF records the build directory, and toolchain versions differ. The
+image's own hash is recorded alongside for humans, and nothing compares it.
+
+The digest cannot tell you the image *works*. The embedded-runner test does, by
+running the suite out of the binary the image is linked into and requiring 100%
+accuracy against the golden checksums compiled into it.

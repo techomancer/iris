@@ -837,6 +837,50 @@ IRIS-BENCH-END
         assert!(run.dmips().unwrap() > 0.0);
     }
 
+    /// Per-row derived units. Ported from `iris-bench`'s own tests when the
+    /// model moved here, so the arithmetic keeps its coverage.
+    #[test]
+    fn per_row_rates_use_the_units_they_claim() {
+        let p = parsed();
+        let alu = p.rows.iter().find(|r| r.name == "int/alu").unwrap();
+        // 15_601_504 work units in 254_727_060 ns.
+        let want = 15_601_504.0 * 1e9 / 254_727_060.0;
+        assert!((alu.rate() - want).abs() < 1.0, "rate was {}", alu.rate());
+        // icount * 1e3 / ns is millions of instructions per second.
+        let want_mips = 26_327_595.0 * 1e3 / 254_727_060.0;
+        assert!((alu.mips() - want_mips).abs() < 0.01);
+
+        // A row with no time, or no instruction counter, reports zero rather
+        // than dividing by it.
+        let mut dead = alu.clone();
+        dead.ns = 0;
+        assert_eq!(dead.rate(), 0.0);
+        assert_eq!(dead.mips(), 0.0);
+        let mut hostish = alu.clone();
+        hostish.icount = 0;
+        assert_eq!(hostish.mips(), 0.0, "no instruction counter is not zero MIPS of work");
+    }
+
+    /// `parse_features` reads the emulator's own startup banner, so a saved
+    /// result records what produced it rather than what the caller believed.
+    #[test]
+    fn features_come_from_the_emulator_banner() {
+        assert_eq!(parse_features("iris: build features: r5k jitv2 tlbvmap\n"),
+                   vec!["r5k", "jitv2", "tlbvmap"]);
+        assert!(parse_features("iris: build features: (none)\n").is_empty());
+        assert!(parse_features("no banner at all").is_empty());
+    }
+
+    /// A run with no whetstone row has no whetstone figure — `None`, not 0.0,
+    /// so a missing kernel cannot be read as a slow one.
+    #[test]
+    fn a_missing_kernel_has_no_figure_rather_than_a_zero_one() {
+        let run = a_run();
+        assert!(run.whet_loops().is_none());
+        assert!(run.linpack_mflops().is_none());
+        assert!(run.dmips().is_some(), "the fixture does have a dhrystone row");
+    }
+
     #[test]
     fn a_category_aggregates_only_its_own_kernels_and_unit() {
         let run = a_run();

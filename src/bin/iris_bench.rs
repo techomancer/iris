@@ -1052,67 +1052,9 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "\
-noise before the block
-IRIS-BENCH-BEGIN v1
-#machine cpu=R4400 prid=0x00000440 fir=0x00000500 config=0x00c08483 l2=1 testdev=1 timebase=1
-#timebase count_hz=33000000 measured=1
-#work base=0x88300000 bytes=25165824
-#cols name unit iters work ns icount count exc checksum golden status
-int/alu ops 16384 262144 250000000 12500000 8250 0 0x1111 0x1111 OK
-int/dhrystone dhry 1000 1757000 1000000000 50000000 33000 0 0x2222 0x3333 MISMATCH
-sys/tlb_hit xlat 256 24576 250000000 5000000 8250 4096 0x0000 0x0000 UNCHECKED
-#totals benches=3 checked=2 matched=1 ns=1500000000 icount=67500000
-IRIS-BENCH-END
-";
-
-    #[test]
-    fn parses_a_report_block_out_of_surrounding_noise() {
-        let (m, rows, checked, matched, ns, ic) = parse_block(SAMPLE).unwrap();
-        assert_eq!(m.cpu, "R4400");
-        assert_eq!(m.count_hz, 33_000_000);
-        assert!(m.timebase && m.testdev && m.l2);
-        assert_eq!(m.work_bytes, 25_165_824);
-        assert_eq!(rows.len(), 3);
-        assert_eq!((checked, matched), (2, 1));
-        assert_eq!((ns, ic), (1_500_000_000, 67_500_000));
-    }
-
-    #[test]
-    fn rates_and_derived_units() {
-        let (_, rows, checked, matched, ns, ic) = parse_block(SAMPLE).unwrap();
-        let run = Run {
-            cell: "t".into(), features: vec![], machine: Machine::default(),
-            host: HostInfo::default(), rows, checked, matched,
-            total_ns: ns, total_icount: ic, wall_s: 2.0,
-            suite_id: "blake3:0000000000000000".into(),
-        };
-        // 262144 work units in 0.25 s
-        assert!((run.row("int/alu").unwrap().rate() - 1_048_576.0).abs() < 1.0);
-        // 12.5M instructions in 0.25 s = 50 MIPS
-        assert!((run.row("int/alu").unwrap().mips() - 50.0).abs() < 0.01);
-        // 1,757,000 dhrystones in 1 s / 1757 = 1000 DMIPS
-        assert!((run.dmips().unwrap() - 1000.0).abs() < 0.01);
-        assert!(run.whet_loops().is_none(), "the sample block has no whetstone row");
-        assert!((run.accuracy() - 50.0).abs() < 0.01);
-        assert!((run.mips() - 45.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn a_truncated_run_is_an_error_not_an_empty_report() {
-        let cut = SAMPLE.split(END).next().unwrap();
-        assert!(parse_block(cut).unwrap_err().contains("IRIS-BENCH-END"));
-        assert!(parse_block("nothing here").unwrap_err().contains("IRIS-BENCH-BEGIN"));
-    }
-
-    #[test]
-    fn features_come_from_the_emulator_banner() {
-        assert_eq!(parse_features("iris: build features: r5k jitv2 tlbvmap\n"),
-                   vec!["r5k", "jitv2", "tlbvmap"]);
-        assert!(parse_features("iris: build features: (none)\n").is_empty());
-        assert!(parse_features("no banner at all").is_empty());
-    }
-
+    /// Only what is local to this binary. The report model, its parser and the
+    /// derived figures moved to `iris::bench_report` and are tested there —
+    /// keeping a second copy here is how two parsers drift apart.
     #[test]
     fn every_cell_name_is_unique_and_maps_to_a_cpu() {
         for (i, a) in CELLS.iter().enumerate() {

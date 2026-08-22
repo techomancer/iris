@@ -262,10 +262,12 @@ writable path to unpack an image to either.
 **Refresh it with `make -C bench prebuilt` whenever you change anything the
 guest is built from** — the kernels, `harness/`, `cpu-tests/harness/`, the link
 script, the compiler flags — and commit it alongside the source change.
-`.github/workflows/suites.yml` rebuilds it and fails on any difference, because
-this is a build product that drifts dangerously: accuracy is scored against
-golden checksums compiled *into* the image, so a stale image against fresh
-goldens reports failures to users that are not real.
+`make -C bench check-prebuilt` — which CI runs — fails if the guest sources have
+moved since the image was last refreshed, because this is a build product that
+drifts dangerously: accuracy is scored against golden checksums compiled *into*
+the image, so a stale image against fresh goldens reports failures to users that
+are not real. It compares a digest of the *sources*, not the image bytes:
+`bench/prebuilt-stamp.py` explains why byte comparison cannot work.
 
 ---
 
