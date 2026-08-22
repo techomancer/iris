@@ -510,17 +510,38 @@ impl Default for GraphicsSection {
     }
 }
 
+/// Emulated CPU. Runtime-selectable: each model is its own monomorphisation,
+/// so the hot path carries no per-model branch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuModel {
+    /// MIPS R4400, 16K direct-mapped L1s, 1 MB L2. The Indy IRIS has always shipped.
+    #[default]
+    R4400,
+    /// MIPS R5000, 2-way 32K L1s, no secondary cache, MIPS IV.
+    R5000,
+}
+
+impl CpuModel {
+    pub const ALL: [Self; 2] = [Self::R4400, Self::R5000];
+    pub fn label(self) -> &'static str {
+        match self { Self::R4400 => "MIPS R4400", Self::R5000 => "MIPS R5000" }
+    }
+}
+
 /// `[machine]` section — platform identity (not performance knobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineSection {
     #[serde(default)]
     pub profile: MachineProfile,
+    #[serde(default)]
+    pub cpu: CpuModel,
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default() }
+        Self { profile: MachineProfile::default(), cpu: CpuModel::default() }
     }
 }
 

@@ -344,6 +344,9 @@ pub trait CpuModel: MipsCache {
 }
 
 pub trait MipsCache: Send + Sync {
+    /// Share the L1-I hit/fetch counters with the status display. No-op where absent.
+    fn set_l1i_counters(&mut self, _hit: Arc<AtomicU64>, _fetch: Arc<AtomicU64>) {}
+
     /// L1/L2 geometry, so CP0 Config reports this model rather than a build-time constant.
     const IC_SIZE: usize;
     const IC_LINE: usize;
@@ -2042,6 +2045,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const L2_CACHE_SIZE: usize, const L2_LINE: usize, const L2_TAGS: usize, const L2_DATA: usize,
     const L2_NINSTRS: usize, const HAS_L2: bool,
     const MIPS4: bool, const PRID: u32, const FIR: u32, const TLB_ENTRIES: usize> MipsCache for CpuCache<IC_SIZE, IC_LINE, IC_WAYS, IC_TAGS, DC_SIZE, DC_LINE, DC_WAYS, DC_TAGS, DC_DATA, L2_CACHE_SIZE, L2_LINE, L2_TAGS, L2_DATA, L2_NINSTRS, HAS_L2, MIPS4, PRID, FIR, TLB_ENTRIES> {
+    fn set_l1i_counters(&mut self, hit: Arc<AtomicU64>, fetch: Arc<AtomicU64>) {
+        self.l1i_hit_count = hit;
+        self.l1i_fetch_count = fetch;
+    }
+
     const IC_SIZE: usize = IC_SIZE;
     const IC_LINE: usize = IC_LINE;
     const IC_WAYS: usize = IC_WAYS;
