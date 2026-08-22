@@ -11710,12 +11710,18 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn load_elf(&self, path: &str) -> Result<String, String>;
     fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
     fn step_n_inline(&self, n: u64) -> Result<u64, String>;
+    #[cfg(feature = "developer")]
     fn step_one_inline_counting_instructions(&self) -> Result<usize, String>;
     fn state_digest(&self) -> Result<CpuStateDigest, String>;
+    #[cfg(feature = "developer")]
     fn restore_state_digest(&self, d: &CpuStateDigest) -> Result<(), String>;
+    #[cfg(feature = "developer")]
     fn fixup_cp0_count(&self, d: &CpuStateDigest) -> Result<(), String>;
+    #[cfg(all(feature = "jitv2", feature = "developer"))]
     fn set_jitv2_dispatch_enabled(&self, on: bool) -> Result<bool, String>;
+    #[cfg(feature = "developer")]
     fn set_hw_read_fixup_recording(&self, on: bool) -> Result<(), String>;
+    #[cfg(feature = "developer")]
     fn set_hw_read_fixup_replay(&self, f: Option<Vec<(u64, u8, u64)>>) -> Result<(), String>;
     /// CPU model name, as the guest and the benchmark report see it.
     fn model_name(&self) -> &'static str;
@@ -11739,14 +11745,20 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
     fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
     fn step_n_inline(&self, n: u64) -> Result<u64, String> { MipsCpu::step_n_inline(self, n) }
+    #[cfg(feature = "developer")]
     fn step_one_inline_counting_instructions(&self) -> Result<usize, String> {
         MipsCpu::step_one_inline_counting_instructions(self)
     }
     fn state_digest(&self) -> Result<CpuStateDigest, String> { MipsCpu::state_digest(self) }
+    #[cfg(feature = "developer")]
     fn restore_state_digest(&self, d: &CpuStateDigest) -> Result<(), String> { MipsCpu::restore_state_digest(self, d) }
+    #[cfg(feature = "developer")]
     fn fixup_cp0_count(&self, d: &CpuStateDigest) -> Result<(), String> { MipsCpu::fixup_cp0_count(self, d) }
+    #[cfg(all(feature = "jitv2", feature = "developer"))]
     fn set_jitv2_dispatch_enabled(&self, on: bool) -> Result<bool, String> { MipsCpu::set_jitv2_dispatch_enabled(self, on) }
+    #[cfg(feature = "developer")]
     fn set_hw_read_fixup_recording(&self, on: bool) -> Result<(), String> { MipsCpu::set_hw_read_fixup_recording(self, on) }
+    #[cfg(feature = "developer")]
     fn set_hw_read_fixup_replay(&self, f: Option<Vec<(u64, u8, u64)>>) -> Result<(), String> {
         MipsCpu::set_hw_read_fixup_replay(self, f)
     }

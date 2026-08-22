@@ -2323,20 +2323,15 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         // L1I and L1D are virtually indexed; L2 is physically indexed.
         // R5K: for L1 index ops, virt_addr bit 14 selects the way — fold into eidx.
+        // 2-way encodes the way into the index; direct-mapped is the plain set.
         let idx = if is_l2 {
             self.l2.get_index(phys_addr)
         } else if is_icache {
-            if Self::IS_R5K {
-            { self.ic.get_index(virt_addr) | (((virt_addr >> 14) as usize & 1) << Self::IC_NUM_LINES_SHIFT) }
-            } else {
-            { self.ic.get_index(virt_addr) }
-            }
+            let set = self.ic.get_index(virt_addr);
+            if Self::IS_R5K { set | (((virt_addr >> 14) as usize & 1) << Self::IC_NUM_LINES_SHIFT) } else { set }
         } else {
-            if Self::IS_R5K {
-            { self.dc.get_index(virt_addr) | (((virt_addr >> 14) as usize & 1) << Self::DC_NUM_LINES_SHIFT) }
-            } else {
-            { self.dc.get_index(virt_addr) }
-            }
+            let set = self.dc.get_index(virt_addr);
+            if Self::IS_R5K { set | (((virt_addr >> 14) as usize & 1) << Self::DC_NUM_LINES_SHIFT) } else { set }
         };
 
         #[cfg(feature = "debug_cache")]

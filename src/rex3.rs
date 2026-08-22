@@ -3350,7 +3350,7 @@ impl Rex3 {
         #[cfg(feature = "developer")]
         {
             let len = self.gfifo.len() + 1;
-            let _ = self.gfifo_hwm.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
+            let _ = self.gfifo_hwm.try_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
                 if len > hwm { Some(len) } else { None }
             });
         }
