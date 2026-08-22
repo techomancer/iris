@@ -1206,6 +1206,34 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                // Chosen at Machine::new, so an edit while running is pending, not live —
+                // same shape as the Memory menu's RAM rows.
+                ui.set_min_width(240.0);
+                ui.label(RichText::new(format!("Processor: {}", self.cfg.machine.cpu.label())).strong());
+                ui.add_enabled_ui(!running, |ui| {
+                    for c in iris::config::CpuModel::ALL {
+                        if ui.radio(self.cfg.machine.cpu == c, c.label()).clicked() {
+                            self.cfg.machine.cpu = c;
+                            self.mark_dirty();
+                            self.toast(format!("{} — applies at next Start", c.label()));
+                        }
+                    }
+                });
+                if running {
+                    match self.started_cpu {
+                        Some(started) if started != self.cfg.machine.cpu => {
+                            ui.label(RichText::new(format!(
+                                "Running: {} (Stop to apply edits)", started.label()))
+                                .color(Color32::YELLOW));
+                        }
+                        Some(started) => {
+                            ui.label(RichText::new(format!("Running: {}", started.label())).weak());
+                        }
+                        None => {}
+                    }
+                    ui.label(RichText::new("CPU changes apply after Stop → Start").weak().small());
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Save state:");
                     ui.add(egui::TextEdit::singleline(&mut self.save_state_name).desired_width(120.0));
@@ -2956,6 +2984,18 @@ impl App {
             ui.label("Platform");
             ui.label(self.cfg.machine.profile.label());
             ui.end_row();
+            // Guest-visible (PRId, cache geometry, ISA level), so it belongs in
+            // the summary next to the platform rather than buried in a tab.
+            ui.label("Processor");
+            ui.label(self.cfg.machine.cpu.label());
+            ui.end_row();
+            if let Some(started) = self.started_cpu {
+                if started != self.cfg.machine.cpu {
+                    ui.label("Processor (last Start)");
+                    ui.label(started.label());
+                    ui.end_row();
+                }
+            }
             ui.label("PROM");
             ui.label(if std::path::Path::new(&self.cfg.prom).exists() {
                 abs_path(&self.cfg.prom)

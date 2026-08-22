@@ -1,5 +1,5 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
-use iris::config::{MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
+use iris::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
 use iris::vc2_timings::NewportResolution;
 
 use crate::ram::RAM_PRESETS;
@@ -11,6 +11,7 @@ pub struct NewMachineDialog {
     pub name: String,
     /// Emulated SGI machine model (Indy IP24 / Indigo2 IP22).
     pub profile: MachineProfile,
+    pub cpu: CpuModel,
     /// Host-forced Newport video mode (`Guest` leaves it to IRIX/setmon).
     pub resolution: NewportResolution,
     pub prom_path: String,
@@ -38,6 +39,7 @@ impl Default for NewMachineDialog {
             open: false,
             name: "indy".into(),
             profile: MachineProfile::default(),
+            cpu: CpuModel::default(),
             resolution: NewportResolution::default(),
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
@@ -95,6 +97,16 @@ impl NewMachineDialog {
                         .show_ui(ui, |ui| {
                             for p in MachineProfile::ALL {
                                 ui.selectable_value(&mut self.profile, p, p.label());
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Processor");
+                    ComboBox::from_id_salt("nm_cpu")
+                        .selected_text(self.cpu.label())
+                        .show_ui(ui, |ui| {
+                            for c in CpuModel::ALL {
+                                ui.selectable_value(&mut self.cpu, c, c.label());
                             }
                         });
                     ui.end_row();
@@ -235,6 +247,7 @@ impl NewMachineDialog {
                     {
                         let mut cfg = MachineConfig::default();
                         cfg.machine.profile = self.profile;
+                        cfg.machine.cpu = self.cpu;
                         cfg.graphics.resolution = self.resolution;
                         cfg.prom = if self.use_embedded_prom { String::new() } else { self.prom_path.clone() };
                         // Empty prom path makes Machine::new fall back to embedded
