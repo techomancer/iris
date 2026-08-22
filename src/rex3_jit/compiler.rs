@@ -1441,17 +1441,34 @@ fn emit_shader(
         b.ins().jump(loop_end, &[]);
 
         b.switch_to_block(y_cont_block); b.seal_block(y_cont_block);
-        // Continue loop: reset x to xsave, new row
-        let new_first = b.ins().iconst(types::I8, 1);
-        let mut back_args: Vec<Value> = vec![xsave_v, ystart_next, new_first];
-        if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
-        if dm0.enzpattern() { back_args.push(zpat_bit_reset); }
-        if dm0.enlspattern() { back_args.push(pat_bit_reset); back_args.push(new_lsmode); }
         if is_hostw || is_hostr {
-            back_args.push(host_shifter_row_reset);
-            back_args.push(hostcnt_row_reset);
+            // Host mode: hardware processes exactly one word per GO. host_xstop_v
+            // (the "word done" threshold) is computed once at shader entry from the
+            // row the GO started on, so it is only valid for that row — continuing
+            // the loop internally past a row wrap would keep running with a stale
+            // threshold and silently skip the word boundary the caller is waiting
+            // on. Treat the row wrap itself as a forced word boundary instead:
+            // flush whatever's accumulated (padded, since a row can end mid-word —
+            // same as the block-done path above) and return to the caller, who
+            // re-enters via a fresh GO/entry() call with a correctly recomputed
+            // host_xstop_v for the new row.
+            if is_hostr {
+                let padded = flushed_shifter(&mut b, current_shifter);
+                emit_store_hostrw(&mut b, ctx_ptr, &mem, padded, dm1);
+            }
+            b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
+            emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
+                dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+            b.ins().jump(loop_end, &[]);
+        } else {
+            // Continue loop: reset x to xsave, new row
+            let new_first = b.ins().iconst(types::I8, 1);
+            let mut back_args: Vec<Value> = vec![xsave_v, ystart_next, new_first];
+            if dm0.shade() { back_args.extend([new_cr, new_cg, new_cb, new_ca]); }
+            if dm0.enzpattern() { back_args.push(zpat_bit_reset); }
+            if dm0.enlspattern() { back_args.push(pat_bit_reset); back_args.push(new_lsmode); }
+            b.ins().jump(loop_header, &block_args(&back_args));
         }
-        b.ins().jump(loop_header, &block_args(&back_args));
     }
 
     // ── cont_x_block: not x_end — check stoponx / host_xstop ─────────────────

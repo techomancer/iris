@@ -3797,6 +3797,213 @@ mod jit_tests {
         assert_eq!(words_interp, words_jit,
             "CI8 HOSTR multirow (no STOPONY) JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
     }
+
+    /// Stress test: large multi-row, multi-word-per-row HOSTR block readbacks with
+    /// STOPONXY set (DM0_READ_BLOCK's real shape — each row wraps mid-primitive
+    /// while more rows remain), comparing interpreter vs pre-warmed JIT output.
+    ///
+    /// Guards against a real bug (row-wrap-under-STOPONY: the JIT shader's
+    /// host_xstop_v word-boundary threshold is computed once at shader entry and
+    /// goes stale across an internal row wrap, so a JIT-compiled READ_BLOCK could
+    /// silently skip a host-word writeback right after wrapping to a new row).
+    /// jit_hostr_ci8_block_multirow_no_stopony above covers the same row-wrap
+    /// shape but without STOPONY, so it never touched this path — this test uses
+    /// DM0_READ_BLOCK (STOPONXY | COLORHOST | DOSETUP) like the real driver and
+    /// test_hostr_ci8_read_block_32bit do, at larger sizes with several rows and
+    /// several words per row so more than one row-wrap is exercised.
+    fn hostr_stress(dm1: u32, width: i32, height: i32, words_per_pixel_row: u32) {
+        // Distinct per-pixel values (not a solid fill) so any word/row
+        // misalignment shows up as a mismatch instead of coincidentally matching.
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for y in 0..height {
+                for x in 0..width {
+                    // Every pixel must stay distinct even after each plane's own
+                    // depth mask (CI8 keeps only the low byte) — vary the low byte
+                    // directly instead of only the high bits, or a CI8 readback
+                    // would see an accidentally-solid fill and hide misalignment.
+                    let i = (y * width + x) as u32;
+                    fb[(y as u32 * 2048 + x as u32) as usize] =
+                        0x1234_5600u32 | (1 + (i % 0xFE));
+                }
+            }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                for y in 0..height {
+                    for x in 0..width {
+                        let idx = (y as u32 * 2048 + x as u32) as usize;
+                        dst[idx] = src[idx];
+                    }
+                }
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_XYENDI,   xy(width - 1, height - 1));
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+        };
+
+        let words = (words_per_pixel_row as i32 * height) as usize;
+        let read_all_words = |rex: &Rex3| -> Vec<u32> {
+            let mut out = Vec::with_capacity(words);
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            for i in 0..words {
+                out.push(if i == words - 1 { read_hostrw32_last(rex) } else { read_hostrw32(rex) });
+            }
+            out
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        let words_interp = read_all_words(rex_i);
+
+        // Pre-warm: throwaway pass over the same primitive shape forces the JIT
+        // shader to be fully compiled *before* the real comparison pass, so
+        // every GO below dispatches via JIT from word 0 — reproducing the "already
+        // compiled by the time the real primitive runs" end state deterministically
+        // instead of relying on racy mid-primitive compile timing.
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let _ = read_all_words(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0),
+                "JIT compile failed dm0={DM0_READ_BLOCK:#010x} dm1={dm1:#010x}");
+        }
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let words_jit = read_all_words(rex_j);
+
+        assert_eq!(words_interp, words_jit,
+            "HOSTR stress ({width}x{height}, dm1={dm1:#010x}) JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    #[test]
+    fn jit_hostr_ci8_stress_large_block() {
+        // 32px wide / 4px-per-word = 8 words/row, 20 rows = 160 words, 20 row-wraps.
+        hostr_stress(DM1_CI8_HOSTRW, 32, 20, 8);
+    }
+
+    #[test]
+    fn jit_hostr_ci8_stress_odd_width_block() {
+        // Odd width: rows don't divide evenly into words, so every row-wrap also
+        // lands mid-word (ceil(17/4) = 5 words/row, last word only 1 valid pixel).
+        hostr_stress(DM1_CI8_HOSTRW, 17, 11, 5);
+    }
+
+    /// Companion to jit_hostr_ci8_stress_odd_width_block: hostr_stress only checks
+    /// interp == JIT, which would pass even if BOTH engines packed a partial word
+    /// wrong the same way. This independently verifies against the fill pattern
+    /// that each row's trailing partial word (1 of 4 CI8 slots valid, 17 % 4 == 1)
+    /// is packed MSB-first with the unfilled low bytes zeroed — same layout
+    /// test_hostr_ci8_partial_word verifies for a single row, checked here across
+    /// every row-wrap in a multirow block for both interp and (pre-warmed) JIT.
+    #[test]
+    fn jit_hostr_ci8_partial_word_alignment_multirow() {
+        let (width, height): (i32, i32) = (17, 6);
+        let words_per_row = 5usize; // ceil(17/4)
+        let dm1 = DM1_CI8_HOSTRW;
+
+        // Same fill formula as hostr_stress: distinct, nonzero low byte per pixel.
+        let pixel_at = |x: i32, y: i32| -> u32 {
+            let i = (y * width + x) as u32;
+            1 + (i % 0xFE)
+        };
+
+        let fill_rex = make_rex3();
+        rex3init(fill_rex);
+        unsafe {
+            let fb = &mut *fill_rex.fb_rgb.get();
+            for y in 0..height {
+                for x in 0..width {
+                    fb[(y as u32 * 2048 + x as u32) as usize] = 0x1234_5600 | pixel_at(x, y);
+                }
+            }
+        }
+
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                let src = &*fill_rex.fb_rgb.get();
+                let dst = &mut *rex.fb_rgb.get();
+                for y in 0..height {
+                    for x in 0..width {
+                        let idx = (y as u32 * 2048 + x as u32) as usize;
+                        dst[idx] = src[idx];
+                    }
+                }
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_XYENDI,   xy(width - 1, height - 1));
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+        };
+
+        let words = words_per_row * height as usize;
+        let read_all_words = |rex: &Rex3| -> Vec<u32> {
+            let mut out = Vec::with_capacity(words);
+            reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+            for i in 0..words {
+                out.push(if i == words - 1 { read_hostrw32_last(rex) } else { read_hostrw32(rex) });
+            }
+            out
+        };
+
+        let check_alignment = |words: &[u32], engine: &str| {
+            for y in 0..height as usize {
+                let row = &words[y * words_per_row..(y + 1) * words_per_row];
+                // Full words: 4 valid CI8 pixels each, MSB-first.
+                for (wi, &w) in row[..words_per_row - 1].iter().enumerate() {
+                    for slot in 0..4 {
+                        let x = (wi * 4 + slot) as i32;
+                        let got = (w >> (24 - 8 * slot)) & 0xFF;
+                        assert_eq!(got, pixel_at(x, y as i32),
+                            "{engine}: y={y} word={wi} slot={slot}: got {got:#04x}");
+                    }
+                }
+                // Trailing partial word: 17 % 4 == 1 valid pixel at x=16, must sit
+                // at the MSB byte with the remaining 3 bytes zero-padded (mirrors
+                // flush_host_pixel's left-shift-to-MSB / emit_shader's
+                // flushed_shifter padding — packing is LSB-to-MSB as slots fill,
+                // so a lone pixel must end up shifted all the way to the top).
+                let last = row[words_per_row - 1];
+                let expected_pixel = pixel_at(16, y as i32);
+                assert_eq!((last >> 24) & 0xFF, expected_pixel,
+                    "{engine}: y={y} partial word MSB byte: got {:#04x} expected {expected_pixel:#04x} (word={last:#010x})",
+                    (last >> 24) & 0xFF);
+                assert_eq!(last & 0x00FF_FFFF, 0,
+                    "{engine}: y={y} partial word low 3 bytes should be zero-padded, got {:#08x}", last & 0x00FF_FFFF);
+            }
+        };
+
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup_read(rex_i);
+        let words_interp = read_all_words(rex_i);
+        check_alignment(&words_interp, "interp");
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let _ = read_all_words(rex_j); // throwaway: triggers compile request
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0),
+                "JIT compile failed dm0={DM0_READ_BLOCK:#010x} dm1={dm1:#010x}");
+        }
+        rex3init(rex_j);
+        setup_read(rex_j);
+        let words_jit = read_all_words(rex_j);
+        check_alignment(&words_jit, "jit");
+    }
+
+    #[test]
+    fn jit_hostr_rgb24_stress_large_block() {
+        // RGB24 hostdepth32: 1 pixel/word, so this is 24 rows x 15 words = 360 row-wraps' worth.
+        hostr_stress(DM1_RGB24_HOSTRW, 15, 24, 15);
+    }
 }
 
 // ---------------------------------------------------------------------------

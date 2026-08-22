@@ -1821,6 +1821,20 @@ impl Rex3 {
                     ctx.mid_primitive = false;
                     break;
                 }
+
+                // Host mode: a row boundary is always a forced word boundary too,
+                // even if the row's width doesn't divide evenly into host_count
+                // (e.g. a 17px-wide CI8 row's last word only has 1 of 4 slots
+                // filled). Without this, a still-open partial word from this row
+                // would keep accumulating pixels from the next row instead of
+                // being flushed — hardware sends one word per GO in host mode,
+                // full or not. Checked here (not just via the hostcnt==0 check
+                // below) because that check alone never fires for a word that
+                // never reaches host_count pixels.
+                if stop_on_word && ctx.hostcnt > 0 {
+                    break;
+                }
+
                 first = true; // pixel in next row will be first
             } else if let Some(limit) = xstop {
                 let limit_reached = if x_dec { ctx.xstart <= limit } else { ctx.xstart >= limit };
