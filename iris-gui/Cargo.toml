@@ -76,9 +76,10 @@ pcap = ["iris/pcap"]
 # "rebuild with --features daynaport" warning, so a config stays editable.
 # Build with: cargo build -p iris-gui --features daynaport
 daynaport = ["iris/daynaport"]
-# Emulate an R5000 CPU instead of the default R4400 (compile-time: the cache
-# model differs deeply). Surfaced read-only on the Memory tab via
-# iris::build_features::CPU. Build with: cargo build -p iris-gui --features r5k
+# Vestigial for CPU selection. The R4400/R5000 choice is a runtime setting on
+# the Memory tab (`[machine] cpu`), and both models are compiled into every
+# build — see the note in src/lib.rs. This passthrough remains only so the
+# feature name still resolves for anyone building with it.
 r5k = ["iris/r5k"]
 # YouTube / max in-process perf: lightning (no GDB hot-path) + idle-pause on the
 # embedded iris core. Build with: cargo build -p iris-gui --release --features premiere

@@ -170,8 +170,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The CPU and the JIT are compile-time cargo features, not runtime
-      # switches — see rules/perf/hardware-profiles.md.
+      # The JIT is a compile-time cargo feature. The CPU is *not*, any more:
+      # 96e5ddd made both cache models monomorphisations selected at machine
+      # construction, so `--features r5k` no longer picks the R5000 and the run
+      # steps below pass `--cpu` instead. The feature is still set here only
+      # because it is what the r5ksc guards key off; it is vestigial for model
+      # selection and can be retired separately.
       #
       # Plain r5k only: r5ksc (the external R4600SC-style secondary cache a real
       # Indy R5000 board has) and r5ksc_triton (the O2's on-die L2, not a machine
@@ -214,6 +218,7 @@ jobs:
           chmod +x build/cputest.elf
           timeout 900 ../target/release/iris \
             --config run/bare.toml \
+            --cpu ${{ matrix.cpu }} \
             --load-elf build/cputest.elf \
             --test-device --test-device-dump build/dump.json \
             --headless --noaudio 2>&1 | tee build/run.log
@@ -244,6 +249,7 @@ jobs:
             --iris ./target/release/iris \
             --label "${{ matrix.cpu }}-${{ matrix.engine }}" \
             --timeout 2400 \
+            -- --cpu ${{ matrix.cpu }} \
             2>&1 | tee bench/build/run.log
 
       # Three ways this can fail quietly, so all three are checked. A build

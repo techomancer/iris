@@ -512,8 +512,9 @@ impl Default for GraphicsSection {
 
 /// Emulated CPU. Runtime-selectable: each model is its own monomorphisation,
 /// so the hot path carries no per-model branch.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[clap(rename_all = "lower")]
 pub enum CpuModel {
     /// MIPS R4400, 16K direct-mapped L1s, 1 MB L2. The Indy IRIS has always shipped.
     #[default]
@@ -1331,6 +1332,15 @@ pub struct Cli {
     #[arg(long = "no-scsi-deferred-int", default_value_t = false)]
     pub no_scsi_deferred_int: bool,
 
+    /// Emulated CPU: `r4400` (default) or `r5000`. Overrides `[machine] cpu`.
+    ///
+    /// Both models are compiled into every build — each is its own
+    /// monomorphisation, so the hot path carries no per-model branch — and this
+    /// picks between them at construction. The `r5k` cargo feature no longer
+    /// selects the model and is vestigial for that purpose.
+    #[arg(long = "cpu", value_name = "MODEL")]
+    pub cpu: Option<CpuModel>,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -1425,6 +1435,7 @@ impl Cli {
         if let Some(p) = self.cdrom6.clone() { apply_scsi(&mut cfg.scsi, 6, p, true, self.cdrom6_extra.clone()); }
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
+        if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }

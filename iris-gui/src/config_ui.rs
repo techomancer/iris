@@ -2,7 +2,7 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    ForwardBind, ForwardProto, GraphicsBoard, MachineConfig, MachineProfile, NetMode,
+    CpuModel, ForwardBind, ForwardProto, GraphicsBoard, MachineConfig, MachineProfile, NetMode,
     NfsConfig, PortForwardConfig, ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard,
     VALID_BANK_SIZES,
 };
@@ -16,6 +16,9 @@ use crate::ram::{ram_summary, RAM_PRESETS};
 pub struct MemoryUiContext {
     pub running: bool,
     pub started_banks: Option<[u32; 4]>,
+    /// The CPU the running guest actually booted on, so a pending change is
+    /// shown as pending rather than as fact. `None` when nothing is running.
+    pub started_cpu: Option<CpuModel>,
 }
 
 /// A host network interface candidate for the PCAP backend selector. This is a
@@ -360,14 +363,43 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
     ui.heading("Processor");
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("CPU");
-        ui.label(RichText::new(build_features::CPU).strong());
+        // A real setting, not a read-out of how this binary was built. Both
+        // cache models are compiled in and `Machine::new` picks between them at
+        // construction, so the choice belongs to the machine's config the same
+        // way its RAM does.
+        ui.add_enabled_ui(!mem_ctx.running, |ui| {
+            ComboBox::from_id_salt("cpu_model")
+                .selected_text(cfg.machine.cpu.label())
+                .show_ui(ui, |ui| {
+                    for c in CpuModel::ALL {
+                        ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
+                    }
+                });
+        });
         ui.end_row();
     });
+
+    if mem_ctx.running {
+        ui.label(
+            RichText::new("Stop the VM to change the CPU — it is chosen when the machine starts.")
+                .color(Color32::from_rgb(220, 170, 90)),
+        );
+        if let Some(started) = mem_ctx.started_cpu {
+            if started != cfg.machine.cpu {
+                ui.label(format!("Running guest: {} · Config (pending): {}",
+                                 started.label(), cfg.machine.cpu.label()));
+            }
+        }
+    } else {
+        ui.label(RichText::new("Applied at next Start").weak());
+    }
     ui.label(RichText::new(
-        "The CPU is fixed at build time — the R4400 and R5000 differ in their cache \
-         architecture, so it can't be switched at runtime. To use a different CPU, \
-         download that build.")
-        .weak());
+        "The R4400 has 16 KB direct-mapped caches and is MIPS III. The R5000 has \
+         2-way 32 KB caches, no secondary cache, and adds the MIPS IV instructions — \
+         so an R4400 raises Reserved Instruction on the ones an R5000 executes. IRIX \
+         reads the CPU from PRId and configures itself accordingly, so switching is a \
+         different machine to the guest, not a speed knob.")
+        .weak().small());
     ui.separator();
 
     ui.heading("Memory");
@@ -1334,8 +1366,10 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     let mut action = ConfigAction::None;
     ui.heading("Build features");
     Grid::new("build_features_grid").num_columns(2).striped(true).show(ui, |ui| {
-        ui.label("CPU");
-        ui.label(build_features::CPU);
+        // What this machine is configured to be, not how the binary was built —
+        // both cache models are always compiled in and selected at start.
+        ui.label("CPU (configured)");
+        ui.label(cfg.machine.cpu.label());
         ui.end_row();
         ui.label("REX3 JIT");
         ui.label(if build_features::REX_JIT { "enabled at compile time" } else { "not built" });
