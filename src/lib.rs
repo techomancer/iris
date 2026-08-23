@@ -7,6 +7,16 @@ compile_error!(
      switching, etc.) while developer exists specifically to add it back — pick one"
 );
 
+#[cfg(all(feature = "instr_stats", feature = "jitv2"))]
+compile_error!(
+    "features `instr_stats` and `jitv2` together are meaningless: instr_stats' \
+     execution counters are interpreter-path only (see its own Cargo.toml doc \
+     comment) and a jitv2 build routes the vast majority of instructions \
+     through compiled code, bypassing them entirely — the resulting counts \
+     would silently undercount almost everything rather than erroring. Build \
+     instr_stats without jitv2 to get real interpreter-only counts."
+);
+
 #[cfg(feature = "r5ksc_triton")]
 compile_error!(
     "`r5ksc_triton` models the O2's on-die R5000 L2, not a machine IRIS \

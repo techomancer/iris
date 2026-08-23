@@ -150,7 +150,7 @@ pub fn handle_request(
     }
     let _clear_scheduled = ClearScheduledOnDrop { page, offset };
 
-    if page.is_denylisted(offset) || page.is_entry_valid(offset) {
+    if page.is_denylisted(offset) || page.is_runnable(offset) {
         return false; // already decided (rejected or already has a fresh artifact)
     }
 
@@ -329,7 +329,7 @@ pub fn handle_request_deferred(
     }
     let _clear_scheduled = ClearScheduledOnDrop { page, offset };
 
-    if page.is_denylisted(offset) || page.is_entry_valid(offset) {
+    if page.is_denylisted(offset) || page.is_runnable(offset) {
         return false;
     }
 
@@ -617,7 +617,7 @@ mod tests {
         let mut codegen = Codegen::new();
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
 
-        assert!(page.is_entry_valid(4), "a plain ADDIU must compile and publish");
+        assert!(page.is_runnable(4), "a plain ADDIU must compile and publish");
         assert!(!page.is_denylisted(4));
     }
 
@@ -631,14 +631,14 @@ mod tests {
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_entry_valid(0));
+        assert!(page.is_runnable(0));
 
         // Bump gen so a naive re-compile would behave differently if it ran;
-        // since is_entry_valid is already true, handle_request must bail
+        // since is_runnable is already true, handle_request must bail
         // before touching the bus again.
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_entry_valid(0), "gen bump alone must not un-publish without going through it");
+        assert!(page.is_runnable(0), "gen bump alone must not un-publish without going through it");
     }
 
     #[test]
@@ -651,7 +651,7 @@ mod tests {
         let mut codegen = Codegen::new();
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
 
-        assert!(!page.is_entry_valid(0));
+        assert!(!page.is_runnable(0));
         assert!(!page.is_denylisted(0), "a transient read failure must not become a sticky rejection");
     }
 
@@ -676,7 +676,7 @@ mod tests {
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-            assert!(page.is_entry_valid(4));
+            assert!(page.is_runnable(4));
             assert!(page.try_schedule(4), "scheduled bit must be cleared after a successful publish, so a future recompile request isn't blocked");
         }
 
@@ -704,7 +704,7 @@ mod tests {
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-            assert!(!page.is_entry_valid(0));
+            assert!(!page.is_runnable(0));
             assert!(!page.is_denylisted(0));
             assert!(page.try_schedule(0), "scheduled bit must be cleared even on a transient bus-read failure, so the offset can be retried");
         }
@@ -746,11 +746,11 @@ mod tests {
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
         assert_eq!(pending, 1, "a lone small compile's page is still open — non-forced sealing must not publish it yet");
-        assert!(!page.is_entry_valid(4), "must not be published until something actually seals its page");
+        assert!(!page.is_runnable(4), "must not be published until something actually seals its page");
 
         force_publish_pending(&mut codegen, &mut pending);
         assert_eq!(pending, 0, "the idle-timeout force-seal sweep must finish the job");
-        assert!(page.is_entry_valid(4), "now published, once forced");
+        assert!(page.is_runnable(4), "now published, once forced");
     }
 
     #[test]
@@ -1052,7 +1052,7 @@ fn prepare_multi_entry_compile(
     // and a re-walk can legitimately exclude one this time (budget/shape
     // changed) even though it published fine before. Denylisting alone
     // isn't enough for those: `compiled`'s bit stays set from the earlier
-    // publish, `is_entry_valid` keeps reporting it dispatchable, but this
+    // publish, `is_runnable` keeps reporting it dispatchable, but this
     // compile's `func` has no case for it — the exact EXEC_FALLBACK-forever
     // shape the candidates fold-in was meant to fix in the first place, just
     // triggered by a denylist instead of a plain omission.
@@ -1551,7 +1551,7 @@ mod tests {
         let mut codegen = Codegen::new();
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
 
-        assert!(page.is_entry_valid(4), "a plain ADDIU must compile and publish");
+        assert!(page.is_runnable(4), "a plain ADDIU must compile and publish");
         assert!(!page.is_denylisted(4));
     }
 
@@ -1561,7 +1561,7 @@ mod tests {
         // compile; its dispatch switch only recognizes the entry_words THAT
         // walk covered. If a later, unrelated compile (offset 8) doesn't
         // re-walk offset 4 alongside it, offset 4's `compiled` bit stays set
-        // (publish unions rather than clearing) and `is_entry_valid` keeps
+        // (publish unions rather than clearing) and `is_runnable` keeps
         // reporting it dispatchable, but the new `func` has no case for it —
         // every dispatch into it would fall through to EXEC_FALLBACK forever
         // (confirmed live via a boot traceback: `[jit:entry]` immediately
@@ -1576,15 +1576,15 @@ mod tests {
         page.mark_requested(4);
         let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_entry_valid(4), "offset 4 must compile and publish on its own");
+        assert!(page.is_runnable(4), "offset 4 must compile and publish on its own");
         let func_after_first_compile = page.func();
 
         page.mark_requested(8);
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_entry_valid(8), "offset 8 must compile and publish");
+        assert!(page.is_runnable(8), "offset 8 must compile and publish");
         assert_ne!(page.func(), func_after_first_compile,
             "sanity: the second compile really did replace func with a new one");
-        assert!(page.is_entry_valid(4),
+        assert!(page.is_runnable(4),
             "offset 4's compiled bit must stay dispatchable after an unrelated later compile — \
              a fresh func that doesn't re-walk it has no dispatch case for it at all, silently \
              turning every future hit into a JIT-entry-then-EXEC_FALLBACK round trip forever");
@@ -1601,10 +1601,10 @@ mod tests {
         let mut analyzer = Analyzer::new();
         let mut codegen = Codegen::new();
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_entry_valid(0));
+        assert!(page.is_runnable(0));
 
         // Bump gen so a naive re-compile would behave differently if it ran;
-        // since is_entry_valid is already true, handle_request must bail
+        // since is_runnable is already true, handle_request must bail
         // before touching the bus again. Re-mark requested: publish clears
         // the covered bit on success (clear_requested_bits), so without
         // this the second call would find zero candidates and no-op for an
@@ -1613,7 +1613,7 @@ mod tests {
         page.mark_requested(0);
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_entry_valid(0), "gen bump alone must not un-publish without going through it");
+        assert!(page.is_runnable(0), "gen bump alone must not un-publish without going through it");
     }
 
     #[test]
@@ -1627,7 +1627,7 @@ mod tests {
         let mut codegen = Codegen::new();
         handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
 
-        assert!(!page.is_entry_valid(0));
+        assert!(!page.is_runnable(0));
         assert!(!page.is_denylisted(0), "a transient read failure must not become a sticky rejection");
         assert_eq!(page.rejected_compiles(), 0, "a bus-read bounce is not a real rejection");
         assert_eq!(page.prepare_bounced(), 1,
@@ -1658,7 +1658,7 @@ mod tests {
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-            assert!(page.is_entry_valid(4));
+            assert!(page.is_runnable(4));
             assert!(page.try_schedule_page(), "scheduled bit must be cleared after a successful publish, so a future recompile request isn't blocked");
         }
 
@@ -1688,7 +1688,7 @@ mod tests {
             let mut analyzer = Analyzer::new();
             let mut codegen = Codegen::new();
             handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-            assert!(!page.is_entry_valid(0));
+            assert!(!page.is_runnable(0));
             assert!(!page.is_denylisted(0));
             assert!(page.try_schedule_page(), "scheduled bit must be cleared even on a transient bus-read failure, so the offset can be retried");
         }
@@ -1731,11 +1731,11 @@ mod tests {
         handle_request_deferred_for_test(&req, &bus, &mut analyzer, &mut codegen, &mut pending);
 
         assert_eq!(pending, 1, "a lone small compile's page is still open — non-forced sealing must not publish it yet");
-        assert!(!page.is_entry_valid(4), "must not be published until something actually seals its page");
+        assert!(!page.is_runnable(4), "must not be published until something actually seals its page");
 
         force_publish_pending(&mut codegen, &mut pending);
         assert_eq!(pending, 0, "the idle-timeout force-seal sweep must finish the job");
-        assert!(page.is_entry_valid(4), "now published, once forced");
+        assert!(page.is_runnable(4), "now published, once forced");
     }
 
     #[test]

@@ -545,7 +545,7 @@ mod tests {
             exec.install_jit_hooks();
         }
         for _ in 0..steps {
-            exec.step();
+            exec.step_jit();
         }
         CoreSnapshot::capture(&exec.core)
     }
@@ -589,7 +589,7 @@ mod tests {
             // tagged jit, NOT interp: this is a real external JIT dispatch,
             // it just isn't recorded via the dev hook (that path stays
             // internal-edge-only, see emit_dev_trace_bp's own doc comment).
-            exec.step(); // one step runs the whole first region under inline compile
+            exec.step_jit(); // one step runs the whole first region under inline compile
 
             let entries = exec.test_traceback_last(64);
             let find = |want: u64| entries.iter().find(|&&(epc, _, _)| epc == want)
@@ -620,7 +620,7 @@ mod tests {
 
             let mut hit = false;
             for _ in 0..6 {
-                if exec.step() == crate::mips_exec::EXEC_BREAKPOINT { hit = true; break; }
+                if exec.step_jit() == crate::mips_exec::EXEC_BREAKPOINT { hit = true; break; }
             }
             assert!(hit, "PC breakpoint inside a compiled region must fire from the dev hook");
             assert_eq!(exec.core.pc, pc + 8,
@@ -703,7 +703,7 @@ mod tests {
         exec.update_fpr_mode();
         exec.jitv2_inline_compile = true;
         exec.install_jit_hooks();
-        exec.step(); // one step compiles + runs the whole region under inline compile
+        exec.step_jit(); // one step compiles + runs the whole region under inline compile
 
         // Sanity: all three ADDIUs actually ran (proves the region really
         // executed entry+slot+fallback+successor, not just compiled).
@@ -761,7 +761,7 @@ mod tests {
         }
         exec.jitv2_inline_compile = true;
         exec.install_jit_hooks();
-        exec.step(); // one step compiles + runs the whole looping region
+        exec.step_jit(); // one step compiles + runs the whole looping region
 
         assert_eq!(exec.core.gpr[1], 0, "loop must run to completion (counter 2 -> 0)");
 
@@ -847,7 +847,7 @@ mod tests {
         // assuming one call suffices.
         for _ in 0..16 {
             if exec.core.gpr[1] == 0 { break; }
-            exec.step();
+            exec.step_jit();
         }
 
         assert_eq!(exec.core.gpr[1], 0, "loop must run to completion (counter 2 -> 0)");
@@ -858,8 +858,19 @@ mod tests {
         assert_eq!(hits.len(), 2, "fallback successor must be dispatched twice (first arrival + one back-edge): {:x?}", entries);
         assert_eq!(hits[0].2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
             "first arrival (from the fallback's own region) must be tagged FallbackSuccessor");
-        assert_eq!(hits[1].2, crate::mips_exec::InstrOrigin::Jit,
-            "second arrival (the loop back-edge) lands inside an already-compiled region as a plain interior word (not a fresh external entry, per emit_dev_trace_bp's normal path) — must be tagged Jit, not silently dropped from the trace");
+        // The loop's back-edge (BNE, a separate compiled region) re-dispatches
+        // to this same word externally, through the dispatch-head Switch —
+        // not an internal Cranelift branch within one function — landing on
+        // the exact same entry as the first fallback arrival. The dispatch
+        // head only has static per-compile analysis facts (is this word a
+        // fallback successor at all?), not "have I personally been entered
+        // before" runtime state, so it can't tell this second arrival apart
+        // from the first — both read FallbackSuccessor. Distinguishing them
+        // would need a runtime first-entry bit on the page/entry, which isn't
+        // worth adding for a `dt` diagnostic tag on a feature that's off by
+        // default (`j2 fallback`, see FALLBACK_ENABLED's own doc comment).
+        assert_eq!(hits[1].2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
+            "second arrival (the loop back-edge) re-enters the same external dispatch head as the first arrival, so it reads the same static tag — FallbackSuccessor, not a runtime-tracked distinction");
     }
 
     /// Diagnostic (not a strict regression gate): loads the REAL page
@@ -3194,7 +3205,11 @@ mod tests {
         exec.core.hot.interrupts.store(1, std::sync::atomic::Ordering::Relaxed); // pending from the start
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         assert_eq!(exec.core.gpr[2], 1, "entry_word's own skipped preamble must not have bailed -- its semantics ran for real");
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        // EXEC_FALLBACK, not EXEC_COMPLETE: the pending interrupt hasn't been
+        // delivered yet at this point -- the caller (step_jit) must fall back
+        // to the interpreter (step_int), whose step_preamble! actually
+        // delivers it. See emit_pending_interrupt_preamble's doc comment.
+        assert_eq!(status, crate::mips_exec::EXEC_FALLBACK);
         assert_eq!(exec.core.pc, pc + 4, "the branch's own (never skip-exempt) preamble must catch the pending interrupt and bail at its own word, before ever taking the back-edge into entry_word");
     }
 
@@ -6262,7 +6277,7 @@ mod tests {
             // `steps` is a safety cap.
             for _ in 0..steps {
                 if exec.core.pc == ra && !exec.core.in_delay_slot { break; }
-                exec.step();
+                exec.step_jit();
             }
             CoreSnapshot::capture(&exec.core)
         };

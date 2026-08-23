@@ -27,20 +27,112 @@ use parking_lot::Mutex;
 use crate::mips_core::MipsCore;
 use crate::mips_exec::ExecStatus;
 use crate::traits::{BusDevice, Device};
+
+/// A compile request pushed from the mips exec thread to the compile thread
+/// over the SPSC fifo (§6.4). Carries the page pointer rather than a
+/// snapshotted generation: the compile thread reads `gen` itself at snapshot
+/// time (§6.5 step 2, `gen_snap = gen`) and re-reads it at publish time — the
+/// generation at queue time is never consulted, only current-at-compile and
+/// current-at-publish. The pointer is mutable because publish (§6.1.3) writes
+/// into the page's `entry_table`/`entry_bits`/`artifact_list`.
+///
+/// Shared by both `old_impl` (non-`j2wp`) and `new_impl` (`j2wp`) — the two
+/// designs' own `handle_request`/senders read this differently (single-entry
+/// walk keyed on `offset` vs. a page-wide multi-entry walk that never reads
+/// it — see each module's own `handle_request`), but the request shape itself
+/// doesn't need two separate type definitions, just the one field that
+/// genuinely differs.
+///
+/// `offset` (non-`j2wp` only — see `old_impl`'s own module doc for why a
+/// request there means "recompile this exact entry point", not "this page
+/// has new coverage to consider" the way `new_impl`'s page-wide, offset-free
+/// request does): §13.2's coalescing design carries no offset at all under
+/// `j2wp` — the compile thread snapshots the page's whole `requested` bitmap
+/// fresh at dequeue time instead, picking up whatever accumulated by then,
+/// not just whichever offset happened to trigger this send.
+///
+/// # Safety
+/// `page` must outlive the request — pages live for the lifetime of their
+/// owning device (see [`PhysicalCodePage`]'s Send/Sync safety note).
+#[derive(Debug)]
+pub struct CompileRequest {
+    pub page: *mut PhysicalCodePage,
+    #[cfg(not(feature = "j2wp"))]
+    pub offset: u16,
+    /// Live `STATUS_FR` bit at enqueue time, threaded through because the
+    /// compile thread has no `MipsCore` to read it from itself — codegen's
+    /// FPR-access emitters are FR-mode-specific and must match whatever mode
+    /// the executor will actually be in when it calls the compiled function
+    /// (same value `exec_decoded` used to run the interpreter fallback for
+    /// this same arrival). Under `j2wp` this remains per-request, not
+    /// per-entry-point, because a page's FR mode is a region-wide compile-time
+    /// constant already (§4.2.1) — every entry point analyzed from one
+    /// snapshot shares one FR mode.
+    pub compiled_for_fr1: bool,
+}
+
+unsafe impl Send for CompileRequest {}
+
+// ============================================================================
+// Tunables & initial settings — shared by both `old_impl` (non-`j2wp`) and
+// `new_impl` (`j2wp`). Single source of truth: every knob that shapes JIT v2's
+// steady-state memory footprint and flush/queue behavior lives here, once,
+// instead of two copies (one per design) that can silently drift apart. See
+// each constant's doc comment for the reasoning behind its specific value.
+// Constants that differ meaningfully between the two designs (page-pool MRU
+// carryover, force-seal timing, min-calls default) stay local to whichever
+// module actually uses them.
+// ============================================================================
+
+/// Upfront reservation for the shared `Codegen`'s Cranelift `ArenaMemoryProvider`
+/// (`Codegen::new_module`'s own doc comment for why this exists at all). A
+/// `PROT_NONE` virtual-address-space reservation (cheap — nothing is actually
+/// committed/faulted-in until code is written there), not a RAM commitment, so
+/// there's no real memory cost to reserving more than the steady-state working
+/// set needs. Must stay in lockstep with `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`
+/// below.
+pub const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
+
+/// Flush threshold for the shared `Codegen`'s Cranelift arena, in bytes
+/// actually reserved (`Codegen::packing_stats()`'s `reserved` — real
+/// host-page-rounded arena footprint, not a function-count proxy).
+/// `cranelift_jit::Memory` never frees on drop/replace (`Codegen::reset`'s own
+/// doc comment), so nothing else bounds arena growth — a long-enough-running
+/// compile (real IRIX boot, not just PROM) will otherwise exhaust the whole
+/// `ARENA_RESERVE_SIZE` reservation. 16MiB of headroom covers the batch that
+/// happens to be in flight when this trips (a batch isn't finalized/counted
+/// until it flushes, so the real reservation can run slightly ahead of this
+/// threshold between checks) while still flushing well before the arena's own
+/// exhaustion error could ever fire — that error path (`comp::handle_request`'s
+/// exhaustion match arm) stays as a belt-and-suspenders backstop, not the
+/// primary trigger.
+pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = ARENA_RESERVE_SIZE as u64 - 16 * 1024 * 1024;
+
+/// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
+/// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
+/// epoch"); `mega_flush` absorbs it being wrong in either direction. Now that
+/// the whole pool is a single array allocated once at this capacity, a larger
+/// capacity is a real memory cost, not just reserved address space — 4096 is a
+/// deliberately modest working-set size rather than a generous upper bound;
+/// `mega_flush`'s cost of getting this wrong low (a pool-exhaustion flush) is
+/// cheap relative to permanently carrying a much larger array.
+pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
+
+/// Depth of the compile-request SPSC ring (§6.4 "bounded queue; drop on full —
+/// hot pages re-trigger"). A starting guess, doubled from 1024 after a live
+/// `j2 status` reading showed the compile thread genuinely falling behind at
+/// that size (20.9% of dispatches dropped for a full queue, average depth at
+/// dispatch 248.6/1024, out of 1,166,218 total dispatches during one session)
+/// rather than the queue mostly sitting near-empty.
+pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
+
+// ============================================================================
+// End shared tunables
+// ============================================================================
+
 mod old_impl {
     #![cfg(not(feature = "j2wp"))]
     use super::*;
-
-
-// ============================================================================
-// Tunables & initial settings
-//
-// Every knob that shapes JIT v2's steady-state behavior — page geometry,
-// pool/queue capacities, and the thresholds that decide when to flush or
-// force-seal — lives in this block so they can be reviewed and retuned
-// together instead of hunting through the file. See each constant's doc
-// comment for the reasoning behind its specific value.
-// ============================================================================
 
 /// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
 /// used throughout the codebase. Canonical home for this constant; `mem.rs`
@@ -54,50 +146,6 @@ pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
 
 /// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
 pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
-
-/// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
-/// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
-/// epoch"); `mega_flush` absorbs it being wrong in either direction. Now that
-/// the whole pool is a single array allocated once at this capacity (see
-/// `Jitv2::new`'s doc comment — `PhysicalCodePage` is no longer boxed inside,
-/// so a larger capacity is a real memory cost, not just reserved address
-/// space), 4096 is a deliberately modest working-set size rather than a
-/// generous upper bound — `mega_flush`'s cost of getting this wrong low
-/// (a pool-exhaustion flush) is cheap relative to permanently carrying a much
-/// larger array.
-pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
-
-/// Depth of the compile-request SPSC ring (§6.4 "bounded queue; drop on full —
-/// hot pages re-trigger"). A starting guess, like `JITV2_INITIAL_PAGE_CAPACITY`
-/// — doubled from 1024 after a live `j2 status` reading showed the compile
-/// thread genuinely falling behind at that size (20.9% of dispatches
-/// dropped for a full queue, average depth at dispatch 248.6/1024, out of
-/// 1,166,218 total dispatches during one session) rather than the queue
-/// mostly sitting near-empty.
-pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
-
-/// Flush threshold for the shared `Codegen`'s Cranelift arena, in bytes
-/// actually reserved (`Codegen::packing_stats()`'s `reserved` — real
-/// host-page-rounded arena footprint, not the function-count proxy this
-/// constant used before batching landed). `cranelift_jit::Memory` never
-/// frees on drop/replace (`Codegen::reset`'s own doc comment), so nothing
-/// else bounds arena growth — a long-enough-running compile (real IRIX boot,
-/// not just PROM) will otherwise exhaust the whole `Codegen::ARENA_RESERVE_SIZE`
-/// reservation.
-///
-/// Function count stopped being a good proxy for arena growth once
-/// deferred-finalize batching (`j2 batch`) started letting many small
-/// functions pack into a shared host-page segment instead of each getting
-/// its own — the byte size actually reserved is now directly measurable
-/// (`PagedArenaState`), so there's no reason to keep estimating it from a
-/// count. 128MiB leaves comfortable headroom under `Codegen::ARENA_RESERVE_SIZE`
-/// (512MiB) for the batch that happens to be in flight when this trips (a
-/// batch isn't finalized/counted until it flushes, so the real reservation
-/// can run slightly ahead of this threshold between checks) while still
-/// flushing well before the arena's own exhaustion error could ever fire —
-/// that error path (`comp::handle_request`'s exhaustion match arm) stays as
-/// a belt-and-suspenders backstop, not the primary trigger.
-pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -222,7 +270,7 @@ const ENTRY_SCHEDULED: u8 = 1 << 2;
 /// `flags` (ENTRY_VALID/ENTRY_DENYLISTED/ENTRY_SCHEDULED) is colocated here
 /// too, rather than `PhysicalCodePage` holding three separate
 /// `[AtomicU64; BITMAP_WORDS]` bitmaps — the dispatch-hot read
-/// (`is_entry_valid`, checked on every dispatch) used to mean touching a
+/// (`is_runnable`, checked on every dispatch) used to mean touching a
 /// bitmap word in one cache line and then `func`/`gen` in a completely
 /// separate one; a single `flags` byte right next to `func`/`gen` means the
 /// first touch of this entry already pulls the whole thing into L1 together.
@@ -517,32 +565,6 @@ impl JitStats {
     }
 }
 
-/// A compile request pushed from the mips exec thread to the compile thread
-/// over the SPSC fifo (§6.4). Carries the page pointer rather than a snapshotted
-/// generation: the compile thread reads `gen` itself at snapshot time (§6.5 step
-/// 2, `gen_snap = gen`) and re-reads it at publish time — the generation at
-/// queue time is never consulted, only current-at-compile and current-at-publish.
-/// The pointer is mutable because publish (§6.1.3) writes into the page's
-/// `entry_table`/`entry_bits`/`artifact_list`.
-///
-/// # Safety
-/// `page` must outlive the request — pages live for the lifetime of their
-/// owning device (see [`PhysicalCodePage`]'s Send/Sync safety note).
-#[derive(Debug)]
-pub struct CompileRequest {
-    pub page: *mut PhysicalCodePage,
-    pub offset: u16,
-    /// Live `STATUS_FR` bit at enqueue time, threaded through because the
-    /// compile thread has no `MipsCore` to read it from itself — codegen's
-    /// FPR-access emitters are FR-mode-specific and must match whatever mode
-    /// the executor will actually be in when it calls the compiled function
-    /// (same value `exec_decoded` used to run the interpreter fallback for
-    /// this same arrival).
-    pub compiled_for_fr1: bool,
-}
-
-unsafe impl Send for CompileRequest {}
-
 /// Per-physical-page code cache metadata, as tracked by the mips executor
 /// (§2.4). One instance per physical RAM/ROM page that has ever been a JIT
 /// compilation target; the executor holds a pointer to the page it is
@@ -721,7 +743,7 @@ impl PhysicalCodePage {
     /// Whether `entries[offset_word]`'s `ENTRY_VALID` flag is set — i.e. some
     /// compile has published a function here, without regard to whether it's
     /// still fresh against the page's current gen. Callers that need "is this
-    /// dispatchable right now" want [`Self::is_entry_valid`]; this is for the
+    /// dispatchable right now" want [`Self::is_runnable`]; this is for the
     /// dispatch-trigger gate (§6.1.2's `entry_bits[pfn].test(offset)`), which
     /// probes the flag first and only then decides exec-vs-recompile from gen.
     #[inline]
@@ -741,11 +763,11 @@ impl PhysicalCodePage {
     /// of an already-published entry, since the flag's *value* doesn't change
     /// on that path. Callers must not read `func` after this returns `true`
     /// without going through this same `gen` load (i.e. don't cache
-    /// `is_published`'s result and reuse it — always call `is_entry_valid`
+    /// `is_published`'s result and reuse it — always call `is_runnable`
     /// fresh right before trusting `func`), or the ordering guarantee is
     /// lost.
     #[inline]
-    pub fn is_entry_valid(&self, offset_word: usize) -> bool {
+    pub fn is_runnable(&self, offset_word: usize) -> bool {
         self.is_published(offset_word)
             && self.entries[offset_word].gen.load(std::sync::atomic::Ordering::Acquire) == self.current_gen()
     }
@@ -762,7 +784,7 @@ impl PhysicalCodePage {
     /// otherwise (not hot enough yet — stay on the interpreter this time).
     ///
     /// Reuses `entries[offset_word].gen` as the counter storage: that field
-    /// has no meaning before an entry is ever published (`is_entry_valid`
+    /// has no meaning before an entry is ever published (`is_runnable`
     /// only ever reads it after first checking `is_published`, per that
     /// method's own doc comment — a pre-publish `gen` value is simply never
     /// consulted by anything), so borrowing it here for an unrelated purpose
@@ -820,7 +842,7 @@ impl PhysicalCodePage {
     /// `entries[offset_word].func` itself is deliberately left in place
     /// (same "may be stale until slot reuse" contract as `JitEntry::func`'s
     /// own doc comment) — nothing between clearing this flag and the next
-    /// `publish` ever reads `func` without first re-checking `is_entry_valid`.
+    /// `publish` ever reads `func` without first re-checking `is_runnable`.
     #[inline]
     pub fn kill(&self, offset_word: usize) {
         self.entries[offset_word].flags.fetch_and(!ENTRY_VALID, std::sync::atomic::Ordering::Release);
@@ -854,6 +876,47 @@ impl PhysicalCodePage {
         self.entries[offset_word].flags.fetch_and(!ENTRY_SCHEDULED, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Same method as `clear_scheduled` under a name that also exists on
+    /// `j2wp`'s `PhysicalCodePage` (which can't reuse the bare
+    /// `clear_scheduled` name there — it already has a no-arg one with
+    /// different callers) — lets `step_jit`
+    /// (`mips_exec.rs`) call either `PhysicalCodePage` design through one
+    /// shared name.
+    #[inline]
+    pub fn clear_scheduled_offset(&self, offset_word: usize) {
+        self.clear_scheduled(offset_word);
+    }
+
+    /// No-op here — this design has no page-wide `requested` bitmap to mark
+    /// (each offset's own `ENTRY_SCHEDULED`/entry-table slot already IS the
+    /// full record of "this offset is wanted", no separate accumulating bit
+    /// needed). Exists purely so `step_jit` (`mips_exec.rs`)
+    /// can call `page.mark_requested(entry_offset)` unconditionally, the same
+    /// way regardless of which `PhysicalCodePage` design is compiled in — see
+    /// `j2wp`'s real `mark_requested` for why it's NOT a no-op there.
+    #[inline]
+    pub fn mark_requested(&self, _offset_word: usize) {}
+
+    /// No-ops here — this design has no page-level dispatch-side diagnostic
+    /// counters (`j2wp`'s `schedule_attempts`/`sends_attempted`/
+    /// `sends_dropped_queue_full` fields don't exist on this
+    /// `PhysicalCodePage`; the per-offset `ENTRY_SCHEDULED` flag's own
+    /// win/lose outcome is directly visible at the call site instead of
+    /// needing a separate lifetime-total tally). Exist purely so
+    /// `step_jit` (`mips_exec.rs`) can call these
+    /// unconditionally, the same way regardless of which `PhysicalCodePage`
+    /// design is compiled in — see `j2wp`'s real versions for why they're
+    /// NOT no-ops there.
+    #[cfg(feature = "developer")]
+    #[inline]
+    pub fn mark_schedule_attempt(&self) {}
+    #[cfg(feature = "developer")]
+    #[inline]
+    pub fn mark_send_attempted(&self) {}
+    #[cfg(feature = "developer")]
+    #[inline]
+    pub fn mark_send_dropped_queue_full(&self) {}
+
     /// Publish a freshly compiled function at `offset_word` (§6.5 step 4):
     /// write `func` first, then Release-store `gen` — in that order, always.
     /// `gen_snap` is the page generation read *before* the compile started
@@ -864,12 +927,12 @@ impl PhysicalCodePage {
     /// the entry was actually published.
     ///
     /// The `func`-then-`gen` order (and `gen`'s Release/Acquire ordering,
-    /// paired with `is_entry_valid`'s Acquire load) is load-bearing, not
+    /// paired with `is_runnable`'s Acquire load) is load-bearing, not
     /// cosmetic — it's what makes *recompiling* an already-published entry
     /// safe, which `ENTRY_VALID` alone cannot do. §2.5's "no recompile of
     /// existing artifacts" design intent means `handle_request`
     /// (`comp.rs`) never calls this on an entry that's currently
-    /// `is_entry_valid` — but an entry whose gen has drifted stale (page
+    /// `is_runnable` — but an entry whose gen has drifted stale (page
     /// mutated, flag still set) *does* get recompiled in place. On that path,
     /// `ENTRY_VALID`'s Release/Acquire pairing provides no fresh
     /// synchronization at all: the flag doesn't change value (it was already
@@ -877,7 +940,7 @@ impl PhysicalCodePage {
     /// cached observation from the *original* publish, with no
     /// happens-before relationship to this recompile's writes whatsoever.
     /// Without `gen` itself carrying the ordering, a dispatcher could
-    /// observe the *new* `gen` (matching `current_gen()`, so `is_entry_valid`
+    /// observe the *new* `gen` (matching `current_gen()`, so `is_runnable`
     /// reports true) paired with the *old* `func` pointer — silently calling
     /// a compiled function for a page state it was never actually compiled
     /// against. Making `gen` the synchronization point (write `func` before
@@ -1003,7 +1066,7 @@ pub struct Jitv2 {
     /// raced against and landing back in a slot that's since been reclaimed
     /// for a different physical page is still a real hazard (unchanged from
     /// before — `worker_loop`'s `drain_pending` and the various
-    /// gen-mismatch/`is_entry_valid` checks are what actually guard against
+    /// gen-mismatch/`is_runnable` checks are what actually guard against
     /// stale content, not pointer validity) — array-lifetime stability alone
     /// doesn't imply content freshness.
     pages: Box<[PhysicalCodePage]>,
@@ -1732,7 +1795,7 @@ impl CompileQueue {
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
         let state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
         let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
-            crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE, state.clone(),
+            ARENA_RESERVE_SIZE, state.clone(),
         ).expect("CompileQueue::start: failed to reserve a fresh jitv2 arena");
         self.start_inner(bus, stats, shared, state);
     }
@@ -2084,7 +2147,7 @@ impl CompileQueue {
                 // value), from the same arena published below.
                 let fresh_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
                 let fresh_arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
-                    crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE, fresh_state.clone(),
+                    ARENA_RESERVE_SIZE, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
                 {
@@ -2494,7 +2557,7 @@ mod tests {
     fn entry_starts_unpublished_and_undenylisted() {
         let counter = AtomicU64::new(0);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-        assert!(!page.is_entry_valid(4));
+        assert!(!page.is_runnable(4));
         assert!(!page.is_denylisted(4));
         assert!(page.entries[4].func.is_null());
     }
@@ -2550,16 +2613,16 @@ mod tests {
 
         // gen matches but bit not set: still invalid.
         page.entries[offset].gen.store(5, Ordering::Relaxed);
-        assert!(!page.is_entry_valid(offset));
+        assert!(!page.is_runnable(offset));
 
         // Publish: set the bit -> now valid.
         page.entries[offset].flags.fetch_or(ENTRY_VALID, Ordering::Release);
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
 
         // Page mutates (gen bumps past what the entry was compiled against):
         // bit is still set, but the entry must read as stale.
         counter.store(6, Ordering::Relaxed);
-        assert!(!page.is_entry_valid(offset), "stale entry (gen mismatch) must not be reported valid");
+        assert!(!page.is_runnable(offset), "stale entry (gen mismatch) must not be reported valid");
     }
 
     #[test]
@@ -2574,19 +2637,19 @@ mod tests {
         let offset = 4usize;
         page.entries[offset].gen.store(0, Ordering::Relaxed);
         page.entries[offset].flags.fetch_or(ENTRY_VALID, Ordering::Release);
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
 
         page.kill(offset);
 
         assert!(!page.is_published(offset), "kill must clear the valid bit");
-        assert!(!page.is_entry_valid(offset));
+        assert!(!page.is_runnable(offset));
         assert!(!page.is_denylisted(offset), "kill must not sticky-reject the offset — a fresh compile is expected to follow");
 
         // A later re-publish (simulating the next visit's fresh compile)
         // must work normally — kill leaves the offset fully recompilable.
         page.entries[offset].gen.store(0, Ordering::Relaxed);
         page.entries[offset].flags.fetch_or(ENTRY_VALID, Ordering::Release);
-        assert!(page.is_entry_valid(offset), "offset must be re-publishable after kill");
+        assert!(page.is_runnable(offset), "offset must be re-publishable after kill");
     }
 
     #[test]
@@ -2601,7 +2664,7 @@ mod tests {
         // reads as matching current_gen(). This test can't force a true
         // concurrent interleaving, but it does verify the sequential
         // contract publish() must uphold for that ordering argument to hold
-        // at all: func actually gets updated, and is_entry_valid only
+        // at all: func actually gets updated, and is_runnable only
         // reports true once gen matches (i.e. after publish() completes).
         let counter = AtomicU64::new(5);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -2609,19 +2672,19 @@ mod tests {
 
         let old_fn = 0x1000usize as *const ();
         assert!(page.publish(offset, old_fn, 5, 1, 0));
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
         assert_eq!(page.entries[offset].func, old_fn);
 
         // Page mutates: entry goes stale (bit stays 1, gen no longer matches).
         counter.store(6, Ordering::Relaxed);
-        assert!(!page.is_entry_valid(offset), "must read stale immediately after the page mutates");
+        assert!(!page.is_runnable(offset), "must read stale immediately after the page mutates");
 
         // Recompile in place (comp.rs's handle_request path for a
         // stale-but-still-published entry) — gen_snap=6 was captured before
         // this second compile started, matching the page's now-current gen.
         let new_fn = 0x2000usize as *const ();
         assert!(page.publish(offset, new_fn, 6, 1, 0));
-        assert!(page.is_entry_valid(offset), "recompiled entry must read valid once publish completes");
+        assert!(page.is_runnable(offset), "recompiled entry must read valid once publish completes");
         assert_eq!(page.entries[offset].func, new_fn, "func must be the NEW function, not the stale one, once gen reads as current");
     }
 
@@ -2632,7 +2695,7 @@ mod tests {
         let offset = 7usize;
         page.entries[offset].flags.fetch_or(ENTRY_DENYLISTED, Ordering::Relaxed);
         assert!(page.is_denylisted(offset));
-        assert!(!page.is_entry_valid(offset), "denylisting must not itself mark an entry valid");
+        assert!(!page.is_runnable(offset), "denylisting must not itself mark an entry valid");
     }
 
     /// Minimal BusDevice whose gen_ptr always returns the same fixed counter,
@@ -2876,7 +2939,7 @@ mod tests {
         // other test's threads competing for the same cores).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while !page.is_entry_valid(0) {
+            while !page.is_runnable(0) {
                 assert!(std::time::Instant::now() < deadline, "entry never published — queue-drain fallback did not fire");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -2942,7 +3005,7 @@ mod tests {
         // full-workspace parallel load.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while !pages[0].is_entry_valid(0) {
+            while !pages[0].is_runnable(0) {
                 assert!(std::time::Instant::now() < deadline, "entry never published within the timeout");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -3001,7 +3064,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let published = pages.iter().filter(|p| p.is_entry_valid(0)).count();
+                let published = pages.iter().filter(|p| p.is_runnable(0)).count();
                 if published == N {
                     break;
                 }
@@ -3065,14 +3128,14 @@ mod new_impl {
 
 
 // ---------------------------------------------------------------------------
-// Tunables — every jitv2 constant meant to be reasoned about/adjusted as a
-// knob, gathered here rather than scattered next to whichever piece of logic
-// first needed it. Sentinels, ABI/layout constants tightly coupled to a
-// specific type (`PAGE_SIZE`/`ENTRIES_PER_PAGE`/`BITMAP_WORDS`,
-// `REJECT_REASON_COUNT`) and disabled/dead-weight settings
-// (`MIN_CALLS_BEFORE_COMPILE`) stay local to their own context instead —
-// moving those here would separate them from the thing they'd go stale
-// against.
+// Tunables local to this design only. The cross-design knobs (arena size,
+// flush threshold, page-pool/queue capacity) live once, shared with
+// `old_impl`, in the top-of-file block above `mod old_impl`. Sentinels,
+// ABI/layout constants tightly coupled to a specific type
+// (`PAGE_SIZE`/`ENTRIES_PER_PAGE`/`BITMAP_WORDS`, `REJECT_REASON_COUNT`) and
+// disabled/dead-weight settings (`MIN_CALLS_BEFORE_COMPILE`) stay local to
+// their own context instead — moving those up would separate them from the
+// thing they'd go stale against.
 // ---------------------------------------------------------------------------
 
 /// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
@@ -3088,69 +3151,11 @@ pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
 /// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
 pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
 
-/// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
-/// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
-/// epoch"); `mega_flush` absorbs it being wrong in either direction. Now that
-/// the whole pool is a single array allocated once at this capacity (see
-/// `Jitv2::new`'s doc comment — `PhysicalCodePage` is no longer boxed inside,
-/// so a larger capacity is a real memory cost, not just reserved address
-/// space), 4096 is a deliberately modest working-set size rather than a
-/// generous upper bound — `mega_flush`'s cost of getting this wrong low
-/// (a pool-exhaustion flush) is cheap relative to permanently carrying a much
-/// larger array.
-pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 8192;
-
 /// How many of the most-recently-used pages survive a flush with their
 /// `requested`/`denied` bitmaps (and pfn/gen/hash entry) intact, to be
 /// recompiled immediately rather than relearned from scratch — see
 /// `Jitv2::mega_flush`'s doc comment for the full churn-reduction rationale.
 const JITV2_FLUSH_PRESERVED: usize = 1024;
-
-/// Upfront reservation for the shared `Codegen`'s Cranelift `ArenaMemoryProvider`
-/// (`Codegen::new_module`'s own doc comment for why this exists at all).
-/// Sized generously: this is a `PROT_NONE` virtual-address-space reservation
-/// (cheap — nothing is actually committed/faulted-in until code is written
-/// there), not a RAM commitment, and 64-bit address space is abundant, so
-/// there's no real cost to reserving far more than we expect to use. Raised
-/// from the original 512MiB to 2GiB (4x) to cut real-flush frequency during a
-/// long boot — churn reduction complementary to, not a substitute for,
-/// `JITV2_FLUSH_PRESERVED`'s MRU-page carryover (`Jitv2::mega_flush`): a
-/// bigger arena means fewer flushes happen at all, while flush-preserve makes
-/// each one that does happen cheaper to recover from. Must stay in lockstep
-/// with `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES` below.
-pub const ARENA_RESERVE_SIZE: usize = 2 * 1024 * 1024 * 1024;
-
-/// Flush threshold for the shared `Codegen`'s Cranelift arena, in bytes
-/// actually reserved (`Codegen::packing_stats()`'s `reserved` — real
-/// host-page-rounded arena footprint, not the function-count proxy this
-/// constant used before batching landed). `cranelift_jit::Memory` never
-/// frees on drop/replace (`Codegen::reset`'s own doc comment), so nothing
-/// else bounds arena growth — a long-enough-running compile (real IRIX boot,
-/// not just PROM) will otherwise exhaust the whole `ARENA_RESERVE_SIZE`
-/// reservation.
-///
-/// Function count stopped being a good proxy for arena growth once
-/// deferred-finalize batching (`j2 batch`) started letting many small
-/// functions pack into a shared host-page segment instead of each getting
-/// its own — the byte size actually reserved is now directly measurable
-/// (`PagedArenaState`), so there's no reason to keep estimating it from a
-/// count. 128MiB of headroom under `ARENA_RESERVE_SIZE` covers the batch that
-/// happens to be in flight when this trips (a batch isn't finalized/counted
-/// until it flushes, so the real reservation can run slightly ahead of this
-/// threshold between checks) while still flushing well before the arena's
-/// own exhaustion error could ever fire — that error path
-/// (`comp::handle_request`'s exhaustion match arm) stays as a
-/// belt-and-suspenders backstop, not the primary trigger.
-pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = ARENA_RESERVE_SIZE as u64 - 128 * 1024 * 1024;
-
-/// Depth of the compile-request SPSC ring (§6.4 "bounded queue; drop on full —
-/// hot pages re-trigger"). A starting guess, like `JITV2_INITIAL_PAGE_CAPACITY`
-/// — doubled from 1024 after a live `j2 status` reading showed the compile
-/// thread genuinely falling behind at that size (20.9% of dispatches
-/// dropped for a full queue, average depth at dispatch 248.6/1024, out of
-/// 1,166,218 total dispatches during one session) rather than the queue
-/// mostly sitting near-empty.
-pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -3500,45 +3505,6 @@ impl JitStats {
     }
 }
 
-/// A compile request pushed from the mips exec thread to the compile thread
-/// over the SPSC fifo (§6.4). Carries the page pointer rather than a snapshotted
-/// generation: the compile thread reads `gen` itself at snapshot time (§13.3
-/// step 2, seqlock) and re-reads it at publish time — the generation at
-/// queue time is never consulted, only current-at-compile and current-at-publish.
-/// The pointer is mutable because publish (§13.3) writes into the page's
-/// bitmaps/`func`/`entry_gen`.
-///
-/// **§13.2: carries no offset.** A request just says "this page has new
-/// coverage to consider" — the compile thread snapshots the page's whole
-/// `requested` bitmap fresh at dequeue time (`PhysicalCodePage::snapshot_requested`)
-/// and analyzes every set bit as an entry point in one pass, picking up
-/// whatever accumulated by the time this request is actually handled, not
-/// just whichever offset happened to trigger the send. This is the
-/// coalescing the design calls for: many distinct new-entry-point
-/// discoveries on a hot page each just set their own `requested` bit and (at
-/// most) send one page-level request.
-///
-/// # Safety
-/// `page` must outlive the request — pages live for the lifetime of their
-/// owning device (see [`PhysicalCodePage`]'s Send/Sync safety note).
-#[derive(Debug)]
-pub struct CompileRequest {
-    pub page: *mut PhysicalCodePage,
-    /// Live `STATUS_FR` bit at enqueue time, threaded through because the
-    /// compile thread has no `MipsCore` to read it from itself — codegen's
-    /// FPR-access emitters are FR-mode-specific and must match whatever mode
-    /// the executor will actually be in when it calls the compiled function
-    /// (same value `exec_decoded` used to run the interpreter fallback for
-    /// this same arrival).
-    ///
-    /// §13.2 note: this remains per-request, not per-entry-point, because a
-    /// page's FR mode is a region-wide compile-time constant already (§4.2.1)
-    /// — every entry point analyzed from one snapshot shares one FR mode.
-    pub compiled_for_fr1: bool,
-}
-
-unsafe impl Send for CompileRequest {}
-
 /// Per-physical-page code cache metadata, as tracked by the mips executor
 /// (§2.4). One instance per physical RAM/ROM page that has ever been a JIT
 /// compilation target; the executor holds a pointer to the page it is
@@ -3613,11 +3579,11 @@ pub struct PhysicalCodePage {
     denied: EntryBitmap,
     /// Offsets that are live entry points into `func` right now (§13.2).
     /// Authoritative for dispatch together with `entry_gen` — see
-    /// `is_entry_valid`.
+    /// `is_runnable`.
     compiled: EntryBitmap,
     /// The page's one compiled function, or null if nothing has published
     /// yet. Validity is owned by `compiled`'s bits together with `entry_gen`
-    /// matching `current_gen()` — see `is_entry_valid`.
+    /// matching `current_gen()` — see `is_runnable`.
     func: std::sync::atomic::AtomicPtr<()>,
     /// Generation this `func`/`compiled` pair was last published against
     /// (§13.3 step 6). Only ever written to a value `>=` its current value;
@@ -4018,7 +3984,7 @@ impl PhysicalCodePage {
     /// `handle_request`'s success path (`comp.rs`) clears an offset's
     /// `requested` bit the moment it gets covered (`clear_requested_bits`),
     /// so a page that had already compiled cleanly and was just sitting in
-    /// its fast `is_entry_valid` dispatch path (no fresh `mark_requested`
+    /// its fast `is_runnable` dispatch path (no fresh `mark_requested`
     /// calls since) reaches a flush with `requested` already empty. Without
     /// this fold, `mega_flush`'s own auto-requeued `CompileRequest` for this
     /// page (pushed right after this call, see its call site) finds zero
@@ -4074,7 +4040,7 @@ impl PhysicalCodePage {
     /// against this is what makes that check gate on "compiled for THIS
     /// generation" rather than blindly re-reading `compiled`'s bits, which
     /// can hold stale-generation leftovers, see `publish`'s own doc
-    /// comment). Not part of the dispatch-hot path — `is_entry_valid` does
+    /// comment). Not part of the dispatch-hot path — `is_runnable` does
     /// its own Acquire load inline rather than calling this.
     #[inline]
     pub fn entry_gen(&self) -> u64 {
@@ -4229,7 +4195,7 @@ impl PhysicalCodePage {
     /// Whether `offset_word` is a live entry point into `func` right now,
     /// without regard to whether `func` is still fresh against the page's
     /// current gen. Callers that need "is this dispatchable right now" want
-    /// [`Self::is_entry_valid`]; this is for the dispatch-trigger gate
+    /// [`Self::is_runnable`]; this is for the dispatch-trigger gate
     /// (§13.2), which probes coverage first and only then decides
     /// exec-vs-recompile from gen.
     #[inline]
@@ -4250,16 +4216,16 @@ impl PhysicalCodePage {
     /// set, doesn't change value on that path either. Callers must not read
     /// `func` after this returns `true` without going through this same
     /// `entry_gen` load (i.e. don't cache `is_published`'s result and reuse
-    /// it — always call `is_entry_valid` fresh right before trusting `func`),
+    /// it — always call `is_runnable` fresh right before trusting `func`),
     /// or the ordering guarantee is lost.
     #[inline]
-    pub fn is_entry_valid(&self, offset_word: usize) -> bool {
+    pub fn is_runnable(&self, offset_word: usize) -> bool {
         self.is_published(offset_word)
             && self.entry_gen.load(Ordering::Acquire) == self.current_gen()
     }
 
     /// The page's compiled function, or null if unpublished. Callers must
-    /// check [`Self::is_entry_valid`] first (in that order — see its doc
+    /// check [`Self::is_runnable`] first (in that order — see its doc
     /// comment on why the `entry_gen` Acquire load must happen-before this
     /// read) before trusting the returned pointer.
     #[inline]
@@ -4306,7 +4272,7 @@ impl PhysicalCodePage {
     ///   one-function-per-page model folds prior coverage into every
     ///   compile's candidates) leaves that offset with no case in the fresh
     ///   `func`'s dispatch switch at all — `compiled`'s bit must not survive
-    ///   or `is_entry_valid` keeps reporting it dispatchable into a function
+    ///   or `is_runnable` keeps reporting it dispatchable into a function
     ///   that doesn't recognize it, turning every future hit into a silent
     ///   JIT-entry-then-EXEC_FALLBACK round trip forever. Here `denied` is
     ///   *not* left alone (the paired `denylist` call sticky-rejects it, on
@@ -4315,7 +4281,7 @@ impl PhysicalCodePage {
     ///
     /// `func` itself is deliberately left in place either way; nothing
     /// between clearing this bit and the next `publish` ever reads `func`
-    /// without first re-checking `is_entry_valid`.
+    /// without first re-checking `is_runnable`.
     #[inline]
     pub fn kill(&self, offset_word: usize) {
         self.compiled[offset_word >> 6].fetch_and(!(1u64 << (offset_word & 63)), Ordering::Release);
@@ -4378,6 +4344,40 @@ impl PhysicalCodePage {
         self.page_scheduled.store(false, Ordering::Relaxed);
     }
 
+    /// Same call shape as non-`j2wp`'s per-offset `try_schedule`
+    /// (`mips_exec.rs`'s `step_jit` calls either
+    /// `PhysicalCodePage` design through this one name for the "is THIS
+    /// dispatch the one that actually builds and sends a `CompileRequest`"
+    /// test-and-set) — backed by the page-level flag here, since only one
+    /// function/compile exists per page in this design. Does NOT also call
+    /// `mark_requested`: that's a separate, unconditional prerequisite every
+    /// `handle_request` call depends on (inline or threaded —
+    /// `snapshot_compile_candidates` reads the `requested` bitmap and bounces
+    /// immediately if empty), not scoped to only the threaded path the way
+    /// this test-and-set is — `step_jit` calls
+    /// `mark_requested` itself, unconditionally, before branching on
+    /// `inline_compile`. Distinct name from `try_schedule_page` (can't
+    /// overload by arity in Rust) — that one's existing callers (`comp.rs`,
+    /// tests) are untouched.
+    #[inline]
+    pub fn try_schedule(&self, _entry_offset: usize) -> bool {
+        self.try_schedule_page()
+    }
+
+    /// Same call shape as non-`j2wp`'s per-offset `clear_scheduled`, backed
+    /// by this design's page-level flag — `entry_offset` genuinely doesn't
+    /// matter to the underlying `clear_scheduled()` call (there's only one
+    /// in-flight flag per page, not one per offset), but the parameter stays
+    /// so `step_jit` can call `page.clear_scheduled(entry_offset)`
+    /// uniformly regardless of which `PhysicalCodePage` design is compiled
+    /// in. Distinct name would collide with the existing no-arg
+    /// `clear_scheduled()` (`comp.rs`, tests) — kept as a separate method
+    /// instead of renaming those call sites.
+    #[inline]
+    pub fn clear_scheduled_offset(&self, _entry_offset: usize) {
+        self.clear_scheduled();
+    }
+
     /// Clear every `requested` bit this compile's snapshot covered, after a
     /// successful publish — so a later re-request for the same offset (e.g.
     /// after a future gen bump) isn't shadowed by a stale bit this compile
@@ -4401,7 +4401,7 @@ impl PhysicalCodePage {
 
     /// Snapshot the `compiled` bitmap — every offset that's a live entry
     /// point into `func` right now (before any `entry_gen` staleness check;
-    /// see `is_entry_valid`). Diagnostic use only (`j2 dump-pcp`) — the hot
+    /// see `is_runnable`). Diagnostic use only (`j2 dump-pcp`) — the hot
     /// dispatch path never needs the whole bitmap at once, only
     /// `is_published`'s single-bit test, and `comp.rs`'s own use of
     /// `compiled` alongside `requested` goes through
@@ -4479,14 +4479,14 @@ impl PhysicalCodePage {
     ///
     /// `func`-then-`compiled`-then-`entry_gen` write order (all Release) means
     /// a reader that observes a `compiled` bit set (Acquire-paired via
-    /// `is_entry_valid`'s `entry_gen` load) never observes a stale/null
+    /// `is_runnable`'s `entry_gen` load) never observes a stale/null
     /// `func` for it. `entry_gen` is written unconditionally on every actual
     /// publish, but only **numerically advances** when `snap_gen >
     /// entry_gen` (a real page-bump-triggered recompile, §13.6/§13.3's
     /// discussion) — a pure entry-coverage publish against unchanged bytes
     /// (`snap_gen == entry_gen` already) rewrites the same value. Readers
     /// never need to distinguish the two: `entry_gen == current_gen()` is
-    /// the only fact `is_entry_valid` needs.
+    /// the only fact `is_runnable` needs.
     ///
     /// When `snap_gen` genuinely advances `entry_gen`, `denied` resets to
     /// all-allowed (§13.6): a page-gen bump means the bytes are provably
@@ -4520,7 +4520,7 @@ impl PhysicalCodePage {
 
         // Safety: `func` is a raw pointer write behind `&self` — sound
         // because no concurrent reader trusts it without first Acquire-
-        // loading `entry_gen` (via `is_entry_valid`) and observing it equal
+        // loading `entry_gen` (via `is_runnable`) and observing it equal
         // to current_gen(); `publish_lock` excludes any concurrent writer of
         // these same three fields.
         self.func.store(func as *mut (), Ordering::Release);
@@ -4622,7 +4622,7 @@ pub struct Jitv2 {
     /// raced against and landing back in a slot that's since been reclaimed
     /// for a different physical page is still a real hazard (unchanged from
     /// before — `worker_loop`'s `drain_pending` and the various
-    /// gen-mismatch/`is_entry_valid` checks are what actually guard against
+    /// gen-mismatch/`is_runnable` checks are what actually guard against
     /// stale content, not pointer validity) — array-lifetime stability alone
     /// doesn't imply content freshness. Every request still in flight at
     /// flush time is drained before any slot is reclaimed (`mega_flush`'s own
@@ -5100,7 +5100,7 @@ impl Jitv2 {
             // compiles are triggered synchronously by dispatch, not this
             // queue, and every preserved page's `requested` bits survived
             // the flush, so the very next dispatch that lands on one
-            // (`is_entry_valid` now false — `func` was just cleared) falls
+            // (`is_runnable` now false — `func` was just cleared) falls
             // straight into the existing "nothing valid, compile now" path
             // on its own.
             for req in requests {
@@ -6317,7 +6317,7 @@ mod tests {
     fn entry_starts_unpublished_and_undenylisted() {
         let counter = AtomicU64::new(0);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-        assert!(!page.is_entry_valid(4));
+        assert!(!page.is_runnable(4));
         assert!(!page.is_denylisted(4));
         assert!(page.func().is_null());
     }
@@ -6450,18 +6450,18 @@ mod tests {
         let offset = 100usize;
 
         // Bit not set at all: invalid regardless of gen.
-        assert!(!page.is_entry_valid(offset));
+        assert!(!page.is_runnable(offset));
 
         // Publish: set the bit -> now valid.
         let mut bits = [0u64; BITMAP_WORDS];
         bits[offset >> 6] |= 1u64 << (offset & 63);
         assert!(page.publish(&bits, 0x1000 as *const (), 5, 1, 0));
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
 
         // Page mutates (gen bumps past what the entry was compiled against):
         // bit is still set, but the entry must read as stale.
         counter.store(6, Ordering::Relaxed);
-        assert!(!page.is_entry_valid(offset), "stale entry (gen mismatch) must not be reported valid");
+        assert!(!page.is_runnable(offset), "stale entry (gen mismatch) must not be reported valid");
     }
 
     #[test]
@@ -6477,12 +6477,12 @@ mod tests {
         let mut bits = [0u64; BITMAP_WORDS];
         bits[offset >> 6] |= 1u64 << (offset & 63);
         assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
 
         page.kill(offset);
 
         assert!(!page.is_published(offset), "kill must clear the valid bit");
-        assert!(!page.is_entry_valid(offset));
+        assert!(!page.is_runnable(offset));
         assert!(!page.is_denylisted(offset), "kill must not sticky-reject the offset — a fresh compile is expected to follow");
 
         // A later re-publish (simulating the next visit's fresh compile)
@@ -6491,7 +6491,7 @@ mod tests {
         // invalidation — publish() still succeeds because `kill` cleared the
         // `compiled` bit, so the previous "subsumed" check no longer blocks it.
         assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
-        assert!(page.is_entry_valid(offset), "offset must be re-publishable after kill");
+        assert!(page.is_runnable(offset), "offset must be re-publishable after kill");
     }
 
     #[test]
@@ -6506,7 +6506,7 @@ mod tests {
         // reads as matching current_gen(). This test can't force a true
         // concurrent interleaving, but it does verify the sequential
         // contract publish() must uphold for that ordering argument to hold
-        // at all: func actually gets updated, and is_entry_valid only
+        // at all: func actually gets updated, and is_runnable only
         // reports true once gen matches (i.e. after publish() completes).
         let counter = AtomicU64::new(5);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -6516,19 +6516,19 @@ mod tests {
 
         let old_fn = 0x1000usize as *const ();
         assert!(page.publish(&bits, old_fn, 5, 1, 0));
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
         assert_eq!(page.func(), old_fn);
 
         // Page mutates: entry goes stale (bit stays 1, gen no longer matches).
         counter.store(6, Ordering::Relaxed);
-        assert!(!page.is_entry_valid(offset), "must read stale immediately after the page mutates");
+        assert!(!page.is_runnable(offset), "must read stale immediately after the page mutates");
 
         // Recompile in place (comp.rs's handle_request path for a
         // stale-but-still-published entry) — gen_snap=6 was captured before
         // this second compile started, matching the page's now-current gen.
         let new_fn = 0x2000usize as *const ();
         assert!(page.publish(&bits, new_fn, 6, 1, 0));
-        assert!(page.is_entry_valid(offset), "recompiled entry must read valid once publish completes");
+        assert!(page.is_runnable(offset), "recompiled entry must read valid once publish completes");
         assert_eq!(page.func(), new_fn, "func must be the NEW function, not the stale one, once gen reads as current");
     }
 
@@ -6539,7 +6539,7 @@ mod tests {
         let offset = 7usize;
         page.denylist(offset);
         assert!(page.is_denylisted(offset));
-        assert!(!page.is_entry_valid(offset), "denylisting must not itself mark an entry valid");
+        assert!(!page.is_runnable(offset), "denylisting must not itself mark an entry valid");
     }
 
     #[test]
@@ -6547,13 +6547,13 @@ mod tests {
         // The real reason `prepare_multi_entry_compile` (comp.rs) must pair
         // every `denylist` call on a previously-`compiled` offset with an
         // explicit `kill()`: dispatch (`exec_decoded`'s gate, mips_exec.rs)
-        // only ever consults `is_published`/`is_entry_valid`, never
+        // only ever consults `is_published`/`is_runnable`, never
         // `is_denylisted` — denylisting purely gates whether a FUTURE
         // compile is offered this offset as a candidate again, it does
         // nothing to stop dispatch from jumping into whatever `func`
         // currently claims to cover it. An offset that was published, then
         // denylisted without also being killed, would still read
-        // `is_entry_valid() == true` forever, dispatchable into a `func`
+        // `is_runnable() == true` forever, dispatchable into a `func`
         // that may no longer actually have a case for it.
         let counter = AtomicU64::new(0);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -6561,16 +6561,16 @@ mod tests {
         let mut bits = [0u64; BITMAP_WORDS];
         bits[offset / 64] |= 1u64 << (offset % 64);
         assert!(page.publish(&bits, 0x1000 as *const (), 0, 1, 0));
-        assert!(page.is_entry_valid(offset));
+        assert!(page.is_runnable(offset));
 
         page.denylist(offset);
         assert!(page.is_denylisted(offset));
-        assert!(page.is_entry_valid(offset),
+        assert!(page.is_runnable(offset),
             "denylist alone must not clear a previously-published entry's valid bit — \
              proving kill() is the mechanism that actually has to do that");
 
         page.kill(offset);
-        assert!(!page.is_entry_valid(offset), "kill() is what actually un-publishes the entry");
+        assert!(!page.is_runnable(offset), "kill() is what actually un-publishes the entry");
     }
 
     #[test]
@@ -6781,7 +6781,7 @@ mod tests {
         let mut bits = [0u64; BITMAP_WORDS];
         bits[0] |= 1u64 << 4;
         assert!(jit.pages[slot].publish(&bits, 0x1000 as *const (), 0, 1, 0));
-        assert!(jit.pages[slot].is_entry_valid(4));
+        assert!(jit.pages[slot].is_runnable(4));
         jit.pages[slot].mark_requested(9);
         jit.pages[slot].denylist(2);
 
@@ -6790,7 +6790,7 @@ mod tests {
         assert_eq!(slot, new_slot, "a preserved single-capacity pool keeps the same slot");
         assert!(jit.pages[new_slot].func().is_null(),
             "a preserved slot's compiled func must not survive a flush");
-        assert!(!jit.pages[new_slot].is_entry_valid(4),
+        assert!(!jit.pages[new_slot].is_runnable(4),
             "a preserved slot's compiled bitmap must not survive a flush");
         assert_eq!(jit.pages[new_slot].entry_gen(), 0,
             "a preserved slot's entry_gen must start fresh, not inherit the previous occupant's value");
@@ -6809,7 +6809,7 @@ mod tests {
         // by the time a later, unrelated flush preserves this page, its
         // `requested` bitmap no longer mentions that offset at all, even
         // though the offset is still live and dispatched purely through the
-        // fast is_entry_valid path (no fresh mark_requested calls). Without
+        // fast is_runnable path (no fresh mark_requested calls). Without
         // folding `compiled` into `requested` before wiping `compiled`,
         // mega_flush's own auto-requeued CompileRequest for this page finds
         // zero candidates and silently no-ops, leaving the page stuck with
@@ -7013,7 +7013,7 @@ mod tests {
         // other test's threads competing for the same cores).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while !page.is_entry_valid(0) {
+            while !page.is_runnable(0) {
                 assert!(std::time::Instant::now() < deadline, "entry never published — queue-drain fallback did not fire");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -7081,7 +7081,7 @@ mod tests {
         // full-workspace parallel load.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            while !pages[0].is_entry_valid(0) {
+            while !pages[0].is_runnable(0) {
                 assert!(std::time::Instant::now() < deadline, "entry never published within the timeout");
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -7145,7 +7145,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let published = pages.iter().filter(|p| p.is_entry_valid(0)).count();
+                let published = pages.iter().filter(|p| p.is_runnable(0)).count();
                 if published == N {
                     break;
                 }

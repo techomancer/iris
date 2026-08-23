@@ -590,6 +590,44 @@ Decomposition of the measured 136 B/instr: hot ≈ 75–95 (two preambles 55–7
 
 ---
 
+## 13. The real dispatch gate (as-built, supersedes §6.1.2's sketch and its "as-built" note)
+
+`bag_of_snakes_to_refactor` (`mips_exec.rs`) is the actual gate — §6.1.2's per-page gateway pointer was never built; there is no `entry_table`/gateway indirection, just `PhysicalCodePage::is_published`/`is_runnable` checked directly against `self.pcp`. Two designs share this one gate behind `#[cfg(feature = "j2wp")]`: **entry-table** (one compiled function per offset, `page.entries[offset]`) and **j2wp/whole-page** (Appendix A's fallback, as-built: one compiled function per page, a Cranelift `Switch` dispatch head over every published entry word, `dispatch_miss_block` as the "otherwise" default).
+
+### 13.1 The probe condition
+
+`trigger || page.is_published(entry_offset)`. `trigger` is `core.jit_trigger`, latched **after** `fetch_instr` (which runs `jitv2_track_pcp` — the only setter for a fresh page's first arrival) — reading/clearing it before `fetch_instr` loses that exact signal (found live: a from-scratch executor's first `step_jit()` never triggered a compile at all). Set by: the interpreter's `handle_exec_complete` on a taken branch/jump, JIT-compiled exit stubs on the same, and `jitv2_track_pcp` when a page crossing lands exactly on word 0 of a new page (deliberately narrower than "any crossing" — see the field's own doc comment for the redundant-recompile failure mode that discipline avoids). One known gap: `deliver_exception` writes `core.pc` straight to the vector (word 0x60 within its page, not 0) with no trigger — the general-exception vector isn't force-probed on first delivery, only once `is_published` catches up some other way.
+
+### 13.2 Entry acceptance: no static predicate, a runtime check instead
+
+§6.1.4's total-entry predicate (offset 0 never an entry, N≥4 requires a non-branch predecessor) was dropped entirely, not just for offset 0. Every compiled entry word carries `core.in_delay_slot`/`delay_slot_target` as a runtime check (codegen.rs, entry block only) — page-agnostic, since `branch_delay` sets the same `MipsCore` fields regardless of which page the branch was on, so it closes the cross-page 0xFFC-inheritance case the same way the static predicate closed the same-page one. Consequence: word 0 is a legal, directly-dispatchable entry.
+
+### 13.3 Miss handling: min-calls threshold, then inline-compile vs async queue
+
+Below `crate::jitv2::min_calls_before_compile()` dispatches (entry-table design only — counted per-offset via `page.count_dispatch_and_check_threshold`; j2wp has no per-offset counter storage, so it's always past-threshold there), the gate does nothing but fall to `step_int()`. Past threshold, `self.jitv2_inline_compile` (a runtime bool, not a Cargo feature) picks one of two ways to get a fresh artifact:
+- **`false` (default)**: mark the offset `requested` (must happen *before* building `CompileRequest` — j2wp's request carries no offset of its own, so whichever side compiles reads `requested` fresh; skipping this starves the page of compiles entirely, confirmed live), test-and-set `try_schedule` to dedupe concurrent requests for the same offset/page, push onto the async compile queue. A dropped push (queue full) must clear the in-flight flag itself — `handle_request`/`handle_request_deferred` are the only other place that clears it, and neither runs for a request that never reached the queue (confirmed live: a j2wp page stuck at 43 requested/0 compiled/0 denylisted, `compiles_since_flush=0`, forever).
+- **`true`**: `jitv2_compile_inline` compiles synchronously on this thread and runs the result immediately instead of waiting for the next dispatch to pick it up via `is_runnable`. Used by tests wanting determinism (no async-thread race) and forced unconditionally under `jitv2_lockstep` (every region must compile+run synchronously so its per-instruction lockstep_step/compare callbacks fire in-region).
+
+`compiled_for_fr1` (whether this compile assumes `STATUS_FR` set) comes from the page's own pinned `is_fr1()` under j2wp (one compiled function per page, one FR mode for all its entries — a mismatch kills the triggering entry and self-heals, §4.2.1) and from live `cp0_status` otherwise.
+
+### 13.4 `jitv2_compile_inline`: synchronous compile-and-run
+
+The `jitv2_inline_compile = true` path (§13.3). Checks the shared `Codegen`'s arena growth **before** compiling (not after): nothing else polls this on the inline path the way the async worker_loop does, and `flush_from_cpu_thread` clears the whole page pool including `self.pcp` — running the check after this call's own compile just published into that same page would yank the rug out from under "run it immediately" below. Same bounded-overshoot as the threaded path: worst case this dispatch's compile pushes one past the threshold and the *next* dispatch flushes.
+
+Under `jitv2_lockstep`, a `None` codegen (owned by the async queue, which must never run under lockstep) is a hard `assert!`, not a silent skip — a silent skip would degrade the run to unverified interpreter, exactly the false-confidence bug that let "clean lockstep boots" verify nothing.
+
+After a successful `handle_request`, re-checks `is_runnable` rather than assuming the offset it just compiled is now servable — `handle_request` can decline that exact offset even on a compile that published something elsewhere (denylisted: a 0xFFC hazard or codegen gap; j2wp: the page's one function simply doesn't cover this offset, e.g. a concurrent-publish race). A miss there resolves via `step_int()`, same §13.5 contract as every other `EXEC_FALLBACK` producer.
+
+### 13.5 The EXEC_FALLBACK / EXEC_RETRY contract
+
+Every exit from this gate resolves to a real status before returning — `step_jit()` does not itself catch `EXEC_FALLBACK` (that changed when its old leading fast-path dispatch was folded into this one shared gate):
+- **A compiled call returns `EXEC_FALLBACK`** (entry-table's own miss path, or j2wp's dispatch-head `Switch` "otherwise" arm for an offset the function doesn't recognize — e.g. a race with a concurrent publish narrowing coverage, or §3.2's pending-interrupt bail with `core.pc` left at the bailing instruction): resolved by falling through to `self.step_int()` right there, never returned bare.
+- **`jitv2_compile_inline`'s two pool-flush recovery paths** (codegen arena over threshold, or a compile that ran out of memory) return `EXEC_RETRY` instead of recursing back into the gate: `core.pc` is untouched by the flush, so `EXEC_RETRY`'s existing contract (instruction didn't retire, PC unmoved, caller naturally re-dispatches the same PC) covers it — the freshly-emptied page just gets a normal fresh gate pass on the very next call.
+
+---
+
 ## Appendix A — fallback: single-function-per-page with `br_table` head
+
+**As-built (`j2wp` feature, §13): this is what got built.** Per-entry duplication (the primary §2–§8 design, still the non-`j2wp` default) and this fallback now coexist behind a Cargo feature rather than one superseding the other — see §13 for how the shared dispatch gate handles both. Original rationale, still accurate:
 
 Retained in case Phase 0 sizing shows per-entry duplication is pathological (arena churn, compile-thread saturation). One Cranelift function per page; external entries dispatch through a `br_table` over the known-entry set; a newly discovered entry queues a **recompile of the page with the entry added** (gen bump on publish; the new offset interprets until it lands); entry sets converge to function entries + post-call return points after warmup. Costs vs. the primary design: recompile churn during warmup, a dispatch `br_table` on every entry, an entry-set convergence assumption, and dispatcher-side entry lookup gains an indirection (one function serves many entries, so the entry_table maps offsets to (function, br_table index) instead of directly to code). Everything else in this document (§3–§5, §7–§8) is unchanged under this variant.

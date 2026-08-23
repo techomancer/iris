@@ -22,9 +22,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
 
 use crate::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
-use crate::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::jitv2::{ARENA_RESERVE_SIZE, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::mips_core::MipsCore;
-use crate::mips_exec::{EXEC_COMPLETE, EXEC_IS_EXCEPTION};
+use crate::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, ExecStatus};
 
 /// Cranelift codegen context, reused across compile jobs like `Analyzer`
 /// (§2.3's per-page scratch-buffer pattern) — `Context`/`FunctionBuilderContext`
@@ -345,15 +345,6 @@ impl Codegen {
     /// the flush-threshold math.
     pub const HOST_PAGE_SIZE: u64 = 4096;
 
-    /// Default path's arena reservation — see this constant's own call site
-    /// for the shared doc comment on why one big reservation beats
-    /// per-function mmap. `j2wp` uses `crate::jitv2::jitv2::ARENA_RESERVE_SIZE`
-    /// instead (2GiB, not 512MiB — a page-sized compiled function is larger
-    /// than an entry-sized one, so the whole-page redesign needs more
-    /// headroom before hitting `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`).
-    #[cfg(not(feature = "j2wp"))]
-    pub(crate) const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
-
     /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
     /// `alloc::alloc`s, which on Linux still routes through mmap for
     /// large/page-sized allocations) a fresh chunk sized to fit exactly
@@ -398,11 +389,7 @@ impl Codegen {
             Some(shared) => (shared, state.expect("new_module: shared arena given without its PagedArenaState")),
             None => {
                 let paged_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-                #[cfg(not(feature = "j2wp"))]
-                let reserve_size = Self::ARENA_RESERVE_SIZE;
-                #[cfg(feature = "j2wp")]
-                let reserve_size = crate::jitv2::jitv2::ARENA_RESERVE_SIZE;
-                let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(reserve_size, paged_state.clone())
+                let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(ARENA_RESERVE_SIZE, paged_state.clone())
                     .expect("failed to reserve jitv2 Codegen arena");
                 (shared, paged_state)
             }
@@ -701,18 +688,22 @@ impl Codegen {
         builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
 
         // Shared exit-to-interpreter block (see BlockSkeleton::exit_block's
-        // doc comment). Params: (core_ptr, word_offset). core_ptr must be
-        // its own block param — not the entry_block value captured above —
-        // because a block with multiple/deferred predecessors can only use
-        // values defined in blocks that dominate it; threading it as a param
-        // is how Cranelift wants a value made available across an
-        // as-yet-unknown set of incoming edges.
+        // doc comment). Params: (core_ptr, word_offset, status). core_ptr
+        // must be its own block param — not the entry_block value captured
+        // above — because a block with multiple/deferred predecessors can
+        // only use values defined in blocks that dominate it; threading it
+        // as a param is how Cranelift wants a value made available across an
+        // as-yet-unknown set of incoming edges. `status` is almost always
+        // EXEC_COMPLETE (every bail site passes its own constant via
+        // emit_bail) — see emit_bail's own doc comment for the one exception
+        // (emit_pending_interrupt_preamble's EXEC_FALLBACK).
         let exit_block = builder.create_block();
         let ptr_ty = builder.func.signature.params[0].value_type;
         let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
         let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
+        let exit_status_param = builder.append_block_param(exit_block, ir::types::I32);
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param);
+        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param, exit_status_param);
         // Not sealed: predecessors are every bail site across the whole
         // function, established incrementally as later passes emit them.
 
@@ -1004,6 +995,7 @@ impl Codegen {
         let ptr_ty = builder.func.signature.params[0].value_type;
         let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
         let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
+        let exit_status_param = builder.append_block_param(exit_block, ir::types::I32);
 
         let exception_call_block = builder.create_block();
         let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
@@ -1071,7 +1063,53 @@ impl Codegen {
         let dispatch_miss_block = builder.create_block();
         let mut switch = cranelift_frontend::Switch::new();
         for &w in &entry_words {
-            let target = entry_body_blocks.get(&w).copied().unwrap_or_else(|| entry_word_block_for(w));
+            let real_target = entry_body_blocks.get(&w).copied().unwrap_or_else(|| entry_word_block_for(w));
+            // `developer`: trace this external arrival here, in the compiled
+            // function's own dispatch head, instead of relying on the Rust
+            // caller that looked this entry up to push a matching traceback
+            // entry itself (the old design — see `InstrOrigin::JitEntry`'s
+            // doc comment for why that's no longer how this works). A small
+            // stub block per entry word: call `emit_dev_trace_bp` (which may
+            // itself return `EXEC_BREAKPOINT` on a hit), then fall through to
+            // `real_target` — the switch dispatches here first, not straight
+            // to `real_target`, so every external arrival is traced exactly
+            // once regardless of which entry word it lands on. Not gated by
+            // `skip_entry_preamble`: this runs unconditionally for every
+            // external entry, entirely separate from that ordinary-block-vs-
+            // body-block distinction.
+            // `is_branch_fallback_successor` takes priority over the plain
+            // `JIT_ENTRY` tag, same as the pass-2 head loop's own origin
+            // pick (see its comment on `emit_dev_trace_bp`): a fallback
+            // successor word can itself become a fresh region's own entry
+            // point (exactly this test's shape — a fallback-ending region's
+            // successor word gets externally re-dispatched into as the start
+            // of a brand new compile) and must keep reading FALLBACK_SUCCESSOR
+            // for that first arrival, not JIT_ENTRY — found live: this stub
+            // originally tagged every entry word JIT_ENTRY unconditionally,
+            // silently reclassifying a fallback successor's external arrival
+            // and breaking `dt`'s "how was this word actually reached" tag.
+            #[cfg(feature = "developer")]
+            let origin = if instrs[w as usize].is_branch_fallback_successor {
+                dev_trace_origin::FALLBACK_SUCCESSOR
+            } else {
+                dev_trace_origin::JIT_ENTRY
+            };
+            #[cfg(feature = "developer")]
+            let target = {
+                let stub = builder.create_block();
+                let saved = builder.current_block();
+                builder.switch_to_block(stub);
+                let raw = instrs[w as usize].raw;
+                let mut unused_cycles_pending = 0u32;
+                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word: w, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                emit_dev_trace_bp(&mut trace_ctx, origin);
+                builder.ins().jump(real_target, &[]);
+                builder.seal_block(stub);
+                if let Some(saved) = saved { builder.switch_to_block(saved); }
+                stub
+            };
+            #[cfg(not(feature = "developer"))]
+            let target = real_target;
             switch.set_entry(w as u128, target);
         }
         switch.emit(&mut builder, live_entry_offset, dispatch_miss_block);
@@ -1083,7 +1121,7 @@ impl Codegen {
         builder.ins().return_(&[fallback_status]);
 
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param);
+        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param, exit_status_param);
         // Left unsealed until every bail site below has been emitted.
 
         builder.switch_to_block(exception_call_block);
@@ -1410,7 +1448,7 @@ impl Codegen {
                         Some(_) => {
                             // Region ends here — mirrors handle_exec_complete's
                             // `pc += 4` (§3.3 "plain boundary").
-                            emit_bail(ctx, exit_block, fallthrough_word);
+                            emit_bail(ctx, exit_block, fallthrough_word, EXEC_COMPLETE);
                         }
                         None => {
                             let next_block = *block_for_word.get(&fallthrough_word)
@@ -1842,7 +1880,17 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
     ctx.builder.switch_to_block(bail_block);
     ctx.builder.set_cold_block(bail_block);
     ctx.builder.seal_block(bail_block);
-    emit_bail(ctx, exit_block, word_offset);
+    // EXEC_FALLBACK, not EXEC_COMPLETE: a pending interrupt here means this
+    // instruction has NOT been handled yet — step_jit's own preamble no
+    // longer runs before every dispatch (moved to the fallback path
+    // specifically to avoid paying for it on every compiled-code hit), so
+    // the real interrupt-delivery/breakpoint/timer logic (step_preamble!)
+    // needs a way back into the interpreter to actually run. EXEC_FALLBACK
+    // is exactly that signal — same contract exec_decoded_jit already uses
+    // for "the compiled path missed, caller must fetch/decode/dispatch
+    // normally" — core.pc is left untouched (still this exact instruction),
+    // so falling back re-enters right here.
+    emit_bail(ctx, exit_block, word_offset, EXEC_FALLBACK);
 
     ctx.builder.switch_to_block(continue_block);
     ctx.builder.seal_block(continue_block);
@@ -2047,15 +2095,27 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
 }
 
 /// Jump to the function's shared exit-to-interpreter block (`BlockSkeleton::
-/// exit_block`) with `(core_ptr, word_offset)` as block arguments, instead of
-/// emitting a fresh copy of the materialize-PC-and-return sequence at every
-/// bail site. Use this from every clean exit — preambles here, and
+/// exit_block`) with `(core_ptr, word_offset, status)` as block arguments,
+/// instead of emitting a fresh copy of the materialize-PC-and-return sequence
+/// at every bail site. Use this from every clean exit — preambles here, and
 /// `fallthrough_exit`/`taken_exit` stubs (§3.3) once those land. Does not
 /// seal or switch blocks; call from within the block that decided to bail,
 /// as its terminator.
-fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
+///
+/// `status` is almost always `EXEC_COMPLETE` (every ordinary region-ending
+/// bail: this instruction retired, `core.pc` now points at whatever comes
+/// next, exactly like the interpreter's own `handle_exec_complete`) — pass
+/// anything else only when the caller needs the Rust-side dispatcher to
+/// react differently than "this was a normal retirement". The one real user
+/// today is `emit_pending_interrupt_preamble`'s bail: it returns
+/// `EXEC_FALLBACK`, not `EXEC_COMPLETE`, specifically so `step_jit`'s caller
+/// falls through to the interpreter fallback path (which runs
+/// `step_preamble!`'s real interrupt-delivery logic) instead of treating a
+/// still-pending interrupt as if this instruction had just retired normally.
+fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, status: ExecStatus) {
     let word_offset_val = ctx.builder.ins().iconst(ir::types::I64, word_offset as i64);
-    ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val)]);
+    let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
+    ctx.builder.ins().jump(exit_block, &[ir::BlockArg::Value(ctx.core_ptr), ir::BlockArg::Value(word_offset_val), ir::BlockArg::Value(status_val)]);
 }
 
 /// Force real forward progress through `core.interp_fallback_fn` instead of
@@ -2236,6 +2296,16 @@ mod dev_trace_origin {
     pub const JIT_DELAY_SLOT: u32 = 3;
     pub const FALLBACK_SUCCESSOR: u32 = 5;
     pub const FALLBACK_SUCCESSOR_BACK_EDGE: u32 = 6;
+    /// A compiled region's entry word, reached via the function's own
+    /// dispatch-head `Switch` (a real external arrival — `step_jit`
+    /// jumping straight into this compiled function for the first time this
+    /// exact PC was reached this way), as opposed to `JIT_ENTRY_BACK_EDGE`'s
+    /// internal in-region edge. Previously recorded by the Rust-side caller
+    /// itself (`InstrOrigin::JitEntry`'s old doc comment) instead of the dev
+    /// hook — moved here so tracing is 100% this compiled function's own
+    /// responsibility for every instruction it dispatches, entry word
+    /// included, with no special-cased caller-side push to keep in sync.
+    pub const JIT_ENTRY: u32 = 7;
 }
 
 /// `core.dev_trace_bp_fn(jit_ctx, pc, raw, origin)` with this instruction's
@@ -2517,7 +2587,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
 /// whatever this function already wrote for real. A preamble bail (nothing
 /// staged this dispatch) is a harmless no-op, same as every other lockstep
 /// compare call.
-fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, core_ptr: Value, word_offset: Value) {
+fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, core_ptr: Value, word_offset: Value, status: Value) {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
@@ -2571,7 +2641,6 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
         builder.seal_block(continue_block);
     }
 
-    let status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     builder.ins().return_(&[status]);
 }
 
@@ -3009,7 +3078,7 @@ fn emit_check_mem_exc(ctx: &mut EmitCtx) {
     ctx.builder.switch_to_block(true_retry_block);
     ctx.builder.set_cold_block(true_retry_block);
     ctx.builder.seal_block(true_retry_block);
-    emit_bail(ctx, ctx.exit_block, ctx.word);
+    emit_bail(ctx, ctx.exit_block, ctx.word, EXEC_COMPLETE);
 
     ctx.builder.switch_to_block(continue_block);
     ctx.builder.seal_block(continue_block);
@@ -4635,7 +4704,7 @@ fn emit_target_edge(
              (needs a runtime-computed target address, which only the caller — knowing \
              whether this is a J/JAL or a conditional branch — can compute correctly)"
         ),
-        Some(_) => emit_bail(ctx, exit_block, target_word),
+        Some(_) => emit_bail(ctx, exit_block, target_word, EXEC_COMPLETE),
         None => {
             let target_block = *block_for_word.get(&target_word)
                 .expect("exit_reason is None -> analyzer guarantees target_word continues into the region");
@@ -7607,6 +7676,7 @@ mod tests {
             let ptr_ty = builder.func.signature.params[0].value_type;
             let exit_core_ptr = builder.append_block_param(exit_block, ptr_ty);
             let exit_word_offset = builder.append_block_param(exit_block, ir::types::I64);
+            let exit_status_param = builder.append_block_param(exit_block, ir::types::I32);
 
             // Shared exception-exit machinery: constructed for EmitCtx's sake
             // (the preamble emitter this harness exercises,
@@ -7642,7 +7712,7 @@ mod tests {
             builder.seal_block(entry_block);
 
             builder.switch_to_block(exit_block);
-            emit_exit_block_body(&mut builder, &mut codegen.module, exit_core_ptr, exit_word_offset);
+            emit_exit_block_body(&mut builder, &mut codegen.module, exit_core_ptr, exit_word_offset, exit_status_param);
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
 
             builder.switch_to_block(exception_call_block);
@@ -7716,7 +7786,12 @@ mod tests {
 
         let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
 
-        assert_eq!(status, EXEC_COMPLETE);
+        // EXEC_FALLBACK, not EXEC_COMPLETE: a pending interrupt means this
+        // instruction hasn't been handled yet — the caller (step_jit) must
+        // fall back to the interpreter (step_int, via exec_decoded_int),
+        // whose own step_preamble! actually delivers the interrupt. See
+        // emit_pending_interrupt_preamble's own doc comment.
+        assert_eq!(status, crate::mips_exec::EXEC_FALLBACK);
         let orig_vbase = 0xFFFFFFFF_80002000u64 & !(PAGE_SIZE as u64 - 1);
         assert_eq!(core.pc, orig_vbase | ((word_offset as u64) * 4),
             "pc must be set to this instruction's own address for the interpreter to retry");

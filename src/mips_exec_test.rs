@@ -430,12 +430,12 @@ mod tests {
         mem.set_word(phys_base, beq);
         mem.set_word(phys_base + 4, lw);
 
-        let s1 = exec.step();
+        let s1 = exec.step_int();
         assert_eq!(s1, EXEC_COMPLETE, "not-taken BEQ itself must not fault");
         assert!(exec.core.in_delay_slot, "not-taken branch must still arm the delay slot");
         assert_eq!(exec.core.pc, pc_base + 4, "pc must sit at the delay-slot instruction");
 
-        let s2 = exec.step();
+        let s2 = exec.step_int();
         assert!(s2 & EXEC_IS_EXCEPTION != 0, "misaligned load in the delay slot must fault");
         assert_eq!((s2 >> 2) & 0x1F, EXC_ADEL);
         assert_ne!(exec.core.cp0_cause & crate::mips_core::CAUSE_BD, 0,
@@ -636,7 +636,7 @@ mod tests {
         exec.core.pc = 0x80000000u32 as i32 as i64 as u64; // Sign-extend from 32 bits
         mem.set_word(0x00000000, 0); // NOP at physical address 0
 
-        exec.step();
+        exec.step_int();
         // KSEG0 is cacheable. NoOpCache returns 0.
         // If it went to memory (uncached), we would get NOP (0).
         // This test is hard to verify without inspecting internal routing or using a cache that returns different data.
@@ -648,7 +648,7 @@ mod tests {
         mem.set_word(0x00000000, 0x48000000);
 
         // Fetch from KSEG1 should hit memory
-        let status = exec.step();
+        let status = exec.step_int();
         assert_eq!(status, exec_exception(EXC_RI)); // 0x12345678 is likely RI
     }
 
@@ -669,7 +669,7 @@ mod tests {
         // 1. Test in 32-bit mode (default, STATUS_KX=0)
         // Upper 32 bits of PC are ignored for translation; low 32 bits = 0x10000000.
         // NOP executes successfully, PC advances by 4 (full 64-bit PC increments).
-        assert_eq!(exec.step(), EXEC_COMPLETE);
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, xkphys_addr + 4);
 
         // 2. Switch to 64-bit kernel mode and restore PC.
@@ -677,7 +677,7 @@ mod tests {
         exec.core.cp0_status = STATUS_KX; // 64-bit kernel mode, no EXL/ERL/BEV
 
         // 3. Test in 64-bit mode: XKPHYS translates to phys 0x10000000, NOP executes.
-        assert_eq!(exec.step(), EXEC_COMPLETE);
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, xkphys_addr + 4);
     }
 
@@ -3389,13 +3389,13 @@ mod tests {
         let pc_base: u64 = 0xFFFFFFFF80000000;
         exec.core.pc = pc_base;
 
-        assert_eq!(exec.step(), EXEC_COMPLETE, "ADDIU r1,r0,42");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "ADDIU r1,r0,42");
         assert_eq!(exec.core.read_gpr(1), 42,  "r1 should be 42");
 
-        assert_eq!(exec.step(), EXEC_COMPLETE, "ADDIU r2,r0,7");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "ADDIU r2,r0,7");
         assert_eq!(exec.core.read_gpr(2), 7,   "r2 should be 7");
 
-        assert_eq!(exec.step(), EXEC_COMPLETE, "ADDU r3,r1,r2");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "ADDU r3,r1,r2");
         assert_eq!(exec.core.read_gpr(3), 49,  "r3 should be 49");
 
         // Re-execute the same sequence — this time all three instructions hit L1I
@@ -3404,11 +3404,11 @@ mod tests {
         exec.core.write_gpr(1, 0);
         exec.core.write_gpr(2, 0);
         exec.core.write_gpr(3, 0);
-        assert_eq!(exec.step(), EXEC_COMPLETE, "cache-hit ADDIU r1,r0,42");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "cache-hit ADDIU r1,r0,42");
         assert_eq!(exec.core.read_gpr(1), 42);
-        assert_eq!(exec.step(), EXEC_COMPLETE, "cache-hit ADDIU r2,r0,7");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "cache-hit ADDIU r2,r0,7");
         assert_eq!(exec.core.read_gpr(2), 7);
-        assert_eq!(exec.step(), EXEC_COMPLETE, "cache-hit ADDU r3,r1,r2");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "cache-hit ADDU r3,r1,r2");
         assert_eq!(exec.core.read_gpr(3), 49);
     }
 
@@ -3463,12 +3463,12 @@ mod tests {
         mem.set_double(256, ((jr_ra as u64) << 32) | nop as u64);
 
         exec.core.pc = pc_base;
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "fused taken BEQ sets PC directly, no delay slot");
         assert_eq!(exec.core.pc, pc_base + 16, "PC should jump straight to branch target");
         assert!(!exec.core.in_delay_slot, "fused path must never set in_delay_slot");
 
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "ADDIU r3,r0,42");
         assert_eq!(exec.core.read_gpr(3), 42);
         assert_eq!(exec.core.read_gpr(1), 0, "skipped ADDIU r1 must not have executed");
@@ -3478,16 +3478,16 @@ mod tests {
         // instruction right after — must execute (PC+=8 skip of branch+NOP only).
         exec.core.pc = pc_base + 128;
         exec.core.write_gpr(1, 0);
-        exec.step();
+        exec.step_int();
         assert_eq!(exec.core.pc, pc_base + 136, "PC should skip branch+NOP (PC+=8)");
         assert!(!exec.core.in_delay_slot);
-        assert_eq!(exec.step(), EXEC_COMPLETE);
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(1), 111, "instruction after skipped NOP must execute");
 
         // JR ra fused with NOP delay slot: unconditional, PC=target directly.
         exec.core.pc = pc_base + 256;
         exec.core.write_gpr(31, pc_base + 300);
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "fused JR sets PC directly");
         assert_eq!(exec.core.pc, pc_base + 300, "PC should jump straight to r31");
         assert!(!exec.core.in_delay_slot);
@@ -3512,9 +3512,9 @@ mod tests {
 
         // First execution: decode-time fusion picks exec_beq_nop.
         exec.core.pc = pc_base;
-        exec.step();
+        exec.step_int();
         assert_eq!(exec.core.pc, pc_base + 16);
-        exec.step();
+        exec.step_int();
         assert_eq!(exec.core.read_gpr(3), 42);
 
         // Now overwrite the delay slot (offset 4) with a real instruction via the
@@ -3538,10 +3538,10 @@ mod tests {
         exec.core.pc = pc_base;
         exec.core.write_gpr(1, 0);
         exec.core.write_gpr(3, 0);
-        let s = exec.step();
+        let s = exec.step_int();
         assert!(exec.core.in_delay_slot, "must re-decode as unfused branch once delay slot is no longer a NOP");
         assert_eq!(exec.core.delay_slot_target, pc_base + 16);
-        let s2 = exec.step();
+        let s2 = exec.step_int();
         assert_eq!(s2, EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(1), 77, "rewritten delay-slot instruction must execute, not be skipped");
     }
@@ -3588,7 +3588,7 @@ mod tests {
         mem.set_double(32, ((nop as u64) << 32) | nop as u64);
 
         exec.core.pc = pc_base;
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "fused LUI+ORI should complete in one step");
         assert_eq!(exec.core.pc, pc_base + 8, "PC should skip both fused instructions");
         assert_eq!(exec.core.read_gpr(3) as u32, 0xa87474f0);
@@ -3596,12 +3596,12 @@ mod tests {
         // and ORI never touches or clears the upper bits — must still be all 1s.
         assert_eq!(exec.core.read_gpr(3), 0xFFFFFFFFa87474f0);
 
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "fused LUI+ADDIU should complete in one step");
         assert_eq!(exec.core.pc, pc_base + 16);
         assert_eq!(exec.core.read_gpr(2), 0x12345678);
 
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE);
         assert_eq!(exec.core.pc, pc_base + 24);
         // lui=0x12340000, addiu adds sign_extend(0xFFFF)=-1 -> 0x1233FFFF
@@ -3610,12 +3610,12 @@ mod tests {
         exec.core.pc = pc_base + 24;
         exec.core.write_gpr(2, 0);
         exec.core.write_gpr(3, 0);
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "unfused LUI should report plain EXEC_COMPLETE");
         assert_eq!(exec.core.pc, pc_base + 28, "unfused: PC advances by 4, not 8");
         // 0x1234's bit 15 is clear, so LUI's sign-extension is a no-op here.
         assert_eq!(exec.core.read_gpr(2), 0x0000000012340000, "LUI alone must have run");
-        let s2 = exec.step();
+        let s2 = exec.step_int();
         assert_eq!(s2, EXEC_COMPLETE);
         assert_eq!(exec.core.pc, pc_base + 32);
         assert_eq!(exec.core.read_gpr(3), 0x12345678, "ADDIU v1,v0,0x5678 using v0 set by LUI");
@@ -3651,7 +3651,7 @@ mod tests {
 
         exec.core.write_gpr(4 /*a0*/, base_addr);
         exec.core.pc = pc_base;
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "fused ADDIU+LW should report plain EXEC_COMPLETE");
         assert_eq!(exec.core.pc, pc_base + 8, "PC should skip both fused instructions");
         assert_eq!(exec.core.read_gpr(8 /*t0*/), base_addr + 4, "ADDIU result must still be written");
@@ -3659,7 +3659,7 @@ mod tests {
         assert_eq!(exec.core.read_gpr(2 /*v0*/), 0xFFFFFFFFCAFEF00D, "LW must load through the fused address");
 
         exec.core.write_gpr(5 /*a1*/, 0x10);
-        let s = exec.step();
+        let s = exec.step_int();
         assert_eq!(s, EXEC_COMPLETE, "fused ADDU+SW should report plain EXEC_COMPLETE");
         assert_eq!(exec.core.pc, pc_base + 16);
         assert_eq!(exec.core.read_gpr(9 /*t1*/), base_addr + 0x10);
@@ -3685,7 +3685,7 @@ mod tests {
 
         exec.core.write_gpr(4, 0x3000);
         exec.core.pc = pc_base;
-        let s = exec.step();
+        let s = exec.step_int();
         assert!(s & EXEC_IS_EXCEPTION != 0, "misaligned fused load must fault");
         assert_eq!((s >> 2) & 0x1F, EXC_ADEL);
         assert_eq!(exec.core.cp0_epc, pc_base + 4,
@@ -3723,14 +3723,14 @@ mod tests {
         exec.core.write_gpr(4, base_addr);
 
         exec.core.pc = pc_base;
-        let s = exec.step();
+        let s = exec.step_int();
         assert!(exec.core.in_delay_slot, "BEQ taken, real delay slot begins");
         assert_eq!(exec.core.pc, pc_base + 4);
 
         // Execute the ADDIU (in the delay slot): must NOT fuse away the LW —
         // it should behave like plain ADDIU and let PC redirect to the branch
         // target via the delay-slot mechanism.
-        let s2 = exec.step();
+        let s2 = exec.step_int();
         assert_eq!(s2, EXEC_COMPLETE, "ADDIU in delay slot falls back to plain completion");
         assert_eq!(exec.core.pc, pc_base + 16, "PC must redirect to branch target, not pc+8");
         assert!(!exec.core.in_delay_slot);

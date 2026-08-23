@@ -1027,9 +1027,19 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     // `compute_cycles_flush` needs this.
     let has_inline_slot = !is_0xffc_branch && !matches!(class, Classify::Sequential);
 
+    // Re-derive `is_branch_fallback_successor` from the page's own bytes
+    // instead of relying on some earlier walk having visited the fallback
+    // branch at `offset - 1` first (the Excluded arm above only sets this
+    // when *it* does the visiting — a region compiled fresh with this word
+    // as its own entry point never runs that arm at all, since the fallback
+    // itself isn't part of this walk). `is_fallback_branch` is a pure decode
+    // of `page[offset-1]`, so this is correct regardless of which region's
+    // walk this is, or whether the fallback's own region was ever compiled.
+    let is_branch_fallback_successor = offset > 0 && is_fallback_branch(page[(offset - 1) as usize]);
+
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
-        fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false,
+        fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor,
         is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot, cycles_delta: 1, cycles_flush: false, is_entry_point: false,
     };
     budget.remaining -= 1;
