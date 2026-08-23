@@ -424,17 +424,24 @@ impl SharedArena {
     /// read-only memory), skip forward to `sealed_up_to` first: that memory
     /// is permanently off-limits to future allocation once sealed, so
     /// packing into it is never safe again, forced-seal or not.
-    /// Returns `(unaligned_start, ptr)` — `unaligned_start` is `position`
-    /// *before* this call's `align_up`, i.e. the byte offset where this
-    /// call's own alignment padding begins. Callers that track "this
-    /// compile's range" for later sealing (`PagedArenaMemoryProvider::allocate`)
-    /// must use `unaligned_start`, not the aligned pointer's own offset —
-    /// see that call site's own comment for why: any padding bytes
-    /// `align_up` skips belong to no other allocation (the bump cursor only
-    /// ever moves forward), so they must be folded into *this* call's range
-    /// or nothing will ever claim them, permanently gapping `seal_queue`'s
-    /// contiguity check for every later allocation.
-    fn allocate(&mut self, size: usize, align: u64, _kind: JITMemoryKind) -> io::Result<(usize, *mut u8)> {
+    /// Returns `(unaligned_start, end, ptr)` — `unaligned_start` is
+    /// `position` *before* this call's `align_up`, i.e. the byte offset
+    /// where this call's own alignment padding begins, and `end` is the
+    /// TRUE end of this allocation's real range, `align_up(unaligned_start,
+    /// align) + size`. Callers that track "this compile's range" for later
+    /// sealing (`PagedArenaMemoryProvider::allocate`) must use
+    /// `unaligned_start` for the start and this `end` directly — NOT
+    /// recompute the end themselves as `unaligned_start + size`. Confirmed
+    /// live as a real bug when the caller used to do exactly that: whenever
+    /// `align_up` actually padded (`unaligned_start` wasn't already
+    /// aligned), `unaligned_start + size` under-reported the consumed range
+    /// by exactly the padding amount — a permanent, unclaimed gap between
+    /// consecutive `SealEntry`s that `try_seal_ready`'s contiguity scan can
+    /// never close short of a full arena flush (thousands of genuinely
+    /// fully-patched entries with nothing draining — a tiny gap between two
+    /// adjacent entries' real `end`/`start` was the actual cause, not a
+    /// stuck compile thread).
+    fn allocate(&mut self, size: usize, align: u64, _kind: JITMemoryKind) -> io::Result<(usize, usize, *mut u8)> {
         let align = usize::try_from(align).expect("alignment too big");
         assert!(align <= region::page::size(), "alignment over page size is not supported");
 
@@ -470,7 +477,7 @@ impl SharedArena {
         self.position = end;
         self.state.crossed_page.store(crosses, Ordering::Relaxed);
         self.record_packing();
-        Ok((unaligned_start, unsafe { self.ptr.add(start) }))
+        Ok((unaligned_start, end, unsafe { self.ptr.add(start) }))
     }
 
     /// Scan `seal_queue` from the front for the longest prefix that is
@@ -866,15 +873,20 @@ impl PagedArenaMemoryProvider {
 impl JITMemoryProvider for PagedArenaMemoryProvider {
     fn allocate(&mut self, size: usize, align: u64, kind: JITMemoryKind) -> io::Result<*mut u8> {
         let mut inner = self.inner.lock();
-        let (start, ptr) = inner.allocate(size, align, kind)?;
+        let (start, end, ptr) = inner.allocate(size, align, kind)?;
         drop(inner);
         // `start` is the pre-alignment offset (`SharedArena::allocate`'s
         // `unaligned_start`), not `ptr`'s own (post-alignment) offset — see
         // that method's own doc comment for why the range this handle
         // tracks/reports must include its own leading alignment pad: that
         // padding is never anyone else's to claim, so folding it into this
-        // call's own range is what keeps seal_queue's ranges gap-free.
-        let end = start + size;
+        // call's own range is what keeps seal_queue's ranges gap-free. `end`
+        // is `SharedArena::allocate`'s own real end (`align_up(start, align)
+        // + size`), NOT recomputed here as `start + size` — that used to be
+        // a real, confirmed-live bug: whenever alignment actually padded,
+        // `start + size` silently undershot the true end by the pad amount,
+        // leaving a permanent gap in the seal queue no flush-free recovery
+        // could ever close (see `SharedArena::allocate`'s own doc comment).
         // Report this exact call's own range to a sibling handle, if one is
         // listening — see `last_allocation`'s own field doc comment. The
         // real caller (`Codegen::compile_region_uncommitted`) reads this
@@ -1145,5 +1157,46 @@ mod tests {
 
         let sealed = a.patch_pending_publish(a_start, a_end, resolved_publish(), true);
         assert_eq!(sealed.len(), 2, "A's patch call sealed both its own and B's earlier-queued range");
+    }
+
+    #[test]
+    fn mailbox_reported_end_includes_alignment_padding_not_just_unaligned_start_plus_size() {
+        // Real, confirmed-live bug: the mailbox used to report `end` as
+        // `unaligned_start + size`, silently skipping whatever padding
+        // align_up added — a permanent, uncounted gap between this
+        // allocation and the next one's `start`, which `push_placeholder`
+        // then baked into two SealEntrys that never actually touch,
+        // permanently blocking `try_seal_ready`'s contiguity scan. The fix:
+        // SharedArena::allocate itself computes and returns the true end
+        // (`align_up(unaligned_start, align) + size`); the wrapper must use
+        // that value directly, never recompute it from `unaligned_start`.
+        let state = Arc::new(PagedArenaState::default());
+        let shared = PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
+        let mailbox = Arc::new(parking_lot::Mutex::new(None));
+        let mut arena = PagedArenaMemoryProvider::from_shared_with_mailbox(shared, mailbox.clone());
+
+        // First allocation: 3 bytes, unaligned, leaves position at an
+        // odd (non-8-aligned) offset so the SECOND allocation's 8-byte
+        // alignment request is guaranteed to need real padding.
+        arena.allocate(3, 1, JITMemoryKind::Executable).unwrap();
+        let (first_start, first_end) = mailbox.lock().take().unwrap();
+        assert_eq!(first_end - first_start, 3);
+
+        arena.allocate(64, 8, JITMemoryKind::Executable).unwrap();
+        let (second_start, second_end) = mailbox.lock().take().unwrap();
+
+        assert_eq!(second_start, first_end,
+            "the second allocation's reported start must be exactly where the first one's reported range \
+             ended — this is what push_placeholder relies on to keep the seal queue gap-free");
+        // second_start (== first_end == 3) isn't itself 8-aligned, so this
+        // allocation's real range starts at align_up(3, 8) = 8 and really
+        // ends at 8 + 64 = 72 — a real 5-byte pad the reported range must
+        // fold in. The confirmed-live bug reported end as
+        // second_start + 64 = 67 instead, silently dropping that pad.
+        let real_aligned_start = second_start.div_ceil(8) * 8;
+        assert_eq!(second_end, real_aligned_start + 64,
+            "the reported end must be the TRUE end (aligned start + size), not unaligned_start + size — \
+             the confirmed-live bug undershot by exactly the alignment pad, leaving those bytes as a \
+             permanent, unclaimed gap between this entry and the next one's start");
     }
 }
