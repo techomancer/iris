@@ -6,10 +6,14 @@ pub mod opcode_support;
 pub mod analyzer;
 pub mod codegen;
 pub mod paged_memory;
+#[cfg(feature = "j2wp")]
+pub mod pcp_dump;
 pub mod equiv_test;
 
+#[cfg(not(feature = "j2wp"))]
+pub use jitv2::JitEntry;
 pub use jitv2::{
-    CompileQueue, CompileRequest, JitEntry, JitFn, JitStats, Jitv2, PageSlot, Pfn, PhysicalCodePage,
+    CompileQueue, CompileRequest, JitFn, JitStats, Jitv2, PageSlot, Pfn, PhysicalCodePage,
     BITMAP_WORDS, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES, COMPILE_QUEUE_CAPACITY, ENTRIES_PER_PAGE,
     JITV2_INITIAL_PAGE_CAPACITY, PAGE_SIZE,
     min_calls_before_compile, set_min_calls_before_compile,

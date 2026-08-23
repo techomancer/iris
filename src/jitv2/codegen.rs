@@ -74,6 +74,22 @@ pub struct Codegen {
     /// can never leak into a later, unrelated decline.
     #[cfg(feature = "developer")]
     last_decline_was_verifier_error: bool,
+    /// Set when `finalize_batch_nonforced`'s own `module.finalize_definitions()`
+    /// call returned `Err` — a real Cranelift/JIT-backend failure at the
+    /// relocation-patching step, distinct from (and much rarer than) a
+    /// gap-blocked seal (`try_seal_ready` returning empty because an earlier
+    /// entry hasn't sealed yet — that's a normal, self-resolving wait, not an
+    /// error). Both outcomes make `finalize_batch_nonforced` return an empty
+    /// `Vec`, which is indistinguishable to the caller without this flag —
+    /// confirmed as a real silent-loss bug: `handle_request_deferred` was
+    /// bumping `pending` and waiting for a later sweep to "unblock" an entry
+    /// that was never blocked at all, just permanently failed, so it could
+    /// never actually succeed no matter how many times a sweep retried it.
+    /// Read via `last_finalize_failed()` immediately after a call whose
+    /// return was empty; always cleared at the top of
+    /// `finalize_batch_nonforced` so a stale `true` can never leak into a
+    /// later, unrelated call.
+    last_finalize_failed: bool,
     /// Shared with the `PagedArenaMemoryProvider` this `Codegen`'s `module`
     /// was built with — see `PagedArenaState`'s own doc comment for why this
     /// indirection exists. Polled via `provider_crossed_page`/`packing_stats`
@@ -146,7 +162,6 @@ struct EmitCtx<'a, 'b> {
     core_ptr: Value,
     raw: u32,
     word: WordOffset,
-    entry_word: WordOffset,
     /// Compile-time-known Cause.BD value for whatever `emit_exception_exit`
     /// call site is currently being emitted with this `ctx` — `true` only
     /// while emitting a delay slot's own inlined semantics
@@ -164,22 +179,23 @@ struct EmitCtx<'a, 'b> {
     /// `true` iff an exception raised while emitting with this `ctx` must
     /// **trust the live `core.pc`/`core.in_delay_slot`** (route through
     /// `exception_entry_word_block`) rather than overwriting them from the
-    /// compile-time `word`/`bd` (`exception_other_word_block`). Set for the
-    /// entry word (state set by the interpreter dispatch that reached it) and
-    /// for a *branch-fallback successor* — the delay slot of a BC1
-    /// interpreter-fallback, reached with `core.pc = slot_addr` and
-    /// `in_delay_slot = true` already correct from the fallback's interpreter
-    /// run; overwriting them (BD would become the compile-time `false`) would
-    /// give a faulting slot the wrong `Cause.BD`/EPC. Distinct from `bd`: `bd`
-    /// is a compile-time literal for the *other-word* path; this bool selects
-    /// *which* path entirely.
+    /// compile-time `word`/`bd` (`exception_other_word_block`). Set for any
+    /// entry word (`instrs[word].is_entry_point`, §13.4 — state set by the
+    /// interpreter dispatch that reached it) and for a *branch-fallback
+    /// successor* — the delay slot of a BC1 interpreter-fallback, reached
+    /// with `core.pc = slot_addr` and `in_delay_slot = true` already correct
+    /// from the fallback's interpreter run; overwriting them (BD would
+    /// become the compile-time `false`) would give a faulting slot the wrong
+    /// `Cause.BD`/EPC. Distinct from `bd`: `bd` is a compile-time literal for
+    /// the *other-word* path; this bool selects *which* path entirely.
     trust_live_pc_bd_on_exc: bool,
     exit_block: Block,
     /// Two-stage shared exception-raise blocks (see their own doc comments
     /// on `BlockSkeleton`) — `emit_exception_exit` picks which outer stage
-    /// to jump to at *compile* time (`ctx.word == ctx.entry_word` is always
-    /// known when emitting a given call site), so no call site ever pays a
-    /// runtime check for something that's actually fixed for that site.
+    /// to jump to at *compile* time (`ctx.trust_live_pc_bd_on_exc` is always
+    /// known when emitting a given call site — see its own doc comment), so
+    /// no call site ever pays a runtime check for something that's actually
+    /// fixed for that site.
     exception_call_block: Block,
     exception_entry_word_block: Block,
     exception_other_word_block: Block,
@@ -232,11 +248,10 @@ pub struct BlockSkeleton {
     /// of the delay-slot-synthesis check + `handle_exception_fn` call, which
     /// showed up directly in compiled code size for any region touching more
     /// than one of them). Split into three blocks, two-stage, rather than
-    /// one block taking `word` as a runtime param: `ctx.word == ctx.entry_word`
+    /// one block taking `word` as a runtime param: `ctx.trust_live_pc_bd_on_exc`
     /// is always known at *compile* time for any given `emit_exception_exit`
-    /// call site (only ever one fixed `entry_word` per region), so there is
-    /// no need to pay a runtime check for it — each call site picks the
-    /// right outer stage directly.
+    /// call site, so there is no need to pay a runtime check for it — each
+    /// call site picks the right outer stage directly.
     ///
     /// - [`Self::exception_other_word_block`]: outer stage for every
     ///   non-entry-word call site — unconditionally synthesizes `fault_pc`
@@ -312,18 +327,6 @@ impl Codegen {
         CODEGEN_OPT_LEVEL_SPEED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Upfront reservation for `ArenaMemoryProvider` — see `new_module`'s
-    /// own doc comment for why this exists at all. Sized generously: this is
-    /// a `PROT_NONE` virtual-address-space reservation (cheap — nothing is
-    /// actually committed/faulted-in until code is written there), not a
-    /// RAM commitment, and 64-bit address space is abundant, so there's no
-    /// real cost to reserving far more than we expect to use. 512MiB is
-    /// comfortably above the ~27MB of compiled code observed for ~130k
-    /// functions live (roughly ~215 bytes/function average), leaving room
-    /// for `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`'s full 1_000_000 functions
-    /// (~200MB+ at that rate) plus slack for larger-than-average regions.
-    pub(crate) const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
-
     /// Host mmap page granularity `ArenaMemoryProvider` rounds every
     /// function's segment up to (`memory/arena.rs`'s own `align_up(size,
     /// page::size())`, via the `region` crate — a transitive dependency of
@@ -341,6 +344,15 @@ impl Codegen {
     /// to `Jitv2::code_bytes_used`'s per-entry accounting instead of just
     /// the flush-threshold math.
     pub const HOST_PAGE_SIZE: u64 = 4096;
+
+    /// Default path's arena reservation — see this constant's own call site
+    /// for the shared doc comment on why one big reservation beats
+    /// per-function mmap. `j2wp` uses `crate::jitv2::jitv2::ARENA_RESERVE_SIZE`
+    /// instead (2GiB, not 512MiB — a page-sized compiled function is larger
+    /// than an entry-sized one, so the whole-page redesign needs more
+    /// headroom before hitting `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`).
+    #[cfg(not(feature = "j2wp"))]
+    pub(crate) const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
 
     /// `cranelift_jit`'s default `SystemMemoryProvider` mmaps (or
     /// `alloc::alloc`s, which on Linux still routes through mmap for
@@ -386,7 +398,11 @@ impl Codegen {
             Some(shared) => (shared, state.expect("new_module: shared arena given without its PagedArenaState")),
             None => {
                 let paged_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-                let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(Self::ARENA_RESERVE_SIZE, paged_state.clone())
+                #[cfg(not(feature = "j2wp"))]
+                let reserve_size = Self::ARENA_RESERVE_SIZE;
+                #[cfg(feature = "j2wp")]
+                let reserve_size = crate::jitv2::jitv2::ARENA_RESERVE_SIZE;
+                let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(reserve_size, paged_state.clone())
                     .expect("failed to reserve jitv2 Codegen arena");
                 (shared, paged_state)
             }
@@ -450,6 +466,7 @@ impl Codegen {
             last_compile_ran_out_of_memory: false,
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
+            last_finalize_failed: false,
             paged_state,
             seal_handle,
             func_ranges: std::collections::HashMap::new(),
@@ -499,6 +516,18 @@ impl Codegen {
     #[cfg(feature = "developer")]
     pub fn arena_range(&self) -> (u64, u64) {
         self.paged_state.arena_range()
+    }
+
+    /// `j2 seal-queue`'s only caller — see
+    /// `SharedArena::seal_queue_snapshot`'s own doc comment.
+    pub fn seal_queue_snapshot(&self) -> crate::jitv2::paged_memory::SealQueueSnapshot {
+        self.seal_handle.shared().lock().seal_queue_snapshot()
+    }
+
+    /// `j2 seal-queue list`'s only caller — see
+    /// `SharedArena::seal_queue_entries`'s own doc comment.
+    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)> {
+        self.seal_handle.shared().lock().seal_queue_entries()
     }
 
     /// Reclaim every executable-memory page this `Codegen` has ever
@@ -599,6 +628,15 @@ impl Codegen {
     /// flush and let it retry.
     pub fn last_compile_ran_out_of_memory(&self) -> bool {
         self.last_compile_ran_out_of_memory
+    }
+
+    /// Whether the most recent `finalize_batch_nonforced` call returned an
+    /// empty `Vec` because `module.finalize_definitions()` itself errored,
+    /// as opposed to a normal gap-blocked seal — see `last_finalize_failed`'s
+    /// own field doc comment. Callers must check this immediately after an
+    /// empty return, before assuming "just gap-blocked, safe to wait."
+    pub fn last_finalize_failed(&self) -> bool {
+        self.last_finalize_failed
     }
 
     /// Whether the most recent `compile_region` call's `None` return came
@@ -809,27 +847,46 @@ impl Codegen {
     /// omitting them there would silently under-test/under-implement the
     /// checks these tools exist to verify.
     ///
-    /// Only ever affects the entry word itself: every other head in the
+    /// Only ever affects entry words themselves: every other head in the
     /// region still gets its full preamble unconditionally, since nothing
-    /// but the interpreter's own dispatch (which only ever lands on
-    /// `entry_word`) can have already performed those checks for it. If an
-    /// *internal* edge (e.g. a backward branch) targets the entry word, that
+    /// but the interpreter's own dispatch (which only ever lands on an entry
+    /// word) can have already performed those checks for it. If an
+    /// *internal* edge (e.g. a backward branch) targets an entry word, that
     /// transfer never went through the interpreter's dispatch either — see
-    /// `block_for_word`'s construction below, which always resolves
-    /// `entry_word` to the full preamble block, never the skipped-preamble
-    /// one, regardless of this flag.
+    /// `block_for_word`'s construction below, which always resolves an entry
+    /// word to its full-preamble block, never its skipped-preamble body
+    /// block, regardless of this flag.
+    ///
+    /// §13.4: takes every entry point's own reachability walk, already
+    /// merged into one buffer via [`crate::jitv2::analyzer::Analyzer::walk_multi_entry`]
+    /// — `instrs[w].is_entry_point` (set by that walk) is now what
+    /// distinguishes an entry word from an ordinary internal instruction,
+    /// wherever this function used to compare against a single scalar
+    /// `entry_word` parameter. Every entry point analyzed from one buffer
+    /// shares this compile's `compiled_for_fr1`/`skip_entry_preamble` — see
+    /// `CompileRequest::compiled_for_fr1`'s own doc comment for why that's
+    /// correct (FR mode and the entry-skip contract are both properties of
+    /// the *compile*, not of any one entry within it).
+    ///
     /// Compile a region into Cranelift IR and hand it to `define_function`,
     /// but do **not** finalize or return a callable pointer — the shared
     /// first half of `compile_region`'s (immediate) and `finalize_batch`'s
     /// (deferred) paths. Returns the `FuncId` `finalize_batch` needs to
     /// retrieve the eventual `JitFn`; callers that need a callable pointer
     /// right away should use `compile_region` instead, not this directly.
+    ///
+    /// `has_fpu`: whether this region contains any CP1/FPU instruction —
+    /// computed by the walk itself (`Analyzer::walk_multi_entry`'s own
+    /// return value, `analyzer::is_fpu_instruction`) and passed straight
+    /// through here rather than re-scanned, so this function never needs
+    /// its own opinion on which opcodes are FPU-shaped.
     pub fn compile_region_uncommitted(
         &mut self,
         instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE],
-        entry_word: WordOffset,
         compiled_for_fr1: bool,
         skip_entry_preamble: bool,
+        has_fpu: bool,
+        page: *mut crate::jitv2::PhysicalCodePage,
     ) -> Option<cranelift_module::FuncId> {
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
         #[cfg(feature = "developer")]
@@ -888,36 +945,47 @@ impl Codegen {
         // already promoted by the walker and has real edges — those get a
         // block like any other head.
         let mut instr_blocks: Vec<(WordOffset, Block)> = Vec::new();
-        let mut entry_word_block = None;
+        let mut entry_words: Vec<WordOffset> = Vec::new();
         for instr in instrs_linear(instrs) {
             if instr.is_slot_only {
                 continue;
             }
             let block = builder.create_block();
-            if instr.word == entry_word {
-                entry_word_block = Some(block);
+            if instr.is_entry_point {
+                entry_words.push(instr.word);
             }
             instr_blocks.push((instr.word, block));
         }
-        let entry_word_block = entry_word_block
-            .expect("entry_word must be a visited, non-slot offset in the walked buffer");
-
-        // When skipping the entry word's own preamble (production path —
-        // see compile_region's doc comment on skip_entry_preamble), the
-        // entry word needs two distinct blocks: entry_word_block keeps its
-        // usual meaning (preamble + semantics, the target for every
-        // *internal* edge — a backward branch landing on entry_word never
-        // went through the interpreter's dispatch, so it must still pay the
-        // checks) and a new entry_word_body_block holds just the
-        // semantics, reached directly from the function's real entry_block,
-        // bypassing the preamble. entry_word_block's own body becomes just
-        // "run the preamble, then jump to entry_word_body_block" in this
-        // mode instead of containing the semantics itself.
-        let entry_word_body_block = if skip_entry_preamble {
-            Some(builder.create_block())
-        } else {
-            None
+        assert!(!entry_words.is_empty(), "at least one entry_word must be a visited, non-slot offset in the walked buffer");
+        // Deterministic order (ascending, matching instr_blocks/instrs_linear)
+        // — nothing depends on it structurally, but a fixed iteration order
+        // keeps codegen output reproducible across runs of the same input.
+        entry_words.sort_unstable();
+        let block_for_word_prelim: std::collections::HashMap<WordOffset, Block> =
+            instr_blocks.iter().copied().collect();
+        let entry_word_block_for = |w: WordOffset| -> Block {
+            *block_for_word_prelim.get(&w)
+                .expect("entry_word must be a visited, non-slot offset in the walked buffer")
         };
+
+        // When skipping an entry word's own preamble (production path — see
+        // compile_region's doc comment on skip_entry_preamble), EVERY entry
+        // word needs two distinct blocks, one pair per entry (§13.4): its
+        // ordinary block (preamble + semantics, the target for every
+        // *internal* edge — a backward branch landing on an entry word never
+        // went through the interpreter's dispatch, so it must still pay the
+        // checks) and a dedicated body block, reached directly from the
+        // function's dispatch head, bypassing the preamble. The ordinary
+        // block's own body becomes just "run the preamble, then jump to the
+        // body block" in this mode instead of containing the semantics
+        // itself. One map, keyed by entry word, rather than a single
+        // `Option<Block>` — the old single-entry shape.
+        let mut entry_body_blocks: std::collections::HashMap<WordOffset, Block> = std::collections::HashMap::new();
+        if skip_entry_preamble {
+            for &w in &entry_words {
+                entry_body_blocks.insert(w, builder.create_block());
+            }
+        }
 
         // entry_block must be the first block Cranelift lays out (it must
         // stay the function's actual entry point, matching the function
@@ -951,31 +1019,68 @@ impl Codegen {
         let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
         let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
 
-        // Region-wide FPU entry guard (CU1 + FR-mode), only when this region
-        // actually contains a CP1 instruction — see emit_fpu_entry_guard's
-        // doc comment. `fpr_mode` is resolved once, at compile time, from
-        // the live STATUS_FR bit; this is also the mode every FPR-access
-        // emitter in the region uses (threaded via `fr_mode` in pass 2).
-        // Still positioned in entry_block here — the guard is entry_block's
-        // own body, emitted before its terminating jump to entry_word_block.
-        let has_fpu = instrs_linear(instrs).any(|i| lookup_cp1_semantics(i.raw).is_some());
+        // §13.4 internal dispatch head: this page's one compiled function may
+        // cover several external entry points, so the function itself must
+        // find out which one it's being called for. No parameter needed:
+        // the offset is already implicit in live `core.pc`, exactly the way
+        // the interpreter's own dispatch derives it — `(pc & 0xFFF) >> 2`.
+        // Computed here, before the FR-mode guard, because the guard's own
+        // kill/fallback bail (on an FR mismatch) also needs to know the live
+        // entry offset — see emit_fr_mode_guard's doc comment.
+        let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+        let mem = MemFlagsData::trusted();
+        let live_pc = builder.ins().load(ir::types::I64, mem, core_ptr, pc_off);
+        let page_off_mask = builder.ins().iconst(ir::types::I64, 0xFFF);
+        let masked = builder.ins().band(live_pc, page_off_mask);
+        let live_entry_offset = builder.ins().ushr_imm_u(masked, 2);
+
+        // Region-wide FR-mode guard ONLY (not CU1 — see emit_cp1_cu1_guard,
+        // called per-instruction in pass 2 below), emitted once when this
+        // region actually contains a CP1 instruction (`has_fpu`, computed
+        // once by the walk itself — see this function's own doc comment).
+        // `compiled_for_fr1` is resolved once, at compile time, from the
+        // live STATUS_FR bit when the compile started (per-page pinned FR
+        // mode, §13 — PhysicalCodePage::fr1); this is also the mode every
+        // FPR-access emitter in the region uses (threaded via `fr_mode` in
+        // pass 2). Still positioned in entry_block here — legitimate as a
+        // region-wide, entry-time check because FR mode (unlike CU1) really
+        // is a whole-compile invariant — see emit_fr_mode_guard's own doc
+        // comment.
         if has_fpu {
             // Not part of any head instruction's own retirement — this
             // guard runs (at most) once in entry_block, before any
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: entry_word, entry_word, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
-            emit_fpu_entry_guard(&mut guard_ctx, entry_word, compiled_for_fr1);
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: 0, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+            emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
-        // Skip straight to entry_word_body_block (bypassing the preamble)
-        // when the caller says the interpreter's own dispatch loop already
-        // ran the equivalent checks for this exact PC; otherwise (the
-        // verifier/test-harness path, never preceded by a real interpreter
-        // step()) go through entry_word_block as normal, paying the
-        // preamble here same as any other head.
-        builder.ins().jump(entry_word_body_block.unwrap_or(entry_word_block), &[]);
+
+        // Dispatch: a `Switch` over every entry this compile covers, jumping
+        // to that entry's own body block (bypassing its preamble, when
+        // skip_entry_preamble) or its ordinary block otherwise — Cranelift
+        // lowers this to a `br_table` when the case count/density justify
+        // it, or a compare chain otherwise (no separate policy needed here).
+        // Any offset none of `entry_words` recognizes (including "some
+        // other compile's coverage was clobbered when this compile's
+        // publish overwrote the page's shared `func` slot" — a page-level
+        // race, not a per-compile concern) bails via EXEC_FALLBACK,
+        // untouched core.pc, so the caller's normal interpret-or-recompile
+        // path takes over exactly as if this function had never been
+        // called.
+        let dispatch_miss_block = builder.create_block();
+        let mut switch = cranelift_frontend::Switch::new();
+        for &w in &entry_words {
+            let target = entry_body_blocks.get(&w).copied().unwrap_or_else(|| entry_word_block_for(w));
+            switch.set_entry(w as u128, target);
+        }
+        switch.emit(&mut builder, live_entry_offset, dispatch_miss_block);
         builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
+
+        builder.switch_to_block(dispatch_miss_block);
+        builder.seal_block(dispatch_miss_block);
+        let fallback_status = builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_FALLBACK as i64);
+        builder.ins().return_(&[fallback_status]);
 
         builder.switch_to_block(exit_block);
         emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param);
@@ -1030,28 +1135,29 @@ impl Codegen {
             // doc). Set at ctx construction so every emit_exception_exit within
             // this word's emission (including a faulting slot instruction) picks
             // the right exception outer stage.
-            let trust_live_pc_bd_on_exc = word == entry_word || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, entry_word, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
+            let is_entry_point = instrs[word as usize].is_entry_point;
+            let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
 
-            if word == entry_word && entry_word_body_block.is_some() {
-                // entry_word_block is reached only by internal in-region
-                // edges (emit_target_edge's None arm — always a plain
-                // fallthrough/taken-branch edge, never a delay-slot
-                // transfer) once skip_entry_preamble is set — the real
-                // external-dispatch entry bypasses straight to
-                // entry_word_body_block instead (see the jump out of
-                // entry_block above), never running any of this. So
+            if is_entry_point && entry_body_blocks.contains_key(&word) {
+                // This entry word's ordinary block is reached only by
+                // internal in-region edges (emit_target_edge's None arm —
+                // always a plain fallthrough/taken-branch edge, never a
+                // delay-slot transfer) once skip_entry_preamble is set — the
+                // real external-dispatch entry bypasses straight to this
+                // entry's own body block instead (the dispatch head's
+                // Switch above), never running any of this. So
                 // core.pc/in_delay_slot are stale here for this specific
                 // word and must be materialized before the preambles below
-                // (which is why this is emitted first, still in
-                // entry_word_block, rather than after them — deliberately
-                // NOT switching to body_block yet, so the preambles still
-                // run exactly once, in entry_word_block, same as always;
+                // (which is why this is emitted first, still in this
+                // entry's ordinary block, rather than after them —
+                // deliberately NOT switching to the body block yet, so the
+                // preambles still run exactly once, same as always;
                 // switching early would make them run a second time inside
-                // body_block too, wrongly subjecting the external-entry
+                // the body block too, wrongly subjecting the external-entry
                 // bypass path to checks it must never pay): unconditionally
-                // false for in_delay_slot (an internal edge into entry_word
-                // is never a delay-slot landing) and vbase|entry_word*4 for
+                // false for in_delay_slot (an internal edge into an entry
+                // word is never a delay-slot landing) and vbase|word*4 for
                 // pc. This is what lets exception_entry_word_block below
                 // assume state is already correct with no runtime check of
                 // its own — see its doc comment.
@@ -1065,7 +1171,7 @@ impl Codegen {
                 // this internal-edge visit somehow followed an earlier,
                 // same-call external foreign-slot visit to this same word —
                 // but that specific sequence can't actually happen: the
-                // pre-existing foreign-slot check on entry_word's own
+                // pre-existing foreign-slot check on this entry word's own
                 // fallthrough exit (below, `is_foreign_slot`) always exits
                 // the function immediately on that path, so a genuine
                 // foreign-slot arrival never continues on to any internal
@@ -1077,19 +1183,19 @@ impl Codegen {
                 let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
                 let pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
                 let vbase = ctx.builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1));
-                let fault_pc = ctx.builder.ins().iadd_imm_s(vbase, (entry_word as i64) * 4);
+                let fault_pc = ctx.builder.ins().iadd_imm_s(vbase, (word as i64) * 4);
                 ctx.builder.ins().store(mem, fault_pc, ctx.core_ptr, pc_off);
                 let false_flag = ctx.builder.ins().iconst(ir::types::I8, 0);
                 ctx.builder.ins().store(mem, false_flag, ctx.core_ptr, flag_off);
             }
 
-            // entry_word_block's preamble is unconditional (every internal
-            // edge into entry_word — a backward branch, say — still needs
-            // it, skip_entry_preamble or not); the only thing that changes
-            // is where the *semantics* get emitted: in entry_word_block
-            // itself normally, or in the separate entry_word_body_block
-            // when skip_entry_preamble is set, with entry_word_block
-            // reduced to just "run the preamble, then jump there".
+            // An entry word's ordinary-block preamble is unconditional
+            // (every internal edge into it — a backward branch, say — still
+            // needs it, skip_entry_preamble or not); the only thing that
+            // changes is where the *semantics* get emitted: in that
+            // ordinary block itself normally, or in its dedicated body
+            // block when skip_entry_preamble is set, with the ordinary
+            // block reduced to just "run the preamble, then jump there".
             //
             // A single preamble suffices now: the CP0 Compare timer fires on
             // the hptimer thread and raises IP7 through `hot.interrupts`
@@ -1122,7 +1228,7 @@ impl Codegen {
             // and traceback lookups keyed on pc find the wrong, earlier one.
             #[cfg(feature = "developer")]
             if !instrs[word as usize].is_fallback {
-                let origin = if word == entry_word {
+                let origin = if is_entry_point {
                     dev_trace_origin::JIT_ENTRY_BACK_EDGE
                 } else if instrs[word as usize].is_branch_fallback_successor {
                     dev_trace_origin::FALLBACK_SUCCESSOR
@@ -1141,8 +1247,8 @@ impl Codegen {
             // own entry; incrementing here too would double-count).
             emit_account_for_cycles(&mut ctx, instrs, word);
 
-            if word == entry_word {
-                if let Some(body_block) = entry_word_body_block {
+            if is_entry_point {
+                if let Some(&body_block) = entry_body_blocks.get(&word) {
                     ctx.builder.ins().jump(body_block, &[]);
                     ctx.builder.switch_to_block(body_block);
                 }
@@ -1233,7 +1339,7 @@ impl Codegen {
                 #[cfg(feature = "jitv2_lockstep")]
                 let region_ending = instrs[word as usize].fallthrough_exit.is_some();
                 #[cfg(feature = "jitv2_lockstep")]
-                let ls_live = word == entry_word || instrs[word as usize].is_branch_fallback_successor;
+                let ls_live = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
                 #[cfg(feature = "jitv2_lockstep")]
                 let ls_bracket = !ls_live;
                 #[cfg(feature = "jitv2_lockstep")]
@@ -1269,6 +1375,12 @@ impl Codegen {
                         emit(&mut ctx);
                     } else {
                         let emit = lookup_cp1_semantics(raw).expect("checked above");
+                        // Per-instruction CU1 check, right before this CP1
+                        // instruction's own semantics — mirrors the
+                        // interpreter's own per-handler check exactly (see
+                        // emit_cp1_cu1_guard's doc comment for why this
+                        // can't be hoisted to entry/region granularity).
+                        emit_cp1_cu1_guard(&mut ctx);
                         emit(&mut ctx, fr_mode);
                     }
                 }
@@ -1331,7 +1443,7 @@ impl Codegen {
                 // pending-transfer and plain arrival paths (the entry word never
                 // needed two static versions here either).
                 let needs_foreign_slot_check =
-                    word == entry_word || instrs[word as usize].is_branch_fallback_successor;
+                    is_entry_point || instrs[word as usize].is_branch_fallback_successor;
                 if needs_foreign_slot_check {
                     let mem = MemFlagsData::trusted();
                     let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
@@ -1392,10 +1504,11 @@ impl Codegen {
         for &(_, block) in &instr_blocks {
             builder.seal_block(block);
         }
-        if let Some(body_block) = entry_word_body_block {
-            // Single predecessor (entry_word_block's own preamble-then-jump),
-            // known from the moment it was emitted above — sealable here
-            // alongside every other block, same as the rest of pass 3.
+        // Each entry's body block has a single predecessor (that entry's own
+        // ordinary-block preamble-then-jump), known from the moment it was
+        // emitted above — sealable here alongside every other block, same
+        // as the rest of pass 3.
+        for &body_block in entry_body_blocks.values() {
             builder.seal_block(body_block);
         }
         builder.seal_block(exit_block);
@@ -1476,7 +1589,7 @@ impl Codegen {
         // push_placeholder's own doc comment for why this can't wait until
         // finalize time. finalize_batch/finalize_batch_nonforced fill in
         // the real PublishInfo (patch_pending_publish) once they have one.
-        self.seal_handle.push_placeholder(range.0, range.1);
+        self.seal_handle.push_placeholder(range.0, range.1, page);
         // Read code size before clearing context (compiled_code is cleared
         // by clear_context) — same pattern as rex3_jit/compiler.rs and
         // jit/compiler.rs. Captured into a field rather than returned
@@ -1516,6 +1629,24 @@ impl Codegen {
     /// specifically cannot tolerate a deferred pointer). Thin wrapper around
     /// `compile_region_uncommitted` + an immediate one-function
     /// `finalize_batch` call.
+    /// §13.4 single-entry compatibility wrapper: same signature every
+    /// existing caller (equivalence tests, `jitv2_verify`, this module's own
+    /// unit tests) already uses — takes an `instrs` buffer produced by a
+    /// plain `Analyzer::walk`/`walk_bounded` call (which knows nothing about
+    /// `is_entry_point` or `has_fpu`, both new §13 concepts) and adapts it
+    /// to `compile_region_uncommitted`'s real multi-entry-capable signature:
+    /// marks `entry_word` as this region's one entry point (mirroring what
+    /// `Analyzer::walk_multi_entry` would have done for a real multi-entry
+    /// caller) and computes `has_fpu` the same way `walk_multi_entry` does,
+    /// since a plain single-entry `walk` never had a reason to. `j2wp`
+    /// production code (`comp.rs`'s `handle_request`/`handle_request_deferred`)
+    /// does NOT go through this — it calls `walk_multi_entry` directly and
+    /// threads its `has_fpu` straight into `compile_region_uncommitted`, no
+    /// re-derivation needed. The default (`not(j2wp)`) path's `comp.rs`
+    /// still uses this directly as its real, single-entry production
+    /// compile call — `page` is passed as null there too (this synchronous
+    /// path finalizes immediately below, so the seal-queue placeholder never
+    /// dangles long enough for `j2 seal-queue`'s page stamp to matter).
     pub fn compile_region(
         &mut self,
         instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE],
@@ -1523,7 +1654,15 @@ impl Codegen {
         compiled_for_fr1: bool,
         skip_entry_preamble: bool,
     ) -> Option<crate::jitv2::JitFn> {
-        let func_id = self.compile_region_uncommitted(instrs, entry_word, compiled_for_fr1, skip_entry_preamble)?;
+        instrs[entry_word as usize].is_entry_point = true;
+        let has_fpu = instrs_linear(instrs).any(|i| crate::jitv2::analyzer::is_fpu_instruction(i.raw));
+        // No real PhysicalCodePage available at this API's call sites
+        // (test-only — see this function's own doc comment) — null is fine,
+        // same as any other diagnostic-only field with nothing real to
+        // report; this compile always finalizes immediately below anyway,
+        // so its seal-queue placeholder is never left dangling long enough
+        // for the page stamp to matter.
+        let func_id = self.compile_region_uncommitted(instrs, compiled_for_fr1, skip_entry_preamble, has_fpu, std::ptr::null_mut())?;
         self.finalize_batch(&[func_id]).into_iter().next()
     }
 
@@ -1572,8 +1711,8 @@ impl Codegen {
                 // fine here since nothing ever reads it back out for this
                 // entry (try_seal_ready's return value is discarded below).
                 let publish = crate::jitv2::paged_memory::PublishInfo {
-                    page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0,
                     jit_fn: Some(jit_fn),
+                    ..crate::jitv2::paged_memory::PublishInfo::blank()
                 };
                 self.seal_handle.patch_pending_publish(start, end, publish, true);
                 jit_fn
@@ -1598,10 +1737,15 @@ impl Codegen {
     /// happened to complete a longer contiguous run that had been waiting
     /// on it), or empty if this entry itself is now the one blocked behind
     /// an earlier gap (retry later: another non-forced call, or the
-    /// seal-quiesce barrier's forced sweep).
+    /// seal-quiesce barrier's forced sweep) OR `finalize_definitions()`
+    /// itself failed outright — check `last_finalize_failed()` immediately
+    /// after an empty return to tell the two apart; only the gap-blocked
+    /// case will ever resolve on its own.
     pub fn finalize_batch_nonforced(&mut self, id: cranelift_module::FuncId, publish: crate::jitv2::paged_memory::PublishInfo) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+        self.last_finalize_failed = false;
         let (start, end) = *self.func_ranges.get(&id).expect("finalize_batch_nonforced: id has no reserved seal-queue range — compile_region_uncommitted must run first");
         if self.module.finalize_definitions().is_err() {
+            self.last_finalize_failed = true;
             self.func_ranges.remove(&id);
             return Vec::new();
         }
@@ -1704,71 +1848,68 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
     ctx.builder.seal_block(continue_block);
 }
 
-/// Region-wide FPU entry guard: emitted once, in `entry_block`, only when
-/// the region being compiled contains at least one CP1 instruction — cheaper
-/// than repeating a CU1/FR-mode check per FPU instruction, and correct
-/// because both are region-wide invariants: `STATUS_CU1`/`STATUS_FR` cannot
-/// change mid-region (the only instructions that touch CP0.Status, MTC0/
-/// ERET, are `Excluded` and end the region on contact, §4.4).
+/// Region-wide FR-mode guard: emitted once, in `entry_block`, only when the
+/// region being compiled contains at least one CP1 instruction — legitimate
+/// as a region-wide check because `STATUS_FR` cannot change mid-region (the
+/// only instructions that touch CP0.Status, MTC0/ERET, are `Excluded` and
+/// end the region on contact, §4.4), so the very first entry checks it once
+/// on behalf of everything the rest of the region will FPR-access-emit.
 ///
-/// The two failure modes are architecturally very different and get
-/// different treatment, checked in real-hardware precedence order (CU1
-/// gates everything — a real CPU never even looks at FR mode if CU1 is
-/// clear):
+/// **Does NOT check CU1** — see `emit_cp1_cu1_guard`'s own doc comment for
+/// why that must be a per-CP1-instruction check, not a region/entry-wide
+/// one (§13.4 correction: an earlier version of this function checked both
+/// here, which was wrong on two counts — CU1-clear is a real per-instruction
+/// exception, and "this function" is no longer "one region, one entry" once
+/// a page's many entries can share it, so a region-wide entry check fired
+/// for entries whose own reachable code never touches CP1 at all).
 ///
-/// - **CU1 clear**: a real, opcode-independent MIPS exception (`EXC_CPU`,
-///   with `Cause.CE` identifying CP1). The exact exception code is known
-///   statically at compile time — no need to defer to the interpreter to
-///   determine *what* went wrong, only to `handle_exception_fn`
-///   (`deliver_exception`, §4.2 single-implementation delivery) to compute
-///   EPC/Cause/vector, same as `emit_exception_exit` does for every other
-///   JIT-detected fault. `Cause.CE` needs a direct store first —
-///   `deliver_exception` only ever touches `CAUSE_EXCCODE_MASK`, never CE.
-///
-/// - **FR mismatch** (believed unreachable for any real compiled guest
-///   binary — see the FrMode doc comment): NOT an architectural exception at
-///   all — it means this *entire compiled artifact* was built assuming a
-///   `STATUS_FR` value that's no longer live, so every FPR-access emitter in
-///   it uses the wrong register-packing scheme. Unlike CU1, simply
-///   continuing (even via the interpreter) isn't enough — this exact
-///   function must never be dispatched again. Kills the entry
-///   (`kill_entry_fn` — see its own doc comment) so the JIT gate stops
-///   re-selecting it, then forces one real interpreter dispatch
-///   (`interp_fallback_fn`) so this instruction still makes progress today;
-///   the *next* visit to this PC gets a genuine fresh compile against
-///   whatever FR mode is live then.
+/// FR mismatch (believed unreachable for any real compiled guest binary —
+/// see the `FrMode` doc comment): NOT an architectural exception at all —
+/// it means this *entire compiled artifact* was built assuming a
+/// `STATUS_FR` value that's no longer live, so every FPR-access emitter in
+/// it uses the wrong register-packing scheme. Continuing (even via the
+/// interpreter) isn't enough — this exact function must never be
+/// dispatched again for this entry. Kills the entry (`kill_entry_fn` — see
+/// its own doc comment) so the JIT gate stops re-selecting it, then forces
+/// one real interpreter dispatch (`interp_fallback_fn`) so this instruction
+/// still makes progress today; the *next* visit to this PC gets a genuine
+/// fresh compile against whatever FR mode is live then.
 ///
 /// `compiled_for_fr1` is the FR mode this whole region was compiled against
 /// (`FrMode::Fr1` if `STATUS_FR` was set when compilation started); the
 /// guard checks whether the live bit still agrees.
-fn emit_fpu_entry_guard(ctx: &mut EmitCtx, entry_word: WordOffset, compiled_for_fr1: bool) {
+///
+/// §13.4: `entry_offset_val` (runtime I32, `core.pc`'s live entry offset —
+/// see the dispatch head this runs just before, in `entry_block`) replaces
+/// the old compile-time `entry_word: WordOffset` — see `emit_kill_entry`'s
+/// own doc comment for why a compile-time constant no longer exists at this
+/// point once a function can serve more than one entry.
+fn emit_fr_mode_guard(ctx: &mut EmitCtx, entry_offset_val: Value, compiled_for_fr1: bool) {
     let mem = MemFlagsData::trusted();
     let status_off = ir::immediates::Offset32::new(core_offset_of_cp0_status());
     let status = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, status_off);
 
-    let cu1_clear = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_CU1 as i64);
-    let cu1_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, cu1_clear, 0);
+    // CU1 gates everything on real hardware — a CPU never even looks at FR
+    // mode if CU1 is clear (this function's own doc comment). Since CU1 is
+    // now checked per-instruction (emit_cp1_cu1_guard), not here, THIS check
+    // must not fire at all when CU1 is clear: the real fault (if the
+    // dispatched entry's control flow ever reaches a CP1 instruction) has to
+    // come from that per-instruction check instead, at the actual
+    // instruction, not from this entry-time check jumping the queue and
+    // reporting a wrong-shaped fault (found live: a region compiled for
+    // FR1, dispatched with CU1 AND FR both clear, hit this FR-mismatch arm
+    // before the real CU1 fault ever got a chance to fire — this exact
+    // ordering bug).
+    let cu1_bit = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_CU1 as i64);
+    let cu1_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cu1_bit, 0);
 
-    let cu1_block = ctx.builder.create_block();
-    let fr_check_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(cu1_bad, cu1_block, &[], fr_check_block, &[]);
-
-    // Cold: CU1 disabled is the rare case for any region that actually
-    // contains FPU instructions (real guest code enables it once, early,
-    // and leaves it on).
-    ctx.builder.switch_to_block(cu1_block);
-    ctx.builder.set_cold_block(cu1_block);
-    ctx.builder.seal_block(cu1_block);
-    emit_materialize_cpu_unusable(ctx);
-
-    ctx.builder.switch_to_block(fr_check_block);
-    ctx.builder.seal_block(fr_check_block);
     let fr_bit = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_FR as i64);
-    let fr_mismatch = if compiled_for_fr1 {
+    let fr_mismatch_if_cu1_set = if compiled_for_fr1 {
         ctx.builder.ins().icmp_imm_s(IntCC::Equal, fr_bit, 0)
     } else {
         ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, fr_bit, 0)
     };
+    let fr_mismatch = ctx.builder.ins().band(cu1_set, fr_mismatch_if_cu1_set);
 
     let bail_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
@@ -1780,20 +1921,75 @@ fn emit_fpu_entry_guard(ctx: &mut EmitCtx, entry_word: WordOffset, compiled_for_
     ctx.builder.switch_to_block(bail_block);
     ctx.builder.set_cold_block(bail_block);
     ctx.builder.seal_block(bail_block);
-    emit_kill_entry(ctx, entry_word);
+    // I32 for kill_entry_fn's ABI (narrow extern "C" params aren't reliably
+    // zero-extended — see kill_entry_fn's doc comment); I64 for
+    // emit_interp_fallback_exit's word-offset arithmetic against vbase.
+    let entry_offset_i32 = ctx.builder.ins().ireduce(ir::types::I32, entry_offset_val);
+    emit_kill_entry(ctx, entry_offset_i32);
     // Not a plain emit_bail: see emit_interp_fallback_exit's doc comment for
     // why a bail here can't force the interpreter's real semantics to
     // actually run (also true here: without this, the killed entry's own
     // interpreter re-dispatch would depend on exec_decoded's gate falling
-    // through correctly, an extra dependency this makes unnecessary).
-    emit_interp_fallback_exit(ctx, entry_word);
+    // through correctly, an extra dependency this makes unnecessary). No PC
+    // materialization needed — see emit_interp_fallback_exit's own doc
+    // comment: live core.pc is already correct here, at the top of
+    // entry_block.
+    emit_interp_fallback_exit(ctx);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
+/// Per-CP1-instruction CU1 (coprocessor-1-usable) check — emitted right
+/// before EVERY CP1 instruction's own semantics, mirroring the interpreter
+/// exactly: each CP1 handler (`exec_cfc1`, `exec_add_s`, ...) independently
+/// checks `if (cp0_status & STATUS_CU1) == 0 { return cpu_unusable(1) }` at
+/// its own top, not once per function/region/entry.
+///
+/// §13.4 correction: an earlier version of this codegen checked CU1 once,
+/// region-wide, at function entry (`emit_fr_mode_guard`'s predecessor,
+/// folded both checks together) — wrong on real-hardware semantics (CU1 is
+/// a *per-instruction* fault: an entry whose reachable code never executes
+/// a CP1 instruction on a given path must never fault at all, and a path
+/// that reaches CP1 only after some branches must fault exactly where the
+/// real CP1 instruction is, not at function/entry start) and, once one
+/// function serves many entries (§13), wrong on top of that: entries with
+/// no CP1 in their own reachable set were paying (and could spuriously
+/// fault from) a check that had nothing to do with them, since `has_fpu`
+/// is a whole-region property, not a per-entry one.
+///
+/// Uses `ctx` as-is (the calling instruction's own `word`/`bd`/
+/// `trust_live_pc_bd_on_exc`) so `emit_exception_exit` (via
+/// `emit_materialize_cpu_unusable`) routes and materializes EPC exactly
+/// like any other per-instruction fault this module detects (a memory
+/// access fault, an overflow trap, ...) — no special-casing needed here
+/// beyond calling it at the right point in pass 2, immediately before the
+/// CP1 instruction's real emitter runs.
+fn emit_cp1_cu1_guard(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let status_off = ir::immediates::Offset32::new(core_offset_of_cp0_status());
+    let status = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, status_off);
+    let cu1_clear = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_CU1 as i64);
+    let cu1_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, cu1_clear, 0);
+
+    let cu1_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(cu1_bad, cu1_block, &[], continue_block, &[]);
+
+    // Cold: CU1 disabled is the rare case for any region that actually
+    // contains FPU instructions (real guest code enables it once, early,
+    // and leaves it on).
+    ctx.builder.switch_to_block(cu1_block);
+    ctx.builder.set_cold_block(cu1_block);
+    ctx.builder.seal_block(cu1_block);
+    emit_materialize_cpu_unusable(ctx);
 
     ctx.builder.switch_to_block(continue_block);
     ctx.builder.seal_block(continue_block);
 }
 
 /// Materialize a real `EXC_CPU` (Coprocessor Unusable, CP1) exception and
-/// deliver it via `handle_exception_fn` — the `emit_fpu_entry_guard`
+/// deliver it via `handle_exception_fn` — the `emit_cp1_cu1_guard`
 /// counterpart to `MipsExecutor::cpu_unusable(1)`. `Cause.CE` needs a direct
 /// store first: `deliver_exception` (what `handle_exception_fn` calls) only
 /// ever touches `Cause.ExcCode`, never the CE field — mirrors
@@ -1824,7 +2020,15 @@ fn emit_materialize_cpu_unusable(ctx: &mut EmitCtx) {
 /// Call `core.kill_entry_fn(jit_ctx, entry_offset)` — see
 /// `MipsCore::kill_entry_fn`'s doc comment. Not a terminator; caller
 /// continues on (typically into `emit_interp_fallback_exit` right after).
-fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset: u16) {
+///
+/// §13.4: `entry_offset_val` is a runtime `Value` (I32), not a compile-time
+/// constant — the FPU/FR guard (this function's only caller) runs once in
+/// `entry_block`, *before* the dispatch head has resolved which of this
+/// compile's possibly-several entry points the live call is actually for,
+/// so there is no single compile-time offset to bake in anymore. The caller
+/// passes the same `live_entry_offset` value the dispatch head itself
+/// computes from `core.pc`, truncated to I32 (see its own call site).
+fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
@@ -1839,10 +2043,7 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset: u16) {
     sig.params.push(AbiParam::new(ir::types::I32)); // entry_offset
     let sig_ref = ctx.builder.import_signature(sig);
 
-    // I32, not I16 — see kill_entry_fn's doc comment (narrow extern "C"
-    // params aren't reliably zero-extended by every caller/ABI).
-    let offset_val = ctx.builder.ins().iconst(ir::types::I32, entry_offset as i64);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, offset_val]);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, entry_offset_val]);
 }
 
 /// Jump to the function's shared exit-to-interpreter block (`BlockSkeleton::
@@ -1859,7 +2060,7 @@ fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
 
 /// Force real forward progress through `core.interp_fallback_fn` instead of
 /// a plain bail, for a condition compiled code detected but can't itself
-/// resolve (`emit_fpu_entry_guard`'s CU1/FR mismatch — the only caller).
+/// resolve (`emit_fr_mode_guard`'s FR mismatch — the only caller).
 /// A plain `emit_bail` just re-sets `core.pc` back to this same instruction
 /// and returns `EXEC_COMPLETE`, which `exec_decoded`'s caller can't tell
 /// apart from a real retirement — if this word is still published/hot, the
@@ -1867,20 +2068,25 @@ fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
 /// bails again, forever, without the interpreter's real semantics (the
 /// `cpu_unusable` exception, in the FPU guard's case) ever actually running
 /// (found live: `cfc1` with CU1 clear spun in place indefinitely). Instead,
-/// write `core.pc` to this instruction's real address (`interp_fallback_fn`
-/// fetches/decodes/dispatches whatever's *there*, same as any other
-/// interpreter step), call it, and return its status directly — whatever
-/// the interpreter's real handler actually did (retired, faulted, retried)
-/// is the true result of this compiled unit's dispatch, not a synthetic
-/// "nothing happened, try again" signal. Terminates the current block.
-fn emit_interp_fallback_exit(ctx: &mut EmitCtx, word_offset: WordOffset) {
+/// call `interp_fallback_fn` (which fetches/decodes/dispatches whatever's
+/// at live `core.pc`, same as any other interpreter step) and return its
+/// status directly — whatever the interpreter's real handler actually did
+/// (retired, faulted, retried) is the true result of this compiled unit's
+/// dispatch, not a synthetic "nothing happened, try again" signal.
+/// Terminates the current block.
+///
+/// §13.4: does **not** materialize `core.pc` before calling — this
+/// function's only caller (the FPU/FR guard) runs at the very top of
+/// `entry_block`, before this compiled function has touched `core.pc` at
+/// all, so live `core.pc` is already exactly this dispatch's real entry
+/// address (the same value the dispatch head's own `live_entry_offset` was
+/// just derived from a few instructions earlier) — writing it again would
+/// recompute a value already sitting there unchanged. If this function ever
+/// gains a second caller from somewhere `core.pc` might be stale, that
+/// caller is responsible for materializing it first.
+fn emit_interp_fallback_exit(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
-    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
-
-    let vbase = emit_vbase(ctx);
-    let target_pc = ctx.builder.ins().iadd_imm_s(vbase, (word_offset as i64) * 4);
-    ctx.builder.ins().store(mem, target_pc, ctx.core_ptr, pc_off);
 
     let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
     let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
@@ -3643,12 +3849,12 @@ fn emit_exception_entry_word_block_body(
 /// a fresh copy of the whole delay-slot-check-and-raise sequence at every
 /// call site — the exception-exit counterpart of `emit_bail`. Picks
 /// `ctx.exception_entry_word_block` or `ctx.exception_other_word_block` at
-/// *compile* time based on `ctx.word == ctx.entry_word` (always known when
+/// *compile* time based on `ctx.trust_live_pc_bd_on_exc` (always known when
 /// emitting a given call site — see `BlockSkeleton`'s doc comment for why
 /// this avoids the runtime check a single fully-shared block would need).
 fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
     if ctx.trust_live_pc_bd_on_exc {
-        // entry_word (state set by the interpreter dispatch that reached it)
+        // entry word (state set by the interpreter dispatch that reached it)
         // or a branch-fallback successor (state set by the BC1 fallback's
         // interpreter run) — `core.pc`/`core.in_delay_slot` are already
         // correct and must NOT be overwritten from the compile-time word/bd
@@ -5771,12 +5977,13 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
     let op = (raw >> 26) & 0x3F;
     // LWC1/LDC1/SWC1/SDC1 are architecturally plain memory ops (separate
     // top-level opcodes, not OP_COP1-encoded), but they read/write an FPR —
-    // routed through this table anyway, not lookup_semantics, so
-    // has_fpu_instruction's single check keeps being the one true trigger
-    // for emit_fpu_entry_guard's region-wide CU1/FR check (see that
-    // function's doc comment): a region containing only e.g. LWC1 must
-    // still get the guard, and putting these in the integer table would
-    // silently skip it.
+    // routed through this table anyway, not lookup_semantics, so (a)
+    // is_fpu_instruction's single check keeps being the one true trigger for
+    // emit_fr_mode_guard's region-wide FR check (a region containing only
+    // e.g. LWC1 must still get it) and (b) they go through the same
+    // per-instruction emit_cp1_cu1_guard call every other CP1-table entry
+    // does (pass 2's `lookup_cp1_semantics` arm) — putting these in the
+    // integer table would silently skip both.
     match op {
         OP_LWC1 => return Some(emit_lwc1),
         OP_LDC1 => return Some(emit_ldc1),
@@ -6583,7 +6790,7 @@ fn fused_lui_imm32(lui_raw: u32, next_raw: u32) -> Option<i64> {
 ///   nothing to peek at, and 0xFFC-adjacent words have their own hazards
 ///   this function doesn't need to reason about — just don't fuse.
 /// - **`word` can be arrived at as a foreign delay slot at runtime**
-///   (`word == entry_word`, or `instrs[word].is_branch_fallback_successor`):
+///   (`instrs[word].is_entry_point`, or `instrs[word].is_branch_fallback_successor`):
 ///   mirrors the interpreter's own `exec_lui_imm32`/`exec_lui_simm32` guard
 ///   (`if self.core.in_delay_slot { ...don't fuse... }`, mips_exec.rs). Such
 ///   an arrival means *this* LUI may actually be some other, outside-the-
@@ -6621,7 +6828,7 @@ fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PA
     }
     #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer"))))]
     {
-        if word == ctx.entry_word || instrs[word as usize].is_branch_fallback_successor {
+        if instrs[word as usize].is_entry_point || instrs[word as usize].is_branch_fallback_successor {
             return 0;
         }
         let next_word = word + 1;
@@ -6942,13 +7149,13 @@ fn emit_sdr(ctx: &mut EmitCtx) {
 
 /// LWC1 ft, imm(rs): load a word from memory into FPR `ft`'s low 32 bits.
 /// Mirrors `MipsExecutor::exec_lwc1`'s `(self.fpr_write_w)(...)` — the CU1
-/// check that handler does first is instead the region-wide
-/// `emit_fpu_entry_guard`, triggered by this being registered in
-/// `lookup_cp1_semantics` (not `lookup_semantics`) despite not being
-/// `OP_COP1`-encoded — see that function's doc comment for why: a region
-/// containing only LWC1/LDC1/SWC1/SDC1 must still get the guard, and
-/// `has_fpu`'s single check (`lookup_cp1_semantics(..).is_some()`) is the
-/// one true trigger for it.
+/// check that handler does first is `emit_cp1_cu1_guard`, emitted per this
+/// instruction's own dispatch site (pass 2's `lookup_cp1_semantics` arm),
+/// same as every other CP1-table entry, triggered by this being registered
+/// in `lookup_cp1_semantics` (not `lookup_semantics`) despite not being
+/// `OP_COP1`-encoded — see that function's doc comment for why: LWC1/LDC1/
+/// SWC1/SDC1 must get both the per-instruction CU1 check and count toward
+/// `is_fpu_instruction`'s region-wide FR-mode-guard trigger.
 fn emit_lwc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let imm = field_imm16_sext(ctx.builder, ctx.raw);
@@ -7425,7 +7632,7 @@ mod tests {
                 // Test harness for preamble emitters only (see this
                 // function's doc comment) — never touches cycles bookkeeping.
                 let mut unused_cycles_pending = 0u32;
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, entry_word: word_offset, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -7469,12 +7676,12 @@ mod tests {
         // function pointer segfaults on call.
         let range = codegen.seal_handle.take_last_allocation()
             .expect("define_function must have allocated real memory");
-        codegen.seal_handle.push_placeholder(range.0, range.1);
+        codegen.seal_handle.push_placeholder(range.0, range.1, std::ptr::null_mut());
         codegen.module.finalize_definitions().unwrap();
         let code_ptr = codegen.module.get_finalized_function(func_id);
         let publish = crate::jitv2::paged_memory::PublishInfo {
-            page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0,
             jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
+            ..crate::jitv2::paged_memory::PublishInfo::blank()
         };
         codegen.seal_handle.patch_pending_publish(range.0, range.1, publish, true);
         // Leak the module so the JIT-compiled code stays valid for the
@@ -7555,12 +7762,12 @@ mod tests {
         // this harness bypasses compile_region_uncommitted too.
         let range = codegen.seal_handle.take_last_allocation()
             .expect("define_function must have allocated real memory");
-        codegen.seal_handle.push_placeholder(range.0, range.1);
+        codegen.seal_handle.push_placeholder(range.0, range.1, std::ptr::null_mut());
         codegen.module.finalize_definitions().unwrap();
         let code_ptr = codegen.module.get_finalized_function(func_id);
         let publish = crate::jitv2::paged_memory::PublishInfo {
-            page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0,
             jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
+            ..crate::jitv2::paged_memory::PublishInfo::blank()
         };
         codegen.seal_handle.patch_pending_publish(range.0, range.1, publish, true);
         std::mem::forget(codegen.module);
@@ -7625,14 +7832,13 @@ mod tests {
         let (instrs, non_empty) = analyzer.walk(&page, entry_word, 0);
         assert!(non_empty);
         let mut instrs_owned = *instrs;
-        codegen.compile_region_uncommitted(&mut instrs_owned, entry_word, true, true)
+        instrs_owned[entry_word as usize].is_entry_point = true;
+        codegen.compile_region_uncommitted(&mut instrs_owned, true, true, false, std::ptr::null_mut())
             .expect("a plain ADDIU must have a real emitter")
     }
 
     fn dummy_publish() -> crate::jitv2::paged_memory::PublishInfo {
-        crate::jitv2::paged_memory::PublishInfo {
-            page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0, jit_fn: None,
-        }
+        crate::jitv2::paged_memory::PublishInfo::blank()
     }
 
     #[test]
@@ -7647,6 +7853,41 @@ mod tests {
         let id = compile_one_addiu(&mut codegen, 0);
         let sealed = codegen.finalize_batch_nonforced(id, dummy_publish());
         assert!(sealed.is_empty(), "a lone small batch's page is still open — non-forced must not seal it");
+    }
+
+    #[test]
+    fn seal_queue_snapshot_stamps_the_real_page_and_thread_of_a_still_unpatched_entry() {
+        // j2 seal-queue's whole reason to exist: naming exactly which
+        // compile is stuck (page + thread), not just "some placeholder,
+        // somewhere." A page that's never been finalized (compile_region_uncommitted
+        // ran, patch_pending_publish never did) must still show up here with
+        // its real identity — that's the unpatched-placeholder case this
+        // diagnostic exists for.
+        use crate::jitv2::PhysicalCodePage;
+        use std::sync::atomic::AtomicU64;
+        let counter = AtomicU64::new(0);
+        let mut page = PhysicalCodePage::new(0x1234, &counter as *const AtomicU64);
+        let mut codegen = Codegen::new();
+        let mut instrs = [JIT_REGION_BOUNDARY_SENTINEL; ENTRIES_PER_PAGE];
+        instrs[0] = (OP_ADDIU << 26) | (1 << 16) | 1;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk(&instrs, 0, 0);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        instrs_owned[0].is_entry_point = true;
+        let this_thread = std::thread::current().id();
+        codegen.compile_region_uncommitted(&mut instrs_owned, true, true, false, &mut page as *mut PhysicalCodePage)
+            .expect("a plain ADDIU must have a real emitter");
+
+        let snap = codegen.seal_queue_snapshot();
+        assert_eq!(snap.queue_len, 1, "the just-reserved, still-unpatched placeholder must be the only entry");
+        assert_eq!(snap.front_is_unpatched_placeholder, Some(true),
+            "compile_region_uncommitted alone (no finalize_batch_nonforced call yet) must leave the entry unpatched");
+        assert_eq!(snap.front_thread_id, Some(this_thread),
+            "the entry must be stamped with the thread that actually called push_placeholder");
+        assert_eq!(snap.front_page, Some(&mut page as *mut PhysicalCodePage),
+            "the entry must be stamped with the real page passed to compile_region_uncommitted, \
+             not PublishInfo::page (which stays null until patch_pending_publish runs)");
     }
 
     #[test]
@@ -7665,6 +7906,10 @@ mod tests {
 
         let sealed = codegen.finalize_batch_nonforced(second, dummy_publish());
         assert!(sealed.is_empty(), "second's range must stay blocked behind first's un-patched gap");
+        assert!(!codegen.last_finalize_failed(),
+            "a normal gap-block is not a finalize failure — last_finalize_failed must stay false, \
+             or comp.rs's handle_request_deferred would wrongly skip incrementing `pending` for an \
+             entry that's genuinely still waiting on a sweep, not permanently stuck");
 
         // Finalizing the first now makes the combined range contiguous from
         // the watermark, but still just two tiny instructions — nowhere
@@ -7673,6 +7918,41 @@ mod tests {
         // does that for a still-open page).
         let sealed = codegen.finalize_batch_nonforced(first, dummy_publish());
         assert!(sealed.is_empty(), "combined range is contiguous now but still within one still-open page — non-forced must not seal it");
+        assert!(!codegen.last_finalize_failed(), "still just a gap-block, not a real failure");
+    }
+
+    #[test]
+    fn seal_queue_snapshot_finds_the_real_gap_behind_a_patched_contiguous_front() {
+        // Confirmed live shape: j2 seal-queue's front entry can be fully
+        // patched (unpatched_placeholder=false) with a queue_len in the
+        // thousands and nothing draining — the front alone is the wrong
+        // place to look. Build exactly that: entry #0 finalized (patched,
+        // contiguous from the watermark), entry #1 left as a bare
+        // push_placeholder (never finalized) — the real, actionable gap.
+        let mut codegen = Codegen::new();
+        let front = compile_one_addiu(&mut codegen, 0);
+        let stuck = compile_one_addiu(&mut codegen, 4);
+
+        let sealed = codegen.finalize_batch_nonforced(front, dummy_publish());
+        // front's own page is still open (too small to seal non-forced —
+        // same reasoning as finalize_batch_nonforced_does_not_seal_a_still_open_page),
+        // so it stays queued: patched, but not yet popped.
+        assert!(sealed.is_empty());
+
+        let snap = codegen.seal_queue_snapshot();
+        assert_eq!(snap.queue_len, 2);
+        assert_eq!(snap.front_is_unpatched_placeholder, Some(false),
+            "sanity: the front entry (front's compile) must be patched — this is the shape that makes \
+             the front alone misleading");
+        assert_eq!(snap.first_gap_index, Some(1),
+            "the scan must walk past the patched, contiguous front and stop at entry #1 (stuck's \
+             still-unpatched placeholder) — that's the entry actually worth investigating");
+        assert_eq!(snap.first_gap_is_unpatched_placeholder, Some(true));
+
+        let entries = codegen.seal_queue_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(!entries[0].2, "entries[0] (front) must report patched");
+        assert!(entries[1].2, "entries[1] (the real gap) must report unpatched");
     }
 
     #[test]

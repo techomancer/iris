@@ -211,6 +211,21 @@ pub fn is_fallback_branch(raw: u32) -> bool {
     op == OP_COP1 && rs == RS_BC1
 }
 
+/// Whether `raw` is any CP1/FPU instruction — arithmetic, move, compare,
+/// convert (`OP_COP1`, any `rs` including `RS_BC1`), indexed FPU load/store
+/// (`OP_COP1X`), or plain FPU load/store (`OP_LWC1`/`OP_LDC1`/`OP_SWC1`/
+/// `OP_SDC1`). Used by [`Analyzer::walk_multi_entry`]/[`Analyzer::walk_bounded`]
+/// to compute a region's `has_fpu` flag as a byproduct of the walk itself
+/// (one scan, at analyzer time) rather than codegen re-scanning the walked
+/// buffer afterward via its own `lookup_cp1_semantics` table — this is a
+/// pure opcode-shape question, the same kind of thing `classify` already
+/// answers, so it belongs here, not duplicated as a second classification
+/// authority in codegen.
+pub fn is_fpu_instruction(raw: u32) -> bool {
+    let op = (raw >> 26) & 0x3F;
+    matches!(op, OP_COP1 | OP_COP1X | OP_LWC1 | OP_LDC1 | OP_SWC1 | OP_SDC1)
+}
+
 /// `Sequential` if `codegen.rs` actually has an emitter for `raw`
 /// (`opcode_support::has_emitter`, the single source of truth shared with
 /// codegen's own lookup tables), `Excluded` otherwise. Before this existed,
@@ -494,6 +509,23 @@ pub struct CompiledInstr {
     /// whichever later word's flush eventually covers it. Meaningless when
     /// `visited` is `false`.
     pub cycles_flush: bool,
+    /// §13.4: `true` iff this word is one of the compile's external entry
+    /// points (a bit set in the `entry_words` passed to
+    /// [`Analyzer::walk_multi_entry`]) — codegen's replacement for the old
+    /// single-`entry_word` scalar comparison (`word == entry_word`) at every
+    /// per-instruction emission site (preamble skip, exception two-stage
+    /// routing, FPU-guard bail target, dual-semantics block choice). Set
+    /// directly by the walk driver on every word it walked *as* an entry
+    /// (not inferred from reachability — a word can be fully reachable as an
+    /// internal instruction and still not be one of this particular
+    /// compile's requested entries). Mirrors `is_slot_only`'s existing
+    /// "upgrade on a later, different-role visit" pattern: a word walked
+    /// first as a plain internal instruction from one entry, then later
+    /// found to itself be a second entry point, gets this flipped `true` by
+    /// the walk driver without needing to re-walk or re-classify it — `visit`
+    /// already computed correct edges for it on the first pass. Meaningless
+    /// when `visited` is `false`.
+    pub is_entry_point: bool,
 }
 
 impl CompiledInstr {
@@ -510,7 +542,7 @@ impl Default for CompiledInstr {
     fn default() -> Self {
         Self {
             visited: false, word: 0, raw: 0, block_id: None, fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false, is_branch_target: false,
-            continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 0, cycles_flush: false,
+            continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 0, cycles_flush: false, is_entry_point: false,
         }
     }
 }
@@ -520,13 +552,51 @@ impl Default for CompiledInstr {
 /// across every job — a page is always exactly 4KB/1024 words, so there's no
 /// reason to heap-allocate a fresh `[CompiledInstr; 1024]` per compile
 /// request. [`Self::walk`] resets the buffer in place before each walk.
+///
+/// §13.4: [`Self::walk_multi_entry`] additionally stores `has_fpu`/`covered`
+/// on `self` as it walks, rather than returning them as a tuple — callers
+/// (`comp.rs`'s `handle_request`/`handle_request_deferred`) read them back
+/// via [`Self::has_fpu`]/[`Self::covered`] once the walk returns, so the
+/// walk's own derived facts live alongside the buffer they were derived
+/// from instead of being threaded separately through every caller.
+/// Overwritten by the next `walk`/`walk_bounded`/`walk_multi_entry` call,
+/// same reuse contract as `instrs` itself.
 pub struct Analyzer {
     instrs: Box<[CompiledInstr; ENTRIES_PER_PAGE]>,
+    has_fpu: bool,
+    covered: Vec<WordOffset>,
 }
 
 impl Analyzer {
     pub fn new() -> Self {
-        Self { instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]) }
+        Self { instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
+    }
+
+    /// Whether the most recent [`Self::walk_multi_entry`] call's merged
+    /// region contained any CP1/FPU instruction (`is_fpu_instruction`).
+    /// Meaningless before the first `walk_multi_entry` call.
+    #[inline]
+    pub fn has_fpu(&self) -> bool {
+        self.has_fpu
+    }
+
+    /// The subset of `entry_words` the most recent [`Self::walk_multi_entry`]
+    /// call actually admitted (didn't decline as excluded-at-entry) —
+    /// borrowed, not cloned; callers that need to keep it past the next walk
+    /// call should copy it out.
+    #[inline]
+    pub fn covered(&self) -> &[WordOffset] {
+        &self.covered
+    }
+
+    /// Owned copy of the most recent walk's buffer — codegen needs `&mut
+    /// [CompiledInstr; ENTRIES_PER_PAGE]` (it writes `block_id` back into
+    /// it), so callers that also want to keep reading `self` (`covered()`/
+    /// `has_fpu()`) via other calls need their own copy rather than holding
+    /// the borrow `walk_multi_entry`'s return value ties to `self`.
+    #[inline]
+    pub fn instrs_snapshot(&self) -> [CompiledInstr; ENTRIES_PER_PAGE] {
+        *self.instrs
     }
 
     /// Walk a region starting at `entry_word` within `page` (§2.3): decode
@@ -578,6 +648,81 @@ impl Analyzer {
         }
         (&self.instrs, non_empty)
     }
+
+    /// §13.4: walk every offset set in `entry_words` into one shared buffer,
+    /// merging their reachable sets. A word reachable from more than one
+    /// entry point is analyzed once (`visit`'s own already-visited
+    /// short-circuit — see its doc comment) and its Cranelift body still only
+    /// gets emitted once by codegen; this is the actual duplication
+    /// elimination §13 exists for. No analyzer-side "is this word also an
+    /// entry point" bookkeeping is needed: entry-hood is purely a codegen-time
+    /// property (bitmap membership), since `visit` already computes correct,
+    /// promotable edges for a word regardless of whether this is its first or
+    /// a later visit (`is_slot_only` promotion is the existing precedent for
+    /// exactly this kind of "upgrade an already-walked word" case).
+    ///
+    /// Returns the merged buffer (same scratch storage `walk_bounded` uses).
+    /// Also stores, on `self` (read back via [`Self::covered`]/
+    /// [`Self::has_fpu`] — see the struct's own doc comment for why these
+    /// live alongside the buffer instead of being returned as a tuple):
+    /// `covered`, the subset of `entry_words` that actually produced a
+    /// non-empty walk (i.e. weren't excluded-at-entry) — callers should
+    /// treat any bit in `entry_words` but not in `covered` as a per-offset
+    /// decline (§6.4 sticky-denylist candidate for that one offset), not
+    /// fail the whole compile; and `has_fpu` (`is_fpu_instruction`, see its
+    /// own doc comment), computed as a byproduct of the same
+    /// `instrs_linear` pass every caller already needs to run over the
+    /// result — codegen's region-wide FR-mode guard (`emit_fr_mode_guard`)
+    /// consumes this instead of re-scanning the buffer itself (the
+    /// per-instruction CU1 check, `emit_cp1_cu1_guard`, doesn't need this at
+    /// all — it's driven directly by each instruction's own opcode during
+    /// pass 2, not by a region-wide flag). Empty `entry_words` produces an empty buffer, empty
+    /// `covered`, `has_fpu = false` — not a caller error (a request whose
+    /// every bit turned out already-covered/denied by the time of the
+    /// pre-compile subsumption check, §13.3 step 4, may legitimately have
+    /// nothing left to walk).
+    pub fn walk_multi_entry(
+        &mut self,
+        page: &[u32; ENTRIES_PER_PAGE],
+        entry_words: &[WordOffset],
+        page_base: u32,
+        max_instrs: usize,
+    ) -> &[CompiledInstr; ENTRIES_PER_PAGE] {
+        self.instrs.fill(CompiledInstr::default());
+        self.covered.clear();
+        let mut any_covered = false;
+        let mut min_visited = WordOffset::MAX;
+        let mut max_visited = 0;
+        for &entry_word in entry_words {
+            let mut budget = Budget::new(max_instrs, entry_word);
+            if visit(&mut self.instrs, page, page_base, entry_word, &mut budget) {
+                // Mark AFTER visit returns, unconditionally — `visit`'s own
+                // already-visited-as-head short-circuit means a word already
+                // marked a real head by an earlier entry's walk is never
+                // reconstructed by this call, so this can't be clobbered by
+                // a later entry in the same loop (see this method's own doc
+                // comment on the `is_slot_only`-promotion precedent this
+                // mirrors).
+                instrs_mark_entry_point(&mut self.instrs, entry_word);
+                self.covered.push(entry_word);
+                any_covered = true;
+                min_visited = min_visited.min(budget.min);
+                max_visited = max_visited.max(budget.max);
+            }
+        }
+        if any_covered {
+            // `compute_cycles_flush` only needs *a* valid re-entry word — it
+            // checks `instrs[t].is_entry_point` for every other entry, so a
+            // single representative (the first covered one) is enough to
+            // drive its `entry_word`-specific "never flush on its own row"
+            // rule (see that function's doc comment); every other entry
+            // point is covered by the `is_entry_point` check the same as any
+            // branch target.
+            compute_cycles_flush(&mut self.instrs, self.covered[0], min_visited, max_visited);
+        }
+        self.has_fpu = instrs_linear(&self.instrs).any(|i| is_fpu_instruction(i.raw));
+        &self.instrs
+    }
 }
 
 /// Remaining instruction-visit budget for a bounded walk (`Analyzer::walk_bounded`),
@@ -614,6 +759,15 @@ impl Budget {
 /// order, so this is just a filter — no separate visit-order log needed.
 pub fn instrs_linear(instrs: &[CompiledInstr; ENTRIES_PER_PAGE]) -> impl Iterator<Item = &CompiledInstr> {
     instrs.iter().filter(|i| i.visited)
+}
+
+/// Flip `offset`'s `is_entry_point` flag — [`Analyzer::walk_multi_entry`]'s
+/// own post-visit marking step, factored out as a free function so it stays
+/// obviously separate from `visit`'s own field-construction sites (this never
+/// runs *during* a walk, only after one entry's walk has fully committed its
+/// edges).
+fn instrs_mark_entry_point(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], offset: WordOffset) {
+    instrs[offset as usize].is_entry_point = true;
 }
 
 /// Mark `offset` visited as a **delay slot** — never charged against
@@ -686,7 +840,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: Some(StopReason::ForeignPageSlot),
             is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
-            is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false,
+            is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false, is_entry_point: false,
         };
         budget.mark_visited(offset);
         return true;
@@ -707,7 +861,7 @@ fn visit_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRI
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
         fallthrough_exit: None, taken_exit: None, is_slot_only: true, is_fallback: false, is_branch_fallback_successor: false,
-        is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false,
+        is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false, is_entry_point: false,
     };
     budget.mark_visited(offset);
     true
@@ -789,7 +943,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
             visited: true, word: offset, raw, block_id: None,
             fallthrough_exit: None, taken_exit: None, is_slot_only: false,
             is_fallback: true, is_branch_fallback_successor: false,
-            is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false,
+            is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot: false, cycles_delta: 1, cycles_flush: false, is_entry_point: false,
         };
         budget.remaining -= 1;
         budget.mark_visited(offset);
@@ -876,7 +1030,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     instrs[offset as usize] = CompiledInstr {
         visited: true, word: offset, raw, block_id: None,
         fallthrough_exit: None, taken_exit: None, is_slot_only: false, is_fallback: false, is_branch_fallback_successor: false,
-        is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot, cycles_delta: 1, cycles_flush: false,
+        is_branch_target: false, continues_to_fallthrough: None, continues_to_taken: None, has_inline_slot, cycles_delta: 1, cycles_flush: false, is_entry_point: false,
     };
     budget.remaining -= 1;
     budget.mark_visited(offset);
@@ -1041,10 +1195,10 @@ fn compute_cycles_flush(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], entry_wo
         }
         let mut flush = instrs[word as usize].is_region_exit();
         if let Some(t) = instrs[word as usize].continues_to_fallthrough {
-            flush |= instrs[t as usize].is_branch_target || t == entry_word;
+            flush |= instrs[t as usize].is_branch_target || instrs[t as usize].is_entry_point || t == entry_word;
         }
         if let Some(t) = instrs[word as usize].continues_to_taken {
-            flush |= instrs[t as usize].is_branch_target || t == entry_word;
+            flush |= instrs[t as usize].is_branch_target || instrs[t as usize].is_entry_point || t == entry_word;
         }
         if !flush {
             continue;
@@ -1657,5 +1811,31 @@ mod tests {
         assert!(!result[0].visited);
         assert!(!result[0].cycles_flush);
         assert!(result[12].cycles_flush, "jr ra's exit-flush is deferred to its own slot (word 12)");
+    }
+
+    #[test]
+    fn cycles_flush_multi_entry_flushes_on_arrival_at_a_non_primary_entry_point() {
+        // walk_multi_entry generalizes compute_cycles_flush's single
+        // `entry_word` special case ("no flush needed, a re-entry there
+        // always arrives with cycles already fresh") to every entry point,
+        // not just the first one walked. Word 1 here is reachable two ways:
+        // as word 0's plain fallthrough, AND as its own independent entry
+        // (e.g. some other guest PC dispatches straight into it) -- if only
+        // the representative entry_word passed to compute_cycles_flush got
+        // the "is a valid re-entry" treatment, word 0's fallthrough edge
+        // into word 1 would wrongly go unflushed, since word 1 is not
+        // is_branch_target (nothing branches to it) and isn't the
+        // representative entry_word (word 0 is).
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop (entry A)
+        page[1] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra (entry B)
+        page[2] = 0; // real NOP delay slot
+        let mut a = Analyzer::new();
+        let result = a.walk_multi_entry(&page, &[0, 1], 0, usize::MAX);
+        assert!(result[1].is_entry_point, "word 1 must be recorded as its own entry point");
+        assert!(
+            result[0].cycles_flush,
+            "word 0's fallthrough lands on word 1, a real entry point -- must flush on arrival just like a branch target"
+        );
     }
 }

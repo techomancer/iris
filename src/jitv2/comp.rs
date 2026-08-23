@@ -353,7 +353,16 @@ pub fn handle_request_deferred(
     }
 
     let mut instrs_owned = *instrs;
-    let func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.offset, req.compiled_for_fr1, true);
+    // compile_region_uncommitted reads is_entry_point off the buffer itself
+    // (§13.4 — codegen's replacement for a separate entry_word scalar) —
+    // this path only ever has one entry point, so mark it directly rather
+    // than going through Analyzer::walk_multi_entry's multi-offset API.
+    // has_fpu is likewise now a caller-computed input rather than something
+    // codegen scans for internally — same one-pass check compile_region's
+    // own wrapper uses.
+    instrs_owned[offset].is_entry_point = true;
+    let has_fpu = crate::jitv2::analyzer::instrs_linear(&instrs_owned).any(|i| crate::jitv2::analyzer::is_fpu_instruction(i.raw));
+    let func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, has_fpu, req.page);
     match func_id {
         Some(func_id) => {
             #[cfg(feature = "developer")]

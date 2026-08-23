@@ -93,7 +93,18 @@ pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 /// flushing well before the arena's own exhaustion error could ever fire —
 /// that error path (`comp::handle_request`'s exhaustion match arm) stays as
 /// a belt-and-suspenders backstop, not the primary trigger.
+#[cfg(not(feature = "j2wp"))]
 pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// `j2wp`'s own Cranelift arena reservation — bigger than the default
+/// path's `Codegen::ARENA_RESERVE_SIZE` (512MiB) because a one-function-
+/// per-page compiled unit is larger on average than a one-function-per-
+/// entry-point unit, so the whole-page redesign needs more headroom before
+/// hitting its own flush threshold below.
+#[cfg(feature = "j2wp")]
+pub const ARENA_RESERVE_SIZE: usize = 2 * 1024 * 1024 * 1024;
+#[cfg(feature = "j2wp")]
+pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = ARENA_RESERVE_SIZE as u64 - 128 * 1024 * 1024;
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -1715,8 +1726,12 @@ impl CompileQueue {
     /// `start_inner`'s own doc comment for the full contract.
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
         let state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+        #[cfg(not(feature = "j2wp"))]
+        let reserve_size = crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE;
+        #[cfg(feature = "j2wp")]
+        let reserve_size = ARENA_RESERVE_SIZE;
         let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
-            crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE, state.clone(),
+            reserve_size, state.clone(),
         ).expect("CompileQueue::start: failed to reserve a fresh jitv2 arena");
         self.start_inner(bus, stats, shared, state);
     }
@@ -2067,8 +2082,12 @@ impl CompileQueue {
                 // rebuilds its own once it wakes (park_at_barrier's return
                 // value), from the same arena published below.
                 let fresh_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
+                #[cfg(not(feature = "j2wp"))]
+                let reserve_size = crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE;
+                #[cfg(feature = "j2wp")]
+                let reserve_size = ARENA_RESERVE_SIZE;
                 let fresh_arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
-                    crate::jitv2::codegen::Codegen::ARENA_RESERVE_SIZE, fresh_state.clone(),
+                    reserve_size, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
                 {

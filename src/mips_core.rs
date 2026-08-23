@@ -347,7 +347,7 @@ pub struct MipsCore {
     /// `core.pc` through the real interpreter dispatch (`MipsExecutor::step`'s
     /// own fetch+exec_decoded path) and return its `ExecStatus`. Exists so
     /// compiled code can force genuine forward progress on a condition it
-    /// can't itself resolve — `emit_fpu_entry_guard`'s FR-mismatch case
+    /// can't itself resolve — `emit_fr_mode_guard`'s FR-mismatch case
     /// (paired with `kill_entry_fn`, see that field) is the current caller:
     /// the JIT's own bail-to-exit_block just re-sets `core.pc` back to the
     /// same instruction and returns `EXEC_COMPLETE`, which `exec_decoded`'s
@@ -356,8 +356,8 @@ pub struct MipsCore {
     /// compiled function again, which bails again, forever. Calling this
     /// directly instead guarantees the interpreter's real semantics run for
     /// this one instruction no matter what compiled code decided it
-    /// couldn't handle. (CU1-clear no longer routes through here — see
-    /// `emit_fpu_entry_guard`'s doc comment: it materializes the real
+    /// couldn't handle. (CU1-clear never routes through here — see
+    /// `emit_cp1_cu1_guard`'s doc comment: it materializes the real
     /// `EXC_CPU` exception directly via `handle_exception_fn`, the same way
     /// every other JIT-detected fault does, since the exact exception code
     /// is known statically and doesn't need the interpreter's help to
@@ -370,7 +370,7 @@ pub struct MipsCore {
     /// only piece of `(page, offset)` compiled code doesn't already have
     /// another way to recover (the executor's own `self.pcp` already tracks
     /// the live page). Paired with `interp_fallback_fn` in
-    /// `emit_fpu_entry_guard`'s FR-mismatch arm: the whole compiled unit was
+    /// `emit_fr_mode_guard`'s FR-mismatch arm: the whole compiled unit was
     /// built assuming a specific `STATUS_FR` value that's no longer live, so
     /// unlike a CU1 fault (a real, opcode-independent MIPS exception —
     /// materialized directly, no kill needed) the entire artifact is wrong,

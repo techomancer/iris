@@ -259,7 +259,19 @@ fn set_readable_and_executable(ptr: *mut u8, len: usize, branch_protection: Bran
 #[derive(Clone, Copy, Debug)]
 pub struct PublishInfo {
     pub page: *mut crate::jitv2::PhysicalCodePage,
+    /// Single entry-point offset — the default (`not(feature = "j2wp")`)
+    /// path's one-function-per-entry-point model, consumed by
+    /// `PhysicalCodePage::publish(offset_word, ...)`. Unused (left `0`) by
+    /// the `j2wp` path, which uses `new_entries` instead.
+    #[cfg(not(feature = "j2wp"))]
     pub offset: usize,
+    /// §13.4: every entry offset this compile covers, not a single `offset`
+    /// — a `j2wp` compile can publish coverage for several entry points at
+    /// once (§13.2/§13.3's coalescing). Consumed by
+    /// `PhysicalCodePage::publish(new_entries, ...)`. Unused (left zeroed)
+    /// by the default path, which uses `offset` instead.
+    #[cfg(feature = "j2wp")]
+    pub new_entries: [u64; crate::jitv2::BITMAP_WORDS],
     pub gen_snap: u64,
     pub instr_count: usize,
     pub code_size: u32,
@@ -271,6 +283,26 @@ pub struct PublishInfo {
 }
 
 unsafe impl Send for PublishInfo {}
+
+impl PublishInfo {
+    /// A blank placeholder — `page` null, no coverage, `jit_fn: None` — for
+    /// `push_placeholder`'s bare reservation (patched later by
+    /// `patch_pending_publish`) and tests. Whichever of `offset`/
+    /// `new_entries` this build carries is left at its zero value.
+    pub(crate) fn blank() -> Self {
+        Self {
+            page: std::ptr::null_mut(),
+            #[cfg(not(feature = "j2wp"))]
+            offset: 0,
+            #[cfg(feature = "j2wp")]
+            new_entries: [0u64; crate::jitv2::BITMAP_WORDS],
+            gen_snap: 0,
+            instr_count: 0,
+            code_size: 0,
+            jit_fn: None,
+        }
+    }
+}
 
 /// One `finalize()` call's worth of already-relocated, write-complete bytes
 /// waiting for their page(s) to be sealed (RW->RX) — see this module's doc
@@ -286,8 +318,74 @@ unsafe impl Send for PublishInfo {}
 struct SealEntry {
     start: usize,
     end: usize,
+    /// Which OS thread's `push_placeholder` call created this entry —
+    /// stamped at allocate time (before we know whether finalize will ever
+    /// actually run for it), unlike `publish.page`/`publish.jit_fn`, which
+    /// stay null/`None` until `patch_pending_publish` fills them in. This is
+    /// what lets `j2 seal-queue` name the stuck thread directly instead of
+    /// just reporting "some placeholder, somewhere" — every worker thread
+    /// looks identical from the outside otherwise.
+    thread_id: std::thread::ThreadId,
+    /// The physical page this compile was for, stamped at the same
+    /// allocate-time point as `thread_id` — independent of `publish.page`
+    /// (which stays null on a bare placeholder). Always non-null: every real
+    /// `push_placeholder` caller (`Codegen::compile_region_uncommitted`)
+    /// has a real page by construction.
+    page: *mut crate::jitv2::PhysicalCodePage,
     publish: PublishInfo,
 }
+
+unsafe impl Send for SealEntry {}
+
+/// Diagnostic snapshot of `SharedArena`'s seal queue front — see
+/// `SharedArena::seal_queue_snapshot`'s own doc comment for what this is
+/// for and how to read it (`j2 seal-queue`).
+#[derive(Clone, Copy, Debug)]
+pub struct SealQueueSnapshot {
+    pub queue_len: usize,
+    pub position: usize,
+    pub sealed_up_to: usize,
+    pub front_start: Option<usize>,
+    pub front_end: Option<usize>,
+    pub front_is_unpatched_placeholder: Option<bool>,
+    /// Which OS thread's `push_placeholder` call created the front entry —
+    /// `ThreadId`'s own `Debug` output (`ThreadId::as_u64()` is still
+    /// nightly-only as of this writing), since `ThreadId` isn't `Display`.
+    /// Names the stuck thread directly instead of "some placeholder,
+    /// somewhere."
+    pub front_thread_id: Option<std::thread::ThreadId>,
+    /// The physical page the front entry's compile was for, stamped at the
+    /// same allocate-time point as `front_thread_id` (independent of
+    /// `PublishInfo::page`, which stays null until patched). Raw pointer —
+    /// the caller (`j2 seal-queue`) is responsible for treating it as an
+    /// opaque identity/debug value only, never dereferencing it without the
+    /// same care any other `*mut PhysicalCodePage` needs (the pool could
+    /// have reset this exact slot since the entry was pushed).
+    pub front_page: Option<*mut crate::jitv2::PhysicalCodePage>,
+    /// Index (0-based, from the front) of the entry where the contiguity
+    /// scan actually stops — `None` only when the queue is empty. This is
+    /// almost always the entry worth investigating, NOT the front: a queue
+    /// can have thousands of already-patched, already-contiguous entries
+    /// ahead of the real gap (confirmed live — a patched front entry with a
+    /// `queue_len` in the thousands and nothing draining). `0` means the
+    /// front entry itself is the gap, matching what `front_*` already
+    /// reports.
+    pub first_gap_index: Option<usize>,
+    pub first_gap_start: Option<usize>,
+    pub first_gap_end: Option<usize>,
+    /// Why the scan stopped here: `true` if this entry is still unpatched
+    /// (the real, actionable case — see this struct's own doc comment for
+    /// what that means); `false` if it's patched but its `start` doesn't
+    /// connect to the running end (a hole in `start` ordering — should be
+    /// structurally impossible per `push_placeholder`'s own insertion
+    /// contract, so seeing `false` here at all would itself be a new,
+    /// different bug worth chasing).
+    pub first_gap_is_unpatched_placeholder: Option<bool>,
+    pub first_gap_thread_id: Option<std::thread::ThreadId>,
+    pub first_gap_page: Option<*mut crate::jitv2::PhysicalCodePage>,
+}
+
+unsafe impl Send for SealQueueSnapshot {}
 
 /// The one real allocator + seal queue behind however many
 /// `PagedArenaMemoryProvider` handles share it. See this module's doc
@@ -395,6 +493,74 @@ impl SharedArena {
             last_sealed: Vec::new(),
             state,
         })
+    }
+
+    /// Diagnostic snapshot of the seal queue's front — `j2 seal-queue`'s only
+    /// caller. Answers "is there a permanent gap, and where" without needing
+    /// per-worker-thread introspection — every `SealEntry` now carries the
+    /// `thread_id`/`page` that created it, stamped at `push_placeholder`
+    /// time (allocate time), independent of `publish`'s own fields (which
+    /// stay null/`None` until `patch_pending_publish` runs). If the front
+    /// entry's `start` hasn't advanced across two calls spaced any real time
+    /// apart while `queue_len` stays nonzero, that placeholder is the
+    /// permanent gap: the named thread's compile for the named page reserved
+    /// this range and its matching `finalize_batch_nonforced` call never ran.
+    ///
+    /// The front entry alone isn't always where the queue is actually
+    /// stuck: `try_seal_ready`'s own contiguity scan (this same function's
+    /// logic, mirrored here) can advance past several already-patched,
+    /// already-contiguous entries before hitting the real gap further back
+    /// in the queue — a `queue_len` in the thousands with a *patched* front
+    /// entry is exactly that shape. `first_gap_index` names where the scan
+    /// actually stops, and `first_gap_*` describes that entry specifically —
+    /// which is almost always the one worth investigating, not the front.
+    pub fn seal_queue_snapshot(&self) -> SealQueueSnapshot {
+        let front = self.seal_queue.front();
+        // Mirrors try_seal_ready's own two-phase scan exactly: entries
+        // already covered by `sealed_up_to` would already have been popped
+        // by a real try_seal_ready call, so front.start > sealed_up_to is
+        // the common case here (this is read-only — it never pops anything
+        // itself). Then walk forward while each entry is patched
+        // (jit_fn.is_some()) AND contiguous with the running end (or
+        // straddles it, for the very first entry) — the first entry that
+        // fails either check is the real gap.
+        let mut expected_start = self.sealed_up_to;
+        let mut gap_index = None;
+        for (i, entry) in self.seal_queue.iter().enumerate() {
+            let contiguous = if i == 0 { entry.start <= expected_start } else { entry.start == expected_start };
+            if entry.publish.jit_fn.is_none() || !contiguous {
+                gap_index = Some(i);
+                break;
+            }
+            expected_start = entry.end.max(expected_start);
+        }
+        let gap = gap_index.and_then(|i| self.seal_queue.get(i));
+        SealQueueSnapshot {
+            queue_len: self.seal_queue.len(),
+            position: self.position,
+            sealed_up_to: self.sealed_up_to,
+            front_start: front.map(|e| e.start),
+            front_end: front.map(|e| e.end),
+            front_is_unpatched_placeholder: front.map(|e| e.publish.jit_fn.is_none()),
+            front_thread_id: front.map(|e| e.thread_id),
+            front_page: front.map(|e| e.page),
+            first_gap_index: gap_index,
+            first_gap_start: gap.map(|e| e.start),
+            first_gap_end: gap.map(|e| e.end),
+            first_gap_is_unpatched_placeholder: gap.map(|e| e.publish.jit_fn.is_none()),
+            first_gap_thread_id: gap.map(|e| e.thread_id),
+            first_gap_page: gap.map(|e| e.page),
+        }
+    }
+
+    /// Every entry in the seal queue, front to back, as
+    /// `(start, end, is_unpatched_placeholder, thread_id, page)` — `j2
+    /// seal-queue`'s only caller. Not bounded/paginated: the caller is
+    /// expected to cap how much it prints.
+    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)> {
+        self.seal_queue.iter()
+            .map(|e| (e.start, e.end, e.publish.jit_fn.is_none(), e.thread_id, e.page))
+            .collect()
     }
 
     fn record_packing(&self) {
@@ -807,11 +973,11 @@ impl PagedArenaMemoryProvider {
     /// position only ever advances between its own calls), but the queue as
     /// a whole, across every worker sharing this arena, is not strictly
     /// append-only.
-    pub fn push_placeholder(&mut self, start: usize, end: usize) {
+    pub fn push_placeholder(&mut self, start: usize, end: usize, page: *mut crate::jitv2::PhysicalCodePage) {
         let mut inner = self.inner.lock();
         let idx = inner.seal_queue.iter().rposition(|e| e.start <= start).map_or(0, |i| i + 1);
-        let publish = PublishInfo { page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0, jit_fn: None };
-        inner.seal_queue.insert(idx, SealEntry { start, end, publish });
+        let thread_id = std::thread::current().id();
+        inner.seal_queue.insert(idx, SealEntry { start, end, thread_id, page, publish: PublishInfo::blank() });
     }
 
     /// Fill in the real `PublishInfo` (resolved `jit_fn` included) for the
@@ -852,6 +1018,16 @@ impl PagedArenaMemoryProvider {
     /// why this lives on the shared arena rather than any one handle.
     pub fn take_last_sealed(&mut self) -> Vec<PublishInfo> {
         std::mem::take(&mut self.inner.lock().last_sealed)
+    }
+
+    /// See `SharedArena::seal_queue_snapshot`'s own doc comment.
+    pub fn seal_queue_snapshot(&self) -> SealQueueSnapshot {
+        self.inner.lock().seal_queue_snapshot()
+    }
+
+    /// See `SharedArena::seal_queue_entries`'s own doc comment.
+    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)> {
+        self.inner.lock().seal_queue_entries()
     }
 
     /// The arena's base address — `PublishInfo`/`Codegen` need this to turn
@@ -962,7 +1138,7 @@ mod tests {
     }
 
     fn dummy_publish() -> PublishInfo {
-        PublishInfo { page: std::ptr::null_mut(), offset: 0, gen_snap: 0, instr_count: 0, code_size: 0, jit_fn: None }
+        PublishInfo::blank()
     }
 
     fn resolved_publish() -> PublishInfo {
@@ -981,7 +1157,7 @@ mod tests {
         state.crossed_page(); // clear
         let base = arena.arena_base() as usize;
         let start = ptr as usize - base;
-        arena.push_placeholder(start, start + 64);
+        arena.push_placeholder(start, start + 64, std::ptr::null_mut());
         let sealed = arena.patch_pending_publish(start, start + 64, resolved_publish(), true);
         assert_eq!(sealed.len(), 1);
         assert!(sealed[0].jit_fn.is_some());
@@ -1004,7 +1180,7 @@ mod tests {
         let ptr1 = arena.allocate(64, 16, JITMemoryKind::Executable).unwrap();
         let base = arena.arena_base() as usize;
         let start1 = ptr1 as usize - base;
-        arena.push_placeholder(start1, start1 + 64);
+        arena.push_placeholder(start1, start1 + 64, std::ptr::null_mut());
         let sealed = arena.patch_pending_publish(start1, start1 + 64, resolved_publish(), false);
         assert!(sealed.is_empty(), "a non-forced patch must not seal the still-open page");
         state.crossed_page(); // clear
@@ -1012,7 +1188,7 @@ mod tests {
         let ptr2 = arena.allocate(64, 16, JITMemoryKind::Executable).unwrap();
         assert!(!state.crossed_page(), "a later allocation must still be able to pack into the page a non-forced patch left open");
         let start2 = ptr2 as usize - base;
-        arena.push_placeholder(start2, start2 + 64);
+        arena.push_placeholder(start2, start2 + 64, std::ptr::null_mut());
         let sealed = arena.patch_pending_publish(start2, start2 + 64, resolved_publish(), false);
         assert_eq!(sealed.len(), 0, "still not a whole vacated page's worth — position (128) is nowhere near the next page boundary");
 
@@ -1020,7 +1196,7 @@ mod tests {
         // seals everything queued so far.
         let ptr3 = arena.allocate(64, 16, JITMemoryKind::Executable).unwrap();
         let start3 = ptr3 as usize - base;
-        arena.push_placeholder(start3, start3 + 64);
+        arena.push_placeholder(start3, start3 + 64, std::ptr::null_mut());
         let sealed = arena.patch_pending_publish(start3, start3 + 64, resolved_publish(), true);
         assert_eq!(sealed.len(), 3,
             "a forced patch must sweep up every still-queued range, not just its own most recent one");
@@ -1067,7 +1243,7 @@ mod tests {
         let base = arena.arena_base() as usize;
         let start = ptr as usize - base;
         let end = start + size;
-        arena.push_placeholder(start, end);
+        arena.push_placeholder(start, end, std::ptr::null_mut());
         let sealed = arena.patch_pending_publish(start, end, resolved_publish(), force);
         (start, end, sealed)
     }
@@ -1116,8 +1292,8 @@ mod tests {
             let base = b.arena_base() as usize;
             (ptr as usize - base, ptr as usize - base + 64)
         };
-        a.push_placeholder(a_start, a_end);
-        b.push_placeholder(b_start, b_end);
+        a.push_placeholder(a_start, a_end, std::ptr::null_mut());
+        b.push_placeholder(b_start, b_end, std::ptr::null_mut());
 
         let sealed = b.patch_pending_publish(b_start, b_end, resolved_publish(), true);
         assert!(sealed.is_empty(), "B's range must not seal while A's (earlier) range is still outstanding");
@@ -1149,8 +1325,8 @@ mod tests {
             let base = b.arena_base() as usize;
             (ptr as usize - base, ptr as usize - base + 64)
         };
-        a.push_placeholder(a_start, a_end);
-        b.push_placeholder(b_start, b_end);
+        a.push_placeholder(a_start, a_end, std::ptr::null_mut());
+        b.push_placeholder(b_start, b_end, std::ptr::null_mut());
 
         let sealed = b.patch_pending_publish(b_start, b_end, resolved_publish(), true);
         assert!(sealed.is_empty());
