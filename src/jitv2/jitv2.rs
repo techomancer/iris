@@ -693,6 +693,18 @@ impl PhysicalCodePage {
         self.gen = &NEVER_COMPILABLE_GEN;
     }
 
+    /// Reset every entry's published/denylisted state, function pointers,
+    /// and the saved-corpus bitmap back to a freshly-claimed page's
+    /// defaults — but, unlike [`Self::reset_to_unclaimed`], leaves `pfn` and
+    /// `gen` untouched: this page stays claimed under the same physical
+    /// frame, it just looks like nothing has ever been compiled for it yet.
+    /// For `j2 clear <paddr>` — a targeted, single-page "forget everything
+    /// you learned about this page" diagnostic, as opposed to `j2 flush`'s
+    /// whole-pool reset or `reset_to_unclaimed`'s pool-eviction semantics.
+    pub fn reset_compiled_state(&mut self) {
+        self.reset_entries_and_bitmaps();
+    }
+
     /// Current generation count for this page. `self.gen` is never null (see
     /// its own doc comment) — a page whose backing device has no real gen
     /// tracking (MMIO, etc) reads the shared, never-bumped
@@ -3976,6 +3988,19 @@ impl PhysicalCodePage {
         self.reset_entries_and_bitmaps();
         self.pfn = UNCLAIMED_PFN;
         self.gen = &NEVER_COMPILABLE_GEN;
+    }
+
+    /// Reset `requested`/`denied`/`compiled` bitmaps, the compiled `func`
+    /// pointer, and every diagnostic counter back to a freshly-claimed
+    /// page's defaults — but, unlike [`Self::reset_to_unclaimed`], leaves
+    /// `pfn`/`gen` untouched: this page stays claimed under the same
+    /// physical frame, it just looks like nothing has ever been compiled for
+    /// it yet. Unlike [`Self::reset_for_flush_survivor`], `requested`/
+    /// `denied` are NOT preserved here — this is a deliberate "forget
+    /// everything you learned about this page" for `j2 clear <paddr>`, not
+    /// the churn-reduction partial reset a real flush wants.
+    pub fn reset_compiled_state(&mut self) {
+        self.reset_entries_and_bitmaps();
     }
 
     /// Churn-reduction partial reset for a flush-surviving page (§ flush

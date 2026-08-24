@@ -39,6 +39,27 @@ fn mips_log(_bit: u32) -> bool {
     false
 }
 
+/// `j2 pagewb [on|off]` gate (default off): when on, `jitv2_track_pcp` writes
+/// back dirty L1-D/L2 lines covering a physical code page the instant a fetch
+/// crosses onto it, before that page can be handed to the JIT for
+/// compilation — see `jitv2_track_pcp`'s own doc comment for why. Process-
+/// global (mirrors `jitv2::analyzer::FALLBACK_ENABLED`'s style) rather than a
+/// per-executor field: it's a diagnostic knob toggled from the monitor
+/// console, not per-core state.
+#[cfg(feature = "jitv2")]
+static JITV2_PAGEWB_ENABLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "jitv2")]
+#[inline]
+fn jitv2_pagewb_enabled() -> bool {
+    JITV2_PAGEWB_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(feature = "jitv2")]
+pub fn set_jitv2_pagewb_enabled(on: bool) {
+    JITV2_PAGEWB_ENABLED.store(on, Ordering::Relaxed);
+}
+
 // Exception codes (from MIPS R4000 documentation)
 pub const EXC_INT: u32 = 0;       // Interrupt
 pub const EXC_MOD: u32 = 1;       // TLB modification exception
@@ -2214,6 +2235,20 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
         if same_page {
             return;
+        }
+        // Diagnostic (`j2 pagewb [on|off]`, default off): write back any
+        // dirty L1-D/L2 lines covering the page we're about to fetch/compile
+        // from, phys-only (no known virt_addr here, and none needed — see
+        // MipsCache::writeback's doc comment on VIPT alias coverage). Chases
+        // the suspicion that relocated/self-modified executable code can
+        // still be sitting dirty in cache when a fresh physical page is
+        // handed to the JIT for compilation, so the compiler snapshots stale
+        // RAM bytes instead of what the program actually just wrote. Placed
+        // on the page-crossing path (not every fetch) to keep the common
+        // same-page case free of this cost even when the toggle is on.
+        if jitv2_pagewb_enabled() {
+            let page_base = pfn * crate::jitv2::PAGE_SIZE;
+            self.cache.writeback(None, page_base as u64, crate::jitv2::PAGE_SIZE as u64);
         }
         // A page crossing landing exactly on word 0 (the exception/TLB-refill
         // vector case included — `deliver_exception` in mips_core.rs writes
@@ -9593,11 +9628,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("loadbin".to_string(), "Load raw bytes at a virtual address: loadbin <file> <addr>".to_string()),
             ("proc".to_string(), "IRIX kernel introspection: proc info  (requires `loadsym` first)".to_string()),
             ("l1i".to_string(), "L1 Instruction Cache commands: l1i <check|dump> <addr|index>".to_string()),
-            ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index>".to_string()),
+            ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index> | l1d wb <vaddr> <size> | l1d pwb <paddr> <size>".to_string()),
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 html [path] | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -9843,6 +9878,34 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             return Ok(());
         }
 
+        if actual_cmd == "l1d" && (actual_args.first().copied() == Some("wb") || actual_args.first().copied() == Some("pwb")) {
+            let is_phys = actual_args[0] == "pwb";
+            if actual_args.len() < 3 {
+                return Err(format!("Usage: l1d {} <{}> <size>", actual_args[0], if is_phys { "paddr" } else { "vaddr" }));
+            }
+            let mut exec = self.try_lock_executor()?;
+            let symbols_arc = exec.symbols.clone();
+            let symbols = symbols_arc.lock();
+            let addr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+            let size = parse_cpu_arg(actual_args[2], &exec.core, Some(&symbols))?;
+            drop(symbols);
+
+            let (virt_addr, phys_addr) = if is_phys {
+                (None, addr)
+            } else {
+                let tr = exec.debug_translate(addr);
+                if tr.is_exception() {
+                    return Err(format!("Virtual {:016x} -> Translation Failed", addr));
+                }
+                (Some(addr), tr.phys as u64)
+            };
+
+            let n = exec.cache.writeback(virt_addr, phys_addr, size);
+            writeln!(writer, "l1d {}: wrote back {} dirty line(s) covering phys [{:016x}, {:016x})",
+                actual_args[0], n, phys_addr, phys_addr + size).unwrap();
+            return Ok(());
+        }
+
         if actual_cmd == "l1i" || actual_cmd == "l1d" || actual_cmd == "l2" {
             if actual_args.is_empty() {
                 return Err(format!("Usage: {} <check|dump> <addr|index>", actual_cmd));
@@ -9850,7 +9913,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             let cache_name = actual_cmd;
             let op = actual_args[0];
             let val_str = if actual_args.len() > 1 { actual_args[1] } else { "0" };
-            
+
             let mut exec = self.try_lock_executor()?;
             let symbols = exec.symbols.lock();
             let val = parse_cpu_arg(val_str, &exec.core, Some(&symbols))?;
@@ -10501,7 +10564,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             }
             #[cfg(feature = "jitv2")]
             "j2" => {
-                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|instrs|threads|opt|min-instrs|max-instrs|min-calls|lockstep|hugepages|flush|html [path]>".to_string()); }
+                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|pagewb|instrs|threads|opt|min-instrs|max-instrs|min-calls|lockstep|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string()); }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
                 // only proves no one holds the lock *right now* (MipsCpu::step
@@ -10645,6 +10708,27 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 writeln!(writer, "j2 fallback: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                             }
                             Some(_) => return Err("Usage: j2 fallback [on|off]".to_string()),
+                        }
+                    }
+                    "pagewb" => {
+                        // Diagnostic: write back dirty L1-D/L2 lines covering
+                        // a physical code page the instant a fetch crosses
+                        // onto it (jitv2_track_pcp), before the JIT can
+                        // compile against it — chases stale-RAM-vs-cache
+                        // divergence for relocated/self-modified code. Takes
+                        // effect immediately (unlike `j2 fallback`/category
+                        // gates, this isn't read at compile time — no `j2
+                        // flush` needed). Defaults off: real per-page-crossing
+                        // cost on every fetch miss while the CPU is running.
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 pagewb: {}", if jitv2_pagewb_enabled() { "on" } else { "off" }).unwrap();
+                            }
+                            Some(on @ ("on" | "off")) => {
+                                set_jitv2_pagewb_enabled(on == "on");
+                                writeln!(writer, "j2 pagewb: {}", on).unwrap();
+                            }
+                            Some(_) => return Err("Usage: j2 pagewb [on|off]".to_string()),
                         }
                     }
                     cat @ ("alu" | "fpu" | "branch" | "loadstore" | "cop0") => {
@@ -11033,6 +11117,81 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             writeln!(writer, "  denylisted words: {}", denylisted_words.join(", ")).unwrap();
                         }
                     }
+                    #[cfg(not(feature = "j2wp"))]
+                    "clear" => {
+                        // Reset the PhysicalCodePage covering `paddr` back to
+                        // a freshly-claimed-but-never-compiled state — every
+                        // entry's published/denylisted flags, function
+                        // pointers, and the saved-corpus bitmap all go back
+                        // to default, in place. Keeps `pfn`/`gen`: this is
+                        // NOT reset_to_unclaimed (that evicts the page from
+                        // the pool entirely, changing its identity) — the
+                        // page stays claimed under the same physical frame,
+                        // it just looks like nothing was ever compiled for
+                        // it. Doesn't require the CPU to be stopped first:
+                        // reset_compiled_state only writes fields this
+                        // page's own dispatch reads through
+                        // is_runnable()/is_published(), which will simply
+                        // see "unpublished" the instant this returns.
+                        if actual_args.len() < 2 { return Err("Usage: j2 clear <paddr>".to_string()); }
+                        let symbols_arc = exec.symbols.clone();
+                        let symbols = symbols_arc.lock();
+                        let paddr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+                        drop(symbols);
+                        if paddr > 0xFFFF_FFFF || (paddr as u32) >= HIMEM_END {
+                            return Err(format!(
+                                "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
+                                paddr, HIMEM_END));
+                        }
+                        let pfn = (paddr as u32) / crate::jitv2::PAGE_SIZE;
+                        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                        let sysad = exec.sysad.clone();
+                        let mut jit = exec.jitv2.lock();
+                        match jit.page_for(pfn, page_base, sysad.as_ref()) {
+                            Some(slot) => {
+                                let page_ptr = jit.page_ptr(slot);
+                                unsafe { (*page_ptr).reset_compiled_state(); }
+                                writeln!(writer, "j2 clear: page pfn={:#010x} (paddr {:#010x}) compiled state reset (pfn/gen kept)", pfn, page_base).unwrap();
+                            }
+                            None => return Err("j2 clear: page pool is full (can't even allocate a fresh lookup entry)".to_string()),
+                        }
+                    }
+                    #[cfg(not(feature = "j2wp"))]
+                    "deny" => {
+                        // Sticky-denylist the single entry offset covering
+                        // `paddr` — the page's other entries are untouched.
+                        // `denylist()` alone only blocks *future* compiles
+                        // (ENTRY_DENYLISTED) — it does NOT retroactively
+                        // clear ENTRY_VALID, so an offset that was already
+                        // published keeps dispatching through its existing
+                        // `func` forever. `kill()` is the un-publish call
+                        // (clears ENTRY_VALID); call both so an already-
+                        // compiled entry actually stops running right away
+                        // instead of only being blocked from recompiling.
+                        if actual_args.len() < 2 { return Err("Usage: j2 deny <paddr>".to_string()); }
+                        let symbols_arc = exec.symbols.clone();
+                        let symbols = symbols_arc.lock();
+                        let paddr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+                        drop(symbols);
+                        if paddr > 0xFFFF_FFFF || (paddr as u32) >= HIMEM_END {
+                            return Err(format!(
+                                "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
+                                paddr, HIMEM_END));
+                        }
+                        let pfn = (paddr as u32) / crate::jitv2::PAGE_SIZE;
+                        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                        let offset = ((paddr as u32) & 0xFFF) as usize >> 2;
+                        let sysad = exec.sysad.clone();
+                        let mut jit = exec.jitv2.lock();
+                        match jit.page_for(pfn, page_base, sysad.as_ref()) {
+                            Some(slot) => {
+                                let page_ptr = jit.page_ptr(slot);
+                                unsafe { (*page_ptr).denylist(offset); (*page_ptr).kill(offset); }
+                                writeln!(writer, "j2 deny: page pfn={:#010x} offset={:#05x} (paddr {:#010x}) denylisted and killed", pfn, offset * 4, paddr).unwrap();
+                            }
+                            None => return Err("j2 deny: page pool is full (can't even allocate a fresh lookup entry)".to_string()),
+                        }
+                    }
                     #[cfg(feature = "j2wp")]
                     "pcp" => {
                         // Optional address argument: inspect an arbitrary
@@ -11191,6 +11350,100 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 writeln!(writer, "    page_off={:#05x} vaddr={:#018x}  R={} C={} D={}",
                                     off * 4, vaddr, r, c, d).unwrap();
                             }
+                        }
+                    }
+                    #[cfg(feature = "j2wp")]
+                    "clear" => {
+                        // Reset the PhysicalCodePage covering `paddr` back to
+                        // a freshly-claimed-but-never-compiled state —
+                        // requested/compiled/denied bitmaps, the compiled
+                        // func pointer, and every diagnostic counter all go
+                        // back to default, in place. Keeps `pfn`/`gen`: this
+                        // is NOT reset_to_unclaimed (that evicts the page
+                        // from the pool entirely, changing its identity) —
+                        // the page stays claimed under the same physical
+                        // frame, it just looks like nothing was ever
+                        // compiled for it. Doesn't require the CPU to be
+                        // stopped first: reset_compiled_state only writes
+                        // fields dispatch reads through
+                        // is_runnable()/is_published(), which will simply see
+                        // "unpublished" the instant this returns.
+                        if actual_args.len() < 2 { return Err("Usage: j2 clear <paddr>".to_string()); }
+                        let symbols_arc = exec.symbols.clone();
+                        let symbols = symbols_arc.lock();
+                        let paddr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+                        drop(symbols);
+                        if paddr > 0xFFFF_FFFF || (paddr as u32) >= HIMEM_END {
+                            return Err(format!(
+                                "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
+                                paddr, HIMEM_END));
+                        }
+                        let pfn = (paddr as u32) / crate::jitv2::PAGE_SIZE;
+                        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                        let sysad = exec.sysad.clone();
+                        let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                        let mut jit = exec.jitv2.lock();
+                        match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                            Some(slot) => {
+                                let page_ptr = jit.page_ptr(slot);
+                                unsafe { (*page_ptr).reset_compiled_state(); }
+                                writeln!(writer, "j2 clear: page pfn={:#010x} (paddr {:#010x}) compiled state reset (pfn/gen kept)", pfn, page_base).unwrap();
+                            }
+                            None => return Err("j2 clear: page pool is full (can't even allocate a fresh lookup entry)".to_string()),
+                        }
+                    }
+                    #[cfg(feature = "j2wp")]
+                    "deny" => {
+                        // Sticky-denylist the single entry offset covering
+                        // `paddr` — the page's other offsets are untouched.
+                        // `denylist()` alone (clearing the `denied` bit) only
+                        // blocks *future* compiles from covering this offset
+                        // — it does NOT retroactively clear an already-set
+                        // `compiled` bit, so an offset published before this
+                        // call keeps dispatching through the page's existing
+                        // `func` forever. `kill()` is the un-publish call
+                        // (clears the `compiled` bit); call both so an
+                        // already-compiled offset actually stops running
+                        // right away instead of only being blocked from
+                        // recompiling.
+                        //
+                        // Note this is still not permanent on a page that
+                        // keeps mutating: `publish()`'s "real invalidation"
+                        // path (snap_gen > prev entry_gen — the underlying
+                        // bytes actually changed, §13.6) resets the whole
+                        // page's `denied` bitmap back to all-eligible on its
+                        // next successful compile, on the theory that a
+                        // sticky rejection against old bytes shouldn't
+                        // outlive them. A `j2 deny` on a page that is still
+                        // actively recompiling (`compiles_since_flush`
+                        // climbing in `j2 pcp`) can therefore be silently
+                        // undone by the very next real recompile — `kill()`
+                        // still stops the specific `func` this call saw, but
+                        // a fresh compile can re-publish the same offset
+                        // right after.
+                        if actual_args.len() < 2 { return Err("Usage: j2 deny <paddr>".to_string()); }
+                        let symbols_arc = exec.symbols.clone();
+                        let symbols = symbols_arc.lock();
+                        let paddr = parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?;
+                        drop(symbols);
+                        if paddr > 0xFFFF_FFFF || (paddr as u32) >= HIMEM_END {
+                            return Err(format!(
+                                "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
+                                paddr, HIMEM_END));
+                        }
+                        let pfn = (paddr as u32) / crate::jitv2::PAGE_SIZE;
+                        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                        let offset = ((paddr as u32) & 0xFFF) as usize >> 2;
+                        let sysad = exec.sysad.clone();
+                        let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                        let mut jit = exec.jitv2.lock();
+                        match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                            Some(slot) => {
+                                let page_ptr = jit.page_ptr(slot);
+                                unsafe { (*page_ptr).denylist(offset); (*page_ptr).kill(offset); }
+                                writeln!(writer, "j2 deny: page pfn={:#010x} offset={:#05x} (paddr {:#010x}) denylisted and killed", pfn, offset * 4, paddr).unwrap();
+                            }
+                            None => return Err("j2 deny: page pool is full (can't even allocate a fresh lookup entry)".to_string()),
                         }
                     }
                     #[cfg(feature = "j2wp")]
@@ -11491,7 +11744,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             }
                         }
                     }
-                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|fallback [on|off|<category>]|instrs|threads|opt [none|speed]|min-instrs [N]|max-instrs [N]|min-calls [N]|lockstep|hugepages|flush>".to_string()),
+                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|fallback [on|off|<category>]|pagewb [on|off]|instrs|threads|opt [none|speed]|min-instrs [N]|max-instrs [N]|min-calls [N]|lockstep|hugepages|flush|clear <paddr>|deny <paddr>>".to_string()),
                 }
                 Ok(())
             }

@@ -392,6 +392,22 @@ pub trait MipsCache: Send + Sync {
     /// For other operations, returns 0
     fn cache_op(&self, cache_op: u32, virt_addr: u64, phys_addr: u64) -> u32;
 
+    /// Write back dirty L1-D (and, if present, L2) lines covering
+    /// `[phys_addr, phys_addr + size)` to memory, without invalidating them.
+    ///
+    /// `virt_addr`, if given, is the virtual address corresponding to
+    /// `phys_addr` (same page offset) — L1-D is VIPT, so a real virtual
+    /// address lets each line be found directly, the same way a normal
+    /// access would. When `virt_addr` is `None` (phys-only), every possible
+    /// virtual alias of each physical line is checked instead (L1-D indexes
+    /// on more bits than the page offset guarantees are VA==PA, so a purely
+    /// physical address cannot rule any alias out) — this may write back
+    /// lines that happen to tag-match but do not actually belong to the
+    /// running program's mapping, which is fine for a diagnostic/flush op.
+    ///
+    /// Returns the number of dirty lines actually written back (L1-D + L2).
+    fn writeback(&self, _virt_addr: Option<u64>, _phys_addr: u64, _size: u64) -> usize { 0 }
+
     /// Get cache configuration for a specific cache target
     /// cache_target: CACH_PI (0), CACH_PD (1), CACH_SI (2), or CACH_SD (3)
     /// Returns (size in bytes, line size in bytes)
@@ -2026,6 +2042,95 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             None
         }
     }
+
+    /// Write back the L1-D line(s) covering physical line `phys_line` (already
+    /// line-aligned to `DC_LINE`), then cascade to L2 if written. Used by
+    /// `writeback_range` for both the known-virt-addr case (a single eidx from
+    /// `hit_l1d`) and the phys-only case (every possible VIPT alias below).
+    /// Returns the number of L1-D lines actually written back (0 or 1).
+    #[inline]
+    fn writeback_dc_eidx(&self, eidx: usize) -> usize {
+        let tag: L1DTag = self.dc.get_tag(eidx);
+        if !tag.dirty { return 0; }
+        self.writeback_l1d_line(eidx, true);
+        1
+    }
+
+    /// Phys-only L1-D writeback for one line: since only the low
+    /// `12 - DC_LINE_SHIFT` index bits are guaranteed to equal the physical
+    /// address's (the rest are virtual page-color bits VIPT can't recover
+    /// from a phys addr alone), probe every alias of those upper index bits,
+    /// across every way, and write back whichever ones tag-match and are
+    /// dirty. Returns the number of lines written back (0, 1, or more if
+    /// multiple aliases happen to independently hold dirty copies).
+    fn writeback_dc_phys_line(&self, phys_line: u64) -> usize {
+        let base_idx = self.dc.get_index(phys_line);
+        let alias_bits = Self::DC_NUM_LINES_SHIFT.saturating_sub(12 - Self::DC_LINE_SHIFT);
+        let num_aliases = 1usize << alias_bits;
+        let alias_mask = (num_aliases - 1) << (12 - Self::DC_LINE_SHIFT);
+        let mut n = 0;
+        for alias in 0..num_aliases {
+            let set = (base_idx & !alias_mask) | (alias << (12 - Self::DC_LINE_SHIFT));
+            for way in 0..DC_WAYS {
+                let eidx = set | (way << Self::DC_NUM_LINES_SHIFT);
+                let tag: L1DTag = self.dc.get_tag(eidx);
+                if tag.dirty && tag.matches_phys(phys_line) {
+                    self.writeback_l1d_line(eidx, true);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Shared implementation of the public `writeback` trait method — see its
+    /// doc comment for the virt/phys-only contract.
+    fn writeback_range(&self, virt_addr: Option<u64>, phys_addr: u64, size: u64) -> usize {
+        if size == 0 { return 0; }
+        let mut count = 0usize;
+
+        // --- L1-D ---
+        let dc_line = DC_LINE as u64;
+        let phys_start = phys_addr & !(dc_line - 1);
+        let phys_end = phys_addr + size;
+        match virt_addr {
+            Some(va) => {
+                let virt_start = va & !(dc_line - 1);
+                let mut off = 0u64;
+                while phys_start + off < phys_end {
+                    if let Some(eidx) = self.hit_l1d(virt_start + off, phys_start + off) {
+                        count += self.writeback_dc_eidx(eidx);
+                    }
+                    off += dc_line;
+                }
+            }
+            None => {
+                let mut line = phys_start;
+                while line < phys_end {
+                    count += self.writeback_dc_phys_line(line);
+                    line += dc_line;
+                }
+            }
+        }
+
+        // --- L2 (if present) ---
+        if self.l2_active() {
+            let l2_line = L2_LINE as u64;
+            let mut line = phys_addr & !(l2_line - 1);
+            while line < phys_end {
+                if let Some(idx) = self.hit_l2(line) {
+                    let tag: L2Tag = self.l2.get_tag(idx);
+                    if tag.cs() == L2_CS_DIRTY_EXCLUSIVE || tag.cs() == L2_CS_DIRTY_SHARED {
+                        self.writeback_l2_line(idx);
+                        count += 1;
+                    }
+                }
+                line += l2_line;
+            }
+        }
+
+        count
+    }
 }
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
@@ -2565,6 +2670,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
             _ => 0,
         }
+    }
+
+    fn writeback(&self, virt_addr: Option<u64>, phys_addr: u64, size: u64) -> usize {
+        self.writeback_range(virt_addr, phys_addr, size)
     }
 
     fn get_config(&self, cache_target: u32) -> (usize, usize) {
@@ -3648,6 +3757,90 @@ mod tests {
     fn only_the_model_with_a_secondary_cache_reports_one() {
         assert!(<R4400Cache as MipsCache>::L2_SIZE > 0, "R4400 has a 1 MB L2");
         assert_eq!(<R5000Cache as MipsCache>::L2_SIZE, 0, "R5000 (Indy) has no secondary cache");
+    }
+
+    /// `writeback(Some(virt), phys, size)`: dirty lines in range land in memory
+    /// and are no longer reported dirty; nothing outside the range is touched.
+    #[test]
+    fn writeback_virt_range_flushes_dirty_lines() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+
+        let base: u32 = 0x1000;
+        // Two full L1D lines (16 bytes each) inside the range, one word in a
+        // different L2 line entirely (writeback's cascade=true flushes the
+        // whole containing L2 line, so an "outside" address must sit outside
+        // that 128-byte L2 line too, not just outside the 32-byte L1D range,
+        // for isolation to be a meaningful thing to assert).
+        for i in 0..8u32 {
+            let phys = base + i * 4;
+            let _ = cache.write::<4>(kseg0(phys), phys as u64, (0x1000_0000 + i) as u64);
+        }
+        let outside_phys = base + R4400Cache::L2_LINE as u32;
+        let _ = cache.write::<4>(kseg0(outside_phys), outside_phys as u64, 0xdead_beef);
+
+        assert_eq!(mem_read(&mem, base), 0, "memory must still be stale before writeback");
+
+        // Both 16-byte lines fall in the same 128-byte L2 line, so writing
+        // back the first one (cascade=true) also flushes the L2 line — which
+        // sweeps in the second L1D line as a side effect (writeback_l2_line's
+        // own "flush dirty L1-D sub-lines into L2 first" pre-pass). So the
+        // *count* of L1D lines this call itself finds still-dirty can be 1
+        // even though both end up correctly in memory; assert on the actual
+        // effect (data landed, dirty cleared) rather than the exact count.
+        let n = cache.writeback(Some(kseg0(base) as u64), base as u64, 32);
+        assert!(n >= 1, "expected at least one dirty line written back, got {}", n);
+
+        for i in 0..8u32 {
+            let phys = base + i * 4;
+            assert_eq!(mem_read(&mem, phys), 0x1000_0000 + i,
+                "phys={:#010x} not flushed to memory by writeback", phys);
+        }
+        // The word outside the requested range must remain stale in memory.
+        assert_eq!(mem_read(&mem, outside_phys), 0,
+            "writeback touched a line outside the requested range");
+
+        // Re-probing the same range should now report nothing dirty.
+        let n2 = cache.writeback(Some(kseg0(base) as u64), base as u64, 32);
+        assert_eq!(n2, 0, "second writeback of the same range should find nothing dirty");
+    }
+
+    /// `writeback(None, phys, size)`: without a virtual address, the phys-only
+    /// path must still find the dirty line via VIPT alias scanning and flush it.
+    #[test]
+    fn writeback_phys_only_finds_line_via_alias_scan() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+
+        let phys: u32 = 0x2040;
+        let virt = kseg0(phys);
+        let _ = cache.write::<4>(virt, phys as u64, 0xcafe_1234);
+        assert_eq!(mem_read(&mem, phys), 0, "memory must still be stale before writeback");
+
+        let n = cache.writeback(None, phys as u64, R4400Cache::DC_LINE as u64);
+        assert_eq!(n, 1, "phys-only writeback should find and flush the one dirty line");
+        assert_eq!(mem_read(&mem, phys), 0xcafe_1234,
+            "phys-only writeback did not reach memory");
+    }
+
+    /// `writeback` must also flush a dirty L2 line that has no matching L1D
+    /// line anymore (L1D already wrote through to L2 and was invalidated).
+    #[test]
+    fn writeback_flushes_dirty_l2_line() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+
+        let phys: u32 = 0x3000;
+        let virt = kseg0(phys);
+        let _ = cache.write::<4>(virt, phys as u64, 0x5555_aaaa);
+        // Push L1D's dirty line into L2 and drop it from L1D, leaving only L2 dirty.
+        cache.cache_op(C_IWBINV | CACH_PD, virt, phys as u64 & 0x1FFF_FFFF);
+        assert_eq!(mem_read(&mem, phys), 0, "L2 writeback should not have happened yet");
+
+        let n = cache.writeback(Some(virt), phys as u64, R4400Cache::L2_LINE as u64);
+        assert!(n >= 1, "expected at least the L2 line to be written back");
+        assert_eq!(mem_read(&mem, phys), 0x5555_aaaa,
+            "writeback did not flush the dirty L2 line to memory");
     }
 
 }
