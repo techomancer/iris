@@ -88,6 +88,20 @@ idle-pause = []
 # instead of masking on every access. Experimental; `Memory` remains the
 # default and the fallback.
 ppmem = []
+# Transparent cache (docs/tcache-design.md): keep the whole cache tag/state
+# machine — line states, LRU, dirty bits, VCE, CACHE-instruction semantics —
+# but stop storing line *data* for cacheable RAM. Reads and writes go straight
+# through ppmem's window, so fills copy nothing and evictions write nothing
+# back. Decoded-instruction slots (L1I on R5000, L2 on R4400) are the deliberate
+# exception and are still filled — they cache work, not memory.
+# Requires ppmem for the window pointer + mapped-region bitmap. Experimental.
+tcache = ["ppmem"]
+# tcache self-check: after every cacheable access, assert that ppmem's window is
+# authoritative for transparent addresses — no BACKED L1D line over a
+# transparent address, and no DIRTY L2 line whose data disagrees with RAM.
+# Panics at the exact diverging access instead of letting corruption surface as
+# a guest crash much later. Very slow; diagnostic only.
+tcache_verify = ["tcache"]
 default = ["tlbvmap"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]

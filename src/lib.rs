@@ -100,6 +100,7 @@ pub mod build_features {
             ("rex-jit", cfg!(feature = "rex-jit")),
             ("lightning", cfg!(feature = "lightning")),
             ("ppmem", cfg!(feature = "ppmem")),
+            ("tcache", cfg!(feature = "tcache")),
             ("tlbvmap", cfg!(feature = "tlbvmap")),
             ("tlbstats", cfg!(feature = "tlbstats")),
             ("tlbcheck", cfg!(feature = "tlbcheck")),

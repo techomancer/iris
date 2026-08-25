@@ -143,6 +143,15 @@ pub trait MappedMemory {
     /// inline field: the executor never moves once inside its `Arc`, and the
     /// only writer is the MEMCFG path on that same thread.
     unsafe fn set_bitmap_sink(&self, ptr: *mut u64);
+
+    /// A second publication target — see [`MappedMemory::set_bitmap_sink`].
+    ///
+    /// Exists so the cache can hold the bitmap *inline* instead of chasing a
+    /// pointer on every access. Both sinks receive every update.
+    ///
+    /// # Safety
+    /// Same contract as `set_bitmap_sink`.
+    unsafe fn set_bitmap_sink2(&self, ptr: *mut u64);
 }
 
 /// One physical memory bank.
@@ -618,10 +627,15 @@ pub struct PpMemSpace {
 
 struct SpaceState {
     mappings: Vec<Mapping>,
-    /// Where the bitmap is published. Points at `own_bitmap` until the CPU
-    /// hands over its inline field via [`MappedMemory::set_bitmap_sink`], so
-    /// it is never null and publication is an unconditional store.
+    /// Where the bitmap is published. Points at `own_bitmap` until a consumer
+    /// hands over its own inline field, so it is never null and publication is
+    /// an unconditional store.
     sink: *mut u64,
+    /// A second publication target, for the cache's inline copy. Consumers keep
+    /// the bitmap *inline* rather than reaching through a pointer, so the hot
+    /// path is one load instead of two — hence one sink per consumer rather
+    /// than a shared indirection. Points at `own_bitmap` until claimed.
+    sink2: *mut u64,
 }
 
 /// The bitmap `PpMemSpace` publishes into before a CPU claims it.
@@ -658,6 +672,7 @@ impl PpMemSpace {
         let space = AddrSpace::reserve(WINDOW_SIZE as usize)?;
         let own_bitmap = OwnBitmap(Box::new(0u64));
         let sink = &*own_bitmap.0 as *const u64 as *mut u64;
+        let sink2 = sink;
         Ok(Self {
             space,
             banks: banks.iter().map(|b| b.shared().clone()).collect(),
@@ -669,6 +684,7 @@ impl PpMemSpace {
             state: UnsafeCell::new(SpaceState {
                 mappings: Vec::new(),
                 sink,
+                sink2,
             }),
         })
     }
@@ -727,10 +743,13 @@ impl PpMemSpace {
                 }
             }
         }
-        // Publish unconditionally — `sink` is always a live `u64`, either the
-        // CPU's inline field or the one this space owns. Only ever reached
-        // from the MEMCFG path on the CPU thread; see `set_bitmap_sink`.
-        unsafe { *state.sink = bits };
+        // Publish to every sink unconditionally — each is always a live `u64`,
+        // either a consumer's inline field or the one this space owns. Only
+        // ever reached from the MEMCFG path on the CPU thread.
+        unsafe {
+            *state.sink = bits;
+            *state.sink2 = bits;
+        }
     }
 
     fn record(state: &mut SpaceState, at: u64, len: u64) {
@@ -762,7 +781,10 @@ impl MappedMemory for PpMemSpace {
                 }
             }
         }
-        unsafe { *st.sink = 0 };
+        unsafe {
+            *st.sink = 0;
+            *st.sink2 = 0;
+        }
     }
 
     fn map_bank(&self, bank: usize, offset: u64, size: u64, period: u64) -> io::Result<()> {
@@ -878,6 +900,13 @@ impl MappedMemory for PpMemSpace {
         // CPU thread starts, so banks are typically already mapped by now.
         let current = unsafe { *st.sink };
         st.sink = ptr;
+        unsafe { *ptr = current };
+    }
+
+    unsafe fn set_bitmap_sink2(&self, ptr: *mut u64) {
+        let st = unsafe { &mut *self.state.get() };
+        let current = unsafe { *st.sink };
+        st.sink2 = ptr;
         unsafe { *ptr = current };
     }
 
@@ -1179,6 +1208,39 @@ mod tests {
             unsafe { *via_bank },
             unsafe { *via_window },
             "window pointer and bank mem_ptr disagree"
+        );
+    }
+
+    /// Pin down the exact byte layout ppmem uses, so tcache's direct accessors
+    /// can be written against a verified fact rather than an assumption.
+    ///
+    /// ppmem/`Memory` store u32 words in native order: byte `i` of the MIPS
+    /// big-endian stream lives at host offset `i ^ 3`, halfword at `(i>>1) ^ 1`,
+    /// word at `i>>2` unswizzled, and a u64 is `rotate_left(32)`.
+    /// The cache's `dc_read`/`dc_write` use an 8-byte swizzle instead
+    /// (`^7`/`^3`/`^1`), so the two layouts are NOT interchangeable.
+    #[test]
+    fn ppmem_byte_layout_is_4byte_swizzled() {
+        let m = PpMemory::new(8);
+        // Write a known big-endian word through the bus.
+        m.write32(0, 0x1122_3344);
+        let base = m.mem_ptr(0).unwrap() as *const u8;
+        unsafe {
+            // MIPS byte 0 (0x11) must sit at host offset 0^3 == 3.
+            assert_eq!(*base.add(3), 0x11, "byte 0 not at offset 3");
+            assert_eq!(*base.add(2), 0x22);
+            assert_eq!(*base.add(1), 0x33);
+            assert_eq!(*base.add(0), 0x44, "byte 3 not at offset 0");
+            // The word itself is readable unswizzled as a native u32.
+            assert_eq!(*(base as *const u32), 0x1122_3344, "word not native at i>>2");
+        }
+        // And a u64 is rotate_left(32) of the MIPS value.
+        m.write64(8, 0x0102_0304_0506_0708);
+        let p8 = m.mem_ptr(8).unwrap();
+        assert_eq!(
+            unsafe { *p8 },
+            0x0102_0304_0506_0708u64.rotate_left(32),
+            "u64 not stored rotate_left(32)"
         );
     }
 
