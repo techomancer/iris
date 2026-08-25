@@ -956,6 +956,60 @@ fn nutlb_perm_bits(va: u64, is_64bit: bool) -> u64 {
     }
 }
 
+/// Per-access-class tally of how far a guest load/store would get through the
+/// checks the JIT's inline memory path emits, before falling back to Rust.
+///
+/// Each counter is a *prefix* of the next: an access counted in `tag_hit` also
+/// passed `nutlb_hit`. That makes the drop between adjacent rows the cost of
+/// that specific stage, and `inline_ok / total` the joint rate — the number
+/// that says how much of the workload the inline emit actually captures.
+#[cfg(feature = "jitstats")]
+#[derive(Default, Clone, Copy)]
+pub struct JitMemStats {
+    /// Every cached data access reaching the fast-path probe.
+    pub total: u64,
+    /// Translation was served by the nutlb (no `translate_fn` call).
+    pub nutlb_hit: u64,
+    /// ...and the L1D tag matched the physical line.
+    pub tag_hit: u64,
+    /// ...and (stores only) that line was already dirty.
+    pub dirty_ok: u64,
+    /// ...and (tcache only) the region is transparent/mapped RAM.
+    /// The full inline predicate: this is what compiled code would handle
+    /// without calling out.
+    pub inline_ok: u64,
+}
+
+#[cfg(feature = "jitstats")]
+#[derive(Default, Clone, Copy)]
+pub struct JitMemStatsPair {
+    pub load:  JitMemStats,
+    pub store: JitMemStats,
+}
+
+#[cfg(feature = "jitstats")]
+impl JitMemStatsPair {
+    pub fn print(&self) {
+        fn pct(n: u64, d: u64) -> f64 { if d == 0 { 0.0 } else { n as f64 / d as f64 * 100.0 } }
+        eprintln!("\n=== JIT inline memory-path coverage ===");
+        eprintln!("  (each stage is a prefix of the next; the drop between rows is that stage's cost)");
+        for (name, s) in [("load", &self.load), ("store", &self.store)] {
+            if s.total == 0 { continue; }
+            eprintln!("  [{name}]  accesses={t}", name = name, t = s.total);
+            eprintln!("        nutlb hit : {v:>12}  {p:5.1}%", v = s.nutlb_hit, p = pct(s.nutlb_hit, s.total));
+            eprintln!("        + tag hit : {v:>12}  {p:5.1}%", v = s.tag_hit,   p = pct(s.tag_hit,   s.total));
+            if name == "store" {
+                eprintln!("        + dirty   : {v:>12}  {p:5.1}%", v = s.dirty_ok, p = pct(s.dirty_ok, s.total));
+            }
+            eprintln!("        = INLINE  : {v:>12}  {p:5.1}%   <- emitted path handles this share",
+                v = s.inline_ok, p = pct(s.inline_ok, s.total));
+            eprintln!("          callout : {v:>12}  {p:5.1}%",
+                v = s.total - s.inline_ok, p = pct(s.total - s.inline_ok, s.total));
+        }
+        eprintln!("=== End JIT inline memory-path coverage ===\n");
+    }
+}
+
 /// Result of address translation: 8 bytes, no heap.
 ///
 /// Layout when success (EXEC_IS_EXCEPTION clear in `status`):
@@ -1124,6 +1178,17 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// just to read this field.
     #[cfg(feature = "jitv2")]
     pub jitv2_stats: std::sync::Arc<crate::jitv2::JitStats>,
+
+    /// Coverage of the JIT's inline load/store path (feature = "jitstats").
+    /// Populated on every cached data access; printed at exit.
+    #[cfg(feature = "jitstats")]
+    pub jit_mem_stats: JitMemStatsPair,
+    /// Did the translation for the access currently in flight come from the
+    /// nutlb/nanotlb fast path? Set by `nutlb_translate`/`nanotlb_translate`,
+    /// consumed by the `jit_probe` call in `read_data`/`write_data` — the
+    /// cache layer cannot see translation outcomes, so it is threaded here.
+    #[cfg(feature = "jitstats")]
+    pub jit_last_xlat_hit: bool,
     /// Pointer to the `PhysicalCodePage` for the page the fetch-side nanotlb last
     /// resolved to. Updated only on a page change (§2.1 — physical page, not VA);
     /// null until the first fetch translation after construction/reset. Owned and
@@ -2228,6 +2293,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             cheritest_dump_hook: false,
             tlb,
             cache,
+            #[cfg(feature = "jitstats")]
+            jit_mem_stats: JitMemStatsPair::default(),
+            #[cfg(feature = "jitstats")]
+            jit_last_xlat_hit: false,
             #[cfg(feature = "developer")]
             undo_buffer: UndoBuffer::new(),
             #[cfg(feature = "developer")]
@@ -2471,6 +2540,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 return self.nutlb_translate::<true>(va);
             }
         }
+        // Without nutlb the inline path's first stage is the nanotlb slot, so
+        // jitstats measures whichever structure is actually in the build.
+        #[cfg(all(feature = "jitstats", not(feature = "nutlb")))]
+        {
+            let hit = self.core.nanotlb[AT as usize].matches(va & !0xFFF);
+            self.jit_last_xlat_hit = hit;
+        }
 
         let va_page = va & !0xFFF;
         let slot = &self.core.nanotlb[AT as usize];
@@ -2560,6 +2636,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         {
             #[cfg(feature = "tlbstats")]
             self.tlb.stats_nutlb_hit(if W { AccessType::Write } else { AccessType::Read });
+            #[cfg(feature = "jitstats")]
+            { self.jit_last_xlat_hit = true; }
             // Deliberately `ok`, not `ok_mapped`: TR_MAPPED/TR_GLOBAL exist
             // only to carry the TLB entry's G bit out to `nutlb_fill`, and a
             // hit never fills. Reconstructing them here would mean stashing
@@ -2582,12 +2660,39 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             self.tlb.stats_nutlb_miss(at);
         }
 
+        #[cfg(feature = "jitstats")]
+        { self.jit_last_xlat_hit = false; }
         let at = if W { AccessType::Write } else { AccessType::Read };
         let result = (self.translate_fn)(self, va, at);
         if !result.is_exception() {
             self.nutlb_fill::<W>(va, &result);
         }
         result
+    }
+
+    /// Tally one cached data access against the JIT inline fast path's
+    /// predicate. Must be called *before* the cache read/write, since a miss
+    /// mutates the very tag state being probed (a fill would make every
+    /// access look like a tag hit after the fact).
+    #[cfg(feature = "jitstats")]
+    #[inline]
+    fn jit_stat_probe<const STORE: bool>(&mut self, virt_addr: u64, phys_addr: u64) {
+        let inline_ok = self.cache.jit_probe::<STORE>(virt_addr, phys_addr);
+        let xlat = self.jit_last_xlat_hit;
+        let s = if STORE { &mut self.jit_mem_stats.store } else { &mut self.jit_mem_stats.load };
+        s.total += 1;
+        // Prefix counters: each stage implies the ones above it. `inline_ok`
+        // already folds tag/dirty/transparent, so the intermediate rows are
+        // reconstructed from it plus the translation outcome rather than
+        // re-probed stage by stage.
+        if xlat {
+            s.nutlb_hit += 1;
+            if inline_ok {
+                s.tag_hit += 1;
+                if STORE { s.dirty_ok += 1; }
+                s.inline_ok += 1;
+            }
+        }
     }
 
     #[cfg(feature = "nutlb")]
@@ -3803,6 +3908,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                         return Err(EXEC_BREAKPOINT);
                     }
 
+                    #[cfg(feature = "jitstats")]
+                    self.jit_stat_probe::<false>(virt_addr, phys_addr);
+
                     let r = self.cache.read::<SIZE>(virt_addr, phys_addr);
                     if r.is_ok() {
                         Ok(r.data)
@@ -3991,6 +4099,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         }
 
         let status = if is_cached {
+            #[cfg(feature = "jitstats")]
+            self.jit_stat_probe::<true>(virt_addr, phys_addr);
+
             let status = self.cache.write::<SIZE>(virt_addr, phys_addr, val);
             if status != BUS_OK && status != BUS_BUSY {
                 if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
@@ -9278,6 +9389,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         self.executor.lock().core.on_cpu_stop();
         #[cfg(feature = "tlbstats")]
         self.executor.lock().tlb.stats_print();
+        #[cfg(feature = "jitstats")]
+        self.executor.lock().jit_mem_stats.print();
         #[cfg(feature = "instr_stats")]
         {
             let exec = self.executor.lock();

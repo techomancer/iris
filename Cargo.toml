@@ -37,6 +37,17 @@ tlbvmap = []
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
+# jitstats: instrumentation for the JIT inline load/store path
+# (docs/nutlb-design.md, docs/jit-inline-memory.md). Counts, per load/store,
+# how far an access gets through the checks compiled code would emit —
+# nutlb hit -> L1D tag match -> (dirty, for stores) -> (transparent region,
+# under tcache) — and reports the joint rate at exit.
+#
+# The point is tuning, not go/no-go: inline memory access is a prerequisite
+# for TCG/DRC-class performance, and nutlb + tcache exist to enable it. These
+# counters say which cases are worth emitting and where the fallbacks land.
+# Diagnostic only; adds a probe to every cached access.
+jitstats = []
 # nutlb: 256-entry direct-mapped data-side micro-TLB replacing the nanotlb's
 # Read/Write slots (docs/nutlb-design.md). Entries are self-describing —
 # ASID + permission set + TLB generation in the tag — so mode switches,

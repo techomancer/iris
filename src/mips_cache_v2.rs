@@ -429,6 +429,27 @@ pub trait MipsCache: Send + Sync {
     /// phys_addr must be SIZE-aligned. Returns BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE.
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32;
 
+    /// Would the JIT's inline load/store fast path have handled this access
+    /// without calling out to Rust? Side-effect-free predicate, `jitstats`
+    /// only — it exists to size and tune the inline emit before (and while)
+    /// building it, and doubles as the executable spec of what that emit must
+    /// check.
+    ///
+    /// `STORE` selects the store predicate, which is strictly narrower: a
+    /// store may only proceed inline on an already-dirty line, because the
+    /// clean->dirty transition is a read-modify-write on the tag that is not
+    /// worth emitting (the first store to a line calls out; the rest inline).
+    ///
+    /// The stages, in the order compiled code would test them:
+    ///   1. L1D tag matches `phys_addr`      (one 64-bit compare)
+    ///   2. store only: that line is dirty
+    ///   3. tcache only: `phys_addr` is in a transparent (mapped RAM) region
+    ///
+    /// The nutlb hit that must precede all of this is counted separately, in
+    /// the executor — the cache layer never sees translation outcomes.
+    #[cfg(feature = "jitstats")]
+    fn jit_probe<const STORE: bool>(&self, _virt_addr: u64, _phys_addr: u64) -> bool { false }
+
     /// Arbitrary-mask doubleword write — escape hatch for SDL/SDR partial stores.
     /// phys_addr must be 8-byte aligned. val/mask are in MIPS big-endian doubleword space.
     /// Returns BUS_OK, BUS_BUSY, BUS_ERR, or BUS_VCE.
@@ -2753,6 +2774,34 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 FetchInstrResult::hit(slot)
             }
         }
+    }
+
+    #[cfg(feature = "jitstats")]
+    fn jit_probe<const STORE: bool>(&self, virt_addr: u64, phys_addr: u64) -> bool {
+        // Mirrors the R4K hit path in `read`/`write` below. R5000 (2-way) is
+        // reported as never-inlinable: the data address needs way selection
+        // (`dc_data_addr` folds the way into the index), so the first emit
+        // targets 1-way only.
+        if Self::IS_R5K {
+            return false;
+        }
+        let dc_idx = self.dc.get_index(virt_addr);
+        let tag = self.dc.get_tag(dc_idx);
+        if !tag.matches_phys(phys_addr) {
+            return false;
+        }
+        // Stores only proceed inline on an already-dirty line — see the trait
+        // doc. A clean line's dirty transition is a tag RMW, left to Rust.
+        if STORE && !tag.dirty {
+            return false;
+        }
+        // tcache: data comes from the ppmem window, so the region must be
+        // mapped. Without tcache the resident line itself is authoritative
+        // and no bitmap test is needed.
+        #[cfg(feature = "tcache")]
+        { self.tc_transparent(phys_addr) }
+        #[cfg(not(feature = "tcache"))]
+        { true }
     }
 
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
