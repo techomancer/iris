@@ -769,6 +769,111 @@ mod tests {
         assert_eq!(exec.core.cp0_index & 0x80000000, 0x80000000);
     }
 
+    // ---- ASID-mutation nanotlb coherency (docs/nutlb-design.md §1a) ----
+    //
+    // The nanotlb tags a translation by VA only, so its entries are valid only
+    // for the ASID that was live when they were filled. Most ASID switches are
+    // contained by a privilege transition (exception / ERET / Status write),
+    // all of which already flush. These two tests cover the sites where an
+    // ASID changes with *no* transition around it: `MTC0 EntryHi` and `TLBR`.
+    //
+    // Both map the same VA to a different PFN under two ASIDs and check the
+    // second read sees the second page. Without the flush they return the
+    // first page's data.
+
+    /// Set up two TLB entries covering VA 0x1000 — ASID 10 → PFN 0x50,
+    /// ASID 11 → PFN 0x60 — and seed distinct data in each physical page.
+    /// Leaves the executor with ASID 10 live and 0x1000 already resident in
+    /// the nanotlb read slot.
+    fn setup_asid_aliased_page(
+        exec: &mut MipsExecutor<crate::mips_tlb::MipsTlb, PassthroughCache>,
+        mem: &Arc<MockMemory>,
+    ) {
+        // Reset leaves Status.ERL=1, under which KUSEG is unmapped/uncached
+        // identity and the TLB is bypassed entirely (translate_32bit_impl,
+        // segment 0..=3). Clear it so VA 0x1000 actually goes through the TLB.
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.update_translate_fn();
+
+        let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+
+        // VA 0x1000 is the odd page of VPN2=0 (VA bit 12 selects EntryLo1).
+        // EntryLo0 stays invalid; only the odd half is mapped.
+        for (index, asid, pfn) in [(5u32, 10u64, 0x50u64), (6, 11, 0x60)] {
+            exec.core.cp0_index = index;
+            exec.core.cp0_pagemask = 0;
+            exec.core.cp0_entryhi = asid; // VPN2=0
+            exec.core.cp0_entrylo0 = 0;
+            // PFN, Cacheable(3), Dirty, Valid — global bit clear so ASID matters.
+            exec.core.cp0_entrylo1 = (pfn << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            assert_eq!(exec.exec(tlbwi_instr), EXEC_COMPLETE);
+        }
+
+        // Distinct payload in each physical page.
+        mem.set_word(0x50000, 0xAAAA_AAAA);
+        mem.set_word(0x60000, 0xBBBB_BBBB);
+
+        // Run under ASID 10 and prime the nanotlb read slot for VA 0x1000.
+        // The TLBWIs above already flushed the nanotlb, so this read both
+        // verifies the mapping and (re)fills the read slot for VA 0x1000.
+        exec.core.cp0_entryhi = 10;
+        assert_eq!(exec.read_data::<4>(0x1000).unwrap(), 0xAAAA_AAAA,
+                   "setup: ASID 10 should see PFN 0x50");
+    }
+
+    #[test]
+    fn test_mtc0_entryhi_asid_change_invalidates_nanotlb() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_mtc0_entryhi_asid_change_invalidates_nanotlb_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_mtc0_entryhi_asid_change_invalidates_nanotlb_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        setup_asid_aliased_page(&mut exec, &mem);
+
+        // Switch to ASID 11 via MTC0 EntryHi — no privilege transition, so
+        // this instruction's own side-effect handler is the only thing that
+        // can flush the stale slot.
+        exec.core.write_gpr(8, 11); // VPN2=0, ASID=11
+        let mtc0_entryhi = (OP_COP0 << 26) | (0x04 << 21) | (8 << 16) | (10 << 11);
+        assert_eq!(exec.exec(mtc0_entryhi), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_entryhi & 0xFF, 11, "ASID should now be 11");
+
+        assert_eq!(exec.read_data::<4>(0x1000).unwrap(), 0xBBBB_BBBB,
+                   "after MTC0 EntryHi changed ASID 10 -> 11, VA 0x1000 must \
+                    translate through ASID 11's entry (PFN 0x60); reading \
+                    0xAAAAAAAA means a stale nanotlb slot survived the switch");
+    }
+
+    #[test]
+    fn test_tlbr_asid_change_invalidates_nanotlb() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_tlbr_asid_change_invalidates_nanotlb_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_tlbr_asid_change_invalidates_nanotlb_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        setup_asid_aliased_page(&mut exec, &mem);
+
+        // TLBR of index 6 overwrites EntryHi from the entry — pulling ASID 11
+        // in — without touching the TLB and without any privilege transition.
+        exec.core.cp0_index = 6;
+        let tlbr_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x01;
+        assert_eq!(exec.exec(tlbr_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_entryhi & 0xFF, 11, "TLBR should load ASID 11");
+
+        assert_eq!(exec.read_data::<4>(0x1000).unwrap(), 0xBBBB_BBBB,
+                   "after TLBR loaded ASID 11 into EntryHi, VA 0x1000 must \
+                    translate through ASID 11's entry (PFN 0x60); reading \
+                    0xAAAAAAAA means a stale nanotlb slot survived the switch");
+    }
+
     #[cfg(feature = "tlbcheck")]
     #[test]
     fn test_tlbwi_breaks_on_duplicate_entry() {

@@ -5386,6 +5386,23 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     }
 
     fn handle_cp0_side_effects(&mut self, reg: u32) {
+        // EntryHi (reg 10) carries the current ASID in bits [7:0]. The nanotlb
+        // tags hold only a VA, so their validity depends on the ASID that was
+        // live when they were filled. Every *other* invalidation site
+        // (`on_cp0_status_changed`, both `handle_exception` paths,
+        // `exec_eret`) is a privilege transition — which is what normally
+        // contains an ASID switch, since a kernel changes ASID inside EXL and
+        // returns through ERET. A bare `MTC0/DMTC0 EntryHi` has no such
+        // transition around it, so nothing else would flush, and a following
+        // access to a mapped VA could hit a slot filled under the *previous*
+        // ASID and return the wrong address space's physical page.
+        //
+        // Cold path (a handful per context switch), so the unconditional
+        // flush costs nothing measurable. See `exec_tlbr` for the other
+        // ASID-mutating site, and docs/nutlb-design.md §1a.
+        if reg == 10 {
+            self.nanotlb_invalidate();
+        }
         // cheritest: a write to CP0 26 triggers the test device's dump. Routed
         // over the bus, so with no test device mapped it's an ignored GIO access.
         if reg == 26 && self.cheritest_dump_hook {
@@ -5407,7 +5424,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         match funct_val {
             // exec_tlbr/p always return bare EXEC_COMPLETE (no other status
             // possible — they don't mutate the TLB), so run them for effect
-            // then finish here. exec_tlbwi/wr retire PC themselves and may
+            // then finish here. Note "doesn't mutate the TLB" is not the same
+            // as "needs no invalidation": exec_tlbr rewrites EntryHi and so
+            // can change the current ASID, and flushes the nanotlb itself for
+            // that reason. exec_tlbwi/wr retire PC themselves and may
             // return EXEC_BREAKPOINT (feature = "tlbcheck" found a bad write),
             // so their return value is passed straight through.
             FUNCT_TLBR => { self.exec_tlbr(); self.handle_exec_complete() }
@@ -5437,6 +5457,14 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.cp0_entrylo0 = (entry.entry_lo[0] & !1) | g_bit; // Set G bit from EntryHi
         self.core.cp0_entrylo1 = (entry.entry_lo[1] & !1) | g_bit; // Set G bit from EntryHi
         self.core.cp0_pagemask = entry.page_mask;
+
+        // TLBR overwrites EntryHi wholesale from the indexed entry — ASID
+        // bits [7:0] included — so the current ASID can change here even
+        // though the TLB itself is untouched. Same hazard as `MTC0 EntryHi`
+        // (see handle_cp0_side_effects): no privilege transition accompanies
+        // a TLBR, so without this flush a stale nanotlb slot filled under the
+        // old ASID stays live. Cold path.
+        self.nanotlb_invalidate();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBR: Read Index {}\n{}", index, self.tlb.format_entry(index)); }
 
