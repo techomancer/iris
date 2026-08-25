@@ -20,6 +20,18 @@ pub struct TlbAccessStats {
     pub nano_hit:         u64,
     /// NanoTLB misses (fell through to translate()). Equals total translate() calls.
     pub nano_miss:        u64,
+    /// nutlb hits (feature = "nutlb"; Read/Write only — Fetch stays nanotlb).
+    #[cfg(feature = "nutlb")]
+    pub nutlb_hit:        u64,
+    /// nutlb misses (fell through to translate()).
+    #[cfg(feature = "nutlb")]
+    pub nutlb_miss:       u64,
+    /// Of those misses, how many found the set holding a *different* valid
+    /// page — i.e. conflict rather than cold/capacity. High values argue for
+    /// a larger NUTLB_BITS (or associativity); low values say the working set
+    /// simply doesn't fit and more sets won't help.
+    #[cfg(feature = "nutlb")]
+    pub nutlb_conflict:   u64,
     /// Vmap found an entry and ASID/global matched → Hit/Invalid/Modified.
     pub vmap_hit:         u64,
     /// Vmap found an entry but it was Invalid (V=0).
@@ -69,6 +81,18 @@ impl TlbStats {
                     name = NAMES[i], total = nano_total,
                     nh = s.nano_hit,  nhp = pct(s.nano_hit,  nano_total),
                     nm = s.nano_miss, nmp = pct(s.nano_miss, nano_total));
+            }
+            // nutlb layer (Read/Write only; Fetch never routes through it)
+            #[cfg(feature = "nutlb")]
+            {
+                let nu_total = s.nutlb_hit + s.nutlb_miss;
+                if nu_total > 0 {
+                    eprintln!("  [{name}]  nutlb:   total={total}  hit={uh} {uhp:.1}%  miss={um} {ump:.1}%  (conflict={uc} {ucp:.1}% of misses)",
+                        name = NAMES[i], total = nu_total,
+                        uh = s.nutlb_hit,  uhp = pct(s.nutlb_hit,  nu_total),
+                        um = s.nutlb_miss, ump = pct(s.nutlb_miss, nu_total),
+                        uc = s.nutlb_conflict, ucp = pct(s.nutlb_conflict, s.nutlb_miss));
+                }
             }
             // TLB translate() layer — may be called by paths other than nanotlb
             let tr = s.addr32 + s.addr64;
@@ -236,6 +260,12 @@ pub enum TlbResult {
         phys_addr: u64,
         cache_attr: CacheAttr,
         dirty: bool,
+        /// Entry's G (global) bit: the mapping is valid for every ASID.
+        /// Consumed by the nutlb fill path, which uses it to decide whether
+        /// to ASID-qualify the cached tag (docs/nutlb-design.md §3). Threaded
+        /// through here rather than re-probed, so filling costs no second
+        /// lookup.
+        global: bool,
     },
 
     /// TLB miss - no matching entry found
@@ -317,6 +347,20 @@ pub trait Tlb {
     /// Record a nanotlb hit (default no-op; overridden by MipsTlb when tlbstats is on).
     #[cfg(feature = "tlbstats")]
     fn stats_nanotlb_hit(&mut self, _at: AccessType) {}
+    /// Record a nutlb hit (feature = "nutlb").
+    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[inline(always)]
+    fn stats_nutlb_hit(&mut self, _at: AccessType) {}
+    /// Record a nutlb miss.
+    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[inline(always)]
+    fn stats_nutlb_miss(&mut self, _at: AccessType) {}
+    /// Record a nutlb *conflict* miss: the set was occupied by a different
+    /// page. Distinguishes "needs more sets" from cold/capacity misses — the
+    /// number that decides whether NUTLB_BITS should grow.
+    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[inline(always)]
+    fn stats_nutlb_conflict(&mut self, _at: AccessType) {}
     /// Record a nanotlb miss.
     #[cfg(feature = "tlbstats")]
     fn stats_nanotlb_miss(&mut self, _at: AccessType) {}
@@ -842,6 +886,15 @@ impl Tlb for MipsTlb {
         // upper bits (true 64-bit aliasing) can share a vmap slot; that's
         // resolved below either by VMAP_MULTI forcing the linear scan, or by
         // the explicit vcmp/vpn_hi verify against the candidate entry.
+        //
+        // Gated so the vmap can actually be switched off for measurement
+        // (`--no-default-features`). Previously `tlbvmap` gated only
+        // tlbcheck's verification of the vmap, not the vmap itself, so
+        // building without it changed nothing on this path — which made the
+        // question "is the vmap still earning its keep now that nutlb
+        // absorbs most lookups?" unanswerable. Falling through to the MRU
+        // scan below is always correct, just slower.
+        #[cfg(feature = "tlbvmap")]
         {
             let vmap_idx = ((virt_addr as u32) >> 13) as usize;
             let slot = self.vmap[vmap_idx];
@@ -886,6 +939,7 @@ impl Tlb for MipsTlb {
                         phys_addr:  s.pfn_base[idx] | (virt_addr & s.offset_mask),
                         cache_attr: s.cache_attr[idx],
                         dirty,
+                        global:     s.global,
                     };
                 }
                 // Mismatch (VPN or ASID/global). If nothing else aliases
@@ -967,6 +1021,7 @@ impl Tlb for MipsTlb {
                 phys_addr:  s.pfn_base[idx] | (virt_addr & s.offset_mask),
                 cache_attr: s.cache_attr[idx],
                 dirty,
+                global:     s.global,
             };
         }
 
@@ -1180,6 +1235,18 @@ impl Tlb for MipsTlb {
         Ok(())
     }
 
+    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    fn stats_nutlb_hit(&mut self, at: AccessType) {
+        self.stats.by_type[at as usize].nutlb_hit += 1;
+    }
+    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    fn stats_nutlb_miss(&mut self, at: AccessType) {
+        self.stats.by_type[at as usize].nutlb_miss += 1;
+    }
+    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    fn stats_nutlb_conflict(&mut self, at: AccessType) {
+        self.stats.by_type[at as usize].nutlb_conflict += 1;
+    }
     #[cfg(feature = "tlbstats")]
     fn stats_nanotlb_hit(&mut self, at: AccessType) {
         self.stats.by_type[at as usize].nano_hit += 1;
@@ -1240,6 +1307,8 @@ impl Tlb for PassthroughTlb {
                 phys_addr: masked_addr,
                 cache_attr: CacheAttr::Uncached,
                 dirty: true, // All pages are writable in passthrough mode
+                // Identity mapping has no ASID concept — valid for all.
+                global: true,
             }
         } else {
             let vpn2 = virt_addr >> 13;

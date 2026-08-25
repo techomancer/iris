@@ -848,6 +848,136 @@ mod tests {
                     0xAAAAAAAA means a stale nanotlb slot survived the switch");
     }
 
+    /// The nutlb must actually serve repeat accesses, not silently fall
+    /// through to `translate_fn` every time. A structure that is never hit is
+    /// indistinguishable from one that is absent — except in benchmark noise
+    /// — so assert the hit directly via tlbstats counters.
+    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[test]
+    fn test_nutlb_actually_serves_repeat_reads() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_nutlb_actually_serves_repeat_reads_inner(); })
+            .unwrap().join().unwrap();
+    }
+    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    fn test_nutlb_actually_serves_repeat_reads_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        setup_asid_aliased_page(&mut exec, &mem);
+
+        let at = crate::mips_tlb::AccessType::Read as usize;
+        let before = exec.tlb.stats.by_type[at].nutlb_hit;
+
+        // Same page, repeatedly: the first was already primed by setup, so
+        // every one of these must be a hit.
+        for _ in 0..16 {
+            assert_eq!(exec.read_data::<4>(0x1000).unwrap(), 0xAAAA_AAAA);
+        }
+
+        let hits = exec.tlb.stats.by_type[at].nutlb_hit - before;
+        assert_eq!(hits, 16, "all 16 repeat reads of the same page should hit \
+                              the nutlb; got {hits}");
+    }
+
+    /// Two pages 1 MiB apart collide in the same direct-mapped set
+    /// (NUTLB_BITS=8 → index is VA[19:12]). Alternating between them must
+    /// still be *correct*, just slower — this is the conflict-miss case the
+    /// `nutlb_conflict` counter exists to measure.
+    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[test]
+    fn test_nutlb_conflict_set_stays_correct() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_nutlb_conflict_set_stays_correct_inner(); })
+            .unwrap().join().unwrap();
+    }
+    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    fn test_nutlb_conflict_set_stays_correct_inner() {
+        use crate::mips_tlb::MipsTlb;
+        use crate::mips_core::{NUTLB_BITS, nutlb_index};
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.update_translate_fn();
+
+        // Stride that maps to the same set: 1 << (12 + NUTLB_BITS).
+        let stride: u64 = 1 << (12 + NUTLB_BITS);
+        let (va_a, va_b) = (0x1000u64, 0x1000u64 + stride);
+        assert_eq!(nutlb_index(va_a), nutlb_index(va_b), "test needs a real collision");
+
+        let tlbwi = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+        // Both global (G=1 in both EntryLo halves) so ASID is irrelevant here.
+        for (index, va, pfn) in [(5u32, va_a, 0x50u64), (6, va_b, 0x60)] {
+            exec.core.cp0_index = index;
+            exec.core.cp0_pagemask = 0;
+            exec.core.cp0_entryhi = va & !0x1FFF; // VPN2
+            exec.core.cp0_entrylo0 = 1; // G, invalid
+            exec.core.cp0_entrylo1 = (pfn << 6) | (3 << 3) | (1 << 2) | (1 << 1) | 1;
+            assert_eq!(exec.exec(tlbwi), EXEC_COMPLETE);
+        }
+        mem.set_word(0x50000, 0x1111_1111);
+        mem.set_word(0x60000, 0x2222_2222);
+
+        // Alternate: every access evicts the other. Correctness must hold.
+        for _ in 0..8 {
+            assert_eq!(exec.read_data::<4>(va_a).unwrap(), 0x1111_1111);
+            assert_eq!(exec.read_data::<4>(va_b).unwrap(), 0x2222_2222);
+        }
+
+        let at = crate::mips_tlb::AccessType::Read as usize;
+        assert!(exec.tlb.stats.by_type[at].nutlb_conflict > 0,
+                "alternating two pages in one set should register conflict misses");
+    }
+
+    /// Segment (unmapped-window) translations must be cached just like TLB
+    /// ones — the nutlb stores a finished VA->PA mapping, so where it came
+    /// from is irrelevant. kseg0 and kseg1 differ only in cache attribute,
+    /// which is per-entry, so both must round-trip with the right C-field.
+    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[test]
+    fn test_nutlb_caches_segment_translations() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_nutlb_caches_segment_translations_inner(); })
+            .unwrap().join().unwrap();
+    }
+    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    fn test_nutlb_caches_segment_translations_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.update_translate_fn();
+
+        // kseg0 (cached) and kseg1 (uncached) both alias physical 0x2000.
+        mem.set_word(0x2000, 0xCAFE_F00D);
+        let kseg0 = 0xFFFF_FFFF_8000_2000u64;
+        let kseg1 = 0xFFFF_FFFF_A000_2000u64;
+
+        let at = crate::mips_tlb::AccessType::Read as usize;
+
+        for va in [kseg0, kseg1] {
+            // Prime, then confirm subsequent accesses are served from nutlb.
+            assert_eq!(exec.read_data::<4>(va).unwrap(), 0xCAFE_F00D);
+            let before = exec.tlb.stats.by_type[at].nutlb_hit;
+            for _ in 0..4 {
+                assert_eq!(exec.read_data::<4>(va).unwrap(), 0xCAFE_F00D);
+            }
+            let hits = exec.tlb.stats.by_type[at].nutlb_hit - before;
+            assert_eq!(hits, 4,
+                "unmapped-segment VA {va:#x} should be cached in the nutlb \
+                 exactly like a TLB-mapped one; got {hits} hits");
+        }
+
+        // The two windows must keep their distinct cache attributes: kseg0
+        // cacheable (C=3), kseg1 uncached (C=2). A shared/overwritten entry
+        // would show up as the wrong attribute here.
+        assert!(exec.debug_translate(kseg0).is_cached(), "kseg0 must be cacheable");
+        assert!(!exec.debug_translate(kseg1).is_cached(), "kseg1 must be uncached");
+    }
+
     #[test]
     fn test_tlbr_asid_change_invalidates_nanotlb() {
         std::thread::Builder::new()

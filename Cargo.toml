@@ -37,6 +37,18 @@ tlbvmap = []
 # TLB translation statistics: per-AccessType counters for nanotlb, vmap, and
 # MRU scan paths including entries-walked totals.  Print at emulator exit.
 tlbstats = []
+# nutlb: 256-entry direct-mapped data-side micro-TLB replacing the nanotlb's
+# Read/Write slots (docs/nutlb-design.md). Entries are self-describing —
+# ASID + permission set + TLB generation in the tag — so mode switches,
+# exceptions and ERET no longer have to flush the data side; only a real TLB
+# mutation (via the generation counter) retires them. The Fetch slot keeps
+# the old untagged, barrier-flushed nanotlb entry either way.
+#
+# OFF by default while it earns its keep: the incumbent is a 1-entry structure
+# that a previous 4-way experiment LOST to, so this has to be measured, not
+# assumed. Build both ways and compare with `iris-bench matrix` (+ tlbstats
+# for hit/miss/conflict breakdown).
+nutlb = []
 # TLB consistency checker: after every TLBWI/TLBWR, walk the whole JTLB and
 # verify there are no duplicate/overlapping entries, that the shadow array
 # matches the architectural entries, that each MRU list visits every valid

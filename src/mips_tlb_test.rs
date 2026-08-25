@@ -47,7 +47,7 @@ mod tests {
 
         // Test identity mapping for low addresses
         match tlb.translate::<0>(0x1000, 0, AccessType::Read) {
-            TlbResult::Hit { phys_addr, cache_attr, dirty } => {
+            TlbResult::Hit { phys_addr, cache_attr, dirty, .. } => {
                 assert_eq!(phys_addr, 0x1000);
                 assert_eq!(cache_attr, CacheAttr::Uncached);
                 assert!(dirty);
@@ -57,7 +57,7 @@ mod tests {
 
         // Test identity mapping at upper boundary
         match tlb.translate::<0>(0x1FFFFFFF, 0, AccessType::Read) {
-            TlbResult::Hit { phys_addr, cache_attr, dirty } => {
+            TlbResult::Hit { phys_addr, cache_attr, dirty, .. } => {
                 assert_eq!(phys_addr, 0x1FFFFFFF);
                 assert_eq!(cache_attr, CacheAttr::Uncached);
                 assert!(dirty);
@@ -104,7 +104,7 @@ mod tests {
         // Test 1: Even page translation
         let va_even = 0x00200000;
         match tlb.translate::<0>(va_even, asid, AccessType::Read) {
-            TlbResult::Hit { phys_addr, cache_attr, dirty } => {
+            TlbResult::Hit { phys_addr, cache_attr, dirty, .. } => {
                 assert_eq!(phys_addr, 0x50000);
                 assert_eq!(cache_attr, CacheAttr::Cacheable);
                 assert!(dirty);
@@ -115,7 +115,7 @@ mod tests {
         // Test 2: Odd page translation
         let va_odd = 0x00201000;
         match tlb.translate::<0>(va_odd, asid, AccessType::Read) {
-            TlbResult::Hit { phys_addr, cache_attr, dirty } => {
+            TlbResult::Hit { phys_addr, cache_attr, dirty, .. } => {
                 assert_eq!(phys_addr, 0x51000);
                 assert_eq!(cache_attr, CacheAttr::Uncached);
                 assert!(!dirty);

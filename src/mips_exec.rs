@@ -882,11 +882,87 @@ pub const TR_UNCACHED:        u32 = 2; // C=2: Uncached
 pub const TR_CACHEABLE:       u32 = 3; // C=3: Cacheable (write-back)
 pub const TR_CACHEABLE_COH:   u32 = 5; // C=5: Cacheable Coherent Exclusive
 
+/// **Contract:** these two flags are set only on the `translate_fn` slow
+/// path, and are read only by `nutlb_fill`. A nutlb *hit* returns them clear
+/// regardless of the underlying page, because a hit never fills and nothing
+/// else consumes them. Do not add a reader without fixing that.
+///
+/// Set on a successful translation that came from a **TLB-mapped** segment.
+/// Clear for the unmapped windows (kseg0/kseg1/xkphys and the ERL identity
+/// case), which are ASID-independent by construction. Only the nutlb fill
+/// path reads it — see `nutlb_fill`.
+pub const TR_MAPPED: u32 = 1 << 3;
+/// Set on a TLB-mapped translation whose entry had the **G** (global) bit,
+/// meaning the mapping is valid for every ASID. Meaningless unless
+/// `TR_MAPPED` is also set.
+pub const TR_GLOBAL: u32 = 1 << 4;
+
+/// Which privilege modes may reach `va`, as nutlb tag bits (10:8).
+///
+/// **Mirrors the segment decode in `translate_32bit_impl` /
+/// `translate_64bit_impl` and must stay in step with them.** Returns 0 for any
+/// segment shape we decline to cache, which makes `nutlb_fill` skip the write.
+///
+/// The bits are a downward-inclusive *permission set*, so a segment reachable
+/// from user mode also sets the supervisor and kernel bits. That is what makes
+/// the probe's `(virttag & cur_sec_mask) != 0` test correct for kernel code
+/// touching user pages (`copyin`/`copyout`), which is the case a naive
+/// "security level of the page" encoding gets wrong.
+#[cfg(feature = "nutlb")]
+#[inline]
+fn nutlb_perm_bits(va: u64, is_64bit: bool) -> u64 {
+    use crate::mips_core::{NUTLB_TAG_KERNEL, NUTLB_TAG_SUPER, NUTLB_TAG_USER};
+    const ALL:   u64 = NUTLB_TAG_KERNEL | NUTLB_TAG_SUPER | NUTLB_TAG_USER;
+    const SUPER: u64 = NUTLB_TAG_KERNEL | NUTLB_TAG_SUPER;
+    const KERN:  u64 = NUTLB_TAG_KERNEL;
+
+    if !is_64bit {
+        // 32-bit: top 3 bits select the segment.
+        return match (va as u32) >> 29 {
+            0..=3 => ALL,   // kuseg  — TLB mapped, reachable from all modes
+            4 | 5 => KERN,  // kseg0/kseg1 — unmapped, kernel only
+            6     => SUPER, // ksseg  — TLB mapped, supervisor+kernel
+            _     => KERN,  // kseg3  — TLB mapped, kernel only
+        };
+    }
+
+    match va >> 62 {
+        // xuseg: bits 63:40 must be zero to be a valid user address.
+        0 => if (va >> 40) == 0 { ALL } else { 0 },
+        // xsseg
+        1 => SUPER,
+        // xkphys: unmapped kernel window. Cacheable like any other segment —
+        // where the translation *came from* is irrelevant to the nutlb, which
+        // stores a finished VA->PA mapping plus its C-field either way. The
+        // per-sub-range C-field variation is a non-issue: the attribute is
+        // stored per entry in `phys` bits [2:0], and a 4 KiB page lies wholly
+        // within one sub-range. Illegal sub-ranges (bits 61:59 < 2) never
+        // reach a fill because translate_64bit_impl raises before returning ok.
+        2 => KERN,
+        // xkseg, including the 32-bit compatibility windows at 0xFFFFFFFF_*.
+        _ => {
+            if (va >> 32) == 0xFFFFFFFF {
+                match ((va as u32) >> 29) & 0x7 {
+                    // kseg0/kseg1 compat — unmapped, kernel
+                    4 | 5 => KERN,
+                    // ksseg compat is supervisor-reachable; kseg3 compat is not.
+                    6     => SUPER,
+                    _     => KERN,
+                }
+            } else {
+                KERN // true 64-bit xkseg
+            }
+        }
+    }
+}
+
 /// Result of address translation: 8 bytes, no heap.
 ///
 /// Layout when success (EXEC_IS_EXCEPTION clear in `status`):
 ///   `phys`   — 32-bit physical address
 ///   `status` — bits [2:0]: C-field cache attr (TR_UNCACHED/TR_CACHEABLE/TR_CACHEABLE_COH)
+///              bit  [3]:   TR_MAPPED — translation came from the TLB
+///              bit  [4]:   TR_GLOBAL — that TLB entry was global (G=1)
 ///              all other bits 0
 ///
 /// Layout when exception (EXEC_IS_EXCEPTION set in `status`):
@@ -902,6 +978,15 @@ impl TranslateResult {
     #[inline(always)]
     pub fn ok(phys: u64, c_field: u32) -> Self {
         Self { phys: phys as u32, status: c_field }
+    }
+    /// Success from a TLB-mapped segment, carrying the entry's G bit so the
+    /// nutlb can decide whether to tag the fill with an ASID.
+    #[inline(always)]
+    pub fn ok_mapped(phys: u64, c_field: u32, global: bool) -> Self {
+        Self {
+            phys: phys as u32,
+            status: c_field | TR_MAPPED | if global { TR_GLOBAL } else { 0 },
+        }
     }
     #[inline(always)]
     pub fn exc(s: ExecStatus) -> Self {
@@ -2368,6 +2453,25 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// On miss: calls `translate_fn` (the slow path) and fills the slot on success.
     #[inline(always)]
     fn nanotlb_translate<const AT: u8>(&mut self, va: u64) -> TranslateResult {
+        // feature = "nutlb": Read/Write are served by the data-side micro-TLB
+        // instead of the single nanotlb slot. Dispatching here rather than at
+        // each call site means every existing caller (read_data, write_data,
+        // the LL/SC paths, the jitv2 hooks) switches over with no edit, and
+        // the two builds stay trivially comparable for benchmarking.
+        //
+        // Fetch is deliberately NOT routed here — it keeps the untagged,
+        // barrier-flushed nanotlb slot in both builds (docs/nutlb-design.md
+        // §7), so the jitv2 `pcp` tracking below is unaffected either way.
+        #[cfg(feature = "nutlb")]
+        {
+            if AT == AccessType::Read as u8 {
+                return self.nutlb_translate::<false>(va);
+            }
+            if AT == AccessType::Write as u8 {
+                return self.nutlb_translate::<true>(va);
+            }
+        }
+
         let va_page = va & !0xFFF;
         let slot = &self.core.nanotlb[AT as usize];
         if slot.matches(va_page) {
@@ -2390,6 +2494,150 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             }
         }
         result
+    }
+
+    #[cfg(feature = "nutlb")]
+    /// Probe the nutlb for `va` on the Read (`W=false`) or Write (`W=true`)
+    /// array, falling back to `translate_fn` and filling on miss.
+    ///
+    /// The hit test is three checks, and they are *not* foldable into one
+    /// compare (docs/nutlb-design.md §3a):
+    ///
+    /// 1. **Identity** — page number + ASID, one 64-bit compare. `asid_mask`
+    ///    is 0 for a global page, which drops the ASID from both sides.
+    /// 2. **Generation** — the TLB must not have been rewritten since the
+    ///    fill.
+    /// 3. **Permission** — `(virttag & cur_sec_mask) != 0`, a *subset* test:
+    ///    "is the current mode in this page's permitted set". Tag bits 10:8
+    ///    are downward-inclusive (a KUSEG page sets all three), so kernel
+    ///    reaching user memory — the `copyin`/`copyout` path — hits. Folding
+    ///    this into the equality compare is what makes the obvious version of
+    ///    this test wrong: it would spuriously miss on exactly that path.
+    ///
+    /// A permission failure deliberately falls through to the slow path
+    /// rather than raising here, so `cp0_badvaddr` and the rest are set by
+    /// the existing `translate_*bit_impl` code. The nutlb never synthesizes
+    /// an exception.
+    #[inline(always)]
+    fn nutlb_translate<const W: bool>(&mut self, va: u64) -> TranslateResult {
+        let idx = crate::mips_core::nutlb_index(va);
+        let arr = if W { crate::mips_core::NUTLB_WRITE } else { crate::mips_core::NUTLB_READ };
+        let e = &self.core.nutlb[arr][idx];
+
+        let amask = e.asid_mask as u64;
+        let want = (va & !0xFFF) | (self.core.cur_asid as u64 & amask);
+        let have = e.virttag & (!0xFFF | amask);
+
+        // Bitwise `&`, not `&&`: deliberately branchless. Short-circuit `&&`
+        // emits two conditional jumps; `&` costs two extra ALU ops but zero
+        // branches. Measured on an isolated microbenchmark of exactly this
+        // test (200M iterations, x86-64):
+        //
+        //     miss rate     &&        &
+        //        0%       3.60ns   3.76ns    <- && wins only here
+        //        2%       3.78ns   3.76ns    <- crossover
+        //       10%       4.40ns   3.74ns    <- & 15% faster
+        //       50%       7.56ns   3.86ns    <- & 49% faster
+        //
+        // `&&` degrades with the miss rate (mispredicts); `&` is flat. Only a
+        // ~100% hit rate favours branching, and no real workload sits there.
+        //
+        // The permission test is kept separate rather than folded into the
+        // equality compare. Folding *is* constructible — you can pre-derive
+        // per-mode tag/mask pairs so that a permitted page compares equal —
+        // but "any of three permission bits set" is not an equality predicate,
+        // so expressing it that way needs an extra isolate-AND, an inject-OR,
+        // and `cur_sec_mask` maintained in two forms. That is 3-4 added ops to
+        // delete one `test`+`setne`, i.e. a net loss.
+        //
+        // What does NOT work is the tempting one-liner: OR-ing the mode mask
+        // into both sides of the existing compare. The bits then cancel and
+        // the permission stops being checked at all (docs/nutlb-design.md §3a
+        // walks through why that version looks right and isn't).
+        if (want == have)
+            & (e.tlbgen == self.core.tlb_gen)
+            & ((e.virttag & self.core.cur_sec_mask) != 0)
+        {
+            #[cfg(feature = "tlbstats")]
+            self.tlb.stats_nutlb_hit(if W { AccessType::Write } else { AccessType::Read });
+            // Deliberately `ok`, not `ok_mapped`: TR_MAPPED/TR_GLOBAL exist
+            // only to carry the TLB entry's G bit out to `nutlb_fill`, and a
+            // hit never fills. Reconstructing them here would mean stashing
+            // the G bit in the tag purely to hand it back to a caller that
+            // has no use for it. If a future caller ever reads those flags on
+            // a *hit* path, this is where it breaks — add an asid_mask-derived
+            // reconstruction then, and not before.
+            return TranslateResult::ok(e.phys_addr(va), e.cache_attr_raw());
+        }
+
+        #[cfg(feature = "tlbstats")]
+        {
+            let at = if W { AccessType::Write } else { AccessType::Read };
+            // Distinguish conflict from capacity/cold: a valid tag with a
+            // different page number means this set was occupied by someone
+            // else, which is the argument for more sets (or associativity).
+            if e.virttag != 0 && (e.virttag & !0xFFF) != (va & !0xFFF) {
+                self.tlb.stats_nutlb_conflict(at);
+            }
+            self.tlb.stats_nutlb_miss(at);
+        }
+
+        let at = if W { AccessType::Write } else { AccessType::Read };
+        let result = (self.translate_fn)(self, va, at);
+        if !result.is_exception() {
+            self.nutlb_fill::<W>(va, &result);
+        }
+        result
+    }
+
+    #[cfg(feature = "nutlb")]
+    /// Fill the nutlb set for `va` from a successful translation.
+    ///
+    /// Everything the tag needs beyond the translation itself has to be
+    /// re-derived from the *current* CP0 state, because `TranslateResult`
+    /// carries only the physical address and cache attribute. That is why
+    /// this is a separate cold-path function and not inlined into the probe.
+    #[inline]
+    fn nutlb_fill<const W: bool>(&mut self, va: u64, result: &TranslateResult) {
+        use crate::mips_core::*;
+
+        // ERL is a do-not-cache window: while it is set, KUSEG/xuseg are
+        // unmapped identity and the translation is free to recompute, so
+        // there is nothing worth caching (§5). `cur_sec_mask` is 0 here
+        // anyway, so a filled entry could never be hit — skip the write
+        // rather than store something permanently dead.
+        if self.core.cur_sec_mask == NUTLB_SEC_ERL {
+            return;
+        }
+
+        // Which modes may reach this VA. Derived from the *segment*, not from
+        // the current mode: a kernel-mode access to a KUSEG page must store
+        // "all three modes", or user code would miss on it forever after.
+        let perm = nutlb_perm_bits(va, self.core.is_64bit_mode());
+        if perm == 0 {
+            return; // segment shape we don't cache — leave the set alone
+        }
+
+        // ASID qualification comes from the translation itself (TR_MAPPED /
+        // TR_GLOBAL), not from a second TLB lookup: `tlb_translate_impl`
+        // already knows the entry's G bit and threads it through
+        // `TranslateResult::ok_mapped`. Unmapped windows (kseg0/kseg1/xkphys)
+        // never set TR_MAPPED and are ASID-independent by construction.
+        let tlb_mapped = result.status & TR_MAPPED != 0;
+        let global     = result.status & TR_GLOBAL != 0;
+        let (asid, asid_mask) = if tlb_mapped && !global {
+            (self.core.cur_asid as u64, 0xFFu8)
+        } else {
+            (0u64, 0u8)
+        };
+
+        let idx = nutlb_index(va);
+        let arr = if W { NUTLB_WRITE } else { NUTLB_READ };
+        let e = &mut self.core.nutlb[arr][idx];
+        e.virttag   = (va & !0xFFF) | NUTLB_TAG_ERL_OK | perm | asid;
+        e.phys      = (result.phys as u64 & !0xFFF) | (result.status & 0x7) as u64;
+        e.tlbgen    = self.core.tlb_gen;
+        e.asid_mask = asid_mask;
     }
 
     /// Invalidate the nanotlb and drop the cached PCP pointer along with it.
@@ -2570,6 +2818,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.update_translate_fn();
         self.update_fpr_mode();
         self.nanotlb_invalidate();
+        // The nutlb does NOT get flushed here — that is the point of tagging
+        // entries with their permission set. A mode switch changes the mask,
+        // and entries the new mode may not touch simply stop matching.
+        #[cfg(feature = "nutlb")]
+        self.core.refresh_nutlb_context();
     }
 
     /// Execute a single instruction (decode into scratch, then execute).
@@ -3080,6 +3333,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         crate::mips_core::deliver_exception(&mut self.core, status);
 
         self.nanotlb_invalidate();
+        // deliver_exception sets EXL directly on cp0_status (forcing kernel
+        // privilege) without going through write_cp0, so refresh the mask.
+        #[cfg(feature = "nutlb")]
+        self.core.refresh_nutlb_context();
         // Reset delay slot state as we are jumping to a new context
         self.core.in_delay_slot = false;
         status
@@ -3130,6 +3387,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.syscall_pending = true;
         crate::mips_core::deliver_exception(&mut self.core, status);
         self.nanotlb_invalidate();
+        #[cfg(feature = "nutlb")]
+        self.core.refresh_nutlb_context();
         self.core.in_delay_slot = false;
         status
     }
@@ -3356,12 +3615,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let tlb_miss_code = if access_type == AccessType::Write { EXC_TLBS } else { EXC_TLBL };
 
         match result {
-            TlbResult::Hit { phys_addr, cache_attr, dirty } => {
+            TlbResult::Hit { phys_addr, cache_attr, dirty, global } => {
                 if access_type == AccessType::Write && !dirty {
                     if !DEBUG { self.update_tlb_exception_registers::<XTLB>(virt_addr); }
                     TranslateResult::exc(exec_exception(EXC_MOD))
                 } else {
-                    TranslateResult::ok(phys_addr, cache_attr as u32)
+                    // ok_mapped, not ok: this came from the TLB, so the nutlb
+                    // fill needs TR_MAPPED plus the entry's G bit to decide
+                    // whether to ASID-qualify the tag it stores.
+                    TranslateResult::ok_mapped(phys_addr, cache_attr as u32, global)
                 }
             }
             TlbResult::Miss { .. } => {
@@ -5402,6 +5664,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // ASID-mutating site, and docs/nutlb-design.md §1a.
         if reg == 10 {
             self.nanotlb_invalidate();
+            // nutlb needs no flush here — ASID is in the tag, so old-ASID
+            // entries stop matching on their own. Just re-mirror it.
+            #[cfg(feature = "nutlb")]
+            self.core.refresh_nutlb_context();
         }
         // cheritest: a write to CP0 26 triggers the test device's dump. Routed
         // over the bus, so with no test device mapped it's an ignored GIO access.
@@ -5465,6 +5731,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // a TLBR, so without this flush a stale nanotlb slot filled under the
         // old ASID stays live. Cold path.
         self.nanotlb_invalidate();
+        #[cfg(feature = "nutlb")]
+        self.core.refresh_nutlb_context();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBR: Read Index {}\n{}", index, self.tlb.format_entry(index)); }
 
@@ -5502,6 +5770,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
         self.tlb.write(index, entry);
         self.nanotlb_invalidate();
+        // nutlb entries are retired by generation, not by flushing: bumping
+        // invalidates every cached translation in one u32 store.
+        #[cfg(feature = "nutlb")]
+        self.core.tlb_gen_bump();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWI: Write Index {}\n{}", index, self.tlb.format_entry(index)); }
 
@@ -5524,6 +5796,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let entry = self.create_tlb_entry_from_cp0();
         self.tlb.write(index, entry);
         self.nanotlb_invalidate();
+        #[cfg(feature = "nutlb")]
+        self.core.tlb_gen_bump();
 
         if mips_log(MIPS_LOG_TLB) { dlog_dev!(LogModule::Mips, "TLBWR: Write Random Index {}\n{}", index, self.tlb.format_entry(index)); }
 
@@ -5575,6 +5849,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // This is implementation-specific but commonly done
         self.cache.set_llbit(false);
         self.nanotlb_invalidate();
+        // ERET clears ERL/EXL on cp0_status *directly*, not through
+        // write_cp0, so the Status callback never fires and `cur_sec_mask`
+        // would go stale — including the ERL->non-ERL transition that
+        // re-enables the nutlb. Refresh explicitly. Still no flush: the
+        // entries themselves remain valid, only the mask changes.
+        #[cfg(feature = "nutlb")]
+        self.core.refresh_nutlb_context();
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;
@@ -6907,6 +7188,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // this rewind path corrupting state before replay's JIT dispatch
         // ever got a chance to run.
         self.on_cp0_status_changed(0, snapshot.cp0_status);
+        // The restored snapshot brings its own TLB contents, so every cached
+        // nutlb translation describes the *previous* TLB. on_cp0_status_changed
+        // refreshes the mask but deliberately does not flush — bump the
+        // generation to retire the entries themselves.
+        #[cfg(feature = "nutlb")]
+        self.core.tlb_gen_bump();
     }
 
     /// Track a memory write for potential undo
@@ -11896,6 +12183,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsC
         exec.pending_memory_writes.clear();
         exec.update_translate_fn();
         exec.update_fpr_mode();
+        // Restored TLB + CP0 state: retire every cached nutlb translation and
+        // re-derive the permission mask from the loaded Status/EntryHi.
+        #[cfg(feature = "nutlb")]
+        {
+            exec.core.refresh_nutlb_context();
+            exec.core.tlb_gen_bump();
+        }
     }
 }
 
