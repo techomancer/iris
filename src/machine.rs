@@ -20,7 +20,7 @@ unsafe impl Sync for PhysPtr {}
 impl PhysPtr {
     fn get(&self) -> *mut Physical { self.0 }
 }
-use crate::mem::Memory;
+use crate::physical::RamBank;
 use crate::prom::Prom;
 use crate::mc::MemoryController;
 use crate::mips_tlb::MipsTlb;
@@ -289,10 +289,10 @@ impl Machine {
         // RAM banks sized per config. addr_mask is initialized to mem_size-1;
         // remap_banks() updates it via set_addr_mask() when MEMCFG0/1 are written during POST.
         let banks = [
-            Memory::new(cfg.banks[0].max(1) as usize),
-            Memory::new(cfg.banks[1].max(1) as usize),
-            Memory::new(cfg.banks[2].max(1) as usize),
-            Memory::new(cfg.banks[3].max(1) as usize),
+            RamBank::new(cfg.banks[0].max(1) as usize),
+            RamBank::new(cfg.banks[1].max(1) as usize),
+            RamBank::new(cfg.banks[2].max(1) as usize),
+            RamBank::new(cfg.banks[3].max(1) as usize),
         ];
 
         // PROM (1MB at 0x1FC00000). IP22 (Indigo2) uses a different PROM image
@@ -761,6 +761,25 @@ impl Machine {
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
         mc.set_cpu(Arc::downgrade(&cpu_device));
         ioc.set_interrupts(cpu.interrupts_ptr());
+
+        // ppmem: hand the CPU's inline bitmap field to the memory space, so a
+        // MEMCFG remap publishes straight into the object the CPU executes out
+        // of. Safe per `set_bitmap_sink`: the executor is at its final address
+        // by now and the only writer is this same CPU thread's MEMCFG path.
+        #[cfg(feature = "ppmem")]
+        {
+            use crate::ppmem::MappedMemory;
+            if let Some(sp) = phys.ppmem_space() {
+                unsafe { sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr()) };
+            }
+            // Point Physical's cached bitmap at the CPU's field too, or its
+            // direct-access fast path would keep reading the sink the space
+            // just abandoned. Same &mut-through-Arc discipline as init().
+            unsafe {
+                let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
+                (*phys_ptr).resync_ppmem_bitmap();
+            }
+        }
 
         // Wire up the CPU cycle counter for every device that reads it —
         // Rex3::new/Wd33c93a::new run before the CPU exists, so this can't

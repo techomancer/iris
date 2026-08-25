@@ -99,6 +99,7 @@ pub mod build_features {
             ("idle-pause", cfg!(feature = "idle-pause")),
             ("rex-jit", cfg!(feature = "rex-jit")),
             ("lightning", cfg!(feature = "lightning")),
+            ("ppmem", cfg!(feature = "ppmem")),
             ("tlbvmap", cfg!(feature = "tlbvmap")),
             ("tlbstats", cfg!(feature = "tlbstats")),
             ("tlbcheck", cfg!(feature = "tlbcheck")),
@@ -139,6 +140,8 @@ pub mod mips_exec;
 pub mod mips_exec_test;
 pub mod mips_instr_stats;
 pub mod mem;
+#[cfg(feature = "ppmem")]
+pub mod ppmem;
 pub mod mc;
 pub mod machine;
 pub mod eeprom_93c56;

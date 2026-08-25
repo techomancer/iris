@@ -2257,6 +2257,20 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
     }
 
+    /// ppmem: pointer to this executor's inline `ppmem_bitmap` word, for
+    /// `PpMemSpace` to write through on every remap.
+    ///
+    /// Same contract as [`Self::interrupts_ptr`] — call it once the executor is
+    /// at its final address (inside its owning `Arc`), never cache it across a
+    /// move. Unlike `interrupts_ptr` this is deliberately **not** atomic: the
+    /// only writer is the MC's MEMCFG path, which runs on this same CPU thread
+    /// (CPU store → MC register write → `remap_banks` → ppmem), and no device
+    /// ever reads or writes it.
+    #[cfg(feature = "ppmem")]
+    pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
+        &self.core.ppmem_bitmap as *const u64 as *mut u64
+    }
+
     /// Raw pointer to this executor's `MipsCore.interrupts` word, for devices
     /// on other threads that need to set/clear interrupt bits (e.g.
     /// `Ioc::set_interrupts`). Always re-derived from `self` at call time —
@@ -8180,6 +8194,11 @@ pub struct MipsCpu<T: Tlb, C: CpuModel> {
     /// for the process lifetime: `executor` below is the only owner of the
     /// `MipsCore` this points into, and it's never dropped before shutdown.
     interrupts_ptr: *const AtomicU64,
+    /// ppmem: pointer to the executor's inline `ppmem_bitmap` field, handed to
+    /// `PpMemSpace` so remaps publish straight into the CPU. Same
+    /// process-lifetime validity argument as `interrupts_ptr` above.
+    #[cfg(feature = "ppmem")]
+    ppmem_bitmap_ptr: *mut u64,
     pub fasttick_count: Arc<AtomicU64>,
     debug: Arc<AtomicBool>,
     exception_mask: Arc<AtomicU32>,
@@ -8212,6 +8231,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         // safe to take raw pointers into it that outlive this constructor.
         let interrupts_ptr = executor_arc.lock().interrupts_ptr();
         let cycles_ptr = executor_arc.lock().cycles_ptr();
+        #[cfg(feature = "ppmem")]
+        let ppmem_bitmap_ptr = executor_arc.lock().ppmem_bitmap_ptr();
         #[cfg(feature = "jitv2")]
         executor_arc.lock().install_jit_hooks();
 
@@ -8221,6 +8242,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             thread: Mutex::new(None),
             cycles_ptr,
             interrupts_ptr,
+            #[cfg(feature = "ppmem")]
+            ppmem_bitmap_ptr,
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
             exception_mask: Arc::new(AtomicU32::new(0)),
@@ -8279,6 +8302,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// once in `new()` after the executor reached its final address.
     pub fn interrupts_ptr(&self) -> *const AtomicU64 {
         self.interrupts_ptr
+    }
+
+    /// ppmem: pointer to the executor's inline `ppmem_bitmap` field, for
+    /// `PpMemSpace::set_bitmap_sink`. Fixed for the life of this `MipsCpu` —
+    /// taken once in `new()` after the executor reached its final address.
+    #[cfg(feature = "ppmem")]
+    pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
+        self.ppmem_bitmap_ptr
     }
 
     pub fn running_flag(&self) -> Arc<AtomicBool> {
@@ -11671,6 +11702,10 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn debug_adapter(self: Arc<Self>) -> Arc<dyn crate::gdb_stub::CpuDebug>;
     fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr;
     fn interrupts_ptr(&self) -> *const AtomicU64;
+    /// ppmem: the executor's inline `ppmem_bitmap` field, for
+    /// `PpMemSpace::set_bitmap_sink`.
+    #[cfg(feature = "ppmem")]
+    fn ppmem_bitmap_ptr(&self) -> *mut u64;
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore;
     fn register_locks(&self);
     fn load_elf(&self, path: &str) -> Result<String, String>;
@@ -11706,6 +11741,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     }
     fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
+    #[cfg(feature = "ppmem")]
+    fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore { MipsCpu::core_ptr(self) }
     fn register_locks(&self) { MipsCpu::register_locks(self) }
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }

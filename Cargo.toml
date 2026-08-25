@@ -82,6 +82,12 @@ r5ksc_triton = ["r5ksc"]
 # in. OFF by default (the CPU thread spins) — opt in with --features idle-pause;
 # off keeps deterministic-clock and raw-benchmark builds simple.
 idle-pause = []
+# Host-MMU-backed physical paged memory (docs/ppmem-design.md). Replaces the
+# Vec<u32>-plus-addr_mask RAM banks in src/mem.rs with real host mappings, so
+# SIMM mirroring and the low-512KB alias are expressed as repeated mappings
+# instead of masking on every access. Experimental; `Memory` remains the
+# default and the fallback.
+ppmem = []
 default = ["tlbvmap"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
@@ -202,12 +208,18 @@ libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }
+# ppmem's Windows backend (src/ppmem/map_windows.rs) additionally needs
+# Win32_System_Memory (VirtualAlloc2/MapViewOfFile3/UnmapViewOfFile2 placeholder
+# API), Win32_System_SystemInformation (GetSystemInfo, for the 64KB allocation
+# granularity) and Win32_Security — the last is non-obvious: CreateFileMappingW
+# is gated behind it because its second parameter is a SECURITY_ATTRIBUTES
+# pointer, so without it the import fails to resolve.
 # thread_affinity.rs calls SetThreadAffinityMask/GetCurrentThread, whose
 # signatures name Foundation::HANDLE — so Win32_Foundation is required on top of
 # Win32_System_Threading. It used to arrive by feature unification from rfd /
 # socket2 / anstyle-wincon; declare it so the Windows build doesn't depend on
 # who else happens to be in the graph.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_Security"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }

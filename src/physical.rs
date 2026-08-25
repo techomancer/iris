@@ -6,7 +6,12 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, Device
 use crate::devlog::LogModule;
 use crate::exp::eval_const_expr;
 use crate::mips_dis;
-use crate::mem::{Memory, BlackHoleRegion, UnmappedRam};
+use crate::mem::{BlackHoleRegion, UnmappedRam};
+#[cfg(not(feature = "ppmem"))]
+use crate::mem::Memory;
+#[cfg(feature = "ppmem")]
+use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
+
 use crate::prom::PromPort;
 use crate::mc::MemoryController;
 use crate::hpc3::Hpc3;
@@ -16,6 +21,19 @@ use crate::mgras::Mgras;
 use crate::vino::Vino;
 #[cfg(feature = "ultra64")]
 use crate::ultra64::Ultra64;
+
+/// The RAM bank implementation in use.
+///
+/// `Memory` (a `Vec<u32>` plus an address mask) by default; `PpMemory`
+/// (host-MMU-backed, see `docs/ppmem-design.md`) under `--features ppmem`.
+/// The two present the same interface — `BusDevice`, `Resettable`,
+/// `save_bin`/`load_bin`, `snapshot_words`/`restore_words`, `set_addr_mask`
+/// and (under jitv2) `gen_ptr` — so everything below is written against
+/// whichever one is compiled in, with no other differences.
+#[cfg(not(feature = "ppmem"))]
+pub type RamBank = Memory;
+#[cfg(feature = "ppmem")]
+pub type RamBank = PpMemory;
 
 // Error device for unmapped addresses
 struct ErrorBus {
@@ -193,7 +211,26 @@ const MYSTERY_HOLE_END: u32  = 0x02090000;
 /// base_addr. Banks 0/1 occupy lomem slots; banks 2/3 occupy himem slots.
 pub struct Physical {
     // 4 × 128MB RAM banks (0,1 in lomem; 2,3 in himem). base_addr set by remap_banks().
-    banks: [Memory; 4],
+    banks: [RamBank; 4],
+    /// ppmem's 4GB window. Banks are mapped into it by `remap_banks` in
+    /// addition to being installed in `device_map`, so the mapping-based fast
+    /// path and the bus path stay in agreement. `None` if the window could not
+    /// be reserved, in which case only the bus path is used.
+    #[cfg(feature = "ppmem")]
+    ppmem_space: Option<PpMemSpace>,
+    /// Base of ppmem's 4GB data window, or null when ppmem is unavailable.
+    /// Cached here so the hot path is a load + shift + test with no `Option`
+    /// unwrapping and no walk through `PpMemSpace`.
+    #[cfg(feature = "ppmem")]
+    ppmem_base: *mut u8,
+    /// Base of ppmem's 8MB generation window (jitv2 only).
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    ppmem_gen_base: *mut std::sync::atomic::AtomicU64,
+    /// The live mapped-region bitmap. Points at the CPU's inline
+    /// `MipsCore::ppmem_bitmap` once the CPU claims it, at `PpMemSpace`'s own
+    /// `u64` before that — never null, so the test needs no guard.
+    #[cfg(feature = "ppmem")]
+    ppmem_bitmap: *const u64,
 
     pub rex3: Option<Arc<Rex3>>,
     /// Second Newport head (dual-head Indigo2 / `graphics.heads = 2`).
@@ -267,7 +304,7 @@ impl Physical {
 
 impl Physical {
     pub fn new(
-        banks: [Memory; 4],
+        banks: [RamBank; 4],
         rex3: Option<Arc<Rex3>>,
         rex3_head1: Option<Arc<Rex3>>,
         xz: Option<Arc<Xz>>,
@@ -305,8 +342,40 @@ impl Physical {
         const NULL_PTR: *const dyn BusDevice = std::ptr::null::<ErrorBus>();
         let device_map: [*const dyn BusDevice; 65536] = [NULL_PTR; 65536];
 
+        // ppmem: reserve the 4GB window over these banks. A failure here is
+        // not fatal — the bus path works regardless — so log and carry on
+        // rather than refusing to boot.
+        #[cfg(feature = "ppmem")]
+        let ppmem_space = match PpMemSpace::over(&banks) {
+            Ok(sp) => Some(sp),
+            Err(e) => {
+                dlog_dev!(LogModule::Mc, "ppmem: could not reserve 4GB window ({e}); \
+                                          falling back to bus-only access");
+                None
+            }
+        };
+
+        #[cfg(feature = "ppmem")]
+        let (ppmem_base, ppmem_bitmap) = match &ppmem_space {
+            Some(sp) => (sp.window_base(), sp.bitmap_ptr()),
+            None => (std::ptr::null_mut(), std::ptr::null()),
+        };
+        #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+        let ppmem_gen_base = match &ppmem_space {
+            Some(sp) => sp.gen_window_base(),
+            None => std::ptr::null_mut(),
+        };
+
         Self {
             banks,
+            #[cfg(feature = "ppmem")]
+            ppmem_space,
+            #[cfg(feature = "ppmem")]
+            ppmem_base,
+            #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+            ppmem_gen_base,
+            #[cfg(feature = "ppmem")]
+            ppmem_bitmap,
             rex3,
             rex3_head1,
             xz,
@@ -508,6 +577,14 @@ impl Physical {
             &self.banks[3],
         ];
 
+        // ppmem: drop every mapping before re-placing the banks. Safe to leave
+        // the window briefly unmapped — remapping runs inside the CPU's MEMCFG
+        // store during PROM POST, before DMA is running (design doc §5.1).
+        #[cfg(feature = "ppmem")]
+        if let Some(sp) = &self.ppmem_space {
+            sp.clear_mappings();
+        }
+
         // Wipe lomem (0x08000000..0x18000000) and himem (0x20000000..0x30000000) slots
         for base in [LOMEM_BASE, HIMEM_BASE] {
             for i in (base >> 16)..((base + 0x10000000) >> 16) {
@@ -532,6 +609,130 @@ impl Physical {
             for slot in 0..(limit >> 16) {
                 let phys = conf_base + (slot << 16);
                 self.device_map[(phys >> 16) as usize] = bank_ptrs[bank_idx];
+            }
+
+            // ppmem: express the same placement as real host mappings. An
+            // undersized bank repeats to fill `limit`, which is exactly the
+            // SIMM mirroring `addr_mask` encodes — see docs/ppmem-design.md §5.
+            #[cfg(feature = "ppmem")]
+            if let Some(sp) = &self.ppmem_space {
+                // `addr_mask + 1` is the SIMM's mirror period, and `limit` the
+                // configured slot. They are independent: a dual-rank SIMM has a
+                // slot half the size of the bank (each rank placed separately),
+                // while an undersized SIMM in a bigger slot repeats. map_bank
+                // handles both — see its doc comment.
+                let period = (addr_mask as u64).wrapping_add(1);
+                let bank_bytes = self.banks[bank_idx].size() as u64;
+                if period > 0 && period <= bank_bytes {
+                    if let Err(e) =
+                        sp.map_bank(bank_idx, conf_base as u64, limit as u64, period)
+                    {
+                        dlog_dev!(LogModule::Mc,
+                            "ppmem: map_bank({bank_idx}, {conf_base:#x}, {limit:#x}, \
+                             period {period:#x}) failed: {e}");
+                    }
+                } else {
+                    dlog_dev!(LogModule::Mc,
+                        "ppmem: bank {bank_idx} mirror period {period:#x} does not fit \
+                         bank size {bank_bytes:#x}; leaving it to the bus path");
+                }
+            }
+        }
+
+        // ppmem: the low-512KB alias of bank 0 (MC spec — the bottom 512KB
+        // mirrors 0x08000000..0x0807ffff). Mapped as real pages rather than
+        // routed through AliasBus, so it is the same physical memory with no
+        // re-dispatch. AliasBus stays installed in device_map as the bus-path
+        // equivalent; both see identical memory.
+        #[cfg(feature = "ppmem")]
+        if let Some(sp) = &self.ppmem_space {
+            let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == LOMEM_BASE);
+            if bank0_mapped {
+                let alias_len = (ALIAS_END - ALIAS_BASE) as u64;
+                if (self.banks[0].size() as u64) >= alias_len {
+                    if let Err(e) = sp.map_alias(0, ALIAS_BASE as u64, alias_len) {
+                        dlog_dev!(LogModule::Mc, "ppmem: low-512KB alias map failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// ppmem: the 4GB window banks are mapped into, if one was reserved.
+    #[cfg(feature = "ppmem")]
+    pub fn ppmem_space(&self) -> Option<&PpMemSpace> {
+        self.ppmem_space.as_ref()
+    }
+
+    /// Re-read the bitmap sink from the space.
+    ///
+    /// `PpMemSpace::set_bitmap_sink` moves publication from the space's own
+    /// `u64` to the CPU's inline field; without this, `Physical`'s cached
+    /// pointer would keep reading the abandoned one and never see another
+    /// remap. Call immediately after handing the CPU's pointer over.
+    ///
+    /// Takes `&mut self` because it is a post-construction fixup on the same
+    /// footing as `init()`, run before any other thread observes the bus.
+    #[cfg(feature = "ppmem")]
+    pub fn resync_ppmem_bitmap(&mut self) {
+        if let Some(sp) = &self.ppmem_space {
+            self.ppmem_bitmap = sp.bitmap_ptr();
+        }
+    }
+
+    /// Is `addr` backed by a whole directly-mapped 64MB region?
+    ///
+    /// This is the quick test the design calls for: one load of the bitmap,
+    /// one shift of the top bits of the physical address, one AND. A set bit
+    /// means the entire 64MB region is mapped RAM, so a direct host access is
+    /// equivalent to going through the bus.
+    #[cfg(feature = "ppmem")]
+    #[inline(always)]
+    fn ppmem_mapped(&self, addr: u32) -> bool {
+        if self.ppmem_bitmap.is_null() {
+            return false;
+        }
+        let bm = unsafe { *self.ppmem_bitmap };
+        bm & (1u64 << (addr >> crate::ppmem::BITMAP_SHIFT)) != 0
+    }
+
+    /// Host pointer for a directly-mapped physical address, or `None` if the
+    /// address is not in a fully-mapped region (MMIO, unmapped RAM, or ppmem
+    /// unavailable).
+    #[cfg(feature = "ppmem")]
+    #[inline(always)]
+    fn ppmem_ptr(&self, addr: u32) -> Option<*mut u64> {
+        if !self.ppmem_mapped(addr) {
+            return None;
+        }
+        Some(unsafe { self.ppmem_base.add(addr as usize) as *mut u64 })
+    }
+
+    /// Generation counter for a directly-mapped physical address.
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    #[inline(always)]
+    fn ppmem_gen_ptr(&self, addr: u32) -> Option<*const std::sync::atomic::AtomicU64> {
+        if !self.ppmem_mapped(addr) || self.ppmem_gen_base.is_null() {
+            return None;
+        }
+        let page = (addr >> 12) as usize;
+        Some(unsafe { self.ppmem_gen_base.add(page) as *const std::sync::atomic::AtomicU64 })
+    }
+
+    /// Bump generation counters for every page a block write touches — the
+    /// direct-path equivalent of `PpMemory::write_block`'s per-page cursor.
+    #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+    #[inline]
+    fn ppmem_bump_gen_range(&self, addr: u32, qwords: usize) {
+        use std::sync::atomic::Ordering;
+        if self.ppmem_gen_base.is_null() {
+            return;
+        }
+        let first = (addr >> 12) as usize;
+        let last = (addr.wrapping_add(((qwords.max(1) - 1) as u32) * 8) >> 12) as usize;
+        for page in first..=last.max(first) {
+            unsafe {
+                (*(self.ppmem_gen_base.add(page))).fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -792,7 +993,173 @@ impl BusDevice for Physical {
     #[cfg(feature = "jitv2")]
     #[inline(always)]
     fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        // ppmem: the counter for a directly-mapped page is at a constant
+        // offset in the gen window — a pure shift off the physical address,
+        // no bank lookup. See docs/ppmem-design.md §6.2.
+        #[cfg(all(feature = "ppmem", feature = "jitv2"))]
+        if let Some(p) = self.ppmem_gen_ptr(addr) {
+            return p;
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         unsafe { (*device_ptr).gen_ptr(addr) }
+    }
+
+    /// Direct pointer into ppmem's window for a directly-mapped physical
+    /// address, so the cache's line-fill fast path (`mips_cache_v2.rs`) reads
+    /// RAM without a device dispatch.
+    ///
+    /// Falls through to the device's own `mem_ptr` — and thus to `None` for
+    /// MMIO — whenever the address is not backed by a whole mapped region.
+    #[inline]
+    fn mem_ptr(&self, addr: u32) -> Option<*const u64> {
+        #[cfg(feature = "ppmem")]
+        if let Some(p) = self.ppmem_ptr(addr) {
+            return Some(p as *const u64);
+        }
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).mem_ptr(addr) }
+    }
+
+    #[inline]
+    fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+        #[cfg(feature = "ppmem")]
+        if let Some(p) = self.ppmem_ptr(addr) {
+            // Same layout as PpMemory::read_block — storage keeps qwords
+            // rotate_left(32).
+            unsafe {
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = (*p.add(i)).rotate_left(32);
+                }
+            }
+            return BUS_OK;
+        }
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).read_block(addr, buf) }
+    }
+
+    #[inline]
+    fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+        #[cfg(feature = "ppmem")]
+        if let Some(p) = self.ppmem_ptr(addr) {
+            unsafe {
+                for (i, &val) in buf.iter().enumerate() {
+                    *p.add(i) = val.rotate_left(32);
+                }
+            }
+            // The gen bump still has to happen: a cache writeback mutates RAM
+            // under any compiled artifact for those pages.
+            #[cfg(feature = "jitv2")]
+            self.ppmem_bump_gen_range(addr, buf.len());
+            return BUS_OK;
+        }
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).write_block(addr, buf) }
+    }
+}
+
+
+#[cfg(all(test, feature = "ppmem"))]
+mod ppmem_tests {
+    //! Exercises the real `remap_banks` path — the same call the MC makes on a
+    //! MEMCFG write during PROM POST — and checks that the ppmem window ends up
+    //! agreeing with the bus.
+    use super::*;
+    use crate::mc::MemoryController;
+    use crate::ppmem::MappedMemory;
+
+    /// Bank placements exactly as `memcfg_bank_info` decodes them for two
+    /// 128MB SIMMs at LOMEM, which is what `iris.toml`'s default config gives.
+    fn two_128mb_banks() -> [Option<(u32, u32, u32)>; 4] {
+        let m0 = MemoryController::encode_memcfg_half(LOMEM_BASE, 128).unwrap();
+        let m1 = MemoryController::encode_memcfg_half(LOMEM_BASE + BANK_SIZE, 128).unwrap();
+        [
+            MemoryController::memcfg_bank_info(m0, 128),
+            MemoryController::memcfg_bank_info(m1, 128),
+            None,
+            None,
+        ]
+    }
+
+    /// After a remap, every address the bitmap claims is directly mapped must
+    /// read the same through the window as through the bus. A divergence here
+    /// is exactly the bug the direct path could introduce.
+    #[test]
+    fn remap_makes_window_agree_with_bus() {
+        let addrs = two_128mb_banks();
+        assert!(addrs[0].is_some(), "bank 0 should decode");
+
+        let banks = [
+            RamBank::new(128),
+            RamBank::new(128),
+            RamBank::new(8),
+            RamBank::new(8),
+        ];
+        let space = PpMemSpace::over(&banks).expect("reserve window");
+
+        // Drive the same mapping remap_banks would, then verify agreement.
+        space.clear_mappings();
+        for (i, entry) in addrs.iter().enumerate() {
+            let Some((base, _mask, limit)) = *entry else { continue };
+            let period = (_mask as u64).wrapping_add(1);
+            space.map_bank(i, base as u64, limit as u64, period).unwrap();
+        }
+
+        let bm = space.mapped_bitmap();
+        assert_ne!(bm, 0, "two 128MB banks at LOMEM should mark regions mapped");
+
+        // Write through the bus, read through the window, at several offsets
+        // spanning both banks.
+        for (i, entry) in addrs.iter().enumerate() {
+            let Some((base, _, limit)) = *entry else { continue };
+            for off in [0u32, 0x1000, 0x10_0000, limit - 8] {
+                let phys = base + off;
+                if bm & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)) == 0 {
+                    continue; // not a fully-mapped region; bus path only
+                }
+                let val = 0xC0DE_0000_0000_0000u64 | ((i as u64) << 32) | off as u64;
+                banks[i].write64(off, val);
+                let w = unsafe {
+                    *(space.window_base().add(phys as usize) as *const u64)
+                };
+                assert_eq!(
+                    w.rotate_left(32),
+                    val,
+                    "window disagrees with bus at phys {phys:#x} (bank {i} off {off:#x})"
+                );
+            }
+        }
+    }
+
+    /// The bitmap must never claim a region that contains MMIO — otherwise the
+    /// CPU would take the direct path into a device aperture.
+    #[test]
+    fn bitmap_never_claims_device_space() {
+        let banks = [
+            RamBank::new(128),
+            RamBank::new(128),
+            RamBank::new(8),
+            RamBank::new(8),
+        ];
+        let space = PpMemSpace::over(&banks).expect("reserve window");
+        for (i, entry) in two_128mb_banks().iter().enumerate() {
+            let Some((base, mask, limit)) = *entry else { continue };
+            space
+                .map_bank(i, base as u64, limit as u64, (mask as u64) + 1)
+                .unwrap();
+        }
+        let bm = space.mapped_bitmap();
+        let claims = |phys: u32| bm & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)) != 0;
+
+        for (name, addr) in [
+            ("MC", MC_BASE),
+            ("HPC3", HPC3_BASE),
+            ("PROM", PROM_BASE),
+            ("Newport", NEWPORT_BASE),
+            ("GIO slot 0", GIO_SLOT0_BASE),
+            ("GIO slot 1", GIO_SLOT1_BASE),
+            ("low alias", ALIAS_BASE),
+        ] {
+            assert!(!claims(addr), "bitmap wrongly claims {name} at {addr:#x}");
+        }
     }
 }

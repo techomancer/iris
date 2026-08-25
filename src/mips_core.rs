@@ -201,6 +201,21 @@ pub struct MipsCore {
     pub cp0_compare: u64,     // 11: Timer Compare (plain hw counts, low 32 bits)
 
     // PC and branch-delay state — read/written together on every dispatch.
+    /// ppmem: bitmap of which 64MB regions of guest physical space are backed
+    /// by a direct host mapping, one bit per region (`1 << (phys >> 26)`).
+    ///
+    /// Lives inline here — not behind a pointer to `PpMemSpace` — so the hot
+    /// path tests it with a load from the object it is already executing out
+    /// of. `PpMemSpace` holds a `*mut u64` to this field and writes through it
+    /// whenever the MC remaps banks.
+    ///
+    /// Not atomic, deliberately: the only writer is `remap_banks`, reached as
+    /// CPU store → MC register write → ppmem, all on this same CPU thread, and
+    /// no device ever touches it. Zero when ppmem is not in use, which reads as
+    /// "nothing is directly mapped" and keeps every access on the bus path.
+    #[cfg(feature = "ppmem")]
+    pub ppmem_bitmap: u64,
+
     pub pc: u64,         // Program Counter
     /// Whether the instruction about to execute is a branch/jump's delay
     /// slot — set by `branch_delay` when the branch itself dispatches,
@@ -836,6 +851,8 @@ impl MipsCore {
             hot: Hot::default(),
             cp0_count: 0,
             cp0_compare: 0,
+            #[cfg(feature = "ppmem")]
+            ppmem_bitmap: 0,
             pc: 0,
             in_delay_slot: false,
             delay_slot_target: 0,
