@@ -351,18 +351,13 @@ impl From<L2Tag> for u32  { fn from(t: L2Tag) -> Self { t.0 } }
 pub static TC_PROBES: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "tcache", feature = "developer"))]
 pub static TC_HITS: AtomicU64 = AtomicU64::new(0);
-/// Cacheable accesses that fell back to the bus because the bitmap did not
-/// claim the address. Should be ~0 in a healthy run.
-#[cfg(all(feature = "tcache", feature = "developer"))]
-pub static TC_BUS_READS: AtomicU64 = AtomicU64::new(0);
-#[cfg(all(feature = "tcache", feature = "developer"))]
-pub static TC_BUS_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// tcache: (probes, hits) since process start.
 #[cfg(all(feature = "tcache", feature = "developer"))]
 pub fn tc_stats() -> (u64, u64) {
     (TC_PROBES.load(Ordering::Relaxed), TC_HITS.load(Ordering::Relaxed))
 }
+
 
 pub trait CpuModel: MipsCache {
     /// MIPS IV opcodes decode rather than raising Reserved Instruction.
@@ -1325,13 +1320,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 }
             }
         } else {
-            #[cfg(feature = "developer")]
-            {
-                let n = TC_BUS_READS.fetch_add(1, Ordering::Relaxed);
-                if n < 20 {
-                    eprintln!("[tcache] BUS READ{} phys={:#010x}", ACC * 8, phys_addr);
-                }
-            }
             let a = phys_addr as u32;
             if ACC == 8 {
                 self.downstream.read64(a).data
@@ -1369,13 +1357,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             // the gen bump it would have performed has to happen here.
             self.tc_bump_gen(phys_addr);
         } else {
-            #[cfg(feature = "developer")]
-            {
-                let n = TC_BUS_WRITES.fetch_add(1, Ordering::Relaxed);
-                if n < 20 {
-                    eprintln!("[tcache] BUS WRITE{} phys={:#010x}", ACC * 8, phys_addr);
-                }
-            }
             let a = phys_addr as u32;
             if ACC == 8 {
                 self.downstream.write64(a, val);
@@ -4818,6 +4799,44 @@ mod tcache_tests {
         space.clear_mappings();
         assert_eq!(unsafe { *cache.tc_bitmap_ptr() }, 0, "clear did not reach the cache");
         assert!(!cache.tc_transparent(BASE));
+    }
+
+    /// The bus fallback in `tc_read`/`tc_write` is not dead code: the MIPS
+    /// exception vectors live at physical 0x0 / 0x80 / 0x180, which sit in
+    /// bitmap region 0. Only the low 512KB of that 64MB region is ever mapped
+    /// (the alias), so the bitmap cannot claim it and those accesses must take
+    /// the bus. Observed live — the bench harness installs its handlers there
+    /// at startup.
+    #[test]
+    fn exception_vectors_need_the_bus_fallback() {
+        let bank = Arc::new(PpMemory::new(BANK_MB));
+        let space = PpMemSpace::over(std::slice::from_ref(&*bank)).unwrap();
+        space.map_bank(0, BASE, REGION, REGION).unwrap();
+        space.map_alias(0, 0, 512 * 1024).unwrap();
+        let tc = R4400Cache::new(bank.clone() as Arc<dyn BusDevice>);
+        unsafe {
+            tc.set_tcache_window_impl(space.window_base());
+            space.set_bitmap_sink2(tc.tc_bitmap_ptr());
+        }
+
+        for vec in [0x0u64, 0x80, 0x180] {
+            assert!(
+                !tc.tc_transparent(vec),
+                "vector {vec:#x} unexpectedly transparent — region 0 is only \
+                 partially mapped, so the bitmap must not claim it"
+            );
+        }
+        assert!(tc.tc_transparent(BASE), "LOMEM should still be transparent");
+
+        // And the fallback must actually work: a write through the cache to a
+        // vector address has to be readable back.
+        let va = 0xFFFF_FFFF_8000_0000u64; // kseg0 phys 0
+        tc.write::<4>(va, 0x0, 0x0800_0180);
+        assert_eq!(
+            tc.read::<4>(va, 0x0).data as u32,
+            0x0800_0180,
+            "bus fallback did not round-trip an exception-vector write"
+        );
     }
 
     /// Sub-word accesses are where a layout mistake shows up: ppmem swizzles on
