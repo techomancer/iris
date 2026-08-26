@@ -2490,13 +2490,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.status_changed_cb = Some((mips_executor_status_cb::<T, C>, ctx));
     }
 
-    /// Install JIT v2's memory-access and exception-delivery hooks
-    /// (`MipsCore`'s `read*_fn`/`write*_fn`/`handle_exception_fn` fields —
-    /// see their doc comments). Same discipline as `interrupts_ptr`: call
-    /// this once the executor is at its final, stable address (inside its
-    /// owning `Arc<Mutex<...>>`), never before — `ctx` is `self`'s address,
-    /// which must not move again afterward for the life of the process.
-    #[cfg(feature = "jitv2")]
     /// Publish the cache/ppmem base pointers the inline load/store fast path
     /// indexes from compiled code (docs/jit-inline-memory.md §3.2).
     ///
@@ -2528,6 +2521,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         }
     }
 
+    /// Install JIT v2's memory-access and exception-delivery hooks
+    /// (`MipsCore`'s `read*_fn`/`write*_fn`/`handle_exception_fn` fields —
+    /// see their doc comments). Same discipline as `interrupts_ptr`: call
+    /// this once the executor is at its final, stable address (inside its
+    /// owning `Arc<Mutex<...>>`), never before — `ctx` is `self`'s address,
+    /// which must not move again afterward for the life of the process.
+    #[cfg(feature = "jitv2")]
     pub fn install_jit_hooks(&mut self) {
         let ctx = self as *mut Self as *mut core::ffi::c_void;
         self.core.jit_ctx = ctx;
