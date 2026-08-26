@@ -301,6 +301,43 @@ pub struct MipsCore {
     /// (typically a type-erased `*mut MipsExecutor<T,C>` set by the executor after construction).
     pub status_changed_cb: Option<(fn(*mut core::ffi::c_void, u32, u32), *mut core::ffi::c_void)>,
 
+    // ---- jitv2 inline load/store fast path (docs/jit-inline-memory.md §3.2) ----
+    //
+    // Raw bases compiled code indexes directly, off `core_ptr` at fixed
+    // `offset_of!` offsets. Installed by `MipsExecutor::install_jit_mem_ptrs`
+    // from the live `Cache`, which owns the storage.
+    //
+    // SAFETY / lifetime: these alias boxed slices owned by the cache. Their
+    // addresses are stable for the cache's life, but ANY path that can
+    // reallocate the backing storage — snapshot restore, cache reconfigure,
+    // ppmem remap — must re-install them, or compiled code dereferences a
+    // dangling pointer. `jit_dc_tags` null is the "inline path unavailable"
+    // signal; codegen must check it before emitting the fast path.
+    /// Base of the L1-D tag array. Null = inline path unavailable.
+    #[cfg(feature = "jitv2")]
+    pub jit_dc_tags: *mut u8,
+    /// Base of the L1-D data array. Null under tcache (line holds no data).
+    #[cfg(feature = "jitv2")]
+    pub jit_dc_data: *mut u8,
+    /// ppmem window base — tcache's data source (`tc_base + phys`).
+    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    pub jit_tc_base: *mut u8,
+    /// 64MB-granularity mapped-region bitmap; bit `phys >> 26` set = the
+    /// region is fully mapped RAM and reachable through the window.
+    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    pub jit_tc_bitmap: *const u64,
+    /// Base of the L2 tag array (`[L2Tag]`, `u32` each). The inline tcache
+    /// store clears `has_code` on the written line so L1-I refills cannot
+    /// reuse stale decoded instructions — mirroring `tc_invalidate_l2_code`.
+    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    pub jit_l2_tags: *mut u8,
+    /// Base of the jitv2 per-page generation array, indexed by `phys >> 12`.
+    /// An inline store through the ppmem window must bump the entry for the
+    /// page it wrote, exactly as `tc_bump_gen` does, or self-modifying code
+    /// stops retiring compiled regions.
+    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    pub jit_tc_gen: *mut u8,
+
     /// JIT v2: monomorphized C-ABI memory-access and exception-delivery
     /// hooks, installed once by `MipsExecutor::install_jit_hooks` (mirrors
     /// `status_changed_cb`'s established pattern — a type-erased context
@@ -1032,6 +1069,18 @@ impl MipsCore {
             // that has jitv2 compiled units live.
             #[cfg(feature = "jitv2")]
             jit_ctx: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jit_dc_tags: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jit_dc_data: std::ptr::null_mut(),
+            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            jit_tc_base: std::ptr::null_mut(),
+            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            jit_tc_bitmap: std::ptr::null(),
+            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            jit_l2_tags: std::ptr::null_mut(),
+            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            jit_tc_gen: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             read8_fn: jit_hooks_not_installed_read,
             #[cfg(feature = "jitv2")]

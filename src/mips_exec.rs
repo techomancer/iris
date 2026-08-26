@@ -957,6 +957,7 @@ fn nutlb_perm_bits(va: u64, is_64bit: bool) -> u64 {
 }
 
 /// Per-access-class tally of how far a guest load/store would get through the
+/// Per-access-class tally of how far a guest load/store would get through the
 /// checks the JIT's inline memory path emits, before falling back to Rust.
 ///
 /// Each counter is a *prefix* of the next: an access counted in `tag_hit` also
@@ -2448,8 +2449,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// # Safety
     /// Same contract as that method.
     #[cfg(all(feature = "tcache", feature = "jitv2"))]
-    pub unsafe fn set_tcache_gen_window(&self, gen_base: *mut std::sync::atomic::AtomicU64) {
+    pub unsafe fn set_tcache_gen_window(&mut self, gen_base: *mut std::sync::atomic::AtomicU64) {
         unsafe { self.cache.set_tcache_gen_window(gen_base) };
+        // The jitv2 inline store path reads this pointer from `MipsCore` at a
+        // fixed offset, so the copy taken at `install_jit_hooks` time is stale
+        // the moment the window is (re)published — refresh it here. Same for
+        // the transparent base and bitmap, which ppmem wires up in the same
+        // machine.rs block.
+        #[cfg(feature = "jitv2")]
+        self.install_jit_mem_ptrs();
     }
 
     /// Raw pointer to this executor's `MipsCore.interrupts` word, for devices
@@ -2489,9 +2497,41 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// owning `Arc<Mutex<...>>`), never before — `ctx` is `self`'s address,
     /// which must not move again afterward for the life of the process.
     #[cfg(feature = "jitv2")]
+    /// Publish the cache/ppmem base pointers the inline load/store fast path
+    /// indexes from compiled code (docs/jit-inline-memory.md §3.2).
+    ///
+    /// Must be re-run after anything that can move the backing storage —
+    /// snapshot restore, cache reconfigure, ppmem remap — because compiled
+    /// code holds these as plain addresses. Called from `install_jit_hooks`,
+    /// so any path already re-running that is covered.
+    #[cfg(feature = "jitv2")]
+    pub fn install_jit_mem_ptrs(&mut self) {
+        let geom = self.cache.jit_dc_geometry();
+        // Publish for the async compile worker, which owns its Codegen by
+        // value and so cannot be stamped directly (see worker_loop).
+        *self.jitv2.lock().dc_geometry.lock() = geom;
+        if geom.supported {
+            self.core.jit_dc_tags = self.cache.jit_dc_tags_ptr();
+            self.core.jit_dc_data = self.cache.jit_dc_data_ptr();
+        } else {
+            // Null tags = "do not emit the inline path" (R5000's 2-way L1-D,
+            // PassthroughCache, anything else unsupported).
+            self.core.jit_dc_tags = std::ptr::null_mut();
+            self.core.jit_dc_data = std::ptr::null_mut();
+        }
+        #[cfg(feature = "tcache")]
+        {
+            self.core.jit_tc_base = self.cache.tcache_base_ptr();
+            self.core.jit_tc_bitmap = self.cache.tcache_bitmap_ptr() as *const u64;
+            self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
+            self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
+        }
+    }
+
     pub fn install_jit_hooks(&mut self) {
         let ctx = self as *mut Self as *mut core::ffi::c_void;
         self.core.jit_ctx = ctx;
+        self.install_jit_mem_ptrs();
         self.core.read8_fn = jit_read8::<T, C>;
         self.core.read16_fn = jit_read16::<T, C>;
         self.core.read32_fn = jit_read32::<T, C>;
@@ -7365,6 +7405,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
              verification would silently be OFF. The queue must not run under lockstep.");
         let mut ran_out_of_memory = false;
         if let Some(codegen) = codegen.as_mut() {
+            // Stamp the L1-D geometry the inline load/store fast path needs.
+            // Done on every take rather than once at startup so a cache
+            // reconfigure can't leave compiled code indexing the old shape;
+            // it is a plain struct copy on a path that is already compiling.
+            // Stamp the L1-D geometry the inline load/store path needs. No
+            // helper build here — see the note in Jitv2::worker_loop.
+            codegen.dc_geometry = self.cache.jit_dc_geometry();
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
@@ -9391,6 +9438,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         self.executor.lock().tlb.stats_print();
         #[cfg(feature = "jitstats")]
         self.executor.lock().jit_mem_stats.print();
+        #[cfg(feature = "jitv2")]
+        {
+            use std::sync::atomic::Ordering;
+            let e = crate::jitv2::codegen::INLINE_MEM_EMITTED.load(Ordering::Relaxed);
+            let d = crate::jitv2::codegen::INLINE_MEM_DECLINED.load(Ordering::Relaxed);
+            if e + d > 0 {
+                eprintln!("jitv2 inline memory: emitted={e} declined={d}");
+            }
+        }
         #[cfg(feature = "instr_stats")]
         {
             let exec = self.executor.lock();
@@ -9711,7 +9767,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -10792,6 +10848,31 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 writeln!(writer, "j2 fallback: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                             }
                             Some(_) => return Err("Usage: j2 fallback [on|off]".to_string()),
+                        }
+                    }
+                    "inline_mem" => {
+                        // Inline load/store fast path: compiled code performs
+                        // the nutlb probe + L1-D tag check itself and reads or
+                        // writes the line directly, instead of calling out to
+                        // the Rust `read*_fn`/`write*_fn` wrappers on every
+                        // access (docs/jit-inline-memory.md).
+                        //
+                        // Read by codegen at *emit* time, so — like `j2
+                        // fallback` — already-compiled regions keep whatever
+                        // they were built with until a `j2 flush` (CPU
+                        // stopped). That is exactly what makes it usable for
+                        // A/B benchmarking on a live guest: toggle, flush,
+                        // measure, repeat, without rebuilding.
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 inline_mem: {}",
+                                    if crate::jitv2::codegen::inline_mem_enabled() { "on" } else { "off" }).unwrap();
+                            }
+                            Some(on @ ("on" | "off")) => {
+                                crate::jitv2::codegen::set_inline_mem_enabled(on == "on");
+                                writeln!(writer, "j2 inline_mem: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
+                            }
+                            Some(_) => return Err("Usage: j2 inline_mem [on|off]".to_string()),
                         }
                     }
                     "pagewb" => {

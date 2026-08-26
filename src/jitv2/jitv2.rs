@@ -1106,6 +1106,11 @@ pub struct Jitv2 {
     /// exclusion discipline the compile thread already has by construction
     /// (only it ever touches its own moved-out copy).
     pub codegen: Mutex<Option<crate::jitv2::codegen::Codegen>>,
+
+    /// L1-D geometry for the inline load/store fast path, published by the
+    /// CPU (`install_jit_mem_ptrs`) and read by the async compile worker,
+    /// which owns its `Codegen` by value and so cannot be stamped directly.
+    pub dc_geometry: Mutex<crate::mips_cache_v2::JitDcGeometry>,
     /// Event counters, read only under `j2 status` (dev-only display — see
     /// `JitStats`'s own doc comment for why the *fields themselves* still
     /// exist and get threaded through unconditionally: it's cheaper to carry
@@ -1152,6 +1157,7 @@ impl Jitv2 {
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
+            dc_geometry: Mutex::new(crate::mips_cache_v2::JitDcGeometry::unsupported()),
             stats: Arc::new(JitStats::default()),
         }
     }
@@ -2020,6 +2026,19 @@ impl CompileQueue {
         quiesce_in_progress: Arc<AtomicBool>,
         thread_count: usize,
     ) -> crate::jitv2::codegen::Codegen {
+        // Pick up the L1-D geometry the CPU published. The worker owns
+        // `codegen` by value for its whole life, so the CPU cannot stamp it
+        // directly — it goes through `Jitv2::dc_geometry` instead.
+        if let Some(j) = jitv2.as_ref().and_then(|w| w.upgrade()) {
+            codegen.dc_geometry = *j.lock().dc_geometry.lock();
+        }
+        // NOTE: no `emit_mem_helpers()` here. Attempt 2's shared-helper build
+        // called `Module::finalize_definitions()` mid-session, which breaks the
+        // arena's deferred sealing and sends every region into endless
+        // recompilation (~9x slowdown; docs/jit-inline-memory.md §9). The
+        // inline emit needs no helper, so nothing calls it until that is
+        // rebuilt on the forced-seal path (§11).
+
         let mut analyzer = crate::jitv2::analyzer::Analyzer::new();
         let mut pending: crate::jitv2::comp::PendingCount = 0;
         // Wall-clock start of the current unbroken stretch of "queue empty
@@ -4679,6 +4698,13 @@ pub struct Jitv2 {
     /// exclusion discipline the compile thread already has by construction
     /// (only it ever touches its own moved-out copy).
     pub codegen: Mutex<Option<crate::jitv2::codegen::Codegen>>,
+
+    /// L1-D geometry for the inline load/store fast path, published once by
+    /// the CPU thread at startup (`MipsExecutor::publish_jit_dc_geometry`)
+    /// and copied into `Codegen` when the compile worker takes it. Held here
+    /// rather than written straight into `Codegen` because the worker owns
+    /// that by value while compiling.
+    pub dc_geometry: Mutex<crate::mips_cache_v2::JitDcGeometry>,
     /// Event counters, read only under `j2 status` (dev-only display — see
     /// `JitStats`'s own doc comment for why the *fields themselves* still
     /// exist and get threaded through unconditionally: it's cheaper to carry
@@ -4735,6 +4761,7 @@ impl Jitv2 {
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
+            dc_geometry: Mutex::new(crate::mips_cache_v2::JitDcGeometry::unsupported()),
             stats: Arc::new(JitStats::default()),
         }
     }
@@ -5782,6 +5809,14 @@ impl CompileQueue {
         quiesce_in_progress: Arc<AtomicBool>,
         thread_count: usize,
     ) -> crate::jitv2::codegen::Codegen {
+        // Pick up the L1-D geometry the CPU published for the inline
+        // load/store path. The worker owns `codegen` by value for its whole
+        // life, so the CPU cannot stamp it directly — it goes through
+        // `Jitv2::dc_geometry` instead.
+        if let Some(j) = jitv2.as_ref().and_then(|w| w.upgrade()) {
+            codegen.dc_geometry = *j.lock().dc_geometry.lock();
+        }
+
         let mut analyzer = crate::jitv2::analyzer::Analyzer::new();
         let mut pending: crate::jitv2::comp::PendingCount = 0;
         // Wall-clock start of the current unbroken stretch of "queue empty

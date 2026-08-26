@@ -31,6 +31,13 @@ use crate::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, ExecStat
 /// own reusable scratch allocations Cranelift would otherwise reallocate
 /// per function.
 pub struct Codegen {
+    /// L1-D geometry for the inline load/store fast path, published by the
+    /// CPU once at startup (`Jitv2::set_dc_geometry`). `Codegen` is not
+    /// generic over `C: Cache`, so the shape has to arrive as data rather
+    /// than as const-generic parameters. `supported == false` (the default)
+    /// means no inline path is emitted and every access calls out, which is
+    /// always correct — see docs/jit-inline-memory.md §4.
+    pub dc_geometry: crate::mips_cache_v2::JitDcGeometry,
     module: cranelift_jit::JITModule,
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
@@ -175,6 +182,8 @@ struct EmitCtx<'a, 'b> {
     /// `exception_other_word_block` as a literal, so BD is always written
     /// unconditionally at the exception-exit call site itself rather than
     /// trusted from whatever's already live in `core.in_delay_slot`.
+    /// L1-D geometry for the inline memory path, copied from `Codegen`.
+    dc_geometry: crate::mips_cache_v2::JitDcGeometry,
     bd: bool,
     /// `true` iff an exception raised while emitting with this `ctx` must
     /// **trust the live `core.pc`/`core.in_delay_slot`** (route through
@@ -448,6 +457,9 @@ impl Codegen {
             module,
             builder_ctx: FunctionBuilderContext::new(),
             func_id_counter: 0,
+            // Off until the CPU publishes a real geometry; every access
+            // calls out in the meantime, which is the pre-existing behaviour.
+            dc_geometry: crate::mips_cache_v2::JitDcGeometry::unsupported(),
             #[cfg(feature = "developer")]
             last_code_size: 0,
             last_compile_ran_out_of_memory: false,
@@ -879,6 +891,7 @@ impl Codegen {
         has_fpu: bool,
         page: *mut crate::jitv2::PhysicalCodePage,
     ) -> Option<cranelift_module::FuncId> {
+        let dc_geometry = self.dc_geometry;
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
@@ -1044,7 +1057,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: 0, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1101,7 +1114,7 @@ impl Codegen {
                 builder.switch_to_block(stub);
                 let raw = instrs[w as usize].raw;
                 let mut unused_cycles_pending = 0u32;
-                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word: w, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit_dev_trace_bp(&mut trace_ctx, origin);
                 builder.ins().jump(real_target, &[]);
                 builder.seal_block(stub);
@@ -1175,7 +1188,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -1692,6 +1705,7 @@ impl Codegen {
         compiled_for_fr1: bool,
         skip_entry_preamble: bool,
     ) -> Option<crate::jitv2::JitFn> {
+        let dc_geometry = self.dc_geometry;
         instrs[entry_word as usize].is_entry_point = true;
         let has_fpu = instrs_linear(instrs).any(|i| crate::jitv2::analyzer::is_fpu_instruction(i.raw));
         // No real PhysicalCodePage available at this API's call sites
@@ -2886,7 +2900,386 @@ impl MemSize {
 /// a fault before trusting the returned value, exactly like every
 /// interpreter load handler's `match self.read_data(...) { Ok(v) => ...,
 /// Err(status) => ... }`.
+/// Runtime gate for the inline load/store path: **on by default**.
+///
+/// Read at *emit* time only — once per compiled access, never on the hot path
+/// — so flipping it costs nothing at runtime, but already-compiled regions
+/// keep whatever they were built with. `j2 inline_mem on|off` (CPU stopped)
+/// followed by `j2 flush` is what actually switches a running system, which is
+/// how it gets A/B'd on live IRIX where rebuilding is impractical.
+///
+/// `IRIS_NO_INLINE_MEM=1` in the environment forces it off at startup, for
+/// scripted benchmark runs that never touch the monitor.
+///
+/// Defaults on: both `tcache` and non-`tcache` builds pass `cpu-tests`
+/// identically to the callout path.
+static INLINE_MEM_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+static INLINE_MEM_INIT: std::sync::Once = std::sync::Once::new();
+
+pub fn inline_mem_enabled() -> bool {
+    INLINE_MEM_INIT.call_once(|| {
+        if std::env::var_os("IRIS_NO_INLINE_MEM").is_some() {
+            INLINE_MEM_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    INLINE_MEM_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_inline_mem_enabled(on: bool) {
+    // Make sure the env-var default has been consumed first, so a later
+    // `inline_mem_enabled()` cannot overwrite an explicit monitor setting.
+    let _ = inline_mem_enabled();
+    INLINE_MEM_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+
+pub static INLINE_MEM_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INLINE_MEM_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Offsets of the inline load/store fast-path pointers in `MipsCore`.
+fn core_offset_of_jit_dc_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_tags) as i32 }
+#[cfg(not(feature = "tcache"))]
+fn core_offset_of_jit_dc_data() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_data) as i32 }
+#[cfg(feature = "tcache")]
+fn core_offset_of_jit_tc_base() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_base) as i32 }
+#[cfg(feature = "tcache")]
+fn core_offset_of_jit_tc_bitmap() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_bitmap) as i32 }
+#[cfg(feature = "tcache")]
+fn core_offset_of_jit_tc_gen() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_gen) as i32 }
+#[cfg(feature = "tcache")]
+fn core_offset_of_jit_l2_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_l2_tags) as i32 }
+
+/// Byte offset of `L1DTag::ptag` / `::dirty`, and the tag stride. Taken with
+/// `offset_of!` (the type is `#[repr(C)]`) rather than hardcoded — see
+/// docs/jit-inline-memory.md §3.1.
+fn l1d_tag_stride() -> i64 { std::mem::size_of::<crate::mips_cache_v2::L1DTag>() as i64 }
+fn l1d_tag_ptag_off() -> i32 { std::mem::offset_of!(crate::mips_cache_v2::L1DTag, ptag) as i32 }
+fn l1d_tag_dirty_off() -> i32 { std::mem::offset_of!(crate::mips_cache_v2::L1DTag, dirty) as i32 }
+
+/// Result of emitting the shared load/store fast-path preamble: nutlb probe,
+/// L1D tag match, and (tcache) the mapped-region test.
+///
+/// On return the builder is positioned in the **fast block**, where `data_ptr`
+/// is a host address that can be loaded from / stored to directly, already
+/// byte-swizzled for `size`. The caller emits its access there, then jumps to
+/// `join_block`. `slow_block` is pre-created for the caller to fill with the
+/// callout; it must also end by jumping to `join_block`.
+struct InlineMemPath {
+    fast_data_ptr: Value,
+    /// Pointer to the matched L1-D tag, live in the fast block. Stores use it
+    /// to set the dirty flag, mirroring `mark_l1d_dirty`.
+    fast_tag_ptr: Value,
+    /// Physical address of the access, live in the fast block. Needed by the
+    /// tcache store path to index the jitv2 generation array.
+    fast_phys: Value,
+    slow_block: ir::Block,
+    join_block: ir::Block,
+}
+
+/// Emit the guard chain shared by inline loads and stores.
+///
+/// Sequence (docs/jit-inline-memory.md §2):
+///   1. nutlb probe: VA -> phys, else slow
+///   2. L1D tag compare on phys, else slow
+///   3. stores: line already dirty, else slow (the clean->dirty tag RMW stays
+///      in Rust)
+///   4. tcache: region is mapped RAM, else slow
+///
+/// Returns `None` when the inline path must not be emitted at all — the cache
+/// reports an unsupported geometry (R5000 2-way, PassthroughCache), in which
+/// case the caller emits only the callout, exactly as before.
+#[cfg(feature = "nutlb")]
+fn emit_inline_mem_guard<const STORE: bool>(
+    ctx: &mut EmitCtx,
+    vaddr: Value,
+    size: MemSize,
+) -> Option<InlineMemPath> {
+    use crate::mips_core as mc;
+
+    let geom = ctx.dc_geometry;
+    if !geom.supported {
+        return None;
+    }
+
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let i64t = ir::types::I64;
+
+    let slow_block = ctx.builder.create_block();
+    let join_block = ctx.builder.create_block();
+    let fast_block = ctx.builder.create_block();
+
+    // ---- alignment ---------------------------------------------------
+    // Misaligned accesses raise AdEL/AdES; that whole path stays in Rust.
+    // Skipped for 1-byte, which cannot be misaligned.
+    let width = size.width_bytes() as i64;
+    if width > 1 {
+        let low = ctx.builder.ins().band_imm_s(vaddr, width - 1);
+        let misaligned = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, low, 0);
+        let aligned_block = ctx.builder.create_block();
+        ctx.builder.ins().brif(misaligned, slow_block, &[], aligned_block, &[]);
+        ctx.builder.switch_to_block(aligned_block);
+        ctx.builder.seal_block(aligned_block);
+    }
+
+    // ---- 1. nutlb probe ----------------------------------------------
+    // Mirrors MipsExecutor::nutlb_translate exactly (mips_exec.rs). Any
+    // divergence here is a correctness bug, not a performance one.
+    let arr = if STORE { mc::NUTLB_WRITE } else { mc::NUTLB_READ };
+    let set_bytes = std::mem::size_of::<mc::NuTlbEntry>() as i64;
+    let arr_base = std::mem::offset_of!(MipsCore, nutlb) as i64
+        + (arr as i64) * (mc::NUM_NUTLB_ENTRIES as i64) * set_bytes;
+
+    let idx = ctx.builder.ins().ushr_imm_s(vaddr, 12);
+    let idx = ctx.builder.ins().band_imm_s(idx, mc::NUTLB_INDEX_MASK as i64);
+    let byte_off = ctx.builder.ins().imul_imm_s(idx, set_bytes);
+    let entry_off = ctx.builder.ins().iadd_imm_s(byte_off, arr_base);
+    // No uextend: already i64, and ptr_ty is i64 here — Cranelift's verifier
+    // rejects a widening that isn't one, which silently declined every region
+    // containing a load (see docs/jit-inline-memory.md §9).
+    let entry = ctx.builder.ins().iadd(ctx.core_ptr, entry_off);
+
+    let e_virttag = ctx.builder.ins().load(i64t, mem, entry,
+        ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, virttag) as i32));
+    let e_phys = ctx.builder.ins().load(i64t, mem, entry,
+        ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, phys) as i32));
+    let e_gen = ctx.builder.ins().load(ir::types::I32, mem, entry,
+        ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, tlbgen) as i32));
+    let e_amask = ctx.builder.ins().load(ir::types::I8, mem, entry,
+        ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, asid_mask) as i32));
+    let e_amask = ctx.builder.ins().uextend(i64t, e_amask);
+
+    let cur_asid = ctx.builder.ins().load(ir::types::I8, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, cur_asid) as i32));
+    let cur_asid = ctx.builder.ins().uextend(i64t, cur_asid);
+    let cur_sec = ctx.builder.ins().load(i64t, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, cur_sec_mask) as i32));
+    let cur_gen = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, tlb_gen) as i32));
+
+    // want = (va & !0xFFF) | (cur_asid & amask)
+    let va_page = ctx.builder.ins().band_imm_s(vaddr, !0xFFFi64);
+    let asid_bits = ctx.builder.ins().band(cur_asid, e_amask);
+    let want = ctx.builder.ins().bor(va_page, asid_bits);
+    // have = virttag & (!0xFFF | amask)
+    let page_mask = ctx.builder.ins().iconst(i64t, !0xFFFi64);
+    let have_mask = ctx.builder.ins().bor(page_mask, e_amask);
+    let have = ctx.builder.ins().band(e_virttag, have_mask);
+
+    let tag_eq = ctx.builder.ins().icmp(IntCC::Equal, want, have);
+    let gen_eq = ctx.builder.ins().icmp(IntCC::Equal, e_gen, cur_gen);
+    // permission: subset test, NOT foldable into the compare above
+    // (docs/nutlb-design.md §3a)
+    let perm = ctx.builder.ins().band(e_virttag, cur_sec);
+    let perm_ok = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, perm, 0);
+
+    // Cacheability. The Rust path branches on `TranslateResult::is_cached()`
+    // and sends uncached accesses to the bus, never the D-cache — so the
+    // inline path must decline them, or an uncached access could be served
+    // from a stale L1-D line. That is reachable, not theoretical: MIPS maps
+    // the same physical page both cached (kseg0) and uncached (kseg1), so a
+    // line filled through kseg0 carries a physical tag that a later kseg1
+    // access would match. C-field lives in phys[2:0] (TR_UNCACHED == 2).
+    let c_field = ctx.builder.ins().band_imm_s(e_phys, 0x7);
+    let cacheable = ctx.builder.ins().icmp_imm_s(
+        IntCC::NotEqual, c_field, crate::mips_exec::TR_UNCACHED as i64);
+
+    let ok = ctx.builder.ins().band(tag_eq, gen_eq);
+    let ok = ctx.builder.ins().band(ok, perm_ok);
+    let ok = ctx.builder.ins().band(ok, cacheable);
+
+    let xlat_ok_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(ok, xlat_ok_block, &[], slow_block, &[]);
+    ctx.builder.switch_to_block(xlat_ok_block);
+    ctx.builder.seal_block(xlat_ok_block);
+
+    // phys = (e.phys & !0xFFF) | (va & 0xFFF)
+    let phys_page = ctx.builder.ins().band_imm_s(e_phys, !0xFFFi64);
+    let va_off = ctx.builder.ins().band_imm_s(vaddr, 0xFFF);
+    let phys = ctx.builder.ins().bor(phys_page, va_off);
+
+    // ---- 2. L1D tag match --------------------------------------------
+    let tags_base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_dc_tags()));
+    let dc_idx = ctx.builder.ins().ushr_imm_s(vaddr, geom.line_shift as i64);
+    let dc_idx = ctx.builder.ins().band_imm_s(dc_idx, geom.num_lines_mask as i64);
+    let dc_off = ctx.builder.ins().imul_imm_s(dc_idx, l1d_tag_stride());
+    let tag_ptr = ctx.builder.ins().iadd(tags_base, dc_off);
+
+    let ptag = ctx.builder.ins().load(i64t, mem, tag_ptr,
+        ir::immediates::Offset32::new(l1d_tag_ptag_off()));
+    // matches_phys: ptag == (phys & !0xFFF) | 1
+    let want_tag = ctx.builder.ins().band_imm_s(phys, !0xFFFi64);
+    let want_tag = ctx.builder.ins().bor_imm_s(want_tag, 1);
+    let tag_hit = ctx.builder.ins().icmp(IntCC::Equal, ptag, want_tag);
+
+    // Stores work on clean lines too — `mark_l1d_dirty` is a single byte
+    // store to a tag we already have the pointer for (emitted in
+    // `emit_mem_write_split`), so there is no reason to hand the first write
+    // to every line back to the slow path.
+    let proceed = tag_hit;
+
+    // ---- 4. tcache: region must be mapped RAM ------------------------
+    //
+    // `jit_tc_bitmap` is never null here: `install_jit_mem_ptrs` points it at
+    // the cache's own inline bitmap word, which exists from construction, and
+    // ppmem later publishes into that same word rather than replacing the
+    // pointer. No null check is emitted — one on every guest memory access to
+    // paper over a startup ordering problem would be paid forever.
+    #[cfg(feature = "tcache")]
+    let proceed = {
+        let bm_ptr = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(core_offset_of_jit_tc_bitmap()));
+        let bits = ctx.builder.ins().load(i64t, mem, bm_ptr, ir::immediates::Offset32::new(0));
+        let region = ctx.builder.ins().ushr_imm_s(phys, crate::ppmem::BITMAP_SHIFT as i64);
+        let one = ctx.builder.ins().iconst(i64t, 1);
+        let bit = ctx.builder.ins().ishl(one, region);
+        let masked = ctx.builder.ins().band(bits, bit);
+        let mapped = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, masked, 0);
+        ctx.builder.ins().band(proceed, mapped)
+    };
+
+    ctx.builder.ins().brif(proceed, fast_block, &[], slow_block, &[]);
+
+    // ---- fast block: compute the swizzled host address ---------------
+    ctx.builder.switch_to_block(fast_block);
+    ctx.builder.seal_block(fast_block);
+
+    // tcache reads/writes the ppmem window byte-indexed by phys; without it
+    // the L1-D line itself holds the data, virtually indexed. The swizzles
+    // differ because the base units differ (docs/jit-inline-memory.md §2.2).
+    #[cfg(feature = "tcache")]
+    let (base, index) = {
+        let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(core_offset_of_jit_tc_base()));
+        (base, phys)
+    };
+    #[cfg(not(feature = "tcache"))]
+    let (base, index) = {
+        let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(core_offset_of_jit_dc_data()));
+        let masked = ctx.builder.ins().band_imm_s(vaddr, geom.data_mask as i64);
+        (base, masked)
+    };
+
+    let swizzled = emit_swizzle_index(ctx, index, size);
+    let fast_data_ptr = ctx.builder.ins().iadd(base, swizzled);
+
+    Some(InlineMemPath { fast_data_ptr, fast_tag_ptr: tag_ptr, fast_phys: phys, slow_block, join_block })
+}
+
+#[cfg(not(feature = "nutlb"))]
+fn emit_inline_mem_guard<const STORE: bool>(
+    _ctx: &mut EmitCtx, _vaddr: Value, _size: MemSize,
+) -> Option<InlineMemPath> {
+    // The inline path is built on the nutlb probe; without it the first stage
+    // would be the 1-entry nanotlb slot, which is not worth emitting.
+    None
+}
+
+/// Byte index within the data array/window for `size`, applying the
+/// word-swapped storage swizzle. The constants differ between the two data
+/// paths because their base units differ — see docs/jit-inline-memory.md §2.2
+/// and the `tc_read`/`dc_read` pair in mips_cache_v2.rs, which these MUST
+/// match exactly. A wrong constant corrupts only sub-word accesses.
+fn emit_swizzle_index(ctx: &mut EmitCtx, index: Value, size: MemSize) -> Value {
+    let x = swizzle_xor(size);
+    if x == 0 { index } else { ctx.builder.ins().bxor_imm_s(index, x) }
+}
+
+/// Byte-offset XOR that reproduces the word-swapped storage layout, per access
+/// size. Derived from `dc_read`/`dc_write`'s element-index math in
+/// mips_cache_v2.rs and verified against it element-by-element:
+///
+/// | size | element expr            | byte-offset XOR |
+/// |------|-------------------------|-----------------|
+/// | B8   | `data[m >> 3]`          | 0               |
+/// | B4   | `words[(m >> 2) ^ 1]`   | 4               |
+/// | B2   | `halves[(m >> 1) ^ 3]`  | 6               |
+/// | B1   | `bytes[m ^ 7]`          | 7               |
+///
+/// Under tcache the base unit is bytes-into-the-ppmem-window rather than
+/// u64-chunks, so the constants differ — see `tc_read`. A wrong value here
+/// corrupts only sub-word accesses, which is why every size has a lockstep
+/// test rather than being assumed from the 32-bit case.
+fn swizzle_xor(size: MemSize) -> i64 {
+    #[cfg(not(feature = "tcache"))]
+    { match size { MemSize::B8 => 0, MemSize::B4 => 4, MemSize::B2 => 6, MemSize::B1 => 7 } }
+    #[cfg(feature = "tcache")]
+    { match size { MemSize::B8 => 0, MemSize::B4 => 0, MemSize::B2 => 2, MemSize::B1 => 3 } }
+}
+
 fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+    // Inline fast path: nutlb hit + L1-D tag hit (+ mapped region under
+    // tcache) reads the host address directly, no callout. Returns None when
+    // the build/cache cannot support it, in which case only the callout below
+    // is emitted, exactly as before.
+    // Attempt 2 (docs/jit-inline-memory.md §8): call the once-per-module
+    // helper instead of the Rust wrapper. Same single straight-line `call` at
+    // the site — no extra blocks, so the caller's register allocation is
+    // untouched — but the callee returns without entering `read_data` on the
+    // ~82% of loads that hit.
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return emit_mem_read_split(ctx, vaddr, size, path);
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    emit_mem_read_callout(ctx, vaddr, size)
+}
+
+/// Fast/slow join for an inline load. On entry the builder sits in the fast
+/// block with `path.fast_data_ptr` live.
+fn emit_mem_read_split(
+    ctx: &mut EmitCtx, vaddr: Value, size: MemSize, path: InlineMemPath,
+) -> Value {
+    let mem = MemFlagsData::trusted();
+    let i64t = ir::types::I64;
+
+    let val = ctx.builder.append_block_param(path.join_block, i64t);
+
+    // --- fast: load from the swizzled host address ---
+    // Loaded zero-extended to I64, matching the read*_fn wrappers' contract
+    // (callers sign-extend themselves for LB/LH/LW).
+    let raw = ctx.builder.ins().load(size.ir_type(), mem, path.fast_data_ptr,
+                                     ir::immediates::Offset32::new(0));
+    let raw = if size == MemSize::B8 {
+        // tcache's window stores doublewords word-swapped; the cache data
+        // array does not (see tc_read vs dc_read).
+        #[cfg(feature = "tcache")]
+        { ctx.builder.ins().rotl_imm_s(raw, 32) }
+        #[cfg(not(feature = "tcache"))]
+        { raw }
+    } else {
+        ctx.builder.ins().uextend(i64t, raw)
+    };
+    // The callout wrapper sets `core.jit_mem_exc = EXEC_COMPLETE` on success
+    // and every load site runs `emit_check_mem_exc` afterwards. The inline
+    // path never calls that wrapper, so it must clear the flag itself —
+    // otherwise the check picks up a *stale* status from some earlier
+    // faulting access and takes a spurious exception exit. (EXEC_COMPLETE is
+    // 0; this is one store of an immediate.)
+    let zero = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().store(mem, zero, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_mem_exc()));
+
+    ctx.builder.ins().jump(path.join_block, &[raw.into()]);
+
+    // --- slow: the original callout ---
+    ctx.builder.switch_to_block(path.slow_block);
+    ctx.builder.set_cold_block(path.slow_block);
+    ctx.builder.seal_block(path.slow_block);
+    let slow_val = emit_mem_read_callout(ctx, vaddr, size);
+    ctx.builder.ins().jump(path.join_block, &[slow_val.into()]);
+
+    ctx.builder.switch_to_block(path.join_block);
+    ctx.builder.seal_block(path.join_block);
+    val
+}
+
+fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
@@ -2927,6 +3320,139 @@ fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
 /// uniformly for both loads and stores rather than branching on this return
 /// value directly.
 fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<true>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            emit_mem_write_split(ctx, vaddr, value, size, path);
+            return;
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    emit_mem_write_callout(ctx, vaddr, value, size)
+}
+
+/// Fast/slow join for an inline store. On entry the builder sits in the fast
+/// block with `path.fast_data_ptr` live.
+fn emit_mem_write_split(
+    ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize, path: InlineMemPath,
+) {
+    let mem = MemFlagsData::trusted();
+
+    // --- fast: store to the swizzled host address ---
+    // `value` arrives as I64 regardless of size (see emit_mem_write_callout's
+    // doc comment on why the ABI is always u64); narrow it here, which is the
+    // same masking the Rust wrapper does.
+    let narrowed = if size == MemSize::B8 {
+        // tcache's window stores doublewords word-swapped, so `tc_write`
+        // applies `val.rotate_left(32)` on the way in — exactly mirroring the
+        // rotate `tc_read` applies on the way out. The cache data array
+        // (`dc_write`) stores them natively and needs no rotate.
+        #[cfg(feature = "tcache")]
+        { ctx.builder.ins().rotl_imm_s(value, 32) }
+        #[cfg(not(feature = "tcache"))]
+        { value }
+    } else {
+        ctx.builder.ins().ireduce(size.ir_type(), value)
+    };
+    ctx.builder.ins().store(mem, narrowed, path.fast_data_ptr,
+                            ir::immediates::Offset32::new(0));
+
+    // mark_l1d_dirty: one byte store into the tag we already located. Set
+    // unconditionally rather than read-modify-write — it is idempotent, and a
+    // load+branch to skip an already-dirty line costs more than the store.
+    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+    ctx.builder.ins().store(mem, one, path.fast_tag_ptr,
+                            ir::immediates::Offset32::new(l1d_tag_dirty_off()));
+
+    // This mirrors `MipsCache::write`'s hit path exactly — that path is the
+    // specification, and the job here is to reproduce it, not to re-derive
+    // when a generation bump or a tag transition is owed:
+    //
+    //   non-tcache:  dc_write(virt, val) + mark_l1d_dirty(idx)
+    //   tcache:      tc_write(phys, val) + tc_bump_gen(phys)
+    //
+    // Any change to `MipsCache::write`'s hit path must be mirrored here.
+    // tcache: bump the per-page jitv2 generation, exactly as `tc_bump_gen`
+    // does — `gen[phys >> 12] += 1`. Relaxed ordering matches the Rust side.
+    #[cfg(feature = "tcache")]
+    {
+        let ptr_ty = ctx.module.target_config().pointer_type();
+        // No null check: `jit_tc_gen` is published by
+        // `set_tcache_gen_window` (machine.rs) before the CPU thread starts,
+        // and `emit_inline_mem_guard` declines the whole inline path when the
+        // geometry is unsupported. Testing it per store would cost a load and
+        // a branch on every guest write, forever, to cover a window that is
+        // closed before any compiled code exists.
+        let gen_base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(core_offset_of_jit_tc_gen()));
+        let page = ctx.builder.ins().ushr_imm_s(path.fast_phys, 12);
+        let off = ctx.builder.ins().imul_imm_s(page, 8);
+        let gp = ctx.builder.ins().iadd(gen_base, off);
+        let cur = ctx.builder.ins().load(ir::types::I64, mem, gp,
+            ir::immediates::Offset32::new(0));
+        let inc = ctx.builder.ins().iadd_imm_s(cur, 1);
+        ctx.builder.ins().store(mem, inc, gp, ir::immediates::Offset32::new(0));
+
+        // tc_invalidate_l2_code: writing the line makes L2's decoded
+        // instruction slots for it stale, so clear `has_code` if this line is
+        // the one L2 currently holds. Mirrors mips_cache_v2.rs exactly:
+        //
+        //   if tag.has_code() && tag.ptag() == l2_ptag(phys) { tag.set_has_code(false) }
+        //
+        // Skipped entirely when the build has no L2, matching that function's
+        // own `if !HAS_L2 { return }`.
+        if ctx.dc_geometry.has_l2 {
+            let l2_base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+                ir::immediates::Offset32::new(core_offset_of_jit_l2_tags()));
+            let l2_idx = ctx.builder.ins().ushr_imm_s(
+                path.fast_phys, ctx.dc_geometry.l2_line_shift as i64);
+            let l2_idx = ctx.builder.ins().band_imm_s(
+                l2_idx, ctx.dc_geometry.l2_num_lines_mask as i64);
+            // L2Tag is a u32 bitfield: ptag [18:0], has_code bit 25.
+            let l2_off = ctx.builder.ins().imul_imm_s(l2_idx, 4);
+            let tp = ctx.builder.ins().iadd(l2_base, l2_off);
+            let tag = ctx.builder.ins().load(ir::types::I32, mem, tp,
+                ir::immediates::Offset32::new(0));
+
+            let has_code = ctx.builder.ins().band_imm_s(tag, 1i64 << 25);
+            let has_code = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, has_code, 0);
+
+            let want_ptag = ctx.builder.ins().ushr_imm_s(
+                path.fast_phys, crate::mips_cache_v2::L2_PTAG_SHIFT as i64);
+            let want_ptag = ctx.builder.ins().band_imm_s(
+                want_ptag, crate::mips_cache_v2::L2_PTAG_MASK as i64);
+            let want_ptag = ctx.builder.ins().ireduce(ir::types::I32, want_ptag);
+            let cur_ptag = ctx.builder.ins().band_imm_s(
+                tag, crate::mips_cache_v2::L2_PTAG_MASK as i64);
+            let ptag_eq = ctx.builder.ins().icmp(IntCC::Equal, cur_ptag, want_ptag);
+
+            let clear = ctx.builder.ins().band(has_code, ptag_eq);
+            // Branchless: recompute the tag either way and store the selected
+            // one. A store to a line L2 does not hold would be wrong, so the
+            // select picks the unmodified tag in that case.
+            let cleared = ctx.builder.ins().band_imm_s(tag, !(1i64 << 25));
+            let new_tag = ctx.builder.ins().select(clear, cleared, tag);
+            ctx.builder.ins().store(mem, new_tag, tp, ir::immediates::Offset32::new(0));
+        }
+    }
+
+    let zero = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().store(mem, zero, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_mem_exc()));
+    ctx.builder.ins().jump(path.join_block, &[]);
+
+    // --- slow: the original callout ---
+    ctx.builder.switch_to_block(path.slow_block);
+    ctx.builder.set_cold_block(path.slow_block);
+    ctx.builder.seal_block(path.slow_block);
+    emit_mem_write_callout(ctx, vaddr, value, size);
+    ctx.builder.ins().jump(path.join_block, &[]);
+
+    ctx.builder.switch_to_block(path.join_block);
+    ctx.builder.seal_block(path.join_block);
+}
+
+fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
@@ -7702,7 +8228,8 @@ mod tests {
                 // Test harness for preamble emitters only (see this
                 // function's doc comment) — never touches cycles bookkeeping.
                 let mut unused_cycles_pending = 0u32;
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let dc_geometry = crate::mips_cache_v2::JitDcGeometry::unsupported();
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves

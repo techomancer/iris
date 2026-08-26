@@ -176,7 +176,43 @@ impl From<L1ITag> for u32 {
 //   [27] W (write-back)  [25:24] CS  [23:0] PTag
 // W' and P are parity over fields we do not model, so they stay zero.
 // Conversion: From<u32>/Into<u32> for snapshot save/load only.
+/// Geometry the jitv2 inline load/store path needs as codegen immediates.
+/// `supported == false` means the cache cannot serve the inline path at all
+/// (no cache, or a shape the first implementation does not cover, e.g. R5000's
+/// 2-way L1-D — see docs/jit-inline-memory.md §4).
+#[derive(Clone, Copy, Debug)]
+pub struct JitDcGeometry {
+    pub supported: bool,
+    /// `addr >> line_shift & num_lines_mask` = tag index.
+    pub line_shift: u32,
+    pub num_lines_mask: u64,
+    /// `virt_addr & data_mask` = byte offset into the data array.
+    pub data_mask: u64,
+    /// L2 present at all (`HAS_L2`). When false the inline tcache store skips
+    /// the decoded-instruction invalidation entirely, matching
+    /// `tc_invalidate_l2_code`'s own early return.
+    pub has_l2: bool,
+    /// `phys >> l2_line_shift & l2_num_lines_mask` = L2 tag index.
+    pub l2_line_shift: u32,
+    pub l2_num_lines_mask: u64,
+}
+
+impl JitDcGeometry {
+    pub const fn unsupported() -> Self {
+        Self {
+            supported: false, line_shift: 0, num_lines_mask: 0, data_mask: 0,
+            has_l2: false, l2_line_shift: 0, l2_num_lines_mask: 0,
+        }
+    }
+}
+
+/// `#[repr(C)]`: jitv2's inline load/store fast path addresses `ptag` and
+/// `dirty` directly from compiled code at fixed byte offsets within the tag
+/// array (docs/jit-inline-memory.md §3.1), the same requirement `MipsCore`
+/// documents for itself. Offsets are taken with `offset_of!` at codegen time,
+/// never hardcoded — but the layout must at least be stable and declared.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct L1DTag {
     /// Encoded tag: 0 = invalid; `(phys_line_base & !0xFFF) | 1` = valid.
     pub ptag: u64,
@@ -391,6 +427,58 @@ pub trait MipsCache: Send + Sync {
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
     #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
+
+    /// tcache: base of the ppmem window this cache reads/writes through
+    /// (`tc_base + phys`). Null until `set_transparent_base` runs.
+    #[cfg(feature = "tcache")]
+    fn tcache_base_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+
+    /// tcache: base of the jitv2 per-page generation array (`[AtomicU64]`,
+    /// indexed by `phys >> 12`). An inline store through the ppmem window
+    /// must bump this or self-modifying code stops invalidating compiled
+    /// regions — see `tc_bump_gen`. Null when jitv2/ppmem is not wired up.
+    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    fn tcache_gen_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+
+    // ---- jitv2 inline load/store fast path (docs/jit-inline-memory.md) ----
+    //
+    // Raw bases the JIT's compiled code indexes directly, mirrored into
+    // `MipsCore` by `install_jit_mem_ptrs` so compiled code can reach them at
+    // a fixed offset off `core_ptr`. Backing storage is a boxed slice with a
+    // stable address, so caching the pointer is sound — but any path that can
+    // reallocate it (snapshot restore, reconfigure) MUST re-install.
+    //
+    // Default null: a null `jit_dc_tags` is the signal that this cache cannot
+    // support the inline path, and codegen must not emit it.
+
+    /// L1-D-resident fast read for the jitv2 memory hooks: on a tag hit
+    /// return the data, else `None` so the caller runs the full path.
+    ///
+    /// Deliberately does no fill, no LRU update, no breakpoint check and no
+    /// bus access — each of those is a reason to decline instead. See
+    /// docs/jit-inline-memory.md §7: the guard lives here, in one Rust
+    /// function, rather than as per-access Cranelift IR.
+    fn jit_fast_read<const SIZE: usize>(&self, _virt: u64, _phys: u64) -> Option<u64> { None }
+
+    /// L1-D-resident fast write. Declines unless the line is present *and*
+    /// already dirty: the clean->dirty transition is a tag read-modify-write
+    /// the slow path owns.
+    fn jit_fast_write<const SIZE: usize>(&self, _virt: u64, _phys: u64, _val: u64) -> bool { false }
+
+    /// Base of the L2 tag array (`[L2Tag]`, one `u32` each). The inline
+    /// tcache store path uses it to clear `has_code` for the written line,
+    /// mirroring `tc_invalidate_l2_code`. Null when there is no L2.
+    fn jit_l2_tags_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+
+    /// Base of the L1-D tag array (`[L1DTag]`). Null if unsupported.
+    fn jit_dc_tags_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+    /// Base of the L1-D data array (`[u64]`). Null under tcache, where the
+    /// line holds no data and reads go to the ppmem window instead.
+    fn jit_dc_data_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+    /// Number of L1-D tag entries, and the line shift used to index them.
+    /// Codegen needs these as immediates; they are const-generic on the cache
+    /// type and differ between R4400 and R5000.
+    fn jit_dc_geometry(&self) -> JitDcGeometry { JitDcGeometry::unsupported() }
 
     /// tcache + jitv2: hand the cache ppmem's generation-window base, so window
     /// writes bump the per-page counter jitv2 validates compiled code against.
@@ -2665,6 +2753,71 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
     #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap_ptr() }
+
+    #[cfg(feature = "tcache")]
+    fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
+
+    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
+
+    fn jit_l2_tags_ptr(&self) -> *mut u8 {
+        if !HAS_L2 {
+            return std::ptr::null_mut();
+        }
+        unsafe { (*self.l2.tags.get()).as_mut_ptr() as *mut u8 }
+    }
+
+    fn jit_dc_tags_ptr(&self) -> *mut u8 {
+        unsafe { (*self.dc.tags.get()).as_mut_ptr() as *mut u8 }
+    }
+
+    fn jit_dc_data_ptr(&self) -> *mut u8 {
+        // tcache: the line holds no data for cacheable RAM, so there is
+        // nothing here for compiled code to read — it must use the ppmem
+        // window instead (docs/jit-inline-memory.md §2.1).
+        #[cfg(feature = "tcache")]
+        { std::ptr::null_mut() }
+        #[cfg(not(feature = "tcache"))]
+        { unsafe { (*self.dc.data.get()).as_mut_ptr() as *mut u8 } }
+    }
+
+    fn jit_dc_geometry(&self) -> JitDcGeometry {
+        // First implementation is 1-way only: R5000's 2-way L1-D folds the
+        // way into the data address (`dc_data_addr`), which compiled code
+        // does not yet select. Report unsupported so codegen keeps calling
+        // out rather than emitting a wrong address.
+        if Self::IS_R5K {
+            return JitDcGeometry::unsupported();
+        }
+        // Under tcache the inline path reads the ppmem window and bumps the
+        // jitv2 generation array directly, so both pointers must be live
+        // before any region compiles. They are published by machine.rs before
+        // the CPU thread starts; declining here (rather than null-checking in
+        // every emitted access) is what lets the emitted code assume them.
+        #[cfg(all(feature = "tcache", feature = "jitv2"))]
+        {
+            if unsafe { *self.tc_base.get() }.is_null()
+                || unsafe { *self.tc_gen.get() }.is_null()
+            {
+                return JitDcGeometry::unsupported();
+            }
+            // The inline store clears L2's has_code bit directly, so the tag
+            // base must be live too. (It is a boxed slice allocated in
+            // `new`, so this only guards against a future refactor.)
+            if HAS_L2 && self.jit_l2_tags_ptr().is_null() {
+                return JitDcGeometry::unsupported();
+            }
+        }
+        JitDcGeometry {
+            supported: true,
+            line_shift: Self::DC_LINE_SHIFT,
+            num_lines_mask: (DC_SIZE / DC_LINE - 1) as u64,
+            data_mask: (DC_SIZE - 1) as u64,
+            has_l2: HAS_L2,
+            l2_line_shift: L2_LINE.trailing_zeros(),
+            l2_num_lines_mask: if HAS_L2 { (L2_CACHE_SIZE / L2_LINE - 1) as u64 } else { 0 },
+        }
+    }
 
     #[cfg(all(feature = "tcache", feature = "jitv2"))]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
