@@ -295,8 +295,31 @@ jobs:
 
       # One place both results are visible, and the only thing that turns a
       # cpu-tests failure count red.
+      #
+      # The gate is a *baseline*, not zero. cpu-tests has never returned 0:
+      # 29f5602 grew the fpu group to 88 tests and landed 121 known failures
+      # with it, each one a deliberate finding written up in
+      # cpu-tests/docs/findings.md §6-§10 (no Unimplemented Operation, inert
+      # FCSR.FS, a trapped exception still writes its result, FCSR.Cause
+      # accumulates). Those are spec gaps in IRIS's FPU exception model, not
+      # regressions, and the count is the record of them. A later `rc == 0`
+      # gate was therefore unsatisfiable from the day it was written.
+      #
+      # So: more failures than the baseline is a regression and fails. Fewer
+      # means a gap was closed — that passes, and asks for the baseline to come
+      # down, which is what keeps this number honest instead of drifting up.
+      # Lower it in the same commit that closes the gap.
+      #
+      # CPUTEST_BASELINE is uniform across all four cells at 61: r5000 skips
+      # some R4400-only checks (2071 passed vs 2101) but fails the identical
+      # fpu set, and jitv2 matches the interpreter check-for-check. Measured
+      # 2026-08-26 on all four cells. A tcache build would be 63 — see
+      # rules/testing/tcache-discards-dirty-data-semantics.md — but no cell
+      # builds tcache today.
       - name: Result
         if: always()
+        env:
+          CPUTEST_BASELINE: 61
         run: |
           {
             echo "### ${{ matrix.cpu }} / ${{ matrix.engine }}"
@@ -306,9 +329,21 @@ jobs:
               || echo " bench: no result"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "${CPUTEST_RC:-1}" != "0" ]; then
-            echo "::error::cpu-tests reported ${CPUTEST_RC:-?} failing checks"
+
+          # Unset means the cpu-tests step never recorded a result — the run
+          # died before the gate could learn anything. That is a failure, and
+          # deliberately not the same message as "too many checks failed".
+          if [ -z "${CPUTEST_RC:-}" ]; then
+            echo "::error::cpu-tests recorded no result"
             exit 1
+          fi
+          if [ "$CPUTEST_RC" -gt "$CPUTEST_BASELINE" ]; then
+            echo "::error::cpu-tests reported $CPUTEST_RC failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_RC - CPUTEST_BASELINE )) new"
+            exit 1
+          fi
+          if [ "$CPUTEST_RC" -lt "$CPUTEST_BASELINE" ]; then
+            echo "::notice::cpu-tests improved to $CPUTEST_RC failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
+            echo "cpu-tests improved to $CPUTEST_RC (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
 
       - uses: actions/upload-artifact@v4
