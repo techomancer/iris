@@ -1072,9 +1072,12 @@ mod tests {
     fn every_cell_name_is_unique_and_maps_to_a_cpu() {
         for (i, a) in CELLS.iter().enumerate() {
             assert!(a.expect_cpu == "R4400" || a.expect_cpu == "R5000");
-            // An r5k cell must actually ask for the r5k feature, or the guard
-            // in `matrix` would reject its own build.
-            assert_eq!(a.expect_cpu == "R5000", a.features.contains("r5k"), "{}", a.name);
+            // `expect_cpu` is what the `matrix` guard compares the guest's
+            // `#machine cpu=` line against, so it must describe the `--cpu`
+            // this cell actually passes. CPU is a runtime flag (see `Cell::cpu`),
+            // not a cargo feature, so the two agreeing is the whole contract.
+            let want = match a.cpu { "r4400" => "R4400", "r5000" => "R5000", c => panic!("{}: unknown --cpu {}", a.name, c) };
+            assert_eq!(a.expect_cpu, want, "{}", a.name);
             for b in CELLS.iter().skip(i + 1) { assert_ne!(a.name, b.name); }
         }
     }
