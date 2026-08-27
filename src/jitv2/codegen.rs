@@ -4509,12 +4509,12 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
     }
 
     let slot_word = word + 1;
-    // `ForeignPageSlot` (word == 1023, analyzer's `is_0xffc_branch`): no
-    // `instrs[slot_word]` to inline at all (`slot_word == WORDS_PER_PAGE`,
-    // one past the array) — arm the pending transfer instead of executing a
-    // slot that isn't on this page, exactly like emit_branch_or_jump's own
-    // `foreign_page_slot` handling.
-    if slot_word as usize >= ENTRIES_PER_PAGE {
+    // Nothing to inline (`is_inlinable`): in practice the `ForeignPageSlot`
+    // 0xFFC hazard (word == 1023, analyzer's `is_0xffc_branch`), where the
+    // slot lives on the next page. Arm the pending transfer instead of
+    // executing a slot that isn't part of this region, exactly like
+    // emit_branch_or_jump's own handling.
+    if !is_inlinable(instrs, slot_word) {
         emit_foreign_page_slot_exit(ctx, word, target_addr);
         return;
     }
@@ -4809,6 +4809,46 @@ fn emit_vbase(ctx: &mut EmitCtx) -> Value {
     ctx.builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1))
 }
 
+/// Can codegen inline `word`'s own semantics into the region it is currently
+/// emitting?
+///
+/// Every way the answer can be "no" collapses to the same analyzer-side fact
+/// — the walker never marked the word visited — and to the same codegen-side
+/// consequence: this word's instruction is not part of the compiled unit, so
+/// its semantics must be *deferred* to the next dispatch rather than emitted
+/// here. The three ways in:
+///
+/// - **Off the page.** `word >= ENTRIES_PER_PAGE`: `visit`/`visit_slot` both
+///   return early on `offset >= WORDS_PER_PAGE`. The 0xFFC hazard (§2.3) is
+///   this case — a branch/jump at word 1023 whose mandatory delay slot is the
+///   next physical page's word 0, recorded as `StopReason::ForeignPageSlot`.
+///   Indexing `instrs` here is not merely wrong, it panics; that is the bug
+///   this helper exists to make unrepresentable (see
+///   `rules/jitv2/nested-delay-slot-across-page-boundary.md`).
+/// - **Forbidden.** `Classify::Excluded` (with fallback admission off) or
+///   `Classify::RegionBoundary` — `visit` returns `false` without marking, and
+///   the caller records `StopReason::Excluded` on its own edge.
+/// - **Over budget.** `budget.remaining == 0` in `visit` — the caller records
+///   `StopReason::Truncated` on itself.
+///
+/// The bounds test alone is the *weaker* check, and deliberately not what this
+/// returns: `compile_region_uncommitted`'s upfront rejection loop iterates
+/// `instrs_linear` (visited words only), so an unvisited word has never been
+/// checked for having a semantics emitter at all. Emitting one is exactly as
+/// unsound as reading past the array — it just fails later and less loudly.
+/// `try_emit_fused_lui` already paired the two tests by hand; this is that
+/// pairing, named once.
+///
+/// Callers that get `false` must emit the deferring exit appropriate to their
+/// position — `emit_foreign_page_slot_exit` (arm `in_delay_slot`/
+/// `delay_slot_target`, land `core.pc` on the word itself) for a delay slot
+/// whose transfer is still pending, `emit_foreign_page_annulled_not_taken_exit`
+/// for an annulled Likely slot that must never run. Never a NOP, and never
+/// silently skipped: the instruction still executes, just on the next dispatch.
+fn is_inlinable(instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> bool {
+    (word as usize) < ENTRIES_PER_PAGE && instrs[word as usize].visited
+}
+
 /// `vbase | (word * 4)` as a runtime `Value` — the in-page address of
 /// `word`, derived from live `core.pc` rather than the compile-time
 /// `page_base` parameter `compile_region` is handed (which is a *physical*
@@ -4981,12 +5021,12 @@ fn emit_branch_or_jump(
     // `pc += 8`, no delay-slot dispatch at all) — its effects must never be
     // committed, so it can only be emitted inside the taken arm.
     let slot_word = word + 1;
-    // `ForeignPageSlot` (analyzer's `is_0xffc_branch`, word == 1023): the
-    // slot is on the next page, there's nothing at `instrs[slot_word]` to
-    // inline — `slot_word == WORDS_PER_PAGE` here, one past the array.
+    // Nothing at `instrs[slot_word]` to inline (`is_inlinable`) — in practice
+    // the `ForeignPageSlot` 0xFFC hazard (analyzer's `is_0xffc_branch`, word
+    // == 1023), where the slot is the next page's word 0.
     // `emit_slot`/`emit_branch_taken_edge`/`emit_target_edge` below are all
     // skipped or redirected accordingly; see the taken/not-taken arms.
-    let foreign_page_slot = slot_word as usize >= ENTRIES_PER_PAGE;
+    let foreign_page_slot = !is_inlinable(instrs, slot_word);
     let slot_raw = if foreign_page_slot { 0 } else { instrs[slot_word as usize].raw };
 
     if branch.link {
@@ -5579,7 +5619,7 @@ fn emit_nested_branch_slot(
     // Before this check, both nested emitters indexed `instrs[word + 1]`
     // unconditionally and panicked on any guest that laid a branch pair
     // across a page boundary (found live in SoftWindows 95).
-    if inner_slot_word as usize >= ENTRIES_PER_PAGE {
+    if !is_inlinable(instrs, inner_slot_word) {
         emit_nested_foreign_page_slot_branch(ctx, word, raw, branch, outer_delay_slot_target);
         return;
     }
@@ -5774,7 +5814,7 @@ fn emit_nested_regjump_slot(
     // slot word so the next dispatch runs it and retires the jump. Mirrors
     // emit_regjump's own ForeignPageSlot handling; RegJump has a single
     // unconditional outcome, so there is no per-arm split to make here.
-    if inner_slot_word as usize >= ENTRIES_PER_PAGE {
+    if !is_inlinable(instrs, inner_slot_word) {
         emit_foreign_page_slot_exit(ctx, word, target_addr);
         return;
     }
@@ -7556,11 +7596,15 @@ fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PA
             return 0;
         }
         let next_word = word + 1;
-        if next_word as usize >= ENTRIES_PER_PAGE {
+        // `is_inlinable` covers the bounds + `visited` pair this site already
+        // tested by hand (it was the only one that got it right — the four
+        // slot sites checked bounds alone); the remaining flags are fusion's
+        // own extra requirements, not general inlinability.
+        if !is_inlinable(instrs, next_word) {
             return 0;
         }
         let next = &instrs[next_word as usize];
-        if !next.visited || next.is_slot_only || next.is_fallback || next.is_branch_target {
+        if next.is_slot_only || next.is_fallback || next.is_branch_target {
             return 0;
         }
         match fused_lui_imm32(ctx.raw, next.raw) {
@@ -8224,6 +8268,36 @@ mod tests {
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
+    }
+
+    /// `is_inlinable` must reject on *both* of its conditions, not just the
+    /// bounds one. The bounds half is what panicked
+    /// (`rules/jitv2/nested-delay-slot-across-page-boundary.md`); the
+    /// `visited` half is the stronger guarantee the four slot sites were
+    /// missing — an unvisited word never went through
+    /// `compile_region_uncommitted`'s upfront emitter-rejection loop (it
+    /// iterates `instrs_linear`, i.e. visited words only), so inlining one
+    /// is unsound even though the index is in range.
+    #[test]
+    fn is_inlinable_rejects_out_of_bounds_and_unvisited_alike() {
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = 0; // nop
+        page[1] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR); // jr ra
+        page[2] = 0; // its delay slot
+        // Word 3 onward is never reached by the walk (the JR ends the region).
+
+        let mut analyzer = Analyzer::new();
+        let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+        assert!(non_empty);
+
+        assert!(is_inlinable(instrs, 0), "a visited, in-bounds word is inlinable");
+        assert!(is_inlinable(instrs, 2), "the JR's walked delay slot is inlinable");
+        assert!(!is_inlinable(instrs, 3),
+            "in bounds but never visited (unreachable past the region-ending JR) — must be refused");
+        assert!(!is_inlinable(instrs, ENTRIES_PER_PAGE as WordOffset),
+            "one past the page (the 0xFFC foreign-slot hazard) — must be refused, not panic");
+        assert!(!is_inlinable(instrs, WordOffset::MAX),
+            "far out of bounds must be refused without indexing");
     }
 
     #[test]
