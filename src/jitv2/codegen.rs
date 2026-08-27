@@ -5429,7 +5429,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     emit_dev_trace_bp(ctx, dev_trace_origin::JIT_DELAY_SLOT);
 
     if let Some(branch) = lookup_branch_or_jump(slot_raw) {
-        emit_nested_branch_slot(ctx, instrs, slot_word, slot_raw, branch, fr_mode);
+        emit_nested_branch_slot(ctx, instrs, slot_word, slot_raw, branch, fr_mode, delay_slot_target);
         return true; // every arm is a terminator; the restore below is unreachable from here
     }
     if let Some(regjump) = lookup_regjump(slot_raw) {
@@ -5551,14 +5551,39 @@ fn emit_nested_branch_slot(
     raw: u32,
     branch: BranchOrJump,
     fr_mode: FrMode,
+    outer_delay_slot_target: Value,
 ) {
     let inner_slot_word = word + 1;
-    let inner_slot_raw = instrs[inner_slot_word as usize].raw;
 
     if branch.link {
         let this_pc_word = word as i64 + 2;
         emit_write_link_register(ctx, this_pc_word, 31);
     }
+
+    // A nested branch/jump sitting at 0xFFC (word 1023) has its own
+    // mandatory slot on the *next* physical page — `instrs[1024]` is one
+    // past the array. There is nothing to inline, and the slot is emphatically
+    // NOT skipped or treated as a NOP: it still has to execute, just on the
+    // next dispatch. So every arm here hands off via
+    // `emit_foreign_page_slot_exit` — arm `core.delay_slot_target` with this
+    // branch's real destination, set `core.in_delay_slot`, and land
+    // `core.pc` on the slot word itself (next page's word 0), leaving the
+    // transfer pending exactly as the interpreter's `branch_delay` does.
+    // Handled before `emit_inner_slot` is even defined, so there is no path
+    // on which a foreign slot gets recursed into with bogus raw bits.
+    //
+    // The analyzer already permits this shape and expects codegen to handle
+    // it: `visit_slot`'s `OFFSET_0XFFC_WORD` arm marks word 1023 visited
+    // with `taken_exit: ForeignPageSlot` and deliberately does *not* walk
+    // word 1024, exactly like `visit`'s `is_0xffc_branch` does for a head.
+    // Before this check, both nested emitters indexed `instrs[word + 1]`
+    // unconditionally and panicked on any guest that laid a branch pair
+    // across a page boundary (found live in SoftWindows 95).
+    if inner_slot_word as usize >= ENTRIES_PER_PAGE {
+        emit_nested_foreign_page_slot_branch(ctx, word, raw, branch, outer_delay_slot_target);
+        return;
+    }
+    let inner_slot_raw = instrs[inner_slot_word as usize].raw;
 
     // Recurse into the inner slot's own emission with ctx.raw/ctx.word
     // switched to its — restored after, same pattern as emit_branch_or_jump's
@@ -5629,6 +5654,99 @@ fn emit_nested_branch_slot(
     }
 }
 
+/// A nested branch/jump sitting at word 1023 (0xFFC), whose own mandatory
+/// delay slot is the *next page's* word 0 — `analyzer::StopReason::
+/// ForeignPageSlot` one nesting level down. The nested-level counterpart to
+/// `emit_branch_or_jump`'s own `foreign_page_slot` arms, and it makes the
+/// same guarantee: the slot is **not** skipped and **not** replaced by a
+/// NOP. It simply cannot be inlined here (there is no `instrs[1024]`), so
+/// this arms the pending transfer and exits with `core.pc` on the slot word
+/// itself, leaving the *next* dispatch — on the next page — to execute the
+/// slot and retire the branch. That is exactly the interpreter's
+/// `branch_delay`/`handle_branch_not_taken` contract, and the entry side
+/// (`exec_decoded`'s `entry_offset == 0` probe) already knows how to consume
+/// it.
+///
+/// Per-outcome, mirroring the head-level arms one-for-one:
+/// - `Always` (J/JAL/unconditional): arm the jump target.
+/// - non-annulling conditional: the slot runs exactly once **either way**
+///   (§6.1.4), so *both* arms arm the foreign slot — taken with the branch
+///   target, not-taken with `word + 2` (`handle_branch_not_taken`'s
+///   `branch_delay(pc + 8)`, deliberately not a direct landing on `word + 2`,
+///   which would wrongly skip the slot).
+/// - annulling Likely: taken arms the slot as usual; not-taken annuls it, so
+///   there is nothing pending at all — plain `pc += 8` via
+///   `emit_foreign_page_annulled_not_taken_exit`
+///   (`handle_branch_likely_skip`).
+///
+/// `core.pc` is already this instruction's own address (`emit_slot_semantics`
+/// wrote it), which is what the target helpers read live. Terminates every
+/// path it emits.
+fn emit_nested_foreign_page_slot_branch(
+    ctx: &mut EmitCtx,
+    word: WordOffset,
+    raw: u32,
+    branch: BranchOrJump,
+    outer_delay_slot_target: Value,
+) {
+    match branch.cond {
+        BranchCond::Always => {
+            let target_addr = emit_jump_target_addr(ctx, word, raw);
+            emit_foreign_page_slot_exit(ctx, word, target_addr);
+        }
+        _ if !branch.annul => {
+            let cond_val = emit_cond(ctx, raw, branch.cond);
+            let taken_addr = emit_branch_target_addr(ctx, word, raw);
+            let fallthrough_addr = emit_word_addr(ctx, word + 2);
+
+            let taken_block = ctx.builder.create_block();
+            let not_taken_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(cond_val, taken_block, &[], not_taken_block, &[]);
+
+            ctx.builder.switch_to_block(taken_block);
+            ctx.builder.seal_block(taken_block);
+            emit_foreign_page_slot_exit(ctx, word, taken_addr);
+
+            ctx.builder.switch_to_block(not_taken_block);
+            ctx.builder.seal_block(not_taken_block);
+            emit_foreign_page_slot_exit(ctx, word, fallthrough_addr);
+        }
+        _ => {
+            let cond_val = emit_cond(ctx, raw, branch.cond);
+
+            let taken_block = ctx.builder.create_block();
+            let not_taken_block = ctx.builder.create_block();
+            ctx.builder.ins().brif(cond_val, taken_block, &[], not_taken_block, &[]);
+
+            ctx.builder.switch_to_block(taken_block);
+            ctx.builder.seal_block(taken_block);
+            let target_addr = emit_branch_target_addr(ctx, word, raw);
+            emit_foreign_page_slot_exit(ctx, word, target_addr);
+
+            ctx.builder.switch_to_block(not_taken_block);
+            ctx.builder.seal_block(not_taken_block);
+            // The one exit in this whole family that leaves `in_delay_slot`
+            // set without arming a target of its own: the annulled slot
+            // never runs, so this nested branch contributes no pending
+            // transfer — but the *outer* branch's is still live (the
+            // interpreter's `branch_delay` armed it one dispatch ago, and
+            // `handle_branch_likely_skip` only does `pc += 8`, touching
+            // neither flag nor target). Outside jitv2_lockstep,
+            // `emit_slot_semantics` deliberately skips its
+            // `delay_slot_target` store — the comment there notes the
+            // non-lockstep path "never reads delay_slot_target for an
+            // inlined slot", which held only while every inlined slot ended
+            // by writing a final `core.pc` directly. This path breaks that
+            // assumption, so materialize the outer target here or the next
+            // dispatch retires the pending transfer to a stale/zero pc.
+            let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
+            ctx.builder.ins().store(
+                MemFlagsData::trusted(), outer_delay_slot_target, ctx.core_ptr, target_off);
+            emit_foreign_page_annulled_not_taken_exit(ctx, word);
+        }
+    }
+}
+
 /// A nested delay slot whose own raw bits are JR/JALR — always exits via the
 /// register-derived target, exactly like the outermost `emit_regjump`, just
 /// without that function's own `taken_exit`/edge bookkeeping (never
@@ -5649,6 +5767,17 @@ fn emit_nested_regjump_slot(
     }
 
     let inner_slot_word = word + 1;
+    // Same foreign-page-slot case as emit_nested_branch_slot: a JR/JALR at
+    // 0xFFC has its own mandatory slot on the next page, with nothing at
+    // `instrs[1024]` to inline. The slot is not skipped — arm the
+    // register-derived transfer, set in_delay_slot, and land core.pc on the
+    // slot word so the next dispatch runs it and retires the jump. Mirrors
+    // emit_regjump's own ForeignPageSlot handling; RegJump has a single
+    // unconditional outcome, so there is no per-arm split to make here.
+    if inner_slot_word as usize >= ENTRIES_PER_PAGE {
+        emit_foreign_page_slot_exit(ctx, word, target_addr);
+        return;
+    }
     let inner_slot_raw = instrs[inner_slot_word as usize].raw;
     ctx.raw = inner_slot_raw;
     ctx.word = inner_slot_word;

@@ -3310,6 +3310,162 @@ mod tests {
         assert!(!exec.core.in_delay_slot, "in_delay_slot must be restored/cleared, not left set from the nested dispatch");
     }
 
+    /// Drive `page` through the real interpreter for `steps` dispatches and
+    /// return the delay-slot-relevant state the JIT must reproduce exactly.
+    /// `CoreSnapshot` deliberately doesn't cover `in_delay_slot`/
+    /// `delay_slot_target` (they're transient dispatch plumbing, not
+    /// architectural registers), but for a foreign-page slot they *are* the
+    /// whole result — the pending transfer handed to the next page's
+    /// dispatch — so this compares them directly rather than asserting
+    /// hand-derived constants.
+    fn interp_delay_state(page: &[(u16, u32)], gpr: [u64; 32], pc: u64, steps: usize) -> (u64, bool, u64) {
+        let (mut exec, mem) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, pc);
+        let page_base = pc & !(PAGE_SIZE as u64 - 1);
+        for &(word, raw) in page {
+            mem.set_word(page_base + (word as u64) * 4, raw);
+        }
+        for _ in 0..steps {
+            let fetch_pc = exec.core.pc;
+            let instr = mem.get_word(fetch_pc & !3);
+            exec.exec(instr);
+        }
+        (exec.core.pc, exec.core.in_delay_slot, exec.core.delay_slot_target)
+    }
+
+    /// Compile a two-word region (head at 1022, nested branch/jump at 1023)
+    /// and run both engines over it, asserting the JIT reproduces the
+    /// interpreter's pending-transfer state exactly.
+    ///
+    /// The shape: a branch at word 1022 whose delay slot (word 1023, 0xFFC)
+    /// is *itself* a branch/jump. The nested one's own mandatory slot lives
+    /// on the **next page**, at `instrs[1024]` — one past the array.
+    /// `emit_nested_branch_slot`/`emit_nested_regjump_slot` indexed
+    /// `instrs[word + 1]` unconditionally and panicked ("index out of
+    /// bounds: the len is 1024 but the index is 1024") the moment a real
+    /// guest (SoftWindows 95, which JITs its own code) laid a branch pair
+    /// across a page boundary this way. The analyzer already permits the
+    /// shape — `visit_slot`'s `OFFSET_0XFFC_WORD` arm marks word 1023
+    /// visited with `taken_exit: ForeignPageSlot` and deliberately does
+    /// *not* recurse into word 1024 — so codegen has to mirror the
+    /// head-level foreign-slot handling: arm `in_delay_slot`/
+    /// `delay_slot_target` and land `pc` on the slot itself, leaving the
+    /// transfer pending. Critically the slot is neither skipped nor treated
+    /// as a NOP; it executes on the next page's dispatch.
+    fn check_nested_foreign_page_slot(head_raw: u32, nested_raw: u32, gpr: [u64; 32]) {
+        let last_word = (ENTRIES_PER_PAGE - 1) as u16;
+        let head_word = last_word - 1;
+        let page = [(head_word, head_raw), (last_word, nested_raw)];
+
+        // Deliberately a page whose base has the PAGE_SIZE bit set below it,
+        // so an OR-vs-ADD slip in the next-page address can't hide.
+        let page_base = 0xFFFF_FFFF_9FC0_F000u64;
+        let pc = page_base + (head_word as u64) * 4;
+
+        // Two dispatches: the head branch (arms its slot), then the nested
+        // branch at 1023 (arms/annuls its own foreign slot).
+        let (int_pc, int_bd, int_target) = interp_delay_state(&page, gpr, pc, 2);
+
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in &page { page_words[word as usize] = raw; }
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, head_word, page_base as u32, usize::MAX);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, head_word, true, false)
+            .expect("region must compile — must not panic indexing instrs[1024]");
+
+        let (exec, _mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, int_pc, "pc must match the interpreter");
+        assert_eq!(exec.core.in_delay_slot, int_bd, "in_delay_slot must match the interpreter");
+        if int_bd {
+            assert_eq!(exec.core.delay_slot_target, int_target,
+                "the armed transfer target must match the interpreter");
+        }
+        std::mem::forget(codegen);
+    }
+
+    #[test]
+    fn nested_branch_at_last_word_with_foreign_page_slot_matches_interpreter() {
+        // BEQ r0,r0,+4 at 1022 -> nested BEQ r0,r0,+2 at 1023 (always taken).
+        check_nested_foreign_page_slot(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 2),
+            [0u64; 32],
+        );
+    }
+
+    #[test]
+    fn nested_jump_at_last_word_with_foreign_page_slot_matches_interpreter() {
+        // Unconditional J at 1023 — emit_nested_foreign_page_slot_branch's
+        // `Always` arm.
+        check_nested_foreign_page_slot(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+            make_j(crate::mips_isa::OP_J, 0x0740_0000 >> 2),
+            [0u64; 32],
+        );
+    }
+
+    #[test]
+    fn nested_regjump_at_last_word_with_foreign_page_slot_matches_interpreter() {
+        // JR ra at 1023 — emit_nested_regjump_slot had the identical
+        // out-of-bounds index.
+        let mut gpr = [0u64; 32];
+        gpr[31] = 0xFFFF_FFFF_8000_9000;
+        check_nested_foreign_page_slot(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+            make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR),
+            gpr,
+        );
+    }
+
+    #[test]
+    fn nested_branch_at_last_word_not_taken_arms_foreign_slot_like_interpreter() {
+        // §6.1.4: a non-annulling conditional's slot runs exactly once
+        // regardless of outcome, so even the not-taken arm must *arm* the
+        // foreign slot (target = word + 2, `handle_branch_not_taken`'s
+        // `branch_delay(pc + 8)`) rather than landing on word + 2 directly,
+        // which would wrongly skip it.
+        check_nested_foreign_page_slot(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::mips_isa::OP_BNE, 0, 0, 2), // r0 == r0 -> never taken
+            [0u64; 32],
+        );
+    }
+
+    #[test]
+    fn nested_likely_at_last_word_not_taken_annuls_foreign_slot_like_interpreter() {
+        // The one foreign-slot case that arms *nothing* new: an annulling
+        // Likely branch on its not-taken arm skips the slot entirely
+        // (`handle_branch_likely_skip`'s plain pc += 8). Note the outer
+        // branch's own pending transfer is still live at that point — the
+        // interpreter leaves in_delay_slot set, and so must the JIT, which
+        // is exactly why this compares against the interpreter rather than
+        // asserting a hand-derived flag value.
+        let mut gpr = [0u64; 32];
+        gpr[1] = 1; // r1 != r0 -> BEQL not taken -> slot annulled
+        check_nested_foreign_page_slot(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::mips_isa::OP_BEQL, 1, 0, 2),
+            gpr,
+        );
+    }
+
+    #[test]
+    fn nested_likely_at_last_word_taken_arms_foreign_slot_like_interpreter() {
+        // The taken arm of the same Likely branch: the slot is *not*
+        // annulled here, so the transfer must be armed like any other.
+        let gpr = [0u64; 32]; // r0 == r0 -> BEQL taken
+        check_nested_foreign_page_slot(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::mips_isa::OP_BEQL, 0, 0, 2),
+            gpr,
+        );
+    }
+
     #[test]
     fn self_loop_with_decrement_in_delay_slot_converges_natively() {
         // BGTZ r2,-1 / slot SUBU r2,r2,r3: a tight decrement loop whose
