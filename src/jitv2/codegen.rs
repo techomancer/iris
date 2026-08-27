@@ -2918,6 +2918,31 @@ static INLINE_MEM_ENABLED: std::sync::atomic::AtomicBool =
 static INLINE_MEM_INIT: std::sync::Once = std::sync::Once::new();
 
 pub fn inline_mem_enabled() -> bool {
+    // jitv2_lockstep: the inline path is unconditionally OFF, and this is a
+    // correctness requirement, not a policy preference.
+    //
+    // Lockstep's entire load/store verification lives in the callout
+    // wrappers — `jit_read*_fn`/`jit_write*_fn` divert to
+    // `MipsExecutor::lockstep_jit_read`/`lockstep_jit_write` (mips_exec.rs),
+    // which re-translate the VA independently and compare address/phys/value
+    // against `core.lockstep_mem`, the triple the interpreter captured when
+    // it ran the same instruction. The inline fast path deliberately does not
+    // call those wrappers (see `emit_mem_read_split`'s own comment on why it
+    // has to store `jit_mem_exc` by hand), so every access that hits nutlb +
+    // the L1-D tag would execute *completely unverified* — around 82% of
+    // loads, per docs/jit-inline-memory.md. Lockstep would then silently
+    // check only the slow-path minority while reporting itself as on, which
+    // is worse than not running it: address-computation bugs on the hot path
+    // are exactly what these hooks exist to catch.
+    //
+    // Gated here rather than at the two `emit_inline_mem_guard` call sites so
+    // the monitor toggle (`j2 inline_mem on`), the env var, and any future
+    // call site are all covered by construction — under lockstep there is no
+    // way to turn it back on. The cost is nil: a lockstep build already runs
+    // every instruction through the interpreter twice.
+    if cfg!(feature = "jitv2_lockstep") {
+        return false;
+    }
     INLINE_MEM_INIT.call_once(|| {
         if std::env::var_os("IRIS_NO_INLINE_MEM").is_some() {
             INLINE_MEM_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -8298,6 +8323,84 @@ mod tests {
             "one past the page (the 0xFFC foreign-slot hazard) — must be refused, not panic");
         assert!(!is_inlinable(instrs, WordOffset::MAX),
             "far out of bounds must be refused without indexing");
+    }
+
+    /// `jitv2_lockstep` must force the inline load/store path off: lockstep's
+    /// entire memory verification lives in the `jit_read*_fn`/`jit_write*_fn`
+    /// callout wrappers (which divert to `lockstep_jit_read`/
+    /// `lockstep_jit_write`), and the inline fast path deliberately bypasses
+    /// those wrappers. Left on, ~82% of loads would execute completely
+    /// unverified while lockstep reported itself as running — silently
+    /// checking only the slow-path minority.
+    ///
+    /// Asserted against `inline_mem_enabled()` rather than against emitted
+    /// code because that is the single gate both `emit_mem_read` and
+    /// `emit_mem_write` consult, and it is unconditional (the monitor's
+    /// `j2 inline_mem on` cannot override it — see the function's own doc
+    /// comment).
+    #[test]
+    #[cfg(feature = "jitv2_lockstep")]
+    fn lockstep_forces_inline_mem_off() {
+        assert!(!inline_mem_enabled(),
+            "jitv2_lockstep must force the inline memory path off — it bypasses \
+             the callout hooks lockstep verifies loads/stores through");
+        // Even an explicit enable must not stick.
+        set_inline_mem_enabled(true);
+        assert!(!inline_mem_enabled(),
+            "jitv2_lockstep's inline-mem override must be unconditional, not a default");
+    }
+
+    /// End-to-end: with the geometry reported as *supported* (the state a
+    /// real R4400 + `nutlb` build reaches — lockstep's own inline-compile
+    /// path stamps the real cache geometry, see `mips_exec.rs`'s
+    /// `codegen.dc_geometry = self.cache.jit_dc_geometry()`), compiling a
+    /// load and a store must still emit zero inline accesses under lockstep.
+    /// The `inline_mem_enabled` unit test above proves the gate; this proves
+    /// the gate is actually the one `emit_mem_read`/`emit_mem_write` consult,
+    /// so the fix cannot regress by someone bypassing it at a call site.
+    #[test]
+    #[cfg(feature = "jitv2_lockstep")]
+    fn lockstep_emits_no_inline_mem_even_with_supported_geometry() {
+        use crate::mips_isa::{OP_LW, OP_SW};
+        fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+            (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+        }
+        let before_e = INLINE_MEM_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = i_type(OP_LW, 1, 2, 0);   // lw r2, 0(r1)
+        page[1] = i_type(OP_SW, 1, 2, 4);   // sw r2, 4(r1)
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[3] = 0;
+
+        let mut analyzer = Analyzer::new();
+        let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+        assert!(non_empty);
+        let mut instrs_owned = *instrs;
+
+        let mut codegen = Codegen::new();
+        // Force the geometry to "supported" so the guard cannot decline for
+        // the unrelated reason that this synthetic test has no real cache.
+        codegen.dc_geometry = crate::mips_cache_v2::JitDcGeometry::unsupported();
+        codegen.dc_geometry.supported = true;
+        let _ = codegen.compile_region(&mut instrs_owned, 0, true, false)
+            .expect("lw/sw region must compile");
+        std::mem::forget(codegen);
+
+        assert_eq!(INLINE_MEM_EMITTED.load(std::sync::atomic::Ordering::Relaxed), before_e,
+            "lockstep build must emit no inline memory accesses even when the cache \
+             geometry reports as supported — every load/store must go through the \
+             callout wrappers lockstep verifies through");
+    }
+
+    /// Counterpart: without lockstep the gate must stay honest — the inline
+    /// path is on by default, so the test above is proving a real override and
+    /// not just observing a globally-disabled feature.
+    #[test]
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    fn inline_mem_on_by_default_without_lockstep() {
+        assert!(inline_mem_enabled(),
+            "inline memory should be on by default in a non-lockstep build");
     }
 
     #[test]

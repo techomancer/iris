@@ -168,7 +168,16 @@ jitv2_corpus_dump = ["jitv2"]
 # faster way to bisect a live-boot divergence into single instructions than
 # chopping the whole boot into recompiled binaries each time. Not for normal
 # runs (pays a compile per matching instruction, none of it cached).
-jitv2_lockstep = ["jitv2"]
+#
+# Pulls in `developer`: lockstep's divergence reports are only actionable with
+# the monitor/traceback machinery (`dt`, `r`, `d pc`) that developer provides,
+# and its own EXEC_BREAKPOINT-on-divergence path breaks into that monitor.
+# Also forces the inline load/store fast path off at runtime
+# (`codegen::inline_mem_enabled`) — it bypasses the callout wrappers lockstep
+# verifies memory through. `lightning`/`opcodefusion` are refused outright in
+# src/lib.rs: Cargo features are additive, so an incompatible one can only be
+# rejected, never unset.
+jitv2_lockstep = ["jitv2", "developer"]
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
 # CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.

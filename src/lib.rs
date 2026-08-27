@@ -7,6 +7,36 @@ compile_error!(
      switching, etc.) while developer exists specifically to add it back — pick one"
 );
 
+#[cfg(all(feature = "jitv2_lockstep", feature = "lightning"))]
+compile_error!(
+    "features `jitv2_lockstep` and `lightning` are mutually exclusive: lockstep \
+     verifies every JIT instruction against a real interpreter run and breaks \
+     into the monitor on divergence, which needs the debuggability lightning \
+     strips (it also implies `opcodefusion`, refused below for its own \
+     reasons). lockstep already pulls in `developer`, which lightning \
+     separately conflicts with — build lockstep without lightning"
+);
+
+#[cfg(all(feature = "jitv2_lockstep", feature = "opcodefusion"))]
+compile_error!(
+    "features `jitv2_lockstep` and `opcodefusion` are mutually exclusive: a \
+     fused pair's second instruction is never independently fetched, decoded \
+     or dispatched, so lockstep's per-instruction interpreter reference run \
+     has nothing to bracket it against — the JIT would execute it while the \
+     comparison silently skipped it. Build lockstep without opcodefusion \
+     (note `lightning` implies opcodefusion)"
+);
+
+#[cfg(all(feature = "jitv2_lockstep", feature = "jitv2_opcodefusion"))]
+compile_error!(
+    "features `jitv2_lockstep` and `jitv2_opcodefusion` are mutually \
+     exclusive, for the same reason as `opcodefusion`: codegen's fusion sites \
+     (`try_emit_fused_nop_slot`, `try_emit_fused_lui`) already disable \
+     themselves under lockstep because a fused instruction cannot be \
+     individually step-bracketed — enabling the feature would be a silent \
+     no-op that misrepresents what was built. Build lockstep without it"
+);
+
 #[cfg(all(feature = "instr_stats", feature = "jitv2"))]
 compile_error!(
     "features `instr_stats` and `jitv2` together are meaningless: instr_stats' \

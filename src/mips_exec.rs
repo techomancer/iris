@@ -10900,8 +10900,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                     if crate::jitv2::codegen::inline_mem_enabled() { "on" } else { "off" }).unwrap();
                             }
                             Some(on @ ("on" | "off")) => {
-                                crate::jitv2::codegen::set_inline_mem_enabled(on == "on");
-                                writeln!(writer, "j2 inline_mem: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
+                                // Under jitv2_lockstep the inline path is
+                                // forced off for correctness (it bypasses the
+                                // callout wrappers lockstep's load/store
+                                // verification lives in — see
+                                // `codegen::inline_mem_enabled`). Say so
+                                // rather than accepting the toggle and
+                                // silently ignoring it.
+                                if cfg!(feature = "jitv2_lockstep") {
+                                    writeln!(writer, "j2 inline_mem: forced off by jitv2_lockstep (the inline path bypasses the callout hooks lockstep verifies loads/stores through) — cannot be enabled in this build").unwrap();
+                                } else {
+                                    crate::jitv2::codegen::set_inline_mem_enabled(on == "on");
+                                    writeln!(writer, "j2 inline_mem: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
+                                }
                             }
                             Some(_) => return Err("Usage: j2 inline_mem [on|off]".to_string()),
                         }
