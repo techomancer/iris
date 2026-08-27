@@ -2519,6 +2519,37 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
             self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
         }
+        #[cfg(not(feature = "tcache"))]
+        self.install_jit_page_probe();
+    }
+
+    /// Publish the compile-time dirty-page probe (`Jitv2::jit_page_probe`).
+    ///
+    /// The compile worker snapshots pages off the bus, which shows it RAM;
+    /// the guest CPU sees RAM overlaid with its own dirty cache lines, and a
+    /// store that retires inside L1-D bumps no page generation counter. This
+    /// hands the worker a way to notice that and decline the compile. See
+    /// `MipsCache::jit_page_has_dirty_lines`.
+    ///
+    /// Does not exist under `tcache`: there the cache reads and writes RAM
+    /// through the ppmem window, so a store is in RAM the moment it retires
+    /// and there is no hidden dirty data to find. tcache closes this hole by
+    /// construction, and `comp` compiles its side of the check out to match.
+    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+    fn install_jit_page_probe(&mut self) {
+        fn thunk<C2: crate::mips_cache_v2::MipsCache>(ctx: *const (), page_base: u64) -> bool {
+            // SAFETY: `ctx` is the `&self.cache` published just below, of
+            // exactly this `C2`. The executor is at its final address by the
+            // time `install_jit_hooks` runs (see its doc comment), so the
+            // cache it owns by value does not move either.
+            let cache = unsafe { &*(ctx as *const C2) };
+            cache.jit_page_has_dirty_lines(page_base)
+        }
+        let ctx = &self.cache as *const C as *const ();
+        // SAFETY: see the thunk's own note — `ctx` matches `C`, and it
+        // outlives the worker because `install_jit_mem_ptrs` is re-run by
+        // every path that can move or replace the cache.
+        unsafe { crate::jitv2::install_jit_page_probe(ctx, thunk::<C>) };
     }
 
     /// Install JIT v2's memory-access and exception-delivery hooks
@@ -11798,14 +11829,23 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             writeln!(writer, "fallback: {} interp-fallback words compiled across {} regions ({})",
                                 fb_words, fb_regions,
                                 if crate::jitv2::analyzer::fallback_enabled() { "j2 fallback: on" } else { "j2 fallback: off" }).unwrap();
-                            if failed > 0 {
+                            // Gate on the buckets, not on `failed`: a
+                            // dirty-page deferral is deliberately not counted
+                            // as a failed compile, so a run whose only
+                            // rejections are deferrals would print nothing at
+                            // all if this asked `failed > 0`.
+                            let any_reject = crate::jitv2::RejectReason::ALL.iter()
+                                .any(|r| jit.stats.reject_reasons[r.index()].load(Ordering::Relaxed) > 0);
+                            if any_reject {
                                 writeln!(writer, "  rejections by reason:").unwrap();
-                                for reason in [
-                                    crate::jitv2::RejectReason::EntryExcluded,
-                                    crate::jitv2::RejectReason::AnalyzerCodegenDisagreement,
-                                    crate::jitv2::RejectReason::CraneliftVerifierError,
-                                    crate::jitv2::RejectReason::TooShort,
-                                ] {
+                                // Driven by RejectReason::ALL, not a list
+                                // repeated here: a variant added to the enum
+                                // but forgotten here is invisible in `j2
+                                // stats` no matter how often it fires, and
+                                // the only symptom is `failed` not matching
+                                // the sum of the printed buckets. That has
+                                // already happened once (PageDirtyInCache).
+                                for reason in crate::jitv2::RejectReason::ALL {
                                     let n = jit.stats.reject_reasons[reason.index()].load(Ordering::Relaxed);
                                     if n == 0 { continue; }
                                     writeln!(writer, "    {:>7}  {}", n, reason.label()).unwrap();

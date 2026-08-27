@@ -161,6 +161,32 @@ pub fn handle_request(
     // catches anything after.
     let gen_snap = page.current_gen();
 
+    // Dirty-cache gate. The snapshot below reads RAM off the bus; the guest
+    // CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a store
+    // that retires inside the cache bumps no generation counter. Compiling
+    // through that would publish pre-store bytes as a valid region. Abort
+    // instead and publish nothing — nothing is denylisted, so this offset is
+    // retried on its next arrival, by which point the lines have usually
+    // aged out to RAM on their own.
+    //
+    // Checked *before* the 4KB bus read: there is no point paying for a
+    // snapshot we are about to discard. The probe is racy by design and can
+    // miss a store that lands after it looks — see
+    // `jitv2::jit_page_has_dirty_lines` for why that is strictly better than
+    // the status quo rather than a new hazard.
+    //
+    // Compiled out entirely under `tcache`: there the cache reads and writes
+    // RAM through the ppmem window, so a store is in RAM the moment it
+    // retires and there is no hidden dirty data for the probe to find. The
+    // executor installs no probe in that build, so this would be a global
+    // load that can only ever answer false.
+    #[cfg(not(feature = "tcache"))]
+    if crate::jitv2::jit_page_has_dirty_lines(phys_base as u64) {
+        #[cfg(feature = "developer")]
+        stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
+        return false;
+    }
+
     let mut words = [0u32; ENTRIES_PER_PAGE];
     for (i, w) in words.iter_mut().enumerate() {
         let r = bus.read32(phys_base + (i as u32) * 4);
@@ -208,6 +234,24 @@ pub fn handle_request(
             let code_size = codegen.last_code_size();
             #[cfg(not(feature = "developer"))]
             let code_size = 0;
+            // Re-probe the cache before committing, exactly as `publish` re-checks
+            // `gen_snap`: the pre-read probe above is only accurate for the instant
+            // it ran, and the compile since then took real time. A store landing in
+            // that window would otherwise be baked into a published region.
+            //
+            // The pair is exhaustive. A store made during the compile is either
+            // still in a cache — its line is dirty, so this probe sees it — or it
+            // reached RAM, which only happens via `writeback_l1d_line`/
+            // `writeback_l2_line`, both of which drain through
+            // `BusDevice::write_block`, which bumps the page generation, which
+            // `publish`'s own `gen_snap` check then rejects. There is no third
+            // state, and a partial writeback bumps the counter just the same.
+            #[cfg(not(feature = "tcache"))]
+            if crate::jitv2::jit_page_has_dirty_lines(phys_base as u64) {
+                #[cfg(feature = "developer")]
+                stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
+                return false;
+            }
             page.publish(offset, jit_fn as *const (), gen_snap, instr_count, code_size);
             #[cfg(feature = "developer")]
             {
@@ -336,6 +380,32 @@ pub fn handle_request_deferred(
     let phys_base = page.pfn * PAGE_SIZE;
     let gen_snap = page.current_gen();
 
+    // Dirty-cache gate. The snapshot below reads RAM off the bus; the guest
+    // CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a store
+    // that retires inside the cache bumps no generation counter. Compiling
+    // through that would publish pre-store bytes as a valid region. Abort
+    // instead and publish nothing — nothing is denylisted, so this offset is
+    // retried on its next arrival, by which point the lines have usually
+    // aged out to RAM on their own.
+    //
+    // Checked *before* the 4KB bus read: there is no point paying for a
+    // snapshot we are about to discard. The probe is racy by design and can
+    // miss a store that lands after it looks — see
+    // `jitv2::jit_page_has_dirty_lines` for why that is strictly better than
+    // the status quo rather than a new hazard.
+    //
+    // Compiled out entirely under `tcache`: there the cache reads and writes
+    // RAM through the ppmem window, so a store is in RAM the moment it
+    // retires and there is no hidden dirty data for the probe to find. The
+    // executor installs no probe in that build, so this would be a global
+    // load that can only ever answer false.
+    #[cfg(not(feature = "tcache"))]
+    if crate::jitv2::jit_page_has_dirty_lines(phys_base as u64) {
+        #[cfg(feature = "developer")]
+        stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
+        return false;
+    }
+
     let mut words = [0u32; ENTRIES_PER_PAGE];
     for (i, w) in words.iter_mut().enumerate() {
         let r = bus.read32(phys_base + (i as u32) * 4);
@@ -462,6 +532,14 @@ fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
     for entry in sealed {
         let page = unsafe { &*entry.page };
         let jit_fn = entry.jit_fn.expect("publish_all: a sealed entry must always carry a resolved JitFn");
+        // Same pre-publish re-probe as the inline path in `handle_request` —
+        // see the comment there for why this plus `publish`'s `gen_snap`
+        // check covers every case. Deferred entries sat in the seal queue for
+        // even longer than an inline compile, so the window is wider here.
+        #[cfg(not(feature = "tcache"))]
+        if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
+            continue;
+        }
         page.publish(entry.offset, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size);
     }
 }
@@ -619,6 +697,66 @@ mod tests {
 
         assert!(page.is_runnable(4), "a plain ADDIU must compile and publish");
         assert!(!page.is_denylisted(4));
+    }
+
+    /// The dirty-page gate must actually be wired into *this* design's compile
+    /// path — not merely exist somewhere in the file.
+    ///
+    /// This exists because it was originally missed: both gates were placed in
+    /// `old_impl`, leaving `j2wp` builds with no probe at all. Nothing caught
+    /// it — every unit test passed, IRIX booted, and the only symptom was
+    /// `PageDirtyInCache` silently reading zero in `j2 stats` forever. A test
+    /// that drives the real entry point with a probe forced to "dirty" fails
+    /// loudly in whichever design forgot to consult it.
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn a_dirty_page_is_never_compiled() {
+        let _g = dirty_probe_lock();
+
+        // Sanity first: with no probe installed this exact request publishes.
+        // Without this the test could pass for the wrong reason (e.g. the page
+        // was never compilable to begin with).
+        crate::jitv2::clear_jit_page_probe();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        let counter = AtomicU64::new(0);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, offset: 4, compiled_for_fr1: true };
+        let mut analyzer = Analyzer::new();
+        let mut codegen = Codegen::new();
+        handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
+        assert!(page.is_runnable(4),
+            "precondition: this request must publish when no probe vetoes it");
+
+        // Now the real assertion: a probe reporting the page dirty must stop
+        // the compile before anything is published.
+        fn always_dirty(_ctx: *const (), _page_base: u64) -> bool { true }
+        static ANCHOR: u8 = 0;
+        // SAFETY: `always_dirty` ignores ctx; ANCHOR is a 'static non-null
+        // stand-in so the installed-probe check sees a live pointer.
+        unsafe { crate::jitv2::install_jit_page_probe(&ANCHOR as *const u8 as *const (), always_dirty) };
+
+        let counter2 = AtomicU64::new(0);
+        let mut page2 = PhysicalCodePage::new(0, &counter2 as *const AtomicU64);
+        let req2 = CompileRequest { page: &mut page2 as *mut PhysicalCodePage, offset: 4, compiled_for_fr1: true };
+        handle_request_for_test(&req2, &bus, &mut analyzer, &mut codegen);
+
+        crate::jitv2::clear_jit_page_probe();
+
+        assert!(!page2.is_runnable(4),
+            "a page reported dirty in the CPU cache must not publish — the compile would be built \
+             from a stale RAM snapshot (this design's compile path is not consulting the probe)");
+        // The abort must be retryable, not sticky: the offset gets another
+        // chance once the cache lines drain to RAM on their own.
+        assert!(!page2.is_denylisted(4),
+            "a dirty-page abort must leave the offset eligible for a later retry, not denylist it");
+    }
+
+    /// Exclusion for the probe global. Delegates to `jitv2::probe_test_lock`
+    /// rather than owning a mutex here: `mips_cache_v2`'s probe tests install
+    /// into the same global, and two independent locks would exclude nothing.
+    #[cfg(not(feature = "tcache"))]
+    fn dirty_probe_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::jitv2::jitv2::probe_test_lock()
     }
 
     #[test]
@@ -936,6 +1074,38 @@ fn prepare_multi_entry_compile(
     let page = unsafe { &*req.page };
     let phys_base = page.pfn * PAGE_SIZE;
 
+    // Dirty-cache gate. The seqlock snapshot below reads RAM off the bus; the
+    // guest CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a
+    // store that retires inside the cache bumps no generation counter — so
+    // the seqlock cannot see it either, and neither can publish's gen
+    // re-check. This is the one mutation class those mechanisms structurally
+    // miss.
+    //
+    // The case it exists for: IRIX loads an executable, relocates it in
+    // place, and jumps straight to it while the relocated words are still
+    // dirty in L2. The interpreter runs correctly out of the cache, but the
+    // execution triggers compiles that read RAM and get the *pre-relocation*
+    // bytes straight from disk — stale addresses baked into compiled code,
+    // crashing 4Dwm/fm at startup. It clears "on its own" once writeback puts
+    // the relocations in RAM and a flush forces recompiles, which is exactly
+    // why `j2 flush` appears to fix it.
+    //
+    // Abort and publish nothing; nothing is denylisted, so these offsets are
+    // retried on their next arrival, by which point the lines have usually
+    // drained. Checked *before* the 4KB read: no point paying for a snapshot
+    // we are about to discard.
+    //
+    // Compiled out entirely under `tcache`: there the cache reads and writes
+    // RAM through the ppmem window, so a store is in RAM the moment it
+    // retires and there is nothing hidden for the probe to find.
+    #[cfg(not(feature = "tcache"))]
+    if crate::jitv2::jit_page_has_dirty_lines(phys_base as u64) {
+        #[cfg(feature = "developer")]
+        stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
+        page.mark_prepare_bounced();
+        return PrepareOutcome::Done(false);
+    }
+
     // §13.3 step 2: seqlock-snapshot the page bytes. Bounded retries — a
     // page under sustained concurrent SMC just keeps losing the race to
     // itself, correctly punted to the next arrival's request rather than
@@ -1154,6 +1324,26 @@ pub fn handle_request(
             let mut new_entries = [0u64; crate::jitv2::BITMAP_WORDS];
             for &offset in analyzer.covered() {
                 new_entries[offset as usize >> 6] |= 1u64 << (offset % 64);
+            }
+            // Re-probe the cache before committing, exactly as `publish`
+            // re-checks `gen_snap`: the probe in `prepare_multi_entry_compile`
+            // is only accurate for the instant it ran, and the compile since
+            // then took real time. A store landing in that window would
+            // otherwise be baked into a published region.
+            //
+            // The pair is exhaustive. A store made during the compile is
+            // either still in a cache — its line is dirty, so this probe sees
+            // it — or it reached RAM, which only happens via
+            // `writeback_l1d_line`/`writeback_l2_line`, both of which drain
+            // through `BusDevice::write_block`, which bumps the page
+            // generation, which `publish`'s own `gen_snap` check then rejects.
+            // There is no third state, and a partial writeback bumps the
+            // counter just the same.
+            #[cfg(not(feature = "tcache"))]
+            if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
+                #[cfg(feature = "developer")]
+                stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
+                return false;
             }
             if page.publish(&new_entries, jit_fn as *const (), gen_snap, instr_count, code_size) {
                 page.clear_requested_bits(&new_entries);
@@ -1393,6 +1583,14 @@ fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
     for entry in sealed {
         let page = unsafe { &*entry.page };
         let jit_fn = entry.jit_fn.expect("publish_all: a sealed entry must always carry a resolved JitFn");
+        // Same pre-publish re-probe as the inline path in `handle_request` —
+        // see the comment there for why this plus `publish`'s `gen_snap` check
+        // covers every case. Deferred entries sat in the seal queue for even
+        // longer than an inline compile, so the window is wider here.
+        #[cfg(not(feature = "tcache"))]
+        if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
+            continue;
+        }
         if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size) {
             page.clear_requested_bits(&entry.new_entries);
         }
@@ -1553,6 +1751,68 @@ mod tests {
 
         assert!(page.is_runnable(4), "a plain ADDIU must compile and publish");
         assert!(!page.is_denylisted(4));
+    }
+
+    /// The dirty-page gate must actually be wired into *this* design's compile
+    /// path — not merely exist somewhere in the file.
+    ///
+    /// This exists because it was originally missed: both gates were placed in
+    /// `old_impl`, leaving `j2wp` builds with no probe at all. Nothing caught
+    /// it — every unit test passed, IRIX booted, and the only symptom was
+    /// `PageDirtyInCache` silently reading zero in `j2 stats` forever. A test
+    /// that drives the real entry point with a probe forced to "dirty" fails
+    /// loudly in whichever design forgot to consult it.
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn a_dirty_page_is_never_compiled() {
+        let _g = dirty_probe_lock();
+
+        // Sanity first: with no probe installed this exact request publishes.
+        // Without this the test could pass for the wrong reason (e.g. the page
+        // was never compilable to begin with).
+        crate::jitv2::clear_jit_page_probe();
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
+        let counter = AtomicU64::new(0);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        page.mark_requested(4);
+        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+        let mut analyzer = Analyzer::new();
+        let mut codegen = Codegen::new();
+        handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
+        assert!(page.is_runnable(4),
+            "precondition: this request must publish when no probe vetoes it");
+
+        // Now the real assertion: a probe reporting the page dirty must stop
+        // the compile before anything is published.
+        fn always_dirty(_ctx: *const (), _page_base: u64) -> bool { true }
+        static ANCHOR: u8 = 0;
+        // SAFETY: `always_dirty` ignores ctx; ANCHOR is a 'static non-null
+        // stand-in so the installed-probe check sees a live pointer.
+        unsafe { crate::jitv2::install_jit_page_probe(&ANCHOR as *const u8 as *const (), always_dirty) };
+
+        let counter2 = AtomicU64::new(0);
+        let mut page2 = PhysicalCodePage::new(0, &counter2 as *const AtomicU64);
+        page2.mark_requested(4);
+        let req2 = CompileRequest { page: &mut page2 as *mut PhysicalCodePage, compiled_for_fr1: true };
+        handle_request_for_test(&req2, &bus, &mut analyzer, &mut codegen);
+
+        crate::jitv2::clear_jit_page_probe();
+
+        assert!(!page2.is_runnable(4),
+            "a page reported dirty in the CPU cache must not publish — the compile would be built \
+             from a stale RAM snapshot (this design's compile path is not consulting the probe)");
+        // The abort must be retryable, not sticky: the offset gets another
+        // chance once the cache lines drain to RAM on their own.
+        assert!(!page2.is_denylisted(4),
+            "a dirty-page abort must leave the offset eligible for a later retry, not denylist it");
+    }
+
+    /// Exclusion for the probe global. Delegates to `jitv2::probe_test_lock`
+    /// rather than owning a mutex here: `mips_cache_v2`'s probe tests install
+    /// into the same global, and two independent locks would exclude nothing.
+    #[cfg(not(feature = "tcache"))]
+    fn dirty_probe_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::jitv2::jitv2::probe_test_lock()
     }
 
     #[test]

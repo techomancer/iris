@@ -21,3 +21,8 @@ pub use jitv2::{
 pub use paged_memory::{PagedArenaMemoryProvider, PagedArenaState};
 #[cfg(feature = "developer")]
 pub use jitv2::{BatchFlushReason, CodeSizeBucket, RejectReason, REJECT_REASON_COUNT};
+
+/// The jitv2 dirty-page probe — see `rules/jitv2/dirty-cache-page-probe.md`.
+/// Absent under `tcache`, which closes that blind spot by construction.
+#[cfg(not(feature = "tcache"))]
+pub use jitv2::{install_jit_page_probe, clear_jit_page_probe, jit_page_has_dirty_lines};

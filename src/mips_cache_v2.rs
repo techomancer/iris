@@ -320,6 +320,16 @@ pub const L2_PTAG_SHIFT: u32 = 17;
 pub const L2_PTAG_MASK: u32 = 0x0007_FFFF; // 19-bit field
 pub const L2_INDEX_MASK: u64 = 0x1FFFF;
 
+/// Guest page size the jitv2 dirty-line probe sweeps
+/// (`MipsCache::jit_page_has_dirty_lines`), as a `usize` for tag-index
+/// arithmetic. Defined in terms of `jitv2::PAGE_SIZE`, the architectural
+/// home for the constant, but kept compiling with jitv2 off — the probe
+/// itself does not otherwise depend on the feature.
+#[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+pub const JIT_PROBE_PAGE_SIZE: usize = crate::jitv2::PAGE_SIZE as usize;
+#[cfg(all(not(feature = "jitv2"), not(feature = "tcache")))]
+pub const JIT_PROBE_PAGE_SIZE: usize = 4096;
+
 /// PIdx comes from virtual address bits [14:12]
 pub const L2_PIDX_VADDR_SHIFT: u32 = 12;
 pub const L2_PIDX_VADDR_MASK: u32 = 0x7; // 3-bit field
@@ -479,6 +489,56 @@ pub trait MipsCache: Send + Sync {
     /// Codegen needs these as immediates; they are const-generic on the cache
     /// type and differ between R4400 and R5000.
     fn jit_dc_geometry(&self) -> JitDcGeometry { JitDcGeometry::unsupported() }
+
+    /// jitv2 compile gate: does this cache hold *dirty* data for any line of
+    /// the 4KB physical page at `page_base`?
+    ///
+    /// The blind spot this closes: the compile worker snapshots a page by
+    /// reading it off the bus (`comp::handle_request_deferred`), which sees
+    /// **RAM**. The guest CPU's view is RAM overlaid with its own dirty cache
+    /// lines. PROM flushes after relocating, so its writes reach RAM before
+    /// the JIT ever looks — but IRIX relies on the R4400's L1I/L1D coherency
+    /// and inclusive L2 to make freshly-written code visible to the fetch
+    /// path without an explicit writeback. Correct for the CPU, invisible to
+    /// us: the page generation counter is bumped by *bus* writes, so a store
+    /// that retires entirely inside L1D bumps nothing, and the compiler
+    /// happily compiles the pre-store bytes and publishes them as valid.
+    ///
+    /// Returning `true` means "this page has writes the bus cannot see yet" —
+    /// the caller must abort the compile and publish nothing, leaving the
+    /// offset to be retried once the lines age out to RAM naturally.
+    ///
+    /// # This is deliberately unsynchronised
+    ///
+    /// Called from the compile thread while the CPU thread is freely mutating
+    /// these same tag arrays. There is no lock, no atomic, and no ordering:
+    /// it is a plain racy read of tag words, and the results may be torn or
+    /// stale. That is an accepted trade, not an oversight:
+    ///
+    /// - The alternatives measured worse. Flushing the cache for every page
+    ///   the compiler touches is catastrophic for guest performance, and
+    ///   `tcache` (making the cache read RAM transparently, which removes the
+    ///   blind spot by construction) costs ~10-20% across the benchmark suite.
+    ///   This probe costs one short tag scan per *compile*, not per access.
+    /// - A false `true` (we saw a dirty tag that is being cleaned right now)
+    ///   is free: we skip a compile and retry later. Pure lost work.
+    /// - A false `false` (a store lands just after we looked) leaves exactly
+    ///   the hole that exists today, no worse. The generation counter still
+    ///   guards every bus-visible write, and `publish` re-checks it.
+    ///
+    /// So this strictly shrinks an existing race rather than introducing one.
+    /// It is a mitigation, not a correctness barrier — do not build anything
+    /// on top of it that assumes a definite answer.
+    ///
+    /// Default `false`: a cache with no writeback state (PassthroughCache)
+    /// never hides anything from the bus.
+    ///
+    /// Absent under `tcache`, which removes the blind spot by construction —
+    /// a transparent cache writes straight through the ppmem window, so RAM
+    /// is current the moment a store retires and there is nothing to find.
+    #[cfg(not(feature = "tcache"))]
+    fn jit_page_has_dirty_lines(&self, _page_base: u64) -> bool { false }
+
 
     /// tcache + jitv2: hand the cache ppmem's generation-window base, so window
     /// writes bump the per-page counter jitv2 validates compiled code against.
@@ -2819,6 +2879,72 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
     }
 
+    /// See `MipsCache::jit_page_has_dirty_lines` for the contract and for why
+    /// this is a deliberately unsynchronised read.
+    ///
+    /// Cost: a 4KB page covers `4096 / DC_LINE` L1-D sets and `4096 / L2_LINE`
+    /// L2 sets, and because both are indexed by low physical address bits
+    /// those sets are *contiguous* — so each scan is one short linear sweep of
+    /// a tag array with no hashing and no full-cache walk. On R4400 that is
+    /// 256 L1-D tags plus 32 L2 tags, once per compile attempt, on the compile
+    /// thread. R5000 doubles the L1-D sweep for its second way.
+    ///
+    /// Both levels are scanned, and L2 is *not* used to short-circuit L1-D.
+    /// On R4400 the inclusive L2 holds the line but a store marks only the
+    /// L1-D tag dirty — `writeback_l1d_line` is what later promotes L2 to
+    /// `DIRTY_EXCLUSIVE`. So the freshly-self-modified page, the exact case
+    /// this exists for, looks like *clean L2 + dirty L1-D*. Checking L2 first
+    /// and skipping L1-D on a clean hit would miss it entirely.
+    #[cfg(not(feature = "tcache"))]
+    fn jit_page_has_dirty_lines(&self, page_base: u64) -> bool {
+        let page_base = page_base & !0xFFF;
+
+        // ---- L1-D: any valid, dirty tag whose line falls in this page ----
+        // The page's lines occupy DC_LINES_PER_PAGE consecutive sets starting
+        // at the set the page base itself indexes to. `matches_phys` compares
+        // the full line address, so an unrelated line aliasing into the same
+        // set is rejected rather than counted as a hit.
+        let dc_lines_per_page = JIT_PROBE_PAGE_SIZE / DC_LINE;
+        let dc_first_set = ((page_base >> Self::DC_LINE_SHIFT) as usize) & Self::DC_NUM_LINES_MASK;
+        for i in 0..dc_lines_per_page {
+            let set = (dc_first_set + i) & Self::DC_NUM_LINES_MASK;
+            let line_phys = page_base + (i * DC_LINE) as u64;
+            for way in 0..DC_WAYS {
+                let tag: L1DTag = self.dc.get_tag(set | (way << Self::DC_NUM_LINES_SHIFT));
+                if tag.dirty && tag.matches_phys(line_phys) {
+                    return true;
+                }
+            }
+        }
+
+        // ---- L2: any line in this page in a dirty cache state ----
+        // Catches data already written back out of L1-D but still sitting in
+        // L2 ahead of RAM. Skipped when there is no L2, or when the Triton
+        // L2-enable bit is off and L1-D writebacks go straight to memory.
+        if HAS_L2 && self.l2_active() {
+            let l2_lines_per_page = JIT_PROBE_PAGE_SIZE / L2_LINE;
+            let l2_first_set = ((page_base >> Self::L2_LINE_SHIFT) as usize) & Self::L2_NUM_LINES_MASK;
+            // An L2 line can be larger than a page (128B here, but the guard
+            // keeps this honest if geometry changes): then the page sits
+            // inside a single line and one probe covers it.
+            let n = if l2_lines_per_page == 0 { 1 } else { l2_lines_per_page };
+            for i in 0..n {
+                let set = (l2_first_set + i) & Self::L2_NUM_LINES_MASK;
+                let tag: L2Tag = self.l2.get_tag(set);
+                let cs = tag.cs();
+                if cs != L2_CS_DIRTY_EXCLUSIVE && cs != L2_CS_DIRTY_SHARED {
+                    continue;
+                }
+                if tag.ptag() == self.l2_ptag(page_base + (i * L2_LINE) as u64) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+
     #[cfg(all(feature = "tcache", feature = "jitv2"))]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe { self.set_tcache_gen_window_impl(gen_base) }
@@ -4136,6 +4262,245 @@ mod tests {
     // Write a word into backing memory, bypassing the cache entirely.
     fn mem_write(mem: &Memory, phys: u32, val: u32) { mem.write32(phys, val); }
     fn mem_read(mem: &Memory, phys: u32) -> u32 { mem.read32(phys).data }
+
+    // ---- jitv2 compile-time dirty-page probe (jit_page_has_dirty_lines) ----
+    //
+    // The whole mechanism is compiled out under `tcache`, so these are too.
+    //
+    // The probe is what stops the jitv2 compile worker publishing a region it
+    // built from a RAM snapshot that the guest CPU has already overwritten in
+    // its own cache. These tests pin the tag-scan logic, which is the part
+    // that can be silently wrong; the unsynchronised cross-thread read it
+    // performs in production is explicitly out of scope (see the function's
+    // own doc comment for why a miss there is tolerated by design).
+
+    const PROBE_PAGE: u32 = 0x0002_0000; // 4KB-aligned, well inside MEM_BYTES
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_reports_clean_page_after_flush() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        // Touch every line of the page so tags are populated, then flush so
+        // nothing is dirty. A populated-but-clean page must not trip the probe
+        // — otherwise the probe would veto essentially every compile.
+        for off in (0..4096u32).step_by(4) {
+            let p = PROBE_PAGE + off;
+            cache.write::<4>(kseg0(p), p as u64, 0xAAAA_0000 | off as u64);
+        }
+        full_flush(&cache);
+        assert!(!cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a fully written-back page has nothing hidden from the bus, so the probe must allow the compile");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_reports_untouched_page_clean() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        assert!(!cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a page never touched by the CPU cannot be dirty in any cache");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_sees_a_store_still_sitting_in_l1d() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+        // Exactly the case the probe exists for, and the one an L2-first
+        // implementation misses: on R4400 a store marks only the L1-D tag
+        // dirty. L2 holds the line but stays CLEAN until writeback, and RAM is
+        // staler still — so the compile worker's bus snapshot would see
+        // pre-store bytes.
+        let p = PROBE_PAGE + 0x40;
+        cache.write::<4>(kseg0(p), p as u64, 0xDEAD_BEEF);
+        assert!(cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a store held in L1-D is invisible to the bus and must veto the compile");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_sees_dirty_data_that_reached_l2_but_not_ram() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+        let p = PROBE_PAGE + 0x80;
+        cache.write::<4>(kseg0(p), p as u64, 0x1234_5678);
+        // Push the L1-D line down into L2 without going all the way to memory:
+        // Hit_WB(PD) writes back and cleans L1-D, leaving L2 dirty.
+        cache.cache_op(C_HWB | CACH_PD, kseg0(p), p as u64);
+        assert!(cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "data written back into a dirty L2 line still has not reached RAM, so the probe must veto");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_ignores_dirty_lines_belonging_to_other_pages() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+        // Dirty a different page that aliases into the same L1-D sets. The
+        // probe compares full line addresses, so an aliasing occupant must not
+        // be mistaken for this page's own data — a probe that only checked the
+        // set index would veto compiles constantly.
+        let other = PROBE_PAGE + (R4400Cache::DC_SIZE as u32); // same sets, different tag
+        cache.write::<4>(kseg0(other), other as u64, 0xFEED_FACE);
+        assert!(cache.jit_page_has_dirty_lines(other as u64),
+            "sanity: the page that really was written must read dirty");
+        assert!(!cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a dirty line aliasing into the same sets belongs to another page and must not veto this one");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_covers_every_line_of_the_page() {
+        // A store anywhere in the page must be found, including the first and
+        // last line — the scan walks a set range, and an off-by-one at either
+        // end would leave a silent hole exactly where a region boundary sits.
+        for off in [0u32, 16, 2048, 4096 - 16] {
+            let mem = Arc::new(Memory::new(MEM_MB));
+            let cache = make_cache(mem.clone());
+            full_flush(&cache);
+            let p = PROBE_PAGE + off;
+            cache.write::<4>(kseg0(p), p as u64, 0x5555_5555);
+            assert!(cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+                "a store at page offset {off:#x} must be visible to the probe");
+            assert!(!cache.jit_page_has_dirty_lines((PROBE_PAGE + 4096) as u64),
+                "a store at page offset {off:#x} must not leak into the next page's result");
+            assert!(!cache.jit_page_has_dirty_lines((PROBE_PAGE - 4096) as u64),
+                "a store at page offset {off:#x} must not leak into the previous page's result");
+        }
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_is_clean_again_once_the_page_is_written_back() {
+        // The retry story depends on this: an aborted compile must eventually
+        // succeed on its own, without anything explicitly telling the JIT that
+        // the page settled.
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+        let p = PROBE_PAGE + 0x100;
+        cache.write::<4>(kseg0(p), p as u64, 0xC0FF_EE00);
+        assert!(cache.jit_page_has_dirty_lines(PROBE_PAGE as u64));
+        full_flush(&cache);
+        assert!(!cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "once the lines drain to RAM the page must become compilable again");
+        assert_eq!(mem_read(&mem, p), 0xC0FF_EE00,
+            "sanity: the flush really did put the store in RAM, which is what the compiler will snapshot");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_handles_a_page_dirty_in_both_levels_at_once() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+        let a = PROBE_PAGE + 0x00;
+        let b = PROBE_PAGE + 0x800;
+        cache.write::<4>(kseg0(a), a as u64, 1);
+        cache.cache_op(C_HWB | CACH_PD, kseg0(a), a as u64); // a: dirty in L2
+        cache.write::<4>(kseg0(b), b as u64, 2);             // b: dirty in L1-D
+        assert!(cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a page dirty at either level must veto; both at once is not a special case");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_works_on_r5000_geometry() {
+        // R5000 has a 2-way L1-D and non-inclusive L2, so the scan has to walk
+        // both ways. Guards against the scan silently only ever checking way 0.
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache_of::<R5000Cache>(mem.clone());
+        let p = PROBE_PAGE + 0x20;
+        assert!(!cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "untouched page must be clean on R5000 too");
+        cache.write::<4>(kseg0(p), p as u64, 0xABCD_1234);
+        assert!(cache.jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a store held in R5000's L1-D must be seen regardless of which way it landed in");
+    }
+
+    #[cfg(not(feature = "tcache"))]
+    #[test]
+    fn probe_ignores_low_bits_of_the_page_base() {
+        // Callers pass a page base, but the compile path derives it from a
+        // pfn multiply; accepting a non-aligned address without masking would
+        // shift the whole scan window.
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+        let p = PROBE_PAGE + 0x30;
+        cache.write::<4>(kseg0(p), p as u64, 0x9999_9999);
+        assert!(cache.jit_page_has_dirty_lines((PROBE_PAGE + 0xFFF) as u64),
+            "an unaligned address inside the page must probe that same page");
+    }
+
+    // ---- probe installation (jitv2::install_jit_page_probe) ----
+    //
+    // The probe reaches the compile worker as a type-erased `(ctx, fn)` pair
+    // that gets `transmute`d back on the read side. That round trip is not
+    // covered by the tag-scan tests above, and a mistake in it fails silently:
+    // the worker would just see "never dirty" forever and the whole gate would
+    // be dead code that still passes every other test.
+    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+    #[test]
+    fn installed_probe_round_trips_to_the_compile_side() {
+        // Serialised against the other test that touches the same global.
+        let _g = probe_global_lock();
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        full_flush(&cache);
+
+        fn thunk<C2: MipsCache>(ctx: *const (), page_base: u64) -> bool {
+            unsafe { &*(ctx as *const C2) }.jit_page_has_dirty_lines(page_base)
+        }
+
+        assert!(!crate::jitv2::jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "with nothing installed the compile path must see a clean answer, not a stale one");
+
+        // SAFETY: `cache` outlives the probe — cleared before it drops below.
+        unsafe {
+            crate::jitv2::install_jit_page_probe(
+                &cache as *const R4400Cache as *const (), thunk::<R4400Cache>);
+        }
+
+        assert!(!crate::jitv2::jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "a clean page must still read clean through the installed probe");
+
+        let p = PROBE_PAGE + 0x50;
+        cache.write::<4>(kseg0(p), p as u64, 0x0BAD_0BAD);
+        assert!(crate::jitv2::jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "the dirty line must be visible through the erased (ctx, fn) pair the worker actually calls");
+
+        crate::jitv2::clear_jit_page_probe();
+        assert!(!crate::jitv2::jit_page_has_dirty_lines(PROBE_PAGE as u64),
+            "after clearing, the compile path must fall back to its pre-probe behaviour");
+    }
+
+    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+    #[test]
+    fn uninstalled_probe_never_blocks_a_compile() {
+        // The default must be permissive: a build or configuration where no
+        // probe is installed has to behave exactly as it did before the probe
+        // existed, rather than vetoing every compile.
+        let _g = probe_global_lock();
+        crate::jitv2::clear_jit_page_probe();
+        for page in [0u64, 0x1000, PROBE_PAGE as u64, 0x2000_0000] {
+            assert!(!crate::jitv2::jit_page_has_dirty_lines(page),
+                "no probe installed must mean no veto for page {page:#x}");
+        }
+    }
+
+    /// Exclusion for the probe global. Delegates to `jitv2::probe_test_lock`
+    /// rather than owning a mutex here: `comp.rs`'s probe tests install into
+    /// the same global, and two independent locks would exclude nothing.
+    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+    fn probe_global_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::jitv2::jitv2::probe_test_lock()
+    }
 
     // Flush a single L2 set to memory.  `phys` is any address within the L2 line.
     // Only valid when L2 is present (r4k or r5k+r5ksc).

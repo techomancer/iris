@@ -126,17 +126,13 @@ pub const JITV2_INITIAL_PAGE_CAPACITY: usize = 4096;
 /// rather than the queue mostly sitting near-empty.
 pub const COMPILE_QUEUE_CAPACITY: usize = 2048;
 
-// ============================================================================
-// End shared tunables
-// ============================================================================
-
-mod old_impl {
-    #![cfg(not(feature = "j2wp"))]
-    use super::*;
 
 /// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
-/// used throughout the codebase. Canonical home for this constant; `mem.rs`
-/// re-exports it as `JITV2_PAGE_SIZE` for its own generation-counter indexing.
+/// used throughout the codebase, and the granularity of the per-page
+/// generation counters. An architectural property of the machine, not a
+/// per-design setting: both `old_impl` and `new_impl` key pages by PFN at
+/// this size, and `mem.rs` re-exports it as `JITV2_PAGE_SIZE` for its own
+/// generation-counter indexing. Canonical home for this constant.
 pub const PAGE_SIZE: u32 = 4096;
 
 /// Number of possible entry offsets per page: one per 4-byte-aligned word
@@ -146,6 +142,142 @@ pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
 
 /// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
 pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
+
+/// Compile-time dirty-page probe: a type-erased handle to the CPU's cache,
+/// installed by `MipsExecutor::install_jit_mem_ptrs` and read by the compile
+/// worker before it publishes anything for a page.
+///
+/// # Why this exists
+///
+/// The compile worker snapshots a page by reading it off the bus
+/// (`comp::handle_request*`), which shows it **RAM**. The guest CPU's view is
+/// RAM overlaid with its own dirty cache lines. The PROM flushes after
+/// relocating, so its writes land in RAM before we ever look — but IRIX
+/// relies on the R4400's L1I/L1D coherency and inclusive L2 to make freshly
+/// written code visible to the fetch path without an explicit writeback.
+/// Correct for the CPU, invisible to us: the page generation counter is
+/// bumped by *bus* writes, so a store that retires entirely inside L1-D bumps
+/// nothing, and the worker compiles pre-store bytes and publishes them as
+/// valid. This is the one hole the generation counter does not cover.
+///
+/// # Shape
+///
+/// A `(ctx, fn)` pair rather than a trait object: `MipsCache` is const-generic
+/// over cache geometry and the executor owns its cache by value, so the `fn`
+/// is a monomorphised thunk that casts `ctx` back to the concrete cache type.
+/// No vtable, no `Arc`, no allocation on the compile path.
+///
+/// A process-global rather than a `Jitv2` field, matching
+/// `MIN_CALLS_BEFORE_COMPILE` above: every consumer is on the compile
+/// worker's snapshot path, which would otherwise have to thread a new
+/// argument through both designs' `handle_request`/`handle_request_deferred`
+/// and every test that calls them. There is one CPU per process here, so a
+/// global loses nothing.
+///
+/// Null `ctx` means "no probe installed" — every consumer then behaves exactly
+/// as it did before this existed.
+///
+/// The whole mechanism is compiled out under `tcache`, which removes the blind
+/// spot by construction rather than probing for it.
+#[cfg(not(feature = "tcache"))]
+static JIT_PAGE_PROBE_CTX: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+#[cfg(not(feature = "tcache"))]
+static JIT_PAGE_PROBE_FN: AtomicU64 = AtomicU64::new(0);
+
+/// Install the dirty-page probe. Called by the CPU thread from
+/// `MipsExecutor::install_jit_mem_ptrs`, which already re-runs on every event
+/// that can move or replace the cache (snapshot restore, reconfigure).
+///
+/// # Safety
+/// `ctx` must point at a live cache of the type `probe` was monomorphised for,
+/// and must stay valid and un-moved for as long as a compile worker can run —
+/// until a later `install_jit_page_probe` replaces it or
+/// `clear_jit_page_probe` retires it.
+#[cfg(not(feature = "tcache"))]
+pub unsafe fn install_jit_page_probe(ctx: *const (), probe: fn(*const (), u64) -> bool) {
+    // fn first, then ctx: `jit_page_has_dirty_lines` gates on ctx being
+    // non-null, so publishing ctx last means it can never observe a live ctx
+    // paired with a stale or zero fn.
+    JIT_PAGE_PROBE_FN.store(probe as usize as u64, Ordering::Relaxed);
+    JIT_PAGE_PROBE_CTX.store(ctx as *mut (), Ordering::Release);
+}
+
+/// Test-only exclusion for the probe global.
+///
+/// The probe is one process-wide `(ctx, fn)` pair, but several places install
+/// into it: `mips_exec`'s executor setup, and the unit tests in both `comp.rs`
+/// and `mips_cache_v2.rs`. `cargo test` runs those concurrently, so any test
+/// that installs a stub must hold *this* lock rather than a private one — two
+/// separate mutexes guarding one global exclude nothing, and the resulting
+/// interference shows up as a test seeing no probe installed (or another
+/// test's stub answering for its page).
+#[cfg(all(test, not(feature = "tcache")))]
+pub fn probe_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Retire the probe. After this, compiles stop consulting the cache and behave
+/// as they did before it existed. Must be called before the cache handed to
+/// `install_jit_page_probe` can go away.
+#[cfg(not(feature = "tcache"))]
+pub fn clear_jit_page_probe() {
+    JIT_PAGE_PROBE_CTX.store(std::ptr::null_mut(), Ordering::Release);
+}
+
+/// Does the CPU hold dirty cache lines for the 4KB physical page at
+/// `page_base`?
+///
+/// `true` means the compile worker must abort and publish nothing: RAM does
+/// not match what the guest CPU would execute. `false` means "no reason found
+/// to abort" — **not** a guarantee.
+///
+/// # This read is deliberately unsynchronised
+///
+/// It runs on the compile thread while the CPU thread freely mutates the very
+/// tag arrays it walks. No lock, no atomics on the tags, no ordering: plain
+/// racy reads that may be torn or stale. That is an accepted trade:
+///
+/// - The alternatives measured worse. Flushing the cache for every page the
+///   compiler touches wrecks guest performance, and `tcache` (cache reads RAM
+///   transparently, removing the blind spot by construction) costs roughly
+///   10-20% across the benchmark suite. This is one short tag scan per
+///   *compile*, not per memory access, and it is off the CPU thread.
+/// - A false `true` (we saw a dirty tag being cleaned right now) is free: one
+///   skipped compile, retried later. Pure lost work, no correctness effect.
+/// - A false `false` (a store lands just after we looked) leaves exactly the
+///   hole that exists today — no worse. The generation counter still guards
+///   every bus-visible write and `publish` re-checks it against `gen_snap`.
+///
+/// So this strictly shrinks an existing race rather than introducing a new
+/// one. Treat it as a mitigation, never as a correctness barrier — do not
+/// build anything on top of it that assumes a definite answer.
+#[cfg(not(feature = "tcache"))]
+pub fn jit_page_has_dirty_lines(page_base: u64) -> bool {
+    let ctx = JIT_PAGE_PROBE_CTX.load(Ordering::Acquire);
+    if ctx.is_null() {
+        return false;
+    }
+    let raw = JIT_PAGE_PROBE_FN.load(Ordering::Relaxed);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: `install_jit_page_probe`'s contract — `ctx` is a live cache of
+    // the type `probe` was monomorphised for, kept alive until cleared. The
+    // tag *contents* it goes on to read race with the CPU thread by design;
+    // the pointer itself does not.
+    let probe: fn(*const (), u64) -> bool = unsafe { std::mem::transmute(raw as usize) };
+    probe(ctx as *const (), page_base)
+}
+
+// ============================================================================
+// End shared tunables
+// ============================================================================
+
+mod old_impl {
+    #![cfg(not(feature = "j2wp"))]
+    use super::*;
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -416,17 +548,42 @@ pub enum RejectReason {
     /// at all, just not judged worth the fixed per-compile cost. See
     /// `comp::MIN_INSTRS_TO_COMPILE`'s own doc comment.
     TooShort,
+    /// The dirty-page probe (`jit_page_has_dirty_lines`) found cache lines
+    /// for this page that have not reached RAM, so the bus snapshot the
+    /// compile would have been built from is known-stale. Not a codegen gap
+    /// and not sticky: the offset stays un-denylisted and is retried on its
+    /// next arrival, by which point the lines have usually drained on their
+    /// own. A steadily climbing count here means the guest is writing code
+    /// into a page it keeps executing from — expected during module load or
+    /// relocation, suspicious if it never settles.
+    PageDirtyInCache,
 }
 #[cfg(feature = "developer")]
-pub const REJECT_REASON_COUNT: usize = 4;
+pub const REJECT_REASON_COUNT: usize = 5;
 #[cfg(feature = "developer")]
 impl RejectReason {
+    /// Every variant, in display order. The single source of truth for
+    /// anything that enumerates reasons (`j2 stats`'s breakdown) — a new
+    /// variant missing from here would silently never be reported, which is
+    /// exactly how `PageDirtyInCache` first went unnoticed. `index()`'s
+    /// exhaustive `match` is what forces this to be updated: adding a variant
+    /// without extending it fails to compile, and the length assertion below
+    /// catches a variant added to the match but not to this list.
+    pub const ALL: [RejectReason; REJECT_REASON_COUNT] = [
+        RejectReason::EntryExcluded,
+        RejectReason::AnalyzerCodegenDisagreement,
+        RejectReason::CraneliftVerifierError,
+        RejectReason::TooShort,
+        RejectReason::PageDirtyInCache,
+    ];
+
     pub fn index(self) -> usize {
         match self {
             RejectReason::EntryExcluded => 0,
             RejectReason::AnalyzerCodegenDisagreement => 1,
             RejectReason::CraneliftVerifierError => 2,
             RejectReason::TooShort => 3,
+            RejectReason::PageDirtyInCache => 4,
         }
     }
     pub fn label(self) -> &'static str {
@@ -435,6 +592,7 @@ impl RejectReason {
             RejectReason::AnalyzerCodegenDisagreement => "analyzer/codegen disagreement (should be unreachable — see doc comment)",
             RejectReason::CraneliftVerifierError => "Cranelift verifier error (real emitter bug)",
             RejectReason::TooShort => "region too short (below j2 min-instrs threshold)",
+            RejectReason::PageDirtyInCache => "page dirty in CPU cache (snapshot would be stale — retried later)",
         }
     }
 }
@@ -542,7 +700,14 @@ impl JitStats {
     /// both, and a shared helper means they can't drift out of sync (one
     /// incremented without the other).
     pub fn record_reject(&self, reason: RejectReason) {
-        self.failed_compiles.fetch_add(1, Ordering::Relaxed);
+        // A dirty-page abort is a *deferral*, not a failed compile: the page
+        // is fine, it just is not in RAM yet, and the same offsets recompile
+        // successfully on a later arrival. Counting it under
+        // `failed_compiles` would make codegen look like it was regressing
+        // while it was working correctly, so it gets its own bucket only.
+        if !matches!(reason, RejectReason::PageDirtyInCache) {
+            self.failed_compiles.fetch_add(1, Ordering::Relaxed);
+        }
         self.reject_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3157,19 +3322,6 @@ mod new_impl {
 // thing they'd go stale against.
 // ---------------------------------------------------------------------------
 
-/// Page size for JIT v2 (§2.4) — matches the MIPS TLB/cache page granularity
-/// used throughout the codebase. Canonical home for this constant; `mem.rs`
-/// re-exports it as `JITV2_PAGE_SIZE` for its own generation-counter indexing.
-pub const PAGE_SIZE: u32 = 4096;
-
-/// Number of possible entry offsets per page: one per 4-byte-aligned word
-/// (MIPS instructions are always word-aligned), i.e. `PAGE_SIZE / 4` (§2.4:
-/// `entry_bits` 16×u64 = 1024 bits, `entry_table` 1024 entries).
-pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
-
-/// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
-pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
-
 /// How many of the most-recently-used pages survive a flush with their
 /// `requested`/`denied` bitmaps (and pfn/gen/hash entry) intact, to be
 /// recompiled immediately rather than relearned from scratch — see
@@ -3375,17 +3527,42 @@ pub enum RejectReason {
     /// at all, just not judged worth the fixed per-compile cost. See
     /// `comp::MIN_INSTRS_TO_COMPILE`'s own doc comment.
     TooShort,
+    /// The dirty-page probe (`jit_page_has_dirty_lines`) found cache lines
+    /// for this page that have not reached RAM, so the bus snapshot the
+    /// compile would have been built from is known-stale. Not a codegen gap
+    /// and not sticky: the offset stays un-denylisted and is retried on its
+    /// next arrival, by which point the lines have usually drained on their
+    /// own. A steadily climbing count here means the guest is writing code
+    /// into a page it keeps executing from — expected during module load or
+    /// relocation, suspicious if it never settles.
+    PageDirtyInCache,
 }
 #[cfg(feature = "developer")]
-pub const REJECT_REASON_COUNT: usize = 4;
+pub const REJECT_REASON_COUNT: usize = 5;
 #[cfg(feature = "developer")]
 impl RejectReason {
+    /// Every variant, in display order. The single source of truth for
+    /// anything that enumerates reasons (`j2 stats`'s breakdown) — a new
+    /// variant missing from here would silently never be reported, which is
+    /// exactly how `PageDirtyInCache` first went unnoticed. `index()`'s
+    /// exhaustive `match` is what forces this to be updated: adding a variant
+    /// without extending it fails to compile, and the length assertion below
+    /// catches a variant added to the match but not to this list.
+    pub const ALL: [RejectReason; REJECT_REASON_COUNT] = [
+        RejectReason::EntryExcluded,
+        RejectReason::AnalyzerCodegenDisagreement,
+        RejectReason::CraneliftVerifierError,
+        RejectReason::TooShort,
+        RejectReason::PageDirtyInCache,
+    ];
+
     pub fn index(self) -> usize {
         match self {
             RejectReason::EntryExcluded => 0,
             RejectReason::AnalyzerCodegenDisagreement => 1,
             RejectReason::CraneliftVerifierError => 2,
             RejectReason::TooShort => 3,
+            RejectReason::PageDirtyInCache => 4,
         }
     }
     pub fn label(self) -> &'static str {
@@ -3394,6 +3571,7 @@ impl RejectReason {
             RejectReason::AnalyzerCodegenDisagreement => "analyzer/codegen disagreement (should be unreachable — see doc comment)",
             RejectReason::CraneliftVerifierError => "Cranelift verifier error (real emitter bug)",
             RejectReason::TooShort => "region too short (below j2 min-instrs threshold)",
+            RejectReason::PageDirtyInCache => "page dirty in CPU cache (snapshot would be stale — retried later)",
         }
     }
 }
@@ -3501,7 +3679,14 @@ impl JitStats {
     /// both, and a shared helper means they can't drift out of sync (one
     /// incremented without the other).
     pub fn record_reject(&self, reason: RejectReason) {
-        self.failed_compiles.fetch_add(1, Ordering::Relaxed);
+        // A dirty-page abort is a *deferral*, not a failed compile: the page
+        // is fine, it just is not in RAM yet, and the same offsets recompile
+        // successfully on a later arrival. Counting it under
+        // `failed_compiles` would make codegen look like it was regressing
+        // while it was working correctly, so it gets its own bucket only.
+        if !matches!(reason, RejectReason::PageDirtyInCache) {
+            self.failed_compiles.fetch_add(1, Ordering::Relaxed);
+        }
         self.reject_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
