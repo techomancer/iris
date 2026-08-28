@@ -875,8 +875,9 @@ mod tests {
 
     /// Diagnostic (not a strict regression gate): loads the REAL page
     /// contents captured live from `wd93_init`'s physical page (pfn=0x800b,
-    /// `ignore/mem.txt`, a `m 0xffffffff8800b000 1024` dump) and walks the
-    /// analyzer from word 0x150 (`0xffffffff8800b540`) — the exact entry
+    /// `test/wd93_init_page_8800b000.txt`, a `m 0xffffffff8800b000 1024`
+    /// monitor dump) and walks the analyzer from word 0x150
+    /// (`0xffffffff8800b540`) — the exact entry
     /// that live-boot's `handle_request` logged as `instr_count=2
     /// visited_words=[150, 151]`. Confirms whether that's a real analyzer
     /// bug or architecturally correct: word 0x150 is `jal 0x805de0` (a real
@@ -885,7 +886,7 @@ mod tests {
     /// produce, not evidence of a truncation bug.
     #[test]
     fn wd93_init_real_page_walk_from_jal_entry() {
-        let raw = include_str!("../../ignore/mem.txt");
+        let raw = include_str!("test/wd93_init_page_8800b000.txt");
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
         let mut count = 0;
         for line in raw.lines() {
@@ -901,7 +902,9 @@ mod tests {
                 count += 1;
             }
         }
-        assert_eq!(count, 1024, "must have parsed all 1024 words from ignore/mem.txt — got {}", count);
+        assert_eq!(count, 1024,
+            "must have parsed all 1024 words from \
+             src/jitv2/test/wd93_init_page_8800b000.txt — got {}", count);
 
         // Sanity: word 0x150 (0xffffffff8800b540) must be the JAL we expect,
         // confirming the file parsed at the right offsets.

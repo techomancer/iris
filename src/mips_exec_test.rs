@@ -852,7 +852,7 @@ mod tests {
     /// through to `translate_fn` every time. A structure that is never hit is
     /// indistinguishable from one that is absent — except in benchmark noise
     /// — so assert the hit directly via tlbstats counters.
-    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[cfg(feature = "tlbstats")]
     #[test]
     fn test_nutlb_actually_serves_repeat_reads() {
         std::thread::Builder::new()
@@ -860,7 +860,7 @@ mod tests {
             .spawn(|| { test_nutlb_actually_serves_repeat_reads_inner(); })
             .unwrap().join().unwrap();
     }
-    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[cfg(feature = "tlbstats")]
     fn test_nutlb_actually_serves_repeat_reads_inner() {
         use crate::mips_tlb::MipsTlb;
 
@@ -885,7 +885,7 @@ mod tests {
     /// (NUTLB_BITS=8 → index is VA[19:12]). Alternating between them must
     /// still be *correct*, just slower — this is the conflict-miss case the
     /// `nutlb_conflict` counter exists to measure.
-    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[cfg(feature = "tlbstats")]
     #[test]
     fn test_nutlb_conflict_set_stays_correct() {
         std::thread::Builder::new()
@@ -893,7 +893,7 @@ mod tests {
             .spawn(|| { test_nutlb_conflict_set_stays_correct_inner(); })
             .unwrap().join().unwrap();
     }
-    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[cfg(feature = "tlbstats")]
     fn test_nutlb_conflict_set_stays_correct_inner() {
         use crate::mips_tlb::MipsTlb;
         use crate::mips_core::{NUTLB_BITS, nutlb_index};
@@ -931,11 +931,89 @@ mod tests {
                 "alternating two pages in one set should register conflict misses");
     }
 
+    /// A kernel-filled nutlb entry must never be reachable from user mode.
+    ///
+    /// nutlb tags carry no permission bits, so the *only* thing standing
+    /// between user mode and a kernel translation is the flush that
+    /// `on_cp0_status_changed` issues via `nanotlb_invalidate()`. Verified to
+    /// fail — returning the kernel page's data instead of the expected
+    /// address error — with that flush removed, so this pins real behaviour
+    /// rather than being a tautology.
+    ///
+    /// Historical note: the superseded self-describing-tag design *failed*
+    /// this test, because its permission AND shared a set-in-every-tag guard
+    /// bit with the mode mask and so never rejected anything. See
+    /// rules/testing/nutlb-erl-guard-defeats-permission-test.md.
+    #[test]
+    fn test_nutlb_kernel_entry_unreachable_from_user() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_nutlb_kernel_entry_unreachable_from_user_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_nutlb_kernel_entry_unreachable_from_user_inner() {
+        use crate::mips_tlb::MipsTlb;
+        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+                               STATUS_KSU_SHIFT, KSU_USER};
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        // Without this, `MTC0 Status` updates the register but never fires
+        // `on_cp0_status_changed`, so `translate_fn` keeps its kernel
+        // specialization and the privilege check below is not the one the
+        // running emulator performs. The test helper does not install it.
+        exec.install_status_cb();
+        exec.core.cp0_status &= !STATUS_ERL;
+        exec.update_translate_fn();
+
+        // KSEG0 is kernel-only and unmapped, so this needs no TLB entry —
+        // and being unmapped it is cached by the nutlb like any other
+        // finished translation (see test_nutlb_caches_segment_translations).
+        let kva: u64 = 0xFFFF_FFFF_8000_4000;
+        mem.set_word(0x4000, 0xDEAD_BEEF);
+
+        // Kernel mode: fill the entry.
+        assert_eq!(exec.read_data::<4>(kva).unwrap(), 0xDEAD_BEEF,
+                   "setup: kernel must be able to read KSEG0");
+
+        // Drop to user mode through a real `MTC0 Status`, which is the
+        // transition both builds hang their correctness on — and going
+        // through the instruction rather than poking the field means the
+        // side-effect handler (`on_cp0_status_changed`) is genuinely
+        // exercised, which is the thing under test.
+        let user_status = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL & !STATUS_ERL)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT);
+        exec.core.write_gpr(8, user_status as u64);
+        let mtc0_status = (OP_COP0 << 26) | (0x04 << 21) | (8 << 16) | (12 << 11);
+        assert_eq!(exec.exec(mtc0_status), EXEC_COMPLETE);
+        assert!(matches!(exec.core.get_privilege_mode(),
+                         crate::mips_core::PrivilegeMode::User),
+                "setup: should be in user mode after MTC0 Status");
+        // `translate_fn` is specialized on privilege at Status-write time, so
+        // if the callback did not fire the emulator is still running the
+        // kernel translator and the check under test is not the real one.
+        // Assert on the translator's behaviour rather than its identity
+        // (the specializations are private): a *fresh* kernel-only VA that
+        // was never cached must now be refused.
+        let probe = (exec.translate_fn)(&mut exec, 0xFFFF_FFFF_8000_9000,
+                                        crate::mips_tlb::AccessType::Read);
+        assert!(probe.is_exception(),
+                "setup: after MTC0 Status the user-mode translator must refuse \
+                 an uncached KSEG0 VA; it did not, so on_cp0_status_changed \
+                 never fired and this test would pass vacuously");
+
+        // User touching KSEG0 is an address error, never a hit. `read_data`
+        // reports the exception as Err; what must not happen is Ok(0xDEADBEEF).
+        let r = exec.read_data::<4>(kva);
+        assert!(r.is_err(),
+                "user mode read of KSEG0 {kva:#x} must raise an address error, \
+                 got {r:?} — a kernel-filled nutlb entry leaked into user mode");
+    }
+
     /// Segment (unmapped-window) translations must be cached just like TLB
     /// ones — the nutlb stores a finished VA->PA mapping, so where it came
     /// from is irrelevant. kseg0 and kseg1 differ only in cache attribute,
     /// which is per-entry, so both must round-trip with the right C-field.
-    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[cfg(feature = "tlbstats")]
     #[test]
     fn test_nutlb_caches_segment_translations() {
         std::thread::Builder::new()
@@ -943,7 +1021,7 @@ mod tests {
             .spawn(|| { test_nutlb_caches_segment_translations_inner(); })
             .unwrap().join().unwrap();
     }
-    #[cfg(all(feature = "nutlb", feature = "tlbstats"))]
+    #[cfg(feature = "tlbstats")]
     fn test_nutlb_caches_segment_translations_inner() {
         use crate::mips_tlb::MipsTlb;
 

@@ -20,17 +20,14 @@ pub struct TlbAccessStats {
     pub nano_hit:         u64,
     /// NanoTLB misses (fell through to translate()). Equals total translate() calls.
     pub nano_miss:        u64,
-    /// nutlb hits (feature = "nutlb"; Read/Write only — Fetch stays nanotlb).
-    #[cfg(feature = "nutlb")]
+    /// nutlb hits (Read/Write only — Fetch stays nanotlb).
     pub nutlb_hit:        u64,
     /// nutlb misses (fell through to translate()).
-    #[cfg(feature = "nutlb")]
     pub nutlb_miss:       u64,
     /// Of those misses, how many found the set holding a *different* valid
     /// page — i.e. conflict rather than cold/capacity. High values argue for
     /// a larger NUTLB_BITS (or associativity); low values say the working set
     /// simply doesn't fit and more sets won't help.
-    #[cfg(feature = "nutlb")]
     pub nutlb_conflict:   u64,
     /// Vmap found an entry and ASID/global matched → Hit/Invalid/Modified.
     pub vmap_hit:         u64,
@@ -83,7 +80,6 @@ impl TlbStats {
                     nm = s.nano_miss, nmp = pct(s.nano_miss, nano_total));
             }
             // nutlb layer (Read/Write only; Fetch never routes through it)
-            #[cfg(feature = "nutlb")]
             {
                 let nu_total = s.nutlb_hit + s.nutlb_miss;
                 if nu_total > 0 {
@@ -347,18 +343,18 @@ pub trait Tlb {
     /// Record a nanotlb hit (default no-op; overridden by MipsTlb when tlbstats is on).
     #[cfg(feature = "tlbstats")]
     fn stats_nanotlb_hit(&mut self, _at: AccessType) {}
-    /// Record a nutlb hit (feature = "nutlb").
-    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    /// Record a nutlb hit.
+    #[cfg(feature = "tlbstats")]
     #[inline(always)]
     fn stats_nutlb_hit(&mut self, _at: AccessType) {}
     /// Record a nutlb miss.
-    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[cfg(feature = "tlbstats")]
     #[inline(always)]
     fn stats_nutlb_miss(&mut self, _at: AccessType) {}
     /// Record a nutlb *conflict* miss: the set was occupied by a different
     /// page. Distinguishes "needs more sets" from cold/capacity misses — the
     /// number that decides whether NUTLB_BITS should grow.
-    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[cfg(feature = "tlbstats")]
     #[inline(always)]
     fn stats_nutlb_conflict(&mut self, _at: AccessType) {}
     /// Record a nanotlb miss.
@@ -1235,15 +1231,15 @@ impl Tlb for MipsTlb {
         Ok(())
     }
 
-    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[cfg(feature = "tlbstats")]
     fn stats_nutlb_hit(&mut self, at: AccessType) {
         self.stats.by_type[at as usize].nutlb_hit += 1;
     }
-    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[cfg(feature = "tlbstats")]
     fn stats_nutlb_miss(&mut self, at: AccessType) {
         self.stats.by_type[at as usize].nutlb_miss += 1;
     }
-    #[cfg(all(feature = "tlbstats", feature = "nutlb"))]
+    #[cfg(feature = "tlbstats")]
     fn stats_nutlb_conflict(&mut self, at: AccessType) {
         self.stats.by_type[at as usize].nutlb_conflict += 1;
     }

@@ -3014,7 +3014,6 @@ struct InlineMemPath {
 /// Returns `None` when the inline path must not be emitted at all — the cache
 /// reports an unsupported geometry (R5000 2-way, PassthroughCache), in which
 /// case the caller emits only the callout, exactly as before.
-#[cfg(feature = "nutlb")]
 fn emit_inline_mem_guard<const STORE: bool>(
     ctx: &mut EmitCtx,
     vaddr: Value,
@@ -3069,35 +3068,6 @@ fn emit_inline_mem_guard<const STORE: bool>(
         ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, virttag) as i32));
     let e_phys = ctx.builder.ins().load(i64t, mem, entry,
         ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, phys) as i32));
-    let e_gen = ctx.builder.ins().load(ir::types::I32, mem, entry,
-        ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, tlbgen) as i32));
-    let e_amask = ctx.builder.ins().load(ir::types::I8, mem, entry,
-        ir::immediates::Offset32::new(std::mem::offset_of!(mc::NuTlbEntry, asid_mask) as i32));
-    let e_amask = ctx.builder.ins().uextend(i64t, e_amask);
-
-    let cur_asid = ctx.builder.ins().load(ir::types::I8, mem, ctx.core_ptr,
-        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, cur_asid) as i32));
-    let cur_asid = ctx.builder.ins().uextend(i64t, cur_asid);
-    let cur_sec = ctx.builder.ins().load(i64t, mem, ctx.core_ptr,
-        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, cur_sec_mask) as i32));
-    let cur_gen = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr,
-        ir::immediates::Offset32::new(std::mem::offset_of!(MipsCore, tlb_gen) as i32));
-
-    // want = (va & !0xFFF) | (cur_asid & amask)
-    let va_page = ctx.builder.ins().band_imm_s(vaddr, !0xFFFi64);
-    let asid_bits = ctx.builder.ins().band(cur_asid, e_amask);
-    let want = ctx.builder.ins().bor(va_page, asid_bits);
-    // have = virttag & (!0xFFF | amask)
-    let page_mask = ctx.builder.ins().iconst(i64t, !0xFFFi64);
-    let have_mask = ctx.builder.ins().bor(page_mask, e_amask);
-    let have = ctx.builder.ins().band(e_virttag, have_mask);
-
-    let tag_eq = ctx.builder.ins().icmp(IntCC::Equal, want, have);
-    let gen_eq = ctx.builder.ins().icmp(IntCC::Equal, e_gen, cur_gen);
-    // permission: subset test, NOT foldable into the compare above
-    // (docs/nutlb-design.md §3a)
-    let perm = ctx.builder.ins().band(e_virttag, cur_sec);
-    let perm_ok = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, perm, 0);
 
     // Cacheability. The Rust path branches on `TranslateResult::is_cached()`
     // and sends uncached accesses to the bus, never the D-cache — so the
@@ -3110,9 +3080,30 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let cacheable = ctx.builder.ins().icmp_imm_s(
         IntCC::NotEqual, c_field, crate::mips_exec::TR_UNCACHED as i64);
 
-    let ok = ctx.builder.ins().band(tag_eq, gen_eq);
-    let ok = ctx.builder.ins().band(ok, perm_ok);
-    let ok = ctx.builder.ins().band(ok, cacheable);
+    // Tag compare + bitmask bit, mirroring `MipsExecutor::nutlb_translate`.
+    // Any divergence here is a correctness bug, not a performance one.
+    let ok = {
+        let va_page = ctx.builder.ins().band_imm_s(vaddr, !0xFFFi64);
+        let tag_eq = ctx.builder.ins().icmp(IntCC::Equal, e_virttag, va_page);
+
+        // valid[arr][idx >> 6] >> (idx & 63) & 1
+        let words_base = std::mem::offset_of!(MipsCore, nutlb_valid) as i64
+            + (arr as i64) * (mc::NUM_NUTLB_WORDS as i64) * 8;
+        let word_idx = ctx.builder.ins().ushr_imm_s(idx, 6);
+        let word_off = ctx.builder.ins().imul_imm_s(word_idx, 8);
+        let word_off = ctx.builder.ins().iadd_imm_s(word_off, words_base);
+        let word_ptr = ctx.builder.ins().iadd(ctx.core_ptr, word_off);
+        let word = ctx.builder.ins().load(i64t, mem, word_ptr, ir::immediates::Offset32::new(0));
+        // Shift count is masked to 6 bits by the ISA (x86 `shr` masks to 63),
+        // and Cranelift's `ushr` is defined the same way, so the explicit
+        // `& 63` in the Rust version is redundant here rather than omitted.
+        let bit = ctx.builder.ins().ushr(word, idx);
+        let valid = ctx.builder.ins().band_imm_s(bit, 1);
+        let valid = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, valid, 0);
+
+        let ok = ctx.builder.ins().band(tag_eq, valid);
+        ctx.builder.ins().band(ok, cacheable)
+    };
 
     let xlat_ok_block = ctx.builder.create_block();
     ctx.builder.ins().brif(ok, xlat_ok_block, &[], slow_block, &[]);
@@ -3192,15 +3183,6 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let fast_data_ptr = ctx.builder.ins().iadd(base, swizzled);
 
     Some(InlineMemPath { fast_data_ptr, fast_tag_ptr: tag_ptr, fast_phys: phys, slow_block, join_block })
-}
-
-#[cfg(not(feature = "nutlb"))]
-fn emit_inline_mem_guard<const STORE: bool>(
-    _ctx: &mut EmitCtx, _vaddr: Value, _size: MemSize,
-) -> Option<InlineMemPath> {
-    // The inline path is built on the nutlb probe; without it the first stage
-    // would be the 1-entry nanotlb slot, which is not worth emitting.
-    None
 }
 
 /// Byte index within the data array/window for `size`, applying the

@@ -1,9 +1,8 @@
 # nutlb — direct-mapped data-side micro-TLB
 
-Status: **implemented behind `--features nutlb`, off by default. Measured a
-~10-13% win on live IRIX.** Replaces the Read/Write slots of the
-existing 3-entry `nanotlb` (`mips_core.rs:702`, `mips_exec.rs:2366`). The Fetch
-slot survives as a separate, specialised one-entry structure.
+Status: **shipped, unconditional (no feature flag).** Replaces the Read/Write
+slots of the old 3-entry `nanotlb`; the Fetch slot survives as a separate,
+specialised one-entry structure.
 
 Companion reading: `HACKING.md` (data path), `rules/testing/` (TLB findings),
 `docs/nanotlb_associativity.md`-adjacent memory note — a previous 4-way/AVX2
@@ -12,7 +11,56 @@ itself against a very cheap incumbent.
 
 ---
 
-## 1. What's wrong with today's nanotlb
+## 0. How this evolved — read this first
+
+This document was written as a design proposal, then kept as a results log, and
+the design it originally specified is **not** the one that shipped. Two
+generations exist, and sections written for the first are marked as historical
+rather than deleted, because the reasoning that killed it is the most useful
+thing here.
+
+**Generation 1 — self-describing tags (§2–§6, historical).** Each entry carried
+ASID + a permission set + a TLB generation counter, so a mode switch, exception
+or ERET did not have to invalidate anything: a stale entry simply failed to
+match. Only a real TLB mutation retired entries, via `tlb_gen`. This measured
+**+10–13% on live IRIX** against the nanotlb (§9) and shipped behind
+`--features nutlb`.
+
+**Generation 2 — validity bitmask (§11, current).** The tag was stripped to a
+bare page number and validity moved to a 4-word-per-array bitmask, with
+coherency restored the way the nanotlb does it: flush at every barrier. This
+trades ~3–4 ALU ops off *every probe* — including every inline JIT load and
+store — against discarding the whole 256-entry working set on every exception,
+ERET, mode switch and ASID change.
+
+That trade was expected to lose. §1.2 and §3 of this document argue at length
+that not-flushing is "the bulk of the win", and the prediction going into the
+experiment was that 256 refills per syscall would swamp a few ops per access.
+**It lost the prediction and won the benchmark** (§12): the probe savings, paid
+on every load and store, outweigh the refills. The flush cost scales with how
+much of the working set is *re-touched before the next flush*, and on real IRIX
+that is far less than capacity suggests.
+
+Generation 1 also turned out to carry a **latent correctness bug** that its own
+design section did not catch — the permission test never rejected anything
+(§11.3). That is not why it was replaced (the benchmark decided that), but it
+does mean the +10–13% in §9 was measured against a permission check doing no
+work, so Generation 2's margin over it is slightly understated.
+
+The lesson worth carrying forward: **on this hot path, per-access cost beat
+per-event cost, twice.** The 4-way nanotlb lost to 1-way for the same reason,
+and now tagged nutlb has lost to untagged. Two data points pointing the same
+direction is worth remembering before adding anything to the probe.
+
+---
+
+## 1. What's wrong with the nanotlb *(the original motivation)*
+
+> Written when the nanotlb still served Read/Write. It no longer does; the
+> Fetch slot is all that remains of it. Both problems below are still the
+> reason a data-side micro-TLB exists — but note that Generation 2 chose to
+> take problem 2 *back* (it flushes on every transition) and still won, which
+> §12 unpacks.
 
 Three single-entry slots indexed by `AccessType` (Fetch=0, Read=1, Write=2):
 
@@ -95,7 +143,13 @@ fails to match rather than needing a flush. That remains a nice property of the
 redesign, but with the hazard already fixed it is **not part of nutlb's
 justification**. That stays performance: §1.1 capacity and §1.2 flush frequency.
 
-## 2. Shape
+## 2. Shape *(Generation 1 — historical, see §0 and §11)*
+
+> **Superseded.** The shipped entry is 16 B — `virttag` (bare page number) +
+> `phys` — with no `tlbgen` and no `asid_mask`, and validity held in a separate
+> bitmask. The Read/Write split and the `phys` encoding below *did* survive
+> unchanged; everything about the tag did not.
+
 
 ```rust
 pub const NUTLB_BITS: usize = 6;                    // tunable, see §8
@@ -130,7 +184,14 @@ mask and `phys_addr(va)` stays `(phys & !0xFFF) | (va & 0xFFF)`.
 
 ---
 
-## 3. The virttag, and a correction to the proposed hit test
+## 3. The virttag, and a correction to the proposed hit test *(Generation 1 — historical)*
+
+> **Superseded.** No permission bits, ASID or generation are stored today.
+> Retained because §3a's analysis of *why* the permission test is hard to fold
+> into one compare is still correct, and because the test it settled on turned
+> out to be broken anyway (§11.3) — a worked example of a design review that
+> checked the algebra and missed the bit assignment.
+
 
 Proposed layout, which I'm keeping:
 
@@ -229,7 +290,11 @@ mutation does, via the generation counter. That is the bulk of the win in §1.2.
 
 ---
 
-## 4. Generation counter
+## 4. Generation counter *(Generation 1 — historical)*
+
+> **Superseded.** There is no `tlb_gen`. TLB mutations retire entries by
+> flushing the validity bitmask, like every other barrier.
+
 
 ```rust
 pub tlb_gen: u32,   // in MipsCore, bumped on every TLB mutation
@@ -269,7 +334,15 @@ see §7's closing note on the asymmetry.
 
 ---
 
-## 5. ERL — recommendation
+## 5. ERL — recommendation *(partly historical)*
+
+> **Partly superseded.** The conclusion — *do not cache ERL translations at
+> all* — survives, and `nutlb_fill` still declines the fill while
+> `Status.ERL=1`. The mechanism does not: there is no `cur_sec_mask` and no
+> ERL guard bit, so the test is a direct `cp0_status & STATUS_ERL` check on the
+> cold fill path rather than a bit folded into the hot-path AND. That folding
+> is precisely what made the permission test defective (§11.3).
+
 
 This is the part of your sketch that was left open, and I think the ERL-bit
 idea should be **dropped** in favour of not caching ERL translations at all.
@@ -331,7 +404,12 @@ which `get_privilege_mode` already folds into `cur_sec_mask` at
 
 ---
 
-## 6. Cached current-context values
+## 6. Cached current-context values *(Generation 1 — historical)*
+
+> **Superseded.** `cur_sec_mask`, `cur_asid` and `tlb_gen` are all gone, along
+> with `refresh_nutlb_context()`. Nothing per-context is cached, because
+> nothing in the tag depends on context.
+
 
 `MipsCore` gains, all recomputed in `on_cp0_status_changed` / EntryHi writes:
 
@@ -418,8 +496,9 @@ flush sites only *add* invalidations, which is always safe for `pcp`.
 
 ## 8. Sizing — measured
 
-Shipped at `NUTLB_BITS = 8` (256 entries/array, 32 B each, 16 KiB total).
-The sweep, on `nutlb,tlbstats` builds:
+`NUTLB_BITS = 8` (256 entries/array) — unchanged in Generation 2, though the
+entry is now 16 B, so the total is 8 KiB rather than 16 KiB. The sweep was run
+on Generation 1 (`nutlb,tlbstats`):
 
 | bits | entries | read hit | MIPS | DMIPS |
 |---|---|---|---|---|
@@ -458,11 +537,21 @@ associativity fought a nearly-free hit test, so it does not transfer
 automatically — but it is a standing warning that this exact idea has already
 failed once here. Measure on live IRIX before believing it.
 
-32 B/entry (padded from 24 B) is also unvalidated: it makes indexing a shift
-instead of a multiply and keeps entries off split cache lines, but the 16 B
-packed variant was never benchmarked.
+32 B/entry (padded from 24 B) was also never validated on its own: it made
+indexing a shift instead of a multiply and kept entries off split cache lines,
+but the packed variant was never benchmarked *against it at equal tag width*.
+Generation 2 does use 16 B entries — and got faster — but changed the tag at
+the same time, so this remains unattributed (§12).
 
-## 9. Results
+## 9. Results *(Generation 1, vs the nanotlb)*
+
+> These are Generation 1's numbers against the **nanotlb** baseline, and they
+> remain the justification for having a data-side micro-TLB at all. They are
+> *not* a comparison between the two nutlb generations — that is §12.
+>
+> One caveat, discovered later: the tagged build's permission test never
+> actually rejected anything (§11.3), so these figures were produced by a probe
+> doing slightly less work than intended.
 
 ### Live IRIX (the number that matters)
 
@@ -532,7 +621,7 @@ Anyone re-measuring this should treat **live IRIX as the primary signal** and
 most actionable number here, and it says the limit is the direct-mapped
 organization, not the size — see §8.
 
-### The hit test is branchless on purpose
+### The hit test is branchless on purpose *(still true in Generation 2)*
 
 Measured on an isolated 200M-iteration microbenchmark of exactly this test:
 
@@ -549,9 +638,14 @@ with `&`.
 
 ## 10. Open questions
 
-Ranked by expected value now that the conflict-miss result (§9) is in hand.
+Ranked by expected value. Revised for Generation 2 — two entries that referred
+to Generation 1 machinery are now moot and marked so.
 
-- **2-way associativity.** The obvious next move: 95–100% of misses are
+- **2-way associativity.** Still the obvious next move, and cheaper to try
+  now: with a 16 B entry a 2-way set is 32 B, one cache line, and the probe it
+  competes against is only two operations. But note that Generation 2 is the
+  *second* time a cheaper hit test beat a smarter one here (§0), so weight the
+  extra tag comparison accordingly. Original reasoning: 95–100% of misses are
   same-set conflicts, and more sets demonstrably don't fix that (§8). Caveat
   in §8 — the 4-way nanotlb experiment already lost once. Note also that a
   *linear sweep* (what `test/ib/iris_bench.c` does) is not helped much by
@@ -571,19 +665,159 @@ Ranked by expected value now that the conflict-miss result (§9) is in hand.
   direct instrumentation of what page sizes IRIX actually maps, not inference
   from the conflict counter.
 
-- **`nutlb_perm_bits` must track the segment decode.** It mirrors the segment
-  logic in `translate_32bit_impl`/`translate_64bit_impl` and will silently rot
-  if either changes — a wrong permission bit means either a spurious miss
-  (slow but safe) or a page cached as more-permissive than it is (**not**
-  safe). Worth a debug-build assertion cross-checking it against a real
-  `translate_impl` result on every fill.
+- **~~`nutlb_perm_bits` must track the segment decode.~~** *Moot in
+  Generation 2* — the function is gone, along with every permission bit. What
+  replaced it, `nutlb_cacheable_segment`, only rejects VA shapes that are not
+  valid addresses at all, so drifting out of sync with the segment decode
+  costs at worst a spurious miss, never an unsafe cache. The hazard this entry
+  warned about is structurally absent.
 
-- **Entry size.** 32 B padded vs 16 B packed was never benchmarked (§8).
+- **Entry size — still open, and now a confound.** 32 B padded vs 16 B packed
+  was never benchmarked in isolation (§8), and Generation 2 changed it at the
+  same time as the tag, so §12's win cannot be attributed between the two. A
+  16 B *tagged* build would separate them.
 
-- **jitv2 fetch-slot longevity (§7).** Moot for the shipped design — Option B
-  keeps the fetch slot barrier-flushed, so `jitv2_track_pcp`'s invalidation
-  cadence is unchanged. Only becomes live if the fetch entry is ever tagged.
+- **jitv2 fetch-slot longevity (§7).** Still moot, and more firmly so: the
+  fetch slot stays barrier-flushed, and Generation 2 removed the only tagged
+  structure in the emulator, so `jitv2_track_pcp`'s invalidation cadence is
+  unchanged. Only becomes live if the fetch entry is ever tagged — for which
+  §0's "per-access cost beat per-event cost, twice" is the standing prior.
 
 - **Did the uncontained ASID change in §1a ever fire on real IRIX?** Moot for
   correctness (fixed), still mildly interesting for sizing the §7 flush cost.
   Lowest priority here.
+
+---
+
+## 11. Generation 2 — the shipped design
+
+### 11.1 Shape
+
+```rust
+pub const NUTLB_BITS:  usize = 8;                       // 256 entries/array
+pub const NUM_NUTLB_WORDS: usize = NUM_NUTLB_ENTRIES / 64;   // 4
+
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+pub struct NuTlbEntry {
+    pub virttag: u64,   // VA[63:12] — bare page number, nothing else
+    pub phys:    u64,   // PA[63:12] in [63:12]; C-field in [2:0]
+}
+
+pub nutlb:       [[NuTlbEntry; NUM_NUTLB_ENTRIES]; 2],   // [0]=Read [1]=Write
+pub nutlb_valid: [[u64; NUM_NUTLB_WORDS]; 2],            // one bit per set
+```
+
+16 B/entry, so both arrays together are **8 KiB** rather than Generation 1's
+16 KiB. The Read/Write split (§2) and the `phys` encoding are unchanged.
+
+**A zero tag is no longer self-evidently invalid.** VA 0 is a legal page
+number, so validity comes *only* from the bitmask. Never test `virttag` without
+first testing its bit — including in diagnostics: the `tlbstats` conflict
+counter has to ask the bitmask, or every post-flush refill is miscounted as a
+conflict.
+
+### 11.2 The hit test, and the flush that pays for it
+
+```rust
+if (e.virttag == (va & !0xFFF)) & self.core.nutlb_is_valid(arr, idx) {
+    return TranslateResult::ok(e.phys_addr(va), e.cache_attr_raw());
+}
+```
+
+One page compare, one bitmask probe, `&` not `&&` for the reasons in §9. The
+bitmask word load is independent of the entry load, so the two issue in
+parallel; what Generation 2 actually removes from the *critical path* is the
+`asid_mask` load that Generation 1's `want`/`have` computation depended on.
+
+Coherency comes back as flushing. `MipsCore::nutlb_clear()` zeroes the bitmask —
+8 stores, independent of how many entries were live — and it is called from
+**`MipsExecutor::nanotlb_invalidate()`**, deliberately, rather than from the
+~10 individual barrier sites. That is the single most important structural
+decision in this generation: the nutlb and the nanotlb now share one barrier,
+so a future barrier cannot cover one structure and silently miss the other.
+Generation 1's call sites each needed their own `refresh`/`bump`/nothing
+decision, and getting one wrong was a silent correctness bug.
+
+Sites that flush (all via `nanotlb_invalidate`): exception delivery, ERET,
+`on_cp0_status_changed`, `MTC0 EntryHi`, `TLBR`, `TLBWI`, `TLBWR`,
+`MipsCpu::stop()`, snapshot restore.
+
+The JIT's inline probe in `jitv2/codegen.rs` mirrors this exactly and dropped
+from ~15 IR ops to 6. Any divergence between the two is a correctness bug, not
+a performance one.
+
+### 11.3 Why Generation 1's permission test never worked
+
+Worth recording in full, because the flaw is invisible in the algebra §3a
+checks and was carried through review, implementation and a full benchmark run.
+
+`NUTLB_TAG_ERL_OK` (bit 11) was set in **every filled tag** *and* in **every
+non-ERL `cur_sec_mask`**:
+
+```
+NUTLB_SEC_USER = ERL_OK | USER   = 0x900
+virttag(kseg0) = ERL_OK | KERNEL = 0xC00
+0xC00 & 0x900  = 0x800           -> nonzero -> "permitted"
+```
+
+The subset test `(virttag & cur_sec_mask) != 0` was therefore satisfied by the
+**shared ERL bit alone**, with no privilege bit in common. A kernel-filled
+KSEG0 entry stayed readable from user mode. Observed directly:
+
+```
+virttag=0xffffffff80004c00 sec_mask=0x900 perm_and=0x800  -> hit
+```
+
+§5's own claim is where it went wrong: folding ERL into the mask costs "zero
+extra hot-path instructions (the AND was already there)". That is exactly the
+problem — **one AND cannot carry both an always-set flag and a subset test**,
+because the always-set bit alone satisfies `!= 0`. The fix would have been to
+mask the privilege bits separately (`& NUTLB_PERM_MASK`), i.e. the extra op
+§3a talked itself out of.
+
+Never reachable in practice on IRIX — it needs a user access to a VA a
+kernel access cached in the same set, with no intervening flush — but it was a
+real hole, not a theoretical one. Generation 2 does not share it: no
+permission bits exist, and the flush at every privilege transition is what
+enforces the property. `test_nutlb_kernel_entry_unreachable_from_user`
+(`mips_exec_test.rs`) is the regression test, verified to fail when the flush
+is removed. Full writeup:
+`rules/testing/nutlb-erl-guard-defeats-permission-test.md`.
+
+---
+
+## 12. Generation 2 vs Generation 1 — measured
+
+Live IRIX, `lightning,rex-jit,j2wp,tcache`:
+
+| benchmark | Gen 1 (tagged) | Gen 2 (bitmask) | delta |
+|---|---|---|---|
+| whetstone | 416 | 400 | **-3.8%** (lower is better) |
+| dhrystone | 263157 | 277777 | **+5.6%** |
+| ssl / irisbench | 2.98 | 3.27 | **+9.7%** |
+
+**The prediction was wrong, and it is worth being precise about how.** The
+argument against Generation 2 (§0, and §1.2/§3 throughout) was that flushing
+256 entries on every syscall would cost far more than 3–4 ALU ops per access
+could save. The error was costing the flush as "discards 256 live
+translations". What a flush actually costs is the refill of however many sets
+are **re-touched before the next flush** — and between two syscalls, IRIX
+touches far fewer than capacity. Meanwhile the probe savings are paid on
+*every single load and store*, which is several orders of magnitude more
+frequent than the barriers.
+
+Flush-based coherency scaling badly with structure size is still true in
+general; it just isn't the binding constraint at this structure's size and this
+barrier frequency.
+
+**Confound, unresolved.** Generation 2 changed two things at once: the tag
+*and* the entry size (32 B → 16 B, arrays 16 KiB → 8 KiB). Some unknown share
+of the win is host D-cache footprint rather than the shorter probe. Separating
+them needs a third build — 16 B entries with tags retained — which was never
+run. §8 already flagged packed-vs-padded as unbenchmarked; it still is. This
+only matters if someone wants tagged entries back, in which case a packed
+tagged entry might recover most of the difference while restoring flush-free
+transitions.
+
+---

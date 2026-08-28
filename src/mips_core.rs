@@ -266,35 +266,30 @@ pub struct MipsCore {
     /// Nano-TLB: 3-entry direct-mapped cache, one slot per access type (Fetch/Read/Write).
     /// Indexed by AccessType discriminant (0=Fetch, 1=Read, 2=Write).
     ///
-    /// The Fetch slot (index 0) is the long-term survivor: it stays untagged
-    /// and barrier-flushed on purpose (docs/nutlb-design.md §7 — one 64-bit
+    /// Only the Fetch slot (index 0) is live: it stays untagged and
+    /// barrier-flushed on purpose (docs/nutlb-design.md §7 — one 64-bit
     /// compare is its whole value, and after an ERET the PC has moved pages
     /// anyway, so the flush discards something already dead). The Read/Write
-    /// slots are what `nutlb` below replaces.
+    /// slots are superseded by `nutlb` below and no longer consulted; the
+    /// array stays 3 wide so `AccessType` still indexes it directly.
     pub nanotlb: [NanoTlbEntry; 3],
 
-    #[cfg(feature = "nutlb")]
-    /// Current mode's nutlb permission mask — one of `NUTLB_SEC_USER` /
-    /// `_SUPER` / `_KERNEL`, or `NUTLB_SEC_ERL` (0) while Status.ERL=1.
-    /// Recomputed by `refresh_nutlb_context()` on every Status write.
-    pub cur_sec_mask: u64,
-
-    #[cfg(feature = "nutlb")]
-    /// Mirror of `cp0_entryhi & 0xFF`, kept so the probe doesn't need a
-    /// dependent load + mask of the CP0 block. Refreshed wherever EntryHi is
-    /// written (`write_cp0` reg 10, `exec_tlbr`).
-    pub cur_asid: u8,
-
-    #[cfg(feature = "nutlb")]
-    /// Bumped on every TLB mutation (`exec_tlbwi`, `exec_tlbwr`, snapshot
-    /// restore). A nutlb entry is stale unless its `tlbgen` still matches.
-    /// Starts at 1 so a zeroed array (gen 0) is dead on arrival.
+    /// nutlb validity, one bit per set: `[array][word]`, so entry `idx` of
+    /// array `a` is live iff `valid[a][idx >> 6] & (1 << (idx & 63))`.
     ///
-    /// Deliberately NOT bumped on ASID change: that is the whole point of
-    /// having ASID in the tag. Bumping there would also discard every
-    /// global-page entry, which is the over-invalidation nutlb exists to
-    /// avoid. On wrap to 0 the arrays are zeroed and it restarts at 1.
-    pub tlb_gen: u32,
+    /// This is the nanotlb's coherency model applied to a 256-entry
+    /// structure. nutlb tags carry only a page number — no ASID, no
+    /// permission set, no generation — so every site that flushes the
+    /// nanotlb must clear these words too (see
+    /// `MipsExecutor::nanotlb_invalidate`). Clearing is 8 stores regardless
+    /// of how many entries were live.
+    ///
+    /// The alternative — self-describing tags that survive a mode switch —
+    /// was implemented and benchmarked against this on live IRIX, and *lost*:
+    /// the per-probe cost of the ASID/permission/generation checks, paid on
+    /// every load and store, outweighed the refills the tags avoided. See
+    /// docs/nutlb-design.md §12.
+    pub nutlb_valid: [[u64; NUM_NUTLB_WORDS]; 2],
 
     /// Called whenever CP0 Status (reg 12) is written, with (old_value, new_value).
     /// The first element is the callback function, the second is an opaque context pointer
@@ -744,7 +739,6 @@ pub struct MipsCore {
     #[cfg(feature = "developer_ip7")]
     pub compare_delta_stats: std::collections::HashMap<u32, u32>,
 
-    #[cfg(feature = "nutlb")]
     /// Data-side micro-TLB: `[NUTLB_READ | NUTLB_WRITE][NUM_NUTLB_ENTRIES]`,
     /// direct-mapped on VA[12+NUTLB_BITS-1:12]. Replaces the nanotlb's
     /// Read/Write slots; see `NuTlbEntry` and docs/nutlb-design.md.
@@ -768,18 +762,20 @@ pub struct LockstepMemCapture {
     pub value: u64,
 }
 
-// ================= nutlb (feature = "nutlb") =================
-// Data-side micro-TLB (docs/nutlb-design.md). Lives in its own module so one
-// `cfg` gates the whole thing: with the feature off a build carries neither
-// the 16 KiB arrays nor any probe cost, and the nanotlb Read/Write slots stay
-// in charge exactly as before.
-#[cfg(feature = "nutlb")]
+// ================= nutlb =================
+// Data-side micro-TLB (docs/nutlb-design.md), replacing the nanotlb's
+// Read/Write slots. Kept in its own module purely for namespacing now that it
+// is unconditional.
 mod nutlb_defs {
     /// Number of nutlb sets, as a power-of-two log. 8 → 256 entries per array,
     /// covering a 1 MiB VA window; two arrays (Read/Write) at 32 B = 16 KiB.
     pub const NUTLB_BITS: usize = 8;
     pub const NUM_NUTLB_ENTRIES: usize = 1 << NUTLB_BITS;
     pub const NUTLB_INDEX_MASK: u64 = (NUM_NUTLB_ENTRIES as u64) - 1;
+
+    /// `nutlb_bitmask`: number of u64 words in one array's valid bitmask.
+    /// 256 entries / 64 = 4, so a full flush is 4 stores per array.
+    pub const NUM_NUTLB_WORDS: usize = NUM_NUTLB_ENTRIES / 64;
 
     /// Array selector for `MipsCore::nutlb`. Read and Write are kept separate
     /// because the Write array holds only pages that passed the dirty-bit (D)
@@ -790,59 +786,28 @@ mod nutlb_defs {
     pub const NUTLB_READ:  usize = 0;
     pub const NUTLB_WRITE: usize = 1;
 
-    // ---- virttag layout (docs/nutlb-design.md §3) ----
-    //
-    //   63:12  VA[63:12] — page number
-    //   11     ERL guard: always SET in a filled tag; cleared from
-    //          `cur_sec_mask` when Status.ERL=1, which makes every entry fail
-    //          the permission test and so disables the nutlb for that window.
-    //   10     page reachable from kernel
-    //    9     page reachable from supervisor
-    //    8     page reachable from user
-    //    7:0   ASID (0 if the page is global)
-    //
-    // Bits 10:8 are a *permission set* ("which modes may touch this page"),
-    // not a single privilege level: MIPS segment permission is downward-
-    // inclusive, so a KUSEG page stores 0b111 and a KSSEG page 0b110. That
-    // orientation is what lets the check be one AND against the current mask.
-    pub const NUTLB_TAG_ERL_OK: u64 = 1 << 11;
-    pub const NUTLB_TAG_KERNEL: u64 = 1 << 10;
-    pub const NUTLB_TAG_SUPER:  u64 = 1 << 9;
-    pub const NUTLB_TAG_USER:   u64 = 1 << 8;
-
-    /// `cur_sec_mask` values: the tag bit for the current mode OR'd with the
-    /// ERL-OK guard — except under ERL, which is 0 so that
-    /// `(virttag & cur_sec_mask) != 0` is false for every cached entry.
-    pub const NUTLB_SEC_USER:   u64 = NUTLB_TAG_ERL_OK | NUTLB_TAG_USER;
-    pub const NUTLB_SEC_SUPER:  u64 = NUTLB_TAG_ERL_OK | NUTLB_TAG_SUPER;
-    pub const NUTLB_SEC_KERNEL: u64 = NUTLB_TAG_ERL_OK | NUTLB_TAG_KERNEL;
-    pub const NUTLB_SEC_ERL:    u64 = 0;
-
     /// Single nutlb entry — the data-side replacement for `NanoTlbEntry`.
     ///
-    /// Unlike the nanotlb (untagged, coherency maintained by flushing on every
-    /// privilege transition), a nutlb entry is self-describing: it carries the
-    /// ASID it was filled under, the set of modes allowed to use it, and the
-    /// TLB generation it came from. A stale entry fails to match rather than
-    /// needing a flush to remove it, which is what lets exceptions and ERET
-    /// stop invalidating the data side.
+    /// Stripped to what flush coherency needs: no generation (the valid
+    /// bitmask retires entries), no ASID and no permission bits (a flush
+    /// covers every event that could change their meaning). So `virttag` is a
+    /// bare page number and the hit test is one compare plus one bitmask
+    /// probe.
     ///
-    /// Padded to 32 B so indexing is a shift, not a multiply, and so an entry
-    /// never straddles a cache line.
+    /// 16 B, aligned 16: two fields, nothing to pad for, and the whole
+    /// structure is 8 KiB rather than 16 KiB — which matters, because the
+    /// arrays are hot enough that their host D-cache footprint is part of
+    /// what this design is buying.
     #[derive(Clone, Copy, Default)]
-    #[repr(C, align(32))]
+    #[repr(C, align(16))]
     pub struct NuTlbEntry {
-        /// Zero = invalid: a filled tag always has at least the ERL-OK bit
-        /// set, so a zeroed array is naturally empty.
+        /// VA[63:12]. Validity lives in `MipsCore::nutlb_valid`, not here, so
+        /// unlike a tagged design a zero tag is NOT self-evidently invalid —
+        /// VA 0 is a legal page. Never test this without the bitmask bit.
         pub virttag: u64,
         /// PA[63:12] in bits [63:12]; hardware C-field (2/3/5) in bits [2:0],
         /// same encoding as `NanoTlbEntry::pa_encoded`.
         pub phys: u64,
-        /// Must equal `MipsCore::tlb_gen` or the entry is stale.
-        pub tlbgen: u32,
-        /// 0x00 if the page is global (ASID ignored), 0xFF if ASID-qualified.
-        pub asid_mask: u8,
-        _pad: [u8; 11],
     }
 
     impl NuTlbEntry {
@@ -857,9 +822,6 @@ mod nutlb_defs {
         pub fn cache_attr_raw(&self) -> u32 {
             (self.phys & 0x7) as u32
         }
-
-        #[inline(always)]
-        pub fn invalidate(&mut self) { self.virttag = 0; }
     }
 
     /// Set index for `va`. Direct-mapped on VA[12 + NUTLB_BITS - 1 : 12].
@@ -869,7 +831,6 @@ mod nutlb_defs {
     }
 }
 
-#[cfg(feature = "nutlb")]
 pub use nutlb_defs::*;
 
 /// Single nano-TLB entry.
@@ -1049,17 +1010,9 @@ impl MipsCore {
             fpu_fenr: 0,
             fpu_fcsr: 0,
             nanotlb: [NanoTlbEntry::default(); 3],
-            // Kernel is the reset privilege, but reset also sets Status.ERL=1
-            // (see `reset()`), so the effective mask is recomputed by
-            // `refresh_nutlb_context()` before any translation happens.
-            #[cfg(feature = "nutlb")]
-            cur_sec_mask: NUTLB_SEC_KERNEL,
-            #[cfg(feature = "nutlb")]
-            cur_asid: 0,
-            // 1, not 0: a zeroed nutlb array carries tlbgen 0, which must
-            // never match a live generation.
-            #[cfg(feature = "nutlb")]
-            tlb_gen: 1,
+            // All-zero = every set invalid, which is what a fresh core
+            // wants; the tag array's contents are then unreachable.
+            nutlb_valid: [[0u64; NUM_NUTLB_WORDS]; 2],
             status_changed_cb: None,
             // Placeholders — overwritten immediately by
             // MipsExecutor::install_jit_hooks (same pattern as translate_fn's
@@ -1177,7 +1130,6 @@ impl MipsCore {
             compare_delta_stats: std::collections::HashMap::new(),
             // 16 KiB of zeroes. `NuTlbEntry: Copy` so this is a const-promoted
             // memset, not 512 separate initializations.
-            #[cfg(feature = "nutlb")]
             nutlb: [[NuTlbEntry::default(); NUM_NUTLB_ENTRIES]; 2],
         };
         core.reset_registers(false);
@@ -1840,55 +1792,30 @@ impl MipsCore {
         self.nanotlb[2].invalidate();
     }
 
-    #[cfg(feature = "nutlb")]
-    /// Recompute the cached nutlb context (`cur_sec_mask`, `cur_asid`) from
-    /// CP0 Status and EntryHi. Cheap; call it wherever either changes rather
-    /// than trying to be clever about which bits matter.
+    /// Drop every nutlb entry by clearing the valid bitmask. 8 stores total
+    /// (4 words x 2 arrays) no matter how many entries were live.
     ///
-    /// This is what replaces the data side's invalidate-on-transition: a mode
-    /// switch changes the *mask*, not the entries, so entries the new mode may
-    /// not touch simply stop matching. Under ERL the mask is 0, which makes
-    /// every entry fail and transparently disables the nutlb for that window —
-    /// see `NUTLB_SEC_ERL` and docs/nutlb-design.md §5.
-    #[inline]
-    pub fn refresh_nutlb_context(&mut self) {
-        self.cur_asid = (self.cp0_entryhi & 0xFF) as u8;
-        self.cur_sec_mask = if (self.cp0_status & STATUS_ERL) != 0 {
-            NUTLB_SEC_ERL
-        } else {
-            match self.get_privilege_mode() {
-                PrivilegeMode::Kernel     => NUTLB_SEC_KERNEL,
-                PrivilegeMode::Supervisor => NUTLB_SEC_SUPER,
-                PrivilegeMode::User       => NUTLB_SEC_USER,
-            }
-        };
-    }
-
-    #[cfg(feature = "nutlb")]
-    /// Bump the TLB generation, retiring every cached nutlb entry at once.
-    /// Call on any TLB mutation (`exec_tlbwi`/`exec_tlbwr`, snapshot restore).
+    /// The tag array is deliberately left untouched: nothing reads a tag
+    /// without first testing its bit, so stale tags are unreachable.
     ///
-    /// On wrap the arrays are zeroed so generation 0 can never alias a live
-    /// entry. That costs a 16 KiB memset once per 2^32 TLB writes — hours of
-    /// guest time — and the branch predicts not-taken until then.
+    /// Called from `MipsExecutor::nanotlb_invalidate`, which is the single
+    /// barrier both data-side structures share — see its doc comment for why
+    /// the flush is hung there rather than on individual call sites.
     #[inline]
-    pub fn tlb_gen_bump(&mut self) {
-        self.tlb_gen = self.tlb_gen.wrapping_add(1);
-        if self.tlb_gen == 0 {
-            self.nutlb_clear();
-            self.tlb_gen = 1;
-        }
-    }
-
-    #[cfg(feature = "nutlb")]
-    /// Drop every nutlb entry. Only needed where the generation counter can't
-    /// express the change (wrap, snapshot restore into a different TLB).
     pub fn nutlb_clear(&mut self) {
-        for arr in self.nutlb.iter_mut() {
-            for e in arr.iter_mut() {
-                e.invalidate();
-            }
-        }
+        self.nutlb_valid = [[0u64; NUM_NUTLB_WORDS]; 2];
+    }
+
+    /// Is set `idx` of array `arr` live?
+    #[inline(always)]
+    pub fn nutlb_is_valid(&self, arr: usize, idx: usize) -> bool {
+        (self.nutlb_valid[arr][idx >> 6] >> (idx & 63)) & 1 != 0
+    }
+
+    /// Mark set `idx` of array `arr` live.
+    #[inline(always)]
+    pub fn nutlb_set_valid(&mut self, arr: usize, idx: usize) {
+        self.nutlb_valid[arr][idx >> 6] |= 1u64 << (idx & 63);
     }
 
     /// Set interrupt bit
