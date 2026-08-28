@@ -602,6 +602,29 @@ pub struct MipsCore {
     /// dispatch-time check, which is the only reader.
     #[cfg(feature = "jitv2")]
     pub jit_trigger: bool,
+    /// Physical frame number of the code page the CPU is currently *fetching
+    /// from* — a mirror of `MipsExecutor::pcp`'s own `pfn`, kept here so the
+    /// data-write path can consult it without dereferencing the `pcp` raw
+    /// pointer (`MipsCore` is what the write path already has in hand, and
+    /// what compiled code is handed).
+    ///
+    /// `u32::MAX` means "no page currently tracked" — the sentinel for
+    /// `pcp == null`, which is a real state (after `nutlb_clear`, a JIT
+    /// arena flush, or before the first fetch). A real pfn can never be
+    /// `u32::MAX`: that would name physical address `0xFFFFFFFF_000`, far
+    /// above any memory this machine has.
+    ///
+    /// Written **only** through `MipsExecutor::set_pcp`/`clear_pcp`, never
+    /// assigned directly — the whole point is that it cannot drift out of
+    /// sync with `self.pcp`, and six separate assignment sites are exactly
+    /// how that drift would happen.
+    ///
+    /// Consumed by the `jitv2_smc_check` diagnostic (see
+    /// `MipsExecutor::smc_check_write`): a data write whose translated
+    /// physical address lands inside this frame is self-modifying code
+    /// hitting the page currently being executed/compiled.
+    #[cfg(feature = "jitv2")]
+    pub cur_code_pfn: u32,
     /// Set by `exec_syscall` when the exception it raises is delivered,
     /// cleared by `handle_exception` on delivery of any *other* exception
     /// (so a syscall handler that itself faults, or gets interrupted, before
@@ -1078,6 +1101,8 @@ impl MipsCore {
             lockstep_mem: None,
             #[cfg(feature = "jitv2")]
             jit_trigger: false,
+            #[cfg(feature = "jitv2")]
+            cur_code_pfn: u32::MAX, // no page tracked yet
             #[cfg(feature = "jitv2")]
             syscall_pending: false,
             cp0_index: 0,

@@ -166,6 +166,20 @@ jitv2_corpus_dump = ["jitv2"]
 # src/lib.rs: Cargo features are additive, so an incompatible one can only be
 # rejected, never unset.
 jitv2_lockstep = ["jitv2", "developer"]
+# jitv2 diagnostic: detect self-modifying code landing on the physical page the
+# CPU is currently fetching/compiling from. Every data write, after translation,
+# compares its physical frame against `core.cur_code_pfn` (the pfn mirror of
+# `MipsExecutor::pcp`); a match means the guest just wrote into the page it is
+# executing, which is exactly the shape that can leave the JIT running a stale
+# compilation of bytes that no longer exist. Reports once per (pc, target page)
+# pair so a memset over a code page doesn't produce a million lines.
+#
+# Diagnostic only — it reports, it does not invalidate (jitv2's real
+# invalidation is the write-protect/generation machinery). Adds a compare to
+# every write, so it is off by default. **Run it with `j2 inline_mem off`**: the
+# inline store fast path writes the L1-D array directly and never goes through
+# `write_data_impl`, so stores that take it are invisible to this check.
+jitv2_smc_check = ["jitv2"]
 # Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
 # Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
 # CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.

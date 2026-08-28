@@ -39,6 +39,16 @@ fn mips_log(_bit: u32) -> bool {
     false
 }
 
+/// `jitv2_smc_check`: total data writes seen landing on the page currently
+/// being fetched from, counted *before* the `(pc, pfn)` dedup — so this is the
+/// real event count, not the number of distinct reports printed. Exposed so a
+/// run can confirm the check fired at all: a zero after a workload that should
+/// have tripped it means the instrumentation is broken (or every store took
+/// the inline fast path, which bypasses `write_data_impl` entirely — see
+/// `smc_check_report`'s doc comment), not that the guest is well-behaved.
+#[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+pub static SMC_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `j2 pagewb [on|off]` gate (default off): when on, `jitv2_track_pcp` writes
 /// back dirty L1-D/L2 lines covering a physical code page the instant a fetch
 /// crosses onto it, before that page can be handed to the JIT for
@@ -1169,6 +1179,10 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// lazily rather than cached across a flush.
     #[cfg(feature = "jitv2")]
     pub(crate) pcp: *mut crate::jitv2::PhysicalCodePage,
+    /// `jitv2_smc_check` dedup set, keyed `(pc, target code pfn)` — see
+    /// [`Self::smc_check_report`].
+    #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+    smc_seen: std::collections::HashSet<(u64, u32)>,
     /// Inline per-instruction lockstep scratch (`jit_lockstep_step`/
     /// `jit_lockstep_compare`): `ls_before` is the pre-instruction state saved
     /// so it can be restored after the interpreter's reference run, before the
@@ -2329,6 +2343,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             jitv2_stats,
             #[cfg(feature = "jitv2")]
             pcp: std::ptr::null_mut(),
+            #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+            smc_seen: std::collections::HashSet::new(),
             #[cfg(feature = "jitv2_lockstep")]
             ls_before: None,
             #[cfg(feature = "jitv2_lockstep")]
@@ -2767,7 +2783,106 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // docs/nutlb-design.md §12.
         self.core.nutlb_clear();
         #[cfg(feature = "jitv2")]
-        { self.pcp = std::ptr::null_mut(); }
+        { self.clear_pcp(); }
+    }
+
+    /// `jitv2_smc_check`: report a data write that lands on the physical page
+    /// the CPU is currently fetching/compiling from — self-modifying code
+    /// hitting live compiled code.
+    ///
+    /// Called from `write_data_impl` *after* translation (the physical
+    /// address is the whole point — a code page is identified by its frame,
+    /// never by VA, and the writer's virtual mapping is usually a completely
+    /// different alias from the fetcher's) and *before* the write commits, so
+    /// the report names the state that produced it.
+    ///
+    /// Reports only, never invalidates: this exists to answer "does this
+    /// actually happen, and where", not to fix it. jitv2's real invalidation
+    /// path is elsewhere.
+    ///
+    /// **Blind spot worth stating:** the JIT's inline store fast path
+    /// (`codegen::emit_mem_write_split`) writes through the L1-D data array
+    /// directly and never enters `write_data_impl`, so a store that takes it
+    /// is invisible here. Run with `j2 inline_mem off` for a complete picture
+    /// — otherwise a clean result means
+    /// "no SMC among the writes that took the slow path", which is a much
+    /// weaker statement than "no SMC".
+    ///
+    /// Deduplicated on `(pc, target pfn)`: a memset or a loader relocating a
+    /// whole page would otherwise emit one line per store. The set is capped
+    /// and cleared wholesale when it grows past the cap, which is fine for a
+    /// diagnostic — worst case a long run re-reports a pair it already showed.
+    #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+    #[cold]
+    #[inline(never)]
+    fn smc_check_report(&mut self, virt_addr: u64, phys_addr: u64, size: usize, pfn: u32) {
+        const DEDUP_CAP: usize = 4096;
+        // Counted before dedup: the total is "how many SMC writes happened",
+        // which is what tells you the instrumentation fired at all. A zero
+        // here after a run that should have tripped it means broken wiring,
+        // not absence of SMC — verify the counter moves before trusting a
+        // clean result.
+        SMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = (self.core.pc, pfn);
+        if self.smc_seen.len() >= DEDUP_CAP {
+            self.smc_seen.clear();
+        }
+        if !self.smc_seen.insert(key) {
+            return;
+        }
+        let page_base = pfn as u64 * crate::jitv2::PAGE_SIZE as u64;
+        let word = ((phys_addr - page_base) / 4) as usize;
+        eprintln!(
+            "jitv2 SMC: write to the page being executed — pc={:#018x} wrote {} byte(s) \
+va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
+            self.core.pc, size, virt_addr, phys_addr, pfn, page_base, word,
+            crate::jitv2::ENTRIES_PER_PAGE,
+        );
+    }
+
+    /// `jitv2_smc_check` hot-path test: does this write's physical address
+    /// fall inside the code page currently being fetched from? Inlined and
+    /// branch-free apart from the compare so a build with the feature on is
+    /// still usable; all the work lives in the `#[cold]`
+    /// [`Self::smc_check_report`].
+    ///
+    /// `cur_code_pfn == u32::MAX` (no page tracked) can never match a real
+    /// frame, so the "nothing tracked" case needs no separate test.
+    #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+    #[inline(always)]
+    fn smc_check_write(&mut self, virt_addr: u64, phys_addr: u64, size: usize) {
+        let pfn = self.core.cur_code_pfn;
+        if (phys_addr / crate::jitv2::PAGE_SIZE as u64) as u32 == pfn {
+            self.smc_check_report(virt_addr, phys_addr, size, pfn);
+        }
+    }
+
+    /// Set `self.pcp` and keep `core.cur_code_pfn` in lockstep with it.
+    ///
+    /// The two must never disagree: `cur_code_pfn` is what the data-write
+    /// path tests against to detect self-modifying code hitting the page
+    /// being executed (`smc_check_write`), and a stale mirror produces either
+    /// false positives (naming a page we long since left) or silent misses.
+    /// Funnelling every assignment through this pair is what makes that
+    /// structural rather than a convention six call sites have to remember.
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn set_pcp(&mut self, page: *mut crate::jitv2::PhysicalCodePage) {
+        self.pcp = page;
+        self.core.cur_code_pfn = if page.is_null() {
+            u32::MAX
+        } else {
+            unsafe { (*page).pfn }
+        };
+    }
+
+    /// Drop the currently tracked code page — the `null` counterpart to
+    /// [`Self::set_pcp`], kept as its own name so the intent reads at the
+    /// call sites (nutlb clear, arena flush) rather than as a bare null store.
+    #[cfg(feature = "jitv2")]
+    #[inline]
+    fn clear_pcp(&mut self) {
+        self.set_pcp(std::ptr::null_mut());
     }
 
     /// JIT v2: re-derive `self.pcp` if the fetch just landed on a different physical
@@ -2834,7 +2949,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1);
         match lookup {
             Some(slot) => {
+                // Assigned directly rather than through `set_pcp`: the
+                // `jit` guard is still live here, so a `&mut self` call
+                // would conflict. `pfn` is the value `set_pcp` would have
+                // read back out of the slot anyway — this keeps the mirror
+                // exact without the borrow.
                 self.pcp = jit.page_ptr(slot);
+                self.core.cur_code_pfn = pfn;
                 // `pfn` here is the real physical frame number (`phys_addr`
                 // is post-translation, from nanotlb_translate's successful
                 // result — never a virtual page) — this must match the slot
@@ -2863,7 +2984,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // there's no reason to blow those away too — just null the
                 // dangling pointer directly and re-derive it below for the
                 // exact page this fetch already landed on.
-                self.pcp = std::ptr::null_mut();
+                self.clear_pcp();
                 let mut jit = self.jitv2.lock();
                 #[cfg(not(feature = "j2wp"))]
                 let slot = jit.page_for(pfn, page_base, self.sysad.as_ref())
@@ -2871,7 +2992,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 #[cfg(feature = "j2wp")]
                 let slot = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1)
                     .expect("flush must leave room for at least one page");
+                // Direct assignment for the same borrow reason as the
+                // hit path above; `pfn` is what `set_pcp` would mirror.
                 self.pcp = jit.page_ptr(slot);
+                self.core.cur_code_pfn = pfn;
                 #[cfg(feature = "j2wp")]
                 debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
                     "jitv2_track_pcp (post-flush retry): page_for({:#x}) returned a slot whose own pfn is {:#x}",
@@ -4081,6 +4205,17 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if translate_result.is_exception() { return translate_result.status; }
         let phys_addr = translate_result.phys as u64;
         let is_cached = translate_result.is_cached();
+
+        // Diagnostic (`jitv2_smc_check`): is this write landing on the code
+        // page the CPU is currently fetching/compiling from? Placed here —
+        // after translation, before the write commits — because a code page
+        // is identified by physical frame, and the writer's virtual alias is
+        // usually not the fetcher's. `DEBUG` accesses are monitor/tooling
+        // reads-and-writes, not guest stores, so they are excluded.
+        #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+        if !DEBUG {
+            self.smc_check_write(virt_addr, phys_addr, SIZE);
+        }
 
         // Track memory write for undo if it's to lomem/himem (production only)
         #[cfg(feature = "developer")]
@@ -7344,7 +7479,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if over_threshold {
             let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
-            self.pcp = std::ptr::null_mut();
+            self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
         }
@@ -7380,7 +7515,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             let page = unsafe { &mut *self.pcp };
             let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
-            self.pcp = std::ptr::null_mut();
+            self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
             return EXEC_RETRY;
         }
@@ -9396,6 +9531,17 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             if e + d > 0 {
                 eprintln!("jitv2 inline memory: emitted={e} declined={d}");
             }
+        }
+        #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
+        {
+            // Always printed, including the zero case: "0" is a real result
+            // here only if you also know the check was live, and printing it
+            // unconditionally is what distinguishes "no SMC observed" from
+            // "the feature wasn't compiled in". Note the inline-store blind
+            // spot — pair a zero with `jitv2 inline memory: emitted=0`
+            // before concluding anything.
+            let hits = SMC_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("jitv2 SMC check: {hits} write(s) landed on the page being executed");
         }
         #[cfg(feature = "instr_stats")]
         {

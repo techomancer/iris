@@ -3469,6 +3469,70 @@ mod tests {
         );
     }
 
+    /// `jitv2_smc_check` must actually fire on a store into the page the CPU
+    /// is fetching from — and must stay silent for a store elsewhere.
+    ///
+    /// The negative half is the point: a check that reported on *every* write
+    /// would also "detect" self-modifying code, so a clean live run only means
+    /// something if the positive case is known to trip. Both directions are
+    /// asserted against the same counter.
+    ///
+    /// Driven through `step_jit()` rather than `exec()`: `exec()` is the
+    /// debug/single-injection entry point and feeds `core.pc` to
+    /// `jitv2_track_pcp` as though it were already physical (see its doc
+    /// comment). For a kseg0 pc that yields a *virtual* pfn, which can never
+    /// equal the physical pfn a store translates to — the check would be
+    /// permanently silent. Only the real fetch path establishes a comparable
+    /// `cur_code_pfn`.
+    #[test]
+    #[cfg(feature = "jitv2_smc_check")]
+    fn smc_check_fires_on_write_to_executing_page_and_not_elsewhere() {
+        use crate::mips_exec::SMC_HITS;
+        use std::sync::atomic::Ordering;
+
+        // `SMC_HITS` is a process-global counter and the suite runs tests in
+        // parallel, so any other test whose guest writes into its own
+        // executing page bumps it too. Serialize on the existing shared test
+        // lock so the deltas measured below are this test's alone — without
+        // this the negative assertion is flaky (observed once).
+        let _serialize = crate::jitv2::analyzer::FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let mut gpr = [0u64; 32];
+        // r1 -> same physical page as pc; r2 -> a different page entirely.
+        gpr[1] = pc + 0x40;
+        gpr[2] = pc + PAGE_SIZE as u64 * 4;
+        let (exec, mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        let sw_here = make_i(crate::mips_isa::OP_SW, 1, 0, 0); // sw r0, 0(r1)
+        let sw_away = make_i(crate::mips_isa::OP_SW, 2, 0, 0); // sw r0, 0(r2)
+        // Seed both the virtual and the masked-physical alias: the fetch
+        // path translates (kseg0 -> low physical), so writing only the
+        // virtual address leaves the CPU fetching zeros. Same pattern the
+        // other multi-page tests in this file use.
+        let put = |va: u64, raw: u32| { mem.set_word(va, raw); mem.set_word(va & 0x1FFF_FFFF, raw); };
+        put(pc, sw_here);
+        put(pc + 4, sw_away);
+        exec.install_jit_hooks();
+
+        // First step establishes the tracked code page via the fetch
+        // translation, then commits the same-page store.
+        let before = SMC_HITS.load(Ordering::Relaxed);
+        exec.step_jit();
+        assert_ne!(exec.core.cur_code_pfn, u32::MAX,
+            "the fetch must establish a tracked code page for the check to mean anything");
+        let after_same = SMC_HITS.load(Ordering::Relaxed);
+        assert!(after_same > before,
+            "a store into the page being fetched from must trip the SMC check \
+             (counter did not move — instrumentation is not wired)");
+
+        exec.step_jit();
+        assert_eq!(SMC_HITS.load(Ordering::Relaxed), after_same,
+            "a store to an unrelated physical page must NOT trip the SMC check");
+    }
+
     #[test]
     fn self_loop_with_decrement_in_delay_slot_converges_natively() {
         // BGTZ r2,-1 / slot SUBU r2,r2,r3: a tight decrement loop whose
