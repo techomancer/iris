@@ -341,14 +341,13 @@ mod tests {
     /// calling this is that the instruction IS supposed to be compilable),
     /// not a silently-skipped comparison.
     ///
-    /// **Safety note on executor placement**: `install_jit_hooks` captures
-    /// `&mut exec` as `jit_ctx` and that pointer must never go stale (see
-    /// `MipsExecutor::install_jit_hooks`'s doc comment — the same discipline
-    /// as `interrupts_ptr`). `exec` is boxed here specifically so its address
-    /// is stable from the hook-install point onward: a bare stack local
-    /// would still be at a fixed address for this function's body, but
-    /// boxing makes that invariant explicit and immune to any future
-    /// refactor that might move `exec` around before calling `jit_fn`.
+    /// **Note on executor placement**: `exec` is boxed so its address is
+    /// stable across the `jit_fn` call. This is no longer load-bearing —
+    /// `install_jit_hooks` captures no pointer at all now, and the hooks
+    /// recover the executor from the `&mut exec.core` they are handed via
+    /// `container_of` (`mips_exec::exec_from_core`), which stays correct even
+    /// if `exec` moves. Kept because a stable address is still the clearer
+    /// thing to reason about while compiled code is running against it.
     fn run_jit(instr: u32, gpr: [u64; 32], pc: u64, word_offset: u16, mem_init: &[(u64, u32)]) -> Option<CoreSnapshot> {
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[word_offset as usize] = instr;
@@ -531,8 +530,8 @@ mod tests {
     fn run_multipage(code: &[(u64, u32)], data: &[(u64, u32)], gpr: [u64; 32], pc: u64, steps: usize, jit: bool) -> CoreSnapshot {
         let mem = if jit { MockMemory::new() } else { MockMemory::new_not_compilable() };
         let (exec, mem) = seeded_executor_over(mem, gpr, pc);
-        // Box so the executor's address is stable from install_jit_hooks onward
-        // (jit_ctx captures &mut exec — same discipline as run_jit).
+        // Box so the executor's address is stable across the jit_fn call
+        // (same as run_jit — no longer required, see its note).
         let mut exec = Box::new(exec);
         let store = |vaddr: u64, val: u32| {
             mem.set_word(vaddr, val);              // virtual
@@ -1015,8 +1014,21 @@ mod tests {
         // the delay-slot-check + handle_exception_fn call (~15-20
         // instructions) at every site. Sanity ceiling, not a tight bound —
         // exact bytes are host-ISA/Cranelift-version-dependent.
+        //
+        // Raised 40 -> 56 when JIT->Rust callouts stopped loading a separate
+        // `jit_ctx` and started passing their own `core_ptr` as arg 0. That
+        // removed a load per callout but made `core_ptr` live across every
+        // call, so regalloc now keeps it in a callee-saved register and each
+        // *cold* ADD trap block spends a few extra bytes re-materializing it
+        // for its jump-with-args. The measured shape is still a shared block,
+        // not an inlined copy — marginal bytes/instr stay flat as the chain
+        // grows (~218 at n=2, ~181 at n=64, i.e. converging, not climbing;
+        // an inlined copy would climb) — and the change is a net *shrink*
+        // where the callouts actually are: a 32-instruction LW chain went
+        // 8594 -> 7890 bytes. This ceiling guards the scaling property; it is
+        // not a byte-level budget.
         let exception_exit_overhead = per_instr_growth - addu_per_instr_growth;
-        assert!(exception_exit_overhead < 40.0,
+        assert!(exception_exit_overhead < 56.0,
             "overflow-check + exception-exit overhead per site ({exception_exit_overhead:.1} bytes) looks like a full inlined copy, not a shared-block jump");
     }
 

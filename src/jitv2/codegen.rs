@@ -2079,7 +2079,7 @@ fn emit_materialize_cpu_unusable(ctx: &mut EmitCtx) {
     emit_exception_exit(ctx, status);
 }
 
-/// Call `core.kill_entry_fn(jit_ctx, entry_offset)` — see
+/// Call `core.kill_entry_fn(core, entry_offset)` — see
 /// `MipsCore::kill_entry_fn`'s doc comment. Not a terminator; caller
 /// continues on (typically into `emit_interp_fallback_exit` right after).
 ///
@@ -2094,18 +2094,17 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(core_offset_of_kill_entry_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I32)); // entry_offset
     let sig_ref = ctx.builder.import_signature(sig);
 
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, entry_offset_val]);
+    let core_arg = callout_core_arg(ctx);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, entry_offset_val]);
 }
 
 /// Jump to the function's shared exit-to-interpreter block (`BlockSkeleton::
@@ -2162,18 +2161,17 @@ fn emit_interp_fallback_exit(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(core_offset_of_interp_fallback_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
 
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
     ctx.builder.ins().return_(&[status]);
 }
@@ -2235,16 +2233,15 @@ fn emit_interp_fallback_head(
     ctx.builder.ins().store(mem, own_pc, ctx.core_ptr, pc_off);
     let expected_next = ctx.builder.ins().iadd_imm_s(own_pc, 4);
 
-    // (2) call core.interp_fallback_fn(jit_ctx) -> ExecStatus.
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    // (2) call core.interp_fallback_fn(core) -> ExecStatus.
     let fn_off = ir::immediates::Offset32::new(core_offset_of_interp_fallback_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
     // (3) status != EXEC_COMPLETE -> return it directly.
@@ -2322,7 +2319,7 @@ mod dev_trace_origin {
     pub const JIT_ENTRY: u32 = 7;
 }
 
-/// `core.dev_trace_bp_fn(jit_ctx, pc, raw, origin)` with this instruction's
+/// `core.dev_trace_bp_fn(core, pc, raw, origin)` with this instruction's
 /// synthesized address, compile-time-known `raw`, and `origin` (one of
 /// `dev_trace_origin`'s constants, identifying which arrival class this call
 /// site is — plain body, entry-word back-edge, delay slot, fallback
@@ -2352,19 +2349,18 @@ fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
     let raw_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
     let origin_val = ctx.builder.ins().iconst(ir::types::I32, origin as i64);
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_dev_trace_bp_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty));         // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty));         // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // pc
     sig.params.push(AbiParam::new(ir::types::I32)); // raw
     sig.params.push(AbiParam::new(ir::types::I32)); // origin
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, pc_val, raw_val, origin_val]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, pc_val, raw_val, origin_val]);
     let status = ctx.builder.inst_results(call)[0];
 
     let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
@@ -2396,7 +2392,7 @@ fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
 /// lockstep only, materialize this instruction's starting `core.pc`/
 /// `in_delay_slot` (the JIT doesn't keep `core.pc` live for straight-line
 /// instructions, so lockstep does — see the module doc) and call
-/// `core.lockstep_step_fn(jit_ctx, pc, raw, bd)`, which runs the interpreter
+/// `core.lockstep_step_fn(core, pc, raw, bd)`, which runs the interpreter
 /// reference for this instruction and leaves the starting state restored for
 /// the JIT to run against. Emitted right after the interrupt preamble, before
 /// the instruction's own semantics. Not a terminator.
@@ -2433,17 +2429,16 @@ fn emit_lockstep_step(ctx: &mut EmitCtx, trust_live: bool) {
     // stays I8, it's real memory, not a call argument).
     let bd_val = ctx.builder.ins().iconst(ir::types::I32, bd_arg as i64);
     let raw_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_step_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty));         // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty));         // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // pc
     sig.params.push(AbiParam::new(ir::types::I32)); // raw
     sig.params.push(AbiParam::new(ir::types::I32)); // bd
     let sig_ref = ctx.builder.import_signature(sig);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, pc_val, raw_val, bd_val]);
+    let core_arg = callout_core_arg(ctx);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, pc_val, raw_val, bd_val]);
 }
 
 /// `jitv2_lockstep` compare bracket for an entry word / delay slot, called
@@ -2459,15 +2454,14 @@ fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
     let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
@@ -2490,7 +2484,7 @@ fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
 /// under lockstep only, materialize the JIT's final `core.pc = pc + 4` for a
 /// straight-line instruction that didn't write pc itself (so the pc compare is
 /// direct against the interpreter's advanced pc), then call
-/// `core.lockstep_compare_fn(jit_ctx)` which compares JIT vs the interpreter
+/// `core.lockstep_compare_fn(core)` which compares JIT vs the interpreter
 /// reference `lockstep_step` stashed and panics on divergence. Emitted after
 /// the instruction's own semantics, before the fallthrough edge. Only used for
 /// straight-line (Sequential/CP1) instructions here — branch/jump/regjump and
@@ -2540,15 +2534,14 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
     // On a divergence, bail to the monitor: EXEC_BREAKPOINT. core.pc/
@@ -2624,15 +2617,14 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
     #[cfg(feature = "jitv2_lockstep")]
     {
         let ptr_ty = module.target_config().pointer_type();
-        let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-        let jit_ctx = builder.ins().load(ptr_ty, mem, core_ptr, jit_ctx_off);
         let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
         let callee = builder.ins().load(ptr_ty, mem, core_ptr, fn_off);
         let mut sig = module.make_signature();
-        sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+        sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
         sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
         let sig_ref = builder.import_signature(sig);
-        let call = builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+        let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
+        let call = builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
         let cmp_status = builder.inst_results(call)[0];
 
         // Divergence: lockstep_compare (mips_exec.rs) already restored
@@ -2804,7 +2796,6 @@ fn core_offset_of_gpr(reg: u32) -> i32 {
 }
 
 #[cfg(feature = "jitv2")]
-fn core_offset_of_jit_ctx() -> i32 { std::mem::offset_of!(MipsCore, jit_ctx) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_read8_fn() -> i32 { std::mem::offset_of!(MipsCore, read8_fn) as i32 }
 #[cfg(feature = "jitv2")]
@@ -2888,7 +2879,7 @@ impl MemSize {
     }
 }
 
-/// Emit a call through `core.read{8,16,32,64}_fn(core.jit_ctx, vaddr)`
+/// Emit a call through `core.read{8,16,32,64}_fn(core_ptr, vaddr)`
 /// (§3.3 "memory access = the interpreter's own access routine"). Returns
 /// the loaded value as I64 (already zero-extended by the wrapper — see
 /// `MipsCore::read32_fn`'s doc comment) — callers needing sign extension
@@ -3286,27 +3277,51 @@ fn emit_mem_read_split(
     val
 }
 
+/// Offset compiled code adds to the core pointer when passing it as a
+/// callout's arg 0. Undone on the Rust side by `mips_exec::core_from_arg`,
+/// which is the *only* place that may do so — see its doc comment for why
+/// the bias exists and what happens without it.
+///
+/// Any value works (the magnitude is irrelevant — only that it is nonzero and
+/// survives the optimizer); 4 keeps the biased pointer inside `MipsCore`, so
+/// it never points outside its own allocation.
+pub const CALLOUT_CORE_BIAS: i64 = 4;
+
+/// Produce arg 0 for a JIT->Rust callout: `core_ptr + CALLOUT_CORE_BIAS`.
+///
+/// **Every callout must pass this, never `ctx.core_ptr` directly.** Passing
+/// the raw base pointer is what caused the regression this bias exists to
+/// fix; passing it now would also hand the Rust side an unbiased pointer that
+/// `core_from_arg` then over-subtracts, corrupting memory silently.
+///
+/// `mips_exec::core_from_arg` documents the full rationale and measurements.
+/// In short: arg 0 is `FixedReg(%rdi)`-constrained while the base pointer is
+/// live across the call, and one SSA value cannot satisfy both without
+/// regalloc2 hitting its 2-split cap and spilling at every use.
+fn callout_core_arg(ctx: &mut EmitCtx) -> Value {
+    ctx.builder.ins().iadd_imm_s(ctx.core_ptr, CALLOUT_CORE_BIAS)
+}
+
 fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(size.read_fn_offset());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
     sig.returns.push(AbiParam::new(ir::types::I64)); // value
     let sig_ref = ctx.builder.import_signature(sig);
 
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, vaddr]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr]);
     ctx.builder.inst_results(call)[0]
 }
 
-/// Emit a call through `core.write{8,16,32,64}_fn(core.jit_ctx, vaddr, value)`.
+/// Emit a call through `core.write{8,16,32,64}_fn(core_ptr, vaddr, value)`.
 /// `value` is always passed as I64, regardless of `size` — never narrowed to
 /// `size.ir_type()` here or by the caller. This is deliberate, not a
 /// simplification: the x86-64 SysV C ABI doesn't guarantee a sub-word
@@ -3463,25 +3478,24 @@ fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: M
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(size.write_fn_offset());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
     sig.params.push(AbiParam::new(ir::types::I64)); // value — always I64, see doc comment
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
 
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, vaddr, value]);
+    let core_arg = callout_core_arg(ctx);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, value]);
     // Return value intentionally unused here — emit_check_mem_exc reads
     // core.jit_mem_exc instead, so loads and stores share one check path.
 }
 
-/// Emit a call through `core.write64_masked_fn(core.jit_ctx, aligned_addr,
+/// Emit a call through `core.write64_masked_fn(core_ptr, aligned_addr,
 /// val, mask)` — the SWL/SWR/SDL/SDR counterpart to [`emit_mem_write`].
 /// `aligned_addr` must already be doubleword-aligned (callers compute this
 /// themselves, same contract as `MipsExecutor::write_data64_masked`); `val`
@@ -3492,21 +3506,20 @@ fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mas
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(core_offset_of_write64_masked_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // aligned_addr
     sig.params.push(AbiParam::new(ir::types::I64)); // val
     sig.params.push(AbiParam::new(ir::types::I64)); // mask
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
 
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, aligned_addr, val, mask]);
+    let core_arg = callout_core_arg(ctx);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, aligned_addr, val, mask]);
     // Return value intentionally unused — emit_check_mem_exc reads
     // core.jit_mem_exc instead, same convention as emit_mem_write.
 }
@@ -3617,7 +3630,7 @@ fn emit_check_mem_exc(ctx: &mut EmitCtx) {
     ctx.builder.seal_block(continue_block);
 }
 
-/// Call `core.fpu_set_mode_fn(core.jit_ctx, rm)` — mirrors
+/// Call `core.fpu_set_mode_fn(core_ptr, rm)` — mirrors
 /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on an
 /// FCSR (reg 31) write. `rm` is a runtime `Value` (the low 2 bits of the
 /// newly-written FCSR), not a compile-time constant.
@@ -3637,17 +3650,16 @@ fn emit_fpu_set_mode(ctx: &mut EmitCtx, rm: Value) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_set_mode_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
 
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I32)); // rm
     let sig_ref = ctx.builder.import_signature(sig);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, rm]);
+    let core_arg = callout_core_arg(ctx);
+    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, rm]);
 }
 
 /// MFC1 rt, fs: rt = sign_extend32(fpr_w[fs]). Mirrors `exec_mfc1`.
@@ -4302,7 +4314,7 @@ fn emit_fpu_arith_flags_sqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
 }
 
 
-/// Deliver `status` via `core.handle_exception_fn(core.jit_ctx, status)`
+/// Deliver `status` via `core.handle_exception_fn(core_ptr, status)`
 /// (§4.2 — the interpreter's own `handle_exception`, the only implementation
 /// of EPC/Cause/BD/vectoring) and return `EXEC_COMPLETE`. Terminates the
 /// current block; call as the block's terminator (like `emit_bail`). Not
@@ -4362,19 +4374,18 @@ fn emit_exception_call_block_body(
     let mem = MemFlagsData::trusted();
     let ptr_ty = module.target_config().pointer_type();
 
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = builder.ins().load(ptr_ty, mem, core_ptr, jit_ctx_off);
 
     let fn_off = ir::immediates::Offset32::new(core_offset_of_handle_exception_fn());
     let callee = builder.ins().load(ptr_ty, mem, core_ptr, fn_off);
 
     let mut sig = module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I32)); // status
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus (== status, unused)
     let sig_ref = builder.import_signature(sig);
 
-    builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, status]);
+    let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
+    builder.ins().call_indirect(sig_ref, callee, &[core_arg, status]);
     let ret_status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     builder.ins().return_(&[ret_status]);
 }
@@ -5536,15 +5547,14 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         ctx.builder.ins().store(mem, zero8, ctx.core_ptr, flag_off);
 
         let ptr_ty = ctx.module.target_config().pointer_type();
-        let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-        let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
         let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
         let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
         let mut sig = ctx.module.make_signature();
         sig.params.push(AbiParam::new(ptr_ty));
         sig.returns.push(AbiParam::new(ir::types::I32));
         let sig_ref = ctx.builder.import_signature(sig);
-        let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx]);
+        let core_arg = callout_core_arg(ctx);
+        let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
         let status = ctx.builder.inst_results(call)[0];
 
         let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
@@ -6398,22 +6408,23 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     let src_f64_val = ctx.builder.ins().iconst(i32t, src_f64 as i64);
     let dst_i64_val = ctx.builder.ins().iconst(i32t, dst_i64 as i64);
 
-    // arg 0 is the `MipsExecutor` pointer (`jit_cvt_to_int` casts it to
-    // `*mut MipsExecutor<T,C>` and takes `&mut exec.core`) — that is
-    // `core.jit_ctx`, NOT `ctx.core_ptr` (which is the bare `*mut MipsCore`
-    // the JitFn was called with). The two are only equal when `core` sits at
-    // offset 0 of `MipsExecutor`, which `repr(Rust)` does not guarantee; every
-    // other JIT->Rust callout loads `jit_ctx` for exactly this reason. Passing
-    // `core_ptr` here made the helper write the converted result into a FPR
-    // array at `self + 2*offsetof(core)` — the real `core.fpr` was left
-    // untouched, surfacing as a `jitv2_lockstep` divergence where the JIT's
-    // CVT/ROUND/TRUNC/CEIL/FLOOR result register simply never updated.
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    // arg 0 is `ctx.core_ptr`, the bare `*mut MipsCore` the JitFn was entered
+    // with — the same arg 0 every JIT->Rust callout passes. `jit_cvt_to_int`
+    // needs the surrounding `MipsExecutor<T,C>`, which it recovers itself via
+    // `mips_exec::exec_from_core` (`container_of`).
+    //
+    // This call used to pass a separately-stashed `core.jit_ctx` executor
+    // pointer instead, and getting the choice wrong here was a real bug: with
+    // two differently-typed pointers behind one `*mut c_void` parameter,
+    // passing `core_ptr` made the helper write the converted result into an
+    // FPR array at `self + 2*offsetof(core)` — it did not fault, the real
+    // `core.fpr` was simply left untouched, surfacing as a `jitv2_lockstep`
+    // divergence where the JIT's CVT/ROUND/TRUNC/CEIL/FLOOR result register
+    // never updated. One pointer for every callout removes that choice.
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_to_int_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx (the MipsExecutor pointer)
+    sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(i32t)); // fs_reg
     sig.params.push(AbiParam::new(i32t)); // fd_reg
     sig.params.push(AbiParam::new(i32t)); // fr1
@@ -6422,7 +6433,8 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     sig.params.push(AbiParam::new(i32t)); // rm
     sig.returns.push(AbiParam::new(i32t)); // trapped (nonzero) or not (0)
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
@@ -6446,10 +6458,8 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     let src_i64_val = ctx.builder.ins().iconst(i32t, src_i64 as i64);
     let dst_f64_val = ctx.builder.ins().iconst(i32t, dst_f64 as i64);
 
-    // arg 0 is the `MipsExecutor` pointer — `core.jit_ctx`, not `ctx.core_ptr`.
-    // See `emit_fcvt_to_int`'s matching comment for the full rationale.
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    // arg 0 is `ctx.core_ptr`; the helper recovers its executor via
+    // `exec_from_core`. See `emit_fcvt_to_int`'s matching comment.
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_int_to_float_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
@@ -6461,7 +6471,8 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     sig.params.push(AbiParam::new(i32t));
     sig.returns.push(AbiParam::new(i32t));
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
@@ -6502,10 +6513,8 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fd_val = ctx.builder.ins().iconst(i32t, fd as i64);
     let fr1_val = ctx.builder.ins().iconst(i32t, matches!(fr_mode, FrMode::Fr1) as i64);
 
-    // arg 0 is the `MipsExecutor` pointer — `core.jit_ctx`, not `ctx.core_ptr`.
-    // See `emit_fcvt_to_int`'s matching comment for the full rationale.
-    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
-    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
+    // arg 0 is `ctx.core_ptr`; the helper recovers its executor via
+    // `exec_from_core`. See `emit_fcvt_to_int`'s matching comment.
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_d_to_s_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
@@ -6515,7 +6524,8 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     sig.params.push(AbiParam::new(i32t));
     sig.returns.push(AbiParam::new(i32t));
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, fs_val, fd_val, fr1_val]);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }

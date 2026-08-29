@@ -1391,12 +1391,99 @@ fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, old
 // translate_fn wrappers above) so their addresses can be stored as bare
 // `unsafe extern "C" fn` pointers in MipsCore (`install_jit_hooks`). Every
 // read sets `core.jit_mem_exc`; compiled code must check it after the call
-// (see MipsCore's read*_fn field doc comments). `ctx` is always the
-// executor's own address, established by `install_jit_hooks` — same safety
-// argument as `mips_executor_status_cb` above.
+// (see MipsCore's read*_fn field doc comments).
+//
+// `ctx` is the `*mut MipsCore` the `JitFn` was itself entered with — the
+// *same* pointer for every hook, so compiled code passes its own arg 0
+// straight through with no load of its own (see `exec_from_core` below and
+// `codegen::emit_mem_read_callout` et al). Hooks needing the surrounding
+// executor recover it with `exec_from_core`, the Rust equivalent of Linux's
+// `container_of`.
+
+/// Turn a JIT callout's arg 0 into the real `*mut MipsCore`.
+///
+/// **Every JIT->Rust hook must funnel its `ctx` through this function (or
+/// through [`exec_from_core`], which calls it) before dereferencing it.**
+/// Compiled code does not pass a usable pointer: `codegen::callout_core_arg`
+/// adds [`CALLOUT_CORE_BIAS`] first, and this subtracts it back. Using `ctx`
+/// raw reads `MipsCore` at a `CALLOUT_CORE_BIAS`-byte offset — every field
+/// lands on the wrong bytes, silently, with no fault.
+///
+/// # Why compiled code biases the pointer at all
+///
+/// Arg 0 carries a `FixedReg(%rdi)` constraint at the call, while the same
+/// core pointer is also the region's base register (`0x50(%r14)`, …) and is
+/// live across that call. Handing regalloc one SSA value for both roles puts
+/// a single long live range under a fixed-register conflict at *every*
+/// callout, and regalloc2 splits a value only `MAX_SPLITS_PER_SPILLSET` (2)
+/// times before giving up and calling `split_into_minimal_bundles` — a spill
+/// plus a reload at every use. Measured on one corpus page: 2152 reloads into
+/// `%rdi`, +1500 `movq`, +4.5 KiB of code.
+///
+/// A biased pointer is a distinct value that is born at the call and dies
+/// there, so it never joins the base pointer's spillset and never reaches
+/// that cliff. Emitted arg 0 becomes a single `leaq 4(%r14), %rdi` with the
+/// base pointer staying resident. A `+0` copy does *not* work — the
+/// `opt_level=speed` optimizer folds it back into the same value (verified:
+/// byte-identical output).
+///
+/// See `rules/jitv2/callout-arg0-is-core-ptr.md` for the full measurements.
+///
+/// # Safety
+/// `ctx` must be arg 0 as produced by `codegen::callout_core_arg` — a real,
+/// live `MipsCore` address plus exactly `CALLOUT_CORE_BIAS`.
+#[cfg(feature = "jitv2")]
+#[inline(always)]
+pub unsafe fn core_from_arg(ctx: *mut core::ffi::c_void) -> *mut MipsCore {
+    debug_assert!(
+        ctx as usize > crate::jitv2::codegen::CALLOUT_CORE_BIAS as usize,
+        "JIT callout arg 0 must be a biased MipsCore pointer, not null/garbage \
+         (see mips_exec::core_from_arg)"
+    );
+    unsafe {
+        ctx.cast::<u8>()
+            .sub(crate::jitv2::codegen::CALLOUT_CORE_BIAS as usize)
+            .cast::<MipsCore>()
+    }
+}
+
+/// Recover the containing `MipsExecutor<T, C>` from a JIT callout's arg 0 —
+/// [`core_from_arg`] followed by `container_of(core, MipsExecutor<T,C>, core)`.
+///
+/// Every JIT->Rust hook takes the same arg 0 — the `*mut MipsCore` compiled
+/// code was entered with, biased — rather than a separately-stashed executor
+/// pointer: one calling convention for all of them, one fewer load per
+/// callout in emitted code, and no way left to pass the wrong one of two
+/// type-erased pointers (a mistake that was silent — it corrupted memory at
+/// `self + 2*offsetof(core)` rather than faulting; see the history in
+/// `codegen::emit_fpu_cvt_to_int_call`).
+///
+/// `offset_of!` asks the compiler for the layout it actually chose, so this
+/// stays correct under `repr(Rust)` field reordering — it is not assuming
+/// `core` sits at offset 0 (it does today, so that part compiles to nothing).
+///
+/// # Safety
+/// `ctx` must satisfy [`core_from_arg`]'s contract, and the `MipsCore` it
+/// names must be the `core` field of a live, exclusively-owned
+/// `MipsExecutor<T, C>` — i.e. must have come from a `jit_fn(&mut exec.core)`
+/// dispatch whose hooks were installed by that same executor's
+/// `install_jit_hooks`. Deriving the container this way (rather than reading
+/// an address captured at install time) is what makes a *moved* executor
+/// merely correct instead of a use-after-free.
+#[cfg(feature = "jitv2")]
+#[inline(always)]
+unsafe fn exec_from_core<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> *mut MipsExecutor<T, C> {
+    unsafe {
+        core_from_arg(ctx)
+            .cast::<u8>()
+            .sub(std::mem::offset_of!(MipsExecutor<T, C>, core))
+            .cast::<MipsExecutor<T, C>>()
+    }
+}
+
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<1>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
@@ -1407,7 +1494,7 @@ unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void,
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<2>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
@@ -1418,7 +1505,7 @@ unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<4>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
@@ -1429,7 +1516,7 @@ unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<8>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
@@ -1440,7 +1527,7 @@ unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     let val = val as u8; // mask to the real width ourselves — see write8_fn's doc comment on why the FFI parameter is u64
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<1>(va, val as u64); }
@@ -1449,7 +1536,7 @@ unsafe extern "C" fn jit_write8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     let val = val as u16; // mask to the real width ourselves — see write16_fn's doc comment
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<2>(va, val as u64); }
@@ -1458,7 +1545,7 @@ unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     let val = val as u32; // mask to the real width ourselves — see write32_fn's doc comment
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<4>(va, val as u64); }
@@ -1467,7 +1554,7 @@ unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<8>(va, val); }
     #[cfg(not(feature = "jitv2_lockstep"))]
@@ -1486,7 +1573,7 @@ unsafe extern "C" fn jit_write64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
 /// `write_data64_masked` regardless of that feature.
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write64_masked<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64, mask: u64) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     let status = exec.write_data64_masked(va, val, mask);
     exec.core.jit_mem_exc = status;
     status
@@ -1496,7 +1583,7 @@ unsafe extern "C" fn jit_write64_masked<T: Tlb, C: CpuModel>(ctx: *mut core::ffi
 /// computed, for both engines.
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_handle_exception<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, status: u32) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     // handle_exception reads self.core.in_delay_slot — a single MipsCore
     // field shared by both engines (no separate JIT-only copy or sync step
     // needed): the interpreter's branch_delay/handle_exec_complete set it on
@@ -1517,7 +1604,7 @@ unsafe extern "C" fn jit_handle_exception<T: Tlb, C: CpuModel>(ctx: *mut core::f
 /// retirement, since both return `EXEC_COMPLETE`).
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_interp_fallback<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     exec.interp_dispatch_one()
 }
 
@@ -1533,7 +1620,7 @@ unsafe extern "C" fn jit_interp_fallback<T: Tlb, C: CpuModel>(ctx: *mut core::ff
 /// nanotlb miss, which a same-page guard check can't trigger.
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_kill_entry<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, offset: u32) {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     assert!(!exec.pcp.is_null(), "jit_kill_entry reached with no tracked PhysicalCodePage");
     let page = unsafe { &*exec.pcp };
     page.kill(offset as usize);
@@ -1566,7 +1653,7 @@ pub static DEV_TRACE_BP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 #[cfg(all(feature = "jitv2", feature = "developer"))]
 unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, origin: u32) -> u32 {
     DEV_TRACE_BP_CALLS.fetch_add(1, Ordering::Relaxed);
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(not(feature = "lightning"))]
     {
         exec.traceback.push(pc, raw, InstrOrigin::from_u32(origin));
@@ -1611,7 +1698,7 @@ unsafe extern "C" fn jit_cvt_to_int<T: Tlb, C: CpuModel>(
     dst_i64: u32,
     rm: u32,
 ) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     cvt_to_int_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, src_f64 != 0, dst_i64 != 0, rm as u8) as u32
 }
 
@@ -1626,7 +1713,7 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
     src_i64: u32,
     dst_f64: u32,
 ) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     cvt_int_to_float_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0, src_i64 != 0, dst_f64 != 0) as u32
 }
 
@@ -1634,7 +1721,7 @@ unsafe extern "C" fn jit_cvt_int_to_float<T: Tlb, C: CpuModel>(
 /// comment. Same `ctx`-is-`MipsExecutor<T,C>` shape as `jit_cvt_to_int`.
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, fs_reg: u32, fd_reg: u32, fr1: u32) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     cvt_d_to_s_and_commit(&mut exec.core, fs_reg, fd_reg, fr1 != 0) as u32
 }
 
@@ -1647,7 +1734,7 @@ unsafe extern "C" fn jit_cvt_d_to_s<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_
 /// `LockstepClass` that can't be compared per-dispatch (Branch/Other).
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_lockstep_step<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, bd: u32) {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     exec.lockstep_step(pc, raw, bd);
 }
 
@@ -1660,7 +1747,7 @@ unsafe extern "C" fn jit_lockstep_step<T: Tlb, C: CpuModel>(ctx: *mut core::ffi:
 /// (disabled class / non-retiring reference).
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_lockstep_compare<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> u32 {
-    let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     if exec.lockstep_compare() { EXEC_BREAKPOINT } else { EXEC_COMPLETE }
 }
 
@@ -2554,14 +2641,18 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
 
     /// Install JIT v2's memory-access and exception-delivery hooks
     /// (`MipsCore`'s `read*_fn`/`write*_fn`/`handle_exception_fn` fields —
-    /// see their doc comments). Same discipline as `interrupts_ptr`: call
-    /// this once the executor is at its final, stable address (inside its
-    /// owning `Arc<Mutex<...>>`), never before — `ctx` is `self`'s address,
-    /// which must not move again afterward for the life of the process.
+    /// see their doc comments).
+    ///
+    /// Installs only function pointers, no context pointer: every hook takes
+    /// the `*mut MipsCore` compiled code was entered with and recovers the
+    /// executor from it via `exec_from_core`. So, unlike `interrupts_ptr`,
+    /// this does *not* require the executor to be at a final, stable address
+    /// — nothing here captures `self`'s address, and an executor that moves
+    /// after installation stays correct rather than dangling. (Callers that
+    /// box the executor before installing, e.g. `equiv_test`'s `run_jit`,
+    /// are now belt-and-braces rather than load-bearing.)
     #[cfg(feature = "jitv2")]
     pub fn install_jit_hooks(&mut self) {
-        let ctx = self as *mut Self as *mut core::ffi::c_void;
-        self.core.jit_ctx = ctx;
         self.install_jit_mem_ptrs();
         self.core.read8_fn = jit_read8::<T, C>;
         self.core.read16_fn = jit_read16::<T, C>;

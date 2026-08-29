@@ -342,13 +342,17 @@ pub struct MipsCore {
     /// per-instantiation Cranelift codegen needed since the *pointer value*
     /// (not the compiled code) carries the monomorphization.
     ///
-    /// `jit_ctx` is the shared first argument to every fn below — a
-    /// type-erased `*mut MipsExecutor<T,C>`, exactly like
-    /// `status_changed_cb`'s context pointer (never derived from `&MipsCore`
-    /// itself, since `MipsCore` is not guaranteed to be `MipsExecutor`'s
-    /// first field in memory — see `install_jit_hooks`'s doc comment).
-    #[cfg(feature = "jitv2")]
-    pub jit_ctx: *mut core::ffi::c_void,
+    /// The shared first argument to every fn below is the `*mut MipsCore`
+    /// compiled code was itself entered with (`JitFn`'s own arg 0) — one
+    /// calling convention for all JIT->Rust callouts, so emitted code passes
+    /// its arg 0 straight through with no load. Hooks needing the containing
+    /// `MipsExecutor<T,C>` recover it with `mips_exec::exec_from_core`
+    /// (`container_of`, via `offset_of!` — correct whatever layout
+    /// `repr(Rust)` picks for `MipsExecutor::core`). This replaced a
+    /// separately-stashed `jit_ctx` executor pointer: with two differently-
+    /// typed pointers behind one `*mut c_void` parameter, passing the wrong
+    /// one was silent (it wrote to `self + 2*offsetof(core)` rather than
+    /// faulting) — see `codegen::emit_fpu_cvt_to_int_call`'s history.
     /// Read wrappers: return the loaded value (zero-extended to u64 for
     /// sub-64-bit widths, matching `MipsExecutor::read_data`'s own
     /// convention), and set `jit_mem_exc` to `EXEC_COMPLETE` (0) on success
@@ -397,7 +401,7 @@ pub struct MipsCore {
     pub write64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u64) -> u32,
     /// Masked doubleword write for the unaligned store family (SWL/SWR/
     /// SDL/SDR — `MipsExecutor::write_data64_masked`'s JIT-callable
-    /// equivalent): `(jit_ctx, virt_addr, val, mask)`, writes only the byte
+    /// equivalent): `(core, virt_addr, val, mask)`, writes only the byte
     /// lanes set in `mask` at the (already doubleword-aligned) `virt_addr`,
     /// leaving the rest of that doubleword untouched. Unlike
     /// `write8_fn`/`write16_fn`/`write32_fn` (which each address a plain,
@@ -494,7 +498,7 @@ pub struct MipsCore {
     /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
     /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
     /// bits [1:0]). Same host-arch-free-function shape as the status hooks
-    /// above — `jit_ctx` unused.
+    /// above — the `core` argument is unused.
     #[cfg(feature = "jitv2")]
     pub fpu_set_mode_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32),
     /// Portable (no host FPU status read) CVT.W/L.S/D: reads `fs_reg`,
@@ -1043,8 +1047,6 @@ impl MipsCore {
             // ever actually called: that would mean compiled code ran before
             // hooks were installed, which must not happen for any executor
             // that has jitv2 compiled units live.
-            #[cfg(feature = "jitv2")]
-            jit_ctx: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             jit_dc_tags: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]

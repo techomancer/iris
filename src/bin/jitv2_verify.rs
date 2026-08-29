@@ -61,15 +61,57 @@ unsafe extern "C" fn verify_fpu_set_mode(_ctx: *mut core::ffi::c_void, rm: u32) 
     iris::platform::set_fpu_mode(rm as u8)
 }
 
+/// Stand-in for `MipsExecutor` in this tool, which has no real executor:
+/// a struct whose *first field is `core`*, so it has the same shape every
+/// JIT->Rust hook now assumes — arg 0 is the `*mut MipsCore` compiled code
+/// was entered with, and a hook needing its container recovers it with
+/// `container_of` (`mips_exec::exec_from_core` in the real emulator,
+/// `VerifyCtx::from_core` here).
+///
+/// Today no hook this tool installs actually needs the container
+/// (`verify_handle_exception` wants only the `MipsCore` it was handed, and
+/// `verify_fpu_set_mode` ignores its argument entirely), so this exists to
+/// keep the *shape* honest rather than to carry state: a `MipsCore` reached
+/// through compiled code is always the `core` field of some containing
+/// context, and this tool is no longer the one exception to that rule. Give
+/// it real fields if a future hook here needs them.
+///
+/// `repr(C)` is not required — `from_core` asks the compiler for the layout
+/// it chose via `offset_of!`, exactly like `exec_from_core` — but the whole
+/// point is that `core` is field 0, so state it plainly.
+struct VerifyCtx {
+    core: MipsCore,
+}
+
+impl VerifyCtx {
+    fn new(core: MipsCore) -> Self {
+        Self { core }
+    }
+
+    /// `container_of(core, VerifyCtx, core)` — the local twin of
+    /// `mips_exec::exec_from_core`.
+    ///
+    /// # Safety
+    /// `core` must point at the `core` field of a live `VerifyCtx`.
+    #[allow(dead_code)] // no hook needs the container yet; see the struct doc
+    unsafe fn from_core(core: *mut core::ffi::c_void) -> *mut VerifyCtx {
+        unsafe {
+            core.cast::<u8>()
+                .sub(std::mem::offset_of!(VerifyCtx, core))
+                .cast::<VerifyCtx>()
+        }
+    }
+}
+
 /// Deliver the exception's architectural effect via
 /// `iris::mips_core::deliver_exception` — the same logic
 /// `MipsExecutor::handle_exception` uses, extracted so it's callable without
 /// a real executor (§4.2 single-implementation delivery: one implementation,
-/// both the interpreter and this tool call it). `ctx` here is `core`'s own
-/// address (set by the caller right before the JIT call, mirroring
-/// `mips_exec.rs`'s `jit_handle_exception<T,C>` reinterpreting the same
-/// field as `*mut MipsExecutor<T, C>` when a real executor exists) — safe to
-/// reinterpret back to `*mut MipsCore` because that's exactly what it is.
+/// both the interpreter and this tool call it). `ctx` is the `*mut MipsCore`
+/// the JitFn was entered with — the uniform arg 0 of every JIT->Rust hook
+/// (`mips_exec.rs`'s `jit_handle_exception<T,C>` receives the identical
+/// pointer and recovers its executor from it with `exec_from_core`; this
+/// one needs nothing but the core itself, so it just casts).
 ///
 /// `deliver_exception` reads `core.in_delay_slot` directly (one field, no
 /// separate JIT-only copy) — `seed_core` sets it from `CoreState::in_delay_slot`,
@@ -77,7 +119,9 @@ unsafe extern "C" fn verify_fpu_set_mode(_ctx: *mut core::ffi::c_void, rm: u32) 
 /// `MipsCore::in_delay_slot` at the same point every other field is
 /// snapshotted, so this is the real recorded value, not a default guess.
 unsafe extern "C" fn verify_handle_exception(ctx: *mut core::ffi::c_void, status: u32) -> u32 {
-    let core = unsafe { &mut *(ctx as *mut MipsCore) };
+    // Arg 0 is biased by compiled code; `core_from_arg` is the one place that
+    // contract is undone. Never dereference a callout's `ctx` without it.
+    let core = unsafe { &mut *iris::mips_exec::core_from_arg(ctx) };
     iris::mips_core::deliver_exception(core, status);
     status
 }
@@ -120,10 +164,10 @@ fn seed_core(state: &CoreState) -> MipsCore {
     core.fpu_fexr = state.fpu_fexr;
     core.fpu_fenr = state.fpu_fenr;
     core.in_delay_slot = state.in_delay_slot;
-    // jit_ctx is set by the caller once core has its final, stable address
-    // (needed by verify_handle_exception, which reinterprets it back to
-    // *mut MipsCore) — the FPU hook below ignores ctx entirely, so leaving
-    // it briefly unset here (until the caller assigns it) is harmless.
+    // No context pointer to install: both hooks below take the `*mut MipsCore`
+    // compiled code is entered with as arg 0, like every other JIT->Rust hook
+    // (see `VerifyCtx`). Nothing here captures an address, so `core` is free
+    // to be moved into its `VerifyCtx` after this returns.
     core.fpu_set_mode_fn = verify_fpu_set_mode;
     core.handle_exception_fn = verify_handle_exception;
     core
@@ -381,15 +425,12 @@ fn run(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbose: boo
             continue;
         };
 
-        let mut core = seed_core(&rec.state);
-        // jit_ctx must be core's own address so verify_handle_exception can
-        // reinterpret it back to *mut MipsCore (mirrors mips_exec.rs's
-        // jit_handle_exception<T,C>, which reinterprets the same field as
-        // *mut MipsExecutor<T,C> — here there's no executor, just the core
-        // itself). Set right before the call since this is core's final,
-        // stable address for the duration of the call.
-        core.jit_ctx = &mut core as *mut MipsCore as *mut core::ffi::c_void;
-        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
+        // Run the compiled function against `core` in its container, so the
+        // pointer it gets is a real `VerifyCtx::core` — the same shape
+        // `exec_from_core` assumes of `MipsExecutor::core` in the emulator.
+        let mut ctx = VerifyCtx::new(seed_core(&rec.state));
+        let status = unsafe { jit_fn(&mut ctx.core as *mut MipsCore) };
+        let core = &mut ctx.core;
 
         if core.pc != expected_post.pc {
             stats.skipped_control_flow_diverged += 1;
@@ -707,9 +748,11 @@ fn run_chain(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbos
         };
         let expected_post = expected_rec.state;
 
-        let mut core = seed_core(&heads[0].0.state);
-        core.jit_ctx = &mut core as *mut MipsCore as *mut core::ffi::c_void;
-        let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
+        // Same as the single-instruction path above: run against the core
+        // inside its `VerifyCtx` container.
+        let mut ctx = VerifyCtx::new(seed_core(&heads[0].0.state));
+        let status = unsafe { jit_fn(&mut ctx.core as *mut MipsCore) };
+        let core = &mut ctx.core;
 
         *stats.chain_len_histogram.entry(heads.len()).or_insert(0) += 1;
 
