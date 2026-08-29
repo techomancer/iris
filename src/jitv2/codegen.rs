@@ -6398,10 +6398,22 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     let src_f64_val = ctx.builder.ins().iconst(i32t, src_f64 as i64);
     let dst_i64_val = ctx.builder.ins().iconst(i32t, dst_i64 as i64);
 
+    // arg 0 is the `MipsExecutor` pointer (`jit_cvt_to_int` casts it to
+    // `*mut MipsExecutor<T,C>` and takes `&mut exec.core`) — that is
+    // `core.jit_ctx`, NOT `ctx.core_ptr` (which is the bare `*mut MipsCore`
+    // the JitFn was called with). The two are only equal when `core` sits at
+    // offset 0 of `MipsExecutor`, which `repr(Rust)` does not guarantee; every
+    // other JIT->Rust callout loads `jit_ctx` for exactly this reason. Passing
+    // `core_ptr` here made the helper write the converted result into a FPR
+    // array at `self + 2*offsetof(core)` — the real `core.fpr` was left
+    // untouched, surfacing as a `jitv2_lockstep` divergence where the JIT's
+    // CVT/ROUND/TRUNC/CEIL/FLOOR result register simply never updated.
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_to_int_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
-    sig.params.push(AbiParam::new(ptr_ty)); // ctx (the MipsExecutor pointer)
+    sig.params.push(AbiParam::new(ptr_ty)); // jit_ctx (the MipsExecutor pointer)
     sig.params.push(AbiParam::new(i32t)); // fs_reg
     sig.params.push(AbiParam::new(i32t)); // fd_reg
     sig.params.push(AbiParam::new(i32t)); // fr1
@@ -6410,7 +6422,7 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     sig.params.push(AbiParam::new(i32t)); // rm
     sig.returns.push(AbiParam::new(i32t)); // trapped (nonzero) or not (0)
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[ctx.core_ptr, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
@@ -6434,6 +6446,10 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     let src_i64_val = ctx.builder.ins().iconst(i32t, src_i64 as i64);
     let dst_f64_val = ctx.builder.ins().iconst(i32t, dst_f64 as i64);
 
+    // arg 0 is the `MipsExecutor` pointer — `core.jit_ctx`, not `ctx.core_ptr`.
+    // See `emit_fcvt_to_int`'s matching comment for the full rationale.
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_int_to_float_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
@@ -6445,15 +6461,22 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     sig.params.push(AbiParam::new(i32t));
     sig.returns.push(AbiParam::new(i32t));
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[ctx.core_ptr, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
 
 /// CVT.D.S: widening float<->float, always exact per the R4000/VR5000
-/// manuals (Table 7-2/9-1 list no exception CVT.D.S can raise) — no FCSR
-/// interaction and so no host-status-read race to avoid; safe to keep as a
-/// plain Cranelift `fpromote`.
+/// manuals (Table 7-2/9-1 list no exception CVT.D.S can raise) — the
+/// conversion itself is a plain Cranelift `fpromote` with no host-status
+/// read to race. It is still a floating-point *computational* instruction,
+/// though, so it rewrites (clears) the FCSR Cause field like every other one
+/// — "Cause holds only the last instruction's exceptions ... rewritten every
+/// FP instruction, even when this instruction raised nothing"
+/// (`fpu_update_fcsr_full`). The interpreter's `exec_fcvt_d_s` does exactly
+/// this via `fpu_update_fcsr(0, …)`; skipping it here let a stale Cause.I
+/// from a preceding inexact CVT survive a CVT.D.S, surfacing as a
+/// `jitv2_lockstep` `fcsr` divergence (`jit=0x1004 interp=0x0004`).
 fn emit_fcvt_d_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
@@ -6461,7 +6484,8 @@ fn emit_fcvt_d_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let val = ctx.builder.ins().bitcast(ir::types::F32, MemFlagsData::new(), bits);
     let result = ctx.builder.ins().fpromote(ir::types::F64, val);
     let result_bits = ctx.builder.ins().bitcast(ir::types::I64, MemFlagsData::new(), result);
-    emit_write_fpr_l(ctx, fd, result_bits, fr_mode);
+    let no_flags = ctx.builder.ins().iconst(ir::types::I32, 0);
+    emit_fpu_update_fcsr(ctx, no_flags, |ctx| emit_write_fpr_l(ctx, fd, result_bits, fr_mode));
 }
 /// CVT.S.D: single `call_indirect` into `core.fpu_cvt_d_to_s_fn`
 /// (`mips_exec.rs::jit_cvt_d_to_s`, calling `cvt_d_to_s_and_commit`) — same
@@ -6478,6 +6502,10 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fd_val = ctx.builder.ins().iconst(i32t, fd as i64);
     let fr1_val = ctx.builder.ins().iconst(i32t, matches!(fr_mode, FrMode::Fr1) as i64);
 
+    // arg 0 is the `MipsExecutor` pointer — `core.jit_ctx`, not `ctx.core_ptr`.
+    // See `emit_fcvt_to_int`'s matching comment for the full rationale.
+    let jit_ctx_off = ir::immediates::Offset32::new(core_offset_of_jit_ctx());
+    let jit_ctx = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, jit_ctx_off);
     let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_d_to_s_fn());
     let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
     let mut sig = ctx.module.make_signature();
@@ -6487,7 +6515,7 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     sig.params.push(AbiParam::new(i32t));
     sig.returns.push(AbiParam::new(i32t));
     let sig_ref = ctx.builder.import_signature(sig);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[ctx.core_ptr, fs_val, fd_val, fr1_val]);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[jit_ctx, fs_val, fd_val, fr1_val]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }

@@ -275,6 +275,10 @@ pub struct PublishInfo {
     pub gen_snap: u64,
     pub instr_count: usize,
     pub code_size: u32,
+    /// Dev diagnostic only (`JitEntry::compiled_for_fr1`, `j2 pcp`): the
+    /// `STATUS_FR` value this region was compiled against. Carried through the
+    /// seal queue so the eventual `page.publish` can stamp it on the entry.
+    pub compiled_for_fr1: bool,
     /// `None` only for a `finalize()` call reached without going through
     /// `Codegen` (a test driving the `JITMemoryProvider` trait directly,
     /// with no publish info to give — see this call site's own comment).
@@ -299,6 +303,7 @@ impl PublishInfo {
             gen_snap: 0,
             instr_count: 0,
             code_size: 0,
+            compiled_for_fr1: false,
             jit_fn: None,
         }
     }

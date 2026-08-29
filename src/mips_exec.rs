@@ -1205,6 +1205,17 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub(crate) ls_delay_target_before: u64,
     #[cfg(feature = "jitv2_lockstep")]
     pub(crate) ls_delay_target_expected: u64,
+    /// Rolling history of the last `LS_HISTORY_CAP` inline-lockstep-bracketed
+    /// instructions: for each, its address/raw word and the machine state
+    /// *entering* it (i.e. the final state of the previous step). Populated by
+    /// `lockstep_step` before the interpreter reference runs, so it survives a
+    /// divergence bail into the monitor — where `j2 lstate` prints it. The
+    /// last entry's `before` is the state right before the diverging
+    /// instruction (`lockstep_compare` only keeps `ls_before`'s pc/slot
+    /// fields, not the full register file, so without this the "what went in"
+    /// context is lost the moment the report prints).
+    #[cfg(feature = "jitv2_lockstep")]
+    pub(crate) ls_history: std::collections::VecDeque<LockstepHistEntry>,
     /// Runtime switch (not a Cargo feature) for how `exec_decoded`'s real
     /// jitv2 dispatch gate gets a fresh artifact on a miss: `false` hands a
     /// `CompileRequest` to the async `compile_queue` worker thread; `true`
@@ -2353,6 +2364,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             ls_delay_target_before: 0,
             #[cfg(feature = "jitv2_lockstep")]
             ls_delay_target_expected: 0,
+            #[cfg(feature = "jitv2_lockstep")]
+            ls_history: std::collections::VecDeque::with_capacity(LS_HISTORY_CAP),
             // Threaded compile is now the default — see Machine::new's
             // compile_queue.start() call, which must run whenever this is
             // `false` (an un-started queue would silently drop every
@@ -7696,16 +7709,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // straight-line head the JIT doesn't keep core.pc live, so codegen's
         // emit_lockstep_step materialized pc/in_delay_slot from compile-time
         // constants and passes them here — set them so the interpreter
-        // reference run is anchored. For an entry word or delay slot
-        // (`bd == LOCKSTEP_BD_LIVE`), core.pc/in_delay_slot/delay_slot_target
-        // are already correct from the arrival (the interpreter dispatch or the
-        // BC1 fallback that reached this word) and MUST NOT be overwritten — a
-        // compile-time bd would clobber an inherited in_delay_slot=true and make
-        // the interpreter reference mishandle the pending transfer. Trust the
-        // live values in that case (`pc` is still the instruction's own address,
-        // which already equals live core.pc, so we can set it either way).
+        // reference run is anchored.
+        //
+        // `pc` is ALWAYS this instruction's own address (`emit_word_addr(word)`),
+        // authoritative regardless of how the word was reached — set it
+        // unconditionally. An earlier version trusted live `core.pc` for the
+        // `bd == LOCKSTEP_BD_LIVE` case on the assumption it "already equals the
+        // instruction's own address": true when the word was reached by
+        // interpreter dispatch or a BC1 fallback, but NOT when a JIT branch/jump
+        // took its *in-region* edge into this word's block — `emit_target_edge`
+        // jumps straight to the block without writing `core.pc`, so it is left
+        // stale at whatever the last materialization set (e.g. the branch's own
+        // address, via `emit_slot_semantics`' `saved_pc` restore). That stale pc
+        // then anchored the interpreter reference one word early, a spurious
+        // `pc` divergence at every `is_branch_fallback_successor` word that is
+        // also a JIT branch target.
+        //
+        // `in_delay_slot`/`delay_slot_target`, on the other hand, MUST stay
+        // trusted-live for `LOCKSTEP_BD_LIVE`: a fallback-successor can arrive
+        // mid-delay-slot (BC1 fallback armed a pending transfer), and a
+        // compile-time `bd` would clobber that inherited `in_delay_slot=true`.
+        self.core.pc = pc;
         if bd != LOCKSTEP_BD_LIVE {
-            self.core.pc = pc;
             self.core.in_delay_slot = bd != 0;
         }
         // Start each instruction with no captured memory access: a
@@ -7717,6 +7742,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         let before = LockstepSnapshot::capture(&self.core);
         let delay_target_before = self.core.delay_slot_target;
+
+        // Record this step's entry state for `j2 lstate`. Done here (before the
+        // interpreter reference runs) so it lands whether or not the step
+        // cleanly retires or diverges — the last entry is then always the
+        // state that fed the instruction the monitor breaks on.
+        if self.ls_history.len() == LS_HISTORY_CAP {
+            self.ls_history.pop_front();
+        }
+        self.ls_history.push_back(LockstepHistEntry { pc, raw, bd, before });
 
         // Run this exact instruction once through the real interpreter, using
         // the `raw` the JIT was compiled from — decode it into the scratch slot
@@ -7994,6 +8028,25 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 }
 
+/// How many recent lockstep steps `MipsExecutor::ls_history` retains for
+/// `j2 lstate`. Small — this is a "what led up to the divergence" window, not
+/// a full trace; each entry is ~640 bytes (two register files).
+#[cfg(feature = "jitv2_lockstep")]
+pub(crate) const LS_HISTORY_CAP: usize = 32;
+
+/// One entry in `MipsExecutor::ls_history`: a lockstep-bracketed instruction
+/// and the machine state that entered it (the previous step's final state).
+#[cfg(feature = "jitv2_lockstep")]
+#[derive(Clone, Copy)]
+pub(crate) struct LockstepHistEntry {
+    pub(crate) pc: u64,
+    pub(crate) raw: u32,
+    /// `bd` as passed to `lockstep_step` (0/1, or `LOCKSTEP_BD_LIVE` for an
+    /// entry word / delay slot whose slot state was inherited, not materialized).
+    pub(crate) bd: u32,
+    pub(crate) before: LockstepSnapshot,
+}
+
 /// Everything an inline-lockstep-compared instruction can read or write,
 /// captured before the interpreter reference run (`lockstep_step`'s `before`,
 /// restored so the JIT runs from the same inputs), as the interpreter result
@@ -8058,6 +8111,20 @@ impl LockstepSnapshot {
         exec.core.fpu_fenr = self.fenr;
         exec.core.in_delay_slot = self.in_delay_slot;
         exec.core.delay_slot_target = delay_slot_target;
+        // Direct `fpu_fcsr` write bypasses `write_fpu_control` / CTC1, the
+        // only path that normally reprograms the host FPU rounding-control
+        // field to match FCSR.RM (mirrors the snapshot-restore and
+        // thread-spawn `set_fpu_mode` calls elsewhere in this file). Without
+        // this, an interpreter reference run that reprogrammed the host mode
+        // (a CTC1 in the bracketed stream) leaves it ahead of the restored
+        // FCSR.RM, and the JIT's re-run — whose `add.d`/`sub.d`/`mul.d` lower
+        // to plain host FP ops that read the live rounding mode, no per-op
+        // resync — then rounds under the wrong mode. The `(x + 2^52) - 2^52`
+        // round-to-integer idiom (software %/÷ by constants) is acutely
+        // sensitive to this: one ULP of rounding difference flips the integer.
+        // The FR-pointer analogue of this is documented in
+        // `rules/jitv2/codegen-gotchas.md`.
+        crate::platform::set_fpu_mode((self.fcsr & 0x3) as u8);
     }
 
     /// `compare_fpr`/`compare_delay_slot`: kept as explicit flags rather than
@@ -9863,7 +9930,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -10392,19 +10459,66 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             }
             "cop1" => {
                 let exec = self.try_lock_executor()?;
+                let status = exec.core.cp0_status;
+                let fr1 = (status & crate::mips_core::STATUS_FR) != 0;
+                let cu1 = (status & crate::mips_core::STATUS_CU1) != 0;
                 writeln!(writer, "COP1 Registers (FPU):").unwrap();
+                // The FR bit decides register-file interpretation: FR=1 is 32
+                // independent 64-bit registers; FR=0 packs even/odd pairs into
+                // one 64-bit slot (odd = upper 32 bits of the even slot), and
+                // double/long ops must use the even register. `f{NN}` below is
+                // always the raw physical slot; the "FR=0 view" line spells out
+                // what the guest actually sees for a paired slot.
+                writeln!(writer, "  cp0_status={:#010x}  CU1={}  FR={}  ({}-bit FPU register mode)",
+                    status, cu1 as u8, fr1 as u8, if fr1 { 64 } else { 32 }).unwrap();
+                if !cu1 {
+                    writeln!(writer, "  NOTE: CU1 clear — any FP instruction here raises Coprocessor Unusable").unwrap();
+                }
                 for i in 0..32 {
                     let val = exec.core.fpr[i];
                     let f32_val = f32::from_bits(val as u32);
                     let f64_val = f64::from_bits(val);
-                    writeln!(writer, "  f{:02}: {:#018x}  (f32: {:e}, f64: {:e})", i, val, f32_val, f64_val).unwrap();
+                    if fr1 {
+                        writeln!(writer, "  f{:02}: {:#018x}  (s: {:e}  d: {:e})", i, val, f32_val, f64_val).unwrap();
+                    } else if i % 2 == 0 {
+                        // FR=0: even slot holds FPR(i) in low32, FPR(i+1) in high32; full 64 bits are FPR(i) as d/l.
+                        let lo = f32::from_bits(val as u32);
+                        let hi = f32::from_bits((val >> 32) as u32);
+                        writeln!(writer, "  f{:02}/f{:02}: {:#018x}  (f{:02} s: {:e}  f{:02} s: {:e}  f{:02} d: {:e})",
+                            i, i + 1, val, i, lo, i + 1, hi, i, f64_val).unwrap();
+                    }
                 }
+                // FCSR decode. Layout (R4000/MIPS III): [1:0] RM, [6:2] sticky
+                // Flags, [11:7] Enables, [17:12] Cause (+ CE at 17), bit 23 =
+                // FCC0, bits [31:25] = FCC[7:1], bit 24 = FS (flush-to-zero).
+                let fcsr = exec.core.fpu_fcsr;
+                let rm = fcsr & 0x3;
+                let rm_name = ["RN (nearest-even)", "RZ (toward zero)", "RP (toward +inf)", "RM (toward -inf)"][rm as usize];
+                let bits5 = |v: u32, base: u32| -> String {
+                    // I U O Z V, low bit first
+                    let names = ["I", "U", "O", "Z", "V"];
+                    let set: Vec<&str> = names.iter().enumerate()
+                        .filter(|&(k, _)| v & (1 << (base + k as u32)) != 0)
+                        .map(|(_, n)| *n).collect();
+                    if set.is_empty() { "-".to_string() } else { set.join(",") }
+                };
+                let fcc = {
+                    let b0 = (fcsr >> 23) & 1;
+                    let hi = (fcsr >> 25) & 0x7F;
+                    (hi << 1) | b0
+                };
                 writeln!(writer, "Control Registers:").unwrap();
                 writeln!(writer, "  FIR:  {:#010x}", exec.core.fpu_fir).unwrap();
                 writeln!(writer, "  FCCR: {:#010x}", exec.core.fpu_fccr).unwrap();
                 writeln!(writer, "  FEXR: {:#010x}", exec.core.fpu_fexr).unwrap();
                 writeln!(writer, "  FENR: {:#010x}", exec.core.fpu_fenr).unwrap();
-                writeln!(writer, "  FCSR: {:#010x}", exec.core.fpu_fcsr).unwrap();
+                writeln!(writer, "  FCSR: {:#010x}", fcsr).unwrap();
+                writeln!(writer, "    RM      = {} ({})", rm, rm_name).unwrap();
+                writeln!(writer, "    Cause   = {}  (CE={})", bits5(fcsr, 12), (fcsr >> 17) & 1).unwrap();
+                writeln!(writer, "    Enables = {}", bits5(fcsr, 7)).unwrap();
+                writeln!(writer, "    Flags   = {}  (sticky)", bits5(fcsr, 2)).unwrap();
+                writeln!(writer, "    FS      = {}  (flush denormals to zero)", (fcsr >> 24) & 1).unwrap();
+                writeln!(writer, "    FCC     = {:#04x}  (bits 7..0)", fcc).unwrap();
                 Ok(())
             }
             "mem" | "m" | "memory" => {
@@ -10795,7 +10909,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             }
             #[cfg(feature = "jitv2")]
             "j2" => {
-                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|pagewb|instrs|threads|opt|min-instrs|max-instrs|min-calls|lockstep|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string()); }
+                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|pagewb|instrs|threads|opt|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string()); }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
                 // only proves no one holds the lock *right now* (MipsCpu::step
@@ -11153,6 +11267,60 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         #[cfg(not(feature = "jitv2_lockstep"))]
                         writeln!(writer, "j2 lockstep: not built (rebuild with the jitv2_lockstep feature to enable).").unwrap();
                     }
+                    #[cfg(feature = "jitv2_lockstep")]
+                    "lstate" => {
+                        // j2 lstate [full] [N]: dump the rolling lockstep step
+                        // history (MipsExecutor::ls_history). The state shown
+                        // for each instruction is what ENTERED it — i.e. the
+                        // previous step's final state — which is exactly the
+                        // context the DIVERGENCE report drops (lockstep_compare
+                        // keeps only ls_before's pc/slot fields, not the
+                        // register file). After a divergence bail the last
+                        // entry is the inputs to the instruction that diverged.
+                        let hist = &exec.ls_history;
+                        if hist.is_empty() {
+                            writeln!(writer, "j2 lstate: lockstep history is empty (no bracketed instruction has stepped yet)").unwrap();
+                        } else {
+                            let (full, count) = match (actual_args.get(1).copied(), actual_args.get(2).copied()) {
+                                (None, _) => (false, 8usize),
+                                (Some("full"), None) => (true, 1usize),
+                                (Some("full"), Some(n)) => (true, n.parse().map_err(|_| "Usage: j2 lstate [full] [N]".to_string())?),
+                                (Some(n), _) => (false, n.parse().map_err(|_| "Usage: j2 lstate [full] [N]".to_string())?),
+                            };
+                            let count = count.clamp(1, hist.len());
+                            let symbols_arc = exec.symbols.clone();
+                            let symbols = symbols_arc.lock();
+                            writeln!(writer, "j2 lstate: {} of {} step(s), oldest first; register state is what ENTERED each instruction", count, hist.len()).unwrap();
+                            let start = hist.len() - count;
+                            for (i, e) in hist.iter().skip(start).enumerate() {
+                                let bd = if e.bd == LOCKSTEP_BD_LIVE { "  [bd:live]" } else if e.bd != 0 { "  [bd]" } else { "" };
+                                writeln!(writer, "  #{:<3} {:#018x}: {:08x}  {}{}", start + i, e.pc, e.raw,
+                                    crate::mips_dis::disassemble(e.raw, e.pc, Some(&symbols)), bd).unwrap();
+                                if full {
+                                    let s = &e.before;
+                                    for row in 0..8 {
+                                        let mut line = String::new();
+                                        for col in 0..4 {
+                                            let r = row * 4 + col;
+                                            line.push_str(&format!("  {:>4}={:016x}", crate::mips_dis::reg_name(r as u32), s.gpr[r]));
+                                        }
+                                        writeln!(writer, "  {}", line).unwrap();
+                                    }
+                                    writeln!(writer, "      hi={:016x}  lo={:016x}  pc={:016x}", s.hi, s.lo, s.pc).unwrap();
+                                    writeln!(writer, "      status={:08x} (FR={})  cause={:08x}  epc={:016x}  fcsr={:08x}",
+                                        s.status, (s.status & crate::mips_core::STATUS_FR != 0) as u8, s.cause, s.epc, s.fcsr).unwrap();
+                                    for row in 0..8 {
+                                        let mut line = String::new();
+                                        for col in 0..4 {
+                                            let r = row * 4 + col;
+                                            line.push_str(&format!("  f{:<2}={:016x}", r, s.fpr[r]));
+                                        }
+                                        writeln!(writer, "  {}", line).unwrap();
+                                    }
+                                }
+                            }
+                        }
+                    }
                     "analyze" => {
                         // Runs the REAL analyzer walk (Analyzer::walk_bounded,
                         // the same one handle_request uses to decide what a
@@ -11291,6 +11459,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
 
                         writeln!(writer, "pfn={:#010x}  gen={}", page.pfn, page.current_gen()).unwrap();
                         writeln!(writer, "pc={:#018x}  page_off={:#05x}", pc, entry_offset * 4).unwrap();
+                        // FR mode: no page-level pinned mode on this
+                        // (non-j2wp) design — each entry is compiled
+                        // independently against the live STATUS_FR at its own
+                        // trigger time (see JitEntry::compiled_for_fr1). Print
+                        // the live bit here for reference; the per-entry
+                        // "fr1=" column below is what each region actually
+                        // baked, and " FR-MISMATCH" flags any that disagree
+                        // with the live bit right now (the exact condition
+                        // emit_fr_mode_guard bails+kills on at entry — a
+                        // standing mismatch here means that guard should have
+                        // fired for this entry, or is about to).
+                        let live_fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                        writeln!(writer, "live STATUS_FR={}  (cp0_status={:#010x})", live_fr1 as u8, exec.core.cp0_status).unwrap();
                         writeln!(
                             writer,
                             "  entry_offset: published={} entry_valid={} denylisted={}",
@@ -11326,6 +11507,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 let func = page.entries[off].func;
                                 let gen = page.entries[off].gen.load(Ordering::Relaxed);
                                 let stale = gen != page.current_gen();
+                                let entry_fr1 = page.entries[off].compiled_for_fr1;
                                 #[cfg(feature = "developer")]
                                 let dev_cols = format!(" instrs={} code_size={} calls={} in_blocks={}",
                                     page.entries[off].instr_count,
@@ -11336,10 +11518,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 let dev_cols = String::new();
                                 writeln!(
                                     writer,
-                                    "    page_off={:#05x} vaddr={:#018x} func={:#014x} gen={}{}{}",
-                                    off * 4, vaddr, func as usize, gen,
+                                    "    page_off={:#05x} vaddr={:#018x} func={:#014x} gen={} fr1={}{}{}{}",
+                                    off * 4, vaddr, func as usize, gen, entry_fr1 as u8,
                                     dev_cols,
                                     if stale { " STALE" } else { "" },
+                                    if entry_fr1 != live_fr1 { " FR-MISMATCH" } else { "" },
                                 ).unwrap();
                             }
                         }
@@ -11546,6 +11729,21 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // diagnostic no longer applies).
                         writeln!(writer, "pfn={:#010x}  gen={}  entry_gen={}  scheduled(in-flight)={}  compiles_since_flush={}  rejected_compiles={}",
                             page.pfn, page.current_gen(), page.entry_gen(), page.is_scheduled(), page.compiles_since_flush(), page.rejected_compiles()).unwrap();
+                        // §13: one function per page, so FR mode is a single
+                        // whole-page value — pinned at page-claim time from the
+                        // live STATUS_FR (PhysicalCodePage::fr1) and every
+                        // FPR-access emitter in the one function bakes its
+                        // register-packing scheme from it. emit_fr_mode_guard
+                        // bails+kills an entry whose live STATUS_FR no longer
+                        // matches this. " FR-MISMATCH" flags a standing
+                        // disagreement with the live bit right now.
+                        {
+                            let page_fr1 = page.is_fr1();
+                            let live_fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                            writeln!(writer, "  fr1 (pinned)={}  live STATUS_FR={}  (cp0_status={:#010x}){}",
+                                page_fr1 as u8, live_fr1 as u8, exec.core.cp0_status,
+                                if page_fr1 != live_fr1 { "  FR-MISMATCH" } else { "" }).unwrap();
+                        }
                         #[cfg(feature = "developer")]
                         writeln!(writer, "  schedule_attempts={}  sends_attempted={}  sends_dropped_queue_full={}",
                             page.schedule_attempts(), page.sends_attempted(), page.sends_dropped_queue_full()).unwrap();
@@ -12025,7 +12223,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             }
                         }
                     }
-                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|fallback [on|off|<category>]|pagewb [on|off]|instrs|threads|opt [none|speed]|min-instrs [N]|max-instrs [N]|min-calls [N]|lockstep|hugepages|flush|clear <paddr>|deny <paddr>>".to_string()),
+                    _ => return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline [on|off]|dispatch [on|off]|fallback [on|off|<category>]|pagewb [on|off]|instrs|threads|opt [none|speed]|min-instrs [N]|max-instrs [N]|min-calls [N]|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>>".to_string()),
                 }
                 Ok(())
             }

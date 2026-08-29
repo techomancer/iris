@@ -505,3 +505,92 @@ word before lockstep's own comparison does). Regression coverage:
 compiles a bare word with `in_delay_slot`/`delay_slot_target` pre-armed (as
 the interpreter would leave them) and asserts the compiled function honors
 the pending transfer rather than its own fallthrough.
+
+## The CVT/ROUND/TRUNC/CEIL/FLOOR helper callouts must pass `core.jit_ctx`, not `ctx.core_ptr`
+
+`emit_fcvt_to_int` / `emit_fcvt_from_int` / `emit_fcvt_s_d` call out to
+`jit_cvt_to_int` / `jit_cvt_int_to_float` / `jit_cvt_d_to_s`
+(`mips_exec.rs`), whose first parameter is the **`MipsExecutor<T,C>`**
+pointer — each does `&mut *(ctx as *mut MipsExecutor<T,C>)` then
+`cvt_*_and_commit(&mut exec.core, …)`.
+
+Every other JIT->Rust callout in this file loads that pointer from
+`core.jit_ctx` (`load(ptr_ty, core_ptr, core_offset_of_jit_ctx())`) — the
+`MipsCore` field `install_jit_hooks` stamps with `self as *mut Self`. These
+three passed the bare `ctx.core_ptr` (the `*mut MipsCore` the JitFn is
+called with, `jit_fn(&mut self.core …)`) instead.
+
+`ctx.core_ptr == core.jit_ctx` **only if `core` sits at offset 0 of
+`MipsExecutor`**, which `repr(Rust)` does not guarantee — and doesn't
+deliver here: with a big align-8 first field followed by an `Arc`, bools, a
+`Vec`, etc., rustc packs the small fields ahead of `core`
+(`offset_of!(MipsExecutor, core)` came out 32 on a representative layout).
+So the helper received `self + off`, treated it as the executor base, and
+read/wrote the FPR file at `self + 2*off` — corrupting `sysad`/`tlb`/`cache`
+bytes while leaving the real `core.fpr` untouched.
+
+Found via a `jitv2_lockstep` divergence: `trunc.w.d f0, f0` (and, in another
+run, `cvt.d.l f3, f3`) reported the JIT's destination FPR **unchanged** —
+`jit=<input>  interp=<converted>` — with nothing else diverging and no
+crash. The tell is "the result register just never updated": the callout
+ran, the conversion math is shared/deterministic, so a silent no-op on the
+real `core` means the write landed somewhere else.
+
+**Fix**: load `core.jit_ctx` and pass that, exactly like `emit_mem_read_callout`
+and friends. In normal (non-lockstep) execution this bug silently corrupts
+`MipsExecutor` memory on every CVT/ROUND/TRUNC/CEIL/FLOOR/`cvt.s.d`, so it is
+not lockstep-specific — lockstep just makes it a hard, immediate failure.
+
+## Every FP computational op rewrites FCSR.Cause — even the ones that raise nothing (CVT.D.S)
+
+The R4000 Cause field holds *only the last FP instruction's* exceptions and is
+rewritten by every floating-point operation, including to zero when the op
+raised nothing (`fpu_update_fcsr_full`'s unconditional `fpu_fcsr &= !FCSR_CM`,
+and its own doc comment). The interpreter honours this everywhere — arith via
+`fpu_update_fcsr`, ABS/NEG via `fpu_check_snan_operand`, compare via
+`exec_fcc_*`, the CVT commit helpers, and — the easy one to miss —
+`exec_fcvt_d_s` via `fpu_update_fcsr(0, …)`.
+
+`emit_fcvt_d_s` was a plain `fpromote` + FPR write with **no FCSR touch at
+all**, on the (correct but incomplete) reasoning that CVT.D.S is always exact
+and raises no exception. It still has to clear Cause. Skipping it let a stale
+`Cause.I` from a preceding inexact CVT ride through a CVT.D.S, surfacing as a
+`jitv2_lockstep` `fcsr` divergence: `jit=0x00001004 interp=0x00000004`
+(JIT kept Cause.I set, interp cleared it — interp/spec correct).
+
+**Fix**: route CVT.D.S's write through `emit_fpu_update_fcsr(ctx, iconst 0, …)`,
+same as the interpreter's `fpu_update_fcsr(0, …)`. When adding any new FP
+computational emitter, the default is "clears Cause"; the only ops that leave
+FCSR entirely untouched are MOV.fmt (and MOVCF.fmt) — ABS/NEG do clear it (via
+the SNaN-operand check).
+
+## `LOCKSTEP_BD_LIVE` must still anchor `core.pc` — only `in_delay_slot` is genuinely "live"
+
+`emit_lockstep_step(trust_live=true)` (entry words, delay slots,
+`is_branch_fallback_successor` words) passes `bd = LOCKSTEP_BD_LIVE`, and
+`lockstep_step` used to skip setting `core.pc` entirely in that case, on the
+comment's claim that live `core.pc` "already equals the instruction's own
+address."
+
+That holds when the word was reached by **interpreter dispatch** or a **BC1
+interpreter fallback** — both write `core.pc`. It does **not** hold when a JIT
+branch/jump took its **in-region edge** into the word's block:
+`emit_target_edge`'s `None` arm is a bare `builder.ins().jump(target_block)`
+with no `core.pc` write, so `core.pc` is left stale at whatever the last
+materialization set — typically the branch's own address, via
+`emit_slot_semantics`' `saved_pc` restore (itself the value a *preceding*
+instruction's lockstep compare wrote as `core.pc = word+1`).
+
+Collision case: a word that is both `is_branch_fallback_successor` (so it gets
+the `trust_live` bracket) **and** a JIT branch target (so it's reached with a
+stale pc). Found live: `beq` taken to a `ldc1` fallback-successor —
+`interp.pc` came out one word past the branch (`exec_ldc1` + `handle_exec_complete`
+anchored at the stale branch address), `jit.pc` was correct (the block's own
+foreign-slot check materialized it), spurious `pc` divergence.
+
+**Fix**: `lockstep_step` sets `self.core.pc = pc` **unconditionally** (`pc` is
+always `emit_word_addr(word)` — the instruction's own address, authoritative
+however it was reached). Only `in_delay_slot`/`delay_slot_target` stay
+trusted-live for `LOCKSTEP_BD_LIVE` — a fallback-successor really can arrive
+mid-delay-slot and a compile-time `bd` would clobber the inherited pending
+transfer.

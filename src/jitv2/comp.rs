@@ -252,7 +252,7 @@ pub fn handle_request(
                 stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
                 return false;
             }
-            page.publish(offset, jit_fn as *const (), gen_snap, instr_count, code_size);
+            page.publish(offset, jit_fn as *const (), gen_snap, instr_count, code_size, req.compiled_for_fr1);
             #[cfg(feature = "developer")]
             {
                 // Per-word block-overlap diagnostic (j2 pcp): every word this
@@ -468,6 +468,7 @@ pub fn handle_request_deferred(
             // idle-timeout/pending-threshold sweep.
             let publish = crate::jitv2::paged_memory::PublishInfo {
                 page: req.page, offset, gen_snap, instr_count, code_size,
+                compiled_for_fr1: req.compiled_for_fr1,
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);
@@ -540,7 +541,7 @@ fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
         if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
             continue;
         }
-        page.publish(entry.offset, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size);
+        page.publish(entry.offset, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1);
     }
 }
 
@@ -1515,6 +1516,7 @@ pub fn handle_request_deferred(
             // comment for the real bug this distinction fixes.
             let publish = crate::jitv2::paged_memory::PublishInfo {
                 page: req.page, new_entries, gen_snap, instr_count, code_size,
+                compiled_for_fr1: req.compiled_for_fr1,
                 jit_fn: None,
             };
             let sealed = codegen.finalize_batch_nonforced(func_id, publish);

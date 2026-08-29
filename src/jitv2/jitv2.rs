@@ -469,6 +469,18 @@ pub struct JitEntry {
     /// can both write it, and `j2 pcp` reads it from the monitor thread.
     #[cfg(feature = "developer")]
     pub block_include_count: AtomicU8,
+    /// The `STATUS_FR` value this entry's region was actually compiled against
+    /// (`CompileRequest::compiled_for_fr1` — on the default, non-`j2wp` path
+    /// that is the *live* `STATUS_FR` at compile-trigger time; there is no
+    /// page-level pinned FR mode here). Every FPR-access emitter in the region
+    /// baked its register-packing scheme (FR=0 even/odd pairing vs FR=1 flat)
+    /// from this, and the in-region `emit_fr_mode_guard` re-checks it against
+    /// the live bit at entry. Written once at publish, same lifecycle as
+    /// `func`. Not `developer`-gated: it's the one field `j2 pcp` needs to
+    /// answer "did this region compile for the wrong FR mode" — the exact
+    /// question `jitv2_lockstep` FPR divergences raise. Meaningless (stays
+    /// `false`) while the entry is unpublished.
+    pub compiled_for_fr1: bool,
 }
 
 impl Default for JitEntry {
@@ -485,6 +497,7 @@ impl Default for JitEntry {
             call_count: AtomicU64::new(0),
             #[cfg(feature = "developer")]
             block_include_count: AtomicU8::new(0),
+            compiled_for_fr1: false,
         }
     }
 }
@@ -1119,7 +1132,7 @@ impl PhysicalCodePage {
     /// machine code size in bytes. Both ignored (but still accepted, to keep
     /// this signature stable across feature combinations) when the
     /// `developer` feature is off.
-    pub fn publish(&self, offset_word: usize, func: *const (), gen_snap: u64, #[allow(unused_variables)] instr_count: usize, #[allow(unused_variables)] code_size: u32) -> bool {
+    pub fn publish(&self, offset_word: usize, func: *const (), gen_snap: u64, #[allow(unused_variables)] instr_count: usize, #[allow(unused_variables)] code_size: u32, compiled_for_fr1: bool) -> bool {
         if gen_snap != self.current_gen() {
             return false; // page already mutated past gen_snap; discard rather than publish a stale artifact
         }
@@ -1133,6 +1146,7 @@ impl PhysicalCodePage {
         unsafe {
             let entries = self.entries.as_ptr() as *mut JitEntry;
             (*entries.add(offset_word)).func = func;
+            (*entries.add(offset_word)).compiled_for_fr1 = compiled_for_fr1;
             #[cfg(feature = "developer")]
             {
                 (*entries.add(offset_word)).instr_count = instr_count as u16;
@@ -2855,7 +2869,7 @@ mod tests {
         let offset = 100usize;
 
         let old_fn = 0x1000usize as *const ();
-        assert!(page.publish(offset, old_fn, 5, 1, 0));
+        assert!(page.publish(offset, old_fn, 5, 1, 0, false));
         assert!(page.is_runnable(offset));
         assert_eq!(page.entries[offset].func, old_fn);
 
@@ -2867,7 +2881,7 @@ mod tests {
         // stale-but-still-published entry) — gen_snap=6 was captured before
         // this second compile started, matching the page's now-current gen.
         let new_fn = 0x2000usize as *const ();
-        assert!(page.publish(offset, new_fn, 6, 1, 0));
+        assert!(page.publish(offset, new_fn, 6, 1, 0, false));
         assert!(page.is_runnable(offset), "recompiled entry must read valid once publish completes");
         assert_eq!(page.entries[offset].func, new_fn, "func must be the NEW function, not the stale one, once gen reads as current");
     }
@@ -2964,9 +2978,9 @@ mod tests {
         let page = &jit.pages[slot];
 
         // Two entries at instr_count=3 (sizes 100, 300), one at instr_count=5 (size 50).
-        assert!(page.publish(0, 0x1000 as *const (), 0, 3, 100));
-        assert!(page.publish(1, 0x2000 as *const (), 0, 3, 300));
-        assert!(page.publish(2, 0x3000 as *const (), 0, 5, 50));
+        assert!(page.publish(0, 0x1000 as *const (), 0, 3, 100, false));
+        assert!(page.publish(1, 0x2000 as *const (), 0, 3, 300, false));
+        assert!(page.publish(2, 0x3000 as *const (), 0, 5, 50, false));
 
         let hist = jit.code_size_by_instr_count();
         let bucket3 = hist[3].expect("instr_count=3 bucket must be present");
