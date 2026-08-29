@@ -1390,7 +1390,7 @@ fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, old
 // Free functions (one monomorphized instantiation per <T,C>, like the
 // translate_fn wrappers above) so their addresses can be stored as bare
 // `unsafe extern "C" fn` pointers in MipsCore (`install_jit_hooks`). Every
-// read sets `core.jit_mem_exc`; compiled code must check it after the call
+// read returns its status alongside the value (see `JitReadResult`);
 // (see MipsCore's read*_fn field doc comments).
 //
 // `ctx` is the `*mut MipsCore` the `JitFn` was itself entered with — the
@@ -1482,47 +1482,47 @@ unsafe fn exec_from_core<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> *m
 }
 
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<1>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<1>(va) {
-        Ok(v) => { exec.core.jit_mem_exc = EXEC_COMPLETE; v }
-        Err(status) => { exec.core.jit_mem_exc = status; 0 }
+        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
+        Err(status) => JitReadResult { val: 0, status },
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<2>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<2>(va) {
-        Ok(v) => { exec.core.jit_mem_exc = EXEC_COMPLETE; v }
-        Err(status) => { exec.core.jit_mem_exc = status; 0 }
+        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
+        Err(status) => JitReadResult { val: 0, status },
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<4>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<4>(va) {
-        Ok(v) => { exec.core.jit_mem_exc = EXEC_COMPLETE; v }
-        Err(status) => { exec.core.jit_mem_exc = status; 0 }
+        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
+        Err(status) => JitReadResult { val: 0, status },
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> u64 {
+unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_read::<8>(va); }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<8>(va) {
-        Ok(v) => { exec.core.jit_mem_exc = EXEC_COMPLETE; v }
-        Err(status) => { exec.core.jit_mem_exc = status; 0 }
+        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
+        Err(status) => JitReadResult { val: 0, status },
     }
 }
 #[cfg(feature = "jitv2")]
@@ -1532,7 +1532,7 @@ unsafe extern "C" fn jit_write8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<1>(va, val as u64); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    { let status = exec.write_data::<1>(va, val as u64); exec.core.jit_mem_exc = status; status }
+    exec.write_data::<1>(va, val as u64)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
@@ -1541,7 +1541,7 @@ unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<2>(va, val as u64); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    { let status = exec.write_data::<2>(va, val as u64); exec.core.jit_mem_exc = status; status }
+    exec.write_data::<2>(va, val as u64)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
@@ -1550,7 +1550,7 @@ unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<4>(va, val as u64); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    { let status = exec.write_data::<4>(va, val as u64); exec.core.jit_mem_exc = status; status }
+    exec.write_data::<4>(va, val as u64)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
@@ -1558,7 +1558,7 @@ unsafe extern "C" fn jit_write64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
     #[cfg(feature = "jitv2_lockstep")]
     { return exec.lockstep_jit_write::<8>(va, val); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    { let status = exec.write_data::<8>(va, val); exec.core.jit_mem_exc = status; status }
+    exec.write_data::<8>(va, val)
 }
 /// JIT-callable `write_data64_masked` wrapper — the SWL/SWR/SDL/SDR
 /// counterpart to `jit_write64`'s plain full-width write. No
@@ -1574,9 +1574,7 @@ unsafe extern "C" fn jit_write64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_voi
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write64_masked<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64, mask: u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    let status = exec.write_data64_masked(va, val, mask);
-    exec.core.jit_mem_exc = status;
-    status
+    exec.write_data64_masked(va, val, mask)
 }
 /// Single-implementation exception delivery (§4.2): calls the interpreter's
 /// own `handle_exception` — the only place EPC/Cause/BD/vectoring are ever
@@ -7872,8 +7870,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // core stays in interp's post-state (already live); the JIT is
             // about to re-run from `before`, but the caller made this a no-op —
             // actually restore `before` so the JIT runs cleanly and its own
-            // exception path (production mem hooks under lockstep still detect
-            // faults via jit_mem_exc) produces the real result the region uses.
+            // exception path (production mem hooks under lockstep still report
+            // faults via their returned status) produces the real result the
+            // region uses.
             before.restore_into(self, delay_target_before);
             self.core.lockstep_mem = None;
             return;
@@ -8033,11 +8032,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// capture data — same behavior a direct JIT test expects from a plain
     /// (non-lockstep) build.
     #[cfg(feature = "jitv2_lockstep")]
-    fn lockstep_jit_read<const SIZE: usize>(&mut self, va: u64) -> u64 {
+    fn lockstep_jit_read<const SIZE: usize>(&mut self, va: u64) -> JitReadResult {
         let Some(captured) = self.core.lockstep_mem else {
             let result = match self.read_data::<SIZE>(va) {
-                Ok(v) => { self.core.jit_mem_exc = EXEC_COMPLETE; v }
-                Err(status) => { self.core.jit_mem_exc = status; 0 }
+                Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
+                Err(status) => JitReadResult { val: 0, status },
             };
             // read_data's own jitv2_lockstep instrumentation just set
             // core.lockstep_mem = Some(this access) as a side effect meant
@@ -8057,8 +8056,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         };
         let translate_result = self.lockstep_translate::<{ AccessType::Read as u8 }>(va);
         if translate_result.is_exception() {
-            self.core.jit_mem_exc = translate_result.status;
-            return 0;
+            return JitReadResult { val: 0, status: translate_result.status };
         }
         let phys = translate_result.phys as u64;
         if va != captured.addr || phys != captured.phys {
@@ -8067,12 +8065,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             eprintln!("  phys jit={:#018x}  interp={:#018x}", phys, captured.phys);
             eprintln!("=== breaking into monitor; use `dt`, `r`, `d pc` to inspect (JIT's wrong post-state is live) ===\n");
             self.core.lockstep_mem = None;
-            self.core.jit_mem_exc = EXEC_BREAKPOINT;
-            return 0;
+            return JitReadResult { val: 0, status: EXEC_BREAKPOINT };
         }
-        self.core.jit_mem_exc = EXEC_COMPLETE;
         let mask: u64 = if SIZE == 8 { u64::MAX } else { (1u64 << (SIZE * 8)) - 1 };
-        captured.value & mask
+        JitReadResult { val: captured.value & mask, status: EXEC_COMPLETE }
     }
 
     /// Lockstep replacement for every `jit_write*_fn` hook — see
@@ -8085,7 +8081,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn lockstep_jit_write<const SIZE: usize>(&mut self, va: u64, val: u64) -> u32 {
         let Some(captured) = self.core.lockstep_mem else {
             let status = self.write_data::<SIZE>(va, val);
-            self.core.jit_mem_exc = status;
             // See lockstep_jit_read's matching None-arm comment: write_data
             // just set core.lockstep_mem as a side effect meant for the
             // interpreter-first path, which doesn't apply to this
@@ -8097,7 +8092,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         };
         let translate_result = self.lockstep_translate::<{ AccessType::Write as u8 }>(va);
         if translate_result.is_exception() {
-            self.core.jit_mem_exc = translate_result.status;
             return translate_result.status;
         }
         let phys = translate_result.phys as u64;
@@ -8111,10 +8105,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             eprintln!("  value jit={:#018x}  interp={:#018x}  (SIZE={} mask={:#x})", jit_masked, interp_masked, SIZE, mask);
             eprintln!("=== breaking into monitor; use `dt`, `r`, `d pc` to inspect (JIT's wrong post-state is live) ===\n");
             self.core.lockstep_mem = None;
-            self.core.jit_mem_exc = EXEC_BREAKPOINT;
             return EXEC_BREAKPOINT;
         }
-        self.core.jit_mem_exc = EXEC_COMPLETE;
         EXEC_COMPLETE
     }
 }

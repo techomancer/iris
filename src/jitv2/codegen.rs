@@ -133,7 +133,7 @@ pub struct Codegen {
 /// handful of helpers that operate on those instead (`emit_read_gpr(reg)`,
 /// `emit_word_addr(word)` for a *target*, etc.).
 ///
-/// `word` is what `emit_check_mem_exc` needs to synthesize the correct
+/// `word` is what `emit_check_mem_status` needs to synthesize the correct
 /// exception PC on a fault (see that function's doc comment): a plain
 /// sequential instruction's body never writes `core.pc` per-instruction
 /// (only exit points do, to keep a straight-line compiled run cheap — that's
@@ -159,7 +159,7 @@ pub struct Codegen {
 ///
 /// `exit_block` is the compiled function's one shared exit-to-interpreter
 /// block (`BlockSkeleton::exit_block`/`compile_region`'s own local of the
-/// same name) — needed by `emit_check_mem_exc` to bail there (via
+/// same name) — needed by `emit_check_mem_status` to bail there (via
 /// `emit_bail`) on a non-exception nonzero status (`EXEC_RETRY`/
 /// `EXEC_BREAKPOINT`) instead of routing it into `emit_exception_exit`,
 /// which must only ever run for a real exception (`EXEC_IS_EXCEPTION` set).
@@ -1621,6 +1621,11 @@ impl Codegen {
         // contention (workers' func_ranges ending up with wrong/overlapping
         // recorded ranges, so try_seal_ready's sealed results could never
         // match back to the FuncId that actually owned them).
+        // TEMP (perf investigation): IRIS_JIT_DISASM=1 dumps each compiled
+        // region's machine code to stderr. Cranelift only fills `vcode` when
+        // asked before compilation, so set the flag here.
+        let want_disasm = std::env::var_os("IRIS_JIT_DISASM").is_some();
+        if want_disasm { self.ctx.set_disasm(true); }
         if let Err(e) = self.module.define_function(func_id, &mut self.ctx) {
             let is_oom = matches!(e, cranelift_module::ModuleError::Allocation { .. });
             self.last_compile_ran_out_of_memory = is_oom;
@@ -1633,6 +1638,14 @@ impl Codegen {
             return None;
         }
         self.last_compile_ran_out_of_memory = false;
+        if want_disasm {
+            if let Some(cc) = self.ctx.compiled_code() {
+                if let Some(vc) = cc.vcode.as_ref() {
+                    println!("===DISASM region size={}===", cc.code_info().total_size);
+                    println!("{}", vc);
+                }
+            }
+        }
         let range = self.seal_handle.take_last_allocation()
             .expect("define_function must have allocated real memory for a successful compile");
         self.func_ranges.insert(func_id, range);
@@ -2060,7 +2073,7 @@ fn emit_cp1_cu1_guard(ctx: &mut EmitCtx) {
 /// guard only ever exists for a region containing CP1 instructions. The
 /// exception code itself (`EXC_CPU`) is a compile-time constant — no
 /// interpreter re-dispatch needed to determine what happened, unlike a
-/// memory-access fault's status (`emit_check_mem_exc`), which only the bus
+/// memory-access fault's status (`emit_check_mem_status`), which only the bus
 /// device knows until the access actually runs. Terminates the current
 /// block (delegates to `emit_exception_exit`, itself a terminator).
 fn emit_materialize_cpu_unusable(ctx: &mut EmitCtx) {
@@ -2825,7 +2838,6 @@ fn core_offset_of_lockstep_step_fn() -> i32 { std::mem::offset_of!(MipsCore, loc
 #[cfg(feature = "jitv2_lockstep")]
 fn core_offset_of_lockstep_compare_fn() -> i32 { std::mem::offset_of!(MipsCore, lockstep_compare_fn) as i32 }
 #[cfg(feature = "jitv2")]
-fn core_offset_of_jit_mem_exc() -> i32 { std::mem::offset_of!(MipsCore, jit_mem_exc) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_in_delay_slot() -> i32 { std::mem::offset_of!(MipsCore, in_delay_slot) as i32 }
 fn core_offset_of_delay_slot_target() -> i32 { std::mem::offset_of!(MipsCore, delay_slot_target) as i32 }
@@ -2886,7 +2898,7 @@ impl MemSize {
 /// (LB/LH/LW) must `sextend` from the narrower width themselves, same as the
 /// interpreter's own handlers do after calling `read_data`.
 ///
-/// Does not itself check the exception result — call [`emit_check_mem_exc`]
+/// Does not itself check the exception result — call [`emit_check_mem_status`]
 /// immediately after with the same `word_offset`/`exit_block` to bail out on
 /// a fault before trusting the returned value, exactly like every
 /// interpreter load handler's `match self.read_data(...) { Ok(v) => ...,
@@ -2919,7 +2931,7 @@ pub fn inline_mem_enabled() -> bool {
     // against `core.lockstep_mem`, the triple the interpreter captured when
     // it ran the same instruction. The inline fast path deliberately does not
     // call those wrappers (see `emit_mem_read_split`'s own comment on why it
-    // has to store `jit_mem_exc` by hand), so every access that hits nutlb +
+    // supplies its status as a constant instead), so every access that hits nutlb +
     // the L1-D tag would execute *completely unverified* — around 82% of
     // loads, per docs/jit-inline-memory.md. Lockstep would then silently
     // check only the slow-path minority while reporting itself as on, which
@@ -3218,25 +3230,38 @@ fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
     // the site — no extra blocks, so the caller's register allocation is
     // untouched — but the callee returns without entering `read_data` on the
     // ~82% of loads that hit.
-    if inline_mem_enabled() {
+    let (val, status) = if inline_mem_enabled() {
         if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
             INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return emit_mem_read_split(ctx, vaddr, size, path);
+            emit_mem_read_split(ctx, vaddr, size, path)
+        } else {
+            INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            emit_mem_read_callout(ctx, vaddr, size)
         }
-    }
-    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    emit_mem_read_callout(ctx, vaddr, size)
+    } else {
+        INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        emit_mem_read_callout(ctx, vaddr, size)
+    };
+    // The status is a live SSA value here, so the check reads a register
+    // rather than reloading a MipsCore field.
+    emit_check_mem_status(ctx, status);
+    val
 }
 
 /// Fast/slow join for an inline load. On entry the builder sits in the fast
 /// block with `path.fast_data_ptr` live.
 fn emit_mem_read_split(
     ctx: &mut EmitCtx, vaddr: Value, size: MemSize, path: InlineMemPath,
-) -> Value {
+) -> (Value, Value) {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
 
     let val = ctx.builder.append_block_param(path.join_block, i64t);
+    // Status rides the join as a block param instead of a MipsCore field.
+    // The fast path contributes a constant 0, so on the hot path this costs
+    // nothing at all — where the old design paid an explicit store of
+    // EXEC_COMPLETE here plus a reload in `emit_check_mem_status`.
+    let status = ctx.builder.append_block_param(path.join_block, ir::types::I32);
 
     // --- fast: load from the swizzled host address ---
     // Loaded zero-extended to I64, matching the read*_fn wrappers' contract
@@ -3253,28 +3278,21 @@ fn emit_mem_read_split(
     } else {
         ctx.builder.ins().uextend(i64t, raw)
     };
-    // The callout wrapper sets `core.jit_mem_exc = EXEC_COMPLETE` on success
-    // and every load site runs `emit_check_mem_exc` afterwards. The inline
-    // path never calls that wrapper, so it must clear the flag itself —
-    // otherwise the check picks up a *stale* status from some earlier
-    // faulting access and takes a spurious exception exit. (EXEC_COMPLETE is
-    // 0; this is one store of an immediate.)
-    let zero = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
-    ctx.builder.ins().store(mem, zero, ctx.core_ptr,
-        ir::immediates::Offset32::new(core_offset_of_jit_mem_exc()));
-
-    ctx.builder.ins().jump(path.join_block, &[raw.into()]);
+    // The inline path cannot fault (every failure condition was already
+    // checked by the guard), so its status is the constant EXEC_COMPLETE.
+    let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().jump(path.join_block, &[raw.into(), ok.into()]);
 
     // --- slow: the original callout ---
     ctx.builder.switch_to_block(path.slow_block);
     ctx.builder.set_cold_block(path.slow_block);
     ctx.builder.seal_block(path.slow_block);
-    let slow_val = emit_mem_read_callout(ctx, vaddr, size);
-    ctx.builder.ins().jump(path.join_block, &[slow_val.into()]);
+    let (slow_val, slow_status) = emit_mem_read_callout(ctx, vaddr, size);
+    ctx.builder.ins().jump(path.join_block, &[slow_val.into(), slow_status.into()]);
 
     ctx.builder.switch_to_block(path.join_block);
     ctx.builder.seal_block(path.join_block);
-    val
+    (val, status)
 }
 
 /// Offset compiled code adds to the core pointer when passing it as a
@@ -3302,7 +3320,8 @@ fn callout_core_arg(ctx: &mut EmitCtx) -> Value {
     ctx.builder.ins().iadd_imm_s(ctx.core_ptr, CALLOUT_CORE_BIAS)
 }
 
-fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
+/// Returns `(value, status)` — both in registers, no memory round-trip.
+fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> (Value, Value) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
@@ -3313,12 +3332,16 @@ fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Valu
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
-    sig.returns.push(AbiParam::new(ir::types::I64)); // value
+    // `JitReadResult` — two INTEGER eightbytes, returned in %rax:%rdx. Must
+    // match the struct's field order (val, status); see its doc comment.
+    sig.returns.push(AbiParam::new(ir::types::I64)); // val
+    sig.returns.push(AbiParam::new(ir::types::I32)); // status
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
     let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr]);
-    ctx.builder.inst_results(call)[0]
+    let r = ctx.builder.inst_results(call);
+    (r[0], r[1])
 }
 
 /// Emit a call through `core.write{8,16,32,64}_fn(core_ptr, vaddr, value)`.
@@ -3336,29 +3359,35 @@ fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Valu
 /// wrapper (`jit_write8` in `mips_exec.rs`) masking to the real width
 /// itself, exactly like `emit_mem_read`'s callers already mask/extend a
 /// full-width return value down to what they need. Returns the `ExecStatus`
-/// result (I32) — 0 on success, an exception status otherwise; also
-/// mirrored into `core.jit_mem_exc` by the wrapper (see
-/// [`emit_check_mem_exc`]), so callers can use the same check helper
-/// uniformly for both loads and stores rather than branching on this return
-/// value directly.
+/// result (I32) in `%eax` — 0 on success, an exception status otherwise.
+/// The caller feeds it straight to [`emit_check_mem_status`]; it never goes
+/// through memory.
+/// Emits the store and checks its status, leaving the builder in the
+/// no-fault continuation block. Callers must not check again.
 fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
-    if inline_mem_enabled() {
+    let status = if inline_mem_enabled() {
         if let Some(path) = emit_inline_mem_guard::<true>(ctx, vaddr, size) {
             INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            emit_mem_write_split(ctx, vaddr, value, size, path);
-            return;
+            emit_mem_write_split(ctx, vaddr, value, size, path)
+        } else {
+            INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            emit_mem_write_callout(ctx, vaddr, value, size)
         }
-    }
-    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    emit_mem_write_callout(ctx, vaddr, value, size)
+    } else {
+        INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        emit_mem_write_callout(ctx, vaddr, value, size)
+    };
+    emit_check_mem_status(ctx, status);
 }
 
 /// Fast/slow join for an inline store. On entry the builder sits in the fast
 /// block with `path.fast_data_ptr` live.
 fn emit_mem_write_split(
     ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize, path: InlineMemPath,
-) {
+) -> Value {
     let mem = MemFlagsData::trusted();
+    // Status rides the join as a block param rather than a MipsCore field.
+    let status = ctx.builder.append_block_param(path.join_block, ir::types::I32);
 
     // --- fast: store to the swizzled host address ---
     // `value` arrives as I64 regardless of size (see emit_mem_write_callout's
@@ -3458,23 +3487,26 @@ fn emit_mem_write_split(
         }
     }
 
-    let zero = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
-    ctx.builder.ins().store(mem, zero, ctx.core_ptr,
-        ir::immediates::Offset32::new(core_offset_of_jit_mem_exc()));
-    ctx.builder.ins().jump(path.join_block, &[]);
+    // The inline path cannot fault (the guard already checked every failure
+    // condition), so its status is a constant that folds away — where the old
+    // design stored EXEC_COMPLETE to `jit_mem_exc` here and reloaded it in
+    // `emit_check_mem_status`.
+    let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    ctx.builder.ins().jump(path.join_block, &[ok.into()]);
 
     // --- slow: the original callout ---
     ctx.builder.switch_to_block(path.slow_block);
     ctx.builder.set_cold_block(path.slow_block);
     ctx.builder.seal_block(path.slow_block);
-    emit_mem_write_callout(ctx, vaddr, value, size);
-    ctx.builder.ins().jump(path.join_block, &[]);
+    let slow_status = emit_mem_write_callout(ctx, vaddr, value, size);
+    ctx.builder.ins().jump(path.join_block, &[slow_status.into()]);
 
     ctx.builder.switch_to_block(path.join_block);
     ctx.builder.seal_block(path.join_block);
+    status
 }
 
-fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
+fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) -> Value {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
@@ -3490,9 +3522,8 @@ fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: M
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, value]);
-    // Return value intentionally unused here — emit_check_mem_exc reads
-    // core.jit_mem_exc instead, so loads and stores share one check path.
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, value]);
+    ctx.builder.inst_results(call)[0]
 }
 
 /// Emit a call through `core.write64_masked_fn(core_ptr, aligned_addr,
@@ -3502,7 +3533,7 @@ fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: M
 /// and `mask` are both full 64-bit values already positioned in
 /// doubleword-space by the caller (`emit_swl`/etc.'s own dword-shift
 /// promotion), not narrowed/widened here.
-fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mask: Value) {
+fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mask: Value) -> Value {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
@@ -3519,13 +3550,12 @@ fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mas
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, aligned_addr, val, mask]);
-    // Return value intentionally unused — emit_check_mem_exc reads
-    // core.jit_mem_exc instead, same convention as emit_mem_write.
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, aligned_addr, val, mask]);
+    ctx.builder.inst_results(call)[0]
 }
 
-/// After [`emit_mem_read`]/[`emit_mem_write`]: load `core.jit_mem_exc` and
-/// route it exactly like the interpreter's own `finish_status` does for a
+/// Route a memory op's status value exactly like the interpreter's own
+/// `finish_status` does for a
 /// status straight out of `read_data`/`write_data` — retry/breakpoint-only
 /// possible here, since loads/stores are the only emitters that ever call
 /// this (§the interpreter's `finish_status` doc comment: "dispatches to
@@ -3556,10 +3586,7 @@ fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mas
 /// "no fault" path) if status was `0` — callers continue emitting there.
 /// Must be called with `builder` positioned in the block holding the memory
 /// op just emitted.
-fn emit_check_mem_exc(ctx: &mut EmitCtx) {
-    let mem = MemFlagsData::trusted();
-    let exc_off = ir::immediates::Offset32::new(core_offset_of_jit_mem_exc());
-    let exc = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, exc_off);
+fn emit_check_mem_status(ctx: &mut EmitCtx, exc: Value) {
     let zero = ctx.builder.ins().iconst(ir::types::I32, 0);
     let has_status = ctx.builder.ins().icmp(IntCC::NotEqual, exc, zero);
 
@@ -7679,8 +7706,9 @@ fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
     let imm = field_imm16_sext(ctx.builder, ctx.raw);
     let vaddr = ctx.builder.ins().iadd(base, imm);
 
+    // emit_mem_read checks the status itself and leaves the builder in the
+    // no-fault continuation block.
     let loaded = emit_mem_read(ctx, vaddr, size);
-    emit_check_mem_exc(ctx); // leaves ctx.builder in the no-fault continuation
 
     // read*_fn always returns the value zero-extended to u64 on the Rust
     // side (MipsCore's read*_fn field doc comments) — narrow back to the
@@ -7748,7 +7776,6 @@ fn emit_lwl_ldl(ctx: &mut EmitCtx, size: MemSize) {
     let byte_offset = ctx.builder.ins().band_imm_s(vaddr, align_mask);
 
     let loaded = emit_mem_read(ctx, aligned_addr, size);
-    emit_check_mem_exc(ctx);
 
     let ity = size.ir_type();
     let mem_val = if size == MemSize::B8 { loaded } else { ctx.builder.ins().ireduce(ity, loaded) };
@@ -7788,7 +7815,6 @@ fn emit_lwr_ldr(ctx: &mut EmitCtx, size: MemSize) {
     let byte_offset = ctx.builder.ins().band_imm_s(vaddr, align_mask);
 
     let loaded = emit_mem_read(ctx, aligned_addr, size);
-    emit_check_mem_exc(ctx);
 
     let ity = size.ir_type();
     let mem_val = if size == MemSize::B8 { loaded } else { ctx.builder.ins().ireduce(ity, loaded) };
@@ -7840,8 +7866,9 @@ fn emit_store(ctx: &mut EmitCtx, size: MemSize) {
     // `size`, not `ireduce`d to the store's real width here.
     let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
 
+    // emit_mem_write checks its own status and leaves the builder in the
+    // no-fault continuation block.
     emit_mem_write(ctx, vaddr, rt_val, size);
-    emit_check_mem_exc(ctx);
 }
 
 fn emit_sb(ctx: &mut EmitCtx) {
@@ -7909,8 +7936,8 @@ fn emit_swl_swr(ctx: &mut EmitCtx, is_left: bool) {
     let val64 = ctx.builder.ins().ishl(word_val64, dw_shift64);
     let mask64 = ctx.builder.ins().ishl(word_mask64, dw_shift64);
 
-    emit_mem_write_masked(ctx, aligned8, val64, mask64);
-    emit_check_mem_exc(ctx);
+    let status = emit_mem_write_masked(ctx, aligned8, val64, mask64);
+    emit_check_mem_status(ctx, status);
 }
 
 fn emit_swl(ctx: &mut EmitCtx) {
@@ -7949,8 +7976,8 @@ fn emit_sdl_sdr(ctx: &mut EmitCtx, is_left: bool) {
     };
 
     let aligned8 = ctx.builder.ins().band_imm_s(vaddr, !7i64);
-    emit_mem_write_masked(ctx, aligned8, val, mask);
-    emit_check_mem_exc(ctx);
+    let status = emit_mem_write_masked(ctx, aligned8, val, mask);
+    emit_check_mem_status(ctx, status);
 }
 
 fn emit_sdl(ctx: &mut EmitCtx) {
@@ -7975,7 +8002,6 @@ fn emit_lwc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let vaddr = ctx.builder.ins().iadd(base, imm);
 
     let loaded = emit_mem_read(ctx, vaddr, MemSize::B4);
-    emit_check_mem_exc(ctx);
 
     let value_32 = ctx.builder.ins().ireduce(ir::types::I32, loaded);
     emit_write_fpr_w(ctx, field_rt(ctx.raw), value_32, fr_mode);
@@ -7989,7 +8015,6 @@ fn emit_ldc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let vaddr = ctx.builder.ins().iadd(base, imm);
 
     let loaded = emit_mem_read(ctx, vaddr, MemSize::B8);
-    emit_check_mem_exc(ctx);
 
     emit_write_fpr_l(ctx, field_rt(ctx.raw), loaded, fr_mode);
 }
@@ -8006,7 +8031,6 @@ fn emit_swc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     // comment on why (ABI upper-bits-undefined gotcha, same as emit_store).
     let value_64 = ctx.builder.ins().uextend(ir::types::I64, value_32);
     emit_mem_write(ctx, vaddr, value_64, MemSize::B4);
-    emit_check_mem_exc(ctx);
 }
 
 /// SDC1 ft, imm(rs): store FPR `ft`'s full 64 bits to memory. Mirrors
@@ -8018,7 +8042,6 @@ fn emit_sdc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
     let value_64 = emit_read_fpr_l(ctx, field_rt(ctx.raw), fr_mode);
     emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
-    emit_check_mem_exc(ctx);
 }
 
 /// MOVZ rd, rs, rt: rd = rs if rt == 0 (no-op otherwise). Mirrors

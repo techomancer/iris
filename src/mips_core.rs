@@ -177,6 +177,34 @@ impl CyclesPtr {
 /// `repr(Rust)` does not guarantee. Offsets must be computed via
 /// `std::mem::offset_of!` at codegen time, never hardcoded — cfg-gated fields are
 /// still fine, they just shift the layout deterministically per build.
+/// Return value of the JIT read hooks (`MipsCore::read{8,16,32,64}_fn`):
+/// the loaded value and its status, returned together **in registers**.
+///
+/// `#[repr(C)]` with two INTEGER-class fields totalling 16 bytes, which the
+/// x86-64 SysV ABI returns in `%rax:%rdx` — no hidden `sret` pointer, no
+/// memory traffic. (Verified in disassembly; if this struct ever grows past
+/// two eightbytes or gains a non-INTEGER field, it silently becomes an sret
+/// return and the whole point is lost.)
+///
+/// This replaced a `MipsCore::jit_mem_exc` scratch field. Passing status
+/// through memory meant every guest load paid a store and a reload: the
+/// callout wrote the field, the *inline* fast path had to write
+/// `EXEC_COMPLETE` to it as well (otherwise the check would see a stale fault
+/// from some earlier access), and the check then loaded it right back.
+/// Returning it in a register lets the value ride the fast/slow join as a
+/// plain block parameter instead.
+///
+/// `status` is `EXEC_COMPLETE` (0) on success, or the fault's `ExecStatus`
+/// (`EXEC_IS_EXCEPTION` set for a real exception). Compiled code must check
+/// it before trusting `val`.
+#[cfg(feature = "jitv2")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct JitReadResult {
+    pub val: u64,
+    pub status: u32,
+}
+
 #[repr(C)]
 pub struct MipsCore {
     /// Interrupt-pending word and instruction/cycle counter — the two
@@ -355,25 +383,28 @@ pub struct MipsCore {
     /// faulting) — see `codegen::emit_fpu_cvt_to_int_call`'s history.
     /// Read wrappers: return the loaded value (zero-extended to u64 for
     /// sub-64-bit widths, matching `MipsExecutor::read_data`'s own
-    /// convention), and set `jit_mem_exc` to `EXEC_COMPLETE` (0) on success
-    /// or the fault's `ExecStatus` (`EXEC_IS_EXCEPTION` bit set) otherwise —
-    /// compiled code must check `jit_mem_exc` after every call before
-    /// trusting the returned value. A single reusable field rather than an
-    /// out-param: exactly one memory op is ever in flight per compiled unit
-    /// before the check, so nothing aliases, and this avoids a Cranelift
-    /// stack-slot alloca per access.
+    /// convention) *and* the status, together, in registers — see
+    /// [`JitReadResult`].
+    ///
+    /// The status used to travel through the `jit_mem_exc` field instead.
+    /// That cost a store and a reload on every load: the callout stored it,
+    /// the inline fast path had to store `EXEC_COMPLETE` explicitly (or a
+    /// stale fault from an earlier access would be picked up), and
+    /// `emit_check_mem_exc` loaded it straight back — a store-to-load
+    /// round-trip through memory on the hot path of every single guest load.
     #[cfg(feature = "jitv2")]
-    pub read8_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    pub read8_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
     #[cfg(feature = "jitv2")]
-    pub read16_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    pub read16_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
     #[cfg(feature = "jitv2")]
-    pub read32_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    pub read32_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
     #[cfg(feature = "jitv2")]
-    pub read64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> u64,
+    pub read64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
     /// Write wrappers: return `EXEC_COMPLETE` (0) on success or the fault's
-    /// `ExecStatus` otherwise — the return value here doubles as
-    /// `jit_mem_exc`'s value (also mirrored into the field for symmetry with
-    /// the read path, so compiled code can use one check helper for both).
+    /// `ExecStatus` otherwise, in `%eax` — compiled code consumes the return
+    /// value directly, exactly like the read path's `status`. Neither path
+    /// routes status through memory (there used to be a `jit_mem_exc` field;
+    /// see `JitReadResult`).
     ///
     /// The value parameter is `u64` for every width, not `u8`/`u16`/`u32` —
     /// deliberately: the x86-64 SysV C ABI does not guarantee a sub-word
@@ -489,11 +520,6 @@ pub struct MipsCore {
     /// panics if ever reached without `install_jit_hooks`.
     #[cfg(all(feature = "jitv2", feature = "developer"))]
     pub dev_trace_bp_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u32, u32) -> u32,
-    /// Scratch: exception status from the most recent `read*_fn`/`write*_fn`
-    /// call (`EXEC_COMPLETE` i.e. 0 = no fault). See the read-wrapper fields'
-    /// doc comment above for the full contract.
-    #[cfg(feature = "jitv2")]
-    pub jit_mem_exc: u32,
     /// Reprogram the host FPU rounding mode, mirroring
     /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
     /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
@@ -932,7 +958,7 @@ impl NanoTlbEntry {
 /// `MipsExecutor::install_jit_hooks` runs. Panics — compiled code must never
 /// be dispatched against a core whose hooks aren't installed yet.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_hooks_not_installed_read(_ctx: *mut core::ffi::c_void, _va: u64) -> u64 {
+unsafe extern "C" fn jit_hooks_not_installed_read(_ctx: *mut core::ffi::c_void, _va: u64) -> JitReadResult {
     panic!("jitv2: read hook called before MipsExecutor::install_jit_hooks");
 }
 #[cfg(feature = "jitv2")]
@@ -1086,7 +1112,6 @@ impl MipsCore {
             #[cfg(all(feature = "jitv2", feature = "developer"))]
             dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
             #[cfg(feature = "jitv2")]
-            jit_mem_exc: 0,
             #[cfg(feature = "jitv2")]
             fpu_set_mode_fn: jit_hooks_not_installed_fpu_set_mode,
             #[cfg(feature = "jitv2")]
