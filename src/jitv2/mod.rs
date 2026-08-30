@@ -46,6 +46,20 @@ mod zz_corpus {
         Codegen::set_opt_level_speed(speed);
         println!("OPTLEVEL speed={}", speed);
         let names = std::fs::read_to_string(&list).expect("list file");
+        // A real, hook-installed core for the constants to point at. Leaked
+        // deliberately: compiled code bakes its address, so it must outlive
+        // every region this test compiles.
+        let consts = {
+            use crate::mips_core::MipsCore;
+            let core: &'static mut MipsCore = Box::leak(Box::new(MipsCore::new()));
+            // The hook fields still hold their not-installed panic sentinels,
+            // which is fine — nothing here *runs* the compiled code, and the
+            // sentinels are real function addresses, so the emitted shape
+            // (baked immediate vs load) is identical to production.
+            crate::jitv2::codegen::JitConsts {
+                core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
+            }
+        };
         let mut total: u64 = 0;
         let mut n_ok = 0u64;
         let mut n_decl = 0u64;
@@ -69,6 +83,12 @@ mod zz_corpus {
             if !ok { continue; }
             let mut ins = *walked;
             let mut cg = Codegen::new();
+            // Stamp the same compile-time constants a live worker would get,
+            // so this measures the code the emulator actually runs. Without
+            // it `hook_addr` returns `None` and every callee falls back to a
+            // register load — which silently made this benchmark blind to the
+            // whole constant-baking change.
+            cg.jit_consts = consts;
             let f: Option<JitFn> = cg.compile_region(&mut ins, off, true, false);
             if f.is_some() { total += cg.last_code_size() as u64; n_ok += 1; }
             else { n_decl += 1; }

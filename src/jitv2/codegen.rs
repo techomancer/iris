@@ -170,6 +170,10 @@ pub struct Codegen {
 struct EmitCtx<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut dyn cranelift_module::Module,
+    /// Compile-time constants for this core — lets `emit_hook_callee` bake
+    /// call targets instead of loading them. Copied (it is `Copy` and two
+    /// words) rather than borrowed, so it doesn't fight `builder`'s `&mut`.
+    jit_consts: JitConsts,
     core_ptr: Value,
     raw: u32,
     word: WordOffset,
@@ -704,6 +708,8 @@ impl Codegen {
         builder.ins().jump(entry_word_block, &[]);
         builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
 
+        // Copy out of `self` before the module is mutably borrowed below.
+        let jit_consts = self.jit_consts;
         // Shared exit-to-interpreter block (see BlockSkeleton::exit_block's
         // doc comment). Params: (core_ptr, word_offset, status). core_ptr
         // must be its own block param — not the entry_block value captured
@@ -720,7 +726,7 @@ impl Codegen {
         let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
         let exit_status_param = builder.append_block_param(exit_block, ir::types::I32);
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param, exit_status_param);
+        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param);
         // Not sealed: predecessors are every bail site across the whole
         // function, established incrementally as later passes emit them.
 
@@ -732,7 +738,7 @@ impl Codegen {
         let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
         let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, call_core_ptr, call_status_param);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param);
 
         let exception_other_word_block = builder.create_block();
         let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
@@ -897,6 +903,7 @@ impl Codegen {
         page: *mut crate::jitv2::PhysicalCodePage,
     ) -> Option<cranelift_module::FuncId> {
         let dc_geometry = self.dc_geometry;
+        let jit_consts = self.jit_consts;
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
@@ -1062,7 +1069,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1119,7 +1126,7 @@ impl Codegen {
                 builder.switch_to_block(stub);
                 let raw = instrs[w as usize].raw;
                 let mut unused_cycles_pending = 0u32;
-                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit_dev_trace_bp(&mut trace_ctx, origin);
                 builder.ins().jump(real_target, &[]);
                 builder.seal_block(stub);
@@ -1139,11 +1146,11 @@ impl Codegen {
         builder.ins().return_(&[fallback_status]);
 
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, exit_core_ptr, word_offset_param, exit_status_param);
+        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param);
         // Left unsealed until every bail site below has been emitted.
 
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, call_core_ptr, call_status_param);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param);
 
         builder.switch_to_block(exception_other_word_block);
         emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
@@ -1193,7 +1200,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -1731,6 +1738,7 @@ impl Codegen {
         skip_entry_preamble: bool,
     ) -> Option<crate::jitv2::JitFn> {
         let dc_geometry = self.dc_geometry;
+        let jit_consts = self.jit_consts;
         instrs[entry_word as usize].is_entry_point = true;
         let has_fpu = instrs_linear(instrs).any(|i| crate::jitv2::analyzer::is_fpu_instruction(i.raw));
         // No real PhysicalCodePage available at this API's call sites
@@ -2120,8 +2128,7 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
     let ptr_ty = ctx.module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_kill_entry_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_kill_entry_fn());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -2187,8 +2194,7 @@ fn emit_interp_fallback_exit(ctx: &mut EmitCtx) {
     let ptr_ty = ctx.module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_interp_fallback_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_interp_fallback_fn());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -2259,8 +2265,7 @@ fn emit_interp_fallback_head(
     let expected_next = ctx.builder.ins().iadd_imm_s(own_pc, 4);
 
     // (2) call core.interp_fallback_fn(core) -> ExecStatus.
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_interp_fallback_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_interp_fallback_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
@@ -2374,8 +2379,7 @@ fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
     let raw_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
     let origin_val = ctx.builder.ins().iconst(ir::types::I32, origin as i64);
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_dev_trace_bp_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_dev_trace_bp_fn());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty));         // core_ptr
@@ -2454,8 +2458,7 @@ fn emit_lockstep_step(ctx: &mut EmitCtx, trust_live: bool) {
     // stays I8, it's real memory, not a call argument).
     let bd_val = ctx.builder.ins().iconst(ir::types::I32, bd_arg as i64);
     let raw_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_step_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_lockstep_step_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty));         // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // pc
@@ -2479,8 +2482,7 @@ fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_lockstep_compare_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
@@ -2559,8 +2561,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_lockstep_compare_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
@@ -2619,7 +2620,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
 /// whatever this function already wrote for real. A preamble bail (nothing
 /// staged this dispatch) is a harmless no-op, same as every other lockstep
 /// compare call.
-fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, core_ptr: Value, word_offset: Value, status: Value) {
+fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, consts: &JitConsts, core_ptr: Value, word_offset: Value, status: Value) {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
@@ -2642,8 +2643,8 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
     #[cfg(feature = "jitv2_lockstep")]
     {
         let ptr_ty = module.target_config().pointer_type();
-        let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
-        let callee = builder.ins().load(ptr_ty, mem, core_ptr, fn_off);
+        let callee = emit_hook_callee_raw(builder, consts, core_ptr, ptr_ty,
+                                          core_offset_of_lockstep_compare_fn());
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
         sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
@@ -3349,9 +3350,97 @@ impl JitConsts {
     pub fn core_addr(&self) -> Option<usize> {
         self.core.map(|c| c.get())
     }
+
+    /// Read the hook function pointer stored at `field_offset` in the core,
+    /// for baking as a call target instead of loading it at run time.
+    ///
+    /// `None` when no core has been published (an un-stamped `Codegen`), in
+    /// which case callers keep emitting the load — always correct, just not
+    /// faster.
+    ///
+    /// # Why this read is sound
+    /// `install_jit_hooks` has already run by the time a core is published
+    /// here — it is what publishes it — so every hook field holds its final
+    /// value. The compile worker reads it from another thread, but nothing
+    /// ever writes these fields again, so there is no race and no torn read,
+    /// and the pointer stays valid for the life of the process.
+    fn hook_addr(&self, field_offset: i32) -> Option<i64> {
+        // Baking call targets as immediates is currently a LOSS — see this
+        // method's callers and rules/jitv2/jit-compile-time-constants.md.
+        // Cranelift rematerializes the constant at every call site rather
+        // than hoisting it (504 copies of one address in a single real
+        // region), costing +13.7% code. Gated off; flip via IRIS_BAKE_HOOKS=1
+        // to re-measure if a future Cranelift changes that.
+        if !bake_hooks_enabled() { return None; }
+        let core = self.core_addr()?;
+        // SAFETY: see the doc comment — `core` is a live `MipsCore` with
+        // final hook fields, and `field_offset` came from `offset_of!` on
+        // that same type.
+        let v = unsafe {
+            ((core as *const u8).offset(field_offset as isize) as *const usize).read()
+        };
+        debug_assert!(
+            v != 0,
+            "jitv2: hook at core+{field_offset:#x} is null — install_jit_hooks \
+             must run before anything is compiled"
+        );
+        Some(v as i64)
+    }
 }
 
-/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps./// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and
+/// Materialize a JIT->Rust hook's address as a call target.
+///
+/// Bakes the pointer as an immediate when a core has been published,
+/// otherwise falls back to loading it from `MipsCore` at `field_offset`.
+///
+/// Baking is a win *specifically for call targets*, and measurably so: a call
+/// operand has to reach a register anyway, so Cranelift hoists the constant
+/// once per function and reuses it (`movabsq $addr, %rbx` then N x
+/// `call *%rbx`), eliminating the per-call load. Measured on 40 calls:
+/// 1137 -> 916 bytes, 40 loads -> 1 `movabsq`.
+///
+/// This does **not** generalize to data addresses. For a base only ever used
+/// as `base + offset`, Cranelift folds each offset into its own 64-bit
+/// constant and rematerializes per use — 640 bytes versus 240 for the same 40
+/// accesses through a register base. Guest registers and cache pointers
+/// therefore stay register-relative.
+fn emit_hook_callee(ctx: &mut EmitCtx, field_offset: i32) -> Value {
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    match ctx.jit_consts.hook_addr(field_offset) {
+        Some(addr) => ctx.builder.ins().iconst(ptr_ty, addr),
+        None => {
+            let off = ir::immediates::Offset32::new(field_offset);
+            ctx.builder.ins().load(ptr_ty, MemFlagsData::trusted(), ctx.core_ptr, off)
+        }
+    }
+}
+
+/// Opt-in switch for baking hook addresses as call-target immediates.
+/// Off by default: measured +13.7% code on real regions (see `hook_addr`).
+fn bake_hooks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_BAKE_HOOKS").is_some())
+}
+
+/// `emit_hook_callee` for the shared blocks, which are built with a bare
+/// `FunctionBuilder` and have no `EmitCtx` to carry the constants.
+fn emit_hook_callee_raw(
+    builder: &mut FunctionBuilder,
+    consts: &JitConsts,
+    core_ptr: Value,
+    ptr_ty: ir::Type,
+    field_offset: i32,
+) -> Value {
+    match consts.hook_addr(field_offset) {
+        Some(addr) => builder.ins().iconst(ptr_ty, addr),
+        None => {
+            let off = ir::immediates::Offset32::new(field_offset);
+            builder.ins().load(ptr_ty, MemFlagsData::trusted(), core_ptr, off)
+        }
+    }
+}
+
+/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and
 /// cached — `compile_region` consults it per region, and this keeps that to
 /// an atomic load rather than a `getenv` walk.
 fn jit_disasm_enabled() -> bool {
@@ -3381,6 +3470,12 @@ pub const CALLOUT_CORE_BIAS: i64 = 4;
 /// live across the call, and one SSA value cannot satisfy both without
 /// regalloc2 hitting its 2-split cap and spilling at every use.
 fn callout_core_arg(ctx: &mut EmitCtx) -> Value {
+    // Deliberately derived from the base-pointer register, not baked as an
+    // immediate — even though the core address *is* a compile-time constant
+    // (`JitConsts`). Measured on 500 real corpus pages: baking it costs
+    // +3.7% code (3,925,717 -> 4,070,123), because Cranelift rematerializes
+    // the constant at every call site — 617 x 10-byte `movabsq` replacing
+    // 617 x 4-byte `leaq`. See rules/jitv2/jit-compile-time-constants.md.
     ctx.builder.ins().iadd_imm_s(ctx.core_ptr, CALLOUT_CORE_BIAS)
 }
 
@@ -3390,8 +3485,7 @@ fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> (Val
     let ptr_ty = ctx.module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(size.read_fn_offset());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, size.read_fn_offset());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -3575,8 +3669,7 @@ fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: M
     let ptr_ty = ctx.module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(size.write_fn_offset());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, size.write_fn_offset());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -3602,8 +3695,7 @@ fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mas
     let ptr_ty = ctx.module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_write64_masked_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_write64_masked_fn());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -3742,8 +3834,7 @@ fn emit_fpu_set_mode(ctx: &mut EmitCtx, rm: Value) {
     let ptr_ty = ctx.module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_set_mode_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_fpu_set_mode_fn());
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -4459,6 +4550,7 @@ fn emit_fpu_arith_flags_sqrt_d(ctx: &mut EmitCtx, fs_bits: Value) -> Value {
 fn emit_exception_call_block_body(
     module: &mut dyn cranelift_module::Module,
     builder: &mut FunctionBuilder,
+    consts: &JitConsts,
     core_ptr: Value,
     status: Value,
 ) {
@@ -4466,8 +4558,8 @@ fn emit_exception_call_block_body(
     let ptr_ty = module.target_config().pointer_type();
 
 
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_handle_exception_fn());
-    let callee = builder.ins().load(ptr_ty, mem, core_ptr, fn_off);
+    let callee = emit_hook_callee_raw(builder, consts, core_ptr, ptr_ty,
+                                      core_offset_of_handle_exception_fn());
 
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
@@ -5638,8 +5730,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         ctx.builder.ins().store(mem, zero8, ctx.core_ptr, flag_off);
 
         let ptr_ty = ctx.module.target_config().pointer_type();
-        let fn_off = ir::immediates::Offset32::new(core_offset_of_lockstep_compare_fn());
-        let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+        let callee = emit_hook_callee(ctx, core_offset_of_lockstep_compare_fn());
         let mut sig = ctx.module.make_signature();
         sig.params.push(AbiParam::new(ptr_ty));
         sig.returns.push(AbiParam::new(ir::types::I32));
@@ -6512,8 +6603,7 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     // `core.fpr` was simply left untouched, surfacing as a `jitv2_lockstep`
     // divergence where the JIT's CVT/ROUND/TRUNC/CEIL/FLOOR result register
     // never updated. One pointer for every callout removes that choice.
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_to_int_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_fpu_cvt_to_int_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(i32t)); // fs_reg
@@ -6551,8 +6641,7 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
 
     // arg 0 is `ctx.core_ptr`; the helper recovers its executor via
     // `exec_from_core`. See `emit_fcvt_to_int`'s matching comment.
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_int_to_float_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_fpu_cvt_int_to_float_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty));
     sig.params.push(AbiParam::new(i32t));
@@ -6606,8 +6695,7 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 
     // arg 0 is `ctx.core_ptr`; the helper recovers its executor via
     // `exec_from_core`. See `emit_fcvt_to_int`'s matching comment.
-    let fn_off = ir::immediates::Offset32::new(core_offset_of_fpu_cvt_d_to_s_fn());
-    let callee = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr, fn_off);
+    let callee = emit_hook_callee(ctx, core_offset_of_fpu_cvt_d_to_s_fn());
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty));
     sig.params.push(AbiParam::new(i32t));
@@ -8642,7 +8730,11 @@ mod tests {
                 // function's doc comment) — never touches cycles bookkeeping.
                 let mut unused_cycles_pending = 0u32;
                 let dc_geometry = crate::mips_cache_v2::JitDcGeometry::unsupported();
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                // This harness compiles against no real core, so hook targets
+                // must keep coming from `core_ptr` loads rather than being
+                // baked — `JitConsts::default()` is exactly that fallback.
+                let jit_consts = JitConsts::default();
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -8651,12 +8743,15 @@ mod tests {
             builder.ins().return_(&[status]);
             builder.seal_block(entry_block);
 
+            // Same harness-with-no-core rationale as the EmitCtx above:
+            // hooks stay register-loaded here.
+            let jit_consts = JitConsts::default();
             builder.switch_to_block(exit_block);
-            emit_exit_block_body(&mut builder, &mut codegen.module, exit_core_ptr, exit_word_offset, exit_status_param);
+            emit_exit_block_body(&mut builder, &mut codegen.module, &jit_consts, exit_core_ptr, exit_word_offset, exit_status_param);
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
 
             builder.switch_to_block(exception_call_block);
-            emit_exception_call_block_body(&mut codegen.module, &mut builder, call_core_ptr, call_status_param);
+            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param);
 
             builder.switch_to_block(exception_other_word_block);
             emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
