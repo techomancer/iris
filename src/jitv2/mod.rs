@@ -77,3 +77,94 @@ mod zz_corpus {
         println!("CORPUS ok={} declined={} total_bytes={}", n_ok, n_decl, total);
     }
 }
+
+/// Scratch: how does Cranelift lower a constant base address used many times?
+/// `IRIS_CONST_MODE` selects the shape. Answers whether a baked constant can
+/// ever match `disp(%reg)` density for struct-field access.
+#[cfg(test)]
+mod zz_constdedup {
+    #[test]
+    fn zz_const_dedup() {
+        use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData};
+        use cranelift_codegen::settings::{self, Configurable};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+        use cranelift_codegen::Context;
+        let Some(mode) = std::env::var_os("IRIS_CONST_MODE") else { return };
+        let mode = mode.to_string_lossy().to_string();
+
+        let mut fb = settings::builder();
+        fb.set("opt_level", "speed").unwrap();
+        let isa = cranelift_native::builder().unwrap()
+            .finish(settings::Flags::new(fb)).unwrap();
+
+        let mut ctx = Context::new();
+        ctx.func.signature.params.push(AbiParam::new(types::I64));
+        ctx.func.signature.returns.push(AbiParam::new(types::I64));
+        let mut bctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut bctx);
+            let blk = b.create_block();
+            b.append_block_params_for_function_params(blk);
+            b.switch_to_block(blk);
+            b.seal_block(blk);
+            const ADDR: i64 = 0x7f_abcd_1234_5678u64 as i64;
+            let mut acc = b.ins().iconst(types::I64, 0);
+            let shared = b.ins().iconst(types::I64, ADDR);
+            let param  = b.block_params(blk)[0];
+            for i in 0..40 {
+                let off = (i * 8) as i32;
+                let v = match mode.as_str() {
+                    // baked constant re-materialized per use
+                    "iconst"  => { let base = b.ins().iconst(types::I64, ADDR);
+                                   b.ins().load(types::I64, MemFlagsData::trusted(), base, off) }
+                    // one SSA constant, reused
+                    "shared"  => b.ins().load(types::I64, MemFlagsData::trusted(), shared, off),
+                    // const + explicit iadd_imm, then load at 0  (struct-ish)
+                    "addimm"  => { let p = b.ins().iadd_imm(shared, off as i64);
+                                   b.ins().load(types::I64, MemFlagsData::trusted(), p, 0) }
+                    // base arrives in a register (today's design)
+                    "param"   => b.ins().load(types::I64, MemFlagsData::trusted(), param, off),
+                    // const forced through an opaque use first
+                    "opaque"  => { let p = b.ins().bor_imm(shared, 0);
+                                   b.ins().load(types::I64, MemFlagsData::trusted(), p, off) }
+                    // Call through a baked function-pointer constant vs a
+                    // pointer loaded from the struct: the case where baking
+                    // should actually win (no load, no indirect predictor slot).
+                    "callconst" => {
+                        let mut sig = cranelift_codegen::ir::Signature::new(
+                            isa.default_call_conv());
+                        sig.params.push(AbiParam::new(types::I64));
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sr = b.import_signature(sig);
+                        let callee = b.ins().iconst(types::I64, ADDR);
+                        let c = b.ins().call_indirect(sr, callee, &[param]);
+                        b.inst_results(c)[0]
+                    }
+                    "callload" => {
+                        let mut sig = cranelift_codegen::ir::Signature::new(
+                            isa.default_call_conv());
+                        sig.params.push(AbiParam::new(types::I64));
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sr = b.import_signature(sig);
+                        let callee = b.ins().load(types::I64, MemFlagsData::trusted(), param, off);
+                        let c = b.ins().call_indirect(sr, callee, &[param]);
+                        b.inst_results(c)[0]
+                    }
+                    _ => panic!("bad mode"),
+                };
+                acc = b.ins().iadd(acc, v);
+            }
+            b.ins().return_(&[acc]);
+            b.finalize(isa.frontend_config());
+        }
+        ctx.set_disasm(true);
+        let _ = ctx.compile(&*isa, &mut Default::default()).unwrap();
+        let cc = ctx.compiled_code().unwrap();
+        let vc = cc.vcode.as_ref().unwrap();
+        let movabs = vc.lines().filter(|l| l.contains("movabsq")).count();
+        println!("CONSTMODE {:8} movabs={:3} size={}", mode, movabs, cc.code_info().total_size);
+        if std::env::var_os("IRIS_CONST_DUMP").is_some() {
+            for l in vc.lines().filter(|l| l.contains("call") || l.contains("movabs")).take(8) { println!("  | {}", l); }
+        }
+    }
+}

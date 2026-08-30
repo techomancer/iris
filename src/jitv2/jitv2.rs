@@ -1290,6 +1290,9 @@ pub struct Jitv2 {
     /// CPU (`install_jit_mem_ptrs`) and read by the async compile worker,
     /// which owns its `Codegen` by value and so cannot be stamped directly.
     pub dc_geometry: Mutex<crate::mips_cache_v2::JitDcGeometry>,
+    /// Compile-time constants for the one core these workers compile for —
+    /// see `codegen::JitConsts`. Same publication route as `dc_geometry`.
+    pub jit_consts: Mutex<crate::jitv2::codegen::JitConsts>,
     /// Event counters, read only under `j2 status` (dev-only display — see
     /// `JitStats`'s own doc comment for why the *fields themselves* still
     /// exist and get threaded through unconditionally: it's cheaper to carry
@@ -1337,6 +1340,7 @@ impl Jitv2 {
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
             dc_geometry: Mutex::new(crate::mips_cache_v2::JitDcGeometry::unsupported()),
+            jit_consts: Mutex::new(crate::jitv2::codegen::JitConsts::default()),
             stats: Arc::new(JitStats::default()),
         }
     }
@@ -2209,7 +2213,9 @@ impl CompileQueue {
         // `codegen` by value for its whole life, so the CPU cannot stamp it
         // directly — it goes through `Jitv2::dc_geometry` instead.
         if let Some(j) = jitv2.as_ref().and_then(|w| w.upgrade()) {
-            codegen.dc_geometry = *j.lock().dc_geometry.lock();
+            let g = j.lock();
+            codegen.dc_geometry = *g.dc_geometry.lock();
+            codegen.jit_consts = *g.jit_consts.lock();
         }
         // NOTE: no `emit_mem_helpers()` here. Attempt 2's shared-helper build
         // called `Module::finalize_definitions()` mid-session, which breaks the
@@ -4904,6 +4910,9 @@ pub struct Jitv2 {
     /// rather than written straight into `Codegen` because the worker owns
     /// that by value while compiling.
     pub dc_geometry: Mutex<crate::mips_cache_v2::JitDcGeometry>,
+    /// Compile-time constants for the one core these workers compile for —
+    /// see `codegen::JitConsts`. Same publication route as `dc_geometry`.
+    pub jit_consts: Mutex<crate::jitv2::codegen::JitConsts>,
     /// Event counters, read only under `j2 status` (dev-only display — see
     /// `JitStats`'s own doc comment for why the *fields themselves* still
     /// exist and get threaded through unconditionally: it's cheaper to carry
@@ -4961,6 +4970,7 @@ impl Jitv2 {
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
             dc_geometry: Mutex::new(crate::mips_cache_v2::JitDcGeometry::unsupported()),
+            jit_consts: Mutex::new(crate::jitv2::codegen::JitConsts::default()),
             stats: Arc::new(JitStats::default()),
         }
     }
@@ -6013,7 +6023,9 @@ impl CompileQueue {
         // life, so the CPU cannot stamp it directly — it goes through
         // `Jitv2::dc_geometry` instead.
         if let Some(j) = jitv2.as_ref().and_then(|w| w.upgrade()) {
-            codegen.dc_geometry = *j.lock().dc_geometry.lock();
+            let g = j.lock();
+            codegen.dc_geometry = *g.dc_geometry.lock();
+            codegen.jit_consts = *g.jit_consts.lock();
         }
 
         let mut analyzer = crate::jitv2::analyzer::Analyzer::new();

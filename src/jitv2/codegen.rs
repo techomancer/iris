@@ -38,6 +38,10 @@ pub struct Codegen {
     /// means no inline path is emitted and every access calls out, which is
     /// always correct — see docs/jit-inline-memory.md §4.
     pub dc_geometry: crate::mips_cache_v2::JitDcGeometry,
+    /// Compile-time constants for this `Codegen`'s one core — see
+    /// [`JitConsts`]. Default (all `None`) means "load from memory as
+    /// before", which is always correct.
+    pub jit_consts: JitConsts,
     module: cranelift_jit::JITModule,
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
@@ -460,6 +464,7 @@ impl Codegen {
             // Off until the CPU publishes a real geometry; every access
             // calls out in the meantime, which is the pre-existing behaviour.
             dc_geometry: crate::mips_cache_v2::JitDcGeometry::unsupported(),
+            jit_consts: JitConsts::default(),
             #[cfg(feature = "developer")]
             last_code_size: 0,
             last_compile_ran_out_of_memory: false,
@@ -1621,10 +1626,17 @@ impl Codegen {
         // contention (workers' func_ranges ending up with wrong/overlapping
         // recorded ranges, so try_seal_ready's sealed results could never
         // match back to the FuncId that actually owned them).
-        // TEMP (perf investigation): IRIS_JIT_DISASM=1 dumps each compiled
-        // region's machine code to stderr. Cranelift only fills `vcode` when
-        // asked before compilation, so set the flag here.
-        let want_disasm = std::env::var_os("IRIS_JIT_DISASM").is_some();
+        // `IRIS_JIT_DISASM=1` dumps every compiled region's machine code to
+        // stdout — the tool for answering "what did codegen actually emit?"
+        // without guessing (see rules/jitv2/callout-arg0-is-core-ptr.md, where
+        // it found a 2152-reload spill storm that byte counts alone had
+        // mis-attributed). Cranelift only fills `CompiledCode::vcode` when
+        // asked *before* compiling, hence the flag here rather than at the
+        // dump site below.
+        //
+        // Zero cost when unset: one `var_os` per compiled region, off the
+        // guest's execution path entirely (this is the compile worker).
+        let want_disasm = jit_disasm_enabled();
         if want_disasm { self.ctx.set_disasm(true); }
         if let Err(e) = self.module.define_function(func_id, &mut self.ctx) {
             let is_oom = matches!(e, cranelift_module::ModuleError::Allocation { .. });
@@ -3293,6 +3305,58 @@ fn emit_mem_read_split(
     ctx.builder.switch_to_block(path.join_block);
     ctx.builder.seal_block(path.join_block);
     (val, status)
+}
+
+/// Values that are fixed for the life of the process by the time any region
+/// is compiled, so codegen can bake them into the instruction stream as
+/// immediates instead of loading them out of `MipsCore` at run time.
+///
+/// # Why these are constants
+///
+/// `MipsExecutor::install_jit_hooks` runs exactly once, when the machine is
+/// built, and `set_tcache_gen_window` (machine.rs) publishes the tcache
+/// windows *before the CPU thread starts* — a window that is closed before
+/// any compiled code exists. Nothing reassigns a hook pointer, a cache base,
+/// or the core's address afterwards. Compiled code currently reloads them on
+/// every use anyway: measured over one real corpus region, **608 of 1936**
+/// loads off the core base (31%) were re-reading a value that could not have
+/// changed — 503 of them the same `dev_trace_bp_fn` pointer.
+///
+/// # The constraint this creates
+///
+/// A `Codegen` carrying these is valid for **exactly one `MipsCore`**. Code
+/// compiled against one executor must never run against another. That is
+/// already effectively true (a compiled region addresses guest registers
+/// through a specific core), but baking constants makes a stale pairing
+/// actively wrong rather than merely surprising, so `core_ptr` is recorded
+/// here and checked on entry under `debug_assertions`.
+///
+/// Published by `install_jit_mem_ptrs` through `Jitv2::jit_consts`, and
+/// copied into each worker's own `Codegen` in `worker_loop` — the same route
+/// `dc_geometry` takes, and for the same reason (a worker owns its `Codegen`
+/// by value, so the CPU thread cannot stamp it directly).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JitConsts {
+    /// Address of the one `MipsCore` this `Codegen`'s output may run against.
+    /// `None` until `install_jit_mem_ptrs` publishes it — codegen falls back
+    /// to loading from memory, exactly as before, so an un-stamped `Codegen`
+    /// stays correct (just no faster).
+    pub core: Option<core::num::NonZeroUsize>,
+}
+
+impl JitConsts {
+    /// The core address, or `None` if nothing has been published yet.
+    pub fn core_addr(&self) -> Option<usize> {
+        self.core.map(|c| c.get())
+    }
+}
+
+/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps./// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and
+/// cached — `compile_region` consults it per region, and this keeps that to
+/// an atomic load rather than a `getenv` walk.
+fn jit_disasm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_JIT_DISASM").is_some())
 }
 
 /// Offset compiled code adds to the core pointer when passing it as a

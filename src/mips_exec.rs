@@ -2587,7 +2587,28 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let geom = self.cache.jit_dc_geometry();
         // Publish for the async compile worker, which owns its Codegen by
         // value and so cannot be stamped directly (see worker_loop).
-        *self.jitv2.lock().dc_geometry.lock() = geom;
+        let core_addr = &mut self.core as *mut MipsCore as usize;
+        {
+            let j = self.jitv2.lock();
+            *j.dc_geometry.lock() = geom;
+            // Everything codegen may bake as an immediate reaches its final
+            // value here — this method is the last thing that moves any of
+            // it (see `codegen::JitConsts`). Republished on every call so a
+            // tcache window remap keeps the constants honest.
+            let consts = crate::jitv2::codegen::JitConsts {
+                core: core::num::NonZeroUsize::new(core_addr),
+            };
+            *j.jit_consts.lock() = consts;
+            // The inline-compile path (`jitv2_compile_inline`) takes this
+            // `Codegen` directly rather than going through `worker_loop`, so
+            // it has to be stamped here too — it was built by `Jitv2::new`,
+            // before this core existed.
+            let mut cg_slot = j.codegen.lock();
+            if let Some(cg) = cg_slot.as_mut() {
+                cg.dc_geometry = geom;
+                cg.jit_consts = consts;
+            }
+        }
         if geom.supported {
             self.core.jit_dc_tags = self.cache.jit_dc_tags_ptr();
             self.core.jit_dc_data = self.cache.jit_dc_data_ptr();
