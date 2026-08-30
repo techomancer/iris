@@ -42,6 +42,20 @@ pub struct Codegen {
     /// [`JitConsts`]. Default (all `None`) means "load from memory as
     /// before", which is always correct.
     pub jit_consts: JitConsts,
+    /// Addresses of the shared memory-access helpers, indexed by
+    /// [`MemHelper::index`]. Emitted once into the arena's lowest range by
+    /// [`Codegen::emit_mem_helpers`] and force-sealed there, so every region
+    /// compiled afterwards can `call` them as a fixed address.
+    ///
+    /// `None` until helpers are built (or if building them failed), in which
+    /// case codegen falls back to the duplicated inline guard — always
+    /// correct, just larger.
+    ///
+    /// Discarded together with everything else on a `mega_flush`, so no
+    /// stale address can outlive the arena it points into.
+    /// Stored as `usize`, not `*const u8`: `Codegen` is moved to a compile
+    /// worker thread, and a raw pointer would make it `!Send`.
+    mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT],
     module: cranelift_jit::JITModule,
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
@@ -174,6 +188,10 @@ struct EmitCtx<'a, 'b> {
     /// call targets instead of loading them. Copied (it is `Copy` and two
     /// words) rather than borrowed, so it doesn't fight `builder`'s `&mut`.
     jit_consts: JitConsts,
+    /// Shared memory-helper addresses, copied from `Codegen::mem_helpers`.
+    /// All `None` when helpers are unbuilt or the toggle is off, in which
+    /// case every access inlines its guard exactly as before.
+    mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT],
     core_ptr: Value,
     raw: u32,
     word: WordOffset,
@@ -469,6 +487,10 @@ impl Codegen {
             // calls out in the meantime, which is the pre-existing behaviour.
             dc_geometry: crate::mips_cache_v2::JitDcGeometry::unsupported(),
             jit_consts: JitConsts::default(),
+            // Built by `emit_mem_helpers`, which the CPU triggers once
+            // `dc_geometry` is known (a fresh `Codegen` has none yet, so
+            // constructing here would always no-op).
+            mem_helpers: [None; MEM_HELPER_COUNT],
             #[cfg(feature = "developer")]
             last_code_size: 0,
             last_compile_ran_out_of_memory: false,
@@ -606,6 +628,13 @@ impl Codegen {
         #[cfg(feature = "developer")]
         { self.last_code_size = 0; }
         self.last_compile_ran_out_of_memory = false;
+        // Old helper addresses point into the arena that was just freed.
+        // Dropped here, but NOT rebuilt: a forced seal mprotects a whole host
+        // page, which is only safe when nothing else can still be
+        // bump-allocating into it (see `worker_loop`'s note on
+        // `handle_request`'s single-caller contract). The flush *leader*
+        // rebuilds them while every other worker is parked at the barrier.
+        self.mem_helpers = [None; MEM_HELPER_COUNT];
     }
 
     /// Number of functions compiled into this `Codegen`'s `JITModule` since
@@ -710,6 +739,7 @@ impl Codegen {
 
         // Copy out of `self` before the module is mutably borrowed below.
         let jit_consts = self.jit_consts;
+        let mem_helpers = self.mem_helpers;
         // Shared exit-to-interpreter block (see BlockSkeleton::exit_block's
         // doc comment). Params: (core_ptr, word_offset, status). core_ptr
         // must be its own block param — not the entry_block value captured
@@ -882,6 +912,253 @@ impl Codegen {
     /// correct (FR mode and the entry-skip contract are both properties of
     /// the *compile*, not of any one entry within it).
     ///
+    /// Emit every shared memory-access helper into the arena's lowest range
+    /// and force-seal it, once, before any region is compiled.
+    ///
+    /// # Why this ordering is the whole design
+    ///
+    /// Attempt 2 (`docs/jit-inline-memory.md` §9) built one helper and called
+    /// `Module::finalize_definitions()` to resolve its address **mid-session**.
+    /// That breaks the arena's deferred-sealing model — `sealed_up_to` is a
+    /// contiguous watermark — and sent every region into endless
+    /// recompilation: 304 MIPS -> 33.9, with the `func_id_counter` heartbeat
+    /// printing "10000 / 20000 functions compiled" that a healthy build never
+    /// prints. Merely *building* the helper caused it; calling it changed
+    /// nothing.
+    ///
+    /// Emitting helpers **first** avoids that entirely. They occupy the
+    /// arena's lowest addresses, so force-sealing that prefix is exactly the
+    /// contiguous-watermark operation the arena is built for, and every region
+    /// compiled afterwards sits above it and seals normally. `finalize_batch`
+    /// is the existing primitive that does this correctly — it finalizes and
+    /// force-seals through the reservation path — so this goes through it
+    /// rather than reaching for `finalize_definitions()` directly.
+    ///
+    /// Call at module construction and after every `mega_flush`, before any
+    /// region compiles. Idempotent-ish: re-running discards the old addresses
+    /// and rebuilds, which is what a flush wants (helpers and their callers
+    /// are thrown away together, so no stale address can survive).
+    ///
+    /// Failure is not fatal — an unbuilt helper leaves `mem_helpers[i] =
+    /// None` and codegen falls back to the duplicated inline guard.
+    pub fn emit_mem_helpers(&mut self) {
+        // Idempotent: callers invoke this whenever geometry might have
+        // arrived, which for a worker is every refresh. Rebuilding would
+        // leak a set of compiled functions per call *and* leave the old
+        // addresses live, so only build when there is nothing built.
+        if self.mem_helpers.iter().any(|h| h.is_some()) {
+            return;
+        }
+        if !self.dc_geometry.supported {
+            // No inline fast path on this cache, so a helper would have
+            // nothing to guard — every access calls out to Rust anyway.
+            return;
+        }
+        let mut built: Vec<(MemHelper, cranelift_module::FuncId)> = Vec::new();
+        let mut high_water = 0usize;
+        for helper in MemHelper::all() {
+            match self.build_mem_helper(helper) {
+                Some((id, end)) => {
+                    built.push((helper, id));
+                    high_water = high_water.max(end);
+                }
+                None => {
+                    #[cfg(feature = "developer")]
+                    eprintln!("jitv2: helper {helper:?} failed to compile; \
+                               that access shape keeps the inline guard");
+                }
+            }
+        }
+        if built.is_empty() {
+            return;
+        }
+        // Resolve addresses, then seal the prefix these helpers occupy.
+        // `finalize_definitions` is safe here specifically because this runs
+        // before any region has been compiled into this arena — the hazard
+        // it caused in attempt 2 (`docs/jit-inline-memory.md` §9) was calling
+        // it *mid-session*, with regions in flight.
+        if self.module.finalize_definitions().is_err() {
+            #[cfg(feature = "developer")]
+            eprintln!("jitv2: finalize_definitions failed for helper batch");
+            return;
+        }
+        for (helper, id) in &built {
+            let addr = self.module.get_finalized_function(*id) as usize;
+            self.mem_helpers[helper.index()] = core::num::NonZeroUsize::new(addr);
+        }
+        self.seal_handle.seal_prefix_no_publish(high_water);
+        #[cfg(feature = "developer")]
+        eprintln!("jitv2: built {} memory helpers, sealed prefix to {high_water}", built.len());
+    }
+
+    /// Compile one helper and reserve its seal-queue range, exactly as
+    /// `compile_region_uncommitted` does for a region. Returns its `FuncId`
+    /// for `emit_mem_helpers` to finalize as one batch.
+    ///
+    /// Signature, mirroring the design in `docs/jit-inline-memory.md` §11:
+    ///
+    /// * load  — `(core_biased: ptr, vaddr: i64, dst_off: i64) -> i32 status`
+    /// * store — `(core_biased: ptr, vaddr: i64, value: i64)    -> i32 status`
+    ///
+    /// A load writes its own result to `core + dst_off`, so the call site
+    /// needs no return value and no store of its own. `dst_off` is chosen at
+    /// compile time — for `rt == 0` the site passes the offset of
+    /// `MipsCore::gpr_scratch` instead of a real register, which keeps the
+    /// helper branchless while still performing the access (a load to r0 must
+    /// still fault and still fill the cache; only the write-back is inert).
+    fn build_mem_helper(&mut self, helper: MemHelper) -> Option<(cranelift_module::FuncId, usize)> {
+        // Own `Context`, not `self.ctx`: that one belongs to whatever region
+        // compile may be in flight, and clobbering it mid-compile corrupts
+        // the caller's function. Helpers are built once per arena, so the
+        // extra allocation is irrelevant.
+        let mut ctx = self.module.make_context();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        // Copy out before `self.module` is mutably borrowed by the builder.
+        let jit_consts = self.jit_consts;
+        let mem_helpers = self.mem_helpers;
+        let dc_geometry = self.dc_geometry;
+        let ptr_ty = self.module.target_config().pointer_type();
+        ctx.func.signature = self.module.make_signature();
+        ctx.func.signature.params.push(AbiParam::new(ptr_ty));        // core (biased)
+        ctx.func.signature.params.push(AbiParam::new(ir::types::I64)); // vaddr
+        ctx.func.signature.params.push(AbiParam::new(ir::types::I64)); // dst_off | value
+        ctx.func.signature.returns.push(AbiParam::new(ir::types::I32)); // status
+
+        {
+            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+
+            let core_biased = builder.block_params(entry)[0];
+            let vaddr = builder.block_params(entry)[1];
+            let third = builder.block_params(entry)[2];
+
+            // Undo the call-site bias once, here, so the rest of the helper
+            // addresses `MipsCore` at its true base — the same contract
+            // `mips_exec::core_from_arg` implements on the Rust side.
+            let core_ptr = builder.ins().iadd_imm_s(core_biased, -CALLOUT_CORE_BIAS);
+
+            // Reuse the region emitters wholesale by handing them a minimal
+            // `EmitCtx`. The guard only ever branches to its own
+            // slow/join blocks, so the exception/exit blocks an `EmitCtx`
+            // normally carries are never reached from here — a helper reports
+            // a fault by *returning* its status, and its caller runs the
+            // usual `emit_check_mem_status` at the call site.
+            let dead = builder.create_block();
+            let mut unused_cycles = 0u32;
+            let mut hctx = EmitCtx {
+                builder: &mut builder,
+                module: &mut self.module,
+                jit_consts,
+                // A helper must never call another helper — it *is* the
+                // implementation. All-None forces the inline guard here.
+                mem_helpers: [None; MEM_HELPER_COUNT],
+                core_ptr,
+                raw: 0,
+                word: 0,
+                dc_geometry,
+                bd: false,
+                trust_live_pc_bd_on_exc: true,
+                exit_block: dead,
+                exception_call_block: dead,
+                exception_entry_word_block: dead,
+                exception_other_word_block: dead,
+                cycles_pending: &mut unused_cycles,
+            };
+
+            let status = match helper {
+                MemHelper::Load { size, extend } => {
+                    let (val, status) = emit_mem_read_raw(&mut hctx, vaddr, size);
+                    // Extend here, in the helper, rather than at every call
+                    // site: `read*_fn` hands back a zero-extended u64 and a
+                    // signed load would otherwise have to `ireduce` +
+                    // `sextend` it back at the site. Baking the extension
+                    // into the helper's identity removes that entirely.
+                    let val = match (size, extend) {
+                        (MemSize::B8, _) => val,
+                        (_, LoadExtend::Zero) => val,
+                        (_, LoadExtend::Sign) => {
+                            let narrow = hctx.builder.ins().ireduce(size.ir_type(), val);
+                            hctx.builder.ins().sextend(ir::types::I64, narrow)
+                        }
+                    };
+                    // Write-back is the helper's job too, so the call site
+                    // needs no return value and no store of its own. `third`
+                    // is a byte offset into `MipsCore` chosen at compile time
+                    // — the real `gpr[rt]` slot, or `gpr_scratch` when
+                    // `rt == 0` (a load to r0 must still fault and still fill
+                    // the cache; only the write-back is inert).
+                    //
+                    // **Only on success.** A faulting load must leave `rt`
+                    // untouched: `exec_lw` and friends write the GPR inside
+                    // the `Ok` arm only, and the exception handler may resume
+                    // the instruction. Storing unconditionally would clobber
+                    // `rt` with the callout's zero placeholder on every TLB
+                    // miss — architecturally wrong and silently corrupting.
+                    let ok_block = hctx.builder.create_block();
+                    let done_block = hctx.builder.create_block();
+                    let faulted = hctx.builder.ins().icmp_imm_s(
+                        IntCC::NotEqual, status, EXEC_COMPLETE as i64);
+                    hctx.builder.ins().brif(faulted, done_block, &[], ok_block, &[]);
+
+                    hctx.builder.switch_to_block(ok_block);
+                    hctx.builder.seal_block(ok_block);
+                    let dst = hctx.builder.ins().iadd(core_ptr, third);
+                    hctx.builder.ins().store(MemFlagsData::trusted(), val, dst,
+                                             ir::immediates::Offset32::new(0));
+                    hctx.builder.ins().jump(done_block, &[]);
+
+                    hctx.builder.switch_to_block(done_block);
+                    hctx.builder.seal_block(done_block);
+                    status
+                }
+                MemHelper::Store { size } => emit_mem_write_raw(&mut hctx, vaddr, third, size),
+            };
+            builder.ins().return_(&[status]);
+            // The placeholder blocks were never branched to; seal so the
+            // verifier does not see an unsealed block.
+            builder.seal_block(dead);
+            builder.switch_to_block(dead);
+            let unreachable_status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+            builder.ins().return_(&[unreachable_status]);
+            builder.finalize(self.module.target_config());
+        }
+
+        let func_id = self.module
+            .declare_anonymous_function(&ctx.func.signature)
+            .ok()?;
+
+        if self.module.define_function(func_id, &mut ctx).is_err() {
+            #[cfg(feature = "developer")]
+            eprintln!("jitv2: define_function failed for helper {helper:?}");
+            return None;
+        }
+        // Deliberately NOT push_placeholder/func_ranges: helpers have nothing
+        // to publish (no `PhysicalCodePage`, no entry table — regions reach
+        // them by address). A seal-queue entry needs a real page, because
+        // every forced seal pops what it made ready and hands it to
+        // `comp::publish_all`, which does `unsafe { &*entry.page }`
+        // unconditionally. `emit_mem_helpers` seals their whole prefix
+        // directly instead, via `seal_prefix_no_publish`.
+        let Some(range) = self.seal_handle.take_last_allocation() else {
+            #[cfg(feature = "developer")]
+            eprintln!("jitv2: helper {helper:?} got no allocation range");
+            return None;
+        };
+        Some((func_id, range.1))
+    }
+
+    /// Address of a built helper, or `None` if it was never built or the
+    /// toggle is off (in which case callers inline the guard instead).
+    fn mem_helper_addr(&self, helper: MemHelper) -> Option<i64> {
+        if !mem_helpers_enabled() {
+            return None;
+        }
+        self.mem_helpers[helper.index()].map(|a| a.get() as i64)
+    }
+
     /// Compile a region into Cranelift IR and hand it to `define_function`,
     /// but do **not** finalize or return a callable pointer — the shared
     /// first half of `compile_region`'s (immediate) and `finalize_batch`'s
@@ -904,6 +1181,7 @@ impl Codegen {
     ) -> Option<cranelift_module::FuncId> {
         let dc_geometry = self.dc_geometry;
         let jit_consts = self.jit_consts;
+        let mem_helpers = self.mem_helpers;
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
@@ -1069,7 +1347,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1126,7 +1404,7 @@ impl Codegen {
                 builder.switch_to_block(stub);
                 let raw = instrs[w as usize].raw;
                 let mut unused_cycles_pending = 0u32;
-                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit_dev_trace_bp(&mut trace_ctx, origin);
                 builder.ins().jump(real_target, &[]);
                 builder.seal_block(stub);
@@ -1200,7 +1478,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -1739,6 +2017,7 @@ impl Codegen {
     ) -> Option<crate::jitv2::JitFn> {
         let dc_geometry = self.dc_geometry;
         let jit_consts = self.jit_consts;
+        let mem_helpers = self.mem_helpers;
         instrs[entry_word as usize].is_entry_point = true;
         let has_fpu = instrs_linear(instrs).any(|i| crate::jitv2::analyzer::is_fpu_instruction(i.raw));
         // No real PhysicalCodePage available at this API's call sites
@@ -2857,10 +3136,15 @@ fn core_offset_of_delay_slot_target() -> i32 { std::mem::offset_of!(MipsCore, de
 
 /// Memory access width, mirroring `MipsExecutor::read_data::<SIZE>`/
 /// `write_data::<SIZE>`'s const-generic `SIZE` parameter (bytes).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemSize { B1, B2, B4, B8 }
 
 impl MemSize {
+    /// Dense 0..4 ordinal, for indexing helper tables.
+    pub fn helper_ord(self) -> usize {
+        match self { MemSize::B1 => 0, MemSize::B2 => 1, MemSize::B4 => 2, MemSize::B8 => 3 }
+    }
+
     fn read_fn_offset(self) -> i32 {
         match self {
             MemSize::B1 => core_offset_of_read8_fn(),
@@ -3251,6 +3535,55 @@ fn swizzle_xor(size: MemSize) -> i64 {
     { match size { MemSize::B8 => 0, MemSize::B4 => 0, MemSize::B2 => 2, MemSize::B1 => 3 } }
 }
 
+impl<'a, 'b> EmitCtx<'a, 'b> {
+    /// Address of the shared helper for `helper`, or `None` to inline instead.
+    fn mem_helper_addr(&self, helper: MemHelper) -> Option<i64> {
+        if !mem_helpers_enabled() {
+            return None;
+        }
+        self.mem_helpers[helper.index()].map(|a| a.get() as i64)
+    }
+}
+
+/// Emit a call to a shared memory helper: `(core_biased, vaddr, third)`,
+/// returning its status. `third` is a destination byte offset for loads, or
+/// the value for stores.
+///
+/// `addr` is baked as an immediate — a call target is the one place a
+/// constant beats a load, because the operand has to reach a register anyway
+/// (see `rules/jitv2/`; measured 1137 -> 916 bytes on a 40-call microbench).
+fn emit_mem_helper_call(ctx: &mut EmitCtx, addr: i64, vaddr: Value, third: Value) -> Value {
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let callee = ctx.builder.ins().iconst(ptr_ty, addr);
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));         // core (biased)
+    sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
+    sig.params.push(AbiParam::new(ir::types::I64)); // dst_off | value
+    sig.returns.push(AbiParam::new(ir::types::I32)); // status
+    let sig_ref = ctx.builder.import_signature(sig);
+
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, third]);
+    ctx.builder.inst_results(call)[0]
+}
+
+/// Guard + data path for a load, returning `(value, status)` without checking
+/// the status. Split out of [`emit_mem_read`] so the shared helper
+/// (`build_mem_helper`) can reuse exactly the same emission and *return* the
+/// status to its caller rather than branching to an exception exit it does
+/// not have.
+fn emit_mem_read_raw(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> (Value, Value) {
+    if inline_mem_enabled() {
+        if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
+            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return emit_mem_read_split(ctx, vaddr, size, path);
+        }
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    emit_mem_read_callout(ctx, vaddr, size)
+}
+
 fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
     // Inline fast path: nutlb hit + L1-D tag hit (+ mapped region under
     // tcache) reads the host address directly, no callout. Returns None when
@@ -3261,18 +3594,7 @@ fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
     // the site — no extra blocks, so the caller's register allocation is
     // untouched — but the callee returns without entering `read_data` on the
     // ~82% of loads that hit.
-    let (val, status) = if inline_mem_enabled() {
-        if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
-            INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            emit_mem_read_split(ctx, vaddr, size, path)
-        } else {
-            INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            emit_mem_read_callout(ctx, vaddr, size)
-        }
-    } else {
-        INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        emit_mem_read_callout(ctx, vaddr, size)
-    };
+    let (val, status) = emit_mem_read_raw(ctx, vaddr, size);
     // The status is a live SSA value here, so the check reads a register
     // rather than reloading a MipsCore field.
     emit_check_mem_status(ctx, status);
@@ -3458,7 +3780,79 @@ fn emit_hook_callee_raw(
     }
 }
 
-/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and
+/// One shared memory-access helper: a compiled function holding the guard +
+/// data path for one (kind, size, extend) combination, called from every
+/// access site instead of duplicating ~45 IR instructions there.
+///
+/// Loads carry their extension in the *helper identity* rather than doing it
+/// at the call site. Today `read*_fn` always zero-extends to u64 and a signed
+/// load then undoes that (`ireduce` + `sextend`) — pure waste that exists only
+/// because the callee's contract is width-agnostic. A per-extend helper does
+/// the extension in the shift it is already performing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemHelper {
+    /// `(core, vaddr, dst_offset)` — loads, extends, stores to `core+dst_offset`.
+    Load { size: MemSize, extend: LoadExtend },
+    /// `(core, vaddr, value)` — stores.
+    Store { size: MemSize },
+}
+
+/// 4 sizes x 2 extends for loads, plus 4 sizes for stores.
+pub const MEM_HELPER_COUNT: usize = 12;
+
+impl MemHelper {
+    /// Dense index into `Codegen::mem_helpers`.
+    pub fn index(self) -> usize {
+        match self {
+            MemHelper::Load { size, extend } => {
+                size.helper_ord() * 2 + (extend == LoadExtend::Sign) as usize
+            }
+            MemHelper::Store { size } => 8 + size.helper_ord(),
+        }
+    }
+
+    /// Every helper, in index order — what `emit_mem_helpers` builds.
+    pub fn all() -> impl Iterator<Item = MemHelper> {
+        use MemSize::*;
+        const SIZES: [MemSize; 4] = [B1, B2, B4, B8];
+        SIZES.iter().flat_map(|&size| {
+            [
+                MemHelper::Load { size, extend: LoadExtend::Zero },
+                MemHelper::Load { size, extend: LoadExtend::Sign },
+            ]
+        }).chain(SIZES.iter().map(|&size| MemHelper::Store { size }))
+    }
+}
+
+/// Whether compiled code should call the shared helpers instead of inlining
+/// the guard at every access site.
+///
+/// Off by default until measured: §10 of `docs/jit-inline-memory.md` got its
+/// +7% MIPS / +27% DMIPS from *fully inlined* guards, and putting a call back
+/// in may give some of that up. §11's open question is exactly whether the
+/// helper is faster or merely smaller — so this stays a runtime toggle
+/// (`j2 helpers on|off`, effective on the next compile) rather than a
+/// hardcoded choice.
+static MEM_HELPERS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One-shot env override so a build can be A/B'd without a monitor command:
+/// `IRIS_MEM_HELPERS=1`.
+fn mem_helpers_env_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_MEM_HELPERS").is_some())
+}
+
+pub fn mem_helpers_enabled() -> bool {
+    MEM_HELPERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || mem_helpers_env_default()
+}
+
+pub fn set_mem_helpers_enabled(on: bool) {
+    MEM_HELPERS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and
 /// cached — `compile_region` consults it per region, and this keeps that to
 /// an atomic load rather than a `getenv` walk.
 fn jit_disasm_enabled() -> bool {
@@ -3540,19 +3934,22 @@ fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> (Val
 /// through memory.
 /// Emits the store and checks its status, leaving the builder in the
 /// no-fault continuation block. Callers must not check again.
-fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
-    let status = if inline_mem_enabled() {
+/// Guard + data path for a store, returning the status without checking it —
+/// the store counterpart to [`emit_mem_read_raw`], and reused by
+/// `build_mem_helper` for the same reason.
+fn emit_mem_write_raw(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) -> Value {
+    if inline_mem_enabled() {
         if let Some(path) = emit_inline_mem_guard::<true>(ctx, vaddr, size) {
             INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            emit_mem_write_split(ctx, vaddr, value, size, path)
-        } else {
-            INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            emit_mem_write_callout(ctx, vaddr, value, size)
+            return emit_mem_write_split(ctx, vaddr, value, size, path);
         }
-    } else {
-        INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        emit_mem_write_callout(ctx, vaddr, value, size)
-    };
+    }
+    INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    emit_mem_write_callout(ctx, vaddr, value, size)
+}
+
+fn emit_mem_write(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: MemSize) {
+    let status = emit_mem_write_raw(ctx, vaddr, value, size);
     emit_check_mem_status(ctx, status);
 }
 
@@ -7863,8 +8260,8 @@ fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PA
 /// How a loaded value's width is extended to fill the 64-bit GPR — mirrors
 /// each `exec_l*` handler's own post-load conversion (`value as iN as i64 as
 /// u64` for signed, `value as u64` for zero-extending/full-width loads).
-#[derive(Clone, Copy)]
-enum LoadExtend { Sign, Zero }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoadExtend { Sign, Zero }
 
 /// Shared body for every `rt, imm(rs)` load: address calc, `read*_fn` call,
 /// exception check, extend-and-write-back. `size` selects the hook/access
@@ -7875,6 +8272,25 @@ fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
     let imm = field_imm16_sext(ctx.builder, ctx.raw);
     let vaddr = ctx.builder.ins().iadd(base, imm);
+
+    // Shared-helper path: one call instead of ~50 inlined IR instructions.
+    // The helper does the guard, the load, the extension, and the write-back,
+    // so nothing is left here but the address math and the call.
+    if let Some(addr) = ctx.mem_helper_addr(MemHelper::Load { size, extend }) {
+        let rt = field_rt(ctx.raw);
+        // `rt == 0` gets the scratch slot: the access must still happen, but
+        // its result must not land in `gpr[0]`. Chosen here, at compile time,
+        // so the helper itself stays branchless.
+        let dst_off = if rt == 0 {
+            std::mem::offset_of!(MipsCore, gpr_scratch) as i64
+        } else {
+            core_offset_of_gpr(rt) as i64
+        };
+        let dst_off = ctx.builder.ins().iconst(ir::types::I64, dst_off);
+        let status = emit_mem_helper_call(ctx, addr, vaddr, dst_off);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
 
     // emit_mem_read checks the status itself and leaves the builder in the
     // no-fault continuation block.
@@ -8035,6 +8451,15 @@ fn emit_store(ctx: &mut EmitCtx, size: MemSize) {
     // on why `write*_fn`'s value parameter is always I64/u64 regardless of
     // `size`, not `ireduce`d to the store's real width here.
     let rt_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+
+    // Shared-helper path: one call instead of the inlined guard. Unlike a
+    // load there is no write-back to place, so the helper's whole job is
+    // guard + store, and its status routes exactly as the inline path's does.
+    if let Some(addr) = ctx.mem_helper_addr(MemHelper::Store { size }) {
+        let status = emit_mem_helper_call(ctx, addr, vaddr, rt_val);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
 
     // emit_mem_write checks its own status and leaves the builder in the
     // no-fault continuation block.
@@ -8752,7 +9177,8 @@ mod tests {
                 // must keep coming from `core_ptr` loads rather than being
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+            let mem_helpers = [None; MEM_HELPER_COUNT];
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -8764,6 +9190,7 @@ mod tests {
             // Same harness-with-no-core rationale as the EmitCtx above:
             // hooks stay register-loaded here.
             let jit_consts = JitConsts::default();
+            let mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT] = [None; MEM_HELPER_COUNT];
             builder.switch_to_block(exit_block);
             emit_exit_block_body(&mut builder, &mut codegen.module, &jit_consts, exit_core_ptr, exit_word_offset, exit_status_param);
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site

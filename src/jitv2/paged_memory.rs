@@ -702,6 +702,24 @@ impl SharedArena {
     /// whose `finalize()` call triggered it (`Codegen::seal_handle`) has no
     /// other way to learn the result, since `JITMemoryProvider::finalize`'s
     /// own trait signature returns nothing useful.
+    /// See `PagedArenaMemoryProvider::seal_prefix_no_publish`.
+    fn seal_prefix_no_publish(&mut self, end: usize) {
+        let page = region::page::size();
+        let page_rounded_end = align_up(end, page);
+        if page_rounded_end <= self.sealed_up_to {
+            return;
+        }
+        let seal_ptr = unsafe { self.ptr.add(self.sealed_up_to) };
+        let seal_len = page_rounded_end - self.sealed_up_to;
+        // Same source `try_seal_ready` uses — the value cranelift computed on
+        // the most recent real `finalize()`, defaulting to None if nothing has
+        // been finalized yet.
+        let bp = self.last_branch_protection.unwrap_or(BranchProtection::None);
+        set_readable_and_executable(seal_ptr, seal_len, bp);
+        self.sealed_up_to = page_rounded_end;
+        wasmtime_jit_icache_coherence::pipeline_flush_mt().expect("Failed pipeline flush");
+    }
+
     fn try_seal_ready(&mut self, force: bool) -> Vec<PublishInfo> {
         let branch_protection = self.last_branch_protection.unwrap_or(BranchProtection::None);
         // A straggler can arrive after the watermark has already passed it:
@@ -1000,6 +1018,26 @@ impl PagedArenaMemoryProvider {
     /// `BranchProtection` the trait's own `finalize()` call already recorded
     /// during this same `finalize_definitions()` call — no need to pass it
     /// again.
+    /// Seal `[0, end)` to RX without touching the seal queue.
+    ///
+    /// For code that must become executable but has **nothing to publish** —
+    /// the shared memory-access helpers, which are reached by address from
+    /// compiled regions rather than through any `PhysicalCodePage` entry
+    /// table. Routing them through `push_placeholder`/`patch_pending_publish`
+    /// would put entries with a null `page` into the queue, and every forced
+    /// seal pops whatever it makes ready and hands it to `publish_all`, which
+    /// does `unsafe { &*entry.page }` unconditionally.
+    ///
+    /// Only valid for a prefix of the arena that nothing else has allocated
+    /// into yet — i.e. immediately after construction or a flush, before any
+    /// region compiles. `sealed_up_to` is a contiguous watermark, so sealing
+    /// a prefix is exactly the operation it is built for; `allocate` already
+    /// skips `position` past `sealed_up_to`, so the next region lands above.
+    pub fn seal_prefix_no_publish(&mut self, end: usize) {
+        let mut inner = self.inner.lock();
+        inner.seal_prefix_no_publish(end);
+    }
+
     pub fn patch_pending_publish(&mut self, start: usize, end: usize, publish: PublishInfo, force: bool) -> Vec<PublishInfo> {
         debug_assert!(publish.jit_fn.is_some(), "patch_pending_publish's entry must carry a resolved JitFn");
         let mut inner = self.inner.lock();

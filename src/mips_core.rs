@@ -803,6 +803,26 @@ pub struct MipsCore {
     /// reaches fields by `offset_of!` at codegen time, so the offsets adjust
     /// themselves; only locality is at stake, and only for fields *after* it.
     pub nutlb: [[NuTlbEntry; NUM_NUTLB_ENTRIES]; 2],
+
+    /// Write-only landing slot for a load whose destination is `r0`.
+    ///
+    /// The shared memory helpers (`jitv2::codegen::MemHelper`) take their
+    /// destination as a byte offset into `MipsCore` and store the loaded
+    /// value there unconditionally — no branch, because the emitter knows
+    /// `rt` at compile time. For `rt == 0` it passes this offset instead of
+    /// `gpr[0]`.
+    ///
+    /// It cannot just target `gpr[0]`: `emit_read_gpr` reads r0 out of memory
+    /// like any other register rather than folding it to a constant zero, so
+    /// clobbering it would corrupt every later read of r0.
+    ///
+    /// The *load itself* still happens for `rt == 0` — it must still fault,
+    /// still hit the bus, still fill the cache. Only the write-back is inert.
+    ///
+    /// Placed after `nutlb` (which is deliberately last, see its doc comment)
+    /// so adding it shifts no existing field's `offset_of!`.
+    #[cfg(feature = "jitv2")]
+    pub gpr_scratch: u64,
 }
 
 /// A completed real memory access, captured for `jitv2_lockstep`'s
@@ -1183,6 +1203,8 @@ impl MipsCore {
             // 16 KiB of zeroes. `NuTlbEntry: Copy` so this is a const-promoted
             // memset, not 512 separate initializations.
             nutlb: [[NuTlbEntry::default(); NUM_NUTLB_ENTRIES]; 2],
+            #[cfg(feature = "jitv2")]
+            gpr_scratch: 0,
         };
         core.reset_registers(false);
         core

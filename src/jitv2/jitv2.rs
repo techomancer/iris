@@ -2217,6 +2217,25 @@ impl CompileQueue {
             codegen.dc_geometry = *g.dc_geometry.lock();
             codegen.jit_consts = *g.jit_consts.lock();
         }
+        // First worker to get here builds the shared helpers into the arena's
+        // lowest range. Startup only — the flush path rebuilds them from the
+        // leader while everyone else is parked (see `run_leader_flush`).
+        //
+        // Serialized on a process-wide latch rather than done per worker: a
+        // forced seal mprotects a whole host page to RX, which is only safe
+        // when nothing else can still be bump-allocating into it (see this
+        // function's own note on `handle_request`'s single-caller contract).
+        // Every other worker waits here until the winner is done, so nobody
+        // allocates into that page mid-seal.
+        {
+            static HELPERS_BUILT: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
+            let mut built = HELPERS_BUILT.lock();
+            if !*built {
+                codegen.emit_mem_helpers();
+                *built = true;
+            }
+        }
+
         // NOTE: no `emit_mem_helpers()` here. Attempt 2's shared-helper build
         // called `Module::finalize_definitions()` mid-session, which breaks the
         // arena's deferred sealing and sends every region into endless
@@ -2354,6 +2373,15 @@ impl CompileQueue {
                     ARENA_RESERVE_SIZE, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
+                // Build the shared memory helpers here and nowhere else.
+                // Every other worker is parked at the barrier and the fresh
+                // arena has had nothing else allocated into it, so this is
+                // the one moment a forced seal — which mprotects a whole
+                // host page to RX — cannot race another worker still
+                // bump-allocating into that page. Helpers land in the
+                // arena's lowest range; every region compiled afterwards
+                // sits above them and seals normally.
+                codegen.emit_mem_helpers();
                 {
                     let (mutex, cv) = &*barrier;
                     let mut state = mutex.lock();
@@ -6027,6 +6055,25 @@ impl CompileQueue {
             codegen.dc_geometry = *g.dc_geometry.lock();
             codegen.jit_consts = *g.jit_consts.lock();
         }
+        // First worker to get here builds the shared helpers into the arena's
+        // lowest range. Startup only — the flush path rebuilds them from the
+        // leader while everyone else is parked (see `run_leader_flush`).
+        //
+        // Serialized on a process-wide latch rather than done per worker: a
+        // forced seal mprotects a whole host page to RX, which is only safe
+        // when nothing else can still be bump-allocating into it (see this
+        // function's own note on `handle_request`'s single-caller contract).
+        // Every other worker waits here until the winner is done, so nobody
+        // allocates into that page mid-seal.
+        {
+            static HELPERS_BUILT: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
+            let mut built = HELPERS_BUILT.lock();
+            if !*built {
+                codegen.emit_mem_helpers();
+                *built = true;
+            }
+        }
+
 
         let mut analyzer = crate::jitv2::analyzer::Analyzer::new();
         let mut pending: crate::jitv2::comp::PendingCount = 0;
@@ -6158,6 +6205,15 @@ impl CompileQueue {
                     ARENA_RESERVE_SIZE, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
+                // Build the shared memory helpers here and nowhere else.
+                // Every other worker is parked at the barrier and the fresh
+                // arena has had nothing else allocated into it, so this is
+                // the one moment a forced seal — which mprotects a whole
+                // host page to RX — cannot race another worker still
+                // bump-allocating into that page. Helpers land in the
+                // arena's lowest range; every region compiled afterwards
+                // sits above them and seals normally.
+                codegen.emit_mem_helpers();
                 {
                     let (mutex, cv) = &*barrier;
                     let mut state = mutex.lock();
