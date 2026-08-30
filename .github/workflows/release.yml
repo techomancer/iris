@@ -1,0 +1,1045 @@
+# Build and release pipeline for IRIS.
+#
+# Manual trigger only (workflow_dispatch), in one of two modes:
+#
+#   publish_release UNCHECKED (the default)
+#     Builds every artifact on every platform and verifies the release contents,
+#     then stops. No tag, no release. Use this to prove a change builds
+#     everywhere; the artifacts are attached to the run.
+#
+#   publish_release CHECKED
+#     The same build, then tags v<YYYY-MM-DD-HH-MM> (UTC, generated at dispatch)
+#     at the built commit and publishes a release carrying the downloads table
+#     generated below.
+#
+# Builds check out `main` by default. Use the build_branch input to build a
+# different branch for testing; a published tag follows that branch's commit.
+#
+# ── What ships ────────────────────────────────────────────────────────────────
+#
+# One build variant per platform/arch: lightning + rex-jit + camera + chd.
+#
+# It is a lightning build (interpreter with breakpoint checks and the traceback
+# buffer stripped — no interactive debugging) and carries the REX3 draw-shader
+# JIT. It does not carry the v1 MIPS JIT (`jit`) or the N64 dev board
+# (`ultra64`); those are source-build opt-ins now (see iris-gui/Cargo.toml). The
+# former "standard" (non-lightning), `pcap`, `-jitv2`, and separate `-r5000`
+# variants and the chd_extract tool are no longer released — all of them remain
+# buildable from source.
+#
+# Each platform ships iris-gui (installer + portable on Windows, .dmg on macOS,
+# AppImage/deb/rpm/pkg on Linux, tarball on riscv64) and a Core tarball holding
+# the `iris` CLI + `iris-ci` automation client.
+#
+# Optional repo secrets for macOS code signing + notarization:
+#   MACOS_CERTIFICATE         base64-encoded Developer ID Application .p12 certificate
+#   MACOS_CERTIFICATE_PWD     password for the .p12 file
+#   MACOS_NOTARIZE_APPLE_ID   your Apple ID email
+#   MACOS_NOTARIZE_PASSWORD   app-specific password from appleid.apple.com
+#   MACOS_TEAM_ID             10-character Apple Developer Team ID
+# Without these, builds use ad-hoc signing and are not notarized (Gatekeeper will warn).
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        # Unchecked: build every artifact and verify the release contents, but
+        # create no tag and no release — a dry run that still surfaces breakage.
+        # Checked: same build, then tag v<timestamp> and publish to Releases.
+        description: "Publish a release (tags v<timestamp> and posts to Releases). Leave unchecked to build artifacts only."
+        type: boolean
+        required: false
+        default: false
+      build_branch:
+        description: Override branch to check out (leave empty to build main)
+        required: false
+        default: ''
+      runner_image:
+        # macOS runner image for build-macos (both arches build on this one
+        # runner). Pinned rather than `macos-latest` so a run is deterministic
+        # during GitHub's macos-15 → macos-26 migration, where `macos-latest`
+        # resolves to either image unpredictably. Override here to test another
+        # image without editing the workflow. Same knob as appstore.yml.
+        description: "macOS runner image (default macos-26; override with macos-latest/macos-15)"
+        required: false
+        default: macos-26
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned quick-sharun + appimagetool versions (same as rusty-backup).
+  ANYLINUX_REF: 2affcd69e3b3fccab4507dbdbaed5d1a04bedfa9
+  APPIMAGETOOL_VERSION: "0.3.0"
+
+jobs:
+  # ── Version ──────────────────────────────────────────────────────────────────
+
+  generate-version:
+    name: Generate Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      # Resolve the commit the build legs will check out so a published release
+      # tags what was actually built. Without this the tag lands on the ref the
+      # run was dispatched from, which is the wrong commit whenever build_branch
+      # is set.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.build_branch || 'main' }}
+
+      - name: Generate version from date
+        id: version
+        run: |
+          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
+          SHA=$(git rev-parse HEAD)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION"    >> $GITHUB_OUTPUT
+          echo "sha=$SHA"         >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION (tag v$VERSION at $SHA)"
+
+      # NOTE: use `inputs.publish_release` (a real boolean), never
+      # `github.event.inputs.publish_release` — that is the STRING "false",
+      # which is truthy in an `if:` and would publish on every run.
+      - name: Announce mode
+        run: |
+          if [ "${{ inputs.publish_release }}" = "true" ]; then
+            echo "### Release run - will publish \`v${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Build-only run - no tag, no release" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Artifacts are attached to this run. Re-run with **Publish a release** checked to tag and publish." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ── Windows ──────────────────────────────────────────────────────────────────
+  #
+  # x64 + arm64: iris-gui (installer + portable, per CPU variant) and the Core
+  # zip (iris + iris-ci). arm64 builds natively on the windows-11-arm runner.
+  # (32-bit x86 dropped — earlier libchdman-rs had no i686 build; it does now, but
+  # we don't ship 32-bit.) libchdman-rs ≥ 0.288.8 ships aarch64-pc-windows-msvc
+  # prebuilts, so CHD works on arm64.
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+            runs-on: windows-latest
+            cli_features: "chd,camera,rex-jit,lightning"
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+            runs-on: windows-11-arm
+            cli_features: "chd,camera,rex-jit,lightning"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Create combined license (for installer)
+        shell: bash
+        run: |
+          printf '%s\n\n\n---\n\n\n' "$(cat LICENSE)" > COMBINED-LICENSE.txt
+          cat LICENSE-libchdman-rs.txt >> COMBINED-LICENSE.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      # ── iris-gui (x64 + arm64) ──────────────────────────────────────────────
+
+      - name: Build iris-gui
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found" }
+          $ver  = "${{ needs.generate-version.outputs.version }}"
+          $src  = "$env:GITHUB_WORKSPACE\target\${{ matrix.target }}\release"
+          $assets = "$env:GITHUB_WORKSPACE\iris-gui\assets\icons"
+          $lic  = "$env:GITHUB_WORKSPACE\COMBINED-LICENSE.txt"
+          & $iscc "/DMyAppVersion=$ver" "/DTargetArch=${{ matrix.arch }}" "/DSourceDir=$src" "/DAssetsDir=$assets" `
+                  "/DLicenseFile=$lic" "/FIRIS-Setup-windows-${{ matrix.arch }}-$ver" `
+                  installer\iris-gui.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+
+      - name: Package iris-gui (portable)
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          7z a "IRIS-gui-windows-${{ matrix.arch }}-${VER}.zip" \
+            "target/${{ matrix.target }}/release/iris-gui.exe" \
+            "iris-gui/assets/icons/icon.ico" \
+            LICENSE LICENSE-libchdman-rs.txt
+
+      # ── Core: iris CLI + iris-ci ────────────────────────────────────────────
+
+      - name: Build iris CLI
+        run: cargo build --release --bin iris --target ${{ matrix.target }} --features ${{ matrix.cli_features }}
+
+      - name: Build iris-ci
+        run: cargo build --release --bin iris-ci --target ${{ matrix.target }} --features ${{ matrix.cli_features }}
+
+      # Staging into a temp dir and zipping from inside it keeps the archive flat
+      # (iris.exe/iris-ci.exe/licenses, no target/... paths).
+      - name: Package Core
+        shell: bash
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          rm -rf _pkg_tmp && mkdir -p _pkg_tmp
+          cp "target/${{ matrix.target }}/release/iris.exe" _pkg_tmp/
+          cp "target/${{ matrix.target }}/release/iris-ci.exe" _pkg_tmp/
+          cp LICENSE LICENSE-libchdman-rs.txt _pkg_tmp/
+          (cd _pkg_tmp && 7z a "../IRIS-cli-windows-${{ matrix.arch }}-${VER}.zip" *)
+          rm -rf _pkg_tmp
+
+      - name: Verify CLI archive contents
+        shell: bash
+        run: |
+          set -e
+          for f in IRIS-cli-*.zip; do
+            listing=$(7z l -ba -slt "$f" | sed -n 's/^Path = //p')
+            for want in iris.exe iris-ci.exe LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      # ── Upload ──────────────────────────────────────────────────────────────
+
+      - name: Upload iris-gui portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+      - name: Upload iris-gui installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: installer\Output\IRIS-Setup-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.exe
+
+      - name: Upload Core
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-windows-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.zip
+
+  # ── macOS ────────────────────────────────────────────────────────────────────
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    # Guard against a hung actions/cache step sitting for the 6h default. Three
+    # compiles (GUI + iris + iris-ci) and three notarytool submissions per leg
+    # (the DMG, the iris CLI, iris-ci — each `--wait`); the ceiling leaves room
+    # for an Apple-side queue spike without masking a hang.
+    timeout-minutes: 120
+    env:
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Add the target to the pinned (nightly) toolchain
+        run: |
+          # rust-toolchain.toml pins nightly, so cargo uses THAT — not stable, so
+          # installing a target via dtolnay/rust-toolchain@stable wouldn't help.
+          # `rustup show` (run in the checked-out repo) auto-installs the pinned
+          # toolchain; then add this leg's target to it. The host arm64 std comes
+          # with the toolchain, but x86_64 must be added explicitly now that it is
+          # cross-compiled here — without it rustc can't find core/std. Mirrors
+          # appstore.yml and the riscv64 job below.
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # ── Build all binaries ──────────────────────────────────────────────────
+
+      - name: Build all binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
+
+      # ── Code signing setup ──────────────────────────────────────────────────
+
+      - name: Import signing certificate
+        if: ${{ env.HAS_SIGNING_CERT == 'true' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm "$CERT_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+      - name: Resolve signing identity
+        id: signing
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+        run: |
+          if [ -n "$MACOS_CERTIFICATE" ]; then
+            ID=$(security find-identity -v -p codesigning "$RUNNER_TEMP/app-signing.keychain-db" \
+              | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "identity=$ID" >> $GITHUB_OUTPUT
+          else
+            echo "identity=-" >> $GITHUB_OUTPUT
+          fi
+
+      # ── iris-gui: app bundles + DMGs ─────────────────────────────────────────
+
+      - name: Create iris-gui app bundles and DMGs
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+        run: |
+          set -e
+          SRC="target/${{ matrix.target }}/release"
+          ARCH="${{ matrix.arch }}"
+
+          make_dmg() {
+            local bin_src="$1"   # path to the built iris-gui binary
+            local dmg_name="IRIS-gui-macos-${ARCH}-${VER}.dmg"
+            local bundle="IRIS.app"
+
+            rm -rf "$bundle" dmg-staging
+            mkdir -p "${bundle}/Contents/MacOS" "${bundle}/Contents/Resources"
+            cp "$bin_src" "${bundle}/Contents/MacOS/iris-gui"
+            chmod +x "${bundle}/Contents/MacOS/iris-gui"
+            cp "iris-gui/assets/icons/icon.icns" "${bundle}/Contents/Resources/AppIcon.icns"
+            cp LICENSE "${bundle}/Contents/Resources/LICENSE"
+            cp LICENSE-libchdman-rs.txt "${bundle}/Contents/Resources/LICENSE-libchdman-rs.txt"
+
+            cat > "${bundle}/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>IRIS</string>
+            <key>CFBundleDisplayName</key><string>IRIS</string>
+            <key>CFBundleIdentifier</key><string>io.github.danifunker.iris</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleExecutable</key><string>iris-gui</string>
+            <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+          </dict>
+          </plist>
+          PLIST
+
+            if [ "$IDENTITY" != "-" ]; then
+              # --entitlements grants allow-unsigned-executable-memory so the
+              # hardened runtime doesn't kill Cranelift's mmap+mprotect JIT pages
+              # (the REX3 draw-shader JIT). Permitted for Developer ID/notarization;
+              # the App Store build can't use it and runs interpreter-only instead.
+              codesign --force --options runtime \
+                --entitlements installer/iris-gui-notarized.entitlements \
+                --sign "$IDENTITY" "${bundle}"
+            else
+              codesign --force --deep --sign - "${bundle}"
+            fi
+
+            mkdir -p dmg-staging
+            cp -R "${bundle}" dmg-staging/
+            ln -sf /Applications dmg-staging/Applications
+            hdiutil create -volname "IRIS" -srcfolder dmg-staging -ov -format UDZO "${dmg_name}"
+
+            if [ "$IDENTITY" != "-" ]; then
+              codesign --force --sign "$IDENTITY" "${dmg_name}"
+            fi
+
+            if [ -n "$MACOS_NOTARIZE_APPLE_ID" ] && [ -n "$MACOS_TEAM_ID" ]; then
+              xcrun notarytool submit "${dmg_name}" \
+                --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+                --password "$MACOS_NOTARIZE_PASSWORD" \
+                --team-id "$MACOS_TEAM_ID" \
+                --wait
+              xcrun stapler staple "${dmg_name}"
+            fi
+          }
+
+          make_dmg "${SRC}/iris-gui"
+
+      # ── Core (iris + iris-ci): sign + package ───────────────────────────────
+
+      - name: Sign and package Core binaries
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          MACOS_NOTARIZE_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+        run: |
+          set -e
+          SRC="target/${{ matrix.target }}/release"
+          ARCH="${{ matrix.arch }}"
+
+          sign_notarize() {
+            local bin_src="$1"
+            local tag="$2"            # unique basename for the notarize zip
+
+            if [ "$IDENTITY" != "-" ]; then
+              # See the GUI bundle signing above: the JIT entitlement keeps the
+              # notarized CLI binaries (built with rex-jit) from being killed by
+              # the hardened runtime on their first JITed REX3 draw.
+              codesign --force --options runtime --timestamp \
+                --entitlements installer/iris-gui-notarized.entitlements \
+                --sign "$IDENTITY" "$bin_src"
+            else
+              codesign --force --sign - "$bin_src"
+            fi
+
+            if [ -n "$MACOS_NOTARIZE_APPLE_ID" ] && [ -n "$MACOS_TEAM_ID" ]; then
+              local zip_tmp="${tag}-notarize.zip"
+              ditto -c -k "$bin_src" "$zip_tmp"
+              xcrun notarytool submit "$zip_tmp" \
+                --apple-id "$MACOS_NOTARIZE_APPLE_ID" \
+                --password "$MACOS_NOTARIZE_PASSWORD" \
+                --team-id "$MACOS_TEAM_ID" \
+                --wait
+              rm -f "$zip_tmp"
+            fi
+          }
+
+          sign_notarize_package() {
+            local bin_src="$1"
+            local out_name="$2"
+
+            sign_notarize "$bin_src" "${out_name%.tar.gz}"
+
+            mkdir -p _pkg_tmp
+            cp "$bin_src" _pkg_tmp/iris
+            cp "${SRC}/iris-ci" _pkg_tmp/iris-ci
+            cp LICENSE "_pkg_tmp/"
+            cp LICENSE-libchdman-rs.txt "_pkg_tmp/"
+            tar -C _pkg_tmp -czf "${out_name}" iris iris-ci LICENSE LICENSE-libchdman-rs.txt
+            rm -rf _pkg_tmp
+          }
+
+          # iris-ci ships in the Core tarball; sign + notarize it first, then the
+          # pkg call below just stages the already-signed binary.
+          sign_notarize "${SRC}/iris-ci" "iris-ci-macos-${ARCH}-${VER}"
+
+          sign_notarize_package "${SRC}/iris" "IRIS-cli-macos-${ARCH}-${VER}.tar.gz"
+
+      - name: Verify CLI archive contents
+        run: |
+          set -e
+          for f in IRIS-cli-*.tar.gz; do
+            listing=$(tar tzf "$f")
+            for want in iris iris-ci LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
+
+      # ── Upload ──────────────────────────────────────────────────────────────
+
+      - name: Upload iris-gui DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-gui-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.dmg
+
+      - name: Upload Core
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-macos-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # ── Linux AppImage ────────────────────────────────────────────────────────────
+  #
+  # Arch Linux container + quick-sharun → self-contained AppImage for iris-gui.
+
+  build-linux-appimage:
+    name: Build Linux AppImage (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    container: ghcr.io/pkgforge-dev/archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+            sharun_arch: x86_64
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            sharun_arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    steps:
+      - name: Install build prerequisites
+        run: |
+          pacman -Syu --noconfirm \
+            base-devel cmake rust \
+            clang \
+            alsa-lib \
+            gtk3 \
+            openssl pkgconf \
+            v4l-utils \
+            wget curl git \
+            libxcb libxcursor libxi libxkbcommon libxkbcommon-x11 libxrandr libxtst \
+            wayland wayland-protocols \
+            mesa vulkan-icd-loader \
+            xorg-server-xvfb strace dbus file patchelf \
+            desktop-file-utils shared-mime-info zsync
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.arch }}-appimage-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install debloated runtime packages
+        run: |
+          wget --retry-connrefused --tries=30 \
+            "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_REF}/useful-tools/get-debloated-pkgs.sh" \
+            -O ./get-debloated-pkgs.sh
+          chmod +x ./get-debloated-pkgs.sh
+          ./get-debloated-pkgs.sh --add-common --add-mesa --prefer-nano
+
+      - name: Download quick-sharun
+        run: |
+          wget --retry-connrefused --tries=30 \
+            "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_REF}/useful-tools/quick-sharun.sh" \
+            -O ./quick-sharun
+          chmod +x ./quick-sharun
+
+      - name: Stage shared AppDir inputs (icons + desktop)
+        run: |
+          install -Dm644 "iris-gui/assets/icons/icon-256.png" \
+            /usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          install -d /usr/share/applications
+          cat > /usr/share/applications/iris-gui.desktop << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=IRIS
+          Comment=SGI Indy (MIPS R4400) emulator
+          Exec=iris-gui
+          Icon=iris-gui
+          Categories=Emulator;Game;
+          Terminal=false
+          EOF
+
+      - name: Build and bundle iris-gui
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning
+          install -Dm755 "target/${{ matrix.target }}/release/iris-gui" /usr/bin/iris-gui
+
+          OUT="IRIS-gui-linux-${{ matrix.arch }}-${VER}.AppImage"
+          export OUTPATH="$PWD/dist"
+          export OUTNAME="$OUT"
+          export VERSION="${VER}"
+          export ICON=/usr/share/icons/hicolor/256x256/apps/iris-gui.png
+          export DESKTOP=/usr/share/applications/iris-gui.desktop
+          export APPIMAGETOOL_LINK="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.sharun_arch }}-linux"
+          mkdir -p "$OUTPATH"
+          ./quick-sharun /usr/bin/iris-gui
+          ./quick-sharun --make-appimage
+          ls -lh "$OUTPATH"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-appimage-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: |
+            dist/IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage
+            dist/IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.AppImage.zsync
+
+  # ── Linux packages + Core tarballs ────────────────────────────────────────────
+  #
+  # deb, rpm, Arch pkg for iris-gui; tar.gz for the Core (iris + iris-ci).
+
+  build-linux-packages:
+    name: Build Linux packages (${{ matrix.arch }})
+    needs: generate-version
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+            runs-on: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            clang libclang-dev \
+            libasound2-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libv4l-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl-dev \
+            dpkg-dev liblzma-dev rpm libarchive-tools zstd
+
+      - name: Install cargo packaging tools
+        run: |
+          cargo install cargo-deb
+          cargo install cargo-generate-rpm
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-packages-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # ── iris-gui packages ───────────────────────────────────────────────────
+
+      - name: Build iris-gui
+        run: cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning
+
+      - name: Package iris-gui (deb + rpm + arch)
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          TARGET="${{ matrix.target }}"
+
+          cargo deb -p iris-gui --target "$TARGET" --no-build
+          mv "target/${TARGET}/debian/"*.deb "IRIS-gui-linux-${ARCH}-${VER}.deb"
+
+          cargo generate-rpm -p iris-gui --target "$TARGET"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "IRIS-gui-linux-${ARCH}-${VER}.rpm"
+
+          mkdir -p arch-pkg/usr/bin arch-pkg/usr/share/applications \
+            arch-pkg/usr/share/icons/hicolor/{16x16,32x32,48x48,64x64,128x128,256x256}/apps \
+            arch-pkg/usr/share/doc/iris-gui
+          cp "target/${TARGET}/release/iris-gui" arch-pkg/usr/bin/
+          chmod 755 arch-pkg/usr/bin/iris-gui
+          for size in 16 32 48 64 128 256; do
+            cp "iris-gui/assets/icons/icon-${size}.png" \
+              "arch-pkg/usr/share/icons/hicolor/${size}x${size}/apps/iris-gui.png"
+          done
+          cp iris-gui/iris-gui.desktop arch-pkg/usr/share/applications/
+          cp LICENSE arch-pkg/usr/share/doc/iris-gui/
+          cp LICENSE-libchdman-rs.txt arch-pkg/usr/share/doc/iris-gui/
+          (cd arch-pkg && tar -czf "../IRIS-gui-linux-${ARCH}-${VER}.pkg.tar.zst" usr)
+          rm -rf arch-pkg
+
+      # ── Core tarball ────────────────────────────────────────────────────────
+
+      - name: Build iris CLI and iris-ci
+        run: |
+          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
+
+      - name: Package Core tarball
+        run: |
+          VER="${{ needs.generate-version.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          SRC="target/${{ matrix.target }}/release"
+
+          pkg_cli() {
+            local src="$1" label="$2"
+            mkdir -p _tmp
+            cp "$src" _tmp/iris
+            cp "${SRC}/iris-ci" _tmp/iris-ci
+            cp LICENSE _tmp/
+            cp LICENSE-libchdman-rs.txt _tmp/
+            tar -C _tmp -czf "${label}" iris iris-ci LICENSE LICENSE-libchdman-rs.txt
+            rm -rf _tmp
+          }
+
+          pkg_cli "${SRC}/iris" "IRIS-cli-linux-${ARCH}-${VER}.tar.gz"
+
+      - name: Verify CLI archive contents
+        run: |
+          set -e
+          for f in IRIS-cli-*.tar.gz; do
+            listing=$(tar tzf "$f")
+            for want in iris iris-ci LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      # ── Upload ──────────────────────────────────────────────────────────────
+
+      - name: Upload iris-gui packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-gui-packages-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: |
+            IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.rpm
+            IRIS-gui-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.pkg.tar.zst
+
+      - name: Upload Core
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
+          path: IRIS-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # ── Linux riscv64 (cross, tarball-only) ───────────────────────────────────────
+  #
+  # No GitHub-hosted riscv64 runner exists, so we cross-compile from an x86_64
+  # Debian trixie host using multiarch: riscv64 is an official Debian 13 release
+  # arch, so the `:riscv64` -dev packages install cleanly alongside the host's.
+  # libchdman-rs ≥ 0.288.8 ships a riscv64gc-unknown-linux-gnu prebuilt, so CHD
+  # works here. Shipped as tarballs only (no deb/rpm/AppImage — the AppImage
+  # sharun tooling has no riscv64 path).
+  build-linux-riscv64:
+    name: Build Linux riscv64 (cross)
+    needs: generate-version
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    env:
+      RELEASE_VERSION: ${{ needs.generate-version.outputs.version }}
+      TARGET: riscv64gc-unknown-linux-gnu
+      ARCH: riscv64
+      # The container runs as root (euid home /root) but Actions sets
+      # HOME=/github/home; rustup hard-errors on that mismatch ("$HOME differs
+      # from euid-obtained home directory") and never installs the target std,
+      # so rustc reports "can't find crate for `core`". Force HOME to root's home
+      # and pin rustup/cargo to fixed paths so install and build agree.
+      HOME: /root
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+      CXX_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-g++
+      AR_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-ar
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_SYSROOT_DIR: "/"
+      PKG_CONFIG_PATH: /usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      BINDGEN_EXTRA_CLANG_ARGS: "--target=riscv64-unknown-linux-gnu -I/usr/include/riscv64-linux-gnu"
+    steps:
+      - name: Install host toolchain + riscv64 cross sysroot
+        run: |
+          set -eux
+          dpkg --add-architecture riscv64
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils git pkg-config \
+            build-essential crossbuild-essential-riscv64 \
+            clang libclang-dev llvm \
+            libasound2-dev:riscv64 libgtk-3-dev:riscv64 libssl-dev:riscv64 \
+            libv4l-dev:riscv64 \
+            libxcb-render0-dev:riscv64 libxcb-shape0-dev:riscv64 libxcb-xfixes0-dev:riscv64 \
+            libxkbcommon-dev:riscv64 libwayland-dev:riscv64 libgl-dev:riscv64
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Install Rust + riscv64 std for the pinned toolchain
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --no-modify-path
+          export PATH="$CARGO_HOME/bin:$PATH"
+          # rust-toolchain.toml pins nightly; `rustup show` (run in the checked-out
+          # repo) auto-installs it, then add the riscv64 std to THAT toolchain —
+          # adding it to stable wouldn't help since the build uses nightly.
+          rustup show
+          rustup target add "$TARGET"
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # iris-gui always pulls camera (v4l) via its iris dep, so libv4l-dev:riscv64
+      # is installed above for the bindgen cross.
+      - name: Build iris-gui (cross)
+        run: |
+          set -eux
+          cargo build --release --target "$TARGET" -p iris-gui --features iris/lightning,bundled
+
+      - name: Build iris CLI + iris-ci (cross)
+        run: |
+          set -eux
+          cargo build --release --bin iris --target "$TARGET" --features chd,camera,rex-jit,lightning
+          cargo build --release --bin iris-ci --target "$TARGET" --features chd,camera,rex-jit,lightning
+
+      - name: Package tarballs
+        run: |
+          set -eux
+          VER="${RELEASE_VERSION}"
+          REL="target/${TARGET}/release"
+
+          pkg_gui() {  # <built-name> <label>
+            local src="$1" label="$2"
+            rm -rf _tmp && mkdir -p _tmp
+            cp "${REL}/${src}" _tmp/iris-gui
+            cp iris-gui/iris-gui.desktop _tmp/ 2>/dev/null || true
+            cp iris-gui/assets/icons/icon-256.png _tmp/ 2>/dev/null || true
+            cp LICENSE LICENSE-libchdman-rs.txt _tmp/
+            tar -C _tmp -czf "${label}" .
+            rm -rf _tmp
+          }
+          pkg_cli() {  # <built-name> <label>
+            local src="$1" label="$2"
+            rm -rf _tmp && mkdir -p _tmp
+            cp "${REL}/${src}" _tmp/iris
+            cp "${REL}/iris-ci" _tmp/iris-ci
+            cp LICENSE LICENSE-libchdman-rs.txt _tmp/
+            # Explicit member list (not ".") so entries aren't "./"-prefixed,
+            # matching the x64/arm64 CLI tarball layout.
+            tar -C _tmp -czf "${label}" iris iris-ci LICENSE LICENSE-libchdman-rs.txt
+            rm -rf _tmp
+          }
+
+          pkg_gui iris-gui "IRIS-gui-linux-${ARCH}-${VER}.tar.gz"
+
+          pkg_cli iris "IRIS-cli-linux-${ARCH}-${VER}.tar.gz"
+
+      - name: Verify CLI archive contents
+        run: |
+          set -e
+          for f in IRIS-cli-*.tar.gz; do
+            listing=$(tar tzf "$f")
+            for want in iris iris-ci LICENSE LICENSE-libchdman-rs.txt; do
+              echo "$listing" | grep -qx "$want" \
+                || { echo "::error::${f} is missing flat member '${want}'"; exit 1; }
+            done
+          done
+
+      - name: Upload riscv64 tarballs
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-linux-riscv64-${{ needs.generate-version.outputs.version }}
+          path: IRIS-*-linux-riscv64-${{ needs.generate-version.outputs.version }}.tar.gz
+
+  # ── Release ───────────────────────────────────────────────────────────────────
+
+  release:
+    name: Package & Publish
+    needs:
+      - generate-version
+      - build-windows
+      - build-macos
+      - build-linux-appimage
+      - build-linux-packages
+      - build-linux-riscv64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( \
+            -name "*.zip" -o -name "*.exe" -o -name "*.dmg" \
+            -o -name "*.AppImage" -o -name "*.AppImage.zsync" \
+            -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" \
+            -o -name "*.tar.gz" \
+          \) -exec cp {} release-files/ \;
+          ls -lh release-files/
+
+      - name: Generate downloads table
+        env:
+          VER: ${{ needs.generate-version.outputs.version }}
+        run: |
+          TAG="v${VER}"
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+          # Warn (don't fail) if an expected asset is missing. Every x64/arm64
+          # platform leg ships the same shape, so the list is generated.
+          for a in x64 arm64; do
+            for f in \
+              "IRIS-gui-windows-${a}-${VER}.zip" \
+              "IRIS-Setup-windows-${a}-${VER}.exe" \
+              "IRIS-cli-windows-${a}-${VER}.zip" \
+              "IRIS-gui-macos-${a}-${VER}.dmg" \
+              "IRIS-cli-macos-${a}-${VER}.tar.gz" \
+              "IRIS-gui-linux-${a}-${VER}.AppImage" \
+              "IRIS-gui-linux-${a}-${VER}.deb" \
+              "IRIS-gui-linux-${a}-${VER}.rpm" \
+              "IRIS-gui-linux-${a}-${VER}.pkg.tar.zst" \
+              "IRIS-cli-linux-${a}-${VER}.tar.gz"; do
+              [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
+            done
+          done
+          for f in \
+            "IRIS-gui-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-cli-linux-riscv64-${VER}.tar.gz"; do
+            [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
+          done
+
+          cat > DOWNLOADS.md << EOF
+          ## Downloads
+
+          **Most people want:** the build for their platform — Windows → **x64 installer** · macOS → **Apple Silicon** or **Intel** \`.dmg\` · Linux → **AppImage**
+
+          Every build is a **⚡ lightning** build: breakpoint checks and the traceback buffer are stripped from the MIPS executor hot path for maximum speed, so interactive debugging (GDB stub, monitor breakpoints) is not available in them. Build from source without \`--features lightning\` if you need to debug IRIX behaviour.
+
+          > All builds include CHD support (\`libchdman-rs\` ≥ 0.288.8) and are distributed under the **BSD 3-Clause** license. See \`LICENSE\` and the \`LICENSE-libchdman-rs.txt\` third-party notice in each archive.
+
+          ### iris-gui
+
+          | Platform | Architecture | Download |
+          |---|---|---|
+          | **Windows 11/10** | x64 (64-bit) | [Installer](${BASE}/IRIS-Setup-windows-x64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-windows-x64-${VER}.zip) |
+          | **Windows 11** | arm64 | [Installer](${BASE}/IRIS-Setup-windows-arm64-${VER}.exe) · [Portable](${BASE}/IRIS-gui-windows-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon (arm64) | [.dmg](${BASE}/IRIS-gui-macos-arm64-${VER}.dmg) |
+          | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/IRIS-gui-macos-x64-${VER}.dmg) |
+          | **Linux** (glibc ≥ 2.39) | x64 | [AppImage](${BASE}/IRIS-gui-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-linux-x64-${VER}.pkg.tar.zst) |
+          | **Linux** (glibc ≥ 2.39) | arm64 | [AppImage](${BASE}/IRIS-gui-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-linux-arm64-${VER}.pkg.tar.zst) |
+          | **Linux** (glibc ≥ 2.35) | riscv64 †| [tar.gz](${BASE}/IRIS-gui-linux-riscv64-${VER}.tar.gz) |
+
+          ### Core (no GUI)
+
+          The emulator without the GUI layer: every \`IRIS-cli-*\` archive contains \`iris\` (the emulator, driven by \`iris.toml\` and the serial/monitor consoles) and \`iris-ci\` (the control-socket client for snapshots, scripted input, and headless automation) at the archive root, on all platforms and architectures.
+
+          | Platform | Architecture | Download |
+          |---|---|---|
+          | **Windows 11/10** | x64 (64-bit) | [zip](${BASE}/IRIS-cli-windows-x64-${VER}.zip) |
+          | **Windows 11** | arm64 | [zip](${BASE}/IRIS-cli-windows-arm64-${VER}.zip) |
+          | **macOS 10.13+** | Apple Silicon | [tar.gz](${BASE}/IRIS-cli-macos-arm64-${VER}.tar.gz) |
+          | **macOS 10.13+** | Intel | [tar.gz](${BASE}/IRIS-cli-macos-x64-${VER}.tar.gz) |
+          | **Linux** | x64 | [tar.gz](${BASE}/IRIS-cli-linux-x64-${VER}.tar.gz) |
+          | **Linux** | arm64 | [tar.gz](${BASE}/IRIS-cli-linux-arm64-${VER}.tar.gz) |
+          | **Linux** | riscv64 †| [tar.gz](${BASE}/IRIS-cli-linux-riscv64-${VER}.tar.gz) |
+
+          <sub>**Windows:** x64 + arm64 (32-bit Windows is not shipped). **macOS:** requires 10.13 High Sierra or later. **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; built against glibc 2.39 (Ubuntu 24.04). **AppImage** is self-contained and runs on most distributions. **† riscv64** is cross-compiled and shipped as a tarball only (no AppImage/deb/rpm), built against glibc 2.35. **All binaries** include \`libchdman-rs\` and are **BSD 3-Clause** licensed.</sub>
+
+          <sub>**Building other configurations:** PCAP bridged networking (\`--features pcap\`), the experimental JIT v2 engine (\`--features jitv2\`), the v1 MIPS JIT (\`--features jit\`), the N64 development board (\`--features ultra64\`), and the \`chd_extract\` tool are all still in the tree — they are just not part of the release matrix. See \`README.md\`.</sub>
+
+          ---
+          EOF
+          echo "----- generated DOWNLOADS.md -----"
+          cat DOWNLOADS.md
+
+      - name: Publish the downloads table to the run summary
+        run: cat DOWNLOADS.md >> $GITHUB_STEP_SUMMARY
+
+      # Timestamps collide only if two runs land in the same UTC minute, but
+      # softprops would then move the existing tag and rewrite that release.
+      # Fail before any of that happens.
+      - name: Check the tag is free
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.generate-version.outputs.tag }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists - refusing to overwrite the release it points at. Re-run for a fresh timestamp."
+            exit 1
+          fi
+          echo "Tag ${TAG} is free."
+
+      - name: Create Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.generate-version.outputs.tag }}
+          target_commitish: ${{ needs.generate-version.outputs.sha }}
+          name: Release ${{ needs.generate-version.outputs.version }}
+          files: release-files/*
+          body_path: DOWNLOADS.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build-only notice
+        if: ${{ !inputs.publish_release }}
+        run: |
+          echo "::notice::Build-only run - artifacts built and verified, no tag or release created. A publish run would have created ${{ needs.generate-version.outputs.tag }}."
+

@@ -1,0 +1,611 @@
+# Mac App Store build and submission pipeline for IRIS.
+#
+# Manual trigger only — run this when you're ready to submit a new build,
+# not on every commit.
+#
+# Required repository secrets:
+#   APP_STORE_APP_CERT          base64-encoded Mac App Distribution .p12
+#   APP_STORE_APP_CERT_PWD      password for the above
+#   APP_STORE_INSTALLER_CERT    base64-encoded Mac Installer Distribution .p12
+#   APP_STORE_INSTALLER_CERT_PWD
+#   APP_STORE_PROVISIONING_PROFILE  base64-encoded .provisionprofile
+#   APP_STORE_CONNECT_KEY_ID    API key ID from App Store Connect
+#   APP_STORE_CONNECT_ISSUER_ID issuer ID from App Store Connect
+#   APP_STORE_CONNECT_PRIVATE_KEY   base64-encoded .p8 private key
+#
+# One-time setup on developer.apple.com before first run:
+#   1. Create an App ID for io.github.danifunker.iris with these capabilities:
+#      - App Sandbox
+#      - Increased Memory Limit (for JIT — labelled "com.apple.security.cs.allow-jit")
+#      - Camera
+#      - Network (client + server)
+#   2. Create a Mac App Distribution provisioning profile for that App ID
+#   3. Create a Mac App Distribution certificate + Mac Installer Distribution certificate
+#   4. Create an app record in App Store Connect (name: IRIS, bundle ID: io.github.danifunker.iris)
+#   5. Generate an App Store Connect API key (Users and Access → Integrations → App Store Connect API)
+
+name: App Store
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_branch:
+        description: Branch to build from (leave empty for workflow branch)
+        required: false
+        default: ''
+      validate_only:
+        description: Validate package but do not submit to App Store Connect
+        required: false
+        type: boolean
+        default: false
+      preflight_only:
+        description: Run ONLY the preflight (skip builds + package) — fast ~1 min secret/auth check
+        required: false
+        type: boolean
+        default: false
+      runner_image:
+        description: Runner image for the preflight, build and package jobs (default macos-26 — pinned for determinism; override with macos-latest / macos-15 if needed).
+        required: false
+        default: macos-26
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUNDLE_ID: io.github.danifunker.iris
+
+jobs:
+  # ── Preflight: validate secrets/certs BEFORE the ~15 min of builds ───────────
+  # Imports both distribution certs into a throwaway keychain and proves each
+  # one is a usable *identity* (cert + private key), checks the provisioning
+  # profile parses, and checks the App Store Connect API key — failing in ~1 min
+  # instead of after the arm64/x64 builds if a secret is wrong.
+
+  preflight:
+    name: Preflight (validate App Store secrets)
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      bundle_version: ${{ steps.version.outputs.bundle_version }}
+    steps:
+      # Stamp the version here, in the first job, so the arm64/x64 build jobs can
+      # bake it into the binary (RELEASE_VERSION → APP_VERSION, shown in About)
+      # AND the packaging job writes the *same* value into Info.plist's
+      # CFBundleVersion. Generating it in the later package job left the builds
+      # with no RELEASE_VERSION, so About fell back to CARGO_PKG_VERSION (0.1.0).
+      - name: Generate version
+        id: version
+        run: |
+          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
+          # App Store requires numeric integers separated by dots (e.g. 20250609.0200)
+          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)/\1\2\3.\4\5/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
+      - name: Verify certificates, provisioning profile, and API key
+        env:
+          APP_STORE_APP_CERT: ${{ secrets.APP_STORE_APP_CERT }}
+          APP_STORE_APP_CERT_PWD: ${{ secrets.APP_STORE_APP_CERT_PWD }}
+          APP_STORE_INSTALLER_CERT: ${{ secrets.APP_STORE_INSTALLER_CERT }}
+          APP_STORE_INSTALLER_CERT_PWD: ${{ secrets.APP_STORE_INSTALLER_CERT_PWD }}
+          APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          fail=0
+          K="$RUNNER_TEMP/preflight.keychain-db"
+          KP=$(openssl rand -base64 24)
+          security create-keychain -p "$KP" "$K"
+          security set-keychain-settings -lut 3600 "$K"
+          security unlock-keychain -p "$KP" "$K"
+
+          # Decode + import a base64 .p12. rc: 0/1 imported, 2 empty, 3 bad base64.
+          import_p12() {
+            local b64="$1" pwd="$2"
+            [ -z "$b64" ] && return 2
+            local f="$RUNNER_TEMP/pf_$RANDOM.p12"
+            echo "$b64" | base64 --decode > "$f" 2>/dev/null || { rm -f "$f"; return 3; }
+            [ -s "$f" ] || { rm -f "$f"; return 3; }
+            security import "$f" -P "$pwd" -A -t cert -f pkcs12 -k "$K" >/dev/null 2>&1
+            local rc=$?; rm -f "$f"; return $rc
+          }
+
+          import_p12 "$APP_STORE_APP_CERT" "$APP_STORE_APP_CERT_PWD"
+          case $? in 2) echo "::error::APP_STORE_APP_CERT is empty"; fail=1;; 3) echo "::error::APP_STORE_APP_CERT is not valid base64"; fail=1;; esac
+
+          import_p12 "$APP_STORE_INSTALLER_CERT" "$APP_STORE_INSTALLER_CERT_PWD"
+          case $? in 2) echo "::error::APP_STORE_INSTALLER_CERT is empty"; fail=1;; 3) echo "::error::APP_STORE_INSTALLER_CERT is not valid base64"; fail=1;; esac
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KP" "$K" >/dev/null 2>&1 || true
+
+          echo "── Identities (certificate + private key) in keychain ──"
+          security find-identity "$K" || true
+          echo "────────────────────────────────────────────────────────"
+
+          # Distinguish "usable identity" vs "cert without key" vs "absent".
+          check_identity() {  # $1 pattern  $2 human name  $3 secret name
+            if security find-identity "$K" | grep -q "$1"; then
+              echo "✅ $2: usable identity (certificate + private key present)."
+            elif security find-certificate -a -c "$1" "$K" >/dev/null 2>&1; then
+              echo "::error::$2: the certificate is present but has NO private key. $3 must be the *identity* exported from Keychain Access — expand the certificate's disclosure triangle, select the cert WITH the private key under it, and Export as .p12. A plain .cer has no key."
+              fail=1
+            else
+              echo "::error::$2: certificate not found in the keychain at all — wrong .p12 in $3, wrong ${3}_PWD, or bad base64."
+              fail=1
+            fi
+          }
+          check_identity "3rd Party Mac Developer Application" "Application (app signing)" "APP_STORE_APP_CERT"
+          check_identity "3rd Party Mac Developer Installer"   "Installer (productbuild)"  "APP_STORE_INSTALLER_CERT"
+
+          # SHA-1 of the cert we sign the .app with — must appear in the profile.
+          APP_SHA=$(security find-identity "$K" | grep "3rd Party Mac Developer Application" | head -1 | awk '{print $2}')
+          security delete-keychain "$K" >/dev/null 2>&1 || true
+
+          PP="$RUNNER_TEMP/pf.provisionprofile"
+          echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode > "$PP" 2>/dev/null || true
+          if [ ! -s "$PP" ]; then
+            echo "::error::APP_STORE_PROVISIONING_PROFILE is empty or not valid base64."
+            fail=1
+          else
+            sz=$(wc -c < "$PP" | tr -d ' ')
+            echo "Provisioning profile: ${sz} bytes; first bytes: $(xxd -l 8 -p "$PP" 2>/dev/null)"
+            # The build only base64-decodes + embeds the profile (no parsing), so
+            # accept it if it decodes to a real provisioning profile. Prefer the
+            # signed-CMS decode; fall back to grepping the embedded plist (the
+            # profile's plist is plaintext inside the CMS envelope).
+            if PLIST=$(security cms -D -i "$PP" 2>/dev/null) && [ -n "$PLIST" ]; then
+              NAME=$(printf '%s' "$PLIST" | plutil -extract Name raw - 2>/dev/null || echo "?")
+              echo "✅ Provisioning profile parses (Name: ${NAME})."
+              # The .app's executable must be signed with a cert that is embedded
+              # in the profile (App Store rejects a mismatch). Compare SHA-1s.
+              printf '%s' "$PLIST" > "$RUNNER_TEMP/pp.plist"
+              PROF_SHAS=$(python3 -c "import plistlib,hashlib,sys; d=plistlib.load(open(sys.argv[1],'rb')); print(chr(10).join(hashlib.sha1(bytes(c)).hexdigest().upper() for c in d.get('DeveloperCertificates',[])))" "$RUNNER_TEMP/pp.plist")
+              echo "Profile certificate SHA-1(s): $(echo "$PROF_SHAS" | tr '\n' ' ')"
+              if [ -n "$APP_SHA" ] && echo "$PROF_SHAS" | grep -qi "$APP_SHA"; then
+                echo "✅ Signing certificate ($APP_SHA) is present in the provisioning profile."
+              else
+                echo "::error::The provisioning profile does NOT contain your app-signing certificate (3rd Party Mac Developer Application, ${APP_SHA}). The profile references a different cert (likely 'Apple Distribution'). Regenerate the Mac App Store profile at developer.apple.com selecting the '3rd Party Mac Developer Application' certificate, then re-encode it into APP_STORE_PROVISIONING_PROFILE."
+                fail=1
+              fi
+              rm -f "$RUNNER_TEMP/pp.plist"
+            elif grep -qa "ProvisionedDevices\|AppIDName\|TeamIdentifier\|com.apple.application-identifier" "$PP"; then
+              echo "✅ Provisioning profile decodes and contains profile markers."
+            else
+              echo "::error::APP_STORE_PROVISIONING_PROFILE decoded to ${sz} bytes but is not a provisioning profile (no profile markers). Likely the wrong file, a base64-of-base64, or a .mobileprovision saved as text. Download the Mac App Store provisioning profile (.provisionprofile) for App ID ${BUNDLE_ID} from developer.apple.com and re-encode it with: base64 -i profile.provisionprofile | pbcopy"
+              fail=1
+            fi
+          fi
+          rm -f "$PP"
+
+          [ -n "$APP_STORE_CONNECT_KEY_ID" ]    && echo "✅ APP_STORE_CONNECT_KEY_ID set"    || { echo "::error::APP_STORE_CONNECT_KEY_ID is empty"; fail=1; }
+          [ -n "$APP_STORE_CONNECT_ISSUER_ID" ] && echo "✅ APP_STORE_CONNECT_ISSUER_ID set" || { echo "::error::APP_STORE_CONNECT_ISSUER_ID is empty"; fail=1; }
+          if echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode 2>/dev/null | grep -q "PRIVATE KEY"; then
+            echo "✅ APP_STORE_CONNECT_PRIVATE_KEY is a .p8 private key"
+            # Smoke-test the API key end to end the way Apple intends now: mint an
+            # ES256 JWT from the .p8 and call the App Store Connect API. Xcode 26's
+            # altool (what macos-latest resolves to since the macOS 26 rollout)
+            # dropped API-key auth from `altool --list-providers` — username/
+            # password only there now — so the old check failed on every macOS 26
+            # run even with a valid key. --generate-jwt + GET /v1/apps is the same
+            # auth the upload uses and is independent of altool subcommand changes;
+            # a bad key/issuer/role fails here in ~1 min with the real HTTP status.
+            if [ -n "$APP_STORE_CONNECT_KEY_ID" ] && [ -n "$APP_STORE_CONNECT_ISSUER_ID" ]; then
+              mkdir -p "$HOME/.appstoreconnect/private_keys"
+              KEYF="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+              echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$KEYF"
+              # Mint the ES256 App Store Connect JWT with openssl + python stdlib
+              # only — NOT altool. GitHub's macos-latest is mid-migration and lands
+              # unpredictably on macOS 15 (altool 8.303) or macOS 26 (altool 26.x),
+              # whose altool builds disagree on JWT / --list-providers support, so
+              # any altool-based check is a coin flip. openssl+python are identical
+              # on every runner image. python parses openssl's DER ECDSA signature
+              # into the JOSE raw r||s (64 bytes) the JWT spec wants.
+              NOW=$(date +%s)
+              b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+              HDR=$(printf '{"alg":"ES256","kid":"%s","typ":"JWT"}' "$APP_STORE_CONNECT_KEY_ID" | b64url)
+              PL=$(printf '{"iss":"%s","iat":%d,"exp":%d,"aud":"appstoreconnect-v1"}' "$APP_STORE_CONNECT_ISSUER_ID" "$NOW" "$((NOW + 600))" | b64url)
+              SI="${HDR}.${PL}"
+              SIG=$(printf '%s' "$SI" | openssl dgst -sha256 -sign "$KEYF" \
+                    | python3 -c 'import sys,base64; der=sys.stdin.buffer.read(); i=2 if der[1]<0x80 else 2+(der[1]&0x7f); rl=der[i+1]; r=der[i+2:i+2+rl]; j=i+2+rl; sl=der[j+1]; s=der[j+2:j+2+sl]; print(base64.urlsafe_b64encode(r.lstrip(b"\x00").rjust(32,b"\x00")+s.lstrip(b"\x00").rjust(32,b"\x00")).decode().rstrip("="))')
+              JWT="${SI}.${SIG}"
+              if [ -z "$SIG" ]; then
+                echo "::error::Could not sign the App Store Connect JWT — the .p8 in APP_STORE_CONNECT_PRIVATE_KEY may be malformed (openssl/python signing failed above)."
+                fail=1
+              else
+                code=$(curl -sS -o "$RUNNER_TEMP/asc.json" -w '%{http_code}' \
+                  -H "Authorization: Bearer $JWT" \
+                  "https://api.appstoreconnect.apple.com/v1/apps?limit=1")
+                case "$code" in
+                  200) echo "✅ App Store Connect API key authenticates." ;;
+                  401) echo "::error::App Store Connect rejected the key (401) — APP_STORE_CONNECT_KEY_ID / APP_STORE_CONNECT_ISSUER_ID / .p8 don't match, or the key was revoked."; fail=1 ;;
+                  403) echo "::error::Key authenticates but isn't authorized (403) — it needs the App Manager (or Admin) role to upload builds."; fail=1 ;;
+                  *)   echo "::error::App Store Connect auth check returned HTTP $code: $(cat "$RUNNER_TEMP/asc.json" 2>/dev/null)"; fail=1 ;;
+                esac
+              fi
+              rm -f "$KEYF"
+            fi
+          else echo "::error::APP_STORE_CONNECT_PRIVATE_KEY is not a base64-encoded .p8 private key."; fail=1; fi
+
+          if [ "$fail" != "0" ]; then
+            echo ""; echo "Preflight FAILED — fix the secrets above; the builds were skipped to save time."; exit 1
+          fi
+          echo ""; echo "Preflight passed ✅ — certs, provisioning profile, and API key all look good."
+
+  # ── Build (both arches on ONE arm64 runner; x86_64 cross-compiled) ───────────
+  # macOS ships a universal SDK, so an Apple-Silicon runner builds
+  # x86_64-apple-darwin natively — no separate Intel runner (which was flaky on
+  # actions/cache and is EOL in 2027 anyway). One job emits both slices; the
+  # package job lipos them into a universal binary exactly as before.
+
+  build:
+    name: Build (arm64 + x86_64 cross)
+    needs: preflight
+    if: ${{ github.event.inputs.preflight_only != 'true' }}
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    timeout-minutes: 45   # a hung actions/cache step can't sit for the 6h default
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      - name: Add both macOS targets to the pinned (nightly) toolchain
+        run: |
+          # rust-toolchain.toml pins nightly, so cargo uses THAT — not stable.
+          # `rustup show` (run in the checked-out repo) auto-installs the pinned
+          # toolchain; then add both macOS targets to it. The host arm64 std is
+          # already present, but x86_64 must be added or the cross build can't
+          # find core/std (adding it to stable via dtolnay wouldn't help — the
+          # build uses nightly). Mirrors the riscv64 job in release.yml.
+          rustup show
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-universal-appstore-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # ── Guideline 2.5.1, part 1: the winit patch must actually apply ─────────
+      # winit's macOS backend calls the private SkyLight APIs
+      # `_CGSSetWindowBackgroundBlurRadius` / `_CGSMainConnectionID` from
+      # `WindowDelegate::set_blur`. IRIS never requests blur, but the import
+      # lands in the binary anyway and Apple's static scan rejects it — that is
+      # what killed submission 2ed07ab1. `third_party/winit-0.30.13/` is a
+      # vendored copy with the call stubbed out, wired in via `[patch.crates-io]`.
+      #
+      # The dangerous failure mode is silent: a patch that matches nothing makes
+      # cargo print "patch ... was not used in the crate graph" and fall back to
+      # the UNPATCHED registry crate — the build still succeeds. So assert the
+      # patched (path-sourced, i.e. no `source =` line) winit is really in the
+      # resolved graph. Cargo.lock is gitignored, so resolve it here first
+      # instead of reading a file a fresh checkout doesn't have.
+      #
+      # A registry winit ALONGSIDE the patched one is only a warning: the patch
+      # matches the 0.30.x requirement only, so `iris`'s own winit 0.29 (used for
+      # the KeyCode type) stays unpatched. It has historically been dead-stripped
+      # — but it is exactly the copy that regressed on 2026-08-03, so it is worth
+      # naming. The nm gate after the build is the authoritative check.
+      # Detail: rules/macos/appstore-private-api.md
+      - name: Resolve the graph and verify the winit patch applied
+        run: |
+          cargo fetch
+          winits=$(awk '
+            /^\[\[package\]\]/ { name=""; ver=""; src="patched" }
+            /^name = /    { gsub(/"/,""); name=$3 }
+            /^version = / { gsub(/"/,""); ver=$3 }
+            /^source = /  { src="registry" }
+            /^$/          { if (name=="winit") { print ver, src; name="" } }
+            END           { if (name=="winit") print ver, src }
+          ' Cargo.lock)
+          echo "winit in the resolved graph:"
+          printf '%s\n' "$winits" | sed 's/^/  /'
+          if ! printf '%s\n' "$winits" | grep -q ' patched$'; then
+            echo "::error::No path-patched winit in the resolved graph — [patch.crates-io] winit = { path = \"third_party/winit-0.30.13\" } did not apply, so this build links the UNPATCHED winit and imports the private SkyLight API. App Store review rejects that under guideline 2.5.1. See rules/macos/appstore-private-api.md."
+            exit 1
+          fi
+          unpatched=$(printf '%s\n' "$winits" | grep -c ' registry$' || true)
+          if [ "$unpatched" != "0" ]; then
+            echo "::warning::${unpatched} winit copy/copies resolve from the registry and are NOT covered by [patch.crates-io] (it matches the 0.30.x requirement only). Their set_blur still calls the private SkyLight API; it is dead-stripped today, but this is the condition that regressed on 2026-08-03. Unifying the graph on winit 0.30.13 removes the risk — see rules/macos/appstore-private-api.md."
+          fi
+
+      - name: Build iris-gui for both arches (lightning + CHD, App Store)
+        env:
+          # Baked into APP_VERSION by iris-gui/build.rs and shown in About.
+          # Must equal the CFBundleVersion the packaging job writes.
+          RELEASE_VERSION: ${{ needs.preflight.outputs.bundle_version }}
+        run: |
+          cargo build --release --target aarch64-apple-darwin -p iris-gui \
+            --features iris/lightning,appstore
+          cargo build --release --target x86_64-apple-darwin  -p iris-gui \
+            --features iris/lightning,appstore
+
+      # ── App Store gate: no private SkyLight API in the linked binaries ───────
+      # eframe → egui-winit → winit calls the private `_CGSSetWindowBackgroundBlurRadius`
+      # (via `_CGSMainConnectionID`) in `WindowDelegate::set_blur`. IRIS never
+      # requests blur, but the import lands in the binary regardless and Apple's
+      # static scan rejects it under guideline 2.5.1 — submission 2ed07ab1 died
+      # exactly this way. third_party/winit-0.30.13 stubs the call out; this gate
+      # proves the stub actually took effect, on the linked binary, before we
+      # spend a job signing and uploading something Apple will bounce.
+      #
+      # `_CGShieldingWindowLevel` is PUBLIC CoreGraphics and legitimately appears
+      # in `nm -u` — never match on it. It is used here as a positive control: a
+      # silently-broken `nm` returning nothing would otherwise grep "clean".
+      # Do NOT try to attribute the symbol by running `nm` over rlibs in
+      # target/*/release/deps — the release profile is `lto = "fat"`, so those
+      # hold LLVM bitcode and `nm` reports "no symbols", which proves nothing.
+      - name: Check for private SkyLight API symbols
+        run: |
+          fail=0
+          check() {
+            bin="$1"
+            if [ ! -f "$bin" ]; then
+              echo "::error::$bin does not exist — the private-API check could not run."
+              fail=1; return
+            fi
+            if ! undef=$(nm -u "$bin"); then
+              echo "::error::nm -u failed on $bin — failing rather than passing a check that did not run."
+              fail=1; return
+            fi
+            if ! printf '%s\n' "$undef" | grep -q '_CGShieldingWindowLevel'; then
+              echo "::error::$bin: nm -u returned $(printf '%s\n' "$undef" | wc -l | tr -d ' ') lines but not the expected PUBLIC _CGShieldingWindowLevel import. The control failed, so a clean private-API result can't be trusted — investigate before shipping."
+              fail=1; return
+            fi
+            if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
+              echo "::error::Private SkyLight API symbol found in $bin — App Store guideline 2.5.1 will reject this build. See rules/macos/appstore-private-api.md."
+              printf '%s\n' "$undef" | grep -E '_CGS' || true
+              fail=1; return
+            fi
+            echo "OK: no private SkyLight symbols in $bin"
+          }
+          check target/aarch64-apple-darwin/release/iris-gui
+          check target/x86_64-apple-darwin/release/iris-gui
+          exit $fail
+
+      - name: Upload arm64 binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: iris-gui-arm64
+          path: target/aarch64-apple-darwin/release/iris-gui
+
+      - name: Upload x86_64 binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: iris-gui-x64
+          path: target/x86_64-apple-darwin/release/iris-gui
+
+  # ── Package and submit ───────────────────────────────────────────────────────
+
+  package-and-submit:
+    name: Package and Submit
+    needs: [preflight, build]
+    if: ${{ github.event.inputs.preflight_only != 'true' }}
+    runs-on: ${{ github.event.inputs.runner_image || 'macos-26' }}
+    env:
+      HAS_CERTS: ${{ secrets.APP_STORE_APP_CERT != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+
+      # Reuse the version stamped by the preflight job so the binary's baked-in
+      # APP_VERSION and the Info.plist CFBundleVersion are identical (re-running
+      # `date` here would drift by the build duration).
+      - name: Generate version
+        id: version
+        run: |
+          echo "version=${{ needs.preflight.outputs.version }}" >> $GITHUB_OUTPUT
+          echo "bundle_version=${{ needs.preflight.outputs.bundle_version }}" >> $GITHUB_OUTPUT
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: bins
+
+      - name: Create universal binary with lipo
+        run: |
+          chmod +x bins/iris-gui-arm64/iris-gui bins/iris-gui-x64/iris-gui
+          lipo -create -output iris-gui-universal \
+            bins/iris-gui-arm64/iris-gui \
+            bins/iris-gui-x64/iris-gui
+          lipo -info iris-gui-universal
+
+      - name: Import certificates
+        env:
+          APP_STORE_APP_CERT: ${{ secrets.APP_STORE_APP_CERT }}
+          APP_STORE_APP_CERT_PWD: ${{ secrets.APP_STORE_APP_CERT_PWD }}
+          APP_STORE_INSTALLER_CERT: ${{ secrets.APP_STORE_INSTALLER_CERT }}
+          APP_STORE_INSTALLER_CERT_PWD: ${{ secrets.APP_STORE_INSTALLER_CERT_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/appstore.keychain-db
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          import_cert() {
+            local b64="$1" pwd="$2"
+            local path=$RUNNER_TEMP/cert_$RANDOM.p12
+            echo "$b64" | base64 --decode > "$path"
+            security import "$path" -P "$pwd" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            rm "$path"
+          }
+
+          import_cert "$APP_STORE_APP_CERT"       "$APP_STORE_APP_CERT_PWD"
+          import_cert "$APP_STORE_INSTALLER_CERT" "$APP_STORE_INSTALLER_CERT_PWD"
+
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+      - name: Resolve signing identities
+        id: identities
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/appstore.keychain-db
+          # List every identity (cert+key pair) that imported. Both the App and
+          # Installer distribution identities must appear here.
+          echo "Identities in keychain:"
+          security find-identity "$KEYCHAIN" || true
+
+          APP_ID=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "3rd Party Mac Developer Application" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+          # The installer (Mac Installer Distribution) cert isn't valid for the
+          # codesigning policy, so use the unfiltered list. It only shows up if
+          # the .p12 contained the certificate AND its private key.
+          INSTALLER_ID=$(security find-identity "$KEYCHAIN" \
+            | grep "3rd Party Mac Developer Installer" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+
+          if [ -z "$APP_ID" ]; then
+            echo "::error::No '3rd Party Mac Developer Application' identity in the keychain. APP_STORE_APP_CERT must be a base64 .p12 containing that certificate and its private key."
+            exit 1
+          fi
+          if [ -z "$INSTALLER_ID" ]; then
+            echo "::error::No '3rd Party Mac Developer Installer' identity in the keychain. APP_STORE_INSTALLER_CERT must be a base64 .p12 that contains the Mac Installer Distribution certificate AND its private key — export the *identity* from Keychain Access (the row with a disclosure triangle hiding a private key), not just the certificate. Also confirm APP_STORE_INSTALLER_CERT_PWD matches the export password."
+            exit 1
+          fi
+
+          echo "app_identity=$APP_ID" >> $GITHUB_OUTPUT
+          echo "installer_identity=$INSTALLER_ID" >> $GITHUB_OUTPUT
+          echo "App identity:       $APP_ID"
+          echo "Installer identity: $INSTALLER_ID"
+
+      - name: Embed provisioning profile and build .app bundle
+        env:
+          APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
+          VER: ${{ steps.version.outputs.version }}
+          BUNDLE_VER: ${{ steps.version.outputs.bundle_version }}
+        run: |
+          BUNDLE="IRIS.app"
+          mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
+
+          cp iris-gui-universal "${BUNDLE}/Contents/MacOS/iris-gui"
+          chmod +x "${BUNDLE}/Contents/MacOS/iris-gui"
+          cp "iris-gui/assets/icons/icon.icns" "${BUNDLE}/Contents/Resources/AppIcon.icns"
+
+          # Embed provisioning profile (required for App Store)
+          echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode \
+            > "${BUNDLE}/Contents/embedded.provisionprofile"
+
+          cat > "${BUNDLE}/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>IRIS</string>
+            <key>CFBundleDisplayName</key><string>IRIS</string>
+            <key>CFBundleIdentifier</key><string>${{ env.BUNDLE_ID }}</string>
+            <key>CFBundleVersion</key><string>${BUNDLE_VER}</string>
+            <key>CFBundleShortVersionString</key><string>${BUNDLE_VER}</string>
+            <key>CFBundleExecutable</key><string>iris-gui</string>
+            <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+            <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
+            <!-- Export compliance: the shipping app uses no non-exempt
+                 encryption. Its own network path is plaintext (src/registry.rs
+                 is explicitly no-TLS); the only TLS-capable crates (rustls/ring)
+                 are BUILD-time deps of libchdman-rs's downloader and are not in
+                 the runtime binary. Setting this false suppresses the per-build
+                 export-compliance question in App Store Connect. -->
+            <key>ITSAppUsesNonExemptEncryption</key><false/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Sign .app with entitlements
+        env:
+          IDENTITY: ${{ steps.identities.outputs.app_identity }}
+        run: |
+          codesign --force --options runtime \
+            --entitlements installer/iris-gui.entitlements \
+            --sign "$IDENTITY" \
+            IRIS.app
+          codesign --verify --deep --strict IRIS.app
+          echo "Signature verified."
+
+      # Second half of the guideline-2.5.1 gate (the first runs on the thin
+      # binaries in the build job). Cheap, and it covers the universal binary as
+      # actually shipped — a wrong artifact download or a stale lipo input can't
+      # sneak the private symbol past the earlier check. `nm -u` on a fat binary
+      # lists both slices' undefined symbols.
+      - name: Re-check the signed bundle for private SkyLight symbols
+        run: |
+          BIN="IRIS.app/Contents/MacOS/iris-gui"
+          undef=$(nm -u "$BIN") || { echo "::error::nm -u failed on $BIN"; exit 1; }
+          if ! printf '%s\n' "$undef" | grep -q '_CGShieldingWindowLevel'; then
+            echo "::error::$BIN: the public _CGShieldingWindowLevel control import is missing, so this check can't be trusted."
+            exit 1
+          fi
+          if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
+            echo "::error::Private SkyLight API symbol found in the shipping bundle $BIN — App Store guideline 2.5.1 will reject this. See rules/macos/appstore-private-api.md."
+            printf '%s\n' "$undef" | grep -E '_CGS' || true
+            exit 1
+          fi
+          echo "OK: no private SkyLight symbols in $BIN"
+
+      - name: Package with productbuild
+        env:
+          IDENTITY: ${{ steps.identities.outputs.installer_identity }}
+          VER: ${{ steps.version.outputs.version }}
+        run: |
+          productbuild \
+            --component IRIS.app /Applications \
+            --sign "$IDENTITY" \
+            "IRIS-appstore-${VER}.pkg"
+
+      - name: Validate package
+        env:
+          VER: ${{ steps.version.outputs.version }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          # altool locates the key by convention: AuthKey_<KEYID>.p8 under
+          # ~/.appstoreconnect/private_keys (it has no --apiPrivateKeyPath flag).
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEYF="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$KEYF"
+          xcrun altool --validate-app \
+            --type osx \
+            --file "IRIS-appstore-${VER}.pkg" \
+            --apiKey    "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          rm -f "$KEYF"
+
+      - name: Submit to App Store Connect
+        if: ${{ github.event.inputs.validate_only != 'true' }}
+        env:
+          VER: ${{ steps.version.outputs.version }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          KEYF="$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$KEYF"
+          xcrun altool --upload-app \
+            --type osx \
+            --file "IRIS-appstore-${VER}.pkg" \
+            --apiKey    "$APP_STORE_CONNECT_KEY_ID" \
+            --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
+          rm -f "$KEYF"
+          echo "Submitted. Check App Store Connect for processing status."
+
+      - name: Upload .pkg as artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: IRIS-appstore-${{ steps.version.outputs.version }}
+          path: IRIS-appstore-${{ steps.version.outputs.version }}.pkg
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/appstore.keychain-db
+          [ -f "$KEYCHAIN_PATH" ] && security delete-keychain "$KEYCHAIN_PATH" || true
