@@ -1383,8 +1383,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// inert rather than broken on a machine without ppmem.
     ///
     /// # Safety
-    /// `base` must be ppmem's window base and `bitmap` a live `u64` that
-    /// outlives this cache.
+    /// `base` must be ppmem's window base, and must outlive this cache.
+    ///
+    /// The bitmap is *not* passed here — ppmem publishes into the cache's own
+    /// inline field via `MappedMemory::set_bitmap_sink2(tc_bitmap_ptr())`,
+    /// which callers must wire up separately (see `machine.rs`).
     #[cfg(feature = "tcache")]
     pub unsafe fn set_tcache_window_impl(&self, base: *mut u8) {
         unsafe { *self.tc_base.get() = base };
@@ -5744,7 +5747,10 @@ mod tcache_hitrate {
         let region = 64 * 1024 * 1024u64;
         space.map_bank(0, 0x0800_0000, region, region).unwrap();
         let cache = R4400Cache::new(bank.clone() as Arc<dyn BusDevice>);
-        unsafe { cache.set_tcache_window_impl(space.window_base(), space.bitmap_ptr()) };
+        unsafe {
+            cache.set_tcache_window_impl(space.window_base());
+            space.set_bitmap_sink2(cache.tc_bitmap_ptr());
+        }
 
         // Walk 1MB sequentially by doubleword: a 16-byte line means one fill
         // per 2 accesses at worst, and far fewer once lines are resident.
@@ -5771,7 +5777,10 @@ mod tcache_hitrate {
         let region = 64 * 1024 * 1024u64;
         space.map_bank(0, 0x0800_0000, region, region).unwrap();
         let cache = R4400Cache::new(bank.clone() as Arc<dyn BusDevice>);
-        unsafe { cache.set_tcache_window_impl(space.window_base(), space.bitmap_ptr()) };
+        unsafe {
+            cache.set_tcache_window_impl(space.window_base());
+            space.set_bitmap_sink2(cache.tc_bitmap_ptr());
+        }
 
         let (p0, h0) = tc_stats();
         for i in 0..1000u64 {

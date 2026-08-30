@@ -60,6 +60,17 @@ mod zz_corpus {
                 core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
             }
         };
+        // R4400 L1-D: 16 KiB direct-mapped, 32-byte lines; 1 MiB L2 with
+        // 128-byte lines. Matches `CpuCache::jit_dc_geometry` for the Indy.
+        let geom = crate::mips_cache_v2::JitDcGeometry {
+            supported: true,
+            line_shift: 5,
+            num_lines_mask: (16 * 1024 / 32) - 1,
+            data_mask: 16 * 1024 - 1,
+            has_l2: true,
+            l2_line_shift: 7,
+            l2_num_lines_mask: (1024 * 1024 / 128) - 1,
+        };
         let mut total: u64 = 0;
         let mut n_ok = 0u64;
         let mut n_decl = 0u64;
@@ -89,6 +100,11 @@ mod zz_corpus {
             // register load — which silently made this benchmark blind to the
             // whole constant-baking change.
             cg.jit_consts = consts;
+            // Real L1-D geometry, so `emit_inline_mem_guard` actually emits
+            // the inline fast path. With the default `unsupported()` the
+            // guard is skipped entirely and this benchmark silently measures
+            // callout-only code — invisible to any change in the inline path.
+            cg.dc_geometry = geom;
             let f: Option<JitFn> = cg.compile_region(&mut ins, off, true, false);
             if f.is_some() { total += cg.last_code_size() as u64; n_ok += 1; }
             else { n_decl += 1; }
