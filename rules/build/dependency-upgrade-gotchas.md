@@ -23,10 +23,12 @@ breaks in a way that reproduces on no other platform.
 `Cargo.toml` now declares both features explicitly. **Don't "simplify" that back
 down to one feature.**
 
-macOS/Linux dev boxes cannot catch this: `windows-sys` is a hard (non
-target-gated) dependency, so Cargo *validates the feature names* everywhere, but
-the module itself only compiles on Windows. Cargo accepting the manifest proves
-nothing about the Windows build.
+macOS/Linux dev boxes cannot catch this: the module only compiles on Windows, so
+Cargo accepting the manifest proves nothing about the Windows build. Until
+2026-08-31 `windows-sys` was a hard (non target-gated) dependency, which at
+least made Cargo *validate the feature names* on every host; it is now gated to
+`cfg(target_os = "windows")` (see the riscv64 section below), so off-Windows not
+even the feature names are checked.
 
 ## cpal 0.18 API churn (`src/hal2.rs`)
 
@@ -89,3 +91,44 @@ shares crates with them: `winit`, `glutin`, `glutin-winit`, `glow`,
 Side effect worth knowing: iris's own `glow` (0.13) and egui's (0.17) are still
 two versions in the lockfile. `png` used to be split the same way and is now
 unified on 0.18.
+
+## windows-sys must stay under `cfg(target_os = "windows")` (riscv64, 2026-08-31)
+
+Symptom: the **riscv64 cross leg alone** fails while all nine other release legs
+are green —
+
+```
+error[E0425]: cannot find type `MEMORY_BASIC_INFORMATION` in this scope
+  --> .../windows-sys-0.61.2/src/Windows/Win32/System/Memory/mod.rs:109
+error: could not compile `windows-sys` (lib) due to 2 previous errors
+```
+
+Cause: `windows-sys` sat in the plain `[dependencies]` table, so Cargo built it
+for **every** target. Its `windows_link::link!` declarations expand on any
+target, but the arch-dependent structs are defined only for the architectures
+Windows runs on (x86, x86_64, aarch64, arm). `riscv64gc` matches none of them,
+so `VirtualQuery`/`VirtualQueryEx` end up naming a type that was never defined.
+x64/arm64 Linux and macOS never noticed: their arch *is* one Windows supports,
+so the structs exist and the crate compiles as dead weight.
+
+Trigger: commit 73a10e2 added the `Win32_System_Memory` feature (for ppmem's
+`map_windows.rs`). The previously enabled features happened to declare nothing
+that referenced an arch-gated struct, so the latent breakage only surfaced then.
+
+Fix: the dependency now lives in
+`[target.'cfg(target_os = "windows")'.dependencies]`. Both consumers were
+already gated — `src/thread_affinity.rs` behind `#[cfg(windows)]`, and
+`src/ppmem/map_windows.rs` reached only via `#[cfg_attr(windows, path = ...)]`
+in `src/ppmem/map.rs` — so nothing off-Windows ever referenced the crate.
+
+**Before adding another `Win32_*` feature**, confirm the crate stays out of the
+non-Windows graphs:
+
+```
+cargo tree -e normal --target riscv64gc-unknown-linux-gnu -i windows-sys
+# must print "nothing to print"
+```
+
+Related: `Cargo.lock` is gitignored, so CI re-resolves the graph on every run.
+A build can go red with no commit touching the code that broke — check the
+resolved crate versions in the log before hunting through the diff.
