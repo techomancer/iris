@@ -1070,49 +1070,20 @@ impl Codegen {
 
             let status = match helper {
                 MemHelper::Load { size, extend } => {
-                    let (val, status) = emit_mem_read_raw(&mut hctx, vaddr, size);
-                    // Extend here, in the helper, rather than at every call
-                    // site: `read*_fn` hands back a zero-extended u64 and a
-                    // signed load would otherwise have to `ireduce` +
-                    // `sextend` it back at the site. Baking the extension
-                    // into the helper's identity removes that entirely.
-                    let val = match (size, extend) {
-                        (MemSize::B8, _) => val,
-                        (_, LoadExtend::Zero) => val,
-                        (_, LoadExtend::Sign) => {
-                            let narrow = hctx.builder.ins().ireduce(size.ir_type(), val);
-                            hctx.builder.ins().sextend(ir::types::I64, narrow)
-                        }
-                    };
-                    // Write-back is the helper's job too, so the call site
-                    // needs no return value and no store of its own. `third`
-                    // is a byte offset into `MipsCore` chosen at compile time
-                    // — the real `gpr[rt]` slot, or `gpr_scratch` when
-                    // `rt == 0` (a load to r0 must still fault and still fill
-                    // the cache; only the write-back is inert).
-                    //
-                    // **Only on success.** A faulting load must leave `rt`
-                    // untouched: `exec_lw` and friends write the GPR inside
-                    // the `Ok` arm only, and the exception handler may resume
-                    // the instruction. Storing unconditionally would clobber
-                    // `rt` with the callout's zero placeholder on every TLB
-                    // miss — architecturally wrong and silently corrupting.
-                    let ok_block = hctx.builder.create_block();
-                    let done_block = hctx.builder.create_block();
-                    let faulted = hctx.builder.ins().icmp_imm_s(
-                        IntCC::NotEqual, status, EXEC_COMPLETE as i64);
-                    hctx.builder.ins().brif(faulted, done_block, &[], ok_block, &[]);
-
-                    hctx.builder.switch_to_block(ok_block);
-                    hctx.builder.seal_block(ok_block);
+                    // `third` is a byte offset into `MipsCore` chosen at
+                    // compile time — the real `gpr[rt]` slot, or
+                    // `gpr_scratch` when `rt == 0` (a load to r0 must still
+                    // fault and still fill the cache; only the write-back is
+                    // inert). `read*_fn`/`read*_sext_fn` write the final,
+                    // already-extended value straight there — only on
+                    // success (`exec_lw` and friends write the GPR inside the
+                    // `Ok` arm only; the exception handler may resume the
+                    // instruction, so a faulting load must leave `rt`
+                    // untouched), which `emit_mem_read_raw` guarantees on
+                    // both its fast and slow paths. Nothing else to do here:
+                    // the value never comes back to this function at all.
                     let dst = hctx.builder.ins().iadd(core_ptr, third);
-                    hctx.builder.ins().store(MemFlagsData::trusted(), val, dst,
-                                             ir::immediates::Offset32::new(0));
-                    hctx.builder.ins().jump(done_block, &[]);
-
-                    hctx.builder.switch_to_block(done_block);
-                    hctx.builder.seal_block(done_block);
-                    status
+                    emit_mem_read_raw(&mut hctx, vaddr, size, dst, extend)
                 }
                 MemHelper::Store { size } => emit_mem_write_raw(&mut hctx, vaddr, third, size),
             };
@@ -3110,6 +3081,12 @@ fn core_offset_of_read32_fn() -> i32 { std::mem::offset_of!(MipsCore, read32_fn)
 #[cfg(feature = "jitv2")]
 fn core_offset_of_read64_fn() -> i32 { std::mem::offset_of!(MipsCore, read64_fn) as i32 }
 #[cfg(feature = "jitv2")]
+fn core_offset_of_read8_sext_fn() -> i32 { std::mem::offset_of!(MipsCore, read8_sext_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_read16_sext_fn() -> i32 { std::mem::offset_of!(MipsCore, read16_sext_fn) as i32 }
+#[cfg(feature = "jitv2")]
+fn core_offset_of_read32_sext_fn() -> i32 { std::mem::offset_of!(MipsCore, read32_sext_fn) as i32 }
+#[cfg(feature = "jitv2")]
 fn core_offset_of_write8_fn() -> i32 { std::mem::offset_of!(MipsCore, write8_fn) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_write16_fn() -> i32 { std::mem::offset_of!(MipsCore, write16_fn) as i32 }
@@ -3145,12 +3122,20 @@ impl MemSize {
         match self { MemSize::B1 => 0, MemSize::B2 => 1, MemSize::B4 => 2, MemSize::B8 => 3 }
     }
 
-    fn read_fn_offset(self) -> i32 {
-        match self {
-            MemSize::B1 => core_offset_of_read8_fn(),
-            MemSize::B2 => core_offset_of_read16_fn(),
-            MemSize::B4 => core_offset_of_read32_fn(),
-            MemSize::B8 => core_offset_of_read64_fn(),
+    /// `extend` picks the hook variant: sub-64-bit widths have a plain
+    /// (zero-extending) and a sign-extending version, each writing the
+    /// already-fully-extended final value to `dst` — no reload/re-extend
+    /// needed at any call site. B8 never extends, so both variants collapse
+    /// to the one `read64_fn`.
+    fn read_fn_offset(self, extend: LoadExtend) -> i32 {
+        match (self, extend) {
+            (MemSize::B1, LoadExtend::Zero) => core_offset_of_read8_fn(),
+            (MemSize::B1, LoadExtend::Sign) => core_offset_of_read8_sext_fn(),
+            (MemSize::B2, LoadExtend::Zero) => core_offset_of_read16_fn(),
+            (MemSize::B2, LoadExtend::Sign) => core_offset_of_read16_sext_fn(),
+            (MemSize::B4, LoadExtend::Zero) => core_offset_of_read32_fn(),
+            (MemSize::B4, LoadExtend::Sign) => core_offset_of_read32_sext_fn(),
+            (MemSize::B8, _) => core_offset_of_read64_fn(),
         }
     }
     fn write_fn_offset(self) -> i32 {
@@ -3568,48 +3553,53 @@ fn emit_mem_helper_call(ctx: &mut EmitCtx, addr: i64, vaddr: Value, third: Value
     ctx.builder.inst_results(call)[0]
 }
 
-/// Guard + data path for a load, returning `(value, status)` without checking
-/// the status. Split out of [`emit_mem_read`] so the shared helper
-/// (`build_mem_helper`) can reuse exactly the same emission and *return* the
-/// status to its caller rather than branching to an exception exit it does
-/// not have.
-fn emit_mem_read_raw(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> (Value, Value) {
+/// Guard + data path for a load, returning `status` without checking it.
+/// `dst` is where the loaded value ends up — the real destination when the
+/// caller has one, a scratch slot otherwise (see `read32_fn`'s doc comment).
+/// `extend` picks zero- vs sign-extension; the final, already-extended value
+/// always lands at `dst` directly, on every path (inline fast, callout slow),
+/// so no caller ever needs to reload and re-extend it themselves.
+/// Split out of [`emit_mem_read`] so the shared helper (`build_mem_helper`)
+/// can reuse exactly the same emission and *return* the status to its caller
+/// rather than branching to an exception exit it does not have.
+fn emit_mem_read_raw(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, dst: Value, extend: LoadExtend) -> Value {
     if inline_mem_enabled() {
         if let Some(path) = emit_inline_mem_guard::<false>(ctx, vaddr, size) {
             INLINE_MEM_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return emit_mem_read_split(ctx, vaddr, size, path);
+            return emit_mem_read_split(ctx, vaddr, size, path, dst, extend);
         }
     }
     INLINE_MEM_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    emit_mem_read_callout(ctx, vaddr, size)
+    emit_mem_read_callout(ctx, vaddr, size, dst, extend)
 }
 
+/// Generic read for callers that need the value back as an SSA value
+/// (FPU loads, LWL/LDL/LWR/LDR) rather than written straight to a GPR —
+/// see `read32_fn`'s doc comment on why those two cases differ. Always
+/// zero-extends (none of those callers want sign extension of the raw
+/// bytes). Routes the value through `jit_read_scratch` and reloads it;
+/// `emit_load`'s GPR-destination fast path (`build_mem_helper`) skips that
+/// round trip entirely by passing the real destination as `dst` instead.
 fn emit_mem_read(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> Value {
-    // Inline fast path: nutlb hit + L1-D tag hit (+ mapped region under
-    // tcache) reads the host address directly, no callout. Returns None when
-    // the build/cache cannot support it, in which case only the callout below
-    // is emitted, exactly as before.
-    // Attempt 2 (docs/jit-inline-memory.md §8): call the once-per-module
-    // helper instead of the Rust wrapper. Same single straight-line `call` at
-    // the site — no extra blocks, so the caller's register allocation is
-    // untouched — but the callee returns without entering `read_data` on the
-    // ~82% of loads that hit.
-    let (val, status) = emit_mem_read_raw(ctx, vaddr, size);
+    let scratch_off = std::mem::offset_of!(MipsCore, jit_read_scratch) as i64;
+    let dst = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, scratch_off);
+    let status = emit_mem_read_raw(ctx, vaddr, size, dst, LoadExtend::Zero);
     // The status is a live SSA value here, so the check reads a register
     // rather than reloading a MipsCore field.
     emit_check_mem_status(ctx, status);
-    val
+    ctx.builder.ins().load(ir::types::I64, MemFlagsData::trusted(), dst, ir::immediates::Offset32::new(0))
 }
 
 /// Fast/slow join for an inline load. On entry the builder sits in the fast
-/// block with `path.fast_data_ptr` live.
+/// block with `path.fast_data_ptr` live. `dst` (see `emit_mem_read_raw`) is
+/// defined in the caller's block, so it dominates both `fast_block` and
+/// `slow_block` without needing to ride the join as a block param.
 fn emit_mem_read_split(
-    ctx: &mut EmitCtx, vaddr: Value, size: MemSize, path: InlineMemPath,
-) -> (Value, Value) {
+    ctx: &mut EmitCtx, vaddr: Value, size: MemSize, path: InlineMemPath, dst: Value, extend: LoadExtend,
+) -> Value {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
 
-    let val = ctx.builder.append_block_param(path.join_block, i64t);
     // Status rides the join as a block param instead of a MipsCore field.
     // The fast path contributes a constant 0, so on the hot path this costs
     // nothing at all — where the old design paid an explicit store of
@@ -3617,8 +3607,6 @@ fn emit_mem_read_split(
     let status = ctx.builder.append_block_param(path.join_block, ir::types::I32);
 
     // --- fast: load from the swizzled host address ---
-    // Loaded zero-extended to I64, matching the read*_fn wrappers' contract
-    // (callers sign-extend themselves for LB/LH/LW).
     let raw = ctx.builder.ins().load(size.ir_type(), mem, path.fast_data_ptr,
                                      ir::immediates::Offset32::new(0));
     let raw = if size == MemSize::B8 {
@@ -3628,24 +3616,27 @@ fn emit_mem_read_split(
         { ctx.builder.ins().rotl_imm_s(raw, 32) }
         #[cfg(not(feature = "tcache"))]
         { raw }
+    } else if extend == LoadExtend::Sign {
+        ctx.builder.ins().sextend(i64t, raw)
     } else {
         ctx.builder.ins().uextend(i64t, raw)
     };
     // The inline path cannot fault (every failure condition was already
-    // checked by the guard), so its status is the constant EXEC_COMPLETE.
+    // checked by the guard), so it may write `dst` unconditionally.
+    ctx.builder.ins().store(mem, raw, dst, ir::immediates::Offset32::new(0));
     let ok = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
-    ctx.builder.ins().jump(path.join_block, &[raw.into(), ok.into()]);
+    ctx.builder.ins().jump(path.join_block, &[ok.into()]);
 
     // --- slow: the original callout ---
     ctx.builder.switch_to_block(path.slow_block);
     ctx.builder.set_cold_block(path.slow_block);
     ctx.builder.seal_block(path.slow_block);
-    let (slow_val, slow_status) = emit_mem_read_callout(ctx, vaddr, size);
-    ctx.builder.ins().jump(path.join_block, &[slow_val.into(), slow_status.into()]);
+    let slow_status = emit_mem_read_callout(ctx, vaddr, size, dst, extend);
+    ctx.builder.ins().jump(path.join_block, &[slow_status.into()]);
 
     ctx.builder.switch_to_block(path.join_block);
     ctx.builder.seal_block(path.join_block);
-    (val, status)
+    status
 }
 
 /// Values that are fixed for the life of the process by the time any region
@@ -3891,27 +3882,26 @@ fn callout_core_arg(ctx: &mut EmitCtx) -> Value {
     ctx.builder.ins().iadd_imm_s(ctx.core_ptr, CALLOUT_CORE_BIAS)
 }
 
-/// Returns `(value, status)` — both in registers, no memory round-trip.
-fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize) -> (Value, Value) {
-    let mem = MemFlagsData::trusted();
+/// Calls `read*_fn(core_ptr, vaddr, dst) -> status`, writing the loaded,
+/// already zero- or sign-extended (per `extend`) value through `dst` rather
+/// than returning it — see `read32_fn`'s doc comment for why (a real
+/// by-value return works out to a 16-byte struct, which the Microsoft x64
+/// ABI can't register-return).
+fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, dst: Value, extend: LoadExtend) -> Value {
     let ptr_ty = ctx.module.target_config().pointer_type();
 
-
-    let callee = emit_hook_callee(ctx, size.read_fn_offset());
+    let callee = emit_hook_callee(ctx, size.read_fn_offset(extend));
 
     let mut sig = ctx.module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I64)); // vaddr
-    // `JitReadResult` — two INTEGER eightbytes, returned in %rax:%rdx. Must
-    // match the struct's field order (val, status); see its doc comment.
-    sig.returns.push(AbiParam::new(ir::types::I64)); // val
+    sig.params.push(AbiParam::new(ptr_ty)); // dst
     sig.returns.push(AbiParam::new(ir::types::I32)); // status
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr]);
-    let r = ctx.builder.inst_results(call);
-    (r[0], r[1])
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, dst]);
+    ctx.builder.inst_results(call)[0]
 }
 
 /// Emit a call through `core.write{8,16,32,64}_fn(core_ptr, vaddr, value)`.

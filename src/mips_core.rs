@@ -177,26 +177,14 @@ impl CyclesPtr {
 /// `repr(Rust)` does not guarantee. Offsets must be computed via
 /// `std::mem::offset_of!` at codegen time, never hardcoded — cfg-gated fields are
 /// still fine, they just shift the layout deterministically per build.
-/// Return value of the JIT read hooks (`MipsCore::read{8,16,32,64}_fn`):
-/// the loaded value and its status, returned together **in registers**.
-///
-/// `#[repr(C)]` with two INTEGER-class fields totalling 16 bytes, which the
-/// x86-64 SysV ABI returns in `%rax:%rdx` — no hidden `sret` pointer, no
-/// memory traffic. (Verified in disassembly; if this struct ever grows past
-/// two eightbytes or gains a non-INTEGER field, it silently becomes an sret
-/// return and the whole point is lost.)
-///
-/// This replaced a `MipsCore::jit_mem_exc` scratch field. Passing status
-/// through memory meant every guest load paid a store and a reload: the
-/// callout wrote the field, the *inline* fast path had to write
-/// `EXEC_COMPLETE` to it as well (otherwise the check would see a stale fault
-/// from some earlier access), and the check then loaded it right back.
-/// Returning it in a register lets the value ride the fast/slow join as a
-/// plain block parameter instead.
+/// Paired result of a guest read, for Rust-to-Rust callers only (e.g.
+/// `MipsExecutor::lockstep_jit_read`) — **not** what `read{8,16,32,64}_fn`
+/// returns across the JIT FFI boundary (see that field's doc comment for
+/// why: this 16-byte `#[repr(C)]` struct used to be returned by value there
+/// and it broke on Windows).
 ///
 /// `status` is `EXEC_COMPLETE` (0) on success, or the fault's `ExecStatus`
-/// (`EXEC_IS_EXCEPTION` set for a real exception). Compiled code must check
-/// it before trusting `val`.
+/// otherwise. Callers must check it before trusting `val`.
 #[cfg(feature = "jitv2")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -381,25 +369,48 @@ pub struct MipsCore {
     /// typed pointers behind one `*mut c_void` parameter, passing the wrong
     /// one was silent (it wrote to `self + 2*offsetof(core)` rather than
     /// faulting) — see `codegen::emit_fpu_cvt_to_int_call`'s history.
-    /// Read wrappers: return the loaded value (zero-extended to u64 for
-    /// sub-64-bit widths, matching `MipsExecutor::read_data`'s own
-    /// convention) *and* the status, together, in registers — see
-    /// [`JitReadResult`].
+    /// Read wrappers: write the loaded value, already fully extended to u64,
+    /// through `dst` — the real destination when the caller has one
+    /// (`emit_write_gpr`'s slot; skips a copy entirely), or
+    /// `jit_read_scratch` when the caller just needs the value back as an
+    /// SSA value (FPU loads, LWL/LDL/LWR/LDR) — and return only the status.
+    /// Only written on success; a faulting load must leave `dst` untouched
+    /// (see `build_mem_helper`'s "only on success" note).
     ///
-    /// The status used to travel through the `jit_mem_exc` field instead.
-    /// That cost a store and a reload on every load: the callout stored it,
-    /// the inline fast path had to store `EXEC_COMPLETE` explicitly (or a
-    /// stale fault from an earlier access would be picked up), and
-    /// `emit_check_mem_exc` loaded it straight back — a store-to-load
-    /// round-trip through memory on the hot path of every single guest load.
+    /// `read8_fn`/`16`/`32` zero-extend (also `read64_fn`'s only option, a
+    /// full 64 bits already); `read8_sext_fn`/`16`/`32` sign-extend instead,
+    /// for LB/LH/LW — extension happens once, in the hook itself (or in the
+    /// inline fast path's own IR), never as a separate reload-and-re-extend
+    /// step at the call site, because sign-extending loads are common enough
+    /// to deserve the same zero-copy treatment as zero-extending ones, not
+    /// just "correct but pays a reload."
+    ///
+    /// Not `-> JitReadResult`: that used to be the return type (16 bytes,
+    /// `{val: u64, status: u32}`), returned in `%rax:%rdx` on SysV with no
+    /// hidden pointer — which is real SysV struct-return behavior, not a
+    /// Cranelift quirk, but the Microsoft x64 ABI has no equivalent carve-out
+    /// for a >8-byte-by-value return, always using a caller-supplied output
+    /// pointer instead and shifting every real argument one register right.
+    /// Cranelift's JIT-compiled caller didn't know to do that (two return
+    /// values fits *its own* register model fine, so its multi-return
+    /// legalization never triggered), so on Windows the real, rustc-compiled
+    /// callee read `ctx`'s value out of the register the caller had put `va`
+    /// in. `dst` sidesteps the question: every real C ABI register-returns a
+    /// single scalar, so that's all this signature asks for.
     #[cfg(feature = "jitv2")]
-    pub read8_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
+    pub read8_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
     #[cfg(feature = "jitv2")]
-    pub read16_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
+    pub read8_sext_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
     #[cfg(feature = "jitv2")]
-    pub read32_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
+    pub read16_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
     #[cfg(feature = "jitv2")]
-    pub read64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64) -> JitReadResult,
+    pub read16_sext_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub read32_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub read32_sext_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
+    #[cfg(feature = "jitv2")]
+    pub read64_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut u64) -> u32,
     /// Write wrappers: return `EXEC_COMPLETE` (0) on success or the fault's
     /// `ExecStatus` otherwise, in `%eax` — compiled code consumes the return
     /// value directly, exactly like the read path's `status`. Neither path
@@ -823,6 +834,13 @@ pub struct MipsCore {
     /// so adding it shifts no existing field's `offset_of!`.
     #[cfg(feature = "jitv2")]
     pub gpr_scratch: u64,
+    /// `dst` target for `read*_fn` callers that just want the value back as
+    /// an SSA value (FPU loads, LWL/LDL/LWR/LDR) rather than writing straight
+    /// to a GPR — see `read32_fn`'s doc comment. One shared slot: reads are
+    /// synchronous leaf calls from single-threaded compiled code, so only one
+    /// is ever in flight.
+    #[cfg(feature = "jitv2")]
+    pub jit_read_scratch: u64,
 }
 
 /// A completed real memory access, captured for `jitv2_lockstep`'s
@@ -978,7 +996,7 @@ impl NanoTlbEntry {
 /// `MipsExecutor::install_jit_hooks` runs. Panics — compiled code must never
 /// be dispatched against a core whose hooks aren't installed yet.
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_hooks_not_installed_read(_ctx: *mut core::ffi::c_void, _va: u64) -> JitReadResult {
+unsafe extern "C" fn jit_hooks_not_installed_read(_ctx: *mut core::ffi::c_void, _va: u64, _dst: *mut u64) -> u32 {
     panic!("jitv2: read hook called before MipsExecutor::install_jit_hooks");
 }
 #[cfg(feature = "jitv2")]
@@ -1108,9 +1126,15 @@ impl MipsCore {
             #[cfg(feature = "jitv2")]
             read8_fn: jit_hooks_not_installed_read,
             #[cfg(feature = "jitv2")]
+            read8_sext_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
             read16_fn: jit_hooks_not_installed_read,
             #[cfg(feature = "jitv2")]
+            read16_sext_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
             read32_fn: jit_hooks_not_installed_read,
+            #[cfg(feature = "jitv2")]
+            read32_sext_fn: jit_hooks_not_installed_read,
             #[cfg(feature = "jitv2")]
             read64_fn: jit_hooks_not_installed_read,
             #[cfg(feature = "jitv2")]
@@ -1205,6 +1229,8 @@ impl MipsCore {
             nutlb: [[NuTlbEntry::default(); NUM_NUTLB_ENTRIES]; 2],
             #[cfg(feature = "jitv2")]
             gpr_scratch: 0,
+            #[cfg(feature = "jitv2")]
+            jit_read_scratch: 0,
         };
         core.reset_registers(false);
         core

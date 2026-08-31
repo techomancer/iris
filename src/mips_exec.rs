@@ -1482,47 +1482,80 @@ unsafe fn exec_from_core<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> *m
 }
 
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
+unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_read::<1>(va); }
+    { let r = exec.lockstep_jit_read::<1>(va); unsafe { *dst = r.val; } return r.status; }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<1>(va) {
-        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
-        Err(status) => JitReadResult { val: 0, status },
+        Ok(v) => { unsafe { *dst = v; } EXEC_COMPLETE }
+        Err(status) => status,
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
+unsafe extern "C" fn jit_read8_sext<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_read::<2>(va); }
+    { let r = exec.lockstep_jit_read::<1>(va); unsafe { *dst = r.val as u8 as i8 as i64 as u64; } return r.status; }
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    match exec.read_data::<1>(va) {
+        Ok(v) => { unsafe { *dst = v as u8 as i8 as i64 as u64; } EXEC_COMPLETE }
+        Err(status) => status,
+    }
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_read16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
+    #[cfg(feature = "jitv2_lockstep")]
+    { let r = exec.lockstep_jit_read::<2>(va); unsafe { *dst = r.val; } return r.status; }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<2>(va) {
-        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
-        Err(status) => JitReadResult { val: 0, status },
+        Ok(v) => { unsafe { *dst = v; } EXEC_COMPLETE }
+        Err(status) => status,
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
+unsafe extern "C" fn jit_read16_sext<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_read::<4>(va); }
+    { let r = exec.lockstep_jit_read::<2>(va); unsafe { *dst = r.val as u16 as i16 as i64 as u64; } return r.status; }
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    match exec.read_data::<2>(va) {
+        Ok(v) => { unsafe { *dst = v as u16 as i16 as i64 as u64; } EXEC_COMPLETE }
+        Err(status) => status,
+    }
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_read32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
+    #[cfg(feature = "jitv2_lockstep")]
+    { let r = exec.lockstep_jit_read::<4>(va); unsafe { *dst = r.val; } return r.status; }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<4>(va) {
-        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
-        Err(status) => JitReadResult { val: 0, status },
+        Ok(v) => { unsafe { *dst = v; } EXEC_COMPLETE }
+        Err(status) => status,
     }
 }
 #[cfg(feature = "jitv2")]
-unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64) -> JitReadResult {
+unsafe extern "C" fn jit_read32_sext<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_read::<8>(va); }
+    { let r = exec.lockstep_jit_read::<4>(va); unsafe { *dst = r.val as u32 as i32 as i64 as u64; } return r.status; }
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    match exec.read_data::<4>(va) {
+        Ok(v) => { unsafe { *dst = v as u32 as i32 as i64 as u64; } EXEC_COMPLETE }
+        Err(status) => status,
+    }
+}
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
+    #[cfg(feature = "jitv2_lockstep")]
+    { let r = exec.lockstep_jit_read::<8>(va); unsafe { *dst = r.val; } return r.status; }
     #[cfg(not(feature = "jitv2_lockstep"))]
     match exec.read_data::<8>(va) {
-        Ok(v) => JitReadResult { val: v, status: EXEC_COMPLETE },
-        Err(status) => JitReadResult { val: 0, status },
+        Ok(v) => { unsafe { *dst = v; } EXEC_COMPLETE }
+        Err(status) => status,
     }
 }
 #[cfg(feature = "jitv2")]
@@ -2674,8 +2707,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     pub fn install_jit_hooks(&mut self) {
         self.install_jit_mem_ptrs();
         self.core.read8_fn = jit_read8::<T, C>;
+        self.core.read8_sext_fn = jit_read8_sext::<T, C>;
         self.core.read16_fn = jit_read16::<T, C>;
+        self.core.read16_sext_fn = jit_read16_sext::<T, C>;
         self.core.read32_fn = jit_read32::<T, C>;
+        self.core.read32_sext_fn = jit_read32_sext::<T, C>;
         self.core.read64_fn = jit_read64::<T, C>;
         self.core.write8_fn = jit_write8::<T, C>;
         self.core.write16_fn = jit_write16::<T, C>;
@@ -9819,7 +9855,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         // fighting over which stops which — a plain CPU pause never touches
         // the compile queue at all anymore.
 
-        *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).spawn(move || {
+        *self.thread.lock() = Some(thread::Builder::new().name("MIPS-CPU".to_string()).stack_size(16 * 1024 * 1024).spawn(move || {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::MipsCpu);
             let mut guard = executor.lock();
 
