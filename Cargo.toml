@@ -256,6 +256,16 @@ libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
 pcap = { version = "2", optional = true }
 shared_memory = { version = "0.12", optional = true }
 raw_sync      = { version = "0.1",  optional = true }
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nokhwa = { version = "0.10", optional = true }
+v4l    = { version = "0.14", features = ["v4l2-sys"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
+
 # ppmem's Windows backend (src/ppmem/map_windows.rs) additionally needs
 # Win32_System_Memory (VirtualAlloc2/MapViewOfFile3/UnmapViewOfFile2 placeholder
 # API), Win32_System_SystemInformation (GetSystemInfo, for the 64KB allocation
@@ -268,16 +278,6 @@ raw_sync      = { version = "0.1",  optional = true }
 # socket2 / anstyle-wincon; declare it so the Windows build doesn't depend on
 # who else happens to be in the graph.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_Security"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nokhwa = { version = "0.10", optional = true }
-v4l    = { version = "0.14", features = ["v4l2-sys"], optional = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
