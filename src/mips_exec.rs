@@ -1647,6 +1647,17 @@ unsafe extern "C" fn jit_handle_exception<T: Tlb, C: CpuModel>(ctx: *mut core::f
     exec.handle_exception(status)
 }
 
+/// [`jit_handle_exception`] with the EPC/BD inputs passed explicitly — see
+/// `MipsCore::handle_exception_at_fn` and
+/// `mips_core::deliver_exception_at` for why. Unlike its sibling, this does
+/// NOT read `core.pc`/`core.in_delay_slot`: compiled code supplies both, so
+/// neither has to be live in memory at the fault site.
+#[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_handle_exception_at<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, status: u32, fault_pc: u64, bd: u8) -> u32 {
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
+    exec.handle_exception_at(status, fault_pc, bd != 0)
+}
+
 /// Force one instruction's worth of real forward progress through the
 /// interpreter, bypassing the JIT dispatch gate — see
 /// `MipsCore::interp_fallback_fn`'s doc comment for why this needs to exist
@@ -2755,6 +2766,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.write64_fn = jit_write64::<T, C>;
         self.core.write64_masked_fn = jit_write64_masked::<T, C>;
         self.core.handle_exception_fn = jit_handle_exception::<T, C>;
+        self.core.handle_exception_at_fn = jit_handle_exception_at::<T, C>;
         self.core.interp_fallback_fn = jit_interp_fallback::<T, C>;
         self.core.kill_entry_fn = jit_kill_entry::<T, C>;
         #[cfg(feature = "developer")]
@@ -3831,6 +3843,56 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // write_cp0, so this is the only barrier on the path.
         self.nanotlb_invalidate();
         // Reset delay slot state as we are jumping to a new context
+        self.core.in_delay_slot = false;
+        status
+    }
+
+    /// [`Self::handle_exception`] with the EPC/BD inputs passed explicitly
+    /// rather than read from `core.pc`/`core.in_delay_slot` — see
+    /// [`crate::mips_core::deliver_exception_at`] for why compiled code wants
+    /// this (it knows both as compile-time constants and would otherwise
+    /// have to store them to memory purely to have them read straight back).
+    ///
+    /// Identical in every other respect, including the `developerx`
+    /// bus/address-error monitor break, the LLBit clear, `syscall_pending`,
+    /// the nutlb flush, and the trailing `in_delay_slot = false`.
+    #[cfg(feature = "jitv2")]
+    fn handle_exception_at(&mut self, status: ExecStatus, fault_pc: u64, bd: bool) -> ExecStatus {
+        #[cfg(feature = "developerx")]
+        {
+            let was_exl = (self.core.cp0_status & STATUS_EXL) != 0;
+            let epc = if was_exl {
+                self.core.cp0_epc
+            } else if bd {
+                fault_pc.wrapping_sub(4)
+            } else {
+                fault_pc
+            };
+            let exc_code = (status & CAUSE_EXCCODE_MASK) >> 2;
+            if exc_code == EXC_IBE || exc_code == EXC_DBE {
+                eprintln!("BUS ERROR ({}) at PC={:#010x} EPC={:#010x}",
+                    if exc_code == EXC_IBE { "IBE" } else { "DBE" },
+                    fault_pc, epc);
+                return EXEC_BREAKPOINT;
+            }
+            if exc_code == EXC_ADEL || exc_code == EXC_ADES {
+                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
+                    if exc_code == EXC_ADEL { "ADEL" } else { "ADES" },
+                    fault_pc, epc, self.core.cp0_badvaddr);
+                return EXEC_BREAKPOINT;
+            }
+            if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
+                eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
+                    if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
+                    fault_pc, epc, self.core.cp0_badvaddr);
+                return EXEC_BREAKPOINT;
+            }
+        }
+
+        self.cache.set_llbit(false);
+        self.core.syscall_pending = false;
+        crate::mips_core::deliver_exception_at(&mut self.core, status, fault_pc, bd);
+        self.nanotlb_invalidate();
         self.core.in_delay_slot = false;
         status
     }

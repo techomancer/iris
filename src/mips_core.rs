@@ -465,6 +465,19 @@ pub struct MipsCore {
     /// interpreter loop — pc is already at the vector, nothing left to do.
     #[cfg(feature = "jitv2")]
     pub handle_exception_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32) -> u32,
+    /// [`Self::handle_exception_fn`] with the EPC/BD inputs passed
+    /// explicitly: `(ctx, status, fault_pc, bd)`. See
+    /// [`deliver_exception_at`] for the full rationale — in short, compiled
+    /// code knows the faulting word and its delay-slot-ness as compile-time
+    /// constants at nearly every fault site, and materializing them into
+    /// `core.pc`/`core.in_delay_slot` purely so the callee could read them
+    /// back was ~29% of all emitted store traffic.
+    ///
+    /// `bd` is `u8` rather than `bool` because this is a C ABI boundary and
+    /// `bool`'s representation is not something to rely on across one;
+    /// nonzero means "in a delay slot".
+    #[cfg(feature = "jitv2")]
+    pub handle_exception_at_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u32, u64, u8) -> u32,
     /// Fetch, decode, and execute exactly one instruction at the current
     /// `core.pc` through the real interpreter dispatch (`MipsExecutor::step`'s
     /// own fetch+exec_decoded path) and return its `ExecStatus`. Exists so
@@ -1024,6 +1037,10 @@ unsafe extern "C" fn jit_hooks_not_installed_exception(_ctx: *mut core::ffi::c_v
     panic!("jitv2: exception hook called before MipsExecutor::install_jit_hooks");
 }
 #[cfg(feature = "jitv2")]
+unsafe extern "C" fn jit_hooks_not_installed_exception_at(_ctx: *mut core::ffi::c_void, _status: u32, _pc: u64, _bd: u8) -> u32 {
+    panic!("jitv2: exception_at hook called before MipsExecutor::install_jit_hooks");
+}
+#[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_interp_fallback(_ctx: *mut core::ffi::c_void) -> u32 {
     panic!("jitv2: interp_fallback hook called before MipsExecutor::install_jit_hooks");
 }
@@ -1149,6 +1166,7 @@ impl MipsCore {
             write64_masked_fn: jit_hooks_not_installed_write64_masked,
             #[cfg(feature = "jitv2")]
             handle_exception_fn: jit_hooks_not_installed_exception,
+            handle_exception_at_fn: jit_hooks_not_installed_exception_at,
             #[cfg(feature = "jitv2")]
             interp_fallback_fn: jit_hooks_not_installed_interp_fallback,
             #[cfg(feature = "jitv2")]
@@ -2191,6 +2209,36 @@ impl MipsCore {
 /// values (`1 << 28`, `1 << 29`) are inlined below; their canonical
 /// definitions and doc comments live in `mips_exec.rs`.
 pub fn deliver_exception(core: &mut MipsCore, status: u32) {
+    // The interpreter maintains `pc`/`in_delay_slot` live on every dispatch,
+    // so reading them here is exactly right for its callers. Compiled code
+    // does not (or rather: would rather not — see
+    // `deliver_exception_at`'s doc comment), and passes them explicitly.
+    deliver_exception_at(core, status, core.pc, core.in_delay_slot)
+}
+
+/// [`deliver_exception`] with the two EPC/BD inputs supplied explicitly
+/// instead of read out of `core`.
+///
+/// **Why this exists.** `Cause.BD` and `cp0_epc` are derived from exactly two
+/// pieces of state: the faulting instruction's own address, and whether it
+/// sat in a branch delay slot. The interpreter keeps both live in `MipsCore`
+/// as a matter of course, so the plain [`deliver_exception`] reading them
+/// back is free there. Compiled code is the opposite case: it knows both as
+/// *compile-time constants* at almost every fault site (`ctx.word`,
+/// `ctx.bd`), and had to spend real stores materializing them into memory
+/// purely so this function could read them back — ~29% of all emitted store
+/// traffic, measured over 300 real IRIX pages, most of it the
+/// `in_delay_slot=1`/`pc=slot_addr` bracket `emit_slot_semantics` wraps
+/// around every inlined delay slot.
+///
+/// `fault_pc` is the faulting instruction's virtual address — NOT the delay
+/// slot's branch, and not pre-decremented: the `- 4` for the BD case happens
+/// here, exactly as it does for the interpreter. `bd` is whether that
+/// instruction was in a delay slot.
+///
+/// Both are ignored when `Status.EXL` was already set (a nested exception
+/// leaves EPC/BD untouched), same as before.
+pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd: bool) {
     const EXEC_IS_TLB_REFILL: u32 = 1 << 28;
     const EXEC_IS_XTLB_REFILL: u32 = 1 << 29;
 
@@ -2203,12 +2251,12 @@ pub fn deliver_exception(core: &mut MipsCore, status: u32) {
     cause = (cause & !CAUSE_EXCCODE_MASK) | (status & CAUSE_EXCCODE_MASK);
 
     if !was_exl {
-        if core.in_delay_slot {
+        if bd {
             cause |= CAUSE_BD;
-            core.cp0_epc = core.pc.wrapping_sub(4);
+            core.cp0_epc = fault_pc.wrapping_sub(4);
         } else {
             cause &= !CAUSE_BD;
-            core.cp0_epc = core.pc;
+            core.cp0_epc = fault_pc;
         }
     }
     core.cp0_cause = cause;
