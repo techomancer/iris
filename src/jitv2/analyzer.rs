@@ -335,6 +335,15 @@ pub enum StopReason {
     /// isn't there. The entry-side counterpart is `exec_decoded`'s
     /// `entry_offset == 0` always-probe, which already consumes this
     /// runtime state correctly regardless of which page armed it.
+    ///
+    /// **Not only the 0xFFC case.** Any branch whose mandatory delay slot
+    /// cannot be inlined ends this way — the slot being on the next physical
+    /// page (offset 0xFFC) and the slot being an `Excluded` instruction are
+    /// the same situation from the branch's point of view, and get the same
+    /// treatment: compile the branch, hand the interpreter a pending
+    /// transfer, let it run the slot. (The excluded case used to *decline the
+    /// branch outright* — a leftover from before the foreign-page handling
+    /// was worked out. Unified 2026-09-02.)
     ForeignPageSlot,
     /// The walk's instruction budget (`Analyzer::walk_bounded`) ran out
     /// before this edge's target could be visited. Test/tooling scaffolding
@@ -1010,22 +1019,36 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     // first, atomically (visit_slot, not visit — the slot is never itself
     // recursed into as a branch/jump target, only as a slot — see
     // visit_slot's doc comment for the nested-branch-in-slot case it does
-    // handle). If the slot (or its own nested slot-chain) comes back
-    // excluded or runs off the page, the branch/jump can't be compiled
-    // either — neither gets marked visited. Not charged against `budget` —
-    // a delay slot was never a truncation candidate (§6.1.4). Skipped
-    // entirely for a 0xFFC branch/jump/regjump — there is no slot to walk.
+    // handle). Not charged against `budget` — a delay slot was never a
+    // truncation candidate (§6.1.4). Skipped entirely for a 0xFFC
+    // branch/jump/regjump — there is no slot on *this* page to walk.
+    //
+    // If the slot can't be inlined — `Excluded`/`RegionBoundary`, or a
+    // nested slot-chain that hits one — the branch is NOT declined. It is
+    // compiled with a deferred slot, exactly like the 0xFFC case: codegen
+    // arms `core.delay_slot_target`, sets `core.in_delay_slot`, lands
+    // `core.pc` on the slot word, and returns, leaving the interpreter to
+    // run the slot and retire the transfer. The two situations are
+    // identical from the branch's point of view ("my mandatory slot is not
+    // something I can emit inline"), and the interpreter handles the
+    // resulting pending-transfer state the same way regardless of *why*.
+    //
+    // This used to `return false`, dropping the branch out of the region
+    // entirely — a leftover from before the foreign-page case was worked
+    // out, and a real cost: every branch whose slot happens to be a
+    // syscall/cache/eret/MFC0/LL/SC/BC1/unimplemented opcode ended its
+    // region one instruction early.
     let slot = offset + 1;
-    if !is_0xffc_branch && !matches!(class, Classify::Sequential) && !visit_slot(instrs, page, page_base, slot, budget) {
-        return false;
-    }
+    let deferred_slot = !is_0xffc_branch
+        && !matches!(class, Classify::Sequential)
+        && !visit_slot(instrs, page, page_base, slot, budget);
 
     // This word has a real, on-page inline slot iff it's a Branch/Jump/
-    // RegJump AND not the 0xFFC foreign-slot case (whose mandatory slot is
-    // on the next, unwalkable page — nothing at `instrs[offset+1]` on this
-    // page belongs to it). See `has_inline_slot`'s doc comment for why
-    // `compute_cycles_flush` needs this.
-    let has_inline_slot = !is_0xffc_branch && !matches!(class, Classify::Sequential);
+    // RegJump whose slot codegen can actually emit — neither the 0xFFC case
+    // (slot on the next, unwalkable page) nor a deferred one (slot excluded).
+    // See `has_inline_slot`'s doc comment for why `compute_cycles_flush`
+    // needs this.
+    let has_inline_slot = !is_0xffc_branch && !deferred_slot && !matches!(class, Classify::Sequential);
 
     // Re-derive `is_branch_fallback_successor` from the page's own bytes
     // instead of relying on some earlier walk having visited the fallback
@@ -1045,7 +1068,14 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     budget.remaining -= 1;
     budget.mark_visited(offset);
 
-    if is_0xffc_branch {
+    if is_0xffc_branch || deferred_slot {
+        // Both hand the interpreter a pending transfer and exit, so every
+        // edge is a region exit regardless of where it points. For the 0xFFC
+        // case the on-page target arithmetic would additionally be *wrong*
+        // (see finish_visit_foreign_page_slot's doc comment); for a deferred
+        // slot it would merely be pointless, since codegen never consults a
+        // taken/fallthrough block for a branch that returns to the
+        // interpreter. Same reason either way, so same handling.
         return finish_visit_foreign_page_slot(instrs, offset, class);
     }
     finish_visit(instrs, page, page_base, offset, class, budget)
@@ -1157,7 +1187,7 @@ fn finish_visit_foreign_page_slot(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE]
         Classify::Jump { .. } | Classify::RegJump => {
             instrs[offset as usize].taken_exit = Some(StopReason::ForeignPageSlot);
         }
-        Classify::Sequential | Classify::Excluded | Classify::RegionBoundary => unreachable!("is_0xffc_branch guarantees a branch/jump/regjump class"),
+        Classify::Sequential | Classify::Excluded | Classify::RegionBoundary => unreachable!("is_0xffc_branch/deferred_slot guarantee a branch/jump/regjump class"),
     }
     true
 }
@@ -1480,11 +1510,17 @@ mod tests {
     }
 
     #[test]
-    fn walk_excluded_delay_slot_disqualifies_the_branch_too() {
-        // A branch whose delay slot is excluded can't be compiled either
-        // (§6.1.4: slot is an indivisible part of the branch unit) -- the
-        // instruction that led into the branch must record the exit instead,
-        // and neither the branch nor its slot may be visited.
+    fn walk_excluded_delay_slot_defers_the_slot_and_still_compiles_the_branch() {
+        // A branch whose delay slot is Excluded is compiled with a DEFERRED
+        // slot, exactly like a branch at 0xFFC whose slot is on the next
+        // page: both mean "my mandatory slot is not something codegen can
+        // emit inline", and both are handled by arming
+        // `core.delay_slot_target`/`core.in_delay_slot`, landing `core.pc`
+        // on the slot word, and letting the interpreter run it.
+        //
+        // This used to decline the branch outright (the region ended at
+        // word 0) — a leftover from before the 0xFFC foreign-slot handling
+        // existed. See `StopReason::ForeignPageSlot`'s doc comment.
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = 0; // nop, falls through to word 1
         page[1] = i_type(OP_BEQ, 1, 2, 3); // branch at word 1, target = 1+1+3 = 5
@@ -1493,10 +1529,17 @@ mod tests {
         let (result, non_empty) = a.walk(&page, 0, 0);
         assert!(non_empty);
         let v: Vec<_> = instrs_linear(result).collect();
-        assert_eq!(v.len(), 1, "only word 0 should be in the region");
+        assert_eq!(v.len(), 2, "word 0 and the branch itself are both in the region");
         assert_eq!(v[0].word, 0);
-        assert_eq!(v[0].fallthrough_exit, Some(StopReason::Excluded));
-        assert!(!result[1].visited, "branch with an excluded delay slot must not be visited");
+        assert_eq!(v[0].fallthrough_exit, None, "word 0 now continues into the branch");
+        assert!(result[1].visited, "the branch is compiled, with its slot deferred");
+        // Every edge exits: the branch hands the interpreter a pending
+        // transfer rather than resolving a taken/fallthrough block.
+        assert_eq!(result[1].taken_exit, Some(StopReason::ForeignPageSlot));
+        assert_eq!(result[1].fallthrough_exit, Some(StopReason::ForeignPageSlot));
+        assert!(!result[1].has_inline_slot, "the slot is deferred, not inlined");
+        // The slot itself is NOT walked into the region — the interpreter
+        // runs it, and it must stay in head position for that.
         assert!(!result[2].visited);
     }
 

@@ -11,12 +11,21 @@ because something upstream already cleared the flag first:
   `emit_branch_taken_edge`/`emit_nested_branch_slot`) runs after
   `emit_slot_semantics`'s non-terminating tail, which unconditionally clears
   the flag and restores `saved_pc` before returning.
-  **(2026-09-01)** An attempt to cfg-gate this clear (and the whole
-  `in_delay_slot=1`/`pc` save/restore bracket) down to
-  `jitv2_lockstep`/`developer` was made and **reverted** — `deliver_exception`
-  reads both fields out of memory, so they are load-bearing on every config.
-  See [[inlined-slot-pc-bd-bracket-is-dead]]. This bullet's guarantee is
-  intact and unconditional, exactly as originally written.
+  **(2026-09-02: this guarantee is GONE.)** The bracket is now
+  `#[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]` — the
+  exception ABI passes `Cause.BD` and EPC as arguments, so nothing reads
+  those fields back for an inlined slot. See [[inlined-slot-pc-bd-bracket]].
+  Compiled code no longer *sets* `in_delay_slot` for an inlined slot either,
+  so these call sites remain correct — the flag is simply never true there to
+  begin with — but they are now correct **by luck of what runs before them**,
+  not by an upstream guarantee. Which is exactly what this note warned about:
+  the removal immediately broke
+  `emit_foreign_page_annulled_not_taken_exit`, which had been silently
+  inheriting `in_delay_slot = 1` from the bracket. That one now takes an
+  explicit `pending_outer_transfer` parameter (its two callers need opposite
+  values). The general fix below — move the clear *inside*
+  `emit_absolute_pc_exit` — is still not done, and is now more clearly worth
+  doing rather than less.
 - The annulling-Likely not-taken arm never sets the flag in the first place
   (the slot is skipped entirely, mirroring `handle_branch_likely_skip`).
 
