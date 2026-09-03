@@ -5407,7 +5407,18 @@ fn emit_vbase(ctx: &mut EmitCtx) -> Value {
 /// for an annulled Likely slot that must never run. Never a NOP, and never
 /// silently skipped: the instruction still executes, just on the next dispatch.
 fn is_inlinable(instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> bool {
-    (word as usize) < ENTRIES_PER_PAGE && instrs[word as usize].visited
+    if (word as usize) >= ENTRIES_PER_PAGE {
+        return false;
+    }
+    let slot = &instrs[word as usize];
+    // `is_fallback`: an analyzer-`Excluded` word kept in the region as an
+    // interpreter-fallback *head*. It is `visited`, but it has no native
+    // emitter by definition, so it can never be inlined as somebody else's
+    // delay slot — the branch above it defers instead (analyzer's
+    // `deferred_slot`). Without this check a word that some *other* path
+    // admitted as a fallback head would look inlinable here purely because
+    // it happens to be marked visited.
+    slot.visited && !slot.is_fallback
 }
 
 /// `vbase | (word * 4)` as a runtime `Value` — the in-page address of

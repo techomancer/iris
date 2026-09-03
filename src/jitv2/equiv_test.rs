@@ -3403,6 +3403,90 @@ mod tests {
         std::mem::forget(codegen);
     }
 
+    /// A branch whose delay slot is an **`Excluded`** instruction (here
+    /// MTC0) is compiled with a *deferred* slot, exactly like a branch at
+    /// 0xFFC whose slot is on the next page: the JIT arms
+    /// `delay_slot_target`/`in_delay_slot`, lands `pc` on the slot word, and
+    /// returns, leaving the interpreter to run the slot and retire the
+    /// transfer.
+    ///
+    /// Before 2026-09-02 the analyzer declined such a branch outright (see
+    /// `analyzer::tests::walk_excluded_delay_slot_defers_the_slot_and_still_compiles_the_branch`),
+    /// so this whole shape fell out of every region — a leftover from before
+    /// the 0xFFC foreign-slot handling existed. This test is the execution-
+    /// level counterpart of that analyzer test: it checks the JIT reproduces
+    /// the interpreter's pending-transfer state exactly, not merely that the
+    /// region compiles.
+    fn check_excluded_delay_slot_deferred(branch_raw: u32, gpr: [u64; 32]) {
+        // Mid-page, so this is unambiguously about the slot being Excluded
+        // rather than about any page-boundary arithmetic.
+        let head_word: u16 = 4;
+        let slot_word = head_word + 1;
+        // MTC0 r1, $12 — Classify::Excluded, so it can never be inlined.
+        let excluded = make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_MTC0, 1, 12, 0, 0);
+        let page = [(head_word, branch_raw), (slot_word, excluded)];
+
+        let page_base = 0xFFFF_FFFF_9FC0_F000u64;
+        let pc = page_base + (head_word as u64) * 4;
+
+        // One dispatch: the branch itself, which arms its slot.
+        let (int_pc, int_bd, int_target) = interp_delay_state(&page, gpr, pc, 1);
+
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(word, raw) in &page { page_words[word as usize] = raw; }
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, head_word, page_base as u32, usize::MAX);
+        assert!(non_empty);
+        assert!(walked[head_word as usize].visited,
+            "the branch must be compiled even though its slot is Excluded");
+        assert!(!walked[head_word as usize].has_inline_slot,
+            "its slot must be deferred, not inlined");
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, head_word, true, false)
+            .expect("a branch with a deferred slot must compile");
+
+        let (exec, _mem) = seeded_executor(gpr, pc);
+        let mut exec = Box::new(exec);
+        let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, int_pc, "pc must match the interpreter");
+        assert_eq!(exec.core.in_delay_slot, int_bd, "in_delay_slot must match the interpreter");
+        if int_bd {
+            assert_eq!(exec.core.delay_slot_target, int_target,
+                "the armed transfer target must match the interpreter");
+        }
+        std::mem::forget(codegen);
+    }
+
+    #[test]
+    fn branch_taken_with_excluded_delay_slot_defers_like_the_interpreter() {
+        // BEQ r0,r0,+3 — always taken.
+        check_excluded_delay_slot_deferred(
+            make_i(crate::mips_isa::OP_BEQ, 0, 0, 3),
+            [0u64; 32],
+        );
+    }
+
+    #[test]
+    fn branch_not_taken_with_excluded_delay_slot_defers_like_the_interpreter() {
+        // BNE r0,r0,+3 — never taken; the slot still executes (non-annulling),
+        // so the pending transfer is the fallthrough.
+        check_excluded_delay_slot_deferred(
+            make_i(crate::mips_isa::OP_BNE, 0, 0, 3),
+            [0u64; 32],
+        );
+    }
+
+    #[test]
+    fn jump_with_excluded_delay_slot_defers_like_the_interpreter() {
+        // Unconditional J — single-edge shape.
+        check_excluded_delay_slot_deferred(
+            make_j(crate::mips_isa::OP_J, 0x3F0_F008 >> 2),
+            [0u64; 32],
+        );
+    }
+
     #[test]
     fn nested_branch_at_last_word_with_foreign_page_slot_matches_interpreter() {
         // BEQ r0,r0,+4 at 1022 -> nested BEQ r0,r0,+2 at 1023 (always taken).

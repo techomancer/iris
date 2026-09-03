@@ -96,8 +96,10 @@ of 3 instructions.
    but it is the *enabler* for (1): merging pass-1 blocks without hoisting the
    preamble buys little, since the preamble re-splits every instruction.
    Must stay per-instruction under `jitv2_lockstep`.
-3. **`pc`/`in_delay_slot` traffic** — partly addressed, see
-   [[inlined-slot-pc-bd-bracket-is-dead]].
+3. **`pc`/`in_delay_slot` traffic** — **done** (2026-09-02): the exception
+   ABI now passes EPC/BD as arguments, so the per-slot bracket is
+   lockstep/developer-only. Total emitted stores across this same 300-page
+   corpus went 24,222 -> 12,431. See [[inlined-slot-pc-bd-bracket]].
 4. **GPR load/store traffic** — smaller than expected, and partly fixed for
    free by (1), since Cranelift already CSEs these within a block.
 
