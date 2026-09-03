@@ -6046,7 +6046,26 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     // an exception, control never returns here (emit_exception_exit is a
     // block terminator), so there's nothing to restore on that path: the
     // slot's `core.pc` write is exactly what deliver_exception needs to see
-    // in that case. The slot's address itself is derived from this same
+    // in that case.
+    //
+    // That last sentence is the load-bearing one, and it is easy to miss:
+    // this store is NOT removable. `deliver_exception` (mips_core.rs) reads
+    // live `core.pc` to compute `cp0_epc = pc - 4` for a delay-slot fault,
+    // and the JIT reaches it through `emit_exception_call_block_body`, which
+    // passes only `(core_ptr, status)` — the faulting word is not an
+    // argument. Nor is `Cause.BD`: the `in_delay_slot = 1` store above is
+    // read out of memory by the same function. `ctx.bd` only selects which
+    // exception *stage block* runs, not what the callee sees.
+    //
+    // The "only bits 12..63 of core.pc matter in-region" argument (true for
+    // addressing — every in-region address is emit_vbase + a compile-time
+    // word) does NOT apply here: EPC needs the exact word. A 2026-09-01
+    // attempt to cfg-gate this whole bracket down to
+    // jitv2_lockstep/developer was reverted after six equiv_test delay-slot
+    // exception failures (Cause differing by exactly bit 31). cpu-tests and
+    // a full IRIX boot both passed the broken build — equiv_test is the only
+    // suite that covers this. See
+    // rules/jitv2/inlined-slot-pc-bd-bracket-is-dead.md. The slot's address itself is derived from this same
     // live pc load (emit_word_addr's vbase, §2.2 position independence) —
     // never from compile-time page_base, which is a physical address in
     // production (`comp.rs`'s `phys_base`) and would be wrong to bake into

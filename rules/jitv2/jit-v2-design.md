@@ -150,6 +150,10 @@ Under decline-and-defer, every stub does one thing: write the interpreter's nati
 
 - `vPC = vbase + static_offset` at every point; the architectural `cpu.pc` field is written **only** in stubs and helpers (the only places it is observable). No per-instruction PC store on the fast path.
 
+> **(as-built, 2026-09-01)** For in-region *addressing* only **bits 12..63** of `core.pc` are consumed: every in-region address is `emit_vbase` (`pc & !0xFFF`) plus a *compile-time* word offset — `emit_word_addr`, `emit_write_link_register`, `emit_jump_target_addr` take the word as an argument; `emit_exit_block_body` takes it as a **block parameter**; `emit_bail` passes an `iconst`. Every store that moves `core.pc` off-page (`emit_absolute_pc_exit`, `emit_runtime_pc_exit`, `emit_foreign_page_slot_exit`, the Likely-skip arms) is immediately followed by `return_`, so no `emit_vbase` can observe one. Memory callouts don't read `core.pc` at all — `jit_read*`/`jit_write*` take the VA as an explicit argument.
+>
+> **This does NOT make the low bits dead.** `deliver_exception` (mips_core.rs) computes `cp0_epc` from live `core.pc` — the exact word, not the page — and the JIT reaches it via `emit_exception_call_block_body`, which passes only `(core_ptr, status)`. So `core.pc` must be the *faulting instruction's own* address whenever an exception can be raised, which includes inside an inlined delay slot. A 2026-09-01 attempt to drop `emit_slot_semantics`' per-slot pc save/restore on the "low bits are dead" argument was reverted after six `equiv_test` delay-slot exception failures. See `rules/jitv2/inlined-slot-pc-bd-bracket-is-dead.md`.
+
 ### 3.5 Region exits
 
 Exit to dispatcher on: `jr`/`jalr` (every return), page-leaving `j`/`jal`/branches, excluded instructions, event-counter fire, exceptions. Exit hands the dispatcher a resolved `(pfn, offset)` where statically computable (KSEG0 targets free; mapped targets need the TLB probe in the stub).
@@ -182,6 +186,12 @@ Both arms that need "run the interpreter for real" (FR-mismatch's fallback, and 
 
 - 0xFFC rule (§2.3).
 - BD stub variants (§3.3).
+
+> **(as-built, 2026-09-01) An inlined slot MUST maintain live `core.pc`/`in_delay_slot`, and this is the one real exception to §3.4's "no per-instruction PC store on the fast path".** `emit_slot_semantics` brackets every inlined slot with `in_delay_slot = 1` / slot-address into `core.pc`, restoring both afterward. It is tempting to call this dead — an in-region branch edge is a plain `jump` (`emit_target_edge`) writing neither field, and `exception_other_word_block` stores both itself — but `deliver_exception` reads **both fields out of memory** to decide `Cause.BD` and `cp0_epc = pc - 4`, and `emit_exception_call_block_body` passes it only `(core_ptr, status)`. `ctx.bd` selects which exception stage block runs; it is not an argument to the callee. Dropping either store yields `BD=0, EPC=pc` where the interpreter yields `BD=1, EPC=pc-4`.
+>
+> Removing this traffic (~29% of all emitted stores) would require changing the JIT→Rust exception ABI to pass BD and the faulting word as arguments. See `rules/jitv2/inlined-slot-pc-bd-bracket-is-dead.md`.
+>
+> `in_delay_slot` is additionally read by the entry word's foreign-slot check (§6.1.4) and `jitv2_lockstep`'s compare.
 - Branch-likely: annul semantics compiled explicitly; annulled slot still charges its interpreter-equivalent cycles. `[Q4.1]` confirm interpreter's cycle charge for annulled slots and mirror it.
 
 ### 4.4 Excluded instructions (interpreter-only, end region)
