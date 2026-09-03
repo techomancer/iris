@@ -1166,6 +1166,7 @@ impl MipsCore {
             write64_masked_fn: jit_hooks_not_installed_write64_masked,
             #[cfg(feature = "jitv2")]
             handle_exception_fn: jit_hooks_not_installed_exception,
+            #[cfg(feature = "jitv2")]
             handle_exception_at_fn: jit_hooks_not_installed_exception_at,
             #[cfg(feature = "jitv2")]
             interp_fallback_fn: jit_hooks_not_installed_interp_fallback,

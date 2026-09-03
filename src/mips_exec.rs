@@ -3092,13 +3092,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.set_pcp(std::ptr::null_mut());
     }
 
-    /// JIT v2: re-derive `self.pcp` if the fetch just landed on a different physical
-    /// page than the one currently tracked (rules/jitv2/jit-v2-design.md §2.1 — PCPs
-    /// are keyed by physical frame, never by VA). Cheap on the common case: same-page
-    /// sequential/loop execution never touches the pool or its lookup map, only the
-    /// nanotlb hit path above and a single PFN comparison here.
-    #[cfg(feature = "jitv2")]
-    #[inline(always)]
     /// Capture the page pool's array base pointers for the lock-free
     /// `page_for` fast path (`jitv2_pfn_map`/`jitv2_pages_base`). Call once,
     /// after the executor's final `Arc<Mutex<Jitv2>>` is in place — in
@@ -3140,6 +3133,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         Some(unsafe { self.jitv2_pages_base.add(slot as usize) })
     }
 
+    /// JIT v2: re-derive `self.pcp` if the fetch just landed on a different physical
+    /// page than the one currently tracked (rules/jitv2/jit-v2-design.md §2.1 — PCPs
+    /// are keyed by physical frame, never by VA). Cheap on the common case: same-page
+    /// sequential/loop execution never touches the pool or its lookup map, only the
+    /// nanotlb hit path above and a single PFN comparison here.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
     fn jitv2_track_pcp(&mut self, phys_addr: u32) {
         let pfn = phys_addr / crate::jitv2::PAGE_SIZE;
         let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
