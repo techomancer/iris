@@ -106,7 +106,19 @@ mod zz_corpus {
             // callout-only code — invisible to any change in the inline path.
             cg.dc_geometry = geom;
             let f: Option<JitFn> = cg.compile_region(&mut ins, off, true, false);
-            if f.is_some() { total += cg.last_code_size() as u64; n_ok += 1; }
+            // `last_code_size` is `developer`-gated, but this test must be
+            // runnable WITHOUT `developer`: that feature also flips
+            // `opt_level` to `none` and injects a per-instruction
+            // `emit_dev_trace_bp` callout, so a developer build measures
+            // code that production never emits (71% of all callouts in one
+            // measurement were the trace hook alone). Report 0 bytes there
+            // rather than refusing to build — the ok/declined counts and
+            // `IRIS_JIT_DISASM=1` output are still the useful part.
+            #[cfg(feature = "developer")]
+            let sz = cg.last_code_size() as u64;
+            #[cfg(not(feature = "developer"))]
+            let sz = 0u64;
+            if f.is_some() { total += sz; n_ok += 1; }
             else { n_decl += 1; }
             std::mem::forget(cg);
         }

@@ -17,7 +17,6 @@
 //! a mutable pointer. Only the compile-request queue itself is added in this pass
 //! — the compile thread and publish path land with codegen (Phase 2).
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
@@ -83,6 +82,92 @@ unsafe impl Send for CompileRequest {}
 // carryover, force-seal timing, min-calls default) stay local to whichever
 // module actually uses them.
 // ============================================================================
+
+/// Number of 4 KiB physical frames in the 32-bit physical address space the
+/// guest can address (`phys_addr: u32` everywhere on the fetch path) — the
+/// exact entry count of `PfnMap` below.
+pub const PFN_MAP_ENTRIES: usize = (u32::MAX as usize / PAGE_SIZE as usize) + 1;
+
+/// Direct-mapped `pfn -> PageSlot` lookup, replacing the `HashMap<Pfn,
+/// PageSlot>` both page pools used to carry.
+///
+/// One `u32` per physical frame: 1 Mi entries x 4 B = 4 MiB, allocated once
+/// and never resized. `PFN_MAP_EMPTY` means "no pool slot for this frame".
+///
+/// Why not a hash map: `page_for` is on the page-crossing path (see
+/// `jitv2_track_pcp`), and a profile of a real IRIX boot put it at ~4.5% of
+/// total runtime with `alloc::alloc::Global`/`RawTable` frames directly above
+/// it — the map's own incremental rehash-and-grow, since the pool claims a
+/// fresh pfn on every page switch it hasn't seen. A direct index has no hash,
+/// no probe sequence, no allocation ever, and no `pages[slot]` bounds-check
+/// dance beyond the one the caller already does.
+///
+/// Boxed rather than inline so `Jitv2` itself stays small enough to move
+/// cheaply (it is constructed into an `Arc<Mutex<..>>`).
+pub struct PfnMap(Box<[u32]>);
+
+/// `PfnMap`'s own "no slot here" sentinel. Numerically identical to each
+/// impl module's private `NO_SLOT` (both `u32::MAX`), spelled separately
+/// because `PfnMap` is shared code that predates either module in this file
+/// and cannot name a `mod`-private constant.
+pub const PFN_MAP_EMPTY: u32 = u32::MAX;
+
+impl PfnMap {
+    /// One allocation, every frame empty.
+    pub fn new() -> Self {
+        PfnMap(vec![PFN_MAP_EMPTY; PFN_MAP_ENTRIES].into_boxed_slice())
+    }
+
+    /// The slot for `pfn`, or `None` when unmapped.
+    #[inline(always)]
+    pub fn get(&self, pfn: u32) -> Option<u32> {
+        let slot = self.0[pfn as usize];
+        if slot == PFN_MAP_EMPTY { None } else { Some(slot) }
+    }
+
+    #[inline(always)]
+    pub fn insert(&mut self, pfn: u32, slot: u32) {
+        self.0[pfn as usize] = slot;
+    }
+
+    #[inline(always)]
+    pub fn remove(&mut self, pfn: u32) {
+        self.0[pfn as usize] = PFN_MAP_EMPTY;
+    }
+
+    /// Drop every mapping (`mega_flush`). A 4 MiB memset — flushes are rare
+    /// and already far more expensive than this, so no generation-tag
+    /// indirection is worth paying for on every lookup to avoid it.
+    pub fn clear(&mut self) {
+        self.0.fill(PFN_MAP_EMPTY);
+    }
+}
+
+impl PfnMap {
+    /// Raw pointer to the backing array, for the CPU thread's lock-free
+    /// lookup fast path (`MipsExecutor::jitv2_pfn_map`).
+    ///
+    /// Valid for the process's whole lifetime: the array is allocated once in
+    /// `new()` and never resized — `mega_flush` clears it in place
+    /// (`PfnMap::clear` is a `fill`, not a reallocation), exactly like the
+    /// `pages` pool array it indexes into.
+    ///
+    /// # Safety (for the caller)
+    /// Reading through this pointer without holding `Mutex<Jitv2>` is sound
+    /// only because the page pool is *CPU-thread-only* state: `page_for` is
+    /// called from the CPU thread alone, and the one cross-thread writer —
+    /// a compile worker's `flush_from_jit_thread` — runs only after
+    /// `cpu.stop()`, which joins the CPU thread outright
+    /// (`MipsCpu::stop`). So no reader is live while a writer runs.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u32 {
+        self.0.as_ptr()
+    }
+}
+
+impl Default for PfnMap {
+    fn default() -> Self { Self::new() }
+}
 
 /// Upfront reservation for the shared `Codegen`'s Cranelift `ArenaMemoryProvider`
 /// (`Codegen::new_module`'s own doc comment for why this exists at all). A
@@ -1230,10 +1315,11 @@ pub type PageSlot = u32;
 /// pre-existing slot in place avoids that entirely: nothing is ever copied
 /// after `Jitv2::new` builds the array.
 ///
-/// Lookup from `pfn` to pool slot goes through `pfn_to_slot`. This is a
-/// HashMap for now — simplest thing that works. If page-switch lookup shows
-/// up hot in profiling, the design doc's dense pfn-indexed alternative
-/// (§2.4) is the fallback; not built preemptively.
+/// Lookup from `pfn` to pool slot goes through `pfn_to_slot` — the design
+/// doc's dense pfn-indexed alternative (§2.4), now built: page-switch lookup
+/// *did* show up hot in profiling (~4.5% of a real IRIX boot, with the
+/// HashMap's own `RawTable` grow-and-rehash allocation directly above it),
+/// which is exactly the trigger this comment used to name. See [`PfnMap`].
 pub struct Jitv2 {
     /// The full-capacity page pool, allocated once — see this struct's own
     /// doc comment. Indices are stable for the pool's entire lifetime,
@@ -1258,8 +1344,8 @@ pub struct Jitv2 {
     next_free: usize,
     /// pfn -> index into `pages`. Consulted only on a page switch (fetch
     /// lands on a different PFN than the currently-tracked one) — not on
-    /// every fetch.
-    pfn_to_slot: HashMap<Pfn, PageSlot>,
+    /// every fetch. Direct-mapped, not hashed — see [`PfnMap`].
+    pfn_to_slot: PfnMap,
     /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
     /// this triggers `mega_flush` (the "ran out of PCPs" resource-exhaustion
     /// trigger).
@@ -1335,7 +1421,7 @@ impl Jitv2 {
         Self {
             pages: (0..capacity).map(|_| PhysicalCodePage::new(0, std::ptr::null())).collect(),
             next_free: 0,
-            pfn_to_slot: HashMap::new(),
+            pfn_to_slot: PfnMap::new(),
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
@@ -1345,6 +1431,24 @@ impl Jitv2 {
         }
     }
 
+    /// Raw pointers backing the CPU thread's lock-free `page_for` fast path:
+    /// `(pfn_map, pages)`. Both arrays are allocated once and never resized
+    /// (see `PfnMap::as_ptr` and the `pages` field's own doc comment), so
+    /// both stay valid for the process's whole lifetime, across `mega_flush`
+    /// included.
+    ///
+    /// Captured once by the executor (`MipsExecutor::jitv2_bind_fast_lookup`)
+    /// and used to resolve `pfn -> *mut PhysicalCodePage` with no
+    /// `Mutex<Jitv2>` acquisition at all on a hit. A miss still goes through
+    /// the lock, since claiming a slot mutates the free list/MRU list.
+    ///
+    /// # Safety (for the caller)
+    /// See `PfnMap::as_ptr` — sound only because the pool is CPU-thread-only
+    /// state and the sole cross-thread writer runs with the CPU thread
+    /// joined.
+    pub fn fast_lookup_ptrs(&mut self) -> (*const u32, *mut PhysicalCodePage) {
+        (self.pfn_to_slot.as_ptr(), self.pages.as_mut_ptr())
+    }
     /// Look up the pool slot for `pfn`, claiming the next unclaimed slot
     /// in place (`PhysicalCodePage::claim`, `gen_ptr(phys_addr)` on the bus)
     /// if this is the first arrival at this page. Returns `None` if the pool
@@ -1356,7 +1460,7 @@ impl Jitv2 {
     /// rather than reconstructed here because callers already have it from
     /// translation and multiplying back out is wasted work on the hot path.
     pub fn page_for(&mut self, pfn: Pfn, phys_addr: u32, bus: &dyn BusDevice) -> Option<PageSlot> {
-        if let Some(&slot) = self.pfn_to_slot.get(&pfn) {
+        if let Some(slot) = self.pfn_to_slot.get(pfn) {
             return Some(slot);
         }
         if self.next_free >= self.capacity {
@@ -4836,6 +4940,11 @@ pub type PageSlot = u32;
 /// `pages.len()` can never reach `u32::MAX` in practice (would be 16TB+ of
 /// `PhysicalCodePage`s), so this can't collide with a real slot index.
 const NO_SLOT: u32 = u32::MAX;
+/// `PfnMap` is shared code and spells its own sentinel (`PFN_MAP_EMPTY`)
+/// because it cannot name this mod-private constant. They must stay the
+/// same value: `page_for` compares slots that came out of `PfnMap::get`
+/// against this module's `NO_SLOT` in the free-list/MRU paths.
+const _: () = assert!(NO_SLOT == super::PFN_MAP_EMPTY);
 
 /// JIT v2 engine state embedded in the mips executor.
 ///
@@ -4859,10 +4968,11 @@ const NO_SLOT: u32 = u32::MAX;
 /// least-recently-used list (`prev`/`next` again) that `mega_flush` walks
 /// from the front to decide which slots survive.
 ///
-/// Lookup from `pfn` to pool slot goes through `pfn_to_slot`. This is a
-/// HashMap for now — simplest thing that works. If page-switch lookup shows
-/// up hot in profiling, the design doc's dense pfn-indexed alternative
-/// (§2.4) is the fallback; not built preemptively.
+/// Lookup from `pfn` to pool slot goes through `pfn_to_slot` — the design
+/// doc's dense pfn-indexed alternative (§2.4), now built: page-switch lookup
+/// *did* show up hot in profiling (~4.5% of a real IRIX boot, with the
+/// HashMap's own `RawTable` grow-and-rehash allocation directly above it),
+/// which is exactly the trigger this comment used to name. See [`PfnMap`].
 pub struct Jitv2 {
     /// The full-capacity page pool, allocated once — see this struct's own
     /// doc comment. Indices are stable for the pool's entire lifetime,
@@ -4903,8 +5013,8 @@ pub struct Jitv2 {
     free_head: u32,
     /// pfn -> index into `pages`. Consulted only on a page switch (fetch
     /// lands on a different PFN than the currently-tracked one) — not on
-    /// every fetch.
-    pfn_to_slot: HashMap<Pfn, PageSlot>,
+    /// every fetch. Direct-mapped, not hashed — see [`PfnMap`].
+    pfn_to_slot: PfnMap,
     /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
     /// this (free list AND MRU-preserved-but-recompiling slots both
     /// exhausted) triggers `mega_flush` (the "ran out of PCPs"
@@ -4993,7 +5103,7 @@ impl Jitv2 {
             mru_head: NO_SLOT,
             mru_tail: NO_SLOT,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
-            pfn_to_slot: HashMap::new(),
+            pfn_to_slot: PfnMap::new(),
             capacity,
             compile_queue: CompileQueue::new(),
             codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
@@ -5029,6 +5139,55 @@ impl Jitv2 {
         if self.mru_tail == NO_SLOT { self.mru_tail = slot; }
     }
 
+    /// Release `slot` back to the free list, undoing everything `page_for`'s
+    /// claim path set up. The single owner of that teardown sequence — every
+    /// step has to happen, in this order, and getting any of them wrong has
+    /// already cost this file real bugs:
+    ///
+    /// 1. **`mru_unlink` first**, while the slot's `prev`/`next` still hold
+    ///    real MRU links. Doing it after step 3 would unlink against
+    ///    already-cleared pointers and corrupt the list.
+    /// 2. **Drop the pfn mapping**, keyed off the slot's *own* `pfn` — read
+    ///    it before `reset_to_unclaimed` zeroes it. A slot freed while still
+    ///    mapped is exactly the "map and the slot it points at have desynced"
+    ///    case `page_for`'s own `debug_assert` exists to catch.
+    /// 3. **`reset_to_unclaimed`**, clearing `pfn`/`gen` and every entry's
+    ///    published state, so a later `claim` starts from a clean slot (its
+    ///    own `debug_assert` enforces this).
+    /// 4. **Push onto the free list**, `prev` explicitly `NO_SLOT`. The free
+    ///    list threads through `next` only, but `prev` must not be left
+    ///    holding a stale MRU link: `touch_mru`'s "am I already linked?"
+    ///    guard tests both, and free-list garbage in `prev` made it call
+    ///    `mru_unlink` on a slot that was never in the MRU list — confirmed
+    ///    live as a boot hang (a cycle in the list that `mega_flush`'s walk
+    ///    then spun on forever). See `page_for`'s own comment on the same trap.
+    fn free_page(&mut self, slot: PageSlot) {
+        self.mru_unlink(slot);
+        let pfn = self.pages[slot as usize].pfn;
+        self.pfn_to_slot.remove(pfn);
+        self.pages[slot as usize].reset_to_unclaimed();
+        self.pages[slot as usize].prev = NO_SLOT;
+        self.pages[slot as usize].next = self.free_head;
+        self.free_head = slot;
+    }
+    /// Raw pointers backing the CPU thread's lock-free `page_for` fast path:
+    /// `(pfn_map, pages)`. Both arrays are allocated once and never resized
+    /// (see `PfnMap::as_ptr` and the `pages` field's own doc comment), so
+    /// both stay valid for the process's whole lifetime, across `mega_flush`
+    /// included.
+    ///
+    /// Captured once by the executor (`MipsExecutor::jitv2_bind_fast_lookup`)
+    /// and used to resolve `pfn -> *mut PhysicalCodePage` with no
+    /// `Mutex<Jitv2>` acquisition at all on a hit. A miss still goes through
+    /// the lock, since claiming a slot mutates the free list/MRU list.
+    ///
+    /// # Safety (for the caller)
+    /// See `PfnMap::as_ptr` — sound only because the pool is CPU-thread-only
+    /// state and the sole cross-thread writer runs with the CPU thread
+    /// joined.
+    pub fn fast_lookup_ptrs(&mut self) -> (*const u32, *mut PhysicalCodePage) {
+        (self.pfn_to_slot.as_ptr(), self.pages.as_mut_ptr())
+    }
     /// Look up the pool slot for `pfn`, claiming the next unclaimed slot
     /// in place (`PhysicalCodePage::claim`, `gen_ptr(phys_addr)` on the bus)
     /// if this is the first arrival at this page. Returns `None` if the pool
@@ -5045,7 +5204,7 @@ impl Jitv2 {
     /// `PhysicalCodePage::fr1`'s own doc comment for why it can't be
     /// re-decided per lookup).
     pub fn page_for(&mut self, pfn: Pfn, phys_addr: u32, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
-        if let Some(&slot) = self.pfn_to_slot.get(&pfn) {
+        if let Some(slot) = self.pfn_to_slot.get(pfn) {
             debug_assert_eq!(self.pages[slot as usize].pfn, pfn,
                 "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have \
                  desynced (a slot was reused/evicted without this map entry being updated to match)",
@@ -5092,9 +5251,21 @@ impl Jitv2 {
 
     /// Number of pool slots currently claimed (since construction or the
     /// last `mega_flush`). Exit-time diagnostic — see `MipsCpu::stop`.
+    ///
+    /// Counts the MRU list rather than the pfn map: [`PfnMap`] is a
+    /// direct-mapped array with no live-entry count of its own, and the MRU
+    /// list holds exactly the claimed set (`page_for` calls `touch_mru` on
+    /// both a lookup hit and a fresh claim; `free_page` unlinks). O(claimed),
+    /// and this is a diagnostic, not a hot path.
     #[inline]
     pub fn pages_used(&self) -> usize {
-        self.pfn_to_slot.len()
+        let mut n = 0usize;
+        let mut slot = self.mru_head;
+        while slot != NO_SLOT {
+            n += 1;
+            slot = self.pages[slot as usize].next;
+        }
+        n
     }
 
     /// Pool capacity, as passed to `new()`.
@@ -5162,17 +5333,27 @@ impl Jitv2 {
     /// need the raw per-page detail instead of a summary statistic. No
     /// longer a contiguous `pages[..next_free]` slice — claimed slots can be
     /// scattered anywhere in `pages` now that `mega_flush` preserves some and
-    /// frees others non-contiguously — so this goes through `pfn_to_slot`
-    /// instead (same set of slots `code_bytes_used`/`code_size_by_instr_count`
+    /// frees others non-contiguously — so this walks the **MRU list**
+    /// instead, which holds exactly the claimed set (`page_for` calls
+    /// `touch_mru` on both a lookup hit and a fresh claim; `free_page`
+    /// unlinks). Same set of slots `code_bytes_used`/`code_size_by_instr_count`
     /// reach a different way, by scanning the whole array and filtering on
-    /// `func().is_null()` — either is a valid definition of "claimed" since a
-    /// slot is in `pfn_to_slot` iff it isn't sitting on the free list, and
-    /// filtering by `pfn_to_slot` here avoids visiting the potentially-large
-    /// free portion of the array at all). `pages` itself stays private
-    /// (index stability, see the field's own doc comment, is an invariant
-    /// only this module should rely on).
+    /// `func().is_null()` — either is a valid definition of "claimed", since
+    /// a slot is MRU-linked iff it isn't sitting on the free list. `pages`
+    /// itself stays private (index stability, see the field's own doc
+    /// comment, is an invariant only this module should rely on).
     pub fn claimed_pages(&self) -> impl Iterator<Item = &PhysicalCodePage> {
-        self.pfn_to_slot.values().map(move |&slot| &self.pages[slot as usize])
+        // Walks the MRU list (exactly the claimed set — see `pages_used`)
+        // rather than the pfn map: [`PfnMap`] is a 1 Mi-entry direct-mapped
+        // array, so iterating *it* would visit a million mostly-empty slots
+        // to find at most `capacity` (4096) real ones.
+        let mut slot = self.mru_head;
+        std::iter::from_fn(move || {
+            if slot == NO_SLOT { return None; }
+            let cur = slot as usize;
+            slot = self.pages[cur].next;
+            Some(&self.pages[cur])
+        })
     }
 
     /// Reset the compiled-code arena to empty while preserving the
@@ -5253,12 +5434,7 @@ impl Jitv2 {
                 // codegen decisions, not the new one's.
                 requests.push(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: page.is_fr1() });
             } else {
-                self.mru_unlink(slot);
-                self.pfn_to_slot.remove(&self.pages[slot as usize].pfn);
-                self.pages[slot as usize].reset_to_unclaimed();
-                self.pages[slot as usize].prev = NO_SLOT;
-                self.pages[slot as usize].next = self.free_head;
-                self.free_head = slot;
+                self.free_page(slot);
             }
             rank += 1;
             slot = next;

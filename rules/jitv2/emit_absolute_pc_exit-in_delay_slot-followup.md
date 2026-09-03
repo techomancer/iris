@@ -11,6 +11,12 @@ because something upstream already cleared the flag first:
   `emit_branch_taken_edge`/`emit_nested_branch_slot`) runs after
   `emit_slot_semantics`'s non-terminating tail, which unconditionally clears
   the flag and restores `saved_pc` before returning.
+  **(2026-09-01)** An attempt to cfg-gate this clear (and the whole
+  `in_delay_slot=1`/`pc` save/restore bracket) down to
+  `jitv2_lockstep`/`developer` was made and **reverted** — `deliver_exception`
+  reads both fields out of memory, so they are load-bearing on every config.
+  See [[inlined-slot-pc-bd-bracket-is-dead]]. This bullet's guarantee is
+  intact and unconditional, exactly as originally written.
 - The annulling-Likely not-taken arm never sets the flag in the first place
   (the slot is skipped entirely, mirroring `handle_branch_likely_skip`).
 

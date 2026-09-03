@@ -1143,6 +1143,26 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// `jitv2_compile_queue`/`jitv2_stats` below.
     #[cfg(feature = "jitv2")]
     pub jitv2: std::sync::Arc<Mutex<crate::jitv2::Jitv2>>,
+    /// Lock-free `pfn -> PageSlot` lookup: a raw pointer to the `PfnMap`
+    /// array inside `jitv2`, captured once by `jitv2_bind_fast_lookup`.
+    ///
+    /// `page_for` is CPU-thread-only, and its hit path is a pure read — but
+    /// it used to pay a `jitv2.lock()` anyway, because the pool happens to
+    /// live inside the same `Mutex<Jitv2>` as genuinely-shared state
+    /// (`codegen`, `compile_queue`, …). Every one of those shared fields
+    /// already carries its *own* synchronization, so the outer mutex was
+    /// protecting only the pool — from a thread that never touches it except
+    /// during a flush, with the CPU thread joined.
+    ///
+    /// Null until bound; a null pointer just means "take the lock", so this
+    /// degrades safely for the (many) test paths that never call the binder.
+    #[cfg(feature = "jitv2")]
+    jitv2_pfn_map: *const u32,
+    /// Companion to `jitv2_pfn_map`: the pool's `pages` array base, so a
+    /// lookup hit can produce the `*mut PhysicalCodePage` the caller wants
+    /// without going back through `Jitv2`. Same lifetime/safety story.
+    #[cfg(feature = "jitv2")]
+    jitv2_pages_base: *mut crate::jitv2::PhysicalCodePage,
     /// Cheap handle to `jitv2.lock().compile_queue`'s underlying push queue,
     /// cloned once at construction (`CompileQueue::queue_handle`) — lets the
     /// per-dispatch compile-request send (`exec_decoded`'s JIT gate) skip
@@ -2466,6 +2486,12 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // self-contained jitv2 pool with no special-casing.
             #[cfg(feature = "jitv2")]
             jitv2: std::sync::Arc::new(Mutex::new(jitv2)),
+            // Bound by `jitv2_bind_fast_lookup` — null means "always take
+            // the lock", which is correct, just slower.
+            #[cfg(feature = "jitv2")]
+            jitv2_pfn_map: std::ptr::null(),
+            #[cfg(feature = "jitv2")]
+            jitv2_pages_base: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             jitv2_compile_queue_handle,
             #[cfg(feature = "jitv2")]
@@ -2528,6 +2554,16 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     pub fn rebind_atomic_ptrs(&mut self) {
         #[cfg(feature = "idle-pause")]
         { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
+        // Same "re-sync raw pointers after Arc injection" job for the page
+        // pool's lock-free lookup arrays — `Machine::new` replaces this
+        // executor's standalone default `Arc<Mutex<Jitv2>>` with the shared
+        // one, which has its own (differently-allocated) pool, so the
+        // pointers captured at construction would otherwise still address
+        // the abandoned default pool. Binding here covers both: construction
+        // (below `MipsExecutor::new`'s own struct literal) and every
+        // post-injection re-sync.
+        #[cfg(feature = "jitv2")]
+        self.jitv2_bind_fast_lookup();
     }
 
     /// ppmem: pointer to this executor's inline `ppmem_bitmap` word, for
@@ -3051,6 +3087,47 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// nanotlb hit path above and a single PFN comparison here.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
+    /// Capture the page pool's array base pointers for the lock-free
+    /// `page_for` fast path (`jitv2_pfn_map`/`jitv2_pages_base`). Call once,
+    /// after the executor's final `Arc<Mutex<Jitv2>>` is in place — in
+    /// production that's `Machine::new`, right where the other jitv2 handles
+    /// are injected; `MipsExecutor::new`'s own standalone default pool binds
+    /// itself so direct-construction callers (equiv_test's ~30 sites) get the
+    /// fast path too.
+    ///
+    /// Idempotent and safe to skip: leaving the pointers null just routes
+    /// every lookup through `jitv2.lock()`, exactly as before.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_bind_fast_lookup(&mut self) {
+        let (map, pages) = self.jitv2.lock().fast_lookup_ptrs();
+        self.jitv2_pfn_map = map;
+        self.jitv2_pages_base = pages;
+    }
+
+    /// Lock-free `pfn -> *mut PhysicalCodePage`, or `None` on a miss (which
+    /// the caller must then resolve under the lock, since claiming mutates
+    /// the free/MRU lists).
+    ///
+    /// # Safety
+    /// Sound because the page pool is CPU-thread-only state and this is the
+    /// CPU thread: `page_for` has no other callers, and the one cross-thread
+    /// writer (a compile worker's `flush_from_jit_thread`) runs only after
+    /// `cpu.stop()` has joined this very thread. Both arrays are allocated
+    /// once and never resized, so the pointers stay valid across
+    /// `mega_flush` (which clears in place). See `PfnMap::as_ptr`.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn jitv2_lookup_page_fast(&self, pfn: u32) -> Option<*mut crate::jitv2::PhysicalCodePage> {
+        if self.jitv2_pfn_map.is_null() {
+            return None;
+        }
+        let slot = unsafe { *self.jitv2_pfn_map.add(pfn as usize) };
+        if slot == crate::jitv2::jitv2::PFN_MAP_EMPTY {
+            return None;
+        }
+        Some(unsafe { self.jitv2_pages_base.add(slot as usize) })
+    }
+
     fn jitv2_track_pcp(&mut self, phys_addr: u32) {
         let pfn = phys_addr / crate::jitv2::PAGE_SIZE;
         let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
@@ -3101,6 +3178,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // CompileRequest::compiled_for_fr1).
         #[cfg(feature = "j2wp")]
         let fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+
+        // Lock-free hit path (default build only — see below). An
+        // already-claimed page needs nothing but the `pfn -> slot -> page`
+        // indirection, which is two loads from arrays that never move; the
+        // `jitv2.lock()` this skips was only ever protecting the *claim*
+        // path's free-list/MRU mutation, plus unrelated fields that all
+        // carry their own synchronization anyway.
+        //
+        // NOT enabled under `j2wp`: that pool's `page_for` also calls
+        // `touch_mru` on a hit, so a hit genuinely mutates the MRU list
+        // there and cannot skip the lock. (Its flush-preservation policy
+        // depends on that ordering — see `mega_flush`'s rank walk.)
+        #[cfg(not(feature = "j2wp"))]
+        if let Some(page) = self.jitv2_lookup_page_fast(pfn) {
+            self.pcp = page;
+            self.core.cur_code_pfn = pfn;
+            debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
+                "jitv2_track_pcp fast path: pfn_map[{:#x}] pointed at a slot whose own pfn is {:#x}",
+                pfn, unsafe { (*self.pcp).pfn });
+            return;
+        }
+
         let mut jit = self.jitv2.lock();
         #[cfg(not(feature = "j2wp"))]
         let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref());
