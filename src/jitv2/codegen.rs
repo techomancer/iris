@@ -232,8 +232,12 @@ struct EmitCtx<'a, 'b> {
     /// no call site ever pays a runtime check for something that's actually
     /// fixed for that site.
     exception_call_block: Block,
-    exception_entry_word_block: Block,
-    exception_other_word_block: Block,
+    /// Shared exception-raise block: `(core_ptr, status, fault_pc, bd)`.
+    /// Both stage blocks that used to sit in front of this (one writing
+    /// compile-time word/bd into `core`, one trusting the live values) are
+    /// gone — `emit_exception_exit_const`/`_live` now pass those two values
+    /// as block args instead of materializing them into memory. See
+    /// `mips_core::deliver_exception_at`.
     /// Compile-time-only running total of retired-but-not-yet-stored
     /// instructions since the last `core.hot.cycles` flush — see the
     /// analyzer's `CompiledInstr::cycles_delta`/`cycles_flush` doc comments
@@ -321,8 +325,7 @@ pub struct BlockSkeleton {
     /// Left unsealed for the same reason `exit_block` is — the caller must
     /// seal them once every exception-exit site has been emitted.
     pub exception_call_block: Block,
-    pub exception_entry_word_block: Block,
-    pub exception_other_word_block: Block,
+
     /// (word offset, allocated block) for every instruction in the region,
     /// in ascending word-offset order (mirrors `instrs_linear`'s order).
     pub instr_blocks: Vec<(WordOffset, Block)>,
@@ -760,29 +763,20 @@ impl Codegen {
         // Not sealed: predecessors are every bail site across the whole
         // function, established incrementally as later passes emit them.
 
-        // Shared exception-raise machinery (see BlockSkeleton's own doc
-        // comment for the two-stage rationale) — same block-param pattern as
-        // exit_block above, split into three blocks so no call site ever
-        // pays a runtime word==entry_word check.
+        // Shared exception-raise machinery — ONE block now, taking
+        // `(core_ptr, status, fault_pc, bd)`. The two outer stages this used
+        // to have (one storing compile-time word/bd into `core`, one
+        // trusting whatever the interpreter left live) are gone:
+        // `emit_exception_exit_const`/`_live` pass those two values as block
+        // args instead, so nothing has to be materialized into memory on the
+        // way to the call. Same block-param pattern as exit_block above.
         let exception_call_block = builder.create_block();
         let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
         let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
+        let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
+        let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param);
-
-        let exception_other_word_block = builder.create_block();
-        let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
-        let other_word_param = builder.append_block_param(exception_other_word_block, ir::types::I64);
-        let other_bd_param = builder.append_block_param(exception_other_word_block, ir::types::I8);
-        let other_status_param = builder.append_block_param(exception_other_word_block, ir::types::I32);
-        builder.switch_to_block(exception_other_word_block);
-        emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
-
-        let exception_entry_word_block = builder.create_block();
-        let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
-        let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
-        builder.switch_to_block(exception_entry_word_block);
-        emit_exception_entry_word_block_body(&mut builder, entry_exc_core_ptr, entry_exc_status_param, exception_call_block);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
         // None of the three sealed here: predecessors (every emit_exception_exit
         // call site, plus the two outer stages' own jumps into
         // exception_call_block) are established incrementally as later
@@ -802,7 +796,7 @@ impl Codegen {
         // once all of a block's predecessors are known.
         drop(builder);
 
-        BlockSkeleton { entry_block, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, instr_blocks }
+        BlockSkeleton { entry_block, exit_block, exception_call_block, instr_blocks }
     }
 
     /// Signature for `JitFn` (`jitv2/jitv2.rs`): `extern "C" fn(*mut MipsCore) -> ExecStatus`.
@@ -1063,8 +1057,6 @@ impl Codegen {
                 trust_live_pc_bd_on_exc: true,
                 exit_block: dead,
                 exception_call_block: dead,
-                exception_entry_word_block: dead,
-                exception_other_word_block: dead,
                 cycles_pending: &mut unused_cycles,
             };
 
@@ -1271,19 +1263,14 @@ impl Codegen {
         let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
         let exit_status_param = builder.append_block_param(exit_block, ir::types::I32);
 
+        // One shared exception block, `(core_ptr, status, fault_pc, bd)` —
+        // see the matching comment in `build_block_skeleton` for why the two
+        // outer stages are gone.
         let exception_call_block = builder.create_block();
         let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
         let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
-
-        let exception_other_word_block = builder.create_block();
-        let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
-        let other_word_param = builder.append_block_param(exception_other_word_block, ir::types::I64);
-        let other_bd_param = builder.append_block_param(exception_other_word_block, ir::types::I8);
-        let other_status_param = builder.append_block_param(exception_other_word_block, ir::types::I32);
-
-        let exception_entry_word_block = builder.create_block();
-        let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
-        let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
+        let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
+        let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
 
         // §13.4 internal dispatch head: this page's one compiled function may
         // cover several external entry points, so the function itself must
@@ -1318,7 +1305,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1375,7 +1362,7 @@ impl Codegen {
                 builder.switch_to_block(stub);
                 let raw = instrs[w as usize].raw;
                 let mut unused_cycles_pending = 0u32;
-                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
                 emit_dev_trace_bp(&mut trace_ctx, origin);
                 builder.ins().jump(real_target, &[]);
                 builder.seal_block(stub);
@@ -1399,15 +1386,9 @@ impl Codegen {
         // Left unsealed until every bail site below has been emitted.
 
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param);
-
-        builder.switch_to_block(exception_other_word_block);
-        emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
-
-        builder.switch_to_block(exception_entry_word_block);
-        emit_exception_entry_word_block_body(&mut builder, entry_exc_core_ptr, entry_exc_status_param, exception_call_block);
-        // None left sealed until every emit_exception_exit call site below
-        // has been emitted — same reasoning as exit_block above.
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
+        // Left unsealed until every emit_exception_exit call site below has
+        // been emitted — same reasoning as exit_block above.
 
         for &(word, block) in &instr_blocks {
             instrs[word as usize].block_id = Some(block.as_u32());
@@ -1449,7 +1430,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -1825,8 +1806,6 @@ impl Codegen {
         }
         builder.seal_block(exit_block);
         builder.seal_block(exception_call_block);
-        builder.seal_block(exception_other_word_block);
-        builder.seal_block(exception_entry_word_block);
         builder.finalize(self.module.target_config());
 
         // Anonymous, not named: this module never looks a compiled region
@@ -3098,6 +3077,7 @@ fn core_offset_of_write64_fn() -> i32 { std::mem::offset_of!(MipsCore, write64_f
 fn core_offset_of_write64_masked_fn() -> i32 { std::mem::offset_of!(MipsCore, write64_masked_fn) as i32 }
 #[cfg(feature = "jitv2")]
 fn core_offset_of_handle_exception_fn() -> i32 { std::mem::offset_of!(MipsCore, handle_exception_fn) as i32 }
+fn core_offset_of_handle_exception_at_fn() -> i32 { std::mem::offset_of!(MipsCore, handle_exception_at_fn) as i32 }
 fn core_offset_of_interp_fallback_fn() -> i32 { std::mem::offset_of!(MipsCore, interp_fallback_fn) as i32 }
 fn core_offset_of_kill_entry_fn() -> i32 { std::mem::offset_of!(MipsCore, kill_entry_fn) as i32 }
 #[cfg(feature = "developer")]
@@ -4958,92 +4938,32 @@ fn emit_exception_call_block_body(
     consts: &JitConsts,
     core_ptr: Value,
     status: Value,
+    fault_pc: Value,
+    bd: Value,
 ) {
-    let mem = MemFlagsData::trusted();
     let ptr_ty = module.target_config().pointer_type();
 
-
+    // `handle_exception_at_fn`, not `handle_exception_fn`: EPC and Cause.BD
+    // are passed as arguments rather than left for the callee to read out of
+    // `core.pc`/`core.in_delay_slot`. See `mips_core::deliver_exception_at`
+    // for the full rationale — compiled code knows both at compile time
+    // almost everywhere, and materializing them into memory purely to have
+    // them read straight back was ~29% of all emitted store traffic.
     let callee = emit_hook_callee_raw(builder, consts, core_ptr, ptr_ty,
-                                      core_offset_of_handle_exception_fn());
+                                      core_offset_of_handle_exception_at_fn());
 
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr_ty)); // core_ptr
     sig.params.push(AbiParam::new(ir::types::I32)); // status
+    sig.params.push(AbiParam::new(ir::types::I64)); // fault_pc
+    sig.params.push(AbiParam::new(ir::types::I8));  // bd
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus (== status, unused)
     let sig_ref = builder.import_signature(sig);
 
     let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
-    builder.ins().call_indirect(sig_ref, callee, &[core_arg, status]);
+    builder.ins().call_indirect(sig_ref, callee, &[core_arg, status, fault_pc, bd]);
     let ret_status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     builder.ins().return_(&[ret_status]);
-}
-
-/// Outer stage for every non-entry-word `emit_exception_exit` call site,
-/// shared across all of them (`word`/`bd` are genuine runtime params here,
-/// unlike the entry-word stage — this one block really does serve many
-/// different words, both delay-slot and non-delay-slot alike). Unconditionally
-/// writes `core.pc = vbase | (word * 4)` and `core.in_delay_slot = bd` from
-/// its own params — never trusts either field's live value on entry, so no
-/// call site needs to rely on any upstream code having left them correct
-/// (see `emit_exception_exit`'s doc comment for why leaving `in_delay_slot`
-/// to inheritance was fragile) — then falls into the inner stage. Every call
-/// site's `bd` is a compile-time-known literal (`emit_exception_exit` reads
-/// `ctx.bd`): `true` only while inlined inside a delay slot's own semantics
-/// (`emit_slot_semantics` sets `ctx.bd = true` before calling in), `false`
-/// for every ordinary, non-slot head — including one that's independently
-/// reachable as this same region's own branch/jump target (§6.1.4 dual
-/// semantics), which is always a *different*, freshly-constructed `ctx` with
-/// its own default `bd = false`.
-fn emit_exception_other_word_block_body(
-    builder: &mut FunctionBuilder,
-    core_ptr: Value,
-    word: Value,
-    bd: Value,
-    status: Value,
-    call_block: Block,
-) {
-    let mem = MemFlagsData::trusted();
-    let i64t = ir::types::I64;
-    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
-    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
-
-    let pc = builder.ins().load(i64t, mem, core_ptr, pc_off);
-    let vbase = builder.ins().band_imm_s(pc, !(PAGE_SIZE as i64 - 1));
-    let byte_offset = builder.ins().imul_imm_s(word, 4);
-    let fault_pc = builder.ins().iadd(vbase, byte_offset);
-    builder.ins().store(mem, fault_pc, core_ptr, pc_off);
-    builder.ins().store(mem, bd, core_ptr, flag_off);
-    builder.ins().jump(call_block, &[ir::BlockArg::Value(core_ptr), ir::BlockArg::Value(status)]);
-}
-
-/// Outer stage for entry-word `emit_exception_exit` call sites — see
-/// `BlockSkeleton::exception_entry_word_block`'s doc comment for why
-/// `entry_word` is baked in as a compile-time constant here rather than
-/// threaded as a block param (there's only ever one per region).
-///
-/// Unconditional, same shape as `emit_exception_other_word_block_body` — no
-/// runtime check. A runtime check *here* cannot work: by the time control
-/// reaches this block, `core.in_delay_slot`'s live value no longer
-/// distinguishes "external interpreter dispatch landed on entry_word"
-/// (state already correct) from "an internal in-region branch landed on
-/// entry_word" (state stale) — both are just some bit pattern in `core`,
-/// with no third signal available here to tell them apart. The
-/// disambiguation has to happen at the branch site instead: entry_word_block
-/// (the target of every *internal* edge into entry_word, per its own doc
-/// comment in `compile_region_uncommitted`) unconditionally forces
-/// `core.in_delay_slot = false` and `core.pc = vbase | entry_word*4` before
-/// falling into entry_word_body_block — internal edges into entry_word are
-/// always ordinary fallthrough/taken-branch edges (`emit_target_edge`'s
-/// `None` arm), never a delay-slot transfer, so `in_delay_slot` is always
-/// `false` on that path. That leaves this block free to just assume state is
-/// already correct unconditionally, exactly like the non-entry-word stage.
-fn emit_exception_entry_word_block_body(
-    builder: &mut FunctionBuilder,
-    core_ptr: Value,
-    status: Value,
-    call_block: Block,
-) {
-    builder.ins().jump(call_block, &[ir::BlockArg::Value(core_ptr), ir::BlockArg::Value(status)]);
 }
 
 /// Jump to the region's shared exception-raise machinery instead of emitting
@@ -5055,26 +4975,61 @@ fn emit_exception_entry_word_block_body(
 /// this avoids the runtime check a single fully-shared block would need).
 fn emit_exception_exit(ctx: &mut EmitCtx, status: Value) {
     if ctx.trust_live_pc_bd_on_exc {
-        // entry word (state set by the interpreter dispatch that reached it)
-        // or a branch-fallback successor (state set by the BC1 fallback's
-        // interpreter run) — `core.pc`/`core.in_delay_slot` are already
-        // correct and must NOT be overwritten from the compile-time word/bd
-        // (which would clobber a slot's BD=true), so route through
-        // exception_entry_word_block, which trusts the live values.
-        ctx.builder.ins().jump(ctx.exception_entry_word_block, &[
-            ir::BlockArg::Value(ctx.core_ptr),
-            ir::BlockArg::Value(status),
-        ]);
+        emit_exception_exit_live(ctx, status);
     } else {
-        let word_val = ctx.builder.ins().iconst(ir::types::I64, ctx.word as i64);
-        let bd_val = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
-        ctx.builder.ins().jump(ctx.exception_other_word_block, &[
-            ir::BlockArg::Value(ctx.core_ptr),
-            ir::BlockArg::Value(word_val),
-            ir::BlockArg::Value(bd_val),
-            ir::BlockArg::Value(status),
-        ]);
+        emit_exception_exit_const(ctx, status);
     }
+}
+
+/// `emit_exception_exit` for a fault site whose faulting word and
+/// delay-slot-ness are known at **compile time** — every ordinary in-region
+/// instruction, including an inlined delay slot.
+///
+/// `fault_pc` is `vbase + word*4` (`emit_word_addr` — position-independent,
+/// §2.2) and `bd` is `ctx.bd`'s literal. Nothing is stored to `core`: both
+/// values go straight into the call as arguments, which is the whole point
+/// of the `handle_exception_at_fn` ABI.
+///
+/// `ctx.bd` is `true` only while emitting inside a delay slot's own
+/// semantics (`emit_slot_semantics` sets it before calling in) and `false`
+/// for every ordinary head — including one independently reachable as a
+/// branch target (§6.1.4 dual semantics), which is always a different,
+/// freshly-constructed `ctx` with its own default `bd = false`.
+fn emit_exception_exit_const(ctx: &mut EmitCtx, status: Value) {
+    let fault_pc = emit_word_addr(ctx, ctx.word);
+    let bd_val = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
+    ctx.builder.ins().jump(ctx.exception_call_block, &[
+        ir::BlockArg::Value(ctx.core_ptr),
+        ir::BlockArg::Value(status),
+        ir::BlockArg::Value(fault_pc),
+        ir::BlockArg::Value(bd_val),
+    ]);
+}
+
+/// `emit_exception_exit` for a fault site that **inherited** its
+/// `core.pc`/`core.in_delay_slot` from outside this compiled unit: the entry
+/// word (state set by the interpreter dispatch that reached it) and a
+/// branch-fallback successor (state set by the BC1 fallback's interpreter
+/// run).
+///
+/// Here the compile-time word/bd would be *wrong* — the entry word can be
+/// arrived at as some other branch's delay slot, with `in_delay_slot` true
+/// and a pending transfer armed, which `ctx.bd == false` would clobber. So
+/// this one loads both from memory, where the interpreter left them, and
+/// passes the loaded values as arguments. Two loads on a cold path, versus
+/// the stores every *other* site would otherwise have to pay on the hot one.
+fn emit_exception_exit_live(ctx: &mut EmitCtx, status: Value) {
+    let mem = MemFlagsData::trusted();
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+    let fault_pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
+    let bd_val = ctx.builder.ins().load(ir::types::I8, mem, ctx.core_ptr, flag_off);
+    ctx.builder.ins().jump(ctx.exception_call_block, &[
+        ir::BlockArg::Value(ctx.core_ptr),
+        ir::BlockArg::Value(status),
+        ir::BlockArg::Value(fault_pc),
+        ir::BlockArg::Value(bd_val),
+    ]);
 }
 
 /// Exit stub for a runtime-computed target address (JR/JALR — §2.3, the
@@ -5573,11 +5528,36 @@ fn emit_foreign_page_slot_exit(ctx: &mut EmitCtx, word: WordOffset, target_addr:
 /// word 4) and exit. No `emit_set_jit_trigger` either, matching
 /// `handle_branch_likely_skip` itself, which doesn't set it. Terminates the
 /// current block.
-fn emit_foreign_page_annulled_not_taken_exit(ctx: &mut EmitCtx, word: WordOffset) {
+fn emit_foreign_page_annulled_not_taken_exit(ctx: &mut EmitCtx, word: WordOffset, pending_outer_transfer: bool) {
     let mem = MemFlagsData::trusted();
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
     let next_pc = emit_word_addr(ctx, word + 2);
     ctx.builder.ins().store(mem, next_pc, ctx.core_ptr, pc_off);
+    // Write `in_delay_slot` explicitly rather than inheriting it. The two
+    // callers need OPPOSITE values, which is exactly why this can't be left
+    // to whatever happened to be in the field:
+    //
+    // - **head-level** branch-likely at 0xFFC (`emit_branch_or_jump`): the
+    //   annulled slot never runs and there is no outer branch, so nothing is
+    //   pending — `false`.
+    // - **nested** branch-likely at 0xFFC (`emit_nested_foreign_page_slot_branch`):
+    //   the *outer* branch's transfer is still live (its `branch_delay` armed
+    //   it a dispatch ago, and `handle_branch_likely_skip` only does
+    //   `pc += 8`), so it must stay pending across the page boundary —
+    //   `true`, paired with the `delay_slot_target` store at that call site.
+    //
+    // Both used to be inherited from `emit_slot_semantics`' unconditional
+    // `in_delay_slot = 1` bracket (nested) or from it never having run
+    // (head). That bracket is now lockstep/developer-only — its other
+    // reader, `deliver_exception`, takes BD as an argument — so this exit
+    // owns the state it depends on. Exactly the fragility
+    // `rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md` flagged
+    // for the mirror-image case. Caught by
+    // `nested_likely_at_last_word_not_taken_annuls_foreign_slot_like_interpreter`
+    // and `beql_not_taken_at_0xffc_skips_slot_and_lands_on_fallthrough_directly`.
+    let bd_val = ctx.builder.ins().iconst(ir::types::I8, pending_outer_transfer as i64);
+    ctx.builder.ins().store(mem, bd_val, ctx.core_ptr, flag_off);
     let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     ctx.builder.ins().return_(&[status]);
 }
@@ -5778,7 +5758,7 @@ fn emit_branch_or_jump(
                 // there's no pending transfer to defer onto the next page's
                 // dispatch, matching handle_branch_likely_skip exactly
                 // (direct pc+=8, no in_delay_slot involvement at all).
-                emit_foreign_page_annulled_not_taken_exit(ctx, word);
+                emit_foreign_page_annulled_not_taken_exit(ctx, word, false);
             } else {
                 let fallthrough_word = word + 2;
                 emit_target_edge(ctx, exit_block, block_for_word, instrs[word as usize].fallthrough_exit, fallthrough_word);
@@ -6010,11 +5990,39 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     // restored back to false afterward: ctx is not reused for anything else
     // once this returns (the pass-2 loop constructs a fresh ctx per head).
     ctx.bd = true;
+    // ...and for the same reason, this slot's fault state is now fully
+    // compile-time known (`slot_word`, `bd = true`), so it must NOT be taken
+    // from live memory even when the *branch* it belongs to is an entry word
+    // / branch-fallback successor (which sets `trust_live_pc_bd_on_exc` for
+    // its own sake). Inheriting that flag into the slot sends
+    // `emit_exception_exit` down `emit_exception_exit_live`, which loads
+    // `core.in_delay_slot` — a field the bracket below no longer writes
+    // outside lockstep/developer, so BD came back false and every
+    // delay-slot fault delivered with Cause.BD clear. (Caught by the six
+    // equiv_test delay-slot exception tests; EPC was already correct,
+    // because `emit_word_addr` derives it from the page base either way.)
+    ctx.trust_live_pc_bd_on_exc = false;
     let mem = MemFlagsData::trusted();
     let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
-    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
-    ctx.builder.ins().store(mem, one, ctx.core_ptr, flag_off);
+    // `core.in_delay_slot = true` for the duration of the slot — needed
+    // ONLY by `jitv2_lockstep` (whose compare reads it as the slot's
+    // post-state) and `developer` (dt tagging).
+    //
+    // It used to be unconditional, because `deliver_exception` read this
+    // field out of memory to decide `Cause.BD`. It no longer does: the
+    // exception path now calls `handle_exception_at_fn`, which takes BD as
+    // an *argument*, and `emit_exception_exit_const` passes `ctx.bd` — a
+    // compile-time literal that is `true` for exactly this case. See
+    // `mips_core::deliver_exception_at`.
+    //
+    // Worth ~3,574 stores per 300 real IRIX pages (measured), on the hot
+    // path, plus the CSE those stores were blocking.
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    {
+        let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+        ctx.builder.ins().store(mem, one, ctx.core_ptr, flag_off);
+    }
     // jitv2_lockstep only: arm core.delay_slot_target with the branch's real
     // destination (already resolved by the caller — a register read for
     // RegJump, the branch-target/fallthrough Value for a conditional/J/JAL)
@@ -6036,43 +6044,31 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     }
     #[cfg(not(feature = "jitv2_lockstep"))]
     let _ = delay_slot_target;
-    // Save the region's real entry pc before overwriting it — every later
-    // exit in this same compiled unit (emit_exit_block_body's `vbase = pc &
-    // !(PAGE_SIZE-1)`, emit_bail's retry word, an outer branch/jump's own
-    // link-register write) needs core.pc to still reflect the entry
-    // instruction's real page once the slot completes normally, not
-    // whatever the slot's own address was. Restored below on the
-    // slot-completed-without-trapping path only — if the slot itself raises
-    // an exception, control never returns here (emit_exception_exit is a
-    // block terminator), so there's nothing to restore on that path: the
-    // slot's `core.pc` write is exactly what deliver_exception needs to see
-    // in that case.
+    // Save the region's real entry pc, then point `core.pc` at the slot's
+    // own address for the duration of its semantics — like the
+    // `in_delay_slot` store above, now needed ONLY by `jitv2_lockstep` (the
+    // compare reads `core.pc` as post-state) and `developer`
+    // (`emit_dev_trace_bp` reports the slot's own pc).
     //
-    // That last sentence is the load-bearing one, and it is easy to miss:
-    // this store is NOT removable. `deliver_exception` (mips_core.rs) reads
-    // live `core.pc` to compute `cp0_epc = pc - 4` for a delay-slot fault,
-    // and the JIT reaches it through `emit_exception_call_block_body`, which
-    // passes only `(core_ptr, status)` — the faulting word is not an
-    // argument. Nor is `Cause.BD`: the `in_delay_slot = 1` store above is
-    // read out of memory by the same function. `ctx.bd` only selects which
-    // exception *stage block* runs, not what the callee sees.
+    // `deliver_exception` used to read live `core.pc` to compute
+    // `cp0_epc = pc - 4`, which made this mandatory; the exception path now
+    // passes the faulting word explicitly (`emit_exception_exit_const` ->
+    // `handle_exception_at_fn`), so nothing reads it back.
     //
-    // The "only bits 12..63 of core.pc matter in-region" argument (true for
-    // addressing — every in-region address is emit_vbase + a compile-time
-    // word) does NOT apply here: EPC needs the exact word. A 2026-09-01
-    // attempt to cfg-gate this whole bracket down to
-    // jitv2_lockstep/developer was reverted after six equiv_test delay-slot
-    // exception failures (Cause differing by exactly bit 31). cpu-tests and
-    // a full IRIX boot both passed the broken build — equiv_test is the only
-    // suite that covers this. See
-    // rules/jitv2/inlined-slot-pc-bd-bracket-is-dead.md. The slot's address itself is derived from this same
-    // live pc load (emit_word_addr's vbase, §2.2 position independence) —
-    // never from compile-time page_base, which is a physical address in
-    // production (`comp.rs`'s `phys_base`) and would be wrong to bake into
-    // a value written into core.pc (a virtual address).
+    // Everything else in a region only ever consumes `core.pc`'s *page
+    // base* (`emit_vbase`, `pc & !0xFFF`, plus a compile-time word offset),
+    // and an inlined slot is always on its branch's own page — the 0xFFC
+    // cross-page slot is never inlined (`is_inlinable` rejects
+    // `word >= ENTRIES_PER_PAGE`; it exits via
+    // `emit_foreign_page_slot_exit`). So dropping this leaves every address
+    // computation in the region unaffected.
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
     let saved_pc = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, pc_off);
-    let slot_addr_val = emit_word_addr(ctx, slot_word);
-    ctx.builder.ins().store(mem, slot_addr_val, ctx.core_ptr, pc_off);
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    {
+        let slot_addr_val = emit_word_addr(ctx, slot_word);
+        ctx.builder.ins().store(mem, slot_addr_val, ctx.core_ptr, pc_off);
+    }
     // The delay slot always executes exactly once here (§6.1.4 — never
     // conditional, never skippable), so this is unconditional too, unlike
     // the head-instruction loop's post-preamble placement — a slot has no
@@ -6185,9 +6181,13 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         ctx.builder.seal_block(continue_block);
     }
 
-    let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
-    ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
-    ctx.builder.ins().store(mem, saved_pc, ctx.core_ptr, pc_off);
+    // Restore only what was actually saved above.
+    #[cfg(any(feature = "jitv2_lockstep", feature = "developer"))]
+    {
+        let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
+        ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
+        ctx.builder.ins().store(mem, saved_pc, ctx.core_ptr, pc_off);
+    }
     false
 }
 
@@ -6405,7 +6405,7 @@ fn emit_nested_foreign_page_slot_branch(
             let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
             ctx.builder.ins().store(
                 MemFlagsData::trusted(), outer_delay_slot_target, ctx.core_ptr, target_off);
-            emit_foreign_page_annulled_not_taken_exit(ctx, word);
+            emit_foreign_page_annulled_not_taken_exit(ctx, word, true);
         }
     }
 }
@@ -9166,16 +9166,8 @@ mod tests {
             let exception_call_block = builder.create_block();
             let call_core_ptr = builder.append_block_param(exception_call_block, ptr_ty);
             let call_status_param = builder.append_block_param(exception_call_block, ir::types::I32);
-
-            let exception_other_word_block = builder.create_block();
-            let other_core_ptr = builder.append_block_param(exception_other_word_block, ptr_ty);
-            let other_word_param = builder.append_block_param(exception_other_word_block, ir::types::I64);
-            let other_bd_param = builder.append_block_param(exception_other_word_block, ir::types::I8);
-            let other_status_param = builder.append_block_param(exception_other_word_block, ir::types::I32);
-
-            let exception_entry_word_block = builder.create_block();
-            let entry_exc_core_ptr = builder.append_block_param(exception_entry_word_block, ptr_ty);
-            let entry_exc_status_param = builder.append_block_param(exception_entry_word_block, ir::types::I32);
+            let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
+            let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
 
             {
                 // Test harness for preamble emitters only (see this
@@ -9187,7 +9179,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, exception_entry_word_block, exception_other_word_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -9205,22 +9197,9 @@ mod tests {
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
 
             builder.switch_to_block(exception_call_block);
-            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param);
+            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
 
-            builder.switch_to_block(exception_other_word_block);
-            emit_exception_other_word_block_body(&mut builder, other_core_ptr, other_word_param, other_bd_param, other_status_param, exception_call_block);
-
-            builder.switch_to_block(exception_entry_word_block);
-            emit_exception_entry_word_block_body(&mut builder, entry_exc_core_ptr, entry_exc_status_param, exception_call_block);
-
-            // Sealed together, after every predecessor edge into any of the
-            // three (the two outer stages' jumps into exception_call_block,
-            // above) has been emitted — never actually jumped to *into* from
-            // outside this trio in this harness, but exception_call_block's
-            // own in-trio predecessors must still be established first.
             builder.seal_block(exception_call_block);
-            builder.seal_block(exception_other_word_block);
-            builder.seal_block(exception_entry_word_block);
 
             builder.finalize(codegen.module.target_config());
         }

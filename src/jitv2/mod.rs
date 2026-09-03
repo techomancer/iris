@@ -216,3 +216,18 @@ mod zz_constdedup {
         }
     }
 }
+
+#[cfg(test)]
+mod zz_offsets {
+    #[test]
+    fn zz_print_offsets() {
+        if std::env::var("IRIS_PRINT_OFFSETS").is_err() { return; }
+        use crate::mips_core::MipsCore;
+        println!("OFF gpr    = {:#x}", std::mem::offset_of!(MipsCore, gpr));
+        println!("OFF pc     = {:#x}", std::mem::offset_of!(MipsCore, pc));
+        println!("OFF hot    = {:#x}", std::mem::offset_of!(MipsCore, hot));
+        println!("OFF fpr    = {:#x}", std::mem::offset_of!(MipsCore, fpr));
+        println!("OFF nutlb  = {:#x}", std::mem::offset_of!(MipsCore, nutlb));
+        println!("SIZE core  = {:#x}", std::mem::size_of::<MipsCore>());
+    }
+}
