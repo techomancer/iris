@@ -94,6 +94,7 @@ impl Dm1 {
     fn sfactor(&self)     -> u32  { (self.val >> 19) & 7 }
     fn dfactor(&self)     -> u32  { (self.val >> 22) & 7 }
     fn backblend(&self)   -> bool { self.val & (1 << 25) != 0 }
+    fn blendalpha(&self)  -> bool { self.val & (1 << 27) != 0 }
     fn logicop(&self)     -> u32  { (self.val >> 28) & 0xF }
 
     /// Compute compile-time host pixel count (pixels per host word) from dm1 fields.
@@ -582,7 +583,8 @@ fn emit_pixel_write(
             dst_plane
         };
         let blend_dst = if dm1.backblend() { pctx.colorback_v } else { dst_24 };
-        let blended   = emit_blend_ir(b, src_color, blend_dst, dm1.sfactor(), dm1.dfactor());
+        let blended   = emit_blend_ir(b, src_color, blend_dst,
+                                      dm1.sfactor(), dm1.dfactor(), dm1.blendalpha());
         let compressed = if dm1.rgbmode() && dm1.drawdepth() != 3 {
             let packed = bayer_pack_ir(b, blended, x_bayer, y_bayer);
             emit_compress_ir(b, packed, dm1.drawdepth(), dm1.dither())
@@ -2618,12 +2620,27 @@ fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value 
 }
 
 /// Inline blend: src and dst are 24-bit BGR (alpha in bits[31:24] of src).
-/// sfactor/dfactor are compile-time constants (0..=5).
-/// Mirrors helper_blend but specialized — constant sfactor/dfactor let Cranelift
-/// fold all the factor-selection branches away.
-fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, dfactor: u32) -> Value {
+/// sfactor/dfactor/blendalpha are compile-time constants.
+/// Mirrors Rex3::blend but specialized — constant factors let Cranelift fold all
+/// the factor-selection branches away.
+///
+/// BLENDALPHA (DRAWMODE1 bit 27) selects what BF_SA resolves to for the SOURCE
+/// multiplier only: '1' = the real source alpha, '0' = 1.0 (spec Table 11).
+/// §3.8 adds "...and destination multiplier is defined by DFACTOR", so DFACTOR
+/// keeps its own definition and still evaluates against the real source alpha.
+/// Substituting into both factors would zero BF_MSA and discard the destination.
+fn emit_blend_ir(
+    b: &mut FunctionBuilder,
+    src: Value,
+    dst: Value,
+    sfactor: u32,
+    dfactor: u32,
+    blendalpha: bool,
+) -> Value {
     let sa   = b.ins().ushr_imm_s(src, 24); // alpha from src bits[31:24]
     let c255 = b.ins().iconst(types::I32, 255);
+    // Source-side alpha: real alpha when BLENDALPHA=1, otherwise 1.0 (255).
+    let sa_src = if blendalpha { sa } else { c255 };
 
     // Extract each 8-bit channel (no nesting)
     let sr   = b.ins().band_imm_s(src, 0xFF);
@@ -2656,7 +2673,7 @@ fn emit_blend_ir(b: &mut FunctionBuilder, src: Value, dst: Value, sfactor: u32, 
     // Blend one channel: (sc*sf + dc*df)/255, clamped to 255, shifted
     macro_rules! blend_ch {
         ($sc:expr, $dc:expr, $shift:literal) => {{
-            let sf = get_factor_ir(b, sfactor, $dc, sa, c255);
+            let sf = get_factor_ir(b, sfactor, $dc, sa_src, c255);
             let df = get_factor_ir(b, dfactor, $sc, sa, c255);
             let sc_sf = b.ins().imul($sc, sf);
             let dc_df = b.ins().imul($dc, df);

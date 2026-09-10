@@ -75,6 +75,13 @@ pub fn try_src_span_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
     if ctx.drawmode1.planes() != 0 {
         return false; // RGB/RGBA planes only
     }
+    // Blending and the alpha-vs-ALPHAREF compare are both per-pixel decisions this
+    // path cannot make: it precomputes one solid colour and stores it unconditionally,
+    // which would bypass the blend entirely and write pixels the alpha test should
+    // have killed. COMPARE == 0x7 means the test is disabled (always pass).
+    if ctx.drawmode1.blend() || ctx.drawmode1.compare() != 0x7 {
+        return false;
+    }
     // Dithering needs a per-pixel bayer(x,y) threshold — not representable as a
     // single precomputed fill color, so fall back to the interpreter for that case.
     if ctx.drawmode1.dither() {
@@ -121,6 +128,11 @@ pub fn try_src_block_rgb(rex: &Rex3, ctx: &Rex3Context) -> bool {
         return false;
     }
     if ctx.drawmode1.planes() != 0 || ctx.drawmode1.fastclear() {
+        return false;
+    }
+    // See try_src_span_rgb: blend and the alpha compare are per-pixel decisions
+    // this precomputed-colour path cannot honour.
+    if ctx.drawmode1.blend() || ctx.drawmode1.compare() != 0x7 {
         return false;
     }
     // See try_src_span_rgb: dithering needs a per-pixel bayer(x,y) threshold,

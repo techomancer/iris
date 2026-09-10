@@ -4004,6 +4004,78 @@ mod jit_tests {
         // RGB24 hostdepth32: 1 pixel/word, so this is 24 rows x 15 words = 360 row-wraps' worth.
         hostr_stress(DM1_RGB24_HOSTRW, 15, 24, 15);
     }
+
+    /// BLENDALPHA (DRAWMODE1 bit 27) must be honoured identically by the JIT and
+    /// the interpreter: it selects what BF_SA resolves to for the SOURCE
+    /// multiplier only ('1' = real source alpha, '0' = 1.0), while DFACTOR keeps
+    /// its own definition against the real alpha. Runs both polarities over a
+    /// spread of alphas against a lit destination, where the two differ most.
+    #[test]
+    fn jit_blend_blendalpha_matches_interp() {
+        for blendalpha in [false, true] {
+            let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+                | DRAWMODE1_COMPARE_DISABLE | (1 << 18)
+                | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+                | ((blendalpha as u32) << 27) | DRAWMODE1_LOGICOP_SRC;
+            let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+                | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+            let dm0 = DM0_DRAW_BLOCK;
+            let alphas: [u32; 5] = [0, 8, 64, 128, 255];
+
+            let setup = |rex: &Rex3| {
+                for (i, a) in alphas.iter().enumerate() {
+                    let x = i as i32;
+                    // Lit destination first, blending off.
+                    reg(rex, REX3_DRAWMODE1, dm1_src);
+                    reg(rex, REX3_WRMASK, 0xFFFFFF);
+                    reg(rex, REX3_COLORALPHA, 255 << 11);
+                    reg(rex, REX3_COLORRED,   0x40 << 11);
+                    reg(rex, REX3_COLORGRN,   0x50 << 11);
+                    reg(rex, REX3_COLORBLUE,  0x60 << 11);
+                    reg(rex, REX3_XYENDI,   xy(x, 0));
+                    reg(rex, REX3_XYSTARTI, xy(x, 0));
+                    reg_go(rex, REX3_DRAWMODE0, dm0);
+                    // Then blend over it.
+                    reg(rex, REX3_DRAWMODE1, dm1);
+                    reg(rex, REX3_ALPHAREF, 0);
+                    reg(rex, REX3_COLORALPHA, a << 11);
+                    reg(rex, REX3_COLORRED,   0xC0 << 11);
+                    reg(rex, REX3_COLORGRN,   0x90 << 11);
+                    reg(rex, REX3_COLORBLUE,  0x30 << 11);
+                    reg(rex, REX3_XYENDI,   xy(x, 0));
+                    reg(rex, REX3_XYSTARTI, xy(x, 0));
+                    reg_go(rex, REX3_DRAWMODE0, dm0);
+                }
+            };
+
+            let rex_i = make_rex3();
+            rex3init(rex_i);
+            setup(rex_i);
+            wait(rex_i);
+            let fb_interp: Vec<u32> =
+                (0..alphas.len() as i32).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
+
+            let rex_j = make_rex3_jit();
+            rex3init(rex_j);
+            setup(rex_j);
+            wait(rex_j);
+            if let Some(ref jit) = rex_j.rex_jit {
+                assert!(jit.wait_compiled(dm0, dm1, 0),
+                    "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+            }
+            clear_region(rex_j, 0, 0, alphas.len() as i32 - 1, 0);
+            rex3init(rex_j);
+            setup(rex_j);
+            wait(rex_j);
+            let fb_jit: Vec<u32> =
+                (0..alphas.len() as i32).map(|x| read_pixel(rex_j, x, 0) & 0xFFFFFF).collect();
+
+            assert_eq!(fb_interp, fb_jit,
+                "BLENDALPHA={blendalpha} JIT/interp mismatch: \
+                 interp={fb_interp:08x?} jit={fb_jit:08x?}");
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -4108,3 +4180,259 @@ mod gfifo_tests {
     }
 }
 
+
+// ============================================================================
+// Blend path: dblsrc slot packing (regression)
+//
+// At 12bpp two pixels share one 24-bit VRAM word, so a compressed 12-bit result
+// must be amplified (val | val<<12) into BOTH packed slots before the write —
+// WRMASK then selects which slot actually lands. The logic-op path always did
+// this; the blend path did not, so any WRMASK covering the high slot (0xfff000,
+// or 0xffffff for both) wrote zeros there, i.e. black. Real IRIX GL hits this
+// constantly: an alpha-blended billboard trace showed 77% of blended draws using
+// WRMASK 0xfff000/0xffffff.
+// ============================================================================
+
+/// DRAWMODE1 for 12bpp RGB, SRC logicop, blend SA+MSA, alpha compare disabled.
+/// planes=RGB, drawdepth=2 (12bpp), rgbmode(15), blend(18), sfactor=SA(4)<<19,
+/// dfactor=MSA(5)<<22.
+const DM1_RGB12_BLEND: u32 = DRAWMODE1_PLANES_RGB
+    | (2 << 3)
+    | (1 << 15)
+    | DRAWMODE1_COMPARE_DISABLE
+    | (1 << 18)
+    | (4 << 19)
+    | (5 << 22)
+    | DRAWMODE1_LOGICOP_SRC;
+
+/// Write an opaque blended pixel into the HIGH 12-bit slot and read it back.
+/// Before the fix the high slot received 0 while the low slot kept whatever was
+/// there, so the drawn pixel came out black.
+#[test]
+fn test_blend_12bpp_writes_high_slot() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB12_BLEND);
+    reg(&rex, REX3_WRMASK, 0xfff000);   // high slot only
+    reg(&rex, REX3_ALPHAREF, 0);
+    // Fully opaque white source: alpha=255 so SA*src + MSA*dst == src.
+    reg(&rex, REX3_COLORALPHA, 255 << 11);
+    reg(&rex, REX3_COLORRED,   255 << 11);
+    reg(&rex, REX3_COLORGRN,   255 << 11);
+    reg(&rex, REX3_COLORBLUE,  255 << 11);
+    reg(&rex, REX3_XYENDI,   xy(7, 9));
+    reg(&rex, REX3_XYSTARTI, xy(7, 9));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    let px = read_pixel(&rex, 7, 9);
+    assert_ne!(
+        (px >> 12) & 0xfff, 0,
+        "blend must amplify into the high 12bpp slot; got {px:#08x} (high slot black)"
+    );
+}
+
+/// Same, with WRMASK covering both packed slots: both must receive the colour.
+#[test]
+fn test_blend_12bpp_writes_both_slots() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB12_BLEND);
+    reg(&rex, REX3_WRMASK, 0xffffff);   // both slots
+    reg(&rex, REX3_ALPHAREF, 0);
+    reg(&rex, REX3_COLORALPHA, 255 << 11);
+    reg(&rex, REX3_COLORRED,   255 << 11);
+    reg(&rex, REX3_COLORGRN,   255 << 11);
+    reg(&rex, REX3_COLORBLUE,  255 << 11);
+    reg(&rex, REX3_XYENDI,   xy(8, 9));
+    reg(&rex, REX3_XYSTARTI, xy(8, 9));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    let px = read_pixel(&rex, 8, 9);
+    let lo = px & 0xfff;
+    let hi = (px >> 12) & 0xfff;
+    assert_eq!(lo, hi, "both packed slots must get the same blended pixel: {px:#08x}");
+    assert_ne!(lo, 0, "blended pixel should not be black: {px:#08x}");
+}
+
+/// The blend result must match the logic-op SRC result for a fully opaque
+/// source — same colour, same slot packing, whichever path produced it.
+#[test]
+fn test_blend_opaque_matches_logicop_src() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm1_src = DRAWMODE1_PLANES_RGB | (2 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+
+    for (x, dm1) in [(20, dm1_src), (21, DM1_RGB12_BLEND)] {
+        reg(&rex, REX3_DRAWMODE1, dm1);
+        reg(&rex, REX3_WRMASK, 0xffffff);
+        reg(&rex, REX3_ALPHAREF, 0);
+        reg(&rex, REX3_COLORALPHA, 255 << 11);
+        reg(&rex, REX3_COLORRED,   0x80 << 11);
+        reg(&rex, REX3_COLORGRN,   0x40 << 11);
+        reg(&rex, REX3_COLORBLUE,  0xC0 << 11);
+        reg(&rex, REX3_XYENDI,   xy(x, 11));
+        reg(&rex, REX3_XYSTARTI, xy(x, 11));
+        reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    }
+
+    let src_px = read_pixel(&rex, 20, 11);
+    let blend_px = read_pixel(&rex, 21, 11);
+    assert_eq!(
+        src_px, blend_px,
+        "opaque blend {blend_px:#08x} must equal logicop SRC {src_px:#08x}"
+    );
+}
+
+/// Alpha==0 with compare != (ALPHAREF=0) must discard the pixel entirely,
+/// leaving the framebuffer untouched.
+#[test]
+fn test_blend_alpha_test_discards_zero_alpha() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    // compare = 0b101 (!=) instead of the disable pattern.
+    let dm1 = (DM1_RGB12_BLEND & !DRAWMODE1_COMPARE_DISABLE) | (0b101 << 12);
+    reg(&rex, REX3_DRAWMODE1, dm1);
+    reg(&rex, REX3_WRMASK, 0xffffff);
+    reg(&rex, REX3_ALPHAREF, 0);
+    reg(&rex, REX3_COLORALPHA, 0);        // alpha 0 → 0 != 0 is false → discard
+    reg(&rex, REX3_COLORRED,   255 << 11);
+    reg(&rex, REX3_COLORGRN,   255 << 11);
+    reg(&rex, REX3_COLORBLUE,  255 << 11);
+    reg(&rex, REX3_XYENDI,   xy(12, 13));
+    reg(&rex, REX3_XYSTARTI, xy(12, 13));
+    reg_go(&rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+
+    assert_eq!(
+        read_pixel(&rex, 12, 13), 0,
+        "alpha==0 with compare '!=' and ALPHAREF=0 must discard the pixel"
+    );
+}
+
+// ============================================================================
+// BLENDALPHA (DRAWMODE1 bit 27) selects the VALUE of BF_SA
+//
+// Spec Table 11: "Selects SFACTOR BF_SA source alpha: '1' = source alpha,
+// '0' = 1.0", and §3.8 adds the load-bearing qualifier: when BLENDALPHA=0 "the
+// source multiplier ... is one instead of source alpha AND DESTINATION
+// MULTIPLIER IS DEFINED BY DFACTOR". So the substitution applies to SFACTOR
+// only — DFACTOR keeps its own definition and still evaluates against the real
+// source alpha. These tests pin that asymmetry.
+// ============================================================================
+
+/// Build a 24bpp RGB blend DRAWMODE1 with the given factors and BLENDALPHA.
+fn dm1_blend24(sfactor: u32, dfactor: u32, blendalpha: bool) -> u32 {
+    DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15) | DRAWMODE1_COMPARE_DISABLE
+        | (1 << 18) | (sfactor << 19) | (dfactor << 22)
+        | ((blendalpha as u32) << 27) | DRAWMODE1_LOGICOP_SRC
+}
+
+/// Paint a single pixel with the given mode/colour and return what landed.
+fn blend_one(rex: &Rex3, x: i32, y: i32, dm1: u32, alpha: u32, rgb: u32) -> u32 {
+    reg(rex, REX3_DRAWMODE1, dm1);
+    reg(rex, REX3_WRMASK, 0xFFFFFF);
+    reg(rex, REX3_ALPHAREF, 0);
+    reg(rex, REX3_COLORALPHA, alpha << 11);
+    reg(rex, REX3_COLORRED,   (rgb & 0xFF) << 11);
+    reg(rex, REX3_COLORGRN,   ((rgb >> 8) & 0xFF) << 11);
+    reg(rex, REX3_COLORBLUE,  ((rgb >> 16) & 0xFF) << 11);
+    reg(rex, REX3_XYENDI,   xy(x, y));
+    reg(rex, REX3_XYSTARTI, xy(x, y));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    read_pixel(rex, x, y) & 0xFFFFFF
+}
+
+/// Same pairing with BLENDALPHA=1 uses the real source alpha, so a low-alpha
+/// source over a black destination is heavily attenuated.
+#[test]
+fn test_blendalpha1_sa_msa_attenuates() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let px = blend_one(&rex, 31, 40,
+        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, true), 8, 0x808080);
+    assert!(px < 0x0A0A0A,
+        "BLENDALPHA=1 + alpha 8 should attenuate src heavily, got {px:#08x}");
+}
+
+/// BF_SA/BF_ONE with BLENDALPHA=0 is ADDITIVE (`1*src + 1*dst`), not a no-op.
+/// Treating BLENDALPHA=0 as "skip the blend" would wrongly discard dst here.
+#[test]
+fn test_blendalpha0_sa_one_is_additive() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    // Lay down a destination first, with blending off.
+    let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+    blend_one(&rex, 32, 40, dm1_src, 255, 0x202020);
+    // Now blend additively over it.
+    let px = blend_one(&rex, 32, 40,
+        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_ONE, false), 8, 0x101010);
+    assert_eq!(px, 0x303030,
+        "BLENDALPHA=0 + BF_SA/BF_ONE must add src and dst, got {px:#08x}");
+}
+
+/// BLENDALPHA=0 substitutes only the SOURCE multiplier: SFACTOR BF_SA becomes
+/// 1.0, but DFACTOR BF_MSA still evaluates 1 - real source alpha. So a low-alpha
+/// source over a lit destination keeps most of the destination, rather than
+/// replacing it (which is what substituting in both factors would do).
+#[test]
+fn test_blendalpha0_substitutes_sfactor_only() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+    // Destination 0x404040, source 0x101010 at alpha 8.
+    blend_one(&rex, 50, 50, dm1_src, 255, 0x404040);
+    let px = blend_one(&rex, 50, 50,
+        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, false), 8, 0x101010);
+    // out = 1.0*src + (1 - 8/255)*dst = 0x10 + ~0x3E = ~0x4E per channel.
+    let ch = px & 0xFF;
+    assert!((0x48..=0x52).contains(&ch),
+        "expected src + (1-alpha)*dst ≈ 0x4E per channel, got {px:#08x}");
+    assert_ne!(px, 0x101010,
+        "destination must still contribute — BLENDALPHA=0 must not zero DFACTOR");
+}
+
+/// With BLENDALPHA=1 both factors use the real alpha, giving a classic blend.
+#[test]
+fn test_blendalpha1_uses_alpha_in_both_factors() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+    blend_one(&rex, 51, 50, dm1_src, 255, 0x404040);
+    let px = blend_one(&rex, 51, 50,
+        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, true), 8, 0x101010);
+    // out = (8/255)*0x10 + (1 - 8/255)*0x40 ≈ 0x3E — dst dominates.
+    let ch = px & 0xFF;
+    assert!((0x38..=0x42).contains(&ch),
+        "expected classic alpha blend ≈ 0x3E per channel, got {px:#08x}");
+}
+
+/// AFUNCTION compares the REAL source alpha (from DDA or host per ALPHAHOST) —
+/// spec §3.3 — and is unaffected by BLENDALPHA, which only substitutes the blend's
+/// source multiplier. With BLENDALPHA=0 the blender sees BF_SA=1.0, but the alpha
+/// test must still see the true alpha: alpha 0 vs ALPHAREF 0 under COMPARE='!='
+/// must inhibit the write regardless of BLENDALPHA.
+#[test]
+fn test_afunction_uses_real_alpha_not_blendalpha() {
+    let rex = make_rex3();
+    rex3init(&rex);
+    let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+        | DRAWMODE1_COMPARE_DISABLE | DRAWMODE1_LOGICOP_SRC;
+
+    for (i, blendalpha) in [false, true].iter().enumerate() {
+        let x = 60 + i as i32;
+        // Lay down a known destination.
+        blend_one(&rex, x, 55, dm1_src, 255, 0x123456);
+        // COMPARE = 0b101 ("!="), ALPHAREF = 0, source alpha = 0 -> must be killed.
+        let dm1 = (dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, *blendalpha)
+            & !DRAWMODE1_COMPARE_DISABLE) | (0b101 << 12);
+        let px = blend_one(&rex, x, 55, dm1, 0, 0xFFFFFF);
+        assert_eq!(
+            px, 0x123456,
+            "alpha==0 must be discarded by AFUNCTION with BLENDALPHA={blendalpha}, \
+             destination should be untouched; got {px:#08x}"
+        );
+    }
+}

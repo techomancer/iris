@@ -183,8 +183,11 @@ pub(crate) fn decode_dm1(v: u32) -> String {
     let hdepth = match dm.hostdepth()  { 0=>"12bpp", 1=>"8bpp", 2=>"4bpp", 3=>"32bpp", _=>"?" };
     let logicop = match dm.logicop()   { 0=>"ZERO",1=>"AND",2=>"ANDR",3=>"SRC",4=>"ANDI",5=>"DST",
         6=>"XOR",7=>"OR",8=>"NOR",9=>"XNOR",10=>"NDST",11=>"ORR",12=>"NSRC",13=>"ORI",14=>"NAND",15=>"ONE", _=>"?" };
-    let sfactor = ["ZERO","ONE","DCOL","1-DCOL","DALPHA","1-DALPHA","SALPHA","1-SALPHA"];
-    let dfactor = sfactor;
+    // rex3 spec Tables 13/14: SFACTOR 010/011 select the *destination* colour while
+    // DFACTOR 010/011 select the *source* colour; 100/101 are source alpha in both.
+    // 110/111 are not defined by the hardware.
+    let sfactor = ["ZERO","ONE","DC","MDC","SA","MSA","?6","?7"];
+    let dfactor = ["ZERO","ONE","SC","MSC","SA","MSA","?6","?7"];
     let sf = sfactor.get(dm.sfactor() as usize).copied().unwrap_or("?");
     let df = dfactor.get(dm.dfactor() as usize).copied().unwrap_or("?");
     let mut flags = String::new();
@@ -363,6 +366,14 @@ pub const DRAWMODE1_INTERP_SETUP_MASK: u32 =
     0x7 | (0x3<<3) | (1<<5) | (1<<7) | (0x3<<8) | (1<<10) | (0x7<<12) |
     (1<<15) | (1<<16) | (1<<17) | (1<<18) |
     (0x7<<19) | (0x7<<22) | (1<<25) | (1<<27) | (0xF<<28);
+
+/// SFACTOR/DFACTOR selector values (spec Tables 13/14). BF_DC/BF_MDC name the
+/// destination colour when used as SFACTOR; the same encodings name the source
+/// colour as DFACTOR (BF_SC/BF_MSC). BF_SA/BF_MSA mean source alpha in both.
+pub const DRAWMODE1_BF_ZERO: u32 = 0;
+pub const DRAWMODE1_BF_ONE:  u32 = 1;
+pub const DRAWMODE1_BF_SA:   u32 = 4;
+pub const DRAWMODE1_BF_MSA:  u32 = 5;
 
 pub const DRAWMODE1_PLANES_NONE: u32 = 0;
 pub const DRAWMODE1_PLANES_RGB: u32 = 1;
@@ -1864,9 +1875,9 @@ impl Rex3 {
     }
 
     fn draw_span(&self, ctx: &mut Rex3Context) {
-        if crate::rex3_simd::try_src_span_rgb(self, ctx) {
-            return;
-        }
+        //if crate::rex3_simd::try_src_span_rgb(self, ctx) {
+        //    return;
+        //}
         if  ctx.drawmode0.lronly() && (ctx.bresoctinc1.octant() & OCTANT_XDEC) != 0{
             return;
         }
@@ -2756,17 +2767,26 @@ impl Rex3 {
         let s_factor_sel = ctx.drawmode1.sfactor();
         let d_factor_sel = ctx.drawmode1.dfactor();
 
-        let sa = (src >> 24) & 0xFF;
-        
+        // BLENDALPHA (DRAWMODE1 bit 27) substitutes the SOURCE multiplier only.
+        // Spec §3.8: "When source multiplier is set to source alpha (SFACTOR=4) ...
+        // When BLENDALPHA is set to 0, the source multiplier for blending alpha is
+        // one instead of source alpha AND DESTINATION MULTIPLIER IS DEFINED BY
+        // DFACTOR." The trailing clause is load-bearing: DFACTOR keeps its own
+        // definition, so a DFACTOR of BF_MSA still evaluates 1 - source alpha
+        // against the real alpha. Substituting in both factors would zero BF_MSA
+        // and discard the destination entirely, which the spec does not say.
+        let sa_real = (src >> 24) & 0xFF;
+        let sa_src = if ctx.drawmode1.blendalpha() { sa_real } else { 255 };
+
         let get_factor = |sel: u32, c: u32, a: u32| -> u32 {
             match sel {
-                0 => 0,             // ZERO
-                1 => 255,           // ONE
-                2 => c,             // DC/SC
-                3 => 255 - c,       // MDC/MSC
-                4 => a,             // SA
-                5 => 255 - a,       // MSA
-                _ => 0,
+                0 => 0,             // BF_ZERO
+                1 => 255,           // BF_ONE
+                2 => c,             // BF_DC (sfactor) / BF_SC (dfactor)
+                3 => 255 - c,       // BF_MDC (sfactor) / BF_MSC (dfactor)
+                4 => a,             // BF_SA
+                5 => 255 - a,       // BF_MSA
+                _ => 0,             // 110/111 undefined by the hardware
             }
         };
 
@@ -2776,8 +2796,8 @@ impl Rex3 {
             let s_c = (src >> shift) & 0xFF;
             let d_c = (dst >> shift) & 0xFF;
             
-            let sf = get_factor(s_factor_sel, d_c, sa);
-            let df = get_factor(d_factor_sel, s_c, sa);
+            let sf = get_factor(s_factor_sel, d_c, sa_src);
+            let df = get_factor(d_factor_sel, s_c, sa_real);
             
             let val = (s_c * sf + d_c * df) / 255;
             let val_clamped = if val > 255 { 255 } else { val };
@@ -2909,9 +2929,15 @@ impl Rex3 {
                     expand_fn(rd_fn(self, addr))
                 };
                 let blended = self.blend(ctx, raw_src, dst_raw);
-                // Compress blended 24-bit result back to plane-depth before write.
+                // Compress blended 24-bit result back to plane-depth, then amplify for
+                // dblsrc packing exactly as the logic-op path below does: at 12bpp two
+                // pixels share a 24-bit word, so compress leaves the value in bits 11:0
+                // and whichever slot WRMASK selects must be fed by amplify. Without it
+                // every WRMASK that covers the high slot (0xfff000, or 0xffffff for both)
+                // writes zeros there — i.e. black.
                 let bayer_fn = unsafe { *self.px_bayer.get() };
-                compress_fn(bayer_fn(blended, x, y))
+                let amp_fn = unsafe { *self.px_amp.get() };
+                amp_fn(compress_fn(bayer_fn(blended, x, y)))
             } else {
                 // Logic op path: compress src to plane-depth, amplify for dblsrc, then logic op.
                 // dst also needs amplify: rd_fn shifts the value down (e.g. bits 15:8 → 7:0 for
@@ -3718,11 +3744,11 @@ impl Rex3 {
                 DRAWMODE0_OPCODE_DRAW    => {
                     let no_cid      = cidmatch_bits == 0xF;
                     let no_host     = !ctx.drawmode0.colorhost() && !ctx.drawmode0.alphahost();
+                    let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
                     let no_blend    = !ctx.drawmode1.blend();
                     let en_z        = ctx.drawmode0.enzpattern();
                     let en_ls       = ctx.drawmode0.enlspattern();
                     let no_zpopaque = !ctx.drawmode0.zpopaque();
-                    let is_src_op   = ctx.drawmode1.logicop() == DRAWMODE1_LOGICOP_SRC >> 28;
                     // Afunction (alpha-vs-ALPHAREF compare) applies regardless of rgbmode;
                     // only inhibits writes when COMPARE != 0x7 (always-pass/disabled).
                     let no_afunction = ctx.drawmode1.compare() == 0x7;
