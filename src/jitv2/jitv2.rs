@@ -311,6 +311,23 @@ pub fn clear_jit_page_probe() {
     JIT_PAGE_PROBE_CTX.store(std::ptr::null_mut(), Ordering::Release);
 }
 
+/// Retire the probe only if `ctx` is still the installed one.
+///
+/// For a dying owner (`Drop for MipsExecutor`) that must not stomp a probe some
+/// *other*, still-live executor installed after it — the common shape in a test
+/// binary, where executors are created and dropped continuously while the probe
+/// global is process-wide. An unconditional clear there would silently disable
+/// the live executor's dirty-page check instead of just retiring the dead one's.
+#[cfg(not(feature = "tcache"))]
+pub fn clear_jit_page_probe_if(ctx: *const ()) {
+    let _ = JIT_PAGE_PROBE_CTX.compare_exchange(
+        ctx as *mut (),
+        std::ptr::null_mut(),
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
+}
+
 /// Does the CPU hold dirty cache lines for the 4KB physical page at
 /// `page_base`?
 ///

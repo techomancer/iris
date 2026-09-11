@@ -1784,7 +1784,17 @@ impl MipsCore {
     /// When reg 12 (Status) is written, invokes `status_changed_cb` with (old, new).
     pub fn write_cp0(&mut self, reg: u32, value: u64) {
         match reg {
-            0 => self.cp0_index = value as u32,
+            // Index: slot field [5:0] plus the probe-failure bit [31]. Bits
+            // [30:6] are reserved and read as zero.
+            //
+            // The P bit is kept deliberately, unlike MAME's r4000 core (which
+            // masks it away with `& 0x3f` here): software reads Index back with
+            // MFC0 to test whether a TLBP missed, and a context switch that
+            // saves and restores Index must round-trip that bit. Bounding the
+            // slot field is what prevents the out-of-range write; dropping P is
+            // not needed for that and would lose architectural state.
+            0 => self.cp0_index = (value as u32)
+                    & (crate::mips_exec::CP0_INDEX_P | crate::mips_exec::CP0_INDEX_SLOT_MASK),
             1 => { /* Random is read-only */ }
             2 => self.cp0_entrylo0 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
             3 => self.cp0_entrylo1 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
@@ -2273,6 +2283,18 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
     };
 
     core.pc = vector_base + offset;
+
+    // Jumping to a handler vector ends any delay slot in progress: the vector's
+    // first instruction is never in one. `bd` was already consumed above (into
+    // Cause.BD / EPC), so clearing here cannot lose information.
+    //
+    // Hung on the delivery function rather than on its callers so it cannot be
+    // forgotten. The three executor wrappers used to each clear this themselves,
+    // which left `bin/jitv2_verify.rs`'s bare-`MipsCore` call — no wrapper — able
+    // to enter a handler with `in_delay_slot` still set. Same
+    // "every caller must remember" shape as the CP0-Status resync bug; see
+    // rules/testing/cp0-status-writes-must-resync-privilege-state.md.
+    core.in_delay_slot = false;
 }
 
 /// CPU Privilege Modes

@@ -1323,6 +1323,14 @@ impl Codegen {
         // called.
         let dispatch_miss_block = builder.create_block();
         let mut switch = cranelift_frontend::Switch::new();
+        // `developer` trace stubs are *created* here but filled only after
+        // `switch.emit` below terminates `entry_block`. Cranelift forbids
+        // switching away from a block that has no terminator yet, and
+        // `entry_block` is exactly that until the switch is emitted — filling a
+        // stub inline here panics with "you have to fill your block before
+        // switching" (frontend.rs), which is why the emission is deferred.
+        #[cfg(feature = "developer")]
+        let mut pending_trace_stubs: Vec<(ir::Block, ir::Block, u16, u32)> = Vec::new();
         for &w in &entry_words {
             let real_target = entry_body_blocks.get(&w).copied().unwrap_or_else(|| entry_word_block_for(w));
             // `developer`: trace this external arrival here, in the compiled
@@ -1358,15 +1366,7 @@ impl Codegen {
             #[cfg(feature = "developer")]
             let target = {
                 let stub = builder.create_block();
-                let saved = builder.current_block();
-                builder.switch_to_block(stub);
-                let raw = instrs[w as usize].raw;
-                let mut unused_cycles_pending = 0u32;
-                let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
-                emit_dev_trace_bp(&mut trace_ctx, origin);
-                builder.ins().jump(real_target, &[]);
-                builder.seal_block(stub);
-                if let Some(saved) = saved { builder.switch_to_block(saved); }
+                pending_trace_stubs.push((stub, real_target, w, origin));
                 stub
             };
             #[cfg(not(feature = "developer"))]
@@ -1375,6 +1375,21 @@ impl Codegen {
         }
         switch.emit(&mut builder, live_entry_offset, dispatch_miss_block);
         builder.seal_block(entry_block); // entry_block's only predecessor is the caller — always sealable immediately
+
+        // Now that `entry_block` is terminated and sealed, fill the per-entry
+        // trace stubs created above: call `emit_dev_trace_bp`, then fall through
+        // to the entry's real target. Each stub's only predecessor is the switch
+        // itself, so it is sealable as soon as it is filled.
+        #[cfg(feature = "developer")]
+        for (stub, real_target, w, origin) in pending_trace_stubs {
+            builder.switch_to_block(stub);
+            let raw = instrs[w as usize].raw;
+            let mut unused_cycles_pending = 0u32;
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
+            emit_dev_trace_bp(&mut trace_ctx, origin);
+            builder.ins().jump(real_target, &[]);
+            builder.seal_block(stub);
+        }
 
         builder.switch_to_block(dispatch_miss_block);
         builder.seal_block(dispatch_miss_block);
@@ -5487,6 +5502,37 @@ fn emit_absolute_pc_exit(ctx: &mut EmitCtx, target_addr: Value) {
     let mem = MemFlagsData::trusted();
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, pc_off);
+
+    // An absolute-PC exit lands on a transfer's real destination, which is by
+    // definition a plain instruction and never a delay slot, so the flag must be
+    // clear on the way out. Unconditional — this function owns the clear rather
+    // than trusting every call site to have done it.
+    //
+    // The flag is emphatically *not* already zero here in a release build. It
+    // arrives set from outside the region: `emit_foreign_page_slot_exit` (and
+    // the interpreter's `branch_delay`) stores `in_delay_slot = 1` and returns,
+    // so the next dispatch enters the following page at word 0 *while still in a
+    // delay slot* — that is the foreign-page-slot protocol, not a debug path,
+    // and it has no cfg gate. Any region entered at such a word that then leaves
+    // via an absolute-PC exit would carry the stale flag out with it, and the
+    // interpreter's next `step()` would treat a plain instruction as
+    // mid-delay-slot. (Compiled code's other non-zero stores — the
+    // `emit_slot_semantics` bracket under `cfg(any(jitv2_lockstep, developer))`,
+    // and the breakpoint path's `ctx.bd` — are separate from this.)
+    //
+    // Cost, measured with `iris-bench`: ~2% (227.5/227.7 MIPS without,
+    // 223.0/223.0 with, three runs each). It lands on all eight call sites,
+    // which are the hot branch/jump transfer paths. Paid deliberately: the
+    // alternative is a correctness hazard on a real, non-debug path.
+    //
+    // See rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md — the
+    // upstream guarantee this used to rely on was removed on 2026-09-02 and
+    // immediately broke `emit_foreign_page_annulled_not_taken_exit`, which had
+    // been silently inheriting `in_delay_slot = 1`.
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+    let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
+    ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
+
     emit_set_jit_trigger(ctx);
     let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     ctx.builder.ins().return_(&[status]);

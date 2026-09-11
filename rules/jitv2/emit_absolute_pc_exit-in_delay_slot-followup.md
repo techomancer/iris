@@ -49,3 +49,38 @@ jitv2_lockstep region-boundary divergence fix (see
 `ls_before`/`ls_delay_target_before` restore-on-divergence work in
 mips_exec.rs `lockstep_compare`). Not fixed in that session — scoped out to
 avoid touching unrelated codegen while the lockstep fix was in flight.
+
+---
+
+## RESOLVED (2026-09-10)
+
+The clear now lives inside `emit_absolute_pc_exit`, unconditionally, as this note
+recommended.
+
+**Why unconditional, and a wrong turn worth recording.** The first attempt gated the store
+on `cfg(any(jitv2_lockstep, developer))`, reasoning that those are the only features under
+which *compiled code* stores a non-zero `in_delay_slot` (the `emit_slot_semantics` bracket),
+so a release build would find the flag already zero and the store would be pure cost.
+
+That reasoning was wrong, and the gate would have left the original bug in release builds.
+The flag does not only arrive from within the region — it arrives **set from outside it**:
+
+- `emit_foreign_page_slot_exit` stores `in_delay_slot = 1`, sets `pc` to word 0 of the next
+  page, and returns. The interpreter's `branch_delay` does the same.
+- The next dispatch therefore *enters* a region at a word that is a delay slot, with the
+  flag live. This is the foreign-page-slot protocol (0xFFC branch, slot on the next page),
+  not a debug path, and it has no cfg gate at all.
+- If that region then leaves via `emit_absolute_pc_exit`, the stale flag goes out with it
+  and the interpreter's next `step()` treats a plain instruction as mid-delay-slot.
+
+So the hazard is live in exactly the configuration the gate would have skipped. **Any entry
+word that is a delay slot can have `in_delay_slot == true` regardless of features.**
+
+**Cost.** ~2%, measured with `iris-bench run`: 227.5 / 227.7 MIPS without the store versus
+223.0 / 223.0 with (three runs each; the clusters are tight, so this is real, not noise).
+It lands on all eight call sites, which are the hot branch/jump transfer paths. Paid
+deliberately — a correctness hazard on a non-debug path is not worth 2%.
+
+If that 2% ever needs reclaiming, the route is *not* a cfg gate: it is tracking at compile
+time whether a given region can be entered at a delay-slot word (the analyzer already knows
+which words are slots) and emitting the store only in regions where it can.

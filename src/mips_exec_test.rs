@@ -935,7 +935,7 @@ mod tests {
     ///
     /// nutlb tags carry no permission bits, so the *only* thing standing
     /// between user mode and a kernel translation is the flush that
-    /// `on_cp0_status_changed` issues via `nanotlb_invalidate()`. Verified to
+    /// `resync_privilege_state` issues via `nanotlb_invalidate()`. Verified to
     /// fail — returning the kernel page's data instead of the expected
     /// address error — with that flush removed, so this pins real behaviour
     /// rather than being a tautology.
@@ -958,7 +958,7 @@ mod tests {
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
         // Without this, `MTC0 Status` updates the register but never fires
-        // `on_cp0_status_changed`, so `translate_fn` keeps its kernel
+        // `resync_privilege_state`, so `translate_fn` keeps its kernel
         // specialization and the privilege check below is not the one the
         // running emulator performs. The test helper does not install it.
         exec.install_status_cb();
@@ -978,7 +978,7 @@ mod tests {
         // Drop to user mode through a real `MTC0 Status`, which is the
         // transition both builds hang their correctness on — and going
         // through the instruction rather than poking the field means the
-        // side-effect handler (`on_cp0_status_changed`) is genuinely
+        // side-effect handler (`resync_privilege_state`) is genuinely
         // exercised, which is the thing under test.
         let user_status = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL & !STATUS_ERL)
             | ((KSU_USER as u32) << STATUS_KSU_SHIFT);
@@ -998,7 +998,7 @@ mod tests {
                                         crate::mips_tlb::AccessType::Read);
         assert!(probe.is_exception(),
                 "setup: after MTC0 Status the user-mode translator must refuse \
-                 an uncached KSEG0 VA; it did not, so on_cp0_status_changed \
+                 an uncached KSEG0 VA; it did not, so resync_privilege_state \
                  never fired and this test would pass vacuously");
 
         // User touching KSEG0 is an address error, never a hit. `read_data`
@@ -1205,8 +1205,11 @@ mod tests {
         let mtc0_instr = (OP_COP0 << 26) | (0x04 << 21) | (1 << 16) | (0 << 11);
         assert_eq!(exec.exec(mtc0_instr), EXEC_COMPLETE);
 
-        // Verify CP0.Index was set
-        assert_eq!(exec.core.cp0_index, 0x12345678);
+        // Verify CP0.Index was set. Index is not a plain 32-bit field: only the
+        // slot bits [5:0] and the TLBP-failure bit [31] are implemented, so the
+        // reserved bits of 0x12345678 read back as zero (0x78 & 0x3F == 0x38).
+        assert_eq!(exec.core.cp0_index, 0x12345678 & (crate::mips_exec::CP0_INDEX_P | crate::mips_exec::CP0_INDEX_SLOT_MASK));
+        assert_eq!(exec.core.cp0_index, 0x38);
 
         // Test MFC0 - Move from CP0
         // Clear r2
@@ -1217,8 +1220,9 @@ mod tests {
         let mfc0_instr = (OP_COP0 << 26) | (0x00 << 21) | (2 << 16) | (0 << 11);
         assert_eq!(exec.exec(mfc0_instr), EXEC_COMPLETE);
 
-        // Verify r2 was loaded with Index value (sign-extended to 64 bits)
-        assert_eq!(exec.core.read_gpr(2), 0x12345678);
+        // Verify r2 was loaded with the Index value as actually stored — the
+        // masked one, not the value originally written.
+        assert_eq!(exec.core.read_gpr(2), 0x38);
     }
 
     #[test]
@@ -1239,6 +1243,10 @@ mod tests {
         // Verify PC was restored from EPC and EXL was cleared
         assert_eq!(exec.core.pc, 0xBFC00100);
         assert_eq!(exec.core.cp0_status & 0x02, 0);  // EXL should be cleared
+        // KSU is 0 (kernel) here, so clearing EXL leaves Kernel — asserted so this
+        // test stops being silently compatible with a stale privilege state.
+        assert!(matches!(exec.core.get_privilege_mode(),
+                         crate::mips_core::PrivilegeMode::Kernel));
 
         // Test ERET from error level (ERL=1)
         exec.core.cp0_errorepc = 0xBFC00300;
@@ -1250,6 +1258,408 @@ mod tests {
         // Verify PC was restored from ErrorEPC and ERL was cleared
         assert_eq!(exec.core.pc, 0xBFC00300);
         assert_eq!(exec.core.cp0_status & 0x04, 0);  // ERL should be cleared
+        assert!(matches!(exec.core.get_privilege_mode(),
+                         crate::mips_core::PrivilegeMode::Kernel));
+    }
+
+    /// ERET into user mode must re-derive `translate_fn`.
+    ///
+    /// ERET clears EXL/ERL by direct field write, so `write_cp0`'s Status callback
+    /// never fires — `exec_eret` must resync itself or the guest runs user code
+    /// through the kernel translator, with KSEG0/KSEG1/KSEG3 wide open.
+    ///
+    /// Flushing the nanotlb/nutlb (which ERET already did before this fix) cannot
+    /// substitute: the flush *guarantees* the next access misses and therefore calls
+    /// `translate_fn`, so a stale pointer is certain to be consulted, not bypassed.
+    ///
+    /// Note this transition is invisible in a real IRIX boot: kernels write Status
+    /// with the target KSU while EXL is still 1, and `get_privilege_mode` reports
+    /// Kernel whenever EXL|ERL is set, so the callback installs the *kernel*
+    /// translator and ERET is what should flip it to user. That is exactly why the
+    /// bug survived — see the ERET arm of `resync_privilege_state`'s callers.
+    #[test]
+    fn test_eret_to_user_mode_refuses_kseg0() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_eret_to_user_mode_refuses_kseg0_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_eret_to_user_mode_refuses_kseg0_inner() {
+        use crate::mips_tlb::{MipsTlb, AccessType};
+        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+                               STATUS_KSU_SHIFT, KSU_USER, PrivilegeMode};
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+
+        // Kernel, mid-exception: KSU=USER but EXL=1 — the real MIPS idiom. Privilege
+        // is Kernel because EXL wins, so this is the kernel translator.
+        let status = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_ERL)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT) | STATUS_EXL;
+        exec.set_cp0_status(status);
+        assert!(matches!(exec.core.get_privilege_mode(), PrivilegeMode::Kernel),
+                "setup: EXL=1 must report Kernel regardless of KSU");
+
+        // Guard against a vacuous pass: KSEG0 must be *accepted* before the ERET.
+        let kseg0: u64 = 0xFFFF_FFFF_8000_9000;
+        let before = (exec.translate_fn)(&mut exec, kseg0, AccessType::Read);
+        assert!(!before.is_exception(),
+                "setup: the kernel translator must accept KSEG0 before the ERET");
+
+        // ERET clears EXL, dropping to the KSU already programmed: user mode.
+        exec.core.cp0_epc = 0x0000_0000_0040_0000;
+        let eret_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x18;
+        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, 0x0000_0000_0040_0000);
+        assert_eq!(exec.core.cp0_status & STATUS_EXL, 0, "ERET must clear EXL");
+        assert!(matches!(exec.core.get_privilege_mode(), PrivilegeMode::User),
+                "after ERET with KSU=USER and EXL clear, privilege must be User");
+
+        // The actual regression: a fresh, never-cached kernel-only VA must now fault.
+        let probe = (exec.translate_fn)(&mut exec, kseg0, AccessType::Read);
+        assert!(probe.is_exception(),
+                "after ERET into user mode the user translator must refuse KSEG0; \
+                 it did not, so exec_eret left the kernel translate_fn installed");
+    }
+
+    /// Exception delivery from user mode must re-derive `translate_fn` too.
+    ///
+    /// This is the mirror of `test_eret_to_user_mode_refuses_kseg0`, and it is the
+    /// half that disarms a double-fault hang: `deliver_exception_at` sets EXL and
+    /// points PC at the handler vector (KSEG0/KSEG1) by direct field write. If the
+    /// user translator were still installed, the fetch of the handler's own first
+    /// instruction would take a spurious ADEL — and since EXL is already set,
+    /// `was_exl` suppresses the EPC update, so the guest never recovers.
+    #[test]
+    fn test_exception_from_user_accepts_kseg0() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_exception_from_user_accepts_kseg0_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_exception_from_user_accepts_kseg0_inner() {
+        use crate::mips_tlb::{MipsTlb, AccessType};
+        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+                               STATUS_KSU_SHIFT, KSU_USER, PrivilegeMode};
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+
+        // Genuine user mode: KSU=USER with both EXL and ERL clear.
+        let user_status = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL & !STATUS_ERL)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT);
+        exec.set_cp0_status(user_status);
+        assert!(matches!(exec.core.get_privilege_mode(), PrivilegeMode::User),
+                "setup: should be in user mode");
+
+        let kseg0: u64 = 0xFFFF_FFFF_8000_9000;
+        let before = (exec.translate_fn)(&mut exec, kseg0, AccessType::Read);
+        assert!(before.is_exception(),
+                "setup: the user translator must refuse KSEG0 before the exception");
+
+        // SYSCALL from user mode. Routes to handle_exception_syscall under jitv2 and
+        // handle_exception otherwise; both must resync.
+        exec.core.pc = 0x0000_0000_0040_0000;
+        let syscall_instr: u32 = 0x0000_000C;
+        exec.exec(syscall_instr);
+
+        assert_ne!(exec.core.cp0_status & STATUS_EXL, 0,
+                   "exception delivery must set EXL");
+        assert!(matches!(exec.core.get_privilege_mode(), PrivilegeMode::Kernel),
+                "EXL forces Kernel privilege");
+
+        // The handler vector lives in KSEG0/KSEG1 — the translator must now accept it,
+        // or the guest cannot fetch its own exception handler.
+        let probe = (exec.translate_fn)(&mut exec, kseg0, AccessType::Read);
+        assert!(!probe.is_exception(),
+                "after taking an exception from user mode the kernel translator must \
+                 accept KSEG0; it did not, so the handler vector fetch would fault");
+
+        // And concretely: the PC the exception actually set must be translatable.
+        let vector = exec.core.pc;
+        let vprobe = (exec.translate_fn)(&mut exec, vector, AccessType::Fetch);
+        assert!(!vprobe.is_exception(),
+                "the exception vector {vector:#x} itself must be fetchable");
+    }
+
+    /// `Index` selects a TLB slot from bits [5:0] — by masking, never modulo.
+    ///
+    /// `%` folds out-of-range values back onto *valid* slots, which is silent
+    /// corruption rather than a no-op:
+    ///   - a failed `TLBP` sets bit 31, and `0x8000_0000 % 48 == 32`, so a
+    ///     TLBWI after a missed probe overwrote a live entry 32;
+    ///   - `49 % 48 == 1` and `63 % 48 == 15`, mapping out-of-range indices
+    ///     onto the low, typically *wired*, entries.
+    ///
+    /// Matches MAME's r4000 and mips3 cores, which both do `Index & 0x3f`
+    /// followed by a bounds check. Note the post-fix failed-probe case writes
+    /// entry 0, which is the architectural behaviour, not a safety net.
+    #[test]
+    fn test_tlb_index_masks_rather_than_wraps() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_tlb_index_masks_rather_than_wraps_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_tlb_index_masks_rather_than_wraps_inner() {
+        use crate::mips_tlb::{MipsTlb, Tlb};
+
+        let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
+        let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+
+        // Park a recognisable entry in slot 32 — the slot `0x8000_0000 % 48`
+        // used to land on. Written through the real CP0 path so the entry's
+        // derived fields are built exactly as hardware would.
+        exec.core.cp0_index = 32;
+        exec.core.cp0_entryhi = (0x2AA << 13) | 7;
+        exec.core.cp0_entrylo0 = (0x77 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        exec.core.cp0_entrylo1 = (0x78 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        exec.core.cp0_pagemask = 0;
+        assert_eq!(exec.exec(tlbwi_instr), EXEC_COMPLETE);
+        let before = exec.tlb.read(32);
+        assert_eq!(before.entry_hi, (0x2AA << 13) | 7, "setup: entry 32 must be written");
+
+        // A failed TLBP leaves Index = 0x8000_0000. Set it the way hardware
+        // does — directly, not through MTC0, which masks.
+        exec.core.cp0_index = crate::mips_exec::CP0_INDEX_P;
+        exec.core.cp0_entryhi = (0x100 << 13) | 5;
+        exec.core.cp0_entrylo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        exec.core.cp0_entrylo1 = (0x51 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        exec.core.cp0_pagemask = 0;
+        exec.exec(tlbwi_instr);
+
+        let after = exec.tlb.read(32);
+        assert_eq!(after.entry_hi, before.entry_hi,
+                   "TLBWI after a failed TLBP must not touch entry 32 — \
+                    `Index % 48` mapped 0x8000_0000 onto slot 32 and clobbered it");
+        assert_eq!(after.entry_lo, before.entry_lo, "entry 32 EntryLo must be untouched");
+
+        // MTC0 must bound the slot field: 49 must not become entry 1.
+        let e1_before = exec.tlb.read(1);
+        exec.core.write_gpr(8, 49);
+        let mtc0_index = (OP_COP0 << 26) | (0x04 << 21) | (8 << 16) | (0 << 11);
+        assert_eq!(exec.exec(mtc0_index), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_index & crate::mips_exec::CP0_INDEX_SLOT_MASK, 49,
+                   "49 fits in the 6-bit slot field and must survive the MTC0 mask");
+        exec.exec(tlbwi_instr);
+        let e1_after = exec.tlb.read(1);
+        assert_eq!(e1_after.entry_hi, e1_before.entry_hi,
+                   "Index=49 is out of range for a 48-entry TLB and must be a no-op, \
+                    not `49 % 48` == wired entry 1");
+
+        // Reserved bits [30:6] must not survive an MTC0.
+        exec.core.write_gpr(8, 0x7FFF_FFC0u64);
+        assert_eq!(exec.exec(mtc0_index), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_index, 0,
+                   "reserved Index bits [30:6] must read back as zero");
+
+        // The probe-failure bit must round-trip through MTC0, so software can
+        // save and restore Index across a context switch.
+        exec.core.write_gpr(8, (crate::mips_exec::CP0_INDEX_P | 5) as u64);
+        assert_eq!(exec.exec(mtc0_index), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_index, crate::mips_exec::CP0_INDEX_P | 5,
+                   "the TLBP failure bit must survive MTC0 — MFC0 readback is how \
+                    software tests for a probe miss");
+    }
+
+    /// A 32-bit TLB miss must leave `EntryHi.Region` matching the address's
+    /// segment: `11` for KSSEG/KSEG3, `00` for KUSEG.
+    ///
+    /// The mask used to be `EH_VPN2_32` alone, which wiped bits [63:32] and left
+    /// Region = `00` (User) even for a kernel-segment miss. A refill handler that
+    /// then issued TLBWI would commit the entry under the wrong region.
+    /// (cpucritique.md TLB-4.)
+    ///
+    /// The fix needs no branch on bit 31: in 32-bit mode every address reaching
+    /// the TLB is sign-extended, so bits [63:32] are all-1 for KSSEG/KSEG3 and
+    /// all-0 for KUSEG — keeping EH_REGION in the mask lets the region fall out
+    /// of the sign extension. This test pins both directions so a future
+    /// "simplification" back to the 32-bit-only mask is caught.
+    #[test]
+    fn test_tlb_miss_preserves_entryhi_region_32bit() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_tlb_miss_preserves_entryhi_region_32bit_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_tlb_miss_preserves_entryhi_region_32bit_inner() {
+        use crate::mips_tlb::{MipsTlb, AccessType};
+        const EH_REGION: u64 = 0xC000_0000_0000_0000;
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+        // Clear ERL so KUSEG actually goes through the TLB rather than the
+        // unmapped identity window.
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.resync_privilege_state();
+        exec.core.cp0_entryhi = 0x2A; // a distinctive ASID to prove it survives
+
+        // KSEG3 miss: Region must read back as 0b11.
+        let kseg3: u64 = 0xFFFF_FFFF_E000_4000;
+        let r = (exec.translate_fn)(&mut exec, kseg3, AccessType::Read);
+        assert!(r.is_exception(), "setup: an empty TLB must miss on KSEG3");
+        assert_eq!((exec.core.cp0_entryhi & EH_REGION) >> 62, 0b11,
+                   "EntryHi.Region must be 11 for a 32-bit KSEG3 miss, not 00 — \
+                    a refill handler's TLBWI would otherwise commit the wrong region");
+        assert_eq!(exec.core.cp0_entryhi & 0xFF, 0x2A, "ASID must be preserved");
+        assert_eq!(exec.core.cp0_badvaddr, kseg3);
+
+        // KSSEG likewise.
+        let ksseg: u64 = 0xFFFF_FFFF_C000_8000;
+        let r = (exec.translate_fn)(&mut exec, ksseg, AccessType::Read);
+        assert!(r.is_exception(), "setup: an empty TLB must miss on KSSEG");
+        assert_eq!((exec.core.cp0_entryhi & EH_REGION) >> 62, 0b11,
+                   "EntryHi.Region must be 11 for a 32-bit KSSEG miss");
+
+        // KUSEG must stay 00 — the sign extension gives this for free, but pin it
+        // so the mask change cannot silently promote user misses to kernel region.
+        let kuseg: u64 = 0x0000_0000_0040_0000;
+        let r = (exec.translate_fn)(&mut exec, kuseg, AccessType::Read);
+        assert!(r.is_exception(), "setup: an empty TLB must miss on KUSEG");
+        assert_eq!((exec.core.cp0_entryhi & EH_REGION) >> 62, 0b00,
+                   "EntryHi.Region must remain 00 for a 32-bit KUSEG miss");
+    }
+
+    /// `deliver_exception_at` must clear `in_delay_slot` itself.
+    ///
+    /// The vector's first instruction is never in a delay slot, and `bd` has
+    /// already been consumed into Cause.BD/EPC by the time we get there. This
+    /// used to be done by each of the three executor wrappers instead, which left
+    /// the bare-`MipsCore` caller in `bin/jitv2_verify.rs` — which has no wrapper
+    /// — able to enter a handler with the flag still set. Asserted directly on
+    /// `MipsCore` because that is precisely the path that had no coverage.
+    #[test]
+    fn test_deliver_exception_clears_in_delay_slot() {
+        use crate::mips_core::{MipsCore, deliver_exception_at};
+
+        let mut core = MipsCore::new();
+        core.in_delay_slot = true;
+        core.pc = 0xFFFF_FFFF_8000_1004;
+
+        // bd = true: the BD information must survive into Cause/EPC even though
+        // the live flag is cleared.
+        let fault_pc = core.pc;
+        deliver_exception_at(&mut core, crate::mips_exec::exec_exception(
+            crate::mips_exec::EXC_SYS), fault_pc, true);
+
+        assert!(!core.in_delay_slot,
+                "deliver_exception_at must clear in_delay_slot — the handler's \
+                 first instruction is never in a delay slot");
+        assert_ne!(core.cp0_cause & crate::mips_core::CAUSE_BD, 0,
+                   "Cause.BD must still record that the faulting instruction was \
+                    in a delay slot");
+        assert_eq!(core.cp0_epc, 0xFFFF_FFFF_8000_1000,
+                   "EPC must point at the branch, i.e. fault_pc - 4");
+    }
+
+    /// CP0 instructions must be refused in user mode unless Status.CU0 is set.
+    ///
+    /// `exec_cop0` is the single dispatch point for MFC0/MTC0/TLB*/ERET/WAIT, and
+    /// it had no privilege check at all: a user process could `MTC0 $x, Status`
+    /// itself straight into kernel mode. That is a strictly bigger hole than the
+    /// stale-`translate_fn` bug, since it needs no stale state to exploit.
+    ///
+    /// Kernel-or-CU0 is the R4400 rule; Supervisor gets no implicit access.
+    #[test]
+    fn test_cop0_requires_kernel_or_cu0() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_cop0_requires_kernel_or_cu0_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_cop0_requires_kernel_or_cu0_inner() {
+        use crate::mips_tlb::MipsTlb;
+        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+                               STATUS_KSU_SHIFT, KSU_USER, STATUS_CU0, PrivilegeMode};
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+
+        // Genuine user mode, CU0 clear.
+        let user_status = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL
+                           & !STATUS_ERL & !STATUS_CU0)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT);
+        exec.set_cp0_status(user_status);
+        assert!(matches!(exec.core.get_privilege_mode(), PrivilegeMode::User),
+                "setup: should be in user mode with CU0 clear");
+
+        // MTC0 $8 -> Status(12): the privilege escalation this gate exists to stop.
+        // Load a would-be kernel Status into $8 so a successful write is obvious.
+        let kernel_status = user_status & !STATUS_KSU_MASK; // KSU=0 == kernel
+        exec.core.write_gpr(8, kernel_status as u64);
+        let mtc0_status = (OP_COP0 << 26) | (0x04 << 21) | (8 << 16) | (12 << 11);
+
+        let status_before = exec.core.cp0_status;
+        let s = exec.exec(mtc0_status);
+        assert!(s & EXEC_IS_EXCEPTION != 0,
+                "MTC0 from user mode without CU0 must raise an exception");
+        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_CPU,
+                   "must be Coprocessor Unusable (EXC_CPU)");
+        assert_eq!((exec.core.cp0_cause & crate::mips_core::CAUSE_CE_MASK)
+                       >> crate::mips_core::CAUSE_CE_SHIFT,
+                   0, "Cause.CE must name coprocessor 0");
+        // The escalation must not have happened. Exception delivery sets EXL, so
+        // compare only the field the instruction tried to write: KSU.
+        assert_eq!(exec.core.cp0_status & STATUS_KSU_MASK,
+                   status_before & STATUS_KSU_MASK,
+                   "the refused MTC0 must not have changed KSU — a user process \
+                    must not be able to write itself into kernel mode");
+
+        // Same instruction, now with CU0 granted: it must be allowed through.
+        let (mut exec2, _mem2) = create_executor_with_tlb(MipsTlb::default());
+        let user_cu0 = (exec2.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL & !STATUS_ERL)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT) | STATUS_CU0;
+        exec2.set_cp0_status(user_cu0);
+        assert!(matches!(exec2.core.get_privilege_mode(), PrivilegeMode::User),
+                "setup: user mode, but with CU0 set");
+        exec2.core.write_gpr(8, (user_cu0 | (1 << 3)) as u64); // any distinguishable value
+        let s2 = exec2.exec(mtc0_status);
+        assert_eq!(s2 & EXEC_IS_EXCEPTION, 0,
+                   "with CU0 set, CP0 access from user mode must be permitted");
+    }
+
+    /// A soft reset taken while the guest is in user mode must still be able to
+    /// fetch the reset vector.
+    ///
+    /// `core.reset(true)` rewrites cp0_status to BEV|ERL|SR and points PC at
+    /// 0xBFC00000 (KSEG1) by direct field write. Without a resync the user
+    /// translator stays installed and the reset vector fetch takes a spurious ADEL.
+    /// Unlike the ERET/exception cases this one is reachable in principle today —
+    /// it survives only because IRIX takes soft resets from kernel mode.
+    #[test]
+    fn test_soft_reset_from_user_fetches_reset_vector() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_soft_reset_from_user_fetches_reset_vector_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_soft_reset_from_user_fetches_reset_vector_inner() {
+        use crate::mips_tlb::{MipsTlb, AccessType};
+        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+                               STATUS_KSU_SHIFT, KSU_USER, PrivilegeMode};
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+
+        let user_status = (exec.core.cp0_status & !STATUS_KSU_MASK & !STATUS_EXL & !STATUS_ERL)
+            | ((KSU_USER as u32) << STATUS_KSU_SHIFT);
+        exec.set_cp0_status(user_status);
+        assert!(matches!(exec.core.get_privilege_mode(), PrivilegeMode::User),
+                "setup: should be in user mode when the reset arrives");
+
+        // Drive the real soft-reset path in step()'s preamble rather than calling
+        // core.reset(true) by hand, so the macro expansion under test is the one that
+        // actually runs. Bit 63 is SOFT_RESET_BIT, the same bit MipsCpu::signal sets.
+        exec.core.hot.interrupts.fetch_or(1u64 << 63, std::sync::atomic::Ordering::SeqCst);
+        let status = exec.step_int();
+        assert_eq!(status, crate::mips_exec::EXEC_RETRY,
+                   "a soft reset retires no instruction, so it must report EXEC_RETRY");
+
+        assert_eq!(exec.core.pc, 0xFFFFFFFF_BFC00000,
+                   "soft reset must land on the KSEG1 reset vector");
+
+        // The reset vector must be fetchable. reset() sets ERL, which forces Kernel,
+        // so a correctly resynced executor holds the kernel translator here.
+        let reset_vector = exec.core.pc;
+        let probe = (exec.translate_fn)(&mut exec, reset_vector, AccessType::Fetch);
+        assert!(!probe.is_exception(),
+                "the reset vector must be fetchable after a soft reset from user mode; \
+                 it was not, so the pre-reset user translate_fn survived the reset");
     }
 
     #[test]
@@ -2856,7 +3266,10 @@ mod tests {
         exec.core.write_gpr(1, 0x1234567890ABCDEF);
         let instr_dmtc0 = (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (0 << 11);
         assert_eq!(exec.exec(instr_dmtc0), EXEC_COMPLETE);
-        assert_eq!(exec.core.cp0_index, 0x90ABCDEF); // Index is 32-bit, truncated
+        // Index is 32-bit (truncated from the 64-bit write) *and* narrow: only
+        // slot bits [5:0] and the TLBP-failure bit [31] are implemented.
+        // 0x90ABCDEF -> P set (bit 31) | (0xEF & 0x3F) == 0x2F.
+        assert_eq!(exec.core.cp0_index, crate::mips_exec::CP0_INDEX_P | 0x2F);
         
         // DMTC0 r1, Context (u64)
         let instr_dmtc0_ctx = (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (4 << 11);

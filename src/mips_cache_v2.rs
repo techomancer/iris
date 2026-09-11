@@ -3193,12 +3193,18 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
         // R5K (2-way): generic path.
         //
-        // tcache is **not implemented here** — the 2-way paths always take the
-        // real-cache route, so no transparent lines are ever created on R5000
-        // and the feature is silently a no-op for that model. Safe, but if
-        // tcache is ever extended to R5000, the `has_code` invalidation below
-        // must be added here too (see the R4K branch above for why it must not
-        // be gated on `transparent`).
+        // tcache **is** active here, contrary to what this comment used to
+        // claim: `fill_l1d_line` sets `transparent = true` purely on
+        // `cfg(tcache)` with no `IS_R5K` guard, so R5000 lines hold no data and
+        // the store below goes to RAM via `tc_write` like any other model.
+        //
+        // `tc_invalidate_l2_code` is called for symmetry with the R4K branch and
+        // is a no-op when `!HAS_L2` (R5000 has no L2). That is correct, not a
+        // gap: `has_code` guards tcache's *decoded-instruction* slots in L2, and
+        // with no L2 there are none to invalidate. L1-I decode slots (`ic_instrs`)
+        // are populated only on an L1-I fill, so they cannot outlive the
+        // guest-issued CACHE op that retires the line — which the architecture
+        // already requires for self-modifying code.
         {
             let way = self.ensure_l1d_line(virt_addr, phys_addr);
             if way > 1 { return way; }
@@ -3377,24 +3383,44 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     };
                     (tag.ptag() << 13) | (state << 10) | (tag.pidx() << 7)
                 } else if is_icache {
-                    // L1-I TagLo format:  [31:8] raw_ptag   [7:6] pstate (2=valid, 0=invalid)
                     let tag: L1ITag = self.ic.get_tag(idx);
                     let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
-                    let pstate = if tag.is_valid() { 2u32 } else { 0u32 };
-                    (raw_ptag << 8) | (pstate << 6)
+                    if Self::IS_R5K {
+                        // R5000 L1-I TagLo:  [31:8] ptag  [7] L (lock)  [6] V
+                        // Not the R4400 2-bit PState. We model no lock bit, so L=0.
+                        let v = if tag.is_valid() { 1u32 << 6 } else { 0 };
+                        (raw_ptag << 8) | v
+                    } else {
+                        // R4400 L1-I TagLo:  [31:8] raw_ptag  [7:6] pstate (2=valid, 0=invalid)
+                        let pstate = if tag.is_valid() { 2u32 } else { 0u32 };
+                        (raw_ptag << 8) | (pstate << 6)
+                    }
                 } else {
-                    // L1-D TagLo format:  [31:8] raw_ptag   [7:6] pstate
                     let tag: L1DTag = self.dc.get_tag(idx);
                     let raw_ptag = (tag.ptag >> L1_PTAG_SHIFT) as u32 & L1_PTAG_MASK;
-                    // dirty=true promotes CleanExclusive→DirtyExclusive in TagLo output
-                    let pstate = match tag.cs as u32 {
-                        L1D_CS_INVALID => 0u32,
-                        L1D_CS_SHARED => 1u32,
-                        L1D_CS_CLEAN_EXCLUSIVE => if tag.dirty { 3u32 } else { 2u32 },
-                        L1D_CS_DIRTY_EXCLUSIVE => 3u32,
-                        _ => 0u32,
-                    };
-                    (raw_ptag << 8) | (pstate << 6)
+                    if Self::IS_R5K {
+                        // R5000 L1-D TagLo:  [31:8] ptag  [7] D (dirty)  [6] V
+                        // Discrete bits, not a 2-bit MESI PState — the R5000 L1 has no
+                        // bus snooping and therefore no Shared/Exclusive distinction.
+                        // Emitting the R4400 encoding here made a valid-clean line read
+                        // back as D=1,V=0, i.e. *invalid* to R5000 software. (CACHE-1.)
+                        let valid = tag.cs as u32 != L1D_CS_INVALID;
+                        let v = if valid { 1u32 << 6 } else { 0 };
+                        let d = if valid && (tag.dirty
+                                    || tag.cs as u32 == L1D_CS_DIRTY_EXCLUSIVE) { 1u32 << 7 } else { 0 };
+                        (raw_ptag << 8) | d | v
+                    } else {
+                        // R4400 L1-D TagLo:  [31:8] raw_ptag  [7:6] pstate
+                        // dirty=true promotes CleanExclusive→DirtyExclusive in TagLo output
+                        let pstate = match tag.cs as u32 {
+                            L1D_CS_INVALID => 0u32,
+                            L1D_CS_SHARED => 1u32,
+                            L1D_CS_CLEAN_EXCLUSIVE => if tag.dirty { 3u32 } else { 2u32 },
+                            L1D_CS_DIRTY_EXCLUSIVE => 3u32,
+                            _ => 0u32,
+                        };
+                        (raw_ptag << 8) | (pstate << 6)
+                    }
                 }
             }
 
@@ -3424,27 +3450,46 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     t.set_pidx(pidx);
                     self.l2.set_tag(idx, t);
                 } else {
-                    // L1 TagLo format:  [31:8] raw_ptag   [7:6] pstate
+                    // L1 TagLo:  [31:8] raw_ptag, then model-specific state bits —
+                    // R4400 packs a 2-bit PState in [7:6]; R5000 uses discrete
+                    // D/V (data) or L/V (instr). Must be the exact inverse of the
+                    // C_ILT encoding above.
                     let raw_ptag = (tag_lo >> 8) & L1_PTAG_MASK;
                     let ptag_line = (raw_ptag as u64) << L1_PTAG_SHIFT; // convert to line-base form
                     let pstate = (tag_lo >> 6) & 0x3;
+                    // R5000: bit 6 alone is Valid. R4400: any non-zero PState is valid.
+                    let valid = if Self::IS_R5K { (tag_lo & (1 << 6)) != 0 } else { pstate != 0 };
 
                     if is_icache {
                         // Evict existing line first to maintain L1I data pointer integrity.
                         self.invalidate_l1i_line(idx, cascade);
-                        self.ic.set_tag(idx, if pstate != 0 { L1ITag::valid(ptag_line) } else { L1ITag::default() });
+                        self.ic.set_tag(idx, if valid { L1ITag::valid(ptag_line) } else { L1ITag::default() });
                     } else {
-                        let cs = match pstate {
-                            0 => L1D_CS_INVALID as u8,
-                            1 => L1D_CS_SHARED as u8,
-                            2 => L1D_CS_CLEAN_EXCLUSIVE as u8,
-                            3 => L1D_CS_DIRTY_EXCLUSIVE as u8,
-                            _ => L1D_CS_INVALID as u8,
+                        // R5000 has no Shared state (no L1 snooping): a valid line is
+                        // Clean- or Dirty-Exclusive per bit 7.
+                        let (cs, dirty) = if Self::IS_R5K {
+                            let d = (tag_lo & (1 << 7)) != 0;
+                            if !valid {
+                                (L1D_CS_INVALID as u8, false)
+                            } else if d {
+                                (L1D_CS_DIRTY_EXCLUSIVE as u8, true)
+                            } else {
+                                (L1D_CS_CLEAN_EXCLUSIVE as u8, false)
+                            }
+                        } else {
+                            let cs = match pstate {
+                                0 => L1D_CS_INVALID as u8,
+                                1 => L1D_CS_SHARED as u8,
+                                2 => L1D_CS_CLEAN_EXCLUSIVE as u8,
+                                3 => L1D_CS_DIRTY_EXCLUSIVE as u8,
+                                _ => L1D_CS_INVALID as u8,
+                            };
+                            (cs, cs == L1D_CS_DIRTY_EXCLUSIVE as u8)
                         };
                         // Writeback dirty data before overwriting the tag.
                         self.writeback_l1d_line(idx, cascade);
                         self.invalidate_l1d_line(idx, true, cascade);
-                        self.dc.set_tag(idx, if cs != 0 { L1DTag::valid(ptag_line, cs, cs == L1D_CS_DIRTY_EXCLUSIVE as u8) } else { L1DTag::default() });
+                        self.dc.set_tag(idx, if cs != L1D_CS_INVALID as u8 { L1DTag::valid(ptag_line, cs, dirty) } else { L1DTag::default() });
                     }
                 }
                 0
@@ -4143,6 +4188,142 @@ mod tests {
             self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17;
             self.0 as u32
         }
+    }
+
+    /// R4400 and R5000 disagree on the L1 TagLo layout, and `C_ILT`/`C_IST`
+    /// must speak each model's own dialect (cpucritique.md CACHE-1).
+    ///
+    /// - R4400 packs a 2-bit MESI PState in [7:6]: 0=Invalid, 1=Shared,
+    ///   2=CleanExclusive, 3=DirtyExclusive.
+    /// - R5000 has no L1 bus snooping and therefore no Shared state; it uses
+    ///   discrete bits — D (bit 7) and V (bit 6) for the D-cache.
+    ///
+    /// Emitting the R4400 encoding on R5000 made a valid *clean* line read back
+    /// as D=1,V=0 — i.e. **invalid** to R5000 software — and a store of the
+    /// R5000 "valid, clean" pattern (0x40) was decoded as PState=1 (Shared).
+    #[test]
+    fn taglo_valid_clean_line_reads_back_valid_on_both_models() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let phys: u32 = 0x3000;
+        let va = kseg0(phys);
+
+        // R4400: a filled (clean) line reports PState=2 (CleanExclusive), V implied.
+        {
+            let cache: R4400Cache = make_cache_of(mem.clone());
+            let _ = cache.read::<4>(va, phys as u64);   // fill the line clean
+            let idx = cache.dc.get_index(va);
+            let tag_lo = cache.cache_op(C_ILT | CACH_PD, va, idx as u64);
+            assert_eq!((tag_lo >> 6) & 0x3, 2,
+                       "R4400 clean line must report PState=CleanExclusive");
+        }
+
+        // R5000: the same line must report V=1 (bit 6) and D=0 (bit 7).
+        {
+            let cache: R5000Cache = make_cache_of(mem.clone());
+            let _ = cache.read::<4>(va, phys as u64);
+            // 2-way: the fill picked a way via LRU; probe both and take the valid one.
+            let set = cache.dc.get_index(va);
+            let nls = R5000Cache::DC_NUM_LINES_SHIFT as usize;
+            let tag_lo = (0..R5000Cache::DC_WAYS)
+                .map(|w| cache.cache_op(C_ILT | CACH_PD, va, (set | (w << nls)) as u64))
+                .find(|t| t & (1 << 6) != 0)
+                .expect("R5000 clean line must set V (bit 6) in TagLo — with the \
+                         R4400 PState encoding it reads back as D=1,V=0, i.e. invalid");
+            assert_eq!(tag_lo & (1 << 7), 0,
+                       "a clean line must not set D (bit 7) on R5000");
+        }
+    }
+
+    /// `C_IST` must be the exact inverse of `C_ILT` for whichever model is
+    /// active: store a tag, load it back, and get the same state bits.
+    ///
+    /// Note this is a *symmetry* check and passes even when both halves share
+    /// the same wrong encoding — `taglo_valid_clean_line_reads_back_valid_on_both_models`
+    /// and `taglo_r5000_decodes_hardware_bit_patterns` are what pin the absolute
+    /// bit positions. Kept because an asymmetric encode/decode pair is its own
+    /// distinct bug class.
+    #[test]
+    fn taglo_store_load_round_trips_on_both_models() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let phys: u32 = 0x5000;
+        let va = kseg0(phys);
+
+        // R4400: PState=3 (DirtyExclusive) must survive the round trip.
+        {
+            let cache: R4400Cache = make_cache_of(mem.clone());
+            let idx = cache.dc.get_index(va) as u64;
+            let raw_ptag = (phys >> L1_PTAG_SHIFT) & L1_PTAG_MASK;
+            let written = (raw_ptag << 8) | (3 << 6);
+            cache.cache_op(C_IST | CACH_PD, va, written as u64);
+            let read_back = cache.cache_op(C_ILT | CACH_PD, va, idx);
+            assert_eq!((read_back >> 6) & 0x3, 3, "R4400 DirtyExclusive must round-trip");
+            assert_eq!(read_back >> 8, raw_ptag, "physical tag must round-trip");
+        }
+
+        // R5000: valid+dirty is D=1,V=1 (0xC0). Under the old code this was
+        // decoded as PState=3 by luck, but valid+clean (0x40) was decoded as
+        // Shared — so assert the clean case too, which is the one that broke.
+        {
+            let cache: R5000Cache = make_cache_of(mem.clone());
+            let set = cache.dc.get_index(va);
+            let nls = R5000Cache::DC_NUM_LINES_SHIFT as usize;
+            let idx = (set | (0 << nls)) as u64;
+            let raw_ptag = (phys >> L1_PTAG_SHIFT) & L1_PTAG_MASK;
+
+            for (d_bit, label) in [(1u32 << 7, "dirty"), (0, "clean")] {
+                let written = (raw_ptag << 8) | d_bit | (1 << 6); // V=1
+                cache.cache_op(C_IST | CACH_PD, va, written as u64);
+                let read_back = cache.cache_op(C_ILT | CACH_PD, va, idx);
+                assert_ne!(read_back & (1 << 6), 0,
+                           "R5000 {label} line must read back V=1");
+                assert_eq!(read_back & (1 << 7), d_bit,
+                           "R5000 {label} line must round-trip its D bit");
+                assert_eq!(read_back >> 8, raw_ptag, "physical tag must round-trip");
+            }
+        }
+    }
+
+    /// R5000 `C_IST` must interpret the bit patterns real R5000 firmware writes,
+    /// independently of what `C_ILT` would emit.
+    ///
+    /// This is the half a pure round-trip test cannot catch: with the R4400
+    /// PState decoder, TagLo=0x40 ("valid, clean" to R5000 firmware) was read as
+    /// PState=1 = *Shared*, and TagLo=0x00 vs 0x80 were both "invalid" so a
+    /// dirty-invalid distinction was lost. Asserting observable *behaviour*
+    /// (does the line hit? does a writeback occur?) rather than re-reading the
+    /// tag keeps this honest.
+    #[test]
+    fn taglo_r5000_decodes_hardware_bit_patterns() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let phys: u32 = 0x7000;
+        let va = kseg0(phys);
+        let cache: R5000Cache = make_cache_of(mem.clone());
+
+        let set = cache.dc.get_index(va);
+        let nls = R5000Cache::DC_NUM_LINES_SHIFT as usize;
+        let idx = (set | (0 << nls)) as u64;
+        let raw_ptag = (phys >> L1_PTAG_SHIFT) & L1_PTAG_MASK;
+
+        // V=0 (whatever bit 7 says) must be Invalid: a subsequent read must miss
+        // and refill rather than returning whatever the tag pointed at.
+        cache.cache_op(C_IST | CACH_PD, va, ((raw_ptag << 8) | (1 << 7)) as u64);
+        let after_invalid = cache.cache_op(C_ILT | CACH_PD, va, idx);
+        assert_eq!(after_invalid & (1 << 6), 0,
+                   "TagLo with V=0 must store an Invalid line on R5000, \
+                    regardless of the D bit");
+
+        // V=1, D=0 — "valid, clean". Must be valid (this is the pattern the
+        // R4400 decoder mis-read as Shared) and must NOT be dirty.
+        cache.cache_op(C_IST | CACH_PD, va, ((raw_ptag << 8) | (1 << 6)) as u64);
+        let clean = cache.cache_op(C_ILT | CACH_PD, va, idx);
+        assert_ne!(clean & (1 << 6), 0, "V=1,D=0 must store a valid line");
+        assert_eq!(clean & (1 << 7), 0, "V=1,D=0 must not be dirty");
+
+        // V=1, D=1 — "valid, dirty".
+        cache.cache_op(C_IST | CACH_PD, va, ((raw_ptag << 8) | (1 << 7) | (1 << 6)) as u64);
+        let dirty = cache.cache_op(C_ILT | CACH_PD, va, idx);
+        assert_ne!(dirty & (1 << 6), 0, "V=1,D=1 must be valid");
+        assert_ne!(dirty & (1 << 7), 0, "V=1,D=1 must be dirty");
     }
 
     /// L1D random read/write: 1M word operations against a shadow copy.

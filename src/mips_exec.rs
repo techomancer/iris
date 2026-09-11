@@ -456,6 +456,17 @@ const EXT_INT_MASK: u32 = crate::mips_core::CAUSE_IP7 |
 // Bit 63 of the interrupts word = soft-reset request
 const SOFT_RESET_BIT: u64 = 1u64 << 63;
 
+/// CP0 `Index` slot field, bits [5:0] — the only bits that select a TLB entry.
+///
+/// Every use of `cp0_index` as an entry number must mask with this rather than
+/// take it modulo the entry count: `%` folds the probe-failure bit (31) and the
+/// out-of-range values 48..63 back onto *valid* slots, silently corrupting live
+/// (and typically wired) entries. See `exec_tlbwi`.
+pub const CP0_INDEX_SLOT_MASK: u32 = 0x3F;
+
+/// CP0 `Index` probe-failure bit, set by `TLBP` when no entry matches.
+pub const CP0_INDEX_P: u32 = 0x8000_0000;
+
 const TRACEBACK_SIZE: usize = 1048576; // 1M entries
 
 /// How a traceback entry's instruction was dispatched — finer-grained than a
@@ -1109,6 +1120,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Hot-path translation function pointer, updated whenever CP0 Status changes.
     /// Always the non-debug variant; selects the correct 32/64-bit × privilege specialisation.
     pub translate_fn: fn(&mut Self, u64, AccessType) -> TranslateResult,
+
+    /// Retires the global jitv2 dirty-page probe when this executor dies.
+    ///
+    /// A field rather than `impl Drop for MipsExecutor`: the latter would make
+    /// the whole executor non-movable-out-of (E0509), which several tests rely
+    /// on. See [`JitPageProbeGuard`].
+    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+    jit_page_probe_guard: JitPageProbeGuard,
     /// FR-mode-aware FPR accessors. Switched in update_fpr_mode() whenever STATUS_FR changes.
     /// FR=0: doubles/longs use full even slot; odd single/word regs are upper 32 bits of even slot.
     /// FR=1: all 32 slots are independent 64-bit registers.
@@ -1399,11 +1418,50 @@ fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at
 unsafe impl<T: Tlb, C: CpuModel> Send for MipsExecutor<T, C> {}
 unsafe impl<T: Tlb, C: CpuModel> Sync for MipsExecutor<T, C> {}
 
-fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, old: u32, new: u32) {
+/// Owns the executor's registration in the process-wide jitv2 dirty-page probe
+/// and retires it on drop.
+///
+/// `install_jit_page_probe` stores a bare `*const ()` to the executor's cache in
+/// a global with no lifetime attached. In production that is benign — the
+/// executor lives as long as the process — but nothing enforced it, and in a
+/// test binary executors are created and dropped continuously while the probe
+/// stays installed. The compile worker then dereferenced a freed cache: seen as
+/// `slice::get_unchecked` out-of-bounds against a *zero-length* tag slice, and
+/// without debug assertions an outright SIGSEGV, on the `jitv2-compile-N`
+/// threads under `--features jitv2,j2wp`.
+///
+/// This is a struct field rather than `impl Drop for MipsExecutor` because a
+/// `Drop` on the executor itself makes it illegal to move fields out of one
+/// (E0509), which several tests do.
+///
+/// The clear is *conditional*: a later executor may have installed its own probe
+/// before this one died, and unconditionally nulling the global would disable
+/// that live executor's dirty-page check rather than merely retiring this dead
+/// one's.
+#[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+struct JitPageProbeGuard {
+    /// The ctx published to the global, or null if this executor never installed.
+    ctx: *const (),
+}
+
+#[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+impl Drop for JitPageProbeGuard {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            crate::jitv2::clear_jit_page_probe_if(self.ctx);
+        }
+    }
+}
+
+
+fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, _old: u32, _new: u32) {
     // SAFETY: ctx is `&mut MipsExecutor<T,C>` cast to void, alive for the executor's lifetime,
     // and only ever called from the CPU thread that exclusively owns the executor.
+    //
+    // The (old, new) pair is `MipsCore::status_changed_cb`'s declared signature; the resync
+    // is unconditional, so neither is read. See `resync_privilege_state`.
     let exec = unsafe { &mut *(ctx as *mut MipsExecutor<T, C>) };
-    exec.on_cp0_status_changed(old, new);
+    exec.resync_privilege_state();
 }
 
 // ---- JIT v2 memory-access / exception-delivery trampolines ------
@@ -2305,6 +2363,11 @@ macro_rules! step_preamble {
             // EXEC_COMPLETE is reserved for "ran fine", which this didn't.
             if pending & SOFT_RESET_BIT != 0 {
                 $self.core.reset(true); // clears interrupts word (including bit 63)
+                // reset() rewrote cp0_status (BEV|ERL|SR) by direct field write and set
+                // pc to the KSEG1 reset vector. Without re-deriving, a soft reset taken
+                // while the guest was in user mode would leave the user translator
+                // installed and fault on the reset vector fetch itself.
+                $self.resync_privilege_state();
                 $self.core.in_delay_slot = false;
                 $self.core.delay_slot_target = 0;
                 return EXEC_RETRY;
@@ -2474,6 +2537,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
+            #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
+            jit_page_probe_guard: JitPageProbeGuard { ctx: std::ptr::null() },
             // Placeholder — overwritten immediately by update_fpr_mode below.
             fpr_read_d:  crate::mips_core::read_fpr_d_fr0,
             fpr_write_d: crate::mips_core::write_fpr_d_fr0,
@@ -2648,8 +2713,24 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
-    /// Call once after construction. The callback is invoked (from write_cp0) with
-    /// (old_status, new_status) whenever CP0 register 12 is written.
+    ///
+    /// This exists for exactly one reason: `MipsCore::write_cp0` has only a
+    /// `&mut MipsCore` and so cannot reach [`Self::resync_privilege_state`] on its own,
+    /// so a guest `MTC0/DMTC0 $x, Status` needs this bridge to resync. **Every other**
+    /// Status mutation (ERET, exception delivery, reset, snapshot/digest restore, gdb
+    /// register writes) calls `resync_privilege_state` directly and does not depend on
+    /// this being installed.
+    ///
+    /// **Must not be called before the executor reaches its final address.** It stores
+    /// `self as *mut Self`, and `MipsExecutor` is neither pinned nor `Box`ed: it is
+    /// returned by value from `new()` and moved again into `Arc<Mutex<_>>` by
+    /// `MipsCpu::new`, which is why the production call site sits there and not in
+    /// `new()`. Installing earlier records a stack frame that is dead by the time the
+    /// CPU thread runs.
+    ///
+    /// A directly-constructed executor (tests) has no callback installed, so it must
+    /// call this itself if it executes a real `MTC0 Status` instruction — see
+    /// `mips_exec_test::test_nutlb_kernel_entry_unreachable_from_user`.
     pub fn install_status_cb(&mut self) {
         let ctx = self as *mut Self as *mut core::ffi::c_void;
         self.core.status_changed_cb = Some((mips_executor_status_cb::<T, C>, ctx));
@@ -2734,8 +2815,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let ctx = &self.cache as *const C as *const ();
         // SAFETY: see the thunk's own note — `ctx` matches `C`, and it
         // outlives the worker because `install_jit_mem_ptrs` is re-run by
-        // every path that can move or replace the cache.
+        // every path that can move or replace the cache, and `Drop for
+        // MipsExecutor` retires the probe when this cache goes away.
         unsafe { crate::jitv2::install_jit_page_probe(ctx, thunk::<C>) };
+        self.jit_page_probe_guard.ctx = ctx;
     }
 
     /// Install JIT v2's memory-access and exception-delivery hooks
@@ -3320,15 +3403,42 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
-    /// Called whenever CP0 Status is written.
+    /// Re-derive every piece of executor state cached off CP0 Status: `translate_fn`
+    /// (privilege x 32/64-bit), the six `fpr_*` accessors (STATUS_FR), and the untagged
+    /// translation caches that carry no permission bits of their own (nanotlb + nutlb +
+    /// the jitv2 pcp, all bundled inside `nanotlb_invalidate`).
+    ///
+    /// **Every write to `core.cp0_status` must be followed by this call.** `write_cp0`
+    /// reg 12 gets here via `status_changed_cb` (see [`Self::install_status_cb`]); every
+    /// other site — ERET, exception delivery, soft reset, snapshot/digest restore, gdb
+    /// register writes — calls it directly, and must, because the callback is not
+    /// installed on a directly-constructed executor.
+    ///
+    /// Flushing alone is *not* sufficient, which is the trap this method exists to close:
+    /// the flush guarantees the next access misses and therefore calls `translate_fn` —
+    /// so a stale `translate_fn` is not merely tolerated across a privilege change, it is
+    /// guaranteed to be consulted.
+    ///
+    /// Unconditional by design — no `(old ^ new)` guard. ERET and exception delivery
+    /// always toggle EXL/ERL, which `get_privilege_mode` reads, so a guard would fire on
+    /// 100% of the transitions that matter while adding a branch and a mask constant to
+    /// get subtly wrong. The flush it rides behind already costs far more.
     #[inline]
-    fn on_cp0_status_changed(&mut self, _old: u32, _new: u32) {
+    pub fn resync_privilege_state(&mut self) {
         self.update_translate_fn();
         self.update_fpr_mode();
         self.nanotlb_invalidate();
-        // The nutlb flush rides along inside `nanotlb_invalidate()` above:
-        // its entries carry no permission bits, so a mode switch has to
-        // retire them.
+    }
+
+    /// Store a new CP0 Status word and re-derive everything cached off it.
+    ///
+    /// For callers that have the whole word (snapshot restore, digest restore, gdb).
+    /// Callers doing read-modify-write on the field (ERET, reset) set it themselves and
+    /// call [`Self::resync_privilege_state`] directly.
+    #[inline]
+    pub fn set_cp0_status(&mut self, new: u32) {
+        self.core.cp0_status = new;
+        self.resync_privilege_state();
     }
 
     /// Execute a single instruction (decode into scratch, then execute).
@@ -3838,12 +3948,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // shared with jitv2_verify (§4.2 single-implementation delivery).
         crate::mips_core::deliver_exception(&mut self.core, status);
 
-        // Flushes the nutlb too: deliver_exception forces kernel privilege
-        // by setting EXL directly on cp0_status, without going through
-        // write_cp0, so this is the only barrier on the path.
-        self.nanotlb_invalidate();
-        // Reset delay slot state as we are jumping to a new context
-        self.core.in_delay_slot = false;
+        // deliver_exception forces kernel privilege by setting EXL directly on
+        // cp0_status, without going through write_cp0, so this is the only barrier on
+        // the path — and it must re-derive translate_fn, not just flush. The handler
+        // vector is in KSEG0/KSEG1, which only the kernel translator will accept.
+        self.resync_privilege_state();
+        // `deliver_exception` clears in_delay_slot itself — see its doc comment.
         status
     }
 
@@ -3892,8 +4002,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.cache.set_llbit(false);
         self.core.syscall_pending = false;
         crate::mips_core::deliver_exception_at(&mut self.core, status, fault_pc, bd);
-        self.nanotlb_invalidate();
-        self.core.in_delay_slot = false;
+        self.resync_privilege_state();
         status
     }
 
@@ -3941,8 +4050,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.cache.set_llbit(false);
         self.core.syscall_pending = true;
         crate::mips_core::deliver_exception(&mut self.core, status);
-        self.nanotlb_invalidate();
-        self.core.in_delay_slot = false;
+        self.resync_privilege_state();
         status
     }
 
@@ -4211,10 +4319,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         self.core.cp0_badvaddr = virt_addr;
 
-        // EntryHi: VPN from address masked per translation mode, ASID preserved.
+        // EntryHi: Region + VPN2 from the address, ASID preserved. One mask for
+        // both translation modes — no `XTLB` branch.
+        //
+        // The 32-bit case needs no narrower mask because every address reaching
+        // the TLB in 32-bit mode is sign-extended: KUSEG has bit 31 clear, so
+        // bits [63:32] are all 0 and both Region and [39:32] fall out as zero;
+        // KSSEG/KSEG3 (0xFFFF_FFFF_C000_0000 / _E000_0000) have bit 31 set, so
+        // bits [63:32] are all 1, giving Region `11` — the architecturally
+        // required value — and [39:32] = 0xFF, which R4400 leaves undefined in
+        // 32-bit mode. The sign extension already encodes the region, so
+        // masking it through is both correct and branch-free.
+        //
+        // Using the narrow 32-bit mask (the original behaviour) wiped bits
+        // [63:32] on a KSSEG/KSEG3 miss, leaving Region = `00` (User); a refill
+        // handler that then issued TLBWI committed the entry under the wrong
+        // region. cpucritique.md TLB-4.
+        //
+        // This is MAME r4000's `EH_WM` (0xC000_00FF_FFFF_E0FF) less the ASID
+        // bits, which are carried separately below.
+        const EH_VPN_MASK: u64 = EH_REGION | EH_VPN2_64; // 0xC000_00FF_FFFF_E000
         let asid = self.core.cp0_entryhi & 0xFF;
-        let vpn_mask = if XTLB != 0 { EH_REGION | EH_VPN2_64 } else { EH_VPN2_32 };
-        self.core.cp0_entryhi = (virt_addr & vpn_mask) | asid;
+        self.core.cp0_entryhi = (virt_addr & EH_VPN_MASK) | asid;
 
         // Context: PTEBase[63:23] preserved, BadVPN2 = virt_addr[31:13] in bits [22:4].
         // Always 32-bit VPN — Context is used by the 32-bit UTLB handler.
@@ -5968,7 +6094,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // CACHE Instruction
     fn exec_cache(&mut self, d: &DecodedInstr) -> ExecStatus {
-        // Check CP0 usability (must be kernel or supervisor, or CU0 set)
+        // Check CP0 usability: Kernel mode, or Status.CU0 set. Supervisor is
+        // NOT implicitly allowed on R4000/R4400 — it falls into the `_` arm and
+        // needs CU0 like user mode. (Same rule as `exec_cop0`.)
         let privilege = self.core.get_privilege_mode();
         use crate::mips_core::{PrivilegeMode, STATUS_CU0};
 
@@ -6153,6 +6281,27 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     // COP0 Instructions
     fn exec_cop0(&mut self, d: &DecodedInstr) -> ExecStatus {
+        // CP0 is usable iff Status.CU0 is set, or the CPU is in Kernel mode.
+        // Supervisor gets no implicit access on R4000/R4400 — it is a segment
+        // privilege level, not a coprocessor-0 one.
+        //
+        // Without this, every CP0 instruction — MTC0 Status included — was
+        // executable from user mode, so a user process could simply write
+        // itself into kernel mode. This is the single dispatch point for all of
+        // OP_COP0: jitv2 classifies the whole major opcode `Excluded`
+        // (analyzer.rs), so compiled code retires these through
+        // `interp_fallback_fn` into this same function.
+        {
+            use crate::mips_core::{PrivilegeMode, STATUS_CU0};
+            let cp0_usable = match self.core.get_privilege_mode() {
+                PrivilegeMode::Kernel => true,
+                _ => (self.core.cp0_status & STATUS_CU0) != 0,
+            };
+            if !cp0_usable {
+                return self.cpu_unusable(0);
+            }
+        }
+
         let rs_val = d.rs as u32;
 
         match rs_val {
@@ -6220,9 +6369,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn handle_cp0_side_effects(&mut self, reg: u32) {
         // EntryHi (reg 10) carries the current ASID in bits [7:0]. The nanotlb
         // tags hold only a VA, so their validity depends on the ASID that was
-        // live when they were filled. Every *other* invalidation site
-        // (`on_cp0_status_changed`, both `handle_exception` paths,
-        // `exec_eret`) is a privilege transition — which is what normally
+        // live when they were filled. Every *other* invalidation site is a
+        // `resync_privilege_state` call (the status callback, all three
+        // `handle_exception` paths, `exec_eret`, soft reset, the restore paths)
+        // — i.e. a privilege transition, which is what normally
         // contains an ASID switch, since a kernel changes ASID inside EXL and
         // returns through ERET. A bare `MTC0/DMTC0 EntryHi` has no such
         // transition around it, so nothing else would flush, and a following
@@ -6281,7 +6431,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // TLBR - Read Indexed TLB Entry
     // Reads the TLB entry indexed by CP0.Index into CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask
     fn exec_tlbr(&mut self) -> ExecStatus {
-        let index = (self.core.cp0_index as usize) % self.tlb.num_entries();
+        // Index selects the slot from bits [5:0] only — mask, never modulo.
+        // `%` folds the TLBP-failure bit (31) back into a *valid* slot number
+        // (0x8000_0000 % 48 == 32), silently reading a live entry; it also maps
+        // an out-of-range 48..63 onto 0..15, which are the wired entries. See
+        // `exec_tlbwi` for the full argument and the MAME cross-check.
+        let index = (self.core.cp0_index & CP0_INDEX_SLOT_MASK) as usize;
+        if index >= self.tlb.num_entries() {
+            return EXEC_COMPLETE;
+        }
         let entry = self.tlb.read(index);
 
         // Per MIPS R4000 spec: Extract G bit from EntryHi bit 12 and populate both EntryLo G bits
@@ -6332,7 +6490,29 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // TLBWI - Write Indexed TLB Entry
     // Writes CP0.EntryHi, CP0.EntryLo0, CP0.EntryLo1, and CP0.PageMask to the TLB entry indexed by CP0.Index
     fn exec_tlbwi(&mut self) -> ExecStatus {
-        let index = (self.core.cp0_index as usize) % self.tlb.num_entries();
+        // The slot is Index[5:0]. Masking rather than `%` matters twice:
+        //
+        // 1. A failed `TLBP` leaves bit 31 set (`0x8000_0000`). Under `%` that
+        //    became `0x8000_0000 % 48 == 32` — a perfectly valid slot — so a
+        //    guest that issued TLBWI after a missed probe silently overwrote a
+        //    live entry 32 instead of touching the slot the architecture names.
+        // 2. `%` maps an out-of-range 48..63 onto 0..15, which are exactly the
+        //    wired entries a kernel relies on staying put.
+        //
+        // R4400 leaves TLBWI with Index >= num_entries *undefined*; skipping is
+        // our choice, not a fidelity claim. It matches MAME's r4000 and mips3
+        // cores, which both do `Index & 0x3f` followed by a bounds check with no
+        // else branch.
+        //
+        // Note the failed-probe case now writes entry 0 (`0x8000_0000 & 0x3f`)
+        // rather than entry 32. That is the architectural behaviour, not a
+        // safety net: entry 0 is typically wired, so a guest doing TLBWI after a
+        // missed TLBP still corrupts something. It just corrupts what real
+        // hardware would.
+        let index = (self.core.cp0_index & CP0_INDEX_SLOT_MASK) as usize;
+        if index >= self.tlb.num_entries() {
+            return self.handle_exec_complete();
+        }
         let entry = self.create_tlb_entry_from_cp0();
         //eprintln!("TLBWI idx={} entryhi={:#018x} lo0={:#018x} lo1={:#018x} pc={:#018x}", index, entry.entry_hi, entry.entry_lo[0], entry.entry_lo[1], self.core.pc);
         self.tlb.write(index, entry);
@@ -6410,11 +6590,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Clear LLbit (Load Linked bit) on ERET
         // This is implementation-specific but commonly done
         self.cache.set_llbit(false);
-        self.nanotlb_invalidate();
-        // `nanotlb_invalidate()` above flushes the nutlb too, which is what
-        // makes ERET safe here: it clears ERL/EXL on cp0_status *directly*,
-        // not through write_cp0, so the Status callback never fires and this
-        // is the only barrier on the privilege change.
+        // ERET clears ERL/EXL on cp0_status *directly*, not through write_cp0, so the
+        // Status callback never fires — this is the only barrier on the privilege change,
+        // and it has to be the full resync rather than a bare flush. Clearing EXL/ERL is
+        // exactly what makes `get_privilege_mode()` stop reporting Kernel and start
+        // reporting KSU, so `translate_fn` must be re-derived here or the guest runs user
+        // code through the kernel translator. The flush alone cannot cover it: it
+        // *guarantees* the next access misses and therefore calls `translate_fn`.
+        self.resync_privilege_state();
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;
@@ -7729,7 +7912,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // full-window rewind) runs jitv2's dispatch gate against a stale
         // self.pcp for a completely different physical page than the one
         // the restored PC actually lives on — silently probing/publishing
-        // into the wrong page's entry table. `on_cp0_status_changed` covers
+        // into the wrong page's entry table. `resync_privilege_state` covers
         // this (nanotlb_invalidate nulls self.pcp too — see its own doc
         // comment, which explicitly names "snapshot restore" as an
         // anticipated caller) plus the two other derived-state resyncs a
@@ -7746,9 +7929,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // spurious "JIT diverged at instruction 1" reports that were actually
         // this rewind path corrupting state before replay's JIT dispatch
         // ever got a chance to run.
-        self.on_cp0_status_changed(0, snapshot.cp0_status);
+        self.resync_privilege_state();
         // The restored snapshot brings its own TLB contents, so every cached
-        // nutlb translation describes the *previous* TLB. `on_cp0_status_changed`
+        // nutlb translation describes the *previous* TLB. `resync_privilege_state`
         // above routes through `nanotlb_invalidate()`, which retires them.
     }
 
@@ -8426,6 +8609,11 @@ impl LockstepSnapshot {
         // The FR-pointer analogue of this is documented in
         // `rules/jitv2/codegen-gotchas.md`.
         crate::platform::set_fpu_mode((self.fcsr & 0x3) as u8);
+        // That FR-pointer analogue, closed: the direct `cp0_status` write above equally
+        // bypasses the path that re-derives `translate_fn` and the fpr accessors, so a
+        // restore across a privilege or FR boundary would otherwise resume on pointers
+        // describing the pre-restore mode.
+        exec.resync_privilege_state();
     }
 
     /// `compare_fpr`/`compare_delay_slot`: kept as explicit flags rather than
@@ -9753,7 +9941,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         exec.core.count_hz = digest.count_hz;
         exec.core.in_delay_slot = digest.in_delay_slot;
         exec.core.reanchor_count_and_reschedule();
-        exec.on_cp0_status_changed(0, digest.cp0_status);
+        exec.resync_privilege_state();
         Ok(())
     }
 
@@ -12990,11 +13178,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsC
         // breakpoints intentionally preserved — debugger state, not hardware state
         #[cfg(feature = "developer")]
         exec.pending_memory_writes.clear();
-        exec.update_translate_fn();
-        exec.update_fpr_mode();
-        // Restored TLB + CP0 state: retire every cached nutlb translation,
-        // all of which describe the *previous* TLB.
-        exec.core.nutlb_clear();
+        // `reset()` above rewrote cp0_status by direct field write. Re-derive
+        // translate_fn/fpr accessors from it, and retire every cached translation:
+        // the reset TLB + CP0 state means all of them describe the *previous* machine.
+        // (This also covers the nanotlb and the jitv2 pcp, which the older
+        // hand-rolled `nutlb_clear()` here left live across a power-on.)
+        exec.resync_privilege_state();
     }
 }
 
@@ -13129,6 +13318,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         if let Some(cache_v) = get_field(v, "cache") {
             exec.cache.load_cache_state(cache_v)?;
         }
+
+        // cp0_status was restored above by direct field write, so translate_fn and the
+        // fpr accessors still describe the *previous* machine. Deliberately last: the
+        // flush this routes through must retire translations made stale by the restored
+        // TLB above, not run before it.
+        exec.resync_privilege_state();
 
         Ok(())
     }
@@ -13320,6 +13515,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
         core.fpr = regs.fpu.r;
         core.fpu_fcsr = regs.fpu.fcsr as u32;
         core.fpu_fir  = regs.fpu.fir as u32;
+        // The debugger just wrote cp0_status by direct field write; re-derive.
+        exec.resync_privilege_state();
     }
 
     fn read_reg(&self, id: MipsRegId<u64>) -> Option<u64> {
@@ -13354,6 +13551,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
             MipsRegId::Fcsr => { core.fpu_fcsr = val as u32; }
             _ => {}
         }
+        // `core`'s borrow ends with the match. Unconditional rather than gated on
+        // MipsRegId::Status — this is a debugger path, and a resync after a GPR write
+        // costs nothing next to never getting one after a Status write.
+        exec.resync_privilege_state();
     }
 
     fn read_mem(&self, addr: u64, buf: &mut [u8]) -> Result<(), ()> {
