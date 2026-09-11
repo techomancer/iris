@@ -13,6 +13,27 @@ debug_cache = []
 developer = []
 developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
 developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TLB errors
+# Per-LL-address LL/SC reservation histogram, queryable with `ll stats`.
+# Deliberately NOT part of `developer`: `developer` is mutually exclusive with
+# `lightning`, and the thing this exists to diagnose (a kernel LL/SC loop that
+# never lands its store, i.e. threads that sleep forever) so far only
+# reproduces at full JIT speed. Cheap enough to carry in a `lightning` build —
+# a fixed-size direct-mapped table, no allocation, no hashing.
+llstats = []
+# Stale-code detector: verify, at execution time, that the instruction word an
+# engine is about to run still matches what memory holds at that VA.
+#
+# Catches the one class lockstep cannot: lockstep compares the JIT against the
+# interpreter, so if BOTH start from the same stale bytes they agree perfectly
+# and the divergence is invisible. This instead compares each engine against
+# memory itself.
+#
+# Covers both engines — compiled code calls `fetch_verify_fn` with the
+# compile-time-constant word it baked in, and the interpreter checks its cached
+# decode against a re-read. Expensive (a memory read per instruction), so it is
+# its own feature rather than part of `developer`, and like `llstats` it is kept
+# `lightning`-compatible so it can run at the speed a timing bug needs.
+fetchverify = []
 # Synthetic deterministic clock for CP0 Compare calibration: dt_ns derived from
 # (instructions executed) * 10ns instead of host Instant::now(). Required for
 # the snapshot determinism validator (Phase 3.3). Default OFF preserves the

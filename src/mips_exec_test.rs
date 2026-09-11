@@ -1226,6 +1226,139 @@ mod tests {
     }
 
     #[test]
+    fn test_eret_in_a_not_taken_branch_slot_does_not_hijack_epc() {
+        // ERET has no delay slot, but it can BE one. A not-taken branch routes
+        // its slot through `branch_delay(pc+8)` so a fault there still reports
+        // EPC=branch/BD=1 — which leaves `in_delay_slot` set and
+        // `delay_slot_target` pointing past the branch. If ERET doesn't clear
+        // the flag, `handle_exec_complete` jumps to that stale target instead
+        // of EPC, hijacking the first instruction at the return address.
+        let (mut exec, _) = create_executor();
+
+        exec.core.cp0_epc = 0xFFFF_FFFF_BFC0_0100;
+        exec.core.cp0_status = 0x02; // EXL
+        exec.core.pc = 0xFFFF_FFFF_BFC0_0200;
+
+        // Stage exactly what a not-taken branch leaves behind.
+        exec.core.in_delay_slot = true;
+        exec.core.delay_slot_target = 0xFFFF_FFFF_DEAD_BEEF;
+
+        let eret_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x18;
+        assert_eq!(exec.exec(eret_instr), EXEC_COMPLETE);
+
+        assert_eq!(exec.core.pc, 0xFFFF_FFFF_BFC0_0100,
+            "ERET must land on EPC, not the stale delay_slot_target");
+        assert!(!exec.core.in_delay_slot,
+            "ERET must clear in_delay_slot, or the next handle_exec_complete jumps to the stale target");
+    }
+
+    /// `WAIT` **completes**: the MIPS spec stalls the processor *after* the
+    /// instruction graduates, so an interrupt taken during the stall reports
+    /// `EPC = WAIT + 4` and `ERET` resumes at the *following* instruction.
+    ///
+    /// This matters for IRIX's idle path: `R4Kasm.s`'s `wait_for_interrupt`
+    /// is `mtc0 a1,C0_SR; c0 C0_WAIT; NOP_0_4; j ra` — the function is meant
+    /// to RETURN once an interrupt has been taken. An implementation that
+    /// left PC on the WAIT (e.g. returning EXEC_RETRY) would re-execute it
+    /// forever and never reach the `j ra`.
+    ///
+    /// WAIT is also the only ISA-level difference between the R4400 and
+    /// R5000 profiles on an IRIX 6.5 boot — the R4400 build idles in a plain
+    /// C spin loop instead (`machdep.c`'s `#else` arm).
+    #[test]
+    fn test_wait_completes_and_advances_pc() {
+        let (mut exec, _) = create_executor();
+
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        exec.core.pc = pc;
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(wait_instr, 0x4200_0020,
+            "encoding sanity: the word IRIX's wait_for_interrupt_fix_loc executes");
+
+        // Interrupts enabled and one already pending, so the stall ends
+        // immediately and we observe the completed PC.
+        exec.core.cp0_status |= crate::mips_core::STATUS_IE;
+        exec.core.cp0_status &= !(crate::mips_core::STATUS_EXL | crate::mips_core::STATUS_ERL);
+        exec.core.cp0_status |= crate::mips_core::CAUSE_IP2;
+        exec.core.hot.interrupts.store(crate::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, pc + 4,
+            "WAIT graduates — PC must advance so the following `j ra` is reachable");
+    }
+
+    /// A WAIT that can never be released — `Status.IE` clear, or `EXL`/`ERL`
+    /// set — must NOT graduate. It returns `EXEC_RETRY` with PC still on the
+    /// instruction, so the guest correctly never progresses (matching hardware,
+    /// which hangs) while the CPU thread keeps returning to its run loop, so
+    /// the monitor, debugger and soft-reset check stay responsive. Spinning
+    /// inside the instruction instead would freeze all three.
+    #[test]
+    fn test_wait_with_interrupts_disabled_retries_without_advancing() {
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+
+        // IE clear.
+        let (mut exec, _) = create_executor();
+        exec.core.pc = pc;
+        exec.core.cp0_status &= !crate::mips_core::STATUS_IE;
+        assert_eq!(exec.exec(wait_instr), crate::mips_exec::EXEC_RETRY);
+        assert_eq!(exec.core.pc, pc, "PC must stay on the WAIT");
+
+        // EXL set (IE on, but exception level masks delivery just the same).
+        let (mut exec, _) = create_executor();
+        exec.core.pc = pc;
+        exec.core.cp0_status |= crate::mips_core::STATUS_IE | crate::mips_core::STATUS_EXL;
+        assert_eq!(exec.exec(wait_instr), crate::mips_exec::EXEC_RETRY);
+        assert_eq!(exec.core.pc, pc, "EXL is just as unreleasable as IE=0");
+    }
+
+    /// The stall ends as soon as an enabled, unmasked interrupt is pending —
+    /// the architectural wake. Seeded in `hot.interrupts` the way a device
+    /// thread raises one, so this also pins that `exec_wait` polls the atomic
+    /// rather than only `cp0_cause`.
+    #[test]
+    fn test_wait_wakes_on_a_pending_interrupt() {
+        let (mut exec, _) = create_executor();
+
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        exec.core.pc = pc;
+
+        // Kernel mode, interrupts on, IP2 unmasked — then raise IP2 exactly
+        // like a device would.
+        exec.core.cp0_status |= crate::mips_core::STATUS_IE;
+        exec.core.cp0_status &= !(crate::mips_core::STATUS_EXL | crate::mips_core::STATUS_ERL);
+        exec.core.cp0_status |= crate::mips_core::CAUSE_IP2; // IM bit for IP2 (same bit position)
+        exec.core.hot.interrupts.store(crate::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let before = exec.core.hot.cycles;
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+        assert_eq!(exec.core.pc, pc + 4);
+        // Did not spin forever, and the guest clock is not required to have
+        // moved (the wake condition was already true on the first poll).
+        assert!(exec.core.hot.cycles >= before);
+    }
+
+    /// A soft reset must escape the stall even when interrupts are enabled but
+    /// nothing is pending — otherwise a reset could not break into an idle
+    /// guest.
+    #[test]
+    fn test_wait_breaks_out_on_soft_reset() {
+        let (mut exec, _) = create_executor();
+
+        exec.core.pc = 0xFFFF_FFFF_8000_1000;
+        exec.core.cp0_status |= crate::mips_core::STATUS_IE;
+        exec.core.cp0_status &= !(crate::mips_core::STATUS_EXL | crate::mips_core::STATUS_ERL);
+        // Interrupts enabled, none pending -> would spin; the reset bit is the
+        // only thing that ends it.
+        exec.core.hot.interrupts.store(1u64 << 63, std::sync::atomic::Ordering::Relaxed);
+
+        let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
+    }
+
+    #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();
 
@@ -3183,6 +3316,213 @@ mod tests {
         let instr_movn = make_r(OP_SPECIAL, 1, 2, 3, 0, FUNCT_MOVN);
         assert_eq!(exec.exec(instr_movn), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(3), 0xDEADBEEF);
+    }
+
+    /// `ll stats` must actually count: an LL takes a reservation, a failed SC
+    /// bumps `fail` and the consecutive-failure run, and a success resets the
+    /// run while bumping `ok`.
+    ///
+    /// The `max_run` column is the point of the whole histogram — it answers
+    /// "is a kernel LL/SC loop failing to make progress?", which is the shape
+    /// of "processes sleep forever while everything else runs" (IRIX builds
+    /// every atomic on LL/SC loops, `mutex_bitlock` on `k_flags` included).
+    #[cfg(feature = "llstats")]
+    #[test]
+    fn test_ll_stats_counts_reservations_and_failure_runs() {
+        let (mut exec, mem) = create_executor();
+
+        let addr = 0x1000;
+        mem.set_word(addr, 0x1234_5678);
+        exec.core.write_gpr(1, addr as u64);
+
+        let instr_ll = make_i(OP_LL, 1, 2, 0);
+        let instr_sc = make_i(OP_SC, 1, 2, 0);
+
+        // One LL, then an SC that succeeds.
+        assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE);
+        let key = exec.cache.get_lladdr();
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 1);
+        {
+            let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).expect("LL must have been recorded");
+            assert_eq!(st.ll, 1);
+            assert_eq!(st.ok, 1);
+            assert_eq!(st.fail, 0);
+            assert_eq!(st.max_run, 0, "no failures yet");
+        }
+
+        // Two SCs with no reservation: both fail, building a run of 2.
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        {
+            let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
+            assert_eq!(st.fail, 2);
+            assert_eq!(st.cur_run, 2, "consecutive failures accumulate");
+            assert_eq!(st.max_run, 2, "and are remembered as the worst run");
+        }
+
+        // A fresh LL + successful SC resets the live run but keeps the max.
+        assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE);
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        {
+            let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
+            assert_eq!(st.ll, 2);
+            assert_eq!(st.ok, 2);
+            assert_eq!(st.cur_run, 0, "a success ends the run");
+            assert_eq!(st.max_run, 2, "but max_run is the historical worst");
+        }
+    }
+
+    /// An `LL` with no matching `SC` shows up as *unresolved* — the column
+    /// `ll stats` now sorts on.
+    ///
+    /// This is the signature worth hunting: a thread took a reservation and
+    /// then went to sleep without completing its LL/SC loop. A row with
+    /// `ll == sc_ok` and no failures is a loop working perfectly, which is why
+    /// sorting on `max_run` alone buried the signal behind a thousand healthy
+    /// rows.
+    #[cfg(feature = "llstats")]
+    #[test]
+    fn test_ll_stats_reports_unresolved_reservations() {
+        let (mut exec, mem) = create_executor();
+
+        let addr = 0x1000;
+        mem.set_word(addr, 0x1234_5678);
+        exec.core.write_gpr(1, addr as u64);
+
+        // Two LLs, only one completed by an SC.
+        let instr_ll = make_i(OP_LL, 1, 2, 0);
+        let instr_sc = make_i(OP_SC, 1, 2, 0);
+        assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE);
+        let key = exec.cache.get_lladdr();
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE); // abandoned
+
+        let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
+        assert_eq!(st.ll, 2);
+        assert_eq!(st.ok, 1);
+        assert_eq!(st.fail, 0);
+        assert_eq!(st.ll - (st.ok + st.fail), 1,
+            "one reservation was taken and never resolved by an SC");
+    }
+
+    /// `fetchverify`, interpreter half: the detector must report a cached
+    /// decode that disagrees with memory, and stay silent when it agrees.
+    ///
+    /// Driven through `fetch_verify_interp` directly rather than by rewriting
+    /// memory under a live `step_int`: the harness's `set_word` goes through a
+    /// path that also refreshes the decode slot, so a memory poke does not
+    /// actually produce a stale cache. What matters is the comparison itself —
+    /// that a disagreement stops execution with `pc` on the offending
+    /// instruction, and that agreement costs nothing.
+    ///
+    /// This is the class `jitv2_lockstep` cannot see: lockstep compares the JIT
+    /// against the interpreter, so if both hold the same stale bytes they agree
+    /// and nothing fires. Comparing against memory is the only way to catch it.
+    #[cfg(feature = "fetchverify")]
+    #[test]
+    fn test_fetchverify_interp_catches_stale_decode() {
+        // The jitv2 equivalence harness disables the detector process-wide (its
+        // MockMemory legitimately holds no instruction words — see
+        // `seeded_executor_over`), `cargo test` runs everything in one process,
+        // and there is no ordering guarantee between them. Rather than fight
+        // over a global, skip when it is off: under `--features fetchverify`
+        // without jitv2 (the combination this test is really for) nothing
+        // disables it and the body always runs.
+        let (mut exec, mem) = create_executor();
+        // Per-core flag, so no other test can turn this off underneath us —
+        // which is exactly what a process-global version did (1-3 spurious
+        // failures per run). See `MipsCore::fetch_verify_on`.
+        exec.core.fetch_verify_on = true;
+
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let phys = 0x1000;
+        let in_memory = make_i(OP_ADDIU, 0, 1, 5);
+        mem.set_word(phys, in_memory);
+
+        let m0 = crate::mips_exec::FETCH_VERIFY_MISMATCHES
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let c0 = crate::mips_exec::FETCH_VERIFY_CHECKS
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Agreement: silent, but still counted as a check.
+        assert_eq!(exec.fetch_verify_interp(pc, in_memory), EXEC_COMPLETE);
+        assert_eq!(
+            crate::mips_exec::FETCH_VERIFY_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
+            m0, "a word matching memory must not be reported");
+        assert!(crate::mips_exec::FETCH_VERIFY_CHECKS
+            .load(std::sync::atomic::Ordering::Relaxed) > c0,
+            "but it must count as a check — a stuck 0 means verification is off");
+
+        // Disagreement: stop, with pc left on the offending instruction.
+        let stale = make_i(OP_ADDIU, 0, 2, 9);
+        assert_ne!(stale, in_memory);
+        assert_eq!(exec.fetch_verify_interp(pc, stale), EXEC_BREAKPOINT,
+            "a cached decode that disagrees with memory must stop, not execute");
+        assert_eq!(exec.core.pc, pc, "and must leave pc on the offending instruction");
+        assert!(crate::mips_exec::FETCH_VERIFY_MISMATCHES
+            .load(std::sync::atomic::Ordering::Relaxed) > m0,
+            "the mismatch counter must record it");
+    }
+
+    /// `SC` succeeds on the **LLbit alone**; `LLAddr` is not part of its
+    /// success condition.
+    ///
+    /// R4000 manual: LLAddr is a diagnostic register, written by LL and
+    /// readable by software. MAME's `r4000.cpp` agrees exactly — `case 0x38:
+    /// // SC` tests `m_ll_active` only, and writes `m_cp0[CP0_LLAddr]` at LL
+    /// time purely so the guest can read it back.
+    ///
+    /// This used to compare `phys_addr` against `LLAddr` and fail SC on a
+    /// mismatch, which can only ever make SC fail where hardware succeeds —
+    /// LLAddr is a single global register while the LLbit is the real
+    /// reservation. It matters because IRIX builds every kernel atomic on
+    /// LL/SC loops (`atomic_ops.h`), including the `mutex_bitlock` on
+    /// `k_flags` that `kthread.h` says guards "all locking in the sync
+    /// routines" — i.e. sleep and wakeup.
+    #[test]
+    fn test_sc_succeeds_on_llbit_alone_ignoring_lladdr() {
+        let (mut exec, mem) = create_executor();
+
+        let addr = 0x1000;
+        mem.set_word(addr, 0x1234_5678);
+        exec.core.write_gpr(1, addr as u64);
+
+        let instr_ll = make_i(OP_LL, 1, 2, 0);
+        assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE);
+        assert!(exec.cache.get_llbit());
+
+        // Point LLAddr somewhere else entirely, leaving the LLbit set. On
+        // hardware the reservation is the LLbit, so the SC must still succeed.
+        exec.cache.set_lladdr(0x0BAD_BEEF);
+
+        exec.core.write_gpr(2, 0xDEAD_BEEF);
+        let instr_sc = make_i(OP_SC, 1, 2, 0);
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 1,
+            "SC must succeed on the LLbit alone — LLAddr is diagnostic, not a gate");
+        assert_eq!(mem.get_word(addr), 0xDEAD_BEEF, "and the store must actually land");
+        assert!(!exec.cache.get_llbit(), "a successful SC clears the reservation");
+    }
+
+    /// The other half: SC must still FAIL when the LLbit is clear (an
+    /// intervening exception/ERET, or no LL at all). Guards against "fixing"
+    /// the LLAddr check by making SC unconditionally succeed.
+    #[test]
+    fn test_sc_fails_when_llbit_is_clear() {
+        let (mut exec, mem) = create_executor();
+
+        let addr = 0x1000;
+        mem.set_word(addr, 0x1234_5678);
+        exec.core.write_gpr(1, addr as u64);
+        exec.core.write_gpr(2, 0xDEAD_BEEF);
+
+        // No LL at all: the reservation was never taken.
+        assert!(!exec.cache.get_llbit());
+        let instr_sc = make_i(OP_SC, 1, 2, 0);
+        assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
+        assert_eq!(exec.core.read_gpr(2), 0, "SC with no reservation must fail");
+        assert_eq!(mem.get_word(addr), 0x1234_5678, "and must not store");
     }
 
     #[test]

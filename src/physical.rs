@@ -111,6 +111,25 @@ impl BusDevice for AliasBus {
     fn write32(&self, addr: u32, val: u32) -> u32 { unsafe { (*self.target).write32(addr.wrapping_add(self.offset), val) } }
     fn read64(&self, addr: u32) -> BusRead64  { unsafe { (*self.target).read64(addr.wrapping_add(self.offset)) } }
     fn write64(&self, addr: u32, val: u64) -> u32 { unsafe { (*self.target).write64(addr.wrapping_add(self.offset), val) } }
+
+    /// Forward the generation counter lookup too — an alias is the same
+    /// physical memory, so it must resolve to the same counter.
+    ///
+    /// Without this the trait default returns null, and `PhysicalCodePage::
+    /// claim` maps a null `gen_ptr` onto the shared `NEVER_COMPILABLE_GEN`
+    /// (initialised to 0, never bumped). A page reached through the alias then
+    /// reads `gen=0` forever: the JIT compiles it, the guest rewrites it via the
+    /// real address, no invalidation is ever observed, and stale compiled code
+    /// keeps running. Seen live as `j2 pcp` reporting `pfn=0 gen=0 entry_gen=0`
+    /// on the TLB refill vector page after the kernel had patched it many times.
+    ///
+    /// This is the bus-path twin of the ppmem-window bug fixed in
+    /// `PpMemSpace::map_alias` — both had to be wrong for the symptom to appear
+    /// in every build, and fixing only one leaves the other configuration broken.
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+        unsafe { (*self.target).gen_ptr(addr.wrapping_add(self.offset)) }
+    }
 }
 
 /// CPU bus error sink: reports to MC then returns 0/Ready so the CPU doesn't also take
@@ -1128,6 +1147,73 @@ mod ppmem_tests {
                 );
             }
         }
+    }
+
+    /// The low-512KB alias must resolve to the SAME generation counter as
+    /// LOMEM — through the ppmem window AND through the bus.
+    ///
+    /// Two independent bugs had to be fixed for this to hold, one per path:
+    ///
+    /// * **window**: `PpMemSpace::map_alias` skipped mapping the alias's gen
+    ///   range whenever it was below host granularity, and 512KB of data needs
+    ///   only 1KB of counters. Its justification ("an alias is the same physical
+    ///   pages, hence the same counters") is true of DATA — one mmap, two views
+    ///   — but false of the gen window, a separate parallel mapping addressed by
+    ///   a pure shift.
+    /// * **bus**: `AliasBus` forwarded all eight read/write methods but not
+    ///   `gen_ptr`, so it fell through to the trait default (null). A null
+    ///   `gen_ptr` makes `PhysicalCodePage::claim` use the shared
+    ///   `NEVER_COMPILABLE_GEN`, which is initialised to 0 and never bumped.
+    ///
+    /// Either one alone produces the same live symptom: `j2 pcp` reporting
+    /// `pfn=0 gen=0 entry_gen=0` for the TLB refill vector page after the kernel
+    /// has patched it repeatedly, because the JIT tracks the page by one address
+    /// while the writes bump the counter for the other. The compiled code is
+    /// then never invalidated — caught by the `fetchverify` detector as
+    /// "STALE COMPILED CODE" at physical 0x48.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn low_alias_gen_counter_agrees_with_lomem_on_both_paths() {
+        // Exercise `AliasBus` directly — constructing a whole `Physical` needs
+        // ten collaborators, and the unit under test is the forwarding itself.
+        struct GenBank { ctr: std::sync::atomic::AtomicU64, base: u32 }
+        impl BusDevice for GenBank {
+            fn read8(&self, _a: u32) -> BusRead8 { BusRead8::ok(0) }
+            fn write8(&self, _a: u32, _v: u8) -> u32 { BUS_OK }
+            fn read16(&self, _a: u32) -> BusRead16 { BusRead16::ok(0) }
+            fn write16(&self, _a: u32, _v: u16) -> u32 { BUS_OK }
+            fn read32(&self, _a: u32) -> BusRead32 { BusRead32::ok(0) }
+            fn write32(&self, _a: u32, _v: u32) -> u32 { BUS_OK }
+            fn read64(&self, _a: u32) -> BusRead64 { BusRead64::ok(0) }
+            fn write64(&self, _a: u32, _v: u64) -> u32 { BUS_OK }
+            #[cfg(feature = "jitv2")]
+            fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
+                // Only the page at `base` has a counter — anything else is a
+                // different page and must NOT resolve here.
+                if addr & !0xFFF == self.base { &self.ctr as *const _ } else { std::ptr::null() }
+            }
+        }
+
+        let target = GenBank { ctr: std::sync::atomic::AtomicU64::new(0), base: LOMEM_BASE };
+        let target_ptr: *const dyn BusDevice = &target;
+        // The real wiring: alias at physical 0 forwards by +LOMEM_BASE.
+        let alias = AliasBus::new(target_ptr, LOMEM_BASE);
+
+        let via_alias = alias.gen_ptr(ALIAS_BASE);
+        let via_direct = target.gen_ptr(LOMEM_BASE);
+
+        assert!(!via_alias.is_null(),
+            "AliasBus must forward gen_ptr — the trait default returns null, and a null \
+             gen_ptr sends the page to NEVER_COMPILABLE_GEN (always 0), so stale JIT code \
+             is never invalidated");
+        assert_eq!(via_alias, via_direct,
+            "the alias and the real address must resolve to ONE counter");
+
+        // And it must still translate, not just return something non-null: a
+        // page one past the alias base maps to LOMEM_BASE + 0x1000, which this
+        // target deliberately has no counter for.
+        assert!(alias.gen_ptr(ALIAS_BASE + 0x1000).is_null(),
+            "forwarding must apply the offset, not blanket-return the first counter");
     }
 
     /// The bitmap must never claim a region that contains MMIO — otherwise the

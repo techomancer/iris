@@ -76,6 +76,16 @@ family (Cause/Flag handling, findings 3-4).
 None of this affects IRIX, which is why it has stayed this way: nothing in the
 system relies on the FP-assist path.
 
+The other five — `fpu/vec_arith_single`, `fpu/vec_arith_double`, `fpu/vec_sqrt`,
+`fpu/cvt_s_d_rounds`, `fpu/cvt_out_of_range` — are a **different** gap and were
+passing at the 2026-08-19 measurement. In all five the computed *result* is
+correct and only the FCSR flag bits are wrong (missing Inexact, or missing
+Invalid on an out-of-range finite conversion). Cause: FPU flags are computed
+from bit patterns rather than read from the host FPU (so both engines can agree
+exactly), and Inexact/Overflow are deliberately not computed for ordinary
+arithmetic. See `rules/jitv2/fpu-flags-are-computed-not-read.md` — which five
+source comments referenced but which did not exist until it was written up.
+
 ## `cpu-tests/docs/status.md` is stale — do not use it as the baseline
 
 That file's results table is dated **2026-08-19** and reports

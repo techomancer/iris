@@ -267,6 +267,17 @@ mod tests {
     /// `MockMemory` — used by `run_interpreter_page` to pass
     /// `MockMemory::new_not_compilable()` (see its doc comment).
     fn seeded_executor_over(mem: MockMemory, gpr: [u64; 32], pc: u64) -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
+        // This harness is a legitimate exception to the `fetchverify`
+        // stale-code detector: it compiles a region from an in-memory page
+        // array and then runs the compiled function against a `MockMemory`
+        // that was never populated with the *instruction* words (compiled code
+        // has them baked in, so no test ever needed to write them — only
+        // `mem_init` data is stored). Memory therefore reads back as zeros
+        // where the code is, and the detector correctly flags every
+        // instruction as stale: "now in memory: 00000000 nop".
+        //
+        // Disabled here rather than weakening the check, since the check is
+        // right and the harness is the unusual one.
         let mem = Arc::new(mem);
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
@@ -276,6 +287,20 @@ mod tests {
         exec.core.gpr[0] = 0;
         exec.core.pc = pc;
         exec.core.hot.interrupts.store(0, std::sync::atomic::Ordering::Relaxed);
+        // `fetchverify` off for this executor only. This harness is a genuine
+        // exception to the stale-code detector: it compiles a region from an
+        // in-memory page array and then runs the compiled function against a
+        // `MockMemory` that was never given the *instruction* words (compiled
+        // code has them baked in; only `mem_init` data is stored). Memory
+        // therefore reads back as zeros where the code is, and the detector
+        // correctly reports every instruction as stale.
+        //
+        // Per-core, not a global: a process-wide switch raced across
+        // concurrently-constructed executors and produced 1-3 spurious
+        // failures per `cargo test` run (a mutex made it worse). See
+        // `MipsCore::fetch_verify_on`.
+        #[cfg(feature = "fetchverify")]
+        { exec.core.fetch_verify_on = false; }
         // no_jitv2 (MockMemory::new_not_compilable's doc comment): pre-claim
         // pc's own physical page and denylist every offset on it right here,
         // in the test setup, rather than relying on gen_ptr returning null
@@ -3203,6 +3228,68 @@ mod tests {
         assert_eq!(jit, interp, "JIT and interpreter diverged: entry_word's fault on its 2nd (internal-back-edge) pass must match the interpreter exactly");
         assert_eq!(jit.cp0_epc, pc, "EPC must be entry_word's own address on this, its 2nd (internal-back-edge) visit");
         assert_eq!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "BD must be clear -- entry_word was reached via an ordinary internal branch edge on this pass, never a delay slot");
+    }
+
+    /// `j2 entrypre on`: the entry word samples interrupts too, and its bail
+    /// must leave `pc` AND `in_delay_slot`/`delay_slot_target` exactly as the
+    /// dispatching `step_jit` set them.
+    ///
+    /// The "touches neither" part is the whole point, and the reason the first
+    /// attempt at this feature panicked IRIX at "tlbmiss: invalid kptbl entry"
+    /// seconds into kernel start: it routed external dispatches through the
+    /// entry word's *ordinary* block, which unconditionally stores
+    /// `in_delay_slot = false` (sound only for internal edges), destroying an
+    /// armed foreign delay-slot transfer. So this test seeds a delay-slot
+    /// arrival and checks it survives.
+    #[test]
+    fn entrypre_bail_preserves_pc_and_delay_slot_state() {
+        // Held for the whole test: the toggle is a process-global every
+        // concurrent compile reads (see ENTRY_PREAMBLE_TEST_LOCK).
+        let _lock = crate::jitv2::ENTRY_PREAMBLE_TEST_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let prev = crate::jitv2::entry_preamble_forced();
+        crate::jitv2::set_entry_preamble_forced(true);
+
+        let word: u16 = 10;
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        page_words[word as usize] = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 5); // ADDIU r1,r1,5
+
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, word, PAGE_A_BASE as u32, 1);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, word, true, true)
+            .expect("single-instruction region must compile");
+
+        let pc = PAGE_A_BASE + (word as u64) * 4;
+        let (exec, _mem) = seeded_executor([0u64; 32], pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+
+        // Arrive as a FOREIGN DELAY SLOT with an interrupt already pending —
+        // the exact combination the broken first implementation corrupted.
+        let target = PAGE_A_BASE + 0x40;
+        exec.core.in_delay_slot = true;
+        exec.core.delay_slot_target = target;
+        exec.core.hot.interrupts.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let r1_before = exec.core.gpr[1];
+        let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+
+        assert_eq!(status, crate::mips_exec::EXEC_FALLBACK,
+            "a pending interrupt at an external entry must bail to the interpreter");
+        assert_eq!(exec.core.gpr[1], r1_before,
+            "the entry instruction's semantics must NOT have run");
+        assert_eq!(exec.core.pc, pc,
+            "pc must be untouched so step_int re-dispatches this exact word");
+        assert!(exec.core.in_delay_slot,
+            "an armed foreign delay-slot transfer must survive the bail");
+        assert_eq!(exec.core.delay_slot_target, target,
+            "and so must its target");
+
+        crate::jitv2::set_entry_preamble_forced(prev);
     }
 
     #[test]

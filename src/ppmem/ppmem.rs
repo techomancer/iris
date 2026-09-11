@@ -857,27 +857,54 @@ impl MappedMemory for PpMemSpace {
             self.space
                 .map(offset as usize, size as usize, b, 0, Prot::ReadWrite)?;
         }
-        // Alias the counters too, when the alias is big enough to cover whole
-        // granules on the gen side. A 512KB alias maps 1KB of counters, which
-        // is below host granularity, so its pages keep whatever the enclosing
-        // region already mapped — harmless, since an alias is by definition the
-        // same physical pages as the region it mirrors, hence the same
-        // counters.
+        // Alias the counters too — this is NOT optional.
+        //
+        // An earlier version skipped the gen mapping whenever the alias's gen
+        // range was below host granularity, reasoning that "an alias is by
+        // definition the same physical pages as the region it mirrors, hence
+        // the same counters". That holds for DATA — one object, two views of
+        // the same mmap — but **not** for the generation window, which is a
+        // separate parallel mapping addressed by a pure shift
+        // (`gen_window_base() + (p >> 12)`, no bank lookup, no masking). Two
+        // addresses aliasing one page therefore index two *different* counters
+        // unless the alias's gen range is explicitly mapped onto the same gen
+        // object.
+        //
+        // The low-512KB alias is exactly that case: 512KB of data needs only
+        // 1KB of counters, below the 4KB host granularity, so the mapping was
+        // silently skipped. Live consequence: the JIT compiled the TLB refill
+        // vector page tracking it as pfn 0 (reading `gen_base + 0`) while the
+        // kernel patched it through LOMEM (bumping `gen_base + 0x8000`), so no
+        // invalidation was ever observed and stale compiled code kept running.
+        // Seen as `j2 pcp` reporting `pfn=0 gen=0 entry_gen=0` on a page that
+        // had been rewritten many times.
+        //
+        // The fix: round the gen length up to one granule. An alias always maps
+        // a bank's *leading* `size` bytes from object offset 0, so rounding up
+        // can only ever pull in gen pages that still belong to this same bank —
+        // it never reaches another bank's counters.
         #[cfg(feature = "jitv2")]
         {
             let gen_off = offset / GEN_RATIO;
             let gen_len = size / GEN_RATIO;
             let gran = super::map::granularity() as u64;
-            if gen_len >= gran && gen_off % gran == 0 && gen_len % gran == 0 {
+            let gen_len_mapped = super::map::align_up(gen_len as usize) as u64;
+            let gen_bank_len = self.gen_banks[bank].len() as u64;
+            if gen_off % gran == 0 && gen_len_mapped <= gen_bank_len {
                 unsafe {
                     self.gen_space.map(
                         gen_off as usize,
-                        gen_len as usize,
+                        gen_len_mapped as usize,
                         &self.gen_banks[bank],
                         0,
                         Prot::ReadWrite,
                     )?;
                 }
+            } else {
+                debug_assert!(false,
+                    "ppmem: alias gen range [{gen_off:#x}, +{gen_len_mapped:#x}) not mappable \
+                     (gran {gran:#x}, gen bank len {gen_bank_len:#x}) — the alias would silently \
+                     get its own generation counters and stale JIT code would never be invalidated");
             }
         }
         let st = unsafe { &mut *self.state.get() };
@@ -1276,6 +1303,66 @@ mod tests {
                 "low alias write not visible at LOMEM"
             );
         }
+    }
+
+    /// The low-512KB alias and LOMEM must resolve to the SAME generation
+    /// counter — they are the same physical pages.
+    ///
+    /// `gen_window_base() + (p >> 12)` is documented as "a pure shift off the
+    /// physical address, no bank lookup, no masking", which means two addresses
+    /// aliasing one page index *different* counters unless the alias's gen
+    /// range is explicitly mapped onto the same object. `map_alias` only does
+    /// that when the gen range meets host granularity, and the low-512KB alias
+    /// needs just 1KB of counters (512KB / GEN_RATIO = 1024 B < 4096), so the
+    /// mapping is skipped — the code says so itself, calling it "harmless,
+    /// since an alias is by definition the same physical pages ... hence the
+    /// same counters". That reasoning holds for DATA (one mmap, two views) but
+    /// not for the gen window, which is a separate parallel mapping.
+    ///
+    /// Consequence when this is wrong: the JIT compiles a page tracked by one
+    /// address, the guest rewrites it through the other, no bump is seen on the
+    /// tracked address, and the stale compilation is never invalidated.
+    /// Observed live as `j2 pcp` reporting `pfn=0 gen=0 entry_gen=0` for the
+    /// TLB refill vector page after the kernel had patched it repeatedly, with
+    /// the `fetchverify` detector then reporting stale compiled code there.
+    #[cfg(feature = "jitv2")]
+    #[test]
+    fn low_alias_and_lomem_share_generation_counters() {
+        let (space, _banks) = PpMemSpace::with_bank_sizes(&[8]).unwrap();
+        space.map_bank(0, 0x0800_0000, 8 * MB as u64, 8 * MB as u64).unwrap();
+        space.map_alias(0, 0, 512 * 1024).unwrap();
+
+        // Same physical page reached two ways; assert the DATA aliasing first
+        // so a failure below is unambiguously about the counters.
+        unsafe {
+            let w = space.window_base();
+            *(w.add(0x0800_0000) as *mut u32) = 0xA11A_5000;
+            assert_eq!(*(w.add(0) as *const u32), 0xA11A_5000,
+                "setup: the alias must mirror LOMEM's data");
+        }
+
+        // Compare BEHAVIOUR, not pointer identity: the two are different window
+        // offsets that must be backed by the same physical page, so their
+        // addresses legitimately differ while their contents must not.
+        let genbase = space.gen_window_base();
+        let alias_ctr = unsafe { &*genbase.add(0) };
+        let lomem_ctr = unsafe { &*genbase.add(0x0800_0000 >> 12) };
+
+        let a0 = alias_ctr.load(Ordering::Relaxed);
+        let l0 = lomem_ctr.load(Ordering::Relaxed);
+
+        // A bump recorded at LOMEM's index must be visible at the alias's, and
+        // vice versa — they are one counter for one physical page.
+        lomem_ctr.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(alias_ctr.load(Ordering::Relaxed), l0 + 1,
+            "a bump through LOMEM must be visible via the alias (alias was {a0}). \
+             If this fails, `map_alias` did not map the alias's gen range onto the \
+             bank's gen object, so the JIT tracking this page by one address never \
+             sees writes made through the other and stale compiled code survives.");
+
+        alias_ctr.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(lomem_ctr.load(Ordering::Relaxed), l0 + 2,
+            "and a bump through the alias must be visible at LOMEM");
     }
 
     #[cfg(feature = "jitv2")]

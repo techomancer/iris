@@ -561,6 +561,36 @@ pub struct MipsCore {
     /// panics if ever reached without `install_jit_hooks`.
     #[cfg(all(feature = "jitv2", feature = "developer"))]
     pub dev_trace_bp_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u32, u32) -> u32,
+    /// `fetchverify`: per-CPU enable for the stale-code detector.
+    ///
+    /// **Per-core, deliberately not a process-global.** A global was tried and
+    /// raced badly: the jitv2 equivalence harness must disable the detector
+    /// (its `MockMemory` legitimately holds no instruction words), `cargo test`
+    /// runs everything in one process, and executors are constructed
+    /// concurrently — so one test's "off" reached another test's executor and
+    /// vice versa, producing 1-3 spurious `STALE COMPILED CODE` failures per
+    /// run. Adding a mutex made it worse by widening the window. Per-core
+    /// state removes the interference by construction.
+    #[cfg(feature = "fetchverify")]
+    pub fetch_verify_on: bool,
+    /// `fetchverify`: stale-code detector. Compiled code calls this before
+    /// every instruction's semantics with that instruction's VA and the
+    /// instruction word the compiler **baked in as a constant**. The callback
+    /// re-reads the word at `va` and reports a mismatch.
+    ///
+    /// The point is to catch what `jitv2_lockstep` structurally cannot.
+    /// Lockstep compares the JIT against the interpreter; if both are running
+    /// the same *stale* bytes they agree perfectly and nothing fires. This
+    /// compares compiled code against memory itself, so code that was
+    /// invalidated after compilation — a page rewritten without a generation
+    /// bump, a write that retired inside the cache, a mis-addressed CACHE op —
+    /// is caught at the instruction that would actually execute it.
+    ///
+    /// Returns `EXEC_BREAKPOINT` on a mismatch (compiled code bails to its
+    /// exit with that status, `core.pc` left at the offending instruction so
+    /// the monitor can inspect it), else `EXEC_COMPLETE`.
+    #[cfg(all(feature = "jitv2", feature = "fetchverify"))]
+    pub fetch_verify_fn: unsafe extern "C" fn(*mut core::ffi::c_void, u64, u32) -> u32,
     /// Reprogram the host FPU rounding mode, mirroring
     /// `MipsCore::write_fpu_control`'s `platform::set_fpu_mode(rm)` call on
     /// an FCSR (reg 31) write. `rm` is the 2-bit MIPS rounding mode (FCSR
@@ -1075,6 +1105,13 @@ unsafe extern "C" fn jit_hooks_not_installed_kill_entry(_ctx: *mut core::ffi::c_
 unsafe extern "C" fn jit_hooks_not_installed_dev_trace_bp(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _origin: u32) -> u32 {
     crate::mips_exec::EXEC_COMPLETE
 }
+/// No-op sentinel, same reasoning as the dev-hook one above: a bare codegen
+/// unit test that runs a `jit_fn` without `install_jit_hooks` has no executor
+/// to re-read memory through, so verification is simply not performed.
+#[cfg(all(feature = "jitv2", feature = "fetchverify"))]
+unsafe extern "C" fn jit_hooks_not_installed_fetch_verify(_ctx: *mut core::ffi::c_void, _va: u64, _expected: u32) -> u32 {
+    crate::mips_exec::EXEC_COMPLETE
+}
 /// No-op (not a panic) like the dev-hook sentinel: lockstep is pure
 /// verification, and a bare codegen unit test that runs a `jit_fn` without
 /// `install_jit_hooks` has no executor/interpreter to compare against — the
@@ -1191,6 +1228,10 @@ impl MipsCore {
             kill_entry_fn: jit_hooks_not_installed_kill_entry,
             #[cfg(all(feature = "jitv2", feature = "developer"))]
             dev_trace_bp_fn: jit_hooks_not_installed_dev_trace_bp,
+            #[cfg(feature = "fetchverify")]
+            fetch_verify_on: true,
+            #[cfg(all(feature = "jitv2", feature = "fetchverify"))]
+            fetch_verify_fn: jit_hooks_not_installed_fetch_verify,
             #[cfg(feature = "jitv2")]
             #[cfg(feature = "jitv2")]
             fpu_set_mode_fn: jit_hooks_not_installed_fpu_set_mode,

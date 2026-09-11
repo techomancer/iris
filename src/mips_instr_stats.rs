@@ -26,6 +26,11 @@ use crate::mips_isa::*;
 #[repr(u16)]
 pub enum InstrKind {
     Reserved = 0,
+    /// **Unreachable — no encoding classifies here.** A real `nop` is
+    /// `sll $0,$0,0` and classifies as [`InstrKind::Sll`]; `WAIT` used to map
+    /// here and now has its own [`InstrKind::Wait`]. Kept only so the
+    /// discriminants of every variant after it stay stable (`NUM_INSTR_KINDS`
+    /// and the `transmute` in the report path both index by discriminant).
     Nop,
     Sll, Movci, Srl, Sra, Sllv, Srlv, Srav, Jr, Jalr, Movz, Movn,
     Syscall, Break, Sync, Mfhi, Mthi, Mflo, Mtlo,
@@ -42,7 +47,7 @@ pub enum InstrKind {
     Addi, Addiu, Daddi, Daddiu, Slti, Sltiu, Andi, Ori, Xori, Lui,
 
     // COP0
-    Mfc0, Dmfc0, Mtc0, Dmtc0, Tlbr, Tlbwi, Tlbwr, Tlbp, Eret,
+    Mfc0, Dmfc0, Mtc0, Dmtc0, Tlbr, Tlbwi, Tlbwr, Tlbp, Eret, Wait,
 
     // COP1 move/branch
     Mfc1, Dmfc1, Cfc1, Mtc1, Dmtc1, Ctc1, Bc1,
@@ -169,7 +174,7 @@ impl InstrKind {
             Reserved => IsaClass::Reserved,
 
             // COP0 moves + TLB management
-            Mfc0 | Dmfc0 | Mtc0 | Dmtc0 | Tlbr | Tlbwi | Tlbwr | Tlbp => IsaClass::Cop0,
+            Mfc0 | Dmfc0 | Mtc0 | Dmtc0 | Tlbr | Tlbwi | Tlbwr | Tlbp | Wait => IsaClass::Cop0,
 
             // MIPS III: 64-bit integer ops, 64-bit loads/stores, ERET
             Dsllv | Dsrlv | Dsrav | Dmult | Dmultu | Ddiv | Ddivu |
@@ -212,7 +217,7 @@ impl InstrKind {
             Bltz | Bgez | Bltzl | Bgezl | Bltzal | Bgezal | Bltzall | Bgezall
             | J | Jal | Beq | Bne | Blez | Bgtz | Beql | Bnel | Blezl | Bgtzl => InstrCategory::BRANCH,
 
-            Mfc0 | Dmfc0 | Mtc0 | Dmtc0 | Tlbr | Tlbwi | Tlbwr | Tlbp | Eret => InstrCategory::COP0,
+            Mfc0 | Dmfc0 | Mtc0 | Dmtc0 | Tlbr | Tlbwi | Tlbwr | Tlbp | Eret | Wait => InstrCategory::COP0,
 
             Mfc1 | Dmfc1 | Cfc1 | Mtc1 | Dmtc1 | Ctc1 | Bc1
             | Fadd_s | Fsub_s | Fmul_s | Fdiv_s | Fsqrt_s | Fabs_s | Fmov_s | Fneg_s
@@ -354,6 +359,7 @@ impl InstrKind {
             Xori => "xori", Lui => "lui",
             Mfc0 => "mfc0", Dmfc0 => "dmfc0", Mtc0 => "mtc0", Dmtc0 => "dmtc0",
             Tlbr => "tlbr", Tlbwi => "tlbwi", Tlbwr => "tlbwr", Tlbp => "tlbp", Eret => "eret",
+            Wait => "wait",
             Mfc1 => "mfc1", Dmfc1 => "dmfc1", Cfc1 => "cfc1",
             Mtc1 => "mtc1", Dmtc1 => "dmtc1", Ctc1 => "ctc1", Bc1 => "bc1",
             Fadd_s => "fadd.s", Fsub_s => "fsub.s", Fmul_s => "fmul.s", Fdiv_s => "fdiv.s",
@@ -433,7 +439,7 @@ pub fn classify_instr(op: u8, rs: u8, rt: u8, funct: u8) -> InstrKind {
             RS_TLB => match funct as u32 {
                 FUNCT_TLBR => Tlbr, FUNCT_TLBWI => Tlbwi, FUNCT_TLBWR => Tlbwr,
                 FUNCT_TLBP => Tlbp, FUNCT_ERET => Eret,
-                FUNCT_WAIT => Nop,
+                FUNCT_WAIT => Wait,
                 _ => Reserved,
             },
             _ => Reserved,
@@ -774,6 +780,48 @@ mod tests {
 
         assert_eq!(stats.exec_counts[InstrKind::Addu as usize], 1);
         assert_eq!(stats.decode_counts[InstrKind::Addu as usize], 2);
+    }
+
+    /// `WAIT` is its own instruction, not a NOP. It used to classify as
+    /// `InstrKind::Nop` — which is doubly wrong: a real `nop` is `sll $0,$0,0`
+    /// and classifies as `Sll`, so `Nop` in a report meant "a WAIT executed"
+    /// and nothing else. That cost real debugging time: an r5k-vs-r4k
+    /// `instr_used.txt` diff showed exactly one line of difference, `nop`, and
+    /// reading it as "r4k doesn't count nops" instead of "only r5k executes
+    /// WAIT" sent the investigation the wrong way. IRIX only uses `WAIT` on
+    /// the R4600/R5000 idle path (`R4Kasm.s`'s `#ifdef R4600`
+    /// `wait_for_interrupt`); the R4400 build idles in a plain C spin loop.
+    #[test]
+    fn wait_is_classified_as_wait_not_nop() {
+        use crate::mips_isa::*;
+        // COP0, rs=RS_TLB(0x10), funct=FUNCT_WAIT(0x20) -> 0x42000020
+        let raw = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
+        assert_eq!(raw, 0x4200_0020, "encoding sanity: this is the word IRIX's wait_for_interrupt_fix_loc executes");
+        let kind = classify_instr(
+            ((raw >> 26) & 0x3F) as u8,
+            ((raw >> 21) & 0x1F) as u8,
+            ((raw >> 16) & 0x1F) as u8,
+            (raw & 0x3F) as u8,
+        );
+        assert_eq!(kind, InstrKind::Wait);
+        assert_eq!(kind.name(), "wait");
+        assert_eq!(kind.isa_class(), IsaClass::Cop0, "COP0-encoded, so it belongs in the COP0 class");
+
+        // And a real nop must NOT be InstrKind::Nop either — it is sll $0,$0,0.
+        let nop = 0u32;
+        let nop_kind = classify_instr(0, 0, 0, 0);
+        assert_eq!(nop, 0);
+        assert_eq!(nop_kind, InstrKind::Sll, "a real nop is sll $0,$0,0");
+    }
+
+    #[cfg(feature = "instr_stats")]
+    #[test]
+    fn used_list_and_counts_render() {
+        let mut stats = InstrStats::default();
+        let (op, rs, rt, funct) = fields(r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU));
+        stats.record(op, rs, rt, funct, r_type(OP_SPECIAL, 1, 2, 3, 0, FUNCT_ADDU));
+        stats.record_decode(op, rs, rt, funct);
+        stats.record_decode(op, rs, rt, funct);
 
         let mut used = Vec::new();
         stats.write_used_list(&mut used).unwrap();

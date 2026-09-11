@@ -25,6 +25,19 @@ pub const MIPS_LOG_TLB:  u32 = 0x0002; // TLB read/write/probe
 pub const MIPS_LOG_MEM:  u32 = 0x0004; // uncached memory accesses
 pub const MIPS_LOG_FPU:  u32 = 0x0008; // FP compare/condmove/convert operand+result trace
 
+/// Opt-in gate for the `developerx` Coprocessor-Unusable break (see the three
+/// `handle_exception*` wrappers). Off unless `IRIS_BREAK_CPU=1`.
+///
+/// Must be opt-in: a CpU exception is a perfectly ordinary event — lazy FPU
+/// enable raises one on purpose every time a process first touches the FPU —
+/// so breaking on all of them unconditionally stops the machine constantly and
+/// breaks any test that exercises the CU0/CU1 gates on purpose.
+#[cfg(feature = "developerx")]
+fn cpu_unusable_break_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IRIS_BREAK_CPU").map(|v| v == "1").unwrap_or(false))
+}
+
 #[cfg(feature = "developer")]
 #[inline(always)]
 fn mips_log(bit: u32) -> bool {
@@ -1065,6 +1078,63 @@ impl MipsCpuConfig {
 }
 
 /// MIPS Execution Engine - combines CPU core with memory interface and TLB
+/// Slot count for the `ll stats` table. Direct-mapped on the low bits of
+/// `LLAddr`, so this is a plain power of two; 1024 rows is far more than the
+/// handful of kernel lock addresses that matter and still only ~40 KB.
+#[cfg(feature = "llstats")]
+pub const LL_STATS_SLOTS: usize = 1024;
+
+/// Direct-mapped lookup into the `ll stats` table.
+///
+/// No hashing and no allocation — this runs on every LL and every SC, in
+/// builds that include `lightning`. On a collision (two `LLAddr`s landing on
+/// one slot) the slot is reset and re-keyed to the newcomer, so a row always
+/// describes exactly one address rather than silently summing two. Collisions
+/// therefore lose history but never fabricate it, which is the right trade for
+/// a diagnostic whose whole job is "is THIS address stuck".
+#[cfg(feature = "llstats")]
+#[inline]
+fn ll_stats_slot(tbl: &mut [LlSiteStats; LL_STATS_SLOTS], key: u32) -> &mut LlSiteStats {
+    let slot = (key as usize) & (LL_STATS_SLOTS - 1);
+    let e = &mut tbl[slot];
+    if e.key != key {
+        *e = LlSiteStats { key, ..Default::default() };
+    }
+    e
+}
+
+/// Read-only slot lookup for tests/inspection: `None` when this address has no
+/// row (never seen, or evicted by a collision).
+#[cfg(feature = "llstats")]
+pub fn ll_stats_lookup(tbl: &[LlSiteStats; LL_STATS_SLOTS], key: u32) -> Option<&LlSiteStats> {
+    let e = &tbl[(key as usize) & (LL_STATS_SLOTS - 1)];
+    if e.key == key { Some(e) } else { None }
+}
+
+/// One `ll stats` row — see `MipsExecutor::ll_stats`.
+#[cfg(feature = "llstats")]
+#[derive(Default, Clone, Copy)]
+pub struct LlSiteStats {
+    /// `LLAddr` (phys >> 4) this row describes; `u32::MAX` when the slot has
+    /// never been used. Stored because the table is direct-mapped and two
+    /// addresses can collide onto one slot — on a collision the slot is reset
+    /// and re-keyed, so a row always describes exactly one address.
+    pub key: u32,
+    /// `LL` executed here, taking a reservation.
+    pub ll: u64,
+    /// `SC` here found the LLbit set and stored.
+    pub ok: u64,
+    /// `SC` here found the LLbit already clear (an intervening exception,
+    /// ERET, or coherent invalidation) and failed.
+    pub fail: u64,
+    /// Consecutive failures since the last success — the live run length.
+    pub cur_run: u64,
+    /// Longest run of consecutive failures ever seen for this address. This
+    /// is the interesting column: a loop that retries a couple of times is
+    /// normal, one stuck in the hundreds is not.
+    pub max_run: u64,
+}
+
 pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
@@ -1088,6 +1158,26 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// dev-only gating.
     #[cfg(feature = "developer")]
     trace_writer: Option<crate::trace::TraceWriter>,
+    /// `ll stats`: per-LL-address retry histogram.
+    ///
+    /// Keyed by the physical address an `LL` reserved (its `LLAddr` value,
+    /// i.e. phys >> 4). For each one: how many times the reservation has been
+    /// established, how many SCs on it succeeded, how many failed, and the
+    /// worst run of consecutive failures seen before one finally succeeded.
+    ///
+    /// Exists to answer a specific question that static reading cannot: is a
+    /// kernel LL/SC loop *failing to make progress*? IRIX builds every atomic
+    /// on LL/SC loops (`atomic_ops.h`), including the `mutex_bitlock` on
+    /// `k_flags` that `kthread.h` says guards "all locking in the sync
+    /// routines" — so an SC that can never land is exactly the shape of
+    /// "processes sleep forever while everything else runs". A high
+    /// `max_consecutive_fail` on one address names the stuck lock; an
+    /// unbounded `fail` with zero `ok` names a loop that never completes.
+    ///
+    /// Developer-only: a HashMap probe per LL/SC is far too heavy for the
+    /// production interpreter path.
+    #[cfg(feature = "llstats")]
+    pub ll_stats: Box<[LlSiteStats; LL_STATS_SLOTS]>,
     #[cfg(feature = "idle-pause")]
     idle_profiler: IdleProfiler,
     #[cfg(feature = "idle-pause")]
@@ -1779,6 +1869,75 @@ unsafe extern "C" fn jit_kill_entry<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_
 /// traceback ends up populated. Diagnostic only.
 #[cfg(all(feature = "jitv2", feature = "developer"))]
 pub static DEV_TRACE_BP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Count of `fetch_verify` checks performed, so `ll`-style "is this actually
+/// verifying?" questions have an answer. A stuck 0 means compiled code never
+/// ran with the hook installed.
+#[cfg(feature = "fetchverify")]
+pub static FETCH_VERIFY_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Count of mismatches found — i.e. compiled code that was about to execute an
+/// instruction word memory no longer holds.
+#[cfg(feature = "fetchverify")]
+pub static FETCH_VERIFY_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+
+/// `fetchverify`: honour `IRIS_NO_FETCH_VERIFY=1` once, at executor
+/// construction, by clearing the per-core flag. Env-only; there is no runtime
+/// global (see `MipsCore::fetch_verify_on` for why).
+#[cfg(feature = "fetchverify")]
+pub fn fetch_verify_env_default() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| !std::env::var("IRIS_NO_FETCH_VERIFY").map(|v| v == "1").unwrap_or(false))
+}
+
+/// `fetchverify`: re-read the instruction word at `va` and compare it against
+/// `expected`, the constant the compiler baked in when it compiled this
+/// instruction. See `MipsCore::fetch_verify_fn`.
+///
+/// Reads through `debug_translate` + the cache's debug fetch path so the check
+/// itself perturbs nothing — no cache fills, no LLbit clears, no exceptions of
+/// its own. A VA that no longer translates is *not* a mismatch (the mapping
+/// legitimately changed, and the next real fetch will fault on its own), so it
+/// is skipped rather than reported.
+#[cfg(all(feature = "jitv2", feature = "fetchverify"))]
+unsafe extern "C" fn jit_fetch_verify<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, expected: u32) -> u32 {
+    let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
+    if !exec.core.fetch_verify_on {
+        return EXEC_COMPLETE;
+    }
+    FETCH_VERIFY_CHECKS.fetch_add(1, Ordering::Relaxed);
+
+    let tr = exec.debug_translate(va);
+    if tr.is_exception() {
+        return EXEC_COMPLETE;
+    }
+    let r = exec.sysad.read32(tr.phys);
+    if !r.is_ok() {
+        return EXEC_COMPLETE;
+    }
+    if r.data != expected {
+        FETCH_VERIFY_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+        let symbols = exec.symbols.lock();
+        let sym = format_pc_symbol(va, &symbols);
+        // Report live `core.pc` and the tracked page alongside the VA. The VA
+        // is *derived* — `emit_word_addr` computes it as
+        // `(core.pc & !0xFFF) + word*4` — so a region dispatched with `core.pc`
+        // on a different page than its snapshot came from reports a wrong
+        // address while `expected` is right, which looks like a coherent
+        // "shift" but is really two unrelated regions. `tracked_pfn` vs
+        // `phys_page` is what tells those apart.
+        let pcp_pfn: i64 = if exec.pcp.is_null() { -1 } else { unsafe { (*exec.pcp).pfn as i64 } };
+        eprintln!(
+            "\n=== STALE COMPILED CODE at {:#018x}{} phys={:#010x} ===\n  compiled-in: {:08x}  {}\n  now in memory: {:08x}  {}\n  live pc={:#018x}  va_page={:#x}  phys_page={:#x}  tracked_pfn={}\n",
+            va, sym, tr.phys,
+            expected, mips_dis::disassemble(expected, va, Some(&symbols)),
+            r.data, mips_dis::disassemble(r.data, va, Some(&symbols)),
+            exec.core.pc, va >> 12, tr.phys >> 12, pcp_pfn);
+        drop(symbols);
+        exec.core.pc = va;
+        return EXEC_BREAKPOINT;
+    }
+    EXEC_COMPLETE
+}
 
 #[cfg(all(feature = "jitv2", feature = "developer"))]
 unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, pc: u64, raw: u32, origin: u32) -> u32 {
@@ -2523,6 +2682,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             traceback: TracebackBuffer::new(),
             #[cfg(feature = "developer")]
             trace_writer: None,
+            #[cfg(feature = "llstats")]
+            ll_stats: Box::new([LlSiteStats { key: u32::MAX, ..Default::default() }; LL_STATS_SLOTS]),
             #[cfg(feature = "idle-pause")]
             idle_profiler: IdleProfiler::default(),
             #[cfg(feature = "idle-pause")]
@@ -2629,6 +2790,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         };
 
         executor.rebind_atomic_ptrs();
+        #[cfg(feature = "fetchverify")]
+        { executor.core.fetch_verify_on = fetch_verify_env_default(); }
         executor.update_translate_fn();
         executor.update_fpr_mode();
 
@@ -2864,6 +3027,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.kill_entry_fn = jit_kill_entry::<T, C>;
         #[cfg(feature = "developer")]
         { self.core.dev_trace_bp_fn = jit_dev_trace_bp::<T, C>; }
+        #[cfg(feature = "fetchverify")]
+        { self.core.fetch_verify_fn = jit_fetch_verify::<T, C>; }
         self.core.fpu_set_mode_fn = jit_fpu_set_mode;
         self.core.fpu_cvt_to_int_fn = jit_cvt_to_int::<T, C>;
         self.core.fpu_cvt_int_to_float_fn = jit_cvt_int_to_float::<T, C>;
@@ -3578,6 +3743,46 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// `fetchverify`, interpreter half: compare the cached decoded word
+    /// against what memory holds at `pc`.
+    ///
+    /// The interpreter caches decoded instructions per I-cache line and only
+    /// re-decodes when `d.flags != 0`, so a cached slot can outlive a change to
+    /// the underlying memory — the same staleness the JIT can have, reached a
+    /// different way. Deliberately checked here rather than inside `fetch`, so
+    /// it sees exactly the word that is about to be dispatched.
+    ///
+    /// Reads via `debug_translate` + a raw bus read so the check perturbs
+    /// nothing. A VA that no longer translates is skipped rather than reported
+    /// (the mapping legitimately changed; the next real fetch will fault).
+    #[cfg(feature = "fetchverify")]
+    pub fn fetch_verify_interp(&mut self, pc: u64, cached: u32) -> ExecStatus {
+        if !self.core.fetch_verify_on {
+            return EXEC_COMPLETE;
+        }
+        FETCH_VERIFY_CHECKS.fetch_add(1, Ordering::Relaxed);
+        let tr = self.debug_translate(pc);
+        if tr.is_exception() {
+            return EXEC_COMPLETE;
+        }
+        let r = self.sysad.read32(tr.phys);
+        if !r.is_ok() || r.data == cached {
+            return EXEC_COMPLETE;
+        }
+        FETCH_VERIFY_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+        let symbols = self.symbols.lock();
+        let sym = format_pc_symbol(pc, &symbols);
+        eprintln!(
+            "\n=== STALE INTERPRETER DECODE at {:#018x}{} phys={:#010x} ===\n  \
+             cached: {:08x}  {}\n  now in memory: {:08x}  {}\n",
+            pc, sym, tr.phys,
+            cached, mips_dis::disassemble(cached, pc, Some(&symbols)),
+            r.data, mips_dis::disassemble(r.data, pc, Some(&symbols)));
+        drop(symbols);
+        self.core.pc = pc;
+        EXEC_BREAKPOINT
+    }
+
     pub fn step_int(&mut self) -> ExecStatus {
         step_preamble!(self);
         let pc = self.core.pc;
@@ -3595,6 +3800,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 }
             }
             let d = unsafe { &*fetch.instr };
+            // `fetchverify`: the interpreter half. `d.raw` is the *cached*
+            // decoded word — `decode_into` only re-runs when `d.flags != 0`,
+            // so a slot can legitimately survive a memory change. Verify it
+            // against memory before dispatching.
+            #[cfg(feature = "fetchverify")]
+            if self.fetch_verify_interp(pc, d.raw) == EXEC_BREAKPOINT {
+                return EXEC_BREAKPOINT;
+            }
             #[cfg(not(feature = "lightning"))]
             self.traceback.push(pc, d.raw, InstrOrigin::Interp);
             self.exec_decoded_int(d)
@@ -3940,6 +4153,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     self.core.pc, epc, self.core.cp0_badvaddr);
                 return EXEC_BREAKPOINT;
             }
+            // Coprocessor Unusable. Worth breaking at the fault site: IRIX's
+            // `VEC_cpfault` panics "kernel used coprocessor" whenever a CpU
+            // arrives with SR_PREVMODE == 0, and it checks that *before*
+            // looking at Cause.CE — so the guest message names no coprocessor,
+            // and by the time it prints, the handler has rewritten Status.
+            // Stopping here preserves the state that actually caused it.
+            if exc_code == EXC_CPU && cpu_unusable_break_enabled() {
+                let ce = (self.core.cp0_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT;
+                eprintln!("COPROCESSOR UNUSABLE (CE={}) at PC={:#018x} EPC={:#018x} Status={:#010x} Cause={:#010x} priv={:?}",
+                    ce, self.core.pc, epc, self.core.cp0_status, self.core.cp0_cause,
+                    self.core.get_privilege_mode());
+                return EXEC_BREAKPOINT;
+            }
             if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
                 eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
                     if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
@@ -4010,6 +4236,23 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     fault_pc, epc, self.core.cp0_badvaddr);
                 return EXEC_BREAKPOINT;
             }
+            // Coprocessor Unusable. Worth breaking at the fault site: IRIX's
+            // `VEC_cpfault` panics "kernel used coprocessor" whenever a CpU
+            // arrives with SR_PREVMODE == 0, and it checks that *before*
+            // looking at Cause.CE — so the guest message names no coprocessor,
+            // and by the time it prints, the handler has rewritten Status.
+            // Stopping here preserves the state that actually caused it.
+            if exc_code == EXC_CPU && cpu_unusable_break_enabled() {
+                let ce = (self.core.cp0_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT;
+                // `fault_pc`, NOT `core.pc`: on this (jitv2) path compiled code
+                // supplies the faulting address explicitly and may not have
+                // materialized `core.pc` yet, so reading the field would report
+                // a stale or unrelated PC.
+                eprintln!("COPROCESSOR UNUSABLE (CE={}) at PC={:#018x} EPC={:#018x} Status={:#010x} Cause={:#010x} priv={:?} [jit]",
+                    ce, fault_pc, epc, self.core.cp0_status, self.core.cp0_cause,
+                    self.core.get_privilege_mode());
+                return EXEC_BREAKPOINT;
+            }
             if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
                 eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
                     if exc_code == EXC_TLBL { "TLBL" } else { "TLBS" },
@@ -4056,6 +4299,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 eprintln!("ADDRESS ERROR ({}) at PC={:#010x} EPC={:#010x} BadVAddr={:#010x}",
                     if exc_code == EXC_ADEL { "ADEL" } else { "ADES" },
                     self.core.pc, epc, self.core.cp0_badvaddr);
+                return EXEC_BREAKPOINT;
+            }
+            // Coprocessor Unusable. Worth breaking at the fault site: IRIX's
+            // `VEC_cpfault` panics "kernel used coprocessor" whenever a CpU
+            // arrives with SR_PREVMODE == 0, and it checks that *before*
+            // looking at Cause.CE — so the guest message names no coprocessor,
+            // and by the time it prints, the handler has rewritten Status.
+            // Stopping here preserves the state that actually caused it.
+            if exc_code == EXC_CPU && cpu_unusable_break_enabled() {
+                let ce = (self.core.cp0_cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT;
+                eprintln!("COPROCESSOR UNUSABLE (CE={}) at PC={:#018x} EPC={:#018x} Status={:#010x} Cause={:#010x} priv={:?}",
+                    ce, self.core.pc, epc, self.core.cp0_status, self.core.cp0_cause,
+                    self.core.get_privilege_mode());
                 return EXEC_BREAKPOINT;
             }
             if (exc_code == EXC_TLBL || exc_code == EXC_TLBS) && (self.core.cp0_badvaddr as u32 == 0xFF800000) {
@@ -6181,6 +6437,37 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
 
     // LL - Load Linked (32-bit)
+    /// `ll stats` bookkeeping: a reservation was just taken at `lladdr`.
+    #[inline]
+    fn ll_stat_ll(&mut self, #[allow(unused_variables)] lladdr: u32) {
+        #[cfg(feature = "llstats")]
+        { ll_stats_slot(&mut self.ll_stats, lladdr).ll += 1; }
+    }
+
+    /// `ll stats` bookkeeping: an `SC` resolved. `ok` distinguishes a store
+    /// that landed from one that found the LLbit already clear.
+    ///
+    /// Keyed by the *current* `LLAddr`, which is the address the live
+    /// reservation was taken on — not the SC's own address. They are normally
+    /// the same; when they are not, attributing to the reservation is what
+    /// makes a stuck loop legible.
+    #[inline]
+    fn ll_stat_sc(&mut self, #[allow(unused_variables)] ok: bool) {
+        #[cfg(feature = "llstats")]
+        {
+            let key = self.cache.get_lladdr();
+            let e = ll_stats_slot(&mut self.ll_stats, key);
+            if ok {
+                e.ok += 1;
+                e.cur_run = 0;
+            } else {
+                e.fail += 1;
+                e.cur_run += 1;
+                if e.cur_run > e.max_run { e.max_run = e.cur_run; }
+            }
+        }
+    }
+
     fn exec_ll(&mut self, d: &DecodedInstr) -> ExecStatus {
         let base = self.core.read_gpr(d.rs as u32);
         let virt_addr = base.wrapping_add(d.immu64());
@@ -6198,6 +6485,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     self.cache.set_lladdr(lladdr);
                     self.core.cp0_lladdr = lladdr;
                     self.cache.set_llbit(true);
+                    self.ll_stat_ll(lladdr);
                 }
                 self.handle_exec_complete()
             }
@@ -6214,6 +6502,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Check the LLBit - if clear, the store fails immediately
         if !self.cache.get_llbit() {
             // Store failed, set rt to 0
+            self.ll_stat_sc(false);
             self.core.write_gpr(rt_reg, 0);
             return self.handle_exec_complete();
         }
@@ -6224,21 +6513,28 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.cache.set_llbit(false);
             return self.finish_status(tr.status);
         }
-        let phys_addr = tr.phys as u64;
-        let ll_addr = (self.cache.get_lladdr() as u64) << 4;
-        if (phys_addr & !0xF) == ll_addr {
-            let value = self.core.read_gpr(rt_reg);
-            let status = self.write_data::<4>(virt_addr, value);
-            if status == EXEC_COMPLETE {
-                self.core.write_gpr(rt_reg, 1);
-                self.cache.set_llbit(false);
-            }
-            self.finish_status(status)
-        } else {
-            self.core.write_gpr(rt_reg, 0);
+
+        // Succeeds on the LLbit ALONE — `LLAddr` is deliberately NOT consulted.
+        //
+        // R4000 manual: LLAddr is a diagnostic register, written by LL and
+        // readable by software, but not part of SC's success condition.
+        // MAME's r4000.cpp agrees exactly: `case 0x38: // SC` tests
+        // `m_ll_active` only, and writes `m_cp0[CP0_LLAddr]` at LL time purely
+        // so the guest can read it back.
+        //
+        // Comparing the address here (as this used to) can only make SC fail
+        // where hardware succeeds: LLAddr is a single global register while
+        // the LLbit is the real reservation, and every architectural reason
+        // for SC to fail — an intervening exception, ERET, or a coherent
+        // invalidation of the line — already clears the LLbit.
+        let value = self.core.read_gpr(rt_reg);
+        let status = self.write_data::<4>(virt_addr, value);
+        if status == EXEC_COMPLETE {
+            self.ll_stat_sc(true);
+            self.core.write_gpr(rt_reg, 1);
             self.cache.set_llbit(false);
-            self.handle_exec_complete()
         }
+        self.finish_status(status)
     }
 
     // LLD - Load Linked Doubleword (64-bit)
@@ -6257,6 +6553,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     self.cache.set_lladdr(lladdr);
                     self.core.cp0_lladdr = lladdr;
                     self.cache.set_llbit(true);
+                    self.ll_stat_ll(lladdr);
                 }
                 self.handle_exec_complete()
             }
@@ -6273,6 +6570,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // Check the LLBit - if clear, the store fails immediately
         if !self.cache.get_llbit() {
             // Store failed, set rt to 0
+            self.ll_stat_sc(false);
             self.core.write_gpr(rt_reg, 0);
             return self.handle_exec_complete();
         }
@@ -6283,23 +6581,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.cache.set_llbit(false);
             return self.finish_status(tr.status);
         }
-        let phys_addr = tr.phys as u64;
-        let ll_addr = (self.cache.get_lladdr() as u64) << 4;
-        if (phys_addr & !0xF) == ll_addr {
-            // Attempt the store
-            let value = self.core.read_gpr(rt_reg);
-            let status = self.write_data::<8>(virt_addr, value);
-            if status == EXEC_COMPLETE {
-                self.core.write_gpr(rt_reg, 1);
-                self.cache.set_llbit(false);
-            }
-            self.finish_status(status)
-        } else {
-            // Store failed (address mismatch), set rt to 0 and clear LLBit
-            self.core.write_gpr(rt_reg, 0);
+        // Succeeds on the LLbit alone — see `exec_sc` for why `LLAddr` is not
+        // consulted (diagnostic register, not part of SC's success condition;
+        // MAME's r4000.cpp tests `m_ll_active` only).
+        let _ = tr;
+        let value = self.core.read_gpr(rt_reg);
+        let status = self.write_data::<8>(virt_addr, value);
+        if status == EXEC_COMPLETE {
+            self.ll_stat_sc(true);
+            self.core.write_gpr(rt_reg, 1);
             self.cache.set_llbit(false);
-            self.handle_exec_complete()
         }
+        self.finish_status(status)
     }
 
     // PREF - Prefetch
@@ -6451,7 +6744,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             FUNCT_TLBWR => self.exec_tlbwr(),
             FUNCT_TLBP => { self.exec_tlbp(); self.handle_exec_complete() }
             FUNCT_ERET => self.exec_eret(), // PC set directly, terminal as-is
-            FUNCT_WAIT => self.handle_exec_complete(), // phi opcode: invalid but not RI on R4000 (NOP)
+            // WAIT (R4600/R5000; the R4000/R4400 have no such instruction —
+            // there it is an unimplemented COP0 function that reads as a
+            // no-op rather than raising RI, which is why this arm is not
+            // model-gated).
+            FUNCT_WAIT => self.exec_wait(),
             _ => {
                 let s = self.reserved_instruction(d);
                 self.handle_exception(s)
@@ -6607,6 +6904,114 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // ERET - Exception Return
     // Returns from exception by restoring PC from EPC or ErrorEPC and clearing exception status
     // Note: ERET does NOT have a delay slot in MIPS III+
+    /// `WAIT` (R4600/R5000): stall until an interrupt is pending.
+    ///
+    /// **The instruction completes.** Per the MIPS spec the processor stalls
+    /// *after* WAIT graduates, so an interrupt taken here reports
+    /// `EPC = WAIT + 4` and `ERET` resumes at the *following* instruction —
+    /// it does not re-execute the WAIT. That matters for IRIX's idle path
+    /// (`R4Kasm.s`'s `wait_for_interrupt`), where the WAIT is followed by
+    /// `NOP_0_4; j ra`: the function is meant to *return* once an interrupt
+    /// has been taken. Leaving PC on the WAIT would make it spin forever and
+    /// never reach the `j ra`.
+    ///
+    /// So: advance PC first (`handle_exec_complete`), then stall here.
+    ///
+    /// ## Why a spin and not a host sleep
+    ///
+    /// `step_cycles!` only runs in `step_preamble!`, i.e. once per dispatch —
+    /// so a stall implemented *inside* this handler has to advance
+    /// `hot.cycles` itself, which it does. Device timing workarounds depend on
+    /// that progress (the SCSI one NetBSD needs in particular) and would stall
+    /// outright if the CPU thread parked on an idle guest. `std::hint::spin_loop`
+    /// keeps it polite to SMT siblings without stopping the clock.
+    ///
+    /// ## Exits
+    ///
+    /// Returns as soon as *any* of:
+    /// - an enabled, unmasked interrupt is pending — the architectural wake;
+    /// - a soft reset is requested (bit 63) — checked because a reset must
+    ///   escape even a guest that executed WAIT with interrupts disabled;
+    ///
+    /// A WAIT that can never be released (`Status.IE` clear, or `EXL`/`ERL`
+    /// set) is handled *before* the PC update instead: see the top of the
+    /// body. It returns `EXEC_RETRY` with PC still on the WAIT, so the guest
+    /// correctly never progresses while the CPU thread keeps returning to its
+    /// run loop.
+    fn exec_wait(&mut self) -> ExecStatus {
+        // Unreleasable WAIT (IE clear, or EXL/ERL set): no interrupt can ever
+        // end this stall. Checked BEFORE the PC update and answered with
+        // EXEC_RETRY, so PC stays on the WAIT and the run loop simply
+        // re-dispatches it. That reproduces the hardware behaviour (a WAIT
+        // with interrupts disabled never completes) while keeping the CPU
+        // thread returning to its loop every iteration, so the monitor, the
+        // debugger and the soft-reset check all stay responsive — none of
+        // which would be true if we spun inside this one instruction.
+        //
+        // IRIX never gets here: `wait_for_interrupt_fix_loc` requires the
+        // `mtc0 a1,C0_SR` that re-enables interrupts to be *adjacent* to the
+        // WAIT, which is what its "must be adjacent to avoid a race with an
+        // interrupt" comment is about.
+        if !self.core.interrupts_enabled() {
+            return EXEC_RETRY;
+        }
+
+        // WAIT graduates: PC moves to the next instruction before the stall.
+        let status = self.handle_exec_complete();
+
+        let stall_start = std::time::Instant::now();
+        let mut issued: u64 = 0;
+        loop {
+            let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
+            if pending & SOFT_RESET_BIT != 0 {
+                break;
+            }
+            let ip = (self.core.cp0_cause | (pending as u32)) & crate::mips_core::CAUSE_IP_MASK;
+            let im = self.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+            if (ip & im) != 0 {
+                break;
+            }
+            // `hot.cycles` MUST keep advancing while stalled, but at a paced
+            // rate, not once per host iteration.
+            //
+            // Must advance: it is the clock other threads wait on. The
+            // WD33C93A's deferred-interrupt path (`wd33c93a.rs`, "Required for
+            // OpenBSD/NetBSD") spins until `cpu_cycles` has moved 10000 —
+            // holding still here deadlocks it against a CPU waiting for the
+            // very interrupt that spin is about to deliver.
+            //
+            // Must be paced: it is also the *virtual time base*
+            // (`NS_PER_GUEST_CYCLE` = 10ns/cycle), and under `ci_clock` CP0
+            // Count derives straight from it (`count_now`). Bumping once per
+            // host iteration would run guest time at hundreds of millions of
+            // cycles per real second inside one instruction — Count would leap
+            // and timers would fire early.
+            //
+            // So: one guest cycle per 10ns of real time, which is exactly the
+            // 1:1 rate `NS_PER_GUEST_CYCLE` defines, sampled off the host
+            // clock rather than off loop iterations. An idle guest's clock
+            // then tracks wall time the same way a running one does.
+            let now = std::time::Instant::now();
+            let elapsed_ns = now.duration_since(stall_start).as_nanos() as u64;
+            // 10ns/cycle — the same rate `mips_core::NS_PER_GUEST_CYCLE`
+            // defines, restated here because that constant is `ci_clock`-only
+            // while this pacing must hold in every build.
+            const STALL_NS_PER_CYCLE: u64 = 10;
+            let want = elapsed_ns / STALL_NS_PER_CYCLE;
+            if want > issued {
+                let delta = want - issued;
+                issued = want;
+                unsafe {
+                    let p = &mut self.core.hot.cycles as *mut u64;
+                    std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(delta));
+                }
+            }
+            std::hint::spin_loop();
+        }
+
+        status
+    }
+
     fn exec_eret(&mut self) -> ExecStatus {
         let target = if (self.core.cp0_status & STATUS_ERL) != 0 {
             // Error level - return to ErrorEPC
@@ -6632,6 +7037,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // ERET jumps immediately without delay slot
         self.core.pc = target;
+
+        // ERET has no delay slot of its own, but it can *be* one. An ERET in
+        // the delay slot of a branch is architecturally UNPREDICTABLE, so the
+        // case that matters is the reachable one: a NOT-TAKEN branch routes
+        // its slot through `branch_delay(pc+8)` (so a fault in the slot still
+        // reports EPC=branch/BD=1), which leaves `in_delay_slot` set with
+        // `delay_slot_target` pointing just past the branch. Without this
+        // clear, `handle_exec_complete` would then jump to that stale target
+        // instead of EPC — hijacking the first instruction at the return
+        // address. Cheap unconditional clear rather than a branch: ERET is
+        // already a slow path.
+        self.core.in_delay_slot = false;
 
         // Unlike every other exec_complete_pc_set caller, ERET's target is
         // compile-worthy only when it's actually returning from a syscall —
@@ -6659,9 +7076,80 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// dispatch-target handler, so it's the terminal action itself.
     #[inline]
     fn cpu_unusable(&mut self, ce: u32) -> ExecStatus {
+        self.cpu_unusable_report(ce);
         self.core.cp0_cause = (self.core.cp0_cause & !CAUSE_CE_MASK) | ((ce & 3) << CAUSE_CE_SHIFT);
         let s = exec_exception(EXC_CPU);
         self.handle_exception(s)
+    }
+
+    /// Diagnostic for every Coprocessor Unusable exception: which coprocessor,
+    /// which instruction, and the CPU state that made it unusable.
+    ///
+    /// Worth having as its own funnel because the guest-side symptom is
+    /// actively misleading. IRIX's `VEC_cpfault` panics with **"kernel used
+    /// coprocessor"** whenever a CpU arrives with `SR_PREVMODE == 0`, and it
+    /// does that *before* looking at `Cause.CE` (`vec_cpfault.s`) — so the
+    /// message says "coprocessor" no matter which one, and invites blaming an
+    /// FPU change when the faulting word can just as easily be a `CACHE` or
+    /// `MFC0` going through the CP0 gate.
+    ///
+    /// Reports the live privilege inputs rather than just the answer, because
+    /// `get_privilege_mode()` folds three things together (EXL, ERL, KSU) and
+    /// which one is responsible is the whole question.
+    ///
+    /// `developer` only — a no-op `dlog_dev!` otherwise, so production pays
+    /// nothing for it.
+    #[cold]
+    fn cpu_unusable_report(&mut self, #[allow(unused_variables)] ce: u32) {
+        #[cfg(feature = "developer")]
+        {
+            use crate::mips_core::{STATUS_CU0, STATUS_CU1, STATUS_EXL, STATUS_ERL,
+                                   STATUS_IE, STATUS_KSU_SHIFT};
+            let st = self.core.cp0_status;
+            let pc = self.core.pc;
+
+            // The faulting word: re-read through the debug path so this never
+            // perturbs cache state or takes an exception of its own. Done
+            // before taking the symbol lock — `debug_translate` needs `&mut
+            // self`, which the lock's borrow would otherwise block.
+            let raw = {
+                let tr = self.debug_translate(pc);
+                if tr.is_exception() {
+                    None
+                } else {
+                    let r = self.sysad.read32(tr.phys);
+                    if r.is_ok() { Some(r.data) } else { None }
+                }
+            };
+
+            let symbols = self.symbols.lock();
+            let sym_str = format_pc_symbol(pc, &symbols);
+            let (raw_str, dis) = match raw {
+                Some(w) => (format!("{:08x}", w), mips_dis::disassemble(w, pc, Some(&symbols))),
+                None => ("????????".to_string(), "<unreadable>".to_string()),
+            };
+
+            let ksu = (st >> STATUS_KSU_SHIFT) & 0x3;
+            dlog_dev!(LogModule::Mips,
+                "CpU: coprocessor {} unusable at {:016x}{}: {} {}\n                       Status={:08x} [CU1={} CU0={} EXL={} ERL={} IE={} KSU={}] priv={:?} -> {}",
+                ce, pc, sym_str, raw_str, dis,
+                st,
+                (st & STATUS_CU1 != 0) as u8,
+                (st & STATUS_CU0 != 0) as u8,
+                (st & STATUS_EXL != 0) as u8,
+                (st & STATUS_ERL != 0) as u8,
+                (st & STATUS_IE  != 0) as u8,
+                ksu,
+                self.core.get_privilege_mode(),
+                // Name the specific reason this instruction was refused.
+                if ce == 1 {
+                    "CU1 clear (FPU not enabled for this context)"
+                } else if self.core.get_privilege_mode() != crate::mips_core::PrivilegeMode::Kernel {
+                    "not kernel mode and CU0 clear"
+                } else {
+                    "kernel mode with CU0 clear — should not happen for CE=0"
+                });
+        }
     }
 
     /// After a FPU arithmetic op has computed its result but *before* it is
@@ -10425,9 +10913,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l1i".to_string(), "L1 Instruction Cache commands: l1i <check|dump> <addr|index>".to_string()),
             ("l1d".to_string(), "L1 Data Cache commands: l1d <check|dump> <addr|index> | l1d wb <vaddr> <size> | l1d pwb <paddr> <size>".to_string()),
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
-            ("ll".to_string(), "Show LL/SC state: llbit and lladdr".to_string()),
+            ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -10663,13 +11151,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             return Err("Usage: proc info".to_string());
         }
 
-        if actual_cmd == "ll" {
+        // Bare `ll` reports live reservation state. `ll stats` / `ll clear`
+        // fall through to the histogram arm below (feature `llstats`) — this
+        // early return used to swallow every `ll ...` form, which silently made
+        // that arm dead code even in a build that had it compiled in.
+        if actual_cmd == "ll" && actual_args.is_empty() {
             let exec = self.try_lock_executor()?;
             let llbit  = exec.cache.get_llbit();
             let lladdr = exec.cache.get_lladdr();
             let phys   = (lladdr as u64) << 4;
             writeln!(writer, "llbit:  {}", if llbit { "SET" } else { "clear" }).unwrap();
             writeln!(writer, "lladdr: {:08x}  (phys {:010x})", lladdr, phys).unwrap();
+            #[cfg(feature = "llstats")]
+            writeln!(writer, "(`ll stats` for the per-address retry histogram)").unwrap();
             return Ok(());
         }
 
@@ -11374,6 +11868,83 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 #[cfg(not(feature = "developer"))]
                 Err("undo requires a developer build".to_string())
             }
+            "ll" => {
+                #[cfg(feature = "llstats")]
+                {
+                    let mut exec = self.try_lock_executor()?;
+                    match actual_args.first().copied() {
+                        Some("clear") => {
+                            for e in exec.ll_stats.iter_mut() {
+                                *e = LlSiteStats { key: u32::MAX, ..Default::default() };
+                            }
+                            writeln!(writer, "ll stats cleared").unwrap();
+                            return Ok(());
+                        }
+                        Some("stats") => {
+                            if exec.ll_stats.iter().all(|e| e.key == u32::MAX) {
+                                writeln!(writer, "ll stats: no LL/SC activity recorded").unwrap();
+                                return Ok(());
+                            }
+                            // Worst max_run first: a kernel LL/SC loop that
+                            // cannot make progress is the thing being hunted,
+                            // and it sorts straight to the top.
+                            let mut rows: Vec<(u32, LlSiteStats)> = exec.ll_stats.iter()
+                                .filter(|e| e.key != u32::MAX)
+                                .map(|e| (e.key, *e))
+                                .collect();
+                            // Lead with reservations that were never resolved:
+                            // `ll - (ok + fail)` counts LLs whose SC never ran
+                            // at all. That is the abandoned-reservation
+                            // signature — a thread that took a reservation and
+                            // then went to sleep without completing its
+                            // LL/SC loop — and it is what a stuck kernel lock
+                            // looks like from here. A row with ll == ok and no
+                            // failures is a loop working perfectly and is the
+                            // least interesting thing in the table, so sorting
+                            // on max_run alone buried the signal.
+                            let unresolved = |st: &LlSiteStats| st.ll.saturating_sub(st.ok + st.fail);
+                            rows.sort_by(|a, b| unresolved(&b.1).cmp(&unresolved(&a.1))
+                                .then(b.1.max_run.cmp(&a.1.max_run))
+                                .then(b.1.fail.cmp(&a.1.fail))
+                                .then(b.1.ll.cmp(&a.1.ll)));
+                            let mut out = String::new();
+                            out.push_str("ll stats — per-LL-address reservation histogram\n");
+                            out.push_str("  (unresolved = LLs whose SC never ran: a reservation taken\n");
+                            out.push_str("   and abandoned, i.e. the thread slept mid-loop. Sorted first.\n");
+                            out.push_str("   max_run = longest run of consecutive SC failures; a couple is\n");
+                            out.push_str("   normal, hundreds means a stuck lock.)\n\n");
+                            out.push_str(&format!("{:>12}  {:>10} {:>10} {:>10} {:>8} {:>8} {:>10}\n",
+                                "phys", "ll", "sc_ok", "sc_fail", "cur_run", "max_run", "unresolved"));
+                            // Totals over EVERY row, not just the 40 printed —
+                            // with ~1000 live addresses a truncated sum is
+                            // actively misleading.
+                            let mut tot_ll = 0u64; let mut tot_ok = 0u64; let mut tot_fail = 0u64;
+                            let mut tot_unres = 0u64;
+                            for (_, st) in rows.iter() {
+                                tot_ll += st.ll; tot_ok += st.ok; tot_fail += st.fail;
+                                tot_unres += unresolved(st);
+                            }
+                            for (lladdr, st) in rows.iter().take(40) {
+                                // LLAddr holds phys >> 4.
+                                out.push_str(&format!("{:>12}  {:>10} {:>10} {:>10} {:>8} {:>8} {:>10}\n",
+                                    format!("{:#010x}", (*lladdr as u64) << 4),
+                                    st.ll, st.ok, st.fail, st.cur_run, st.max_run,
+                                    unresolved(st)));
+                            }
+                            if rows.len() > 40 {
+                                out.push_str(&format!("  ... {} more addresses\n", rows.len() - 40));
+                            }
+                            out.push_str(&format!("\n  {} addresses (all rows); ll={} sc_ok={} sc_fail={} unresolved={}\n",
+                                rows.len(), tot_ll, tot_ok, tot_fail, tot_unres));
+                            write!(writer, "{}", out).unwrap();
+                            return Ok(());
+                        }
+                        _ => return Err("Usage: ll [stats|clear]".to_string()),
+                    }
+                }
+                #[cfg(not(feature = "llstats"))]
+                Err("ll stats requires --features llstats".to_string())
+            }
             "tlb" => {
                 if actual_args.is_empty() { return Err("Usage: tlb <dump|trans|debug> ...".to_string()); }
                 let exec = self.try_lock_executor()?;
@@ -11555,6 +12126,27 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 writeln!(writer, "j2 fallback: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                             }
                             Some(_) => return Err("Usage: j2 fallback [on|off]".to_string()),
+                        }
+                    }
+                    "entrypre" => {
+                        // Entry-word interrupt preamble. Normally an
+                        // externally-dispatched entry word bypasses its own
+                        // preamble (`skip_entry_preamble`), so a pending
+                        // interrupt is sampled one head later. Turning this on
+                        // emits the check at the entry word too.
+                        //
+                        // Read by codegen at compile time, so a `j2 flush` (CPU
+                        // stopped) is required for it to affect regions that are
+                        // already compiled.
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 entrypre: {}", if crate::jitv2::entry_preamble_forced() { "on" } else { "off" }).unwrap();
+                            }
+                            Some(on @ ("on" | "off")) => {
+                                crate::jitv2::set_entry_preamble_forced(on == "on");
+                                writeln!(writer, "j2 entrypre: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
+                            }
+                            Some(_) => return Err("Usage: j2 entrypre [on|off]".to_string()),
                         }
                     }
                     "inline_mem" => {
@@ -12143,6 +12735,67 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             }
                             None => return Err("j2 deny: page pool is full (can't even allocate a fresh lookup entry)".to_string()),
                         }
+                    }
+                    // `j2wp` only: `pcp_dump` is that impl's module, and the dump
+                    // format is its `PhysicalCodePage` layout.
+                    #[cfg(feature = "j2wp")]
+                    "dumppcp" => {
+                        // Capture a PhysicalCodePage + its raw 4KB of memory to
+                        // a file for offline analysis with the `jitv2_pcp_dump`
+                        // binary (which re-runs the real reachability walker and
+                        // disassembles every requested/compiled/denylisted
+                        // offset). `PcpDump` already had capture/to_bytes/
+                        // from_bytes and a whole offline analyzer built on it —
+                        // there was simply no command to trigger a capture, so
+                        // the analyzer had nothing to read.
+                        //
+                        // Usage: j2 dumppcp [addr] [path]
+                        //   addr — page to dump; defaults to the tracked page
+                        //          (or the page PC translates to).
+                        //   path — output file; defaults to
+                        //          `jitv2_pcp_<pfn>.bin` in the cwd.
+                        let explicit_addr = if let Some(&a) = actual_args.get(1) {
+                            if a.starts_with("./") || a.contains('/') || a.ends_with(".bin") {
+                                None // it's a path, not an address
+                            } else {
+                                let symbols_arc = exec.symbols.clone();
+                                let symbols = symbols_arc.lock();
+                                Some(parse_cpu_arg(a, &exec.core, Some(&symbols))?)
+                            }
+                        } else { None };
+
+                        let page_ptr = if explicit_addr.is_none() && !exec.pcp.is_null() {
+                            exec.pcp
+                        } else {
+                            let pc = explicit_addr.unwrap_or(exec.core.pc);
+                            let result = exec.debug_translate(pc);
+                            if result.is_exception() {
+                                return Err(format!("{:#018x} doesn't translate", pc));
+                            }
+                            let pfn = result.phys / crate::jitv2::PAGE_SIZE;
+                            let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                            let sysad = exec.sysad.clone();
+                            let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                            let mut jit = exec.jitv2.lock();
+                            match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                                Some(slot) => jit.page_ptr(slot),
+                                None => return Err("page pool full".to_string()),
+                            }
+                        };
+                        let page = unsafe { &*page_ptr };
+                        let sysad = exec.sysad.clone();
+                        let dump = crate::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref())
+                            .map_err(|st| format!("capture failed: bus status {:#x}", st))?;
+                        // A path argument is whichever arg is not the address.
+                        let path = actual_args.iter().skip(1)
+                            .find(|a| a.contains('/') || a.ends_with(".bin"))
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| crate::jitv2::pcp_dump::default_dump_path(dump.pfn));
+                        std::fs::write(&path, dump.to_bytes())
+                            .map_err(|e| format!("write {}: {}", path, e))?;
+                        writeln!(writer, "wrote {} (pfn {:#x}, gen {} entry_gen {}, fr1={})",
+                            path, dump.pfn, dump.current_gen, dump.entry_gen, dump.fr1).unwrap();
+                        writeln!(writer, "analyse with: jitv2_pcp_dump {} [--offset <hex>] [--compile]", path).unwrap();
                     }
                     #[cfg(feature = "j2wp")]
                     "pcp" => {

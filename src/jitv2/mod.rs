@@ -231,3 +231,51 @@ mod zz_offsets {
         println!("SIZE core  = {:#x}", std::mem::size_of::<MipsCore>());
     }
 }
+
+/// Force the entry word's own interrupt preamble to be emitted, instead of
+/// bypassing it via the dispatch head's body blocks (`skip_entry_preamble`).
+///
+/// Default **off**, matching the shipping behaviour. `IRIS_ENTRY_PREAMBLE=1`
+/// at startup, or `j2 entrypre on` from the monitor (followed by `j2 flush`,
+/// since already-compiled regions keep whatever shape they were built with).
+///
+/// Why it exists: an externally-dispatched entry word currently runs with no
+/// interrupt check of its own, so delivery is deferred by one dispatch. That is
+/// bounded and never *lost* — every internal back-edge onto an entry word still
+/// pays the preamble — but the window scales with how fast the JIT retires
+/// code, which makes it a candidate whenever a fault reproduces under a fast
+/// JIT and disappears under the interpreter or lockstep.
+static ENTRY_PREAMBLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One-shot startup read of `IRIS_ENTRY_PREAMBLE`, so the env var works without
+/// a monitor command.
+static ENTRY_PREAMBLE_ENV: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+#[inline]
+pub fn entry_preamble_forced() -> bool {
+    ENTRY_PREAMBLE_ENV.get_or_init(|| {
+        if std::env::var("IRIS_ENTRY_PREAMBLE").map(|v| v == "1").unwrap_or(false) {
+            ENTRY_PREAMBLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ENTRY_PREAMBLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `j2 entrypre on|off`. Caller must `j2 flush` afterward — already-compiled
+/// regions are unaffected until rebuilt.
+pub fn set_entry_preamble_forced(on: bool) {
+    let _ = entry_preamble_forced(); // pin the env read first
+    ENTRY_PREAMBLE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Serializes tests that flip [`set_entry_preamble_forced`].
+///
+/// `ENTRY_PREAMBLE` is a process-global read by **every** compile, so a test
+/// that turns it on while another test is compiling a region in parallel gives
+/// that region an entry-word interrupt check it never asked for — a flake that
+/// shows up only in a full run, never when the test is filtered. Any test that
+/// writes the toggle must hold this for the whole time it is non-default, and
+/// restore the previous value before releasing.
+#[cfg(test)]
+pub static ENTRY_PREAMBLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

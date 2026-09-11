@@ -1238,6 +1238,36 @@ impl Codegen {
         // itself. One map, keyed by entry word, rather than a single
         // `Option<Block>` — the old single-entry shape.
         let mut entry_body_blocks: std::collections::HashMap<WordOffset, Block> = std::collections::HashMap::new();
+        // `j2 entrypre on` (or IRIS_ENTRY_PREAMBLE=1) forces the entry word's
+        // own preamble back on by NOT building the bypass blocks: with the map
+        // empty the dispatch head falls through to `entry_word_block_for(w)`,
+        // which runs the preamble like every other word. Costs one relaxed
+        // atomic load per external entry; buys interrupt sampling at the exact
+        // instruction an external dispatch lands on instead of one head later.
+        //
+        // Worth having as a live toggle because the deferral is a *timing*
+        // property, not a semantic one: a full jitv2_lockstep boot (which
+        // verifies every instruction inline) reaches a working desktop, so the
+        // instruction emulation is correct and what differs under a fast JIT
+        // is when interrupts get sampled, not what the code computes.
+        // NOTE: `entry_preamble_forced()` is deliberately NOT consulted here.
+        // Routing the dispatch head into the entry word's *ordinary* block —
+        // which is what emptying this map does — is WRONG, and panics IRIX at
+        // "tlbmiss: invalid kptbl entry" within seconds of kernel start.
+        //
+        // Why: that ordinary block opens by unconditionally storing
+        // `in_delay_slot = false` (see the long comment at its emission site),
+        // which is sound *only* for internal edges, "an internal edge into an
+        // entry word is never a delay-slot landing". An EXTERNAL dispatch can
+        // land on a delay-slot word — that is precisely what the foreign-slot
+        // protocol exists for — so sending external arrivals through it
+        // destroys an armed delay-slot transfer, the guest branches somewhere
+        // it should not, and the kernel faults on a garbage KSEG2 address.
+        //
+        // Making the entry word pay its own interrupt check therefore needs the
+        // preamble emitted into the *body* block (after the dispatch head's
+        // foreign-slot handling), not a redirect to the ordinary block. Left
+        // unimplemented rather than half-done.
         if skip_entry_preamble {
             for &w in &entry_words {
                 entry_body_blocks.insert(w, builder.create_block());
@@ -1307,6 +1337,37 @@ impl Codegen {
             let mut unused_cycles_pending = 0u32;
             let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
+        }
+
+        // `j2 entrypre on`: sample pending interrupts at the entry word too.
+        //
+        // Normally an externally-dispatched entry word bypasses its own
+        // preamble (`skip_entry_preamble`), so a pending interrupt is not seen
+        // until the next head — bounded, never lost, but a window that widens
+        // with how fast the JIT retires code. A full `jitv2_lockstep` boot
+        // (every instruction verified inline, hence very slow) reaches a
+        // working desktop, so what differs under a fast JIT is *when*
+        // interrupts are sampled, not what the code computes. This closes that
+        // window so the difference can be tested against a live boot.
+        //
+        // Emitted HERE, in entry_block before the dispatch Switch, for the same
+        // reason `emit_fr_mode_guard` is: at this point the function has not
+        // touched `core.pc` or `core.in_delay_slot`, so live values are still
+        // exactly this dispatch's own — including a foreign delay-slot arrival.
+        // The bail is a bare `return EXEC_FALLBACK` (`emit_entry_interrupt_bail`)
+        // that stores NEITHER, so `step_jit` routes to `step_int`, which
+        // re-dispatches at the untouched PC with its real preamble.
+        //
+        // Do NOT implement this by routing the dispatch head into the entry
+        // word's *ordinary* block: that block opens by unconditionally storing
+        // `in_delay_slot = false`, which is sound only for internal edges, and
+        // an external dispatch CAN land on a delay-slot word. Tried; IRIX
+        // panicked at "tlbmiss: invalid kptbl entry" within seconds of kernel
+        // start, because the armed foreign-slot transfer was destroyed.
+        if crate::jitv2::entry_preamble_forced() {
+            let mut unused_cycles_pending = 0u32;
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
+            emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
         // Dispatch: a `Switch` over every entry this compile covers, jumping
@@ -1545,6 +1606,13 @@ impl Codegen {
                 };
                 emit_dev_trace_bp(&mut ctx, origin);
             }
+            // `fetchverify`: verify this instruction's baked-in word still
+            // matches memory, immediately before its semantics run. Placed
+            // after the preamble for the same reason the cycle accounting is:
+            // if the preamble bailed, this instruction is not executing and
+            // there is nothing to verify.
+            #[cfg(feature = "fetchverify")]
+            emit_fetch_verify(&mut ctx);
             // Past the preamble: this instruction is actually going to
             // execute (the preamble didn't bail to the interpreter for this
             // word), matching step()'s per-instruction cycle count exactly —
@@ -2433,6 +2501,47 @@ fn emit_bail(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset, stat
 /// recompute a value already sitting there unchanged. If this function ever
 /// gains a second caller from somewhere `core.pc` might be stale, that
 /// caller is responsible for materializing it first.
+/// `j2 entrypre on` only: sample `hot.interrupts` at an external entry and, if
+/// anything is pending, return `EXEC_FALLBACK` **without storing `core.pc` or
+/// `core.in_delay_slot`**.
+///
+/// That "stores neither" property is the whole point. Emitted in `entry_block`
+/// before the dispatch `Switch`, where this compiled function has not yet
+/// touched either field, so the live values are still exactly what the
+/// dispatching `step_jit` set up — including `in_delay_slot`/`delay_slot_target`
+/// for a foreign delay-slot arrival. `step_jit` turns `EXEC_FALLBACK` into a
+/// `step_int()` call, which re-dispatches at that untouched PC and runs the
+/// interpreter's real `step_preamble!` (interrupt delivery, timer, breakpoints).
+///
+/// Deliberately NOT `emit_bail`: that jumps to the shared exit stub, which
+/// recomputes and stores `core.pc` from the compile-time word offset
+/// (`emit_exit_block_body`). Correct for an interior instruction, wrong here —
+/// an entry word reached as a foreign delay slot would have its arrival state
+/// rewritten. Same reasoning as `emit_interp_fallback_exit`'s "does not
+/// materialize core.pc before calling".
+fn emit_entry_interrupt_bail(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let interrupts_ptr = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, core_offset_of_interrupts() as i64);
+    // Same seq-cst load the per-instruction preamble uses: `atomic_load` so
+    // `opt_level=speed` cannot hoist it, and so a device thread's `fetch_or`
+    // is observed promptly rather than as a stale snapshot.
+    let pending = ctx.builder.ins().atomic_load(ir::types::I64, mem, interrupts_ptr);
+    let has_pending = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, pending, 0);
+
+    let bail_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(has_pending, bail_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(bail_block);
+    ctx.builder.set_cold_block(bail_block);
+    ctx.builder.seal_block(bail_block);
+    let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_FALLBACK as i64);
+    ctx.builder.ins().return_(&[status]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+}
+
 fn emit_interp_fallback_exit(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
@@ -2591,6 +2700,61 @@ mod dev_trace_origin {
     /// responsibility for every instruction it dispatches, entry word
     /// included, with no special-cased caller-side push to keep in sync.
     pub const JIT_ENTRY: u32 = 7;
+}
+
+/// `fetchverify`: call `core.fetch_verify_fn(core, va, expected_raw)` before
+/// this instruction's semantics, where `expected_raw` is `ctx.raw` — the
+/// instruction word **this compile baked in as a constant**.
+///
+/// Catches what `jitv2_lockstep` structurally cannot: lockstep compares the JIT
+/// against the interpreter, so if both run the same stale bytes they agree and
+/// nothing fires. This compares compiled code against memory itself.
+///
+/// On a mismatch the callback returns `EXEC_BREAKPOINT`; this bails with
+/// `core.pc` set to the offending instruction and `in_delay_slot` = `ctx.bd`,
+/// exactly like `emit_dev_trace_bp`'s breakpoint arm, so the monitor lands on
+/// the instruction that was about to run stale.
+#[cfg(feature = "fetchverify")]
+fn emit_fetch_verify(ctx: &mut EmitCtx) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    let word = ctx.word;
+
+    let va_val = emit_word_addr(ctx, word);
+    let expected_val = ctx.builder.ins().iconst(ir::types::I32, ctx.raw as i64);
+
+    let callee = emit_hook_callee(ctx, core_offset_of_fetch_verify_fn());
+
+    let mut sig = ctx.module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));          // core_ptr
+    sig.params.push(AbiParam::new(ir::types::I64));  // va
+    sig.params.push(AbiParam::new(ir::types::I32));  // expected raw
+    sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
+    let sig_ref = ctx.builder.import_signature(sig);
+    let core_arg = callout_core_arg(ctx);
+    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, va_val, expected_val]);
+    let status = ctx.builder.inst_results(call)[0];
+
+    let is_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bad_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(is_bad, bad_block, &[], continue_block, &[]);
+
+    // Cold: stale compiled code is the bug being hunted, not the common case.
+    ctx.builder.switch_to_block(bad_block);
+    ctx.builder.set_cold_block(bad_block);
+    ctx.builder.seal_block(bad_block);
+    let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
+    let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+    let pc_again = emit_word_addr(ctx, word);
+    ctx.builder.ins().store(mem, pc_again, ctx.core_ptr, pc_off);
+    let bd_store = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
+    ctx.builder.ins().store(mem, bd_store, ctx.core_ptr, flag_off);
+    let bad_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    ctx.builder.ins().return_(&[bad_status]);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
 }
 
 /// `core.dev_trace_bp_fn(core, pc, raw, origin)` with this instruction's
@@ -3097,6 +3261,8 @@ fn core_offset_of_interp_fallback_fn() -> i32 { std::mem::offset_of!(MipsCore, i
 fn core_offset_of_kill_entry_fn() -> i32 { std::mem::offset_of!(MipsCore, kill_entry_fn) as i32 }
 #[cfg(feature = "developer")]
 fn core_offset_of_dev_trace_bp_fn() -> i32 { std::mem::offset_of!(MipsCore, dev_trace_bp_fn) as i32 }
+#[cfg(feature = "fetchverify")]
+fn core_offset_of_fetch_verify_fn() -> i32 { std::mem::offset_of!(MipsCore, fetch_verify_fn) as i32 }
 #[cfg(feature = "jitv2_lockstep")]
 fn core_offset_of_lockstep_step_fn() -> i32 { std::mem::offset_of!(MipsCore, lockstep_step_fn) as i32 }
 #[cfg(feature = "jitv2_lockstep")]
@@ -6023,12 +6189,18 @@ fn emit_target_edge(
 /// `bool` result), `false` if the slot needs the normal path.
 #[cfg_attr(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
 fn try_emit_fused_nop_slot(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], slot_word: WordOffset, slot_raw: u32) -> bool {
-    #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"))]
+    // `fetchverify` joins lockstep/developer in disabling this fusion. The
+    // fast path emits ONLY cycle accounting — it never reaches
+    // `emit_slot_semantics`, so the slot's word is never checked against
+    // memory. A NOP slot is exactly where a page-patching kernel puts real
+    // code later (padding rewritten in place), which makes it the last place
+    // the detector should have a blind spot.
+    #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer", feature = "fetchverify"))]
     {
         let _ = (instrs, slot_word, slot_raw);
         false
     }
-    #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer"))))]
+    #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer", feature = "fetchverify"))))]
     {
         if slot_raw != 0 {
             return false;
@@ -6145,6 +6317,14 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     // own (set above), matching what the hook needs to record.
     #[cfg(feature = "developer")]
     emit_dev_trace_bp(ctx, dev_trace_origin::JIT_DELAY_SLOT);
+    // An inlined delay slot is a real instruction with its own address and its
+    // own compile-time-constant word, so it needs verifying like any other.
+    // `ctx.word`/`ctx.raw` are already the slot's own (set above). Without this
+    // a slot was the one thing `fetchverify` could not see — and slots are
+    // exactly where a branch-likely's nullified word sits, which is where a
+    // page-patching kernel (the TLB refill vector) rewrites code.
+    #[cfg(feature = "fetchverify")]
+    emit_fetch_verify(ctx);
 
     if let Some(branch) = lookup_branch_or_jump(slot_raw) {
         emit_nested_branch_slot(ctx, instrs, slot_word, slot_raw, branch, fr_mode, delay_slot_target);
@@ -8288,14 +8468,20 @@ fn fused_lui_imm32(lui_raw: u32, next_raw: u32) -> Option<i64> {
 ///   make the fused LUI conditionally skip only for non-branch-target
 ///   arrivals (impossible — block choice is a single static edge, not a
 ///   per-arrival runtime branch).
-#[cfg_attr(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"), allow(unused))]
+///
+/// `fetchverify` disables this fusion for the same reason it disables the
+/// fused NOP slot: the swallowed `word + 1` never gets its own
+/// `emit_fetch_verify` call (that happens once per *head*, and fusion removes
+/// the second head), so its instruction word would never be checked against
+/// memory.
+#[cfg_attr(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer", feature = "fetchverify"), allow(unused))]
 fn try_emit_fused_lui(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], word: WordOffset) -> u16 {
-    #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer"))]
+    #[cfg(any(not(feature = "jitv2_opcodefusion"), feature = "jitv2_lockstep", feature = "developer", feature = "fetchverify"))]
     {
         let _ = (instrs, word);
         0
     }
-    #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer"))))]
+    #[cfg(all(feature = "jitv2_opcodefusion", not(any(feature = "jitv2_lockstep", feature = "developer", feature = "fetchverify"))))]
     {
         if instrs[word as usize].is_entry_point || instrs[word as usize].is_branch_fallback_successor {
             return 0;

@@ -164,7 +164,7 @@ pub const FUNCT_TLBWI: u32 = 0x02;
 pub const FUNCT_TLBWR: u32 = 0x06;
 pub const FUNCT_TLBP: u32 = 0x08;
 pub const FUNCT_ERET: u32 = 0x18; // MIPS III
-pub const FUNCT_WAIT: u32 = 0x20; // R4000: invalid but not RI (phi opcode, treated as NOP)
+pub const FUNCT_WAIT: u32 = 0x20; // R4600/R5000 WAIT; on R4000/R4400 an unimplemented COP0 function that reads as a no-op rather than raising RI
 
 // COP1 (RS) - Bits 25..21
 pub const RS_MFC1: u32 = 0x00;
