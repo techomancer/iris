@@ -3077,12 +3077,22 @@ mod tests {
 
     #[test]
     fn skip_entry_preamble_true_bypasses_the_entry_words_own_checks() {
-        // skip_entry_preamble=true (comp.rs's production path): the
-        // interpreter's step() dispatch loop already ran the equivalent
-        // IP7/pending-interrupt checks for this exact PC immediately before
-        // calling into compiled code, so the compiled function's own entry
-        // path must NOT re-check and bail — it should run the entry
-        // instruction's real semantics directly. Proven here by seeding a
+        // skip_entry_preamble=true (comp.rs's production path): the entry
+        // word's own preamble is skipped, so the compiled function runs the
+        // entry instruction's real semantics directly instead of re-checking
+        // and bailing.
+        //
+        // NOTE: this test documents WHAT the production path does, not that
+        // skipping is free. The justification comp.rs used to carry — "step()
+        // already ran the equivalent checks immediately before" — is stale:
+        // `step_jit` runs no `step_preamble!`. The consequence is that
+        // delivery at an external entry is deferred by one dispatch, not
+        // skipped, because every internal back-edge onto an entry word still
+        // routes through the preamble-bearing block — which is exactly what
+        // `skip_entry_preamble_true_still_checks_on_an_internal_back_edge_into_entry`
+        // (below) pins down. Change that pairing together or not at all.
+        //
+        // Proven here by seeding a
         // pending interrupt (core.hot.interrupts != 0) that would normally make
         // emit_pending_interrupt_preamble bail immediately (status
         // EXEC_COMPLETE, pc unchanged) and confirming the entry
@@ -4226,6 +4236,16 @@ mod tests {
     #[test]
     #[cfg(feature = "mips4")]
     fn movci_matches_interpreter_across_all_cc_and_tf_combinations() {
+        // `cu1` is swept, not fixed, because MOVF/MOVT take Coprocessor
+        // Unusable when CU1 is clear (they read FCSR's condition codes -
+        // see `exec_movci`/`emit_movci`). With CU1 left clear, as this test
+        // used to leave it, BOTH engines fault identically and the whole
+        // cc/tf sweep below goes dead: it would pass without ever executing
+        // a single MOVCI. The `cu1 = true` arm tests the semantics; the
+        // `cu1 = false` arm tests that the engines agree on the fault
+        // (cause+CE, EPC, PC), which is the regression test for the CU1
+        // check itself.
+        for cu1 in [false, true] {
         for cc in 0u32..8 {
             for tf in [false, true] {
                 for cc_actual_value in [false, true] {
@@ -4244,6 +4264,8 @@ mod tests {
                     let (mut interp_exec, _) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, 0xFFFF_FFFF_8000_1000);
                     interp_exec.core.fpu_fcsr = 0;
                     interp_exec.core.set_fpu_cc(cc, cc_actual_value);
+                    if cu1 { interp_exec.core.cp0_status |= crate::mips_core::STATUS_CU1; }
+                    else { interp_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1; }
                     interp_exec.exec(instr);
                     let interp_snapshot = CoreSnapshot::capture(&interp_exec.core);
 
@@ -4263,15 +4285,25 @@ mod tests {
                     let mut jit_exec = Box::new(jit_exec);
                     jit_exec.core.fpu_fcsr = 0;
                     jit_exec.core.set_fpu_cc(cc, cc_actual_value);
+                    if cu1 { jit_exec.core.cp0_status |= crate::mips_core::STATUS_CU1; }
+                    else { jit_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1; }
                     jit_exec.install_jit_hooks();
                     unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
                     std::mem::forget(codegen);
                     let jit_snapshot = CoreSnapshot::capture(&jit_exec.core);
 
                     assert_eq!(jit_snapshot, interp_snapshot,
-                        "MOVCI diverged for cc={} tf={} cc_actual={}", cc, tf, cc_actual_value);
+                        "MOVCI diverged for cu1={} cc={} tf={} cc_actual={}", cu1, cc, tf, cc_actual_value);
+
+                    // Guard against this sweep going vacuous again: with CU1
+                    // clear both engines MUST have faulted; with CU1 set
+                    // neither may have.
+                    let took_exception = (interp_snapshot.cp0_status & crate::mips_core::STATUS_EXL) != 0;
+                    assert_eq!(took_exception, !cu1,
+                        "MOVCI must fault exactly when CU1 is clear (cu1={}, cc={})", cu1, cc);
                 }
             }
+        }
         }
     }
 

@@ -3571,6 +3571,16 @@ pub type Pfn = u32;
 /// require 16TB+ of physical address space at `PAGE_SIZE` granularity).
 pub const UNCLAIMED_PFN: Pfn = Pfn::MAX;
 
+/// No FR re-pin outstanding — see `PhysicalCodePage::fr_repin`. Zero so a
+/// freshly-zeroed or reset slot means "nothing demanded", the safe default.
+pub const FR_REPIN_NONE: u8 = 0;
+/// An FR-guard bail observed live FR=0 and demands the page be re-pinned to
+/// FR0 at its next compile.
+pub const FR_REPIN_FR0: u8 = 1;
+/// An FR-guard bail observed live FR=1 and demands the page be re-pinned to
+/// FR1 at its next compile.
+pub const FR_REPIN_FR1: u8 = 2;
+
 /// Compiled-function ABI (§6.1.2's "handler ABI", simplified for this storage
 /// pass — no `DecodedInstr`/state-struct plumbing yet, just direct MipsCore
 /// access): takes a pointer to the executor's `MipsCore` and returns the same
@@ -4009,16 +4019,67 @@ pub struct PhysicalCodePage {
     /// dispatched, self-limiting to at most (published entry count) guard
     /// failures rather than one check per dispatch forever.
     ///
-    /// TODO(§13, revisit later): once every entry on a page has been killed
-    /// this way, `fr1` itself is NOT re-pinned — the next compile for this
-    /// page still targets the original mode and will guard-fail again if the
-    /// live mode hasn't reverted. Deliberately left as-is: measured at ~2
-    /// occurrences per real IRIX boot (rare), so a repin-on-all-killed
-    /// heuristic isn't worth the complexity yet. Revisit once real usage
-    /// stats (`j2 status`'s kill-entry counter) justify it — candidates
-    /// include re-deriving `fr1` from the live mode at the first compile
-    /// after a page goes fully dark, or a second per-page "shadow" function.
+    /// **Re-pinned, as of the fix below.** The original TODO here said `fr1`
+    /// was never re-pinned, and justified it as "measured at ~2 occurrences
+    /// per real IRIX boot (rare)". That measurement was of a *different*
+    /// scenario — a page whose entries all get killed — and said nothing
+    /// about **page recycling**, which is the damaging case: a page freed by
+    /// an o32 (FR0) process and reallocated to an n32 (FR1) one kept the old
+    /// pin even though every byte on it was new. Real symptom: 4Dwm/fm/
+    /// background core-dumping at session start (a burst of exactly that
+    /// recycling), cleared by `j2 flush`. Two resets now cover it, and
+    /// neither subsumes the other:
+    ///
+    /// 1. [`Self::publish`] clears the pin on a real invalidation (the guest
+    ///    wrote new bytes), so the next compile re-derives from the live
+    ///    mode. This sits beside the existing `compiled`/`denied` resets,
+    ///    which already reason "the bytes changed, so what was decided
+    ///    against the OLD bytes deserves a fresh chance" — `fr1` had
+    ///    identical justification and was the one field left behind.
+    /// 2. [`Self::request_fr_repin`] records the *demanded* mode when the
+    ///    in-function FR guard bails, for the case (1) cannot see: the same
+    ///    bytes arriving in a new mode (the shared `checkfp.s` page).
+    ///
+    /// Why the guard alone was never sufficient: `emit_fr_mode_guard`
+    /// computes `band(cu1_set, ...)`, deliberately suppressing the FR check
+    /// when CU1 is clear so it can't pre-empt the real per-instruction CU1
+    /// fault. So a stale pin is *not* always caught, and wrong FR packing on
+    /// `ldc1`/`lwc1` puts an FP value in the wrong register half — silent
+    /// corruption, not a fault.
+    ///
+    /// Entries already published against the old mode are retired **lazily**:
+    /// the per-entry guard kills them one at a time and `mega_flush` recycles
+    /// the page eventually. A page-wide kill on re-pin would discard correct
+    /// code — non-FP entries on the same page are mode-independent — to save
+    /// a bounded number of guard failures.
     fr1: std::sync::atomic::AtomicBool,
+    /// FR mode demanded by the most recent in-function FR-guard bail, or
+    /// `None` if no bail is outstanding. Read and cleared by the next compile
+    /// for this page, which re-pins [`Self::fr1`] to it.
+    ///
+    /// Stores the **demanded mode**, not a "flip me" bit, deliberately.
+    /// Several bails normally land before the next compile — the guard kills
+    /// a page's FPU-touching entries one at a time as each is dispatched, and
+    /// each kill records a demand — so a flip bit would toggle once per
+    /// killed entry and an even number of kills would settle back on the
+    /// wrong mode. Recording the observed live FR is idempotent: N bails all
+    /// demanding FR1 say "FR1" N times, and the recompile reads a value
+    /// rather than applying a delta.
+    ///
+    /// Encoded as a `u8` rather than `Option<bool>` so it can live in an
+    /// atomic: [`FR_REPIN_NONE`], [`FR_REPIN_FR0`], [`FR_REPIN_FR1`].
+    fr_repin: std::sync::atomic::AtomicU8,
+    /// Set by [`Self::publish`] on a real invalidation: the page's bytes were
+    /// replaced, so the FR mode pinned against the OLD bytes carries no
+    /// information about what the new ones want. The next compile re-derives
+    /// [`Self::fr1`] from the live mode rather than keeping the stale pin.
+    ///
+    /// Separate from [`Self::fr_repin`] because the two answer different
+    /// questions — `fr_repin` says "a bail proved the pin wrong, use THIS
+    /// mode", while this says "the pin is merely unjustified, use whatever is
+    /// live at the next compile". A bail's demand is the stronger signal and
+    /// wins when both are set.
+    fr_unpinned: std::sync::atomic::AtomicBool,
     /// Serializes the publish step (§13.3 step 6/§13.5) — the compare/union/
     /// swap of `func`+`compiled`+`entry_gen` together needs to happen as one
     /// step even though individual dispatch reads of those fields remain
@@ -4235,6 +4296,8 @@ impl PhysicalCodePage {
             entry_gen: AtomicU64::new(0),
             page_scheduled: std::sync::atomic::AtomicBool::new(false),
             fr1: std::sync::atomic::AtomicBool::new(false),
+            fr_repin: std::sync::atomic::AtomicU8::new(FR_REPIN_NONE),
+            fr_unpinned: std::sync::atomic::AtomicBool::new(false),
             publish_lock: Mutex::new(()),
             saved_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             #[cfg(feature = "developer")]
@@ -4295,9 +4358,9 @@ impl PhysicalCodePage {
     /// `reset_entries_and_bitmaps`'s call sites for why a slot only ever
     /// reaches `claim` already clean.
     ///
-    /// `fr1`: live `STATUS_FR` at the moment of first arrival, pinned for
-    /// this page's whole lifetime (see [`Self::fr1`]'s own doc comment for
-    /// why — TODO, revisit).
+    /// `fr1`: live `STATUS_FR` at the moment of first arrival. Pinned, but no
+    /// longer for the page's whole lifetime — it is re-derived on a real
+    /// invalidation and on an FR-guard bail (see [`Self::fr1`]'s doc comment).
     pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64, fr1: bool) {
         debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == UNCLAIMED_PFN,
             "claim() called on a slot that wasn't clean (pfn={:#x}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
@@ -4307,12 +4370,69 @@ impl PhysicalCodePage {
         self.pfn = pfn;
         self.gen = if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen };
         self.fr1.store(fr1, Ordering::Relaxed);
+        // A freshly-claimed slot has no bail outstanding: `fr1` was just set
+        // from the live mode, so there is nothing to correct.
+        self.fr_repin.store(FR_REPIN_NONE, Ordering::Relaxed);
+        self.fr_unpinned.store(false, Ordering::Relaxed);
     }
 
     /// This page's pinned FR mode (§13, see [`Self::fr1`]'s own doc comment).
     #[inline]
     pub fn is_fr1(&self) -> bool {
         self.fr1.load(Ordering::Relaxed)
+    }
+
+    /// Return every offset to eligible-for-compile, discarding the sticky
+    /// denylist. For the FR-mode-flip case on the flush-survivor path: the
+    /// denylist records decisions made while compiling for the OLD mode, so
+    /// once the page is re-pinned those verdicts no longer describe the code
+    /// that will actually be generated. `publish` has its own equivalent for
+    /// the real-invalidation case (new bytes deserve a fresh chance, §13.6).
+    #[inline]
+    pub fn reset_denied(&self) {
+        for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
+    }
+
+    /// Record that an in-function FR-guard bail observed live FR = `fr1` and
+    /// that this page's pin should be corrected to it at the next compile.
+    /// Called from `jit_kill_entry` (mips_exec.rs), which already holds both
+    /// the executor (for live `cp0_status`) and this page.
+    ///
+    /// Idempotent by construction — it stores the demanded mode, so repeated
+    /// bails demanding the same mode are indistinguishable from one. Last
+    /// writer wins, which is correct: the most recent observation of the live
+    /// mode is the best available estimate of what the next compile should
+    /// target.
+    #[inline]
+    pub fn request_fr_repin(&self, fr1: bool) {
+        self.fr_repin.store(if fr1 { FR_REPIN_FR1 } else { FR_REPIN_FR0 }, Ordering::Relaxed);
+    }
+
+    /// Consume any outstanding FR re-pin request, applying it to [`Self::fr1`]
+    /// and returning the mode the next compile should target.
+    ///
+    /// Takes `live_fr1` so a page with no request outstanding keeps its
+    /// existing pin rather than tracking whatever mode happens to be live at
+    /// compile time — a page is normally dispatched in its pinned mode, and
+    /// re-deriving unconditionally would let an unrelated dispatch re-pin a
+    /// page that was never mismatched.
+    #[inline]
+    pub fn take_fr_repin(&self, live_fr1: bool) -> bool {
+        match self.fr_repin.swap(FR_REPIN_NONE, Ordering::Relaxed) {
+            FR_REPIN_FR0 => { self.fr1.store(false, Ordering::Relaxed); false }
+            FR_REPIN_FR1 => { self.fr1.store(true, Ordering::Relaxed); true }
+            // No bail outstanding. If `publish` cleared the pin on a real
+            // invalidation the page is unpinned and takes the live mode;
+            // otherwise it keeps what it has.
+            _ => {
+                if self.fr_unpinned.swap(false, Ordering::Relaxed) {
+                    self.fr1.store(live_fr1, Ordering::Relaxed);
+                    live_fr1
+                } else {
+                    self.fr1.load(Ordering::Relaxed)
+                }
+            }
+        }
     }
 
     /// Return this slot to the fully-unclaimed state (`pfn = UNCLAIMED_PFN`,
@@ -4927,6 +5047,17 @@ impl PhysicalCodePage {
             // so whatever got sticky-denied against the OLD bytes deserves a
             // fresh chance against the new ones (§13.6).
             for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
+            // `fr1` has exactly the same justification and used to be the one
+            // field left behind here. A physical page freed by an o32 (FR0)
+            // process and reallocated to an n32 (FR1) one arrived with new
+            // bytes but kept the previous tenant's pin, so the next compile
+            // specialized fresh code for the wrong FR mode — and because
+            // `emit_fr_mode_guard` suppresses itself when CU1 is clear, that
+            // was not reliably caught. Don't pin a mode here (the compiling
+            // thread's notion of "live" is the one that matters, and it is
+            // read at compile-request time); just drop the stale claim so the
+            // next compile re-derives it. See `fr1`'s own doc comment.
+            self.fr_unpinned.store(true, Ordering::Relaxed);
         }
         true
     }
@@ -5436,20 +5567,26 @@ impl Jitv2 {
             if rank < JITV2_FLUSH_PRESERVED {
                 let page = &mut self.pages[slot as usize];
                 page.reset_for_flush_survivor();
-                // TODO(§ flush design, revisit later): if this page's most
-                // recent kills before the flush were FR-mismatch kills
-                // (`emit_kill_entry`/`jit_kill_entry` — see `fr1`'s own TODO
-                // on why that case doesn't currently re-pin the mode), this
-                // would be the natural point to flip `fr1` to the mode that
-                // was actually being demanded, since every entry is about to
-                // be recompiled from scratch anyway. Not implemented yet:
-                // needs a per-page "last kill was FR-caused" signal that
-                // doesn't exist today (`kill()` doesn't record a reason),
-                // and flipping `fr1` here would also need to reset `denied`
-                // back to all-eligible — same as a real generation bump —
-                // since the denylist was learned against the old mode's
-                // codegen decisions, not the new one's.
-                requests.push(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: page.is_fr1() });
+                // Every entry here is about to be recompiled from scratch, so
+                // this is the natural point to honour an outstanding
+                // FR-mismatch re-pin (the TODO that used to sit here asked
+                // for a "last kill was FR-caused" signal; `fr_repin` is it).
+                // No live `cp0_status` on this path — it runs on the flush
+                // path, not a dispatch — so the current pin is the fallback
+                // when no bail is outstanding.
+                //
+                // The old TODO also required `denied` be reset when the mode
+                // flips, since the denylist was learned against the old
+                // mode's codegen decisions. `reset_for_flush_survivor`
+                // deliberately PRESERVES `denied` (that is its whole
+                // churn-reduction purpose), so an actual flip has to clear it
+                // here — otherwise offsets denied for old-mode reasons stay
+                // sticky-denied against code that will now be compiled
+                // differently.
+                let was = page.is_fr1();
+                let fr1 = page.take_fr_repin(was);
+                if fr1 != was { page.reset_denied(); }
+                requests.push(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: fr1 });
             } else {
                 self.free_page(slot);
             }
@@ -6665,6 +6802,96 @@ impl CompileQueue {
 mod tests {
     use super::*;
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64};
+
+    /// A claimed, otherwise-untouched page slot for the FR-pin tests below.
+    /// `claim` debug-asserts the slot is clean, so it must start unclaimed.
+    fn claimed_page(fr1: bool) -> Box<PhysicalCodePage> {
+        let mut page = Box::new(PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null()));
+        page.claim(0x1234, std::ptr::null(), fr1);
+        page
+    }
+
+    /// A page recycled between processes of different ABIs (o32 FR=0 ->
+    /// n32 FR=1) must not keep the previous tenant's FR pin. `publish` already
+    /// replaces `compiled` and resets `denied` on a real invalidation,
+    /// reasoning that decisions made against the OLD bytes are worthless once
+    /// the bytes change; `fr1` has identical justification and used to be the
+    /// one field left behind.
+    ///
+    /// This is the 4Dwm/fm session-start core-dump shape: a burst of process
+    /// creation recycles pages, the stale pin makes the next compile
+    /// specialize for the wrong FR mode, and because `emit_fr_mode_guard`
+    /// suppresses itself when CU1 is clear that is not reliably caught —
+    /// wrong FPR packing on `ldc1`/`lwc1` silently corrupts FP data.
+    #[test]
+    fn real_invalidation_drops_the_stale_fr_pin() {
+        let page = claimed_page(false); // o32 tenant: FR0
+        assert!(!page.is_fr1());
+
+        // A real invalidation: the guest replaced this page's bytes, so the
+        // publish carries a generation strictly newer than `entry_gen`.
+        let entries = [0u64; BITMAP_WORDS];
+        let published = page.publish(&entries, std::ptr::null(), 1, 1, 0);
+        assert!(published, "setup: a fresh generation must actually publish");
+
+        // The next compile arrives from an n32 process (live FR=1). Before
+        // the fix this returned the stale `false` and compiled FR0 code for
+        // FR1 bytes.
+        assert!(page.take_fr_repin(true), "a page whose bytes were replaced must re-derive FR from the live mode, not keep the old tenant's pin");
+    }
+
+    /// Coverage added to an EXISTING generation is not an invalidation — the
+    /// bytes are unchanged, so the pin still describes them and an unrelated
+    /// dispatch in another mode must not silently re-specialize the page.
+    /// Guards the obvious over-correction of the test above.
+    #[test]
+    fn coverage_only_publish_keeps_the_fr_pin() {
+        let page = claimed_page(false);
+        let mut entries = [0u64; BITMAP_WORDS];
+        entries[0] = 1;
+        assert!(page.publish(&entries, std::ptr::null(), 0, 1, 0));
+
+        assert!(!page.take_fr_repin(true), "a coverage-only publish leaves the bytes alone, so the pin still describes them");
+    }
+
+    /// The FR guard's bail records the mode the dispatch actually demanded,
+    /// and the next compile adopts it. Without this a page whose live mode
+    /// flipped without its bytes changing (the shared `checkfp.s` page)
+    /// rebuilds the same wrong-mode code and guard-fails again, forever.
+    #[test]
+    fn fr_guard_bail_repins_to_the_demanded_mode() {
+        let page = claimed_page(false);
+        page.request_fr_repin(true); // guard observed live FR=1
+
+        assert!(page.take_fr_repin(false), "the compile must adopt the mode the bail demanded, not the stale pin");
+        assert!(page.is_fr1(), "the demand must be committed to the pin, not just returned once");
+        // Consumed: a second compile with no new bail keeps the new pin.
+        assert!(page.take_fr_repin(false), "the request is one-shot; the re-pinned mode persists");
+    }
+
+    /// The re-pin request stores the DEMANDED mode, not a "flip me" bit.
+    /// Multiple bails before one compile is the NORMAL case, not a race: the
+    /// guard kills a page's FPU-touching entries one at a time as each is
+    /// dispatched, so a page with two such entries records two demands. A
+    /// flip-bit encoding would toggle twice and land back on the wrong mode.
+    #[test]
+    fn repeated_repin_requests_are_idempotent() {
+        let page = claimed_page(false);
+        page.request_fr_repin(true);
+        page.request_fr_repin(true);
+        assert!(page.take_fr_repin(false), "two bails demanding FR1 must still mean FR1, not a double flip back to FR0");
+    }
+
+    /// With nothing outstanding, an ordinary dispatch must not re-pin a page
+    /// that was never mismatched — a page is normally dispatched in its
+    /// pinned mode, and re-deriving unconditionally would let any passing
+    /// dispatch re-specialize it.
+    #[test]
+    fn take_fr_repin_is_inert_without_a_request() {
+        let page = claimed_page(true);
+        assert!(page.take_fr_repin(false), "no request and no invalidation: keep the existing pin");
+        assert!(page.is_fr1());
+    }
 
     /// Pins `comp::MAX_INSTRS_PER_COMPILE` to an explicit value for the
     /// lifetime of the guard, restoring the prior value on drop (including

@@ -223,10 +223,21 @@ pub fn handle_request(
     }
 
     let mut instrs_owned = *instrs;
-    // skip_entry_preamble=true: this compile is always reached from
-    // mips_exec.rs's step() dispatch loop, which already ran the equivalent
-    // IP7/pending-interrupt checks for req.offset's exact PC immediately
-    // before ever arriving here — see compile_region's doc comment.
+    // skip_entry_preamble=true. The original justification here — "the
+    // step() dispatch loop already ran the equivalent IP7/pending-interrupt
+    // checks for this exact PC immediately before arriving" — is NO LONGER
+    // TRUE: `step_jit` (mips_exec.rs) deliberately does not run
+    // `step_preamble!`, as its own doc comment states.
+    //
+    // What actually holds: an externally-dispatched entry word runs without
+    // its own interrupt check, so delivery is DEFERRED BY AT MOST ONE entry
+    // dispatch — never skipped. Every non-entry word, and every internal
+    // back-edge landing on an entry word, still pays the full preamble
+    // (codegen.rs's entry_body_blocks split), so any region with a back-edge
+    // samples on its next iteration. IP7 is raised on wall-clock time by the
+    // hptimer, so it lands in `hot.interrupts` whether or not the guest makes
+    // progress. See `skip_entry_preamble_true_bypasses_the_entry_words_own_checks`
+    // and its back-edge counterpart in equiv_test.rs.
     let func = codegen.compile_region(&mut instrs_owned, req.offset, req.compiled_for_fr1, true);
     match func {
         Some(jit_fn) => {
@@ -1309,10 +1320,13 @@ pub fn handle_request(
     };
 
     let mut instrs_owned = analyzer.instrs_snapshot();
-    // skip_entry_preamble=true: this compile is always reached from
-    // mips_exec.rs's step() dispatch loop, which already ran the equivalent
-    // IP7/pending-interrupt checks for the live PC immediately before ever
-    // arriving here — see compile_region_uncommitted's doc comment.
+    // skip_entry_preamble=true — see the identical note on the single-entry
+    // path above: the "step() already checked" justification is stale
+    // (`step_jit` runs no `step_preamble!`), and the real invariant is that
+    // delivery is deferred by at most one entry dispatch, because internal
+    // back-edges still route through the preamble-bearing block. Under j2wp a
+    // function is entered from many more sites than the per-entry design, so
+    // this is the weaker of the two cases — still bounded, never skipped.
     let func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
     match func_id {
         Some(func_id) => {

@@ -1,7 +1,13 @@
 # Status
 
-*Last full run: 2026-08-19, tests-only branch (no emulator changes).*
+*Last full run: 2026-09-11, all four matrix cells, on `main`.*
 *A full run is a few minutes per cell on a quiet machine.*
+
+> **Run it with `FORCE_BUILD=1 run/matrix.sh`.** `build_iris` reuses any existing
+> `build/iris-<cpu>-<engine>` binary, and a stale one fails in a way that looks
+> like a test failure rather than a skipped cell (an Aug-21 binary here predated
+> the `--cpu` flag and every r4400 cell reported `error: unexpected argument
+> '--cpu'`). See `rules/testing/cpu-tests-known-failure-baseline.md`.
 
 ## Coverage
 
@@ -48,35 +54,82 @@ the suite reports every finding rather than hiding any.
 
 | cell | pass | fail | failing tests |
 |---|---:|---:|---|
-| R4400, interpreter | 2041 | 121 | 29 |
-| R5000, interpreter | 2095 | 37 | 13 |
-| R4400, PROM boot from a `mkvh` image | 2041 | 121 | 29 |
+| R4400, interpreter | 2101 | 61 | 15 |
+| R4400, jitv2 | 2101 | 61 | 15 |
+| R5000, interpreter | 2071 | 61 | 15 |
+| R5000, jitv2 | 2071 | 61 | 15 |
 
-The PROM row is the same binary reaching the same answer down the path a
-bootable disc will use: the PROM reads the volume header, loads the ELF and
-jumps to it. The JIT cells `run/matrix.sh` defines are still unrun.
+**All four cells fail the same 15 tests**, verified by diffing the failing-test
+names, not just the counts. Two things follow, and both are the point of having
+a matrix:
+
+- **interp and jitv2 agree exactly**, on both CPUs. A guest-visible ISA suite is
+  the cleanest available JIT differential test, and it currently finds nothing.
+- **R4400 and R5000 agree on which tests fail.** The 2101-vs-2071 *check* count
+  is the MIPS IV split working as intended: the 13 `mips4/` tests all pass on
+  both, executing on R5000 and raising Reserved Instruction on R4400, but the
+  R4400 path runs fewer individual checks getting there.
+
+The pass counts moved a long way from the 2026-08-19 measurement (2041/121/29
+for R4400-interp). Gone since: the 11 `mips4/` failures (finding 2),
+`cp0/wired_reserved_bits` and `fpu/fcsr_reserved` (findings 3-4). The remaining
+15 are listed below.
+
+`cp0/count_writable` is **load-sensitive**, not a stable pass: it writes
+`0x12345678` to Count and checks the top 16 bits, so a busy host can let Count
+cross `0x1235_0000` first. A run reporting 2100/61+1 with it failing is equally
+healthy. (`cp0/compare_sets_ip7` drifts the *total* by one for the separate
+reason noted below.)
+
+The PROM row is unmeasured in this run; it was the same binary reaching the same
+answer down the path a bootable disc uses.
 
 
-Every failure is a recorded finding — see [findings.md](findings.md):
+Every failure is a recorded finding — see [findings.md](findings.md). The 15
+that remain, all `fpu/`, all on every cell:
 
-| failing tests | finding | CPUs |
-|---|---|---:|
-| the eleven `mips4/` tests | 2 — MIPS IV executes instead of raising RI | R4400 |
-| `mips4/multi_fp_cc` | 1 — `c.cond.fmt` writes the wrong condition code | R5000 |
-| `cp0/wired_reserved_bits` | 3 — reserved bits do not read back as zero | both |
-| `fpu/fcsr_reserved` | 4 — reserved bits do not read back as zero | both |
-| the six `fpu/trap_*` tests, and `fpu/cmp_trap_on_signal` | 6 — a trapped exception still writes its result and its Flag bit | both |
-| `fpu/cause_per_instruction` | 7 — Cause accumulates instead of being rewritten | both |
-| `fpu/denorm_*`, `fpu/qnan_operand`, `fpu/underflow_enable_e` | 8 — no Unimplemented Operation, and FS is inert | R4400 (asserted; reported on R5000) |
-| `fpu/cmp_snan_any_pred` | 9 — a signalling NaN raises Invalid only where a quiet one would | both |
-| `fpu/snan_operands` | 10 — ABS and NEG never raise Invalid | both |
+| failing tests | finding |
+|---|---|
+| the six `fpu/trap_*` tests | 6 — a trapped exception still writes its result and its Flag bit |
+| `fpu/invalid_operations`, `fpu/inexact_flag`, `fpu/overflow_flag`, `fpu/double_invalid_ops` | 3/4/6 — Cause/Flag handling around a raised exception |
+| `fpu/vec_arith_single`, `fpu/vec_arith_double`, `fpu/vec_sqrt` | **unclassified — see below** |
+| `fpu/cvt_s_d_rounds`, `fpu/cvt_out_of_range` | **unclassified — see below** |
 
-The R4400 column is dominated by two findings that are not about the FPU's
-arithmetic at all: the MIPS IV decode (11 tests) and the missing Unimplemented
-Operation path (6 tests). Everything the FPU is asked to *compute* — every
-vector in `fpu_vectors.c`, all 128 predicate results in `fpu_compare.c`, both
-formats, all four rounding modes, every integer conversion — passes on both
-CPUs.
+### Fixed since 2026-08-19
+
+- **The eleven `mips4/` failures** (finding 2, "MIPS IV executes instead of
+  raising RI" on R4400). All 13 `mips4/` tests now pass on every cell.
+  Re-verified in the configuration that specifically provoked it — a binary with
+  **both** `mips4` and `jitv2` compiled in, run with `--cpu r4400`, where the
+  JIT has MIPS IV emitters available but the model must trap: 2101/61, all
+  `mips4/` PASS, including the `CHECK_RI` assertions.
+- `cp0/wired_reserved_bits` and `fpu/fcsr_reserved` (findings 3-4).
+- `mips4/multi_fp_cc` on R5000 (finding 1) — now reports a skip rather than a
+  failure.
+
+### Unclassified: the `fpu/vec_*` and `fpu/cvt_*` failures
+
+These five are **not** explained by the exception-model findings (6-10), which
+are all about *when a trap is taken and what it writes*. `fpu_vectors.c` checks
+computed results and flags against tables generated by `gen/fpvectors.py` with
+exact rational arithmetic. So these are about **what the FPU computes**, a
+different and more serious class.
+
+Note this contradicts the paragraph that used to sit here claiming "every vector
+in `fpu_vectors.c` ... passes on both CPUs". That was true at the 2026-08-19
+measurement and is not true now. Whether the tests or the emulator changed has
+not been determined — start by bisecting `fpu/vec_sqrt`, the narrowest of them.
+
+What remains is now entirely FPU, and entirely the same on all four cells. Most
+of it is the exception model rather than the arithmetic (see
+`rules/testing/fpu-exception-model-vs-r4400.md`): IRIS computes on the host FPU
+and delivers the correct IEEE answer where an R4400 would refuse denormals and
+trap for software assist, so it looks *more* conformant than the hardware, not
+less.
+
+The exception to that — and the part worth investigating — is the five
+`fpu/vec_*` / `fpu/cvt_*` failures, which are about computed results. All 128
+predicate results in `fpu_compare.c` still pass on both CPUs.
 
 > The total check count drifts by one or two between runs. `cp0/compare_sets_ip7`
 > executes two checks when the timer fires and one when it reports a skip, and
@@ -86,8 +139,10 @@ CPUs.
 
 - **The EFS CD.** The volume-header path is proven — `boot -f dksc(0,2,8)cputest`
   runs the whole suite — but an EFS writer does not exist yet. See PLAN.md §12.
-- **The JIT cells.** `run/matrix.sh` and the CI workflow define them; they have
-  not been run here.
+- ~~**The JIT cells.**~~ Run as of 2026-09-11: both `r4400-jitv2` and
+  `r5000-jitv2` agree exactly with their interpreter counterparts (same 15
+  failing tests). What remains unrun is the **`j2wp` whole-page** variant, which
+  `matrix.sh` does not define a cell for.
 - **Interrupt delivery.** Everything runs with `Status.IE` clear, so the suite
   tests that interrupts become *pending* but never that one is *taken*. That
   needs a handler that can distinguish an interrupt from a fault, and is the

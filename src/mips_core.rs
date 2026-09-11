@@ -90,8 +90,25 @@ pub const KSU_USER: u32 = 0b10;
 #[repr(align(64))]
 #[derive(Default)]
 pub struct Hot {
-    /// Interrupt-pending word. Bits 8..15 = IP0..IP7 (mirror CAUSE.IP
-    /// layout). Bit 63 = soft-reset request. A real atomic (unlike
+    /// Interrupt-pending word, laid out to mirror CAUSE.IP (bits 8..15 =
+    /// IP0..IP7) so the preamble can mask and merge without shifting.
+    ///
+    /// Only **IP2..IP7** are ever set here, though: those are the external
+    /// lines (devices via the IOC, plus IP7 from the compare timer on the
+    /// hptimer thread), and `EXT_INT_MASK` in mips_exec.rs merges exactly
+    /// that range into Cause. **IP0/IP1 are software interrupts, written
+    /// only by `mtc0 Cause`** (see `write_cp0`), and live in `cp0_cause`
+    /// alone — nothing external ever sets bits 8/9 of this word.
+    ///
+    /// That asymmetry matters for jitv2: compiled code samples this atomic
+    /// but never reads `cp0_cause`, so a *software* interrupt is invisible
+    /// to it. That is sound rather than a missed delivery, because IP0/IP1
+    /// cannot change inside a region — the only writers are `mtc0 Cause`
+    /// (Excluded, so it runs in `step_int`) and exception delivery (which
+    /// touches ExcCode only), and the word after either is dispatched
+    /// through the interpreter's own preamble.
+    ///
+    /// Bit 63 = soft-reset request. A real atomic (unlike
     /// `cycles` below): devices set/clear individual bits from their own
     /// thread via `fetch_or`/`fetch_and`, which needs a genuine RMW, not
     /// just eventual visibility of a monotonic count.

@@ -8760,6 +8760,18 @@ fn emit_movn(ctx: &mut EmitCtx) {
 /// `OP_COP1`), matching `exec_movci`'s dispatch through the integer funct
 /// table — registered in `lookup_semantics`, not `lookup_cp1_semantics`.
 fn emit_movci(ctx: &mut EmitCtx) {
+    // MOVF/MOVT read FCSR's condition codes, so they fault CpU when CU1 is
+    // clear — mirroring `exec_movci`. Emitted here inside the semantics
+    // rather than at the `lookup_semantics` dispatch site because MOVCI is
+    // the only entry in the *integer* table that touches CP1 state: the CP1
+    // table's dispatch arm guards every one of its entries unconditionally,
+    // which would be wrong for the ~150 genuinely-integer emitters this one
+    // shares a table with.
+    //
+    // Must be the FIRST thing emitted: the guard terminates the current block
+    // and switches to a fresh continue block, so any IR emitted before it
+    // would land in the pre-guard block.
+    emit_cp1_cu1_guard(ctx);
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
     let rd = field_rd(ctx.raw);
     let cc = (ctx.raw >> 18) & 0x7;

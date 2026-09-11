@@ -1744,6 +1744,16 @@ unsafe extern "C" fn jit_kill_entry<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_
     assert!(!exec.pcp.is_null(), "jit_kill_entry reached with no tracked PhysicalCodePage");
     let page = unsafe { &*exec.pcp };
     page.kill(offset as usize);
+    // Record the FR mode this dispatch actually wanted, so the next compile
+    // for this page re-pins to it instead of rebuilding the same wrong-mode
+    // code and guard-failing again. `emit_fr_mode_guard` is the only emitter
+    // that calls kill_entry, and it only fires when CU1 is set and live FR
+    // disagrees with the compiled mode — so live FR here IS the demanded
+    // mode. Storing the demanded mode rather than a "flip" bit keeps this
+    // idempotent across the several bails a page normally takes before its
+    // next compile — one per killed entry (see `fr_repin`'s doc comment).
+    #[cfg(feature = "j2wp")]
+    page.request_fr_repin((exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0);
     #[cfg(feature = "developer")]
     exec.jitv2.lock().stats.kill_entry_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -3658,10 +3668,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     // CompileRequest carries no offset, so whichever side
                     // compiles reads `requested` fresh (§13.3).
                     page.mark_requested(entry_offset);
+                    let live_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                    // j2wp pins FR per physical page (one function per page,
+                    // FR baked into every FPR emitter), but the pin is no
+                    // longer permanent: consume any outstanding correction
+                    // first — a re-pin demanded by an FR-guard bail, or a pin
+                    // dropped by `publish` because the page's bytes were
+                    // replaced. With neither outstanding this returns the
+                    // existing pin, so an ordinary dispatch can't re-pin a
+                    // page that was never mismatched. See `fr1`'s doc comment.
                     #[cfg(feature = "j2wp")]
-                    let compiled_for_fr1 = page.is_fr1();
+                    let compiled_for_fr1 = page.take_fr_repin(live_fr1);
                     #[cfg(not(feature = "j2wp"))]
-                    let compiled_for_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                    let compiled_for_fr1 = live_fr1;
                     let req = crate::jitv2::CompileRequest {
                         page: self.pcp,
                         #[cfg(not(feature = "j2wp"))]
@@ -4777,6 +4796,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.handle_exec_complete()
     }
     fn exec_movci(&mut self, d: &DecodedInstr) -> ExecStatus {
+        // MOVF/MOVT read the FP condition codes out of FCSR, so they are CP1
+        // accesses and take Coprocessor Unusable when CU1 is clear — exactly
+        // like the COP1-*encoded* MOVF.fmt handler (`exec_fmovcf_s`) a few
+        // hundred lines down. Easy to miss because this one is dispatched
+        // from the integer SPECIAL funct table (funct 0x01), not through any
+        // COP1 gate.
+        //
+        // IRIX unloads the FPU lazily on context switch (`swtch.c` checkfp)
+        // and sets SR_CU1 on the resulting CpU fault. Without this check a
+        // MIPS IV process resumed after a context switch reads the *previous*
+        // process's FCSR condition bits instead of faulting into the restore.
+        if (self.core.cp0_status & STATUS_CU1) == 0 { return self.cpu_unusable(1); }
         let rs_reg = d.rs as u32;
         let rd_reg = d.rd as u32;
         let cc = (d.raw >> 18) & 0x7;
@@ -8106,29 +8137,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // crashed a CU1-guard equivalence test).
         let slot = fetch.instr as *mut DecodedInstr;
         let d = unsafe { &mut *slot };
-        // SCRATCH cache-vs-physical-memory guard: compare what the cache
-        // model just handed back against a direct bus read of the same
-        // physical address (bypassing cache entirely, same primitive
-        // `j2 analyze` uses). Catches a cache line that's HIT + valid but
-        // holds bytes that disagree with real backing memory (found live:
-        // intrfast's entry word, 0x08022ab0, an L2 line reported
-        // DirtyExclusive/HIT with wrong cached content). Remove once the
-        // root cause is found.
-        {
-            let cached_raw = d.raw;
-            let tr = self.debug_translate(pc);
-            if !tr.is_exception() {
-                let phys_read = self.sysad.read32(tr.phys);
-                if phys_read.is_ok() && phys_read.data != cached_raw {
-                    eprintln!(
-                        "\n=== CACHE/MEMORY MISMATCH at pc={:#018x} phys={:#010x}: cache.raw={:#010x} bus.raw={:#010x} ===\n",
-                        pc, tr.phys, cached_raw, phys_read.data
-                    );
-                    self.core.pc = pc;
-                    return EXEC_BREAKPOINT;
-                }
-            }
-        }
         if d.flags != 0 {
             decode_into::<T, C>(d);
         }

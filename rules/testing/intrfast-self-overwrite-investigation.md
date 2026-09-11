@@ -122,3 +122,32 @@ open question. Two live hypotheses, unresolved:
 
 - [[jitv2_lockstep_region_ending_double_page_jump]] — the unrelated bug this
   session started with (fixed, unrelated to this cache finding).
+
+---
+
+## Update (2026-09-10): the SCRATCH guard has been removed
+
+The cache-vs-bus guard this investigation left behind in `interp_dispatch_one`
+(`mips_exec.rs`, ~lines 8109-8131) is **gone**. It compared the cache model's
+`d.raw` against a direct `sysad.read32` and, on mismatch, printed
+`=== CACHE/MEMORY MISMATCH ... ===`, rewound `self.core.pc = pc`, and returned
+`EXEC_BREAKPOINT`.
+
+Removed because it was actively harmful, not merely stale:
+
+- **Under `lightning` (the production build) it livelocked.** The run loop
+  discards `step_jit`'s return value entirely (`mips_exec.rs`, the 10x-unrolled
+  batch), so `EXEC_BREAKPOINT` was ignored — and because the guard *also*
+  rewound `core.pc`, the next dispatch re-fetched the same stale line and
+  re-triggered. Infinite loop, unbounded stderr spam. `EXEC_BREAKPOINT` is
+  supposed to be impossible in a `lightning` build at all.
+- **Without `lightning` it stopped the CPU thread outright** (`running.store(false)`),
+  which presents as a hang with one line on stderr.
+- A mismatch here is usually a **legitimate** stale-I$ window — the guest wrote
+  code and has not yet issued `Hit_Invalidate_I` — which on real hardware would
+  also execute stale. That is the other reason it must never stop the machine.
+- It cost a `debug_translate` + uncached bus read on **every** fallback dispatch.
+
+If the intrfast symptom recurs, recover the guard from git history — but
+re-introduce it as a `developer`-gated, rate-limited **log line only**: no
+`EXEC_BREAKPOINT`, no `core.pc` rewind.
