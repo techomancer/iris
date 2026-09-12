@@ -41,12 +41,15 @@ void con_init(void)
  * is not a small cost: it was about 78 seconds of a 117-second bare-metal
  * benchmark run, spent waiting on a port with nothing on the other end.
  *
- * Latching only when `have_testdev` is what keeps this from silently dropping
- * output: with a test device the host is reading that instead and serial is
- * redundant, and without one serial is the only sink there is, so a slow port
- * still beats no output. A PROM-booted run has a working SCC, never trips the
- * limit, and is unaffected either way — which matters, because run-prom.sh
- * decides pass or fail by grepping the serial log.
+ * Latching only when some other sink exists is what keeps this from silently
+ * dropping output: with a test device or the scsilog disk tap the run is being
+ * captured elsewhere and serial is redundant, and with neither it is the only
+ * sink there is, so a slow port still beats no output. This matters most on a
+ * real Indy with a graphics console, where the PROM never enables the channel B
+ * transmitter and every character would otherwise burn the whole spin limit.
+ * A PROM-booted run on `console=d` has a working SCC, never trips the limit,
+ * and is unaffected — which run-prom.sh depends on, since it decides pass or
+ * fail by grepping the serial log.
  */
 static void scc_putc(int c)
 {
@@ -55,7 +58,7 @@ static void scc_putc(int c)
     if (scc_dead) return;
     while (!(RD8(SCC_CHB_CMD) & SCC_RR0_TX_EMPTY)) {
         if (++spins > TX_SPIN_LIMIT) {
-            if (have_testdev) scc_dead = 1;
+            if (have_testdev || con_tap) scc_dead = 1;
             return;
         }
     }
@@ -111,8 +114,18 @@ void testdev_exit(u32 code)
     for (;;) { }
 }
 
+void (*con_tap)(int c) = 0;
+
+/* Stop writing the SCC: used when ARCS is driving the PROM's own console, which
+ * already reaches whatever that console is, serial or graphics. */
+void con_disable_scc(void)
+{
+    scc_dead = 1;
+}
+
 void con_putc(int c)
 {
+    if (con_tap) con_tap(c);
     if (c == '\n') {
         scc_putc('\r');
         if (have_testdev) WR32(TESTDEV_PUTC, '\r');

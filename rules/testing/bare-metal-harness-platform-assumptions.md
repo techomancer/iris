@@ -77,9 +77,23 @@ Reasoning, **not** tested — treat as a starting point, not as fact:
 - Anything about Octane or Origin.
 - The exact ARCS vector layout (below).
 
-No run on real SGI hardware is recorded anywhere in this repo. `run-prom.sh`
-exists and is built for it, but every number we have is the emulator's opinion
-of itself.
+**This is no longer true.** The cpu-tests suite ran on a physical SGI Indy
+(R4400 rev 6.0) on 2026-09-11 and now passes 240/240 there; the logs are in
+`cpu-tests/oracle/` and the bring-up is written up in
+[running-cpu-tests-on-real-hardware.md](running-cpu-tests-on-real-hardware.md).
+`bench/` still has no hardware run — everything it reports remains the
+emulator's opinion of itself.
+
+Two corrections to **assumption 2 (the console)** came out of that work:
+
+- On a graphics console (`console=g`) the suite emits **nothing at all**. The
+  harness drives SCC channel B directly and never goes through the PROM console,
+  so this is silence rather than degraded output. `harness/scsilog.c` exists for
+  exactly that case: it mirrors the console to fixed LBAs on the boot disk.
+- The `scc_dead` latch that bounds a wedged port used to be conditional on
+  `have_testdev`, which is 0 on real hardware — so on an unprogrammed SCC it
+  never fired and every character burned the full 100,000-iteration spin. It is
+  now `have_testdev || con_tap`, i.e. give up once anything else is capturing.
 
 ## If someone ports it: use ARCS, not per-machine drivers
 

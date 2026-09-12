@@ -1,0 +1,3 @@
+# The hardware logs are the point of this directory, not build noise: the
+# repo-root *.log rule would otherwise drop the only real-silicon evidence.
+!*.log

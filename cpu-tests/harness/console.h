@@ -35,6 +35,9 @@ static inline int is_r4400(void) { return cpu_kind == CPU_R4400; }
 /* ── Console ──────────────────────────────────────────────────────────────── */
 void con_init(void);
 void con_putc(int c);
+/* Optional second sink for every console byte; null unless a harness sets it. */
+extern void (*con_tap)(int c);
+void con_disable_scc(void);
 void con_puts(const char *s);
 void con_hex32(u32 v);
 void con_hex64(u64 v);

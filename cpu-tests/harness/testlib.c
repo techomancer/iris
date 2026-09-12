@@ -1,6 +1,8 @@
 /* testlib.c — result accounting, exception plumbing, and the runner. */
 
 #include "testlib.h"
+#include "scsilog.h"
+#include "arcs.h"
 #include "cp0.h"
 #include "excoff.h"
 
@@ -194,16 +196,33 @@ static void print_name(const char *name)
     con_putc(' ');
 }
 
+/* Every console byte also goes to the disk log and, when the PROM is present,
+ * to the ARCS console — the only sink a graphics-console Indy can show. */
+static void console_tee(int c)
+{
+    scsilog_tap(c);
+    arcs_putc(c);
+}
+
 int main(void)
 {
     unsigned gi, ti;
+    int have_arcs;
 
     con_init();
+    /* Probe before the first byte of output, so the banner is visible too. */
+    have_arcs = arcs_probe();
+    if (have_arcs) con_disable_scc();
+    con_tap = console_tee;
+    exc_clear();
+    exc_install();        /* must precede the probe: an empty GIO slot faults */
     testdev_probe();
+    /* EXC_RESUME_SKIP left the load's destination register untouched, so the
+     * magic comparison inside the probe is not by itself trustworthy. */
+    if (exc.count) have_testdev = 0;
+    exc_clear();
     identify();
     cache_detect();
-    exc_clear();
-    exc_install();
 
     con_puts("\n");
     con_puts("========================================================\n");
@@ -260,6 +279,18 @@ int main(void)
     {
         u32 rc = n_fail > 100 ? 100 : n_fail;
         con_printf("\nIRIS-CPUTEST-DONE rc=%u\n", rc);
+        /* On hardware this is the only sink there is — see scsilog.c. */
+        /* Prefer the firmware's driver: it negotiated this bus, ours did not. */
+        if (have_arcs) {
+            unsigned n;
+            const void *b = scsilog_prepare(&n);
+            con_printf("arcs disk: rc=%d\n",
+                       arcs_disk_write(SCSILOG_ARCS_PATH,
+                                       (u64)SCSILOG_LBA * 512u, b, n));
+        } else {
+            con_printf("scsilog: rc=%d\n", scsilog_flush(SCSILOG_TARGET));
+        }
+        arcs_flush();
         con_flush();          /* or the machine stops mid-line — see console.c */
         testdev_exit(rc);
     }

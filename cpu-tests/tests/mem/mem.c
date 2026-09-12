@@ -154,10 +154,24 @@ static void t_lwr_all_offsets(void)
     fill_pattern();
 
     for (o = 0; o < 4; o++) {
-        u64 v = OPAQUE(0x00000000AAAAAAAAull);
+        u64 orig = 0x00000000AAAAAAAAull;
+        u64 v = OPAQUE(orig);
         const volatile u8 *a = p + o;
+        u64 want;
         __asm__ __volatile__(A "lwr %0, 0(%1)" Z : "+r"(v) : "r"(a));
-        CHECK_EQ_AT("off", o, v, (u64)(s64)(s32)want32[o]);
+        /*
+         * The two parts genuinely differ here, which is why this is gated.
+         * On an R4400 a *partial* LWR merges into the low half and leaves the
+         * upper half of rt untouched; only the complete four-byte load
+         * sign-extends from bit 31. An R5000 sign-extends at every offset.
+         * Both measured on real silicon — R4400 rev 6.0 and R5000 rev 1.0.
+         * LWL sign-extends everywhere on both, because it always writes all
+         * 32 bits.
+         */
+        want = (o == 3 || is_r5000())
+                        ? (u64)(s64)(s32)want32[o]
+                        : ((orig & 0xFFFFFFFF00000000ull) | want32[o]);
+        CHECK_EQ_AT("off", o, v, want);
     }
 }
 

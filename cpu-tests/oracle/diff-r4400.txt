@@ -1,0 +1,36 @@
+IRIS-WRONG (0) — NEW: IRIS wrong where the suite passes it
+
+IRIS-BUG (28) — confirmed emulator bug -> docs/findings.md
+    excep/cop2_unusable
+    fpu/cmp_signalling_qnan
+    fpu/cmp_snan_any_pred
+    fpu/cmp_trap_on_signal
+    fpu/compare_nan
+    fpu/cvt_out_of_range
+    fpu/cvt_s_d_rounds
+    fpu/double_invalid_ops
+    fpu/inexact_flag
+    fpu/invalid_operations
+    fpu/overflow_flag
+    fpu/qnan_operand
+    fpu/snan_operands
+    fpu/trap_disabled_control
+    fpu/trap_enable_selective
+    fpu/trap_inexact
+    fpu/trap_invalid
+    fpu/trap_overflow
+    fpu/trap_overflow_via_i
+    fpu/vec_arith_double
+    fpu/vec_arith_single
+    fpu/vec_cvt_from_l
+    fpu/vec_sqrt
+    mem/lwr_all_offsets
+    mips4/fp_cond_move_d
+    mips4/fp_cond_move_s
+    mips4/recip_rsqrt
+    mips4/recip_rsqrt_d
+
+TEST-BUG (0) — the test is wrong -> docs/gotchas.md
+
+both pass: 211
+not compared: cp0/count_writable (known non-deterministic under IRIS)

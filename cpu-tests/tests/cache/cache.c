@@ -86,6 +86,7 @@ static void t_index_store_load_tag(void)
 
         cp0_taglo_set(0xFFFFFFFFu);          /* poison, so a no-op is visible */
         CACHE_OP(CACHE_D | CACHE_OP_IDX_LOAD_TAG, line);
+        CACHE_TAG_HAZARD();
         CHECK_EQ_AT("idx", idx, cp0_taglo(), 0u);
     }
 

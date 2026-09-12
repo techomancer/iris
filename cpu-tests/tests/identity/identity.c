@@ -11,7 +11,11 @@
 static void t_prid(void)
 {
     u32 prid = cp0_prid();
-    CHECK_EQ(prid, is_r5000() ? PRID_R5000 : PRID_R4400);
+    /* Only the implementation field names the part. The low byte is the silicon
+     * revision and legitimately varies: IRIS models an R4400 rev 4.0, the Indy
+     * this was validated on is rev 6.0 (PRId 0x460). Asserting the whole
+     * register made a real CPU fail for being real. */
+    CHECK_EQ(PRID_IMP(prid), (u32)(is_r5000() ? IMP_R5000 : IMP_R4400));
     /* PRId is read-only: a write must not stick. Not written via a macro
      * because there is no cp0_prid_set — that is the point. */
     {
@@ -25,7 +29,10 @@ static void t_prid(void)
 
 static void t_fir(void)
 {
-    CHECK_EQ(fir(), is_r5000() ? FIR_R5000 : FIR_R4000);
+    /* Same story as PRId: the low byte is a revision. A real R5000 rev 1.0
+     * reports FIR 0x2310 where IRIS models 0x2300. Both FIR_* constants end in
+     * a zero byte, so masking it off compares the part, not the stepping. */
+    CHECK_EQ(fir() & ~0xFFu, (u32)(is_r5000() ? FIR_R5000 : FIR_R4000));
 }
 
 /* Config.IC/DC encode cache size as 2^(12+n) bytes; IB/DB are the line size,

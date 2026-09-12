@@ -49,15 +49,26 @@ static void t_random_read_only_and_moves(void)
 static void t_random_respects_wired(void)
 {
     unsigned i;
-    u32 low = 0, high = 0;
+    u32 low = 0, high = 0, min = 0x3F;
+
     cp0_wired_set(40);
     for (i = 0; i < 2000; i++) {
         u32 r = cp0_random() & 0x3F;
         if (r < 40) low++;
+        if (r < min) min = r;
         if (r > TLB_ENTRIES - 1) high++;
     }
-    CHECK_EQ(low, 0u);
+    /*
+     * Random never exceeds the last TLB entry — that much holds on silicon.
+     * The floor does not: an Indy R4400 rev 6.0 puts 250 of 2000 samples below
+     * Wired, which is exactly one in eight, and Wired=40 leaves an eight-entry
+     * cycle — so one position in each cycle reads low. A 512-sample warm-up
+     * changed nothing, so it is not a settling effect after the Wired write.
+     * The minimum is reported rather than asserted until the mechanism is
+     * known; inventing an expectation for it would only freeze today's guess.
+     */
     CHECK_EQ(high, 0u);
+    con_printf("\n      [random: %u/2000 below Wired=40, min=%u]", low, min);
     cp0_wired_set(0);
 }
 

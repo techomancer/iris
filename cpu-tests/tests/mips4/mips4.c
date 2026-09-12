@@ -57,6 +57,24 @@ static void report_exc(const char *what)
         CHECK_EQ(CAUSE_EXC(exc.cause), (u32)EXC_RI);                       \
     } while (0)
 
+/*
+ * The same for COP1 (major opcode 0x46) encodings. A real R4400 dispatches
+ * these to the FPU, which signals Unimplemented Operation through the
+ * floating-point exception — EXC_FPE, not EXC_RI. Reserved Instruction is what
+ * the integer unit raises for an undecodable main opcode; a COP1 word is a
+ * valid instruction that coprocessor 1 must decode and reject itself.
+ * Confirmed on an Indy R4400 rev 6.0 (PRId 0x460) — the emulator and this
+ * suite previously agreed on EXC_RI, and both were wrong. See
+ * rules/testing/running-cpu-tests-on-real-hardware.md.
+ */
+#define CHECK_COP1_UNIMPL(word_literal)                                    \
+    do {                                                                   \
+        exc_clear();                                                       \
+        __asm__ __volatile__(A ".word " word_literal Z);                   \
+        CHECK_EQ(exc.count, 1u);                                           \
+        CHECK_EQ(CAUSE_EXC(exc.cause), (u32)EXC_FPE);                      \
+    } while (0)
+
 /* ── conditional moves on GPRs: MOVN / MOVZ ───────────────────────────────── */
 
 /*
@@ -145,8 +163,8 @@ static void t_pref(void)
 static void t_recip_rsqrt(void)
 {
     if (is_r4400()) {
-        CHECK_RI("0x46000095");     /* recip.s $f2, $f0 */
-        CHECK_RI("0x46000096");     /* rsqrt.s $f2, $f0 */
+        CHECK_COP1_UNIMPL("0x46000095");     /* recip.s $f2, $f0 */
+        CHECK_COP1_UNIMPL("0x46000096");     /* rsqrt.s $f2, $f0 */
         return;
     }
     {

@@ -1,0 +1,265 @@
+
+========================================================
+ IRIS CPU test suite   cpu=R4400
+   PRId   0x00000460    FIR    0x00000500
+   Config 0x20c1c483    testdev no   L2 yes
+========================================================
+identity/prid .............................. PASS
+identity/fir ............................... PASS
+identity/cache_geometry .................... PASS
+identity/config_k0 ......................... PASS
+identity/tlb_size .......................... PASS
+alu/addu_sign_extends ...................... PASS
+alu/addiu_sign_extends ..................... PASS
+alu/subu_sign_extends ...................... PASS
+alu/sll_sign_extends ....................... PASS
+alu/srl_uses_low32 ......................... PASS
+alu/sra_uses_low32 ......................... PASS
+alu/variable_shift_mask .................... PASS
+alu/dsll_dsrl_dsra ......................... PASS
+alu/dshift32_variants ...................... PASS
+alu/dsllv_mask ............................. PASS
+alu/add_overflow_traps ..................... PASS
+alu/addu_no_trap ........................... PASS
+alu/addi_overflow_traps .................... PASS
+alu/add_overflow_negative .................. PASS
+alu/add_mixed_signs_ok ..................... PASS
+alu/sub_overflow_traps ..................... PASS
+alu/dadd_overflow_traps .................... PASS
+alu/dadd_no_ov_at_32bit .................... PASS
+alu/daddu_no_trap .......................... PASS
+alu/dsub_overflow_traps .................... PASS
+alu/logical_64bit .......................... PASS
+alu/imm_logic_zero_extends ................. PASS
+alu/addiu_imm_sign_extends ................. PASS
+alu/daddiu_imm_sign_extends ................ PASS
+alu/lui_sign_extends ....................... PASS
+alu/slt_signed ............................. PASS
+alu/sltu_unsigned .......................... PASS
+alu/sltiu_sign_extend ...................... PASS
+alu/zero_register .......................... PASS
+muldiv/mult_signed ......................... PASS
+muldiv/mult_wide_product ................... PASS
+muldiv/mult_lo_sign_extend ................. PASS
+muldiv/multu ............................... PASS
+muldiv/multu_unsigned_ops .................. PASS
+muldiv/dmult ............................... PASS
+muldiv/dmultu_wide ......................... PASS
+muldiv/dmult_no_32bit_ext .................. PASS
+muldiv/div_signed .......................... PASS
+muldiv/divu ................................ PASS
+muldiv/divu_not_signed ..................... PASS
+muldiv/ddiv ................................ PASS
+muldiv/ddivu ............................... PASS
+muldiv/div_overflow_no_trap ................ 
+      [div 0x80000000/-1: lo=0xffffffff80000000 hi=0x0000000000000000]PASS
+muldiv/ddiv_overflow_no_trap ............... 
+      [ddiv min/-1: lo=0x8000000000000000 hi=0x0000000000000000]PASS
+muldiv/div_by_zero_no_trap ................. 
+      [div/0: lo=0xffffffffffffffff hi=0x000000000000002a  divu/0: lo=0xffffffffffffffff hi=0x000000000000002a]PASS
+muldiv/mthi_mtlo ........................... PASS
+muldiv/mult_writes_both .................... PASS
+mem/load_widths_sign ....................... PASS
+mem/store_widths ........................... PASS
+mem/negative_displacement .................. PASS
+mem/lwl_all_offsets ........................ PASS
+mem/lwr_all_offsets ........................ PASS
+mem/lwl_lwr_unaligned ...................... PASS
+mem/swl_all_offsets ........................ PASS
+mem/swr_all_offsets ........................ PASS
+mem/swl_swr_unaligned ...................... PASS
+mem/ldl_ldr_unaligned ...................... PASS
+mem/ldl_preserves_low ...................... PASS
+mem/sdl_sdr_unaligned ...................... PASS
+mem/unaligned_lw_faults .................... PASS
+mem/unaligned_ld_faults .................... PASS
+mem/unaligned_sw_faults .................... PASS
+mem/unaligned_lh_faults .................... PASS
+mem/unaligned_family_ok .................... PASS
+mem/kseg0_kseg1_alias ...................... PASS
+branch/beq_bne ............................. PASS
+branch/beq_64bit_compare ................... PASS
+branch/bgez_bltz ........................... PASS
+branch/bgtz_blez ........................... PASS
+branch/sign_test_64bit ..................... PASS
+branch/likely_nullifies .................... PASS
+branch/regimm_likely ....................... PASS
+branch/bal_links_pc_plus_8 ................. PASS
+branch/jalr_explicit_rd .................... PASS
+branch/delay_slot_sets_ra .................. PASS
+branch/jr_delay_slot ....................... PASS
+branch/load_in_delay_slot .................. PASS
+branch/exc_in_delay_slot ................... PASS
+branch/exc_no_delay_slot ................... PASS
+branch/backward_branch ..................... PASS
+excep/syscall .............................. PASS
+excep/break ................................ PASS
+excep/teq_tne .............................. PASS
+excep/tlt_tge .............................. PASS
+excep/trap_immediate ....................... PASS
+excep/reserved_instruction ................. PASS
+excep/cop1_unusable ........................ PASS
+excep/cop1_usable .......................... PASS
+excep/cop2_unusable ........................ 
+      [cop2 with CU2 set: exceptions=0]PASS
+excep/exl_set_and_cleared .................. PASS
+excep/no_spurious_int ...................... PASS
+excep/handler_preserves_gpr ................ PASS
+excep/epc_is_faulting_insn ................. PASS
+excep/exl_preserves_epc .................... PASS
+excep/general_vector ....................... PASS
+cp0/prid_read_only ......................... PASS
+cp0/random_moves ........................... PASS
+cp0/random_respects_wired .................. 
+      [random: 0/2000 below Wired=40, min=40]PASS
+cp0/wired_reserved_bits .................... PASS
+cp0/wired_resets_random .................... PASS
+cp0/pagemask_reserved ...................... PASS
+cp0/pagemask_all_sizes ..................... PASS
+cp0/status_bits ............................ PASS
+cp0/cause_read_only ........................ PASS
+cp0/software_int_bits ...................... PASS
+cp0/entryhi_64bit .......................... PASS
+cp0/entrylo_round_trip ..................... PASS
+cp0/entryhi_fill_zero ...................... PASS
+cp0/context_ptebase ........................ PASS
+cp0/xcontext_ptebase ....................... PASS
+cp0/count_advances ......................... PASS
+cp0/count_writable ......................... PASS
+cp0/compare_round_trip ..................... PASS
+cp0/compare_sets_ip7 ....................... PASS
+cp0/eret_clears_ll ......................... PASS
+cp0/ll_sc_succeeds ......................... PASS
+tlb/tlbwi_tlbr ............................. PASS
+tlb/all_entries ............................ PASS
+tlb/tlbp_hit_miss .......................... PASS
+tlb/page_sizes ............................. PASS
+tlb/translation_works ...................... PASS
+tlb/invalid_page_tlbl ...................... PASS
+tlb/readonly_page_mod ...................... PASS
+tlb/asid_match ............................. PASS
+tlb/global_ignores_asid .................... PASS
+tlb/refill_context ......................... 
+      [refill vector = 2 (1=TLB 2=XTLB), Status.KX=1]PASS
+fpu/mtc1_mfc1 .............................. PASS
+fpu/dmtc1_dmfc1 ............................ PASS
+fpu/load_store ............................. PASS
+fpu/arith_single ........................... PASS
+fpu/mov_abs_neg_bitwise .................... PASS
+fpu/signed_zero ............................ PASS
+fpu/infinity ............................... PASS
+fpu/divide_by_zero ......................... PASS
+fpu/invalid_operations ..................... PASS
+fpu/sqrt_negative .......................... PASS
+fpu/arith_double ........................... PASS
+fpu/convert_formats ........................ PASS
+fpu/cvt_w_rounding ......................... PASS
+fpu/fixed_rounding ......................... PASS
+fpu/long_conversions ....................... PASS
+fpu/compare_ordered ........................ PASS
+fpu/compare_nan ............................ PASS
+fpu/bc1t_bc1f .............................. PASS
+fpu/bc1tl_nullifies ........................ PASS
+fpu/flags_sticky ........................... PASS
+fpu/inexact_flag ........................... PASS
+fpu/overflow_flag .......................... PASS
+fpu/fcsr_reserved .......................... PASS
+fpu/fcsr_rm_round_trip ..................... PASS
+fpu/fr0_pair_aliasing ...................... PASS
+fpu/fr1_independent ........................ PASS
+fpu/trap_invalid ........................... PASS
+fpu/trap_divide_by_zero .................... PASS
+fpu/trap_overflow .......................... PASS
+fpu/trap_inexact ........................... PASS
+fpu/trap_overflow_via_i .................... PASS
+fpu/trap_sqrt_negative ..................... PASS
+fpu/trap_disabled_control .................. PASS
+fpu/trap_enable_selective .................. PASS
+fpu/trap_ctc1_arms ......................... PASS
+fpu/trap_ctc1_quiet ........................ PASS
+fpu/cause_per_instruction .................. PASS
+fpu/cause_not_by_moves ..................... PASS
+fpu/trap_epc ............................... PASS
+fpu/trap_delay_slot ........................ PASS
+fpu/fs_bit_round_trip ...................... PASS
+fpu/denorm_operand ......................... 
+      [denorm operand with FS=1: exc=1 code=15 cause=0x00000020 flags=0x00000000 result=0x5a5a5a5a]PASS
+fpu/qnan_operand ........................... PASS
+fpu/denorm_compare ......................... PASS
+fpu/denorm_move ............................ PASS
+fpu/denorm_result_fs0 ...................... PASS
+fpu/denorm_result_fs1 ...................... PASS
+fpu/underflow_enable_e ..................... PASS
+fpu/denorm_double .......................... PASS
+fpu/cmp_all_predicates_s ................... PASS
+fpu/cmp_all_predicates_d ................... PASS
+fpu/cmp_signalling_qnan .................... PASS
+fpu/cmp_snan_any_pred ...................... PASS
+fpu/cmp_trap_on_signal ..................... PASS
+fpu/cmp_double_zeros ....................... PASS
+fpu/cmp_c_bit_ownership .................... PASS
+fpu/vec_arith_single ....................... PASS
+fpu/vec_arith_double ....................... PASS
+fpu/vec_sqrt ............................... PASS
+fpu/vec_rounding_modes ..................... PASS
+fpu/vec_cvt_w_s ............................ PASS
+fpu/vec_cvt_w_d ............................ PASS
+fpu/vec_cvt_l_s ............................ PASS
+fpu/vec_cvt_l_d ............................ PASS
+fpu/vec_cvt_from_w ......................... PASS
+fpu/vec_cvt_from_l ......................... PASS
+fpu/double_mov_bitwise ..................... PASS
+fpu/double_abs_neg ......................... PASS
+fpu/double_signed_zero ..................... PASS
+fpu/double_infinity ........................ PASS
+fpu/double_invalid_ops ..................... PASS
+fpu/cvt_d_s_exact .......................... PASS
+fpu/cvt_s_d_rounds ......................... PASS
+fpu/cvt_s_d_rm ............................. PASS
+fpu/fr0_lwc1_halves ........................ PASS
+fpu/fr0_swc1_halves ........................ PASS
+fpu/fr0_mtc1_mfc1 .......................... PASS
+fpu/fr0_double_arith ....................... PASS
+fpu/fr0_single_arith ....................... PASS
+fpu/fr0_odd_undefined ...................... 
+      [FR=0 add.s on odd registers: result=0x00000000 exc=0]PASS
+fpu/fr_mode_switch ......................... 
+      [FR=1 $f0=1111111122222222 $f1=3333333344444444 -> FR=0 pair reads 0x1111111122222222]PASS
+fpu/fr_bit_writable ........................ PASS
+fpu/all_registers .......................... PASS
+fpu/snan_operands .......................... PASS
+fpu/cvt_out_of_range ....................... 
+      [cvt.w.s of 2^31: exc=1 cause=0x00000020 result=0x5a5a5a5a]PASS
+fpu/cvt_infinity ........................... 
+      [cvt.w.s of +inf: exc=1 cause=0x00000020 result=0x5a5a5a5a]PASS
+fpu/unaligned_access ....................... PASS
+fpu/unaligned_badvaddr ..................... PASS
+cache/geometry ............................. 
+      [I$ 16384/16B  D$ 16384/16B  L2 present]PASS
+cache/index_tag_rt ......................... PASS
+cache/cached_uncached ...................... 
+      [unflushed: k0[0]=0x00002000 k1[0]=0x00001000]PASS
+cache/hit_inv_discards ..................... PASS
+cache/set_conflict ......................... PASS
+cache/icache_coherency ..................... PASS
+cache/kernel_mode_ok ....................... PASS
+cache/miss_is_noop ......................... PASS
+mips4/movn_movz ............................ PASS
+mips4/pref ................................. PASS
+mips4/recip_rsqrt .......................... PASS
+mips4/movci ................................ PASS
+mips4/cop1x ................................ PASS
+mips4/multi_fp_cc .......................... 
+      [c.eq.s cc=3 on R4400: exc=0 code=0]PASS
+mips4/mips3_control ........................ PASS
+mips4/recip_rsqrt_d ........................ PASS
+mips4/cop1x_memory ......................... PASS
+mips4/madd_family_s ........................ PASS
+mips4/madd_family_d ........................ PASS
+mips4/fp_cond_move_s ....................... PASS
+mips4/fp_cond_move_d ....................... PASS
+========================================================
+ RESULT: 2164 checks passed, 0 failed  (240 tests)
+========================================================
+
+IRIS-CPUTEST-DONE rc=0

@@ -209,3 +209,100 @@ Two independent races, both of which had to be fixed:
 
 The first one loses the bytes for good; the second only reads too early. Both
 produce the same symptom, which is why fixing one of them was not enough.
+
+## The suite had quiet and signalling NaNs the wrong way round — **confirmed on hardware**
+
+*Found by running the suite on an Indy R4400 rev 6.0 (PRId `0x460`).*
+
+Both the arithmetic and the comparison tests asserted the opposite of what real
+silicon does, and IRIS agreed with them, so nothing showed up until the suite
+ran on the machine itself. This is the case the oracle exists for: an emulator
+and its tests can agree with each other indefinitely.
+
+| case | the suite asserted | the R4400 actually does |
+|---|---|---|
+| QNaN operand, arithmetic | Unimplemented Operation, nothing stored | no trap; delivers `0x7FBFFFFF` |
+| SNaN operand, arithmetic | no trap, Invalid **flag** set | Unimplemented Operation, no flag set |
+| QNaN operand, compare | Invalid on signalling predicates only | Invalid on **every** predicate |
+| SNaN operand, compare | Invalid on every predicate | Invalid on **signalling predicates only** |
+
+The two compare rows are exactly each other's old expectations — the tables were
+swapped. Note the flag rule that makes the arithmetic rows consistent: when a
+floating-point exception is taken the hardware does not set the flag bits, so a
+trap and a flag are mutually exclusive rather than complementary.
+
+Affects `fpu/qnan_operand`, `fpu/snan_operands`, `fpu/compare_nan`,
+`fpu/cmp_signalling_qnan`, `fpu/cmp_snan_any_pred`, `fpu/cmp_trap_on_signal`.
+
+## An unimplemented COP1 encoding raises FPE, not Reserved Instruction — **confirmed on hardware**
+
+*Found by `mips4/fp_cond_move_s`, `_d`, `mips4/recip_rsqrt`, `recip_rsqrt_d`.*
+
+MIPS IV instructions in the **COP1** major opcode (`0x46`) do not raise Reserved
+Instruction on an R4400. The CPU dispatches the word to coprocessor 1, which
+signals **Unimplemented Operation** — `EXC_FPE` (15), FCSR `Cause.E`. Reserved
+Instruction is what the integer unit raises for an undecodable *main* opcode,
+which is why `mips4/movci` (SPECIAL) and `mips4/pref` still assert `EXC_RI` and
+still pass.
+
+`CHECK_COP1_UNIMPL` now covers the COP1 encodings; `CHECK_RI` keeps the rest.
+
+## `cvt.s.l` / `cvt.d.l` will not round past 2^53 — **confirmed on hardware**
+
+*Found by `fpu/vec_cvt_from_l`.*
+
+An R4400 refuses a 64-bit integer outside the range a double represents exactly.
+`2^40 + 1` converts; `2^53 + 1` and `2^62` both raise Unimplemented Operation
+(ExcCode 15, FCSR `Cause.E` = `0x00020000`) and write nothing — in *both*
+precisions, whatever flags the result would have carried. The test now derives
+the threshold from the input value rather than listing the vector indices.
+
+## LWR does not sign-extend a partial load — **confirmed on hardware**
+
+*Found by `mem/lwr_all_offsets`.*
+
+A partial `LWR` merges bytes into the low half and leaves the upper 32 bits of
+`rt` untouched. Only the complete four-byte load sign-extends from bit 31.
+`LWL` sign-extends at every offset, because it always writes all 32 bits — so
+the two are not symmetric, and asserting that they were made real silicon fail.
+
+## `mfc2` with CU2 set raises nothing — **confirmed on hardware**
+
+*Found by `excep/cop2_unusable`.*
+
+With `Status.CU2` **set**, an R4400 executes a COP2 access without any
+exception: nothing tells the CPU that coprocessor 2 is absent rather than merely
+present and enabled, so the access completes with an undefined result. The
+absent-coprocessor case is only observable with CU2 clear.
+
+## PRId carries a revision, and real silicon has a different one
+
+*Found by `identity/prid`.*
+
+The test compared the whole register against `0x440`. A real Indy reports
+`0x460` — the same implementation (`imp = 0x04`) at revision **6.0** rather than
+the 4.0 IRIS models. Only the implementation field names the part; asserting the
+low byte made a genuine R4400 fail for being genuine.
+
+## Index_Load_Tag needs hazard spacing before the TagLo read
+
+*Found by `cache/index_tag_rt`.*
+
+`CACHE_OP` emitted the `cache` instruction with no following spacing. IRIS
+updates `TagLo` instantly, so the test passed there; on real silicon every tag
+read back as the poison value the test had written, because the `mfc0` ran
+before `Index_Load_Tag` landed. `CACHE_TAG_HAZARD()` is kept separate from
+`CACHE_OP` so the bulk cache sweeps do not pay for it.
+
+## Random dips below Wired depending on your sampling stride
+
+*Found by `cp0/random_respects_wired`.*
+
+An early hardware run reported 250 of 2000 samples below `Wired` — exactly one
+in eight, with `Wired = 40` leaving an eight-entry cycle. The number was
+identical across two runs, and then went to **zero** when the sampling loop
+changed length. So it is a stride artifact: `Random` transiently reads below
+`Wired` at the wrap, and whether you observe it depends on how many
+instructions separate your samples. The test now asserts only the invariant that
+held (`Random` never exceeds the last entry) and *reports* the count and
+minimum, rather than freezing a guess about the mechanism.

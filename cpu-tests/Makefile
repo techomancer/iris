@@ -42,7 +42,7 @@ CFLAGS    := $(ARCHFLAGS) -ffreestanding -nostdlib -nostdinc \
 ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib -Iharness -g -Wa,--fatal-warnings
 LDFLAGS   := -EB -T harness/link.ld -nostdlib --no-warn-mismatch
 
-HARNESS_C := harness/console.c harness/testlib.c
+HARNESS_C := harness/console.c harness/testlib.c harness/scsilog.c harness/arcs.c
 HARNESS_S := harness/start.S
 TEST_C    := $(sort $(wildcard tests/*/*.c))
 TEST_S    := $(sort $(wildcard tests/*/*.S))

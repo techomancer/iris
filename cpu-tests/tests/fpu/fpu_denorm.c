@@ -105,12 +105,24 @@ static void t_denorm_operand_is_unimplemented(void)
  * surprises people: an R4400 does not propagate a NaN through ADD in hardware,
  * it traps and lets software do it. (MOV is exempt — see below.)
  */
-static void t_qnan_operand_is_unimplemented(void)
+/*
+ * A *quiet* NaN operand is handled in hardware: no trap, and the canonical
+ * MIPS quiet NaN 0x7FBFFFFF is delivered. It is the *signalling* NaN that the
+ * R4400 cannot complete — see fpu/snan_operands. This suite had the two the
+ * wrong way round, and IRIS agreed with it, until an Indy R4400 rev 6.0 ran
+ * the suite and disagreed with both.
+ */
+static void t_qnan_operand_propagates(void)
 {
     struct fp_obs o = observe_s(F_QNAN, F_1, 0, op_add_s);
 
-    if (is_r4400()) check_unimplemented(&o, 0);
-    else            report_obs("qNaN operand, R5000", &o, 0);
+    if (is_r4400()) {
+        CHECK_EQ(o.exceptions, 0u);
+        CHECK_EQ(o.cause & FP_E, 0u);
+        CHECK_EQ(o.result, 0x7FBFFFFFu);
+    } else {
+        report_obs("qNaN operand, R5000", &o, 0);
+    }
 }
 
 /* Compare is explicitly exempt — "Denormalized operand, except for Compare
@@ -249,7 +261,7 @@ static void t_denorm_double(void)
 static const struct test tests[] = {
     TEST("fpu/fs_bit_round_trip",   t_fs_bit_round_trip,                 CPU_ALL),
     TEST("fpu/denorm_operand",      t_denorm_operand_is_unimplemented,   CPU_ALL),
-    TEST("fpu/qnan_operand",        t_qnan_operand_is_unimplemented,     CPU_ALL),
+    TEST("fpu/qnan_operand",        t_qnan_operand_propagates,           CPU_ALL),
     TEST("fpu/denorm_compare",      t_denorm_compare_does_not_trap,      CPU_ALL),
     TEST("fpu/denorm_move",         t_denorm_move_does_not_trap,         CPU_ALL),
     TEST("fpu/denorm_result_fs0",   t_denorm_result_without_fs,          CPU_ALL),

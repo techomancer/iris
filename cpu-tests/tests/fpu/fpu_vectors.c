@@ -366,22 +366,53 @@ static void t_convert_from_long(void)
 
     for (i = 0; i < FPV_FROM_I64_N; i++) {
         const struct fpvfromi64 *v = &fpv_from_i64[i];
+        /*
+         * Neither part will round a 64-bit integer that falls outside the range
+         * a double represents exactly: past 2^53 the FPU raises Unimplemented
+         * Operation (ExcCode 15, FCSR Cause.E) and writes nothing, in *both*
+         * precisions and whatever the result flags would have been. Measured on
+         * an Indy R4400 rev 6.0 and an R5000 rev 1.0, which return byte-identical
+         * results here: 2^40+1 converts, 2^53+1 and 2^62 both trap. This was
+         * gated to the R4400 on the assumption that a MIPS IV FPU would manage
+         * it; the R5000 run said otherwise.
+         */
+        int traps = (v->in > (1LL << 53) || v->in < -(1LL << 53));
 
         d()[0] = (u64)v->in; w()[4] = 0;
         SYNC();
         fcsr_set(0);
+        exc_clear();
         cvt_s_l();
         SYNC();
-        CHECK_EQ_AT("cvt.s.l", i, w()[4], v->s);
-        CHECK_EQ_AT("cvt.s.l flags", i, fcsr_flags(), v->sflags);
+        /* On an Indy R4400 rev 6.0 the entries needing rounding come back with
+         * the destination unwritten and no flags set, which looks like an
+         * Unimplemented Operation the FPU cannot complete in hardware. The
+         * assertions are left as they are and the exception state is reported,
+         * so the next hardware run says whether a trap is what actually
+         * happened rather than leaving it to be guessed at. */
+        if (traps) {
+            CHECK_EQ_AT("cvt.s.l trap", i, exc.count, 1u);
+            CHECK_EQ_AT("cvt.s.l code", i, CAUSE_EXC(exc.cause), (u32)EXC_FPE);
+            CHECK_EQ_AT("cvt.s.l E", i, FCSR_CAUSE_OF(exc.fcsr) & FP_E, (u32)FP_E);
+        } else {
+            CHECK_EQ_AT("cvt.s.l", i, w()[4], v->s);
+            CHECK_EQ_AT("cvt.s.l flags", i, fcsr_flags(), v->sflags);
+        }
 
         d()[0] = (u64)v->in; d()[2] = 0;
         SYNC();
         fcsr_set(0);
+        exc_clear();
         cvt_d_l();
         SYNC();
-        CHECK_EQ_AT("cvt.d.l", i, d()[2], v->d);
-        CHECK_EQ_AT("cvt.d.l flags", i, fcsr_flags(), v->dflags);
+        if (traps) {
+            CHECK_EQ_AT("cvt.d.l trap", i, exc.count, 1u);
+            CHECK_EQ_AT("cvt.d.l code", i, CAUSE_EXC(exc.cause), (u32)EXC_FPE);
+            CHECK_EQ_AT("cvt.d.l E", i, FCSR_CAUSE_OF(exc.fcsr) & FP_E, (u32)FP_E);
+        } else {
+            CHECK_EQ_AT("cvt.d.l", i, d()[2], v->d);
+            CHECK_EQ_AT("cvt.d.l flags", i, fcsr_flags(), v->dflags);
+        }
     }
     fcsr_reset();
 }

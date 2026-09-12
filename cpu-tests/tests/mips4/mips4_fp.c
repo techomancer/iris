@@ -46,6 +46,24 @@ static volatile u64 *dw(void) { return (volatile u64 *)_scratch_start; }
     } while (0)
 
 /*
+ * The same for COP1 (major opcode 0x46) encodings. A real R4400 dispatches
+ * these to the FPU, which signals Unimplemented Operation through the
+ * floating-point exception — EXC_FPE, not EXC_RI. Reserved Instruction is what
+ * the integer unit raises for an undecodable main opcode; a COP1 word is a
+ * valid instruction that coprocessor 1 must decode and reject itself.
+ * Confirmed on an Indy R4400 rev 6.0 (PRId 0x460) — the emulator and this
+ * suite previously agreed on EXC_RI, and both were wrong. See
+ * rules/testing/running-cpu-tests-on-real-hardware.md.
+ */
+#define CHECK_COP1_UNIMPL(word_literal)                                    \
+    do {                                                                   \
+        exc_clear();                                                       \
+        __asm__ __volatile__(A ".word " word_literal Z);                   \
+        CHECK_EQ(exc.count, 1u);                                           \
+        CHECK_EQ(CAUSE_EXC(exc.cause), (u32)EXC_FPE);                      \
+    } while (0)
+
+/*
  * The same, for the COP1X encodings, which name $13 as base and $14 as index:
  * point them at the scratch area first. Without that the literal runs — on a
  * CPU that wrongly accepts it — against whatever the compiler happened to
@@ -88,8 +106,8 @@ static volatile u64 *dw(void) { return (volatile u64 *)_scratch_start; }
 static void t_recip_rsqrt_double(void)
 {
     if (is_r4400()) {
-        CHECK_RI("0x46200095");
-        CHECK_RI("0x46200096");
+        CHECK_COP1_UNIMPL("0x46200095");
+        CHECK_COP1_UNIMPL("0x46200096");
         return;
     }
 
@@ -266,10 +284,10 @@ static void t_multiply_add_family_double(void)
 static void t_fp_conditional_moves_single(void)
 {
     if (is_r4400()) {
-        CHECK_RI("0x46010111");
-        CHECK_RI("0x46000111");
-        CHECK_RI("0x460D0113");
-        CHECK_RI("0x460D0112");
+        CHECK_COP1_UNIMPL("0x46010111");
+        CHECK_COP1_UNIMPL("0x46000111");
+        CHECK_COP1_UNIMPL("0x460D0113");
+        CHECK_COP1_UNIMPL("0x460D0112");
         return;
     }
     {
@@ -343,8 +361,8 @@ static void t_fp_conditional_moves_single(void)
 static void t_fp_conditional_moves_double(void)
 {
     if (is_r4400()) {
-        CHECK_RI("0x46210111");
-        CHECK_RI("0x462D0113");
+        CHECK_COP1_UNIMPL("0x46210111");
+        CHECK_COP1_UNIMPL("0x462D0113");
         return;
     }
     {

@@ -183,13 +183,13 @@ static void t_cop2_always_unusable(void)
      * -march=mips3 target that has no COP2. */
     __asm__ __volatile__(A ".word 0x480C0000" Z ::: "$12");
     cp0_status_set(saved);
-    /* Either Coprocessor Unusable (CE=2) or Reserved Instruction is defensible
-     * for a coprocessor that is not merely disabled but absent. Accept both,
-     * and report which. */
-    CHECK_EQ(exc.count, 1u);
-    CHECK(CAUSE_EXC(exc.cause) == EXC_CPU || CAUSE_EXC(exc.cause) == EXC_RI);
-    con_printf("\n      [cop2: ExcCode=%u CE=%u]",
-               CAUSE_EXC(exc.cause), (exc.cause & CAUSE_CE_MASK) >> CAUSE_CE_SHIFT);
+    /* With CU2 *set*, a real R4400 takes no exception at all: nothing tells the
+     * CPU that coprocessor 2 is absent rather than merely present-and-enabled,
+     * so the access simply executes and returns an undefined value. Confirmed
+     * on an Indy R4400 rev 6.0, where this asserted an exception that never
+     * came. The absent-coprocessor case is only observable with CU2 clear. */
+    CHECK_EQ(exc.count, 0u);
+    con_printf("\n      [cop2 with CU2 set: exceptions=%u]", exc.count);
 }
 
 /* ── Status and Cause around an exception ─────────────────────────────────── */

@@ -386,3 +386,96 @@ would invent a requirement:
 
 See [oracle.md](oracle.md) for the standing rule on where expected values come
 from.
+
+---
+
+## Hardware confirmation — every FP failure in this suite is a real IRIS bug
+
+On 2026-09-11 the suite ran on a physical **SGI Indy, R4400 rev 6.0**
+(PRId `0x460`, Config `0x20c1c483`), booted from a BlueSCSI v2 through the
+machine's own PROM. Method and bring-up are in
+[`rules/testing/running-cpu-tests-on-real-hardware.md`](../../rules/testing/running-cpu-tests-on-real-hardware.md);
+the logs are archived under [`oracle/`](../oracle/).
+
+The result settles what this file exists to ask. **All 15 tests that fail under
+IRIS pass on real silicon**, so every one is a genuine emulator bug and not a
+bad expectation:
+
+```
+fpu/cvt_out_of_range      fpu/trap_disabled_control   fpu/vec_arith_double
+fpu/cvt_s_d_rounds        fpu/trap_enable_selective   fpu/vec_arith_single
+fpu/double_invalid_ops    fpu/trap_inexact            fpu/vec_sqrt
+fpu/inexact_flag          fpu/trap_invalid
+fpu/invalid_operations    fpu/trap_overflow
+fpu/overflow_flag         fpu/trap_overflow_via_i
+```
+
+Not one landed in `gotchas.md`. The first hardware diff produced **zero**
+test-side failures among them — the suite's existing findings were all real.
+
+### The suite was also wrong, in the other direction
+
+The same run found **16 tests that pass under IRIS and fail on hardware** — the
+more valuable bucket, because the emulator and the tests agreed with each other
+and were both wrong. Those corrections are written up in
+[`gotchas.md`](gotchas.md); the largest is that quiet and signalling NaN
+handling was swapped in both the arithmetic and the comparison tests.
+
+Correcting them moved IRIS's own score from **61 failed checks to 124**, across
+27 failing tests rather than 15. That number is the point: the suite now
+measures the emulator against silicon instead of against itself, and the gap it
+reports is IRIS's real bug surface.
+
+### The R5000 says the same thing, and adds to it
+
+A second machine — an Indy **R5000 rev 1.0** (PRId `0x2310`, FIR `0x2310`,
+Config `0x1043e6f3`, no L2) — ran the same binary on 2026-09-12 and reaches
+**240/240, `rc=0`** (`oracle/r5000-rev1.0-run2-clean.log`). Diffed against the
+emulator it gives the cleanest possible verdict:
+
+```
+IRIS-WRONG (0)     nothing where IRIS is wrong and the suite rewards it
+TEST-BUG   (0)     no remaining bad expectations
+IRIS-BUG   (22)    every divergence is an emulator bug
+```
+
+Twenty-two, not fifteen. The R5000 confirms the original FP set **and** six more
+that only became visible once the expectations were corrected against the
+R4400 — `excep/cop2_unusable`, `fpu/compare_nan`, `fpu/cmp_signalling_qnan`,
+`fpu/cmp_snan_any_pred`, `fpu/cmp_trap_on_signal`, `fpu/snan_operands` — plus
+`fpu/vec_cvt_from_l`. Both parts behave identically on all of them, so these are
+family-wide IRIS bugs rather than R4400 quirks.
+
+### One real difference between the two parts
+
+`mem/lwr_all_offsets` is the only test that needed CPU gating. An **R4400**
+leaves the upper half of `rt` untouched on a partial `LWR`; an **R5000**
+sign-extends at every offset. Both measured, both now asserted.
+
+### Where the emulator now stands
+
+| | checks passed | failed | failing tests | bugs confirmed |
+|---|---:|---:|---:|---:|
+| Indy R4400 rev 6.0 | **2164** | **0** | **0** | 28 |
+| Indy R5000 rev 1.0 | **2135** | **0** | **0** | 22 |
+| IRIS `--cpu r4400` | 2040 | 124 | 27 | |
+| IRIS `--cpu r5000` | 2027 | 108 | 22 | |
+
+Both machines diff to `IRIS-WRONG 0, TEST-BUG 0` — no expectation is now known
+to be wrong on either part, and every remaining disagreement is an emulator bug.
+
+Six are R4400-only, and they are not a separate class of bug so much as a
+separate class of *instruction* — the R4400 paths IRIS models least carefully:
+
+```
+mips4/fp_cond_move_s   mips4/recip_rsqrt     fpu/qnan_operand
+mips4/fp_cond_move_d   mips4/recip_rsqrt_d   mem/lwr_all_offsets
+```
+
+The four `mips4/*` are all the same root cause — an unimplemented COP1 encoding
+must raise `EXC_FPE`, and IRIS raises `EXC_RI`. `fpu/qnan_operand` is the
+quiet-NaN propagation the R4400 does in hardware, and `mem/lwr_all_offsets` is
+the partial-`LWR` upper-half rule that differs between the two parts.
+
+Anything IRIS fails that hardware passes is a bug in `src/`. No emulator change
+was made on this branch — the suite reports, it does not fix.

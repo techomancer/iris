@@ -75,18 +75,29 @@ static void t_signalling_nan_operands(void)
 {
     struct fp_obs o;
 
+    /*
+     * An R4400 does not complete an arithmetic operation with a signalling NaN
+     * operand at all: it raises Unimplemented Operation (Cause.E, ExcCode 15)
+     * and stores nothing, so no Invalid *flag* is ever set — "when a
+     * floating-point exception is taken, the flag bits are not set by the
+     * hardware". Confirmed on an Indy R4400 rev 6.0. The quiet-NaN delivery
+     * this once asserted is what happens for a *quiet* NaN operand; see
+     * fpu/qnan_operand.
+     */
     o = observe_s(F_SNAN, F_1, 0, op_add_s);
-    CHECK_EQ(o.exceptions, 0u);                  /* Invalid is not enabled */
-    CHECK_EQ(o.flags & FP_V, (u32)FP_V);
-    CHECK(is_nan_s(o.result));
-    /* "A quiet NaN is delivered to the destination register." */
-    CHECK_EQ(o.result & 0x00400000u, 0x00400000u);
+    CHECK_EQ(o.exceptions, 1u);
+    CHECK_EQ(o.excode, (u32)EXC_FPE);
+    CHECK_EQ(o.cause & FP_E, (u32)FP_E);
+    CHECK_EQ(o.flags & FP_V, 0u);
+    CHECK_EQ(o.result, SENTINEL_S);
 
+    /* abs and neg are not arithmetic on the R4400 either way: they move sign
+     * bits and do not inspect the operand, so nothing is raised. */
     o = observe_s(F_SNAN, F_0, 0, op_abs_s);
-    CHECK_EQ(o.flags & FP_V, (u32)FP_V);
+    CHECK_EQ(o.flags & FP_V, 0u);
 
     o = observe_s(F_SNAN, F_0, 0, op_neg_s);
-    CHECK_EQ(o.flags & FP_V, (u32)FP_V);
+    CHECK_EQ(o.flags & FP_V, 0u);
 
     /* MOV is not arithmetic: no Invalid, and the payload survives intact. */
     o = observe_s(F_SNAN, F_0, 0, op_mov_s);

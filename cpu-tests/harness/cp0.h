@@ -121,6 +121,18 @@
 #define fir()           fcr_read(0)
 
 /* CACHE instruction with a compile-time op and a runtime address. */
+/*
+ * Index_Load_Tag writes TagLo through the cache pipeline, and a real R4400
+ * needs spacing before the mfc0 that reads it back. IRIS updates it instantly,
+ * so this was invisible until an Indy ran the suite and every tag read back as
+ * the poison value the test had written. Kept separate from CACHE_OP so the
+ * bulk cache sweeps do not pay for it.
+ */
+#define CACHE_TAG_HAZARD()                                                 \
+    __asm__ __volatile__(".set push; .set noreorder\n\t"                   \
+                         "nop; nop; nop; nop; nop; nop; nop; nop\n\t"      \
+                         ".set pop" ::: "memory")
+
 #define CACHE_OP(op, addr) do {                                            \
     void *__a = (void *)(unsigned long)(addr);                             \
     __asm__ __volatile__(".set push; .set mips3; .set noreorder; .set nomacro; .set noat\n\t"                       \

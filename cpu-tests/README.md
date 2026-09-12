@@ -95,14 +95,25 @@ family would actually involve, are written up once in
 
 ## Expected results
 
-| | pass | fail | failing tests |
-|---|---:|---:|---|
-| R4400 | 2041 | 121 | 29 |
-| R5000 | 2095 | 37 | 13 |
+The expectations are **validated against real hardware**: an SGI Indy, R4400
+rev 6.0, passes 240/240 (`oracle/r4400-rev6.0-run4.log`). Measured against that,
+the emulator reports:
 
-Every failure is a known finding, listed in [docs/findings.md](docs/findings.md).
-Anything else is new — start with [docs/gotchas.md](docs/gotchas.md), which
-collects the times the *test* was wrong and the emulator was right.
+| | pass | fail | failing tests |
+|---|---:|---:|---:|
+| Indy R4400 rev 6.0 | 2164 | **0** | **0** |
+| Indy R5000 rev 1.0 | 2135 | **0** | **0** |
+| IRIS `--cpu r4400` | 2040 | 124 | 27 |
+| IRIS `--cpu r5000` | 2027 | 108 | 22 |
+
+Every emulator failure is a known finding, listed in
+[docs/findings.md](docs/findings.md) — and all 15 of the original FP failures are
+now hardware-confirmed as real IRIS bugs rather than bad tests. Anything else is
+new: start with [docs/gotchas.md](docs/gotchas.md), which collects the times the
+*test* was wrong, including the sixteen the Indy caught that IRIS agreed with.
+
+`run/diff-hw.py` classifies a hardware log against an emulator one; the archived
+hardware logs live in `oracle/`.
 
 ## Writing a test
 
