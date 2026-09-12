@@ -1,1 +1,10 @@
-5a3d3937a47cda0606882e62e5019901  build/cputest.elf
+# The guest binary the archived hardware logs were produced with.
+# A diff is only meaningful between logs from the same ELF.
+5a3d3937a47cda0606882e62e5019901  cputest.elf
+
+# The tree has since moved by exactly one change: cp0/count_writable now
+# retries instead of sampling Count once (it was the suite's only
+# run-to-run-variable check, and it broke the CI baseline). That test passes on
+# the first attempt on real silicon, where Count is clocked at half the
+# pipeline rate, so the change cannot alter any result in these logs — but the
+# hash differs, and pretending otherwise would defeat the point of recording it.

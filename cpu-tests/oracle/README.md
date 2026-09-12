@@ -28,8 +28,9 @@ ARCS and the log reached the disk through the PROM's own driver — see
 | `r4400-rev6.0-run5-clean.log` | **0 / 0**, `rc=0` — 2164 checks |
 | `diff-r4400.txt`, `diff-r5000.txt` | three-bucket classification of each clean run |
 
-`ELF.md5` pins the guest binary all of these were produced with. A diff is only
-meaningful between logs from the *same* ELF.
+`ELF.md5` pins the guest binary all of these were produced with, and notes the
+one change made since. A diff is only meaningful between logs from the *same*
+ELF.
 
 Both clean runs are against the **same** current ELF, so `r4400-…-run5-clean`
 also serves as the regression check on the three changes the R5000 forced

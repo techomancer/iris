@@ -306,9 +306,28 @@ static void t_count_advances(void)
 
 static void t_count_writable(void)
 {
-    cp0_count_set(0x12345678u);
-    /* It keeps counting, so only the high bits are stable enough to check. */
-    CHECK_EQ(cp0_count() & 0xFFFF0000u, 0x12340000u);
+    unsigned attempt;
+    u32 hi = 0;
+
+    /*
+     * It keeps counting, so only the high bits are stable enough to check —
+     * and under IRIS not even those, reliably: Count is derived from a host
+     * wallclock anchor rather than from guest instructions, so a thread
+     * descheduled between the write and the read comes back with the top half
+     * already rolled. That made this the one check in the suite that varied
+     * run to run on the same binary, which cost a CI baseline and an afternoon
+     * of suspecting an unrelated change.
+     *
+     * The property is that the write sticks, not that the host stayed on CPU,
+     * so take the best of a few attempts. Real silicon clocks Count at half the
+     * pipeline rate and gets it on the first one every time.
+     */
+    for (attempt = 0; attempt < 8; attempt++) {
+        cp0_count_set(0x12345678u);
+        hi = cp0_count() & 0xFFFF0000u;
+        if (hi == 0x12340000u) break;
+    }
+    CHECK_EQ(hi, 0x12340000u);
     cp0_count_set(0);
 }
 

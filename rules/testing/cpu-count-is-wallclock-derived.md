@@ -34,9 +34,18 @@ and is fully deterministic, so this test should pass reliably on hardware. A
 difference here would land in the "passes in IRIS, fails on hardware" bucket (or
 its opposite, run to run) and mean nothing about the CPU model.
 
-`cpu-tests/run/diff-hw.py` therefore excludes it by name; `--include-flaky`
-overrides that. Any other Count-derived assertion added later belongs in the
-same list.
+The test now **retries** — up to eight attempts, passing on the first clean
+one. The property is that the write sticks, not that the host stayed on CPU.
+Real silicon gets it first time, so hardware results are unaffected.
+
+That was not optional in the end: at 124 failing checks the CI baseline is
+exact, and this one check varying took two of four cells red with
+"125 failing checks, baseline is 124 — 1 new". A single non-deterministic
+check is affordable when nobody counts; it is not once something does.
+
+`cpu-tests/run/diff-hw.py` still excludes it by name as belt and braces;
+`--include-flaky` overrides that. Any other Count-derived assertion added later
+belongs in the same list.
 
 ## Related
 
