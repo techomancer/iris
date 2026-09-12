@@ -224,6 +224,12 @@ jobs:
             --headless --noaudio 2>&1 | tee build/run.log
           rc=${PIPESTATUS[0]}
           echo "CPUTEST_RC=$rc" >> "$GITHUB_ENV"
+          # The exit code saturates at 100 (testlib.c), so it stopped being a
+          # usable count the moment a cell exceeded that. Take the real number
+          # off the RESULT line, which is what the gate below compares.
+          failed=$(grep -oE '^ RESULT: [0-9]+ checks passed, [0-9]+ failed' build/run.log \
+                   | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
+          echo "CPUTEST_FAILED=${failed:-}" >> "$GITHUB_ENV"
           if [ "$rc" = "124" ]; then echo "::error::cpu-tests timed out"; exit 1; fi
           grep -q 'IRIS-CPUTEST-DONE' build/run.log \
             || { echo "::error::cpu-tests never printed its DONE token"; exit 1; }
@@ -310,16 +316,27 @@ jobs:
       # down, which is what keeps this number honest instead of drifting up.
       # Lower it in the same commit that closes the gap.
       #
-      # CPUTEST_BASELINE is uniform across all four cells at 61: r5000 skips
-      # some R4400-only checks (2071 passed vs 2101) but fails the identical
-      # fpu set, and jitv2 matches the interpreter check-for-check. Measured
-      # 2026-08-26 on all four cells. A tcache build would be 63 — see
-      # rules/testing/tcache-discards-dirty-data-semantics.md — but no cell
-      # builds tcache today.
+      # CPUTEST_BASELINE was uniform at 61 until the suite was validated against
+      # two real Indys (cpu-tests/oracle/). Sixteen expectations turned out to be
+      # wrong in a way IRIS happened to share, so correcting them raised what the
+      # emulator fails — not a regression, a stricter oracle. The cells now
+      # differ, so the baseline is per-CPU:
+      #
+      #   r4400  124    r5000  108
+      #
+      # Measured 2026-09-12 on all four cells; jitv2 still matches the
+      # interpreter check-for-check. Hardware passes 240/240 on both parts, so
+      # every one of these is an emulator bug with a confirmed counter-example —
+      # see cpu-tests/docs/findings.md. A tcache build would be higher by the
+      # two in rules/testing/tcache-discards-dirty-data-semantics.md, but no
+      # cell builds tcache today.
+      #
+      # Gate on CPUTEST_FAILED, not CPUTEST_RC: the exit code saturates at 100
+      # and both cells are past it.
       - name: Result
         if: always()
         env:
-          CPUTEST_BASELINE: 61
+          CPUTEST_BASELINE: ${{ matrix.cpu == 'r4400' && 124 || 108 }}
         run: |
           {
             echo "### ${{ matrix.cpu }} / ${{ matrix.engine }}"
@@ -333,17 +350,17 @@ jobs:
           # Unset means the cpu-tests step never recorded a result — the run
           # died before the gate could learn anything. That is a failure, and
           # deliberately not the same message as "too many checks failed".
-          if [ -z "${CPUTEST_RC:-}" ]; then
+          if [ -z "${CPUTEST_FAILED:-}" ]; then
             echo "::error::cpu-tests recorded no result"
             exit 1
           fi
-          if [ "$CPUTEST_RC" -gt "$CPUTEST_BASELINE" ]; then
-            echo "::error::cpu-tests reported $CPUTEST_RC failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_RC - CPUTEST_BASELINE )) new"
+          if [ "$CPUTEST_FAILED" -gt "$CPUTEST_BASELINE" ]; then
+            echo "::error::cpu-tests reported $CPUTEST_FAILED failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_FAILED - CPUTEST_BASELINE )) new"
             exit 1
           fi
-          if [ "$CPUTEST_RC" -lt "$CPUTEST_BASELINE" ]; then
-            echo "::notice::cpu-tests improved to $CPUTEST_RC failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
-            echo "cpu-tests improved to $CPUTEST_RC (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          if [ "$CPUTEST_FAILED" -lt "$CPUTEST_BASELINE" ]; then
+            echo "::notice::cpu-tests improved to $CPUTEST_FAILED failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
+            echo "cpu-tests improved to $CPUTEST_FAILED (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
 
       - uses: actions/upload-artifact@v4
