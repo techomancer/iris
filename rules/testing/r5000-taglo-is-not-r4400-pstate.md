@@ -76,3 +76,38 @@ own bug class) but never treat a round-trip test as evidence that a wire format 
 
 Both fixes were verified by reverting each half independently and confirming the
 corresponding test fails.
+
+## Open: `C_IST` writes back a dirty L1D victim (cpucritique §5.1)
+
+Investigated 2026-09-12, **deliberately not changed** — recorded so the next
+session starts from the finding rather than re-deriving it.
+
+`cache_op`'s `C_IST` arm is **asymmetric between levels**:
+
+- **L2** calls `invalidate_l2_line(idx)` with the comment *"C_IST does not
+  writeback (it's used for cache init/invalidation)."* Correct.
+- **L1D** calls `writeback_l1d_line(idx, cascade)` before
+  `invalidate_l1d_line`, commented *"Writeback dirty data before overwriting
+  the tag."* This is what §5.1 flags.
+
+The architectural argument against the writeback: `Index_Store_Tag` is the
+cache **initialization** primitive. It runs when tags hold power-on garbage, so
+a line that merely *looks* Dirty-Exclusive has no valid ptag — writing it back
+scribbles arbitrary data at an arbitrary physical address. Hardware does not
+do this.
+
+**Why it was left alone:**
+
+1. The plan called for checking the **VR5000 manual** first; it is not
+   available locally, and R4400-vs-R5000 cache behaviour is exactly where this
+   file already documents a divergence that was gotten wrong once.
+2. It is on the boot-critical cache-init path.
+3. Changing writeback semantics on reasoning alone, with no failing test and
+   no observed symptom, is the wrong risk trade against everything else in
+   this batch, which had tests that failed before the fix.
+
+**To pick this up:** confirm against the VR5000 (and R4400 §11) manuals, then
+drop the `writeback_l1d_line` call so L1D matches L2. A test would seed a dirty
+L1D line with a ptag pointing at known memory, issue `C_IST` with a TagLo whose
+state bits read Dirty-Exclusive, and assert memory is **unchanged**. That test
+fails today.

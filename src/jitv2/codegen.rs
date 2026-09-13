@@ -1846,6 +1846,15 @@ impl Codegen {
                         ctx.builder.ins().store(mem, target, ctx.core_ptr, pc_off);
                         emit_lockstep_compare_live(&mut ctx);
                     }
+                    // The pending transfer being consumed here was armed by
+                    // whatever branched onto this page — including a JR, whose
+                    // target is register-sourced and can be misaligned. This is
+                    // `emit_absolute_pc_exit`'s one caller whose target is not a
+                    // compile-time immediate, so it needs the check its siblings
+                    // don't. Ordered after the lockstep compare so the compare
+                    // still sees the JIT's and interpreter's states agreeing on
+                    // the misaligned PC before either delivers the fault.
+                    emit_misaligned_pc_check(&mut ctx, target);
                     emit_absolute_pc_exit(&mut ctx, target);
 
                     // Plain arm: no pending transfer. Under lockstep (ls_live),
@@ -3086,6 +3095,7 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
 
 fn core_offset_of_pc() -> i32 { std::mem::offset_of!(MipsCore, pc) as i32 }
 fn core_offset_of_jit_trigger() -> i32 { std::mem::offset_of!(MipsCore, jit_trigger) as i32 }
+fn core_offset_of_badvaddr() -> i32 { std::mem::offset_of!(MipsCore, cp0_badvaddr) as i32 }
 
 /// Mark `core.jit_trigger` so the interpreter's `exec_decoded` dispatch gate
 /// probes this exit's target PC as a fresh compile-worthy arrival — the
@@ -5225,9 +5235,83 @@ fn emit_runtime_pc_exit(ctx: &mut EmitCtx, target_addr: Value) {
     let mem = MemFlagsData::trusted();
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
     ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, pc_off);
+
+    // Misaligned target -> AdEL. This is the JIT's counterpart to the
+    // interpreter's `handle_exec_complete` delay-slot arm, and — as there —
+    // it is the *only* compiled exit that needs the test, because it is the
+    // only one whose target is register-sourced:
+    //
+    //   - `emit_absolute_pc_exit`'s targets come from
+    //     `emit_jump_target_addr` / `emit_branch_target_addr` (immediate
+    //     `<< 2`), so their low two bits are structurally zero. Its one
+    //     exception is the pending-outer-transfer site, handled there.
+    //   - `emit_foreign_page_slot_exit` only *arms* `delay_slot_target` and
+    //     returns; the interpreter's `handle_exec_complete` installs it and
+    //     checks it there.
+    //   - ERET never reaches compiled code at all — every `OP_COP0` is
+    //     `Classify::Excluded` (analyzer.rs), so the interpreter runs it and
+    //     `exec_eret`'s own check applies.
+    //
+    // So: two emitters, matching the interpreter's three terminals. See
+    // `MipsExecutor::check_pc_alignment` for the full enumeration and for why
+    // the fault belongs after the delay slot rather than at the jump.
+    //
+    // `core.pc` is stored *before* the test so the fault site sees the same
+    // state the interpreter would, and `fault_pc` is the misaligned target
+    // (not this instruction's word) with `bd = 0` — the slot has retired.
+    // Ordered before `emit_set_jit_trigger` to match the interpreter's
+    // `handle_exec_complete`: a faulting transfer must not leave the trigger
+    // set for a target that never became live.
+    emit_misaligned_pc_check(ctx, target_addr);
+
     emit_set_jit_trigger(ctx);
     let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     ctx.builder.ins().return_(&[status]);
+}
+
+/// Branch to the exception path when `target_addr`'s low two bits are set.
+///
+/// Splits the current block: the misaligned edge jumps to
+/// `ctx.exception_call_block` with `fault_pc = target_addr` and `bd = 0`
+/// (matching the interpreter, where the delay slot has already retired), and
+/// emission continues in a fresh aligned-path block. Two instructions on the
+/// taken-never path.
+///
+/// BadVAddr comes from `handle_exception_at`'s AdEL/AdES arm, which writes
+/// `fault_pc` — added for exactly this path, so the register state after a
+/// misaligned target matches the interpreter's `misaligned_fetch_exception`.
+fn emit_misaligned_pc_check(ctx: &mut EmitCtx, target_addr: Value) {
+    let misaligned_block = ctx.builder.create_block();
+    let aligned_block = ctx.builder.create_block();
+
+    let low_bits = ctx.builder.ins().band_imm_s(target_addr, 0x3);
+    ctx.builder.ins().brif(low_bits, misaligned_block, &[], aligned_block, &[]);
+
+    ctx.builder.switch_to_block(misaligned_block);
+    ctx.builder.seal_block(misaligned_block);
+    // BadVAddr must be set HERE, not in `handle_exception_at`. That callback
+    // is shared with the data-path address errors, which arrive with BadVAddr
+    // already holding the faulting *data* address (set by
+    // `read_data_impl`/`write_data_impl` after a misaligned access bails to
+    // `slow_block`) and `fault_pc` holding the instruction address — writing
+    // `fault_pc` there clobbered the correct value, and the
+    // `ad{e,s}l_*_matches_interpreter` equivalence tests caught it. Each
+    // faulting path owns its own BadVAddr; this is ours.
+    let mem = MemFlagsData::trusted();
+    let bv_off = ir::immediates::Offset32::new(core_offset_of_badvaddr());
+    ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, bv_off);
+    let status = ctx.builder.ins().iconst(
+        ir::types::I32, crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_ADEL) as i64);
+    let bd_zero = ctx.builder.ins().iconst(ir::types::I8, 0);
+    ctx.builder.ins().jump(ctx.exception_call_block, &[
+        ir::BlockArg::Value(ctx.core_ptr),
+        ir::BlockArg::Value(status),
+        ir::BlockArg::Value(target_addr),
+        ir::BlockArg::Value(bd_zero),
+    ]);
+
+    ctx.builder.switch_to_block(aligned_block);
+    ctx.builder.seal_block(aligned_block);
 }
 
 /// Emit a JR/JALR unit: read the target register first (before the delay

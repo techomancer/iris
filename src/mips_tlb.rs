@@ -449,6 +449,34 @@ impl ShadowEntry {
     }
 
     fn from_entry(e: &TlbEntry) -> Self {
+        // EntryLo's C field. Deliberately decodes **only** the two encodings
+        // that occur in practice, and treats everything else as uncached:
+        //
+        //   2 = Uncached, 3 = Cacheable noncoherent, 5 = Cacheable coherent
+        //
+        // The remaining encodings differ *between parts* and cannot be decoded
+        // correctly here, because `ShadowEntry` is model-agnostic — it has no
+        // `CpuModel` parameter and threading one through the TLB would touch
+        // every shadow/vmap path. Verified against `docs/`:
+        //
+        //   C | R4400 (UM Table 4-6)              | VR5000 (UM Table 6-6)
+        //   --+-----------------------------------+------------------------------
+        //   0 | Reserved                          | Cacheable, write-through, no WA
+        //   1 | Reserved                          | Cacheable, write-through, WA
+        //   4 | Cacheable coherent exclusive      | Reserved
+        //   6 | Cacheable coherent update-on-write| Reserved
+        //
+        // So 0/1 are cacheable on R5000 and reserved on R4400, and 4/6 are the
+        // exact reverse. A single table is wrong for one part or the other; an
+        // earlier revision mapped 4/6 to cacheable on both, which is backwards
+        // for R5000 (whose cacheable write-through modes are 0/1).
+        //
+        // Uncached is the safe default for the undecodable cases: IRIX maps
+        // pages C=3 and the PROM flips K0 between 3 and 2, so nothing reachable
+        // uses them, and treating a reserved encoding as uncached costs
+        // performance rather than correctness. `MipsExecutor::decode_cache_attr`
+        // has the full per-model tables for the KSEG0/`Config.K0` path, where
+        // the model *is* in scope.
         let decode_cache_attr = |lo: u64| match (lo >> 3) & 0x7 {
             2 => CacheAttr::Uncached,
             3 => CacheAttr::Cacheable,

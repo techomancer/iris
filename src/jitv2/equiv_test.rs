@@ -2880,6 +2880,72 @@ mod tests {
         assert_eq!(jit.pc, gpr[1], "pc must be the register's own value, unmodified");
     }
 
+    // ---- Misaligned JR/JALR targets (cpucritique C1) ---------------------
+    //
+    // A register-sourced target can be misaligned, and that raises AdEL. The
+    // check lives at the exits that *install* such a target — the
+    // interpreter's `handle_exec_complete` delay-slot arm and the JIT's
+    // `emit_runtime_pc_exit` / pending-transfer consumer — so both engines
+    // must agree on the resulting PC, EPC, BadVAddr, Cause and Status, and
+    // both must still have run the delay slot first.
+    //
+    // Equivalence is the strong assertion here: the interpreter-side unit
+    // tests in mips_exec_test.rs pin the architectural values, and these pin
+    // that compiled code reproduces them.
+
+    #[test]
+    fn misaligned_jr_target_matches_interpreter() {
+        for off in [1u64, 2, 3] {
+            let mut gpr = [0u64; 32];
+            gpr[1] = 0xFFFF_FFFF_8000_5000 | off;
+            assert_branch_matches_interpreter(
+                regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr);
+        }
+    }
+
+    #[test]
+    fn misaligned_jalr_target_matches_interpreter() {
+        for off in [1u64, 2, 3] {
+            let mut gpr = [0u64; 32];
+            gpr[1] = 0xFFFF_FFFF_8000_5000 | off;
+            // rd=31: the link register must still be written even though the
+            // transfer faults — JALR's link happens before the target is used.
+            assert_branch_matches_interpreter(
+                regjump_layout(crate::mips_isa::FUNCT_JALR, 1, 31), gpr);
+        }
+    }
+
+    /// The delay slot's side effect must survive the fault in compiled code
+    /// too — the JIT emits the slot inline *before* `emit_runtime_pc_exit`, so
+    /// this pins that ordering rather than trusting it.
+    #[test]
+    fn misaligned_jr_still_executes_its_delay_slot_in_jit() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_5001; // misaligned
+        let jit = run_jit_page(&regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
+            .expect("JR region must compile even with a misaligned target");
+        assert_eq!(jit.gpr[5], 1,
+            "the delay slot (ADDIU r5,r0,1) must have executed before the \
+             misaligned target faulted — its side effect is architecturally \
+             visible");
+        assert_ne!(jit.pc, gpr[1],
+            "pc must be the exception vector, not the misaligned target");
+    }
+
+    /// An *aligned* target through the same emitter must be untouched — the
+    /// check is two instructions on a never-taken edge, not a behaviour change.
+    #[test]
+    fn aligned_jr_target_is_unaffected_by_the_misalignment_check() {
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_5000;
+        let jit = run_jit_page(&regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
+            .expect("JR region must compile");
+        assert_eq!(jit.pc, gpr[1], "aligned target installs unchanged");
+        assert_eq!(jit.gpr[5], 1, "slot ran");
+    }
+
     /// Same fusion coverage as `j_with_nop_slot_fuses_and_still_advances_cycles_by_two`,
     /// for the `emit_regjump` call site (JR's own top-level slot, not the
     /// nested-branch-in-slot path).
@@ -3627,6 +3693,40 @@ mod tests {
             make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR),
             gpr,
         );
+    }
+
+    /// A misaligned JR target at 0xFFC must still *arm* the foreign-page slot
+    /// normally — the fault belongs to whoever consumes the transfer, not to
+    /// the arming side. Pins that the misalignment check did not leak into
+    /// `emit_foreign_page_slot_exit`, which would fault a page too early.
+    ///
+    /// **Coverage limit, stated rather than implied:** this does NOT exercise
+    /// the consumer — the second site `emit_misaligned_pc_check` is wired into
+    /// (the pending-outer-transfer arm of `entry_block`). `check_nested_foreign_page_slot`
+    /// compiles and runs only the *arming* page and then compares
+    /// pc/in_delay_slot/delay_slot_target; it never compiles the next page,
+    /// where the consumer lives. Verified by reverting that emitter's check —
+    /// this test still passes.
+    ///
+    /// The consumer's correctness rests on: (a) it is the same
+    /// `emit_misaligned_pc_check` the regjump exit uses, covered by
+    /// `misaligned_jr_target_matches_interpreter`; and (b) the interpreter
+    /// reaches the identical state through `handle_exec_complete`, covered by
+    /// `test_misaligned_jr_target_raises_adel_not_silent_execution`. A test
+    /// that genuinely drove the two-page consumer path would need a harness
+    /// that compiles both pages and dispatches across the boundary — worth
+    /// building if this area changes again.
+    #[test]
+    fn misaligned_jr_at_0xffc_still_arms_the_foreign_page_slot() {
+        for off in [1u64, 2, 3] {
+            let mut gpr = [0u64; 32];
+            gpr[31] = 0xFFFF_FFFF_8000_9000 | off;
+            check_nested_foreign_page_slot(
+                make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
+                make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR),
+                gpr,
+            );
+        }
     }
 
     #[test]

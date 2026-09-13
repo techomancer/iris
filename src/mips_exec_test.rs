@@ -5256,4 +5256,480 @@ mod tests {
         assert_eq!(exec.exec(make_cop1_move(RS_MFC1, 10, 1)), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(10), 2.0f32.to_bits() as u64);
     }
+
+    // ================= T1: XTLB refill vector follows the MODE ==============
+    //
+    // The R4400 chooses between the TLB-refill vector (offset 0x000) and the
+    // XTLB-refill vector (0x080) from `Status.KX`/`SX`/`UX` for the mode the
+    // miss was taken in — NOT from the shape of the faulting address. IRIX 6.5
+    // on IP22 runs with KX=0 (`trap.c`), so nothing we boot exercises this;
+    // these tests are the only coverage the fix has. Do not delete them as
+    // "untested code" — they ARE the test.
+    //
+    // Before the fix, `translate_64bit_impl`'s kseg3/ksseg compat arm passed
+    // `XTLB=0`, which had two effects, one per use of that const param:
+    //   1. wrong vector — a KX=1 kernel's cksseg miss went to 0x000
+    //   2. wrong compare width — `vcmp32` drops EntryHi's Region field, so a
+    //      cksseg VA could alias an xuseg entry with a colliding VPN2[31:13]
+    // Both are asserted below.
+
+    /// Map `va`'s VPN2 to `pfn` at TLB index `index`, global, valid, dirty.
+    /// Writes through the real TLBWI path so the shadow/vmap stay coherent.
+    fn tlb_map_global(
+        exec: &mut MipsExecutor<crate::mips_tlb::MipsTlb, PassthroughCache>,
+        index: u32, va: u64, pfn: u64,
+    ) {
+        // Region + VPN2, exactly as update_tlb_exception_registers commits it.
+        const EH_VPN_MASK: u64 = 0xC000_00FF_FFFF_E000;
+        exec.core.cp0_index = index;
+        exec.core.cp0_pagemask = 0; // 4KB
+        exec.core.cp0_entryhi = va & EH_VPN_MASK;
+        // Even and odd halves both valid; VA bit 12 picks between them.
+        let lo = |p: u64| (p << 6) | (3 << 3) | (1 << 2) | (1 << 1) | 1; // C=3,D,V,G
+        exec.core.cp0_entrylo0 = lo(pfn);
+        exec.core.cp0_entrylo1 = lo(pfn + 1);
+        let tlbwi = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+        assert_eq!(exec.exec(tlbwi), EXEC_COMPLETE);
+    }
+
+    /// Put the executor in 64-bit kernel mode with a *live* (not ERL/EXL)
+    /// context, so TLB segments actually translate through the TLB.
+    fn enter_kx_kernel(exec: &mut MipsExecutor<crate::mips_tlb::MipsTlb, PassthroughCache>) {
+        use crate::mips_core::{STATUS_KX, STATUS_ERL, STATUS_EXL};
+        exec.core.cp0_status &= !(STATUS_ERL | STATUS_EXL);
+        exec.core.cp0_status |= STATUS_KX;
+        exec.update_translate_fn();
+        assert!(exec.core.is_64bit_mode(), "test setup: KX must give 64-bit mode");
+    }
+
+    #[test]
+    fn test_xtlb_vector_chosen_by_kx_not_address_shape() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_xtlb_vector_chosen_by_kx_not_address_shape_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_xtlb_vector_chosen_by_kx_not_address_shape_inner() {
+        use crate::mips_tlb::MipsTlb;
+        use crate::mips_exec::EXEC_IS_XTLB_REFILL;
+        use crate::mips_core::STATUS_KX;
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+
+        // A 32-bit-shaped kseg3 address, sign-extended — the compat range.
+        // Nothing maps it, so every access below is a refill miss.
+        let cksseg = 0xFFFF_FFFF_C000_0000u64;
+
+        // --- KX=1: must take the XTLB vector (0x080) ---
+        enter_kx_kernel(&mut exec);
+        let st = exec.read_data::<4>(cksseg).expect_err("empty TLB must miss");
+        assert_ne!(st & EXEC_IS_TLB_REFILL, 0, "should be a refill miss");
+        assert_ne!(st & EXEC_IS_XTLB_REFILL, 0,
+            "with KX=1 a kseg3-compat refill miss must vector to XTLB (0x080). \
+             The vector follows Status.KX, not the 32-bit shape of the address; \
+             this failing means translate_64bit_impl's compat arm passed XTLB=0.");
+
+        // --- KX=0: must take the 32-bit UTLB vector (0x000) ---
+        exec.core.cp0_status &= !STATUS_KX;
+        exec.update_translate_fn();
+        assert!(!exec.core.is_64bit_mode());
+        let st = exec.read_data::<4>(cksseg).expect_err("empty TLB must miss");
+        assert_ne!(st & EXEC_IS_TLB_REFILL, 0, "should be a refill miss");
+        assert_eq!(st & EXEC_IS_XTLB_REFILL, 0,
+            "with KX=0 the same address must use the 32-bit refill vector");
+
+        // A true 64-bit xkseg address was already XTLB before the fix; assert
+        // it still is, so the change is narrowed to the compat arm.
+        enter_kx_kernel(&mut exec);
+        let st = exec.read_data::<4>(0xC000_0000_0000_0000u64)
+            .expect_err("empty TLB must miss");
+        assert_ne!(st & EXEC_IS_XTLB_REFILL, 0, "true xkseg is unchanged: XTLB");
+    }
+
+    #[test]
+    fn test_xtlb_compare_width_disambiguates_region_field() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_xtlb_compare_width_disambiguates_region_field_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_xtlb_compare_width_disambiguates_region_field_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+        enter_kx_kernel(&mut exec);
+
+        // Two addresses whose VPN2[31:13] are identical but whose Region
+        // fields differ: xuseg (R=00) vs kseg3-compat (R=11).
+        let xuseg  = 0x0000_0000_C000_0000u64;
+        let cksseg = 0xFFFF_FFFF_C000_0000u64;
+        assert_eq!((xuseg >> 13) & 0x7FFFF, (cksseg >> 13) & 0x7FFFF,
+                   "test setup: the two VAs must collide in VPN2[31:13]");
+
+        // Map ONLY the xuseg one.
+        tlb_map_global(&mut exec, 5, xuseg, 0x70);
+        mem.set_word(0x70000, 0x1234_5678);
+
+        // The mapped address reads back, confirming the entry is live.
+        assert_eq!(exec.read_data::<4>(xuseg).unwrap(), 0x1234_5678,
+                   "setup: xuseg VA must hit its own entry");
+
+        // The cksseg address must MISS: same VPN2[31:13], different Region.
+        // Before the fix this arm compared with `vcmp32`, which drops Region,
+        // so it spuriously hit the xuseg entry and returned that page's data.
+        let err = exec.read_data::<4>(cksseg).expect_err(
+            "a kseg3-compat VA must NOT alias an xuseg entry that merely \
+             collides in VPN2[31:13] — the Region field distinguishes them, \
+             and under KX=1 the compare must include it (vcmp64)");
+        assert_ne!(err & EXEC_IS_TLB_REFILL, 0, "and it should be a refill miss");
+    }
+
+    #[test]
+    fn test_tlbp_region_field_symmetry_under_kx() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| { test_tlbp_region_field_symmetry_under_kx_inner(); })
+            .unwrap().join().unwrap();
+    }
+    fn test_tlbp_region_field_symmetry_under_kx_inner() {
+        use crate::mips_tlb::MipsTlb;
+
+        let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
+        enter_kx_kernel(&mut exec);
+
+        let xuseg  = 0x0000_0000_C000_0000u64;
+        let cksseg = 0xFFFF_FFFF_C000_0000u64;
+        tlb_map_global(&mut exec, 5, xuseg, 0x70);
+
+        let tlbp = (OP_COP0 << 26) | (0x10 << 21) | 0x08;
+        const EH_VPN_MASK: u64 = 0xC000_00FF_FFFF_E000;
+
+        // R=00 (xuseg): finds index 5.
+        exec.core.cp0_entryhi = xuseg & EH_VPN_MASK;
+        exec.core.cp0_index = 0xFFFF_FFFF;
+        assert_eq!(exec.exec(tlbp), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_index, 5,
+                   "TLBP with the entry's own Region must find it");
+
+        // R=11 (kseg3-compat): must report no match.
+        //
+        // Honest scope note: unlike the two tests above, this one passed
+        // BEFORE the T1 fix as well — `exec_tlbp` masks EntryHi with
+        // EH_VPN_MASK, so `virt_addr >> 32` is 0xC00000FF, never the
+        // 0xFFFFFFFF the old `is_xtlb_address` tested for. The compat arm it
+        // was checking is unreachable from a masked EntryHi, so TLBP always
+        // took the 64-bit compare. This test is therefore a *consistency*
+        // assertion, not a regression test: it pins that TLBP and a real
+        // access through `tlb_translate_impl` now agree on Region, which is
+        // the property the fix makes true on the access side. Keep it — a
+        // future change to either side that breaks the agreement fails here.
+        exec.core.cp0_entryhi = cksseg & EH_VPN_MASK;
+        exec.core.cp0_index = 0;
+        assert_eq!(exec.exec(tlbp), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_index & 0x8000_0000, 0x8000_0000,
+                   "TLBP for a kseg3-compat VPN2 must set the P bit: it differs \
+                    from the xuseg entry in Region, so it is not a match");
+    }
+
+    // ============ T3: Config.K0 cacheability, per model ====================
+    //
+    // `Config.K0` and EntryLo's C field share an encoding, but **the two parts
+    // decode it differently** — verified against docs/R4000_um2.pdf Table 4-6
+    // and docs/"VR5000 User Manual.pdf" Table 6-6:
+    //
+    //   C | R4400                             | VR5000
+    //   --+-----------------------------------+-------------------------------
+    //   0 | Reserved                          | Cacheable write-through, no WA
+    //   1 | Reserved                          | Cacheable write-through, WA
+    //   2 | Uncached                          | Uncached
+    //   3 | Cacheable noncoherent             | Cacheable noncoherent
+    //   4 | Cacheable coherent exclusive      | Reserved
+    //   5 | Cacheable coherent excl-on-write  | Reserved
+    //   6 | Cacheable coherent update-on-write| Reserved
+    //   7 | Reserved                          | Reserved
+    //
+    // 4/5/6 are coherent variants on R4400, NOT write-through; the
+    // write-through modes are R5000's 0/1 — the encodings R4400 reserves. The
+    // two tables are near-mirror images, so a single shared table is wrong for
+    // one part or the other.
+    //
+    // Only 2 and 3 occur in practice (the PROM flips K0 between them around
+    // cache work; IRIX maps pages C=3), so these tests are the only coverage
+    // for the rest.
+
+    #[test]
+    fn test_decode_cache_attr_matches_the_r4400_table() {
+        let (exec, _mem) = create_executor(); // PassthroughCache => MIPS4 = false
+        type E = MipsExecutor<PassthroughTlb, PassthroughCache>;
+        let _ = &exec;
+
+        // R4400 UM Table 4-6.
+        for (c, want_cached) in [(0u32, false), (1, false), (2, false), (3, true),
+                                 (4, true), (5, true), (6, true), (7, false)] {
+            let attr = E::decode_cache_attr(c);
+            let cached = attr & 0x7 != crate::mips_exec::TR_UNCACHED;
+            assert_eq!(cached, want_cached,
+                "R4400 C={c} should be {} per UM Table 4-6",
+                if want_cached { "CACHED" } else { "uncached" });
+        }
+        // The coherent variants decode as coherent, not plain cacheable.
+        for c in [4u32, 5, 6] {
+            assert_eq!(E::decode_cache_attr(c), crate::mips_exec::TR_CACHEABLE_COH,
+                       "R4400 C={c} is a cacheable COHERENT variant");
+        }
+        assert_eq!(E::decode_cache_attr(3), crate::mips_exec::TR_CACHEABLE);
+    }
+
+    #[test]
+    fn test_decode_cache_attr_matches_the_vr5000_table() {
+        let (exec, _mem) = create_executor_m4(); // PassthroughCacheM4 => MIPS4 = true
+        type E = MipsExecutor<PassthroughTlb, PassthroughCacheM4>;
+        let _ = &exec;
+
+        // VR5000 UM Table 6-6 — note 0/1 cacheable and 4/5/6 reserved, the
+        // reverse of R4400. Getting this backwards maps every R5000
+        // write-through page to uncached.
+        for (c, want_cached) in [(0u32, true), (1, true), (2, false), (3, true),
+                                 (4, false), (5, false), (6, false), (7, false)] {
+            let attr = E::decode_cache_attr(c);
+            let cached = attr & 0x7 != crate::mips_exec::TR_UNCACHED;
+            assert_eq!(cached, want_cached,
+                "R5000 C={c} should be {} per VR5000 UM Table 6-6",
+                if want_cached { "CACHED" } else { "uncached" });
+        }
+        // Write-through folds onto write-back: the cache model has no
+        // write-through path, and write-back is the closest representable
+        // behaviour (uncached would be a coherency error, not a safe default).
+        for c in [0u32, 1] {
+            assert_eq!(E::decode_cache_attr(c), crate::mips_exec::TR_CACHEABLE,
+                       "R5000 C={c} (write-through) folds onto write-back");
+        }
+    }
+
+    /// The two tables must actually differ — a shared table would satisfy each
+    /// of the tests above only if they happened to agree, and they don't.
+    #[test]
+    fn test_the_two_cache_attr_tables_are_not_the_same() {
+        type R4K = MipsExecutor<PassthroughTlb, PassthroughCache>;
+        type R5K = MipsExecutor<PassthroughTlb, PassthroughCacheM4>;
+        let un = crate::mips_exec::TR_UNCACHED;
+
+        // C=0/1: cacheable on R5000, reserved (uncached) on R4400.
+        for c in [0u32, 1] {
+            assert_eq!(R4K::decode_cache_attr(c), un, "R4400 C={c} reserved");
+            assert_ne!(R5K::decode_cache_attr(c), un, "R5000 C={c} cacheable");
+        }
+        // C=4/5/6: the exact reverse.
+        for c in [4u32, 5, 6] {
+            assert_ne!(R4K::decode_cache_attr(c), un, "R4400 C={c} coherent");
+            assert_eq!(R5K::decode_cache_attr(c), un, "R5000 C={c} reserved");
+        }
+        // The two that matter agree on both parts.
+        assert_eq!(R4K::decode_cache_attr(2), R5K::decode_cache_attr(2));
+        assert_eq!(R4K::decode_cache_attr(3), R5K::decode_cache_attr(3));
+    }
+
+    #[test]
+    fn test_kseg0_cacheability_follows_config_k0() {
+        let (mut exec, _mem) = create_executor();
+
+        let kseg0  = 0x8000_0000u64;
+        let kseg1  = 0xA000_0000u64;
+
+        // Reset value is K0=3 (cacheable, non-coherent) — the IRIX case.
+        assert_eq!(exec.core.cp0_config & 0x7, 3, "reset Config.K0 should be 3");
+        assert!(exec.debug_translate(kseg0).is_cached(),
+                "K0=3: KSEG0 is cached");
+
+        // K0=2 (uncached) — what PROM/kernel cache-init code sets while it
+        // sizes or invalidates the caches. Written through MTC0 so the
+        // nutlb-flush barrier in handle_cp0_side_effects is exercised too.
+        exec.core.write_gpr(9, (exec.core.cp0_config & !0x7) as u64 | 2);
+        let mtc0_config = (OP_COP0 << 26) | (0x04 << 21) | (9 << 16) | (16 << 11);
+        assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_config & 0x7, 2, "K0 should now read 2");
+
+        assert!(!exec.debug_translate(kseg0).is_cached(),
+                "K0=2 must make KSEG0 UNCACHED. Hardcoding TR_CACHEABLE here \
+                 defeated exactly the cache-init window K0=2 exists for.");
+
+        // KSEG1 is architecturally always uncached, never K0-controlled.
+        assert!(!exec.debug_translate(kseg1).is_cached(), "KSEG1 always uncached");
+
+        // Back to 3 and confirm it re-caches — i.e. the attribute is read
+        // live, and no stale nutlb/translation state pins the old value.
+        exec.core.write_gpr(9, (exec.core.cp0_config & !0x7) as u64 | 3);
+        assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+        assert!(exec.debug_translate(kseg0).is_cached(),
+                "K0 back to 3 must restore cached KSEG0");
+
+        // The nutlb barrier — cached *translations* only. A K0 write does not
+        // write back or invalidate L1/L2 (real hardware doesn't either; getting
+        // dirty lines out before changing cacheability is software's job). It
+        // must drop nutlb entries, because `nutlb_fill` stores the attribute
+        // inside the entry and the tag records nothing about which K0 filled
+        // it, so stale entries would keep serving the old cacheability.
+        let any_valid = |e: &MipsExecutor<PassthroughTlb, PassthroughCache>| {
+            e.core.nutlb_valid.iter().any(|arr| arr.iter().any(|w| *w != 0))
+        };
+
+        // ERL must be clear to fill at all: `nutlb_fill` treats ERL=1 as a
+        // do-not-cache window (docs/nutlb-design.md §5), and reset leaves it set.
+        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.update_translate_fn();
+        let _ = exec.read_data::<4>(kseg0);
+        assert!(any_valid(&exec), "setup: a KSEG0 access should fill the nutlb");
+
+        exec.core.write_gpr(9, (exec.core.cp0_config & !0x7) as u64 | 2);
+        assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+        assert!(!any_valid(&exec),
+                "a Config write must flush the nutlb — its entries cache the \
+                 cache attribute and carry nothing identifying which K0 filled \
+                 them, so nothing else would drop them");
+
+        // `translate_impl` reads K0 live, so it is correct either way; this
+        // pins that the two agree rather than only the slow path being right.
+        assert!(!exec.debug_translate(kseg0).is_cached(),
+                "the translation path must honour the new K0 immediately");
+
+        exec.core.write_gpr(9, (exec.core.cp0_config & !0x7) as u64 | 3);
+        assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+        assert!(exec.debug_translate(kseg0).is_cached());
+
+        // Reserved encodings: not defined on this part, so treat as uncached
+        // rather than guessing a cacheable variant.
+        for k0 in [0u64, 1, 7] {
+            exec.core.write_gpr(9, (exec.core.cp0_config & !0x7) as u64 | k0);
+            assert_eq!(exec.exec(mtc0_config), EXEC_COMPLETE);
+            assert!(!exec.debug_translate(kseg0).is_cached(),
+                    "reserved K0={k0} should read as uncached");
+        }
+    }
+
+    // ============ C1: misaligned instruction address raises AdEL ===========
+    //
+    // Before the fix nothing checked PC alignment, so a misaligned target
+    // fetched and executed the word *containing* the address — silently
+    // running an instruction the guest never branched to. cpucritique C1.
+    //
+    // The check lives at the two terminals that install a register-sourced PC
+    // (`handle_exec_complete` for a retiring delay slot, `exec_complete_pc_set`
+    // for ERET and the fused jr_nop) rather than on every fetch: only JR/JALR
+    // and ERET can produce a misaligned PC. See `check_pc_alignment`.
+    //
+    // The ordering that matters: the delay slot's side effect must still be
+    // applied. `exec_jr` does not validate its target, so the slot executes and
+    // the fault arrives as that slot retires — same step, side effect first.
+
+    #[test]
+    fn test_misaligned_jr_target_raises_adel_not_silent_execution() {
+        let (mut exec, mem) = create_executor();
+
+        // 0x1000: JR r8      (r8 = 0x2002, misaligned)
+        // 0x1004: ADDIU r9, r0, 0x55   <- delay slot, MUST still take effect
+        // 0x2000: ADDIU r10, r0, 0x77  <- the word CONTAINING 0x2002;
+        //                                 must NOT execute
+        mem.set_word(0x1000, (OP_SPECIAL << 26) | (8 << 21) | FUNCT_JR);
+        mem.set_word(0x1004, make_i(OP_ADDIU, 0, 9, 0x55));
+        mem.set_word(0x2000, make_i(OP_ADDIU, 0, 10, 0x77));
+
+        exec.core.write_gpr(8, 0x2002);
+        exec.core.pc = 0x1000;
+
+        // JR itself must not fault — it only arms the delay slot. R4400 defers
+        // the fault to the target, which is why the check is not in exec_jr.
+        assert_eq!(exec.step_int(), EXEC_COMPLETE, "JR itself must not fault");
+        assert!(exec.core.in_delay_slot, "JR should have armed a delay slot");
+
+        // The delay slot executes, and the AdEL arrives as it retires — the
+        // moment the misaligned target actually becomes PC.
+        let st = exec.step_int();
+        assert_ne!(st & EXEC_IS_EXCEPTION, 0,
+                   "the misaligned target must raise as the delay slot retires");
+        assert_eq!(st, exec_exception(EXC_ADEL),
+                   "a misaligned instruction address raises AdEL");
+
+        // The slot's side effect survives: it is architecturally visible even
+        // though the transfer it belonged to faulted.
+        assert_eq!(exec.core.read_gpr(9), 0x55,
+                   "the delay slot's write must still have happened — putting \
+                    the check in exec_jr would have skipped it");
+
+        assert_eq!(exec.core.cp0_badvaddr, 0x2002,
+                   "BadVAddr gets the misaligned address itself");
+        assert_eq!(exec.core.cp0_epc, 0x2002,
+                   "EPC points at the misaligned target, not at the JR");
+        assert_eq!(exec.core.cp0_cause & (1 << 31), 0,
+                   "BD clear: the fault is on the target's fetch, and the slot \
+                    has already retired");
+        assert_eq!(exec.core.read_gpr(10), 0,
+                   "the word CONTAINING 0x2002 must not have executed — that \
+                    silent execution is the bug C1 fixes");
+    }
+
+    #[test]
+    fn test_misaligned_eret_target_raises_adel() {
+        use crate::mips_core::{STATUS_EXL, STATUS_ERL};
+
+        let (mut exec, mem) = create_executor();
+
+        // ERET is the other register-sourced PC install, and unlike JR it has
+        // no delay slot — it goes straight through exec_complete_pc_set.
+        let eret = (OP_COP0 << 26) | (0x10 << 21) | 0x18;
+        mem.set_word(0x1000, eret);
+        mem.set_word(0x3000, make_i(OP_ADDIU, 0, 11, 0x99)); // must NOT run
+
+        exec.core.cp0_status &= !STATUS_ERL;
+        exec.core.cp0_status |= STATUS_EXL; // ERET returns via EPC, not ErrorEPC
+        exec.core.cp0_epc = 0x3001;         // misaligned return address
+        exec.core.pc = 0x1000;
+
+        let st = exec.step_int();
+        assert_eq!(st, exec_exception(EXC_ADEL),
+                   "ERET to a misaligned EPC must raise AdEL");
+        assert_eq!(exec.core.cp0_badvaddr, 0x3001);
+        assert_eq!(exec.core.read_gpr(11), 0,
+                   "the word containing the misaligned EPC must not execute");
+    }
+
+    #[test]
+    fn test_aligned_targets_are_unaffected_by_the_alignment_check() {
+        let (mut exec, mem) = create_executor();
+
+        // Guard against the check firing on legitimate transfers. JR to an
+        // aligned target, delay slot, and the target instruction all run.
+        mem.set_word(0x1000, (OP_SPECIAL << 26) | (8 << 21) | FUNCT_JR);
+        mem.set_word(0x1004, make_i(OP_ADDIU, 0, 9, 0x11));
+        mem.set_word(0x2000, make_i(OP_ADDIU, 0, 10, 0x22));
+
+        exec.core.write_gpr(8, 0x2000);
+        exec.core.pc = 0x1000;
+
+        assert_eq!(exec.step_int(), EXEC_COMPLETE); // JR
+        assert_eq!(exec.step_int(), EXEC_COMPLETE); // delay slot retires -> 0x2000
+        assert_eq!(exec.core.pc, 0x2000, "aligned target installs normally");
+        assert_eq!(exec.step_int(), EXEC_COMPLETE); // target
+        assert_eq!(exec.core.read_gpr(9), 0x11);
+        assert_eq!(exec.core.read_gpr(10), 0x22);
+    }
+
+    #[test]
+    fn test_all_three_misalignments_of_a_jr_target_fault() {
+        let (mut exec, mem) = create_executor();
+
+        mem.set_word(0x1000, (OP_SPECIAL << 26) | (8 << 21) | FUNCT_JR);
+        mem.set_word(0x1004, 0); // NOP delay slot
+
+        for off in [1u64, 2, 3] {
+            exec.core.cp0_status &= !crate::mips_core::STATUS_EXL;
+            exec.core.in_delay_slot = false;
+            exec.core.write_gpr(8, 0x2000 + off);
+            exec.core.pc = 0x1000;
+
+            assert_eq!(exec.step_int(), EXEC_COMPLETE, "JR (off={off})");
+            assert_eq!(exec.step_int(), exec_exception(EXC_ADEL),
+                       "a target misaligned by {off} must raise AdEL");
+            assert_eq!(exec.core.cp0_badvaddr, 0x2000 + off);
+        }
+    }
 }

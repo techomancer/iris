@@ -52,6 +52,79 @@ another reason to compare identities rather than counts.
 means 62 failed checks, not "error 62". `Error 124` is different — that is
 `timeout(1)`, i.e. the run was killed (see below).
 
+## The 2101/61 number is STALE for the current tree (2026-09-12)
+
+Re-measured `25f86c1` (default features, R4400, interpreter — the same config
+the 2101/61 figure claims):
+
+```
+RESULT: 2040 checks passed, 124 failed  (240 tests)     28 failing tests
+```
+
+So **~124 failures are pre-existing on this tree**, not 61, and the 15-test list
+below is incomplete. A change measured against 61 looks like it broke ~65
+checks when it broke nothing.
+
+**The reliable procedure is to measure your own baseline, every time:**
+
+```sh
+git stash && cargo build --release
+make -C cpu-tests run; grep -E "FAIL" cpu-tests/build/serial.log | sort > /tmp/base.txt
+git stash pop && cargo build --release
+make -C cpu-tests run; grep -E "FAIL" cpu-tests/build/serial.log | sort > /tmp/mine.txt
+diff /tmp/base.txt /tmp/mine.txt          # empty == clean
+```
+
+That diff is the only trustworthy signal here. It is what confirmed the
+T1/T2/T3/C1 batch clean (identical identities) after the raw count had already
+sent one investigation down the wrong path.
+
+**Read the last PASSing line before the stall.** A run that times out names the
+culprit for free: the T3 hang stopped right after `identity/cache_geometry`, and
+the next test in the file is `identity/config_k0` — precisely what the change
+touched. Two reverts were wasted on a different suspect before reading it.
+
+## The baseline is CONFIG-SPECIFIC — check your binary first
+
+**Measured on R4400 + interpreter**, i.e. `cargo build --release` with *default
+features*. `make -C cpu-tests run` just uses whatever `../target/release/iris`
+happens to be, and says nothing about how it was built — so if you last built
+with `--features lightning,rex-jit,jitv2,j2wp,tcache` (the recommended run
+config), `make run` silently measures **that** binary against an
+interpreter-only baseline.
+
+Observed 2026-09-12 doing exactly this: **2038/126 with 29 failing tests**
+against the documented 2101/61 with 15. The 14 extra are not regressions; they
+are what the JIT build scores. Recognisable shapes:
+
+```
+mem/lwr_all_offsets        sign-extension differs from the interpreter
+cache/hit_inv_discards     invalidate leaves stale data visible
+excep/cop2_unusable        CU2-set case takes an exception it shouldn't
+mips4/recip_rsqrt{,_d}     \  present whenever the `mips4` emitters are
+mips4/fp_cond_move_{s,d}   /  compiled in
+```
+
+**Before comparing, rebuild to match:**
+
+```sh
+cargo build --release                     # default features == the baseline
+make -C cpu-tests run
+```
+
+Or point the runner at a specific binary without disturbing `target/`:
+
+```sh
+IRIS=/path/to/iris-plain LOG=build/serial-plain.log \
+  cpu-tests/run/run-local.sh cpu-tests/build/cputest.elf
+```
+
+Recording this because the failure mode is quiet and convincing: a
+count-and-identity diff against the wrong binary produces a long, specific,
+entirely bogus regression list, and the extra tests look plausible enough
+(memory, cache, exceptions) to send someone bisecting a change that had nothing
+to do with them.
+
 ## Compare identities, not just the total
 
 A matching count with a *different* test failing is a regression that a

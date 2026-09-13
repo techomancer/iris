@@ -3670,6 +3670,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if self.core.in_delay_slot {
             self.core.pc = self.core.delay_slot_target;
             self.core.in_delay_slot = false;
+            // A register-sourced target can be misaligned. This is the ONLY
+            // place a retiring delay slot installs it, and it is already past
+            // the slot's side effects — which is exactly the architectural
+            // ordering (see `check_pc_alignment`).
+            //
+            // Ordered *before* `jit_trigger` so a faulting transfer doesn't
+            // leave the trigger set for a target that never became live. The
+            // exception's own vector is reached through `deliver_exception`,
+            // which is a fresh arrival the normal machinery already handles.
+            if (self.core.pc & 0x3) != 0 {
+                return self.misaligned_fetch_exception();
+            }
             // The delay slot just retired: PC now holds the branch's actual
             // target, landing here for the first time this transfer. Mark it
             // as a compile-worthy arrival (jitv2_track_pcp's `AT == Fetch`
@@ -3680,6 +3692,81 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.core.pc = self.core.pc.wrapping_add(4);
         }
         EXEC_COMPLETE
+    }
+
+    /// AdEL for a misaligned PC, delivered as a real exception.
+    ///
+    /// Split out (and `#[cold]`) so the aligned path of
+    /// `handle_exec_complete`/`exec_complete_pc_set` stays a single test and
+    /// branch, with no exception machinery inlined into it.
+    #[cold]
+    #[inline(never)]
+    fn misaligned_fetch_exception(&mut self) -> ExecStatus {
+        self.core.cp0_badvaddr = self.core.pc;
+        self.handle_exception(exec_exception(EXC_ADEL))
+    }
+
+    /// A misaligned instruction address raises **AdEL** — R4400 UM §3, and it
+    /// is a fetch-side fault, not a fault of the instruction that produced the
+    /// address. Without this check a misaligned target fetched and executed the
+    /// word *containing* the address, silently running an instruction the guest
+    /// never branched to. cpucritique C1.
+    ///
+    /// **Where the check lives, and why not in `fetch_instr_impl`.** Testing
+    /// every fetch would be correct but pays on the hottest path in the
+    /// emulator for a condition only a handful of instructions can create. PC
+    /// only becomes misaligned when something installs a *register-sourced*
+    /// address:
+    ///
+    /// | how PC is set | can be misaligned? |
+    /// |---|---|
+    /// | `pc += 4` (sequential, every ordinary instruction) | no — was aligned |
+    /// | `pc += 8` (branch-likely nullified) | no — same |
+    /// | J/JAL, all B* (PC-relative or immediate `<< 2`) | no — low 2 bits are structurally 0 |
+    /// | **JR / JALR** (`read_gpr`) | **yes** |
+    /// | **ERET** (`cp0_epc` / `cp0_errorepc`) | **yes** |
+    ///
+    /// So exactly two sources, arriving through three terminals:
+    ///
+    /// 1. `handle_exec_complete`'s **delay-slot branch only** — a retiring slot
+    ///    installing `delay_slot_target`. This is how plain JR/JALR arrive. The
+    ///    sequential `pc += 4` arm needs no check (PC was already aligned), so
+    ///    ordinary instructions pay nothing.
+    /// 2. `exec_complete_pc_set` — a direct `core.pc = target`. Of its callers
+    ///    only the fused `jr_nop` is register-sourced; the rest (`j_nop`,
+    ///    `jal_nop`, fused `beq`/`bne`) are PC-relative or immediate and
+    ///    structurally aligned.
+    /// 3. `exec_eret` — open-codes its own completion rather than calling
+    ///    `exec_complete_pc_set`, so it needs the check separately.
+    ///
+    /// Those three cover every case and cost one `test`+`jcc`, on paths that
+    /// were already doing branchy PC arithmetic. Compare the alternative of
+    /// testing inside `fetch_instr_impl`: equally correct, but it pays on the
+    /// hottest path in the emulator for a condition two instruction forms can
+    /// create.
+    ///
+    /// **The ordering matters and this placement is what gets it right.** The
+    /// fault belongs on the fetch of the target, *after* the delay slot has
+    /// executed: `exec_jr` deliberately does not validate its target, it just
+    /// calls `branch_delay`, so the slot retires normally and only then does
+    /// the bad PC become live. Putting the check inside `exec_jr` instead would
+    /// skip the slot's architecturally visible side effect. Both terminals sit
+    /// after the slot, so both are correct by construction.
+    ///
+    /// EPC therefore lands on the misaligned target (not on the JR), BD is
+    /// clear, and BadVAddr holds the misaligned address.
+    ///
+    /// Returns `EXEC_COMPLETE` when the PC is aligned — i.e. callers can
+    /// `return` it unconditionally, since that is exactly what they would have
+    /// returned anyway. No `Option`: the status word already encodes "nothing
+    /// happened", so wrapping it only adds a discriminant to branch on.
+    #[inline(always)]
+    fn check_pc_alignment(&mut self) -> ExecStatus {
+        if (self.core.pc & 0x3) != 0 {
+            self.misaligned_fetch_exception()
+        } else {
+            EXEC_COMPLETE
+        }
     }
 
     /// Terminal action for "branch likely not taken" / a fused straight-line
@@ -3717,12 +3804,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// for handlers that skip the delay-slot dance entirely. Status codes no
     /// longer carry PC-related meaning (every handler sets core.pc itself),
     /// so this just returns EXEC_COMPLETE like everything else — jit_trigger
-    /// is the real payload here.
+    /// is the real payload here. (The one exception is a misaligned
+    /// register-sourced PC, which `check_pc_alignment` turns into AdEL.)
     #[inline(always)]
     fn exec_complete_pc_set(&mut self) -> ExecStatus {
         #[cfg(feature = "jitv2")]
         { self.core.jit_trigger = true; }
-        EXEC_COMPLETE
+        // ERET and the fused `jr_nop` install a register-sourced PC through
+        // here; see `check_pc_alignment` for why this is one of only two
+        // places that needs the test.
+        self.check_pc_alignment()
     }
 
     /// Finish a handler given a raw status straight out of read_data/write_data/
@@ -4263,6 +4354,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         self.cache.set_llbit(false);
         self.core.syscall_pending = false;
+
+        // NOTE: deliberately does NOT touch `cp0_badvaddr`. An earlier revision
+        // set it from `fault_pc` for AdEL/AdES on the theory that the JIT's
+        // data-path address errors never reach here — they do. A misaligned
+        // load/store branches to `slow_block`, re-runs in Rust where
+        // `read_data_impl`/`write_data_impl` set BadVAddr to the faulting
+        // *data* address, and then arrives here with `fault_pc` = the
+        // instruction address. Writing it clobbered the right value with the
+        // wrong one; the `ad{e,s}l_*_matches_interpreter` equivalence tests
+        // caught it as a one-field divergence. Every caller that needs
+        // BadVAddr sets it before calling.
         crate::mips_core::deliver_exception_at(&mut self.core, status, fault_pc, bd);
         self.resync_privilege_state();
         status
@@ -4337,19 +4439,106 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// Returns whether a virtual address would use the XTLB (64-bit) vector on a TLB miss.
     /// Mirrors the xtlb flag logic in translate_32/64bit_impl exactly.
-    ///   - 32-bit mode: always false (all TLB segments use UTLB vector)
-    ///   - 64-bit mode: true for xuseg (top=0), xsseg (top=1), and true 64-bit xkseg (top=3,
-    ///     not in 32-bit compat range 0xFFFFFFFF_xxxxxxxx); false for 32-bit compat xkseg
+    ///   - 32-bit mode (KX=0): always false — all TLB segments use the UTLB vector.
+    ///   - 64-bit mode (KX=1): true for every mapped segment, including the
+    ///     32-bit-shaped kseg3/ksseg compat range (`0xFFFF_FFFF_xxxx_xxxx`).
+    ///
+    /// The vector follows the *mode*, not the address shape: R4400 User Manual
+    /// §5 selects XTLB whenever the relevant X-bit (KX/SX/UX) is set for the
+    /// mode the miss was taken in. An earlier version returned false for the
+    /// compat range, which sent a KX=1 kernel's cksseg miss to the 32-bit
+    /// refill vector. cpucritique.md T1.
+    ///
+    /// xkphys (top=2) is unmapped and never reaches the TLB, so it keeps
+    /// returning false; the only caller that can pass it is `exec_tlbp`, which
+    /// is asking about an EntryHi value rather than a real access.
     #[inline]
     fn is_xtlb_address(&self, virt_addr: u64) -> bool {
-        if !self.core.is_64bit_mode() {
-            return false;
+        self.core.is_64bit_mode() && (virt_addr >> 62) != 2
+    }
+
+    /// Decode a 3-bit cache-coherency attribute (EntryLo's C field, or
+    /// `Config.K0`, which uses the same encoding) into a `TR_*` value.
+    ///
+    /// **The two parts have genuinely different tables — this is not one table
+    /// with reserved holes.** Verified against the manuals in `docs/`:
+    ///
+    /// | C | R4400 (`R4000_um2.pdf` Table 4-6) | VR5000 (`VR5000 User Manual.pdf` Table 6-6) |
+    /// |---|---|---|
+    /// | 0 | Reserved | Cacheable noncoherent, **write-through, no write allocate** |
+    /// | 1 | Reserved | Cacheable noncoherent, **write-through, write allocate** |
+    /// | 2 | **Uncached** | **Uncached** |
+    /// | 3 | **Cacheable noncoherent** | **Cacheable noncoherent** |
+    /// | 4 | Cacheable coherent exclusive | Reserved |
+    /// | 5 | Cacheable coherent exclusive on write | Reserved |
+    /// | 6 | Cacheable coherent update on write | Reserved |
+    /// | 7 | Reserved | Reserved |
+    ///
+    /// Note 4/5/6 are **coherent** variants on R4400 — not write-through. The
+    /// write-through modes are R5000's 0/1, i.e. the encodings R4400 reserves.
+    /// Getting these backwards maps every R5000 write-through page to uncached
+    /// and every R4400 coherent page to cacheable-with-the-wrong-attribute.
+    ///
+    /// **Only 2 and 3 matter in practice**: those are what the PROM flips
+    /// between around cache work (measured: five K0 changes over a full IRIX
+    /// boot/run/shutdown, all 3<->2, from `0xbfc047ac`/`0xbfc047ec` running
+    /// uncached out of KSEG1), and what IRIX leaves pages mapped with. The rest
+    /// are decoded for correctness, not because anything exercises them.
+    ///
+    /// Write-through (R5000 C=0/1) folds onto write-back: `mips_cache_v2` has
+    /// no write-through path, so write-back is the closest representable
+    /// behaviour, and it is the right approximation — the alternative,
+    /// treating a cacheable page as uncached, is a coherency error rather than
+    /// a conservative fallback. Coherent variants (R4400 C=4/5/6) map to
+    /// `TR_CACHEABLE_COH` where the cache models it and `TR_CACHEABLE`
+    /// otherwise; the Indy is uniprocessor, so the distinction has no
+    /// observable effect here.
+    ///
+    /// Reserved encodings stay **uncached**: undefined on the part in
+    /// question, so a guest programming one is already out of spec, and
+    /// declining to cache is the safe reading.
+    ///
+    /// `C::MIPS4` is the model discriminator — R5000 is the MIPS IV part,
+    /// R4400 the MIPS III one — matching how the rest of this file selects
+    /// per-model behaviour.
+    #[inline]
+    pub(crate) fn decode_cache_attr(c: u32) -> u32 {
+        if C::MIPS4 {
+            // VR5000 Table 6-6.
+            match c & 0x7 {
+                0 | 1 => TR_CACHEABLE, // write-through -> write-back (see above)
+                3     => TR_CACHEABLE,
+                _     => TR_UNCACHED,  // 2 = Uncached; 4,5,6,7 reserved
+            }
+        } else {
+            // R4400 Table 4-6.
+            match c & 0x7 {
+                3         => TR_CACHEABLE,
+                4 | 5 | 6 => TR_CACHEABLE_COH, // coherent variants
+                _         => TR_UNCACHED,      // 2 = Uncached; 0,1,7 reserved
+            }
         }
-        match virt_addr >> 62 {
-            0 | 1 => true,
-            3 => (virt_addr >> 32) != 0xFFFFFFFF,
-            _ => false, // xkphys (top=2) is unmapped, never TLB; shouldn't be called for non-TLB addrs
-        }
+    }
+
+    /// KSEG0's cache attribute, from `Config.K0` (bits 2:0) rather than a
+    /// hardcoded "cacheable".
+    ///
+    /// `Config.K0` uses the same encoding as EntryLo's C field (R4400 UM
+    /// Table 4-6 / VR5000 UM Table 6-6), so this is just
+    /// [`Self::decode_cache_attr`] applied to the register — see there for the
+    /// per-model tables and why they differ.
+    ///
+    /// Why it matters even though IRIX leaves K0=3 for its whole life: the
+    /// PROM legitimately sets K0=2 to run KSEG0 uncached around cache work,
+    /// including at runtime on video-mode changes. Hardcoding `TR_CACHEABLE`
+    /// made those accesses go through the cache anyway, which is exactly the
+    /// window where doing so is wrong. cpucritique T3.
+    ///
+    /// There is no equivalent knob for KSEG1 — architecturally always
+    /// uncached, not K0-controlled.
+    #[inline]
+    fn kseg0_cache_attr(&self) -> u32 {
+        Self::decode_cache_attr(self.core.cp0_config)
     }
 
     /// Core translation logic.  When `DEBUG` is true the function:
@@ -4408,10 +4597,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.tlb_translate_impl::<DEBUG, 0>(virt_addr, access_type)
             }
 
-            // KSEG0: 0x80000000 - 0x9FFFFFFF (kernel unmapped, cached)
+            // KSEG0: 0x80000000 - 0x9FFFFFFF (kernel unmapped; cacheability
+            // from Config.K0 — see `kseg0_cache_attr`)
             4 => {
                 if PRIV == PRIV_KERNEL {
-                    TranslateResult::ok((virt_addr32 & 0x1FFFFFFF) as u64, TR_CACHEABLE)
+                    TranslateResult::ok((virt_addr32 & 0x1FFFFFFF) as u64, self.kseg0_cache_attr())
                 } else {
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     TranslateResult::exc(addr_exc(access_type == AccessType::Write))
@@ -4517,10 +4707,27 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     // Compatibility segments: top 32 bits all 1s → 32-bit compat (xtlb=false)
                     if (virt_addr >> 32) == 0xFFFFFFFF {
                         match (addr_32 >> 29) & 0x7 {
-                            4 => return TranslateResult::ok((addr_32 & 0x1FFFFFFF) as u64, TR_CACHEABLE),
+                            // ckseg0 — same Config.K0 control as the 32-bit
+                            // KSEG0 arm; it is the same physical window.
+                            4 => return TranslateResult::ok((addr_32 & 0x1FFFFFFF) as u64, self.kseg0_cache_attr()),
                             5 => return TranslateResult::ok((addr_32 & 0x1FFFFFFF) as u64, TR_UNCACHED),
-                            // KSSEG/KSEG3 compat: TLB mapped, 32-bit compat → xtlb=false
-                            _ => return self.tlb_translate_impl::<DEBUG, 0>(virt_addr, access_type),
+                            // KSSEG/KSEG3 compat: TLB mapped. `xtlb=1` even
+                            // though the address is 32-bit-shaped — we are only
+                            // here because `is_64bit_mode()` (Status.KX) is
+                            // already true, and the R4400 chooses the refill
+                            // vector from the *mode*, not the address shape.
+                            // cpucritique.md T1.
+                            //
+                            // The compare width has to follow for the same
+                            // reason: `vcmp64` keeps the Region field, which is
+                            // `11` for these sign-extended addresses. Dropping
+                            // it (`vcmp32`) let a cksseg VA alias an xuseg entry
+                            // whose VPN2[31:13] happened to collide. This is
+                            // only consistent because EntryHi is now committed
+                            // through the unified `EH_VPN_MASK`, so a refill
+                            // handler's TLBWI writes R=11 and bits[39:32]=0xFF
+                            // — exactly what `vcmp64` will compare against.
+                            _ => return self.tlb_translate_impl::<DEBUG, 1>(virt_addr, access_type),
                         }
                     }
                     // True 64-bit xkseg: xtlb=true
@@ -6712,6 +6919,38 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // to the wrong address space.
             self.nanotlb_invalidate();
         }
+        // Config (reg 16), K0 field (bits 2:0): KSEG0's cache attribute, read
+        // by `kseg0_cache_attr` on every KSEG0/ckseg0 translation.
+        //
+        // This invalidates the **nutlb only** — the cached *translations*. It
+        // does not touch L1/L2, and must not: flipping K0 writes back nothing
+        // on real hardware either. Getting dirty lines out of the caches before
+        // changing a region's cacheability is software's job, and software that
+        // skips it loses them. All we owe here is that the next access
+        // re-derives its attribute instead of reusing a cached one.
+        //
+        // Needed because `nutlb_fill` stores the attribute *inside* the entry
+        // (`result.status & 0x7`), and a nutlb tag is a bare page number
+        // recording nothing about which K0 filled it — so without this,
+        // entries filled before a K0 change keep serving the old cacheability.
+        // Structurally identical to the EntryHi/ASID flush above.
+        //
+        // Unconditional rather than gated on "did K0 actually change":
+        // measured over a full IRIX boot + run + shutdown, the PROM writes
+        // Config five times and **every one of them changes K0** (3<->2, from
+        // `0xbfc047ac`/`0xbfc047ec`, running uncached out of KSEG1 around cache
+        // work — including at runtime on video-mode changes, not just at boot).
+        // A change-detection gate would therefore have skipped exactly zero
+        // flushes on a real workload while costing a field to keep in sync
+        // across every path that writes cp0_config directly.
+        //
+        // Five events per boot also means the flush's cost is irrelevant, so
+        // there is nothing to optimise here.
+        //
+        // KSEG1 needs no barrier: architecturally always uncached.
+        if reg == 16 {
+            self.nanotlb_invalidate();
+        }
         // cheritest: a write to CP0 26 triggers the test device's dump. Routed
         // over the bus, so with no test device mapped it's an ignored GIO access.
         if reg == 26 && self.cheritest_dump_hook {
@@ -7063,10 +7302,20 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         {
             self.core.jit_trigger = self.core.syscall_pending;
             self.core.syscall_pending = false;
-            EXEC_COMPLETE
         }
-        #[cfg(not(feature = "jitv2"))]
-        EXEC_COMPLETE
+
+        // ERET's target is EPC/ErrorEPC — register-sourced, so it can be
+        // misaligned. This is the third PC-install terminal (`exec_eret`
+        // open-codes its completion rather than calling
+        // `exec_complete_pc_set`), and the last one that needs the check; see
+        // `check_pc_alignment` for the enumeration.
+        //
+        // Deliberately *after* the Status/privilege updates above: ERET's
+        // architectural effect on EXL/ERL happens regardless, and the AdEL is
+        // then delivered from the returned-to privilege level, which is what
+        // sets EXL again. Checking before would leave the guest stuck in EXL
+        // with no way to observe the fault.
+        self.check_pc_alignment()
     }
 
     // ===== COP1 (FPU) Instructions =====
