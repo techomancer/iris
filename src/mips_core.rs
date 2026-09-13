@@ -46,11 +46,50 @@ pub const CAUSE_IP7: u32 = 1 << 15;            // Timer interrupt (IP7)
 /// `infer_count_hz` measure the real rate the guest believes in.
 pub const DEFAULT_COUNT_HZ: u64 = 33_000_000;
 
+
 /// ci_clock: synthetic nanoseconds per retired instruction (~100 MIPS R4400).
 /// Virtual time is derived from `hot.cycles` instead of the wall clock so the
 /// snapshot determinism validator stays reproducible at any host speed.
 #[cfg(feature = "ci_clock")]
 pub const NS_PER_GUEST_CYCLE: u64 = 10;
+
+/// Claim the right to deliver IP7 for the armed deadline `ticket`.
+///
+/// Both deliverers race here: the CPU thread (when `count_now` steps Count
+/// over Compare, or when a Compare write is classified as an already-missed
+/// deadline) and the hptimer callback (when its one-shot expires). The
+/// sequence word holds the ticket of the currently-armed deadline; the winner
+/// swaps it to `IP7_SEQ_CONSUMED` and asserts IP7, and every later claim for
+/// the same ticket -- including an in-flight timer callback whose arm the
+/// guest has already superseded -- fails the compare-exchange and does
+/// nothing.
+///
+/// Returns true if this caller delivered the interrupt.
+///
+/// Level-triggered semantics are preserved: the word stays consumed until the
+/// next Compare write re-arms it via `MipsCore::arm_ip7_sequence`, which is
+/// exactly the guest's acknowledgement.
+#[inline]
+fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64) -> bool {
+    if ticket == IP7_SEQ_CONSUMED {
+        return false;
+    }
+    if seq
+        .compare_exchange(ticket, IP7_SEQ_CONSUMED, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        fasttick.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Sentinel meaning "the armed deadline has already been delivered". Never a
+/// valid ticket: `arm_ip7_sequence` only ever issues values from a monotonic
+/// counter starting at 1.
+const IP7_SEQ_CONSUMED: u64 = 0;
 
 /// Raw pointer to a `MipsCore`'s `hot.interrupts` word, captured by the armed
 /// compare-timer callback so the hptimer thread can raise IP7. Same
@@ -861,6 +900,54 @@ pub struct MipsCore {
     /// preamble instead of an hptimer). u64::MAX = disarmed.
     #[cfg(feature = "ci_clock")]
     pub count_fire_cycle: u64,
+    /// developer_ip7: total CP0 Compare writes seen, and how many of those
+    /// landed behind Count (which arms a full-wrap ~2^32 wait).
+    #[cfg(feature = "developer_ip7")]
+    pub ip7_writes: u64,
+    #[cfg(feature = "developer_ip7")]
+    pub ip7_past_writes: u64,
+    /// The last CP0 Count value handed to the guest by an MFC0 read of reg 9.
+    /// A guest programs its next deadline relative to this value, so it is
+    /// the reference that separates a deliberate ack (`write_c0_compare(
+    /// read_c0_count())` -- Compare *equals* what was read) from a deadline
+    /// we simply overran (Compare differs from it, yet already lies behind
+    /// the freshly materialized Count). See `write_cp0` reg 11.
+    pub(crate) count_last_guest_read: u32,
+    /// IP7 delivery sequence, CPU-thread copy. Incremented by
+    /// `arm_ip7_sequence` on every Compare write / re-arm; the value it
+    /// becomes is the ticket that the *next* IP7 delivery must present.
+    ///
+    /// Only the CPU thread writes this; the timer thread never touches it.
+    pub(crate) ip7_seq: u64,
+    /// IP7 delivery sequence, shared with the hptimer callback. Holds the
+    /// ticket of the currently-armed deadline. Exactly one deliverer --
+    /// whichever of the CPU thread (crossing detection / late-deadline
+    /// classification) or the timer callback gets there first -- wins the
+    /// compare-exchange that consumes it; the loser does nothing.
+    ///
+    /// This is what makes IP7 delivery exactly-once per armed deadline. The
+    /// hptimer's `remove()` cannot retract a callback the timer thread has
+    /// already dequeued and is about to run outside the lock, so a one-shot
+    /// armed for a superseded Compare can still execute after the guest has
+    /// acked -- re-raising the interrupt it just cleared, which is what
+    /// breaks Linux's second `c0_compare_int_usable` verification window.
+    /// Bumping the sequence at the top of the Compare write invalidates any
+    /// such in-flight callback by construction rather than by timing.
+    pub(crate) ip7_seq_shared: Arc<AtomicU64>,
+    /// developer_ip7: Compare writes classified as a pure acknowledgement.
+    #[cfg(feature = "developer_ip7")]
+    pub ip7_acks: u64,
+    /// developer_ip7: Compare writes whose deadline we had already overrun,
+    /// so IP7 was asserted immediately.
+    #[cfg(feature = "developer_ip7")]
+    pub ip7_late_fires: u64,
+    /// developer_ip7: times `count_now` materialized a Count advance that
+    /// stepped over Compare and raised IP7 at the crossing.
+    #[cfg(feature = "developer_ip7")]
+    pub ip7_cross_fires: u64,
+    /// developer_ip7: number of Status writes that flipped the IM7 mask bit.
+    #[cfg(feature = "developer_ip7")]
+    pub ip7_mask_changes: u64,
     /// Frequency map of CP0 Compare delta values (hardware counts, rounded to nearest 100).
     /// Key = `(delta >> 16) / 100 * 100`, value = number of occurrences. Debug-only
     /// bookkeeping the JIT never touches — kept at the tail, out of the way of the
@@ -1307,6 +1394,21 @@ impl MipsCore {
             #[cfg(feature = "ci_clock")]
             count_fire_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
+            ip7_writes: 0,
+            #[cfg(feature = "developer_ip7")]
+            ip7_past_writes: 0,
+            count_last_guest_read: 0,
+            ip7_seq: 0,
+            ip7_seq_shared: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "developer_ip7")]
+            ip7_acks: 0,
+            #[cfg(feature = "developer_ip7")]
+            ip7_late_fires: 0,
+            #[cfg(feature = "developer_ip7")]
+            ip7_cross_fires: 0,
+            #[cfg(feature = "developer_ip7")]
+            ip7_mask_changes: 0,
+            #[cfg(feature = "developer_ip7")]
             compare_delta_stats: std::collections::HashMap::new(),
             // 16 KiB of zeroes. `NuTlbEntry: Copy` so this is a const-promoted
             // memset, not 512 separate initializations.
@@ -1459,7 +1561,13 @@ impl MipsCore {
             5 => self.cp0_pagemask & 0x01FFE000, // PageMask: only bits 24:13 are valid
             6 => self.cp0_wired as u64 & 0x3F, // Wired: only bits 5:0 are valid, R4000 manual Table 4-10
             8 => self.cp0_badvaddr,
-            9 => self.count_now() as u64,
+            9 => {
+                // Cache what the guest saw; a later Compare write is
+                // classified relative to this (see write_cp0 reg 11).
+                let c = self.count_now();
+                self.count_last_guest_read = c;
+                c as u64
+            }
             10 => self.cp0_entryhi,
             11 => self.cp0_compare,
             12 => self.cp0_status as u64,
@@ -1471,6 +1579,14 @@ impl MipsCore {
             18 => self.cp0_watchlo as u64,
             19 => self.cp0_watchhi as u64,
             20 => self.cp0_xcontext,
+            25 => {
+                // PerfCnt: R4400 has no performance counters. Log any probe so
+                // a guest expecting them (and routing their overflow onto the
+                // timer IP) is visible rather than silently reading 0.
+                #[cfg(feature = "developer_ip7")]
+                eprintln!("[ip7] MFC0 PerfCnt (reg 25) read -> 0");
+                0
+            }
             26 => self.cp0_ecc as u64,
             27 => self.cp0_cacheerr as u64,
             28 => self.cp0_taglo as u64,
@@ -1541,7 +1657,65 @@ impl MipsCore {
             { self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / NS_PER_GUEST_CYCLE); }
             #[cfg(not(feature = "ci_clock"))]
             { self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns); }
-            self.cp0_count = (self.cp0_count as u32).wrapping_add(ticks as u32) as u64;
+            let before = self.cp0_count as u32;
+            let after = before.wrapping_add(ticks as u32);
+            self.cp0_count = after as u64;
+
+            // Architecturally, IP7 is pending as soon as Count *reaches*
+            // Compare. On silicon that is exact, because Count increments one
+            // tick at a time. Here Count is virtual and materialized in
+            // lumps: a single `count_now` can carry it from before Compare to
+            // well past it in one step, and nothing else notices — IP7 is
+            // otherwise raised only by the hptimer one-shot, which is racing
+            // on another thread against the wall clock rather than against
+            // this Count value.
+            //
+            // That race is what breaks short deadline checks. Linux's
+            // c0_compare_int_usable() waits for Count to pass its programmed
+            // Compare, then looks for IP7 within COMPARE_INT_SEEN_TICKS (50
+            // counts). Our polling `mfc0` loop overshoots Compare by hundreds
+            // of counts in one materialization, so the 50-count window is
+            // already behind us when the wait loop exits, and whether IP7 is
+            // pending at that instant depends purely on whether the timer
+            // thread happened to fire yet. It usually has not, so the probe
+            // returns 0, r4k_clockevent_init() gets -ENXIO, no clockevent is
+            // registered, jiffies never advance, and the kernel spins in
+            // calibrate_delay_converge forever.
+            //
+            // Restore the invariant directly: if this advance stepped over
+            // Compare, raise IP7 at the crossing. `wrapping_sub` makes the
+            // test wrap-safe -- the distance from `before` to Compare being
+            // within the distance we just travelled is exactly "we passed
+            // it", for any rollover. This does not replace the hptimer (which
+            // still delivers IP7 while the guest is running code that never
+            // reads Count); it just makes a Count read agree with what the
+            // guest would have seen on real hardware.
+            //
+            // Writing Compare is what acks IP7 (see write_cp0 reg 11), so an
+            // ack that leaves Compare just behind Count does not re-trigger
+            // here: the crossing already happened before the ack cleared it,
+            // and the next crossing is a full wrap away.
+            let dist_to_compare = (self.cp0_compare as u32).wrapping_sub(before);
+            if dist_to_compare != 0 && (dist_to_compare as u64) <= ticks {
+                // Same ticket the armed one-shot holds: whichever of us gets
+                // here first delivers, the other is a no-op.
+                let won = claim_ip7(
+                    &self.ip7_seq_shared,
+                    self.ip7_seq,
+                    &self.hot.interrupts,
+                    &self.fasttick_count,
+                );
+                #[cfg(feature = "developer_ip7")]
+                if won {
+                    self.ip7_cross_fires += 1;
+                    if self.ip7_cross_fires <= 40 {
+                        eprintln!("[ip7] CROSS count {:#010x}->{:#010x} passed compare {:#010x} ticket={} (cross={})",
+                            before, after, self.cp0_compare as u32, self.ip7_seq, self.ip7_cross_fires);
+                    }
+                }
+                #[cfg(not(feature = "developer_ip7"))]
+                let _ = won;
+            }
         }
         self.count_read_cycle = cycles;
         self.cp0_count as u32
@@ -1702,6 +1876,23 @@ impl MipsCore {
         }
     }
 
+    /// Issue a fresh IP7 delivery ticket, invalidating any previously armed
+    /// one. Called from the CPU thread at the top of a Compare write, before
+    /// IP7 is cleared, so that a timer callback racing us cannot re-assert
+    /// the interrupt the guest is in the middle of acknowledging.
+    ///
+    /// Returns the new ticket, which the caller hands to whoever may deliver
+    /// this deadline (the armed one-shot, and the CPU thread's own crossing
+    /// and late-deadline checks).
+    fn arm_ip7_sequence(&mut self) -> u64 {
+        self.ip7_seq = self.ip7_seq.wrapping_add(1);
+        if self.ip7_seq == IP7_SEQ_CONSUMED {
+            self.ip7_seq = 1; // never issue the sentinel
+        }
+        self.ip7_seq_shared.store(self.ip7_seq, Ordering::SeqCst);
+        self.ip7_seq
+    }
+
     /// (Re-)arm the Count==Compare interrupt for the current
     /// `cp0_count`/`cp0_compare` values. Caller must have just materialized
     /// the count (`count_now`) so the delta is measured from *now*.
@@ -1729,6 +1920,21 @@ impl MipsCore {
             d => d,
         };
         let ns = ((delta as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
+        #[cfg(feature = "developer_ip7")]
+        if self.ip7_writes <= 40 {
+            eprintln!("[ip7] ARM  delta={} ns={} count={:#010x} compare={:#010x} ticket={}",
+                delta, ns, self.cp0_count as u32, self.cp0_compare as u32, self.ip7_seq);
+        }
+        #[cfg(feature = "developer_ip7")]
+        if ns > 100_000_000 {
+            // Anything over 100ms out is not a real periodic tick: either a
+            // full-wrap "Compare in the past" arm, or a wildly wrong count_hz.
+            eprintln!(
+                "[ip7] ARM  delta={} ns={} ({:.3}s) count={:#010x} compare={:#010x} hz={}  <-- LONG",
+                delta, ns, ns as f64 / 1e9,
+                self.cp0_count as u32, self.cp0_compare as u32, self.count_hz,
+            );
+        }
         #[cfg(feature = "ci_clock")]
         {
             self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
@@ -1746,6 +1952,11 @@ impl MipsCore {
             }
             let irq = TimerIrqPtr(&self.hot.interrupts as *const AtomicU64);
             let fasttick = self.fasttick_count.clone();
+            // Stamp this arm. A callback that finds the epoch moved on was
+            // armed for a Compare value the guest has since replaced (or
+            // acked), so it must not raise IP7.
+            let ticket = self.ip7_seq;
+            let seq_ref = self.ip7_seq_shared.clone();
             // After firing, hardware would next match Compare again after a
             // full 32-bit Count wrap — self-reschedule that far out. In
             // practice the guest's interrupt handler writes Compare long
@@ -1755,14 +1966,31 @@ impl MipsCore {
             );
             self.timer_id = Some(tm.add_one_shot(
                 std::time::Duration::from_nanos(ns),
-                (irq, fasttick, wrap),
-                |(irq, fasttick, wrap)| {
+                (irq, fasttick, wrap, ticket, seq_ref),
+                |(irq, fasttick, wrap, ticket, seq_ref)| {
                     // SAFETY: points into the MipsCore owned by the executor's
                     // top-level Arc<Mutex<..>>, which outlives the armed timer
                     // (Drop for MipsCore removes it). Same contract as
                     // Ioc::set_interrupts's stored pointer.
-                    unsafe { &*irq.0 }.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
-                    fasttick.fetch_add(1, Ordering::Relaxed);
+                    let irq_ref = unsafe { &*irq.0 };
+                    // Only deliver if this ticket is still the armed one. A
+                    // Compare write since this one-shot was scheduled has
+                    // already issued a new ticket, so this claim fails and the
+                    // interrupt the guest just acked is not re-asserted.
+                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick);
+                    #[cfg(feature = "developer_ip7")]
+                    {
+                        let n = fasttick.load(Ordering::Relaxed);
+                        if n <= 40 {
+                            eprintln!("[ip7] FIRE callback ticket={} {} (fired={})",
+                                ticket,
+                                if won { "-> IP7 set" } else { "STALE -> ignored" },
+                                n);
+                        }
+                    }
+                    if !won {
+                        return crate::hptimer::TimerReturn::Delete;
+                    }
                     crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
                 },
             ));
@@ -1888,14 +2116,74 @@ impl MipsCore {
                 // schedule_compare_timer arm/classify against the true
                 // current Count/Compare relationship, then arm the
                 // interrupt.
-                self.count_now();
+                // Issue a new delivery ticket before anything else. Any
+                // one-shot armed for the previous Compare -- including one the
+                // timer thread has already dequeued and is about to run
+                // outside its lock, which `remove()` cannot retract -- now
+                // holds a stale ticket and can no longer assert IP7 over the
+                // acknowledgement we are about to perform.
+                let ticket = self.arm_ip7_sequence();
+                let count_before = self.count_now();
                 self.cp0_compare = value as u32 as u64;
-                // Writing Compare acknowledges the timer interrupt: clear
-                // IP7 both in Cause and in the shared pending word (the
-                // step() preamble mirrors the pending word into Cause, so
-                // leaving the atomic bit set would immediately re-raise it).
+
+                // Writing Compare always acknowledges the pending timer
+                // interrupt first: clear IP7 in both Cause and the shared
+                // pending word (the step() preamble mirrors the pending word
+                // into Cause, so leaving the atomic bit set would immediately
+                // re-raise it).
                 self.cp0_cause &= !CAUSE_IP7;
                 self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
+
+                // Now classify what the guest actually asked for. Count here
+                // is virtual and materialized in lumps from the wall clock,
+                // so "Compare is behind Count" is ambiguous in a way it never
+                // is on silicon, where Count advances one tick at a time:
+                //
+                //  1. Compare == the Count the guest last read, but behind
+                //     the Count we just materialized. A pure acknowledgement
+                //     (`write_c0_compare(read_c0_count())`), which is how
+                //     Linux's c0_compare_int_usable and c0_compare_interrupt
+                //     both ack. The guest wants the interrupt *gone* and no
+                //     new deadline. Leave IP7 clear; the next architectural
+                //     match is a full 32-bit wrap away.
+                //
+                //  2. Compare != the last read, yet still behind the current
+                //     Count. The guest asked for a real deadline
+                //     (`read_c0_count() + delta`) that we blew through while
+                //     emulating the handful of instructions between its read
+                //     and this write. On hardware IP7 would already be
+                //     asserted, so raise it now rather than waiting a wrap.
+                //
+                //  3. Compare is ahead of Count: an ordinary future deadline.
+                //     Leave IP7 clear and let the timer deliver it.
+                //
+                // Every case re-arms schedule_compare_timer below; for 1 and
+                // 2 that is the full-wrap arm, which is correct -- there is
+                // no way to disable the MIPS timer, so "no deadline" is
+                // expressed as a match a wrap away.
+                let compare_u32 = self.cp0_compare as u32;
+                let in_future = compare_u32.wrapping_sub(count_before) != 0
+                    && (compare_u32.wrapping_sub(count_before) as i32) > 0;
+                if !in_future {
+                    if compare_u32 == self.count_last_guest_read {
+                        // Case 1: pure ack. IP7 stays cleared above.
+                        #[cfg(feature = "developer_ip7")]
+                        { self.ip7_acks += 1; }
+                    } else {
+                        // Case 2: missed deadline -- assert immediately,
+                        // consuming this write's own fresh ticket.
+                        let won = claim_ip7(
+                            &self.ip7_seq_shared,
+                            ticket,
+                            &self.hot.interrupts,
+                            &self.fasttick_count,
+                        );
+                        #[cfg(feature = "developer_ip7")]
+                        if won { self.ip7_late_fires += 1; }
+                        #[cfg(not(feature = "developer_ip7"))]
+                        let _ = won;
+                    }
+                }
 
                 // new_delta is this write's own Compare-minus-Count — what
                 // the guest is asking to wait *starting now*, not yet lived
@@ -1917,6 +2205,29 @@ impl MipsCore {
                 {
                     let bucket = (new_delta / 100) * 100;
                     *self.compare_delta_stats.entry(bucket).or_insert(0) += 1;
+                    // Signed view: negative means Compare was written *behind*
+                    // Count, which schedule_compare_timer turns into a full
+                    // 2^32-count wait. That is the Linux/HZ=1000 failure mode.
+                    let signed = new_delta as i32;
+                    self.ip7_writes += 1;
+                    if signed <= 0 { self.ip7_past_writes += 1; }
+                    if self.ip7_writes <= 200 || signed <= 0 {
+                        eprintln!(
+                            "[ip7] MTC0 Compare #{:<5} lastread={:#010x} count={:#010x} compare={:#010x} delta={:>8} {} fired={} ack={} late={} cross={}",
+                            self.ip7_writes,
+                            self.count_last_guest_read,
+                            count_before,
+                            self.cp0_compare as u32,
+                            signed,
+                            if in_future { "FUTURE " }
+                            else if compare_u32 == self.count_last_guest_read { "ACK    " }
+                            else { "LATE!  " },
+                            self.fasttick_count.load(Ordering::Relaxed),
+                            self.ip7_acks,
+                            self.ip7_late_fires,
+                            self.ip7_cross_fires,
+                        );
+                    }
                 }
                 if self.compare_delta_prev != 0 {
                     self.infer_count_hz(self.compare_delta_prev);
@@ -1934,6 +2245,24 @@ impl MipsCore {
             12 => {
                 let old = self.cp0_status;
                 self.cp0_status = value as u32;
+                // Trace every change to the IP7 mask bit (Status.IM7). Linux's
+                // mips_cpu_irq_controller masks IM7 on interrupt entry
+                // (irq_ack) and unmasks on EOI; if the unmask never comes, no
+                // further timer interrupt can ever be delivered.
+                #[cfg(feature = "developer_ip7")]
+                {
+                    const IM7: u32 = 1 << 15;
+                    if (old ^ self.cp0_status) & IM7 != 0 {
+                        self.ip7_mask_changes += 1;
+                        if self.ip7_mask_changes <= 60 {
+                            eprintln!(
+                                "[ip7] Status IM7 {}  status {:#010x} -> {:#010x}  epc={:#018x} cause={:#010x}",
+                                if self.cp0_status & IM7 != 0 { "SET  " } else { "CLEAR" },
+                                old, self.cp0_status, self.cp0_epc, self.cp0_cause,
+                            );
+                        }
+                    }
+                }
                 if let Some((cb, ctx)) = self.status_changed_cb {
                     cb(ctx, old, self.cp0_status);
                 }
@@ -1968,6 +2297,10 @@ impl MipsCore {
             18 => self.cp0_watchlo = value as u32,
             19 => self.cp0_watchhi = value as u32,
             20 => self.cp0_xcontext = value,
+            25 => {
+                #[cfg(feature = "developer_ip7")]
+                eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);
+            }
             26 => self.cp0_ecc = value as u32,
             27 => self.cp0_cacheerr = value as u32,
             28 => self.cp0_taglo = value as u32,
