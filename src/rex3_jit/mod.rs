@@ -154,7 +154,11 @@ impl RexJit {
         };
 
         // Warm-up: queue all profile triples for pre-compilation.
+        #[cfg(not(test))]
         let profile = profile::load_profile();
+        // Unit tests must not compile a user's persistent warm-up profile.
+        #[cfg(test)]
+        let profile: Vec<(u32, u32, u32)> = Vec::new();
         let warmup_count = profile.len();
         for (dm0, dm1, cm) in profile {
             jit.request_compile(dm0, dm1, cm);
@@ -245,7 +249,11 @@ impl RexJit {
                 return;
             }
         }
-        let _ = self.compile_tx.try_send(CompileRequest::Compile(dm0, dm1, cm));
+        if self.compile_tx.try_send(CompileRequest::Compile(dm0, dm1, cm)).is_err() {
+            // A full queue did not accept this shader. Permit a later draw to
+            // retry instead of leaving the key permanently marked as queued.
+            self.store.queued.write().unwrap().remove(&(dm0, dm1, cm));
+        }
     }
 
     /// Block until a specific (dm0, dm1, cm) shader is compiled (used in tests).
@@ -314,5 +322,26 @@ pub struct ShaderInfo {
 impl Drop for RexJit {
     fn drop(&mut self) {
         let _ = self.compile_tx.try_send(CompileRequest::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn full_compile_queue_allows_retry() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(tx.try_send(CompileRequest::Compile(1, 2, 3)).is_ok());
+        let jit = RexJit {
+            store: Arc::new(ShaderStore::new()), compile_tx: tx,
+            _compiler_thread: thread::spawn(|| {}),
+        };
+        jit.request_compile(4, 5, 6);
+        assert_eq!(jit.queued_count(), 0);
+        rx.recv().unwrap();
+        jit.request_compile(4, 5, 6);
+        assert_eq!(jit.queued_count(), 1);
+        assert!(matches!(rx.recv().unwrap(), CompileRequest::Compile(4, 5, 6)));
     }
 }
