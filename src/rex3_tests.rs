@@ -39,6 +39,8 @@ fn make_rex3() -> &'static Rex3 {
                 (*rex.fb_rgb.get()).fill(0);
                 (*rex.fb_aux.get()).fill(0);
             }
+            #[cfg(feature = "rex-jit")]
+            rex.jit_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
             rex.start();
             rex
         })
@@ -212,7 +214,7 @@ const DM0_READ_BLOCK:  u32 = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK | D
 
 /// Initialise REX3 to a known baseline — matches rex3init() from rex3.c.
 /// XYWIN is left at 0 (no hardware xbias correction needed in emulation).
-/// clipmode=0 means no smask checking, no CID checking.
+/// All CID mask bits set permit every window ID; screen masks are disabled.
 fn rex3init(rex: &Rex3) {
     reg(rex, REX3_LSMODE,      0);
     reg(rex, REX3_LSPATTERN,   0);
@@ -245,8 +247,64 @@ fn rex3init(rex: &Rex3) {
     reg(rex, REX3_SMASK4Y,     0);
     reg(rex, REX3_XYWIN,       0);
     reg(rex, REX3_TOPSCAN,     0x3FF);
-    reg(rex, REX3_CLIPMODE,    0);  // no CID, no smask checking
+    reg(rex, REX3_CLIPMODE,    0xF << CLIPMODE_CIDMATCH_SHIFT);
     wait(rex);
+}
+
+// CIDMATCH is a set of permitted two-bit CIDs, not a four-bit equality
+// comparison. Popup bits and the other auxiliary lanes must not affect it.
+fn check_cid_write_masks(rex: &Rex3, compiled: bool) {
+    rex3init(rex);
+    #[cfg(feature = "rex-jit")]
+    let jit_before = rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+    let src = 10 * 2048 + 10;
+    let dst = 20 * 2048 + 10;
+    for dm0 in [DM0_DRAW_BLOCK, DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE | DM0_DOSETUP | DM0_STOPONXY, DM0_SCR2SCR] {
+        for mask in 0..16_u32 {
+            let cm = mask << CLIPMODE_CIDMATCH_SHIFT;
+            #[cfg(feature = "rex-jit")]
+            if compiled {
+                let jit = rex.rex_jit.as_ref().unwrap();
+                jit.request_compile(dm0, DM1_RGB24_SRC, cm);
+                assert!(jit.wait_compiled(dm0, DM1_RGB24_SRC, cm));
+            }
+            #[cfg(not(feature = "rex-jit"))]
+            assert!(!compiled);
+            for cid in 0..4_u32 {
+                for popup in 0..4_u32 {
+                    wait(rex);
+                    unsafe {
+                        (*rex.fb_rgb.get())[src] = 0x123456;
+                        (*rex.fb_rgb.get())[dst] = 0xabcdef;
+                        (*rex.fb_aux.get())[dst] = 0x80000000 | (cid << 4) | (popup << 2) | cid;
+                    }
+                    reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+                    reg(rex, REX3_COLORI, 0x123456);
+                    reg(rex, REX3_CLIPMODE, cm);
+                    let copying = dm0 == DM0_SCR2SCR;
+                    reg(rex, REX3_XYMOVE, if copying { 10 } else { 0 });
+                    reg(rex, REX3_XYSTARTI, xy(10, if copying { 10 } else { 20 }));
+                    reg(rex, REX3_XYENDI, xy(10, if copying { 10 } else { 20 }));
+                    reg_go(rex, REX3_DRAWMODE0, dm0);
+                    let expected = if mask & (1 << cid) != 0 { 0x123456 } else { 0xabcdef };
+                    assert_eq!(read_pixel(rex, 10, 20), expected,
+                        "dm0={dm0:#x} CIDMATCH={mask:04b} cid={cid} popup={popup}");
+                }
+            }
+        }
+    }
+    #[cfg(feature = "rex-jit")]
+    assert_eq!(rex.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) - jit_before,
+        if compiled { 768 } else { 0 });
+}
+
+#[test]
+fn cid_write_masks_interpreter() {
+    let rex = make_rex3();
+    #[cfg(feature = "rex-jit")]
+    rex.jit_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+    check_cid_write_masks(rex, false);
+    rex.stop();
 }
 
 // ============================================================================
@@ -2448,6 +2506,13 @@ mod jit_tests {
     use super::*;
     use crate::rex3_jit::RexJit;
 
+    #[test]
+    fn cid_write_masks_jit() {
+        let rex = make_rex3_jit();
+        check_cid_write_masks(rex, true);
+        rex.stop();
+    }
+
     /// Build a Rex3 with JIT enabled.
     fn make_rex3_jit() -> &'static Rex3 {
         std::thread::Builder::new()
@@ -2514,7 +2579,7 @@ mod jit_tests {
         setup: impl Fn(&Rex3),
         dm0: u32, dm1: u32,
     ) {
-        // Interpreter run (no JIT — rex_jit is None)
+        // Interpreter run with JIT dispatch disabled.
         let rex_interp = make_rex3();
         rex3init(rex_interp);
         setup(rex_interp);
@@ -3068,10 +3133,10 @@ mod jit_tests {
         if let Some(ref jit) = rex_jit.rex_jit {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                if jit.compiled_pairs().contains(&(dm0, dm1, 0)) { break; }
+                if jit.compiled_pairs().contains(&(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT)) { break; }
                 assert!(std::time::Instant::now() < deadline,
                     "JIT compile timed out for dm0={dm0:#010x} dm1={dm1:#010x}");
-                jit.request_compile(dm0, dm1, 0); // retry if channel was full
+                jit.request_compile(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT); // retry if channel was full
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -3165,9 +3230,9 @@ mod jit_tests {
         if let Some(ref jit) = rex_j.rex_jit {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                if jit.compiled_pairs().contains(&(dm0, dm1, 0)) { break; }
+                if jit.compiled_pairs().contains(&(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT)) { break; }
                 assert!(std::time::Instant::now() < deadline, "JIT compile timeout");
-                jit.request_compile(dm0, dm1, 0);
+                jit.request_compile(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
@@ -3469,7 +3534,7 @@ mod jit_tests {
         write_hostrw32(rex_j, word); // triggers compile request
         wait(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0, dm1, 0),
+            assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
         }
         // Reset and replay via JIT
@@ -3515,7 +3580,7 @@ mod jit_tests {
         write_hostrw32(rex_j, pixels[0]); // trigger compile
         wait(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0, dm1, 0),
+            assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
         }
         clear_region(rex_j, 0, 0, 3, 0);
@@ -3560,7 +3625,7 @@ mod jit_tests {
         write_hostrw64(rex_j, word64);
         wait(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0, dm1, 0),
+            assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
         }
         clear_region(rex_j, 0, 0, 1, 0);
@@ -3620,7 +3685,7 @@ mod jit_tests {
         setup_read(rex_j);
         reg_go(rex_j, REX3_DRAWMODE0, dm0_read); // triggers compile + first batch
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+            assert!(jit.wait_compiled(dm0_read, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
         }
         // Re-run via JIT
@@ -3690,7 +3755,7 @@ mod jit_tests {
         reg_go(rex_j, REX3_DRAWMODE0, dm0_read);
         read_hostrw32_last(rex_j); // drain
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+            assert!(jit.wait_compiled(dm0_read, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
         }
         let words_jit = read_words(rex_j);
@@ -3787,7 +3852,7 @@ mod jit_tests {
         setup_read(rex_j);
         let _ = read_all_words(rex_j); // throwaway: triggers compile request
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(dm0_read, dm1, 0),
+            assert!(jit.wait_compiled(dm0_read, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
         }
         rex3init(rex_j);
@@ -3872,7 +3937,7 @@ mod jit_tests {
         setup_read(rex_j);
         let _ = read_all_words(rex_j);
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0),
+            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={DM0_READ_BLOCK:#010x} dm1={dm1:#010x}");
         }
         rex3init(rex_j);
@@ -3990,7 +4055,7 @@ mod jit_tests {
         setup_read(rex_j);
         let _ = read_all_words(rex_j); // throwaway: triggers compile request
         if let Some(ref jit) = rex_j.rex_jit {
-            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0),
+            assert!(jit.wait_compiled(DM0_READ_BLOCK, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                 "JIT compile failed dm0={DM0_READ_BLOCK:#010x} dm1={dm1:#010x}");
         }
         rex3init(rex_j);
@@ -4060,7 +4125,7 @@ mod jit_tests {
             setup(rex_j);
             wait(rex_j);
             if let Some(ref jit) = rex_j.rex_jit {
-                assert!(jit.wait_compiled(dm0, dm1, 0),
+                assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
                     "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
             }
             clear_region(rex_j, 0, 0, alphas.len() as i32 - 1, 0);

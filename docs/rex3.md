@@ -129,7 +129,7 @@ REX3 orchestrates external Display Control Bus hardware (XMAP9, VC2, CMAP RAMDAC
 
 #### CLIPMODE (Clipping and CID)
 *   `4:0 ENSMASK`: Individual enables for SMASK0 through SMASK4.
-*   `12:9 CIDMATCH`: CID codes to compare. If matching, write is permitted.
+*   `12:9 CIDMATCH`: Mask of permitted two-bit CIDs: bit N permits writes to CID N.
 
 #### STATUS / USER_STATUS
 *   `2:0 VERSION`: Revision code.
@@ -206,7 +206,7 @@ AND
 ### CID Masking (Per-Pixel Window IDs)
 For complex, non-rectangular window clipping, REX3 relies on Coordinate ID (CID) planes. The frame buffer dedicates physical bitplanes specifically to store a "Window ID" for every pixel on the screen.
 
-When the `CIDMATCH` field in the `CLIPMODE` register is set to anything other than `1111` (0xF), hardware CID checking is invoked during drawing. Before the REX3 writes a pixel to the RGB/CI planes, it first reads the destination pixel's CID plane. If the destination's CID value matches the `CIDMATCH` value, the write is permitted; otherwise, it is silently aborted. This allows arbitrary overlapping window topologies to be managed securely without calculating complex fractional rectangles on the host CPU.
+The `CIDMATCH` field in `CLIPMODE` is a four-bit mask: bit N permits writes to pixels whose two-bit CID is N. For example, `0010` permits CID `01`. The mask `1111` permits all CIDs; `0000` rejects all writes. Popup bits are separate and do not participate in this check. Drawing and screen-to-screen copies check the destination CID; framebuffer reads do not check CID. See the [REX3 specification](rex3.pdf), table 16 and section 3.3.
 
 ## Drawing Modes
 

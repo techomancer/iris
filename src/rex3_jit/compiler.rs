@@ -1035,7 +1035,7 @@ fn emit_shader(
         ensmask_key, coord_bias, c0, c2048, ptr_type,
     );
 
-    // CID mask check: skip write if fb_aux[addr] & 0xF != cidmatch.
+    // CIDMATCH selects permitted two-bit CIDs; popup bits are unrelated.
     // Only emitted when cidmatch != 0xF (0xF = disabled).
     // Does not apply to HOSTR (READ) since that reads from fb, not writes to it.
     if cidmatch != 0xF && !is_hostr {
@@ -1048,8 +1048,11 @@ fn emit_shader(
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
         let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
-        let aux_lo4 = b.ins().band_imm_s(aux_raw, 0xF_i64);
-        let cid_matches = b.ins().icmp_imm_s(IntCC::Equal, aux_lo4, cidmatch as i64);
+        let cid = b.ins().band_imm_s(aux_raw, 3);
+        let enabled = b.ins().iconst(types::I32, cidmatch as i64);
+        let selected = b.ins().ushr(enabled, cid);
+        let allowed = b.ins().band_imm_s(selected, 1);
+        let cid_matches = b.ins().icmp_imm_s(IntCC::NotEqual, allowed, 0);
         let cid_ok = b.create_block();
         let cid_skip_args: &[Value] = if is_hostw { &clip_skip_args_buf[..] } else { &[] };
         b.ins().brif(cid_matches, cid_ok, &[], skip_block, &block_args(cid_skip_args));
@@ -1829,8 +1832,11 @@ fn emit_draw_iline(
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
         let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
-        let aux_lo4 = b.ins().band_imm_s(aux_raw, 0xF_i64);
-        let cid_matches = b.ins().icmp_imm_s(IntCC::Equal, aux_lo4, cidmatch as i64);
+        let cid = b.ins().band_imm_s(aux_raw, 3);
+        let enabled = b.ins().iconst(types::I32, cidmatch as i64);
+        let selected = b.ins().ushr(enabled, cid);
+        let allowed = b.ins().band_imm_s(selected, 1);
+        let cid_matches = b.ins().icmp_imm_s(IntCC::NotEqual, allowed, 0);
         let cid_ok = b.create_block();
         b.ins().brif(cid_matches, cid_ok, &[], skip_block, &[]);
         b.switch_to_block(cid_ok); b.seal_block(cid_ok);

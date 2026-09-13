@@ -2848,6 +2848,15 @@ impl Rex3 {
         self.store_host_pixel(ctx, pixel);
     }
 
+    fn cid_allows_write(&self, ctx: &Rex3Context, addr: u32) -> bool {
+        let enabled = (ctx.clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF;
+        if enabled == 0xF { return true; }
+        // REX3 spec, CLIPMODE table 16: each bit enables one of the four
+        // two-bit CID values. AUX bits 3:2 are popup data, not part of CID.
+        let cid = unsafe { (*self.fb_aux.get())[addr as usize] } & 3;
+        enabled & (1 << cid) != 0
+    }
+
     fn process_pixel_draw(&self, ctx: &mut Rex3Context, x: i32, y: i32) {
         let colorhost = ctx.drawmode0.colorhost();
         let alphahost = ctx.drawmode0.alphahost();
@@ -2888,15 +2897,7 @@ impl Rex3 {
         };
 
         if let Some(addr) = self.calculate_fb_address(x, y, ctx, true) {
-            // CID Masking
-            let cidmatch = (ctx.clipmode >> CLIPMODE_CIDMATCH_SHIFT) & 0xF;
-            if cidmatch != 0xF {
-                let aux_val = unsafe { (*self.fb_aux.get())[addr as usize] };
-                // Compare against lower 4 bits of AUX (CID+PUP usually)
-                if (aux_val & 0xF) != cidmatch {
-                    return;
-                }
-            }
+            if !self.cid_allows_write(ctx, addr) { return; }
 
             // src color: 24-bit BGR in rgbmode, plane-depth index in CI mode
             let raw_src = if use_bg {
@@ -3019,6 +3020,7 @@ impl Rex3 {
         };
 
         if let Some(dst_addr) = self.calculate_fb_address(x, y, ctx, true) {
+            if !self.cid_allows_write(ctx, dst_addr) { return; }
             let wr_fn = unsafe { *self.px_wr.get() };
 
             let res = if ctx.drawmode1.blend() {
