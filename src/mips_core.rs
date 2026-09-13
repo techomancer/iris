@@ -347,6 +347,11 @@ pub struct MipsCore {
     /// Base of the L1-D data array. Null under tcache (line holds no data).
     #[cfg(feature = "jitv2")]
     pub jit_dc_data: *mut u8,
+    /// Base of the L1-D per-set LRU bitmap (one bit per set). Only read by the
+    /// 2-way (R5000) inline path, which updates it on a hit exactly as
+    /// `ensure_l1d_line` does; null on a direct-mapped model.
+    #[cfg(feature = "jitv2")]
+    pub jit_dc_lru: *mut u8,
     /// ppmem window base — tcache's data source (`tc_base + phys`).
     #[cfg(all(feature = "jitv2", feature = "tcache"))]
     pub jit_tc_base: *mut u8,
@@ -1184,6 +1189,8 @@ impl MipsCore {
             // that has jitv2 compiled units live.
             #[cfg(feature = "jitv2")]
             jit_dc_tags: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
+            jit_dc_lru: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             jit_dc_data: std::ptr::null_mut(),
             #[cfg(all(feature = "jitv2", feature = "tcache"))]

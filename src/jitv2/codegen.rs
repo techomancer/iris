@@ -3420,6 +3420,7 @@ pub static INLINE_MEM_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 /// Offsets of the inline load/store fast-path pointers in `MipsCore`.
 fn core_offset_of_jit_dc_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_tags) as i32 }
+fn core_offset_of_jit_dc_lru() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_lru) as i32 }
 #[cfg(not(feature = "tcache"))]
 fn core_offset_of_jit_dc_data() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_data) as i32 }
 #[cfg(feature = "tcache")]
@@ -3572,19 +3573,57 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let phys = ctx.builder.ins().bor(phys_page, va_off);
 
     // ---- 2. L1D tag match --------------------------------------------
+    //
+    // Mirrors `ensure_l1d_line`'s hit path exactly (mips_cache_v2.rs). On a
+    // 1-way (R4400) cache that is a single tag compare. On a 2-way (R5000)
+    // cache both ways are probed, the winning way is folded into the extended
+    // tag index (`set | way << num_lines_shift`) so the tag pointer — and, in
+    // a non-tcache build, the data address — address the right half, and the
+    // per-set LRU bit is updated: a way0 hit makes way1 the next victim and
+    // vice versa. Skipping the LRU update would leave fills evicting the
+    // just-used line.
     let tags_base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
         ir::immediates::Offset32::new(core_offset_of_jit_dc_tags()));
-    let dc_idx = ctx.builder.ins().ushr_imm_s(vaddr, geom.line_shift as i64);
-    let dc_idx = ctx.builder.ins().band_imm_s(dc_idx, geom.num_lines_mask as i64);
-    let dc_off = ctx.builder.ins().imul_imm_s(dc_idx, l1d_tag_stride());
-    let tag_ptr = ctx.builder.ins().iadd(tags_base, dc_off);
+    let set_idx = ctx.builder.ins().ushr_imm_s(vaddr, geom.line_shift as i64);
+    let set_idx = ctx.builder.ins().band_imm_s(set_idx, geom.num_lines_mask as i64);
 
-    let ptag = ctx.builder.ins().load(i64t, mem, tag_ptr,
-        ir::immediates::Offset32::new(l1d_tag_ptag_off()));
     // matches_phys: ptag == (phys & !0xFFF) | 1
     let want_tag = ctx.builder.ins().band_imm_s(phys, !0xFFFi64);
     let want_tag = ctx.builder.ins().bor_imm_s(want_tag, 1);
-    let tag_hit = ctx.builder.ins().icmp(IntCC::Equal, ptag, want_tag);
+
+    let (tag_hit, tag_ptr, dc_idx) = if geom.ways > 1 {
+        // Way 0 lives at `set`, way 1 at `set | (1 << num_lines_shift)`.
+        let way1_bit = 1i64 << geom.num_lines_shift;
+
+        let off0 = ctx.builder.ins().imul_imm_s(set_idx, l1d_tag_stride());
+        let p0 = ctx.builder.ins().iadd(tags_base, off0);
+        let t0 = ctx.builder.ins().load(i64t, mem, p0,
+            ir::immediates::Offset32::new(l1d_tag_ptag_off()));
+        let hit0 = ctx.builder.ins().icmp(IntCC::Equal, t0, want_tag);
+
+        let idx1 = ctx.builder.ins().bor_imm_s(set_idx, way1_bit);
+        let off1 = ctx.builder.ins().imul_imm_s(idx1, l1d_tag_stride());
+        let p1 = ctx.builder.ins().iadd(tags_base, off1);
+        let t1 = ctx.builder.ins().load(i64t, mem, p1,
+            ir::immediates::Offset32::new(l1d_tag_ptag_off()));
+        let hit1 = ctx.builder.ins().icmp(IntCC::Equal, t1, want_tag);
+
+        // Branchless select rather than a second block: both tag words are
+        // loaded unconditionally anyway (they share a cache line in the tag
+        // array), so a cmov is strictly cheaper than a branch the predictor
+        // has to learn per access site.
+        let hit = ctx.builder.ins().bor(hit0, hit1);
+        let idx = ctx.builder.ins().select(hit1, idx1, set_idx);
+        let ptr = ctx.builder.ins().select(hit1, p1, p0);
+        (hit, ptr, idx)
+    } else {
+        let off = ctx.builder.ins().imul_imm_s(set_idx, l1d_tag_stride());
+        let ptr = ctx.builder.ins().iadd(tags_base, off);
+        let t = ctx.builder.ins().load(i64t, mem, ptr,
+            ir::immediates::Offset32::new(l1d_tag_ptag_off()));
+        let hit = ctx.builder.ins().icmp(IntCC::Equal, t, want_tag);
+        (hit, ptr, set_idx)
+    };
 
     // Stores work on clean lines too — `mark_l1d_dirty` is a single byte
     // store to a tag we already have the pointer for (emitted in
@@ -3649,9 +3688,59 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let (base, index) = {
         let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
             ir::immediates::Offset32::new(core_offset_of_jit_dc_data()));
-        let masked = ctx.builder.ins().band_imm_s(vaddr, geom.data_mask as i64);
+        // `dc_data_addr(dc_ext_idx, vaddr)`:
+        //     (dc_ext_idx << line_shift) | (vaddr & line_mask)
+        // For 1-way this is exactly `vaddr & data_mask` (the index came from
+        // those same VA bits), which is what the original emitted. For 2-way
+        // it is NOT — way1's data lives in the upper half of the array, and
+        // only the extended index carries that bit. Computing it from
+        // `dc_idx` is correct for both, so there is one form here rather than
+        // a branch.
+        let line_mask = ((1i64 << geom.line_shift) - 1) & geom.data_mask as i64;
+        let line_base = ctx.builder.ins().ishl_imm_s(dc_idx, geom.line_shift as i64);
+        let off_in_line = ctx.builder.ins().band_imm_s(vaddr, line_mask);
+        let addr = ctx.builder.ins().bor(line_base, off_in_line);
+        let masked = ctx.builder.ins().band_imm_s(addr, geom.data_mask as i64);
         (base, masked)
     };
+
+    // ---- 2-way: hit-side LRU update ----------------------------------
+    //
+    // `ensure_l1d_line` sets the set's LRU bit to 1 on a way0 hit and 0 on a
+    // way1 hit — i.e. "the other way is the next victim". The bit we want is
+    // therefore `way ^ 1`, and `way` is bit `num_lines_shift` of `dc_idx`.
+    //
+    // Emitted here, inside `fast_block`, so it runs only on a confirmed hit —
+    // the same place the Rust path does it. A miss falls to `slow_block` and
+    // the callout updates LRU itself.
+    if geom.ways > 1 {
+        let lru_base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(core_offset_of_jit_dc_lru()));
+        // set = dc_idx with the way bit cleared (lru is indexed by set, not
+        // by the extended index — see `lru_set`'s `dc_idx & DC_NUM_LINES_MASK`).
+        let set = ctx.builder.ins().band_imm_s(dc_idx, geom.num_lines_mask as i64);
+        // word = lru[set >> 6], bit position = set & 63
+        let word_idx = ctx.builder.ins().ushr_imm_s(set, 6);
+        let word_off = ctx.builder.ins().imul_imm_s(word_idx, 8);
+        let word_ptr = ctx.builder.ins().iadd(lru_base, word_off);
+        let word = ctx.builder.ins().load(i64t, mem, word_ptr,
+            ir::immediates::Offset32::new(0));
+
+        let one = ctx.builder.ins().iconst(i64t, 1);
+        let bit_mask = ctx.builder.ins().ishl(one, set);
+
+        // val = way ^ 1, where way = (dc_idx >> num_lines_shift) & 1
+        let way = ctx.builder.ins().ushr_imm_s(dc_idx, geom.num_lines_shift as i64);
+        let way = ctx.builder.ins().band_imm_s(way, 1);
+        let val = ctx.builder.ins().bxor_imm_s(way, 1);
+        let val_bit = ctx.builder.ins().ishl(val, set);
+
+        // word = (word & !mask) | val_bit   — exactly `lru_set`.
+        let cleared = ctx.builder.ins().band_not(word, bit_mask);
+        let updated = ctx.builder.ins().bor(cleared, val_bit);
+        ctx.builder.ins().store(mem, updated, word_ptr,
+            ir::immediates::Offset32::new(0));
+    }
 
     let swizzled = emit_swizzle_index(ctx, index, size);
     let fast_data_ptr = ctx.builder.ins().iadd(base, swizzled);

@@ -195,6 +195,13 @@ pub struct JitDcGeometry {
     /// `phys >> l2_line_shift & l2_num_lines_mask` = L2 tag index.
     pub l2_line_shift: u32,
     pub l2_num_lines_mask: u64,
+    /// L1-D associativity: 1 (R4400) or 2 (R5000). With `ways == 2` the
+    /// emitted guard probes both ways and, on a hit, updates the per-set LRU
+    /// bit exactly as `ensure_l1d_line` does.
+    pub ways: u32,
+    /// `set | (way << num_lines_shift)` = extended tag index. Only meaningful
+    /// when `ways > 1`.
+    pub num_lines_shift: u32,
 }
 
 impl JitDcGeometry {
@@ -202,6 +209,7 @@ impl JitDcGeometry {
         Self {
             supported: false, line_shift: 0, num_lines_mask: 0, data_mask: 0,
             has_l2: false, l2_line_shift: 0, l2_num_lines_mask: 0,
+            ways: 1, num_lines_shift: 0,
         }
     }
 }
@@ -489,6 +497,11 @@ pub trait MipsCache: Send + Sync {
     /// Codegen needs these as immediates; they are const-generic on the cache
     /// type and differ between R4400 and R5000.
     fn jit_dc_geometry(&self) -> JitDcGeometry { JitDcGeometry::unsupported() }
+
+    /// Base of the L1-D per-set LRU bitmap (`[u64]`, one bit per set), for the
+    /// 2-way inline path's hit-side LRU update. Null on a direct-mapped model,
+    /// where there is no LRU state at all.
+    fn jit_dc_lru_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
 
     /// jitv2 compile gate: does this cache hold *dirty* data for any line of
     /// the 4KB physical page at `page_base`?
@@ -2845,13 +2858,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     }
 
     fn jit_dc_geometry(&self) -> JitDcGeometry {
-        // First implementation is 1-way only: R5000's 2-way L1-D folds the
-        // way into the data address (`dc_data_addr`), which compiled code
-        // does not yet select. Report unsupported so codegen keeps calling
-        // out rather than emitting a wrong address.
-        if Self::IS_R5K {
-            return JitDcGeometry::unsupported();
-        }
+        // Both associativities are supported. R5000's 2-way L1-D needs the
+        // emitted guard to probe *both* ways and, on a hit, fold the winning
+        // way into the extended tag index — see `emit_inline_mem_guard`, which
+        // mirrors `ensure_l1d_line` (including its hit-side LRU update).
+        //
+        // Without tcache the way also folds into the data address
+        // (`dc_data_addr`); with tcache the data comes from `tc_base + phys`,
+        // so the way affects only the tag probe and the LRU bit.
         // Under tcache the inline path reads the ppmem window and bumps the
         // jitv2 generation array directly, so both pointers must be live
         // before any region compiles. They are published by machine.rs before
@@ -2874,12 +2888,28 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         JitDcGeometry {
             supported: true,
             line_shift: Self::DC_LINE_SHIFT,
-            num_lines_mask: (DC_SIZE / DC_LINE - 1) as u64,
+            // **Sets, not total lines.** `DC_NUM_LINES_MASK` is
+            // `DC_NUM_SETS - 1` = `DC_SIZE / DC_LINE / DC_WAYS - 1`, which is
+            // what `dc.get_index()` masks with. Writing `DC_SIZE / DC_LINE - 1`
+            // here is correct only for a direct-mapped cache; on R5000's 2-way
+            // it is one bit too wide, and that extra bit **is** the way bit —
+            // so a way-0 index could alias into way 1's range and the
+            // `set | way << num_lines_shift` fold became meaningless.
+            num_lines_mask: Self::DC_NUM_LINES_MASK as u64,
             data_mask: (DC_SIZE - 1) as u64,
             has_l2: HAS_L2,
             l2_line_shift: L2_LINE.trailing_zeros(),
             l2_num_lines_mask: if HAS_L2 { (L2_CACHE_SIZE / L2_LINE - 1) as u64 } else { 0 },
+            ways: DC_WAYS as u32,
+            num_lines_shift: Self::DC_NUM_LINES_SHIFT as u32,
         }
+    }
+
+    fn jit_dc_lru_ptr(&self) -> *mut u8 {
+        // Empty (and so no meaningful base) on a direct-mapped model — the
+        // 1-way guard never reads it.
+        if !Self::IS_R5K { return std::ptr::null_mut(); }
+        unsafe { (*self.dc_lru.get()).as_mut_ptr() as *mut u8 }
     }
 
     /// See `MipsCache::jit_page_has_dirty_lines` for the contract and for why
@@ -4459,6 +4489,62 @@ mod tests {
     // own doc comment for why a miss there is tolerated by design).
 
     const PROBE_PAGE: u32 = 0x0002_0000; // 4KB-aligned, well inside MEM_BYTES
+
+    /// The geometry handed to codegen must describe the *sets*, not the total
+    /// line count, or the 2-way inline path's `set | way << num_lines_shift`
+    /// fold is nonsense: the extra mask bit IS the way bit, so a way-0 index
+    /// aliases into way 1's range. R4400 hides this (1 way makes the two
+    /// expressions equal), which is why it only ever broke R5000.
+    #[test]
+    fn jit_dc_geometry_masks_sets_not_lines() {
+        // Asserted against the cache types' own constants rather than a live
+        // `jit_dc_geometry()` call: under tcache that call legitimately
+        // returns `unsupported()` for a bare test cache (no ppmem window), so
+        // reading it here would test the null path, not the arithmetic.
+        // These are exactly the values `jit_dc_geometry` copies out.
+        assert_eq!(R4400Cache::DC_NUM_LINES_MASK as u64, 1023,
+                   "R4400: 16K / 16B / 1 way = 1024 sets");
+        assert_eq!(R5000Cache::DC_NUM_LINES_MASK as u64, 511,
+                   "R5000: 32K / 32B / 2 ways = 512 sets, mask 0x1ff. NOT 1023 \
+                    — that counts both ways, and the surplus bit IS the way \
+                    bit, so a way-0 index would alias into way 1's range and \
+                    the `set | way << num_lines_shift` fold becomes nonsense.");
+        assert_eq!(R5000Cache::DC_NUM_LINES_SHIFT, 9,
+                   "way bit sits just above the 512 set indices");
+
+        // R4400 is immune to the bug by coincidence — with one way,
+        // `DC_SIZE/DC_LINE - 1` and `DC_SIZE/DC_LINE/DC_WAYS - 1` are equal.
+        // That is why this only ever broke R5000, and why the wrong form
+        // survived review.
+        assert_eq!(16384 / 16 - 1, R4400Cache::DC_NUM_LINES_MASK,
+                   "the two formulas coincide at 1 way");
+        assert_ne!(32768 / 32 - 1, R5000Cache::DC_NUM_LINES_MASK,
+                   "and diverge at 2 ways — this is the whole bug");
+
+        // The fold must land way 1 in the upper half of the data array, which
+        // is what `dc_data_addr` documents.
+        let set = 0x91u64;
+        let eidx1 = set | (1u64 << R5000Cache::DC_NUM_LINES_SHIFT);
+        let addr1 = (eidx1 << R5000Cache::DC_LINE_SHIFT) & (32768u64 - 1);
+        assert!(addr1 >= 32768 / 2, "way 1 data must be in the upper half");
+
+        // And the struct codegen actually receives must carry those values —
+        // the constants above are only the *source*. Without tcache a bare
+        // cache reports a supported geometry, so this reads the real thing.
+        // (Under tcache `jit_dc_geometry` returns `unsupported()` here for
+        // want of a ppmem window, which is why this half is cfg'd: asserting
+        // it there would test the null path instead of the arithmetic.)
+        #[cfg(not(feature = "tcache"))]
+        {
+            let mem = Arc::new(Memory::new(1));
+            let g5 = R5000Cache::new(mem as Arc<dyn BusDevice>).jit_dc_geometry();
+            assert!(g5.supported);
+            assert_eq!(g5.ways, 2);
+            assert_eq!(g5.num_lines_mask, 511,
+                       "the geometry handed to codegen must mask SETS");
+            assert_eq!(g5.num_lines_shift, 9);
+        }
+    }
 
     #[cfg(not(feature = "tcache"))]
     #[test]

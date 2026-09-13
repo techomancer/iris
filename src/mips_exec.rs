@@ -2946,11 +2946,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if geom.supported {
             self.core.jit_dc_tags = self.cache.jit_dc_tags_ptr();
             self.core.jit_dc_data = self.cache.jit_dc_data_ptr();
+            self.core.jit_dc_lru  = self.cache.jit_dc_lru_ptr();
         } else {
             // Null tags = "do not emit the inline path" (R5000's 2-way L1-D,
             // PassthroughCache, anything else unsupported).
             self.core.jit_dc_tags = std::ptr::null_mut();
             self.core.jit_dc_data = std::ptr::null_mut();
+            self.core.jit_dc_lru  = std::ptr::null_mut();
         }
         #[cfg(feature = "tcache")]
         {

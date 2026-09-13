@@ -70,6 +70,10 @@ mod zz_corpus {
             has_l2: true,
             l2_line_shift: 7,
             l2_num_lines_mask: (1024 * 1024 / 128) - 1,
+            // Direct-mapped, so the guard takes its 1-way path; the way bit
+            // never participates. `num_lines_shift` is unread when ways == 1.
+            ways: 1,
+            num_lines_shift: 0,
         };
         let mut total: u64 = 0;
         let mut n_ok = 0u64;
