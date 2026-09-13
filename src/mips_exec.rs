@@ -10620,7 +10620,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// Snapshot the deterministic-from-state CPU registers. Excludes host
     /// wallclock anchors like `count_anchor_instant` (they're meaningless
     /// across runs) but includes their calibrated equivalents (count_hz,
-    /// compare_delta_*).
+    /// the fixed count_hz).
     ///
     /// Also drains `hw_read_fixup_recorded` (see that field's doc comment)
     /// into the returned digest's `hw_reads` and clears it — empty/no-op
@@ -10899,21 +10899,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             let jit = exec.jitv2.lock();
             eprintln!("=== JIT v2 page pool ===");
             eprintln!("  {} / {} pages used", jit.pages_used(), jit.capacity());
-        }
-        #[cfg(feature = "developer_ip7")]
-        {
-            let map = &self.executor.lock().core.compare_delta_stats;
-            if !map.is_empty() {
-                let total: u32 = map.values().sum();
-                let mut top: Vec<(u32, u32)> = map.iter().map(|(&k, &v)| (k, v)).collect();
-                top.sort_by(|a, b| b.1.cmp(&a.1));
-                eprintln!("=== CP0 Compare delta stats ({} samples) ===", total);
-                eprintln!("  Top clusters (hw-counts rounded to 100):");
-                for (bucket, cnt) in top.iter().take(10) {
-                    let pct = *cnt as f64 * 100.0 / total as f64;
-                    eprintln!("    ~{:>8}  {:>6}x  {:5.1}%", bucket, cnt, pct);
-                }
-            }
         }
     }
 
@@ -11527,12 +11512,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 let sym_str = format_pc_symbol(pc, &symbols);
                 writeln!(writer, "{} pc={:016x}{}", if running { "running" } else { "stopped" }, pc, sym_str).unwrap();
                 let hz = exec.core.count_hz;
-                let slow = exec.core.compare_delta_slow;
-                let fast = exec.core.compare_delta_fast;
                 writeln!(writer, "  count_hz={} ({:.3} MHz)  count={:#010x} compare={:#010x}",
                     hz, hz as f64 / 1e6, exec.core.count_peek(), exec.core.cp0_compare as u32).unwrap();
-                writeln!(writer, "  compare_delta_slow={} hw-counts  compare_delta_fast={} hw-counts",
-                    slow, fast).unwrap();
                 Ok(())
             }
             "ip7" => {
@@ -11687,16 +11668,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     }
                 }
                 let c = &exec.core;
-                // count_hz is derived purely from which pattern bucket the
-                // Compare deltas fall into (assumed 100Hz slow / 1kHz fast —
-                // see infer_count_hz's doc comment for why real elapsed time
-                // can't be used: it would be circular with our own hptimer's
-                // fire time).
+                // count_hz is fixed for the life of the core (DEFAULT_COUNT_HZ
+                // unless overridden by `[clock] fixed_mhz` / the CLI).
                 writeln!(writer, "  IP7 timer: count_hz={} ({:.3} MHz)  fired={}",
                     c.count_hz, c.count_hz as f64 / 1e6,
                     c.fasttick_count.load(Ordering::Relaxed)).unwrap();
-                writeln!(writer, "    slow_delta={} hw-counts  fast_delta={} hw-counts",
-                    c.compare_delta_slow, c.compare_delta_fast).unwrap();
                 Ok(())
             }
             "cop1" => {
@@ -14128,7 +14104,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         // intentionally not saved: it's a host-wall anchor, not calibrated
         // state, and must be reset on load.
         cp0u64!(count_hz);
-        cp0u64!(compare_delta_slow); cp0u64!(compare_delta_fast);
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
         cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
@@ -14184,7 +14159,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             ld32!(cp0_index); ld32!(cp0_random); ld32!(cp0_wired);
             ld64!(cp0_count); ld64!(cp0_compare);
             ld64!(count_hz);
-            ld64!(compare_delta_slow); ld64!(compare_delta_fast);
             // Compat shim: pre-timer-based snapshots stored cp0_count/
             // cp0_compare and the learned deltas in 32.32 fixed-point
             // (hardware count in the high word). Values above u32::MAX can
@@ -14193,8 +14167,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             // stays at its default until the guest's tick is re-recognized.)
             if c.cp0_count > u32::MAX as u64 { c.cp0_count >>= 32; }
             if c.cp0_compare > u32::MAX as u64 { c.cp0_compare >>= 32; }
-            if c.compare_delta_slow > u32::MAX as u64 { c.compare_delta_slow >>= 32; }
-            if c.compare_delta_fast > u32::MAX as u64 { c.compare_delta_fast >>= 32; }
             // Mirror count_hz into its atomic shadow (read by the display
             // thread) so the live UI matches the restored core state.
             c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);

@@ -69,10 +69,12 @@ impl IdleParkState {
     /// nominal ~100 MIPS — so cross-thread cycle readers (Wd33c93a's
     /// deferred-interrupt spin-wait, CP0 Random) keep seeing progress.
     pub fn park(&self, core: &mut MipsCore, running: &AtomicBool) {
-        // Only park once the guest has a recognized periodic tick: before
-        // that (PROM), Compare use is ad-hoc and there may be nothing armed
-        // to wake us.
-        if core.compare_delta_slow == 0 {
+        // Only park once the guest has actually armed a Compare deadline.
+        // Before that (PROM), Compare use is ad-hoc and there may be nothing
+        // armed to wake us. cp0_compare is zero out of reset and the guest
+        // must write it to schedule anything, so a non-zero value is the
+        // signal that parking is safe.
+        if core.cp0_compare == 0 {
             return;
         }
 

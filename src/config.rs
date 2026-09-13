@@ -621,13 +621,11 @@ impl Default for Jitv2Config {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ClockConfig {
-    /// Pin the virtual CP0 Count frequency at this fixed value (MHz) instead
-    /// of auto-inferring it from the guest's Compare-write cadence. The
-    /// auto-inference assumes an IRIX-shaped two-bucket periodic tick (100 Hz
-    /// "slow" / 1 kHz "fast", both at a guessed real MIPS clock); guests that
-    /// don't fit that model (e.g. Linux/MIPS) can otherwise get misclassified
-    /// or chased as a moving target. None = auto-infer (default, matches
-    /// real hardware detection behavior IRIX expects).
+    /// CP0 Count frequency in MHz. Count ticks at a fixed rate; there is no
+    /// runtime inference. None = `DEFAULT_COUNT_HZ` (33 MHz), which is what
+    /// IRIX expects — it reports a 66 MHz CPU for a 33 MHz Count, and since
+    /// these systems are interrupt-driven the emulator running at a different
+    /// real speed has no ill effects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_mhz: Option<f64>,
 }
@@ -1395,7 +1393,7 @@ pub struct Cli {
     /// Pin the virtual CP0 Count frequency at this fixed value (MHz) instead
     /// of auto-inferring it from the guest's periodic timer tick. Use for
     /// guests (e.g. Linux/MIPS) whose tick doesn't fit IRIX's slow/fast
-    /// two-bucket model, e.g. --clock-fixed-mhz 33.
+    /// Override the fixed CP0 Count frequency, e.g. --clock-fixed-mhz 33.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
     pub clock_fixed_mhz: Option<f64>,
 }

@@ -720,12 +720,11 @@ impl Machine {
             }
         }
 
-        // Pin the CP0 Count frequency if the user asked for a fixed clock
-        // (guests like Linux/MIPS whose periodic tick doesn't fit IRIX's
-        // slow/fast two-bucket auto-inference model). Must happen before the
-        // core starts executing.
+        // CP0 Count runs at a fixed frequency: DEFAULT_COUNT_HZ unless the
+        // user overrode it via `[clock] fixed_mhz` or the CLI. Must happen
+        // before the core starts executing.
         if let Some(mhz) = clock_fixed_mhz {
-            executor.core.set_fixed_clock_hz((mhz * 1_000_000.0) as u64);
+            executor.core.set_count_hz((mhz * 1_000_000.0) as u64);
         }
 
         // Inject the shared fasttick_count Arc into the executor core before wrapping in MipsCpu.
