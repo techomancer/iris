@@ -187,6 +187,7 @@ pub mod monitor;
 pub mod locks;
 pub mod pit8254;
 pub mod net;
+mod host_dns;
 pub mod nfsudp;
 pub mod tftp;
 pub mod testdev;

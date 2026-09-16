@@ -51,6 +51,11 @@ const RPC_PROG_NFS:      u32 = 100003;
 const RPC_PROG_MOUNTD:   u32 = 100005;
 const RPC_PORTMAP_GETPORT: u32 = 3;
 
+/// DNS server used when the host has none configured, and advertised by DHCP.
+const DNS_FALLBACK: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+/// How long a host DNS server lookup is reused before reading it again.
+const HOST_DNS_REFRESH: Duration = Duration::from_secs(5);
+
 // ── Gateway configuration ─────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -58,7 +63,9 @@ pub struct GatewayConfig {
     pub gateway_ip:  Ipv4Addr,
     pub client_ip:   Ipv4Addr,
     pub netmask:     Ipv4Addr,
-    pub dns_upstream: SocketAddr,
+    /// Fixed upstream for guest DNS queries. None follows the host's configured
+    /// DNS server (see [`crate::host_dns`]), falling back to 8.8.8.8.
+    pub dns_upstream: Option<SocketAddr>,
     /// NFS configuration; if Some, portmap and NAT redirection for NFS/mountd are enabled.
     pub nfs: Option<NfsConfig>,
     /// Port forwarding rules: host listens and forwards to the guest.
@@ -83,7 +90,7 @@ impl Default for GatewayConfig {
             gateway_ip:   subnet.gateway_ip,
             client_ip:    subnet.client_ip,
             netmask:      subnet.netmask,
-            dns_upstream: "8.8.8.8:53".parse().unwrap(),
+            dns_upstream: None,
             nfs:          None,
             port_forwards: vec![],
             mode:         NetMode::Nat,
@@ -1136,6 +1143,7 @@ mod nfs_pcap_tests {
 // ── NAT engine ────────────────────────────────────────────────────────────────
 pub struct NatEngine {
     config:  GatewayConfig,
+    host_dns: Option<(SocketAddr, Instant)>, // host DNS server and when it was read
     tx_cons: rtrb::Consumer<Vec<u8>>, // outbound frames from enet thread
     rx_prod: rtrb::Producer<Vec<u8>>, // inbound frames to enet thread
     rx_wake: Arc<(Mutex<()>, Condvar)>, // signal enet thread when rx_prod gets a frame
@@ -1273,7 +1281,7 @@ impl NatEngine {
             eprintln!("iris: TFTP server (read-only) serving {}", dir.display());
             crate::tftp::TftpServer::new(dir.clone())
         });
-        Self { config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
+        Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
                tcp_fwd_listeners, udp_fwd_listeners, fwd_static_count,
@@ -1871,9 +1879,12 @@ impl NatEngine {
             rep[o+2..o+6].copy_from_slice(&self.config.netmask.octets()); o+=6;
             rep[o]=3; rep[o+1]=4;
             rep[o+2..o+6].copy_from_slice(&self.config.gateway_ip.octets()); o+=6;
-            let dns_ip = match self.config.dns_upstream.ip() {
-                IpAddr::V4(ip) => ip,
-                _              => Ipv4Addr::new(8,8,8,8),
+            // Not the host's DNS server: that is often loopback (a VPN or
+            // systemd-resolved stub), which the guest would take as its own.
+            // Guest queries to any address are forwarded, so this still works.
+            let dns_ip = match self.config.dns_upstream.map(|a| a.ip()) {
+                Some(IpAddr::V4(ip)) => ip,
+                _                    => DNS_FALLBACK,
             };
             rep[o]=6; rep[o+1]=4;
             rep[o+2..o+6].copy_from_slice(&dns_ip.octets()); o+=6;
@@ -1896,7 +1907,7 @@ impl NatEngine {
         dlog_dev!(LogModule::Net, "NAT DNS forward len={}", query.len());
         let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return; };
         let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-        if sock.send_to(query, self.config.dns_upstream).is_err() { return; }
+        if sock.send_to(query, self.dns_upstream()).is_err() { return; }
         let mut buf = [0u8; 512];
         if let Ok((n, _)) = sock.recv_from(&mut buf) {
             let udp = udp_packet(self.config.gateway_ip, client_ip,
@@ -1905,6 +1916,21 @@ impl NatEngine {
                                  self.config.gateway_ip, client_ip, IP_PROTO_UDP, &udp);
             self.enqueue_rx(frame);
         }
+    }
+
+    // Re-read periodically so turning a VPN on or off needs no restart.
+    fn dns_upstream(&mut self) -> SocketAddr {
+        if let Some(addr) = self.config.dns_upstream { return addr; }
+        if let Some((addr, read_at)) = self.host_dns {
+            if read_at.elapsed() < HOST_DNS_REFRESH { return addr; }
+        }
+        let ip = crate::host_dns::system_dns_server().unwrap_or(DNS_FALLBACK);
+        let addr = SocketAddr::from((ip, UDP_PORT_DNS));
+        if self.host_dns.map(|(old, _)| old) != Some(addr) {
+            dlog_dev!(LogModule::Net, "NAT DNS upstream {}", addr);
+        }
+        self.host_dns = Some((addr, Instant::now()));
+        addr
     }
 
     // ── Time services (RFC 868 + NTP) ─────────────────────────────────────────
@@ -2689,5 +2715,75 @@ impl NetBackend for NatEngine {
     fn run(&mut self) {
         // Delegate to the inherent run loop.
         NatEngine::run(self)
+    }
+}
+
+#[cfg(test)]
+mod dns_nat_tests {
+    use super::*;
+
+    fn engine(config: GatewayConfig) -> (NatEngine, rtrb::Consumer<Vec<u8>>) {
+        let (_, tx_cons) = rtrb::RingBuffer::new(8);
+        let (rx_prod, rx_cons) = rtrb::RingBuffer::new(8);
+        let engine = NatEngine::new(
+            config, tx_cons, rx_prod,
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new((Mutex::new(()), Condvar::new())),
+            Arc::new(AtomicBool::new(true)), NatControl::new(),
+        );
+        (engine, rx_cons)
+    }
+
+    #[test]
+    fn dns_query_goes_to_configured_upstream() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let upstream = server.local_addr().unwrap();
+        let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            buf[2] |= 0x80;
+            server.send_to(&buf[..n], peer).unwrap();
+            buf[..n].to_vec()
+        });
+        let (mut e, mut rx) = engine(GatewayConfig { dns_upstream: Some(upstream), ..GatewayConfig::default() });
+        let (client, gateway) = (e.config.client_ip, e.config.gateway_ip);
+        e.handle_udp(&[1; 6], client, gateway, &udp_packet(client, gateway, 4321, 53, query));
+        let answer = responder.join().unwrap();
+        assert_eq!(&answer[..2], &query[..2]);
+        let frame = rx.pop().expect("guest DNS response");
+        assert_eq!(r16(&frame, 36), 4321);
+        assert_eq!(&frame[42..], &answer[..]);
+    }
+
+    #[test]
+    fn host_dns_is_default_upstream_and_cached() {
+        let (mut e, _rx) = engine(GatewayConfig::default());
+        let expected = crate::host_dns::system_dns_server().unwrap_or(DNS_FALLBACK);
+        assert_eq!(e.dns_upstream(), SocketAddr::from((expected, 53)));
+        let (_, read_at) = e.host_dns.unwrap();
+        e.dns_upstream();
+        assert_eq!(e.host_dns.unwrap().1, read_at, "re-read before HOST_DNS_REFRESH");
+    }
+
+    #[test]
+    fn dhcp_advertises_fallback_not_host_dns() {
+        let (mut e, mut rx) = engine(GatewayConfig::default());
+        let mut request = vec![0; 244];
+        request[0] = 1;
+        request[236..].copy_from_slice(&[99, 130, 83, 99, 53, 1, 1, 255]);
+        e.handle_bootp(&[1; 6], 68, &request);
+        let reply = rx.pop().expect("DHCP offer");
+        let options = &reply[42 + 240..];
+        let mut pos = 0;
+        while options[pos] != 255 {
+            let len = options[pos + 1] as usize;
+            if options[pos] == 6 {
+                assert_eq!(&options[pos + 2..pos + 2 + len], &DNS_FALLBACK.octets());
+                return;
+            }
+            pos += 2 + len;
+        }
+        panic!("missing DNS option");
     }
 }
