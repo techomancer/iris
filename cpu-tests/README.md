@@ -134,10 +134,16 @@ yet. Each is plain architecture rather than a part-specific quirk:
 | `mem/load_then_trap` | a syscall, break, trap, overflow or reserved instruction right behind a load: exactly one exception, EPC on it, the load complete |
 | `mem/load_then_more` | a CP0 read, a divide, a jump, and nearby loads and stores right behind a load |
 | `fpu/trap_behind_a_load` | an FP trap right behind an integer load, while the load may still be waiting on its fill |
+| `mem/load_then_load` | a load right behind a load that does not name its register - same line, two lines, the same word at two widths, three in a row, the first load's value as the third's base, the second's used at once, after a store, before a store, an LWL merge, KSEG1 against KSEG0 - with both lines cold, both warm, and each one warm alone |
+| `mem/load_then_load_evict` | the second of two loads evicts the first's D-cache line, or finds its own line just written back to memory |
+| `mem/load_then_store` | a store right behind a load, in the load's line and another, read back, in the same four cache states |
+| `tlb/load_then_mapped_load` | two loads where one or both walk the TLB, and the second's value is used at once |
 
 The first results for them are from the `sgiindy_MiSTer` FPGA core presenting as
-an R4600: all pass (2259 checks over 246 tests in its simulator, both with every
-load stalling execute and with loads that stall only when they must).
+an R4600: all pass (2409 checks over 250 tests in its simulator, both with every
+load stalling execute and with loads that stall only when they must, including
+behind another load or store). `mem/load_then_load` found that core releasing a
+stalled load's execute hold on the completion of the load ahead of it.
 
 ## Writing a test
 

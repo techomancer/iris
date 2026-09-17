@@ -687,6 +687,224 @@ static void t_load_then_more(void)
     }
 }
 
+/*
+ * A load right behind a load, and a store right behind a load, where neither
+ * names the first load's register. A core whose memory stage reads a
+ * synchronous cache RAM has the second access's address on that RAM while the
+ * first one is still being answered, so these are the sequences where it hands
+ * one access the other's word. Every sequence runs in four cache states: both
+ * lines cold, both warm, only the first warm, only the second warm - a fill,
+ * a hit, and each of the two mixed.
+ *
+ * t_load_then_load_evict adds the case where the second load evicts the
+ * first one's line, or finds its own line just written back.
+ */
+#define LL_WARM(first, second)                                              \
+    do {                                                                    \
+        q[0] = v0; q[1] = (u64)(s64)(s32)(unsigned long)&q[8]; q[2] = 0;    \
+        q[3] = 0; q[4] = v4; q[5] = v5; q[6] = 0; q[7] = 0; q[8] = v8;      \
+        SYNC();                                                             \
+        dcache_wb_invalidate_range(q, 9 * 8);                               \
+        SYNC();                                                             \
+        if (first)  { u64 w = q[0] ^ q[1]; (void)w; }                       \
+        if (second) { u64 w = q[4] ^ q[5]; (void)w; }                       \
+    } while (0)
+
+static void t_load_then_load(void)
+{
+    volatile u64 *q = (volatile u64 *)(_scratch_start + 1536);
+    volatile u64 *q1;                           /* the same lines, uncached */
+    const u64 v0 = 0x0123456789ABCDEFull;
+    const u64 v4 = 0x5555AAAA3333CCCCull;
+    const u64 v5 = 0x0F1E2D3C4B5A6978ull;
+    const u64 v8 = 0x7766554433221100ull;
+    u64 r, s, t;
+    int pass;
+
+    q1 = (volatile u64 *)K1_PTR(q);
+
+    for (pass = 0; pass < 4; pass++) {
+        /* Same line, consecutive words. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tld $9, 8(%2)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("same line first", pass, r, v0);
+        CHECK_EQ_AT("same line second", pass, s, (u64)(s64)(s32)(unsigned long)&q[8]);
+
+        /* Two lines. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tld $9, 32(%2)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("two lines first", pass, r, v0);
+        CHECK_EQ_AT("two lines second", pass, s, v4);
+
+        /* The same word twice, at two widths and offsets. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "lw $8, 4(%2)\n\tlbu $9, 1(%2)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("same word lw", pass, r, 0xFFFFFFFF89ABCDEFull);
+        CHECK_EQ_AT("same word lbu", pass, s, 0x23u);
+
+        /* Three in a row, each from its own line. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%3)\n\tld $9, 32(%3)\n\tld $10, 64(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero\n\tdaddu %2, $10, $zero" Z
+                             : "=r"(r), "=r"(s), "=r"(t) : "r"(q) : "$8", "$9", "$10");
+        CHECK_EQ_AT("three first", pass, r, v0);
+        CHECK_EQ_AT("three second", pass, s, v4);
+        CHECK_EQ_AT("three third", pass, t, v8);
+
+        /* The first load's value is the base of the third instruction, which
+         * reads it while the second load is in the memory stage. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 8(%2)\n\tld $9, 32(%2)\n\tld $10, 0($8)\n\t"
+                               "daddu %0, $9, $zero\n\tdaddu %1, $10, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9", "$10");
+        CHECK_EQ_AT("chase behind second", pass, r, v4);
+        CHECK_EQ_AT("chase value", pass, s, v8);
+
+        /* The second load's value used at once: that one has to hold. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tld $9, 32(%2)\n\tdaddu $10, $9, $9\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $10, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9", "$10");
+        CHECK_EQ_AT("second used first", pass, r, v0);
+        CHECK_EQ_AT("second used", pass, s, v4 + v4);
+
+        /* A store, then two loads: the first of them waits out READWAIT. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "sd %2, 16(%3)\n\tld $8, 16(%3)\n\tld $9, 40(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(OPAQUE((u64)v8)), "r"(q)
+                             : "$8", "$9", "memory");
+        CHECK_EQ_AT("store load load first", pass, r, v8);
+        CHECK_EQ_AT("store load load second", pass, s, v5);
+
+        /* Two loads, a store, and the store read back. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%3)\n\tld $9, 32(%3)\n\tsd $8, 48(%3)\n\tld $10, 48(%3)\n\t"
+                               "daddu %0, $9, $zero\n\tdaddu %1, $10, $zero\n\tdaddu %2, $8, $zero" Z
+                             : "=r"(r), "=r"(s), "=r"(t) : "r"(q) : "$8", "$9", "$10", "memory");
+        CHECK_EQ_AT("load load store second", pass, r, v4);
+        CHECK_EQ_AT("load load store reload", pass, s, v0);
+        CHECK_EQ_AT("load load store first", pass, t, v0);
+
+        /* LWL merges with the register's old value, behind a load. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "lui $9, 0x1234\n\tori $9, $9, 0x5678\n\t"
+                               "ld $8, 0(%2)\n\tlwl $9, 33(%2)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q) : "$8", "$9");
+        CHECK_EQ_AT("lwl first", pass, r, v0);
+        CHECK_EQ_AT("lwl merged", pass, s, 0x0000000055AAAA78ull);
+
+        /* Uncached (KSEG1) and cached (KSEG0) loads of the same memory. */
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%3)\n\tld $9, 32(%2)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q), "r"(q1) : "$8", "$9");
+        CHECK_EQ_AT("kseg1 then kseg0 first", pass, r, v0);
+        CHECK_EQ_AT("kseg1 then kseg0 second", pass, s, v4);
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tld $9, 32(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q), "r"(q1) : "$8", "$9");
+        CHECK_EQ_AT("kseg0 then kseg1 first", pass, r, v0);
+        CHECK_EQ_AT("kseg0 then kseg1 second", pass, s, v4);
+    }
+}
+
+/*
+ * The second load evicts, or is evicted by, the first. p16 is 16 KB above q:
+ * another line of memory at the same index in a direct-mapped D-cache of up to
+ * 16 KB (on a two-way cache the two simply share a set). Writing it in C
+ * leaves its line dirty in the cache, so the load of q that follows writes it
+ * back before filling, and the load of p16 right behind has to find the
+ * written-back word in memory.
+ */
+static void t_load_then_load_evict(void)
+{
+    volatile u64 *q  = (volatile u64 *)(_scratch_start + 1536);
+    volatile u64 *p16 = (volatile u64 *)(_scratch_start + 1536 + 16384);
+    const u64 v0 = 0x0123456789ABCDEFull;
+    const u64 w0 = 0x6B6B6B6B00000000ull;
+    u64 r, s;
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        q[0] = v0; p16[0] = 0;
+        SYNC();
+        dcache_wb_invalidate_range(q, 8);
+        dcache_wb_invalidate_range(p16, 8);
+        SYNC();
+
+        /* p16's line cached and dirty; load q (write-back, fill), then p16. */
+        p16[0] = w0 + (u64)pass;
+        __asm__ __volatile__(A "ld $8, 0(%2)\n\tld $9, 0(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q), "r"(p16) : "$8", "$9");
+        CHECK_EQ_AT("evict q", pass, r, v0);
+        CHECK_EQ_AT("evicted p16", pass, s, w0 + (u64)pass);
+
+        /* And the other way round, with q's line dirty. */
+        q[0] = v0 + (u64)pass;
+        __asm__ __volatile__(A "ld $8, 0(%3)\n\tld $9, 0(%2)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(q), "r"(p16) : "$8", "$9");
+        CHECK_EQ_AT("evict p16", pass, r, w0 + (u64)pass);
+        CHECK_EQ_AT("evicted q", pass, s, v0 + (u64)pass);
+    }
+}
+
+/*
+ * A store right behind a load, not storing or addressing through the loaded
+ * register, read back afterwards - in the load's own line and in another, in
+ * the same four cache states as above.
+ */
+static void t_load_then_store(void)
+{
+    volatile u64 *q = (volatile u64 *)(_scratch_start + 1536);
+    const u64 v0 = 0x0123456789ABCDEFull;
+    const u64 v4 = 0x5555AAAA3333CCCCull;
+    const u64 v5 = 0x0F1E2D3C4B5A6978ull;
+    const u64 v8 = 0x7766554433221100ull;
+    const u64 x  = 0x3C3C3C3CA5A5A5A5ull;
+    u64 r, s;
+    int pass;
+
+    for (pass = 0; pass < 4; pass++) {
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%3)\n\tsd %2, 16(%3)\n\tld $9, 16(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(OPAQUE((u64)x)), "r"(q)
+                             : "$8", "$9", "memory");
+        CHECK_EQ_AT("store own line value", pass, r, v0);
+        CHECK_EQ_AT("store own line reload", pass, s, x);
+        CHECK_EQ_AT("store own line memory", pass, q[2], x);
+
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 0(%3)\n\tsw %2, 44(%3)\n\tld $9, 40(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(OPAQUE((u64)x)), "r"(q)
+                             : "$8", "$9", "memory");
+        CHECK_EQ_AT("store other line value", pass, r, v0);
+        CHECK_EQ_AT("store other line reload", pass, s, (v5 & 0xFFFFFFFF00000000ull) | (x & 0xFFFFFFFFull));
+
+        LL_WARM(pass == 1 || pass == 2, pass == 1 || pass == 3);
+        __asm__ __volatile__(A "ld $8, 32(%3)\n\tsb %2, 3(%3)\n\tld $9, 0(%3)\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $9, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(OPAQUE((u64)x)), "r"(q)
+                             : "$8", "$9", "memory");
+        CHECK_EQ_AT("sb value", pass, r, v4);
+        CHECK_EQ_AT("sb reload", pass, s, (v0 & ~0x000000FF00000000ull) | 0x000000A500000000ull);
+        (void)v8;
+    }
+}
+#undef LL_WARM
+
 static const struct test tests[] = {
     TEST("mem/load_widths_sign",      t_load_widths_and_sign,            CPU_ALL),
     TEST("mem/store_widths",          t_store_widths,                    CPU_ALL),
@@ -709,6 +927,9 @@ static const struct test tests[] = {
     TEST("mem/load_then_use",         t_load_then_use,                   CPU_ALL),
     TEST("mem/load_then_trap",        t_load_then_trap,                  CPU_ALL),
     TEST("mem/load_then_more",        t_load_then_more,                  CPU_ALL),
+    TEST("mem/load_then_load",        t_load_then_load,                  CPU_ALL),
+    TEST("mem/load_then_load_evict",  t_load_then_load_evict,            CPU_ALL),
+    TEST("mem/load_then_store",       t_load_then_store,                 CPU_ALL),
 };
 
 const struct test_group group_mem = {

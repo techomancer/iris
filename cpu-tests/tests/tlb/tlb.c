@@ -352,6 +352,68 @@ static void t_refill_vector_and_context(void)
     cp0_entryhi_set(saved_hi);
 }
 
+/* ── a load behind a load, through the TLB ───────────────────────────────── */
+
+/*
+ * The second of two loads needs a TLB walk, or the first does, and the
+ * instruction after the second uses its value. A core that lets the first load
+ * leave execute without holding it runs the second load's walk and its own
+ * load stall while the first load is still being answered - and must not take
+ * the first load's completion for the second's. Rewriting the entry before
+ * each sequence makes the mapped access walk the TLB rather than hit a cached
+ * translation. Both passes: lines not in the D-cache, then cached.
+ */
+static void t_load_then_mapped_load(void)
+{
+    u64 saved_hi = cp0_entryhi();
+    u64 phys = scratch_phys();
+    volatile u64 *qk = (volatile u64 *)(_scratch_start + 1536);
+    volatile u64 *qt = (volatile u64 *)(unsigned long)(TEST_VA + 1536);
+    const u64 v0 = 0x1357924680ACEBDFull;
+    const u64 v1 = 0x0246813579BDFACEull;
+    const u64 v4 = 0x7FEDCBA987654321ull;
+    u64 r, s;
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        qk[0] = v0; qk[1] = v1; qk[4] = v4;
+        SYNC();
+        dcache_wb_invalidate_range(qk, 5 * 8);
+        SYNC();
+        if (pass == 1) { u64 w = qk[0] ^ qk[4]; (void)w; }
+
+        write_entry(3, TEST_VA, entrylo(phys, ELO_V | ELO_D | ELO_G), 0, PM_4K);
+        exc_clear();
+        __asm__ __volatile__(A "ld $8, 32(%2)\n\tld $9, 0(%3)\n\tdaddu $10, $9, $9\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $10, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(qk), "r"(qt) : "$8", "$9", "$10");
+        CHECK_EQ_AT("kseg0 then mapped: first", pass, r, v4);
+        CHECK_EQ_AT("kseg0 then mapped: second used", pass, s, v0 + v0);
+        CHECK_EQ_AT("kseg0 then mapped: exceptions", pass, exc.count, 0u);
+
+        write_entry(3, TEST_VA, entrylo(phys, ELO_V | ELO_D | ELO_G), 0, PM_4K);
+        exc_clear();
+        __asm__ __volatile__(A "ld $8, 32(%3)\n\tld $9, 8(%2)\n\tdaddu $10, $9, $9\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $10, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(qk), "r"(qt) : "$8", "$9", "$10");
+        CHECK_EQ_AT("mapped then kseg0: first", pass, r, v4);
+        CHECK_EQ_AT("mapped then kseg0: second used", pass, s, v1 + v1);
+        CHECK_EQ_AT("mapped then kseg0: exceptions", pass, exc.count, 0u);
+
+        write_entry(3, TEST_VA, entrylo(phys, ELO_V | ELO_D | ELO_G), 0, PM_4K);
+        exc_clear();
+        __asm__ __volatile__(A "ld $8, 32(%2)\n\tld $9, 8(%2)\n\tdaddu $10, $9, $9\n\t"
+                               "daddu %0, $8, $zero\n\tdaddu %1, $10, $zero" Z
+                             : "=r"(r), "=r"(s) : "r"(qt) : "$8", "$9", "$10");
+        CHECK_EQ_AT("mapped then mapped: first", pass, r, v4);
+        CHECK_EQ_AT("mapped then mapped: second used", pass, s, v1 + v1);
+        CHECK_EQ_AT("mapped then mapped: exceptions", pass, exc.count, 0u);
+    }
+
+    write_entry(3, 0x1FFFE000ull, 0, 0, PM_4K);
+    cp0_entryhi_set(saved_hi);
+}
+
 static const struct test tests[] = {
     TEST("tlb/tlbwi_tlbr",         t_tlbwi_tlbr_round_trip,       CPU_ALL),
     TEST("tlb/all_entries",        t_all_entries_round_trip,      CPU_ALL),
@@ -363,6 +425,7 @@ static const struct test tests[] = {
     TEST("tlb/asid_match",         t_asid_match_and_mismatch,     CPU_ALL),
     TEST("tlb/global_ignores_asid", t_global_entry_ignores_asid,  CPU_ALL),
     TEST("tlb/refill_context",     t_refill_vector_and_context,   CPU_ALL),
+    TEST("tlb/load_then_mapped_load", t_load_then_mapped_load,   CPU_ALL),
 };
 
 const struct test_group group_tlb = {
