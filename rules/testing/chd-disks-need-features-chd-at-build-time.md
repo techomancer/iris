@@ -23,5 +23,5 @@ cargo build --release --bin iris --features lightning,rex-jit,tlbvmap,chd
 ```
 
 (`chd = ["dep:libchdman-rs"]` in `Cargo.toml`.) The docs mandate CHD over raw
-for install disks (see `docs/irix-install.md`), so `chd` is effectively
+for install disks (see `rules/irix/irix-install.md`), so `chd` is effectively
 required for normal use — don't drop it from the feature list when rebuilding.

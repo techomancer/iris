@@ -36,9 +36,9 @@ Implementation: `iris-gui/src/input.rs` (`pump`, `release_capture`,
 `force_release`); capture is also force-released when the emulator stops so the
 host cursor can't get stuck hidden.
 
-> Note: iris's `mouseabs` cargo feature is **misnamed** — it is still grab +
-> warp-to-center + relative deltas (`src/ui.rs:532`), *not* absolute
-> positioning. There is no hidden absolute backend to tap.
+> Note: iris used to have a `mouseabs` cargo feature. It was **misnamed** — it
+> was still grab + warp-to-center + relative deltas, *not* absolute positioning
+> — and has since been removed. There is no hidden absolute backend to tap.
 
 ## The absolute pattern (classic Mac OS)
 

@@ -316,25 +316,27 @@ nothing platform-specific. Pass `--iris` to measure a *different* emulator
 binary in a subprocess instead — which is what `matrix` does, and what CI does
 for each cell, because a cell's features live in its binary.
 
-`matrix` builds a **separate emulator per cell**, because the CPU model and the
-JIT are compile-time cargo features and there is no runtime switch to flip:
+`matrix` builds a **separate emulator per feature set**, because the JIT and
+`lightning` are compile-time cargo features. The CPU is not: it is passed as
+`--cpu`, so cells that differ only by CPU share one binary.
 
-| cell | features |
-|---|---|
-| `r4400-interp` | (default) |
-| `r5000-interp` | `r5k` |
-| `r4400-jitv2` | `jitv2` |
-| `r5000-jitv2` | `r5k,jitv2` |
-| `r4400-lightning` | `lightning` |
-| `r4400-jitv2-lightning` | `jitv2,lightning` |
+| cell | features | `--cpu` |
+|---|---|---|
+| `r4400-interp` | (default) | `r4400` |
+| `r5000-interp` | (default) | `r5000` |
+| `r4400-jitv2` | `jitv2` | `r4400` |
+| `r5000-jitv2` | `jitv2` | `r5000` |
+| `r4400-lightning` | `lightning` | `r4400` |
+| `r4400-jitv2-lightning` | `jitv2,lightning` | `r4400` |
 
-Each build is copied to `bench/build/iris-<cell>` before the next one starts —
+Each build is copied to `bench/build/iris-<features>` before the next one starts —
 the next `cargo build` overwrites `target/release/iris`, and a matrix that races
 its own artefacts produces results labelled with the wrong build. After the run,
 the guest's own `#machine cpu=` line (read from PRId, so it is authoritative) is
 checked against what the cell claims. cpu-tests has the same guard for the same
-reason: an `--features r5k` build once overwrote the binary between the copy and
-the run, and an "R4400" cell silently exercised an R5000.
+reason: back when the CPU was a cargo feature, an `--features r5k` build once
+overwrote the binary between the copy and the run, and an "R4400" cell silently
+exercised an R5000.
 
 The report gives per-cell summaries with DMIPS/MWIPS/MFLOPS, per-kernel
 throughput with speedups against a baseline cell and against native, any

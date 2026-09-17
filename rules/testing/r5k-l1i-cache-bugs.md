@@ -2,6 +2,13 @@
 
 ## Status: open, not investigated — all R5000 L1I/L2 configs are broken
 
+> **Since August 2026 the CPU model is a runtime setting** (`--cpu r5000`,
+> `e677edf`): both cache models are compiled into every build, so the `r5k`
+> feature no longer selects the R5000, and the plain R5000 cache model is what
+> `--cpu r5000` runs. `r5ksc` and `r5ksc_triton` are still refused by
+> `compile_error!` in `src/lib.rs`. The feature-combination commands below are
+> as they were when this was written; re-check them before relying on them.
+
 Discovered while building `run/matrix.sh`'s R5000 cell for the cpu-tests
 findings pass ([[project_cpu_tests_findings]]). Not one of dani's findings —
 this is in `src/mips_cache_v2.rs`'s unit tests, found by running `cargo test`

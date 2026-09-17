@@ -1,5 +1,8 @@
 # App Store review response — IRIS
 
+> **Note:** `docs/appstore-review-notes.txt` was never committed to this repository;
+> the text below is what remains here.
+>
 > **Paste-ready version → `docs/appstore-review-notes.txt`** (3,915 chars, under
 > the field's 4,000 limit). Copy it verbatim into **App Review Information →
 > Notes** in App Store Connect; leave the **App Sandbox Information** section

@@ -2,12 +2,17 @@
 
 ## How does this thing work?
 
-IRIS is an SGI Indy (MIPS R4400) emulator written in Rust. It is not cycle-accurate
-anywhere. IRIX doesn't expect it, and accuracy would just make things slower.
+IRIS is an SGI Indy (IP24) and Indigo2 (IP22) emulator written in Rust, with an
+R4400 or R5000 CPU chosen at runtime. It is not cycle-accurate anywhere. IRIX
+doesn't expect it, and accuracy would only make things slower.
+
+Before re-deriving a gotcha, check `rules/` — it is organised by subsystem
+(`jitv2/`, `rex3/`, `irix/`, `testing/`, `snapshot/`, `gui/`, `perf/`, `scsi/`,
+`macos/`, `build/`). When you confirm a non-obvious fix, write it up there.
 
 ---
 
-## 1. Data Path & Endianness
+## 1. Data path and endianness
 
 **Word-Transparent Architecture.** Host `u32`/`u64` values are bit-containers — no
 internal byte-swapping. Endianness is handled only at "The Edge" (PROM/disk I/O) via
@@ -18,7 +23,7 @@ Do not suggest `.to_be()` or `.to_le()` for memory or register logic.
 
 ---
 
-## 2. Concurrency Model
+## 2. Concurrency model
 
 Every device can run in its own thread. CPU, REX3, SCSI, and ethernet each have their
 own thread. `hptimer.rs` provides a repeating-event timer for devices that don't need
@@ -26,7 +31,15 @@ a dedicated thread.
 
 Synchronisation is per-device: each device locks its own internal state. Be careful
 when calling back up to a parent device (e.g. from SCSI → HPC3) — that is where
-deadlocks live. Ethernet had two of them; see memory notes for the gory details.
+deadlocks live. Ethernet had two of them.
+
+Other threads worth knowing about: the REX3 refresh thread (display, owns the GL
+context — teardown must run there too), the HAL2 audio pump, the VINO DMA pump
+(only when a video source is configured), the NAT engine, the jitv2 compile pool,
+the monitor/serial/CI socket listeners, and in iris-gui the GUI's worker thread
+that owns the `Machine`. The REX3 processor and the CPU thread both *park* when
+idle instead of spinning (`rules/perf/`); the CPU only does so in `idle-pause`
+builds.
 
 Memory access is YOLO: all devices can freely read/write DRAM. It works because 32-bit
 and 64-bit transactions are halfway atomic (though unordered). Hardware sync points are
@@ -34,34 +47,50 @@ maintained where the real hardware requires them.
 
 ---
 
-## 3. Device, Bus & Port Abstraction
+## 3. Device, bus, and port abstraction
 
 The **MC (Memory Controller)** is the central crossbar. All traffic — CPU PIO and HPC3
 DMA — passes through it.
 
 ```rust
-pub enum BusStatus { Ready, Busy, Error, Data(u32), Data64(u64) }
-
+// src/traits.rs
 pub trait BusDevice: Send + Sync {
-    fn read8/16/32/64(&self, addr: u32) -> BusStatus;
-    fn write8/16/32/64(&self, addr: u32, val: u32) -> BusStatus;
+    fn read8 (&self, addr: u32) -> BusRead8;             // .status == BUS_OK on success
+    fn write8(&self, addr: u32, val: u8) -> u32;          // BUS_OK / BUS_BUSY / BUS_ERR
+    // ... read16/write16, read32/write32, read64/write64
+    fn dma_read64 / dma_write64                           // DMA-initiated access (REX3 HOSTRW)
+    fn mem_ptr(&self, addr: u32) -> Option<*const u64>;  // direct backing-store pointer
+    fn read_block / write_block / write64_masked          // bulk and masked fast paths
+    fn gen_ptr(&self, addr: u32) -> *const AtomicU64;    // jitv2 per-page generation counter
 }
 
 pub trait Device: Send + Sync {
-    fn clock(&mut self);
-    fn run(&mut self);
-    fn stop(&mut self);
-    fn start(&mut self);
+    fn step(&self, cycles: u64);
+    fn stop(&self);
+    fn start(&self);
     fn is_running(&self) -> bool;
     fn get_clock(&self) -> u64;
+    fn signal(&self, signal: Signal) {}
+    fn register_commands(&self) -> Vec<(String, String)>;   // monitor commands
+    fn execute_command(&self, cmd: &str, args: &[&str], w: Box<dyn Write + Send>) -> Result<(), String>;
 }
+
+pub trait Saveable { fn save_state(&self) -> toml::Value; fn load_state(&self, v: &toml::Value) -> Result<(), String>; }
+pub trait Resettable { fn power_on(&self); }
 ```
 
-Devices usually implement both traits and expose getters for each. Devices connect to
-each other via implementation-specific `connect()` / `set_phys()` functions.
+Every width has a default that returns a bus error, so a device implements only
+the widths it natively supports. Write return values are layout-compatible with
+`ExecStatus`. Devices usually implement both traits and expose getters for each.
+Devices connect to each other via implementation-specific `connect()` /
+`set_phys()` functions. The monitor asks every registered `Device` for its
+commands, so a new device gets console commands by implementing
+`register_commands`/`execute_command`. Snapshot support means implementing
+`Saveable` and adding a save/load/save round-trip test
+(`rules/snapshot/per-device-saveloadsave-round-trip-is-the-regression-net.md`).
 
 **Physical address map** (`physical.rs`) uses a 64KB-granularity lookup table for O(1)
-address decoding. There is a lot of unsafe in there — it's intentional and somewhat
+address decoding (`device_map`, one entry per `addr >> 16`). There is a lot of unsafe in there — it's intentional and somewhat
 cursed.
 
 Address space hierarchy:
@@ -71,7 +100,7 @@ Address space hierarchy:
 
 ---
 
-## 4. Hardware Notes
+## 4. Hardware notes
 
 **HPC3** — self-programming DMA; fetches descriptors via the MC bus.
 
@@ -79,44 +108,83 @@ Address space hierarchy:
 64K entries so it can absorb large DMA transfers and render pixels while the CPU does
 other things.
 
-**Memory** — emulated as `Vec<u32>`. Banks 2 and 3 can be enabled (up to 512MB). PROM
-is fine with it; IRIX 6.5 uses 384MB, 5.3 uses up to 512MB.
+**Machine profiles** — `[machine] profile` selects Indy IP24 ("Guinness" MC/IOC,
+one WD33C93A) or Indigo2 IP22 ("Fullhouse" MC/IOC, two SCSI controllers, INT2,
+serial EEPROM for NVRAM and MAC). `src/platform.rs`/`machine.rs` wire the
+difference; `platform_profile_tests.rs` pins it down.
 
-**Cache** — fully emulated L2 was a mistake in hindsight but here we are.
-- L1I: virtually indexed, physically tagged (VIPT)
-- L1D: virtually indexed, physically tagged (VIPT)
-- L2: physically indexed, physically tagged
-- Decoded instructions are cached in L2; L1I entries point into L2 (inclusive).
-- VCE fires when VA[14:12] doesn't match the L2's stored pidx for the same physical line.
+**Memory** — emulated as `Vec<u32>` (`src/mem.rs`) by default, or as real host
+mappings under `--features ppmem` (`src/ppmem/`, `docs/ppmem-design.md`), where
+SIMM mirroring is expressed as repeated mappings instead of address masking.
+Banks 2 and 3 can be enabled (up to 512MB). PROM is fine with it; IRIX 6.5 uses
+384MB, 5.3 uses up to 512MB. Each RAM page has a jitv2 generation counter.
 
-**Count/Compare** — calibrates itself to real time to fire fasttick at 1KHz using a
-15-bit fixed-point counter. It is cursed.
+**Cache** (`src/mips_cache_v2.rs`) — fully emulated L2 was a mistake in hindsight but
+here we are. The CPU model is the `CpuModel` trait (`MIPS4`, `PRID`, `FIR`,
+`TLB_ENTRIES`, `NAME`) implemented by each cache model; `MipsExecutor` is
+monomorphised over it, so both CPUs are in every binary with no per-model branch
+on the hot path, and `Machine::new` picks one from `[machine] cpu`.
+- R4400: 16KB direct-mapped L1I/L1D (16B lines), 1MB L2.
+  - L1I and L1D: virtually indexed, physically tagged (VIPT)
+  - L2: physically indexed, physically tagged
+  - Decoded instructions are cached in L2; L1I entries point into L2 (inclusive).
+  - VCE fires when VA[14:12] doesn't match the L2's stored pidx for the same physical line.
+- R5000: 32KB 2-way L1I/L1D (32B lines, LRU in a bitmask), no L2 (the PROM is
+  told so). Decoded instructions live in L1I. The R5000 secondary-cache variants
+  (`r5ksc`, `r5ksc_triton`) are refused at build time until their L1I bugs are
+  fixed (`rules/testing/r5k-l1i-cache-bugs.md`).
+- `--features tcache` keeps the whole cache state machine but stops copying line
+  data for cacheable RAM (`docs/tcache-design.md`).
+- Config.K0 switches KSEG0 between cached and uncached modes, including the
+  misaligned-fetch behaviour of the reserved modes
+  (`rules/irix/cache-attributes-and-fetch-alignment.md`).
+
+**Address translation** (`src/mips_tlb.rs`, `mips_core.rs`) — layered fast paths in
+front of the JTLB: a one-entry fetch `nanotlb`, the direct-mapped data-side
+`nutlb` (`docs/nutlb-design.md`, always on), and an 8KB-granularity `vmap` that
+points VPNs straight at TLB entries (always on; the `tlbvmap` feature name is
+vestigial). All are invalidated on ASID changes and TLB writes. `tlbcheck` and
+`tlbstats` are the diagnostic features.
+
+**Count/Compare** — CP0 Count is anchored to host wall-clock time and ticks at a
+fixed 33 MHz (`DEFAULT_COUNT_HZ`; `[clock] fixed_mhz` overrides). IRIX reports
+that as a 66 MHz CPU. The Compare interrupt (IP7) is delivered by a host timer
+(`hptimer.rs`), not by counting instructions. There is no calibration or
+slow/fast-tick inference any more — that was removed in September 2026 because
+a fixed rate is more stable, and these guests are interrupt-driven so running
+faster or slower than "real" does no harm. `--features ci_clock` instead derives
+Count from retired instructions (10ns each) for deterministic replays.
 
 ---
 
 ## 5. Interrupts
 
-The CPU thread polls an `AtomicU64` interrupt bitmask every instruction cycle.
-INT2/INT3 (Local0/Local1) logic maps to R4000 IP2/IP3.
+The CPU thread polls an `AtomicU64` interrupt bitmask (`MipsCore::interrupts`) every
+instruction cycle; devices set bits through `MipsCore::set_interrupt`.
+INT2/INT3 (Local0/Local1) logic maps to R4000 IP2/IP3; the Indigo2's extra INT2
+cascade is handled in `ioc.rs`/`hpc3.rs`. `docs/interrupt_map.md` has the full map.
 
 ---
 
-## 6. CPU Execution Architecture
+## 6. CPU execution architecture
 
-**MipsCore** (`mips_core.rs`) — pure register state: GPRs r0–r31 (64-bit), CP0, CP1
-FPU registers, interrupt state (`AtomicU64`). No execution logic.
+**MipsCore** (`mips_core.rs`) — register state: GPRs r0–r31 (64-bit), CP0, CP1
+FPU registers, interrupt state (`AtomicU64`), delay-slot state (`in_delay_slot`
+and its target), the cycle counter, and the fields compiled code reads directly.
+Field order is deliberate (hot fields together for cache locality), and jitv2
+bakes field offsets and the core's address into emitted code, so reordering is
+not free. No execution logic.
 
 **MipsExecutor** (`mips_exec.rs`) — execution engine combining core + memory:
 
 ```rust
-pub struct MipsExecutor<T: Tlb, C: MipsCache> {
+pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub core: MipsCore,
     pub sysad: Arc<dyn BusDevice>,
     pub tlb: T,
     pub cache: C,
-    in_delay_slot: bool,
-    pub delay_slot_target: u64,
-    // + breakpoints, traceback, symbol table, decode cache, hot-path fn ptrs, ...
+    // + breakpoints, traceback, undo buffer [developer], symbol table,
+    //   jitv2 state, LL/SC stats, hot-path fn ptrs, ...
 }
 ```
 
@@ -124,7 +192,13 @@ Key methods:
 - `exec(instr: u32) -> ExecStatus` — execute one already-fetched instruction
 - `step() -> ExecStatus` — fetch from PC and execute
 
-PC advancement and delay slots are managed internally by the executor.
+PC advancement and delay slots are managed internally by the executor. The
+executor is wrapped in `MipsCpu` behind the object-safe `CpuDevice` trait, which is
+what `Machine` holds.
+
+With the `opcodefusion` feature (implied by `lightning`) the interpreter
+collapses branch+NOP, LUI+ORI/ADDIU and address-calc+load/store pairs into one
+dispatch; a breakpoint on the second instruction of a fused pair never fires.
 
 ### ExecStatus
 
@@ -157,7 +231,7 @@ exec_xtlb_miss(code)   // IS_EXCEPTION | IS_TLB_REFILL | IS_XTLB_REFILL | code
 
 The EXC code lives in bits [6:2] of the status word (same position as CAUSE.ExcCode).
 
-### Exception Codes
+### Exception codes
 
 | Constant    | Value | Meaning                              |
 |-------------|-------|--------------------------------------|
@@ -196,42 +270,85 @@ address translation (TLB + segment mapping), alignment checking, and cache simul
 
 ## 7. JIT v2 (`--features jitv2`) — experimental
 
-Not a port of the JIT in §6/README — a new design (`src/jitv2/`) built on
-different principles. The original JIT is speculative and tiered, with
-rollback for when compiled code turns out wrong; v2 deletes that failure
-mode by construction instead: whole physical-page regions (not single basic
-blocks) compiled via Cranelift, memory-resident registers, no speculation —
-unconditionally correct at publish time or not published at all. Full design
-rationale, the analyzer/codegen block-emission model, and the delay-slot/
-exception materialization rules live in `rules/jitv2/jit-v2-design.md` —
-read that before touching `analyzer.rs`/`codegen.rs`.
-`rules/jitv2/codegen-gotchas.md` has accumulated Cranelift-specific footguns
-found the hard way.
+The only MIPS JIT. The original speculative, tiered JIT (with its rollback path
+and `IRIS_JIT*` env vars) was removed in August 2026 (commit `33c4e68`). v2
+(`src/jitv2/`) compiles physical 4KB pages via Cranelift with memory-resident
+registers and no speculation — compiled code is unconditionally correct at
+publish time or not published at all. Full design rationale, the
+analyzer/codegen block-emission model, and the delay-slot/exception
+materialization rules live in `rules/jitv2/jit-v2-design.md` — read that before
+touching `analyzer.rs`/`codegen.rs`. `rules/jitv2/codegen-gotchas.md` has
+accumulated Cranelift-specific footguns found the hard way, and the rest of
+`rules/jitv2/` covers individual bugs.
 
-Enabled automatically at runtime once compiled in — no env var gate like the
-older `jit`. Tuned via the `j2` monitor console command, not build-time flags:
+Shape of it:
+- The CPU thread tracks the physical code page it executes from
+  (`PhysicalCodePage`, looked up through a flat pfn→slot array) and requests a
+  compile when an entry point gets hot. Compilation is triggered on the
+  transition into a page, not in the middle of one.
+- Requests go over a lock-free queue to a compile pool (`[jitv2] threads`,
+  `--jitv2-threads`, default 1). Finished code is published into the page's
+  entry table.
+- Invalidation is by per-page generation counters owned by the memory device;
+  a write to a page bumps its generation and stale code stops dispatching.
+  Without `tcache`, a compile is also abandoned if any line of the page is dirty
+  in the emulated cache (`rules/jitv2/dirty-cache-page-probe.md`).
+- Loads and stores whose L1D line is already cached are inlined into compiled
+  code for both CPU models; everything else calls back into Rust. Callouts take
+  the core pointer as their first argument and return status in registers — the
+  Windows x64 ABI cannot return two values, so reads write straight into the
+  destination GPR (`rules/jitv2/callout-arg0-is-core-ptr.md`,
+  `read-status-in-registers.md`).
+- Anything without an emitter (`opcode_support.rs`) falls back to the
+  interpreter. MIPS IV opcodes are only compiled with the `mips4` feature.
+- `j2wp` switches to one Cranelift function per page with many entry points.
+  It is not production-ready.
+
+Enabled automatically at runtime once compiled in. Tuned via the `j2` monitor
+console command:
 
 | Command | Effect | Default (release / `developer`) |
 |---|---|---|
 | `j2 opt [none\|speed]` | Cranelift opt level, takes effect on next flush | `speed` / `none` |
-| `j2 min-instrs [N]` | minimum head instructions in a region before it's compiled | `2` / `1` |
+| `j2 min-instrs [N]` | minimum instructions in a region before it's compiled | `2` / `1` |
+| `j2 max-instrs [N]` | cap on instructions per compile | `128` |
 | `j2 min-calls [N]` | dispatch count before a hot entry is scheduled to compile | `4` / `0` |
-| `j2 batch [on\|off]` | batch multiple compiles per host page before finalizing | `on` / `off` |
-| `j2 inline [on\|off]` | compile synchronously inline vs. on the async compile thread | `off` |
-| `j2 dispatch [on\|off]` | master switch for the jitv2 dispatch gate (off = interpreter-only) | `on` |
-| `j2 lockstep [<alu\|branch\|loadstore\|fpu>] [on\|off]` | shadow-compile-and-compare a class against the interpreter (needs `jitv2_lockstep` feature) | off |
+| `j2 inline [on\|off]` | compile synchronously inline vs. on the compile pool | `off` (`on` under lockstep) |
+| `j2 dispatch [on\|off]` | main switch for the jitv2 dispatch gate (off = interpreter-only) | `on` |
+| `j2 fallback [on\|off]` | keep an unsupported instruction inside a region as an interpreter call instead of ending the region (needs `j2 flush`) | `off` |
+| `j2 inline_mem [on\|off]` | inline L1D loads/stores (forced off under lockstep) | `on` |
+| `j2 pagewb [on\|off]` | write back L1D/L2 data when moving to a new code page, to flush out stale-data bugs | `off` |
+| `j2 <alu\|fpu\|branch\|loadstore\|cop0> [on\|off]` | enable/disable compiling one instruction category | `on` |
+| `j2 instrs [category]` | list instructions and whether they have emitters | — |
+| `j2 threads` | compile-pool thread count (read-only) | — |
 | `j2 flush` | drop all compiled code and reset the arena (stop the CPU first) | — |
+| `j2 clear <paddr>` / `j2 deny <paddr>` | reset one physical code page / deny one entry | — |
 | `j2 status` (alias `j2 stats`) | arena usage, compile counts, reject reasons | — |
-| `j2 pcp` | physical code page introspection | — |
+| `j2 pcp` / `j2 dumppcp [addr] [path]` | physical code page introspection / capture for `jitv2_pcp_dump` | — |
+| `j2 html [path]` | render the physical code page visualiser | — |
+| `j2 lockstep` / `j2 lstate [full] [N]` | lockstep status / recent lockstep history (`jitv2_lockstep`) | — |
+
+`jitcheck <n> [skip]` runs n instructions interpreter-only and through JIT
+dispatch from the same captured state and stops at the first divergence.
 
 `developer` builds default every knob toward "compile and see everything"
-(no instruction-count/call-count floor, unoptimized Cranelift output, no
-batching) since that's what you want while chasing a codegen bug; release
-builds default toward throughput.
+(no instruction-count/call-count floor, unoptimized Cranelift output) since
+that's what you want while chasing a codegen bug; release builds default toward
+throughput.
+
+Verification tools, cheapest first: the `jitv2/equiv_test.rs` unit tests (install
+the JIT hooks unconditionally, match the ISA level — see `rules/testing/`), the
+cpu-tests matrix (`cpu-tests/run/matrix.sh`, R4400/R5000 × interp/jitv2),
+`jitcheck`, `--features jitv2_lockstep` (every instruction checked against the
+interpreter; incompatible with `lightning` and fusion), `jitv2_smc_check`, and
+`--features fetchverify` for stale code that both engines would agree on.
 
 ---
 
-## 8. Building & Debugging
+## 8. Building, testing & debugging
+
+The toolchain is pinned to nightly in `rust-toolchain.toml`. `cargo build` builds
+the `iris` workspace member; the GUI is `-p iris-gui`.
 
 Normal build:
 ```
@@ -240,25 +357,63 @@ cargo run --release
 
 Developer build (enables intrusive debug helpers; affects performance):
 ```
-cargo run --release --features developer
+cargo run --release --features developer     # or: cargo run --profile developer
 ```
 
-The `developer` feature enables: undo buffer, pending-write tracking, extra MCP debug
-commands, and some additional assertions.
+The `developer` feature enables: the undo buffer, pending-write tracking,
+per-instruction trace recording, `jitcheck`, the `[DEV]` monitor commands, the
+CPU starting paused, and some additional assertions. It is mutually exclusive
+with `lightning`. `cargo build --profile profiling` gives full debug info for
+`perf`/flamegraph.
+
+Binaries:
+
+| Binary | Purpose |
+|---|---|
+| `iris` | the emulator |
+| `iris-ci` | CI socket client (README) |
+| `iris-bench` | benchmark driver (`bench/README.md`) |
+| `coffdump` | dump MIPS COFF executables |
+| `mkvh` | build and inspect SGI volume headers (`src/sgi_vh.rs`) |
+| `chd_extract` | extract CHD images (`--features chd`) |
+| `jitv2_analyze`, `jitv2_verify`, `jitv2_pcp_dump` | offline jitv2 analyzer/codegen tools (`--features jitv2`; `jitv2_pcp_dump` also needs `j2wp`) |
+| `iris-gui` | the egui front-end (`-p iris-gui`) |
+
+Tests:
+- `cargo test --workspace` — unit tests, including per-device snapshot round
+  trips, `mips_exec_test.rs`, `mips_tlb_test.rs`, `rex3_tests.rs`, and the jitv2
+  equivalence tests (with `--features jitv2`). Tests that build a whole machine
+  run on threads with enlarged stacks.
+- `make -C cpu-tests run` / `cpu-tests/run/matrix.sh` — bare-metal instruction
+  correctness (`cpu-tests/README.md`).
+- `iris-bench run` / `iris-bench matrix` — bare-metal throughput and accuracy
+  (`bench/README.md`).
+- `tools/iris-test` with `tools/tests/*.yaml` — PROM/restore/screenshot smoke
+  tests driven over `iris-ci`.
+- CI (`.github/workflows/`): `rust.yml` builds and tests the workspace,
+  `suites.yml` runs cpu-tests and bench across CPU × engine and gates cpu-tests
+  on a per-CPU failure baseline, `release.yml` and `appstore.yml` build the
+  distributed packages.
 
 **Breakpoints** don't survive emulator restart.
 
 **Monitor console** — available in the terminal or via telnet to `127.0.0.1:8888`.
 Serial ports are on 8880 (port A) and 8881 (port B / IRIX serial terminal).
+`debug.md` is a guided tour of the debugger; HELP.md has the full command list.
+`src/iris_mcp.py` exposes the monitor as MCP tools.
+
+**Crashes on Windows** — `crash_diag.rs` logs otherwise-silent process deaths
+(`0xC000041D` and friends) with a symbolised stack to `iris-crash.log`
+(`rules/gui/windows-silent-exit-0xc000041d.md`).
 
 ---
 
-## 9. GDB Stub
+## 9. GDB stub
 
 Iris includes a GDB Remote Serial Protocol stub (`src/gdb_stub.rs`) that lets you
 connect GDB to the running emulator and debug IRIX/guest code with a real debugger.
 
-### Starting the GDB stub
+### Start the GDB stub
 
 Pass `--gdb-port <port>` on the command line:
 
@@ -273,7 +428,7 @@ cargo run --release -- --gdb-port 1234
 The stub binds `127.0.0.1:<port>`. One client at a time; breakpoints set by GDB are
 automatically removed when the client disconnects.
 
-### Connecting GDB
+### Connect GDB
 
 With `mips64-unknown-linux-gnu-gdb` (recommended):
 
@@ -396,6 +551,7 @@ override, no cache side-effects, no breakpoints triggered).
 
 ## 10. Reference
 
-- SGI Indy hardware manuals see docs/
+- SGI Indy hardware manuals and chip datasheets: `docs/*.pdf`; per-device notes:
+  `docs/*.md` (`hal2`, `rex3`, `wd33c93a`, `interrupt_map`, `indigo2-ip22`, …)
 - [SGI driver programmer's guide — address spaces](https://tqd1.physik.uni-freiburg.de/library/SGI_bookshelves/SGI_Developer/books/DevDriver_PG/sgi_html/ch01.html)
 - MAME `newport.cpp` for REX3 drawing engine reference

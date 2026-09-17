@@ -12,9 +12,9 @@
 //!   - **where does the time go**, both as share of wall clock and as
 //!     emulation efficiency, which are different lists.
 //!
-//! `matrix` builds each CPU x engine combination and runs all of them, because
-//! the CPU model and the JIT are compile-time cargo features — comparing them
-//! means comparing binaries, not flags.
+//! `matrix` builds each engine (a compile-time cargo feature) and runs every
+//! CPU x engine combination, passing the CPU model as `--cpu` — so comparing
+//! engines means comparing binaries, and comparing CPUs means comparing flags.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

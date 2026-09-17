@@ -1,5 +1,5 @@
 # iris-irix65.toml — IRIX 6.5.22 install run
-# Follows docs/irix-install.md. Media in irix/ (filenames as on disk).
+# Follows rules/irix/irix-install.md. Media in irix/ (filenames as on disk).
 # PROM is loaded from the embedded image (prom.bin not required).
 
 headless    = false

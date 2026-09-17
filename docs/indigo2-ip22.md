@@ -7,7 +7,23 @@ Select in the GUI (**Platform → SGI Indigo2 (IP22)**) or set:
 profile = "indigo2_ip22"
 ```
 
-No separate build is required — the same `iris` / `iris-gui` binary supports Indy IP24 and Indigo2 IP22.
+No separate build is required — the same `iris` / `iris-gui` binary supports Indy IP24 and Indigo2 IP22 (`--ip22` on the command line).
+
+## PROM, NVRAM and storage
+
+- **PROM:** IRIS tries `prom` from the config, then `070-1367-012.bin` in the
+  working directory, then falls back to an embedded Indigo2 PROM
+  (`src/prombini2.rs`) — not the Indy one.
+- **NVRAM and MAC:** the Indigo2 keeps its PROM environment and Ethernet address
+  in a 93CS56 serial EEPROM, not the Indy's DS1386. It is loaded from `nveeprom`
+  (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
+  `nveeprom save`. `[network] mac` is injected into it before boot.
+- **SCSI:** two WD33C93A controllers. Put a device on the second one with
+  `controller = 1` in its `[scsi.N]` section; `scsi0` / `scsi1` in the monitor
+  address each controller.
+- **Interrupts:** INT2 and the fullhouse cascade are modelled; the IRIX kernel
+  never hooks GIO interrupt 2, so vertical retrace is delivered the way the
+  table below describes.
 
 ## Hardware deltas vs Indy IP24
 
@@ -23,23 +39,24 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 
 ## Boot checklist
 
-1. Build: `cargo build --release --features lightning,rex-jit` (same as Indy)
+1. Build: `cargo build --release --features lightning,rex-jit` (same as Indy), or
+   pass `--ip22` on the command line
 2. **Stop → Start** after changing platform (cold start picks up IRQ + VC2 bootstrap)
-3. Monitor `mc status` → SYSID `00000010`, GIO64_ARB without `0x400`
-3. Monitor `ioc status` → `sys_id=11`, `gc_select`/`extio` visible on fullhouse
-4. Guest `hinv` → one XL graphics board (embedded Indy PROM may mis-report inventory)
-5. X11 login on primary head (`/dev/gfx` / head 0)
+3. Monitor `mc regs` → SYSID `00000010`, GIO64_ARB without `0x400`
+4. Monitor `ioc status` → `sys_id=11`, `gc_select`/`extio` visible on fullhouse
+5. Guest `hinv` → one XL graphics board
+6. X11 login on primary head (`/dev/gfx` / head 0)
 
 With **Guest** display resolution, iris bootstraps **1280×1024** on fullhouse at Start so the GUI shows a framebuffer before IRIX programs VC2 (embedded Indy PROM often delays or skips gfx init on Indigo2-class hardware).
 
-6. Dual-head (`graphics.heads = 2`): guest `hinv` shows two XL boards; iris-gui shows side-by-side heads; CI `screenshot` accepts `"head": 0` or `1`
+7. Dual-head (`graphics.heads = 2`): guest `hinv` shows two XL boards; iris-gui shows side-by-side heads; CI `screenshot` accepts `"head": 0` or `1`
 
 ## Headless smoke (CI)
 
 ```powershell
 iris.exe --config irix-install/iris-indigo2-smoke-ci.toml
 iris-ci ping
-# monitor: mc status → SYSID 00000010
+# monitor: mc regs → SYSID 00000010
 ```
 
 ## Dual-head Newport
@@ -61,6 +78,5 @@ Shared GIO interrupt lines (FIFO full, graphics, retrace) are latched in the IOC
 
 - IMPACT / MGRAS preview stub (`src/mgras.rs`, `[impact]` config) — see `docs/impact-mgras-research.md`
 - Full EXTIO bus-error and EISA interrupt paths
-- Indigo2-specific PROM (embedded Indy PROM may need replacement for inventory)
 
 See also [`docs/interrupt_map.md`](interrupt_map.md) and [`rules/gui/machine-profile-vs-guest-ip22.md`](../rules/gui/machine-profile-vs-guest-ip22.md).

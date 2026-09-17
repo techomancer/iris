@@ -70,9 +70,18 @@ This is also the case the whole R4400-vs-R5000 axis exists for.
 
 ---
 
-## 2. MIPS IV instructions execute on the R4400 — **open**
+## 2. MIPS IV instructions execute on the R4400 — **fixed** (`e677edf`)
 
 *Found by the whole `mips4/` group, and by `mips4_fp.c` in more detail.*
+
+> **Status (August 2026):** fixed when the CPU model became a type. The
+> interpreter's decoder now consults `C::MIPS4`, so an R4400 raises Reserved
+> Instruction for these encodings and an R5000 executes them. jitv2 only
+> compiles them in a `--features mips4` build and otherwise falls back to the
+> interpreter. The `mips4/*` tests still failing on R4400 in the hardware
+> comparison below are a different bug: an unimplemented COP1 encoding must
+> raise `EXC_FPE`, and IRIS raises `EXC_RI`. The text below describes the
+> original finding.
 
 Every MIPS IV instruction the suite tries runs to completion on an R4400 build
 instead of raising Reserved Instruction:

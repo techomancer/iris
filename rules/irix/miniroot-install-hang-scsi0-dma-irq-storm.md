@@ -123,7 +123,7 @@ Possibilities, ranked by current evidence weight:
 
 ## Compare against working installed boot
 
-Once a fresh install completes (see `docs/irix-6.5.22-install.md`) and
+Once a fresh install completes (see `rules/irix/irix-install.md`) and
 the installed disk boots multi-user, at login:
 
     IOC  L0  stat=00 [-]  mask=82

@@ -95,11 +95,12 @@ cdrom  = false
 # Change this if 192.168.0.x conflicts with your local network.
 #nat_subnet = "192.168.0.0/24"
 
-# NFS share
-# The shared directory is exported to the VM at <gateway_ip>:/path (standard NFS port 2049).
-# From IRIX: mount <gateway_ip>:/absolute/path /mnt  (default gateway: 192.168.0.1)
+# NFS share, served in-process by the NAT gateway (NFSv2 for IRIX 5.3, NFSv3
+# for 6.x — nothing to install on the host). The export is a single root.
+# From IRIX: mount <gateway_ip>:/ /mnt  (default gateway: 192.168.0.1)
 [nfs]
 shared_dir = "./shared"
+#version = "auto"   # "auto" (default), "v2" or "v3"
 
 # Port forwarding rules — forward host ports into the guest (IRIX).
 # proto:      "tcp" or "udp"
@@ -150,8 +151,13 @@ bind       = "localhost"
 #cdrom = true
 #path  = "cdrom4.iso"   # optional — omit to start with an empty tray
 
+# VINO video-in (IndyCam). Off by default.
+# source:   "off" | "test_pattern" | "black" | "camera" (--features camera)
+# standard: "ntsc" | "pal"
 #[vino]
-#source = "camera"
+#source       = "camera"
+#standard     = "ntsc"
+#camera_index = 0
 
 # ── Networking backend ────────────────────────────────────────────────────────
 # mode = "nat"  (default) : built-in software NAT gateway (DHCP/DNS/ICMP/TCP/UDP
@@ -181,10 +187,6 @@ bind       = "localhost"
 # `pcap_interface` but leave `[network]` commented out, the keys land in the
 # top-level table and are rejected as unknown (the emulator will refuse to
 # start) — they only take effect under the [network] table.
-# N64 development board (Ultra64 GIO card).
-# Requires gopher64 patched with src/device/sgi_dev.rs to be running.
-# IRIS creates the POSIX shm (/iris_n64_bridge) and two semaphores on startup.
-# gopher64 opens them; it must be started AFTER iris.
 
 [network]
 mode           = "nat"
@@ -196,5 +198,55 @@ mode           = "nat"
 # before boot — no need to `setenv eaddr` by hand at the PROM monitor.
 #mac            = "08:00:69:12:34:56"
 
+# N64 development board (Ultra64 GIO card). Needs a build with
+# --features ultra64 and the ultra64 branch of github.com/techomancer/gopher64,
+# which maps the shared-memory bridge (/iris_n64_bridge). See HELP.md.
 #[ultra64]
 #enabled = true
+
+# ── Machine ───────────────────────────────────────────────────────────────────
+# profile: "indy_ip24" (default) or "indigo2_ip22" (same as --ip22)
+# cpu:     "r4400" (default) or "r5000" (same as --cpu). Both are in every build.
+#[machine]
+#profile = "indy_ip24"
+#cpu     = "r4400"
+
+# Per-config NVRAM files, so two installs don't overwrite each other's PROM env.
+# These are top-level keys: put them near the top of the file, above any
+# [section], if you uncomment them.
+#nvram    = "nvram.bin"
+#nveeprom = "nveeprom.bin"   # Indigo2 only
+
+# Graphics: board "newport" (default) or "xz" (Indy XZ/Elan preview stub);
+# heads 1 or 2; resolution "guest" (IRIX/PROM programs VC2), "1024x768",
+# "1280x960" or "1280x1024".
+#[graphics]
+#board      = "newport"
+#heads      = 1
+#resolution = "guest"
+
+# CP0 Count frequency. Default 33 MHz, which IRIX reports as a 66 MHz CPU.
+#[clock]
+#fixed_mhz = 33
+
+# HAL2 audio output buffering.
+#[audio]
+#prebuf_ms          = 20
+#cpal_buffer_frames = 512
+
+# Host thread pinning.
+#[perf]
+#thread_affinity = true
+#cpu_core        = 2
+#rex3_core       = 3
+#refresh_core    = 4
+
+# jitv2 compile-pool threads (--features jitv2; same as --jitv2-threads).
+#[jitv2]
+#threads = 1
+
+# Debug knobs, applied as environment variables at start.
+#[debug]
+#no_idle        = false      # IRIS_NO_IDLE: disable idle park (idle-pause builds)
+#gui_gl_capture = false      # IRIS_GUI_GL: iris-gui GL capture renderer
+#debug_log      = "scsi,net" # IRIS_DEBUG_LOG: devlog modules to enable at startup

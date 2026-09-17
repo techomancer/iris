@@ -2,7 +2,7 @@
 
 | Capability | MAME Indy | IRIS Phase 3 |
 |------------|-----------|--------------|
-| IRIX 6.5 desktop | Slow; DRC often flaky | Premiere stack (dual JIT) |
+| IRIX 6.5 desktop | Slow; DRC often flaky | Premiere stack (`lightning` + `rex-jit` + `idle-pause`; jitv2 optional) |
 | Config GUI | None | Full `MachineConfig` + export TOML |
 | CI automation | External scripts | `iris-ci` + TCP on Windows |
 | Extended RAM | Limited | 384/512 MB GUI presets |

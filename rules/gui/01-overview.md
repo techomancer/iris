@@ -1,42 +1,76 @@
 # iris-gui — overview
 
-Optional egui-based launcher for iris. Lives as a separate workspace crate
+Optional egui front-end for iris. Lives as a separate workspace crate
 (`iris-gui/`); default `cargo build` does not include it. Build with
-`cargo build -p iris-gui --release`.
+`cargo build -p iris-gui --release`. The user-facing tour, storage model and
+module map are in `iris-gui-README.md`; this note keeps the invariants that are
+easy to break.
 
 ## Process / thread model
 
 - The eframe app owns the **single** `winit::EventLoop` in the process. iris's
-  own `src/ui.rs` event loop is **not** used by iris-gui — the GUI starts the
-  emulator in headless mode and (Phase B) renders the REX3 framebuffer into
-  an egui panel itself.
-- A worker thread (`iris-gui/src/handle.rs::worker_loop`) owns the `Machine`.
-  GUI ↔ worker communication is via `crossbeam_channel` (`Cmd` and `Evt`).
-  The worker thread has an 8 MB stack to satisfy `Machine::new`'s
-  `Physical::device_map` allocation, matching `src/main.rs`.
-- Settings (recents, window size, ui scale, fullscreen) persist to
-  `~/.config/iris/gui.json`. Machine configs stay in TOML so they remain
-  runnable via `iris --config …`.
+  own `src/ui.rs` event loop is **not** used by iris-gui. The GUI does *not*
+  force `headless = true`: REX3 still runs its refresh thread, and the GUI
+  installs a capture `Renderer` to receive frames.
+- **Window calls belong to the event-loop thread.** Resize, fullscreen, surface
+  creation and the first GL `make_current` must run there; other threads send
+  requests. Violations crashed Windows (#94) and macOS
+  (`winit-window-calls-must-be-on-event-thread.md`,
+  `../macos/winit-030-window-handle-main-thread-only.md`).
+- **GL teardown belongs to the refresh thread** that owns the context
+  (`gl-teardown-must-run-on-the-refresh-thread.md`).
+- A worker thread (`iris-gui/src/handle.rs`) owns the `Machine`, with a 64 MB
+  stack because machine construction builds large objects on the stack. GUI ↔
+  worker communication is via `crossbeam_channel` (`Cmd` and `Evt`); every
+  `Machine` call on the worker is wrapped in `catch_unwind`.
+- `CyclesPtr` (the live MIPS readout) must be cleared before the `Machine` is
+  dropped (`cycles-ptr-must-be-cleared-before-dropping-the-machine.md`).
+- Settings **and machine configs** persist to `<config dir>/iris/gui.json`
+  (`dirs::config_dir()`), which is the system of record. `iris.toml` is
+  import/export only, hidden in `bundled` builds.
 
-## Safe-stop logic (`src/safe_stop.rs`)
+## Frames and input
 
-Stopping is "safe" iff any of:
-1. PowerOff event observed (IRIX `halt` completed).
-2. CPU is sitting at the PROM monitor.
-3. Zero dirty COW overlay sectors and no in-flight SCSI writes.
+The GUI installs `framebuffer.rs::CaptureRenderer` in `Rex3::renderer`
+immediately after `Machine::new`, before the CPU starts. Each `render` call from
+the REX3 refresh thread does a stride-aware copy into a `FrameSink`; the main
+thread uploads it to an `egui::TextureHandle`. `IRIS_GUI_GL=1`
+(`[debug] gui_gl_capture`) uses the GL compositor's capture path instead.
 
-Otherwise a modal lists the failing condition(s), plus a per-CHD warning when
-a SCSI device uses a `.chd` image without `overlay = true` (writes are lost).
-Modal offers **Cancel / Send IRIX halt / Force stop**.
+PS/2 input flows through `input.rs::pump`, only while captured:
+
+- Keys are sent by **physical position**, never layout-translated
+  (`keyboard-layout-send-physical-keys-not-logical.md`, #72).
+- egui swallows Tab/arrows/Esc and turns Ctrl/Cmd+C/X/V into clipboard
+  commands; the pump re-synthesises them
+  (`keyboard-capture-egui-steals-tab-arrows-esc-and-ctrl-cxv.md`).
+- Modifiers arrive as real left/right key events; AltRight is AltGr.
+- Capture is released by Ctrl+Alt (Option+Command on macOS), Ctrl+Alt+Esc, or
+  focus loss after a grace period. Plain F11 is the fullscreen toggle;
+  Ctrl+Alt+F11 sends F11 to the guest.
+- Mouse capture details: `gui_mouse_integration.md`.
+
+## Safe-stop logic (`iris-gui/src/safe_stop.rs`)
+
+Stopping without a prompt is safe when the CPU has halted (clean shutdown,
+soft power-off, or idle at the PROM), or when no attached device writes guest
+data straight into its base image. CD-ROMs, COW overlays, scratch volumes and
+CHDs (`.diff.chd` sidecars) are all safe; a plain read-write hard disk is not.
+The decision is config-based: the core exposes no live dirty-sector count.
+Otherwise a modal offers **Cancel / Send IRIX halt / Force stop**; "Send IRIX
+halt" writes `halt\n` to `127.0.0.1:8881`.
+
+The standalone binary exits the process on soft power-off; iris-gui sets
+`IRIS_NO_EXIT_ON_POWEROFF=1` so the machine only stops. A wedged `Machine::stop`
+is abandoned after 5 s so the GUI stays responsive.
 
 ## What the GUI knows about iris
 
-Only the public API: `MachineConfig`, `Cli`, `Machine::{new, start, stop,
-register_system_controller}`. Anything else the GUI needs (status query,
-event subscription, framebuffer access) is added as a `pub fn` accessor on
-the existing type, never by reaching into private fields.
+Only the public API: `MachineConfig`, `Machine`, `iris::build_features`, and
+accessors added as `pub fn` on the existing types — never private fields. The
+emulated CPU is not a build feature; read `MachineConfig::machine.cpu`.
 
-## Empty-media CD-ROM (Phase B item #6, landed)
+## Empty-media CD-ROM
 
 `ScsiDevice.backend` is `Option<DiskBackend>`. `None` represents "drive
 present, tray empty": INQUIRY still answers, TEST UNIT READY / READ
@@ -46,50 +80,6 @@ CAPACITY / READ / READ TOC return `CHECK CONDITION` with sense key
 `Wd33c93a::insert_disc(id, path)`; unload with
 `Wd33c93a::eject_to_empty(id)`. In `iris.toml` an empty-tray CD-ROM is
 `cdrom = true` with an empty `path` and no `discs` — `MachineConfig::
-validate` accepts this state.
-
-## Phase B — embedded framebuffer & input (landed)
-
-The GUI installs an `iris::rex3::Renderer` impl
-(`iris-gui/src/framebuffer.rs::CaptureRenderer`) in
-`Rex3::renderer` immediately after `Machine::new`, before the CPU
-starts. Each `render(buffer, width, height)` call from the REX3 refresh
-thread does a stride-aware copy of `width × height` u32 pixels into a
-`FrameSink` (parking_lot Mutex of `Frame { width, height, rgba, seq }`).
-The main thread reads the sink each egui frame, uploads to a lazily
-allocated `egui::TextureHandle`, and renders centered in the central
-panel with aspect-preserving fit.
-
-PS/2 input flows through `iris-gui/src/input.rs::pump`. Modifiers
-(shift/ctrl/alt/super) are diffed against the previous frame and
-synthesised as `ShiftLeft / ControlLeft / AltLeft / SuperLeft`
-press/release events because egui delivers modifiers as a separate
-field, not as `Key` events. egui `Key` → `winit::keyboard::KeyCode`
-mapping covers letters/digits/punctuation/F-keys/navigation; misses
-return `None` and are dropped. Mouse events fire only when the cursor
-is inside the framebuffer rect — menu / config clicks don't leak into
-the guest. F11 is consumed by the GUI (fullscreen toggle) and never
-forwarded.
-
-`Cmd::SaveState` calls `Machine::save_snapshot` then `Machine::start`
-(save_snapshot stops the CPU as part of its work). `Cmd::RestoreState`
-calls `Machine::ci_restore`. `Cmd::Screenshot` PNG-encodes the latest
-`FrameSink` snapshot via the `png` crate.
-
-The safe-stop "Send IRIX halt" button TCP-connects to
-`127.0.0.1:8881` (iris's standing ttyd1 listener in non-CI mode) and
-writes `halt\n`.
-
-## Phase B follow-ups
-
-- Embed REX3 framebuffer into an egui panel (add `Rex3::snapshot_rgba()` or
-  similar, upload to egui texture each frame).
-- Wire egui key/pointer events → `Ps2Controller` input.
-- Status polling: add `Machine::is_in_prom()`, `Machine::dirty_cow_sectors()`,
-  `Machine::subscribe_events() -> Receiver<MachineEvent>`.
-- Hook `Machine::ci_save` / `ci_restore` / screenshot to the existing Cmd
-  variants — currently they `Evt::Error` "not yet wired".
-- "Send IRIX halt" should write `halt\n` via the existing serial-send CI
-  path (currently falls through to force-stop with a toast).
-- Replace text-field path entry with `rfd` pickers throughout the config UI
-  (PROM, NVRAM, SCSI image paths, NFS dir).
+validate` accepts this state. The GUI's `Cmd::LoadDisc` / `EjectCdrom` /
+`RemountCdrom` drive these on a running machine
+(`cdrom-hot-insert-remount.md`).

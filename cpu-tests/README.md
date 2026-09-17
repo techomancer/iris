@@ -9,8 +9,8 @@ expectations for R4400 (MIPS III) or R5000 (MIPS IV) — both validated on real
 Indys — or R4600 (MIPS III), whose expectations are inferred rather than
 measured; [docs/r4600.md](docs/r4600.md) says from what.
 
-**This branch is tests only** — no emulator changes. Findings are reported, not
-fixed, so the suite keeps showing them.
+**The suite is tests only** — emulator fixes land separately. Findings are
+reported, not fixed here, so the suite keeps showing them until `src/` changes.
 
 ## Build
 
@@ -48,20 +48,19 @@ cell exceeds that today, so read the `RESULT:` line for the real number.
 
 ### Other CPUs and engines
 
-The CPU and the JIT are compile-time cargo features, so each combination needs
-its own IRIS build:
+The CPU is a runtime choice (`--cpu r4400|r5000`); the JIT is a compile-time
+cargo feature, so each engine needs its own IRIS build:
 
 ```sh
-cargo build --release                                # R4400, interpreter
-cargo build --release --features r5k                 # R5000
+cargo build --release                                # interpreter
 cargo build --release --features jitv2               # jitv2 (no env var needed)
+# then add --cpu r5000 to the run command above for an R5000
 ```
 
-Then run as above. `run/matrix.sh` does all four combinations and builds each
-one for you; `CELLS="r4400-jitv2" run/matrix.sh` runs just one.
-
-> The jitv2 cells have never been run. They are written but unproven — the
-> first green run is still owed.
+`run/matrix.sh` does all four CPU × engine combinations and builds what it
+needs; `CELLS="r4400-jitv2" run/matrix.sh` runs just one. The *Bare-metal
+suites* CI workflow (`.github/workflows/suites.yml`) runs every cell on each
+push that touches the CPU, and gates on the known failing count per CPU.
 
 ### Booting it like real hardware
 

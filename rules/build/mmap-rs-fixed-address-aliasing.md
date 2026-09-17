@@ -2,7 +2,7 @@
 
 ## Status: verified by experiment, 2026-08-24 — read before writing ppmem's mapper
 
-Background for `src/ppmem.rs` (see `docs/ppmem-design.md`): the design needs one
+Background for `src/ppmem/` (`ppmem.rs`, `map_unix.rs`, `map_windows.rs`) (see `docs/ppmem-design.md`): the design needs one
 physical RAM bank to appear at several virtual addresses at once, so that a bank
 smaller than the region it is mapped into *repeats* without any per-access
 masking, and so the low 512KB alias can be a real mapping instead of an

@@ -849,7 +849,8 @@ pub struct MachineConfig {
     #[serde(default = "default_scsi", with = "scsi_keys")]
     pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
 
-    /// NFS share configuration. If present, unfsd is started and NFS is available inside the VM.
+    /// NFS share configuration. If present, the NAT's in-process NFS server
+    /// (`src/nfsudp.rs`) exports `shared_dir` to the guest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs: Option<NfsConfig>,
 
@@ -1390,10 +1391,8 @@ pub struct Cli {
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
 
-    /// Pin the virtual CP0 Count frequency at this fixed value (MHz) instead
-    /// of auto-inferring it from the guest's periodic timer tick. Use for
-    /// guests (e.g. Linux/MIPS) whose tick doesn't fit IRIX's slow/fast
-    /// Override the fixed CP0 Count frequency, e.g. --clock-fixed-mhz 33.
+    /// Override the fixed CP0 Count frequency in MHz (default 33, which IRIX
+    /// reports as a 66 MHz CPU), e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
     pub clock_fixed_mhz: Option<f64>,
 }

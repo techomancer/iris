@@ -14,7 +14,7 @@
 
 even when the kernel has the real `vino` driver loaded (i.e. after
 `vino_eoe` is installed from Foundations 1.1; this bug is independent of
-the missing-CD issue documented in `docs/irix-6.5.22-install.md`).
+the missing-CD issue documented in `rules/irix/irix-install.md`).
 
 ## Root cause
 
@@ -60,7 +60,7 @@ upper byte" but the upper *nibble* needed to be `0xE`, not `0xF`.
 
 Even with this fix, `videod` still fails to open `/dev/vino` on a stock
 6.5.22 install because the kernel was built with `vidstubs.a` instead
-of the real `vino` driver — see `docs/irix-6.5.22-install.md` for the
+of the real `vino` driver — see `rules/irix/irix-install.md` for the
 missing Foundations 1.1 CD problem. To verify this fix end-to-end you
 need `vino_eoe` (kernel driver) + `vl_eoe` (vlserver) + `indycam_eoe`
 (IndyCam-specific bits) installed, all of which live on that missing
@@ -72,4 +72,4 @@ CD.
 - `src/physical.rs` — `build_device_map` mapping of `0x1F080000` to
   `vino_gio_alias`.
 - `docs/vino/` — VINO ASIC datasheets.
-- `docs/irix-6.5.22-install.md` — install procedure + missing-CD note.
+- `rules/irix/irix-install.md` — install procedure + missing-CD note.

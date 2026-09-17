@@ -283,7 +283,8 @@ ic serial-wait --timeout 60 "Option?"
 
 ic serial-send "5"                # Command Monitor
 ic serial-wait --timeout 10 ">> " # PROM monitor prompt
-ic serial-send "setenv -f eaddr 08:00:69:de:ad:01"
+ic serial-send "setenv -f eaddr 08:00:69:de:ad:01"   # optional: IRIS injects [network] mac
+                                                    # (default 08:00:69:12:34:56) into a blank slot
 ic serial-wait --timeout 10 ">> "
 ic serial-send "setenv -f SystemPartition scsi(0)disk(1)rdisk(0)partition(8)"
 ic serial-wait --timeout 10 ">> "

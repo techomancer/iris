@@ -20,7 +20,7 @@ ic run "mount -t efs -o ro /dev/dsk/dks0d4s7 /CDROM"
 ```
 
 This came up cycling the 3 Developer's Toolbox CDs during a 5.3 add-on
-install (`docs/irix-install.md` §11). The base-OS install via the changer
+install (`rules/irix/irix-install.md` §11). The base-OS install via the changer
 (6.5.22 recipe) doesn't hit it because `inst` itself reopens the
 distribution path after each swap rather than relying on a `/CDROM` mount.
 

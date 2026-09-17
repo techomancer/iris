@@ -1,7 +1,9 @@
 # Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown
 
-Status: **flatten-on-exit (Phases 2–5) implemented 2026-06-18; Phase 1 COW toggle
-still pending.** What ships now folds an existing `.diff.chd` back into its base
+Status: **implemented.** Flatten-on-exit (Phases 2–5) and the per-disk COW toggle
+for CHDs (Phase 1) both landed 2026-06-18, with Commit/Discard in iris-gui's SCSI
+menu and `iris-ci chd-sync` / `quit --sync-chd` on the CLI side. The original
+status line read: flatten-on-exit implemented; Phase 1 COW toggle still pending. What ships now folds an existing `.diff.chd` back into its base
 on a clean app exit, with a "Synchronizing disks…" modal — covering the
 compressed-CHD case (which always auto-creates a diff) without the per-disk COW
 toggle. See "Implemented (v1)" below.

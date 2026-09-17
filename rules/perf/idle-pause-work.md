@@ -40,7 +40,7 @@ idle-loop candidate: 0x88011704..=0x88011748 (72 bytes) — ~57% of samples, int
 - Production CPU run loop: `MipsCpu::start()` (`mips_exec.rs:~4983`) spawns the
   `MIPS-CPU` thread running `step()` in batches of 1000, holding the executor
   lock for the whole run. (This is the interpreter run loop; the v1 Cranelift JIT
-  that used to bypass it — `--features jit` + `IRIS_JIT=1` — has since been
+  that used to bypass it — `--features jit` + `IRIS_JIT=1`, the old JIT removed in August 2026 — has since been
   removed. The current `jitv2` region compiler, `--features jitv2`, is
   architecturally different and its interaction with idle-pause has not been
   re-investigated.)

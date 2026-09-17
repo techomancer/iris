@@ -1,5 +1,5 @@
 # iris-irix53.toml — IRIX 5.3 for Indy install run.
-# Follows docs/irix-install.md.
+# Follows rules/irix/irix-install.md.
 # PROM is loaded from the embedded image (prom.bin not required).
 
 scale       = 2
@@ -26,7 +26,7 @@ size_mb = 16
 
 # 5.3 base CD active; Developer's Toolbox 6.0 discs in the changer so
 # they can be cycled in with `iris-ci cdrom-eject 4` for the post-base
-# add-on install (docs/irix-install.md §11). Omit the discs = [...]
+# add-on install (rules/irix/irix-install.md §11). Omit the discs = [...]
 # list if you don't have the Toolbox CDs.
 [scsi.4]
 path  = "irix53/IRIX 5.3 for Indy including R5000.iso"

@@ -81,7 +81,7 @@ luma 7..27) writes at full intensity, quantising to a visible grey/pink haze at
 ## The `blast` demo artifact is NOT a REX3 bug
 
 Replaying the trace into an image of exactly what the host wrote to the colour
-registers (`tools/rex3_replay_png.py`) settles it:
+registers (a `tools/rex3_replay_png.py` script, not checked in) settles it:
 
 * The texture is `orion.rgb` — an SGI RLE image, **256x256, z=3, NO ALPHA
   channel**. All transparency in this demo comes from texels being *black*, never

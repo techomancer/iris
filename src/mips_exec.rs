@@ -10953,7 +10953,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
 
-            // Idle detection + park state (see docs/idle-pause-work.md). Compiled
+            // Idle detection + park state (see rules/perf/idle-pause-work.md). Compiled
             // in only with the `idle-pause` feature (off by default; opt in with
             // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
             // spinning the host CPU at runtime (for benchmarking/debug).

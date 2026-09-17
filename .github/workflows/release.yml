@@ -23,8 +23,9 @@
 #
 # It is a lightning build (interpreter with breakpoint checks and the traceback
 # buffer stripped — no interactive debugging) and carries the REX3 draw-shader
-# JIT. It does not carry the v1 MIPS JIT (`jit`) or the N64 dev board
-# (`ultra64`); those are source-build opt-ins now (see iris-gui/Cargo.toml). The
+# JIT. It does not carry the experimental MIPS JIT (`jitv2`) or the N64 dev
+# board (`ultra64`); those are source-build opt-ins (see iris-gui/Cargo.toml).
+# (The v1 MIPS JIT, `jit`, was removed from the tree in 33c4e68.) The
 # former "standard" (non-lightning), `pcap`, `-jitv2`, and separate `-r5000`
 # variants and the chd_extract tool are no longer released — all of them remain
 # buildable from source.
@@ -1000,7 +1001,7 @@ jobs:
 
           <sub>**Windows:** x64 + arm64 (32-bit Windows is not shipped). **macOS:** requires 10.13 High Sierra or later. **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; built against glibc 2.39 (Ubuntu 24.04). **AppImage** is self-contained and runs on most distributions. **† riscv64** is cross-compiled and shipped as a tarball only (no AppImage/deb/rpm), built against glibc 2.35. **All binaries** include \`libchdman-rs\` and are **BSD 3-Clause** licensed.</sub>
 
-          <sub>**Building other configurations:** PCAP bridged networking (\`--features pcap\`), the experimental JIT v2 engine (\`--features jitv2\`), the v1 MIPS JIT (\`--features jit\`), the N64 development board (\`--features ultra64\`), and the \`chd_extract\` tool are all still in the tree — they are just not part of the release matrix. See \`README.md\`.</sub>
+          <sub>**Building other configurations:** PCAP bridged networking (\`--features pcap\`), the experimental JIT v2 engine (\`--features jitv2\`), the N64 development board (\`--features ultra64\`), and the \`chd_extract\` tool are all still in the tree — they are just not part of the release matrix. See \`README.md\`.</sub>
 
           ---
           EOF

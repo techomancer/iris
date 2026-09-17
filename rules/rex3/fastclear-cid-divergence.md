@@ -32,7 +32,7 @@ There are **three** fastclear implementations, and they do not agree:
 | Path | CID honoured? |
 |---|---|
 | `execute_go` processor select ([rex3.rs:3862](../../src/rex3.rs)) — `fastclear() && no_cid && no_host` | ✅ yes |
-| `rex3_simd::try_fastclear_block` ([rex3_simd.rs:23](../../src/rex3_simd.rs)) | ❌ **no** |
+| `rex3_simd::try_fastclear_block` (`src/rex3_simd.rs`, since deleted) | ❌ **no** |
 | rex-jit `emit_pixel_write` ([compiler.rs:543](../../src/rex3_jit/compiler.rs)) — `dm1.fastclear() && !is_hostw` | ❌ **no** |
 
 `try_fastclear_block` runs as a pre-loop bailout at the top of `draw_block`

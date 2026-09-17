@@ -8,13 +8,12 @@
 #   R4400 vs R5000   the MIPS IV opcodes must compute on one and raise
 #                    Reserved Instruction on the other
 #   interp vs jitv2  a guest-visible ISA suite is the cleanest possible JIT
-#                    differential test. rules/jit/verify-mode.md notes that
-#                    verify mode is structurally invalid for blocks containing
-#                    stores, so this covers ground it cannot.
+#                    differential test, and needs no special build.
 #
-# Each cell needs its own IRIS build, because the CPU is a compile-time cargo
-# feature (see rules/perf/hardware-profiles.md). Builds are cached in
-# build/iris-<cpu>/ so a re-run only relinks what changed.
+# The CPU is chosen at runtime with --cpu; the engine is a compile-time cargo
+# feature. Builds are cached in build/iris-<cpu>-<engine> so a re-run only
+# relinks what changed. (The r5000 cells still pass the vestigial r5k feature;
+# it no longer selects the CPU.)
 #
 # usage: run/matrix.sh [cell ...]      (default: all cells)
 #        CELLS="r4400-interp r5000-interp" run/matrix.sh

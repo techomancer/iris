@@ -9,7 +9,7 @@
 /// Master I2C bus for programming SAA7191 (DMSD) and CDMC camera controller.
 ///
 /// References:
-///   docs/vino/vino.md         — SGI VINO Design Spec 099-8937-001 v2.0
+///   docs/vino/vino.pdf        — SGI VINO Design Spec 099-8937-001 v2.0
 ///   docs/vino/vino.{h,cpp}   — MAME reference implementation (Ryan Holtz)
 ///   irix/stand/arcs/ide/IP22/video/VINO/vinohw.h — IRIX diagnostic headers
 

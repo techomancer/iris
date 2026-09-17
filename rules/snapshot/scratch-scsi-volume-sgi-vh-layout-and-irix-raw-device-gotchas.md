@@ -34,7 +34,7 @@ guest: dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -
 3. Without a valid VH at sector 0, IRIX creates the device nodes but every read returns I/O error.
 4. Checksum is required: vh_csum at offset 0x1F8 must make the sum of all 128 big-endian u32 words equal 0. iris computes this in sgi_vh::fix_csum.
 
-## When to use scratch over unfsd
+## When to use scratch over NFS
 
-unfsd needs a manual build on macOS, is flaky in our experience, and requires IRIX networking before any file movement. The scratch volume works at PROM time, single-user, or any other phase.
+NFS (now served in-process by the NAT, no `unfsd` since June 2026) still requires IRIX networking before any file movement. The scratch volume works at PROM time, single-user, or any other phase.
 

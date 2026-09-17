@@ -2,8 +2,9 @@
 
 ## Unified config
 
-`MachineConfig` now includes `[jit]`, `[perf]`, and `[machine]` TOML sections. CLI applies
-`cfg.jit.apply_env()` at startup; iris-gui syncs Debug tab edits into `cfg.jit` before Start.
+`MachineConfig` now includes `[debug]` (formerly `[jit]`), `[perf]`, and `[machine]` TOML
+sections. CLI applies `cfg.debug.apply_env()` at startup; iris-gui syncs Debug tab edits into
+`cfg.debug` before Start.
 
 ## Windows CI
 
@@ -36,7 +37,9 @@ dedicated pump thread caused scratchy audio on Windows — see
   dirty_h`, driven by `status_bar_only`, not by the removed per-pixel
   tracker) + live VRAM borrow (`fb_borrowed`).
 
-## JIT stores
+## JIT stores (obsolete)
 
-Set `[jit] compile_stores = true` (or uncheck "Disable JIT stores" in GUI) to clear
-`IRIS_JIT_NO_STORES`. Write-log rollback remains the safety net per `rules/jit/store-compilation.md`.
+This section described the old tiered MIPS JIT's `[jit] compile_stores` /
+`IRIS_JIT_NO_STORES` switch and its write-log rollback (`rules/jit/store-compilation.md`).
+That JIT, the setting and the rules were removed in August 2026 (`33c4e68`). jitv2
+compiles stores unconditionally; see `rules/jitv2/`.

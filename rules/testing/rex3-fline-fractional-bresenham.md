@@ -151,7 +151,7 @@ distinct root causes, listed separately since none of them are really
 "F_LINE" bugs; they just surfaced while verifying the F_LINE change didn't
 regress the wider `rex-jit` suite.
 
-- **`jit_fastclear_rgb24`** (`rex3_simd.rs`): `try_fastclear_block`,
+- **`jit_fastclear_rgb24`** (`rex3_simd.rs`, deleted in the September 2026 REX3 refactor): `try_fastclear_block`,
   `try_src_block_rgb`, and `try_src_span_rgb` all compute their bounding box
   via `(ctx.xstart >> 11).clamp(0, REX3_SCREEN_WIDTH - 1)` — but
   `ctx.xstart >> 11` is a **biased** coordinate (REX3_COORD_BIAS = 4096

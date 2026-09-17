@@ -128,7 +128,7 @@ r5ksc = []
 r5ksc_triton = ["r5ksc"]
 # Idle detection + in-place CPU park: when the guest sits in its interrupt-enabled
 # idle loop, sleep the CPU thread until the next timer tick / device interrupt
-# rather than spinning the host core (see docs/idle-pause-work.md). Wallclock-
+# rather than spinning the host core (see rules/perf/idle-pause-work.md). Wallclock-
 # anchored timing; the IRIS_NO_IDLE env var disables it at runtime when compiled
 # in. OFF by default (the CPU thread spins) — opt in with --features idle-pause;
 # off keeps deterministic-clock and raw-benchmark builds simple.
@@ -167,7 +167,7 @@ jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-
 # with a live bug (silently corrupting a register and dropping a pending
 # foreign delay-slot transfer whenever the standalone-compiled LUI word was
 # actually running as someone else's delay slot at runtime; see
-# rules/jit/jitv2_lui_fusion_foreign_delay_slot_hazard.md) that was hit on
+# rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md) that was hit on
 # real IRIX boot/shutdown traces even after a first fix landed. Not worth the
 # debuggability/complexity cost for the perf it buys in the jitv2 pipeline
 # specifically; opt in with --features jitv2_opcodefusion once it's earned

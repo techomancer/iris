@@ -29,7 +29,7 @@ reset on kernel<>user switch and tlb ops
 
 DONE split translate into translate_32/64_kernel/user add function pointer
 
-DONE new self-calibrating fasttick
+DONE new self-calibrating fasttick (since replaced: CP0 Count now runs at a fixed 33 MHz and IP7 comes from a host timer)
 
 DONEish fpu
 look at ide fpu test, convert to user space test, compile and run on irix, fix failures
@@ -50,7 +50,7 @@ scsi - cdrom no sense in irix 5.3
 
 DONE scsi - large requests fail
 
-ui - file selection for cd load
+DONE ui - file selection for cd load (RCtrl+F12 in iris, Ctrl/Cmd+F12 and the SCSI menu in iris-gui)
 
 DONE bus - writemask on write64 and write32 for more efficient uncached store left/right?
 

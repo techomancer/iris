@@ -16,15 +16,20 @@
 | `identity` | 5 | PRId, FIR, cache geometry, Config.K0, TLB size |
 | `alu` | 29 | sign extension across the 32/64-bit boundary, overflow traps, shifts, logic, SLT |
 | `muldiv` | 18 | mult/div in both widths, HI/LO, the unspecified cases |
-| `mem` | 18 | load/store widths, the whole unaligned family at every offset, alignment faults, KSEG0/KSEG1 |
+| `mem` | 21 | load/store widths, the whole unaligned family at every offset, alignment faults, KSEG0/KSEG1 |
 | `branch` | 15 | every conditional, likely-nullification, link registers, delay slots, faults in delay slots |
-| `excep` | 15 | traps, reserved instructions, coprocessor usability, EXL/ERET, vector selection |
+| `excep` | 17 | traps, reserved instructions, coprocessor usability, EXL/ERET, vector selection |
 | `cp0` | 21 | read-only registers, reserved-bit masks, 64-bit access, Count/Compare, LL/SC |
 | `tlb` | 10 | entry round-trip over all 48, TLBP, every page size, real translation, V/D bits, ASIDs, refill |
-| `fpu` | 88 | see below |
+| `fpu` | 89 | see below |
 | `cache` | 8 | geometry, tag round-trip, cached/uncached views, I-cache coherency |
 | `mips4` | 13 | every MIPS IV addition — computes on R5000, must raise RI on R4400 |
-| **total** | **240** | |
+| **total** | **246** | |
+
+Six of these (`excep/cp0_unusable_user`, `excep/cp0_usable_cu0`,
+`mem/load_then_use`, `mem/load_then_trap`, `mem/load_then_more`,
+`fpu/trap_behind_a_load`) were added after the 2026-09-11 run and are not in
+its numbers; `identity/config_k0` was also re-enabled.
 
 ### Inside `fpu`
 

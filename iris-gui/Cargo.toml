@@ -77,7 +77,7 @@ pcap = ["iris/pcap"]
 # Build with: cargo build -p iris-gui --features daynaport
 daynaport = ["iris/daynaport"]
 # Vestigial for CPU selection. The R4400/R5000 choice is a runtime setting on
-# the Memory tab (`[machine] cpu`), and both models are compiled into every
+# the General tab and Machine menu (`[machine] cpu`), and both models are compiled into every
 # build — see the note in src/lib.rs. This passthrough remains only so the
 # feature name still resolves for anyone building with it.
 r5k = ["iris/r5k"]

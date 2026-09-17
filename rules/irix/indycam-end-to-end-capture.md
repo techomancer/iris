@@ -145,11 +145,11 @@ order they fail in if you walk the IRIX vino driver's init path.
   big-endian MIPS-II mode. ECOFF EXTR records are 16 bytes (`u32`
   reserved, `u32 iss`, `u32 value`, `u32 bits`); SYMR offsets in HDRR
   are at byte offsets 64/68 (issExtMax/cbSsExtOffset) and 88/92
-  (iextMax/cbExtOffset). See `tools/disasm-vino.py` style if revived.
+  (iextMax/cbExtOffset). A `tools/disasm-vino.py` helper was used for this but never checked in; the guest-side VINO tools that were are in `tools/vino/`.
 
 ## See also
 
 - [vino-gio-alias-offset.md](vino-gio-alias-offset.md)
 - [vino-attach-via-sysid-bit4.md](vino-attach-via-sysid-bit4.md)
-- `docs/irix-6.5.22-install.md` — install procedure + lessons
+- `rules/irix/irix-install.md` — install procedure + lessons
 - `tools/inst-watch.py` — prompt-classifying tail for the serial log

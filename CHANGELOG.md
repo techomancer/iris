@@ -2,14 +2,158 @@
 
 All notable user-facing and developer-facing changes to iris.
 
-## [Unreleased] — 2026-05-03
+IRIS has no numbered releases. Binary builds are tagged `v<YYYY-MM-DD-HH-MM>` by
+the Release workflow when someone publishes one. This file is grouped by month,
+newest first, and within a month by area. Commit hashes are given where a change
+is easiest to understand by reading the commit.
 
-The headline of this release is a complete snapshot/rollback stack: capture
-the full machine state to disk, restore it, roll back inside a session, ship
-snapshots between machines over HTTP, and validate that any of the above
-produces deterministic results.
+## September 2026
 
-### Added
+### Graphics (REX3)
+
+- **Drawing engine refactor** (`35a3b18`). One generic draw routine
+  (`src/rex3_generic.rs`, mode decoding in `src/rex3_shape.rs`) is specialised
+  ahead of time into 462 native draw functions (`src/rex3_shaders.rs`, generated
+  by `tools/gen_rex3_shaders.py` from a corpus of the draw modes the IRIX desktop
+  uses). Most desktop drawing now runs through LLVM-optimised specialised code in
+  every build, not only with `rex-jit`. The REX3 JIT and the precompiled set share
+  one dispatch table. `src/rex3_simd.rs` is gone; the JIT profile moved to
+  `src/rex3_profile.rs`.
+- VDMA copes with REX3 reporting busy; `advlast` fixed in the JIT; the REX3
+  diagnostic counters were moved off the hot path behind the new default-on
+  `rexdiag` feature, so a last-drops build can drop them with
+  `--no-default-features` (`f1d0fcb`).
+- The GFIFO push is retryable, and a shader rejected by a full compile queue can
+  be requested again (`rules/testing/rex-jit-queue-retry.md`).
+- `CIDMATCH` is a mask of permitted CIDs, not an equality value
+  (`rules/rex3/cidmatch-is-a-mask.md`).
+- Blend-alpha handling fixed (`rules/rex3/blendalpha-and-alpha-blending.md`).
+- REX3 benchmarking tests; a triangle benchmark in `gltest`.
+
+### CPU and timing
+
+- **CP0 Count runs at a fixed 33 MHz** (`066935b`). The slow/fast tick detection
+  and Count/IP7 frequency inference are gone; a constant rate proved more stable.
+  IRIX reports it as a 66 MHz CPU. `[clock] fixed_mhz` / `--clock-fixed-mhz`
+  override it.
+- IP7 delivery improved for Linux guests' timer checks and calibration.
+- Misaligned-fetch exception, and Config.K0 cache modes including the reserved
+  ones (`rules/irix/cache-attributes-and-fetch-alignment.md`).
+- FR=1 FPU mode handled better, with a guard for `MOVCI`
+  (`rules/jitv2/fr1-pin-must-be-re-derived.md`,
+  `rules/testing/movci-is-cp1-by-behaviour-not-encoding.md`).
+
+### JIT v2
+
+- Inline load/store for the R5000 cache model, not only the R4400.
+- Physical code pages are found through a flat pfn array instead of a hash map;
+  PC/BD stores are emitted only when needed; the last instruction on a page and
+  excluded instructions share one path (early September).
+
+### Networking
+
+- **Guest DNS goes to the host's DNS server** (`src/host_dns.rs`): the first IPv4
+  `nameserver` in `/etc/resolv.conf`, or the active adapter's server on Windows,
+  re-read every few seconds so a VPN coming or going needs no restart. `8.8.8.8`
+  is only the fallback.
+
+### Testing
+
+- **cpu-tests validated on real SGI hardware** (`5150db0`). An Indy R4400 rev 6.0
+  and an Indy R5000 rev 1.0 both pass every check; the logs are in
+  `cpu-tests/oracle/`. All 15 original FP failures are confirmed IRIS bugs.
+  `run/diff-hw.py` classifies a hardware log against an emulator one.
+- CI now gates cpu-tests on the real failing count per CPU instead of on zero.
+- New tests: CP0 instructions from User/Supervisor mode must raise Coprocessor
+  Unusable; `identity/config_k0` is back; `mem/load_then_use`,
+  `load_then_trap`, `load_then_more` and `fpu/trap_behind_a_load` cover the
+  instructions right behind a load; an R4600 case with every expectation's
+  source written down (`cpu-tests/docs/r4600.md`).
+- `cp0/count_writable` no longer varies between runs.
+- The prebuilt bench guest image was refreshed.
+
+### iris-gui
+
+- Scaling and resize fixes (`e93c5bb`): the VM screen scale is now the maximum
+  draw scale, so a larger window centres the picture instead of stretching it;
+  a snap-to-size request made while fullscreen is applied when fullscreen ends.
+- **Windows crash fixes** (#94): window resizes are sent to the main event-loop
+  thread instead of being called from other threads, the GL surface and the first
+  `make_current` happen on the main thread, and further cross-thread UI fixes.
+- `crash_diag`: silent Windows deaths (`0xC000041D`) are logged with a symbolised
+  stack to `iris-crash.log` (`rules/gui/windows-silent-exit-0xc000041d.md`).
+
+## August 2026
+
+### CPU
+
+- **The CPU model is a runtime setting** (`e677edf`, `29158fc`). R4400 vs R5000
+  used to be 99 `#[cfg(feature = "r5k")]` sites and a rebuild per CPU. Both
+  models are now types monomorphised into every binary; `[machine] cpu`,
+  `--cpu`, the GUI and `iris-bench` pick one. Snapshots record the CPU and refuse
+  a crossed restore. The `r5k` feature is vestigial; `r5ksc`/`r5ksc_triton`
+  refuse to build until the R5000 L1I bugs are fixed.
+- R5000 IRIX boot hang fixed: the PROM is told there is no L2 (`98332ed`).
+- Six `CpuDevice` methods that recursed instead of forwarding were fixed.
+- `WAIT` in the disassembler; debugger fixes (breakpoints no longer alias
+  adjacent instructions, `EXEC_RETRY` is retried in both debugger paths, a PC
+  breakpoint waits until its instruction is fetchable, the step-off-breakpoint
+  skip also applies to `step_one`); the GDB stub returns an error for unreadable
+  memory instead of zeros.
+- FPU flag synchronisation and rounding-mode fixes found by cpu-tests; R5000 L1
+  cache test fixes.
+- `MipsCore` reorganised: the interrupt word, `in_delay_slot` and its target live
+  in the core; fields reordered for cache locality; the cycles counter is a plain
+  variable. Cranelift upgraded 0.116 → 0.134, and every dependency except the
+  egui stack updated (`rules/build/dependency-upgrade-gotchas.md`).
+- IP7 is driven by a host timer instead of instruction counting (`1e05210`), and a
+  fixed CP0 Count clock option was added (superseded in September).
+
+### Memory, caches and translation
+
+- **ppmem**: host-MMU-backed physical memory (`--features ppmem`,
+  `docs/ppmem-design.md`).
+- **tcache**: transparent cache on top of ppmem (`--features tcache`,
+  `docs/tcache-design.md`), with `tcache_verify`.
+- **nutlb**: a direct-mapped data-side translation cache, later reworked around a
+  validity bitmask and made permanent (`docs/nutlb-design.md`). nanotlb is
+  invalidated on ASID changes. `tlbcheck` walks the JTLB after every write;
+  `jitstats` instruments the inline-memory path.
+
+### JIT v2 (new) and the old JIT (removed)
+
+- **jitv2** (`c340118`): a physical-page Cranelift compiler with memory-resident
+  registers and no speculation (`rules/jitv2/jit-v2-design.md`). Over the month:
+  a multi-threaded compile pool with a lock-free queue (`[jitv2] threads`,
+  `--jitv2-threads`), compiles triggered on page transitions, FMOVCF and DADDIU
+  emitters, interpreter fallbacks that don't break streaks, NOP elimination,
+  lazily materialised cycle counts, inline L1D loads/stores for lines already in
+  cache, a dirty-cache-page probe, self-modifying-code detection, and a Windows
+  x64 callout ABI that returns status in registers.
+- `jitv2_opcodefusion` (LUI+ORI/ADDIU, branch+NOP) exists but is **off by
+  default** after it broke Linux (`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
+- `j2wp` whole-page compile, `jitv2_lockstep`, `jitv2_smc_check`,
+  `jitv2_corpus_dump`, the `j2` monitor command (`clear`, `deny`, `pagewb`,
+  `html` physical code page visualiser, …) and the `jitv2_analyze`,
+  `jitv2_verify`, `jitv2_pcp_dump` tools.
+- Status-bar feedback for JIT activity.
+- **The original tiered MIPS JIT was removed** (`33c4e68`), along with its
+  `jit` feature, `IRIS_JIT*` environment variables and `rules/jit/`.
+
+### Bare-metal testing and benchmarking
+
+- **cpu-tests** (`866925c` onwards): a self-checking MIPS III/IV suite that runs on
+  the emulated CPU with no OS — ALU, mul/div, memory, branches, exceptions, CP0,
+  TLB, FPU (88 tests), caches and MIPS IV — plus `run/matrix.sh` for R4400/R5000 ×
+  interpreter/jitv2 and a CI workflow.
+- Emulator support for it: `--load-elf` and the `loadelf`/`loadbin` monitor
+  commands (`src/elf.rs`); a default-off **test device** in GIO slot 0 with guest
+  console, machine-state JSON dump and exit code (`--test-device`,
+  `src/testdev.rs`), later with a host clock and a retired-instruction counter.
+- **bench/** (`07d8a3b`): 46 kernels in six groups, each checksummed against a
+  golden value, reporting throughput, guest MIPS and an accuracy score.
+  **iris-bench** runs, compares and sweeps builds (`matrix`, `host`).
+  `bench/irix/` covers workloads under a booted IRIX.
 
 #### Benchmark, for everyone
 
@@ -18,52 +162,211 @@ produces deterministic results.
   into `iris` (`bench/prebuilt/`, `src/benchsuite.rs`) and runs on a headless
   machine the emulator builds for itself (`iris::bench_runner`). No MIPS cross
   toolchain, no ELF on disk, no subprocess, and nothing written outside the
-  application container — so the Benchmark tab now ships in App Store builds
-  instead of being hidden. `iris-bench run --iris PATH` still measures a
-  separate binary in a subprocess, which is what `matrix` needs.
+  application container — so the Benchmark tab ships in App Store builds.
+  `iris-bench run --iris PATH` still measures a separate binary in a subprocess,
+  which is what `matrix` needs.
 - **The bare-metal suite got 2.5x faster** (117 s → 46 s for a full r4400
-  lightning run, same 40/40 accuracy). `--load-elf` skips the PROM, so the
-  SCC's transmitter is never enabled and every character the guest printed
-  burned a 100,000-iteration spin waiting for a TX-empty bit that would never
-  come. `cpu-tests` was paying the same tax and gets the same speedup. See
-  `rules/testing/scc-serial-output-from-bare-metal-code.md`.
+  lightning run). `--load-elf` skips the PROM, so the SCC's transmitter was never
+  enabled and every character the guest printed burned a 100,000-iteration spin
+  waiting for a TX-empty bit that would never come. `cpu-tests` gets the same
+  speedup. See `rules/testing/scc-serial-output-from-bare-metal-code.md`.
 - **Quick mode** (`iris-bench run --quick`, and the GUI's default): about half
   the wall clock for the same numbers to within a couple of percent. It never
-  runs fewer kernels — accuracy would then mean less while still reading 100% —
-  it only shortens the timed passes. Requested through a new test-device
-  register (`TESTDEV_RUN_CONFIG`), since a bare-metal image has no argv; every
-  field means "unrestricted" when zero, so older emulators are unaffected.
-  Recorded on every result, and refused by `iris-bench reference`.
-- **Every result records the machine it measured.** The suite now reads the
-  hardware out of the hardware before it starts — CPU identity and revision and
-  the L1/L2 geometry from CP0 Config, the RAM banks from the memory
-  controller's MEMCFG registers — and prints it as a header and as `#cache` /
-  `#memory` lines in the machine block. Works with no PROM and no POST, since
-  `--load-elf` programs MEMCFG exactly as POST would. This is provenance that
-  matters: the `mem/` kernels are a direct readout of the cache hierarchy, and
-  nothing in a saved result previously said whether two results even had the
-  same one. The GUI shows it under "Machine measured"; the exported report
-  carries it.
-- **Any MIPS CPU is identified and runs.** The suite named only the R4400 and
-  R5000 and *refused to run* on anything else, on the stated grounds that "the
-  golden checksums are selected by PRId" — which was not true: `golden.h` is one
-  flat, CPU-independent table and no kernel is CPU-gated. It now names R4000,
-  R4400, R4600, R4700, R5000, R8000, R10000, R12000, R14000, RM5200 and RM7000
-  from PRId (R4000 and R4400 split on revision, the standard rule), prints an
-  unrecognised implementation as `MIPS-imp-0xNN`, and runs either way. Verified
-  by presenting an R10000 and an unknown implementation to the guest: both
-  identify correctly and score 40/40.
-- **Platform limits documented.** The bare-metal harness both suites share is
-  written for an Indy or Indigo2 (IP22/IP24): the load address, the console and
-  the memory inventory all assume that machine, and the load address is what
-  stops a port first, not the console. Recorded once in
-  `rules/testing/bare-metal-harness-platform-assumptions.md` — including which
-  claims were tested and which are reasoning, and why an ARCS-based port would
-  be one path for the whole SGI family rather than one per machine.
-- `iris::bench_report` — the report parser, data model and reference table
-  moved out of `src/bin/iris_bench.rs` so the CLI, the runner and the GUI share
-  one definition of what "accuracy" means.
+  runs fewer kernels, it only shortens the timed passes. Requested through a
+  test-device register (`TESTDEV_RUN_CONFIG`); every field means "unrestricted"
+  when zero, so older emulators are unaffected. Refused by `iris-bench reference`.
+- **Every result records the machine it measured**: CPU identity and revision
+  and the L1/L2 geometry from CP0 Config, and the RAM banks from MEMCFG, printed
+  as a header and as `#cache` / `#memory` lines.
+- **Any MIPS CPU is identified and runs.** The suite names R4000, R4400, R4600,
+  R4700, R5000, R8000, R10000, R12000, R14000, RM5200 and RM7000 from PRId and
+  runs on anything else too; `golden.h` was always CPU-independent.
+- **Platform limits documented** in
+  `rules/testing/bare-metal-harness-platform-assumptions.md`.
+- `iris::bench_report` holds the report parser, data model and reference table,
+  shared by the CLI, the runner and the GUI.
 
+### Platforms and devices
+
+- **Indigo2 (IP22)**: its own PROM with an embedded fallback (`src/prombini2.rs`),
+  INT2 and the fullhouse interrupt layout, a second SCSI controller, NVRAM in the
+  93CS56 serial EEPROM (`nveeprom`), MC revision bump for the PROM, and vertical
+  retrace delivery for Indigo2 graphics.
+- **DaynaPort SCSI/Link** (`--features daynaport`, `734660b`): Ethernet over the
+  SCSI bus as a per-ID target with its own NAT or PCAP backend
+  (`docs/daynaport.md`, `docs/iris-daynaport-target.md`).
+- **TFTP server** in the NAT gateway for PROM network boot (`--tftp-dir`,
+  `src/tftp.rs`).
+- **SGI volume headers**: volume-directory support and the `mkvh` tool.
+- SCSI fixes for Linux (phantom LUNs, mode pages, MODE SENSE(10)) and the Indigo2.
+- PS/2: report that the aux mux is unsupported (fixes the mouse in Debian 7);
+  keyboard and mouse enable/disable toggles.
+- REX3 framebuffer dump (`rex fbdump`); 8-bit DCB writes packed into the top of
+  the word; alpha compare fixed.
+
+### iris-gui
+
+- **Benchmark tab** (in-process, ships everywhere) and a **CPU picker** shown
+  wherever the machine is described.
+- JIT and Ultra64 are opt-in build features rather than always on.
+- Sends physical key positions instead of layout-translated keys (#72); captures
+  the macOS window handle on the main thread (abort on first frame); file dialogs
+  open where the file is; never pairs a file name with a directory on macOS.
+- Installer: the R5000 build got its own AppId, then was dropped when the CPU
+  became a setting.
+
+### Tooling, CI and diagnostics
+
+- **Release and App Store pipelines** moved into this repo (`f40a1c1`):
+  manual dispatch, dry run by default, publish on request. One variant per
+  platform: lightning + rex-jit + camera + chd.
+- One `suites.yml` workflow for both bare-metal suites.
+- `iris-ci`: the socket read timeout follows the caller's deadline instead of a
+  fixed 300 s.
+- Stack sizes raised for machine construction and tests.
+- Build warnings cleaned up; the `r5ksc_triton` and non-JIT builds fixed.
+- `scripts/build-manifest.sh` emits a per-build crate manifest.
+- Snapshot fixes: the MC timebase is re-anchored at start, HPC3 PDMA latched
+  flags are serialized, SCC RR0 is normalised against emptied FIFOs, and the L1D
+  dirty bit is encoded where the hardware keeps it (late July).
+
+## July 2026
+
+### Graphics
+
+- Removed dirty-rectangle tracking; fixed line (`fline`) drawing, line stipple
+  (`lspattern`/`zpattern`) and accelerated quads/spans; fixed a packed HOSTRW read
+  that drew black bars; fixed SoftWindows corruption (#46).
+- GL compositor falls back from GL 3.2 / GLSL 1.50 to GL 2.1 / GLSL 1.20; the 2px
+  framebuffer offset is gone, and the 1024x768 mode displays correctly.
+- Screenshots after the first work with the GL compositor.
+- The status bar shows the IP7 rate instead of the (constant) refresh rate.
+
+### CPU
+
+- **Interpreter opcode fusion** (`252efb5`, part of `lightning`): branch+NOP,
+  LUI+ADDIU/ORI and add/sub+load/store pairs dispatch as one.
+- Inlined completion tails.
+- Per-instruction statistics (`instr_stats`); FPU rounding modes and control-bit
+  reads/writes fixed; targeted FPU-instruction logging.
+- Delay-slot fix for a branch that is not taken.
+
+### Platforms and devices
+
+- **Indigo2 IP22 platform** (`f2d0bff`): `[machine] profile`, fullhouse MC/IOC,
+  a Newport XL on the GIO graphics slot, plus preview stubs for the Indy XZ/Elan
+  board (`src/xz.rs`) and Indigo2 IMPACT (`src/mgras.rs`), dual-head Newport and
+  forced Newport resolutions.
+- IndyCam CDMC register map and power-on defaults corrected
+  (`rules/irix/indycam-cdmc-register-map.md`).
+- NFS resolves `.` and `..` server-side.
+- NAT: port forwards to rsh/rlogin use a reserved source port, probing for a free
+  one (`rules/irix/rsh-forward-needs-reserved-source-port.md`).
+- Recent HAL2 changes reverted after they broke audio.
+- `libchdman-rs` 0.288.8 (BSD-3-Clause; drops GPL-3.0), then 0.288.9 (bin/cue fix).
+- Machine and other large objects are constructed with bigger stacks (#60).
+
+## June 2026 (and late May)
+
+### iris-gui (new)
+
+- **Optional egui front-end** (`a8b8262`, contributed via danifunker's fork):
+  named machines with autosave in `gui.json`, iris.toml import/export, embedded
+  framebuffer, mouse and keyboard capture, safe-stop dialog, icons.
+- Live MIPS readout; fewer framebuffer copies; X11 mouse capture fix;
+  IntelliMouse wheel support in the core.
+- **Mac App Store support**: security-scoped bookmarks, interpreter-only under the
+  App Sandbox, notarised-distribution entitlements, winit's private blur API
+  stubbed out (guideline 2.5.1, `rules/macos/appstore-private-api.md`), camera
+  and network entitlements made testable, keyboard capture, CHD folder grants,
+  licenses window, and `PRIVACY.md`.
+- Adaptive framebuffer filtering and the left control column; windowed-first
+  sizing with a VM-screen scale; NVRAM at a stable per-user path, seeded on
+  first run, with automatic MAC detection and writing; managed location for new
+  disk images; NET status light; redesigned Networking tab with live subnet
+  changes and a "Check networking" dialog; CHD copy-on-write UI; powered-off
+  overlay; `bundled` build feature and "Use embedded PROM".
+- GL teardown runs on the refresh thread that owns the context (fixes a segfault
+  on power-off and window close).
+
+### Networking
+
+- **In-process NFS server** (`src/nfsudp.rs`, eight increments ending `685f534`):
+  NFSv2 for IRIX 5.3 and NFSv3 for 6.x, MOUNT v1/v3, a duplicate-request cache,
+  IP-fragment reassembly, and READDIR that respects `count`. The external
+  `unfsd` and its `--unfsd`, `--nfs-port` and `--mountd-port` options are gone.
+- **PCAP bridged networking** (`--features pcap`, `2c83ac8`), with capture-
+  permission elevation and installer plumbing, an NFS responder on a virtual LAN
+  IP (`nfs_pcap_ip`), live NIC changes, and a fix for RX starvation on busy LANs.
+- **XDMCP** reverse-proxy helper (`src/xdmcp.rs`, `docs/xdmcp.md`).
+- FTP passive-mode helper for inbound port forwards; port forwards can be
+  rebound live; NAT adoption and "networking off" diagnostics.
+- Time and NTP answered by the gateway (late May).
+
+### Storage
+
+- **Hot-swappable CD-ROM** (#47): load a disc at runtime with RCtrl+F12 (CLI) or
+  Ctrl/Cmd+F12 (GUI), empty trays, and three changer bugs fixed.
+- **CHD copy-on-write** (`fe8d449`): writes go to a `.diff.chd` sidecar and are
+  folded back into the base on exit ("Synchronizing disks…").
+- **WD33C93A rewrite** for OpenBSD (`1cdf836`), plus SCSI fixes for Linux, NetBSD
+  and OpenBSD and a `scsi_deferred_int` setting for the BSDs.
+
+### Other emulation
+
+- **Ultra64 N64 development board** (`--features ultra64`) in GIO slot 0, bridged
+  over shared memory to a modified gopher64.
+- GL-based display compositor, window resizing and fullscreen.
+- vmap TLB indexing fixed for NetBSD's large pages; serial TX-empty interrupt no
+  longer fires constantly (Gentoo).
+- Mouse clicks on the IndyCam image fixed by clip-mode and CID checks in the REX3
+  JIT; compositor modularised.
+- Indycam capture works on Linux hosts (V4L).
+
+### Late May
+
+- **VINO / IndyCam** end to end: pixel pipeline, CDMC and SAA7191, host camera
+  capture on macOS, SYSID bit 4 so IRIX attaches the driver, I2C fixes, capture
+  on IRIX 6.5, colour and interlace fixes (`rules/irix/vino-*`,
+  `rules/irix/indycam-end-to-end-capture.md`).
+- **Idle park** (`--features idle-pause`, off by default): the CPU thread sleeps
+  while IRIX idles. The REX3 GFIFO consumer parks instead of spinning, the refresh
+  thread skips unchanged frames, and the winit loop waits when idle.
+- IRIX install guide for 5.3 and 6.5.22 (`rules/irix/irix-install.md`) with
+  `tools/inst-*.py` helpers; config templates `iris-irix53.toml` and
+  `iris-irix65.toml`; per-config `nvram = "..."`.
+- SCSI: IRIX miniroot install hang fixed
+  (`rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
+- `--serial-log` mirrors ttyd1 output; the monitor port stays bound under `--ci`;
+  telnet option negotiation on the serial and monitor listeners.
+- `iris-ci rtc-save`, `cdrom-eject`, `cdrom-load`; `get`/`put` work under a
+  `/bin/sh` guest shell.
+- Monitor: `ps2 type`/`enter`/`status`, `proc info`.
+- `chd_extract` tool.
+- First R5000 support (slower than R4400 under the interpreter because every
+  cache access probes two ways).
+- Enabled build features are printed at startup.
+- A configured SCSI device that can't attach is a fatal error.
+
+## May 2026 — snapshots, CHD and CI
+
+- **CHD images** (`--features chd`, May 18–20) for SCSI disks and CD-ROMs, via the
+  `libchdman-rs` crate.
+- Configurable NAT subnet; unprivileged ICMP on macOS.
+- `tlbvmap` on by default, TLB translation statistics, a shadow TLB with cooked
+  values.
+- `gr_osview` and `jot` fixed on IRIX 5.3; 12bpp colour-index decoding fixed.
+- CD-ROM enabled by default; TCP forwarding regression from the CI work fixed.
+- NetBSD no longer hangs on DCB access.
+
+The snapshot and CI work below landed on 2026-05-03.
+
+The headline is a complete snapshot/rollback stack: capture
+the full machine state to disk, restore it, roll back inside a session, ship
+snapshots between machines over HTTP, and validate that any of the above
+produces deterministic results.
+
+### Added
 
 #### Snapshot system
 
@@ -218,9 +521,9 @@ compute the live chunk set.
 - **Persistent JIT cache** (was Phase 2.5): descoped. Interp on M2 hits
   Indy parity (60–100 MIPS for integer code). The plan-cited 1.5–2× JIT
   win wasn't worth the maintenance burden of an unstable JIT (still-open
-  POST hang on M2, prior Loads-tier and store-correctness issues). JIT
-  code stays mothballed behind the existing `--features jit` flag —
-  re-enable if a future workload outgrows interp.
+  POST hang on M2, prior Loads-tier and store-correctness issues). At the
+  time the JIT stayed mothballed behind `--features jit`; that JIT was
+  removed entirely in August 2026 and replaced by jitv2.
 
 ### Module map
 
@@ -270,7 +573,7 @@ directly.
 
 ---
 
-### `iris-ci` wrapper binary
+#### `iris-ci` wrapper binary
 
 Driving the CI socket via raw `printf … | nc -U /tmp/iris.sock` proved tedious
 and error-prone in real use (long lines, brittle JSON quoting, hand-managed
@@ -328,7 +631,7 @@ that.
   newline-delimited JSON request, reads one line of response, shuts down
   the write side so the server's read loop exits cleanly.
 
-#### What this replaced in the manual test runbook
+#### What this replaced in the manual test runbook (since deleted)
 
 | Before | After |
 |---|---|
@@ -338,3 +641,15 @@ that.
 | Hand-built `dd … conv=sync,notrunc` + `wc -c` for extraction | `iris-ci get /tmp/foo --to ./foo.tar` |
 | Multi-line shell sequences with manual error handling | `iris-ci script tests/scenario.iris` |
 | JSON output piped through `head -c` and visually parsed | Pretty-printed tables + `--json` opt-in |
+
+## April 2026 — initial release
+
+- First public code (2026-04-01): an SGI Indy (R4400) emulator booting IRIX 6.5
+  and 5.3 with Newport graphics, HAL2 audio, SCSI, the SEEQ Ethernet with a NAT
+  gateway, PS/2 input, a monitor console and serial ports.
+- Early additions: 2x window scale, ICMP on Windows, unfs3-based file sharing
+  (replaced in June), port forwarding, headless mode, copy-on-write disk
+  overlays, the first MIPS JIT (removed in August), the REX3 draw-shader JIT
+  (`rex-jit`), a custom GFIFO, TLB vmap and nanotlb fast paths, many interpreter
+  micro-optimisations, the GDB stub, screenshots, CD-ROM block size fixes and
+  monitor commands for the CD changer.

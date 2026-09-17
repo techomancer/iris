@@ -1,6 +1,13 @@
 # PCAP release + elevation plan
 
-Status: **in progress** (updated 2026-06-20). The PCAP feature itself is **done**
+Status (September 2026): **superseded for release wiring.** PCAP support, the
+capture-permission elevation and the installer plumbing landed (June 2026). The
+release pipeline then moved into this repo (`.github/workflows/release.yml`) and
+ships one variant per platform, **without** `pcap`; PCAP is a source-build option
+(`--features pcap`, `-p iris-gui --features pcap`). The `[main]` checklist below
+describes the fork's old pipeline and is kept for history.
+
+Original status: **in progress** (updated 2026-06-20). The PCAP feature itself is **done**
 and lives on branch `add-pcap-builds` (GenSayer's "Add PCap support" + danifunker
 edition, merged). This document now tracks the remaining elevation / installer /
 release-wiring work to completion.

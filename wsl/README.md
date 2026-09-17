@@ -154,7 +154,7 @@ Uses `GlCompositor` on the refresh thread instead of the CPU path. Still slower 
 
 After any change: **Stop → cold Start** (fully quit iris, relaunch). Verify:
 
-1. Monitor: `mc status` — banks 2–3 should show **VLD=1** when extended RAM is configured
+1. Monitor: `mc regs` — banks 2–3 should show **VLD=1** when extended RAM is configured
 2. IRIX: `hinv -t memory` or System Manager → About This System
 
 For **IRIX 6.5**, prefer **384 MB** over 512 MB. The 512 MB preset is documented for IRIX 5.3.
@@ -168,26 +168,26 @@ See [rules/testing/silent-app-quit-debug.md](../rules/testing/silent-app-quit-de
 
 Send `premiere-debug.log`, monitor `status`/`bt`/`dt 80`, and `hinv -t memory` after a quit.
 
-### Authentic max Indy (R5000SC, 256 MB)
+### R5000 Indy
 
-**Currently unavailable.** `iris/r5ksc` (the R5000's external secondary
-cache) doesn't build — the memory-mapped L2 control transactions it needs
-aren't implemented, and the plain R5000 L1I model has separate open bugs.
-See `rules/testing/r5k-l1i-cache-bugs.md`. Use `iris/r5k` alone (no
-secondary cache) if you need R5000 CPU/FPU behavior without the cache
-profile:
-
-```powershell
-cargo +nightly-x86_64-pc-windows-msvc build -p iris-gui --release --features iris/r5k
-cargo +nightly-x86_64-pc-windows-msvc build --release --bin iris --features lightning,rex-jit,idle-pause,iris/r5k
-```
+The CPU is a runtime setting, not a build feature: every build contains both the
+R4400 and the R5000. Pick **R5000** in iris-gui (Machine menu or General tab),
+or in the TOML / on the command line:
 
 ```toml
-banks = [128, 128, 0, 0]
-scale = 1
+[machine]
+cpu = "r5000"
 ```
 
-Switching CPU after IRIX is installed may require reinstall (same as real hardware). IRIS models R5000SC with 1 MB L2 (real R5000SC often had 512 KB).
+```powershell
+target\release\iris.exe --config irix-install\iris-windows.toml --cpu r5000
+```
+
+The emulated R5000 has 32 KB 2-way L1 caches and **no** secondary cache. The
+R5000SC variant (external L2) is not available: `iris/r5ksc` deliberately fails
+to build until its L1I cache bugs are fixed (`rules/testing/r5k-l1i-cache-bugs.md`).
+The old `iris/r5k` feature no longer selects the CPU. A snapshot taken on one
+CPU refuses to restore onto the other.
 
 ---
 
@@ -260,7 +260,7 @@ See [rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md](../rules/sn
 - [ ] Same `nvram`, `scsi.*.path`, `prom` paths (run from repo root or use absolute paths)
 - [ ] **Stop → Start** in GUI after RAM changes
 - [ ] Same Debug env for CLI as GUI Debug tab
-- [ ] `mc status` shows expected MEMCFG for extended RAM
+- [ ] `mc regs` shows expected MEMCFG for extended RAM
 - [ ] Re-export after GUI changes you want CLI/CI to keep
 
 ---

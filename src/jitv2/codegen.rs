@@ -3957,7 +3957,7 @@ impl JitConsts {
     /// and the pointer stays valid for the life of the process.
     fn hook_addr(&self, field_offset: i32) -> Option<i64> {
         // Baking call targets as immediates is currently a LOSS — see this
-        // method's callers and rules/jitv2/jit-compile-time-constants.md.
+        // method's callers.
         // Cranelift rematerializes the constant at every call site rather
         // than hoisting it (504 copies of one address in a single real
         // region), costing +13.7% code. Gated off; flip via IRIS_BAKE_HOOKS=1
@@ -4138,7 +4138,7 @@ fn callout_core_arg(ctx: &mut EmitCtx) -> Value {
     // (`JitConsts`). Measured on 500 real corpus pages: baking it costs
     // +3.7% code (3,925,717 -> 4,070,123), because Cranelift rematerializes
     // the constant at every call site — 617 x 10-byte `movabsq` replacing
-    // 617 x 4-byte `leaq`. See rules/jitv2/jit-compile-time-constants.md.
+    // 617 x 4-byte `leaq`.
     ctx.builder.ins().iadd_imm_s(ctx.core_ptr, CALLOUT_CORE_BIAS)
 }
 
@@ -6341,9 +6341,8 @@ fn emit_target_edge(
 /// contribution of 2 without this function double-counting the branch's
 /// own share.
 ///
-/// This compiled unit's `opt_level = "none"` (see
-/// `rules/jit/cranelift-opt-levelnone-is-the-right-trade-for-throughput-jits.md`)
-/// means none of `emit_slot_semantics`' bracketing IR would otherwise be
+/// This compiled unit's `opt_level = "none"` (the `developer` default; `j2 opt`
+/// switches it) means none of `emit_slot_semantics`' bracketing IR would otherwise be
 /// eliminated even though a NOP's own semantics emitter (`emit_sll` with
 /// `rd == 0`, skipped by `emit_write_gpr`) is already free — every load/
 /// store in the bracketing becomes real native code, so skipping it here is

@@ -1,8 +1,11 @@
 # Networking tab redesign — design & plan
 
-Status: **Phase 0 + 1 done** (subnet logic + Networking tab UI landed, unit-tested,
-builds clean on default and `appstore` features; not yet committed). Phases 2
-(FTP ALG) and 3 (in-app file bridge) pending. Captures the design agreed for the iris-gui
+Status (September 2026): **Phases 0, 1 and 2 shipped** (subnet logic, the
+Networking tab, and the FTP ALG). NFS moved in-process instead
+(`docs/nfsudp-plan.md`). **Phase 3 (in-app file bridge) was never started**, and
+the suppaftp fork prompt it depended on (`docs/suppaftp-emu-fork-prompt.md`) was
+removed from the repo. Original status: Phase 0 + 1 done; Phases 2 (FTP ALG) and
+3 (in-app file bridge) pending. Captures the design agreed for the iris-gui
 **Networking** config tab and the two new backend features it pulls in. Mirrors
 the `docs/cow-chd-sync-plan.md` convention so the work survives across sessions.
 
@@ -108,7 +111,7 @@ sandbox (no new entitlements; no reliance on spawning external binaries).
 ### Phase 3 plan (decided 2026-06-18)
 Architecture **B** (pure NAT-side client, no host sockets). FTP reuses suppaftp's
 protocol code via a **transport-generic fork** rather than a hand-rolled client —
-spec in `docs/suppaftp-emu-fork-prompt.md` (make suppaftp's sync client generic
+spec in `docs/suppaftp-emu-fork-prompt.md`, since removed (make suppaftp's sync client generic
 over an `FtpConnector` trait; default `TcpConnector` preserves behavior; passive
 first; TLS only on the TCP path). With a virtual-net connector **no ALG/PASV
 rewrite is needed** for the bridge (we reach the guest's PASV address directly on

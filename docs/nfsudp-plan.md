@@ -1,6 +1,12 @@
 # Plan: in-core NFSv3-over-UDP server (`src/nfsudp.rs`)
 
-Status: **CODE-COMPLETE** (increments 1–8 landed, ~19 unit tests, builds clean on
+Status: **shipped.** It is the only NFS path (HELP.md, "NFS file sharing"). Real
+IRIX mounts have since turned up and fixed
+READDIR `count` handling (`rules/irix/nfs-readdir-must-respect-count-and-fit-one-datagram.md`),
+server-side `.`/`..` resolution (`rules/irix/nfs-dot-and-dotdot-must-resolve-server-side.md`)
+and the PCAP-mode responder. The original status line follows.
+
+Original status: **CODE-COMPLETE** (increments 1–8 landed, ~19 unit tests, builds clean on
 default + appstore). Replaces the external `unfsd` with a synchronous, pure-Rust
 NFS/UDP server that lives inside the NAT. **Pending: real-boot validation** —
 mount from IRIX 5.3 (v2) and 6.x (v3), read/write, and large transfers

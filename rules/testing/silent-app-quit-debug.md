@@ -32,7 +32,7 @@ bt
 dt 80
 exception all on
 cow status
-mc status
+mc regs
 ```
 
 Developer build adds `debug on`, `log mips mask insn`, `dt file crash-trace.txt 1048576`.

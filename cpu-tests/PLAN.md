@@ -4,7 +4,16 @@ Goal: a **self-checking, bare-metal MIPS test suite** for the CPUs IRIS
 emulates (R4400 / MIPS III and R5000 / MIPS IV), delivered as a **bootable SGI
 CD image** the PROM loads directly, and runnable headless in CI.
 
-This document is the roadmap. Nothing is built yet.
+> **Status (September 2026): implemented.** This is the original plan, kept for
+> its reasoning. The suite, the matrix runner, the PROM-bootable image and CI
+> all exist; see [README.md](README.md) for how to use them and
+> [docs/status.md](docs/status.md) for where it stands. Two things below have
+> changed since it was written: the CPU model is now a **runtime** setting
+> (`--cpu r4400|r5000`, not the `r5k` cargo feature), and the old tiered JIT
+> (`--features jit`, `IRIS_JIT=1`, verify mode, `rules/jit/`) was removed —
+> jitv2 is the JIT cell.
+
+This document was the roadmap.
 
 ---
 

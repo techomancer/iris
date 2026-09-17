@@ -23,7 +23,7 @@ Both profiles are supported in the default build (GUI platform dropdown and CI u
 
 ## Verify after changing profile
 
-1. Monitor console (`127.0.0.1:8888`): `mc status` → SYSID `00000013` on Indy IP24; `00000010` on Indigo2 IP22.
+1. Monitor console (`127.0.0.1:8888`): `mc regs` → SYSID `00000013` on Indy IP24; `00000010` on Indigo2 IP22.
 2. IRIX guest: `hinv | head -20` → IP22-family processor line + R4400; Indy-appropriate devices (single Newport, not dual-head Indigo2).
 3. TOML with `profile = "indigo2_ip22"` → Start succeeds; hardware is fullhouse, not Guinness.
 

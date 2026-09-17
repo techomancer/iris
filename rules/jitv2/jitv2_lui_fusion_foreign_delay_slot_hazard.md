@@ -55,4 +55,4 @@ alone already suppresses fusion and the test would pass even on the buggy
 code without exercising the real path.
 
 See also [[jitv2_lockstep_region_ending_double_page_jump]] for a related
-0xFFC-adjacent jitv2 hazard, and `rules/jit/emit_absolute_pc_exit-in_delay_slot-followup.md`.
+0xFFC-adjacent jitv2 hazard, and `rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md`.

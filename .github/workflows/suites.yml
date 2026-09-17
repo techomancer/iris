@@ -14,9 +14,7 @@
 #              R4400 vs R5000 because the mips4/ group requires each MIPS IV
 #              instruction to compute on R5000 and raise Reserved Instruction
 #              on R4400. interp vs jitv2 because a guest-visible ISA suite is
-#              the cleanest JIT differential available, and covers ground
-#              rules/jit/verify-mode.md says verify mode structurally cannot
-#              (blocks containing stores).
+#              the cleanest JIT differential available.
 #
 #   bench      is it still correct after ten million of them, with whatever
 #              state the last million left — and how long did that take.
@@ -186,9 +184,9 @@ jobs:
       # rather than a machine that never shipped; CPU/FPU correctness (what
       # cpu-tests actually exercises) doesn't depend on the secondary cache.
       #
-      # jitv2, not the v1 jit: v1 is the speculative tiered block compiler being
-      # replaced, and is not what this project runs. jitv2 needs no runtime
-      # switch — it is active as soon as the feature is compiled in.
+      # jitv2 is the only MIPS JIT (the v1 tiered compiler was removed in
+      # 33c4e68). It needs no runtime switch — it is active as soon as the
+      # feature is compiled in.
       #
       # iris-bench is built with the cell's features too. It embeds the guest
       # image and can run the suite in-process, so a default-feature build here

@@ -85,7 +85,7 @@ believing it's mid-delay-slot).
 ## Related
 
 - [[project_jitv2_lockstep_status]]
-- `rules/jit/emit_absolute_pc_exit-in_delay_slot-followup.md` — a related,
+- `rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md` — a related,
   *not yet fixed* fragility found during this same investigation:
   `emit_absolute_pc_exit` never clears `core.in_delay_slot` itself, relying
   on every caller to have already cleared it first.

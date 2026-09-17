@@ -5,7 +5,7 @@ slots of the old 3-entry `nanotlb`; the Fetch slot survives as a separate,
 specialised one-entry structure.
 
 Companion reading: `HACKING.md` (data path), `rules/testing/` (TLB findings),
-`docs/nanotlb_associativity.md`-adjacent memory note — a previous 4-way/AVX2
+and an earlier nanotlb-associativity note (never checked in) — a previous 4-way/AVX2
 experiment **lost** to the 1-way nanotlb, so any new structure has to justify
 itself against a very cheap incumbent.
 

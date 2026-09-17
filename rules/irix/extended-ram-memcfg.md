@@ -14,7 +14,7 @@ MEMCFG1 and fires the remap callback. See `src/mc.rs`.
 ## Verify
 
 1. Set `banks = [128, 128, 64, 64]` (384 MB for IRIX 6.5), Stop → Start.
-2. Monitor telnet `127.0.0.1:8888`: `mc status` — banks 2–3 should show VLD=1.
+2. Monitor telnet `127.0.0.1:8888`: `mc regs` — banks 2–3 should show VLD=1.
 3. In IRIX: `hinv -t memory` or System Manager → About This System.
 
 ## Layout reference

@@ -139,8 +139,9 @@ because the *same binary* runs on both sides and any disagreement is a bug:
   negative control — a MIPS III instruction that must fault on neither, so a
   CPU that raised RI for everything cannot pass by accident.
 - **Interpreter vs JIT.** A guest-visible ISA suite is the cleanest JIT
-  differential available. `rules/jit/verify-mode.md` records that JIT verify
-  mode is structurally invalid for blocks containing stores — so this covers
-  ground verify mode cannot reach.
+  differential available. It was written when the old JIT's verify mode could
+  not check blocks containing stores; that JIT has since been removed, and
+  jitv2's lockstep checks per instruction, but the suite remains the only
+  differential that needs no special build.
 
 `run/matrix.sh` runs all four cells.

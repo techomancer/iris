@@ -1,5 +1,9 @@
 # Task: add a DaynaPort SCSI/Link target to the IRIS emulator
 
+> **Status: done** (`734660b`, 2026-08-12, verified against both IRIX drivers on
+> 2026-08-13). The user-facing documentation is [daynaport.md](daynaport.md). This
+> file is the original task brief, kept for its protocol notes.
+
 Hand this to an agent (or a human) working in the **`iris`** repo. It is written
 against `iris` as of 2026-08-12 and cross-checked with the real file layout, so
 the file and symbol references below should resolve.

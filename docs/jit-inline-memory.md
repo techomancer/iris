@@ -1,8 +1,12 @@
 # JIT inline loads and stores
 
-Status: **first attempt implemented and REVERTED — 9x slower.** The scaffolding
-(pointer plumbing, geometry, `jitstats` measurement) is sound and kept; the
-emit strategy is not. See §7 before attempting this again.
+Status: **working and on by default** (§10). Inline loads and stores run for L1D
+lines already in cache and fall back to the Rust callouts otherwise; the R5000
+cache model got the same path in September 2026. `j2 inline_mem [on|off]`
+switches it at runtime, and lockstep forces it off
+(`rules/jitv2/lockstep-must-disable-inline-memory.md`). §7–§9 record the two
+failed attempts, whose real cause was a Cranelift verifier error (§10), not the
+emit strategy.
 
 Original status line: design, not implemented. Scope: aligned 8/16/32/64-bit loads and
 stores only. Unaligned (LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR) keeps calling out —
