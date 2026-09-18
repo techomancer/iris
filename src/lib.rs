@@ -142,6 +142,11 @@ pub mod build_features {
             ("developer", cfg!(feature = "developer")),
             ("developer_ip7", cfg!(feature = "developer_ip7")),
             ("debug_cache", cfg!(feature = "debug_cache")),
+            ("jitv2_lockstep", cfg!(feature = "jitv2_lockstep")),
+            ("jitv2_smc_check", cfg!(feature = "jitv2_smc_check")),
+            ("fetchverify", cfg!(feature = "fetchverify")),
+            ("j2wp", cfg!(feature = "j2wp")),
+            ("llstats", cfg!(feature = "llstats")),
         ];
         FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect()
     }
