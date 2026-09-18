@@ -1422,6 +1422,23 @@ mod tests {
     }
 
     #[test]
+    fn region_boundary_is_declined_even_with_fallback_on() {
+        // jitv2_verify poisons a branch's untaken arm so the analyzer bails on
+        // that edge. An `Excluded` word is not enough: with fallback on it is
+        // admitted as a fallback head (see the test below, which asserts
+        // exactly that for a COP0 word). RegionBoundary is declined first.
+        let _fb = fallback_on_guard();
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL;
+        page[1] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        let mut a = Analyzer::new();
+        let (result, non_empty) = a.walk(&page, 0, 0);
+        assert!(!non_empty, "a region-boundary entry is not a compilable region");
+        assert!(!result[0].visited, "the sentinel must never be visited");
+        assert!(!result[0].is_fallback, "the sentinel must never become a fallback head");
+    }
+
+    #[test]
     fn walk_excluded_entry_is_a_one_instruction_fallback_region() {
         let _fb = fallback_on_guard();
         // Interpreter-fallback: an excluded entry is no longer an empty region.

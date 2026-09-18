@@ -462,15 +462,19 @@ fn run(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbose: boo
     Ok(stats)
 }
 
-/// Any word whose top 6 bits are `OP_COP0` (rest zero — decodes as `MFC0
-/// r0, $0`) unconditionally classifies `Excluded` (`analyzer::classify`),
-/// regardless of the specific COP0 sub-opcode. Used by `run_chain` to
-/// "poison" a branch's untaken arm inside a multi-instruction chain: the
-/// analyzer refuses to walk into an excluded word, so that edge always
-/// bails instead of accidentally reading whatever stale/zero content
-/// happens to sit at that word in the synthetic page buffer as if it were
-/// real code the trace never actually validated.
-const POISON_WORD: u32 = iris::mips_isa::OP_COP0 << 26;
+/// `JIT_REGION_BOUNDARY_SENTINEL` classifies `RegionBoundary`, which `visit`
+/// declines before it considers interpreter-fallback admission — never
+/// visited, never a fallback head. Used by `run_chain` to "poison" a branch's
+/// untaken arm inside a multi-instruction chain, so that edge always bails
+/// instead of accidentally reading whatever stale/zero content happens to sit
+/// at that word in the synthetic page buffer as if it were real code the
+/// trace never actually validated.
+///
+/// Was `OP_COP0 << 26` (`MFC0 r0, $0`), which relied on COP0 classifying
+/// `Excluded` and `Excluded` being unwalkable. With `j2 fallback on` an
+/// excluded word is admitted as a fallback head instead, so the poison
+/// stopped poisoning.
+const POISON_WORD: u32 = iris::mips_isa::JIT_REGION_BOUNDARY_SENTINEL;
 
 /// Multi-instruction chain mode (`--chain N`): instead of verifying one
 /// instruction (or one branch+slot unit) per compiled region, attempt to
@@ -486,7 +490,7 @@ const POISON_WORD: u32 = iris::mips_isa::OP_COP0 << 26;
 /// actually taken — so the *other* arm's word (if it lands in-page and
 /// isn't otherwise part of the chain) is overwritten with [`POISON_WORD`]
 /// in the synthetic page buffer before compiling. The analyzer then bails
-/// on that edge (`Classify::Excluded`) instead of either matching by luck
+/// on that edge (`Classify::RegionBoundary`) instead of either matching by luck
 /// or wandering into zero-filled/stale memory as if it were reachable real
 /// code — the compiled region's *shape* is forced to match the trace's
 /// actual path, not just its entry point.
