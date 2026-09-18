@@ -41,6 +41,14 @@ impl IdleParkState {
         let im = core.cp0_status & STATUS_IM_MASK;
         let interrupt_ready = (ip & im) != 0;
 
+        // With every mask bit clear nothing can satisfy `park`'s
+        // `(ip & im) != 0`, so parking here never wakes.
+        if im == 0 {
+            self.ring_len = 0;
+            self.ring_pos = 0;
+            return false;
+        }
+
         if !(ie && !interrupt_ready) {
             self.ring_len = 0;
             self.ring_pos = 0;
@@ -105,4 +113,38 @@ impl IdleParkState {
 
 pub fn idle_park_enabled() -> bool {
     std::env::var_os("IRIS_NO_IDLE").is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mips_core::{MipsCore, STATUS_IE, STATUS_IM_SHIFT};
+
+    /// A state the detector would otherwise park on: interrupts enabled, none
+    /// ready, and the same architectural state seen twice.
+    fn repeated_idle_state(status: u32) -> (IdleParkState, MipsCore) {
+        let mut core = MipsCore::default();
+        core.cp0_status = status;
+        core.cp0_cause = 0;
+        core.pc = 0x8000_0100;
+        let mut st = IdleParkState::default();
+        st.update(&core); // first sighting fills the ring
+        (st, core)
+    }
+
+    #[test]
+    fn update_parks_on_a_repeated_state_when_an_interrupt_could_arrive() {
+        // Control for the test below: with a mask bit set, `park`'s
+        // `(ip & im) != 0` is satisfiable, so parking is safe and expected.
+        let (mut st, core) = repeated_idle_state(STATUS_IE | (1 << (STATUS_IM_SHIFT + 7)));
+        assert!(st.update(&core), "a repeated idle state with IM set should park");
+    }
+
+    #[test]
+    fn update_declines_to_park_when_every_interrupt_is_masked() {
+        // IE set but IM zero: the guest would take an interrupt, but none can
+        // be delivered, so the wait `park` performs can never end.
+        let (mut st, core) = repeated_idle_state(STATUS_IE);
+        assert!(!st.update(&core), "IM == 0 makes park's wake condition unsatisfiable");
+    }
 }
