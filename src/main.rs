@@ -2,6 +2,10 @@ use iris::config::load_config;
 use iris::machine::Machine;
 
 fn main() {
+    // Without a backend every `log::warn!` here is discarded. Stays at
+    // `error` unless RUST_LOG is set, as iris-gui already does.
+    env_logger::init();
+
     // Turn a silent death (exit 0xC000041D and friends) into iris-crash.log.
     // Cheap: dormant until something actually crashes. See the module docs.
     iris::crash_diag::install();
