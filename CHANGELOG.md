@@ -23,6 +23,12 @@ is easiest to understand by reading the commit.
   diagnostic counters were moved off the hot path behind the new default-on
   `rexdiag` feature, so a last-drops build can drop them with
   `--no-default-features` (`f1d0fcb`).
+- **Crash fix: `rex-jit` CIDMATCH probe on aux-plane draws.** A draw into an
+  overlay plane (OLAY/PUP/CID) with CID checking live re-derived the CID probe's
+  offset against `fb_rgb` while the pixel pointer was already `fb_aux`-based,
+  reading `fb_aux + (fb_aux - fb_rgb) + off` — a wild pointer that segfaulted the
+  REX3 thread under X11. `Dm1::use_aux()` now picks the base in both shader
+  emitters (`rules/rex3/cidmatch-aux-plane-base.md`).
 - The GFIFO push is retryable, and a shader rejected by a full compile queue can
   be requested again (`rules/testing/rex-jit-queue-retry.md`).
 - `CIDMATCH` is a mask of permitted CIDs, not an equality value

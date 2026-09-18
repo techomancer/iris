@@ -104,6 +104,16 @@ impl Dm1 {
     fn blendalpha(&self)  -> bool { self.val & (1 << 27) != 0 }
     fn logicop(&self)     -> u32  { (self.val >> 28) & 0xF }
 
+    /// OLAY/PUP/CID are packed into the auxiliary framebuffer; RGB/RGBA live in
+    /// the main one. Every framebuffer pointer the shader forms — the pixel
+    /// address, the scr2scr source, the CIDMATCH probe — has to pick its base
+    /// with this, and mixing two bases is what made a CID-plane draw under a
+    /// live CIDMATCH read `fb_aux + (fb_aux - fb_rgb) + off`.
+    fn use_aux(&self) -> bool {
+        matches!(self.planes(),
+            p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID)
+    }
+
     /// Compute compile-time host pixel count (pixels per host word) from dm1 fields.
     /// Mirrors Rex3::host_setup() count logic.
     fn host_count(&self) -> u32 {
@@ -496,8 +506,7 @@ fn emit_calculate_fb_address(
     let c4        = b.ins().iconst(types::I32, 4);
     let byte_off  = b.ins().imul(addr_i32, c4);
     let byte_off64 = b.ins().uextend(types::I64, byte_off);
-    let use_aux   = matches!(dm1.planes(),
-        p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
+    let use_aux   = dm1.use_aux();
     let fb_ptr    = if use_aux { pctx.fb_aux } else { pctx.fb_rgb };
     let px_ptr    = b.ins().iadd(fb_ptr, byte_off64);
     let _ptr_type = ptr_type; // consumed by caller if needed
@@ -523,8 +532,7 @@ fn emit_pixel_write(
     dm1:         &Dm1,
     is_hostw:    bool,
 ) {
-    let use_aux     = matches!(dm1.planes(),
-        p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
+    let use_aux     = dm1.use_aux();
     let depth_mask: i64  = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
     let dblsrc_shift: i64 = match dm1.drawdepth() { 0 => 4, 1 => 8, 2 => 12, _ => 0 };
     let (aux_read_shift0, aux_read_shift1, aux_read_mask): (i64, i64, i64) = match dm1.planes() {
@@ -640,9 +648,9 @@ fn emit_pixel_write(
     //
     // Reuse the destination load above when there was one. `fb_px_raw` is the
     // same address, loaded with no intervening store, so a second load fetches
-    // a value we already have. (Note this is only the *plane* pixel: the CID
-    // match test reads fb_aux at a different pointer and is a genuinely
-    // separate access, not part of this pair.) Cranelift's redundant-load
+    // a value we already have. (Note this is only the *plane* pixel: for an
+    // RGB-plane draw the CID match test reads fb_aux at a different pointer and
+    // is a genuinely separate access, not part of this pair.) Cranelift's redundant-load
     // elimination will not merge them itself — the loads use `memv`, the
     // possibly-aliased flag, so it cannot prove nothing wrote in between.
     let old_val = if needs_dst {
@@ -1188,12 +1196,16 @@ fn emit_shader(
     // Only emitted when cidmatch != 0xF (0xF = disabled).
     // Does not apply to HOSTR (READ) since that reads from fb, not writes to it.
     if cidmatch != 0xF && !is_hostr {
-        let aux_ptr = {
-            // Re-derive the fb_aux byte offset from px_ptr (which is already byte-offset into fb_rgb).
+        let aux_ptr = if dm1.use_aux() {
+            // px_ptr is already an fb_aux pointer for this pixel.
+            px_ptr
+        } else {
+            // Re-derive the fb_aux byte offset from px_ptr (an fb_rgb pointer here).
             // fb_rgb and fb_aux share the same stride/layout (2048 u32 entries per row),
-            // so the byte offset into fb_aux is the same as into fb_rgb.
-            let fb_rgb_base = pctx.fb_rgb;
-            let byte_off64  = b.ins().isub(px_ptr, fb_rgb_base);
+            // so the byte offset into fb_aux is the same as into fb_rgb. Subtracting
+            // the wrong base is a wild pointer, not a wrong pixel — see
+            // rules/rex3/cidmatch-aux-plane-base.md.
+            let byte_off64 = b.ins().isub(px_ptr, pctx.fb_rgb);
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
         let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));
@@ -1230,8 +1242,7 @@ fn emit_shader(
         // to decide whether we consumed a host pixel (false) or drew colorback (true).
         let mut draw_use_bg_bool: Value = b.ins().iconst(types::I8, 0); // default: drew from host/DDA
         let src_color = if is_scr2scr {
-            let use_aux = matches!(dm1.planes(),
-                p if p == DRAWMODE1_PLANES_OLAY || p == DRAWMODE1_PLANES_PUP || p == DRAWMODE1_PLANES_CID);
+            let use_aux = dm1.use_aux();
             let (aux_read_shift0, aux_read_shift1, aux_read_mask): (i64, i64, i64) = match dm1.planes() {
                 p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
                 p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
@@ -1996,9 +2007,10 @@ fn emit_draw_iline(
 
     // CID mask check for lines (same logic as emit_shader).
     if cidmatch != 0xF {
-        let aux_ptr = {
-            let fb_rgb_base = pctx.fb_rgb;
-            let byte_off64  = b.ins().isub(px_ptr, fb_rgb_base);
+        let aux_ptr = if dm1.use_aux() {
+            px_ptr // already an fb_aux pointer for this pixel
+        } else {
+            let byte_off64 = b.ins().isub(px_ptr, pctx.fb_rgb);
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
         let aux_raw = b.ins().load(types::I32, memv, aux_ptr, ir::immediates::Offset32::new(0));

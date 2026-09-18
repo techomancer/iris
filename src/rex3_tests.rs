@@ -4807,6 +4807,85 @@ mod jit_tests {
             dm0, dm1,
         );
     }
+
+    /// CIDMATCH on a draw whose target plane lives in fb_aux (OLAY/PUP/CID).
+    ///
+    /// The CID probe re-derives its fb_aux offset from `px_ptr`, which is only
+    /// an fb_rgb pointer when the target plane is RGB/RGBA. For an aux-plane
+    /// draw `px_ptr` is already fb_aux-based, and subtracting fb_rgb from it
+    /// produced `fb_aux + (fb_aux - fb_rgb) + off` — a pointer hundreds of MB
+    /// outside either framebuffer. It segfaulted the REX3 thread the moment
+    /// IRIX drew into an overlay plane with CID checking live (X11 menus and
+    /// the cursor do exactly that). `fb_rgb` and `fb_aux` are two independent
+    /// `Box<[u32]>` allocations, so what the wild read hits is a property of
+    /// the heap layout, not of the shader: in the emulator (bases 700 MB
+    /// apart) SIGSEGV; in this test process (bases adjacent) a stray but
+    /// mapped word, which shows up as the CID test answering differently from
+    /// the interpreter. Either outcome fails the test.
+    ///
+    /// Both shader emitters carry the probe, so the line adrmode is covered
+    /// alongside the block one. cid_write_masks_jit already covers the
+    /// RGB-plane half of the same test.
+    #[test]
+    fn jit_cidmatch_aux_plane_matches_interp() {
+        fn aux_pixel(rex: &Rex3, x: i32, y: i32) -> u32 {
+            unsafe { (*rex.fb_aux.get())[(y as u32 * 2048 + x as u32) as usize] }
+        }
+
+        let rex_interp = make_rex3();
+        let rex_jit    = make_rex3_jit();
+        let dst = 20 * 2048 + 10;
+        let mut drew_something = false;
+
+        for planes in [DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID] {
+            let dm1 = planes | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
+            for dm0 in [DM0_DRAW_BLOCK,
+                        DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LINE_SH | DM0_DOSETUP | DM0_STOPONXY] {
+                for mask in [0b0001u32, 0b0100, 0b1010] {
+                    let cm = mask << CLIPMODE_CIDMATCH_SHIFT;
+                    let jit = rex_jit.rex_jit.as_ref().unwrap();
+                    jit.request_compile(dm0, dm1, cm);
+                    assert!(jit.wait_compiled(dm0, dm1, cm),
+                        "JIT compile failed for dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}");
+
+                    for cid in 0..4_u32 {
+                        let seed = 0x80000000 | (cid << 4) | cid;
+                        let run = |rex: &Rex3| -> u32 {
+                            rex3init(rex);
+                            wait(rex);
+                            unsafe { (*rex.fb_aux.get())[dst] = seed; }
+                            reg(rex, REX3_DRAWMODE1, dm1);
+                            reg(rex, REX3_COLORI,    0xFF);
+                            reg(rex, REX3_CLIPMODE,  cm);
+                            reg(rex, REX3_XYSTARTI,  xy(10, 20));
+                            reg(rex, REX3_XYENDI,    xy(10, 20));
+                            reg_go(rex, REX3_DRAWMODE0, dm0);
+                            aux_pixel(rex, 10, 20)
+                        };
+
+                        let before  = rex_jit.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+                        let got_jit = run(rex_jit);
+                        assert_eq!(rex_jit.jit_go_count.load(std::sync::atomic::Ordering::Relaxed) - before, 1,
+                            "GO did not dispatch to the compiled shader: \
+                             dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}");
+
+                        let got_interp = run(rex_interp);
+                        assert_eq!(got_jit, got_interp,
+                            "JIT/interp mismatch: planes={planes} dm0={dm0:#010x} \
+                             CIDMATCH={mask:04b} cid={cid}");
+                        drew_something |= got_interp != seed;
+                    }
+                }
+            }
+        }
+
+        // A permitted CID has to actually write, or every comparison above is
+        // a comparison of two untouched seed values.
+        assert!(drew_something, "no aux-plane write landed — the comparison was vacuous");
+
+        rex_jit.stop();
+        rex_interp.stop();
+    }
 }
 
 // ---------------------------------------------------------------------------
