@@ -418,6 +418,24 @@ pub struct SharedArena {
     /// Monotonic: `try_seal_ready` is the only writer, advancing it by whole
     /// hugepage-sized steps as `sealed_up_to` clears each boundary.
     collapsed_up_to: usize,
+    /// How many `JITModule`s are still using this arena.
+    ///
+    /// The compile pool puts N independent modules on ONE arena (see
+    /// `Codegen::new_with_shared_arena`), and `JITModule::free_memory()`
+    /// forwards straight to `SharedArena::free_memory`. Without a count, the
+    /// first worker to reset its `Codegen` drops the `region::Allocation` out
+    /// from under the other fifteen: their bump-allocated code — and any heap
+    /// block the allocator has since handed out of that address range — is
+    /// silently reused while they are still writing to it.
+    ///
+    /// Observed as a `Vec<(MemHelper, FuncId)>` tearing *between two adjacent
+    /// lines on one thread*: `push(funcid5)` then reading back `funcid32610`
+    /// from `last()`. The eventual symptom is cranelift's "function must be
+    /// compiled before it can be finalized".
+    ///
+    /// Incremented by every provider handle built over this arena, decremented
+    /// by `free_memory`; only the last one out actually frees.
+    users: usize,
     /// The real `BranchProtection` cranelift computed and passed into the
     /// most recent real `finalize()` call (`JITModule::finalize_definitions()`
     /// derives this from the live ISA — BTI on aarch64 when the target
@@ -494,6 +512,9 @@ impl SharedArena {
             sealed_up_to: 0,
             seal_queue: VecDeque::new(),
             collapsed_up_to: 0,
+            // The arena starts with no module attached; each provider handle
+            // registers itself in `new_shared`/`new_with_size`.
+            users: 0,
             last_branch_protection: None,
             last_sealed: Vec::new(),
             state,
@@ -829,6 +850,13 @@ impl SharedArena {
         if self.ptr == ptr::null_mut() {
             return;
         }
+        // N modules can share one arena (the compile pool's whole shape), and
+        // each one's `JITModule::free_memory()` lands here. Only the last one
+        // may actually release the mapping — see `users`.
+        self.users = self.users.saturating_sub(1);
+        if self.users > 0 {
+            return;
+        }
         self.seal_queue.clear();
         let _: Option<region::Allocation> = self.alloc.take();
         self.ptr = ptr::null_mut();
@@ -840,8 +868,15 @@ impl Drop for SharedArena {
         if self.ptr == ptr::null_mut() {
             return;
         }
+        // Deliberately unchanged: a *live* arena (anything already sealed to
+        // RX) is intentionally leaked, because compiled code in it may still
+        // be executing or reachable. Only a never-sealed arena is released
+        // here. The `users` refcount governs the explicit `free_memory` path
+        // (module reset), not this one — reaching Drop at all means the last
+        // `Arc` is gone.
         let is_live = self.sealed_up_to > 0;
         if !is_live {
+            self.users = 0;
             unsafe { self.free_memory() };
         }
     }
@@ -926,6 +961,16 @@ impl PagedArenaMemoryProvider {
     /// See `last_allocation`'s own field doc comment for why this exists.
     pub fn from_shared_with_mailbox(inner: Arc<Mutex<SharedArena>>, mailbox: Arc<Mutex<Option<(usize, usize)>>>) -> Self {
         Self { inner, last_allocation: Some(mailbox) }
+    }
+
+    /// Register this handle as a user of the arena, so `free_memory` knows
+    /// how many modules are still live on it.
+    ///
+    /// Called only for the handle that actually goes inside a `JITModule` —
+    /// that is the one whose `free_memory()` cranelift invokes. Sibling
+    /// handles (`Codegen::seal_handle`) never free, so they must not count.
+    pub fn register_module_user(&self) {
+        self.inner.lock().users += 1;
     }
 
     /// Read-and-clear whatever the most recent `allocate()` call (through

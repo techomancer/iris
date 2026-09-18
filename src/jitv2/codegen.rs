@@ -948,12 +948,19 @@ impl Codegen {
             // nothing to guard — every access calls out to Rust anyway.
             return;
         }
-        let mut built: Vec<(MemHelper, cranelift_module::FuncId)> = Vec::new();
+        // Fixed array, not a Vec: the batch is exactly MEM_HELPER_COUNT
+        // entries, known at compile time, so there is no reason to involve the
+        // heap or to leave a reallocation in the middle of the one loop whose
+        // contents have to be trusted.
+        let mut built: [Option<(MemHelper, cranelift_module::FuncId)>; MEM_HELPER_COUNT] =
+            [None; MEM_HELPER_COUNT];
+        let mut built_n = 0usize;
         let mut high_water = 0usize;
         for helper in MemHelper::all() {
             match self.build_mem_helper(helper) {
                 Some((id, end)) => {
-                    built.push((helper, id));
+                    built[helper.index()] = Some((helper, id));
+                    built_n += 1;
                     high_water = high_water.max(end);
                 }
                 None => {
@@ -963,7 +970,7 @@ impl Codegen {
                 }
             }
         }
-        if built.is_empty() {
+        if built_n == 0 {
             return;
         }
         // Resolve addresses, then seal the prefix these helpers occupy.
@@ -976,13 +983,16 @@ impl Codegen {
             eprintln!("jitv2: finalize_definitions failed for helper batch");
             return;
         }
-        for (helper, id) in &built {
+        // Indexed by `helper.index()`, so a gap (a helper that declined to
+        // build) simply stays `None` rather than shifting everything after it.
+        for entry in built.iter() {
+            let Some((helper, id)) = entry else { continue };
             let addr = self.module.get_finalized_function(*id) as usize;
             self.mem_helpers[helper.index()] = core::num::NonZeroUsize::new(addr);
         }
         self.seal_handle.seal_prefix_no_publish(high_water);
         #[cfg(feature = "developer")]
-        eprintln!("jitv2: built {} memory helpers, sealed prefix to {high_water}", built.len());
+        eprintln!("jitv2: built {built_n} memory helpers, sealed prefix to {high_water}");
     }
 
     /// Compile one helper and reserve its seal-queue range, exactly as

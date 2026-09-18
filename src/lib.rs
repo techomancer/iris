@@ -262,6 +262,7 @@ pub mod jitv2_html_default;
 pub mod jitv2_html_j2wp;
 pub mod jit_feedback;
 pub mod crash_diag;
+pub mod hwwatch;
 
 #[cfg(test)]
 mod platform_profile_tests;
