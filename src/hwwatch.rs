@@ -128,7 +128,11 @@ mod imp {
         }
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = trap_handler as usize;
+            // Via `*const ()` rather than a direct `as usize`: `sa_sigaction` is
+            // a `usize` in libc, but casting a zero-sized function item straight
+            // to an integer is what `function_casts_as_integer` warns about.
+            // Going through a pointer makes the function-pointer decay explicit.
+            sa.sa_sigaction = trap_handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGTRAP, &sa, std::ptr::null_mut());
