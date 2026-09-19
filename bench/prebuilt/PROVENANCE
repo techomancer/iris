@@ -4,6 +4,6 @@
 # CI compares it and fails if the image was not refreshed alongside a
 # source change. The ELF's own hash is informational only — two correct
 # builds of identical source differ, because -g records the build path.
-sources  sha256 83aaf81fbd45b5e6bb783ebf69cc41d53f6236dac44bc0aa3953dcf3acba4378
-image    sha256 7683c7c8a337c03e566880dfa2df883277eebc4c2f509582f5ce62893e873d9c  300952 bytes
+sources  sha256 d7b9e28723311e3c38fd79ff7d0779f2576daaa5ce8cea775c23fb284409f5e0
+image    sha256 b1f59210b8b5c2d6c1650d4477e8a9ebe1d0d47ad4e05e6606c5fc38e3bdea6d  309540 bytes
 inputs   32 files
