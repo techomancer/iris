@@ -98,6 +98,13 @@ pub struct Machine {
     newport_active: bool,
     /// Indigo2 IP22 fullhouse layout (`!guinness`).
     fullhouse: bool,
+    /// Pointer slot shared by every holder of a raw `*mut Machine` — the
+    /// monitor's `SystemController`, the `machine-events` thread and the CI
+    /// server. Created on first use by `machine_slot` and nulled in `Drop`, so
+    /// a handle that outlives this Machine sees "machine is not running"
+    /// instead of freed memory.
+    controller_slot: Option<MachineSlot>,
+    controller_registered: bool,
 }
 
 /// In-memory snapshot of the just-restored guest state. Populated at the end
@@ -927,6 +934,8 @@ impl Machine {
             display_resolution,
             newport_active,
             fullhouse: !guinness,
+            controller_slot: None,
+            controller_registered: false,
         }
     }
 
@@ -1002,18 +1011,30 @@ impl Machine {
         }
     }
 
+    /// The shared, nullable pointer slot for this Machine, created on first
+    /// use. Must be called while `self` is in its final location (boxed, or on
+    /// `main`'s stack) — the slot records this address.
+    pub(crate) fn machine_slot(&mut self) -> MachineSlot {
+        let ptr = self as *mut Machine;
+        let slot = self.controller_slot
+            .get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr))));
+        debug_assert_eq!(slot.lock().0, ptr, "Machine moved after its slot was handed out");
+        slot.clone()
+    }
+
     /// Register a SystemController with the monitor so that `reset`, `save`,
     /// and `load` commands work. Must be called after `Machine::new()` while
     /// `self` is in its final stack location (i.e. before any moves).
     /// Also starts the machine event dispatch thread (HardReset, PowerOff).
     pub fn register_system_controller(&mut self) {
-        // SAFETY: Machine lives for the entire process lifetime (stack in main).
+        // The controller and the event thread reach this Machine through the
+        // shared slot, which `Drop` nulls: iris-gui drops a Machine on Stop
+        // while the monitor thread (and a connected client) lives on.
         // SystemController stops all threads before mutating machine state.
-        // The monitor serializes connections via its devices Mutex.
-        let ptr = self as *const Machine as *mut Machine;
-        let machine_arc = Arc::new(Mutex::new(ptr));
+        assert!(!self.controller_registered, "register_system_controller called twice");
+        self.controller_registered = true;
         let ctrl = Arc::new(SystemController {
-            machine: machine_arc.clone(),
+            machine: self.machine_slot(),
         });
         // We need interior mutability to register after construction.
         // Monitor::register_device takes &mut self, so we use unsafe to call it.
@@ -2029,23 +2050,56 @@ impl Machine {
 
 // ---- SystemController — registers reset/save/load with the monitor ----
 
+/// A raw pointer to a live `Machine`, or null once that Machine is dropped.
+pub(crate) struct MachineRef(*mut Machine);
+
+// SAFETY: only dereferenced under the slot's Mutex, while non-null; `Drop for
+// Machine` nulls it under that same Mutex before any field is torn down.
+unsafe impl Send for MachineRef {}
+unsafe impl Sync for MachineRef {}
+
+pub(crate) type MachineSlot = Arc<Mutex<MachineRef>>;
+
+/// Run `f` against the Machine behind `slot`, or fail if it has been dropped.
+pub(crate) fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
+    let guard = slot.lock();
+    let ptr = guard.0;
+    if ptr.is_null() {
+        return Err("machine is not running".to_string());
+    }
+    // SAFETY: non-null only while the Machine is alive. Drop nulls it while
+    // holding this lock, and `guard` is held until `f` returns, so the Machine
+    // cannot be freed while `f` runs.
+    let result = f(unsafe { &mut *ptr });
+    drop(guard);
+    Ok(result)
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        // Runs before any field is dropped. Taking the lock waits for an
+        // in-flight monitor/event/CI command to finish, so none of them can see
+        // a half-destroyed Machine. No controller command drops the Machine, so
+        // this never waits on a lock its own thread holds.
+        if let Some(slot) = self.controller_slot.take() {
+            slot.lock().0 = std::ptr::null_mut();
+        }
+        // Release port 8888 and this Machine's device handles, so the next
+        // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
+        self.monitor.shutdown();
+    }
+}
+
 /// A thin monitor device that wraps the machine behind a Mutex so the monitor
 /// thread can issue system-level commands (reset, save, load).
 pub struct SystemController {
-    machine: Arc<Mutex<*mut Machine>>,
+    machine: MachineSlot,
 }
 
-// SAFETY: Machine is only accessed from the monitor thread (one connection at
-// a time, serialized) and all CPU/peripheral threads are stopped before any
-// state mutation in reset/save/load.
-unsafe impl Send for SystemController {}
-unsafe impl Sync for SystemController {}
 
 impl SystemController {
     fn with_machine<F: FnOnce(&mut Machine) -> Result<(), String>>(&self, f: F) -> Result<(), String> {
-        let mut guard = self.machine.lock();
-        let machine = unsafe { &mut **guard };
-        f(machine)
+        with_machine_slot(&self.machine, f)?
     }
 }
 
@@ -2134,6 +2188,37 @@ impl Device for SystemController {
                 })
             }
             _ => Err(format!("Unknown command: {}", cmd)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod controller_lifetime_tests {
+    use super::*;
+
+    fn build_machine() -> Box<Machine> {
+        // Machine::new needs more stack than a test thread has (see main.rs).
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| Box::new(Machine::new(crate::bench_runner::bench_config(
+                [16, 0, 0, 0], crate::config::CpuModel::default()))))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// iris-gui drops a Machine on Stop while the monitor keeps its
+    /// SystemController. Every command through that controller afterwards used
+    /// to dereference freed memory (SIGSEGV in `save_snapshot`).
+    #[test]
+    fn controller_outliving_its_machine_reports_not_running() {
+        let mut machine = build_machine();
+        machine.register_system_controller();
+        let ctrl = SystemController { machine: machine.machine_slot() };
+        drop(machine);
+        for (cmd, args) in [("save", &["crashtest"][..]), ("reset", &[][..]), ("machine-stop", &[][..])] {
+            let err = ctrl.execute_command(cmd, args, Box::new(std::io::sink())).unwrap_err();
+            assert_eq!(err, "machine is not running", "{cmd}");
         }
     }
 }

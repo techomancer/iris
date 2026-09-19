@@ -55,16 +55,12 @@ impl Response {
 // Server
 // ----------------------------------------------------------------------------
 
-/// Holder for the raw `*mut Machine` passed in from `main`. The pointer is
-/// valid for the process lifetime because `Machine` lives on main's stack.
-/// Mirrors the `SystemController` pattern in `machine.rs`.
-struct MachinePtr(*mut Machine);
-unsafe impl Send for MachinePtr {}
-unsafe impl Sync for MachinePtr {}
-
 pub struct CiServer {
     socket_path: String,
-    machine: Arc<Mutex<MachinePtr>>,
+    /// The Machine's shared pointer slot (see `Machine::machine_slot`): the
+    /// same one the monitor's SystemController uses, nulled when the Machine
+    /// is dropped, so a CI command can never reach a freed Machine.
+    machine: crate::machine::MachineSlot,
     ci_serial: Arc<CiSerialBackend>,
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
@@ -87,23 +83,30 @@ fn cleanup_socket_path(path: &str) {
 }
 
 impl CiServer {
-    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> R) -> R {
-        let mut guard = self.machine.lock();
-        // SAFETY: pointer is valid for process lifetime; this mutex serializes
-        // all Machine accesses from CI command handlers. CPU/peripheral threads
-        // observe state changes only when the methods we call stop them first
-        // (ci_restore/ci_rollback do).
-        let machine = unsafe { &mut *(guard.0) };
-        f(machine)
+    /// Run `f` against the Machine, or fail if it has been dropped. The slot's
+    /// mutex serializes all Machine accesses from CI command handlers.
+    /// CPU/peripheral threads observe state changes only when the methods we
+    /// call stop them first (ci_restore/ci_rollback do).
+    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
+        crate::machine::with_machine_slot(&self.machine, f)
+    }
+
+    /// `with_machine` for a fallible closure, flattening both failures into
+    /// the message the command reports.
+    fn with_machine_result<T, E: std::fmt::Display>(
+        &self,
+        f: impl FnOnce(&mut Machine) -> Result<T, E>,
+    ) -> Result<T, String> {
+        self.with_machine(f)?.map_err(|e| e.to_string())
     }
 }
 
 /// Bind the control socket, spawn the accept thread, return a handle.
 ///
 /// # Safety
-/// `machine_ptr` must remain valid for the process lifetime. Pass the address
-/// of a `Machine` owned by `main`'s stack (or a heap-pinned Box that `main`
-/// keeps alive).
+/// `machine_ptr` must point to a live `Machine` in its final location (boxed,
+/// or on `main`'s stack). The server reaches it only through the Machine's
+/// shared slot afterwards, so it may be dropped while the server runs.
 pub fn start_server(
     machine_ptr: *mut Machine,
     socket_path: &str,
@@ -117,7 +120,7 @@ pub fn start_server(
     let path = socket_path.to_string();
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
-        machine: Arc::new(Mutex::new(MachinePtr(machine_ptr))),
+        machine: unsafe { (*machine_ptr).machine_slot() },
         ci_serial,
         rex3,
         rex3_head1,
@@ -284,7 +287,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
 
 fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
     let explicit_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let result = server.with_machine(|m| {
+    let result = server.with_machine_result(|m| {
         let rtc = m.hpc3().rtc();
         let path = explicit_path.clone().unwrap_or_else(|| rtc.nvram_path().to_string());
         rtc.save_nvram(&path).map(|_| path)
@@ -300,7 +303,7 @@ fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
         Some(n) => n as usize,
         None => return Response::err("cdrom-eject: missing 'id' arg"),
     };
-    let result = server.with_machine(|m| {
+    let result = server.with_machine_result(|m| {
         m.hpc3().scsi().eject_disc(id)
     });
     match result {
@@ -318,7 +321,7 @@ fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
         Some(p) => p.to_string(),
         None => return Response::err("cdrom-load: missing 'path' arg"),
     };
-    let result = server.with_machine(|m| {
+    let result = server.with_machine_result(|m| {
         m.hpc3().scsi().load_disc(id, path.clone())
     });
     match result {
@@ -346,11 +349,13 @@ fn cmd_chd_sync(server: &CiServer, args: &Value) -> Response {
         Ok(v) => v,
         Err(e) => return Response::err(e),
     };
-    if server.with_machine(|m| m.cpu_is_running()) {
-        return Response::err("CPU is running — stop the guest first \
-                              (folding releases the disk backend)");
+    match server.with_machine(|m| m.cpu_is_running()) {
+        Ok(false) => {}
+        Ok(true) => return Response::err("CPU is running — stop the guest first \
+                              (folding releases the disk backend)"),
+        Err(e) => return Response::err(e),
     }
-    match server.with_machine(|m| m.sync_chd_disks(only, &mut |_, _, _| {}, &|| false)) {
+    match server.with_machine_result(|m| m.sync_chd_disks(only, &mut |_, _, _| {}, &|| false)) {
         Ok(n) => Response::data(serde_json::json!({ "synced": n })),
         Err(e) => Response::err(e.to_string()),
     }
@@ -365,7 +370,7 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
             Ok(v) => v,
             Err(e) => return Response::err(e),
         };
-        let r = server.with_machine(|m| {
+        let r = server.with_machine_result(|m| {
             m.stop();
             m.sync_chd_disks(only, &mut |_, _, _| {}, &|| false)
         });
@@ -391,8 +396,10 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
 }
 
 fn cmd_start(server: &CiServer) -> Response {
-    server.with_machine(|m| m.cpu_start());
-    Response::ok()
+    match server.with_machine(|m| m.cpu_start()) {
+        Ok(()) => Response::ok(),
+        Err(e) => Response::err(e),
+    }
 }
 
 fn cmd_save(server: &CiServer, args: &Value) -> Response {
@@ -400,7 +407,7 @@ fn cmd_save(server: &CiServer, args: &Value) -> Response {
         Some(n) => n.to_string(),
         None => return Response::err("save: missing 'name' arg"),
     };
-    match server.with_machine(|m| m.save_snapshot(&name)) {
+    match server.with_machine_result(|m| m.save_snapshot(&name)) {
         Ok(()) => Response::ok(),
         Err(e) => Response::err(format!("save failed: {}", e)),
     }
@@ -411,14 +418,14 @@ fn cmd_restore(server: &CiServer, args: &Value) -> Response {
         Some(n) => n.to_string(),
         None => return Response::err("restore: missing 'name' arg"),
     };
-    match server.with_machine(|m| m.ci_restore(&name)) {
+    match server.with_machine_result(|m| m.ci_restore(&name)) {
         Ok(()) => Response::ok(),
         Err(e) => Response::err(format!("restore failed: {}", e)),
     }
 }
 
 fn cmd_rollback(server: &CiServer) -> Response {
-    match server.with_machine(|m| m.ci_rollback()) {
+    match server.with_machine_result(|m| m.ci_rollback()) {
         Ok(()) => Response::ok(),
         Err(e) => Response::err(format!("rollback failed: {}", e)),
     }
@@ -690,7 +697,7 @@ fn cmd_scratch_write(server: &CiServer, args: &Value) -> Response {
         Err(e) => return Response::err(format!("scratch-write: read {}: {}", host_path.display(), e)),
     };
 
-    let result = server.with_machine(|m| {
+    let result = server.with_machine_result(|m| {
         let scratch = match m.scratch_path() {
             Some(p) => p.to_path_buf(),
             None => return Err("scratch volume not configured (set `scratch = true` on a SCSI device in iris.toml)".to_string()),
@@ -732,7 +739,7 @@ fn cmd_scratch_read(server: &CiServer, args: &Value) -> Response {
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
     let length = args.get("length").and_then(|v| v.as_u64());
 
-    let result = server.with_machine(|m| {
+    let result = server.with_machine_result(|m| {
         let scratch = match m.scratch_path() {
             Some(p) => p.to_path_buf(),
             None => return Err("scratch volume not configured (set `scratch = true` on a SCSI device in iris.toml)".to_string()),
@@ -769,7 +776,7 @@ fn cmd_scratch_read(server: &CiServer, args: &Value) -> Response {
 }
 
 fn cmd_scratch_clear(server: &CiServer) -> Response {
-    let result = server.with_machine(|m| {
+    let result = server.with_machine_result(|m| {
         let scratch = match m.scratch_path() {
             Some(p) => p.to_path_buf(),
             None => return Err("scratch volume not configured".to_string()),
@@ -804,7 +811,10 @@ fn cmd_scratch_clear(server: &CiServer) -> Response {
 }
 
 fn cmd_scratch_info(server: &CiServer) -> Response {
-    let path = server.with_machine(|m| m.scratch_path().map(|p| p.to_path_buf()));
+    let path = match server.with_machine(|m| m.scratch_path().map(|p| p.to_path_buf())) {
+        Ok(path) => path,
+        Err(e) => return Response::err(format!("scratch-info: {e}")),
+    };
     let Some(path) = path else {
         return Response::err("scratch-info: scratch volume not configured");
     };
@@ -831,7 +841,7 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
         .and_then(|v| v.as_u64())
         .unwrap_or(1_000_000);
 
-    let report_result = server.with_machine(|m| {
+    let report_result = server.with_machine_result(|m| {
         crate::validate::validate_snapshot_determinism(m, &name, n)
     });
 
