@@ -11079,11 +11079,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         match signal {
             Signal::Reset(_soft) => {
                 interrupts.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
+                #[cfg(feature = "idle-pause")]
+                crate::idle_park::wake();
             }
             Signal::Interrupt(line, active) => {
                 let mask = 1u64 << (line + 8);
                 if active {
                     interrupts.fetch_or(mask, Ordering::SeqCst);
+                    #[cfg(feature = "idle-pause")]
+                    crate::idle_park::wake();
                 } else {
                     interrupts.fetch_and(!mask, Ordering::SeqCst);
                 }

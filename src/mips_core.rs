@@ -82,6 +82,8 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
         .is_ok()
     {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        #[cfg(feature = "idle-pause")]
+        crate::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -2109,6 +2111,8 @@ impl MipsCore {
     #[inline]
     pub fn set_interrupt(&self, bit: u8) {
         self.hot.interrupts.fetch_or(1u64 << (bit + 8), Ordering::SeqCst);
+        #[cfg(feature = "idle-pause")]
+        crate::idle_park::wake();
     }
 
     /// Clear interrupt bit

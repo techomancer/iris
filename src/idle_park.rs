@@ -12,6 +12,27 @@ use crate::mips_core::MipsCore;
 const IDLE_RING: usize = 32;
 const SLICE_NS: u64 = 1_000_000;
 
+/// The CPU thread while it is parked in [`IdleParkState::park`], so an
+/// interrupt source can wake it at once instead of leaving it to notice on its
+/// next slice. There is one CPU thread, so one slot.
+static PARKER: parking_lot::Mutex<Option<std::thread::Thread>> = parking_lot::const_mutex(None);
+/// Set while the CPU thread is between its last look at the pending word and
+/// its sleep. Paired with the writers' order (set the bit, then read this) so
+/// a wakeup cannot be lost.
+static PARKED: AtomicBool = AtomicBool::new(false);
+
+/// Wake the parked CPU thread, if it is parked. Call after setting a bit in
+/// `hot.interrupts` from any thread; one relaxed-cost atomic load when the CPU
+/// is running.
+#[inline]
+pub fn wake() {
+    if PARKED.load(Ordering::SeqCst) {
+        if let Some(t) = PARKER.lock().as_ref() {
+            t.unpark();
+        }
+    }
+}
+
 /// Tracks recent architectural-state hashes to detect polling idle loops.
 #[derive(Default)]
 pub struct IdleParkState {
@@ -86,11 +107,16 @@ impl IdleParkState {
             return;
         }
 
+        *PARKER.lock() = Some(std::thread::current());
         loop {
             if !running.load(Ordering::Relaxed) {
                 break;
             }
-            let pending = core.hot.interrupts.load(Ordering::Relaxed) as u32;
+            // Announce the park before the last look at the pending word: a
+            // writer sets its bit and then reads PARKED, so either we see the
+            // bit here or the writer sees PARKED and unparks us.
+            PARKED.store(true, Ordering::SeqCst);
+            let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
             let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
             let im = core.cp0_status & STATUS_IM_MASK;
             if (ip & im) != 0 {
@@ -104,10 +130,15 @@ impl IdleParkState {
             }
 
             let t0 = Instant::now();
-            std::thread::sleep(Duration::from_nanos(SLICE_NS));
+            // Still a bounded slice — `running` and the ci_clock threshold are
+            // only polled — but an interrupt now ends it at once.
+            std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
         }
+        // Every exit, including the ci_clock one, leaves the flag clear: a
+        // stale `true` would put `wake` on the mutex for a running CPU.
+        PARKED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -146,5 +177,77 @@ mod tests {
         // be delivered, so the wait `park` performs can never end.
         let (mut st, core) = repeated_idle_state(STATUS_IE);
         assert!(!st.update(&core), "IM == 0 makes park's wake condition unsatisfiable");
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    use crate::mips_core::{MipsCore, CAUSE_IP7, STATUS_IE, STATUS_IM_SHIFT};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    /// `park` holds `&mut MipsCore`; the interrupt writers reach the same word
+    /// through `MipsCpu::interrupts_ptr`, which is what this models.
+    struct InterruptsPtr(*const AtomicU64);
+    unsafe impl Send for InterruptsPtr {}
+
+    /// Time from an interrupt bit being set on another thread to `park`
+    /// returning on the CPU thread. `raise_after` picks where in a slice the
+    /// interrupt lands.
+    fn delivery_latency(raise_after: Duration) -> Duration {
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        core.cp0_compare = 1; // park returns immediately while this is zero
+        let ptr = InterruptsPtr(&core.hot.interrupts as *const AtomicU64);
+        let running = Arc::new(AtomicBool::new(true));
+        let raised = Arc::new(parking_lot::Mutex::new(None::<Instant>));
+        let raised_tx = raised.clone();
+
+        let raiser = std::thread::spawn(move || {
+            let p = ptr;
+            std::thread::sleep(raise_after);
+            *raised_tx.lock() = Some(Instant::now());
+            unsafe { &*p.0 }.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+            wake();
+        });
+
+        let st = IdleParkState::default();
+        st.park(&mut core, &running);
+        let returned = Instant::now();
+        raiser.join().unwrap();
+        let at = raised.lock().expect("raiser set the bit");
+        returned - at
+    }
+
+    /// One pass over the slice. Sweeping matters: a single sample can be fast
+    /// by luck, on an interrupt that landed just before a slice boundary.
+    fn worst_over_a_slice() -> Duration {
+        (0..5)
+            .map(|i| delivery_latency(Duration::from_micros(2_100 + i * 200)))
+            .max()
+            .unwrap()
+    }
+
+    #[test]
+    fn an_interrupt_ends_the_park_without_waiting_out_the_slice() {
+        // Without `wake` every sweep contains a phase that waits out most of a
+        // slice, so no number of retries makes this pass; with it, each phase
+        // costs a thread wakeup (~6 us here). The retries are only so a
+        // scheduling stall on a loaded CI runner does not fail the build.
+        const LIMIT: Duration = Duration::from_micros(300);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let worst = worst_over_a_slice();
+            if worst < LIMIT {
+                return;
+            }
+            seen.push(worst);
+        }
+        panic!(
+            "worst-phase latency {seen:?} over 3 sweeps, all above {LIMIT:?}; \
+             a slice is {:?}",
+            Duration::from_nanos(SLICE_NS)
+        );
     }
 }

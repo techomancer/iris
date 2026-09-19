@@ -1102,6 +1102,8 @@ impl IocState {
 
             if set_mask != 0 {
                 interrupts.fetch_or(set_mask, Ordering::SeqCst);
+                #[cfg(feature = "idle-pause")]
+                crate::idle_park::wake();
             }
             if clear_mask != 0 {
                 interrupts.fetch_and(!clear_mask, Ordering::SeqCst);
