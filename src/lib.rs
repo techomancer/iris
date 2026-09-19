@@ -174,6 +174,7 @@ pub mod mem;
 #[cfg(feature = "ppmem")]
 pub mod ppmem;
 pub mod mc;
+pub mod mc_vdma;
 pub mod machine;
 pub mod eeprom_93c56;
 pub mod platform;

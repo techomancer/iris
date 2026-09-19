@@ -928,9 +928,19 @@ fn emit_shader(
     // Apply swapendian at shader entry if needed (compile-time constant from dm1).
     let host_shifter_init: Value = if is_hostw {
         let raw = {
-            let hi = b.ins().load(types::I64, mem, ctx_ptr,
-                ir::immediates::Offset32::new(ctx_off!(hostrw) as i32));
-            hi
+            // Address the slot the cursor points at, not element 0. For the
+            // resting PIO state (host_len == 1) this is element 0, exactly as
+            // before; for a batch it walks the array like the interpreter.
+            //
+            // Advance immediately after the load, mirroring
+            // `fetch_host_pixel`'s `hostrw_get()` + `hostrw_advance()` pair.
+            // The shader consumes exactly one word per call, so the step
+            // belongs here: without it every call re-reads the same slot and a
+            // multi-row upload paints row 0's pixels into every row.
+            let slot = emit_hostrw_slot_ptr(&mut b, ctx_ptr, &mem);
+            let word = b.ins().load(types::I64, mem, slot, ir::immediates::Offset32::new(0));
+            emit_hostrw_advance(&mut b, ctx_ptr, &mem);
+            word
         };
         if dm1.swapendian() {
             if dm1.rwdouble() {
@@ -3099,6 +3109,74 @@ fn emit_pack_host_pixel_ir(
     }
 }
 
+/// Emit IR computing `&ctx.hostrw[ctx.hostrw_index()]`.
+///
+/// Mirrors `Rex3Context::hostrw_index` bit for bit:
+///
+/// ```ignore
+/// let last = host_len.saturating_sub(1);
+/// host_cursor.min(last).min(HOSTRW_BUF_QWORDS - 1)
+/// ```
+///
+/// The clamps are not decoration. `host_len == 0` would otherwise underflow to
+/// `u32::MAX`, and an out-of-range cursor would index past a 1 MiB array — in
+/// generated code that is an out-of-bounds write with no bounds check behind
+/// it, so the JIT must clamp exactly where the interpreter does.
+///
+/// For the resting PIO state (`host_len == 1`) this always yields element 0,
+/// which is what the shader used to address by fixed offset.
+fn emit_hostrw_slot_ptr(
+    b:       &mut FunctionBuilder,
+    ctx_ptr: Value,
+    mem:     &MemFlagsData,
+) -> Value {
+    let host_len = b.ins().load(types::I32, *mem, ctx_ptr,
+        ir::immediates::Offset32::new(ctx_off!(host_len)));
+    let host_cursor = b.ins().load(types::I32, *mem, ctx_ptr,
+        ir::immediates::Offset32::new(ctx_off!(host_cursor)));
+
+    // last = host_len.saturating_sub(1)
+    let one = b.ins().iconst(types::I32, 1);
+    let dec = b.ins().isub(host_len, one);
+    let is_zero = b.ins().icmp_imm_s(IntCC::Equal, host_len, 0);
+    let zero = b.ins().iconst(types::I32, 0);
+    let last = b.ins().select(is_zero, zero, dec);
+
+    // idx = min(cursor, last, HOSTRW_BUF_QWORDS - 1)
+    let idx = b.ins().umin(host_cursor, last);
+    let cap = b.ins().iconst(types::I32, (crate::rex3::HOSTRW_BUF_QWORDS - 1) as i64);
+    let idx = b.ins().umin(idx, cap);
+
+    // &hostrw[idx] = ctx + offset_of(hostrw) + idx * 8
+    let idx64 = b.ins().uextend(types::I64, idx);
+    let byte_off = b.ins().ishl_imm_s(idx64, 3);
+    let arr = b.ins().iadd_imm_s(ctx_ptr, ctx_off!(hostrw) as i64);
+    b.ins().iadd(arr, byte_off)
+}
+
+/// Emit IR for `Rex3Context::hostrw_advance`: step the cursor, saturating at
+/// `host_len`.
+///
+/// Without this the shader would re-read or overwrite the same slot for every
+/// word of a batch — which is precisely why batched transfers had to bypass the
+/// JIT entirely.
+fn emit_hostrw_advance(
+    b:       &mut FunctionBuilder,
+    ctx_ptr: Value,
+    mem:     &MemFlagsData,
+) {
+    let host_len = b.ins().load(types::I32, *mem, ctx_ptr,
+        ir::immediates::Offset32::new(ctx_off!(host_len)));
+    let host_cursor = b.ins().load(types::I32, *mem, ctx_ptr,
+        ir::immediates::Offset32::new(ctx_off!(host_cursor)));
+    let one = b.ins().iconst(types::I32, 1);
+    let next = b.ins().iadd(host_cursor, one);
+    let below = b.ins().icmp(IntCC::UnsignedLessThan, host_cursor, host_len);
+    let stepped = b.ins().select(below, next, host_cursor);
+    b.ins().store(*mem, stepped, ctx_ptr,
+        ir::immediates::Offset32::new(ctx_off!(host_cursor)));
+}
+
 /// Emit IR to apply send_host_word semantics and store to ctx.hostrw.
 /// Mirrors Rex3::send_host_word: if swapendian → swap_bytes; else if !rwdouble → shift left 32.
 /// Used at loop exit for HOSTR mode.
@@ -3117,6 +3195,10 @@ fn emit_store_hostrw(
     } else {
         shifter
     };
-    b.ins().store(*mem, val, ctx_ptr,
-        ir::immediates::Offset32::new(ctx_off!(hostrw) as i32));
+    // Write into the cursor's slot and step it, mirroring the interpreter's
+    // `hostrw_set` + `hostrw_advance` pair in `send_host_word`. A multi-word
+    // readback fills the array; host_len == 1 keeps writing element 0.
+    let slot = emit_hostrw_slot_ptr(b, ctx_ptr, mem);
+    b.ins().store(*mem, val, slot, ir::immediates::Offset32::new(0));
+    emit_hostrw_advance(b, ctx_ptr, mem);
 }

@@ -1163,13 +1163,30 @@ fn host_pack<M: Mode>(m: &M, acc: u64, pixel: u32) -> u64 {
     }
 }
 
+/// Has the current transfer been fully consumed?
+///
+/// Host mode stops after one *word* per GO on real hardware, because the CPU
+/// feeds HOSTRW one word at a time and each write carries its own GO. With the
+/// port as an array the rule generalises to "one *transfer* per GO": the
+/// walker keeps going while `host_cursor` has not reached `host_len`. A PIO
+/// write is `host_len == 1`, which reproduces one-word-per-GO exactly.
+#[inline(always)]
+fn host_batch_drained(ctx: &Rex3Context) -> bool {
+    ctx.hostrw_drained()
+}
+
 /// Pull one pixel from the HOSTRW FIFO, refilling the shifter when empty.
 #[inline(always)]
 pub fn fetch_host_pixel<M: Mode>(ctx: &mut Rex3Context, m: &M) -> u32 {
     if ctx.hostcnt == 0 {
+        // Load the word at the cursor, then step past it. For a single-word
+        // PIO access (host_len == 1) the step is a no-op and the cursor stays
+        // on element 0, exactly as the scalar port behaved; for a longer
+        // transfer it walks the array.
         // 32-bit writes land in the high half [63:32] via HOSTRW0, so the data
         // is already at the MSB.
-        ctx.host_shifter = ctx.hostrw;
+        ctx.host_shifter = ctx.hostrw_get();
+        ctx.hostrw_advance();
         if m.swapendian() != 0 {
             ctx.host_shifter = if m.rwdouble() != 0 {
                 ctx.host_shifter.swap_bytes()
@@ -1189,6 +1206,10 @@ pub fn fetch_host_pixel<M: Mode>(ctx: &mut Rex3Context, m: &M) -> u32 {
 }
 
 /// Publish the assembled shifter back to HOSTRW for the CPU to read.
+///
+/// Writes into `hostrw[host_cursor]` and steps, so a multi-word read fills
+/// the array and is available after one pipeline drain instead of one per
+/// qword. For `host_len == 1` the cursor stays on element 0.
 #[inline(always)]
 fn send_host_word<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     let mut val = ctx.host_shifter;
@@ -1197,7 +1218,10 @@ fn send_host_word<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     } else if m.rwdouble() == 0 {
         val <<= 32;
     }
-    ctx.hostrw = val;
+    ctx.hostrw_set(val);
+    // Step so the next word lands in the next slot. For host_len == 1 the
+    // cursor stays put and the CPU reads element 0, as before.
+    ctx.hostrw_advance();
 }
 
 /// Append one pixel to the host word, publishing when it fills.
@@ -1440,6 +1464,10 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
             // full or not. Checked here (not just via the hostcnt==0 check
             // below) because that check alone never fires for a word that
             // never reaches host_count pixels.
+            // Unconditional: a partial word at a row boundary must be sent
+            // even mid-transfer. Gating this on the transfer being drained
+            // merges the partial word into the next row, which is exactly the
+            // divergence the JIT/interpreter HOSTR stress test catches.
             if stop_on_word && ctx.hostcnt > 0 {
                 break;
             }
@@ -1454,7 +1482,10 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
 
         // Host mode: stop after one word (after y-advance so row boundary is handled first).
         // Primitive continues on next GO — mid_primitive stays true.
-        if stop_on_word && ctx.hostcnt == 0 {
+        // A multi-word transfer carries N words behind one GO, so it keeps
+        // going until the array is drained. For host_len == 1 that is after a
+        // single word, which is exactly the old one-word-per-GO rule.
+        if stop_on_word && ctx.hostcnt == 0 && host_batch_drained(ctx) {
             break;
         }
 
@@ -1532,7 +1563,8 @@ pub fn draw_span_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
 
         // Host mode: stop after one word.
         // Primitive continues on next GO — mid_primitive stays true.
-        if stop_on_word && ctx.hostcnt == 0 {
+        // See the block walker: a batch runs to completion under one GO.
+        if stop_on_word && ctx.hostcnt == 0 && host_batch_drained(ctx) {
             break false;
         }
 

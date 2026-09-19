@@ -1,6 +1,9 @@
 # Batched HOSTRW / VDMA — design sketch
 
-Not built. Written while the analysis is fresh.
+**Status: built** (bulk trait methods + REX3 batch tokens + MC staging buffer).
+Two things landed differently from this sketch — see "What actually got built"
+at the bottom. The cost analysis below is the pre-batching baseline, kept
+because it is what motivated the design; it has not been re-measured since.
 
 ## What it costs today
 
@@ -126,3 +129,99 @@ The current `dma_loop` interleaves address translation, byte packing, direction
 handling, zoom/stride bookkeeping and BUS_BUSY spinning in one nest. Batching
 splits it: translate a run, hand a slice to the device, advance. The zoom/stride
 logic stays, but it stops being tangled with per-byte bus access.
+
+
+## What actually got built
+
+Implemented across four layers.
+
+- `traits.rs`: `dma_write64_bulk` / `dma_read64_bulk` beside the scalar pair.
+  Defaults are scalar loops, so other devices are unaffected. `BUS_ERR` means
+  "not batchable here, use scalar" and the MC path falls back on it.
+  `physical.rs` forwards both — otherwise the default loop runs against
+  `Physical` and the device's own override never sees the slice.
+- `rex3.rs`: **`Rex3Context::hostrw` is now an array**, `HOSTRW_BUF_QWORDS`
+  (131072) u64s = 1 MiB, inline in the context. Not a pointer, not a separate
+  buffer on `Rex3`: the port itself is the array, it always exists, and it can
+  never be null. `host_cursor` picks the element and `host_len` is the count.
+  `REX3_DMA_BATCH_W` / `REX3_DMA_BATCH_R` tokens, plus `GFIFO_PAYLOAD`.
+- `rex3_generic.rs`: `fetch_host_pixel` / `send_host_word` index
+  `hostrw[host_cursor]` and step.
+- `mc_vdma.rs`: `VDMA_CHUNK_QWORDS` (32768) staging buffer; the flat 64-bit
+  paths gather/scatter through it. Chunking is unavoidable at any buffer size,
+  so the sizes trade round trips against footprint, nothing more.
+
+### The count is the only thing that distinguishes a batch
+
+`host_len` defaults to **1**, set by `power_on_default` and re-armed by every
+PIO register write (`hostrw_arm_single`) and at the end of `execute_go`. A batch
+token sets it to the transfer size. Nothing downstream branches on "is this a
+batch" — there is only a count, which is the point of making the port an array.
+
+Corollaries that bit during implementation:
+
+- The walkers' "one word per GO" stop became "one *transfer* per GO"
+  (`hostrw_drained()`). At `host_len == 1` that is true after one word, exactly
+  the old rule.
+- **The row-boundary flush stayed unconditional.** Applying the same drained
+  guard there merges each row's partial word into the next row. See
+  `rules/rex3/hostrw-row-boundary-forces-a-word-flush.md`.
+- The JIT bypass is `host_len > 1`, not `> 0`. Gating on `> 0` disables the JIT
+  for *every* draw, since 1 is the resting state — caught by
+  `cid_write_masks_jit` asserting `jit_go_count == 768` and getting 0.
+
+### Payload travels through the GFIFO
+
+`dma_write64_bulk` pushes the token and then one GFIFO entry per payload word,
+all under one producer lock with a single Release on tail (`GFifo::push_batch`).
+The register processor's `REX3_DMA_BATCH_W` arm calls `drain_payload`, which
+streams those entries straight into `ctx.hostrw[]`.
+
+Keeping the payload *in the queue* rather than writing the array behind the
+queue's back is what orders the transfer correctly against concurrent CPU
+register writes: the words arrive in the stream at the point the producer put
+them. `push_batch` checks capacity for token + payload before writing any slot,
+so it is all-or-nothing like `try_push2`.
+
+`drain_payload` must step over the token first — the consumer loop `peek`s and
+only `consume()`s after `process_register` returns, so `local_head` still points
+at the token. It then rewinds one so the caller's `consume()` retires the last
+payload entry, making the total head advance exactly `1 + taken`.
+
+### The array must be the last field in `Rex3Context`
+
+`repr(C)` lays fields out in declaration order, and the JIT addresses every
+scalar by `offset_of!` as a Cranelift `Offset32`. With a megabyte mid-struct,
+every field after it lands at a ~1 MB offset. Keep `hostrw` last.
+
+### Stacks had to grow
+
+`Rex3Context` is `Copy` and construction moves it through temporaries, so a
+1 MiB member overflows the old stacks. Raised to 64 MiB in `main.rs`,
+`bench_runner.rs` and both `rex3_tests.rs` construction helpers (the GUI already
+used 64 MiB for this reason). Virtual address space, lazily committed.
+
+### Batched draws bypass the JIT
+
+Compiled shaders address `hostrw[0]` by fixed offset and never step the cursor,
+so a multi-word transfer would consume one word and repeat it. `execute_go`
+forces the interpreter when `host_len > 1`. A correctness guard, not a design
+choice, and it caps the win: the batched path is the slower engine until
+`emit_store_hostrw` and the shader-entry load learn to walk the array.
+
+### Still not done
+
+- **Per-page TLB translation.** The staging loops translate once per qword; the
+  generic byte engine still does it once per *byte*. See
+  `rules/irix/vdma-transfers-are-always-translated.md`.
+- **Measurement.** No before/after numbers taken. The table at the top is the
+  pre-batching baseline and one of its terms (`wait_idle`) was never measured.
+
+### Tests
+
+`rex3_tests.rs`: `test_hostw_batch_matches_scalar_writes` (multi-word write
+equivalence — this is the one that caught the one-word-per-GO stop),
+`test_hostw_batch_of_one_equals_single_write` (len-1 identity),
+`test_pio_write_after_batch_is_unaffected` (no leak into PIO),
+`test_hostr_batch_matches_scalar_dma_reads` (read equivalence). The existing
+JIT/interpreter HOSTR stress tests are what caught the row-flush regression.

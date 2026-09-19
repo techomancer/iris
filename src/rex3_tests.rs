@@ -21,11 +21,12 @@ use super::*;
 /// Build a running Rex3 with the GFIFO processor thread started.
 /// Uses Box::leak to get a 'static reference — memory is reclaimed by the OS after the test
 /// process exits. The processor thread also holds a 'static ref via start()'s transmute.
-/// Construction runs on a thread with an 8MB stack because Rex3 is large enough to overflow
-/// the default Rust test thread stack (2MB).
+/// Construction runs on a thread with a 64MB stack: Rex3 is large enough to overflow the
+/// default Rust test thread stack (2MB), and Rex3Context now embeds the 1 MiB HOSTRW
+/// data-port array, which construction moves through several temporaries.
 fn make_rex3() -> &'static Rex3 {
     std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .spawn(|| {
             let rex = Box::leak(Box::new(Rex3::new(
                 Arc::new(AtomicU64::new(0)),
@@ -2567,9 +2568,9 @@ mod jit_tests {
         rex
     }
 
-    fn make_rex3_jit() -> &'static Rex3 {
+    pub(super) fn make_rex3_jit() -> &'static Rex3 {
         std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(|| {
                 let rex = Box::leak(Box::new(Rex3::new(
                     Arc::new(AtomicU64::new(0)),
@@ -5606,3 +5607,1585 @@ fn gfifo_push_breakdown() {
     println!("  + bus/register dispatch:   {:>6.1} ns  (+{:.1} overhead)", c, c - b);
     assert!(a > 0.0);
 }
+
+// ── Batched HOSTRW (VDMA bulk path) ─────────────────────────────────────────
+
+/// A batched write must paint exactly what the same words painted one at a
+/// time. This is the core equivalence claim of the HOSTRW batching design:
+/// `host_len = N` and N separate PIO writes are the same transfer.
+#[test]
+fn test_hostw_batch_matches_scalar_writes() {
+    use crate::traits::BusDevice;
+
+    let rows: [[u8; 8]; 3] = [
+        [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80],
+        [0x91, 0xA2, 0xB3, 0xC4, 0xD5, 0xE6, 0xF7, 0x08],
+        [0x19, 0x2A, 0x3B, 0x4C, 0x5D, 0x6E, 0x7F, 0x00],
+    ];
+    let words: Vec<u64> = rows.iter().map(|row| {
+        (row[0] as u64) << 56 | (row[1] as u64) << 48
+      | (row[2] as u64) << 40 | (row[3] as u64) << 32
+      | (row[4] as u64) << 24 | (row[5] as u64) << 16
+      | (row[6] as u64) <<  8 | (row[7] as u64)
+    }).collect();
+
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(7, 2));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    };
+
+    // Reference: one PIO write per word.
+    let rex_scalar = make_rex3();
+    setup(rex_scalar);
+    for &w in &words { write_hostrw64(rex_scalar, w); }
+    wait(rex_scalar);
+
+    // Batched: one bulk call carrying the whole run.
+    let rex_batch = make_rex3();
+    setup(rex_batch);
+    let st = rex_batch.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words);
+    assert_eq!(st, crate::traits::BUS_OK, "bulk write should be accepted");
+    wait(rex_batch);
+
+    for y in 0..3i32 {
+        for x in 0..8i32 {
+            let s = read_pixel(rex_scalar, x, y) & 0xFF;
+            let b = read_pixel(rex_batch,  x, y) & 0xFF;
+            assert_eq!(b, s, "batch vs scalar mismatch at ({x},{y}): {b:#04x} != {s:#04x}");
+        }
+        }
+    // And the pixels are actually the input, not two matching blanks.
+    for (y, row) in rows.iter().enumerate() {
+        for (x, &want) in row.iter().enumerate() {
+            assert_eq!(read_pixel(rex_batch, x as i32, y as i32) & 0xFF, want as u32,
+                "batch painted wrong pixel at ({x},{y})");
+        }
+    }
+}
+
+/// A one-word batch must behave exactly like a plain HOSTRW64 write — the
+/// property that lets the shader have no batched-vs-single branch.
+#[test]
+fn test_hostw_batch_of_one_equals_single_write() {
+    use crate::traits::BusDevice;
+
+    let word: u64 = 0x1122_3344_5566_7788;
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(7, 0));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    };
+
+    let rex_scalar = make_rex3();
+    setup(rex_scalar);
+    write_hostrw64(rex_scalar, word);
+    wait(rex_scalar);
+
+    let rex_batch = make_rex3();
+    setup(rex_batch);
+    assert_eq!(rex_batch.dma_write64_bulk(go_addr(REX3_HOSTRW0), &[word]),
+               crate::traits::BUS_OK);
+    wait(rex_batch);
+
+    for x in 0..8i32 {
+        assert_eq!(read_pixel(rex_batch, x, 0) & 0xFF,
+                   read_pixel(rex_scalar, x, 0) & 0xFF,
+                   "len-1 batch differs from a single write at x={x}");
+    }
+}
+
+/// The batch window must not leak into the PIO path that follows it:
+/// after a batch retires, a plain HOSTRW write draws from ctx.hostrw again.
+#[test]
+fn test_pio_write_after_batch_is_unaffected() {
+    use crate::traits::BusDevice;
+
+    let rex = make_rex3();
+    rex3init(rex);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(7, 0));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    let _ = rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &[0x1111_1111_1111_1111u64; 2]);
+    wait(rex);
+
+    // Now a normal PIO write to a different row.
+    reg(rex, REX3_XYENDI,   xy(7, 5));
+    reg(rex, REX3_XYSTARTI, xy(0, 5));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    write_hostrw64(rex, 0xAABB_CCDD_EEFF_0102);
+    wait(rex);
+
+    let expect = [0xAAu32, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02];
+    for (x, &want) in expect.iter().enumerate() {
+        assert_eq!(read_pixel(rex, x as i32, 5) & 0xFF, want,
+            "PIO write after a batch painted the wrong pixel at x={x}");
+    }
+}
+
+/// The batched read must return exactly what N scalar `dma_read64` calls
+/// return. This is the read-side half of the batching equivalence claim, and
+/// the direction where the win is biggest (one pipeline drain per batch instead
+/// of one per qword).
+#[test]
+fn test_hostr_batch_matches_scalar_dma_reads() {
+    use crate::traits::BusDevice;
+
+    const NWORDS: usize = 8;
+    // CI8 packed into 64-bit words: 8 pixels per word, so NWORDS*8 pixels.
+    let (x0, y0, x1, y1) = (0i32, 0i32, 15i32, 3i32);
+    let color = 0x5Au8;
+
+    let setup_read = |rex: &Rex3| {
+        rex3init(rex);
+        // Fill the region first.
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_COLORI, color as u32);
+        reg(rex, REX3_XYENDI,   xy(x1, y1));
+        reg(rex, REX3_XYSTARTI, xy(x0, y0));
+        reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+        wait(rex);
+        // Arm the READ block.
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_XYENDI,   xy(x1, y1));
+        reg(rex, REX3_XYSTARTI, xy(x0, y0));
+        reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+    };
+
+    let rex_scalar = make_rex3();
+    setup_read(rex_scalar);
+    let mut scalar = [0u64; NWORDS];
+    for slot in scalar.iter_mut() {
+        let r = rex_scalar.dma_read64(go_addr(REX3_HOSTRW0));
+        assert!(r.is_ok(), "scalar dma_read64 failed");
+        *slot = r.data;
+    }
+
+    let rex_batch = make_rex3();
+    setup_read(rex_batch);
+    let mut batched = [0u64; NWORDS];
+    let st = rex_batch.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut batched);
+    assert_eq!(st, crate::traits::BUS_OK, "bulk read should be accepted");
+
+    assert_eq!(batched, scalar,
+        "batched read differs from the scalar dma_read64 sequence");
+
+    // And it is real pixel data, not two matching zeroes.
+    let expect = u64::from_be_bytes([color; 8]);
+    assert_eq!(batched[0], expect,
+        "batched read returned {:#018x}, expected the filled colour {:#018x}",
+        batched[0], expect);
+}
+
+/// Ground-truth check for the DMA read path: a READ block armed with a GO
+/// already produces word 0, so the first `dma_read64`/`dma_read64_bulk` must
+/// return *that* word, not the one after it.
+///
+/// Comparing batched against scalar cannot catch a shared off-by-one-word
+/// phase error — both skip the same word and agree. So this asserts against
+
+
+/// DMA HOSTR readback, driven the way the real driver does it: set up the READ
+/// block **without** an arming GO, then let `dma_read64` supply the GO for each
+/// word (see commit 250ed09 — "the go is not sent by the driver ... we need to
+/// invert timing for go/hostread in dma scenario").
+///
+/// Asserts against framebuffer contents, not against the other engine: a batch
+/// and a scalar loop that are both off by the same word agree with each other,
+/// which is how the SoftWindows phase error hid.
+#[test]
+fn test_hostr_dma_readback_phase_matches_framebuffer() {
+    use crate::traits::BusDevice;
+
+    // 16px wide CI8 @ 8 pixels per 64-bit word = 2 words/row, 2 rows.
+    let (w, h) = (16i32, 2i32);
+    let seed = |rex: &Rex3| unsafe {
+        let fb = &mut *rex.fb_rgb.get();
+        for y in 0..h {
+            for x in 0..w {
+                fb[(y as u32 * 2048 + x as u32) as usize] = (1 + y * w + x) as u32 & 0xFF;
+            }
+        }
+    };
+    // READ block armed with NO GO — the DMA path issues it.
+    let arm = |rex: &Rex3| {
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+    };
+
+    let want = [
+        u64::from_be_bytes([1, 2, 3, 4, 5, 6, 7, 8]),
+        u64::from_be_bytes([9, 10, 11, 12, 13, 14, 15, 16]),
+        u64::from_be_bytes([17, 18, 19, 20, 21, 22, 23, 24]),
+        u64::from_be_bytes([25, 26, 27, 28, 29, 30, 31, 32]),
+    ];
+
+    // Scalar: one GO per word, GO before each read.
+    let rex_s = make_rex3();
+    rex3init(rex_s);
+    seed(rex_s);
+    arm(rex_s);
+    let mut scalar = [0u64; 4];
+    for slot in scalar.iter_mut() {
+        let r = rex_s.dma_read64(go_addr(REX3_HOSTRW0));
+        assert!(r.is_ok());
+        *slot = r.data;
+    }
+    assert_eq!(scalar, want,
+        "scalar dma_read64 phase wrong:\n got {scalar:#018x?}\nwant {want:#018x?}");
+
+    // Batched: one token for the whole run.
+    let rex_b = make_rex3();
+    rex3init(rex_b);
+    seed(rex_b);
+    arm(rex_b);
+    let mut batched = [0u64; 4];
+    assert_eq!(rex_b.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut batched),
+               crate::traits::BUS_OK);
+    assert_eq!(batched, want,
+        "batched dma read phase wrong:\n got {batched:#018x?}\nwant {want:#018x?}");
+}
+
+/// A READ block spanning several words must keep its phase across a *chunked*
+/// readback: two back-to-back `dma_read64_bulk` calls on the same armed
+/// primitive must return consecutive words, not restart or skip.
+///
+/// This is the shape SoftWindows uses to save the area under a popup, and the
+/// one a single-batch test cannot exercise.
+#[test]
+fn test_hostr_dma_bulk_keeps_phase_across_chunks() {
+    use crate::traits::BusDevice;
+
+    // 32px wide CI8 = 4 words/row, 2 rows = 8 words total.
+    let (w, h) = (32i32, 2i32);
+    let rex = make_rex3();
+    rex3init(rex);
+    unsafe {
+        let fb = &mut *rex.fb_rgb.get();
+        for y in 0..h {
+            for x in 0..w {
+                fb[(y as u32 * 2048 + x as u32) as usize] = (1 + y * w + x) as u32 & 0xFF;
+            }
+        }
+    }
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    // Read in two chunks of 4 words.
+    let mut a = [0u64; 4];
+    let mut b = [0u64; 4];
+    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut a), crate::traits::BUS_OK);
+    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut b), crate::traits::BUS_OK);
+
+    let mut want = [0u64; 8];
+    for (i, slot) in want.iter_mut().enumerate() {
+        let base = (i * 8 + 1) as u8;
+        *slot = u64::from_be_bytes([base, base+1, base+2, base+3, base+4, base+5, base+6, base+7]);
+    }
+    let got: Vec<u64> = a.iter().chain(b.iter()).copied().collect();
+    assert_eq!(&got[..], &want[..],
+        "chunked bulk read lost phase:\n got {got:#018x?}\nwant {want:#018x?}");
+}
+
+/// Full save/restore round trip through the DMA paths, the way SoftWindows
+/// saves the area under a popup and puts it back.
+///
+/// Reads a block out with `dma_read64_bulk`, clears it, writes it back with
+/// `dma_write64_bulk`, and requires the framebuffer to match what was there
+/// before. A phase error in either direction shows up as shifted pixels.
+#[test]
+fn test_hostrw_dma_save_restore_round_trip() {
+    use crate::traits::BusDevice;
+
+    let (w, h) = (32i32, 4i32);
+    let rex = make_rex3();
+    rex3init(rex);
+
+    let orig: Vec<u32> = (0..(w * h)).map(|i| (1 + i) as u32 & 0xFF).collect();
+    unsafe {
+        let fb = &mut *rex.fb_rgb.get();
+        for y in 0..h {
+            for x in 0..w {
+                fb[(y as u32 * 2048 + x as u32) as usize] = orig[(y * w + x) as usize];
+            }
+        }
+    }
+
+    // Save: READ block, no arming GO (DMA supplies it).
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    let nwords = (w * h / 8) as usize;
+    let mut saved = vec![0u64; nwords];
+    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut saved),
+               crate::traits::BUS_OK);
+
+    // Scribble over the region so a failed restore is obvious.
+    unsafe {
+        let fb = &mut *rex.fb_rgb.get();
+        for y in 0..h {
+            for x in 0..w {
+                fb[(y as u32 * 2048 + x as u32) as usize] = 0xEE;
+            }
+        }
+    }
+
+    // Restore: HOSTW block.
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &saved),
+               crate::traits::BUS_OK);
+    wait(rex);
+
+    for y in 0..h {
+        for x in 0..w {
+            let got = read_pixel(rex, x, y) & 0xFF;
+            let want = orig[(y * w + x) as usize];
+            assert_eq!(got, want,
+                "save/restore mismatch at ({x},{y}): got {got:#04x} want {want:#04x}");
+        }
+    }
+}
+
+/// After a bulk read of N words, the *next* scalar `dma_read64` must return
+/// word N — the batch must consume exactly N words from the primitive, no
+/// more. Over-consuming shifts everything that follows, which is what a
+/// save-under-popup would see as an 8-pixel slip at CI8.
+#[test]
+fn test_hostr_bulk_consumes_exactly_its_count() {
+    use crate::traits::BusDevice;
+
+    let (w, h) = (32i32, 2i32);
+    let rex = make_rex3();
+    rex3init(rex);
+    unsafe {
+        let fb = &mut *rex.fb_rgb.get();
+        for y in 0..h {
+            for x in 0..w {
+                fb[(y as u32 * 2048 + x as u32) as usize] = (1 + y * w + x) as u32 & 0xFF;
+            }
+        }
+    }
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
+
+    let mut first2 = [0u64; 2];
+    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut first2),
+               crate::traits::BUS_OK);
+
+    // Next scalar read must be word 2 = pixels 17..24.
+    let next = rex.dma_read64(go_addr(REX3_HOSTRW0));
+    assert!(next.is_ok());
+    let want = u64::from_be_bytes([17, 18, 19, 20, 21, 22, 23, 24]);
+    assert_eq!(next.data, want,
+        "bulk of 2 then scalar: expected word 2 ({want:#018x}), got {:#018x} — \
+         the batch consumed the wrong number of words", next.data);
+}
+
+/// A HOSTW block whose pixel count exceeds one word must consume words in the
+/// same order and quantity whether fed one-per-GO (scalar) or as a batch.
+///
+/// The batch runs the whole primitive under a single GO, so anything the
+/// hardware advances *per GO* rather than per word diverges. Tiled/zoomed
+/// fills are the case that would expose it.
+#[test]
+fn test_hostw_batch_matches_scalar_on_a_multiword_row() {
+    use crate::traits::BusDevice;
+
+    // 24px wide CI8 @ 8px/word = 3 words in one row.
+    let (w, h) = (24i32, 1i32);
+    let words: Vec<u64> = (0..3u64)
+        .map(|i| {
+            let b = (i * 8 + 1) as u8;
+            u64::from_be_bytes([b, b+1, b+2, b+3, b+4, b+5, b+6, b+7])
+        })
+        .collect();
+
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    };
+
+    let rex_s = make_rex3();
+    setup(rex_s);
+    for &v in &words { write_hostrw64(rex_s, v); }
+    wait(rex_s);
+
+    let rex_b = make_rex3();
+    setup(rex_b);
+    assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex_b);
+
+    for x in 0..w {
+        let s = read_pixel(rex_s, x, 0) & 0xFF;
+        let b = read_pixel(rex_b, x, 0) & 0xFF;
+        assert_eq!(b, s, "batch vs scalar at x={x}: {b:#04x} != {s:#04x}");
+        assert_eq!(b, (x + 1) as u32, "wrong pixel value at x={x}");
+    }
+}
+
+/// A batched upload spanning several rows must paint every row, not just the
+/// first.
+///
+/// Host mode stops the walker at each row boundary and expects the next GO to
+/// resume — the CPU's one-word-per-GO feed gives it that for free. A batch has
+/// one GO for N words, so `execute_go` has to drive the primitive round until
+/// the batch is drained. Without that, the upload paints row 0 and silently
+/// drops the rest: pixmaps render as empty frames, tiled fills leave bands of
+/// untouched framebuffer.
+#[test]
+fn test_hostw_batch_paints_every_row_of_a_multirow_block() {
+    use crate::traits::BusDevice;
+
+    // 12px wide CI8: each row is one full 64-bit word plus a HALF word, so the
+    // walker hits the partial-word row break (`hostcnt > 0`) that a
+    // word-aligned width never triggers. 4 rows, 2 words per row.
+    let (w, h) = (12i32, 4i32);
+    let words: Vec<u64> = (0..(h as u64 * 2))
+        .map(|k| {
+            let b = (k * 8 + 1) as u8;
+            u64::from_be_bytes([b, b+1, b+2, b+3, b+4, b+5, b+6, b+7])
+        })
+        .collect();
+
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    };
+
+    // Reference: the CPU's one-word-per-GO feed, which is what the batch must
+    // reproduce. Its output defines correct — including whatever the row
+    // boundary does to a partial word.
+    let rex_s = make_rex3();
+    setup(rex_s);
+    for &v in &words { write_hostrw64(rex_s, v); }
+    wait(rex_s);
+
+    let rex_b = make_rex3();
+    setup(rex_b);
+    assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex_b);
+
+    for y in 0..h {
+        for x in 0..w {
+            let s = read_pixel(rex_s, x, y) & 0xFF;
+            let b = read_pixel(rex_b, x, y) & 0xFF;
+            assert_eq!(b, s,
+                "row {y} col {x}: batch painted {b:#04x}, scalar painted {s:#04x} \
+                 — a batch must reproduce the one-word-per-GO feed exactly");
+        }
+    }
+    // And it is real data, not two matching blanks.
+    assert_ne!(read_pixel(rex_b, 0, h - 1) & 0xFF, 0,
+        "last row is blank: the batch was dropped before finishing");
+}
+
+/// The real icon-upload shape from `vdma.log`: 98 x 98 RGB24, 49 64-bit words
+/// per row, 4802 words in one batch.
+///
+/// Drives the batch against the CPU's one-word-per-GO feed, which is the
+/// reference. An odd word count per row means the row boundary lands
+/// mid-stream for every row after the first, so any mismatch between the two
+/// feeds shows up as a progressive shift — exactly how the login-screen icons
+/// came out empty/garbled.
+#[test]
+fn test_hostw_batch_matches_scalar_on_the_icon_upload_shape() {
+    use crate::traits::BusDevice;
+
+    // RGB24 + rwdouble: 2 pixels per 64-bit word.
+    let (w, h) = (98i32, 98i32);
+    let words_per_row = (w as usize) / 2;              // 49
+    let total = words_per_row * h as usize;            // 4802
+    let words: Vec<u64> = (0..total as u64)
+        .map(|k| {
+            // Distinct, non-zero per word so a shift is unmistakable.
+            let hi = (0x10_0000u64 + k) & 0xFF_FFFF;
+            let lo = (0x80_0000u64 + k) & 0xFF_FFFF;
+            (hi << 32) | lo
+        })
+        .collect();
+    assert_eq!(total, 4802, "shape must match the logged icon transfer");
+
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFFFFFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    };
+
+    let rex_s = make_rex3();
+    setup(rex_s);
+    for &v in &words { write_hostrw64(rex_s, v); }
+    wait(rex_s);
+
+    let rex_b = make_rex3();
+    setup(rex_b);
+    assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex_b);
+
+    let mut first_bad = None;
+    for y in 0..h {
+        for x in 0..w {
+            let s = read_pixel(rex_s, x, y) & 0xFFFFFF;
+            let b = read_pixel(rex_b, x, y) & 0xFFFFFF;
+            if s != b && first_bad.is_none() {
+                first_bad = Some((x, y, b, s));
+            }
+        }
+    }
+    if let Some((x, y, b, s)) = first_bad {
+        panic!("icon-shape batch diverges at ({x},{y}): batch={b:#08x} scalar={s:#08x}");
+    }
+    // Non-vacuous: the last row must hold real data, not a matching blank.
+    assert_ne!(read_pixel(rex_b, 0, h - 1) & 0xFFFFFF, 0,
+        "last row blank — the batch stopped early");
+}
+
+// ── GFIFO batch push/drain ──────────────────────────────────────────────────
+
+/// `push_batch` + `drain_payload` must move every word, including across the
+/// ring's wrap point and for a batch far larger than the 64-entry head-publish
+/// interval.
+///
+/// The icon uploads that came out empty push ~4802 payload entries behind one
+/// token, so any truncation in this pair loses most of an image.
+#[test]
+fn test_gfifo_push_batch_round_trips_every_word() {
+    // GFifo is 65536 entries; build it on a thread with room for it,
+    // the same reason make_rex3 does.
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        use crate::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
+
+        // Heap-allocate: GFifo is 65536 entries and overflows a test stack.
+        let fifo = Box::new(GFifo::new());
+        let mut dst = Box::new(HostRwArray::default());
+
+        for n in [1usize, 2, 63, 64, 65, 4802] {
+            let words: Vec<u64> = (0..n as u64).map(|k| 0xAAAA_0000_0000_0000 | k).collect();
+            fifo.push_batch(REX3_DMA_BATCH_W, n as u64, &words);
+
+            // The consumer sees the token first, exactly as register_processor does.
+            let (addr, val) = fifo.peek().expect("token must be queued");
+            assert_eq!(addr, REX3_DMA_BATCH_W, "n={n}: first entry must be the token");
+            assert_eq!(val, n as u64, "n={n}: token must carry the count");
+
+            let got = fifo.drain_payload(n.min(HOSTRW_BUF_QWORDS), &mut dst);
+            assert_eq!(got, n, "n={n}: drained {got} of {n} payload words");
+            for (i, w) in words.iter().enumerate() {
+                assert_eq!(dst[i], *w, "n={n}: word {i} differs");
+            }
+            // Retire the last payload entry, as the consumer loop does.
+            fifo.consume();
+            assert!(fifo.is_empty(), "n={n}: queue must be empty after the batch");
+        }
+    }).expect("spawn").join().expect("test thread panicked");
+}
+
+/// Back-to-back batches must not bleed into each other: the second batch's
+/// payload entries carry the same GFIFO_PAYLOAD marker, so `drain_payload`
+/// has to stop at its own count rather than at the marker alone.
+#[test]
+fn test_gfifo_back_to_back_batches_stay_separate() {
+    // GFifo is 65536 entries; build it on a thread with room for it,
+    // the same reason make_rex3 does.
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        use crate::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
+
+        let fifo = Box::new(GFifo::new());
+        let mut dst = Box::new(HostRwArray::default());
+
+        let a: Vec<u64> = (0..100u64).map(|k| 0xA000_0000_0000_0000 | k).collect();
+        let b: Vec<u64> = (0..50u64).map(|k| 0xB000_0000_0000_0000 | k).collect();
+        fifo.push_batch(REX3_DMA_BATCH_W, a.len() as u64, &a);
+        fifo.push_batch(REX3_DMA_BATCH_W, b.len() as u64, &b);
+
+        let (_, va) = fifo.peek().unwrap();
+        assert_eq!(va, a.len() as u64);
+        assert_eq!(fifo.drain_payload(a.len().min(HOSTRW_BUF_QWORDS), &mut dst), a.len());
+        for (i, w) in a.iter().enumerate() {
+            assert_eq!(dst[i], *w, "batch A word {i}");
+        }
+        fifo.consume();
+
+        let (_, vb) = fifo.peek().expect("second token must follow");
+        assert_eq!(vb, b.len() as u64, "second batch's token must be next");
+        assert_eq!(fifo.drain_payload(b.len().min(HOSTRW_BUF_QWORDS), &mut dst), b.len());
+        for (i, w) in b.iter().enumerate() {
+            assert_eq!(dst[i], *w, "batch B word {i}");
+        }
+        fifo.consume();
+        assert!(fifo.is_empty());
+    }).expect("spawn").join().expect("test thread panicked");
+}
+
+/// `drain_payload` must return exactly the promised count, even when the
+/// producer is still publishing and `tail` is sampled mid-batch.
+///
+/// The old version sampled `tail` once and stopped at `head == tail`, so a
+/// batch larger than what had been published at that instant came back short —
+/// and the caller could not tell a truncated drain from a complete one. A
+/// 4802-word icon upload losing its tail is exactly the "pixmaps missing"
+/// symptom.
+#[test]
+fn test_gfifo_drain_payload_returns_the_exact_promised_count() {
+    use crate::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
+    use std::sync::Arc;
+
+    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
+        let fifo = Arc::new(GFifo::new());
+        let mut dst = Box::new(HostRwArray::default());
+
+        const N: usize = 4802; // the logged icon-upload size
+        let words: Vec<u64> = (0..N as u64).map(|k| 0xC0DE_0000_0000_0000 | k).collect();
+
+        // `push_batch` publishes the token and all N words with a single
+        // Release store on `tail`, so a consumer that merely waits for the
+        // token already sees everything — which makes a naive "race" test
+        // vacuous. Reproduce the real hazard directly instead: publish the
+        // token with a tail that covers only part of the batch, exactly what a
+        // single mid-batch `tail` sample looks like to the drain loop.
+        fifo.push_batch(REX3_DMA_BATCH_W, N as u64, &words);
+        fifo.rewind_tail_for_test(1 + N / 2);
+
+        let (addr, val) = fifo.peek().expect("token");
+        assert_eq!(addr, REX3_DMA_BATCH_W);
+        assert_eq!(val, N as u64);
+
+        // Republish the rest shortly after the drain starts, as the producer
+        // would. The drain must wait for it rather than returning short.
+        let f2 = Arc::clone(&fifo);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            f2.restore_tail_for_test(1 + N);
+        });
+        let got = fifo.drain_payload(N.min(HOSTRW_BUF_QWORDS), &mut dst);
+        assert_eq!(got, N, "drain must return the full promised count, got {got}");
+        for i in 0..N {
+            assert_eq!(dst[i], words[i], "word {i} differs");
+        }
+        producer.join().unwrap();
+    }).expect("spawn").join().expect("test thread panicked");
+}
+
+/// The draw-debug ring must get a record for an ordinary host-mode block —
+/// that is what the pixel-under-cursor overlay reads.
+///
+/// `log_block` bails when `mid_primitive` is set, so anything that leaves that
+/// flag latched across GOs silently empties the overlay.
+#[test]
+#[cfg(feature = "developer")]
+fn test_draw_debug_ring_records_a_host_block() {
+    let rex = make_rex3();
+    rex3init(rex);
+    rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
+    rex.draw_ring.lock().count = 0;
+
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(7, 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    write_hostrw64(rex, 0x1122_3344_5566_7788);
+    write_hostrw64(rex, 0x99AA_BBCC_DDEE_FF00);
+    wait(rex);
+
+    let n = rex.draw_ring.lock().count;
+    assert!(n > 0, "draw ring is empty after a host block — the overlay has nothing to show");
+}
+
+/// Same, for a plain DRAW block (no host data) — the other shape the overlay
+/// is meant to report.
+#[test]
+#[cfg(feature = "developer")]
+fn test_draw_debug_ring_records_a_plain_block() {
+    let rex = make_rex3();
+    rex3init(rex);
+    rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
+    rex.draw_ring.lock().count = 0;
+
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_COLORI, 0x5A);
+    reg(rex, REX3_XYENDI,   xy(15, 7));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    wait(rex);
+
+    let n = rex.draw_ring.lock().count;
+    assert!(n > 0, "draw ring is empty after a plain DRAW block");
+}
+
+/// A *batched* host block must produce a draw record too.
+///
+/// The batch runs the whole primitive under one GO, so if `mid_primitive` is
+/// still set when `log_block` runs — or the continuation path re-enters
+/// `draw_primitive` in a way that suppresses it — the overlay shows nothing for
+/// exactly the transfers that matter most (pixmap and icon uploads).
+#[test]
+#[cfg(feature = "developer")]
+fn test_draw_debug_ring_records_a_batched_host_block() {
+    use crate::traits::BusDevice;
+
+    let rex = make_rex3();
+    rex3init(rex);
+    rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
+    rex.draw_ring.lock().count = 0;
+
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(7, 3));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+
+    let words: Vec<u64> = (0..4u64).map(|k| 0x1000_0000_0000_0000 | k).collect();
+    assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex);
+
+    let n = rex.draw_ring.lock().count;
+    assert!(n > 0,
+        "draw ring is empty after a BATCHED host block — the overlay goes blank \
+         for pixmap/icon uploads even though the pixels land");
+}
+
+/// The draw-debug overlay's HOSTRW counter must match what a batch actually
+/// delivered.
+///
+/// A DMA batch hands REX3 N words in one call, so counting the token as a
+/// single write made the overlay report `0/4802` (or `1/4802`) for icon
+/// uploads that carried every word — the counter said the data was missing
+/// when it was not, which is worse than no counter at all.
+#[test]
+#[cfg(feature = "developer")]
+fn test_draw_debug_counts_every_word_of_a_batch() {
+    use crate::traits::BusDevice;
+
+    // 8px CI8 rows, 4 rows = 4 words, all delivered in one batch.
+    let rex = make_rex3();
+    rex3init(rex);
+    rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
+    rex.draw_ring.lock().count = 0;
+
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(7, 3));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+
+    let words: Vec<u64> = (0..4u64).map(|k| 0x1122_3344_5566_0000 | k).collect();
+    assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex);
+
+    let ring = rex.draw_ring.lock();
+    let rec = ring.iter_newest_first().next().copied()
+        .expect("a host block must produce a draw record");
+    drop(ring);
+
+    assert!(rec.expected_words > 0,
+        "colorhost draw must have a non-zero expected word count");
+    assert_eq!(rec.hostrw_writes, words.len() as u32,
+        "overlay counted {} HOSTRW writes for a {}-word batch (expected_words={}, \
+         expected_doubles={}) — the counter must reflect what was delivered",
+        rec.hostrw_writes, words.len(), rec.expected_words, rec.expected_doubles);
+    assert_eq!(rec.spurious_writes, 0, "no write should be counted as spurious");
+}
+
+/// A batch's word count must not leak onto the *next*, non-host primitive.
+///
+/// `host_len` stays raised until `execute_go` retires it, so a following plain
+/// DRAW was being credited with the previous batch's words — and since it has
+/// colorhost=0 they landed in `spurious_writes`, so the overlay reported
+/// phantom host traffic (`SPURIOUS:1`) on an ordinary block.
+#[test]
+#[cfg(feature = "developer")]
+fn test_draw_debug_batch_count_does_not_leak_to_the_next_draw() {
+    use crate::traits::BusDevice;
+
+    let rex = make_rex3();
+    rex3init(rex);
+    rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
+    rex.draw_ring.lock().count = 0;
+
+    // A host batch.
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(7, 3));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
+    let words: Vec<u64> = (0..4u64).map(|k| 0x2233_4455_6677_0000 | k).collect();
+    assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex);
+
+    // Then an ordinary DRAW that consumes no host data at all.
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW);
+    reg(rex, REX3_COLORI, 0x5A);
+    reg(rex, REX3_XYENDI,   xy(15, 15));
+    reg(rex, REX3_XYSTARTI, xy(0, 8));
+    reg_go(rex, REX3_DRAWMODE0, DM0_DRAW_BLOCK);
+    wait(rex);
+
+    let ring = rex.draw_ring.lock();
+    let newest = ring.iter_newest_first().next().copied().expect("record");
+    drop(ring);
+
+    assert_eq!(newest.spurious_writes, 0,
+        "the plain DRAW was credited with {} spurious HOSTRW writes — the \
+         previous batch's count leaked onto it", newest.spurious_writes);
+    assert_eq!(newest.hostrw_writes, 0,
+        "the plain DRAW consumes no host data but was credited with {} writes",
+        newest.hostrw_writes);
+}
+
+/// Multi-row HOSTW batch **without STOPONY** — the shape IRIX actually uses
+/// for the tiled wallpaper and the login icons.
+///
+/// Without STOPONY the walker treats each row as its own primitive: it clears
+/// `mid_primitive` and breaks at the end of every row, expecting the next GO to
+/// start the next row. The CPU's one-word-per-GO feed supplies those GOs. A
+/// batch has exactly ONE, so anything that stops the resume loop at the first
+/// row boundary silently discards every remaining row — leaving holes in an
+/// image whose data arrived intact.
+#[test]
+fn test_hostw_batch_without_stopony_paints_all_rows() {
+    use crate::traits::BusDevice;
+
+    // 8px CI8 rows = exactly one 64-bit word per row, 4 rows.
+    const DM0_HOSTW_BLOCK_NO_STOPONY: u32 =
+        DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONX | DM0_COLORHOST;
+    let (w, h) = (8i32, 4i32);
+    let words: Vec<u64> = (0..h as u64)
+        .map(|r| {
+            let b = (r * 8 + 1) as u8;
+            u64::from_be_bytes([b, b+1, b+2, b+3, b+4, b+5, b+6, b+7])
+        })
+        .collect();
+
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK_NO_STOPONY);
+    };
+
+    // Reference: one GO per word, which is what the hardware feed does.
+    let rex_s = make_rex3();
+    setup(rex_s);
+    for &v in &words { write_hostrw64(rex_s, v); }
+    wait(rex_s);
+
+    let rex_b = make_rex3();
+    setup(rex_b);
+    assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex_b);
+
+    for y in 0..h {
+        for x in 0..w {
+            let s = read_pixel(rex_s, x, y) & 0xFF;
+            let b = read_pixel(rex_b, x, y) & 0xFF;
+            assert_eq!(b, s,
+                "row {y} col {x}: batch={b:#04x} scalar={s:#04x} — rows after the \
+                 first are dropped when the batch stops at a row boundary");
+        }
+    }
+    assert_ne!(read_pixel(rex_b, 0, h - 1) & 0xFF, 0, "last row is blank");
+}
+
+
+// ── Bulk vs scalar DMA equivalence, with position-bearing pixel data ────────
+//
+// The tests above each pin one shape. These sweep width x height through the
+// *DMA entry points the VDMA engine actually calls*, in both directions, and
+// verify every pixel against a generated pattern rather than only against the
+// other engine.
+//
+// The pattern is a 32-bit counter spread over 4 consecutive CI8 pixels, so each
+// byte carries a slice of the index of the pixel group it belongs to. That
+// makes the two failure modes distinguishable, which batch-vs-scalar comparison
+// alone cannot do:
+//
+//   * a pixel holding the *right* value at the *wrong* place is a skew — the
+//     bytes are intact but shifted, so the decoded counter is off by a
+//     predictable amount;
+//   * a pixel holding a value no counter would ever produce is dropped or
+//     merged data.
+//
+// The widths matter more than the heights. A CI8 row of 8 or 16 px is a whole
+// number of 64-bit words, so a row boundary always lands on a word boundary and
+// both engines agree even when the row/word interaction is wrong. Widths like
+// 12 and 20 leave a *partial* trailing word on every row — that is where a skew
+// shows, and it is the shape the taskbar blit that exposed this uses.
+
+const DM0_HOSTW_NO_STOPONY: u32 =
+    DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONX | DM0_COLORHOST;
+const DM0_HOSTR_NO_STOPONY: u32 =
+    DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONX | DM0_COLORHOST
+        | DM0_DOSETUP;
+
+/// The byte a given pixel index must hold.
+///
+/// Pixel `i` belongs to counter group `i / 4` and is byte `i % 4` of that
+/// group's 32-bit value. The counter is offset by 1 and the low byte forced
+/// non-zero so that no legal pixel is ever 0x00 — a cleared framebuffer is
+/// therefore never mistaken for correctly-transferred data.
+fn counter_byte(i: usize) -> u8 {
+    let group = (i / 4) as u32 + 1;
+    let counter = group.wrapping_mul(0x0105_0307) | 0x0100_0001;
+    counter.to_be_bytes()[i % 4]
+}
+
+/// Decode a pixel byte back to the set of indices that could have produced it.
+/// Used only to make failure messages actionable.
+fn counter_explain(i: usize, got: u8) -> String {
+    for cand in 0..4096usize {
+        if counter_byte(cand) == got {
+            let delta = cand as isize - i as isize;
+            return format!("(value belongs to pixel {cand}, skew {delta:+})");
+        }
+    }
+    "(value matches no pixel — dropped or merged data)".to_string()
+}
+
+/// Pack a `w` x `h` CI8 image of counter bytes into 64-bit words, one whole
+/// word group per row (a partial trailing word is zero-padded, exactly as the
+/// hardware's per-row word flush leaves it).
+fn counter_words(w: i32, h: i32) -> Vec<u64> {
+    let per_row = ((w as usize) + 7) / 8;
+    let mut out = Vec::with_capacity(per_row * h as usize);
+    for r in 0..h as usize {
+        for c in 0..per_row {
+            let mut v = 0u64;
+            for k in 0..8usize {
+                let x = c * 8 + k;
+                // Index by absolute pixel position in the image, so the value
+                // encodes where the pixel belongs, not merely its order.
+                let byte = if x < w as usize { counter_byte(r * w as usize + x) } else { 0 };
+                v |= (byte as u64) << (56 - k * 8);
+            }
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Write the counter pattern straight into the framebuffer, bypassing REX3.
+/// The readback tests need a known image on screen without depending on the
+/// write path they are meant to be independent of.
+fn prefill_counter_image(rex: &Rex3, w: i32, h: i32) {
+    unsafe {
+        let fb = &mut *rex.fb_rgb.get();
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                fb[y * 2048 + x] = counter_byte(y * w as usize + x) as u32;
+            }
+        }
+    }
+}
+
+const SWEEP_SHAPES: &[(i32, i32)] = &[
+    (8, 1), (8, 4), (8, 7),      // exact single word per row
+    (16, 3), (16, 5),            // exact two words per row
+    (12, 4), (12, 9),            // partial trailing word — the skew case
+    (20, 3), (20, 6),            // partial, wider
+    (4, 5),  (1, 3),             // sub-word rows
+    (33, 2),                     // odd width, > 4 words
+];
+
+/// HOSTW: a bulk DMA write must place every pixel where the counter says it
+/// belongs, and must match the scalar one-word-per-GO feed doing the same.
+#[test]
+fn test_hostw_bulk_matches_scalar_and_counter_pattern() {
+    use crate::traits::BusDevice;
+
+    for &(w, h) in SWEEP_SHAPES {
+        let words = counter_words(w, h);
+
+        let setup = |rex: &Rex3| {
+            rex3init(rex);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+            reg(rex, REX3_WRMASK, 0xFF);
+            reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTW_NO_STOPONY);
+        };
+
+        // Reference engine: one GO per word, as the hardware feed does.
+        let rex_s = make_rex3();
+        setup(rex_s);
+        for &v in &words { write_hostrw64(rex_s, v); }
+        wait(rex_s);
+
+        // Under test: one bulk DMA write, exactly as mc_vdma issues it.
+        let rex_b = make_rex3();
+        setup(rex_b);
+        assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+                   crate::traits::BUS_OK, "{w}x{h}: bulk write refused");
+        wait(rex_b);
+
+        for y in 0..h {
+            for x in 0..w {
+                let i = y as usize * w as usize + x as usize;
+                let want = counter_byte(i);
+                let b = (read_pixel(rex_b, x, y) & 0xFF) as u8;
+                let s = (read_pixel(rex_s, x, y) & 0xFF) as u8;
+                assert_eq!(b, want,
+                    "{w}x{h} bulk at ({x},{y}) pixel {i}: got {b:#04x} want {want:#04x} {}",
+                    counter_explain(i, b));
+                assert_eq!(s, want,
+                    "{w}x{h} scalar at ({x},{y}) pixel {i}: got {s:#04x} want {want:#04x} {}",
+                    counter_explain(i, s));
+            }
+        }
+    }
+}
+
+/// HOSTR: a bulk DMA read must return the counter image that is on screen, and
+/// must match the scalar GO-wait-read feed reading the same screen.
+#[test]
+fn test_hostr_bulk_matches_scalar_and_counter_pattern() {
+    use crate::traits::BusDevice;
+
+    for &(w, h) in SWEEP_SHAPES {
+        let per_row = ((w as usize) + 7) / 8;
+        let nwords = per_row * h as usize;
+        // What the screen holds, packed the way a correct readback must return
+        // it: one whole word group per row, partial trailing word zero-padded.
+        let want = counter_words(w, h);
+
+        let arm = |rex: &Rex3| {
+            rex3init(rex);
+            prefill_counter_image(rex, w, h);
+            reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+            reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+            reg(rex, REX3_DRAWMODE0, DM0_HOSTR_NO_STOPONY);
+        };
+
+        // Scalar: one GO-wait-read per word.
+        let rex_s = make_rex3();
+        arm(rex_s);
+        let mut scalar = Vec::with_capacity(nwords);
+        for k in 0..nwords {
+            let r = rex_s.dma_read64(go_addr(REX3_HOSTRW0));
+            assert!(r.is_ok(), "{w}x{h}: scalar read {k} failed");
+            scalar.push(r.data);
+        }
+
+        // Bulk: one token, one pipeline drain, copy the array out.
+        let rex_b = make_rex3();
+        arm(rex_b);
+        let mut bulk = vec![0u64; nwords];
+        assert_eq!(rex_b.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut bulk),
+                   crate::traits::BUS_OK, "{w}x{h}: bulk read refused");
+
+        for k in 0..nwords {
+            let row = k / per_row;
+            let col = k % per_row;
+            assert_eq!(bulk[k], want[k],
+                "{w}x{h} bulk word {k} (row {row}, word {col} of row):\n  \
+                 got  {:016x}\n  want {:016x}", bulk[k], want[k]);
+            assert_eq!(scalar[k], want[k],
+                "{w}x{h} scalar word {k} (row {row}, word {col} of row):\n  \
+                 got  {:016x}\n  want {:016x}", scalar[k], want[k]);
+        }
+    }
+}
+
+/// Round trip: upload by bulk DMA, read back by bulk DMA, get the same words.
+///
+/// Both directions share the walker, so this alone could not catch a fault in
+/// the walker — the two tests above pin each direction to the counter pattern
+/// for that. This one catches the pairing: an upload and a readback that are
+/// each self-consistent but disagree about where row `n` starts.
+#[test]
+fn test_hostrw_bulk_round_trip_preserves_the_image() {
+    use crate::traits::BusDevice;
+
+    for &(w, h) in SWEEP_SHAPES {
+        let src = counter_words(w, h);
+
+        let rex = make_rex3();
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_NO_STOPONY);
+        assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &src),
+                   crate::traits::BUS_OK, "{w}x{h}: bulk write refused");
+        wait(rex);
+
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTR_NO_STOPONY);
+        let mut back = vec![0u64; src.len()];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut back),
+                   crate::traits::BUS_OK, "{w}x{h}: bulk read refused");
+
+        assert_eq!(back, src,
+            "{w}x{h}: round trip changed the image\n  wrote {:016x?}\n  read  {:016x?}",
+            src, back);
+    }
+}
+
+/// The row-boundary word flush, **with STOPONY** — the shape that actually
+/// reaches it.
+///
+/// With STOPONY the block walker advances rows itself instead of ending the
+/// primitive at each row, so a row whose width does not fill a whole 64-bit
+/// word leaves a partial word open in the shifter. Hardware sends one word per
+/// GO in host mode, full or not, so that partial word must be flushed at the
+/// row boundary; carrying it into the next row shifts every subsequent row by
+/// the remainder.
+///
+/// The `!stopony` sweep above cannot catch this: it breaks out of the walker at
+/// the row boundary before the flush is reached. Widths here are deliberately
+/// not multiples of 8.
+#[test]
+fn test_hostw_stopony_flushes_partial_word_at_row_boundary() {
+    use crate::traits::BusDevice;
+
+    const DM0_HOSTW_STOPONY: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH
+        | DM0_STOPONXY | DM0_COLORHOST;
+
+    for &(w, h) in &[(12, 4), (20, 3), (4, 6), (33, 2), (12, 9)] {
+        let words = counter_words(w, h);
+
+        let rex = make_rex3();
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_STOPONY);
+        assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+                   crate::traits::BUS_OK, "{w}x{h}: bulk write refused");
+        wait(rex);
+
+        for y in 0..h {
+            for x in 0..w {
+                let i = y as usize * w as usize + x as usize;
+                let want = counter_byte(i);
+                let got = (read_pixel(rex, x, y) & 0xFF) as u8;
+                assert_eq!(got, want,
+                    "{w}x{h} at ({x},{y}) pixel {i}: got {got:#04x} want {want:#04x} {}\n\
+                     a partial word left open at the row boundary shifts every \
+                     following row", counter_explain(i, got));
+            }
+        }
+    }
+}
+
+/// The readback mirror: with STOPONY, a partial trailing word must be published
+/// at the row boundary rather than accumulating pixels from the next row.
+#[test]
+fn test_hostr_stopony_flushes_partial_word_at_row_boundary() {
+    use crate::traits::BusDevice;
+
+    const DM0_HOSTR_STOPONY: u32 = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH
+        | DM0_STOPONXY | DM0_COLORHOST | DM0_DOSETUP;
+
+    for &(w, h) in &[(12, 4), (20, 3), (4, 6), (33, 2)] {
+        let per_row = ((w as usize) + 7) / 8;
+        let nwords = per_row * h as usize;
+        let want = counter_words(w, h);
+
+        let rex = make_rex3();
+        rex3init(rex);
+        prefill_counter_image(rex, w, h);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTR_STOPONY);
+
+        let mut back = vec![0u64; nwords];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut back),
+                   crate::traits::BUS_OK, "{w}x{h}: bulk read refused");
+
+        for k in 0..nwords {
+            assert_eq!(back[k], want[k],
+                "{w}x{h} word {k} (row {}, word {} of row):\n  got  {:016x}\n  want {:016x}\n\
+                 a partial word carried into the next row skews the readback",
+                k / per_row, k % per_row, back[k], want[k]);
+        }
+    }
+}
+
+/// The internal GFIFO sentinels must carry the GO bit and must be nameable.
+///
+/// Each sentinel's value already has bit 11 set, so `| 0x0800` was a no-op that
+/// read as if it were setting it. That is easy to "clean up" into a value with
+/// no GO bit, which would stop the token dispatching a primitive at all — the
+/// transfer would vanish silently. This pins the bit to the value.
+///
+/// It also pins the names: these reach the bus log with the GO bit stripped, so
+/// a missing arm prints `UNKNOWN`, indistinguishable from a real unmapped
+/// register.
+#[test]
+fn test_gfifo_sentinels_carry_go_and_have_names() {
+    for (name, tok, reg) in [
+        ("REX3_DMA_PURE_GO", REX3_DMA_PURE_GO, REX3_DMA_PURE_GO_REG),
+        ("REX3_DMA_BATCH_W", REX3_DMA_BATCH_W, REX3_DMA_BATCH_W_REG),
+        ("REX3_DMA_BATCH_R", REX3_DMA_BATCH_R, REX3_DMA_BATCH_R_REG),
+    ] {
+        assert_ne!(tok & 0x0800, 0,
+            "{name} = {tok:#06x} has no GO bit — its token would never run a primitive");
+        assert_eq!(reg, tok & !0x0800, "{name}_REG must be the token minus the GO bit");
+        assert_ne!(crate::rex3::rex3_reg_name(reg), "UNKNOWN",
+            "{name}_REG ({reg:#06x}) has no name — the bus log cannot tell it from \
+             a real unmapped register");
+    }
+    // The sentinels must not collide with each other or with a real register.
+    let toks = [REX3_DMA_PURE_GO, REX3_DMA_BATCH_W, REX3_DMA_BATCH_R];
+    for (i, a) in toks.iter().enumerate() {
+        for b in &toks[i + 1..] {
+            assert_ne!(a, b, "two sentinels share the value {a:#06x}");
+        }
+    }
+}
+
+/// A bulk transfer must leave something usable in the bus log.
+///
+/// The batch protocol replaces N `HOSTRW64` pushes with ONE token, and the
+/// payload words are consumed inside `drain_payload` without ever reaching the
+/// logger. So where the scalar path printed a line per word, the bulk path
+/// printed a single opaque token line — exactly the path the wallpaper and
+/// icons now take, and the one hardest to debug from a log.
+///
+/// This pins that both directions leave a line carrying the word count and a
+/// data sample, so "the data arrived" can be told from "the data was wrong".
+#[test]
+#[cfg(feature = "developer")]
+fn test_bulk_transfers_appear_in_the_bus_log() {
+    use crate::traits::BusDevice;
+    use std::io::Read;
+
+    let dir = std::env::temp_dir().join(format!("iris-buslog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let prev = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&dir).expect("chdir");
+
+    let rex = make_rex3();
+    rex3init(rex);
+
+    // `rex buslog on` — same path the monitor command takes.
+    {
+        let mut log = rex.rex3_log.lock();
+        *log = Some(std::fs::File::create("rex3.log").expect("create log"));
+    }
+
+    let (w, h) = (8i32, 4i32);
+    let words = counter_words(w, h);
+
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_NO_STOPONY);
+    assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words), crate::traits::BUS_OK);
+    wait(rex);
+
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+    reg(rex, REX3_XYSTARTI, xy(0, 0));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTR_NO_STOPONY);
+    let mut back = vec![0u64; words.len()];
+    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut back), crate::traits::BUS_OK);
+
+    { *rex.rex3_log.lock() = None; }
+
+    let mut text = String::new();
+    std::fs::File::open("rex3.log").expect("open log")
+        .read_to_string(&mut text).expect("read log");
+    std::env::set_current_dir(&prev).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(text.contains("DMA_BATCH_W"),
+        "bulk write left no named token in the bus log:\n{text}");
+    assert!(text.contains(&format!("batch write {} qwords", words.len())),
+        "bulk write logged no word count:\n{text}");
+    assert!(text.contains(&format!("first={:016x}", words[0])),
+        "bulk write logged no data sample:\n{text}");
+    assert!(text.contains(&format!("BATCH_R done: {} qwords", back.len())),
+        "bulk read logged no result line — a readback's data never appears:\n{text}");
+    assert!(text.contains(&format!("last={:016x}", back[back.len() - 1])),
+        "bulk read result line carries no data sample:\n{text}");
+}
+
+/// JIT/interpreter equivalence for **batched** HOSTRW transfers.
+///
+/// The general rule for this emulator is that the two engines must be
+/// indistinguishable. Batched transfers used to sidestep that rather than
+/// satisfy it: `execute_go` forced `entry = None` whenever `host_len > 1`,
+/// because the compiled shaders addressed `hostrw[0]` by fixed offset and never
+/// stepped the cursor — so a multi-word transfer would consume one word and
+/// repeat it for the whole run.
+///
+/// With the shader addressing `hostrw[hostrw_index()]` and advancing the cursor
+/// on store, the bypass is no longer needed and these must agree pixel for
+/// pixel and word for word.
+#[cfg(feature = "rex-jit")]
+mod batch_jit_equivalence {
+    use super::*;
+    use crate::traits::BusDevice;
+    use super::jit_tests::make_rex3_jit;
+
+    /// Drive one batched HOSTW transfer and return the painted region.
+    fn run_hostw(rex: &Rex3, w: i32, h: i32, words: &[u64]) -> Vec<u32> {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTW_NO_STOPONY);
+        assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), words),
+                   crate::traits::BUS_OK);
+        wait(rex);
+        let mut out = Vec::new();
+        for y in 0..h { for x in 0..w { out.push(read_pixel(rex, x, y) & 0xFF); } }
+        out
+    }
+
+    /// Drive one batched HOSTR readback and return the words.
+    fn run_hostr(rex: &Rex3, w: i32, h: i32, n: usize) -> Vec<u64> {
+        prefill_counter_image(rex, w, h);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_HOSTR_NO_STOPONY);
+        let mut back = vec![0u64; n];
+        assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut back),
+                   crate::traits::BUS_OK);
+        back
+    }
+
+    #[test]
+    fn batched_hostw_matches_between_engines() {
+        for &(w, h) in &[(8i32, 4i32), (16, 3), (12, 4), (20, 3), (33, 2)] {
+            let words = counter_words(w, h);
+
+            let rex_i = make_rex3();            // interpreter (jit_enabled = false)
+            let interp = run_hostw(rex_i, w, h, &words);
+
+            let rex_j = make_rex3_jit();
+            rex_j.jit_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+            // The first run only *requests* the compile — it happens on another
+            // thread, so this run still executes on the interpreter. Wait for
+            // the shader to exist before the run that is actually compared, or
+            // the comparison is interpreter-vs-interpreter and passes with the
+            // JIT arbitrarily broken.
+            let _ = run_hostw(rex_j, w, h, &words);
+            let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+            // The dispatch key is the *normalized* dm1, the same one
+            // execute_go and compile_shader use. Passing the raw value looks
+            // up a key nothing was ever filed under.
+            let dm1_key = crate::rex3_shape::normalize_dm1(
+                DM1_CI8_HOSTRW64, DRAWMODE0_OPCODE_DRAW);
+            if let Some(ref jit) = rex_j.rex_jit {
+                assert!(jit.wait_compiled(DM0_HOSTW_NO_STOPONY, dm1_key, cm),
+                    "{w}x{h}: JIT compile failed");
+            }
+            #[cfg(feature = "rexdiag")]
+            let before = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+            let jitted = run_hostw(rex_j, w, h, &words);
+            // Without this the comparison is vacuous: if the batch never
+            // reaches compiled code, both sides are the interpreter and the
+            // test passes with the JIT arbitrarily broken.
+            #[cfg(feature = "rexdiag")]
+            {
+                let after = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(after > before,
+                    "{w}x{h}: no GO dispatched to compiled code — the batch is still \
+                     bypassing the JIT, so this comparison proves nothing");
+            }
+
+            assert_eq!(jitted, interp,
+                "{w}x{h}: JIT and interpreter disagree on a batched HOSTW");
+            // And both must match the source pattern, so an identical-but-wrong
+            // pair cannot pass.
+            for (i, got) in interp.iter().enumerate() {
+                assert_eq!(*got as u8, counter_byte(i),
+                    "{w}x{h}: interpreter itself is wrong at pixel {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn batched_hostr_matches_between_engines() {
+        for &(w, h) in &[(8i32, 4i32), (16, 3), (12, 4), (20, 3)] {
+            let n = (((w as usize) + 7) / 8) * h as usize;
+            let want = counter_words(w, h);
+
+            let rex_i = make_rex3();
+            rex3init(rex_i);
+            let interp = run_hostr(rex_i, w, h, n);
+
+            let rex_j = make_rex3_jit();
+            rex_j.jit_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+            rex3init(rex_j);
+            let _ = run_hostr(rex_j, w, h, n);
+            let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+            let dm1_key = crate::rex3_shape::normalize_dm1(
+                DM1_CI8_HOSTRW64, DRAWMODE0_OPCODE_READ);
+            if let Some(ref jit) = rex_j.rex_jit {
+                assert!(jit.wait_compiled(DM0_HOSTR_NO_STOPONY, dm1_key, cm),
+                    "{w}x{h}: JIT compile failed");
+            }
+            rex3init(rex_j);
+            #[cfg(feature = "rexdiag")]
+            let before = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+            let jitted = run_hostr(rex_j, w, h, n);
+            #[cfg(feature = "rexdiag")]
+            {
+                let after = rex_j.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(after >= before + n as u64,
+                    "{w}x{h}: only {} GOs reached compiled code for {n} words — the \
+                     batch is not being driven through the shader",
+                    after - before);
+            }
+
+            for k in 0..n {
+                assert_eq!(jitted[k], interp[k],
+                    "{w}x{h} word {k}: JIT {:016x} != interpreter {:016x}",
+                    jitted[k], interp[k]);
+            }
+            assert_eq!(interp, want, "{w}x{h}: interpreter readback itself is wrong");
+        }
+    }
+}
+
+/// The precompiled (LLVM) shader table must handle batches too.
+///
+/// In a release build `Rex3::new` seeds the shader map from
+/// `rex3_shaders::SHADERS` (462 shapes). Those entries are found *before*
+/// Cranelift is ever consulted, so in a real build a batch is served by an LLVM
+/// shader — neither by the interpreter nor by the Cranelift JIT the
+/// `batch_jit_equivalence` tests cover.
+///
+/// Tests normally start with an empty map (see `Rex3::new`, `#[cfg(test)]`) so
+/// JIT-vs-generic comparisons genuinely exercise Cranelift. That also means
+/// nothing else in the suite covers the seeded path.
+///
+/// The generated wrappers monomorphise `rex3_generic::draw_with_fb` and are
+/// rebuilt with the crate, so they inherit `fetch_host_pixel`/`send_host_word`
+/// and the cursor accessors automatically. What they do *not* inherit is the
+/// batch resume loop in `execute_go` — a shader returns at a word boundary, so
+/// the loop that drives it round for the remaining N-1 words has to exist on
+/// the shader dispatch path. That is what this pins.
+#[test]
+fn precompiled_shaders_handle_batched_transfers() {
+    use crate::traits::BusDevice;
+
+    // A shape that is genuinely in the corpus, or seeding the map changes
+    // nothing and the draw quietly falls through to the interpreter — which is
+    // how the first version of this test passed while proving nothing.
+    // dm0=0x0046 is DRAW BLOCK COLORHOST with neither STOPONX nor STOPONY;
+    // dm1=0x30007589 is DM1_CI8_HOSTRW64; cm=0x1e00 is rex3init's CIDMATCH.
+    const DM0_PRECOMPILED_HOSTW: u32 = 0x0046;
+    let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
+    assert_eq!(cm, 0x1e00, "CIDMATCH default changed — re-check the corpus key");
+    assert!(crate::rex3_shaders::SHADERS.iter().any(|(k, _)| {
+        *k == (DM0_PRECOMPILED_HOSTW, DM1_CI8_HOSTRW64, cm)
+    }), "dm0={DM0_PRECOMPILED_HOSTW:#06x} dm1={DM1_CI8_HOSTRW64:#010x} cm={cm:#06x} is not \
+         in the generated corpus — this test would exercise the interpreter instead");
+
+    let (w, h) = (8i32, 4i32);
+    let words = counter_words(w, h);
+
+    let setup = |rex: &Rex3| {
+        rex3init(rex);
+        reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+        reg(rex, REX3_WRMASK, 0xFF);
+        reg(rex, REX3_XYENDI,   xy(w - 1, h - 1));
+        reg(rex, REX3_XYSTARTI, xy(0, 0));
+        reg(rex, REX3_DRAWMODE0, DM0_PRECOMPILED_HOSTW);
+    };
+
+    // Reference: empty shader map, so this is the interpreter.
+    let rex_i = make_rex3();
+    setup(rex_i);
+    assert_eq!(rex_i.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex_i);
+
+    // Under test: seed the generated table, as a non-test build does.
+    let rex_s = make_rex3();
+    {
+        let mut map = rex_s.shaders.write();
+        for (k, f) in crate::rex3_shaders::SHADERS { map.insert(*k, *f); }
+    }
+    // `make_rex3` leaves the dispatch switch off so JIT tests start from a known
+    // state; it gates the *whole* shader path, precompiled entries included. A
+    // release build has it on.
+    #[cfg(feature = "rex-jit")]
+    rex_s.jit_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+    setup(rex_s);
+    #[cfg(feature = "rexdiag")]
+    let before = rex_s.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(rex_s.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
+               crate::traits::BUS_OK);
+    wait(rex_s);
+    // Confirm a compiled shader really served it. Without this the seeded map
+    // could miss and the comparison would be interpreter-vs-interpreter.
+    #[cfg(feature = "rexdiag")]
+    {
+        let after = rex_s.jit_go_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after >= before + words.len() as u64,
+            "only {} GOs reached compiled code for {} words — the batch is not \
+             being driven through the precompiled shader",
+            after - before, words.len());
+    }
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = y as usize * w as usize + x as usize;
+            let want = counter_byte(i);
+            let a = (read_pixel(rex_i, x, y) & 0xFF) as u8;
+            let b = (read_pixel(rex_s, x, y) & 0xFF) as u8;
+            assert_eq!(a, want, "interpreter wrong at pixel {i}");
+            assert_eq!(b, want,
+                "seeded-shader build wrong at ({x},{y}) pixel {i}: got {b:#04x} \
+                 want {want:#04x} {} — a precompiled shader served this batch and \
+                 did not walk the array", counter_explain(i, b));
+        }
+    }
+}
+

@@ -90,6 +90,64 @@ pub trait BusDevice: Send + Sync {
     fn dma_read64 (&self, addr: u32) -> BusRead64 { self.read64(addr) }
     fn dma_write64(&self, addr: u32, val: u64) -> u32 { self.write64(addr, val) }
 
+    /// Bulk form of [`dma_write64`](Self::dma_write64): hand the device a whole
+    /// run of qwords destined for `addr` in one call.
+    ///
+    /// This exists to collapse the per-qword producer/consumer round trip. For
+    /// REX3's HOSTRW port the scalar path costs a GFIFO push per 8 bytes; the
+    /// batch form pushes **one** token carrying the whole slice, which the
+    /// register processor streams into the host buffer before a single draw.
+    ///
+    /// Returns `BUS_OK` when the whole slice was accepted, or `BUS_BUSY` when
+    /// none of it was. **It is all-or-nothing**: a device must not consume a
+    /// prefix and report busy, because the DMA worker has no EXEC_RETRY and
+    /// will re-issue the identical slice — a partial commit duplicates data
+    /// (the bug class `try_push2` exists to prevent). `BUS_ERR` means the
+    /// address is not batchable and the caller should fall back to scalar.
+    ///
+    /// The default implementation is the obvious scalar loop, which is correct
+    /// for every device but wins nothing.
+    ///
+    /// It spins on BUS_BUSY rather than returning it. That is not laziness: a
+    /// scalar loop cannot un-consume the words it already pushed, so returning
+    /// busy mid-slice would break the all-or-nothing contract and the caller's
+    /// retry would duplicate the prefix. Spinning is what the VDMA worker did
+    /// per word before batching existed, and it keeps the default honest. A
+    /// device that wants real back-pressure must override this and check
+    /// capacity for the whole slice up front, the way REX3 does.
+    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+        for &v in vals.iter() {
+            loop {
+                let st = self.dma_write64(addr, v);
+                if st == BUS_OK { break; }
+                if st != BUS_BUSY { return st; }
+                std::hint::spin_loop();
+            }
+        }
+        BUS_OK
+    }
+
+    /// Bulk form of [`dma_read64`](Self::dma_read64): fill `out` with a run of
+    /// qwords read from `addr`.
+    ///
+    /// Mirrors [`dma_write64_bulk`](Self::dma_write64_bulk). For REX3 this
+    /// replaces one `wait_idle()` full-pipeline drain *per qword* with one per
+    /// batch: the shader fills its host buffer, then the whole thing is copied
+    /// out here.
+    ///
+    /// Returns `BUS_OK` on success. On any other status the contents of `out`
+    /// are unspecified and the caller must not use them.
+    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+        for slot in out.iter_mut() {
+            let r = self.dma_read64(addr);
+            if !r.is_ok() {
+                return r.status;
+            }
+            *slot = r.data;
+        }
+        BUS_OK
+    }
+
     /// Return a pointer directly into the device's backing store at `addr`.
     /// `addr` must be 8-byte aligned. The pointer is valid for the lifetime of `&self`.
     /// Returns `None` for devices that do not support direct pointer access (default).

@@ -1009,6 +1009,23 @@ impl BusDevice for Physical {
         unsafe { (*device_ptr).dma_write64(addr, val) }
     }
 
+    // Same reason as the scalar pair above: without these, the trait's default
+    // bulk loop would run against Physical and call *its* dma_write64 per word,
+    // which forwards correctly but one word at a time — losing the entire point
+    // of batching. Forward the whole slice so the device's own bulk override
+    // (Rex3's single-token push) actually gets a chance to run.
+    #[inline(always)]
+    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).dma_write64_bulk(addr, vals) }
+    }
+
+    #[inline(always)]
+    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+        let device_ptr = self.device_map[(addr >> 16) as usize];
+        unsafe { (*device_ptr).dma_read64_bulk(addr, out) }
+    }
+
     #[cfg(feature = "jitv2")]
     #[inline(always)]
     fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {

@@ -10,6 +10,11 @@ use crate::eeprom_93c56::Eeprom93c56;
 use crate::ioc::{Ioc, IocInterrupt};
 use std::io::Write as IoWrite;
 
+// The GIO virtual DMA engine — registers, µTLB translation and the transfer
+// bodies — lives in `mc_vdma.rs`; its half of `impl MemoryController` is there.
+// Re-exported here so `mc::REG_DMA_*` etc. keep working for existing callers.
+pub use crate::mc_vdma::*;
+
 // MC Register Offsets (Base 0x1FA00000)
 pub const MC_BASE: u32 = 0x1FA00000;
 pub const MC_SIZE: u32 = 0x20000; // 128KB window
@@ -37,92 +42,10 @@ pub const REG_GIO_ERROR_STAT: u32 = 0x00F8;
 pub const REG_SYS_SEMAPHORE: u32 = 0x0100;
 pub const REG_LOCK_MEMORY: u32 = 0x0108;
 pub const REG_EISA_LOCK: u32 = 0x0110;
-pub const REG_DMA_GIO_MASK: u32 = 0x0150;
-pub const REG_DMA_GIO_SUB: u32 = 0x0158;
-pub const REG_DMA_CAUSE: u32 = 0x0160;
-pub const DMA_CAUSE_FAULT: u32 = 0x01;
-pub const DMA_CAUSE_TLB_MISS: u32 = 0x02;
-pub const DMA_CAUSE_CLEAN: u32 = 0x04;
-pub const DMA_CAUSE_COMPLETE: u32 = 0x08;
-pub const REG_DMA_CTL: u32 = 0x0168;
-pub const DMA_CTL_XLATE: u32 = 1u32 << 8;
-pub const DMA_CTL_INT_ENABLE: u32 = 1u32 << 4;
-pub const REG_DMA_TLB_HI_0: u32 = 0x0180;
-pub const REG_DMA_TLB_LO_0: u32 = 0x0188;
-// ... DMA TLB entries 1-3 omitted for brevity, follow pattern +0x10
 pub const REG_RPSS_CTR: u32 = 0x1000;
-pub const REG_DMA_MEMADR: u32 = 0x2000;
-pub const REG_DMA_MEMADRD: u32 = 0x2008;
-pub const REG_DMA_SIZE: u32 = 0x2010;
-pub const REG_DMA_STRIDE: u32 = 0x2018;
-pub const REG_DMA_GIO_ADR: u32 = 0x2020;
-pub const REG_DMA_GIO_ADRS: u32 = 0x2028;
-pub const REG_DMA_MODE: u32 = 0x2030;
-pub const DMA_MODE_TO_HOST: u32 = 1u32 << 1;
-pub const DMA_MODE_SYNC: u32 = 1u32 << 2; // wait for vsync to start
-pub const DMA_MODE_FILL: u32 = 1u32 << 3;
-pub const DMA_MODE_DIR: u32 = 1u32 << 4;
-pub const DMA_MODE_SNOOP: u32 = 1u32 << 5;
-pub const DMA_MODE_LONG: u32 = 1u32 << 6;
-pub const REG_DMA_COUNT: u32 = 0x2038;
-pub const REG_DMA_STDMA: u32 = 0x2040;
-pub const REG_DMA_RUN: u32 = 0x2048;
-pub const DMA_RUN_RUN: u32 = 0x40;
-pub const REG_DMA_MEMADRDS: u32 = 0x2070;
 pub const REG_SEMAPHORE_0: u32 = 0x10000;
 
 // ... Semaphores 1-15 follow pattern +0x1000
-
-pub struct GioDmaState {
-    pub gio_mask: u32,
-    pub gio_sub: u32,
-    pub cause: u32,
-    pub ctl: u32,
-    pub tlb_hi: [u32; 4],
-    pub tlb_lo: [u32; 4],
-
-    pub memadr: u32,
-    pub size: u32,
-    pub stride: u32,
-    pub gio_adr: u32,
-    pub mode: u32,
-    pub count: u32,
-    pub run: u32,
-    pub stdma: u32,
-    // prom tests if dma is running right after starting it, but we are too quick for it and complete and reset running bit before it happens
-    // so we are going to latch the run bit in run register and clear it according to run_real on read.
-    pub run_real: bool,
-}
-
-pub struct GioDma {
-    pub state: Mutex<GioDmaState>,
-    pub cond: Condvar,
-}
-
-impl GioDma {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(GioDmaState {
-                gio_mask: 0,
-                gio_sub: 0,
-                cause: 0,
-                ctl: 0,
-                tlb_hi: [0; 4],
-                tlb_lo: [0; 4],
-                memadr: 0,
-                size: 0,
-                stride: 0,
-                gio_adr: 0,
-                mode: 0,
-                count: 0,
-                run: 0,
-                stdma: 0,
-                run_real: false,
-            }),
-            cond: Condvar::new(),
-        }
-    }
-}
 
 struct MemoryControllerState {
     regs: Vec<u32>,
@@ -159,6 +82,14 @@ pub struct MemoryController {
     vdma_debug: Arc<AtomicBool>,
     /// Log file for VDMA transactions (set when vdma_debug is enabled).
     vdma_log: Arc<Mutex<Option<std::fs::File>>>,
+    /// Staging buffer for the batched VDMA paths (see `VDMA_CHUNK_QWORDS`).
+    ///
+    /// Allocated once and reused: the transfer path gathers into it and hands
+    /// the slice to the device, so an allocation per transfer would be pure
+    /// overhead. Behind a Mutex because `dma_worker` is a thread and the buffer
+    /// is per-controller, not per-transfer — uncontended in practice, since
+    /// only that one thread runs transfers.
+    vdma_stage: Arc<Mutex<Box<[u64]>>>,
 }
 
 impl MemoryController {
@@ -190,6 +121,8 @@ impl MemoryController {
             event_tx: Arc::new(OnceLock::new()),
             vdma_debug: Arc::new(AtomicBool::new(false)),
             vdma_log: Arc::new(Mutex::new(None)),
+            vdma_stage: Arc::new(Mutex::new(
+                vec![0u64; crate::mc_vdma::VDMA_CHUNK_QWORDS].into_boxed_slice())),
         }
     }
 
@@ -461,338 +394,24 @@ impl MemoryController {
         eprintln!("MC: GIO Timeout at {:08x}", addr);
     }
 
-    fn signal_dma_interrupt(&self) {
-        if let Some(ioc) = &self.state.lock().ioc {
-            ioc.set_interrupt(IocInterrupt::McDma, true);
-        }
-    }
+    // ── Accessors for the DMA engine in mc_vdma.rs ──────────────────────────
+    // The fields stay private to mc.rs; mc_vdma reaches them through these.
 
-    fn translate_addr(&self, vaddr: u32, writing: bool) -> Option<u32> {
-        let mut state = self.giodma.state.lock();
+    pub(crate) fn giodma(&self) -> &Arc<GioDma> { &self.giodma }
 
-        if (state.ctl & DMA_CTL_XLATE) == 0 {
-            return Some(vaddr);
-        }
+    pub(crate) fn phys(&self) -> Option<&Arc<dyn BusDevice>> { self.phys.get() }
 
-        // GIO CTL[1]: page size (0=4KB, 1=16KB)
-        // GIO CTL[0]: PTE size  (0=4B,  1=8B)
-        let page_16k  = (state.ctl & 0x2) != 0;
-        let pte_8byte = (state.ctl & 0x1) != 0;
-        let (page_shift, page_mask): (u32, u32) = if page_16k { (14, 0x3fff) } else { (12, 0xfff) };
-        let pte_shift = if pte_8byte { 3 } else { 2 };
+    /// The IOC handle, cloned out so the caller does not hold the MC state lock
+    /// while raising an interrupt.
+    pub(crate) fn ioc(&self) -> Option<Ioc> { self.state.lock().ioc.clone() }
 
-        // VPNhi: top 10 bits [31:22] match µTLB tag
-        for i in 0..4 {
-            let tlb_hi = state.tlb_hi[i];
-            let tlb_lo = state.tlb_lo[i];
+    pub(crate) fn dma_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
 
-            if (vaddr & 0xffc00000) != (tlb_hi & 0xffc00000) {
-                continue;
-            }
+    pub(crate) fn vdma_debug_enabled(&self) -> bool { self.vdma_debug.load(Ordering::Relaxed) }
 
-            // Check Valid bit (bit 1)
-            if (tlb_lo & 2) == 0 {
-                dlog_dev!(LogModule::Mc, "MC: DMA TLB hit but invalid entry {} for vaddr={:#010x}", i, vaddr);
-                state.cause |= DMA_CAUSE_TLB_MISS;
-                drop(state);
-                self.signal_dma_interrupt();
-                return None;
-            }
+    pub(crate) fn vdma_log(&self) -> &Mutex<Option<std::fs::File>> { &self.vdma_log }
 
-            // PTEBase is bits [25:6] of TLBLO (mask 0x03ffffc0), shifted left 6 → phys addr
-            let pte_base_addr = (tlb_lo & 0x03ffffc0) << 6;
-            // VPNlo: bits [21:page_shift], index into page table
-            let vpn_lo = (vaddr & 0x003fffff) >> page_shift;
-            let pte_addr = pte_base_addr + (vpn_lo << pte_shift);
-
-            drop(state);
-
-            if let Some(phys) = self.phys.get() {
-                // Read PTE — 4 or 8 bytes. For 8-byte PTEs, read64 and take the low word.
-                let pte_opt = if pte_8byte {
-                    { let _r = phys.read64(pte_addr); if _r.is_ok() { Some(_r.data as u32) } else { None } }
-                } else {
-                    { let _r = phys.read32(pte_addr); if _r.is_ok() { let d = _r.data as _; Some(d) } else { None } }
-                };
-
-                if let Some(pte) = pte_opt {
-                    // PTE valid bit (bit 1)
-                    if (pte & 2) == 0 {
-                        dlog_dev!(LogModule::Mc, "MC: DMA page fault vaddr={:#010x} pte_addr={:#010x} pte={:#010x}", vaddr, pte_addr, pte);
-                        let mut state = self.giodma.state.lock();
-                        state.cause |= DMA_CAUSE_FAULT;
-                        drop(state);
-                        self.signal_dma_interrupt();
-                        return None;
-                    }
-
-                    if writing && (pte & 0x4) == 0 {
-                        dlog_dev!(LogModule::Mc, "MC: DMA clean fault vaddr={:#010x} pte={:#010x}", vaddr, pte);
-                        let mut state = self.giodma.state.lock();
-                        state.cause |= DMA_CAUSE_CLEAN;
-                        drop(state);
-                        self.signal_dma_interrupt();
-                        return None;
-                    }
-
-                    // PFN: bits [29:6], physical addr = (PFN << page_shift) | page_offset
-                    let phys_addr = ((pte & 0x03ffffc0) << 6) | (vaddr & page_mask);
-                    return Some(phys_addr);
-                }
-            }
-            dlog_dev!(LogModule::Mc, "MC: DMA phys read failed for pte_addr={:#010x} (page_16k={} pte_8byte={})", pte_addr, page_16k, pte_8byte);
-            return None;
-        }
-
-        // No µTLB match
-        dlog_dev!(LogModule::Mc, "MC: DMA TLB miss vaddr={:#010x} tlb_hi={:#010x?}", vaddr, state.tlb_hi);
-        state.cause |= DMA_CAUSE_TLB_MISS;
-        drop(state);
-        self.signal_dma_interrupt();
-        None
-    }
-
-    fn dma_worker(&self) {
-        let giodma = self.giodma.clone();
-        let (lock, cvar) = (&giodma.state, &giodma.cond);
-
-        let mut state = lock.lock();
-        while self.running.load(Ordering::Relaxed) {
-            // Wait for run signal
-            cvar.wait(&mut state);
-
-            if !self.running.load(Ordering::Relaxed) { break; }
-
-            state.run |= DMA_RUN_RUN; // ensure set (may already be set by write handler)
-
-            // Latch all settings before dropping lock
-            let mut line_count = (state.size >> 16) & 0xFFFF;
-            let line_width    = state.size & 0xFFFF;
-            let line_zoom     = (state.stride >> 16) & 0x3FF;
-            let stride        = (state.stride as i16) as i32;
-            let mut zoom_count = (state.count >> 16) & 0x3FF;
-            let mut byte_count = state.count & 0xFFFF;
-            let gio_addr      = state.gio_adr & !7u32; // GIO bus is 64-bit; low 3 bits are don't-care
-            let mut mem_vaddr = state.memadr;
-            let mode_reg      = state.mode;
-            let to_host       = (mode_reg & DMA_MODE_TO_HOST) != 0;
-            let fill          = (mode_reg & DMA_MODE_FILL) != 0;
-            let dir_up        = (mode_reg & DMA_MODE_DIR) != 0;
-            let ctl           = state.ctl;
-            let ie            = (ctl & DMA_CTL_INT_ENABLE) != 0;
-            let xlate         = (ctl & DMA_CTL_XLATE) != 0;
-            let mut exc       = false;
-
-            // Word-aligned: memory addr, stride, line_width, byte_count and gio_addr all 4-byte aligned
-            let word_aligned = (mem_vaddr & 3 == 0) && (stride & 3 == 0)
-                            && (line_width & 3 == 0) && (byte_count & 3 == 0)
-                            && (gio_addr & 3 == 0);
-
-            let start_time = crate::platform::get_host_ticks();
-            dlog_dev!(LogModule::Mc, "MC: DMA latched: line_count={} line_width={:#x} line_zoom={} zoom_count={} byte_count={:#x} stride={} count={:#010x}",
-                line_count, line_width, line_zoom, zoom_count, byte_count, stride, state.count);
-            dlog_dev!(LogModule::Mc, "MC: DMA Started. Mem: {:08x}, GIO: {:08x}, Size: {:08x}, Mode: {:08x} \
-                (to_host={} fill={} dir_up={}) Xlate: {} word_aligned: {}",
-                mem_vaddr, gio_addr, state.size, mode_reg,
-                to_host, fill, dir_up, xlate, word_aligned);
-
-            // Snapshot the µTLB while state is still locked, for the vdma_log page-table
-            // dump below — translate_addr() re-reads this per-page during the transfer,
-            // but the log only needs the entries valid at transfer start.
-            let tlb_snapshot = if self.vdma_debug.load(Ordering::Relaxed) {
-                Some((state.tlb_hi, state.tlb_lo))
-            } else {
-                None
-            };
-
-            drop(state);
-
-            if let Some((tlb_hi, tlb_lo)) = tlb_snapshot {
-                if let Some(f) = self.vdma_log.lock().as_mut() {
-                    let page_16k  = (ctl & 0x2) != 0;
-                    let pte_8byte = (ctl & 0x1) != 0;
-                    let _ = writeln!(f,
-                        "VDMA start: dir={} mode={}{} mem={:08x} gio={:08x} xlate={} page={} pte={}B",
-                        if to_host { "gio->mem" } else { "mem->gio" },
-                        if fill { "fill" } else { "copy" },
-                        if dir_up { "" } else { " dir_down" },
-                        mem_vaddr, gio_addr, xlate,
-                        if page_16k { "16K" } else { "4K" },
-                        if pte_8byte { 8 } else { 4 });
-                    let _ = writeln!(f,
-                        "  block: line_count={} line_width={:#x} line_zoom={} zoom_count={} byte_count={:#x} stride={}",
-                        line_count, line_width, line_zoom, zoom_count, byte_count, stride);
-                    if xlate {
-                        let _ = writeln!(f, "  uTLB:");
-                        for i in 0..4 {
-                            let hi = tlb_hi[i];
-                            let lo = tlb_lo[i];
-                            let valid = (lo & 2) != 0;
-                            let pte_base = (lo & 0x03ffffc0) << 6;
-                            let _ = writeln!(f, "    [{i}] vpnhi={:08x} valid={valid} pte_base={pte_base:08x}",
-                                hi & 0xffc00000);
-                        }
-                    }
-                }
-            }
-
-            if let Some(phys) = self.phys.get() {
-                // ── Fast path: word-aligned fill to host, no translation ──────────────
-                // Handles both stride==0 (flat) and stride!=0 (line gaps).
-                // Each "line" is line_zoom repetitions of line_width bytes, then stride advance.
-                if word_aligned && fill && to_host && !xlate {
-                    dlog_dev!(LogModule::Mc, "MC: DMA using FILL FAST PATH (stride={})", stride);
-                    while line_count > 0 {
-                        line_count -= 1;
-                        let line_start = mem_vaddr;
-                        let mut zc = zoom_count;
-                        while zc > 0 {
-                            zc -= 1;
-                            let mut bc = byte_count;
-                            let mut addr = mem_vaddr;
-                            while bc > 0 {
-                                phys.write32(addr, gio_addr);
-                                addr = addr.wrapping_add(4);
-                                bc -= 4;
-                            }
-                            byte_count = line_width;
-                            if zc > 0 {
-                                // zoom rewind: stay at line_start for next zoom rep
-                                mem_vaddr = line_start;
-                            } else {
-                                mem_vaddr = addr;
-                            }
-                        }
-                        zoom_count = line_zoom;
-                        mem_vaddr = (mem_vaddr as i32).wrapping_add(stride) as u32;
-                        let _ = line_start; // suppress unused warning
-                    }
-                }
-                // GIO side uses 64-bit (qword) transactions; memory side uses bytes.
-                // For fill+to_host the inner unit is 4 bytes (dword).
-                else {
-                    {
-                        let path = if word_aligned && !xlate { "WORD" } else { "BYTE" };
-                        dlog_dev!(LogModule::Mc, "MC: DMA using {} PATH (to_host={} fill={} xlate={} stride={})",
-                            path, to_host, fill, xlate, stride);
-                    }
-
-                    'dma_loop: while line_count > 0 {
-                        line_count -= 1;
-                        while zoom_count > 0 {
-                            zoom_count -= 1;
-                            while byte_count > 0 {
-                                if to_host {
-                                    if fill {
-                                        // Fill: write gio_addr as dword to memory, step 4
-                                        let phys_addr = if xlate {
-                                            match self.translate_addr(mem_vaddr, true) {
-                                                Some(a) => a,
-                                                None => { exc = true; break 'dma_loop; }
-                                            }
-                                        } else { mem_vaddr };
-                                        phys.write32(phys_addr, gio_addr);
-                                        if dir_up { mem_vaddr = mem_vaddr.wrapping_add(4); }
-                                        else       { mem_vaddr = mem_vaddr.wrapping_sub(4); }
-                                        byte_count = byte_count.saturating_sub(4);
-                                    } else {
-                                        // GIO -> Mem: read qword from GIO, unpack bytes to memory.
-                                        // Spin on BUS_BUSY (GRXDLY / pipeline not idle) — DMA worker
-                                        // thread has no EXEC_RETRY mechanism, so we busy-wait here.
-                                        let length = byte_count.min(8);
-                                        let data = loop {
-                                            let r = phys.dma_read64(gio_addr);
-                                            if r.is_ok() { break r.data; }
-                                            if r.status != crate::traits::BUS_BUSY { break 0u64; }
-                                            std::hint::spin_loop();
-                                        };
-                                        let mut shift = 56u32;
-                                        for _ in 0..length {
-                                            let byte = (data >> shift) as u8;
-                                            let phys_addr = if xlate {
-                                                match self.translate_addr(mem_vaddr, true) {
-                                                    Some(a) => a,
-                                                    None => { exc = true; break 'dma_loop; }
-                                                }
-                                            } else { mem_vaddr };
-                                            phys.write8(phys_addr, byte);
-                                            if dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
-                                            else       { mem_vaddr = mem_vaddr.wrapping_sub(1); }
-                                            shift = shift.wrapping_sub(8);
-                                        }
-                                        byte_count = byte_count.saturating_sub(length);
-                                    }
-                                } else {
-                                    // Mem -> GIO: pack bytes from memory into qword, write to GIO
-                                    let length = byte_count.min(8);
-                                    let mut data = 0u64;
-                                    let mut shift = 56u32;
-                                    for _ in 0..length {
-                                        let phys_addr = if xlate {
-                                            match self.translate_addr(mem_vaddr, false) {
-                                                Some(a) => a,
-                                                None => { exc = true; break 'dma_loop; }
-                                            }
-                                        } else { mem_vaddr };
-                                        let byte = { let _r = phys.read8(phys_addr); if _r.is_ok() { let b = _r.data as _; b } else { 0 } };
-                                        data |= (byte as u64) << shift;
-                                        if dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
-                                        else       { mem_vaddr = mem_vaddr.wrapping_sub(1); }
-                                        shift = shift.wrapping_sub(8);
-                                    }
-                                    // Spin on BUS_BUSY, same as the GIO->Mem read
-                                    // path above: the DMA worker has no EXEC_RETRY
-                                    // mechanism, so dropping the status here would
-                                    // silently lose pixel data whenever REX3's GFIFO
-                                    // is full (write64 reports BUS_BUSY rather than
-                                    // blocking, so the CPU can retry — but only a
-                                    // caller that checks it actually retries).
-                                    while phys.dma_write64(gio_addr, data)
-                                        == crate::traits::BUS_BUSY
-                                    {
-                                        std::hint::spin_loop();
-                                    }
-                                    byte_count = byte_count.saturating_sub(length);
-                                }
-                            }
-                            byte_count = line_width;
-                            if zoom_count > 0 {
-                                if dir_up { mem_vaddr = mem_vaddr.wrapping_sub(line_width); }
-                                else       { mem_vaddr = mem_vaddr.wrapping_add(line_width); }
-                            }
-                        }
-                        zoom_count = line_zoom;
-                        mem_vaddr = (mem_vaddr as i32).wrapping_add(stride) as u32;
-                    }
-                }
-            } else {
-                exc = true;
-            }
-
-            let end_time = crate::platform::get_host_ticks();
-            let elapsed = end_time.wrapping_sub(start_time);
-            let freq = crate::platform::get_host_tick_frequency();
-            let elapsed_us = (elapsed as f64 / freq as f64) * 1_000_000.0;
-            dlog_dev!(LogModule::Mc, "MC: DMA Finished in {:.3} us ({} ticks)", elapsed_us, elapsed);
-
-            if self.vdma_debug.load(Ordering::Relaxed) {
-                if let Some(f) = self.vdma_log.lock().as_mut() {
-                    let _ = writeln!(f, "VDMA end: mem={:08x} fault={} {:.3}us", mem_vaddr, exc, elapsed_us);
-                }
-            }
-
-            state = lock.lock();
-            state.memadr = mem_vaddr;
-            state.size &= 0x0000ffff; // line_count → 0, line_width preserved
-            state.count = 0;          // zoom_count and byte_count → 0
-            if ie && !exc {
-                state.cause |= DMA_CAUSE_COMPLETE;
-                self.signal_dma_interrupt();
-            }
-            state.run_real = false;
-            state.run |= state.cause & 0xF;
-        }
-    }
+    pub(crate) fn vdma_stage(&self) -> &Mutex<Box<[u64]>> { &self.vdma_stage }
 
     pub fn register_locks(&self) {
         use crate::locks::register_lock_fn;
@@ -802,6 +421,11 @@ impl MemoryController {
         register_lock_fn("mc::state",        move || state.is_locked());
         let threads = self.threads.clone();
         register_lock_fn("mc::threads",      move || threads.is_locked());
+        // Held across REX3 bus calls (which take REX3's own locks and can
+        // wait_idle), so it must be visible to the deadlock detector even
+        // though only the MC-DMA thread ever acquires it.
+        let stage = self.vdma_stage.clone();
+        register_lock_fn("mc::vdma_stage",   move || stage.is_locked());
     }
 }
 

@@ -64,10 +64,49 @@ pub const GFIFO_DISP_SYNC: u32 = 0xFFFF_0002;
 /// touching any context field. Exists so MC's VDMA worker can prime/advance the HOSTRW
 /// read-then-advance pipeline via the normal GFIFO path (correct ordering relative to
 /// concurrent CPU-driven register writes) without needing its own bespoke sentinel.
-/// GO bit (0x0800) is baked in, mirroring GFIFO_PURE_GO's convention.
-pub const REX3_DMA_PURE_GO: u32 = 0x1FF0 | 0x0800;
+/// The GO bit (0x0800) is already set in the value itself — 0x1FF0 has bit 11
+/// — mirroring GFIFO_PURE_GO's convention. Do not re-OR it in; that reads as
+/// if it were setting the bit when it is merely a no-op.
+pub const REX3_DMA_PURE_GO: u32 = 0x1FF0;
 /// REX3_DMA_PURE_GO with the GO bit stripped — the reg_offset seen by process_register.
 pub const REX3_DMA_PURE_GO_REG: u32 = REX3_DMA_PURE_GO & !0x0800;
+
+/// Capacity of the HOSTRW data port array, in 64-bit words (1 MiB of u64).
+///
+/// A transfer larger than this is chunked by the caller — which it would have
+/// to be at any size, so the size trades round trips against footprint rather
+/// than capping anything.
+pub const HOSTRW_BUF_QWORDS: usize = (1024 * 1024) / 8;
+
+/// Internal-only offset (as REX3_DMA_PURE_GO, one slot below it): a **batched**
+/// HOSTRW write. `val` carries the qword count; the payload itself has already
+/// carried by the GFIFO entries that follow the token, which the register
+/// pushed.
+///
+/// One token stands in for what used to be N separate `dma_write64` pushes, so
+/// a full-line blit costs one GFIFO round trip instead of one per 8 bytes. The
+/// register processor sets `host_cursor = 0`, `host_len = count`, and the GO
+/// bit runs the shader once over the whole run.
+pub const REX3_DMA_BATCH_W: u32 = 0x1FE0; // bit 11 (GO) already set
+/// REX3_DMA_BATCH_W with the GO bit stripped — the reg_offset seen by process_register.
+pub const REX3_DMA_BATCH_W_REG: u32 = REX3_DMA_BATCH_W & !0x0800;
+
+/// Internal-only offset: a **batched** HOSTRW read. `val` carries the qword
+/// count the shader should produce into `Rex3Context::hostrw`.
+///
+/// Replaces one `wait_idle()` full-pipeline drain per qword with one per batch:
+/// the consumer sets `host_cursor = 0`, `host_len = count`, runs the shader
+/// once, and `dma_read64_bulk` then copies the filled buffer out.
+pub const REX3_DMA_BATCH_R: u32 = 0x1FD0; // bit 11 (GO) already set
+/// REX3_DMA_BATCH_R with the GO bit stripped — the reg_offset seen by process_register.
+pub const REX3_DMA_BATCH_R_REG: u32 = REX3_DMA_BATCH_R & !0x0800;
+
+/// Address marking a GFIFO entry as batch *payload* rather than a register
+/// write. Entries carrying these follow a `REX3_DMA_BATCH_W` token and are
+/// consumed by it; encountering one on its own is inert.
+///
+/// No GO bit, so `process_register` sees this value directly as reg_offset.
+pub const GFIFO_PAYLOAD: u32 = 0xFFFF_0003;
 pub const REX3_COORD_BIAS: i32 = 4096; // Physical coordinate system offset.
 pub const REX3_SCREEN_WIDTH: i32 = 1344; // 1280 displayable + 64 off-screen.
 pub const REX3_SCREEN_HEIGHT: i32 = 1024; // Max displayable height.
@@ -226,7 +265,7 @@ pub(crate) fn decode_dm1(v: u32) -> String {
     format!("{} {} host:{} cmp:{} logicop:{}{}", planes, depth, hdepth, dm.compare(), logicop, flags)
 }
 
-fn rex3_reg_name(offset: u32) -> &'static str {
+pub(crate) fn rex3_reg_name(offset: u32) -> &'static str {
     match offset {
         REX3_DRAWMODE1 => "DRAWMODE1",
         REX3_DRAWMODE0 => "DRAWMODE0",
@@ -301,6 +340,14 @@ fn rex3_reg_name(offset: u32) -> &'static str {
         REX3_STATUS => "STATUS",
         REX3_USER_STATUS => "USER_STATUS",
         REX3_DCBRESET => "DCBRESET",
+        // Internal GFIFO sentinels. Not hardware registers, but they travel the
+        // same path and reach the bus log with the GO bit already stripped, so
+        // without these they show up as a bare "UNKNOWN" — which is exactly
+        // what a real unmapped register looks like.
+        REX3_DMA_PURE_GO_REG => "DMA_PURE_GO",
+        REX3_DMA_BATCH_W_REG => "DMA_BATCH_W",
+        REX3_DMA_BATCH_R_REG => "DMA_BATCH_R",
+        GFIFO_PURE_GO_REG => "GFIFO_PURE_GO",
         _ => "UNKNOWN",
     }
 }
@@ -852,6 +899,32 @@ impl DrawRingBuf {
         }
     }
 
+    /// Batched form of `on_hostrw_write`: one DMA token delivers `n` words in a
+    /// single call, so counting it as one write makes the overlay report
+    /// `0/4802` (or `1/4802`) for a transfer that actually carried everything.
+    pub fn on_hostrw_writes(&mut self, n: u32) {
+        if let Some(idx) = self.pending {
+            let r = &mut self.entries[idx];
+            if r.expected_words > 0 {
+                r.hostrw_writes += n;
+            } else {
+                r.spurious_writes += n;
+            }
+        }
+    }
+
+    /// Batched form of `on_hostrw_read`.
+    pub fn on_hostrw_reads(&mut self, n: u32) {
+        if let Some(idx) = self.pending {
+            let r = &mut self.entries[idx];
+            if r.expected_words > 0 {
+                r.hostrw_reads += n;
+            } else {
+                r.spurious_reads += n;
+            }
+        }
+    }
+
     /// Called on every HOSTRW read (32-bit or 64-bit).
     /// Increments `hostrw_reads` on the pending draw, or `spurious_reads` if colorhost=0.
     pub fn on_hostrw_read(&mut self) {
@@ -874,6 +947,37 @@ impl DrawRingBuf {
             &self.entries[idx]
         })
     }
+}
+
+/// The HOSTRW data port's backing array.
+///
+/// A newtype purely so `Rex3Context` can keep `#[derive(Default, Debug)]`:
+/// Rust implements neither for arrays longer than 32. Transparent repr, so the
+/// field offset the JIT computes is the array's own address.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct HostRwArray(pub [u64; HOSTRW_BUF_QWORDS]);
+
+impl Default for HostRwArray {
+    fn default() -> Self { Self([0; HOSTRW_BUF_QWORDS]) }
+}
+
+impl std::fmt::Debug for HostRwArray {
+    /// Prints the length, not a megabyte of zeroes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HostRwArray[{}]", HOSTRW_BUF_QWORDS)
+    }
+}
+
+impl std::ops::Index<usize> for HostRwArray {
+    type Output = u64;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &u64 { &self.0[i] }
+}
+
+impl std::ops::IndexMut<usize> for HostRwArray {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut u64 { &mut self.0[i] }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -929,9 +1033,19 @@ pub struct Rex3Context {
     pub topscan: u32,
     pub xywin: u32,
     pub clipmode: u32,
-    pub hostrw: u64,
     pub host_shifter: u64,
     pub hostcnt: u32,
+    /// Index of the next qword in `hostrw`. Always <= `host_len`.
+    ///
+    /// Not snapshotted, and correctly so: a transfer lives entirely inside one
+    /// `execute_go`, which runs on the GFIFO consumer thread with the queue
+    /// drained, so no snapshot can observe one in flight.
+    pub host_cursor: u32,
+    /// Number of valid qwords in `hostrw` for the current transfer.
+    ///
+    /// A PIO register write sets this to 1; a DMA batch sets it to the batch
+    /// size. Zero means nothing is loaded.
+    pub host_len: u32,
     /// Bit index (31..=0) for lspattern with lsmode repeat/length; reset to 31 at GO start and each new row.
     pub pat_bit: u8,
     /// Bit index (31..=0) for zpattern; always 32-bit repeating, reset to 31 at GO start and each new row.
@@ -958,6 +1072,25 @@ pub struct Rex3Context {
     /// compared. `Rex3Context` is `Copy`, and copies share the pointer, which is
     /// correct — they all refer to the same device.
     pub host: *const Rex3,
+
+    /// The HOSTRW data port — an **array**, not a scalar.
+    ///
+    /// Every access is `hostrw[host_cursor]`: a PIO register write is just
+    /// `host_len = 1` with the cursor at 0, and a DMA transfer is the same
+    /// thing with a larger length. That is the whole point of making this an
+    /// array — there is no batched-vs-single branch anywhere downstream, only
+    /// a count. It is inline storage, so it always exists and can never be
+    /// absent.
+    ///
+    /// **Must stay the last field.** `repr(C)` lays fields out in declaration
+    /// order, and the JIT addresses every scalar by `offset_of!` as a Cranelift
+    /// `Offset32` immediate. With a megabyte sitting mid-struct, everything
+    /// after it lands at a ~1 MB offset and the generated loads/stores go
+    /// wrong — which showed up as smask/zpattern/cid JIT tests failing while
+    /// the interpreter stayed correct. Keeping the array last leaves every
+    /// scalar at a small offset and the array's own base is reached by a
+    /// register anyway.
+    pub hostrw: HostRwArray,
 }
 
 // Safety: `host` is only ever set to the owning Rex3, which outlives every
@@ -974,7 +1107,83 @@ impl Rex3Context {
     pub fn power_on_default() -> Self {
         let mut ctx = Self::default();
         ctx.drawmode1 = DrawMode1(ctx.drawmode1.0 | (0x7 << 12));
+        // The data port always holds at least the one word PIO uses. A zero
+        // count would make the shader treat a plain HOSTRW register write as an
+        // empty transfer; 1 is the resting state, and only a batch token
+        // raises it.
+        ctx.host_len = 1;
         ctx
+    }
+
+    // ── HOSTRW array access ─────────────────────────────────────────────────
+    //
+    // Every read/write of the data port goes through these. `host_cursor` picks
+    // the element; PIO leaves it at 0 with `host_len == 1`, a DMA batch walks it
+    // across the run. Nothing downstream distinguishes the two cases.
+
+    /// The current HOSTRW word — `hostrw[host_cursor]`.
+    ///
+    /// For the resting `host_len == 1` the cursor is always 0, so this is
+    /// element 0: the same slot the compiled shaders address by fixed offset.
+    #[inline(always)]
+    pub fn hostrw_get(&self) -> u64 {
+        self.hostrw[self.hostrw_index()]
+    }
+
+    /// Store to the current HOSTRW word.
+    #[inline(always)]
+    pub fn hostrw_set(&mut self, val: u64) {
+        let i = self.hostrw_index();
+        self.hostrw[i] = val;
+    }
+
+    /// The element the port currently addresses.
+    ///
+    /// Clamped to the last valid word: the cursor may sit one past the end
+    /// after the final `hostrw_advance`, and a PIO read after a transfer must
+    /// still see the word that was written.
+    #[inline(always)]
+    fn hostrw_index(&self) -> usize {
+        let last = self.host_len.saturating_sub(1);
+        (self.host_cursor.min(last) as usize).min(HOSTRW_BUF_QWORDS - 1)
+    }
+
+    /// Arm the port for a single-word PIO access: cursor 0, length 1.
+    ///
+    /// This is what makes a register write indistinguishable from a one-word
+    /// DMA batch downstream.
+    #[inline(always)]
+    pub fn hostrw_arm_single(&mut self) {
+        self.host_cursor = 0;
+        self.host_len = 1;
+    }
+
+    /// Has the whole transfer been consumed?
+    ///
+    /// The cursor counts words *taken*, so it runs from 0 up to `host_len`.
+    /// The walkers call this at a word boundary, after `fetch_host_pixel` has
+    /// loaded a word and stepped past it, so `cursor == host_len` means the
+    /// last word has been used.
+    ///
+    /// With the resting `host_len == 1` this is true after one word, which
+    /// reproduces the old one-word-per-GO rule exactly.
+    #[inline(always)]
+    pub fn hostrw_drained(&self) -> bool {
+        self.host_cursor >= self.host_len
+    }
+
+
+    /// Step past the word just taken.
+    ///
+    /// The cursor may reach `host_len` (one past the end); `hostrw_index`
+    /// clamps, so an over-long primitive re-reads the last word instead of
+    /// running off the array — the same thing the scalar port did when the CPU
+    /// under-fed HOSTRW. Saturates there rather than wrapping.
+    #[inline(always)]
+    pub fn hostrw_advance(&mut self) {
+        if self.host_cursor < self.host_len {
+            self.host_cursor += 1;
+        }
     }
 
     pub fn set_colori(&mut self, val: u32) {
@@ -1223,6 +1432,64 @@ impl GFifo {
         true
     }
 
+    /// Push a batch token followed by its payload words, as one atomic unit.
+    ///
+    /// The token carries the count; the `vals.len()` entries after it carry the
+    /// data, and the consumer streams them into `ctx.hostrw[]`. Payload entries
+    /// reuse `GFIFO_PAYLOAD` as their address so a stray read of one outside a
+    /// batch is inert rather than being mistaken for a register write.
+    ///
+    /// Capacity for token + payload is checked before a single slot is written,
+    /// so this is all-or-nothing in the same way `try_push2` is: the DMA worker
+    /// has no EXEC_RETRY, and a partial commit followed by a retry would
+    /// duplicate the prefix.
+    ///
+    /// Blocks rather than reporting busy. The batch may be larger than the
+    /// queue, so "wait for room" is the only workable contract; callers are the
+    /// DMA worker, which has nothing better to do, never the CPU store path.
+    pub fn push_batch(&self, token: u32, count_val: u64, vals: &[u64]) {
+        let need = vals.len() + 1;
+        assert!(need < GFIFO_DEPTH, "batch of {} exceeds GFIFO capacity", vals.len());
+        loop {
+            if self.lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                std::hint::spin_loop();
+                continue;
+            }
+            let tail = self.tail.load(Ordering::Relaxed);
+            let head = self.head.load(Ordering::Acquire);
+            self.shadow_head.set(head);
+            // Free slots, keeping the one-empty-slot invariant the ring uses to
+            // distinguish full from empty.
+            let used = tail.wrapping_sub(head) & GFIFO_MASK;
+            let free = GFIFO_MASK - used;
+            if free < need {
+                // Not enough room yet — drop the lock so the consumer can drain.
+                self.lock.store(false, Ordering::Release);
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: we hold the lock and have verified capacity for all
+            // `need` slots; no other producer touches them.
+            unsafe {
+                let slot = self.buf.as_ptr().add(tail) as *mut GFIFOEntry;
+                (*slot).addr = token;
+                (*slot).val  = count_val;
+                let mut idx = tail;
+                for &v in vals {
+                    idx = idx.wrapping_add(1) & GFIFO_MASK;
+                    let slot = self.buf.as_ptr().add(idx) as *mut GFIFOEntry;
+                    (*slot).addr = GFIFO_PAYLOAD;
+                    (*slot).val  = v;
+                }
+            }
+            let new_tail = tail.wrapping_add(need) & GFIFO_MASK;
+            // One Release publishes the token and every payload slot.
+            self.tail.store(new_tail, Ordering::Release);
+            self.lock.store(false, Ordering::Release);
+            return;
+        }
+    }
+
     /// Push an entry, spinning until it fits. Safe to call from multiple
     /// producers concurrently.
     ///
@@ -1258,6 +1525,84 @@ impl GFifo {
     /// Advance head past the current entry after it has been fully processed.
     /// Must follow a successful `peek()`.
     #[inline]
+    /// Consume up to `n` payload entries that follow a batch token, copying
+    /// their values into `dst`. Returns how many were taken.
+    ///
+    /// The producer wrote the token and all of its payload under one lock with
+    /// a single Release on tail, so once the token is visible every payload
+    /// entry behind it is too — this never has to wait.
+    /// Test hook: pretend only `t` entries have been published yet.
+    ///
+    /// `push_batch` publishes a whole batch with one Release, so a consumer
+    /// that sees the token always sees the payload too — which makes it
+    /// impossible to test the drain loop's mid-batch behaviour honestly
+    /// without this. Not compiled into a normal build.
+    #[cfg(test)]
+    pub fn rewind_tail_for_test(&self, t: usize) {
+        self.tail.store(t & GFIFO_MASK, Ordering::Release);
+        self.shadow_tail.set(t & GFIFO_MASK);
+    }
+
+    /// Test hook: publish up to `t` entries, undoing `rewind_tail_for_test`.
+    #[cfg(test)]
+    pub fn restore_tail_for_test(&self, t: usize) {
+        self.tail.store(t & GFIFO_MASK, Ordering::Release);
+    }
+
+    pub fn drain_payload(&self, n: usize, dst: &mut HostRwArray) -> usize {
+        // `local_head` still points at the token: the consumer loop peeks and
+        // only calls `consume()` after process_register returns. Step over it
+        // so we start at the first payload slot, and leave it stepped — the
+        // caller's `consume()` then retires the last payload entry instead of
+        // the token, keeping the head advance exactly `1 + taken` overall.
+        let mut head = self.local_head.get().wrapping_add(1) & GFIFO_MASK;
+        let mut tail = self.tail.load(Ordering::Acquire);
+        let mut taken = 0;
+        // Drain EXACTLY the promised count. The token says N words follow, and
+        // `push_batch` publishes the token and all N under one Release, so they
+        // are guaranteed to be there — but `tail` is sampled once and a batch
+        // is far bigger than the 64-entry head-publish interval, so a single
+        // sample can sit mid-batch. Returning short there would silently drop
+        // the rest of an image: the caller has no way to tell a truncated
+        // drain from a complete one, and the pixels are simply gone.
+        //
+        // Re-sample `tail` instead of stopping. A payload entry that is not yet
+        // visible is only a matter of waiting for the producer's Release store,
+        // which has already happened logically — this cannot deadlock, because
+        // `push_batch` publishes the whole batch before it ever returns.
+        while taken < n {
+            if head == tail {
+                tail = self.tail.load(Ordering::Acquire);
+                if head == tail {
+                    std::hint::spin_loop();
+                    continue;
+                }
+            }
+            // SAFETY: consumer owns head; the slot was published with the token.
+            let slot = unsafe { &*self.buf.as_ptr().add(head) };
+            // There is no legitimate non-payload slot inside a batch:
+            // `push_batch` writes the token and all N payload entries under
+            // one lock and publishes them with a single Release. Anything else
+            // here means the token/payload pairing is broken and pixel data is
+            // already being lost, so say so loudly rather than absorbing it.
+            // Still consumes the slot: stopping short would desync the head
+            // from the count the caller was promised.
+            #[cfg(feature = "developer")]
+            if slot.addr != GFIFO_PAYLOAD {
+                eprintln!("!!!!!!!!!! GFIFO BATCH CORRUPTION !!!!!!!!!! slot {taken} of {n} \
+has addr={:#010x}, expected GFIFO_PAYLOAD ({:#010x}) — token/payload pairing is broken \
+and pixel data is being lost", slot.addr, GFIFO_PAYLOAD);
+            }
+            dst[taken] = slot.val;
+            taken += 1;
+            head = head.wrapping_add(1) & GFIFO_MASK;
+        }
+        self.shadow_tail.set(tail);
+        // Rewind by one: the caller's consume() advances past the final entry.
+        self.local_head.set(head.wrapping_sub(1) & GFIFO_MASK);
+        taken
+    }
+
     pub fn consume(&self) {
         let head = self.local_head.get();
         let next_head = head.wrapping_add(1) & GFIFO_MASK;
@@ -1821,6 +2166,11 @@ impl Rex3 {
     #[cfg(feature = "developer")]
     #[inline(always)]
     fn note_hostrw_write(&self) { if self.draw_debug_active() { self.draw_ring.lock().on_hostrw_write(); } }
+    /// Count `n` HOSTRW words at once — a DMA batch delivers them in one call.
+    #[cfg(feature = "developer")]
+    fn note_hostrw_writes(&self, n: u32) { if self.draw_debug_active() { self.draw_ring.lock().on_hostrw_writes(n); } }
+    #[cfg(not(feature = "developer"))]
+    fn note_hostrw_writes(&self, _n: u32) {}
     #[cfg(not(feature = "developer"))]
     #[inline(always)]
     fn note_hostrw_write(&self) {}
@@ -1828,6 +2178,11 @@ impl Rex3 {
     #[cfg(feature = "developer")]
     #[inline(always)]
     fn note_hostrw_read(&self) { if self.draw_debug_active() { self.draw_ring.lock().on_hostrw_read(); } }
+    /// Count `n` HOSTRW words at once — see `note_hostrw_writes`.
+    #[cfg(feature = "developer")]
+    fn note_hostrw_reads(&self, n: u32) { if self.draw_debug_active() { self.draw_ring.lock().on_hostrw_reads(n); } }
+    #[cfg(not(feature = "developer"))]
+    fn note_hostrw_reads(&self, _n: u32) {}
     #[cfg(not(feature = "developer"))]
     #[inline(always)]
     fn note_hostrw_read(&self) {}
@@ -2528,7 +2883,28 @@ impl Rex3 {
         true
     }
 
-    fn wait_idle(&self) {
+    /// Push a batch token plus its payload words through the GFIFO.
+    ///
+    /// See `GFifo::push_batch`. Wakes a parked consumer the same way
+    /// `gfifo_push` does.
+    fn gfifo_push_batch(&self, token: u32, vals: &[u64]) {
+        #[cfg(feature = "developer")]
+        {
+            let len = self.gfifo.len() + vals.len() + 1;
+            let _ = self.gfifo_hwm.try_update(Ordering::Relaxed, Ordering::Relaxed, |hwm| {
+                if len > hwm { Some(len) } else { None }
+            });
+        }
+        self.gfifo.push_batch(token, vals.len() as u64, vals);
+        #[cfg(feature = "idle-pause")]
+        if self.processor_parked.load(Ordering::Acquire) {
+            if let Some(t) = self.processor_unparker.get() {
+                t.unpark();
+            }
+        }
+    }
+
+    pub(crate) fn wait_idle(&self) {
         loop {
             // Publish before testing: unlike the bus read paths this one has no
             // retry escape — it spins here until the queue reports empty — so a
@@ -2582,8 +2958,25 @@ impl Rex3 {
                             _ => String::new(),
                         };
                         if is_go {
-                            let _ = writeln!(f, "------- GO reg={:04x}({}) val={:016x}{} -------",
-                                reg_offset, rex3_reg_name(reg_offset), val, extra);
+                            // A batch token stands in for N HOSTRW pushes that
+                            // never appear individually in this log — the
+                            // payload is consumed inside drain_payload. Without
+                            // the word count and a sample here, a bulk transfer
+                            // is a single opaque line, while the scalar path it
+                            // replaced printed every word. Show enough to tell
+                            // "the data arrived" from "the data was wrong".
+                            let batch = match reg_offset {
+                                REX3_DMA_BATCH_W_REG => {
+                                    let ctxr = unsafe { &*self.context.get() };
+                                    format!("  ; batch write {} qwords, first={:016x}",
+                                        val, ctxr.hostrw[0])
+                                }
+                                REX3_DMA_BATCH_R_REG =>
+                                    format!("  ; batch read {} qwords (filled after GO)", val),
+                                _ => String::new(),
+                            };
+                            let _ = writeln!(f, "------- GO reg={:04x}({}) val={:016x}{}{} -------",
+                                reg_offset, rex3_reg_name(reg_offset), val, extra, batch);
                         } else {
                             let _ = writeln!(f, "reg={:04x}({}) val={:016x}{}",
                                 reg_offset, rex3_reg_name(reg_offset), val, extra);
@@ -2769,6 +3162,19 @@ impl Rex3 {
                     }
                     e
                 };
+                // Batched HOSTRW transfers used to be excluded here, because
+                // the generated code addressed hostrw[0] by fixed offset and
+                // never stepped the cursor — a multi-word transfer would
+                // consume one word and repeat it for the whole run.
+                //
+                // The shader now addresses hostrw[hostrw_index()] and advances
+                // the cursor on store (emit_hostrw_slot_ptr /
+                // emit_hostrw_advance in rex3_jit::compiler), mirroring the
+                // interpreter's accessors, so the bypass is gone: both engines
+                // walk the array identically. `batch_jit_equivalence` pins
+                // that, and the general rule it serves — JIT and interpreter
+                // must be indistinguishable — is why bypassing was never an
+                // acceptable long-term answer.
                 if let Some(entry) = entry {
                     // Mirror the interpreter's log_block() calls so block/span
                     // primitives trace identically whichever engine ran them.
@@ -2780,6 +3186,33 @@ impl Rex3 {
                     unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
                     #[cfg(feature = "rexdiag")]
                     self.jit_go_count.fetch_add(1, Ordering::Relaxed);
+                    if ctx.host_len > 1 && (ctx.drawmode0.colorhost() || ctx.drawmode0.alphahost()) {
+                        self.note_hostrw_writes(ctx.host_len);
+                    }
+                    // Same batch resume loop the interpreter path runs below: a
+                    // shader consumes exactly one host word per call (its
+                    // host_xstop stops it at a word boundary), so a batch of N
+                    // words needs N calls. Without this the JIT would paint the
+                    // first word and silently drop the rest — which is why
+                    // batches used to bypass the JIT entirely instead.
+                    //
+                    // Not gated on `mid_primitive`: without STOPONY the walker
+                    // clears it at every row end, and each row is its own
+                    // primitive. `host_cursor` is what terminates the loop.
+                    while ctx.host_len > 1 && ctx.host_cursor < ctx.host_len {
+                        let before = ctx.host_cursor;
+                        ctx.hostcnt = 0;
+                        unsafe { entry(ctx as *mut Rex3Context, fb_rgb, fb_aux); }
+                        #[cfg(feature = "rexdiag")]
+                        self.jit_go_count.fetch_add(1, Ordering::Relaxed);
+                        // A shape that cannot make progress must not spin here
+                        // holding the GFIFO.
+                        if ctx.host_cursor == before { break; }
+                    }
+                    if ctx.host_len > 1 {
+                        ctx.host_len = 1;
+                        ctx.host_cursor = 0;
+                    }
                     #[cfg(feature = "rexdiag")]
                     self.diag.fetch_and(!Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
                     return;
@@ -2808,6 +3241,57 @@ impl Rex3 {
         // per-adrmode walkers; every shape-selecting field reaches it as its own
         // argument, which is the list stage 5 promotes to const generics.
         crate::rex3_generic::draw_primitive(ctx);
+        // Attribute this batch's words to the record `draw_primitive` just
+        // created (via log_block). Doing it any earlier counts against the
+        // wrong record — see the batch-token arm in process_register.
+        //
+        // Only for a draw that actually consumes host data. `host_len` stays
+        // raised until this function retires it, so a following non-host
+        // primitive would otherwise be credited with the previous batch's
+        // words — and because it has colorhost=0 they land in
+        // `spurious_writes`, making the overlay report phantom host traffic on
+        // an ordinary DRAW.
+        if ctx.host_len > 1 && (ctx.drawmode0.colorhost() || ctx.drawmode0.alphahost()) {
+            self.note_hostrw_writes(ctx.host_len);
+        }
+        // A host-mode primitive stops at a word or row boundary and expects the
+        // next GO to resume it — that is how the CPU's one-word-per-GO feed
+        // works. A batch carries N words behind a *single* GO, so anything the
+        // primitive did not consume this pass has to be driven round again
+        // here, or it is silently dropped: a multi-row pixmap upload would
+        // paint its first row and discard the rest, and a tiled fill would
+        // leave bands of untouched framebuffer.
+        // NOTE: deliberately not gated on `mid_primitive`. Without STOPONY the
+        // walker clears that flag and breaks at the end of *every row* — each
+        // row is its own primitive, resumed by the next GO. The CPU's
+        // one-word-per-GO feed supplies those GOs; a batch has exactly one, so
+        // gating the resume on `mid_primitive` drops every row after the first.
+        // That is what left holes in the tiled wallpaper and the login icons.
+        // The `host_cursor` bound is what actually terminates this loop.
+        while ctx.host_len > 1 && ctx.host_cursor < ctx.host_len {
+            let before = ctx.host_cursor;
+            // Each round must start on a word boundary, exactly as the CPU's
+            // one-word-per-GO feed does: that feed hands the walker a fresh
+            // HOSTRW word per GO, so a partial word left open when the walker
+            // broke at a row boundary is *discarded*, not carried into the next
+            // row. Leaving `hostcnt` set here instead shifts every row after
+            // the first — the corruption that made pixmaps and tiled fills come
+            // out wrong.
+            ctx.hostcnt = 0;
+            crate::rex3_generic::draw_primitive(ctx);
+            // Guard against a primitive that consumes nothing: without this a
+            // shape that cannot make progress (a degenerate block, a mode the
+            // walker declines) would spin here forever holding the GFIFO.
+            if ctx.host_cursor == before {
+                break;
+            }
+        }
+        // Retire the transfer: back to the resting single-word state. Leaving
+        // a batch count set would make the next PIO HOSTRW access walk a stale
+        // run instead of the one word it wrote. Element 0 keeps the last word,
+        // which is what a PIO read after a transfer expects to see.
+        ctx.host_len = 1;
+        ctx.host_cursor = 0;
         #[cfg(feature = "rexdiag")]
         self.interp_go_count.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "rexdiag")]
@@ -3084,11 +3568,54 @@ impl Rex3 {
             // dma_read64/dma_write64's priming alias — same no-op treatment as
             // GFIFO_PURE_GO_REG (see REX3_DMA_PURE_GO doc comment).
             REX3_DMA_PURE_GO_REG => {}
+            // Batch payload consumed by its token (see REX3_DMA_BATCH_W_REG).
+            // Reaching one here means it was left behind by a truncated batch;
+            // ignoring it is inert, which is the point of the distinct address.
+            GFIFO_PAYLOAD => {}
+            // Batched HOSTRW write: the payload is already in host_buf (the
+            // producer filled it before pushing this token). Arm the cursor and
+            // let the GO bit run the shader once over the whole run.
+            REX3_DMA_BATCH_W_REG => {
+                // The token's payload is the next `count` entries in the queue.
+                // Stream them straight into the data-port array, then set the
+                // count the shader walks. The GO bit on this same entry runs
+                // the primitive once over the whole run.
+                let count = (val64 as usize).min(HOSTRW_BUF_QWORDS);
+                let got = self.gfifo.drain_payload(count, &mut ctx.hostrw);
+                ctx.host_cursor = 0;
+                ctx.host_len = got as u32;
+                ctx.hostcnt = 0;
+                // Deliberately NOT counted here. `log_block` — which creates
+                // the draw record this would be attributed to — does not run
+                // until `execute_go` dispatches the primitive, so a count
+                // issued now lands on the *previous* record or is dropped
+                // entirely (`pending == None`). That is why the overlay showed
+                // `0/4802` for a transfer that carried every word. The words
+                // are counted in `execute_go` instead, once the record exists.
+                #[cfg(feature = "developer")]
+                if let Some(f) = self.block_log.lock().as_mut() {
+                    let _ = writeln!(f, "  HOSTRW batch write: {} qwords (asked {})", got, count);
+                }
+            }
+            // Batched HOSTRW read: arm the cursor so the shader scatters its
+            // output across host_buf instead of latching one word.
+            REX3_DMA_BATCH_R_REG => {
+                // Nothing to stream in: the shader produces the words. Just set
+                // the count it should fill.
+                ctx.host_cursor = 0;
+                ctx.host_len = (val64 as u32).min(HOSTRW_BUF_QWORDS as u32);
+                ctx.hostcnt = 0;
+                #[cfg(feature = "developer")]
+                if let Some(f) = self.block_log.lock().as_mut() {
+                    let _ = writeln!(f, "  HOSTRW batch read: {} qwords", ctx.host_len);
+                }
+            }
             // HOSTRW: store data port value; reset shift so the draw picks up pixels from MSB.
             // The actual draw/read is triggered by execute_go() when entry.go is set.
             // 64-bit write (REX3_HOSTRW0_64 = 0x0231): store full val64 directly.
             REX3_HOSTRW64 => {
-                ctx.hostrw = val64;
+                ctx.hostrw_arm_single();
+                ctx.hostrw_set(val64);
                 ctx.hostcnt = 0;
                 self.note_hostrw_write();
                 #[cfg(feature = "developer")]
@@ -3098,8 +3625,9 @@ impl Rex3 {
             }
             REX3_HOSTRW0 => {
                 // 32-bit write to HOSTRW0: update high 32 bits [63:32].
-                let new_val = (ctx.hostrw & 0x0000_0000_FFFF_FFFF) | ((val64 & 0xFFFF_FFFF) << 32);
-                ctx.hostrw = new_val;
+                ctx.hostrw_arm_single();
+                let new_val = (ctx.hostrw_get() & 0x0000_0000_FFFF_FFFF) | ((val64 & 0xFFFF_FFFF) << 32);
+                ctx.hostrw_set(new_val);
                 ctx.hostcnt = 0;
                 self.note_hostrw_write();
                 #[cfg(feature = "developer")]
@@ -3109,8 +3637,9 @@ impl Rex3 {
             }
             REX3_HOSTRW1 => {
                 // 32-bit write to HOSTRW1: update low 32 bits [31:0].
-                let new_val = (ctx.hostrw & 0xFFFF_FFFF_0000_0000) | (val64 & 0xFFFF_FFFF);
-                ctx.hostrw = new_val;
+                ctx.hostrw_arm_single();
+                let new_val = (ctx.hostrw_get() & 0xFFFF_FFFF_0000_0000) | (val64 & 0xFFFF_FFFF);
+                ctx.hostrw_set(new_val);
                 ctx.hostcnt = 0;
                 self.note_hostrw_write();
                 #[cfg(feature = "developer")]
@@ -3933,8 +4462,8 @@ impl BusDevice for Rex3 {
             _ => {
                 let ctx = unsafe { &*self.context.get() };
                 match reg_offset {
-                    REX3_HOSTRW0      => busy_or_val!((ctx.hostrw >> 32) as u32),
-                    REX3_HOSTRW1      => busy_or_val!(ctx.hostrw as u32),
+                    REX3_HOSTRW0      => busy_or_val!((ctx.hostrw_get() >> 32) as u32),
+                    REX3_HOSTRW1      => busy_or_val!(ctx.hostrw_get() as u32),
                     REX3_DRAWMODE1    => busy_or_val!(ctx.drawmode1.0),
                     REX3_DRAWMODE0    => busy_or_val!(ctx.drawmode0.0 & 0xFFFFFF),
                     REX3_LSMODE       => busy_or_val!(ctx.lsmode.0 & 0x0FFFFFFF),
@@ -4191,7 +4720,7 @@ impl BusDevice for Rex3 {
             if self.gfxbusy.load(Ordering::Acquire) || !self.gfifo.is_empty() {
                 return BusRead64::busy();
             }
-            let val = unsafe { (*self.context.get()).hostrw };
+            let val = unsafe { (*self.context.get()).hostrw_get() };
             self.note_hostrw_read();
             #[cfg(feature = "developer")]
             if let Some(f) = self.block_log.lock().as_mut() {
@@ -4234,17 +4763,98 @@ impl BusDevice for Rex3 {
         }
 
         #[cfg(feature = "developer")]
-        let before = unsafe { (*self.context.get()).hostrw };
+        let before = unsafe { (*self.context.get()).hostrw_get() };
         self.gfifo_push(REX3_DMA_PURE_GO, 0);
         self.wait_idle();
 
-        let val = unsafe { (*self.context.get()).hostrw };
+        let val = unsafe { (*self.context.get()).hostrw_get() };
         self.note_hostrw_read();
         #[cfg(feature = "developer")]
         if let Some(f) = self.block_log.lock().as_mut() {
             let _ = writeln!(f, "  HOSTRW0_64 dma_read: before={:016x} after={:016x} (primed)", before, val);
         }
         BusRead64::ok(val)
+    }
+
+    /// Batched HOSTRW write: stream `vals` into the host buffer and run the
+    /// shader once over the whole run.
+    ///
+    /// Replaces N `gfifo_push(REX3_HOSTRW64)` round trips with one token. The
+    /// payload is copied into `host_buf` **before** the token is pushed, so the
+    /// consumer never observes a token pointing at a half-written buffer.
+    ///
+    /// All-or-nothing, as the trait requires: the capacity check and the single
+    /// token push both happen before anything is consumed, so a refusal leaves
+    /// no state behind for the caller's retry to duplicate.
+    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+        let offset = addr & (REX3_SIZE - 1);
+        let is_go = (offset & 0x0800) != 0;
+        if (offset & !0x0800) != REX3_HOSTRW0 || !is_go {
+            // Not the batchable port — let the caller fall back to scalar.
+            return BUS_ERR;
+        }
+        if vals.is_empty() { return BUS_OK; }
+        if vals.len() > HOSTRW_BUF_QWORDS {
+            // Caller must chunk. Reporting ERR (not BUSY) so a retry loop
+            // cannot spin forever on a request that can never fit.
+            return BUS_ERR;
+        }
+
+        // Token first, then the payload words, all as GFIFO entries: the token
+        // tells the processor how many words follow, and it streams them into
+        // ctx.hostrw[] as it consumes them. Keeping the payload in the queue
+        // (rather than writing the array behind the queue's back) is what makes
+        // the transfer ordered correctly against concurrent CPU register writes
+        // — the words arrive in the stream at the point the producer put them.
+        self.gfifo_push_batch(REX3_DMA_BATCH_W, vals);
+        BUS_OK
+    }
+
+    /// Batched HOSTRW read: one token, one pipeline drain, then copy the
+    /// filled array out.
+    ///
+    /// This is where the big win is. The scalar path pays a `wait_idle()` —
+    /// a full pipeline drain — for every 8 bytes; here one drain covers the
+    /// entire transfer.
+    ///
+    /// Keeps `dma_read64`'s ordering inversion at transfer granularity: the
+    /// token is pushed and waited on *before* anything is read out, so the
+    /// array is already filled when we copy from it.
+    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+        let offset = addr & (REX3_SIZE - 1);
+        let is_go64r = (offset & 0x0800) != 0;
+        if (offset & !0x0800) != REX3_HOSTRW0 || !is_go64r {
+            return BUS_ERR;
+        }
+        if out.is_empty() { return BUS_OK; }
+        if out.len() > HOSTRW_BUF_QWORDS {
+            return BUS_ERR;
+        }
+
+        self.gfifo_push(REX3_DMA_BATCH_R, out.len() as u64);
+        self.wait_idle();
+
+        // SAFETY: wait_idle() means the consumer has finished and its writes to
+        // ctx.hostrw are visible (gfxbusy is loaded Acquire).
+        unsafe {
+            let ctx = &*self.context.get();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = ctx.hostrw[i];
+            }
+        }
+        // `out.len()` words came back in this one call — count them all, or the
+        // overlay under-reports a bulk readback the same way it did writes.
+        self.note_hostrw_reads(out.len() as u32);
+        // The token line in the bus log is written before the shader runs, so
+        // it cannot show what came back. Close the loop here, where the data
+        // exists: otherwise a bulk readback is the only transfer in the log
+        // whose result is never visible.
+        #[cfg(feature = "developer")]
+        if let Some(f) = self.rex3_log.lock().as_mut() {
+            let _ = writeln!(f, "------- BATCH_R done: {} qwords, first={:016x} last={:016x} -------",
+                out.len(), out[0], out[out.len() - 1]);
+        }
+        BUS_OK
     }
 
     fn write64(&self, addr: u32, val: u64) -> u32 {

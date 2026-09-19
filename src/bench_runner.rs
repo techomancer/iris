@@ -112,7 +112,11 @@ pub fn run(
     let opts = opts.clone();
     std::thread::Builder::new()
         .name("bench-runner".to_string())
-        .stack_size(16 * 1024 * 1024)
+        // Rex3Context embeds the HOSTRW data-port array (HOSTRW_BUF_QWORDS u64s,
+            // 1 MiB), and construction has several context-sized temporaries in
+            // flight before the machine is boxed. This is virtual address space,
+            // lazily committed, so the large reservation has no real cost.
+            .stack_size(64 * 1024 * 1024)
         .spawn(move || run_inner(&opts, progress))
         .map_err(|e| format!("bench runner thread: {}", e))?
         .join()
