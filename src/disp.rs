@@ -505,13 +505,12 @@ const LED_GREEN_OFF: u32 = 0xFF003000;
 #[cfg(feature = "jitv2")]
 const JIT_FLUSH_FLASH: u32 = 0xFFFF20C0;
 
-/// Green-at-0-to-red-at-255 interpolation for the jitv2 fill bars
-/// (`StatusBar::draw_fill_bar`). `frac` is `JitFeedback`'s 0..=255
-/// fixed-point fraction, not a 0..=100 percentage. 0xAABBGGRR, this file's
-/// rgba convention: B fixed near 0, G falls from 0xE0 to 0 as R rises from
-/// 0 to 0xE0, so the midpoint lands on a yellow-ish amber rather than
+/// Green-at-0-to-red-at-255 interpolation for the fill gauges
+/// (`StatusBar::draw_fill_bar`, `StatusBar::draw_gfifo_rect`). `frac` is a
+/// 0..=255 fixed-point fraction, not a 0..=100 percentage. 0xAABBGGRR, this
+/// file's rgba convention: B fixed near 0, G falls from 0xE0 to 0 as R rises
+/// from 0 to 0xE0, so the midpoint lands on a yellow-ish amber rather than
 /// passing through a washed-out gray.
-#[cfg(feature = "jitv2")]
 fn lerp_green_red(frac: u8) -> u32 {
     let f = frac as u32;
     let r = f * 0xE0 / 255;
@@ -637,9 +636,9 @@ impl StatusBar {
         let rx_color = if self.enet_rx_fade > 0 { BAR_ACTIVE } else { BAR_DIM };
 
         #[cfg(feature = "developer")]
-        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cnt:{:5.1}MHz g{:04X}  NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_hz as f64 / 1e6, stats.gfifo_pending);
+        let line = format!(" {:5.1} MIPS D:{:3.0}% I$:{:3.0}% UC:{:3.0}% {:4.0}Hz cnt:{:5.1}MHz g{:04X} NET:", self.mips, self.decode_pct, self.l1i_hit_pct, self.uncached_pct, self.fasthz, stats.count_hz as f64 / 1e6, stats.gfifo_pending);
         #[cfg(not(feature = "developer"))]
-        let line = format!(" {:5.1} MIPS {:4.0}Hz  NET:", self.mips, self.fasthz);
+        let line = format!(" {:5.1} MIPS {:4.0}Hz NET:", self.mips, self.fasthz);
 
         let row_stride = 2048;
         for row in 0..STATUS_BAR_HEIGHT {
@@ -651,21 +650,23 @@ impl StatusBar {
         cursor_x = self.draw_text(rgba, &line,    cursor_x, bar_y, width, BAR_FG);
         cursor_x = self.draw_text(rgba, " TX",    cursor_x, bar_y, width, tx_color);
         cursor_x = self.draw_text(rgba, " RX",    cursor_x, bar_y, width, rx_color);
-        cursor_x = self.draw_text(rgba, "  SCSI:", cursor_x, bar_y, width, BAR_FG);
+        cursor_x = self.draw_text(rgba, " SCSI:", cursor_x, bar_y, width, BAR_FG);
         for i in 0..7 {
             let color = if self.scsi_fade[i] > 0 { BAR_ACTIVE } else { BAR_DIM };
             cursor_x = self.draw_text(rgba, &format!(" {}", i), cursor_x, bar_y, width, color);
         }
-        cursor_x = self.draw_text(rgba, "  LED:", cursor_x, bar_y, width, BAR_FG);
+        cursor_x = self.draw_text(rgba, " LED:", cursor_x, bar_y, width, BAR_FG);
         cursor_x = self.draw_square(rgba, cursor_x + 2, bar_y, width,
             if self.led_red   { LED_RED_ON   } else { LED_RED_OFF   });
         cursor_x = self.draw_square(rgba, cursor_x + 4, bar_y, width,
             if self.led_green { LED_GREEN_ON } else { LED_GREEN_OFF });
         #[cfg(feature = "jitv2")]
         {
-            cursor_x = self.draw_text(rgba, "  JIT:", cursor_x, bar_y, width, BAR_FG);
+            cursor_x = self.draw_text(rgba, " JIT:", cursor_x, bar_y, width, BAR_FG);
             cursor_x = self.draw_jit_rect(rgba, cursor_x + 2, bar_y, width);
         }
+        cursor_x = self.draw_text(rgba, " G:", cursor_x, bar_y, width, BAR_FG);
+        cursor_x = self.draw_gfifo_rect(rgba, cursor_x + 2, bar_y, width, stats.gfifo_pending);
         let _ = cursor_x;
     }
 
@@ -691,6 +692,52 @@ impl StatusBar {
         self.draw_fill_bar(rgba, x, bar_y,            RECT_W, RECT_H, width, self.jit_arena_fill);
         self.draw_fill_bar(rgba, x, bar_y + RECT_H,   RECT_W, RECT_H, width, self.jit_queue_fill);
         x + RECT_W + 4
+    }
+
+    /// 16x16 GFIFO-occupancy gauge, filled left-to-right in columns with the
+    /// boundary column partially filled from the bottom — 16 columns x 16 rows
+    /// gives 256 distinguishable levels out of a 16x16 box, where whole-column
+    /// filling alone would give 16.
+    ///
+    /// The scale is logarithmic, not linear. `GFIFO_DEPTH` is 65536 but the
+    /// guest only ever feels back-pressure in the last `GFIFO_HW_DEPTH` (32)
+    /// entries — see `Rex3::gfifo_hw_level` — so normal operation lives in the
+    /// low hundreds, which is under 1% of depth. A linear gauge would read as
+    /// an empty box every frame except the ones just before an overrun, which
+    /// is precisely when it's too late to be useful. Log scale puts each
+    /// doubling of occupancy at a constant distance, so a fifo idling at 8
+    /// entries and one climbing through 2000 look visibly different.
+    ///
+    /// `pending` is `GFifo::len()`, sampled once per frame in `rex3.rs`'s
+    /// refresh loop — two atomic loads, no lock.
+    fn draw_gfifo_rect(&self, rgba: &mut Vec<u32>, x: usize, bar_y: usize, width: usize, pending: usize) -> usize {
+        const RECT: usize = 16;
+        // log2(pending+1) / log2(GFIFO_DEPTH) mapped onto 0..=255. The +1 keeps
+        // an empty fifo at exactly 0 rather than at log2(0) = -inf.
+        let frac = if pending == 0 {
+            0u8
+        } else {
+            let lg = (pending as f64 + 1.0).log2();
+            let full = (crate::rex3::GFIFO_DEPTH as f64).log2();
+            ((lg / full) * 255.0).clamp(0.0, 255.0) as u8
+        };
+        let color = lerp_green_red(frac);
+        // Total sub-columns of fill: RECT columns x RECT rows of resolution.
+        let units = (frac as usize * RECT * RECT) / 255;
+        let full_cols = units / RECT;
+        let partial   = units % RECT;
+        for col in 0..RECT {
+            let px = x + col;
+            if px >= width { break; }
+            // Rows filled in this column, counted from the bottom of the box.
+            let filled_rows = if col < full_cols { RECT } else if col == full_cols { partial } else { 0 };
+            for row in 0..RECT {
+                let idx = (bar_y + row) * 2048 + px;
+                if idx >= rgba.len() { continue; }
+                rgba[idx] = if row >= RECT - filled_rows { color } else { BAR_BG };
+            }
+        }
+        x + RECT + 4
     }
 
     /// One horizontal fill bar: `BAR_BG` background, filled left-to-right by
