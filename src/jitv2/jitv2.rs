@@ -17,6 +17,7 @@
 //! a mutable pointer. Only the compile-request queue itself is added in this pass
 //! — the compile thread and publish path land with codegen (Phase 2).
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
@@ -3637,6 +3638,13 @@ fn bitmap_is_subset_of(subset: &[u64; BITMAP_WORDS], bm: &EntryBitmap) -> bool {
     (0..BITMAP_WORDS).all(|i| subset[i] & !bm[i].load(Ordering::Relaxed) == 0)
 }
 
+/// [`bitmap_is_subset_of`] for two plain arrays — the churn-avoidance
+/// snapshot's bitmaps (`CompileSnapshot`) are ordinary `[u64; _]` behind a
+/// `Mutex`, not atomics, since nothing reads them lock-free.
+fn bitmap_is_subset_of_plain(subset: &[u64; BITMAP_WORDS], of: &[u64; BITMAP_WORDS]) -> bool {
+    (0..BITMAP_WORDS).all(|i| subset[i] & !of[i] == 0)
+}
+
 /// OR `bits` into `bm`, word by word, at the given ordering — used to publish
 /// a compile's newly-covered entry points into `compiled` (§13.3 step 6).
 fn bitmap_union_from(bm: &EntryBitmap, bits: &[u64; BITMAP_WORDS], order: Ordering) {
@@ -4259,6 +4267,160 @@ pub struct PhysicalCodePage {
     /// present, not `developer`-gated, lifetime total (not cleared by any
     /// reset).
     pub finalize_failed: std::sync::atomic::AtomicU32,
+    /// How many compile requests for this page were answered entirely by the
+    /// churn-avoidance snapshot — no walk, no codegen, no finalize, just an
+    /// `entry_gen` re-validation of the code already installed. See
+    /// [`Self::try_skip_redundant_compile`]; `Jitv2::redundant_compile_totals`
+    /// sums these across the pool for the process-wide ratio.
+    ///
+    /// Lives per-page rather than on `JitStats` because a page is the only
+    /// thing the compile path has in hand at the point of the decision
+    /// (`prepare_multi_entry_compile` has no `JitStats` outside a
+    /// `developer` build), and because the per-page breakdown is the more
+    /// useful reading anyway — "which pages churn" rather than just "how
+    /// much".
+    ///
+    /// A page with a high count here is one whose generation churns for
+    /// reasons unrelated to its code — data sharing the page, or DMA into
+    /// it — and is exactly the case this cache was built for. Always
+    /// present, not `developer`-gated.
+    ///
+    /// **Per-flush-epoch, not a lifetime total** — cleared by both
+    /// `reset_for_flush_survivor` and `reset_to_unclaimed`, unlike
+    /// `rejected_compiles`/`prepare_bounced` next door. A boot's exec storm
+    /// racks up hundreds of thousands of skips (measured: ~286k, 98% of
+    /// everything checked), and as a lifetime total that figure would sit in
+    /// `j2 status` forever, drowning out whatever the system is doing now.
+    /// The flush is the honest epoch boundary anyway: it invalidates the very
+    /// snapshots these counted, so the old tallies describe a state that no
+    /// longer exists.
+    pub redundant_skipped: std::sync::atomic::AtomicU32,
+    /// The complement of [`Self::redundant_skipped`] for this page: requests
+    /// that had a snapshot to compare against and still had to compile. A
+    /// page where this dominates is genuinely being rewritten (or flipping
+    /// FR mode), not merely churning generations.
+    pub redundant_rejected: std::sync::atomic::AtomicU32,
+    /// Churn-avoidance cache: what the last successful compile of this page
+    /// actually looked at, kept so a later request whose only difference is
+    /// a bumped generation can be answered without recompiling at all. See
+    /// [`CompileSnapshot`] for the contents and
+    /// [`Self::try_skip_redundant_compile`] for the comparison rule.
+    ///
+    /// Inline rather than `Option<Box<..>>` deliberately, matching the same
+    /// call made for `entries` under the old design: the pool array is
+    /// allocated once up front, so a boxed payload would buy nothing but a
+    /// pointer-chase and an allocation on every page's first compile, while
+    /// the flat version's cost is bounded, predictable, and mostly untouched
+    /// zero pages for slots that never compile.
+    ///
+    /// Set by [`Self::kill`], cleared by [`Self::stage_compile_snapshot`]:
+    /// "some entry was killed since the snapshot below was taken."
+    ///
+    /// A kill means "stop dispatching into `func` here", so a skip must not
+    /// re-advertise the killed offset. `compiled` cannot answer that question
+    /// on its own, because a narrowing skip clears bits there for an entirely
+    /// unrelated reason — hence a separate flag. Page-granular rather than
+    /// per-offset because the skip is all-or-nothing anyway: one kill on the
+    /// page simply costs that page one real recompile, which re-derives the
+    /// coverage honestly.
+    killed_since_snapshot: std::sync::atomic::AtomicBool,
+    /// **Unsynchronized, and sound because a page is never compiled twice at
+    /// once.** `page_scheduled` is a test-and-set taken by the dispatch gate
+    /// before a `CompileRequest` is sent and released only by
+    /// `handle_request`/`handle_request_deferred`'s exit scope guard — so it
+    /// stays held for the *whole* compile, not just the enqueue. A second
+    /// request for the same page therefore cannot even be sent, let alone
+    /// dequeued, while the first is still running, at any `thread_count`.
+    /// That is the same invariant that lets `Analyzer`'s 1024-entry buffer be
+    /// reused across compiles without locking.
+    ///
+    /// A `Mutex` here would guard against nothing reachable while adding two
+    /// atomics and a 4KB compare inside a critical section. Dispatch never
+    /// touches this field at all — only a compiling thread does, plus the
+    /// exec thread's reset paths, which are mutually exclusive with compiles
+    /// by the same flag.
+    compile_snapshot: UnsafeCell<CompileSnapshot>,
+}
+
+/// What a successful compile of a page looked at, recorded so the next
+/// compile request for the same page can prove it would produce identical
+/// code and skip the work (§ churn reduction).
+///
+/// The whole 4KB is stored, not a hash: the comparison must be exact (a hash
+/// collision here would publish code for bytes that no longer exist), and at
+/// this size a `memcmp` of the used words is cheaper than re-reading and
+/// re-walking the page anyway. The `used` mask is what makes the comparison
+/// *useful* rather than merely correct — a page where the guest rewrote a
+/// data constant, or any word the walk never reached, still matches, because
+/// only words the compile actually consumed are compared.
+struct CompileSnapshot {
+    /// Whether the fields below describe a real, still-installed compile.
+    /// False on a fresh page and after any reset that drops `func` — a
+    /// snapshot without the function it describes must never authorize a
+    /// skip, since there would be nothing left to re-publish.
+    ///
+    /// A record starts life with this `false` ([`PhysicalCodePage::stage_compile_snapshot`])
+    /// and only becomes `true` once the publish it describes actually lands
+    /// ([`PhysicalCodePage::commit_compile_snapshot`]). The deferred compile
+    /// path (`comp.rs`'s `handle_request_deferred`) needs that split: it
+    /// hands its compile to the shared arena's seal queue and the matching
+    /// publish can happen later, on another worker's `finalize` call, with
+    /// only a `PublishInfo` in hand — far too late and too small to carry a
+    /// 4KB page snapshot through. Staging at compile time and committing at
+    /// publish time keeps the 4KB on the page it belongs to while still
+    /// guaranteeing a snapshot is never consultable before the code it
+    /// describes is installed.
+    valid: bool,
+    /// The generation the staged record was compiled against, used by
+    /// [`PhysicalCodePage::commit_compile_snapshot`] to confirm the publish
+    /// it is being asked to vouch for is the compile that staged this record.
+    /// The case this guards is a reset landing under an in-flight compile:
+    /// [`PhysicalCodePage::invalidate_compile_snapshot`] poisons this to
+    /// `u64::MAX`, which no real generation can equal, so the compile's later
+    /// commit finds no match and the record stays dead instead of vouching
+    /// for a function the reset already discarded.
+    staged_gen: u64,
+    /// The page bytes as the recorded compile saw them (its seqlock
+    /// snapshot, `prepare_multi_entry_compile` step 2). Only the words
+    /// selected by `used` are ever compared.
+    words: [u32; ENTRIES_PER_PAGE],
+    /// Words the recorded compile actually decoded — every instruction the
+    /// merged multi-entry walk visited (`instrs_linear`), including delay
+    /// slots. A word outside this set had no influence on the emitted code,
+    /// so a change to it cannot change what a recompile would produce.
+    used: [u64; BITMAP_WORDS],
+    /// Entry points the recorded compile published (`new_entries` as handed
+    /// to `publish`). A new request asking for an entry point outside this
+    /// set needs a real compile: the published `func`'s dispatch switch has
+    /// no case for it, so no amount of byte equality helps.
+    entries: [u64; BITMAP_WORDS],
+    /// FR mode the recorded compile was specialized for
+    /// (`CompileRequest::compiled_for_fr1`). Compared alongside the bytes,
+    /// and NOT optional: FR mode is baked into every FPR-access emitter at
+    /// compile time (§4.2.1) and is not visible anywhere in the page bytes,
+    /// so identical bytes compiled for the other mode are genuinely
+    /// different code. Skipping on a mismatch would leave the old mode's
+    /// `func` installed while the requester expects the new one — and
+    /// because `emit_fr_mode_guard` suppresses itself when CU1 is clear (see
+    /// [`PhysicalCodePage::fr1`]'s doc comment), the in-function guard is not
+    /// a reliable backstop: the failure mode is `ldc1`/`lwc1` packing an FP
+    /// value into the wrong register half, which is silent corruption rather
+    /// than a fault. A page whose FR pin legitimately flips therefore always
+    /// takes a real recompile, exactly as it did before this cache existed.
+    fr1: bool,
+}
+
+impl CompileSnapshot {
+    fn new() -> Self {
+        Self {
+            valid: false,
+            staged_gen: u64::MAX,
+            words: [0u32; ENTRIES_PER_PAGE],
+            used: [0u64; BITMAP_WORDS],
+            entries: [0u64; BITMAP_WORDS],
+            fr1: false,
+        }
+    }
 }
 
 // Safety: `gen` points into the owning BusDevice's storage, which outlives
@@ -4268,6 +4430,13 @@ pub struct PhysicalCodePage {
 // referencing it exists. `func`, when non-null, points to finalized
 // JIT-compiled code owned by the compile-thread arena, which outlives every
 // PhysicalCodePage referencing it until the next mega_flush.
+//
+// `compile_snapshot`'s UnsafeCell is what makes the Sync impl load-bearing
+// rather than merely a formality for the raw `gen` pointer: it is genuinely
+// unsynchronized data behind `&self`. Sound because a page is never compiled
+// twice at once and nothing but a compile (or a reset, mutually exclusive
+// with one) ever touches it — see that field's own doc comment for the
+// `page_scheduled` argument.
 unsafe impl Send for PhysicalCodePage {}
 unsafe impl Sync for PhysicalCodePage {}
 
@@ -4299,6 +4468,10 @@ impl PhysicalCodePage {
             fr_repin: std::sync::atomic::AtomicU8::new(FR_REPIN_NONE),
             fr_unpinned: std::sync::atomic::AtomicBool::new(false),
             publish_lock: Mutex::new(()),
+            redundant_skipped: std::sync::atomic::AtomicU32::new(0),
+            redundant_rejected: std::sync::atomic::AtomicU32::new(0),
+            killed_since_snapshot: std::sync::atomic::AtomicBool::new(false),
+            compile_snapshot: UnsafeCell::new(CompileSnapshot::new()),
             saved_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             #[cfg(feature = "developer")]
             instr_count: std::sync::atomic::AtomicU32::new(0),
@@ -4339,9 +4512,18 @@ impl PhysicalCodePage {
         // page permanently denylisted everywhere).
         for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
         self.func.store(std::ptr::null_mut(), Ordering::Relaxed);
+        // The snapshot describes the `func` just dropped — see
+        // `invalidate_compile_snapshot`.
+        self.invalidate_compile_snapshot();
         self.entry_gen.store(0, Ordering::Relaxed);
         self.page_scheduled.store(false, Ordering::Relaxed);
         self.compiles_since_flush.store(0, Ordering::Relaxed);
+        // Churn-avoidance tallies are per-flush-epoch (see
+        // `reset_for_flush_survivor`), and this slot is additionally about to
+        // be handed to a different physical page entirely — carrying the
+        // previous tenant's counts into it would misattribute them.
+        self.redundant_skipped.store(0, Ordering::Relaxed);
+        self.redundant_rejected.store(0, Ordering::Relaxed);
         #[cfg(feature = "developer")]
         {
             self.instr_count.store(0, Ordering::Relaxed);
@@ -4496,12 +4678,27 @@ impl PhysicalCodePage {
         }
         for word in self.compiled.iter() { word.store(0, Ordering::Relaxed); }
         self.func.store(std::ptr::null_mut(), Ordering::Relaxed);
+        // The arena this page's `func` lived in is being flushed out from
+        // under it, so the snapshot no longer describes anything runnable —
+        // this page must take a real recompile even though its bytes are
+        // unchanged. (Preserving `requested`/`denied` is the churn reduction
+        // a flush survivor gets; the snapshot cannot join them.)
+        self.invalidate_compile_snapshot();
         self.entry_gen.store(0, Ordering::Relaxed);
         self.page_scheduled.store(false, Ordering::Relaxed);
         // Cleared here too, unlike `compile_count` below — see
         // `compiles_since_flush`'s own field doc comment for why the two
         // have deliberately opposite lifetimes.
         self.compiles_since_flush.store(0, Ordering::Relaxed);
+        // Same "since the last flush" lifetime, for the same reason: a boot
+        // accumulates a huge churn-avoidance count (the exec storm skips
+        // hundreds of thousands of redundant compiles), which then sits in
+        // `j2 status` forever and drowns out whatever the system is doing
+        // now. A flush is the natural epoch boundary — the snapshots these
+        // counted are being invalidated by this very call, so their tallies
+        // describe a state that no longer exists.
+        self.redundant_skipped.store(0, Ordering::Relaxed);
+        self.redundant_rejected.store(0, Ordering::Relaxed);
         #[cfg(feature = "developer")]
         {
             self.instr_count.store(0, Ordering::Relaxed);
@@ -4778,6 +4975,9 @@ impl PhysicalCodePage {
     #[inline]
     pub fn kill(&self, offset_word: usize) {
         self.compiled[offset_word >> 6].fetch_and(!(1u64 << (offset_word & 63)), Ordering::Release);
+        // Block the churn-avoidance skip until a real compile re-derives this
+        // page's coverage — see `killed_since_snapshot`.
+        self.killed_since_snapshot.store(true, Ordering::Release);
     }
 
     /// Mark `offset_word` as a requested entry point (§13.2) — unconditional,
@@ -5059,6 +5259,273 @@ impl PhysicalCodePage {
             // next compile re-derives it. See `fr1`'s own doc comment.
             self.fr_unpinned.store(true, Ordering::Relaxed);
         }
+        true
+    }
+
+    /// Record what a compile looked at, **provisionally** — the record is
+    /// stored but left invalid, so it cannot authorize a skip until
+    /// [`Self::commit_compile_snapshot`] vouches for it with the publish
+    /// that actually installed the code.
+    ///
+    /// Called right after codegen succeeds, before the publish (which, on
+    /// the deferred path, may happen later and on another thread). `used`
+    /// must be every word the walk decoded, including delay slots; `entries`
+    /// exactly the bitmap that will be handed to `publish`.
+    ///
+    /// Overwrites any earlier staged-but-uncommitted record — which can only
+    /// be one left behind by a compile whose publish never landed (it was
+    /// stale, subsumed, or the page was reset under it), since this page
+    /// cannot be compiled twice at once. `staged_gen` is what lets
+    /// [`Self::commit_compile_snapshot`] tell its own record from such a
+    /// leftover.
+    pub fn stage_compile_snapshot(
+        &self,
+        words: &[u32; ENTRIES_PER_PAGE],
+        used: &[u64; BITMAP_WORDS],
+        entries: &[u64; BITMAP_WORDS],
+        gen_snap: u64,
+        fr1: bool,
+    ) {
+        // Safety: see `compile_snapshot`'s field doc — only a compiling
+        // thread reaches here, and a page is never compiled twice at once.
+        let snap = unsafe { &mut *self.compile_snapshot.get() };
+        // This compile re-derived coverage from scratch, so any kill that
+        // predates it is already accounted for in what it published.
+        self.killed_since_snapshot.store(false, Ordering::Release);
+        snap.valid = false;
+        snap.staged_gen = gen_snap;
+        snap.words.copy_from_slice(words);
+        snap.used.copy_from_slice(used);
+        snap.entries.copy_from_slice(entries);
+        snap.fr1 = fr1;
+    }
+
+    /// Promote a staged record to usable, now that the publish it describes
+    /// has actually installed its code.
+    ///
+    /// `gen_snap` and `entries` identify the publish doing the vouching; the
+    /// record is only committed if they match what was staged. The mismatch
+    /// case that matters is a reset landing between stage and publish
+    /// (`invalidate_compile_snapshot` poisons `staged_gen` precisely so this
+    /// cannot re-validate a snapshot for a function the reset discarded) —
+    /// the record is dropped rather than committed, costing a future
+    /// recompile instead of risking one that skips against the wrong bytes.
+    pub fn commit_compile_snapshot(&self, gen_snap: u64, entries: &[u64; BITMAP_WORDS]) {
+        // Safety: as `stage_compile_snapshot`.
+        let snap = unsafe { &mut *self.compile_snapshot.get() };
+        if snap.staged_gen == gen_snap && snap.entries == *entries {
+            snap.valid = true;
+        } else {
+            snap.valid = false;
+        }
+    }
+
+    /// Whether this page has a recorded compile snapshot to compare a new
+    /// request against. `false` on a page that has never compiled, or whose
+    /// snapshot was invalidated by a reset — those requests are not
+    /// candidates for a skip at all, and the caller counts neither outcome
+    /// for them (see [`Self::redundant_skipped`]).
+    #[inline]
+    pub fn has_compile_snapshot(&self) -> bool {
+        // Safety: as `stage_compile_snapshot`.
+        unsafe { (*self.compile_snapshot.get()).valid }
+    }
+
+    /// Count one compile request answered by the snapshot — see
+    /// [`Self::redundant_skipped`].
+    #[inline]
+    pub fn mark_redundant_compile_skipped(&self) {
+        self.redundant_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one compile request that had a snapshot but still had to
+    /// compile — see [`Self::redundant_rejected`].
+    #[inline]
+    pub fn mark_redundant_compile_rejected(&self) {
+        self.redundant_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn redundant_skipped(&self) -> u32 {
+        self.redundant_skipped.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn redundant_rejected(&self) -> u32 {
+        self.redundant_rejected.load(Ordering::Relaxed)
+    }
+
+    /// Drop the recorded compile snapshot — the `func` it describes is gone
+    /// or no longer trustworthy, so it must not authorize a skip.
+    ///
+    /// Every reset path that clears `func` calls this. There is no path that
+    /// legitimately keeps a snapshot past its function: a skip works by
+    /// re-validating the *installed* code, so a stale snapshot would
+    /// advance `entry_gen` over a null or superseded `func` and send
+    /// dispatch into nothing.
+    #[inline]
+    pub fn invalidate_compile_snapshot(&self) {
+        // Safety: the reset paths that call this run on the exec thread with
+        // no compile in flight for this page (see the field doc).
+        let snap = unsafe { &mut *self.compile_snapshot.get() };
+        snap.valid = false;
+        // Poison the staging slot too, not just `valid`: a compile that was
+        // in flight across this reset would otherwise come back and commit
+        // its record, re-validating a snapshot for a `func` this reset just
+        // threw away. `u64::MAX` can never be a real `gen_snap` (the counter
+        // starts at 0 and only increments), so no commit can match it.
+        snap.staged_gen = u64::MAX;
+    }
+
+    /// Churn-avoidance fast path (§13.3 step 2.5): decide whether the compile
+    /// this request is asking for would reproduce, byte for byte, the code
+    /// already installed — and if so, re-validate that code against the new
+    /// generation and skip the compile entirely.
+    ///
+    /// The caller has already taken its seqlock byte snapshot (`words`,
+    /// coherent with `gen_snap`) and computed the entry points it wants
+    /// (`wanted_entries`). Three things must all hold to skip:
+    ///
+    /// 1. **The wanted entries are a subset of what's published.** The
+    ///    installed `func`'s dispatch switch only has cases for the entries
+    ///    its own compile covered, so an entry outside that set cannot be
+    ///    served no matter how identical the bytes are.
+    /// 2. **Every word the recorded compile decoded is unchanged.** Words
+    ///    outside `used` are irrelevant by construction — the walk never
+    ///    read them, so they had no influence on the emitted code. This is
+    ///    what makes the check pay off on a page whose generation bumps
+    ///    because the guest wrote *data* sharing the page with code.
+    /// 3. **The FR mode matches.** See [`CompileSnapshot::fr1`].
+    ///
+    /// On success `entry_gen` is advanced to `gen_snap` under
+    /// `publish_lock`, which is exactly what makes `is_runnable` start
+    /// returning true again — the same single-field write `publish` would
+    /// have performed, minus the `func`/`compiled` stores (unchanged) and
+    /// minus the `denied` reset, which would be actively wrong here: the
+    /// bytes are provably identical, so an offset denied against them is
+    /// still correctly denied, and clearing it would re-walk and re-reject
+    /// it on every generation bump — the very churn this exists to remove.
+    ///
+    /// Returns `true` iff the compile was skipped.
+    pub fn try_skip_redundant_compile(
+        &self,
+        words: &[u32; ENTRIES_PER_PAGE],
+        wanted_entries: &[u64; BITMAP_WORDS],
+        gen_snap: u64,
+        fr1: bool,
+    ) -> bool {
+        // Safety: as `stage_compile_snapshot`.
+        let snap = unsafe { &*self.compile_snapshot.get() };
+        if !snap.valid || snap.fr1 != fr1 {
+            return false;
+        }
+        // A published `func` is what the snapshot describes; without one
+        // there is nothing to re-validate. (Belt and braces — every path
+        // that nulls `func` also invalidates the snapshot.)
+        if self.func.load(Ordering::Relaxed).is_null() {
+            return false;
+        }
+        if !bitmap_is_subset_of_plain(wanted_entries, &snap.entries) {
+            return false;
+        }
+        for i in 0..BITMAP_WORDS {
+            let mut bits = snap.used[i];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let w = i * 64 + bit;
+                if words[w] != snap.words[w] {
+                    return false;
+                }
+            }
+        }
+        // Re-validate the installed code against the new generation. Taken
+        // under `publish_lock` for the same reason `publish` does: this page
+        // is never compiled twice at once, but a dispatch-side `kill` can
+        // still land concurrently, and the gen write must not interleave with
+        // the coverage check below.
+        let _guard = self.publish_lock.lock();
+        // Re-check under the lock, exactly as `publish` does — a mutation
+        // may have landed between the byte snapshot and here, in which case
+        // the bytes we just compared are already history.
+        if self.current_gen() > gen_snap {
+            return false;
+        }
+        // Never move `entry_gen` backwards: a concurrent publish may have
+        // already installed newer coverage at a higher generation, and
+        // rewinding it would invalidate that publish's own code.
+        if self.entry_gen.load(Ordering::Relaxed) > gen_snap {
+            return false;
+        }
+        // Deliberately NOT `wanted_entries ⊆ compiled`. That is the wrong
+        // question: `compiled` is what is currently *advertised*, which a
+        // previous skip may legitimately have narrowed (see the coverage
+        // write below), whereas what matters is whether the installed `func`
+        // has a case for these offsets — `snap.entries`, checked above, which
+        // does not change while that same `func` stays installed. Requiring
+        // the stricter condition refuses to re-cover an entry an earlier skip
+        // dropped even though the very same function can still serve it,
+        // forcing a pointless recompile: a second churn source with the same
+        // "skips a lot, runs slower" signature as the first.
+        //
+        // What DOES have to bail is a `kill` — it means "stop dispatching
+        // into `func` here", so a skip must never re-advertise a killed
+        // offset. `killed_since_snapshot` is the exact condition;
+        // `compiled` cannot express it, because a narrowing skip clears bits
+        // there for an unrelated reason. In production every `kill` is
+        // already paired with either an FR repin (caught by `snap.fr1 !=
+        // fr1`) or a `denylist` (caught by `denied`, which the caller folds
+        // into `wanted_entries`), so this is defence in depth rather than the
+        // only guard — but it is the one that states the actual invariant.
+        if self.killed_since_snapshot.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        // Leave exactly the coverage a real `publish` of this same candidate
+        // set would have left, because that is what the installed `func` can
+        // actually serve.
+        //
+        // This is NOT a formality — getting it wrong is a throughput
+        // regression that masquerades as the optimization working. After a
+        // gen bump the caller's candidate set is `requested & denied`
+        // (`snapshot_compile_candidates(same_gen=false)` deliberately drops
+        // `compiled`), and `publish` treats `snap_gen > entry_gen` as a real
+        // invalidation and REPLACES `compiled` wholesale with that set. A
+        // skip that merely bumped `entry_gen` would leave the older, wider
+        // bitmap published: `is_runnable` then returns true for offsets this
+        // check never verified, dispatch calls `func` for one, the switch
+        // `compile_region` built has no case for it, and it returns
+        // EXEC_FALLBACK — on every arrival, forever, each one re-requesting a
+        // compile. Measured as high skip counts with *lower* throughput,
+        // worst on R4K.
+        //
+        // Mirrors `publish`'s own is_real_invalidation branch, and for the
+        // same reason: replace on a generation advance (old bits describe
+        // bytes that no longer exist), union when the generation is
+        // unchanged (pure added coverage against the same bytes).
+        if gen_snap > self.entry_gen.load(Ordering::Relaxed) {
+            for i in 0..BITMAP_WORDS {
+                let dropped = self.compiled[i].swap(wanted_entries[i], Ordering::Release)
+                    & !wanted_entries[i];
+                // Entries this narrowing drops are still legitimately wanted:
+                // unlike `publish`'s equivalent branch, the bytes here are
+                // provably UNCHANGED, so an offset that was worth compiling a
+                // moment ago is worth compiling still — it just is not in
+                // this round's candidate set (it was covered, so nothing
+                // re-`requested` it, and `snapshot_compile_candidates` drops
+                // `compiled` once the generation moves). Folding it back into
+                // `requested` is what gives it a path to a real recompile;
+                // without it the entry is silently stranded on the
+                // interpreter until something happens to fetch it again,
+                // which is the same "no automatic path back" failure
+                // `reset_for_flush_survivor` documents and guards against the
+                // same way.
+                if dropped != 0 { self.requested[i].fetch_or(dropped, Ordering::Relaxed); }
+            }
+        } else {
+            bitmap_union_from(&self.compiled, wanted_entries, Ordering::Release);
+        }
+        self.entry_gen.store(gen_snap, Ordering::Release);
         true
     }
 
@@ -5414,6 +5881,34 @@ impl Jitv2 {
             slot = self.pages[slot as usize].next;
         }
         n
+    }
+
+    /// Pool-wide churn-avoidance totals as `(skipped, rejected)`: compile
+    /// requests answered by re-validating already-installed code, vs. those
+    /// that had a snapshot to compare against and had to compile anyway.
+    /// See `PhysicalCodePage::redundant_skipped`.
+    ///
+    /// Summed over the claimed pages on demand rather than kept as a running
+    /// pair of globals — this is a `j2 status` diagnostic, not a hot path,
+    /// and a sum cannot drift out of step with the per-page numbers `j2 pcp`
+    /// prints.
+    ///
+    /// Reads as "since the last `mega_flush`", because that is the lifetime
+    /// of the underlying per-page counters (see
+    /// `PhysicalCodePage::redundant_skipped`) — deliberately, so the figure
+    /// tracks current behaviour instead of staying pinned to the boot storm
+    /// that dominates any lifetime total. A flush therefore resets this to
+    /// near zero; that is the intent, not drift.
+    pub fn redundant_compile_totals(&self) -> (u64, u64) {
+        let (mut skipped, mut rejected) = (0u64, 0u64);
+        let mut slot = self.mru_head;
+        while slot != NO_SLOT {
+            let page = &self.pages[slot as usize];
+            skipped += page.redundant_skipped() as u64;
+            rejected += page.redundant_rejected() as u64;
+            slot = page.next;
+        }
+        (skipped, rejected)
     }
 
     /// Pool capacity, as passed to `new()`.
@@ -7021,6 +7516,16 @@ mod tests {
         // so this should be dramatically smaller than before — fails loudly
         // if PhysicalCodePage ever grows past a sanity ceiling rather than
         // silently ballooning Jitv2::new's one-shot allocation.
+        //
+        // The churn-avoidance `CompileSnapshot` (see its own doc comment)
+        // deliberately put ~4.25KB of that back: a 4KB copy of the page
+        // bytes plus two bitmaps. That is the dominant term now — roughly
+        // 20MB across the default 4096-slot pool, traded knowingly against
+        // the analyze+codegen+finalize passes it avoids. Slots that never
+        // compile never touch their copy, so it stays untouched zero pages
+        // rather than resident memory. If this assert fires, check whether
+        // something OTHER than that snapshot grew before raising the
+        // ceiling.
         let page_size = std::mem::size_of::<PhysicalCodePage>();
         println!("size_of::<PhysicalCodePage>() = {page_size} bytes");
         assert!(page_size < 128 * 1024, "PhysicalCodePage grew unexpectedly large: {page_size} bytes — check for accidental field bloat before raising this ceiling");
@@ -7252,6 +7757,577 @@ mod tests {
         assert!(page.publish(&bits, new_fn, 6, 1, 0));
         assert!(page.is_runnable(offset), "recompiled entry must read valid once publish completes");
         assert_eq!(page.func(), new_fn, "func must be the NEW function, not the stale one, once gen reads as current");
+    }
+
+    /// Build the page-byte/used/entries triple for the churn-avoidance
+    /// tests: `entries` bits set for each offset in `entry_offsets`, `used`
+    /// bits set for each word in `used_words`, and `words` filled with a
+    /// recognisable pattern.
+    fn churn_fixture(
+        entry_offsets: &[usize],
+        used_words: &[usize],
+    ) -> ([u32; ENTRIES_PER_PAGE], [u64; BITMAP_WORDS], [u64; BITMAP_WORDS]) {
+        let words: [u32; ENTRIES_PER_PAGE] = std::array::from_fn(|i| 0x1000_0000 + i as u32);
+        let mut used = [0u64; BITMAP_WORDS];
+        for &w in used_words { used[w >> 6] |= 1u64 << (w & 63); }
+        let mut entries = [0u64; BITMAP_WORDS];
+        for &o in entry_offsets { entries[o >> 6] |= 1u64 << (o & 63); }
+        (words, used, entries)
+    }
+
+    /// Stage + commit a compile snapshot against a real publish, the way
+    /// `comp.rs` does — the churn tests all start from a page in this state.
+    fn publish_with_snapshot(
+        page: &PhysicalCodePage,
+        words: &[u32; ENTRIES_PER_PAGE],
+        used: &[u64; BITMAP_WORDS],
+        entries: &[u64; BITMAP_WORDS],
+        gen: u64,
+        fr1: bool,
+        func: *const (),
+    ) {
+        page.stage_compile_snapshot(words, used, entries, gen, fr1);
+        assert!(page.publish(entries, func, gen, 1, 0), "fixture publish must succeed");
+        page.commit_compile_snapshot(gen, entries);
+        assert!(page.has_compile_snapshot(), "fixture must leave a usable snapshot");
+    }
+
+    #[test]
+    fn a_bumped_gen_with_unchanged_code_words_skips_the_compile() {
+        // The case the whole mechanism exists for: something wrote to the
+        // page (gen bumped) but not to any word the compile actually
+        // decoded, so recompiling would emit byte-identical code. The skip
+        // must re-validate the installed function against the new gen —
+        // leaving it dispatchable — without touching func or compiled.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11, 12]);
+        let func = 0x1000usize as *const ();
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, func);
+
+        // A write lands somewhere on the page that is NOT one of the decoded
+        // words — data sharing the page, DMA, a neighbouring structure.
+        let mut changed = words;
+        changed[900] = 0xdead_beef;
+        counter.store(6, Ordering::Relaxed);
+        assert!(!page.is_runnable(10), "gen bump must make the entry stale first");
+
+        assert!(page.try_skip_redundant_compile(&changed, &entries, 6, false),
+            "unchanged decoded words must skip the compile");
+        assert!(page.is_runnable(10), "the skip must re-validate the installed code against the new gen");
+        assert_eq!(page.func(), func, "a skip must leave the installed function alone");
+    }
+
+    #[test]
+    fn a_changed_decoded_word_forces_a_real_compile() {
+        // The complement: the write DID land on a word the compile decoded,
+        // so the installed code no longer describes the page and a real
+        // recompile is mandatory.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11, 12]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        let mut changed = words;
+        changed[11] = 0xdead_beef; // a decoded word
+        counter.store(6, Ordering::Relaxed);
+
+        assert!(!page.try_skip_redundant_compile(&changed, &entries, 6, false),
+            "a changed decoded word must NOT be skippable");
+        assert!(!page.is_runnable(10), "a rejected skip must leave the entry stale, not re-validate it");
+    }
+
+    #[test]
+    fn an_fr_mode_flip_forces_a_real_compile_despite_identical_bytes() {
+        // FR mode is baked into every FPR-access emitter and is invisible in
+        // the page bytes, so identical bytes compiled for the other mode are
+        // genuinely different code. Skipping here would leave the wrong
+        // mode's function installed — silent FP register-half corruption,
+        // since emit_fr_mode_guard suppresses itself when CU1 is clear.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        counter.store(6, Ordering::Relaxed);
+        assert!(!page.try_skip_redundant_compile(&words, &entries, 6, true),
+            "identical bytes in the OTHER FR mode must never be skipped");
+        // Same request in the mode it was compiled for still skips, proving
+        // the rejection above was the FR check and nothing else.
+        assert!(page.try_skip_redundant_compile(&words, &entries, 6, false),
+            "the same request in the compiled-for mode must still skip");
+    }
+
+    #[test]
+    fn a_wanted_entry_point_outside_published_coverage_forces_a_compile() {
+        // The installed function's dispatch switch only has cases for the
+        // entries its own compile covered. An entry outside that set cannot
+        // be served no matter how identical the bytes are — skipping would
+        // leave every dispatch into it falling through to the interpreter
+        // forever while `entry_gen` claimed it was runnable.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        let mut wants_more = entries;
+        wants_more[0] |= 1u64 << 20; // offset 20 was never compiled
+        counter.store(6, Ordering::Relaxed);
+
+        assert!(!page.try_skip_redundant_compile(&words, &wants_more, 6, false),
+            "asking for an uncompiled entry point must force a real compile");
+    }
+
+    #[test]
+    fn a_killed_entry_forces_a_compile_even_with_identical_bytes() {
+        // `kill` clears a `compiled` bit without dropping `func` (an
+        // FR-guard bail, or a denylist landing on a previously-published
+        // offset). The skip path re-checks coverage against the LIVE
+        // `compiled` bitmap under the lock precisely so a killed entry
+        // cannot be silently resurrected by a byte comparison.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        page.kill(10);
+        counter.store(6, Ordering::Relaxed);
+        assert!(!page.try_skip_redundant_compile(&words, &entries, 6, false),
+            "an entry killed since publish must not be revived by a skip");
+    }
+
+    #[test]
+    fn a_snapshot_is_unusable_until_its_publish_commits_it() {
+        // Staging alone must never authorize a skip: on the deferred path
+        // the matching publish can be gap-blocked in the seal queue for a
+        // while, and a snapshot consulted in that window would re-validate
+        // a `func` that was never installed.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+
+        page.stage_compile_snapshot(&words, &used, &entries, 5, false);
+        assert!(!page.has_compile_snapshot(), "a staged-but-uncommitted record must not be usable");
+        assert!(!page.try_skip_redundant_compile(&words, &entries, 5, false),
+            "a staged-but-uncommitted record must never authorize a skip");
+
+        assert!(page.publish(&entries, 0x1000usize as *const (), 5, 1, 0));
+        page.commit_compile_snapshot(5, &entries);
+        assert!(page.has_compile_snapshot(), "the commit must make it usable");
+    }
+
+    #[test]
+    fn a_commit_for_a_different_compile_drops_the_staged_record() {
+        // A commit must only ever validate its OWN record. A page is never
+        // compiled twice at once (`page_scheduled` is held for the whole
+        // compile), so the reachable way the staging slot stops matching is a
+        // reset landing under an in-flight compile — covered separately by
+        // `a_late_commit_cannot_revive_a_snapshot_invalidated_by_a_reset`.
+        // This pins the matching rule itself, which is what makes that
+        // protection work: a commit whose identity doesn't match what was
+        // staged drops the record rather than validating it. Costs one
+        // future recompile; committing it would let a later skip compare
+        // against the wrong bytes.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+
+        page.stage_compile_snapshot(&words, &used, &entries, 5, false);
+        assert!(page.publish(&entries, 0x1000usize as *const (), 5, 1, 0));
+        // A different compile's publish tries to vouch for it.
+        let mut other_entries = [0u64; BITMAP_WORDS];
+        other_entries[0] |= 1u64 << 42;
+        page.commit_compile_snapshot(5, &other_entries);
+        assert!(!page.has_compile_snapshot(),
+            "a commit whose entries don't match the staged record must drop it, not validate it");
+    }
+
+    #[test]
+    fn dropping_the_compiled_function_invalidates_the_snapshot() {
+        // A snapshot outliving the `func` it describes would let a skip
+        // advance `entry_gen` over a null function and send dispatch into
+        // nothing. Every reset that clears `func` must clear the snapshot.
+        let counter = AtomicU64::new(5);
+        let page = {
+            let mut p = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+            let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+            publish_with_snapshot(&p, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+            p.reset_for_flush_survivor();
+            p
+        };
+        assert!(!page.has_compile_snapshot(),
+            "reset_for_flush_survivor drops func, so the snapshot must go with it");
+
+        let counter2 = AtomicU64::new(5);
+        let mut page2 = PhysicalCodePage::new(0, &counter2 as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page2, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+        page2.reset_to_unclaimed();
+        assert!(!page2.has_compile_snapshot(),
+            "reset_to_unclaimed drops func, so the snapshot must go with it");
+    }
+
+    #[test]
+    fn a_late_commit_cannot_revive_a_snapshot_invalidated_by_a_reset() {
+        // A compile in flight across a flush comes back and tries to commit.
+        // The reset poisoned `staged_gen`, so the commit must find no match
+        // and leave the snapshot invalid rather than re-validating a record
+        // for a function the flush threw away.
+        let counter = AtomicU64::new(5);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+
+        page.stage_compile_snapshot(&words, &used, &entries, 5, false);
+        page.reset_for_flush_survivor();
+        page.commit_compile_snapshot(5, &entries);
+        assert!(!page.has_compile_snapshot(),
+            "a commit arriving after a reset must not revive the snapshot");
+    }
+
+    #[test]
+    fn a_skip_never_moves_entry_gen_backwards() {
+        // A concurrent publish may have already installed newer coverage at
+        // a higher generation. Rewinding `entry_gen` to this compile's older
+        // snapshot would invalidate that publish's code while leaving it
+        // installed.
+        let counter = AtomicU64::new(9);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 9, false, 0x1000usize as *const ());
+
+        // A stale request (snapshot taken at gen 7) arrives after the page
+        // has already published at gen 9.
+        assert!(!page.try_skip_redundant_compile(&words, &entries, 7, false),
+            "a skip must refuse to rewind entry_gen");
+        assert_eq!(page.entry_gen(), 9, "entry_gen must be left where the newer publish put it");
+    }
+
+    #[test]
+    fn a_skip_requeues_the_entries_its_narrowing_drops() {
+        // Companion to `a_skip_must_not_leave_coverage_the_check_never_verified`:
+        // narrowing `compiled` to the verified set is necessary, but it must
+        // not silently strand the entries it drops. Unlike `publish`'s
+        // equivalent branch, the bytes here are provably UNCHANGED, so a
+        // dropped entry is still legitimately wanted — nothing re-requested
+        // it only because it was already covered. Folding it back into
+        // `requested` is what gives it a path to a real recompile, the same
+        // guard `reset_for_flush_survivor` documents.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10, 40], &[10, 11, 40, 41]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+        // Both were covered, so neither is outstanding as a request.
+        page.clear_requested_bits(&entries);
+        assert!(!page.is_requested(40));
+
+        counter.store(6, Ordering::Relaxed);
+        let mut asks_for_one = [0u64; BITMAP_WORDS];
+        asks_for_one[0] |= 1u64 << 10;
+        assert!(page.try_skip_redundant_compile(&words, &asks_for_one, 6, false));
+
+        assert!(!page.is_runnable(40), "the dropped entry must not stay published");
+        assert!(page.is_requested(40),
+            "the dropped entry must be re-requested, or it is stranded on the interpreter \
+             with no automatic path back to compiled dispatch");
+    }
+
+    #[test]
+    fn churn_counters_reset_on_flush_but_rejected_compiles_does_not() {
+        // The churn tallies are per-flush-epoch on purpose: a boot storm
+        // racks up ~286k skips, and as a lifetime total that would sit in
+        // `j2 status` forever instead of describing current behaviour. This
+        // pins that, and pins the contrast with `rejected_compiles`, which
+        // deliberately DOES survive a flush (pure churn history) — the two
+        // sit next to each other and the difference is easy to "tidy up" by
+        // mistake later.
+        let counter = AtomicU64::new(5);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        page.mark_redundant_compile_skipped();
+        page.mark_redundant_compile_rejected();
+        page.mark_analyze_rejected(); // bumps rejected_compiles
+        assert_eq!((page.redundant_skipped(), page.redundant_rejected()), (1, 1));
+
+        page.reset_for_flush_survivor();
+        assert_eq!((page.redundant_skipped(), page.redundant_rejected()), (0, 0),
+            "a flush survivor must start a fresh churn epoch");
+        assert_eq!(page.rejected_compiles(), 1,
+            "rejected_compiles is lifetime history and must NOT be reset by a flush");
+
+        // An evicted-and-recycled slot must not carry the previous tenant's
+        // counts into a different physical page either.
+        page.mark_redundant_compile_skipped();
+        page.reset_to_unclaimed();
+        assert_eq!(page.redundant_skipped(), 0,
+            "a recycled slot must not inherit the previous page's churn counts");
+    }
+
+    #[test]
+    fn a_skip_must_not_leave_coverage_the_check_never_verified() {
+        // THE CHURN BUG. After a gen bump `same_gen` is false, so the
+        // caller's candidate set is `requested & denied` — it deliberately
+        // EXCLUDES `compiled`. A real compile then walks exactly that set and
+        // `publish` REPLACES `compiled` with it wholesale (is_real_invalidation).
+        //
+        // A skip that only bumps `entry_gen` leaves the OLD, wider `compiled`
+        // in place, so `is_runnable` starts reporting true for entries this
+        // check never verified. Dispatch calls `func` for one, the installed
+        // function's switch has no case for it, and it returns EXEC_FALLBACK
+        // — forever, on every arrival, plus a re-request each time. That is
+        // strictly worse than having recompiled: high skip counts, lower
+        // throughput.
+        //
+        // So a skip must end with the same coverage a real publish of the
+        // same candidate set would have produced.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        // Page was compiled with two entry points.
+        let (words, used, entries) = churn_fixture(&[10, 40], &[10, 11, 40, 41]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        // Gen bumps; only offset 10 is freshly requested this round.
+        counter.store(6, Ordering::Relaxed);
+        let mut asks_for_one = [0u64; BITMAP_WORDS];
+        asks_for_one[0] |= 1u64 << 10;
+        assert!(page.try_skip_redundant_compile(&words, &asks_for_one, 6, false));
+
+        assert!(page.is_runnable(10), "the verified entry must be runnable");
+        assert!(!page.is_runnable(40),
+            "offset 40 was NOT in this round's candidate set, so a real compile would have \
+             dropped it from `compiled` — a skip that leaves it published sends every \
+             dispatch into EXEC_FALLBACK forever");
+    }
+
+    #[test]
+    fn a_re_requested_dropped_entry_can_still_skip_against_the_same_function() {
+        // The snapshot's `entries` records what the installed `func` CAN
+        // serve (its switch cases), which does not change while that `func`
+        // stays installed. `compiled` records what is currently advertised,
+        // which a skip narrows to the set it verified. Keeping those two
+        // separate is what lets an entry dropped by one skip come back and be
+        // served by a later one WITHOUT a recompile — narrowing the snapshot
+        // to match `compiled` would forfeit exactly the reuse this whole
+        // mechanism exists for.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10, 40], &[10, 11, 40, 41]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        // First skip verifies only offset 10; 40 is dropped and re-requested.
+        counter.store(6, Ordering::Relaxed);
+        let mut only_10 = [0u64; BITMAP_WORDS];
+        only_10[0] |= 1u64 << 10;
+        assert!(page.try_skip_redundant_compile(&words, &only_10, 6, false));
+        assert!(!page.is_runnable(40));
+
+        // 40 comes back around. The same `func` still has a case for it, so
+        // this must skip too rather than forcing a recompile.
+        counter.store(7, Ordering::Relaxed);
+        let mut both = [0u64; BITMAP_WORDS];
+        both[0] |= (1u64 << 10) | (1u64 << 40);
+        assert!(page.try_skip_redundant_compile(&words, &both, 7, false),
+            "an entry the installed function can still serve must be re-coverable without a recompile");
+        assert!(page.is_runnable(10));
+        assert!(page.is_runnable(40), "both entries must be advertised again");
+    }
+
+    #[test]
+    fn a_stale_denial_carried_by_a_skip_self_heals_on_the_next_real_compile() {
+        // A skip deliberately does NOT reset `denied`, unlike `publish` on a
+        // gen bump. `publish`'s reset is justified as "the bytes changed, so
+        // old denials deserve a fresh chance" — and on the skip path the
+        // DECODED bytes provably did not change, so the denials that matter
+        // (ones earned while walking those bytes) are still valid.
+        //
+        // The gap: a denial can be earned against bytes outside `used`, which
+        // a skip never compares. Carrying it forward is conservative in the
+        // SAFE direction — an offset stays on the interpreter that might have
+        // compiled. It is lost opportunity, never wrong code, and it is
+        // bounded because it self-heals the moment a decoded word changes and
+        // a real compile runs.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        counter.store(6, Ordering::Relaxed);
+        page.denylist(40);
+
+        // Skips keep the denial while the decoded words hold still.
+        counter.store(7, Ordering::Relaxed);
+        let mut only_10 = [0u64; BITMAP_WORDS];
+        only_10[0] |= 1u64 << 10;
+        assert!(page.try_skip_redundant_compile(&words, &only_10, 7, false));
+        assert!(page.is_denylisted(40), "a skip must not resurrect denials it did not re-derive");
+
+        // A decoded word finally changes: no skip, real compile, and
+        // `publish`'s own is_real_invalidation reset clears the denial.
+        let mut changed = words;
+        changed[11] = 0xdead_beef;
+        counter.store(8, Ordering::Relaxed);
+        assert!(!page.try_skip_redundant_compile(&changed, &only_10, 8, false),
+            "a changed decoded word must force a real compile");
+        assert!(page.publish(&only_10, 0x2000usize as *const (), 8, 1, 0));
+        assert!(!page.is_denylisted(40),
+            "the real compile's publish must reset denied, healing any stale denial a skip carried");
+    }
+
+    #[test]
+    fn a_rewritten_excluded_entry_word_forces_a_real_compile() {
+        // Every production denylist is a COMPILER verdict, with three
+        // reasons: (1) the entry word itself was excluded, (2) the merged
+        // region was too short, (3) Cranelift declined. For (2) and (3) the
+        // offending code is a COVERED offset, so its word is in `used` by
+        // construction and a rewrite fails the byte compare on its own.
+        //
+        // (1) is the odd one out: `visit` returns false, so
+        // `walk_multi_entry` never marks that word visited and
+        // `instrs_linear` never reports it. `prepare_multi_entry_compile`
+        // therefore folds the excluded entry's own word into `used`
+        // explicitly — without it, the guest could rewrite that instruction
+        // into something compilable and the sticky denial would survive
+        // every skip forever, when a real compile would have reset `denied`.
+        //
+        // This test drives the page API directly with a `used` mask built the
+        // way that fold builds it, i.e. covered words PLUS the excluded
+        // entry's word.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        // Covered {10} (words 10,11); offset 40 was a candidate the walk
+        // excluded — so 40 is denied AND 40 is folded into `used`.
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11, 40]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+        page.denylist(40);
+
+        let mut only_10 = [0u64; BITMAP_WORDS];
+        only_10[0] |= 1u64 << 10;
+
+        // Unchanged: the skip is still available (the denial is still valid
+        // against these exact bytes, so re-deriving it would be pure churn).
+        counter.store(6, Ordering::Relaxed);
+        assert!(page.try_skip_redundant_compile(&words, &only_10, 6, false),
+            "an unchanged excluded word must not cost a recompile");
+
+        // Rewritten: the excluded word is in `used`, so the compare fails and
+        // a real compile runs — which resets `denied` and retries offset 40.
+        let mut rewritten = words;
+        rewritten[40] = 0x2021_0000;
+        counter.store(7, Ordering::Relaxed);
+        assert!(!page.try_skip_redundant_compile(&rewritten, &only_10, 7, false),
+            "rewriting an excluded+denied entry word must force a real compile, or the \
+             sticky denial outlives the instruction that earned it");
+    }
+
+    #[test]
+    fn a_denied_offsets_word_stays_compared_across_a_later_same_gen_compile() {
+        // `denied` is sticky page state that outlives the compile that set
+        // it, so "this compile's denials are covered by this compile's
+        // `used`" is NOT sufficient. A later same-generation compile (pure
+        // added coverage — it does not reset `denied`) re-stages the
+        // snapshot, and its own walk has no reason to touch a word denied
+        // long ago: `denied` masks that offset out of the candidate set, so
+        // nothing walks it. The denial would stay live while the evidence for
+        // it dropped out of the snapshot, and from then on no skip could ever
+        // notice the guest rewriting that instruction into something
+        // compilable — the denial outliving the code that earned it,
+        // permanently.
+        //
+        // `prepare_multi_entry_compile` therefore folds the WHOLE `denied`
+        // set into `used` when it stages, not just the offsets it denied
+        // itself. This test models that second compile's staging directly.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+
+        // Compile A covers {10}, denies 40.
+        let (words, used_a, entries_a) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used_a, &entries_a, 5, false, 0x1000usize as *const ());
+        page.denylist(40);
+
+        // Compile B, SAME generation: adds entry 20. Its walk covers only
+        // {10,11,20,21} — nothing walks word 40. Staging applies the fold,
+        // so word 40 is still carried into `used`.
+        let (_w, mut used_b, entries_b) = churn_fixture(&[10, 20], &[10, 11, 20, 21]);
+        for (i, w) in page.snapshot_denied_raw().iter().enumerate() {
+            used_b[i] |= !*w;
+        }
+        page.stage_compile_snapshot(&words, &used_b, &entries_b, 5, false);
+        assert!(page.publish(&entries_b, 0x2000usize as *const (), 5, 1, 0));
+        page.commit_compile_snapshot(5, &entries_b);
+        assert!(page.is_denylisted(40), "a same-gen publish must not reset denied");
+
+        let mut only_10 = [0u64; BITMAP_WORDS];
+        only_10[0] |= 1u64 << 10;
+
+        // Unchanged bytes still skip — the fold must not cost churn.
+        counter.store(6, Ordering::Relaxed);
+        assert!(page.try_skip_redundant_compile(&words, &only_10, 6, false),
+            "folding denied words in must not break the ordinary skip");
+
+        // Rewriting the denied word is now noticed, even though the compile
+        // that staged this snapshot never walked it.
+        let mut rewritten = words;
+        rewritten[40] = 0x2021_0000;
+        counter.store(7, Ordering::Relaxed);
+        assert!(!page.try_skip_redundant_compile(&rewritten, &only_10, 7, false),
+            "a denied offset's word must stay compared across later compiles, or the denial \
+             outlives the instruction that earned it with no way back");
+    }
+
+    #[test]
+    fn every_cpu_thread_denial_path_also_kills_which_blocks_the_skip() {
+        // Why the churn-avoidance `denied` fold does not need to worry about
+        // denials originating on the CPU thread.
+        //
+        // Structurally, it could not matter anyway: the CPU thread only ever
+        // reaches an offset it was actually EXECUTING, which means that
+        // offset was published and dispatchable, which means it was in
+        // `covered` at its last compile — so its word is already in `used` by
+        // construction and its bytes are already compared.
+        //
+        // Mechanically there is also a backstop, which is what this test
+        // pins: every CPU-thread path that touches denial state (`j2 deny`
+        // in the monitor, and the FR-guard's `jit_kill_entry`) also calls
+        // `kill()`, and `kill()` sets `killed_since_snapshot`, which refuses
+        // the next skip outright so a real compile re-derives everything.
+        //
+        // If a future CPU-thread path ever denylists WITHOUT killing, this
+        // test won't catch it directly — but the invariant it records is the
+        // thing to re-check at that point.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+
+        let mut only_10 = [0u64; BITMAP_WORDS];
+        only_10[0] |= 1u64 << 10;
+        counter.store(6, Ordering::Relaxed);
+
+        // The `j2 deny` / FR-guard shape: denylist + kill together.
+        page.denylist(40);
+        page.kill(40);
+
+        assert!(!page.try_skip_redundant_compile(&words, &only_10, 6, false),
+            "a kill from the CPU thread must block the next skip, so a real compile re-derives \
+             coverage and denial state rather than a skip carrying stale assumptions forward");
+    }
+
+    #[test]
+    fn a_skip_does_not_reset_the_denylist() {
+        // A gen bump normally clears `denied` (§13.6: new bytes deserve a
+        // fresh chance). A skip proves the opposite — the decoded bytes are
+        // IDENTICAL — so an offset denied against them is still correctly
+        // denied. Clearing it would re-walk and re-reject it on every gen
+        // bump, which is exactly the churn this exists to remove.
+        let counter = AtomicU64::new(5);
+        let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
+        let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+        page.denylist(200);
+        assert!(page.is_denylisted(200));
+
+        counter.store(6, Ordering::Relaxed);
+        assert!(page.try_skip_redundant_compile(&words, &entries, 6, false));
+        assert!(page.is_denylisted(200),
+            "a skip must leave the denylist alone — the bytes are provably unchanged");
     }
 
     #[test]

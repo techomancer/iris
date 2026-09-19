@@ -51,6 +51,18 @@ is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **Compile churn avoidance (`j2wp`).** Each page now remembers the bytes its
+  last compile decoded, the entry points it published and the FR mode it was
+  built for. A later compile request whose generation moved but whose *decoded*
+  words are all unchanged re-validates the installed function instead of
+  recompiling it — the common case where code and data share a 4KB page, so a
+  write to the data bumps the generation and used to force a full
+  analyze+codegen+finalize that emitted byte-identical code. On an IRIX 6.5
+  boot this skips ~286k compiles, 98% of everything checked. Costs ~20MB
+  (`PhysicalCodePage` 720 → 4976 bytes across the 4096-slot pool). `j2 status`
+  and `j2 pcp` report the skipped/recompiled split (since last flush, and
+  available in `lightning` builds, not just `developer`). See
+  `rules/jitv2/compile-churn-avoidance-snapshot.md`.
 - Inline load/store for the R5000 cache model, not only the R4400.
 - Physical code pages are found through a flat pfn array instead of a hash map;
   PC/BD stores are emitted only when needed; the last instruction on a page and

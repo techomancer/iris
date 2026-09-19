@@ -13134,6 +13134,18 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         writeln!(writer, "  [finalize] failed={}", page.finalize_failed()).unwrap();
                         writeln!(writer, "  [seal] gap_blocked={}", page.seal_gap_blocked()).unwrap();
                         writeln!(writer, "  [publish] compiles_since_flush={}", page.compiles_since_flush()).unwrap();
+                        // Churn avoidance: how often a compile request for
+                        // this page was answered by re-validating the code
+                        // already installed (its generation moved but every
+                        // word the last compile decoded was unchanged), vs.
+                        // how often it had a snapshot to compare against and
+                        // genuinely had to recompile. A page with a large
+                        // `skipped` is one whose gen churns for reasons
+                        // unrelated to its code. Neither counts a request
+                        // that had no snapshot to compare against at all.
+                        // Both are since-last-flush, not lifetime.
+                        writeln!(writer, "  [churn] redundant_skipped={} redundant_rejected={} (since last flush)",
+                            page.redundant_skipped(), page.redundant_rejected()).unwrap();
                         writeln!(writer, "pc={:#018x}  page_off={:#05x}", pc, entry_offset * 4).unwrap();
                         writeln!(
                             writer,
@@ -13403,6 +13415,22 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     "stats" | "status" => {
                         let jit = exec.jitv2.lock();
                         writeln!(writer, "pages: {} / {} used", jit.pages_used(), jit.capacity()).unwrap();
+                        // Churn avoidance (`j2wp` only — the whole-page
+                        // design is the one that keeps a per-page compile
+                        // snapshot). "skipped" is compile work that did not
+                        // happen because the page's generation moved without
+                        // any word the last compile decoded changing;
+                        // "rejected" had a snapshot to check and still had
+                        // to compile. A high skipped:rejected ratio is the
+                        // mechanism paying for itself; near-zero skipped
+                        // means the RAM is buying nothing on this workload.
+                        #[cfg(feature = "j2wp")]
+                        {
+                            let (skipped, rejected) = jit.redundant_compile_totals();
+                            let considered = skipped + rejected;
+                            let pct = if considered > 0 { (skipped as f64 / considered as f64) * 100.0 } else { 0.0 };
+                            writeln!(writer, "churn (since last flush): {skipped} compiles skipped as redundant, {rejected} had to recompile ({pct:.1}% avoided of {considered} checked)").unwrap();
+                        }
                         // Report the EFFECTIVE inline state: jitv2_lockstep forces
                         // it on regardless of the runtime field (see exec_decoded's
                         // `inline_compile`), so printing the raw field would

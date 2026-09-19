@@ -1065,7 +1065,33 @@ pub fn min_instrs_to_compile() -> usize {
 /// `gen_snap`/`instr_count` the eventual `publish` call needs.
 enum PrepareOutcome {
     Done(bool),
-    Ready { gen_snap: u64, instr_count: usize },
+    Ready {
+        gen_snap: u64,
+        instr_count: usize,
+        /// The seqlock byte snapshot this compile was built from, and the
+        /// words the walk actually decoded — handed to
+        /// `PhysicalCodePage::record_compile_snapshot` after a successful
+        /// publish so the next request for this page can be checked against
+        /// them (churn avoidance).
+        ///
+        /// Boxed so the 4KB payload is moved as a pointer out of this enum
+        /// rather than memcpy'd through every `match` on the way back to the
+        /// caller. It is already a heap round trip by then — the compile it
+        /// belongs to is about to run — so the allocation is noise next to
+        /// what follows, unlike the copies it removes.
+        snapshot: Box<CompileInputs>,
+    },
+}
+
+/// The two byte-level facts a finished compile needs to record about itself
+/// for the churn-avoidance check to work on the *next* request for the same
+/// page. See `PhysicalCodePage::record_compile_snapshot`.
+struct CompileInputs {
+    /// The page bytes this compile analyzed (coherent with `gen_snap`).
+    words: [u32; ENTRIES_PER_PAGE],
+    /// One bit per word the walk decoded, delay slots included — the only
+    /// words whose value could change what a recompile would emit.
+    used: [u64; crate::jitv2::BITMAP_WORDS],
 }
 
 /// §13.3 steps 1-5, shared front half of `handle_request`/
@@ -1210,6 +1236,40 @@ fn prepare_multi_entry_compile(
         return PrepareOutcome::Done(false); // everything requested is either already covered or already denylisted
     }
 
+    // Churn avoidance: before paying for the walk + codegen + finalize, ask
+    // whether this compile would just reproduce the code already installed.
+    //
+    // The common case this catches is a page whose generation keeps bumping
+    // for reasons that have nothing to do with the code on it — the guest
+    // writing data that shares the page, a DMA landing in it, a neighbouring
+    // structure being touched. §13.3 step 4's subsumption check cannot help
+    // there: it gives up the moment `entry_gen != gen_snap`, which is
+    // precisely what a gen bump guarantees. So every such bump used to cost
+    // a full recompile producing byte-identical code.
+    //
+    // Comparing only the words the last compile actually decoded (rather
+    // than the whole page) is what makes this fire in that case: the data
+    // that changed was never part of the region. See
+    // `try_skip_redundant_compile` for the exact conditions — bytes, entry
+    // coverage, and FR mode all have to line up, and the gen re-validation
+    // happens under `publish_lock`.
+    //
+    // Deliberately placed after `candidates` is built, not earlier:
+    // `candidate_bits` is exactly the entry-point set this compile would
+    // publish, so it is the honest thing to test coverage against, and it
+    // already has `denied` and the gen guard folded in.
+    if page.has_compile_snapshot() {
+        if page.try_skip_redundant_compile(&words, &candidate_bits, gen_snap, req.compiled_for_fr1) {
+            // Covered offsets are no longer outstanding asks — the installed
+            // `func` serves them again as of the gen just written. Mirrors
+            // `handle_request`'s own post-publish `clear_requested_bits`.
+            page.clear_requested_bits(&candidate_bits);
+            page.mark_redundant_compile_skipped();
+            return PrepareOutcome::Done(false);
+        }
+        page.mark_redundant_compile_rejected();
+    }
+
     #[cfg(feature = "jitv2_corpus_dump")]
     for &offset in &candidates {
         dump_corpus_snapshot(page, offset, &words);
@@ -1219,9 +1279,22 @@ fn prepare_multi_entry_compile(
     // borrows `analyzer` mutably (it's `&self.instrs`), so it must be done
     // being used before any other `analyzer.*()` call (`covered()`, an
     // immutable borrow) can happen below.
+    // `used` is built here, from the same borrow as `instr_count`: it is one
+    // bit per instruction the merged walk visited, which is exactly the set
+    // of words whose bytes could change what codegen emits. Anything else on
+    // the page — data, padding, code the walk never reached — is provably
+    // irrelevant to this compile's output, which is what lets the
+    // churn-avoidance check ignore writes to it.
+    let mut used = [0u64; crate::jitv2::BITMAP_WORDS];
     let instr_count = {
         let instrs = analyzer.walk_multi_entry(&words, &candidates, phys_base, max_instrs_per_compile());
-        crate::jitv2::analyzer::instrs_linear(instrs).count()
+        let mut n = 0usize;
+        for instr in crate::jitv2::analyzer::instrs_linear(instrs) {
+            let w = instr.word as usize;
+            used[w >> 6] |= 1u64 << (w & 63);
+            n += 1;
+        }
+        n
     };
 
     // Per-offset declines: any candidate NOT in `covered` was excluded at
@@ -1269,7 +1342,31 @@ fn prepare_multi_entry_compile(
         return PrepareOutcome::Done(false);
     }
 
-    PrepareOutcome::Ready { gen_snap, instr_count }
+    // Fold every DENIED offset's own word into `used`, on top of the words
+    // the walk decoded.
+    //
+    // `denied` is sticky page state that outlives the compile that set it,
+    // so "this compile's denials are covered by this compile's `used`" is not
+    // enough. A later same-generation compile (pure added coverage — it does
+    // NOT reset `denied`) re-stages the snapshot, and its own walk has no
+    // reason to touch a word denied long ago: `denied` masks that offset out
+    // of the candidate set, so nothing walks it. The denial stays live while
+    // the evidence for it drops out of the snapshot, and from then on a skip
+    // can never notice the guest rewriting that instruction into something
+    // compilable — the denial outlives the code that earned it, permanently.
+    //
+    // Folding the whole `denied` set in makes the snapshot self-contained:
+    // every sticky decision it carries forward has its own evidence in the
+    // bytes it compares. The cost is at most one extra compared word per
+    // denied offset, and denials are rare relative to page size.
+    //
+    // Read fresh here rather than reusing `candidate_bits`'s copy: the
+    // exclusion loop above may have denied more offsets since.
+    for (i, w) in page.snapshot_denied_raw().iter().enumerate() {
+        used[i] |= !*w; // `denied` is inverted: 0 = denied, so complement it
+    }
+
+    PrepareOutcome::Ready { gen_snap, instr_count, snapshot: Box::new(CompileInputs { words, used }) }
 }
 
 /// §13.3 compile-from-snapshot protocol, multi-entry (§13.10 build-order
@@ -1314,9 +1411,9 @@ pub fn handle_request(
     let outcome = prepare_multi_entry_compile(req, bus, analyzer, stats);
     #[cfg(not(feature = "developer"))]
     let outcome = prepare_multi_entry_compile(req, bus, analyzer);
-    let (gen_snap, instr_count) = match outcome {
+    let (gen_snap, instr_count, inputs) = match outcome {
         PrepareOutcome::Done(early) => return early,
-        PrepareOutcome::Ready { gen_snap, instr_count } => (gen_snap, instr_count),
+        PrepareOutcome::Ready { gen_snap, instr_count, snapshot } => (gen_snap, instr_count, snapshot),
     };
 
     let mut instrs_owned = analyzer.instrs_snapshot();
@@ -1360,8 +1457,16 @@ pub fn handle_request(
                 stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
                 return false;
             }
+            // Stage what this compile consumed, so the next request for this
+            // page can be answered without redoing any of it if nothing that
+            // mattered changed. Staged before the publish and committed only
+            // if it succeeds: a usable snapshot must always describe the
+            // `func` currently installed, and `publish`'s two early-outs
+            // (stale gen, subsumed) leave someone else's code in place.
+            page.stage_compile_snapshot(&inputs.words, &inputs.used, &new_entries, gen_snap, req.compiled_for_fr1);
             if page.publish(&new_entries, jit_fn as *const (), gen_snap, instr_count, code_size) {
                 page.clear_requested_bits(&new_entries);
+                page.commit_compile_snapshot(gen_snap, &new_entries);
             }
             #[cfg(feature = "developer")]
             {
@@ -1491,9 +1596,9 @@ pub fn handle_request_deferred(
     let outcome = prepare_multi_entry_compile(req, bus, analyzer, stats);
     #[cfg(not(feature = "developer"))]
     let outcome = prepare_multi_entry_compile(req, bus, analyzer);
-    let (gen_snap, instr_count) = match outcome {
+    let (gen_snap, instr_count, inputs) = match outcome {
         PrepareOutcome::Done(early) => return early,
-        PrepareOutcome::Ready { gen_snap, instr_count } => (gen_snap, instr_count),
+        PrepareOutcome::Ready { gen_snap, instr_count, snapshot } => (gen_snap, instr_count, snapshot),
     };
 
     let mut new_entries = [0u64; crate::jitv2::BITMAP_WORDS];
@@ -1509,6 +1614,13 @@ pub fn handle_request_deferred(
             let code_size = codegen.last_code_size();
             #[cfg(not(feature = "developer"))]
             let code_size = 0;
+            // Stage the churn-avoidance record here rather than at publish
+            // time: the matching publish goes through the seal queue and may
+            // be performed later, by another worker's `finalize` call, with
+            // only a `PublishInfo` in hand — which deliberately carries no
+            // 4KB page snapshot (see `CompileSnapshot::valid`). `publish_all`
+            // commits it once the publish actually lands.
+            page.stage_compile_snapshot(&inputs.words, &inputs.used, &new_entries, gen_snap, req.compiled_for_fr1);
             // Finalize immediately, every compile — see this function's own
             // doc comment for why deferring finalize itself (rather than
             // just the seal) was the actual bug. finalize_batch_nonforced
@@ -1609,6 +1721,12 @@ fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
         }
         if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size) {
             page.clear_requested_bits(&entry.new_entries);
+            // Vouch for the record `handle_request_deferred` staged for this
+            // compile — matched by `gen_snap`+`new_entries`, so a record
+            // some other compile of the same page overwrote in the meantime
+            // is dropped rather than wrongly validated. See
+            // `PhysicalCodePage::commit_compile_snapshot`.
+            page.commit_compile_snapshot(entry.gen_snap, &entry.new_entries);
         }
     }
 }
