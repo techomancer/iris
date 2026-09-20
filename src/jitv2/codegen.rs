@@ -243,6 +243,11 @@ struct EmitCtx<'a, 'b> {
     /// no call site ever pays a runtime check for something that's actually
     /// fixed for that site.
     exception_call_block: Block,
+    /// Shared absolute-PC exit block (`(core_ptr, target_addr)`) — every
+    /// branch/jump taken-edge jumps here instead of emitting its own body and
+    /// duplicate function epilogue. See its declaration in
+    /// `compile_region_uncommitted`.
+    abs_exit_block: Block,
     /// Shared exception-raise block: `(core_ptr, status, fault_pc, bd)`.
     /// Both stage blocks that used to sit in front of this (one writing
     /// compile-time word/bd into `core`, one trusting the live values) are
@@ -1189,6 +1194,10 @@ impl Codegen {
                 trust_live_pc_bd_on_exc: true,
                 exit_block: dead,
                 exception_call_block: dead,
+                // Mem helpers are standalone Cranelift functions with their
+                // own frame; they never take a region's absolute-PC exit, so
+                // this is the same unreachable placeholder as the two above.
+                abs_exit_block: dead,
                 cycles_pending: &mut unused_cycles,
             };
 
@@ -1434,6 +1443,30 @@ impl Codegen {
         let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
         let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
 
+        // Shared absolute-PC exit — ONE block taking `(core_ptr, target_addr)`,
+        // reached by a `jump` from every branch/jump taken-edge instead of each
+        // site emitting its own `return_`.
+        //
+        // Cranelift lowers every `return_` into its own copy of the function
+        // epilogue (restore callee-saved regs, tear down the frame, `retq`).
+        // Measured on one real corpus page, **167 of 170** epilogue-bearing
+        // blocks were `emit_absolute_pc_exit` sites, and the duplicated
+        // 8-instruction epilogue alone was ~20% of all emitted code there.
+        // (The genuinely cold exits already share a block: exceptions via
+        // `exception_call_block`, interrupt/bail via `exit_block` — those
+        // accounted for 3 of the 170.) A standalone Cranelift probe
+        // (`zz_forwarding`, shapes `manyret` vs `onerettail`) confirms the
+        // tail is not re-duplicated during layout: 9 `retq` became 2.
+        //
+        // Deliberately NOT `set_cold_block`: these are the guest's hot path
+        // out of a region, and a conditional branch with both arms exiting
+        // reaches it from two arms of which one is always taken — there is no
+        // correct layout favourite, which is exactly the case where sharing
+        // costs least and duplicating buys nothing.
+        let abs_exit_block = builder.create_block();
+        let abs_exit_core_ptr = builder.append_block_param(abs_exit_block, ptr_ty);
+        let abs_exit_target = builder.append_block_param(abs_exit_block, ir::types::I64);
+
         // §13.4 internal dispatch head: this page's one compiled function may
         // cover several external entry points, so the function itself must
         // find out which one it's being called for. No parameter needed:
@@ -1467,7 +1500,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1498,7 +1531,7 @@ impl Codegen {
         // start, because the armed foreign-slot transfer was destroyed.
         if crate::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1578,7 +1611,7 @@ impl Codegen {
             builder.switch_to_block(stub);
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
@@ -1597,6 +1630,10 @@ impl Codegen {
         emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
         // Left unsealed until every emit_exception_exit call site below has
         // been emitted — same reasoning as exit_block above.
+
+        builder.switch_to_block(abs_exit_block);
+        emit_absolute_pc_exit_block_body(&mut builder, abs_exit_core_ptr, abs_exit_target);
+        // Left unsealed until every taken-edge site below has been emitted.
 
         for &(word, block) in &instr_blocks {
             instrs[word as usize].block_id = Some(block.as_u32());
@@ -1708,7 +1745,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -3323,10 +3360,17 @@ fn core_offset_of_badvaddr() -> i32 { std::mem::offset_of!(MipsCore, cp0_badvadd
 /// own asymmetry: a straight-line `pc += 4` fallthrough never sets the
 /// trigger either, only an actual taken transfer does.
 fn emit_set_jit_trigger(ctx: &mut EmitCtx) {
+    emit_set_jit_trigger_raw(ctx.builder, ctx.core_ptr);
+}
+
+/// `emit_set_jit_trigger` without an `EmitCtx` — for the shared exit-block
+/// bodies, which are emitted once per function before any per-instruction
+/// context exists.
+fn emit_set_jit_trigger_raw(builder: &mut FunctionBuilder, core_ptr: Value) {
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_jit_trigger());
-    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
-    ctx.builder.ins().store(mem, one, ctx.core_ptr, off);
+    let one = builder.ins().iconst(ir::types::I8, 1);
+    builder.ins().store(mem, one, core_ptr, off);
 }
 fn core_offset_of_cycles() -> i32 {
     (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, cycles)) as i32
@@ -6075,9 +6119,29 @@ fn emit_branch_target_addr(ctx: &mut EmitCtx, word: WordOffset, raw: u32) -> Val
 /// fresh at the true destination, matching a from-scratch interpreter run
 /// exactly.
 fn emit_absolute_pc_exit(ctx: &mut EmitCtx, target_addr: Value) {
+    // Jump to the one shared tail rather than emitting this exit's whole body
+    // (and with it a duplicate function epilogue) inline — see
+    // `abs_exit_block`'s declaration in `compile_region_uncommitted` for the
+    // measurement that motivated it. The body itself lives in
+    // `emit_absolute_pc_exit_block_body` below; everything it does is
+    // identical at every call site, so `target_addr` is the only block param.
+    ctx.builder.ins().jump(ctx.abs_exit_block, &[
+        ir::BlockArg::Value(ctx.core_ptr),
+        ir::BlockArg::Value(target_addr),
+    ]);
+}
+
+/// Body of the shared absolute-PC exit block (`abs_exit_block`), emitted once
+/// per compiled function. Reached by a `jump` from every
+/// `emit_absolute_pc_exit` call site with `(core_ptr, target_addr)`.
+fn emit_absolute_pc_exit_block_body(
+    builder: &mut FunctionBuilder,
+    core_ptr: Value,
+    target_addr: Value,
+) {
     let mem = MemFlagsData::trusted();
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
-    ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, pc_off);
+    builder.ins().store(mem, target_addr, core_ptr, pc_off);
 
     // An absolute-PC exit lands on a transfer's real destination, which is by
     // definition a plain instruction and never a delay slot, so the flag must be
@@ -6106,12 +6170,12 @@ fn emit_absolute_pc_exit(ctx: &mut EmitCtx, target_addr: Value) {
     // immediately broke `emit_foreign_page_annulled_not_taken_exit`, which had
     // been silently inheriting `in_delay_slot = 1`.
     let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
-    let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
-    ctx.builder.ins().store(mem, zero, ctx.core_ptr, flag_off);
+    let zero = builder.ins().iconst(ir::types::I8, 0);
+    builder.ins().store(mem, zero, core_ptr, flag_off);
 
-    emit_set_jit_trigger(ctx);
-    let status = ctx.builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
-    ctx.builder.ins().return_(&[status]);
+    emit_set_jit_trigger_raw(builder, core_ptr);
+    let status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
+    builder.ins().return_(&[status]);
 }
 
 /// Exit stub for a branch/jump/regjump at 0xFFC whose delay slot lives on
@@ -9833,6 +9897,11 @@ mod tests {
             let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
             let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
 
+            // Shared absolute-PC exit, same shape as the production path's.
+            let abs_exit_block = builder.create_block();
+            let abs_exit_core_ptr = builder.append_block_param(abs_exit_block, ptr_ty);
+            let abs_exit_target = builder.append_block_param(abs_exit_block, ir::types::I64);
+
             {
                 // Test harness for preamble emitters only (see this
                 // function's doc comment) — never touches cycles bookkeeping.
@@ -9843,7 +9912,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -9862,6 +9931,8 @@ mod tests {
 
             builder.switch_to_block(exception_call_block);
             emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
+            builder.switch_to_block(abs_exit_block);
+            emit_absolute_pc_exit_block_body(&mut builder, abs_exit_core_ptr, abs_exit_target);
 
             builder.seal_block(exception_call_block);
 
