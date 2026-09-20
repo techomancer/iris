@@ -3,6 +3,13 @@
 Measured 2026-09-01 on 300 real IRIX corpus pages (`jitv2_corpus/`) via
 `zz_corpus_sizes` with `IRIS_JIT_DISASM=1` and `IRIS_OPT_SPEED=1`.
 
+> **Note (2026-09-19):** that 300-page corpus was a local artifact and is
+> gone; the `jitv2_corpus_dump` feature that produced it has been removed.
+> Capture a fresh one with `j2 corpus` — see
+> [[corpus-capture-from-the-pcp-cache]], which also covers the `requested`
+> vs `compiled` trap and the `last_code_size` gating bug that made the
+> "measure without `developer`" advice below impossible to actually follow.
+
 ## First: measure without `developer`
 
 `CODEGEN_OPT_LEVEL_SPEED` (codegen.rs) defaults to
@@ -19,8 +26,10 @@ measuring emitted code:
    callout statistics and the block-size distribution.
 
 `zz_corpus_sizes` used to require `developer` (it calls `last_code_size()`,
-which is developer-gated) and so silently measured the wrong thing. It now
-builds without it, reporting size 0 in that case.
+which was developer-gated) and so silently measured the wrong thing. It then
+built without it but reported size 0 in that case — i.e. the number was
+available only in the build that invalidates it. `last_code_size` is now
+ungated, so a non-`developer` build reports real bytes.
 
 **Rule: any claim about emitted-code shape must come from a non-`developer`
 build.** The first pass of this investigation produced a completely wrong

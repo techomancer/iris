@@ -63,10 +63,21 @@ pub struct Codegen {
     /// Compiled machine code size, in bytes, of the most recent successful
     /// `compile_region` call — see that function's "Read code size before
     /// clearing context" comment for why this can't just be returned
-    /// directly. Dev-only (`j2 pcp`/`j2 stats` diagnostic); `handle_request`
+    /// directly. Feeds the `j2 pcp`/`j2 stats` diagnostics (`handle_request`
     /// reads it immediately after `compile_region` returns `Some` and
-    /// forwards it to `page.publish` as `JitEntry::code_size`.
-    #[cfg(feature = "developer")]
+    /// forwards it to `page.publish` as `JitEntry::code_size`) and the
+    /// `zz_corpus_sizes` corpus measurement.
+    ///
+    /// **Not `developer`-gated**, though it was. That gate made the one
+    /// number a codegen size measurement needs available *only* in the build
+    /// that invalidates such a measurement: `developer` flips `opt_level` to
+    /// `none` and injects a per-instruction trace callout, so its emitted
+    /// code is not the code production runs (see
+    /// `rules/jitv2/block-fragmentation-blocks-cse.md`, where this cost a
+    /// whole wrong conclusion once). `zz_corpus_sizes` consequently reported
+    /// `total_bytes=0` in exactly the build it was supposed to measure. It's
+    /// one `u32` written once per compile off the hot path, so gating it
+    /// bought nothing to begin with.
     last_code_size: u32,
     /// Set right before `compile_region` returns `None` iff that failure
     /// was `ModuleError::Allocation` — the `ArenaMemoryProvider` running out
@@ -494,7 +505,6 @@ impl Codegen {
             // `dc_geometry` is known (a fresh `Codegen` has none yet, so
             // constructing here would always no-op).
             mem_helpers: [None; MEM_HELPER_COUNT],
-            #[cfg(feature = "developer")]
             last_code_size: 0,
             last_compile_ran_out_of_memory: false,
             #[cfg(feature = "developer")]
@@ -628,8 +638,7 @@ impl Codegen {
         self.ctx = self.module.make_context();
         self.func_id_counter = 0;
         self.func_ranges.clear();
-        #[cfg(feature = "developer")]
-        { self.last_code_size = 0; }
+        self.last_code_size = 0;
         self.last_compile_ran_out_of_memory = false;
         // Old helper addresses point into the arena that was just freed.
         // Dropped here, but NOT rebuilt: a forced seal mprotects a whole host
@@ -655,7 +664,6 @@ impl Codegen {
 
     /// Compiled machine code size, in bytes, of the most recent successful
     /// `compile_region` call — see `last_code_size`'s own field doc comment.
-    #[cfg(feature = "developer")]
     pub fn last_code_size(&self) -> u32 {
         self.last_code_size
     }
@@ -2008,12 +2016,9 @@ impl Codegen {
         // jit/compiler.rs. Captured into a field rather than returned
         // directly, to keep this function's `Option<JitFn>` return type
         // stable for its several other callers (equiv_test, lockstep, …).
-        #[cfg(feature = "developer")]
-        {
-            self.last_code_size = self.ctx.compiled_code()
-                .map(|cc| cc.code_buffer().len() as u32)
-                .unwrap_or(0);
-        }
+        self.last_code_size = self.ctx.compiled_code()
+            .map(|cc| cc.code_buffer().len() as u32)
+            .unwrap_or(0);
         self.module.clear_context(&mut self.ctx);
         self.func_id_counter += 1;
         // Heartbeat: cranelift-jit exposes no arena-size/mmap-count API of

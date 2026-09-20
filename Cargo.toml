@@ -183,11 +183,6 @@ jitv2_opcodefusion = ["jitv2"]
 # boots have hit a core dump) — opt in for testing, default path (this flag
 # off) is what ships. See that doc's §13 for the full design rationale.
 j2wp = ["jitv2"]
-# jitv2 dev tool: dump every compile-request's 4KB page snapshot to
-# jitv2_corpus/ instead of (alongside) actually compiling. Used to build a
-# corpus for offline analyzer/codegen development; off by default so normal
-# jitv2 runs never touch the filesystem from the compile thread.
-jitv2_corpus_dump = ["jitv2"]
 # jitv2 dev tool: temporary in-process lockstep verifier. On every dispatch,
 # classifies the current instruction (alu/branch/load-store/fpu) and, for the
 # categories currently wired up (alu only, to start), inline-compiles just

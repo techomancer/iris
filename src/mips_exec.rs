@@ -11155,7 +11155,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -12967,9 +12967,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             None => return Err("j2 deny: page pool is full (can't even allocate a fresh lookup entry)".to_string()),
                         }
                     }
-                    // `j2wp` only: `pcp_dump` is that impl's module, and the dump
-                    // format is its `PhysicalCodePage` layout.
-                    #[cfg(feature = "j2wp")]
+                    // Available under both `comp.rs` implementations: the dump
+                    // format is implementation-agnostic (the default impl
+                    // reconstructs the bitmaps from its per-`JitEntry` state
+                    // behind `PhysicalCodePage::dump_*`).
                     "dumppcp" => {
                         // Capture a PhysicalCodePage + its raw 4KB of memory to
                         // a file for offline analysis with the `jitv2_pcp_dump`
@@ -13006,9 +13007,18 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             let pfn = result.phys / crate::jitv2::PAGE_SIZE;
                             let page_base = pfn * crate::jitv2::PAGE_SIZE;
                             let sysad = exec.sysad.clone();
-                            let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
                             let mut jit = exec.jitv2.lock();
-                            match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
+                            // `page_for` takes the live FR mode under `j2wp`
+                            // (which pins it per page) and not under the
+                            // default impl (which pins per compile).
+                            #[cfg(feature = "j2wp")]
+                            let slot = {
+                                let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                                jit.page_for(pfn, page_base, sysad.as_ref(), fr1)
+                            };
+                            #[cfg(not(feature = "j2wp"))]
+                            let slot = jit.page_for(pfn, page_base, sysad.as_ref());
+                            match slot {
                                 Some(slot) => jit.page_ptr(slot),
                                 None => return Err("page pool full".to_string()),
                             }
@@ -13027,6 +13037,74 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         writeln!(writer, "wrote {} (pfn {:#x}, gen {} entry_gen {}, fr1={})",
                             path, dump.pfn, dump.current_gen, dump.entry_gen, dump.fr1).unwrap();
                         writeln!(writer, "analyse with: jitv2_pcp_dump {} [--offset <hex>] [--compile]", path).unwrap();
+                    }
+                    // Bulk corpus capture, replacing the old
+                    // `jitv2_corpus_dump` Cargo feature (see
+                    // `jitv2/pcp_dump.rs`'s module doc for why that one went
+                    // away). Everything a corpus needs is already sitting in
+                    // the live pcp cache after a boot — every page the JIT
+                    // touched, with its entry bitmaps — so this just walks the
+                    // pool and writes each claimed page out in the same `.pcp`
+                    // format `dumppcp` uses. No feature flag, so a corpus can
+                    // be taken from the production-shaped build whose emitted
+                    // code is the thing worth measuring.
+                    "corpus" => {
+                        // Usage: j2 corpus [dir]   (default: jitv2_corpus)
+                        let dir = actual_args.get(1).copied().unwrap_or(crate::jitv2::pcp_dump::CORPUS_DIR);
+                        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir, e))?;
+
+                        // Capture under the lock into memory first, then write
+                        // outside it: `capture` reads 1024 words per page off
+                        // the bus, and holding the jitv2 lock across a few
+                        // thousand of those plus the filesystem would stall
+                        // every dispatching CPU thread for the whole dump.
+                        let sysad = exec.sysad.clone();
+                        let mut unreadable = 0usize;
+                        let dumps: Vec<crate::jitv2::pcp_dump::PcpDump> = {
+                            let jit = exec.jitv2.lock();
+                            let mut v = Vec::new();
+                            for page in jit.claimed_pages() {
+                                // A claimed page whose memory won't read right
+                                // now (device unmapped under it, say) is skipped
+                                // rather than failing the whole dump — one bad
+                                // page shouldn't cost the other few thousand.
+                                match crate::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref()) {
+                                    Ok(d) => v.push(d),
+                                    Err(_) => unreadable += 1,
+                                }
+                            }
+                            v
+                        };
+
+                        let mut written = 0usize;
+                        let mut failed = 0usize;
+                        let mut total_calls = 0u64;
+                        for dump in &dumps {
+                            // pfn-named, not timestamped like `default_dump_path`:
+                            // a corpus is a set keyed by page, and re-running
+                            // `j2 corpus` into the same directory should refresh
+                            // it rather than pile up a second copy of every page.
+                            let path = std::path::Path::new(dir)
+                                .join(format!("pcp_{:08x}.pcp", dump.pfn));
+                            match std::fs::write(&path, dump.to_bytes()) {
+                                Ok(()) => {
+                                    written += 1;
+                                    total_calls = total_calls.saturating_add(dump.call_count);
+                                }
+                                Err(e) => {
+                                    if failed == 0 {
+                                        writeln!(writer, "j2 corpus: write {}: {}", path.display(), e).unwrap();
+                                    }
+                                    failed += 1;
+                                }
+                            }
+                        }
+                        writeln!(writer, "j2 corpus: wrote {} page(s) to {}/ ({} unreadable, {} write failure(s))",
+                            written, dir, unreadable, failed).unwrap();
+                        if total_calls > 0 {
+                            writeln!(writer, "  total recorded dispatches across corpus: {}", total_calls).unwrap();
+                        }
+                        writeln!(writer, "  measure with: IRIS_CORPUS_DIR={} IRIS_OPT_SPEED=1 cargo test --release --features jitv2 zz_corpus_sizes -- --nocapture", dir).unwrap();
                     }
                     #[cfg(feature = "j2wp")]
                     "pcp" => {

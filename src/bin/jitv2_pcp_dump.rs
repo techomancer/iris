@@ -84,6 +84,11 @@ fn main() {
         if dump.current_gen == dump.entry_gen { "(func/compiled ARE fresh vs this snapshot's gen)" }
         else { "(func/compiled are STALE vs this snapshot's current_gen — page mutated after last publish)" });
     println!("fr1={}", dump.fr1);
+    // v2 field; a v1 file reads it back as 0 ("unknown"), so only print it
+    // when there's something to say rather than showing a misleading 0.
+    if dump.call_count > 0 {
+        println!("call_count={} (dispatches into this page's compiled code)", dump.call_count);
+    }
     println!();
 
     // §13: `is_requested`/`is_compiled`/`is_denylisted` are WORD-indexed

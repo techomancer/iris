@@ -26,11 +26,7 @@ mod old_impl {
 //! hardware), which keeps extending for free until it terminates or runs
 //! off the page, at which point the walk declines the whole region rather
 //! than compiling a partial chain.
-//!
-//! Corpus collection (raw page dump to `jitv2_corpus/`, used to develop the
-//! analyzer/codegen offline against real captured pages) is preserved behind
-//! the `jitv2_corpus_dump` feature — with it off, `handle_request` never
-//! touches the filesystem.
+
 
 use std::sync::Arc;
 
@@ -195,9 +191,6 @@ pub fn handle_request(
         }
         *w = r.data;
     }
-
-    #[cfg(feature = "jitv2_corpus_dump")]
-    dump_corpus_snapshot(page, req.offset, &words);
 
     let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, max_instrs_per_compile());
     if !non_empty {
@@ -426,9 +419,6 @@ pub fn handle_request_deferred(
         *w = r.data;
     }
 
-    #[cfg(feature = "jitv2_corpus_dump")]
-    dump_corpus_snapshot(page, req.offset, &words);
-
     let (instrs, non_empty) = analyzer.walk_bounded(&words, req.offset, phys_base, max_instrs_per_compile());
     if !non_empty {
         page.denylist(offset);
@@ -586,34 +576,6 @@ pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) 
     let sealed = codegen.force_seal_pending();
     *pending = pending.saturating_sub(sealed.len());
     publish_all(&sealed);
-}
-
-#[cfg(feature = "jitv2_corpus_dump")]
-pub const CORPUS_DIR: &str = "jitv2_corpus";
-
-#[cfg(feature = "jitv2_corpus_dump")]
-fn dump_corpus_snapshot(page: &crate::jitv2::PhysicalCodePage, offset: u16, words: &[u32; ENTRIES_PER_PAGE]) {
-    use std::io::Write;
-
-    if !page.mark_saved(offset as usize) {
-        return; // already dumped for this (pfn, offset)
-    }
-    let out_dir = std::path::Path::new(CORPUS_DIR);
-    if let Err(e) = std::fs::create_dir_all(out_dir) {
-        eprintln!("jitv2 corpus: failed to create {}: {}", CORPUS_DIR, e);
-        return;
-    }
-    let path = out_dir.join(format!("pfn_{:08x}_off_{:04x}.bin", page.pfn, offset));
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&path)?;
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words))
-        };
-        f.write_all(bytes)
-    };
-    if let Err(e) = write() {
-        eprintln!("jitv2 corpus: failed to write snapshot for pfn={:#010x} offset={:#06x}: {}", page.pfn, offset, e);
-    }
 }
 
 #[cfg(test)]
@@ -958,11 +920,7 @@ mod new_impl {
 //! hardware), which keeps extending for free until it terminates or runs
 //! off the page, at which point the walk declines the whole region rather
 //! than compiling a partial chain.
-//!
-//! Corpus collection (raw page dump to `jitv2_corpus/`, used to develop the
-//! analyzer/codegen offline against real captured pages) is preserved behind
-//! the `jitv2_corpus_dump` feature — with it off, `handle_request` never
-//! touches the filesystem.
+
 
 use std::sync::Arc;
 
@@ -1268,11 +1226,6 @@ fn prepare_multi_entry_compile(
             return PrepareOutcome::Done(false);
         }
         page.mark_redundant_compile_rejected();
-    }
-
-    #[cfg(feature = "jitv2_corpus_dump")]
-    for &offset in &candidates {
-        dump_corpus_snapshot(page, offset, &words);
     }
 
     // instr_count computed immediately, right after the walk: `instrs`
@@ -1761,34 +1714,6 @@ pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) 
     let sealed = codegen.force_seal_pending();
     *pending = pending.saturating_sub(sealed.len());
     publish_all(&sealed);
-}
-
-#[cfg(feature = "jitv2_corpus_dump")]
-pub const CORPUS_DIR: &str = "jitv2_corpus";
-
-#[cfg(feature = "jitv2_corpus_dump")]
-fn dump_corpus_snapshot(page: &crate::jitv2::PhysicalCodePage, offset: u16, words: &[u32; ENTRIES_PER_PAGE]) {
-    use std::io::Write;
-
-    if !page.mark_saved(offset as usize) {
-        return; // already dumped for this (pfn, offset)
-    }
-    let out_dir = std::path::Path::new(CORPUS_DIR);
-    if let Err(e) = std::fs::create_dir_all(out_dir) {
-        eprintln!("jitv2 corpus: failed to create {}: {}", CORPUS_DIR, e);
-        return;
-    }
-    let path = out_dir.join(format!("pfn_{:08x}_off_{:04x}.bin", page.pfn, offset));
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&path)?;
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words))
-        };
-        f.write_all(bytes)
-    };
-    if let Err(e) = write() {
-        eprintln!("jitv2 corpus: failed to write snapshot for pfn={:#010x} offset={:#06x}: {}", page.pfn, offset, e);
-    }
 }
 
 #[cfg(test)]

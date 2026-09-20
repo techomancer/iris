@@ -32,7 +32,7 @@ Changes beyond upstream IRIS that affect how you run and configure the Indy:
 | **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in `gui.json`; **File → Prepare for premiere…** exports TOML |
 | **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [rules/perf/gui-idle-refresh.md](../rules/perf/gui-idle-refresh.md) |
 | **Audio** | hptimer late-fire catch-up; Display tab `[audio]` prebuf / cpal buffer |
-| **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); tuning via `--features jitv2_lockstep,jitv2_corpus_dump,jitv2_opcodefusion` and `[jitv2] threads` in TOML |
+| **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); tuning via `--features jitv2_lockstep,jitv2_opcodefusion` and `[jitv2] threads` in TOML |
 
 See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 

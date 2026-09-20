@@ -142,7 +142,6 @@ at startup.
 | `jitv2_smc_check` | Report writes into the page the CPU is executing (run with `j2 inline_mem off`) |
 | `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
 | `j2wp` | jitv2 whole-page compile instead of one function per entry point (not production-ready) |
-| `jitv2_corpus_dump` | Dump compile-request pages to `jitv2_corpus/` |
 | `debug_cache` | Track one cache line across all operations |
 | `mips4` | Lets jitv2 compile MIPS IV opcodes (otherwise they run in the interpreter). The interpreter enables MIPS IV from the runtime CPU model on its own |
 | `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
@@ -338,15 +337,37 @@ counters, and falls back to the interpreter for anything it has no emitter for.
 
 Extra features: `jitv2_lockstep` (cross-checks every compiled instruction
 against the interpreter — slow, diagnostic only), `jitv2_smc_check`,
-`jitv2_corpus_dump` (dumps compile-request page snapshots to `jitv2_corpus/`
-instead of compiling, for building an offline test corpus), `j2wp` (whole-page
-compile, experimental), and `jitv2_opcodefusion` (LUI+ORI/ADDIU and
+`j2wp` (whole-page compile, experimental), and `jitv2_opcodefusion` (LUI+ORI/ADDIU and
 branch/jump+NOP delay-slot fusion, jitv2's counterparts to the interpreter's
 `opcodefusion` — OFF by default, unlike the interpreter's own fusion, due to a
 history of live-boot bugs; see
 `rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`). Developer tools:
 `jitv2_analyze`, `jitv2_verify` and `jitv2_pcp_dump` binaries, and the `j2`
 monitor command.
+
+#### Measuring emitted code against a real corpus
+
+`j2 corpus [dir]` (default `jitv2_corpus/`) writes every page in the live JIT
+page cache to a `.pcp` file — the same format `j2 dumppcp` produces for a
+single page, carrying the page's bytes, its entry-point bitmaps, its
+generation and its dispatch count. Boot the guest, do whatever workload you
+care about, then take the dump; the pages are already cached, so this costs
+nothing until you ask for it.
+
+```
+(monitor) j2 corpus                 # -> jitv2_corpus/pcp_<pfn>.pcp, one per page
+IRIS_CORPUS_DIR=jitv2_corpus IRIS_OPT_SPEED=1   cargo test --release --features jitv2 zz_corpus_sizes -- --nocapture
+```
+
+That compiles every entry point of every captured page and reports total
+emitted bytes, plus a dispatch-weighted total, so a codegen change can be
+measured against real guest code instead of a microbenchmark.
+
+**Do not measure under `developer`.** It forces `opt_level=none` and injects a
+per-instruction trace callout, so its output describes code production never
+emits — this has produced a completely wrong conclusion before, and the test
+prints a warning if you try. See
+`rules/jitv2/block-fragmentation-blocks-cse.md`.
 
 ### REX3 drawing and the graphics JIT (`--features rex-jit`)
 

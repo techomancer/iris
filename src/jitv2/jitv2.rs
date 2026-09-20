@@ -509,11 +509,6 @@ const ENTRY_SCHEDULED: u8 = 1 << 2;
 /// bitmap word in one cache line and then `func`/`gen` in a completely
 /// separate one; a single `flags` byte right next to `func`/`gen` means the
 /// first touch of this entry already pulls the whole thing into L1 together.
-/// `saved_bits` (corpus-collection scaffolding only, not part of the design
-/// doc's per-page metadata — see its own field doc) is the one bitmap that
-/// stays a separate SoA array: it's scanned/tested completely independently
-/// of dispatch and is slated for deletion once the real compiler replaces
-/// the dump-to-disk stub anyway.
 pub struct JitEntry {
     /// Compiled function pointer for this offset, or null if unpublished.
     /// Validity is owned entirely by `flags`' `ENTRY_VALID` bit (§6.1.2's
@@ -889,13 +884,6 @@ pub struct PhysicalCodePage {
     /// exist for doesn't apply anymore; the indirection would just be extra
     /// pointer-chasing on every entry access for no benefit.
     pub entries: [JitEntry; ENTRIES_PER_PAGE],
-    /// Scaffolding for corpus collection only (`jitv2/comp.rs`) — NOT part of
-    /// the design doc's per-page metadata (§2.4). One bit per entry offset:
-    /// set once that (pfn, offset) pair's page snapshot has been dumped to
-    /// `jitv2_corpus/`, so a hot page revisited many times only gets saved
-    /// once. Safe to delete once the real compiler (reachability walk +
-    /// codegen) replaces the dump-to-disk stub in the worker loop.
-    pub saved_bits: [AtomicU64; BITMAP_WORDS],
 }
 
 // Safety: `gen` points into the owning BusDevice's storage, which outlives
@@ -923,7 +911,6 @@ impl PhysicalCodePage {
             pfn,
             gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
             entries: std::array::from_fn(|_| JitEntry::default()),
-            saved_bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -944,7 +931,6 @@ impl PhysicalCodePage {
     /// whatever count was sitting there from its previous physical page's
     /// occupancy, silently skewing the new page's own warm-up window.
     fn reset_entries_and_bitmaps(&mut self) {
-        for word in self.saved_bits.iter() { word.store(0, std::sync::atomic::Ordering::Relaxed); }
         for entry in self.entries.iter_mut() {
             entry.func = std::ptr::null();
             entry.gen.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1268,26 +1254,135 @@ impl PhysicalCodePage {
         true
     }
 
-    /// Corpus-collection scaffolding (`saved_bits`, see its field doc):
-    /// whether this offset's page snapshot has already been dumped to disk.
-    #[inline]
-    pub fn is_saved(&self, offset_word: usize) -> bool {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        self.saved_bits[word].load(std::sync::atomic::Ordering::Relaxed) & (1 << bit) != 0
+    // ---- `pcp_dump` capture accessors (`j2 dumppcp` / `j2 corpus`) ----
+    //
+    // The dump format (`jitv2/pcp_dump.rs`) was designed against the `j2wp`
+    // page layout, which keeps `requested`/`compiled`/`denied` as three real
+    // `EntryBitmap` fields plus a page-level `entry_gen` and pinned `fr1`.
+    // This implementation has none of those as *fields*: its per-offset state
+    // lives in each `JitEntry`'s `flags`/`gen`, one function per entry point
+    // rather than one per page. All of it is still recoverable, so rather
+    // than gate the dump on `j2wp` these accessors reconstruct the same
+    // logical view by scanning `entries`, letting one format and one offline
+    // tool serve both implementations. Prefixed `dump_` to keep them visibly
+    // diagnostic-only: nothing on a hot path calls them, and each is O(1024).
+    //
+    // Naming note: `dump_entry_gen`/`dump_fr1` exist under both impls purely
+    // so `PcpDump::capture` can be implementation-agnostic. Under `j2wp` they
+    // forward to the real page-level fields; here they synthesize the nearest
+    // honest equivalent, documented per method below.
+
+    /// Entry offsets that have a live compiled function right now — the
+    /// `compiled` bitmap's meaning, reconstructed from each entry's
+    /// `ENTRY_VALID` flag and generation.
+    ///
+    /// Uses `is_runnable`, not just `ENTRY_VALID`: an entry whose `gen` no
+    /// longer matches the page's is stale, and dispatch would refuse to call
+    /// it, so reporting it as compiled would misrepresent what the JIT would
+    /// actually do with this page.
+    pub fn dump_compiled(&self) -> [u64; BITMAP_WORDS] {
+        let mut bm = [0u64; BITMAP_WORDS];
+        for off in 0..ENTRIES_PER_PAGE {
+            if self.is_runnable(off) {
+                bm[off >> 6] |= 1u64 << (off & 63);
+            }
+        }
+        bm
     }
 
-    /// Corpus-collection scaffolding: mark `offset_word` as saved. Returns
-    /// `true` if this call is the one that set the bit (i.e. the caller
-    /// should actually write the file) — using `fetch_or`'s previous value
-    /// means concurrent duplicate work is impossible even if this is ever
-    /// called from more than one thread for the same page.
-    #[inline]
-    pub fn mark_saved(&self, offset_word: usize) -> bool {
-        let word = offset_word >> 6;
-        let bit = offset_word & 63;
-        let prev = self.saved_bits[word].fetch_or(1 << bit, std::sync::atomic::Ordering::Relaxed);
-        prev & (1 << bit) == 0
+    /// Entry offsets some dispatch has asked for, in the `requested`
+    /// bitmap's sense.
+    ///
+    /// Reconstructed as "has a non-null entry point, or is on its way to
+    /// one": `ENTRY_VALID` (something compiled here) or `ENTRY_SCHEDULED` (a
+    /// `CompileRequest` is in flight for it) or sticky-denied (it was
+    /// requested at least once — that is *why* the compiler got to reject
+    /// it). The union is the closest honest analogue of `j2wp`'s field,
+    /// which is likewise a superset of `compiled`.
+    ///
+    /// It is genuinely an approximation in one direction, and deliberately
+    /// so: this implementation has no memory of a request that was made,
+    /// satisfied against an older generation, and then invalidated without
+    /// ever being re-requested. Such an offset reads as not-requested here
+    /// where `j2wp` would still show its bit set. That costs a corpus
+    /// consumer nothing — every offset worth compiling is one the guest will
+    /// dispatch again, which re-sets the flag — and the alternative would be
+    /// a new always-on bitmap on the hot page struct solely to feed a
+    /// diagnostic.
+    pub fn dump_requested(&self) -> [u64; BITMAP_WORDS] {
+        let mut bm = [0u64; BITMAP_WORDS];
+        for off in 0..ENTRIES_PER_PAGE {
+            let flags = self.entries[off].flags.load(std::sync::atomic::Ordering::Relaxed);
+            if flags & (ENTRY_VALID | ENTRY_SCHEDULED | ENTRY_DENYLISTED) != 0 {
+                bm[off >> 6] |= 1u64 << (off & 63);
+            }
+        }
+        bm
+    }
+
+    /// The denylist in the dump format's **raw/inverted** sense: 1 = still
+    /// eligible to compile, 0 = sticky-denied. Inverted here to match
+    /// `j2wp`'s `denied` field, which stores it that way so it composes with
+    /// its other bitmaps; this implementation stores the un-inverted fact in
+    /// `ENTRY_DENYLISTED`, so the sense is flipped on the way out.
+    pub fn dump_denied_raw(&self) -> [u64; BITMAP_WORDS] {
+        let mut bm = [0u64; BITMAP_WORDS];
+        for off in 0..ENTRIES_PER_PAGE {
+            if !self.is_denylisted(off) {
+                bm[off >> 6] |= 1u64 << (off & 63);
+            }
+        }
+        bm
+    }
+
+    /// Generation the page's compiled entries were published against.
+    ///
+    /// There is no page-level `entry_gen` under this implementation — each
+    /// entry carries its own `gen` — so this reports the newest generation
+    /// any live entry was compiled against, which is what a reader comparing
+    /// it against `current_gen` wants to know ("is any of this page's
+    /// compiled code still current"). `current_gen()` when nothing is
+    /// published, matching `j2wp`'s own fresh-page value.
+    pub fn dump_entry_gen(&self) -> u64 {
+        let mut newest = None;
+        for off in 0..ENTRIES_PER_PAGE {
+            if self.is_published(off) {
+                let g = self.entries[off].gen.load(std::sync::atomic::Ordering::Acquire);
+                newest = Some(newest.map_or(g, |n: u64| n.max(g)));
+            }
+        }
+        newest.unwrap_or_else(|| self.current_gen())
+    }
+
+    /// Pinned FR mode. This implementation pins FR per *compile*, not per
+    /// page (`JitEntry::compiled_for_fr1` — the `j2wp` design's one-function-
+    /// per-page model is what forced a single page-wide pin), so there may be
+    /// no single answer. Reports the mode of the first published entry, which
+    /// is the mode a reader disassembling this page should assume; `false`
+    /// when nothing is published.
+    pub fn dump_fr1(&self) -> bool {
+        (0..ENTRIES_PER_PAGE)
+            .find(|&off| self.is_published(off))
+            .map(|off| self.entries[off].compiled_for_fr1)
+            .unwrap_or(false)
+    }
+
+    /// Total dispatches into this page's compiled code, summed over its
+    /// entries (this implementation counts per entry; `j2wp` counts per
+    /// page). 0 when the counters are compiled out.
+    pub fn dump_call_count(&self) -> u64 {
+        #[cfg(feature = "developer")]
+        {
+            let mut total = 0u64;
+            for off in 0..ENTRIES_PER_PAGE {
+                total = total.saturating_add(
+                    self.entries[off].call_count.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            total
+        }
+        #[cfg(not(feature = "developer"))]
+        { 0 }
     }
 
     /// Dev-only (`j2 pcp`): saturating-increment `offset_word`'s
@@ -2241,9 +2336,9 @@ impl CompileQueue {
     }
 
     /// Worker body: pop requests until stopped and hand each to
-    /// `comp::handle_request` (reachability walk + codegen + publish, §6.5;
-    /// dump-to-disk corpus collection lives behind the `jitv2_corpus_dump`
-    /// feature in the same function, see `jitv2/comp.rs`). Owns the
+    /// `comp::handle_request` (reachability walk + codegen + publish, §6.5 —
+    /// no filesystem access of any kind; corpus capture is now an on-demand
+    /// `j2 corpus` walk of this pool, see `jitv2/pcp_dump.rs`). Owns the
     /// `Analyzer` scratch state for the thread's whole lifetime (meant to be
     /// reused across jobs, not rebuilt per request); `codegen` is the shared
     /// one moved in by `start`. Backs off briefly when the queue is empty
@@ -4096,13 +4191,6 @@ pub struct PhysicalCodePage {
     /// unlocked and in parallel, including two compiles of the same page;
     /// only the cheap publish tail is serialized here.
     publish_lock: Mutex<()>,
-    /// Scaffolding for corpus collection only (`jitv2/comp.rs`) — NOT part of
-    /// the design doc's per-page metadata (§2.4). One bit per entry offset:
-    /// set once that (pfn, offset) pair's page snapshot has been dumped to
-    /// `jitv2_corpus/`, so a hot page revisited many times only gets saved
-    /// once. Safe to delete once the real compiler (reachability walk +
-    /// codegen) replaces the dump-to-disk stub in the worker loop.
-    pub saved_bits: [AtomicU64; BITMAP_WORDS],
     /// Dev-only diagnostics for `j2 pcp`/`j2 status` (§13.1 — page-granular
     /// now that there's one function; the old per-entry `instr_count`/
     /// `code_size`/`call_count`/`block_include_count` don't have a
@@ -4472,7 +4560,6 @@ impl PhysicalCodePage {
             redundant_rejected: std::sync::atomic::AtomicU32::new(0),
             killed_since_snapshot: std::sync::atomic::AtomicBool::new(false),
             compile_snapshot: UnsafeCell::new(CompileSnapshot::new()),
-            saved_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             #[cfg(feature = "developer")]
             instr_count: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "developer")]
@@ -4503,7 +4590,6 @@ impl PhysicalCodePage {
     /// (`Jitv2::mega_flush`'s per-slot reset) — a fresh, never-claimed slot
     /// is already zeroed by `PhysicalCodePage::new` and doesn't need this.
     fn reset_entries_and_bitmaps(&mut self) {
-        for word in self.saved_bits.iter() { word.store(0, Ordering::Relaxed); }
         for bm in [&self.requested, &self.compiled] {
             for word in bm.iter() { word.store(0, Ordering::Relaxed); }
         }
@@ -5529,21 +5615,28 @@ impl PhysicalCodePage {
         true
     }
 
-    /// Corpus-collection scaffolding (`saved_bits`, see its field doc):
-    /// whether this offset's page snapshot has already been dumped to disk.
-    #[inline]
-    pub fn is_saved(&self, offset_word: usize) -> bool {
-        bitmap_test(&self.saved_bits, offset_word, Ordering::Relaxed)
-    }
+    // ---- `pcp_dump` capture accessors (`j2 dumppcp` / `j2 corpus`) ----
+    //
+    // Thin forwarders to this implementation's real fields. They exist so
+    // `PcpDump::capture` can be written once against a single accessor set
+    // and work under both `comp.rs` implementations — the default one has no
+    // `requested`/`compiled`/`denied` bitmaps and no page-level `entry_gen`,
+    // and reconstructs all of it from its per-`JitEntry` state behind these
+    // same names (see its own copy for what each reconstruction assumes).
+    pub fn dump_requested(&self) -> [u64; BITMAP_WORDS] { self.snapshot_requested() }
+    pub fn dump_compiled(&self) -> [u64; BITMAP_WORDS] { self.snapshot_compiled() }
+    pub fn dump_denied_raw(&self) -> [u64; BITMAP_WORDS] { self.snapshot_denied_raw() }
+    pub fn dump_entry_gen(&self) -> u64 { self.entry_gen() }
+    pub fn dump_fr1(&self) -> bool { self.is_fr1() }
 
-    /// Corpus-collection scaffolding: mark `offset_word` as saved. Returns
-    /// `true` if this call is the one that set the bit (i.e. the caller
-    /// should actually write the file) — using `fetch_or`'s previous value
-    /// means concurrent duplicate work is impossible even if this is ever
-    /// called from more than one thread for the same page.
-    #[inline]
-    pub fn mark_saved(&self, offset_word: usize) -> bool {
-        bitmap_test_and_set(&self.saved_bits, offset_word, Ordering::Relaxed)
+    /// Dispatches into this page's compiled code. Page-level here (§13's one
+    /// function per page); 0 when the counter is compiled out, which is the
+    /// dump format's documented "unknown".
+    pub fn dump_call_count(&self) -> u64 {
+        #[cfg(feature = "developer")]
+        { self.call_count.load(Ordering::Relaxed) }
+        #[cfg(not(feature = "developer"))]
+        { 0 }
     }
 }
 
@@ -6781,9 +6874,9 @@ impl CompileQueue {
     }
 
     /// Worker body: pop requests until stopped and hand each to
-    /// `comp::handle_request` (reachability walk + codegen + publish, §6.5;
-    /// dump-to-disk corpus collection lives behind the `jitv2_corpus_dump`
-    /// feature in the same function, see `jitv2/comp.rs`). Owns the
+    /// `comp::handle_request` (reachability walk + codegen + publish, §6.5 —
+    /// no filesystem access of any kind; corpus capture is now an on-demand
+    /// `j2 corpus` walk of this pool, see `jitv2/pcp_dump.rs`). Owns the
     /// `Analyzer` scratch state for the thread's whole lifetime (meant to be
     /// reused across jobs, not rebuilt per request); `codegen` is the shared
     /// one moved in by `start`. Backs off briefly when the queue is empty

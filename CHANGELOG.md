@@ -55,6 +55,35 @@ is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **Corpus capture moved to the pcp cache; `jitv2_corpus_dump` removed.** The
+  old Cargo feature dumped a raw 4KB page per compile request from inside the
+  compile worker, with one entry offset encoded per filename and a
+  `PhysicalCodePage::saved_bits` bitmap to dedup them. It had to be compiled in
+  *before* the run that would produce the interesting pages, so a corpus could
+  only be captured by deciding in advance you wanted one — and the corpus every
+  `rules/jitv2/` measurement cites was a local artifact that got lost, with no
+  way to reproduce it.
+
+  `j2 corpus [dir]` now walks the live JIT page cache on demand and writes one
+  `.pcp` per page — the format `j2 dumppcp` already used, bumped to `IRISPCP2`
+  with a `call_count`, for weighting a measurement by how hot a page actually
+  was. The format stays entirely physical: no virtual address is recorded,
+  because jitv2 compiles PIC precisely because one physical page is shared
+  across processes, so no single VA is meaningful. `IRISPCP1` files still
+  read. Both
+  `j2 dumppcp` and `j2 corpus` now work under **both** `comp.rs`
+  implementations, not just `j2wp`: the default impl reconstructs the entry
+  bitmaps from its per-`JitEntry` state. `zz_corpus_sizes` consumes a directory
+  of `.pcp` files via `IRIS_CORPUS_DIR` instead of a file of filenames.
+
+  Also fixed along the way: `Codegen::last_code_size` was `developer`-gated,
+  which made the one number a codegen-size measurement needs available only in
+  the build that invalidates such a measurement (`developer` forces
+  `opt_level=none` and injects a per-instruction trace callout) — so
+  `zz_corpus_sizes` reported `total_bytes=0` in exactly the build it was meant
+  to measure. See `rules/jitv2/corpus-capture-from-the-pcp-cache.md`, including
+  the `requested`-vs-`compiled` trap that silently discards 99.5% of a corpus.
+
 - **Compile churn avoidance (`j2wp`).** Each page now remembers the bytes its
   last compile decoded, the entry points it published and the FR mode it was
   built for. A later compile request whose generation moved but whose *decoded*
@@ -155,7 +184,7 @@ is easiest to understand by reading the commit.
 - `jitv2_opcodefusion` (LUI+ORI/ADDIU, branch+NOP) exists but is **off by
   default** after it broke Linux (`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 - `j2wp` whole-page compile, `jitv2_lockstep`, `jitv2_smc_check`,
-  `jitv2_corpus_dump`, the `j2` monitor command (`clear`, `deny`, `pagewb`,
+  the `j2` monitor command (`clear`, `deny`, `pagewb`,
   `html` physical code page visualiser, …) and the `jitv2_analyze`,
   `jitv2_verify`, `jitv2_pcp_dump` tools.
 - Status-bar feedback for JIT activity.

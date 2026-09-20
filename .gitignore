@@ -23,3 +23,9 @@ IRIS.app/
 # but deliberately checked in — building the suite must need nothing but the
 # MIPS cross toolchain.
 bench/build/
+
+# `j2 corpus` captures: tens of MB of binary page dumps, regenerated on demand
+# from any boot (see rules/jitv2/corpus-capture-from-the-pcp-cache.md).
+jitv2_corpus/
+*.pcp
+pcp_dump_pfn_*.bin
