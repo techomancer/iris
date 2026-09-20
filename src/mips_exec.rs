@@ -11155,7 +11155,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -12555,6 +12555,66 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             },
                         }
                     }
+                    "intrun" => {
+                        // How many consecutive instructions share one
+                        // pending-interrupt check. See
+                        // `CODEGEN_INTERRUPT_RUN` for why this is the knob
+                        // that controls GPR store->load forwarding in emitted
+                        // code, and what raising it costs (interrupt-sampling
+                        // latency, bounded by this value).
+                        //
+                        // Honoured under `developer` too (that build exists
+                        // to debug and test things). Forced to 1 only under
+                        // jitv2_lockstep, which verifies the unmodified
+                        // per-instruction emission — see
+                        // `Codegen::interrupt_run`.
+                        // Report `opt_level` alongside the value, always:
+                        // this knob only removes an alias-analysis barrier,
+                        // and at `opt_level=none` Cranelift runs no
+                        // store-to-load forwarding for it to unblock, so
+                        // raising intrun legitimately changes almost nothing
+                        // in emitted code. That looks exactly like a broken
+                        // knob unless the opt level is visible next to it.
+                        // `developer` defaults to `none`
+                        // (CODEGEN_OPT_LEVEL_SPEED) but can run `speed` like
+                        // any other build — hence a note pointing at how,
+                        // not a claim that the combination is unavailable.
+                        let opt = if crate::jitv2::codegen::Codegen::opt_level_speed() { "speed" } else { "none" };
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 intrun: {} (max {}, opt_level={})",
+                                    crate::jitv2::codegen::Codegen::interrupt_run(),
+                                    crate::jitv2::codegen::MAX_INTERRUPT_RUN, opt).unwrap();
+                                if !crate::jitv2::codegen::Codegen::opt_level_speed() {
+                                    writeln!(writer, "  note: opt_level=none — Cranelift runs no store-to-load forwarding, so this knob has little effect on emitted code. Set IRIS_OPT_SPEED=1 at launch, or `j2 opt speed` then stop + `j2 flush` to rebuild.").unwrap();
+                                }
+                            }
+                            Some(n) => match n.parse::<u32>() {
+                                Ok(n) if n >= 1 => {
+                                    crate::jitv2::codegen::Codegen::set_interrupt_run(n);
+                                    writeln!(writer, "j2 intrun: {} (max {}, opt_level={})",
+                                        crate::jitv2::codegen::Codegen::interrupt_run(),
+                                        crate::jitv2::codegen::MAX_INTERRUPT_RUN, opt).unwrap();
+                                    if !crate::jitv2::codegen::Codegen::opt_level_speed() {
+                                        writeln!(writer, "  note: opt_level=none — Cranelift runs no store-to-load forwarding, so this knob has little effect on emitted code. Set IRIS_OPT_SPEED=1 at launch, or `j2 opt speed` then stop + `j2 flush` to rebuild.").unwrap();
+                                    }
+                                    if cfg!(feature = "jitv2_lockstep") {
+                                        writeln!(writer, "  (forced to 1: jitv2_lockstep verifies the unmodified per-instruction emission)").unwrap();
+                                    }
+                                    // Already-compiled regions baked the old
+                                    // policy into their emitted code. Not
+                                    // flushed here: `j2 flush` requires the
+                                    // CPU stopped (it would otherwise race a
+                                    // concurrently-executing compiled
+                                    // function), and this command does not.
+                                    // Same "takes effect on the next relevant
+                                    // event" contract as `j2 opt`.
+                                    writeln!(writer, "  applies to code compiled from now on; run `stop` then `j2 flush` to rebuild what already exists").unwrap();
+                                }
+                                _ => return Err(format!("Usage: j2 intrun [1..{}]", crate::jitv2::codegen::MAX_INTERRUPT_RUN)),
+                            },
+                        }
+                    }
                     "min-calls" => {
                         // Only applies to exec_decoded's real dispatch gate,
                         // on the async (non-inline) compile path — see
@@ -13575,11 +13635,29 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             let flushes = crate::jit_feedback::JIT_FEEDBACK.flush_events.load(Ordering::Relaxed);
                             writeln!(writer, "mega-flushes (arena/pool wipes, each recompiles everything): {}", flushes).unwrap();
                         }
-                        #[cfg(feature = "developer")]
+                        // `j2wp`, not `developer`: this block reports emitted
+                        // code size (arena bytes + the bytes/instruction
+                        // histogram), and `developer` distorts exactly that
+                        // number — it forces `opt_level=none` and emits a
+                        // 4-argument `call_indirect` per instruction
+                        // (`emit_dev_trace_bp`), measured live at ~380 code
+                        // bytes/guest instruction where the same pages compile
+                        // to ~92 without it. Gating the metric on the feature
+                        // that invalidates it meant it could never be read for
+                        // the build that ships. The underlying counters are two
+                        // u32 per pooled page (32 KiB at full capacity), so
+                        // keeping them always-on costs nothing.
+                        #[cfg(feature = "j2wp")]
                         {
                             let code_bytes = jit.code_bytes_used();
                             writeln!(writer, "arena bytes (host-page-rounded, ~{}KiB/fn floor): {} ({:.1} KiB) across published entries — best-effort proxy for actual Cranelift arena size, not the arena's own byte count (cranelift_jit::Memory exposes none)",
                                 crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE / 1024, code_bytes, code_bytes as f64 / 1024.0).unwrap();
+                        }
+                        // Everything below is genuinely developer-only
+                        // (rejection reasons, fallback counters, stats fields
+                        // that do not exist without the feature).
+                        #[cfg(feature = "developer")]
+                        {
                             let compiles = jit.stats.compiles.load(Ordering::Relaxed);
                             let failed = jit.stats.failed_compiles.load(Ordering::Relaxed);
                             let kills = jit.stats.kill_entry_calls.load(Ordering::Relaxed);
@@ -13652,6 +13730,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 }
                             }
 
+                        }
+                        // Size histogram: `j2wp`, not `developer` — same
+                        // reasoning as the arena-bytes block above.
+                        #[cfg(feature = "j2wp")]
+                        {
                             // Real distribution of published regions' instruction
                             // counts, scanned across every pooled page — ground
                             // truth against MAX_INSTRS_PER_COMPILE (comp.rs),

@@ -98,13 +98,24 @@ of 3 instructions.
 
 ## Ranking (by evidence, not intuition)
 
+> **Superseded for items 1-2 (2026-09-19).** Direct Cranelift probing showed
+> block structure is NOT a barrier — Cranelift forwards stores across a plain
+> block boundary joined by an unconditional jump exactly as it does within one
+> block. The duplicate loads counted below were separated by a boundary *and*
+> an interrupt preamble; only the preamble mattered. Item 2 is therefore the
+> whole of items 1+2, and item 1 should not be built. Implemented as
+> `j2 intrun`, which shrinks emitted code 6-10% — **and produced no measurable
+> benchmark difference** on a live boot. See
+> [[interrupt-check-frequency-gates-gpr-forwarding]].
+
 1. **Block fragmentation** — 6,745 provably-recoverable redundant loads,
    median block of 3 instructions. Merging straight-line runs into single
-   blocks is the real lever.
+   blocks is the real lever. *(Wrong — see the note above.)*
 2. **Hoisting the interrupt check to block granularity** — small by volume,
    but it is the *enabler* for (1): merging pass-1 blocks without hoisting the
    preamble buys little, since the preamble re-splits every instruction.
-   Must stay per-instruction under `jitv2_lockstep`.
+   Must stay per-instruction under `jitv2_lockstep`. *(This was the entire
+   effect; no block merging was needed or done.)*
 3. **`pc`/`in_delay_slot` traffic** — **done** (2026-09-02): the exception
    ABI now passes EPC/BD as arguments, so the per-slot bracket is
    lockstep/developer-only. Total emitted stores across this same 300-page

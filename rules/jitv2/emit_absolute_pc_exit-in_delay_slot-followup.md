@@ -84,3 +84,50 @@ deliberately — a correctness hazard on a non-debug path is not worth 2%.
 If that 2% ever needs reclaiming, the route is *not* a cfg gate: it is tracking at compile
 time whether a given region can be entered at a delay-slot word (the analyzer already knows
 which words are slots) and emitting the store only in regions where it can.
+
+---
+
+## Do NOT gate that store on word kind (attempted and reverted, 2026-09-20)
+
+The note above suggests reclaiming the 2% by "tracking at compile time whether
+a given region can be entered at a delay-slot word ... and emitting the store
+only in regions where it can". Two things went wrong when that was tried:
+
+1. **A region-level predicate is always true.** "Can this region be entered at
+   a delay-slot word" reduces to `is_entry_point || is_branch_fallback_successor`
+   over the region's entries, and every region has at least one entry point.
+   It gates nothing.
+
+2. **A per-word predicate is not safe.** The obvious refinement — emit the
+   store only for entry/fallback-successor words, since an interior word
+   "cannot carry a live foreign-slot flag" — breaks flow control. The JIT
+   *writes* `in_delay_slot` on exit paths (`emit_foreign_page_slot_exit` stores
+   1), so the flag's value at an exit is not a function of the word's arrival
+   kind alone. Removing the clear at interior words can let a set flag escape.
+   Reverted before measuring.
+
+**And it would not help forwarding anyway.** Exception/bail exits do not block
+store-to-load forwarding at all — see
+[[what-actually-blocks-gpr-forwarding]], shapes `exitbr`/`exitbr2`. This store
+costs code size and ~2% MIPS, nothing else. Anyone reclaiming it needs a real
+flow-sensitive analysis of what the flag holds at each exit, not an arrival-kind
+heuristic.
+
+## Deferred: skip the pc/bd reload on the `_live` exception exit
+
+`emit_exception_exit_live` loads `core.pc` and `core.in_delay_slot` purely to
+pass them as arguments to `handle_exception_at_fn(core, status, fault_pc, bd)`.
+The callee already has `core` and could read both fields itself — on this path
+they are exactly what the interpreter left there, unchanged, which is *why*
+this variant loads them instead of materializing compile-time constants.
+
+So the two loads are redundant with the callee's own reach. Removing them
+would need a second hook (`handle_exception_live_fn`) that takes only
+`(core, status)`, since the existing ABI is shared with
+`emit_exception_exit_const`, whose whole point is passing compile-time values
+that are *not* in memory.
+
+**Measured payoff: 20 sites, 40 loads, 4.4% of CLIF loads on one real region —
+all on cold exception paths.** Near-zero runtime effect. Recorded for
+completeness, not recommended: it adds a hook and an ABI variant to save code
+that does not execute.

@@ -25,7 +25,12 @@ pub use jitv2::{
 };
 pub use paged_memory::{PagedArenaMemoryProvider, PagedArenaState};
 #[cfg(feature = "developer")]
-pub use jitv2::{BatchFlushReason, CodeSizeBucket, RejectReason, REJECT_REASON_COUNT};
+pub use jitv2::{BatchFlushReason, RejectReason, REJECT_REASON_COUNT};
+/// Always exported under `j2wp`: the emitted-code-size histogram must be
+/// readable in a production build, because `developer` distorts the very
+/// number it reports (see `PhysicalCodePage::instr_count`'s field doc).
+#[cfg(feature = "j2wp")]
+pub use jitv2::CodeSizeBucket;
 
 /// The jitv2 dirty-page probe — see `rules/jitv2/dirty-cache-page-probe.md`.
 /// Absent under `tcache`, which closes that blind spot by construction.
@@ -64,7 +69,15 @@ mod zz_corpus {
         // defaults to `none` under `developer`. Production runs `speed`.
         let speed = std::env::var("IRIS_OPT_SPEED").is_ok();
         Codegen::set_opt_level_speed(speed);
-        println!("OPTLEVEL speed={}", speed);
+        // `j2 intrun`'s compile-time equivalent, so a sweep can measure what
+        // coalescing the pending-interrupt check does to emitted code size
+        // without booting anything. Default 1 = historical per-instruction
+        // behaviour, so an un-set run reproduces the old baseline exactly.
+        let intrun: u32 = std::env::var("IRIS_INTRUN").ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        Codegen::set_interrupt_run(intrun);
+        println!("OPTLEVEL speed={} intrun={}", speed, Codegen::interrupt_run());
         let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("IRIS_CORPUS_DIR {}: {}", dir, e))
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -451,6 +464,250 @@ mod zz_runs {
         }
         println!("  why runs end: region-exit={} branch-target={} entry/foreign-slot={} fallback={} non-contiguous={}",
             end_exit, end_branch_target, end_entry, end_fallback, end_page);
+    }
+}
+
+/// Does Cranelift forward GPR stores to later loads, and does the
+/// pending-interrupt preamble's seqcst `atomic_load` block that?
+///
+/// This is the question block merging hinges on. Merging straight-line runs
+/// into one Cranelift block only pays if, once they share a block, Cranelift's
+/// redundant-load-elimination actually promotes `core.gpr[n]` traffic to
+/// registers. `rules/jitv2/block-fragmentation-blocks-cse.md` measured that it
+/// does *within* a block (zero redundant same-address loads inside any machine
+/// block) — but every block there was one instruction, so that finding says
+/// nothing about whether the preamble sitting between two merged instructions
+/// defeats it.
+///
+/// Emits three shapes at `opt_level=speed` against a `core`-like struct
+/// pointer and counts the loads/stores each keeps:
+///
+/// - `plain`   — store gpr[a], load gpr[a], store gpr[b]: the ideal. Should
+///               forward, leaving one store (or two) and no reload.
+/// - `barrier` — the same, with a seqcst `atomic_load` of `hot.interrupts`
+///               in between, exactly as `emit_pending_interrupt_preamble`
+///               emits it per instruction.
+/// - `sidexit` — the same, with the preamble's `brif` to a cold block too,
+///               i.e. the real emitted shape.
+///
+/// Usage: `IRIS_RUN_CL_PROBE=1 cargo test --release --features jitv2 \
+///   zz_cl_forwarding -- --nocapture`
+#[cfg(test)]
+mod zz_forwarding {
+    use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData};
+    use cranelift_codegen::settings::{self, Configurable};
+    use cranelift_codegen::Context;
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    /// Byte offsets mirroring `MipsCore`'s real layout, per the field-traffic
+    /// table in `rules/jitv2/block-fragmentation-blocks-cse.md`.
+    const OFF_INTERRUPTS: i32 = 0x0;
+    const OFF_GPR_A: i32 = 0x68 + 8 * 4;
+    const OFF_GPR_B: i32 = 0x68 + 8 * 5;
+
+    #[test]
+    fn zz_cl_forwarding() {
+        if std::env::var("IRIS_RUN_CL_PROBE").is_err() { return; }
+
+        // "split*" = the two instructions in SEPARATE Cranelift blocks joined
+        // by an unconditional jump, i.e. exactly what codegen emits today.
+        // Cranelift merges a block with a single predecessor reached by an
+        // unconditional jump, so these answer whether the per-word block
+        // structure is itself a barrier or whether only the preamble is.
+        // "callout" = store gpr[a], then a call_indirect handed &gpr[a] as a
+        // destination pointer (exactly `emit_mem_read_callout`'s shape: the
+        // Rust side writes the loaded value THROUGH that pointer), then load
+        // gpr[a] back. The forwarded store must NOT survive that call, or the
+        // JIT would read a stale register value the callout just overwrote.
+        // This is a soundness check, not a perf one.
+        // "exitbr"  = store gpr[a], then a brif to a COLD block that stores
+        //             core.pc and returns (an exception/bail exit), continuing
+        //             on the hot path, then load gpr[a].
+        //             Question: does the mere presence of an exit branch force
+        //             Cranelift to materialize gpr[a] to memory eagerly, or is
+        //             the store sunk/forwarded on the path that continues?
+        // "exitbr2" = same, but the cold block also READS gpr[a] (as a real
+        //             exception path would, via the shared exception ABI).
+        // "manyret"  = N separate blocks each ending in its own `return_`,
+        //              as codegen emits today (23 return_ sites, 170 exits in
+        //              one real region).
+        // "onerettail"= the same N blocks, but each `jump`s to ONE shared
+        //              block that takes the status as a block param and does
+        //              the single `return_`.
+        // Question: does Cranelift then emit ONE epilogue, or does it
+        // re-duplicate it per predecessor during layout anyway?
+        for shape in ["plain", "barrier", "sidexit", "split_plain", "split_barrier",
+                      "callout", "exitbr", "exitbr2", "manyret", "onerettail"] {
+            let mut fb = settings::builder();
+            fb.set("opt_level", "speed").unwrap();
+            fb.set("is_pic", "false").unwrap();
+            let isa = cranelift_native::builder().unwrap()
+                .finish(settings::Flags::new(fb)).unwrap();
+
+            let mut ctx = Context::new();
+            ctx.func.signature.params.push(AbiParam::new(types::I64));
+            let mut bctx = FunctionBuilderContext::new();
+            {
+                let mut b = FunctionBuilder::new(&mut ctx.func, &mut bctx);
+                let blk = b.create_block();
+                b.append_block_params_for_function_params(blk);
+                b.switch_to_block(blk);
+                let core = b.block_params(blk)[0];
+                let mem = MemFlagsData::trusted();
+
+                // "instruction 1": write a computed value into gpr[a].
+                let v0 = b.ins().load(types::I64, mem, core, OFF_GPR_B);
+                let v1 = b.ins().iadd_imm_s(v0, 7);
+                b.ins().store(mem, v1, core, OFF_GPR_A);
+
+                // Split shapes: end instruction 1's block and start
+                // instruction 2's, joined by a plain unconditional jump —
+                // the `emit_target_edge` `None` arm.
+                let split = shape.starts_with("split");
+                if split {
+                    let next = b.create_block();
+                    b.ins().jump(next, &[]);
+                    b.seal_block(blk);
+                    b.switch_to_block(next);
+                    b.seal_block(next);
+                }
+
+                // The per-instruction preamble, as emitted today.
+                let cold = b.create_block();
+                let cont = b.create_block();
+                if shape == "barrier" || shape == "sidexit" || shape == "split_barrier" {
+                    let ip = b.ins().iadd_imm_s(core, OFF_INTERRUPTS as i64);
+                    let pending = b.ins().atomic_load(types::I64, mem, ip);
+                    if shape == "sidexit" {
+                        let zero = b.ins().iconst(types::I64, 0);
+                        let has = b.ins().icmp(
+                            cranelift_codegen::ir::condcodes::IntCC::NotEqual, pending, zero);
+                        b.ins().brif(has, cold, &[], cont, &[]);
+                        b.switch_to_block(cold);
+                        b.set_cold_block(cold);
+                        b.seal_block(cold);
+                        b.ins().return_(&[]);
+                        b.switch_to_block(cont);
+                        b.seal_block(cont);
+                    }
+                }
+
+                if shape == "exitbr" || shape == "exitbr2" {
+                    // Exception-style side exit: brif on a flag to a cold
+                    // block that returns; hot path continues.
+                    let flag = b.ins().load(types::I8, mem, core, 0x58);
+                    let cold2 = b.create_block();
+                    let hot2 = b.create_block();
+                    b.ins().brif(flag, cold2, &[], hot2, &[]);
+                    b.switch_to_block(cold2);
+                    b.set_cold_block(cold2);
+                    b.seal_block(cold2);
+                    if shape == "exitbr2" {
+                        // Cold arm reads gpr[a] — the real exception path does
+                        // read register state.
+                        let r = b.ins().load(types::I64, mem, core, OFF_GPR_A);
+                        b.ins().store(mem, r, core, 0x50);
+                    }
+                    b.ins().return_(&[]);
+                    b.switch_to_block(hot2);
+                    b.seal_block(hot2);
+                }
+
+                let mut shared_ret_blk: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Value)> = None;
+                if shape == "manyret" || shape == "onerettail" {
+                    // Force several callee-saved registers live so the
+                    // epilogue is non-trivial, like the real one (restores
+                    // r12-r15 + frame teardown).
+                    let mut acc = b.ins().load(types::I64, mem, core, 0x68);
+                    for k in 1..6i32 {
+                        let v = b.ins().load(types::I64, mem, core, 0x68 + k * 8);
+                        acc = b.ins().iadd(acc, v);
+                    }
+                    let shared_ret = b.create_block();
+                    if shape == "onerettail" {
+                        b.append_block_param(shared_ret, types::I64);
+                    }
+                    // 8 exit sites, each with its own payload store.
+                    for k in 0..8i32 {
+                        let cold = b.create_block();
+                        let hot = b.create_block();
+                        let f = b.ins().load(types::I8, mem, core, 0x58);
+                        b.ins().brif(f, cold, &[], hot, &[]);
+                        b.switch_to_block(cold);
+                        b.set_cold_block(cold);
+                        b.seal_block(cold);
+                        // payload: this exit's own word offset + status
+                        let w = b.ins().iconst(types::I64, 0x100 + k as i64);
+                        b.ins().store(mem, w, core, 0x50);
+                        if shape == "manyret" {
+                            b.ins().store(mem, acc, core, 0x90);
+                            b.ins().return_(&[]);
+                        } else {
+                            b.ins().jump(shared_ret, &[cranelift_codegen::ir::BlockArg::Value(acc)]);
+                        }
+                        b.switch_to_block(hot);
+                        b.seal_block(hot);
+                    }
+                    // Emit the shared tail LAST (after the function's own
+                    // fallthrough return below) so it is reachable only from
+                    // the 8 cold jumps. Recorded here and finished after the
+                    // main body.
+                    if shape == "onerettail" {
+                        shared_ret_blk = Some((shared_ret, acc));
+                    }
+                }
+
+                if shape == "callout" {
+                    // A call that is handed &core.gpr[a] and writes through
+                    // it, as every memory read does since "reads write
+                    // directly to gpr where possible".
+                    let ptr_ty = types::I64;
+                    let mut sig = cranelift_codegen::ir::Signature::new(
+                        cranelift_codegen::isa::CallConv::SystemV);
+                    sig.params.push(AbiParam::new(ptr_ty));  // core
+                    sig.params.push(AbiParam::new(types::I64)); // vaddr
+                    sig.params.push(AbiParam::new(ptr_ty));  // dst = &gpr[a]
+                    sig.returns.push(AbiParam::new(types::I32));
+                    let sig_ref = b.import_signature(sig);
+                    let callee = b.ins().load(types::I64, mem, core, 0x20);
+                    let dst = b.ins().iadd_imm_s(core, OFF_GPR_A as i64);
+                    let va = b.ins().iconst(types::I64, 0x1234);
+                    b.ins().call_indirect(sig_ref, callee, &[core, va, dst]);
+                }
+
+                // "instruction 2": read gpr[a] straight back. THIS is the load
+                // that should disappear.
+                let r = b.ins().load(types::I64, mem, core, OFF_GPR_A);
+                let r2 = b.ins().iadd_imm_s(r, 1);
+                b.ins().store(mem, r2, core, OFF_GPR_B);
+                b.ins().return_(&[]);
+                // The one shared epilogue, reached by every cold exit's jump.
+                if let Some((sr, _)) = shared_ret_blk {
+                    b.switch_to_block(sr);
+                    b.seal_block(sr);
+                    let v = b.block_params(sr)[0];
+                    b.ins().store(mem, v, core, 0x90);
+                    b.ins().return_(&[]);
+                }
+                if !split { b.seal_block(blk); }
+                b.finalize(isa.frontend_config());
+            }
+
+            // Cranelift only fills `CompiledCode::vcode` when asked.
+            ctx.set_disasm(true);
+            ctx.compile(&*isa, &mut Default::default()).unwrap();
+            let vcode = ctx.compiled_code().unwrap().vcode.as_ref().unwrap().clone();
+            // Count real memory traffic in the emitted assembly. Crude but
+            // decisive: the question is only "did the reload survive".
+            let loads = vcode.lines().filter(|l| l.contains("movq") && l.contains("(%r")).count();
+            println!("--- shape={} ---", shape);
+            for line in vcode.lines() {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with("block") || t.starts_with(";;") { continue; }
+                println!("    {}", t);
+            }
+            println!("  (memory-operand movq count: {})", loads);
+        }
     }
 }
 

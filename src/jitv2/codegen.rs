@@ -359,6 +359,68 @@ pub struct BlockSkeleton {
 /// generated code `speed` produces.
 static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
 
+/// How many consecutive head instructions may share ONE pending-interrupt
+/// check (`emit_pending_interrupt_preamble`) instead of each paying its own.
+/// `1` (the default) is the historical behaviour: every instruction checks.
+///
+/// # Why this exists
+///
+/// The preamble's `atomic_load` is **seqcst** — deliberately, so
+/// `opt_level=speed` can't hoist a stale snapshot (see its own doc comment) —
+/// and that makes it a full barrier for Cranelift's alias analysis. Emitting
+/// one per instruction therefore stops every GPR store from being forwarded
+/// to the next instruction's load of the same register, which is the single
+/// biggest source of redundant memory traffic in emitted code.
+///
+/// Measured directly (`zz_forwarding::zz_cl_forwarding`, a three-shape
+/// Cranelift probe): two instructions with a store→load of the same GPR emit
+///
+/// ```text
+///   no preamble between them:   movq 0x90(%rdi), %rsi
+///                               leaq 7(%rsi), %r8
+///                               movq %r8, 0x88(%rdi)
+///                               leaq 8(%rsi), %rsi      <- forwarded, no reload
+///   preamble between them:      ...
+///                               movq %rsi, 0x88(%rdi)
+///                               movq (%rdi), %r8        <- the atomic_load
+///                               addq 0x88(%rdi), %rsi   <- RELOADED
+/// ```
+///
+/// On one real corpus region (pfn 0x8004, entry 0x258): 46 redundant
+/// store→load pairs survive today; 190 would be forwardable without the
+/// barrier, across 218 interrupt loads.
+///
+/// **Block structure is NOT the barrier.** The same probe shows Cranelift
+/// forwards across a plain block boundary joined by an unconditional jump
+/// (`split_plain`) exactly as it does within one block — so merging the
+/// per-word blocks buys nothing on its own, and isn't done. Only the
+/// preamble's frequency matters. This corrects the ranking in
+/// `rules/jitv2/block-fragmentation-blocks-cse.md`, which inferred
+/// "fragmentation" from block-boundary-separated duplicate loads without
+/// testing whether a boundary alone blocks forwarding.
+///
+/// # What raising it costs
+///
+/// Interrupt-sampling *latency*, and nothing else: a pending interrupt is
+/// observed up to `N-1` guest instructions later than it would have been.
+/// That is a timing property, not a semantic one — the same kind of deferral
+/// `skip_entry_preamble` already makes (an external entry defers its check by
+/// one head), and the emulator is explicitly not cycle-accurate. Instructions
+/// inside a run still execute in order with correct architectural effects; a
+/// bail from the run's head leaves `core.pc` at that head, so re-entry is
+/// unchanged.
+///
+/// Bounded deliberately rather than "once per region": a region can be
+/// hundreds of instructions, and interrupt latency should not scale with
+/// however long a straight-line run happens to be. `j2 intrun <n>` sets it.
+static CODEGEN_INTERRUPT_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Hard ceiling on [`CODEGEN_INTERRUPT_RUN`]. 32 guest instructions is
+/// already well past the point of diminishing returns (runs of 32+ are 0.2%
+/// of the corpus; the mean run is 4.33), and it keeps worst-case interrupt
+/// latency obviously bounded.
+pub const MAX_INTERRUPT_RUN: u32 = 32;
+
 impl Codegen {
     /// Set the `opt_level` used by future `Codegen::new()`/`reset()` calls.
     /// `speed` trades slower compiles for faster generated code (real
@@ -374,6 +436,58 @@ impl Codegen {
 
     pub fn opt_level_speed() -> bool {
         CODEGEN_OPT_LEVEL_SPEED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set how many consecutive instructions may share one pending-interrupt
+    /// check (see [`CODEGEN_INTERRUPT_RUN`]). Clamped to
+    /// `1..=MAX_INTERRUPT_RUN`; `1` restores per-instruction checking. The
+    /// caller must flush already-compiled regions (`Jitv2::mega_flush`) for
+    /// the change to affect code that already exists. Honoured in every
+    /// build — see [`Self::interrupt_run`].
+    pub fn set_interrupt_run(n: u32) {
+        CODEGEN_INTERRUPT_RUN.store(n.clamp(1, MAX_INTERRUPT_RUN), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current interrupt-check run length.
+    ///
+    /// Forced to `1` under `jitv2_lockstep` **only**. Lockstep's whole job is
+    /// to emit and verify the same per-instruction shape the JIT would
+    /// otherwise produce; it keeps every preamble exactly as before so that
+    /// what it verifies is the unmodified emission, not a coalesced variant.
+    ///
+    /// **`developer` is NOT pinned**, though an earlier version of this
+    /// function pinned it too. That was wrong and self-defeating: `developer`
+    /// is the build you use to debug and test things, so compiling the
+    /// feature out there meant a `developer` boot with `j2 intrun 2` reported
+    /// `1` and silently exercised nothing. Nothing in that build needs the
+    /// pin — `emit_dev_trace_bp` (the `dt` traceback and PC-breakpoint hook)
+    /// is emitted from its own `#[cfg(feature = "developer")]` block
+    /// *outside* the preamble skip, so it still runs once per instruction at
+    /// any `intrun`, and tracing and breakpoints are unaffected.
+    ///
+    /// (Note `developer` separately forces `opt_level=none` via
+    /// `CODEGEN_OPT_LEVEL_SPEED`, so the GPR forwarding this knob unlocks
+    /// won't show up in emitted code there without `IRIS_OPT_SPEED=1`. The
+    /// deferral itself is still exercised, which is what a correctness boot
+    /// is for.) See
+    /// `rules/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`.
+    pub fn interrupt_run() -> u32 {
+        if cfg!(feature = "jitv2_lockstep") {
+            return 1;
+        }
+        // `IRIS_INTRUN` seeds the initial value, once, so that every compile
+        // path picks it up — not just the ones that call `set_interrupt_run`
+        // explicitly. Without this, running a test suite with the env var set
+        // silently measured/verified the default instead (the equivalence
+        // tests build their own `Codegen` directly and never touch the
+        // setter). An explicit `j2 intrun` still overrides it afterwards.
+        static SEED: std::sync::Once = std::sync::Once::new();
+        SEED.call_once(|| {
+            if let Some(n) = std::env::var("IRIS_INTRUN").ok().and_then(|v| v.parse::<u32>().ok()) {
+                CODEGEN_INTERRUPT_RUN.store(n.clamp(1, MAX_INTERRUPT_RUN), std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        CODEGEN_INTERRUPT_RUN.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Host mmap page granularity `ArenaMemoryProvider` rounds every
@@ -1500,6 +1614,76 @@ impl Codegen {
         let block_for_word: std::collections::HashMap<WordOffset, Block> =
             instr_blocks.iter().copied().collect();
 
+        // Which words may SKIP their own pending-interrupt preamble because a
+        // recent predecessor already checked on their behalf
+        // (`CODEGEN_INTERRUPT_RUN`; see its doc comment for why the preamble's
+        // seqcst load is what actually blocks GPR forwarding).
+        //
+        // A word may be covered only if every path that can reach it has just
+        // run the check. That means all of:
+        //
+        //  - it is `word_prev + 1` in this same region (a plain fallthrough,
+        //    with any inlined delay slot in between — see the `gap` walk),
+        //  - **nothing else can jump to it**: `is_branch_target`,
+        //    `is_entry_point` and `is_branch_fallback_successor` each mean an
+        //    arrival that did NOT come through the predecessor's check, so
+        //    such a word always heads a new run,
+        //  - the predecessor's own edges stay inside the region: any
+        //    `taken_exit`/`fallthrough_exit` means control can leave between
+        //    the two, so the check it ran doesn't cover this word,
+        //  - it is not `is_fallback` (runs in the interpreter, which does its
+        //    own step preamble),
+        //  - the run has not hit its length cap.
+        //
+        // Same predicate `try_emit_fused_lui` uses to decide two adjacent
+        // words may be treated as one unit, for the same reasons — see its
+        // doc comment, which spells out each arrival kind.
+        //
+        // Note this deliberately does NOT merge Cranelift blocks. Every word
+        // keeps its own block exactly as before: measurement
+        // (`zz_forwarding::zz_cl_forwarding`, shape `split_plain`) shows
+        // Cranelift already forwards stores across a plain block boundary
+        // joined by an unconditional jump, so merging blocks buys nothing and
+        // would complicate every bail's word bookkeeping for no gain.
+        let interrupt_run = Self::interrupt_run();
+        let mut skip_interrupt_preamble: std::collections::HashSet<WordOffset> =
+            std::collections::HashSet::new();
+        if interrupt_run > 1 {
+            let mut run_len: u32 = 0;
+            let mut prev: Option<WordOffset> = None;
+            for &(word, _) in &instr_blocks {
+                let ins = &instrs[word as usize];
+                // Every word strictly between the previous head and this one
+                // must be that head's inlined delay slot, not a gap: a slot
+                // occupies word+1 but has no block of its own, so the next
+                // head after a branch sits at word+2.
+                let contiguous = prev.map_or(false, |p| {
+                    word > p && (p + 1..word).all(|g| {
+                        let gi = &instrs[g as usize];
+                        gi.visited && gi.is_slot_only
+                    })
+                });
+                let joinable = !ins.is_branch_target
+                    && !ins.is_entry_point
+                    && !ins.is_branch_fallback_successor
+                    && !ins.is_fallback;
+                if contiguous && joinable && run_len > 0 && run_len < interrupt_run {
+                    skip_interrupt_preamble.insert(word);
+                    run_len += 1;
+                } else {
+                    run_len = 1;
+                }
+                // This word's own edges leaving the region end the run: the
+                // next word can be reached without passing through here.
+                if ins.taken_exit.is_some() || ins.fallthrough_exit.is_some() {
+                    run_len = 0;
+                    prev = None;
+                    continue;
+                }
+                prev = Some(word);
+            }
+        }
+
         // Pass 2: emit every head instruction's body and outgoing edges.
         // Nothing is sealed here — a block's predecessor set (especially a
         // backward branch target's) isn't complete until this whole pass
@@ -1589,7 +1773,13 @@ impl Codegen {
             // like every device line, so the pending-interrupt check *is*
             // the timer check — there's no per-instruction cp0_count advance
             // to mirror anymore (Count is virtual, materialized on read).
-            emit_pending_interrupt_preamble(&mut ctx, exit_block, word);
+            // Skipped when a recent predecessor's check already covers this
+            // word (see `skip_interrupt_preamble` above). Under
+            // `jitv2_lockstep` `interrupt_run()` returns 1, so the set is
+            // empty and this is unconditional, exactly as before.
+            if !skip_interrupt_preamble.contains(&word) {
+                emit_pending_interrupt_preamble(&mut ctx, exit_block, word);
+            }
             // Developer per-instruction hook (dt traceback + PC breakpoints),
             // right after the interrupt check — the same per-instruction point
             // the interpreter's step() does its trace/breakpoint work, so a
@@ -1983,6 +2173,16 @@ impl Codegen {
         // guest's execution path entirely (this is the compile worker).
         let want_disasm = jit_disasm_enabled();
         if want_disasm { self.ctx.set_disasm(true); }
+        // `IRIS_JIT_CLIF=1` dumps the CLIF IR just before Cranelift lowers it.
+        // Distinct from `IRIS_JIT_DISASM`, which shows the *result*: to see why
+        // a load survived (or didn't), you need the input the optimizer saw —
+        // which stores/loads it could prove alias-free, where the barriers sit,
+        // and what the block structure actually is. Printed pre-`define_function`
+        // because that call consumes/clears the context.
+        if std::env::var_os("IRIS_JIT_CLIF").is_some() {
+            println!("===CLIF===");
+            println!("{}", self.ctx.func.display());
+        }
         if let Err(e) = self.module.define_function(func_id, &mut self.ctx) {
             let is_oom = matches!(e, cranelift_module::ModuleError::Allocation { .. });
             self.last_compile_ran_out_of_memory = is_oom;
@@ -5475,7 +5675,29 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
 
 /// Load `core.gpr[reg]` as I64. Matches `MipsCore::read_gpr` (a plain,
 /// non-atomic load — GPRs are only ever touched by the owning exec thread).
+///
+/// `reg == 0` is materialized as the constant 0, never loaded: `$zero` reads
+/// as 0 architecturally and `emit_write_gpr` already refuses to store to it,
+/// so the memory never holds anything else. This is the mirror of that
+/// function's own `reg == 0` early return, and it was missing here — the
+/// write side skipped the store while the read side still emitted a real
+/// load, for every `addu rd, rs, $zero` (the standard MIPS register move),
+/// every `beq rs, $zero`, every `sll rd, rt, 0`.
+///
+/// Cranelift cannot fix this itself: `MemFlagsData::trusted()` is
+/// `notrap + aligned` with **no alias region**, so it cannot prove the
+/// location is invariant across a callout and must reload it every time.
+/// Measured on one real corpus region (pfn 0x8004 entry 0x258), `gpr[0]`
+/// (offset 0x68) was the single hottest address in the whole region: **79
+/// loads, 0 stores** — 33% of all GPR-range loads, all of them reading a
+/// constant. See
+/// `rules/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`, where
+/// these showed up as "loads with nothing to forward from" before the cause
+/// was understood.
 fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
+    if reg == 0 {
+        return ctx.builder.ins().iconst(ir::types::I64, 0);
+    }
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)

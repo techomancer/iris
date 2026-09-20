@@ -4191,14 +4191,30 @@ pub struct PhysicalCodePage {
     /// unlocked and in parallel, including two compiles of the same page;
     /// only the cheap publish tail is serialized here.
     publish_lock: Mutex<()>,
-    /// Dev-only diagnostics for `j2 pcp`/`j2 status` (§13.1 — page-granular
-    /// now that there's one function; the old per-entry `instr_count`/
-    /// `code_size`/`call_count`/`block_include_count` don't have a
-    /// meaningful per-offset home anymore since overlap between entries is
-    /// structurally impossible under this design).
-    #[cfg(feature = "developer")]
+    /// Page-granular compile diagnostics for `j2 pcp`/`j2 status` (§13.1 —
+    /// page-granular now that there's one function; the old per-entry
+    /// `instr_count`/`code_size`/`call_count`/`block_include_count` don't
+    /// have a meaningful per-offset home anymore since overlap between
+    /// entries is structurally impossible under this design).
+    ///
+    /// **`instr_count`/`code_size` are NOT `developer`-gated**, unlike the
+    /// counters below. They are the emitted-code-size metric
+    /// (`code_size_by_instr_count`, `j2 status`' bytes/instruction), and
+    /// gating them made that metric available *only* in the build that
+    /// invalidates it: `developer` forces `opt_level=none` **and** emits
+    /// `emit_dev_trace_bp` — a 4-argument `call_indirect` per instruction,
+    /// which is both large and an opaque clobber that kills the GPR
+    /// forwarding the metric is usually being read to evaluate. Measured
+    /// live, that build reports ~380 code bytes per guest instruction where
+    /// the same pages compile to ~92 without `developer`: a 4x error, and
+    /// the whole point of the number is to compare codegen changes.
+    ///
+    /// Cost of keeping them always-on: 8 bytes per pooled page (two u32),
+    /// i.e. 32 KiB at the default 4096-page capacity, written once per
+    /// successful `publish`. Nothing reads them on any hot path. See
+    /// `rules/jitv2/block-fragmentation-blocks-cse.md`'s "measure without
+    /// `developer`" rule, which this makes possible to actually follow.
     pub instr_count: std::sync::atomic::AtomicU32,
-    #[cfg(feature = "developer")]
     pub code_size: std::sync::atomic::AtomicU32,
     #[cfg(feature = "developer")]
     pub call_count: AtomicU64,
@@ -4560,9 +4576,7 @@ impl PhysicalCodePage {
             redundant_rejected: std::sync::atomic::AtomicU32::new(0),
             killed_since_snapshot: std::sync::atomic::AtomicBool::new(false),
             compile_snapshot: UnsafeCell::new(CompileSnapshot::new()),
-            #[cfg(feature = "developer")]
             instr_count: std::sync::atomic::AtomicU32::new(0),
-            #[cfg(feature = "developer")]
             code_size: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "developer")]
             call_count: AtomicU64::new(0),
@@ -4610,10 +4624,10 @@ impl PhysicalCodePage {
         // previous tenant's counts into it would misattribute them.
         self.redundant_skipped.store(0, Ordering::Relaxed);
         self.redundant_rejected.store(0, Ordering::Relaxed);
+        self.instr_count.store(0, Ordering::Relaxed);
+        self.code_size.store(0, Ordering::Relaxed);
         #[cfg(feature = "developer")]
         {
-            self.instr_count.store(0, Ordering::Relaxed);
-            self.code_size.store(0, Ordering::Relaxed);
             self.call_count.store(0, Ordering::Relaxed);
             self.compile_count.store(0, Ordering::Relaxed);
         }
@@ -4785,10 +4799,10 @@ impl PhysicalCodePage {
         // describe a state that no longer exists.
         self.redundant_skipped.store(0, Ordering::Relaxed);
         self.redundant_rejected.store(0, Ordering::Relaxed);
+        self.instr_count.store(0, Ordering::Relaxed);
+        self.code_size.store(0, Ordering::Relaxed);
         #[cfg(feature = "developer")]
         {
-            self.instr_count.store(0, Ordering::Relaxed);
-            self.code_size.store(0, Ordering::Relaxed);
             // `call_count`/`compile_count` deliberately NOT reset — both are
             // pure history counters (`j2 html`'s "how hot/how much churn was
             // this page" stats), not correctness state; a preserved page
@@ -5275,8 +5289,8 @@ impl PhysicalCodePage {
         new_entries: &[u64; BITMAP_WORDS],
         func: *const (),
         snap_gen: u64,
-        #[allow(unused_variables)] instr_count: usize,
-        #[allow(unused_variables)] code_size: u32,
+        instr_count: usize,
+        code_size: u32,
     ) -> bool {
         let _guard = self.publish_lock.lock();
 
@@ -5304,10 +5318,10 @@ impl PhysicalCodePage {
         // these same three fields.
         self.func.store(func as *mut (), Ordering::Release);
         self.compiles_since_flush.fetch_add(1, Ordering::Relaxed);
+        self.instr_count.store(instr_count as u32, Ordering::Relaxed);
+        self.code_size.store(code_size, Ordering::Relaxed);
         #[cfg(feature = "developer")]
         {
-            self.instr_count.store(instr_count as u32, Ordering::Relaxed);
-            self.code_size.store(code_size, Ordering::Relaxed);
             self.compile_count.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -5778,7 +5792,10 @@ pub struct Jitv2 {
 /// per-function code size Cranelift actually emitted) `code_size` bytes
 /// across them, as count/sum/min/max — enough to report both an average and
 /// a spread without keeping every individual size around.
-#[cfg(feature = "developer")]
+/// Not `developer`-gated under `j2wp`: `code_size_by_instr_count` is the
+/// emitted-code-size metric and has to be readable in a production-shaped
+/// build — see `PhysicalCodePage::instr_count`'s field doc for why measuring
+/// it under `developer` gives a ~4x wrong answer.
 #[derive(Debug, Clone, Copy)]
 pub struct CodeSizeBucket {
     pub count: u32,
@@ -6020,7 +6037,6 @@ impl Jitv2 {
     /// raw `code_size` alone would under-report real arena consumption.
     /// §13: page-granular now (one function per page), not per-offset — see
     /// `PhysicalCodePage::code_size`'s own field doc.
-    #[cfg(feature = "developer")]
     pub fn code_bytes_used(&self) -> u64 {
         let page_size = crate::jitv2::codegen::Codegen::HOST_PAGE_SIZE;
         self.pages.iter()
@@ -6041,7 +6057,6 @@ impl Jitv2 {
     /// `PhysicalCodePage::instr_count`'s own field doc for why per-offset
     /// overlap accounting no longer applies (overlap between entries is
     /// structurally impossible under the one-function-per-page design).
-    #[cfg(feature = "developer")]
     pub fn code_size_by_instr_count(&self) -> Vec<Option<CodeSizeBucket>> {
         let mut hist: Vec<Option<CodeSizeBucket>> = Vec::new();
         for page in self.pages.iter() {

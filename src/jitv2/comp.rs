@@ -234,10 +234,14 @@ pub fn handle_request(
     let func = codegen.compile_region(&mut instrs_owned, req.offset, req.compiled_for_fr1, true);
     match func {
         Some(jit_fn) => {
-            #[cfg(feature = "developer")]
+            // Not `developer`-gated: `last_code_size()` is unconditional, and
+            // the emitted-code-size stats it feeds (`j2 status`'
+            // bytes/instruction) have to be readable in a production build —
+            // `developer` distorts that number ~4x by forcing
+            // `opt_level=none` and emitting a per-instruction trace callout.
+            // Hardcoding 0 here made the histogram print empty in exactly the
+            // build worth measuring.
             let code_size = codegen.last_code_size();
-            #[cfg(not(feature = "developer"))]
-            let code_size = 0;
             // Re-probe the cache before committing, exactly as `publish` re-checks
             // `gen_snap`: the pre-read probe above is only accurate for the instant
             // it ran, and the compile since then took real time. A store landing in
@@ -448,10 +452,14 @@ pub fn handle_request_deferred(
     let func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, has_fpu, req.page);
     match func_id {
         Some(func_id) => {
-            #[cfg(feature = "developer")]
+            // Not `developer`-gated: `last_code_size()` is unconditional, and
+            // the emitted-code-size stats it feeds (`j2 status`'
+            // bytes/instruction) have to be readable in a production build —
+            // `developer` distorts that number ~4x by forcing
+            // `opt_level=none` and emitting a per-instruction trace callout.
+            // Hardcoding 0 here made the histogram print empty in exactly the
+            // build worth measuring.
             let code_size = codegen.last_code_size();
-            #[cfg(not(feature = "developer"))]
-            let code_size = 0;
             // Finalize immediately, every compile — see this function's own
             // doc comment for why deferring finalize itself (rather than
             // just the seal) was the actual bug. finalize_batch_nonforced
@@ -1382,10 +1390,14 @@ pub fn handle_request(
         Some(func_id) => {
             let jit_fn = codegen.finalize_batch(&[func_id]).into_iter().next()
                 .expect("finalize_batch of exactly one FuncId must return exactly one JitFn");
-            #[cfg(feature = "developer")]
+            // Not `developer`-gated: `last_code_size()` is unconditional, and
+            // the emitted-code-size stats it feeds (`j2 status`'
+            // bytes/instruction) have to be readable in a production build —
+            // `developer` distorts that number ~4x by forcing
+            // `opt_level=none` and emitting a per-instruction trace callout.
+            // Hardcoding 0 here made the histogram print empty in exactly the
+            // build worth measuring.
             let code_size = codegen.last_code_size();
-            #[cfg(not(feature = "developer"))]
-            let code_size = 0;
             let mut new_entries = [0u64; crate::jitv2::BITMAP_WORDS];
             for &offset in analyzer.covered() {
                 new_entries[offset as usize >> 6] |= 1u64 << (offset % 64);
@@ -1563,10 +1575,14 @@ pub fn handle_request_deferred(
     let func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
     match func_id {
         Some(func_id) => {
-            #[cfg(feature = "developer")]
+            // Not `developer`-gated: `last_code_size()` is unconditional, and
+            // the emitted-code-size stats it feeds (`j2 status`'
+            // bytes/instruction) have to be readable in a production build —
+            // `developer` distorts that number ~4x by forcing
+            // `opt_level=none` and emitting a per-instruction trace callout.
+            // Hardcoding 0 here made the histogram print empty in exactly the
+            // build worth measuring.
             let code_size = codegen.last_code_size();
-            #[cfg(not(feature = "developer"))]
-            let code_size = 0;
             // Stage the churn-avoidance record here rather than at publish
             // time: the matching publish goes through the seal queue and may
             // be performed later, by another worker's `finalize` call, with

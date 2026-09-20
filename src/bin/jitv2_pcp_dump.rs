@@ -214,6 +214,21 @@ fn fmt_offsets(offsets: &[u16]) -> String {
 
 fn run_compile_attempt(analyzer: &mut Analyzer, fr1: bool) {
     use iris::jitv2::codegen::Codegen;
+    // Match what the emulator would emit, not this binary's bare defaults.
+    // Both are process-wide statics read at `Codegen::new()`/compile time, so
+    // they must be set before the `Codegen` is built. Without this the tool
+    // silently disassembles `opt_level=none`, `intrun=1` code whatever the
+    // caller asked for — which made an `IRIS_INTRUN` comparison print two
+    // byte-identical listings.
+    if std::env::var_os("IRIS_OPT_SPEED").is_some() {
+        Codegen::set_opt_level_speed(true);
+    }
+    if let Some(n) = std::env::var("IRIS_INTRUN").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Codegen::set_interrupt_run(n);
+    }
+    println!("(codegen: opt_level={} intrun={})",
+        if Codegen::opt_level_speed() { "speed" } else { "none" },
+        Codegen::interrupt_run());
     let mut codegen = Codegen::new();
     // `analyzer`'s scratch buffer already holds the merged walk from
     // `main`'s own `walk_multi_entry` call — codegen needs an owned,
