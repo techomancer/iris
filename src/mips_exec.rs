@@ -1252,6 +1252,15 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// `jitv2_compile_queue`/`jitv2_stats` below.
     #[cfg(feature = "jitv2")]
     pub jitv2: std::sync::Arc<Mutex<crate::jitv2::Jitv2>>,
+    /// Lock-free `pfn -> PageSlot` lookup: a raw pointer to the `PfnMap`
+    /// array inside `jitv2`, captured once by `jitv2_bind_fast_lookup`.
+    #[cfg(feature = "jitv2")]
+    jitv2_pfn_map: *const u32,
+    /// Companion to `jitv2_pfn_map`: the pool's `pages` array base, so a
+    /// lookup hit can produce the `*mut PhysicalCodePage` the caller wants
+    /// without going back through `Jitv2`.
+    #[cfg(feature = "jitv2")]
+    jitv2_pages_base: *mut crate::jitv2::PhysicalCodePage,
     /// Cheap handle to `jitv2.lock().compile_queue`'s underlying push queue,
     /// cloned once at construction (`CompileQueue::queue_handle`) — lets the
     /// per-dispatch compile-request send (`exec_decoded`'s JIT gate) skip
@@ -2713,6 +2722,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2: std::sync::Arc::new(Mutex::new(jitv2)),
             #[cfg(feature = "jitv2")]
+            jitv2_pfn_map: std::ptr::null(),
+            #[cfg(feature = "jitv2")]
+            jitv2_pages_base: std::ptr::null_mut(),
+            #[cfg(feature = "jitv2")]
             jitv2_compile_queue_handle,
             #[cfg(feature = "jitv2")]
             jitv2_stats,
@@ -2776,7 +2789,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     pub fn rebind_atomic_ptrs(&mut self) {
         #[cfg(feature = "idle-pause")]
         { self.idle_profile_on_ptr = Arc::as_ptr(&self.idle_profile_on); }
-
+        #[cfg(feature = "jitv2")]
+        self.jitv2_bind_fast_lookup();
     }
 
     /// ppmem: pointer to this executor's inline `ppmem_bitmap` word, for
@@ -3316,6 +3330,30 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.set_pcp(std::ptr::null_mut());
     }
 
+    /// Capture the page pool's array base pointers for the lock-free
+    /// `page_for` fast path (`jitv2_pfn_map`/`jitv2_pages_base`).
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_bind_fast_lookup(&mut self) {
+        let (map, pages) = self.jitv2.lock().fast_lookup_ptrs();
+        self.jitv2_pfn_map = map;
+        self.jitv2_pages_base = pages;
+    }
+
+    /// Lock-free `pfn -> *mut PhysicalCodePage`, or `None` on a miss (which
+    /// the caller must then resolve under the lock, since claiming mutates
+    /// the free list).
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn jitv2_lookup_page_fast(&self, pfn: u32) -> Option<*mut crate::jitv2::PhysicalCodePage> {
+        if self.jitv2_pfn_map.is_null() {
+            return None;
+        }
+        let slot = unsafe { *self.jitv2_pfn_map.add(pfn as usize) };
+        if slot == crate::jitv2::jitv2::PFN_MAP_EMPTY {
+            return None;
+        }
+        Some(unsafe { self.jitv2_pages_base.add(slot as usize) })
+    }
 
     /// JIT v2: re-derive `self.pcp` if the fetch just landed on a different physical
     /// page than the one currently tracked (rules/jitv2/jit-v2-design.md §2.1 — PCPs
@@ -3364,6 +3402,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if phys_addr & (crate::jitv2::PAGE_SIZE - 1) == 0 {
             self.core.jit_trigger = true;
         }
+
+        // Lock-free hit path: an already-claimed page needs nothing but the
+        // `pfn -> slot -> page` indirection, which is two loads from arrays that
+        // never move; this skips `jitv2.lock()`.
+        if let Some(page) = self.jitv2_lookup_page_fast(pfn) {
+            self.pcp = page;
+            self.core.cur_code_pfn = pfn;
+            debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
+                "jitv2_track_pcp fast path: pfn_map[{:#x}] pointed at a slot whose own pfn is {:#x}",
+                pfn, unsafe { (*self.pcp).pfn });
+            return;
+        }
+
         let page_base = pfn * crate::jitv2::PAGE_SIZE;
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
@@ -11014,7 +11065,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 flushkeep [N] (MRU pages keeping their entry-point bitmaps across a flush; 0 = relearn all) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -12074,7 +12125,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 // one of them (`intrun`/`flushkeep`/`corpus`/`dumppcp` were
                 // all missing here after being added only to the help table).
                 if actual_args.is_empty() {
-                    return Err("Usage: j2 <analyze <addr>|pcp [addr]|dumppcp [addr] [path]|corpus [dir]|status|inline|dispatch|fallback|inline_mem|pagewb|instrs|threads|opt [none|speed]|intrun [N]|flushkeep [N]|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string());
+                    return Err("Usage: j2 <analyze <addr>|pcp [addr]|dumppcp [addr] [path]|corpus [dir]|status|inline|dispatch|fallback|inline_mem|pagewb|instrs|threads|opt [none|speed]|intrun [N]|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string());
                 }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
@@ -12422,38 +12473,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             },
                         }
                     }
-                    "flushkeep" => {
-                        // How many MRU pages survive a mega_flush with their
-                        // `requested`/`denied` bitmaps intact. Default 0 =
-                        // free everything and relearn entry points from
-                        // scratch.
-                        //
-                        // The old behaviour (1024, the whole pool) folds each
-                        // survivor's `compiled` bits back into `requested`, so
-                        // a physical page later reused by a *different*
-                        // program inherits the previous occupant's entry
-                        // points. That inflates both the compiled function and
-                        // the per-entry dispatch ladder — see
-                        // `JITV2_FLUSH_PRESERVED`'s doc comment for the
-                        // measured entry-point counts.
-                        match actual_args.get(1).copied() {
-                            None => {
-                                writeln!(writer, "j2 flushkeep: {} (max {})",
-                                    crate::jitv2::jitv2::flush_preserved(),
-                                    crate::jitv2::jitv2::JITV2_FLUSH_PRESERVED_MAX).unwrap();
-                            }
-                            Some(n) => match n.parse::<usize>() {
-                                Ok(n) => {
-                                    crate::jitv2::jitv2::set_flush_preserved(n);
-                                    writeln!(writer, "j2 flushkeep: {} (max {}); takes effect at the next flush",
-                                        crate::jitv2::jitv2::flush_preserved(),
-                                        crate::jitv2::jitv2::JITV2_FLUSH_PRESERVED_MAX).unwrap();
-                                }
-                                Err(_) => return Err(format!("Usage: j2 flushkeep [0..{}]",
-                                    crate::jitv2::jitv2::JITV2_FLUSH_PRESERVED_MAX)),
-                            },
-                        }
-                    }
+
                     "intrun" => {
                         // How many consecutive instructions share one
                         // pending-interrupt check. See

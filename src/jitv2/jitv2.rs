@@ -120,6 +120,11 @@ impl PfnMap {
     pub fn clear(&mut self) {
         self.0.fill(PFN_MAP_EMPTY);
     }
+
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u32 {
+        self.0.as_ptr()
+    }
 }
 
 
@@ -337,54 +342,7 @@ pub fn jit_page_has_dirty_lines(page_base: u64) -> bool {
 
 /// How many of the most-recently-used pages survive a flush with their
 /// `requested`/`denied` bitmaps (and pfn/gen/hash entry) intact, to be
-/// recompiled immediately rather than relearned from scratch — see
-/// `Jitv2::mega_flush`'s doc comment for the full churn-reduction rationale.
-///
-/// **Default 0: preserve nothing, free every page.** This was 1024 (the whole
-/// pool), which made a flush a no-op for the pool and kept every surviving
-/// page's accumulated entry-point set alive across it.
-///
-/// Why that is suspect: `reset_for_flush_survivor` folds `compiled` back into
-/// `requested`, so every entry offset a page ever had gets re-requested after
-/// the flush. A physical page reused by a *different* program then inherits
-/// the previous occupant's entry points and compiles a function with entries
-/// for code that no longer exists there. Measured on a real corpus page: **98
-/// entry points for 329 walked instructions** — one entry per 3.4
-/// instructions, which does not look like real control flow. Corpus-wide the
-/// median is 43 entry points per page and the maximum 222.
-///
-/// That costs twice over: a bigger compiled function, and a deeper
-/// entry-dispatch binary search (`(pc & 0xfff) >> 2` compared down a ladder,
-/// ~6-8 levels at these counts) paid on *every* external entry into the page.
-///
-/// Runtime-settable via `j2 flushkeep <n>` so the two policies can be
-/// benchmarked against each other without a rebuild. The old behaviour is
-/// `j2 flushkeep 1024`.
-static JITV2_FLUSH_PRESERVED: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
-/// Serializes the tests that force [`JITV2_FLUSH_PRESERVED`] to a specific
-/// value — it is a process-wide global, so two such tests running
-/// concurrently would stomp each other.
-#[cfg(test)]
-pub fn flush_preserved_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Hard ceiling for [`JITV2_FLUSH_PRESERVED`] — the whole pool.
-pub const JITV2_FLUSH_PRESERVED_MAX: usize = 4096;
-
-/// Set how many MRU pages survive a flush with their bitmaps intact.
-/// Clamped to `0..=JITV2_FLUSH_PRESERVED_MAX`; takes effect at the next flush.
-pub fn set_flush_preserved(n: usize) {
-    JITV2_FLUSH_PRESERVED.store(n.min(JITV2_FLUSH_PRESERVED_MAX), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Current flush-preservation count (see [`JITV2_FLUSH_PRESERVED`]).
-pub fn flush_preserved() -> usize {
-    JITV2_FLUSH_PRESERVED.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -815,22 +773,8 @@ static NEVER_COMPILABLE_GEN: AtomicU64 = AtomicU64::new(0);
 /// the page it is currently executing out of.
 pub struct PhysicalCodePage {
     pub pfn: Pfn,
-    /// Intrusive doubly-linked-list pointers into `Jitv2::pages`, reused for
-    /// two different lists depending on this slot's state — never both at
-    /// once, so one field pair suffices instead of two: while claimed, part
-    /// of `Jitv2`'s MRU list (§ churn-reduction flush, `jit-v2-design.md`);
-    /// while free, part of `Jitv2::free_head`'s singly-consumed free list
-    /// (`prev` unused there — see that field's own doc comment). `u32::MAX`
-    /// is the sentinel for "no link" (list head's `prev`, list tail's
-    /// `next`, or an as-yet-unlinked fresh slot). Owned entirely by the exec
-    /// thread under `Jitv2`'s lock, same as `pfn`/`gen` below — never touched
-    /// lock-free by a dispatching CPU thread or the compile thread, unlike
-    /// the `Atomic*` fields further down.
-    prev: u32,
-    /// See [`Self::prev`]. Also the free list's only pointer (singly linked
-    /// there — a free slot is only ever popped from the head, never removed
-    /// from the middle, so `prev` is left stale/unused while a slot sits on
-    /// that list).
+    /// Free list pointer: singly-linked free list threaded through
+    /// `Jitv2::free_head`. `NO_SLOT` when claimed or at tail of free list.
     next: u32,
     /// Pointer to this page's generation counter, obtained from the owning
     /// `BusDevice` via `gen_ptr` (§2.4, §7). RAM devices return one counter
@@ -1023,9 +967,9 @@ pub struct PhysicalCodePage {
     /// Same trigger as `compile_count` (bumped once per successful
     /// `publish()`), but with the opposite lifetime and always present, not
     /// `developer`-gated: `compile_count` is a lifetime-total churn counter
-    /// deliberately preserved across `reset_for_flush_survivor` (see that
-    /// field's own doc comment), whereas this one is cleared by BOTH
-    /// `reset_to_unclaimed` and `reset_for_flush_survivor` — so it answers
+    /// deliberately preserved across a page's reset (see that field's own
+    /// doc comment), whereas this one is cleared by `reset_to_unclaimed` —
+    /// so it answers
     /// "has this page compiled at all since its last flush/claim" directly,
     /// without needing a `developer` build or reasoning through generation
     /// numbers to rule out "never even tried" vs "tried and is legitimately
@@ -1182,8 +1126,8 @@ pub struct PhysicalCodePage {
     /// it — and is exactly the case this cache was built for. Always
     /// present, not `developer`-gated.
     ///
-    /// **Per-flush-epoch, not a lifetime total** — cleared by both
-    /// `reset_for_flush_survivor` and `reset_to_unclaimed`, unlike
+    /// **Per-flush-epoch, not a lifetime total** — cleared by
+    /// `reset_to_unclaimed`, unlike
     /// `rejected_compiles`/`prepare_bounced` next door. A boot's exec storm
     /// racks up hundreds of thousands of skips (measured: ~286k, 98% of
     /// everything checked), and as a lifetime total that figure would sit in
@@ -1352,7 +1296,6 @@ impl PhysicalCodePage {
     pub fn new(pfn: Pfn, gen: *const AtomicU64) -> Self {
         Self {
             pfn,
-            prev: NO_SLOT,
             next: NO_SLOT,
             gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
             requested: new_bitmap(),
@@ -1411,8 +1354,8 @@ impl PhysicalCodePage {
         self.entry_gen.store(0, Ordering::Relaxed);
         self.page_scheduled.store(false, Ordering::Relaxed);
         self.compiles_since_flush.store(0, Ordering::Relaxed);
-        // Churn-avoidance tallies are per-flush-epoch (see
-        // `reset_for_flush_survivor`), and this slot is additionally about to
+        // Churn-avoidance tallies are per-flush-epoch (see the
+        // `redundant_skipped` field), and this slot is additionally about to
         // be handed to a different physical page entirely — carrying the
         // previous tenant's counts into it would misattribute them.
         self.redundant_skipped.store(0, Ordering::Relaxed);
@@ -1436,6 +1379,11 @@ impl PhysicalCodePage {
     /// `fr1`: live `STATUS_FR` at the moment of first arrival. Pinned, but no
     /// longer for the page's whole lifetime — it is re-derived on a real
     /// invalidation and on an FR-guard bail (see [`Self::fr1`]'s doc comment).
+    #[inline]
+    pub fn is_claimed(&self) -> bool {
+        self.pfn != UNCLAIMED_PFN
+    }
+
     pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64, fr1: bool) {
         debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == UNCLAIMED_PFN,
             "claim() called on a slot that wasn't clean (pfn={:#x}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
@@ -1529,82 +1477,14 @@ impl PhysicalCodePage {
     /// page's defaults — but, unlike [`Self::reset_to_unclaimed`], leaves
     /// `pfn`/`gen` untouched: this page stays claimed under the same
     /// physical frame, it just looks like nothing has ever been compiled for
-    /// it yet. Unlike [`Self::reset_for_flush_survivor`], `requested`/
-    /// `denied` are NOT preserved here — this is a deliberate "forget
-    /// everything you learned about this page" for `j2 clear <paddr>`, not
-    /// the churn-reduction partial reset a real flush wants.
+    /// it yet. `requested`/`denied` are cleared too — this is a deliberate
+    /// "forget everything you learned about this page" for
+    /// `j2 clear <paddr>`.
     pub fn reset_compiled_state(&mut self) {
         self.reset_entries_and_bitmaps();
     }
 
-    /// Churn-reduction partial reset for a flush-surviving page (§ flush
-    /// design, `Jitv2::mega_flush`'s doc comment): drops the compiled
-    /// function and every generation/publish-derived bit, but — unlike
-    /// [`Self::reset_to_unclaimed`] — keeps `pfn`/`gen` (this page stays
-    /// claimed, stays in `Jitv2::pfn_to_slot`, under the same physical frame)
-    /// and keeps `requested`/`denied` (what to recompile and what not to
-    /// waste time on are exactly the knowledge this whole feature exists to
-    /// avoid relearning from scratch every flush). `compiled` still clears:
-    /// its bits describe `func`, which is gone, so leaving them set would
-    /// just be stale coverage nothing reads correctly anymore.
-    ///
-    /// Before clearing, `compiled`'s bits are folded into `requested` —
-    /// `handle_request`'s success path (`comp.rs`) clears an offset's
-    /// `requested` bit the moment it gets covered (`clear_requested_bits`),
-    /// so a page that had already compiled cleanly and was just sitting in
-    /// its fast `is_runnable` dispatch path (no fresh `mark_requested`
-    /// calls since) reaches a flush with `requested` already empty. Without
-    /// this fold, `mega_flush`'s own auto-requeued `CompileRequest` for this
-    /// page (pushed right after this call, see its call site) finds zero
-    /// candidates in `prepare_multi_entry_compile` (`requested_snapshot` is
-    /// empty) and silently no-ops — leaving the page fully reset
-    /// (`entry_gen=0`, nothing published, nothing denylisted) with no
-    /// automatic path back to compiled dispatch; it only revives if a live
-    /// fetch happens to land again on one of its exact previously-covered
-    /// entry offsets, which may never happen (confirmed live: `j2 pcp` on a
-    /// heavily-written page showing a high `gen` yet `entry_gen=0` and 0/1024
-    /// offsets published, permanently, well after boot settled).
-    pub fn reset_for_flush_survivor(&mut self) {
-        for (req, comp) in self.requested.iter().zip(self.compiled.iter()) {
-            let bits = comp.load(Ordering::Relaxed);
-            if bits != 0 { req.fetch_or(bits, Ordering::Relaxed); }
-        }
-        for word in self.compiled.iter() { word.store(0, Ordering::Relaxed); }
-        self.func.store(std::ptr::null_mut(), Ordering::Relaxed);
-        // The arena this page's `func` lived in is being flushed out from
-        // under it, so the snapshot no longer describes anything runnable —
-        // this page must take a real recompile even though its bytes are
-        // unchanged. (Preserving `requested`/`denied` is the churn reduction
-        // a flush survivor gets; the snapshot cannot join them.)
-        self.invalidate_compile_snapshot();
-        self.entry_gen.store(0, Ordering::Relaxed);
-        self.page_scheduled.store(false, Ordering::Relaxed);
-        // Cleared here too, unlike `compile_count` below — see
-        // `compiles_since_flush`'s own field doc comment for why the two
-        // have deliberately opposite lifetimes.
-        self.compiles_since_flush.store(0, Ordering::Relaxed);
-        // Same "since the last flush" lifetime, for the same reason: a boot
-        // accumulates a huge churn-avoidance count (the exec storm skips
-        // hundreds of thousands of redundant compiles), which then sits in
-        // `j2 status` forever and drowns out whatever the system is doing
-        // now. A flush is the natural epoch boundary — the snapshots these
-        // counted are being invalidated by this very call, so their tallies
-        // describe a state that no longer exists.
-        self.redundant_skipped.store(0, Ordering::Relaxed);
-        self.redundant_rejected.store(0, Ordering::Relaxed);
-        self.instr_count.store(0, Ordering::Relaxed);
-        self.code_size.store(0, Ordering::Relaxed);
-        #[cfg(feature = "developer")]
-        {
-            // `call_count`/`compile_count` deliberately NOT reset — both are
-            // pure history counters (`j2 html`'s "how hot/how much churn was
-            // this page" stats), not correctness state; a preserved page
-            // keeping its lifetime totals across a flush it survived is the
-            // more useful reading, not a bug.
-        }
-    }
-
-    /// Current generation count for this page. `self.gen` is never null (see
+    /// Current generation count for this page.    /// Current generation count for this page. `self.gen` is never null (see
     /// its own doc comment) — a page whose backing device has no real gen
     /// tracking (MMIO, etc) reads the shared, never-bumped
     /// [`NEVER_COMPILABLE_GEN`] fallback here instead, so this is
@@ -1631,7 +1511,7 @@ impl PhysicalCodePage {
     }
 
     /// How many times `publish()` has succeeded since this page's last
-    /// `reset_to_unclaimed`/`reset_for_flush_survivor` — see the field's own
+    /// `reset_to_unclaimed` — see the field's own
     /// doc comment for why this exists alongside `compile_count` (opposite
     /// lifetime, always present). Not on the hot dispatch path — only read
     /// by `j2 pcp`.
@@ -2376,9 +2256,9 @@ impl PhysicalCodePage {
                 // `requested` is what gives it a path to a real recompile;
                 // without it the entry is silently stranded on the
                 // interpreter until something happens to fetch it again,
-                // which is the same "no automatic path back" failure
-                // `reset_for_flush_survivor` documents and guards against the
-                // same way.
+                // which is the same "no automatic path back" failure a
+                // dropped-but-still-wanted entry always risks, guarded
+                // against the same way.
                 if dropped != 0 { self.requested[i].fetch_or(dropped, Ordering::Relaxed); }
             }
         } else {
@@ -2436,14 +2316,14 @@ const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 /// entirely: nothing is ever copied after `Jitv2::new` builds the array.
 ///
 /// Slots are handed out via [`Self::free_head`], a singly-linked free list
-/// threaded through every unclaimed slot's `PhysicalCodePage::next` — not a
-/// bump allocator anymore (superseded by the churn-reduction flush design:
-/// `mega_flush` now partially preserves the most-recently-used slots instead
-/// of resetting the whole pool to empty every time, so "next unclaimed slot"
-/// is no longer a contiguous suffix of the array). Every claimed slot is also
-/// threaded onto [`Self::mru_head`]/[`Self::mru_tail`], a doubly-linked
-/// least-recently-used list (`prev`/`next` again) that `mega_flush` walks
-/// from the front to decide which slots survive.
+/// threaded through every unclaimed slot's `PhysicalCodePage::next`. A slot
+/// is claimed iff its `pfn != UNCLAIMED_PFN` (see
+/// [`PhysicalCodePage::is_claimed`]) — there is no separate recency list:
+/// `mega_flush` resets the whole pool to empty and rebuilds the free list
+/// from slot 0, so after a flush "next unclaimed slot" is once again the
+/// whole array. (An earlier design preserved the most-recently-used slots
+/// across a flush, threaded on an MRU list; that was removed — preserved
+/// entry points could be stale, and keeping them was at best neutral.)
 ///
 /// Lookup from `pfn` to pool slot goes through `pfn_to_slot` — the design
 /// doc's dense pfn-indexed alternative (§2.4), now built: page-switch lookup
@@ -2468,34 +2348,19 @@ pub struct Jitv2 {
     /// doc comment), so an evicted slot handed to a different pfn is never
     /// racing a stale in-flight reference to begin with.
     pages: Box<[PhysicalCodePage]>,
-    /// Head of the claimed-slot MRU list (most-recently-touched slot; `NO_SLOT`
-    /// when nothing is claimed) — `page_for` moves a slot here on every hit
-    /// or fresh claim, threaded through `PhysicalCodePage::prev`/`next`.
-    /// `mega_flush` walks from here to decide which `JITV2_FLUSH_PRESERVED`
-    /// slots survive.
-    mru_head: u32,
-    /// Tail of the claimed-slot MRU list (least-recently-touched slot;
-    /// `NO_SLOT` when nothing is claimed) — the eviction end; `mega_flush`
-    /// could equally walk from here for "least recent first" but walks from
-    /// `mru_head` instead (see its own doc comment for why that's the more
-    /// useful order to preserve-from). Kept for O(1) `unlink`/detection of
-    /// "this is the last claimed slot" rather than a doc-comment-only field.
-    mru_tail: u32,
     /// Head of the free-slot singly-linked list, threaded through
-    /// `PhysicalCodePage::next` (`prev` unused on this list — see that
-    /// field's own doc comment). `NO_SLOT` when the pool is fully claimed.
+    /// `PhysicalCodePage::next`. `NO_SLOT` when the pool is fully claimed.
     /// Every slot starts here (`Jitv2::new` links the whole array into this
     /// list up front); `page_for` pops from the head on a fresh claim,
-    /// `mega_flush` pushes evicted slots back onto it.
+    /// `mega_flush` resets the pool and rebuilds the free list.
     free_head: u32,
     /// pfn -> index into `pages`. Consulted only on a page switch (fetch
     /// lands on a different PFN than the currently-tracked one) — not on
     /// every fetch. Direct-mapped, not hashed — see [`PfnMap`].
     pfn_to_slot: PfnMap,
     /// Pool capacity, fixed at construction (== `pages.len()`). Claiming past
-    /// this (free list AND MRU-preserved-but-recompiling slots both
-    /// exhausted) triggers `mega_flush` (the "ran out of PCPs"
-    /// resource-exhaustion trigger).
+    /// this (i.e. with the free list exhausted) triggers `mega_flush` (the
+    /// "ran out of PCPs" resource-exhaustion trigger).
     capacity: usize,
     /// Compile-request fifo + worker thread (§6.4/§9). Constructed alongside
     /// the pool; `start()`/`stop()` are separate calls so the executor
@@ -2580,8 +2445,6 @@ impl Jitv2 {
         }
         Self {
             pages,
-            mru_head: NO_SLOT,
-            mru_tail: NO_SLOT,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
             pfn_to_slot: PfnMap::new(),
             capacity,
@@ -2593,85 +2456,25 @@ impl Jitv2 {
         }
     }
 
-    /// Detach `slot` from the MRU list, patching its neighbors' links and
-    /// `mru_head`/`mru_tail` as needed. Leaves `pages[slot].prev`/`.next`
-    /// untouched (the caller either immediately relinks it elsewhere —
-    /// `touch_mru` — or is about to overwrite them as part of pushing it
-    /// onto the free list — `mega_flush`).
-    fn mru_unlink(&mut self, slot: u32) {
-        let (prev, next) = (self.pages[slot as usize].prev, self.pages[slot as usize].next);
-        if prev != NO_SLOT { self.pages[prev as usize].next = next; } else { self.mru_head = next; }
-        if next != NO_SLOT { self.pages[next as usize].prev = prev; } else { self.mru_tail = prev; }
-    }
-
-    /// Move `slot` to the front of the MRU list (unlink if already linked,
-    /// then push at `mru_head`) — `page_for`'s touch on both a lookup hit and
-    /// a fresh claim.
-    fn touch_mru(&mut self, slot: u32) {
-        if self.mru_head == slot { return; } // already the most-recent; nothing to do
-        if self.pages[slot as usize].next != NO_SLOT || self.pages[slot as usize].prev != NO_SLOT || self.mru_tail == slot {
-            self.mru_unlink(slot);
-        }
-        self.pages[slot as usize].prev = NO_SLOT;
-        self.pages[slot as usize].next = self.mru_head;
-        if self.mru_head != NO_SLOT { self.pages[self.mru_head as usize].prev = slot; }
-        self.mru_head = slot;
-        if self.mru_tail == NO_SLOT { self.mru_tail = slot; }
-    }
-
-    /// Release `slot` back to the free list, undoing everything `page_for`'s
-    /// claim path set up. The single owner of that teardown sequence — every
-    /// step has to happen, in this order, and getting any of them wrong has
-    /// already cost this file real bugs:
-    ///
-    /// 1. **`mru_unlink` first**, while the slot's `prev`/`next` still hold
-    ///    real MRU links. Doing it after step 3 would unlink against
-    ///    already-cleared pointers and corrupt the list.
-    /// 2. **Drop the pfn mapping**, keyed off the slot's *own* `pfn` — read
-    ///    it before `reset_to_unclaimed` zeroes it. A slot freed while still
-    ///    mapped is exactly the "map and the slot it points at have desynced"
-    ///    case `page_for`'s own `debug_assert` exists to catch.
-    /// 3. **`reset_to_unclaimed`**, clearing `pfn`/`gen` and every entry's
-    ///    published state, so a later `claim` starts from a clean slot (its
-    ///    own `debug_assert` enforces this).
-    /// 4. **Push onto the free list**, `prev` explicitly `NO_SLOT`. The free
-    ///    list threads through `next` only, but `prev` must not be left
-    ///    holding a stale MRU link: `touch_mru`'s "am I already linked?"
-    ///    guard tests both, and free-list garbage in `prev` made it call
-    ///    `mru_unlink` on a slot that was never in the MRU list — confirmed
-    ///    live as a boot hang (a cycle in the list that `mega_flush`'s walk
-    ///    then spun on forever). See `page_for`'s own comment on the same trap.
+    /// Release `slot` back to the free list.
     fn free_page(&mut self, slot: PageSlot) {
-        self.mru_unlink(slot);
         let pfn = self.pages[slot as usize].pfn;
         self.pfn_to_slot.remove(pfn);
         self.pages[slot as usize].reset_to_unclaimed();
-        self.pages[slot as usize].prev = NO_SLOT;
         self.pages[slot as usize].next = self.free_head;
         self.free_head = slot;
     }
+
     /// Look up the pool slot for `pfn`, claiming the next unclaimed slot
     /// in place (`PhysicalCodePage::claim`, `gen_ptr(phys_addr)` on the bus)
     /// if this is the first arrival at this page. Returns `None` if the pool
     /// is exhausted — the caller (mips exec thread) is responsible for
     /// running `mega_flush` and retrying.
-    ///
-    /// `phys_addr` must be the physical address whose containing page is
-    /// `pfn` (i.e. `pfn == phys_addr / PAGE_SIZE`) — passed separately
-    /// rather than reconstructed here because callers already have it from
-    /// translation and multiplying back out is wasted work on the hot path.
-    ///
-    /// `fr1`: live `STATUS_FR` at the moment of a first (claiming) arrival —
-    /// ignored on a lookup hit (the page's FR mode is already pinned; see
-    /// `PhysicalCodePage::fr1`'s own doc comment for why it can't be
-    /// re-decided per lookup).
     pub fn page_for(&mut self, pfn: Pfn, phys_addr: u32, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
         if let Some(slot) = self.pfn_to_slot.get(pfn) {
             debug_assert_eq!(self.pages[slot as usize].pfn, pfn,
-                "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have \
-                 desynced (a slot was reused/evicted without this map entry being updated to match)",
+                "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have                  desynced (a slot was reused/evicted without this map entry being updated to match)",
                 pfn, slot, self.pages[slot as usize].pfn);
-            self.touch_mru(slot);
             return Some(slot);
         }
         if self.free_head == NO_SLOT {
@@ -2681,25 +2484,14 @@ impl Jitv2 {
         self.free_head = self.pages[slot as usize].next;
         let gen = bus.gen_ptr(phys_addr);
         self.pages[slot as usize].claim(pfn, gen, fr1);
-        // `claim` doesn't touch prev/next, and popping off the free list
-        // above only consumed `next` — both still hold stale free-list
-        // leftovers at this point (`next` may be some other free slot's
-        // index, not NO_SLOT; `prev` is whatever this slot's `prev` was the
-        // last time it was linked into anything). `touch_mru`'s own guard
-        // decides whether to unlink-first by checking prev/next/mru_tail
-        // against NO_SLOT/this slot — against real MRU-list state that
-        // works correctly, but against free-list garbage it can wrongly
-        // decide "already linked" and call `mru_unlink` on bogus
-        // prev/next values, corrupting `mru_head`/an unrelated slot's own
-        // links (confirmed live: a boot hang traced to exactly this —
-        // `mega_flush`'s list walk stuck in a cycle created here). Must
-        // clear both to NO_SLOT explicitly before `touch_mru` runs, so it
-        // always sees a genuinely-unlinked slot on a fresh claim.
-        self.pages[slot as usize].prev = NO_SLOT;
         self.pages[slot as usize].next = NO_SLOT;
-        self.touch_mru(slot);
         self.pfn_to_slot.insert(pfn, slot);
         Some(slot)
+    }
+
+    /// Pointers for lock-free `pfn -> *mut PhysicalCodePage` fast lookup.
+    pub fn fast_lookup_ptrs(&mut self) -> (*const u32, *mut PhysicalCodePage) {
+        (self.pfn_to_slot.as_ptr(), self.pages.as_mut_ptr())
     }
 
     /// Raw pointer to the page at `slot`. Valid for the process's entire
@@ -2714,46 +2506,28 @@ impl Jitv2 {
     /// Number of pool slots currently claimed (since construction or the
     /// last `mega_flush`). Exit-time diagnostic — see `MipsCpu::stop`.
     ///
-    /// Counts the MRU list rather than the pfn map: [`PfnMap`] is a
-    /// direct-mapped array with no live-entry count of its own, and the MRU
-    /// list holds exactly the claimed set (`page_for` calls `touch_mru` on
-    /// both a lookup hit and a fresh claim; `free_page` unlinks). O(claimed),
+    /// Scans `pages` rather than consulting the pfn map: [`PfnMap`] is a
+    /// direct-mapped array with no live-entry count of its own, while
+    /// `pfn != UNCLAIMED_PFN` is the authoritative claimed test. O(capacity),
     /// and this is a diagnostic, not a hot path.
+    ///
+    /// Reads 0 immediately after a `mega_flush`, which resets every slot —
+    /// so this is "claimed right now", not a cumulative total. It is NOT
+    /// comparable against `Codegen::function_count`, which resets on a
+    /// Cranelift arena flush instead; the two count over different windows.
     #[inline]
     pub fn pages_used(&self) -> usize {
-        let mut n = 0usize;
-        let mut slot = self.mru_head;
-        while slot != NO_SLOT {
-            n += 1;
-            slot = self.pages[slot as usize].next;
-        }
-        n
+        self.pages.iter().filter(|p| p.is_claimed()).count()
     }
 
     /// Pool-wide churn-avoidance totals as `(skipped, rejected)`: compile
     /// requests answered by re-validating already-installed code, vs. those
     /// that had a snapshot to compare against and had to compile anyway.
-    /// See `PhysicalCodePage::redundant_skipped`.
-    ///
-    /// Summed over the claimed pages on demand rather than kept as a running
-    /// pair of globals — this is a `j2 status` diagnostic, not a hot path,
-    /// and a sum cannot drift out of step with the per-page numbers `j2 pcp`
-    /// prints.
-    ///
-    /// Reads as "since the last `mega_flush`", because that is the lifetime
-    /// of the underlying per-page counters (see
-    /// `PhysicalCodePage::redundant_skipped`) — deliberately, so the figure
-    /// tracks current behaviour instead of staying pinned to the boot storm
-    /// that dominates any lifetime total. A flush therefore resets this to
-    /// near zero; that is the intent, not drift.
     pub fn redundant_compile_totals(&self) -> (u64, u64) {
         let (mut skipped, mut rejected) = (0u64, 0u64);
-        let mut slot = self.mru_head;
-        while slot != NO_SLOT {
-            let page = &self.pages[slot as usize];
+        for page in self.pages.iter().filter(|p| p.is_claimed()) {
             skipped += page.redundant_skipped() as u64;
             rejected += page.redundant_rejected() as u64;
-            slot = page.next;
         }
         (skipped, rejected)
     }
@@ -2818,73 +2592,36 @@ impl Jitv2 {
 
     /// Every claimed page in the pool, exposed as a borrowing iterator
     /// rather than folded into an aggregate, for callers (`j2 html`) that
-    /// need the raw per-page detail instead of a summary statistic. No
-    /// longer a contiguous `pages[..next_free]` slice — claimed slots can be
-    /// scattered anywhere in `pages` now that `mega_flush` preserves some and
-    /// frees others non-contiguously — so this walks the **MRU list**
-    /// instead, which holds exactly the claimed set (`page_for` calls
-    /// `touch_mru` on both a lookup hit and a fresh claim; `free_page`
-    /// unlinks). Same set of slots `code_bytes_used`/`code_size_by_instr_count`
-    /// reach a different way, by scanning the whole array and filtering on
-    /// `func().is_null()` — either is a valid definition of "claimed", since
-    /// a slot is MRU-linked iff it isn't sitting on the free list. `pages`
-    /// itself stays private (index stability, see the field's own doc
-    /// comment, is an invariant only this module should rely on).
+    /// need the raw per-page detail instead of a summary statistic. Not
+    /// necessarily a contiguous `pages[..n]` prefix — `free_page` can return
+    /// an individual slot mid-run, so claimed slots may be scattered anywhere
+    /// in the array — hence the full scan filtered on
+    /// [`PhysicalCodePage::is_claimed`]. `pages` itself stays private (index
+    /// stability, see the field's own doc comment, is an invariant only this
+    /// module should rely on).
     pub fn claimed_pages(&self) -> impl Iterator<Item = &PhysicalCodePage> {
-        // Walks the MRU list (exactly the claimed set — see `pages_used`)
-        // rather than the pfn map: [`PfnMap`] is a 1 Mi-entry direct-mapped
-        // array, so iterating *it* would visit a million mostly-empty slots
-        // to find at most `capacity` (4096) real ones.
-        let mut slot = self.mru_head;
-        std::iter::from_fn(move || {
-            if slot == NO_SLOT { return None; }
-            let cur = slot as usize;
-            slot = self.pages[cur].next;
-            Some(&self.pages[cur])
-        })
+        self.pages.iter().filter(|p| p.is_claimed())
     }
 
-    /// Reset the compiled-code arena to empty while preserving the
-    /// `JITV2_FLUSH_PRESERVED` most-recently-used pages' `pfn`/`requested`/
-    /// `denied` — the MAME-style "flush the world" response to running out
-    /// of any bump-allocated JIT resource, softened so it no longer means
-    /// relearning every hot page's reachability/denylist from zero every
-    /// time (§6.3's `flush_all()`, of which this is the first caller:
-    /// arena-full, `restore`, `rollback` all route through one routine).
+    /// Reset the whole page pool to empty — the MAME-style "flush the world"
+    /// response to running out of any bump-allocated JIT resource (§6.3's
+    /// `flush_all()`: arena-full, `restore`, `rollback` all route through
+    /// this one routine).
     ///
-    /// **Why**: a full-page-per-function region can easily compile to
-    /// 100-200KB of native code; a busy boot recompiles the same hot pages
-    /// over and over as new entry points are discovered on them, and every
-    /// one of those compiles was, before this, thrown away completely on the
-    /// next arena-full flush — discovered entry points, learned denylist,
-    /// everything — only to be rediscovered by dispatch one arrival at a
-    /// time. Keeping the `requested`/`denied` bitmaps for the pages that
-    /// were actually hot right before the flush (the MRU list's front) means
-    /// the compiler can immediately re-target exactly the entry points that
-    /// mattered, instead of the page cache re-warming from nothing.
+    /// Every slot gets [`PhysicalCodePage::reset_to_unclaimed`] (which clears
+    /// `pfn` back to `UNCLAIMED_PFN`, so `pages_used()` reads 0 afterwards),
+    /// `pfn_to_slot` is cleared, and the free list is relinked across the
+    /// entire array from slot 0. Slot *indices* stay stable — the array is
+    /// reset in place and never reallocates (see the `pages` field's own doc
+    /// comment) — but a slot's *contents* do not survive, so any surviving
+    /// pointer to one must re-check pfn/gen before trusting it.
     ///
-    /// Walks the MRU list from `mru_head` (freshest first): the first
-    /// `JITV2_FLUSH_PRESERVED` slots get [`PhysicalCodePage::reset_for_flush_survivor`]
-    /// (keeps pfn/gen/fr1/requested/denied, drops the compiled function) and
-    /// stay in `pfn_to_slot` under the same pfn — from dispatch's point of
-    /// view these pages never left, they just briefly have no compiled
-    /// function until the immediate requeue below re-compiles them. Every
-    /// slot beyond that gets the full [`PhysicalCodePage::reset_to_unclaimed`],
-    /// is dropped from `pfn_to_slot`, and goes back onto the free list.
-    /// "Freshest `N` survive" rather than "least-recently-used `N` are
-    /// preserved instead" (walking from `mru_tail`) is a deliberate choice:
-    /// the whole point is keeping the pages dispatch is *about to* revisit
-    /// immediately, which the MRU-touch order tracks directly — recency here
-    /// is a proxy for both hotness and short-term future demand, and using
-    /// it in the more-recent-first direction is what actually reduces churn.
-    ///
-    /// After the reset loop, one `CompileRequest` is pushed per preserved
-    /// page, in the same freshest-first MRU order (this fn's own return
-    /// value; the caller sends them once the compile queue it needs is
-    /// actually running again — see both public wrappers) — so the compiler
-    /// starts working on exactly the pages that were hot a moment ago right
-    /// away, instead of waiting for dispatch to re-discover each one from
-    /// scratch one arrival at a time.
+    /// An earlier design preserved the `pfn`/`requested`/`denied` of the N
+    /// most-recently-used pages across a flush and immediately requeued them
+    /// for recompilation, to avoid re-warming the page cache from nothing.
+    /// That was removed: the preserved entry points could be stale, and
+    /// accumulating bad ones was measured as at best neutral and slightly
+    /// harmful. The MRU list it depended on is gone with it.
     ///
     /// Does not yet demote promoted decode-entry handlers or null
     /// entry_table slots (§6.1.3, §6.3) — there are none to demote until
@@ -2898,127 +2635,31 @@ impl Jitv2 {
     /// rather than leaving it the caller's responsibility, is what makes the
     /// whole operation self-contained now that `Jitv2` owns its own
     /// compile-queue lifecycle independently of `MipsCpu::stop()`/`start()`).
-    fn mega_flush(&mut self) -> Vec<CompileRequest> {
-        // Read once: the knob can change between flushes but must stay fixed
-        // for the duration of one walk, or the surviving prefix and the MRU
-        // list disagree about where the cut was.
-        let preserve = flush_preserved();
-        let mut requests = Vec::with_capacity(preserve);
-        let mut slot = self.mru_head;
-        let mut rank = 0usize;
-        while slot != NO_SLOT {
-            let next = self.pages[slot as usize].next; // save before this slot's links get overwritten below
-            if rank < preserve {
-                let page = &mut self.pages[slot as usize];
-                page.reset_for_flush_survivor();
-                // Every entry here is about to be recompiled from scratch, so
-                // this is the natural point to honour an outstanding
-                // FR-mismatch re-pin (the TODO that used to sit here asked
-                // for a "last kill was FR-caused" signal; `fr_repin` is it).
-                // No live `cp0_status` on this path — it runs on the flush
-                // path, not a dispatch — so the current pin is the fallback
-                // when no bail is outstanding.
-                //
-                // The old TODO also required `denied` be reset when the mode
-                // flips, since the denylist was learned against the old
-                // mode's codegen decisions. `reset_for_flush_survivor`
-                // deliberately PRESERVES `denied` (that is its whole
-                // churn-reduction purpose), so an actual flip has to clear it
-                // here — otherwise offsets denied for old-mode reasons stay
-                // sticky-denied against code that will now be compiled
-                // differently.
-                let was = page.is_fr1();
-                let fr1 = page.take_fr_repin(was);
-                if fr1 != was { page.reset_denied(); }
-                requests.push(CompileRequest { page: page as *mut PhysicalCodePage, compiled_for_fr1: fr1 });
-            } else {
-                self.free_page(slot);
-            }
-            rank += 1;
-            slot = next;
+    fn mega_flush(&mut self) {
+        self.pfn_to_slot.clear();
+        let cap = self.pages.len();
+        for (i, page) in self.pages.iter_mut().enumerate() {
+            page.reset_to_unclaimed();
+            page.next = (i + 1) as u32;
         }
-        // The surviving prefix is already exactly the MRU list now (nothing
-        // beyond JITV2_FLUSH_PRESERVED is still linked) — `mru_head` is
-        // unchanged, and `mru_unlink` above kept `mru_tail` correct as each
-        // evicted slot was detached from the end backward.
-        // Status-bar feedback (disp.rs's StatusBar): reset the code-arena
-        // gauge to empty and bump the flush-event counter so the bar
-        // flashes once this frame — see JitFeedback's own doc comment for
-        // why a counter, not a bool. Arena fill itself is tracked from
-        // Codegen::packing_stats() at each compile (worker_loop /
-        // jitv2_inline_compile), not here — this only needs to zero it
-        // because mega_flush is also what resets the real Cranelift arena
-        // (Codegen::reset, called by both of this fn's callers right after).
+        if cap > 0 {
+            self.pages[cap - 1].next = NO_SLOT;
+            self.free_head = 0;
+        } else {
+            self.free_head = NO_SLOT;
+        }
         crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         crate::jit_feedback::JIT_FEEDBACK.record_flush();
-        requests
     }
 
     /// Self-contained page-pool + compiled-code-arena flush, called FROM the
-    /// CPU thread (`jitv2_track_pcp`'s pool-exhaustion handler). The caller
-    /// is already "as good as stopped" — it's the one executing this,
-    /// synchronously, not racing itself — so this never touches the CPU at
-    /// all, only the *compile* queue (the other side): pauses it if it's
-    /// running (every in-flight/queued `CompileRequest` points into
-    /// `self.pages`, which `mega_flush` is about to clear — the worker must
-    /// be fully joined and drained first, or it could dereference a page
-    /// mid-drop out from under it; `stop()` also hands back whatever
-    /// `Codegen` the worker was using), clears the pool, resets the
-    /// `Codegen` (frees the Cranelift memory arena — `Codegen::function_count`'s
-    /// doc comment for why nothing else ever does), and hands the reset
-    /// `Codegen` back to wherever it came from — restarting the compile
-    /// queue if (and only if) it was the one running, or back into
-    /// `self.codegen` (idle slot) if inline dispatch owned it instead. Which
-    /// of those it was is exactly what `compile_queue.stop()`'s `Option`
-    /// tells us; blindly restarting the queue regardless used to silently
-    /// steal the `Codegen` away from inline dispatch (see the code's own
-    /// comment for the failure mode this caused).
-    ///
-    /// The caller (`jitv2_track_pcp`) is still responsible for its own
-    /// `nanotlb_invalidate()`/`self.pcp = null` afterward — this type has no
-    /// executor access to do that itself. See [`Self::flush_from_jit_thread`]
-    /// for the mirror-image case (compile thread detects its own growth,
-    /// must pause the *CPU* instead).
-    ///
-    /// # Safety
-    /// Same contract as `Codegen::reset` — no `JitFn` this `Codegen` ever
-    /// produced may still be reachable/callable after this returns.
-    /// Guaranteed here: every `PhysicalCodePage` that could reference such a
-    /// function is cleared by `mega_flush` in the same operation, and the
-    /// compile queue is fully stopped (joined) before that clear runs.
+    /// CPU thread (`jitv2_track_pcp`'s pool-exhaustion handler).
     pub unsafe fn flush_from_cpu_thread(&mut self, bus: Arc<dyn BusDevice>) {
-        // `compile_queue.stop()` returns non-empty only if the async worker
-        // was actually running (i.e. threaded/`j2 inline off` mode) —
-        // that's also the only case this should restart it afterward. When
-        // it returns empty, the codegen was already idle in `self.codegen`
-        // (inline/`j2 inline on` mode, the default), and it must be reset
-        // and stay there, NOT go to the compile queue — unconditionally
-        // restarting the queue here regardless of which mode was actually
-        // active used to silently steal the codegen out from under inline
-        // dispatch: every inline compile after the first pool-exhaustion
-        // flush would find `self.codegen` empty and silently no-op
-        // (mips_exec.rs's `if let Some(codegen) = codegen.as_mut()` guard
-        // swallows it with no error), while `j2 inline` still reported "on"
-        // the whole time.
         let stopped = self.compile_queue.stop();
         let was_threaded = !stopped.is_empty();
         let mut function_count = 0;
-        // `stop()` already drains the ring itself (see its own doc comment)
-        // — this second call is a harmless no-op belt-and-suspenders: every
-        // request still queued at stop-time points into the pool
-        // `mega_flush` is about to clear, and this must happen before that
-        // clear runs, not after (see `drain_pending`'s own doc comment for
-        // the live-confirmed crash that reasoning guards against).
         self.compile_queue.drain_pending_queue();
         if was_threaded {
-            // The threaded queue's own Codegen(s) are discarded (dropped,
-            // not reset — `start()` will build fresh ones internally on
-            // restart below, same as it always does on a first start).
-            // `Codegen`'s `mem::forget`-on-drop semantics (see `reset`'s own
-            // doc comment) mean this leaks the old arena, same as any other
-            // orphaned Codegen — acceptable here since mega_flush below is
-            // about to invalidate every PhysicalCodePage entry that could
-            // have pointed into it anyway.
             function_count = stopped.iter().map(|c| c.function_count()).sum();
         } else if let Some(codegen) = self.codegen.get_mut().as_mut() {
             function_count = codegen.function_count();
@@ -3028,79 +2669,21 @@ impl Jitv2 {
             "jitv2: mega_flush (from cpu thread) — {} / {} pages used, {} functions compiled",
             self.pages_used(), self.capacity(), function_count,
         );
-        let requests = self.mega_flush();
+        self.mega_flush();
         if was_threaded {
             let stats = self.stats.clone();
-            self.compile_queue.start(bus, stats.clone());
-            // Immediately re-target the pages that were hottest right before
-            // this flush, freshest first — see `mega_flush`'s own doc
-            // comment for why. Inline mode needs no equivalent here: its
-            // compiles are triggered synchronously by dispatch, not this
-            // queue, and every preserved page's `requested` bits survived
-            // the flush, so the very next dispatch that lands on one
-            // (`is_runnable` now false — `func` was just cleared) falls
-            // straight into the existing "nothing valid, compile now" path
-            // on its own.
-            for req in requests {
-                self.compile_queue.send(req, &stats);
-            }
+            self.compile_queue.start(bus, stats);
         }
     }
 
     /// Mirror image of [`Self::flush_from_cpu_thread`], called FROM the
-    /// compile thread (`CompileQueue::worker_loop`'s `run_leader_flush`,
-    /// when the shared arena's growth crosses
-    /// `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES`). The compile thread can't
-    /// pause itself (`CompileQueue::stop()` joins the very thread that
-    /// would be calling it — a self-join deadlock), so this pauses the
-    /// *CPU* instead: `cpu.stop()` fully joins the CPU's OS thread and
-    /// establishes `pcp == null` as a stop-time invariant (`MipsCpu::stop`'s
-    /// own doc comment) before returning, which is what makes it safe for
-    /// this to clear the page pool directly despite §6.1.3's usual
-    /// CPU-thread-only contract — the CPU is provably not running for the
-    /// whole operation.
-    ///
-    /// Page-pool clear only — no longer resets any `Codegen`/arena itself
-    /// (unlike before the compile-pool redesign): `run_leader_flush` is the
-    /// one that builds the fresh shared arena and rebuilds every worker's
-    /// `Codegen` on top of it, since that needs direct access to
-    /// `SharedArena`/`BarrierState` types that have no reason to leak into
-    /// `Jitv2` itself. `function_count` is just for the log line (the
-    /// caller's own `codegen.function_count()` at the moment of the flush —
-    /// `Jitv2` has no `Codegen` of its own to read this from anymore).
-    ///
-    /// # Safety
-    /// No `JitFn` any worker's `Codegen` ever produced may still be
-    /// reachable/callable anywhere after this returns — guaranteed by the
-    /// caller having fully stopped the CPU (and, once a real pool exists,
-    /// having every other worker parked) before this runs.
-    ///
-    /// Must be called with `self` NOT already locked by the caller:
-    /// `cpu.stop()` locks the executor and, through it, this same
-    /// `Mutex<Jitv2>` again (to print its own page-pool stats — see
-    /// `MipsCpu::stop`'s doc comment) — calling this while already holding
-    /// `Jitv2`'s lock (e.g. via `jit.lock().flush_from_jit_thread(...)`)
-    /// self-deadlocks the compile thread on its own non-reentrant lock.
-    /// Callers must take the lock only for the `mega_flush` portion, not
-    /// across `cpu.stop()`/`cpu.start()` — see `CompileQueue::worker_loop`'s
-    /// `run_leader_flush` for the correct call shape.
+    /// compile thread.
     pub unsafe fn flush_from_jit_thread(&mut self, function_count: u32) {
         eprintln!(
             "jitv2: mega_flush (from jit thread) — {} / {} pages used, {} functions compiled",
             self.pages_used(), self.capacity(), function_count,
         );
-        let requests = self.mega_flush();
-        // Unlike `flush_from_cpu_thread`, the compile queue itself was never
-        // stopped here — only drained (`run_leader_flush`'s own comment) —
-        // every worker just parks at the barrier and resumes on the same
-        // running queue, so these can be pushed straight onto it right now
-        // rather than waiting for a restart that isn't coming. See
-        // `mega_flush`'s own doc comment for why re-targeting these pages
-        // immediately, freshest first, is the point of preserving them at all.
-        let stats = self.stats.clone();
-        for req in requests {
-            self.compile_queue.send(req, &stats);
-        }
+        self.mega_flush();
     }
 }
 
@@ -4797,22 +4380,11 @@ mod tests {
         // advance `entry_gen` over a null function and send dispatch into
         // nothing. Every reset that clears `func` must clear the snapshot.
         let counter = AtomicU64::new(5);
-        let page = {
-            let mut p = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-            let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
-            publish_with_snapshot(&p, &words, &used, &entries, 5, false, 0x1000usize as *const ());
-            p.reset_for_flush_survivor();
-            p
-        };
-        assert!(!page.has_compile_snapshot(),
-            "reset_for_flush_survivor drops func, so the snapshot must go with it");
-
-        let counter2 = AtomicU64::new(5);
-        let mut page2 = PhysicalCodePage::new(0, &counter2 as *const AtomicU64);
+        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
-        publish_with_snapshot(&page2, &words, &used, &entries, 5, false, 0x1000usize as *const ());
-        page2.reset_to_unclaimed();
-        assert!(!page2.has_compile_snapshot(),
+        publish_with_snapshot(&page, &words, &used, &entries, 5, false, 0x1000usize as *const ());
+        page.reset_to_unclaimed();
+        assert!(!page.has_compile_snapshot(),
             "reset_to_unclaimed drops func, so the snapshot must go with it");
     }
 
@@ -4827,7 +4399,7 @@ mod tests {
         let (words, used, entries) = churn_fixture(&[10], &[10, 11]);
 
         page.stage_compile_snapshot(&words, &used, &entries, 5, false);
-        page.reset_for_flush_survivor();
+        page.reset_to_unclaimed();
         page.commit_compile_snapshot(5, &entries);
         assert!(!page.has_compile_snapshot(),
             "a commit arriving after a reset must not revive the snapshot");
@@ -4860,7 +4432,7 @@ mod tests {
         // dropped entry is still legitimately wanted — nothing re-requested
         // it only because it was already covered. Folding it back into
         // `requested` is what gives it a path to a real recompile, the same
-        // guard `reset_for_flush_survivor` documents.
+        // guard `publish` applies for a dropped-but-still-wanted entry.
         let counter = AtomicU64::new(5);
         let page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
         let (words, used, entries) = churn_fixture(&[10, 40], &[10, 11, 40, 41]);
@@ -4896,9 +4468,9 @@ mod tests {
         page.mark_analyze_rejected(); // bumps rejected_compiles
         assert_eq!((page.redundant_skipped(), page.redundant_rejected()), (1, 1));
 
-        page.reset_for_flush_survivor();
+        page.reset_to_unclaimed();
         assert_eq!((page.redundant_skipped(), page.redundant_rejected()), (0, 0),
-            "a flush survivor must start a fresh churn epoch");
+            "reset_to_unclaimed must clear churn counters");
         assert_eq!(page.rejected_compiles(), 1,
             "rejected_compiles is lifetime history and must NOT be reset by a flush");
 
@@ -5243,8 +4815,8 @@ mod tests {
         assert!(page.publish(&bits2, 0x1000 as *const (), 0, 1, 0));
         assert_eq!(page.compiles_since_flush(), 2);
 
-        page.reset_for_flush_survivor();
-        assert_eq!(page.compiles_since_flush(), 0, "reset_for_flush_survivor must clear it");
+        page.reset_to_unclaimed();
+        assert_eq!(page.compiles_since_flush(), 0, "reset_to_unclaimed must clear it");
 
         assert!(page.publish(&bits, 0x2000 as *const (), 0, 1, 0));
         assert_eq!(page.compiles_since_flush(), 1);
@@ -5270,16 +4842,7 @@ mod tests {
         assert_eq!(page.rejected_compiles(), 3, "the umbrella total must sum both stage-specific counters");
     }
 
-    #[test]
-    fn rejected_compiles_is_not_cleared_by_reset_for_flush_survivor() {
-        let counter = AtomicU64::new(0);
-        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-        page.mark_analyze_rejected();
-        page.mark_codegen_rejected();
-        page.reset_for_flush_survivor();
-        assert_eq!(page.rejected_compiles(), 2,
-            "rejected_compiles is a lifetime-total churn counter, deliberately preserved across a flush the page survived — same as compile_count");
-    }
+
 
     /// Minimal BusDevice whose gen_ptr always returns the same fixed counter,
     /// standing in for a real RAM/ROM device in these pool-only tests.
@@ -5316,188 +4879,36 @@ mod tests {
     }
 
     #[test]
-    fn mega_flush_preserves_the_mru_page_under_flush_preserved_capacity() {
-        // Preservation is a runtime policy now, defaulting to 0 ("free
-        // everything"); this test is specifically about the preserving
-        // behaviour, so it asks for it rather than relying on the default.
-        let _g = flush_preserved_test_lock();
-        set_flush_preserved(JITV2_FLUSH_PRESERVED_MAX);
-        // Pool capacity 1, well under JITV2_FLUSH_PRESERVED: the one
-        // claimed page ranks 0 in the MRU walk, so it survives the flush
-        // in place (same slot, same pfn) rather than being evicted —
-        // superseding the old bump-allocator behavior this test used to
-        // check ("slots renumber from 0"), which no longer applies now that
-        // MRU-preserved pages stay claimed under their original pfn.
+    fn mega_flush_resets_all_pages_and_frees_all_slots() {
         let dev = FakeDevice(AtomicU64::new(0));
-        let mut jit = Jitv2::new(1);
-        let first = jit.page_for(0, 0, &dev, false).unwrap();
-        jit.mega_flush();
-        let second = jit.page_for(0, 0, &dev, false).unwrap();
-        assert_eq!(first, second, "a preserved page keeps its slot and pfn across a flush");
-        assert!(jit.page_for(1, PAGE_SIZE, &dev, false).is_none(),
-            "pool still fully claimed (by the preserved page) — no free slot for a different pfn");
-    }
-
-    #[test]
-    fn mega_flush_evicts_pages_beyond_flush_preserved_and_frees_their_slots() {
-        // Beyond JITV2_FLUSH_PRESERVED, pages are fully evicted (not
-        // preserved) and their slots return to the free list for a
-        // different pfn to claim — the eviction half of the same flush.
-        let dev = FakeDevice(AtomicU64::new(0));
-        let _g = flush_preserved_test_lock();
-        const PRESERVE: usize = 8;
-        set_flush_preserved(PRESERVE);
-        let capacity = PRESERVE + 4;
-        let mut jit = Jitv2::new(capacity);
-        for i in 0..capacity as Pfn {
+        let mut jit = Jitv2::new(4);
+        for i in 0..4 as Pfn {
             jit.page_for(i, i * PAGE_SIZE, &dev, false).unwrap();
         }
-        // MRU order is claim order here (each page_for call touches its own
-        // fresh slot to the front) — pfn 0 was touched first, so it's now
-        // the LEAST recently used, at MRU rank `capacity - 1`, past the
-        // preserved cutoff; it must be evicted.
-        jit.mega_flush();
-        assert_eq!(jit.pages_used(), PRESERVE, "exactly the preserved count survives");
-        // Its slot is free now — claimable by a brand-new pfn.
-        assert!(jit.page_for(capacity as Pfn, capacity as u32 * PAGE_SIZE, &dev, false).is_some(),
-            "an evicted page's slot must return to the free list");
-    }
+        assert_eq!(jit.pages_used(), 4);
+        assert!(jit.page_for(4, 4 * PAGE_SIZE, &dev, false).is_none());
 
-    /// Walk `Jitv2::mru_head` and assert it's a genuine, finite, acyclic
-    /// list of exactly `expected_len` slots, each backward/forward link
-    /// internally consistent (`prev`/`next` agree with their neighbor) and
-    /// terminating in `mru_tail`. A slot claimed straight off the free list
-    /// without first clearing its leftover `next`/`prev` (the actual bug
-    /// this guards against — `touch_mru`'s unlink-first guard mistaking free-
-    /// list garbage for real MRU-list membership) corrupts this into a
-    /// shorter/cyclic structure that a plain `pages_used()` count can't
-    /// detect on its own — this walks the real links instead.
-    fn assert_mru_list_is_well_formed(jit: &Jitv2, expected_len: usize) {
-        let mut seen = std::collections::HashSet::new();
-        let mut slot = jit.mru_head;
-        let mut prev = NO_SLOT;
-        while slot != NO_SLOT {
-            assert!(seen.insert(slot), "mru list has a cycle at slot {slot} (visited {} so far, expected {expected_len} total)", seen.len());
-            assert_eq!(jit.pages[slot as usize].prev, prev, "slot {slot}'s prev link disagrees with its actual predecessor");
-            prev = slot;
-            slot = jit.pages[slot as usize].next;
+        jit.mega_flush();
+        assert_eq!(jit.pages_used(), 0);
+
+        for i in 0..4 as Pfn {
+            assert!(jit.page_for(i + 10, (i + 10) * PAGE_SIZE, &dev, false).is_some());
         }
-        assert_eq!(prev, jit.mru_tail, "walking from mru_head must end exactly at mru_tail");
-        assert_eq!(seen.len(), expected_len, "mru list length must match the claimed-page count");
+        assert_eq!(jit.pages_used(), 4);
     }
 
     #[test]
-    fn mru_list_stays_well_formed_across_repeated_claim_evict_reclaim_cycles() {
-        // Regression test for the bug this whole feature shipped with: a
-        // slot popped off the free list carries stale next/prev from
-        // whatever it was doing before (either the original Jitv2::new
-        // free-list linking, or a previous eviction) — touch_mru's
-        // unlink-first guard can't tell that apart from genuine existing
-        // MRU-list membership unless page_for explicitly clears both to
-        // NO_SLOT first. Confirmed live: this corrupted mru_head into
-        // pointing at an unrelated free-list index, which a later
-        // mega_flush's `while slot != NO_SLOT` walk turned into an
-        // effectively infinite loop — a real boot hang, not just a stats
-        // miscount. Runs several claim/evict/reclaim cycles (not just one)
-        // since the bug specifically needs a slot to have gone through the
-        // free list at least once before being reclaimed.
+    fn fast_lookup_ptrs_lookup_hit() {
         let dev = FakeDevice(AtomicU64::new(0));
-        // Preservation is a runtime policy defaulting to 0; this test
-        // exercises the preserve-then-evict cycle, so it pins a value.
-        let _g = flush_preserved_test_lock();
-        const PRESERVE: usize = 8;
-        set_flush_preserved(PRESERVE);
-        let capacity = PRESERVE + 8;
-        let mut jit = Jitv2::new(capacity);
-        let mut next_pfn: Pfn = 0;
-        // First cycle fills every slot from empty (capacity claims); every
-        // cycle after that only has as many FREE slots as the previous
-        // flush evicted (`capacity - PRESERVE`) — the
-        // preserved pages are still claimed and don't need reclaiming.
-        let mut claims_this_cycle = capacity;
-        for _cycle in 0..4 {
-            for _ in 0..claims_this_cycle {
-                jit.page_for(next_pfn, next_pfn * PAGE_SIZE, &dev, false).unwrap();
-                next_pfn += 1;
-            }
-            assert_mru_list_is_well_formed(&jit, capacity);
-            jit.mega_flush();
-            assert_mru_list_is_well_formed(&jit, PRESERVE);
-            claims_this_cycle = capacity - PRESERVE;
+        let mut jit = Jitv2::new(4);
+        let slot = jit.page_for(7, 7 * PAGE_SIZE, &dev, false).unwrap();
+        let (pfn_map_ptr, pages_base) = jit.fast_lookup_ptrs();
+        unsafe {
+            let mapped_slot = *pfn_map_ptr.add(7);
+            assert_eq!(mapped_slot, slot);
+            let page = &*pages_base.add(mapped_slot as usize);
+            assert_eq!(page.pfn, 7);
         }
-    }
-
-    #[test]
-    fn mega_flush_clears_func_and_entry_gen_but_keeps_requested_and_denied_for_a_preserved_page() {
-        // This test is about the *preserving* path specifically, and
-        // preservation is now a runtime policy defaulting to 0 ("free
-        // everything"), so ask for it explicitly.
-        let _g = flush_preserved_test_lock();
-        set_flush_preserved(JITV2_FLUSH_PRESERVED_MAX);
-        // A page preserved by the flush (rank < the flushkeep count) must
-        // not keep its previous compiled func/entry_gen/compiled-bitmap —
-        // those describe code that no longer exists — but MUST keep
-        // requested/denied, the whole point of preserving it at all (§ flush
-        // design doc comment on PhysicalCodePage::reset_for_flush_survivor).
-        let dev = FakeDevice(AtomicU64::new(0));
-        let mut jit = Jitv2::new(1);
-        let slot = jit.page_for(0, 0, &dev, false).unwrap() as usize;
-
-        let mut bits = [0u64; BITMAP_WORDS];
-        bits[0] |= 1u64 << 4;
-        assert!(jit.pages[slot].publish(&bits, 0x1000 as *const (), 0, 1, 0));
-        assert!(jit.pages[slot].is_runnable(4));
-        jit.pages[slot].mark_requested(9);
-        jit.pages[slot].denylist(2);
-
-        jit.mega_flush();
-        let new_slot = jit.page_for(0, 0, &dev, false).unwrap() as usize;
-        assert_eq!(slot, new_slot, "a preserved single-capacity pool keeps the same slot");
-        assert!(jit.pages[new_slot].func().is_null(),
-            "a preserved slot's compiled func must not survive a flush");
-        assert!(!jit.pages[new_slot].is_runnable(4),
-            "a preserved slot's compiled bitmap must not survive a flush");
-        assert_eq!(jit.pages[new_slot].entry_gen(), 0,
-            "a preserved slot's entry_gen must start fresh, not inherit the previous occupant's value");
-        let requested = jit.pages[new_slot].snapshot_requested();
-        assert_ne!(requested[9 / 64] & (1u64 << (9 % 64)), 0,
-            "a preserved slot's requested bits must survive the flush");
-        assert!(jit.pages[new_slot].is_denylisted(2),
-            "a preserved slot's denied bits must survive the flush");
-    }
-
-    #[test]
-    fn mega_flush_refolds_compiled_bits_into_requested_for_a_preserved_page() {
-        // Real steady-state bug: an offset that was requested, then
-        // successfully published, has its `requested` bit cleared by
-        // `clear_requested_bits` (comp.rs's handle_request success path) —
-        // by the time a later, unrelated flush preserves this page, its
-        // `requested` bitmap no longer mentions that offset at all, even
-        // though the offset is still live and dispatched purely through the
-        // fast is_runnable path (no fresh mark_requested calls). Without
-        // folding `compiled` into `requested` before wiping `compiled`,
-        // mega_flush's own auto-requeued CompileRequest for this page finds
-        // zero candidates and silently no-ops, leaving the page stuck with
-        // entry_gen=0 and nothing published or denylisted forever.
-        let dev = FakeDevice(AtomicU64::new(0));
-        let mut jit = Jitv2::new(1);
-        let slot = jit.page_for(0, 0, &dev, false).unwrap() as usize;
-
-        jit.pages[slot].mark_requested(4);
-        let mut bits = [0u64; BITMAP_WORDS];
-        bits[0] |= 1u64 << 4;
-        assert!(jit.pages[slot].publish(&bits, 0x1000 as *const (), 0, 1, 0));
-        jit.pages[slot].clear_requested_bits(&bits);
-        let requested_before = jit.pages[slot].snapshot_requested();
-        assert_eq!(requested_before[0] & (1u64 << 4), 0,
-            "sanity: a published offset's requested bit is cleared post-publish, same as the real dispatch path");
-
-        jit.mega_flush();
-        let new_slot = jit.page_for(0, 0, &dev, false).unwrap() as usize;
-        let requested_after = jit.pages[new_slot].snapshot_requested();
-        assert_ne!(requested_after[0] & (1u64 << 4), 0,
-            "a preserved slot's previously-compiled offset must be re-marked requested across a flush, \
-             or mega_flush's own auto-requeue for this page finds no candidates and the page never recompiles");
     }
 
     #[test]
@@ -5835,7 +5246,7 @@ mod tests {
 
     #[test]
     fn compile_queue_send_drops_when_full() {
-        let mut q = CompileQueue::new();
+        let q = CompileQueue::new();
         // Don't start the worker: nothing drains, so capacity fills exactly.
         let mut page = PhysicalCodePage::new(0, std::ptr::null());
         let stats = JitStats::default();

@@ -2143,6 +2143,7 @@ impl Codegen {
         }
         builder.seal_block(exit_block);
         builder.seal_block(exception_call_block);
+        builder.seal_block(abs_exit_block);
         builder.finalize(self.module.target_config());
 
         // Anonymous, not named: this module never looks a compiled region
@@ -9933,6 +9934,7 @@ mod tests {
             emit_absolute_pc_exit_block_body(&mut builder, abs_exit_core_ptr, abs_exit_target);
 
             builder.seal_block(exception_call_block);
+            builder.seal_block(abs_exit_block);
 
             builder.finalize(codegen.module.target_config());
         }
