@@ -3591,7 +3591,52 @@ mod new_impl {
 /// `requested`/`denied` bitmaps (and pfn/gen/hash entry) intact, to be
 /// recompiled immediately rather than relearned from scratch — see
 /// `Jitv2::mega_flush`'s doc comment for the full churn-reduction rationale.
-const JITV2_FLUSH_PRESERVED: usize = 1024;
+///
+/// **Default 0: preserve nothing, free every page.** This was 1024 (the whole
+/// pool), which made a flush a no-op for the pool and kept every surviving
+/// page's accumulated entry-point set alive across it.
+///
+/// Why that is suspect: `reset_for_flush_survivor` folds `compiled` back into
+/// `requested`, so every entry offset a page ever had gets re-requested after
+/// the flush. A physical page reused by a *different* program then inherits
+/// the previous occupant's entry points and compiles a function with entries
+/// for code that no longer exists there. Measured on a real corpus page: **98
+/// entry points for 329 walked instructions** — one entry per 3.4
+/// instructions, which does not look like real control flow. Corpus-wide the
+/// median is 43 entry points per page and the maximum 222.
+///
+/// That costs twice over: a bigger compiled function, and a deeper
+/// entry-dispatch binary search (`(pc & 0xfff) >> 2` compared down a ladder,
+/// ~6-8 levels at these counts) paid on *every* external entry into the page.
+///
+/// Runtime-settable via `j2 flushkeep <n>` so the two policies can be
+/// benchmarked against each other without a rebuild. The old behaviour is
+/// `j2 flushkeep 1024`.
+static JITV2_FLUSH_PRESERVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Serializes the tests that force [`JITV2_FLUSH_PRESERVED`] to a specific
+/// value — it is a process-wide global, so two such tests running
+/// concurrently would stomp each other.
+#[cfg(test)]
+pub fn flush_preserved_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hard ceiling for [`JITV2_FLUSH_PRESERVED`] — the whole pool.
+pub const JITV2_FLUSH_PRESERVED_MAX: usize = 4096;
+
+/// Set how many MRU pages survive a flush with their bitmaps intact.
+/// Clamped to `0..=JITV2_FLUSH_PRESERVED_MAX`; takes effect at the next flush.
+pub fn set_flush_preserved(n: usize) {
+    JITV2_FLUSH_PRESERVED.store(n.min(JITV2_FLUSH_PRESERVED_MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current flush-preservation count (see [`JITV2_FLUSH_PRESERVED`]).
+pub fn flush_preserved() -> usize {
+    JITV2_FLUSH_PRESERVED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Force-seal trigger for a continuously busy batching worker — see
 /// `worker_loop`'s own comment at its call site. `handle_request_deferred`
@@ -6162,12 +6207,16 @@ impl Jitv2 {
     /// whole operation self-contained now that `Jitv2` owns its own
     /// compile-queue lifecycle independently of `MipsCpu::stop()`/`start()`).
     fn mega_flush(&mut self) -> Vec<CompileRequest> {
-        let mut requests = Vec::with_capacity(JITV2_FLUSH_PRESERVED);
+        // Read once: the knob can change between flushes but must stay fixed
+        // for the duration of one walk, or the surviving prefix and the MRU
+        // list disagree about where the cut was.
+        let preserve = flush_preserved();
+        let mut requests = Vec::with_capacity(preserve);
         let mut slot = self.mru_head;
         let mut rank = 0usize;
         while slot != NO_SLOT {
             let next = self.pages[slot as usize].next; // save before this slot's links get overwritten below
-            if rank < JITV2_FLUSH_PRESERVED {
+            if rank < preserve {
                 let page = &mut self.pages[slot as usize];
                 page.reset_for_flush_survivor();
                 // Every entry here is about to be recompiled from scratch, so
@@ -8576,6 +8625,11 @@ mod tests {
 
     #[test]
     fn mega_flush_preserves_the_mru_page_under_flush_preserved_capacity() {
+        // Preservation is a runtime policy now, defaulting to 0 ("free
+        // everything"); this test is specifically about the preserving
+        // behaviour, so it asks for it rather than relying on the default.
+        let _g = flush_preserved_test_lock();
+        set_flush_preserved(JITV2_FLUSH_PRESERVED_MAX);
         // Pool capacity 1, well under JITV2_FLUSH_PRESERVED: the one
         // claimed page ranks 0 in the MRU walk, so it survives the flush
         // in place (same slot, same pfn) rather than being evicted —
@@ -8598,7 +8652,10 @@ mod tests {
         // preserved) and their slots return to the free list for a
         // different pfn to claim — the eviction half of the same flush.
         let dev = FakeDevice(AtomicU64::new(0));
-        let capacity = JITV2_FLUSH_PRESERVED + 4;
+        let _g = flush_preserved_test_lock();
+        const PRESERVE: usize = 8;
+        set_flush_preserved(PRESERVE);
+        let capacity = PRESERVE + 4;
         let mut jit = Jitv2::new(capacity);
         for i in 0..capacity as Pfn {
             jit.page_for(i, i * PAGE_SIZE, &dev, false).unwrap();
@@ -8608,7 +8665,7 @@ mod tests {
         // the LEAST recently used, at MRU rank `capacity - 1`, past the
         // preserved cutoff; it must be evicted.
         jit.mega_flush();
-        assert_eq!(jit.pages_used(), JITV2_FLUSH_PRESERVED, "exactly the preserved count survives");
+        assert_eq!(jit.pages_used(), PRESERVE, "exactly the preserved count survives");
         // Its slot is free now — claimable by a brand-new pfn.
         assert!(jit.page_for(capacity as Pfn, capacity as u32 * PAGE_SIZE, &dev, false).is_some(),
             "an evicted page's slot must return to the free list");
@@ -8653,12 +8710,17 @@ mod tests {
         // since the bug specifically needs a slot to have gone through the
         // free list at least once before being reclaimed.
         let dev = FakeDevice(AtomicU64::new(0));
-        let capacity = JITV2_FLUSH_PRESERVED + 8;
+        // Preservation is a runtime policy defaulting to 0; this test
+        // exercises the preserve-then-evict cycle, so it pins a value.
+        let _g = flush_preserved_test_lock();
+        const PRESERVE: usize = 8;
+        set_flush_preserved(PRESERVE);
+        let capacity = PRESERVE + 8;
         let mut jit = Jitv2::new(capacity);
         let mut next_pfn: Pfn = 0;
         // First cycle fills every slot from empty (capacity claims); every
         // cycle after that only has as many FREE slots as the previous
-        // flush evicted (`capacity - JITV2_FLUSH_PRESERVED`) — the
+        // flush evicted (`capacity - PRESERVE`) — the
         // preserved pages are still claimed and don't need reclaiming.
         let mut claims_this_cycle = capacity;
         for _cycle in 0..4 {
@@ -8668,14 +8730,19 @@ mod tests {
             }
             assert_mru_list_is_well_formed(&jit, capacity);
             jit.mega_flush();
-            assert_mru_list_is_well_formed(&jit, JITV2_FLUSH_PRESERVED);
-            claims_this_cycle = capacity - JITV2_FLUSH_PRESERVED;
+            assert_mru_list_is_well_formed(&jit, PRESERVE);
+            claims_this_cycle = capacity - PRESERVE;
         }
     }
 
     #[test]
     fn mega_flush_clears_func_and_entry_gen_but_keeps_requested_and_denied_for_a_preserved_page() {
-        // A page preserved by the flush (rank < JITV2_FLUSH_PRESERVED) must
+        // This test is about the *preserving* path specifically, and
+        // preservation is now a runtime policy defaulting to 0 ("free
+        // everything"), so ask for it explicitly.
+        let _g = flush_preserved_test_lock();
+        set_flush_preserved(JITV2_FLUSH_PRESERVED_MAX);
+        // A page preserved by the flush (rank < the flushkeep count) must
         // not keep its previous compiled func/entry_gen/compiled-bitmap —
         // those describe code that no longer exists — but MUST keep
         // requested/denied, the whole point of preserving it at all (§ flush

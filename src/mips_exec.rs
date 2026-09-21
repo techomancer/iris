@@ -11155,7 +11155,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 flushkeep [N] (MRU pages keeping their entry-point bitmaps across a flush; 0 = relearn all) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -12208,7 +12208,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             }
             #[cfg(feature = "jitv2")]
             "j2" => {
-                if actual_args.is_empty() { return Err("Usage: j2 <analyze <addr>|pcp [addr]|status|inline|dispatch|fallback|pagewb|instrs|threads|opt|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string()); }
+                // Kept in sync with the `("j2", ...)` entry in the command
+                // help table above — this is the bare-`j2` usage line and is
+                // a separate, hand-maintained string, so a new subcommand has
+                // to be added in BOTH places or it stays undiscoverable from
+                // one of them (`intrun`/`flushkeep`/`corpus`/`dumppcp` were
+                // all missing here after being added only to the help table).
+                if actual_args.is_empty() {
+                    return Err("Usage: j2 <analyze <addr>|pcp [addr]|dumppcp [addr] [path]|corpus [dir]|status|inline|dispatch|fallback|inline_mem|pagewb|instrs|threads|opt [none|speed]|intrun [N]|flushkeep [N]|min-instrs|max-instrs|min-calls|lockstep|lstate [full] [N]|hugepages|flush|clear <paddr>|deny <paddr>|html [path]>".to_string());
+                }
                 // "flush" needs the CPU genuinely stopped, not just this
                 // lock momentarily free — try_lock_executor() succeeding
                 // only proves no one holds the lock *right now* (MipsCpu::step
@@ -12552,6 +12560,41 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                     writeln!(writer, "j2 max-instrs: {}", crate::jitv2::comp::max_instrs_per_compile()).unwrap();
                                 }
                                 Err(_) => return Err("Usage: j2 max-instrs [N]".to_string()),
+                            },
+                        }
+                    }
+                    // `j2wp` only: page-pool flush preservation is that
+                    // impl's `mega_flush` policy.
+                    #[cfg(feature = "j2wp")]
+                    "flushkeep" => {
+                        // How many MRU pages survive a mega_flush with their
+                        // `requested`/`denied` bitmaps intact. Default 0 =
+                        // free everything and relearn entry points from
+                        // scratch.
+                        //
+                        // The old behaviour (1024, the whole pool) folds each
+                        // survivor's `compiled` bits back into `requested`, so
+                        // a physical page later reused by a *different*
+                        // program inherits the previous occupant's entry
+                        // points. That inflates both the compiled function and
+                        // the per-entry dispatch ladder — see
+                        // `JITV2_FLUSH_PRESERVED`'s doc comment for the
+                        // measured entry-point counts.
+                        match actual_args.get(1).copied() {
+                            None => {
+                                writeln!(writer, "j2 flushkeep: {} (max {})",
+                                    crate::jitv2::jitv2::flush_preserved(),
+                                    crate::jitv2::jitv2::JITV2_FLUSH_PRESERVED_MAX).unwrap();
+                            }
+                            Some(n) => match n.parse::<usize>() {
+                                Ok(n) => {
+                                    crate::jitv2::jitv2::set_flush_preserved(n);
+                                    writeln!(writer, "j2 flushkeep: {} (max {}); takes effect at the next flush",
+                                        crate::jitv2::jitv2::flush_preserved(),
+                                        crate::jitv2::jitv2::JITV2_FLUSH_PRESERVED_MAX).unwrap();
+                                }
+                                Err(_) => return Err(format!("Usage: j2 flushkeep [0..{}]",
+                                    crate::jitv2::jitv2::JITV2_FLUSH_PRESERVED_MAX)),
                             },
                         }
                     }
@@ -13721,7 +13764,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             // above, but packing_stats isn't mirrored since
                             // it's purely informational, not something the
                             // hot compile path needs a lock-free read of).
-                            if let Some(codegen) = jit.codegen.lock().as_ref() {
+                            // Bind the guard to a local rather than using the
+                            // `lock()` temporary directly in the `if let`
+                            // scrutinee: the temporary otherwise lives until
+                            // the end of the enclosing block, which outlives
+                            // `jit` now that the stats output is split into
+                            // several cfg-gated blocks.
+                            let codegen_guard = jit.codegen.lock();
+                            if let Some(codegen) = codegen_guard.as_ref() {
                                 let (used, reserved) = codegen.packing_stats();
                                 if reserved > 0 {
                                     let pct = used as f64 * 100.0 / reserved as f64;
