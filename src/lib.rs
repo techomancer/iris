@@ -262,9 +262,7 @@ pub mod rex3_profile;
 pub mod rex3_jit;
 #[cfg(feature = "jitv2")]
 pub mod jitv2;
-#[cfg(all(feature = "jitv2", not(feature = "j2wp")))]
-pub mod jitv2_html_default;
-#[cfg(all(feature = "jitv2", feature = "j2wp"))]
+#[cfg(feature = "jitv2")]
 pub mod jitv2_html_j2wp;
 pub mod jit_feedback;
 pub mod crash_diag;

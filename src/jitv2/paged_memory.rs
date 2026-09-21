@@ -263,14 +263,8 @@ pub struct PublishInfo {
     /// path's one-function-per-entry-point model, consumed by
     /// `PhysicalCodePage::publish(offset_word, ...)`. Unused (left `0`) by
     /// the `j2wp` path, which uses `new_entries` instead.
-    #[cfg(not(feature = "j2wp"))]
-    pub offset: usize,
-    /// §13.4: every entry offset this compile covers, not a single `offset`
-    /// — a `j2wp` compile can publish coverage for several entry points at
-    /// once (§13.2/§13.3's coalescing). Consumed by
-    /// `PhysicalCodePage::publish(new_entries, ...)`. Unused (left zeroed)
-    /// by the default path, which uses `offset` instead.
-    #[cfg(feature = "j2wp")]
+    /// Every entry offset this compile covers. Consumed by
+    /// `PhysicalCodePage::publish(new_entries, ...)`.
     pub new_entries: [u64; crate::jitv2::BITMAP_WORDS],
     pub gen_snap: u64,
     pub instr_count: usize,
@@ -296,9 +290,6 @@ impl PublishInfo {
     pub(crate) fn blank() -> Self {
         Self {
             page: std::ptr::null_mut(),
-            #[cfg(not(feature = "j2wp"))]
-            offset: 0,
-            #[cfg(feature = "j2wp")]
             new_entries: [0u64; crate::jitv2::BITMAP_WORDS],
             gen_snap: 0,
             instr_count: 0,

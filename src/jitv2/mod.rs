@@ -15,10 +15,8 @@ pub mod paged_memory;
 pub mod pcp_dump;
 pub mod equiv_test;
 
-#[cfg(not(feature = "j2wp"))]
-pub use jitv2::JitEntry;
 pub use jitv2::{
-    CompileQueue, CompileRequest, JitFn, JitStats, Jitv2, PageSlot, Pfn, PhysicalCodePage,
+    CodeSizeBucket, CompileQueue, CompileRequest, JitFn, JitStats, Jitv2, PageSlot, Pfn, PhysicalCodePage,
     ARENA_RESERVE_SIZE, BITMAP_WORDS, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES, COMPILE_QUEUE_CAPACITY,
     ENTRIES_PER_PAGE, JITV2_INITIAL_PAGE_CAPACITY, PAGE_SIZE,
     min_calls_before_compile, set_min_calls_before_compile,
@@ -26,11 +24,6 @@ pub use jitv2::{
 pub use paged_memory::{PagedArenaMemoryProvider, PagedArenaState};
 #[cfg(feature = "developer")]
 pub use jitv2::{BatchFlushReason, RejectReason, REJECT_REASON_COUNT};
-/// Always exported under `j2wp`: the emitted-code-size histogram must be
-/// readable in a production build, because `developer` distorts the very
-/// number it reports (see `PhysicalCodePage::instr_count`'s field doc).
-#[cfg(feature = "j2wp")]
-pub use jitv2::CodeSizeBucket;
 
 /// The jitv2 dirty-page probe — see `rules/jitv2/dirty-cache-page-probe.md`.
 /// Absent under `tcache`, which closes that blind spot by construction.
@@ -199,7 +192,7 @@ mod zz_corpus {
             // The UNION of `requested` and `compiled`, not `requested`
             // alone — same entry set `jitv2_pcp_dump`'s offline walk uses,
             // and for the same reason. `requested` is not a cumulative
-            // record of every entry ever asked for: under `j2wp` a bit is
+            // record of every entry ever asked for: a bit is
             // cleared once a compile covers it, so on a page whose compiles
             // have all landed it reads as *empty* while `compiled` holds the
             // real entry set. Measured on the first 1427-page IRIX corpus:

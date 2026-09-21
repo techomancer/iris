@@ -1,14 +1,11 @@
-//! `j2 html`: complete self-contained implementation for the `j2wp`
-//! whole-page design — data structs (`jitv2_html`), the HTML/JS renderer
+//! `j2 html`: complete self-contained implementation for the whole-page
+//! design — data structs (`jitv2_html`), the HTML/JS renderer
 //! (`render_jitv2_html`), and the page-snapshot collector
 //! (`write_jitv2_html`) that populates a `jitv2_html::Snapshot` from every
 //! claimed `PhysicalCodePage`'s `requested`/`compiled`/`denied` bitmaps and
-//! single per-page compiled function. See `jitv2_html_default.rs` for the
-//! default design's complete, separate counterpart — the two don't share a
-//! collection body (or even the same `Snapshot` shape): §13's one page, one
-//! function, many entry points model runs exactly one `walk_multi_entry`
-//! per page (over every currently-published offset) instead of one walk
-//! per entry the pre-§13 design used.
+//! single per-page compiled function. One page, one function, many entry points:
+//! runs exactly one `walk_multi_entry` per page (over every currently-published
+//! offset).
 
 use std::io::Write;
 use std::sync::atomic::Ordering;

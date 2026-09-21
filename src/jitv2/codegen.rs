@@ -2284,22 +2284,20 @@ impl Codegen {
     /// specifically cannot tolerate a deferred pointer). Thin wrapper around
     /// `compile_region_uncommitted` + an immediate one-function
     /// `finalize_batch` call.
-    /// §13.4 single-entry compatibility wrapper: same signature every
-    /// existing caller (equivalence tests, `jitv2_verify`, this module's own
-    /// unit tests) already uses — takes an `instrs` buffer produced by a
+    /// Single-entry compatibility wrapper: used by test suites
+    /// (equivalence tests, `jitv2_verify`, this module's own
+    /// unit tests) — takes an `instrs` buffer produced by a
     /// plain `Analyzer::walk`/`walk_bounded` call (which knows nothing about
-    /// `is_entry_point` or `has_fpu`, both new §13 concepts) and adapts it
-    /// to `compile_region_uncommitted`'s real multi-entry-capable signature:
+    /// `is_entry_point` or `has_fpu`) and adapts it
+    /// to `compile_region_uncommitted`'s multi-entry-capable signature:
     /// marks `entry_word` as this region's one entry point (mirroring what
     /// `Analyzer::walk_multi_entry` would have done for a real multi-entry
     /// caller) and computes `has_fpu` the same way `walk_multi_entry` does,
-    /// since a plain single-entry `walk` never had a reason to. `j2wp`
+    /// since a plain single-entry `walk` never had a reason to. Whole-page
     /// production code (`comp.rs`'s `handle_request`/`handle_request_deferred`)
     /// does NOT go through this — it calls `walk_multi_entry` directly and
     /// threads its `has_fpu` straight into `compile_region_uncommitted`, no
-    /// re-derivation needed. The default (`not(j2wp)`) path's `comp.rs`
-    /// still uses this directly as its real, single-entry production
-    /// compile call — `page` is passed as null there too (this synchronous
+    /// re-derivation needed. `page` is passed as null here (this synchronous
     /// path finalizes immediately below, so the seal-queue placeholder never
     /// dangles long enough for `j2 seal-queue`'s page stamp to matter).
     pub fn compile_region(

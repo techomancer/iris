@@ -173,15 +173,10 @@ jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-
 # specifically; opt in with --features jitv2_opcodefusion once it's earned
 # more confidence.
 jitv2_opcodefusion = ["jitv2"]
-# jitv2 whole-page compile (§13, rules/jitv2/jit-v2-design.md): one compiled
-# Cranelift function per 4KB physical page with multiple dispatchable entry
-# points, replacing the default one-function-per-entry-point design. Shares
-# the pool/MRU/free-list, analyzer walk primitives, and Cranelift codegen
-# with the default path; forks PhysicalCodePage's layout, page_for, the
-# compile-thread request handlers (comp.rs), and the mips_exec.rs dispatch
-# gate's FR-mode plumbing. Not yet production-ready as of introduction (real
-# boots have hit a core dump) — opt in for testing, default path (this flag
-# off) is what ships. See that doc's §13 for the full design rationale.
+# jitv2 whole-page compile (§13, rules/jitv2/jit-v2-design.md): whole-page
+# compilation is now the standard and only JIT v2 design. Kept as a compatibility
+# alias for `jitv2` so downstream scripts and builds specifying `--features j2wp`
+# continue to work.
 j2wp = ["jitv2"]
 # jitv2 dev tool: temporary in-process lockstep verifier. On every dispatch,
 # classifies the current instruction (alu/branch/load-store/fpu) and, for the
