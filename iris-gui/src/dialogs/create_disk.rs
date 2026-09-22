@@ -1,4 +1,9 @@
-use eframe::egui::{self, Color32, Grid, RichText, Slider, TextEdit};
+#[cfg(not(native_mac))]
+use eframe::egui;
+// The native macOS front-end swaps `egui::Window` for OS windows.
+#[cfg(native_mac)]
+use crate::macos_native::egui;
+use egui::{Color32, Grid, RichText, Slider, TextEdit};
 use std::path::PathBuf;
 
 /// Modal that creates a blank zero-filled disk image for a chosen SCSI ID.
