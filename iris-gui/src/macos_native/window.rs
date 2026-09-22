@@ -12,6 +12,8 @@
 //! Each window is an immediate viewport. It is drawn inside the parent's pass,
 //! so the body can borrow app state the way an `egui::Window` body does. Don't
 //! nest them: showing one from inside another's body is not supported.
+//!
+//! A closed window isn't dropped straight away; see [`end_frame`].
 
 use eframe::egui::{
     self, Context, InnerResponse, Pos2, Ui, Vec2, ViewportBuilder, ViewportClass, ViewportId,
@@ -126,10 +128,18 @@ impl<'open> Window<'open> {
             .with_resizable(resizable)
             .with_maximize_button(resizable)
             .with_minimize_button(false)
-            .with_close_button(open.is_some());
+            .with_close_button(open.is_some())
+            // Explicit, so reopening a window that `end_frame` hid shows it.
+            .with_visible(true);
         if let Some(centre) = place.centre {
             builder = builder.with_position(centre - size / 2.0);
         }
+
+        ctx.data_mut(|d| {
+            d.get_temp_mut_or_default::<Registry>(egui::Id::new(REGISTRY))
+                .shown
+                .push((viewport_id, builder.clone()))
+        });
 
         let mut body = Some(add_contents);
         let mut close_requested = false;
@@ -173,6 +183,54 @@ impl<'open> Window<'open> {
         }
         Some(shown)
     }
+}
+
+const REGISTRY: &str = "iris-native-window-registry";
+
+/// Which windows exist, for [`end_frame`].
+#[derive(Clone, Default)]
+struct Registry {
+    /// Shown by [`Window::show`] during this pass.
+    shown: Vec<(ViewportId, ViewportBuilder)>,
+    /// Every window that existed at the end of the last pass: the shown ones
+    /// plus the hidden ones still waiting to be dropped.
+    alive: Vec<(ViewportId, ViewportBuilder)>,
+    /// Whether the main window was painted in the last pass.
+    root_painted: bool,
+}
+
+/// Call once at the end of every main-window pass, after all windows have
+/// been shown.
+///
+/// Guards against a crash in eframe's glow backend. All windows share one GL
+/// context. While the main window is occluded (fullscreen on another Space,
+/// or minimized), eframe still runs its UI for a visible child window but
+/// skips painting the main window itself. So the child is the last thing drawn
+/// and the context is left attached to the child's view. If the child is
+/// dropped then, its view is freed, the context's view becomes nil, and the
+/// main window's next paint panics in glutin's `is_view_current`.
+///
+/// So a window that stops being shown is kept alive, hidden, until the main
+/// window has been painted since. Only then is it dropped.
+pub fn end_frame(ctx: &Context) {
+    let root_visible = ctx.input(|i| i.viewport().visible()).unwrap_or(true);
+    let mut reg: Registry =
+        ctx.data_mut(|d| std::mem::take(d.get_temp_mut_or_default(egui::Id::new(REGISTRY))));
+
+    let mut alive = std::mem::take(&mut reg.shown);
+    for (id, builder) in reg.alive {
+        if alive.iter().any(|(shown, _)| *shown == id) || reg.root_painted {
+            // Still open, or safe to drop: the main window's paint in the last
+            // pass moved the context back to the main window's view.
+            continue;
+        }
+        let builder = builder.with_visible(false);
+        ctx.show_viewport_immediate(id, builder.clone(), |_, _| {});
+        alive.push((id, builder));
+    }
+    reg.alive = alive;
+    reg.root_painted = root_visible;
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(REGISTRY), reg));
 }
 
 #[cfg(test)]

@@ -43,6 +43,25 @@ code is shared unchanged.
 - A window is centred over the main window each time it opens. If it wasn't
   shown in the previous pass, it counts as reopened.
 
+## A closed window must outlive the main window's next paint
+
+All windows share one GL context, which eframe moves to whichever window it
+paints. While the main window is occluded (fullscreen on another Space, or
+minimized), eframe still runs the main window's UI for a visible child window
+(`is_viewport_or_descendant_visible` in `glow_integration.rs`) but skips
+*painting* the main window. That leaves the context attached to the child's view.
+If the child is dropped then, the view is freed and the context's view becomes
+nil. On the main window's next paint, glutin's CGL `is_view_current` does
+`view().expect("context to have a current view")` and aborts the app.
+
+Repro: open Configuration, fullscreen the main window, go back to the desktop
+Space, close Configuration, then click IRIS in the Dock.
+
+`window::end_frame` (called at the very end of `App::ui`) handles this. A window
+that stops being shown is kept alive, hidden, until the main window has been
+painted in a previous pass, and only then is it dropped. This is an eframe 0.36
+/ glutin 0.32 bug; the guard can go once upstream handles a nil view.
+
 ## Menu bar (menubar.rs)
 
 - An `NSMenuItem` can't hold a closure. Items carry a *tag* that indexes the

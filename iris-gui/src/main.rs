@@ -3805,6 +3805,10 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
+
+        // Native macOS: closed OS windows are dropped only once it's safe.
+        #[cfg(native_mac)]
+        macos_native::end_frame(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

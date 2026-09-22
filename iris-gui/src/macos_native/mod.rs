@@ -59,6 +59,8 @@ impl Default for State {
     }
 }
 
+pub use window::end_frame;
+
 /// Runs in `main` before the event loop starts.
 pub fn before_launch() {
     menubar::disable_automatic_window_tabbing();
