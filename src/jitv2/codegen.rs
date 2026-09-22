@@ -1256,7 +1256,7 @@ impl Codegen {
 
     /// Address of a built helper, or `None` if it was never built or the
     /// toggle is off (in which case callers inline the guard instead).
-    fn mem_helper_addr(&self, helper: MemHelper) -> Option<i64> {
+    fn mem_helper_addr_if_enabled(&self, helper: MemHelper) -> Option<i64> {
         if !mem_helpers_enabled() {
             return None;
         }
@@ -4040,7 +4040,7 @@ fn swizzle_xor(size: MemSize) -> i64 {
 
 impl<'a, 'b> EmitCtx<'a, 'b> {
     /// Address of the shared helper for `helper`, or `None` to inline instead.
-    fn mem_helper_addr(&self, helper: MemHelper) -> Option<i64> {
+    fn mem_helper_addr_if_enabled(&self, helper: MemHelper) -> Option<i64> {
         if !mem_helpers_enabled() {
             return None;
         }
@@ -4340,24 +4340,24 @@ impl MemHelper {
 /// +7% MIPS / +27% DMIPS from *fully inlined* guards, and putting a call back
 /// in may give some of that up. §11's open question is exactly whether the
 /// helper is faster or merely smaller — so this stays a runtime toggle
-/// (`j2 helpers on|off`, effective on the next compile) rather than a
+/// (`j2 memhelpers on|off`, effective on the next compile) rather than a
 /// hardcoded choice.
 static MEM_HELPERS_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-/// One-shot env override so a build can be A/B'd without a monitor command:
-/// `IRIS_MEM_HELPERS=1`.
-fn mem_helpers_env_default() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("IRIS_MEM_HELPERS").is_some())
-}
+static MEM_HELPERS_INIT: std::sync::Once = std::sync::Once::new();
 
 pub fn mem_helpers_enabled() -> bool {
+    MEM_HELPERS_INIT.call_once(|| {
+        if std::env::var_os("IRIS_MEM_HELPERS").is_some() {
+            MEM_HELPERS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     MEM_HELPERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-        || mem_helpers_env_default()
 }
 
 pub fn set_mem_helpers_enabled(on: bool) {
+    // Ensure env default is initialized before overwriting with an explicit setting
+    let _ = mem_helpers_enabled();
     MEM_HELPERS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -6839,6 +6839,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         } else {
             let emit = lookup_cp1_semantics(slot_raw)
                 .expect("slot instruction must have a semantics emitter (checked in compile_region)");
+            emit_cp1_cu1_guard(ctx);
             emit(ctx, fr_mode);
         }
     }
@@ -7185,20 +7186,16 @@ fn emit_cond(ctx: &mut EmitCtx, raw: u32, cond: BranchCond) -> Value {
             ctx.builder.ins().icmp(IntCC::NotEqual, rs_val, rt_val)
         }
         BranchCond::LeZero => {
-            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
-            ctx.builder.ins().icmp(IntCC::SignedLessThanOrEqual, rs_val, zero)
+            ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, rs_val, 0)
         }
         BranchCond::GtZero => {
-            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
-            ctx.builder.ins().icmp(IntCC::SignedGreaterThan, rs_val, zero)
+            ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, rs_val, 0)
         }
         BranchCond::LtZero => {
-            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
-            ctx.builder.ins().icmp(IntCC::SignedLessThan, rs_val, zero)
+            ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, rs_val, 0)
         }
         BranchCond::GeZero => {
-            let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
-            ctx.builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, rs_val, zero)
+            ctx.builder.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, rs_val, 0)
         }
     }
 }
@@ -7511,6 +7508,90 @@ fn emit_fmovcf_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let fs = field_rd(ctx.raw);
     let fd = field_sa(ctx.raw);
     let taken = emit_fmovcf_taken(ctx);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    let value = emit_read_fpr_l(ctx, fs, fr_mode);
+    emit_write_fpr_l(ctx, fd, value, fr_mode);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_fmovz_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let taken = ctx.builder.ins().icmp_imm_s(IntCC::Equal, ft_val, 0);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    let value = emit_read_fpr_w(ctx, fs, fr_mode);
+    emit_write_fpr_w(ctx, fd, value, fr_mode);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_fmovn_s(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let taken = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_val, 0);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    let value = emit_read_fpr_w(ctx, fs, fr_mode);
+    emit_write_fpr_w(ctx, fd, value, fr_mode);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_fmovz_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let taken = ctx.builder.ins().icmp_imm_s(IntCC::Equal, ft_val, 0);
+
+    let write_block = ctx.builder.create_block();
+    let merge_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, write_block, &[], merge_block, &[]);
+
+    ctx.builder.switch_to_block(write_block);
+    ctx.builder.seal_block(write_block);
+    let value = emit_read_fpr_l(ctx, fs, fr_mode);
+    emit_write_fpr_l(ctx, fd, value, fr_mode);
+    ctx.builder.ins().jump(merge_block, &[]);
+
+    ctx.builder.switch_to_block(merge_block);
+    ctx.builder.seal_block(merge_block);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_fmovn_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let fs = field_rd(ctx.raw);
+    let fd = field_sa(ctx.raw);
+    let ft_val = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let taken = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, ft_val, 0);
 
     let write_block = ctx.builder.create_block();
     let merge_block = ctx.builder.create_block();
@@ -8110,6 +8191,17 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
         OP_LDC1 => return Some(emit_ldc1),
         OP_SWC1 => return Some(emit_swc1),
         OP_SDC1 => return Some(emit_sdc1),
+        #[cfg(feature = "mips4")]
+        OP_COP1X => {
+            let funct = raw & 0x3F;
+            return match funct {
+                FUNCT_LWXC1 => Some(emit_lwxc1),
+                FUNCT_LDXC1 => Some(emit_ldxc1),
+                FUNCT_SWXC1 => Some(emit_swxc1),
+                FUNCT_SDXC1 => Some(emit_sdxc1),
+                _ => None,
+            };
+        }
         _ => {}
     }
     if op != OP_COP1 {
@@ -8132,6 +8224,14 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMOVCF => Some(emit_fmovcf_s),
             #[cfg(not(feature = "mips4"))]
             FUNCT_FMOVCF => None,
+            #[cfg(feature = "mips4")]
+            FUNCT_FMOVZ => Some(emit_fmovz_s),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FMOVZ => None,
+            #[cfg(feature = "mips4")]
+            FUNCT_FMOVN => Some(emit_fmovn_s),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FMOVN => None,
             FUNCT_FCVT_D => Some(emit_fcvt_d_s),
             FUNCT_FCVT_W => Some(emit_fcvt_w_s),
             FUNCT_FCVT_L => Some(emit_fcvt_l_s),
@@ -8159,6 +8259,14 @@ fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
             FUNCT_FMOVCF => Some(emit_fmovcf_d),
             #[cfg(not(feature = "mips4"))]
             FUNCT_FMOVCF => None,
+            #[cfg(feature = "mips4")]
+            FUNCT_FMOVZ => Some(emit_fmovz_d),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FMOVZ => None,
+            #[cfg(feature = "mips4")]
+            FUNCT_FMOVN => Some(emit_fmovn_d),
+            #[cfg(not(feature = "mips4"))]
+            FUNCT_FMOVN => None,
             FUNCT_FCVT_S => Some(emit_fcvt_s_d),
             FUNCT_FCVT_W => Some(emit_fcvt_w_d),
             FUNCT_FCVT_L => Some(emit_fcvt_l_d),
@@ -8727,18 +8835,11 @@ fn field_imm16_sext(builder: &mut FunctionBuilder, raw: u32) -> Value {
 /// `DecodedInstr::immi64`'s "imm as u64" convention (imm is already
 /// zero-extended at decode for ANDI/ORI/XORI) — used for bitwise-immediate
 /// ops, which treat imm16 as unsigned.
-fn field_imm16_zext(builder: &mut FunctionBuilder, raw: u32) -> Value {
-    let imm16 = (raw & 0xFFFF) as i64;
-    builder.ins().iconst(ir::types::I64, imm16)
-}
-
 fn emit_addiu(ctx: &mut EmitCtx) {
     // ADDIU rt, rs, imm: rt = sign_extend32(rs[31:0] + sext(imm16)), no trap.
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
     let rs_32 = ctx.builder.ins().ireduce(ir::types::I32, rs_val);
-    let imm_32 = ctx.builder.ins().ireduce(ir::types::I32, imm);
-    let sum_32 = ctx.builder.ins().iadd(rs_32, imm_32);
+    let sum_32 = ctx.builder.ins().iadd_imm_s(rs_32, (ctx.raw & 0xFFFF) as i16 as i64);
     let result = ctx.builder.ins().sextend(ir::types::I64, sum_32);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
@@ -8804,37 +8905,32 @@ fn emit_daddi(ctx: &mut EmitCtx) {
 /// truncate/sign-extend step, unlike `emit_addiu`).
 fn emit_daddiu(ctx: &mut EmitCtx) {
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let result = ctx.builder.ins().iadd(rs_val, imm);
+    let result = ctx.builder.ins().iadd_imm_s(rs_val, (ctx.raw & 0xFFFF) as i16 as i64);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
 fn emit_andi(ctx: &mut EmitCtx) {
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_zext(ctx.builder, ctx.raw);
-    let result = ctx.builder.ins().band(rs_val, imm);
+    let result = ctx.builder.ins().band_imm_s(rs_val, (ctx.raw & 0xFFFF) as i64);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
 fn emit_ori(ctx: &mut EmitCtx) {
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_zext(ctx.builder, ctx.raw);
-    let result = ctx.builder.ins().bor(rs_val, imm);
+    let result = ctx.builder.ins().bor_imm_s(rs_val, (ctx.raw & 0xFFFF) as i64);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
 fn emit_xori(ctx: &mut EmitCtx) {
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_zext(ctx.builder, ctx.raw);
-    let result = ctx.builder.ins().bxor(rs_val, imm);
+    let result = ctx.builder.ins().bxor_imm_s(rs_val, (ctx.raw & 0xFFFF) as i64);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
 
 fn emit_slti(ctx: &mut EmitCtx) {
     // SLTI rt, rs, imm: rt = (rs <s sext(imm16)) ? 1 : 0.
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let lt = ctx.builder.ins().icmp(IntCC::SignedLessThan, rs_val, imm);
+    let lt = ctx.builder.ins().icmp_imm_s(IntCC::SignedLessThan, rs_val, (ctx.raw & 0xFFFF) as i16 as i64);
     let result = ctx.builder.ins().uextend(ir::types::I64, lt);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
@@ -8843,8 +8939,7 @@ fn emit_sltiu(ctx: &mut EmitCtx) {
     // SLTIU rt, rs, imm: rt = (rs <u sext(imm16)) ? 1 : 0 — imm is still
     // sign-extended at decode (immu64), only the comparison is unsigned.
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let lt = ctx.builder.ins().icmp(IntCC::UnsignedLessThan, rs_val, imm);
+    let lt = ctx.builder.ins().icmp_imm_s(IntCC::UnsignedLessThan, rs_val, (ctx.raw & 0xFFFF) as i16 as i64);
     let result = ctx.builder.ins().uextend(ir::types::I64, lt);
     emit_write_gpr(ctx, field_rt(ctx.raw), result);
 }
@@ -8994,13 +9089,12 @@ pub enum LoadExtend { Sign, Zero }
 /// `exec_lw`/`exec_lwu`/`exec_ld` — they differ only in these two axes.
 fn emit_load(ctx: &mut EmitCtx, size: MemSize, extend: LoadExtend) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let vaddr = ctx.builder.ins().iadd(base, imm);
+    let vaddr = ctx.builder.ins().iadd_imm_s(base, (ctx.raw & 0xFFFF) as i16 as i64);
 
     // Shared-helper path: one call instead of ~50 inlined IR instructions.
     // The helper does the guard, the load, the extension, and the write-back,
     // so nothing is left here but the address math and the call.
-    if let Some(addr) = ctx.mem_helper_addr(MemHelper::Load { size, extend }) {
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Load { size, extend }) {
         let rt = field_rt(ctx.raw);
         // `rt == 0` gets the scratch slot: the access must still happen, but
         // its result must not land in `gpr[0]`. Chosen here, at compile time,
@@ -9168,8 +9262,7 @@ fn emit_ldr(ctx: &mut EmitCtx) {
 /// `exec_sw`/`exec_sd`'s common shape.
 fn emit_store(ctx: &mut EmitCtx, size: MemSize) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let vaddr = ctx.builder.ins().iadd(base, imm);
+    let vaddr = ctx.builder.ins().iadd_imm_s(base, (ctx.raw & 0xFFFF) as i16 as i64);
 
     // Passed to emit_mem_write unnarrowed — see that function's doc comment
     // on why `write*_fn`'s value parameter is always I64/u64 regardless of
@@ -9179,7 +9272,7 @@ fn emit_store(ctx: &mut EmitCtx, size: MemSize) {
     // Shared-helper path: one call instead of the inlined guard. Unlike a
     // load there is no write-back to place, so the helper's whole job is
     // guard + store, and its status routes exactly as the inline path's does.
-    if let Some(addr) = ctx.mem_helper_addr(MemHelper::Store { size }) {
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Store { size }) {
         let status = emit_mem_helper_call(ctx, addr, vaddr, rt_val);
         emit_check_mem_status(ctx, status);
         return;
@@ -9317,8 +9410,7 @@ fn emit_sdr(ctx: &mut EmitCtx) {
 /// `is_fpu_instruction`'s region-wide FR-mode-guard trigger.
 fn emit_lwc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let vaddr = ctx.builder.ins().iadd(base, imm);
+    let vaddr = ctx.builder.ins().iadd_imm_s(base, (ctx.raw & 0xFFFF) as i16 as i64);
 
     let loaded = emit_mem_read(ctx, vaddr, MemSize::B4);
 
@@ -9330,8 +9422,16 @@ fn emit_lwc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// `MipsExecutor::exec_ldc1`'s `(self.fpr_write_l)(...)`.
 fn emit_ldc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let vaddr = ctx.builder.ins().iadd(base, imm);
+    let vaddr = ctx.builder.ins().iadd_imm_s(base, (ctx.raw & 0xFFFF) as i16 as i64);
+
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Load { size: MemSize::B8, extend: LoadExtend::Zero }) {
+        let ft_reg = field_rt(ctx.raw);
+        let target_reg = if fr_mode == FrMode::Fr0 { ft_reg & !1 } else { ft_reg };
+        let dst_off = ctx.builder.ins().iconst(ir::types::I64, core_offset_of_fpr(target_reg) as i64);
+        let status = emit_mem_helper_call(ctx, addr, vaddr, dst_off);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
 
     let loaded = emit_mem_read(ctx, vaddr, MemSize::B8);
 
@@ -9342,13 +9442,19 @@ fn emit_ldc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// `MipsExecutor::exec_swc1`'s `(self.fpr_read_w)(...)`.
 fn emit_swc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let vaddr = ctx.builder.ins().iadd(base, imm);
+    let vaddr = ctx.builder.ins().iadd_imm_s(base, (ctx.raw & 0xFFFF) as i16 as i64);
 
     let value_32 = emit_read_fpr_w(ctx, field_rt(ctx.raw), fr_mode);
     // emit_mem_write always takes I64 regardless of size — see its own doc
     // comment on why (ABI upper-bits-undefined gotcha, same as emit_store).
     let value_64 = ctx.builder.ins().uextend(ir::types::I64, value_32);
+
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Store { size: MemSize::B4 }) {
+        let status = emit_mem_helper_call(ctx, addr, vaddr, value_64);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
+
     emit_mem_write(ctx, vaddr, value_64, MemSize::B4);
 }
 
@@ -9356,10 +9462,82 @@ fn emit_swc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// `MipsExecutor::exec_sdc1`'s `(self.fpr_read_l)(...)`.
 fn emit_sdc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
     let base = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let vaddr = ctx.builder.ins().iadd(base, imm);
+    let vaddr = ctx.builder.ins().iadd_imm_s(base, (ctx.raw & 0xFFFF) as i16 as i64);
 
     let value_64 = emit_read_fpr_l(ctx, field_rt(ctx.raw), fr_mode);
+
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Store { size: MemSize::B8 }) {
+        let status = emit_mem_helper_call(ctx, addr, vaddr, value_64);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
+
+    emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_lwxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let index = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let vaddr = ctx.builder.ins().iadd(base, index);
+
+    let loaded = emit_mem_read(ctx, vaddr, MemSize::B4);
+    let value_32 = ctx.builder.ins().ireduce(ir::types::I32, loaded);
+    emit_write_fpr_w(ctx, field_sa(ctx.raw), value_32, fr_mode);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_ldxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let index = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let vaddr = ctx.builder.ins().iadd(base, index);
+
+    let fd = field_sa(ctx.raw);
+    let target_reg = if fr_mode == FrMode::Fr0 { fd & !1 } else { fd };
+
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Load { size: MemSize::B8, extend: LoadExtend::Zero }) {
+        let dst_off = ctx.builder.ins().iconst(ir::types::I64, core_offset_of_fpr(target_reg) as i64);
+        let status = emit_mem_helper_call(ctx, addr, vaddr, dst_off);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
+
+    let loaded = emit_mem_read(ctx, vaddr, MemSize::B8);
+    emit_write_fpr_l(ctx, fd, loaded, fr_mode);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_swxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let index = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let vaddr = ctx.builder.ins().iadd(base, index);
+
+    let value_32 = emit_read_fpr_w(ctx, field_rd(ctx.raw), fr_mode);
+    let value_64 = ctx.builder.ins().uextend(ir::types::I64, value_32);
+
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Store { size: MemSize::B4 }) {
+        let status = emit_mem_helper_call(ctx, addr, vaddr, value_64);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
+
+    emit_mem_write(ctx, vaddr, value_64, MemSize::B4);
+}
+
+#[cfg(feature = "mips4")]
+fn emit_sdxc1(ctx: &mut EmitCtx, fr_mode: FrMode) {
+    let base = emit_read_gpr(ctx, field_rs(ctx.raw));
+    let index = emit_read_gpr(ctx, field_rt(ctx.raw));
+    let vaddr = ctx.builder.ins().iadd(base, index);
+
+    let value_64 = emit_read_fpr_l(ctx, field_rd(ctx.raw), fr_mode);
+
+    if let Some(addr) = ctx.mem_helper_addr_if_enabled(MemHelper::Store { size: MemSize::B8 }) {
+        let status = emit_mem_helper_call(ctx, addr, vaddr, value_64);
+        emit_check_mem_status(ctx, status);
+        return;
+    }
+
     emit_mem_write(ctx, vaddr, value_64, MemSize::B8);
 }
 
@@ -9505,8 +9683,7 @@ fn emit_tne(ctx: &mut EmitCtx) { emit_trap_rr(ctx, IntCC::NotEqual); }
 /// here.
 fn emit_trap_ri(ctx: &mut EmitCtx, cc: IntCC) {
     let rs_val = emit_read_gpr(ctx, field_rs(ctx.raw));
-    let imm = field_imm16_sext(ctx.builder, ctx.raw);
-    let taken = ctx.builder.ins().icmp(cc, rs_val, imm);
+    let taken = ctx.builder.ins().icmp_imm_s(cc, rs_val, (ctx.raw & 0xFFFF) as i16 as i64);
 
     let trap_block = ctx.builder.create_block();
     let ok_block = ctx.builder.create_block();

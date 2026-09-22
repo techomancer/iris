@@ -268,7 +268,12 @@ impl InstrKind {
         // which raises Reserved Instruction (see `mips_exec.rs`'s decode
         // table). Keep this arm list in sync with that gate.
         if !cfg!(feature = "mips4")
-            && matches!(self, Movz | Movn | Movci | Pref | Fmovcf_s | Fmovcf_d)
+            && matches!(
+                self,
+                Movz | Movn | Movci | Pref | Fmovcf_s | Fmovcf_d
+                    | Fmovz_s | Fmovn_s | Fmovz_d | Fmovn_d
+                    | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1
+            )
         {
             return false;
         }
@@ -291,15 +296,15 @@ impl InstrKind {
             | Swl | Swr | Sdl | Sdr
             | Pref
             // CP1 (mirrors has_cp1_emitter's OP_LWC1/LDC1/SWC1/SDC1 + OP_COP1 coverage)
-            | Lwc1 | Ldc1 | Swc1 | Sdc1
+            | Lwc1 | Ldc1 | Swc1 | Sdc1 | Lwxc1 | Ldxc1 | Swxc1 | Sdxc1
             | Fadd_s | Fsub_s | Fmul_s | Fdiv_s | Fsqrt_s
-            | Fabs_s | Fneg_s | Fmov_s | Fmovcf_s
+            | Fabs_s | Fneg_s | Fmov_s | Fmovcf_s | Fmovz_s | Fmovn_s
             | Fcvt_d_s | Fcvt_w_s | Fcvt_l_s
             | Fround_w_s | Ftrunc_w_s | Fceil_w_s | Ffloor_w_s
             | Fround_l_s | Ftrunc_l_s | Fceil_l_s | Ffloor_l_s
             | Fcc_s
             | Fadd_d | Fsub_d | Fmul_d | Fdiv_d | Fsqrt_d
-            | Fabs_d | Fneg_d | Fmov_d | Fmovcf_d
+            | Fabs_d | Fneg_d | Fmov_d | Fmovcf_d | Fmovz_d | Fmovn_d
             | Fcvt_s_d | Fcvt_w_d | Fcvt_l_d
             | Fround_w_d | Ftrunc_w_d | Fceil_w_d | Ffloor_w_d
             | Fround_l_d | Ftrunc_l_d | Fceil_l_d | Ffloor_l_d

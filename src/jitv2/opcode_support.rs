@@ -300,6 +300,9 @@ mod tests {
 
     #[test]
     fn cp1_movz_fmt_has_no_emitter_yet() {
+        #[cfg(feature = "mips4")]
+        assert!(has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ)));
+        #[cfg(not(feature = "mips4"))]
         assert!(!has_emitter(r_type(OP_COP1, RS_S, 2, 3, 0, FUNCT_FMOVZ)));
     }
 

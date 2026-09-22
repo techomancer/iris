@@ -227,7 +227,7 @@ mod zz_corpus {
                     weighted += (sz as u128) * (dump.call_count as u128);
                 } else { n_decl += 1; }
                 // Explicit: `f` must not outlive the reset below.
-                drop(f);
+                let _ = f;
                 since_reset += sz;
                 if since_reset >= RESET_AFTER_BYTES {
                     // Safety: no `JitFn` from this `Codegen` is live — none is
@@ -746,12 +746,12 @@ mod zz_constdedup {
                     // one SSA constant, reused
                     "shared"  => b.ins().load(types::I64, MemFlagsData::trusted(), shared, off),
                     // const + explicit iadd_imm, then load at 0  (struct-ish)
-                    "addimm"  => { let p = b.ins().iadd_imm(shared, off as i64);
+                    "addimm"  => { let p = b.ins().iadd_imm_s(shared, off as i64);
                                    b.ins().load(types::I64, MemFlagsData::trusted(), p, 0) }
                     // base arrives in a register (today's design)
                     "param"   => b.ins().load(types::I64, MemFlagsData::trusted(), param, off),
                     // const forced through an opaque use first
-                    "opaque"  => { let p = b.ins().bor_imm(shared, 0);
+                    "opaque"  => { let p = b.ins().bor_imm_s(shared, 0);
                                    b.ins().load(types::I64, MemFlagsData::trusted(), p, off) }
                     // Call through a baked function-pointer constant vs a
                     // pointer loaded from the struct: the case where baking

@@ -1357,6 +1357,9 @@ mod tests {
         // lands this must become Sequential, never get stuck as a phantom
         // branch exclusion.
         let instr = r_type(OP_COP1X, RS_BC1, 2, 3, 4, FUNCT_LWXC1);
+        #[cfg(feature = "mips4")]
+        assert_eq!(classify(instr, 5, 0), Classify::Sequential);
+        #[cfg(not(feature = "mips4"))]
         assert_eq!(classify(instr, 5, 0), Classify::Excluded);
     }
 

@@ -5562,6 +5562,170 @@ mod tests {
         assert_ne!(jit.pc, pc, "CU1-clear must vector via handle_exception, not silently load");
     }
 
+    #[test]
+    fn cp1_instruction_in_delay_slot_with_cu1_clear_traps_with_cause_bd_matching_interpreter() {
+        // A CP1 instruction in a branch's delay slot when CU1 is clear must raise
+        // EXC_CPU with Cause.BD = true, Cause.CE = 1, and EPC = branch_pc.
+        // Previously, emit_slot_semantics lacked emit_cp1_cu1_guard, so the slot
+        // instruction would execute without checking CU1.
+        let pc = 0xFFFF_FFFF_8000_1000u64;
+        let entry_word = ((pc & 0xFFF) / 4) as u16;
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_2000;
+
+        // word0: BEQ r0, r0, +2
+        // word1: LWC1 $f2, 0($r1) in the delay slot
+        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 2);
+        let lwc1 = make_i(crate::mips_isa::OP_LWC1, 1, 2, 0);
+
+        // Seed interpreter and clear CU1
+        let (mut interp_exec, interp_mem) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
+        interp_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1;
+        interp_mem.set_word(0xFFFF_FFFF_8000_2000u64, 0x3F80_0000u32);
+        let phys_base = ((pc as u32) & 0x1FFF_FFFF) as u64;
+        interp_mem.set_word(phys_base, beq);
+        interp_mem.set_word(phys_base + 4, lwc1);
+
+        // Execute branch in interpreter (arms delay slot), then execute the slot
+        interp_exec.exec(beq);
+        interp_exec.exec(lwc1);
+        let interp = CoreSnapshot::capture(&interp_exec.core);
+
+        // Verify interpreter trapped with Cause.BD and Cause.CE=1 and EPC=pc
+        let cause_bd = (interp.cp0_cause & crate::mips_core::CAUSE_BD) != 0;
+        let cause_ce = (interp.cp0_cause >> crate::mips_core::CAUSE_CE_SHIFT) & 3;
+        assert!(cause_bd, "Interpreter must set Cause.BD");
+        assert_eq!(cause_ce, 1, "Interpreter must set Cause.CE to 1 (CP1)");
+        assert_eq!(interp.cp0_epc, pc, "Interpreter EPC must point to the branch");
+
+        // Now compile region in JIT
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        page_words[entry_word as usize] = beq;
+        page_words[(entry_word + 1) as usize] = lwc1;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, 0, 2);
+        assert!(non_empty);
+        let mut instrs_owned = *walked;
+        let mut codegen = Codegen::new();
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, entry_word, true, false)
+            .expect("branch with LWC1 slot must compile");
+
+        let (jit_exec, jit_mem) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
+        let mut jit_exec = Box::new(jit_exec);
+        jit_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1;
+        jit_mem.set_word(0xFFFF_FFFF_8000_2000u64, 0x3F80_0000u32);
+        jit_mem.set_word(phys_base, beq);
+        jit_mem.set_word(phys_base + 4, lwc1);
+        jit_exec.install_jit_hooks();
+
+        unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
+        std::mem::forget(codegen);
+        let jit = CoreSnapshot::capture(&jit_exec.core);
+
+        assert_eq!(jit, interp, "JIT with CU1-clear slot LWC1 must match interpreter exactly");
+    }
+
+    #[test]
+    fn fpu_load_store_with_mem_helpers_matches_interpreter() {
+        let prev = crate::jitv2::codegen::mem_helpers_enabled();
+        crate::jitv2::codegen::set_mem_helpers_enabled(true);
+
+        // LDC1
+        let mut gpr = [0u64; 32];
+        gpr[1] = 0xFFFF_FFFF_8000_2000;
+        let ldc1_instr = make_i(crate::mips_isa::OP_LDC1, 1, 2, 0x18);
+        let bits = (3.75f64).to_bits();
+        let mem_init = &[
+            (0xFFFF_FFFF_8000_2018u64, (bits >> 32) as u32),
+            (0xFFFF_FFFF_8000_201Cu64, bits as u32),
+        ];
+        assert_fpu_matches_interpreter_mem(ldc1_instr, gpr, [0u64; 32], false, mem_init);
+        assert_fpu_matches_interpreter_mem(ldc1_instr, gpr, [0u64; 32], true, mem_init);
+
+        // SWC1
+        let mut fpr = [0u64; 32];
+        fpr[2] = (1.5f32).to_bits() as u64;
+        let swc1_instr = make_i(crate::mips_isa::OP_SWC1, 1, 2, 0x20);
+        assert_fpu_matches_interpreter(swc1_instr, gpr, fpr, false);
+        assert_fpu_matches_interpreter(swc1_instr, gpr, fpr, true);
+
+        // SDC1
+        fpr[2] = (9.125f64).to_bits();
+        let sdc1_instr = make_i(crate::mips_isa::OP_SDC1, 1, 2, 0x28);
+        assert_fpu_matches_interpreter(sdc1_instr, gpr, fpr, false);
+        assert_fpu_matches_interpreter(sdc1_instr, gpr, fpr, true);
+
+        crate::jitv2::codegen::set_mem_helpers_enabled(prev);
+    }
+
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn fmovz_fmovn_matches_interpreter_fr0_and_fr1() {
+        for fr1 in [false, true] {
+            for taken in [false, true] {
+                let mut gpr = [0u64; 32];
+                // ft is the GPR condition register (field_rt)
+                gpr[4] = if taken { 0 } else { 42 };
+
+                let mut fpr = [0u64; 32];
+                fpr[2] = 0x1111_2222_3333_4444; // fs
+                fpr[6] = 0xAAAA_BBBB_CCCC_DDDD; // pre-existing fd
+
+                // FMOVZ.S: fmt=RS_S, rt=4 (GPR), rd=2 (fs), sa=6 (fd), funct=FUNCT_FMOVZ
+                let fmovz_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 4, 2, 6, crate::mips_isa::FUNCT_FMOVZ);
+                assert_fpu_matches_interpreter(fmovz_s, gpr, fpr, fr1);
+
+                // FMOVZ.D: fmt=RS_D
+                let fmovz_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 4, 2, 6, crate::mips_isa::FUNCT_FMOVZ);
+                assert_fpu_matches_interpreter(fmovz_d, gpr, fpr, fr1);
+
+                // FMOVN: condition inverted (taken when GPR != 0)
+                gpr[4] = if taken { 42 } else { 0 };
+                let fmovn_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 4, 2, 6, crate::mips_isa::FUNCT_FMOVN);
+                assert_fpu_matches_interpreter(fmovn_s, gpr, fpr, fr1);
+
+                let fmovn_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 4, 2, 6, crate::mips_isa::FUNCT_FMOVN);
+                assert_fpu_matches_interpreter(fmovn_d, gpr, fpr, fr1);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "mips4")]
+    fn cop1x_indexed_load_store_matches_interpreter() {
+        for fr1 in [false, true] {
+            let mut gpr = [0u64; 32];
+            gpr[1] = 0xFFFF_FFFF_8000_2000; // base (rs)
+            gpr[2] = 0x20;                  // index (rt)
+            // vaddr = 0xFFFF_FFFF_8000_2020
+
+            // LWXC1: OP_COP1X, rs=1, rt=2, rd=0, sa=4 (fd), funct=FUNCT_LWXC1
+            let lwxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 0, 4, crate::mips_isa::FUNCT_LWXC1);
+            let mem_init_w = &[(0xFFFF_FFFF_8000_2020u64, 0x4049_0FDBu32)]; // ~pi f32
+            assert_fpu_matches_interpreter_mem(lwxc1, gpr, [0u64; 32], fr1, mem_init_w);
+
+            // LDXC1: OP_COP1X, rs=1, rt=2, rd=0, sa=4 (fd), funct=FUNCT_LDXC1
+            let ldxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 0, 4, crate::mips_isa::FUNCT_LDXC1);
+            let d_bits = (3.141592653589793f64).to_bits();
+            let mem_init_d = &[
+                (0xFFFF_FFFF_8000_2020u64, (d_bits >> 32) as u32),
+                (0xFFFF_FFFF_8000_2024u64, d_bits as u32),
+            ];
+            assert_fpu_matches_interpreter_mem(ldxc1, gpr, [0u64; 32], fr1, mem_init_d);
+
+            // SWXC1: OP_COP1X, rs=1, rt=2, rd=4 (fs), sa=0, funct=FUNCT_SWXC1
+            let mut fpr = [0u64; 32];
+            fpr[4] = (2.71828f32).to_bits() as u64;
+            let swxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 4, 0, crate::mips_isa::FUNCT_SWXC1);
+            assert_fpu_matches_interpreter(swxc1, gpr, fpr, fr1);
+
+            // SDXC1: OP_COP1X, rs=1, rt=2, rd=4 (fs), sa=0, funct=FUNCT_SDXC1
+            fpr[4] = (2.718281828459045f64).to_bits();
+            let sdxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 4, 0, crate::mips_isa::FUNCT_SDXC1);
+            assert_fpu_matches_interpreter(sdxc1, gpr, fpr, fr1);
+        }
+    }
+
     // ---- CP1: batch F3 conversions ------
 
     #[test]

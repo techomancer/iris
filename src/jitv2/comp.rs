@@ -900,6 +900,8 @@ mod tests {
 
     #[test]
     fn handle_request_publishes_a_compilable_instruction() {
+        #[cfg(not(feature = "tcache"))]
+        let _g = dirty_probe_lock();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1067,6 +1069,8 @@ mod tests {
     /// sticky denylist, and "bus not readable, retry later."
     #[test]
     fn handle_request_clears_scheduled_bit_on_every_outcome() {
+        #[cfg(not(feature = "tcache"))]
+        let _g = dirty_probe_lock();
         let counter = AtomicU64::new(0);
 
         // Outcome 1: publishes successfully.
