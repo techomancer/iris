@@ -539,7 +539,7 @@ impl Machine {
         let rex3_head1: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.heads < 2 {
             None
         } else {
-            let r = Arc::new(Rex3::new(heartbeat, fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
+            let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
@@ -552,11 +552,30 @@ impl Machine {
             Some(r)
         };
 
-        // Indy XZ/Elan preview stub — same GIO gfx slot as Newport, no compositor.
-        let xz: Option<Arc<crate::xz::Xz>> = if guinness && cfg.graphics.board == crate::config::GraphicsBoard::Xz {
-            Some(Arc::new(crate::xz::Xz::new()))
-        } else {
-            None
+        // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
+        // selecting the board is explicit, and the PROM needs it to probe.
+        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics.board {
+            crate::config::GraphicsBoard::Newport => None,
+            board => {
+                use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant};
+                let variant = if board == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
+                let g = Gr2::new(variant, Gr2Stats { heartbeat: heartbeat.clone(), fasttick: fasttick_count.clone() });
+                // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
+                // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
+                // latch the guest clears (see Ioc::write8/int2_write8), so only
+                // the rising edge is driven from here.
+                let line = if guinness { crate::ioc::IocInterrupt::VerticalRetrace } else { crate::ioc::IocInterrupt::GioSgRetrace };
+                if guinness { ioc.set_gen_cntl_retrace_ack(true); }
+                let ioc_r = ioc.clone();
+                // true = vertical blank starts, false = it ends. On Indigo2,
+                // EXTIO SG_STAT_0 is the board's vertical status level (low in
+                // blank); the PROM and the kernel retrace handler poll it.
+                g.set_retrace_callback(Arc::new(move |vblank| {
+                    if vblank { ioc_r.set_interrupt(line, true); }
+                    if !guinness { ioc_r.set_ext_io_level(crate::ioc::ext_io_regs::SG_STAT_0, !vblank); }
+                }));
+                Some(g)
+            }
         };
 
         // Indigo2 IMPACT/MGRAS preview — multi-slot GIO stub.
@@ -622,7 +641,7 @@ impl Machine {
             banks,
             rex3.clone(),
             rex3_head1.clone(),
-            xz.clone(),
+            gr2.clone(),
             mgras.clone(),
             #[cfg(feature = "ultra64")]
             ultra64,
@@ -809,6 +828,7 @@ impl Machine {
         // Machine::start) actually spawns the worker thread that reads it.
         if let Some(rex3) = &phys.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
         if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(gr2) = &phys.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
         if let Some(td) = &phys.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
             if phys.testdev.is_none() {
@@ -878,7 +898,7 @@ impl Machine {
         if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
         if let Some(rex3) = &phys.rex3_head1 { monitor.register_device(rex3.clone()); }
         if let Some(td) = &phys.testdev { monitor.register_device(td.clone()); }
-        if let Some(xz) = &phys.xz { monitor.register_device(xz.clone()); }
+        if let Some(gr2) = &phys.gr2 { monitor.register_device(gr2.clone()); }
         if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
         #[cfg(feature = "ultra64")]
         if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
@@ -995,6 +1015,7 @@ impl Machine {
         self.apply_host_display_resolution();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
+        if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
         #[cfg(feature = "ultra64")]
         if let Some(u64) = &self._phys.ultra64 { u64.start(); }
 
@@ -1082,6 +1103,7 @@ impl Machine {
         self.cpu.stop();
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
+        if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
         self.hpc3.stop();
         self.mc.stop();
         #[cfg(feature = "ultra64")]
@@ -1147,6 +1169,23 @@ impl Machine {
 
     pub fn get_rex3_head1(&self) -> Option<Arc<crate::rex3::Rex3>> {
         self._phys.rex3_head1.clone()
+    }
+
+    /// The graphics board driving the primary display, whichever it is.
+    pub fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
+        if let Some(g) = &self._phys.gr2 {
+            return Some(g.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
+        }
+        self._phys.rex3.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
+    }
+
+    pub fn get_gr2(&self) -> Option<Arc<crate::dev::gr2::Gr2>> {
+        self._phys.gr2.clone()
+    }
+
+    /// The second head's display (Newport dual-head only).
+    pub fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
+        self._phys.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
     }
 
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
@@ -1625,6 +1664,7 @@ impl Machine {
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
+        if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
     }
 
     /// Helper to power-on reset all devices.
@@ -1654,6 +1694,7 @@ impl Machine {
         self.hpc3.power_on();
         if let Some(rex3) = &self._phys.rex3 { rex3.power_on(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.power_on(); }
+        if let Some(gr2) = &self._phys.gr2 { gr2.power_on(); }
         if let Some(td) = &self._phys.testdev { td.power_on(); }
         self.apply_host_display_resolution();
     }
@@ -1728,8 +1769,8 @@ impl Machine {
                 rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
             }
         }
-        if let Some(xz) = &self._phys.xz {
-            snap.write_state("xz", &xz.save_state(), sv).map_err(|e| e.to_string())?;
+        if let Some(gr2) = &self._phys.gr2 {
+            snap.write_state("gr2", &gr2.save_state(), sv).map_err(|e| e.to_string())?;
         }
         if let Some(mgras) = &self._phys.mgras {
             snap.write_state("mgras", &mgras.save_state(), sv).map_err(|e| e.to_string())?;
@@ -1810,6 +1851,7 @@ impl Machine {
         self.mc.stop();
         if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
+        if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
         Ok(())
     }
 
@@ -1990,9 +2032,9 @@ impl Machine {
                 }
             }
         }
-        if let Some(xz) = &self._phys.xz {
-            if let Ok(xz_v) = snap.read_state("xz", schema_version) {
-                xz.load_state(&xz_v)?;
+        if let Some(gr2) = &self._phys.gr2 {
+            if let Ok(gr2_v) = snap.read_state("gr2", schema_version) {
+                gr2.load_state(&gr2_v)?;
             }
         }
         if let Some(mgras) = &self._phys.mgras {

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::machine::Machine;
-use crate::rex3::Rex3;
+use crate::gfx_display::GfxDisplay;
 use crate::z85c30::CiSerialBackend;
 
 /// Set at `start_server`; consulted by `quit` so the socket file is cleaned up
@@ -64,8 +64,8 @@ pub struct CiServer {
     ci_serial: Arc<CiSerialBackend>,
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
-    rex3: Option<Arc<Rex3>>,
-    rex3_head1: Option<Arc<Rex3>>,
+    display: Option<Arc<dyn GfxDisplay>>,
+    display_head1: Option<Arc<dyn GfxDisplay>>,
 }
 
 impl Drop for CiServer {
@@ -114,16 +114,16 @@ pub fn start_server(
     // SAFETY: caller guarantees the pointer is valid.
     let ci_serial = unsafe { (*machine_ptr).get_ci_serial() }
         .ok_or_else(|| "CI mode: CiSerialBackend not installed on Machine".to_string())?;
-    let rex3 = unsafe { (*machine_ptr).get_rex3() };
-    let rex3_head1 = unsafe { (*machine_ptr).get_rex3_head1() };
+    let display = unsafe { (*machine_ptr).get_display() };
+    let display_head1 = unsafe { (*machine_ptr).get_display_head1() };
 
     let path = socket_path.to_string();
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
         machine: unsafe { (*machine_ptr).machine_slot() },
         ci_serial,
-        rex3,
-        rex3_head1,
+        display,
+        display_head1,
     });
 
     *SOCKET_PATH.lock() = Some(path.clone());
@@ -556,14 +556,14 @@ fn cmd_serial_read(server: &CiServer) -> Response {
 
 fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
     let head = args.get("head").and_then(|v| v.as_u64()).unwrap_or(0);
-    let rex3 = match head {
-        0 => server.rex3.as_ref(),
-        1 => server.rex3_head1.as_ref(),
+    let display = match head {
+        0 => server.display.as_ref(),
+        1 => server.display_head1.as_ref(),
         _ => return Response::err("screenshot: head must be 0 or 1"),
     };
-    let Some(rex3) = rex3 else {
+    let Some(display) = display else {
         return Response::err(format!(
-            "screenshot: REX3 head {} not present (headless or graphics.heads < 2?)",
+            "screenshot: display head {} not present (headless or graphics.heads < 2?)",
             head
         ));
     };
@@ -574,7 +574,7 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
     // Snapshot the framebuffer under the screen lock; unlock before the PNG
     // encode so the refresh thread isn't blocked during disk I/O.
     let (width, height, rgba_copy) = {
-        let screen = rex3.screen.lock();
+        let screen = display.screen().lock();
         let w = screen.width;
         let h = screen.height;
         let mut out = Vec::with_capacity(w * h);
@@ -586,13 +586,13 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
         (w, h, out)
     };
 
-    // Encode each u32 0xFFRRGGBB as 3 RGB bytes in the order the PNG encoder
-    // expects.
     let mut rgb = Vec::with_capacity(width * height * 3);
+    // `rgba` is 0xAABBGGRR (R in the low byte), the compositors' format;
+    // see disp::save_screenshot.
     for px in &rgba_copy {
-        rgb.push(((px >> 16) & 0xff) as u8);
-        rgb.push(((px >> 8) & 0xff) as u8);
         rgb.push((px & 0xff) as u8);
+        rgb.push(((px >> 8) & 0xff) as u8);
+        rgb.push(((px >> 16) & 0xff) as u8);
     }
 
     let file = match std::fs::File::create(path) {

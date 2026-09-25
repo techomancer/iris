@@ -33,6 +33,10 @@ pub struct CompositorSource<'a> {
     pub height:           usize,
     /// Heartbeat: only status-bar rows changed — skip full DID upload.
     pub status_bar_only:  bool,
+    /// A finished frame (stride 2048, `0xAABBGGRR`, R in the low byte) from a board that does its
+    /// own composition (GR2). When `Some`, compositors present it verbatim and
+    /// ignore every Newport field above except `width`/`height`.
+    pub prebuilt:         Option<&'a [u32]>,
 }
 
 /// Compositor: maps hardware source state to a composited GL texture.
@@ -84,7 +88,9 @@ impl SwCompositor {
         }
     }
 
-    /// Raw composited pixel buffer (stride 2048, 0xFFBBGGRR). Valid after `compose_pixels()`.
+    /// Raw composited pixel buffer (stride 2048, 0xFFBBGGRR: R in the low byte).
+    /// Valid after `compose_pixels()`. Note: the `r_*`/`b_*` names in
+    /// `compose_pixels` follow Newport's CMAP layout, whose bits 23:16 are blue.
     pub fn pixels(&self) -> &[u32] { &self.buf }
 
     fn ensure_tex(&mut self, gl: &glow::Context) -> glow::Texture {
@@ -116,6 +122,14 @@ impl SwCompositor {
 
         let width  = src.width;
         let height = src.height;
+
+        if let Some(frame) = src.prebuilt {
+            for y in 0..height {
+                let row = y * 2048;
+                self.buf[row..row + width].copy_from_slice(&frame[row..row + width]);
+            }
+            return;
+        }
 
         let cursor_x_reg   = src.vc2_regs[VC2_REG_CURRENT_CURSOR_X   as usize];
         let cursor_y_reg   = src.vc2_regs[VC2_REG_WORKING_CURSOR_Y   as usize];

@@ -430,6 +430,26 @@ impl Compositor for GlCompositor {
         let w = src.width as i32;
         let h = src.height as i32;
 
+        // A board that composites on the CPU (GR2) hands over a finished frame
+        // in SwCompositor's format (0xAABBGGRR, R in the low byte = RGBA bytes).
+        // Put it straight into the output texture so the draw and readback
+        // paths see exactly what the shader would have produced.
+        if let Some(frame) = src.prebuilt {
+            let tex_out = self.tex_out.unwrap();
+            unsafe {
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_out));
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, FB_W);
+                let bytes = std::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 4);
+                gl.tex_sub_image_2d(
+                    glow::TEXTURE_2D, 0, 0, 0, w, h,
+                    glow::RGBA, glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(bytes)),
+                );
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            }
+            return tex_out;
+        }
+
         let program    = self.program.unwrap();
         let tex_rgb    = self.tex_rgb.unwrap();
         let tex_aux    = self.tex_aux.unwrap();

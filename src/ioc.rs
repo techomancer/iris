@@ -354,6 +354,9 @@ struct IocState {
     // Misc Registers
     gc_select: u8,
     gen_cntl: u8,
+    /// Indy with GR2 (Elan/XZ) graphics installed: GEN_CNTL bit 0 low clears
+    /// the vertical-retrace latch. Off for Newport, which acks via REX3 STATUS.
+    gen_cntl_retrace_ack: bool,
     panel: u8,
     read_reg: u8,
     dma_sel: u8,
@@ -458,6 +461,7 @@ impl Ioc {
             ext_io: ext_io_regs::IDLE,
             gc_select: 0,
             gen_cntl: 0,
+            gen_cntl_retrace_ack: false,
             panel: 1, // Power State (Bit 0) = 1 (On)
             read_reg: 0x70, // Ethernet/SCSI Power Good (Bits 6,5,4 = 1)
             dma_sel: 0,
@@ -520,6 +524,20 @@ impl Ioc {
     /// `interrupts` must point into a `MipsCore` that outlives this `Ioc`
     /// (see `IocState.interrupts`'s doc comment) — `MipsCpu::interrupts_ptr()`
     /// is the intended source.
+    /// Drive level-type `HPC3_EXT_IO` status bits (`ext_io_regs::SG_STAT_0`
+    /// etc.) from a GIO board. `high = true` sets the bits, `false` clears
+    /// them. GR2 holds SG_STAT_0 low during vertical blank; the PROM waits on
+    /// that edge before touching the DACs.
+    pub fn set_ext_io_level(&self, mask: u16, high: bool) {
+        let mut state = self.state.lock();
+        if high { state.ext_io |= mask; } else { state.ext_io &= !mask; }
+    }
+
+    /// Enable the Indy GR2 retrace acknowledge through GEN_CNTL bit 0.
+    pub fn set_gen_cntl_retrace_ack(&self, on: bool) {
+        self.state.lock().gen_cntl_retrace_ack = on;
+    }
+
     pub fn set_interrupts(&self, interrupts: *const AtomicU64) {
         self.state.lock().interrupts = Some(interrupts);
     }
@@ -873,7 +891,14 @@ impl BusDevice for Ioc {
             }
 
             IOC_GC_SELECT => state.gc_select = val,
-            IOC_GEN_CNTL => state.gen_cntl = val,
+            IOC_GEN_CNTL => {
+                // Indy with Elan/XZ graphics: pulsing bit 0 low clears the
+                // vertical-retrace latch (PROM gr2_init.c, is_indyelan()).
+                if state.gen_cntl_retrace_ack && val & 1 == 0 {
+                    state.l1_stat &= !l1_regs::VERTICAL_RETRACE;
+                }
+                state.gen_cntl = val;
+            }
             IOC_PANEL => {
                 // Bits 6, 4, 1 are W1C (Write 1 to Clear)
                 let mut current = state.panel;
@@ -1027,6 +1052,10 @@ impl Ioc {
                 if val & (pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N)
                     != (pcon_regs::CLR_SG_RETRACE_N | pcon_regs::CLR_S0_RETRACE_N) {
                     state.l1_stat &= !l1_regs::VERTICAL_RETRACE;
+                    // Also release the per-slot EXTIO retrace bits (active-low),
+                    // which GR2 raises via GioSgRetrace/GioS0Retrace.
+                    if val & pcon_regs::CLR_SG_RETRACE_N == 0 { state.ext_io |= ext_io_regs::SG_RETRACE; }
+                    if val & pcon_regs::CLR_S0_RETRACE_N == 0 { state.ext_io |= ext_io_regs::S0_RETRACE; }
                 }
                 state.port_config = val;
             }

@@ -202,6 +202,12 @@ pub struct VdmaJob {
     pub xlate: bool,
     /// Memory addr, stride, line width, byte count and GIO addr all 4-byte aligned.
     pub word_aligned: bool,
+    /// Target GIO slot is 32 bits wide (its `GIO64_ARB` *_SIZE_64 bit is
+    /// clear), e.g. GR2. Set by the worker after latching; routes the whole
+    /// transfer to [`dma_gio32`](MemoryController::dma_gio32).
+    pub gio32: bool,
+    /// Port address for 32-bit transfers (4-byte granular).
+    pub gio_addr32: u32,
 }
 
 impl VdmaJob {
@@ -234,6 +240,8 @@ impl VdmaJob {
             word_aligned: (mem_vaddr & 3 == 0) && (stride & 3 == 0)
                 && (line_width & 3 == 0) && (byte_count & 3 == 0)
                 && (gio_addr & 3 == 0),
+            gio32: false,
+            gio_addr32: state.gio_adr & !3u32,
         }
     }
 
@@ -472,7 +480,9 @@ impl MemoryController {
         // the first thing worth knowing about a corrupted readback.
         if self.vdma_debug_enabled() {
             if let Some(f) = self.vdma_log().lock().as_mut() {
-                let path = if job.word_aligned && job.fill && job.to_host && !job.xlate {
+                let path = if job.gio32 {
+                    "GIO32 word"
+                } else if job.word_aligned && job.fill && job.to_host && !job.xlate {
                     "FILL"
                 } else if job.qword_flat() && !job.fill && !job.to_host {
                     "MEM->GIO qword"
@@ -494,7 +504,11 @@ impl MemoryController {
             }
         }
 
-        if job.word_aligned && job.fill && job.to_host && !job.xlate {
+        if job.gio32 {
+            dlog_dev!(LogModule::Mc, "MC: DMA using GIO32 PATH (gio={:#010x} to_host={} xlate={})",
+                job.gio_addr32, job.to_host, job.xlate);
+            self.dma_gio32(phys, job)
+        } else if job.word_aligned && job.fill && job.to_host && !job.xlate {
             dlog_dev!(LogModule::Mc, "MC: DMA using FILL FAST PATH (stride={})", job.stride);
             self.dma_fill_phys(phys, job)
         } else if job.qword_flat() && !job.fill && !job.to_host {
@@ -1051,6 +1065,83 @@ impl MemoryController {
         VdmaResult { mem_vaddr, exc }
     }
 
+    /// 32-bit GIO slot (GR2): the same line/zoom/stride nest as the generic
+    /// engine, but the GIO side moves one 32-bit word per bus transaction,
+    /// issued as a single register access at the port address. Bytes are
+    /// packed MSB-first, as on the big-endian bus; a short tail (<4 bytes)
+    /// goes out left-justified in the word.
+    fn dma_gio32(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
+        let mut mem_vaddr = job.mem_vaddr;
+        let mut exc = false;
+        let step = |v: u32| if job.dir_up { v.wrapping_add(1) } else { v.wrapping_sub(1) };
+        let mut zoom_count = job.zoom_count;
+        let mut byte_count = job.byte_count;
+
+        'dma: for _line in 0..job.line_count {
+            while zoom_count > 0 {
+                zoom_count -= 1;
+                while byte_count > 0 {
+                    let length = byte_count.min(4);
+                    if job.to_host {
+                        let data = loop {
+                            let r = phys.read32(job.gio_addr32);
+                            if r.is_ok() { break r.data; }
+                            if r.status != BUS_BUSY { break 0; }
+                            std::hint::spin_loop();
+                        };
+                        for k in 0..length {
+                            let Some(pa) = self.dma_mem_addr(job, mem_vaddr, true) else { exc = true; break 'dma; };
+                            phys.write8(pa, (data >> (24 - 8 * k)) as u8);
+                            mem_vaddr = step(mem_vaddr);
+                        }
+                    } else {
+                        let mut data = 0u32;
+                        for k in 0..length {
+                            let Some(pa) = self.dma_mem_addr(job, mem_vaddr, false) else { exc = true; break 'dma; };
+                            let b = phys.read8(pa);
+                            data |= (if b.is_ok() { b.data as u32 } else { 0 }) << (24 - 8 * k);
+                            mem_vaddr = step(mem_vaddr);
+                        }
+                        while phys.write32(job.gio_addr32, data) == BUS_BUSY {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    byte_count -= length;
+                }
+                byte_count = job.line_width;
+                if zoom_count > 0 {
+                    mem_vaddr = if job.dir_up { mem_vaddr.wrapping_sub(job.line_width) }
+                                else { mem_vaddr.wrapping_add(job.line_width) };
+                }
+            }
+            zoom_count = job.line_zoom;
+            mem_vaddr = (mem_vaddr as i32).wrapping_add(job.stride) as u32;
+        }
+        VdmaResult { mem_vaddr, exc }
+    }
+
+    /// Memory-side address for one byte: translated or identity.
+    #[inline]
+    fn dma_mem_addr(&self, job: &VdmaJob, vaddr: u32, writing: bool) -> Option<u32> {
+        if job.xlate { self.translate_addr(vaddr, writing) } else { Some(vaddr) }
+    }
+
+    /// True when the GIO slot holding `addr` is programmed 32 bits wide in
+    /// GIO64_ARB (its *_SIZE_64 bit clear). Addresses outside the three GIO64
+    /// slots report false: they keep the existing 64-bit behaviour.
+    pub(crate) fn gio_slot_is_32bit(&self, addr: u32) -> bool {
+        const GRX_SIZE_64: u32 = 1 << 1;
+        const EXP0_SIZE_64: u32 = 1 << 2;
+        const EXP1_SIZE_64: u32 = 1 << 3;
+        let bit = match addr {
+            0x1f00_0000..=0x1f3f_ffff => GRX_SIZE_64,
+            0x1f40_0000..=0x1f5f_ffff => EXP0_SIZE_64,
+            0x1f60_0000..=0x1f9f_ffff => EXP1_SIZE_64,
+            _ => return false,
+        };
+        self.gio64_arb() & bit == 0
+    }
+
     /// The MC-DMA thread body: wait for a run signal, latch, dispatch, retire.
     pub(crate) fn dma_worker(&self) {
         let giodma = self.giodma().clone();
@@ -1065,7 +1156,7 @@ impl MemoryController {
 
             state.run |= DMA_RUN_RUN; // ensure set (may already be set by write handler)
 
-            let job = VdmaJob::latch(&state);
+            let mut job = VdmaJob::latch(&state);
 
             let start_time = crate::platform::get_host_ticks();
             dlog_dev!(LogModule::Mc, "MC: DMA latched: line_count={} line_width={:#x} line_zoom={} zoom_count={} byte_count={:#x} stride={} count={:#010x}",
@@ -1085,6 +1176,11 @@ impl MemoryController {
             };
 
             drop(state);
+
+            // Bus width comes from how the OS programmed GIO64_ARB for the
+            // target slot (read after dropping the DMA lock: MC state has its
+            // own lock). Fill mode never touches the GIO side.
+            job.gio32 = !job.fill && self.gio_slot_is_32bit(job.gio_addr32);
 
             if let Some((tlb_hi, tlb_lo)) = tlb_snapshot {
                 self.log_vdma_start(&job, tlb_hi, tlb_lo);
@@ -1109,9 +1205,16 @@ impl MemoryController {
             state.memadr = result.mem_vaddr;
             state.size &= 0x0000ffff; // line_count → 0, line_width preserved
             state.count = 0;          // zoom_count and byte_count → 0
-            if job.ie && !result.exc {
+            // COMPLETE is a status bit (DMA_CAUSE / DMA_RUN bit 3) set on every
+            // successful transfer; VDMA_C_IE only gates the interrupt. IRIX's
+            // polled path (MCdma(.., 0) -> vdma_wait) checks VDMA_R_COMPLETE in
+            // DMA_RUN after RUNNING clears and fails the transfer without it;
+            // the GR2 driver (_Gr2MCDMAtrigger) always polls.
+            if !result.exc {
                 state.cause |= DMA_CAUSE_COMPLETE;
-                self.signal_dma_interrupt();
+                if job.ie {
+                    self.signal_dma_interrupt();
+                }
             }
             state.run_real = false;
             state.run |= state.cause & 0xF;
@@ -1207,7 +1310,7 @@ mod tests {
             line_count: 1, line_width: 0x40, line_zoom: 1, zoom_count: 1,
             byte_count: 0x40, stride: 0, gio_addr: 0x1f0f_0000, mem_vaddr: 0x1000,
             mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-            ie: false, xlate: false, word_aligned: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
         };
         f(&mut j);
         j
@@ -1330,7 +1433,7 @@ mod zoom_tests {
             line_count: 4, line_width: 0x40, line_zoom: 1, zoom_count: 1,
             byte_count: 0x40, stride: 0x40, gio_addr: 0x1f0f_0000, mem_vaddr: 0x1000,
             mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-            ie: false, xlate: false, word_aligned: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
         };
         assert!(j.qword_flat(), "baseline non-zoomed block should be flat");
 
@@ -1401,7 +1504,7 @@ mod zoom_semantics_tests {
             line_count: 1, line_width: 8, line_zoom: 3, zoom_count: 3,
             byte_count: 8, stride: 0, gio_addr: 0x1f0f_0000, mem_vaddr: 0x100,
             mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-            ie: false, xlate: false, word_aligned: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
         };
         assert!(!job.qword_flat(), "zoomed job must not take the flat path");
 
@@ -1424,7 +1527,7 @@ mod pixmap_tests {
             line_count: 1, line_width: 0x40, line_zoom: 1, zoom_count: 1,
             byte_count: 0x40, stride: 0, gio_addr: 0x1f0f_0000, mem_vaddr: 0x1000,
             mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-            ie: false, xlate: false, word_aligned: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
         }
     }
 
@@ -1656,7 +1759,7 @@ mod rex3_e2e_tests {
                 gio_addr: REX3_BASE | 0x0800 | REX3_HOSTRW0,
                 mem_vaddr: src,
                 mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-                ie: false, xlate: false, word_aligned: true,
+                ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
             };
             assert!(job.qword_flat(), "{w}x{h}: job should take the flat 64-bit path");
 
@@ -1774,7 +1877,7 @@ mod line_bulk_tests_support {
             line_count: 1, line_width: 8, line_zoom: 1, zoom_count: 1,
             byte_count: 8, stride: 0, gio_addr: 0x1f0f_0a30, mem_vaddr: 0x2000,
             mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-            ie: false, xlate: false, word_aligned: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
         }
     }
 
@@ -2049,7 +2152,7 @@ mod line_bulk_chunk_tests {
                 stride: lw as i32 + 8, line_zoom: zoom, zoom_count: zoom,
                 gio_addr: 0x1f0f_0a30, mem_vaddr: 0x2000,
                 mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
-                ie: false, xlate: false, word_aligned: false,
+                ie: false, xlate: false, word_aligned: false, gio32: false, gio_addr32: 0,
             };
             assert!(job.line_bulk_ok(), "{name}: gate rejected the shape");
             let qpl = job.qwords_per_line();
@@ -2153,4 +2256,118 @@ mod ragged_line_regression_tests {
     }
 
     fn gcd(a: u32, b: u32) -> u32 { if b == 0 { a } else { gcd(b, a % b) } }
+}
+
+/// 32-bit GIO slots (GR2): bus width follows GIO64_ARB, and each word is one
+/// register access at the port, MSB-first.
+#[cfg(test)]
+mod gio32_tests {
+    use super::*;
+    use crate::eeprom_93c56::Eeprom93c56;
+    use crate::mem::Memory;
+    use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::Arc;
+
+    const PORT: u32 = 0x1f06_a068; // GR2 HQ2_GEDMA
+
+    struct Bus {
+        mem: Memory,
+        writes: PlMutex<Vec<u32>>,
+        reads: PlMutex<Vec<u32>>,
+    }
+    impl BusDevice for Bus {
+        fn read8(&self, a: u32) -> crate::traits::BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read32(&self, a: u32) -> BusRead32 {
+            if a == PORT { BusRead32::ok(self.reads.lock().remove(0)) } else { self.mem.read32(a) }
+        }
+        fn write32(&self, a: u32, v: u32) -> u32 {
+            if a == PORT { self.writes.lock().push(v); BUS_OK } else { self.mem.write32(a, v) }
+        }
+        fn read64(&self, a: u32) -> BusRead64 { self.mem.read64(a) }
+        fn write64(&self, a: u32, v: u64) -> u32 { self.mem.write64(a, v) }
+    }
+
+    fn setup() -> (Arc<Bus>, MemoryController) {
+        let bus = Arc::new(Bus { mem: Memory::new(4), writes: PlMutex::new(vec![]), reads: PlMutex::new(vec![]) });
+        let mc = MemoryController::new(Arc::new(PlMutex::new(Eeprom93c56::new())), true, [1, 0, 0, 0]);
+        mc.set_phys(bus.clone() as Arc<dyn BusDevice>);
+        (bus, mc)
+    }
+
+    fn job(bytes: u32, to_host: bool) -> VdmaJob {
+        VdmaJob {
+            line_count: 1, line_width: bytes, line_zoom: 1, zoom_count: 1, byte_count: bytes, stride: 0,
+            gio_addr: PORT & !7, mem_vaddr: 0x2000, mode: 0, ctl: 0, to_host, fill: false, dir_up: true,
+            ie: false, xlate: false, word_aligned: false, gio32: true, gio_addr32: PORT,
+        }
+    }
+
+    #[test]
+    fn gio64_arb_selects_bus_width_per_slot() {
+        let (_bus, mc) = setup();
+        // Indy default: only ONE_GIO; the graphics slot is 32 bits wide.
+        assert!(mc.gio_slot_is_32bit(PORT));
+        // Ng1Probe (Newport) sets GRX_SIZE_64 before touching REX3.
+        mc.write32(crate::mc::MC_BASE + 0x84, 0x400 | 0x2);
+        assert!(!mc.gio_slot_is_32bit(PORT));
+        assert!(mc.gio_slot_is_32bit(0x1f40_0000), "EXP0 still 32-bit");
+        assert!(!mc.gio_slot_is_32bit(0x0800_0000), "non-GIO addresses keep 64-bit behaviour");
+    }
+
+    #[test]
+    fn mem_to_gio32_packs_msb_first_with_short_tail() {
+        let (bus, mc) = setup();
+        for i in 0..10u32 {
+            bus.mem.write8(0x2000 + i, 0x10 + i as u8);
+        }
+        let r = mc.dma_dispatch(&job(10, false));
+        assert!(!r.exc);
+        assert_eq!(*bus.writes.lock(), vec![0x1011_1213, 0x1415_1617, 0x1819_0000]);
+        assert_eq!(r.mem_vaddr, 0x200a);
+    }
+
+    /// IRIX's polled VDMA (MCdma(.., 0) -> vdma_wait, used by the GR2 driver)
+    /// waits for RUNNING to clear, then requires VDMA_R_COMPLETE (bit 3) in
+    /// DMA_RUN even though the completion interrupt is disabled.
+    #[test]
+    fn polled_vdma_reports_complete_without_interrupt_enable() {
+        use crate::traits::Device;
+        let (bus, mc) = setup();
+        mc.start();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let reg = |r: u32, v: u32| { mc.write32(crate::mc::MC_BASE + r, v); };
+        for i in 0..8u32 {
+            bus.mem.write8(0x2000 + i, i as u8);
+        }
+        reg(REG_DMA_CTL, 0); // no IE, no XLATE
+        reg(REG_DMA_MEMADR, 0x2000);
+        reg(REG_DMA_MODE, DMA_MODE_DIR); // mem -> gio, ascending
+        reg(REG_DMA_SIZE, (1 << 16) | 8);
+        reg(REG_DMA_STRIDE, 1 << 16);
+        reg(REG_DMA_COUNT, (1 << 16) | 8);
+        reg(REG_DMA_GIO_ADRS, PORT); // starts the transfer
+        let t = std::time::Instant::now();
+        let run = loop {
+            let r = mc.read32(crate::mc::MC_BASE + REG_DMA_RUN).data;
+            if r & 0x40 == 0 {
+                break r;
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(2), "DMA never finished");
+        };
+        assert_ne!(run & 0x08, 0, "VDMA_R_COMPLETE missing: DMA_RUN = {run:#x}");
+        assert_eq!(*bus.writes.lock(), vec![0x0001_0203, 0x0405_0607]);
+        mc.stop();
+    }
+
+    #[test]
+    fn gio32_to_mem_unpacks_msb_first() {
+        let (bus, mc) = setup();
+        *bus.reads.lock() = vec![0xa0a1_a2a3, 0xb0b1_b2b3];
+        let r = mc.dma_dispatch(&job(6, true));
+        assert!(!r.exc);
+        let got: Vec<u8> = (0..6).map(|i| bus.mem.read8(0x2000 + i).data).collect();
+        assert_eq!(got, vec![0xa0, 0xa1, 0xa2, 0xa3, 0xb0, 0xb1]);
+    }
 }

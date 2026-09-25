@@ -384,13 +384,13 @@ fn worker_loop(
                     // Install the capture renderer before the CPU starts
                     // so the very first REX3 frame already lands in the
                     // sink the GUI can read.
-                    if let Some(rex3) = m.get_rex3() {
-                        *rex3.renderer.lock() =
+                    if let Some(display) = m.get_display() {
+                        *display.renderer_slot().lock() =
                             Some(new_capture_renderer(sink_for_machine));
                     }
                     if heads >= 2 {
-                        if let Some(rex3) = m.get_rex3_head1() {
-                            *rex3.renderer.lock() =
+                        if let Some(display) = m.get_display_head1() {
+                            *display.renderer_slot().lock() =
                                 Some(new_capture_renderer(sink_for_head1));
                         }
                     }
@@ -406,7 +406,7 @@ fn worker_loop(
                                 .into_iter().map(|h| (h.network, h.prefix)).collect());
                         *ps2_slot.lock() = Some(m.get_ps2());
                         // Latch REX3's cycle counter for the live MIPS estimate.
-                        cycles = m.get_rex3().map(|r| r.cycles.get());
+                        cycles = m.get_display().map(|d| d.cycles());
                         prev_cycles = cycles.map(|c| c.get()).unwrap_or(0);
                         prev_tick = std::time::Instant::now();
                         machine = Some(m);

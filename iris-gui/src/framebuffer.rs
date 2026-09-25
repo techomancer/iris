@@ -167,6 +167,13 @@ impl Renderer for GlCaptureRenderer {
         if self.rgba.len() < needed {
             self.rgba.resize(needed, 0);
         }
+        if screen.prebuilt {
+            // GR2 hands over a finished frame (stride 2048, RGBA bytes):
+            // no GPU round trip needed.
+            self.last_pixels.copy_from_slice(&screen.fb_rgb[..needed]);
+            pack_sw_frame(&self.sink, &self.last_pixels, width, height, &mut self.seq);
+            return;
+        }
         let src = screen.compositor_source_from(live_fb_rgb, live_fb_aux);
         let gl = &self.headless.gl;
         let _tex = self.compositor.compose(&src, gl);

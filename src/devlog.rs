@@ -47,6 +47,8 @@ pub enum LogModule {
     /// daughtercard chip, `eeprom` command) — the two are separate physical
     /// parts on real hardware, see machine.rs's `eeprom_mc`/`eeprom_hpc3`.
     Nveeprom = 25,
+    /// GR2 (XZ / Extreme) graphics: HQ2, GE7, RE3, VC1, XMAP5, Bt457.
+    Gr2 = 26,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -55,7 +57,7 @@ pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
 impl LogModule {
-    pub const COUNT: usize = 26;
+    pub const COUNT: usize = 27;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -85,6 +87,7 @@ impl LogModule {
             "l1d"    => Some(Self::L1d),
             "l2c"    => Some(Self::L2c),
             "ultra"  => Some(Self::Ultra),
+            "gr2"    => Some(Self::Gr2),
             _        => None,
         }
     }
@@ -117,6 +120,7 @@ impl LogModule {
             Self::L1d    => "l1d",
             Self::L2c    => "l2c",
             Self::Ultra  => "ultra",
+            Self::Gr2    => "gr2",
         }
     }
 
@@ -127,7 +131,7 @@ impl LogModule {
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
-            Self::Nveeprom,
+            Self::Nveeprom, Self::Gr2,
         ]
     }
 
@@ -264,6 +268,7 @@ impl DevLog {
                 ModuleLog::new(), // Ultra
                 ModuleLog::new(), // Scsi1
                 ModuleLog::new(), // Nveeprom
+                ModuleLog::new(), // Gr2
             ],
         }
     }

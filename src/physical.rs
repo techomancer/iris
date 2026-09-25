@@ -16,7 +16,7 @@ use crate::prom::PromPort;
 use crate::mc::MemoryController;
 use crate::hpc3::Hpc3;
 use crate::rex3::Rex3;
-use crate::xz::Xz;
+use crate::dev::gr2::Gr2;
 use crate::mgras::Mgras;
 use crate::vino::Vino;
 #[cfg(feature = "ultra64")]
@@ -254,8 +254,8 @@ pub struct Physical {
     pub rex3: Option<Arc<Rex3>>,
     /// Second Newport head (dual-head Indigo2 / `graphics.heads = 2`).
     pub rex3_head1: Option<Arc<Rex3>>,
-    /// Indy XZ/Elan preview stub (`graphics.board = xz`).
-    pub xz: Option<Arc<Xz>>,
+    /// GR2 graphics (`graphics.board = xz | extreme`), see src/dev/gr2.
+    pub gr2: Option<Arc<Gr2>>,
     /// Indigo2 IMPACT/MGRAS preview stub (`[impact]` section).
     pub mgras: Option<Arc<Mgras>>,
     #[cfg(feature = "ultra64")]
@@ -326,7 +326,7 @@ impl Physical {
         banks: [RamBank; 4],
         rex3: Option<Arc<Rex3>>,
         rex3_head1: Option<Arc<Rex3>>,
-        xz: Option<Arc<Xz>>,
+        gr2: Option<Arc<Gr2>>,
         mgras: Option<Arc<Mgras>>,
         #[cfg(feature = "ultra64")]
         ultra64: Option<Arc<Ultra64>>,
@@ -397,7 +397,7 @@ impl Physical {
             ppmem_bitmap,
             rex3,
             rex3_head1,
-            xz,
+            gr2,
             mgras,
             #[cfg(feature = "ultra64")]
             ultra64,
@@ -432,7 +432,7 @@ impl Physical {
         let rex3_ptr: Option<*const dyn BusDevice> = self.rex3.as_deref().map(|r| r as *const dyn BusDevice);
         let rex3_head1_ptr: Option<*const dyn BusDevice> =
             self.rex3_head1.as_deref().map(|r| r as *const dyn BusDevice);
-        let xz_ptr: Option<*const dyn BusDevice> = self.xz.as_deref().map(|x| x as *const dyn BusDevice);
+        let gr2_ptr: Option<*const dyn BusDevice> = self.gr2.as_deref().map(|g| g as *const dyn BusDevice);
         let mgras_ptr: Option<*const dyn BusDevice> = self.mgras.as_deref().map(|m| m as *const dyn BusDevice);
         #[cfg(feature = "ultra64")]
         let ultra64_ptr: Option<*const dyn BusDevice> = self.ultra64.as_deref().map(|u| u as *const dyn BusDevice);
@@ -492,10 +492,10 @@ impl Physical {
             for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
                 self.device_map[i as usize] = rex3_ptr;
             }
-        } else if let Some(xz_ptr) = xz_ptr {
-            // Indy XZ/Elan preview: same gfx slot, HQ2 register stub in `src/xz.rs`.
+        } else if let Some(gr2_ptr) = gr2_ptr {
+            // GR2 (XZ / Extreme): the whole 4 MB gfx slot; see src/dev/gr2.
             for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
-                self.device_map[i as usize] = xz_ptr;
+                self.device_map[i as usize] = gr2_ptr;
             }
         } else if let Some(mgras_ptr) = mgras_ptr {
             // Indigo2 IMPACT preview: MGRAS stub spans gfx + populated expansion slots.

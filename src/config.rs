@@ -408,15 +408,17 @@ impl MachineProfile {
     }
 }
 
-/// Indy / Indigo2 graphics board family (preview stubs for non-Newport options).
+/// Indy / Indigo2 graphics board in the GIO gfx slot.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphicsBoard {
     /// Newport (REX3) — fully emulated. Default.
     #[default]
     Newport,
-    /// Indy GR3-XZ / Elan (HQ2 command engine) — register stub only (`src/xz.rs`).
+    /// GR2 XZ (2 GE7) — Indy XZ or Indigo2 XZ (`src/dev/gr2`). In bring-up.
     Xz,
+    /// GR2 Extreme (8 GE7) — Indigo2 only (`src/dev/gr2`). In bring-up.
+    Extreme,
 }
 
 /// IMPACT board occupying one GIO64 slot (Indigo2 preview scaffold).
@@ -478,7 +480,7 @@ impl ImpactSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
-    /// Graphics board family. `xz` is Indy-only preview; disables Newport compositor.
+    /// Graphics board: `newport` (default), or GR2 `xz` (Indy/Indigo2) / `extreme` (Indigo2).
     #[serde(default)]
     pub board: GraphicsBoard,
     /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
@@ -1202,17 +1204,21 @@ impl MachineConfig {
                 self.graphics.heads
             ));
         }
-        if self.graphics.board == GraphicsBoard::Xz {
-            if self.machine.profile != MachineProfile::IndyIp24 {
+        if self.graphics.board != GraphicsBoard::Newport {
+            let name = if self.graphics.board == GraphicsBoard::Xz { "xz" } else { "extreme" };
+            if self.graphics.board == GraphicsBoard::Extreme && self.machine.profile != MachineProfile::Indigo2Ip22 {
                 return Err(
-                    "graphics.board \"xz\" is only valid on Indy (machine.profile = indy_ip24)".into(),
+                    "graphics.board \"extreme\" is only valid on Indigo2 (machine.profile = indigo2_ip22)".into(),
                 );
             }
             if self.graphics.heads != 1 {
-                return Err("graphics.board \"xz\" does not support dual-head (graphics.heads must be 1)".into());
+                return Err(format!("graphics.board \"{name}\" does not support dual-head (graphics.heads must be 1)"));
             }
             if !self.graphics.resolution.is_guest() {
                 return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
+            }
+            if self.impact.any_enabled() {
+                return Err(format!("graphics.board \"{name}\" and [impact] both claim the GIO gfx slot"));
             }
         }
         if self.impact.any_enabled() && self.machine.profile != MachineProfile::Indigo2Ip22 {

@@ -10,7 +10,8 @@ use winit::{
 };
 use glow::HasContext;
 use crate::ps2::Ps2Controller;
-use crate::rex3::{Rex3, Renderer};
+use crate::rex3::Renderer;
+use crate::gfx_display::GfxDisplay;
 use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats, STATUS_BAR_HEIGHT};
 use crate::compositor::{Compositor, SwCompositor};
 use crate::gl_compositor::GlCompositor;
@@ -617,7 +618,9 @@ impl Renderer for GlRenderer {
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
-            if need_readback {
+            // A prebuilt frame (GR2) is already final in `screen.rgba`; reading
+            // the GL framebuffer back would only replace it (it came back black).
+            if need_readback && !screen.prebuilt {
                 if let Some(pixels) = self.compositor.read_pixels() {
                     screen.rgba.copy_from_slice(pixels);
                 } else {
@@ -741,7 +744,7 @@ struct MouseDelta {
 /// UI Manager handling Window, OpenGL context, and Input
 pub struct Ui {
     ps2: Arc<Ps2Controller>,
-    rex3: Arc<Rex3>,
+    display: Arc<dyn GfxDisplay>,
     scsi: Arc<Wd33c93a>,
     window: Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -754,7 +757,7 @@ pub struct Ui {
 }
 
 impl Ui {
-    pub fn new(ps2: Arc<Ps2Controller>, rex3: Arc<Rex3>, scsi: Arc<Wd33c93a>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
+    pub fn new(ps2: Arc<Ps2Controller>, display: Arc<dyn GfxDisplay>, scsi: Arc<Wd33c93a>, timer_manager: Arc<TimerManager>, event_loop: &EventLoop<()>, scale: u32, scroll_pixels_per_line: f64, lock_aspect_ratio: bool) -> Self {
         // The Indy's default video mode is 1280×1024; open the window at that
         // size (plus the status bar). The renderer snaps to the real resolution
         // via resize() once the PROM/IRIX programs its actual mode.
@@ -888,14 +891,14 @@ impl Ui {
             current_win_h: 0,
         };
 
-        *rex3.renderer.lock() = Some(Box::new(renderer));
+        *display.renderer_slot().lock() = Some(Box::new(renderer));
 
-        Self { ps2, rex3, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
+        Self { ps2, display, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale: scale, scroll_pixels_per_line, lock_aspect_ratio }
     }
 
     /// Run the UI event loop (blocks the current thread)
     pub fn run(self, event_loop: EventLoop<()>) {
-        let Ui { ps2, rex3, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
+        let Ui { ps2, display, scsi, window, window_size, resize_request, display_res, timer_manager, initial_scale, scroll_pixels_per_line, lock_aspect_ratio } = self;
         let scale = initial_scale;
 
         let last_win_size = {
@@ -920,7 +923,7 @@ impl Ui {
 
         event_loop.set_control_flow(ControlFlow::Wait);
         let mut app = UiApp {
-            ps2, rex3, scsi, window, window_size, resize_request, display_res, mouse_delta,
+            ps2, display, scsi, window, window_size, resize_request, display_res, mouse_delta,
             scale, scroll_pixels_per_line, lock_aspect_ratio,
             mouse_grabbed: false, rctrl_held: false, last_win_size,
         };
@@ -968,7 +971,7 @@ impl Ui {
         }
     }
 
-    fn handle_keyboard(ps2: &Ps2Controller, rex3: &Rex3, scsi: &Arc<Wd33c93a>,
+    fn handle_keyboard(ps2: &Ps2Controller, display: &dyn GfxDisplay, scsi: &Arc<Wd33c93a>,
         resize_request: &Mutex<Option<ResizeRequest>>,
         input: KeyEvent, grabbed: &mut bool, rctrl_held: &mut bool, window: &Window)
     {
@@ -987,7 +990,7 @@ impl Ui {
             }
 
             if keycode == KeyCode::PrintScreen && pressed && !input.repeat && *rctrl_held {
-                rex3.screenshot_pending.store(true, Ordering::Relaxed);
+                display.request_screenshot();
                 return;
             }
 
@@ -1075,7 +1078,7 @@ impl Ui {
 /// `Ui::run`'s event-loop state: `run_app` takes the old closure's captures as a struct.
 struct UiApp {
     ps2:         Arc<Ps2Controller>,
-    rex3:        Arc<Rex3>,
+    display:     Arc<dyn GfxDisplay>,
     scsi:        Arc<Wd33c93a>,
     window:      Arc<Window>,
     window_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -1128,7 +1131,7 @@ impl ApplicationHandler for UiApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                Ui::handle_keyboard(&self.ps2, &self.rex3, &self.scsi, &self.resize_request, event,
+                Ui::handle_keyboard(&self.ps2, &*self.display, &self.scsi, &self.resize_request, event,
                     &mut self.mouse_grabbed, &mut self.rctrl_held, &self.window);
             }
             WindowEvent::MouseInput { state, button, .. } => {

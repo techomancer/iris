@@ -6202,7 +6202,7 @@ fn test_gfifo_push_batch_round_trips_every_word() {
             assert_eq!(addr, REX3_DMA_BATCH_W, "n={n}: first entry must be the token");
             assert_eq!(val, n as u64, "n={n}: token must carry the count");
 
-            let got = fifo.drain_payload(n.min(HOSTRW_BUF_QWORDS), &mut dst);
+            let got = fifo.drain_payload(n.min(HOSTRW_BUF_QWORDS), &mut *dst);
             assert_eq!(got, n, "n={n}: drained {got} of {n} payload words");
             for (i, w) in words.iter().enumerate() {
                 assert_eq!(dst[i], *w, "n={n}: word {i} differs");
@@ -6234,7 +6234,7 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
 
         let (_, va) = fifo.peek().unwrap();
         assert_eq!(va, a.len() as u64);
-        assert_eq!(fifo.drain_payload(a.len().min(HOSTRW_BUF_QWORDS), &mut dst), a.len());
+        assert_eq!(fifo.drain_payload(a.len().min(HOSTRW_BUF_QWORDS), &mut *dst), a.len());
         for (i, w) in a.iter().enumerate() {
             assert_eq!(dst[i], *w, "batch A word {i}");
         }
@@ -6242,7 +6242,7 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
 
         let (_, vb) = fifo.peek().expect("second token must follow");
         assert_eq!(vb, b.len() as u64, "second batch's token must be next");
-        assert_eq!(fifo.drain_payload(b.len().min(HOSTRW_BUF_QWORDS), &mut dst), b.len());
+        assert_eq!(fifo.drain_payload(b.len().min(HOSTRW_BUF_QWORDS), &mut *dst), b.len());
         for (i, w) in b.iter().enumerate() {
             assert_eq!(dst[i], *w, "batch B word {i}");
         }
@@ -6291,7 +6291,7 @@ fn test_gfifo_drain_payload_returns_the_exact_promised_count() {
             std::thread::sleep(std::time::Duration::from_millis(20));
             f2.restore_tail_for_test(1 + N);
         });
-        let got = fifo.drain_payload(N.min(HOSTRW_BUF_QWORDS), &mut dst);
+        let got = fifo.drain_payload(N.min(HOSTRW_BUF_QWORDS), &mut *dst);
         assert_eq!(got, N, "drain must return the full promised count, got {got}");
         for i in 0..N {
             assert_eq!(dst[i], words[i], "word {i} differs");

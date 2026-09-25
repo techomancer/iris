@@ -405,6 +405,9 @@ impl MemoryController {
     /// while raising an interrupt.
     pub(crate) fn ioc(&self) -> Option<Ioc> { self.state.lock().ioc.clone() }
 
+    /// Current GIO64_ARB value (bus widths / arbitration per GIO slot).
+    pub(crate) fn gio64_arb(&self) -> u32 { self.state.lock().regs[(REG_GIO64_ARB / 4) as usize] }
+
     pub(crate) fn dma_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
 
     pub(crate) fn vdma_debug_enabled(&self) -> bool { self.vdma_debug.load(Ordering::Relaxed) }

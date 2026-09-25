@@ -58,6 +58,12 @@ pub struct Rex3Screen {
     pub status_bar_only: bool,
     /// When true, `fb_rgb`/`fb_aux` snapshots were not copied — use live slices from refresh().
     pub fb_borrowed: bool,
+    /// When true, `fb_rgb` already holds a finished frame (stride 2048,
+    /// `0xAABBGGRR` with R in the low byte, the same format `SwCompositor`
+    /// produces) built by a
+    /// board's own compositor (GR2's `gr2comp`). The renderer's compositor
+    /// then presents it as-is instead of decoding Newport state.
+    pub prebuilt: bool,
 }
 
 impl Rex3Screen {
@@ -81,6 +87,7 @@ impl Rex3Screen {
             cursor_x_adjust:  0,
             status_bar_only:  false,
             fb_borrowed:      false,
+            prebuilt:         false,
         }
     }
 
@@ -269,6 +276,7 @@ impl Rex3Screen {
             width:            self.width,
             height:           self.height,
             status_bar_only:  self.status_bar_only,
+            prebuilt:         if self.prebuilt { Some(&self.fb_rgb) } else { None },
         }
     }
 

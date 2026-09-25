@@ -1,4 +1,4 @@
-//! Headless acceptance tests for IP22/IP24 profile wiring, XZ, and IMPACT stubs.
+//! Headless acceptance tests for IP22/IP24 profile wiring, GR2 (XZ/Extreme), and IMPACT stubs.
 //!
 //! These run in `cargo test --lib` without booting the guest. For live boot
 //! checks, point `iris-indigo2-smoke-ci.toml` at a local IRIX root disk (raw or
@@ -17,7 +17,7 @@ mod tests {
     use crate::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
     use crate::mgras::{self, reg as mgras_reg, Mgras, MGRAS_REG_OFF, MGRAS_SLOT_GFX_BASE};
     use crate::traits::{BusDevice, Saveable};
-    use crate::xz::{self, reg as xz_reg, Xz, XZ_REG_BASE};
+    use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant, GR2_BASE};
 
     fn minimal_cfg() -> MachineConfig {
         let mut cfg = MachineConfig::default();
@@ -73,12 +73,20 @@ mod tests {
     }
 
     #[test]
-    fn xz_on_indigo2_rejected() {
+    fn xz_on_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
         cfg.graphics.board = GraphicsBoard::Xz;
+        cfg.validate().expect("XZ board on Indigo2");
+    }
+
+    #[test]
+    fn extreme_on_indy_rejected() {
+        let mut cfg = minimal_cfg();
+        cfg.machine.profile = MachineProfile::IndyIp24;
+        cfg.graphics.board = GraphicsBoard::Extreme;
         let err = cfg.validate().unwrap_err();
-        assert!(err.contains("indy_ip24"), "got: {err}");
+        assert!(err.contains("indigo2_ip22"), "got: {err}");
     }
 
     #[test]
@@ -122,27 +130,58 @@ mod tests {
         assert_eq!(ioc.read32(gc).data, 0x0F, "fullhouse gc_select round-trip");
     }
 
+    fn gr2(variant: Gr2Variant) -> Arc<Gr2> {
+        Gr2::new(variant, Gr2Stats {
+            heartbeat: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            fasttick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// What PROM Gr2Probe / Gr2InitInfo read (GR2.h probe section).
     #[test]
-    fn xz_board_id_probe() {
-        let xz = Xz::new();
-        let id = xz.read32(XZ_REG_BASE + xz_reg::BOARD_ID).data;
-        assert_eq!(id, xz_reg::BOARD_ID_VAL);
-        let rev = xz.read32(XZ_REG_BASE + xz_reg::REVISION).data;
-        assert_eq!(rev, xz_reg::REVISION_VAL);
-        let status = xz.read32(XZ_REG_BASE + xz_reg::STATUS).data;
-        assert_eq!(status, xz_reg::STATUS_RESET_VAL);
+    fn gr2_probe_answers() {
+        for (variant, rev) in [(Gr2Variant::Xz, 4), (Gr2Variant::Extreme, 6)] {
+            let g = gr2(variant);
+            assert_eq!(g.read32(GR2_BASE + 0x6a07c).data, 0xdead_beef, "hq.mystery");
+            let rd0 = g.read32(GR2_BASE + 0x6c000).data;
+            assert_eq!(!rd0 & 0xf, rev, "board rev");
+            let rd1 = g.read32(GR2_BASE + 0x6c004).data;
+            assert_eq!(rd1 & 0x30, 0x30, "24bpp + Z");
+            assert_ne!(!rd1 & 3, 0, "VB rev present");
+            // The kernel reads bdvers with lbu at the word address.
+            assert_eq!(g.read8(GR2_BASE + 0x6c000).data, rd0 as u8);
+            // Config writes must not disturb the ID.
+            g.write32(GR2_BASE + 0x6c000, 0x47);
+            assert_eq!(g.read32(GR2_BASE + 0x6c000).data, rd0);
+        }
+    }
+
+    /// GE count probe: installed windows are RAM, the rest do not read back.
+    #[test]
+    fn gr2_ge_window_probe() {
+        for (variant, ges) in [(Gr2Variant::Xz, 2), (Gr2Variant::Extreme, 8)] {
+            let g = gr2(variant);
+            let mut found = 1;
+            for i in 1..8u32 {
+                let a = GR2_BASE + 0x68000 + i * 0x400;
+                g.write32(a, 0x1f1f_1f1f);
+                g.write32(a + 127 * 4, 0x5b5b_5b5b);
+                if g.read32(a).data == 0x1f1f_1f1f && g.read32(a + 127 * 4).data == 0x5b5b_5b5b {
+                    found = i + 1;
+                }
+            }
+            assert_eq!(found, ges, "{variant:?}");
+        }
     }
 
     #[test]
-    fn xz_fifo_write_tracks_depth() {
-        let xz = Xz::new();
-        assert_eq!(xz.write32(XZ_REG_BASE + xz_reg::FIFO_WRITE, 0x1234_5678), crate::traits::BUS_OK);
-        let saved = xz.save_state();
-        let depth = saved
-            .get("fifo_depth")
-            .and_then(|v| v.as_integer())
-            .expect("fifo_depth in save_state");
-        assert_eq!(depth, 4);
+    fn gr2_save_state_round_trips_shram() {
+        let g = gr2(Gr2Variant::Xz);
+        g.write32(GR2_BASE + 0x7fff * 4, 1);
+        let saved = g.save_state();
+        let h = gr2(Gr2Variant::Xz);
+        h.load_state(&saved).unwrap();
+        assert_eq!(h.read32(GR2_BASE + 0x7fff * 4).data, 1);
     }
 
     #[test]

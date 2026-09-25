@@ -1,0 +1,12 @@
+# GR2 bring-up: emulator-side gotchas
+
+Hardware facts go in `ignore/gr2/*.h`, not here. This note covers how the emulator and its tooling behave.
+
+- **The default config attaches `scsi1.raw` with no overlay.** In this checkout that file is a symlink to `ignore/gr2/HD1_512_I650.img`. A test config without its own `[scsi.1]` boots IRIX from it and writes to it (a crash dump, for example). Always give test configs `[scsi.1] path = ... overlay = true`.
+- **With `ci = true`, the CPU starts paused.** Run `iris-ci --socket tcp:HOST:PORT start` first. The GIO timeouts at `0x1f4f1338` early in boot are the PROM probing for a second Newport head in slot 0; they're harmless.
+- **Headless screenshots work on GR2.** The display thread copies each composed frame into `Rex3Screen.rgba`, so `iris-ci screenshot` needs no renderer.
+- **GR2 presents a finished frame.** `Rex3Screen.prebuilt = true` makes both UI compositors (SW and GL) upload `fb_rgb` verbatim. Newport-specific screen fields are ignored.
+- **Screen pixels are `0xAABBGGRR`, with R in the low byte.** That is RGBA byte order on the little-endian host, and it's what the GL upload, `disp::save_screenshot` and the GUI expect. Newport's CMAP and `expand_*_rgb` also store `B<<16 | G<<8 | R`, which is why `SwCompositor`'s `r_in = >>16` is really blue. GR2's XMAP5 CLUT holds `0x00RRGGBB` internally, and `gr2comp` swaps to screen order only in the final pack. GR2 first emitted `0xFFRRGGBB`: the window showed R/B swapped, and CI screenshots looked right only because `ci.rs` had the opposite swap (fixed).
+- **Retrace needs two signals.** GR2 drives the IOC retrace latch (rising edge only; the guest clears it with PORT_CONFIG or GEN_CNTL) and, on Indigo2, the EXTIO `SG_STAT_0` level. If `SG_STAT_0` never toggles, the IP22 PROM hangs at `0x9fc066ac` with the DACs blanked: a black screen while `gr2` in the monitor shows the microcode loaded.
+- **Monitor command `gr2`** prints microcode state, FIFO levels, VC1/XMAP/DAC setup and the RE3 scissor. It's the quickest check of how far the PROM got.
+- **VDMA COMPLETE must be set even with interrupts disabled.** IRIX's polled VDMA (`MCdma(args, 0)` → `vdma_wait`) waits for `DMA_RUN` RUNNING to clear and then requires `VDMA_R_COMPLETE` (bit 3); without it `MCdma` returns −2. The GR2 kernel's `_Gr2MCDMAtrigger` then fails the pixel-DMA ioctl before it ever polls FIN2, and Xsgi exits (xsetmon's window image was the first to hit this). `VDMA_C_IE` only gates the interrupt. Newport never noticed because its driver uses interrupt-enabled DMA.
