@@ -42,6 +42,7 @@ emulation will be noticeably slow.
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
 | `bundled` | Distributed build: hides the iris.toml import/export items. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
+| `macos-gui` | Native macOS front-end: system menu bar, dialogs in OS windows, status in the window title (see [Native macOS front-end](#native-macos-front-end)). Ignored off macOS |
 | `r5k` | Vestigial. The CPU is a runtime setting (Machine menu / General tab) |
 
 Core features that change how the executor is built pass straight through to
@@ -115,6 +116,34 @@ to fit.
 The control column holds, top to bottom: the drop-down menus, the capture
 button and hint, the configuration editor, and a status footer (run state,
 machine name, MIPS readout, and the **NET** light for the internal network).
+
+### Native macOS front-end
+
+Building with `--features macos-gui` swaps the layout on macOS. The
+default layout above is untouched, and on other platforms the feature does
+nothing.
+
+```
+cargo run -p iris-gui --release --features macos-gui
+```
+
+- The File / Machine / Memory / SCSI / View / Help menus are in the **system
+  menu bar**, and the window holds only the emulator screen (or the welcome
+  panel while stopped). Save and restore state use fixed slots (snap1–4),
+  since a menu has nowhere to type a name. Help → About IRIS lists the build
+  features.
+- **File → Configuration…** (⌘,) opens the configuration editor in a
+  **separate window**. Every dialog is also its own window, so none of them
+  ever covers the picture.
+- The **window title** carries the status footer: machine name, run state,
+  MIPS, networking, on-screen scale, capture state and the latest
+  notification.
+- Extra shortcuts: ⌘R / ⇧⌘R start / stop, ⌘K capture, ⌘F fullscreen, ⌘N new
+  machine, ⌘Q quit (through the same close handling as closing the window, so
+  pending CHD changes are still folded back).
+
+The implementation is in `src/macos_native/`. See
+`rules/gui/macos-gui-front-end.md`.
 
 ### Menus
 
@@ -334,6 +363,11 @@ iris/
         ├── filedialog.rs      where file dialogs open
         ├── macos_sandbox.rs   security-scoped bookmarks (App Store)
         ├── single_instance.rs previous-instance reclaim
+        ├── macos_native/      optional native macOS front-end (`macos-gui`)
+        │   ├── mod.rs         hooks called from main.rs, config/About windows, title
+        │   ├── menus.rs       menu model + action dispatcher
+        │   ├── menubar.rs     AppKit NSMenu glue
+        │   └── window.rs      egui::Window stand-in that opens OS windows
         └── dialogs/
             ├── new_machine.rs Startup "New machine" dialog
             └── create_disk.rs Blank-HDD-image creator

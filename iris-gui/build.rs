@@ -23,4 +23,13 @@ fn main() {
     };
 
     println!("cargo:rustc-env=APP_VERSION={}", full_version);
+
+    // `native_mac`: the `macos-gui` front-end is compiled in. The feature is
+    // a no-op off macOS, so gate on the target here once instead of repeating
+    // `all(target_os = "macos", feature = "macos-gui")` at every use.
+    println!("cargo::rustc-check-cfg=cfg(native_mac)");
+    let macos = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos");
+    if macos && std::env::var_os("CARGO_FEATURE_MACOS_GUI").is_some() {
+        println!("cargo:rustc-cfg=native_mac");
+    }
 }

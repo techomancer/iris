@@ -1,4 +1,9 @@
-use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
+#[cfg(not(native_mac))]
+use eframe::egui;
+// The native macOS front-end swaps `egui::Window` for OS windows.
+#[cfg(native_mac)]
+use crate::macos_native::egui;
+use egui::{Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
 use iris::vc2_timings::NewportResolution;
 

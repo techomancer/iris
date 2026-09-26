@@ -125,6 +125,11 @@ is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **Optional native macOS front-end** (`--features macos-gui`): menus in the
+  system menu bar, the configuration editor and every dialog in their own OS
+  windows, and the run state in the window title, so the main window holds only
+  the display. Off by default and ignored off macOS; the default layout is
+  unchanged. See `rules/gui/macos-gui-front-end.md`.
 - Scaling and resize fixes (`e93c5bb`): the VM screen scale is now the maximum
   draw scale, so a larger window centres the picture instead of stretching it;
   a snap-to-size request made while fullscreen is applied when fullscreen ends.

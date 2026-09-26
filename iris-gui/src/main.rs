@@ -9,6 +9,8 @@ mod dialogs;
 mod framebuffer;
 mod handle;
 mod input;
+#[cfg(native_mac)]
+mod macos_native;
 mod macos_sandbox;
 mod netfix;
 mod netplan;
@@ -23,7 +25,11 @@ use config_ui::{cfg_to_toml, show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
 use ram::{ram_summary, RAM_PRESETS};
+#[cfg(not(native_mac))]
 use eframe::egui;
+// The native macOS front-end swaps `egui::Window` for OS windows.
+#[cfg(native_mac)]
+use macos_native::egui;
 use egui::{Color32, RichText, ViewportCommand};
 use handle::{Cmd, EmulatorHandle, Evt, NetState};
 use iris::config::MachineConfig;
@@ -133,6 +139,8 @@ fn main() -> eframe::Result<()> {
     // copy that would otherwise keep the monitor/serial ports bound) and claim
     // the single-instance lock for ourselves.
     single_instance::acquire();
+    #[cfg(native_mac)]
+    macos_native::before_launch();
     let prefs = GuiSettings::load();
     // Re-acquire macOS sandbox access to previously user-selected files (disk
     // images, PROM, ISOs, …) before any machine can open them. No-op elsewhere.
@@ -335,6 +343,9 @@ struct App {
     /// (reset to None on Stop). Used by the running status footer to show "net:
     /// PCAP → eth0" or "net: NAT" so the user can verify which backend is active.
     launched_net: Option<(iris::config::NetMode, Option<String>)>,
+    /// State of the native macOS front-end (menu bar, window title).
+    #[cfg(native_mac)]
+    native: macos_native::State,
 }
 
 /// Progress of the exit-time "Synchronizing disks…" step.
@@ -451,6 +462,7 @@ struct ChdGrantModal {
     disks: Vec<ChdNeedsGrant>,
 }
 
+#[cfg_attr(native_mac, allow(dead_code))]
 impl App {
     fn new(mut prefs: GuiSettings) -> Self {
         // Resolution order on startup:
@@ -556,6 +568,8 @@ impl App {
             cow_discard_confirm: None,
             pcap_ifaces: None,
             launched_net: None,
+            #[cfg(native_mac)]
+            native: Default::default(),
         }
     }
 
@@ -3274,6 +3288,7 @@ impl eframe::App for App {
 
         // The control column lives on the left, always visible (even in
         // fullscreen) — the VM screen sits to its right and never hides it.
+        #[cfg(not(native_mac))]
         egui::Panel::left("control_panel")
             .resizable(false)
             .exact_size(186.0)
@@ -3286,11 +3301,16 @@ impl eframe::App for App {
         //  - IDLE: it takes the WHOLE central area instead (below), hiding the
         //    welcome/info screen — no cramped split when there's nothing to
         //    watch. The toolbar's "Edit config…" toggle drives both.
+        #[cfg(not(native_mac))]
         let mut config_in_side_panel = self.show_config_editor && self.emu.is_running();
+        #[cfg(not(native_mac))]
         egui::Panel::right("config_editor")
             .resizable(true)
             .default_size(420.0)
             .show_collapsible(ui, &mut config_in_side_panel, |ui| self.config_editor_panel(ui));
+        // Native macOS: menu bar and window title in place of the side panels.
+        #[cfg(native_mac)]
+        self.native_frame(ctx);
 
         // Zero the central panel's inner margin so the emulated display reaches
         // the window edges — every reclaimed pixel makes the (tall, 5:4) picture
@@ -3298,8 +3318,11 @@ impl eframe::App for App {
         // letterbox bars stay black.
         let central_frame = egui::Frame::central_panel(ui.style())
             .inner_margin(egui::Margin::ZERO);
+        #[cfg(native_mac)]
+        let central_frame = self.native_central_frame(central_frame);
         egui::CentralPanel::default().frame(central_frame).show(ui, |ui| {
-            if self.show_config_editor && !self.emu.is_running() {
+            // (The native macOS front-end has the editor in a window of its own.)
+            if !cfg!(native_mac) && self.show_config_editor && !self.emu.is_running() {
                 // Idle + editing: config fills the whole pane (welcome hidden).
                 // A small margin gives it breathing room (the central frame is
                 // edge-to-edge for the framebuffer).
@@ -3331,9 +3354,14 @@ impl eframe::App for App {
                 // Emulator not running: make sure a leftover mouse capture is
                 // released so the host cursor isn't stuck hidden/locked.
                 input::force_release(ui.ctx(), &mut self.input_state);
+                #[cfg(not(native_mac))]
                 self.welcome_panel(ui);
+                #[cfg(native_mac)]
+                self.native_welcome_panel(ui);
             }
         });
+        #[cfg(native_mac)]
+        self.native_windows(ctx);
 
         // Rename-machine modal: a text box + OK/Cancel. The buffer is App state
         // (`rename_buffer`), so typed input persists across frames — a text box
@@ -3746,6 +3774,10 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
+
+        // Native macOS: closed OS windows are dropped only once it's safe.
+        #[cfg(native_mac)]
+        macos_native::end_frame(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
