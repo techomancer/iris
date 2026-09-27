@@ -86,12 +86,17 @@ env:
   # a future upstream change ever needs to be held back.
   ANYLINUX_REF: refs/heads/main
 
+# Ubuntu runners are pinned to ubuntu-24.04 (and ubuntu-24.04-arm), never
+# `ubuntu-latest`: a glibc-linked Linux binary needs at least the build host's
+# glibc, so the runner label decides which distros our AppImage/deb/rpm/pkg run
+# on. `ubuntu-latest` moves to 26.04 in late 2026. Move to a newer image
+# deliberately, all jobs at once (suites.yml and rust.yml pin the same image).
 jobs:
   # ── Version ──────────────────────────────────────────────────────────────────
 
   generate-version:
     name: Generate Version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -790,14 +795,15 @@ jobs:
           name: IRIS-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}
           path: IRIS-cli-linux-${{ matrix.arch }}-${{ needs.generate-version.outputs.version }}.tar.gz
 
-  # ── Linux riscv64 (cross, tarball-only) ───────────────────────────────────────
+  # ── Linux riscv64 (cross) ─────────────────────────────────────────────────────
   #
   # No GitHub-hosted riscv64 runner exists, so we cross-compile from an x86_64
   # Debian trixie host using multiarch: riscv64 is an official Debian 13 release
   # arch, so the `:riscv64` -dev packages install cleanly alongside the host's.
   # libchdman-rs ≥ 0.288.8 ships a riscv64gc-unknown-linux-gnu prebuilt, so CHD
-  # works here. Shipped as tarballs only (no deb/rpm/AppImage — the AppImage
-  # sharun tooling has no riscv64 path).
+  # works here. Ships iris-gui as a .deb, .rpm and tarball, plus the Core
+  # tarball. No AppImage (the sharun tooling has no riscv64 path), so all of
+  # these link the user's system GTK3/GL at runtime.
   build-linux-riscv64:
     name: Build Linux riscv64 (cross)
     needs: generate-version
@@ -830,7 +836,7 @@ jobs:
           dpkg --add-architecture riscv64
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl xz-utils git pkg-config \
+            ca-certificates curl xz-utils git pkg-config file rpm \
             build-essential crossbuild-essential-riscv64 \
             clang libclang-dev llvm \
             libasound2-dev:riscv64 libgtk-3-dev:riscv64 libssl-dev:riscv64 \
@@ -867,6 +873,79 @@ jobs:
           set -eux
           cargo build --release --bin iris --target "$TARGET" --features chd,camera,rex-jit,lightning
           cargo build --release --bin iris-ci --target "$TARGET" --features chd,camera,rex-jit,lightning
+
+      # The release profile keeps debug info (debug = 1) and the host `strip`
+      # can't read a riscv64 ELF, so strip iris-gui with the cross strip here and
+      # package with --no-strip below.
+      - name: Strip + verify iris-gui ELF
+        run: |
+          set -eux
+          ELF="target/${TARGET}/release/iris-gui"
+          riscv64-linux-gnu-strip "$ELF"
+          file "$ELF"
+          ls -lh "$ELF"
+
+      - name: Install cargo packaging tools
+        # Host tools, so drop the job's riscv64 pkg-config/bindgen env or any
+        # -sys crate they build would link against the riscv64 sysroot.
+        run: |
+          set -eu
+          for crate in cargo-deb cargo-generate-rpm; do
+            for attempt in 1 2 3; do
+              if env -u PKG_CONFIG_PATH -u PKG_CONFIG_SYSROOT_DIR -u PKG_CONFIG_ALLOW_CROSS \
+                   -u BINDGEN_EXTRA_CLANG_ARGS cargo install --locked "$crate"; then
+                continue 2
+              fi
+              echo "Install of $crate failed (attempt $attempt/3)"
+              sleep 15
+            done
+            echo "::error::failed to install $crate after 3 attempts"
+            exit 1
+          done
+
+      # Same Cargo.toml metadata as the x64/arm64 packages; --target makes both
+      # tools read target/riscv64gc-unknown-linux-gnu/release/iris-gui.
+      - name: Package iris-gui (deb)
+        run: |
+          set -euo pipefail
+          DEB="IRIS-gui-linux-${ARCH}-${RELEASE_VERSION}.deb"
+          cargo deb -p iris-gui --target "$TARGET" --no-build --no-strip -o "$DEB"
+          dpkg-deb -f "$DEB" Package Version Architecture Depends
+          # $auto runs dpkg-shlibdeps against the :riscv64 multiarch packages.
+          # When it fails cargo-deb only warns and ships a .deb whose Depends is
+          # empty, so check the resolved deps actually landed.
+          [ "$(dpkg-deb -f "$DEB" Architecture)" = riscv64 ] \
+            || { echo "::error::$DEB is not Architecture: riscv64"; exit 1; }
+          DEPENDS=$(dpkg-deb -f "$DEB" Depends)
+          case "$DEPENDS" in
+            *libc6*) ;;
+            *) echo "::error::\$auto deps did not resolve (no libc6 in Depends: $DEPENDS)"; exit 1 ;;
+          esac
+          case "$DEPENDS" in
+            *-cross*) echo "::error::Depends names a host cross-toolchain package: $DEPENDS"; exit 1 ;;
+          esac
+
+      - name: Package iris-gui (rpm)
+        run: |
+          set -euo pipefail
+          ELF="target/${TARGET}/release/iris-gui"
+          RPM="IRIS-gui-linux-${ARCH}-${RELEASE_VERSION}.rpm"
+          # Auto-requires runs the host ldd, which can't load a riscv64 ELF, so
+          # emit the soname()(64bit) requires from the cross objdump instead.
+          # --set-metadata replaces the whole requires table (dropping the
+          # x64/arm64 libpcap entry, which this lightning build doesn't link).
+          REQS=$(riscv64-linux-gnu-objdump -p "$ELF" \
+            | awk '$1 == "NEEDED" { printf "%s\"%s()(64bit)\" = \"*\"", sep, $2; sep = ", " }')
+          [ -n "$REQS" ] || { echo "::error::no NEEDED entries in $ELF"; exit 1; }
+          # The target triple's first segment is riscv64gc; RPM distros say riscv64.
+          cargo generate-rpm -p iris-gui --target "$TARGET" --arch riscv64 \
+            --auto-req disabled \
+            --set-metadata "requires = { ${REQS} }"
+          mv "target/${TARGET}/generate-rpm/"*.rpm "$RPM"
+          rpm -qp --qf '%{NAME} %{VERSION} %{ARCH}\n' "$RPM"
+          rpm -qp --requires "$RPM"
+          [ "$(rpm -qp --qf '%{ARCH}' "$RPM")" = riscv64 ] \
+            || { echo "::error::$RPM is not arch riscv64"; exit 1; }
 
       - name: Package tarballs
         run: |
@@ -911,11 +990,14 @@ jobs:
             done
           done
 
-      - name: Upload riscv64 tarballs
+      - name: Upload riscv64 packages + tarballs
         uses: actions/upload-artifact@v7
         with:
           name: IRIS-linux-riscv64-${{ needs.generate-version.outputs.version }}
-          path: IRIS-*-linux-riscv64-${{ needs.generate-version.outputs.version }}.tar.gz
+          path: |
+            IRIS-*-linux-riscv64-${{ needs.generate-version.outputs.version }}.tar.gz
+            IRIS-gui-linux-riscv64-${{ needs.generate-version.outputs.version }}.deb
+            IRIS-gui-linux-riscv64-${{ needs.generate-version.outputs.version }}.rpm
 
   # ── Release ───────────────────────────────────────────────────────────────────
 
@@ -928,7 +1010,7 @@ jobs:
       - build-linux-appimage
       - build-linux-packages
       - build-linux-riscv64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -972,6 +1054,8 @@ jobs:
           done
           for f in \
             "IRIS-gui-linux-riscv64-${VER}.tar.gz" \
+            "IRIS-gui-linux-riscv64-${VER}.deb" \
+            "IRIS-gui-linux-riscv64-${VER}.rpm" \
             "IRIS-cli-linux-riscv64-${VER}.tar.gz"; do
             [ -f "release-files/${f}" ] || echo "::warning::expected release asset missing: ${f}"
           done
@@ -995,7 +1079,7 @@ jobs:
           | **macOS 10.13+** | Intel (x64) | [.dmg](${BASE}/IRIS-gui-macos-x64-${VER}.dmg) |
           | **Linux** (glibc ≥ 2.39) | x64 | [AppImage](${BASE}/IRIS-gui-linux-x64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-linux-x64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-x64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-linux-x64-${VER}.pkg.tar.zst) |
           | **Linux** (glibc ≥ 2.39) | arm64 | [AppImage](${BASE}/IRIS-gui-linux-arm64-${VER}.AppImage) · [deb](${BASE}/IRIS-gui-linux-arm64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-arm64-${VER}.rpm) · [pkg](${BASE}/IRIS-gui-linux-arm64-${VER}.pkg.tar.zst) |
-          | **Linux** (glibc ≥ 2.35) | riscv64 †| [tar.gz](${BASE}/IRIS-gui-linux-riscv64-${VER}.tar.gz) |
+          | **Linux** (glibc ≥ 2.35) | riscv64 †| [deb](${BASE}/IRIS-gui-linux-riscv64-${VER}.deb) · [rpm](${BASE}/IRIS-gui-linux-riscv64-${VER}.rpm) · [tar.gz](${BASE}/IRIS-gui-linux-riscv64-${VER}.tar.gz) |
 
           ### Core (no GUI)
 
@@ -1011,7 +1095,7 @@ jobs:
           | **Linux** | arm64 | [tar.gz](${BASE}/IRIS-cli-linux-arm64-${VER}.tar.gz) |
           | **Linux** | riscv64 †| [tar.gz](${BASE}/IRIS-cli-linux-riscv64-${VER}.tar.gz) |
 
-          <sub>**Windows:** x64 + arm64 (32-bit Windows is not shipped). **macOS:** requires 10.13 High Sierra or later. **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; built against glibc 2.39 (Ubuntu 24.04). **AppImage** is self-contained and runs on most distributions. **† riscv64** is cross-compiled and shipped as a tarball only (no AppImage/deb/rpm), built against glibc 2.35. **All binaries** include \`libchdman-rs\` and are **BSD 3-Clause** licensed.</sub>
+          <sub>**Windows:** x64 + arm64 (32-bit Windows is not shipped). **macOS:** requires 10.13 High Sierra or later. **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; built against glibc 2.39 (Ubuntu 24.04). **AppImage** is self-contained and runs on most distributions. **† riscv64** is cross-compiled and shipped as deb/rpm/tarball (no AppImage), using the system GTK3/GL at runtime; built against glibc 2.35. **All binaries** include \`libchdman-rs\` and are **BSD 3-Clause** licensed.</sub>
 
           <sub>**Building other configurations:** PCAP bridged networking (\`--features pcap\`), the experimental JIT v2 engine (\`--features jitv2\`), the N64 development board (\`--features ultra64\`), and the \`chd_extract\` tool are all still in the tree — they are just not part of the release matrix. See \`README.md\`.</sub>
 

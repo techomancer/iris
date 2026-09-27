@@ -60,7 +60,7 @@ env:
 jobs:
   guests:
     name: Build the guest binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -125,7 +125,7 @@ jobs:
 
   host-baseline:
     name: Host baseline
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       # The same kernels, natively. Its accuracy score must be 100% by
@@ -147,7 +147,7 @@ jobs:
   run:
     name: ${{ matrix.cpu }} / ${{ matrix.engine }}
     needs: guests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -376,7 +376,7 @@ jobs:
     name: Comparison report
     needs: run
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
