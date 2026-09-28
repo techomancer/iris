@@ -38,7 +38,7 @@ CFLAGS    := $(ARCHFLAGS) -ffreestanding -nostdlib -nostdinc \
              -fno-delete-null-pointer-checks -fomit-frame-pointer \
              -O1 -g -std=gnu11 \
              -Wall -Wextra -Werror -Wno-unused-parameter \
-             -Iharness
+             -Iharness $(if $(ONLY),-DCPUTEST_ONLY=$(ONLY))
 ASFLAGS   := $(ARCHFLAGS) -ffreestanding -nostdlib -Iharness -g -Wa,--fatal-warnings
 LDFLAGS   := -EB -T harness/link.ld -nostdlib --no-warn-mismatch
 
