@@ -639,6 +639,21 @@ impl Hq2Engine {
                 self.gl_port(index, val, out, &mut done);
                 return;
             }
+            // Commands whose arguments all go to the command's own index
+            // (0x02E enable, plane; 0x008 IRIS GL buffer): a repeat of the
+            // index mid-command is the next argument, not a new command.
+            if index == self.cmd && self.need != 0 && self.need != OPEN && self.need != STREAM
+                && self.nargs < self.need
+            {
+                if (self.nargs as usize) < MAX_ARGS {
+                    self.args[self.nargs as usize] = val;
+                }
+                self.nargs += 1;
+                if self.nargs >= self.need {
+                    self.complete(out, &mut done);
+                }
+                return;
+            }
             if self.need == STREAM {
                 self.end_stream(&mut done);
             } else if self.need == OPEN {

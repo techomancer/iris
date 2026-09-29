@@ -1842,3 +1842,101 @@ fn iris_sboxf_fills_box() {
     assert_eq!(gl_px(g, 95, 55), 0xffffff, "sboxfi inside");
     assert_eq!(gl_px(g, 95, 65), 0, "sboxfi above the box");
 }
+
+/// IRIS GL tmesh with swaptmesh (0x04B), the fan idiom from the IRIS GL
+/// manual: bgntmesh; v(c); v(1); swaptmesh; v(2); swaptmesh; v(3); endtmesh
+/// draws (1, c, 2) and (2, c, 3). Backseat Driver's road and terrain are
+/// tmeshes full of swaps. Without the swap the second triangle is (1, 2, 3).
+#[test]
+fn iris_swaptmesh_fan() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x6913, 0x00ff_ffff);
+    cmd(g, 0x046, 0);
+    cmd(g, 0x447, 0);
+    let v = |g: &Gr2, x: f32, y: f32| for w in [x, y, 0.0] { cmd(g, 0xa63, fl(w)); };
+    v(g, 100.0, 100.0); // centre
+    v(g, 200.0, 100.0);
+    cmd(g, 0x04b, 0);
+    v(g, 200.0, 200.0);
+    cmd(g, 0x04b, 0);
+    v(g, 100.0, 200.0);
+    cmd(g, 0x04a, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 170, 120), 0xffffff, "first wedge (1, c, 2)");
+    assert_eq!(gl_px(g, 120, 170), 0xffffff, "second wedge (2, c, 3), around the centre");
+}
+
+/// Near-plane clipping (Backseat Driver's road and terrain): a ground quad
+/// under a perspective camera runs from in front of the eye to behind it.
+/// Dropping every triangle with a vertex behind the eye lost the whole
+/// ground; clipped at z = -w, the visible part is drawn.
+#[test]
+fn gl_near_plane_clips_ground() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    // glFrustum(-1, 1, -1, 1, 1, 100) (column-major), identity modelview.
+    let (n, f) = (1.0f32, 100.0f32);
+    let proj = [n, 0., 0., 0., 0., n, 0., 0., 0., 0., -(f + n) / (f - n), -1., 0., 0., -2. * f * n / (f - n), 0.];
+    for v in proj { cmd(g, 0x038, fl(v)); }
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x6913, 0x0000_ff00);
+    // Ground at y = -1 from z = +5 (behind the eye) to z = -50.
+    cmd(g, 0x1a4, 0);
+    cmd(g, 0x5ae, 0);
+    for p in [[-10.0f32, -1., 5.], [10., -1., 5.], [10., -1., -50.], [-10., -1., -50.]] {
+        for x in p { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x041, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    // Window 400x300: the ground fills the lower half up to the horizon.
+    assert_eq!(gl_px(g, 200, 20), 0xff00, "near ground, bottom centre");
+    assert_eq!(gl_px(g, 200, 140), 0xff00, "far ground just below the horizon");
+    assert_eq!(gl_px(g, 200, 250), 0, "sky");
+}
+
+/// Far-plane and user-plane clipping. A quad from z = -0.5 to z = -150
+/// under glFrustum(near 1, far 100) is cut at the far plane, not drawn out
+/// to its end with clamped depth. A user plane (0x02E / 0x02F, eye space,
+/// x >= 0) removes the left half.
+#[test]
+fn gl_clip_far_and_user_planes() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    let (n, f) = (1.0f32, 100.0f32);
+    let proj = [n, 0., 0., 0., 0., n, 0., 0., 0., 0., -(f + n) / (f - n), -1., 0., 0., -2. * f * n / (f - n), 0.];
+    for v in proj { cmd(g, 0x038, fl(v)); }
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    let ground = |g: &Gr2| {
+        cmd(g, 0x1a4, 0);
+        cmd(g, 0x5ae, 0);
+        for p in [[-10.0f32, -1., -0.5], [10., -1., -0.5], [10., -1., -150.], [-10., -1., -150.]] {
+            for x in p { cmd(g, 0xa63, fl(x)); }
+        }
+        cmd(g, 0x041, 0);
+        cmd(g, 0x465, 0);
+    };
+    cmd(g, 0x6913, 0x0000_ff00);
+    ground(g);
+    g.wait_idle();
+    // Screen y of the far edge: y_ndc = -1/100 -> window 150 - 1.5 = 148.5.
+    assert_eq!(gl_px(g, 200, 147), 0xff00, "ground just in front of the far plane");
+    assert_eq!(gl_px(g, 200, 149), 0, "beyond the far plane: clipped");
+
+    // User plane 0: x >= 0 in eye space.
+    cmd(g, 0x6913, 0x00ff_0000);
+    cmd(g, 0x02f, 0);
+    for v in [1.0f32, 0., 0., 0.] { data(g, fl(v)); }
+    cmd(g, 0x02e, 1);
+    cmd(g, 0x02e, 0);
+    ground(g);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 300, 60), 0xff_0000, "right of x = 0: drawn");
+    assert_eq!(gl_px(g, 100, 60), 0xff00, "left of x = 0: clipped (old colour)");
+}

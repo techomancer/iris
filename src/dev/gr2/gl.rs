@@ -126,7 +126,15 @@ pub const T_IRIS_GETCPOS: u32 = 0x068;
 /// the token, y1, x2, y2 on DATA, f32; sboxfi is ITOF (0x4053 / 0x41DF).
 /// The corners are transformed, the box between them filled axis-aligned.
 /// twilight draws its stars with it.
+/// User clip planes (__glExpEnableClipPlanes / __glExpPassClipPlanes):
+/// 0x02E = enabled, then 0x02E = plane (0..5); 0x02F = plane, DATA a, b,
+/// c, d in eye space (gc->state.transform.eyeClipPlanes).
+pub const T_CLIP_PLANE_ENABLE: u32 = 0x02e;
+pub const T_CLIP_PLANE: u32 = 0x02f;
 pub const T_IRIS_SBOXF: u32 = 0x053;
+/// swaptmesh (gl_i_swaptmesh): swap the two vertices a tmesh (bgntmesh =
+/// 0x046, LOADV|0x047) keeps; the next vertex makes a triangle with them.
+pub const T_IRIS_SWAPTMESH: u32 = 0x04b;
 pub const T_IRIS_SBOXFI: u32 = 0x4053;
 pub const T_IRIS_CHAR16: u32 = 0x069;
 pub const T_IRIS_CHAR16_TALL: u32 = 0x06a;
@@ -208,8 +216,35 @@ pub struct Wv {
     pub c: [f32; 4],
     /// Back-face colour (two-sided lighting; = c otherwise).
     pub cb: [f32; 4],
-    /// 0 when the vertex is behind the eye (w <= 0): its primitive is dropped.
+    /// 0 when the vertex is behind the eye (w <= 0): it has no window
+    /// position and its primitive must be clipped (gl_tri / gl_line).
     pub ok: u32,
+    /// Clip-space position (frustum clipping) and eye-space position (user
+    /// clip planes). Both are linear in the object position, so clipping
+    /// interpolates them along an edge exactly.
+    pub h: [f32; 4],
+    pub e: [f32; 4],
+}
+
+/// Clip planes: 0..5 the view volume -w <= x, y, z <= w (GL and IRIS GL
+/// alike; their different Z ranges come after clipping, in the viewport
+/// transform), 6..11 the user planes (0x02E / 0x02F, eye space).
+const CLIP_PLANES: usize = 12;
+
+/// Point on a-b at the crossing of a plane where the signed distances are
+/// da and db: positions and colours interpolated, window position still to
+/// be computed (GlState::project).
+fn clip_cross(a: &Wv, b: &Wv, da: f32, db: f32) -> Wv {
+    let t = da / (da - db);
+    let l = |x: f32, y: f32| x + (y - x) * t;
+    let mut v = *a;
+    for k in 0..4 {
+        v.h[k] = l(a.h[k], b.h[k]);
+        v.e[k] = l(a.e[k], b.e[k]);
+        v.c[k] = l(a.c[k], b.c[k]);
+        v.cb[k] = l(a.cb[k], b.cb[k]);
+    }
+    v
 }
 
 /// GL state held by the HQ2/GE7. Plain data, valid when zeroed.
@@ -294,6 +329,11 @@ pub struct GlState {
     /// move / draw pen: 0 = next 0x05D point is a move.
     pen: u32,
     pen_at: Wv,
+    /// Triangle strip / tmesh winding: toggles per triangle and per swap.
+    tflip: u32,
+    /// User clip planes (eye space) and their enable bits.
+    uclip: [[f32; 4]; 6],
+    uclip_on: u32,
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
 }
@@ -359,8 +399,47 @@ impl GlState {
         self.update_mvp();
         let m = &self.mvp;
         let clip = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-        let (cx, cy, cz, cw) = (clip(0), clip(1), clip(2), clip(3));
-        let mut out = Wv { c: self.color, cb: self.color, ..Default::default() };
+        let h = [clip(0), clip(1), clip(2), clip(3)];
+        let m = &self.mv;
+        let eye = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
+        let e = [eye(0), eye(1), eye(2), eye(3)];
+        let out = Wv { c: self.color, cb: self.color, h, e, ..Default::default() };
+        self.project(out)
+    }
+
+    /// Signed distance of `v` to clip plane `i` (>= 0 inside).
+    fn clip_dist(&self, v: &Wv, i: usize) -> f32 {
+        let h = &v.h;
+        match i {
+            0 => h[3] + h[0],
+            1 => h[3] - h[0],
+            2 => h[3] + h[1],
+            3 => h[3] - h[1],
+            4 => h[3] + h[2],
+            5 => h[3] - h[2],
+            _ => {
+                let p = &self.uclip[i - 6];
+                p[0] * v.e[0] + p[1] * v.e[1] + p[2] * v.e[2] + p[3] * v.e[3]
+            }
+        }
+    }
+
+    /// Planes in use: the view volume plus the enabled user planes.
+    fn clip_mask(&self) -> u32 {
+        0x3f | ((self.uclip_on & 0x3f) << 6)
+    }
+
+    /// Bit i set when `v` is outside plane i.
+    fn outcode(&self, v: &Wv) -> u32 {
+        let mask = self.clip_mask();
+        (0..CLIP_PLANES).filter(|&i| mask & (1 << i) != 0 && self.clip_dist(v, i) < 0.0)
+            .fold(0, |o, i| o | (1 << i))
+    }
+
+    /// Window position of `v` from its clip position (`ok` = 0 if w <= 0).
+    fn project(&self, mut out: Wv) -> Wv {
+        let [cx, cy, cz, cw] = out.h;
+        out.ok = 0;
         if cw <= 1e-6 {
             return out;
         }
@@ -644,6 +723,9 @@ impl Hq2Engine {
             | T_IRIS_PMV | T_IRIS_PCLOS | T_IRIS_MOVE | T_IRIS_GETCPOS => 1,
             T_DEPTH_CLEAR => 3,
             T_IRIS_SBOXF | T_IRIS_SBOXFI => 4,
+            T_IRIS_SWAPTMESH => 1,
+            T_CLIP_PLANE_ENABLE => 2,
+            T_CLIP_PLANE => 5,
             T_STENCIL_MODE => 7,
             T_STIPPLE_ON => 33,
             c if BEGIN_TOKENS.contains(&c) || END_TOKENS.contains(&c) => 1,
@@ -934,6 +1016,17 @@ impl Hq2Engine {
                 }
             }
             T_IRIS_MOVE => g.pen = 0,
+            T_CLIP_PLANE_ENABLE => if a[1] < 6 {
+                let bit = 1 << a[1];
+                g.uclip_on = if a[0] & 1 != 0 { g.uclip_on | bit } else { g.uclip_on & !bit };
+            },
+            T_CLIP_PLANE => if a[0] < 6 {
+                g.uclip[a[0] as usize] = [f(a[1]), f(a[2]), f(a[3]), f(a[4])];
+            },
+            T_IRIS_SWAPTMESH => {
+                g.prev.swap(0, 1);
+                g.tflip ^= 1;
+            }
             T_IRIS_SBOXF | T_IRIS_SBOXFI => {
                 let num = |w: u32| if cmd == T_IRIS_SBOXFI { w as i32 as f32 } else { f(w) };
                 let p = g.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
@@ -1019,6 +1112,7 @@ impl Hq2Engine {
                 }
                 self.gl.vroutine = r;
                 self.gl.nv = 0;
+                self.gl.tflip = 0;
             }
             END_LLOOP => {
                 if self.gl.vroutine == VR_LLOOP && self.gl.nv > 1 {
@@ -1116,7 +1210,11 @@ impl Hq2Engine {
             VR_LSTRIP | VR_LLOOP => if n >= 1 { self.gl_line(p0, v, v.c, out) },
             VR_TRIANGLES => if n % 3 == 2 { self.gl_tri([p1, p0, v], flat(v), 0b111, out, done) },
             VR_TSTRIP => if n >= 2 {
-                let t = if n % 2 == 0 { [p1, p0, v] } else { [p0, p1, v] };
+                // (older, newer, v); every other triangle reversed to keep
+                // one winding. A swaptmesh also flips it, so fans built with
+                // swaps keep one winding too.
+                let t = if g.tflip == 0 { [p1, p0, v] } else { [p0, p1, v] };
+                g.tflip ^= 1;
                 self.gl_tri(t, flat(v), 0b111, out, done)
             },
             VR_TFAN => if n >= 2 { self.gl_tri([first, p0, v], flat(v), 0b111, out, done) },
@@ -1310,7 +1408,7 @@ impl Hq2Engine {
     }
 
     fn gl_point(&mut self, v: Wv, color: [f32; 4], out: &mut dyn Re3Sink) {
-        if v.ok == 0 {
+        if v.ok == 0 || self.gl.outcode(&v) != 0 {
             return;
         }
         let (x, y) = (v.x.floor() as i32, v.y.floor() as i32);
@@ -1325,7 +1423,33 @@ impl Hq2Engine {
 
     /// 1-pixel line (DDA along the major axis) in one colour (smooth lines
     /// not yet).
-    fn gl_line(&mut self, a: Wv, b: Wv, color: [f32; 4], out: &mut dyn Re3Sink) {
+    fn gl_line(&mut self, mut a: Wv, mut b: Wv, color: [f32; 4], out: &mut dyn Re3Sink) {
+        // Parametric clip against every plane in use (Liang-Barsky style).
+        let (oa, ob) = (self.gl.outcode(&a), self.gl.outcode(&b));
+        if oa & ob != 0 {
+            return;
+        }
+        if oa | ob != 0 {
+            let (mut t0, mut t1) = (0.0f32, 1.0f32);
+            for plane in 0..CLIP_PLANES {
+                if (oa | ob) & (1 << plane) == 0 {
+                    continue;
+                }
+                let (da, db) = (self.gl.clip_dist(&a, plane), self.gl.clip_dist(&b, plane));
+                let t = da / (da - db);
+                if da < 0.0 { t0 = t0.max(t) } else { t1 = t1.min(t) }
+            }
+            if t0 >= t1 {
+                return;
+            }
+            let at = |t: f32| {
+                // Distances along the edge are linear: fake them for clip_cross.
+                clip_cross(&a, &b, -t, 1.0 - t)
+            };
+            let (na, nb) = (at(t0), at(t1));
+            a = self.gl.project(na);
+            b = self.gl.project(nb);
+        }
         if a.ok == 0 || b.ok == 0 {
             return;
         }
@@ -1351,11 +1475,79 @@ impl Hq2Engine {
     /// `prov` = the provoking vertex (flat shading colour); `edges` = which
     /// edges are polygon edges (bit 0: v0-v1, 1: v1-v2, 2: v2-v0) for
     /// GL_LINE polygon mode.
-    fn gl_tri(&mut self, mut v: [Wv; 3], mut prov: Wv, edges: u8, out: &mut dyn Re3Sink,
+    /// Clip a triangle to the view volume and the enabled user planes
+    /// (Sutherland-Hodgman), then rasterize the piece as a fan. Backseat
+    /// Driver's road and terrain run under the camera: without clipping,
+    /// every triangle with a vertex behind the eye was lost.
+    fn gl_tri(&mut self, v: [Wv; 3], prov: Wv, edges: u8, out: &mut dyn Re3Sink,
               done: &mut Option<&mut dyn FnMut(String)>) {
-        if v.iter().any(|v| v.ok == 0) {
+        let oc = [self.gl.outcode(&v[0]), self.gl.outcode(&v[1]), self.gl.outcode(&v[2])];
+        if oc[0] & oc[1] & oc[2] != 0 {
+            return; // all outside one plane
+        }
+        let cross = oc[0] | oc[1] | oc[2];
+        if cross == 0 {
+            if v.iter().all(|x| x.ok != 0) {
+                self.gl_tri_raster(v, prov, edges, out, done);
+            }
             return;
         }
+        // Polygon with its edge flags (flag k: edge from vertex k to k+1).
+        const MAXV: usize = 3 + CLIP_PLANES;
+        let mut poly = [Wv::default(); MAXV];
+        let mut pedge = [false; MAXV];
+        let mut n = 3;
+        poly[..3].copy_from_slice(&v);
+        for k in 0..3 {
+            pedge[k] = edges & (1 << k) != 0;
+        }
+        for plane in 0..CLIP_PLANES {
+            if cross & (1 << plane) == 0 || n == 0 {
+                continue;
+            }
+            let mut np = [Wv::default(); MAXV];
+            let mut ne = [false; MAXV];
+            let mut m = 0;
+            for i in 0..n {
+                let (a, b) = (&poly[i], &poly[(i + 1) % n]);
+                let (da, db) = (self.gl.clip_dist(a, plane), self.gl.clip_dist(b, plane));
+                if da >= 0.0 {
+                    // The edge from an inside vertex is (part of) edge i.
+                    np[m] = *a;
+                    ne[m] = pedge[i];
+                    m += 1;
+                }
+                if (da >= 0.0) != (db >= 0.0) && m < MAXV {
+                    // Entering: the rest of edge i. Leaving: the next edge
+                    // runs along the clip plane, not a polygon edge.
+                    np[m] = clip_cross(a, b, da, db);
+                    ne[m] = da < 0.0 && pedge[i];
+                    m += 1;
+                }
+            }
+            poly = np;
+            pedge = ne;
+            n = m;
+        }
+        if n < 3 {
+            return;
+        }
+        for p in &mut poly[..n] {
+            *p = self.gl.project(*p);
+        }
+        if poly[..n].iter().any(|p| p.ok == 0) {
+            return;
+        }
+        for i in 1..n - 1 {
+            let e = (if i == 1 { pedge[0] as u8 } else { 0 })
+                | ((pedge[i] as u8) << 1)
+                | (if i == n - 2 { (pedge[n - 1] as u8) << 2 } else { 0 });
+            self.gl_tri_raster([poly[0], poly[i], poly[i + 1]], prov, e, out, done);
+        }
+    }
+
+    fn gl_tri_raster(&mut self, mut v: [Wv; 3], mut prov: Wv, edges: u8, out: &mut dyn Re3Sink,
+                     done: &mut Option<&mut dyn FnMut(String)>) {
         let area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y);
         if area.abs() < 1e-6 {
             return;
