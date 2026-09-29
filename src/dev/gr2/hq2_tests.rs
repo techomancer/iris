@@ -1791,3 +1791,54 @@ fn ddx_line_seg_cap_not_last() {
     assert_eq!(px(103, 512), 0, "no pixel below the left edge");
     assert_eq!(px(0, 0), 0, "(0, 0)-(0, 0) draws nothing");
 }
+
+/// twilight on the root window (IRIX 6.5.22 trace): 0x1E5 with obscured = 1
+/// and 0 pieces; the kernel sends only the bounding box. Xsgi paints the
+/// root's visible region with the context's CID, so the WID test decides.
+#[test]
+fn gl_clip_obscured_no_pieces_uses_wid() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, HQ2_2D_BEGIN, 0);
+    cmd(g, HQ2_2D_MODE, 4);
+    cmd(g, HQ2_2D_COLOR_AUX, 0);
+    cmd(g, HQ2_2D_ROP, 0);
+    for v in [0xffffff, 3, 0] { data(g, v); }
+    cmd(g, HQ2_2D_CID_WRITE, (1 << 8) | 0xf000);
+    cmd(g, HQ2_2D_SOLID_RECT, 0);
+    for v in [0, 0, 264, 1024] { data(g, v); }
+    cmd(g, HQ2_2D_END_PRIMITIVE, 0);
+    cmd(g, HQ2_2D_CID_WRITE, 0);
+    // Window (64, 660) 400x300 as in gl_setup_window, obscured, 0 pieces,
+    // bounding box in the first pair.
+    cmd(g, 0x1e5, 64);
+    for v in [660, 400, 300, 1, 1, 0, (463 << 11) | 64, (959 << 10) | 660, 0, 0, 0, 0, 0, 0] { data(g, v); }
+    cmd(g, 0x104, fl(1.0));
+    for v in [0.0f32, 0.0, 1.0] { data(g, fl(v)); }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 100, 150), 0xff, "CID 1: the root's visible part");
+    assert_ne!(gl_px(g, 300, 150), 0xff, "CID 0: a window on top, untouched");
+}
+
+/// twilight stars: sboxf (0x053: x1; DATA y1, x2, y2, f32) and sboxfi
+/// (0x4053 / 0x41DF, integers) fill the screen-aligned box between the
+/// transformed corners in the current colour.
+#[test]
+fn iris_sboxf_fills_box() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x6913, 0x00ff_ffff);
+    cmd(g, 0x053, fl(10.0));
+    for v in [20.0f32, 40.0, 30.0] { data(g, fl(v)); }
+    cmd(g, 0x4053, 100);
+    for v in [50, 90, 60] { cmd(g, 0x41df, v); }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 25, 25), 0xffffff, "sboxf inside");
+    assert_eq!(gl_px(g, 45, 25), 0, "sboxf right of the box");
+    assert_eq!(gl_px(g, 95, 55), 0xffffff, "sboxfi inside");
+    assert_eq!(gl_px(g, 95, 65), 0, "sboxfi above the box");
+}

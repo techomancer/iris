@@ -122,6 +122,12 @@ pub const T_IRIS_GETCPOS: u32 = 0x068;
 ///   0x069: 9 words, two 16-bit rows each, low half first (h <= 17);
 ///   0x06A: 17 words, the same (h <= 33);
 ///   0x06D: 17 words, one 32-bit row each (w <= 32, h <= 17).
+/// sboxf(x1, y1, x2, y2): screen-aligned filled box (gl_i_sboxf): x1 on
+/// the token, y1, x2, y2 on DATA, f32; sboxfi is ITOF (0x4053 / 0x41DF).
+/// The corners are transformed, the box between them filled axis-aligned.
+/// twilight draws its stars with it.
+pub const T_IRIS_SBOXF: u32 = 0x053;
+pub const T_IRIS_SBOXFI: u32 = 0x4053;
 pub const T_IRIS_CHAR16: u32 = 0x069;
 pub const T_IRIS_CHAR16_TALL: u32 = 0x06a;
 pub const T_IRIS_CHAR32: u32 = 0x06d;
@@ -371,9 +377,11 @@ impl GlState {
     }
 
     /// Window clipping by the RE3 WID test: more visible pieces than the 4
-    /// rectangles 0x1E5 can carry.
+    /// rectangles 0x1E5 can carry, or an obscured window sent with no piece
+    /// list (Gr2ValidateClip then sends only the bounding box; twilight
+    /// drawing the root window under every desktop window, IRIX 6.5.22).
     fn wid_clip(&self) -> bool {
-        self.clip_n > 4
+        self.clip_n > 4 || (self.clip_n == 0 && self.clip_obscured != 0)
     }
 
     /// Visible rectangles (screen, exclusive): clip_rect() intersected with
@@ -383,8 +391,15 @@ impl GlState {
         let mut out = [[0i32; 4]; 4];
         // The piece list decides, not the obscured flag: a partly covered
         // window arrives with obscured = 0 and 2 pieces (IRIX 6.5.22 atlantis
-        // trace). 0 pieces = the whole window.
+        // trace). 0 pieces and not obscured = the whole window; the WID
+        // test cases are bounded by the window (the box the kernel sends).
         if self.clip_n == 0 || self.wid_clip() {
+            let r = if self.clip_n == 0 && self.clip_obscured != 0 {
+                let b = self.clip_rects[0];
+                [r[0].max(b[0]), r[1].max(b[1]), r[2].min(b[2]), r[3].min(b[3])]
+            } else {
+                r
+            };
             if r[0] < r[2] && r[1] < r[3] {
                 out[0] = r;
                 return (out, 1);
@@ -628,6 +643,7 @@ impl Hq2Engine {
             T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
             | T_IRIS_PMV | T_IRIS_PCLOS | T_IRIS_MOVE | T_IRIS_GETCPOS => 1,
             T_DEPTH_CLEAR => 3,
+            T_IRIS_SBOXF | T_IRIS_SBOXFI => 4,
             T_STENCIL_MODE => 7,
             T_STIPPLE_ON => 33,
             c if BEGIN_TOKENS.contains(&c) || END_TOKENS.contains(&c) => 1,
@@ -851,15 +867,13 @@ impl Hq2Engine {
                 g.clip_n = a[6];
                 // Pieces: (x1 << 11) | x0, (ytop << 10) | ybottom, inclusive,
                 // GL y up. Obscured with 0 pieces: one rectangle (the window
-                // clamped to the screen) in the first pair.
+                // clamped to the screen) in the first pair; only a bound, the
+                // visible region comes from the WID test (wid_clip).
                 let pairs = if g.clip_n == 0 && g.clip_obscured != 0 { 1 } else { g.clip_n.min(4) };
                 for k in 0..pairs as usize {
                     let (w0, w1) = (a[7 + 2 * k], a[8 + 2 * k]);
                     g.clip_rects[k] = [(w0 & 0x7ff) as i32, (w1 & 0x3ff) as i32,
                                        ((w0 >> 11) & 0x7ff) as i32 + 1, ((w1 >> 10) & 0x3ff) as i32 + 1];
-                }
-                if g.clip_n == 0 && g.clip_obscured != 0 {
-                    g.clip_n = 1;
                 }
             }
             T_VIEWPORT => g.vp = [f(a[1]), f(a[2]), f(a[3]), f(a[4]), f(a[5]), f(a[6])],
@@ -920,6 +934,26 @@ impl Hq2Engine {
                 }
             }
             T_IRIS_MOVE => g.pen = 0,
+            T_IRIS_SBOXF | T_IRIS_SBOXFI => {
+                let num = |w: u32| if cmd == T_IRIS_SBOXFI { w as i32 as f32 } else { f(w) };
+                let p = g.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
+                let q = g.transform([num(a[2]), num(a[3]), 0.0, 1.0]);
+                if p.ok != 0 && q.ok != 0 {
+                    let (x0, x1) = (p.x.min(q.x), p.x.max(q.x));
+                    let (y0, y1) = (p.y.min(q.y), p.y.max(q.y));
+                    let at = |x: f32, y: f32| Wv { x, y, ..p };
+                    let (c0, c1, c2, c3) = (at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1));
+                    // Counter-clockwise, so face culling never drops it.
+                    let (cf, cb) = (g.cull_front, g.cull_back);
+                    g.cull_front = 0;
+                    g.cull_back = 0;
+                    let mut none: Option<&mut dyn FnMut(String)> = None;
+                    self.gl_tri([c0, c1, c2], c0, 0b111, out, &mut none);
+                    self.gl_tri([c0, c2, c3], c0, 0b111, out, &mut none);
+                    self.gl.cull_front = cf;
+                    self.gl.cull_back = cb;
+                }
+            }
             T_IRIS_GETCPOS => {
                 out.shram(READBACK_SHRAM, g.cpos[0] as u32);
                 out.shram(READBACK_SHRAM + 1, g.cpos[1] as u32);

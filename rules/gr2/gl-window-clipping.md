@@ -16,6 +16,11 @@ Gotchas found the hard way:
   state. To see one, capture across a window move plus a few frames.
 - `pieces > 4`: no rectangles; the HLE turns on the RE3 WID test (window-id
   planes painted by Xsgi's 2D_CID_WRITE).
+- `obscured = 1, pieces = 0`: the one rectangle the kernel sends is the
+  window's bounding box, not its visible region. WID test too, bounded by
+  the box. Treating it as a visible rectangle let twilight's root-window
+  background paint over every desktop window (the draw is 24-bit RGB, so
+  all planes of those windows went).
 - Clipping is at span level in `gl_tri` (`GlState::span_pieces`): colour,
   alpha and Z iterators must be started at each piece's left end, or shading
   jumps at the cut (`gl_clip_to_visible_pieces` checks this).
