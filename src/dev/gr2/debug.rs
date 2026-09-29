@@ -166,7 +166,7 @@ impl Gr2 {
                 t.line(format_args!("RE3 #{seq:06} op  COPYRECT dst=({}, {})  [GL y, bottom-up]", f(0), f(16)));
             }
             re3::RE3_OP_READ_ADVANCE => t.line(format_args!("RE3 #{seq:06} op  READBUF advance")),
-            re3::RE3_OP_PIXFMT => t.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", if val == 1 { "RGB12" } else { "native" })),
+            re3::RE3_OP_PIXFMT => t.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", match val { 1 => "RGB12", 2 => "CI12", _ => "native" })),
             re3::RE3_OP_ZCTL => t.line(format_args!("RE3 #{seq:06} op  ZCTL test={} func={} zmask={:#08x}", val & 1, (val >> 1) & 7, (val >> 8) & 0xff_ffff)),
             re3::RE3_OP_STENCIL => t.line(format_args!("RE3 #{seq:06} op  STENCIL on={} func={} ref={} mask={:#x} wmask={:#x} ops fail={} zfail={} zpass={}",
                 val & 1, (val >> 1) & 7, (val >> 4) & 0xff, (val >> 12) & 0xff, (val >> 20) & 0xff, (val >> 28) & 0xf, (val >> 32) & 0xf, (val >> 36) & 0xf)),

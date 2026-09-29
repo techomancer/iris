@@ -589,7 +589,10 @@ fn ddx_glyphs_lines_spans_stipples() {
     assert_eq!((px(0x15, 0x300), px(0x1d, 0x300), px(0x1e, 0x300)), (7, 7, 0));
     assert_eq!(px(0x16, 0x301), 7);
     assert!((0x3e0..=0x3ee).all(|y| px(0x11, y) == 7), "vertical run");
-    assert!((0x11..=0x22).all(|x| px(x, 0x3e0) == 7), "horizontal run");
+    // The final point is not drawn (expLineSS adds an (x + 1) point itself
+    // when the cap style wants the end pixel).
+    assert!((0x11..0x22).all(|x| px(x, 0x3e0) == 7), "horizontal run");
+    assert_eq!(px(0x22, 0x3e0), 0, "polyline end point not drawn");
     assert!((0x100..=0x110).all(|x| px(x, 0x80) == 7), "segment inclusive");
     assert_eq!(px(0x111, 0x80), 0);
 
@@ -1681,4 +1684,110 @@ fn pll_programming_is_decoded() {
     g.cmd_gr2(&["status"], &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     assert!(s.contains("60 Hz, 107.352 MHz"), "{s}");
+}
+
+/// showmap (IRIX 6.5.22 trace): a 12-bit colour-index window (MAKECURRENT
+/// 10) draws each CLUT entry as a rectangle: color(i) on ITOF|C1 0x030, then
+/// 0x044 / LOADV|0x1AE, four ITOF|V3 vertices on 0x045, 0x042 / LOADV|0x065.
+/// The index lands unclamped; writemask 0xFFF keeps it to bank 0.
+#[test]
+fn iris_ci12_rect() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 10);
+    cmd(g, 0x005, 0xfff);
+    let fl = |v: f32| v.to_bits();
+    for v in [2.0 / 40.0, 0., 0., 0., 0., 2.0 / 30.0, 0., 0., 0., 0., -1., 0., -1., -1., 0., 1.0f32] {
+        cmd(g, 0x036, fl(v));
+    }
+    let rect = |g: &Gr2, i: u32, x: u32, y: u32| {
+        cmd(g, 0x7030, i);
+        cmd(g, 0x044, 0);
+        cmd(g, 0x5ae, 0);
+        for (px, py) in [(x, y), (x + 1, y), (x + 1, y + 1), (x, y + 1)] {
+            for w in [px, py, 0] { cmd(g, 0x4845, w); }
+        }
+        cmd(g, 0x042, 0);
+        cmd(g, 0x465, 0);
+    };
+    rect(g, 0x9a5, 3, 2);
+    rect(g, 7, 4, 2);
+    g.wait_idle();
+    // One unit = 10 x 10 pixels.
+    assert_eq!(gl_px(g, 35, 25), 0x9a5);
+    assert_eq!(gl_px(g, 45, 25), 7);
+    assert_eq!(gl_px(g, 25, 25), 0, "outside");
+}
+
+/// gr_osview (IRIX 6.5.22 trace): move / draw outlines (0x05B, then points
+/// on V3 0x85D) and cmov (0x866) + getcpos (0x068) through the mailbox.
+#[test]
+fn iris_move_draw_and_getcpos() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x6913, 0x0000_ff00);
+    cmd(g, 0x05b, 0);
+    for p in [[20.0f32, 20.5, 0.], [120.0, 20.5, 0.], [120.0, 80.5, 0.]] {
+        for x in p { cmd(g, 0x85d, fl(x)); }
+    }
+    for x in [33.0f32, 44.0, 0.0] { cmd(g, 0x866, fl(x)); }
+    cmd(g, 0x068, 0);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 60, 20), 0xff00, "bottom edge drawn");
+    assert_eq!(gl_px(g, 120, 50), 0xff00, "right edge drawn");
+    assert_eq!(gl_px(g, 60, 50), 0, "outline only");
+    let sh = |i: u32| r32(g, (0x4022 + i) * 4);
+    assert_eq!((sh(0), sh(1), sh(2)), (33, 44, 0));
+}
+
+/// gr_osview text: cmov, then 0x069 glyphs (w << 16 | h, orig, move, flags,
+/// 9 words of 16-bit rows, low half first, top row first; flags bit 0 clear
+/// = one padding slot first). The position advances by xmove.
+#[test]
+fn iris_glyph16_at_cmov() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x6913, 0x0000_00ff);
+    for x in [40.0f32, 50.0, 0.0] { cmd(g, 0x866, fl(x)); }
+    cmd(g, 0x6913, 0x00ff_0000); // after cmov: glyphs keep the cmov colour
+    // 3 rows (odd: padding first): top 0x8000, middle 0x4000, bottom 0xc000.
+    let glyph = [0x0002_0003, 0x0000_0000, 0x0005_0000, 0xffff_0000, 0x8000_dead, 0xc000_4000, 0, 0, 0, 0, 0, 0, 0];
+    for _ in 0..2 {
+        for w in glyph { cmd(g, 0x069, w); }
+    }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 40, 52), 0xff, "top row, leftmost pixel");
+    assert_eq!(gl_px(g, 41, 52), 0, "top row, second pixel clear");
+    assert_eq!(gl_px(g, 41, 51), 0xff, "middle row");
+    assert_eq!((gl_px(g, 40, 50), gl_px(g, 41, 50)), (0xff, 0xff), "bottom row");
+    assert_eq!(gl_px(g, 45, 52), 0xff, "second glyph advanced by xmove 5");
+}
+
+/// xterm's hollow cursor (IRIX 6.5.22 trace): XDrawRectangle through
+/// expSegmentSS with CapNotLast = LINE_SEG, reversed edges swapped with +1,
+/// then a (0, 0)-(0, 0) segment. Every pixel once, nothing past the corners.
+#[test]
+fn ddx_line_seg_cap_not_last() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    cmd(g, hq2::HQ2_2D_BEGIN, 0);
+    cmd(g, HQ2_2D_MODE, 0x1009);
+    cmd(g, HQ2_2D_ROP, 2);
+    for v in [0xff, 3, 0] { data(g, v); }
+    let px = |x: i32, y: i32| g.vram()[(1023 - y) as usize * FB_W + x as usize] & 0xff;
+    cmd(g, HQ2_2D_LINE_SEG, 0);
+    for v in [103, 497, 110, 497, 110, 497, 110, 511, 104, 511, 111, 511, 103, 498, 103, 512, 0, 0, 0, 0] {
+        data(g, v);
+    }
+    cmd(g, HQ2_2D_END_PRIMITIVE, 0);
+    g.wait_idle();
+    assert!((103..=110).all(|x| px(x, 497) == 2 && px(x, 511) == 2), "top and bottom");
+    assert!((497..=511).all(|y| px(103, y) == 2 && px(110, y) == 2), "sides");
+    assert_eq!(px(111, 511), 0, "no pixel past the bottom-right corner");
+    assert_eq!(px(103, 512), 0, "no pixel below the left edge");
+    assert_eq!(px(0, 0), 0, "(0, 0)-(0, 0) draws nothing");
 }

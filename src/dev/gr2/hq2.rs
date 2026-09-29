@@ -767,7 +767,12 @@ impl Hq2Engine {
                         // = 1280 with y 0 (LINE_SEG, 4Dwm frames).
                         let pad = (a[1] == PAD_X && a[2] == PAD_Y) || (a[1] == PAD_X && a[3] == PAD_X);
                         if !pad {
-                            self.line2d([a[1] as i32, a[2] as i32], [a[3] as i32, a[4] as i32], true, out);
+                            // SEGMENTS draws both endpoints; LINE_SEG is the
+                            // CapNotLast form and stops before (x2, y2)
+                            // (expSegmentSS picks it by cap style and swaps
+                            // reversed segments with +1 to keep the pixels).
+                            let last = self.cmd == HQ2_2D_SEGMENTS;
+                            self.line2d([a[1] as i32, a[2] as i32], [a[3] as i32, a[4] as i32], last, out);
                         }
                         if let Some(f) = done.as_mut() {
                             f(format!("{} ({}, {})-({}, {}){} fg={:#x}", token_name(self.cmd).unwrap_or("?"),
@@ -779,10 +784,11 @@ impl Hq2Engine {
                         if a[1] == PAD_X && a[2] == PAD_Y {
                             self.line_have_prev = 0;
                         } else if self.line_have_prev != 0 {
-                            // Joints are drawn once: skip the first point of
-                            // every segment after the first.
-                            let first = self.stream_items == 2;
-                            self.line2d(self.line_prev, p, first, out);
+                            // Each segment stops before its end point, so
+                            // joints are drawn once and the final point is
+                            // not drawn: expLineSS sends an extra (x + 1, y)
+                            // point when the cap style wants it.
+                            self.line2d(self.line_prev, p, false, out);
                             self.line_prev = p;
                         } else {
                             self.line_prev = p;
@@ -982,8 +988,9 @@ impl Hq2Engine {
     }
 
     /// Zero-width line with Bresenham, clipped to the line clip box and the
-    /// screen, emitted as horizontal runs. `first` includes the start point.
-    fn line2d(&mut self, p0: [i32; 2], p1: [i32; 2], first: bool, out: &mut dyn Re3Sink) {
+    /// screen, emitted as horizontal runs. The start point is always drawn;
+    /// `last` also draws the end point.
+    fn line2d(&mut self, p0: [i32; 2], p1: [i32; 2], last: bool, out: &mut dyn Re3Sink) {
         let c = self.line_clip;
         let (cx1, cx2) = (c[0].max(0), c[1].min(re3::FB_W as i32 - 1));
         let (cy1, cy2) = (c[2].max(0), c[3].min(SCREEN_H - 1));
@@ -992,11 +999,12 @@ impl Hq2Engine {
         let (sx, sy) = (if p1[0] >= x { 1 } else { -1 }, if p1[1] >= y { 1 } else { -1 });
         let mut err = dx + dy;
         let mut run: Option<(i32, i32, i32)> = None; // (y, xmin, xmax)
-        let mut skip = !first;
         loop {
-            if skip {
-                skip = false;
-            } else if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2 {
+            let end = x == p1[0] && y == p1[1];
+            if end && !last {
+                break;
+            }
+            if x >= cx1 && x <= cx2 && y >= cy1 && y <= cy2 {
                 run = match run {
                     Some((ry, a, b)) if ry == y && (x == b + 1 || x == a - 1) => Some((ry, a.min(x), b.max(x))),
                     Some((ry, a, b)) => {
@@ -1006,7 +1014,7 @@ impl Hq2Engine {
                     None => Some((y, x, x)),
                 };
             }
-            if x == p1[0] && y == p1[1] {
+            if end {
                 break;
             }
             let e2 = 2 * err;

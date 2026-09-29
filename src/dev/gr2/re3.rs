@@ -170,6 +170,9 @@ pub const RE3_OP_READ_ADVANCE: u32 = 0xFFFF_1003;
 /// into both 12-bit buffers, the plane mask selecting the buffer.
 pub const RE3_OP_PIXFMT: u32 = 0xFFFF_1004;
 pub const PIXFMT_RGB12: u32 = 1;
+/// 12-bit colour index: the R iterator (12.11) carries the index, written
+/// into both 12-bit banks like PIXFMT_RGB12 (the plane mask picks the buffer).
+pub const PIXFMT_CI12: u32 = 2;
 /// Emulator-private depth control (the enables and write mask have no
 /// documented RE3 register): val = test enable (bit 0) | func (bits 3:1,
 /// GL order NEVER..ALWAYS) | Z write mask << 8 (24 bits). Depth is tested
@@ -336,6 +339,10 @@ impl Re3 {
     #[inline]
     fn color(&self, x: i32, y: i32) -> u32 {
         let c = &self.ctx;
+        if c.pixfmt == PIXFMT_CI12 {
+            let i = (c.r >> 11).clamp(0, 0xfff) as u32;
+            return i | (i << 12);
+        }
         let ch = |v: i64| (v >> 11).clamp(0, 255) as u32;
         self.pack(ch(c.r) | (ch(c.g) << 8) | (ch(c.b) << 16), x, y)
     }
@@ -345,7 +352,7 @@ impl Re3 {
     #[inline]
     fn color_blended(&self, x: i32, y: i32, off: usize) -> u32 {
         let c = &self.ctx;
-        if c.blend & 1 == 0 {
+        if c.blend & 1 == 0 || c.pixfmt == PIXFMT_CI12 {
             return self.color(x, y);
         }
         let ch = |v: i64| (v >> 11).clamp(0, 255) as u32;

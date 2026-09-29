@@ -95,6 +95,36 @@ pub const T_IRIS_COLOR: u32 = 0x113;
 pub const T_IRIS_BGNPOLYGON: u32 = 0x1a4;
 pub const T_IRIS_ENDPOLYGON: u32 = 0x041;
 const VR_IRIS_POLYGON: u32 = 0x1ae;
+/// color(i) is 0x030 (ITOF|C1 for an integer index). pmv / pdr / pclos
+/// polygons (libgl.so gl_i_pmv2 / gl_i_pdr / gl_i_pclos; rectf, circf,
+/// showmap): 0x044 then LOADV|0x1AE, points on 0x045 (V3 or ITOF|V3), 0x042
+/// then LOADV|0x065.
+pub const T_IRIS_INDEX: u32 = 0x030;
+pub const T_IRIS_PMV: u32 = 0x044;
+pub const T_IRIS_PCLOS: u32 = 0x042;
+pub const T_IRIS_PDR: u32 = 0x045;
+/// libgl.so (IP12GR232) move / draw: move sends 0x05B = 0, then the point
+/// on 0x05D (V3, float or ITOF); draw sends only the point. A line from the
+/// previous point to each drawn one (gl_i_move2, gl_i_draw).
+pub const T_IRIS_MOVE: u32 = 0x05b;
+pub const T_IRIS_DRAW: u32 = 0x05d;
+/// cmov: current character position, V3 (gl_c_cmov). getcpos sends 0x068 =
+/// 0, Finish, reads the mailbox: x, y (window pixels, stored as shorts) and
+/// a word whose sign bit means "invalid, leave the caller's values" (gl_g_getcpos).
+pub const T_IRIS_CMOV: u32 = 0x066;
+pub const T_IRIS_GETCPOS: u32 = 0x068;
+/// Character bitmaps drawn at the character position, which then advances
+/// (charstr / fmprstr; gr_osview, IRIX 6.5.22 trace; sender not found in
+/// libgl.so, format (inferred) from the glyph data). Four header words:
+///   w << 16 | h;  xorig << 16 | yorig (i16);  xmove << 16 | ymove (i16);
+///   flags (bit 0 clear: the first 16-bit row slot is padding);
+/// then rows top-down, MSB = leftmost pixel:
+///   0x069: 9 words, two 16-bit rows each, low half first (h <= 17);
+///   0x06A: 17 words, the same (h <= 33);
+///   0x06D: 17 words, one 32-bit row each (w <= 32, h <= 17).
+pub const T_IRIS_CHAR16: u32 = 0x069;
+pub const T_IRIS_CHAR16_TALL: u32 = 0x06a;
+pub const T_IRIS_CHAR32: u32 = 0x06d;
 /// Frame setup: 0x008 = 0, back buffer (0/1); 0x005 = colour write mask
 /// for it (0x000FFF / 0xFFF000 for 12-bit double buffering).
 pub const T_IRIS_BUFFER: u32 = 0x008;
@@ -245,12 +275,19 @@ pub struct GlState {
     /// Self-streaming port being assembled.
     port: u32,
     port_n: u32,
-    port_buf: [u32; 16],
+    port_buf: [u32; 24],
     /// Primitive assembly.
     vroutine: u32,
     nv: u32,
     first: Wv,
     prev: [Wv; 3],
+    /// Character position (cmov): window x, y; 0 valid, 1 clipped.
+    cpos: [i32; 3],
+    /// Colour latched by cmov for the characters drawn there.
+    cpos_color: [f32; 4],
+    /// move / draw pen: 0 = next 0x05D point is a move.
+    pen: u32,
+    pen_at: Wv,
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
 }
@@ -258,6 +295,11 @@ pub struct GlState {
 const IDENT: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
 
 impl GlState {
+    /// Range of the R channel in GL colour units (see to_fixed).
+    fn cmax(&self) -> f32 {
+        if self.pixfmt == re3::PIXFMT_CI12 { 4095.0 / 255.0 } else { 1.0 }
+    }
+
     fn ensure_init(&mut self) {
         if self.inited == 0 {
             self.inited = 1;
@@ -409,11 +451,15 @@ fn port_words(index: u32) -> Option<u32> {
         T_SPAN_COLOR | T_SPAN_COLOR_B if conv == 5 => Some(1),
         T_SPAN_COLOR | T_SPAN_COLOR_B if conv == 0 || conv == 4 => Some(4),
         T_SPAN_SETUP | T_SPAN_SKIP if index & !0x1ff == 0 => Some(if tok == T_SPAN_SETUP { 6 } else { 1 }),
-        T_VERTEX if index & (USEV | LOADV) != 0 || conv != 0 => Some(match conv { 1 => 3, 2 => 2, _ => 4 }),
+        T_VERTEX | T_IRIS_PDR if index & (USEV | LOADV) != 0 || conv != 0 => Some(match conv { 1 => 3, 2 => 2, _ => 4 }),
+        T_IRIS_INDEX if conv == 6 => Some(1),
+        T_IRIS_DRAW | T_IRIS_CMOV if conv != 0 => Some(match conv { 1 => 3, 2 => 2, _ => 4 }),
         T_COLOR if index & !0x1ff != 0 => Some(match conv { 3 => 3, 4 => 4, _ => 1 }),
         T_IRIS_COLOR => Some(match conv { 3 => 3, 4 => 4, _ => 1 }),
         _ if index & !0x1ff != 0 => None,
         T_MODELVIEW | T_PROJECTION | T_TEXTURE_MATRIX | T_IRIS_MATRIX => Some(16),
+        T_IRIS_CHAR16 => Some(13),
+        T_IRIS_CHAR16_TALL | T_IRIS_CHAR32 => Some(21),
         T_NORMAL_MATRIX => Some(9),
         T_NORMAL | T_IRIS_NORMAL => Some(3),
         T_COLOR_WRITEMASK => Some(2),
@@ -422,9 +468,12 @@ fn port_words(index: u32) -> Option<u32> {
     }
 }
 
-fn to_rgb8(c: [f32; 4]) -> u32 {
-    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-    q(c[0]) | (q(c[1]) << 8) | (q(c[2]) << 16)
+/// R, G, B as RE3 8.11 iterator values. `max` is the channel range in GL
+/// units: 1.0 in RGB; in colour-index mode R carries the index (/255) and
+/// may reach 4095/255 (R is 12.11, RE3.h).
+fn to_fixed(c: [f32; 4], max: f32) -> [u32; 3] {
+    let q = |v: f32, m: f32| ((v.clamp(0.0, m) * 255.0 + 0.5) as u32) << 11;
+    [q(c[0], max), q(c[1], 1.0), q(c[2], 1.0)]
 }
 
 /// GL context save / restore through kernel memory, as the kernel's
@@ -576,7 +625,8 @@ impl Hq2Engine {
             | T_BLEND_MODE | T_LOGIC_OP | T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS | T_READ_DONE => 1,
             T_FRAGMENT => 7,
             T_STENCIL_CLEAR | T_IRIS_BUFFER | T_IRIS_DB => 2,
-            T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON => 1,
+            T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
+            | T_IRIS_PMV | T_IRIS_PCLOS | T_IRIS_MOVE | T_IRIS_GETCPOS => 1,
             T_DEPTH_CLEAR => 3,
             T_STENCIL_MODE => 7,
             T_STIPPLE_ON => 33,
@@ -687,7 +737,35 @@ impl Hq2Engine {
                     _ => g.color,
                 };
             }
-            T_VERTEX => {
+            T_IRIS_INDEX => {
+                g.color = [num(b[0]) / 255.0, 0.0, 0.0, 1.0];
+            }
+            T_IRIS_CMOV => {
+                let v = [num(b[0]), num(b[1]), if conv == 2 { 0.0 } else { num(b[2]) }, 1.0];
+                let wv = g.transform(v);
+                g.cpos = [
+                    (wv.x - g.win[0] as f32).floor() as i32,
+                    (wv.y - g.win[1] as f32).floor() as i32,
+                    (wv.ok == 0) as i32,
+                ];
+                g.cpos_color = g.color;
+            }
+            T_IRIS_CHAR16 | T_IRIS_CHAR16_TALL | T_IRIS_CHAR32 => {
+                let b = &b[..n as usize];
+                self.gl_glyph(tok, b, out);
+            }
+            T_IRIS_DRAW => {
+                let v = [num(b[0]), num(b[1]), if conv == 2 { 0.0 } else { num(b[2]) }, 1.0];
+                let wv = g.transform(v);
+                let (p, pen) = (g.pen_at, g.pen);
+                g.pen_at = wv;
+                g.pen = 1;
+                if pen != 0 {
+                    let c = wv.c;
+                    self.gl_line(p, wv, c, out);
+                }
+            }
+            T_VERTEX | T_IRIS_PDR => {
                 let v = match conv {
                     1 => [num(b[0]), num(b[1]), num(b[2]), 1.0],
                     2 => [num(b[0]), num(b[1]), 0.0, 1.0],
@@ -805,7 +883,7 @@ impl Hq2Engine {
             T_STIPPLE_OFF => g.stipple_on = 0,
             T_BLEND_MODE => g.blend_fast = a[0] & 1,
             T_IRIS_DB => g.lt.on = a[1] & 1,
-            T_IRIS_BUFFER | T_IRIS_BGNPOLYGON => {}
+            T_IRIS_BUFFER | T_IRIS_BGNPOLYGON | T_IRIS_PMV => {}
             T_IRIS_WRITEMASK => g.masks = [a[0] & 0x00ff_ffff; 2],
             T_IRIS_CLEAR => {
                 let c = g.color;
@@ -815,7 +893,7 @@ impl Hq2Engine {
             // Z is signed 24-bit); the word is the Z plane mask (atlantis
             // sends 0x00FFFFFF). Explicit values come through czclear, 0x68A0.
             T_IRIS_ZCLEAR => self.gl_zfill(0x007f_ffff, a[0] & 0x00ff_ffff, out),
-            T_IRIS_ENDPOLYGON => {
+            T_IRIS_ENDPOLYGON | T_IRIS_PCLOS => {
                 let g = &self.gl;
                 if g.vroutine == VR_IRIS_POLYGON && g.polymode == 3 && g.nv >= 3 {
                     let (a, b) = (g.prev[0], g.first);
@@ -840,6 +918,12 @@ impl Hq2Engine {
                 for (k, v) in n.iter().enumerate() {
                     out.shram(READBACK_SHRAM + k, v.to_bits());
                 }
+            }
+            T_IRIS_MOVE => g.pen = 0,
+            T_IRIS_GETCPOS => {
+                out.shram(READBACK_SHRAM, g.cpos[0] as u32);
+                out.shram(READBACK_SHRAM + 1, g.cpos[1] as u32);
+                out.shram(READBACK_SHRAM + 2, if g.cpos[2] != 0 { 0x8000_0000 } else { 0 });
             }
             T_GET_RASTERPOS => {
                 // Raster position is not tracked yet (unverified layout).
@@ -878,9 +962,12 @@ impl Hq2Engine {
                 let z = a[1] & 0x00ff_ffff;
                 self.gl_zfill(z, 0x00ff_ffff, out);
             }
+            // Visual of the window being bound: 4 = 24-bit RGB, 2 = 12-bit
+            // RGB, 10 = 12-bit colour index (showmap) (inferred from traces).
             T_MAKECURRENT => match a[0] {
                 4 => g.pixfmt = 0,
                 2 => g.pixfmt = re3::PIXFMT_RGB12,
+                10 => g.pixfmt = re3::PIXFMT_CI12,
                 _ => {}
             },
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => {
@@ -939,6 +1026,8 @@ impl Hq2Engine {
             T_STIPPLE_OFF => "GL_POLYGON_STIPPLE off".to_string(),
             T_FRAGMENT => format!("GL_FRAGMENT window ({}, {}) z {:#x} rgba ({:.3}, {:.3}, {:.3}, {:.3})",
                 a[0] as i32 - FRAGMENT_BIAS, a[1] as i32 - FRAGMENT_BIAS, a[2], f(a[3]), f(a[4]), f(a[5]), f(a[6])),
+            T_IRIS_MOVE => "IRISGL_MOVE".to_string(),
+            T_IRIS_GETCPOS => format!("IRISGL_GETCPOS -> ({}, {}){}", g.cpos[0], g.cpos[1], if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
             T_LOGIC_OP => format!("GL_LOGIC_OP {}", g.logic_op),
@@ -952,8 +1041,8 @@ impl Hq2Engine {
             T_IRIS_WRITEMASK => format!("IRISGL_WRITEMASK {:#08x}", a[0]),
             T_IRIS_CLEAR => format!("IRISGL_CLEAR rgb ({:.3}, {:.3}, {:.3}) rect {:?}", g.color[0], g.color[1], g.color[2], g.clip_rect()),
             T_IRIS_ZCLEAR => format!("IRISGL_ZCLEAR {:#x}", a[0]),
-            T_IRIS_BGNPOLYGON => "IRISGL_BGNPOLYGON".to_string(),
-            T_IRIS_ENDPOLYGON => "IRISGL_ENDPOLYGON".to_string(),
+            T_IRIS_BGNPOLYGON | T_IRIS_PMV => "IRISGL_BGNPOLYGON".to_string(),
+            T_IRIS_ENDPOLYGON | T_IRIS_PCLOS => "IRISGL_ENDPOLYGON".to_string(),
             T_IRIS_DB => format!("IRISGL_LIGHTING {}", a[1]),
             T_DEPTH_TEST | T_DEPTH_FUNC | T_DEPTH_MASK => format!("GL_DEPTH test={} func={} mask={:#08x}", g.ztest, g.zfunc, g.zmask),
             T_STENCIL_MODE => format!("GL_STENCIL on={} ref={} func={} mask={:#x} ops fail={} zfail={} zpass={}",
@@ -963,7 +1052,11 @@ impl Hq2Engine {
             T_STENCIL_CLEAR => format!("GL_CLEAR_STENCIL {} mask {:#x} rect {:?}", a[0], a[1], g.clip_rect()),
             T_DEPTH_CLEAR => format!("GL_CLEAR_DEPTH {:#x} colour {:#010x} planes {:#08x} rect {:?}", a[1], a[0], a[2], g.clip_rect()),
             T_SWAP_BUFFERS => format!("GL_SWAP_BUFFERS state {} (draw mask {:#08x})", g.swap, g.masks[g.swap as usize & 1]),
-            T_MAKECURRENT => format!("GL_MAKECURRENT mode {} -> {}", a[0], if g.pixfmt == re3::PIXFMT_RGB12 { "RGB12" } else { "RGB24" }),
+            T_MAKECURRENT => format!("GL_MAKECURRENT mode {} -> {}", a[0], match g.pixfmt {
+                re3::PIXFMT_RGB12 => "RGB12",
+                re3::PIXFMT_CI12 => "CI12",
+                _ => "RGB24",
+            }),
             _ => return None,
         })
     }
@@ -1091,9 +1184,8 @@ impl Hq2Engine {
         }
         self.gl_setup(out);
         let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32) << 11;
-        out.reg(re3::REG_R, q(c[0]));
-        out.reg(re3::REG_G, q(c[1]));
-        out.reg(re3::REG_B, q(c[2]));
+        let rgb = to_fixed(c, self.gl.cmax());
+        self.gl_color_regs(rgb, out);
         out.reg(re3::REG_DR, 0);
         out.reg(re3::REG_DG, 0);
         out.reg(re3::REG_DB, 0);
@@ -1122,10 +1214,50 @@ impl Hq2Engine {
         }
     }
 
-    fn gl_color_regs(&mut self, rgb: u32, out: &mut dyn Re3Sink) {
-        out.reg(re3::REG_R, (rgb & 0xff) << 11);
-        out.reg(re3::REG_G, ((rgb >> 8) & 0xff) << 11);
-        out.reg(re3::REG_B, ((rgb >> 16) & 0xff) << 11);
+    fn gl_color_regs(&mut self, c: [u32; 3], out: &mut dyn Re3Sink) {
+        out.reg(re3::REG_R, c[0]);
+        out.reg(re3::REG_G, c[1]);
+        out.reg(re3::REG_B, c[2]);
+    }
+
+    /// One character bitmap (T_IRIS_CHAR*) at the character position.
+    fn gl_glyph(&mut self, tok: u32, b: &[u32], out: &mut dyn Re3Sink) {
+        let g = &mut self.gl;
+        let hi = |w: u32| (w >> 16) as i16 as i32;
+        let lo = |w: u32| w as i16 as i32;
+        let (w, h) = (hi(b[0]), lo(b[0]));
+        let (xorig, yorig) = (hi(b[1]), lo(b[1]));
+        let (cx, cy, invalid) = (g.cpos[0], g.cpos[1], g.cpos[2]);
+        g.cpos[0] += hi(b[2]);
+        g.cpos[1] += lo(b[2]);
+        if invalid != 0 || w <= 0 || h <= 0 {
+            return;
+        }
+        let data = &b[4..];
+        let rows: Vec<u32> = if tok == T_IRIS_CHAR32 {
+            data.to_vec()
+        } else {
+            let skip = (b[3] & 1 == 0) as usize;
+            data.iter().flat_map(|&v| [(v & 0xffff) << 16, v & 0xffff_0000]).skip(skip).collect()
+        };
+        let (x0, top) = (g.win[0] + cx - xorig, g.win[1] + cy - yorig + h - 1);
+        let wmask = if w >= 32 { u32::MAX } else { !(u32::MAX >> w) };
+        let c = to_fixed(g.cpos_color, g.cmax());
+        self.gl_setup(out);
+        self.gl_color_regs(c, out);
+        for (r, &bits) in rows.iter().take(h as usize).enumerate() {
+            let bits = bits & wmask;
+            if bits == 0 {
+                continue;
+            }
+            let y = top - r as i32;
+            let (pieces, np) = self.gl.span_pieces(y, x0, x0 + w);
+            for &(a, e) in &pieces[..np] {
+                let sh = (a - x0) as u32;
+                self.span(a, y, (e - a) as u32, Some(if sh >= 32 { 0 } else { bits << sh }), out);
+            }
+        }
+        self.gl_done(out);
     }
 
     fn gl_clear(&mut self, c: [f32; 4], out: &mut dyn Re3Sink) {
@@ -1134,7 +1266,7 @@ impl Hq2Engine {
             return;
         }
         self.gl_setup(out);
-        self.gl_color_regs(to_rgb8(c), out);
+        self.gl_color_regs(to_fixed(c, self.gl.cmax()), out);
         for r in &rects[..n] {
             for y in r[1]..r[3] {
                 self.span(r[0], y, (r[2] - r[0]) as u32, None, out);
@@ -1152,7 +1284,7 @@ impl Hq2Engine {
             return;
         }
         self.gl_setup(out);
-        self.gl_color_regs(to_rgb8(color), out);
+        self.gl_color_regs(to_fixed(color, self.gl.cmax()), out);
         self.span(x, y, 1, None, out);
         self.gl_done(out);
     }
@@ -1164,7 +1296,7 @@ impl Hq2Engine {
             return;
         }
         self.gl_setup(out);
-        self.gl_color_regs(to_rgb8(color), out);
+        self.gl_color_regs(to_fixed(color, self.gl.cmax()), out);
         let (dx, dy) = (b.x - a.x, b.y - a.y);
         let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
         let (sx, sy) = (dx / steps as f32, dy / steps as f32);
@@ -1256,12 +1388,13 @@ impl Hq2Engine {
         let iter = smooth || zs || blend;
         let aplane = grad(3);
         let flat_c = flat.unwrap_or(v[2].c);
+        let cmax = self.gl.cmax();
         self.gl_setup(out);
         if iter {
             out.reg(re3::REG_DX, 1 << 14);
             out.reg(re3::REG_DY, 0);
         } else {
-            self.gl_color_regs(to_rgb8(flat_c), out);
+            self.gl_color_regs(to_fixed(flat_c, self.gl.cmax()), out);
         }
         let ymin = v.iter().map(|v| v.y).fold(f32::MAX, f32::min);
         let ymax = v.iter().map(|v| v.y).fold(f32::MIN, f32::max);
@@ -1294,13 +1427,14 @@ impl Hq2Engine {
                     let mut start = [0u32; 3];
                     let mut step = [0u32; 3];
                     for k in 0..3 {
+                        let m = if k == 0 { cmax } else { 1.0 };
                         if !smooth {
-                            start[k] = ((flat_c[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u32) << 11;
+                            start[k] = to_fixed(flat_c, cmax)[k];
                             continue;
                         }
                         let (c0, dx, dy) = planes[k];
-                        let s = (c0 + dx * (px - v[0].x) + dy * (yc - v[0].y)).clamp(0.0, 255.0);
-                        let e = (s + dx * (n - 1) as f32).clamp(0.0, 255.0);
+                        let s = (c0 + dx * (px - v[0].x) + dy * (yc - v[0].y)).clamp(0.0, 255.0 * m);
+                        let e = (s + dx * (n - 1) as f32).clamp(0.0, 255.0 * m);
                         let d = if n > 1 { (e - s) / (n - 1) as f32 } else { 0.0 };
                         start[k] = (s * 2048.0) as u32;
                         step[k] = ((d * 2048.0) as i32) as u32;
