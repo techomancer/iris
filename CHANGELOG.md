@@ -125,6 +125,10 @@ is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **Graphics board picker** in Configuration → General: Newport, GR2 XZ or GR2
+  Extreme (Indigo2 only). Picking a GR2 board resets heads, resolution and
+  `[impact]` to values `validate()` accepts; the Newport heads control is
+  hidden for GR2.
 - Scaling and resize fixes (`e93c5bb`): the VM screen scale is now the maximum
   draw scale, so a larger window centres the picture instead of stretching it;
   a snap-to-size request made while fullscreen is applied when fullscreen ends.

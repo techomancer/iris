@@ -421,6 +421,21 @@ pub enum GraphicsBoard {
     Extreme,
 }
 
+impl GraphicsBoard {
+    pub const ALL: [Self; 3] = [Self::Newport, Self::Xz, Self::Extreme];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Newport => "Newport (XL)",
+            Self::Xz => "GR2 XZ",
+            Self::Extreme => "GR2 Extreme",
+        }
+    }
+    /// Whether `validate()` accepts this board on `profile`.
+    pub fn supports(self, profile: MachineProfile) -> bool {
+        self != Self::Extreme || profile == MachineProfile::Indigo2Ip22
+    }
+}
+
 /// IMPACT board occupying one GIO64 slot (Indigo2 preview scaffold).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]

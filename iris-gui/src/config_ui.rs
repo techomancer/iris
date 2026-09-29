@@ -218,6 +218,11 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                 ui.selectable_value(&mut cfg.machine.profile, p, p.label());
             }
         });
+    // GR2 Extreme is Indigo2-only; moving to Indy keeps the closest board
+    // rather than leaving a config `validate()` would reject at Start.
+    if !cfg.graphics.board.supports(cfg.machine.profile) {
+        cfg.graphics.board = GraphicsBoard::Xz;
+    }
     ui.label(
         RichText::new(
             "IRIX Software Manager and hinv report IP22 as the platform family on Indy — that is normal. \
@@ -287,13 +292,16 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         .weak().small());
     ui.separator();
 
-    ui.horizontal(|ui| {
-        ui.label("Newport heads");
-        ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
-        if cfg.graphics.heads == 2 {
-            ui.label(RichText::new("(dual-head: second REX3 @ GIO slot 1)").weak().small());
-        }
-    });
+    show_board_picker(ui, cfg, mem_ctx.running);
+    if cfg.graphics.board == GraphicsBoard::Newport {
+        ui.horizontal(|ui| {
+            ui.label("Newport heads");
+            ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
+            if cfg.graphics.heads == 2 {
+                ui.label(RichText::new("(dual-head: second REX3 @ GIO slot 1)").weak().small());
+            }
+        });
+    }
     show_resolution_picker(ui, cfg, false);
     ui.add_space(4.0);
     Grid::new("general_grid").num_columns(2).striped(true).show(ui, |ui| {
@@ -425,6 +433,49 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
         .weak()
         .small(),
     );
+}
+
+fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
+    let before = cfg.graphics.board;
+    ui.horizontal(|ui| {
+        ui.label("Graphics board");
+        ui.add_enabled_ui(!running, |ui| {
+            ComboBox::from_id_salt("graphics_board")
+                .selected_text(cfg.graphics.board.label())
+                .show_ui(ui, |ui| {
+                    for b in GraphicsBoard::ALL {
+                        ui.add_enabled_ui(b.supports(cfg.machine.profile), |ui| {
+                            ui.selectable_value(&mut cfg.graphics.board, b, b.label())
+                                .on_disabled_hover_text("Indigo2 only");
+                        });
+                    }
+                });
+        });
+    });
+    // GR2 is single-head, has no VC2 presets and shares the gfx slot with
+    // IMPACT; clear those so the config still passes `validate()`.
+    if cfg.graphics.board != before && cfg.graphics.board != GraphicsBoard::Newport {
+        cfg.graphics.heads = 1;
+        cfg.graphics.resolution = NewportResolution::Guest;
+        cfg.impact = Default::default();
+    }
+    if running {
+        ui.label(
+            RichText::new("Stop the VM to change the graphics board — it applies at the next Start.")
+                .color(Color32::from_rgb(220, 170, 90))
+                .small(),
+        );
+    }
+    if cfg.graphics.board != GraphicsBoard::Newport {
+        ui.label(
+            RichText::new(
+                "GR2 is newer than Newport: PROM, textport, X and GL work, with gaps. \
+                 Single head, guest-programmed resolution.",
+            )
+            .weak()
+            .small(),
+        );
+    }
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
