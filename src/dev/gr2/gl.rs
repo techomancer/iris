@@ -217,8 +217,11 @@ pub struct Wv {
     /// Back-face colour (two-sided lighting; = c otherwise).
     pub cb: [f32; 4],
     /// 0 when the vertex is behind the eye (w <= 0): it has no window
-    /// position and its primitive must be clipped (gl_tri / gl_line).
+    /// position and its primitive must be clipped (gl_poly / gl_line).
     pub ok: u32,
+    /// Clip planes the vertex is outside of (bit i = plane i), computed once
+    /// at transform; 0 for vertices made by clipping or in window space.
+    pub oc: u32,
     /// Clip-space position (frustum clipping) and eye-space position (user
     /// clip planes). Both are linear in the object position, so clipping
     /// interpolates them along an edge exactly.
@@ -231,6 +234,19 @@ pub struct Wv {
 /// transform), 6..11 the user planes (0x02E / 0x02F, eye space).
 const CLIP_PLANES: usize = 12;
 
+/// Vertex buffer (GlState::vb): strips, fans and tmeshes cycle through the
+/// first RING slots, never overwriting the vertices they still refer to
+/// (the last three and a fan's first); polygons fill all VB slots and are
+/// drawn whole at their end. Clipping appends new vertices in a scratch
+/// area addressed after the buffer (indices VB..), so polygons are clipped
+/// as index lists.
+const VB: usize = 32;
+const RING: usize = 8;
+/// Largest polygon after clipping: each plane adds at most one vertex.
+const MAXP: usize = VB + CLIP_PLANES;
+const SCRATCH: usize = 2 * CLIP_PLANES;
+const ALL_EDGES: u64 = u64::MAX;
+
 /// Point on a-b at the crossing of a plane where the signed distances are
 /// da and db: positions and colours interpolated, window position still to
 /// be computed (GlState::project).
@@ -238,6 +254,7 @@ fn clip_cross(a: &Wv, b: &Wv, da: f32, db: f32) -> Wv {
     let t = da / (da - db);
     let l = |x: f32, y: f32| x + (y - x) * t;
     let mut v = *a;
+    v.oc = 0;
     for k in 0..4 {
         v.h[k] = l(a.h[k], b.h[k]);
         v.e[k] = l(a.e[k], b.e[k]);
@@ -317,11 +334,19 @@ pub struct GlState {
     port: u32,
     port_n: u32,
     port_buf: [u32; 24],
-    /// Primitive assembly.
+    /// Primitive assembly: the vertex routine (LOADV), vertices since it
+    /// started, the vertex buffer, the three newest earlier vertices (pv[0]
+    /// newest; swaptmesh swaps pv[0] and pv[1]), the first vertex (fans,
+    /// line loops), the ring's next slot, a polygon's vertex count and
+    /// whether it continues an earlier full buffer.
     vroutine: u32,
     nv: u32,
-    first: Wv,
-    prev: [Wv; 3],
+    vb: [Wv; VB],
+    pv: [u32; 3],
+    vfirst: u32,
+    vhead: u32,
+    pn: u32,
+    pcont: u32,
     /// Character position (cmov): window x, y; 0 valid, 1 clipped.
     cpos: [i32; 3],
     /// Colour latched by cmov for the characters drawn there.
@@ -403,8 +428,22 @@ impl GlState {
         let m = &self.mv;
         let eye = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
         let e = [eye(0), eye(1), eye(2), eye(3)];
-        let out = Wv { c: self.color, cb: self.color, h, e, ..Default::default() };
+        let mut out = Wv { c: self.color, cb: self.color, h, e, ..Default::default() };
+        out.oc = self.outcode(&out);
         self.project(out)
+    }
+
+    /// Ring slot for the next strip / fan / tmesh vertex.
+    fn vb_alloc(&mut self) -> usize {
+        for i in 0..RING {
+            let s = (self.vhead as usize + i) % RING;
+            let s32 = s as u32;
+            if !self.pv.contains(&s32) && s32 != self.vfirst {
+                self.vhead = s32 + 1;
+                return s;
+            }
+        }
+        0
     }
 
     /// Signed distance of `v` to clip plane `i` (>= 0 inside).
@@ -989,14 +1028,8 @@ impl Hq2Engine {
             // Z is signed 24-bit); the word is the Z plane mask (atlantis
             // sends 0x00FFFFFF). Explicit values come through czclear, 0x68A0.
             T_IRIS_ZCLEAR => self.gl_zfill(0x007f_ffff, a[0] & 0x00ff_ffff, out),
-            T_IRIS_ENDPOLYGON | T_IRIS_PCLOS => {
-                let g = &self.gl;
-                if g.vroutine == VR_IRIS_POLYGON && g.polymode == 3 && g.nv >= 3 {
-                    let (a, b) = (g.prev[0], g.first);
-                    let c = if g.smooth != 0 { b.c } else { g.first.c };
-                    self.gl_line(a, b, c, out);
-                }
-            }
+            // The polygon is drawn whole when LOADV|0x065 follows.
+            T_IRIS_ENDPOLYGON | T_IRIS_PCLOS => {}
             light::T_LIGHTING | light::T_TWO_SIDED | light::T_NORMALIZE | light::T_NORMALIZE_B
             | light::T_FOG_ON | light::T_MATERIAL_COMMIT => {
                 g.lt.command(cmd, &a[..]);
@@ -1024,7 +1057,7 @@ impl Hq2Engine {
                 g.uclip[a[0] as usize] = [f(a[1]), f(a[2]), f(a[3]), f(a[4])];
             },
             T_IRIS_SWAPTMESH => {
-                g.prev.swap(0, 1);
+                g.pv.swap(0, 1);
                 g.tflip ^= 1;
             }
             T_IRIS_SBOXF | T_IRIS_SBOXFI => {
@@ -1032,17 +1065,17 @@ impl Hq2Engine {
                 let p = g.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
                 let q = g.transform([num(a[2]), num(a[3]), 0.0, 1.0]);
                 if p.ok != 0 && q.ok != 0 {
+                    // Window-space box: rasterized directly, no clipping.
                     let (x0, x1) = (p.x.min(q.x), p.x.max(q.x));
                     let (y0, y1) = (p.y.min(q.y), p.y.max(q.y));
-                    let at = |x: f32, y: f32| Wv { x, y, ..p };
-                    let (c0, c1, c2, c3) = (at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1));
+                    let at = |x: f32, y: f32| Wv { x, y, oc: 0, ..p };
+                    let mut quad = [at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)];
                     // Counter-clockwise, so face culling never drops it.
                     let (cf, cb) = (g.cull_front, g.cull_back);
                     g.cull_front = 0;
                     g.cull_back = 0;
                     let mut none: Option<&mut dyn FnMut(String)> = None;
-                    self.gl_tri([c0, c1, c2], c0, 0b111, out, &mut none);
-                    self.gl_tri([c0, c2, c3], c0, 0b111, out, &mut none);
+                    self.gl_poly_raster(&mut quad, p, ALL_EDGES, out, &mut none);
                     self.gl.cull_front = cf;
                     self.gl.cull_back = cb;
                 }
@@ -1106,27 +1139,25 @@ impl Hq2Engine {
                 }
             }
             c if c & LOADV != 0 => {
-                let r = c & 0x1ff;
-                if self.gl.vroutine == VR_LLOOP && r == VR_OUTSIDE && self.gl.nv > 1 {
-                    // (closing handled by END_LLOOP)
-                }
-                self.gl.vroutine = r;
-                self.gl.nv = 0;
-                self.gl.tflip = 0;
+                // A new vertex routine ends the primitive in progress: every
+                // End (GL 0x0FC/0x0FD, IRIS 0x041/0x042) is followed by
+                // LOADV|0x065. A pending polygon is drawn now, whole.
+                let mut none: Option<&mut dyn FnMut(String)> = None;
+                self.gl_poly_flush(true, out, &mut none);
+                let g = &mut self.gl;
+                g.vroutine = c & 0x1ff;
+                g.nv = 0;
+                g.tflip = 0;
+                g.pn = 0;
+                g.pcont = 0;
+                g.pv = [u32::MAX; 3];
+                g.vfirst = u32::MAX;
             }
             END_LLOOP => {
-                if self.gl.vroutine == VR_LLOOP && self.gl.nv > 1 {
-                    let (a, b) = (self.gl.prev[0], self.gl.first);
-                    self.gl_line(a, b, b.c, out);
-                }
-            }
-            END_POLYGON => {
-                // Line mode: the closing edge of the polygon.
                 let g = &self.gl;
-                if g.vroutine == VR_POLYGON && g.polymode == 3 && g.nv >= 3 {
-                    let (a, b, c) = (g.prev[0], g.first, g.first.c);
-                    let flat = if g.smooth != 0 { b.c } else { c };
-                    self.gl_line(a, b, flat, out);
+                if g.vroutine == VR_LLOOP && g.nv > 1 {
+                    let (a, b) = (g.vb[g.pv[0] as usize], g.vb[g.vfirst as usize]);
+                    self.gl_line(a, b, b.c, out);
                 }
             }
             _ => {} // other Begin/End tokens: assembly is keyed by LOADV
@@ -1191,47 +1222,78 @@ impl Hq2Engine {
 
     /// Primitive assembly for one transformed vertex.
     fn gl_vertex(&mut self, v: Wv, out: &mut dyn Re3Sink, done: &mut Option<&mut dyn FnMut(String)>) {
+        let polygon = matches!(self.gl.vroutine, VR_POLYGON | VR_IRIS_POLYGON);
+        if polygon {
+            // Polygons are convex (GL and IRIS GL): kept whole and drawn as
+            // one primitive at their end. A buffer-full polygon is drawn
+            // so far and continues from its first and last vertex.
+            if self.gl.pn as usize == VB {
+                self.gl_poly_flush(false, out, done);
+            }
+            let g = &mut self.gl;
+            g.vb[g.pn as usize] = v;
+            g.pn += 1;
+            g.nv += 1;
+            return;
+        }
         let g = &mut self.gl;
         let n = g.nv;
         g.nv += 1;
-        let (p0, p1, p2) = (g.prev[0], g.prev[1], g.prev[2]);
-        let first = g.first;
+        let s = g.vb_alloc();
+        g.vb[s] = v;
         if n == 0 {
-            g.first = v;
+            g.vfirst = s as u32;
         }
-        // prev[0] = newest before v.
-        g.prev = [v, p0, p1];
-        let flat = |c: Wv| c;
-        // Edge masks (bit 0: v0-v1, 1: v1-v2, 2: v2-v0) mark real polygon
-        // edges for GL_LINE polygon mode (no quad/polygon diagonals).
+        let [p0, p1, p2] = g.pv.map(|x| x as u8);
+        g.pv = [s as u32, g.pv[0], g.pv[1]];
+        let (s, first) = (s as u8, g.vfirst as u8);
         match g.vroutine {
             VR_POINTS => self.gl_point(v, v.c, out),
-            VR_LINES => if n % 2 == 1 { self.gl_line(p0, v, v.c, out) },
-            VR_LSTRIP | VR_LLOOP => if n >= 1 { self.gl_line(p0, v, v.c, out) },
-            VR_TRIANGLES => if n % 3 == 2 { self.gl_tri([p1, p0, v], flat(v), 0b111, out, done) },
+            VR_LINES => if n % 2 == 1 { self.gl_line(self.gl.vb[p0 as usize], v, v.c, out) },
+            VR_LSTRIP | VR_LLOOP => if n >= 1 { self.gl_line(self.gl.vb[p0 as usize], v, v.c, out) },
+            VR_TRIANGLES => if n % 3 == 2 { self.gl_poly(&[p1, p0, s], s, ALL_EDGES, out, done) },
             VR_TSTRIP => if n >= 2 {
                 // (older, newer, v); every other triangle reversed to keep
                 // one winding. A swaptmesh also flips it, so fans built with
                 // swaps keep one winding too.
-                let t = if g.tflip == 0 { [p1, p0, v] } else { [p0, p1, v] };
+                let t = if g.tflip == 0 { [p1, p0, s] } else { [p0, p1, s] };
                 g.tflip ^= 1;
-                self.gl_tri(t, flat(v), 0b111, out, done)
+                self.gl_poly(&t, s, ALL_EDGES, out, done)
             },
-            VR_TFAN => if n >= 2 { self.gl_tri([first, p0, v], flat(v), 0b111, out, done) },
-            VR_QUADS => if n % 4 == 3 {
-                self.gl_tri([p2, p1, p0], flat(v), 0b011, out, done);
-                self.gl_tri([p2, p0, v], flat(v), 0b110, out, done);
-            },
-            VR_QSTRIP => if n >= 3 && n % 2 == 1 {
-                // Quad (v0, v1, v3, v2) of the pair (p2, p1) + (p0, v).
-                self.gl_tri([p2, p1, v], flat(v), 0b011, out, done);
-                self.gl_tri([p2, v, p0], flat(v), 0b110, out, done);
-            },
-            VR_POLYGON | VR_IRIS_POLYGON => if n >= 2 {
-                let edges = 0b010 | if n == 2 { 0b001 } else { 0 };
-                self.gl_tri([first, p0, v], flat(first), edges, out, done)
-            },
+            VR_TFAN => if n >= 2 { self.gl_poly(&[first, p0, s], s, ALL_EDGES, out, done) },
+            VR_QUADS => if n % 4 == 3 { self.gl_poly(&[p2, p1, p0, s], s, ALL_EDGES, out, done) },
+            // Quad (v0, v1, v3, v2) of the pair (p2, p1) + (p0, v).
+            VR_QSTRIP => if n >= 3 && n % 2 == 1 { self.gl_poly(&[p2, p1, s, p0], s, ALL_EDGES, out, done) },
             _ => {}
+        }
+    }
+
+    /// Draw the polygon collected in the vertex buffer. `last`: its end
+    /// (closing edge is a real edge); otherwise the buffer is full and the
+    /// polygon continues as a fan piece from vertex 0 and the last one.
+    fn gl_poly_flush(&mut self, last: bool, out: &mut dyn Re3Sink, done: &mut Option<&mut dyn FnMut(String)>) {
+        let g = &self.gl;
+        if !matches!(g.vroutine, VR_POLYGON | VR_IRIS_POLYGON) || g.pn < 3 {
+            return;
+        }
+        let n = g.pn as usize;
+        let mut edges = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if !last {
+            edges &= !(1u64 << (n - 1));
+        }
+        if g.pcont != 0 {
+            edges &= !1;
+        }
+        let mut idx = [0u8; VB];
+        for (i, x) in idx.iter_mut().enumerate().take(n) {
+            *x = i as u8;
+        }
+        self.gl_poly(&idx[..n], 0, edges, out, done);
+        if !last {
+            let g = &mut self.gl;
+            g.vb[1] = g.vb[n - 1];
+            g.pn = 2;
+            g.pcont = 1;
         }
     }
 
@@ -1408,7 +1470,7 @@ impl Hq2Engine {
     }
 
     fn gl_point(&mut self, v: Wv, color: [f32; 4], out: &mut dyn Re3Sink) {
-        if v.ok == 0 || self.gl.outcode(&v) != 0 {
+        if v.ok == 0 || v.oc != 0 {
             return;
         }
         let (x, y) = (v.x.floor() as i32, v.y.floor() as i32);
@@ -1425,7 +1487,7 @@ impl Hq2Engine {
     /// not yet).
     fn gl_line(&mut self, mut a: Wv, mut b: Wv, color: [f32; 4], out: &mut dyn Re3Sink) {
         // Parametric clip against every plane in use (Liang-Barsky style).
-        let (oa, ob) = (self.gl.outcode(&a), self.gl.outcode(&b));
+        let (oa, ob) = (a.oc, b.oc);
         if oa & ob != 0 {
             return;
         }
@@ -1469,95 +1531,119 @@ impl Hq2Engine {
         self.gl_done(out);
     }
 
-    /// Scan-convert one triangle (window coordinates, GL y up; pixel centres
-    /// at +0.5, top-left style fill: a pixel is in if its centre is in
-    /// [left, right) on rows whose centre is in [ymin, ymax)).
-    /// `prov` = the provoking vertex (flat shading colour); `edges` = which
-    /// edges are polygon edges (bit 0: v0-v1, 1: v1-v2, 2: v2-v0) for
-    /// GL_LINE polygon mode.
-    /// Clip a triangle to the view volume and the enabled user planes
-    /// (Sutherland-Hodgman), then rasterize the piece as a fan. Backseat
-    /// Driver's road and terrain run under the camera: without clipping,
-    /// every triangle with a vertex behind the eye was lost.
-    fn gl_tri(&mut self, v: [Wv; 3], prov: Wv, edges: u8, out: &mut dyn Re3Sink,
-              done: &mut Option<&mut dyn FnMut(String)>) {
-        let oc = [self.gl.outcode(&v[0]), self.gl.outcode(&v[1]), self.gl.outcode(&v[2])];
-        if oc[0] & oc[1] & oc[2] != 0 {
+    /// Clip a convex polygon (indices into the vertex buffer) to the view
+    /// volume and the enabled user planes, then rasterize it as one
+    /// primitive. Vertices carry their outcodes from transform, so most
+    /// polygons are accepted or rejected without touching a plane. The rest
+    /// are clipped Sutherland-Hodgman style on index lists; new vertices go
+    /// to a scratch area addressed after the buffer. `prov` = provoking
+    /// vertex (flat shading); `edges` bit k = edge k -> k+1 is a real edge
+    /// (GL_LINE polygon mode). Backseat Driver's road and terrain run under
+    /// the camera: without clipping they were lost entirely.
+    fn gl_poly(&mut self, idx: &[u8], prov: u8, edges: u64, out: &mut dyn Re3Sink,
+               done: &mut Option<&mut dyn FnMut(String)>) {
+        let g = &self.gl;
+        let (mut and, mut or) = (u32::MAX, 0u32);
+        for &i in idx {
+            let o = g.vb[i as usize].oc;
+            and &= o;
+            or |= o;
+        }
+        if and != 0 {
             return; // all outside one plane
         }
-        let cross = oc[0] | oc[1] | oc[2];
-        if cross == 0 {
-            if v.iter().all(|x| x.ok != 0) {
-                self.gl_tri_raster(v, prov, edges, out, done);
+        let prov = g.vb[prov as usize];
+        let mut rv = [Wv::default(); MAXP];
+        let mut redges = edges;
+        let n;
+        if or == 0 {
+            for (d, &i) in rv.iter_mut().zip(idx) {
+                *d = g.vb[i as usize];
             }
-            return;
-        }
-        // Polygon with its edge flags (flag k: edge from vertex k to k+1).
-        const MAXV: usize = 3 + CLIP_PLANES;
-        let mut poly = [Wv::default(); MAXV];
-        let mut pedge = [false; MAXV];
-        let mut n = 3;
-        poly[..3].copy_from_slice(&v);
-        for k in 0..3 {
-            pedge[k] = edges & (1 << k) != 0;
-        }
-        for plane in 0..CLIP_PLANES {
-            if cross & (1 << plane) == 0 || n == 0 {
-                continue;
+            n = idx.len();
+            if rv[..n].iter().any(|v| v.ok == 0) {
+                return;
             }
-            let mut np = [Wv::default(); MAXV];
-            let mut ne = [false; MAXV];
-            let mut m = 0;
-            for i in 0..n {
-                let (a, b) = (&poly[i], &poly[(i + 1) % n]);
-                let (da, db) = (self.gl.clip_dist(a, plane), self.gl.clip_dist(b, plane));
-                if da >= 0.0 {
-                    // The edge from an inside vertex is (part of) edge i.
-                    np[m] = *a;
-                    ne[m] = pedge[i];
-                    m += 1;
+        } else {
+            let mut scratch = [Wv::default(); SCRATCH];
+            let mut ns = 0usize;
+            let mut cur = [0u8; MAXP];
+            let mut cn = idx.len();
+            cur[..cn].copy_from_slice(idx);
+            let vtx = |scratch: &[Wv; SCRATCH], i: u8| -> Wv {
+                if (i as usize) < VB { g.vb[i as usize] } else { scratch[i as usize - VB] }
+            };
+            for plane in 0..CLIP_PLANES {
+                if or & (1 << plane) == 0 || cn < 3 {
+                    continue;
                 }
-                if (da >= 0.0) != (db >= 0.0) && m < MAXV {
-                    // Entering: the rest of edge i. Leaving: the next edge
-                    // runs along the clip plane, not a polygon edge.
-                    np[m] = clip_cross(a, b, da, db);
-                    ne[m] = da < 0.0 && pedge[i];
-                    m += 1;
+                let mut next = [0u8; MAXP];
+                let mut ne = 0u64;
+                let mut m = 0;
+                for i in 0..cn {
+                    let (ia, ib) = (cur[i], cur[(i + 1) % cn]);
+                    let (a, b) = (vtx(&scratch, ia), vtx(&scratch, ib));
+                    let (da, db) = (g.clip_dist(&a, plane), g.clip_dist(&b, plane));
+                    let e = redges >> i & 1;
+                    if da >= 0.0 && m < MAXP {
+                        // The edge from an inside vertex is (part of) edge i.
+                        next[m] = ia;
+                        ne |= e << m;
+                        m += 1;
+                    }
+                    if (da >= 0.0) != (db >= 0.0) && m < MAXP && ns < SCRATCH {
+                        // Entering: the rest of edge i. Leaving: the next
+                        // edge runs along the clip plane, not a real edge.
+                        scratch[ns] = clip_cross(&a, &b, da, db);
+                        next[m] = (VB + ns) as u8;
+                        ne |= ((da < 0.0) as u64 & e) << m;
+                        ns += 1;
+                        m += 1;
+                    }
                 }
+                cur = next;
+                redges = ne;
+                cn = m;
             }
-            poly = np;
-            pedge = ne;
-            n = m;
+            if cn < 3 {
+                return;
+            }
+            for v in &mut scratch[..ns] {
+                *v = g.project(*v);
+            }
+            for (d, &i) in rv.iter_mut().zip(&cur[..cn]) {
+                *d = vtx(&scratch, i);
+                d.oc = 0;
+            }
+            n = cn;
+            if rv[..n].iter().any(|v| v.ok == 0) {
+                return;
+            }
         }
+        self.gl_poly_raster(&mut rv[..n], prov, redges, out, done);
+    }
+
+    /// Culling, two-sided colours and polygon mode for one window-space
+    /// convex polygon, then the rasterizer.
+    fn gl_poly_raster(&mut self, v: &mut [Wv], mut prov: Wv, edges: u64, out: &mut dyn Re3Sink,
+                      done: &mut Option<&mut dyn FnMut(String)>) {
+        let n = v.len();
         if n < 3 {
             return;
         }
-        for p in &mut poly[..n] {
-            *p = self.gl.project(*p);
+        // Twice the signed area (shoelace): > 0 = counter-clockwise, GL y up.
+        let mut area = 0.0f32;
+        for i in 0..n {
+            let (a, b) = (&v[i], &v[(i + 1) % n]);
+            area += a.x * b.y - b.x * a.y;
         }
-        if poly[..n].iter().any(|p| p.ok == 0) {
-            return;
-        }
-        for i in 1..n - 1 {
-            let e = (if i == 1 { pedge[0] as u8 } else { 0 })
-                | ((pedge[i] as u8) << 1)
-                | (if i == n - 2 { (pedge[n - 1] as u8) << 2 } else { 0 });
-            self.gl_tri_raster([poly[0], poly[i], poly[i + 1]], prov, e, out, done);
-        }
-    }
-
-    fn gl_tri_raster(&mut self, mut v: [Wv; 3], mut prov: Wv, edges: u8, out: &mut dyn Re3Sink,
-                     done: &mut Option<&mut dyn FnMut(String)>) {
-        let area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y);
         if area.abs() < 1e-6 {
             return;
         }
-        // Face culling: window-space counter-clockwise (GL y up) is front
-        // when FrontFace is CCW.
         let front = (area > 0.0) == (self.gl.front_ccw != 0);
         if (front && self.gl.cull_front != 0) || (!front && self.gl.cull_back != 0) {
             if let Some(d) = done.as_mut() {
-                d(format!("GL triangle culled ({} face)", if front { "front" } else { "back" }));
+                d(format!("GL polygon culled ({} face)", if front { "front" } else { "back" }));
             }
             return;
         }
@@ -1568,20 +1654,20 @@ impl Hq2Engine {
             }
             prov.c = prov.cb;
         }
-        let flat = Some(prov.c);
+        let smooth = self.gl.smooth != 0;
         match self.gl.polymode {
             2 => {
-                for k in 0..3 {
-                    let c = if self.gl.smooth != 0 { v[k].c } else { flat.unwrap_or(v[2].c) };
+                for k in 0..n {
+                    let c = if smooth { v[k].c } else { prov.c };
                     self.gl_point(v[k], c, out);
                 }
                 return;
             }
             3 => {
-                for k in 0..3 {
-                    if edges & (1 << k) != 0 {
-                        let (a, b) = (v[k], v[(k + 1) % 3]);
-                        let c = if self.gl.smooth != 0 { b.c } else { flat.unwrap_or(v[2].c) };
+                for k in 0..n {
+                    if k < 64 && edges >> k & 1 != 0 {
+                        let (a, b) = (v[k], v[(k + 1) % n]);
+                        let c = if smooth { b.c } else { prov.c };
                         self.gl_line(a, b, c, out);
                     }
                 }
@@ -1589,121 +1675,154 @@ impl Hq2Engine {
             }
             _ => {}
         }
-        let smooth = self.gl.smooth != 0;
+        match (smooth, self.gl_zs_active()) {
+            (true, true) => self.raster_poly::<true, true>(v, prov.c, out, done),
+            (true, false) => self.raster_poly::<true, false>(v, prov.c, out, done),
+            (false, true) => self.raster_poly::<false, true>(v, prov.c, out, done),
+            (false, false) => self.raster_poly::<false, false>(v, prov.c, out, done),
+        }
+    }
+
+    /// Scan-convert a convex polygon (window coordinates, GL y up; pixel
+    /// centres at +0.5; a pixel is in if its centre is in [left, right) on
+    /// rows whose centre is in [ymin, ymax)). Walks the two edge chains down
+    /// from the top vertex; colour (SMOOTH), alpha and Z (ZS) are
+    /// interpolated along the chains and then across each row, which is the
+    /// plane equation for a triangle and Gouraud scanline interpolation for
+    /// a polygon. Each row becomes one RE3 span per visible window piece.
+    /// Flat shading takes `flat` (the provoking vertex's colour).
+    fn raster_poly<const SMOOTH: bool, const ZS: bool>(&mut self, v: &[Wv], flat: [f32; 4], out: &mut dyn Re3Sink,
+                                                       done: &mut Option<&mut dyn FnMut(String)>) {
+        let n = v.len();
         let clip = self.gl.clip_rect();
         if let Some(d) = done.as_mut() {
-            d(format!("GL triangle ({:.1}, {:.1}) ({:.1}, {:.1}) ({:.1}, {:.1}) {} clip {:?}",
-                v[0].x, v[0].y, v[1].x, v[1].y, v[2].x, v[2].y, if smooth { "smooth" } else { "flat" }, clip));
+            d(format!("GL polygon {} vertices ({:.1}, {:.1}) ({:.1}, {:.1}) ({:.1}, {:.1}){} {} clip {:?}",
+                n, v[0].x, v[0].y, v[1].x, v[1].y, v[2].x, v[2].y, if n > 3 { " ..." } else { "" },
+                if SMOOTH { "smooth" } else { "flat" }, clip));
         }
-        // Colour plane equations (per channel, in 0..255 units).
-        let det = area;
-        let grad = |k: usize| {
-            let (c0, c1, c2) = (v[0].c[k] * 255.0, v[1].c[k] * 255.0, v[2].c[k] * 255.0);
-            let dx = ((c1 - c0) * (v[2].y - v[0].y) - (c2 - c0) * (v[1].y - v[0].y)) / det;
-            let dy = ((c2 - c0) * (v[1].x - v[0].x) - (c1 - c0) * (v[2].x - v[0].x)) / det;
-            (c0, dx, dy)
-        };
-        let planes = [grad(0), grad(1), grad(2)];
-        // Window z plane (z already in depth-buffer units).
-        let zdx = ((v[1].z - v[0].z) * (v[2].y - v[0].y) - (v[2].z - v[0].z) * (v[1].y - v[0].y)) / det;
-        let zdy = ((v[2].z - v[0].z) * (v[1].x - v[0].x) - (v[1].z - v[0].z) * (v[2].x - v[0].x)) / det;
-        let zs = self.gl_zs_active();
-        // SHADED spans iterate colour and Z per pixel: needed for smooth
-        // shading and for any depth/stencil work (flat colour = zero deltas).
         let blend = self.gl.blend_func().is_some();
-        let iter = smooth || zs || blend;
-        let aplane = grad(3);
-        let flat_c = flat.unwrap_or(v[2].c);
+        // SHADED spans iterate colour and Z per pixel: smooth shading, depth
+        // or stencil work and blending (flat colour = zero deltas).
+        let iter = SMOOTH || ZS || blend;
         let cmax = self.gl.cmax();
+        let flat_fixed = to_fixed(flat, cmax);
         self.gl_setup(out);
         if iter {
             out.reg(re3::REG_DX, 1 << 14);
             out.reg(re3::REG_DY, 0);
         } else {
-            self.gl_color_regs(to_fixed(flat_c, self.gl.cmax()), out);
+            self.gl_color_regs(flat_fixed, out);
         }
-        let ymin = v.iter().map(|v| v.y).fold(f32::MAX, f32::min);
-        let ymax = v.iter().map(|v| v.y).fold(f32::MIN, f32::max);
+        let (mut top, mut ymin, mut ymax) = (0, f32::MAX, f32::MIN);
+        for (i, p) in v.iter().enumerate() {
+            if p.y > ymax {
+                ymax = p.y;
+                top = i;
+            }
+            ymin = ymin.min(p.y);
+        }
         let y0 = ((ymin - 0.5).ceil() as i32).max(clip[1]);
         let y1 = ((ymax - 0.5).ceil() as i32).min(clip[3]);
-        for y in y0..y1 {
-            let yc = y as f32 + 0.5;
-            // Intersections of the row centre with the three edges.
-            let mut xs = [0.0f32; 2];
-            let mut nx = 0;
-            for i in 0..3 {
-                let (p, q) = (v[i], v[(i + 1) % 3]);
-                let (lo, hi) = if p.y < q.y { (p, q) } else { (q, p) };
-                if yc >= lo.y && yc < hi.y && nx < 2 {
-                    xs[nx] = lo.x + (yc - lo.y) * (hi.x - lo.x) / (hi.y - lo.y);
-                    nx += 1;
-                }
+        // Chain state: current edge (upper a, lower b) and edges walked.
+        // Chain 0 runs forward from the top vertex, chain 1 backward.
+        let mut ch = [(top, (top + 1) % n, 0usize), (top, (top + n - 1) % n, 0usize)];
+        let step = [1, n - 1];
+        // Attributes along a chain at row centre yc: x, z, r, g, b, a.
+        let at = |a: &Wv, b: &Wv, yc: f32| -> [f32; 6] {
+            let t = (yc - b.y) / (a.y - b.y);
+            let l = |p: f32, q: f32| q + (p - q) * t;
+            let mut r = [l(a.x, b.x), 0.0, 0.0, 0.0, 0.0, 0.0];
+            if ZS {
+                r[1] = l(a.z, b.z);
             }
-            if nx < 2 {
+            if SMOOTH {
+                for k in 0..4 {
+                    r[2 + k] = l(a.c[k], b.c[k]) * 255.0;
+                }
+            } else if blend {
+                r[5] = flat[3] * 255.0;
+            }
+            r
+        };
+        for y in (y0..y1).rev() {
+            let yc = y as f32 + 0.5;
+            let mut side = [[0.0f32; 6]; 2];
+            let mut ok = true;
+            for c in 0..2 {
+                let (ref mut a, ref mut b, ref mut walked) = ch[c];
+                // Advance past edges that end above this row.
+                while v[*b].y > yc && *walked < n {
+                    *a = *b;
+                    *b = (*b + step[c]) % n;
+                    *walked += 1;
+                }
+                if *walked >= n || v[*a].y <= yc {
+                    ok = false;
+                    break;
+                }
+                side[c] = at(&v[*a], &v[*b], yc);
+            }
+            if !ok {
                 continue;
             }
-            let (xl, xr) = if xs[0] < xs[1] { (xs[0], xs[1]) } else { (xs[1], xs[0]) };
-            // Clip the row to the window's visible pieces: each piece is its
-            // own RE3 span with iterators started at its left end.
-            let (pieces, np) = self.gl.span_pieces(y, (xl - 0.5).ceil() as i32, (xr - 0.5).ceil() as i32);
+            let (l, r) = if side[0][0] <= side[1][0] { (side[0], side[1]) } else { (side[1], side[0]) };
+            let w = r[0] - l[0];
+            let slope = |k: usize| if w > 1e-6 { (r[k] - l[k]) / w } else { 0.0 };
+            let (pieces, np) = self.gl.span_pieces(y, (l[0] - 0.5).ceil() as i32, (r[0] - 0.5).ceil() as i32);
             for &(x0, x1) in &pieces[..np] {
-                let n = (x1 - x0) as u32;
-                if iter {
-                    let px = x0 as f32 + 0.5;
-                    let mut start = [0u32; 3];
-                    let mut step = [0u32; 3];
-                    for k in 0..3 {
-                        let m = if k == 0 { cmax } else { 1.0 };
-                        if !smooth {
-                            start[k] = to_fixed(flat_c, cmax)[k];
-                            continue;
-                        }
-                        let (c0, dx, dy) = planes[k];
-                        let s = (c0 + dx * (px - v[0].x) + dy * (yc - v[0].y)).clamp(0.0, 255.0 * m);
-                        let e = (s + dx * (n - 1) as f32).clamp(0.0, 255.0 * m);
-                        let d = if n > 1 { (e - s) / (n - 1) as f32 } else { 0.0 };
-                        start[k] = (s * 2048.0) as u32;
-                        step[k] = ((d * 2048.0) as i32) as u32;
-                    }
-                    if blend {
-                        // Source alpha for the blender (8.11), flat or smooth.
-                        let (a0, adx, ady) = aplane;
-                        let (sa, da) = if smooth {
-                            let s = (a0 + adx * (px - v[0].x) + ady * (yc - v[0].y)).clamp(0.0, 255.0);
-                            let e = (s + adx * (n - 1) as f32).clamp(0.0, 255.0);
-                            (s, if n > 1 { (e - s) / (n - 1) as f32 } else { 0.0 })
-                        } else {
-                            (flat_c[3].clamp(0.0, 1.0) * 255.0, 0.0)
-                        };
-                        let step = ((da * 2048.0) as i32) as u32 as u64;
-                        out.op(re3::RE3_OP_ALPHA, ((sa * 2048.0) as u32 as u64) | (step << 32));
-                    }
-                    if zs {
-                        // RE3 Z iterator: signed 24-bit integer Z, 24.14 step
-                        // (IRIS GL uses -0x800000..0x7FFFFF, OpenGL 0..0x7FFFFF).
-                        let z = (v[0].z + zdx * (px - v[0].x) + zdy * (yc - v[0].y)).clamp(-8388608.0, 8388607.0);
-                        let dz = (zdx as f64 * 16384.0).round() as i64;
-                        out.reg(re3::REG_Z, (z as i32 as u32) & 0x00ff_ffff);
-                        out.reg(re3::REG_DZI, ((dz >> 14) as u32) & 0x00ff_ffff);
-                        out.reg(re3::REG_DZF, (dz as u32) & 0x3fff);
-                    }
-                    out.reg(re3::REG_R, start[0]);
-                    out.reg(re3::REG_G, start[1]);
-                    out.reg(re3::REG_B, start[2]);
-                    out.reg(re3::REG_DR, step[0] & 0x00ff_ffff);
-                    out.reg(re3::REG_DG, step[1] & 0x000f_ffff);
-                    out.reg(re3::REG_DB, step[2] & 0x000f_ffff);
-                    let pat = self.gl_stipple_pattern(x0, y);
-                    self.gl_span_ir(x0, y, n, re3::IR_SHADED, pat, out);
-                } else {
-                    let pat = self.gl_stipple_pattern(x0, y);
-                    self.span(x0, y, n, pat, out);
+                let cnt = (x1 - x0) as u32;
+                let pat = self.gl_stipple_pattern(x0, y);
+                if !iter {
+                    self.span(x0, y, cnt, pat, out);
+                    continue;
                 }
+                let px = x0 as f32 + 0.5;
+                // Start and per-pixel step of attribute k over this span,
+                // clamped at both ends like the hardware iterators.
+                let run = |k: usize, max: f32| {
+                    let d = slope(k);
+                    let s0 = (l[k] + d * (px - l[0])).clamp(0.0, max);
+                    let e = (s0 + d * (cnt - 1) as f32).clamp(0.0, max);
+                    (s0, if cnt > 1 { (e - s0) / (cnt - 1) as f32 } else { 0.0 })
+                };
+                let (mut start, mut stepc) = ([0u32; 3], [0u32; 3]);
+                for k in 0..3 {
+                    if SMOOTH {
+                        let (s0, d) = run(2 + k, 255.0 * if k == 0 { cmax } else { 1.0 });
+                        start[k] = (s0 * 2048.0) as u32;
+                        stepc[k] = ((d * 2048.0) as i32) as u32;
+                    } else {
+                        start[k] = flat_fixed[k];
+                    }
+                }
+                if blend {
+                    // Source alpha for the blender (8.11).
+                    let (sa, da) = if SMOOTH { run(5, 255.0) } else { ((flat[3].clamp(0.0, 1.0)) * 255.0, 0.0) };
+                    let st = ((da * 2048.0) as i32) as u32 as u64;
+                    out.op(re3::RE3_OP_ALPHA, ((sa * 2048.0) as u32 as u64) | (st << 32));
+                }
+                if ZS {
+                    // RE3 Z iterator: signed 24-bit integer Z, 24.14 step
+                    // (IRIS GL uses -0x800000..0x7FFFFF, OpenGL 0..0x7FFFFF).
+                    let dzp = slope(1);
+                    let z = (l[1] + dzp * (px - l[0])).clamp(-8388608.0, 8388607.0);
+                    let dz = (dzp as f64 * 16384.0).round() as i64;
+                    out.reg(re3::REG_Z, (z as i32 as u32) & 0x00ff_ffff);
+                    out.reg(re3::REG_DZI, ((dz >> 14) as u32) & 0x00ff_ffff);
+                    out.reg(re3::REG_DZF, (dz as u32) & 0x3fff);
+                }
+                out.reg(re3::REG_R, start[0]);
+                out.reg(re3::REG_G, start[1]);
+                out.reg(re3::REG_B, start[2]);
+                out.reg(re3::REG_DR, stepc[0] & 0x00ff_ffff);
+                out.reg(re3::REG_DG, stepc[1] & 0x000f_ffff);
+                out.reg(re3::REG_DB, stepc[2] & 0x000f_ffff);
+                self.gl_span_ir(x0, y, cnt, re3::IR_SHADED, pat, out);
             }
         }
         if iter {
             // FLAT spans step the colour iterators too: leave them at zero.
-            if zs {
+            if ZS {
                 out.reg(re3::REG_DZI, 0);
                 out.reg(re3::REG_DZF, 0);
             }

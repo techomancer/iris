@@ -1940,3 +1940,134 @@ fn gl_clip_far_and_user_planes() {
     assert_eq!(gl_px(g, 300, 60), 0xff_0000, "right of x = 0: drawn");
     assert_eq!(gl_px(g, 100, 60), 0xff00, "left of x = 0: clipped (old colour)");
 }
+
+fn gl_identity_mv(g: &Gr2) {
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, v.to_bits()); }
+}
+
+/// A GL_POLYGON with more vertices than the vertex buffer (32) is drawn in
+/// convex chunks from its first vertex: a 60-gon disc has no holes.
+#[test]
+fn gl_polygon_longer_than_buffer() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    gl_identity_mv(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, 0x6913, 0x00ff_ffff);
+    cmd(g, 0x0f7, 0);
+    cmd(g, 0x4f8, 0);
+    for i in 0..60 {
+        let a = i as f32 / 60.0 * std::f32::consts::TAU;
+        for w in [200.0 + 100.0 * a.cos(), 150.0 + 100.0 * a.sin(), 0.0] { cmd(g, 0xa63, fl(w)); }
+    }
+    cmd(g, 0x0fc, 0);
+    cmd(g, 0x0fd, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    for (x, y) in [(200, 150), (290, 150), (110, 150), (200, 240), (200, 60), (260, 210), (140, 90)] {
+        assert_eq!(gl_px(g, x, y), 0xffffff, "inside the disc at ({x}, {y})");
+    }
+    assert_eq!(gl_px(g, 200, 255), 0, "outside");
+}
+
+/// A tmesh fan built with swaptmesh around one centre with more vertices
+/// than the ring (8): the centre stays referenced and must not be
+/// overwritten.
+#[test]
+fn gl_tmesh_long_swap_fan_keeps_centre() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    gl_identity_mv(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, 0x6913, 0x00ff_ffff);
+    cmd(g, 0x046, 0);
+    cmd(g, 0x447, 0);
+    let v = |g: &Gr2, x: f32, y: f32| for w in [x, y, 0.0] { cmd(g, 0xa63, fl(w)); };
+    v(g, 200.0, 150.0);
+    for i in 0..=16 {
+        let a = i as f32 / 16.0 * std::f32::consts::TAU;
+        v(g, 200.0 + 100.0 * a.cos(), 150.0 + 100.0 * a.sin());
+        if i < 16 {
+            cmd(g, 0x04b, 0);
+        }
+    }
+    cmd(g, 0x04a, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    for (x, y) in [(260, 160), (160, 200), (140, 120), (230, 90), (205, 145)] {
+        assert_eq!(gl_px(g, x, y), 0xffffff, "wedge at ({x}, {y})");
+    }
+}
+
+/// One polygon cut by three planes at once (near, right side, a user
+/// plane): the clipped piece is drawn as one primitive, nothing outside.
+#[test]
+fn gl_polygon_clipped_by_several_planes() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    let (n, f) = (1.0f32, 100.0f32);
+    let proj = [n, 0., 0., 0., 0., n, 0., 0., 0., 0., -(f + n) / (f - n), -1., 0., 0., -2. * f * n / (f - n), 0.];
+    for v in proj { cmd(g, 0x038, fl(v)); }
+    gl_identity_mv(g);
+    // User plane: y <= 0.5 * -z (keeps the lower part), eye space.
+    cmd(g, 0x02f, 0);
+    for v in [0.0f32, -1.0, -0.5, 0.0] { data(g, fl(v)); }
+    cmd(g, 0x02e, 1);
+    cmd(g, 0x02e, 0);
+    cmd(g, 0x6913, 0x0000_ff00);
+    // Ground from behind the eye (z = 5) to z = -50, and far out to x = 200.
+    cmd(g, 0x1a4, 0);
+    cmd(g, 0x5ae, 0);
+    for p in [[-10.0f32, -1., 5.], [200., -1., 5.], [200., -1., -50.], [-10., -1., -50.]] {
+        for x in p { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x041, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 200, 20), 0xff00, "near ground");
+    assert_eq!(gl_px(g, 395, 60), 0xff00, "right edge of the window (side plane)");
+    assert_eq!(gl_px(g, 200, 250), 0, "sky");
+}
+
+/// A smooth-shaded quad is one primitive: colours interpolate along the
+/// edges and across each row (Gouraud). Flat shading uses the provoking
+/// vertex: the first one for polygons.
+#[test]
+fn gl_quad_gouraud_and_flat_provoking() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    gl_identity_mv(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, 0x013, 1); // smooth
+    cmd(g, 0x0f3, 0);
+    cmd(g, 0x4f5, 0);
+    for (c, p) in [([1.0f32, 0., 0.], [100.0f32, 100.]), ([0., 1., 0.], [300., 100.]),
+                   ([0., 0., 1.], [300., 200.]), ([1., 1., 1.], [100., 200.])] {
+        for x in c { cmd(g, 0x1982, fl(x)); }
+        for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x0f4, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    let px = gl_px(g, 200, 150);
+    let (r, gg, b) = (px & 0xff, (px >> 8) & 0xff, px >> 16);
+    // Centre = average of the four corners: (0.5, 0.5, 0.5).
+    for c in [r, gg, b] {
+        assert!((120..=136).contains(&c), "centre {px:#08x}");
+    }
+    assert!(gl_px(g, 101, 100) & 0xff >= 250, "near the red corner");
+
+    cmd(g, 0x013, 0); // flat: polygon provoking vertex = first
+    cmd(g, 0x0f7, 0);
+    cmd(g, 0x4f8, 0);
+    for (c, p) in [([1.0f32, 0., 0.], [100.0f32, 220.]), ([0., 1., 0.], [200., 220.]), ([0., 0., 1.], [150., 280.])] {
+        for x in c { cmd(g, 0x1982, fl(x)); }
+        for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x0fc, 0);
+    cmd(g, 0x0fd, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 150, 240), 0xff, "flat polygon: first vertex's red");
+}
