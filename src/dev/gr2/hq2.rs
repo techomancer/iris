@@ -146,6 +146,18 @@ pub const HQ2_2D_DRAW_IMAGE_SMALL: u32 = 343;
 /// height, words per row, flag, 0; then height * words_per_row pixel words
 /// through HQ2_GEDMA (VDMA). The kernel waits for FIN2 after the transfer.
 pub const HQ2_DMA_WRITE_PIXELS: u32 = 327;
+/// GL-microcode pixel DMA (IRIS GL lrectwrite, libgl gl_gr2dma_lrectwrite):
+/// 0x0B5 at pixel zoom 1, 0x0B8 zoomed. Same kernel protocol and header as
+/// 0x147, drawn in the current GL context (window-relative, GL y up).
+pub const HQ2_GL_DMA_WRITE: u32 = 0x0b5;
+pub const HQ2_GL_DMA_WRITE_ZOOM: u32 = 0x0b8;
+
+/// Pixel rectangles streamed by the kernel's pixel DMA (_Gr2DMAtrigger):
+/// x on the token; y, width, height, words/row, flag, 0 on GE_DATA; then
+/// the pixel words through HQ2_GEDMA; FIN2 when done.
+fn is_pixel_dma(cmd: u32) -> bool {
+    matches!(cmd, HQ2_DMA_WRITE_PIXELS | HQ2_GL_DMA_WRITE | HQ2_GL_DMA_WRITE_ZOOM)
+}
 /// Screen-to-screen copy: pitch; DATA chunk, srcX, srcY, w, h, dstX, dstY
 /// (X-style y). Layout from HQ2.h section 8 (unverified against a trace).
 pub const HQ2_2D_COPY_RECT: u32 = 340;
@@ -564,7 +576,8 @@ impl Hq2Engine {
             HQ2_2D_POLY_SPAN | HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG => STREAM,
             HQ2_2D_SOLID_RECT => STREAM,
             HQ2_2D_TILE_RECT | HQ2_2D_TILE_RECT_ODD => 7,
-            HQ2_2D_DRAW_IMAGE | HQ2_2D_DRAW_IMAGE_SMALL | HQ2_DMA_WRITE_PIXELS => STREAM,
+            HQ2_2D_DRAW_IMAGE | HQ2_2D_DRAW_IMAGE_SMALL | HQ2_DMA_WRITE_PIXELS
+            | HQ2_GL_DMA_WRITE | HQ2_GL_DMA_WRITE_ZOOM => STREAM,
             HQ2_2D_COPY_RECT => 8,
             HQ2_2D_TILE_DATA_FIRST..=HQ2_2D_TILE_DATA_LAST => STREAM,
             _ => Self::gl_arg_count(cmd).unwrap_or(OPEN),
@@ -677,7 +690,7 @@ impl Hq2Engine {
                 if index == HQ2_2D_POLYLINE || index == HQ2_2D_POLYLINE_ALT {
                     self.line_have_prev = 0;
                 }
-                if index == HQ2_2D_DRAW_IMAGE || index == HQ2_2D_DRAW_IMAGE_SMALL || index == HQ2_DMA_WRITE_PIXELS {
+                if index == HQ2_2D_DRAW_IMAGE || index == HQ2_2D_DRAW_IMAGE_SMALL || is_pixel_dma(index) {
                     self.img_hdr[0] = val;
                     self.img_rows_done = 0;
                 }
@@ -714,7 +727,13 @@ impl Hq2Engine {
                 self.need = 0;
                 out.finish(FIN2);
                 if let Some(f) = done.as_mut() {
-                    f(format!("GE_CX_RESTORE_MAIN {} words restored -> FIN2", self.args[0]));
+                    let why = match self.gl_ctx.restore_reject {
+                        0 => "restored".to_string(),
+                        1 => format!("REJECTED: {} words, image is {}: previous context's state stays live", self.args[0], CX_WORDS),
+                        2 => "REJECTED: bad magic: previous context's state stays live".to_string(),
+                        _ => "REJECTED: GlState size differs: previous context's state stays live".to_string(),
+                    };
+                    f(format!("GE_CX_RESTORE_MAIN {} words {} -> FIN2", self.args[0], why));
                 }
             }
             return;
@@ -737,7 +756,7 @@ impl Hq2Engine {
             self.tile_push(val);
             return;
         }
-        if self.cmd == HQ2_2D_DRAW_IMAGE || self.cmd == HQ2_2D_DRAW_IMAGE_SMALL || self.cmd == HQ2_DMA_WRITE_PIXELS {
+        if self.cmd == HQ2_2D_DRAW_IMAGE || self.cmd == HQ2_2D_DRAW_IMAGE_SMALL || is_pixel_dma(self.cmd) {
             self.image_word(val, out, done);
             return;
         }
@@ -929,7 +948,7 @@ impl Hq2Engine {
         if k < 6 {
             self.img_hdr[1 + k] = val;
             if k == 5 {
-                if self.cmd == HQ2_DMA_WRITE_PIXELS {
+                if is_pixel_dma(self.cmd) {
                     // DMA header is y, width, height, words/row, flag, 0:
                     // derive the pixel format from pixels per word.
                     let (w, wpr) = (self.img_hdr[2], self.img_hdr[4].max(1));
@@ -937,8 +956,10 @@ impl Hq2Engine {
                     self.img_hdr[5] = match per_word { 4 => 2, 2 => 1, _ => 0 };
                     self.img_hdr[6] = 0;
                 }
-                let fg = self.s2d.fg;
-                self.setup2d(fg, out);
+                if self.cmd == HQ2_DMA_WRITE_PIXELS || !is_pixel_dma(self.cmd) {
+                    let fg = self.s2d.fg;
+                    self.setup2d(fg, out);
+                }
             }
             return;
         }
@@ -953,10 +974,16 @@ impl Hq2Engine {
         }
         if i + 1 == wpr {
             let row = self.img_rows_done;
-            self.image_row(x as i32, y as i32 + row as i32, w, fmt, skip, wpr.min(IMG_ROW_WORDS), out);
+            if self.cmd == HQ2_GL_DMA_WRITE || self.cmd == HQ2_GL_DMA_WRITE_ZOOM {
+                let words = self.img_row;
+                let zoomed = self.cmd == HQ2_GL_DMA_WRITE_ZOOM;
+                self.gl_pixel_row(x as i32, y as i32, row, w, rows, fmt, &words[..wpr.min(IMG_ROW_WORDS)], zoomed, out);
+            } else {
+                self.image_row(x as i32, y as i32 + row as i32, w, fmt, skip, wpr.min(IMG_ROW_WORDS), out);
+            }
             self.img_rows_done += 1;
             if self.img_rows_done == rows {
-                if self.cmd == HQ2_DMA_WRITE_PIXELS {
+                if is_pixel_dma(self.cmd) {
                     // The kernel polls FIN2 for completion of the transfer.
                     out.finish(FIN2);
                 }
@@ -1210,7 +1237,15 @@ impl Hq2Engine {
         match cmd {
             PUC_INIT => format!("{name} arg={}", i(0)),
             HQ_TOKEN_UNSTALL => format!("microcode start arg={} -> FIN2", i(0)),
-            GE_HQMSAV => format!("{name} ctx={:#x} state={} mode={} -> FIN2", i(0), i(1), i(2)),
+            GE_HQMSAV => {
+                let prev = self.gl_ctx.prev_owner;
+                let live = if prev == u32::MAX { "none".to_string() } else { format!("{prev:#x}") };
+                // State 1 = the kernel believes this context's state is still
+                // in the GE: no restore follows. If the HLE's live state
+                // belongs to another context, that one's state leaks.
+                let leak = if i(1) == 1 && prev != u32::MAX && prev != a[0] { "  LEAK? state 1 but live state is another context's" } else { "" };
+                format!("{name} ctx={:#x} state={} mode={} (live was {live}){leak} -> FIN2", i(0), i(1), i(2))
+            }
             HQ_PCX_1E0 | HQ_PCX_1E6 => format!("{name} {} -> FIN2", i(0)),
             HQ_GL_FIN3 | GL_FINISH => format!("{name} {} -> FIN3", i(0)),
             HQ2_2D_ROP => format!("{name} fg={:#x} planemask={:#x} alu={} flag={:#x}", a[0], a[1], i(2), a[3]),

@@ -800,6 +800,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 |---------|-------------|
 | `mc regs` | Memory Controller registers (incl. MEMCFG) |
 | `mc dma` | MC GIO DMA (VDMA) state |
+| `mc dma xlate [vaddr] [w]` | Walk the VDMA address translation (µTLB, PTE) for `vaddr` (default MEMADR) without side effects; `w` = transfer writes memory |
 | `mc vdma <on\|off>` | VDMA trace to `vdma.log` |
 | `eeprom <on\|off\|dump\|r <word>\|w <word> <val>>` | CPU/MC boot-config EEPROM (93C56) |
 | `nveeprom <on\|off\|dump\|r\|w\|save [file]>` | Indigo2 NVRAM EEPROM (93CS56: env vars + MAC) |

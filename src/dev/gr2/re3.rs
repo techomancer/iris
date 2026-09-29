@@ -16,6 +16,8 @@ pub const FB_H: usize = 1024;
 pub const REG_ENABRGB: usize = 0x04;
 pub const REG_FUNC: usize = 0x06;
 pub const REG_NOPUP: usize = 0x08;
+/// Subpixel start fraction (4 bits; see load_iterators).
+pub const REG_XYFRAC: usize = 0x09;
 pub const REG_RGB: usize = 0x0a;
 pub const REG_YX: usize = 0x0b;
 pub const REG_PUPDATA: usize = 0x0c;
@@ -207,6 +209,7 @@ pub const RE3_OP_BLEND: u32 = 0xFFFF_1009;
 /// Emulator-private source alpha iterator: val = start (8.11, bits 31:0) |
 /// per-pixel step (signed 8.11) << 32.
 pub const RE3_OP_ALPHA: u32 = 0xFFFF_100A;
+
 /// Stop the RE3 thread.
 pub const RE3_OP_EXIT: u32 = 0xFFFF_1FFF;
 /// Set on register entries pushed by the HQ2 thread (vs. CPU writes to the
@@ -295,6 +298,17 @@ impl Re3 {
         let c = &mut self.ctx;
         c.x = (c.reg[REG_X] as i64) << 14;
         c.y = (c.reg[REG_Y] as i64) << 14;
+        // XYFRAC (inferred): the minor axis's subpixel start in 1/16 pixel,
+        // the GE's vertex precision. The major axis steps whole pixels from
+        // a pixel start (its step is +-1.0), so one 4-bit fraction suffices;
+        // it becomes the top 4 bits of the minor iterator's 14-bit fraction.
+        let frac = ((c.reg[REG_XYFRAC] & 0xf) as i64) << 10;
+        let dx = (c.reg[REG_DX] as u16 as i16) as i32;
+        if dx.abs() == 0x4000 {
+            c.y |= frac;
+        } else {
+            c.x |= frac;
+        }
         c.z = ((c.reg[REG_Z] as i64) << 40) >> 26;
         c.r = c.reg[REG_R] as i64;
         c.g = c.reg[REG_G] as i64;

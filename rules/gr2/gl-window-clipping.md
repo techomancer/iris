@@ -27,3 +27,16 @@ Gotchas found the hard way:
 - Symptom of missing clipping on a 12-bit double-buffered GL window: odd flat
   colour (the clear) and GL geometry inside the X window in front, because
   X's 8-bit CI pixels share VRAM bits 7:0 with GL buffer 0.
+
+- The pieces are XOR'ed, not unioned: a window with a hole (C shape)
+  arrives as [whole window, covered rectangle], 2 pieces, obscured = 0,
+  wid = 0 (Xsgi DDX exp_window.c expValidateClip; full table in HQ2.h).
+  The union let atlantis draw under ideas (flicker) whenever ideas covered
+  the middle of atlantis's side; L shapes (disjoint pieces) were fine, which
+  hid it. `span_pieces` pairs the sorted piece edges of each row;
+  `visible_rects` bands the XOR for clears. Test: `gl_clip_pieces_are_xor`.
+- Window origin words in 0x1E5 are signed (off-screen windows).
+- Open: in the WID-test case (>= 5 visible rectangles) the wid sent is the
+  RRM window id (0x10 in traces); we compare `wid & 0xf` with the 4-bit CID
+  planes, i.e. 0, the CID of plain X windows. Probably wrong; check what
+  rrmValidateCID paints for that window before trusting WID clipping.

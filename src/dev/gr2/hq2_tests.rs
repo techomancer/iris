@@ -1554,7 +1554,11 @@ fn replay_trace(g: &Gr2, text: &str) {
         let mut it = line.split_whitespace();
         let idx = u32::from_str_radix(it.next().unwrap(), 16).unwrap();
         let val = u32::from_str_radix(it.next().unwrap(), 16).unwrap();
-        cmd(g, idx, val);
+        if idx == hq2::HQ_TOKEN_GEDMA {
+            w32(g, 0x6a068, val); // kernel VDMA data ("GEDMA data" trace lines)
+        } else {
+            cmd(g, idx, val);
+        }
     }
     g.wait_idle();
 }
@@ -2070,4 +2074,233 @@ fn gl_quad_gouraud_and_flat_provoking() {
     cmd(g, 0x465, 0);
     g.wait_idle();
     assert_eq!(gl_px(g, 150, 240), 0xff, "flat polygon: first vertex's red");
+}
+
+/// IRIX 5.3 "Gr2PixelDma: TIMEOUT gfx DMA did not complete (finish flag not
+/// set)": the kernel polls version bit 1 (FIN2) in a counted loop right after
+/// the VDMA of a pixel rectangle, while our HQ2 may still be drawing it. With
+/// FIN2 awaited (acked just before), a version read stalls while the HQ2 has
+/// work, so the kernel's very first poll already sees FIN2.
+#[test]
+fn kernel_pixel_dma_fin2_poll_waits_for_hq() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    cmd(g, HQ2_2D_BEGIN, 0);
+    cmd(g, HQ2_2D_MODE, 0x1009);
+    cmd(g, HQ2_2D_ROP, 0);
+    for v in [0xff, 3, 0] { data(g, v); }
+    let (rows, wpr) = (400u32, 320u32); // 1280 8-bit pixels per row
+    w32(g, 0x6a04c, 0); // fin2 = 0
+    cmd(g, HQ2_DMA_WRITE_PIXELS, 0);
+    for v in [100, wpr * 4, rows, wpr, 0, 0] {
+        w32(g, 0x40000, v);
+    }
+    for i in 0..rows * wpr {
+        w32(g, 0x6a068, i.wrapping_mul(0x0101_0101));
+    }
+    assert_eq!(r32(g, 0x6a040) & 2, 2, "first poll after the DMA sees FIN2");
+    // With the HQ2 idle and FIN2 set, reads return at once.
+    assert_eq!(r32(g, 0x6a040) & 2, 2);
+}
+
+/// IRIS GL lrectwrite by pixel DMA (IRIX 5.3 MRI software, libgl
+/// gl_gr2dma_lrectwrite): 0x0B5 = x; GE_DATA y, width, height, words/row,
+/// flag, 0; 16-bit colour indices through HQ2_GEDMA, first pixel in the
+/// high half; rows arrive top row first (the kernel's VDMA runs the
+/// bottom-up lrectwrite array from its end), y = bottom of the rectangle;
+/// FIN2 at the end. Unimplemented, it timed out the kernel ("Gr2PixelDma:
+/// TIMEOUT") and got Xsgi killed.
+#[test]
+fn gl_pixel_dma_lrectwrite_ci16() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g); // window at screen (64, 660), 400x300
+    cmd(g, 0x004, 10); // 12-bit colour index
+    cmd(g, 0x005, 0xfff);
+    w32(g, 0x6a04c, 0); // fin2 = 0
+    cmd(g, 0x0b5, 4);
+    for v in [10, 4, 2, 2, 0, 0] { w32(g, 0x40000, v); }
+    for v in [0x0204_0205, 0x0206_0207, 0x0210_0211, 0x0212_0213] { w32(g, 0x6a068, v); }
+    assert_eq!(r32(g, 0x6a040) & 2, 2, "FIN2 after the last row");
+    g.wait_idle();
+    assert_eq!(gl_px(g, 4, 11) & 0xfff, 0x204, "first DMA row is the top row");
+    assert_eq!(gl_px(g, 7, 11) & 0xfff, 0x207);
+    assert_eq!(gl_px(g, 5, 10) & 0xfff, 0x211, "second DMA row below it, at y");
+    assert_eq!(gl_px(g, 8, 10) & 0xfff, 0, "past the width");
+
+    // Zoomed (0x0B8): pixel zoom 2 x 2 from 0x0BB.
+    for v in [0.0f32, 2.0, 2.0] { cmd(g, 0x0bb, v.to_bits()); }
+    w32(g, 0x6a04c, 0);
+    cmd(g, 0x0b8, 100);
+    for v in [50, 2, 1, 1, 0, 0] { w32(g, 0x40000, v); }
+    w32(g, 0x6a068, 0x0300_0301);
+    assert_eq!(r32(g, 0x6a040) & 2, 2);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 101, 51) & 0xfff, 0x300, "first pixel covers 2x2");
+    assert_eq!(gl_px(g, 102, 50) & 0xfff, 0x301);
+}
+
+/// A window partly off the left and bottom of the screen: 0x1E5 carries a
+/// negative x (and y = 0x400 - (yorg + ysize) < 0). The visible part must be
+/// drawn at the screen edge, not wrapped to the far right / top.
+#[test]
+fn gl_window_off_screen_left_bottom() {
+    let g = live_gr2(Gr2Variant::Xz);
+    let fl = |v: f32| v.to_bits();
+    // Window at screen (-50, -20), 200x100, one visible piece: x 0..149,
+    // y 0..79 (GL y up).
+    cmd(g, 0x1e5, (-50i32) as u32);
+    for v in [(-20i32) as u32, 200, 100, 0x10, 0, 1, (149 << 11) | 0, (79 << 10) | 0, 0, 0, 0, 0, 0, 0] { data(g, v); }
+    cmd(g, 0x03b, fl(1.0));
+    for v in [0.0f32, 199.0, 0.0, 99.0, 1073741823.0, 1073741823.0] { data(g, fl(v)); }
+    for v in [2.0 / 200.0, 0., 0., 0., 0., 2.0 / 100.0, 0., 0., 0., 0., -1., 0., -1., -1., 0., 1.0f32] { cmd(g, 0x038, fl(v)); }
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    // Fill the whole window (window coordinates 0..200 x 0..100).
+    cmd(g, 0x6913, 0x00ff_ffff);
+    cmd(g, 0x0f3, 0);
+    cmd(g, 0x4f5, 0);
+    for p in [[0.0f32, 0.], [200., 0.], [200., 100.], [0., 100.]] {
+        for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x0f4, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    let px = |x: usize, y: usize| g.vram()[y * FB_W + x] & 0xff_ffff;
+    assert_eq!(px(0, 0), 0xffffff, "visible corner at the screen origin");
+    assert_eq!(px(149, 79), 0xffffff, "far visible corner");
+    assert_eq!(px(150, 40), 0, "right of the window");
+    assert_eq!(px(1279 - 40, 40), 0, "nothing wrapped to the right edge");
+}
+
+/// The kernel queues 0x1E1 (save main) and starts its VDMA read of
+/// HQ2_GEDMA at once. With work queued ahead of the save, a read that beat
+/// the HQ2 got the end of the previous image and shifted the saved image by
+/// one word; the restore was rejected and the other context's state stayed
+/// live (ideas drawn in amesh's window, IRIX 6.5.22). GEDMA reads now wait
+/// for the queued save.
+#[test]
+fn gl_context_save_read_waits_for_hq() {
+    let g = live_gr2(Gr2Variant::Xz);
+    let fl = |v: f32| v.to_bits();
+    let switch = |g: &Gr2, id: u32, state: u32| {
+        cmd(g, 0x1f0, id);
+        data(g, state);
+        data(g, 0);
+    };
+    switch(g, 0x74, 0);
+    gl_setup_window(g);
+    g.wait_idle();
+    // Plenty of work ahead of the switch and the save, so the HQ2 is busy.
+    for _ in 0..3000 {
+        for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    }
+    switch(g, 0xe8, 0);
+    cmd(g, 0x1e1, 0);
+    // No wait: read the image the way the kernel's VDMA does.
+    assert_eq!(r32(g, 0x6a068), 0x474c_4358, "first word read is the image header");
+    assert_eq!(r32(g, 0x6a068), ((hq2::CX_WORDS - 2) * 4) as u32, "then the GlState size");
+}
+
+/// atlantis with ideas over the middle of its right side (clipping.log,
+/// IRIX 6.5.22): the visible region is a C, and 0x1E5 carries it as two
+/// pieces, [whole window, covered rectangle], obscured = 0. Read as a union
+/// that is the whole window (atlantis drew over ideas); read as XOR (odd
+/// coverage) it is the C. The L case (two disjoint pieces) is unchanged.
+#[test]
+fn gl_clip_pieces_are_xor() {
+    let g = live_gr2(Gr2Variant::Xz);
+    let fl = |v: f32| v.to_bits();
+    let piece = |x0: u32, x1: u32, yb: u32, yt: u32| [(x1 << 11) | x0, (yt << 10) | yb];
+    let window = |g: &Gr2, pieces: &[[u32; 2]]| {
+        cmd(g, 0x1e5, 60);
+        for v in [566, 259, 320, 0, 0, pieces.len() as u32] { data(g, v); }
+        for k in 0..4 {
+            let p = pieces.get(k).copied().unwrap_or([0, 0]);
+            data(g, p[0]);
+            data(g, p[1]);
+        }
+    };
+    let fill = |g: &Gr2, c: u32| {
+        cmd(g, 0x03b, fl(1.0));
+        for v in [0.0f32, 258.0, 0.0, 319.0, 1073741823.0, 1073741823.0] { data(g, fl(v)); }
+        for v in [2.0 / 259.0, 0., 0., 0., 0., 2.0 / 320.0, 0., 0., 0., 0., -1., 0., -1., -1., 0., 1.0f32] { cmd(g, 0x038, fl(v)); }
+        for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+        cmd(g, 0x6913, c);
+        cmd(g, 0x0f3, 0);
+        cmd(g, 0x4f5, 0);
+        for p in [[0.0f32, 0.], [259., 0.], [259., 320.], [0., 320.]] {
+            for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
+        }
+        cmd(g, 0x0f4, 0);
+        cmd(g, 0x465, 0);
+        g.wait_idle();
+    };
+    let px = |x: usize, y: usize| g.vram()[y * FB_W + x] & 0xff_ffff;
+    // C: whole window + covered rectangle (the exact 8.926 s packet).
+    window(g, &[piece(60, 318, 566, 885), piece(165, 318, 582, 865)]);
+    fill(g, 0x00ff_ffff);
+    assert_eq!(px(100, 700), 0xffffff, "left strip visible");
+    assert_eq!(px(250, 875), 0xffffff, "top band visible");
+    assert_eq!(px(250, 570), 0xffffff, "bottom band visible");
+    assert_eq!(px(250, 700), 0, "under ideas: not drawn");
+    // L: two disjoint pieces (the 11.617 s packet) = their union.
+    window(g, &[piece(60, 318, 704, 885), piece(60, 156, 566, 703)]);
+    fill(g, 0x0000_ff00);
+    assert_eq!(px(250, 800), 0x00ff00, "top band");
+    assert_eq!(px(100, 600), 0x00ff00, "bottom-left strip");
+    assert_eq!(px(250, 600), 0, "covered corner: never drawn");
+}
+
+/// GL lines are one RE3 SHADED primitive stepping DX / DY from a subpixel
+/// start (not a horizontal span): a smooth diagonal line gets its colour
+/// iterated, keeps to the right pixels, and is clipped by the window's
+/// pieces through RE3's scissor (XOR: C-shaped atlantis packet).
+#[test]
+fn gl_line_is_one_re3_primitive() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g); // window at (64, 660), 400x300
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x013, 1); // smooth
+    cmd(g, 0x17c, 0);
+    cmd(g, 0x456, 0);
+    for (c, p) in [([1.0f32, 0., 0.], [10.5f32, 10.5]), ([0., 0., 1.], [110.5, 60.5])] {
+        for x in c { cmd(g, 0x1982, fl(x)); }
+        for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x057, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    // Slope 1/2 from (10, 10): pixel (10 + 2k, 10 + k).
+    assert_eq!(gl_px(g, 10, 10) & 0xff, 0xff, "start pixel red");
+    assert_ne!(gl_px(g, 50, 30), 0, "middle on the line");
+    let mid = gl_px(g, 50, 30);
+    assert!((mid & 0xff) > 0x40 && (mid >> 16) > 0x40, "colour iterated: {mid:#08x}");
+    assert_eq!(gl_px(g, 50, 31), 0, "one pixel wide");
+    assert_eq!(gl_px(g, 110, 60), 0, "last point not drawn");
+}
+
+/// Y-major line drawn downwards: DY = -1.0, DX = slope, XYFRAC holds the x
+/// start fraction in 1/16 pixel. From (25.5, 110.5) to (20.5, 10.5): the
+/// pixel at row y is x = floor(25.5 - 0.05 * (110 - y)).
+#[test]
+fn gl_line_steep_downwards() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    cmd(g, 0x6913, 0x00ff_ffff);
+    cmd(g, 0x17c, 0);
+    cmd(g, 0x456, 0);
+    for p in [[25.5f32, 110.5], [20.5, 10.5]] {
+        for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
+    }
+    cmd(g, 0x057, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    for y in [110, 90, 60, 30, 11] {
+        let x = (25.5f32 - 0.05 * (110 - y) as f32).floor() as i32;
+        assert_eq!(gl_px(g, x, y), 0xffffff, "row {y} at x {x}");
+        assert_eq!(gl_px(g, x + 1, y), 0, "one pixel wide at row {y}");
+    }
+    assert_eq!(gl_px(g, 20, 10), 0, "last point not drawn");
 }

@@ -157,6 +157,31 @@ pub struct Gr2 {
     /// wait, and the pipeline would run a whole frame behind every swap
     /// (ideas flicker, IRIX 6.5.22). See rules/gr2/fin3-must-track-pending-finish.md.
     fin3_pending: AtomicU32,
+    /// Set when the kernel acks FIN2 (write to 0x6A04C), which it does right
+    /// before issuing a FIN2 command (pixel DMA 0x147, context save/restore)
+    /// and polling version bit 1 in a counted loop (100,000 x us_delay(1) for
+    /// pixel DMA). Our HQ2 may still be drawing a large pixel DMA when that
+    /// budget runs out: IRIX 5.3 then logged "Gr2PixelDma: TIMEOUT", raised a
+    /// graphics error and detached Xsgi. While set, a version read with FIN2
+    /// clear stalls (bus busy) as long as the HQ2 still has work, so the
+    /// kernel sees FIN2 as soon as the HQ2 gets there. See
+    /// rules/gr2/fin2-wait-must-stall.md.
+    fin2_wait: AtomicU32,
+    /// Context saves (0x1E1) the CPU has queued that the HQ2 has not executed
+    /// yet. HQ2_GEDMA reads stall while any is pending: the kernel starts its
+    /// VDMA read right after queuing 0x1E1, and a read that beat the HQ2
+    /// returned the end of the previous image, shifting the saved image one
+    /// word; its restore was then rejected and the previous context's state
+    /// stayed live (another demo drawn in amesh's window). See
+    /// rules/gr2/cx-save-must-wait-for-hq.md.
+    cx_save_pending: AtomicU32,
+    /// Host time (fin2_clock ns) of the first stalled FIN2 poll since the
+    /// wait was armed (0 = none yet). The stall gives up FIN2_STALL_LIMIT
+    /// after that, so a pipeline that can never finish (RE3 held by a
+    /// CPU-driven readback) cannot hang the machine. Counted from the first
+    /// poll, not from the ack: the DMA between ack and poll may take long on
+    /// a busy host (a 400-row pixel DMA on a GitHub CI runner did).
+    fin2_armed_ns: AtomicU64,
     /// Context image handed to the kernel through HQ2_GEDMA reads (0x1E1).
     cx_out: [AtomicU32; hq2::CX_WORDS],
     cx_out_len: AtomicU32,
@@ -280,6 +305,17 @@ impl Gr2 {
             && !self.re3_busy.load(Ordering::Acquire)
     }
 
+    /// A FIN2 poll may stall: true until FIN2_STALL_LIMIT after the first
+    /// stalled poll of this wait (Gr2::fin2_armed_ns).
+    fn fin2_stall_ok(&self) -> bool {
+        let now = fin2_clock().max(1);
+        let first = match self.fin2_armed_ns.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => now,
+            Err(t) => t,
+        };
+        now.saturating_sub(first) < FIN2_STALL_LIMIT.as_nanos() as u64
+    }
+
     /// Spin until both engines are idle (tests and snapshots).
     pub fn wait_idle(&self) {
         let backoff = crossbeam_utils::Backoff::new();
@@ -327,6 +363,10 @@ impl Gr2 {
             // HQ2_GEDMA read: the next word of a context image (0x1E1 save,
             // read by the kernel's VDMA). Past the end: 0.
             0x6a068 => {
+                if self.cx_save_pending.load(Ordering::Acquire) != 0 {
+                    // The save the kernel is reading has not run yet.
+                    return BusRead32::busy();
+                }
                 let len = self.cx_out_len.load(Ordering::Acquire);
                 let pos = self.cx_out_pos.fetch_add(1, Ordering::Relaxed);
                 if pos < len {
@@ -338,12 +378,30 @@ impl Gr2 {
             }
             0x6b000 => if self.fin3_pending.load(Ordering::Acquire) != 0 { 0 } else { r.hq.fin[hq2::FIN3].load(Ordering::Acquire) },
             HQREGS..HQREGS_END => {
+                // Sample "HQ2 has work" before reading the register: the HQ2
+                // raises FIN2 before it consumes the entry and drops
+                // hq_busy, so if it was idle before the read, the read sees
+                // every FIN2 it raised (sampling after would race).
+                let hq_working = off - HQREGS == hq2::HQ_VERSION
+                    && (!self.hq_fifo.is_empty() || self.hq_busy.load(Ordering::Acquire));
                 let v = r.hq.read(off - HQREGS);
-                if off - HQREGS == hq2::HQ_VERSION && self.fin3_pending.load(Ordering::Acquire) != 0 {
-                    v & !1
-                } else {
-                    v
+                if off - HQREGS == hq2::HQ_VERSION {
+                    if self.fin2_wait.load(Ordering::Acquire) != 0 {
+                        if v & 2 != 0 {
+                            self.fin2_wait.store(0, Ordering::Release);
+                        } else if hq_working && self.fin2_stall_ok() {
+                            // FIN2 awaited and the HQ2 is still working: the
+                            // read waits for it instead of spending the
+                            // kernel's poll budget. With the HQ2 idle and no
+                            // FIN2, the kernel times out as on hardware.
+                            return BusRead32::busy();
+                        }
+                    }
+                    if self.fin3_pending.load(Ordering::Acquire) != 0 {
+                        return BusRead32::ok(v & !1);
+                    }
                 }
+                v
             }
             0x6c000..0x6c010 => self.bdvers_read((off - BDVERS) >> 2),
             0x6c040..0x6c060 => r.vc1.read(off & 0x1c),
@@ -394,14 +452,21 @@ impl Gr2 {
             FIFO..FIFO_END => {
                 let idx = (off - FIFO) >> 2;
                 let fin = is_fin3_token(idx);
+                let save = is_cx_save_token(idx);
                 if fin {
                     // Counted before the push so the HQ can never see the
                     // token before the counter includes it.
                     self.fin3_pending.fetch_add(1, Ordering::AcqRel);
                 }
+                if save {
+                    self.cx_save_pending.fetch_add(1, Ordering::AcqRel);
+                }
                 if !self.hq_fifo.try_push(idx, val as u64) {
                     if fin {
                         self.fin3_pending.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    if save {
+                        self.cx_save_pending.fetch_sub(1, Ordering::AcqRel);
                     }
                     return BUS_BUSY;
                 }
@@ -430,7 +495,13 @@ impl Gr2 {
                 r.hq.write(off - HQREGS, val, &mut r.ge);
                 Self::wake(&self.hq_thread);
             }
-            HQREGS..HQREGS_END => r.hq.write(off - HQREGS, val, &mut r.ge),
+            HQREGS..HQREGS_END => {
+                if off - HQREGS == hq2::HQ_FIN2 {
+                    self.fin2_armed_ns.store(0, Ordering::Release);
+                    self.fin2_wait.store(1, Ordering::Release);
+                }
+                r.hq.write(off - HQREGS, val, &mut r.ge)
+            }
             0x6c000..0x6c010 => r.bdvers_w[((off - BDVERS) >> 2) as usize] = val,
             0x6c040..0x6c060 => {
                 r.vc1.write(off & 0x1c, val);
@@ -594,6 +665,11 @@ impl Gr2 {
                     let _ = self.fin3_pending.fetch_update(Ordering::AcqRel, Ordering::Acquire,
                         |n| Some(n.saturating_sub(1)));
                 }
+                if is_cx_save_token(index) {
+                    // Executed: the image is published (cx_publish).
+                    let _ = self.cx_save_pending.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                        |n| Some(n.saturating_sub(1)));
+                }
                 self.hq_fifo.consume();
                 backoff.reset();
             } else {
@@ -748,12 +824,19 @@ impl BusDevice for Gr2 {
             // Both words or neither: a retried store must not push the first twice.
             let idx = (off - FIFO) >> 2;
             let fins = is_fin3_token(idx) as u32 + is_fin3_token(idx + 1) as u32;
+            let saves = is_cx_save_token(idx) as u32 + is_cx_save_token(idx + 1) as u32;
             if fins != 0 {
                 self.fin3_pending.fetch_add(fins, Ordering::AcqRel);
+            }
+            if saves != 0 {
+                self.cx_save_pending.fetch_add(saves, Ordering::AcqRel);
             }
             if !self.hq_fifo.try_push2(idx, hi as u64, idx + 1, lo as u64) {
                 if fins != 0 {
                     self.fin3_pending.fetch_sub(fins, Ordering::AcqRel);
+                }
+                if saves != 0 {
+                    self.cx_save_pending.fetch_sub(saves, Ordering::AcqRel);
                 }
                 return BUS_BUSY;
             }
@@ -806,6 +889,8 @@ impl Device for Gr2 {
         // Discard the exit sentinels (and anything behind them).
         self.hq_fifo.reset();
         self.fin3_pending.store(0, Ordering::Release);
+        self.fin2_wait.store(0, Ordering::Release);
+        self.cx_save_pending.store(0, Ordering::Release);
         self.re3_fifo.reset();
     }
 
@@ -890,6 +975,21 @@ impl Saveable for Gr2 {
 }
 
 /// FIFO tokens that raise FIN3 when executed (GL Finish, 2D sync).
+/// Longest a version read stalls for an awaited FIN2 (see Gr2::fin2_wait).
+const FIN2_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Monotonic host nanoseconds for the FIN2 stall limit.
+fn fin2_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// Context save main (0x1E1): publishes the image the kernel then reads
+/// from HQ2_GEDMA.
+fn is_cx_save_token(idx: u32) -> bool {
+    idx == hq2::GE_CX_SAVE_MAIN
+}
+
 fn is_fin3_token(idx: u32) -> bool {
     idx == hq2::GL_FINISH || idx == hq2::HQ_GL_FIN3
 }

@@ -928,7 +928,7 @@ impl Device for MemoryController {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("mc".to_string(), "Memory Controller commands: mc dma, mc regs, mc vdma <on|off>".to_string()),
+            ("mc".to_string(), "Memory Controller commands: mc dma, mc dma xlate [vaddr] [w], mc regs, mc vdma <on|off>".to_string()),
             ("eeprom".to_string(), "CPU/MC EEPROM commands (93C56 @ 0x1fa00030, CPU boot config incl. CACHSZ_REG @ word 0x11 — NOT the NVRAM/MAC chip, see `nveeprom`): eeprom <on|off> | eeprom dump | eeprom r <word> | eeprom w <word> <val>".to_string()),
         ]
     }
@@ -936,6 +936,48 @@ impl Device for MemoryController {
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn IoWrite + Send>) -> Result<(), String> {
         match cmd {
             "mc" => {
+                if args.len() >= 2 && args[0] == "dma" && args[1] == "xlate" {
+                    // mc dma xlate [vaddr] [w]: walk the DMA translation the
+                    // way the engine would, without side effects. Default
+                    // address: the current MEMADR.
+                    let Some((ctl, tlb_hi, tlb_lo, memadr)) = self.giodma.state.try_lock()
+                        .map(|s| (s.ctl, s.tlb_hi, s.tlb_lo, s.memadr))
+                    else {
+                        writeln!(writer, "DMA state busy, try again").unwrap();
+                        return Ok(());
+                    };
+                    let vaddr = match args.get(2) {
+                        Some(a) => u32::from_str_radix(a.trim_start_matches("0x"), 16)
+                            .map_err(|e| format!("bad address {a}: {e}"))?,
+                        None => memadr,
+                    };
+                    let writing = args.get(3).is_some_and(|a| *a == "w");
+                    let w = self.dma_xlate_walk(ctl, tlb_hi, tlb_lo, vaddr, writing);
+                    writeln!(writer, "DMA xlate {:08x} ({})  ctl={:08x} xlate={} page={} pte={}B",
+                        vaddr, if writing { "write to memory" } else { "read from memory" }, ctl,
+                        (ctl & DMA_CTL_XLATE) != 0, if w.page_16k { "16K" } else { "4K" },
+                        if w.pte_8byte { 8 } else { 4 }).unwrap();
+                    if (ctl & DMA_CTL_XLATE) != 0 {
+                        match w.entry {
+                            Some(i) => writeln!(writer, "  µTLB[{i}] hi={:08x} lo={:08x} valid={}  pte_base={:08x}",
+                                tlb_hi[i], tlb_lo[i], tlb_lo[i] & 2 != 0, w.pte_base).unwrap(),
+                            None => writeln!(writer, "  no µTLB entry for VPNhi {:08x} (entries {:08x?})",
+                                vaddr & 0xffc0_0000, tlb_hi).unwrap(),
+                        }
+                        if w.entry.is_some() && w.pte_addr != 0 {
+                            writeln!(writer, "  vpn_lo={:#x}  pte_addr={:08x}  pte={}", w.vpn_lo, w.pte_addr,
+                                match w.pte {
+                                    Some(p) => format!("{:08x} (valid={} dirty={} pfn={:#x})", p, p & 2 != 0, p & 4 != 0, (p & 0x03ff_ffc0) >> 6),
+                                    None => "unreadable".to_string(),
+                                }).unwrap();
+                        }
+                    }
+                    match w.result {
+                        Ok(p) => writeln!(writer, "  -> phys {:08x}", p).unwrap(),
+                        Err(f) => writeln!(writer, "  -> FAULT {:?}", f).unwrap(),
+                    }
+                    return Ok(());
+                }
                 if !args.is_empty() && args[0] == "dma" {
                     // Try to get DMA state without blocking — use try_lock so the monitor
                     // remains usable even if the DMA thread currently holds the lock.

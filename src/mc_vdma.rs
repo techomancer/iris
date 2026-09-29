@@ -362,6 +362,43 @@ impl VdmaJob {
     }
 }
 
+/// Why a DMA translation failed (the DMA_CAUSE bit it raises in brackets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaXlateFault {
+    /// No µTLB entry's VPNhi matches [TLB_MISS].
+    TlbMiss,
+    /// The matching µTLB entry is not valid [TLB_MISS].
+    TlbInvalid,
+    /// The page table word could not be read (no memory there) [none].
+    PteRead,
+    /// PTE not valid [FAULT].
+    Page,
+    /// Write to a PTE without the dirty/writable bit [CLEAN].
+    Clean,
+}
+
+/// One DMA translation walk, step by step (`dma_xlate_walk`).
+#[derive(Clone, Copy, Debug)]
+pub struct DmaXlate {
+    pub vaddr: u32,
+    pub writing: bool,
+    pub page_16k: bool,
+    pub pte_8byte: bool,
+    pub entry: Option<usize>,
+    pub pte_base: u32,
+    pub vpn_lo: u32,
+    pub pte_addr: u32,
+    pub pte: Option<u32>,
+    pub result: Result<u32, DmaXlateFault>,
+}
+
+impl Default for DmaXlate {
+    fn default() -> Self {
+        DmaXlate { vaddr: 0, writing: false, page_16k: false, pte_8byte: false, entry: None,
+                   pte_base: 0, vpn_lo: 0, pte_addr: 0, pte: None, result: Err(DmaXlateFault::TlbMiss) }
+    }
+}
+
 /// What a transfer body reports back to the epilogue.
 pub struct VdmaResult {
     /// Final memory address, written back to MEMADR.
@@ -379,95 +416,108 @@ impl MemoryController {
         }
     }
 
+    /// Walk the DMA translation for `vaddr` with the given CTL and µTLB
+    /// contents: no side effects (the engine raises causes from the result;
+    /// the monitor's `mc dma xlate` prints it).
+    pub(crate) fn dma_xlate_walk(&self, ctl: u32, tlb_hi: [u32; 4], tlb_lo: [u32; 4], vaddr: u32,
+                                 writing: bool) -> DmaXlate {
+        let mut w = DmaXlate { vaddr, writing, ..Default::default() };
+        if (ctl & DMA_CTL_XLATE) == 0 {
+            w.result = Ok(vaddr);
+            return w;
+        }
+        // GIO CTL[1]: page size (0=4KB, 1=16KB)
+        // GIO CTL[0]: PTE size  (0=4B,  1=8B)
+        let page_16k = (ctl & 0x2) != 0;
+        let pte_8byte = (ctl & 0x1) != 0;
+        let (page_shift, page_mask): (u32, u32) = if page_16k { (14, 0x3fff) } else { (12, 0xfff) };
+        let pte_shift = if pte_8byte { 3 } else { 2 };
+        w.page_16k = page_16k;
+        w.pte_8byte = pte_8byte;
+        // VPNhi: top 10 bits [31:22] match µTLB tag
+        let Some(i) = (0..4).find(|&i| (vaddr & 0xffc0_0000) == (tlb_hi[i] & 0xffc0_0000)) else {
+            w.result = Err(DmaXlateFault::TlbMiss);
+            return w;
+        };
+        w.entry = Some(i);
+        // Valid bit (bit 1)
+        if (tlb_lo[i] & 2) == 0 {
+            w.result = Err(DmaXlateFault::TlbInvalid);
+            return w;
+        }
+        // PTEBase is bits [25:6] of TLBLO (mask 0x03ffffc0), shifted left 6 → phys addr
+        let pte_base = (tlb_lo[i] & 0x03ff_ffc0) << 6;
+        // VPNlo: bits [21:page_shift], index into page table
+        let vpn_lo = (vaddr & 0x003f_ffff) >> page_shift;
+        let pte_addr = pte_base + (vpn_lo << pte_shift);
+        w.pte_base = pte_base;
+        w.vpn_lo = vpn_lo;
+        w.pte_addr = pte_addr;
+        // Read PTE — 4 or 8 bytes. For 8-byte PTEs, read64 and take the low word.
+        let pte = self.phys().and_then(|phys| {
+            if pte_8byte {
+                let r = phys.read64(pte_addr);
+                r.is_ok().then_some(r.data as u32)
+            } else {
+                let r = phys.read32(pte_addr);
+                r.is_ok().then_some(r.data)
+            }
+        });
+        let Some(pte) = pte else {
+            w.result = Err(DmaXlateFault::PteRead);
+            return w;
+        };
+        w.pte = Some(pte);
+        // PTE valid bit (bit 1), dirty/writable bit (bit 2)
+        if (pte & 2) == 0 {
+            w.result = Err(DmaXlateFault::Page);
+        } else if writing && (pte & 0x4) == 0 {
+            w.result = Err(DmaXlateFault::Clean);
+        } else {
+            // PFN: bits [29:6], physical addr = (PFN << page_shift) | page_offset
+            w.result = Ok(((pte & 0x03ff_ffc0) << 6) | (vaddr & page_mask));
+        }
+        w
+    }
+
     /// Translate a DMA virtual address through the 4-entry µTLB and the page
     /// table it points at. Returns `None` and raises the matching DMA cause on
     /// any fault; the caller aborts the transfer.
     fn translate_addr(&self, vaddr: u32, writing: bool) -> Option<u32> {
-        let mut state = self.giodma().state.lock();
-
-        if (state.ctl & DMA_CTL_XLATE) == 0 {
-            return Some(vaddr);
-        }
-
-        // GIO CTL[1]: page size (0=4KB, 1=16KB)
-        // GIO CTL[0]: PTE size  (0=4B,  1=8B)
-        let page_16k  = (state.ctl & 0x2) != 0;
-        let pte_8byte = (state.ctl & 0x1) != 0;
-        let (page_shift, page_mask): (u32, u32) = if page_16k { (14, 0x3fff) } else { (12, 0xfff) };
-        let pte_shift = if pte_8byte { 3 } else { 2 };
-
-        // VPNhi: top 10 bits [31:22] match µTLB tag
-        for i in 0..4 {
-            let tlb_hi = state.tlb_hi[i];
-            let tlb_lo = state.tlb_lo[i];
-
-            if (vaddr & 0xffc00000) != (tlb_hi & 0xffc00000) {
-                continue;
-            }
-
-            // Check Valid bit (bit 1)
-            if (tlb_lo & 2) == 0 {
-                dlog_dev!(LogModule::Mc, "MC: DMA TLB hit but invalid entry {} for vaddr={:#010x}", i, vaddr);
-                state.cause |= DMA_CAUSE_TLB_MISS;
-                drop(state);
-                self.signal_dma_interrupt();
+        let (ctl, tlb_hi, tlb_lo) = {
+            let state = self.giodma().state.lock();
+            (state.ctl, state.tlb_hi, state.tlb_lo)
+        };
+        let w = self.dma_xlate_walk(ctl, tlb_hi, tlb_lo, vaddr, writing);
+        let cause = match w.result {
+            Ok(p) => return Some(p),
+            Err(DmaXlateFault::PteRead) => {
+                dlog_dev!(LogModule::Mc, "MC: DMA phys read failed for pte_addr={:#010x} (page_16k={} pte_8byte={})",
+                    w.pte_addr, w.page_16k, w.pte_8byte);
                 return None;
             }
-
-            // PTEBase is bits [25:6] of TLBLO (mask 0x03ffffc0), shifted left 6 → phys addr
-            let pte_base_addr = (tlb_lo & 0x03ffffc0) << 6;
-            // VPNlo: bits [21:page_shift], index into page table
-            let vpn_lo = (vaddr & 0x003fffff) >> page_shift;
-            let pte_addr = pte_base_addr + (vpn_lo << pte_shift);
-
-            drop(state);
-
-            if let Some(phys) = self.phys() {
-                // Read PTE — 4 or 8 bytes. For 8-byte PTEs, read64 and take the low word.
-                let pte_opt = if pte_8byte {
-                    { let _r = phys.read64(pte_addr); if _r.is_ok() { Some(_r.data as u32) } else { None } }
-                } else {
-                    { let _r = phys.read32(pte_addr); if _r.is_ok() { let d = _r.data as _; Some(d) } else { None } }
-                };
-
-                if let Some(pte) = pte_opt {
-                    // PTE valid bit (bit 1)
-                    if (pte & 2) == 0 {
-                        dlog_dev!(LogModule::Mc, "MC: DMA page fault vaddr={:#010x} pte_addr={:#010x} pte={:#010x}", vaddr, pte_addr, pte);
-                        let mut state = self.giodma().state.lock();
-                        state.cause |= DMA_CAUSE_FAULT;
-                        drop(state);
-                        self.signal_dma_interrupt();
-                        return None;
-                    }
-
-                    if writing && (pte & 0x4) == 0 {
-                        dlog_dev!(LogModule::Mc, "MC: DMA clean fault vaddr={:#010x} pte={:#010x}", vaddr, pte);
-                        let mut state = self.giodma().state.lock();
-                        state.cause |= DMA_CAUSE_CLEAN;
-                        drop(state);
-                        self.signal_dma_interrupt();
-                        return None;
-                    }
-
-                    // PFN: bits [29:6], physical addr = (PFN << page_shift) | page_offset
-                    let phys_addr = ((pte & 0x03ffffc0) << 6) | (vaddr & page_mask);
-                    return Some(phys_addr);
-                }
+            Err(DmaXlateFault::TlbMiss) => {
+                dlog_dev!(LogModule::Mc, "MC: DMA TLB miss vaddr={:#010x} tlb_hi={:#010x?}", vaddr, tlb_hi);
+                DMA_CAUSE_TLB_MISS
             }
-            dlog_dev!(LogModule::Mc, "MC: DMA phys read failed for pte_addr={:#010x} (page_16k={} pte_8byte={})", pte_addr, page_16k, pte_8byte);
-            return None;
-        }
-
-        // No µTLB match
-        dlog_dev!(LogModule::Mc, "MC: DMA TLB miss vaddr={:#010x} tlb_hi={:#010x?}", vaddr, state.tlb_hi);
-        state.cause |= DMA_CAUSE_TLB_MISS;
-        drop(state);
+            Err(DmaXlateFault::TlbInvalid) => {
+                dlog_dev!(LogModule::Mc, "MC: DMA TLB hit but invalid entry {:?} for vaddr={:#010x}", w.entry, vaddr);
+                DMA_CAUSE_TLB_MISS
+            }
+            Err(DmaXlateFault::Page) => {
+                dlog_dev!(LogModule::Mc, "MC: DMA page fault vaddr={:#010x} pte_addr={:#010x} pte={:#010x?}", vaddr, w.pte_addr, w.pte);
+                DMA_CAUSE_FAULT
+            }
+            Err(DmaXlateFault::Clean) => {
+                dlog_dev!(LogModule::Mc, "MC: DMA clean fault vaddr={:#010x} pte={:#010x?}", vaddr, w.pte);
+                DMA_CAUSE_CLEAN
+            }
+        };
+        self.giodma().state.lock().cause |= cause;
         self.signal_dma_interrupt();
         None
     }
 
-    /// Pick the transfer body for this job. See the module docs for the table.
     fn dma_dispatch(&self, job: &VdmaJob) -> VdmaResult {
         let Some(phys) = self.phys() else {
             return VdmaResult { mem_vaddr: job.mem_vaddr, exc: true };

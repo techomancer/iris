@@ -131,6 +131,9 @@ pub const T_IRIS_GETCPOS: u32 = 0x068;
 /// c, d in eye space (gc->state.transform.eyeClipPlanes).
 pub const T_CLIP_PLANE_ENABLE: u32 = 0x02e;
 pub const T_CLIP_PLANE: u32 = 0x02f;
+/// Pixel zoom for pixel writes: token x3 = 0.0, zoom x, zoom y (meaning
+/// of the first word unverified; lrectwrite sends 0, 1, 1 at zoom 1).
+pub const T_PIXEL_ZOOM: u32 = 0x0bb;
 pub const T_IRIS_SBOXF: u32 = 0x053;
 /// swaptmesh (gl_i_swaptmesh): swap the two vertices a tmesh (bgntmesh =
 /// 0x046, LOADV|0x047) keeps; the next vertex makes a triangle with them.
@@ -233,6 +236,9 @@ pub struct Wv {
 /// alike; their different Z ranges come after clipping, in the viewport
 /// transform), 6..11 the user planes (0x02E / 0x02F, eye space).
 const CLIP_PLANES: usize = 12;
+
+/// Most visible rectangles a 0x1E5 clip decomposes into (visible_rects).
+const MAX_VIS: usize = 32;
 
 /// Vertex buffer (GlState::vb): strips, fans and tmeshes cycle through the
 /// first RING slots, never overwriting the vertices they still refer to
@@ -356,6 +362,8 @@ pub struct GlState {
     pen_at: Wv,
     /// Triangle strip / tmesh winding: toggles per triangle and per swap.
     tflip: u32,
+    /// Pixel zoom (0x0BB): x, y; 0 = 1.
+    pzoom: [f32; 2],
     /// User clip planes (eye space) and their enable bits.
     uclip: [[f32; 4]; 6],
     uclip_on: u32,
@@ -503,14 +511,13 @@ impl GlState {
     }
 
     /// Visible rectangles (screen, exclusive): clip_rect() intersected with
-    /// the window's visible pieces. Empty ones are dropped.
-    fn visible_rects(&self) -> ([[i32; 4]; 4], usize) {
+    /// the window's visible region, as y bands of the piece list's XOR
+    /// (see span_pieces). Up to 7 bands of up to 4 intervals.
+    fn visible_rects(&self) -> ([[i32; 4]; MAX_VIS], usize) {
         let r = self.clip_rect();
-        let mut out = [[0i32; 4]; 4];
-        // The piece list decides, not the obscured flag: a partly covered
-        // window arrives with obscured = 0 and 2 pieces (IRIX 6.5.22 atlantis
-        // trace). 0 pieces and not obscured = the whole window; the WID
-        // test cases are bounded by the window (the box the kernel sends).
+        let mut out = [[0i32; 4]; MAX_VIS];
+        // 0 pieces and not obscured = the whole window; the WID test cases
+        // are bounded by the window (the box the kernel sends).
         if self.clip_n == 0 || self.wid_clip() {
             let r = if self.clip_n == 0 && self.clip_obscured != 0 {
                 let b = self.clip_rects[0];
@@ -524,33 +531,89 @@ impl GlState {
             }
             return (out, 0);
         }
-        let mut n = 0;
+        // Band edges: every piece's top and bottom inside the clip rect.
+        let mut ys = [0i32; 10];
+        let mut ny = 0;
+        ys[ny] = r[1];
+        ny += 1;
+        ys[ny] = r[3];
+        ny += 1;
         for p in &self.clip_rects[..self.clip_n.min(4) as usize] {
-            let c = [r[0].max(p[0]), r[1].max(p[1]), r[2].min(p[2]), r[3].min(p[3])];
-            if c[0] < c[2] && c[1] < c[3] {
-                out[n] = c;
-                n += 1;
+            for y in [p[1], p[3]] {
+                if y > r[1] && y < r[3] {
+                    ys[ny] = y;
+                    ny += 1;
+                }
+            }
+        }
+        let ys = &mut ys[..ny];
+        ys.sort_unstable();
+        let mut n = 0;
+        for band in ys.windows(2) {
+            let (y0, y1) = (band[0], band[1]);
+            if y0 >= y1 {
+                continue;
+            }
+            let (pieces, np) = self.span_pieces(y0, r[0], r[2]);
+            for &(a, b) in &pieces[..np] {
+                if n < MAX_VIS {
+                    out[n] = [a, y0, b, y1];
+                    n += 1;
+                }
             }
         }
         (out, n)
     }
 
     /// The visible pieces of row `y` between x0 and x1 (exclusive), left to
-    /// right.
+    /// right. A pixel is visible when it lies in an odd number of the 0x1E5
+    /// pieces (XOR). Xsgi's expValidateClip sends either disjoint visible
+    /// rectangles (XOR = union) or, when the region is the window minus one
+    /// rectangle, [whole window, hole] with wid = 0 (HQ2.h 0x1E5): atlantis
+    /// with ideas over the middle of its side. The union let atlantis draw
+    /// over ideas.
     fn span_pieces(&self, y: i32, x0: i32, x1: i32) -> ([(i32, i32); 4], usize) {
-        let (rects, n) = self.visible_rects();
+        let r = self.clip_rect();
         let mut out = [(0, 0); 4];
-        let mut k = 0;
-        for r in &rects[..n] {
-            if y >= r[1] && y < r[3] {
-                let (a, b) = (x0.max(r[0]), x1.min(r[2]));
+        if y < r[1] || y >= r[3] {
+            return (out, 0);
+        }
+        let (x0, x1) = (x0.max(r[0]), x1.min(r[2]));
+        if x0 >= x1 {
+            return (out, 0);
+        }
+        if self.clip_n == 0 || self.wid_clip() {
+            let (rects, n) = self.visible_rects();
+            if n == 1 && y >= rects[0][1] && y < rects[0][3] {
+                let (a, b) = (x0.max(rects[0][0]), x1.min(rects[0][2]));
                 if a < b {
-                    out[k] = (a, b);
-                    k += 1;
+                    out[0] = (a, b);
+                    return (out, 1);
                 }
             }
+            return (out, 0);
         }
-        out[..k].sort_unstable_by_key(|p| p.0);
+        // Edges of the pieces covering this row; sorted, they pair up into
+        // the intervals of odd coverage (equal edges cancel).
+        let mut xs = [0i32; 8];
+        let mut nx = 0;
+        for p in &self.clip_rects[..self.clip_n.min(4) as usize] {
+            if y >= p[1] && y < p[3] && p[0] < p[2] {
+                xs[nx] = p[0];
+                xs[nx + 1] = p[2];
+                nx += 2;
+            }
+        }
+        let xs = &mut xs[..nx];
+        xs.sort_unstable();
+        let mut k = 0;
+        for pair in xs.chunks(2) {
+            let (a, b) = (pair[0].max(x0), pair[1].min(x1));
+            if a < b && k < 4 {
+                out[k] = (a, b);
+                k += 1;
+            }
+        }
         (out, k)
     }
 
@@ -592,6 +655,7 @@ fn port_words(index: u32) -> Option<u32> {
         _ if index & !0x1ff != 0 => None,
         T_MODELVIEW | T_PROJECTION | T_TEXTURE_MATRIX | T_IRIS_MATRIX => Some(16),
         T_IRIS_CHAR16 => Some(13),
+        T_PIXEL_ZOOM => Some(3),
         T_IRIS_CHAR16_TALL | T_IRIS_CHAR32 => Some(21),
         T_NORMAL_MATRIX => Some(9),
         T_NORMAL | T_IRIS_NORMAL => Some(3),
@@ -646,6 +710,11 @@ pub struct GlCx {
     /// Image of the outgoing context, taken at GE_HQMSAV (before a new
     /// context resets the state) and handed out at 0x1E1.
     save: [u32; CX_WORDS],
+    /// Trace notes: owner of the live state before the last GE_HQMSAV
+    /// (u32::MAX = none), and why the last restore was rejected (0 = it
+    /// loaded; 1 length, 2 magic, 3 GlState size).
+    pub(super) prev_owner: u32,
+    pub(super) restore_reject: u32,
 }
 
 impl Hq2Engine {
@@ -686,6 +755,7 @@ impl Hq2Engine {
             self.gl_ctx.have_cur = 0;
             return;
         }
+        self.gl_ctx.prev_owner = if self.gl_ctx.have_cur != 0 { self.gl_ctx.cur } else { u32::MAX };
         let outgoing = self.gl_ctx.have_cur != 0 && self.gl_ctx.cur != id;
         if outgoing {
             let mut img = [0u32; CX_WORDS];
@@ -725,8 +795,24 @@ impl Hq2Engine {
         if c.got < c.expect {
             return false;
         }
-        if c.expect as usize == CX_WORDS && c.buf[0] == CX_MAGIC
-            && c.buf[1] == std::mem::size_of::<GlState>() as u32 {
+        c.restore_reject = if c.expect as usize != CX_WORDS {
+            1
+        } else if c.buf[0] != CX_MAGIC {
+            2
+        } else if c.buf[1] != std::mem::size_of::<GlState>() as u32 {
+            3
+        } else {
+            0
+        };
+        if c.restore_reject != 0 {
+            // Not an image of ours (truncated, shifted, or another build's):
+            // start from the defaults rather than keep the outgoing
+            // context's live state, which would draw into its window.
+            // SAFETY: GlState is plain data, valid when zeroed.
+            self.gl = unsafe { std::mem::zeroed() };
+        }
+        let c = &mut self.gl_ctx;
+        if c.restore_reject == 0 {
             // SAFETY: same layout as gl_cx_image wrote; GlState is plain data
             // for which every bit pattern of its number fields is valid.
             unsafe {
@@ -874,6 +960,7 @@ impl Hq2Engine {
                     _ => g.color,
                 };
             }
+            T_PIXEL_ZOOM => g.pzoom = [f(b[1]), f(b[2])],
             T_IRIS_INDEX => {
                 g.color = [num(b[0]) / 255.0, 0.0, 0.0, 1.0];
             }
@@ -982,7 +1069,11 @@ impl Hq2Engine {
         let g = &mut self.gl;
         match cmd {
             T_WINDOW => {
-                g.win = [a[0] as i32 & 0x7ff, a[1] as i32 & 0x7ff, a[2] as i32, a[3] as i32];
+                // x and y are full signed words (Gr2ValidateClip: xorg, and
+                // 0x400 - (yorg + ysize)): negative for a window pushed past
+                // the left or bottom edge of the screen. Masking them to 11
+                // bits put such windows far off to the right / top.
+                g.win = [a[0] as i32, a[1] as i32, a[2] as i32, a[3] as i32];
                 g.clip_wid = a[4];
                 g.clip_obscured = a[5] & 1;
                 g.clip_n = a[6];
@@ -1454,6 +1545,64 @@ impl Hq2Engine {
         self.gl_done(out);
     }
 
+    /// One row of a GL pixel DMA (0x0B5 / 0x0B8, lrectwrite): `row` counts
+    /// DMA rows, which arrive top row first; (x, y) is the rectangle's
+    /// bottom-left corner in window coordinates (GL y up) and `h` its height.
+    /// The kernel builds the VDMA "high to low" (_Gr2HtoLmkudmada, from the
+    /// end of the bottom-up lrectwrite array) unless the client's rows are
+    /// already top-down (_Gr2mkudmada), so the GE always gets rows top-down
+    /// (OPART MRI: a 512x512 image in 4 bands of 128 rows, y = 0..384).
+    /// `fmt`: 2 =
+    /// 4 pixels per word, 1 = 2, 0 = 1; first pixel in the MSB. Colour-index
+    /// visuals take the value as the index; RGB visuals take 32-bit pixels as
+    /// 0xAABBGGRR (cpack order). Drawn as runs of equal pixels, clipped to
+    /// the window, with integer pixel zoom for 0x0B8.
+    pub(super) fn gl_pixel_row(&mut self, x: i32, y: i32, row: u32, w: u32, h: u32, fmt: u32, words: &[u32],
+                               zoomed: bool, out: &mut dyn Re3Sink) {
+        let g = &self.gl;
+        let (per_word, bits) = match fmt { 2 => (4usize, 8u32), 1 => (2, 16), _ => (1, 32) };
+        let px = |n: usize| -> u32 {
+            let wi = n / per_word;
+            if wi >= words.len() {
+                return 0;
+            }
+            if bits == 32 { words[wi] } else { (words[wi] >> (32 - bits * (1 + (n % per_word) as u32))) & ((1 << bits) - 1) }
+        };
+        let ci = g.pixfmt == re3::PIXFMT_CI12 || bits < 32;
+        let colour = |v: u32| -> [f32; 4] {
+            if ci {
+                [v as f32 / 255.0, 0.0, 0.0, 1.0]
+            } else {
+                let u = |sh: u32| ((v >> sh) & 0xff) as f32 / 255.0;
+                [u(0), u(8), u(16), u(24)]
+            }
+        };
+        let z = |v: f32| if zoomed && v >= 1.0 { v.round() as i32 } else { 1 };
+        let (zx, zy) = (z(g.pzoom[0]), z(g.pzoom[1]));
+        let from_bottom = h.saturating_sub(1 + row) as i32;
+        let (wx, wy) = (g.win[0] + x, g.win[1] + y + from_bottom * zy);
+        let cmax = g.cmax();
+        self.gl_setup(out);
+        let mut n = 0usize;
+        while n < w as usize {
+            let v = px(n);
+            let mut e = n + 1;
+            while e < w as usize && px(e) == v {
+                e += 1;
+            }
+            self.gl_color_regs(to_fixed(colour(v), cmax), out);
+            let (x0, x1) = (wx + n as i32 * zx, wx + e as i32 * zx);
+            for dy in 0..zy {
+                let (pieces, np) = self.gl.span_pieces(wy + dy, x0, x1);
+                for &(a, b) in &pieces[..np] {
+                    self.span(a, wy + dy, (b - a) as u32, None, out);
+                }
+            }
+            n = e;
+        }
+        self.gl_done(out);
+    }
+
     fn gl_clear(&mut self, c: [f32; 4], out: &mut dyn Re3Sink) {
         let (rects, n) = self.gl.visible_rects();
         if n == 0 {
@@ -1515,18 +1664,134 @@ impl Hq2Engine {
         if a.ok == 0 || b.ok == 0 {
             return;
         }
-        self.gl_setup(out);
-        self.gl_color_regs(to_fixed(color, self.gl.cmax()), out);
+        // One RE3 SHADED primitive: SHADED is not a horizontal span but a
+        // stepper from (X, Y) by (DX, DY) per pixel for NUMPIX pixels (RE3.h;
+        // the GR1 RE1 spec: "interpolates pixels along random-angled or
+        // horizontal scan lines"), so a line is a single primitive with its
+        // colour, Z and alpha iterated along it. The major axis steps whole
+        // pixels (+-1.0) through the pixel centres in [start, end) (GL
+        // diamond-exit approximated; the last point is not drawn, so strip
+        // joints are drawn once); the minor axis starts at its coordinate at
+        // the first centre, whole part in X / Y and 1/16 fraction in XYFRAC.
         let (dx, dy) = (b.x - a.x, b.y - a.y);
-        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
-        let (sx, sy) = (dx / steps as f32, dy / steps as f32);
-        // GL diamond-exit rule approximated: draw steps pixels, excluding the last.
-        for i in 0..steps {
-            let x = (a.x + sx * i as f32).floor() as i32;
-            let y = (a.y + sy * i as f32).floor() as i32;
-            if self.gl.pixel_visible(x, y) {
-                self.span(x, y, 1, None, out);
+        let xmajor = dx.abs() >= dy.abs();
+        let (ma, mb, na) = if xmajor { (a.x, b.x, a.y) } else { (a.y, b.y, a.x) };
+        let dmaj = mb - ma;
+        if dmaj == 0.0 {
+            return;
+        }
+        let dir = if dmaj > 0.0 { 1.0f32 } else { -1.0 };
+        let slope = (if xmajor { dy } else { dx }) / dmaj.abs();
+        // First and past-last pixel index along the major axis.
+        let (p0, p1) = if dir > 0.0 {
+            ((ma - 0.5).ceil(), (mb - 0.5).ceil())
+        } else {
+            ((ma - 0.5).floor(), (mb - 0.5).floor())
+        };
+        let total = ((p1 - p0) * dir) as i32;
+        if total <= 0 {
+            return;
+        }
+        // Minor coordinate at pixel centre p (along the major axis).
+        let minor_at = |p: f32| na + slope * ((p + 0.5 - ma) * dir);
+        // Keep to pixels on screen: RE3 X / Y are unsigned.
+        let (lim_maj, lim_min) = if xmajor { (re3::FB_W as f32, SCREEN_H as f32) } else { (SCREEN_H as f32, re3::FB_W as f32) };
+        let mut i0 = 0i32;
+        let mut i1 = total;
+        // Major axis.
+        let first_ok = |p: f32| p >= 0.0 && p < lim_maj;
+        while i0 < i1 && !first_ok(p0 + dir * i0 as f32) {
+            i0 += 1;
+            if i0 > 4096 { return; }
+        }
+        while i1 > i0 && !first_ok(p0 + dir * (i1 - 1) as f32) {
+            i1 -= 1;
+        }
+        // Minor axis (slope <= 1, so a bounded walk).
+        let minor_ok = |i: i32| { let m = minor_at(p0 + dir * i as f32); m >= 0.0 && m < lim_min };
+        while i0 < i1 && !minor_ok(i0) {
+            i0 += 1;
+        }
+        while i1 > i0 && !minor_ok(i1 - 1) {
+            i1 -= 1;
+        }
+        if i0 >= i1 {
+            return;
+        }
+        let n = (i1 - i0) as u32;
+        let pmaj = p0 + dir * i0 as f32;
+        let m16 = (minor_at(pmaj) * 16.0).floor() as i32; // 1/16 pixel
+        let (minor_px, minor_frac) = (m16 >> 4, (m16 & 15) as u32);
+        let (x_px, y_px) = if xmajor { (pmaj as i32, minor_px) } else { (minor_px, pmaj as i32) };
+        // Parameter along a -> b at the first pixel, and per pixel.
+        let t0 = ((pmaj + 0.5 - ma) / dmaj).clamp(0.0, 1.0);
+        let dt = 1.0 / dmaj.abs();
+        let steps = 1.0 / dt; // pixels per unit parameter, for the deltas
+        let smooth = self.gl.smooth != 0;
+        let (ca, cb) = if smooth { (a.c, b.c) } else { (color, color) };
+        let lerp = |p: f32, q: f32| p + (q - p) * t0;
+        let cmax = self.gl.cmax();
+        let blend = self.gl.blend_func().is_some();
+        let zs = self.gl_zs_active();
+        self.gl_setup(out);
+        // Colour: start at step i0, per-pixel steps from the ends (8.11).
+        let mut start = [0u32; 3];
+        let mut step = [0u32; 3];
+        for k in 0..3 {
+            let m = 255.0 * if k == 0 { cmax } else { 1.0 };
+            let c0 = (lerp(ca[k], cb[k]) * 255.0).clamp(0.0, m);
+            let d = (cb[k] - ca[k]) * 255.0 / steps;
+            start[k] = (c0 * 2048.0) as u32;
+            step[k] = ((d * 2048.0) as i32) as u32;
+        }
+        out.reg(re3::REG_R, start[0]);
+        out.reg(re3::REG_G, start[1]);
+        out.reg(re3::REG_B, start[2]);
+        out.reg(re3::REG_DR, step[0] & 0x00ff_ffff);
+        out.reg(re3::REG_DG, step[1] & 0x000f_ffff);
+        out.reg(re3::REG_DB, step[2] & 0x000f_ffff);
+        if zs {
+            let z = lerp(a.z, b.z).clamp(-8388608.0, 8388607.0);
+            let dz = (((b.z - a.z) / steps) as f64 * 16384.0).round() as i64;
+            out.reg(re3::REG_Z, (z as i32 as u32) & 0x00ff_ffff);
+            out.reg(re3::REG_DZI, ((dz >> 14) as u32) & 0x00ff_ffff);
+            out.reg(re3::REG_DZF, (dz as u32) & 0x3fff);
+        }
+        let dxy = |v: f32| ((v * 16384.0).round() as i32 as u32) & 0xffff;
+        let (sx, sy) = if xmajor { (dir, slope) } else { (slope, dir) };
+        out.reg(re3::REG_DX, dxy(sx));
+        out.reg(re3::REG_DY, dxy(sy));
+        out.reg(re3::REG_XYFRAC, minor_frac);
+        // Clip in RE3: once per visible rectangle with the scissor set to it
+        // (the WID test covers the rest in WID mode, set up by gl_setup).
+        let (rects, nr) = self.gl.visible_rects();
+        for r in &rects[..nr] {
+            out.reg(re3::REG_XMIN, r[0] as u32);
+            out.reg(re3::REG_XMAX, (r[2] - 1) as u32);
+            out.reg(re3::REG_YMIN, r[1] as u32);
+            out.reg(re3::REG_YMAX, (r[3] - 1) as u32);
+            if blend {
+                let a0 = (lerp(ca[3], cb[3]).clamp(0.0, 1.0) * 255.0 * 2048.0) as u32 as u64;
+                let da = (((cb[3] - ca[3]) * 255.0 / steps * 2048.0) as i32) as u32 as u64;
+                out.op(re3::RE3_OP_ALPHA, a0 | (da << 32));
             }
+            self.gl_span_ir(x_px, y_px, n, re3::IR_SHADED, None, out);
+        }
+        // Back to the full-screen scissor and zero steps (FLAT spans and the
+        // 2D path step the iterators too).
+        out.reg(re3::REG_XMIN, 0);
+        out.reg(re3::REG_XMAX, re3::FB_W as u32 - 1);
+        out.reg(re3::REG_YMIN, 0);
+        out.reg(re3::REG_YMAX, re3::FB_H as u32 - 1);
+        out.reg(re3::REG_DX, 0);
+        out.reg(re3::REG_DY, 0);
+        out.reg(re3::REG_XYFRAC, 0);
+        out.reg(re3::REG_DR, 0);
+        out.reg(re3::REG_DG, 0);
+        out.reg(re3::REG_DB, 0);
+        if zs {
+            out.reg(re3::REG_DZI, 0);
+            out.reg(re3::REG_DZF, 0);
         }
         self.gl_done(out);
     }
