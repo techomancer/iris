@@ -171,13 +171,19 @@ pub struct Gr2 {
     /// kernel sees FIN2 as soon as the HQ2 gets there. See
     /// rules/gr2/fin2-wait-must-stall.md.
     fin2_wait: AtomicU32,
-    /// Host time (fin2_clock ns) of the first stalled FIN2 poll since the
-    /// wait was armed (0 = none yet). The stall gives up FIN2_STALL_LIMIT
-    /// after that, so a pipeline that can never finish (RE3 held by a
-    /// CPU-driven readback) cannot hang the machine. Counted from the first
-    /// poll, not from the ack: the DMA between ack and poll may take long on
-    /// a busy host (a 400-row pixel DMA on a GitHub CI runner did).
+    /// Host time (fin2_clock ns) of the last progress seen by a stalled FIN2
+    /// poll since the wait was armed (0 = no stalled poll yet). The stall
+    /// gives up after FIN2_STALL_LIMIT without progress, so a pipeline that
+    /// can never finish (RE3 held by a CPU-driven readback) cannot hang the
+    /// machine, while a long but moving backlog is waited out: gltest
+    /// --bench 500 (500 full-screen quads, ~2.4 s of RE3 work) timed out a
+    /// context switch's FIN2 with a fixed 2 s cap and crashed the kernel in
+    /// Gr2PcxSwap. Not counted from the ack: the DMA between ack and poll
+    /// may take long on a busy host (a 400-row pixel DMA on a GitHub CI
+    /// runner did).
     fin2_armed_ns: AtomicU64,
+    /// HQ2 + RE3 FIFO consumer positions at the last stalled FIN2 poll.
+    fin2_progress: AtomicU64,
     /// HQ2_GEDMA read port: HQ2 -> host words (context saves 0x1E1, pixel
     /// DMA reads 0x152 / 0x0AC). A ring the HQ2 thread fills and the reader
     /// (the kernel's VDMA) drains; head / tail count words since reset.
@@ -306,15 +312,20 @@ impl Gr2 {
             && !self.re3_busy.load(Ordering::Acquire)
     }
 
-    /// A FIN2 poll may stall: true until FIN2_STALL_LIMIT after the first
-    /// stalled poll of this wait (Gr2::fin2_armed_ns).
+    /// A FIN2 poll may stall: true until the HQ2 and RE3 have made no
+    /// progress for FIN2_STALL_LIMIT (Gr2::fin2_armed_ns).
     fn fin2_stall_ok(&self) -> bool {
         let now = fin2_clock().max(1);
-        let first = match self.fin2_armed_ns.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire) {
+        let pos = (self.hq_fifo.consumed() as u64) ^ ((self.re3_fifo.consumed() as u64) << 32);
+        if self.fin2_progress.swap(pos, Ordering::AcqRel) != pos {
+            self.fin2_armed_ns.store(now, Ordering::Release);
+            return true;
+        }
+        let last = match self.fin2_armed_ns.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => now,
             Err(t) => t,
         };
-        now.saturating_sub(first) < FIN2_STALL_LIMIT.as_nanos() as u64
+        now.saturating_sub(last) < FIN2_STALL_LIMIT.as_nanos() as u64
     }
 
     /// Spin until both engines are idle (tests and snapshots).

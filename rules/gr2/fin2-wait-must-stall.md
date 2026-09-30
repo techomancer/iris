@@ -18,11 +18,12 @@ Fix (mod.rs `fin2_wait`): the FIN2 ack arms a wait; while armed, a version
 read with FIN2 clear returns bus busy as long as the HQ2 has queued or
 in-progress work, so the kernel's first poll after the DMA sees FIN2. With
 the HQ2 idle and no FIN2 the read returns at once and the kernel times out,
-as on hardware. The stall is capped at 2 s of host time, counted from the
-first stalled poll (not from the ack: the DMA in between can take long on a
-busy host; counting from the ack failed this test on a GitHub CI runner)
-(FIN2_STALL_LIMIT), in case the pipeline can never finish (RE3 held by a
-CPU-driven RWDATA readback). Sample "HQ2 working" BEFORE reading the register (the HQ2
+as on hardware. The stall gives up after 2 s of host time WITHOUT
+PROGRESS (FIN2_STALL_LIMIT; progress = the HQ2 or RE3 FIFO consumer moved,
+`GFifo::consumed`), in case the pipeline can never finish (RE3 held by a
+CPU-driven RWDATA readback). Not counted from the ack (the DMA in between
+can take long on a busy host; that failed this test on a GitHub CI runner),
+and not a fixed cap from the first poll either: see gltest below. Sample "HQ2 working" BEFORE reading the register (the HQ2
 raises FIN2 before it consumes the entry and drops hq_busy); sampling after
 lost the race in about one run in three. Test:
 `kernel_pixel_dma_fin2_poll_waits_for_hq`.
@@ -32,9 +33,13 @@ FIN3 seen too early).
 
 The same wait covers the context switch (Gr2PcxSwap: GE_HQMSAV, 0x1E0 /
 0x1E6, save / restore; 1,000,000 x us_delay(1)). With our deep FIFO a GL
-client can queue enough work that the switch's FIN2 comes after the budget
-(suspected cause of Xsgi dying under `gltest --bench 400`, which passes on
-hardware at 1000).
+client can queue far more work than hardware's 512 words allow: `gltest
+--bench N` is N full-screen 800x600 quads (a few FIFO words, 480k pixels
+each) then glFinish. N = 500 is ~2.4 s of RE3 work; a context switch behind
+it outlived the old fixed 2 s cap, the kernel's FIN2 poll timed out and it
+crashed in Gr2PcxSwap's 0x1E5 clip loop (PC 0x882adcac, IRIX 6.5.22 XZ);
+N = 300..400 stayed under 2 s and passed. Hardware passes at 1000. Hence the
+limit counts from the last progress, not from the first poll.
 
 Second cause of the same console message (IRIX 5.3 MRI software): the pixel
 DMA command itself was unimplemented. lrectwrite goes out as token 0x0B5

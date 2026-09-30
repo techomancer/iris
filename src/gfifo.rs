@@ -60,6 +60,14 @@ impl<const DEPTH: usize> GFifo<DEPTH> {
         unsafe { std::mem::zeroed() }
     }
 
+    /// Entries the consumer has published as consumed since reset (wraps).
+    /// A change means the consumer made progress; the consumer publishes
+    /// in batches, so it lags by up to one batch.
+    #[inline]
+    pub fn consumed(&self) -> usize {
+        self.head.load(Ordering::Acquire)
+    }
+
     /// Returns the approximate number of entries currently in the queue.
     #[inline]
     pub fn len(&self) -> usize {
