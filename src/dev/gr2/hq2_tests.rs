@@ -2304,3 +2304,192 @@ fn gl_line_steep_downwards() {
     }
     assert_eq!(gl_px(g, 20, 10), 0, "last point not drawn");
 }
+
+/// Kernel pixel-DMA read as Xsgi's expReadImage drives it for large
+/// rectangles (XGetImage, readximage.log): BUF_SELECT; fin2 = 0; 0x152 x;
+/// GE_DATA y, width, rows, words/row, flag, 0; the VDMA then reads the
+/// packed rows (top first, X-style y) from HQ2_GEDMA and waits for FIN2.
+/// Before IRIS knew 0x152 the reads got zeros, FIN2 never came and the
+/// kernel reset the board.
+#[test]
+fn ddx_dma_read_pixels_streams_gedma_and_sets_fin2() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    cmd(g, HQ2_2D_BEGIN, 0);
+    cmd(g, HQ2_2D_MODE, 0x1009);
+    cmd(g, HQ2_2D_ROP, 0);
+    for v in [0xff, 3, 0] { data(g, v); }
+    cmd(g, HQ2_2D_DRAW_IMAGE, 100);
+    for v in [50, 6, 2, 2, 2, 0] { data(g, v); }
+    for v in [0x01020304u32, 0x05060000, 0x11121314, 0x15160000, 0xdeadbeef, 0xdeadbeef] {
+        data(g, v);
+    }
+    cmd(g, HQ2_2D_END_PRIMITIVE, 0);
+    cmd(g, HQ2_2D_BUF_SELECT, 2);
+    data(g, 0);
+    w32(g, 0x6a04c, 0);
+    cmd(g, HQ2_2D_DMA_READ_PIXELS, 100);
+    for v in [50, 6, 2, 2, 0, 0] { cmd(g, 0, v); }
+    // No wait: read the way the VDMA does, right after the header.
+    let words: Vec<u32> = (0..4).map(|_| r32(g, 0x6a068)).collect();
+    assert_eq!(words, vec![0x0102_0304, 0x0506_0000, 0x1112_1314, 0x1516_0000]);
+    assert_eq!(r32(g, 0x6a040) & 2, 2, "FIN2 after the transfer");
+}
+
+/// A GEDMA read with nothing produced and the HQ2 idle is an overrun: 0,
+/// not a hang. (With the HQ2 busy it waits instead; see the save test.)
+#[test]
+fn gedma_read_with_hq_idle_is_an_overrun() {
+    let g = live_gr2(Gr2Variant::Xz);
+    g.wait_idle();
+    assert_eq!(r32(g, 0x6a068), 0);
+}
+
+fn gl_dma_read(g: &Gr2, x: u32, y: u32, w: u32, rows: u32) -> Vec<u32> {
+    w32(g, 0x6a04c, 0);
+    cmd(g, super::hq2::HQ2_GL_DMA_READ, x);
+    for v in [y, w, rows, w, 0, 0] { cmd(g, 0, v); }
+    let words = (0..w * rows).map(|_| r32(g, 0x6a068)).collect();
+    assert_eq!(r32(g, 0x6a040) & 2, 2, "FIN2 after the transfer");
+    words
+}
+
+/// glReadPixels RGBA through the kernel pixel DMA (libglcore
+/// __glExpReadPixelsKDMARGBA, readback.log): 0x10A read source; 0x0AC x;
+/// GE_DATA y (window-relative, bottom row), width, rows, words/row, 0, 0.
+/// 24-bit RGB: one pixel per word as 0xAABBGGRR (the order 0x0B5 takes),
+/// alpha 0xFF; rows go out top first.
+#[test]
+fn gl_dma_read_rgb24_top_row_first() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    gl_quad3(g, [1., 0., 0.], [[0., 0., 0.], [400., 0., 0.], [400., 150., 0.], [0., 150., 0.]]);
+    gl_quad3(g, [0., 0., 1.], [[0., 150., 0.], [400., 150., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    for v in [0, 0] { cmd(g, 0x10a, v); }
+    let (red, blue) = (0xff00_00ff, 0xffff_0000);
+    assert_eq!(gl_dma_read(g, 10, 148, 2, 4), vec![blue, blue, blue, blue, red, red, red, red]);
+}
+
+/// Double-buffered 12-bit RGB (MAKECURRENT 2): GL_BACK draws with the write
+/// masks 0xFFF000 / 0x000FFF, so in swap state 0 the back buffer is bank 1.
+/// A back read (0x10A = 0, 1) returns it with the nibbles widened; a front
+/// read returns bank 0.
+#[test]
+fn gl_dma_read_rgb12_back_and_front_banks() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 2);
+    for v in [0x00ff_f000, 0x0000_0fff] { cmd(g, 0x10b, v); }
+    cmd(g, 0x011, 0);
+    gl_quad3(g, [1., 0.5, 0.], [[0., 0., 0.], [400., 0., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    for v in [0, 1] { cmd(g, 0x10a, v); }
+    let back = gl_dma_read(g, 20, 20, 1, 1);
+    assert_eq!(back[0] & 0xff00_00ff, 0xff00_00ff, "back: red nibble 0xF widened to 0xFF, alpha 0xFF");
+    assert_eq!(back[0] & 0x00ff_0000, 0, "back: no blue");
+    for v in [0, 0] { cmd(g, 0x10a, v); }
+    assert_eq!(gl_dma_read(g, 20, 20, 1, 1), vec![0xff00_0000], "front bank untouched");
+}
+
+/// XGetImage of a 12-bit double-buffered window (cap.log, glprim --scene
+/// quadrants --db): expReadImage12TC sets MODE 0x1002 and ROP flag = the
+/// window's buffer * 8, reads 32-bit words by 0x152 and keeps the low
+/// nibble of each byte. So the read returns the flagged bank as 8:8:8 with
+/// the nibbles replicated, not the raw 24 bits of both banks.
+#[test]
+fn ddx_dma_read_rgb12_takes_the_flagged_bank() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 2);
+    cmd(g, 0x011, 0);
+    // Bank 0 red, bank 1 blue (12-bit: R 3:0, G 7:4, B 11:8).
+    for v in [0x0000_0fff, 0x0000_0fff] { cmd(g, 0x10b, v); }
+    gl_quad3(g, [1., 0., 0.], [[0., 0., 0.], [400., 0., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    for v in [0x00ff_f000, 0x00ff_f000] { cmd(g, 0x10b, v); }
+    gl_quad3(g, [0., 0., 1.], [[0., 0., 0.], [400., 0., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    let read = |buffer: u32| {
+        cmd(g, HQ2_2D_BEGIN, 0);
+        cmd(g, HQ2_2D_MODE, 0x1002);
+        cmd(g, HQ2_2D_ROP, 0);
+        for v in [0xff_ffff, 3, buffer * 8] { data(g, v); }
+        cmd(g, HQ2_2D_BUF_SELECT, 0);
+        data(g, 0);
+        w32(g, 0x6a04c, 0);
+        // Screen x 100, X-style y 1023 - 700 (inside the window).
+        cmd(g, HQ2_2D_DMA_READ_PIXELS, 100);
+        for v in [1023 - 700, 1, 1, 1, 0, 0] { cmd(g, 0, v); }
+        let w = r32(g, 0x6a068);
+        (w & 0xf) | ((w & 0xf00) >> 4) | ((w & 0xf0000) >> 8)
+    };
+    assert_eq!(read(0), 0x00f, "buffer 0: red as an X 12-bit pixel");
+    assert_eq!(read(1), 0xf00, "buffer 1: blue");
+}
+
+fn ddx_12bit_setup(g: &Gr2, planemask: u32, buffer: u32) {
+    use super::hq2::*;
+    cmd(g, HQ2_2D_BEGIN, 0);
+    cmd(g, HQ2_2D_MODE, 0x1002);
+    cmd(g, HQ2_2D_ROP, 0);
+    for v in [planemask, 3, buffer.wrapping_mul(8)] { data(g, v); }
+}
+
+/// 12-bit TrueColor windows (MODE 0x1002): the buffers stay put in VRAM
+/// (bank 0 = bits 11:0, bank 1 = bits 23:12) and the ROP flag (dbc buffer
+/// * 8) says which one X draws into. A GC pixel is the visual's 12-bit
+/// value (R 3:0, G 7:4, B 11:8).
+#[test]
+fn ddx_12bit_fill_goes_to_the_flagged_bank() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    // Solid rect, X-style y: (10, 1023 - 20) .. (13, 1023 - 20).
+    let rect = |g: &Gr2, fg: u32, pm: u32, buffer: u32| {
+        ddx_12bit_setup(g, pm, buffer);
+        cmd(g, HQ2_2D_ROP, fg);
+        for v in [pm, 3, buffer.wrapping_mul(8)] { data(g, v); }
+        cmd(g, HQ2_2D_SOLID_RECT, 0);
+        for v in [10, 1023 - 20, 14, 1023 - 19] { data(g, v); }
+        cmd(g, HQ2_2D_END_PRIMITIVE, 0);
+        g.wait_idle();
+    };
+    rect(g, 0x00f, 0xff_ffff, 0);
+    assert_eq!(pixel(g, 11, 20), 0x00_000f, "buffer 0 only, even with an all-ones plane mask");
+    rect(g, 0xf00, 0xfff, 1);
+    assert_eq!(pixel(g, 11, 20), 0xf0_000f, "buffer 1: the low mask moved up");
+    // dbc -1: the DDX doubles the mask itself.
+    rect(g, 0x0f0, 0xff_ffff, u32::MAX);
+    assert_eq!(pixel(g, 11, 20), 0x0f_00f0, "both buffers");
+}
+
+/// Image words in 12-bit mode come widened by the DDX (expDrawImage12TC:
+/// (x & 0xF) << 4 | (x & 0xF0) << 8 | (x & 0xF00) << 12) and land as the
+/// 12-bit pixel.
+#[test]
+fn ddx_12bit_image_word_is_widened_pixel() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    ddx_12bit_setup(g, 0xfff, 0);
+    let widen = |x: u32| ((x & 0xf) << 4) | ((x & 0xf0) << 8) | ((x & 0xf00) << 12);
+    cmd(g, HQ2_2D_DRAW_IMAGE, 100);
+    for v in [50, 2, 1, 2, 0, 0] { data(g, v); }
+    for v in [widen(0x123), widen(0xabc)] { data(g, v); }
+    cmd(g, HQ2_2D_END_PRIMITIVE, 0);
+    g.wait_idle();
+    assert_eq!(pixel(g, 100, 1023 - 50), 0x123);
+    assert_eq!(pixel(g, 101, 1023 - 50), 0xabc);
+}
+
+/// A 2D 12-bit draw must not leave the RE3 in 12-bit mode for a 24-bit GL
+/// window drawn next.
+#[test]
+fn gl_24bit_after_ddx_12bit_draw() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    ddx_12bit_setup(g, 0xfff, 0);
+    cmd(g, HQ2_2D_SOLID_RECT, 0);
+    for v in [0, 0, 2, 2] { data(g, v); }
+    cmd(g, HQ2_2D_END_PRIMITIVE, 0);
+    gl_quad3(g, [1., 0.5, 0.25], [[0., 0., 0.], [400., 0., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 20, 20), 0x40_80ff);
+}

@@ -151,6 +151,13 @@ pub const HQ2_DMA_WRITE_PIXELS: u32 = 327;
 /// 0x147, drawn in the current GL context (window-relative, GL y up).
 pub const HQ2_GL_DMA_WRITE: u32 = 0x0b5;
 pub const HQ2_GL_DMA_WRITE_ZOOM: u32 = 0x0b8;
+/// Pixel DMA reads (HQ2.h "PIXEL DMA DIRECTION"): the same kernel ioctl and
+/// header as the writes, but the VDMA reads height * words/row words from
+/// HQ2_GEDMA; FIN2 when done. 0x152 = Xsgi expReadImage* (screen, X-style
+/// y = top row, format from BUF_SELECT); 0x0AC = GL lrectread /
+/// glReadPixels (window-relative, y = bottom row, source from 0x10A).
+pub const HQ2_2D_DMA_READ_PIXELS: u32 = 0x152;
+pub const HQ2_GL_DMA_READ: u32 = 0x0ac;
 
 /// Pixel rectangles streamed by the kernel's pixel DMA (_Gr2DMAtrigger):
 /// x on the token; y, width, height, words/row, flag, 0 on GE_DATA; then
@@ -226,16 +233,45 @@ pub struct State2d {
     pub buf_offset: u32,
 }
 
-/// A READ_IMAGE request, as the sink needs it.
+/// How a screen-to-host read turns a VRAM word into a pixel value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadDecode {
+    /// Xsgi: the plane group selected by the 2D MODE (`read_value`).
+    Planes2d,
+    /// GL 24-bit RGB: 0xAABBGGRR, alpha 0xFF (no alpha planes).
+    Rgb24,
+    /// GL 12-bit RGB in `bank` (0 = bits 11:0, 1 = bits 23:12), nibbles
+    /// widened to 8 bits (x 17), as Rgb24.
+    Rgb12 { bank: u32 },
+    /// GL colour index in 12-bit `bank`.
+    Ci12 { bank: u32 },
+    /// GL depth: Z right-justified (libglcore shifts it up by 32 - bits).
+    Depth,
+}
+
+/// Where a screen-to-host read goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadDest {
+    /// READ_IMAGE: shram from READ_IMAGE_SHRAM, then FIN3.
+    Shram,
+    /// Pixel DMA read: the HQ2_GEDMA read port, then FIN2.
+    Gedma,
+}
+
+/// A screen-to-host read (READ_IMAGE, 0x152, 0x0AC), as the sink needs it.
 #[derive(Clone, Copy)]
 pub struct ReadImage {
-    /// Left x and GL row of the top line (y = 0 at the bottom).
+    /// Left x and GL row of the top line (y = 0 at the bottom); rows go
+    /// down from there.
     pub x: i32,
     pub top: i32,
     pub w: u32,
     pub rows: u32,
     pub words_per_row: u32,
+    /// Pixel format (buf_select: 2 = 8-bit, 1 = 16-bit, 0 = 32-bit) and
+    /// first-pixel slot (buf_offset); the planes for Planes2d.
     pub s2d: State2d,
+    pub decode: ReadDecode,
 }
 
 impl ReadImage {
@@ -260,12 +296,29 @@ impl ReadImage {
                 for p in 0..per_word {
                     let i = (k as u32 * per_word + p) as i32 - off;
                     if i >= 0 && (i as u32) < self.w {
-                        let v = read_value(&self.s2d, read(self.x + i, gy)) & mask;
+                        let v = self.value(read(self.x + i, gy)) & mask;
                         word |= v << (32 - bits * (p + 1));
                     }
                 }
                 *d = word;
             }
+        }
+    }
+}
+
+impl ReadImage {
+    /// The pixel value of VRAM word `vram` (for Depth: the Z buffer word).
+    pub fn value(&self, vram: u32) -> u32 {
+        let wide = |n: u32| (n & 0xf) * 17;
+        match self.decode {
+            ReadDecode::Planes2d => read_value(&self.s2d, vram),
+            ReadDecode::Rgb24 => 0xff00_0000 | (vram & 0x00ff_ffff),
+            ReadDecode::Rgb12 { bank } => {
+                let v = (vram >> (12 * (bank & 1))) & 0xfff;
+                0xff00_0000 | wide(v) | (wide(v >> 4) << 8) | (wide(v >> 8) << 16)
+            }
+            ReadDecode::Ci12 { bank } => (vram >> (12 * (bank & 1))) & 0xfff,
+            ReadDecode::Depth => vram & 0x00ff_ffff,
         }
     }
 }
@@ -278,6 +331,16 @@ pub fn read_value(s: &State2d, vram: u32) -> u32 {
     match s.mode & 0xff {
         8 => aux,
         0xb => if s.aux_mask & 0xc != 0 { (aux >> 2) & 3 } else { aux & 3 },
+        // 12-bit RGB (expReadImage12TC: MODE 0x1002, ROP flag = the
+        // window's buffer * 8): the bank the flag selects, R 3:0, G 7:4,
+        // B 11:8, as 8:8:8 with each nibble replicated. The DDX takes the
+        // low nibble of each byte back ((w & 0xF) | (w & 0xF00) >> 4 |
+        // (w & 0xF0000) >> 8); expDrawImage12TC sends the high nibbles.
+        2 => {
+            let v = (vram >> (12 * ((s.flag >> 3) & 1))) & 0xfff;
+            let wide = |n: u32| (n & 0xf) * 17;
+            wide(v) | (wide(v >> 4) << 8) | (wide(v >> 8) << 16)
+        }
         _ => vram & 0x00ff_ffff,
     }
 }
@@ -303,6 +366,7 @@ pub fn token_name(index: u32) -> Option<&'static str> {
         323 => "2D_GLYPH_8", 324 => "2D_GLYPH_16", 325 => "2D_GLYPH_32", 326 => "2D_GLYPH_64",
         HQ2_2D_LINE_MODE => "2D_LINE_MODE", HQ2_2D_LINE_CLIP => "2D_LINE_CLIP", HQ2_2D_MODE => "2D_MODE", HQ2_2D_ROP => "2D_ROP",
         HQ2_2D_CID_WRITE => "2D_CID_WRITE", HQ2_2D_BUF_SELECT => "2D_BUF_SELECT",
+        HQ2_2D_DMA_READ_PIXELS => "2D_DMA_READ_PIXELS", HQ2_GL_DMA_READ => "GL_DMA_READ",
         340 => "2D_COPY_RECT", 342 => "2D_DRAW_IMAGE", 343 => "2D_DRAW_IMAGE_SMALL",
         HQ2_2D_READ_IMAGE => "2D_READ_IMAGE", 346 | 347 => "2D_STIPPLED_SPAN", HQ2_2D_STIPPLE_RECT => "2D_STIPPLE_RECT",
         349 => "2D_MONO_IMAGE_8", 350 => "2D_MONO_IMAGE_16", 351 => "2D_MONO_IMAGE_32",
@@ -351,7 +415,7 @@ pub fn gl_token_name(tok: u32) -> Option<&'static str> {
         0x0f3 => "GL_BEGIN_QUADS", 0x0f4 => "GL_END_QUADS", 0x0f5 => "GL_VTX_QUADS",
         0x0f6 => "GL_EDGE_FLAG", 0x0f7 => "GL_BEGIN_POLYGON", 0x0f8 => "GL_VTX_POLYGON",
         0x0fc | 0x0fd => "GL_END_POLYGON", 0x104 => "GL_CLEAR_COLOR", 0x108 => "GL_FRONT_FACE",
-        0x10a => "GL_BUFFER_MODE", 0x10b => "GL_COLOR_WRITEMASK", 0x10d => "GL_NORMAL",
+        0x10a => "GL_READ_BUFFER", 0x10b => "GL_COLOR_WRITEMASK", 0x10d => "GL_NORMAL",
         0x10e => "GL_LIGHTPATH", 0x11d => "GL_BEGIN_POINTS", 0x123 => "GL_VTX_POINTS",
         0x168 => "GL_END_POINTS", 0x17c => "GL_BEGIN_LINES", 0x182 => "COLOR",
         0x1e5 => "CX_RESTORE_1E5", 0x1e7 => "GL_SWAP_BUFFERS",
@@ -481,15 +545,18 @@ pub trait Re3Sink {
     /// Raise a finish flag (FIN1/FIN2/FIN3), as the microcode does when it
     /// completes a request the host is waiting on.
     fn finish(&mut self, flag: usize);
-    /// READ_IMAGE: once all drawing is done, pack the rectangle into shram
-    /// and raise FIN3.
-    fn read_image(&mut self, req: &ReadImage);
+    /// Screen-to-host read: once all drawing is done, pack the rectangle
+    /// into shram and raise FIN3 (READ_IMAGE), or feed it to the HQ2_GEDMA
+    /// read port and raise FIN2 (pixel DMA reads).
+    fn read_image(&mut self, req: &ReadImage, dest: ReadDest);
     /// Emulator-private RE3 operation (re3::RE3_OP_*).
     fn op(&mut self, op: u32, val: u64);
     /// Store a word into shared RAM, as the microcode does for readbacks.
     fn shram(&mut self, word: usize, val: u32);
-    /// Make a saved context image available on HQ2_GEDMA reads (0x1E1).
-    fn cx_publish(&mut self, words: &[u32]);
+    /// Start a new transfer on the HQ2_GEDMA read port and queue `words`
+    /// (a context image, 0x1E1). Words a previous transfer left unread are
+    /// dropped. Blocks while the port is full.
+    fn gedma_out(&mut self, words: &[u32]);
 }
 
 /// HLE command interpreter state. Owned by the HQ2 thread. Plain data.
@@ -559,6 +626,8 @@ impl Hq2Engine {
             | HQ2_2D_CID_WRITE | HQ2_2D_END_PRIMITIVE => 1,
             HQ2_2D_BUF_SELECT => 2,
             HQ2_2D_READ_IMAGE => 5,
+            // Token x, then y, width, height, words/row, flag, 0 on GE_DATA.
+            HQ2_2D_DMA_READ_PIXELS | HQ2_GL_DMA_READ => 7,
             HQ2_2D_ROP => 4,
             HQ2_2D_TILE_SETUP => 5,
             HQ2_2D_MONO_IMAGE_8 => 8,
@@ -897,8 +966,30 @@ impl Hq2Engine {
         }
     }
 
-    /// Set the RE3 colour for `pixel` (colour planes: R in bits 7:0).
+    /// Set the RE3 colour for a GC pixel (fg, COLOR_ON / OFF; colour planes:
+    /// R in bits 7:0). In 12-bit mode (MODE 2) the pixel is the X visual's
+    /// 12-bit value (R 3:0, G 7:4, B 11:8): the DDX passes GC pixels
+    /// unconverted (expDrawPoints), so widen it here (inferred).
     fn color2d(&self, pixel: u32, out: &mut dyn Re3Sink) {
+        if self.s2d.mode & 0xff == 2 {
+            let wide = |n: u32| (n & 0xf) * 17;
+            return self.rgb2d(wide(pixel) | (wide(pixel >> 4) << 8) | (wide(pixel >> 8) << 16), out);
+        }
+        self.rgb2d(pixel, out);
+    }
+
+    /// Colour of an image / tile pixel word: in 12-bit mode the DDX has
+    /// already widened it to 8:8:8 (expDrawImage12TC, expTileRects: the
+    /// nibbles in the high halves), which the RE3 12-bit packer takes as is.
+    fn image2d(&self, pixel: u32, out: &mut dyn Re3Sink) {
+        if self.s2d.mode & 0xff == 2 && self.s2d.cid_write & 0xf000 == 0 {
+            return self.rgb2d(pixel, out);
+        }
+        self.value2d(pixel, out);
+    }
+
+    /// RE3 colour registers from an 8:8:8 value (R in bits 7:0).
+    fn rgb2d(&self, pixel: u32, out: &mut dyn Re3Sink) {
         out.reg(re3::REG_R, (pixel & 0xff) << 11);
         out.reg(re3::REG_G, ((pixel >> 8) & 0xff) << 11);
         out.reg(re3::REG_B, ((pixel >> 16) & 0xff) << 11);
@@ -1022,7 +1113,7 @@ impl Hq2Engine {
             }
             let sx = x + (n - start) as i32;
             if sx < re3::FB_W as i32 && sx + (e - n) as i32 > 0 {
-                self.value2d(c, out);
+                self.image2d(c, out);
                 self.span(sx, gy, (e - n) as u32, None, out);
             }
             n = e;
@@ -1177,7 +1268,7 @@ impl Hq2Engine {
                 while e < x2 && tile_px((e - ox).rem_euclid(tw), ty) == c {
                     e += 1;
                 }
-                self.value2d(c, out);
+                self.image2d(c, out);
                 self.span(x, gy, (e - x) as u32, None, out);
                 x = e;
             }
@@ -1207,11 +1298,33 @@ impl Hq2Engine {
                     out.reg(re3::REG_PIXMASK, 0);
                     self.value2d(fg, out);
                 }
+                // 12-bit RGB (MODE 2, 12-bit TrueColor windows): the RE3
+                // writes the value to both 12-bit buffers and the plane mask
+                // picks one (RE3.h). The buffers never move; ROP flag bit 3
+                // (the window's dbc buffer * 8) names buffer 1. A mask the
+                // DDX already moved or doubled (dbc -3 / -1, expTileRects)
+                // is used as it is.
+                2 => {
+                    let pm = s.planemask & 0x00ff_ffff;
+                    let mask = if s.flag & 8 == 0 {
+                        pm & 0xfff
+                    } else if pm & 0xfff000 != 0 {
+                        pm
+                    } else {
+                        pm << 12
+                    };
+                    out.reg(re3::REG_UAUXDATA, 0);
+                    out.reg(re3::REG_AUXMASK, 0);
+                    out.reg(re3::REG_PIXMASK, mask);
+                    out.op(re3::RE3_OP_PIXFMT, re3::PIXFMT_RGB12 as u64);
+                    out.reg(re3::REG_ENABDITH, 0);
+                }
                 // Colour planes.
                 _ => {
                     out.reg(re3::REG_UAUXDATA, 0);
                     out.reg(re3::REG_AUXMASK, 0);
                     out.reg(re3::REG_PIXMASK, s.planemask & 0x00ff_ffff);
+                    out.op(re3::RE3_OP_PIXFMT, 0);
                 }
             }
         }
@@ -1263,6 +1376,10 @@ impl Hq2Engine {
             HQ2_2D_MODE | HQ2_2D_COLOR_AUX | HQ2_2D_COLOR_OFF | HQ2_2D_COLOR_ON | HQ2_2D_CID_WRITE
             | HQ2_2D_BEGIN | HQ2_2D_END_PRIMITIVE => format!("{name} {:#x}", a[0]),
             HQ2_2D_BUF_SELECT => format!("{name} format={} offset={}", i(0), i(1)),
+            HQ2_2D_DMA_READ_PIXELS => format!("{name} ({}, {}) {}x{} words/row={} flag={} format={} offset={} mode={:#x} -> GEDMA, FIN2",
+                i(0), i(1), i(2), i(3), i(4), i(5), self.s2d.buf_select, self.s2d.buf_offset, self.s2d.mode),
+            HQ2_GL_DMA_READ => format!("{name} ({}, {}) {}x{} words/row={} flag={} {} -> GEDMA, FIN2",
+                i(0), i(1), i(2), i(3), i(4), i(5), self.gl_read_desc()),
             HQ2_2D_READ_IMAGE => format!("{name} ({}, {}) {}x{} words/row={} format={} offset={} mode={:#x} -> shram[{:#x}], FIN3",
                 i(1), i(2), i(3), i(4), i(0), self.s2d.buf_select, self.s2d.buf_offset, self.s2d.mode, READ_IMAGE_SHRAM),
             PUC_COLOR => format!("{name} ci={}", i(0)),
@@ -1316,7 +1433,7 @@ impl Hq2Engine {
                 out.finish(FIN2);
             }
             GE_CX_SAVE_EXT => {
-                out.cx_publish(&[]);
+                out.gedma_out(&[]);
                 out.finish(FIN2);
             }
             HQ_PCX_1E0 | HQ_PCX_1E6 => out.finish(FIN2),
@@ -1358,9 +1475,23 @@ impl Hq2Engine {
                     rows: a[4],
                     words_per_row: a[0],
                     s2d: self.s2d,
+                    decode: ReadDecode::Planes2d,
                 };
-                out.read_image(&req);
+                out.read_image(&req, ReadDest::Shram);
             }
+            HQ2_2D_DMA_READ_PIXELS => {
+                let req = ReadImage {
+                    x: a[0] as i32,
+                    top: SCREEN_H - 1 - a[1] as i32,
+                    w: a[2],
+                    rows: a[3],
+                    words_per_row: a[4],
+                    s2d: self.s2d,
+                    decode: ReadDecode::Planes2d,
+                };
+                out.read_image(&req, ReadDest::Gedma);
+            }
+            HQ2_GL_DMA_READ => self.gl_dma_read(&a, out),
             HQ2_2D_TILE_SETUP => {
                 self.tile_w = a[1];
                 self.tile_h = a[2];

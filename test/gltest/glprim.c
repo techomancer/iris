@@ -16,8 +16,10 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <X11/X.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <GL/gl.h>
 #include <GL/glx.h>
 
@@ -58,6 +60,33 @@ static int stipple = 0;               /* --stipple: 1 = test, 2 = half */
 static char scene[16] = "";           /* --scene depth|stencil|alphatest|blend */
 static GLenum depth_func = GL_LESS;   /* --depthfunc */
 static int want_stencil = 0;
+
+/* ---- readback (--read) ---------------------------------------------------
+   After the draw (and glFinish), read pixels back and print what came back:
+     ximage   XGetImage of the window (Xsgi, front buffer)
+     front    glReadBuffer(GL_FRONT) + glReadPixels colour
+     back     glReadBuffer(GL_BACK)  + glReadPixels colour (needs --db)
+     depth    glReadPixels GL_DEPTH_COMPONENT (needs a depth buffer)
+     stencil  glReadPixels GL_STENCIL_INDEX (needs a stencil buffer)
+   With --db the scene is swapped to the front, then the back buffer is
+   cleared to --backclear with a white marker (bottom left), so front and
+   back reads differ. libglcore (EXPRESS gr2_pixel.c) picks the path:
+     colour GL_RGBA/UNSIGNED_BYTE        kernel pixel DMA (0x0AC), rows swapped
+     colour GL_ABGR_EXT/UNSIGNED_BYTE    kernel pixel DMA (0x0AC), as is
+     depth  UNSIGNED_INT                 kernel pixel DMA (0x0AC), buffer_mode 2
+     unaligned buffer / odd stride       PIO READ_RECT (0x0AD) via the mailbox
+     GL_FLOAT, stencil                   slow path, one READ_RECT per pixel
+   --readfmt/--readtype/--readunaligned choose among them. */
+#define MAX_READS 8
+static char reads[MAX_READS][8];
+static int nreads = 0;
+static int rrect[4] = { -1, 0, 0, 0 };   /* --readrect x,y,w,h (GL window coords) */
+static char readfmt[8] = "rgba";          /* --readfmt rgba|abgr */
+static char readtype[8] = "ub";           /* --readtype ub|float (colour), uint|float (depth) */
+static int read_unaligned = 0;            /* --readunaligned: force the PIO path */
+static int pack_row = 0;                  /* --packrow N: GL_PACK_ROW_LENGTH */
+static const char *read_out = 0;          /* --readout PREFIX: write PREFIX_<mode>.ppm/.pgm */
+static float back_rgb[3] = { 0.0f, 0.75f, 0.75f };  /* --backclear */
 
 /* ---- multi-primitive scenes (window pixel coordinates, glOrtho) ---------
    Each is small and has a known expected image:
@@ -254,6 +283,47 @@ static void draw_scene(float w, float h) {
         glColor4f(0, 0, 1, 1.0f); glVertex2f(0.5f * w, 0.9f * h);
         glEnd();
         glDisable(GL_BLEND);
+    } else if (!strcmp(scene, "quadrants")) {
+        /* Readback pattern: every orientation error shows. Border and gaps
+           keep the clear colour; depth and stencil differ per quadrant.
+             bottom left  red,    z  0.5 (depth 0.25), stencil 1
+             bottom right green,  z  0.0 (depth 0.50), stencil 2
+             top left     blue,   z -0.5 (depth 0.75), stencil 3
+             top right    black -> yellow ramp left to right, z 0.9 -> -0.9
+                          (depth 0.05 -> 0.95), stencil 4 */
+        float x0 = 8, x1 = w * 0.5f - 4, x2 = w * 0.5f + 4, x3 = w - 8;
+        float y0 = 8, y1 = h * 0.5f - 4, y2 = h * 0.5f + 4, y3 = h - 8;
+        if (want_stencil) {
+            glEnable(GL_STENCIL_TEST);
+            glStencilFunc(GL_ALWAYS, 0, 0xff);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        }
+        glShadeModel(GL_FLAT);
+        if (want_stencil) glStencilFunc(GL_ALWAYS, 1, 0xff);
+        glBegin(GL_QUADS);
+        glColor3f(1, 0, 0);
+        glVertex3f(x0, y0, 0.5f); glVertex3f(x1, y0, 0.5f); glVertex3f(x1, y1, 0.5f); glVertex3f(x0, y1, 0.5f);
+        glEnd();
+        if (want_stencil) glStencilFunc(GL_ALWAYS, 2, 0xff);
+        glBegin(GL_QUADS);
+        glColor3f(0, 1, 0);
+        glVertex3f(x2, y0, 0.0f); glVertex3f(x3, y0, 0.0f); glVertex3f(x3, y1, 0.0f); glVertex3f(x2, y1, 0.0f);
+        glEnd();
+        if (want_stencil) glStencilFunc(GL_ALWAYS, 3, 0xff);
+        glBegin(GL_QUADS);
+        glColor3f(0, 0, 1);
+        glVertex3f(x0, y2, -0.5f); glVertex3f(x1, y2, -0.5f); glVertex3f(x1, y3, -0.5f); glVertex3f(x0, y3, -0.5f);
+        glEnd();
+        if (want_stencil) glStencilFunc(GL_ALWAYS, 4, 0xff);
+        glShadeModel(GL_SMOOTH);
+        glBegin(GL_QUADS);
+        glColor3f(0, 0, 0); glVertex3f(x2, y2, 0.9f);
+        glColor3f(1, 1, 0); glVertex3f(x3, y2, -0.9f);
+        glColor3f(1, 1, 0); glVertex3f(x3, y3, -0.9f);
+        glColor3f(0, 0, 0); glVertex3f(x2, y3, 0.9f);
+        glEnd();
+        glShadeModel(smooth ? GL_SMOOTH : GL_FLAT);
+        glDisable(GL_STENCIL_TEST);
     } else {
         printf("unknown scene %s\n", scene);
     }
@@ -365,6 +435,15 @@ static void usage(void) {
     printf("  --scene NAME         depth | stencil | alphatest | blend | blendsmooth |\n"
            "                       lit | litlocal | twoside | fog (see source)\n"
            "  --depthfunc F        never less equal lequal greater notequal gequal always\n");
+    printf("  --read M[,M...]      after drawing, read back: ximage front back depth stencil\n"
+           "  --readrect X,Y,W,H   area to read (GL window coords; default whole window)\n"
+           "  --readfmt rgba|abgr  colour format for glReadPixels (default rgba)\n"
+           "  --readtype T         ub|float for colour, uint|float for depth (default ub/uint)\n"
+           "  --readunaligned      read into a misaligned buffer (forces the PIO path)\n"
+           "  --packrow N          GL_PACK_ROW_LENGTH N (strided pixel DMA)\n"
+           "  --readout PREFIX     also write PREFIX_<mode>.ppm (colour) / .pgm (depth, stencil)\n"
+           "  --backclear R,G,B    with --db: back buffer colour for the back read (default 0,.75,.75)\n"
+           "  (--scene quadrants is the readback pattern: depth + stencil, see source)\n");
 }
 
 static int parse_ints(const char *s, int *out, int n) {
@@ -449,7 +528,27 @@ static void parse_args(int argc, char **argv) {
             strncpy(scene, next, sizeof(scene) - 1);
             if (!strcmp(scene, "depth")) depth = 1;
             if (!strcmp(scene, "stencil")) want_stencil = 1;
-        } else if (!strcmp(a, "--depthfunc")) {
+            if (!strcmp(scene, "quadrants")) { depth = 1; want_stencil = 1; }
+        } else if (!strcmp(a, "--read")) {
+            char buf[64], *t;
+            NEED();
+            strncpy(buf, next, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            for (t = strtok(buf, ","); t; t = strtok(0, ",")) {
+                if (strcmp(t, "ximage") && strcmp(t, "front") && strcmp(t, "back")
+                    && strcmp(t, "depth") && strcmp(t, "stencil")) {
+                    fprintf(stderr, "bad --read mode %s\n", t); exit(2);
+                }
+                if (nreads < MAX_READS) strncpy(reads[nreads++], t, 7);
+            }
+        } else if (!strcmp(a, "--readrect")) { NEED(); if (!parse_ints(next, rrect, 4)) { fprintf(stderr, "bad --readrect\n"); exit(2); } }
+        else if (!strcmp(a, "--readfmt")) { NEED(); strncpy(readfmt, next, sizeof(readfmt) - 1); }
+        else if (!strcmp(a, "--readtype")) { NEED(); strncpy(readtype, next, sizeof(readtype) - 1); }
+        else if (!strcmp(a, "--readunaligned")) read_unaligned = 1;
+        else if (!strcmp(a, "--packrow")) { NEED(); pack_row = atoi(next); }
+        else if (!strcmp(a, "--readout")) { NEED(); read_out = next; }
+        else if (!strcmp(a, "--backclear")) { NEED(); if (!parse_floats(next, back_rgb, 3)) { fprintf(stderr, "bad --backclear\n"); exit(2); } }
+        else if (!strcmp(a, "--depthfunc")) {
             static const char *names[] = { "never", "less", "equal", "lequal", "greater", "notequal", "gequal", "always" };
             NEED();
             for (k = 0; k < 8; k++) if (!strcmp(next, names[k])) break;
@@ -460,6 +559,207 @@ static void parse_args(int argc, char **argv) {
         else { fprintf(stderr, "unknown option %s\n", a); usage(); exit(2); }
 #undef NEED
     }
+}
+
+/* ---- readback ------------------------------------------------------------ */
+
+enum { RB_COLOR, RB_DEPTH, RB_STENCIL };
+
+static double now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+/* Width in bits and shift of a visual channel mask. */
+static void mask_bits(unsigned long m, int *shift, int *bits) {
+    *shift = 0; *bits = 0;
+    if (!m) return;
+    while (!(m & 1)) { m >>= 1; (*shift)++; }
+    while (m & 1) { m >>= 1; (*bits)++; }
+}
+
+/* Scale an n-bit channel value to 8 bits by bit replication. */
+static unsigned long to8(unsigned long v, int bits) {
+    unsigned long r = 0;
+    int have = 0;
+    if (bits <= 0) return 0;
+    if (bits >= 8) return v >> (bits - 8);
+    while (have < 8) { r = (r << bits) | v; have += bits; }
+    return r >> (have - 8);
+}
+
+/* Read one buffer into vals[] (GL order: row 0 = bottom), as 0xRRGGBBAA
+   for colour, the raw 32-bit value for depth, the index for stencil.
+   Returns the kind, or -1 when the read is not possible. */
+static int read_pixels(Display *dpy, Window win, XVisualInfo *vi, const char *m,
+                       int x, int y, int w, int h, unsigned long *vals) {
+    int row = pack_row > w ? pack_row : w;
+    int r, c;
+    if (!strcmp(m, "ximage")) {
+        XImage *im;
+        int rs, rb, gs, gb, bs, bb;
+        mask_bits(vi->red_mask, &rs, &rb);
+        mask_bits(vi->green_mask, &gs, &gb);
+        mask_bits(vi->blue_mask, &bs, &bb);
+        im = XGetImage(dpy, win, x, win_h - y - h, (unsigned)w, (unsigned)h, AllPlanes, ZPixmap);
+        if (!im) { printf("  XGetImage failed\n"); return -1; }
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++) {
+                unsigned long p = XGetPixel(im, c, h - 1 - r);
+                vals[r * w + c] = (to8((p & vi->red_mask) >> rs, rb) << 24)
+                                | (to8((p & vi->green_mask) >> gs, gb) << 16)
+                                | (to8((p & vi->blue_mask) >> bs, bb) << 8) | 0xff;
+            }
+        XDestroyImage(im);
+        return RB_COLOR;
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT, read_unaligned ? 1 : 4);
+    glPixelStorei(GL_PACK_ROW_LENGTH, pack_row);
+    if (!strcmp(m, "front") || !strcmp(m, "back")) {
+        int isf = !strcmp(readtype, "float");
+        int abgr = !strcmp(readfmt, "abgr");
+        size_t bpp = isf ? 16 : 4;
+        char *mem = malloc((size_t)row * h * bpp + 8);
+        unsigned char *b = (unsigned char *)mem + (read_unaligned ? 1 : 0);
+        if (!mem) return -1;
+        glReadBuffer(!strcmp(m, "front") ? GL_FRONT : GL_BACK);
+#ifdef GL_ABGR_EXT
+        glReadPixels(x, y, w, h, abgr ? GL_ABGR_EXT : GL_RGBA, isf ? GL_FLOAT : GL_UNSIGNED_BYTE, b);
+#else
+        if (abgr) printf("  (no GL_ABGR_EXT, reading GL_RGBA)\n");
+        abgr = 0;
+        glReadPixels(x, y, w, h, GL_RGBA, isf ? GL_FLOAT : GL_UNSIGNED_BYTE, b);
+#endif
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++) {
+                unsigned long ch[4];
+                int k;
+                for (k = 0; k < 4; k++) {
+                    if (isf) {
+                        float f;
+                        memcpy(&f, b + ((size_t)r * row + c) * 16 + k * 4, 4);
+                        ch[k] = (unsigned long)(f * 255.0f + 0.5f) & 0xff;
+                    } else ch[k] = b[((size_t)r * row + c) * 4 + k];
+                }
+                /* ABGR_EXT is A, B, G, R in memory. */
+                vals[r * w + c] = abgr
+                    ? (ch[3] << 24) | (ch[2] << 16) | (ch[1] << 8) | ch[0]
+                    : (ch[0] << 24) | (ch[1] << 16) | (ch[2] << 8) | ch[3];
+            }
+        free(mem);
+        return RB_COLOR;
+    }
+    if (!strcmp(m, "depth")) {
+        int isf = !strcmp(readtype, "float");
+        char *mem = malloc((size_t)row * h * 4 + 8);
+        unsigned char *b = (unsigned char *)mem + (read_unaligned ? 1 : 0);
+        if (!mem) return -1;
+        glReadPixels(x, y, w, h, GL_DEPTH_COMPONENT, isf ? GL_FLOAT : GL_UNSIGNED_INT, b);
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++) {
+                if (isf) {
+                    float f;
+                    memcpy(&f, b + ((size_t)r * row + c) * 4, 4);
+                    vals[r * w + c] = (unsigned long)((double)f * 4294967295.0);
+                } else {
+                    unsigned int u;
+                    memcpy(&u, b + ((size_t)r * row + c) * 4, 4);
+                    vals[r * w + c] = u;
+                }
+            }
+        free(mem);
+        return RB_DEPTH;
+    }
+    if (!strcmp(m, "stencil")) {
+        unsigned char *b = malloc((size_t)row * h + 8);
+        if (!b) return -1;
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(x, y, w, h, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, b);
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++) vals[r * w + c] = b[(size_t)r * row + c];
+        free(b);
+        return RB_STENCIL;
+    }
+    return -1;
+}
+
+static void print_val(int kind, unsigned long v) {
+    if (kind == RB_COLOR) printf("%08lx", v);
+    else if (kind == RB_DEPTH) printf("%08lx (%.3f)", v, (double)v / 4294967295.0);
+    else printf("%lu", v);
+}
+
+/* PPM/PGM, top row first (image file convention). */
+static void write_image(const char *m, int kind, int w, int h, const unsigned long *vals) {
+    char name[256];
+    FILE *f;
+    int r, c;
+    sprintf(name, "%.200s_%s.%s", read_out, m, kind == RB_COLOR ? "ppm" : "pgm");
+    f = fopen(name, "wb");
+    if (!f) { printf("  cannot write %s\n", name); return; }
+    fprintf(f, "%s\n%d %d\n255\n", kind == RB_COLOR ? "P6" : "P5", w, h);
+    for (r = h - 1; r >= 0; r--)
+        for (c = 0; c < w; c++) {
+            unsigned long v = vals[r * w + c];
+            if (kind == RB_COLOR) {
+                fputc((int)(v >> 24) & 0xff, f);
+                fputc((int)(v >> 16) & 0xff, f);
+                fputc((int)(v >> 8) & 0xff, f);
+            } else if (kind == RB_DEPTH) fputc((int)(v >> 24) & 0xff, f);
+            else fputc(v > 4 ? 255 : (int)v * 60, f);
+        }
+    fclose(f);
+    printf("  wrote %s\n", name);
+}
+
+static void do_reads(Display *dpy, Window win, XVisualInfo *vi) {
+    int x = 0, y = 0, w = win_w, h = win_h, i;
+    unsigned long *vals;
+    if (rrect[0] >= 0) { x = rrect[0]; y = rrect[1]; w = rrect[2]; h = rrect[3]; }
+    vals = malloc(sizeof(unsigned long) * (size_t)w * h);
+    if (!vals) return;
+    for (i = 0; i < nreads; i++) {
+        /* Sample points, relative to the read rectangle: corners 2 px in,
+           the centre, the quadrant centres (the --scene quadrants colours). */
+        static const char *lbl[9] = { "bl", "br", "tl", "tr", "centre", "q.bl", "q.br", "q.tl", "q.tr" };
+        int sx[9], sy[9], kind, k;
+        unsigned long sum = 2166136261UL;
+        GLenum err;
+        double t0, t1;
+        sx[0] = 2; sy[0] = 2; sx[1] = w - 3; sy[1] = 2; sx[2] = 2; sy[2] = h - 3;
+        sx[3] = w - 3; sy[3] = h - 3; sx[4] = w / 2; sy[4] = h / 2;
+        sx[5] = w / 4; sy[5] = h / 4; sx[6] = 3 * w / 4; sy[6] = h / 4;
+        sx[7] = w / 4; sy[7] = 3 * h / 4; sx[8] = 3 * w / 4; sy[8] = 3 * h / 4;
+        memset(vals, 0, sizeof(unsigned long) * (size_t)w * h);
+        while (glGetError() != GL_NO_ERROR) ;
+        t0 = now_ms();
+        kind = read_pixels(dpy, win, vi, reads[i], x, y, w, h, vals);
+        t1 = now_ms();
+        err = glGetError();
+        if (kind < 0) continue;
+        for (k = 0; k < w * h; k++) {
+            /* Colour: RGB only, so XGetImage and glReadPixels compare. */
+            unsigned long v = kind == RB_COLOR ? vals[k] >> 8 : vals[k];
+            sum = ((sum ^ (v & 0xff)) * 16777619UL) & 0xffffffffUL;
+            sum = ((sum ^ ((v >> 8) & 0xff)) * 16777619UL) & 0xffffffffUL;
+            sum = ((sum ^ ((v >> 16) & 0xff)) * 16777619UL) & 0xffffffffUL;
+            sum = ((sum ^ ((v >> 24) & 0xff)) * 16777619UL) & 0xffffffffUL;
+        }
+        printf("glprim: read %s %dx%d at %d,%d%s%s%s: %.1f ms, gl error 0x%x, sum %08lx\n",
+               reads[i], w, h, x, y,
+               kind == RB_COLOR && strcmp(reads[i], "ximage") ? (strcmp(readfmt, "abgr") ? " rgba" : " abgr") : "",
+               strcmp(reads[i], "ximage") && strcmp(reads[i], "stencil") ? (!strcmp(readtype, "float") ? " float" : "") : "",
+               read_unaligned ? " unaligned" : "", t1 - t0, (unsigned)err, sum);
+        for (k = 0; k < 9; k++) {
+            printf("  %-6s (%3d,%3d) ", lbl[k], sx[k], sy[k]);
+            print_val(kind, vals[sy[k] * w + sx[k]]);
+            printf("\n");
+        }
+        if (read_out) write_image(reads[i], kind, w, h, vals);
+        fflush(stdout);
+    }
+    free(vals);
 }
 
 /* ---- main ---------------------------------------------------------------- */
@@ -610,6 +910,24 @@ int main(int argc, char **argv) {
     if (dbl) glXSwapBuffers(dpy, win);
     else glFlush();
     glFinish();
+
+    if (nreads > 0) {
+        if (dbl) {
+            /* The scene is now in front; give the back buffer its own
+               content: --backclear with a white 40x40 marker at the bottom left
+               (the "bl" sample).
+               Depth and stencil keep the scene's values. */
+            glDrawBuffer(GL_BACK);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(back_rgb[0], back_rgb[1], back_rgb[2], 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glColor3f(1, 1, 1);
+            glRecti(0, 0, 40, 40);
+            glFinish();
+        }
+        do_reads(dpy, win, vi);
+    }
 
     if (hold_ms > 0) {
         int left = hold_ms;

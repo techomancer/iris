@@ -186,6 +186,16 @@ pub const T_GET_COLOR: u32 = 0x0e9;
 pub const T_GET_NORMAL: u32 = 0x0ea;
 pub const T_GET_RASTERPOS: u32 = 0x107;
 pub const T_READ_DONE: u32 = 0x0bd;
+/// Pixel read setup (__glExpReadPixelsKDMA, Fetch, ReadColor): read setup
+/// 0x0A7 / 0x0A8 = 0 and read mode 0x0BC (1 before a pixel DMA read, 0
+/// before READ_RECT). Meaning unknown; the HLE ignores them.
+pub const T_READ_SETUP_A: u32 = 0x0a7;
+pub const T_READ_SETUP_B: u32 = 0x0a8;
+pub const T_READ_MODE: u32 = 0x0bc;
+/// Read source (__glExpSetReadBuffer): two words to the token, kind and
+/// buffer: 0, 0 = front; 0, 1 = back; 1, n = with aux buffers; 2, 0 = the
+/// Z buffer (depth and stencil reads).
+pub const T_READ_BUFFER: u32 = 0x10a;
 const READBACK_SHRAM: usize = 0x4022;
 
 // Vertex routines (LOADV token) and Begin/End tokens (gr2_prim.c).
@@ -367,6 +377,8 @@ pub struct GlState {
     /// User clip planes (eye space) and their enable bits.
     uclip: [[f32; 4]; 6],
     uclip_on: u32,
+    /// Read source from 0x10A: kind, buffer (0, 0 = front).
+    read_src: [u32; 2],
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
 }
@@ -659,7 +671,7 @@ fn port_words(index: u32) -> Option<u32> {
         T_IRIS_CHAR16_TALL | T_IRIS_CHAR32 => Some(21),
         T_NORMAL_MATRIX => Some(9),
         T_NORMAL | T_IRIS_NORMAL => Some(3),
-        T_COLOR_WRITEMASK => Some(2),
+        T_COLOR_WRITEMASK | T_READ_BUFFER => Some(2),
         T_BLEND_FACTOR => Some(3),
         t => light::Lighting::port_words(t),
     }
@@ -720,7 +732,53 @@ pub struct GlCx {
 impl Hq2Engine {
     /// 0x1E1 save main: the image the kernel now reads from HQ2_GEDMA.
     pub(super) fn gl_cx_save(&mut self, out: &mut dyn Re3Sink) {
-        out.cx_publish(&self.gl_ctx.save);
+        out.gedma_out(&self.gl_ctx.save);
+    }
+
+    /// How 0x0AC reads the current read source (0x10A) in this window's
+    /// pixel format. Double-buffered 12-bit: after the swap to state s the
+    /// front is bank s and the back bank s ^ 1 (the inverse of GL_BACK's
+    /// write masks 0xFFF000 / 0x000FFF for states 0 / 1).
+    fn gl_read_decode(&self) -> super::ReadDecode {
+        use super::ReadDecode;
+        let g = &self.gl;
+        if g.read_src[0] == 2 {
+            return ReadDecode::Depth;
+        }
+        let bank = (g.swap ^ (g.read_src[1] & 1)) & 1;
+        match g.pixfmt {
+            re3::PIXFMT_RGB12 => ReadDecode::Rgb12 { bank },
+            re3::PIXFMT_CI12 => ReadDecode::Ci12 { bank },
+            _ => ReadDecode::Rgb24,
+        }
+    }
+
+    pub(super) fn gl_read_desc(&self) -> String {
+        format!("src {} {} {:?} window ({}, {})", self.gl.read_src[0], self.gl.read_src[1],
+            self.gl_read_decode(), self.gl.win[0], self.gl.win[1])
+    }
+
+    /// 0x0AC pixel DMA read (lrectread, glReadPixels KDMA): x on the token;
+    /// y, width, height, words/row, flag, 0. Window-relative, y = the
+    /// bottom row; rows go out top first, as 0x0B5 takes them in. Pixels
+    /// per word from width / words per row, MSB first.
+    pub(super) fn gl_dma_read(&mut self, a: &[u32], out: &mut dyn Re3Sink) {
+        use super::{ReadDest, ReadImage};
+        self.gl.ensure_init();
+        let (w, rows, wpr) = (a[2], a[3], a[4].max(1));
+        let mut s2d = self.s2d;
+        s2d.buf_select = match (w + wpr - 1) / wpr { 4 => 2, 2 => 1, _ => 0 };
+        s2d.buf_offset = 0;
+        let req = ReadImage {
+            x: self.gl.win[0] + a[0] as i32,
+            top: self.gl.win[1] + a[1] as i32 + rows as i32 - 1,
+            w,
+            rows,
+            words_per_row: wpr,
+            s2d,
+            decode: self.gl_read_decode(),
+        };
+        out.read_image(&req, ReadDest::Gedma);
     }
 
     /// The live GL state as a context image.
@@ -841,7 +899,8 @@ impl Hq2Engine {
             T_SHADE_MODEL | T_FRONT_FACE | T_MAKECURRENT | T_CULL_FRONT | T_CULL_BACK
             | T_POLYGON_MODE | T_SWAP_BUFFERS | T_DITHER | T_STIPPLE_OFF
             | T_DEPTH_TEST | T_DEPTH_FUNC | T_DEPTH_MASK | T_STENCIL_WMASK | T_STENCIL_CONFIG
-            | T_BLEND_MODE | T_LOGIC_OP | T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS | T_READ_DONE => 1,
+            | T_BLEND_MODE | T_LOGIC_OP | T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS | T_READ_DONE
+            | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE => 1,
             T_FRAGMENT => 7,
             T_STENCIL_CLEAR | T_IRIS_BUFFER | T_IRIS_DB => 2,
             T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
@@ -1040,6 +1099,12 @@ impl Hq2Engine {
                     }
                 };
             }
+            T_READ_BUFFER => {
+                g.read_src = [b[0], b[1]];
+                if let Some(d) = done.as_mut() {
+                    d(format!("GL_READ_BUFFER {} {}", b[0], b[1]));
+                }
+            }
             T_COLOR_WRITEMASK => {
                 // Word 0 = plane mask for swap state 0, word 1 = state 1.
                 // (Swapping them makes ideas flicker from the start: tested.)
@@ -1126,7 +1191,7 @@ impl Hq2Engine {
                 g.lt.command(cmd, &a[..]);
             }
             T_LOGIC_OP => g.logic_op = a[0] & 0xf,
-            T_READ_DONE => {}
+            T_READ_DONE | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE => {}
             T_GET_COLOR => {
                 let c = g.color;
                 for (k, v) in c.iter().enumerate() {
@@ -1280,6 +1345,8 @@ impl Hq2Engine {
             T_IRIS_GETCPOS => format!("IRISGL_GETCPOS -> ({}, {}){}", g.cpos[0], g.cpos[1], if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
+            T_READ_SETUP_A | T_READ_SETUP_B => format!("GL_READ_SETUP {:#x} {:#x}", cmd, a[0]),
+            T_READ_MODE => format!("GL_READ_MODE {}", a[0]),
             T_LOGIC_OP => format!("GL_LOGIC_OP {}", g.logic_op),
             light::T_LIGHTING => format!("GL_LIGHTING {}", if g.lt.on != 0 { "on" } else { "off" }),
             light::T_TWO_SIDED => format!("GL_LIGHT_MODEL_TWO_SIDE {}", g.lt.two_sided),
@@ -1412,8 +1479,9 @@ impl Hq2Engine {
         out.reg(re3::REG_ALIGNPAT, 0);
         let mask = self.gl.masks[self.gl.swap as usize & 1] & self.gl.colormask;
         out.reg(re3::REG_PIXMASK, mask & 0x00ff_ffff);
+        // Always: a 2D 12-bit draw (MODE 2) may have left RGB12 behind.
+        out.op(re3::RE3_OP_PIXFMT, self.gl.pixfmt as u64);
         if self.gl.pixfmt != 0 {
-            out.op(re3::RE3_OP_PIXFMT, self.gl.pixfmt as u64);
             out.reg(re3::REG_ENABDITH, self.gl.dither);
         }
         if self.gl_zs_active() {

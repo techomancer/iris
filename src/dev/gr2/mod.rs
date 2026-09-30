@@ -92,6 +92,10 @@ pub const TP_PROBE_ID: usize = 0x7fff;
 
 pub const HQ_FIFO_DEPTH: usize = 65536;
 pub const RE3_FIFO_DEPTH: usize = 65536;
+/// Words the HQ2_GEDMA read port holds ahead of its reader (power of two).
+pub const GEDMA_OUT_WORDS: usize = 16384;
+/// How long the HQ2 waits for a reader when the read port is full.
+const GEDMA_OUT_STALL_LIMIT_NS: u64 = 2_000_000_000;
 
 /// Which board is installed. Same hardware family; only the probe answers differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,14 +171,6 @@ pub struct Gr2 {
     /// kernel sees FIN2 as soon as the HQ2 gets there. See
     /// rules/gr2/fin2-wait-must-stall.md.
     fin2_wait: AtomicU32,
-    /// Context saves (0x1E1) the CPU has queued that the HQ2 has not executed
-    /// yet. HQ2_GEDMA reads stall while any is pending: the kernel starts its
-    /// VDMA read right after queuing 0x1E1, and a read that beat the HQ2
-    /// returned the end of the previous image, shifting the saved image one
-    /// word; its restore was then rejected and the previous context's state
-    /// stayed live (another demo drawn in amesh's window). See
-    /// rules/gr2/cx-save-must-wait-for-hq.md.
-    cx_save_pending: AtomicU32,
     /// Host time (fin2_clock ns) of the first stalled FIN2 poll since the
     /// wait was armed (0 = none yet). The stall gives up FIN2_STALL_LIMIT
     /// after that, so a pipeline that can never finish (RE3 held by a
@@ -182,10 +178,15 @@ pub struct Gr2 {
     /// poll, not from the ack: the DMA between ack and poll may take long on
     /// a busy host (a 400-row pixel DMA on a GitHub CI runner did).
     fin2_armed_ns: AtomicU64,
-    /// Context image handed to the kernel through HQ2_GEDMA reads (0x1E1).
-    cx_out: [AtomicU32; hq2::CX_WORDS],
-    cx_out_len: AtomicU32,
-    cx_out_pos: AtomicU32,
+    /// HQ2_GEDMA read port: HQ2 -> host words (context saves 0x1E1, pixel
+    /// DMA reads 0x152 / 0x0AC). A ring the HQ2 thread fills and the reader
+    /// (the kernel's VDMA) drains; head / tail count words since reset.
+    /// A read with the ring empty waits (bus busy) while the HQ2 still has
+    /// work, since the kernel starts the VDMA right after queuing the
+    /// request. See rules/gr2/gedma-read-port.md.
+    gedma_out: [AtomicU32; GEDMA_OUT_WORDS],
+    gedma_out_head: AtomicU32,
+    gedma_out_tail: AtomicU32,
     hq_fifo: GFifo<HQ_FIFO_DEPTH>,
     re3_fifo: GFifo<RE3_FIFO_DEPTH>,
     /// Pending half of a two-entry COPY op (RE3 thread only).
@@ -324,6 +325,58 @@ impl Gr2 {
         }
     }
 
+    /// HQ2 thread: a new HQ2_GEDMA read transfer starts. Words an earlier
+    /// one left unread would shift this one, so drop them.
+    fn gedma_begin(&self) {
+        let head = self.gedma_out_head.load(Ordering::Relaxed);
+        let tail = self.gedma_out_tail.load(Ordering::Acquire);
+        if head != tail {
+            crate::dlog_dev!(crate::devlog::LogModule::Gr2,
+                "GR2: GEDMA: {} words of the previous transfer never read, dropped", head.wrapping_sub(tail));
+            let _ = self.gedma_out_tail.compare_exchange(tail, head, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+
+    /// HQ2 thread: queue one word on the HQ2_GEDMA read port, waiting while
+    /// it is full. False if no reader drained it within the limit (or the
+    /// engine stops): the rest of the transfer is dropped.
+    fn gedma_push(&self, w: u32) -> bool {
+        let head = self.gedma_out_head.load(Ordering::Relaxed);
+        let mut since = 0u64;
+        while head.wrapping_sub(self.gedma_out_tail.load(Ordering::Acquire)) as usize >= GEDMA_OUT_WORDS {
+            if !self.running.load(Ordering::Relaxed) {
+                return false;
+            }
+            let now = fin2_clock();
+            if since == 0 {
+                since = now;
+            } else if now - since > GEDMA_OUT_STALL_LIMIT_NS {
+                crate::dlog_dev!(crate::devlog::LogModule::Gr2, "GR2: GEDMA read port full, no reader: transfer dropped");
+                return false;
+            }
+            thread::yield_now();
+        }
+        self.gedma_out[head as usize & (GEDMA_OUT_WORDS - 1)].store(w, Ordering::Relaxed);
+        self.gedma_out_head.store(head.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Reader: the next HQ2_GEDMA word, if the HQ2 has produced one.
+    fn gedma_pop(&self) -> Option<u32> {
+        let mut tail = self.gedma_out_tail.load(Ordering::Acquire);
+        loop {
+            if tail == self.gedma_out_head.load(Ordering::Acquire) {
+                return None;
+            }
+            let v = self.gedma_out[tail as usize & (GEDMA_OUT_WORDS - 1)].load(Ordering::Relaxed);
+            // CAS: the CPU and the VDMA worker may both read the port.
+            match self.gedma_out_tail.compare_exchange(tail, tail.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(v),
+                Err(t) => tail = t,
+            }
+        }
+    }
+
     fn wake(slot: &Mutex<Option<thread::Thread>>) {
         if let Some(t) = slot.lock().as_ref() {
             t.unpark();
@@ -360,20 +413,21 @@ impl Gr2 {
             FIFO..FIFO_END => 0,
             HQUCODE..HQUCODE_END => r.hq.ucode[((off - HQUCODE) >> 2) as usize],
             GEWIN..GEWIN_END => r.ge.read(((off - GEWIN) >> 10) as usize, ((off >> 2) & 0xff) as usize),
-            // HQ2_GEDMA read: the next word of a context image (0x1E1 save,
-            // read by the kernel's VDMA). Past the end: 0.
+            // HQ2_GEDMA read: the next word the HQ2 produced (context image,
+            // pixel DMA read), read by the kernel's VDMA.
             0x6a068 => {
-                if self.cx_save_pending.load(Ordering::Acquire) != 0 {
-                    // The save the kernel is reading has not run yet.
-                    return BusRead32::busy();
-                }
-                let len = self.cx_out_len.load(Ordering::Acquire);
-                let pos = self.cx_out_pos.fetch_add(1, Ordering::Relaxed);
-                if pos < len {
-                    self.cx_out[pos as usize].load(Ordering::Relaxed)
-                } else {
-                    crate::dlog_dev!(crate::devlog::LogModule::Gr2, "GR2: GEDMA read past the context image ({pos}/{len})");
-                    0
+                // Sample "HQ2 has work" before looking at the port: a word
+                // is pushed before the HQ2 goes idle, so an idle HQ2 seen
+                // here means every word it produced is visible below.
+                let working = !self.hq_fifo.is_empty() || self.hq_busy.load(Ordering::Acquire);
+                match self.gedma_pop() {
+                    Some(v) => v,
+                    // Not produced yet: the request is queued or running.
+                    None if working => return BusRead32::busy(),
+                    None => {
+                        crate::dlog_dev!(crate::devlog::LogModule::Gr2, "GR2: GEDMA read overrun (HQ2 idle, nothing to read)");
+                        0
+                    }
                 }
             }
             0x6b000 => if self.fin3_pending.load(Ordering::Acquire) != 0 { 0 } else { r.hq.fin[hq2::FIN3].load(Ordering::Acquire) },
@@ -452,21 +506,14 @@ impl Gr2 {
             FIFO..FIFO_END => {
                 let idx = (off - FIFO) >> 2;
                 let fin = is_fin3_token(idx);
-                let save = is_cx_save_token(idx);
                 if fin {
                     // Counted before the push so the HQ can never see the
                     // token before the counter includes it.
                     self.fin3_pending.fetch_add(1, Ordering::AcqRel);
                 }
-                if save {
-                    self.cx_save_pending.fetch_add(1, Ordering::AcqRel);
-                }
                 if !self.hq_fifo.try_push(idx, val as u64) {
                     if fin {
                         self.fin3_pending.fetch_sub(1, Ordering::AcqRel);
-                    }
-                    if save {
-                        self.cx_save_pending.fetch_sub(1, Ordering::AcqRel);
                     }
                     return BUS_BUSY;
                 }
@@ -611,34 +658,46 @@ impl Gr2 {
                     *w = val;
                 }
             }
-            fn cx_publish(&mut self, words: &[u32]) {
-                let g = self.0;
-                for (slot, &w) in g.cx_out.iter().zip(words) {
-                    slot.store(w, Ordering::Relaxed);
+            fn gedma_out(&mut self, words: &[u32]) {
+                self.0.gedma_begin();
+                for &w in words {
+                    if !self.0.gedma_push(w) {
+                        break;
+                    }
                 }
-                g.cx_out_pos.store(0, Ordering::Relaxed);
-                g.cx_out_len.store(words.len().min(g.cx_out.len()) as u32, Ordering::Release);
             }
             fn op(&mut self, op: u32, val: u64) {
                 self.0.re3_fifo.push(op, val);
                 Gr2::wake(&self.0.re3_thread);
             }
-            fn read_image(&mut self, req: &hq2::ReadImage) {
+            fn read_image(&mut self, req: &hq2::ReadImage, dest: hq2::ReadDest) {
                 while !self.0.re3_fifo.is_empty() || self.0.re3_busy.load(Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
-                // SAFETY: RE3 is drained and idle; VRAM is only read here, as
-                // the display thread does.
-                let vram = unsafe { &(*self.0.re3.get()).vram };
+                // SAFETY: RE3 is drained and idle; VRAM and Z are only read
+                // here, as the display thread does.
+                let re3 = unsafe { &*self.0.re3.get() };
+                let plane: &[u32] = if req.decode == hq2::ReadDecode::Depth { &re3.zbuf } else { &re3.vram };
                 let read = |x: i32, y: i32| {
                     if x < 0 || y < 0 || x as usize >= re3::FB_W || y as usize >= re3::FB_H {
                         0
                     } else {
-                        vram[y as usize * re3::FB_W + x as usize]
+                        plane[y as usize * re3::FB_W + x as usize]
                     }
                 };
-                req.pack(read, &mut self.0.regs().shram[hq2::READ_IMAGE_SHRAM..]);
-                self.0.regs().hq.fin[hq2::FIN3].store(1, Ordering::Release);
+                match dest {
+                    hq2::ReadDest::Shram => {
+                        req.pack(read, &mut self.0.regs().shram[hq2::READ_IMAGE_SHRAM..]);
+                        self.0.regs().hq.fin[hq2::FIN3].store(1, Ordering::Release);
+                    }
+                    hq2::ReadDest::Gedma => {
+                        let mut words = vec![0u32; req.rows as usize * req.words_per_row as usize];
+                        req.pack(read, &mut words);
+                        self.gedma_out(&words);
+                        // The kernel polls FIN2 once its VDMA has read them.
+                        self.0.regs().hq.fin[hq2::FIN2].store(1, Ordering::Release);
+                    }
+                }
             }
         }
         *self.hq_thread.lock() = Some(thread::current());
@@ -663,11 +722,6 @@ impl Gr2 {
                     // Executed (FIN3 raised if it was a Finish): no longer
                     // pending. Saturating: tests and replays push directly.
                     let _ = self.fin3_pending.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-                        |n| Some(n.saturating_sub(1)));
-                }
-                if is_cx_save_token(index) {
-                    // Executed: the image is published (cx_publish).
-                    let _ = self.cx_save_pending.fetch_update(Ordering::AcqRel, Ordering::Acquire,
                         |n| Some(n.saturating_sub(1)));
                 }
                 self.hq_fifo.consume();
@@ -824,19 +878,12 @@ impl BusDevice for Gr2 {
             // Both words or neither: a retried store must not push the first twice.
             let idx = (off - FIFO) >> 2;
             let fins = is_fin3_token(idx) as u32 + is_fin3_token(idx + 1) as u32;
-            let saves = is_cx_save_token(idx) as u32 + is_cx_save_token(idx + 1) as u32;
             if fins != 0 {
                 self.fin3_pending.fetch_add(fins, Ordering::AcqRel);
-            }
-            if saves != 0 {
-                self.cx_save_pending.fetch_add(saves, Ordering::AcqRel);
             }
             if !self.hq_fifo.try_push2(idx, hi as u64, idx + 1, lo as u64) {
                 if fins != 0 {
                     self.fin3_pending.fetch_sub(fins, Ordering::AcqRel);
-                }
-                if saves != 0 {
-                    self.cx_save_pending.fetch_sub(saves, Ordering::AcqRel);
                 }
                 return BUS_BUSY;
             }
@@ -890,7 +937,8 @@ impl Device for Gr2 {
         self.hq_fifo.reset();
         self.fin3_pending.store(0, Ordering::Release);
         self.fin2_wait.store(0, Ordering::Release);
-        self.cx_save_pending.store(0, Ordering::Release);
+        let head = self.gedma_out_head.load(Ordering::Acquire);
+        self.gedma_out_tail.store(head, Ordering::Release);
         self.re3_fifo.reset();
     }
 
@@ -982,12 +1030,6 @@ const FIN2_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 fn fin2_clock() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
-}
-
-/// Context save main (0x1E1): publishes the image the kernel then reads
-/// from HQ2_GEDMA.
-fn is_cx_save_token(idx: u32) -> bool {
-    idx == hq2::GE_CX_SAVE_MAIN
 }
 
 fn is_fin3_token(idx: u32) -> bool {
