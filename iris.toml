@@ -207,9 +207,9 @@ mode           = "nat"
 # ── Machine ───────────────────────────────────────────────────────────────────
 # profile: "indy_ip24" (default) or "indigo2_ip22" (same as --ip22)
 # cpu:     "r4400" (default) or "r5000" (same as --cpu). Both are in every build.
-[machine]
-profile = "indy_ip24"
-cpu     = "r5000"
+#[machine]
+#profile = "indy_ip24"
+#cpu     = "r4400"
 
 # Per-config NVRAM files, so two installs don't overwrite each other's PROM env.
 # These are top-level keys: put them near the top of the file, above any
@@ -222,7 +222,7 @@ cpu     = "r5000"
 # heads 1 or 2; resolution "guest" (IRIX/PROM programs VC2), "1024x768",
 # "1280x960" or "1280x1024".
 #[graphics]
-#board      = "xz"
+#board      = "newport"
 #heads      = 1
 #resolution = "guest"
 
