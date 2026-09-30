@@ -89,6 +89,24 @@ premiere = ["iris/lightning", "iris/idle-pause"]
 # `ultra64` field on iris's Config only exists with the core feature on).
 # Build with: cargo build -p iris-gui --features ultra64
 ultra64 = ["iris/ultra64"]
+# The Indigo2 IMPACT (IP28) machine profile and its R10000 CPU (bring-up
+# status — see the `8579614` commit and `ip28.toml.example`). Implies ppmem.
+# Off by default: it's a much bigger memory-model change than the other
+# passthrough features. Gates the "SGI Indigo2 IMPACT (IP28)" machine profile
+# and "MIPS R10000" CPU dropdown entries; the IMPACT/MGRAS graphics board
+# itself (Indigo2 profiles, either IP22 or IP28) needs no feature and is
+# always selectable. Build with: cargo build -p iris-gui --features ip28
+ip28 = ["iris/ip28"]
+# Host services for IRIX programs over private syscalls 3000-3009
+# (`iris-hostcall`) — no per-machine config, a guest either gets the trap or
+# doesn't. Build with: cargo build -p iris-gui --features hostcall
+hostcall = ["iris/hostcall"]
+# Host OpenGL for IRIX programs (`iris-hostgl`), replaying the guest's GL
+# command stream on the host GPU; implies hostcall. Only macOS has a backend
+# (CGL) today — elsewhere this builds but registers nothing, and the guest's
+# replacement libGL (github.com/atomchild411/iris-guest-tools) reports host
+# GL as unavailable. Build with: cargo build -p iris-gui --features hostgl
+hostgl = ["hostcall", "iris/hostgl"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can enable

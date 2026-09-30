@@ -56,13 +56,18 @@ impl Default for NewMachineDialog {
     }
 }
 
-pub fn distribute_ram(total: u32) -> [u32; 4] {
-    // Greedy fill banks 0..3 with the largest valid bank size that fits.
+/// Greedy-fill banks 0..3 with the largest valid bank size that fits.
+/// `allow_256` gates the 256 MB size, which only the IP28 MC can express
+/// (`validate()` rejects it on any other machine profile) — pass
+/// `cfg.machine.profile.ip28()`.
+pub fn distribute_ram(total: u32, allow_256: bool) -> [u32; 4] {
     let mut remaining = total;
     let mut banks = [0u32; 4];
     for slot in &mut banks {
         // Pick the largest size in VALID_BANK_SIZES that is <= remaining.
-        let pick = VALID_BANK_SIZES.iter().filter(|&&s| s > 0 && s <= remaining).max().copied().unwrap_or(0);
+        let pick = VALID_BANK_SIZES.iter()
+            .filter(|&&s| s > 0 && s <= remaining && (s != 256 || allow_256))
+            .max().copied().unwrap_or(0);
         *slot = pick;
         remaining -= pick;
         if remaining == 0 { break; }
@@ -92,6 +97,7 @@ impl NewMachineDialog {
                     ui.end_row();
 
                     ui.label("Machine model");
+                    let profile_before = self.profile;
                     ComboBox::from_id_salt("nm_profile")
                         .selected_text(self.profile.label())
                         .show_ui(ui, |ui| {
@@ -99,6 +105,29 @@ impl NewMachineDialog {
                                 ui.selectable_value(&mut self.profile, p, p.label());
                             }
                         });
+                    if self.profile != profile_before {
+                        // The IP28 machine means "R10000 in the Indigo2 chassis" —
+                        // nudge the Processor pick to match; leaving it un-does the
+                        // nudge rather than stranding the user on R10000 elsewhere.
+                        if self.profile == MachineProfile::Indigo2Ip28 {
+                            self.cpu = CpuModel::R10000;
+                            self.use_embedded_prom = false;
+                            // There is no embedded IP28 PROM (only IP22/IP24) — clear the
+                            // IP22/IP24 placeholder path so Create can't silently ship a
+                            // machine that falls back to the wrong embedded PROM.
+                            self.prom_path.clear();
+                            // Newport resolution presets don't apply to IMPACT.
+                            self.resolution = NewportResolution::Guest;
+                        } else if profile_before == MachineProfile::Indigo2Ip28 {
+                            self.cpu = CpuModel::default();
+                            self.use_embedded_prom = true;
+                            if self.prom_path.is_empty() { self.prom_path = "prom.bin".into(); }
+                            // 256 MB banks are the IP28 MC's granule only.
+                            for bank in &mut self.ram_banks {
+                                if *bank == 256 { *bank = 128; }
+                            }
+                        }
+                    }
                     ui.end_row();
 
                     ui.label("Processor");
@@ -168,13 +197,17 @@ impl NewMachineDialog {
                             });
                         ui.end_row();
                     } else {
+                        let ip28_banks = self.profile.ip28();
                         for i in 0..4 {
                             ui.label(format!("Bank {i}"));
                             ComboBox::from_id_salt(("nm_bank", i))
                                 .selected_text(format!("{} MB", self.ram_banks[i]))
                                 .show_ui(ui, |ui| {
                                     for &sz in VALID_BANK_SIZES {
-                                        ui.selectable_value(&mut self.ram_banks[i], sz, format!("{sz} MB"));
+                                        ui.add_enabled_ui(sz != 256 || ip28_banks, |ui| {
+                                            ui.selectable_value(&mut self.ram_banks[i], sz, format!("{sz} MB"))
+                                                .on_disabled_hover_text("256 MB banks need the IP28 machine profile");
+                                        });
                                     }
                                 });
                             ui.end_row();
@@ -188,6 +221,27 @@ impl NewMachineDialog {
                     ui.checkbox(&mut self.ram_advanced, "Advanced: configure individual banks");
                     ui.end_row();
                 });
+
+                if self.profile == MachineProfile::Indigo2Ip28 {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Bring-up. The new machine is set up with IMPACT graphics — the \
+                             IP28 IRIX kernel has no Newport driver at all; change it from the \
+                             General tab after creation if needed. The embedded PROM is \
+                             IP22/IP24 only — point PROM image at a real dumped IP28 PROM.",
+                        )
+                        .color(Color32::from_rgb(220, 170, 90))
+                        .small(),
+                    );
+                    if !crate::disk_readable(&self.prom_path) {
+                        ui.label(
+                            RichText::new("PROM image doesn't point at a readable file yet.")
+                                .color(Color32::from_rgb(220, 120, 90))
+                                .small(),
+                        );
+                    }
+                }
 
                 ui.separator();
                 ui.label(RichText::new("Boot disk (optional)").strong());
@@ -257,8 +311,15 @@ impl NewMachineDialog {
                         cfg.banks = if self.ram_advanced {
                             self.ram_banks
                         } else {
-                            distribute_ram(self.ram_total_mb)
+                            distribute_ram(self.ram_total_mb, self.profile.ip28())
                         };
+                        // The IP28 IRIX kernel carries no Newport driver at all —
+                        // default straight to IMPACT so a fresh machine has a working
+                        // display instead of a blank Newport head. See config_ui.rs's
+                        // GfxChoice picker, which the user can still change afterwards.
+                        if self.profile == MachineProfile::Indigo2Ip28 {
+                            cfg.impact.gfx = iris::config::ImpactSlot::Solid;
+                        }
                         // SCSI defaults: drop the built-in entries unless the
                         // user explicitly opted in.
                         cfg.scsi.clear();

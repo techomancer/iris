@@ -96,6 +96,19 @@ pub mod build_features {
     /// monitor breakpoints) is non-functional in this build.
     pub const LIGHTNING: bool = cfg!(feature = "lightning");
     pub const IDLE_PAUSE: bool = cfg!(feature = "idle-pause");
+    /// The Indigo2 IMPACT (IP28) machine profile and its R10000 CPU model.
+    /// Implies `ppmem`. The GUI gates the IP28/R10000 entries in the machine
+    /// profile and CPU dropdowns on this.
+    pub const IP28: bool = cfg!(feature = "ip28");
+    /// Host services for IRIX programs (private syscalls 3000-3009,
+    /// `iris-hostcall`). No per-machine config — a guest either gets the trap
+    /// or doesn't, decided at build time.
+    pub const HOSTCALL: bool = cfg!(feature = "hostcall");
+    /// Host OpenGL for IRIX programs over host call 3000 (`iris-hostgl`).
+    /// Implies `hostcall`. Only macOS has a backend (CGL) — `hostgl` can be
+    /// built elsewhere, but `register()` then has nothing to register, so
+    /// this is `false` off macOS even in a `--features hostgl` build.
+    pub const HOSTGL: bool = cfg!(feature = "hostgl") && cfg!(target_os = "macos");
     // There is deliberately no `CPU` constant here any more. The emulated CPU
     // stopped being a build-time property in 96e5ddd: both cache models are
     // monomorphised into every binary and `Machine::new` picks between them
@@ -130,6 +143,9 @@ pub mod build_features {
             ("rex-jit", cfg!(feature = "rex-jit")),
             ("lightning", cfg!(feature = "lightning")),
             ("ppmem", cfg!(feature = "ppmem")),
+            ("ip28", cfg!(feature = "ip28")),
+            ("hostcall", cfg!(feature = "hostcall")),
+            ("hostgl", cfg!(feature = "hostgl")),
             ("tcache", cfg!(feature = "tcache")),
             ("tlbvmap", cfg!(feature = "tlbvmap")),
             ("tlbstats", cfg!(feature = "tlbstats")),

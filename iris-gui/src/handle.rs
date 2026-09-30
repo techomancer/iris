@@ -85,6 +85,10 @@ pub struct Status {
     pub dirty_cow: usize,
     /// Approximate instructions/sec (millions).
     pub mips: f32,
+    /// The kernel's clock-tick rate in Hz (see `Machine::fasttick_count`) —
+    /// what IRIX actually ticks time with, distinct from `mips` (host
+    /// emulation throughput). Mirrors the CLI status bar's Hz readout.
+    pub kernel_hz: f32,
     /// The CPU is not executing: either stopped (soft power-off) or idle at the
     /// PROM after an IRIX `halt` (0 MIPS). When set, the guest has shut down and
     /// stopping the machine can't corrupt a disk — see [`crate::safe_stop`].
@@ -316,6 +320,10 @@ fn worker_loop(
     // refresh/status-bar loop. `None` until a machine is up.
     let mut cycles: Option<iris::mips_core::CyclesPtr> = None;
     let mut prev_cycles: u64 = 0;
+    // Kernel tick-rate Hz, sampled alongside MIPS from the same shared
+    // counter the CLI status bar reads (see `Machine::fasttick_count`).
+    let mut fasttick: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+    let mut prev_fasttick: u64 = 0;
     let mut prev_tick = std::time::Instant::now();
     // Tick cadence for the status poll while idle on the command channel.
     const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(500);
@@ -331,6 +339,14 @@ fn worker_loop(
                         let dc = cur.wrapping_sub(prev_cycles);
                         let mips = (dc as f64 / dt / 1_000_000.0 * 10.0).round() as f32 / 10.0;
                         prev_cycles = cur;
+                        let kernel_hz = if let Some(ft) = &fasttick {
+                            let cur_ft = ft.load(std::sync::atomic::Ordering::Relaxed);
+                            let df = cur_ft.wrapping_sub(prev_fasttick);
+                            prev_fasttick = cur_ft;
+                            (df as f64 / dt).round() as f32
+                        } else {
+                            0.0
+                        };
                         prev_tick = now;
                         // The guest has shut down when the CPU thread has stopped
                         // (soft power-off calls Machine::stop) or has retired no
@@ -345,7 +361,7 @@ fn worker_loop(
                         let pcap_status = machine.as_ref()
                             .map_or(iris::net::PcapStatus::Inactive, |m| m.net_pcap_status());
                         let _ = evt_tx.send(Evt::Status(Status {
-                            mips, cpu_halted, cpu_stopped, chd_sync_pending,
+                            mips, kernel_hz, cpu_halted, cpu_stopped, chd_sync_pending,
                             net_frames, net_guest_ip, net_guest_gateway, net_nat_gateway,
                             pcap_status,
                             ..Status::default()
@@ -408,6 +424,9 @@ fn worker_loop(
                         // Latch REX3's cycle counter for the live MIPS estimate.
                         cycles = m.get_display().map(|d| d.cycles());
                         prev_cycles = cycles.map(|c| c.get()).unwrap_or(0);
+                        let ft = m.fasttick_count();
+                        prev_fasttick = ft.load(std::sync::atomic::Ordering::Relaxed);
+                        fasttick = Some(ft);
                         prev_tick = std::time::Instant::now();
                         machine = Some(m);
                         let _ = evt_tx.send(Evt::Started);
@@ -443,6 +462,7 @@ fn worker_loop(
                 if let Some(m) = machine.take() {
                     *ps2_slot.lock() = None;
                     cycles = None;
+                    fasttick = None;
                     // Always report the machine as stopped so the user regains
                     // control, even if the stop failed or had to be abandoned.
                     if let Err(msg) = stop_machine_timed(m) {
@@ -462,6 +482,7 @@ fn worker_loop(
                 if let Some(mut m) = machine.take() {
                     *ps2_slot.lock() = None;
                     cycles = None;
+                    fasttick = None;
                     m.stop();
                     synced = match m.sync_chd_disks(
                         None,

@@ -382,7 +382,7 @@ struct MissingDisk {
 /// grant has lapsed — so opening alone would still slip past the check and only
 /// fail deep in the CHD/image loader. Catching it here routes the disk to the
 /// missing-disk modal, where the user can re-select or detach it.
-fn disk_readable(path: &str) -> bool {
+pub(crate) fn disk_readable(path: &str) -> bool {
     use std::io::Read;
     if path.is_empty() {
         return false;
@@ -1332,6 +1332,7 @@ impl App {
                 } else {
                     ui.label(RichText::new("Applied at next Start").weak().small());
                 }
+                let ip28_banks = self.cfg.machine.profile.ip28();
                 ui.separator();
                 ui.label("Quick presets (auto-distributed):");
                 for &p in RAM_PRESETS {
@@ -1340,7 +1341,7 @@ impl App {
                         .on_disabled_hover_text("Stop the VM to change RAM")
                         .clicked()
                     {
-                        self.cfg.banks = distribute_ram(p);
+                        self.cfg.banks = distribute_ram(p, ip28_banks);
                         self.mark_dirty();
                         self.toast(format!("RAM set to {} ({:?})", ram_summary(&self.cfg.banks), self.cfg.banks));
                         ui.close();
@@ -1352,8 +1353,12 @@ impl App {
                     ui.menu_button(format!("Bank {i}: {} MB", self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
-                                .add_enabled(!running, egui::Button::new(format!("{sz} MB")))
-                                .on_disabled_hover_text("Stop the VM to change RAM")
+                                .add_enabled(!running && (sz != 256 || ip28_banks), egui::Button::new(format!("{sz} MB")))
+                                .on_disabled_hover_text(if running {
+                                    "Stop the VM to change RAM"
+                                } else {
+                                    "256 MB banks need the IP28 machine profile"
+                                })
                                 .clicked()
                             {
                                 self.cfg.banks[i] = sz;
@@ -1798,6 +1803,12 @@ impl App {
                 .on_hover_text(
                     "MIPS = instructions per wall-clock second on your PC (real emulation speed).\n\
                      IRIX System Manager \"MHz\" from hinv is inventory from the PROM — not host performance.",
+                );
+            ui.label(format!("{:.0} Hz", self.emu.status.kernel_hz))
+                .on_hover_text(
+                    "The kernel's own clock-tick rate — CP0 Compare matches, or the 8254 \
+                     timer interrupts IRIX uses instead when it can (they never both run). \
+                     Distinct from MIPS: this is what IRIX keeps time with.",
                 );
         }
         // Networking indicator — ONE badge that shows both liveness (the dot's

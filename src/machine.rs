@@ -1337,6 +1337,15 @@ impl Machine {
         self.cpu.is_running()
     }
 
+    /// The kernel's clock-tick counter — CP0 Compare matches, or the IOC's
+    /// 8254 timer 0/1 interrupts when IRIX uses those instead (see
+    /// `Ioc::set_clock_ticks`; the two never both run). Read a delta over wall
+    /// time to get the guest's Hz, the same math the CLI status bar's
+    /// `BarStats::fasttick` uses (`src/disp.rs`).
+    pub fn fasttick_count(&self) -> Arc<AtomicU64> {
+        self.cpu.fasttick_count()
+    }
+
     /// Number of attached CHD disks whose `.diff.chd` holds changes pending a
     /// fold-back into the base on a clean shutdown (the "Synchronizing disks"
     /// step). 0 means a clean exit needs no disk sync.

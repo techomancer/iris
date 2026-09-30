@@ -2,9 +2,9 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, MachineConfig,
-    MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset, ScsiDeviceConfig, ScsiKind,
-    VinoSource, VinoStandard, VALID_BANK_SIZES,
+    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, ImpactSection,
+    ImpactSlot, MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
+    ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
 use iris::nfsudp::NfsVersion;
 use iris::vc2_timings::NewportResolution;
@@ -223,6 +223,24 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if !cfg.graphics.board.supports(cfg.machine.profile) {
         cfg.graphics.board = GraphicsBoard::Xz;
     }
+    // [impact] (IMPACT/MGRAS graphics) is Indigo2-only, either profile;
+    // moving to Indy falls back to Newport rather than leaving a config
+    // `validate()` would reject at Start.
+    if cfg.impact.any_enabled()
+        && !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
+    {
+        cfg.impact = Default::default();
+    }
+    // 256 MB banks are the IP28 MC's granule only; moving away from it would
+    // leave a config `validate()` rejects at Start. Compared against the
+    // profile *variant*, not `.ip28()` (which also requires the `ip28` build
+    // feature) — a build without the feature must not silently rewrite a
+    // perfectly good IP28 machine's banks just because it can't run it.
+    if cfg.machine.profile != MachineProfile::Indigo2Ip28 {
+        for bank in &mut cfg.banks {
+            if *bank == 256 { *bank = 128; }
+        }
+    }
     ui.label(
         RichText::new(
             "IRIX Software Manager and hinv report IP22 as the platform family on Indy — that is normal. \
@@ -250,6 +268,18 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
             .small(),
         );
     }
+    if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
+        ui.label(
+            RichText::new(
+                "Bring-up: an R10000 module in the Indigo2 chassis, 16 MB MEMCFG \
+                 granule (256 MB banks below), RAM at 0x20000000. IRIX carries no \
+                 Newport driver for this board — set Graphics board to an IMPACT \
+                 option below, not Newport.",
+            )
+            .color(Color32::from_rgb(220, 170, 90))
+            .small(),
+        );
+    }
         ui.heading("Processor");
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("CPU");
@@ -265,6 +295,21 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                         ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
                     }
                 });
+        });
+        ui.end_row();
+
+        ui.label("CP0 Count clock");
+        ui.horizontal(|ui| {
+            let auto_default = if cfg.machine.profile.ip28() { 97.5 } else { 33.0 };
+            let mut mhz = cfg.clock.fixed_mhz.unwrap_or(auto_default);
+            let changed = ui.add(DragValue::new(&mut mhz).range(0.1..=1000.0).suffix(" MHz")).changed();
+            if changed { cfg.clock.fixed_mhz = Some(mhz); }
+            if ui.add_enabled(cfg.clock.fixed_mhz.is_some(), egui::Button::new("Auto"))
+                .on_hover_text(format!("Default: {auto_default} MHz — what IRIX reads as CPU speed"))
+                .clicked()
+            {
+                cfg.clock.fixed_mhz = None;
+            }
         });
         ui.end_row();
     });
@@ -290,10 +335,18 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
          reads the CPU from PRId and configures itself accordingly, so switching is a \
          different machine to the guest, not a speed knob.")
         .weak().small());
+    if cfg.machine.cpu == CpuModel::R10000 {
+        ui.label(RichText::new(
+            "The R10000 is a shadow cache (loads/stores go straight to memory; the \
+             tag/data arrays only answer CACHE ops and PROM diagnostics), a 64-entry \
+             JTLB, and 44-bit virtual addresses. Bring-up status — pair it with the \
+             IP28 machine profile.")
+            .weak().small());
+    }
     ui.separator();
 
     show_board_picker(ui, cfg, mem_ctx.running);
-    if cfg.graphics.board == GraphicsBoard::Newport {
+    if cfg.graphics.board == GraphicsBoard::Newport && !cfg.impact.any_enabled() {
         ui.horizontal(|ui| {
             ui.label("Newport heads");
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -337,6 +390,18 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
     });
+    if cfg.machine.profile.ip28() && !crate::disk_readable(&cfg.prom) {
+        ui.label(
+            RichText::new(
+                "There is no embedded IP28 PROM — this PROM path doesn't resolve to a \
+                 readable file, and falling back to the built-in IP22 PROM will not pass \
+                 POST on an IP28. Point PROM image at a real dumped IP28 PROM \
+                 (see ip28.toml.example).",
+            )
+            .color(Color32::from_rgb(220, 170, 90))
+            .small(),
+        );
+    }
 
     show_rtc_offset(ui, &mut cfg.rtc_offset, mem_ctx.running);
 
@@ -435,29 +500,109 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
     );
 }
 
+/// The graphics board picker unifies two independent config fields
+/// (`graphics.board` and `[impact]`) into one dropdown — they claim the same
+/// GIO gfx slot and `validate()` refuses a config that sets both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GfxChoice {
+    Newport,
+    Xz,
+    Extreme,
+    ImpactSolid,
+    ImpactHigh,
+    ImpactMax,
+}
+
+impl GfxChoice {
+    const ALL: [Self; 6] = [
+        Self::Newport, Self::Xz, Self::Extreme,
+        Self::ImpactSolid, Self::ImpactHigh, Self::ImpactMax,
+    ];
+
+    fn from_cfg(cfg: &MachineConfig) -> Self {
+        match cfg.impact.gfx {
+            ImpactSlot::Solid => Self::ImpactSolid,
+            ImpactSlot::High => Self::ImpactHigh,
+            ImpactSlot::Max => Self::ImpactMax,
+            ImpactSlot::None => match cfg.graphics.board {
+                GraphicsBoard::Newport => Self::Newport,
+                GraphicsBoard::Xz => Self::Xz,
+                GraphicsBoard::Extreme => Self::Extreme,
+            },
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Newport => "Newport (XL)",
+            Self::Xz => "GR2 XZ",
+            Self::Extreme => "GR2 Extreme",
+            Self::ImpactSolid => "IMPACT Solid",
+            Self::ImpactHigh => "IMPACT High",
+            Self::ImpactMax => "IMPACT Maximum",
+        }
+    }
+
+    /// Whether `validate()` accepts this choice on `profile`.
+    fn supports(self, profile: MachineProfile) -> bool {
+        match self {
+            Self::Newport | Self::Xz => true,
+            Self::Extreme => profile == MachineProfile::Indigo2Ip22,
+            Self::ImpactSolid | Self::ImpactHigh | Self::ImpactMax => {
+                matches!(profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
+            }
+        }
+    }
+
+    fn is_impact(self) -> bool {
+        matches!(self, Self::ImpactSolid | Self::ImpactHigh | Self::ImpactMax)
+    }
+
+    fn apply(self, cfg: &mut MachineConfig) {
+        cfg.graphics.board = match self {
+            Self::Xz => GraphicsBoard::Xz,
+            Self::Extreme => GraphicsBoard::Extreme,
+            Self::Newport | Self::ImpactSolid | Self::ImpactHigh | Self::ImpactMax => GraphicsBoard::Newport,
+        };
+        cfg.impact = ImpactSection {
+            gfx: match self {
+                Self::ImpactSolid => ImpactSlot::Solid,
+                Self::ImpactHigh => ImpactSlot::High,
+                Self::ImpactMax => ImpactSlot::Max,
+                Self::Newport | Self::Xz | Self::Extreme => ImpactSlot::None,
+            },
+            ..Default::default()
+        };
+    }
+}
+
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let before = cfg.graphics.board;
+    let before = GfxChoice::from_cfg(cfg);
+    let mut choice = before;
     ui.horizontal(|ui| {
         ui.label("Graphics board");
         ui.add_enabled_ui(!running, |ui| {
             ComboBox::from_id_salt("graphics_board")
-                .selected_text(cfg.graphics.board.label())
+                .selected_text(choice.label())
                 .show_ui(ui, |ui| {
-                    for b in GraphicsBoard::ALL {
-                        ui.add_enabled_ui(b.supports(cfg.machine.profile), |ui| {
-                            ui.selectable_value(&mut cfg.graphics.board, b, b.label())
+                    for c in GfxChoice::ALL {
+                        ui.add_enabled_ui(c.supports(cfg.machine.profile), |ui| {
+                            ui.selectable_value(&mut choice, c, c.label())
                                 .on_disabled_hover_text("Indigo2 only");
                         });
                     }
                 });
         });
     });
-    // GR2 is single-head, has no VC2 presets and shares the gfx slot with
-    // IMPACT; clear those so the config still passes `validate()`.
-    if cfg.graphics.board != before && cfg.graphics.board != GraphicsBoard::Newport {
-        cfg.graphics.heads = 1;
-        cfg.graphics.resolution = NewportResolution::Guest;
-        cfg.impact = Default::default();
+    // Every non-Newport choice is single-head with no VC2 presets, and GR2 /
+    // IMPACT share the gfx slot; clear those so the config still passes
+    // `validate()`.
+    if choice != before {
+        choice.apply(cfg);
+        if choice != GfxChoice::Newport {
+            cfg.graphics.heads = 1;
+            cfg.graphics.resolution = NewportResolution::Guest;
+        }
     }
     if running {
         ui.label(
@@ -466,7 +611,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 .small(),
         );
     }
-    if cfg.graphics.board != GraphicsBoard::Newport {
+    if matches!(choice, GfxChoice::Xz | GfxChoice::Extreme) {
         ui.label(
             RichText::new(
                 "GR2 is newer than Newport: PROM, textport, X and GL work, with gaps. \
@@ -476,10 +621,27 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
             .small(),
         );
     }
+    if choice.is_impact() {
+        ui.label(
+            RichText::new(if cfg.machine.profile == MachineProfile::Indigo2Ip28 {
+                "IMPACT (MGRAS): PROM POST, textport and the 4Dwm desktop work on IP28 — the \
+                 raster engine covers lines, rects, fills, RGB/CI pixels and overlay planes. \
+                 TRAM and 3D GL are not modeled. No Newport fallback — the IP28 IRIX kernel \
+                 carries no Newport driver at all. Single head, guest-programmed resolution."
+            } else {
+                "IMPACT (MGRAS): a register-level model — lines, rects, fills, RGB/CI pixels \
+                 and overlay planes. TRAM and 3D GL are not modeled. Confirmed booting to the \
+                 4Dwm desktop on the IP28 machine profile; untested standalone on IP22. Single \
+                 head, guest-programmed resolution."
+            })
+            .weak()
+            .small(),
+        );
+    }
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless;
+    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless && !cfg.impact.any_enabled();
     ui.horizontal(|ui| {
         ui.label("Display resolution");
         if !newport {
@@ -546,6 +708,7 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
             .small(),
         );
     }
+    let ip28_banks = cfg.machine.profile.ip28();
     ui.add_space(4.0);
     ui.label("Quick presets:");
     ui.horizontal_wrapped(|ui| {
@@ -555,11 +718,15 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
                 .on_disabled_hover_text("Stop the VM to change RAM")
                 .clicked()
             {
-                cfg.banks = crate::dialogs::new_machine::distribute_ram(p);
+                cfg.banks = crate::dialogs::new_machine::distribute_ram(p, ip28_banks);
             }
         }
     });
-    ui.label("RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128)");
+    ui.label(if ip28_banks {
+        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128, 256 — the IP28 MC only)"
+    } else {
+        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128 — 256 needs the IP28 machine profile)"
+    });
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
         for i in 0..4 {
             ui.label(format!("Bank {i}"));
@@ -568,7 +735,10 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
                 ComboBox::from_id_salt(("bank", i)).selected_text(format!("{cur} MB"))
                     .show_ui(ui, |ui| {
                         for &sz in VALID_BANK_SIZES {
-                            ui.selectable_value(&mut cfg.banks[i], sz, format!("{sz} MB"));
+                            ui.add_enabled_ui(sz != 256 || ip28_banks, |ui| {
+                                ui.selectable_value(&mut cfg.banks[i], sz, format!("{sz} MB"))
+                                    .on_disabled_hover_text("256 MB banks need the IP28 machine profile");
+                            });
                         }
                     });
             });
@@ -1504,7 +1674,35 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             build_features::CAMERA,
         ));
         ui.end_row();
+        ui.label("IP28 / R10000");
+        ui.label(if build_features::IP28 {
+            "built in — Indigo2 IMPACT (IP28) profile and R10000 CPU selectable"
+        } else {
+            "not built — rebuild with --features ip28 for the IP28 profile / R10000 CPU"
+        });
+        ui.end_row();
+        ui.label("Host services / Host GL");
+        ui.label(match (build_features::HOSTCALL, build_features::HOSTGL) {
+            (_, true) => "built in — IRIX OpenGL programs render on the host GPU (CGL)",
+            (true, false) if cfg!(target_os = "macos") =>
+                "hostcall only — rebuild with --features hostgl for host OpenGL",
+            (true, false) =>
+                "hostcall only — host GL has no backend on this OS yet (macOS/CGL only)",
+            (false, _) => "not built — rebuild with --features hostgl for host OpenGL",
+        });
+        ui.end_row();
     });
+    if build_features::HOSTCALL {
+        ui.label(
+            RichText::new(
+                "Host services answer private syscalls 3000-3009 from IRIX programs built \
+                 against the replacement libGL (github.com/atomchild411/iris-guest-tools) — \
+                 no per-machine setting, a guest either gets the trap or doesn't.",
+            )
+            .weak()
+            .small(),
+        );
+    }
     ui.label(
         RichText::new(
             "Status-bar MIPS = host emulation throughput. IRIX System Manager MHz \

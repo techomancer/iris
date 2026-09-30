@@ -129,6 +129,42 @@ is easiest to understand by reading the commit.
   Extreme (Indigo2 only). Picking a GR2 board resets heads, resolution and
   `[impact]` to values `validate()` accepts; the Newport heads control is
   hidden for GR2.
+- **IP28 / R10000 and IMPACT graphics wired into the GUI.** A new `ip28`
+  crate feature (`cargo build -p iris-gui --features ip28`, passes through to
+  `iris/ip28`) puts the Indigo2 IMPACT (IP28) machine profile and R10000 CPU
+  in the Machine model / Processor dropdowns, gates the 256 MB RAM bank size
+  (the IP28 MC's own granule) with a hint everywhere banks are picked, and
+  reports build status on the Debug tab. The New Machine dialog nudges
+  Processor to R10000 and turns off "use embedded PROM" when IP28 is picked
+  (there is no embedded IP28 PROM — only IP22/IP24 — so it needs a real
+  dumped image), and pre-sets IMPACT graphics so a fresh machine has a
+  display.
+- **The graphics board picker above now also covers IMPACT** (Solid / High /
+  Maximum, Indigo2 only — either IP22 or IP28; no feature needed, since the
+  `[impact]` config section and the `mgras` board model it drives already
+  existed). It's the same dropdown, now unifying `[graphics].board` and
+  `[impact]` since they claim the same GIO gfx slot: picking a non-Newport
+  choice resets heads, resolution, and the other of the two config sections
+  to values `validate()` accepts, and the Newport heads/resolution controls
+  are hidden whenever either is active. Moving the machine profile off
+  Indigo2 falls the picker back to Newport instead of leaving a config
+  `validate()` would reject at Start.
+- **CP0 Count clock (Processor section, General tab):** a `[clock] fixed_mhz`
+  control (was CLI/TOML only) with an "Auto" reset to the profile's default
+  (33 MHz, or 97.5 MHz on IP28).
+- **Kernel Hz next to MIPS in the status footer** (`Machine::fasttick_count`,
+  new in core): the guest's own clock-tick rate — CP0 Compare matches, or the
+  IOC's 8254 timer interrupts when IRIX uses those instead — distinct from
+  the MIPS readout's host emulation throughput. The CLI's baked status bar
+  has shown this since `837b048`; iris-gui had no equivalent readout at all.
+- **Host services / host OpenGL build status on the Debug tab.** New passthrough
+  `hostcall`/`hostgl` crate features (`iris/hostcall`, `iris/hostgl` — see
+  `c8dc330`, `1a93808`): private syscalls 3000-3009 let an IRIX program built
+  against the replacement libGL (iris-guest-tools) ask the host for something
+  the emulated machine doesn't have, with host OpenGL the first service. There
+  is no per-machine config for either — a guest either gets the trap or
+  doesn't — so the GUI's only job is reporting what's built in (and, for
+  `hostgl`, that only macOS/CGL has a backend so far).
 - Scaling and resize fixes (`e93c5bb`): the VM screen scale is now the maximum
   draw scale, so a larger window centres the picture instead of stretching it;
   a snap-to-size request made while fullscreen is applied when fullscreen ends.

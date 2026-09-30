@@ -39,6 +39,9 @@ emulation will be noticeably slow.
 | `pcap` | PCAP bridged networking; the Networking tab lists host interfaces. Needs libpcap / a WinPcap-compatible SDK |
 | `daynaport` | DaynaPort SCSI/Link targets on the Disks tab (without it the option is shown with a rebuild hint) |
 | `ultra64` | N64 development board toggle and help window |
+| `ip28` | Indigo2 IMPACT (IP28) machine profile and R10000 CPU in the Machine model / Processor dropdowns. Bring-up status; implies `ppmem`. The IMPACT/MGRAS graphics board itself needs no feature — it's selectable in the Graphics board dropdown for any Indigo2 profile |
+| `hostcall` | Host services for IRIX programs over private syscalls 3000-3009. No per-machine setting — the Debug tab just reports it's built in |
+| `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) only for now — builds elsewhere but registers no backend |
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
 | `bundled` | Distributed build: hides the iris.toml import/export items. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
@@ -141,7 +144,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform (Indy / Indigo2), CPU, Newport heads, display resolution, PROM, NVRAM, ttyd1 serial log |
+| **General** | Platform (Indy / Indigo2 / Indigo2 IMPACT with `ip28`), CPU (R4400 / R5000 / R10000 with `ip28`), graphics board (Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Max — one dropdown covers both `[graphics]` and `[impact]`, since they share the GIO gfx slot), Newport heads, display resolution, PROM, NVRAM, ttyd1 serial log |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, controller (Indigo2) |
 | **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
