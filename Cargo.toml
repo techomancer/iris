@@ -1,5 +1,9 @@
 [workspace]
-members = ["iris-gui", "iris-hostcall", "iris-hostgl"]
+members = ["iris-gui", "iris-hostcall"]
+# iris-hostgl is built only through `--features hostgl`, never by a plain or
+# `--workspace` build: it links the host's OpenGL (CGL today), which hosts
+# such as RISC-V boards do not have.
+exclude = ["iris-hostgl"]
 
 [package]
 name = "iris"
@@ -282,6 +286,8 @@ hostcall = ["dep:iris-hostcall"]
 # side libraries are the iris-guest-tools project
 # (github.com/atomchild411/iris-guest-tools). macOS only for now (CGL); on
 # other hosts the service is not registered and the guest's libGL says so.
+# Off by default, and iris-hostgl is outside the workspace members, so
+# nothing builds it unless this feature is asked for.
 hostgl = ["hostcall", "dep:iris-hostgl"]
 
 [dependencies]
