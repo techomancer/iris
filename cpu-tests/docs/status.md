@@ -16,20 +16,23 @@
 | `identity` | 5 | PRId, FIR, cache geometry, Config.K0, TLB size |
 | `alu` | 29 | sign extension across the 32/64-bit boundary, overflow traps, shifts, logic, SLT |
 | `muldiv` | 18 | mult/div in both widths, HI/LO, the unspecified cases |
-| `mem` | 21 | load/store widths, the whole unaligned family at every offset, alignment faults, KSEG0/KSEG1 |
+| `mem` | 24 | load/store widths, the whole unaligned family at every offset, alignment faults, KSEG0/KSEG1, loads and stores right behind a load |
 | `branch` | 15 | every conditional, likely-nullification, link registers, delay slots, faults in delay slots |
 | `excep` | 17 | traps, reserved instructions, coprocessor usability, EXL/ERET, vector selection |
 | `cp0` | 21 | read-only registers, reserved-bit masks, 64-bit access, Count/Compare, LL/SC |
-| `tlb` | 10 | entry round-trip over all 48, TLBP, every page size, real translation, V/D bits, ASIDs, refill |
+| `tlb` | 11 | entry round-trip over all 48, TLBP, every page size, real translation, V/D bits, ASIDs, refill |
+| `umode` | 12 | User mode under KX/SX/UX all set, all clear, and UX alone (IRIX 6 n32): syscalls, interrupts, TLB refill vectors and Context/XContext, address errors, 64-bit ops |
 | `fpu` | 89 | see below |
 | `cache` | 8 | geometry, tag round-trip, cached/uncached views, I-cache coherency |
 | `mips4` | 13 | every MIPS IV addition — computes on R5000, must raise RI on R4400 |
-| **total** | **246** | |
+| **total** | **262** | |
 
 Six of these (`excep/cp0_unusable_user`, `excep/cp0_usable_cu0`,
 `mem/load_then_use`, `mem/load_then_trap`, `mem/load_then_more`,
 `fpu/trap_behind_a_load`) were added after the 2026-09-11 run and are not in
-its numbers; `identity/config_k0` was also re-enabled.
+its numbers; `identity/config_k0` was also re-enabled. `mem/load_then_load`,
+`mem/load_then_load_evict`, `mem/load_then_store`, `tlb/load_then_mapped_load`
+and the whole `umode` group came later still and are not in them either.
 
 ### Inside `fpu`
 

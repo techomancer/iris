@@ -24,6 +24,10 @@ make                        # -> build/cputest.elf
 No root? `make toolchain-local` unpacks the same packages into
 `~/.local/opt`; the Makefile finds them automatically.
 
+`make ONLY=group_umode` (any `group_*` from `harness/tests.c`) builds a suite of
+`identity` plus that one group - for iterating on a slow target such as an HDL
+simulator. Do a clean build when switching between it and the full suite.
+
 ## Run
 
 ```sh
@@ -138,12 +142,22 @@ yet. Each is plain architecture rather than a part-specific quirk:
 | `mem/load_then_load_evict` | the second of two loads evicts the first's D-cache line, or finds its own line just written back to memory |
 | `mem/load_then_store` | a store right behind a load, in the load's line and another, read back, in the same four cache states |
 | `tlb/load_then_mapped_load` | two loads where one or both walk the TLB, and the second's value is used at once |
+| `umode/*` (12 tests) | User mode the way IRIX 6 runs it: n32 processes with `Status.UX` = 1 under a 32-bit kernel (KX = 0), so every exception and ERET switches addressing mode. Each test runs a few words at kuseg `0x00400000` under three Status settings - KX = SX = UX = 1, all clear (IRIX 5), and UX alone (IRIX 6) - and records every exception: vector, Cause, EPC, BadVAddr, Context, XContext, EntryHi. Syscalls as the first and second instruction after ERET (libc's `_getuid`), a break, a pending interrupt, load and fetch TLB refills (XTLB vector when UX = 1; fixed up and retried), KSEG0 and misaligned loads (AdEL), and 64-bit operations with UX set |
 
 The first results for them are from the `sgiindy_MiSTer` FPGA core presenting as
 an R4600: all pass (2409 checks over 250 tests in its simulator, both with every
 load stalling execute and with loads that stall only when they must, including
 behind another load or store). `mem/load_then_load` found that core releasing a
 stalled load's execute hold on the completion of the load ahead of it.
+
+The `umode` group came out of IRIX 6.5's installer dying on that core with `init
+died (why = 3, what = 0xb)`: init's saved frame showed a TLB miss at the general
+exception vector's own address, reported on the `syscall` in `_getuid`. The core
+built the vector address with the kernel's 32-bit mode and fetched it under the
+process's UX = 1. Before its fix `umode/syscall_second` reproduced init's frame
+exactly; after it, 2752 checks pass over 267 tests on the FPGA, all but
+`umode/fetch_miss_entry` (the core still takes an instruction-TLB miss on an ERET
+target as a nested exception). IRIS passes all 12.
 
 ## Writing a test
 
@@ -185,7 +199,7 @@ and the CPU each did about it.
 
 ```
 harness/   startup, exception vectors, CHECK macros, console
-tests/     identity alu muldiv mem branch excep cp0 tlb fpu cache mips4
+tests/     identity alu muldiv mem branch excep cp0 tlb umode fpu cache mips4
 gen/       fpvectors.py — computes the FP expectation tables
 run/       run-local.sh  matrix.sh  run-prom.sh  bare.toml  boot.toml
 docs/      findings gotchas status oracle memory-map toolchain
