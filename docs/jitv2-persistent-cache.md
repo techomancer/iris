@@ -4,6 +4,13 @@ Status, 2026-09-24: implemented behind `IRIS_JIT_CACHE=1` (`src/jitv2/pcache.rs`
 under verification. Where the implementation departs from the plan below, the
 section says so.
 
+Update, 2026-10-01: the toggle is now `[jitv2] cache`/`cache_dir` in
+`iris.toml` (also exposed in the iris-gui config editor), which
+`Jitv2Config::apply_env` (`src/config.rs`) turns into the `IRIS_JIT_CACHE`/
+`IRIS_JIT_CACHE_DIR` env vars described below. The env vars still work as a
+direct override — same rule as the rest of `[debug]`/`[jitv2]` — but are no
+longer the documented interface.
+
 The R10000 JIT recompiles the same pages in every run. This keeps compiled
 pages on disk, keyed by what they were compiled from, so a later run loads
 them instead of running Cranelift again. It is also the storage an

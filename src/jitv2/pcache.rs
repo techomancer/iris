@@ -2,9 +2,13 @@
 //! what they were compiled from. Design, measurements and verification plan:
 //! `docs/jitv2-persistent-cache.md`.
 //!
-//! Opt-in with `IRIS_JIT_CACHE=1`. `IRIS_JIT_CACHE_DIR` moves the cache
-//! (default: the platform's user cache directory, `iris/jitv2` inside it;
-//! see `default_base`).
+//! Opt-in with `[jitv2] cache = true` in `iris.toml` (or the GUI's jitv2
+//! section), which `Jitv2Config::apply_env` turns into the `IRIS_JIT_CACHE`
+//! env var this module actually reads — that var (and `IRIS_JIT_CACHE_DIR`,
+//! `[jitv2] cache_dir`'s counterpart, which moves the cache; default: the
+//! platform's user cache directory, `iris/jitv2` inside it; see
+//! `default_base`) still work directly too, same override rule as the rest
+//! of `[debug]`/`[jitv2]`.
 //!
 //! Layout, under the base directory:
 //!

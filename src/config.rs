@@ -654,22 +654,48 @@ fn set_or_remove_env(key: &str, val: &str) {
     }
 }
 
-/// jitv2 compile-pool tuning (`[jitv2]` section) — its one tunable today,
-/// the compile-pool thread count. Fixed at process startup, never changed
-/// at runtime — see `CompileQueue::set_thread_count`'s own doc comment for
-/// why.
+/// jitv2 compile-pool tuning (`[jitv2]` section): the compile-pool thread
+/// count, fixed at process startup, never changed at runtime — see
+/// `CompileQueue::set_thread_count`'s own doc comment for why — plus the
+/// persistent on-disk code cache (`src/jitv2/pcache.rs`), applied to the
+/// process environment at `Start` the same way `DebugConfig` applies
+/// `[debug]` (see `Jitv2Config::apply_env`). `cache`/`cache_dir` used to be
+/// the undocumented `IRIS_JIT_CACHE`/`IRIS_JIT_CACHE_DIR` env vars; those
+/// still work as a direct override (same "env wins if externally set" rule
+/// as `[debug]`), but the config is now the documented interface.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
     #[serde(default = "default_jitv2_threads")]
     pub threads: usize,
+    /// Keep compiled pages on disk across runs (`IRIS_JIT_CACHE`). 86-95%
+    /// warm hits in the measurements in `docs/jitv2-persistent-cache.md`.
+    #[serde(default)]
+    pub cache: bool,
+    /// Where to keep the cache (`IRIS_JIT_CACHE_DIR`). Blank (the default)
+    /// means the platform's user cache directory — `~/Library/Caches` on
+    /// macOS, `%LOCALAPPDATA%` on Windows, `$XDG_CACHE_HOME` or `~/.cache`
+    /// elsewhere — with `iris/jitv2` inside it; see `pcache::default_base`.
+    /// A directory that doesn't exist yet is created on first use.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_dir: String,
 }
 
 fn default_jitv2_threads() -> usize { 1 }
 
 impl Default for Jitv2Config {
     fn default() -> Self {
-        Self { threads: default_jitv2_threads() }
+        Self { threads: default_jitv2_threads(), cache: false, cache_dir: String::new() }
+    }
+}
+
+impl Jitv2Config {
+    /// Apply to current process environment (CLI and iris-gui before
+    /// Machine::new). Same "doesn't overwrite a variable the caller set"
+    /// rule as `DebugConfig::apply_env` — see its doc comment.
+    pub fn apply_env(&self) {
+        set_or_remove_env("IRIS_JIT_CACHE", if self.cache { "1" } else { "" });
+        set_or_remove_env("IRIS_JIT_CACHE_DIR", &self.cache_dir);
     }
 }
 

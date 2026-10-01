@@ -45,8 +45,9 @@ fn main() {
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
 
-    // Apply [debug] from TOML (env vars still override if set externally).
+    // Apply [debug] and [jitv2] from TOML (env vars still override if set externally).
     cfg.debug.apply_env();
+    cfg.jitv2.apply_env();
 
     // Machine::new() allocates >1MB on the stack (Physical device_map), which overflows
     // the default stack on Windows (1MB). We spawn a thread with a larger stack to create it.

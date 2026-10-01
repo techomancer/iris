@@ -782,6 +782,7 @@ impl App {
             self.toast(format!("'{}' not found — using embedded PROM", self.cfg.prom));
         }
         self.cfg.debug.apply_env();
+        self.cfg.jitv2.apply_env();
         // Latch the networking backend the machine is being started with, so the
         // running status footer can report PCAP vs NAT (and which interface)
         // independent of any later edits to the config editor. On a build without
