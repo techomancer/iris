@@ -24,6 +24,16 @@ is easiest to understand by reading the commit.
   `<config dir>/iris/nveeprom.bin` default (`GuiSettings::default_nveeprom_path`),
   the same relative-path migration `nvram` gets on load, and a "NVRAM EEPROM
   file" row on the General tab right below NVRAM file.
+- **"Reset NVRAM" and the no-MAC-yet pre-flight now also patch the NVRAM
+  EEPROM.** Both only ever touched the DS1386 `nvram` file — on Indigo2/IP28,
+  which read `eaddr` from `nveeprom` instead (see above), this had no effect
+  on the guest's actual Ethernet MAC at all: the toast would report a fresh
+  MAC, but IRIX kept reporting the static `config::DEFAULT_MAC` because
+  `nveeprom` stayed blank and core's own blank-EEPROM fallback filled it in
+  with that default on every boot. Added `nveeprom`-side equivalents of every
+  `nvram` MAC helper (`nveeprom_has_mac`, `write_nveeprom_mac`,
+  `ensure_nveeprom_exists`, `reset_nveeprom`) and call them alongside the
+  `nvram` ones, so both chips get a real MAC regardless of machine profile.
 
 ## September 2026
 

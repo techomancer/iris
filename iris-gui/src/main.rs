@@ -818,21 +818,42 @@ impl App {
         // boot instead of boot-then-reboot.
         // Seed a default NVRAM if there's none yet (a fresh install / bundled
         // app has nothing in the working dir to migrate), so the machine boots
-        // with proper PROM env instead of a blank one.
+        // with proper PROM env instead of a blank one. `toast` holds one
+        // message, so every step below collects into `notes` and one final
+        // call reports them all, rather than each overwriting the last.
+        let mut notes = Vec::new();
         if settings::ensure_nvram_seeded(&self.cfg.nvram) {
-            self.toast("seeded a default NVRAM");
+            notes.push("seeded a default NVRAM".to_string());
         }
         // Networking needs an Ethernet MAC in NVRAM (6 raw bytes at a fixed
         // offset). If there's none, write a generated one *now*, before boot —
         // so IRIX attaches ec0 on the first boot, no PROM monitor / reboot.
+        //
+        // Indigo2/IP28 read `eaddr` from the NVRAM *EEPROM* instead
+        // (`nveeprom`, see `rules/irix/networking.md`) — the DS1386 write
+        // above has no effect on those profiles' guest networking at all.
+        // Patch whichever chip(s) the config carries; harmless on a profile
+        // that doesn't use one (core's own `backdoor_set_mac_if_blank` simply
+        // never reads it then).
         if !settings::nvram_has_mac(&self.cfg.nvram) {
             let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
             let mac = settings::generate_mac_bytes(seed);
-            match settings::write_nvram_mac(&self.cfg.nvram, mac) {
-                Ok(true)  => self.toast(format!("no Ethernet MAC in NVRAM — wrote {}", settings::mac_to_string(mac))),
-                Ok(false) => self.toast("no Ethernet MAC, and no NVRAM file yet to write into"),
-                Err(e)    => self.toast(format!("couldn't write MAC to NVRAM: {e}")),
+            notes.push(match settings::write_nvram_mac(&self.cfg.nvram, mac) {
+                Ok(true)  => format!("no Ethernet MAC in NVRAM — wrote {}", settings::mac_to_string(mac)),
+                Ok(false) => "no Ethernet MAC, and no NVRAM file yet to write into".to_string(),
+                Err(e)    => format!("couldn't write MAC to NVRAM: {e}"),
+            });
+        }
+        if !settings::nveeprom_has_mac(&self.cfg.nveeprom) {
+            settings::ensure_nveeprom_exists(&self.cfg.nveeprom);
+            let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+            let mac = settings::generate_mac_bytes(seed);
+            if let Ok(true) = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac) {
+                notes.push(format!("no Ethernet MAC in NVRAM EEPROM — wrote {}", settings::mac_to_string(mac)));
             }
+        }
+        if !notes.is_empty() {
+            self.toast(notes.join("; "));
         }
     }
 
@@ -1233,19 +1254,35 @@ impl App {
                 }
                 if ui.add_enabled(!running, egui::Button::new("Reset NVRAM (fresh PRAM)"))
                     .on_hover_text(format!(
-                        "Restore this machine's NVRAM to defaults and assign a fresh Ethernet MAC.\n{}",
-                        abs_path(&self.cfg.nvram)))
+                        "Restore this machine's NVRAM and NVRAM EEPROM to defaults and assign a \
+                         fresh Ethernet MAC to whichever one the platform reads eaddr from.\n{}\n{}",
+                        abs_path(&self.cfg.nvram), abs_path(&self.cfg.nveeprom)))
                     .clicked()
                 {
+                    // Indigo2/IP28 read eaddr and PROM env from the NVRAM
+                    // EEPROM (nveeprom), not the DS1386 nvram file below — see
+                    // rules/irix/networking.md. Reset and re-MAC both, so this
+                    // button actually works regardless of machine profile
+                    // instead of only ever touching the Indy chip. `toast`
+                    // holds one message, so collect both outcomes into a
+                    // single final one rather than letting a later call
+                    // silently overwrite an earlier failure.
+                    let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+                    let mac = settings::generate_mac_bytes(seed);
+                    let mut errors = Vec::new();
                     match settings::reset_nvram(&self.cfg.nvram) {
-                        Ok(()) => {
-                            let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
-                            let mac = settings::generate_mac_bytes(seed);
-                            let _ = settings::write_nvram_mac(&self.cfg.nvram, mac);
-                            self.toast(format!("NVRAM reset — new MAC {}", settings::mac_to_string(mac)));
-                        }
-                        Err(e) => self.toast(format!("NVRAM reset failed: {e}")),
+                        Ok(()) => { let _ = settings::write_nvram_mac(&self.cfg.nvram, mac); }
+                        Err(e) => errors.push(format!("NVRAM reset failed: {e}")),
                     }
+                    match settings::reset_nveeprom(&self.cfg.nveeprom) {
+                        Ok(()) => { let _ = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac); }
+                        Err(e) => errors.push(format!("NVRAM EEPROM reset failed: {e}")),
+                    }
+                    self.toast(if errors.is_empty() {
+                        format!("NVRAM reset — new MAC {}", settings::mac_to_string(mac))
+                    } else {
+                        errors.join("; ")
+                    });
                     ui.close();
                 }
                 ui.separator();

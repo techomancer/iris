@@ -140,6 +140,81 @@ pub fn reset_nvram(path: &str) -> std::io::Result<()> {
     std::fs::write(path, DEFAULT_NVRAM)
 }
 
+/// Byte offset of the Ethernet MAC inside the NVRAM *EEPROM* (93CS56) file —
+/// word 0x7D, 2 bytes per word, big-endian (`src/eeprom_93c56.rs`'s
+/// `backdoor_set_mac`: word 0x7D = MAC[0]<<8|MAC[1], …, so the three words'
+/// raw bytes are the 6 MAC bytes in order). **Indigo2/IP28 read `eaddr` from
+/// here, not from [`NVRAM_MAC_OFFSET`]** — that offset is the DS1386 chip,
+/// which those profiles don't use for the MAC at all. A build that only ever
+/// patches `NVRAM_MAC_OFFSET` silently has no effect on those profiles' guest
+/// networking; see `rules/irix/networking.md`.
+pub const NVEEPROM_MAC_OFFSET: usize = 0x7D * 2;
+
+/// The blank/erased size of a 93C56: 128 words × 2 bytes.
+const NVEEPROM_SIZE: usize = 128 * 2;
+
+/// The 6 raw MAC bytes from an NVRAM EEPROM file, if it holds a non-blank one.
+/// A real 93C56 reads all-`0xFF` when erased (never all-zero — that's the
+/// DS1386's blank state, not this chip's), but `nvram_mac`'s both-sentinels
+/// check already covers it, so the same logic works unmodified.
+pub fn nveeprom_mac(path: &str) -> Option<[u8; 6]> {
+    let b = std::fs::read(path).ok()?;
+    let m: [u8; 6] = b.get(NVEEPROM_MAC_OFFSET..NVEEPROM_MAC_OFFSET + 6)?.try_into().ok()?;
+    let blank = m.iter().all(|&x| x == 0x00) || m.iter().all(|&x| x == 0xff);
+    (!blank).then_some(m)
+}
+
+/// Whether the NVRAM EEPROM already has an Ethernet MAC.
+pub fn nveeprom_has_mac(path: &str) -> bool {
+    nveeprom_mac(path).is_some()
+}
+
+/// Write 6 MAC bytes into an existing NVRAM EEPROM file at
+/// [`NVEEPROM_MAC_OFFSET`], touching only those 6 bytes. Backs the file up to
+/// `<path>.bak` first. Returns `Ok(false)` if there's no file yet or it's too
+/// small — call [`ensure_nveeprom_exists`] first to create a blank one.
+pub fn write_nveeprom_mac(path: &str, mac: [u8; 6]) -> std::io::Result<bool> {
+    let Ok(mut bytes) = std::fs::read(path) else { return Ok(false); };
+    if bytes.len() < NVEEPROM_MAC_OFFSET + 6 {
+        return Ok(false);
+    }
+    let _ = std::fs::copy(path, format!("{path}.bak")); // best-effort backup
+    bytes[NVEEPROM_MAC_OFFSET..NVEEPROM_MAC_OFFSET + 6].copy_from_slice(&mac);
+    std::fs::write(path, &bytes)?;
+    Ok(true)
+}
+
+/// Create a blank (all-erased, `0xFF`) 256-byte EEPROM image at `path` if
+/// there's no (non-empty) file there yet. Returns true if it created one.
+/// Unlike [`ensure_nvram_seeded`], there's no baked-in asset to seed from —
+/// `0xFF`-erased is exactly a brand new 93C56's real power-on state, and
+/// `Eeprom93c56::backdoor_set_mac_if_blank` (core, at `Machine::new`) already
+/// fills in a MAC from a blank one, same as the DS1386 path.
+pub fn ensure_nveeprom_exists(path: &str) -> bool {
+    if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        return false;
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, vec![0xFFu8; NVEEPROM_SIZE]).is_ok()
+}
+
+/// Overwrite the NVRAM EEPROM at `path` with a blank (`0xFF`-erased) image —
+/// backs the current file up to `<path>.bak` first. Used by the
+/// "Reset NVRAM / fresh PRAM" menu action alongside [`reset_nvram`], so a
+/// reset actually clears whichever chip the current profile reads `eaddr`
+/// and PROM env from, not just the DS1386 one.
+pub fn reset_nveeprom(path: &str) -> std::io::Result<()> {
+    if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        let _ = std::fs::copy(path, format!("{path}.bak"));
+    }
+    if let Some(parent) = Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, vec![0xFFu8; NVEEPROM_SIZE])
+}
+
 /// Allowed UI-scale range, shared by the View-menu slider, the Ctrl +/-/0
 /// keyboard zoom, and the load-time clamp so a stale persisted value can never
 /// put the UI into a state the slider can't represent (which egui would then
