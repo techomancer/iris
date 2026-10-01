@@ -2493,3 +2493,142 @@ fn gl_24bit_after_ddx_12bit_draw() {
     g.wait_idle();
     assert_eq!(gl_px(g, 20, 20), 0x40_80ff);
 }
+
+/// glIndexi in a colour-index window (gr_osview, IRIX 6.5.22, grosview.log):
+/// ITOF|C1|0x0FE (0x70FE) carries the index before each Begin; vertices
+/// (V2|USEV 0x1263) carry no colour. Ignoring 0x0FE drew every bar in the
+/// default colour (index 255): a black window.
+#[test]
+fn gl_index_sets_ci_colour() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    let quad = |g: &Gr2, index: u32, x0: f32, x1: f32| {
+        cmd(g, 0x70fe, index);
+        cmd(g, 0x0f3, 0);
+        cmd(g, 0x4f5, 0);
+        for (x, y) in [(x0, 10.0f32), (x1, 10.0), (x1, 20.0), (x0, 20.0)] {
+            cmd(g, 0x1263, fl(x));
+            cmd(g, 0x1263, fl(y));
+        }
+        cmd(g, 0x0f4, 0);
+        cmd(g, 0x465, 0);
+    };
+    quad(g, 5, 10.0, 20.0);
+    quad(g, 6, 30.0, 40.0);
+    // The float form (C1|0x0FE) too.
+    cmd(g, 0x30fe, fl(7.0));
+    cmd(g, 0x0f3, 0);
+    cmd(g, 0x4f5, 0);
+    for (x, y) in [(50.0f32, 10.0f32), (60.0, 10.0), (60.0, 20.0), (50.0, 20.0)] {
+        cmd(g, 0x1263, fl(x));
+        cmd(g, 0x1263, fl(y));
+    }
+    cmd(g, 0x0f4, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 15, 15) & 0xff, 5);
+    assert_eq!(gl_px(g, 35, 15) & 0xff, 6);
+    assert_eq!(gl_px(g, 55, 15) & 0xff, 7);
+}
+
+/// glRasterPos + glBitmap (gr_osview labels, grosview.log): 0x105 x; DATA
+/// y, z, w. 0x18C x6: (16 << 16) | 7, xorig, yorig, xmove, ymove, 1; then 9
+/// DATA rows, top row first (bottom-first drew the labels upside down), MSB
+/// leftmost. The raster then moves by xmove: the second glyph lands 7
+/// pixels to the right.
+#[test]
+fn gl_bitmap_draws_at_raster_and_advances() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, 0x70fe, 9);
+    cmd(g, 0x105, fl(20.0));
+    for v in [30.0f32, 0.0, 1.0] { data(g, fl(v)); }
+    let glyph = |g: &Gr2| {
+        for v in [(16u32 << 16) | 7, fl(0.0), fl(0.0), fl(7.0), fl(0.0), 1] { cmd(g, 0x18c, v); }
+        // Top row (first): pixels 0..3; bottom row (row 6): leftmost only.
+        for r in 0..9u32 {
+            data(g, match r { 0 => 0xf000_0000, 6 => 0x8000_0000, _ => 0 });
+        }
+    };
+    glyph(g);
+    glyph(g);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 20, 30) & 0xff, 9, "bottom-left pixel at the raster position");
+    assert_eq!(gl_px(g, 21, 30) & 0xff, 0);
+    assert_eq!(gl_px(g, 23, 36) & 0xff, 9, "top row, 4 pixels wide");
+    assert_eq!(gl_px(g, 24, 36) & 0xff, 0);
+    assert_eq!(gl_px(g, 27, 30) & 0xff, 9, "second glyph after xmove 7");
+}
+
+/// glClearIndex + glClear in a colour-index window (gr_osview: C1|0x104 =
+/// 0x3104, index 46.0; DATA 0, 0, 0). Unimplemented, the window kept
+/// whatever was under it.
+#[test]
+fn gl_clear_ci_fills_window_with_index() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x3104, 46.0f32.to_bits());
+    for _ in 0..3 { data(g, 0); }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 0, 0) & 0xff, 46);
+    assert_eq!(gl_px(g, 399, 299) & 0xff, 46);
+}
+
+/// MAKECURRENT 9 = 8-bit colour index (gr_osview). The index lands in the
+/// low byte (and the byte above, for the other 8-bit buffer's mask), blending
+/// is off in CI, and a 0x0AC read returns the index, not RGB.
+#[test]
+fn gl_ci8_draw_and_read() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 9);
+    for v in [0xff, 0xff] { cmd(g, 0x10b, v); }
+    cmd(g, 0x70fe, 0x2a);
+    gl_quad3(g, [0x2a as f32 / 255.0, 0., 0.], [[0., 0., 0.], [400., 0., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 20, 20) & 0xff, 0x2a);
+    for v in [0, 0] { cmd(g, 0x10a, v); }
+    // 4 pixels per word (8-bit), MSB first.
+    w32(g, 0x6a04c, 0);
+    cmd(g, super::hq2::HQ2_GL_DMA_READ, 20);
+    for v in [20, 4, 1, 1, 0, 0] { cmd(g, 0, v); }
+    assert_eq!(r32(g, 0x6a068), 0x2a2a_2a2a);
+}
+
+/// MAKECURRENT 1 = 8-bit 3:3:2 TrueColor (R 7:5, B 4:3, G 2:0).
+#[test]
+fn gl_rgb8_packs_332() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 1);
+    for v in [0xff, 0xff] { cmd(g, 0x10b, v); }
+    cmd(g, 0x011, 0);
+    gl_quad3(g, [1., 0., 1.], [[0., 0., 0.], [400., 0., 0.], [400., 300., 0.], [0., 300., 0.]]);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 20, 20) & 0xff, 0xe0 | 0x18, "red + blue");
+    for v in [0, 0] { cmd(g, 0x10a, v); }
+    let w = gl_dma_read(g, 20, 20, 1, 1);
+    assert_eq!(w, vec![0xffff_00ff], "read back widened, alpha 0xFF");
+}
+
+/// glBitmap's largest block (0x18E: 33 rows): a 20-row bitmap, top row
+/// first.
+#[test]
+fn gl_bitmap_huge_block() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    cmd(g, 0x70fe, 3);
+    cmd(g, 0x105, fl(50.0));
+    for v in [50.0f32, 0.0, 1.0] { data(g, fl(v)); }
+    for v in [(8u32 << 16) | 20, fl(0.0), fl(0.0), fl(9.0), fl(0.0), 1] { cmd(g, 0x18e, v); }
+    for r in 0..33u32 {
+        data(g, match r { 0 => 0xff00_0000, 19 => 0x8000_0000, _ => 0 });
+    }
+    g.wait_idle();
+    assert_eq!(gl_px(g, 57, 69) & 0xff, 3, "top row (first) is 8 wide at y + 19");
+    assert_eq!(gl_px(g, 50, 50) & 0xff, 3, "bottom row (20th) at the raster");
+    assert_eq!(gl_px(g, 51, 50) & 0xff, 0);
+}

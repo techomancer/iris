@@ -245,6 +245,11 @@ pub enum ReadDecode {
     Rgb12 { bank: u32 },
     /// GL colour index in 12-bit `bank`.
     Ci12 { bank: u32 },
+    /// GL 8-bit colour index in 8-bit `bank` (bits 7:0 / 15:8, see
+    /// re3::PIXFMT_CI8).
+    Ci8 { bank: u32 },
+    /// GL 8-bit 3:3:2 RGB in 8-bit `bank`, widened as Rgb24.
+    Rgb8 { bank: u32 },
     /// GL depth: Z right-justified (libglcore shifts it up by 32 - bits).
     Depth,
 }
@@ -318,6 +323,11 @@ impl ReadImage {
                 0xff00_0000 | wide(v) | (wide(v >> 4) << 8) | (wide(v >> 8) << 16)
             }
             ReadDecode::Ci12 { bank } => (vram >> (12 * (bank & 1))) & 0xfff,
+            ReadDecode::Ci8 { bank } => (vram >> (8 * (bank & 1))) & 0xff,
+            ReadDecode::Rgb8 { bank } => {
+                let [r, g, b] = re3::rgb332_to_888((vram >> (8 * (bank & 1))) & 0xff);
+                0xff00_0000 | r | (g << 8) | (b << 16)
+            }
             ReadDecode::Depth => vram & 0x00ff_ffff,
         }
     }
@@ -398,6 +408,7 @@ pub fn gl_token_name(tok: u32) -> Option<&'static str> {
         0x01f => "GL_POLYGON_STIPPLE", 0x024 => "GL_DEPTH_FUNC", 0x026 => "GL_BLEND_MODE",
         0x02b => "GL_FRAGMENT", 0x0a1 => "GL_CLEAR_STENCIL", 0x0bd => "GL_READ_DONE",
         0x0e9 => "GL_GET_COLOR", 0x0ea => "GL_GET_NORMAL", 0x107 => "GL_GET_RASTERPOS",
+        0x105 => "GL_RASTER_POS", 0x18c..=0x18e => "GL_BITMAP", 0x0fe => "GL_INDEX",
         0x010 => "GL_STENCIL_WMASK", 0x011 => "GL_DITHER", 0x013 => "GL_SHADE_MODEL",
         0x017 => "GL_LINE_WIDTH", 0x018 => "GL_LINE_STIPPLE", 0x01b => "GL_CULL_A", 0x01c => "GL_CULL_B",
         0x021 => "GL_POINT_SMOOTH", 0x022 => "GL_LINE_SMOOTH", 0x025 => "GL_BLEND_FACTOR",

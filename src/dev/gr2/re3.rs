@@ -175,6 +175,14 @@ pub const PIXFMT_RGB12: u32 = 1;
 /// 12-bit colour index: the R iterator (12.11) carries the index, written
 /// into both 12-bit banks like PIXFMT_RGB12 (the plane mask picks the buffer).
 pub const PIXFMT_CI12: u32 = 2;
+/// 8-bit colour index: the R iterator carries the index (0..255), written
+/// as i | i << 8 so either 8-bit buffer mask works (libglcore builds the
+/// double-buffer masks by shifting by the depth: 0x00FF / 0xFF00 for 8
+/// bits; the bank-1 position is unverified).
+pub const PIXFMT_CI8: u32 = 3;
+/// 8-bit 3:3:2 TrueColor (Xsgi visual masks: R 7:5, B 4:3, G 2:0), packed
+/// from 8:8:8 by truncation and written as v | v << 8 like PIXFMT_CI8.
+pub const PIXFMT_RGB8: u32 = 4;
 /// Emulator-private depth control (the enables and write mask have no
 /// documented RE3 register): val = test enable (bit 0) | func (bits 3:1,
 /// GL order NEVER..ALWAYS) | Z write mask << 8 (24 bits). Depth is tested
@@ -357,6 +365,10 @@ impl Re3 {
             let i = (c.r >> 11).clamp(0, 0xfff) as u32;
             return i | (i << 12);
         }
+        if c.pixfmt == PIXFMT_CI8 {
+            let i = (c.r >> 11).clamp(0, 0xff) as u32;
+            return i | (i << 8);
+        }
         let ch = |v: i64| (v >> 11).clamp(0, 255) as u32;
         self.pack(ch(c.r) | (ch(c.g) << 8) | (ch(c.b) << 16), x, y)
     }
@@ -366,7 +378,8 @@ impl Re3 {
     #[inline]
     fn color_blended(&self, x: i32, y: i32, off: usize) -> u32 {
         let c = &self.ctx;
-        if c.blend & 1 == 0 || c.pixfmt == PIXFMT_CI12 {
+        // No blending in colour-index mode (GL).
+        if c.blend & 1 == 0 || c.pixfmt == PIXFMT_CI12 || c.pixfmt == PIXFMT_CI8 {
             return self.color(x, y);
         }
         let ch = |v: i64| (v >> 11).clamp(0, 255) as u32;
@@ -401,6 +414,10 @@ impl Re3 {
             let buf = if self.ctx.reg[REG_PIXMASK] & 0xfff == 0 { (p >> 12) & 0xfff } else { p & 0xfff };
             return [(buf & 0xf) * 17, ((buf >> 4) & 0xf) * 17, ((buf >> 8) & 0xf) * 17];
         }
+        if self.ctx.pixfmt == PIXFMT_RGB8 {
+            let v = if self.ctx.reg[REG_PIXMASK] & 0xff == 0 { (p >> 8) & 0xff } else { p & 0xff };
+            return rgb332_to_888(v);
+        }
         [p & 0xff, (p >> 8) & 0xff, (p >> 16) & 0xff]
     }
 
@@ -416,6 +433,10 @@ impl Re3 {
                 crate::rex3_generic::rgb24_to_rgb12(rgb)
             };
             return v | (v << 12);
+        }
+        if c.pixfmt == PIXFMT_RGB8 {
+            let v = (rgb & 0xe0) | ((rgb >> 19) & 0x18) | ((rgb >> 13) & 0x07);
+            return v | (v << 8);
         }
         rgb & 0x00ff_ffff
     }
@@ -750,4 +771,9 @@ fn unpack(data: u32, n: u32, mode: u32) -> u32 {
         3 => (data >> (8 * (3 - n))) & 0xff,
         _ => data,
     }
+}
+
+/// 8-bit 3:3:2 (R 7:5, B 4:3, G 2:0) to 8:8:8 values [R, G, B].
+pub fn rgb332_to_888(v: u32) -> [u32; 3] {
+    [((v >> 5) & 7) * 255 / 7, (v & 7) * 255 / 7, ((v >> 3) & 3) * 255 / 3]
 }

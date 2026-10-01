@@ -40,6 +40,9 @@ pub const T_COLOR_WRITEMASK: u32 = 0x10b;
 pub const T_FRONT_FACE: u32 = 0x108;
 pub const T_CLEAR_COLOR: u32 = 0x104;
 pub const T_CLEAR_COLOR_DEPTH: u32 = 0x0a0;
+/// Colour-index clear (libglcore clear_ci, C1|0x104): index (f32); DATA
+/// 0, 0, 0. gr_osview clears its window with index 46 this way.
+pub const T_CLEAR_CI: u32 = 0x3104;
 /// Window rectangle, sent by the kernel at context restore: x0; DATA y0 (GL,
 /// bottom-up), w, h, 0x10, 0, 1, (x1 << 11) | x0, (y1 << 10) | y0, 0 x 6.
 pub const T_WINDOW: u32 = 0x1e5;
@@ -100,6 +103,11 @@ const VR_IRIS_POLYGON: u32 = 0x1ae;
 /// showmap): 0x044 then LOADV|0x1AE, points on 0x045 (V3 or ITOF|V3), 0x042
 /// then LOADV|0x065.
 pub const T_IRIS_INDEX: u32 = 0x030;
+/// OpenGL glIndex (libglcore HQ2_GL_INDEX, gr2_vapi.c): C1|0x0FE = 0x30FE
+/// with a float index, or ITOF|C1|0x0FE = 0x70FE (the CI aperture) with an
+/// integer. Colour-index windows (gr_osview on IRIX 6.5) set every colour
+/// this way.
+pub const T_INDEX: u32 = 0x0fe;
 pub const T_IRIS_PMV: u32 = 0x044;
 pub const T_IRIS_PCLOS: u32 = 0x042;
 pub const T_IRIS_PDR: u32 = 0x045;
@@ -186,6 +194,24 @@ pub const T_GET_COLOR: u32 = 0x0e9;
 pub const T_GET_NORMAL: u32 = 0x0ea;
 pub const T_GET_RASTERPOS: u32 = 0x107;
 pub const T_READ_DONE: u32 = 0x0bd;
+/// glRasterPos (gr_osview, IRIX 6.5.22): x on the token; DATA y, z, w
+/// (object coordinates). The GE transforms it and latches the current
+/// colour; libglcore keeps its own copy of the position and reads only the
+/// colour back (0x107 -> mailbox r, g, b, a; CI: index in r).
+pub const T_RASTER_POS: u32 = 0x105;
+/// glBitmap (libglcore __glExpRenderBitmap, draw_bitmap 0x2630): six
+/// words to the token: (width << 16) | height, xorig, yorig, xmove, ymove
+/// (f32), then a constant 1; then the rows on DATA, TOP row first
+/// (libglcore walks the GL array from its last row back), one word per row
+/// (widths up to 32), MSB = leftmost pixel, zero-padded to a fixed block
+/// chosen by the row count: 9 words (0x18C), 17 (0x18D) or 33 (0x18E).
+/// Wider or taller bitmaps take libglcore's slow path; nothing is sent for
+/// an invalid raster position. The bottom row lands at floor(raster -
+/// orig) in the raster colour; the raster then moves by (xmove, ymove).
+pub const T_BITMAP: u32 = 0x18c;
+pub const T_BITMAP_TALL: u32 = 0x18d;
+pub const T_BITMAP_HUGE: u32 = 0x18e;
+const BITMAP_HDR: usize = 6;
 /// Pixel read setup (__glExpReadPixelsKDMA, Fetch, ReadColor): read setup
 /// 0x0A7 / 0x0A8 = 0 and read mode 0x0BC (1 before a pixel DMA read, 0
 /// before READ_RECT). Meaning unknown; the HLE ignores them.
@@ -367,6 +393,9 @@ pub struct GlState {
     cpos: [i32; 3],
     /// Colour latched by cmov for the characters drawn there.
     cpos_color: [f32; 4],
+    /// OpenGL raster position (window-relative, fractional), set by 0x105
+    /// and advanced by glBitmap; validity is cpos[2].
+    rpos: [f32; 2],
     /// move / draw pen: 0 = next 0x05D point is a move.
     pen: u32,
     pen_at: Wv,
@@ -660,7 +689,7 @@ fn port_words(index: u32) -> Option<u32> {
         T_SPAN_COLOR | T_SPAN_COLOR_B if conv == 0 || conv == 4 => Some(4),
         T_SPAN_SETUP | T_SPAN_SKIP if index & !0x1ff == 0 => Some(if tok == T_SPAN_SETUP { 6 } else { 1 }),
         T_VERTEX | T_IRIS_PDR if index & (USEV | LOADV) != 0 || conv != 0 => Some(match conv { 1 => 3, 2 => 2, _ => 4 }),
-        T_IRIS_INDEX if conv == 6 => Some(1),
+        T_IRIS_INDEX | T_INDEX if conv == 6 => Some(1),
         T_IRIS_DRAW | T_IRIS_CMOV if conv != 0 => Some(match conv { 1 => 3, 2 => 2, _ => 4 }),
         T_COLOR if index & !0x1ff != 0 => Some(match conv { 3 => 3, 4 => 4, _ => 1 }),
         T_IRIS_COLOR => Some(match conv { 3 => 3, 4 => 4, _ => 1 }),
@@ -749,6 +778,8 @@ impl Hq2Engine {
         match g.pixfmt {
             re3::PIXFMT_RGB12 => ReadDecode::Rgb12 { bank },
             re3::PIXFMT_CI12 => ReadDecode::Ci12 { bank },
+            re3::PIXFMT_CI8 => ReadDecode::Ci8 { bank },
+            re3::PIXFMT_RGB8 => ReadDecode::Rgb8 { bank },
             _ => ReadDecode::Rgb24,
         }
     }
@@ -891,7 +922,7 @@ impl Hq2Engine {
         Some(match cmd {
             T_VIEWPORT => 7,
             T_SCISSOR => 4,
-            T_CLEAR_COLOR => 4,
+            T_CLEAR_COLOR | T_CLEAR_CI => 4,
             T_CLEAR_COLOR_DEPTH => 6,
             T_WINDOW => 15,
             light::T_LIGHTING | light::T_TWO_SIDED => 2,
@@ -906,6 +937,10 @@ impl Hq2Engine {
             T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
             | T_IRIS_PMV | T_IRIS_PCLOS | T_IRIS_MOVE | T_IRIS_GETCPOS => 1,
             T_DEPTH_CLEAR => 3,
+            T_RASTER_POS => 4,
+            T_BITMAP => (BITMAP_HDR + 9) as u32,
+            T_BITMAP_TALL => (BITMAP_HDR + 17) as u32,
+            T_BITMAP_HUGE => (BITMAP_HDR + 33) as u32,
             T_IRIS_SBOXF | T_IRIS_SBOXFI => 4,
             T_IRIS_SWAPTMESH => 1,
             T_CLIP_PLANE_ENABLE => 2,
@@ -1020,7 +1055,7 @@ impl Hq2Engine {
                 };
             }
             T_PIXEL_ZOOM => g.pzoom = [f(b[1]), f(b[2])],
-            T_IRIS_INDEX => {
+            T_IRIS_INDEX | T_INDEX => {
                 g.color = [num(b[0]) / 255.0, 0.0, 0.0, 1.0];
             }
             T_IRIS_CMOV => {
@@ -1242,11 +1277,21 @@ impl Hq2Engine {
                 out.shram(READBACK_SHRAM + 2, if g.cpos[2] != 0 { 0x8000_0000 } else { 0 });
             }
             T_GET_RASTERPOS => {
-                // Raster position is not tracked yet (unverified layout).
-                for k in 0..4 {
-                    out.shram(READBACK_SHRAM + k, 0);
+                // __glExpGetRasterPosData: the raster colour (the position
+                // is kept by libglcore).
+                let c = g.cpos_color;
+                for (k, v) in c.iter().enumerate() {
+                    out.shram(READBACK_SHRAM + k, v.to_bits());
                 }
             }
+            T_RASTER_POS => {
+                let wv = g.transform([f(a[0]), f(a[1]), f(a[2]), f(a[3])]);
+                let (rx, ry) = (wv.x - g.win[0] as f32, wv.y - g.win[1] as f32);
+                g.rpos = [rx, ry];
+                g.cpos = [rx.floor() as i32, ry.floor() as i32, (wv.ok == 0 || wv.oc != 0) as i32];
+                g.cpos_color = g.color;
+            }
+            T_BITMAP | T_BITMAP_TALL | T_BITMAP_HUGE => self.gl_bitmap(cmd, &a, out),
             T_FRAGMENT => {
                 let (x, y) = (a[0] as i32 - FRAGMENT_BIAS, a[1] as i32 - FRAGMENT_BIAS);
                 let c = [f(a[3]), f(a[4]), f(a[5]), f(a[6])];
@@ -1280,12 +1325,18 @@ impl Hq2Engine {
             }
             // Visual of the window being bound: 4 = 24-bit RGB, 2 = 12-bit
             // RGB, 10 = 12-bit colour index (showmap) (inferred from traces).
+            // Visual code from the kernel (inferred from 1, 2, 4, 9, 10 in
+            // traces and the DDX's matching 2D MODE numbers): bit 3 = colour
+            // index, low bits = depth (1 = 8, 2 = 12, 4 = 24 bits).
             T_MAKECURRENT => match a[0] {
                 4 => g.pixfmt = 0,
                 2 => g.pixfmt = re3::PIXFMT_RGB12,
+                1 => g.pixfmt = re3::PIXFMT_RGB8,
                 10 => g.pixfmt = re3::PIXFMT_CI12,
+                9 => g.pixfmt = re3::PIXFMT_CI8,
                 _ => {}
             },
+            T_CLEAR_CI => self.gl_clear([f(a[0]) / 255.0, 0.0, 0.0, 1.0], out),
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => {
                 let c = [f(a[0]), f(a[1]), f(a[2]), 1.0];
                 self.gl_clear(c, out);
@@ -1329,6 +1380,7 @@ impl Hq2Engine {
             T_VIEWPORT => format!("GL_VIEWPORT x {}..{} y {}..{} zscale {} zcenter {}", g.vp[0], g.vp[1], g.vp[2], g.vp[3], g.vp[4], g.vp[5]),
             T_SCISSOR => format!("GL_SCISSOR ({}, {})-({}, {})", g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]),
             T_SHADE_MODEL => format!("GL_SHADE_MODEL {}", if g.smooth != 0 { "smooth" } else { "flat" }),
+            T_CLEAR_CI => format!("GL_CLEAR index {} rect {:?}", f(a[0]), g.clip_rect()),
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => format!("GL_CLEAR rgb ({}, {}, {}) rect {:?}", f(a[0]), f(a[1]), f(a[2]), g.clip_rect()),
             c if c & LOADV != 0 => format!("GL vertex routine {:#x}", c & 0x1ff),
             c if BEGIN_TOKENS.contains(&c) || END_TOKENS.contains(&c) => super::index_label(c),
@@ -1345,6 +1397,11 @@ impl Hq2Engine {
             T_IRIS_GETCPOS => format!("IRISGL_GETCPOS -> ({}, {}){}", g.cpos[0], g.cpos[1], if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
+            T_RASTER_POS => format!("GL_RASTER_POS -> window ({:.2}, {:.2}){} colour ({:.3}, {:.3}, {:.3})",
+                g.rpos[0], g.rpos[1], if g.cpos[2] != 0 { " invalid" } else { "" },
+                g.cpos_color[0], g.cpos_color[1], g.cpos_color[2]),
+            T_BITMAP | T_BITMAP_TALL | T_BITMAP_HUGE => format!("GL_BITMAP {}x{} orig ({:.1}, {:.1}) move ({:.1}, {:.1}) -> raster ({:.2}, {:.2})",
+                a[0] >> 16, a[0] & 0xffff, f(a[1]), f(a[2]), f(a[3]), f(a[4]), g.rpos[0], g.rpos[1]),
             T_READ_SETUP_A | T_READ_SETUP_B => format!("GL_READ_SETUP {:#x} {:#x}", cmd, a[0]),
             T_READ_MODE => format!("GL_READ_MODE {}", a[0]),
             T_LOGIC_OP => format!("GL_LOGIC_OP {}", g.logic_op),
@@ -1372,6 +1429,8 @@ impl Hq2Engine {
             T_MAKECURRENT => format!("GL_MAKECURRENT mode {} -> {}", a[0], match g.pixfmt {
                 re3::PIXFMT_RGB12 => "RGB12",
                 re3::PIXFMT_CI12 => "CI12",
+                re3::PIXFMT_CI8 => "CI8",
+                re3::PIXFMT_RGB8 => "RGB8",
                 _ => "RGB24",
             }),
             _ => return None,
@@ -1574,6 +1633,42 @@ impl Hq2Engine {
     }
 
     /// One character bitmap (T_IRIS_CHAR*) at the character position.
+    /// glBitmap (0x18C / 0x18D; layout at T_BITMAP).
+    fn gl_bitmap(&mut self, cmd: u32, a: &[u32], out: &mut dyn Re3Sink) {
+        let g = &mut self.gl;
+        let (w, h) = ((a[0] >> 16) as i32, (a[0] & 0xffff) as i32);
+        let (xorig, yorig, xmove, ymove) = (f(a[1]), f(a[2]), f(a[3]), f(a[4]));
+        let (rx, ry, invalid) = (g.rpos[0], g.rpos[1], g.cpos[2]);
+        g.rpos = [rx + xmove, ry + ymove];
+        g.cpos[0] = g.rpos[0].floor() as i32;
+        g.cpos[1] = g.rpos[1].floor() as i32;
+        let block = match cmd { T_BITMAP_TALL => 17, T_BITMAP_HUGE => 33, _ => 9 };
+        let h = h.min(block);
+        if invalid != 0 || w <= 0 || h <= 0 {
+            return;
+        }
+        let rows = &a[BITMAP_HDR..BITMAP_HDR + block as usize];
+        let x0 = g.win[0] + (rx - xorig).floor() as i32;
+        let bottom = g.win[1] + (ry - yorig).floor() as i32;
+        let wmask = if w >= 32 { u32::MAX } else { !(u32::MAX >> w) };
+        let c = to_fixed(g.cpos_color, g.cmax());
+        self.gl_setup(out);
+        self.gl_color_regs(c, out);
+        for r in 0..h {
+            let bits = rows[r as usize] & wmask;
+            if bits == 0 {
+                continue;
+            }
+            let y = bottom + h - 1 - r;
+            let (pieces, np) = self.gl.span_pieces(y, x0, x0 + w);
+            for &(s, e) in &pieces[..np] {
+                let sh = (s - x0) as u32;
+                self.span(s, y, (e - s) as u32, Some(if sh >= 32 { 0 } else { bits << sh }), out);
+            }
+        }
+        self.gl_done(out);
+    }
+
     fn gl_glyph(&mut self, tok: u32, b: &[u32], out: &mut dyn Re3Sink) {
         let g = &mut self.gl;
         let hi = |w: u32| (w >> 16) as i16 as i32;
@@ -1636,7 +1731,7 @@ impl Hq2Engine {
             }
             if bits == 32 { words[wi] } else { (words[wi] >> (32 - bits * (1 + (n % per_word) as u32))) & ((1 << bits) - 1) }
         };
-        let ci = g.pixfmt == re3::PIXFMT_CI12 || bits < 32;
+        let ci = g.pixfmt == re3::PIXFMT_CI12 || g.pixfmt == re3::PIXFMT_CI8 || bits < 32;
         let colour = |v: u32| -> [f32; 4] {
             if ci {
                 [v as f32 / 255.0, 0.0, 0.0, 1.0]
