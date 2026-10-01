@@ -645,15 +645,29 @@ impl App {
                 self.emu.send(Cmd::Stop);
                 self.start_emulator();
             }
-            Action::ResetNvram => match settings::reset_nvram(&self.cfg.nvram) {
-                Ok(()) => {
-                    let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
-                    let mac = settings::generate_mac_bytes(seed);
-                    let _ = settings::write_nvram_mac(&self.cfg.nvram, mac);
-                    self.toast(format!("NVRAM reset \u{2014} new MAC {}", settings::mac_to_string(mac)));
+            Action::ResetNvram => {
+                // Indigo2/IP28 read eaddr and PROM env from the NVRAM EEPROM
+                // (nveeprom), not the DS1386 nvram file below \u{2014} see
+                // rules/irix/networking.md. Reset and re-MAC both, so this
+                // works regardless of machine profile. `toast` holds one
+                // message, so collect outcomes into a single final call.
+                let seed = self.prefs.active_machine.as_deref().unwrap_or("indy");
+                let mac = settings::generate_mac_bytes(seed);
+                let mut errors = Vec::new();
+                match settings::reset_nvram(&self.cfg.nvram) {
+                    Ok(()) => { let _ = settings::write_nvram_mac(&self.cfg.nvram, mac); }
+                    Err(e) => errors.push(format!("NVRAM reset failed: {e}")),
                 }
-                Err(e) => self.toast(format!("NVRAM reset failed: {e}")),
-            },
+                match settings::reset_nveeprom(&self.cfg.nveeprom) {
+                    Ok(()) => { let _ = settings::write_nveeprom_mac(&self.cfg.nveeprom, mac); }
+                    Err(e) => errors.push(format!("NVRAM EEPROM reset failed: {e}")),
+                }
+                self.toast(if errors.is_empty() {
+                    format!("NVRAM reset \u{2014} new MAC {}", settings::mac_to_string(mac))
+                } else {
+                    errors.join("; ")
+                });
+            }
             Action::SetCpu(c) => {
                 self.cfg.machine.cpu = c;
                 self.mark_dirty();
