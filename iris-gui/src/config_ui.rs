@@ -386,6 +386,14 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         path_row(ui, "nvram", &mut cfg.nvram, Pick::SaveFile, NVRAM_FILTERS);
         ui.end_row();
 
+        ui.label("NVRAM EEPROM file")
+            .on_hover_text(
+                "The motherboard EEPROM (93CS56) — Indigo2/IP28 read `eaddr` and PROM env \
+                 from here, not the NVRAM file above. Indy has no such chip.",
+            );
+        path_row(ui, "nveeprom", &mut cfg.nveeprom, Pick::SaveFile, NVRAM_FILTERS);
+        ui.end_row();
+
         ui.label("Serial log (ttyd1 -> file)");
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();

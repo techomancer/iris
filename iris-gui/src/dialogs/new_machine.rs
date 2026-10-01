@@ -17,6 +17,7 @@ pub struct NewMachineDialog {
     pub prom_path: String,
     pub use_embedded_prom: bool,
     pub nvram_path: String,
+    pub nveeprom_path: String,
     pub ram_total_mb: u32,
     /// If true the dialog exposes 4 per-bank selectors and ignores ram_total_mb.
     pub ram_advanced: bool,
@@ -44,6 +45,7 @@ impl Default for NewMachineDialog {
             prom_path: "prom.bin".into(),
             use_embedded_prom: true,
             nvram_path: crate::settings::GuiSettings::default_nvram_path(),
+            nveeprom_path: crate::settings::GuiSettings::default_nveeprom_path(),
             ram_total_mb: 256,
             ram_advanced: false,
             ram_banks: [128, 128, 0, 0],
@@ -186,6 +188,23 @@ impl NewMachineDialog {
                     });
                     ui.end_row();
 
+                    ui.label("NVRAM EEPROM file")
+                        .on_hover_text("Indigo2/IP28's motherboard EEPROM — eaddr and PROM env live here, not in NVRAM above.");
+                    ui.horizontal(|ui| {
+                        ui.add(TextEdit::singleline(&mut self.nveeprom_path).desired_width(260.0));
+                        if ui.button("📁").clicked() {
+                            if let Some(p) = crate::filedialog::dialog_with(
+                                "NVRAM EEPROM file", &self.nveeprom_path,
+                                crate::filedialog::Anchor::Data,
+                                crate::filedialog::Purpose::Save,
+                                &[("NVRAM EEPROM", &["bin"])]).save_file()
+                            {
+                                self.nveeprom_path = p.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    ui.end_row();
+
                     if !self.ram_advanced {
                         ui.label("Total RAM");
                         ComboBox::from_id_salt("ram_total")
@@ -308,6 +327,7 @@ impl NewMachineDialog {
                         // (the load path warns + falls back when the file is missing).
                         if cfg.prom.is_empty() { cfg.prom = "(embedded)".into(); }
                         cfg.nvram = self.nvram_path.clone();
+                        cfg.nveeprom = self.nveeprom_path.clone();
                         cfg.banks = if self.ram_advanced {
                             self.ram_banks
                         } else {

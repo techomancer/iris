@@ -7,6 +7,24 @@ the Release workflow when someone publishes one. This file is grouped by month,
 newest first, and within a month by area. Commit hashes are given where a change
 is easiest to understand by reading the commit.
 
+## October 2026
+
+### iris-gui
+
+- **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
+  (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
+  on those profiles, not in the NVRAM file) used to default to a bare
+  `"nveeprom.bin"` with no anchoring, no migration, and no config-editor field,
+  unlike `nvram`. Since iris-gui never changes its working directory, that bare
+  default resolved against whatever CWD the OS happened to launch it with —
+  often not the same place twice between `cargo run` and a bundled `.app` — so
+  a machine could silently load a different (usually blank) EEPROM each
+  launch, and "Reset NVRAM"'s MAC write (which only ever touched `nvram`) had
+  no effect on Indigo2/IP28's actual `eaddr`. Now: a stable
+  `<config dir>/iris/nveeprom.bin` default (`GuiSettings::default_nveeprom_path`),
+  the same relative-path migration `nvram` gets on load, and a "NVRAM EEPROM
+  file" row on the General tab right below NVRAM file.
+
 ## September 2026
 
 ### Graphics (REX3)

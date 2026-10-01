@@ -193,6 +193,10 @@ PCAP-mode NFS IP).
 - `<config dir>/iris/nvram.bin` — the default NVRAM path. It is absolute on
   purpose, so the NVRAM is the same however the app was launched; older relative
   `nvram.bin` entries are migrated.
+- `<config dir>/iris/nveeprom.bin` — the default NVRAM EEPROM path (Indigo2/IP28's
+  motherboard EEPROM, where `eaddr` and PROM env actually live on those profiles —
+  Indy has no such chip). Same absolute-path and migration treatment as `nvram.bin`
+  above. Editable on the General tab, right below NVRAM file.
 - `iris.toml` — the **standalone iris CLI's** config format. iris-gui
   treats it as *import/export only* via the File menu (hidden in `bundled`
   builds), so a machine configured in the GUI can still be booted with

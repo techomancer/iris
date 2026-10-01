@@ -198,6 +198,21 @@ impl GuiSettings {
             .unwrap_or_else(|| "nvram.bin".to_string())
     }
 
+    /// Default absolute NVRAM EEPROM path: `<data_dir>/nveeprom.bin`. Same
+    /// reasoning as [`default_nvram_path`] — the core default is a bare
+    /// `"nveeprom.bin"` (`src/config.rs::default_nveeprom`), which resolves
+    /// against the process's working directory and silently finds a
+    /// different (usually blank) file between `cargo run` and a bundled
+    /// `.app`. This is the motherboard EEPROM Indigo2/IP28 actually read
+    /// `eaddr` from (`Eeprom93c56`, see `rules/irix/networking.md`) — unlike
+    /// `nvram`, it has no per-machine PROM-env asset to seed, so there's no
+    /// `ensure_nveeprom_seeded` counterpart; it's fine starting blank.
+    pub fn default_nveeprom_path() -> String {
+        Self::data_dir()
+            .map(|d| d.join("nveeprom.bin").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "nveeprom.bin".to_string())
+    }
+
     /// Managed directory for newly-created disk images: `<data_dir>/disks`.
     /// Absolute and writable in every launch context — the OS maps it into the
     /// sandbox container on the App Store build, so creating a disk here needs
@@ -237,6 +252,32 @@ impl GuiSettings {
         *nvram = dst.to_string_lossy().into_owned();
     }
 
+    /// Same anchoring as [`migrate_nvram_path`], for the NVRAM EEPROM path.
+    /// The legacy default was a bare `"nveeprom.bin"`, which could be
+    /// anywhere depending on how iris-gui was launched (no `set_current_dir`
+    /// call of its own) — this was never anchored at all before, so most
+    /// existing machines will have nothing to find at the old relative path
+    /// and just start a fresh EEPROM at the new stable location, same as a
+    /// brand new machine would.
+    pub fn migrate_nveeprom_path(nveeprom: &mut String) {
+        if !nveeprom.is_empty() && Path::new(&nveeprom).is_absolute() {
+            return;
+        }
+        let Some(dir) = Self::data_dir() else { return; };
+        let _ = std::fs::create_dir_all(&dir);
+        let leaf = Path::new(nveeprom.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("nveeprom.bin");
+        let dst = dir.join(leaf);
+        let src = PathBuf::from(nveeprom.as_str()); // relative to cwd
+        if !dst.exists() && !nveeprom.is_empty() && src.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+        *nveeprom = dst.to_string_lossy().into_owned();
+    }
+
     pub fn load() -> Self {
         // Load from disk when present, else start from defaults — but ALWAYS
         // fall through to the sanitizer below. A missing or unreadable file used
@@ -268,6 +309,7 @@ impl GuiSettings {
         // next save).
         for m in s.machines.values_mut() {
             Self::migrate_nvram_path(&mut m.nvram);
+            Self::migrate_nveeprom_path(&mut m.nveeprom);
         }
         s
     }
