@@ -115,7 +115,7 @@ jobs:
 
       # One binary of each for every cell below — that is what makes the matrix
       # a differential test rather than N independent runs.
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: guest-elfs
           path: |
@@ -137,7 +137,7 @@ jobs:
           ./bench/build/irisbench-host | tee bench/build/host.log
       - name: The oracle must agree with itself
         run: grep -q 'IRIS-BENCH-DONE rc=0' bench/build/host.log
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-host-log
@@ -161,7 +161,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: guest-elfs
           path: .
@@ -353,7 +353,7 @@ jobs:
             echo "cpu-tests improved to $CPUTEST_FAILED (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: suites-${{ matrix.cpu }}-${{ matrix.engine }}
@@ -376,7 +376,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: suites-*
           path: artifacts
@@ -395,7 +395,7 @@ jobs:
           cargo build --release --bin iris-bench
           ./target/release/iris-bench report --format md > bench/build/report.md
           cat bench/build/report.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-report
           path: bench/build/report.md
