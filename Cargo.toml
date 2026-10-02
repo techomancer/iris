@@ -113,33 +113,6 @@ tlbcheck = []
 # jitv2::opcode_support depends on it unconditionally for its own
 # emitter-coverage gating. See mips_instr_stats.rs.
 instr_stats = []
-# MIPS IV ISA additions (MOVN/MOVZ, PREF, RECIP/RSQRT, MOVF/MOVT, COP1X,
-# MADD/MSUB/NMADD/NMSUB).
-#
-# VESTIGIAL as of 2026-09-22 — it no longer gates anything. ISA level is a
-# property of the CPU model, which is a *runtime* choice, so both engines now
-# read it from there: the interpreter from `C::MIPS4` directly, jitv2 from
-# `jitv2::isa`, which `MipsExecutor::new` publishes `C::MIPS4` into. Every
-# MIPS IV emitter is compiled into every build and selected at runtime.
-#
-# Until then this claimed to be a "decode gate" that made an R4400 raise
-# Reserved Instruction. It never did: 45 of its 47 cfg sites were inside
-# jitv2, the interpreter gated on `C::MIPS4` instead, and jitv2 read that
-# const zero times. One binary serves every model, so the two could only
-# agree by coincidence — a `mips4` build on an R4400 config had jitv2
-# executing MOVZ/COP1X where the interpreter trapped, and the reverse left an
-# R5000 without MIPS IV compilation unless the build said `mips4` (worth ~20%
-# of integer throughput, measured on our IP28 / R10000 machine, which comes
-# in a later pull request).
-#
-# Kept declared so existing build commands and `r5k = ["mips4"]` keep
-# working. All it does now is seed the runtime flag's initial value, for the
-# window before any CPU exists (unit tests that compile without constructing
-# an executor). Passing it or not makes no difference to a real run.
-mips4 = []
-# R5000 CPU: 2-way set-associative 32KB L1I/L1D (32B lines), non-inclusive cache hierarchy.
-# Switches PRID/FIR to R5000 values and selects 2-way L1 probe/fill paths.
-r5k = ["mips4"]
 # Secondary cache present. Without this flag the CPU reports SC=1 (no secondary cache)
 # and the L2 is bypassed entirely. Use alone for external R4600SC-style cache sized via
 # EEPROM, or together with r5ksc_triton for Triton on-die L2.
@@ -155,20 +128,15 @@ r5ksc_triton = ["r5ksc"]
 # in. OFF by default (the CPU thread spins) — opt in with --features idle-pause;
 # off keeps deterministic-clock and raw-benchmark builds simple.
 idle-pause = []
-# Host-MMU-backed physical paged memory (docs/ppmem-design.md). Replaces the
-# Vec<u32>-plus-addr_mask RAM banks in src/mem.rs with real host mappings, so
-# SIMM mirroring and the low-512KB alias are expressed as repeated mappings
-# instead of masking on every access. Experimental; `Memory` remains the
-# default and the fallback.
-ppmem = []
 # Transparent cache (docs/tcache-design.md): keep the whole cache tag/state
 # machine — line states, LRU, dirty bits, VCE, CACHE-instruction semantics —
 # but stop storing line *data* for cacheable RAM. Reads and writes go straight
 # through ppmem's window, so fills copy nothing and evictions write nothing
 # back. Decoded-instruction slots (L1I on R5000, L2 on R4400) are the deliberate
 # exception and are still filled — they cache work, not memory.
-# Requires ppmem for the window pointer + mapped-region bitmap. Experimental.
-tcache = ["ppmem"]
+# Always on with jitv2 (which implies it); can also be enabled alone for an
+# interpreter build. ppmem (docs/ppmem-design.md) is unconditional.
+tcache = []
 # tcache self-check: after every cacheable access, assert that ppmem's window is
 # authoritative for transparent addresses — no BACKED L1D line over a
 # transparent address, and no DIRTY L2 line whose data disagrees with RAM.
@@ -181,7 +149,7 @@ rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 # JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
 # Unconditionally-correct-at-publish redesign, replacing the speculative v1
 # tiered JIT. Built incrementally behind this flag; does not imply `jit`.
-jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
+jitv2 = ["tcache", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
 # jitv2 opcode fusion: LUI+ORI/ADDIU (32-bit immediate materialization) and
 # branch/jump+NOP delay-slot collapsing, jitv2's counterparts to the
 # interpreter's `opcodefusion` feature. OFF by default (unlike the
@@ -195,12 +163,6 @@ jitv2 = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-
 # specifically; opt in with --features jitv2_opcodefusion once it's earned
 # more confidence.
 jitv2_opcodefusion = ["jitv2"]
-# IP28: the Indigo2 IMPACT machine (IP28) and its R10000 CPU. Without it the
-# IP28 profile and the R10000 model are refused at startup with a message
-# naming this feature, and none of their code is built, so nothing behind it
-# can reach the R4400/R5000 machines. It implies ppmem: IP28 guest RAM is
-# always mapped through the host MMU. Add jitv2 for the JIT, as elsewhere.
-ip28 = ["ppmem"]
 # jitv2 whole-page compile (§13, rules/jitv2/jit-v2-design.md): whole-page
 # compilation is now the standard and only JIT v2 design. Kept as a compatibility
 # alias for `jitv2` so downstream scripts and builds specifying `--features j2wp`
@@ -238,18 +200,6 @@ jitv2_lockstep = ["jitv2", "developer"]
 # inline store fast path writes the L1-D array directly and never goes through
 # `write_data_impl`, so stores that take it are invisible to this check.
 jitv2_smc_check = ["jitv2"]
-# Use WindowEvent::CursorMoved for mouse motion instead of DeviceEvent::MouseMotion.
-# Useful for testing absolute cursor position tracking. May cause doubled moves on some platforms.
-# CHD disk image support (SCSI HDDs and CD-ROMs) via libchdman-rs.
-# Off by default — enable with `cargo build --features chd`.
-chd = ["dep:libchdman-rs"]
-# Live host camera capture as the VINO video source (phase 3 of IndyCam
-# emulation).  Platform backends:
-#   macOS   — nokhwa AVFoundation (dep:nokhwa)
-#   Linux   — v4l crate directly (dep:v4l); requires libv4l-dev at build time
-#   Windows — nokhwa MediaFoundation (dep:nokhwa)
-# Off by default — enable with `cargo build --features camera`.
-camera = ["dep:nokhwa", "dep:v4l"]
 # PCAP/bridged networking backend: instead of the built-in software NAT gateway,
 # bridge the guest's raw Ethernet frames onto a real host interface via libpcap.
 # Lets the guest appear as a real L2 host on the physical LAN. Requires a pcap
@@ -263,17 +213,6 @@ camera = ["dep:nokhwa", "dep:v4l"]
 # Off by default — enable with `cargo build --features pcap`. Select at runtime
 # with `[network] mode = "pcap"` in iris.toml.
 pcap = ["dep:pcap"]
-# N64 development board (Ultra64) — GIO slot 0 + shm IPC.
-ultra64 = ["dep:shared_memory", "dep:raw_sync"]
-# DaynaPort SCSI/Link target: a SCSI-attached Ethernet adapter (type 3
-# Processor device) selectable per SCSI id, giving the guest a second network
-# path that does not go through the onboard SEEQ. Needs a guest driver — see
-# github.com/techomancer/irixdayna for the IRIX one. Each target runs its own
-# NAT gateway (or PCAP bridge with --features pcap) on its own subnet.
-# Off by default — enable with `cargo build --features daynaport`, then select
-# it at runtime with `kind = "daynaport"` in an `[scsi.N]` section.
-daynaport = []
-
 # Host services for IRIX programs, reached through the private system calls
 # 3000-3009 (iris-hostcall/): the trap in `exec_syscall` and the self-test
 # service. The trap answers only user-mode `syscall`s outside a delay slot,
@@ -326,21 +265,21 @@ cranelift-native     = { version = "0.134", optional = true }
 target-lexicon       = { version = "0.13",  optional = true }
 region               = { version = "3.0",   optional = true }
 wasmtime-jit-icache-coherence = { version = "=47.0.3", optional = true, package = "wasmtime-internal-jit-icache-coherence" }
-libchdman-rs = { version = "0.289", features = ["prebuilt"], optional = true }
+libchdman-rs = { version = "0.289", features = ["prebuilt"] }
 pcap = { version = "2", optional = true }
-shared_memory = { version = "0.12", optional = true }
-raw_sync      = { version = "0.1",  optional = true }
+shared_memory = { version = "0.12" }
+raw_sync      = { version = "0.1" }
 iris-hostcall = { path = "iris-hostcall", optional = true }
 iris-hostgl = { path = "iris-hostgl", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
-nokhwa = { version = "0.10", features = ["input-avfoundation"], optional = true }
+nokhwa = { version = "0.10", features = ["input-avfoundation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nokhwa = { version = "0.10", optional = true }
-v4l    = { version = "0.14", features = ["v4l2-sys"], optional = true }
+nokhwa = { version = "0.10" }
+v4l    = { version = "0.14", features = ["v4l2-sys"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nokhwa = { version = "0.10", features = ["input-msmf"], optional = true }
+nokhwa = { version = "0.10", features = ["input-msmf"] }
 
 # ppmem's Windows backend (src/ppmem/map_windows.rs) additionally needs
 # Win32_System_Memory (VirtualAlloc2/MapViewOfFile3/UnmapViewOfFile2 placeholder
@@ -411,7 +350,6 @@ path = "src/bin/iris_bench.rs"
 [[bin]]
 name = "chd_extract"
 path = "src/bin/chd_extract.rs"
-required-features = ["chd"]
 
 [[bin]]
 name = "mkvh"

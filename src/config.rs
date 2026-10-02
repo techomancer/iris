@@ -401,10 +401,7 @@ pub enum MachineProfile {
 impl MachineProfile {
     /// All selectable profiles, in display order. Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
-    #[cfg(feature = "ip28")]
     pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
-    #[cfg(not(feature = "ip28"))]
-    pub const ALL: [Self; 2] = [Self::IndyIp24, Self::Indigo2Ip22];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -414,11 +411,6 @@ impl MachineProfile {
         }
     }
 
-    pub fn supported(self) -> bool {
-        matches!(self, Self::IndyIp24 | Self::Indigo2Ip22)
-            || (cfg!(feature = "ip28") && matches!(self, Self::Indigo2Ip28))
-    }
-
     /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
@@ -426,10 +418,8 @@ impl MachineProfile {
 
     /// The R10000 Indigo2. Selects the IP28 decodes inside the shared
     /// fullhouse devices — see the variant's own documentation for the list.
-    ///
-    /// Always false without the `ip28` feature, so every IP28 decode folds away.
     pub fn ip28(self) -> bool {
-        cfg!(feature = "ip28") && matches!(self, Self::Indigo2Ip28)
+        matches!(self, Self::Indigo2Ip28)
     }
 }
 
@@ -556,15 +546,8 @@ pub enum CpuModel {
 }
 
 impl CpuModel {
-    #[cfg(feature = "ip28")]
     pub const ALL: [Self; 3] = [Self::R4400, Self::R5000, Self::R10000];
-    #[cfg(not(feature = "ip28"))]
-    pub const ALL: [Self; 2] = [Self::R4400, Self::R5000];
 
-    /// Whether this build can run the model: the R10000 needs the `ip28` feature.
-    pub fn available(self) -> bool {
-        !matches!(self, Self::R10000) || cfg!(feature = "ip28")
-    }
     pub fn label(self) -> &'static str {
         match self {
             Self::R4400 => "MIPS R4400",
@@ -1118,7 +1101,6 @@ pub struct MachineConfig {
     pub rtc_offset: RtcOffset,
 
     /// N64 development board (Ultra64) — GIO slot 0 + shm IPC.
-    #[cfg(feature = "ultra64")]
     #[serde(default)]
     pub ultra64: Ultra64Config,
 }
@@ -1229,7 +1211,6 @@ impl Default for MachineConfig {
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
-            #[cfg(feature = "ultra64")]
             ultra64: Ultra64Config::default(),
         }
     }
@@ -1271,18 +1252,6 @@ impl MachineConfig {
 
     /// Validate bank sizes, returns a description of any errors.
     pub fn validate(&self) -> Result<(), String> {
-        if (self.machine.profile == MachineProfile::Indigo2Ip28 && !cfg!(feature = "ip28"))
-            || !self.machine.cpu.available()
-        {
-            return Err("IP28 / R10000 support is not built into this binary; rebuild with --features ip28".to_string());
-        }
-        if !self.machine.profile.supported() {
-            return Err(format!(
-                "machine profile \"{}\" is not implemented; use {}",
-                self.machine.profile.label(),
-                MachineProfile::IndyIp24.label(),
-            ));
-        }
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
                 "graphics.heads {} is invalid (valid: 1, 2)",
@@ -1888,7 +1857,6 @@ mod export_tests {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
         cfg.validate().expect("indigo2_ip22 should validate on default build");
-        assert!(cfg.machine.profile.supported());
         assert!(!cfg.machine.profile.guinness());
     }
 
@@ -1899,7 +1867,6 @@ mod export_tests {
         cfg.banks = [256, 128, 0, 0];
         let err = cfg.validate().expect_err("the IP22 MC cannot express a 256 MB bank");
         assert!(err.contains("256 MB"), "{err}");
-        #[cfg(feature = "ip28")]
         {
             cfg.machine.profile = MachineProfile::Indigo2Ip28;
             cfg.machine.cpu = CpuModel::R10000;

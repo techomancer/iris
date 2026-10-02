@@ -31,7 +31,6 @@ use crate::mips_tlb::MipsTlb;
 use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
 use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-#[cfg(feature = "ip28")]
 use crate::mips_cache_shadow::R10000ShadowCache;
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
@@ -229,8 +228,7 @@ pub(crate) struct LiveCheckpoint {
 /// (`iris-gui`'s worker wraps construction in `catch_unwind`) — killing the
 /// application over a configuration mistake is not a choice a library gets to
 /// make for its caller.
-fn check_testdev_slot_free(#[cfg(feature = "ultra64")] ultra64_present: bool) {
-    #[cfg(feature = "ultra64")]
+fn check_testdev_slot_free(ultra64_present: bool) {
     if ultra64_present {
         panic!("--test-device and the ultra64 dev board both claim GIO slot 0");
     }
@@ -269,20 +267,6 @@ impl Machine {
         let clock_fixed_mhz = cfg.clock.fixed_mhz;
         let cfg_cpu_model = cfg.machine.cpu;
 
-        if (cfg.machine.profile == MachineProfile::Indigo2Ip28 && !cfg!(feature = "ip28"))
-            || !cfg_cpu_model.available()
-        {
-            eprintln!("iris: IP28 / R10000 support is not built into this binary; rebuild with --features ip28");
-            std::process::exit(1);
-        }
-        if !cfg.machine.profile.supported() {
-            eprintln!(
-                "iris: machine profile \"{}\" is not implemented; use {}",
-                cfg.machine.profile.label(),
-                MachineProfile::IndyIp24.label(),
-            );
-            std::process::exit(1);
-        }
         let guinness = cfg.machine.profile.guinness();
 
         // 0. EEPROMs. Real IP22 hardware has two distinct 93-series serial
@@ -302,10 +286,7 @@ impl Machine {
         let model_has_l2 = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
-            #[cfg(feature = "ip28")]
             crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
-            #[cfg(not(feature = "ip28"))]
-            crate::config::CpuModel::R10000 => unreachable!("refused above without the ip28 feature"),
         };
         if !model_has_l2 {
             eeprom_mc.lock().set_cachsz(0);
@@ -627,7 +608,6 @@ impl Machine {
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
-        #[cfg(feature = "ultra64")]
         let ultra64: Option<Arc<crate::ultra64::Ultra64>> = if cfg.ultra64.enabled {
             match crate::ultra64::Ultra64::new(ioc.clone()) {
                 Ok(dev) => Some(Arc::new(dev)),
@@ -660,13 +640,11 @@ impl Machine {
         // alongside the ultra64 dev board, which claims the same GIO slot.
         let testdev = if let Some(dev) = testdev_override {
             check_testdev_slot_free(
-                #[cfg(feature = "ultra64")]
                 ultra64.is_some(),
             );
             Some(dev)
         } else if cfg.test_device {
             check_testdev_slot_free(
-                #[cfg(feature = "ultra64")]
                 ultra64.is_some(),
             );
             let path = cfg.test_device_dump.clone()
@@ -684,7 +662,6 @@ impl Machine {
             rex3_head1.clone(),
             gr2.clone(),
             mgras.clone(),
-            #[cfg(feature = "ultra64")]
             ultra64,
             testdev,
             vino,
@@ -744,7 +721,6 @@ impl Machine {
         };
         let source: Option<Arc<dyn crate::video_source::VideoSource>> = match cfg.vino.source {
             crate::config::VinoSource::Camera => {
-                #[cfg(feature = "camera")]
                 {
                     let idx = cfg.vino.camera_index;
                     match crate::camera::CameraSource::new_with_index(standard, idx) {
@@ -754,11 +730,6 @@ impl Machine {
                             Some(Arc::new(crate::video_source::BlackSource::new(standard)))
                         }
                     }
-                }
-                #[cfg(not(feature = "camera"))]
-                {
-                    eprintln!("VINO: source=\"camera\" set but iris was built without --features camera; using test pattern");
-                    Some(Arc::new(crate::video_source::TestPatternSource::new(standard)))
                 }
             }
             crate::config::VinoSource::TestPattern =>
@@ -829,10 +800,7 @@ impl Machine {
             // IP28 uses the shadow cache: out of the data path entirely, with
             // tag and data arrays that exist only to answer CACHE ops and the
             // PROM's diagnostics. See mips_cache_shadow.rs.
-            #[cfg(feature = "ip28")]
             crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
-            #[cfg(not(feature = "ip28"))]
-            crate::config::CpuModel::R10000 => unreachable!("refused above without the ip28 feature"),
         };
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
@@ -848,7 +816,6 @@ impl Machine {
         // MEMCFG remap publishes straight into the object the CPU executes out
         // of. Safe per `set_bitmap_sink`: the executor is at its final address
         // by now and the only writer is this same CPU thread's MEMCFG path.
-        #[cfg(feature = "ppmem")]
         {
             use crate::ppmem::MappedMemory;
             if let Some(sp) = phys.ppmem_space() {
@@ -958,7 +925,6 @@ impl Machine {
         if let Some(td) = &phys.testdev { monitor.register_device(td.clone()); }
         if let Some(gr2) = &phys.gr2 { monitor.register_device(gr2.clone()); }
         if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
-        #[cfg(feature = "ultra64")]
         if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
         monitor.register_device(Arc::new(phys.vino.clone()));
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
@@ -1075,7 +1041,6 @@ impl Machine {
         if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
         if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
-        #[cfg(feature = "ultra64")]
         if let Some(u64) = &self._phys.ultra64 { u64.start(); }
 
         // Monitor server on localhost:8888 — always start, even in CI mode,
@@ -1166,7 +1131,6 @@ impl Machine {
         if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
         self.hpc3.stop();
         self.mc.stop();
-        #[cfg(feature = "ultra64")]
         if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
     }
 
@@ -1987,7 +1951,10 @@ impl Machine {
                 } else {
                     // Build features must match exactly.
                     let cur_features = enabled_features();
-                    if !m.features.is_empty() && m.features != cur_features {
+                    let snap_features: Vec<String> = m.features.iter()
+                        .filter(|f| !crate::snapshot::RETIRED_FEATURES.contains(&f.as_str()))
+                        .cloned().collect();
+                    if !m.features.is_empty() && snap_features != cur_features {
                         fatal.push(format!(
                             "build features differ: snapshot [{}] vs current [{}]",
                             m.features.join(","), cur_features.join(",")

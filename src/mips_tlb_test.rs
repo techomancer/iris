@@ -451,14 +451,12 @@ mod tests {
 /// it reported was that write being dropped.
 #[test]
 fn tlb_size_follows_the_cpu_model() {
-    #[cfg(feature = "ip28")]
     use crate::mips_cache_shadow::R10000ShadowCache;
     use crate::mips_cache_v2::{R4400Cache, R5000Cache};
     use crate::mips_exec::MipsCpuConfig;
 
     assert_eq!(MipsCpuConfig::for_model::<R4400Cache>().tlb_entries, 48);
     assert_eq!(MipsCpuConfig::for_model::<R5000Cache>().tlb_entries, 48);
-    #[cfg(feature = "ip28")]
     assert_eq!(MipsCpuConfig::for_model::<R10000ShadowCache>().tlb_entries, 64);
 }
 

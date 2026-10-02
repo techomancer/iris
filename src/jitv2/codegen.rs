@@ -3805,13 +3805,8 @@ pub static INLINE_MEM_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// Offsets of the inline load/store fast-path pointers in `MipsCore`.
 fn core_offset_of_jit_dc_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_tags) as i32 }
 fn core_offset_of_jit_dc_lru() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_lru) as i32 }
-#[cfg(not(feature = "tcache"))]
-fn core_offset_of_jit_dc_data() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_data) as i32 }
-#[cfg(feature = "tcache")]
 fn core_offset_of_jit_tc_base() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_base) as i32 }
-#[cfg(feature = "tcache")]
 fn core_offset_of_jit_tc_gen() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_gen) as i32 }
-#[cfg(feature = "tcache")]
 fn core_offset_of_jit_l2_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_l2_tags) as i32 }
 
 /// Byte offset of `L1DTag::ptag` / `::dirty`, and the tag stride. Taken with
@@ -3866,10 +3861,6 @@ fn emit_inline_mem_guard<const STORE: bool>(
         return None;
     }
     // A tagless cache has an inline path only through tcache's window.
-    #[cfg(not(feature = "tcache"))]
-    if geom.tagless {
-        return None;
-    }
 
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
@@ -3960,7 +3951,6 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let va_off = ctx.builder.ins().band_imm_s(vaddr, 0xFFF);
     let phys = ctx.builder.ins().bor(phys_page, va_off);
 
-    #[cfg(feature = "tcache")]
     if geom.tagless {
         return Some(emit_tagless_tail(ctx, phys, size, fast_block, slow_block, join_block));
     }
@@ -4030,7 +4020,6 @@ fn emit_inline_mem_guard<const STORE: bool>(
     // core: ppmem publishes the same bits there and into the cache's own
     // copy in one statement on every remap, so it needs no pointer, no null
     // check and no second load.
-    #[cfg(feature = "tcache")]
     let proceed = {
         let mapped = emit_tc_mapped(ctx, phys);
         ctx.builder.ins().band(proceed, mapped)
@@ -4045,30 +4034,10 @@ fn emit_inline_mem_guard<const STORE: bool>(
     // tcache reads/writes the ppmem window byte-indexed by phys; without it
     // the L1-D line itself holds the data, virtually indexed. The swizzles
     // differ because the base units differ (docs/jit-inline-memory.md §2.2).
-    #[cfg(feature = "tcache")]
     let (base, index) = {
         let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
             ir::immediates::Offset32::new(core_offset_of_jit_tc_base()));
         (base, phys)
-    };
-    #[cfg(not(feature = "tcache"))]
-    let (base, index) = {
-        let base = ctx.builder.ins().load(ptr_ty, mem, ctx.core_ptr,
-            ir::immediates::Offset32::new(core_offset_of_jit_dc_data()));
-        // `dc_data_addr(dc_ext_idx, vaddr)`:
-        //     (dc_ext_idx << line_shift) | (vaddr & line_mask)
-        // For 1-way this is exactly `vaddr & data_mask` (the index came from
-        // those same VA bits), which is what the original emitted. For 2-way
-        // it is NOT — way1's data lives in the upper half of the array, and
-        // only the extended index carries that bit. Computing it from
-        // `dc_idx` is correct for both, so there is one form here rather than
-        // a branch.
-        let line_mask = ((1i64 << geom.line_shift) - 1) & geom.data_mask as i64;
-        let line_base = ctx.builder.ins().ishl_imm_s(dc_idx, geom.line_shift as i64);
-        let off_in_line = ctx.builder.ins().band_imm_s(vaddr, line_mask);
-        let addr = ctx.builder.ins().bor(line_base, off_in_line);
-        let masked = ctx.builder.ins().band_imm_s(addr, geom.data_mask as i64);
-        (base, masked)
     };
 
     // ---- 2-way: hit-side LRU update ----------------------------------
@@ -4121,7 +4090,6 @@ fn emit_inline_mem_guard<const STORE: bool>(
 /// One load: the bitmap is the core's own `ppmem_bitmap` field. Reaching it
 /// through a pointer to the cache's copy put a second, dependent load on
 /// every guest load and store.
-#[cfg(feature = "tcache")]
 fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
@@ -4155,7 +4123,6 @@ fn emit_tc_mapped(ctx: &mut EmitCtx, phys: Value) -> Value {
 /// `phys` is cut to 32 bits first, as the callout does: the shadow cache
 /// hands `phys as u32` to the bus, so an address above 4GB aliases here
 /// exactly as it does there.
-#[cfg(feature = "tcache")]
 fn emit_tagless_tail(
     ctx: &mut EmitCtx, phys: Value, size: MemSize,
     fast_block: ir::Block, slow_block: ir::Block, join_block: ir::Block,
@@ -4203,10 +4170,7 @@ fn emit_swizzle_index(ctx: &mut EmitCtx, index: Value, size: MemSize) -> Value {
 /// corrupts only sub-word accesses, which is why every size has a lockstep
 /// test rather than being assumed from the 32-bit case.
 fn swizzle_xor(size: MemSize) -> i64 {
-    #[cfg(not(feature = "tcache"))]
-    { match size { MemSize::B8 => 0, MemSize::B4 => 4, MemSize::B2 => 6, MemSize::B1 => 7 } }
-    #[cfg(feature = "tcache")]
-    { match size { MemSize::B8 => 0, MemSize::B4 => 0, MemSize::B2 => 2, MemSize::B1 => 3 } }
+    match size { MemSize::B8 => 0, MemSize::B4 => 0, MemSize::B2 => 2, MemSize::B1 => 3 }
 }
 
 impl<'a, 'b> EmitCtx<'a, 'b> {
@@ -4301,10 +4265,7 @@ fn emit_mem_read_split(
     let raw = if size == MemSize::B8 {
         // tcache's window stores doublewords word-swapped; the cache data
         // array does not (see tc_read vs dc_read).
-        #[cfg(feature = "tcache")]
-        { ctx.builder.ins().rotl_imm_s(raw, 32) }
-        #[cfg(not(feature = "tcache"))]
-        { raw }
+        ctx.builder.ins().rotl_imm_s(raw, 32)
     } else if extend == LoadExtend::Sign {
         ctx.builder.ins().sextend(i64t, raw)
     } else {
@@ -4650,10 +4611,7 @@ fn emit_mem_write_split(
         // applies `val.rotate_left(32)` on the way in — exactly mirroring the
         // rotate `tc_read` applies on the way out. The cache data array
         // (`dc_write`) stores them natively and needs no rotate.
-        #[cfg(feature = "tcache")]
-        { ctx.builder.ins().rotl_imm_s(value, 32) }
-        #[cfg(not(feature = "tcache"))]
-        { value }
+        ctx.builder.ins().rotl_imm_s(value, 32)
     } else {
         ctx.builder.ins().ireduce(size.ir_type(), value)
     };
@@ -4679,7 +4637,6 @@ fn emit_mem_write_split(
     // Any change to `MipsCache::write`'s hit path must be mirrored here.
     // tcache: bump the per-page jitv2 generation, exactly as `tc_bump_gen`
     // does — `gen[phys >> 12] += 1`. Relaxed ordering matches the Rust side.
-    #[cfg(feature = "tcache")]
     {
         let ptr_ty = ctx.module.target_config().pointer_type();
         // No null check: `jit_tc_gen` is published by

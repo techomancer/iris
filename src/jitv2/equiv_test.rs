@@ -25,12 +25,8 @@ mod tests {
     // every MIPS IV opcode the JIT happily compiles (MOVN/MOVZ/MOVCI/PREF/
     // MOVCF) is rejected by the interpreter with EXC_RI and every such
     // equivalence test "diverges" for a reason that has nothing to do with the
-    // JIT. Gated on `mips4` rather than `r5k` because `r5k = ["mips4"]` and
-    // `mips4` is the flag that actually selects the ISA level.
-    #[cfg(feature = "mips4")]
+    // JIT.
     use crate::mips_cache_v2::PassthroughCacheM4 as PassthroughCache;
-    #[cfg(not(feature = "mips4"))]
-    use crate::mips_cache_v2::PassthroughCache;
     use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BUS_BUSY};
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
@@ -4540,7 +4536,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn movz_matches_interpreter_taken_and_not_taken() {
         let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_MOVZ);
         for rt in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF] {
@@ -4553,7 +4548,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn movn_matches_interpreter_taken_and_not_taken() {
         let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_MOVN);
         for rt in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF] {
@@ -4566,7 +4560,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn movz_writing_r0_is_a_noop() {
         let mut gpr = [0u64; 32];
         gpr[1] = 5;
@@ -4576,7 +4569,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn movci_matches_interpreter_across_all_cc_and_tf_combinations() {
         // `cu1` is swept, not fixed, because MOVF/MOVT take Coprocessor
         // Unusable when CU1 is clear (they read FCSR's condition codes -
@@ -4655,7 +4647,6 @@ mod tests {
     /// of a GPR write, and exercised across both FR modes since fs/fd
     /// register addressing differs between them (see `emit_read_fpr_l`/
     /// `emit_write_fpr_l`'s FrMode handling).
-    #[cfg(feature = "mips4")]
     fn fmovcf_case(fmt: u32, fr1: bool) {
         for cc in 0u32..8 {
             for tf in [false, true] {
@@ -4704,14 +4695,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn fmovcf_s_matches_interpreter_across_all_cc_and_tf_combinations() {
         fmovcf_case(crate::mips_isa::RS_S, false);
         fmovcf_case(crate::mips_isa::RS_S, true);
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn fmovcf_d_matches_interpreter_across_all_cc_and_tf_combinations() {
         fmovcf_case(crate::mips_isa::RS_D, false);
         fmovcf_case(crate::mips_isa::RS_D, true);
@@ -4842,7 +4831,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn pref_is_a_true_noop_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
@@ -5818,7 +5806,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn fmovz_fmovn_matches_interpreter_fr0_and_fr1() {
         for fr1 in [false, true] {
             for taken in [false, true] {
@@ -5854,7 +5841,6 @@ mod tests {
     /// COP1X field layout is not COP1's: fr=rs, ft=rt, fs=rd, fd=sa, and the
     /// result is fd = ±(fs*ft ± fr).
     #[test]
-    #[cfg(feature = "mips4")]
     fn madd_family_matches_interpreter_fr0_and_fr1() {
         use crate::mips_isa::{OP_COP1X, FUNCT_MADD_S, FUNCT_MADD_D, FUNCT_MSUB_S,
                               FUNCT_MSUB_D, FUNCT_NMADD_S, FUNCT_NMADD_D,
@@ -5905,7 +5891,6 @@ mod tests {
     /// which is MIPS IV's answer. A single-rounding FMA keeps the residual and
     /// yields `5.551115123125783e-17`.
     #[test]
-    #[cfg(feature = "mips4")]
     fn madd_d_rounds_the_product_first() {
         use crate::mips_isa::{OP_COP1X, FUNCT_MADD_D};
         let mut fpr = [0u64; 32];
@@ -5927,7 +5912,6 @@ mod tests {
     /// RECIP/RSQRT, including the operands that drive their flag paths:
     /// zero (divide-by-zero), negative (Invalid for RSQRT), and sNaN.
     #[test]
-    #[cfg(feature = "mips4")]
     fn recip_rsqrt_matches_interpreter_fr0_and_fr1() {
         use crate::mips_isa::{OP_COP1, RS_S, RS_D, FUNCT_FRECIP, FUNCT_FRSQRT};
         for fr1 in [false, true] {
@@ -5956,7 +5940,6 @@ mod tests {
     /// The emitter is empty, so this is really asserting that "empty" is the
     /// same as what `exec_prefx` does.
     #[test]
-    #[cfg(feature = "mips4")]
     fn prefx_matches_interpreter_and_changes_nothing() {
         use crate::mips_isa::{OP_COP1X, FUNCT_PREFX};
         let mut gpr = [0u64; 32];
@@ -5971,7 +5954,6 @@ mod tests {
 
 
     #[test]
-    #[cfg(feature = "mips4")]
     fn cop1x_indexed_load_store_matches_interpreter() {
         for fr1 in [false, true] {
             let mut gpr = [0u64; 32];

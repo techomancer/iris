@@ -154,11 +154,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
             arch: x64
             runs-on: windows-latest
-            cli_features: "chd,camera,rex-jit,lightning"
+            cli_features: "rex-jit,lightning"
           - target: aarch64-pc-windows-msvc
             arch: arm64
             runs-on: windows-11-arm
-            cli_features: "chd,camera,rex-jit,lightning"
+            cli_features: "rex-jit,lightning"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -322,8 +322,8 @@ jobs:
       - name: Build all binaries
         run: |
           cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
-          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
-          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
+          cargo build --release --bin iris --target ${{ matrix.target }} --features rex-jit,lightning
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features rex-jit,lightning
 
       # ── Code signing setup ──────────────────────────────────────────────────
 
@@ -745,8 +745,8 @@ jobs:
 
       - name: Build iris CLI and iris-ci
         run: |
-          cargo build --release --bin iris --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
-          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features chd,camera,rex-jit,lightning
+          cargo build --release --bin iris --target ${{ matrix.target }} --features rex-jit,lightning
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features rex-jit,lightning
 
       - name: Package Core tarball
         run: |
@@ -871,8 +871,8 @@ jobs:
       - name: Build iris CLI + iris-ci (cross)
         run: |
           set -eux
-          cargo build --release --bin iris --target "$TARGET" --features chd,camera,rex-jit,lightning
-          cargo build --release --bin iris-ci --target "$TARGET" --features chd,camera,rex-jit,lightning
+          cargo build --release --bin iris --target "$TARGET" --features rex-jit,lightning
+          cargo build --release --bin iris-ci --target "$TARGET" --features rex-jit,lightning
 
       # The release profile keeps debug info (debug = 1) and the host `strip`
       # can't read a riscv64 ELF, so strip iris-gui with the cross strip here and
@@ -1097,7 +1097,7 @@ jobs:
 
           <sub>**Windows:** x64 + arm64 (32-bit Windows is not shipped). **macOS:** requires 10.13 High Sierra or later. **Linux packages:** deb = Debian/Ubuntu, rpm = Fedora/RHEL/openSUSE, pkg = Arch/Manjaro; built against glibc 2.39 (Ubuntu 24.04). **AppImage** is self-contained and runs on most distributions. **† riscv64** is cross-compiled and shipped as deb/rpm/tarball (no AppImage), using the system GTK3/GL at runtime; built against glibc 2.35. **All binaries** include \`libchdman-rs\` and are **BSD 3-Clause** licensed.</sub>
 
-          <sub>**Building other configurations:** PCAP bridged networking (\`--features pcap\`), the experimental JIT v2 engine (\`--features jitv2\`), the N64 development board (\`--features ultra64\`), and the \`chd_extract\` tool are all still in the tree — they are just not part of the release matrix. See \`README.md\`.</sub>
+          <sub>**Building other configurations:** PCAP bridged networking (\`--features pcap\`), the experimental JIT v2 engine (\`--features jitv2\`) and the \`chd_extract\` tool are both still in the tree — they are just not part of the release matrix. See \`README.md\`.</sub>
 
           ---
           EOF

@@ -312,7 +312,6 @@ struct App {
     /// Whether the "Mount the shared folder in IRIX" Help window is open.
     show_nfs_help: bool,
     /// Whether the "N64 development board (Ultra64)" Help window is open.
-    #[cfg(feature = "ultra64")]
     show_ultra64_help: bool,
     /// Whether the License / Privacy Help windows are open.
     show_license: bool,
@@ -548,7 +547,6 @@ impl App {
             serial_input: String::new(),
             show_help_info: false,
             show_nfs_help: false,
-            #[cfg(feature = "ultra64")]
             show_ultra64_help: false,
             show_license: false,
             show_privacy: false,
@@ -1541,11 +1539,10 @@ impl App {
                     self.show_nfs_help = true;
                     ui.close();
                 }
-                // N64 dev board getting-started guide. Only in builds that carry
-                // the board (source builds with --features ultra64), and never in
-                // App Store builds, where it can't run anyway (sandbox blocks the
-                // POSIX shm bridge and there's no way to run the external gopher64).
-                #[cfg(all(feature = "ultra64", not(feature = "appstore")))]
+                // N64 dev board getting-started guide. Never in App Store
+                // builds, where it can't run anyway (sandbox blocks the POSIX
+                // shm bridge and there's no way to run the external gopher64).
+                #[cfg(not(feature = "appstore"))]
                 if ui.button("🎮 N64 development board (Ultra64)…")
                     .on_hover_text("How to set up the N64 devkit and run ROMs with gload")
                     .clicked()
@@ -1582,8 +1579,6 @@ impl App {
                 ui.separator();
                 ui.label(RichText::new("Build features:").strong());
                 use iris::build_features as bf;
-                ui.label(format!("  chd:       {}", if bf::CHD { "on" } else { "off" }));
-                ui.label(format!("  camera:    {}", if bf::CAMERA { "on" } else { "off" }));
                 // rex-jit is a compile-time feature, but the sandbox (App
                 // Store) build forces interpreter-only at runtime via IRIS_NO_JIT
                 // (Cranelift's non-MAP_JIT pages get killed under the sandbox).
@@ -1593,10 +1588,6 @@ impl App {
                 let jit_state = |feat: bool| if !feat { "off" } else if jit_off { "off (sandbox)" } else { "on" };
                 ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
-                // ultra64 (N64 dev board) is a source-build opt-in; shipped builds
-                // don't carry it, and the App Store sandbox couldn't open its
-                // POSIX shm bridge even if they did.
-                ui.label(format!("  ultra64:   {}", if bf::ULTRA64 { "on" } else { "off" }));
             });
         });
     }
@@ -2607,10 +2598,8 @@ impl App {
         const LICENSE_BSD: &str = include_str!("../../LICENSE");
         // The CHD backend (libchdman-rs >= 0.288.8) is BSD-3-Clause, as is the
         // MAME CHD core it vendors, so a CHD build stays fully BSD-3-Clause.
-        // Shown only when CHD support is actually built in.
         const LICENSE_CHD: &str = include_str!("../../LICENSE-libchdman-rs.txt");
         if !self.show_license { return; }
-        let chd = iris::build_features::CHD;
         let mut open = true;
         egui::Window::new("License")
             .open(&mut open)
@@ -2620,33 +2609,27 @@ impl App {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.label("IRIS itself is licensed under the BSD 3-Clause License.");
-                if chd {
-                    ui.label(
-                        "This build includes CHD disk support via libchdman-rs, which is licensed \
-                         under the BSD 3-Clause License (as is the MAME CHD core it vendors), so \
-                         the whole binary stays BSD 3-Clause. Its notice is shown below.");
-                }
+                ui.label(
+                    "This build includes CHD disk support via libchdman-rs, which is licensed \
+                     under the BSD 3-Clause License (as is the MAME CHD core it vendors), so \
+                     the whole binary stays BSD 3-Clause. Its notice is shown below.");
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("Source:");
                     ui.hyperlink_to("danifunker/iris", "https://github.com/danifunker/iris");
-                    if chd {
-                        ui.label("·");
-                        ui.hyperlink_to("libchdman-rs", "https://crates.io/crates/libchdman-rs");
-                    }
+                    ui.label("·");
+                    ui.hyperlink_to("libchdman-rs", "https://crates.io/crates/libchdman-rs");
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.label(RichText::new("IRIS — BSD 3-Clause License").strong());
                     ui.add_space(2.0);
                     ui.label(RichText::new(LICENSE_BSD).monospace());
-                    if chd {
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.label(RichText::new("CHD backend (libchdman-rs) — BSD 3-Clause").strong());
-                        ui.add_space(2.0);
-                        ui.label(RichText::new(LICENSE_CHD).monospace());
-                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(RichText::new("CHD backend (libchdman-rs) — BSD 3-Clause").strong());
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(LICENSE_CHD).monospace());
                 });
             });
         if !open { self.show_license = false; }
@@ -2922,7 +2905,6 @@ impl App {
     /// bridge); the N64 itself is the external gopher64 fork, so the guide is
     /// mostly about wiring the two processes together. Never reachable in App
     /// Store builds (the menu item that opens it is compiled out there).
-    #[cfg(feature = "ultra64")]
     fn ultra64_help_window(&mut self, ctx: &egui::Context) {
         if !self.show_ultra64_help {
             return;
@@ -3453,7 +3435,6 @@ impl eframe::App for App {
         self.nfs_help_window(ctx);
 
         // Help → "N64 development board (Ultra64)" — devkit getting-started guide.
-        #[cfg(feature = "ultra64")]
         self.ultra64_help_window(ctx);
 
         // "Synchronizing disks…" modal during the exit-time CHD fold-back.

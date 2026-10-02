@@ -2,10 +2,10 @@
 
 Addresses `cpucritique2.md` JIT-B.
 
-> Since the CPU model became a runtime setting (August 2026) the interpreter's
-> MIPS IV decode follows the CPU model, not a feature. `mips4` still decides
-> whether jitv2 *emits* MIPS IV opcodes, which is the part this note is about;
-> `r5k` is vestigial.
+> The `mips4` and `r5k` features are gone (October 2026). Both engines take
+> MIPS IV from the CPU model at runtime, and `equiv_test` always uses
+> `PassthroughCacheM4` as its reference. The history below still explains why
+> the two must match.
 
 ## Symptom
 

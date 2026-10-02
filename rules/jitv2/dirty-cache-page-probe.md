@@ -1,5 +1,11 @@
 # jitv2: the dirty-cache blind spot, and the probe that closes it
 
+> **Retired (October 2026).** `jitv2` now implies `tcache`, which closes this
+> hole by construction, so the probe and everything below it were deleted.
+> Kept for the history. The "tcache costs 10–20%" figure below is stale:
+> tcache is what the jitv2 inline-memory work builds on and is a large net win
+> with the JIT. It is only left off for interpreter-only builds.
+
 ## The hole
 
 The jitv2 compile worker builds a region from a 4KB page snapshot it reads

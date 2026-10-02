@@ -1,8 +1,9 @@
 # ppmem — host-MMU-backed physical paged memory
 
-Status: **implemented behind `--features ppmem`** (August 2026, `src/ppmem/`,
-with Unix and Windows mapping backends). `Memory` (`Vec<u32>`) remains the
-default. `tcache` builds on it (`docs/tcache-design.md`). The rest of this
+Status: **implemented and always on** (August 2026, `src/ppmem/`, with Unix
+and Windows mapping backends; the `ppmem` feature was retired in October 2026).
+RAM banks are `PpMemory`; `Memory` (`Vec<u32>`) survives only as a test/bus
+fixture. `tcache` builds on it (`docs/tcache-design.md`). The rest of this
 document is the design as proposed; the original status was: design draft for
 discussion, no implementation yet. Companion note
 with the verified platform findings: `rules/build/mmap-rs-fixed-address-aliasing.md`.

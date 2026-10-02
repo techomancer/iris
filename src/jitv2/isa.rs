@@ -28,7 +28,8 @@
 //!
 //! What remains here is the **default** for the things that have no CPU to
 //! ask: `Analyzer::new()`, `CompileQueue::new()`, and the offline tools that
-//! replay a recorded trace. The `mips4` cargo feature seeds it.
+//! replay a recorded trace. That default is MIPS IV: only a MIPS III model
+//! (the R4400) turns it off.
 //!
 //! This replaced a process-global that `MipsExecutor::new` published under
 //! `cfg(not(test))`, so the one line that mattered was compiled out of every
@@ -38,10 +39,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Seeded from the cargo feature so a build that passes `mips4` behaves as it
-/// did before a CPU is constructed; `set_mips4` then publishes the real
+/// MIPS IV until a CPU is constructed; `set_mips4` then publishes the real
 /// model's value.
-static MIPS4: AtomicBool = AtomicBool::new(cfg!(feature = "mips4"));
+static MIPS4: AtomicBool = AtomicBool::new(true);
 
 /// True when the running CPU model implements MIPS IV — i.e. when
 /// `C::MIPS4` is set for the model the guest was configured with.

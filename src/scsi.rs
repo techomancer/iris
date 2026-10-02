@@ -70,11 +70,9 @@ pub enum DiskBackend {
     Cow(CowDisk),
     /// Hard-disk CHD. Writable; compressed parents get an uncompressed
     /// `.diff.chd` sidecar (MAME-style), so the parent stays untouched.
-    #[cfg(feature = "chd")]
     ChdHd(crate::chd_disk::ChdHd),
     /// CD CHD (single-track MODE1) exposed as a 2048-byte/sector read-only
     /// stream. Writes return an error.
-    #[cfg(feature = "chd")]
     ChdCd(crate::chd_disk::ChdCd),
 }
 
@@ -95,9 +93,7 @@ impl DiskBackend {
             DiskBackend::Cow(cow) => {
                 cow.read_sectors(lba, count)
             }
-            #[cfg(feature = "chd")]
             DiskBackend::ChdHd(hd) => hd.read_blocks(lba, count, block_size),
-            #[cfg(feature = "chd")]
             DiskBackend::ChdCd(cd) => cd.read_blocks(lba, count, block_size),
         }
     }
@@ -111,9 +107,7 @@ impl DiskBackend {
                 Ok(())
             }
             DiskBackend::Cow(cow) => cow.write_sectors(lba, data),
-            #[cfg(feature = "chd")]
             DiskBackend::ChdHd(hd) => hd.write_sectors(lba, data),
-            #[cfg(feature = "chd")]
             DiskBackend::ChdCd(_) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "CD CHD is read-only",
@@ -125,9 +119,7 @@ impl DiskBackend {
         match self {
             DiskBackend::Direct(file) => file.metadata().map(|m| m.len()).unwrap_or(0),
             DiskBackend::Cow(cow) => cow.size(),
-            #[cfg(feature = "chd")]
             DiskBackend::ChdHd(hd) => hd.size(),
-            #[cfg(feature = "chd")]
             DiskBackend::ChdCd(cd) => cd.size(),
         }
     }
@@ -143,7 +135,6 @@ impl DiskBackend {
 pub enum DeviceKind {
     Disk,
     Cdrom,
-    #[cfg(feature = "daynaport")]
     DaynaPort(Box<crate::daynaport::DaynaPort>),
 }
 
@@ -212,7 +203,6 @@ impl ScsiDevice {
 
     /// Construct a DaynaPort SCSI/Link target — a type-3 Processor device with
     /// no storage backing at all (no image, no CHD, no overlay).
-    #[cfg(feature = "daynaport")]
     pub fn new_daynaport(dp: crate::daynaport::DaynaPort) -> Self {
         Self {
             backend: None,
@@ -229,7 +219,6 @@ impl ScsiDevice {
     }
 
     /// The DaynaPort behind this target, if it is one.
-    #[cfg(feature = "daynaport")]
     pub fn daynaport_mut(&mut self) -> Option<&mut crate::daynaport::DaynaPort> {
         match &mut self.kind {
             DeviceKind::DaynaPort(dp) => Some(dp),
@@ -238,7 +227,6 @@ impl ScsiDevice {
     }
 
     /// The DaynaPort behind this target, if it is one.
-    #[cfg(feature = "daynaport")]
     pub fn daynaport(&self) -> Option<&crate::daynaport::DaynaPort> {
         match &self.kind {
             DeviceKind::DaynaPort(dp) => Some(dp),
@@ -250,10 +238,7 @@ impl ScsiDevice {
     /// this to skip block-oriented handling (the controller, for instance, must
     /// not read a WRITE(6) byte count as `blocks × 512`).
     pub fn is_daynaport(&self) -> bool {
-        #[cfg(feature = "daynaport")]
-        { matches!(self.kind, DeviceKind::DaynaPort(_)) }
-        #[cfg(not(feature = "daynaport"))]
-        { false }
+        matches!(self.kind, DeviceKind::DaynaPort(_))
     }
 
     /// Whether physical media is loaded. For HDDs always true; for CD-ROMs
@@ -288,7 +273,6 @@ impl ScsiDevice {
         if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
             return cow.commit();
         }
-        #[cfg(feature = "chd")]
         {
             // CHD: rebuild needs the file closed first, so extract the paths,
             // drop the backend, flatten, then reopen with the same COW mode.
@@ -318,7 +302,6 @@ impl ScsiDevice {
         if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
             return cow.reset_overlay();
         }
-        #[cfg(feature = "chd")]
         {
             let info = match &self.backend {
                 Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow())),
@@ -360,7 +343,6 @@ impl ScsiDevice {
     pub fn cow_dirty_count(&self) -> usize {
         match &self.backend {
             Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
-            #[cfg(feature = "chd")]
             Some(DiskBackend::ChdHd(hd)) => usize::from(hd.diff_dirty()),
             _ => 0,
         }
@@ -371,7 +353,6 @@ impl ScsiDevice {
     pub fn is_cow(&self) -> bool {
         match &self.backend {
             Some(DiskBackend::Cow(_)) => true,
-            #[cfg(feature = "chd")]
             Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().is_some(),
             _ => false,
         }
@@ -381,7 +362,6 @@ impl ScsiDevice {
     /// sidecar that holds changes worth folding back into the base on a clean
     /// shutdown. `None` for in-place / non-CHD / no-media devices.
     pub fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        #[cfg(feature = "chd")]
         {
             if let Some(DiskBackend::ChdHd(hd)) = &self.backend {
                 return hd.pending_sync();
@@ -601,7 +581,6 @@ impl ScsiDevice {
         // it here, ahead of the storage match below, or those two would be
         // read as disk block transfers. It answers no storage command at all —
         // not READ CAPACITY, not MODE SENSE, not READ TOC.
-        #[cfg(feature = "daynaport")]
         if let DeviceKind::DaynaPort(dp) = &mut self.kind {
             let mut response = dp.request(req)?;
             if let ScsiDataLength::Fixed(max_len) = req.data_len {

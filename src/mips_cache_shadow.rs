@@ -155,7 +155,7 @@ pub struct ShadowCache<
     tc_base: UnsafeCell<*mut u8>,
     #[cfg(feature = "tcache")]
     tc_bitmap: UnsafeCell<u64>,
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
 }
 
@@ -205,7 +205,7 @@ impl<
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "tcache")]
             tc_bitmap: UnsafeCell::new(0),
-            #[cfg(all(feature = "tcache", feature = "jitv2"))]
+            #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
         }
     }
@@ -319,10 +319,10 @@ impl<
     #[cfg(feature = "tcache")]
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     fn tcache_gen_ptr(&self) -> *mut u8 { unsafe { *self.tc_gen.get() as *mut u8 } }
 
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut std::sync::atomic::AtomicU64) {
         unsafe { *self.tc_gen.get() = gen_base };
     }
@@ -332,7 +332,7 @@ impl<
     /// emitted code can assume them. Without tcache there is no inline path:
     /// every access calls out, exactly as for `PassthroughCache`.
     fn jit_dc_geometry(&self) -> crate::mips_cache_v2::JitDcGeometry {
-        #[cfg(all(feature = "tcache", feature = "jitv2"))]
+        #[cfg(feature = "jitv2")]
         if !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null() {
             return crate::mips_cache_v2::JitDcGeometry {
                 supported: true,
@@ -551,7 +551,7 @@ mod tests {
     use crate::mips_cache_v2::{CACH_PD, CACH_SD};
 
     fn cache() -> R10000ShadowCache {
-        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1024 * 1024));
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1)); // MB
         R10000ShadowCache::from(mem)
     }
 
@@ -734,7 +734,7 @@ mod tests {
     /// only once both windows are published: the emitted code dereferences
     /// them without a null check.
     #[test]
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     fn tcache_offers_a_tagless_path_once_both_windows_exist() {
         let c = cache();
         assert!(!c.jit_dc_geometry().supported, "no window yet");

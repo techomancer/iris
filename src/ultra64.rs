@@ -19,8 +19,6 @@
 ///   +0xA00  DRAM_PAGE    R/W  bits[23:20] = 1 MB page select (0–15)
 ///   +0xC00  GIO_INT_ACK  R    bits[4:0] from N64 (_U64_REGMASK); clears GIO interrupt
 ///   +0xE00  GIO_SYNC     R    bits[4:0] polling register, no interrupt
-
-#[cfg(feature = "ultra64")]
 mod imp {
 
 use crate::devlog::{devlog, devlog_is_active, LogModule};
@@ -637,21 +635,4 @@ impl BusDevice for Ultra64 {
 
 } // mod imp
 
-// ---------------------------------------------------------------------------
-// Re-export or stub depending on feature flag
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "ultra64")]
 pub use imp::*;
-
-#[cfg(not(feature = "ultra64"))]
-pub mod stub {
-    /// Placeholder constants so physical.rs can always reference them.
-    pub const GIO_SLOT0_BASE: u32 = 0x1F40_0000;
-    pub const RAMROM_BASE:    u32 = 0x1F50_0000;
-    pub const RAMROM_SIZE:    u32 = 0x10_0000;
-    pub const RAMROM_TOTAL: usize = 0x100_0000;
-    pub struct Ultra64;
-}
-#[cfg(not(feature = "ultra64"))]
-pub use stub::*;

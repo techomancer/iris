@@ -70,9 +70,8 @@ run_cell() {
 
     build_iris "$cpu" "$engine" || { echo "FAIL  $cell (build)"; return 1; }
 
-    # --cpu, not the r5k cargo feature: since 96e5ddd both cache models are
-    # compiled into every build and the model is chosen at construction, so
-    # building with --features r5k no longer produces an R5000 machine.
+    # The CPU model is a runtime choice: every CPU model is compiled into
+    # every build and picked at construction from --cpu.
     timeout "${TIMEOUT:-1200}" "$iris" \
         --config run/bare.toml \
         --cpu "$cpu" \
@@ -87,7 +86,7 @@ run_cell() {
     fi
 
     # Confirm the binary that ran is actually the CPU this cell names. Earlier
-    # in this suite's history an --features r5k build overwrote
+    # in this suite's history an R5000 build overwrote
     # target/release/iris between the copy and the run, and an "R4400" cell
     # silently exercised an R5000 — every mips4 expectation inverted, with no
     # indication anything was wrong. The banner is authoritative because the

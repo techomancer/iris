@@ -113,9 +113,10 @@ one WD33C93A) or Indigo2 IP22 ("Fullhouse" MC/IOC, two SCSI controllers, INT2,
 serial EEPROM for NVRAM and MAC). `src/platform.rs`/`machine.rs` wire the
 difference; `platform_profile_tests.rs` pins it down.
 
-**Memory** — emulated as `Vec<u32>` (`src/mem.rs`) by default, or as real host
-mappings under `--features ppmem` (`src/ppmem/`, `docs/ppmem-design.md`), where
-SIMM mirroring is expressed as repeated mappings instead of address masking.
+**Memory** — emulated as real host mappings (`src/ppmem/`,
+`docs/ppmem-design.md`), where SIMM mirroring is expressed as repeated mappings
+instead of address masking. RAM banks are still bus devices, so DMA and every
+other bus-path access work whether or not the host window could be reserved.
 Banks 2 and 3 can be enabled (up to 512MB). PROM is fine with it; IRIX 6.5 uses
 384MB, 5.3 uses up to 512MB. Each RAM page has a jitv2 generation counter.
 
@@ -291,8 +292,9 @@ Shape of it:
   entry table.
 - Invalidation is by per-page generation counters owned by the memory device;
   a write to a page bumps its generation and stale code stops dispatching.
-  Without `tcache`, a compile is also abandoned if any line of the page is dirty
-  in the emulated cache (`rules/jitv2/dirty-cache-page-probe.md`).
+  `jitv2` implies `tcache`, so cache stores land in RAM as they retire and the
+  compile worker's bus snapshot is never behind the CPU's view (the old
+  dirty-page probe, `rules/jitv2/dirty-cache-page-probe.md`, is gone).
 - Loads and stores whose L1D line is already cached are inlined into compiled
   code for both CPU models; everything else calls back into Rust. Callouts take
   the core pointer as their first argument and return status in registers — the
@@ -300,7 +302,10 @@ Shape of it:
   destination GPR (`rules/jitv2/callout-arg0-is-core-ptr.md`,
   `read-status-in-registers.md`).
 - Anything without an emitter (`opcode_support.rs`) falls back to the
-  interpreter. MIPS IV opcodes are only compiled with the `mips4` feature.
+  interpreter. MIPS IV opcodes are compiled when the configured CPU is MIPS IV
+  (R5000/R10000) — a runtime flag the `Analyzer` carries (`jitv2::isa`). The
+  interpreter gets the same answer from `C::MIPS4`, a const on the CPU model,
+  so an R4400 gets its own MIPS III decoder monomorphisation.
 - `j2wp` switches to one Cranelift function per page with many entry points.
   It is not production-ready.
 
@@ -375,7 +380,7 @@ Binaries:
 | `iris-bench` | benchmark driver (`bench/README.md`) |
 | `coffdump` | dump MIPS COFF executables |
 | `mkvh` | build and inspect SGI volume headers (`src/sgi_vh.rs`) |
-| `chd_extract` | extract CHD images (`--features chd`) |
+| `chd_extract` | extract CHD images |
 | `jitv2_analyze`, `jitv2_verify`, `jitv2_pcp_dump` | offline jitv2 analyzer/codegen tools (`--features jitv2`; `jitv2_pcp_dump` also needs `j2wp`) |
 | `iris-gui` | the egui front-end (`-p iris-gui`) |
 

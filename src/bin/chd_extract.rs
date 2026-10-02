@@ -5,8 +5,6 @@
 use std::env;
 use std::io::Write;
 use std::process::exit;
-
-#[cfg(feature = "chd")]
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
@@ -54,8 +52,3 @@ fn main() {
     eprintln!("done: wrote {} bytes to {}", total, output);
 }
 
-#[cfg(not(feature = "chd"))]
-fn main() {
-    eprintln!("chd_extract: rebuild with --features chd");
-    exit(2);
-}

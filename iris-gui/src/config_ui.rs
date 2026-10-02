@@ -415,15 +415,13 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
 
     // N64 development board (Ultra64). A single runtime toggle — the GIO device
     // and POSIX shm bridge (/iris_n64_bridge) are only created when this is on,
-    // read once at VM start. The toggle exists only in builds that carry the
-    // board (source builds with --features ultra64; shipped builds don't), and
-    // never in App Store builds: the sandbox can't open the named shm or run the
-    // external gopher64 process it talks to.
+    // read once at VM start. The toggle is never shown in App Store builds:
+    // the sandbox can't open the named shm or run the external gopher64
+    // process it talks to.
     #[cfg(not(feature = "appstore"))]
     {
 
     ui.separator();
-        #[cfg(feature = "ultra64")]
         ui.checkbox(&mut cfg.ultra64.enabled, "N64 development board (Ultra64)")
             .on_hover_text(
                 "Emulate the SGI Indy N64 development board. Requires the gopher64 \
@@ -431,13 +429,9 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                  IRIX. Applies on next Start. See docs/ultra64.md.",
             );
         ui.label(
-            RichText::new(if cfg!(feature = "ultra64") {
+            RichText::new(
                 "Settings autosave ~600 ms after edits (watch for * next to the machine name). \
-                 Platform, resolution, and Ultra64 apply on the next Stop → Start."
-            } else {
-                "Settings autosave ~600 ms after edits (watch for * next to the machine name). \
-                 Platform and resolution apply on the next Stop → Start."
-            })
+                 Platform, resolution, and Ultra64 apply on the next Stop → Start.")
             .weak()
             .small(),
         );
@@ -807,12 +801,6 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
     ui.heading("SCSI devices");
     ui.horizontal(|ui| {
         ui.label("IDs 1–7. CD-ROMs typically use 4–6.");
-        if build_features::CHD {
-            ui.label(RichText::new("[CHD support: ON]").color(Color32::LIGHT_GREEN).small());
-        } else {
-            ui.label(RichText::new("[CHD support: OFF — rebuild with --features chd]")
-                .color(Color32::from_rgb(220, 170, 90)).small());
-        }
     });
     let mut to_delete: Option<u8> = None;
     for id in 1u8..=7 {
@@ -840,14 +828,6 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     ui.label("Type");
                     scsi_type_combo(ui, id, dev, &mut edit);
                     ui.end_row();
-
-                    if !build_features::DAYNAPORT {
-                        ui.label("");
-                        ui.label(RichText::new(
-                            "⚠ this build lacks DaynaPort support — rebuild with --features daynaport")
-                            .color(Color32::from_rgb(230, 140, 70)));
-                        ui.end_row();
-                    }
 
                     ui.label("MAC address")
                         .on_hover_text("Blank = derived from the SCSI id (00:80:19:44:50:<id>).");
@@ -891,18 +871,12 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                     };
                 }
                 ui.end_row();
-                if dev.path.ends_with(".chd") && !build_features::CHD {
-                    ui.label("");
-                    ui.label(RichText::new("⚠ .chd path but this build lacks CHD support — rebuild with --features chd")
-                        .color(Color32::from_rgb(230, 140, 70)));
-                    ui.end_row();
-                }
                 // Active copy-on-write overlay for a compressed CHD: show exactly
                 // which `.diff.chd` is in use (the path honours IRIS_CHD_DIFF_DIR,
                 // so on the sandbox build this is the container sidecar) and its
                 // size, so it's unambiguous that changes are landing here and that
                 // this is the file folded back into the disk on a clean exit.
-                if build_features::CHD && dev.path.ends_with(".chd") {
+                if dev.path.ends_with(".chd") {
                     let diff = iris::chd_disk::diff_path_for(Path::new(&dev.path));
                     if let Ok(meta) = std::fs::metadata(&diff) {
                         let mb = meta.len() as f64 / (1024.0 * 1024.0);
@@ -1595,12 +1569,7 @@ fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut cfg.vino.source, VinoSource::Off, "off (disabled)");
                 ui.selectable_value(&mut cfg.vino.source, VinoSource::TestPattern, "test_pattern");
-                let camera_label = if build_features::CAMERA {
-                    "camera"
-                } else {
-                    "camera (needs --features camera)"
-                };
-                ui.selectable_value(&mut cfg.vino.source, VinoSource::Camera, camera_label);
+                ui.selectable_value(&mut cfg.vino.source, VinoSource::Camera, "camera");
                 ui.selectable_value(&mut cfg.vino.source, VinoSource::Black, "black");
             });
         ui.end_row();
@@ -1624,34 +1593,27 @@ fn show_vino(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     // grant the camera permission. This exercises the same host-capture code
     // the VINO/IndyCam source uses.
     ui.add_space(8.0);
-    if build_features::CAMERA {
-        ui.horizontal(|ui| {
-            if ui.button("📷 Test Camera").clicked() {
-                action = ConfigAction::TestCamera;
-            }
-            ui.label(
-                RichText::new(format!(
-                    "Preview host camera #{} live ({}).",
-                    cfg.vino.camera_index,
-                    match cfg.vino.standard { VinoStandard::Ntsc => "NTSC", VinoStandard::Pal => "PAL" },
-                ))
-                .weak(),
-            );
-        });
+    ui.horizontal(|ui| {
+        if ui.button("📷 Test Camera").clicked() {
+            action = ConfigAction::TestCamera;
+        }
         ui.label(
-            RichText::new(
-                "On first use macOS will ask for camera permission. The camera \
-                 is released when you close the preview.",
-            )
-            .weak()
-            .small(),
+            RichText::new(format!(
+                "Preview host camera #{} live ({}).",
+                cfg.vino.camera_index,
+                match cfg.vino.standard { VinoStandard::Ntsc => "NTSC", VinoStandard::Pal => "PAL" },
+            ))
+            .weak(),
         );
-    } else {
-        ui.label(
-            RichText::new("Camera test unavailable — this build was compiled without --features camera.")
-                .weak(),
-        );
-    }
+    });
+    ui.label(
+        RichText::new(
+            "On first use macOS will ask for camera permission. The camera \
+             is released when you close the preview.",
+        )
+        .weak()
+        .small(),
+    );
 
     action
 }
@@ -1674,20 +1636,8 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.label("Idle pause");
         ui.label(if build_features::IDLE_PAUSE { "yes" } else { "no" });
         ui.end_row();
-        ui.label("CHD / PCAP / Camera");
-        ui.label(format!(
-            "CHD={} PCAP={} Camera={}",
-            build_features::CHD,
-            build_features::PCAP,
-            build_features::CAMERA,
-        ));
-        ui.end_row();
-        ui.label("IP28 / R10000");
-        ui.label(if build_features::IP28 {
-            "built in — Indigo2 IMPACT (IP28) profile and R10000 CPU selectable"
-        } else {
-            "not built — rebuild with --features ip28 for the IP28 profile / R10000 CPU"
-        });
+        ui.label("PCAP");
+        ui.label(if build_features::PCAP { "yes" } else { "no" });
         ui.end_row();
         ui.label("Host services / Host GL");
         ui.label(match (build_features::HOSTCALL, build_features::HOSTGL) {
@@ -1771,7 +1721,6 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     });
     ui.monospace("cargo build --release --bin iris --features lightning,rex-jit,idle-pause");
     ui.monospace("cargo build -p iris-gui --release --features premiere");
-    ui.monospace("cargo build -p iris-gui --release --features iris/r5k,iris/r5ksc  # R5000SC");
     ui.separator();
     ui.heading("Host performance");
     Grid::new("perf_grid").num_columns(2).striped(true).show(ui, |ui| {
@@ -1920,8 +1869,7 @@ struct PathEdit {
 /// SCSI target-type picker. `kind`/`cdrom` are two spellings of the same
 /// setting in the config, so write both from one place: a DaynaPort must not
 /// keep a stale `cdrom = true`, and a disk/CD-ROM must not keep
-/// `kind = "daynaport"`. DaynaPort is offered even in a build without the
-/// feature — with a warning next to it — so an existing config stays editable.
+/// `kind = "daynaport"`.
 fn scsi_type_combo(ui: &mut Ui, id: u8, dev: &mut ScsiDeviceConfig, edit: &mut PathEdit) {
     let mut kind = dev.kind();
     let before = kind;

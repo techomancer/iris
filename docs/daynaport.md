@@ -17,15 +17,8 @@ nothing else happens. The IRIX driver lives at
 
 ## Build
 
-Off by default — it is only useful with that driver:
-
-```sh
-cargo build --release --features daynaport             # iris CLI
-cargo build --release -p iris-gui --features daynaport # GUI
-```
-
-Without the feature, a config that asks for one fails at startup with
-`DaynaPort support not compiled in (rebuild with --features daynaport)`.
+Always built in; a target only exists when a `[scsi.N]` section asks for one
+(it is only useful with that driver).
 
 ## Configure
 

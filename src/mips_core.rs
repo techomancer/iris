@@ -322,7 +322,6 @@ pub struct MipsCore {
     /// CPU store → MC register write → ppmem, all on this same CPU thread, and
     /// no device ever touches it. Zero when ppmem is not in use, which reads as
     /// "nothing is directly mapped" and keeps every access on the bus path.
-    #[cfg(feature = "ppmem")]
     pub ppmem_bitmap: u64,
 
     pub pc: u64,         // Program Counter
@@ -420,27 +419,24 @@ pub struct MipsCore {
     /// Base of the L1-D tag array. Null = inline path unavailable.
     #[cfg(feature = "jitv2")]
     pub jit_dc_tags: *mut u8,
-    /// Base of the L1-D data array. Null under tcache (line holds no data).
-    #[cfg(feature = "jitv2")]
-    pub jit_dc_data: *mut u8,
     /// Base of the L1-D per-set LRU bitmap (one bit per set). Only read by the
     /// 2-way (R5000) inline path, which updates it on a hit exactly as
     /// `ensure_l1d_line` does; null on a direct-mapped model.
     #[cfg(feature = "jitv2")]
     pub jit_dc_lru: *mut u8,
     /// ppmem window base — tcache's data source (`tc_base + phys`).
-    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    #[cfg(feature = "jitv2")]
     pub jit_tc_base: *mut u8,
     /// Base of the L2 tag array (`[L2Tag]`, `u32` each). The inline tcache
     /// store clears `has_code` on the written line so L1-I refills cannot
     /// reuse stale decoded instructions — mirroring `tc_invalidate_l2_code`.
-    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    #[cfg(feature = "jitv2")]
     pub jit_l2_tags: *mut u8,
     /// Base of the jitv2 per-page generation array, indexed by `phys >> 12`.
     /// An inline store through the ppmem window must bump the entry for the
     /// page it wrote, exactly as `tc_bump_gen` does, or self-modifying code
     /// stops retiring compiled regions.
-    #[cfg(all(feature = "jitv2", feature = "tcache"))]
+    #[cfg(feature = "jitv2")]
     pub jit_tc_gen: *mut u8,
 
     /// JIT v2: monomorphized C-ABI memory-access and exception-delivery
@@ -1254,7 +1250,6 @@ impl MipsCore {
             hot: Hot::default(),
             cp0_count: 0,
             cp0_compare: 0,
-            #[cfg(feature = "ppmem")]
             ppmem_bitmap: 0,
             pc: 0,
             in_delay_slot: false,
@@ -1284,12 +1279,11 @@ impl MipsCore {
             #[cfg(feature = "jitv2")]
             jit_dc_lru: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
-            jit_dc_data: std::ptr::null_mut(),
-            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            #[cfg(feature = "jitv2")]
             jit_tc_base: std::ptr::null_mut(),
-            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            #[cfg(feature = "jitv2")]
             jit_l2_tags: std::ptr::null_mut(),
-            #[cfg(all(feature = "jitv2", feature = "tcache"))]
+            #[cfg(feature = "jitv2")]
             jit_tc_gen: std::ptr::null_mut(),
             #[cfg(feature = "jitv2")]
             read8_fn: jit_hooks_not_installed_read,

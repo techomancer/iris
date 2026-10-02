@@ -74,6 +74,11 @@ pub fn cpu_model_mismatch(snapshot: Option<&str>, current: &str) -> Option<Strin
     }
 }
 
+/// Feature names older builds recorded that are no longer cargo features (the
+/// code they gated is now always built). Ignored when comparing a snapshot's
+/// recorded features against the running build.
+pub const RETIRED_FEATURES: &[&str] = &["chd", "camera"];
+
 /// Build the list of cargo features enabled in this binary. Recorded in the
 /// manifest and required to match on restore, since features such as `ci_clock`
 /// (synthetic clock) change CPU/timer semantics that the captured
@@ -89,8 +94,6 @@ pub fn enabled_features() -> Vec<String> {
     push_if!("idle-pause");
     push_if!("ci_clock");
     push_if!("tlbvmap");
-    push_if!("chd");
-    push_if!("camera");
     push_if!("developer");
     push_if!("developer_ip7");
     push_if!("tlbstats");

@@ -1320,13 +1320,6 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Always the non-debug variant; selects the correct 32/64-bit × privilege specialisation.
     pub translate_fn: fn(&mut Self, u64, AccessType) -> TranslateResult,
 
-    /// Retires the global jitv2 dirty-page probe when this executor dies.
-    ///
-    /// A field rather than `impl Drop for MipsExecutor`: the latter would make
-    /// the whole executor non-movable-out-of (E0509), which several tests rely
-    /// on. See [`JitPageProbeGuard`].
-    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
-    jit_page_probe_guard: JitPageProbeGuard,
     /// FR-mode-aware FPR accessors. Switched in update_fpr_mode() whenever STATUS_FR changes.
     /// FR=0: doubles/longs use full even slot; odd single/word regs are upper 32 bits of even slot.
     /// FR=1: all 32 slots are independent 64-bit registers.
@@ -1605,42 +1598,6 @@ fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at
 // MipsCore which outlive the executor. The executor is only accessed from the CPU thread.
 unsafe impl<T: Tlb, C: CpuModel> Send for MipsExecutor<T, C> {}
 unsafe impl<T: Tlb, C: CpuModel> Sync for MipsExecutor<T, C> {}
-
-/// Owns the executor's registration in the process-wide jitv2 dirty-page probe
-/// and retires it on drop.
-///
-/// `install_jit_page_probe` stores a bare `*const ()` to the executor's cache in
-/// a global with no lifetime attached. In production that is benign — the
-/// executor lives as long as the process — but nothing enforced it, and in a
-/// test binary executors are created and dropped continuously while the probe
-/// stays installed. The compile worker then dereferenced a freed cache: seen as
-/// `slice::get_unchecked` out-of-bounds against a *zero-length* tag slice, and
-/// without debug assertions an outright SIGSEGV, on the `jitv2-compile-N`
-/// threads under `--features jitv2`.
-///
-/// This is a struct field rather than `impl Drop for MipsExecutor` because a
-/// `Drop` on the executor itself makes it illegal to move fields out of one
-/// (E0509), which several tests do.
-///
-/// The clear is *conditional*: a later executor may have installed its own probe
-/// before this one died, and unconditionally nulling the global would disable
-/// that live executor's dirty-page check rather than merely retiring this dead
-/// one's.
-#[cfg(all(feature = "jitv2", not(feature = "tcache")))]
-struct JitPageProbeGuard {
-    /// The ctx published to the global, or null if this executor never installed.
-    ctx: *const (),
-}
-
-#[cfg(all(feature = "jitv2", not(feature = "tcache")))]
-impl Drop for JitPageProbeGuard {
-    fn drop(&mut self) {
-        if !self.ctx.is_null() {
-            crate::jitv2::clear_jit_page_probe_if(self.ctx);
-        }
-    }
-}
-
 
 fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, _old: u32, _new: u32) {
     // SAFETY: ctx is `&mut MipsExecutor<T,C>` cast to void, alive for the executor's lifetime,
@@ -2846,8 +2803,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             uncached_fetch_count: Arc::new(AtomicU64::new(0)),
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
-            #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
-            jit_page_probe_guard: JitPageProbeGuard { ctx: std::ptr::null() },
             // Placeholder — overwritten immediately by update_fpr_mode below.
             fpr_read_d:  crate::mips_core::read_fpr_d_fr0,
             fpr_write_d: crate::mips_core::write_fpr_d_fr0,
@@ -2956,7 +2911,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// only writer is the MC's MEMCFG path, which runs on this same CPU thread
     /// (CPU store → MC register write → `remap_banks` → ppmem), and no device
     /// ever reads or writes it.
-    #[cfg(feature = "ppmem")]
     pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
         &self.core.ppmem_bitmap as *const u64 as *mut u64
     }
@@ -2983,7 +2937,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     ///
     /// # Safety
     /// Same contract as that method.
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     pub unsafe fn set_tcache_gen_window(&mut self, gen_base: *mut std::sync::atomic::AtomicU64) {
         unsafe { self.cache.set_tcache_gen_window(gen_base) };
         // The jitv2 inline store path reads this pointer from `MipsCore` at a
@@ -3082,54 +3036,16 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         }
         if geom.supported {
             self.core.jit_dc_tags = self.cache.jit_dc_tags_ptr();
-            self.core.jit_dc_data = self.cache.jit_dc_data_ptr();
             self.core.jit_dc_lru  = self.cache.jit_dc_lru_ptr();
         } else {
             // Null tags = "do not emit the inline path" (R5000's 2-way L1-D,
             // PassthroughCache, anything else unsupported).
             self.core.jit_dc_tags = std::ptr::null_mut();
-            self.core.jit_dc_data = std::ptr::null_mut();
             self.core.jit_dc_lru  = std::ptr::null_mut();
         }
-        #[cfg(feature = "tcache")]
-        {
-            self.core.jit_tc_base = self.cache.tcache_base_ptr();
-            self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
-            self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
-        }
-        #[cfg(not(feature = "tcache"))]
-        self.install_jit_page_probe();
-    }
-
-    /// Publish the compile-time dirty-page probe (`Jitv2::jit_page_probe`).
-    ///
-    /// The compile worker snapshots pages off the bus, which shows it RAM;
-    /// the guest CPU sees RAM overlaid with its own dirty cache lines, and a
-    /// store that retires inside L1-D bumps no page generation counter. This
-    /// hands the worker a way to notice that and decline the compile. See
-    /// `MipsCache::jit_page_has_dirty_lines`.
-    ///
-    /// Does not exist under `tcache`: there the cache reads and writes RAM
-    /// through the ppmem window, so a store is in RAM the moment it retires
-    /// and there is no hidden dirty data to find. tcache closes this hole by
-    /// construction, and `comp` compiles its side of the check out to match.
-    #[cfg(all(feature = "jitv2", not(feature = "tcache")))]
-    fn install_jit_page_probe(&mut self) {
-        fn thunk<C2: crate::mips_cache_v2::MipsCache>(ctx: *const (), page_base: u64) -> bool {
-            // SAFETY: `ctx` is the `&self.cache` published just below, of
-            // exactly this `C2`. The executor is at its final address by the
-            // time `install_jit_hooks` runs (see its doc comment), so the
-            // cache it owns by value does not move either.
-            let cache = unsafe { &*(ctx as *const C2) };
-            cache.jit_page_has_dirty_lines(page_base)
-        }
-        let ctx = &self.cache as *const C as *const ();
-        // SAFETY: see the thunk's own note — `ctx` matches `C`, and it
-        // outlives the worker because `install_jit_mem_ptrs` is re-run by
-        // every path that can move or replace the cache, and `Drop for
-        // MipsExecutor` retires the probe when this cache goes away.
-        unsafe { crate::jitv2::install_jit_page_probe(ctx, thunk::<C>) };
-        self.jit_page_probe_guard.ctx = ctx;
+        self.core.jit_tc_base = self.cache.tcache_base_ptr();
+        self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
+        self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
     }
 
     /// Install JIT v2's memory-access and exception-delivery hooks
@@ -10462,7 +10378,6 @@ pub struct MipsCpu<T: Tlb, C: CpuModel> {
     /// ppmem: pointer to the executor's inline `ppmem_bitmap` field, handed to
     /// `PpMemSpace` so remaps publish straight into the CPU. Same
     /// process-lifetime validity argument as `interrupts_ptr` above.
-    #[cfg(feature = "ppmem")]
     ppmem_bitmap_ptr: *mut u64,
     pub fasttick_count: Arc<AtomicU64>,
     debug: Arc<AtomicBool>,
@@ -10496,7 +10411,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         // safe to take raw pointers into it that outlive this constructor.
         let interrupts_ptr = executor_arc.lock().interrupts_ptr();
         let cycles_ptr = executor_arc.lock().cycles_ptr();
-        #[cfg(feature = "ppmem")]
         let ppmem_bitmap_ptr = executor_arc.lock().ppmem_bitmap_ptr();
         #[cfg(feature = "jitv2")]
         executor_arc.lock().install_jit_hooks();
@@ -10507,7 +10421,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             thread: Mutex::new(None),
             cycles_ptr,
             interrupts_ptr,
-            #[cfg(feature = "ppmem")]
             ppmem_bitmap_ptr,
             fasttick_count,
             debug: Arc::new(AtomicBool::new(false)),
@@ -10572,7 +10485,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// ppmem: pointer to the executor's inline `ppmem_bitmap` field, for
     /// `PpMemSpace::set_bitmap_sink`. Fixed for the life of this `MipsCpu` —
     /// taken once in `new()` after the executor reached its final address.
-    #[cfg(feature = "ppmem")]
     pub fn ppmem_bitmap_ptr(&self) -> *mut u64 {
         self.ppmem_bitmap_ptr
     }
@@ -10596,7 +10508,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     ///
     /// # Safety
     /// Same contract as that method.
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     pub unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe { self.executor.lock().set_tcache_gen_window(gen_base) };
     }
@@ -13801,8 +13713,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 // but forgotten here is invisible in `j2
                                 // stats` no matter how often it fires, and
                                 // the only symptom is `failed` not matching
-                                // the sum of the printed buckets. That has
-                                // already happened once (PageDirtyInCache).
+                                // the sum of the printed buckets.
                                 for reason in crate::jitv2::RejectReason::ALL {
                                     let n = jit.stats.reject_reasons[reason.index()].load(Ordering::Relaxed);
                                     if n == 0 { continue; }
@@ -14282,7 +14193,6 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn interrupts_ptr(&self) -> *const AtomicU64;
     /// ppmem: the executor's inline `ppmem_bitmap` field, for
     /// `PpMemSpace::set_bitmap_sink`.
-    #[cfg(feature = "ppmem")]
     fn ppmem_bitmap_ptr(&self) -> *mut u64;
     /// tcache: hand the cache ppmem's window base + mapped-region bitmap.
     ///
@@ -14297,7 +14207,7 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     ///
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_gen_window`.
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64);
     fn core_ptr(&self) -> *const crate::mips_core::MipsCore;
     fn register_locks(&self);
@@ -14334,7 +14244,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     }
     fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
-    #[cfg(feature = "ppmem")]
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
     #[cfg(feature = "tcache")]
     unsafe fn set_tcache_window(&self, base: *mut u8) {
@@ -14342,7 +14251,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     }
     #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { MipsCpu::tcache_bitmap_ptr(self) }
-    #[cfg(all(feature = "tcache", feature = "jitv2"))]
+    #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe { MipsCpu::set_tcache_gen_window(self, gen_base) }
     }

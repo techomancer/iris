@@ -61,7 +61,7 @@ boots to a usable system: shell, networking, X11, the works.
 - **Indy IP24:** X11 / Newport (REX3) graphics works, with mouse and keyboard input
   (IntelliMouse wheel included), HAL2 audio, and IndyCam video-in through VINO
 - **Indigo2 IP22:** hardware emulation + serial boot (see [docs/indigo2-ip22.md](docs/indigo2-ip22.md)); GUI framebuffer still maturing
-- R4400 or R5000 CPU, selected per machine at runtime
+- R4400 or R5000 CPU (R10000 for the IP28 bring-up), selected per machine at runtime
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental),
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
   optional REX3 shader JIT (`rex-jit`)
@@ -74,7 +74,7 @@ boots to a usable system: shell, networking, X11, the works.
   or PCAP bridging onto a real LAN
 - Headless mode and a CI control socket (`iris-ci`) for automation
 - Optional egui front-end (`iris-gui`) with machine management and a benchmark tab
-- DaynaPort SCSI/Link Ethernet and the N64 development board (Ultra64), both opt-in
+- DaynaPort SCSI/Link Ethernet and the N64 development board (Ultra64), both enabled per machine in the config
 - Other guests: Linux (Debian 7, Gentoo), NetBSD and OpenBSD have had SCSI,
   interrupt and timer fixes land for them. They are not regularly tested, so
   expect rough edges
@@ -109,17 +109,18 @@ cargo run --release --features rex-jit               # enable REX3 graphics JIT 
 cargo run --release --features jitv2,rex-jit         # MIPS JIT v2 (experimental; see "JIT compilers")
 cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Count clock (CI/snapshot validator only; loses realtime desktop timing)
-cargo run --release --features chd                   # mount .chd disk/CD-ROM images directly (via libchdman-rs); off by default to keep builds light
-cargo run --release --features camera                # use a host camera as the IndyCam video source (AVFoundation / V4L / MediaFoundation). See [vino] in iris.toml.
 cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
-cargo run --release --features daynaport             # DaynaPort SCSI/Link: Ethernet over the SCSI bus, selectable per SCSI id. Needs a guest driver. See docs/daynaport.md.
-cargo run --release --features ultra64               # N64 development board in GIO slot 0, bridged to an external gopher64. See HELP.md.
 cargo run -p iris-gui --release                      # the egui front-end, see iris-gui-README.md
 ```
 
 `lightning` and `developer` are mutually exclusive, and `lightning` implies the
 interpreter's `opcodefusion`. The emulator prints the features it was built with
 at startup.
+
+CHD images, the host camera (IndyCam source), DaynaPort, the Ultra64 dev board
+and the IP28 / R10000 machine are always built in; nothing to enable. MIPS IV
+follows the configured CPU (R4400 is MIPS III, R5000/R10000 are MIPS IV) in
+both the interpreter and jitv2.
 
 <details>
 <summary>Diagnostic and experimental features</summary>
@@ -136,37 +137,26 @@ at startup.
 | `tlbstats` / `tlbcheck` | TLB translation counters / full JTLB consistency check after every TLB write |
 | `jitstats` | Counts how far each load/store gets through the JIT inline-memory checks |
 | `instr_stats` | Per-opcode decode/execute counters (interpreter only; refused with `jitv2`) |
-| `ppmem` | Host-MMU-backed physical memory ([docs/ppmem-design.md](docs/ppmem-design.md)) |
-| `tcache` / `tcache_verify` | Transparent cache on top of `ppmem` ([docs/tcache-design.md](docs/tcache-design.md)) / its self-check |
+| `tcache` / `tcache_verify` | Transparent cache over the ppmem window ([docs/tcache-design.md](docs/tcache-design.md)) / its self-check. Always on with `jitv2`; optional for an interpreter build |
 | `jitv2_lockstep` | Verify every JIT instruction against the interpreter (implies `developer`) |
 | `jitv2_smc_check` | Report writes into the page the CPU is executing (run with `j2 inline_mem off`) |
 | `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
 | `j2wp` | jitv2 whole-page compile instead of one function per entry point (not production-ready) |
 | `debug_cache` | Track one cache line across all operations |
-| `mips4` | Lets jitv2 compile MIPS IV opcodes (otherwise they run in the interpreter). The interpreter enables MIPS IV from the runtime CPU model on its own |
 | `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
-| `r5k` | Vestigial for CPU selection (the CPU is a runtime setting) |
 | `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`rules/testing/r5k-l1i-cache-bugs.md`) |
 
 </details>
 
-### CHD image support (`--features chd`)
+### CHD image support
 
-Off by default. When enabled, IRIS can mount `.chd` hard-disk and CD-ROM
-images directly without first extracting to raw. Compressed parent CHDs
-stay untouched — writes go to a MAME-style `.diff.chd` sidecar.
-
-```
-cargo build --release --features chd
-```
-
-Without this feature, attempting to mount a `.chd` path returns an
-`Unsupported` error; raw images and COW overlays continue to work as
-before.
+IRIS mounts `.chd` hard-disk and CD-ROM images directly without first
+extracting to raw. Compressed parent CHDs stay untouched — writes go to a
+MAME-style `.diff.chd` sidecar.
 
 The CHD backend (`libchdman-rs` >= 0.288.8) and the MAME CHD core it vendors
-are BSD-3-Clause licensed, so enabling this feature keeps IRIS fully
-BSD-3-Clause (see `LICENSE-libchdman-rs.txt`).
+are BSD-3-Clause licensed, so IRIS stays fully BSD-3-Clause (see
+`LICENSE-libchdman-rs.txt`).
 
 See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
 NVRAM/MAC address setup, disk image prep, and more.
@@ -203,7 +193,7 @@ Debian/Ubuntu, or the macOS system libpcap).
 
 1. **Build** with `--features pcap`:
    ```
-   cargo build --release --features chd,pcap
+   cargo build --release --features pcap
    ```
 
 2. **Configure** in `iris.toml` (or pass CLI flags):
@@ -253,12 +243,12 @@ back to the NAT gateway, and `--list-net-interfaces` reports that the feature
 is missing.
 
 
-## DaynaPort SCSI/Link (`--features daynaport`)
+## DaynaPort SCSI/Link
 
 A SCSI-attached Ethernet adapter (SCSI type 3, Processor) selectable on any
 SCSI id — a second network path for the guest that goes over the SCSI bus
-instead of the onboard SEEQ. Off by default, because it is only useful with a
-guest driver; IRIX has none in the box (see
+instead of the onboard SEEQ. Only attached when configured, because it is only
+useful with a guest driver; IRIX has none in the box (see
 [irixdayna](https://github.com/techomancer/irixdayna), where it appears as
 `dp0`).
 
@@ -408,7 +398,7 @@ Writes go to `scsi1.raw.overlay`. Monitor commands:
 - `cow commit [id]` - merge overlay into base image (permanent)
 - `cow reset [id]` - discard all overlay writes
 
-CHD images (`--features chd`) get the same protection automatically: writes go
+CHD images get the same protection automatically: writes go
 to a `.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or
 the GUI's "Commit changes to disk") folds the diff back into the base.
 
@@ -626,9 +616,8 @@ first. It'll save you a few days.
 
 BSD 3-Clause (`LICENSE`).
 
-The optional `--features chd` build links `libchdman-rs` (>= 0.288.8), which —
-along with the MAME CHD core it vendors — is also BSD 3-Clause, so CHD builds
-stay fully BSD 3-Clause. See `LICENSE-libchdman-rs.txt` for that third-party
+IRIS links `libchdman-rs` (>= 0.288.8), which — along with the MAME CHD core
+it vendors — is also BSD 3-Clause, so the whole binary stays BSD 3-Clause. See `LICENSE-libchdman-rs.txt` for that third-party
 notice.
 
 ## Whodunnit?

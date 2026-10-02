@@ -78,7 +78,7 @@ cdrom  = false
 #size_mb = 64
 
 # DaynaPort SCSI/Link — Ethernet over the SCSI bus (SCSI type 3, Processor).
-# Requires a build with `--features daynaport` AND a driver in the guest; IRIX
+# Requires a driver in the guest; IRIX
 # has none in the box (see github.com/techomancer/irixdayna, where it shows up
 # as dp0). Has no disk image: path/discs/overlay/scratch don't apply.
 #   mac    — optional; default 00:80:19:44:50:<scsi-id>
@@ -152,7 +152,7 @@ bind       = "localhost"
 #path  = "cdrom4.iso"   # optional — omit to start with an empty tray
 
 # VINO video-in (IndyCam). Off by default.
-# source:   "off" | "test_pattern" | "black" | "camera" (--features camera)
+# source:   "off" | "test_pattern" | "black" | "camera"
 # standard: "ntsc" | "pal"
 #[vino]
 #source       = "camera"
@@ -198,9 +198,9 @@ mode           = "nat"
 # before boot — no need to `setenv eaddr` by hand at the PROM monitor.
 #mac            = "08:00:69:12:34:56"
 
-# N64 development board (Ultra64 GIO card). Needs a build with
-# --features ultra64 and the ultra64 branch of github.com/techomancer/gopher64,
-# which maps the shared-memory bridge (/iris_n64_bridge). See HELP.md.
+# N64 development board (Ultra64 GIO card). Needs the ultra64 branch of
+# github.com/techomancer/gopher64, which maps the shared-memory bridge
+# (/iris_n64_bridge). See HELP.md.
 #[ultra64]
 #enabled = true
 

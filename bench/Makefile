@@ -171,7 +171,7 @@ run: $(TARGET)
 	@run/run-local.sh $(TARGET)
 
 # The matrix lives in iris-bench, not in a shell script: it has to build a
-# separate emulator per cell (the CPU model and the JIT are cargo features),
+# separate emulator per cell where the JIT differs (a cargo feature),
 # check that each one really is the CPU it claims, parse the results and write
 # a comparison. That is a program, and it needs tests.
 matrix: $(TARGET)

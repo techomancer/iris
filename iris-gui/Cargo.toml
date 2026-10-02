@@ -69,34 +69,9 @@ appstore = ["bundled"]
 # interfaces in a dropdown and the in-process VM can actually bridge onto them.
 # Build with: cargo build -p iris-gui --features pcap
 pcap = ["iris/pcap"]
-# DaynaPort SCSI/Link target — Ethernet over the SCSI bus, selectable per SCSI
-# id on the Disks tab. Off by default: it is only useful with a guest driver
-# (IRIX: github.com/techomancer/irixdayna), and without one the device just sits
-# on the bus. The Disks tab still shows the option in a build without it, with a
-# "rebuild with --features daynaport" warning, so a config stays editable.
-# Build with: cargo build -p iris-gui --features daynaport
-daynaport = ["iris/daynaport"]
-# Vestigial for CPU selection. The R4400/R5000 choice is a runtime setting on
-# the General tab and Machine menu (`[machine] cpu`), and both models are compiled into every
-# build — see the note in src/lib.rs. This passthrough remains only so the
-# feature name still resolves for anyone building with it.
-r5k = ["iris/r5k"]
 # YouTube / max in-process perf: lightning (no GDB hot-path) + idle-pause on the
 # embedded iris core. Build with: cargo build -p iris-gui --release --features premiere
 premiere = ["iris/lightning", "iris/idle-pause"]
-# N64 development board (Ultra64) — GIO slot 0 + POSIX shm bridge to an external
-# gopher64. Gates both the core device and this crate's toggle/help window (the
-# `ultra64` field on iris's Config only exists with the core feature on).
-# Build with: cargo build -p iris-gui --features ultra64
-ultra64 = ["iris/ultra64"]
-# The Indigo2 IMPACT (IP28) machine profile and its R10000 CPU (bring-up
-# status — see the `8579614` commit and `ip28.toml.example`). Implies ppmem.
-# Off by default: it's a much bigger memory-model change than the other
-# passthrough features. Gates the "SGI Indigo2 IMPACT (IP28)" machine profile
-# and "MIPS R10000" CPU dropdown entries; the IMPACT/MGRAS graphics board
-# itself (Indigo2 profiles, either IP22 or IP28) needs no feature and is
-# always selectable. Build with: cargo build -p iris-gui --features ip28
-ip28 = ["iris/ip28"]
 # Host services for IRIX programs over private syscalls 3000-3009
 # (`iris-hostcall`) — no per-machine config, a guest either gets the trap or
 # doesn't. Build with: cargo build -p iris-gui --features hostcall
@@ -114,7 +89,7 @@ hostgl = ["hostcall", "iris/hostgl"]
 # rex-jit (REX3 draw-shader compiler). They add code paths and native deps but no
 # runtime cost when unused. `ultra64` used to be here too; it is now an opt-in
 # passthrough feature (above), since it needs an external gopher64 to be usable.
-iris = { path = "..", features = ["chd", "camera", "rex-jit"] }
+iris = { path = "..", features = ["rex-jit"] }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"
 crossbeam-channel = "0.5"

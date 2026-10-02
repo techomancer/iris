@@ -192,13 +192,6 @@ fn prepare_multi_entry_compile(
     // Compiled out entirely under `tcache`: there the cache reads and writes
     // RAM through the ppmem window, so a store is in RAM the moment it
     // retires and there is nothing hidden for the probe to find.
-    #[cfg(not(feature = "tcache"))]
-    if crate::jitv2::jit_page_has_dirty_lines(phys_base as u64) {
-        #[cfg(feature = "developer")]
-        stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
-        page.mark_prepare_bounced();
-        return PrepareOutcome::Done(false);
-    }
 
     // §13.3 step 2: seqlock-snapshot the page bytes. Bounded retries — a
     // page under sustained concurrent SMC just keeps losing the race to
@@ -544,12 +537,6 @@ pub fn handle_request(
             // generation, which `publish`'s own `gen_snap` check then rejects.
             // There is no third state, and a partial writeback bumps the
             // counter just the same.
-            #[cfg(not(feature = "tcache"))]
-            if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
-                #[cfg(feature = "developer")]
-                stats.record_reject(crate::jitv2::RejectReason::PageDirtyInCache);
-                return false;
-            }
             // Stage what this compile consumed, so the next request for this
             // page can be answered without redoing any of it if nothing that
             // mattered changed. Staged before the publish and committed only
@@ -862,10 +849,6 @@ fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
         // see the comment there for why this plus `publish`'s `gen_snap` check
         // covers every case. Deferred entries sat in the seal queue for even
         // longer than an inline compile, so the window is wider here.
-        #[cfg(not(feature = "tcache"))]
-        if crate::jitv2::jit_page_has_dirty_lines((page.pfn * PAGE_SIZE) as u64) {
-            continue;
-        }
         if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1) {
             page.clear_requested_bits(&entry.new_entries);
             // Vouch for the record `handle_request_deferred` staged for this
@@ -992,8 +975,6 @@ mod tests {
 
     #[test]
     fn handle_request_publishes_a_compilable_instruction() {
-        #[cfg(not(feature = "tcache"))]
-        let _g = dirty_probe_lock();
         let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
@@ -1006,68 +987,6 @@ mod tests {
 
         assert!(page.is_runnable(4), "a plain ADDIU must compile and publish");
         assert!(!page.is_denylisted(4));
-    }
-
-    /// The dirty-page gate must actually be wired into *this* design's compile
-    /// path — not merely exist somewhere in the file.
-    ///
-    /// This exists because it was originally missed: both gates were placed in
-    /// `old_impl`, leaving `j2wp` builds with no probe at all. Nothing caught
-    /// it — every unit test passed, IRIX booted, and the only symptom was
-    /// `PageDirtyInCache` silently reading zero in `j2 stats` forever. A test
-    /// that drives the real entry point with a probe forced to "dirty" fails
-    /// loudly in whichever design forgot to consult it.
-    #[cfg(not(feature = "tcache"))]
-    #[test]
-    fn a_dirty_page_is_never_compiled() {
-        let _g = dirty_probe_lock();
-
-        // Sanity first: with no probe installed this exact request publishes.
-        // Without this the test could pass for the wrong reason (e.g. the page
-        // was never compilable to begin with).
-        crate::jitv2::clear_jit_page_probe();
-        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice);
-        let counter = AtomicU64::new(0);
-        let mut page = PhysicalCodePage::new(0, &counter as *const AtomicU64);
-        page.mark_requested(4);
-        let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
-        let mut analyzer = Analyzer::new();
-        let mut codegen = Codegen::new();
-        handle_request_for_test(&req, &bus, &mut analyzer, &mut codegen);
-        assert!(page.is_runnable(4),
-            "precondition: this request must publish when no probe vetoes it");
-
-        // Now the real assertion: a probe reporting the page dirty must stop
-        // the compile before anything is published.
-        fn always_dirty(_ctx: *const (), _page_base: u64) -> bool { true }
-        static ANCHOR: u8 = 0;
-        // SAFETY: `always_dirty` ignores ctx; ANCHOR is a 'static non-null
-        // stand-in so the installed-probe check sees a live pointer.
-        unsafe { crate::jitv2::install_jit_page_probe(&ANCHOR as *const u8 as *const (), always_dirty) };
-
-        let counter2 = AtomicU64::new(0);
-        let mut page2 = PhysicalCodePage::new(0, &counter2 as *const AtomicU64);
-        page2.mark_requested(4);
-        let req2 = CompileRequest { page: &mut page2 as *mut PhysicalCodePage, compiled_for_fr1: true };
-        handle_request_for_test(&req2, &bus, &mut analyzer, &mut codegen);
-
-        crate::jitv2::clear_jit_page_probe();
-
-        assert!(!page2.is_runnable(4),
-            "a page reported dirty in the CPU cache must not publish — the compile would be built \
-             from a stale RAM snapshot (this design's compile path is not consulting the probe)");
-        // The abort must be retryable, not sticky: the offset gets another
-        // chance once the cache lines drain to RAM on their own.
-        assert!(!page2.is_denylisted(4),
-            "a dirty-page abort must leave the offset eligible for a later retry, not denylist it");
-    }
-
-    /// Exclusion for the probe global. Delegates to `jitv2::probe_test_lock`
-    /// rather than owning a mutex here: `mips_cache_v2`'s probe tests install
-    /// into the same global, and two independent locks would exclude nothing.
-    #[cfg(not(feature = "tcache"))]
-    fn dirty_probe_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::jitv2::jitv2::probe_test_lock()
     }
 
     #[test]
@@ -1161,8 +1080,6 @@ mod tests {
     /// sticky denylist, and "bus not readable, retry later."
     #[test]
     fn handle_request_clears_scheduled_bit_on_every_outcome() {
-        #[cfg(not(feature = "tcache"))]
-        let _g = dirty_probe_lock();
         let counter = AtomicU64::new(0);
 
         // Outcome 1: publishes successfully.

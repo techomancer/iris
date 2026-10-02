@@ -9,6 +9,26 @@ is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Build / features
+
+- **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,
+  `mips4` and `r5k` cargo features.** CHD images, the host camera, the
+  Ultra64 dev board, DaynaPort and the IP28 / R10000 machine are always built
+  in and enabled per machine in the config. Physical RAM is always ppmem
+  (host-MMU mapped); RAM banks stay bus devices, so DMA and other bus-path
+  accesses are unchanged. iris-gui drops its matching passthrough features
+  and the "rebuild with --features ..." hints. Old snapshots that recorded
+  `chd`/`camera` in their manifest still restore.
+- **MIPS IV is purely a property of the configured CPU.** The interpreter
+  already monomorphised on `C::MIPS4` (R4400 gets its own MIPS III decoder);
+  jitv2's `Analyzer` carries the same answer as a runtime flag, now defaulting
+  to MIPS IV for tools that have no CPU to ask.
+- **`jitv2` implies `tcache`.** The JIT now always runs over the transparent
+  cache. The compile-time dirty-page probe (`jit_page_has_dirty_lines`,
+  `RejectReason::PageDirtyInCache`) and the non-tcache inline load/store path
+  (`jit_dc_data`) existed only for jitv2 without tcache and are gone.
+  `tcache` can still be enabled alone for an interpreter build.
+
 ### iris-gui
 
 - **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`

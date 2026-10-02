@@ -168,21 +168,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The JIT is a compile-time cargo feature. The CPU is *not*, any more:
-      # 96e5ddd made both cache models monomorphisations selected at machine
-      # construction, so `--features r5k` no longer picks the R5000 and the run
-      # steps below pass `--cpu` instead. The feature is still set here only
-      # because it is what the r5ksc guards key off; it is vestigial for model
-      # selection and can be retired separately.
-      #
-      # Plain r5k only: r5ksc (the external R4600SC-style secondary cache a real
-      # Indy R5000 board has) and r5ksc_triton (the O2's on-die L2, not a machine
-      # this emulator targets anyway) both fail mips_cache_v2's L1I tests and are
-      # refused at compile time (src/lib.rs) — see
-      # rules/testing/r5k-l1i-cache-bugs.md. Plain r5k reports Config.SC as
-      # no-L2, so the cache group tests a real R5000 minus its secondary cache
-      # rather than a machine that never shipped; CPU/FPU correctness (what
-      # cpu-tests actually exercises) doesn't depend on the secondary cache.
+      # The JIT is a compile-time cargo feature; the CPU is not — the run
+      # steps below pass `--cpu`. The R5000 cell is the R5000 without a
+      # secondary cache: r5ksc / r5ksc_triton are refused at compile time
+      # (src/lib.rs, rules/testing/r5k-l1i-cache-bugs.md), and CPU/FPU
+      # correctness (what cpu-tests exercises) doesn't depend on it.
       #
       # jitv2 is the only MIPS JIT (the v1 tiered compiler was removed in
       # 33c4e68). It needs no runtime switch — it is active as soon as the
@@ -195,8 +185,7 @@ jobs:
       - name: Build IRIS
         run: |
           FEATURES=""
-          [ "${{ matrix.cpu }}" = "r5000" ] && FEATURES="r5k"
-          [ "${{ matrix.engine }}" = "jitv2" ] && FEATURES="${FEATURES:+$FEATURES,}jitv2"
+          [ "${{ matrix.engine }}" = "jitv2" ] && FEATURES="jitv2"
           if [ -n "$FEATURES" ]; then
             cargo build --release --bin iris --bin iris-bench --features "$FEATURES"
           else

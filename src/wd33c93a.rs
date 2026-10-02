@@ -412,17 +412,9 @@ impl Wd33c93a {
             }
             return Ok(());
         }
-
-        #[cfg(feature = "chd")]
         let is_chd_path = crate::chd_disk::is_chd(path);
-        #[cfg(not(feature = "chd"))]
-        let is_chd_path = {
-            let p = path.to_ascii_lowercase();
-            p.ends_with(".chd")
-        };
 
         let (backend, size) = if is_chd_path {
-            #[cfg(feature = "chd")]
             {
                 use crate::chd_disk::{ChdCd, ChdHd};
                 if is_cdrom {
@@ -439,13 +431,6 @@ impl Wd33c93a {
                     let sz = hd.size();
                     (DiskBackend::ChdHd(hd), sz)
                 }
-            }
-            #[cfg(not(feature = "chd"))]
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "CHD image support not compiled in (rebuild with --features chd)",
-                ));
             }
         } else if overlay && !is_cdrom {
             let overlay_path = overlay_path_override
@@ -477,7 +462,6 @@ impl Wd33c93a {
     /// image/CHD/overlay path above runs. Its backend thread (NAT gateway, or
     /// PCAP bridge) is started here, before the device becomes visible on the
     /// bus, so the first INQUIRY already finds a live interface.
-    #[cfg(feature = "daynaport")]
     pub fn add_daynaport(
         &self,
         id: usize,
@@ -493,19 +477,6 @@ impl Wd33c93a {
         let mut state = self.state.lock();
         state.devices[id] = Some(ScsiDevice::new_daynaport(dp));
         Ok(())
-    }
-
-    #[cfg(not(feature = "daynaport"))]
-    pub fn add_daynaport(
-        &self,
-        _id: usize,
-        _mac: [u8; 6],
-        _gateway: crate::net::GatewayConfig,
-    ) -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "DaynaPort support not compiled in (rebuild with --features daynaport)",
-        ))
     }
 
     /// Mount media on a CD-ROM device (newly inserts or swaps existing).
@@ -626,7 +597,6 @@ impl Wd33c93a {
     /// `progress(done, total, fraction)` reports per-disk progress; `cancel()`
     /// stops before the next disk (the in-flight rebuild also honours it),
     /// leaving every un-synced base+diff intact. Returns the count synced.
-    #[cfg(feature = "chd")]
     pub fn sync_chd_disks(
         &self,
         only: Option<usize>,
@@ -661,16 +631,6 @@ impl Wd33c93a {
             progress(done, total, 1.0);
         }
         Ok(done)
-    }
-
-    #[cfg(not(feature = "chd"))]
-    pub fn sync_chd_disks(
-        &self,
-        _only: Option<usize>,
-        _progress: &mut dyn FnMut(usize, usize, f32),
-        _cancel: &dyn Fn() -> bool,
-    ) -> std::io::Result<usize> {
-        Ok(0)
     }
 
     /// Copy every COW overlay into `dir` as `scsi<id>.overlay`. Returns a
@@ -1087,7 +1047,6 @@ impl Device for Wd33c93a {
         }
         // Any DaynaPort target owns a backend thread of its own; stop it too
         // (after the worker is joined, so nothing is mid-command).
-        #[cfg(feature = "daynaport")]
         {
             let mut state = self.state.lock();
             for dev in state.devices.iter_mut().flatten() {
@@ -1099,7 +1058,6 @@ impl Device for Wd33c93a {
         if self.running.swap(true, Ordering::SeqCst) { return; }
         // Re-arm any DaynaPort backend a previous stop() shut down. No-op on
         // first boot — add_daynaport() already started them.
-        #[cfg(feature = "daynaport")]
         {
             let mut st = self.state.lock();
             for dev in st.devices.iter_mut().flatten() {
@@ -1287,7 +1245,6 @@ impl Device for Wd33c93a {
                     return Ok(());
                 }
                 Some("dayna") => {
-                    #[cfg(feature = "daynaport")]
                     {
                         let state = self.state.lock();
                         let mut found = false;
@@ -1303,12 +1260,9 @@ impl Device for Wd33c93a {
                             writeln!(writer, "No DaynaPort targets attached").unwrap();
                         }
                     }
-                    #[cfg(not(feature = "daynaport"))]
-                    writeln!(writer, "DaynaPort support not built in (rebuild with --features daynaport)").unwrap();
                     return Ok(());
                 }
                 Some("status") => {
-                    #[cfg(feature = "daynaport")]
                     {
                         let state = self.state.lock();
                         for dev in state.devices.iter().flatten() {
@@ -1499,7 +1453,6 @@ impl Resettable for Wd33c93a {
         // A DaynaPort comes up disabled with empty queues, and its NAT tables
         // are flushed on the backend thread's next loop — the same answer
         // Seeq8003::power_on gives for the onboard Ethernet.
-        #[cfg(feature = "daynaport")]
         for dev in state.devices.iter_mut().flatten() {
             if let Some(dp) = dev.daynaport_mut() { dp.power_on(); }
         }

@@ -11,7 +11,7 @@
 # Usage — pass the SAME cargo selection flags the build used, after `--`:
 #
 #   ./scripts/build-manifest.sh -o dist/manifest.txt -- -p iris-gui --features premiere,pcap
-#   ./scripts/build-manifest.sh -o dist/manifest.txt -- --features lightning,rex-jit,chd
+#   ./scripts/build-manifest.sh -o dist/manifest.txt -- --features lightning,rex-jit
 #   ./scripts/build-manifest.sh                        # defaults: root pkg, default features, stdout
 #
 # Run it AFTER the build, in the same job, on the same machine. It reads the

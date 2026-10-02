@@ -1,5 +1,9 @@
 # The jitv2 dirty-page probe must be retired when its cache dies
 
+> **Retired (October 2026).** `jitv2` now implies `tcache`, which closes this
+> hole by construction, so the probe and everything below it were deleted.
+> Kept for the history.
+
 This is the root cause of the long-standing `--features jitv2,j2wp` crash (~2 runs in 3,
 alternating SIGABRT and SIGSEGV on the `jitv2-compile-N` threads). **It was not the
 "racy as hell" cache probe** that commit `81f1b20` self-describes — that raciness produces

@@ -4,7 +4,7 @@
 
 ```
 prom.bin         # PROM image from a real Indy (optional; a built-in one is used otherwise)
-scsi1.raw        # Hard disk image (raw, or .chd with --features chd)
+scsi1.raw        # Hard disk image (raw or .chd)
 cargo run --release
 ```
 
@@ -450,7 +450,7 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 # Valid IDs: 1–7. For a hard disk, set cdrom = false.
 [scsi.1]
-path    = "scsi1.raw"       # raw image, or .chd with --features chd
+path    = "scsi1.raw"       # raw or .chd image
 cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
 # controller = 0            # Indigo2 only: 0 or 1
@@ -467,8 +467,8 @@ cdrom = true
 # scratch = true
 # size_mb = 64
 
-# DaynaPort SCSI/Link — Ethernet over the SCSI bus. Needs --features daynaport
-# and a guest driver (IRIX: irixdayna -> dp0). See docs/daynaport.md.
+# DaynaPort SCSI/Link — Ethernet over the SCSI bus. Needs a guest driver
+# (IRIX: irixdayna -> dp0). See docs/daynaport.md.
 # [scsi.3]
 # kind   = "daynaport"      # "disk" (default) | "cdrom" | "daynaport"
 # mac    = "00:80:19:12:34:56"
@@ -498,13 +498,13 @@ mode = "nat"                # or "pcap" (--features pcap)
 [vino]                      # IndyCam video-in
 source       = "off"        # "off" (default) | "test_pattern" | "black" | "camera"
 standard     = "ntsc"       # or "pal"
-camera_index = 0            # host camera, source = "camera" only (--features camera)
+camera_index = 0            # host camera, source = "camera" only
 
 [audio]
 prebuf_ms = 20
 # cpal_buffer_frames = 512
 
-# [ultra64]                 # N64 dev board, --features ultra64
+# [ultra64]                 # N64 dev board
 # enabled = true
 
 # ── Host tuning and debugging ────────────────────────────────────────────────
@@ -881,13 +881,8 @@ development board IPC bridge.  The IRIS-compatible fork lives at:
    enabled = true
    ```
 
-   The dev board is an opt-in build feature — without `ultra64` the `[ultra64]`
-   section is ignored and no board appears in GIO slot 0:
-
-   ```bash
-   cargo run --release --features lightning,rex-jit,ultra64          # CLI
-   cargo run --release -p iris-gui --features ultra64                # GUI
-   ```
+   The board is built into every IRIS binary; without `enabled = true` no
+   board appears in GIO slot 0.
 
 2. Build and run the N64 emulator (it can be started at any time — it will
    wait for IRIS to create the shared memory region):
