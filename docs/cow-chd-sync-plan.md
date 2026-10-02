@@ -169,7 +169,7 @@ only the sync *presentation* differs per frontend.
 
 ### Phase 1 — Core: COW toggle wired through MAME's diff
 
-Files: `src/chd_disk.rs`, `src/wd33c93a.rs`, `src/config.rs`.
+Files: `src/chd_disk.rs`, `src/dev/wd33c93a.rs`, `src/config.rs`.
 
 1. **`ChdHd` open modes** (`chd_disk.rs:36-56`): add an explicit COW-on open that
    **always** uses `open_with_diff`/`reopen_diff` (forces a diff even for an

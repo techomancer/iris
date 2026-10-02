@@ -68,7 +68,7 @@ the SD card to a host; the region starts with `IRISLOG1` and a big-endian length
 Four things that were not obvious:
 
 - **PIO writes are not available.** `TRANSFER_DATA_OUT` is raised in exactly one
-  place in `src/wd33c93a.rs` — inside the `TRANSFER_INFO` handler — and never
+  place in `src/dev/wd33c93a.rs` — inside the `TRANSFER_INFO` handler — and never
   from `SELECT_ATN_XFER`. The path IRIX and the PROM use is DMA with the
   descriptor pre-armed, so that is the path to copy. Writing the PIO
   phase-stepping variant instead would exercise emulator code no real guest

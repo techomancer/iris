@@ -881,7 +881,7 @@ pub enum Line {
 
 pub struct Mgras {
     kind: ImpactSlot,
-    ioc: crate::ioc::Ioc,
+    ioc: crate::dev::ioc::Ioc,
     /// System memory, for the board's DMA (it is a GIO bus master).
     sys_mem: Mutex<Option<Arc<dyn BusDevice>>>,
     /// Current level of the general interrupt line.
@@ -901,7 +901,7 @@ pub struct Mgras {
 }
 
 impl Mgras {
-    pub fn new(cfg: &ImpactSection, ioc: crate::ioc::Ioc, heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Self {
+    pub fn new(cfg: &ImpactSection, ioc: crate::dev::ioc::Ioc, heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Self {
         trace::init();
         Mgras {
             kind: cfg.gfx,
@@ -938,7 +938,7 @@ impl Mgras {
 
     /// Drive one of the board's interrupt lines (graphics slot wiring).
     fn set_line(&self, line: Line, active: bool) {
-        use crate::ioc::IocInterrupt;
+        use crate::dev::ioc::IocInterrupt;
         let src = match line {
             Line::Fifo => IocInterrupt::GioSgFifo,
             Line::General => IocInterrupt::GioSgGraphics,

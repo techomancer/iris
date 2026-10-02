@@ -2,7 +2,7 @@ use crate::framebuffer::{new_capture_renderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use iris::config::{MachineConfig, PortForwardConfig};
 use iris::machine::Machine;
-use iris::ps2::Ps2Controller;
+use iris::dev::ps2::Ps2Controller;
 use parking_lot::Mutex;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;

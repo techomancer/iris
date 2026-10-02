@@ -3,7 +3,7 @@
 **Keywords:** indycam, cdmc, vino, camera, green, colour cast, white balance,
 register map, i2c 0x56
 **Category:** vino, irix
-**Status:** Fixed in `src/cdmc.rs`.
+**Status:** Fixed in `src/dev/cdmc.rs`.
 
 ## Symptom
 
@@ -49,7 +49,7 @@ respond proportionally as the guest moves them away from default. AGCENA and
 AWBCTL suppress the gain and balance terms respectively, which matches a host
 webcam running its own auto-exposure and auto-white-balance.
 
-`power_on_defaults_pass_the_field_through_untouched` in `src/cdmc.rs` locks the
+`power_on_defaults_pass_the_field_through_untouched` in `src/dev/cdmc.rs` locks the
 pass-through property in.
 
 ## Debugging technique worth reusing
@@ -58,7 +58,7 @@ Isolate host capture from the guest before touching emulator code. A short
 example binary that opens the camera through the same `nokhwa` path, prints the
 negotiated format and raw buffer length, and writes a PPM proved in one run that
 macOS AVFoundation delivers correct 1920×1080 packed YUYV (Cb at byte 1, Cr at
-byte 3) — clearing `src/camera.rs` and pointing at the guest side.
+byte 3) — clearing `src/dev/camera.rs` and pointing at the guest side.
 
 Then replay a captured host frame through `Cdmc::apply_uyvy_field` offline with
 candidate register states and compare against the guest's screenshot. The

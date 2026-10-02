@@ -62,6 +62,6 @@ and checking every pixel lands where the counter says.
 - `rules/rex3/hostrw-row-boundary-forces-a-word-flush.md` — why the flush is
   unconditional.
 - `rules/rex3/hostrw-batching-design.md` — the batch token/payload protocol.
-- `src/mc_vdma.rs` `rex3_e2e_tests` — the same pattern driven through the real
+- `src/dev/mc_vdma.rs` `rex3_e2e_tests` — the same pattern driven through the real
   VDMA engine into a live REX3, which is what catches an MC/REX3 disagreement
   that neither component's own tests can see.

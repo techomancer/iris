@@ -15,7 +15,7 @@ with the verified platform findings: `rules/build/mmap-rs-fixed-address-aliasing
 **Goals**
 
 - An alternative implementation of physical RAM that presents **exactly the
-  interface `src/mem.rs`'s `Memory` presents today**, so `Physical` can hold it
+  interface `src/dev/mem.rs`'s `Memory` presents today**, so `Physical` can hold it
   in place of `Memory` with no changes to callers.
 - Back the guest's 4GB physical address space with a **real host virtual
   address reservation**, so guest physical address → host address is one add,
@@ -48,7 +48,7 @@ Today every RAM access does `addr & self.addr_mask` then indexes a `Vec<u32>`,
 after a `device_map[addr >> 16]` lookup and a virtual dispatch through
 `*const dyn BusDevice`. The masking exists to emulate SIMM wrapping — a bank
 smaller than its configured slot mirrors within it (`memcfg_bank_info`'s
-`addr_mask`, `src/mc.rs`).
+`addr_mask`, `src/dev/mc.rs`).
 
 The host MMU does all of that in hardware for free. If a bank is mapped into its
 slot repeatedly, mirroring **is** the mapping — no mask, no branch. The

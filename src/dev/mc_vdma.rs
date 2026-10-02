@@ -69,8 +69,8 @@ use std::io::Write as IoWrite;
 
 use crate::devlog::LogModule;
 use crate::traits::BUS_BUSY;
-use crate::ioc::IocInterrupt;
-use crate::mc::MemoryController;
+use crate::dev::ioc::IocInterrupt;
+use crate::dev::mc::MemoryController;
 
 // ── DMA register offsets (MC base 0x1FA00000) ───────────────────────────────
 
@@ -1306,7 +1306,7 @@ impl MemoryController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mem::Memory;
+    use crate::dev::mem::Memory;
     use crate::traits::BusDevice;
 
     /// The 64-bit shortcut paths assume `read64`/`write64` move the same bytes,
@@ -1400,7 +1400,7 @@ mod tests {
     /// `dma_mem_to_gio_64`.
     #[test]
     fn translated_qword_path_reads_through_the_page_table() {
-        use crate::eeprom_93c56::Eeprom93c56;
+        use crate::dev::eeprom_93c56::Eeprom93c56;
         use std::sync::Arc;
         use parking_lot::Mutex as PlMutex;
 
@@ -1501,7 +1501,7 @@ mod zoom_tests {
 #[cfg(test)]
 mod zoom_semantics_tests {
     use super::*;
-    use crate::mem::Memory;
+    use crate::dev::mem::Memory;
     use crate::traits::{BusDevice, BusRead64, BUS_OK};
     use std::sync::Mutex as StdMutex;
 
@@ -1534,7 +1534,7 @@ mod zoom_semantics_tests {
     /// different lines instead of N copies of one.
     #[test]
     fn line_zoom_resends_the_same_source_line() {
-        use crate::eeprom_93c56::Eeprom93c56;
+        use crate::dev::eeprom_93c56::Eeprom93c56;
         use std::sync::Arc;
         use parking_lot::Mutex as PlMutex;
 
@@ -1631,8 +1631,8 @@ mod pixmap_tests {
 #[cfg(test)]
 mod rex3_e2e_tests {
     use super::*;
-    use crate::eeprom_93c56::Eeprom93c56;
-    use crate::mem::Memory;
+    use crate::dev::eeprom_93c56::Eeprom93c56;
+    use crate::dev::mem::Memory;
     use crate::dev::ng1::rex3::*;
     use crate::traits::{BusDevice, Device};
     use parking_lot::Mutex as PlMutex;
@@ -1847,8 +1847,8 @@ mod rex3_e2e_tests {
 #[cfg(test)]
 mod line_bulk_tests_support {
     use super::*;
-    use crate::eeprom_93c56::Eeprom93c56;
-    use crate::mem::Memory;
+    use crate::dev::eeprom_93c56::Eeprom93c56;
+    use crate::dev::mem::Memory;
     use crate::traits::{BusDevice, BusRead64, BUS_ERR, BUS_OK};
     use parking_lot::Mutex as PlMutex;
     use std::sync::Arc;
@@ -2313,8 +2313,8 @@ mod ragged_line_regression_tests {
 #[cfg(test)]
 mod gio32_tests {
     use super::*;
-    use crate::eeprom_93c56::Eeprom93c56;
-    use crate::mem::Memory;
+    use crate::dev::eeprom_93c56::Eeprom93c56;
+    use crate::dev::mem::Memory;
     use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
     use parking_lot::Mutex as PlMutex;
     use std::sync::Arc;
@@ -2360,7 +2360,7 @@ mod gio32_tests {
         // Indy default: only ONE_GIO; the graphics slot is 32 bits wide.
         assert!(mc.gio_slot_is_32bit(PORT));
         // Ng1Probe (Newport) sets GRX_SIZE_64 before touching REX3.
-        mc.write32(crate::mc::MC_BASE + 0x84, 0x400 | 0x2);
+        mc.write32(crate::dev::mc::MC_BASE + 0x84, 0x400 | 0x2);
         assert!(!mc.gio_slot_is_32bit(PORT));
         assert!(mc.gio_slot_is_32bit(0x1f40_0000), "EXP0 still 32-bit");
         assert!(!mc.gio_slot_is_32bit(0x0800_0000), "non-GIO addresses keep 64-bit behaviour");
@@ -2387,7 +2387,7 @@ mod gio32_tests {
         let (bus, mc) = setup();
         mc.start();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let reg = |r: u32, v: u32| { mc.write32(crate::mc::MC_BASE + r, v); };
+        let reg = |r: u32, v: u32| { mc.write32(crate::dev::mc::MC_BASE + r, v); };
         for i in 0..8u32 {
             bus.mem.write8(0x2000 + i, i as u8);
         }
@@ -2400,7 +2400,7 @@ mod gio32_tests {
         reg(REG_DMA_GIO_ADRS, PORT); // starts the transfer
         let t = std::time::Instant::now();
         let run = loop {
-            let r = mc.read32(crate::mc::MC_BASE + REG_DMA_RUN).data;
+            let r = mc.read32(crate::dev::mc::MC_BASE + REG_DMA_RUN).data;
             if r & 0x40 == 0 {
                 break r;
             }

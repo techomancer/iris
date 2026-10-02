@@ -1,6 +1,6 @@
 # DaynaPort target: the three things that bite
 
-Added 2026-08-12 with `--features daynaport` (`src/daynaport.rs`). Protocol per
+Added 2026-08-12 with `--features daynaport` (`src/dev/daynaport.rs`). Protocol per
 SLINKCMD.TXT rev 1.20, cross-checked against `dp_do_rx()` in
 [irixdayna](https://github.com/techomancer/irixdayna). **Verified end to end
 2026-08-13** against both IRIX drivers, with no IRIS changes needed: 6.5 walks

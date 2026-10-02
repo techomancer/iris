@@ -23,7 +23,7 @@
 //! so navigating menus over the display never gets "eaten" into a capture.
 
 use egui::{CursorGrab, Event, Key, MouseWheelUnit, PointerButton, ViewportCommand};
-use iris::ps2::Ps2Controller;
+use iris::dev::ps2::Ps2Controller;
 use winit::keyboard::KeyCode;
 
 pub struct InputState {

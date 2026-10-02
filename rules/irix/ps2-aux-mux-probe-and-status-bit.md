@@ -9,7 +9,7 @@ stays in `PSMOUSE_CMD_MODE`/`PSMOUSE_INITIALIZING` and never reaches
 `PSMOUSE_ACTIVATED` even though well-formed 3-byte motion packets are being
 sent. Keyboard input can also intermittently misbehave.
 
-## Root causes (two independent bugs, both in `src/ps2.rs`)
+## Root causes (two independent bugs, both in `src/dev/ps2.rs`)
 
 **1. Command `0xD3` (`I8042_CMD_AUX_LOOP`) was unhandled.**
 
@@ -69,7 +69,7 @@ reported correctly to the boot-time probe.
 
 ## Where
 
-- `write_command` / `write_data` — `src/ps2.rs` (0xD3 → `CommandState::AuxLoop`
+- `write_command` / `write_data` — `src/dev/ps2.rs` (0xD3 → `CommandState::AuxLoop`
   → next `write_data` byte echoed back tagged `MouseCmd`; 0xA7/0xA8 and
   0xAD/0xAE toggle CTR bits 5/4 in `state.config`)
 - `read_status` — AUX bit now covers both `Mouse` and `MouseCmd` sources

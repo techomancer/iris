@@ -73,7 +73,7 @@ net status      # NAT tables (shared command; shows the onboard NIC's engine)
 ## Protocol
 
 Reference: **SLINKCMD.TXT** (Roger Burrows, rev 1.20). Implemented in
-`src/daynaport.rs`; the record format is what `dp_do_rx()` in the IRIX driver
+`src/dev/daynaport.rs`; the record format is what `dp_do_rx()` in the IRIX driver
 consumes. All multi-byte fields are big-endian on the wire.
 
 | Opcode | Name | Direction |
@@ -104,7 +104,7 @@ Records back to back, each:
    6   pktlen    the Ethernet frame, then 4 CRC bytes
 ```
 
-Rules that matter, all covered by the unit tests in `src/daynaport.rs`:
+Rules that matter, all covered by the unit tests in `src/dev/daynaport.rs`:
 
 - **`pktlen` includes the 4 CRC bytes and the payload physically carries
   them.** Getting this wrong truncates every frame by 4 bytes — frames that are

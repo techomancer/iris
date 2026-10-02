@@ -2,7 +2,7 @@
 
 **Keywords:** vino, indycam, vid, vino_init, SYSID, MC, EISA, no boards found, videod, vlinfo
 **Category:** vino, irix, mc
-**Status:** Fixed in `src/mc.rs` (`init_registers`): SYSID now has bit 4 set
+**Status:** Fixed in `src/dev/mc.rs` (`init_registers`): SYSID now has bit 4 set
 on Indy (`0x13` for Guinness, `0x10` otherwise). With this, `vlinfo` on a
 fresh IRIX 5.3-for-Indy install reports `vino 0` with 5 nodes (digital +
 analog input, two memory drains, device controls). Without it, `videod`
@@ -65,7 +65,7 @@ so iris should report it set.
 
 ## Fix
 
-`src/mc.rs::init_registers`:
+`src/dev/mc.rs::init_registers`:
 
 ```rust
 regs[(REG_SYSID / 4) as usize] = if guinness { 0x00000013 } else { 0x00000010 };
@@ -116,5 +116,5 @@ rule.
 - [vino-gio-alias-offset.md](vino-gio-alias-offset.md) — the prior alias
   fix that made REV_ID reachable in the first place.
 - `docs/mc.pdf` §5.4 — SYSID register layout (documented).
-- `src/mc.rs` — `REG_SYSID` and `init_registers`.
-- `src/vino.rs` — `REV_ID @ 0x0000` returns `0xB0` (chip_id=0xB rev=0).
+- `src/dev/mc.rs` — `REG_SYSID` and `init_registers`.
+- `src/dev/vino.rs` — `REV_ID @ 0x0000` returns `0xB0` (chip_id=0xB rev=0).

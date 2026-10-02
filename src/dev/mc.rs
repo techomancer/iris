@@ -6,14 +6,14 @@ use std::sync::mpsc;
 use std::thread;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Signal, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
-use crate::eeprom_93c56::Eeprom93c56;
-use crate::ioc::{Ioc, IocInterrupt};
+use crate::dev::eeprom_93c56::Eeprom93c56;
+use crate::dev::ioc::{Ioc, IocInterrupt};
 use std::io::Write as IoWrite;
 
 // The GIO virtual DMA engine — registers, µTLB translation and the transfer
 // bodies — lives in `mc_vdma.rs`; its half of `impl MemoryController` is there.
 // Re-exported here so `mc::REG_DMA_*` etc. keep working for existing callers.
-pub use crate::mc_vdma::*;
+pub use crate::dev::mc_vdma::*;
 
 // MC Register Offsets (Base 0x1FA00000)
 pub const MC_BASE: u32 = 0x1FA00000;
@@ -148,7 +148,7 @@ impl MemoryController {
             vdma_debug: Arc::new(AtomicBool::new(false)),
             vdma_log: Arc::new(Mutex::new(None)),
             vdma_stage: Arc::new(Mutex::new(
-                vec![0u64; crate::mc_vdma::VDMA_CHUNK_QWORDS].into_boxed_slice())),
+                vec![0u64; crate::dev::mc_vdma::VDMA_CHUNK_QWORDS].into_boxed_slice())),
         }
     }
 

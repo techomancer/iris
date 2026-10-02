@@ -41,37 +41,37 @@ order they fail in if you walk the IRIX vino driver's init path.
    `0xFF000000` (= `-0x01000000`); had to be `0xE1000000` (=
    `-0x1F000000`). Pure off-by-an-F mistake.
 
-2. **MC SYSID bit 4** (`src/mc.rs`, commit `4cf7c67`).
+2. **MC SYSID bit 4** (`src/dev/mc.rs`, commit `4cf7c67`).
    The IRIX 5.3 vino driver's `vino_init()` reads MC SYSID at `0xBFA0001C`
    and silently bails if bit 4 is clear. Per the MC datasheet bit 4 = "EISA
    present"; on Indy that's clear per spec. The vino driver uses it as a
    vino-board-present gate anyway, so iris has to report it set. Without
    this, `videod` prints "no boards found".
 
-3. **CDMC I2C address `0xAE/0xAF` → `0x56/0x57`** (`src/cdmc.rs`,
+3. **CDMC I2C address `0xAE/0xAF` → `0x56/0x57`** (`src/dev/cdmc.rs`,
    commit `2af7ead`). iris was using a stale 0xAE assumption from
    `IRIX 6.5 indycam.h`. The actual IRIX 5.3 driver writes 0x56/0x57 (=
    7-bit address 0x2B << 1) — verified by literal scan of `vino_*.o`
    immediates.
 
-4. **I2C_DATA writes trigger transfer when NOT_IDLE set** (`src/vino.rs`,
+4. **I2C_DATA writes trigger transfer when NOT_IDLE set** (`src/dev/vino.rs`,
    commit `2af7ead`). Real VINO sends a byte to the slave on every
    I2C_DATA write while NOT_IDLE is asserted. iris was only triggering on
    I2C_CONTROL writes, so only the very first byte of each I2C transaction
    ever reached the slave.
 
-5. **I2C_CONTROL trigger only on rising edge of NOT_IDLE** (`src/vino.rs`,
+5. **I2C_CONTROL trigger only on rising edge of NOT_IDLE** (`src/dev/vino.rs`,
    commit `2af7ead`). The flip-side of #4: once you trigger on every
    I2C_DATA write, you must NOT also trigger on every I2C_CONTROL poll,
    otherwise every byte goes out twice and CDMC state gets scrambled.
 
-6. **CDMC repeated-start recognition** (`src/cdmc.rs`, commit `2af7ead`).
+6. **CDMC repeated-start recognition** (`src/dev/cdmc.rs`, commit `2af7ead`).
    IRIX reads CDMC registers via `START → 0x56 → subaddr → REPEATED-START
    → 0x57 → read`. The CDMC state machine has to recognise its own slave
    address re-arriving mid-transaction as a repeated-start, not as a
    data byte.
 
-7. **CDMC `CAMERA_ID` register at subaddr 0x0E = 0x10** (`src/cdmc.rs`,
+7. **CDMC `CAMERA_ID` register at subaddr 0x0E = 0x10** (`src/dev/cdmc.rs`,
    commit `2db20fb`). `vinoCameraAttached()` reads CDMC subaddr 0x0E and
    requires *exactly* 0x10 to consider the camera present (disassembly in
    vino_main.o); otherwise the kernel prints "IndyCam not attached.
@@ -87,14 +87,14 @@ order they fail in if you walk the IRIX vino driver's init path.
    BlackHoleRegion (read-zero, write-eat) silences it without implementing
    HPC1 semantics.
 
-9. **Vino sub-word access (`read8/16, write8/16`)** (`src/vino.rs`,
+9. **Vino sub-word access (`read8/16, write8/16`)** (`src/dev/vino.rs`,
    commit `2db20fb`). IRIX issues at least one 16-bit read at
    `VINO_BASE + 0x16`; iris's BusDevice impl only had 32/64-bit, so the
    default trait err triggered a `PANIC: KERNEL FAULT … Bad addr:
    0xa0080016`. Implementations extract the appropriate sub-field of the
    underlying 32-bit register.
 
-10. **Interlace: rewind DMA cursor at field boundaries** (`src/vino.rs`,
+10. **Interlace: rewind DMA cursor at field boundaries** (`src/dev/vino.rs`,
     commit `e72ba22`). `pump_field()` reloads descriptors from
     `start_desc_ptr` and sets `page_index` to either 0 (Even field) or
     `line_size + 8` (Odd field, = actual row stride since `CH_LINE_SIZE`
@@ -102,14 +102,14 @@ order they fail in if you walk the IRIX vino driver's init path.
     Without this the Odd field continued past the end of the frame
     buffer and the captured image's odd memory rows stayed zero.
 
-11. **Interlace skip-trigger condition `>=` → `>`** (`src/vino.rs`,
+11. **Interlace skip-trigger condition `>=` → `>`** (`src/dev/vino.rs`,
     commit `e72ba22`). The line-size register encodes the *last dword's*
     offset within the line — one dword short of the actual stride. The
     trigger must fire after `line_counter` exceeds `line_size`, not after
     it equals it. With `>=` the last dword of every row went to the next
     row's territory and a 2-px-per-row drift accumulated.
 
-12. **nokhwa-on-macOS YUYV is YVYU byte-order** (`src/camera.rs`,
+12. **nokhwa-on-macOS YUYV is YVYU byte-order** (`src/dev/camera.rs`,
     commit `e72ba22`). The nokhwa AVFoundation backend delivers Cr at
     byte 1 and Cb at byte 3 (not the textbook Cb-then-Cr YUYV order).
     Reading them straight to `yuv_to_rgb` swapped U and V in every pixel,

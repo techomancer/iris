@@ -11,7 +11,7 @@ read/write log lines during boot — looked like PROM never touched the chip.
 
 ## Root cause
 
-`Hpc3::read8`/`write8` (`src/hpc3.rs`) never had a case for `MISC_BASE`
+`Hpc3::read8`/`write8` (`src/dev/hpc3.rs`) never had a case for `MISC_BASE`
 addresses at all — only `read32`/`write32` handled `MISC_EEPROM_DATA` (the
 bit-banged EEPROM control register at physical `0x1fbb0008`). PROM actually
 drives this register **8 bits at a time**, writing to `0x1fbb000b` — the

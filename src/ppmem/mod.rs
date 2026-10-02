@@ -1,6 +1,6 @@
 //! ppmem — physical paged memory backed by the host MMU.
 //!
-//! An alternative to [`crate::mem::Memory`] that presents the same interface
+//! An alternative to [`crate::dev::mem::Memory`] that presents the same interface
 //! (`BusDevice`, `Resettable`, and `Memory`'s inherent methods) but backs the
 //! guest's physical address space with real host virtual memory, so that
 //! SIMM mirroring and the low-512KB alias become *mappings* rather than

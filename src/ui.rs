@@ -9,7 +9,7 @@ use winit::{
     window::{Window, WindowAttributes, WindowId},
 };
 use glow::HasContext;
-use crate::ps2::Ps2Controller;
+use crate::dev::ps2::Ps2Controller;
 use crate::dev::ng1::rex3::Renderer;
 use crate::gfx_display::GfxDisplay;
 use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats, STATUS_BAR_HEIGHT};
@@ -17,7 +17,7 @@ use crate::compositor::{Compositor, SwCompositor};
 use crate::gl_compositor::GlCompositor;
 use crate::debug_overlay::DebugOverlay;
 use crate::hptimer::{TimerManager, TimerReturn};
-use crate::wd33c93a::Wd33c93a;
+use crate::dev::wd33c93a::Wd33c93a;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, PossiblyCurrentContext, Version};
 use glutin::display::GetGlDisplay;

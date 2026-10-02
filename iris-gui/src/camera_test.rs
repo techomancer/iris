@@ -1,6 +1,6 @@
 //! "Test Camera" support.
 //!
-//! Opens the host camera through the same [`iris::camera::CameraSource`] the
+//! Opens the host camera through the same [`iris::dev::camera::CameraSource`] the
 //! VINO / IndyCam emulation uses, on a background thread, and parks the latest
 //! frame (converted to RGBA) plus a status line for the GUI to display. This
 //! gives the user — and an App Review tester — a way to confirm the host-camera
@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
 
-use iris::camera::CameraSource;
+use iris::dev::camera::CameraSource;
 use iris::video_source::{Field, VideoSource, VideoStandard};
 
 #[derive(Default)]

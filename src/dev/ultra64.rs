@@ -22,7 +22,7 @@
 mod imp {
 
 use crate::devlog::{devlog, devlog_is_active, LogModule};
-use crate::ioc::{Ioc, IocInterrupt};
+use crate::dev::ioc::{Ioc, IocInterrupt};
 use crate::traits::{BusDevice, BusRead32, BusRead64, BusRead16, BusRead8, BUS_OK, Device};
 use crate::ultra_proto::{h2n, n2h, rdb_type, rdb_bytes, IpcRing, ShmHeader,
     SHM_MAGIC, SHM_VERSION, EVENT_AREA_SIZE, SHM_HEADER_OFFSET, SHM_RAMROM_OFFSET,

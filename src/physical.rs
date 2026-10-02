@@ -6,17 +6,17 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, Device
 use crate::devlog::LogModule;
 use crate::exp::eval_const_expr;
 use crate::mips_dis;
-use crate::mem::{BlackHoleRegion, UnmappedRam};
+use crate::dev::mem::{BlackHoleRegion, UnmappedRam};
 use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
 
-use crate::prom::PromPort;
-use crate::mc::MemoryController;
-use crate::hpc3::Hpc3;
+use crate::dev::prom::PromPort;
+use crate::dev::mc::MemoryController;
+use crate::dev::hpc3::Hpc3;
 use crate::dev::ng1::rex3::Rex3;
 use crate::dev::gr2::Gr2;
 use crate::dev::mgras::Mgras;
-use crate::vino::Vino;
-use crate::ultra64::Ultra64;
+use crate::dev::vino::Vino;
+use crate::dev::ultra64::Ultra64;
 
 /// The RAM bank implementation: `PpMemory`, host-MMU-backed (see
 /// `docs/ppmem-design.md`). It is still a `BusDevice`, so DMA and every other
@@ -323,7 +323,7 @@ pub struct Physical {
     pub mgras: Option<Arc<Mgras>>,
     pub ultra64: Option<Arc<Ultra64>>,
     /// Bare-metal test device (`--test-device`), in GIO expansion slot 0.
-    pub testdev: Option<Arc<crate::testdev::TestDevice>>,
+    pub testdev: Option<Arc<crate::dev::testdev::TestDevice>>,
     pub vino: Vino,
     mc: MemoryController,
     hpc3: Hpc3,
@@ -401,7 +401,7 @@ impl Physical {
         gr2: Option<Arc<Gr2>>,
         mgras: Option<Arc<Mgras>>,
         ultra64: Option<Arc<Ultra64>>,
-        testdev: Option<Arc<crate::testdev::TestDevice>>,
+        testdev: Option<Arc<crate::dev::testdev::TestDevice>>,
         vino: Vino,
         mc: MemoryController,
         hpc3: Hpc3,
@@ -539,7 +539,7 @@ impl Physical {
         // Layer 3: real devices overlaid on top
 
         // Map VINO (physical 0x00080000, one 64KB slot)
-        self.device_map[(crate::vino::VINO_BASE >> 16) as usize] = vino_ptr;
+        self.device_map[(crate::dev::vino::VINO_BASE >> 16) as usize] = vino_ptr;
 
         // Map Mystery Hole
         for i in (MYSTERY_HOLE_BASE >> 16)..((MYSTERY_HOLE_END - 1) >> 16) + 1 {
@@ -592,7 +592,7 @@ impl Physical {
 
         // GIO expansion slot 0 (0x1F400000–0x1F5FFFFF): N64 dev board if enabled
         if let Some(u64_ptr) = ultra64_ptr {
-            use crate::ultra64::{GIO_SLOT0_BASE, RAMROM_BASE, RAMROM_SIZE};
+            use crate::dev::ultra64::{GIO_SLOT0_BASE, RAMROM_BASE, RAMROM_SIZE};
             // Control registers: 0x1F400000–0x1F4FFFFF (16 × 64KB slots)
             for i in (GIO_SLOT0_BASE >> 16)..((RAMROM_BASE - 1) >> 16) + 1 {
                 self.device_map[i as usize] = u64_ptr;
@@ -608,7 +608,7 @@ impl Physical {
         // stock Indy and otherwise answers with a GIO timeout. See testdev.rs.
         if let Some(td) = self.testdev.as_deref() {
             let td_ptr: *const dyn BusDevice = td;
-            use crate::testdev::{TEST_DEV_BASE, TEST_DEV_SIZE};
+            use crate::dev::testdev::{TEST_DEV_BASE, TEST_DEV_SIZE};
             for i in (TEST_DEV_BASE >> 16)..((TEST_DEV_BASE + TEST_DEV_SIZE - 1) >> 16) + 1 {
                 self.device_map[i as usize] = td_ptr;
             }
@@ -1191,7 +1191,7 @@ mod ppmem_tests {
     //! MEMCFG write during PROM POST — and checks that the ppmem window ends up
     //! agreeing with the bus.
     use super::*;
-    use crate::mc::MemoryController;
+    use crate::dev::mc::MemoryController;
     use crate::ppmem::MappedMemory;
 
     /// Bank placements exactly as `memcfg_bank_info` decodes them for two

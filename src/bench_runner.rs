@@ -24,7 +24,7 @@ use crate::bench_report::{host_info, parse_block, Run};
 use crate::benchsuite;
 use crate::config::{CpuModel, MachineConfig};
 use crate::machine::Machine;
-use crate::testdev::{RunConfig, TestDevice};
+use crate::dev::testdev::{RunConfig, TestDevice};
 
 /// RAM for the bare-metal machine, in MB per bank — the same 256 MB in two
 /// banks as `bench/run/bare.toml`. The suite probes for up to 24 MB of working

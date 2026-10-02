@@ -13,8 +13,8 @@ mod tests {
     use crate::config::{
         GraphicsBoard, ImpactSection, ImpactSlot, MachineConfig, MachineProfile,
     };
-    use crate::eeprom_93c56::Eeprom93c56;
-    use crate::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
+    use crate::dev::eeprom_93c56::Eeprom93c56;
+    use crate::dev::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
     use crate::dev::mgras::{Mgras, GIO_ID, MGRAS_SLOT_GFX_BASE};
     use crate::traits::{BusDevice, Saveable};
     use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant, GR2_BASE};
@@ -114,10 +114,10 @@ mod tests {
     #[test]
     fn fullhouse_vblank_routes_sg_retrace_to_l1() {
         let ioc = Ioc::new_ci(false);
-        ioc.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, true);
+        ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VerticalRetrace, true);
         let l1 = ioc.read32(IOC_BASE + IOC_INT3_L1_STAT).data as u8;
         assert_ne!(l1 & l1_regs::VERTICAL_RETRACE, 0, "SG retrace should assert L1 vblank");
-        ioc.set_interrupt(crate::ioc::IocInterrupt::VerticalRetrace, false);
+        ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VerticalRetrace, false);
         let l1 = ioc.read32(IOC_BASE + IOC_INT3_L1_STAT).data as u8;
         assert_eq!(l1 & l1_regs::VERTICAL_RETRACE, 0);
     }
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn ioc_fullhouse_gc_select_read_write() {
         let ioc = Ioc::new_ci(false);
-        let gc = IOC_BASE + crate::ioc::IOC_GC_SELECT;
+        let gc = IOC_BASE + crate::dev::ioc::IOC_GC_SELECT;
         assert_eq!(ioc.write32(gc, 0x0F), crate::traits::BUS_OK);
         assert_eq!(ioc.read32(gc).data, 0x0F, "fullhouse gc_select round-trip");
     }
@@ -188,7 +188,7 @@ mod tests {
     fn mgras_answers_the_gio_id_probe() {
         let cfg = ImpactSection { gfx: ImpactSlot::Solid, exp0: ImpactSlot::None, exp1: ImpactSlot::None };
         let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let ioc = crate::ioc::Ioc::new(false);
+        let ioc = crate::dev::ioc::Ioc::new(false);
         let m = Mgras::new(&cfg, ioc, hb.clone(), hb);
         assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE).data, GIO_ID);
     }
@@ -198,7 +198,7 @@ mod tests {
         // MC SYSID is covered in mc.rs; here we sanity-check both profiles share
         // the same EEPROM path convention (no compile-time indigo2 gate).
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
-        let _indy_mc = crate::mc::MemoryController::new(eeprom.clone(), true, [128, 128, 0, 0]);
-        let _i2_mc = crate::mc::MemoryController::new(eeprom, false, [128, 128, 0, 0]);
+        let _indy_mc = crate::dev::mc::MemoryController::new(eeprom.clone(), true, [128, 128, 0, 0]);
+        let _i2_mc = crate::dev::mc::MemoryController::new(eeprom, false, [128, 128, 0, 0]);
     }
 }

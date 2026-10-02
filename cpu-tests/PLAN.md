@@ -161,13 +161,13 @@ Secondary path (debugging + the external `cheritest` corpus): the IRIS **test
 device** — a signature register the guest probes for, plus `PUTC`, a full
 machine-state `DUMP`, and an `EXIT` that sets the process exit code. Absent on
 real hardware, so the suite probes for it and falls back to SCC-only output.
-Landed as `--test-device` (`src/testdev.rs`).
+Landed as `--test-device` (`src/dev/testdev.rs`).
 
 ### 4.2 Console
 
 Write bytes straight to the Z85C30 through KSEG1 (uncached):
 
-- IOC base `0x1FBD9800` (`src/ioc.rs:15`), SCC at `+0x30..0x3C`
+- IOC base `0x1FBD9800` (`src/dev/ioc.rs:15`), SCC at `+0x30..0x3C`
   (`IOC_SERIAL1_CMD/DATA`, `IOC_SERIAL2_CMD/DATA`) → KSEG1 `0xBFBD9830…`.
 - Poll TX-empty in RR0 before each byte. ~40 lines of C.
 - The PROM has already initialised the console before it hands control over, so

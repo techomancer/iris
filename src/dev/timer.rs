@@ -1,3 +1,13 @@
+//! Example bus device: a cycle counter plus a target register.
+//!
+//! Not wired into any machine. It was one of the first devices written after
+//! the `BusDevice`/`Device` traits went in, and it is kept as a small,
+//! complete reference for the shape a device takes: `Timer` is the `Device`
+//! half (lifecycle, `step` advancing the counter), `TimerPort` the
+//! `BusDevice` half (32-bit register decode at 0x00 counter / 0x04 target,
+//! 64-bit accesses split into two 32-bit ones), sharing one locked state.
+//! The target is only stored; nothing fires when the counter reaches it.
+
 use std::sync::Arc;
 use parking_lot::Mutex;
 

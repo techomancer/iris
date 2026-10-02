@@ -4227,7 +4227,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use crate::mem::Memory;
+    use crate::dev::mem::Memory;
     use crate::traits::{BUS_OK, Resettable};
 
     // 4MB — enough tag diversity to exercise eviction; power-of-two for easy masking.

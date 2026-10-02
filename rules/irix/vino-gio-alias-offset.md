@@ -68,7 +68,7 @@ CD.
 
 ## See also
 
-- `src/vino.rs` — `VINO_BASE = 0x00080000`, `REV_ID @ 0x0000` returns `0xB0`.
+- `src/dev/vino.rs` — `VINO_BASE = 0x00080000`, `REV_ID @ 0x0000` returns `0xB0`.
 - `src/physical.rs` — `build_device_map` mapping of `0x1F080000` to
   `vino_gio_alias`.
 - `docs/vino/` — VINO ASIC datasheets.

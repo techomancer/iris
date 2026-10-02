@@ -19,8 +19,8 @@ use parking_lot::{Mutex, Condvar};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device};
-use crate::saa7191::Saa7191;
-use crate::cdmc::Cdmc;
+use crate::dev::saa7191::Saa7191;
+use crate::dev::cdmc::Cdmc;
 use crate::devlog::{LogModule, devlog_is_active};
 use crate::video_source::{VideoSource, Field, FieldParity};
 
@@ -407,7 +407,7 @@ impl Vino {
     }
 
     /// Read CDMC register file for pixel pipeline adjustments.
-    pub fn cdmc_regs(&self) -> [u8; crate::cdmc::reg::COUNT] {
+    pub fn cdmc_regs(&self) -> [u8; crate::dev::cdmc::reg::COUNT] {
         self.state.lock().cdmc.regs_copy()
     }
 
@@ -1815,16 +1815,16 @@ mod tests {
     #[test]
     fn cdmc_version_register_reads_as_identification_value() {
         let vino = Vino::new();
-        let v = i2c_read_reg(&vino, 0x57, crate::cdmc::reg::VERSION);
-        assert_eq!(v, crate::cdmc::reg::VERSION_VAL,
+        let v = i2c_read_reg(&vino, 0x57, crate::dev::cdmc::reg::VERSION);
+        assert_eq!(v, crate::dev::cdmc::reg::VERSION_VAL,
             "CDMC subaddress 0x00 should return the identification byte");
     }
 
     #[test]
     fn cdmc_register_write_then_read_round_trips() {
         let vino = Vino::new();
-        i2c_write_reg(&vino, 0x56, crate::cdmc::reg::GAIN, 0x42);
-        let v = i2c_read_reg(&vino, 0x57, crate::cdmc::reg::GAIN);
+        i2c_write_reg(&vino, 0x56, crate::dev::cdmc::reg::GAIN, 0x42);
+        let v = i2c_read_reg(&vino, 0x57, crate::dev::cdmc::reg::GAIN);
         assert_eq!(v, 0x42, "CDMC GAIN register write should round-trip");
     }
 
@@ -1833,7 +1833,7 @@ mod tests {
         let vino = Vino::new();
 
         // Write CDMC GAIN = 0x77
-        i2c_write_reg(&vino, 0x56, crate::cdmc::reg::GAIN, 0x77);
+        i2c_write_reg(&vino, 0x56, crate::dev::cdmc::reg::GAIN, 0x77);
         {
             let st = vino.state.lock();
             assert!(!st.dmsd.is_active() && !st.cdmc.is_active(),
@@ -1841,10 +1841,10 @@ mod tests {
         }
 
         // Address SAA7191 — must not touch CDMC state.
-        i2c_write_reg(&vino, 0x8A, crate::saa7191::reg::HUEC, 0x55);
+        i2c_write_reg(&vino, 0x8A, crate::dev::saa7191::reg::HUEC, 0x55);
 
         // CDMC GAIN must still be 0x77.
-        let v = i2c_read_reg(&vino, 0x57, crate::cdmc::reg::GAIN);
+        let v = i2c_read_reg(&vino, 0x57, crate::dev::cdmc::reg::GAIN);
         assert_eq!(v, 0x77, "CDMC state must survive SAA7191 traffic");
     }
 

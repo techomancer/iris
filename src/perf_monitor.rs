@@ -4,7 +4,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::hal2::Hal2;
+use crate::dev::hal2::Hal2;
 use crate::dev::ng1::rex3::Rex3;
 use crate::traits::Device;
 

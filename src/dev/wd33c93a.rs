@@ -472,7 +472,7 @@ impl Wd33c93a {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput, "SCSI ID out of range"));
         }
-        let mut dp = crate::daynaport::DaynaPort::new(id, mac, gateway, self.heartbeat.clone());
+        let mut dp = crate::dev::daynaport::DaynaPort::new(id, mac, gateway, self.heartbeat.clone());
         dp.start();
         let mut state = self.state.lock();
         state.devices[id] = Some(ScsiDevice::new_daynaport(dp));

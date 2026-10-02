@@ -2,11 +2,11 @@
 
 **Keywords:** install, miniroot, scsi, pdma, hpc3, irq, storm, wd33c93, condvar, lost-wakeup
 **Category:** irix, hpc3
-**Status:** Fixed in `src/wd33c93a.rs` + `src/hpc3.rs`. Verified end-to-end against 6.5.18 (kernel `10151452`) and 6.5.22 (kernel `10070055`) install media — both miniroots now boot through to the Inst 4.1 prompt.
+**Status:** Fixed in `src/dev/wd33c93a.rs` + `src/dev/hpc3.rs`. Verified end-to-end against 6.5.18 (kernel `10151452`) and 6.5.22 (kernel `10070055`) install media — both miniroots now boot through to the Inst 4.1 prompt.
 
 ## Root cause (TWO bugs working together)
 
-1. **Lost-wakeup race in WD33C93 worker thread** (`src/wd33c93a.rs`).
+1. **Lost-wakeup race in WD33C93 worker thread** (`src/dev/wd33c93a.rs`).
    The thread called `cond.wait()` unconditionally on every iteration. If
    the kernel wrote a new `COMMAND` register between the previous
    `process_wd_command` finishing and `cond.wait` being entered, the
@@ -18,7 +18,7 @@
    loop — the standard condvar pattern.
 
 2. **PDMA SCSI*_DMA intstat bit not cleared by the kernel's chip-level
-   ack** (`src/hpc3.rs`).  IRIX 6.5's miniroot SCSI ISR acks SCSI
+   ack** (`src/dev/hpc3.rs`).  IRIX 6.5's miniroot SCSI ISR acks SCSI
    completions only by reading `SCSI_STATUS` from the WD33C93 chip (which
    clears `ASR.INT`). The PDMA-side `HPC3_INTSTAT_SCSI*_DMA` bit stays
    asserted forever, IP2 storms (~12M IRQs / 2 min, ≈98 k/s), and the
@@ -100,7 +100,7 @@ Possibilities, ranked by current evidence weight:
    `set_active(false)` path on EOX with XIE always raises — perhaps a
    reset/flush sequence on the kernel side triggers this without
    queuing a real descriptor.
-3. **HPC3 `MISC_INTSTAT` write path missing.** `src/hpc3.rs:1610-1631`
+3. **HPC3 `MISC_INTSTAT` write path missing.** `src/dev/hpc3.rs:1610-1631`
    only handles writes to `MISC_GIO_MISC` and `MISC_EEPROM_DATA`; all
    other MISC writes (including a possible W1C of `MISC_INTSTAT`) are
    silently dropped via `_ => {}`. We ruled this out as the *immediate*
@@ -110,15 +110,15 @@ Possibilities, ranked by current evidence weight:
 
 ## Suspect code
 
-- `src/hpc3.rs:620-628` — PDMA IRQ raise on `irq` (end of dma_read/write)
-- `src/hpc3.rs:390-398` — PDMA IRQ raise on EOX descriptor with XIE
-- `src/hpc3.rs:740-771` — `SCSI_CTRL` write handler (FLUSH path also
+- `src/dev/hpc3.rs:620-628` — PDMA IRQ raise on `irq` (end of dma_read/write)
+- `src/dev/hpc3.rs:390-398` — PDMA IRQ raise on EOX descriptor with XIE
+- `src/dev/hpc3.rs:740-771` — `SCSI_CTRL` write handler (FLUSH path also
   raises IRQ if XIE)
-- `src/hpc3.rs:714-728` — `SCSI_CTRL` read = ack path (clears INT,
+- `src/dev/hpc3.rs:714-728` — `SCSI_CTRL` read = ack path (clears INT,
   notifies callback)
-- `src/hpc3.rs:1610-1631` — HPC3 MISC write handler (no `MISC_INTSTAT`
+- `src/dev/hpc3.rs:1610-1631` — HPC3 MISC write handler (no `MISC_INTSTAT`
   case)
-- `src/wd33c93a.rs` — chip ASR/INT bit lifecycle; check whether DMA-end
+- `src/dev/wd33c93a.rs` — chip ASR/INT bit lifecycle; check whether DMA-end
   paths assert ASR.INT for the kernel to find
 
 ## Compare against working installed boot
@@ -146,7 +146,7 @@ The following were tried and verified-not-to-fix the hang. Each was either
 left in place (because it's defensively correct and doesn't break the
 working boot) or removed.
 
-1. **MISC_INTSTAT W1C write handler** (`src/hpc3.rs` write32 path, KEPT).
+1. **MISC_INTSTAT W1C write handler** (`src/dev/hpc3.rs` write32 path, KEPT).
    Implemented W1C: writing 1 to a bit in `MISC_INTSTAT` clears it, and
    for `SCSI*_DMA` / `ENET_*_DMA` bits also clears the per-channel
    `PDMA_CTRL_INT` flag + calls `set_dma_interrupt(false)`. No effect:
@@ -154,7 +154,7 @@ working boot) or removed.
    miniroot kernel never touches that register.
 
 2. **Drop IRQ raise inside SCSI_CTRL FLUSH branch**
-   (`src/hpc3.rs:759-771` ScsiDmaOps::write, KEPT — verified not to
+   (`src/dev/hpc3.rs:759-771` ScsiDmaOps::write, KEPT — verified not to
    break the installed-system boot path). The FLUSH path used to call
    `cb.set_dma_interrupt(true)` if `chan.xie`, on the theory that
    FLUSH should signal completion. Removed — IRIX miniroot acks the
@@ -184,13 +184,13 @@ One of these, in order of likelihood:
 - **WD33C93 doesn't signal `ASR.INT` at end-of-DMA for the IO pattern
   the miniroot uses.** The IRIX SCSI ISR likely checks `ASR.INT` first
   and returns "not me" if zero, even when PDMA's `SCSI0_DMA` bit is set
-  in `MISC_INTSTAT`. Fix would live in `src/wd33c93a.rs` — wire the
+  in `MISC_INTSTAT`. Fix would live in `src/dev/wd33c93a.rs` — wire the
   end-of-DMA event from the PdmaClient back into the chip so it raises
   `ASR.INT` at the same instant.
 - **Spurious PDMA IRQ raise on stale-descriptor re-fetch.** When the
   kernel re-activates a previously-deactivated channel whose `nbdp`
   still points at the prior chain's terminator (bc=0 + EOX + XIE),
-  `fetch_descriptor()` at `src/hpc3.rs:388-405` re-fires the IRQ.
+  `fetch_descriptor()` at `src/dev/hpc3.rs:388-405` re-fires the IRQ.
   Fix: suppress IRQ from `fetch_descriptor` when re-activating onto
   a stale terminal descriptor. Needs validation that real HPC3 doesn't.
 - **Edge-vs-level mismatch on `MISC_INTSTAT[SCSI0_DMA]`.** Last resort

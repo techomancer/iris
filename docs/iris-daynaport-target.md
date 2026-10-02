@@ -53,10 +53,10 @@ on this work:
 | File | What it does now | What it needs |
 |---|---|---|
 | `src/scsi.rs` | `ScsiDevice` — one concrete struct, `is_cdrom: bool` selects HDD vs CD-ROM behaviour. `ScsiDevice::request(&mut self, &ScsiRequest) -> Result<ScsiResponse>` dispatches on `req.cdb[0]`. | A third device kind, and a dispatch branch that runs **before** the storage opcodes |
-| `src/wd33c93a.rs` | The controller. Owns `state.devices[id]: Option<ScsiDevice>`; constructs them around lines 385–444 from config | Construct a DaynaPort target when configured |
+| `src/dev/wd33c93a.rs` | The controller. Owns `state.devices[id]: Option<ScsiDevice>`; constructs them around lines 385–444 from config | Construct a DaynaPort target when configured |
 | `src/config.rs` | `ScsiConfig { path, cdrom, overlay }` (~line 15) | A way to say "this target is a DaynaPort" |
 | `src/net.rs` | `NatEngine`, `GatewayConfig`, `NatControl`, `NetBackend` trait, frame helpers (`eth_frame`, `mac_str`, `eth_summary`) | Reuse as-is — no changes expected |
-| `src/seeq8003.rs` | The Indy's onboard Ethernet. **This is your template** for how a device owns frame queues and drives a `NatEngine` | Read `start()` around lines 550–600 |
+| `src/dev/seeq8003.rs` | The Indy's onboard Ethernet. **This is your template** for how a device owns frame queues and drives a `NatEngine` | Read `start()` around lines 550–600 |
 
 ### The reuse that makes this cheap
 
@@ -64,7 +64,7 @@ on this work:
 ring buffers and hands the far ends to a `NatEngine` running on its own thread:
 
 ```rust
-// src/seeq8003.rs, in Device::start()
+// src/dev/seeq8003.rs, in Device::start()
 NatEngine::new(config, tx_cons, rx_prod, rx_wake_nat, tx_wake_nat,
                running_nat, nat_ctl).run();
 ```
@@ -228,7 +228,7 @@ and return empty READ responses.
 
 Roughly, and adapt to what the code actually looks like:
 
-1. **`src/daynaport.rs`** (new). A `DaynaPort` struct holding:
+1. **`src/dev/daynaport.rs`** (new). A `DaynaPort` struct holding:
    - `tx_prod: rtrb::Producer<Vec<u8>>`, `rx_cons: rtrb::Consumer<Vec<u8>>`
    - the wake handles the `NatEngine` needs
    - `mac: [u8; 6]`, `enabled: bool`, `broadcast: bool`
@@ -260,7 +260,7 @@ Roughly, and adapt to what the code actually looks like:
 
    Keep the existing `cdrom = true` spelling working so no config breaks.
 
-4. **`src/wd33c93a.rs`** — around lines 385–444, construct a DaynaPort target
+4. **`src/dev/wd33c93a.rs`** — around lines 385–444, construct a DaynaPort target
    when the config says so, instead of opening a disk image. Note it has no
    file backing at all, so the CHD/overlay path must be skipped entirely.
 
@@ -374,6 +374,6 @@ works you can validate against both IRIX releases.
   implementing that section. `irix5.3/RESUME.md` has the porting background.
 - **BlueSCSI V2 / ZuluSCSI** firmware — open-source implementations of this
   exact device, and the source of the multi-packet extension.
-- **IRIS**: `HACKING.md`, `src/seeq8003.rs` (the template), `src/net.rs`
+- **IRIS**: `HACKING.md`, `src/dev/seeq8003.rs` (the template), `src/net.rs`
   (the backend you are reusing), `rules/` (check before re-deriving a gotcha,
   and add a note there when you confirm a non-obvious fix).

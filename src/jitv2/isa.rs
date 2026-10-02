@@ -138,7 +138,7 @@ mod tests {
         use crate::mips_cache_v2::{CpuModel, PassthroughCache, PassthroughCacheM4};
         use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
         use crate::mips_tlb::PassthroughTlb;
-        use crate::mem::Memory;
+        use crate::dev::mem::Memory;
         use crate::traits::BusDevice;
         use std::sync::Arc;
 

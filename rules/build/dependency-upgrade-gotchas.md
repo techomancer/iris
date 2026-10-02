@@ -30,7 +30,7 @@ least made Cargo *validate the feature names* on every host; it is now gated to
 `cfg(target_os = "windows")` (see the riscv64 section below), so off-Windows not
 even the feature names are checked.
 
-## cpal 0.18 API churn (`src/hal2.rs`)
+## cpal 0.18 API churn (`src/dev/hal2.rs`)
 
 Four unrelated breaks in the audio-output path:
 

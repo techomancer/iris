@@ -1,5 +1,5 @@
 //! Host-MMU-backed physical memory banks — a drop-in alternative to
-//! [`crate::mem::Memory`].
+//! [`crate::dev::mem::Memory`].
 //!
 //! See `docs/ppmem-design.md`. In short: a bank's storage is a shared-memory
 //! object rather than a `Vec<u32>`, which lets the same bank be mapped into
@@ -156,7 +156,7 @@ pub trait MappedMemory {
 
 /// One physical memory bank.
 ///
-/// The ppmem counterpart of [`crate::mem::Memory`], with the same storage
+/// The ppmem counterpart of [`crate::dev::mem::Memory`], with the same storage
 /// layout and the same interface. Cheap to clone-share via `Arc`; the backing
 /// object is refcounted so the bank stays alive as long as either the bank
 /// handle or any mapping of it does.
@@ -957,7 +957,7 @@ mod tests {
     /// `PpMemory` can stand in for `Memory` anywhere.
     #[test]
     fn matches_memory_byte_for_byte() {
-        use crate::mem::Memory;
+        use crate::dev::mem::Memory;
         let a = Memory::new(8);
         let b = PpMemory::new(8);
 
@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn addr_mask_wraps_like_memory() {
-        use crate::mem::Memory;
+        use crate::dev::mem::Memory;
         let mut a = Memory::new(8);
         let b = PpMemory::new(8);
         // Mirror an 8MB bank every 1MB.
@@ -1074,7 +1074,7 @@ mod tests {
             assert_eq!(b.read32(i * 4).data, 0x1234_0000 + i, "word {i}");
         }
         // Format must be interchangeable with Memory's.
-        let c = crate::mem::Memory::new(8);
+        let c = crate::dev::mem::Memory::new(8);
         c.load_bin(&path).unwrap();
         assert_eq!(c.read32(0).data, b.read32(0).data);
 

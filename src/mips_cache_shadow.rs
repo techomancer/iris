@@ -547,7 +547,7 @@ pub type R10000ShadowCache =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mem::Memory;
+    use crate::dev::mem::Memory;
     use crate::mips_cache_v2::{CACH_PD, CACH_SD};
 
     fn cache() -> R10000ShadowCache {

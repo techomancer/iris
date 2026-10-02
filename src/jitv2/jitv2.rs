@@ -7,7 +7,7 @@
 //!   the physical page it's currently executing out of.
 //! - Generation counters live in the owning `BusDevice` (one per page for RAM,
 //!   a single shared never-bumped counter for ROM — `BusDevice::gen_ptr`,
-//!   `src/mem.rs`, `src/prom.rs`) and are read through a raw pointer here so the
+//!   `src/dev/mem.rs`, `src/dev/prom.rs`) and are read through a raw pointer here so the
 //!   hot path avoids an indirect call through the device trait object.
 //!
 //! Threading model: the mips exec thread owns `PhysicalCodePage` management

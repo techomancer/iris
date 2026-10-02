@@ -67,11 +67,11 @@ pub trait VideoSource: Send + Sync {
 /// Applies IndyCam CDMC gain/balance/saturation to UYVY fields after capture.
 pub struct CdmcAdjustedSource {
     inner: Arc<dyn VideoSource>,
-    vino:  crate::vino::Vino,
+    vino:  crate::dev::vino::Vino,
 }
 
 impl CdmcAdjustedSource {
-    pub fn new(inner: Arc<dyn VideoSource>, vino: crate::vino::Vino) -> Self {
+    pub fn new(inner: Arc<dyn VideoSource>, vino: crate::dev::vino::Vino) -> Self {
         Self { inner, vino }
     }
 }
@@ -83,7 +83,7 @@ impl VideoSource for CdmcAdjustedSource {
         let mut field = self.inner.next_field();
         let regs = self.vino.cdmc_regs();
         let mut pixels = field.pixels.to_vec();
-        crate::cdmc::Cdmc::apply_uyvy_field(&mut pixels, &regs);
+        crate::dev::cdmc::Cdmc::apply_uyvy_field(&mut pixels, &regs);
         field.pixels = Arc::from(pixels);
         field
     }
@@ -93,9 +93,9 @@ impl VideoSource for CdmcAdjustedSource {
         format!(
             "{}  cdmc gain={:#04x} red_bal={:#04x} blue_bal={:#04x}",
             self.inner.status(),
-            regs[crate::cdmc::reg::GAIN as usize],
-            regs[crate::cdmc::reg::RED_BAL as usize],
-            regs[crate::cdmc::reg::BLUE_BAL as usize],
+            regs[crate::dev::cdmc::reg::GAIN as usize],
+            regs[crate::dev::cdmc::reg::RED_BAL as usize],
+            regs[crate::dev::cdmc::reg::BLUE_BAL as usize],
         )
     }
 }

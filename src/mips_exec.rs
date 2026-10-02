@@ -7213,7 +7213,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // cheritest: a write to CP0 26 triggers the test device's dump. Routed
         // over the bus, so with no test device mapped it's an ignored GIO access.
         if reg == 26 && self.cheritest_dump_hook {
-            self.sysad.write32(crate::testdev::TEST_DEV_BASE + crate::testdev::REG_DUMP,
+            self.sysad.write32(crate::dev::testdev::TEST_DEV_BASE + crate::dev::testdev::REG_DUMP,
                                self.core.cp0_ecc);
         }
         #[cfg(feature = "r5ksc_triton")]

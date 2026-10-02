@@ -275,7 +275,7 @@ are not real. It compares a digest of the *sources*, not the image bytes:
 
 A bare-metal image loaded with `--load-elf` has no argv and no environment, so
 the host leaves its request in a test-device register the guest reads at
-startup (`TESTDEV_RUN_CONFIG`, `src/testdev.rs`):
+startup (`TESTDEV_RUN_CONFIG`, `src/dev/testdev.rs`):
 
 ```
   31            16 15   12 11             0

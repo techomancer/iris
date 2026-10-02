@@ -775,7 +775,7 @@ impl App {
             }
         }
         // Surface the embedded-PROM fallback so it's clear the start did
-        // happen (iris::prom::Prom::from_file_or_embedded handles this
+        // happen (iris::dev::prom::Prom::from_file_or_embedded handles this
         // transparently — we just echo it to the toast).
         if !std::path::Path::new(&self.cfg.prom).exists() {
             self.toast(format!("'{}' not found — using embedded PROM", self.cfg.prom));

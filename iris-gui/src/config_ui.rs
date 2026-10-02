@@ -147,7 +147,7 @@ pub enum ConfigAction {
     None,
     /// User clicked "Use embedded PROM"; the app should confirm with the user
     /// and, if accepted, clear `cfg.prom` (an empty path falls back to the
-    /// built-in PROM in `iris::prom::Prom::from_file_or_embedded`).
+    /// built-in PROM in `iris::dev::prom::Prom::from_file_or_embedded`).
     RequestEmbeddedProm,
     /// User clicked "Test Camera" on the Video-In tab; the app should open the
     /// host camera and show a live preview (using the current `[vino]` standard

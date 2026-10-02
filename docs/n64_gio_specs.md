@@ -5,7 +5,7 @@ and communication protocols for the original Nintendo 64 Development Board (the 
 GIO-bus peripheral card designed for Silicon Graphics Indy workstations).
 
 > **Emulation note**: This hardware is being emulated by two cooperating processes — IRIS (SGI
-> Indy) and gopher64 (N64). See `src/ultra64.rs` (IRIS) and gopher64's `src/device/sgi_dev.rs`
+> Indy) and gopher64 (N64). See `src/dev/ultra64.rs` (IRIS) and gopher64's `src/device/sgi_dev.rs`
 > for the implementation. The IPC bridge design is documented at the end of this file.
 
 ---

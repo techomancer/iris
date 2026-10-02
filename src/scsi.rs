@@ -135,7 +135,7 @@ impl DiskBackend {
 pub enum DeviceKind {
     Disk,
     Cdrom,
-    DaynaPort(Box<crate::daynaport::DaynaPort>),
+    DaynaPort(Box<crate::dev::daynaport::DaynaPort>),
 }
 
 pub struct ScsiDevice {
@@ -203,7 +203,7 @@ impl ScsiDevice {
 
     /// Construct a DaynaPort SCSI/Link target — a type-3 Processor device with
     /// no storage backing at all (no image, no CHD, no overlay).
-    pub fn new_daynaport(dp: crate::daynaport::DaynaPort) -> Self {
+    pub fn new_daynaport(dp: crate::dev::daynaport::DaynaPort) -> Self {
         Self {
             backend: None,
             size: 0,
@@ -219,7 +219,7 @@ impl ScsiDevice {
     }
 
     /// The DaynaPort behind this target, if it is one.
-    pub fn daynaport_mut(&mut self) -> Option<&mut crate::daynaport::DaynaPort> {
+    pub fn daynaport_mut(&mut self) -> Option<&mut crate::dev::daynaport::DaynaPort> {
         match &mut self.kind {
             DeviceKind::DaynaPort(dp) => Some(dp),
             _ => None,
@@ -227,7 +227,7 @@ impl ScsiDevice {
     }
 
     /// The DaynaPort behind this target, if it is one.
-    pub fn daynaport(&self) -> Option<&crate::daynaport::DaynaPort> {
+    pub fn daynaport(&self) -> Option<&crate::dev::daynaport::DaynaPort> {
         match &self.kind {
             DeviceKind::DaynaPort(dp) => Some(dp),
             _ => None,

@@ -10,7 +10,7 @@ on **6.5.22**, where it currently does NOT fully work yet.
 **Status: ★ SOLVED + CLEAN IMAGE (cont. 15–16) ★** — `vidtomem` delivers a **clean,
 correctly-coloured 640×480 SMPTE-bar frame** on IRIX 6.5, reproducibly (no hang, no
 scramble). First successful end-to-end IndyCam capture on 6.5. FOUR fixes in
-`src/vino.rs` + a fast-exchange fix in `src/iris_ci_main.rs` (all uncommitted on
+`src/dev/vino.rs` + a fast-exchange fix in `src/iris_ci_main.rs` (all uncommitted on
 `vino-6.5-capture-engage`, alongside committed physical.rs alias 8426efd). Read cont. 16
 (latest) then 15. The vino.rs fixes:
 1. **`dma_emit_dword` defer** (delivery): interlaced first field (`field_counter==0`)
@@ -37,13 +37,13 @@ not chased — the bars/ramp look clean.
 
 **Committed/shipped (safe, keep):**
 - VINO bit-30 descriptor-pointer strip (`desc::PTR_MASK = 0x3FFF_FFF0` in
-  `src/vino.rs`). Makes 6.5 capture engage + DESC fire. 5.3-neutral. This
+  `src/dev/vino.rs`). Makes 6.5 capture engage + DESC fire. 5.3-neutral. This
   REPLACES the earlier `src/physical.rs` `alias_phys()` (commit `8426efd`):
   the `0x4000_0000` accesses were VINO DMA, not the CPU, and there is no RAM
   alias there on real hardware — the bit-30 JUMP control flag must be stripped
   in VINO, not aliased across the whole physical bus. See "Fix #1" below.
 - Boot speed 292s→89s on the klindert guest (nsswitch files-first + FQDN + service
-  disables) — see [[project_klindert_boot_speed]]. `src/vino.rs` is at HEAD.
+  disables) — see [[project_klindert_boot_speed]]. `src/dev/vino.rs` is at HEAD.
 
 **THE delivery path (unified — cont. 6 and cont. 11 are the SAME gate):** videod's
 worker blocks in the kernel `vinoGetFrame` on `sleep(conn,0x13c)` (0x118&8==0 ⇒
@@ -75,7 +75,7 @@ the cursor reach STOP each field). The kernel then re-arms DMA every field, sett
 `conn+0xb8=1` EVERY field → `0x7640` always takes the EVEN branch → parity never odd
 → `0x60b4` never reaches its tail → `*(conn+0xc)` never clears → videod never woken.
 
-**THE FIX (IMPLEMENTED in `dma_emit_dword`, `src/vino.rs`):** model one DMA-enable
+**THE FIX (IMPLEMENTED in `dma_emit_dword`, `src/dev/vino.rs`):** model one DMA-enable
 cycle as one interlaced frame. `field_counter` is 0 for the cycle's first field (reset
 in `start_channel`) and >=1 after. When the DMA cursor reaches a STOP descriptor, if
 `interleave && field_counter == 0` (the FIRST field), DO NOT raise DESC and DO NOT
@@ -279,7 +279,7 @@ not match it. Do not present the current reconstruction as a faithful grab.
 - **But `vlGetNextValid` times out**: the driver enables DMA, doesn't get the
   completion it waits for, tears down and retries in a tight loop forever.
 
-## Fix #1 (DONE): strip the descriptor bit-30 control flag in VINO — `src/vino.rs`
+## Fix #1 (DONE): strip the descriptor bit-30 control flag in VINO — `src/dev/vino.rs`
 
 The `MC: CPU Error at 48621cf0` flood (~160k lines) was **not** a CPU access and
 there is **no 0x40000000 RAM alias** on the Indy. The accesses are VINO **DMA**:
@@ -354,7 +354,7 @@ driver lays out a long descriptor chain (3 page-ptrs + a JUMP per 16-byte
 group, advancing `0x10` per jump) that ends in a region of `0x80000001` STOP
 descriptors (seen at `0x08621400`).
 
-iris's `pump_field()` (`src/vino.rs`) **rewinds to a fixed `start_desc_ptr` at
+iris's `pump_field()` (`src/dev/vino.rs`) **rewinds to a fixed `start_desc_ptr` at
 the start of every field and never advances it**, so it re-traverses the same
 front of the chain each field and never reaches the STOP descriptors → the DESC
 interrupt never fires → the driver never sees completion.
@@ -404,7 +404,7 @@ Two findings this session, one a fix and one a self-inflicted regression now rev
    vidtomem run. So the earlier hypothesis that 6.5 needed an interlace
    restructure (one DESC per frame, no per-row skip, no rewind) was WRONG — that
    restructure REMOVED the descriptor-cursor advance that lands the cursor on the
-   chain's STOP, so DESC stopped firing. Reverted `src/vino.rs` to HEAD. The
+   chain's STOP, so DESC stopped firing. Reverted `src/dev/vino.rs` to HEAD. The
    original per-row interleave skip + stride pad is load-bearing: one field emits
    ~150 page-writes but the chain is 300 aligned pages, so each write must advance
    the cursor ~2 descriptor slots (the skip) to reach STOP and raise DESC.
@@ -504,7 +504,7 @@ Drove the kernel completion check (vino.o vinoEOD→0x77c0) from the iris side.
 `s1 != buffer_base && s1 != buffer_base+0x10 && s1 != *(conn+0xc)`, where `s1`
 is the channel's A_DESC_TABLE_PTR (reg 0x70, low word read at 0x74).
 
-Fixes applied this pass (all in src/vino.rs, on top of the physical.rs alias):
+Fixes applied this pass (all in src/dev/vino.rs, on top of the physical.rs alias):
 1. **field_counter free-running** (don't zero in start_channel). More
    hardware-faithful; did NOT by itself fix delivery.
 2. **A_DESC_TABLE_PTR read returns the live cursor** (`next_desc_ptr`), not the
@@ -578,7 +578,7 @@ genuine multi-session work, not a one-line fix.
 - src/physical.rs: uncached-alias fix — SOLID standalone win (makes 6.5 capture
   engage + DESC fire; no 5.3 regression expected as it's a pure bus-alias fix).
   RECOMMEND COMMITTING THIS ALONE.
-- src/vino.rs: register-modeling improvements (field_counter free-run;
+- src/dev/vino.rs: register-modeling improvements (field_counter free-run;
   A_DESC_TABLE_PTR read = live next_desc_ptr; next_desc_ptr advances across JUMPs;
   interleave rewind targets the re-armed A_NEXT_4_DESC base). All more
   hardware-faithful and necessary for the eventual fix, but they do NOT by
@@ -1000,7 +1000,7 @@ chain STOP each field). The kernel re-arms DMA each field → `conn+0xb8=1` each
 forever; `*(conn+0xd2)` sampled even.)
 
 ### 7. THE FIX (IMPLEMENTED — compiles + unit-tested; live validation pending)
-Implemented in `dma_emit_dword` (`src/vino.rs`), NOT via the pump_field rewind. Insight:
+Implemented in `dma_emit_dword` (`src/dev/vino.rs`), NOT via the pump_field rewind. Insight:
 a DMA-enable cycle = one interlaced frame; `field_counter` (reset to 0 in
 `start_channel`, incremented per field) IS the in-cycle field index. At the STOP
 descriptor, `if interleave && field_counter == 0` (first field) → return false WITHOUT
@@ -1032,7 +1032,7 @@ icrash (module relocates per boot — re-derive each boot): `od vino_board 1`→
 `/tmp/dv2.py` (host) is the symbol/reloc-aware disassembler used this session:
 `python3 /tmp/dv2.py <symbol>` | `-r <start> <end>` (raw range) | `-c <symbol>`
 (callers via relocs). vino.o at `/tmp/vino.o`. Committed state unchanged: physical.rs
-alias only (8426efd); src/vino.rs at HEAD.
+alias only (8426efd); src/dev/vino.rs at HEAD.
 
 ## 2026-05-30 (cont. 13) — LIVE TEST of the cont.12 fix: parity now reaches ODD, but delivery still blocked
 
@@ -1193,7 +1193,7 @@ assumed `phys==base`; the kernel actually records the field boundary at `base+0x
 (≈ descriptor group 120 — exactly the "cursor freezes at 0x0861e780" from cont. 3, and
 = rows-per-field 240 × 8).
 
-### THE FIX (two parts, both in src/vino.rs — VERIFIED LIVE)
+### THE FIX (two parts, both in src/dev/vino.rs — VERIFIED LIVE)
 1. **`dma_emit_dword`** (from cont.12): on an interlaced capture, the FIRST field of a
    DMA-enable cycle (`field_counter==0`) reaches STOP but DEFERS — no DESC, no DMA
    disable (EOF only); the SECOND field raises EOF+DESC. → INTR 0x01 then 0x05, parity
@@ -1229,7 +1229,7 @@ hang). FIRST successful end-to-end IndyCam capture on 6.5.
 
 ## 2026-05-30 (cont. 16) — image UNSCRAMBLED: JUMP alignment + R/B byte order; iris-ci get fixed
 
-After delivery (cont. 15) the saved frame was scrambled. Two more fixes (src/vino.rs)
+After delivery (cont. 15) the saved frame was scrambled. Two more fixes (src/dev/vino.rs)
 produce a clean, correctly-coloured 640×480 SMPTE bar capture (verified live — pulled
 via `iris-ci get`, converted with ImageMagick, visually correct: white/yellow/cyan/
 green/magenta/red/blue/black bars + luma ramp):
@@ -1259,7 +1259,7 @@ sh-root (6.5 klindert) and csh-root (classic 5.3) guests.
 ### State
 Full pipeline works end to end on 6.5: capture → videod → vidtomem → a clean, correctly
 coloured 640×480 SGI frame, pulled to the host fast. Uncommitted on
-`vino-6.5-capture-engage`: src/vino.rs (delivery defer + DESC_TABLE_PTR span + JUMP
+`vino-6.5-capture-engage`: src/dev/vino.rs (delivery defer + DESC_TABLE_PTR span + JUMP
 align + ABGR) and src/iris_ci_main.rs (shell-aware get/put). 11 vino unit tests pass.
 Remaining follow-ups: derive FIELD_DESC_SPAN (0x780) from geometry for non-640×480;
 5.3 regression (geometry/colour now apply to 5.3's interlace path too — verify stock

@@ -5,10 +5,10 @@ use crate::devlog::LogModule;
 use std::sync::mpsc;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::snapshot::{get_field, toml_u8, hex_u8};
-use crate::z85c30::{Z85c30, IrqCallback};
-use crate::pit8254::{Pit8254, TimerCallback};
+use crate::dev::z85c30::{Z85c30, IrqCallback};
+use crate::dev::pit8254::{Pit8254, TimerCallback};
 use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
-use crate::ps2::{Ps2Controller, Ps2Callback};
+use crate::dev::ps2::{Ps2Controller, Ps2Callback};
 use crate::hptimer::TimerManager;
 use std::io::Write;
 
@@ -16,7 +16,7 @@ pub const IOC_BASE: u32 = 0x1FBD9800;
 pub const IOC_SIZE: u32 = 0x100;
 
 /// Fullhouse-only: real physical base of the INT2 register block (HPC3 PBUS
-/// PIO channel 4 — same address `crate::hpc3::HPC3_BASE + HPC3_INT2_BASE`
+/// PIO channel 4 — same address `crate::dev::hpc3::HPC3_BASE + HPC3_INT2_BASE`
 /// resolves to). Lower than `IOC_BASE` (PIO channel 6), so `read8`/`write8`
 /// check this window *before* computing `addr - IOC_BASE`, letting callers
 /// (hpc3.rs) forward whichever real address they received to the same
@@ -145,7 +145,7 @@ pub mod ext_io_regs {
 /// IP22 fullhouse exposes the *same* INT3-shaped interrupt registers
 /// (`l0_stat`/`l0_mask`/`l1_stat`/`l1_mask`/`map_stat`/`map_mask0`/
 /// `map_mask1`, plus the embedded PIT) as Indy, just at a second, more
-/// compact address — HPC3 PBUS PIO channel 4 (`crate::hpc3::HPC3_INT2_BASE`)
+/// compact address — HPC3 PBUS PIO channel 4 (`crate::dev::hpc3::HPC3_INT2_BASE`)
 /// — instead of PIO channel 6 (`IOC_BASE`). Confirmed against MAME's
 /// `src/mame/sgi/ioc2.cpp`: `ioc2_guinness_device` and
 /// `ioc2_full_house_device` both derive from the same `ioc2_device` base

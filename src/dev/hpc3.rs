@@ -7,14 +7,14 @@ use crate::devlog::{LogModule, devlog_mask};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
 use crate::snapshot::{get_field, u32_slice_to_toml, load_u32_slice, toml_u32, toml_bool, hex_u32};
 use crate::config::{AudioConfig, NetworkConfig, RtcOffset};
-use crate::eeprom_93c56::Eeprom93c56;
-use crate::ioc::Ioc;
-use crate::ds1x86::Ds1x86;
+use crate::dev::eeprom_93c56::Eeprom93c56;
+use crate::dev::ioc::Ioc;
+use crate::dev::ds1x86::Ds1x86;
 use crate::net::GatewayConfig;
-use crate::seeq8003::{Seeq8003, SeeqCallback};
-use crate::wd33c93a::{Wd33c93a, ScsiCallback};
-use crate::ioc::IocInterrupt;
-use crate::hal2::Hal2;
+use crate::dev::seeq8003::{Seeq8003, SeeqCallback};
+use crate::dev::wd33c93a::{Wd33c93a, ScsiCallback};
+use crate::dev::ioc::IocInterrupt;
+use crate::dev::hal2::Hal2;
 use crate::hptimer::TimerManager;
 use crate::exp::eval_const_expr;
 
@@ -102,18 +102,18 @@ pub const HAL2_BASE: u32 = 0x58000;
 /// hal2 driver recognises "no chip" and skips init rather than spinning.
 /// All other registers return 0: ISR.TSTATUS=0 (not busy), no spurious state.
 fn hal2_absent_read(offset: u32) -> u16 {
-    use crate::hal2::HAL2_REV;
+    use crate::dev::hal2::HAL2_REV;
     if (offset & 0xF0) == HAL2_REV { 0xFFFF } else { 0x0000 }
 }
 pub const HPC3_IOC_BASE: u32 = 0x59800;
 pub const PBUS_PIO_STRIDE: u32 = 0x400;
 /// IP22 fullhouse only: INT2 interrupt registers at PBUS PIO channel 4.
 /// Same register semantics as guinness's INT3 (HPC3_IOC_BASE / PIO channel
-/// 6), just a different address — see `crate::ioc::INT2_REG_COUNT`'s doc
+/// 6), just a different address — see `crate::dev::ioc::INT2_REG_COUNT`'s doc
 /// comment. Registers are dword-indexed (`idx = offset >> 2`), matching the
 /// packing every other PBUS PIO channel in this file already uses.
 pub const HPC3_INT2_BASE: u32 = PBUS_PIO_BASE + 4 * PBUS_PIO_STRIDE;
-pub const HPC3_INT2_SIZE: u32 = crate::ioc::INT2_REG_COUNT * 4;
+pub const HPC3_INT2_SIZE: u32 = crate::dev::ioc::INT2_REG_COUNT * 4;
 
 /// IP22 fullhouse only: Full House's "extended register" (PBUS PIO channel
 /// 5). `kern/sys/hpc3.h`: "Address of Full House's extended register. PX at

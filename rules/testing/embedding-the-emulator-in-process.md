@@ -50,7 +50,7 @@ already running.
 ## Give the guest its configuration through a register
 
 A bare-metal image loaded with `--load-elf` has no argv and no environment.
-`TESTDEV_RUN_CONFIG` (`src/testdev.rs`, `RunConfig`) is the channel. Encode it so
+`TESTDEV_RUN_CONFIG` (`src/dev/testdev.rs`, `RunConfig`) is the channel. Encode it so
 that **every field means "unrestricted" when zero**: that is what an emulator
 predating the register returns from an undecoded address, so the guest can read
 it unconditionally with no capability check of its own beyond the one that

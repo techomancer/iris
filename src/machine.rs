@@ -9,7 +9,7 @@ use std::thread;
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig};
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
-use crate::eeprom_93c56::Eeprom93c56;
+use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::physical::Physical;
 
 // Helper for passing *mut Physical into a Send+Sync closure (MEMCFG callback).
@@ -21,8 +21,8 @@ impl PhysPtr {
     fn get(&self) -> *mut Physical { self.0 }
 }
 use crate::physical::RamBank;
-use crate::prom::Prom;
-use crate::mc::MemoryController;
+use crate::dev::prom::Prom;
+use crate::dev::mc::MemoryController;
 
 /// Count on the IP28's 195 MHz R10000: half the pipeline clock, and what
 /// IRIX assumes there (see where the MC is created).
@@ -32,8 +32,8 @@ use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter
 use crate::gdb_stub::CpuDebug;
 use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
 use crate::mips_cache_shadow::R10000ShadowCache;
-use crate::hpc3::Hpc3;
-use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
+use crate::dev::hpc3::Hpc3;
+use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
 use crate::dev::ng1::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
@@ -76,7 +76,7 @@ pub struct Machine {
     timer_manager: Arc<TimerManager>,
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
-    ci_serial: Option<Arc<crate::z85c30::CiSerialBackend>>,
+    ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
     /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
     /// name as the fallback path if the in-memory checkpoint is absent.
     last_restore: Option<String>,
@@ -254,7 +254,7 @@ impl Machine {
     /// `process::exit` (`crate::bench_runner`, `TestDevice::new_embedded`).
     pub fn new_with_testdev(
         cfg: MachineConfig,
-        testdev_override: Option<Arc<crate::testdev::TestDevice>>,
+        testdev_override: Option<Arc<crate::dev::testdev::TestDevice>>,
     ) -> Self {
         // Capture config flags that are needed after the local `cfg` binding
         // is shadowed later in this function.
@@ -353,7 +353,7 @@ impl Machine {
         // Must happen before any peripheral `start()` call (which clones the
         // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
-            let b = Arc::new(crate::z85c30::CiSerialBackend::new());
+            let b = Arc::new(crate::dev::z85c30::CiSerialBackend::new());
             if let Some(path) = cfg.serial_log.as_deref() {
                 if let Err(e) = b.set_log_file(path) {
                     eprintln!("iris: serial_log: failed to open {}: {}", path, e);
@@ -370,7 +370,7 @@ impl Machine {
             // in addition to whatever client is attached to the TCP socket.
             if let Some(path) = cfg.serial_log.as_deref() {
                 let inner = ioc.scc().backend_b();
-                match crate::z85c30::TeeBackend::new(inner, path) {
+                match crate::dev::z85c30::TeeBackend::new(inner, path) {
                     Ok(tee) => {
                         ioc.scc().set_backend_b(Arc::new(tee));
                         eprintln!("iris: serial console mirroring to {}", path);
@@ -586,7 +586,7 @@ impl Machine {
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
                 // latch the guest clears (see Ioc::write8/int2_write8), so only
                 // the rising edge is driven from here.
-                let line = if guinness { crate::ioc::IocInterrupt::VerticalRetrace } else { crate::ioc::IocInterrupt::GioSgRetrace };
+                let line = if guinness { crate::dev::ioc::IocInterrupt::VerticalRetrace } else { crate::dev::ioc::IocInterrupt::GioSgRetrace };
                 if guinness { ioc.set_gen_cntl_retrace_ack(true); }
                 let ioc_r = ioc.clone();
                 // true = vertical blank starts, false = it ends. On Indigo2,
@@ -594,7 +594,7 @@ impl Machine {
                 // blank); the PROM and the kernel retrace handler poll it.
                 g.set_retrace_callback(Arc::new(move |vblank| {
                     if vblank { ioc_r.set_interrupt(line, true); }
-                    if !guinness { ioc_r.set_ext_io_level(crate::ioc::ext_io_regs::SG_STAT_0, !vblank); }
+                    if !guinness { ioc_r.set_ext_io_level(crate::dev::ioc::ext_io_regs::SG_STAT_0, !vblank); }
                 }));
                 Some(g)
             }
@@ -608,8 +608,8 @@ impl Machine {
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
-        let ultra64: Option<Arc<crate::ultra64::Ultra64>> = if cfg.ultra64.enabled {
-            match crate::ultra64::Ultra64::new(ioc.clone()) {
+        let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled {
+            match crate::dev::ultra64::Ultra64::new(ioc.clone()) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
                     eprintln!("ultra64: failed to initialize ({e}); running without N64 dev board");
@@ -621,12 +621,12 @@ impl Machine {
         };
 
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
-        let vino = crate::vino::Vino::new();
+        let vino = crate::dev::vino::Vino::new();
         {
-            struct VinoIrqAdapter { ioc: crate::ioc::Ioc }
-            impl crate::vino::VinoIrq for VinoIrqAdapter {
+            struct VinoIrqAdapter { ioc: crate::dev::ioc::Ioc }
+            impl crate::dev::vino::VinoIrq for VinoIrqAdapter {
                 fn set_interrupt(&self, active: bool) {
-                    self.ioc.set_interrupt(crate::ioc::IocInterrupt::VideoVsync, active);
+                    self.ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VideoVsync, active);
                 }
             }
             vino.set_irq(Arc::new(VinoIrqAdapter { ioc: ioc.clone() }));
@@ -648,10 +648,10 @@ impl Machine {
                 ultra64.is_some(),
             );
             let path = cfg.test_device_dump.clone()
-                .unwrap_or_else(|| crate::testdev::DEFAULT_DUMP_PATH.to_string());
+                .unwrap_or_else(|| crate::dev::testdev::DEFAULT_DUMP_PATH.to_string());
             eprintln!("iris: test device enabled at {:#010x}, dumps to {}",
-                      crate::testdev::TEST_DEV_BASE, path);
-            Some(Arc::new(crate::testdev::TestDevice::new(path)))
+                      crate::dev::testdev::TEST_DEV_BASE, path);
+            Some(Arc::new(crate::dev::testdev::TestDevice::new(path)))
         } else {
             None
         };
@@ -723,7 +723,7 @@ impl Machine {
             crate::config::VinoSource::Camera => {
                 {
                     let idx = cfg.vino.camera_index;
-                    match crate::camera::CameraSource::new_with_index(standard, idx) {
+                    match crate::dev::camera::CameraSource::new_with_index(standard, idx) {
                         Ok(c)  => Some(Arc::new(c)),
                         Err(e) => {
                             eprintln!("VINO: camera {} unavailable ({}); using black source", idx, e);
@@ -1177,7 +1177,7 @@ impl Machine {
         }
     }
 
-    pub fn get_ps2(&self) -> Arc<crate::ps2::Ps2Controller> {
+    pub fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
         self.hpc3.ioc().ps2()
     }
 
@@ -1248,7 +1248,7 @@ impl Machine {
 
     /// The in-process serial backend used by `--ci` mode. `None` in
     /// interactive mode.
-    pub fn get_ci_serial(&self) -> Option<Arc<crate::z85c30::CiSerialBackend>> {
+    pub fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> {
         self.ci_serial.clone()
     }
 

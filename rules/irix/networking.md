@@ -41,7 +41,7 @@ backdoor-injects `[network] mac` (default `08:00:69:12:34:56`, see
 `config::DEFAULT_MAC`) directly into the emulated chip before the CPU ever
 runs, rather than requiring a guest-side `setenv`:
 
-- **Indy (`Ds1x86::backdoor_set_mac_if_blank`, `src/ds1x86.rs`):** patches
+- **Indy (`Ds1x86::backdoor_set_mac_if_blank`, `src/dev/ds1x86.rs`):** patches
   NVRAM bytes `regs[314..320]` — the offset SGI's own documented
   `fill -w -v 0xbfbe04e8 ...` RTC-recovery procedure pokes (physical
   `0x1fbe04e8..0x1fbe04fc`, HPC3 PBUS_BBRAM sparse-packs one live byte per
@@ -49,7 +49,7 @@ runs, rather than requiring a guest-side `setenv`:
   314..319 = 0x13a..0x13f). Only patches while the slot is still blank
   (`00:00:00:00:00:00`), so it never clobbers a MAC you already `setenv -f
   eaddr`'d and `rtc save`d from a prior session.
-- **Indigo2 (`Eeprom93c56::backdoor_set_mac_if_blank`, `src/eeprom_93c56.rs`):**
+- **Indigo2 (`Eeprom93c56::backdoor_set_mac_if_blank`, `src/dev/eeprom_93c56.rs`):**
   patches EEPROM words `0x7D..0x7F` (last 3 of 128 words: `MAC[0]<<8|MAC[1]`,
   `MAC[2]<<8|MAC[3]`, `MAC[4]<<8|MAC[5]`). Only patches while those words are
   still erased (`0xFFFF` each), so it never clobbers a MAC already written

@@ -9,7 +9,7 @@ at 256 MB even when the GUI shows 384 or 512 MB.
 
 After each MEMCFG0/1 write, if banks 0–1 are valid (VLD=1) and configured
 himem banks are still invalid, `MemoryController::synthesize_himem_banks` patches
-MEMCFG1 and fires the remap callback. See `src/mc.rs`.
+MEMCFG1 and fires the remap callback. See `src/dev/mc.rs`.
 
 ## Verify
 

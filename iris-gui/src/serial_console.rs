@@ -1,7 +1,7 @@
 //! In-app IRIX serial-console viewer.
 //!
 //! The emulated SGI Indy exposes its serial console (ttyd1) as a loopback TCP
-//! server on `127.0.0.1:8881` (see `iris::z85c30`). This viewer connects to it
+//! server on `127.0.0.1:8881` (see `iris::dev::z85c30`). This viewer connects to it
 //! as a client and shows the live console stream, and lets the user type back
 //! into it — so the serial console works inside the app without an external
 //! terminal. It is also the visible demonstration of the app's network
