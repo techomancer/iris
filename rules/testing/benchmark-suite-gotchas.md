@@ -88,9 +88,23 @@ that depends on a mapping *prove* the mapping before timing it.
 
 ## The feature banner has to name the CPU
 
-`print_build_features()` in `src/main.rs` did not list `r5k`, `jitv2`, or
+`print_build_features()` in `src/main.rs` once did not list `r5k`, `jitv2`, or
 `mips4`, so an R5000 build announced itself as `build features: tlbvmap` and a
-benchmark result recorded from it was indistinguishable from an R4400 one. It
-lists them now. `iris-bench matrix` still cross-checks the guest's own
+benchmark result recorded from it was indistinguishable from an R4400 one. The
+CPU is a runtime setting now (`--cpu`; the `r5k`/`mips4` features are gone), so
+the banner cannot name it. `iris-bench matrix` cross-checks the guest's own
 `#machine cpu=` line, read from PRId — same guard, and for the same reason, as
 `cpu-tests/run/matrix.sh`.
+
+## A comment edit in a guest input makes the prebuilt image "stale"
+
+`make -C bench check-prebuilt` (CI) hashes the *files* the guest is built from —
+`bench/harness`, `bench/kernels`, `bench/golden/golden.h`, `bench/Makefile`,
+`cpu-tests/harness`, `cpu-tests/toolchain.mk` — not the code. Rewording a
+comment in `bench/Makefile` during an unrelated cleanup was enough to fail it.
+
+If the change cannot affect the image (comments, docs-only lines), don't rebuild:
+`python3 bench/prebuilt-stamp.py --write` re-records the digest against the
+existing `irisbench.elf`, and `make -C bench check-prebuilt` confirms. Commit
+`bench/prebuilt/PROVENANCE` with the edit. Anything that can change the code
+still needs the full `make -C bench prebuilt`.
