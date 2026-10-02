@@ -14,7 +14,7 @@ use crate::mc::MemoryController;
 use crate::hpc3::Hpc3;
 use crate::dev::ng1::rex3::Rex3;
 use crate::dev::gr2::Gr2;
-use crate::mgras::Mgras;
+use crate::dev::mgras::Mgras;
 use crate::vino::Vino;
 use crate::ultra64::Ultra64;
 

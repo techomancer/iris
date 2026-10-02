@@ -230,7 +230,6 @@ pub mod camera;
 pub mod saa7191;
 pub mod video_source;
 pub mod vino;
-pub mod mgras;
 pub mod ultra_proto;
 pub mod ultra64;
 #[cfg(feature = "jitv2")]

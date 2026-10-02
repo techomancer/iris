@@ -15,7 +15,7 @@ mod tests {
     };
     use crate::eeprom_93c56::Eeprom93c56;
     use crate::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
-    use crate::mgras::{Mgras, GIO_ID, MGRAS_SLOT_GFX_BASE};
+    use crate::dev::mgras::{Mgras, GIO_ID, MGRAS_SLOT_GFX_BASE};
     use crate::traits::{BusDevice, Saveable};
     use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant, GR2_BASE};
 

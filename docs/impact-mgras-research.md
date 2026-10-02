@@ -2,13 +2,13 @@
 
 IRIS emulates **Newport (REX3)** on Indy and Indigo2 XL paths. IMPACT is a separate
 post-1995 architecture (on-board geometry + TRAM). A **preview register stub** lives in
-`src/mgras.rs` (Wave 5).
+`src/dev/mgras.rs` (Wave 5).
 
 ## Implementation status (IRIS)
 
 | Component | Status |
 |-----------|--------|
-| `src/mgras.rs` | Preview — per-slot register file, GIO mapping for gfx/exp0/exp1 |
+| `src/dev/mgras.rs` | Preview — per-slot register file, GIO mapping for gfx/exp0/exp1 |
 | `config::ImpactSection` | `[impact]` TOML: `gfx`, `exp0`, `exp1` → `none` / `solid` / `high` / `max` |
 | `physical.rs` | Maps MGRAS stub across populated GIO slots when `profile = indigo2_ip22` |
 | Command processing / TRAM / GL | **Not implemented** |
@@ -56,7 +56,7 @@ Valid dual-head combos with Newport: Solid+Solid, Solid+High, Solid+Max — not 
 **Recommendation:** Complete Indigo2 Newport boot + dual-head before pursuing full IMPACT.
 Orders of magnitude more work than REX3.
 
-## Stub register map (`src/mgras.rs`)
+## Stub register map (`src/dev/mgras.rs`)
 
 Each populated GIO slot exposes an 8 KB window at `slot_base + 0x0F0000` (same offset
 pattern as Newport/XZ until a verified MGRAS map is available):

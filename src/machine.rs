@@ -601,8 +601,8 @@ impl Machine {
         };
 
         // Indigo2 IMPACT graphics in the GIO graphics slot.
-        let mgras: Option<Arc<crate::mgras::Mgras>> = if !guinness && cfg.impact.any_enabled() {
-            Some(Arc::new(crate::mgras::Mgras::new(&cfg.impact, ioc.clone(), heartbeat.clone(), fasttick_count.clone())))
+        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = if !guinness && cfg.impact.any_enabled() {
+            Some(Arc::new(crate::dev::mgras::Mgras::new(&cfg.impact, ioc.clone(), heartbeat.clone(), fasttick_count.clone())))
         } else {
             None
         };
@@ -713,7 +713,7 @@ impl Machine {
         // Host GL frames composite straight into the IMPACT framebuffer.
         #[cfg(feature = "hostgl")]
         if let Some(mgras) = &phys.mgras {
-            iris_hostcall::set_display(Arc::new(crate::mgras::ImpactScreen(mgras.clone())));
+            iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(mgras.clone())));
         }
         let standard = match cfg.vino.standard {
             crate::config::VinoStandard::Ntsc => crate::video_source::VideoStandard::Ntsc,
