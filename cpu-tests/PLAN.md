@@ -21,14 +21,14 @@ This document was the roadmap.
 
 | Thing | Where | Note |
 |---|---|---|
-| 101 host-side Rust CPU tests | `src/mips_exec_test.rs` | ALU, FPU, TLB, LL/SC, COP1X, FR-bit aliasing, fusion… Runs under `cargo test`. |
-| TLB unit tests | `src/mips_tlb_test.rs` | |
+| 101 host-side Rust CPU tests | `src/cpu/mips_exec_test.rs` | ALU, FPU, TLB, LL/SC, COP1X, FR-bit aliasing, fusion… Runs under `cargo test`. |
+| TLB unit tests | `src/cpu/mips_tlb_test.rs` | |
 | SGI volume-header writer | `src/sgi_vh.rs` | Writes magic + partition table + checksum. **Does not yet write the volume directory** (the `vd[15]` array at offset `0x48`) — that is what makes a disk bootable by name. |
 | CD-ROM with 512↔2048 block switching | `src/scsi.rs:174` | Exactly what the PROM/`dksc` needs to read an SGI VH + EFS off a CD. |
 | Runtime disc load | `iris-ci cdrom-load <id> <path>` | Swap a freshly built test image without restarting the emulator. |
 | Serial drive + capture | `iris-ci serial-send / serial-wait / --serial-log` | The CI result channel. |
 | Snapshots | `iris-ci save/restore` (~145 ms restore) | Restore a "sitting at the PROM prompt" snapshot instead of re-POSTing each run. |
-| Monitor console (TCP 8888) | `src/mips_exec.rs:5880+` | `regs`, `cop0`, `cop1`, `mem`, `dis`, `bp add`, `step`, `loadsym`, `l1i/l1d/l2`, `tlb dump`. This is the debugger for failing tests. |
+| Monitor console (TCP 8888) | `src/cpu/mips_exec.rs:5880+` | `regs`, `cop0`, `cop1`, `mem`, `dis`, `bp add`, `step`, `loadsym`, `l1i/l1d/l2`, `tlb dump`. This is the debugger for failing tests. |
 | GDB stub | `src/gdb_stub.rs`, `--gdb-port` | `mips-…-gdb` can single-step a failing test binary. |
 | YAML test driver | `tools/iris-test`, `tools/tests/*.yaml` | Existing pattern for scripted emulator runs. |
 
@@ -126,8 +126,8 @@ and decide expectations at runtime:
 | ISA | MIPS III | MIPS IV (RECIP/RSQRT, MOVF/MOVT, COP1X MADD/LDXC1…, PREF) |
 | L2 | present | absent, external, or Triton on-die per feature |
 
-(source: `src/mips_core.rs:348-364`, `src/mips_cache_v2.rs:41-100`,
-`src/mips_exec.rs:777-790`)
+(source: `src/cpu/mips_core.rs:348-364`, `src/cpu/mips_cache_v2.rs:41-100`,
+`src/cpu/mips_exec.rs:777-790`)
 
 Design rule: **every check declares which CPUs it applies to.** A MIPS IV
 opcode is a *pass* on R4400 only if it raises Reserved Instruction, and a
@@ -234,7 +234,7 @@ be *stable*), `0x8000000000000000 / -1`, 32-bit results sign-extended.
 
 **mem/** — `lb/lbu/lh/lhu/lw/lwu/ld/sb/sh/sw/sd`; **`lwl/lwr/swl/swr` and
 `ldl/ldr/sdl/sdr` at all 4/8 alignments** (big-endian merge semantics — very
-high bug density, and `src/mips_exec_test.rs` only covers some cases);
+high bug density, and `src/cpu/mips_exec_test.rs` only covers some cases);
 unaligned `lw`/`ld` → AdEL/AdES with correct `BadVAddr`; `ll/sc` and `lld/scd`
 including SC-fails-after-intervening-store, SC-fails-after-ERET, and `LLAddr`;
 KUSEG/KSEG0/KSEG1/KSEG2/XKPHYS address decoding.
@@ -254,7 +254,7 @@ COP2/COP3 always), address error on fetch, correct **vector selection**
 **cp0/** — per-register writable-bit masks (R4400 vs R5000 differ; `PRId`
 read-only; `Config` mostly read-only except K0/CU); `Count`/`Compare` →
 IP7 timer interrupt and `Count` running at half clock
-(`src/mips_core.rs:589`); `Random` decrement + `Wired` floor; `Context`/
+(`src/cpu/mips_core.rs:589`); `Random` decrement + `Wired` floor; `Context`/
 `XContext` auto-fill on TLB miss; `WatchLo/WatchHi` watchpoints on load/store;
 `LLAddr`; `TagLo/TagHi`; software interrupts via `Cause.IP0/IP1`; `Status.IM`
 masking; interrupt taken in a delay slot.
@@ -280,7 +280,7 @@ this area has already bitten once.
 neg/mov` in S and D; all conversions (`cvt.s/d/w/l`, `round/trunc/ceil/floor`)
 under all four rounding modes; **IEEE edge cases** — signed zeros, infinities,
 quiet vs signalling NaN propagation, denormal input/output handling (R4400
-punts to software on underflow; see `src/mips_exec.rs:3779`); FCSR
+punts to software on underflow; see `src/cpu/mips_exec.rs:3779`); FCSR
 cause/enable/flag bit interaction, trapped vs untrapped exceptions;
 all 16 `C.cond.fmt` predicates; `BC1T/F` + `BC1TL/FL` with a delay slot;
 FCSR readback after each op.
@@ -370,7 +370,7 @@ Three ways to get the binary executing, fastest first:
 **Tier 0 — direct load (needs a small IRIS change).**
 Add `--load-elf FILE` / a monitor `loadbin <file> <addr>` command, then
 `jump` + `run`. Sub-second iteration, no PROM, no image. ~100 lines against the
-existing monitor command table in `src/mips_exec.rs`. Best debug loop by far;
+existing monitor command table in `src/cpu/mips_exec.rs`. Best debug loop by far;
 also the only mode that can run before POST.
 
 **Tier 1 — PROM boot from a scratch disk.**

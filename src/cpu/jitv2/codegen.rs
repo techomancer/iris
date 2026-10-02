@@ -21,10 +21,10 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
 
-use crate::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
-use crate::jitv2::{ARENA_RESERVE_SIZE, ENTRIES_PER_PAGE, PAGE_SIZE};
-use crate::mips_core::MipsCore;
-use crate::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, ExecStatus};
+use crate::cpu::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
+use crate::cpu::jitv2::{ARENA_RESERVE_SIZE, ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::cpu::mips_core::MipsCore;
+use crate::cpu::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, ExecStatus};
 
 /// Cranelift codegen context, reused across compile jobs like `Analyzer`
 /// (§2.3's per-page scratch-buffer pattern) — `Context`/`FunctionBuilderContext`
@@ -37,7 +37,7 @@ pub struct Codegen {
     /// than as const-generic parameters. `supported == false` (the default)
     /// means no inline path is emitted and every access calls out, which is
     /// always correct — see docs/jit-inline-memory.md §4.
-    pub dc_geometry: crate::mips_cache_v2::JitDcGeometry,
+    pub dc_geometry: crate::cpu::mips_cache_v2::JitDcGeometry,
     /// Compile-time constants for this `Codegen`'s one core — see
     /// [`JitConsts`]. Default (all `None`) means "load from memory as
     /// before", which is always correct.
@@ -135,14 +135,14 @@ pub struct Codegen {
     /// was built with — see `PagedArenaState`'s own doc comment for why this
     /// indirection exists. Polled via `provider_crossed_page`/`packing_stats`
     /// after every compile.
-    paged_state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+    paged_state: std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     /// A second handle over the exact same shared arena as `module`'s own
     /// (opaque, unreachable) provider — see `new_module`'s doc comment.
     /// Exists purely so `Codegen` can drive non-forced sealing
     /// (`try_seal_pending`, `set_force_seal`) from outside `module` without
     /// needing anything back from it — `JITModule` never exposes its own
     /// provider once constructed.
-    seal_handle: crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+    seal_handle: crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
     /// Byte range (arena-relative offsets) each still-unpublished `FuncId`'s
     /// machine code landed in, recorded by `compile_region_uncommitted`
     /// right after its `define_function` call, read via
@@ -225,7 +225,7 @@ struct EmitCtx<'a, 'b> {
     /// unconditionally at the exception-exit call site itself rather than
     /// trusted from whatever's already live in `core.in_delay_slot`.
     /// L1-D geometry for the inline memory path, copied from `Codegen`.
-    dc_geometry: crate::mips_cache_v2::JitDcGeometry,
+    dc_geometry: crate::cpu::mips_cache_v2::JitDcGeometry,
     bd: bool,
     /// `true` iff an exception raised while emitting with this `ctx` must
     /// **trust the live `core.pc`/`core.in_delay_slot`** (route through
@@ -526,12 +526,12 @@ impl Codegen {
     /// (`compile_region_uncommitted`'s range tracking) without needing
     /// anything back from the module.
     fn new_module(
-        shared: Option<std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>>,
-        state: Option<std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>>,
+        shared: Option<std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>>,
+        state: Option<std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>>,
     ) -> (
         cranelift_jit::JITModule,
-        std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
-        crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+        std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+        crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
     ) {
         let mut flag_builder = settings::builder();
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
@@ -543,8 +543,8 @@ impl Codegen {
         let (shared, paged_state) = match shared {
             Some(shared) => (shared, state.expect("new_module: shared arena given without its PagedArenaState")),
             None => {
-                let paged_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-                let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(ARENA_RESERVE_SIZE, paged_state.clone())
+                let paged_state = std::sync::Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+                let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(ARENA_RESERVE_SIZE, paged_state.clone())
                     .expect("failed to reserve jitv2 Codegen arena");
                 (shared, paged_state)
             }
@@ -559,8 +559,8 @@ impl Codegen {
         // the one actually inside `JITModule`); `seal_handle` only ever
         // reads via `take_last_allocation`.
         let last_allocation = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        let module_handle = crate::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared_with_mailbox(shared.clone(), last_allocation.clone());
-        let seal_handle = crate::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared_with_mailbox(shared, last_allocation);
+        let module_handle = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared_with_mailbox(shared.clone(), last_allocation.clone());
+        let seal_handle = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared_with_mailbox(shared, last_allocation);
         jit_builder.memory_provider(Box::new(module_handle));
         (cranelift_jit::JITModule::new(jit_builder), paged_state, seal_handle)
     }
@@ -585,8 +585,8 @@ impl Codegen {
     /// rather than reserving a fresh one and leaking the old — see
     /// `PagedArenaMemoryProvider::shared`'s own doc comment).
     pub fn new_with_shared_arena(
-        shared: std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
-        state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+        shared: std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+        state: std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) -> Self {
         Self::from_module(Self::new_module(Some(shared), Some(state)))
     }
@@ -594,8 +594,8 @@ impl Codegen {
     fn from_module(
         (module, paged_state, seal_handle): (
             cranelift_jit::JITModule,
-            std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
-            crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+            std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+            crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
         ),
     ) -> Self {
         Self {
@@ -605,7 +605,7 @@ impl Codegen {
             func_id_counter: 0,
             // Off until the CPU publishes a real geometry; every access
             // calls out in the meantime, which is the pre-existing behaviour.
-            dc_geometry: crate::mips_cache_v2::JitDcGeometry::unsupported(),
+            dc_geometry: crate::cpu::mips_cache_v2::JitDcGeometry::unsupported(),
             jit_consts: JitConsts::default(),
             // Built by `emit_mem_helpers`, which the CPU triggers once
             // `dc_geometry` is known (a fresh `Codegen` has none yet, so
@@ -655,8 +655,8 @@ impl Codegen {
     /// reserving a fresh one, e.g. a `j2 inline` mode switch reusing the
     /// outgoing mode's still-live arena instead of leaking it.
     pub fn shared_arena(&self) -> (
-        std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
-        std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+        std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+        std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) {
         (self.seal_handle.shared(), self.paged_state.clone())
     }
@@ -670,13 +670,13 @@ impl Codegen {
 
     /// `j2 seal-queue`'s only caller — see
     /// `SharedArena::seal_queue_snapshot`'s own doc comment.
-    pub fn seal_queue_snapshot(&self) -> crate::jitv2::paged_memory::SealQueueSnapshot {
+    pub fn seal_queue_snapshot(&self) -> crate::cpu::jitv2::paged_memory::SealQueueSnapshot {
         self.seal_handle.shared().lock().seal_queue_snapshot()
     }
 
     /// `j2 seal-queue list`'s only caller — see
     /// `SharedArena::seal_queue_entries`'s own doc comment.
-    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)> {
+    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::cpu::jitv2::PhysicalCodePage)> {
         self.seal_handle.shared().lock().seal_queue_entries()
     }
 
@@ -732,8 +732,8 @@ impl Codegen {
     /// other mode's still-live one during a switch).
     pub unsafe fn reset_with_shared_arena(
         &mut self,
-        shared: std::sync::Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
-        state: std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
+        shared: std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+        state: std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) {
         unsafe { self.reset_inner(Self::new_module(Some(shared), Some(state))) }
     }
@@ -742,8 +742,8 @@ impl Codegen {
         &mut self,
         (new_module, new_paged_state, new_seal_handle): (
             cranelift_jit::JITModule,
-            std::sync::Arc<crate::jitv2::paged_memory::PagedArenaState>,
-            crate::jitv2::paged_memory::PagedArenaMemoryProvider,
+            std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+            crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
         ),
     ) {
         let old_module = std::mem::replace(&mut self.module, new_module);
@@ -803,7 +803,7 @@ impl Codegen {
     /// Whatever is left out here is served across a change to it, so when in
     /// doubt, add it. The build itself (features, codegen source, Cranelift
     /// version) is covered separately by the cache's build id.
-    pub fn cache_fingerprint(&self, skip_entry_preamble: bool) -> Option<crate::jitv2::pcache::Fingerprint> {
+    pub fn cache_fingerprint(&self, skip_entry_preamble: bool) -> Option<crate::cpu::jitv2::pcache::Fingerprint> {
         if (bake_hooks_enabled() && self.jit_consts.core.is_some()) || self.mem_helpers.iter().any(|h| h.is_some()) {
             return None;
         }
@@ -813,16 +813,16 @@ impl Codegen {
         let _ = write!(
             s,
             "max={} min={} speed={} intrun={} inline={} helpers={} fallback={} preamble={} skip_preamble={} mips4={} dc={:?} triple={} flags={}",
-            crate::jitv2::comp::max_instrs_per_compile(),
-            crate::jitv2::comp::min_instrs_to_compile(),
+            crate::cpu::jitv2::comp::max_instrs_per_compile(),
+            crate::cpu::jitv2::comp::min_instrs_to_compile(),
             Self::opt_level_speed(),
             Self::interrupt_run(),
             inline_mem_enabled(),
             mem_helpers_enabled(),
-            crate::jitv2::analyzer::fallback_enabled(),
-            crate::jitv2::entry_preamble_forced(),
+            crate::cpu::jitv2::analyzer::fallback_enabled(),
+            crate::cpu::jitv2::entry_preamble_forced(),
             skip_entry_preamble,
-            crate::jitv2::isa::mips4_enabled(),
+            crate::cpu::jitv2::isa::mips4_enabled(),
             self.dc_geometry,
             isa.triple(),
             isa.flags(),
@@ -831,7 +831,7 @@ impl Codegen {
             let _ = write!(s, " {v}");
         }
         s.push_str(" ops=");
-        s.extend(crate::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
+        s.extend(crate::cpu::jitv2::opcode_support::enabled_snapshot().iter().map(|&b| if b { '1' } else { '0' }));
         Some(blake3::hash(s.as_bytes()).as_bytes()[..16].try_into().unwrap())
     }
 
@@ -850,7 +850,7 @@ impl Codegen {
         &mut self,
         code: &[u8],
         align: u32,
-        page: *mut crate::jitv2::PhysicalCodePage,
+        page: *mut crate::cpu::jitv2::PhysicalCodePage,
     ) -> Option<cranelift_module::FuncId> {
         let sig = self.jit_fn_signature();
         let func_id = self.module
@@ -1108,7 +1108,7 @@ impl Codegen {
     /// block, regardless of this flag.
     ///
     /// §13.4: takes every entry point's own reachability walk, already
-    /// merged into one buffer via [`crate::jitv2::analyzer::Analyzer::walk_multi_entry`]
+    /// merged into one buffer via [`crate::cpu::jitv2::analyzer::Analyzer::walk_multi_entry`]
     /// — `instrs[w].is_entry_point` (set by that walk) is now what
     /// distinguishes an entry word from an ordinary internal instruction,
     /// wherever this function used to compare against a single scalar
@@ -1366,7 +1366,7 @@ impl Codegen {
         compiled_for_fr1: bool,
         skip_entry_preamble: bool,
         has_fpu: bool,
-        page: *mut crate::jitv2::PhysicalCodePage,
+        page: *mut crate::cpu::jitv2::PhysicalCodePage,
     ) -> Option<cranelift_module::FuncId> {
         let dc_geometry = self.dc_geometry;
         let jit_consts = self.jit_consts;
@@ -1404,7 +1404,7 @@ impl Codegen {
                 // head too, and has done since interpreter fallback landed,
                 // so without this the same stale-FR hazard already existed on
                 // that path. One comparison closes it for both.
-                if has_fpu && crate::jitv2::cop0::writes_cp0_status(instr.raw) {
+                if has_fpu && crate::cpu::jitv2::cop0::writes_cp0_status(instr.raw) {
                     return None;
                 }
                 continue;
@@ -1635,7 +1635,7 @@ impl Codegen {
         // an external dispatch CAN land on a delay-slot word. Tried; IRIX
         // panicked at "tlbmiss: invalid kptbl entry" within seconds of kernel
         // start, because the armed foreign-slot transfer was destroyed.
-        if crate::jitv2::entry_preamble_forced() {
+        if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
             let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_entry_interrupt_bail(&mut pre_ctx);
@@ -1725,7 +1725,7 @@ impl Codegen {
 
         builder.switch_to_block(dispatch_miss_block);
         builder.seal_block(dispatch_miss_block);
-        let fallback_status = builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_FALLBACK as i64);
+        let fallback_status = builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_FALLBACK as i64);
         builder.ins().return_(&[fallback_status]);
 
         builder.switch_to_block(exit_block);
@@ -2092,7 +2092,7 @@ impl Codegen {
                 // it applied (fold word+1 into this write, fall through to
                 // word+2 instead) or 0 otherwise (ordinary single-word LUI,
                 // or any other opcode).
-                let extra_skip = if raw & 0xFC00_0000 == (crate::mips_isa::OP_LUI << 26) {
+                let extra_skip = if raw & 0xFC00_0000 == (crate::cpu::mips_isa::OP_LUI << 26) {
                     try_emit_fused_lui(&mut ctx, instrs, word)
                 } else {
                     0
@@ -2366,7 +2366,7 @@ impl Codegen {
         // For the persistent cache: code with a relocation (a libcall, say)
         // is only valid where it was linked, so it is not kept.
         self.last_blob = None;
-        if crate::jitv2::pcache::enabled() {
+        if crate::cpu::jitv2::pcache::enabled() {
             if let Some(cc) = self.ctx.compiled_code() {
                 if cc.buffer.relocs().is_empty() {
                     self.last_blob = Some((cc.code_buffer().to_vec(), cc.buffer.alignment));
@@ -2423,12 +2423,12 @@ impl Codegen {
         entry_word: WordOffset,
         compiled_for_fr1: bool,
         skip_entry_preamble: bool,
-    ) -> Option<crate::jitv2::JitFn> {
+    ) -> Option<crate::cpu::jitv2::JitFn> {
         let dc_geometry = self.dc_geometry;
         let jit_consts = self.jit_consts;
         let mem_helpers = self.mem_helpers;
         instrs[entry_word as usize].is_entry_point = true;
-        let has_fpu = instrs_linear(instrs).any(|i| crate::jitv2::analyzer::is_fpu_instruction(i.raw));
+        let has_fpu = instrs_linear(instrs).any(|i| crate::cpu::jitv2::analyzer::is_fpu_instruction(i.raw));
         // No real PhysicalCodePage available at this API's call sites
         // (test-only — see this function's own doc comment) — null is fine,
         // same as any other diagnostic-only field with nothing real to
@@ -2450,7 +2450,7 @@ impl Codegen {
     /// new page or the caller otherwise decides to stop batching (queue
     /// drained, etc). `ids` empty is a valid no-op (returns an empty `Vec`)
     /// rather than a caller-side special case.
-    pub fn finalize_batch(&mut self, ids: &[cranelift_module::FuncId]) -> Vec<crate::jitv2::JitFn> {
+    pub fn finalize_batch(&mut self, ids: &[cranelift_module::FuncId]) -> Vec<crate::cpu::jitv2::JitFn> {
         if ids.is_empty() {
             return Vec::new();
         }
@@ -2472,7 +2472,7 @@ impl Codegen {
                 let (start, end) = self.func_ranges.remove(&id)
                     .expect("finalize_batch: id has no reserved seal-queue range — compile_region_uncommitted must run first");
                 let code_ptr = self.module.get_finalized_function(id);
-                let jit_fn = unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) };
+                let jit_fn = unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) };
                 // Forced: this caller's whole contract is "give me a
                 // callable pointer right now" (compile_region/inline mode),
                 // so the underlying page(s) must actually be sealed to RX
@@ -2483,9 +2483,9 @@ impl Codegen {
                 // through page.publish()) — a null/zeroed PublishInfo is
                 // fine here since nothing ever reads it back out for this
                 // entry (try_seal_ready's return value is discarded below).
-                let publish = crate::jitv2::paged_memory::PublishInfo {
+                let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
                     jit_fn: Some(jit_fn),
-                    ..crate::jitv2::paged_memory::PublishInfo::blank()
+                    ..crate::cpu::jitv2::paged_memory::PublishInfo::blank()
                 };
                 self.seal_handle.patch_pending_publish(start, end, publish, true);
                 jit_fn
@@ -2514,7 +2514,7 @@ impl Codegen {
     /// itself failed outright — check `last_finalize_failed()` immediately
     /// after an empty return to tell the two apart; only the gap-blocked
     /// case will ever resolve on its own.
-    pub fn finalize_batch_nonforced(&mut self, id: cranelift_module::FuncId, publish: crate::jitv2::paged_memory::PublishInfo) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+    pub fn finalize_batch_nonforced(&mut self, id: cranelift_module::FuncId, publish: crate::cpu::jitv2::paged_memory::PublishInfo) -> Vec<crate::cpu::jitv2::paged_memory::PublishInfo> {
         self.last_finalize_failed = false;
         let (start, end) = *self.func_ranges.get(&id).expect("finalize_batch_nonforced: id has no reserved seal-queue range — compile_region_uncommitted must run first");
         if self.module.finalize_definitions().is_err() {
@@ -2524,8 +2524,8 @@ impl Codegen {
         }
         self.func_ranges.remove(&id);
         let code_ptr = self.module.get_finalized_function(id);
-        let publish = crate::jitv2::paged_memory::PublishInfo {
-            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
+        let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
+            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) }),
             ..publish
         };
         self.seal_handle.patch_pending_publish(start, end, publish, false)
@@ -2544,7 +2544,7 @@ impl Codegen {
     /// caller just publishes all of them; see `paged_memory::PublishInfo`'s
     /// own doc comment for why no `FuncId`/`func_ranges` lookup is needed
     /// here anymore.
-    pub fn force_seal_pending(&mut self) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+    pub fn force_seal_pending(&mut self) -> Vec<crate::cpu::jitv2::paged_memory::PublishInfo> {
         self.seal_handle.try_seal_ready_forced()
     }
 
@@ -2553,7 +2553,7 @@ impl Codegen {
     /// pushing anything new, and without forcing past a still-open page.
     /// See `paged_memory::PagedArenaMemoryProvider::try_seal_ready`'s own
     /// doc comment.
-    pub fn try_seal_ready(&mut self) -> Vec<crate::jitv2::paged_memory::PublishInfo> {
+    pub fn try_seal_ready(&mut self) -> Vec<crate::cpu::jitv2::paged_memory::PublishInfo> {
         self.seal_handle.try_seal_ready()
     }
 }
@@ -2693,10 +2693,10 @@ fn emit_fr_mode_guard(ctx: &mut EmitCtx, entry_offset_val: Value, compiled_for_f
     // FR1, dispatched with CU1 AND FR both clear, hit this FR-mismatch arm
     // before the real CU1 fault ever got a chance to fire — this exact
     // ordering bug).
-    let cu1_bit = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_CU1 as i64);
+    let cu1_bit = ctx.builder.ins().band_imm_s(status, crate::cpu::mips_core::STATUS_CU1 as i64);
     let cu1_set = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, cu1_bit, 0);
 
-    let fr_bit = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_FR as i64);
+    let fr_bit = ctx.builder.ins().band_imm_s(status, crate::cpu::mips_core::STATUS_FR as i64);
     let fr_mismatch_if_cu1_set = if compiled_for_fr1 {
         ctx.builder.ins().icmp_imm_s(IntCC::Equal, fr_bit, 0)
     } else {
@@ -2762,7 +2762,7 @@ fn emit_cp1_cu1_guard(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let status_off = ir::immediates::Offset32::new(core_offset_of_cp0_status());
     let status = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, status_off);
-    let cu1_clear = ctx.builder.ins().band_imm_s(status, crate::mips_core::STATUS_CU1 as i64);
+    let cu1_clear = ctx.builder.ins().band_imm_s(status, crate::cpu::mips_core::STATUS_CU1 as i64);
     let cu1_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, cu1_clear, 0);
 
     let cu1_block = ctx.builder.create_block();
@@ -2798,14 +2798,14 @@ fn emit_materialize_cpu_unusable(ctx: &mut EmitCtx) {
     let mem = MemFlagsData::trusted();
     let cause_off = ir::immediates::Offset32::new(core_offset_of_cp0_cause());
     let cause = ctx.builder.ins().load(ir::types::I32, mem, ctx.core_ptr, cause_off);
-    let ce_cleared = ctx.builder.ins().band_imm_s(cause, !(crate::mips_core::CAUSE_CE_MASK as i64));
-    let ce_bit = 1i64 << crate::mips_core::CAUSE_CE_SHIFT; // CP1
+    let ce_cleared = ctx.builder.ins().band_imm_s(cause, !(crate::cpu::mips_core::CAUSE_CE_MASK as i64));
+    let ce_bit = 1i64 << crate::cpu::mips_core::CAUSE_CE_SHIFT; // CP1
     let new_cause = ctx.builder.ins().bor_imm_s(ce_cleared, ce_bit);
     ctx.builder.ins().store(mem, new_cause, ctx.core_ptr, cause_off);
 
     let status = ctx.builder.ins().iconst(
         ir::types::I32,
-        crate::mips_exec::exec_exception(crate::mips_exec::EXC_CPU) as i64,
+        crate::cpu::mips_exec::exec_exception(crate::cpu::mips_exec::EXC_CPU) as i64,
     );
     emit_exception_exit(ctx, status);
 }
@@ -2985,7 +2985,7 @@ fn emit_interp_fallback_head(
     ctx: &mut EmitCtx,
     exit_block: Block,
     block_for_word: &std::collections::HashMap<WordOffset, Block>,
-    fallthrough_exit: Option<crate::jitv2::analyzer::StopReason>,
+    fallthrough_exit: Option<crate::cpu::jitv2::analyzer::StopReason>,
 ) {
     let mem = MemFlagsData::trusted();
     let ptr_ty = ctx.module.target_config().pointer_type();
@@ -3121,7 +3121,7 @@ fn emit_fetch_verify(ctx: &mut EmitCtx) {
     let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, va_val, expected_val]);
     let status = ctx.builder.inst_results(call)[0];
 
-    let is_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let is_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     let bad_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
     ctx.builder.ins().brif(is_bad, bad_block, &[], continue_block, &[]);
@@ -3136,7 +3136,7 @@ fn emit_fetch_verify(ctx: &mut EmitCtx) {
     ctx.builder.ins().store(mem, pc_again, ctx.core_ptr, pc_off);
     let bd_store = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
     ctx.builder.ins().store(mem, bd_store, ctx.core_ptr, flag_off);
-    let bad_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bad_status = ctx.builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     ctx.builder.ins().return_(&[bad_status]);
 
     ctx.builder.switch_to_block(continue_block);
@@ -3186,7 +3186,7 @@ fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
     let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, pc_val, raw_val, origin_val]);
     let status = ctx.builder.inst_results(call)[0];
 
-    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     let bp_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
     ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
@@ -3204,7 +3204,7 @@ fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
     ctx.builder.ins().store(mem, pc_again, ctx.core_ptr, pc_off);
     let bd_store = ctx.builder.ins().iconst(ir::types::I8, ctx.bd as i64);
     ctx.builder.ins().store(mem, bd_store, ctx.core_ptr, flag_off);
-    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     ctx.builder.ins().return_(&[bp_status]);
 
     ctx.builder.switch_to_block(continue_block);
@@ -3234,7 +3234,7 @@ fn emit_lockstep_step(ctx: &mut EmitCtx, trust_live: bool) {
     let pc_val = emit_word_addr(ctx, word);
     let bd_arg = if trust_live {
         // Trust live pc/in_delay_slot — don't overwrite them.
-        crate::mips_exec::LOCKSTEP_BD_LIVE
+        crate::cpu::mips_exec::LOCKSTEP_BD_LIVE
     } else {
         // Plain head: materialize the starting pc/in_delay_slot so both engines
         // are anchored (the JIT doesn't keep core.pc live for straight-line ops).
@@ -3285,7 +3285,7 @@ fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
     let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
-    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     let bp_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
     ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
@@ -3294,7 +3294,7 @@ fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
     ctx.builder.set_cold_block(bp_block);
     ctx.builder.seal_block(bp_block);
     // pc is already final for this arm — leave it, just return the break.
-    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     ctx.builder.ins().return_(&[bp_status]);
 
     ctx.builder.switch_to_block(continue_block);
@@ -3369,7 +3369,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
     // instruction's own starting values — lockstep_compare (mips_exec.rs)
     // restores all three from `ls_before`/`ls_delay_target_before` itself,
     // in Rust, before returning — codegen has nothing left to fix up here.
-    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     let bp_block = ctx.builder.create_block();
     let continue_block = ctx.builder.create_block();
     ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
@@ -3377,7 +3377,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
     ctx.builder.switch_to_block(bp_block);
     ctx.builder.set_cold_block(bp_block);
     ctx.builder.seal_block(bp_block);
-    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     ctx.builder.ins().return_(&[bp_status]);
 
     ctx.builder.switch_to_block(continue_block);
@@ -3452,7 +3452,7 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
         // instruction's own starting values from `ls_before`/
         // `ls_delay_target_before` before returning — nothing left to fix up
         // here, just propagate the breakpoint status instead of EXEC_COMPLETE.
-        let is_bp = builder.ins().icmp_imm_s(IntCC::Equal, cmp_status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        let is_bp = builder.ins().icmp_imm_s(IntCC::Equal, cmp_status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
         let bp_block = builder.create_block();
         let continue_block = builder.create_block();
         builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
@@ -3460,7 +3460,7 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
         builder.switch_to_block(bp_block);
         builder.set_cold_block(bp_block);
         builder.seal_block(bp_block);
-        let bp_status = builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        let bp_status = builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
         builder.ins().return_(&[bp_status]);
 
         builder.switch_to_block(continue_block);
@@ -3498,13 +3498,13 @@ fn emit_set_jit_trigger_raw(builder: &mut FunctionBuilder, core_ptr: Value) {
     builder.ins().store(mem, one, core_ptr, off);
 }
 fn core_offset_of_cycles() -> i32 {
-    (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, cycles)) as i32
+    (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::cpu::mips_core::Hot, cycles)) as i32
 }
 
 /// Account for one retiring architectural instruction against
 /// `core.hot.cycles` — the JIT-compiled-code counterpart to the
 /// interpreter's `step()` incrementing it once per `step()` call
-/// (`src/mips_exec.rs`: a real, direct write — see `Hot::cycles`'s own doc
+/// (`src/cpu/mips_exec.rs`: a real, direct write — see `Hot::cycles`'s own doc
 /// comment for why it must never silently stop advancing). A compiled unit
 /// never calls the interpreter's `step()` for the instructions it covers, so
 /// without this, `cycles` — and everything that depends on it being visibly
@@ -3567,7 +3567,7 @@ fn emit_account_for_cycles(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_P
     *ctx.cycles_pending = 0;
 }
 fn core_offset_of_interrupts() -> i32 {
-    (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::mips_core::Hot, interrupts)) as i32
+    (std::mem::offset_of!(MipsCore, hot) + std::mem::offset_of!(crate::cpu::mips_core::Hot, interrupts)) as i32
 }
 fn core_offset_of_hi() -> i32 { std::mem::offset_of!(MipsCore, hi) as i32 }
 fn core_offset_of_lo() -> i32 { std::mem::offset_of!(MipsCore, lo) as i32 }
@@ -3812,9 +3812,9 @@ fn core_offset_of_jit_l2_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_l2_t
 /// Byte offset of `L1DTag::ptag` / `::dirty`, and the tag stride. Taken with
 /// `offset_of!` (the type is `#[repr(C)]`) rather than hardcoded — see
 /// docs/jit-inline-memory.md §3.1.
-fn l1d_tag_stride() -> i64 { std::mem::size_of::<crate::mips_cache_v2::L1DTag>() as i64 }
-fn l1d_tag_ptag_off() -> i32 { std::mem::offset_of!(crate::mips_cache_v2::L1DTag, ptag) as i32 }
-fn l1d_tag_dirty_off() -> i32 { std::mem::offset_of!(crate::mips_cache_v2::L1DTag, dirty) as i32 }
+fn l1d_tag_stride() -> i64 { std::mem::size_of::<crate::cpu::mips_cache_v2::L1DTag>() as i64 }
+fn l1d_tag_ptag_off() -> i32 { std::mem::offset_of!(crate::cpu::mips_cache_v2::L1DTag, ptag) as i32 }
+fn l1d_tag_dirty_off() -> i32 { std::mem::offset_of!(crate::cpu::mips_cache_v2::L1DTag, dirty) as i32 }
 
 /// Result of emitting the shared load/store fast-path preamble: nutlb probe,
 /// L1D tag match, and (tcache) the mapped-region test.
@@ -3854,7 +3854,7 @@ fn emit_inline_mem_guard<const STORE: bool>(
     vaddr: Value,
     size: MemSize,
 ) -> Option<InlineMemPath> {
-    use crate::mips_core as mc;
+    use crate::cpu::mips_core as mc;
 
     let geom = ctx.dc_geometry;
     if !geom.supported {
@@ -3914,7 +3914,7 @@ fn emit_inline_mem_guard<const STORE: bool>(
     // access would match. C-field lives in phys[2:0] (TR_UNCACHED == 2).
     let c_field = ctx.builder.ins().band_imm_s(e_phys, 0x7);
     let cacheable = ctx.builder.ins().icmp_imm_s(
-        IntCC::NotEqual, c_field, crate::mips_exec::TR_UNCACHED as i64);
+        IntCC::NotEqual, c_field, crate::cpu::mips_exec::TR_UNCACHED as i64);
 
     // Tag compare + bitmask bit, mirroring `MipsExecutor::nutlb_translate`.
     // Any divergence here is a correctness bug, not a performance one.
@@ -4680,12 +4680,12 @@ fn emit_mem_write_split(
             let has_code = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, has_code, 0);
 
             let want_ptag = ctx.builder.ins().ushr_imm_s(
-                path.fast_phys, crate::mips_cache_v2::L2_PTAG_SHIFT as i64);
+                path.fast_phys, crate::cpu::mips_cache_v2::L2_PTAG_SHIFT as i64);
             let want_ptag = ctx.builder.ins().band_imm_s(
-                want_ptag, crate::mips_cache_v2::L2_PTAG_MASK as i64);
+                want_ptag, crate::cpu::mips_cache_v2::L2_PTAG_MASK as i64);
             let want_ptag = ctx.builder.ins().ireduce(ir::types::I32, want_ptag);
             let cur_ptag = ctx.builder.ins().band_imm_s(
-                tag, crate::mips_cache_v2::L2_PTAG_MASK as i64);
+                tag, crate::cpu::mips_cache_v2::L2_PTAG_MASK as i64);
             let ptag_eq = ctx.builder.ins().icmp(IntCC::Equal, cur_ptag, want_ptag);
 
             let clear = ctx.builder.ins().band(has_code, ptag_eq);
@@ -4846,7 +4846,7 @@ fn emit_check_mem_status(ctx: &mut EmitCtx, exc: Value) {
     // as the exception path's terminator — core.pc is already this
     // instruction's own address (loads/stores never advance it), so the
     // monitor lands exactly here.
-    let is_breakpoint = ctx.builder.ins().icmp_imm_s(IntCC::Equal, exc, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let is_breakpoint = ctx.builder.ins().icmp_imm_s(IntCC::Equal, exc, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     let breakpoint_block = ctx.builder.create_block();
     let true_retry_block = ctx.builder.create_block();
     ctx.builder.ins().brif(is_breakpoint, breakpoint_block, &[], true_retry_block, &[]);
@@ -4854,7 +4854,7 @@ fn emit_check_mem_status(ctx: &mut EmitCtx, exc: Value) {
     ctx.builder.switch_to_block(breakpoint_block);
     ctx.builder.set_cold_block(breakpoint_block);
     ctx.builder.seal_block(breakpoint_block);
-    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+    let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
     ctx.builder.ins().return_(&[bp_status]);
 
     ctx.builder.switch_to_block(true_retry_block);
@@ -5047,7 +5047,7 @@ fn emit_ctc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
             ctx.builder.switch_to_block(raise_block);
             ctx.builder.set_cold_block(raise_block);
             ctx.builder.seal_block(raise_block);
-            let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+            let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
             let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
             emit_exception_exit(ctx, status_val);
 
@@ -5137,7 +5137,7 @@ fn emit_fpu_update_fcsr(ctx: &mut EmitCtx, flags: Value, write_result: impl Fn(&
     ctx.builder.seal_block(raise_block);
     // Trapped: neither the destination register nor the sticky Flag field
     // are touched — only Cause (already set above).
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
     let status_val = ctx.builder.ins().iconst(i32t, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -5168,7 +5168,7 @@ fn emit_fpu_unimplemented(ctx: &mut EmitCtx) {
     let fcsr_cleared = ctx.builder.ins().band_imm_s(fcsr, !FCSR_CM);
     let fcsr_with_e = ctx.builder.ins().bor_imm_s(fcsr_cleared, FCSR_CE);
     ctx.builder.ins().store(mem, fcsr_with_e, ctx.core_ptr, fcsr_off);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
     let status_val = ctx.builder.ins().iconst(i32t, status as i64);
     emit_exception_exit(ctx, status_val);
 }
@@ -5210,7 +5210,7 @@ fn emit_check_snan_operand(ctx: &mut EmitCtx, bits: Value, is_d: bool, write_res
 
     ctx.builder.switch_to_block(raise_block);
     ctx.builder.seal_block(raise_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
     let status_val = ctx.builder.ins().iconst(i32t, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -5828,7 +5828,7 @@ fn emit_misaligned_pc_check(ctx: &mut EmitCtx, target_addr: Value) {
     let bv_off = ir::immediates::Offset32::new(core_offset_of_badvaddr());
     ctx.builder.ins().store(mem, target_addr, ctx.core_ptr, bv_off);
     let status = ctx.builder.ins().iconst(
-        ir::types::I32, crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_ADEL) as i64);
+        ir::types::I32, crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_ADEL) as i64);
     let bd_zero = ctx.builder.ins().iconst(ir::types::I8, 0);
     ctx.builder.ins().jump(ctx.exception_call_block, &[
         ir::BlockArg::Value(ctx.core_ptr),
@@ -6089,7 +6089,7 @@ struct BranchOrJump {
 /// shape correctly falls through to `compile_region`'s `None` rejection
 /// instead of being silently mis-emitted.
 fn lookup_branch_or_jump(raw: u32) -> Option<BranchOrJump> {
-    use crate::mips_isa::*;
+    use crate::cpu::mips_isa::*;
     let op = (raw >> 26) & 0x3F;
     let rt = (raw >> 16) & 0x1F;
     match op {
@@ -6139,7 +6139,7 @@ struct RegJump {
 }
 
 fn lookup_regjump(raw: u32) -> Option<RegJump> {
-    use crate::mips_isa::*;
+    use crate::cpu::mips_isa::*;
     let op = (raw >> 26) & 0x3F;
     if op != OP_SPECIAL {
         return None;
@@ -6663,14 +6663,14 @@ fn emit_jump_taken_edge(
     ctx: &mut EmitCtx,
     exit_block: Block,
     block_for_word: &std::collections::HashMap<WordOffset, Block>,
-    taken_exit: Option<crate::jitv2::analyzer::StopReason>,
+    taken_exit: Option<crate::cpu::jitv2::analyzer::StopReason>,
     word: WordOffset,
     raw: u32,
 ) {
-    if taken_exit == Some(crate::jitv2::analyzer::StopReason::PageLeaving) {
+    if taken_exit == Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving) {
         let target_addr = emit_jump_target_addr(ctx, word, raw);
         emit_absolute_pc_exit(ctx, target_addr);
-    } else if taken_exit == Some(crate::jitv2::analyzer::StopReason::ForeignPageSlot) {
+    } else if taken_exit == Some(crate::cpu::jitv2::analyzer::StopReason::ForeignPageSlot) {
         let target_addr = emit_jump_target_addr(ctx, word, raw);
         emit_foreign_page_slot_exit(ctx, word, target_addr);
     } else {
@@ -6686,14 +6686,14 @@ fn emit_branch_taken_edge(
     ctx: &mut EmitCtx,
     exit_block: Block,
     block_for_word: &std::collections::HashMap<WordOffset, Block>,
-    taken_exit: Option<crate::jitv2::analyzer::StopReason>,
+    taken_exit: Option<crate::cpu::jitv2::analyzer::StopReason>,
     word: WordOffset,
     raw: u32,
 ) {
-    if taken_exit == Some(crate::jitv2::analyzer::StopReason::PageLeaving) {
+    if taken_exit == Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving) {
         let target_addr = emit_branch_target_addr(ctx, word, raw);
         emit_absolute_pc_exit(ctx, target_addr);
-    } else if taken_exit == Some(crate::jitv2::analyzer::StopReason::ForeignPageSlot) {
+    } else if taken_exit == Some(crate::cpu::jitv2::analyzer::StopReason::ForeignPageSlot) {
         let target_addr = emit_branch_target_addr(ctx, word, raw);
         emit_foreign_page_slot_exit(ctx, word, target_addr);
     } else {
@@ -6735,11 +6735,11 @@ fn emit_target_edge(
     ctx: &mut EmitCtx,
     exit_block: Block,
     block_for_word: &std::collections::HashMap<WordOffset, Block>,
-    exit_reason: Option<crate::jitv2::analyzer::StopReason>,
+    exit_reason: Option<crate::cpu::jitv2::analyzer::StopReason>,
     target_word: WordOffset,
 ) {
     match exit_reason {
-        Some(crate::jitv2::analyzer::StopReason::PageLeaving) => unreachable!(
+        Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving) => unreachable!(
             "PageLeaving must be handled by the caller via emit_target_edge_page_leaving \
              (needs a runtime-computed target address, which only the caller — knowing \
              whether this is a J/JAL or a conditional branch — can compute correctly)"
@@ -7061,7 +7061,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
         let status = ctx.builder.inst_results(call)[0];
 
-        let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
         let bp_block = ctx.builder.create_block();
         let continue_block = ctx.builder.create_block();
         ctx.builder.ins().brif(is_bp, bp_block, &[], continue_block, &[]);
@@ -7076,7 +7076,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         // not the one after it.
         let slot_addr_again = emit_word_addr(ctx, slot_word);
         ctx.builder.ins().store(mem, slot_addr_again, ctx.core_ptr, pc_off);
-        let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::mips_exec::EXEC_BREAKPOINT as i64);
+        let bp_status = ctx.builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
         ctx.builder.ins().return_(&[bp_status]);
 
         ctx.builder.switch_to_block(continue_block);
@@ -8160,7 +8160,7 @@ fn emit_trap_if_nonzero(ctx: &mut EmitCtx, trapped: Value) {
     ctx.builder.switch_to_block(raise_block);
     ctx.builder.set_cold_block(raise_block);
     ctx.builder.seal_block(raise_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
     let status_val = ctx.builder.ins().iconst(i32t, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -8348,7 +8348,7 @@ fn emit_fcc(ctx: &mut EmitCtx, fr_mode: FrMode, is_d: bool) {
     ctx.builder.seal_block(raise_fpe_block);
     // Trapped: Cause is already set above, but the sticky Flag field is
     // not — R4000 manual: flag bits are not set when an exception is taken.
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_FPE);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_FPE);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -8397,7 +8397,7 @@ fn emit_fcc_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
 /// (arithmetic/convert/compare/move) — `RS_BC1` is `Excluded` by the
 /// analyzer and never reaches codegen at all (§4.4).
 fn lookup_cp1_semantics(raw: u32) -> Option<Cp1Emitter> {
-    use crate::mips_isa::*;
+    use crate::cpu::mips_isa::*;
     let op = (raw >> 26) & 0x3F;
     // LWC1/LDC1/SWC1/SDC1 are architecturally plain memory ops (separate
     // top-level opcodes, not OP_COP1-encoded), but they read/write an FPR —
@@ -8567,7 +8567,7 @@ fn emit_add_sub_trapping(ctx: &mut EmitCtx, is_sub: bool) {
     ctx.builder.switch_to_block(trap_block);
     ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_OV);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -8874,7 +8874,7 @@ fn emit_dadd_dsub_trapping(ctx: &mut EmitCtx, is_sub: bool) {
     ctx.builder.switch_to_block(trap_block);
     ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_OV);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -9081,7 +9081,7 @@ fn emit_addi(ctx: &mut EmitCtx) {
     ctx.builder.switch_to_block(trap_block);
     ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_OV);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -9108,7 +9108,7 @@ fn emit_daddi(ctx: &mut EmitCtx) {
     ctx.builder.switch_to_block(trap_block);
     ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_OV);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_OV);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -9189,11 +9189,11 @@ fn fused_lui_imm32(lui_raw: u32, next_raw: u32) -> Option<i64> {
     if next_rs != rt || next_rt != rt {
         return None;
     }
-    if next_op == crate::mips_isa::OP_ORI {
+    if next_op == crate::cpu::mips_isa::OP_ORI {
         let hi = (lui_raw & 0xFFFF) << 16;
         let lo = next_raw & 0xFFFF;
         Some((hi | lo) as i32 as i64)
-    } else if next_op == crate::mips_isa::OP_ADDIU {
+    } else if next_op == crate::cpu::mips_isa::OP_ADDIU {
         let hi = ((lui_raw & 0xFFFF) << 16) as i32;
         let lo = (next_raw & 0xFFFF) as i16 as i32;
         Some(hi.wrapping_add(lo) as i64)
@@ -10046,7 +10046,7 @@ fn emit_trap_rr(ctx: &mut EmitCtx, cc: IntCC) {
     ctx.builder.switch_to_block(trap_block);
     ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_TR);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_TR);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -10082,7 +10082,7 @@ fn emit_trap_ri(ctx: &mut EmitCtx, cc: IntCC) {
     ctx.builder.switch_to_block(trap_block);
     ctx.builder.set_cold_block(trap_block);
     ctx.builder.seal_block(trap_block);
-    let status = crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_TR);
+    let status = crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_TR);
     let status_val = ctx.builder.ins().iconst(ir::types::I32, status as i64);
     emit_exception_exit(ctx, status_val);
 
@@ -10110,7 +10110,7 @@ fn emit_nop(_ctx: &mut EmitCtx) {}
 /// treat `None` as "can't compile this region" (deny/reject), not panic —
 /// the instruction set is being filled in incrementally.
 fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
-    use crate::mips_isa::*;
+    use crate::cpu::mips_isa::*;
     let op = (raw >> 26) & 0x3F;
     let funct = raw & 0x3F;
     match op {
@@ -10219,8 +10219,8 @@ fn lookup_semantics(raw: u32) -> Option<SemanticsEmitter> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jitv2::analyzer::Analyzer;
-    use crate::mips_isa::*;
+    use crate::cpu::jitv2::analyzer::Analyzer;
+    use crate::cpu::mips_isa::*;
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
@@ -10292,7 +10292,7 @@ mod tests {
     #[test]
     #[cfg(feature = "jitv2_lockstep")]
     fn lockstep_emits_no_inline_mem_even_with_supported_geometry() {
-        use crate::mips_isa::{OP_LW, OP_SW};
+        use crate::cpu::mips_isa::{OP_LW, OP_SW};
         fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
             (op << 26) | (rs << 21) | (rt << 16) | imm as u32
         }
@@ -10312,7 +10312,7 @@ mod tests {
         let mut codegen = Codegen::new();
         // Force the geometry to "supported" so the guard cannot decline for
         // the unrelated reason that this synthetic test has no real cache.
-        codegen.dc_geometry = crate::mips_cache_v2::JitDcGeometry::unsupported();
+        codegen.dc_geometry = crate::cpu::mips_cache_v2::JitDcGeometry::unsupported();
         codegen.dc_geometry.supported = true;
         let _ = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("lw/sw region must compile");
@@ -10416,8 +10416,8 @@ mod tests {
         name: &str,
         emit: impl FnOnce(&mut EmitCtx, Block, WordOffset),
         word_offset: WordOffset,
-    ) -> crate::jitv2::JitFn {
-        use crate::mips_exec::EXEC_COMPLETE;
+    ) -> crate::cpu::jitv2::JitFn {
+        use crate::cpu::mips_exec::EXEC_COMPLETE;
 
         let mut codegen = Codegen::new();
         codegen.ctx.func.signature = codegen.jit_fn_signature();
@@ -10462,7 +10462,7 @@ mod tests {
                 // Test harness for preamble emitters only (see this
                 // function's doc comment) — never touches cycles bookkeeping.
                 let mut unused_cycles_pending = 0u32;
-                let dc_geometry = crate::mips_cache_v2::JitDcGeometry::unsupported();
+                let dc_geometry = crate::cpu::mips_cache_v2::JitDcGeometry::unsupported();
                 // This harness compiles against no real core, so hook targets
                 // must keep coming from `core_ptr` loads rather than being
                 // baked — `JitConsts::default()` is exactly that fallback.
@@ -10509,9 +10509,9 @@ mod tests {
         codegen.seal_handle.push_placeholder(range.0, range.1, std::ptr::null_mut());
         codegen.module.finalize_definitions().unwrap();
         let code_ptr = codegen.module.get_finalized_function(func_id);
-        let publish = crate::jitv2::paged_memory::PublishInfo {
-            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
-            ..crate::jitv2::paged_memory::PublishInfo::blank()
+        let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
+            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) }),
+            ..crate::cpu::jitv2::paged_memory::PublishInfo::blank()
         };
         codegen.seal_handle.patch_pending_publish(range.0, range.1, publish, true);
         // Leak the module so the JIT-compiled code stays valid for the
@@ -10519,7 +10519,7 @@ mod tests {
         // do (code lives as long as the module, which normally lives for
         // the compile thread's whole run).
         std::mem::forget(codegen.module);
-        unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }
+        unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) }
     }
 
     #[test]
@@ -10532,7 +10532,7 @@ mod tests {
 
         let status = unsafe { jit_fn(&mut core as *mut MipsCore) };
 
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(core.pc, orig_pc, "pc must be untouched when nothing is pending");
     }
 
@@ -10551,7 +10551,7 @@ mod tests {
         // fall back to the interpreter (step_int, via exec_decoded_int),
         // whose own step_preamble! actually delivers the interrupt. See
         // emit_pending_interrupt_preamble's own doc comment.
-        assert_eq!(status, crate::mips_exec::EXEC_FALLBACK);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_FALLBACK);
         let orig_vbase = 0xFFFFFFFF_80002000u64 & !(PAGE_SIZE as u64 - 1);
         assert_eq!(core.pc, orig_vbase | ((word_offset as u64) * 4),
             "pc must be set to this instruction's own address for the interpreter to retry");
@@ -10600,9 +10600,9 @@ mod tests {
         codegen.seal_handle.push_placeholder(range.0, range.1, std::ptr::null_mut());
         codegen.module.finalize_definitions().unwrap();
         let code_ptr = codegen.module.get_finalized_function(func_id);
-        let publish = crate::jitv2::paged_memory::PublishInfo {
-            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::jitv2::JitFn>(code_ptr) }),
-            ..crate::jitv2::paged_memory::PublishInfo::blank()
+        let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
+            jit_fn: Some(unsafe { std::mem::transmute::<*const u8, crate::cpu::jitv2::JitFn>(code_ptr) }),
+            ..crate::cpu::jitv2::paged_memory::PublishInfo::blank()
         };
         codegen.seal_handle.patch_pending_publish(range.0, range.1, publish, true);
         std::mem::forget(codegen.module);
@@ -10639,7 +10639,7 @@ mod tests {
         ];
         for (x, rm) in cases {
             let jit_result = f64::from_bits(f(x, rm) as u64);
-            let interp_result = crate::mips_exec::round_f64_to_int_mode(x, rm as u8);
+            let interp_result = crate::cpu::mips_exec::round_f64_to_int_mode(x, rm as u8);
             assert_eq!(jit_result, interp_result, "round_to_int_mode({x}, rm={rm}): jit={jit_result} interp={interp_result}");
         }
     }
@@ -10672,8 +10672,8 @@ mod tests {
             .expect("a plain ADDIU must have a real emitter")
     }
 
-    fn dummy_publish() -> crate::jitv2::paged_memory::PublishInfo {
-        crate::jitv2::paged_memory::PublishInfo::blank()
+    fn dummy_publish() -> crate::cpu::jitv2::paged_memory::PublishInfo {
+        crate::cpu::jitv2::paged_memory::PublishInfo::blank()
     }
 
     #[test]
@@ -10698,7 +10698,7 @@ mod tests {
         // ran, patch_pending_publish never did) must still show up here with
         // its real identity — that's the unpatched-placeholder case this
         // diagnostic exists for.
-        use crate::jitv2::PhysicalCodePage;
+        use crate::cpu::jitv2::PhysicalCodePage;
         use std::sync::atomic::AtomicU64;
         let counter = AtomicU64::new(0);
         let mut page = PhysicalCodePage::new(0x1234, &counter as *const AtomicU64);
@@ -10836,8 +10836,8 @@ mod tests {
         // compile+forced-finalize one function and asserting their packing
         // stats (read off the one shared PagedArenaState) accumulate
         // together rather than each starting its own separate reservation.
-        let state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-        let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
+        let state = std::sync::Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
 
         let mut a = Codegen::new_with_shared_arena(shared.clone(), state.clone());
         let mut b = Codegen::new_with_shared_arena(shared, state.clone());
@@ -10864,9 +10864,9 @@ mod tests {
         // reserving a new mmap — verify the resulting Codegen's own arena
         // base address matches the one explicitly handed in, not some new
         // reservation.
-        let state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-        let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
-        let expected_base = crate::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared(shared.clone()).arena_base();
+        let state = std::sync::Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, state.clone()).unwrap();
+        let expected_base = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::from_shared(shared.clone()).arena_base();
 
         let mut codegen = Codegen::new(); // starts with its OWN private arena
         let original_base = codegen.seal_handle.arena_base();

@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, BUS_OK, BUS_ERR, Resettable};
 
 #[cfg(feature = "jitv2")]
-const JITV2_PAGE_SIZE: usize = crate::jitv2::jitv2::PAGE_SIZE as usize;
+const JITV2_PAGE_SIZE: usize = crate::cpu::jitv2::jitv2::PAGE_SIZE as usize;
 
 /// Memory Module with direct word access
 ///
@@ -71,7 +71,7 @@ impl Memory {
     }
 
     /// JIT v2: raw pointer to the generation counter for the page containing `addr`.
-    /// Used to populate `PhysicalCodePage::gen` (see src/jitv2/jitv2.rs). The pointer
+    /// Used to populate `PhysicalCodePage::gen` (see src/cpu/jitv2/jitv2.rs). The pointer
     /// is valid for the lifetime of `&self` (the `gen` vec is never resized after `new`).
     #[cfg(feature = "jitv2")]
     #[inline]

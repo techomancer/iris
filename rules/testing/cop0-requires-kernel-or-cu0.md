@@ -1,6 +1,6 @@
 # CP0 instructions must be gated on Kernel-or-CU0
 
-`exec_cop0` (`src/mips_exec.rs`) is the single dispatch point for MFC0/DMFC0/MTC0/DMTC0/
+`exec_cop0` (`src/cpu/mips_exec.rs`) is the single dispatch point for MFC0/DMFC0/MTC0/DMTC0/
 TLBR/TLBWI/TLBWR/TLBP/ERET/WAIT. It had **no privilege check at all**, so a user-mode
 process could execute `MTC0 $x, Status` and write itself directly into kernel mode.
 

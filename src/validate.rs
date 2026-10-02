@@ -14,7 +14,7 @@
 //! doesn't leak into the result.
 
 use crate::machine::Machine;
-use crate::mips_exec::{CpuStateDigest, EXEC_RETRY};
+use crate::cpu::mips_exec::{CpuStateDigest, EXEC_RETRY};
 
 /// Result of `validate_snapshot_determinism`.
 #[derive(Debug)]

@@ -130,7 +130,7 @@ fpu/cvt_out_of_range  o.cause & FP_V got 0x0 want 0x10     (missing Invalid)
 ```
 
 The cause is documented in `fpu_update_fcsr`'s own doc comment
-(`src/mips_exec.rs`): FPU exception flags are **computed from bit patterns, not
+(`src/cpu/mips_exec.rs`): FPU exception flags are **computed from bit patterns, not
 read from the host FPU** — because the JIT has no portable way to read host FPU
 status and the two engines must agree exactly — and for ordinary arithmetic
 **Inexact and Overflow are deliberately never computed** ("not worth the IR to

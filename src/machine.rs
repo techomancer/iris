@@ -27,11 +27,11 @@ use crate::dev::mc::MemoryController;
 /// Count on the IP28's 195 MHz R10000: half the pipeline clock, and what
 /// IRIX assumes there (see where the MC is created).
 const IP28_COUNT_HZ: u64 = 97_500_000;
-use crate::mips_tlb::MipsTlb;
-use crate::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
+use crate::cpu::mips_tlb::MipsTlb;
+use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-use crate::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
+use crate::cpu::mips_cache_shadow::R10000ShadowCache;
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -65,7 +65,7 @@ pub fn emulator_name() -> &'static str {
 }
 
 pub struct Machine {
-    cpu: Arc<dyn crate::mips_exec::CpuDevice>,
+    cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice>,
     _phys: Arc<Physical>, // Keep reference to Physical Bus
     mc: MemoryController,
     hpc3: Hpc3,
@@ -791,10 +791,10 @@ impl Machine {
         // inside the executor's Arc<Mutex<..>>.
         executor.core.set_timer_manager(timer_manager.clone());
 
-        Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::mips_exec::CpuDevice>
+        Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::cpu::mips_exec::CpuDevice>
         }}}
 
-        let cpu: Arc<dyn crate::mips_exec::CpuDevice> = match cfg_cpu_model {
+        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
             // IP28 uses the shadow cache: out of the data path entirely, with
@@ -1401,7 +1401,7 @@ impl Machine {
     }
 
     /// Snapshot the deterministic-from-state CPU registers.
-    pub fn cpu_state_digest(&self) -> Result<crate::mips_exec::CpuStateDigest, String> {
+    pub fn cpu_state_digest(&self) -> Result<crate::cpu::mips_exec::CpuStateDigest, String> {
         self.cpu.state_digest()
     }
 
@@ -1416,14 +1416,14 @@ impl Machine {
     /// Restore CPU registers from a `CpuStateDigest` — see
     /// `MipsCpu::restore_state_digest`'s doc comment.
     #[cfg(feature = "developer")]
-    pub fn cpu_restore_state_digest(&self, digest: &crate::mips_exec::CpuStateDigest) -> Result<(), String> {
+    pub fn cpu_restore_state_digest(&self, digest: &crate::cpu::mips_exec::CpuStateDigest) -> Result<(), String> {
         self.cpu.restore_state_digest(digest)
     }
 
     /// Force `cp0_count`/`count_hz` to a reference digest's values — see
     /// `MipsCpu::fixup_cp0_count`'s doc comment.
     #[cfg(feature = "developer")]
-    pub fn cpu_fixup_cp0_count(&self, digest: &crate::mips_exec::CpuStateDigest) -> Result<(), String> {
+    pub fn cpu_fixup_cp0_count(&self, digest: &crate::cpu::mips_exec::CpuStateDigest) -> Result<(), String> {
         self.cpu.fixup_cp0_count(digest)
     }
 

@@ -2,11 +2,11 @@
 mod tests {
     use std::sync::Mutex;
     use std::collections::HashMap;
-    use crate::mips_core::{STATUS_KX, STATUS_CU1, STATUS_FR};
-    use crate::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_BREAKPOINT, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
-    use crate::mips_isa::*;
-    use crate::mips_tlb::PassthroughTlb;
-    use crate::mips_cache_v2::{PassthroughCache, PassthroughCacheM4, MipsCache, R4400Cache, CpuModel};
+    use crate::cpu::mips_core::{STATUS_KX, STATUS_CU1, STATUS_FR};
+    use crate::cpu::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_BREAKPOINT, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
+    use crate::cpu::mips_isa::*;
+    use crate::cpu::mips_tlb::PassthroughTlb;
+    use crate::cpu::mips_cache_v2::{PassthroughCache, PassthroughCacheM4, MipsCache, R4400Cache, CpuModel};
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BusDevice};
     use std::sync::Arc;
 
@@ -133,7 +133,7 @@ mod tests {
         // "not compilable") — that inference no longer holds (a null
         // gen_ptr now just means "use the shared, never-bumped fallback
         // counter", not "never dispatchable" — see
-        // `crate::jitv2::jitv2::NEVER_COMPILABLE_GEN`'s doc comment), so the
+        // `crate::cpu::jitv2::jitv2::NEVER_COMPILABLE_GEN`'s doc comment), so the
         // real enforcement moved to the executor-level switches below;
         // staying null here is still fine (and simplest — no per-page
         // counter storage needed in this basic MockMemory at all).
@@ -147,14 +147,14 @@ mod tests {
     /// see `MockMemory::gen_ptr`'s doc comment for why this, not a null
     /// `gen_ptr`, is what actually keeps jitv2 out of this file's tests now.
     #[cfg(feature = "jitv2")]
-    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: CpuModel>(exec: &mut MipsExecutor<T, C>) {
+    fn disable_jitv2<T: crate::cpu::mips_tlb::Tlb, C: CpuModel>(exec: &mut MipsExecutor<T, C>) {
         // jitv2_dispatch_enabled=false turns the whole JIT dispatch gate off,
         // which is what drives lockstep now — so this alone keeps jitv2 (and its
         // lockstep instrumentation) out of these interpreter-only tests.
         exec.jitv2_dispatch_enabled = false;
     }
     #[cfg(not(feature = "jitv2"))]
-    fn disable_jitv2<T: crate::mips_tlb::Tlb, C: CpuModel>(_exec: &mut MipsExecutor<T, C>) {}
+    fn disable_jitv2<T: crate::cpu::mips_tlb::Tlb, C: CpuModel>(_exec: &mut MipsExecutor<T, C>) {}
 
     // Helper to create executor with mock memory
     fn create_executor() -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
@@ -176,7 +176,7 @@ mod tests {
     }
 
     // Helper to create executor with specific TLB
-    fn create_executor_with_tlb<T: crate::mips_tlb::Tlb>(tlb: T) -> (MipsExecutor<T, PassthroughCache>, Arc<MockMemory>) {
+    fn create_executor_with_tlb<T: crate::cpu::mips_tlb::Tlb>(tlb: T) -> (MipsExecutor<T, PassthroughCache>, Arc<MockMemory>) {
         let mem = Arc::new(MockMemory::new());
         let mem_bus: Arc<dyn BusDevice> = mem.clone();
         let cfg = MipsCpuConfig::indy();
@@ -201,7 +201,7 @@ mod tests {
     /// R4400 out of an R5000 machine because only the reset value had been updated.
     #[test]
     fn cpu_model_identity_is_live_at_construction() {
-        fn build<C: crate::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>()
+        fn build<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>()
             -> MipsExecutor<PassthroughTlb, C> {
             let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
             MipsExecutor::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy())
@@ -211,13 +211,13 @@ mod tests {
         assert_eq!(e4.core.fpu_fir,  0x0000_0500, "R4400 FIR at construction");
         assert!(!R4400Cache::MIPS4, "R4400 is MIPS III");
 
-        let e5 = build::<crate::mips_cache_v2::R5000Cache>();
+        let e5 = build::<crate::cpu::mips_cache_v2::R5000Cache>();
         assert_eq!(e5.core.cp0_prid, 0x0000_2321, "R5000 PRId at construction");
         assert_eq!(e5.core.fpu_fir,  0x0000_2300, "R5000 FIR at construction");
-        assert!(crate::mips_cache_v2::R5000Cache::MIPS4, "R5000 is MIPS IV");
+        assert!(crate::cpu::mips_cache_v2::R5000Cache::MIPS4, "R5000 is MIPS IV");
 
         // and they must survive a power_on, which re-derives from the reset values
-        let e5b = build::<crate::mips_cache_v2::R5000Cache>();
+        let e5b = build::<crate::cpu::mips_cache_v2::R5000Cache>();
         let mut core = e5b.core;
         core.reset(false);
         assert_eq!(core.cp0_prid, 0x0000_2321, "R5000 PRId after reset");
@@ -438,7 +438,7 @@ mod tests {
         let s2 = exec.step_int();
         assert!(s2 & EXEC_IS_EXCEPTION != 0, "misaligned load in the delay slot must fault");
         assert_eq!((s2 >> 2) & 0x1F, EXC_ADEL);
-        assert_ne!(exec.core.cp0_cause & crate::mips_core::CAUSE_BD, 0,
+        assert_ne!(exec.core.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0,
             "Cause.BD must be set: the fault happened in a delay slot, taken or not");
         assert_eq!(exec.core.cp0_epc, pc_base,
             "EPC must point at the branch itself (pc_base), not the delay-slot instruction (pc_base+4)");
@@ -782,7 +782,7 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_tlb_instructions_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
 
@@ -857,13 +857,13 @@ mod tests {
     /// Leaves the executor with ASID 10 live and 0x1000 already resident in
     /// the nanotlb read slot.
     fn setup_asid_aliased_page(
-        exec: &mut MipsExecutor<crate::mips_tlb::MipsTlb, PassthroughCache>,
+        exec: &mut MipsExecutor<crate::cpu::mips_tlb::MipsTlb, PassthroughCache>,
         mem: &Arc<MockMemory>,
     ) {
         // Reset leaves Status.ERL=1, under which KUSEG is unmapped/uncached
         // identity and the TLB is bypassed entirely (translate_32bit_impl,
         // segment 0..=3). Clear it so VA 0x1000 actually goes through the TLB.
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
         exec.update_translate_fn();
 
         let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
@@ -900,7 +900,7 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_mtc0_entryhi_asid_change_invalidates_nanotlb_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
         setup_asid_aliased_page(&mut exec, &mem);
@@ -933,12 +933,12 @@ mod tests {
     }
     #[cfg(feature = "tlbstats")]
     fn test_nutlb_actually_serves_repeat_reads_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
         setup_asid_aliased_page(&mut exec, &mem);
 
-        let at = crate::mips_tlb::AccessType::Read as usize;
+        let at = crate::cpu::mips_tlb::AccessType::Read as usize;
         let before = exec.tlb.stats.by_type[at].nutlb_hit;
 
         // Same page, repeatedly: the first was already primed by setup, so
@@ -966,11 +966,11 @@ mod tests {
     }
     #[cfg(feature = "tlbstats")]
     fn test_nutlb_conflict_set_stays_correct_inner() {
-        use crate::mips_tlb::MipsTlb;
-        use crate::mips_core::{NUTLB_BITS, nutlb_index};
+        use crate::cpu::mips_tlb::MipsTlb;
+        use crate::cpu::mips_core::{NUTLB_BITS, nutlb_index};
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
         exec.update_translate_fn();
 
         // Stride that maps to the same set: 1 << (12 + NUTLB_BITS).
@@ -997,7 +997,7 @@ mod tests {
             assert_eq!(exec.read_data::<4>(va_b).unwrap(), 0x2222_2222);
         }
 
-        let at = crate::mips_tlb::AccessType::Read as usize;
+        let at = crate::cpu::mips_tlb::AccessType::Read as usize;
         assert!(exec.tlb.stats.by_type[at].nutlb_conflict > 0,
                 "alternating two pages in one set should register conflict misses");
     }
@@ -1023,8 +1023,8 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_nutlb_kernel_entry_unreachable_from_user_inner() {
-        use crate::mips_tlb::MipsTlb;
-        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+        use crate::cpu::mips_tlb::MipsTlb;
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
                                STATUS_KSU_SHIFT, KSU_USER};
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
@@ -1057,7 +1057,7 @@ mod tests {
         let mtc0_status = (OP_COP0 << 26) | (0x04 << 21) | (8 << 16) | (12 << 11);
         assert_eq!(exec.exec(mtc0_status), EXEC_COMPLETE);
         assert!(matches!(exec.core.get_privilege_mode(),
-                         crate::mips_core::PrivilegeMode::User),
+                         crate::cpu::mips_core::PrivilegeMode::User),
                 "setup: should be in user mode after MTC0 Status");
         // `translate_fn` is specialized on privilege at Status-write time, so
         // if the callback did not fire the emulator is still running the
@@ -1066,7 +1066,7 @@ mod tests {
         // (the specializations are private): a *fresh* kernel-only VA that
         // was never cached must now be refused.
         let probe = (exec.translate_fn)(&mut exec, 0xFFFF_FFFF_8000_9000,
-                                        crate::mips_tlb::AccessType::Read);
+                                        crate::cpu::mips_tlb::AccessType::Read);
         assert!(probe.is_exception(),
                 "setup: after MTC0 Status the user-mode translator must refuse \
                  an uncached KSEG0 VA; it did not, so resync_privilege_state \
@@ -1094,10 +1094,10 @@ mod tests {
     }
     #[cfg(feature = "tlbstats")]
     fn test_nutlb_caches_segment_translations_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
         exec.update_translate_fn();
 
         // kseg0 (cached) and kseg1 (uncached) both alias physical 0x2000.
@@ -1105,7 +1105,7 @@ mod tests {
         let kseg0 = 0xFFFF_FFFF_8000_2000u64;
         let kseg1 = 0xFFFF_FFFF_A000_2000u64;
 
-        let at = crate::mips_tlb::AccessType::Read as usize;
+        let at = crate::cpu::mips_tlb::AccessType::Read as usize;
 
         for va in [kseg0, kseg1] {
             // Prime, then confirm subsequent accesses are served from nutlb.
@@ -1135,7 +1135,7 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_tlbr_asid_change_invalidates_nanotlb_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
         setup_asid_aliased_page(&mut exec, &mem);
@@ -1163,7 +1163,7 @@ mod tests {
     }
     #[cfg(feature = "tlbcheck")]
     fn test_tlbwi_breaks_on_duplicate_entry_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
         let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
@@ -1222,7 +1222,7 @@ mod tests {
     }
     #[cfg(feature = "tlbcheck")]
     fn test_tlbcheck_vmap_survives_overlap_repair_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
         let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
@@ -1253,7 +1253,7 @@ mod tests {
         // Confirm entry 5 is genuinely still reachable through the vmap fast
         // path, not just "no violation reported" — translate() must still
         // find it.
-        use crate::mips_tlb::{AccessType, Tlb, TlbResult};
+        use crate::cpu::mips_tlb::{AccessType, Tlb, TlbResult};
         let va = 0x100u64 << 13;
         match exec.tlb.translate::<0>(va, 10, AccessType::Read) {
             TlbResult::Hit { phys_addr, .. } => {
@@ -1279,7 +1279,7 @@ mod tests {
         // Verify CP0.Index was set. Index is not a plain 32-bit field: only the
         // slot bits [5:0] and the TLBP-failure bit [31] are implemented, so the
         // reserved bits of 0x12345678 read back as zero (0x78 & 0x3F == 0x38).
-        assert_eq!(exec.core.cp0_index, 0x12345678 & (crate::mips_exec::CP0_INDEX_P | crate::mips_exec::CP0_INDEX_SLOT_MASK));
+        assert_eq!(exec.core.cp0_index, 0x12345678 & (crate::cpu::mips_exec::CP0_INDEX_P | crate::cpu::mips_exec::CP0_INDEX_SLOT_MASK));
         assert_eq!(exec.core.cp0_index, 0x38);
 
         // Test MFC0 - Move from CP0
@@ -1348,10 +1348,10 @@ mod tests {
 
         // Interrupts enabled and one already pending, so the stall ends
         // immediately and we observe the completed PC.
-        exec.core.cp0_status |= crate::mips_core::STATUS_IE;
-        exec.core.cp0_status &= !(crate::mips_core::STATUS_EXL | crate::mips_core::STATUS_ERL);
-        exec.core.cp0_status |= crate::mips_core::CAUSE_IP2;
-        exec.core.hot.interrupts.store(crate::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        exec.core.cp0_status |= crate::cpu::mips_core::CAUSE_IP2;
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
 
         assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
         assert_eq!(exec.core.pc, pc + 4,
@@ -1372,15 +1372,15 @@ mod tests {
         // IE clear.
         let (mut exec, _) = create_executor();
         exec.core.pc = pc;
-        exec.core.cp0_status &= !crate::mips_core::STATUS_IE;
-        assert_eq!(exec.exec(wait_instr), crate::mips_exec::EXEC_RETRY);
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_IE;
+        assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
         assert_eq!(exec.core.pc, pc, "PC must stay on the WAIT");
 
         // EXL set (IE on, but exception level masks delivery just the same).
         let (mut exec, _) = create_executor();
         exec.core.pc = pc;
-        exec.core.cp0_status |= crate::mips_core::STATUS_IE | crate::mips_core::STATUS_EXL;
-        assert_eq!(exec.exec(wait_instr), crate::mips_exec::EXEC_RETRY);
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::STATUS_EXL;
+        assert_eq!(exec.exec(wait_instr), crate::cpu::mips_exec::EXEC_RETRY);
         assert_eq!(exec.core.pc, pc, "EXL is just as unreleasable as IE=0");
     }
 
@@ -1397,10 +1397,10 @@ mod tests {
 
         // Kernel mode, interrupts on, IP2 unmasked — then raise IP2 exactly
         // like a device would.
-        exec.core.cp0_status |= crate::mips_core::STATUS_IE;
-        exec.core.cp0_status &= !(crate::mips_core::STATUS_EXL | crate::mips_core::STATUS_ERL);
-        exec.core.cp0_status |= crate::mips_core::CAUSE_IP2; // IM bit for IP2 (same bit position)
-        exec.core.hot.interrupts.store(crate::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
+        exec.core.cp0_status |= crate::cpu::mips_core::CAUSE_IP2; // IM bit for IP2 (same bit position)
+        exec.core.hot.interrupts.store(crate::cpu::mips_core::CAUSE_IP2 as u64, std::sync::atomic::Ordering::Relaxed);
 
         let before = exec.core.hot.cycles;
         let wait_instr = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
@@ -1419,8 +1419,8 @@ mod tests {
         let (mut exec, _) = create_executor();
 
         exec.core.pc = 0xFFFF_FFFF_8000_1000;
-        exec.core.cp0_status |= crate::mips_core::STATUS_IE;
-        exec.core.cp0_status &= !(crate::mips_core::STATUS_EXL | crate::mips_core::STATUS_ERL);
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_IE;
+        exec.core.cp0_status &= !(crate::cpu::mips_core::STATUS_EXL | crate::cpu::mips_core::STATUS_ERL);
         // Interrupts enabled, none pending -> would spin; the reset bit is the
         // only thing that ends it.
         exec.core.hot.interrupts.store(1u64 << 63, std::sync::atomic::Ordering::Relaxed);
@@ -1450,7 +1450,7 @@ mod tests {
         // KSU is 0 (kernel) here, so clearing EXL leaves Kernel — asserted so this
         // test stops being silently compatible with a stale privilege state.
         assert!(matches!(exec.core.get_privilege_mode(),
-                         crate::mips_core::PrivilegeMode::Kernel));
+                         crate::cpu::mips_core::PrivilegeMode::Kernel));
 
         // Test ERET from error level (ERL=1)
         exec.core.cp0_errorepc = 0xBFC00300;
@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(exec.core.pc, 0xBFC00300);
         assert_eq!(exec.core.cp0_status & 0x04, 0);  // ERL should be cleared
         assert!(matches!(exec.core.get_privilege_mode(),
-                         crate::mips_core::PrivilegeMode::Kernel));
+                         crate::cpu::mips_core::PrivilegeMode::Kernel));
     }
 
     /// ERET into user mode must re-derive `translate_fn`.
@@ -1489,8 +1489,8 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_eret_to_user_mode_refuses_kseg0_inner() {
-        use crate::mips_tlb::{MipsTlb, AccessType};
-        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+        use crate::cpu::mips_tlb::{MipsTlb, AccessType};
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
                                STATUS_KSU_SHIFT, KSU_USER, PrivilegeMode};
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
@@ -1541,8 +1541,8 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_exception_from_user_accepts_kseg0_inner() {
-        use crate::mips_tlb::{MipsTlb, AccessType};
-        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+        use crate::cpu::mips_tlb::{MipsTlb, AccessType};
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
                                STATUS_KSU_SHIFT, KSU_USER, PrivilegeMode};
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
@@ -1604,7 +1604,7 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_tlb_index_masks_rather_than_wraps_inner() {
-        use crate::mips_tlb::{MipsTlb, Tlb};
+        use crate::cpu::mips_tlb::{MipsTlb, Tlb};
 
         let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
         let tlbwi_instr = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
@@ -1623,7 +1623,7 @@ mod tests {
 
         // A failed TLBP leaves Index = 0x8000_0000. Set it the way hardware
         // does — directly, not through MTC0, which masks.
-        exec.core.cp0_index = crate::mips_exec::CP0_INDEX_P;
+        exec.core.cp0_index = crate::cpu::mips_exec::CP0_INDEX_P;
         exec.core.cp0_entryhi = (0x100 << 13) | 5;
         exec.core.cp0_entrylo0 = (0x50 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
         exec.core.cp0_entrylo1 = (0x51 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
@@ -1641,7 +1641,7 @@ mod tests {
         exec.core.write_gpr(8, 49);
         let mtc0_index = (OP_COP0 << 26) | (0x04 << 21) | (8 << 16) | (0 << 11);
         assert_eq!(exec.exec(mtc0_index), EXEC_COMPLETE);
-        assert_eq!(exec.core.cp0_index & crate::mips_exec::CP0_INDEX_SLOT_MASK, 49,
+        assert_eq!(exec.core.cp0_index & crate::cpu::mips_exec::CP0_INDEX_SLOT_MASK, 49,
                    "49 fits in the 6-bit slot field and must survive the MTC0 mask");
         exec.exec(tlbwi_instr);
         let e1_after = exec.tlb.read(1);
@@ -1657,9 +1657,9 @@ mod tests {
 
         // The probe-failure bit must round-trip through MTC0, so software can
         // save and restore Index across a context switch.
-        exec.core.write_gpr(8, (crate::mips_exec::CP0_INDEX_P | 5) as u64);
+        exec.core.write_gpr(8, (crate::cpu::mips_exec::CP0_INDEX_P | 5) as u64);
         assert_eq!(exec.exec(mtc0_index), EXEC_COMPLETE);
-        assert_eq!(exec.core.cp0_index, crate::mips_exec::CP0_INDEX_P | 5,
+        assert_eq!(exec.core.cp0_index, crate::cpu::mips_exec::CP0_INDEX_P | 5,
                    "the TLBP failure bit must survive MTC0 — MFC0 readback is how \
                     software tests for a probe miss");
     }
@@ -1685,13 +1685,13 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_tlb_miss_preserves_entryhi_region_32bit_inner() {
-        use crate::mips_tlb::{MipsTlb, AccessType};
+        use crate::cpu::mips_tlb::{MipsTlb, AccessType};
         const EH_REGION: u64 = 0xC000_0000_0000_0000;
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
         // Clear ERL so KUSEG actually goes through the TLB rather than the
         // unmapped identity window.
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
         exec.resync_privilege_state();
         exec.core.cp0_entryhi = 0x2A; // a distinctive ASID to prove it survives
 
@@ -1731,7 +1731,7 @@ mod tests {
     /// `MipsCore` because that is precisely the path that had no coverage.
     #[test]
     fn test_deliver_exception_clears_in_delay_slot() {
-        use crate::mips_core::{MipsCore, deliver_exception_at};
+        use crate::cpu::mips_core::{MipsCore, deliver_exception_at};
 
         let mut core = MipsCore::new();
         core.in_delay_slot = true;
@@ -1740,13 +1740,13 @@ mod tests {
         // bd = true: the BD information must survive into Cause/EPC even though
         // the live flag is cleared.
         let fault_pc = core.pc;
-        deliver_exception_at(&mut core, crate::mips_exec::exec_exception(
-            crate::mips_exec::EXC_SYS), fault_pc, true);
+        deliver_exception_at(&mut core, crate::cpu::mips_exec::exec_exception(
+            crate::cpu::mips_exec::EXC_SYS), fault_pc, true);
 
         assert!(!core.in_delay_slot,
                 "deliver_exception_at must clear in_delay_slot — the handler's \
                  first instruction is never in a delay slot");
-        assert_ne!(core.cp0_cause & crate::mips_core::CAUSE_BD, 0,
+        assert_ne!(core.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0,
                    "Cause.BD must still record that the faulting instruction was \
                     in a delay slot");
         assert_eq!(core.cp0_epc, 0xFFFF_FFFF_8000_1000,
@@ -1769,8 +1769,8 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_cop0_requires_kernel_or_cu0_inner() {
-        use crate::mips_tlb::MipsTlb;
-        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+        use crate::cpu::mips_tlb::MipsTlb;
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
                                STATUS_KSU_SHIFT, KSU_USER, STATUS_CU0, PrivilegeMode};
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
@@ -1793,10 +1793,10 @@ mod tests {
         let s = exec.exec(mtc0_status);
         assert!(s & EXEC_IS_EXCEPTION != 0,
                 "MTC0 from user mode without CU0 must raise an exception");
-        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_CPU,
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_CPU,
                    "must be Coprocessor Unusable (EXC_CPU)");
-        assert_eq!((exec.core.cp0_cause & crate::mips_core::CAUSE_CE_MASK)
-                       >> crate::mips_core::CAUSE_CE_SHIFT,
+        assert_eq!((exec.core.cp0_cause & crate::cpu::mips_core::CAUSE_CE_MASK)
+                       >> crate::cpu::mips_core::CAUSE_CE_SHIFT,
                    0, "Cause.CE must name coprocessor 0");
         // The escalation must not have happened. Exception delivery sets EXL, so
         // compare only the field the instruction tried to write: KSU.
@@ -1834,8 +1834,8 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_soft_reset_from_user_fetches_reset_vector_inner() {
-        use crate::mips_tlb::{MipsTlb, AccessType};
-        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
+        use crate::cpu::mips_tlb::{MipsTlb, AccessType};
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK,
                                STATUS_KSU_SHIFT, KSU_USER, PrivilegeMode};
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
@@ -1851,7 +1851,7 @@ mod tests {
         // actually runs. Bit 63 is SOFT_RESET_BIT, the same bit MipsCpu::signal sets.
         exec.core.hot.interrupts.fetch_or(1u64 << 63, std::sync::atomic::Ordering::SeqCst);
         let status = exec.step_int();
-        assert_eq!(status, crate::mips_exec::EXEC_RETRY,
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_RETRY,
                    "a soft reset retires no instruction, so it must report EXEC_RETRY");
 
         assert_eq!(exec.core.pc, 0xFFFFFFFF_BFC00000,
@@ -2604,7 +2604,7 @@ mod tests {
         let add_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD);
         let s = exec.exec(add_s);
         assert!(s & EXEC_IS_EXCEPTION != 0, "denormal operand must trap");
-        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpu_control(31) & 0x0002_0000, 0x0002_0000, "Cause.E must be set");
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
     }
@@ -2624,7 +2624,7 @@ mod tests {
         let add_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FADD);
         let s = exec.exec(add_s);
         assert!(s & EXEC_IS_EXCEPTION != 0, "qNaN operand must trap");
-        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
     }
 
@@ -2644,7 +2644,7 @@ mod tests {
         let mul_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FMUL);
         let s = exec.exec(mul_s);
         assert!(s & EXEC_IS_EXCEPTION != 0, "denormal result without FS must trap");
-        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpu_control(31) & 0x0002_0000, 0x0002_0000, "Cause.E must be set");
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
     }
@@ -2694,7 +2694,7 @@ mod tests {
         let mul_s = make_cop1_compute(RS_S, 2, 1, 0, FUNCT_FMUL);
         let s = exec.exec(mul_s);
         assert!(s & EXEC_IS_EXCEPTION != 0, "underflow-enable must force Unimplemented, not flush");
-        assert_eq!((s >> 2) & 0x1F, crate::mips_exec::EXC_FPE);
+        assert_eq!((s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_FPE);
         assert_eq!(exec.core.read_fpu_control(31) & 0x0002_0000, 0x0002_0000, "Cause.E must be set");
         assert_eq!(exec.core.read_fpu_control(31) & 0x0000_2000, 0, "Cause.U must NOT be set — this is E, not U");
         assert_eq!(exec.core.read_fpr_w(0), 0x5a5a5a5a, "destination must be untouched on trap");
@@ -3040,12 +3040,12 @@ mod tests {
         // Attempt MTC1 - should trigger coprocessor unusable exception
         exec.core.write_gpr(1, 0x3F800000);
         let mtc1_instr = make_cop1_move(RS_MTC1, 1, 0);
-        { let _s = exec.exec(mtc1_instr); assert!(_s & EXEC_IS_EXCEPTION != 0, "Expected coprocessor unusable exception"); assert_eq!((_s >> 2) & 0x1F, crate::mips_exec::EXC_CPU); }
+        { let _s = exec.exec(mtc1_instr); assert!(_s & EXEC_IS_EXCEPTION != 0, "Expected coprocessor unusable exception"); assert_eq!((_s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_CPU); }
 
         // Attempt LWC1 - should also trigger exception
         exec.core.write_gpr(2, 0x1000);
         let lwc1_instr = make_i(OP_LWC1, 2, 0, 0);
-        { let _s = exec.exec(lwc1_instr); assert!(_s & EXEC_IS_EXCEPTION != 0, "Expected coprocessor unusable exception"); assert_eq!((_s >> 2) & 0x1F, crate::mips_exec::EXC_CPU); }
+        { let _s = exec.exec(lwc1_instr); assert!(_s & EXEC_IS_EXCEPTION != 0, "Expected coprocessor unusable exception"); assert_eq!((_s >> 2) & 0x1F, crate::cpu::mips_exec::EXC_CPU); }
     }
 
     #[test]
@@ -3415,7 +3415,7 @@ mod tests {
         assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
         assert_eq!(exec.core.read_gpr(2), 1);
         {
-            let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).expect("LL must have been recorded");
+            let st = *crate::cpu::mips_exec::ll_stats_lookup(&exec.ll_stats, key).expect("LL must have been recorded");
             assert_eq!(st.ll, 1);
             assert_eq!(st.ok, 1);
             assert_eq!(st.fail, 0);
@@ -3426,7 +3426,7 @@ mod tests {
         assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
         assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
         {
-            let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
+            let st = *crate::cpu::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
             assert_eq!(st.fail, 2);
             assert_eq!(st.cur_run, 2, "consecutive failures accumulate");
             assert_eq!(st.max_run, 2, "and are remembered as the worst run");
@@ -3436,7 +3436,7 @@ mod tests {
         assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE);
         assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
         {
-            let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
+            let st = *crate::cpu::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
             assert_eq!(st.ll, 2);
             assert_eq!(st.ok, 2);
             assert_eq!(st.cur_run, 0, "a success ends the run");
@@ -3469,7 +3469,7 @@ mod tests {
         assert_eq!(exec.exec(instr_sc), EXEC_COMPLETE);
         assert_eq!(exec.exec(instr_ll), EXEC_COMPLETE); // abandoned
 
-        let st = *crate::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
+        let st = *crate::cpu::mips_exec::ll_stats_lookup(&exec.ll_stats, key).unwrap();
         assert_eq!(st.ll, 2);
         assert_eq!(st.ok, 1);
         assert_eq!(st.fail, 0);
@@ -3511,17 +3511,17 @@ mod tests {
         let in_memory = make_i(OP_ADDIU, 0, 1, 5);
         mem.set_word(phys, in_memory);
 
-        let m0 = crate::mips_exec::FETCH_VERIFY_MISMATCHES
+        let m0 = crate::cpu::mips_exec::FETCH_VERIFY_MISMATCHES
             .load(std::sync::atomic::Ordering::Relaxed);
-        let c0 = crate::mips_exec::FETCH_VERIFY_CHECKS
+        let c0 = crate::cpu::mips_exec::FETCH_VERIFY_CHECKS
             .load(std::sync::atomic::Ordering::Relaxed);
 
         // Agreement: silent, but still counted as a check.
         assert_eq!(exec.fetch_verify_interp(pc, in_memory), EXEC_COMPLETE);
         assert_eq!(
-            crate::mips_exec::FETCH_VERIFY_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
+            crate::cpu::mips_exec::FETCH_VERIFY_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed),
             m0, "a word matching memory must not be reported");
-        assert!(crate::mips_exec::FETCH_VERIFY_CHECKS
+        assert!(crate::cpu::mips_exec::FETCH_VERIFY_CHECKS
             .load(std::sync::atomic::Ordering::Relaxed) > c0,
             "but it must count as a check — a stuck 0 means verification is off");
 
@@ -3531,7 +3531,7 @@ mod tests {
         assert_eq!(exec.fetch_verify_interp(pc, stale), EXEC_BREAKPOINT,
             "a cached decode that disagrees with memory must stop, not execute");
         assert_eq!(exec.core.pc, pc, "and must leave pc on the offending instruction");
-        assert!(crate::mips_exec::FETCH_VERIFY_MISMATCHES
+        assert!(crate::cpu::mips_exec::FETCH_VERIFY_MISMATCHES
             .load(std::sync::atomic::Ordering::Relaxed) > m0,
             "the mismatch counter must record it");
     }
@@ -3633,7 +3633,7 @@ mod tests {
     #[test]
     #[cfg(feature = "hostcall")]
     fn host_call_answers_user_syscall_and_leaves_kernel_alone() {
-        use crate::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK, STATUS_KSU_SHIFT, KSU_USER};
+        use crate::cpu::mips_core::{STATUS_ERL, STATUS_EXL, STATUS_KSU_MASK, STATUS_KSU_SHIFT, KSU_USER};
         iris_hostcall::register(iris_hostcall::SELFTEST, Box::new(iris_hostcall::SelfTest));
         let syscall = make_r(OP_SPECIAL, 0, 0, 0, 0, FUNCT_SYSCALL);
         let set_call = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, args: &[u64]| {
@@ -3737,7 +3737,7 @@ mod tests {
         // Index is 32-bit (truncated from the 64-bit write) *and* narrow: only
         // slot bits [5:0] and the TLBP-failure bit [31] are implemented.
         // 0x90ABCDEF -> P set (bit 31) | (0xEF & 0x3F) == 0x2F.
-        assert_eq!(exec.core.cp0_index, crate::mips_exec::CP0_INDEX_P | 0x2F);
+        assert_eq!(exec.core.cp0_index, crate::cpu::mips_exec::CP0_INDEX_P | 0x2F);
         
         // DMTC0 r1, Context (u64)
         let instr_dmtc0_ctx = (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (4 << 11);
@@ -3759,8 +3759,8 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_tlb_random_write_inner() {
-        use crate::mips_tlb::Tlb;
-        let (mut exec, _) = create_executor_with_tlb(crate::mips_tlb::MipsTlb::default());
+        use crate::cpu::mips_tlb::Tlb;
+        let (mut exec, _) = create_executor_with_tlb(crate::cpu::mips_tlb::MipsTlb::default());
 
         // TLBWR
         exec.core.cp0_random = 10;
@@ -3783,7 +3783,7 @@ mod tests {
         exec.core.write_gpr(1, 0x1000);
         let instr_cache = make_i(OP_CACHE, 1, 0, 0);
         // Requires CP0 usable
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU0;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU0;
         assert_eq!(exec.exec(instr_cache), EXEC_COMPLETE);
     }
 
@@ -4577,7 +4577,7 @@ mod tests {
         fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.get_double((addr & !7) as u64)) }
         fn write64(&self, addr: u32, val: u64) -> u32 { self.set_double((addr & !7) as u64, val); BUS_OK }
         fn gen_ptr(&self, addr: u32) -> *const std::sync::atomic::AtomicU64 {
-            let page = addr / crate::jitv2::PAGE_SIZE;
+            let page = addr / crate::cpu::jitv2::PAGE_SIZE;
             let mut gens = self.gens.lock().unwrap();
             let counter = gens.entry(page).or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
             counter.as_ref() as *const std::sync::atomic::AtomicU64
@@ -4975,12 +4975,12 @@ mod tests {
     #[test]
     fn test_virtual_coherency_exception() {
         #[allow(unused_imports)]
-        use crate::mips_exec::{MipsExecutor, MipsCpuConfig, EXC_VCED, EXC_VCEI};
-        use crate::mips_tlb::PassthroughTlb;
+        use crate::cpu::mips_exec::{MipsExecutor, MipsCpuConfig, EXC_VCED, EXC_VCEI};
+        use crate::cpu::mips_tlb::PassthroughTlb;
         #[allow(unused_imports)]
-        use crate::mips_cache_v2::R4400Cache;
+        use crate::cpu::mips_cache_v2::R4400Cache;
         #[allow(unused_imports)]
-        use crate::mips_core::STATUS_KX;
+        use crate::cpu::mips_core::STATUS_KX;
         use crate::traits::{BUS_OK, BUS_VCE};
 
         let (exec, mem) = create_executor_with_r4000cache();
@@ -5016,10 +5016,10 @@ mod tests {
         mem.set_word(phys_addr + 0x1000, 0x00000000);
 
         let result = exec.cache.fetch(virt1, phys_addr + 0x1000);
-        assert_eq!(result.status, crate::mips_exec::EXEC_COMPLETE, "First fetch should succeed");
+        assert_eq!(result.status, crate::cpu::mips_exec::EXEC_COMPLETE, "First fetch should succeed");
 
         let result = exec.cache.fetch(virt2, phys_addr + 0x1000);
-        assert_eq!(result.status, crate::mips_exec::exec_exception_const(crate::mips_exec::EXC_VCEI),
+        assert_eq!(result.status, crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_VCEI),
                    "Second fetch with different virtual index should trigger VCEI");
     }
 
@@ -5436,7 +5436,7 @@ mod tests {
     /// Map `va`'s VPN2 to `pfn` at TLB index `index`, global, valid, dirty.
     /// Writes through the real TLBWI path so the shadow/vmap stay coherent.
     fn tlb_map_global(
-        exec: &mut MipsExecutor<crate::mips_tlb::MipsTlb, PassthroughCache>,
+        exec: &mut MipsExecutor<crate::cpu::mips_tlb::MipsTlb, PassthroughCache>,
         index: u32, va: u64, pfn: u64,
     ) {
         // Region + VPN2, exactly as update_tlb_exception_registers commits it.
@@ -5454,8 +5454,8 @@ mod tests {
 
     /// Put the executor in 64-bit kernel mode with a *live* (not ERL/EXL)
     /// context, so TLB segments actually translate through the TLB.
-    fn enter_kx_kernel(exec: &mut MipsExecutor<crate::mips_tlb::MipsTlb, PassthroughCache>) {
-        use crate::mips_core::{STATUS_KX, STATUS_ERL, STATUS_EXL};
+    fn enter_kx_kernel(exec: &mut MipsExecutor<crate::cpu::mips_tlb::MipsTlb, PassthroughCache>) {
+        use crate::cpu::mips_core::{STATUS_KX, STATUS_ERL, STATUS_EXL};
         exec.core.cp0_status &= !(STATUS_ERL | STATUS_EXL);
         exec.core.cp0_status |= STATUS_KX;
         exec.update_translate_fn();
@@ -5470,9 +5470,9 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_xtlb_vector_chosen_by_kx_not_address_shape_inner() {
-        use crate::mips_tlb::MipsTlb;
-        use crate::mips_exec::EXEC_IS_XTLB_REFILL;
-        use crate::mips_core::STATUS_KX;
+        use crate::cpu::mips_tlb::MipsTlb;
+        use crate::cpu::mips_exec::EXEC_IS_XTLB_REFILL;
+        use crate::cpu::mips_core::STATUS_KX;
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
 
@@ -5514,7 +5514,7 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_xtlb_compare_width_disambiguates_region_field_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
         enter_kx_kernel(&mut exec);
@@ -5552,7 +5552,7 @@ mod tests {
             .unwrap().join().unwrap();
     }
     fn test_tlbp_region_field_symmetry_under_kx_inner() {
-        use crate::mips_tlb::MipsTlb;
+        use crate::cpu::mips_tlb::MipsTlb;
 
         let (mut exec, _mem) = create_executor_with_tlb(MipsTlb::default());
         enter_kx_kernel(&mut exec);
@@ -5627,17 +5627,17 @@ mod tests {
         for (c, want_cached) in [(0u32, false), (1, false), (2, false), (3, true),
                                  (4, true), (5, true), (6, true), (7, false)] {
             let attr = E::decode_cache_attr(c);
-            let cached = attr & 0x7 != crate::mips_exec::TR_UNCACHED;
+            let cached = attr & 0x7 != crate::cpu::mips_exec::TR_UNCACHED;
             assert_eq!(cached, want_cached,
                 "R4400 C={c} should be {} per UM Table 4-6",
                 if want_cached { "CACHED" } else { "uncached" });
         }
         // The coherent variants decode as coherent, not plain cacheable.
         for c in [4u32, 5, 6] {
-            assert_eq!(E::decode_cache_attr(c), crate::mips_exec::TR_CACHEABLE_COH,
+            assert_eq!(E::decode_cache_attr(c), crate::cpu::mips_exec::TR_CACHEABLE_COH,
                        "R4400 C={c} is a cacheable COHERENT variant");
         }
-        assert_eq!(E::decode_cache_attr(3), crate::mips_exec::TR_CACHEABLE);
+        assert_eq!(E::decode_cache_attr(3), crate::cpu::mips_exec::TR_CACHEABLE);
     }
 
     #[test]
@@ -5652,7 +5652,7 @@ mod tests {
         for (c, want_cached) in [(0u32, true), (1, true), (2, false), (3, true),
                                  (4, false), (5, false), (6, false), (7, false)] {
             let attr = E::decode_cache_attr(c);
-            let cached = attr & 0x7 != crate::mips_exec::TR_UNCACHED;
+            let cached = attr & 0x7 != crate::cpu::mips_exec::TR_UNCACHED;
             assert_eq!(cached, want_cached,
                 "R5000 C={c} should be {} per VR5000 UM Table 6-6",
                 if want_cached { "CACHED" } else { "uncached" });
@@ -5661,7 +5661,7 @@ mod tests {
         // write-through path, and write-back is the closest representable
         // behaviour (uncached would be a coherency error, not a safe default).
         for c in [0u32, 1] {
-            assert_eq!(E::decode_cache_attr(c), crate::mips_exec::TR_CACHEABLE,
+            assert_eq!(E::decode_cache_attr(c), crate::cpu::mips_exec::TR_CACHEABLE,
                        "R5000 C={c} (write-through) folds onto write-back");
         }
     }
@@ -5672,7 +5672,7 @@ mod tests {
     fn test_the_two_cache_attr_tables_are_not_the_same() {
         type R4K = MipsExecutor<PassthroughTlb, PassthroughCache>;
         type R5K = MipsExecutor<PassthroughTlb, PassthroughCacheM4>;
-        let un = crate::mips_exec::TR_UNCACHED;
+        let un = crate::cpu::mips_exec::TR_UNCACHED;
 
         // C=0/1: cacheable on R5000, reserved (uncached) on R4400.
         for c in [0u32, 1] {
@@ -5735,7 +5735,7 @@ mod tests {
 
         // ERL must be clear to fill at all: `nutlb_fill` treats ERL=1 as a
         // do-not-cache window (docs/nutlb-design.md §5), and reset leaves it set.
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
         exec.update_translate_fn();
         let _ = exec.read_data::<4>(kseg0);
         assert!(any_valid(&exec), "setup: a KSEG0 access should fill the nutlb");
@@ -5829,7 +5829,7 @@ mod tests {
 
     #[test]
     fn test_misaligned_eret_target_raises_adel() {
-        use crate::mips_core::{STATUS_EXL, STATUS_ERL};
+        use crate::cpu::mips_core::{STATUS_EXL, STATUS_ERL};
 
         let (mut exec, mem) = create_executor();
 
@@ -5881,7 +5881,7 @@ mod tests {
         mem.set_word(0x1004, 0); // NOP delay slot
 
         for off in [1u64, 2, 3] {
-            exec.core.cp0_status &= !crate::mips_core::STATUS_EXL;
+            exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_EXL;
             exec.core.in_delay_slot = false;
             exec.core.write_gpr(8, 0x2000 + off);
             exec.core.pc = 0x1000;

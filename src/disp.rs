@@ -541,11 +541,11 @@ pub struct StatusBar {
     decode_pct: f64,
     l1i_hit_pct: f64,
     uncached_pct: f64,
-    /// Live arena/queue fill fractions (0..=255) from `crate::jit_feedback`,
+    /// Live arena/queue fill fractions (0..=255) from `crate::cpu::jit_feedback`,
     /// sampled fresh every `update()` — unlike the fade counters above,
     /// these are gauges, not events, so there's nothing to remember between
     /// frames beyond "what they are right now". Feature-gated: with jitv2
-    /// not built in, `crate::jit_feedback::JIT_FEEDBACK` never gets touched
+    /// not built in, `crate::cpu::jit_feedback::JIT_FEEDBACK` never gets touched
     /// by anything and would just read as a permanently-empty rectangle —
     /// this hides it instead of showing a gauge for a JIT that isn't there.
     #[cfg(feature = "jitv2")]
@@ -610,7 +610,7 @@ impl StatusBar {
         #[cfg(feature = "jitv2")]
         {
             use std::sync::atomic::Ordering as JitOrdering;
-            let fb = &crate::jit_feedback::JIT_FEEDBACK;
+            let fb = &crate::cpu::jit_feedback::JIT_FEEDBACK;
             self.jit_arena_fill = fb.arena_fill.load(JitOrdering::Relaxed);
             self.jit_queue_fill = fb.queue_fill.load(JitOrdering::Relaxed);
             let flush_events = fb.flush_events.load(JitOrdering::Relaxed);
@@ -683,7 +683,7 @@ impl StatusBar {
     /// (dim background, filled left-to-right by the live percentage,
     /// like `draw_bar`'s convention elsewhere in this file) whose filled
     /// color interpolates green-at-0%-to-red-at-100% (`lerp_green_red`) —
-    /// see `crate::jit_feedback::JitFeedback`'s own doc comment for what
+    /// see `crate::cpu::jit_feedback::JitFeedback`'s own doc comment for what
     /// feeds the two percentages. While `jit_flush_fade` is counting down
     /// (a `mega_flush` happened recently), the whole rectangle flashes a
     /// single flat color instead, overriding both bars — a flush resets the

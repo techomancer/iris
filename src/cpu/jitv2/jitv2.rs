@@ -24,8 +24,8 @@ use std::thread::JoinHandle;
 
 use parking_lot::Mutex;
 
-use crate::mips_core::MipsCore;
-use crate::mips_exec::ExecStatus;
+use crate::cpu::mips_core::MipsCore;
+use crate::cpu::mips_exec::ExecStatus;
 use crate::traits::{BusDevice, Device};
 
 /// A compile request pushed from the mips exec thread to the compile thread
@@ -2324,17 +2324,17 @@ pub struct Jitv2 {
     /// `codegen.lock()` for the duration of one compile/reset, same
     /// exclusion discipline the compile thread already has by construction
     /// (only it ever touches its own moved-out copy).
-    pub codegen: Mutex<Option<crate::jitv2::codegen::Codegen>>,
+    pub codegen: Mutex<Option<crate::cpu::jitv2::codegen::Codegen>>,
 
     /// L1-D geometry for the inline load/store fast path, published once by
     /// the CPU thread at startup (`MipsExecutor::publish_jit_dc_geometry`)
     /// and copied into `Codegen` when the compile worker takes it. Held here
     /// rather than written straight into `Codegen` because the worker owns
     /// that by value while compiling.
-    pub dc_geometry: Mutex<crate::mips_cache_v2::JitDcGeometry>,
+    pub dc_geometry: Mutex<crate::cpu::mips_cache_v2::JitDcGeometry>,
     /// Compile-time constants for the one core these workers compile for —
     /// see `codegen::JitConsts`. Same publication route as `dc_geometry`.
-    pub jit_consts: Mutex<crate::jitv2::codegen::JitConsts>,
+    pub jit_consts: Mutex<crate::cpu::jitv2::codegen::JitConsts>,
     /// Event counters, read only under `j2 status` (dev-only display — see
     /// `JitStats`'s own doc comment for why the *fields themselves* still
     /// exist and get threaded through unconditionally: it's cheaper to carry
@@ -2391,9 +2391,9 @@ impl Jitv2 {
             pfn_to_slot: PfnMap::new(),
             capacity,
             compile_queue: CompileQueue::new(),
-            codegen: Mutex::new(Some(crate::jitv2::codegen::Codegen::new())),
-            dc_geometry: Mutex::new(crate::mips_cache_v2::JitDcGeometry::unsupported()),
-            jit_consts: Mutex::new(crate::jitv2::codegen::JitConsts::default()),
+            codegen: Mutex::new(Some(crate::cpu::jitv2::codegen::Codegen::new())),
+            dc_geometry: Mutex::new(crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()),
+            jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
             stats: Arc::new(JitStats::default()),
         }
     }
@@ -2579,7 +2579,7 @@ impl Jitv2 {
     /// whole operation self-contained now that `Jitv2` owns its own
     /// compile-queue lifecycle independently of `MipsCpu::stop()`/`start()`).
     fn mega_flush(&mut self) {
-        crate::jitv2::hashstats::FLUSH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::cpu::jitv2::hashstats::FLUSH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pfn_to_slot.clear();
         let cap = self.pages.len();
         for (i, page) in self.pages.iter_mut().enumerate() {
@@ -2592,8 +2592,8 @@ impl Jitv2 {
         } else {
             self.free_head = NO_SLOT;
         }
-        crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
-        crate::jit_feedback::JIT_FEEDBACK.record_flush();
+        crate::cpu::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+        crate::cpu::jit_feedback::JIT_FEEDBACK.record_flush();
     }
 
     /// Self-contained page-pool + compiled-code-arena flush, called FROM the
@@ -2687,8 +2687,8 @@ struct BarrierState {
     /// first flush ever completes (never read before then, since nothing
     /// can be parked before any worker has ever detected a flush trigger),
     /// and never touched by a seal-only cycle (see `was_flush`).
-    current_arena: Option<Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>>,
-    current_state: Option<Arc<crate::jitv2::paged_memory::PagedArenaState>>,
+    current_arena: Option<Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>>,
+    current_state: Option<Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>>,
 }
 
 impl BarrierState {
@@ -2764,7 +2764,7 @@ pub struct CompileQueue {
     /// One `JoinHandle` per worker thread — empty when not running. Each
     /// thread hands back its own `Codegen` on exit (see `worker_loop`'s
     /// return type); `stop()` collects all of them.
-    threads: Vec<JoinHandle<crate::jitv2::codegen::Codegen>>,
+    threads: Vec<JoinHandle<crate::cpu::jitv2::codegen::Codegen>>,
     /// Weak handle to the CPU device, so the worker can stop/start it itself
     /// when a memory-growth flush is needed (`Codegen::function_count()`
     /// crossing `CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES` — see `worker_loop`). Set
@@ -2831,7 +2831,7 @@ impl CompileQueue {
     /// [`Self::start`] to spawn the pool.
     pub fn new() -> Self {
         Self {
-            mips4: crate::jitv2::isa::mips4_enabled(),
+            mips4: crate::cpu::jitv2::isa::mips4_enabled(),
             queue: Arc::new(crossbeam_queue::ArrayQueue::new(COMPILE_QUEUE_CAPACITY)),
             running: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
@@ -2882,7 +2882,7 @@ impl CompileQueue {
     /// any hot path, safe for a monitor command to call at any time
     /// (contends real compiles for the duration of one queue-front peek,
     /// same as any other `try_seal_ready` call already does).
-    pub fn seal_queue_snapshot(&self) -> Option<crate::jitv2::paged_memory::SealQueueSnapshot> {
+    pub fn seal_queue_snapshot(&self) -> Option<crate::cpu::jitv2::paged_memory::SealQueueSnapshot> {
         let (mutex, _cv) = &*self.barrier;
         let arena = mutex.lock().current_arena.clone()?;
         let snapshot = arena.lock().seal_queue_snapshot();
@@ -2893,7 +2893,7 @@ impl CompileQueue {
     /// caller. `None` if the pool has never started. See
     /// `SharedArena::seal_queue_entries`'s own doc comment; not bounded, the
     /// caller decides how much to print.
-    pub fn seal_queue_entries(&self) -> Option<Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)>> {
+    pub fn seal_queue_entries(&self) -> Option<Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::cpu::jitv2::PhysicalCodePage)>> {
         let (mutex, _cv) = &*self.barrier;
         let arena = mutex.lock().current_arena.clone()?;
         let entries = arena.lock().seal_queue_entries();
@@ -3033,8 +3033,8 @@ impl CompileQueue {
     }
 
     pub fn start(&mut self, bus: Arc<dyn BusDevice>, stats: Arc<JitStats>) {
-        let state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-        let shared = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
+        let state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let shared = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
             ARENA_RESERVE_SIZE, state.clone(),
         ).expect("CompileQueue::start: failed to reserve a fresh jitv2 arena");
         self.start_inner(bus, stats, shared, state);
@@ -3049,8 +3049,8 @@ impl CompileQueue {
         &mut self,
         bus: Arc<dyn BusDevice>,
         stats: Arc<JitStats>,
-        shared: Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
-        state: Arc<crate::jitv2::paged_memory::PagedArenaState>,
+        shared: Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+        state: Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) {
         self.start_inner(bus, stats, shared, state);
     }
@@ -3078,8 +3078,8 @@ impl CompileQueue {
         &mut self,
         bus: Arc<dyn BusDevice>,
         stats: Arc<JitStats>,
-        shared: Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>,
-        state: Arc<crate::jitv2::paged_memory::PagedArenaState>,
+        shared: Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+        state: Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
     ) {
         if !self.threads.is_empty() {
             return;
@@ -3106,7 +3106,7 @@ impl CompileQueue {
         }
         self.function_counts = (0..self.thread_count).map(|_| Arc::new(AtomicU32::new(0))).collect();
         for i in 0..self.thread_count {
-            let codegen = crate::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
+            let codegen = crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared.clone(), state.clone());
             let queue = self.queue.clone();
             let running = self.running.clone();
             let bus = bus.clone();
@@ -3145,14 +3145,14 @@ impl CompileQueue {
     /// reading was confirmed live to otherwise stay stuck at whatever it
     /// last was before the stop, forever, since nothing calls
     /// `set_queue_fill` again once no worker is running.
-    pub fn stop(&mut self) -> Vec<crate::jitv2::codegen::Codegen> {
+    pub fn stop(&mut self) -> Vec<crate::cpu::jitv2::codegen::Codegen> {
         self.running.store(false, Ordering::SeqCst);
         let result: Vec<_> = self.threads.drain(..).enumerate().filter_map(|(i, h)| {
             let r = h.join();
             r.ok()
         }).collect();
         self.drain_pending_queue();
-        crate::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
+        crate::cpu::jit_feedback::JIT_FEEDBACK.set_queue_fill(0, COMPILE_QUEUE_CAPACITY);
         result
     }
 
@@ -3185,7 +3185,7 @@ impl CompileQueue {
         barrier: &Arc<(parking_lot::Mutex<BarrierState>, parking_lot::Condvar)>,
         running: &AtomicBool,
         quiesce_in_progress: &AtomicBool,
-    ) -> Option<(Arc<parking_lot::Mutex<crate::jitv2::paged_memory::SharedArena>>, Arc<crate::jitv2::paged_memory::PagedArenaState>)> {
+    ) -> Option<(Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>, Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>)> {
         let (mutex, cv) = &**barrier;
         let mut state = mutex.lock();
         let my_generation = state.generation;
@@ -3294,7 +3294,7 @@ impl CompileQueue {
         queue: Arc<crossbeam_queue::ArrayQueue<CompileRequest>>,
         running: Arc<AtomicBool>,
         bus: Arc<dyn BusDevice>,
-        mut codegen: crate::jitv2::codegen::Codegen,
+        mut codegen: crate::cpu::jitv2::codegen::Codegen,
         cpu: Option<Weak<dyn Device>>,
         jitv2: Option<Weak<Mutex<Jitv2>>>,
         function_count: Arc<AtomicU32>,
@@ -3304,7 +3304,7 @@ impl CompileQueue {
         thread_count: usize,
         // The CPU model’s ISA level, for this worker’s `Analyzer`.
         mips4: bool,
-    ) -> crate::jitv2::codegen::Codegen {
+    ) -> crate::cpu::jitv2::codegen::Codegen {
         // Pick up the L1-D geometry the CPU published for the inline
         // load/store path. The worker owns `codegen` by value for its whole
         // life, so the CPU cannot stamp it directly — it goes through
@@ -3334,8 +3334,8 @@ impl CompileQueue {
         }
 
 
-        let mut analyzer = crate::jitv2::analyzer::Analyzer::with_isa(mips4);
-        let mut pending: crate::jitv2::comp::PendingCount = 0;
+        let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::with_isa(mips4);
+        let mut pending: crate::cpu::jitv2::comp::PendingCount = 0;
         // Wall-clock start of the current unbroken stretch of "queue empty
         // AND pending still non-empty after a non-forced publish attempt" —
         // see the `Err(_)` arm below (queue-drain fallback) for the
@@ -3383,7 +3383,7 @@ impl CompileQueue {
         // publish — any follower already parked (or about to park) must
         // still wake up and see `was_flush: false`, not hang forever behind
         // a leader that's giving up.
-        let abandon_quiesce = |pending: &mut crate::jitv2::comp::PendingCount| {
+        let abandon_quiesce = |pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             *pending = 0;
             let (mutex, cv) = &*barrier;
             let mut state = mutex.lock();
@@ -3398,9 +3398,9 @@ impl CompileQueue {
         // worker_loop's own doc comment for the step-by-step. Called only
         // after this thread has already won leadership via
         // `quiesce_in_progress.compare_exchange`.
-        let run_leader_flush = |codegen: &mut crate::jitv2::codegen::Codegen,
+        let run_leader_flush = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                                  function_count: &Arc<AtomicU32>,
-                                 pending: &mut crate::jitv2::comp::PendingCount| {
+                                 pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             let Some((cpu, jit)) = cpu.as_ref().and_then(Weak::upgrade).zip(jitv2.as_ref().and_then(Weak::upgrade)) else {
                 // `set_cpu`/`set_owner` were never called, or their target
                 // has since been dropped — this thread already won
@@ -3459,8 +3459,8 @@ impl CompileQueue {
                 // own) Codegen on top of it — every other, parked worker
                 // rebuilds its own once it wakes (park_at_barrier's return
                 // value), from the same arena published below.
-                let fresh_state = std::sync::Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-                let fresh_arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
+                let fresh_state = std::sync::Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+                let fresh_arena = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(
                     ARENA_RESERVE_SIZE, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
@@ -3498,8 +3498,8 @@ impl CompileQueue {
         // `quiesce_in_progress.compare_exchange` a flush leader would use —
         // see `BarrierState`'s own doc comment for why this and
         // `run_leader_flush` share one gate/barrier instead of two.
-        let run_leader_seal = |codegen: &mut crate::jitv2::codegen::Codegen,
-                                pending: &mut crate::jitv2::comp::PendingCount| {
+        let run_leader_seal = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
+                                pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             // Bails out cleanly (no seal performed) if `running` goes false
             // first — see `wait_for_followers_or_abandon`'s own doc comment
             // for the `CompileQueue::stop()` race this guards.
@@ -3507,7 +3507,7 @@ impl CompileQueue {
                 abandon_quiesce(pending);
                 return;
             }
-            crate::jitv2::comp::force_publish_pending(codegen, pending);
+            crate::cpu::jitv2::comp::force_publish_pending(codegen, pending);
             {
                 let (mutex, cv) = &*barrier;
                 let mut state = mutex.lock();
@@ -3529,9 +3529,9 @@ impl CompileQueue {
         // thread_count == 1 there is only ever one worker, so this always
         // wins trivially — real contention is exercised separately
         // (`tests::barrier_parks_followers_until_leader_resumes_them`).
-        let try_flush = |codegen: &mut crate::jitv2::codegen::Codegen,
+        let try_flush = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
                           function_count: &Arc<AtomicU32>,
-                          pending: &mut crate::jitv2::comp::PendingCount| {
+                          pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if quiesce_in_progress.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 run_leader_flush(codegen, function_count, pending);
             } else {
@@ -3543,8 +3543,8 @@ impl CompileQueue {
                 function_count.store(codegen.function_count(), Ordering::Relaxed);
             }
         };
-        let try_force_seal = |codegen: &mut crate::jitv2::codegen::Codegen,
-                               pending: &mut crate::jitv2::comp::PendingCount| {
+        let try_force_seal = |codegen: &mut crate::cpu::jitv2::codegen::Codegen,
+                               pending: &mut crate::cpu::jitv2::comp::PendingCount| {
             if quiesce_in_progress.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                 run_leader_seal(codegen, pending);
             } else {
@@ -3601,9 +3601,9 @@ impl CompileQueue {
                     // what triggered it.
                     let ran_out_of_memory = {
                         #[cfg(feature = "developer")]
-                        { crate::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending, &stats) }
+                        { crate::cpu::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending, &stats) }
                         #[cfg(not(feature = "developer"))]
-                        { crate::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending) }
+                        { crate::cpu::jitv2::comp::handle_request_deferred(&req, &bus, &mut analyzer, &mut codegen, &mut pending) }
                     };
                     // Keep CompileQueue::function_count's mirror in sync —
                     // see that field's doc comment for why it exists
@@ -3622,8 +3622,8 @@ impl CompileQueue {
                     // iteration was already computing for the threshold
                     // check below.
                     let reserved_bytes = codegen.packing_stats().1;
-                    crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
-                    crate::jit_feedback::JIT_FEEDBACK.set_queue_fill(queue.len(), COMPILE_QUEUE_CAPACITY);
+                    crate::cpu::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+                    crate::cpu::jit_feedback::JIT_FEEDBACK.set_queue_fill(queue.len(), COMPILE_QUEUE_CAPACITY);
                     if ran_out_of_memory {
                         // The compile that just ran couldn't get memory —
                         // flush immediately, regardless of the byte
@@ -3665,7 +3665,7 @@ impl CompileQueue {
                         // forced seal is only safe once every other worker
                         // is provably parked (not mid-compile).
                         #[cfg(feature = "developer")]
-                        stats.record_batch_flush(pending, crate::jitv2::BatchFlushReason::PendingThreshold);
+                        stats.record_batch_flush(pending, crate::cpu::jitv2::BatchFlushReason::PendingThreshold);
                         try_force_seal(&mut codegen, &mut pending);
                         function_count.store(codegen.function_count(), Ordering::Relaxed);
                     }
@@ -3699,14 +3699,14 @@ impl CompileQueue {
                     // need once a real multi-worker pool shares one arena
                     // gets exercised and proven first.
                     if pending > 0 {
-                        crate::jitv2::comp::publish_ready_nonforced(&mut codegen, &mut pending);
+                        crate::cpu::jitv2::comp::publish_ready_nonforced(&mut codegen, &mut pending);
                         if pending > 0 {
                             if idle_since.is_none() {
                                 idle_since = Some(std::time::Instant::now());
                             }
                             if idle_since.is_some_and(|t| t.elapsed() >= IDLE_FORCE_SEAL_THRESHOLD) {
                                 #[cfg(feature = "developer")]
-                                stats.record_batch_flush(pending, crate::jitv2::BatchFlushReason::QueueDrain);
+                                stats.record_batch_flush(pending, crate::cpu::jitv2::BatchFlushReason::QueueDrain);
                                 // Same shared quiesce barrier as the pending-
                                 // threshold trigger above — see
                                 // BarrierState's own doc comment.
@@ -3887,14 +3887,14 @@ mod tests {
     struct MaxInstrsGuard(usize);
     impl MaxInstrsGuard {
         fn set(n: usize) -> Self {
-            let prev = crate::jitv2::comp::max_instrs_per_compile();
-            crate::jitv2::comp::set_max_instrs_per_compile(n);
+            let prev = crate::cpu::jitv2::comp::max_instrs_per_compile();
+            crate::cpu::jitv2::comp::set_max_instrs_per_compile(n);
             Self(prev)
         }
     }
     impl Drop for MaxInstrsGuard {
         fn drop(&mut self) {
-            crate::jitv2::comp::set_max_instrs_per_compile(self.0);
+            crate::cpu::jitv2::comp::set_max_instrs_per_compile(self.0);
         }
     }
 
@@ -3932,8 +3932,8 @@ mod tests {
             }
         }
 
-        let fresh_state = Arc::new(crate::jitv2::paged_memory::PagedArenaState::default());
-        let fresh_arena = crate::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, fresh_state.clone()).unwrap();
+        let fresh_state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let fresh_arena = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_shared(1 << 20, fresh_state.clone()).unwrap();
         {
             let (mutex, cv) = &*barrier;
             let mut state = mutex.lock();
@@ -5247,9 +5247,9 @@ mod tests {
         fn read32(&self, addr: u32) -> BusRead32 {
             let offset_word = (addr % PAGE_SIZE) / 4;
             if offset_word < 2 {
-                BusRead32::ok((crate::mips_isa::OP_ADDIU << 26) | (1 << 16) | 1)
+                BusRead32::ok((crate::cpu::mips_isa::OP_ADDIU << 26) | (1 << 16) | 1)
             } else {
-                BusRead32::ok(crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
+                BusRead32::ok(crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
             }
         }
         fn write32(&self, _addr: u32, _val: u32) -> u32 { crate::traits::BUS_ERR }

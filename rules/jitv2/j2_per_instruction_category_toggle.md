@@ -1,6 +1,6 @@
 # j2 per-instruction/category enable toggle
 
-`src/jitv2/opcode_support.rs` now carries a **per-`InstrKind` runtime enable
+`src/cpu/jitv2/opcode_support.rs` now carries a **per-`InstrKind` runtime enable
 table** (`ENABLED`, one `AtomicBool` per instruction kind, lazily built via
 `OnceLock`), not just the static "does codegen have an emitter"
 (`InstrKind::has_jitv2_emitter`/`has_jitv2_support`) table. `has_emitter(raw)`

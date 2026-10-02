@@ -1,6 +1,6 @@
 # IRIS JIT v2 — Design Plan (draft for discussion)
 
-Status: **implementation in progress, doc tracks as-built reality** (last reconciled against `src/jitv2/` 2026-08-07). Open questions marked `[Q]` throughout and collected at the end. Sections marked *(as-built)* describe what the implementation actually does where it diverged from the original plan; §12 is the divergence map and the code-cache locality investigation.
+Status: **implementation in progress, doc tracks as-built reality** (last reconciled against `src/cpu/jitv2/` 2026-08-07). Open questions marked `[Q]` throughout and collected at the end. Sections marked *(as-built)* describe what the implementation actually does where it diverged from the original plan; §12 is the divergence map and the code-cache locality investigation.
 
 ---
 
@@ -69,7 +69,7 @@ Per physical frame:
 
 (`covered_bits` is no longer needed for dispatch or dedup; keep it only if the debugger/`jit-diag` wants coverage introspection.)
 
-**(as-built)** `PhysicalCodePage` (`src/jitv2/jitv2.rs`) implements: `valid_bits` (= `entry_bits`), `denylist_bits` (sticky rejection), `scheduled_bits` (= `queued_bits`, test-and-set dedup), and `entries` — an **AoS** `JitEntry { func, gen }` table rather than the SoA split, because `gen` is consulted together with `func` at every dispatch (per-entry gen is how staleness is detected, §7 as-built — there is no kill walk to make a bitmap authoritative alone). Gen counters live in the owning `BusDevice` (per-page for RAM, one shared never-bumped counter for ROM), reached via a raw `gen_ptr`. **Not implemented** (not needed under lazy staleness + flush-the-world): `artifact_list`, `entry_count`, the global per-PFN `flags` byte array. Pages are pooled in `Jitv2` (bump-allocated `Vec`, `pfn → slot` HashMap consulted only on page switch, capacity `JITV2_INITIAL_PAGE_CAPACITY` = 16384; exhaustion triggers mega_flush).
+**(as-built)** `PhysicalCodePage` (`src/cpu/jitv2/jitv2.rs`) implements: `valid_bits` (= `entry_bits`), `denylist_bits` (sticky rejection), `scheduled_bits` (= `queued_bits`, test-and-set dedup), and `entries` — an **AoS** `JitEntry { func, gen }` table rather than the SoA split, because `gen` is consulted together with `func` at every dispatch (per-entry gen is how staleness is detected, §7 as-built — there is no kill walk to make a bitmap authoritative alone). Gen counters live in the owning `BusDevice` (per-page for RAM, one shared never-bumped counter for ROM), reached via a raw `gen_ptr`. **Not implemented** (not needed under lazy staleness + flush-the-world): `artifact_list`, `entry_count`, the global per-PFN `flags` byte array. Pages are pooled in `Jitv2` (bump-allocated `Vec`, `pfn → slot` HashMap consulted only on page switch, capacity `JITV2_INITIAL_PAGE_CAPACITY` = 16384; exhaustion triggers mega_flush).
 
 ### 2.5 New-entry policy: compile another overlapping function
 

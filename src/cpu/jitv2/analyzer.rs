@@ -12,8 +12,8 @@
 //! runner that invokes it over a directory of corpus snapshots
 //! (`jitv2/comp.rs`'s dump format).
 
-use crate::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
-use crate::mips_isa::*;
+use crate::cpu::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::cpu::mips_isa::*;
 
 /// Word offset within a page (0..1024), matching `PhysicalCodePage`'s entry
 /// indexing (§2.4).
@@ -250,7 +250,7 @@ pub fn is_fpu_instruction(raw: u32) -> bool {
 /// adding a new emitter automatically un-exclude it — no analyzer.rs edit
 /// needed.
 fn sequential_or_excluded(raw: u32, mips4: bool) -> Classify {
-    if crate::jitv2::opcode_support::has_emitter(raw, mips4) {
+    if crate::cpu::jitv2::opcode_support::has_emitter(raw, mips4) {
         Classify::Sequential
     } else {
         Classify::Excluded
@@ -271,8 +271,8 @@ fn branch_category_gate(raw: u32, already_classified: Classify) -> Classify {
     let rs = (raw >> 21) & 0x1F;
     let rt = (raw >> 16) & 0x1F;
     let funct = raw & 0x3F;
-    let kind = crate::mips_instr_stats::classify_instr(op as u8, rs as u8, rt as u8, funct as u8);
-    if crate::jitv2::opcode_support::instr_enabled(kind) {
+    let kind = crate::cpu::mips_instr_stats::classify_instr(op as u8, rs as u8, rt as u8, funct as u8);
+    if crate::cpu::jitv2::opcode_support::instr_enabled(kind) {
         already_classified
     } else {
         Classify::Excluded
@@ -592,7 +592,7 @@ pub struct Analyzer {
 impl Analyzer {
     pub fn new() -> Self {
         Self {
-            mips4: crate::jitv2::isa::mips4_enabled(), instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
+            mips4: crate::cpu::jitv2::isa::mips4_enabled(), instrs: Box::new([CompiledInstr::default(); ENTRIES_PER_PAGE]), has_fpu: false, covered: Vec::new() }
     }
 
     /// An analyzer for a specific CPU model's ISA level.
@@ -737,7 +737,7 @@ impl Analyzer {
         // pages without CP1 code keep them.
         if self.has_fpu
             && instrs_linear(&self.instrs)
-                .any(|i| i.is_fallback && crate::jitv2::cop0::writes_cp0_status(i.raw))
+                .any(|i| i.is_fallback && crate::cpu::jitv2::cop0::writes_cp0_status(i.raw))
         {
             self.walk_multi_entry_once(page, entry_words, page_base, max_instrs, true);
         }
@@ -993,7 +993,7 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     }
 
     if class == Classify::Excluded && budget.status_ends_region
-        && crate::jitv2::cop0::writes_cp0_status(raw)
+        && crate::cpu::jitv2::cop0::writes_cp0_status(raw)
     {
         // The second walk of a page that mixes CP1 code with a Status write:
         // the write ends the region, as every CP0 word did before CP0 heads,
@@ -1002,8 +1002,8 @@ fn visit(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], page: &[u32; ENTRIES_PE
     }
 
     if class == Classify::Excluded && !fallback_enabled()
-        && !crate::jitv2::cop0::stays_in_region(raw)
-        && !crate::jitv2::atomics::stays_in_region(raw)
+        && !crate::cpu::jitv2::cop0::stays_in_region(raw)
+        && !crate::cpu::jitv2::atomics::stays_in_region(raw)
     {
         // Fallback disabled (the default): an excluded instruction ends the
         // region here, exactly as it always did — never visited, the caller
@@ -1354,7 +1354,7 @@ fn compute_cycles_flush(instrs: &mut [CompiledInstr; ENTRIES_PER_PAGE], entry_wo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mips_isa::*;
+    use crate::cpu::mips_isa::*;
 
     /// Delegates to the crate-wide [`super::test_fallback_guard`] so this
     /// module's fallback tests share the one lock with every other module's.
@@ -1429,8 +1429,8 @@ mod tests {
         // The monitor half: a divergence found on a live boot must be
         // bisectable without relaunching.
         let _lock = FALLBACK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        use crate::mips_instr_stats::InstrKind;
-        use crate::jitv2::opcode_support::{instr_enabled, set_instr_enabled};
+        use crate::cpu::mips_instr_stats::InstrKind;
+        use crate::cpu::jitv2::opcode_support::{instr_enabled, set_instr_enabled};
 
         let word = r_type(OP_COP0, RS_MFC0, 9, 9, 0, 0);
         let page = cop0_then_work_page(word);
@@ -1471,7 +1471,7 @@ mod tests {
         assert_eq!(a.covered(), &[1], "only the entry past the write forms a region");
         assert!(a.has_fpu());
         assert!(
-            !instrs_linear(&result).any(|i| i.is_fallback && crate::jitv2::cop0::writes_cp0_status(i.raw)),
+            !instrs_linear(&result).any(|i| i.is_fallback && crate::cpu::jitv2::cop0::writes_cp0_status(i.raw)),
             "nothing codegen would decline may be left in the walk"
         );
     }
@@ -1561,12 +1561,12 @@ mod tests {
         // cargo features happened to select.
         let instr = r_type(OP_COP1X, 1, 2, 3, 4, FUNCT_MADD_S);
         {
-            let _isa = crate::jitv2::isa::test_isa(true);
+            let _isa = crate::cpu::jitv2::isa::test_isa(true);
             assert_eq!(classify(instr, 5, 0, true), Classify::Sequential,
                        "an R5000/R10000 may execute MADD.S");
         }
         {
-            let _isa = crate::jitv2::isa::test_isa(false);
+            let _isa = crate::cpu::jitv2::isa::test_isa(false);
             assert_eq!(classify(instr, 5, 0, false), Classify::Excluded,
                        "an R4400 must leave MADD.S to the interpreter, which raises RI");
         }
@@ -1593,11 +1593,11 @@ mod tests {
         // branch exclusion.
         let instr = r_type(OP_COP1X, RS_BC1, 2, 3, 4, FUNCT_LWXC1);
         {
-            let _isa = crate::jitv2::isa::test_isa(true);
+            let _isa = crate::cpu::jitv2::isa::test_isa(true);
             assert_eq!(classify(instr, 5, 0, true), Classify::Sequential);
         }
         {
-            let _isa = crate::jitv2::isa::test_isa(false);
+            let _isa = crate::cpu::jitv2::isa::test_isa(false);
             // Still Excluded for ISA reasons, never for "it looked like BC1".
             assert_eq!(classify(instr, 5, 0, false), Classify::Excluded);
         }
@@ -1687,7 +1687,7 @@ mod tests {
         // exactly that for a COP0 word). RegionBoundary is declined first.
         let _fb = fallback_on_guard();
         let mut page = [0u32; ENTRIES_PER_PAGE];
-        page[0] = crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL;
+        page[0] = crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL;
         page[1] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
         let mut a = Analyzer::new();
         let (result, non_empty) = a.walk(&page, 0, 0);
@@ -1751,7 +1751,7 @@ mod tests {
         // deliberately excluded (COP0) specifically to prove it's never even
         // looked at.
         let mut page = [0u32; ENTRIES_PER_PAGE];
-        page[0] = crate::mips_isa::OP_J << 26 | 2; // J, target26=2 (would be word 2 if resolved on-page)
+        page[0] = crate::cpu::mips_isa::OP_J << 26 | 2; // J, target26=2 (would be word 2 if resolved on-page)
         page[1] = 0; // delay slot
         page[2] = r_type(OP_COP0, RS_MTC0, 0, 12, 0, 0); // never visited: J never resolves here
         let mut a = Analyzer::new();

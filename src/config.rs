@@ -640,7 +640,7 @@ fn set_or_remove_env(key: &str, val: &str) {
 /// jitv2 compile-pool tuning (`[jitv2]` section): the compile-pool thread
 /// count, fixed at process startup, never changed at runtime — see
 /// `CompileQueue::set_thread_count`'s own doc comment for why — plus the
-/// persistent on-disk code cache (`src/jitv2/pcache.rs`), applied to the
+/// persistent on-disk code cache (`src/cpu/jitv2/pcache.rs`), applied to the
 /// process environment at `Start` the same way `DebugConfig` applies
 /// `[debug]` (see `Jitv2Config::apply_env`). `cache`/`cache_dir` used to be
 /// the undocumented `IRIS_JIT_CACHE`/`IRIS_JIT_CACHE_DIR` env vars; those

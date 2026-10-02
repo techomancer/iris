@@ -11,7 +11,7 @@
 
 Discovered while building `run/matrix.sh`'s R5000 cell for the cpu-tests
 findings pass ([[project_cpu_tests_findings]]). Not one of dani's findings —
-this is in `src/mips_cache_v2.rs`'s unit tests, found by running `cargo test`
+this is in `src/cpu/mips_cache_v2.rs`'s unit tests, found by running `cargo test`
 under different R5000 feature combinations.
 
 ## What's broken

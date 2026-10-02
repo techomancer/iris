@@ -11,7 +11,7 @@ and stays as-is. `jitv2` builds now behave as if fusion never existed unless
 `--features jitv2,jitv2_opcodefusion` is passed explicitly. See Cargo.toml's
 `jitv2_opcodefusion` doc comment and README.md's JIT v2 section.
 
-Commit `23114a7` added `try_emit_fused_lui` (src/jitv2/codegen.rs) to fold the
+Commit `23114a7` added `try_emit_fused_lui` (src/cpu/jitv2/codegen.rs) to fold the
 `lui rX,hi; {ori,addiu} rX,rX,lo` 32-bit-immediate idiom into one write,
 skipping word+1's dispatch and jumping straight to word+2.
 
@@ -47,7 +47,7 @@ non-entry, non-fallback-successor word is a compile-time-known plain
 fallthrough or branch/jump target, never a delay-slot handoff.
 
 Regression test: `lui_not_fused_when_entry_word_is_a_foreign_delay_slot`
-(src/jitv2/equiv_test.rs), modeled on
+(src/cpu/jitv2/equiv_test.rs), modeled on
 `standalone_compile_of_a_foreign_delay_slot_honors_pending_transfer`. Needs
 `walk_bounded(..., max_instrs=2)` (not 1) so word+1 is actually visited/
 compiled as part of the region — with budget 1 the existing `!visited` check

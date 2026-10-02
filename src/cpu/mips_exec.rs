@@ -1,15 +1,15 @@
 // MIPS Execution Engine
 
-use crate::mips_core::*;
-use crate::mips_isa::*;
+use crate::cpu::mips_core::*;
+use crate::cpu::mips_isa::*;
 use crate::traits::*;
-use crate::mips_tlb::*;
-use crate::mips_cache_v2::*;
+use crate::cpu::mips_tlb::*;
+use crate::cpu::mips_cache_v2::*;
 use crate::devlog::{LogModule, devlog_mask, devlog_is_active};
-use crate::mips_dis;
+use crate::cpu::mips_dis;
 use crate::physical::{HIMEM_BASE, HIMEM_END, LOMEM_BASE, LOMEM_END};
 use std::fmt::Write as FmtWrite;
-use crate::mips_dis::SymbolTable;
+use crate::cpu::mips_dis::SymbolTable;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
@@ -556,12 +556,12 @@ mod undo_buffer_tests {
 // into Cause. IP7 (CP0 Count==Compare) is included since the compare timer
 // fires on the hptimer thread and raises it exactly like a device line;
 // writing Compare clears the pending bit again (mips_core.rs write_cp0).
-const EXT_INT_MASK: u32 = crate::mips_core::CAUSE_IP7 |
-                          crate::mips_core::CAUSE_IP6 |
-                          crate::mips_core::CAUSE_IP5 |
-                          crate::mips_core::CAUSE_IP4 |
-                          crate::mips_core::CAUSE_IP3 |
-                          crate::mips_core::CAUSE_IP2;
+const EXT_INT_MASK: u32 = crate::cpu::mips_core::CAUSE_IP7 |
+                          crate::cpu::mips_core::CAUSE_IP6 |
+                          crate::cpu::mips_core::CAUSE_IP5 |
+                          crate::cpu::mips_core::CAUSE_IP4 |
+                          crate::cpu::mips_core::CAUSE_IP3 |
+                          crate::cpu::mips_core::CAUSE_IP2;
 
 // Bit 63 of the interrupts word = soft-reset request
 const SOFT_RESET_BIT: u64 = 1u64 << 63;
@@ -958,7 +958,7 @@ pub const EXEC_BUS_VCE: ExecStatus = exec_exception_const(EXC_VCED); // 0x0800_0
 /// `const`-evaluable version of exec_exception (for use in const initializers).
 #[inline(always)]
 pub const fn exec_exception_const(code: u32) -> ExecStatus {
-    EXEC_IS_EXCEPTION | (code << crate::mips_core::CAUSE_EXCCODE_SHIFT)
+    EXEC_IS_EXCEPTION | (code << crate::cpu::mips_core::CAUSE_EXCCODE_SHIFT)
 }
 
 /// Build an exception ExecStatus from an EXC_* code.
@@ -970,13 +970,13 @@ pub fn exec_exception(code: u32) -> ExecStatus {
 /// Build a TLB-refill ExecStatus from an EXC_* code (32-bit UTLB vector).
 #[inline(always)]
 pub fn exec_tlb_miss(code: u32) -> ExecStatus {
-    EXEC_IS_EXCEPTION | EXEC_IS_TLB_REFILL | (code << crate::mips_core::CAUSE_EXCCODE_SHIFT)
+    EXEC_IS_EXCEPTION | EXEC_IS_TLB_REFILL | (code << crate::cpu::mips_core::CAUSE_EXCCODE_SHIFT)
 }
 
 /// Build an XTLB-refill ExecStatus from an EXC_* code (64-bit XTLB vector, offset 0x080).
 #[inline(always)]
 pub fn exec_xtlb_miss(code: u32) -> ExecStatus {
-    EXEC_IS_EXCEPTION | EXEC_IS_TLB_REFILL | EXEC_IS_XTLB_REFILL | (code << crate::mips_core::CAUSE_EXCCODE_SHIFT)
+    EXEC_IS_EXCEPTION | EXEC_IS_TLB_REFILL | EXEC_IS_XTLB_REFILL | (code << crate::cpu::mips_core::CAUSE_EXCCODE_SHIFT)
 }
 
 /// Alignment mask for a memory access of SIZE bytes.
@@ -1181,7 +1181,7 @@ impl MipsCpuConfig {
     /// end is silently dropped. The R10000 has 64 entries where the R4400 has
     /// 48, and SGI's IP28 diagnostic writes index 48 on its first cache-alias
     /// test — every one of its reported failures was that write going nowhere.
-    pub fn for_model<C: crate::mips_cache_v2::CpuModel>() -> Self {
+    pub fn for_model<C: crate::cpu::mips_cache_v2::CpuModel>() -> Self {
         Self { tlb_entries: C::TLB_ENTRIES }
     }
 }
@@ -1259,14 +1259,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pending_memory_writes: Vec<MemoryWrite>,
     traceback: TracebackBuffer,
     /// Per-instruction execution trace recorder (rules/jitv2's lockstep
-    /// verification tooling, `src/trace.rs`). `None` when not recording —
+    /// verification tooling, `src/cpu/trace.rs`). `None` when not recording —
     /// checked on every step() (one branch on a `None` tag), so armed cost
     /// is a file write, disarmed cost is a predictable branch. Developer-only:
     /// this captures full architectural state per instruction, meaningfully
     /// intrusive on the hot path, matching undo_buffer/idle_profiler's own
     /// dev-only gating.
     #[cfg(feature = "developer")]
-    trace_writer: Option<crate::trace::TraceWriter>,
+    trace_writer: Option<crate::cpu::trace::TraceWriter>,
     /// `ll stats`: per-LL-address retry histogram.
     ///
     /// Keyed by the physical address an `LL` reserved (its `LLAddr` value,
@@ -1333,7 +1333,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub(crate) cached_pending: u64,
     /// Per-instruction execution frequency counters (feature = "instr_stats").
     #[cfg(feature = "instr_stats")]
-    pub instr_stats: crate::mips_instr_stats::InstrStats,
+    pub instr_stats: crate::cpu::mips_instr_stats::InstrStats,
     /// JIT v2 engine state: physical-code-page pool + allocator (rules/jitv2/jit-v2-design.md §2.4).
     /// Lives independently of the executor (`Arc<Mutex<...>>`, constructed by
     /// `Machine` and shared in) — NOT owned by the executor's own struct
@@ -1353,7 +1353,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// pushing a compile request, does *not* go through this lock — see
     /// `jitv2_compile_queue`/`jitv2_stats` below.
     #[cfg(feature = "jitv2")]
-    pub jitv2: std::sync::Arc<Mutex<crate::jitv2::Jitv2>>,
+    pub jitv2: std::sync::Arc<Mutex<crate::cpu::jitv2::Jitv2>>,
     /// Lock-free `pfn -> PageSlot` lookup: a raw pointer to the `PfnMap`
     /// array inside `jitv2`, captured once by `jitv2_bind_fast_lookup`.
     #[cfg(feature = "jitv2")]
@@ -1362,7 +1362,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// lookup hit can produce the `*mut PhysicalCodePage` the caller wants
     /// without going back through `Jitv2`.
     #[cfg(feature = "jitv2")]
-    jitv2_pages_base: *mut crate::jitv2::PhysicalCodePage,
+    jitv2_pages_base: *mut crate::cpu::jitv2::PhysicalCodePage,
     /// Cheap handle to `jitv2.lock().compile_queue`'s underlying push queue,
     /// cloned once at construction (`CompileQueue::queue_handle`) — lets the
     /// per-dispatch compile-request send (`exec_decoded`'s JIT gate) skip
@@ -1372,14 +1372,14 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// more clone, held here instead of re-derived through the mutex on
     /// every dispatch.
     #[cfg(feature = "jitv2")]
-    pub jitv2_compile_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::jitv2::CompileRequest>>,
+    pub jitv2_compile_queue_handle: std::sync::Arc<crossbeam_queue::ArrayQueue<crate::cpu::jitv2::CompileRequest>>,
     /// Cheap handle to `jitv2.lock().stats`, cloned once at construction —
     /// same reasoning as `jitv2_compile_queue_handle`: `JitStats` is already
     /// `Arc`-shared internally (see `Jitv2::stats`'s own doc comment), so
     /// there is no reason a per-dispatch send should reacquire `jitv2.lock()`
     /// just to read this field.
     #[cfg(feature = "jitv2")]
-    pub jitv2_stats: std::sync::Arc<crate::jitv2::JitStats>,
+    pub jitv2_stats: std::sync::Arc<crate::cpu::jitv2::JitStats>,
 
     /// Coverage of the JIT's inline load/store path (feature = "jitstats").
     /// Populated on every cached data access; printed at exit.
@@ -1398,7 +1398,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// valid until the next `jitv2.mega_flush()`, which is why it's re-derived
     /// lazily rather than cached across a flush.
     #[cfg(feature = "jitv2")]
-    pub(crate) pcp: *mut crate::jitv2::PhysicalCodePage,
+    pub(crate) pcp: *mut crate::cpu::jitv2::PhysicalCodePage,
     /// `jitv2_smc_check` dedup set, keyed `(pc, target code pfn)` — see
     /// [`Self::smc_check_report`].
     #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
@@ -1457,7 +1457,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// comment for why inline dispatch and the async compile thread share
     /// one Cranelift memory arena rather than each growing its own.
     #[cfg(feature = "jitv2")]
-    pub(crate) jitv2_inline_analyzer: crate::jitv2::analyzer::Analyzer,
+    pub(crate) jitv2_inline_analyzer: crate::cpu::jitv2::analyzer::Analyzer,
     /// Runtime kill switch for `exec_decoded`'s real JIT dispatch gate
     /// (`#[cfg(all(feature = "jitv2", not(feature = "jitv2_lockstep")))]`
     /// path) — `true` (default) is normal behavior; `false` makes
@@ -1574,22 +1574,22 @@ fn bp_match_key(addr: u64) -> u64 {
 // These are free functions so they can be stored as bare fn pointers in MipsExecutor.
 // They are only called on a nanotlb miss — the nanotlb probe happens before the fn-pointer call.
 fn translate_32_kernel<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    e.translate_32bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at)
+    e.translate_32bit_impl::<false, {crate::cpu::mips_core::PRIV_KERNEL}>(va, at)
 }
 fn translate_32_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    e.translate_32bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at)
+    e.translate_32bit_impl::<false, {crate::cpu::mips_core::PRIV_SUPERVISOR}>(va, at)
 }
 fn translate_32_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    e.translate_32bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at)
+    e.translate_32bit_impl::<false, {crate::cpu::mips_core::PRIV_USER}>(va, at)
 }
 fn translate_64_kernel<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    e.translate_64bit_impl::<false, {crate::mips_core::PRIV_KERNEL}>(va, at)
+    e.translate_64bit_impl::<false, {crate::cpu::mips_core::PRIV_KERNEL}>(va, at)
 }
 fn translate_64_supervisor<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    e.translate_64bit_impl::<false, {crate::mips_core::PRIV_SUPERVISOR}>(va, at)
+    e.translate_64bit_impl::<false, {crate::cpu::mips_core::PRIV_SUPERVISOR}>(va, at)
 }
 fn translate_64_user<T: Tlb, C: CpuModel>(e: &mut MipsExecutor<T,C>, va: u64, at: AccessType) -> TranslateResult {
-    e.translate_64bit_impl::<false, {crate::mips_core::PRIV_USER}>(va, at)
+    e.translate_64bit_impl::<false, {crate::cpu::mips_core::PRIV_USER}>(va, at)
 }
 
 /// Free-standing trampoline for the CP0 Status callback installed by `install_status_cb`.
@@ -1659,13 +1659,13 @@ fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, _ol
 #[inline(always)]
 pub unsafe fn core_from_arg(ctx: *mut core::ffi::c_void) -> *mut MipsCore {
     debug_assert!(
-        ctx as usize > crate::jitv2::codegen::CALLOUT_CORE_BIAS as usize,
+        ctx as usize > crate::cpu::jitv2::codegen::CALLOUT_CORE_BIAS as usize,
         "JIT callout arg 0 must be a biased MipsCore pointer, not null/garbage \
          (see mips_exec::core_from_arg)"
     );
     unsafe {
         ctx.cast::<u8>()
-            .sub(crate::jitv2::codegen::CALLOUT_CORE_BIAS as usize)
+            .sub(crate::cpu::jitv2::codegen::CALLOUT_CORE_BIAS as usize)
             .cast::<MipsCore>()
     }
 }
@@ -1897,7 +1897,7 @@ unsafe extern "C" fn jit_kill_entry<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_
     // mode. Storing the demanded mode rather than a "flip" bit keeps this
     // idempotent across the several bails a page normally takes before its
     // next compile — one per killed entry (see `fr_repin`'s doc comment).
-    page.request_fr_repin((exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0);
+    page.request_fr_repin((exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0);
     #[cfg(feature = "developer")]
     exec.jitv2.lock().stats.kill_entry_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2001,7 +2001,7 @@ unsafe extern "C" fn jit_dev_trace_bp<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::
     {
         exec.traceback.push(pc, raw, InstrOrigin::from_u32(origin));
         if let Some(w) = exec.trace_writer.as_mut() {
-            let record = crate::trace::TraceRecord::capture(pc, raw, &exec.core);
+            let record = crate::cpu::trace::TraceRecord::capture(pc, raw, &exec.core);
             let _ = w.push(&record);
         }
         // PC breakpoint, honoring the one-shot skip_breakpoints the monitor
@@ -2509,8 +2509,8 @@ macro_rules! step_cycles {
             // normally a Compare write re-arms much sooner.
             let wrap_ns = ((1u128 << 32) * 1_000_000_000) / $self.core.count_hz as u128;
             $self.core.count_fire_cycle = $self.core.hot.cycles
-                .saturating_add(wrap_ns as u64 / crate::mips_core::NS_PER_GUEST_CYCLE);
-            $self.core.hot.interrupts.fetch_or(crate::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
+                .saturating_add(wrap_ns as u64 / crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+            $self.core.hot.interrupts.fetch_or(crate::cpu::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
             $self.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }};
@@ -2605,8 +2605,8 @@ macro_rules! step_preamble {
             let skip_int = false;
 
             if $self.core.interrupts_enabled() && !skip_int {
-                let ip = $self.core.cp0_cause & crate::mips_core::CAUSE_IP_MASK;
-                let im = $self.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+                let ip = $self.core.cp0_cause & crate::cpu::mips_core::CAUSE_IP_MASK;
+                let im = $self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
                 if (ip & im) != 0 {
                     let s = exec_exception(EXC_INT);
                     return $self.handle_exception(s);
@@ -2744,7 +2744,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // counter — see `jitv2_compile_queue_handle`/`jitv2_stats`'s own
         // doc comments on the struct fields.
         #[cfg(feature = "jitv2")]
-        let mut jitv2 = crate::jitv2::Jitv2::new(crate::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
+        let mut jitv2 = crate::cpu::jitv2::Jitv2::new(crate::cpu::jitv2::JITV2_INITIAL_PAGE_CAPACITY);
         // The ISA level travels as data rather than through a global: the
         // model's `MIPS4` const goes to the compile pool here and to this
         // executor's own inline analyzer below, and from there into
@@ -2804,15 +2804,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // Placeholder — overwritten immediately by update_translate_fn below.
             translate_fn: translate_32_kernel::<T, C>,
             // Placeholder — overwritten immediately by update_fpr_mode below.
-            fpr_read_d:  crate::mips_core::read_fpr_d_fr0,
-            fpr_write_d: crate::mips_core::write_fpr_d_fr0,
-            fpr_read_l:  crate::mips_core::read_fpr_l_fr0,
-            fpr_write_l: crate::mips_core::write_fpr_l_fr0,
-            fpr_read_w:  crate::mips_core::read_fpr_w_fr0,
-            fpr_write_w: crate::mips_core::write_fpr_w_fr0,
+            fpr_read_d:  crate::cpu::mips_core::read_fpr_d_fr0,
+            fpr_write_d: crate::cpu::mips_core::write_fpr_d_fr0,
+            fpr_read_l:  crate::cpu::mips_core::read_fpr_l_fr0,
+            fpr_write_l: crate::cpu::mips_core::write_fpr_l_fr0,
+            fpr_read_w:  crate::cpu::mips_core::read_fpr_w_fr0,
+            fpr_write_w: crate::cpu::mips_core::write_fpr_w_fr0,
             cached_pending: 0,
             #[cfg(feature = "instr_stats")]
-            instr_stats: crate::mips_instr_stats::InstrStats::default(),
+            instr_stats: crate::cpu::mips_instr_stats::InstrStats::default(),
             // Standalone default — production (`Machine::new`) immediately
             // replaces this with its own shared `Arc<Mutex<Jitv2>>` (mirrors
             // the `l1i_fetch_count`/`rebind_atomic_ptrs` Arc-injection pattern
@@ -2867,7 +2867,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_inline_compile: cfg!(feature = "jitv2_lockstep"),
             #[cfg(feature = "jitv2")]
-            jitv2_inline_analyzer: crate::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
+            jitv2_inline_analyzer: crate::cpu::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
             // IRIS_JIT_DISPATCH=off starts with the JIT dispatch gate shut: the
             // same binary as an interpreter-only reference, for comparing
             // results against compiled code (cpu-tests/jitcov). The monitor's
@@ -2967,8 +2967,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// deferred-interrupt spin-wait) — see `CyclesPtr`/`Hot::cycles`'s doc
     /// comments. Same "call once at final address, valid for the rest of the
     /// process" contract as `interrupts_ptr` above.
-    pub fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr {
-        crate::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
+    pub fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr {
+        crate::cpu::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -3015,7 +3015,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // value here — this method is the last thing that moves any of
             // it (see `codegen::JitConsts`). Republished on every call so a
             // tcache window remap keeps the constants honest.
-            let consts = crate::jitv2::codegen::JitConsts {
+            let consts = crate::cpu::jitv2::codegen::JitConsts {
                 // IRIS_JIT_PIC=1: publish no core address, so codegen loads the
                 // hook pointers from the core instead of baking them. Compiled
                 // code then holds no host address at all (the memory helpers,
@@ -3164,8 +3164,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// an exception.
     #[inline(always)]
     fn nutlb_translate<const W: bool>(&mut self, va: u64) -> TranslateResult {
-        let idx = crate::mips_core::nutlb_index(va);
-        let arr = if W { crate::mips_core::NUTLB_WRITE } else { crate::mips_core::NUTLB_READ };
+        let idx = crate::cpu::mips_core::nutlb_index(va);
+        let arr = if W { crate::cpu::mips_core::NUTLB_WRITE } else { crate::cpu::mips_core::NUTLB_READ };
         let e = &self.core.nutlb[arr][idx];
 
         // The whole hit test: one page compare, one bitmask bit. No
@@ -3244,7 +3244,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// Fill the nutlb set for `va` from a successful translation.
     #[inline]
     fn nutlb_fill<const W: bool>(&mut self, va: u64, result: &TranslateResult) {
-        use crate::mips_core::*;
+        use crate::cpu::mips_core::*;
 
         // ERL is a do-not-cache window: while it is set, KUSEG/xuseg stop
         // being TLB-mapped and become unmapped uncached identity
@@ -3349,13 +3349,13 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if !self.smc_seen.insert(key) {
             return;
         }
-        let page_base = pfn as u64 * crate::jitv2::PAGE_SIZE as u64;
+        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
         let word = ((phys_addr - page_base) / 4) as usize;
         eprintln!(
             "jitv2 SMC: write to the page being executed — pc={:#018x} wrote {} byte(s) \
 va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.core.pc, size, virt_addr, phys_addr, pfn, page_base, word,
-            crate::jitv2::ENTRIES_PER_PAGE,
+            crate::cpu::jitv2::ENTRIES_PER_PAGE,
         );
     }
 
@@ -3371,7 +3371,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline(always)]
     fn smc_check_write(&mut self, virt_addr: u64, phys_addr: u64, size: usize) {
         let pfn = self.core.cur_code_pfn;
-        if (phys_addr / crate::jitv2::PAGE_SIZE as u64) as u32 == pfn {
+        if (phys_addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32 == pfn {
             self.smc_check_report(virt_addr, phys_addr, size, pfn);
         }
     }
@@ -3386,7 +3386,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// structural rather than a convention six call sites have to remember.
     #[cfg(feature = "jitv2")]
     #[inline]
-    fn set_pcp(&mut self, page: *mut crate::jitv2::PhysicalCodePage) {
+    fn set_pcp(&mut self, page: *mut crate::cpu::jitv2::PhysicalCodePage) {
         self.pcp = page;
         self.core.cur_code_pfn = if page.is_null() {
             u32::MAX
@@ -3418,12 +3418,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// the free list).
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn jitv2_lookup_page_fast(&self, pfn: u32) -> Option<*mut crate::jitv2::PhysicalCodePage> {
+    fn jitv2_lookup_page_fast(&self, pfn: u32) -> Option<*mut crate::cpu::jitv2::PhysicalCodePage> {
         if self.jitv2_pfn_map.is_null() {
             return None;
         }
         let slot = unsafe { *self.jitv2_pfn_map.add(pfn as usize) };
-        if slot == crate::jitv2::jitv2::PFN_MAP_EMPTY {
+        if slot == crate::cpu::jitv2::jitv2::PFN_MAP_EMPTY {
             return None;
         }
         Some(unsafe { self.jitv2_pages_base.add(slot as usize) })
@@ -3437,7 +3437,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     #[inline(always)]
     fn jitv2_track_pcp(&mut self, phys_addr: u32) {
-        let pfn = phys_addr / crate::jitv2::PAGE_SIZE;
+        let pfn = phys_addr / crate::cpu::jitv2::PAGE_SIZE;
         let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
         if same_page {
             return;
@@ -3453,8 +3453,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // on the page-crossing path (not every fetch) to keep the common
         // same-page case free of this cost even when the toggle is on.
         if jitv2_pagewb_enabled() {
-            let page_base = pfn * crate::jitv2::PAGE_SIZE;
-            self.cache.writeback(None, page_base as u64, crate::jitv2::PAGE_SIZE as u64);
+            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
+            self.cache.writeback(None, page_base as u64, crate::cpu::jitv2::PAGE_SIZE as u64);
         }
         // A page crossing landing exactly on word 0 (the exception/TLB-refill
         // vector case included — `deliver_exception` in mips_core.rs writes
@@ -3473,7 +3473,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // wants; `page.is_published`/`is_runnable` still handle every
         // other arrival at an already-compiled offset without needing this
         // flag at all.
-        if phys_addr & (crate::jitv2::PAGE_SIZE - 1) == 0 {
+        if phys_addr & (crate::cpu::jitv2::PAGE_SIZE - 1) == 0 {
             self.core.jit_trigger = true;
         }
 
@@ -3489,12 +3489,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return;
         }
 
-        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
         // ignored by page_for on a lookup hit (an already-claimed page keeps
         // whatever it was pinned to).
-        let fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+        let fr1 = (self.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
 
         let mut jit = self.jitv2.lock();
         let lookup = jit.page_for(pfn, page_base, self.sysad.as_ref(), fr1);
@@ -3554,7 +3554,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// and at init/reset time.
     #[inline]
     pub fn update_translate_fn(&mut self) {
-        use crate::mips_core::PrivilegeMode;
+        use crate::cpu::mips_core::PrivilegeMode;
         let is_64bit = self.core.is_64bit_mode();
         let privilege = self.core.get_privilege_mode();
         self.translate_fn = match (is_64bit, privilege) {
@@ -3572,7 +3572,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// FR=1 (IRIX 6.5): full 64-bit slots.
     #[inline]
     pub fn update_fpr_mode(&mut self) {
-        use crate::mips_core::{
+        use crate::cpu::mips_core::{
             read_fpr_d_fr0, write_fpr_d_fr0, read_fpr_l_fr0, write_fpr_l_fr0,
             read_fpr_w_fr0, write_fpr_w_fr0,
             read_fpr_d_fr1, write_fpr_d_fr1, read_fpr_l_fr1, write_fpr_l_fr1,
@@ -3966,7 +3966,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     debug_assert!(!func.is_null(), "valid bit set with null func");
                     #[cfg(feature = "developer")]
                     { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                    let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
+                    let jit_fn: crate::cpu::jitv2::JitFn = unsafe { std::mem::transmute(func) };
                     let status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
                     break 'gate if status != EXEC_FALLBACK { status } else { self.step_int() };
                 }
@@ -3989,12 +3989,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // CompileRequest carries no offset, so whichever side
                 // compiles reads `requested` fresh (§13.3).
                 page.mark_requested(entry_offset);
-                let live_fr1 = (self.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                let live_fr1 = (self.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                 // Pinned FR per physical page (one function per page,
                 // FR baked into every FPR emitter), consuming any outstanding
                 // correction first.
                 let compiled_for_fr1 = page.take_fr_repin(live_fr1);
-                let req = crate::jitv2::CompileRequest {
+                let req = crate::cpu::jitv2::CompileRequest {
                     page: self.pcp,
                     compiled_for_fr1,
                 };
@@ -4012,7 +4012,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         // request that never reached the queue
                         // (confirmed live: starves the page of compiles
                         // forever otherwise).
-                        if !crate::jitv2::jitv2::push_compile_request(&self.jitv2_compile_queue_handle, req, &self.jitv2_stats) {
+                        if !crate::cpu::jitv2::jitv2::push_compile_request(&self.jitv2_compile_queue_handle, req, &self.jitv2_stats) {
                             page.clear_scheduled();
                             #[cfg(feature = "developer")]
                             page.mark_send_dropped_queue_full();
@@ -4020,7 +4020,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     } else if page.note_waiting_arrival() {
                         // Already queued, and being executed hard while it
                         // waits: jump the queue (jitv2::HOT_QUEUE).
-                        crate::jitv2::jitv2::push_hot_request(req);
+                        crate::cpu::jitv2::jitv2::push_hot_request(req);
                     }
                     break 'gate self.step_int();
                 }
@@ -4040,14 +4040,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     /// Begin recording a per-instruction execution trace to `path`
-    /// (`src/trace.rs`, rules/jitv2's lockstep verification tooling).
+    /// (`src/cpu/trace.rs`, rules/jitv2's lockstep verification tooling).
     /// Overwrites any existing file at `path`. No-op-safe to call while
     /// already recording — starts a fresh file, silently dropping (not
     /// flushing) whatever writer was active before, so callers that want a
     /// clean handoff should `trace_stop` first.
     #[cfg(feature = "developer")]
     pub fn trace_start(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        self.trace_writer = Some(crate::trace::TraceWriter::create(path)?);
+        self.trace_writer = Some(crate::cpu::trace::TraceWriter::create(path)?);
         Ok(())
     }
 
@@ -4376,7 +4376,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // Architectural effect (Cause/EPC/Status/vector) — the portable part
         // shared with jitv2_verify (§4.2 single-implementation delivery).
-        crate::mips_core::deliver_exception(&mut self.core, status);
+        crate::cpu::mips_core::deliver_exception(&mut self.core, status);
 
         // deliver_exception forces kernel privilege by setting EXL directly on
         // cp0_status, without going through write_cp0, so this is the only barrier on
@@ -4389,7 +4389,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// [`Self::handle_exception`] with the EPC/BD inputs passed explicitly
     /// rather than read from `core.pc`/`core.in_delay_slot` — see
-    /// [`crate::mips_core::deliver_exception_at`] for why compiled code wants
+    /// [`crate::cpu::mips_core::deliver_exception_at`] for why compiled code wants
     /// this (it knows both as compile-time constants and would otherwise
     /// have to store them to memory purely to have them read straight back).
     ///
@@ -4459,7 +4459,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // wrong one; the `ad{e,s}l_*_matches_interpreter` equivalence tests
         // caught it as a one-field divergence. Every caller that needs
         // BadVAddr sets it before calling.
-        crate::mips_core::deliver_exception_at(&mut self.core, status, fault_pc, bd);
+        crate::cpu::mips_core::deliver_exception_at(&mut self.core, status, fault_pc, bd);
         self.resync_privilege_state();
         status
     }
@@ -4520,7 +4520,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         self.cache.set_llbit(false);
         self.core.syscall_pending = true;
-        crate::mips_core::deliver_exception(&mut self.core, status);
+        crate::cpu::mips_core::deliver_exception(&mut self.core, status);
         self.resync_privilege_state();
         status
     }
@@ -4640,7 +4640,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// - never writes any CP0 side-effect registers (BadvAddr, EntryHi, Context, XContext).
     #[inline]
     fn translate_impl<const DEBUG: bool>(&mut self, virt_addr: u64, access_type: AccessType) -> TranslateResult {
-        use crate::mips_core::{PrivilegeMode, PRIV_KERNEL, PRIV_SUPERVISOR, PRIV_USER};
+        use crate::cpu::mips_core::{PrivilegeMode, PRIV_KERNEL, PRIV_SUPERVISOR, PRIV_USER};
 
         let is_64bit = self.is_64bit();
         let privilege = if DEBUG {
@@ -4670,7 +4670,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// dead branches statically rather than relying on runtime dispatch.
     #[inline]
     fn translate_32bit_impl<const DEBUG: bool, const PRIV: u8>(&mut self, virt_addr: u64, access_type: AccessType) -> TranslateResult {
-        use crate::mips_core::{PRIV_KERNEL, PRIV_SUPERVISOR};
+        use crate::cpu::mips_core::{PRIV_KERNEL, PRIV_SUPERVISOR};
 
         // Upper 32 bits are ignored in 32-bit mode; only low 32 bits used for segment decode.
         let virt_addr32 = virt_addr as u32;
@@ -4684,7 +4684,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // KUSEG: 0x00000000 - 0x7FFFFFFF (user segment, TLB mapped)
             0..=3 => {
                 // When ERL=1, KUSEG becomes unmapped, uncached identity mapping
-                if (self.core.cp0_status & crate::mips_core::STATUS_ERL) != 0 {
+                if (self.core.cp0_status & crate::cpu::mips_core::STATUS_ERL) != 0 {
                     return TranslateResult::ok(virt_addr32 as u64, TR_UNCACHED);
                 }
                 // 32-bit mode: XTLB=0 → UTLB vector on miss
@@ -4741,7 +4741,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// or `PRIV_USER` from `mips_core`.
     #[inline]
     fn translate_64bit_impl<const DEBUG: bool, const PRIV: u8>(&mut self, virt_addr: u64, access_type: AccessType) -> TranslateResult {
-        use crate::mips_core::{PRIV_KERNEL, PRIV_SUPERVISOR};
+        use crate::cpu::mips_core::{PRIV_KERNEL, PRIV_SUPERVISOR};
 
         // Check address region based on top bits
         let top_bits = virt_addr >> 62;
@@ -4757,7 +4757,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 }
 
                 // When ERL=1, xuseg becomes unmapped, uncached identity mapping
-                if (self.core.cp0_status & crate::mips_core::STATUS_ERL) != 0 {
+                if (self.core.cp0_status & crate::cpu::mips_core::STATUS_ERL) != 0 {
                     return TranslateResult::ok(virt_addr, TR_UNCACHED);
                 }
 
@@ -4841,7 +4841,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// returned so the caller knows the translation failed.
     #[inline]
     fn tlb_translate_impl<const DEBUG: bool, const XTLB: u8>(&mut self, virt_addr: u64, access_type: AccessType) -> TranslateResult {
-        use crate::mips_tlb::TlbResult;
+        use crate::cpu::mips_tlb::TlbResult;
 
         // Get current ASID from EntryHi register
         let asid = (self.core.cp0_entryhi & 0xFF) as u8;
@@ -5182,7 +5182,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // be `None`, not stale `Some` data, on that path).
         #[cfg(feature = "jitv2_lockstep")]
         {
-            self.core.lockstep_mem = result.ok().map(|val| crate::mips_core::LockstepMemCapture {
+            self.core.lockstep_mem = result.ok().map(|val| crate::cpu::mips_core::LockstepMemCapture {
                 addr: virt_addr,
                 phys: translate_result.phys as u64,
                 value: val,
@@ -5308,7 +5308,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // `None`, not stale `Some` data, on that path).
         #[cfg(feature = "jitv2_lockstep")]
         {
-            self.core.lockstep_mem = (status == BUS_OK).then_some(crate::mips_core::LockstepMemCapture {
+            self.core.lockstep_mem = (status == BUS_OK).then_some(crate::cpu::mips_core::LockstepMemCapture {
                 addr: virt_addr,
                 phys: phys_addr,
                 value: val,
@@ -6732,7 +6732,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // NOT implicitly allowed on R4000/R4400 — it falls into the `_` arm and
         // needs CU0 like user mode. (Same rule as `exec_cop0`.)
         let privilege = self.core.get_privilege_mode();
-        use crate::mips_core::{PrivilegeMode, STATUS_CU0};
+        use crate::cpu::mips_core::{PrivilegeMode, STATUS_CU0};
 
         let cp0_usable = match privilege {
             PrivilegeMode::Kernel => true,
@@ -6805,7 +6805,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // cap of 600 silently truncated a run at precisely the boundary and
         // made a partial picture look like the whole one. It exists only so a
         // hot loop cannot rewrite the timing it is measuring.
-        if crate::mips_core::cachediag_on() {
+        if crate::cpu::mips_core::cachediag_on() {
             let from_prom = (self.core.pc >> 32) == 0xFFFF_FFFF;
             // CBARRIER is pure ordering: it names no line and carries no check
             // bits, and it outnumbers everything else ~8:1 (83534 of 94322 in
@@ -7029,7 +7029,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // (analyzer.rs), so compiled code retires these through
         // `interp_fallback_fn` into this same function.
         {
-            use crate::mips_core::{PrivilegeMode, STATUS_CU0};
+            use crate::cpu::mips_core::{PrivilegeMode, STATUS_CU0};
             let cp0_usable = match self.core.get_privilege_mode() {
                 PrivilegeMode::Kernel => true,
                 _ => (self.core.cp0_status & STATUS_CU0) != 0,
@@ -7293,8 +7293,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     // Helper function to construct a TLB entry from CP0 registers
     // Per MIPS R4000 spec: G bit is formed by ANDing G bits from EntryLo0 and EntryLo1
     // and stored in bit 12 of EntryHi in the TLB entry
-    fn create_tlb_entry_from_cp0(&self) -> crate::mips_tlb::TlbEntry {
-        use crate::mips_tlb::TlbEntry;
+    fn create_tlb_entry_from_cp0(&self) -> crate::cpu::mips_tlb::TlbEntry {
+        use crate::cpu::mips_tlb::TlbEntry;
 
         let g0 = (self.core.cp0_entrylo0 & 1) != 0;
         let g1 = (self.core.cp0_entrylo1 & 1) != 0;
@@ -7322,7 +7322,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// environment variable because it selects a *subset*, which the module
     /// mask has no way to express; the on/off is devlog's.
     #[inline]
-    fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::mips_tlb::TlbEntry) {
+    fn ip28_trace_tlb_write(&self, op: &str, index: usize, entry: &crate::cpu::mips_tlb::TlbEntry) {
         if !mips_log_always(MIPS_LOG_TLB) {
             return;
         }
@@ -7490,8 +7490,8 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             if pending & SOFT_RESET_BIT != 0 {
                 break;
             }
-            let ip = (self.core.cp0_cause | (pending as u32)) & crate::mips_core::CAUSE_IP_MASK;
-            let im = self.core.cp0_status & crate::mips_core::STATUS_IM_MASK;
+            let ip = (self.core.cp0_cause | (pending as u32)) & crate::cpu::mips_core::CAUSE_IP_MASK;
+            let im = self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
             if (ip & im) != 0 {
                 break;
             }
@@ -7647,7 +7647,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     fn cpu_unusable_report(&mut self, #[allow(unused_variables)] ce: u32) {
         #[cfg(feature = "developer")]
         {
-            use crate::mips_core::{STATUS_CU0, STATUS_CU1, STATUS_EXL, STATUS_ERL,
+            use crate::cpu::mips_core::{STATUS_CU0, STATUS_CU1, STATUS_EXL, STATUS_ERL,
                                    STATUS_IE, STATUS_KSU_SHIFT};
             let st = self.core.cp0_status;
             let pc = self.core.pc;
@@ -7688,7 +7688,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // Name the specific reason this instruction was refused.
                 if ce == 1 {
                     "CU1 clear (FPU not enabled for this context)"
-                } else if self.core.get_privilege_mode() != crate::mips_core::PrivilegeMode::Kernel {
+                } else if self.core.get_privilege_mode() != crate::cpu::mips_core::PrivilegeMode::Kernel {
                     "not kernel mode and CU0 clear"
                 } else {
                     "kernel mode with CU0 clear — should not happen for CE=0"
@@ -9042,15 +9042,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[cfg(feature = "jitv2")]
     /// Synchronous compile-and-run for `jitv2_inline_compile = true`.
     /// Full rationale: rules/jitv2/jit-v2-design.md §13.4.
-    fn jitv2_compile_inline(&mut self, req: crate::jitv2::CompileRequest, trigger: bool) -> ExecStatus {
+    fn jitv2_compile_inline(&mut self, req: crate::cpu::jitv2::CompileRequest, trigger: bool) -> ExecStatus {
         let page = unsafe { &mut *self.pcp };
         // Check arena growth BEFORE compiling — flush_from_cpu_thread
         // clears self.pcp/page, which must not happen after this call's
         // own compile just published into that same page.
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
-            .is_some_and(|c| c.packing_stats().1 > crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+            .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
@@ -9073,20 +9073,20 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
             let reserved_bytes = self.jitv2.lock().codegen.lock().as_ref()
                 .map_or(0, |c| c.packing_stats().1);
-            crate::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
+            crate::cpu::jit_feedback::JIT_FEEDBACK.set_arena_fill(reserved_bytes, crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let phys_page_base = page.pfn * crate::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
@@ -9101,7 +9101,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             debug_assert!(!func.is_null(), "valid bit set with null func");
             #[cfg(feature = "developer")]
             { page.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-            let jit_fn: crate::jitv2::JitFn = unsafe { std::mem::transmute(func) };
+            let jit_fn: crate::cpu::jitv2::JitFn = unsafe { std::mem::transmute(func) };
             let status = unsafe { jit_fn(&mut self.core as *mut MipsCore) };
             if status != EXEC_FALLBACK {
                 status
@@ -9415,7 +9415,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         eprintln!("\n=== jitv2_lockstep DIVERGENCE at pc={:#018x} raw was executed by JIT ===", at_pc);
         for r in 0..32 {
             if jit.gpr[r] != expected.gpr[r] {
-                eprintln!("  gpr[{:2}] {:<5} jit={:#018x}  interp={:#018x}", r, crate::mips_dis::reg_name(r as u32), jit.gpr[r], expected.gpr[r]);
+                eprintln!("  gpr[{:2}] {:<5} jit={:#018x}  interp={:#018x}", r, crate::cpu::mips_dis::reg_name(r as u32), jit.gpr[r], expected.gpr[r]);
             }
         }
         if jit.pc != expected.pc { eprintln!("  pc       jit={:#018x}  interp={:#018x}", jit.pc, expected.pc); }
@@ -10369,7 +10369,7 @@ pub struct MipsCpu<T: Tlb, C: CpuModel> {
     /// Pointer into the executor's `MipsCore.hot.cycles` — see
     /// `CyclesPtr`/`Hot::cycles`'s doc comments. Same process-lifetime
     /// validity argument as `interrupts_ptr` right below.
-    cycles_ptr: crate::mips_core::CyclesPtr,
+    cycles_ptr: crate::cpu::mips_core::CyclesPtr,
     /// Raw pointer into the executor's `MipsCore.interrupts` (an inline
     /// field, not `Arc<AtomicU64>` — see that field's doc comment). Valid
     /// for the process lifetime: `executor` below is the only owner of the
@@ -10466,11 +10466,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// Pointer to the executor's `MipsCore`, for devices that report CPU state
     /// from the CPU thread itself (the test device's DUMP). Same
     /// process-lifetime validity argument as `cycles_ptr`.
-    pub fn core_ptr(&self) -> *const crate::mips_core::MipsCore {
-        &self.executor.lock().core as *const crate::mips_core::MipsCore
+    pub fn core_ptr(&self) -> *const crate::cpu::mips_core::MipsCore {
+        &self.executor.lock().core as *const crate::cpu::mips_core::MipsCore
     }
 
-    pub fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr {
+    pub fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr {
         self.cycles_ptr
     }
 
@@ -10523,7 +10523,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     /// (`Jitv2::codegen`/`CompileQueue`'s doc comments) without needing
     /// broader access to the executor itself.
     #[cfg(feature = "jitv2")]
-    pub fn jitv2(&self) -> Arc<Mutex<crate::jitv2::Jitv2>> {
+    pub fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>> {
         self.executor.lock().jitv2.clone()
     }
 
@@ -10669,7 +10669,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         continue;
                     }
                     s if s & EXEC_IS_EXCEPTION != 0 && s & EXEC_IS_TLB_REFILL == 0 => {
-                        let code = (s >> crate::mips_core::CAUSE_EXCCODE_SHIFT) & 0x1F;
+                        let code = (s >> crate::cpu::mips_core::CAUSE_EXCCODE_SHIFT) & 0x1F;
                         let mask = exception_mask.load(Ordering::Relaxed);
                         if (mask & (1 << code)) != 0 {
                             writeln!(writer, "PC={:016x}: Exception code={}", pc, code).unwrap();
@@ -10677,7 +10677,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         }
                     }
                     s if s & EXEC_IS_EXCEPTION != 0 && s & EXEC_IS_TLB_REFILL != 0 => {
-                        let code = (s >> crate::mips_core::CAUSE_EXCCODE_SHIFT) & 0x1F;
+                        let code = (s >> crate::cpu::mips_core::CAUSE_EXCCODE_SHIFT) & 0x1F;
                         let mask = exception_mask.load(Ordering::Relaxed);
                         if (mask & (1 << code)) != 0 {
                             writeln!(writer, "PC={:016x}: TLB Miss code={}", pc, code).unwrap();
@@ -11118,8 +11118,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
         #[cfg(feature = "jitv2")]
         {
             use std::sync::atomic::Ordering;
-            let e = crate::jitv2::codegen::INLINE_MEM_EMITTED.load(Ordering::Relaxed);
-            let d = crate::jitv2::codegen::INLINE_MEM_DECLINED.load(Ordering::Relaxed);
+            let e = crate::cpu::jitv2::codegen::INLINE_MEM_EMITTED.load(Ordering::Relaxed);
+            let d = crate::cpu::jitv2::codegen::INLINE_MEM_DECLINED.load(Ordering::Relaxed);
             if e + d > 0 {
                 eprintln!("jitv2 inline memory: emitted={e} declined={d}");
             }
@@ -11255,7 +11255,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // iteration, so its state never repeats — we must NOT park it or
             // boot stalls. The state-repeat test distinguishes the two.
             #[cfg(feature = "idle-pause")]
-            let mut idle_state = crate::idle_park::IdleParkState::default();
+            let mut idle_state = crate::cpu::idle_park::IdleParkState::default();
 
             while running.load(Ordering::Relaxed) {
                 // Read the runtime jitv2 on/off switch once per 1000-instruction
@@ -11328,7 +11328,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     run_batch!(step_int);
                 }
                 #[cfg(feature = "idle-pause")]
-                if crate::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
+                if crate::cpu::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
                     drop(guard);
                     {
                         let mut guard = executor.lock();
@@ -11369,14 +11369,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             Signal::Reset(_soft) => {
                 interrupts.fetch_or(SOFT_RESET_BIT, Ordering::SeqCst);
                 #[cfg(feature = "idle-pause")]
-                crate::idle_park::wake();
+                crate::cpu::idle_park::wake();
             }
             Signal::Interrupt(line, active) => {
                 let mask = 1u64 << (line + 8);
                 if active {
                     interrupts.fetch_or(mask, Ordering::SeqCst);
                     #[cfg(feature = "idle-pause")]
-                    crate::idle_park::wake();
+                    crate::cpu::idle_park::wake();
                 } else {
                     interrupts.fetch_and(!mask, Ordering::SeqCst);
                 }
@@ -11971,8 +11971,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             "cop1" => {
                 let exec = self.try_lock_executor()?;
                 let status = exec.core.cp0_status;
-                let fr1 = (status & crate::mips_core::STATUS_FR) != 0;
-                let cu1 = (status & crate::mips_core::STATUS_CU1) != 0;
+                let fr1 = (status & crate::cpu::mips_core::STATUS_FR) != 0;
+                let cu1 = (status & crate::cpu::mips_core::STATUS_CU1) != 0;
                 writeln!(writer, "COP1 Registers (FPU):").unwrap();
                 // The FR bit decides register-file interpretation: FR=1 is 32
                 // independent 64-bit registers; FR=0 packs even/odd pairs into
@@ -12572,7 +12572,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                         if let Some(old) = stopped.into_iter().next() {
                                             let (shared, state) = old.shared_arena();
                                             drop(old);
-                                            *jit.codegen.lock() = Some(crate::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
+                                            *jit.codegen.lock() = Some(crate::cpu::jitv2::codegen::Codegen::new_with_shared_arena(shared, state));
                                         }
                                     }
                                     exec.jitv2_inline_compile = true;
@@ -12647,10 +12647,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // validated against live boots.
                         match actual_args.get(1).copied() {
                             None => {
-                                writeln!(writer, "j2 fallback: {}", if crate::jitv2::analyzer::fallback_enabled() { "on" } else { "off" }).unwrap();
+                                writeln!(writer, "j2 fallback: {}", if crate::cpu::jitv2::analyzer::fallback_enabled() { "on" } else { "off" }).unwrap();
                             }
                             Some(on @ ("on" | "off")) => {
-                                crate::jitv2::analyzer::set_fallback_enabled(on == "on");
+                                crate::cpu::jitv2::analyzer::set_fallback_enabled(on == "on");
                                 writeln!(writer, "j2 fallback: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                             }
                             Some(_) => return Err("Usage: j2 fallback [on|off]".to_string()),
@@ -12668,10 +12668,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // already compiled.
                         match actual_args.get(1).copied() {
                             None => {
-                                writeln!(writer, "j2 entrypre: {}", if crate::jitv2::entry_preamble_forced() { "on" } else { "off" }).unwrap();
+                                writeln!(writer, "j2 entrypre: {}", if crate::cpu::jitv2::entry_preamble_forced() { "on" } else { "off" }).unwrap();
                             }
                             Some(on @ ("on" | "off")) => {
-                                crate::jitv2::set_entry_preamble_forced(on == "on");
+                                crate::cpu::jitv2::set_entry_preamble_forced(on == "on");
                                 writeln!(writer, "j2 entrypre: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                             }
                             Some(_) => return Err("Usage: j2 entrypre [on|off]".to_string()),
@@ -12693,7 +12693,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         match actual_args.get(1).copied() {
                             None => {
                                 writeln!(writer, "j2 inline_mem: {}",
-                                    if crate::jitv2::codegen::inline_mem_enabled() { "on" } else { "off" }).unwrap();
+                                    if crate::cpu::jitv2::codegen::inline_mem_enabled() { "on" } else { "off" }).unwrap();
                             }
                             Some(on @ ("on" | "off")) => {
                                 // Under jitv2_lockstep the inline path is
@@ -12706,7 +12706,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 if cfg!(feature = "jitv2_lockstep") {
                                     writeln!(writer, "j2 inline_mem: forced off by jitv2_lockstep (the inline path bypasses the callout hooks lockstep verifies loads/stores through) — cannot be enabled in this build").unwrap();
                                 } else {
-                                    crate::jitv2::codegen::set_inline_mem_enabled(on == "on");
+                                    crate::cpu::jitv2::codegen::set_inline_mem_enabled(on == "on");
                                     writeln!(writer, "j2 inline_mem: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                                 }
                             }
@@ -12725,10 +12725,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         match actual_args.get(1).copied() {
                             None => {
                                 writeln!(writer, "j2 memhelpers: {}",
-                                    if crate::jitv2::codegen::mem_helpers_enabled() { "on" } else { "off" }).unwrap();
+                                    if crate::cpu::jitv2::codegen::mem_helpers_enabled() { "on" } else { "off" }).unwrap();
                             }
                             Some(on @ ("on" | "off")) => {
-                                crate::jitv2::codegen::set_mem_helpers_enabled(on == "on");
+                                crate::cpu::jitv2::codegen::set_mem_helpers_enabled(on == "on");
                                 writeln!(writer, "j2 memhelpers: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", on).unwrap();
                             }
                             Some(_) => return Err("Usage: j2 memhelpers [on|off]".to_string()),
@@ -12767,20 +12767,20 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // for bisecting a live-boot divergence into one functional unit
                         // before narrowing further.
                         let bit = match cat {
-                            "alu" => crate::mips_instr_stats::InstrCategory::ALU,
-                            "fpu" => crate::mips_instr_stats::InstrCategory::FPU,
-                            "branch" => crate::mips_instr_stats::InstrCategory::BRANCH,
-                            "loadstore" => crate::mips_instr_stats::InstrCategory::LOADSTORE,
-                            "cop0" => crate::mips_instr_stats::InstrCategory::COP0,
+                            "alu" => crate::cpu::mips_instr_stats::InstrCategory::ALU,
+                            "fpu" => crate::cpu::mips_instr_stats::InstrCategory::FPU,
+                            "branch" => crate::cpu::mips_instr_stats::InstrCategory::BRANCH,
+                            "loadstore" => crate::cpu::mips_instr_stats::InstrCategory::LOADSTORE,
+                            "cop0" => crate::cpu::mips_instr_stats::InstrCategory::COP0,
                             _ => unreachable!(),
                         };
                         match actual_args.get(1).copied() {
                             None => {
-                                let on = crate::jitv2::opcode_support::category_enabled(bit);
+                                let on = crate::cpu::jitv2::opcode_support::category_enabled(bit);
                                 writeln!(writer, "j2 {}: {}", cat, if on { "on" } else { "off" }).unwrap();
                             }
                             Some(on @ ("on" | "off")) => {
-                                crate::jitv2::opcode_support::set_category_enabled(bit, on == "on");
+                                crate::cpu::jitv2::opcode_support::set_category_enabled(bit, on == "on");
                                 writeln!(writer, "j2 {}: {} — run `j2 flush` (CPU stopped) for it to take effect on already-compiled regions", cat, on).unwrap();
                             }
                             Some(_) => return Err(format!("Usage: j2 {} [on|off]", cat)),
@@ -12793,14 +12793,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // defeats the point of a runtime bisection tool.
                         let filter = match actual_args.get(1).copied() {
                             None => None,
-                            Some("alu") => Some(crate::mips_instr_stats::InstrCategory::ALU),
-                            Some("fpu") => Some(crate::mips_instr_stats::InstrCategory::FPU),
-                            Some("branch") => Some(crate::mips_instr_stats::InstrCategory::BRANCH),
-                            Some("loadstore") => Some(crate::mips_instr_stats::InstrCategory::LOADSTORE),
-                            Some("cop0") => Some(crate::mips_instr_stats::InstrCategory::COP0),
+                            Some("alu") => Some(crate::cpu::mips_instr_stats::InstrCategory::ALU),
+                            Some("fpu") => Some(crate::cpu::mips_instr_stats::InstrCategory::FPU),
+                            Some("branch") => Some(crate::cpu::mips_instr_stats::InstrCategory::BRANCH),
+                            Some("loadstore") => Some(crate::cpu::mips_instr_stats::InstrCategory::LOADSTORE),
+                            Some("cop0") => Some(crate::cpu::mips_instr_stats::InstrCategory::COP0),
                             Some(_) => return Err("Usage: j2 instrs [alu|fpu|branch|loadstore|cop0]".to_string()),
                         };
-                        let _ = crate::jitv2::opcode_support::write_status(&mut writer, filter);
+                        let _ = crate::cpu::jitv2::opcode_support::write_status(&mut writer, filter);
                     }
                     "threads" => {
                         // Read-only: thread_count is fixed at process
@@ -12822,14 +12822,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // own doc comment.
                         match actual_args.get(1).copied() {
                             None => {
-                                writeln!(writer, "j2 opt: {}", if crate::jitv2::codegen::Codegen::opt_level_speed() { "speed" } else { "none" }).unwrap();
+                                writeln!(writer, "j2 opt: {}", if crate::cpu::jitv2::codegen::Codegen::opt_level_speed() { "speed" } else { "none" }).unwrap();
                             }
                             Some("speed") => {
-                                crate::jitv2::codegen::Codegen::set_opt_level_speed(true);
+                                crate::cpu::jitv2::codegen::Codegen::set_opt_level_speed(true);
                                 writeln!(writer, "j2 opt: speed (takes effect on the next flush/reset)").unwrap();
                             }
                             Some("none") => {
-                                crate::jitv2::codegen::Codegen::set_opt_level_speed(false);
+                                crate::cpu::jitv2::codegen::Codegen::set_opt_level_speed(false);
                                 writeln!(writer, "j2 opt: none (takes effect on the next flush/reset)").unwrap();
                             }
                             Some(_) => return Err("Usage: j2 opt [none|speed]".to_string()),
@@ -12844,12 +12844,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // retroactively un-denylist anything.
                         match actual_args.get(1).copied() {
                             None => {
-                                writeln!(writer, "j2 min-instrs: {}", crate::jitv2::comp::min_instrs_to_compile()).unwrap();
+                                writeln!(writer, "j2 min-instrs: {}", crate::cpu::jitv2::comp::min_instrs_to_compile()).unwrap();
                             }
                             Some(n) => match n.parse::<usize>() {
                                 Ok(n) => {
-                                    crate::jitv2::comp::set_min_instrs_to_compile(n);
-                                    writeln!(writer, "j2 min-instrs: {}", crate::jitv2::comp::min_instrs_to_compile()).unwrap();
+                                    crate::cpu::jitv2::comp::set_min_instrs_to_compile(n);
+                                    writeln!(writer, "j2 min-instrs: {}", crate::cpu::jitv2::comp::min_instrs_to_compile()).unwrap();
                                 }
                                 Err(_) => return Err("Usage: j2 min-instrs [N]".to_string()),
                             },
@@ -12862,12 +12862,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // denylisted under the old budget.
                         match actual_args.get(1).copied() {
                             None => {
-                                writeln!(writer, "j2 max-instrs: {}", crate::jitv2::comp::max_instrs_per_compile()).unwrap();
+                                writeln!(writer, "j2 max-instrs: {}", crate::cpu::jitv2::comp::max_instrs_per_compile()).unwrap();
                             }
                             Some(n) => match n.parse::<usize>() {
                                 Ok(n) => {
-                                    crate::jitv2::comp::set_max_instrs_per_compile(n);
-                                    writeln!(writer, "j2 max-instrs: {}", crate::jitv2::comp::max_instrs_per_compile()).unwrap();
+                                    crate::cpu::jitv2::comp::set_max_instrs_per_compile(n);
+                                    writeln!(writer, "j2 max-instrs: {}", crate::cpu::jitv2::comp::max_instrs_per_compile()).unwrap();
                                 }
                                 Err(_) => return Err("Usage: j2 max-instrs [N]".to_string()),
                             },
@@ -12898,23 +12898,23 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // (CODEGEN_OPT_LEVEL_SPEED) but can run `speed` like
                         // any other build — hence a note pointing at how,
                         // not a claim that the combination is unavailable.
-                        let opt = if crate::jitv2::codegen::Codegen::opt_level_speed() { "speed" } else { "none" };
+                        let opt = if crate::cpu::jitv2::codegen::Codegen::opt_level_speed() { "speed" } else { "none" };
                         match actual_args.get(1).copied() {
                             None => {
                                 writeln!(writer, "j2 intrun: {} (max {}, opt_level={})",
-                                    crate::jitv2::codegen::Codegen::interrupt_run(),
-                                    crate::jitv2::codegen::MAX_INTERRUPT_RUN, opt).unwrap();
-                                if !crate::jitv2::codegen::Codegen::opt_level_speed() {
+                                    crate::cpu::jitv2::codegen::Codegen::interrupt_run(),
+                                    crate::cpu::jitv2::codegen::MAX_INTERRUPT_RUN, opt).unwrap();
+                                if !crate::cpu::jitv2::codegen::Codegen::opt_level_speed() {
                                     writeln!(writer, "  note: opt_level=none — Cranelift runs no store-to-load forwarding, so this knob has little effect on emitted code. Set IRIS_OPT_SPEED=1 at launch, or `j2 opt speed` then stop + `j2 flush` to rebuild.").unwrap();
                                 }
                             }
                             Some(n) => match n.parse::<u32>() {
                                 Ok(n) if n >= 1 => {
-                                    crate::jitv2::codegen::Codegen::set_interrupt_run(n);
+                                    crate::cpu::jitv2::codegen::Codegen::set_interrupt_run(n);
                                     writeln!(writer, "j2 intrun: {} (max {}, opt_level={})",
-                                        crate::jitv2::codegen::Codegen::interrupt_run(),
-                                        crate::jitv2::codegen::MAX_INTERRUPT_RUN, opt).unwrap();
-                                    if !crate::jitv2::codegen::Codegen::opt_level_speed() {
+                                        crate::cpu::jitv2::codegen::Codegen::interrupt_run(),
+                                        crate::cpu::jitv2::codegen::MAX_INTERRUPT_RUN, opt).unwrap();
+                                    if !crate::cpu::jitv2::codegen::Codegen::opt_level_speed() {
                                         writeln!(writer, "  note: opt_level=none — Cranelift runs no store-to-load forwarding, so this knob has little effect on emitted code. Set IRIS_OPT_SPEED=1 at launch, or `j2 opt speed` then stop + `j2 flush` to rebuild.").unwrap();
                                     }
                                     if cfg!(feature = "jitv2_lockstep") {
@@ -12930,7 +12930,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                     // event" contract as `j2 opt`.
                                     writeln!(writer, "  applies to code compiled from now on; run `stop` then `j2 flush` to rebuild what already exists").unwrap();
                                 }
-                                _ => return Err(format!("Usage: j2 intrun [1..{}]", crate::jitv2::codegen::MAX_INTERRUPT_RUN)),
+                                _ => return Err(format!("Usage: j2 intrun [1..{}]", crate::cpu::jitv2::codegen::MAX_INTERRUPT_RUN)),
                             },
                         }
                     }
@@ -12942,12 +12942,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // are exempt by construction, not by this value.
                         match actual_args.get(1).copied() {
                             None => {
-                                writeln!(writer, "j2 min-calls: {}", crate::jitv2::min_calls_before_compile()).unwrap();
+                                writeln!(writer, "j2 min-calls: {}", crate::cpu::jitv2::min_calls_before_compile()).unwrap();
                             }
                             Some(n) => match n.parse::<u64>() {
                                 Ok(n) => {
-                                    crate::jitv2::set_min_calls_before_compile(n);
-                                    writeln!(writer, "j2 min-calls: {}", crate::jitv2::min_calls_before_compile()).unwrap();
+                                    crate::cpu::jitv2::set_min_calls_before_compile(n);
+                                    writeln!(writer, "j2 min-calls: {}", crate::cpu::jitv2::min_calls_before_compile()).unwrap();
                                 }
                                 Err(_) => return Err("Usage: j2 min-calls [N]".to_string()),
                             },
@@ -12994,20 +12994,20 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             for (i, e) in hist.iter().skip(start).enumerate() {
                                 let bd = if e.bd == LOCKSTEP_BD_LIVE { "  [bd:live]" } else if e.bd != 0 { "  [bd]" } else { "" };
                                 writeln!(writer, "  #{:<3} {:#018x}: {:08x}  {}{}", start + i, e.pc, e.raw,
-                                    crate::mips_dis::disassemble(e.raw, e.pc, Some(&symbols)), bd).unwrap();
+                                    crate::cpu::mips_dis::disassemble(e.raw, e.pc, Some(&symbols)), bd).unwrap();
                                 if full {
                                     let s = &e.before;
                                     for row in 0..8 {
                                         let mut line = String::new();
                                         for col in 0..4 {
                                             let r = row * 4 + col;
-                                            line.push_str(&format!("  {:>4}={:016x}", crate::mips_dis::reg_name(r as u32), s.gpr[r]));
+                                            line.push_str(&format!("  {:>4}={:016x}", crate::cpu::mips_dis::reg_name(r as u32), s.gpr[r]));
                                         }
                                         writeln!(writer, "  {}", line).unwrap();
                                     }
                                     writeln!(writer, "      hi={:016x}  lo={:016x}  pc={:016x}", s.hi, s.lo, s.pc).unwrap();
                                     writeln!(writer, "      status={:08x} (FR={})  cause={:08x}  epc={:016x}  fcsr={:08x}",
-                                        s.status, (s.status & crate::mips_core::STATUS_FR != 0) as u8, s.cause, s.epc, s.fcsr).unwrap();
+                                        s.status, (s.status & crate::cpu::mips_core::STATUS_FR != 0) as u8, s.cause, s.epc, s.fcsr).unwrap();
                                     for row in 0..8 {
                                         let mut line = String::new();
                                         for col in 0..4 {
@@ -13050,7 +13050,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         let entry_word = ((phys_addr & 0xFFF) >> 2) as u16;
                         let page_base_phys = phys_addr & !0xFFFu32;
 
-                        let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
+                        let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
                         for (i, w) in words.iter_mut().enumerate() {
                             let a = page_base_phys + (i as u32) * 4;
                             let r = exec.sysad.read32(a);
@@ -13065,7 +13065,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         if !non_empty {
                             writeln!(writer, "  region is EMPTY — entry word itself is Excluded with no emitter and fallback is off, or otherwise undispatchable").unwrap();
                         } else {
-                            let visited: Vec<_> = crate::jitv2::analyzer::instrs_linear(walked).collect();
+                            let visited: Vec<_> = crate::cpu::jitv2::analyzer::instrs_linear(walked).collect();
                             writeln!(writer, "  {} instructions visited:", visited.len()).unwrap();
                             for instr in &visited {
                                 let paddr = page_base_phys + (instr.word as u32) * 4;
@@ -13121,11 +13121,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             if result.is_exception() {
                                 return Err(format!("{:#018x} doesn't translate", pc));
                             }
-                            let pfn = result.phys / crate::jitv2::PAGE_SIZE;
-                            let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                            let pfn = result.phys / crate::cpu::jitv2::PAGE_SIZE;
+                            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
                             let sysad = exec.sysad.clone();
                             let mut jit = exec.jitv2.lock();
-                            let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                            let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let slot = jit.page_for(pfn, page_base, sysad.as_ref(), fr1);
                             match slot {
                                 Some(slot) => jit.page_ptr(slot),
@@ -13134,13 +13134,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         };
                         let page = unsafe { &*page_ptr };
                         let sysad = exec.sysad.clone();
-                        let dump = crate::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref())
+                        let dump = crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref())
                             .map_err(|st| format!("capture failed: bus status {:#x}", st))?;
                         // A path argument is whichever arg is not the address.
                         let path = actual_args.iter().skip(1)
                             .find(|a| a.contains('/') || a.ends_with(".bin"))
                             .map(|a| a.to_string())
-                            .unwrap_or_else(|| crate::jitv2::pcp_dump::default_dump_path(dump.pfn));
+                            .unwrap_or_else(|| crate::cpu::jitv2::pcp_dump::default_dump_path(dump.pfn));
                         std::fs::write(&path, dump.to_bytes())
                             .map_err(|e| format!("write {}: {}", path, e))?;
                         writeln!(writer, "wrote {} (pfn {:#x}, gen {} entry_gen {}, fr1={})",
@@ -13159,7 +13159,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     // code is the thing worth measuring.
                     "corpus" => {
                         // Usage: j2 corpus [dir]   (default: jitv2_corpus)
-                        let dir = actual_args.get(1).copied().unwrap_or(crate::jitv2::pcp_dump::CORPUS_DIR);
+                        let dir = actual_args.get(1).copied().unwrap_or(crate::cpu::jitv2::pcp_dump::CORPUS_DIR);
                         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {}", dir, e))?;
 
                         // Capture under the lock into memory first, then write
@@ -13169,7 +13169,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // every dispatching CPU thread for the whole dump.
                         let sysad = exec.sysad.clone();
                         let mut unreadable = 0usize;
-                        let dumps: Vec<crate::jitv2::pcp_dump::PcpDump> = {
+                        let dumps: Vec<crate::cpu::jitv2::pcp_dump::PcpDump> = {
                             let jit = exec.jitv2.lock();
                             let mut v = Vec::new();
                             for page in jit.claimed_pages() {
@@ -13177,7 +13177,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 // now (device unmapped under it, say) is skipped
                                 // rather than failing the whole dump — one bad
                                 // page shouldn't cost the other few thousand.
-                                match crate::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref()) {
+                                match crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref()) {
                                     Ok(d) => v.push(d),
                                     Err(_) => unreadable += 1,
                                 }
@@ -13262,10 +13262,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 return Ok(());
                             }
                             let phys_addr = result.phys;
-                            let pfn = phys_addr / crate::jitv2::PAGE_SIZE;
-                            let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                            let pfn = phys_addr / crate::cpu::jitv2::PAGE_SIZE;
+                            let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
                             let sysad = exec.sysad.clone();
-                            let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                            let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let mut jit = exec.jitv2.lock();
                             match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
                                 Some(slot) => jit.page_ptr(slot),
@@ -13306,7 +13306,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // disagreement with the live bit right now.
                         {
                             let page_fr1 = page.is_fr1();
-                            let live_fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                            let live_fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             writeln!(writer, "  fr1 (pinned)={}  live STATUS_FR={}  (cp0_status={:#010x}){}",
                                 page_fr1 as u8, live_fr1 as u8, exec.core.cp0_status,
                                 if page_fr1 != live_fr1 { "  FR-MISMATCH" } else { "" }).unwrap();
@@ -13345,7 +13345,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         let mut requested = 0usize;
                         let mut published = 0usize;
                         let mut denylisted = 0usize;
-                        for off in 0..crate::jitv2::ENTRIES_PER_PAGE {
+                        for off in 0..crate::cpu::jitv2::ENTRIES_PER_PAGE {
                             if page.is_requested(off) { requested += 1; }
                             if page.is_published(off) { published += 1; }
                             if page.is_denylisted(off) { denylisted += 1; }
@@ -13353,7 +13353,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         writeln!(
                             writer,
                             "totals: {} / {} offsets requested, {} published, {} denylisted",
-                            requested, crate::jitv2::ENTRIES_PER_PAGE, published, denylisted,
+                            requested, crate::cpu::jitv2::ENTRIES_PER_PAGE, published, denylisted,
                         ).unwrap();
 
                         // One function serves the whole page — print its
@@ -13390,7 +13390,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // command and jitv2_pcp_dump print, was 0x900).
                         if requested > 0 || published > 0 || denylisted > 0 {
                             writeln!(writer, "  offsets (R=requested C=compiled D=denylisted):").unwrap();
-                            for off in 0..crate::jitv2::ENTRIES_PER_PAGE {
+                            for off in 0..crate::cpu::jitv2::ENTRIES_PER_PAGE {
                                 let r = page.is_requested(off);
                                 let c = page.is_published(off);
                                 let d = page.is_denylisted(off);
@@ -13426,10 +13426,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
                                 paddr, HIMEM_END));
                         }
-                        let pfn = (paddr as u32) / crate::jitv2::PAGE_SIZE;
-                        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                        let pfn = (paddr as u32) / crate::cpu::jitv2::PAGE_SIZE;
+                        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
                         let sysad = exec.sysad.clone();
-                        let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                        let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
                         match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
                             Some(slot) => {
@@ -13478,11 +13478,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 "{:#x} doesn't look like a physical address (must be < {:#x}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
                                 paddr, HIMEM_END));
                         }
-                        let pfn = (paddr as u32) / crate::jitv2::PAGE_SIZE;
-                        let page_base = pfn * crate::jitv2::PAGE_SIZE;
+                        let pfn = (paddr as u32) / crate::cpu::jitv2::PAGE_SIZE;
+                        let page_base = pfn * crate::cpu::jitv2::PAGE_SIZE;
                         let offset = ((paddr as u32) & 0xFFF) as usize >> 2;
                         let sysad = exec.sysad.clone();
-                        let fr1 = (exec.core.cp0_status & crate::mips_core::STATUS_FR) != 0;
+                        let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
                         match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
                             Some(slot) => {
@@ -13530,7 +13530,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 } else {
                                     writeln!(writer, "no gap found (queue empty or fully contiguous — should be draining)").unwrap();
                                 }
-                                let describe_page = |writer: &mut String, page_ptr: *mut crate::jitv2::PhysicalCodePage| {
+                                let describe_page = |writer: &mut String, page_ptr: *mut crate::cpu::jitv2::PhysicalCodePage| {
                                     if page_ptr.is_null() {
                                         writeln!(writer, "    page: none (test-only compile path, no real page)").unwrap();
                                     } else {
@@ -13545,7 +13545,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                         // signal, not a crash risk.
                                         let page = unsafe { &*page_ptr };
                                         writeln!(writer, "    page: pfn={:#010x} phys_base={:#010x}",
-                                            page.pfn, page.pfn * crate::jitv2::PAGE_SIZE).unwrap();
+                                            page.pfn, page.pfn * crate::cpu::jitv2::PAGE_SIZE).unwrap();
                                     }
                                 };
                                 match jit.compile_queue.seal_queue_entries() {
@@ -13577,12 +13577,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         }
                     }
                     "html" => {
-                        // See src/jitv2_html_j2wp.rs for the full collect+render
+                        // See src/cpu/jitv2_html_j2wp.rs for the full collect+render
                         // implementation.
                         let path = actual_args.get(1).copied().unwrap_or("jitv2.html");
                         let jitv2_arc = exec.jitv2.clone();
                         let bus = exec.sysad.clone();
-                        crate::jitv2_html_j2wp::write_jitv2_html(
+                        crate::cpu::jitv2_html_j2wp::write_jitv2_html(
                             &jitv2_arc, &bus, &mut exec.jitv2_inline_analyzer, path, &mut *writer,
                         )?;
                     }
@@ -13614,14 +13614,14 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             // counts real JIT-vs-interpreter compares. Stuck at 0
                             // means the JIT never ran (nothing compiled) and
                             // verification is silently OFF.
-                            let verified = crate::mips_exec::LOCKSTEP_VERIFICATIONS.load(Ordering::Relaxed);
+                            let verified = crate::cpu::mips_exec::LOCKSTEP_VERIFICATIONS.load(Ordering::Relaxed);
                             writeln!(writer, "lockstep: {} instructions verified (0 => NOT verifying — JIT not running)", verified).unwrap();
                         }
                         #[cfg(not(feature = "jitv2_lockstep"))]
                         writeln!(writer, "inline compile: {}", if exec.jitv2_inline_compile { "on" } else { "off" }).unwrap();
                         #[cfg(feature = "developer")]
                         {
-                            let dt_calls = crate::mips_exec::DEV_TRACE_BP_CALLS.load(Ordering::Relaxed);
+                            let dt_calls = crate::cpu::mips_exec::DEV_TRACE_BP_CALLS.load(Ordering::Relaxed);
                             writeln!(writer, "dev trace hook: {} calls (0 => emit_dev_trace_bp never reached from compiled code)", dt_calls).unwrap();
                         }
                         // Functions compiled into the active Codegen's
@@ -13654,8 +13654,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             };
                             if let Some((used, reserved)) = stats {
                                 writeln!(writer, "arena reserved: {} / {} bytes ({:.1}%), used {} bytes ({:.1}% packing) — real flush trigger",
-                                    reserved, crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES,
-                                    reserved as f64 * 100.0 / crate::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES as f64,
+                                    reserved, crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES,
+                                    reserved as f64 * 100.0 / crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES as f64,
                                     used, if reserved == 0 { 0.0 } else { used as f64 * 100.0 / reserved as f64 }).unwrap();
                             } else if jit.compile_queue.is_running() {
                                 writeln!(writer, "arena reserved: n/a while pooled (no cross-thread byte mirror yet — see function_count for a live signal instead)").unwrap();
@@ -13665,7 +13665,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             // that keeps climbing during steady-state execution
                             // is the arena-fill/flush/recompile death spiral —
                             // the working set exceeds the arena threshold.
-                            let flushes = crate::jit_feedback::JIT_FEEDBACK.flush_events.load(Ordering::Relaxed);
+                            let flushes = crate::cpu::jit_feedback::JIT_FEEDBACK.flush_events.load(Ordering::Relaxed);
                             writeln!(writer, "mega-flushes (arena/pool wipes, each recompiles everything): {}", flushes).unwrap();
                         }
                         // Arena bytes: this block reports emitted code size (arena
@@ -13698,13 +13698,13 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             let fb_regions = jit.stats.fallback_regions.load(Ordering::Relaxed);
                             writeln!(writer, "fallback: {} interp-fallback words compiled across {} regions ({})",
                                 fb_words, fb_regions,
-                                if crate::jitv2::analyzer::fallback_enabled() { "j2 fallback: on" } else { "j2 fallback: off" }).unwrap();
+                                if crate::cpu::jitv2::analyzer::fallback_enabled() { "j2 fallback: on" } else { "j2 fallback: off" }).unwrap();
                             // Gate on the buckets, not on `failed`: a
                             // dirty-page deferral is deliberately not counted
                             // as a failed compile, so a run whose only
                             // rejections are deferrals would print nothing at
                             // all if this asked `failed > 0`.
-                            let any_reject = crate::jitv2::RejectReason::ALL.iter()
+                            let any_reject = crate::cpu::jitv2::RejectReason::ALL.iter()
                                 .any(|r| jit.stats.reject_reasons[r.index()].load(Ordering::Relaxed) > 0);
                             if any_reject {
                                 writeln!(writer, "  rejections by reason:").unwrap();
@@ -13714,7 +13714,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 // stats` no matter how often it fires, and
                                 // the only symptom is `failed` not matching
                                 // the sum of the printed buckets.
-                                for reason in crate::jitv2::RejectReason::ALL {
+                                for reason in crate::cpu::jitv2::RejectReason::ALL {
                                     let n = jit.stats.reject_reasons[reason.index()].load(Ordering::Relaxed);
                                     if n == 0 { continue; }
                                     writeln!(writer, "    {:>7}  {}", n, reason.label()).unwrap();
@@ -13728,7 +13728,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                 let avg_depth = depth_sum as f64 / dispatches as f64;
                                 let full_pct = full as f64 * 100.0 / dispatches as f64;
                                 writeln!(writer, "compile queue: {} / {} now, {} dispatches, {} full ({:.1}%), avg depth at dispatch {:.1}",
-                                    jit.compile_queue.queue_occupancy(), crate::jitv2::COMPILE_QUEUE_CAPACITY,
+                                    jit.compile_queue.queue_occupancy(), crate::cpu::jitv2::COMPILE_QUEUE_CAPACITY,
                                     dispatches, full, full_pct, avg_depth).unwrap();
                             }
 
@@ -13824,7 +13824,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             return Ok(());
                         }
                         writeln!(writer, "arena: {:#x}..{:#x} ({} bytes, {} MiB)", ptr, ptr + len, len, len / (1024 * 1024)).unwrap();
-                        match crate::jitv2::paged_memory::anon_hugepages_in_range(ptr, len) {
+                        match crate::cpu::jitv2::paged_memory::anon_hugepages_in_range(ptr, len) {
                             Some(hugepage_bytes) => {
                                 let pct = hugepage_bytes as f64 * 100.0 / len as f64;
                                 writeln!(writer, "AnonHugePages within arena: {} bytes ({} MiB, {:.1}% of reservation) — from /proc/self/smaps",
@@ -14189,7 +14189,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
 pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn as_device(self: Arc<Self>) -> Arc<dyn Device>;
     fn debug_adapter(self: Arc<Self>) -> Arc<dyn crate::gdb_stub::CpuDebug>;
-    fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr;
+    fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr;
     fn interrupts_ptr(&self) -> *const AtomicU64;
     /// ppmem: the executor's inline `ppmem_bitmap` field, for
     /// `PpMemSpace::set_bitmap_sink`.
@@ -14209,7 +14209,7 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     /// Same contract as `CpuCache::set_tcache_gen_window`.
     #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64);
-    fn core_ptr(&self) -> *const crate::mips_core::MipsCore;
+    fn core_ptr(&self) -> *const crate::cpu::mips_core::MipsCore;
     fn register_locks(&self);
     fn load_elf(&self, path: &str) -> Result<String, String>;
     fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
@@ -14234,7 +14234,7 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn fasttick_count(&self) -> Arc<AtomicU64>;
     fn count_hz_atomic(&self) -> Arc<AtomicU64>;
     #[cfg(feature = "jitv2")]
-    fn jitv2(&self) -> Arc<Mutex<crate::jitv2::Jitv2>>;
+    fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>>;
 }
 
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCpu<T, C> {
@@ -14242,7 +14242,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn debug_adapter(self: Arc<Self>) -> Arc<dyn crate::gdb_stub::CpuDebug> {
         MipsCpuDebugAdapter::new(self)
     }
-    fn cycles_ptr(&self) -> crate::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
+    fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
     #[cfg(feature = "tcache")]
@@ -14255,7 +14255,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {
         unsafe { MipsCpu::set_tcache_gen_window(self, gen_base) }
     }
-    fn core_ptr(&self) -> *const crate::mips_core::MipsCore { MipsCpu::core_ptr(self) }
+    fn core_ptr(&self) -> *const crate::cpu::mips_core::MipsCore { MipsCpu::core_ptr(self) }
     fn register_locks(&self) { MipsCpu::register_locks(self) }
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
     fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
@@ -14285,7 +14285,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
         Arc::clone(&self.executor.lock().core.count_hz_atomic)
     }
     #[cfg(feature = "jitv2")]
-    fn jitv2(&self) -> Arc<Mutex<crate::jitv2::Jitv2>> { MipsCpu::jitv2(self) }
+    fn jitv2(&self) -> Arc<Mutex<crate::cpu::jitv2::Jitv2>> { MipsCpu::jitv2(self) }
 }
 
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsCpu<T, C> {
@@ -14505,7 +14505,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDebug
     }
 
     fn step_one(&self) -> StopReason {
-        use crate::mips_exec::{EXEC_BREAKPOINT, EXEC_RETRY};
+        use crate::cpu::mips_exec::{EXEC_BREAKPOINT, EXEC_RETRY};
         self.cpu.stop(); // ensure no thread is running
         let mut exec = self.cpu.executor.lock();
         exec.last_bp_hit = None;

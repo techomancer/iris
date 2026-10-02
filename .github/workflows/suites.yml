@@ -41,7 +41,7 @@ on:
       - 'cpu-tests/**'
       - 'bench/**'
       - 'src/mips_*.rs'
-      - 'src/jitv2/**'
+      - 'src/cpu/jitv2/**'
       - 'src/elf.rs'
       - 'src/testdev.rs'
       - 'src/bench_report.rs'

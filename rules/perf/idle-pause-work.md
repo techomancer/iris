@@ -47,7 +47,7 @@ idle-loop candidate: 0x88011704..=0x88011748 (72 bytes) — ~57% of samples, int
 
 ## 3. Tools/code added so far
 
-### `idleprof` — PC-sampling histogram (in `src/mips_exec.rs`)
+### `idleprof` — PC-sampling histogram (in `src/cpu/mips_exec.rs`)
 Locates hot spin/idle loops. **Lock-free arming** (shared `Arc<AtomicBool>`
 between `MipsCpu` and the executor, read in `step()` via a cached raw ptr) so the
 CPU is never paused to enable it.
@@ -148,7 +148,7 @@ means we can stop executing and let real time pass.
   host CPU drop to ~0 at the idle prompt while the clock and interactivity stay
   correct.
 
-### Implemented so far (`src/mips_exec.rs`, in the `MIPS-CPU` run loop in `start()`)
+### Implemented so far (`src/cpu/mips_exec.rs`, in the `MIPS-CPU` run loop in `start()`)
 
 The **park mechanism is done and validated**, run entirely in-place in the run
 loop (no thread/peripheral restart): on detected idle, sleep in ≤1 ms slices,

@@ -96,7 +96,7 @@ impl Drop for IsaGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mips_cache_v2::{CpuModel, PassthroughCache, PassthroughCacheM4,
+    use crate::cpu::mips_cache_v2::{CpuModel, PassthroughCache, PassthroughCacheM4,
                                R4400Cache, R5000Cache};
 
     /// The models' own `MIPS4` consts are what the interpreter gates on, so
@@ -135,9 +135,9 @@ mod tests {
     /// with.
     #[test]
     fn an_executor_walks_at_its_own_models_isa_level() {
-        use crate::mips_cache_v2::{CpuModel, PassthroughCache, PassthroughCacheM4};
-        use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
-        use crate::mips_tlb::PassthroughTlb;
+        use crate::cpu::mips_cache_v2::{CpuModel, PassthroughCache, PassthroughCacheM4};
+        use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
+        use crate::cpu::mips_tlb::PassthroughTlb;
         use crate::dev::mem::Memory;
         use crate::traits::BusDevice;
         use std::sync::Arc;

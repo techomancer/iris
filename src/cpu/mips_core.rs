@@ -57,7 +57,7 @@ pub fn cachediag_on() -> bool {
 pub fn cp0_log() -> bool {
     crate::devlog::devlog_is_active(crate::devlog::LogModule::Mips)
         && (crate::devlog::devlog_mask(crate::devlog::LogModule::Mips)
-            & crate::mips_exec::MIPS_LOG_CP0) != 0
+            & crate::cpu::mips_exec::MIPS_LOG_CP0) != 0
 }
 
 // CP0 Cause Register bit definitions
@@ -115,7 +115,7 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
     {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
         #[cfg(feature = "idle-pause")]
-        crate::idle_park::wake();
+        crate::cpu::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
         true
     } else {
@@ -1110,8 +1110,8 @@ impl NanoTlbEntry {
 
     /// Decode the CacheAttr (used by TLB layer).
     #[inline(always)]
-    pub fn cache_attr(&self) -> crate::mips_exec::CacheAttr {
-        use crate::mips_exec::CacheAttr;
+    pub fn cache_attr(&self) -> crate::cpu::mips_exec::CacheAttr {
+        use crate::cpu::mips_exec::CacheAttr;
         match self.pa_encoded & 0x7 {
             3 => CacheAttr::Cacheable,
             5 => CacheAttr::CacheableCoherent,
@@ -1128,7 +1128,7 @@ impl NanoTlbEntry {
 
     /// Fill entry from a successful translation.
     #[inline(always)]
-    pub fn fill(&mut self, va: u64, phys_addr: u64, attr: crate::mips_exec::CacheAttr) {
+    pub fn fill(&mut self, va: u64, phys_addr: u64, attr: crate::cpu::mips_exec::CacheAttr) {
         self.va_tag     = (va & !0xFFF) | 1;
         self.pa_encoded = (phys_addr & !0xFFF) | (attr as u64);
     }
@@ -1196,14 +1196,14 @@ unsafe extern "C" fn jit_hooks_not_installed_kill_entry(_ctx: *mut core::ffi::c_
 /// breakpoint") rather than an abort.
 #[cfg(all(feature = "jitv2", feature = "developer"))]
 unsafe extern "C" fn jit_hooks_not_installed_dev_trace_bp(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _origin: u32) -> u32 {
-    crate::mips_exec::EXEC_COMPLETE
+    crate::cpu::mips_exec::EXEC_COMPLETE
 }
 /// No-op sentinel, same reasoning as the dev-hook one above: a bare codegen
 /// unit test that runs a `jit_fn` without `install_jit_hooks` has no executor
 /// to re-read memory through, so verification is simply not performed.
 #[cfg(all(feature = "jitv2", feature = "fetchverify"))]
 unsafe extern "C" fn jit_hooks_not_installed_fetch_verify(_ctx: *mut core::ffi::c_void, _va: u64, _expected: u32) -> u32 {
-    crate::mips_exec::EXEC_COMPLETE
+    crate::cpu::mips_exec::EXEC_COMPLETE
 }
 /// No-op (not a panic) like the dev-hook sentinel: lockstep is pure
 /// verification, and a bare codegen unit test that runs a `jit_fn` without
@@ -1213,7 +1213,7 @@ unsafe extern "C" fn jit_hooks_not_installed_fetch_verify(_ctx: *mut core::ffi::
 #[cfg(feature = "jitv2_lockstep")]
 unsafe extern "C" fn jit_hooks_not_installed_lockstep_step(_ctx: *mut core::ffi::c_void, _pc: u64, _raw: u32, _bd: u32) {}
 #[cfg(feature = "jitv2_lockstep")]
-unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::mips_exec::EXEC_COMPLETE }
+unsafe extern "C" fn jit_hooks_not_installed_lockstep_compare(_ctx: *mut core::ffi::c_void) -> u32 { crate::cpu::mips_exec::EXEC_COMPLETE }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_hooks_not_installed_fpu_set_mode(_ctx: *mut core::ffi::c_void, _rm: u32) {
     panic!("jitv2: fpu_set_mode hook called before MipsExecutor::install_jit_hooks");
@@ -1948,7 +1948,7 @@ impl MipsCore {
             // slot field is what prevents the out-of-range write; dropping P is
             // not needed for that and would lose architectural state.
             0 => self.cp0_index = (value as u32)
-                    & (crate::mips_exec::CP0_INDEX_P | crate::mips_exec::CP0_INDEX_SLOT_MASK),
+                    & (crate::cpu::mips_exec::CP0_INDEX_P | crate::cpu::mips_exec::CP0_INDEX_SLOT_MASK),
             1 => { /* Random is read-only */ }
             2 => self.cp0_entrylo0 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
             3 => self.cp0_entrylo1 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
@@ -2253,7 +2253,7 @@ impl MipsCore {
     pub fn set_interrupt(&self, bit: u8) {
         self.hot.interrupts.fetch_or(1u64 << (bit + 8), Ordering::SeqCst);
         #[cfg(feature = "idle-pause")]
-        crate::idle_park::wake();
+        crate::cpu::idle_park::wake();
     }
 
     /// Clear interrupt bit
@@ -2512,7 +2512,7 @@ impl MipsCore {
 /// Does NOT perform the two executor-level side effects the real
 /// `handle_exception` also does (`cache.set_llbit(false)`,
 /// `nanotlb_invalidate()`) — neither affects any field `CoreState`
-/// (`src/trace.rs`) tracks, and `jitv2_verify` has no cache/TLB to touch in
+/// (`src/cpu/trace.rs`) tracks, and `jitv2_verify` has no cache/TLB to touch in
 /// the first place. `handle_exception` remains responsible for those; this
 /// function only owns the part that's genuinely portable.
 ///

@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mips_tlb::*;
-    use crate::mips_exec::CacheAttr;
+    use crate::cpu::mips_tlb::*;
+    use crate::cpu::mips_exec::CacheAttr;
 
     #[test]
     fn test_tlb_entry_flags() {
@@ -451,9 +451,9 @@ mod tests {
 /// it reported was that write being dropped.
 #[test]
 fn tlb_size_follows_the_cpu_model() {
-    use crate::mips_cache_shadow::R10000ShadowCache;
-    use crate::mips_cache_v2::{R4400Cache, R5000Cache};
-    use crate::mips_exec::MipsCpuConfig;
+    use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+    use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
+    use crate::cpu::mips_exec::MipsCpuConfig;
 
     assert_eq!(MipsCpuConfig::for_model::<R4400Cache>().tlb_entries, 48);
     assert_eq!(MipsCpuConfig::for_model::<R5000Cache>().tlb_entries, 48);

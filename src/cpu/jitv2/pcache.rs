@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
 
-use crate::jitv2::{BITMAP_WORDS, ENTRIES_PER_PAGE};
+use crate::cpu::jitv2::{BITMAP_WORDS, ENTRIES_PER_PAGE};
 
 pub type Fingerprint = [u8; 16];
 pub type PageHash = [u8; 16];

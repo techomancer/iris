@@ -7,7 +7,7 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 use crate::snapshot::{get_field, toml_u8, hex_u8};
 use crate::dev::z85c30::{Z85c30, IrqCallback};
 use crate::dev::pit8254::{Pit8254, TimerCallback};
-use crate::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
+use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
 use crate::dev::ps2::{Ps2Controller, Ps2Callback};
 use crate::hptimer::TimerManager;
 use std::io::Write;
@@ -1173,7 +1173,7 @@ impl IocState {
             if set_mask != 0 {
                 interrupts.fetch_or(set_mask, Ordering::SeqCst);
                 #[cfg(feature = "idle-pause")]
-                crate::idle_park::wake();
+                crate::cpu::idle_park::wake();
             }
             if clear_mask != 0 {
                 interrupts.fetch_and(!clear_mask, Ordering::SeqCst);

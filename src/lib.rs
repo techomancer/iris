@@ -56,7 +56,7 @@ compile_error!(
      unfinished on its own terms: `cargo test --features r5ksc_triton` \
      fails mips_cache_v2::tests::cache_op_index_inv_l1i. Refusing to build \
      rather than silently shipping a broken cache model for a machine this \
-     emulator doesn't target. See src/mips_cache_v2.rs and \
+     emulator doesn't target. See src/cpu/mips_cache_v2.rs and \
      rules/testing/r5k-l1i-cache-bugs.md."
 );
 
@@ -66,7 +66,7 @@ compile_error!(
      R5000 board has) does not currently work: `cargo test --features \
      r5ksc` fails mips_cache_v2's L1I tests. There is currently no working \
      R5000 secondary-cache configuration. Refusing to build rather than silently \
-     shipping a broken cache model. See src/mips_cache_v2.rs and \
+     shipping a broken cache model. See src/cpu/mips_cache_v2.rs and \
      rules/testing/r5k-l1i-cache-bugs.md. The R5000 without a secondary \
      cache (`--cpu r5000`) is unaffected."
 );
@@ -149,20 +149,10 @@ pub mod build_features {
 
 pub mod config;
 pub mod traits;
-pub mod trace;
 #[macro_use]
 pub mod devlog;
 pub mod prombin;
 pub mod prombini2;
-pub mod mips_isa;
-pub mod mips_dis;
-pub mod mips_core;
-pub mod mips_tlb;
-pub mod mips_cache_v2;
-pub mod mips_cache_shadow;
-pub mod mips_exec;
-pub mod mips_exec_test;
-pub mod mips_instr_stats;
 pub mod ppmem;
 pub mod machine;
 pub mod platform;
@@ -177,6 +167,7 @@ pub mod cow_disk;
 pub mod chd_disk;
 pub mod scsi;
 pub mod ui;
+pub mod cpu;
 pub mod dev;
 pub mod gfifo;
 pub mod gfx_display;
@@ -198,16 +189,9 @@ pub mod perf_monitor;
 pub mod ci;
 pub mod hptimer;
 pub mod hptimer_tests;
-#[cfg(feature = "idle-pause")]
-pub mod idle_park;
 pub mod vga_font;
 pub mod video_source;
 pub mod ultra_proto;
-#[cfg(feature = "jitv2")]
-pub mod jitv2;
-#[cfg(feature = "jitv2")]
-pub mod jitv2_html_j2wp;
-pub mod jit_feedback;
 pub mod crash_diag;
 pub mod hwwatch;
 

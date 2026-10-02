@@ -1,7 +1,7 @@
 # The pending-interrupt check, not block structure, is what blocks GPR forwarding
 
 Measured 2026-09-19 with `zz_forwarding::zz_cl_forwarding` (a six-shape
-Cranelift probe, `src/jitv2/mod.rs`) plus real emitted code from the corpus.
+Cranelift probe, `src/cpu/jitv2/mod.rs`) plus real emitted code from the corpus.
 
 > **Bottom line first — and the title oversells it.** The mechanism is real in
 > isolation, and `j2 intrun` does shrink emitted code 6-10%. But at corpus

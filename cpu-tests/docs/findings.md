@@ -14,7 +14,7 @@ in [gotchas.md](gotchas.md) instead. Telling the two apart is most of the work.
 *Found by `mips4/multi_fp_cc`.*
 
 > This branch carries tests only. The fix lives on **`fix/fp-condition-code`**
-> (two commits, `src/mips_exec.rs` and `src/mips_exec_test.rs`), so
+> (two commits, `src/cpu/mips_exec.rs` and `src/cpu/mips_exec_test.rs`), so
 > `mips4/multi_fp_cc` fails here — which is what the suite should be reporting
 > until the fix lands.
 
@@ -167,7 +167,7 @@ is a documented requirement.
 
 IP7 fires when `Count` becomes numerically **equal** to `Compare` — not when it
 exceeds it. IRIS models that faithfully and says so
-(`schedule_compare_timer` in `src/mips_core.rs`): a `Compare` written "in the
+(`schedule_compare_timer` in `src/cpu/mips_core.rs`): a `Compare` written "in the
 past" correctly does not fire until `Count` wraps through 2^32.
 
 But `Count` is wallclock-anchored by default, so it advances in jumps rather

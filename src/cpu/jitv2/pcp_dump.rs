@@ -81,7 +81,7 @@
 //! had one — so it was empty exactly where it was supposed to help, and
 //! misleading in the single-page case where it was set.)
 
-use crate::jitv2::{PhysicalCodePage, BITMAP_WORDS, ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::cpu::jitv2::{PhysicalCodePage, BITMAP_WORDS, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::traits::BusDevice;
 
 /// Format version 2 magic. Writers always emit this.
@@ -97,7 +97,7 @@ pub const MAGIC_V1: &[u8; 8] = b"IRISPCP1";
 /// duplicates this struct rather than depending on the `iris` lib's private
 /// `mips_exec`-adjacent glue; this module itself is `pub` and reused as a
 /// library dependency by that binary, same pattern as `jitv2_analyze`
-/// depending on `iris::jitv2::analyzer`).
+/// depending on `iris::cpu::jitv2::analyzer`).
 pub struct PcpDump {
     pub pfn: u32,
     pub current_gen: u64,

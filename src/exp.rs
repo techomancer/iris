@@ -1,5 +1,5 @@
-use crate::mips_core::MipsCore;
-use crate::mips_dis::{self, SymbolTable};
+use crate::cpu::mips_core::MipsCore;
+use crate::cpu::mips_dis::{self, SymbolTable};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegTarget {

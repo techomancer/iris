@@ -14,7 +14,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::Serialize;
 
-use crate::jitv2::Jitv2;
+use crate::cpu::jitv2::Jitv2;
 use crate::physical::HIMEM_BASE;
 use crate::traits::BusDevice;
 
@@ -455,7 +455,7 @@ document.addEventListener('keydown', (e) => {{
 pub fn write_jitv2_html(
     jitv2: &Arc<Mutex<Jitv2>>,
     bus: &Arc<dyn BusDevice>,
-    analyzer: &mut crate::jitv2::analyzer::Analyzer,
+    analyzer: &mut crate::cpu::jitv2::analyzer::Analyzer,
     path: &str,
     writer: &mut dyn Write,
 ) -> Result<(), String> {
@@ -469,7 +469,7 @@ pub fn write_jitv2_html(
     // (Jitv2::code_bytes_used doc comment) — fine for an on-demand dump,
     // not a hot path.
     for page in jit.claimed_pages() {
-        let phys_addr = page.pfn * crate::jitv2::PAGE_SIZE;
+        let phys_addr = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
         // PROM_BASE/PROM_SIZE mirror the private constants in
         // `prom.rs`/`physical.rs` (0x1FC00000, 1MB) — jitv2 can and does
         // compile boot-time PROM code (physical alias of
@@ -487,7 +487,7 @@ pub fn write_jitv2_html(
         };
         let page_gen = page.current_gen();
 
-        let mut words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
+        let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
             *w = bus.read32(phys_addr + (i as u32) * 4).data;
         }
@@ -510,7 +510,7 @@ pub fn write_jitv2_html(
         let mut entry_count = 0u32;
         let mut denylisted_count = 0u32;
         let mut entry_words: Vec<u16> = Vec::new();
-        for off in 0..crate::jitv2::ENTRIES_PER_PAGE {
+        for off in 0..crate::cpu::jitv2::ENTRIES_PER_PAGE {
             if page.is_denylisted(off) { denylisted_count += 1; }
             if !page.is_published(off) { continue; }
             entry_count += 1;
@@ -522,21 +522,21 @@ pub fn write_jitv2_html(
             // Read before the walk: `walked` borrows the analyzer.
             let mips4 = analyzer.mips4();
             let walked = analyzer.walk_multi_entry(&words, &entry_words, phys_addr, usize::MAX);
-            rows = crate::jitv2::analyzer::instrs_linear(walked)
+            rows = crate::cpu::jitv2::analyzer::instrs_linear(walked)
                 .map(|instr| {
-                    let kind = match crate::jitv2::analyzer::classify(instr.raw, instr.word, phys_addr, mips4) {
-                        crate::jitv2::analyzer::Classify::Sequential => "Sequential",
-                        crate::jitv2::analyzer::Classify::Branch { .. } => "Branch",
-                        crate::jitv2::analyzer::Classify::Jump { .. } => "Jump",
-                        crate::jitv2::analyzer::Classify::RegJump => "RegJump",
-                        crate::jitv2::analyzer::Classify::Excluded => "Excluded",
-                        crate::jitv2::analyzer::Classify::RegionBoundary => "RegionBoundary",
+                    let kind = match crate::cpu::jitv2::analyzer::classify(instr.raw, instr.word, phys_addr, mips4) {
+                        crate::cpu::jitv2::analyzer::Classify::Sequential => "Sequential",
+                        crate::cpu::jitv2::analyzer::Classify::Branch { .. } => "Branch",
+                        crate::cpu::jitv2::analyzer::Classify::Jump { .. } => "Jump",
+                        crate::cpu::jitv2::analyzer::Classify::RegJump => "RegJump",
+                        crate::cpu::jitv2::analyzer::Classify::Excluded => "Excluded",
+                        crate::cpu::jitv2::analyzer::Classify::RegionBoundary => "RegionBoundary",
                     };
                     let paddr = phys_addr + (instr.word as u32) * 4;
                     jitv2_html::WordRow {
                         word: instr.word as u32,
                         raw: instr.raw,
-                        dis: crate::mips_dis::disassemble(instr.raw, paddr as u64, None),
+                        dis: crate::cpu::mips_dis::disassemble(instr.raw, paddr as u64, None),
                         kind,
                         is_entry_point: instr.is_entry_point,
                         is_fallback: instr.is_fallback,

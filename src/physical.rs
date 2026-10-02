@@ -5,7 +5,7 @@ use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, Device, BUS_OK};
 use crate::devlog::LogModule;
 use crate::exp::eval_const_expr;
-use crate::mips_dis;
+use crate::cpu::mips_dis;
 use crate::dev::mem::{BlackHoleRegion, UnmappedRam};
 use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
 

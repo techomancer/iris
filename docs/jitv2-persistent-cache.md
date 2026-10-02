@@ -1,6 +1,6 @@
 # jitv2 persistent code cache — design
 
-Status, 2026-09-24: implemented behind `IRIS_JIT_CACHE=1` (`src/jitv2/pcache.rs`),
+Status, 2026-09-24: implemented behind `IRIS_JIT_CACHE=1` (`src/cpu/jitv2/pcache.rs`),
 under verification. Where the implementation departs from the plan below, the
 section says so.
 

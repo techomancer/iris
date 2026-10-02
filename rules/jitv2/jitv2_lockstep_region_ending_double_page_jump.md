@@ -18,7 +18,7 @@ not_same_page`).
 
 ## Root cause
 
-`emit_lockstep_compare_seq` (src/jitv2/codegen.rs) materialized a **throwaway**
+`emit_lockstep_compare_seq` (src/cpu/jitv2/codegen.rs) materialized a **throwaway**
 `core.pc = word+1` purely so the lockstep compare hook had a `pc` field to
 check — codegen doesn't otherwise keep `core.pc` live between straight-line
 instructions. For a region-ending word, `word+1` crosses onto the next page.

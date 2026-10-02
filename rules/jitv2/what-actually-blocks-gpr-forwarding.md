@@ -1,7 +1,7 @@
 # What actually blocks GPR store-to-load forwarding (and what doesn't)
 
 Measured 2026-09-19/20 with `zz_forwarding::zz_cl_forwarding` (an eight-shape
-Cranelift probe, `src/jitv2/mod.rs`) at `opt_level=speed`, plus CLIF IR and
+Cranelift probe, `src/cpu/jitv2/mod.rs`) at `opt_level=speed`, plus CLIF IR and
 final asm from a real corpus page (`IRIS_JIT_CLIF=1`, `IRIS_JIT_DISASM=1`).
 
 There is no register cache in this JIT: `emit_read_gpr`/`emit_write_gpr` are

@@ -2,7 +2,7 @@
 
 ## Symptom
 
-Panic while compiling, from `src/jitv2/codegen.rs`:
+Panic while compiling, from `src/cpu/jitv2/codegen.rs`:
 
 ```
 index out of bounds: the len is 1024 but the index is 1024
@@ -130,7 +130,7 @@ unguarded, which is fine — every path to them is behind an `is_inlinable` gate
 
 ## Tests
 
-`src/jitv2/equiv_test.rs`, via the `check_nested_foreign_page_slot` helper —
+`src/cpu/jitv2/equiv_test.rs`, via the `check_nested_foreign_page_slot` helper —
 runs both engines over the same two-word region and asserts the JIT matches the
 interpreter's `pc` / `in_delay_slot` / `delay_slot_target`:
 

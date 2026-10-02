@@ -182,6 +182,6 @@ is covered by the normal build here.
 ## Related
 
 - [[project_ppmem]] — the design this supports
-- `src/jitv2/paged_memory.rs` already uses the `region` crate for the JIT code
+- `src/cpu/jitv2/paged_memory.rs` already uses the `region` crate for the JIT code
   arena; `region` has no aliasing support, which is why ppmem needs a different
   crate rather than reusing that one.

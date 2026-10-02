@@ -22,7 +22,7 @@ Under tcache both checks report `got 0xDEAD0000 / want 0xBA5E0000`.
 ## Why
 
 For a transparent line the cache holds **no data of its own**. `Cache::write`
-(`src/mips_cache_v2.rs`, the `#[cfg(feature = "tcache")]` arm) sends the store
+(`src/cpu/mips_cache_v2.rs`, the `#[cfg(feature = "tcache")]` arm) sends the store
 straight into ppmem — the comment there says it outright: *"The cache stores no
 data — the write goes to RAM."* `mark_l1d_dirty` still runs, but the dirty bit
 now describes a line whose data already landed in memory.

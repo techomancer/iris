@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn test_prom_disassembly() {
-        use crate::mips_dis;
+        use crate::cpu::mips_dis;
 
         let prom = Prom::new();
         let port = prom.get_port();

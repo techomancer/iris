@@ -69,7 +69,7 @@ test prints a warning when `developer` is on. See
 
 ## Format
 
-`.pcp` is now `IRISPCP2` (`src/jitv2/pcp_dump.rs`), v1 still readable. v2
+`.pcp` is now `IRISPCP2` (`src/cpu/jitv2/pcp_dump.rs`), v1 still readable. v2
 appends one field, free at capture time: `call_count`, dispatches into the
 page, for weighting. A flat byte total counts a page dispatched two million
 times and one dispatched twice equally, which makes it a poor proxy for the

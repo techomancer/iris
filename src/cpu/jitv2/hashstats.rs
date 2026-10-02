@@ -27,7 +27,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::jitv2::{BITMAP_WORDS, ENTRIES_PER_PAGE};
+use crate::cpu::jitv2::{BITMAP_WORDS, ENTRIES_PER_PAGE};
 
 /// Bumped by `Jitv2::mega_flush`.
 pub static FLUSH_EPOCH: AtomicU64 = AtomicU64::new(0);

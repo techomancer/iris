@@ -48,7 +48,7 @@
 //! only ("is there an emitter"), not the emitter itself, and not the runtime
 //! toggle.
 
-use crate::mips_instr_stats::{classify_instr, InstrCategory, InstrKind, NUM_INSTR_KINDS};
+use crate::cpu::mips_instr_stats::{classify_instr, InstrCategory, InstrKind, NUM_INSTR_KINDS};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Per-`InstrKind` runtime enable bit, initialized `true` for every kind
@@ -237,7 +237,7 @@ pub fn has_emitter(raw: u32, mips4: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mips_isa::*;
+    use crate::cpu::mips_isa::*;
 
     fn r_type(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | funct
@@ -427,17 +427,17 @@ mod tests {
         let jr = r_type(OP_SPECIAL, 1, 0, 0, 0, FUNCT_JR);
         let j = i_type(OP_J, 0, 0, 0);
 
-        assert_ne!(crate::jitv2::analyzer::classify(beq, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
-        assert_ne!(crate::jitv2::analyzer::classify(jr, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
-        assert_ne!(crate::jitv2::analyzer::classify(j, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::cpu::jitv2::analyzer::classify(beq, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::cpu::jitv2::analyzer::classify(jr, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::cpu::jitv2::analyzer::classify(j, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
 
         set_category_enabled(InstrCategory::BRANCH, false);
-        assert_eq!(crate::jitv2::analyzer::classify(beq, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
-        assert_eq!(crate::jitv2::analyzer::classify(jr, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
-        assert_eq!(crate::jitv2::analyzer::classify(j, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_eq!(crate::cpu::jitv2::analyzer::classify(beq, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
+        assert_eq!(crate::cpu::jitv2::analyzer::classify(jr, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
+        assert_eq!(crate::cpu::jitv2::analyzer::classify(j, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
 
         set_category_enabled(InstrCategory::BRANCH, true);
-        assert_ne!(crate::jitv2::analyzer::classify(beq, 5, 0, true), crate::jitv2::analyzer::Classify::Excluded);
+        assert_ne!(crate::cpu::jitv2::analyzer::classify(beq, 5, 0, true), crate::cpu::jitv2::analyzer::Classify::Excluded);
     }
 
     #[test]

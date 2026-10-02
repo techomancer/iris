@@ -1,6 +1,6 @@
 // MIPS TLB (Translation Lookaside Buffer) interface and implementations
 
-use crate::mips_exec::CacheAttr;
+use crate::cpu::mips_exec::CacheAttr;
 use std::fmt::Write;
 use crate::snapshot::{u64_slice_to_toml, load_u64_slice};
 

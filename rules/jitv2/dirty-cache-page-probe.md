@@ -156,7 +156,7 @@ ignored the tag would veto compiles constantly
   one — entries sit in the seal queue after compiling.
 
   Verify coverage by *module*, not by grep count:
-  `awk '/^mod old_impl/{m="old"} /^mod new_impl/{m="new"} /\.publish\(/{print m" "NR}' src/jitv2/comp.rs`
+  `awk '/^mod old_impl/{m="old"} /^mod new_impl/{m="new"} /\.publish\(/{print m" "NR}' src/cpu/jitv2/comp.rs`
   and check every publish line has a probe line just above it.
 
   **This was originally wrong and is worth remembering.** Both gates first went

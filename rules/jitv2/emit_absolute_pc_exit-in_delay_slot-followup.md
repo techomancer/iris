@@ -1,6 +1,6 @@
 # Follow-up: `emit_absolute_pc_exit` should own its own `in_delay_slot=false` clear
 
-`emit_absolute_pc_exit` (src/jitv2/codegen.rs) stores `target_addr` into
+`emit_absolute_pc_exit` (src/cpu/jitv2/codegen.rs) stores `target_addr` into
 `core.pc` and returns `EXEC_COMPLETE`, but never touches
 `core.in_delay_slot`. Every one of its ~8 call sites today is safe only
 because something upstream already cleared the flag first:

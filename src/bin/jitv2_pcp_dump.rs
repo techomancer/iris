@@ -1,5 +1,5 @@
 //! Standalone offline analyzer for a `j2 dump-pcp` capture file
-//! (`src/jitv2/pcp_dump.rs`'s format): loads the dumped `PhysicalCodePage`
+//! (`src/cpu/jitv2/pcp_dump.rs`'s format): loads the dumped `PhysicalCodePage`
 //! state + raw 4KB memory, re-runs the real reachability walker over every
 //! offset that was requested/compiled/denylisted at capture time, and
 //! prints disassembly + classification for each — the offline counterpart
@@ -19,10 +19,10 @@
 //!                    the dump predates a codegen fix and you want to know
 //!                    if this exact page would compile now).
 
-use iris::jitv2::analyzer::{instrs_linear, Analyzer};
-use iris::jitv2::pcp_dump::PcpDump;
-use iris::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
-use iris::mips_dis::disassemble;
+use iris::cpu::jitv2::analyzer::{instrs_linear, Analyzer};
+use iris::cpu::jitv2::pcp_dump::PcpDump;
+use iris::cpu::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
+use iris::cpu::mips_dis::disassemble;
 
 fn print_usage_and_exit() -> ! {
     eprintln!("Usage: jitv2_pcp_dump <dump_file> [--offset <hex>] [--compile]");
@@ -213,7 +213,7 @@ fn fmt_offsets(offsets: &[u16]) -> String {
 }
 
 fn run_compile_attempt(analyzer: &mut Analyzer, fr1: bool) {
-    use iris::jitv2::codegen::Codegen;
+    use iris::cpu::jitv2::codegen::Codegen;
     // Match what the emulator would emit, not this binary's bare defaults.
     // Both are process-wide statics read at `Codegen::new()`/compile time, so
     // they must be set before the `Codegen` is built. Without this the tool

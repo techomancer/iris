@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
-use crate::mips_core::MipsCore;
+use crate::cpu::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
+use crate::cpu::mips_core::MipsCore;
 
 const IDLE_RING: usize = 32;
 const SLICE_NS: u64 = 1_000_000;
@@ -149,7 +149,7 @@ pub fn idle_park_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mips_core::{MipsCore, STATUS_IE, STATUS_IM_SHIFT};
+    use crate::cpu::mips_core::{MipsCore, STATUS_IE, STATUS_IM_SHIFT};
 
     /// A state the detector would otherwise park on: interrupts enabled, none
     /// ready, and the same architectural state seen twice.
@@ -183,7 +183,7 @@ mod tests {
 #[cfg(test)]
 mod wake_tests {
     use super::*;
-    use crate::mips_core::{MipsCore, CAUSE_IP7, STATUS_IE, STATUS_IM_SHIFT};
+    use crate::cpu::mips_core::{MipsCore, CAUSE_IP7, STATUS_IE, STATUS_IM_SHIFT};
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 

@@ -897,7 +897,7 @@ pub struct Mgras {
     screenshot_pending: AtomicBool,
     heartbeat: Arc<AtomicU64>,
     fasttick: Arc<AtomicU64>,
-    cycles: Mutex<crate::mips_core::CyclesPtr>,
+    cycles: Mutex<crate::cpu::mips_core::CyclesPtr>,
 }
 
 impl Mgras {
@@ -917,7 +917,7 @@ impl Mgras {
             screenshot_pending: AtomicBool::new(false),
             heartbeat,
             fasttick,
-            cycles: Mutex::new(crate::mips_core::CyclesPtr::dangling()),
+            cycles: Mutex::new(crate::cpu::mips_core::CyclesPtr::dangling()),
         }
     }
 
@@ -948,7 +948,7 @@ impl Mgras {
     }
 
     /// Wire up the CPU cycle counter for the status bar's MIPS figure.
-    pub fn set_cpu_cycles(&self, ptr: crate::mips_core::CyclesPtr) {
+    pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
         *self.cycles.lock() = ptr;
     }
 
@@ -1104,7 +1104,7 @@ impl crate::gfx_display::GfxDisplay for Mgras {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
     fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
-    fn cycles(&self) -> crate::mips_core::CyclesPtr { *self.cycles.lock() }
+    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { *self.cycles.lock() }
 }
 
 impl Device for Mgras {

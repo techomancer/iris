@@ -35,7 +35,7 @@ Cranelift's plain `sdiv`/`srem` lower straight to the host `idiv` instruction,
 which raises `#DE` (SIGFPE) on x86_64 for `i32::MIN / -1` — same as C's
 `INT_MIN / -1`. This is *not* guarded by Cranelift itself.
 
-MIPS `DIV`'s interpreter implementation (`exec_div`, `src/mips_exec.rs`) uses
+MIPS `DIV`'s interpreter implementation (`exec_div`, `src/cpu/mips_exec.rs`) uses
 Rust's `wrapping_div`/`wrapping_rem`, which define this case as
 `(i32::MIN, 0)` rather than panicking. A JIT emitter that naively lowers to
 `sdiv`/`srem` will SIGFPE the whole process on this input instead of matching
@@ -43,10 +43,10 @@ the interpreter.
 
 Fix: explicitly branch on `rs == i32::MIN && rt == -1` before emitting
 `sdiv`/`srem`, and materialize `(i32::MIN, 0)` directly on that path. See
-`emit_div_impl` in `src/jitv2/codegen.rs`.
+`emit_div_impl` in `src/cpu/jitv2/codegen.rs`.
 
 Caught by the jitv2-vs-interpreter equivalence harness
-(`src/jitv2/equiv_test.rs`) — `div_matches_interpreter`'s
+(`src/cpu/jitv2/equiv_test.rs`) — `div_matches_interpreter`'s
 `i32::MIN / -1` case SIGFPE'd the test binary before the fix, confirming the
 harness is doing real work rather than rubber-stamping.
 
@@ -293,7 +293,7 @@ first pass.
 
 ## Branch-in-delay-slot ("unusual but legal") panicked the JIT compiler live
 
-A real IRIX boot hit `panicked at src/jitv2/codegen.rs:1749:18: exit_reason
+A real IRIX boot hit `panicked at src/cpu/jitv2/codegen.rs:1749:18: exit_reason
 is None -> analyzer guarantees target_word continues into the region` —
 not in `jitv2_verify`, in the *live* JIT compiler thread. Root cause: a
 branch/jump whose target word coincides with a word that's *also* someone's

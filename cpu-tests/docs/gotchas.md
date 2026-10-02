@@ -85,7 +85,7 @@ The genuine holes on R4400/R5000 are primary opcodes **0x1C..0x1F**. (Later
 MIPS32 revisions claimed 0x1C and 0x1F as SPECIAL2/SPECIAL3; neither of these
 parts implements them.) The suite uses 0x1C, 0x1D and 0x1F, and deliberately
 skips **0x1E** — IRIS's own jitv2 uses that as a region-boundary sentinel
-(`src/mips_isa.rs:64`), so testing it would measure the JIT's tooling rather
+(`src/cpu/mips_isa.rs:64`), so testing it would measure the JIT's tooling rather
 than the CPU.
 
 ## An exception taken with EXL set has nowhere to return to

@@ -1,4 +1,4 @@
-//! JIT v2 trace verifier: replays a `src/trace.rs`-format execution trace
+//! JIT v2 trace verifier: replays a `src/cpu/trace.rs`-format execution trace
 //! (captured live via the `trace start <path>` monitor command in a
 //! `developer` build) offline, compiling each recorded instruction through
 //! `Codegen` and diffing the result against what the interpreter actually
@@ -14,7 +14,7 @@
 //! pre-state. No double-execution, no risk of re-firing device side effects.
 //!
 //! `MipsCore`'s FPU status hooks and `handle_exception_fn` are wired to real,
-//! standalone logic (`iris::platform::*`, `iris::mips_core::deliver_exception`
+//! standalone logic (`iris::platform::*`, `iris::cpu::mips_core::deliver_exception`
 //! — see their trampolines below) rather than left panicking or stubbed to a
 //! no-op, so instructions that raise real exceptions (integer overflow,
 //! FCSR-enabled traps, CTC1 rounding-mode changes) get verified too, not just
@@ -42,11 +42,11 @@
 
 use std::path::PathBuf;
 
-use iris::jitv2::analyzer::{classify, Analyzer, Classify};
-use iris::jitv2::codegen::Codegen;
-use iris::jitv2::{JitFn, ENTRIES_PER_PAGE};
-use iris::mips_core::MipsCore;
-use iris::trace::{CoreState, TraceReader, TraceRecord};
+use iris::cpu::jitv2::analyzer::{classify, Analyzer, Classify};
+use iris::cpu::jitv2::codegen::Codegen;
+use iris::cpu::jitv2::{JitFn, ENTRIES_PER_PAGE};
+use iris::cpu::mips_core::MipsCore;
+use iris::cpu::trace::{CoreState, TraceReader, TraceRecord};
 
 /// The ISA level this offline tool analyses at.
 ///
@@ -54,7 +54,7 @@ use iris::trace::{CoreState, TraceReader, TraceRecord};
 /// process-wide default, which the `mips4` cargo feature seeds. A trace from
 /// a MIPS IV guest should be verified with a `mips4` build.
 fn isa_mips4() -> bool {
-    iris::jitv2::isa::mips4_enabled()
+    iris::cpu::jitv2::isa::mips4_enabled()
 }
 
 /// `MipsCore`'s FPU rounding-mode hook (`fpu_set_mode_fn`) is a pure
@@ -113,7 +113,7 @@ impl VerifyCtx {
 }
 
 /// Deliver the exception's architectural effect via
-/// `iris::mips_core::deliver_exception` — the same logic
+/// `iris::cpu::mips_core::deliver_exception` — the same logic
 /// `MipsExecutor::handle_exception` uses, extracted so it's callable without
 /// a real executor (§4.2 single-implementation delivery: one implementation,
 /// both the interpreter and this tool call it). `ctx` is the `*mut MipsCore`
@@ -130,8 +130,8 @@ impl VerifyCtx {
 unsafe extern "C" fn verify_handle_exception(ctx: *mut core::ffi::c_void, status: u32) -> u32 {
     // Arg 0 is biased by compiled code; `core_from_arg` is the one place that
     // contract is undone. Never dereference a callout's `ctx` without it.
-    let core = unsafe { &mut *iris::mips_exec::core_from_arg(ctx) };
-    iris::mips_core::deliver_exception(core, status);
+    let core = unsafe { &mut *iris::cpu::mips_exec::core_from_arg(ctx) };
+    iris::cpu::mips_core::deliver_exception(core, status);
     status
 }
 
@@ -139,7 +139,7 @@ unsafe extern "C" fn verify_handle_exception(ctx: *mut core::ffi::c_void, status
 /// entirely (see module doc). Opcode-based, deliberately not routed through
 /// `lookup_semantics` (that would also match plenty of non-memory ops).
 fn touches_memory(raw: u32) -> bool {
-    use iris::mips_isa::*;
+    use iris::cpu::mips_isa::*;
     let op = (raw >> 26) & 0x3F;
     matches!(
         op,
@@ -400,7 +400,7 @@ fn run(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbose: boo
             }
         }
 
-        let fr1 = (rec.state.cp0_status & iris::mips_core::STATUS_FR) != 0;
+        let fr1 = (rec.state.cp0_status & iris::cpu::mips_core::STATUS_FR) != 0;
         let slot_raw_key = if is_branch_or_jump { Some(rec_next.raw) } else { None };
         let cache_key = (rec.raw, slot_raw_key, word, page_base, fr1);
 
@@ -483,7 +483,7 @@ fn run(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbose: boo
 /// `Excluded` and `Excluded` being unwalkable. With `j2 fallback on` an
 /// excluded word is admitted as a fallback head instead, so the poison
 /// stopped poisoning.
-const POISON_WORD: u32 = iris::mips_isa::JIT_REGION_BOUNDARY_SENTINEL;
+const POISON_WORD: u32 = iris::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL;
 
 /// Multi-instruction chain mode (`--chain N`): instead of verifying one
 /// instruction (or one branch+slot unit) per compiled region, attempt to
@@ -718,7 +718,7 @@ fn run_chain(trace_path: &std::path::Path, skip: u64, limit: Option<u64>, verbos
 
         let entry_word = ((heads[0].0.pc & 0xFFF) / 4) as u16;
         let page_base = page_base_of(heads[0].0.pc);
-        let fr1 = (heads[0].0.state.cp0_status & iris::mips_core::STATUS_FR) != 0;
+        let fr1 = (heads[0].0.state.cp0_status & iris::cpu::mips_core::STATUS_FR) != 0;
 
         // Cache key: every raw word that determines page_words' content, in
         // order (head, its slot if any, next head, ...) — two chains with
@@ -1026,8 +1026,8 @@ fn diff_state(got: &CoreState, want: &CoreState) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iris::mips_isa::{FUNCT_JR, OP_ADDIU, OP_BEQ, OP_BNE, OP_LW, OP_SPECIAL};
-    use iris::trace::TraceWriter;
+    use iris::cpu::mips_isa::{FUNCT_JR, OP_ADDIU, OP_BEQ, OP_BNE, OP_LW, OP_SPECIAL};
+    use iris::cpu::trace::TraceWriter;
 
     fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
         (op << 26) | (rs << 21) | (rt << 16) | (imm as u32)
@@ -1416,7 +1416,7 @@ mod tests {
         assert!(non_empty);
         assert_eq!(
             walked[word as usize].taken_exit,
-            Some(iris::jitv2::analyzer::StopReason::Excluded),
+            Some(iris::cpu::jitv2::analyzer::StopReason::Excluded),
             "the branch's taken arm must bail on the poisoned word, not silently walk into it"
         );
     }
@@ -1445,7 +1445,7 @@ mod tests {
         assert!(non_empty);
         assert_eq!(
             walked[word as usize].fallthrough_exit,
-            Some(iris::jitv2::analyzer::StopReason::Excluded),
+            Some(iris::cpu::jitv2::analyzer::StopReason::Excluded),
             "a Sequential tail's fallthrough must bail on the poisoned word regardless of remaining budget"
         );
     }
@@ -1526,7 +1526,7 @@ mod tests {
         // Excluded. The interpreter dispatches it for real (its own
         // architectural effect isn't this test's concern), producing
         // whatever state the *next* record after it reflects.
-        let mfc0_raw = (iris::mips_isa::OP_COP0 << 26) | (0 << 21) | (3 << 16); // rs=0 (MFC0), rt=3
+        let mfc0_raw = (iris::cpu::mips_isa::OP_COP0 << 26) | (0 << 21) | (3 << 16); // rs=0 (MFC0), rt=3
         w.push(&TraceRecord::new(pc0 + 8, mfc0_raw, s)).unwrap();
         s.gpr[3] = 0xDEAD; // whatever the real CP0 register read produced
         s.pc = pc0 + 12;

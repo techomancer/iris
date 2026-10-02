@@ -44,7 +44,7 @@ everything else runs".
 ## LL/SC are interpreter-only
 
 `analyzer.rs` classifies `OP_LL | OP_LLD | OP_SC | OP_SCD` as
-`Classify::Excluded`, and nothing in `src/jitv2/` touches `llbit` or `lladdr`
+`Classify::Excluded`, and nothing in `src/cpu/jitv2/` touches `llbit` or `lladdr`
 (both greps empty). So the semantics are identical under either engine, and the
 JIT cannot corrupt a reservation directly — it can only change *interleaving*,
 i.e. how much runs between an LL and its SC and where interrupts land.
@@ -83,7 +83,7 @@ obvious-looking conclusion was a stale-build/caching problem. It was not. The
 give-away was dumping the binary's help text and finding **two** `ll`
 registrations — one from the early return's table entry, one from the new arm.
 
-So: before adding a monitor command, `grep -n '"<name>"' src/mips_exec.rs` and
+So: before adding a monitor command, `grep -n '"<name>"' src/cpu/mips_exec.rs` and
 check for `if actual_cmd == "<name>"` as well as a match arm. The early return
 now gates on `actual_args.is_empty()` so `ll stats`/`ll clear` fall through,
 with a comment saying why.

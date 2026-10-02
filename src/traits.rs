@@ -12,7 +12,7 @@
 // The hot path in mips_exec.rs can pass write results through as ExecStatus
 // with zero conversion.
 //
-// BUS_VCE is only ever returned by MipsCache (src/mips_cache_v2.rs).
+// BUS_VCE is only ever returned by MipsCache (src/cpu/mips_cache_v2.rs).
 // BusDevice implementations must never return BUS_VCE.
 pub const BUS_OK:   u32 = 0x0000_0000;
 pub const BUS_BUSY: u32 = 0x0000_0100;
@@ -315,7 +315,7 @@ pub trait Device: Send + Sync {
 // Compile-time asserts: BUS_* constants must equal the corresponding ExecStatus values.
 // If these fail, update BOTH sets of constants to agree.
 // See also: mips_exec.rs EXEC_BUS_ERR / EXEC_BUS_VCE / EXEC_COMPLETE / EXEC_RETRY.
-const _: () = assert!(BUS_OK   == crate::mips_exec::EXEC_COMPLETE);
-const _: () = assert!(BUS_BUSY == crate::mips_exec::EXEC_RETRY);
-const _: () = assert!(BUS_ERR  == crate::mips_exec::EXEC_BUS_ERR);
-const _: () = assert!(BUS_VCE  == crate::mips_exec::EXEC_BUS_VCE);
+const _: () = assert!(BUS_OK   == crate::cpu::mips_exec::EXEC_COMPLETE);
+const _: () = assert!(BUS_BUSY == crate::cpu::mips_exec::EXEC_RETRY);
+const _: () = assert!(BUS_ERR  == crate::cpu::mips_exec::EXEC_BUS_ERR);
+const _: () = assert!(BUS_VCE  == crate::cpu::mips_exec::EXEC_BUS_VCE);

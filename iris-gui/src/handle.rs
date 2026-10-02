@@ -318,7 +318,7 @@ fn worker_loop(
     // the delta by wall-clock between ticks. Mirrors the status-bar math in
     // src/disp.rs, but driven here since the GUI never runs REX3's own
     // refresh/status-bar loop. `None` until a machine is up.
-    let mut cycles: Option<iris::mips_core::CyclesPtr> = None;
+    let mut cycles: Option<iris::cpu::mips_core::CyclesPtr> = None;
     let mut prev_cycles: u64 = 0;
     // Kernel tick-rate Hz, sampled alongside MIPS from the same shared
     // counter the CLI status bar reads (see `Machine::fasttick_count`).

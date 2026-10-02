@@ -45,7 +45,7 @@ itself): a phantom miss on an address IRIX believes is mapped can plausibly
 cascade into the kernel's own TLB-refill handler inserting a fresh entry that
 collides with the orphaned one.
 
-## Repro (see `src/mips_exec_test.rs`)
+## Repro (see `src/cpu/mips_exec_test.rs`)
 
 `test_tlbcheck_detects_vmap_left_dangling_by_overlap_repair`:
 1. TLBWI index 5: VPN2=0x100, ASID=10, valid.
@@ -74,6 +74,6 @@ Fixing needs one of:
   restore its claim (more invasive, keeps strict O(1) hot path).
 
 Left as a `tlbcheck`-covered regression (see [[project_tlbcheck]] /
-`src/mips_exec_test.rs`) rather than fixed in the same pass that added the
+`src/cpu/mips_exec_test.rs`) rather than fixed in the same pass that added the
 checker, since it's a distinct, pre-existing correctness bug the checker
 happened to surface.

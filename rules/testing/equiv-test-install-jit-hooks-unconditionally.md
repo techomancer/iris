@@ -5,7 +5,7 @@
 `full_mutex_lock_cas_call_chain_matches_interpreter`:
 
 ```
-panicked at src/mips_core.rs:1029:
+panicked at src/cpu/mips_core.rs:1029:
   jitv2: write hook called before MipsExecutor::install_jit_hooks
 ```
 

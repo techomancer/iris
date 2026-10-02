@@ -1,6 +1,6 @@
 # `$zero` was being loaded from memory, 79 times in one region
 
-Fixed 2026-09-20 (`emit_read_gpr`, src/jitv2/codegen.rs).
+Fixed 2026-09-20 (`emit_read_gpr`, src/cpu/jitv2/codegen.rs).
 
 `emit_write_gpr` has always had a `reg == 0` early return — gpr[0] reads as 0
 architecturally and is never written, so the store is skipped. **`emit_read_gpr`

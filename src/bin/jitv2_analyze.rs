@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use iris::jitv2::analyzer::{instrs_linear, Analyzer, StopReason};
-use iris::jitv2::ENTRIES_PER_PAGE;
+use iris::cpu::jitv2::analyzer::{instrs_linear, Analyzer, StopReason};
+use iris::cpu::jitv2::ENTRIES_PER_PAGE;
 
 /// Parsed from a corpus filename `pfn_<pfn:08x>_off_<offset:04x>.bin`
 /// (`jitv2/comp.rs::corpus_path`).
@@ -108,7 +108,7 @@ fn main() {
         };
 
         let entry_word = entry.offset / 4;
-        let page_base = entry.pfn.wrapping_mul(iris::jitv2::PAGE_SIZE);
+        let page_base = entry.pfn.wrapping_mul(iris::cpu::jitv2::PAGE_SIZE);
         let (result, non_empty) = analyzer.walk(&page, entry_word, page_base);
 
         stats.files_walked += 1;

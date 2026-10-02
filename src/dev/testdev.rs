@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::mips_core::MipsCore;
+use crate::cpu::mips_core::MipsCore;
 use crate::traits::{BusDevice, BusRead32, BusRead8, Device, Resettable, Saveable, BUS_OK};
 
 /// GIO64 expansion slot 0. 64 KB is decoded; registers repeat every 16 bytes.

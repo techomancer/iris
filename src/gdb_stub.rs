@@ -45,7 +45,7 @@ use gdbstub_arch::mips::reg::id::MipsRegId;
 use gdbstub_arch::mips::reg::{MipsCoreRegs, MipsCp0Regs, MipsFpuRegs};
 use gdbstub_arch::mips::MipsBreakpointKind;
 
-use crate::mips_exec::BpType;
+use crate::cpu::mips_exec::BpType;
 
 // ── Custom MIPS64 arch — 72-register g packet ────────────────────────────────
 //

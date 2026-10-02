@@ -1,7 +1,7 @@
 # CP0 Count is wallclock-derived, so Count tests flake
 
 IRIS derives CP0 Count from a host `Instant` anchor plus a calibrated
-`count_hz`, not from a guest instruction count — `src/mips_exec.rs:9686` calls
+`count_hz`, not from a guest instruction count — `src/cpu/mips_exec.rs:9686` calls
 `count_anchor_instant` a wallclock anchor and notes it is "meaningless across
 runs". Count therefore advances with **host** time, and how much of it passes
 between two guest instructions depends on host scheduling.

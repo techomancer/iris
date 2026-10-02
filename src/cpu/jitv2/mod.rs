@@ -32,11 +32,11 @@ pub use jitv2::{BatchFlushReason, RejectReason, REJECT_REASON_COUNT};
 
 #[cfg(test)]
 mod zz_corpus {
-    use crate::jitv2::analyzer::Analyzer;
-    use crate::jitv2::codegen::Codegen;
-    use crate::jitv2::JitFn;
-    use crate::jitv2::jitv2::ENTRIES_PER_PAGE;
-    use crate::jitv2::pcp_dump;
+    use crate::cpu::jitv2::analyzer::Analyzer;
+    use crate::cpu::jitv2::codegen::Codegen;
+    use crate::cpu::jitv2::JitFn;
+    use crate::cpu::jitv2::jitv2::ENTRIES_PER_PAGE;
+    use crate::cpu::jitv2::pcp_dump;
 
     /// Compile every entry point of every `.pcp` page in `IRIS_CORPUS_DIR`
     /// and report the total emitted bytes. Same input set for two builds =
@@ -84,19 +84,19 @@ mod zz_corpus {
         // deliberately: compiled code bakes its address, so it must outlive
         // every region this test compiles.
         let consts = {
-            use crate::mips_core::MipsCore;
+            use crate::cpu::mips_core::MipsCore;
             let core: &'static mut MipsCore = Box::leak(Box::new(MipsCore::new()));
             // The hook fields still hold their not-installed panic sentinels,
             // which is fine — nothing here *runs* the compiled code, and the
             // sentinels are real function addresses, so the emitted shape
             // (baked immediate vs load) is identical to production.
-            crate::jitv2::codegen::JitConsts {
+            crate::cpu::jitv2::codegen::JitConsts {
                 core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
             }
         };
         // R4400 L1-D: 16 KiB direct-mapped, 32-byte lines; 1 MiB L2 with
         // 128-byte lines. Matches `CpuCache::jit_dc_geometry` for the Indy.
-        let geom = crate::mips_cache_v2::JitDcGeometry {
+        let geom = crate::cpu::mips_cache_v2::JitDcGeometry {
             supported: true,
             line_shift: 5,
             num_lines_mask: (16 * 1024 / 32) - 1,
@@ -288,9 +288,9 @@ mod zz_corpus {
 ///   zz_corpus_runs -- --nocapture`
 #[cfg(test)]
 mod zz_runs {
-    use crate::jitv2::analyzer::{instrs_linear, Analyzer};
-    use crate::jitv2::jitv2::ENTRIES_PER_PAGE;
-    use crate::jitv2::pcp_dump;
+    use crate::cpu::jitv2::analyzer::{instrs_linear, Analyzer};
+    use crate::cpu::jitv2::jitv2::ENTRIES_PER_PAGE;
+    use crate::cpu::jitv2::pcp_dump;
 
     #[test]
     fn zz_corpus_runs() {
@@ -801,7 +801,7 @@ mod zz_offsets {
     #[test]
     fn zz_print_offsets() {
         if std::env::var("IRIS_PRINT_OFFSETS").is_err() { return; }
-        use crate::mips_core::MipsCore;
+        use crate::cpu::mips_core::MipsCore;
         println!("OFF gpr    = {:#x}", std::mem::offset_of!(MipsCore, gpr));
         println!("OFF pc     = {:#x}", std::mem::offset_of!(MipsCore, pc));
         println!("OFF hot    = {:#x}", std::mem::offset_of!(MipsCore, hot));

@@ -17,7 +17,7 @@
 // touch `DecodedInstr` (which is deliberately kept minimal — it lives in the
 // L1I cache line shadow).
 
-use crate::mips_isa::*;
+use crate::cpu::mips_isa::*;
 
 /// One variant per instruction handler in mips_exec.rs (exec_* functions),
 /// plus Reserved for undecoded/illegal encodings.
@@ -829,7 +829,7 @@ mod tests {
     /// `wait_for_interrupt`); the R4400 build idles in a plain C spin loop.
     #[test]
     fn wait_is_classified_as_wait_not_nop() {
-        use crate::mips_isa::*;
+        use crate::cpu::mips_isa::*;
         // COP0, rs=RS_TLB(0x10), funct=FUNCT_WAIT(0x20) -> 0x42000020
         let raw = (OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_WAIT;
         assert_eq!(raw, 0x4200_0020, "encoding sanity: this is the word IRIX's wait_for_interrupt_fix_loc executes");

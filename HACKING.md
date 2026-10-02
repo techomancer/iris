@@ -120,7 +120,7 @@ other bus-path access work whether or not the host window could be reserved.
 Banks 2 and 3 can be enabled (up to 512MB). PROM is fine with it; IRIX 6.5 uses
 384MB, 5.3 uses up to 512MB. Each RAM page has a jitv2 generation counter.
 
-**Cache** (`src/mips_cache_v2.rs`) — fully emulated L2 was a mistake in hindsight but
+**Cache** (`src/cpu/mips_cache_v2.rs`) — fully emulated L2 was a mistake in hindsight but
 here we are. The CPU model is the `CpuModel` trait (`MIPS4`, `PRID`, `FIR`,
 `TLB_ENTRIES`, `NAME`) implemented by each cache model; `MipsExecutor` is
 monomorphised over it, so both CPUs are in every binary with no per-model branch
@@ -140,7 +140,7 @@ on the hot path, and `Machine::new` picks one from `[machine] cpu`.
   misaligned-fetch behaviour of the reserved modes
   (`rules/irix/cache-attributes-and-fetch-alignment.md`).
 
-**Address translation** (`src/mips_tlb.rs`, `mips_core.rs`) — layered fast paths in
+**Address translation** (`src/cpu/mips_tlb.rs`, `mips_core.rs`) — layered fast paths in
 front of the JTLB: a one-entry fetch `nanotlb`, the direct-mapped data-side
 `nutlb` (`docs/nutlb-design.md`, always on), and an 8KB-granularity `vmap` that
 points VPNs straight at TLB entries (always on; the `tlbvmap` feature name is
@@ -273,7 +273,7 @@ address translation (TLB + segment mapping), alignment checking, and cache simul
 
 The only MIPS JIT. The original speculative, tiered JIT (with its rollback path
 and `IRIS_JIT*` env vars) was removed in August 2026 (commit `33c4e68`). v2
-(`src/jitv2/`) compiles physical 4KB pages via Cranelift with memory-resident
+(`src/cpu/jitv2/`) compiles physical 4KB pages via Cranelift with memory-resident
 registers and no speculation — compiled code is unconditionally correct at
 publish time or not published at all. Full design rationale, the
 analyzer/codegen block-emission model, and the delay-slot/exception

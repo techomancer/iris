@@ -79,7 +79,7 @@ pub struct CoreState {
 }
 
 impl CoreState {
-    pub fn capture(core: &crate::mips_core::MipsCore) -> Self {
+    pub fn capture(core: &crate::cpu::mips_core::MipsCore) -> Self {
         Self {
             gpr: core.gpr, pc: core.pc, hi: core.hi, lo: core.lo,
             cp0_epc: core.cp0_epc, cp0_badvaddr: core.cp0_badvaddr,
@@ -92,7 +92,7 @@ impl CoreState {
 }
 
 impl TraceRecord {
-    pub fn capture(pc: u64, raw: u32, core: &crate::mips_core::MipsCore) -> Self {
+    pub fn capture(pc: u64, raw: u32, core: &crate::cpu::mips_core::MipsCore) -> Self {
         Self { pc, raw, _pad: 0, state: CoreState::capture(core) }
     }
 

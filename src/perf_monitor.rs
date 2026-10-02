@@ -14,7 +14,7 @@ pub struct PerfMonitor {
     /// `CyclesPtr`/`Hot::cycles`'s doc comments. Obtained from
     /// `MipsCpu::cycles_ptr()`, which has the same "stable from construction
     /// onward" guarantee `interrupts_ptr` does.
-    cycles: crate::mips_core::CyclesPtr,
+    cycles: crate::cpu::mips_core::CyclesPtr,
     fasttick: Arc<AtomicU64>,
     rex3: Option<Arc<Rex3>>,
     hal2: Option<Arc<Hal2>>,
@@ -23,7 +23,7 @@ pub struct PerfMonitor {
 impl PerfMonitor {
     pub fn new(
         cpu_running: Arc<AtomicBool>,
-        cycles: crate::mips_core::CyclesPtr,
+        cycles: crate::cpu::mips_core::CyclesPtr,
         fasttick: Arc<AtomicU64>,
         rex3: Option<Arc<Rex3>>,
         hal2: Option<Arc<Hal2>>,

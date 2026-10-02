@@ -118,7 +118,7 @@ self-contained.
 ---
 
 > You are continuing a performance investigation into `jitv2`, the Cranelift
-> region compiler in this repo (`src/jitv2/`). Read `docs/jitv2_performance_analysis.md`
+> region compiler in this repo (`src/cpu/jitv2/`). Read `docs/jitv2_performance_analysis.md`
 > (this file) and `rules/jitv2/jit-v2-design.md` first — especially §3.2
 > (interrupt sampling contract and its coarsening roadmap), §3.3 (exit stubs and
 > the memory-helper ABI), §4.4 (excluded instructions) and §5 (memory-resident
@@ -134,7 +134,7 @@ self-contained.
 > **Your job**, in this order:
 >
 > **Step 0 — instrument (R0).** There is no way today to tell "compiled but
-> slow" from "never compiled": `j2 stats` (`src/mips_exec.rs:10459`) reports
+> slow" from "never compiled": `j2 stats` (`src/cpu/mips_exec.rs:10459`) reports
 > pages, functions compiled, arena bytes and mega-flushes, but no coverage.
 > Add a counter of retired instructions executed inside compiled code — the
 > natural place is alongside `emit_increment_cycles` (`codegen.rs:2387`),
@@ -212,7 +212,7 @@ self-contained.
 >   (`fpu/cvt_s_d_rounds`, `fpu/cvt_out_of_range`); anything else is new. This
 >   matters most for step 2 — the FP flag model is exactly what those tests
 >   cover.
-> - `cargo test --release` — 387 lib tests, plus `src/jitv2/equiv_test.rs`, which
+> - `cargo test --release` — 387 lib tests, plus `src/cpu/jitv2/equiv_test.rs`, which
 >   is the JIT-vs-interpreter differential net.
 >
 > **Reporting.** Every claim should come with a number from `iris-bench`, not an

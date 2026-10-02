@@ -8,7 +8,7 @@ for that purpose".
 `src/machine.rs:752` dispatches `build_cpu!(R4400Cache)` / `build_cpu!(R5000Cache)`
 from `cfg.machine.cpu`, and MIPS IV availability rides along with it — `C::MIPS4`
 is an associated const on that type parameter (`R4400Cache::MIPS4 == false`,
-`R5000Cache::MIPS4 == true`, asserted in `src/mips_exec_test.rs:212`). So
+`R5000Cache::MIPS4 == true`, asserted in `src/cpu/mips_exec_test.rs:212`). So
 `--cpu r5000` really does get MIPS IV, and `--cpu r4400` really does raise
 Reserved Instruction on it. No rebuild, no feature flag.
 

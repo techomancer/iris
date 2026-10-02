@@ -25,7 +25,7 @@
 //! it exits. Self-modifying code through `sc` on its own page is not something
 //! any guest here does.
 
-use crate::mips_isa::*;
+use crate::cpu::mips_isa::*;
 
 /// Whether this word is an `ll`/`lld`/`sc`/`scd` that may stay in a region as
 /// an interpreter-fallback head. Honours the per-instruction enable table, so
@@ -36,13 +36,13 @@ pub fn stays_in_region(raw: u32) -> bool {
     if !matches!(op, OP_LL | OP_LLD | OP_SC | OP_SCD) {
         return false;
     }
-    let kind = crate::mips_instr_stats::classify_instr(
+    let kind = crate::cpu::mips_instr_stats::classify_instr(
         op as u8,
         ((raw >> 21) & 0x1F) as u8,
         ((raw >> 16) & 0x1F) as u8,
         (raw & 0x3F) as u8,
     );
-    crate::jitv2::opcode_support::instr_enabled(kind)
+    crate::cpu::jitv2::opcode_support::instr_enabled(kind)
 }
 
 #[cfg(test)]

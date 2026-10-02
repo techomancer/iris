@@ -1,6 +1,6 @@
 // MIPS Disassembler
 
-use crate::mips_isa::*;
+use crate::cpu::mips_isa::*;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead};

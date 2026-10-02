@@ -32,7 +32,7 @@ entry, reached a second time in the boot at a different point).
 
 ## Mechanism, confirmed via `debug_cache` feature live trace
 
-`DEBUG_TRACK_ADDR` in `src/mips_cache_v2.rs` was set to `0x080165d4` to get
+`DEBUG_TRACK_ADDR` in `src/cpu/mips_cache_v2.rs` was set to `0x080165d4` to get
 per-line tracked debug prints (see the (also fixed this session) hex-format
 cleanup of these prints — was decimal `idx={}`/`l1_idx={}`, now `0x{:x}`).
 

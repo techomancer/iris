@@ -8,7 +8,7 @@
 
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
-use crate::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT};
+use crate::cpu::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_MISS, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -57,7 +57,7 @@ enum CacheKind { Insn = 0, Data = 1, L2 = 2 }
 // monomorphisation, so every index/mask below still folds to a literal.
 
 // Re-export cache operation constants for convenience
-pub use crate::mips_isa::{
+pub use crate::cpu::mips_isa::{
     CACH_PI, CACH_PD, CACH_SI, CACH_SD,
     C_IINV, C_IWBINV, C_ILT, C_IST, C_CDX,
     C_HINV, C_HWBINV, C_FILL, C_HWB, C_HSV,

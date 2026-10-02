@@ -6,7 +6,7 @@
 ```
 you have to fill your block before switching
   cranelift-frontend/src/frontend.rs:379
-  Codegen::compile_region_uncommitted   src/jitv2/codegen.rs
+  Codegen::compile_region_uncommitted   src/cpu/jitv2/codegen.rs
 ```
 
 Under `--features jitv2,jitv2_lockstep` this was 244 failing tests, 246 of them this one

@@ -1406,7 +1406,7 @@ pub struct Rex3 {
     /// enough — no atomicity needed for the pointer variable itself.
     /// `CyclesPtr::dangling()` until `set_cpu_cycles` runs; its own `get()`
     /// treats that as "not wired up yet" and reports 0.
-    pub cycles: std::cell::Cell<crate::mips_core::CyclesPtr>,
+    pub cycles: std::cell::Cell<crate::cpu::mips_core::CyclesPtr>,
     /// CP0 Count==Compare match counter — incremented every fastick interrupt.
     pub fasttick_count: Arc<AtomicU64>,
     pub decoded_count: Arc<AtomicU64>,
@@ -1562,7 +1562,7 @@ impl Rex3 {
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
             heartbeat,
-            cycles: std::cell::Cell::new(crate::mips_core::CyclesPtr::dangling()),
+            cycles: std::cell::Cell::new(crate::cpu::mips_core::CyclesPtr::dangling()),
             fasttick_count,
             decoded_count,
             l1i_hit_count,
@@ -1577,7 +1577,7 @@ impl Rex3 {
             screenshot_pending: AtomicBool::new(false),
             screenshot_counter: AtomicU32::new(0),
             #[cfg(feature = "developer")]
-            count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::mips_core::DEFAULT_COUNT_HZ))),
+            count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::cpu::mips_core::DEFAULT_COUNT_HZ))),
         }
     }
 
@@ -1691,7 +1691,7 @@ impl Rex3 {
     /// `MipsCpu` exists (`Rex3::new` runs before it does, so this can't be a
     /// constructor parameter; see `Hot::cycles`'s doc comment for why it's a
     /// raw pointer at all, not a shared `Arc<AtomicU64>`).
-    pub fn set_cpu_cycles(&self, ptr: crate::mips_core::CyclesPtr) {
+    pub fn set_cpu_cycles(&self, ptr: crate::cpu::mips_core::CyclesPtr) {
         self.cycles.set(ptr);
     }
 
@@ -4506,7 +4506,7 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn renderer_slot(&self) -> &Mutex<Option<Box<dyn Renderer>>> { &self.renderer }
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
-    fn cycles(&self) -> crate::mips_core::CyclesPtr { self.cycles.get() }
+    fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.cycles.get() }
 }
 
 impl Resettable for Rex3 {

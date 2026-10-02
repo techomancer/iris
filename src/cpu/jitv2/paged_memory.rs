@@ -258,14 +258,14 @@ fn set_readable_and_executable(ptr: *mut u8, len: usize, branch_protection: Bran
 /// still pending — see `SharedArena::finalize`'s own doc comment).
 #[derive(Clone, Copy, Debug)]
 pub struct PublishInfo {
-    pub page: *mut crate::jitv2::PhysicalCodePage,
+    pub page: *mut crate::cpu::jitv2::PhysicalCodePage,
     /// Single entry-point offset — the default (`not(feature = "j2wp")`)
     /// path's one-function-per-entry-point model, consumed by
     /// `PhysicalCodePage::publish(offset_word, ...)`. Unused (left `0`) by
     /// the `j2wp` path, which uses `new_entries` instead.
     /// Every entry offset this compile covers. Consumed by
     /// `PhysicalCodePage::publish(new_entries, ...)`.
-    pub new_entries: [u64; crate::jitv2::BITMAP_WORDS],
+    pub new_entries: [u64; crate::cpu::jitv2::BITMAP_WORDS],
     pub gen_snap: u64,
     pub instr_count: usize,
     pub code_size: u32,
@@ -277,7 +277,7 @@ pub struct PublishInfo {
     /// `Codegen` (a test driving the `JITMemoryProvider` trait directly,
     /// with no publish info to give — see this call site's own comment).
     /// Every real caller always sets this.
-    pub jit_fn: Option<crate::jitv2::JitFn>,
+    pub jit_fn: Option<crate::cpu::jitv2::JitFn>,
 }
 
 unsafe impl Send for PublishInfo {}
@@ -290,7 +290,7 @@ impl PublishInfo {
     pub(crate) fn blank() -> Self {
         Self {
             page: std::ptr::null_mut(),
-            new_entries: [0u64; crate::jitv2::BITMAP_WORDS],
+            new_entries: [0u64; crate::cpu::jitv2::BITMAP_WORDS],
             gen_snap: 0,
             instr_count: 0,
             code_size: 0,
@@ -327,7 +327,7 @@ struct SealEntry {
     /// (which stays null on a bare placeholder). Always non-null: every real
     /// `push_placeholder` caller (`Codegen::compile_region_uncommitted`)
     /// has a real page by construction.
-    page: *mut crate::jitv2::PhysicalCodePage,
+    page: *mut crate::cpu::jitv2::PhysicalCodePage,
     publish: PublishInfo,
 }
 
@@ -357,7 +357,7 @@ pub struct SealQueueSnapshot {
     /// opaque identity/debug value only, never dereferencing it without the
     /// same care any other `*mut PhysicalCodePage` needs (the pool could
     /// have reset this exact slot since the entry was pushed).
-    pub front_page: Option<*mut crate::jitv2::PhysicalCodePage>,
+    pub front_page: Option<*mut crate::cpu::jitv2::PhysicalCodePage>,
     /// Index (0-based, from the front) of the entry where the contiguity
     /// scan actually stops — `None` only when the queue is empty. This is
     /// almost always the entry worth investigating, NOT the front: a queue
@@ -378,7 +378,7 @@ pub struct SealQueueSnapshot {
     /// different bug worth chasing).
     pub first_gap_is_unpatched_placeholder: Option<bool>,
     pub first_gap_thread_id: Option<std::thread::ThreadId>,
-    pub first_gap_page: Option<*mut crate::jitv2::PhysicalCodePage>,
+    pub first_gap_page: Option<*mut crate::cpu::jitv2::PhysicalCodePage>,
 }
 
 unsafe impl Send for SealQueueSnapshot {}
@@ -574,7 +574,7 @@ impl SharedArena {
     /// `(start, end, is_unpatched_placeholder, thread_id, page)` — `j2
     /// seal-queue`'s only caller. Not bounded/paginated: the caller is
     /// expected to cap how much it prints.
-    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)> {
+    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::cpu::jitv2::PhysicalCodePage)> {
         self.seal_queue.iter()
             .map(|e| (e.start, e.end, e.publish.jit_fn.is_none(), e.thread_id, e.page))
             .collect()
@@ -1032,7 +1032,7 @@ impl PagedArenaMemoryProvider {
     /// position only ever advances between its own calls), but the queue as
     /// a whole, across every worker sharing this arena, is not strictly
     /// append-only.
-    pub fn push_placeholder(&mut self, start: usize, end: usize, page: *mut crate::jitv2::PhysicalCodePage) {
+    pub fn push_placeholder(&mut self, start: usize, end: usize, page: *mut crate::cpu::jitv2::PhysicalCodePage) {
         let mut inner = self.inner.lock();
         let idx = inner.seal_queue.iter().rposition(|e| e.start <= start).map_or(0, |i| i + 1);
         let thread_id = std::thread::current().id();
@@ -1105,7 +1105,7 @@ impl PagedArenaMemoryProvider {
     }
 
     /// See `SharedArena::seal_queue_entries`'s own doc comment.
-    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::jitv2::PhysicalCodePage)> {
+    pub fn seal_queue_entries(&self) -> Vec<(usize, usize, bool, std::thread::ThreadId, *mut crate::cpu::jitv2::PhysicalCodePage)> {
         self.inner.lock().seal_queue_entries()
     }
 
@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     fn resolved_publish() -> PublishInfo {
-        PublishInfo { jit_fn: Some(unsafe { std::mem::transmute::<usize, crate::jitv2::JitFn>(1) }), ..dummy_publish() }
+        PublishInfo { jit_fn: Some(unsafe { std::mem::transmute::<usize, crate::cpu::jitv2::JitFn>(1) }), ..dummy_publish() }
     }
 
     #[test]

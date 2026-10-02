@@ -18,9 +18,9 @@
 
 use std::sync::Arc;
 
-use crate::jitv2::analyzer::Analyzer;
-use crate::jitv2::codegen::Codegen;
-use crate::jitv2::{CompileRequest, ENTRIES_PER_PAGE, PAGE_SIZE};
+use crate::cpu::jitv2::analyzer::Analyzer;
+use crate::cpu::jitv2::codegen::Codegen;
+use crate::cpu::jitv2::{CompileRequest, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::traits::BusDevice;
 
 /// Instruction budget for a compile-from-arrival region (see module doc):
@@ -143,10 +143,10 @@ struct CompileInputs {
     words: [u32; ENTRIES_PER_PAGE],
     /// One bit per word the walk decoded, delay slots included — the only
     /// words whose value could change what a recompile would emit.
-    used: [u64; crate::jitv2::BITMAP_WORDS],
+    used: [u64; crate::cpu::jitv2::BITMAP_WORDS],
     /// Content hash of `words`, when the persistent cache is in play for
     /// this compile (`prepare_multi_entry_compile`'s `cache_fp`).
-    page_hash: Option<crate::jitv2::pcache::PageHash>,
+    page_hash: Option<crate::cpu::jitv2::pcache::PageHash>,
 }
 
 /// §13.3 steps 1-5, shared front half of `handle_request`/
@@ -162,8 +162,8 @@ fn prepare_multi_entry_compile(
     req: &CompileRequest,
     bus: &Arc<dyn BusDevice>,
     analyzer: &mut Analyzer,
-    cache_fp: Option<&crate::jitv2::pcache::Fingerprint>,
-    #[cfg(feature = "developer")] stats: &crate::jitv2::JitStats,
+    cache_fp: Option<&crate::cpu::jitv2::pcache::Fingerprint>,
+    #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
     let phys_base = page.pfn * PAGE_SIZE;
@@ -273,7 +273,7 @@ fn prepare_multi_entry_compile(
     // the exact bit algebra and the `include_compiled` gen guard).
     let candidate_bits = page.snapshot_compile_candidates(same_gen);
     let mut candidates: Vec<u16> = Vec::new();
-    for word_idx in 0..crate::jitv2::BITMAP_WORDS {
+    for word_idx in 0..crate::cpu::jitv2::BITMAP_WORDS {
         let bits = candidate_bits[word_idx];
         if bits == 0 { continue; }
         for bit in 0..64 {
@@ -327,12 +327,12 @@ fn prepare_multi_entry_compile(
     // it subsumes, so a page's stored code converges on every entry it has
     // ever needed instead of accumulating near-duplicates. Denied offsets
     // stay out, exactly as for `candidate_bits`.
-    let page_hash = cache_fp.map(|_| crate::jitv2::pcache::page_hash(&words));
+    let page_hash = cache_fp.map(|_| crate::cpu::jitv2::pcache::page_hash(&words));
     if let (Some(fp), Some(ph)) = (cache_fp, &page_hash) {
-        let known = crate::jitv2::pcache::known_entries(fp, ph, req.compiled_for_fr1);
+        let known = crate::cpu::jitv2::pcache::known_entries(fp, ph, req.compiled_for_fr1);
         let denied = page.snapshot_denied_raw();
         let mut added = 0u32;
-        for i in 0..crate::jitv2::BITMAP_WORDS {
+        for i in 0..crate::cpu::jitv2::BITMAP_WORDS {
             let extra = known[i] & denied[i] & !candidate_bits[i];
             if extra == 0 { continue; }
             added += extra.count_ones();
@@ -344,7 +344,7 @@ fn prepare_multi_entry_compile(
         }
         if added > 0 {
             candidates.sort_unstable();
-            crate::jitv2::pcache::note_union_added(added);
+            crate::cpu::jitv2::pcache::note_union_added(added);
         }
     }
 
@@ -358,11 +358,11 @@ fn prepare_multi_entry_compile(
     // the page — data, padding, code the walk never reached — is provably
     // irrelevant to this compile's output, which is what lets the
     // churn-avoidance check ignore writes to it.
-    let mut used = [0u64; crate::jitv2::BITMAP_WORDS];
+    let mut used = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
     let instr_count = {
         let instrs = analyzer.walk_multi_entry(&words, &candidates, phys_base, max_instrs_per_compile());
         let mut n = 0usize;
-        for instr in crate::jitv2::analyzer::instrs_linear(instrs) {
+        for instr in crate::cpu::jitv2::analyzer::instrs_linear(instrs) {
             let w = instr.word as usize;
             used[w >> 6] |= 1u64 << (w & 63);
             n += 1;
@@ -390,7 +390,7 @@ fn prepare_multi_entry_compile(
             page.kill_denylisted(offset as usize);
             page.mark_analyze_rejected();
             #[cfg(feature = "developer")]
-            stats.record_reject(crate::jitv2::RejectReason::EntryExcluded);
+            stats.record_reject(crate::cpu::jitv2::RejectReason::EntryExcluded);
         }
     }
     if analyzer.covered().is_empty() {
@@ -411,7 +411,7 @@ fn prepare_multi_entry_compile(
         }
         page.mark_analyze_rejected();
         #[cfg(feature = "developer")]
-        stats.record_reject(crate::jitv2::RejectReason::TooShort);
+        stats.record_reject(crate::cpu::jitv2::RejectReason::TooShort);
         return PrepareOutcome::Done(false);
     }
 
@@ -439,12 +439,12 @@ fn prepare_multi_entry_compile(
         used[i] |= !*w; // `denied` is inverted: 0 = denied, so complement it
     }
 
-    if crate::jitv2::hashstats::enabled() {
-        let mut entries = [0u64; crate::jitv2::BITMAP_WORDS];
+    if crate::cpu::jitv2::hashstats::enabled() {
+        let mut entries = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
         for &o in analyzer.covered() {
             entries[o as usize >> 6] |= 1u64 << (o % 64);
         }
-        crate::jitv2::hashstats::record(page.pfn, &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
+        crate::cpu::jitv2::hashstats::record(page.pfn, &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
             page.last_skip_reject.load(std::sync::atomic::Ordering::Relaxed));
     }
 
@@ -469,7 +469,7 @@ pub fn handle_request(
     bus: &Arc<dyn BusDevice>,
     analyzer: &mut Analyzer,
     codegen: &mut Codegen,
-    #[cfg(feature = "developer")] stats: &crate::jitv2::JitStats,
+    #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> bool {
     let page = unsafe { &*req.page };
 
@@ -483,7 +483,7 @@ pub fn handle_request(
     // (re-)requested again — a scope guard rather than clearing at each of
     // the several return points below so a future added early-return can't
     // forget it.
-    struct ClearScheduledOnDrop<'a> { page: &'a crate::jitv2::PhysicalCodePage }
+    struct ClearScheduledOnDrop<'a> { page: &'a crate::cpu::jitv2::PhysicalCodePage }
     impl Drop for ClearScheduledOnDrop<'_> {
         fn drop(&mut self) { self.page.clear_scheduled(); }
     }
@@ -519,7 +519,7 @@ pub fn handle_request(
             // Hardcoding 0 here made the histogram print empty in exactly the
             // build worth measuring.
             let code_size = codegen.last_code_size();
-            let mut new_entries = [0u64; crate::jitv2::BITMAP_WORDS];
+            let mut new_entries = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
             for &offset in analyzer.covered() {
                 new_entries[offset as usize >> 6] |= 1u64 << (offset % 64);
             }
@@ -551,7 +551,7 @@ pub fn handle_request(
             #[cfg(feature = "developer")]
             {
                 let mut fb = 0u64;
-                for instr in crate::jitv2::analyzer::instrs_linear(&instrs_owned) {
+                for instr in crate::cpu::jitv2::analyzer::instrs_linear(&instrs_owned) {
                     if instr.is_fallback { fb += 1; }
                 }
                 if fb > 0 {
@@ -590,9 +590,9 @@ pub fn handle_request(
             #[cfg(feature = "developer")]
             {
                 let reason = if codegen.last_decline_was_verifier_error() {
-                    crate::jitv2::RejectReason::CraneliftVerifierError
+                    crate::cpu::jitv2::RejectReason::CraneliftVerifierError
                 } else {
-                    crate::jitv2::RejectReason::AnalyzerCodegenDisagreement
+                    crate::cpu::jitv2::RejectReason::AnalyzerCodegenDisagreement
                 };
                 stats.record_reject(reason);
             }
@@ -662,11 +662,11 @@ pub fn handle_request_deferred(
     analyzer: &mut Analyzer,
     codegen: &mut Codegen,
     pending: &mut PendingCount,
-    #[cfg(feature = "developer")] stats: &crate::jitv2::JitStats,
+    #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> bool {
     let page = unsafe { &*req.page };
 
-    struct ClearScheduledOnDrop<'a> { page: &'a crate::jitv2::PhysicalCodePage }
+    struct ClearScheduledOnDrop<'a> { page: &'a crate::cpu::jitv2::PhysicalCodePage }
     impl Drop for ClearScheduledOnDrop<'_> {
         fn drop(&mut self) { self.page.clear_scheduled(); }
     }
@@ -675,7 +675,7 @@ pub fn handle_request_deferred(
     // Persistent cache: only for a `Codegen` whose output can be stored
     // (see `Codegen::cache_fingerprint`). `true` matches the
     // `skip_entry_preamble` this path compiles with below.
-    let cache_fp = if crate::jitv2::pcache::enabled() { codegen.cache_fingerprint(true) } else { None };
+    let cache_fp = if crate::cpu::jitv2::pcache::enabled() { codegen.cache_fingerprint(true) } else { None };
     #[cfg(feature = "developer")]
     let outcome = prepare_multi_entry_compile(req, bus, analyzer, cache_fp.as_ref(), stats);
     #[cfg(not(feature = "developer"))]
@@ -685,7 +685,7 @@ pub fn handle_request_deferred(
         PrepareOutcome::Ready { gen_snap, instr_count, snapshot } => (gen_snap, instr_count, snapshot),
     };
 
-    let mut new_entries = [0u64; crate::jitv2::BITMAP_WORDS];
+    let mut new_entries = [0u64; crate::cpu::jitv2::BITMAP_WORDS];
     for &offset in analyzer.covered() {
         new_entries[offset as usize >> 6] |= 1u64 << (offset % 64);
     }
@@ -693,7 +693,7 @@ pub fn handle_request_deferred(
     let mut instrs_owned = analyzer.instrs_snapshot();
     let cache_key = cache_fp.zip(inputs.page_hash);
     let cached = cache_key.as_ref().and_then(|(fp, ph)| {
-        crate::jitv2::pcache::lookup(fp, ph, req.compiled_for_fr1, &inputs.words, &new_entries)
+        crate::cpu::jitv2::pcache::lookup(fp, ph, req.compiled_for_fr1, &inputs.words, &new_entries)
     });
     let mut func_id = None;
     let mut loaded = false;
@@ -708,13 +708,13 @@ pub fn handle_request_deferred(
         func_id = codegen.load_region_uncommitted(&blob.code, blob.align, req.page);
         if func_id.is_some() {
             let denied = page.snapshot_denied_raw(); // inverted: 1 = allowed
-            for i in 0..crate::jitv2::BITMAP_WORDS {
+            for i in 0..crate::cpu::jitv2::BITMAP_WORDS {
                 new_entries[i] = blob.entries[i] & denied[i];
                 inputs.used[i] |= blob.used[i];
             }
             instr_count = blob.instr_count as usize;
             loaded = true;
-            crate::jitv2::pcache::note_load_time(t_load.elapsed());
+            crate::cpu::jitv2::pcache::note_load_time(t_load.elapsed());
         } else {
             // Out of arena: the OOM arm below flushes, as for a compile.
             load_oom = codegen.last_compile_ran_out_of_memory();
@@ -723,10 +723,10 @@ pub fn handle_request_deferred(
     if !loaded && !load_oom {
         let t_compile = std::time::Instant::now();
         func_id = codegen.compile_region_uncommitted(&mut instrs_owned, req.compiled_for_fr1, true, analyzer.has_fpu(), req.page);
-        crate::jitv2::hashstats::note_compile_time(t_compile.elapsed());
+        crate::cpu::jitv2::hashstats::note_compile_time(t_compile.elapsed());
         if let (Some(_), Some((fp, ph))) = (func_id, cache_key) {
             match codegen.take_last_blob() {
-                Some((code, align)) => crate::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::jitv2::pcache::Blob {
+                Some((code, align)) => crate::cpu::jitv2::pcache::store(fp, ph, req.compiled_for_fr1, crate::cpu::jitv2::pcache::Blob {
                     entries: new_entries,
                     used: inputs.used,
                     instr_count: instr_count as u32,
@@ -734,7 +734,7 @@ pub fn handle_request_deferred(
                     words: Box::new(inputs.words),
                     code,
                 }),
-                None => crate::jitv2::pcache::note_refused(),
+                None => crate::cpu::jitv2::pcache::note_refused(),
             }
         }
     }
@@ -774,7 +774,7 @@ pub fn handle_request_deferred(
             // which case this entry will never resolve no matter how many
             // sweeps run — see `Codegen::last_finalize_failed`'s own doc
             // comment for the real bug this distinction fixes.
-            let publish = crate::jitv2::paged_memory::PublishInfo {
+            let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
                 page: req.page, new_entries, gen_snap, instr_count, code_size,
                 compiled_for_fr1: req.compiled_for_fr1,
                 jit_fn: None,
@@ -798,7 +798,7 @@ pub fn handle_request_deferred(
                 // these process-wide counters regardless of which path
                 // compiled.
                 let mut fb = 0u64;
-                for instr in crate::jitv2::analyzer::instrs_linear(&instrs_owned) {
+                for instr in crate::cpu::jitv2::analyzer::instrs_linear(&instrs_owned) {
                     if instr.is_fallback { fb += 1; }
                 }
                 if fb > 0 {
@@ -822,9 +822,9 @@ pub fn handle_request_deferred(
             #[cfg(feature = "developer")]
             {
                 let reason = if codegen.last_decline_was_verifier_error() {
-                    crate::jitv2::RejectReason::CraneliftVerifierError
+                    crate::cpu::jitv2::RejectReason::CraneliftVerifierError
                 } else {
-                    crate::jitv2::RejectReason::AnalyzerCodegenDisagreement
+                    crate::cpu::jitv2::RejectReason::AnalyzerCodegenDisagreement
                 };
                 stats.record_reject(reason);
             }
@@ -841,7 +841,7 @@ pub fn handle_request_deferred(
 /// entries pushed by a *different* worker than the one that triggered this
 /// particular sweep — that's fine and expected (see this function's own
 /// callers' doc comments).
-fn publish_all(sealed: &[crate::jitv2::paged_memory::PublishInfo]) {
+fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) {
     for entry in sealed {
         let page = unsafe { &*entry.page };
         let jit_fn = entry.jit_fn.expect("publish_all: a sealed entry must always carry a resolved JitFn");
@@ -896,8 +896,8 @@ pub fn force_publish_pending(codegen: &mut Codegen, pending: &mut PendingCount) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jitv2::PhysicalCodePage;
-    use crate::mips_isa::{OP_ADDIU, OP_SPECIAL};
+    use crate::cpu::jitv2::PhysicalCodePage;
+    use crate::cpu::mips_isa::{OP_ADDIU, OP_SPECIAL};
     use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_ERR};
     use std::sync::atomic::AtomicU64;
 
@@ -910,7 +910,7 @@ mod tests {
     fn handle_request_for_test(req: &CompileRequest, bus: &Arc<dyn BusDevice>, analyzer: &mut Analyzer, codegen: &mut Codegen) -> bool {
         #[cfg(feature = "developer")]
         {
-            let stats = crate::jitv2::JitStats::default();
+            let stats = crate::cpu::jitv2::JitStats::default();
             handle_request(req, bus, analyzer, codegen, &stats)
         }
         #[cfg(not(feature = "developer"))]
@@ -952,7 +952,7 @@ mod tests {
         fn read16(&self, _addr: u32) -> BusRead16 { BusRead16::err() }
         fn write16(&self, _addr: u32, _val: u16) -> u32 { BUS_ERR }
         fn read32(&self, _addr: u32) -> BusRead32 {
-            BusRead32::ok(crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
+            BusRead32::ok(crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL)
         }
         fn write32(&self, _addr: u32, _val: u32) -> u32 { BUS_ERR }
         fn read64(&self, _addr: u32) -> BusRead64 { BusRead64::err() }
@@ -1133,7 +1133,7 @@ mod tests {
     fn handle_request_deferred_for_test(req: &CompileRequest, bus: &Arc<dyn BusDevice>, analyzer: &mut Analyzer, codegen: &mut Codegen, pending: &mut PendingCount) -> bool {
         #[cfg(feature = "developer")]
         {
-            let stats = crate::jitv2::JitStats::default();
+            let stats = crate::cpu::jitv2::JitStats::default();
             handle_request_deferred(req, bus, analyzer, codegen, pending, &stats)
         }
         #[cfg(not(feature = "developer"))]

@@ -15,18 +15,18 @@
 
 #[cfg(all(test, feature = "jitv2"))]
 mod tests {
-    use crate::jitv2::analyzer::Analyzer;
-    use crate::jitv2::codegen::Codegen;
-    use crate::jitv2::{JitFn, ENTRIES_PER_PAGE, PAGE_SIZE};
-    use crate::mips_core::MipsCore;
-    use crate::mips_exec::{MipsCpuConfig, MipsExecutor};
-    use crate::mips_tlb::PassthroughTlb;
+    use crate::cpu::jitv2::analyzer::Analyzer;
+    use crate::cpu::jitv2::codegen::Codegen;
+    use crate::cpu::jitv2::{JitFn, ENTRIES_PER_PAGE, PAGE_SIZE};
+    use crate::cpu::mips_core::MipsCore;
+    use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
+    use crate::cpu::mips_tlb::PassthroughTlb;
     // The reference interpreter must sit at the same ISA level as the JIT, or
     // every MIPS IV opcode the JIT happily compiles (MOVN/MOVZ/MOVCI/PREF/
     // MOVCF) is rejected by the interpreter with EXC_RI and every such
     // equivalence test "diverges" for a reason that has nothing to do with the
     // JIT.
-    use crate::mips_cache_v2::PassthroughCacheM4 as PassthroughCache;
+    use crate::cpu::mips_cache_v2::PassthroughCacheM4 as PassthroughCache;
     use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BUS_BUSY};
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
@@ -592,10 +592,10 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_1000u64;
         // Three ADDIUs then a JR to exit the region cleanly.
         let code = [
-            (pc + 0x00, make_i(crate::mips_isa::OP_ADDIU, 0, 1, 1)),
-            (pc + 0x04, make_i(crate::mips_isa::OP_ADDIU, 0, 2, 2)),
-            (pc + 0x08, make_i(crate::mips_isa::OP_ADDIU, 0, 3, 3)),
-            (pc + 0x0c, make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR)),
+            (pc + 0x00, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 1, 1)),
+            (pc + 0x04, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 2, 2)),
+            (pc + 0x08, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 3, 3)),
+            (pc + 0x0c, make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR)),
             (pc + 0x10, 0), // jr delay slot
         ];
         let mut gpr = [0u64; 32];
@@ -646,11 +646,11 @@ mod tests {
             exec.install_jit_hooks();
             // Breakpoint on the 3rd ADDIU (pc+8), which lives inside the
             // compiled region (not the entry word).
-            exec.add_breakpoint(1, pc + 8, crate::mips_exec::BpType::Pc);
+            exec.add_breakpoint(1, pc + 8, crate::cpu::mips_exec::BpType::Pc);
 
             let mut hit = false;
             for _ in 0..6 {
-                if exec.step_jit() == crate::mips_exec::EXEC_BREAKPOINT { hit = true; break; }
+                if exec.step_jit() == crate::cpu::mips_exec::EXEC_BREAKPOINT { hit = true; break; }
             }
             assert!(hit, "PC breakpoint inside a compiled region must fire from the dev hook");
             assert_eq!(exec.core.pc, pc + 8,
@@ -693,14 +693,14 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x10;
 
-        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 1);
-        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 1); // always taken, target = word1+1+1 = word3
-        let slot = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 2);
+        let addiu0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 2, 1);
+        let beq = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 1); // always taken, target = word1+1+1 = word3
+        let slot = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 3, 2);
         // BC1F cc0, +10: branch-if-false, condition = !cc. cc0 set true
         // below -> condition = false -> NOT taken -> falls through to its
         // own delay slot (word4), same as bc1f in the back-edge test.
-        let bc1f = (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | 10u32;
-        let succ = make_i(crate::mips_isa::OP_ADDIU, 1, 5, 3);
+        let bc1f = (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | 10u32;
+        let succ = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 5, 3);
         let page = [
             (entry0, addiu0),
             (entry0 + 1, beq),
@@ -713,7 +713,7 @@ mod tests {
             // page's end — filling the 64-entry traceback window with ~250
             // more Jit-tagged NOPs and pushing this test's 5 real entries
             // out of it entirely (found via this exact test failing empty).
-            (entry0 + 5, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+            (entry0 + 5, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
         ];
 
         // Drive through the REAL dispatch gate (step()), not a direct jit_fn
@@ -728,7 +728,7 @@ mod tests {
             mem.set_word(vaddr, raw);
             mem.set_word(vaddr & 0x1FFF_FFFF, raw);
         }
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.set_fpu_cc(0, true); // cc0=true -> BC1F not taken
         exec.update_fpr_mode();
         exec.jitv2_inline_compile = true;
@@ -745,15 +745,15 @@ mod tests {
         let find = |want: u64| entries.iter().find(|&&(epc, _, _)| epc == want)
             .unwrap_or_else(|| panic!("pc {:#x} missing from traceback: {:x?}", want, entries));
 
-        assert_eq!(find(pc).2, crate::mips_exec::InstrOrigin::JitEntry,
+        assert_eq!(find(pc).2, crate::cpu::mips_exec::InstrOrigin::JitEntry,
             "entry word's external JIT dispatch must be tagged JitEntry (recorded by exec_decoded's own JIT-hit push, not the dev hook)");
-        assert_eq!(find(pc + 4).2, crate::mips_exec::InstrOrigin::Jit,
+        assert_eq!(find(pc + 4).2, crate::cpu::mips_exec::InstrOrigin::Jit,
             "the BEQ head must be tagged Jit");
-        assert_eq!(find(pc + 8).2, crate::mips_exec::InstrOrigin::JitDelaySlot,
+        assert_eq!(find(pc + 8).2, crate::cpu::mips_exec::InstrOrigin::JitDelaySlot,
             "the BEQ's inlined delay slot must be tagged JitDelaySlot");
-        assert_eq!(find(pc + 12).2, crate::mips_exec::InstrOrigin::FallbackWord,
+        assert_eq!(find(pc + 12).2, crate::cpu::mips_exec::InstrOrigin::FallbackWord,
             "the MTC0 fallback head must be tagged FallbackWord");
-        assert_eq!(find(pc + 16).2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
+        assert_eq!(find(pc + 16).2, crate::cpu::mips_exec::InstrOrigin::FallbackSuccessor,
             "the word after the fallback must be tagged FallbackSuccessor");
     }
 
@@ -772,13 +772,13 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 2; // loop counter: 2 iterations -> 1 back-edge
 
-        let dec = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1
-        let bne = make_i(crate::mips_isa::OP_BNE, 1, 0, (-2i16) as u16); // target = word0
+        let dec = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1
+        let bne = make_i(crate::cpu::mips_isa::OP_BNE, 1, 0, (-2i16) as u16); // target = word0
         let page = [
             (entry0, dec),
             (entry0 + 1, bne),
             (entry0 + 2, 0), // bne's delay slot (nop)
-            (entry0 + 3, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+            (entry0 + 3, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
         ];
 
         let mem = MockMemory::new();
@@ -798,9 +798,9 @@ mod tests {
         let entries = exec.test_traceback_last_origin(64);
         let entry_hits: Vec<_> = entries.iter().filter(|&&(epc, _, _)| epc == pc).collect();
         assert_eq!(entry_hits.len(), 2, "entry word must be dispatched twice (external + one back-edge): {:x?}", entries);
-        assert_eq!(entry_hits[0].2, crate::mips_exec::InstrOrigin::JitEntry,
+        assert_eq!(entry_hits[0].2, crate::cpu::mips_exec::InstrOrigin::JitEntry,
             "first (external) entry arrival must be tagged JitEntry (exec_decoded's own JIT-hit push)");
-        assert_eq!(entry_hits[1].2, crate::mips_exec::InstrOrigin::JitEntryBackEdge,
+        assert_eq!(entry_hits[1].2, crate::cpu::mips_exec::InstrOrigin::JitEntryBackEdge,
             "second (looped) entry arrival must be tagged JitEntryBackEdge");
     }
 
@@ -844,15 +844,15 @@ mod tests {
         // below, condition = !true = false -> NOT taken -> falls through to
         // its own delay slot (word1), same as any non-taken branch. (Offset
         // value is irrelevant on the not-taken path — only used if taken.)
-        let bc1f = (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | 10u32;
-        let dec = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1, BC1's delay slot / successor word
-        let bne = make_i(crate::mips_isa::OP_BNE, 1, 0, (-2i16) as u16); // target = word1 (the successor)
+        let bc1f = (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | 10u32;
+        let dec = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1, BC1's delay slot / successor word
+        let bne = make_i(crate::cpu::mips_isa::OP_BNE, 1, 0, (-2i16) as u16); // target = word1 (the successor)
         let page = [
             (entry0, bc1f),
             (entry0 + 1, dec),
             (entry0 + 2, bne),
             (entry0 + 3, 0), // bne's delay slot (nop)
-            (entry0 + 4, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+            (entry0 + 4, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
         ];
 
         let mem = MockMemory::new();
@@ -863,7 +863,7 @@ mod tests {
             mem.set_word(vaddr, raw);
             mem.set_word(vaddr & 0x1FFF_FFFF, raw);
         }
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.set_fpu_cc(0, true); // cc0=true -> BC1F (branch-if-false) not taken -> falls through
         exec.update_fpr_mode();
         exec.jitv2_inline_compile = true;
@@ -886,7 +886,7 @@ mod tests {
         let entries = exec.test_traceback_last_origin(64);
         let hits: Vec<_> = entries.iter().filter(|&&(epc, _, _)| epc == successor_pc).collect();
         assert_eq!(hits.len(), 2, "fallback successor must be dispatched twice (first arrival + one back-edge): {:x?}", entries);
-        assert_eq!(hits[0].2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
+        assert_eq!(hits[0].2, crate::cpu::mips_exec::InstrOrigin::FallbackSuccessor,
             "first arrival (from the fallback's own region) must be tagged FallbackSuccessor");
         // The loop's back-edge (BNE, a separate compiled region) re-dispatches
         // to this same word externally, through the dispatch-head Switch —
@@ -899,7 +899,7 @@ mod tests {
         // would need a runtime first-entry bit on the page/entry, which isn't
         // worth adding for a `dt` diagnostic tag on a feature that's off by
         // default (`j2 fallback`, see FALLBACK_ENABLED's own doc comment).
-        assert_eq!(hits[1].2, crate::mips_exec::InstrOrigin::FallbackSuccessor,
+        assert_eq!(hits[1].2, crate::cpu::mips_exec::InstrOrigin::FallbackSuccessor,
             "second arrival (the loop back-edge) re-enters the same external dispatch head as the first arrival, so it reads the same static tag — FallbackSuccessor, not a runtime-tracked distinction");
     }
 
@@ -934,7 +934,7 @@ mod tests {
         }
         assert_eq!(count, 1024,
             "must have parsed all 1024 words from \
-             src/jitv2/test/wd93_init_page_8800b000.txt — got {}", count);
+             src/cpu/jitv2/test/wd93_init_page_8800b000.txt — got {}", count);
 
         // Sanity: word 0x150 (0xffffffff8800b540) must be the JAL we expect,
         // confirming the file parsed at the right offsets.
@@ -945,7 +945,7 @@ mod tests {
         let entry_word: u16 = 0x150;
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry_word, 0x8800b000, usize::MAX);
         assert!(non_empty, "region must not be empty");
-        let visited: Vec<u16> = crate::jitv2::analyzer::instrs_linear(walked).map(|i| i.word).collect();
+        let visited: Vec<u16> = crate::cpu::jitv2::analyzer::instrs_linear(walked).map(|i| i.word).collect();
         eprintln!("DEBUG real-page walk from word {:#x}: visited = {:x?}", entry_word, visited);
         // A JAL is a control transfer with a mandatory delay slot — the walk
         // SHOULD stop right after the slot (nothing else is reachable by
@@ -967,7 +967,7 @@ mod tests {
         let entry2: u16 = 0x154;
         let (walked2, non_empty2) = analyzer2.walk_bounded(&page_words, entry2, 0x8800b000, usize::MAX);
         assert!(non_empty2, "region must not be empty");
-        let visited2: Vec<u16> = crate::jitv2::analyzer::instrs_linear(walked2).map(|i| i.word).collect();
+        let visited2: Vec<u16> = crate::cpu::jitv2::analyzer::instrs_linear(walked2).map(|i| i.word).collect();
         eprintln!("DEBUG real-page walk from word {:#x}: visited = {:x?}", entry2, visited2);
         assert!(visited2.contains(&0x150) && visited2.contains(&0x151),
             "0x150/0x151 SHOULD be included here — they're the target of a real backward branch (bne at 0x15a) inside this region: {:x?}", visited2);
@@ -985,7 +985,7 @@ mod tests {
         // linearly with instruction count; after, only the constant-size
         // jump-with-args at each site should scale, with the shared block's
         // body paid once regardless of how many ADDs are chained.
-        let add = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD);
+        let add = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
 
@@ -1016,7 +1016,7 @@ mod tests {
         // specifically what the overflow-check + exception-exit call site
         // costs on top of a plain instruction, which is what the shared
         // block is actually supposed to shrink.
-        let addu = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADDU);
+        let addu = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADDU);
         let size_for_n_addu = |n: u16| -> u32 {
             let mut page_words = [0u32; ENTRIES_PER_PAGE];
             for w in 0..n { page_words[w as usize] = addu; }
@@ -1095,8 +1095,8 @@ mod tests {
                                 pc: u64, steps: usize, cu1: bool, fr1: bool) -> CoreSnapshot {
         let (mut exec, mem) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, pc);
         exec.set_cp0_status(
-            (if cu1 { crate::mips_core::STATUS_CU1 } else { 0 })
-            | (if fr1 { crate::mips_core::STATUS_FR } else { 0 }));
+            (if cu1 { crate::cpu::mips_core::STATUS_CU1 } else { 0 })
+            | (if fr1 { crate::cpu::mips_core::STATUS_FR } else { 0 }));
         exec.core.set_fpu_cc(cc, cc_val);
         let page_base = pc & !(PAGE_SIZE as u64 - 1);
         for &(word, raw) in page {
@@ -1135,8 +1135,8 @@ mod tests {
         let (exec, mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
         exec.set_cp0_status(
-            (if cu1 { crate::mips_core::STATUS_CU1 } else { 0 })
-            | (if fr1 { crate::mips_core::STATUS_FR } else { 0 }));
+            (if cu1 { crate::cpu::mips_core::STATUS_CU1 } else { 0 })
+            | (if fr1 { crate::cpu::mips_core::STATUS_FR } else { 0 }));
         exec.core.set_fpu_cc(cc, cc_val);
         let phys_base = (page_base & 0x1FFF_FFFF) as u64;
         for &(word, raw) in page {
@@ -1163,7 +1163,7 @@ mod tests {
     /// `cc<<2 | nd<<1 | tf`, sitting at raw[20:16].
     fn make_bc1(cc: u32, tf: bool, nd: bool, imm: u16) -> u32 {
         let rt = (cc << 2) | ((nd as u32) << 1) | (tf as u32);
-        (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | (rt << 16) | (imm as u32)
+        (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | (rt << 16) | (imm as u32)
     }
 
     fn bc1_layout(cc: u32, tf: bool, nd: bool) -> Vec<(u16, u32)> {
@@ -1171,7 +1171,7 @@ mod tests {
             (0, make_bc1(cc, tf, nd, BRANCH_IMM)),
             // r5 = 1 marks that the delay slot ran (annulled on a not-taken
             // "likely", exactly as for BEQL).
-            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
         ]
     }
 
@@ -1259,7 +1259,7 @@ mod tests {
         // otherwise leave the executor's fpr_read_w/fpr_write_w fn pointers stale at
         // whatever FR mode MipsExecutor::new() initialized them to. `set_cp0_status`
         // stores the word and re-derives, same as the real write_cp0 path.
-        exec.set_cp0_status(crate::mips_core::STATUS_CU1 | if fr1 { crate::mips_core::STATUS_FR } else { 0 });
+        exec.set_cp0_status(crate::cpu::mips_core::STATUS_CU1 | if fr1 { crate::cpu::mips_core::STATUS_FR } else { 0 });
         (exec, mem)
     }
 
@@ -1389,8 +1389,8 @@ mod tests {
     /// Excluded word is admitted to a region), so the guard is held for the
     /// whole test body; tests using only native instructions or the
     /// `RegionBoundary` sentinel are flag-independent and don't need it.
-    fn fallback_on_guard() -> crate::jitv2::analyzer::TestFallbackGuard {
-        crate::jitv2::analyzer::test_fallback_guard()
+    fn fallback_on_guard() -> crate::cpu::jitv2::analyzer::TestFallbackGuard {
+        crate::cpu::jitv2::analyzer::test_fallback_guard()
     }
 
     /// Not a diff against `assert_jit_matches_interpreter`'s `opt_level=none`
@@ -1418,14 +1418,14 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = 10;
             gpr[2] = 20;
-            let addu = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADDU);
+            let addu = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADDU);
             assert_jit_matches_interpreter(addu, gpr, 0xFFFF_FFFF_8000_1000);
 
             // ADD: overflow-trap cold block, both taken and not-taken.
             let mut gpr_ok = [0u64; 32];
             gpr_ok[1] = 5;
             gpr_ok[2] = 10;
-            let add = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD);
+            let add = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD);
             assert_jit_matches_interpreter(add, gpr_ok, 0xFFFF_FFFF_8000_1000);
 
             let mut gpr_overflow = [0u64; 32];
@@ -1437,7 +1437,7 @@ mod tests {
             let mut gpr_trap_taken = [0u64; 32];
             gpr_trap_taken[1] = 7;
             gpr_trap_taken[2] = 7;
-            let teq = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::mips_isa::FUNCT_TEQ);
+            let teq = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::cpu::mips_isa::FUNCT_TEQ);
             assert_jit_matches_interpreter(teq, gpr_trap_taken, 0xFFFF_FFFF_8000_1000);
 
             let mut gpr_trap_not_taken = [0u64; 32];
@@ -1454,7 +1454,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 10;
         gpr[2] = 20;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADDU);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADDU);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -1463,7 +1463,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF;
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADDU);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADDU);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -1474,7 +1474,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF;
         gpr[2] = 1; // sum = 0x8000_0000 (32-bit), sign-extends to 0xFFFFFFFF_80000000
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADDU);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADDU);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -1484,7 +1484,7 @@ mod tests {
         gpr[1] = 5;
         gpr[2] = 5;
         // rd = 0: architecturally a no-op write.
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::mips_isa::FUNCT_ADDU);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::cpu::mips_isa::FUNCT_ADDU);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -1492,7 +1492,7 @@ mod tests {
     fn addu_same_register_as_both_operands() {
         let mut gpr = [0u64; 32];
         gpr[4] = 7;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 4, 4, 4, 0, crate::mips_isa::FUNCT_ADDU);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 4, 4, 4, 0, crate::cpu::mips_isa::FUNCT_ADDU);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -1519,7 +1519,7 @@ mod tests {
         // one-instruction fallback region, not an empty one. (Pre-fallback this
         // asserted non_empty == false — see git history / the analyzer's own
         // walk_excluded_entry_* tests, updated in the same change.)
-        let instr = make_r(crate::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::mips_isa::FUNCT_MADD_PS);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1X, 1, 2, 3, 4, crate::cpu::mips_isa::FUNCT_MADD_PS);
         let mut page = [0u32; ENTRIES_PER_PAGE];
         page[0] = instr;
         let mut analyzer = Analyzer::new();
@@ -1541,21 +1541,21 @@ mod tests {
 
     #[test]
     fn addiu_matches_interpreter() {
-        alu_imm_case(crate::mips_isa::OP_ADDIU, 10, 20);
-        alu_imm_case(crate::mips_isa::OP_ADDIU, 0xFFFF_FFFF, 1); // 32-bit wraparound
-        alu_imm_case(crate::mips_isa::OP_ADDIU, 5, 0x8000); // negative immediate
+        alu_imm_case(crate::cpu::mips_isa::OP_ADDIU, 10, 20);
+        alu_imm_case(crate::cpu::mips_isa::OP_ADDIU, 0xFFFF_FFFF, 1); // 32-bit wraparound
+        alu_imm_case(crate::cpu::mips_isa::OP_ADDIU, 5, 0x8000); // negative immediate
     }
 
     #[test]
     fn addi_no_overflow_matches_interpreter() {
-        alu_imm_case(crate::mips_isa::OP_ADDI, 10, 20);
+        alu_imm_case(crate::cpu::mips_isa::OP_ADDI, 10, 20);
     }
 
     #[test]
     fn addi_overflow_traps_and_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF;
-        let instr = make_i(crate::mips_isa::OP_ADDI, 1, 2, 1);
+        let instr = make_i(crate::cpu::mips_isa::OP_ADDI, 1, 2, 1);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -1566,18 +1566,18 @@ mod tests {
 
     #[test]
     fn daddi_no_overflow_matches_interpreter() {
-        alu_imm_case(crate::mips_isa::OP_DADDI, 10, 20);
+        alu_imm_case(crate::cpu::mips_isa::OP_DADDI, 10, 20);
         // 32-bit boundary is NOT an overflow for DADDI (unlike ADDI) —
         // confirms the emitter is genuinely 64-bit-wide, not just ADDI with
         // a different opcode byte.
-        alu_imm_case(crate::mips_isa::OP_DADDI, 0x7FFF_FFFF, 1);
+        alu_imm_case(crate::cpu::mips_isa::OP_DADDI, 0x7FFF_FFFF, 1);
     }
 
     #[test]
     fn daddi_overflow_traps_and_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF_FFFF_FFFF; // i64::MAX
-        let instr = make_i(crate::mips_isa::OP_DADDI, 1, 2, 1);
+        let instr = make_i(crate::cpu::mips_isa::OP_DADDI, 1, 2, 1);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -1588,16 +1588,16 @@ mod tests {
 
     #[test]
     fn daddiu_matches_interpreter() {
-        alu_imm_case(crate::mips_isa::OP_DADDIU, 10, 20);
+        alu_imm_case(crate::cpu::mips_isa::OP_DADDIU, 10, 20);
         // 64-bit wraparound is NOT a trap for DADDIU (unlike DADDI) — confirms
         // the emitter is genuinely wrapping, not DADDI with a different opcode byte.
-        alu_imm_case(crate::mips_isa::OP_DADDIU, 0xFFFF_FFFF_FFFF_FFFF, 1);
-        alu_imm_case(crate::mips_isa::OP_DADDIU, 5, 0x8000); // negative immediate
+        alu_imm_case(crate::cpu::mips_isa::OP_DADDIU, 0xFFFF_FFFF_FFFF_FFFF, 1);
+        alu_imm_case(crate::cpu::mips_isa::OP_DADDIU, 5, 0x8000); // negative immediate
     }
 
     #[test]
     fn andi_ori_xori_match_interpreter() {
-        for op in [crate::mips_isa::OP_ANDI, crate::mips_isa::OP_ORI, crate::mips_isa::OP_XORI] {
+        for op in [crate::cpu::mips_isa::OP_ANDI, crate::cpu::mips_isa::OP_ORI, crate::cpu::mips_isa::OP_XORI] {
             alu_imm_case(op, 0xFFFF_FFFF_FFFF_0000, 0xFFFF); // imm is zero-extended, not sign-extended
             alu_imm_case(op, 0, 0);
         }
@@ -1605,18 +1605,18 @@ mod tests {
 
     #[test]
     fn slti_sltiu_match_interpreter() {
-        alu_imm_case(crate::mips_isa::OP_SLTI, u64::MAX, 1); // -1 <s 1 -> true
-        alu_imm_case(crate::mips_isa::OP_SLTIU, u64::MAX, 1); // huge <u 1 -> false (imm sign-extends to huge too, but check boundary)
-        alu_imm_case(crate::mips_isa::OP_SLTI, 1, 1);
-        alu_imm_case(crate::mips_isa::OP_SLTIU, 0, 1);
+        alu_imm_case(crate::cpu::mips_isa::OP_SLTI, u64::MAX, 1); // -1 <s 1 -> true
+        alu_imm_case(crate::cpu::mips_isa::OP_SLTIU, u64::MAX, 1); // huge <u 1 -> false (imm sign-extends to huge too, but check boundary)
+        alu_imm_case(crate::cpu::mips_isa::OP_SLTI, 1, 1);
+        alu_imm_case(crate::cpu::mips_isa::OP_SLTIU, 0, 1);
     }
 
     #[test]
     fn lui_matches_interpreter() {
         let mut gpr = [0u64; 32];
-        let instr = make_i(crate::mips_isa::OP_LUI, 0, 2, 0x8000); // high bit set -> must sign-extend
+        let instr = make_i(crate::cpu::mips_isa::OP_LUI, 0, 2, 0x8000); // high bit set -> must sign-extend
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
-        let instr2 = make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234);
+        let instr2 = make_i(crate::cpu::mips_isa::OP_LUI, 0, 2, 0x1234);
         gpr[2] = 0;
         assert_jit_matches_interpreter(instr2, gpr, 0xFFFF_FFFF_8000_1000);
     }
@@ -1631,9 +1631,9 @@ mod tests {
     fn lui_ori_fuses_and_matches_interpreter() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
-            (1, make_i(crate::mips_isa::OP_ORI, 2, 2, 0x5678)),
-            (2, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // marker: proves word 2 still ran
+            (0u16, make_i(crate::cpu::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::cpu::mips_isa::OP_ORI, 2, 2, 0x5678)),
+            (2, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // marker: proves word 2 still ran
         ];
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, 3, 3);
         let jit = run_jit_page(&page, [0u64; 32], pc, 0, 3, &[]).expect("region must compile");
@@ -1650,9 +1650,9 @@ mod tests {
     fn lui_addiu_fuses_with_carry_and_matches_interpreter() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
-            (1, make_i(crate::mips_isa::OP_ADDIU, 2, 2, 0xFFFF)), // lo16 = -1, carries out of bit 16
-            (2, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (0u16, make_i(crate::cpu::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 2, 2, 0xFFFF)), // lo16 = -1, carries out of bit 16
+            (2, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
         ];
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, 0, 3, 3);
         let jit = run_jit_page(&page, [0u64; 32], pc, 0, 3, &[]).expect("region must compile");
@@ -1695,14 +1695,14 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 2; // loop counter, independent of r2
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
-            (1, make_i(crate::mips_isa::OP_ORI, 2, 2, 0x5678)),
-            (2, make_i(crate::mips_isa::OP_ADDIU, 4, 4, 1)), // counts word-1 passes
+            (0u16, make_i(crate::cpu::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::cpu::mips_isa::OP_ORI, 2, 2, 0x5678)),
+            (2, make_i(crate::cpu::mips_isa::OP_ADDIU, 4, 4, 1)), // counts word-1 passes
             (3, 0),
             (4, 0),
-            (5, make_i(crate::mips_isa::OP_BNE, 1, 0, imm16)), // while r1 != 0
-            (6, make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF)), // delay slot: r1 -= 1
-            (7, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+            (5, make_i(crate::cpu::mips_isa::OP_BNE, 1, 0, imm16)), // while r1 != 0
+            (6, make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 0xFFFF)), // delay slot: r1 -= 1
+            (7, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
         ];
         // word0 (1) + 3 passes of word1..word6 (6 each: r1 starts at 2, BNE
         // tests-then-slot-decrements each pass — taken at r1=2, taken at
@@ -1743,8 +1743,8 @@ mod tests {
         let pc_word0 = 0xFFFF_FFFF_BFC0_0000u64;
         let target = 0xFFFF_FFFF_BFC0_03C0u64; // arbitrary foreign delay-slot target
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_LUI, 0, 2, 0x1234)),
-            (1, make_i(crate::mips_isa::OP_ORI, 2, 2, 0x5678)), // unrelated at runtime; must NOT be folded in
+            (0u16, make_i(crate::cpu::mips_isa::OP_LUI, 0, 2, 0x1234)),
+            (1, make_i(crate::cpu::mips_isa::OP_ORI, 2, 2, 0x5678)), // unrelated at runtime; must NOT be folded in
         ];
 
         let page_base = 0x1FC0_0000u32;
@@ -1769,7 +1769,7 @@ mod tests {
         jit_exec.core.delay_slot_target = target;
 
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         assert_eq!(jit_exec.core.pc, target,
             "a standalone-compiled LUI that's actually running as a foreign delay slot must exit via delay_slot_target (0x{:x}), not a fused fallthrough to word+2 (got 0x{:x})",
@@ -1783,7 +1783,7 @@ mod tests {
     fn lw_matches_interpreter_basic() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000; // base
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 8); // LW r2, 8(r1)
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 8); // LW r2, 8(r1)
         assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000,
             &[(0xFFFF_FFFF_8010_0008, 0x1234_5678)]);
     }
@@ -1792,7 +1792,7 @@ mod tests {
     fn lw_matches_interpreter_sign_extends_negative_word() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 0);
         assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000,
             &[(0xFFFF_FFFF_8010_0000, 0x8000_0001)]); // high bit set -> sign-extends to 0xFFFFFFFF_80000001
     }
@@ -1802,7 +1802,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
         gpr[2] = 0xDEAD_BEEF;
-        let instr = make_i(crate::mips_isa::OP_SW, 1, 2, 4); // SW r2, 4(r1)
+        let instr = make_i(crate::cpu::mips_isa::OP_SW, 1, 2, 4); // SW r2, 4(r1)
         assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000, &[]);
     }
 
@@ -1813,7 +1813,7 @@ mod tests {
         // Status/pc-at-vector must all match the interpreter exactly.
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 0);
         let pc = 0xFFFF_FFFF_8000_1000u64;
 
         let interp = run_interpreter(instr, gpr, pc, &[]);
@@ -1852,7 +1852,7 @@ mod tests {
     fn assert_head_fault_matches_interpreter(fault_instr: u32, gpr: [u64; 32]) {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let page = vec![
-            (0, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (0, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
             (1, fault_instr),
         ];
         let interp = run_interpreter_page(&page, gpr, pc, 2);
@@ -1865,14 +1865,14 @@ mod tests {
         // a compiled unit that never updates it per-instruction) or the
         // region's page base.
         assert_eq!(jit.cp0_epc, pc + 4, "EPC must point at the faulting instruction (word 1), not stale/wrong core.pc");
-        assert_eq!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "a head-instruction fault must not report BD set");
+        assert_eq!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "a head-instruction fault must not report BD set");
     }
 
     #[test]
     fn adel_after_runway_epc_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 0);
         assert_head_fault_matches_interpreter(instr, gpr);
     }
 
@@ -1881,7 +1881,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
         gpr[2] = 0xDEAD_BEEF;
-        let instr = make_i(crate::mips_isa::OP_SW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_SW, 1, 2, 0);
         assert_head_fault_matches_interpreter(instr, gpr);
     }
 
@@ -1890,7 +1890,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF; // ADD r3, r1, r2 with r2=1 overflows i32
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD);
         assert_head_fault_matches_interpreter(instr, gpr);
     }
 
@@ -1906,7 +1906,7 @@ mod tests {
     fn assert_slot_fault_matches_interpreter(fault_instr: u32, gpr: [u64; 32]) {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let page = vec![
-            (0, make_i(crate::mips_isa::OP_BEQ, 0, 0, 0)), // BEQ r0, r0, +0 -> always taken, target = slot's own addr + 0
+            (0, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0)), // BEQ r0, r0, +0 -> always taken, target = slot's own addr + 0
             (1, fault_instr),
         ];
         let interp = run_interpreter_page(&page, gpr, pc, 2);
@@ -1916,14 +1916,14 @@ mod tests {
         assert_ne!(jit.pc, pc, "pc must be vectored by handle_exception, not left at the branch");
         let slot_addr = pc + 4;
         assert_eq!(jit.cp0_epc, slot_addr - 4, "EPC must be slot_addr - 4 per deliver_exception's in_delay_slot branch");
-        assert_ne!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "a delay-slot fault must report BD set");
+        assert_ne!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "a delay-slot fault must report BD set");
     }
 
     #[test]
     fn adel_in_delay_slot_epc_and_bd_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 0);
         assert_slot_fault_matches_interpreter(instr, gpr);
     }
 
@@ -1932,7 +1932,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
         gpr[2] = 0xDEAD_BEEF;
-        let instr = make_i(crate::mips_isa::OP_SW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_SW, 1, 2, 0);
         assert_slot_fault_matches_interpreter(instr, gpr);
     }
 
@@ -1973,7 +1973,7 @@ mod tests {
         let branch_pc = 0xFFFF_FFFF_8000_0000u64; // BEQ r0,r0,+0 (not compiled — real interpreter dispatch)
         let slot_pc = branch_pc + 4; // fault_instr's own address; also entry_word's address below
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 0)),
+            (0u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0)),
             (1u16, fault_instr),
         ];
 
@@ -2008,14 +2008,14 @@ mod tests {
         assert_eq!(jit, interp, "JIT and interpreter diverged when a standalone-compiled entry word was reached as a foreign delay slot");
         assert_ne!(jit.pc, slot_pc, "pc must be vectored by handle_exception");
         assert_eq!(jit.cp0_epc, branch_pc, "EPC must be the real branch's address (core.pc - 4), not this word's own address");
-        assert_ne!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "BD must be set — this word was reached as a delay slot, even though it was compiled as a plain entry");
+        assert_ne!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "BD must be set — this word was reached as a delay slot, even though it was compiled as a plain entry");
     }
 
     #[test]
     fn adel_in_entry_word_reached_as_foreign_slot_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 0);
         assert_entry_word_reached_as_foreign_slot_matches_interpreter(instr, gpr);
     }
 
@@ -2024,7 +2024,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // misaligned by 1 byte
         gpr[2] = 0xDEAD_BEEF;
-        let instr = make_i(crate::mips_isa::OP_SW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_SW, 1, 2, 0);
         assert_entry_word_reached_as_foreign_slot_matches_interpreter(instr, gpr);
     }
 
@@ -2033,7 +2033,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF;
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD);
         assert_entry_word_reached_as_foreign_slot_matches_interpreter(instr, gpr);
     }
 
@@ -2047,14 +2047,14 @@ mod tests {
     fn adel_in_entry_word_ordinary_arrival_still_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001;
-        let instr = make_i(crate::mips_isa::OP_LW, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 1, 2, 0);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
             .expect("LW must be compilable for this test to be meaningful");
         assert_eq!(jit, interp);
         assert_eq!(jit.cp0_epc, pc, "ordinary (non-delay-slot) entry-word fault must still report EPC = this instruction's own address");
-        assert_eq!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "ordinary entry-word fault must not report BD set");
+        assert_eq!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "ordinary entry-word fault must not report BD set");
     }
 
     /// Regression test for a live `jitcheck` divergence: a compiled unit's
@@ -2084,8 +2084,8 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[16] = error_addr - 256; // s0; LW t4, 256(s0) below reaches error_addr
         let page: Vec<(u16, u32)> = vec![
-            (0, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // runway: r5 = 1
-            (1, make_i(crate::mips_isa::OP_LW, 16, 12, 256)), // LW t4(r12), 256(s0/r16) -> error_addr
+            (0, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // runway: r5 = 1
+            (1, make_i(crate::cpu::mips_isa::OP_LW, 16, 12, 256)), // LW t4(r12), 256(s0/r16) -> error_addr
         ];
         let page_base = pc & !(PAGE_SIZE as u64 - 1);
         let responses = vec![(BUS_ERR, 0)]; // always errors — single entry repeats forever
@@ -2141,7 +2141,7 @@ mod tests {
         // instruction ahead of the LW, so pc legitimately advances even
         // without any fault — only EXL can only be set by a real exception
         // actually being delivered.
-        assert_ne!(jit.cp0_status & crate::mips_core::STATUS_EXL, 0, "a real bus error on this address must vector via handle_exception in both engines");
+        assert_ne!(jit.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "a real bus error on this address must vector via handle_exception in both engines");
     }
 
     /// Regression test for a second live `jitcheck` divergence, found via the
@@ -2171,7 +2171,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[16] = addr - 64; // s0; LW t4, 64(s0) below reaches addr
-        let instr = make_i(crate::mips_isa::OP_LW, 16, 12, 64); // LW t4(r12), 64(s0/r16)
+        let instr = make_i(crate::cpu::mips_isa::OP_LW, 16, 12, 64); // LW t4(r12), 64(s0/r16)
         const MAX_ATTEMPTS: usize = 10; // generous bound; a real bail-and-redispatch loop, not expected to ever approach this
         // Busy for the first two attempts, then succeeds with a real value —
         // the last entry repeats forever once popped, so both engines can
@@ -2189,7 +2189,7 @@ mod tests {
             loop {
                 let status = exec.exec(instr);
                 attempts += 1;
-                if status != crate::mips_exec::EXEC_RETRY { break; }
+                if status != crate::cpu::mips_exec::EXEC_RETRY { break; }
                 assert!(attempts < MAX_ATTEMPTS, "interpreter retried more than expected — magic-response queue is broken");
             }
             CoreSnapshot::capture(&exec.core)
@@ -2243,7 +2243,7 @@ mod tests {
 
         assert_eq!(jit, interp, "JIT and interpreter diverged on a transiently-busy uncached read: {:x?} vs {:x?}", jit, interp);
         assert_eq!(jit.pc, pc + 4, "the read must eventually succeed and retire normally, not vector as an exception");
-        assert_eq!(jit.cp0_status & crate::mips_core::STATUS_EXL, 0, "a retry must never leave EXL set — no exception was ever real");
+        assert_eq!(jit.cp0_status & crate::cpu::mips_core::STATUS_EXL, 0, "a retry must never leave EXL set — no exception was ever real");
         assert_eq!(jit.gpr[12], 0x1234_5678, "t4 must hold the value from the read that finally succeeded");
     }
 
@@ -2269,14 +2269,14 @@ mod tests {
     fn cond_branch_layout(op: u32, rs: u32, rt: u32) -> Vec<(u16, u32)> {
         vec![
             (0, make_i(op, rs, rt, BRANCH_IMM)),
-            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // r5 = 1, marks the slot ran
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // r5 = 1, marks the slot ran
         ]
     }
 
     fn regimm_branch_layout(rt_field: u32, rs: u32) -> Vec<(u16, u32)> {
         vec![
-            (0, make_i(crate::mips_isa::OP_REGIMM, rs, rt_field, BRANCH_IMM)),
-            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (0, make_i(crate::cpu::mips_isa::OP_REGIMM, rs, rt_field, BRANCH_IMM)),
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
         ]
     }
 
@@ -2298,7 +2298,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 42;
         gpr[2] = 42; // equal -> taken
-        assert_branch_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BEQ, 1, 2), gpr);
+        assert_branch_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BEQ, 1, 2), gpr);
     }
 
     #[test]
@@ -2306,7 +2306,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 42;
         gpr[2] = 43; // not equal -> not taken
-        assert_branch_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BEQ, 1, 2), gpr);
+        assert_branch_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BEQ, 1, 2), gpr);
     }
 
     #[test]
@@ -2314,9 +2314,9 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 1;
         gpr[2] = 2;
-        assert_branch_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BNE, 1, 2), gpr);
+        assert_branch_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BNE, 1, 2), gpr);
         gpr[2] = 1;
-        assert_branch_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BNE, 1, 2), gpr);
+        assert_branch_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BNE, 1, 2), gpr);
     }
 
     #[test]
@@ -2324,8 +2324,8 @@ mod tests {
         let mut gpr = [0u64; 32];
         for rs_val in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF /* -1 */] {
             gpr[1] = rs_val;
-            assert_branch_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BLEZ, 1, 0), gpr);
-            assert_branch_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BGTZ, 1, 0), gpr);
+            assert_branch_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BLEZ, 1, 0), gpr);
+            assert_branch_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BGTZ, 1, 0), gpr);
         }
     }
 
@@ -2334,8 +2334,8 @@ mod tests {
         let mut gpr = [0u64; 32];
         for rs_val in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF /* -1 */] {
             gpr[1] = rs_val;
-            assert_branch_matches_interpreter(regimm_branch_layout(crate::mips_isa::RT_BLTZ, 1), gpr);
-            assert_branch_matches_interpreter(regimm_branch_layout(crate::mips_isa::RT_BGEZ, 1), gpr);
+            assert_branch_matches_interpreter(regimm_branch_layout(crate::cpu::mips_isa::RT_BLTZ, 1), gpr);
+            assert_branch_matches_interpreter(regimm_branch_layout(crate::cpu::mips_isa::RT_BGEZ, 1), gpr);
         }
     }
 
@@ -2346,12 +2346,12 @@ mod tests {
         // from a normal conditional skip.
         let mut gpr = [0u64; 32];
         gpr[1] = 1; gpr[2] = 1; // taken
-        let jit = run_jit_page(&cond_branch_layout(crate::mips_isa::OP_BEQ, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
+        let jit = run_jit_page(&cond_branch_layout(crate::cpu::mips_isa::OP_BEQ, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
             .expect("BEQ region must compile");
         assert_eq!(jit.gpr[5], 1, "slot must execute on the taken path");
 
         gpr[2] = 2; // not taken
-        let jit = run_jit_page(&cond_branch_layout(crate::mips_isa::OP_BEQ, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
+        let jit = run_jit_page(&cond_branch_layout(crate::cpu::mips_isa::OP_BEQ, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
             .expect("BEQ region must compile");
         assert_eq!(jit.gpr[5], 1, "slot must execute on the not-taken path too");
     }
@@ -2384,13 +2384,13 @@ mod tests {
         // exits; it never dispatches this word (step count unchanged from the
         // original 16).
         let page = vec![
-            (0, make_i(crate::mips_isa::OP_ADDIU, 0, 1, 3)), // r1 = 3
-            (1, make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF)), // loop body / branch target: r1 -= 1
+            (0, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 1, 3)), // r1 = 3
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 0xFFFF)), // loop body / branch target: r1 -= 1
             (2, 0),
             (3, 0),
-            (4, make_i(crate::mips_isa::OP_BNE, 1, 0, imm16)), // while r1 != 0
+            (4, make_i(crate::cpu::mips_isa::OP_BNE, 1, 0, imm16)), // while r1 != 0
             (5, 0), // delay slot: nop
-            (6, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL), // hard region end
+            (6, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL), // hard region end
         ];
         let pc = 0xFFFF_FFFF_8000_0000u64;
         // Interpreter dispatch count: word0 ADDIU (1), then per loop
@@ -2419,14 +2419,14 @@ mod tests {
     fn jump_layout(op: u32) -> Vec<(u16, u32)> {
         vec![
             (0, make_j(op, 7)),
-            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
         ]
     }
 
     #[test]
     fn j_matches_interpreter() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
-        assert_jit_matches_interpreter_page(&jump_layout(crate::mips_isa::OP_J), [0u64; 32], pc, 0, 2, 1);
+        assert_jit_matches_interpreter_page(&jump_layout(crate::cpu::mips_isa::OP_J), [0u64; 32], pc, 0, 2, 1);
     }
 
     #[test]
@@ -2434,7 +2434,7 @@ mod tests {
         // JAL writes r31 = this instruction's address + 8 (past the delay
         // slot) — verified as part of the full snapshot comparison.
         let pc = 0xFFFF_FFFF_8000_0000u64;
-        assert_jit_matches_interpreter_page(&jump_layout(crate::mips_isa::OP_JAL), [0u64; 32], pc, 0, 2, 1);
+        assert_jit_matches_interpreter_page(&jump_layout(crate::cpu::mips_isa::OP_JAL), [0u64; 32], pc, 0, 2, 1);
     }
 
     /// Regression test: JAL's link-register write (`emit_write_link_register`)
@@ -2462,8 +2462,8 @@ mod tests {
         // which run_jit_page/analyzer::jump_target now compute correctly
         // against pc's real page (see run_jit_page's doc comment).
         let page = vec![
-            (entry_word, make_j(crate::mips_isa::OP_JAL, 0)),
-            (entry_word + 1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // delay slot, marks that it ran
+            (entry_word, make_j(crate::cpu::mips_isa::OP_JAL, 0)),
+            (entry_word + 1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // delay slot, marks that it ran
         ];
         assert_jit_matches_interpreter_page(&page, [0u64; 32], pc, entry_word, 2, 1);
     }
@@ -2471,7 +2471,7 @@ mod tests {
     #[test]
     fn jump_delay_slot_always_executes() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
-        let jit = run_jit_page(&jump_layout(crate::mips_isa::OP_J), [0u64; 32], pc, 0, 1, &[])
+        let jit = run_jit_page(&jump_layout(crate::cpu::mips_isa::OP_J), [0u64; 32], pc, 0, 1, &[])
             .expect("J region must compile");
         assert_eq!(jit.gpr[5], 1, "slot must execute");
     }
@@ -2486,7 +2486,7 @@ mod tests {
     #[test]
     fn j_with_nop_slot_fuses_and_still_advances_cycles_by_two() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
-        let page = vec![(0u16, make_j(crate::mips_isa::OP_J, 7)), (1, 0)]; // word 1: real NOP
+        let page = vec![(0u16, make_j(crate::cpu::mips_isa::OP_J, 7)), (1, 0)]; // word 1: real NOP
         let (jit, cycles) = run_jit_page_with_cycles(&page, [0u64; 32], pc, 0, 1, &[])
             .expect("J+NOP region must compile");
         let expected_target = (pc & 0xFFFF_FFFF_F000_0000) | (7 * 4);
@@ -2520,12 +2520,12 @@ mod tests {
     #[test]
     fn jit_jump_exit_sets_jit_trigger_for_the_interpreter_gate() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
-        let page = jump_layout(crate::mips_isa::OP_J);
-        let mut page_words = [0u32; crate::jitv2::ENTRIES_PER_PAGE];
+        let page = jump_layout(crate::cpu::mips_isa::OP_J);
+        let mut page_words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
         for &(word, raw) in &page {
             page_words[word as usize] = raw;
         }
-        let page_base = (pc & !(crate::jitv2::PAGE_SIZE as u64 - 1)) as u32;
+        let page_base = (pc & !(crate::cpu::jitv2::PAGE_SIZE as u64 - 1)) as u32;
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 1);
         assert!(non_empty);
@@ -2570,8 +2570,8 @@ mod tests {
         // a different 4KB page than pc (pc's page is 0x8000_0000..0x8000_1000;
         // target26=0x0400 -> byte target 0x1000, well outside it).
         let page = vec![
-            (0u16, make_j(crate::mips_isa::OP_J, 0x0400)),
-            (1u16, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // delay slot, marks that it ran
+            (0u16, make_j(crate::cpu::mips_isa::OP_J, 0x0400)),
+            (1u16, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // delay slot, marks that it ran
         ];
 
         let page_base = pc as u32; // pc is already page-aligned in this test
@@ -2580,7 +2580,7 @@ mod tests {
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 2);
         assert!(non_empty);
-        assert_eq!(walked[0].taken_exit, Some(crate::jitv2::analyzer::StopReason::PageLeaving));
+        assert_eq!(walked[0].taken_exit, Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving));
         let mut instrs_owned = *walked;
         let mut codegen = Codegen::new();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false)
@@ -2589,7 +2589,7 @@ mod tests {
         let (mut jit_exec, jit_mem) = seeded_executor([0u64; 32], pc);
         for &(word, raw) in &page { jit_mem.set_word(pc + (word as u64) * 4, raw); }
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         // A from-scratch 2-step interpreter run (J itself, then its delay
         // slot, which is where the real branch_delay-driven transfer lands)
@@ -2618,7 +2618,7 @@ mod tests {
         // there.
         let pc = 0xFFFF_FFFF_BFC0_0000u64;
         let raw = 0x0bf000f0u32; // j 0xfc003c0 <realstart>
-        assert_eq!((raw >> 26) & 0x3F, crate::mips_isa::OP_J, "sanity: raw must decode as J");
+        assert_eq!((raw >> 26) & 0x3F, crate::cpu::mips_isa::OP_J, "sanity: raw must decode as J");
         let expected_target = 0xFFFF_FFFF_BFC0_03C0u64;
 
         let page = vec![
@@ -2637,7 +2637,7 @@ mod tests {
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 0, page_base, 1);
         assert!(non_empty);
-        assert_eq!(walked[0].taken_exit, Some(crate::jitv2::analyzer::StopReason::PageLeaving),
+        assert_eq!(walked[0].taken_exit, Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving),
             "J is always classified PageLeaving regardless of on-page-ness (analyzer::jump_target's doc comment)");
         let mut instrs_owned = *walked;
         let mut codegen = Codegen::new();
@@ -2647,7 +2647,7 @@ mod tests {
         let (mut jit_exec, jit_mem) = seeded_executor([0u64; 32], pc);
         for &(word, r) in &page { jit_mem.set_word(pc + (word as u64) * 4, r); }
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         assert_eq!(jit_exec.core.pc, expected_target,
             "JIT'd reset-vector J must land on realstart (0x{:x}), not fall through to the next word (got 0x{:x})",
@@ -2685,7 +2685,7 @@ mod tests {
         let pc_word1 = 0xFFFF_FFFF_BFC0_0004u64; // word 1 of the same real page
         let target = 0xFFFF_FFFF_BFC0_03C0u64; // realstart
         let page = vec![
-            (1u16, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // stands in for the delay-slot nop; marks that it ran
+            (1u16, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // stands in for the delay-slot nop; marks that it ran
         ];
 
         let page_base = 0x1FC0_0000u32; // physical alias, matching real handle_request
@@ -2705,7 +2705,7 @@ mod tests {
         jit_exec.core.delay_slot_target = target;
 
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         assert_eq!(jit_exec.core.pc, target,
             "a standalone-compiled word that's actually running as a foreign delay slot must exit via delay_slot_target (0x{:x}), not its own compile-time fallthrough (got 0x{:x})",
@@ -2742,7 +2742,7 @@ mod tests {
         let pc_word0 = 0xFFFF_FFFF_9FC1_0000u64; // page B, word 0 (the inherited slot)
         let target = 0xFFFF_FFFF_8000_0400u64; // where page A's taken branch actually went
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // stands in for the delay-slot instruction; marks that it ran
+            (0u16, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // stands in for the delay-slot instruction; marks that it ran
         ];
 
         let page_base = 0x9FC1_0000u32;
@@ -2762,7 +2762,7 @@ mod tests {
         jit_exec.core.delay_slot_target = target;
 
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         assert_eq!(jit_exec.core.pc, target,
             "word 0, standalone-compiled, running as a delay slot inherited from the *previous page's* taken branch must exit via delay_slot_target (0x{:x}), not its own compile-time fallthrough (got 0x{:x})",
@@ -2783,7 +2783,7 @@ mod tests {
         let pc_word0 = 0xFFFF_FFFF_9FC1_0000u64; // page B, word 0 (the inherited slot)
         let target = pc_word0.wrapping_add(4); // not-taken: natural fallthrough past the slot
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // stands in for the delay-slot instruction; marks that it ran
+            (0u16, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // stands in for the delay-slot instruction; marks that it ran
         ];
 
         let page_base = 0x9FC1_0000u32;
@@ -2803,7 +2803,7 @@ mod tests {
         jit_exec.core.delay_slot_target = target;
 
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         assert_eq!(jit_exec.core.pc, target,
             "word 0, standalone-compiled, running as a delay slot inherited from the *previous page's* not-taken branch must exit via delay_slot_target (0x{:x}), not its own compile-time fallthrough (got 0x{:x})",
@@ -2824,8 +2824,8 @@ mod tests {
         // BEQ r0,r0 (always taken), imm16 = -0x100 -> target word =
         // 4 + 1 + (-0x100) = -251, well before word 0 -> off-page backward.
         let page = vec![
-            (4u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 0xFF00u16 /* -0x100 as i16 */)),
-            (5u16, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)), // delay slot, marks that it ran
+            (4u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0xFF00u16 /* -0x100 as i16 */)),
+            (5u16, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)), // delay slot, marks that it ran
         ];
 
         let page_base = (pc & !0xFFFu64) as u32;
@@ -2834,7 +2834,7 @@ mod tests {
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, 4, page_base, 2);
         assert!(non_empty);
-        assert_eq!(walked[4].taken_exit, Some(crate::jitv2::analyzer::StopReason::PageLeaving));
+        assert_eq!(walked[4].taken_exit, Some(crate::cpu::jitv2::analyzer::StopReason::PageLeaving));
         let mut instrs_owned = *walked;
         let mut codegen = Codegen::new();
         let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 4, true, false)
@@ -2843,7 +2843,7 @@ mod tests {
         let (mut jit_exec, jit_mem) = seeded_executor([0u64; 32], pc);
         for &(word, raw) in &page { jit_mem.set_word((page_base as u64) + (word as u64) * 4, raw); }
         let status = unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
 
         let interp_final = run_interpreter_page(&page, [0u64; 32], pc, 2);
         let jit_final = CoreSnapshot::capture(&jit_exec.core);
@@ -2854,8 +2854,8 @@ mod tests {
     #[test]
     fn jal_link_register_matches_interpreter() {
         let pc = 0xFFFF_FFFF_8000_0000u64;
-        let interp = run_interpreter_page(&jump_layout(crate::mips_isa::OP_JAL), [0u64; 32], pc, 2);
-        let jit = run_jit_page(&jump_layout(crate::mips_isa::OP_JAL), [0u64; 32], pc, 0, 1, &[])
+        let interp = run_interpreter_page(&jump_layout(crate::cpu::mips_isa::OP_JAL), [0u64; 32], pc, 2);
+        let jit = run_jit_page(&jump_layout(crate::cpu::mips_isa::OP_JAL), [0u64; 32], pc, 0, 1, &[])
             .expect("JAL region must compile");
         assert_eq!(jit.gpr[31], interp.gpr[31]);
         assert_eq!(jit.gpr[31], pc + 8, "link register must be this instruction's address + 8");
@@ -2867,18 +2867,18 @@ mod tests {
     fn bltzal_bgezal_taken_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_FFFF_FFFF; // -1: BLTZAL taken, BGEZAL not taken
-        assert_branch_matches_interpreter(regimm_branch_layout(crate::mips_isa::RT_BLTZAL, 1), gpr);
+        assert_branch_matches_interpreter(regimm_branch_layout(crate::cpu::mips_isa::RT_BLTZAL, 1), gpr);
         gpr[1] = 0; // BGEZAL taken, BLTZAL not taken
-        assert_branch_matches_interpreter(regimm_branch_layout(crate::mips_isa::RT_BGEZAL, 1), gpr);
+        assert_branch_matches_interpreter(regimm_branch_layout(crate::cpu::mips_isa::RT_BGEZAL, 1), gpr);
     }
 
     #[test]
     fn bltzal_bgezal_not_taken_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0; // BLTZAL not taken
-        assert_branch_matches_interpreter(regimm_branch_layout(crate::mips_isa::RT_BLTZAL, 1), gpr);
+        assert_branch_matches_interpreter(regimm_branch_layout(crate::cpu::mips_isa::RT_BLTZAL, 1), gpr);
         gpr[1] = 0xFFFF_FFFF_FFFF_FFFF; // BGEZAL not taken
-        assert_branch_matches_interpreter(regimm_branch_layout(crate::mips_isa::RT_BGEZAL, 1), gpr);
+        assert_branch_matches_interpreter(regimm_branch_layout(crate::cpu::mips_isa::RT_BGEZAL, 1), gpr);
     }
 
     #[test]
@@ -2889,7 +2889,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0; // BLTZAL: not taken
-        let page = regimm_branch_layout(crate::mips_isa::RT_BLTZAL, 1);
+        let page = regimm_branch_layout(crate::cpu::mips_isa::RT_BLTZAL, 1);
         let interp = run_interpreter_page(&page, gpr, pc, 2);
         let jit = run_jit_page(&page, gpr, pc, 0, 1, &[]).expect("BLTZAL must compile");
         assert_eq!(jit.gpr[31], interp.gpr[31]);
@@ -2900,8 +2900,8 @@ mod tests {
 
     fn regimm_likely_layout(rt_field: u32, rs: u32) -> Vec<(u16, u32)> {
         vec![
-            (0, make_i(crate::mips_isa::OP_REGIMM, rs, rt_field, BRANCH_IMM)),
-            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (0, make_i(crate::cpu::mips_isa::OP_REGIMM, rs, rt_field, BRANCH_IMM)),
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
         ]
     }
 
@@ -2925,18 +2925,18 @@ mod tests {
     fn beql_bnel_taken_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 1; gpr[2] = 1;
-        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BEQL, 1, 2), gpr);
+        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BEQL, 1, 2), gpr);
         gpr[2] = 2;
-        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BNEL, 1, 2), gpr);
+        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BNEL, 1, 2), gpr);
     }
 
     #[test]
     fn beql_bnel_not_taken_annuls_slot_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 1; gpr[2] = 2; // not equal -> BEQL not taken
-        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BEQL, 1, 2), gpr);
+        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BEQL, 1, 2), gpr);
         gpr[2] = 1; // equal -> BNEL not taken
-        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BNEL, 1, 2), gpr);
+        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BNEL, 1, 2), gpr);
     }
 
     #[test]
@@ -2946,12 +2946,12 @@ mod tests {
         // never dispatched at all.
         let mut gpr = [0u64; 32];
         gpr[1] = 1; gpr[2] = 2; // not equal -> BEQL not taken
-        let jit = run_jit_page(&cond_branch_layout(crate::mips_isa::OP_BEQL, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
+        let jit = run_jit_page(&cond_branch_layout(crate::cpu::mips_isa::OP_BEQL, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
             .expect("BEQL region must compile");
         assert_eq!(jit.gpr[5], 0, "annulled slot must not execute");
 
         gpr[2] = 1; // equal -> taken
-        let jit = run_jit_page(&cond_branch_layout(crate::mips_isa::OP_BEQL, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
+        let jit = run_jit_page(&cond_branch_layout(crate::cpu::mips_isa::OP_BEQL, 1, 2), gpr, 0xFFFF_FFFF_8000_0000, 0, 1, &[])
             .expect("BEQL region must compile");
         assert_eq!(jit.gpr[5], 1, "slot must execute on the taken path");
     }
@@ -2960,22 +2960,22 @@ mod tests {
     fn blezl_bgtzl_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0;
-        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BLEZL, 1, 0), gpr);
-        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BGTZL, 1, 0), gpr);
+        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BLEZL, 1, 0), gpr);
+        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BGTZL, 1, 0), gpr);
         gpr[1] = 1;
-        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BLEZL, 1, 0), gpr);
-        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::mips_isa::OP_BGTZL, 1, 0), gpr);
+        assert_likely_not_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BLEZL, 1, 0), gpr);
+        assert_likely_taken_matches_interpreter(cond_branch_layout(crate::cpu::mips_isa::OP_BGTZL, 1, 0), gpr);
     }
 
     #[test]
     fn bltzl_bgezl_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_FFFF_FFFF; // -1
-        assert_likely_taken_matches_interpreter(regimm_likely_layout(crate::mips_isa::RT_BLTZL, 1), gpr);
-        assert_likely_not_taken_matches_interpreter(regimm_likely_layout(crate::mips_isa::RT_BGEZL, 1), gpr);
+        assert_likely_taken_matches_interpreter(regimm_likely_layout(crate::cpu::mips_isa::RT_BLTZL, 1), gpr);
+        assert_likely_not_taken_matches_interpreter(regimm_likely_layout(crate::cpu::mips_isa::RT_BGEZL, 1), gpr);
         gpr[1] = 0;
-        assert_likely_not_taken_matches_interpreter(regimm_likely_layout(crate::mips_isa::RT_BLTZL, 1), gpr);
-        assert_likely_taken_matches_interpreter(regimm_likely_layout(crate::mips_isa::RT_BGEZL, 1), gpr);
+        assert_likely_not_taken_matches_interpreter(regimm_likely_layout(crate::cpu::mips_isa::RT_BLTZL, 1), gpr);
+        assert_likely_taken_matches_interpreter(regimm_likely_layout(crate::cpu::mips_isa::RT_BGEZL, 1), gpr);
     }
 
     #[test]
@@ -2983,7 +2983,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_FFFF_FFFF; // -1: BLTZALL taken
-        let page = regimm_likely_layout(crate::mips_isa::RT_BLTZALL, 1);
+        let page = regimm_likely_layout(crate::cpu::mips_isa::RT_BLTZALL, 1);
         let interp = run_interpreter_page(&page, gpr, pc, 2);
         let jit = run_jit_page(&page, gpr, pc, 0, 1, &[]).expect("BLTZALL must compile");
         assert_eq!(jit, interp);
@@ -2993,7 +2993,7 @@ mod tests {
         // like BLTZAL), but the slot is annulled. BGEZALL is not-taken when
         // rs < 0.
         gpr[1] = 0xFFFF_FFFF_FFFF_FFFF; // -1
-        let page = regimm_likely_layout(crate::mips_isa::RT_BGEZALL, 1);
+        let page = regimm_likely_layout(crate::cpu::mips_isa::RT_BGEZALL, 1);
         let interp = run_interpreter_page(&page, gpr, pc, 1);
         let jit = run_jit_page(&page, gpr, pc, 0, 1, &[]).expect("BGEZALL must compile");
         assert_eq!(jit, interp);
@@ -3008,8 +3008,8 @@ mod tests {
     /// region is inherently isolated already.
     fn regjump_layout(op_funct: u32, rs: u32, rd: u32) -> Vec<(u16, u32)> {
         vec![
-            (0, make_r(crate::mips_isa::OP_SPECIAL, rs, 0, rd, 0, op_funct)),
-            (1, make_i(crate::mips_isa::OP_ADDIU, 0, 5, 1)),
+            (0, make_r(crate::cpu::mips_isa::OP_SPECIAL, rs, 0, rd, 0, op_funct)),
+            (1, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 1)),
         ]
     }
 
@@ -3017,7 +3017,7 @@ mod tests {
     fn jr_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000; // target register value (an arbitrary valid-looking address)
-        assert_branch_matches_interpreter(regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr);
+        assert_branch_matches_interpreter(regjump_layout(crate::cpu::mips_isa::FUNCT_JR, 1, 0), gpr);
     }
 
     #[test]
@@ -3025,7 +3025,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000;
-        let jit = run_jit_page(&regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
+        let jit = run_jit_page(&regjump_layout(crate::cpu::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
             .expect("JR region must compile");
         assert_eq!(jit.gpr[5], 1, "slot must execute");
         assert_eq!(jit.pc, gpr[1], "pc must be the register's own value, unmodified");
@@ -3050,7 +3050,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = 0xFFFF_FFFF_8000_5000 | off;
             assert_branch_matches_interpreter(
-                regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr);
+                regjump_layout(crate::cpu::mips_isa::FUNCT_JR, 1, 0), gpr);
         }
     }
 
@@ -3062,7 +3062,7 @@ mod tests {
             // rd=31: the link register must still be written even though the
             // transfer faults — JALR's link happens before the target is used.
             assert_branch_matches_interpreter(
-                regjump_layout(crate::mips_isa::FUNCT_JALR, 1, 31), gpr);
+                regjump_layout(crate::cpu::mips_isa::FUNCT_JALR, 1, 31), gpr);
         }
     }
 
@@ -3074,7 +3074,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5001; // misaligned
-        let jit = run_jit_page(&regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
+        let jit = run_jit_page(&regjump_layout(crate::cpu::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
             .expect("JR region must compile even with a misaligned target");
         assert_eq!(jit.gpr[5], 1,
             "the delay slot (ADDIU r5,r0,1) must have executed before the \
@@ -3091,7 +3091,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000;
-        let jit = run_jit_page(&regjump_layout(crate::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
+        let jit = run_jit_page(&regjump_layout(crate::cpu::mips_isa::FUNCT_JR, 1, 0), gpr, pc, 0, 1, &[])
             .expect("JR region must compile");
         assert_eq!(jit.pc, gpr[1], "aligned target installs unchanged");
         assert_eq!(jit.gpr[5], 1, "slot ran");
@@ -3105,7 +3105,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000;
-        let page = vec![(0u16, make_r(crate::mips_isa::OP_SPECIAL, 1, 0, 0, 0, crate::mips_isa::FUNCT_JR)), (1, 0)]; // word 1: real NOP
+        let page = vec![(0u16, make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR)), (1, 0)]; // word 1: real NOP
         let (jit, cycles) = run_jit_page_with_cycles(&page, gpr, pc, 0, 1, &[])
             .expect("JR+NOP region must compile");
         assert_eq!(jit.pc, gpr[1], "pc must be the register's own value, unmodified, with a fused NOP slot");
@@ -3196,7 +3196,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 42;
         gpr[2] = 42; // equal -> taken
-        let instr = make_i(crate::mips_isa::OP_BEQ, 1, 2, 0); // target irrelevant: ForeignPageSlot never resolves it on-page
+        let instr = make_i(crate::cpu::mips_isa::OP_BEQ, 1, 2, 0); // target irrelevant: ForeignPageSlot never resolves it on-page
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot, "taken branch must arm in_delay_slot");
@@ -3208,7 +3208,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 1;
         gpr[2] = 2; // not equal -> not taken
-        let instr = make_i(crate::mips_isa::OP_BEQ, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_BEQ, 1, 2, 0);
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot, "delay slot always executes, taken or not (§6.1.4) — must still be armed");
@@ -3221,7 +3221,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 42;
         gpr[2] = 42; // equal -> taken
-        let instr = make_i(crate::mips_isa::OP_BEQL, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_BEQL, 1, 2, 0);
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot, "annulling Likely's taken arm still executes its slot");
@@ -3238,7 +3238,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 1;
         gpr[2] = 2; // not equal -> not taken -> annulled
-        let instr = make_i(crate::mips_isa::OP_BEQL, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_BEQL, 1, 2, 0);
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(!jit.in_delay_slot, "annulled slot never executes — nothing to arm");
@@ -3248,7 +3248,7 @@ mod tests {
     #[test]
     fn j_at_0xffc_arms_foreign_page_slot() {
         let gpr = [0u64; 32];
-        let instr = make_j(crate::mips_isa::OP_J, 0x0400);
+        let instr = make_j(crate::cpu::mips_isa::OP_J, 0x0400);
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot, "J is unconditional — its slot always executes");
@@ -3258,7 +3258,7 @@ mod tests {
     #[test]
     fn jal_at_0xffc_arms_foreign_page_slot_and_writes_link_register() {
         let gpr = [0u64; 32];
-        let instr = make_j(crate::mips_isa::OP_JAL, 0x0400);
+        let instr = make_j(crate::cpu::mips_isa::OP_JAL, 0x0400);
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot);
@@ -3269,7 +3269,7 @@ mod tests {
     fn jr_at_0xffc_arms_foreign_page_slot() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 0, 0, 0, crate::mips_isa::FUNCT_JR);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot);
@@ -3281,7 +3281,7 @@ mod tests {
     fn jalr_at_0xffc_arms_foreign_page_slot_and_writes_link_register() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 0, 2, 0, crate::mips_isa::FUNCT_JALR); // rd=2
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 0, 2, 0, crate::cpu::mips_isa::FUNCT_JALR); // rd=2
         assert_0xffc_matches_interpreter(instr, gpr);
         let jit = run_0xffc_jit(instr, gpr);
         assert!(jit.in_delay_slot);
@@ -3304,8 +3304,8 @@ mod tests {
         let entry_word = LAST_WORD - 1;
         let pc = PAGE_A_BASE + (entry_word as u64) * 4;
         let page = vec![
-            (entry_word, make_i(crate::mips_isa::OP_ADDIU, 0, 1, 5)), // ADDIU r1,r0,5
-            (LAST_WORD, make_i(crate::mips_isa::OP_ADDIU, 1, 2, 7)),  // ADDIU r2,r1,7
+            (entry_word, make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 1, 5)), // ADDIU r1,r0,5
+            (LAST_WORD, make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 2, 7)),  // ADDIU r2,r1,7
         ];
         let gpr = [0u64; 32];
         let interp = run_interpreter_page(&page, gpr, pc, 2);
@@ -3342,7 +3342,7 @@ mod tests {
         // advanced past it) instead of bailing.
         let word: u16 = 10;
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
-        page_words[word as usize] = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 5); // ADDIU r1,r1,5
+        page_words[word as usize] = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 5); // ADDIU r1,r1,5
 
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, word, 0, 1);
@@ -3365,7 +3365,7 @@ mod tests {
         // anything": gpr[1] must show the ADDIU actually executed, and pc
         // must have advanced past it (word+1), not stayed at word (which is
         // what a preamble bail — Some(Hazard)/interrupt-caught — would do).
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(exec.core.gpr[1], 5, "entry instruction's real semantics must run despite the pending interrupt -- the preamble that would have bailed on it must be skipped");
         assert_eq!(exec.core.pc, pc + 4, "must have bailed at the normal end-of-region boundary (word+1, past the ADDIU), not at word itself (which is what a preamble bail on the pending interrupt would produce)");
     }
@@ -3414,9 +3414,9 @@ mod tests {
         // entry_word: ADD r2,r2,r3 -> 1 + 0x7FFFFFFE = 0x7FFFFFFF, harmless
         // on pass 1 (external entry); overflows on pass 2 (internal back-edge)
         // once r3 has advanced below.
-        page_words[entry_word as usize] = make_r(crate::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::mips_isa::FUNCT_ADD);
-        page_words[entry_word as usize + 1] = make_i(crate::mips_isa::OP_ADDIU, 3, 3, 1); // runway: r3 += 1
-        page_words[entry_word as usize + 2] = make_i(crate::mips_isa::OP_BEQ, 0, 0, 0xFFFD); // BEQ r0,r0,-3 -> target = entry_word (back-edge)
+        page_words[entry_word as usize] = make_r(crate::cpu::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::cpu::mips_isa::FUNCT_ADD);
+        page_words[entry_word as usize + 1] = make_i(crate::cpu::mips_isa::OP_ADDIU, 3, 3, 1); // runway: r3 += 1
+        page_words[entry_word as usize + 2] = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0xFFFD); // BEQ r0,r0,-3 -> target = entry_word (back-edge)
         page_words[entry_word as usize + 3] = 0; // delay slot (nop)
 
         let page: Vec<(u16, u32)> = (entry_word..entry_word + 4)
@@ -3444,7 +3444,7 @@ mod tests {
 
         assert_eq!(jit, interp, "JIT and interpreter diverged: entry_word's fault on its 2nd (internal-back-edge) pass must match the interpreter exactly");
         assert_eq!(jit.cp0_epc, pc, "EPC must be entry_word's own address on this, its 2nd (internal-back-edge) visit");
-        assert_eq!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "BD must be clear -- entry_word was reached via an ordinary internal branch edge on this pass, never a delay slot");
+        assert_eq!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "BD must be clear -- entry_word was reached via an ordinary internal branch edge on this pass, never a delay slot");
     }
 
     /// `j2 entrypre on`: the entry word samples interrupts too, and its bail
@@ -3462,14 +3462,14 @@ mod tests {
     fn entrypre_bail_preserves_pc_and_delay_slot_state() {
         // Held for the whole test: the toggle is a process-global every
         // concurrent compile reads (see ENTRY_PREAMBLE_TEST_LOCK).
-        let _lock = crate::jitv2::ENTRY_PREAMBLE_TEST_LOCK
+        let _lock = crate::cpu::jitv2::ENTRY_PREAMBLE_TEST_LOCK
             .lock().unwrap_or_else(|e| e.into_inner());
-        let prev = crate::jitv2::entry_preamble_forced();
-        crate::jitv2::set_entry_preamble_forced(true);
+        let prev = crate::cpu::jitv2::entry_preamble_forced();
+        crate::cpu::jitv2::set_entry_preamble_forced(true);
 
         let word: u16 = 10;
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
-        page_words[word as usize] = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 5); // ADDIU r1,r1,5
+        page_words[word as usize] = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 5); // ADDIU r1,r1,5
 
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page_words, word, PAGE_A_BASE as u32, 1);
@@ -3495,7 +3495,7 @@ mod tests {
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
         std::mem::forget(codegen);
 
-        assert_eq!(status, crate::mips_exec::EXEC_FALLBACK,
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_FALLBACK,
             "a pending interrupt at an external entry must bail to the interpreter");
         assert_eq!(exec.core.gpr[1], r1_before,
             "the entry instruction's semantics must NOT have run");
@@ -3506,7 +3506,7 @@ mod tests {
         assert_eq!(exec.core.delay_slot_target, target,
             "and so must its target");
 
-        crate::jitv2::set_entry_preamble_forced(prev);
+        crate::cpu::jitv2::set_entry_preamble_forced(prev);
     }
 
     #[test]
@@ -3527,8 +3527,8 @@ mod tests {
         // entry_word never actually happens on this call).
         let word: u16 = 10;
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
-        page_words[word as usize] = make_i(crate::mips_isa::OP_ADDIU, 2, 2, 1); // ADDIU r2,r2,1 (entry)
-        page_words[word as usize + 1] = make_i(crate::mips_isa::OP_BEQ, 0, 0, 0xFFFF); // BEQ r0,r0,-1 -> target = word
+        page_words[word as usize] = make_i(crate::cpu::mips_isa::OP_ADDIU, 2, 2, 1); // ADDIU r2,r2,1 (entry)
+        page_words[word as usize + 1] = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0xFFFF); // BEQ r0,r0,-1 -> target = word
         page_words[word as usize + 2] = 0; // delay slot (nop)
 
         let mut analyzer = Analyzer::new();
@@ -3549,7 +3549,7 @@ mod tests {
         // delivered yet at this point -- the caller (step_jit) must fall back
         // to the interpreter (step_int), whose step_preamble! actually
         // delivers it. See emit_pending_interrupt_preamble's doc comment.
-        assert_eq!(status, crate::mips_exec::EXEC_FALLBACK);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_FALLBACK);
         assert_eq!(exec.core.pc, pc + 4, "the branch's own (never skip-exempt) preamble must catch the pending interrupt and bail at its own word, before ever taking the back-edge into entry_word");
     }
 
@@ -3591,7 +3591,7 @@ mod tests {
         let (exec, _mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0xFFFF_FFFF_9FC1_0000u64, "must land on the next page, not stay on this one");
     }
 
@@ -3618,9 +3618,9 @@ mod tests {
         // own (word+6) target, even though BEQ is unconditionally taken.
         // The ADDU must still execute exactly once (JR's mandatory slot).
         let word: u16 = 10;
-        let branch_raw = make_i(crate::mips_isa::OP_BEQ, 0, 0, 5);
-        let slot_raw = make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR);
-        let inner_slot_raw = make_r(crate::mips_isa::OP_SPECIAL, 8, 9, 10, 0, crate::mips_isa::FUNCT_ADDU);
+        let branch_raw = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 5);
+        let slot_raw = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+        let inner_slot_raw = make_r(crate::cpu::mips_isa::OP_SPECIAL, 8, 9, 10, 0, crate::cpu::mips_isa::FUNCT_ADDU);
 
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
         page_words[word as usize] = branch_raw;
@@ -3644,7 +3644,7 @@ mod tests {
         let (exec, _mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(exec.core.pc, 0xFFFF_FFFF_8000_9000u64, "innermost (JR ra) transfer must win over the outer BEQ's own target");
         assert_eq!(exec.core.gpr[10], 123, "JR's own mandatory slot (the ADDU) must still execute exactly once");
         assert!(!exec.core.in_delay_slot, "in_delay_slot must be restored/cleared, not left set from the nested dispatch");
@@ -3718,7 +3718,7 @@ mod tests {
         let (exec, _mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(exec.core.pc, int_pc, "pc must match the interpreter");
         assert_eq!(exec.core.in_delay_slot, int_bd, "in_delay_slot must match the interpreter");
         if int_bd {
@@ -3748,7 +3748,7 @@ mod tests {
         let head_word: u16 = 4;
         let slot_word = head_word + 1;
         // MTC0 r1, $12 — Classify::Excluded, so it can never be inlined.
-        let excluded = make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_MTC0, 1, 12, 0, 0);
+        let excluded = make_r(crate::cpu::mips_isa::OP_COP0, crate::cpu::mips_isa::RS_MTC0, 1, 12, 0, 0);
         let page = [(head_word, branch_raw), (slot_word, excluded)];
 
         let page_base = 0xFFFF_FFFF_9FC0_F000u64;
@@ -3774,7 +3774,7 @@ mod tests {
         let (exec, _mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(exec.core.pc, int_pc, "pc must match the interpreter");
         assert_eq!(exec.core.in_delay_slot, int_bd, "in_delay_slot must match the interpreter");
         if int_bd {
@@ -3788,7 +3788,7 @@ mod tests {
     fn branch_taken_with_excluded_delay_slot_defers_like_the_interpreter() {
         // BEQ r0,r0,+3 — always taken.
         check_excluded_delay_slot_deferred(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 3),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 3),
             [0u64; 32],
         );
     }
@@ -3798,7 +3798,7 @@ mod tests {
         // BNE r0,r0,+3 — never taken; the slot still executes (non-annulling),
         // so the pending transfer is the fallthrough.
         check_excluded_delay_slot_deferred(
-            make_i(crate::mips_isa::OP_BNE, 0, 0, 3),
+            make_i(crate::cpu::mips_isa::OP_BNE, 0, 0, 3),
             [0u64; 32],
         );
     }
@@ -3807,7 +3807,7 @@ mod tests {
     fn jump_with_excluded_delay_slot_defers_like_the_interpreter() {
         // Unconditional J — single-edge shape.
         check_excluded_delay_slot_deferred(
-            make_j(crate::mips_isa::OP_J, 0x3F0_F008 >> 2),
+            make_j(crate::cpu::mips_isa::OP_J, 0x3F0_F008 >> 2),
             [0u64; 32],
         );
     }
@@ -3816,8 +3816,8 @@ mod tests {
     fn nested_branch_at_last_word_with_foreign_page_slot_matches_interpreter() {
         // BEQ r0,r0,+4 at 1022 -> nested BEQ r0,r0,+2 at 1023 (always taken).
         check_nested_foreign_page_slot(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 2),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 2),
             [0u64; 32],
         );
     }
@@ -3827,8 +3827,8 @@ mod tests {
         // Unconditional J at 1023 — emit_nested_foreign_page_slot_branch's
         // `Always` arm.
         check_nested_foreign_page_slot(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-            make_j(crate::mips_isa::OP_J, 0x0740_0000 >> 2),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+            make_j(crate::cpu::mips_isa::OP_J, 0x0740_0000 >> 2),
             [0u64; 32],
         );
     }
@@ -3840,8 +3840,8 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[31] = 0xFFFF_FFFF_8000_9000;
         check_nested_foreign_page_slot(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-            make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+            make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR),
             gpr,
         );
     }
@@ -3873,8 +3873,8 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[31] = 0xFFFF_FFFF_8000_9000 | off;
             check_nested_foreign_page_slot(
-                make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-                make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR),
+                make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+                make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR),
                 gpr,
             );
         }
@@ -3888,8 +3888,8 @@ mod tests {
         // `branch_delay(pc + 8)`) rather than landing on word + 2 directly,
         // which would wrongly skip it.
         check_nested_foreign_page_slot(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-            make_i(crate::mips_isa::OP_BNE, 0, 0, 2), // r0 == r0 -> never taken
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::cpu::mips_isa::OP_BNE, 0, 0, 2), // r0 == r0 -> never taken
             [0u64; 32],
         );
     }
@@ -3906,8 +3906,8 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 1; // r1 != r0 -> BEQL not taken -> slot annulled
         check_nested_foreign_page_slot(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-            make_i(crate::mips_isa::OP_BEQL, 1, 0, 2),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::cpu::mips_isa::OP_BEQL, 1, 0, 2),
             gpr,
         );
     }
@@ -3918,8 +3918,8 @@ mod tests {
         // annulled here, so the transfer must be armed like any other.
         let gpr = [0u64; 32]; // r0 == r0 -> BEQL taken
         check_nested_foreign_page_slot(
-            make_i(crate::mips_isa::OP_BEQ, 0, 0, 4),
-            make_i(crate::mips_isa::OP_BEQL, 0, 0, 2),
+            make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 4),
+            make_i(crate::cpu::mips_isa::OP_BEQL, 0, 0, 2),
             gpr,
         );
     }
@@ -3942,7 +3942,7 @@ mod tests {
     #[test]
     #[cfg(feature = "jitv2_smc_check")]
     fn smc_check_fires_on_write_to_executing_page_and_not_elsewhere() {
-        use crate::mips_exec::SMC_HITS;
+        use crate::cpu::mips_exec::SMC_HITS;
         use std::sync::atomic::Ordering;
 
         // `SMC_HITS` is a process-global counter and the suite runs tests in
@@ -3950,7 +3950,7 @@ mod tests {
         // executing page bumps it too. Serialize on the existing shared test
         // lock so the deltas measured below are this test's alone — without
         // this the negative assertion is flaky (observed once).
-        let _serialize = crate::jitv2::analyzer::FALLBACK_TEST_LOCK
+        let _serialize = crate::cpu::jitv2::analyzer::FALLBACK_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -3961,8 +3961,8 @@ mod tests {
         gpr[2] = pc + PAGE_SIZE as u64 * 4;
         let (exec, mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
-        let sw_here = make_i(crate::mips_isa::OP_SW, 1, 0, 0); // sw r0, 0(r1)
-        let sw_away = make_i(crate::mips_isa::OP_SW, 2, 0, 0); // sw r0, 0(r2)
+        let sw_here = make_i(crate::cpu::mips_isa::OP_SW, 1, 0, 0); // sw r0, 0(r1)
+        let sw_away = make_i(crate::cpu::mips_isa::OP_SW, 2, 0, 0); // sw r0, 0(r2)
         // Seed both the virtual and the masked-physical alias: the fetch
         // path translates (kseg0 -> low physical), so writing only the
         // virtual address leaves the CPU fetching zeros. Same pattern the
@@ -4001,8 +4001,8 @@ mod tests {
         // produce the architecturally correct final state: same as running
         // the interpreter for the same number of iterations by hand.
         let word: u16 = 10;
-        let branch_raw = make_i(crate::mips_isa::OP_BGTZ, 2, 0, 0xFFFF); // BGTZ r2,-1
-        let slot_raw = make_r(crate::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::mips_isa::FUNCT_SUBU);
+        let branch_raw = make_i(crate::cpu::mips_isa::OP_BGTZ, 2, 0, 0xFFFF); // BGTZ r2,-1
+        let slot_raw = make_r(crate::cpu::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::cpu::mips_isa::FUNCT_SUBU);
 
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
         page_words[word as usize] = branch_raw;
@@ -4033,7 +4033,7 @@ mod tests {
         let (exec, _mem) = seeded_executor(gpr, pc);
         let mut exec = Box::new(exec);
         let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
-        assert_eq!(status, crate::mips_exec::EXEC_COMPLETE);
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_COMPLETE);
         assert_eq!(exec.core.gpr[2] as i64, -3, "native convergence must match hand-computed interpreter-equivalent result");
     }
 
@@ -4044,7 +4044,7 @@ mod tests {
         // rd=8: JALR's link register is whatever `rd` decodes to, NOT
         // always r31 (unlike J/JAL/BLTZAL/BGEZAL) — pick a non-r31 register
         // specifically to catch a codegen bug that hardcodes r31.
-        assert_branch_matches_interpreter(regjump_layout(crate::mips_isa::FUNCT_JALR, 1, 8), gpr);
+        assert_branch_matches_interpreter(regjump_layout(crate::cpu::mips_isa::FUNCT_JALR, 1, 8), gpr);
     }
 
     #[test]
@@ -4052,7 +4052,7 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_0000u64;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_5000;
-        let jit = run_jit_page(&regjump_layout(crate::mips_isa::FUNCT_JALR, 1, 8), gpr, pc, 0, 1, &[])
+        let jit = run_jit_page(&regjump_layout(crate::cpu::mips_isa::FUNCT_JALR, 1, 8), gpr, pc, 0, 1, &[])
             .expect("JALR region must compile");
         assert_eq!(jit.gpr[8], pc + 8, "rd (r8) must hold the link address");
         assert_eq!(jit.gpr[31], 0, "r31 must be untouched when rd != 31");
@@ -4063,22 +4063,22 @@ mod tests {
         // The common `jr ra` return idiom.
         let mut gpr = [0u64; 32];
         gpr[31] = 0xFFFF_FFFF_8000_9000;
-        assert_branch_matches_interpreter(regjump_layout(crate::mips_isa::FUNCT_JR, 31, 0), gpr);
+        assert_branch_matches_interpreter(regjump_layout(crate::cpu::mips_isa::FUNCT_JR, 31, 0), gpr);
     }
 
     // ---- Batch 5: 64-bit ALU ops ------
 
     #[test]
     fn daddu_dsubu_match_interpreter() {
-        alu_rrr_case(crate::mips_isa::FUNCT_DADDU, u64::MAX, 1); // full 64-bit wraparound
-        alu_rrr_case(crate::mips_isa::FUNCT_DADDU, 100, 200);
-        alu_rrr_case(crate::mips_isa::FUNCT_DSUBU, 0, 1); // full 64-bit wraparound
-        alu_rrr_case(crate::mips_isa::FUNCT_DSUBU, 200, 100);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_DADDU, u64::MAX, 1); // full 64-bit wraparound
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_DADDU, 100, 200);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_DSUBU, 0, 1); // full 64-bit wraparound
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_DSUBU, 200, 100);
     }
 
     #[test]
     fn dadd_no_overflow_matches_interpreter() {
-        alu_rrr_case(crate::mips_isa::FUNCT_DADD, 100, 200);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_DADD, 100, 200);
     }
 
     #[test]
@@ -4086,7 +4086,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF_FFFF_FFFF; // i64::MAX
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_DADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_DADD);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -4097,7 +4097,7 @@ mod tests {
 
     #[test]
     fn dsub_no_overflow_matches_interpreter() {
-        alu_rrr_case(crate::mips_isa::FUNCT_DSUB, 200, 100);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_DSUB, 200, 100);
     }
 
     #[test]
@@ -4105,7 +4105,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x8000_0000_0000_0000; // i64::MIN
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_DSUB);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_DSUB);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -4117,9 +4117,9 @@ mod tests {
     #[test]
     fn dsll_dsrl_dsra_match_interpreter() {
         for sa in [0u32, 1, 31, 63] {
-            shift_imm_case(crate::mips_isa::FUNCT_DSLL, 0x8765_4321_FEDC_BA98, sa);
-            shift_imm_case(crate::mips_isa::FUNCT_DSRL, 0x8765_4321_FEDC_BA98, sa);
-            shift_imm_case(crate::mips_isa::FUNCT_DSRA, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_DSLL, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_DSRL, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_DSRA, 0x8765_4321_FEDC_BA98, sa);
         }
     }
 
@@ -4127,9 +4127,9 @@ mod tests {
     fn dsll32_dsrl32_dsra32_match_interpreter() {
         // sa field itself only spans 0..31; the "+32" is baked into the emitter.
         for sa in [0u32, 1, 15, 31] {
-            shift_imm_case(crate::mips_isa::FUNCT_DSLL32, 0x8765_4321_FEDC_BA98, sa);
-            shift_imm_case(crate::mips_isa::FUNCT_DSRL32, 0x8765_4321_FEDC_BA98, sa);
-            shift_imm_case(crate::mips_isa::FUNCT_DSRA32, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_DSLL32, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_DSRL32, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_DSRA32, 0x8765_4321_FEDC_BA98, sa);
         }
     }
 
@@ -4138,9 +4138,9 @@ mod tests {
         for sa in [0u64, 1, 31, 63, 0xFFFF_FFFF_FFFF_FFFF] {
             // rs supplies the shift amount, masked to 6 bits (0x3F) — exercise
             // a value with high bits set to confirm the mask is applied.
-            shift_var_case(crate::mips_isa::FUNCT_DSLLV, sa, 0x8765_4321_FEDC_BA98);
-            shift_var_case(crate::mips_isa::FUNCT_DSRLV, sa, 0x8765_4321_FEDC_BA98);
-            shift_var_case(crate::mips_isa::FUNCT_DSRAV, sa, 0x8765_4321_FEDC_BA98);
+            shift_var_case(crate::cpu::mips_isa::FUNCT_DSLLV, sa, 0x8765_4321_FEDC_BA98);
+            shift_var_case(crate::cpu::mips_isa::FUNCT_DSRLV, sa, 0x8765_4321_FEDC_BA98);
+            shift_var_case(crate::cpu::mips_isa::FUNCT_DSRAV, sa, 0x8765_4321_FEDC_BA98);
         }
     }
 
@@ -4150,12 +4150,12 @@ mod tests {
     fn mfhi_mflo_mthi_mtlo_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xDEAD_BEEF_1234_5678;
-        for funct in [crate::mips_isa::FUNCT_MFHI, crate::mips_isa::FUNCT_MFLO] {
-            let instr = make_r(crate::mips_isa::OP_SPECIAL, 0, 0, 3, 0, funct);
+        for funct in [crate::cpu::mips_isa::FUNCT_MFHI, crate::cpu::mips_isa::FUNCT_MFLO] {
+            let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 0, 3, 0, funct);
             assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
         }
-        for funct in [crate::mips_isa::FUNCT_MTHI, crate::mips_isa::FUNCT_MTLO] {
-            let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 0, 0, 0, funct);
+        for funct in [crate::cpu::mips_isa::FUNCT_MTHI, crate::cpu::mips_isa::FUNCT_MTLO] {
+            let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 0, 0, 0, funct);
             assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
         }
     }
@@ -4164,49 +4164,49 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;
         gpr[2] = rt_val;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, funct);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn mult_matches_interpreter() {
-        mult_case(crate::mips_isa::FUNCT_MULT, 1000, 2000);
-        mult_case(crate::mips_isa::FUNCT_MULT, 0xFFFF_FFFF, 0xFFFF_FFFF); // (-1)*(-1) = 1
-        mult_case(crate::mips_isa::FUNCT_MULT, 0x7FFF_FFFF, 0x7FFF_FFFF); // large positive product
+        mult_case(crate::cpu::mips_isa::FUNCT_MULT, 1000, 2000);
+        mult_case(crate::cpu::mips_isa::FUNCT_MULT, 0xFFFF_FFFF, 0xFFFF_FFFF); // (-1)*(-1) = 1
+        mult_case(crate::cpu::mips_isa::FUNCT_MULT, 0x7FFF_FFFF, 0x7FFF_FFFF); // large positive product
     }
 
     #[test]
     fn multu_matches_interpreter() {
-        mult_case(crate::mips_isa::FUNCT_MULTU, 1000, 2000);
-        mult_case(crate::mips_isa::FUNCT_MULTU, 0xFFFF_FFFF, 0xFFFF_FFFF);
-        mult_case(crate::mips_isa::FUNCT_MULTU, 0x8000_0000, 2);
+        mult_case(crate::cpu::mips_isa::FUNCT_MULTU, 1000, 2000);
+        mult_case(crate::cpu::mips_isa::FUNCT_MULTU, 0xFFFF_FFFF, 0xFFFF_FFFF);
+        mult_case(crate::cpu::mips_isa::FUNCT_MULTU, 0x8000_0000, 2);
     }
 
     fn div_case(funct: u32, rs_val: u64, rt_val: u64) {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;
         gpr[2] = rt_val;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, funct);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn div_matches_interpreter() {
-        div_case(crate::mips_isa::FUNCT_DIV, 100, 7);
-        div_case(crate::mips_isa::FUNCT_DIV, 0xFFFF_FFFF_FFFF_FFFF, 3); // -1 / 3
-        div_case(crate::mips_isa::FUNCT_DIV, 0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_FFFF_FFFF); // i32::MIN / -1
+        div_case(crate::cpu::mips_isa::FUNCT_DIV, 100, 7);
+        div_case(crate::cpu::mips_isa::FUNCT_DIV, 0xFFFF_FFFF_FFFF_FFFF, 3); // -1 / 3
+        div_case(crate::cpu::mips_isa::FUNCT_DIV, 0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_FFFF_FFFF); // i32::MIN / -1
     }
 
     #[test]
     fn div_by_zero_is_noop_matches_interpreter() {
-        div_case(crate::mips_isa::FUNCT_DIV, 100, 0);
-        div_case(crate::mips_isa::FUNCT_DIVU, 100, 0);
+        div_case(crate::cpu::mips_isa::FUNCT_DIV, 100, 0);
+        div_case(crate::cpu::mips_isa::FUNCT_DIVU, 100, 0);
     }
 
     #[test]
     fn divu_matches_interpreter() {
-        div_case(crate::mips_isa::FUNCT_DIVU, 100, 7);
-        div_case(crate::mips_isa::FUNCT_DIVU, 0xFFFF_FFFF, 3);
+        div_case(crate::cpu::mips_isa::FUNCT_DIVU, 100, 7);
+        div_case(crate::cpu::mips_isa::FUNCT_DIVU, 0xFFFF_FFFF, 3);
     }
 
     #[test]
@@ -4215,23 +4215,23 @@ mod tests {
         // large-positive/-1-times--1 cases here genuinely produce a
         // nonzero hi half (unlike MULT, where every 32x32 product fits in
         // the lo half alone), exercising smulhi, not just imul.
-        mult_case(crate::mips_isa::FUNCT_DMULT, 1_000_000_000_000, 2_000_000_000_000);
-        mult_case(crate::mips_isa::FUNCT_DMULT, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF); // (-1)*(-1) = 1
-        mult_case(crate::mips_isa::FUNCT_DMULT, 0x7FFF_FFFF_FFFF_FFFF, 0x7FFF_FFFF_FFFF_FFFF); // i64::MAX^2
-        mult_case(crate::mips_isa::FUNCT_DMULT, 0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_8000_0000); // i64::MIN^2
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULT, 1_000_000_000_000, 2_000_000_000_000);
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULT, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF); // (-1)*(-1) = 1
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULT, 0x7FFF_FFFF_FFFF_FFFF, 0x7FFF_FFFF_FFFF_FFFF); // i64::MAX^2
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULT, 0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_8000_0000); // i64::MIN^2
     }
 
     #[test]
     fn dmultu_matches_interpreter() {
-        mult_case(crate::mips_isa::FUNCT_DMULTU, 1_000_000_000_000, 2_000_000_000_000);
-        mult_case(crate::mips_isa::FUNCT_DMULTU, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF);
-        mult_case(crate::mips_isa::FUNCT_DMULTU, 0x8000_0000_0000_0000, 2);
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULTU, 1_000_000_000_000, 2_000_000_000_000);
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULTU, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF);
+        mult_case(crate::cpu::mips_isa::FUNCT_DMULTU, 0x8000_0000_0000_0000, 2);
     }
 
     #[test]
     fn ddiv_matches_interpreter() {
-        div_case(crate::mips_isa::FUNCT_DDIV, 100, 7);
-        div_case(crate::mips_isa::FUNCT_DDIV, 0xFFFF_FFFF_FFFF_FFFF, 3); // -1 / 3
+        div_case(crate::cpu::mips_isa::FUNCT_DDIV, 100, 7);
+        div_case(crate::cpu::mips_isa::FUNCT_DDIV, 0xFFFF_FFFF_FFFF_FFFF, 3); // -1 / 3
     }
 
     #[test]
@@ -4242,19 +4242,19 @@ mod tests {
         // emit_ddiv_impl's overflow_block must reproduce (jump straight to
         // skip_block, no write to lo/hi at all), not DIV's "compute
         // MIN/wrap" pattern.
-        div_case(crate::mips_isa::FUNCT_DDIV, 0x8000_0000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF);
+        div_case(crate::cpu::mips_isa::FUNCT_DDIV, 0x8000_0000_0000_0000, 0xFFFF_FFFF_FFFF_FFFF);
     }
 
     #[test]
     fn ddiv_by_zero_is_noop_matches_interpreter() {
-        div_case(crate::mips_isa::FUNCT_DDIV, 100, 0);
-        div_case(crate::mips_isa::FUNCT_DDIVU, 100, 0);
+        div_case(crate::cpu::mips_isa::FUNCT_DDIV, 100, 0);
+        div_case(crate::cpu::mips_isa::FUNCT_DDIVU, 100, 0);
     }
 
     #[test]
     fn ddivu_matches_interpreter() {
-        div_case(crate::mips_isa::FUNCT_DDIVU, 100, 7);
-        div_case(crate::mips_isa::FUNCT_DDIVU, 0xFFFF_FFFF_FFFF_FFFF, 3);
+        div_case(crate::cpu::mips_isa::FUNCT_DDIVU, 100, 7);
+        div_case(crate::cpu::mips_isa::FUNCT_DDIVU, 0xFFFF_FFFF_FFFF_FFFF, 3);
     }
 
     // ---- Batch 3: remaining loads/stores ------
@@ -4263,8 +4263,8 @@ mod tests {
     fn lb_lbu_sign_and_zero_extend_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
-        let lb = make_i(crate::mips_isa::OP_LB, 1, 2, 0);
-        let lbu = make_i(crate::mips_isa::OP_LBU, 1, 2, 0);
+        let lb = make_i(crate::cpu::mips_isa::OP_LB, 1, 2, 0);
+        let lbu = make_i(crate::cpu::mips_isa::OP_LBU, 1, 2, 0);
         // High bit set -> LB sign-extends negative, LBU zero-extends.
         assert_jit_matches_interpreter_mem(lb, gpr, 0xFFFF_FFFF_8000_1000, &[(0xFFFF_FFFF_8010_0000, 0xFF)]);
         assert_jit_matches_interpreter_mem(lbu, gpr, 0xFFFF_FFFF_8000_1000, &[(0xFFFF_FFFF_8010_0000, 0xFF)]);
@@ -4276,8 +4276,8 @@ mod tests {
     fn lh_lhu_sign_and_zero_extend_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
-        let lh = make_i(crate::mips_isa::OP_LH, 1, 2, 0);
-        let lhu = make_i(crate::mips_isa::OP_LHU, 1, 2, 0);
+        let lh = make_i(crate::cpu::mips_isa::OP_LH, 1, 2, 0);
+        let lhu = make_i(crate::cpu::mips_isa::OP_LHU, 1, 2, 0);
         assert_jit_matches_interpreter_mem(lh, gpr, 0xFFFF_FFFF_8000_1000, &[(0xFFFF_FFFF_8010_0000, 0xFFFF)]);
         assert_jit_matches_interpreter_mem(lhu, gpr, 0xFFFF_FFFF_8000_1000, &[(0xFFFF_FFFF_8010_0000, 0xFFFF)]);
     }
@@ -4286,7 +4286,7 @@ mod tests {
     fn lwu_zero_extends_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
-        let instr = make_i(crate::mips_isa::OP_LWU, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LWU, 1, 2, 0);
         assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000, &[(0xFFFF_FFFF_8010_0000, 0x8000_0001)]);
     }
 
@@ -4294,7 +4294,7 @@ mod tests {
     fn ld_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
-        let instr = make_i(crate::mips_isa::OP_LD, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LD, 1, 2, 0);
         // mem_init writes 32-bit words (set_word); LD reads 8 bytes, so seed
         // both halves of the doubleword.
         assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000,
@@ -4313,7 +4313,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned + offset; // base; imm=0
             gpr[2] = 0x1122_3344_5566_7788; // rt's pre-existing value, must partially survive
-            let instr = make_i(crate::mips_isa::OP_LWL, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_LWL, 1, 2, 0);
             assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000,
                 &[(aligned, 0xDEAD_BEEF)]);
         }
@@ -4326,7 +4326,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned + offset;
             gpr[2] = 0x1122_3344_5566_7788;
-            let instr = make_i(crate::mips_isa::OP_LWR, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 0);
             assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000,
                 &[(aligned, 0xDEAD_BEEF)]);
         }
@@ -4346,8 +4346,8 @@ mod tests {
         let base = 0xFFFF_FFFF_8010_0001u64; // deliberately unaligned
         let mut gpr = [0u64; 32];
         gpr[1] = base;
-        let lwl = make_i(crate::mips_isa::OP_LWL, 1, 2, 0);
-        let lwr = make_i(crate::mips_isa::OP_LWR, 1, 2, 3);
+        let lwl = make_i(crate::cpu::mips_isa::OP_LWL, 1, 2, 0);
+        let lwr = make_i(crate::cpu::mips_isa::OP_LWR, 1, 2, 3);
         let mem_init: &[(u64, u32)] = &[(0xFFFF_FFFF_8010_0000u64, 0xDEAD_BEEFu32), (0xFFFF_FFFF_8010_0004u64, 0xCAFE_BABEu32)];
         let pc = 0xFFFF_FFFF_8000_1000u64;
 
@@ -4371,7 +4371,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned + offset;
             gpr[2] = 0x1122_3344_5566_7788;
-            let instr = make_i(crate::mips_isa::OP_LDL, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_LDL, 1, 2, 0);
             assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000, mem_init);
         }
     }
@@ -4384,7 +4384,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned + offset;
             gpr[2] = 0x1122_3344_5566_7788;
-            let instr = make_i(crate::mips_isa::OP_LDR, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_LDR, 1, 2, 0);
             assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000, mem_init);
         }
     }
@@ -4441,7 +4441,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned8 + offset;
             gpr[2] = 0xAABB_CCDD;
-            let instr = make_i(crate::mips_isa::OP_SWL, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_SWL, 1, 2, 0);
             assert_masked_store_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000u64, aligned8, seed);
         }
     }
@@ -4454,7 +4454,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned8 + offset;
             gpr[2] = 0xAABB_CCDD;
-            let instr = make_i(crate::mips_isa::OP_SWR, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_SWR, 1, 2, 0);
             assert_masked_store_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000u64, aligned8, seed);
         }
     }
@@ -4467,7 +4467,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned8 + offset;
             gpr[2] = 0xAABB_CCDD_EEFF_0011;
-            let instr = make_i(crate::mips_isa::OP_SDL, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_SDL, 1, 2, 0);
             assert_masked_store_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000u64, aligned8, seed);
         }
     }
@@ -4480,7 +4480,7 @@ mod tests {
             let mut gpr = [0u64; 32];
             gpr[1] = aligned8 + offset;
             gpr[2] = 0xAABB_CCDD_EEFF_0011;
-            let instr = make_i(crate::mips_isa::OP_SDR, 1, 2, 0);
+            let instr = make_i(crate::cpu::mips_isa::OP_SDR, 1, 2, 0);
             assert_masked_store_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000u64, aligned8, seed);
         }
     }
@@ -4498,8 +4498,8 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = base;
         gpr[2] = 0xDEAD_BEEF;
-        let swl = make_i(crate::mips_isa::OP_SWL, 1, 2, 0);
-        let swr = make_i(crate::mips_isa::OP_SWR, 1, 2, 3);
+        let swl = make_i(crate::cpu::mips_isa::OP_SWL, 1, 2, 0);
+        let swr = make_i(crate::cpu::mips_isa::OP_SWR, 1, 2, 3);
         let pc = 0xFFFF_FFFF_8000_1000u64;
 
         let mem_init = [(aligned8, (seed >> 32) as u32), (aligned8 + 4, seed as u32)];
@@ -4537,7 +4537,7 @@ mod tests {
 
     #[test]
     fn movz_matches_interpreter_taken_and_not_taken() {
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_MOVZ);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_MOVZ);
         for rt in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF] {
             let mut gpr = [0u64; 32];
             gpr[1] = 0xDEAD_BEEF_1234_5678;
@@ -4549,7 +4549,7 @@ mod tests {
 
     #[test]
     fn movn_matches_interpreter_taken_and_not_taken() {
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_MOVN);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_MOVN);
         for rt in [0u64, 1, 0xFFFF_FFFF_FFFF_FFFF] {
             let mut gpr = [0u64; 32];
             gpr[1] = 0xDEAD_BEEF_1234_5678;
@@ -4564,7 +4564,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 5;
         gpr[2] = 0; // condition true
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::mips_isa::FUNCT_MOVZ);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::cpu::mips_isa::FUNCT_MOVZ);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -4587,19 +4587,19 @@ mod tests {
                     gpr[1] = 0xCAFE_BABE_0000_0001;
                     gpr[3] = 0x2222_2222_2222_2222;
                     // rd=3, rs=1, cc field in bits [20:18], tf in bit 16.
-                    let instr = crate::mips_isa::OP_SPECIAL << 26
+                    let instr = crate::cpu::mips_isa::OP_SPECIAL << 26
                         | (1 << 21) // rs
                         | (0 << 16) // rt bit0 = tf, overwritten below
                         | (3 << 11) // rd
-                        | crate::mips_isa::FUNCT_MOVCI;
+                        | crate::cpu::mips_isa::FUNCT_MOVCI;
                     let instr = (instr & !(0x7 << 18)) | (cc << 18);
                     let instr = (instr & !(1 << 16)) | ((tf as u32) << 16);
 
                     let (mut interp_exec, _) = seeded_executor_over(MockMemory::new_not_compilable(), gpr, 0xFFFF_FFFF_8000_1000);
                     interp_exec.core.fpu_fcsr = 0;
                     interp_exec.core.set_fpu_cc(cc, cc_actual_value);
-                    if cu1 { interp_exec.core.cp0_status |= crate::mips_core::STATUS_CU1; }
-                    else { interp_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1; }
+                    if cu1 { interp_exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1; }
+                    else { interp_exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_CU1; }
                     interp_exec.exec(instr);
                     let interp_snapshot = CoreSnapshot::capture(&interp_exec.core);
 
@@ -4619,8 +4619,8 @@ mod tests {
                     let mut jit_exec = Box::new(jit_exec);
                     jit_exec.core.fpu_fcsr = 0;
                     jit_exec.core.set_fpu_cc(cc, cc_actual_value);
-                    if cu1 { jit_exec.core.cp0_status |= crate::mips_core::STATUS_CU1; }
-                    else { jit_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1; }
+                    if cu1 { jit_exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1; }
+                    else { jit_exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_CU1; }
                     jit_exec.install_jit_hooks();
                     unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
                     std::mem::forget(codegen);
@@ -4632,7 +4632,7 @@ mod tests {
                     // Guard against this sweep going vacuous again: with CU1
                     // clear both engines MUST have faulted; with CU1 set
                     // neither may have.
-                    let took_exception = (interp_snapshot.cp0_status & crate::mips_core::STATUS_EXL) != 0;
+                    let took_exception = (interp_snapshot.cp0_status & crate::cpu::mips_core::STATUS_EXL) != 0;
                     assert_eq!(took_exception, !cu1,
                         "MOVCI must fault exactly when CU1 is clear (cu1={}, cc={})", cu1, cc);
                 }
@@ -4657,7 +4657,7 @@ mod tests {
                     // fs=rd-position(1), fd=sa-position(3); cc/tf packed into
                     // the rt-position field: bits[20:18]=cc, bit16=tf.
                     let cc_tf = (cc << 2) | (tf as u32);
-                    let instr = make_r(crate::mips_isa::OP_COP1, fmt, cc_tf, 1, 3, crate::mips_isa::FUNCT_FMOVCF);
+                    let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, cc_tf, 1, 3, crate::cpu::mips_isa::FUNCT_FMOVCF);
 
                     let pc = 0xFFFF_FFFF_8000_1000u64;
                     let word_offset = (pc as u16 / 4) & 0x3FF;
@@ -4696,112 +4696,112 @@ mod tests {
 
     #[test]
     fn fmovcf_s_matches_interpreter_across_all_cc_and_tf_combinations() {
-        fmovcf_case(crate::mips_isa::RS_S, false);
-        fmovcf_case(crate::mips_isa::RS_S, true);
+        fmovcf_case(crate::cpu::mips_isa::RS_S, false);
+        fmovcf_case(crate::cpu::mips_isa::RS_S, true);
     }
 
     #[test]
     fn fmovcf_d_matches_interpreter_across_all_cc_and_tf_combinations() {
-        fmovcf_case(crate::mips_isa::RS_D, false);
-        fmovcf_case(crate::mips_isa::RS_D, true);
+        fmovcf_case(crate::cpu::mips_isa::RS_D, false);
+        fmovcf_case(crate::cpu::mips_isa::RS_D, true);
     }
 
     fn trap_case_rr(funct: u32, rs_val: u64, rt_val: u64) {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;
         gpr[2] = rt_val;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, funct);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn tge_matches_interpreter_taken_and_not_taken() {
-        trap_case_rr(crate::mips_isa::FUNCT_TGE, 5, 3); // taken: 5 >= 3
-        trap_case_rr(crate::mips_isa::FUNCT_TGE, 3, 5); // not taken
-        trap_case_rr(crate::mips_isa::FUNCT_TGE, 5, 5); // taken: equal
-        trap_case_rr(crate::mips_isa::FUNCT_TGE, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 < 0 signed: not taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGE, 5, 3); // taken: 5 >= 3
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGE, 3, 5); // not taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGE, 5, 5); // taken: equal
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGE, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 < 0 signed: not taken
     }
 
     #[test]
     fn tgeu_matches_interpreter_taken_and_not_taken() {
-        trap_case_rr(crate::mips_isa::FUNCT_TGEU, 5, 3);
-        trap_case_rr(crate::mips_isa::FUNCT_TGEU, 3, 5);
-        trap_case_rr(crate::mips_isa::FUNCT_TGEU, 0xFFFF_FFFF_FFFF_FFFF, 0); // unsigned: taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGEU, 5, 3);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGEU, 3, 5);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TGEU, 0xFFFF_FFFF_FFFF_FFFF, 0); // unsigned: taken
     }
 
     #[test]
     fn tlt_matches_interpreter_taken_and_not_taken() {
-        trap_case_rr(crate::mips_isa::FUNCT_TLT, 3, 5); // taken
-        trap_case_rr(crate::mips_isa::FUNCT_TLT, 5, 3); // not taken
-        trap_case_rr(crate::mips_isa::FUNCT_TLT, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 < 0 signed: taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TLT, 3, 5); // taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TLT, 5, 3); // not taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TLT, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 < 0 signed: taken
     }
 
     #[test]
     fn tltu_matches_interpreter_taken_and_not_taken() {
-        trap_case_rr(crate::mips_isa::FUNCT_TLTU, 3, 5);
-        trap_case_rr(crate::mips_isa::FUNCT_TLTU, 5, 3);
-        trap_case_rr(crate::mips_isa::FUNCT_TLTU, 0xFFFF_FFFF_FFFF_FFFF, 0); // unsigned: not taken
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TLTU, 3, 5);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TLTU, 5, 3);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TLTU, 0xFFFF_FFFF_FFFF_FFFF, 0); // unsigned: not taken
     }
 
     #[test]
     fn teq_matches_interpreter_taken_and_not_taken() {
-        trap_case_rr(crate::mips_isa::FUNCT_TEQ, 7, 7);
-        trap_case_rr(crate::mips_isa::FUNCT_TEQ, 7, 8);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TEQ, 7, 7);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TEQ, 7, 8);
     }
 
     #[test]
     fn tne_matches_interpreter_taken_and_not_taken() {
-        trap_case_rr(crate::mips_isa::FUNCT_TNE, 7, 8);
-        trap_case_rr(crate::mips_isa::FUNCT_TNE, 7, 7);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TNE, 7, 8);
+        trap_case_rr(crate::cpu::mips_isa::FUNCT_TNE, 7, 7);
     }
 
     fn trap_case_ri(rt: u32, rs_val: u64, imm: u16) {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;
-        let instr = make_i(crate::mips_isa::OP_REGIMM, 1, rt, imm);
+        let instr = make_i(crate::cpu::mips_isa::OP_REGIMM, 1, rt, imm);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn tgei_matches_interpreter_taken_and_not_taken() {
-        trap_case_ri(crate::mips_isa::RT_TGEI, 5, 3);
-        trap_case_ri(crate::mips_isa::RT_TGEI, 3, 5);
-        trap_case_ri(crate::mips_isa::RT_TGEI, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 >= 0 signed: not taken
+        trap_case_ri(crate::cpu::mips_isa::RT_TGEI, 5, 3);
+        trap_case_ri(crate::cpu::mips_isa::RT_TGEI, 3, 5);
+        trap_case_ri(crate::cpu::mips_isa::RT_TGEI, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 >= 0 signed: not taken
     }
 
     #[test]
     fn tgeiu_matches_interpreter_taken_and_not_taken() {
-        trap_case_ri(crate::mips_isa::RT_TGEIU, 5, 3);
-        trap_case_ri(crate::mips_isa::RT_TGEIU, 3, 5);
+        trap_case_ri(crate::cpu::mips_isa::RT_TGEIU, 5, 3);
+        trap_case_ri(crate::cpu::mips_isa::RT_TGEIU, 3, 5);
         // imm is sign-extended to -1 (0xFFFF...FFFF) then compared unsigned:
         // rs=5 < 0xFFFF...FFFF unsigned -> not taken.
-        trap_case_ri(crate::mips_isa::RT_TGEIU, 5, 0xFFFF);
+        trap_case_ri(crate::cpu::mips_isa::RT_TGEIU, 5, 0xFFFF);
     }
 
     #[test]
     fn tlti_matches_interpreter_taken_and_not_taken() {
-        trap_case_ri(crate::mips_isa::RT_TLTI, 3, 5);
-        trap_case_ri(crate::mips_isa::RT_TLTI, 5, 3);
-        trap_case_ri(crate::mips_isa::RT_TLTI, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 < 0 signed: taken
+        trap_case_ri(crate::cpu::mips_isa::RT_TLTI, 3, 5);
+        trap_case_ri(crate::cpu::mips_isa::RT_TLTI, 5, 3);
+        trap_case_ri(crate::cpu::mips_isa::RT_TLTI, 0xFFFF_FFFF_FFFF_FFFF, 0); // -1 < 0 signed: taken
     }
 
     #[test]
     fn tltiu_matches_interpreter_taken_and_not_taken() {
-        trap_case_ri(crate::mips_isa::RT_TLTIU, 3, 5);
-        trap_case_ri(crate::mips_isa::RT_TLTIU, 5, 3);
-        trap_case_ri(crate::mips_isa::RT_TLTIU, 5, 0xFFFF); // 5 < 0xFFFF...FFFF unsigned: taken
+        trap_case_ri(crate::cpu::mips_isa::RT_TLTIU, 3, 5);
+        trap_case_ri(crate::cpu::mips_isa::RT_TLTIU, 5, 3);
+        trap_case_ri(crate::cpu::mips_isa::RT_TLTIU, 5, 0xFFFF); // 5 < 0xFFFF...FFFF unsigned: taken
     }
 
     #[test]
     fn teqi_matches_interpreter_taken_and_not_taken() {
-        trap_case_ri(crate::mips_isa::RT_TEQI, 7, 7);
-        trap_case_ri(crate::mips_isa::RT_TEQI, 7, 8);
+        trap_case_ri(crate::cpu::mips_isa::RT_TEQI, 7, 7);
+        trap_case_ri(crate::cpu::mips_isa::RT_TEQI, 7, 8);
     }
 
     #[test]
     fn tnei_matches_interpreter_taken_and_not_taken() {
-        trap_case_ri(crate::mips_isa::RT_TNEI, 7, 8);
-        trap_case_ri(crate::mips_isa::RT_TNEI, 7, 7);
+        trap_case_ri(crate::cpu::mips_isa::RT_TNEI, 7, 8);
+        trap_case_ri(crate::cpu::mips_isa::RT_TNEI, 7, 7);
     }
 
     #[test]
@@ -4813,7 +4813,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 7;
         gpr[2] = 7;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::mips_isa::FUNCT_TEQ);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 0, 0, crate::cpu::mips_isa::FUNCT_TEQ);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -4826,7 +4826,7 @@ mod tests {
     fn sync_is_a_true_noop_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x1234;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::mips_isa::FUNCT_SYNC);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::cpu::mips_isa::FUNCT_SYNC);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -4834,7 +4834,7 @@ mod tests {
     fn pref_is_a_true_noop_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
-        let instr = make_i(crate::mips_isa::OP_PREF, 1, 0, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_PREF, 1, 0, 0);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
@@ -4843,7 +4843,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0000;
         gpr[2] = 0xFFFF_FFFF_FFFF_FFFF;
-        for op in [crate::mips_isa::OP_SB, crate::mips_isa::OP_SH, crate::mips_isa::OP_SD] {
+        for op in [crate::cpu::mips_isa::OP_SB, crate::cpu::mips_isa::OP_SH, crate::cpu::mips_isa::OP_SD] {
             let instr = make_i(op, 1, 2, 0);
             assert_jit_matches_interpreter_mem(instr, gpr, 0xFFFF_FFFF_8000_1000, &[]);
         }
@@ -4853,7 +4853,7 @@ mod tests {
     fn lh_unaligned_raises_adel_and_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8010_0001; // odd address, misaligned for halfword
-        let instr = make_i(crate::mips_isa::OP_LH, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LH, 1, 2, 0);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -4868,19 +4868,19 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;
         gpr[2] = rt_val;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, funct);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn subu_matches_interpreter() {
-        alu_rrr_case(crate::mips_isa::FUNCT_SUBU, 5, 20); // underflow case too
-        alu_rrr_case(crate::mips_isa::FUNCT_SUBU, 0x8000_0000, 1); // sign-extension boundary
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SUBU, 5, 20); // underflow case too
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SUBU, 0x8000_0000, 1); // sign-extension boundary
     }
 
     #[test]
     fn and_or_xor_nor_match_interpreter() {
-        for funct in [crate::mips_isa::FUNCT_AND, crate::mips_isa::FUNCT_OR, crate::mips_isa::FUNCT_XOR, crate::mips_isa::FUNCT_NOR] {
+        for funct in [crate::cpu::mips_isa::FUNCT_AND, crate::cpu::mips_isa::FUNCT_OR, crate::cpu::mips_isa::FUNCT_XOR, crate::cpu::mips_isa::FUNCT_NOR] {
             alu_rrr_case(funct, 0xFFFF_FFFF_0000_0000, 0x0000_FFFF_FFFF_0000);
             alu_rrr_case(funct, 0, 0);
             alu_rrr_case(funct, u64::MAX, 0);
@@ -4891,45 +4891,45 @@ mod tests {
     fn slt_sltu_match_interpreter() {
         // Signed vs. unsigned comparison must diverge for this pair: as i64,
         // -1 < 1; as u64, u64::MAX > 1 -- SLT and SLTU must disagree here.
-        alu_rrr_case(crate::mips_isa::FUNCT_SLT, u64::MAX, 1);
-        alu_rrr_case(crate::mips_isa::FUNCT_SLTU, u64::MAX, 1);
-        alu_rrr_case(crate::mips_isa::FUNCT_SLT, 1, 1);
-        alu_rrr_case(crate::mips_isa::FUNCT_SLTU, 1, 1);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SLT, u64::MAX, 1);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SLTU, u64::MAX, 1);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SLT, 1, 1);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SLTU, 1, 1);
     }
 
     fn shift_imm_case(funct: u32, rt_val: u64, sa: u32) {
         let mut gpr = [0u64; 32];
         gpr[2] = rt_val;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 0, 2, 3, sa, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 2, 3, sa, funct);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn sll_srl_sra_match_interpreter() {
         for sa in [0u32, 1, 15, 31] {
-            shift_imm_case(crate::mips_isa::FUNCT_SLL, 0x8765_4321_FEDC_BA98, sa);
-            shift_imm_case(crate::mips_isa::FUNCT_SRL, 0x8765_4321_FEDC_BA98, sa);
-            shift_imm_case(crate::mips_isa::FUNCT_SRA, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_SLL, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_SRL, 0x8765_4321_FEDC_BA98, sa);
+            shift_imm_case(crate::cpu::mips_isa::FUNCT_SRA, 0x8765_4321_FEDC_BA98, sa);
         }
     }
 
     #[test]
     fn sll_zero_is_true_nop() {
         // raw == 0 (sll r0, r0, 0) is the canonical NOP encoding.
-        shift_imm_case(crate::mips_isa::FUNCT_SLL, 0, 0);
+        shift_imm_case(crate::cpu::mips_isa::FUNCT_SLL, 0, 0);
     }
 
     fn shift_var_case(funct: u32, rs_val: u64, rt_val: u64) {
         let mut gpr = [0u64; 32];
         gpr[1] = rs_val;
         gpr[2] = rt_val;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, funct);
         assert_jit_matches_interpreter(instr, gpr, 0xFFFF_FFFF_8000_1000);
     }
 
     #[test]
     fn add_no_overflow_matches_interpreter() {
-        alu_rrr_case(crate::mips_isa::FUNCT_ADD, 10, 20);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_ADD, 10, 20);
     }
 
     #[test]
@@ -4939,7 +4939,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7FFF_FFFF;
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -4951,7 +4951,7 @@ mod tests {
 
     #[test]
     fn sub_no_overflow_matches_interpreter() {
-        alu_rrr_case(crate::mips_isa::FUNCT_SUB, 20, 5);
+        alu_rrr_case(crate::cpu::mips_isa::FUNCT_SUB, 20, 5);
     }
 
     #[test]
@@ -4960,7 +4960,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_0000; // sign-extended i32::MIN in a GPR
         gpr[2] = 1;
-        let instr = make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_SUB);
+        let instr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_SUB);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let interp = run_interpreter(instr, gpr, pc, &[]);
         let jit = run_jit(instr, gpr, pc, (pc as u16 / 4) & 0x3FF, &[])
@@ -4995,8 +4995,8 @@ mod tests {
         gpr[1] = 0x7FFF_FFFF;
         gpr[2] = 1;
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 5)), // always taken, target = 0+1+5 = word 6 (unreachable — slot traps first)
-            (1u16, make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD)), // delay slot: overflows
+            (0u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 5)), // always taken, target = 0+1+5 = word 6 (unreachable — slot traps first)
+            (1u16, make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD)), // delay slot: overflows
         ];
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let page_base = pc as u32; // pc is already page-aligned in this test
@@ -5022,7 +5022,7 @@ mod tests {
 
         assert_eq!(jit, interp, "EPC/Cause/pc must match the interpreter exactly");
         assert_eq!(jit.cp0_epc, pc, "EPC must point at the branch, not the delay slot");
-        assert_ne!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "Cause.BD must be set — exception raised from a delay slot");
+        assert_ne!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "Cause.BD must be set — exception raised from a delay slot");
         assert_eq!(jit.gpr[3], 0, "rd must be untouched when the slot's add traps");
     }
 
@@ -5063,11 +5063,11 @@ mod tests {
         gpr[3] = 0x7FFF_FFFE; // r3: one below overflow
 
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 2)), // taken, target = 0+1+2 = word 3
+            (0u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 2)), // taken, target = 0+1+2 = word 3
             // delay slot (word 1) -- inlined-slot pass: ADD r2,r2,r3 -> 0x7FFFFFFF, harmless
-            (1u16, make_r(crate::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::mips_isa::FUNCT_ADD)),
-            (3u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 0xFFFD)), // taken, target = 3+1+(-3) = word 1 (independent branch target)
-            (4u16, make_i(crate::mips_isa::OP_ADDIU, 3, 3, 1)), // word 3's own delay slot: r3 += 1, so word 1's 2nd pass overflows
+            (1u16, make_r(crate::cpu::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::cpu::mips_isa::FUNCT_ADD)),
+            (3u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0xFFFD)), // taken, target = 3+1+(-3) = word 1 (independent branch target)
+            (4u16, make_i(crate::cpu::mips_isa::OP_ADDIU, 3, 3, 1)), // word 3's own delay slot: r3 += 1, so word 1's 2nd pass overflows
         ];
 
         // 5 dispatches: word0 BEQ, word1 slot (1st pass), word3 BEQ, word4
@@ -5098,7 +5098,7 @@ mod tests {
 
         assert_eq!(jit, interp, "JIT and interpreter diverged: word 1's fault on its 2nd (independent-branch-target) pass must match the interpreter exactly, not anything left over from its 1st (inlined-delay-slot) pass");
         assert_eq!(jit.cp0_epc, pc + 4, "EPC must be word 1's own address on this, its 2nd (independent-branch-target) visit -- not word 0's address (which is what Cause.BD-set delay-slot EPC math would wrongly compute)");
-        assert_eq!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "BD must be clear -- word 1 was reached as an ordinary internal branch target on this pass, not a delay slot");
+        assert_eq!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "BD must be clear -- word 1 was reached as an ordinary internal branch target on this pass, not a delay slot");
     }
 
     /// Mirror of `word_both_inlined_delay_slot_and_independent_branch_target_matches_interpreter`
@@ -5125,10 +5125,10 @@ mod tests {
         gpr[3] = 1; // r3: ADD r2,r2,r3 overflows immediately, on the 1st (inlined-slot) pass
 
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 2)), // taken, target = 0+1+2 = word 3
+            (0u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 2)), // taken, target = 0+1+2 = word 3
             // delay slot (word 1) -- inlined-slot pass: ADD r2,r2,r3 overflows here, immediately
-            (1u16, make_r(crate::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::mips_isa::FUNCT_ADD)),
-            (3u16, make_i(crate::mips_isa::OP_BEQ, 0, 0, 0xFFFD)), // taken, target = word 1 -- never reached, the slot faults first
+            (1u16, make_r(crate::cpu::mips_isa::OP_SPECIAL, 2, 3, 2, 0, crate::cpu::mips_isa::FUNCT_ADD)),
+            (3u16, make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0xFFFD)), // taken, target = word 1 -- never reached, the slot faults first
         ];
 
         // 2 dispatches: word0 BEQ, word1 slot (1st pass, faults immediately) --
@@ -5155,7 +5155,7 @@ mod tests {
 
         assert_eq!(jit, interp, "JIT and interpreter diverged: word 1's fault on its 1st (inlined-delay-slot) pass must match the interpreter exactly");
         assert_eq!(jit.cp0_epc, pc, "EPC must be the BRANCH's address (word 0, pc - 4), not the slot's own address -- this fault happened while word 1 was inlined as word 0's delay slot");
-        assert_ne!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "BD must be set -- word 1 was executing as a delay slot on this, its 1st (inlined-slot) pass");
+        assert_ne!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "BD must be set -- word 1 was executing as a delay slot on this, its 1st (inlined-slot) pass");
         assert_eq!(jit.gpr[2], 0x7FFF_FFFF, "rd must be untouched when the slot's own add traps");
     }
 
@@ -5178,8 +5178,8 @@ mod tests {
         gpr[1] = 0x7FFF_FFFF;
         gpr[2] = 1;
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_BEQ, 1, 0, 5)), // r1 != r0 -> not taken
-            (1u16, make_r(crate::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::mips_isa::FUNCT_ADD)), // delay slot: overflows regardless
+            (0u16, make_i(crate::cpu::mips_isa::OP_BEQ, 1, 0, 5)), // r1 != r0 -> not taken
+            (1u16, make_r(crate::cpu::mips_isa::OP_SPECIAL, 1, 2, 3, 0, crate::cpu::mips_isa::FUNCT_ADD)), // delay slot: overflows regardless
         ];
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let page_base = pc as u32;
@@ -5205,7 +5205,7 @@ mod tests {
 
         assert_eq!(jit, interp, "EPC/Cause/pc must match the interpreter exactly");
         assert_eq!(jit.cp0_epc, pc, "EPC must point at the branch, not the delay slot, even though not taken");
-        assert_ne!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "Cause.BD must be set — the slot always executes, taken or not");
+        assert_ne!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "Cause.BD must be set — the slot always executes, taken or not");
         assert_eq!(jit.gpr[3], 0, "rd must be untouched when the slot's add traps");
     }
 
@@ -5222,8 +5222,8 @@ mod tests {
         gpr[2] = 0x7FFF_FFFF;
         gpr[3] = 1; // would overflow if the slot ever ran
         let page = vec![
-            (0u16, make_i(crate::mips_isa::OP_BEQL, 1, 0, 5)),
-            (1u16, make_r(crate::mips_isa::OP_SPECIAL, 2, 3, 4, 0, crate::mips_isa::FUNCT_ADD)), // would overflow if executed
+            (0u16, make_i(crate::cpu::mips_isa::OP_BEQL, 1, 0, 5)),
+            (1u16, make_r(crate::cpu::mips_isa::OP_SPECIAL, 2, 3, 4, 0, crate::cpu::mips_isa::FUNCT_ADD)), // would overflow if executed
         ];
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let page_base = pc as u32;
@@ -5259,7 +5259,7 @@ mod tests {
         assert_eq!(jit, interp, "annulled not-taken Likely branch must match the interpreter exactly");
         assert_eq!(jit.pc, pc + 8, "not taken lands past the annulled slot, word+2");
         assert!(!jit_in_delay_slot, "annulled slot must never set in_delay_slot");
-        assert_eq!(jit.cp0_cause & crate::mips_core::CAUSE_BD, 0, "Cause.BD must stay clear — no exception, and the slot never ran");
+        assert_eq!(jit.cp0_cause & crate::cpu::mips_core::CAUSE_BD, 0, "Cause.BD must stay clear — no exception, and the slot never ran");
         assert_eq!(jit.gpr[4], 0, "annulled slot's ADD must never have executed");
     }
 
@@ -5268,9 +5268,9 @@ mod tests {
         for sa in [0u64, 1, 15, 31, 63, 0xFFFF_FFFF] {
             // rs supplies the shift amount, masked to 5 bits by the emitter —
             // exercise values above 31 to confirm the mask is applied.
-            shift_var_case(crate::mips_isa::FUNCT_SLLV, sa, 0x8765_4321_FEDC_BA98);
-            shift_var_case(crate::mips_isa::FUNCT_SRLV, sa, 0x8765_4321_FEDC_BA98);
-            shift_var_case(crate::mips_isa::FUNCT_SRAV, sa, 0x8765_4321_FEDC_BA98);
+            shift_var_case(crate::cpu::mips_isa::FUNCT_SLLV, sa, 0x8765_4321_FEDC_BA98);
+            shift_var_case(crate::cpu::mips_isa::FUNCT_SRLV, sa, 0x8765_4321_FEDC_BA98);
+            shift_var_case(crate::cpu::mips_isa::FUNCT_SRAV, sa, 0x8765_4321_FEDC_BA98);
         }
     }
 
@@ -5281,7 +5281,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = (2.5f32).to_bits() as u64;
         fpr[2] = (1.25f32).to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 1, 3, crate::mips_isa::FUNCT_FADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 1, 3, crate::cpu::mips_isa::FUNCT_FADD);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -5290,7 +5290,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = (2.5f64).to_bits();
         fpr[2] = (1.25f64).to_bits();
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 2, 1, 3, crate::mips_isa::FUNCT_FADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 2, 1, 3, crate::cpu::mips_isa::FUNCT_FADD);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -5301,7 +5301,7 @@ mod tests {
         // half of slot 0), fd=2 (even, low half of slot 2).
         let mut fpr = [0u64; 32];
         fpr[0] = ((1.25f32).to_bits() as u64) | (((2.5f32).to_bits() as u64) << 32);
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 1, 0, 2, crate::mips_isa::FUNCT_FADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 1, 0, 2, crate::cpu::mips_isa::FUNCT_FADD);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, false);
     }
 
@@ -5311,7 +5311,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[0] = (2.5f64).to_bits();
         fpr[2] = (1.25f64).to_bits();
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 2, 0, 4, crate::mips_isa::FUNCT_FADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 2, 0, 4, crate::cpu::mips_isa::FUNCT_FADD);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, false);
     }
 
@@ -5323,7 +5323,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
         fpr[2] = (1.0f32).to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 1, 3, crate::mips_isa::FUNCT_FADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 1, 3, crate::cpu::mips_isa::FUNCT_FADD);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -5335,7 +5335,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = (1.0f32).to_bits() as u64;
         fpr[2] = (1.0f32).to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 1, 3, crate::mips_isa::FUNCT_FADD);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 1, 3, crate::cpu::mips_isa::FUNCT_FADD);
 
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let word_offset = (pc as u16 / 4) & 0x3FF;
@@ -5397,34 +5397,34 @@ mod tests {
 
     fn fbinop_case(funct: u32, fmt: u32, fs_val: f64, ft_val: f64) {
         let mut fpr = [0u64; 32];
-        if fmt == crate::mips_isa::RS_S {
+        if fmt == crate::cpu::mips_isa::RS_S {
             fpr[1] = (fs_val as f32).to_bits() as u64;
             fpr[2] = (ft_val as f32).to_bits() as u64;
         } else {
             fpr[1] = (fs_val).to_bits();
             fpr[2] = (ft_val).to_bits();
         }
-        let instr = make_r(crate::mips_isa::OP_COP1, fmt, 2, 1, 3, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 2, 1, 3, funct);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
     #[test]
     fn sub_s_d_match_interpreter() {
-        fbinop_case(crate::mips_isa::FUNCT_FSUB, crate::mips_isa::RS_S, 5.0, 3.0);
-        fbinop_case(crate::mips_isa::FUNCT_FSUB, crate::mips_isa::RS_D, 5.0, 3.0);
-        fbinop_case(crate::mips_isa::FUNCT_FSUB, crate::mips_isa::RS_S, 3.0, 5.0); // negative result
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FSUB, crate::cpu::mips_isa::RS_S, 5.0, 3.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FSUB, crate::cpu::mips_isa::RS_D, 5.0, 3.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FSUB, crate::cpu::mips_isa::RS_S, 3.0, 5.0); // negative result
     }
 
     #[test]
     fn mul_s_d_match_interpreter() {
-        fbinop_case(crate::mips_isa::FUNCT_FMUL, crate::mips_isa::RS_S, 2.5, 4.0);
-        fbinop_case(crate::mips_isa::FUNCT_FMUL, crate::mips_isa::RS_D, 2.5, 4.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FMUL, crate::cpu::mips_isa::RS_S, 2.5, 4.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FMUL, crate::cpu::mips_isa::RS_D, 2.5, 4.0);
     }
 
     #[test]
     fn div_s_d_match_interpreter() {
-        fbinop_case(crate::mips_isa::FUNCT_FDIV, crate::mips_isa::RS_S, 10.0, 4.0);
-        fbinop_case(crate::mips_isa::FUNCT_FDIV, crate::mips_isa::RS_D, 10.0, 4.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_S, 10.0, 4.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_D, 10.0, 4.0);
     }
 
     #[test]
@@ -5432,50 +5432,50 @@ mod tests {
         // FP divide-by-zero: unlike integer DIV (no-op on zero divisor),
         // this raises FCSR.Z and returns +/-Infinity per IEEE-754 — must
         // match the interpreter's FCSR flag accumulation exactly.
-        fbinop_case(crate::mips_isa::FUNCT_FDIV, crate::mips_isa::RS_S, 1.0, 0.0);
-        fbinop_case(crate::mips_isa::FUNCT_FDIV, crate::mips_isa::RS_D, 1.0, 0.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_S, 1.0, 0.0);
+        fbinop_case(crate::cpu::mips_isa::FUNCT_FDIV, crate::cpu::mips_isa::RS_D, 1.0, 0.0);
     }
 
     fn funop_case(funct: u32, fmt: u32, fs_val: f64) {
         let mut fpr = [0u64; 32];
-        if fmt == crate::mips_isa::RS_S {
+        if fmt == crate::cpu::mips_isa::RS_S {
             fpr[1] = (fs_val as f32).to_bits() as u64;
         } else {
             fpr[1] = fs_val.to_bits();
         }
-        let instr = make_r(crate::mips_isa::OP_COP1, fmt, 0, 1, 3, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 1, 3, funct);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
     #[test]
     fn sqrt_s_d_match_interpreter() {
-        funop_case(crate::mips_isa::FUNCT_FSQRT, crate::mips_isa::RS_S, 16.0);
-        funop_case(crate::mips_isa::FUNCT_FSQRT, crate::mips_isa::RS_D, 2.0);
+        funop_case(crate::cpu::mips_isa::FUNCT_FSQRT, crate::cpu::mips_isa::RS_S, 16.0);
+        funop_case(crate::cpu::mips_isa::FUNCT_FSQRT, crate::cpu::mips_isa::RS_D, 2.0);
     }
 
     #[test]
     fn sqrt_of_negative_matches_interpreter() {
         // Invalid operation (NaN result + FCSR.V) — bug-for-bug parity check.
-        funop_case(crate::mips_isa::FUNCT_FSQRT, crate::mips_isa::RS_S, -4.0);
+        funop_case(crate::cpu::mips_isa::FUNCT_FSQRT, crate::cpu::mips_isa::RS_S, -4.0);
     }
 
     #[test]
     fn abs_s_d_match_interpreter() {
-        funop_case(crate::mips_isa::FUNCT_FABS, crate::mips_isa::RS_S, -3.5);
-        funop_case(crate::mips_isa::FUNCT_FABS, crate::mips_isa::RS_D, -3.5);
-        funop_case(crate::mips_isa::FUNCT_FABS, crate::mips_isa::RS_S, 3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FABS, crate::cpu::mips_isa::RS_S, -3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FABS, crate::cpu::mips_isa::RS_D, -3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FABS, crate::cpu::mips_isa::RS_S, 3.5);
     }
 
     #[test]
     fn neg_s_d_match_interpreter() {
-        funop_case(crate::mips_isa::FUNCT_FNEG, crate::mips_isa::RS_S, 3.5);
-        funop_case(crate::mips_isa::FUNCT_FNEG, crate::mips_isa::RS_D, -3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FNEG, crate::cpu::mips_isa::RS_S, 3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FNEG, crate::cpu::mips_isa::RS_D, -3.5);
     }
 
     #[test]
     fn mov_s_d_match_interpreter() {
-        funop_case(crate::mips_isa::FUNCT_FMOV, crate::mips_isa::RS_S, 3.5);
-        funop_case(crate::mips_isa::FUNCT_FMOV, crate::mips_isa::RS_D, 3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FMOV, crate::cpu::mips_isa::RS_S, 3.5);
+        funop_case(crate::cpu::mips_isa::FUNCT_FMOV, crate::cpu::mips_isa::RS_D, 3.5);
     }
 
     #[test]
@@ -5485,7 +5485,7 @@ mod tests {
         // that WOULD raise flags under add/sub/mul/div (e.g. abs(NaN)).
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 1, 3, crate::mips_isa::FUNCT_FABS);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 3, crate::cpu::mips_isa::FUNCT_FABS);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -5495,7 +5495,7 @@ mod tests {
     fn mfc1_matches_interpreter() {
         let mut fpr = [0u64; 32];
         fpr[5] = 0xFFFF_FFFF_DEAD_BEEFu64; // high bits must be discarded, low 32 sign-extended
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_MFC1, 3, 5, 0, 0);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_MFC1, 3, 5, 0, 0);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -5503,7 +5503,7 @@ mod tests {
     fn dmfc1_matches_interpreter() {
         let mut fpr = [0u64; 32];
         fpr[5] = 0xFFFF_FFFF_DEAD_BEEFu64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_DMFC1, 3, 5, 0, 0);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_DMFC1, 3, 5, 0, 0);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -5511,7 +5511,7 @@ mod tests {
     fn mtc1_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[3] = 0xFFFF_FFFF_DEAD_BEEFu64; // MTC1 truncates to low 32 bits
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_MTC1, 3, 5, 0, 0);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_MTC1, 3, 5, 0, 0);
         assert_fpu_matches_interpreter(instr, gpr, [0u64; 32], true);
     }
 
@@ -5519,7 +5519,7 @@ mod tests {
     fn dmtc1_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[3] = 0xFFFF_FFFF_DEAD_BEEFu64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_DMTC1, 3, 5, 0, 0);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_DMTC1, 3, 5, 0, 0);
         assert_fpu_matches_interpreter(instr, gpr, [0u64; 32], true);
     }
 
@@ -5531,7 +5531,7 @@ mod tests {
         gpr[3] = 0xDEAD_BEEFu64;
         let mut fpr = [0u64; 32];
         fpr[0] = 0x1234_5678_0000_0000u64; // pre-existing even-half (reg 0) content
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_MTC1, 3, 1, 0, 0); // fs=1 (odd)
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_MTC1, 3, 1, 0, 0); // fs=1 (odd)
         assert_fpu_matches_interpreter(instr, gpr, fpr, false);
     }
 
@@ -5542,7 +5542,7 @@ mod tests {
         // and check reg 0 (FIR, read-only, nonzero default) instead, which
         // exercises the same read-path dispatch.
         let _ = &mut fpr;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CFC1, 3, 0, 0, 0); // fs=0 (FIR)
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 3, 0, 0, 0); // fs=0 (FIR)
         assert_fpu_matches_interpreter(instr, [0u64; 32], [0u64; 32], true);
     }
 
@@ -5550,9 +5550,9 @@ mod tests {
     fn ctc1_fexr_fenr_match_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[3] = 0x1234;
-        let instr_fexr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CTC1, 3, 26, 0, 0);
+        let instr_fexr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CTC1, 3, 26, 0, 0);
         assert_fpu_matches_interpreter(instr_fexr, gpr, [0u64; 32], true);
-        let instr_fenr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CTC1, 3, 28, 0, 0);
+        let instr_fenr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CTC1, 3, 28, 0, 0);
         assert_fpu_matches_interpreter(instr_fenr, gpr, [0u64; 32], true);
     }
 
@@ -5560,7 +5560,7 @@ mod tests {
     fn ctc1_fcsr_writes_rounding_mode_matches_interpreter() {
         let mut gpr = [0u64; 32];
         gpr[3] = 0x2; // RM = 2 (round toward +Infinity), no cause/enable bits set
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CTC1, 3, 31, 0, 0);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CTC1, 3, 31, 0, 0);
         assert_fpu_matches_interpreter(instr, gpr, [0u64; 32], true);
     }
 
@@ -5574,7 +5574,7 @@ mod tests {
         let mut gpr = [0u64; 32];
         // FCSR: Cause.V (bit 16) set, Enable.V (bit 7) set.
         gpr[3] = (1 << 16) | (1 << 7);
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CTC1, 3, 31, 0, 0);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CTC1, 3, 31, 0, 0);
 
         let interp = run_interpreter_fpu(instr, gpr, [0u64; 32], pc, true);
         let jit = run_jit_fpu(instr, gpr, [0u64; 32], pc, word_offset, true)
@@ -5590,10 +5590,10 @@ mod tests {
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let mut gpr = [0u64; 32];
         gpr[3] = 0b1010_1010; // arbitrary 8-bit condition-code pattern
-        let ctc1 = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CTC1, 3, 25, 0, 0);
+        let ctc1 = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CTC1, 3, 25, 0, 0);
         assert_fpu_matches_interpreter(ctc1, gpr, [0u64; 32], true);
 
-        let cfc1 = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CFC1, 4, 25, 0, 0);
+        let cfc1 = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 4, 25, 0, 0);
         // Chain: write via CTC1 first, then read back via CFC1 in the same
         // seeded state (both engines start from the post-CTC1 FCSR).
         let (mut interp_exec, _m) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
@@ -5614,7 +5614,7 @@ mod tests {
     fn lwc1_matches_interpreter_fr0_and_fr1() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_2000; // base
-        let instr = make_i(crate::mips_isa::OP_LWC1, 1, 2, 0x10); // ft=2, offset=0x10
+        let instr = make_i(crate::cpu::mips_isa::OP_LWC1, 1, 2, 0x10); // ft=2, offset=0x10
         let mem_init = &[(0xFFFF_FFFF_8000_2010u64, 0x3F80_0000u32)]; // 1.0f32 bits
         assert_fpu_matches_interpreter_mem(instr, gpr, [0u64; 32], false, mem_init);
         assert_fpu_matches_interpreter_mem(instr, gpr, [0u64; 32], true, mem_init);
@@ -5624,7 +5624,7 @@ mod tests {
     fn ldc1_matches_interpreter_fr0_and_fr1() {
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_2000;
-        let instr = make_i(crate::mips_isa::OP_LDC1, 1, 2, 0x18); // ft=2, offset=0x18
+        let instr = make_i(crate::cpu::mips_isa::OP_LDC1, 1, 2, 0x18); // ft=2, offset=0x18
         // 2.5f64 bits, high/low words as they'd sit in big-endian-addressed
         // memory (MockMemory::set_word writes one 32-bit word at a time;
         // read_data<8> assembles the full 64-bit value from two such words —
@@ -5644,7 +5644,7 @@ mod tests {
         gpr[1] = 0xFFFF_FFFF_8000_2000;
         let mut fpr = [0u64; 32];
         fpr[2] = (1.5f32).to_bits() as u64;
-        let instr = make_i(crate::mips_isa::OP_SWC1, 1, 2, 0x20); // ft=2, offset=0x20
+        let instr = make_i(crate::cpu::mips_isa::OP_SWC1, 1, 2, 0x20); // ft=2, offset=0x20
         assert_fpu_matches_interpreter(instr, gpr, fpr, false);
         assert_fpu_matches_interpreter(instr, gpr, fpr, true);
     }
@@ -5655,7 +5655,7 @@ mod tests {
         gpr[1] = 0xFFFF_FFFF_8000_2000;
         let mut fpr = [0u64; 32];
         fpr[2] = (4.25f64).to_bits();
-        let instr = make_i(crate::mips_isa::OP_SDC1, 1, 2, 0x28); // ft=2, offset=0x28
+        let instr = make_i(crate::cpu::mips_isa::OP_SDC1, 1, 2, 0x28); // ft=2, offset=0x28
         assert_fpu_matches_interpreter(instr, gpr, fpr, false);
         assert_fpu_matches_interpreter(instr, gpr, fpr, true);
     }
@@ -5675,11 +5675,11 @@ mod tests {
         let word_offset = (pc as u16 / 4) & 0x3FF;
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_2000;
-        let instr = make_i(crate::mips_isa::OP_LWC1, 1, 2, 0);
+        let instr = make_i(crate::cpu::mips_isa::OP_LWC1, 1, 2, 0);
         let mem_word = (0xFFFF_FFFF_8000_2000u64, 0x3F80_0000u32);
 
         let (mut interp_exec, mem) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
-        interp_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1;
+        interp_exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_CU1;
         mem.set_word(mem_word.0, mem_word.1);
         interp_exec.exec(instr);
         let interp = CoreSnapshot::capture(&interp_exec.core);
@@ -5698,7 +5698,7 @@ mod tests {
             .expect("LWC1 must be compilable regardless of live CU1 state");
         let (jit_exec, jit_mem) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
         let mut jit_exec = Box::new(jit_exec);
-        jit_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1;
+        jit_exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_CU1;
         jit_mem.set_word(mem_word.0, mem_word.1);
         jit_exec.install_jit_hooks();
         unsafe { jit_fn(&mut jit_exec.core as *mut MipsCore) };
@@ -5722,12 +5722,12 @@ mod tests {
 
         // word0: BEQ r0, r0, +2
         // word1: LWC1 $f2, 0($r1) in the delay slot
-        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 2);
-        let lwc1 = make_i(crate::mips_isa::OP_LWC1, 1, 2, 0);
+        let beq = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 2);
+        let lwc1 = make_i(crate::cpu::mips_isa::OP_LWC1, 1, 2, 0);
 
         // Seed interpreter and clear CU1
         let (mut interp_exec, interp_mem) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
-        interp_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1;
+        interp_exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_CU1;
         interp_mem.set_word(0xFFFF_FFFF_8000_2000u64, 0x3F80_0000u32);
         let phys_base = ((pc as u32) & 0x1FFF_FFFF) as u64;
         interp_mem.set_word(phys_base, beq);
@@ -5739,8 +5739,8 @@ mod tests {
         let interp = CoreSnapshot::capture(&interp_exec.core);
 
         // Verify interpreter trapped with Cause.BD and Cause.CE=1 and EPC=pc
-        let cause_bd = (interp.cp0_cause & crate::mips_core::CAUSE_BD) != 0;
-        let cause_ce = (interp.cp0_cause >> crate::mips_core::CAUSE_CE_SHIFT) & 3;
+        let cause_bd = (interp.cp0_cause & crate::cpu::mips_core::CAUSE_BD) != 0;
+        let cause_ce = (interp.cp0_cause >> crate::cpu::mips_core::CAUSE_CE_SHIFT) & 3;
         assert!(cause_bd, "Interpreter must set Cause.BD");
         assert_eq!(cause_ce, 1, "Interpreter must set Cause.CE to 1 (CP1)");
         assert_eq!(interp.cp0_epc, pc, "Interpreter EPC must point to the branch");
@@ -5759,7 +5759,7 @@ mod tests {
 
         let (jit_exec, jit_mem) = fpu_seeded_executor(gpr, [0u64; 32], pc, true);
         let mut jit_exec = Box::new(jit_exec);
-        jit_exec.core.cp0_status &= !crate::mips_core::STATUS_CU1;
+        jit_exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_CU1;
         jit_mem.set_word(0xFFFF_FFFF_8000_2000u64, 0x3F80_0000u32);
         jit_mem.set_word(phys_base, beq);
         jit_mem.set_word(phys_base + 4, lwc1);
@@ -5774,13 +5774,13 @@ mod tests {
 
     #[test]
     fn fpu_load_store_with_mem_helpers_matches_interpreter() {
-        let prev = crate::jitv2::codegen::mem_helpers_enabled();
-        crate::jitv2::codegen::set_mem_helpers_enabled(true);
+        let prev = crate::cpu::jitv2::codegen::mem_helpers_enabled();
+        crate::cpu::jitv2::codegen::set_mem_helpers_enabled(true);
 
         // LDC1
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_2000;
-        let ldc1_instr = make_i(crate::mips_isa::OP_LDC1, 1, 2, 0x18);
+        let ldc1_instr = make_i(crate::cpu::mips_isa::OP_LDC1, 1, 2, 0x18);
         let bits = (3.75f64).to_bits();
         let mem_init = &[
             (0xFFFF_FFFF_8000_2018u64, (bits >> 32) as u32),
@@ -5792,17 +5792,17 @@ mod tests {
         // SWC1
         let mut fpr = [0u64; 32];
         fpr[2] = (1.5f32).to_bits() as u64;
-        let swc1_instr = make_i(crate::mips_isa::OP_SWC1, 1, 2, 0x20);
+        let swc1_instr = make_i(crate::cpu::mips_isa::OP_SWC1, 1, 2, 0x20);
         assert_fpu_matches_interpreter(swc1_instr, gpr, fpr, false);
         assert_fpu_matches_interpreter(swc1_instr, gpr, fpr, true);
 
         // SDC1
         fpr[2] = (9.125f64).to_bits();
-        let sdc1_instr = make_i(crate::mips_isa::OP_SDC1, 1, 2, 0x28);
+        let sdc1_instr = make_i(crate::cpu::mips_isa::OP_SDC1, 1, 2, 0x28);
         assert_fpu_matches_interpreter(sdc1_instr, gpr, fpr, false);
         assert_fpu_matches_interpreter(sdc1_instr, gpr, fpr, true);
 
-        crate::jitv2::codegen::set_mem_helpers_enabled(prev);
+        crate::cpu::jitv2::codegen::set_mem_helpers_enabled(prev);
     }
 
     #[test]
@@ -5818,19 +5818,19 @@ mod tests {
                 fpr[6] = 0xAAAA_BBBB_CCCC_DDDD; // pre-existing fd
 
                 // FMOVZ.S: fmt=RS_S, rt=4 (GPR), rd=2 (fs), sa=6 (fd), funct=FUNCT_FMOVZ
-                let fmovz_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 4, 2, 6, crate::mips_isa::FUNCT_FMOVZ);
+                let fmovz_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 4, 2, 6, crate::cpu::mips_isa::FUNCT_FMOVZ);
                 assert_fpu_matches_interpreter(fmovz_s, gpr, fpr, fr1);
 
                 // FMOVZ.D: fmt=RS_D
-                let fmovz_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 4, 2, 6, crate::mips_isa::FUNCT_FMOVZ);
+                let fmovz_d = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 4, 2, 6, crate::cpu::mips_isa::FUNCT_FMOVZ);
                 assert_fpu_matches_interpreter(fmovz_d, gpr, fpr, fr1);
 
                 // FMOVN: condition inverted (taken when GPR != 0)
                 gpr[4] = if taken { 42 } else { 0 };
-                let fmovn_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 4, 2, 6, crate::mips_isa::FUNCT_FMOVN);
+                let fmovn_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 4, 2, 6, crate::cpu::mips_isa::FUNCT_FMOVN);
                 assert_fpu_matches_interpreter(fmovn_s, gpr, fpr, fr1);
 
-                let fmovn_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 4, 2, 6, crate::mips_isa::FUNCT_FMOVN);
+                let fmovn_d = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 4, 2, 6, crate::cpu::mips_isa::FUNCT_FMOVN);
                 assert_fpu_matches_interpreter(fmovn_d, gpr, fpr, fr1);
             }
         }
@@ -5842,7 +5842,7 @@ mod tests {
     /// result is fd = ±(fs*ft ± fr).
     #[test]
     fn madd_family_matches_interpreter_fr0_and_fr1() {
-        use crate::mips_isa::{OP_COP1X, FUNCT_MADD_S, FUNCT_MADD_D, FUNCT_MSUB_S,
+        use crate::cpu::mips_isa::{OP_COP1X, FUNCT_MADD_S, FUNCT_MADD_D, FUNCT_MSUB_S,
                               FUNCT_MSUB_D, FUNCT_NMADD_S, FUNCT_NMADD_D,
                               FUNCT_NMSUB_S, FUNCT_NMSUB_D};
         // Even registers throughout so the FR=0 pairing rules are satisfied
@@ -5892,7 +5892,7 @@ mod tests {
     /// yields `5.551115123125783e-17`.
     #[test]
     fn madd_d_rounds_the_product_first() {
-        use crate::mips_isa::{OP_COP1X, FUNCT_MADD_D};
+        use crate::cpu::mips_isa::{OP_COP1X, FUNCT_MADD_D};
         let mut fpr = [0u64; 32];
         fpr[2] = (-1.0f64).to_bits();  // fr
         fpr[4] = (10.0f64).to_bits();  // ft
@@ -5913,7 +5913,7 @@ mod tests {
     /// zero (divide-by-zero), negative (Invalid for RSQRT), and sNaN.
     #[test]
     fn recip_rsqrt_matches_interpreter_fr0_and_fr1() {
-        use crate::mips_isa::{OP_COP1, RS_S, RS_D, FUNCT_FRECIP, FUNCT_FRSQRT};
+        use crate::cpu::mips_isa::{OP_COP1, RS_S, RS_D, FUNCT_FRECIP, FUNCT_FRSQRT};
         for fr1 in [false, true] {
             for v in [4.0f64, 0.25f64, 1.0f64, 0.0f64, -0.0f64, -4.0f64,
                       f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
@@ -5941,7 +5941,7 @@ mod tests {
     /// same as what `exec_prefx` does.
     #[test]
     fn prefx_matches_interpreter_and_changes_nothing() {
-        use crate::mips_isa::{OP_COP1X, FUNCT_PREFX};
+        use crate::cpu::mips_isa::{OP_COP1X, FUNCT_PREFX};
         let mut gpr = [0u64; 32];
         gpr[1] = 0xFFFF_FFFF_8000_2000;
         gpr[2] = 0x40;
@@ -5962,12 +5962,12 @@ mod tests {
             // vaddr = 0xFFFF_FFFF_8000_2020
 
             // LWXC1: OP_COP1X, rs=1, rt=2, rd=0, sa=4 (fd), funct=FUNCT_LWXC1
-            let lwxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 0, 4, crate::mips_isa::FUNCT_LWXC1);
+            let lwxc1 = make_r(crate::cpu::mips_isa::OP_COP1X, 1, 2, 0, 4, crate::cpu::mips_isa::FUNCT_LWXC1);
             let mem_init_w = &[(0xFFFF_FFFF_8000_2020u64, 0x4049_0FDBu32)]; // ~pi f32
             assert_fpu_matches_interpreter_mem(lwxc1, gpr, [0u64; 32], fr1, mem_init_w);
 
             // LDXC1: OP_COP1X, rs=1, rt=2, rd=0, sa=4 (fd), funct=FUNCT_LDXC1
-            let ldxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 0, 4, crate::mips_isa::FUNCT_LDXC1);
+            let ldxc1 = make_r(crate::cpu::mips_isa::OP_COP1X, 1, 2, 0, 4, crate::cpu::mips_isa::FUNCT_LDXC1);
             let d_bits = (3.141592653589793f64).to_bits();
             let mem_init_d = &[
                 (0xFFFF_FFFF_8000_2020u64, (d_bits >> 32) as u32),
@@ -5978,12 +5978,12 @@ mod tests {
             // SWXC1: OP_COP1X, rs=1, rt=2, rd=4 (fs), sa=0, funct=FUNCT_SWXC1
             let mut fpr = [0u64; 32];
             fpr[4] = (2.71828f32).to_bits() as u64;
-            let swxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 4, 0, crate::mips_isa::FUNCT_SWXC1);
+            let swxc1 = make_r(crate::cpu::mips_isa::OP_COP1X, 1, 2, 4, 0, crate::cpu::mips_isa::FUNCT_SWXC1);
             assert_fpu_matches_interpreter(swxc1, gpr, fpr, fr1);
 
             // SDXC1: OP_COP1X, rs=1, rt=2, rd=4 (fs), sa=0, funct=FUNCT_SDXC1
             fpr[4] = (2.718281828459045f64).to_bits();
-            let sdxc1 = make_r(crate::mips_isa::OP_COP1X, 1, 2, 4, 0, crate::mips_isa::FUNCT_SDXC1);
+            let sdxc1 = make_r(crate::cpu::mips_isa::OP_COP1X, 1, 2, 4, 0, crate::cpu::mips_isa::FUNCT_SDXC1);
             assert_fpu_matches_interpreter(sdxc1, gpr, fpr, fr1);
         }
     }
@@ -5994,12 +5994,12 @@ mod tests {
     fn cvt_d_s_and_s_d_match_interpreter() {
         let mut fpr = [0u64; 32];
         fpr[1] = (3.5f32).to_bits() as u64;
-        let cvt_d_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_D);
+        let cvt_d_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_D);
         assert_fpu_matches_interpreter(cvt_d_s, [0u64; 32], fpr, true);
 
         let mut fpr_d = [0u64; 32];
         fpr_d[1] = (3.5f64).to_bits();
-        let cvt_s_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_S);
+        let cvt_s_d = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_S);
         assert_fpu_matches_interpreter(cvt_s_d, [0u64; 32], fpr_d, true);
     }
 
@@ -6009,7 +6009,7 @@ mod tests {
         // rounding behavior must match Rust's `as f32` cast exactly.
         let mut fpr = [0u64; 32];
         fpr[1] = (std::f64::consts::PI).to_bits();
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_S);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_S);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -6033,12 +6033,12 @@ mod tests {
 
     fn cvt_to_int_case(funct: u32, fmt: u32, fs_val: f64) {
         let mut fpr = [0u64; 32];
-        if fmt == crate::mips_isa::RS_S {
+        if fmt == crate::cpu::mips_isa::RS_S {
             fpr[1] = (fs_val as f32).to_bits() as u64;
         } else {
             fpr[1] = fs_val.to_bits();
         }
-        let instr = make_r(crate::mips_isa::OP_COP1, fmt, 0, 1, 2, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 1, 2, funct);
         let pc = 0xFFFF_FFFF_8000_1000u64;
         let word_offset = (pc as u16 / 4) & 0x3FF;
         let interp = run_interpreter_fpu(instr, [0u64; 32], fpr, pc, true);
@@ -6053,15 +6053,15 @@ mod tests {
 
     #[test]
     fn cvt_w_s_d_match_interpreter() {
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_S, 3.7);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_D, 3.7);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_S, -3.7);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, 3.7);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_D, 3.7);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, -3.7);
     }
 
     #[test]
     fn cvt_l_s_d_match_interpreter() {
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_L, crate::mips_isa::RS_S, 3.7);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_L, crate::mips_isa::RS_D, 3.7);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_L, crate::cpu::mips_isa::RS_S, 3.7);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_L, crate::cpu::mips_isa::RS_D, 3.7);
     }
 
     #[test]
@@ -6070,27 +6070,27 @@ mod tests {
         // zero) from Cranelift's default `nearest` (half to even): 2.5 and
         // -2.5 must both round AWAY from zero (3.0, -3.0), not to the
         // nearest even integer (2.0, -2.0).
-        cvt_to_int_case(crate::mips_isa::FUNCT_FROUND_W, crate::mips_isa::RS_S, 2.5);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FROUND_W, crate::mips_isa::RS_S, -2.5);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FROUND_W, crate::mips_isa::RS_S, 3.5);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FROUND_W, crate::mips_isa::RS_D, 4.5);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FROUND_W, crate::cpu::mips_isa::RS_S, 2.5);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FROUND_W, crate::cpu::mips_isa::RS_S, -2.5);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FROUND_W, crate::cpu::mips_isa::RS_S, 3.5);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FROUND_W, crate::cpu::mips_isa::RS_D, 4.5);
     }
 
     #[test]
     fn trunc_ceil_floor_w_match_interpreter() {
         for val in [3.7, -3.7, 3.2, -3.2] {
-            cvt_to_int_case(crate::mips_isa::FUNCT_FTRUNC_W, crate::mips_isa::RS_S, val);
-            cvt_to_int_case(crate::mips_isa::FUNCT_FCEIL_W, crate::mips_isa::RS_S, val);
-            cvt_to_int_case(crate::mips_isa::FUNCT_FFLOOR_W, crate::mips_isa::RS_S, val);
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FTRUNC_W, crate::cpu::mips_isa::RS_S, val);
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCEIL_W, crate::cpu::mips_isa::RS_S, val);
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FFLOOR_W, crate::cpu::mips_isa::RS_S, val);
         }
     }
 
     #[test]
     fn trunc_ceil_floor_l_match_interpreter() {
         for val in [3.7, -3.7] {
-            cvt_to_int_case(crate::mips_isa::FUNCT_FTRUNC_L, crate::mips_isa::RS_D, val);
-            cvt_to_int_case(crate::mips_isa::FUNCT_FCEIL_L, crate::mips_isa::RS_D, val);
-            cvt_to_int_case(crate::mips_isa::FUNCT_FFLOOR_L, crate::mips_isa::RS_D, val);
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FTRUNC_L, crate::cpu::mips_isa::RS_D, val);
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCEIL_L, crate::cpu::mips_isa::RS_D, val);
+            cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FFLOOR_L, crate::cpu::mips_isa::RS_D, val);
         }
     }
 
@@ -6102,15 +6102,15 @@ mod tests {
         // single function both engines call through `cvt_to_int_and_commit`.
         // Also sets FCSR.V/Cause, which `cvt_to_int_case`'s snapshot compare
         // covers alongside the destination register value.
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_S, 1.0e20);
-        cvt_to_int_case(crate::mips_isa::FUNCT_FCVT_W, crate::mips_isa::RS_S, -1.0e20);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, 1.0e20);
+        cvt_to_int_case(crate::cpu::mips_isa::FUNCT_FCVT_W, crate::cpu::mips_isa::RS_S, -1.0e20);
 
         // cvt_to_int_case only checks JIT == interpreter, which a shared bug
         // in cvt_to_int_and_commit would pass right through — pin the actual
         // MIPS poison values against the interpreter directly too.
         let mut fpr = [0u64; 32];
         fpr[1] = (1.0e20f32).to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_W);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_W);
         let pos = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
         assert_eq!(pos.fpr[2] as u32, i32::MAX as u32, "positive overflow must poison to INT_MAX");
         assert_ne!(pos.fpu_fcsr & 0x0001_0000, 0, "overflow must raise FCSR Cause.V (bit 16)");
@@ -6127,7 +6127,7 @@ mod tests {
         // overflow) — see `cvt_to_int_overflow_saturates_matches_interpreter`.
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 1, 2, crate::mips_isa::FUNCT_FCVT_W);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 1, 2, crate::cpu::mips_isa::FUNCT_FCVT_W);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
 
         let nan = run_interpreter_fpu(instr, [0u64; 32], fpr, 0xFFFF_FFFF_8000_1000u64, true);
@@ -6137,73 +6137,73 @@ mod tests {
 
     fn cvt_from_int_case(funct: u32, fmt: u32, val: i64) {
         let mut fpr = [0u64; 32];
-        if fmt == crate::mips_isa::RS_W {
+        if fmt == crate::cpu::mips_isa::RS_W {
             fpr[1] = (val as i32 as u32) as u64;
         } else {
             fpr[1] = val as u64;
         }
-        let instr = make_r(crate::mips_isa::OP_COP1, fmt, 0, 1, 2, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 0, 1, 2, funct);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
     #[test]
     fn cvt_s_w_d_w_match_interpreter() {
-        cvt_from_int_case(crate::mips_isa::FUNCT_FCVT_S, crate::mips_isa::RS_W, 42);
-        cvt_from_int_case(crate::mips_isa::FUNCT_FCVT_D, crate::mips_isa::RS_W, 42);
-        cvt_from_int_case(crate::mips_isa::FUNCT_FCVT_S, crate::mips_isa::RS_W, -42);
+        cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_S, crate::cpu::mips_isa::RS_W, 42);
+        cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_D, crate::cpu::mips_isa::RS_W, 42);
+        cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_S, crate::cpu::mips_isa::RS_W, -42);
     }
 
     #[test]
     fn cvt_s_l_d_l_match_interpreter() {
-        cvt_from_int_case(crate::mips_isa::FUNCT_FCVT_S, crate::mips_isa::RS_L, 123456789);
-        cvt_from_int_case(crate::mips_isa::FUNCT_FCVT_D, crate::mips_isa::RS_L, 123456789);
-        cvt_from_int_case(crate::mips_isa::FUNCT_FCVT_D, crate::mips_isa::RS_L, -123456789);
+        cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_S, crate::cpu::mips_isa::RS_L, 123456789);
+        cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_D, crate::cpu::mips_isa::RS_L, 123456789);
+        cvt_from_int_case(crate::cpu::mips_isa::FUNCT_FCVT_D, crate::cpu::mips_isa::RS_L, -123456789);
     }
 
     // ---- CP1: batch F4 compares — C.cond.fmt ------
 
     fn fcc_case(funct: u32, fmt: u32, cc: u32, fs_val: f64, ft_val: f64) {
         let mut fpr = [0u64; 32];
-        if fmt == crate::mips_isa::RS_S {
+        if fmt == crate::cpu::mips_isa::RS_S {
             fpr[1] = (fs_val as f32).to_bits() as u64;
             fpr[2] = (ft_val as f32).to_bits() as u64;
         } else {
             fpr[1] = fs_val.to_bits();
             fpr[2] = ft_val.to_bits();
         }
-        let instr = make_r(crate::mips_isa::OP_COP1, fmt, 2, 1, cc, funct);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, fmt, 2, 1, cc, funct);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
     #[test]
     fn c_eq_s_d_match_interpreter() {
-        fcc_case(crate::mips_isa::FUNCT_FC_EQ, crate::mips_isa::RS_S, 0, 1.0, 1.0);
-        fcc_case(crate::mips_isa::FUNCT_FC_EQ, crate::mips_isa::RS_S, 0, 1.0, 2.0);
-        fcc_case(crate::mips_isa::FUNCT_FC_EQ, crate::mips_isa::RS_D, 0, 1.0, 1.0);
+        fcc_case(crate::cpu::mips_isa::FUNCT_FC_EQ, crate::cpu::mips_isa::RS_S, 0, 1.0, 1.0);
+        fcc_case(crate::cpu::mips_isa::FUNCT_FC_EQ, crate::cpu::mips_isa::RS_S, 0, 1.0, 2.0);
+        fcc_case(crate::cpu::mips_isa::FUNCT_FC_EQ, crate::cpu::mips_isa::RS_D, 0, 1.0, 1.0);
     }
 
     #[test]
     fn c_lt_le_ult_ule_match_interpreter() {
         for (a, b) in [(1.0, 2.0), (2.0, 1.0), (1.0, 1.0)] {
-            fcc_case(crate::mips_isa::FUNCT_FC_OLT, crate::mips_isa::RS_S, 0, a, b);
-            fcc_case(crate::mips_isa::FUNCT_FC_OLE, crate::mips_isa::RS_S, 0, a, b);
-            fcc_case(crate::mips_isa::FUNCT_FC_ULT, crate::mips_isa::RS_S, 0, a, b);
-            fcc_case(crate::mips_isa::FUNCT_FC_ULE, crate::mips_isa::RS_S, 0, a, b);
+            fcc_case(crate::cpu::mips_isa::FUNCT_FC_OLT, crate::cpu::mips_isa::RS_S, 0, a, b);
+            fcc_case(crate::cpu::mips_isa::FUNCT_FC_OLE, crate::cpu::mips_isa::RS_S, 0, a, b);
+            fcc_case(crate::cpu::mips_isa::FUNCT_FC_ULT, crate::cpu::mips_isa::RS_S, 0, a, b);
+            fcc_case(crate::cpu::mips_isa::FUNCT_FC_ULE, crate::cpu::mips_isa::RS_S, 0, a, b);
         }
     }
 
     #[test]
     fn c_all_16_conditions_match_interpreter() {
         let conds = [
-            crate::mips_isa::FUNCT_FC_F, crate::mips_isa::FUNCT_FC_UN, crate::mips_isa::FUNCT_FC_EQ,
-            crate::mips_isa::FUNCT_FC_UEQ, crate::mips_isa::FUNCT_FC_OLT, crate::mips_isa::FUNCT_FC_ULT,
-            crate::mips_isa::FUNCT_FC_OLE, crate::mips_isa::FUNCT_FC_ULE, crate::mips_isa::FUNCT_FC_SF,
-            crate::mips_isa::FUNCT_FC_NGLE, crate::mips_isa::FUNCT_FC_SEQ, crate::mips_isa::FUNCT_FC_NGL,
-            crate::mips_isa::FUNCT_FC_LT, crate::mips_isa::FUNCT_FC_NGE, crate::mips_isa::FUNCT_FC_LE,
-            crate::mips_isa::FUNCT_FC_NGT,
+            crate::cpu::mips_isa::FUNCT_FC_F, crate::cpu::mips_isa::FUNCT_FC_UN, crate::cpu::mips_isa::FUNCT_FC_EQ,
+            crate::cpu::mips_isa::FUNCT_FC_UEQ, crate::cpu::mips_isa::FUNCT_FC_OLT, crate::cpu::mips_isa::FUNCT_FC_ULT,
+            crate::cpu::mips_isa::FUNCT_FC_OLE, crate::cpu::mips_isa::FUNCT_FC_ULE, crate::cpu::mips_isa::FUNCT_FC_SF,
+            crate::cpu::mips_isa::FUNCT_FC_NGLE, crate::cpu::mips_isa::FUNCT_FC_SEQ, crate::cpu::mips_isa::FUNCT_FC_NGL,
+            crate::cpu::mips_isa::FUNCT_FC_LT, crate::cpu::mips_isa::FUNCT_FC_NGE, crate::cpu::mips_isa::FUNCT_FC_LE,
+            crate::cpu::mips_isa::FUNCT_FC_NGT,
         ];
         for funct in conds {
-            fcc_case(funct, crate::mips_isa::RS_S, 0, 2.0, 3.0);
+            fcc_case(funct, crate::cpu::mips_isa::RS_S, 0, 2.0, 3.0);
         }
     }
 
@@ -6211,8 +6211,8 @@ mod tests {
     fn c_cc_index_nonzero_matches_interpreter() {
         // cc=1..7 map to different FCSR bits (24+cc) than cc0's bit 23 —
         // exercise a nonzero index specifically.
-        fcc_case(crate::mips_isa::FUNCT_FC_EQ, crate::mips_isa::RS_S, 3, 5.0, 5.0);
-        fcc_case(crate::mips_isa::FUNCT_FC_EQ, crate::mips_isa::RS_S, 7, 5.0, 6.0);
+        fcc_case(crate::cpu::mips_isa::FUNCT_FC_EQ, crate::cpu::mips_isa::RS_S, 3, 5.0, 5.0);
+        fcc_case(crate::cpu::mips_isa::FUNCT_FC_EQ, crate::cpu::mips_isa::RS_S, 7, 5.0, 6.0);
     }
 
     #[test]
@@ -6222,7 +6222,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
         fpr[2] = (1.0f32).to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 1, 0, crate::mips_isa::FUNCT_FC_UN);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 1, 0, crate::cpu::mips_isa::FUNCT_FC_UN);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -6234,7 +6234,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
         fpr[2] = (1.0f32).to_bits() as u64;
-        let instr = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 1, 0, crate::mips_isa::FUNCT_FC_SEQ);
+        let instr = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 1, 0, crate::cpu::mips_isa::FUNCT_FC_SEQ);
         assert_fpu_matches_interpreter(instr, [0u64; 32], fpr, true);
     }
 
@@ -6247,7 +6247,7 @@ mod tests {
         let mut fpr = [0u64; 32];
         fpr[1] = f32::NAN.to_bits() as u64;
         fpr[2] = (1.0f32).to_bits() as u64;
-        let seq = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 1, 0, crate::mips_isa::FUNCT_FC_SEQ);
+        let seq = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 1, 0, crate::cpu::mips_isa::FUNCT_FC_SEQ);
 
         // Interpreter: CTC1 to set EV, then the signaling compare.
         let (mut interp_exec, _m) = fpu_seeded_executor([0u64; 32], fpr, pc, true);
@@ -6313,7 +6313,7 @@ mod tests {
             mem.set_word((phys_base & 0x1FFF_FFFF) + (off as u64) * 4, raw);
         };
         store(word_offset, instr);
-        store(word_offset + 1, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL);
+        store(word_offset + 1, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL);
         exec.exec(instr);
     }
 
@@ -6336,7 +6336,7 @@ mod tests {
     #[test]
     fn lockstep_branch_not_taken_with_alu_delay_slot() {
         let pc = 0x1fc00434u64;
-        let branch = make_i(crate::mips_isa::OP_BNE, 5, 0, 7);
+        let branch = make_i(crate::cpu::mips_isa::OP_BNE, 5, 0, 7);
         let slot = 0x3c0100c0u32; // LUI $1, 0x00c0
         let word_offset = ((pc & 0xFFF) >> 2) as u16;
 
@@ -6374,7 +6374,7 @@ mod tests {
     fn lockstep_load_store_codegen_gap_still_advances_pc() {
         let pc = 0x1fc00434u64;
         // CACHE op=Index_Store_Tag(2), cache=PD(1) -> rt field = (2<<2)|1 = 9; base=v0(2), offset=0
-        let cache_instr = make_i(crate::mips_isa::OP_CACHE, 2, 9, 0);
+        let cache_instr = make_i(crate::cpu::mips_isa::OP_CACHE, 2, 9, 0);
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         exec.install_jit_hooks();
 
@@ -6398,9 +6398,9 @@ mod tests {
         // pack two per 64-bit fpr[] slot (read_fpr_w_fr0/write_fpr_w_fr0:
         // odd fs/ft/fd address the *upper* 32 bits of fpr[reg & !1], not
         // fpr[reg] directly) — even numbers keep this test's setup simple.
-        let fadd_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 2, 0, 4, crate::mips_isa::FUNCT_FADD);
+        let fadd_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 2, 0, 4, crate::cpu::mips_isa::FUNCT_FADD);
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.fpr[0] = (1.5f32).to_bits() as u64;
         exec.core.fpr[2] = (2.25f32).to_bits() as u64;
         exec.update_fpr_mode();
@@ -6429,7 +6429,7 @@ mod tests {
     #[test]
     fn lockstep_fpu_cu1_unusable_matches_interpreter_no_false_divergence() {
         let pc = 0x1fc00434u64;
-        let cfc1 = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_CFC1, 2, 31, 0, 0); // CFC1 $2, $31 (FCSR)
+        let cfc1 = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_CFC1, 2, 31, 0, 0); // CFC1 $2, $31 (FCSR)
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
         // STATUS_CU1 deliberately left clear.
         // interp_fallback_fn does a real fetch from core.pc — unlike the old
@@ -6446,7 +6446,7 @@ mod tests {
         // genuine EXC_CPU delivered by the interpreter, not silently eaten.
         ls_exec_one(&mut exec, &mem, pc, cfc1);
         assert_ne!(exec.core.pc, pc, "CU1-unusable CFC1 must still vector via handle_exception");
-        assert_eq!((exec.core.cp0_cause >> 2) & 0x1F, crate::mips_exec::EXC_CPU);
+        assert_eq!((exec.core.cp0_cause >> 2) & 0x1F, crate::cpu::mips_exec::EXC_CPU);
     }
 
     /// Regression test: `CVT.W.S` on an already-integer-valued source
@@ -6469,9 +6469,9 @@ mod tests {
         // CVT.W.S fd=$f18, fs=$f16 — matches the real fs/fd register numbers
         // from the live-boot divergence (both even, so FR0 packing is a
         // non-issue here regardless).
-        let cvt_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FCVT_W);
+        let cvt_w_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 16, 18, crate::cpu::mips_isa::FUNCT_FCVT_W);
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.fpr[16] = (79.0f32).to_bits() as u64;
         exec.update_fpr_mode();
         exec.install_jit_hooks();
@@ -6494,9 +6494,9 @@ mod tests {
     #[test]
     fn lockstep_fpu_trunc_w_s_non_integer_value_sets_inexact() {
         let pc = 0x1fc00434u64;
-        let trunc_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FTRUNC_W);
+        let trunc_w_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 16, 18, crate::cpu::mips_isa::FUNCT_FTRUNC_W);
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.fpr[16] = (3.7f32).to_bits() as u64;
         exec.update_fpr_mode();
         exec.install_jit_hooks();
@@ -6525,9 +6525,9 @@ mod tests {
     #[test]
     fn lockstep_fpu_cvt_w_d_65535_5_honors_fcsr_rm_toward_zero() {
         let pc = 0x1fc00434u64;
-        let cvt_w_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 0, 6, 4, crate::mips_isa::FUNCT_FCVT_W);
+        let cvt_w_d = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 0, 6, 4, crate::cpu::mips_isa::FUNCT_FCVT_W);
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.fpr[6] = 65535.5f64.to_bits();
         exec.core.fpu_fcsr = 1; // RM = round toward zero
         exec.update_fpr_mode();
@@ -6547,7 +6547,7 @@ mod tests {
     #[test]
     fn lockstep_fpu_cvt_w_d_all_rounding_modes() {
         let pc = 0x1fc00434u64;
-        let cvt_w_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 0, 6, 4, crate::mips_isa::FUNCT_FCVT_W);
+        let cvt_w_d = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 0, 6, 4, crate::cpu::mips_isa::FUNCT_FCVT_W);
         // (fcsr_rm, expected CVT.W.D(65535.5))
         let cases: [(u32, i32); 4] = [
             (0, 65536), // nearest-even: tie between odd 65535 and even 65536 -> even
@@ -6557,7 +6557,7 @@ mod tests {
         ];
         for (rm, expected) in cases {
             let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-            exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
             exec.core.fpr[6] = 65535.5f64.to_bits();
             exec.core.fpu_fcsr = rm;
             exec.update_fpr_mode();
@@ -6579,7 +6579,7 @@ mod tests {
     #[test]
     fn lockstep_fpu_cvt_w_d_magnitude_between_half_and_one() {
         let pc = 0x1fc00434u64;
-        let cvt_w_d = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_D, 0, 10, 10, crate::mips_isa::FUNCT_FCVT_W);
+        let cvt_w_d = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_D, 0, 10, 10, crate::cpu::mips_isa::FUNCT_FCVT_W);
         // (source, fcsr_rm, expected)
         let cases: [(f64, u32, i32); 12] = [
             (-0.9757914543151855, 0, -1),
@@ -6597,7 +6597,7 @@ mod tests {
         ];
         for (src, rm, expected) in cases {
             let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-            exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
             exec.core.fpr[10] = src.to_bits();
             exec.core.fpu_fcsr = rm;
             exec.update_fpr_mode();
@@ -6619,9 +6619,9 @@ mod tests {
     #[test]
     fn lockstep_fpu_round_w_s_ignores_fcsr_rm() {
         let pc = 0x1fc00434u64;
-        let round_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FROUND_W);
+        let round_w_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 16, 18, crate::cpu::mips_isa::FUNCT_FROUND_W);
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.fpr[16] = 65535.5f32.to_bits() as u64;
         exec.core.fpu_fcsr = 1; // RM = toward zero -- must NOT affect ROUND.W.S
         exec.update_fpr_mode();
@@ -6641,23 +6641,23 @@ mod tests {
     fn lockstep_fpu_trunc_ceil_floor_ignore_fcsr_rm() {
         let pc = 0x1fc00434u64;
         let (mut exec, mem) = seeded_executor([0u64; 32], pc);
-        exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
         exec.core.fpr[16] = (2.5f32).to_bits() as u64;
         exec.core.fpu_fcsr = 2; // RM = toward +inf -- must not affect any of these
         exec.update_fpr_mode();
         exec.install_jit_hooks();
 
-        let trunc_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FTRUNC_W);
+        let trunc_w_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 16, 18, crate::cpu::mips_isa::FUNCT_FTRUNC_W);
         ls_exec_one(&mut exec, &mem, pc, trunc_w_s);
         assert_eq!(exec.core.fpr[18] as i32, 2, "TRUNC.W.S(2.5) must truncate to 2 regardless of FCSR.RM");
 
         exec.core.pc = pc;
-        let ceil_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FCEIL_W);
+        let ceil_w_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 16, 18, crate::cpu::mips_isa::FUNCT_FCEIL_W);
         ls_exec_one(&mut exec, &mem, pc, ceil_w_s);
         assert_eq!(exec.core.fpr[18] as i32, 3, "CEIL.W.S(2.5) must round up to 3 regardless of FCSR.RM");
 
         exec.core.pc = pc;
-        let floor_w_s = make_r(crate::mips_isa::OP_COP1, crate::mips_isa::RS_S, 0, 16, 18, crate::mips_isa::FUNCT_FFLOOR_W);
+        let floor_w_s = make_r(crate::cpu::mips_isa::OP_COP1, crate::cpu::mips_isa::RS_S, 0, 16, 18, crate::cpu::mips_isa::FUNCT_FFLOOR_W);
         exec.exec(floor_w_s);
         assert_eq!(exec.core.fpr[18] as i32, 2, "FLOOR.W.S(2.5) must round down to 2 regardless of FCSR.RM");
     }
@@ -6706,7 +6706,7 @@ mod tests {
         // comes from gpr[1], set by the caller. Both engines write it
         // identically; `cp0_context` is outside `CoreSnapshot`, so it never
         // introduces a spurious divergence in the snapshot-comparison tests.
-        make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_MTC0, 1, 4, 0, 0)
+        make_r(crate::cpu::mips_isa::OP_COP0, crate::cpu::mips_isa::RS_MTC0, 1, 4, 0, 0)
     }
 
     /// TEST 1 — pc+bd left correct after a fallback.
@@ -6749,9 +6749,9 @@ mod tests {
         // word0: ADDIU r2 = r1 + 0x11   (pre-fallback normal instruction)
         // word1: MTC0  r1 -> CP0[9]     (excluded -> interpreter fallback)
         // word2: ADDIU r3 = r1 + 0x22   (post-fallback "entry-like" successor)
-        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 0x11);
+        let addiu0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 2, 0x11);
         let mtc0 = benign_excluded_mtc0();
-        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 0x22);
+        let addiu2 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 3, 0x22);
         let page = [
             (entry_word, addiu0),
             (entry_word + 1, mtc0),
@@ -6775,9 +6775,9 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x7;
 
-        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 0x11);
+        let addiu0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 2, 0x11);
         let mtc0 = benign_excluded_mtc0();
-        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 0x22);
+        let addiu2 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 3, 0x22);
         let page = [
             (entry_word, addiu0),
             (entry_word + 1, mtc0),
@@ -6806,11 +6806,11 @@ mod tests {
         let mut gpr = [0u64; 32];
         gpr[1] = 0x100;
 
-        let addiu0 = make_i(crate::mips_isa::OP_ADDIU, 1, 2, 0x11);
-        let syscall = make_r(crate::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::mips_isa::FUNCT_SYSCALL);
+        let addiu0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 2, 0x11);
+        let syscall = make_r(crate::cpu::mips_isa::OP_SPECIAL, 0, 0, 0, 0, crate::cpu::mips_isa::FUNCT_SYSCALL);
         // Successor: if it ever runs, r3 becomes nonzero — the snapshot would
         // then diverge from the interpreter, which never reaches it.
-        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 0, 3, 0x55);
+        let addiu2 = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 3, 0x55);
         let page = [
             (entry_word, addiu0),
             (entry_word + 1, syscall),
@@ -6861,16 +6861,16 @@ mod tests {
         // entry paths deterministically (no delay slot, never executed), so the
         // interpreter's step count and the JIT's run-to-exit stop at the same pc
         // (word4, just past word3).
-        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 2);
+        let beq = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 2);
         let nop = 0u32;
         let mtc0 = benign_excluded_mtc0();
-        let addiu3 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 1);
+        let addiu3 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 3, 1);
         let page = [
             (entry0, beq),
             (entry0 + 1, nop),
             (entry0 + 2, mtc0),
             (entry0 + 3, addiu3),
-            (entry0 + 4, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+            (entry0 + 4, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
         ];
 
         // Path A: enter at the branch. Interpreter dispatches: BEQ (arms delay),
@@ -6988,8 +6988,8 @@ mod tests {
 
         // word3: ERET (excluded; retires EXEC_COMPLETE, pc <- EPC)
         // word4: ADDIU r5 = r0 + 0x77  (must NOT run — PC moved to EPC)
-        let eret = make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_TLB, 0, 0, 0, crate::mips_isa::FUNCT_ERET);
-        let addiu_succ = make_i(crate::mips_isa::OP_ADDIU, 0, 5, 0x77);
+        let eret = make_r(crate::cpu::mips_isa::OP_COP0, crate::cpu::mips_isa::RS_TLB, 0, 0, 0, crate::cpu::mips_isa::FUNCT_ERET);
+        let addiu_succ = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 0x77);
         let page = [(excluded_word, eret), (excluded_word + 1, addiu_succ)];
 
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
@@ -7016,8 +7016,8 @@ mod tests {
         // A reset core has STATUS_ERL set (mips_core.rs's reset:
         // BEV|ERL) — exec_eret checks ERL *first* and would return to
         // ErrorEPC(0), so clear ERL and set EXL to exercise the EPC path.
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
-        exec.core.cp0_status |= crate::mips_core::STATUS_EXL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_EXL;
         exec.core.cp0_epc = epc;
 
         unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
@@ -7254,10 +7254,10 @@ mod tests {
         // word3 then word4 — both quiesce at `ra`, so a fixed step count lands
         // both engines in the same place regardless of which arm ran. The
         // difference the test actually checks is which of r1/r2/r3 got set.
-        let addiu1 = make_i(crate::mips_isa::OP_ADDIU, 0, 1, 0x11);
-        let addiu2 = make_i(crate::mips_isa::OP_ADDIU, 0, 2, 0x22);
-        let addiu3 = make_i(crate::mips_isa::OP_ADDIU, 0, 3, 0x33);
-        let jr = make_r(crate::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::mips_isa::FUNCT_JR);
+        let addiu1 = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 1, 0x11);
+        let addiu2 = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 2, 0x22);
+        let addiu3 = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 3, 0x33);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
         // `ra` lands on a `jr $ra`-to-SELF (ra points at the jr itself), whose
         // delay slot is a nop. This pins pc at `ra` and, being a RegJump (always
         // a region boundary), exits the JIT region every dispatch — so `step()`
@@ -7285,7 +7285,7 @@ mod tests {
             let mut exec = Box::new(exec);
             let store = |vaddr: u64, val: u32| { mem.set_word(vaddr, val); mem.set_word(vaddr & 0x1FFF_FFFF, val); };
             for &(vaddr, raw) in &code { store(vaddr, raw); }
-            exec.core.cp0_status |= crate::mips_core::STATUS_CU1;
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_CU1;
             exec.core.set_fpu_cc(0, cc0);
             exec.update_fpr_mode();
             if jit { exec.jitv2_inline_compile = true; exec.install_jit_hooks(); }
@@ -7330,7 +7330,7 @@ mod tests {
         let _fb = fallback_on_guard();
         // BC1TL cc0, +2 (likely). cc0=false -> not taken -> slot ANNULLED (pc+8).
         // rt = (cc<<2)|(likely<<1)|tf = (0<<2)|(1<<1)|1 = 3.
-        let bc1tl = (crate::mips_isa::OP_COP1 << 26) | (crate::mips_isa::RS_BC1 << 21) | (3u32 << 16) | 2;
+        let bc1tl = (crate::cpu::mips_isa::OP_COP1 << 26) | (crate::cpu::mips_isa::RS_BC1 << 21) | (3u32 << 16) | 2;
         assert_bc1_fallback_matches(bc1tl, false, 12);
     }
 
@@ -7357,14 +7357,14 @@ mod tests {
         // word3: nop (bne's delay slot)
         // word4: region-boundary sentinel (clean end)
         let mtc0 = benign_excluded_mtc0();
-        let dec  = make_i(crate::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1
-        let bne  = make_i(crate::mips_isa::OP_BNE, 1, 0, (-3i16) as u16);
+        let dec  = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 1, 0xFFFF); // -1
+        let bne  = make_i(crate::cpu::mips_isa::OP_BNE, 1, 0, (-3i16) as u16);
         let page = [
             (entry0,     mtc0),
             (entry0 + 1, dec),
             (entry0 + 2, bne),
             (entry0 + 3, 0),
-            (entry0 + 4, crate::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+            (entry0 + 4, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
         ];
 
         // Interpreter dispatches per iteration: mtc0(1) + dec(2) + bne(3, arms
@@ -7400,8 +7400,8 @@ mod tests {
         let epc = 0xFFFF_FFFF_9000_0000u64 | (((excluded_word as u64) + 1) * 4);
         let gpr = [0u64; 32];
 
-        let eret = make_r(crate::mips_isa::OP_COP0, crate::mips_isa::RS_TLB, 0, 0, 0, crate::mips_isa::FUNCT_ERET);
-        let addiu_succ = make_i(crate::mips_isa::OP_ADDIU, 0, 5, 0x77);
+        let eret = make_r(crate::cpu::mips_isa::OP_COP0, crate::cpu::mips_isa::RS_TLB, 0, 0, 0, crate::cpu::mips_isa::FUNCT_ERET);
+        let addiu_succ = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 5, 0x77);
         let page = [(excluded_word, eret), (excluded_word + 1, addiu_succ)];
 
         let mut page_words = [0u32; ENTRIES_PER_PAGE];
@@ -7420,8 +7420,8 @@ mod tests {
         let phys_base = (page_base & 0x1FFF_FFFF) as u64;
         for &(w, raw) in &page { mem.set_word(phys_base + (w as u64) * 4, raw); }
         exec.install_jit_hooks();
-        exec.core.cp0_status &= !crate::mips_core::STATUS_ERL;
-        exec.core.cp0_status |= crate::mips_core::STATUS_EXL;
+        exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+        exec.core.cp0_status |= crate::cpu::mips_core::STATUS_EXL;
         exec.core.cp0_epc = epc;
 
         unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
@@ -7460,9 +7460,9 @@ mod tests {
         // word0: BEQ r0,r0,+2 (target word3)
         // word1: MTC0 (excluded) IN THE DELAY SLOT
         // word3: ADDIU r3 = r1 + 1 (branch target)
-        let beq = make_i(crate::mips_isa::OP_BEQ, 0, 0, 2);
+        let beq = make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 2);
         let mtc0 = benign_excluded_mtc0();
-        let addiu3 = make_i(crate::mips_isa::OP_ADDIU, 1, 3, 1);
+        let addiu3 = make_i(crate::cpu::mips_isa::OP_ADDIU, 1, 3, 1);
         let page = [
             (entry_word, beq),
             (entry_word + 1, mtc0),

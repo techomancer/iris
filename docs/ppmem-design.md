@@ -339,7 +339,7 @@ mmap(base+off, size, PROT_NONE,
 which another thread can be handed an address inside the range. The initial
 reservation is what makes `MAP_FIXED` *safe*: `MAP_FIXED` over an address we do
 not own would silently unmap someone else's mapping (the JIT arena in
-`src/jitv2/paged_memory.rs` reserves its own region; thread stacks and `dlopen`
+`src/cpu/jitv2/paged_memory.rs` reserves its own region; thread stacks and `dlopen`
 also allocate) and produce corruption with no error at the call site.
 
 **The only macOS difference is how the fd is created.** `memfd_create` is

@@ -1,6 +1,6 @@
 # A synthetic call chain must preserve `ra`, or it never returns
 
-`full_mutex_lock_cas_call_chain_matches_interpreter` (`src/jitv2/equiv_test.rs`) failed for
+`full_mutex_lock_cas_call_chain_matches_interpreter` (`src/cpu/jitv2/equiv_test.rs`) failed for
 months under `--features jitv2,jitv2_lockstep`. Every GPR matched between the JIT and the
 interpreter; only `pc` differed, by 8 bytes. It looked like a subtle JIT divergence. It was
 a bug in the test fixture.

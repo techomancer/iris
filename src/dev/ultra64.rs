@@ -366,7 +366,7 @@ impl Device for Ultra64 {
                     // N64 cart ROM starts at virtual 0xA4000000 (DMEM) or 0xB0000000 (PI).
                     // Use 0xA4000000 base so branch targets look like DMEM addresses.
                     let pc = 0xA400_0000u64 + pos as u64;
-                    let dis = crate::mips_dis::disassemble(instr, pc, None);
+                    let dis = crate::cpu::mips_dis::disassemble(instr, pc, None);
                     writeln!(w, "  {:08x}: {:08x}  {}", pos, instr, dis).unwrap();
                 }
             }

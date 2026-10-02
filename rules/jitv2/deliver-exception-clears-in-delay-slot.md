@@ -5,7 +5,7 @@ Addresses `cpucritique.md` finding BD-2.
 ## The change
 
 `core.in_delay_slot = false;` now lives at the end of `deliver_exception_at`
-(`src/mips_core.rs`), and the three executor wrappers (`handle_exception`,
+(`src/cpu/mips_core.rs`), and the three executor wrappers (`handle_exception`,
 `handle_exception_at`, `handle_exception_syscall`) no longer each do it themselves.
 
 Safe because `bd` is fully consumed *before* this point — folded into `Cause.BD` and

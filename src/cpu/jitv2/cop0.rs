@@ -53,7 +53,7 @@
 //! been. The `j2 cop0 off` monitor toggle still works for bisecting a live
 //! divergence, through the ordinary per-`InstrKind` enable table.
 
-use crate::mips_isa::*;
+use crate::cpu::mips_isa::*;
 
 /// CP0 registers an `MTC0`/`DMTC0` may write from inside a region.
 ///
@@ -104,13 +104,13 @@ pub fn stays_in_region(raw: u32) -> bool {
     // The monitor half of the switch: `j2 cop0 off`, or a single InstrKind
     // flipped off, must reach here too, so a divergence found on a live boot
     // can be bisected without relaunching.
-    let kind = crate::mips_instr_stats::classify_instr(
+    let kind = crate::cpu::mips_instr_stats::classify_instr(
         (OP_COP0 as u8) & 0x3F,
         ((raw >> 21) & 0x1F) as u8,
         ((raw >> 16) & 0x1F) as u8,
         (raw & 0x3F) as u8,
     );
-    if !crate::jitv2::opcode_support::instr_enabled(kind) {
+    if !crate::cpu::jitv2::opcode_support::instr_enabled(kind) {
         return false;
     }
 

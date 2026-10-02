@@ -1,7 +1,7 @@
 //! A cache that is visible to software but stays out of the data path.
 //!
 //! Every load, store and instruction fetch goes straight to memory, exactly as
-//! in [`PassthroughCacheOf`](crate::mips_cache_v2::PassthroughCacheOf). What
+//! in [`PassthroughCacheOf`](crate::cpu::mips_cache_v2::PassthroughCacheOf). What
 //! this adds is a *shadow*: tag and data arrays that only the CACHE
 //! instruction ever touches.
 //!
@@ -32,11 +32,11 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use crate::mips_cache_v2::{
+use crate::cpu::mips_cache_v2::{
     cache_op_name, CpuModel, FetchInstrResult, MipsCache, C_ILT, C_IST, C_R10K_CBARRIER,
     C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
-use crate::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
+use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 use crate::traits::{BusDevice, BusRead64};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
@@ -331,16 +331,16 @@ impl<
     /// Declined until both windows are published, as `CpuCache` does, so the
     /// emitted code can assume them. Without tcache there is no inline path:
     /// every access calls out, exactly as for `PassthroughCache`.
-    fn jit_dc_geometry(&self) -> crate::mips_cache_v2::JitDcGeometry {
+    fn jit_dc_geometry(&self) -> crate::cpu::mips_cache_v2::JitDcGeometry {
         #[cfg(feature = "jitv2")]
         if !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null() {
-            return crate::mips_cache_v2::JitDcGeometry {
+            return crate::cpu::mips_cache_v2::JitDcGeometry {
                 supported: true,
                 tagless: true,
-                ..crate::mips_cache_v2::JitDcGeometry::unsupported()
+                ..crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()
             };
         }
-        crate::mips_cache_v2::JitDcGeometry::unsupported()
+        crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()
     }
 
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
@@ -548,7 +548,7 @@ pub type R10000ShadowCache =
 mod tests {
     use super::*;
     use crate::dev::mem::Memory;
-    use crate::mips_cache_v2::{CACH_PD, CACH_SD};
+    use crate::cpu::mips_cache_v2::{CACH_PD, CACH_SD};
 
     fn cache() -> R10000ShadowCache {
         let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1)); // MB
@@ -716,7 +716,7 @@ mod tests {
         c.write::<4>(0, 0x2000, 0x1234_5678);
         assert_eq!(c.read::<4>(0, 0x2000).data, 0x1234_5678);
         // An invalidate cannot lose it, and a writeback cannot be needed.
-        c.cache_op(crate::mips_cache_v2::C_IINV | CACH_PD, 0x2000, 0);
+        c.cache_op(crate::cpu::mips_cache_v2::C_IINV | CACH_PD, 0x2000, 0);
         assert_eq!(c.read::<4>(0, 0x2000).data, 0x1234_5678);
     }
 

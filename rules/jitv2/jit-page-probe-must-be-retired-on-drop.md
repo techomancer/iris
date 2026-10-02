@@ -12,7 +12,7 @@ alternating SIGABRT and SIGSEGV on the `jitv2-compile-N` threads). **It was not 
 ## Symptom
 
 ```
-thread 'jitv2-compile-2' panicked at src/mips_cache_v2.rs:940:
+thread 'jitv2-compile-2' panicked at src/cpu/mips_cache_v2.rs:940:
 unsafe precondition(s) violated: slice::get_unchecked requires that the index is within the slice
 ```
 
