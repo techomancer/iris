@@ -306,24 +306,27 @@ jobs:
       # CPUTEST_BASELINE was uniform at 61 until the suite was validated against
       # two real Indys (cpu-tests/oracle/). Sixteen expectations turned out to be
       # wrong in a way IRIS happened to share, so correcting them raised what the
-      # emulator fails — not a regression, a stricter oracle. The cells now
-      # differ, so the baseline is per-CPU:
+      # emulator fails — not a regression, a stricter oracle. The baseline is
+      # per cell:
       #
-      #   r4400  124    r5000  108
+      #            interp  jitv2
+      #   r4400     124     126
+      #   r5000     108     110
       #
-      # Measured 2026-09-12 on all four cells; jitv2 still matches the
-      # interpreter check-for-check. Hardware passes 240/240 on both parts, so
-      # every one of these is an emulator bug with a confirmed counter-example —
-      # see cpu-tests/docs/findings.md. A tcache build would be higher by the
-      # two in rules/testing/tcache-discards-dirty-data-semantics.md, but no
-      # cell builds tcache today.
+      # Interpreter numbers measured 2026-09-12. Hardware passes 240/240 on both
+      # parts, so every one of these is an emulator bug with a confirmed
+      # counter-example — see cpu-tests/docs/findings.md. jitv2 implies tcache
+      # (since 2026-10-01), which makes L1-D write-through, so
+      # cache/hit_inv_discards fails its 2 checks there by design — see
+      # rules/testing/tcache-discards-dirty-data-semantics.md. Otherwise jitv2
+      # matches the interpreter check-for-check.
       #
       # Gate on CPUTEST_FAILED, not CPUTEST_RC: the exit code saturates at 100
       # and both cells are past it.
       - name: Result
         if: always()
         env:
-          CPUTEST_BASELINE: ${{ matrix.cpu == 'r4400' && 124 || 108 }}
+          CPUTEST_BASELINE: ${{ matrix.cpu == 'r4400' && (matrix.engine == 'jitv2' && 126 || 124) || (matrix.engine == 'jitv2' && 110 || 108) }}
         run: |
           {
             echo "### ${{ matrix.cpu }} / ${{ matrix.engine }}"
