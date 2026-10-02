@@ -8,10 +8,10 @@ use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, 
 use crate::devlog::{LogModule, devlog_is_active, devlog};
 use crate::snapshot::{get_field, u32_slice_to_toml, u16_slice_to_toml, u8_slice_to_toml, load_u32_slice, load_u16_slice, load_u8_slice, toml_u32, toml_u64, toml_u8, hex_u32, hex_u64, hex_u8};
 use std::cell::{Cell, UnsafeCell};
-use crate::vc2::Vc2;
-use crate::xmap9::Xmap9;
-use crate::cmap::Cmap;
-use crate::bt445::Bt445;
+use crate::dev::ng1::vc2::Vc2;
+use crate::dev::ng1::xmap9::Xmap9;
+use crate::dev::ng1::cmap::Cmap;
+use crate::dev::ng1::bt445::Bt445;
 use bitfield::bitfield;
 use crate::disp::Rex3Screen;
 use std::io::Write;
@@ -680,7 +680,7 @@ pub trait Rex3RegisterOps {
     /// # Example
     /// For a 12.4.7 format (12+4=16 value bits, top 9 bits unused, 7 bottom bits masked):
     /// ```
-    /// use iris::rex3::Rex3RegisterOps;
+    /// use iris::dev::ng1::rex3::Rex3RegisterOps;
     /// let val = 0x12345678u32.rexset(9, 7); // Input: uuuuuuuuuVVVVVVVVVVVVVVVVbbbbbbb
     ///                                        // Output: SSSSSSSSSVVVVVVVVVVVVVVVV0000000
     /// ```
@@ -697,7 +697,7 @@ pub trait Rex3RegisterOps {
     /// # Example
     /// For reading a 12.4.7 format register (16 value bits, 9 top bits, 7 bottom bits):
     /// ```
-    /// use iris::rex3::Rex3RegisterOps;
+    /// use iris::dev::ng1::rex3::Rex3RegisterOps;
     /// let raw_register = 0u32;
     /// let val = raw_register.rexget(9, 7); // Input: SSSSSSSSSVVVVVVVVVVVVVVVV0000000
     ///                                       // Output: 000000000VVVVVVVVVVVVVVVV0000000
@@ -1372,9 +1372,9 @@ pub struct Rex3 {
     /// `rex3_shaders` are built into every binary, and they use the same ABI as
     /// a Cranelift one. Seeded from the static table at construction; with
     /// `rex-jit` the compiler thread adds to it as new shapes appear.
-    pub shaders: Arc<RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>>,
+    pub shaders: Arc<RwLock<crate::dev::ng1::rex3_shape::ShapeMap<crate::dev::ng1::rex3_shaders::ShaderFn>>>,
     /// One-entry memo in front of `shaders`, on the GFIFO consumer thread only.
-    pub shader_last: std::cell::Cell<(u32, u32, u32, Option<crate::rex3_shaders::ShaderFn>)>,
+    pub shader_last: std::cell::Cell<(u32, u32, u32, Option<crate::dev::ng1::rex3_shaders::ShaderFn>)>,
     /// Every draw shape this run has dispatched — the corpus the shader
     /// generator consumes.
     ///
@@ -1383,9 +1383,9 @@ pub struct Rex3 {
     /// never runs, so a JIT-owned corpus would record nothing and could never
     /// grow to cover new shapes. Written on the GFIFO consumer thread only when
     /// a shape is new, which the `shader_last` memo makes rare.
-    pub seen_shapes: Mutex<crate::rex3_shape::ShapeSet>,
+    pub seen_shapes: Mutex<crate::dev::ng1::rex3_shape::ShapeSet>,
     #[cfg(feature = "rex-jit")]
-    pub rex_jit: Option<std::sync::Arc<crate::rex3_jit::RexJit>>,
+    pub rex_jit: Option<std::sync::Arc<crate::dev::ng1::rex3_jit::RexJit>>,
     /// Whether the JIT is enabled for dispatch (can be toggled at runtime via `rex jit on/off`).
     #[cfg(feature = "rex-jit")]
     pub jit_enabled: AtomicBool,
@@ -1459,11 +1459,11 @@ impl Rex3 {
         // a pre-seeded LLVM shader would serve those shapes first and the test
         // would compare the generic path against itself.
         #[cfg(not(test))]
-        let shaders_shared: Arc<RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>> =
-            Arc::new(RwLock::new(crate::rex3_shaders::SHADERS.iter().copied().collect()));
+        let shaders_shared: Arc<RwLock<crate::dev::ng1::rex3_shape::ShapeMap<crate::dev::ng1::rex3_shaders::ShaderFn>>> =
+            Arc::new(RwLock::new(crate::dev::ng1::rex3_shaders::SHADERS.iter().copied().collect()));
         #[cfg(test)]
-        let shaders_shared: Arc<RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>> =
-            Arc::new(RwLock::new(crate::rex3_shape::ShapeMap::default()));
+        let shaders_shared: Arc<RwLock<crate::dev::ng1::rex3_shape::ShapeMap<crate::dev::ng1::rex3_shaders::ShaderFn>>> =
+            Arc::new(RwLock::new(crate::dev::ng1::rex3_shape::ShapeMap::default()));
 
         let config = Rex3Config::default();
         config.config.store(CONFIG_BUSWIDTH | CONFIG_EXTREGXCVR |
@@ -1541,7 +1541,7 @@ impl Rex3 {
             rex_jit: if std::env::var_os("IRIS_NO_JIT").is_some() {
                 None
             } else {
-                Some(std::sync::Arc::new(crate::rex3_jit::RexJit::new(
+                Some(std::sync::Arc::new(crate::dev::ng1::rex3_jit::RexJit::new(
                     Arc::clone(&shaders_shared),
                 )))
             },
@@ -1558,7 +1558,7 @@ impl Rex3 {
             // `rex3_shaders::lookup` directly.
             shaders: Arc::clone(&shaders_shared),
             shader_last: std::cell::Cell::new((0, 0, 0, None)),
-            seen_shapes: Mutex::new(crate::rex3_shape::ShapeSet::default()),
+            seen_shapes: Mutex::new(crate::dev::ng1::rex3_shape::ShapeSet::default()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
             heartbeat,
@@ -1625,13 +1625,13 @@ impl Rex3 {
     }
 
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
-    pub fn apply_display_resolution(&self, mode: crate::vc2_timings::NewportResolution) {
+    pub fn apply_display_resolution(&self, mode: crate::dev::ng1::vc2_timings::NewportResolution) {
         if mode.is_guest() {
             return;
         }
         {
             let mut vc2 = self.vc2.lock();
-            crate::vc2_timings::apply_newport_resolution(&mut vc2, mode);
+            crate::dev::ng1::vc2_timings::apply_newport_resolution(&mut vc2, mode);
         }
         // Idle background until the guest paints (compositor uses host-only
         // direct-colour fallback while xmap is still zero — see CaptureRenderer).
@@ -1737,7 +1737,7 @@ impl Rex3 {
             let (_incrx1, incrx2, _incry1, incry2, y_major) = REX3_BRES_OCTANTS[(octant & 7) as usize];
             let mut x = ctx.xstart >> 11;
             let mut y = ctx.ystart >> 11;
-            crate::rex3_generic::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
+            crate::dev::ng1::rex3_generic::fline_apply_fract(ctx, &mut d, &mut x, &mut y, incrx2, incry2, y_major);
             ctx.xstart = x << 11;
             ctx.ystart = y << 11;
         }
@@ -2037,7 +2037,7 @@ impl Rex3 {
         use std::collections::BTreeSet;
 
         let precompiled: std::collections::HashSet<(u32, u32, u32)> =
-            crate::rex3_shaders::SHADERS.iter().map(|(k, _)| *k).collect();
+            crate::dev::ng1::rex3_shaders::SHADERS.iter().map(|(k, _)| *k).collect();
 
         // Every shape worth reporting: what was drawn, what is precompiled, and
         // (with rex-jit) what Cranelift knows about.
@@ -2088,7 +2088,7 @@ impl Rex3 {
     fn save_shape_corpus(&self) {
         let drawn: std::collections::HashSet<(u32, u32, u32)> =
             self.seen_shapes.lock().iter().copied().collect();
-        let on_disk = crate::rex3_profile::load_profile_quiet();
+        let on_disk = crate::dev::ng1::rex3_profile::load_profile_quiet();
 
         // Union of three sources. A run can only ever add: a session that drew
         // two shapes must not shrink a corpus collected over many.
@@ -2097,7 +2097,7 @@ impl Rex3 {
         // The generated table's keys: those shapes are served by compiled-in
         // Rust and may never reach Cranelift, so without this a regeneration
         // would emit a smaller table than the one it replaced.
-        all.extend(crate::rex3_shaders::SHADERS.iter().map(|(k, _)| *k));
+        all.extend(crate::dev::ng1::rex3_shaders::SHADERS.iter().map(|(k, _)| *k));
 
         if all.is_empty() {
             return;
@@ -2108,7 +2108,7 @@ impl Rex3 {
         let known: std::collections::HashSet<(u32, u32, u32)> = on_disk
             .iter()
             .copied()
-            .chain(crate::rex3_shaders::SHADERS.iter().map(|(k, _)| *k))
+            .chain(crate::dev::ng1::rex3_shaders::SHADERS.iter().map(|(k, _)| *k))
             .collect();
         let new_this_run = drawn.difference(&known).count();
 
@@ -2120,10 +2120,10 @@ impl Rex3 {
             drawn.len(),
             new_this_run,
             on_disk.len(),
-            crate::rex3_shaders::SHADERS.len(),
+            crate::dev::ng1::rex3_shaders::SHADERS.len(),
             triples.len(),
         );
-        if let Err(e) = crate::rex3_profile::save_profile(&triples) {
+        if let Err(e) = crate::dev::ng1::rex3_profile::save_profile(&triples) {
             eprintln!("REX3: failed to save shape corpus: {e}");
         }
     }
@@ -2196,7 +2196,7 @@ impl Rex3 {
                     if addr == 4 || addr == 6 { self.xmap1.lock().write_crs(crs, v); }
                     // Mode table write (CRS 5) = buf_sel flip: push a DISP_SYNC fence
                     // so the display thread waits for all prior draws before snapshotting.
-                    if crs == crate::xmap9::XMAP9_REG_MODE_TABLE_WRITE {
+                    if crs == crate::dev::ng1::xmap9::XMAP9_REG_MODE_TABLE_WRITE {
                         let fence = self.xmap_fence.fetch_add(1, Ordering::Relaxed) + 1;
                         self.gfifo_push(GFIFO_DISP_SYNC, fence as u64);
                     }
@@ -2388,7 +2388,7 @@ impl Rex3 {
         *slot = (*slot & !mask) | (val & mask);
     }
 
-    // ── Shims for the generic draw path (src/rex3_generic.rs) ────────────────
+    // ── Shims for the generic draw path (src/dev/ng1/rex3_generic.rs) ────────────────
     // The generic path selects among these bodies by decoded shape instead of
     // through the px_* function pointers. They are re-exported rather than
     // reimplemented: the colour packings are irregular (1-2-1 at 4bpp, 3-3-2 at
@@ -2707,7 +2707,7 @@ impl Rex3 {
             let dm0 = ctx.drawmode0.0;
             // Shared with compile_shader and the interpreter setup key below —
             // all three must agree or shaders get filed under a key nobody looks up.
-            let dm1 = crate::rex3_shape::normalize_dm1(ctx.drawmode1.0, opcode);
+            let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(ctx.drawmode1.0, opcode);
             let adrmode = ctx.drawmode0.adrmode();
             let is_line = adrmode == DRAWMODE0_ADRMODE_I_LINE
                 || adrmode == DRAWMODE0_ADRMODE_F_LINE
@@ -2825,7 +2825,7 @@ impl Rex3 {
         // Folding it out here is safe — see planes_setup: BLEND is not among the
         // fields it reads — and it keeps the three keys identical, which the
         // generated draw table will depend on.
-        let dm1_norm = crate::rex3_shape::normalize_dm1(ctx.drawmode1.0, opcode);
+        let dm1_norm = crate::dev::ng1::rex3_shape::normalize_dm1(ctx.drawmode1.0, opcode);
         let setup_key = (
             ctx.drawmode0.0 & DRAWMODE0_INTERP_SETUP_MASK,
             dm1_norm        & DRAWMODE1_INTERP_SETUP_MASK,
@@ -2834,7 +2834,7 @@ impl Rex3 {
         // One decode, one entry point. rex3_generic::draw fans out to the
         // per-adrmode walkers; every shape-selecting field reaches it as its own
         // argument, which is the list stage 5 promotes to const generics.
-        crate::rex3_generic::draw_primitive(ctx);
+        crate::dev::ng1::rex3_generic::draw_primitive(ctx);
         // Attribute this batch's words to the record `draw_primitive` just
         // created (via log_block). Doing it any earlier counts against the
         // wrong record — see the batch-token arm in process_register.
@@ -2872,7 +2872,7 @@ impl Rex3 {
             // the first — the corruption that made pixmaps and tiled fills come
             // out wrong.
             ctx.hostcnt = 0;
-            crate::rex3_generic::draw_primitive(ctx);
+            crate::dev::ng1::rex3_generic::draw_primitive(ctx);
             // Guard against a primitive that consumes nothing: without this a
             // shape that cannot make progress (a degenerate block, a mode the
             // walker declines) would spin here forever holding the GFIFO.
@@ -3046,7 +3046,7 @@ impl Rex3 {
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
                     let mut vc2 = self.vc2.lock();
-                    vc2.regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
+                    vc2.regs[crate::dev::ng1::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::dev::ng1::vc2::VC2_REG_CURSOR_Y_LOC as usize];
                     drop(vc2);
                     self.diag.fetch_and(!Self::DIAG_LOCK_VC2, Ordering::Relaxed);
                 }
@@ -3105,7 +3105,7 @@ impl Rex3 {
                 {
                     self.diag.fetch_or(Self::DIAG_LOCK_VC2, Ordering::Relaxed);
                     let mut vc2 = self.vc2.lock();
-                    vc2.regs[crate::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::vc2::VC2_REG_CURSOR_Y_LOC as usize];
+                    vc2.regs[crate::dev::ng1::vc2::VC2_REG_WORKING_CURSOR_Y as usize] = vc2.regs[crate::dev::ng1::vc2::VC2_REG_CURSOR_Y_LOC as usize];
                     drop(vc2);
                     self.diag.fetch_and(!Self::DIAG_LOCK_VC2, Ordering::Relaxed);
                 }
@@ -3747,7 +3747,7 @@ impl Device for Rex3 {
 
         if cmd == "bt445" && args[0] == "identity" {
             let mut dac = self.bt445.lock();
-            for i in 0..crate::bt445::BT445_PALETTE_SIZE {
+            for i in 0..crate::dev::ng1::bt445::BT445_PALETTE_SIZE {
                 dac.palette[i] = [i as u8, i as u8, i as u8];
             }
             dac.dirty = true;
@@ -4523,12 +4523,12 @@ impl Resettable for Rex3 {
             (*self.fb_aux.get()).fill(0);
         }
         // Reset Vc2, Xmap, Cmap
-        *self.vc2.lock() = crate::vc2::Vc2::new();
-        *self.xmap0.lock() = crate::xmap9::Xmap9::new();
-        *self.xmap1.lock() = crate::xmap9::Xmap9::new();
-        *self.cmap0.lock() = crate::cmap::Cmap::new(0);
-        *self.cmap1.lock() = crate::cmap::Cmap::new(1);
-        *self.bt445.lock() = crate::bt445::Bt445::new();
+        *self.vc2.lock() = crate::dev::ng1::vc2::Vc2::new();
+        *self.xmap0.lock() = crate::dev::ng1::xmap9::Xmap9::new();
+        *self.xmap1.lock() = crate::dev::ng1::xmap9::Xmap9::new();
+        *self.cmap0.lock() = crate::dev::ng1::cmap::Cmap::new(0);
+        *self.cmap1.lock() = crate::dev::ng1::cmap::Cmap::new(1);
+        *self.bt445.lock() = crate::dev::ng1::bt445::Bt445::new();
     }
 }
 
@@ -4718,7 +4718,7 @@ impl Saveable for Rex3 {
     }
 }
 
-fn save_xmap9(xmap: &crate::xmap9::Xmap9) -> toml::Value {
+fn save_xmap9(xmap: &crate::dev::ng1::xmap9::Xmap9) -> toml::Value {
     let mut tbl = toml::map::Map::new();
     tbl.insert("config".into(),           hex_u32(xmap.config          as u32));
     tbl.insert("cursor_cmap_msb".into(),  hex_u32(xmap.cursor_cmap_msb as u32));
@@ -4728,7 +4728,7 @@ fn save_xmap9(xmap: &crate::xmap9::Xmap9) -> toml::Value {
     toml::Value::Table(tbl)
 }
 
-fn load_xmap9(xmap: &mut crate::xmap9::Xmap9, v: &toml::Value) {
+fn load_xmap9(xmap: &mut crate::dev::ng1::xmap9::Xmap9, v: &toml::Value) {
     if let Some(x) = get_field(v, "config")          { xmap.config          = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "cursor_cmap_msb") { xmap.cursor_cmap_msb = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "popup_cmap_msb")  { xmap.popup_cmap_msb  = toml_u32(x).unwrap_or(0) as u8; }
@@ -4737,7 +4737,7 @@ fn load_xmap9(xmap: &mut crate::xmap9::Xmap9, v: &toml::Value) {
     xmap.dirty = true;
 }
 
-fn save_cmap(cmap: &crate::cmap::Cmap) -> toml::Value {
+fn save_cmap(cmap: &crate::dev::ng1::cmap::Cmap) -> toml::Value {
     let mut tbl = toml::map::Map::new();
     tbl.insert("addr_lo".into(),   hex_u32(cmap.addr_lo  as u32));
     tbl.insert("addr_hi".into(),   hex_u32(cmap.addr_hi  as u32));
@@ -4746,7 +4746,7 @@ fn save_cmap(cmap: &crate::cmap::Cmap) -> toml::Value {
     toml::Value::Table(tbl)
 }
 
-fn load_cmap(cmap: &mut crate::cmap::Cmap, v: &toml::Value) {
+fn load_cmap(cmap: &mut crate::dev::ng1::cmap::Cmap, v: &toml::Value) {
     if let Some(x) = get_field(v, "addr_lo")  { cmap.addr_lo  = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "addr_hi")  { cmap.addr_hi  = toml_u32(x).unwrap_or(0) as u8; }
     if let Some(x) = get_field(v, "command")  { cmap.command  = toml_u32(x).unwrap_or(0) as u8; }
@@ -4757,7 +4757,7 @@ fn load_cmap(cmap: &mut crate::cmap::Cmap, v: &toml::Value) {
 // Bt445 RAMDAC: palette + control registers. Critical for snapshot restore
 // because `power_on` wipes the palette to all-zero, which makes every pixel
 // decode to black after the gamma lookup in disp.rs::refresh.
-fn save_bt445(dac: &crate::bt445::Bt445) -> toml::Value {
+fn save_bt445(dac: &crate::dev::ng1::bt445::Bt445) -> toml::Value {
     let flatten = |rgb: &[[u8; 3]]| -> Vec<u8> {
         let mut v = Vec::with_capacity(rgb.len() * 3);
         for e in rgb { v.extend_from_slice(e); }
@@ -4777,7 +4777,7 @@ fn save_bt445(dac: &crate::bt445::Bt445) -> toml::Value {
     toml::Value::Table(tbl)
 }
 
-fn load_bt445(dac: &mut crate::bt445::Bt445, v: &toml::Value) {
+fn load_bt445(dac: &mut crate::dev::ng1::bt445::Bt445, v: &toml::Value) {
     let unflatten = |bytes: &[u8], dest: &mut [[u8; 3]]| {
         for (i, chunk) in bytes.chunks(3).enumerate() {
             if i >= dest.len() { break; }

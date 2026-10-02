@@ -13,7 +13,7 @@ span lengths — the signature of timing failed `try_push` calls (~8 ns each)
 rather than draws. The single-span validation step could not catch it
 because it writes into an empty queue.
 
-Fix in `src/rex3_tests.rs`: `w32`/`w64` spin while the status is `BUS_BUSY`;
+Fix in `src/dev/ng1/rex3_tests.rs`: `w32`/`w64` spin while the status is `BUS_BUSY`;
 `reg()`, `reg_go()` and the direct `write32(go_addr(..))` call sites use them.
 
 Rule: if a number from a device-level throughput test looks better than the

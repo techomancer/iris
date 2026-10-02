@@ -35,7 +35,7 @@ use crate::mips_cache_shadow::R10000ShadowCache;
 use crate::hpc3::Hpc3;
 use crate::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
-use crate::rex3::Rex3;
+use crate::dev::ng1::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
@@ -98,7 +98,7 @@ pub struct Machine {
     /// Configured nvram file path, recorded in snapshot manifests.
     nvram_path: String,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
-    display_resolution: crate::vc2_timings::NewportResolution,
+    display_resolution: crate::dev::ng1::vc2_timings::NewportResolution,
     /// Whether Newport compositor is active (not headless / not XZ board).
     newport_active: bool,
     /// Indigo2 IP22 fullhouse layout (`!guinness`).
@@ -992,7 +992,7 @@ impl Machine {
             // (embedded Indy PROM, gfxinit mismatch). Bootstrap 1280×1024 so the GUI
             // refresh thread has non-zero dimensions; guest can reprogram VC2 later.
             if self.fullhouse {
-                crate::vc2_timings::NewportResolution::Res1280x1024
+                crate::dev::ng1::vc2_timings::NewportResolution::Res1280x1024
             } else {
                 return;
             }
@@ -1187,11 +1187,11 @@ impl Machine {
         &self.hpc3
     }
 
-    pub fn get_rex3(&self) -> Option<Arc<crate::rex3::Rex3>> {
+    pub fn get_rex3(&self) -> Option<Arc<crate::dev::ng1::rex3::Rex3>> {
         self._phys.rex3.clone()
     }
 
-    pub fn get_rex3_head1(&self) -> Option<Arc<crate::rex3::Rex3>> {
+    pub fn get_rex3_head1(&self) -> Option<Arc<crate::dev::ng1::rex3::Rex3>> {
         self._phys.rex3_head1.clone()
     }
 

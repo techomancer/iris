@@ -1,15 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use glow::HasContext;
-use crate::vc2::{Vc2, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_DID_EN, VC2_REG_DID_ENTRY_PTR,
+use crate::dev::ng1::vc2::{Vc2, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_DID_EN, VC2_REG_DID_ENTRY_PTR,
     VC2_REG_SCANLINE_LEN, VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y,
     VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE, VC2_REG_CURSOR_ENTRY_PTR,
     VC2_REG_VIDEO_ENTRY_PTR, VC2_CTRL_BLACKOUT, VC2_CTRL_VIDEO_TIMING_EN,
     VT_VIS_LN_VC_N, VT_DSPLY_EN_RO_N, VT_CBLANK_XMAP_N, VT_HPOS_VC_N};
-use crate::xmap9::Xmap9;
-use crate::cmap::Cmap;
-use crate::bt445::Bt445;
-use crate::rex3::Rex3;
+use crate::dev::ng1::xmap9::Xmap9;
+use crate::dev::ng1::cmap::Cmap;
+use crate::dev::ng1::bt445::Bt445;
+use crate::dev::ng1::rex3::Rex3;
 use crate::compositor::CompositorSource;
 use crate::debug_overlay::OverlaySource;
 
@@ -593,7 +593,7 @@ impl StatusBar {
     }
 
     pub fn update(&mut self, hb: u64) {
-        use crate::rex3::Rex3;
+        use crate::dev::ng1::rex3::Rex3;
         if hb & Rex3::HB_ENET_TX != 0 { self.enet_tx_fade = FADE_FRAMES; }
         if hb & Rex3::HB_ENET_RX != 0 { self.enet_rx_fade = FADE_FRAMES; }
         for i in 0..7usize {
@@ -726,7 +726,7 @@ impl StatusBar {
             0u8
         } else {
             let lg = (pending as f64 + 1.0).log2();
-            let full = (crate::rex3::GFIFO_DEPTH as f64).log2();
+            let full = (crate::dev::ng1::rex3::GFIFO_DEPTH as f64).log2();
             ((lg / full) * 255.0).clamp(0.0, 255.0) as u8
         };
         let color = lerp_green_red(frac);

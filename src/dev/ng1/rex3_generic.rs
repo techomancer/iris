@@ -14,7 +14,7 @@
 //! from runtime register values to constants — but the logic it dispatches into
 //! is shared, not duplicated.
 
-use crate::rex3::{
+use crate::dev::ng1::rex3::{
     Rex3, Rex3Context, OCTANT_XDEC, OCTANT_YDEC, REX3_BRES_OCTANTS, CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_MASK,
     CLIPMODE_ENSMASK_SMASK0, CLIPMODE_ENSMASK_SMASK1_4,
     DRAWMODE0_ADRMODE_A_LINE, DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_F_LINE,
@@ -47,7 +47,7 @@ use crate::rex3::{
     DRAWMODE1_LOGICOP_ORI,
     DRAWMODE1_LOGICOP_NAND,
 };
-use crate::rex3_shape as sh;
+use crate::dev::ng1::rex3_shape as sh;
 
 /// The two framebuffer planes, as the JIT shader receives them.
 ///

@@ -505,7 +505,7 @@ pub struct GraphicsSection {
     pub heads: u8,
     /// Host-forced Newport video mode at VM start (`guest` = IRIX/setmon controls VC2).
     #[serde(default)]
-    pub resolution: crate::vc2_timings::NewportResolution,
+    pub resolution: crate::dev::ng1::vc2_timings::NewportResolution,
 }
 
 impl GraphicsSection {
@@ -524,7 +524,7 @@ impl Default for GraphicsSection {
         Self {
             board: GraphicsBoard::default(),
             heads: default_graphics_heads(),
-            resolution: crate::vc2_timings::NewportResolution::default(),
+            resolution: crate::dev::ng1::vc2_timings::NewportResolution::default(),
         }
     }
 }

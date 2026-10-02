@@ -7,7 +7,7 @@
 //! Today this holds only `normalize_dm1`. The field extractors and the
 //! `unpack()` that feeds the const-generic draw path land in the next stage.
 
-use crate::rex3::{
+use crate::dev::ng1::rex3::{
     CLIPMODE_CIDMATCH_SHIFT, CLIPMODE_ENSMASK_MASK, DRAWMODE0_OPCODE_DRAW,
     DRAWMODE0_OPCODE_READ, DRAWMODE0_OPCODE_SCR2SCR,
 };
@@ -144,7 +144,7 @@ pub const fn normalize_dm1(dm1: u32, opcode: u32) -> u32 {
 /// table small. Without it, drawmodes that generate byte-identical code become
 /// distinct monomorphisations, because drivers leave stale bits in fields the
 /// current mode ignores.
-pub const fn unpack(dm0: u32, dm1: u32, clipmode: u32) -> crate::rex3_generic::DynMode {
+pub const fn unpack(dm0: u32, dm1: u32, clipmode: u32) -> crate::dev::ng1::rex3_generic::DynMode {
     let opcode = dm0_opcode(dm0);
     let dm1 = normalize_dm1(dm1, opcode);
 
@@ -169,7 +169,7 @@ pub const fn unpack(dm0: u32, dm1: u32, clipmode: u32) -> crate::rex3_generic::D
     let blend = if fastclear_active { 0 } else { dm1_blend(dm1) };
     let blending = blend != 0;
 
-    crate::rex3_generic::DynMode {
+    crate::dev::ng1::rex3_generic::DynMode {
         opcode,
         planes: dm1_planes(dm1),
         drawdepth: dm1_drawdepth(dm1),
@@ -224,7 +224,7 @@ pub const fn unpack(dm0: u32, dm1: u32, clipmode: u32) -> crate::rex3_generic::D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rex3::{DrawMode0, DrawMode1, CLIPMODE_CIDMATCH_MASK};
+    use crate::dev::ng1::rex3::{DrawMode0, DrawMode1, CLIPMODE_CIDMATCH_MASK};
 
     /// The expression `execute_go` and `compile_shader` each spelled out inline
     /// before this module existed. Kept verbatim as the oracle so the shared

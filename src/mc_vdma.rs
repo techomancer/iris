@@ -122,8 +122,8 @@ pub const VDMA_CHUNK_QWORDS: usize = (256 * 1024) / 8;
 // silent corruption if they ever stop holding: the device would truncate the
 // transfer, or push_batch would spin forever waiting for room that cannot
 // exist.
-const _: () = assert!(VDMA_CHUNK_QWORDS <= crate::rex3::HOSTRW_BUF_QWORDS);
-const _: () = assert!(VDMA_CHUNK_QWORDS + 1 < crate::rex3::GFIFO_DEPTH);
+const _: () = assert!(VDMA_CHUNK_QWORDS <= crate::dev::ng1::rex3::HOSTRW_BUF_QWORDS);
+const _: () = assert!(VDMA_CHUNK_QWORDS + 1 < crate::dev::ng1::rex3::GFIFO_DEPTH);
 
 // ── State ───────────────────────────────────────────────────────────────────
 
@@ -1633,7 +1633,7 @@ mod rex3_e2e_tests {
     use super::*;
     use crate::eeprom_93c56::Eeprom93c56;
     use crate::mem::Memory;
-    use crate::rex3::*;
+    use crate::dev::ng1::rex3::*;
     use crate::traits::{BusDevice, Device};
     use parking_lot::Mutex as PlMutex;
     use std::sync::atomic::AtomicU64;
@@ -2130,7 +2130,7 @@ mod line_bulk_tests_support {
             let lines_per_chunk = (VDMA_CHUNK_QWORDS / qpl).max(1);
             assert!(lines_per_chunk * qpl <= VDMA_CHUNK_QWORDS,
                 "lw={lw}: chunk of {lines_per_chunk} lines x {qpl} qwords overflows the staging buffer");
-            assert!(lines_per_chunk * qpl <= crate::rex3::HOSTRW_BUF_QWORDS,
+            assert!(lines_per_chunk * qpl <= crate::dev::ng1::rex3::HOSTRW_BUF_QWORDS,
                 "lw={lw}: chunk exceeds REX3's HOSTRW array");
         }
     }

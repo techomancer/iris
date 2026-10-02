@@ -960,7 +960,7 @@ impl BusDevice for Ioc {
             }
             IOC_DMA_SEL => state.dma_sel = val,
             IOC_RESET => {
-                use crate::rex3::Rex3;
+                use crate::dev::ng1::rex3::Rex3;
                 state.reset_reg = val;
 
                 // LED bits are active-low: 0x10=LED_RED_OFF, 0x20=LED_GREEN_OFF

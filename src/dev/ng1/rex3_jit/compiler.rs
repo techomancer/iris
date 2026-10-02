@@ -34,7 +34,7 @@ fn block_args(vals: &[Value]) -> Vec<ir::BlockArg> {
     vals.iter().map(|&v| ir::BlockArg::Value(v)).collect()
 }
 
-use crate::rex3::{
+use crate::dev::ng1::rex3::{
     Rex3Context,
     DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR, DRAWMODE0_OPCODE_READ,
     DRAWMODE0_ADRMODE_BLOCK, DRAWMODE0_ADRMODE_SPAN,
@@ -198,7 +198,7 @@ impl ShaderCompiler {
         // Shared with execute_go's dispatch key and interpreter setup key. If this
         // and the dispatch site ever disagree, shaders compile under a key the draw
         // path never asks for and every GO silently falls back to the interpreter.
-        let dm1_val = crate::rex3_shape::normalize_dm1(dm1_val, opcode);
+        let dm1_val = crate::dev::ng1::rex3_shape::normalize_dm1(dm1_val, opcode);
 
         // Hardware disables FASTCLEAR when CID checking is enabled — rex3.pdf
         // says so in DRAWMODE1 bit 17 ("when CID checking disabled (CLIPMODE
@@ -264,13 +264,13 @@ impl ShaderCompiler {
             self.ctx.func.clear();
             self.jit_module.clear_context(&mut self.ctx);
             eprintln!("REX JIT: emit failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x} cm={clipmode_key:#010x}: {}  {}",
-                crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
+                crate::dev::ng1::rex3::decode_dm0(dm0_val), crate::dev::ng1::rex3::decode_dm1(dm1_val));
             return None;
         }
 
         if let Err(e) = self.jit_module.define_function(func_id, &mut self.ctx) {
             eprintln!("REX JIT: define_function failed for dm0={dm0_val:#010x} dm1={dm1_val:#010x} cm={clipmode_key:#010x}: {}  {}  -- {e}",
-                crate::rex3::decode_dm0(dm0_val), crate::rex3::decode_dm1(dm1_val));
+                crate::dev::ng1::rex3::decode_dm0(dm0_val), crate::dev::ng1::rex3::decode_dm1(dm1_val));
             eprintln!("--- Cranelift IR ---\n{}", self.ctx.func.display());
             self.jit_module.clear_context(&mut self.ctx);
             return None;
@@ -3144,7 +3144,7 @@ fn emit_hostrw_slot_ptr(
 
     // idx = min(cursor, last, HOSTRW_BUF_QWORDS - 1)
     let idx = b.ins().umin(host_cursor, last);
-    let cap = b.ins().iconst(types::I32, (crate::rex3::HOSTRW_BUF_QWORDS - 1) as i64);
+    let cap = b.ins().iconst(types::I32, (crate::dev::ng1::rex3::HOSTRW_BUF_QWORDS - 1) as i64);
     let idx = b.ins().umin(idx, cap);
 
     // &hostrw[idx] = ctx + offset_of(hostrw) + idx * 8

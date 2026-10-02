@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::hal2::Hal2;
-use crate::rex3::Rex3;
+use crate::dev::ng1::rex3::Rex3;
 use crate::traits::Device;
 
 pub struct PerfMonitor {
@@ -77,7 +77,7 @@ impl PerfMonitor {
             writeln!(
                 writer,
                 "REX3 GO: counters disabled in this build (rexdiag off/lightning)  gfifo {}/{}",
-                rex.gfifo.len(), crate::rex3::GFIFO_DEPTH,
+                rex.gfifo.len(), crate::dev::ng1::rex3::GFIFO_DEPTH,
             ).map_err(|e| e.to_string())?;
 
             #[cfg(feature = "rexdiag")]
@@ -90,7 +90,7 @@ impl PerfMonitor {
             writeln!(
                 writer,
                 "REX3 GO: {} total  JIT {}%  gfifo {}/{}",
-                total, pct, rex.gfifo.len(), crate::rex3::GFIFO_DEPTH,
+                total, pct, rex.gfifo.len(), crate::dev::ng1::rex3::GFIFO_DEPTH,
             ).map_err(|e| e.to_string())?;
             writeln!(
                 writer,

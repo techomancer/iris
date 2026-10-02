@@ -1,6 +1,6 @@
 use glow::HasContext;
 use crate::compositor::{Compositor, CompositorSource};
-use crate::vc2::{
+use crate::dev::ng1::vc2::{
     VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_CURSOR_ENTRY_PTR,
     VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE,
 };

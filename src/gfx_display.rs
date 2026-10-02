@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 
 use crate::disp::Rex3Screen;
 use crate::mips_core::CyclesPtr;
-use crate::rex3::Renderer;
+use crate::dev::ng1::rex3::Renderer;
 
 pub trait GfxDisplay: Send + Sync {
     /// Slot the front-end installs its renderer into. The board's display

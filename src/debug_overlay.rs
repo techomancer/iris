@@ -1,7 +1,7 @@
 use glow::HasContext;
-use crate::rex3::{DrawRecord, DrawMode0, DrawMode1, ModeEntry,
+use crate::dev::ng1::rex3::{DrawRecord, DrawMode0, DrawMode1, ModeEntry,
     DRAWMODE0_OPCODE_READ, DRAWMODE0_OPCODE_DRAW, DRAWMODE0_OPCODE_SCR2SCR};
-use crate::vc2::{
+use crate::dev::ng1::vc2::{
     VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_DISPLAY_CONTROL,
     VC2_CTRL_CURSOR_EN,
 };
@@ -267,11 +267,11 @@ impl DebugOverlay {
                     0=>"SPAN",1=>"BLK",2=>"ILINE",3=>"FLINE",4=>"ALINE",_=>"?"
                 };
                 let pln_str = |dm1: u32| match DrawMode1(dm1).planes() {
-                    crate::rex3::DRAWMODE1_PLANES_RGB  => "RGB",
-                    crate::rex3::DRAWMODE1_PLANES_RGBA => "RGBA",
-                    crate::rex3::DRAWMODE1_PLANES_OLAY => "OLAY",
-                    crate::rex3::DRAWMODE1_PLANES_PUP  => "PUP",
-                    crate::rex3::DRAWMODE1_PLANES_CID  => "CID",
+                    crate::dev::ng1::rex3::DRAWMODE1_PLANES_RGB  => "RGB",
+                    crate::dev::ng1::rex3::DRAWMODE1_PLANES_RGBA => "RGBA",
+                    crate::dev::ng1::rex3::DRAWMODE1_PLANES_OLAY => "OLAY",
+                    crate::dev::ng1::rex3::DRAWMODE1_PLANES_PUP  => "PUP",
+                    crate::dev::ng1::rex3::DRAWMODE1_PLANES_CID  => "CID",
                     _                                   => "NONE",
                 };
                 let lop_str = |dm1: u32| match DrawMode1(dm1).logicop() {

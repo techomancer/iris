@@ -7,11 +7,11 @@
 // position, so this file cannot disagree with the runtime decoder.
 //
 // Regenerate after collecting a fatter corpus:
-//     tools/gen_rex3_shaders.py -o src/rex3_shaders.rs
+//     tools/gen_rex3_shaders.py -o src/dev/ng1/rex3_shaders.rs
 
-use crate::rex3::Rex3Context;
-use crate::rex3_generic::{draw_with_fb, ConstMode, Framebuffers};
-use crate::rex3_shape::unpack;
+use crate::dev::ng1::rex3::Rex3Context;
+use crate::dev::ng1::rex3_generic::{draw_with_fb, ConstMode, Framebuffers};
+use crate::dev::ng1::rex3_shape::unpack;
 
 /// A specialised draw entry point.
 ///

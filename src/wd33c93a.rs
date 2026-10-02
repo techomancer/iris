@@ -1086,7 +1086,7 @@ impl Device for Wd33c93a {
 
                     let tid = state_guard.target_id;
                     if tid < 7 {
-                        heartbeat.fetch_or(1u64 << (crate::rex3::Rex3::HB_SCSI_BASE as u64 + tid as u64), Ordering::Relaxed);
+                        heartbeat.fetch_or(1u64 << (crate::dev::ng1::rex3::Rex3::HB_SCSI_BASE as u64 + tid as u64), Ordering::Relaxed);
                     }
                 }
 

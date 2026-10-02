@@ -14,7 +14,7 @@ actually uses) — one in the interpreter, one in the JIT, both about the same
 invariant: **a row boundary in host mode is always a forced word boundary**,
 full or not, because hardware sends exactly one word per GO.
 
-## Interpreter bug (`src/rex3.rs`, `draw_block`)
+## Interpreter bug (`src/dev/ng1/rex3.rs`, `draw_block`)
 
 The row-wrap branch (`x_end_reached` under `stopony`, more rows remaining)
 fell through into the shared `stop_on_word && ctx.hostcnt == 0` check below
@@ -38,7 +38,7 @@ Existing tests didn't catch this because `test_hostr_ci8_partial_word` is
 single-row (hits `y_end_reached`, which already broke correctly) and the
 existing multirow test uses `!stopony`.
 
-## JIT bug (`src/rex3_jit/compiler.rs`, `emit_shader`'s `y_cont_block`)
+## JIT bug (`src/dev/ng1/rex3_jit/compiler.rs`, `emit_shader`'s `y_cont_block`)
 
 Cranelift codegen computes `host_xstop_v` — the "this word is done" x
 threshold — **once, at shader-function entry**, from the x position at the
@@ -64,7 +64,7 @@ actually finished.
 
 ## Regression coverage
 
-`src/rex3_tests.rs`, `jit_tests::hostr_stress` (+ 3 callers,
+`src/dev/ng1/rex3_tests.rs`, `jit_tests::hostr_stress` (+ 3 callers,
 `jit_hostr_ci8_stress_large_block`/`_odd_width_block`/
 `jit_hostr_rgb24_stress_large_block`): differential interp-vs-JIT tests over
 larger multi-row blocks, including odd widths that force every row to end

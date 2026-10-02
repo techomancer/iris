@@ -48,7 +48,7 @@ use parking_lot::Mutex;
 use crate::disp::Rex3Screen;
 use crate::gfifo::GFifo;
 use crate::mips_core::CyclesPtr;
-use crate::rex3::Renderer;
+use crate::dev::ng1::rex3::Renderer;
 use crate::snapshot::{get_field, hex_u32, load_u32_slice, load_u8_slice, toml_u32, u32_slice_to_toml, u8_slice_to_toml};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, Saveable, BUS_BUSY, BUS_OK};
 

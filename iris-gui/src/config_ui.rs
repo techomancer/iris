@@ -7,7 +7,7 @@ use iris::config::{
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
 use iris::nfsudp::NfsVersion;
-use iris::vc2_timings::NewportResolution;
+use iris::dev::ng1::vc2_timings::NewportResolution;
 
 use crate::ram::{ram_summary, RAM_PRESETS};
 

@@ -362,7 +362,7 @@ prints a warning if you try. See
 ### REX3 drawing and the graphics JIT (`--features rex-jit`)
 
 Every build draws through one generic REX3 draw routine that is specialised
-ahead of time into 400+ native draw functions (`src/rex3_shaders.rs`, generated
+ahead of time into 400+ native draw functions (`src/dev/ng1/rex3_shaders.rs`, generated
 by `tools/gen_rex3_shaders.py` from a corpus of the DrawMode0/DrawMode1/clip
 combinations the IRIX desktop actually uses). Most desktop drawing already runs
 through one of those, with no JIT involved.

@@ -1,5 +1,5 @@
 use glow::HasContext;
-use crate::rex3::Rex3;
+use crate::dev::ng1::rex3::Rex3;
 
 /// All source data needed to composite one display frame.
 /// Borrowed from Rex3Screen's cached copies — no allocations per frame.
@@ -114,11 +114,11 @@ impl SwCompositor {
     /// After this, `self.buf` holds the composited frame; call `upload_gl` to
     /// push it to the GPU, or read `self.buf` directly for CPU readback.
     pub fn compose_pixels(&mut self, src: &CompositorSource<'_>) {
-        use crate::vc2::{
+        use crate::dev::ng1::vc2::{
             VC2_REG_CURRENT_CURSOR_X, VC2_REG_WORKING_CURSOR_Y, VC2_REG_CURSOR_ENTRY_PTR,
             VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE,
         };
-        use crate::rex3::ModeEntry;
+        use crate::dev::ng1::rex3::ModeEntry;
 
         let width  = src.width;
         let height = src.height;

@@ -13,7 +13,7 @@
 //! - DrawMode pairs seen at runtime are persisted to disk and pre-compiled on next boot.
 
 pub mod compiler;
-pub use crate::rex3_profile as profile;
+pub use crate::dev::ng1::rex3_profile as profile;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -23,7 +23,7 @@ use std::thread;
 #[cfg(feature = "developer")]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
 
-use crate::rex3::Rex3Context;
+use crate::dev::ng1::rex3::Rex3Context;
 use compiler::ShaderCompiler;
 
 /// A compiled draw shader and its housekeeping metadata.
@@ -104,13 +104,13 @@ impl ShaderState {
 /// (`seen_shapes`), because it must be recorded in builds with no Cranelift at
 /// all. Keeping a second copy here was pure duplication once that moved.
 pub struct ShaderStore {
-    pub shaders: RwLock<crate::rex3_shape::ShapeMap<ShaderState>>,
+    pub shaders: RwLock<crate::dev::ng1::rex3_shape::ShapeMap<ShaderState>>,
 }
 
 impl ShaderStore {
     fn new() -> Self {
         Self {
-            shaders: RwLock::new(crate::rex3_shape::ShapeMap::default()),
+            shaders: RwLock::new(crate::dev::ng1::rex3_shape::ShapeMap::default()),
         }
     }
 }
@@ -123,7 +123,7 @@ impl ShaderStore {
 /// through this handle. Shared with the generated LLVM shaders — both use the
 /// same ABI, so the dispatch never needs to know which produced an entry.
 pub type PublishMap =
-    Arc<parking_lot::RwLock<crate::rex3_shape::ShapeMap<crate::rex3_shaders::ShaderFn>>>;
+    Arc<parking_lot::RwLock<crate::dev::ng1::rex3_shape::ShapeMap<crate::dev::ng1::rex3_shaders::ShaderFn>>>;
 
 pub struct RexJit {
     store: Arc<ShaderStore>,
@@ -241,7 +241,7 @@ impl RexJit {
                         // shader for a covered shape would never be called —
                         // compiling it burns startup CPU (and competes with the
                         // guest for cores) to produce code nothing dispatches.
-                        if crate::rex3_shaders::lookup(dm0, dm1, cm).is_some() {
+                        if crate::dev::ng1::rex3_shaders::lookup(dm0, dm1, cm).is_some() {
                             continue;
                         }
                         // One lookup answers "is this already known?" — where the
@@ -263,7 +263,7 @@ impl RexJit {
         }
         let precompiled = profile
             .iter()
-            .filter(|(d0, d1, c)| crate::rex3_shaders::lookup(*d0, *d1, *c).is_some())
+            .filter(|(d0, d1, c)| crate::dev::ng1::rex3_shaders::lookup(*d0, *d1, *c).is_some())
             .count();
         if warmup_count > 0 {
             eprintln!(

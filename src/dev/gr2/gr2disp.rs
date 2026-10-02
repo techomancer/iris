@@ -19,7 +19,7 @@ const VBLANK: Duration = Duration::from_micros(700);
 /// Minimum refresh rate while idle, so the status bar keeps moving.
 const IDLE_HEARTBEAT_FRAMES: u32 = 6;
 /// Heartbeat bits that persist across frames (front-panel LEDs); same as REX3.
-const HB_PERSISTENT: u64 = crate::rex3::Rex3::HB_PERSISTENT;
+const HB_PERSISTENT: u64 = crate::dev::ng1::rex3::Rex3::HB_PERSISTENT;
 
 impl Gr2 {
     pub(super) fn display_loop(&self) {

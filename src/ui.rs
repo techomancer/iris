@@ -10,7 +10,7 @@ use winit::{
 };
 use glow::HasContext;
 use crate::ps2::Ps2Controller;
-use crate::rex3::Renderer;
+use crate::dev::ng1::rex3::Renderer;
 use crate::gfx_display::GfxDisplay;
 use crate::disp::{Rex3Screen, StatusBar, StatusBarTexture, BarStats, STATUS_BAR_HEIGHT};
 use crate::compositor::{Compositor, SwCompositor};

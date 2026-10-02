@@ -56,8 +56,8 @@ whose batch handling dropped every row after the first; see
 
 ## What IRIS does with the bit today
 
-**Nothing.** `prefetch()` is decoded at `src/rex3.rs:425` and used only to print
-` PREFETCH` in the register log (`src/rex3.rs:263`). No path branches on it.
+**Nothing.** `prefetch()` is decoded at `src/dev/ng1/rex3.rs:425` and used only to print
+` PREFETCH` in the register log (`src/dev/ng1/rex3.rs:263`). No path branches on it.
 
 That is currently harmless rather than correct, and it is worth knowing which:
 

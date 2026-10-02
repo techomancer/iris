@@ -9,7 +9,7 @@ use iris::debug_overlay::DebugOverlay;
 use iris::disp::{BarStats, Rex3Screen, StatusBar, StatusBarTexture};
 use iris::gl_compositor::GlCompositor;
 use iris::headless_gl::HeadlessGl;
-use iris::rex3::Renderer;
+use iris::dev::ng1::rex3::Renderer;
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

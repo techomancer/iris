@@ -12,7 +12,7 @@ use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
 use crate::prom::PromPort;
 use crate::mc::MemoryController;
 use crate::hpc3::Hpc3;
-use crate::rex3::Rex3;
+use crate::dev::ng1::rex3::Rex3;
 use crate::dev::gr2::Gr2;
 use crate::mgras::Mgras;
 use crate::vino::Vino;

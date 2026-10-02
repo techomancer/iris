@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
-use iris::vc2_timings::NewportResolution;
+use iris::dev::ng1::vc2_timings::NewportResolution;
 
 use crate::ram::RAM_PRESETS;
 

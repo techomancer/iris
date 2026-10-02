@@ -18,7 +18,7 @@ uses. A Python reimplementation would be a second decoder free to drift, and the
 whole point of the refactor is that there is only one.
 
 Usage:
-    tools/gen_rex3_shaders.py [profile ...] -o src/rex3_shaders.rs
+    tools/gen_rex3_shaders.py [profile ...] -o src/dev/ng1/rex3_shaders.rs
 
 With no profile argument it reads $IRIS_REX_JIT_PROFILE, else
 $HOME/.iris/rex-jit-profile.bin. Multiple profiles are merged and de-duplicated,
@@ -122,7 +122,7 @@ def emit(entries: list[tuple[int, int, int]], source: str) -> str:
     w("// position, so this file cannot disagree with the runtime decoder.")
     w("//")
     w("// Regenerate after collecting a fatter corpus:")
-    w("//     tools/gen_rex3_shaders.py -o src/rex3_shaders.rs")
+    w("//     tools/gen_rex3_shaders.py -o src/dev/ng1/rex3_shaders.rs")
     w("")
     w("use crate::rex3::Rex3Context;")
     w("use crate::rex3_generic::{draw_with_fb, ConstMode, Framebuffers};")

@@ -204,19 +204,10 @@ pub mod ui;
 pub mod dev;
 pub mod gfifo;
 pub mod gfx_display;
-pub mod rex3;
-pub mod rex3_generic;
-pub mod rex3_shaders;
-pub mod rex3_shape;
 pub mod compositor;
 pub mod gl_compositor;
 pub mod headless_gl;
 pub mod debug_overlay;
-pub mod vc2;
-pub mod vc2_timings;
-pub mod xmap9;
-pub mod cmap;
-pub mod bt445;
 pub mod disp;
 pub mod exp;
 pub mod gdb_stub;
@@ -242,12 +233,6 @@ pub mod vino;
 pub mod mgras;
 pub mod ultra_proto;
 pub mod ultra64;
-/// Draw-shape corpus persistence. Deliberately NOT behind `rex-jit`: the corpus
-/// records what the guest draws, and the generated shader table serves draws in
-/// builds with no Cranelift at all.
-pub mod rex3_profile;
-#[cfg(feature = "rex-jit")]
-pub mod rex3_jit;
 #[cfg(feature = "jitv2")]
 pub mod jitv2;
 #[cfg(feature = "jitv2")]

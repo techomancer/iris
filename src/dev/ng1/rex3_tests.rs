@@ -2536,7 +2536,7 @@ fn test_iline_line_loop_rect() {
 #[cfg(feature = "rex-jit")]
 mod jit_tests {
     use super::*;
-    use crate::rex3_jit::RexJit;
+    use crate::dev::ng1::rex3_jit::RexJit;
 
     #[test]
     fn cid_write_masks_jit() {
@@ -2556,7 +2556,7 @@ mod jit_tests {
         let rex = make_rex3();
         {
             let mut map = rex.shaders.write();
-            for (k, f) in crate::rex3_shaders::SHADERS {
+            for (k, f) in crate::dev::ng1::rex3_shaders::SHADERS {
                 map.insert(*k, *f);
             }
         }
@@ -2671,7 +2671,7 @@ mod jit_tests {
         // Drain GFIFO so ctx.clipmode is committed, then read clipmode_key.
         wait(rex_jit);
         let cm = {
-            use crate::rex3::CLIPMODE_JIT_KEY_MASK;
+            use crate::dev::ng1::rex3::CLIPMODE_JIT_KEY_MASK;
             let ctx = unsafe { &*rex_jit.context.get() };
             ctx.clipmode & CLIPMODE_JIT_KEY_MASK
         };
@@ -3684,9 +3684,9 @@ mod jit_tests {
         {
             let cm = unsafe { (*rex_interp.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
             for (name, d0) in [("flat", dm0_flat), ("plain", dm0_plain), ("zpat", dm0_zpat)] {
-                let nd1 = crate::rex3_shape::normalize_dm1(dm1, DRAWMODE0_OPCODE_DRAW);
+                let nd1 = crate::dev::ng1::rex3_shape::normalize_dm1(dm1, DRAWMODE0_OPCODE_DRAW);
                 println!("  bench shape {name:<5}: dm0={d0:#010x} dm1={nd1:#010x} cm={cm:#010x}  \
-                          precompiled={}", crate::rex3_shaders::lookup(d0, nd1, cm).is_some());
+                          precompiled={}", crate::dev::ng1::rex3_shaders::lookup(d0, nd1, cm).is_some());
             }
         }
 
@@ -5348,7 +5348,7 @@ fn corpus_records_shapes_without_jit() {
     // The recorded key must be the canonical one the table is keyed on, or a
     // regenerated shader would be filed under something the dispatch never asks
     // for.
-    let dm1 = crate::rex3_shape::normalize_dm1(DM1_RGB24_SRC, DRAWMODE0_OPCODE_DRAW);
+    let dm1 = crate::dev::ng1::rex3_shape::normalize_dm1(DM1_RGB24_SRC, DRAWMODE0_OPCODE_DRAW);
     // cm carries the clipmode key, which rex3init leaves at CIDMATCH=0xF
     // (checking disabled) — read it back rather than assuming zero.
     let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
@@ -5512,12 +5512,12 @@ fn dispatch_lookup_cost() {
     let ks2 = keys.clone();
     let locked_ref = &locked;
     let with_lock = bench("RwLock<HashMap> read + lookup", Box::new(move |i| *locked_ref.read().get(&ks2[i]).unwrap()));
-    let fxmap: crate::rex3_shape::ShapeMap<u32> =
+    let fxmap: crate::dev::ng1::rex3_shape::ShapeMap<u32> =
         keys.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
     let ks_fx = keys.clone();
     let fx = bench("ShapeMap (FxHash), no lock", Box::new(move |i| *fxmap.get(&ks_fx[i]).unwrap()));
     let fxlocked = parking_lot::RwLock::new({
-        let m: crate::rex3_shape::ShapeMap<u32> =
+        let m: crate::dev::ng1::rex3_shape::ShapeMap<u32> =
             keys.iter().enumerate().map(|(i, k)| (*k, i as u32)).collect();
         m
     });
@@ -5568,7 +5568,7 @@ fn gfifo_push_breakdown() {
     println!("\n=== GFIFO push breakdown ===");
 
     // 1. The ring alone, no consumer running at all.
-    let quiet = crate::rex3::GFifo::new();
+    let quiet = crate::dev::ng1::rex3::GFifo::new();
     let a = bench("try_push, NO consumer thread", &|| {
         // Drain by hand so the ring never fills.
         if !quiet.try_push(0x100, 0) {
@@ -5577,7 +5577,7 @@ fn gfifo_push_breakdown() {
     });
 
     // 2. Same ring, but a consumer thread spinning on it — the real topology.
-    let live: &'static crate::rex3::GFifo = Box::leak(Box::new(crate::rex3::GFifo::new()));
+    let live: &'static crate::dev::ng1::rex3::GFifo = Box::leak(Box::new(crate::dev::ng1::rex3::GFifo::new()));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
     let h = std::thread::spawn(move || {
@@ -6187,7 +6187,7 @@ fn test_gfifo_push_batch_round_trips_every_word() {
     // GFifo is 65536 entries; build it on a thread with room for it,
     // the same reason make_rex3 does.
     std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-        use crate::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
+        use crate::dev::ng1::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
 
         // Heap-allocate: GFifo is 65536 entries and overflows a test stack.
         let fifo = Box::new(GFifo::new());
@@ -6222,7 +6222,7 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
     // GFifo is 65536 entries; build it on a thread with room for it,
     // the same reason make_rex3 does.
     std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
-        use crate::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
+        use crate::dev::ng1::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
 
         let fifo = Box::new(GFifo::new());
         let mut dst = Box::new(HostRwArray::default());
@@ -6261,7 +6261,7 @@ fn test_gfifo_back_to_back_batches_stay_separate() {
 /// symptom.
 #[test]
 fn test_gfifo_drain_payload_returns_the_exact_promised_count() {
-    use crate::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
+    use crate::dev::ng1::rex3::{GFifo, HostRwArray, REX3_DMA_BATCH_W, HOSTRW_BUF_QWORDS};
     use std::sync::Arc;
 
     std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(|| {
@@ -6869,7 +6869,7 @@ fn test_gfifo_sentinels_carry_go_and_have_names() {
         assert_ne!(tok & 0x0800, 0,
             "{name} = {tok:#06x} has no GO bit — its token would never run a primitive");
         assert_eq!(reg, tok & !0x0800, "{name}_REG must be the token minus the GO bit");
-        assert_ne!(crate::rex3::rex3_reg_name(reg), "UNKNOWN",
+        assert_ne!(crate::dev::ng1::rex3::rex3_reg_name(reg), "UNKNOWN",
             "{name}_REG ({reg:#06x}) has no name — the bus log cannot tell it from \
              a real unmapped register");
     }
@@ -7017,7 +7017,7 @@ mod batch_jit_equivalence {
             // The dispatch key is the *normalized* dm1, the same one
             // execute_go and compile_shader use. Passing the raw value looks
             // up a key nothing was ever filed under.
-            let dm1_key = crate::rex3_shape::normalize_dm1(
+            let dm1_key = crate::dev::ng1::rex3_shape::normalize_dm1(
                 DM1_CI8_HOSTRW64, DRAWMODE0_OPCODE_DRAW);
             if let Some(ref jit) = rex_j.rex_jit {
                 assert!(jit.wait_compiled(DM0_HOSTW_NO_STOPONY, dm1_key, cm),
@@ -7063,7 +7063,7 @@ mod batch_jit_equivalence {
             rex3init(rex_j);
             let _ = run_hostr(rex_j, w, h, n);
             let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
-            let dm1_key = crate::rex3_shape::normalize_dm1(
+            let dm1_key = crate::dev::ng1::rex3_shape::normalize_dm1(
                 DM1_CI8_HOSTRW64, DRAWMODE0_OPCODE_READ);
             if let Some(ref jit) = rex_j.rex_jit {
                 assert!(jit.wait_compiled(DM0_HOSTR_NO_STOPONY, dm1_key, cm),
@@ -7122,7 +7122,7 @@ fn precompiled_shaders_handle_batched_transfers() {
     const DM0_PRECOMPILED_HOSTW: u32 = 0x0046;
     let cm = 0xF << CLIPMODE_CIDMATCH_SHIFT;
     assert_eq!(cm, 0x1e00, "CIDMATCH default changed — re-check the corpus key");
-    assert!(crate::rex3_shaders::SHADERS.iter().any(|(k, _)| {
+    assert!(crate::dev::ng1::rex3_shaders::SHADERS.iter().any(|(k, _)| {
         *k == (DM0_PRECOMPILED_HOSTW, DM1_CI8_HOSTRW64, cm)
     }), "dm0={DM0_PRECOMPILED_HOSTW:#06x} dm1={DM1_CI8_HOSTRW64:#010x} cm={cm:#06x} is not \
          in the generated corpus — this test would exercise the interpreter instead");
@@ -7150,7 +7150,7 @@ fn precompiled_shaders_handle_batched_transfers() {
     let rex_s = make_rex3();
     {
         let mut map = rex_s.shaders.write();
-        for (k, f) in crate::rex3_shaders::SHADERS { map.insert(*k, *f); }
+        for (k, f) in crate::dev::ng1::rex3_shaders::SHADERS { map.insert(*k, *f); }
     }
     // `make_rex3` leaves the dispatch switch off so JIT tests start from a known
     // state; it gates the *whole* shader path, precompiled entries included. A

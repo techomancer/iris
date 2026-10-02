@@ -2,7 +2,7 @@
 
 > **Not in this tree.** The swappable backend below (`src/gfifo.rs` and the
 > `gfifo-*` features) was an experiment that did not land; the GFIFO is the
-> hand-written `GFifo` in `src/rex3.rs`. The measurements are kept because they
+> hand-written `GFifo` in `src/dev/ng1/rex3.rs`. The measurements are kept because they
 > are why the custom ring stayed.
 
 The CPU→REX3-painter command queue (`src/gfifo.rs`) can be built on any of four

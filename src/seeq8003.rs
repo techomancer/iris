@@ -717,8 +717,8 @@ impl Device for Seeq8003 {
                 // Calling it unconditionally on every idle loop spin is wasteful and can
                 // re-raise a stale interrupt that the driver already cleared via CLRINT.
                 // Signal heartbeat activity bits for the display thread.
-                if tx_activity { heartbeat_enet.fetch_or(crate::rex3::Rex3::HB_ENET_TX, Ordering::Relaxed); }
-                if rx_activity { heartbeat_enet.fetch_or(crate::rex3::Rex3::HB_ENET_RX, Ordering::Relaxed); }
+                if tx_activity { heartbeat_enet.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_TX, Ordering::Relaxed); }
+                if rx_activity { heartbeat_enet.fetch_or(crate::dev::ng1::rex3::Rex3::HB_ENET_RX, Ordering::Relaxed); }
 
                 let did_something = tx_activity || rx_activity || dma_irq;
                 if did_something {

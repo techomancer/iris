@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::config::{ImpactSection, ImpactSlot};
-use crate::rex3::Renderer;
+use crate::dev::ng1::rex3::Renderer;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, Device, Saveable};
 
 /// The graphics slot the board decodes.
@@ -1009,7 +1009,7 @@ impl Mgras {
         let mut sized = false;
         let mut last_pending = 0u64;
         let mut idle_frames = 0u32;
-        const PERSISTENT: u64 = crate::rex3::Rex3::HB_LED_RED | crate::rex3::Rex3::HB_LED_GREEN;
+        const PERSISTENT: u64 = crate::dev::ng1::rex3::Rex3::HB_LED_RED | crate::dev::ng1::rex3::Rex3::HB_LED_GREEN;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
