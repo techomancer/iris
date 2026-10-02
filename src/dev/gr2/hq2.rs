@@ -207,6 +207,9 @@ const PAD_X: u32 = 1280;
 const PAD_Y: u32 = 1024;
 /// Max pixel words per image row kept (1280 8-bit pixels = 320 words).
 const IMG_ROW_WORDS: usize = 1280;
+/// Pixel words one FIFO pixel-write chunk can hold (chunks are <= 48 pixels;
+/// IRIS GL pads its last 0x071 block to 16 words).
+pub(super) const PIX_WORDS: usize = 64;
 /// Max tile words kept (a 64x64 8-bit tile is 1024 words; larger is clipped).
 /// Tile/stipple store. expTileRects sends tiles of up to 0x1300 words
 /// (words per row * rows <= 0x1300; 4Dwm's 85x67 8-bit icon images need
@@ -615,6 +618,10 @@ pub struct Hq2Engine {
     gl_ctx: gl::GlCx,
     /// GE_CX_RESTORE_EXT words still to consume (u32::MAX: count not yet in).
     cx_ext_left: u32,
+    /// FIFO pixel writes (0x0B1 start, 0x071 data, 0x0B2 place, 0x0B3
+    /// end): words collected for the current chunk (up to 48 pixels).
+    pix: [u32; PIX_WORDS],
+    pix_n: u32,
 }
 
 impl Hq2Engine {

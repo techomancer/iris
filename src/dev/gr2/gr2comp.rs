@@ -97,10 +97,13 @@ pub fn pixel_rgb(p: u32, mode: u32, xm: &Xmap5) -> u32 {
         return xm.clut[0x1c00 + aux_pg * 16 + olay as usize];
     }
 
-    // Buffer select: the two 12-bit buffers live at bits 11:0 and 23:12
-    // (the bank-1 layout for 4/8-bit modes is unverified).
+    // Buffer select: bank 1 starts at the visual's depth, as libglcore's
+    // double-buffer write masks are the bank-0 mask shifted by the depth:
+    // 12-bit 11:0 / 23:12 (0x000FFF / 0xFFF000), 8-bit 7:0 / 15:8 (0x00FF
+    // / 0xFF00), 4-bit 3:0 / 7:4.
     let bank1 = pix_mode & 1 == 1 && pix_mode < 6;
-    let buf = if bank1 { (p >> 12) & 0xfff } else { p & 0xfff };
+    let shift = match pix_mode { 0 | 1 => 4, 2 | 3 => 8, _ => 12 };
+    let buf = (if bank1 { p >> shift } else { p }) & 0xfff;
 
     match pd_mode {
         PD_RGB => match pix_mode {
@@ -156,6 +159,22 @@ mod tests {
         assert_eq!(pixel_rgb(0xe0, mode, &xm), 0x00ff_0000, "red");
         assert_eq!(pixel_rgb(0x07, mode, &xm), 0x0000_ff00, "green");
         assert_eq!(pixel_rgb(0x18, mode, &xm), 0x0000_00ff, "blue");
+    }
+
+    /// Bank 1 sits at the depth: 8-bit buffers at 7:0 and 15:8 (libglcore's
+    /// 8-bit double-buffer masks 0x00FF / 0xFF00), 12-bit at 11:0 / 23:12.
+    #[test]
+    fn bank1_starts_at_the_depth() {
+        let mut xm: Box<Xmap5> = unsafe { Box::new_zeroed().assume_init() };
+        xm.clut[0x12] = 0x0000_0012;
+        xm.clut[0x34] = 0x0000_0034;
+        let ci8 = |pix_mode: u32| pix_mode << 24; // PD_MODE 0: colour index
+        let p = 0x0056_3412;
+        assert_eq!(pixel_rgb(p, ci8(2), &xm), 0x12, "8-bit bank 0: bits 7:0");
+        assert_eq!(pixel_rgb(p, ci8(3), &xm), 0x34, "8-bit bank 1: bits 15:8");
+        let rgb12 = |pix_mode: u32| (pix_mode << 24) | (PD_RGB << 16);
+        assert_eq!(pixel_rgb(0x000f_000f, rgb12(4), &xm), 0x00ff_0000, "12-bit bank 0: red");
+        assert_eq!(pixel_rgb(0x000f_000f, rgb12(5), &xm), 0x0000_ff00, "12-bit bank 1: green");
     }
 
     /// A line table with several DIDs (Xsgi login window: DID 3, DID 9 from

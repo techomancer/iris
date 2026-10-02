@@ -103,6 +103,30 @@ const VR_IRIS_POLYGON: u32 = 0x1ae;
 /// showmap): 0x044 then LOADV|0x1AE, points on 0x045 (V3 or ITOF|V3), 0x042
 /// then LOADV|0x065.
 pub const T_IRIS_INDEX: u32 = 0x030;
+/// IRIS GL writepixels / writeRGB (gl_g_writepixels): after the row is
+/// written (rectwrite), the character position moves past it: x (window
+/// pixels, the getcpos x + count) on the token; DATA y, 0. Untransformed,
+/// unlike cmov (0x066).
+pub const T_IRIS_SETCPOS: u32 = 0x0d0;
+/// Window origin readback (IRIS GL getorigin, writepixels; libglcore
+/// get_origin 0x2334): token 0; Finish; the mailbox holds the window's
+/// lower-left corner in screen coordinates (x, y; ints). getcpos and
+/// setcpos use the same screen space: writepixels places its row at
+/// getcpos - getorigin.
+pub const T_GET_ORIGIN: u32 = 0x0cd;
+/// FIFO pixel writes (IRIS GL writepixels / writeRGB via rectwrite; OpenGL
+/// glDrawPixels, __glExpDrawPixelsUnpack*), per chunk of <= 48 pixels:
+///   0x0B1 = 0                    start (the chunk's data follows)
+///   0x071 word, DATA ...         pixel words (IRIS GL: 16-word blocks, one
+///                                pixel per word, the last block padded
+///                                with 0xDEADBEEF)
+///   0x0B2 = x; DATA y, width,    place the chunk: window-relative x, y
+///         width, flag            (GL y up); flag != 0: pixels right to left
+///   0x0B3 = 0                    end
+pub const T_PIX_START: u32 = 0x0b1;
+pub const T_PIX_DATA: u32 = 0x071;
+pub const T_PIX_RECT: u32 = 0x0b2;
+pub const T_PIX_END: u32 = 0x0b3;
 /// OpenGL glIndex (libglcore HQ2_GL_INDEX, gr2_vapi.c): C1|0x0FE = 0x30FE
 /// with a float index, or ITOF|C1|0x0FE = 0x70FE (the CI aperture) with an
 /// integer. Colour-index windows (gr_osview on IRIX 6.5) set every colour
@@ -937,6 +961,9 @@ impl Hq2Engine {
             T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
             | T_IRIS_PMV | T_IRIS_PCLOS | T_IRIS_MOVE | T_IRIS_GETCPOS => 1,
             T_DEPTH_CLEAR => 3,
+            T_IRIS_SETCPOS => 3,
+            T_GET_ORIGIN | T_PIX_START | T_PIX_END => 1,
+            T_PIX_RECT => 5,
             T_RASTER_POS => 4,
             T_BITMAP => (BITMAP_HDR + 9) as u32,
             T_BITMAP_TALL => (BITMAP_HDR + 17) as u32,
@@ -1161,7 +1188,8 @@ impl Hq2Engine {
 
     /// Fixed-size GL commands. Returns false if `cmd` is not one.
     pub(super) fn gl_execute(&mut self, cmd: u32, out: &mut dyn Re3Sink) -> bool {
-        if Self::gl_arg_count(cmd).is_none() {
+        // 0x071 is open-ended (its words run to the next token).
+        if Self::gl_arg_count(cmd).is_none() && cmd != T_PIX_DATA {
             return false;
         }
         self.gl.ensure_init();
@@ -1271,10 +1299,45 @@ impl Hq2Engine {
                     self.gl.cull_back = cb;
                 }
             }
+            T_IRIS_SETCPOS => {
+                // Screen coordinates (getcpos x + count).
+                g.cpos[0] = a[0] as i32 - g.win[0];
+                g.cpos[1] = a[1] as i32 - g.win[1];
+                g.rpos = [g.cpos[0] as f32, g.cpos[1] as f32];
+            }
+            T_GET_ORIGIN => {
+                out.shram(READBACK_SHRAM, g.win[0] as u32);
+                out.shram(READBACK_SHRAM + 1, g.win[1] as u32);
+            }
+            T_PIX_START | T_PIX_END => self.pix_n = 0,
+            T_PIX_DATA => {
+                let n = (self.last_nargs as usize).min(a.len());
+                for &w in &a[..n] {
+                    if (self.pix_n as usize) < super::PIX_WORDS {
+                        self.pix[self.pix_n as usize] = w;
+                        self.pix_n += 1;
+                    }
+                }
+            }
+            T_PIX_RECT => {
+                let w = (a[2] as usize).min(self.pix_n as usize);
+                let mut words = [0u32; super::PIX_WORDS];
+                words[..w].copy_from_slice(&self.pix[..w]);
+                if a[4] != 0 {
+                    words[..w].reverse();
+                }
+                self.gl_pixel_row(a[0] as i32, a[1] as i32, 0, w as u32, 1, 0, &words[..w], false, out);
+                self.pix_n = 0;
+            }
             T_IRIS_GETCPOS => {
-                out.shram(READBACK_SHRAM, g.cpos[0] as u32);
-                out.shram(READBACK_SHRAM + 1, g.cpos[1] as u32);
-                out.shram(READBACK_SHRAM + 2, if g.cpos[2] != 0 { 0x8000_0000 } else { 0 });
+                // Screen coordinates (IRIS GL getcpos; writepixels subtracts
+                // getorigin to place its row).
+                out.shram(READBACK_SHRAM, (g.win[0] + g.cpos[0]) as u32);
+                out.shram(READBACK_SHRAM + 1, (g.win[1] + g.cpos[1]) as u32);
+                // Status: negative = invalid (gl_g_getcpos keeps its old
+                // values), zero = nothing to draw (gl_g_writepixels returns
+                // at once: mandel's window stayed grey), positive = valid.
+                out.shram(READBACK_SHRAM + 2, if g.cpos[2] != 0 { 0x8000_0000 } else { 1 });
             }
             T_GET_RASTERPOS => {
                 // __glExpGetRasterPosData: the raster colour (the position
@@ -1394,7 +1457,14 @@ impl Hq2Engine {
             T_FRAGMENT => format!("GL_FRAGMENT window ({}, {}) z {:#x} rgba ({:.3}, {:.3}, {:.3}, {:.3})",
                 a[0] as i32 - FRAGMENT_BIAS, a[1] as i32 - FRAGMENT_BIAS, a[2], f(a[3]), f(a[4]), f(a[5]), f(a[6])),
             T_IRIS_MOVE => "IRISGL_MOVE".to_string(),
-            T_IRIS_GETCPOS => format!("IRISGL_GETCPOS -> ({}, {}){}", g.cpos[0], g.cpos[1], if g.cpos[2] != 0 { " invalid" } else { "" }),
+            T_GET_ORIGIN => format!("GL_GET_ORIGIN -> ({}, {})", g.win[0], g.win[1]),
+            T_PIX_START => "GL_PIXELS_START".to_string(),
+            T_PIX_END => "GL_PIXELS_END".to_string(),
+            T_PIX_DATA => format!("GL_PIXEL_DATA {} words (chunk {})", self.last_nargs, self.pix_n),
+            T_PIX_RECT => format!("GL_PIXELS_PLACE ({}, {}) {} px {}", a[0] as i32, a[1] as i32, a[2], if a[4] != 0 { "right to left" } else { "" }),
+            T_IRIS_SETCPOS => format!("IRISGL_SETCPOS ({}, {}) {:#x}", a[0] as i32, a[1] as i32, a[2]),
+            T_IRIS_GETCPOS => format!("IRISGL_GETCPOS -> screen ({}, {}){}", g.win[0] + g.cpos[0], g.win[1] + g.cpos[1],
+                if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
             T_RASTER_POS => format!("GL_RASTER_POS -> window ({:.2}, {:.2}){} colour ({:.3}, {:.3}, {:.3})",

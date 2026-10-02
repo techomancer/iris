@@ -1743,7 +1743,8 @@ fn iris_move_draw_and_getcpos() {
     assert_eq!(gl_px(g, 120, 50), 0xff00, "right edge drawn");
     assert_eq!(gl_px(g, 60, 50), 0, "outline only");
     let sh = |i: u32| r32(g, (0x4022 + i) * 4);
-    assert_eq!((sh(0), sh(1), sh(2)), (33, 44, 0));
+    // Screen coordinates: the window's origin is (64, 660).
+    assert_eq!((sh(0), sh(1), sh(2)), (64 + 33, 660 + 44, 1));
 }
 
 /// gr_osview text: cmov, then 0x069 glyphs (w << 16 | h, orig, move, flags,
@@ -2631,4 +2632,58 @@ fn gl_bitmap_huge_block() {
     assert_eq!(gl_px(g, 57, 69) & 0xff, 3, "top row (first) is 8 wide at y + 19");
     assert_eq!(gl_px(g, 50, 50) & 0xff, 3, "bottom row (20th) at the raster");
     assert_eq!(gl_px(g, 51, 50) & 0xff, 0);
+}
+
+/// IRIS GL writepixels (mandel, IRIX 6.5.22): cmov, then getcpos; a zero
+/// status word made gl_g_writepixels return without drawing (grey window),
+/// so a valid position must read back positive. After the row it moves the
+/// character position with 0x0D0 x; DATA y, 0 (window pixels).
+#[test]
+fn iris_getcpos_status_and_setcpos() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
+    for x in [0.0f32, 2.0, 0.0] { cmd(g, 0x866, fl(x)); }
+    cmd(g, 0x068, 0);
+    g.wait_idle();
+    let sh = |i: u32| r32(g, (0x4022 + i) * 4);
+    // Screen coordinates (window origin (64, 660)), as getorigin.
+    assert_eq!((sh(0), sh(1)), (64, 662));
+    assert!(sh(2) as i32 > 0, "valid position: positive status");
+    cmd(g, 0x0cd, 0);
+    g.wait_idle();
+    assert_eq!((sh(0), sh(1)), (64, 660), "getorigin");
+    cmd(g, 0x0d0, 64 + 100);
+    data(g, 662);
+    data(g, 0);
+    cmd(g, 0x068, 0);
+    g.wait_idle();
+    assert_eq!((sh(0), sh(1)), (164, 662));
+}
+
+/// IRIS GL writepixels row (mandel2.log): 0x0B1; 0x071 blocks of 16 words,
+/// one colour index per word; 0x0B2 x; DATA y, width, width, flag; 0x0B3.
+/// The chunk lands at window (x, y); flag set = right to left.
+#[test]
+fn iris_writepixels_fifo_chunk() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let chunk = |g: &Gr2, x: u32, y: u32, px: &[u32], flag: u32| {
+        cmd(g, 0x0b1, 0);
+        let mut block = px.to_vec();
+        block.resize(16, 0);
+        cmd(g, 0x071, block[0]);
+        for &v in &block[1..] { data(g, v); }
+        cmd(g, 0x0b2, x);
+        for v in [y, px.len() as u32, px.len() as u32, flag] { data(g, v); }
+        cmd(g, 0x0b3, 0);
+    };
+    chunk(g, 10, 20, &[5, 6, 7, 8], 0);
+    chunk(g, 10, 21, &[5, 6, 7, 8], 1);
+    g.wait_idle();
+    let row = |y: i32| (10..14).map(|x| gl_px(g, x, y) & 0xff).collect::<Vec<_>>();
+    assert_eq!(row(20), vec![5, 6, 7, 8]);
+    assert_eq!(row(21), vec![8, 7, 6, 5]);
+    assert_eq!(gl_px(g, 14, 20) & 0xff, 0, "only width pixels, not the padding");
 }
