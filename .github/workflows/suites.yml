@@ -62,7 +62,7 @@ jobs:
     name: Build the guest binaries
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the MIPS cross toolchain
         run: |
@@ -115,7 +115,7 @@ jobs:
 
       # One binary of each for every cell below — that is what makes the matrix
       # a differential test rather than N independent runs.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: guest-elfs
           path: |
@@ -127,7 +127,7 @@ jobs:
     name: Host baseline
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The same kernels, natively. Its accuracy score must be 100% by
       # construction — it is the source of the golden values — so a failure
       # here means a kernel is not deterministic even against itself.
@@ -137,7 +137,7 @@ jobs:
           ./bench/build/irisbench-host | tee bench/build/host.log
       - name: The oracle must agree with itself
         run: grep -q 'IRIS-BENCH-DONE rc=0' bench/build/host.log
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: bench-host-log
@@ -154,14 +154,14 @@ jobs:
         cpu: [r4400, r5000]
         engine: [interp, jitv2]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: guest-elfs
           path: .
@@ -353,7 +353,7 @@ jobs:
             echo "cpu-tests improved to $CPUTEST_FAILED (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: suites-${{ matrix.cpu }}-${{ matrix.engine }}
@@ -370,13 +370,13 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           pattern: suites-*
           path: artifacts
@@ -395,7 +395,7 @@ jobs:
           cargo build --release --bin iris-bench
           ./target/release/iris-bench report --format md > bench/build/report.md
           cat bench/build/report.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: bench-report
           path: bench/build/report.md
