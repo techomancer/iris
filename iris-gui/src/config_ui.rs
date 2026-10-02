@@ -343,6 +343,24 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
              IP28 machine profile.")
             .weak().small());
     }
+    // jitv2 persistent code cache: lives here (not the Debug tab) so it's
+    // reachable from lightning builds too, which hide Debug entirely
+    // (build_features::LIGHTNING check in Tab::visible) even though jitv2
+    // itself is an independent feature from lightning.
+    if build_features::JITV2 {
+        ui.add_space(4.0);
+        Grid::new("jitv2_cache_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("Persistent JIT code cache (IRIS_JIT_CACHE)");
+            ui.checkbox(&mut cfg.jitv2.cache, "")
+                .on_hover_text("Keep compiled pages on disk across runs and load them instead of recompiling. See docs/jitv2-persistent-cache.md.");
+            ui.end_row();
+            ui.label("Cache directory (IRIS_JIT_CACHE_DIR)");
+            ui.add(TextEdit::singleline(&mut cfg.jitv2.cache_dir)
+                .hint_text("blank = platform cache dir")
+                .desired_width(280.0));
+            ui.end_row();
+        });
+    }
     ui.separator();
 
     show_board_picker(ui, cfg, mem_ctx.running);
@@ -1746,25 +1764,6 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         }
         ui.end_row();
     });
-    ui.separator();
-    ui.heading("jitv2 persistent code cache");
-    if build_features::JITV2 {
-        Grid::new("jitv2_cache_grid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.label("Keep compiled pages on disk (IRIS_JIT_CACHE)");
-            ui.checkbox(&mut cfg.jitv2.cache, "")
-                .on_hover_text("Load pages compiled in a previous run instead of recompiling. See docs/jitv2-persistent-cache.md.");
-            ui.end_row();
-            ui.label("Cache directory (IRIS_JIT_CACHE_DIR)");
-            ui.add(TextEdit::singleline(&mut cfg.jitv2.cache_dir)
-                .hint_text("blank = platform cache dir")
-                .desired_width(280.0));
-            ui.end_row();
-        });
-    } else {
-        ui.label(RichText::new(
-            "not built — rebuild with --features jitv2 (iris) or --features iris/jitv2 (iris-gui)",
-        ).weak());
-    }
     action
 }
 
