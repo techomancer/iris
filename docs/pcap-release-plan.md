@@ -46,7 +46,7 @@ resources it consumes are authored here. The two halves meet only at release tim
 - [x] **Phase 0 — feature merged.** `add-pcap-builds` carries the pcap feature:
   - root `Cargo.toml`: `pcap = ["dep:pcap"]`, `pcap = { version = "2", optional = true }`
   - `iris-gui/Cargo.toml`: `pcap = ["iris/pcap"]`
-  - `src/net_pcap.rs` (`PcapEngine`, `open_capture`, `is_pcap_mode`) present.
+  - `src/net/net_pcap.rs` (`PcapEngine`, `open_capture`, `is_pcap_mode`) present.
 - [x] **Build sanity** on this branch (verified 2026-06-20, all green):
   - [x] `cargo build --features pcap`
   - [x] `cargo build -p iris-gui --features pcap`
@@ -73,9 +73,9 @@ resources it consumes are authored here. The two halves meet only at release tim
 
 ### A1 — Capture-permission detection + GUI surfacing  *(cross-cutting, DONE 2026-06-20)*
 - [x] **[branch]** Surface `PcapEngine::open_capture` failure to the GUI: added
-  `PcapStatus` enum (`src/net.rs`) + `NatControl.pcap_status` field/methods;
+  `PcapStatus` enum (`src/net/mod.rs`) + `NatControl.pcap_status` field/methods;
   `PcapEngine` sets Active/PermissionDenied/DeviceError via `classify_open_error`
-  (`src/net_pcap.rs`, string-classifies EPERM/EACCES — pcap 2.x has no perm
+  (`src/net/net_pcap.rs`, string-classifies EPERM/EACCES — pcap 2.x has no perm
   variant); `Machine::net_pcap_status()` accessor; `handle.rs` samples it into
   `Status` + exposes `EmulatorHandle::pcap_status()`. Unit-tested.
 - [x] **[branch]** UX entry points (both, per decision): explicit "Enable packet

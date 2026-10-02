@@ -5,7 +5,7 @@ public IPs worked but hostnames did not resolve. NAT forwarded every guest UDP
 port-53 query to a hard-coded 8.8.8.8, and Mullvad blocks DNS to anything but
 its own resolver.
 
-`src/host_dns.rs` finds the host's DNS server; `NatEngine::dns_upstream` uses it
+`src/net/host_dns.rs` finds the host's DNS server; `NatEngine::dns_upstream` uses it
 unless `GatewayConfig::dns_upstream` is set, re-reading every
 `HOST_DNS_REFRESH` (5 s) so VPN changes apply without a restart. Fallback is
 8.8.8.8.

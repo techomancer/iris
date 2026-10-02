@@ -18,7 +18,7 @@ negative lookup in its DNLC, so **testing a fix needs a fresh mount**.
 
 ## Cause
 
-`src/nfsudp.rs` funnelled every LOOKUP name through `valid_component()`, which
+`src/net/nfsudp.rs` funnelled every LOOKUP name through `valid_component()`, which
 rejects `.`, `..`, empty, and anything with a separator. That is right for
 CREATE/MKDIR/REMOVE/RENAME, but wrong for LOOKUP:
 

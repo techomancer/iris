@@ -279,7 +279,7 @@ grep -v '^#' /etc/inetd.conf | grep -E 'tcp|udp'
 ## NFS file sharing
 
 IRIS exports a host directory to IRIX over NFS using a **built-in, pure-Rust NFS
-server** (`src/nfsudp.rs`). It runs entirely inside the NAT — the emulator
+server** (`src/net/nfsudp.rs`). It runs entirely inside the NAT — the emulator
 answers portmap (port 111) and the MOUNT/NFS RPC itself and injects the replies
 as virtual-network frames. **Nothing to install** (no external `unfsd`), **no
 host sockets**, and it works the same on Linux, macOS, and Windows. The only

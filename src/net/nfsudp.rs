@@ -1,6 +1,6 @@
 //! In-core NFS server (NFSv2 + NFSv3) over UDP, dispatched by the NAT engine.
 //!
-//! The whole protocol stays inside the NAT: `src/net.rs` hands guest MOUNT/NFS
+//! The whole protocol stays inside the NAT: `src/net/mod.rs` hands guest MOUNT/NFS
 //! RPC datagrams to this module and injects the reply bytes back as
 //! virtual-network frames — there are **no host network sockets**. The only host
 //! interaction is file I/O against the user-chosen backing folder.

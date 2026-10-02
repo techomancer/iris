@@ -30,7 +30,7 @@ fn main() {
         if cfg.network.mode == iris::config::NetMode::Pcap
             && cfg.network.pcap_interface.as_deref().map(str::trim).unwrap_or("").is_empty()
         {
-            if let Some(name) = iris::net_pcap::prompt_for_interface() {
+            if let Some(name) = iris::net::net_pcap::prompt_for_interface() {
                 cfg.network.pcap_interface = Some(name);
             }
         }

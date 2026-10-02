@@ -1,4 +1,4 @@
-# Plan: in-core NFSv3-over-UDP server (`src/nfsudp.rs`)
+# Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`)
 
 Status: **shipped.** It is the only NFS path (HELP.md, "NFS file sharing"). Real
 IRIX mounts have since turned up and fixed
@@ -10,8 +10,8 @@ Original status: **CODE-COMPLETE** (increments 1–8 landed, ~19 unit tests, bui
 default + appstore). Replaces the external `unfsd` with a synchronous, pure-Rust
 NFS/UDP server that lives inside the NAT. **Pending: real-boot validation** —
 mount from IRIX 5.3 (v2) and 6.x (v3), read/write, and large transfers
-(fragmentation/reassembly). Code: `src/nfsudp.rs` (backend, XDR/RPC, NFSv2+v3,
-MOUNT, DRC, NfsServer) + `src/net.rs` (handle_udp intercept, inbound reassembly).
+(fragmentation/reassembly). Code: `src/net/nfsudp.rs` (backend, XDR/RPC, NFSv2+v3,
+MOUNT, DRC, NfsServer) + `src/net/mod.rs` (handle_udp intercept, inbound reassembly).
 
 ## Decisions (locked 2026-06-18)
 
@@ -38,7 +38,7 @@ MOUNT, DRC, NfsServer) + `src/net.rs` (handle_udp intercept, inbound reassembly)
 
 ## Goal & hard constraints
 
-- A minimal **NFSv3 server, UDP only**, in `src/nfsudp.rs` (the `iris` core
+- A minimal **NFSv3 server, UDP only**, in `src/net/nfsudp.rs` (the `iris` core
   crate). No TLS, no NLM/locking, no real auth (allow every host, ignore RPC
   credentials), **faked/synthesized unix permissions** for cross-platform
   parity (esp. Windows, which has no unix uid/gid/mode).
@@ -53,7 +53,7 @@ MOUNT, DRC, NfsServer) + `src/net.rs` (handle_udp intercept, inbound reassembly)
 
 ## Why it fits the existing NAT cleanly
 
-`src/net.rs` already does most of the wiring:
+`src/net/mod.rs` already does most of the wiring:
 - **Portmap** is intercepted in-NAT (`handle_portmap_udp`, `portmap_lookup`/
   `portmap_reply`) — it answers GETPORT with `NFS_VM_PORT=2049` / `MOUNTD_VM_PORT
   =1234`. That's our "minimal service discovery"; reuse as-is.

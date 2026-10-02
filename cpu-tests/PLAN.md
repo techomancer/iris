@@ -58,7 +58,7 @@ Strings extracted from the embedded PROM (`src/prombin.rs`, 070-9101-011, 512 KB
   the "EFS CDROM" shape you want.
 - **Network boot exists in the PROM**: full BOOTP + TFTP client
   (`bootp()sashIP24`, `"TFTP: RRQ for file %s to %s"`, `network(%d)tftp()`).
-  IRIS answers BOOTP (`src/net.rs:1679`) but **has no TFTP server** — adding one
+  IRIS answers BOOTP (`src/net/mod.rs:1679`) but **has no TFTP server** — adding one
   (~150 lines in `net.rs`) would let `boot -f bootp()cputest.elf` pull the
   freshly-built ELF straight off the host with no image rebuild at all.
 
@@ -403,7 +403,7 @@ image/
   fallback if `mkefs` slips.
 
 **Optional accelerator — TFTP.** Adding a TFTP server next to the existing
-BOOTP handler in `src/net.rs` unlocks `boot -f bootp()cputest.elf`: no image,
+BOOTP handler in `src/net/mod.rs` unlocks `boot -f bootp()cputest.elf`: no image,
 no disk, straight from the host build directory. ~150 lines, and it exercises
 the PROM's network stack (which nothing currently tests).
 

@@ -4,6 +4,25 @@
 // the enet thread via an rtrb::Consumer<Vec<u8>>, processes them through a
 // software NAT stack, and enqueues inbound frames back via rtrb::Producer<Vec<u8>>.
 
+// Host-side networking. This file is the NAT engine itself; the rest of the
+// directory is the services it dispatches to, the PCAP alternative to it, and
+// the monitor's telnet negotiation.
+//
+//   net_pcap.rs  PCAP bridged backend (`pcap` feature)
+//   nfsudp.rs    in-core NFSv2/v3 server
+//   tftp.rs      read-only TFTP for PROM network boot
+//   xdmcp.rs     XDMCP gateway into the guest's xdm
+//   host_dns.rs  host DNS server discovery for NAT DNS forwarding
+//   telnet.rs    telnet option negotiation for the monitor/serial consoles
+
+mod host_dns;
+#[cfg(feature = "pcap")]
+pub mod net_pcap;
+pub mod nfsudp;
+pub mod telnet;
+pub mod tftp;
+pub mod xdmcp;
+
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -64,7 +83,7 @@ pub struct GatewayConfig {
     pub client_ip:   Ipv4Addr,
     pub netmask:     Ipv4Addr,
     /// Fixed upstream for guest DNS queries. None follows the host's configured
-    /// DNS server (see [`crate::host_dns`]), falling back to 8.8.8.8.
+    /// DNS server (see [`crate::net::host_dns`]), falling back to 8.8.8.8.
     pub dns_upstream: Option<SocketAddr>,
     /// NFS configuration; if Some, portmap and NAT redirection for NFS/mountd are enabled.
     pub nfs: Option<NfsConfig>,
@@ -579,7 +598,7 @@ fn portmap_reply(xid: u32, port: u32) -> Vec<u8> {
 pub(crate) struct NfsVirtualHost {
     ip: Ipv4Addr,
     mac: [u8; 6],
-    server: crate::nfsudp::NfsServer,
+    server: crate::net::nfsudp::NfsServer,
     nfs_cfg: NfsConfig,
     ip_id: u16,
     /// Inbound IP-fragment reassembly buffer, keyed by (src IP, IP id, proto).
@@ -592,7 +611,7 @@ impl NfsVirtualHost {
         // Locally-administered MAC, distinct from the NAT gateway's, so the guest
         // keeps the virtual NFS host as its own ARP entry. (0xBF53 ≈ "BF-NFS".)
         let mac = [0x02, 0x00, 0xDE, 0xAD, 0xBF, 0x53];
-        let server = crate::nfsudp::NfsServer::new(nfs_cfg.shared_dir.clone(), nfs_cfg.version);
+        let server = crate::net::nfsudp::NfsServer::new(nfs_cfg.shared_dir.clone(), nfs_cfg.version);
         Self { ip, mac, server, nfs_cfg, ip_id: 1, frag_reasm: HashMap::new() }
     }
 
@@ -1237,7 +1256,7 @@ mod nfs_pcap_tests {
 
         let mut host = NfsVirtualHost::new(
             nfs_ip,
-            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::nfsudp::NfsVersion::Auto },
+            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::net::nfsudp::NfsVersion::Auto },
         );
 
         // Full UDP datagram (header + portmap GETPORT for NFS), then split its IP
@@ -1270,7 +1289,7 @@ mod nfs_pcap_tests {
 
         let mut host = NfsVirtualHost::new(
             nfs_ip,
-            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::nfsudp::NfsVersion::Auto },
+            NfsConfig { shared_dir: "/nonexistent".into(), version: crate::net::nfsudp::NfsVersion::Auto },
         );
         let dgram = udp_packet(guest_ip, nfs_ip, 0x9abc, UDP_PORT_PORTMAP, &getport_call(7, RPC_PROG_MOUNTD));
         let frame = ip_frame(&host_mac, &guest_mac, guest_ip, nfs_ip, IP_PROTO_UDP, &dgram);
@@ -1318,7 +1337,7 @@ pub struct NatEngine {
     ip_id: u16,
     // In-core NFS/UDP server (replaces external unfsd). Some when an NFS export
     // is configured; the NAT dispatches guest MOUNT/NFS RPC straight to it.
-    nfs: Option<crate::nfsudp::NfsServer>,
+    nfs: Option<crate::net::nfsudp::NfsServer>,
     // Inbound IP-fragment reassembly buffers, keyed by (src_ip, ip_id, proto).
     // NFS writes arrive fragmented when wsize > MTU.
     frag_reasm: HashMap<(u32, u16, u8), FragReasm>,
@@ -1328,10 +1347,10 @@ pub struct NatEngine {
     // the XDMCP UDP-forward hook in poll_udp_fwd_listeners.
     xdmcp_sessions: HashMap<u16, Ipv4Addr>,
     // Read-only TFTP server for PROM network boot. Some when tftp_dir is set.
-    tftp: Option<crate::tftp::TftpServer>,
+    tftp: Option<crate::net::tftp::TftpServer>,
     // MAC to reply to per TFTP client, so a retransmit can be addressed without
     // relying on the last-learned guest MAC.
-    tftp_macs: HashMap<crate::tftp::ClientId, [u8; 6]>,
+    tftp_macs: HashMap<crate::net::tftp::ClientId, [u8; 6]>,
 }
 
 /// Reassembly state for one fragmented inbound IP datagram.
@@ -1416,11 +1435,11 @@ impl NatEngine {
         // Spin up the in-core NFS server if an export is configured.
         let nfs = config.nfs.as_ref().map(|c| {
             eprintln!("iris: in-core NFS server exporting {}", c.shared_dir);
-            crate::nfsudp::NfsServer::new(c.shared_dir.clone(), c.version)
+            crate::net::nfsudp::NfsServer::new(c.shared_dir.clone(), c.version)
         });
         let tftp = config.tftp_dir.as_ref().map(|dir| {
             eprintln!("iris: TFTP server (read-only) serving {}", dir.display());
-            crate::tftp::TftpServer::new(dir.clone())
+            crate::net::tftp::TftpServer::new(dir.clone())
         });
         Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
@@ -1974,7 +1993,7 @@ impl NatEngine {
         self.tftp_macs.retain(|client, _| server.has_transfer(client));
     }
 
-    fn send_tftp(&mut self, client: crate::tftp::ClientId, mac: [u8; 6], packet: &[u8]) {
+    fn send_tftp(&mut self, client: crate::net::tftp::ClientId, mac: [u8; 6], packet: &[u8]) {
         let udp = udp_packet(self.config.gateway_ip, client.0, UDP_PORT_TFTP, client.1, packet);
         let frame = ip_frame(&mac, &self.config.gateway_mac,
                              self.config.gateway_ip, client.0, IP_PROTO_UDP, &udp);
@@ -2072,7 +2091,7 @@ impl NatEngine {
         if let Some((addr, read_at)) = self.host_dns {
             if read_at.elapsed() < HOST_DNS_REFRESH { return addr; }
         }
-        let ip = crate::host_dns::system_dns_server().unwrap_or(DNS_FALLBACK);
+        let ip = crate::net::host_dns::system_dns_server().unwrap_or(DNS_FALLBACK);
         let addr = SocketAddr::from((ip, UDP_PORT_DNS));
         if self.host_dns.map(|(old, _)| old) != Some(addr) {
             dlog_dev!(LogModule::Net, "NAT DNS upstream {}", addr);
@@ -2882,7 +2901,7 @@ impl NatEngine {
             // session at gateway:(6000+display) — which nfs_remap_dst then relays
             // to the real X server. Record display→X-server (the datagram source).
             let data = if guest_port == XDMCP_GUEST_PORT {
-                match (crate::xdmcp::rewrite_request_ipv4(&data, gw_ip), from.ip()) {
+                match (crate::net::xdmcp::rewrite_request_ipv4(&data, gw_ip), from.ip()) {
                     (Some(rw), IpAddr::V4(xserver)) => {
                         let x11_port = X11_BASE_PORT.wrapping_add(rw.display_number);
                         self.xdmcp_sessions.insert(x11_port, xserver);
@@ -2977,7 +2996,7 @@ mod dns_nat_tests {
     #[test]
     fn host_dns_is_default_upstream_and_cached() {
         let (mut e, _rx) = engine(GatewayConfig::default());
-        let expected = crate::host_dns::system_dns_server().unwrap_or(DNS_FALLBACK);
+        let expected = crate::net::host_dns::system_dns_server().unwrap_or(DNS_FALLBACK);
         assert_eq!(e.dns_upstream(), SocketAddr::from((expected, 53)));
         let (_, read_at) = e.host_dns.unwrap();
         e.dns_upstream();

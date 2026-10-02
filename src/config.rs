@@ -207,14 +207,14 @@ pub struct PortForwardConfig {
 }
 
 /// NFS share configuration. NFS is served in-process by the NAT
-/// (`src/nfsudp.rs`) — no external `unfsd`, no host sockets.
+/// (`src/net/nfsudp.rs`) — no external `unfsd`, no host sockets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NfsConfig {
     /// Directory to export over NFS.
     pub shared_dir: String,
     /// NFS protocol version to serve (Auto answers whatever the guest mounts).
     #[serde(default)]
-    pub version: crate::nfsudp::NfsVersion,
+    pub version: crate::net::nfsudp::NfsVersion,
 }
 
 /// Pre-parsed NAT subnet derived from a CIDR string.
@@ -1043,7 +1043,7 @@ pub struct MachineConfig {
     pub scsi: std::collections::HashMap<u8, ScsiDeviceConfig>,
 
     /// NFS share configuration. If present, the NAT's in-process NFS server
-    /// (`src/nfsudp.rs`) exports `shared_dir` to the guest.
+    /// (`src/net/nfsudp.rs`) exports `shared_dir` to the guest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfs: Option<NfsConfig>,
 
@@ -1690,7 +1690,7 @@ pub fn load_config() -> (MachineConfig, u32) {
     if cli.list_net_interfaces {
         #[cfg(feature = "pcap")]
         {
-            print!("{}", crate::net_pcap::format_interfaces());
+            print!("{}", crate::net::net_pcap::format_interfaces());
             std::process::exit(0);
         }
         #[cfg(not(feature = "pcap"))]

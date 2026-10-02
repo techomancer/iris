@@ -61,7 +61,7 @@ old `default-features = false` config never had an equivalent either.
 ## Smaller renames
 
 - **socket2 0.6**: `Socket::set_ttl` → `set_ttl_v4` (disambiguated from the IPv6
-  hop limit). `src/net.rs` sets it on an `IPV4` ICMP socket, so the rename is a
+  hop limit). `src/net/mod.rs` sets it on an `IPV4` ICMP socket, so the rename is a
   straight substitution.
 - **png 0.18**: `Reader::output_buffer_size()` returns `Option<usize>` (`None`
   when the size would overflow `usize`).

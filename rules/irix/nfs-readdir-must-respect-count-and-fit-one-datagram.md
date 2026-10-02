@@ -2,7 +2,7 @@
 
 ## Symptom
 
-Mounting the in-core NFS server (`src/nfsudp.rs`) works, but `ls` on a folder
+Mounting the in-core NFS server (`src/net/nfsudp.rs`) works, but `ls` on a folder
 with many entries (e.g. a real Mac `~/Downloads`) fails on the guest with:
 
 ```

@@ -6,7 +6,7 @@ use iris::config::{
     ImpactSlot, MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
-use iris::nfsudp::NfsVersion;
+use iris::net::nfsudp::NfsVersion;
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
 use crate::ram::{ram_summary, RAM_PRESETS};
@@ -22,7 +22,7 @@ pub struct MemoryUiContext {
 }
 
 /// A host network interface candidate for the PCAP backend selector. This is a
-/// GUI-local, feature-independent copy of `iris::net_pcap::NetInterface` so the
+/// GUI-local, feature-independent copy of `iris::net::net_pcap::NetInterface` so the
 /// App state and `show_network` signature don't need `#[cfg(feature = "pcap")]`.
 #[derive(Debug, Clone)]
 pub struct PcapIface {
@@ -64,7 +64,7 @@ impl PcapIface {
 pub fn enumerate_pcap_ifaces() -> Result<Vec<PcapIface>, String> {
     #[cfg(feature = "pcap")]
     {
-        iris::net_pcap::list_interfaces().map(|list| {
+        iris::net::net_pcap::list_interfaces().map(|list| {
             list.into_iter()
                 .map(|i| PcapIface {
                     name: i.name,
@@ -1442,7 +1442,7 @@ fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan:
 /// capture interface (else the first host interface), reserve the host's own
 /// addresses, and pick the first [`nfs_ip_candidates`] entry.
 ///
-/// [`nfs_ip_candidates`]: iris::net_pcap::nfs_ip_candidates
+/// [`nfs_ip_candidates`]: iris::net::net_pcap::nfs_ip_candidates
 #[cfg(feature = "pcap")]
 fn suggest_nfs_ip(cfg: &MachineConfig, host: &[crate::netplan::HostIface]) -> Option<std::net::Ipv4Addr> {
     let want = cfg.network.pcap_interface.as_deref().filter(|s| !s.is_empty());
@@ -1450,7 +1450,7 @@ fn suggest_nfs_ip(cfg: &MachineConfig, host: &[crate::netplan::HostIface]) -> Op
         .and_then(|n| host.iter().find(|h| h.name == n))
         .or_else(|| host.first())?;
     let reserved: Vec<_> = host.iter().map(|h| h.addr).collect();
-    iris::net_pcap::nfs_ip_candidates(iface.network, iface.prefix, &reserved)
+    iris::net::net_pcap::nfs_ip_candidates(iface.network, iface.prefix, &reserved)
         .into_iter()
         .next()
 }

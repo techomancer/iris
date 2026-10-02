@@ -9,7 +9,7 @@
 //! *connects* (network.client), both on loopback.
 //!
 //! A background thread owns the socket, strips inbound telnet negotiation via
-//! `iris::telnet::TelnetFilter`, and parks decoded text in a shared buffer.
+//! `iris::net::telnet::TelnetFilter`, and parks decoded text in a shared buffer.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use iris::telnet::{self, TelnetFilter};
+use iris::net::telnet::{self, TelnetFilter};
 
 /// The loopback address the emulator binds for ttyd1 (IRIX serial console).
 pub const SERIAL_ADDR: &str = "127.0.0.1:8881";

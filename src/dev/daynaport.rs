@@ -211,7 +211,7 @@ impl DaynaPort {
                 use crate::net::NetBackend;
                 if config.mode == crate::config::NetMode::Pcap {
                     eprintln!("iris: DaynaPort {} backend = PCAP (bridged)", id);
-                    let mut engine = crate::net_pcap::PcapEngine::new(
+                    let mut engine = crate::net::net_pcap::PcapEngine::new(
                         config, tx_cons, rx_prod,
                         rx_wake_nat, tx_wake_nat,
                         running_nat, nat_ctl);

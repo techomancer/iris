@@ -1676,7 +1676,7 @@ impl App {
         let gw = self.emu.status.net_guest_gateway;
         // The configured NAT subnet, for fresh-guest guidance and the
         // "match the guest" action. IRIS is plug-and-play: it ADOPTS whatever
-        // gateway the guest ARPs for (src/net.rs), so the guest's own subnet is
+        // gateway the guest ARPs for (src/net/mod.rs), so the guest's own subnet is
         // fine — there is no fixed address it must use once ec0 is configured.
         let (eb, ep) = netplan::parse_cidr(self.cfg.nat_subnet.as_deref());
         let cfg_net = netplan::classify(eb, ep, &[]).derived;
@@ -2742,7 +2742,7 @@ impl App {
         if !self.show_nfs_help {
             return;
         }
-        use iris::nfsudp::NfsVersion;
+        use iris::net::nfsudp::NfsVersion;
 
         // Address the guest mounts from. PCAP (bridged) mode: the in-core NFS
         // server is a virtual L2 host at the IP you assigned — show that, not a NAT

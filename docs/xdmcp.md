@@ -22,7 +22,7 @@ mode** the guest is a real LAN host, so XDMCP works directly with no proxy.
 ```
 
 1. A UDP port-forward `host:11177 → guest:177` carries the XDMCP control channel.
-2. The ALG (`src/xdmcp.rs` + `net.rs`) rewrites the `Request` packet's
+2. The ALG (`src/net/xdmcp.rs` + `net.rs`) rewrites the `Request` packet's
    *connection-addresses* to the NAT gateway and records `display → X-server
    address` (the datagram's source).
 3. The guest's `xdm` opens the X11 session to `gateway:(6000+display)`. The NAT

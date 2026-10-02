@@ -464,7 +464,7 @@ impl SerialBackend for UnixSocketBackend {
 
 struct TcpConn {
     stream: TcpStream,
-    telnet: crate::telnet::TelnetFilter,
+    telnet: crate::net::telnet::TelnetFilter,
 }
 
 struct TcpSocketBackend {
@@ -502,7 +502,7 @@ impl SerialBackend for TcpSocketBackend {
         let mut guard = self.conn.lock();
         if let Some(ref mut c) = *guard {
             let mut buf = Vec::with_capacity(2);
-            crate::telnet::escape_byte(byte, &mut buf);
+            crate::net::telnet::escape_byte(byte, &mut buf);
             if let Err(e) = c.stream.write_all(&buf) {
                 if e.kind() != io::ErrorKind::WouldBlock {
                     *guard = None;
@@ -520,11 +520,11 @@ impl SerialBackend for TcpSocketBackend {
                     socket.set_nonblocking(true)?;
                     let mut c = TcpConn {
                         stream: socket,
-                        telnet: crate::telnet::TelnetFilter::new(),
+                        telnet: crate::net::telnet::TelnetFilter::new(),
                     };
                     // Send the initial WILL/DO offers. If the write fails,
                     // drop the connection — the client can reconnect.
-                    let hs = crate::telnet::TelnetFilter::initial_handshake();
+                    let hs = crate::net::telnet::TelnetFilter::initial_handshake();
                     if c.stream.write_all(&hs).is_err() {
                         return Err(io::Error::new(io::ErrorKind::WouldBlock, "handshake failed"));
                     }

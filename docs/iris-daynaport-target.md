@@ -55,7 +55,7 @@ on this work:
 | `src/scsi.rs` | `ScsiDevice` — one concrete struct, `is_cdrom: bool` selects HDD vs CD-ROM behaviour. `ScsiDevice::request(&mut self, &ScsiRequest) -> Result<ScsiResponse>` dispatches on `req.cdb[0]`. | A third device kind, and a dispatch branch that runs **before** the storage opcodes |
 | `src/dev/wd33c93a.rs` | The controller. Owns `state.devices[id]: Option<ScsiDevice>`; constructs them around lines 385–444 from config | Construct a DaynaPort target when configured |
 | `src/config.rs` | `ScsiConfig { path, cdrom, overlay }` (~line 15) | A way to say "this target is a DaynaPort" |
-| `src/net.rs` | `NatEngine`, `GatewayConfig`, `NatControl`, `NetBackend` trait, frame helpers (`eth_frame`, `mac_str`, `eth_summary`) | Reuse as-is — no changes expected |
+| `src/net/mod.rs` | `NatEngine`, `GatewayConfig`, `NatControl`, `NetBackend` trait, frame helpers (`eth_frame`, `mac_str`, `eth_summary`) | Reuse as-is — no changes expected |
 | `src/dev/seeq8003.rs` | The Indy's onboard Ethernet. **This is your template** for how a device owns frame queues and drives a `NatEngine` | Read `start()` around lines 550–600 |
 
 ### The reuse that makes this cheap
@@ -374,6 +374,6 @@ works you can validate against both IRIX releases.
   implementing that section. `irix5.3/RESUME.md` has the porting background.
 - **BlueSCSI V2 / ZuluSCSI** firmware — open-source implementations of this
   exact device, and the source of the multi-packet extension.
-- **IRIS**: `HACKING.md`, `src/dev/seeq8003.rs` (the template), `src/net.rs`
+- **IRIS**: `HACKING.md`, `src/dev/seeq8003.rs` (the template), `src/net/mod.rs`
   (the backend you are reusing), `rules/` (check before re-deriving a gotcha,
   and add a note there when you confirm a non-obvious fix).

@@ -580,7 +580,7 @@ impl Device for Seeq8003 {
                 use crate::net::NetBackend;
                 if config.mode == crate::config::NetMode::Pcap {
                     eprintln!("iris: networking backend = PCAP (bridged)");
-                    let mut engine = crate::net_pcap::PcapEngine::new(
+                    let mut engine = crate::net::net_pcap::PcapEngine::new(
                         config, tx_cons, rx_prod,
                         rx_wake_nat, tx_wake_nat,
                         running_nat, nat_ctl);
@@ -842,7 +842,7 @@ impl Device for Seeq8003 {
                         // List host interfaces available for PCAP bridging.
                         #[cfg(feature = "pcap")]
                         {
-                            write!(w, "{}", crate::net_pcap::format_interfaces()).ok();
+                            write!(w, "{}", crate::net::net_pcap::format_interfaces()).ok();
                         }
                         #[cfg(not(feature = "pcap"))]
                         {
