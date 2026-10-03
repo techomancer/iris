@@ -260,8 +260,9 @@ pub enum ReadDecode {
 /// Where a screen-to-host read goes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadDest {
-    /// READ_IMAGE: shram from READ_IMAGE_SHRAM, then FIN3.
-    Shram,
+    /// shram from this word (READ_IMAGE: READ_IMAGE_SHRAM; GL READ_RECT:
+    /// the mailbox), then FIN3.
+    Shram(usize),
     /// Pixel DMA read: the HQ2_GEDMA read port, then FIN2.
     Gedma,
 }
@@ -1495,7 +1496,7 @@ impl Hq2Engine {
                     s2d: self.s2d,
                     decode: ReadDecode::Planes2d,
                 };
-                out.read_image(&req, ReadDest::Shram);
+                out.read_image(&req, ReadDest::Shram(READ_IMAGE_SHRAM));
             }
             HQ2_2D_DMA_READ_PIXELS => {
                 let req = ReadImage {

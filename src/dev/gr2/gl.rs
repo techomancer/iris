@@ -163,9 +163,21 @@ pub const T_IRIS_GETCPOS: u32 = 0x068;
 /// c, d in eye space (gc->state.transform.eyeClipPlanes).
 pub const T_CLIP_PLANE_ENABLE: u32 = 0x02e;
 pub const T_CLIP_PLANE: u32 = 0x02f;
-/// Pixel zoom for pixel writes: token x3 = 0.0, zoom x, zoom y (meaning
-/// of the first word unverified; lrectwrite sends 0, 1, 1 at zoom 1).
+/// Pixel zoom for pixel writes: 0.0, zoom x, zoom y (f32; meaning of the
+/// first word unverified; lrectwrite sends 0, 1, 1 at zoom 1). libglcore
+/// sends all three to the token; IRIS GL rectzoom sends the first to the
+/// token and the zooms on DATA (snoop: 0, 6.0, 6.0).
 pub const T_PIXEL_ZOOM: u32 = 0x0bb;
+/// Pixel read through the mailbox (IRIS GL readpixels / rectread, OpenGL
+/// ReadColor, Fetch, Pack1): x on the token; DATA y, width, height, then
+/// three words (1, 0, 0 seen; meaning unknown). Window-relative, GL y up,
+/// y = the bottom row. The microcode puts the pixels in shram from the
+/// mailbox word 0x4022, one per word (as the 0x0AC DMA read decodes them,
+/// rows top first), and raises FIN3 itself: libgl polls version bit 0
+/// without sending a Finish, then copies the words, acks FIN3 at 0x6B000
+/// and sends READ_DONE. Unimplemented, snoop spun on FIN3 for its whole
+/// time slice.
+pub const T_READ_RECT: u32 = 0x0ad;
 pub const T_IRIS_SBOXF: u32 = 0x053;
 /// swaptmesh (gl_i_swaptmesh): swap the two vertices a tmesh (bgntmesh =
 /// 0x046, LOADV|0x047) keeps; the next vertex makes a triangle with them.
@@ -720,7 +732,6 @@ fn port_words(index: u32) -> Option<u32> {
         _ if index & !0x1ff != 0 => None,
         T_MODELVIEW | T_PROJECTION | T_TEXTURE_MATRIX | T_IRIS_MATRIX => Some(16),
         T_IRIS_CHAR16 => Some(13),
-        T_PIXEL_ZOOM => Some(3),
         T_IRIS_CHAR16_TALL | T_IRIS_CHAR32 => Some(21),
         T_NORMAL_MATRIX => Some(9),
         T_NORMAL | T_IRIS_NORMAL => Some(3),
@@ -811,6 +822,28 @@ impl Hq2Engine {
     pub(super) fn gl_read_desc(&self) -> String {
         format!("src {} {} {:?} window ({}, {})", self.gl.read_src[0], self.gl.read_src[1],
             self.gl_read_decode(), self.gl.win[0], self.gl.win[1])
+    }
+
+    /// 0x0AD: read a rectangle into the mailbox (layout at T_READ_RECT).
+    fn gl_mailbox_read(&mut self, a: &[u32], out: &mut dyn Re3Sink) {
+        use super::{ReadDest, ReadImage};
+        self.gl.ensure_init();
+        // Room in shram above the mailbox.
+        let (w, rows) = (a[2].min(2048), a[3].min(4096));
+        let rows = rows.min((0x8000 - READBACK_SHRAM as u32) / w.max(1));
+        let mut s2d = self.s2d;
+        s2d.buf_select = 0;
+        s2d.buf_offset = 0;
+        let req = ReadImage {
+            x: self.gl.win[0] + a[0] as i32,
+            top: self.gl.win[1] + a[1] as i32 + rows as i32 - 1,
+            w,
+            rows,
+            words_per_row: w,
+            s2d,
+            decode: self.gl_read_decode(),
+        };
+        out.read_image(&req, ReadDest::Shram(READBACK_SHRAM));
     }
 
     /// 0x0AC pixel DMA read (lrectread, glReadPixels KDMA): x on the token;
@@ -961,7 +994,8 @@ impl Hq2Engine {
             T_IRIS_WRITEMASK | T_IRIS_CLEAR | T_IRIS_ZCLEAR | T_IRIS_BGNPOLYGON | T_IRIS_ENDPOLYGON
             | T_IRIS_PMV | T_IRIS_PCLOS | T_IRIS_MOVE | T_IRIS_GETCPOS => 1,
             T_DEPTH_CLEAR => 3,
-            T_IRIS_SETCPOS => 3,
+            T_IRIS_SETCPOS | T_PIXEL_ZOOM => 3,
+            T_READ_RECT => 7,
             T_GET_ORIGIN | T_PIX_START | T_PIX_END => 1,
             T_PIX_RECT => 5,
             T_RASTER_POS => 4,
@@ -1081,7 +1115,6 @@ impl Hq2Engine {
                     _ => g.color,
                 };
             }
-            T_PIXEL_ZOOM => g.pzoom = [f(b[1]), f(b[2])],
             T_IRIS_INDEX | T_INDEX => {
                 g.color = [num(b[0]) / 255.0, 0.0, 0.0, 1.0];
             }
@@ -1299,6 +1332,8 @@ impl Hq2Engine {
                     self.gl.cull_back = cb;
                 }
             }
+            T_PIXEL_ZOOM => g.pzoom = [f(a[1]), f(a[2])],
+            T_READ_RECT => self.gl_mailbox_read(&a, out),
             T_IRIS_SETCPOS => {
                 // Screen coordinates (getcpos x + count).
                 g.cpos[0] = a[0] as i32 - g.win[0];
@@ -1467,6 +1502,9 @@ impl Hq2Engine {
                 if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
+            T_PIXEL_ZOOM => format!("GL_PIXEL_ZOOM {} x {} ({})", f(a[1]), f(a[2]), f(a[0])),
+            T_READ_RECT => format!("GL_READ_RECT ({}, {}) {}x{} [{:#x} {:#x} {:#x}] {} -> shram[{:#x}], FIN3",
+                a[0] as i32, a[1] as i32, a[2], a[3], a[4], a[5], a[6], self.gl_read_desc(), READBACK_SHRAM),
             T_RASTER_POS => format!("GL_RASTER_POS -> window ({:.2}, {:.2}){} colour ({:.3}, {:.3}, {:.3})",
                 g.rpos[0], g.rpos[1], if g.cpos[2] != 0 { " invalid" } else { "" },
                 g.cpos_color[0], g.cpos_color[1], g.cpos_color[2]),
@@ -1779,12 +1817,17 @@ impl Hq2Engine {
     }
 
     /// One row of a GL pixel DMA (0x0B5 / 0x0B8, lrectwrite): `row` counts
-    /// DMA rows, which arrive top row first; (x, y) is the rectangle's
-    /// bottom-left corner in window coordinates (GL y up) and `h` its height.
-    /// The kernel builds the VDMA "high to low" (_Gr2HtoLmkudmada, from the
-    /// end of the bottom-up lrectwrite array) unless the client's rows are
-    /// already top-down (_Gr2mkudmada), so the GE always gets rows top-down
-    /// (OPART MRI: a 512x512 image in 4 bands of 128 rows, y = 0..384).
+    /// DMA rows; (x, y) is the rectangle's bottom-left corner in window
+    /// coordinates (GL y up) and `h` its height. Row order depends on the
+    /// kernel path (Gr2MCPixDma), which walks the client's array in
+    /// opposite directions:
+    ///   0x0B5 (zoom 1): from the end of the bottom-up lrectwrite array, so
+    ///     rows arrive TOP first (OPART MRI: 4 bands of 128 rows, y = 0..384);
+    ///   0x0B8 (zoomed; libgl sets request bit 0x10): forward through the
+    ///     array, so rows arrive BOTTOM first (snoop's zoom-6 view came out
+    ///     upside down when drawn top-first).
+    /// Request bit 2 (pixmode PM_TTOB: the array is already top-down) flips
+    /// both walks, so each token always delivers its own order.
     /// `fmt`: 2 =
     /// 4 pixels per word, 1 = 2, 0 = 1; first pixel in the MSB. Colour-index
     /// visuals take the value as the index; RGB visuals take 32-bit pixels as
@@ -1812,7 +1855,7 @@ impl Hq2Engine {
         };
         let z = |v: f32| if zoomed && v >= 1.0 { v.round() as i32 } else { 1 };
         let (zx, zy) = (z(g.pzoom[0]), z(g.pzoom[1]));
-        let from_bottom = h.saturating_sub(1 + row) as i32;
+        let from_bottom = if zoomed { row as i32 } else { h.saturating_sub(1 + row) as i32 };
         let (wx, wy) = (g.win[0] + x, g.win[1] + y + from_bottom * zy);
         let cmax = g.cmax();
         self.gl_setup(out);

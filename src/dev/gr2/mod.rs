@@ -697,8 +697,8 @@ impl Gr2 {
                     }
                 };
                 match dest {
-                    hq2::ReadDest::Shram => {
-                        req.pack(read, &mut self.0.regs().shram[hq2::READ_IMAGE_SHRAM..]);
+                    hq2::ReadDest::Shram(base) => {
+                        req.pack(read, &mut self.0.regs().shram[base..]);
                         self.0.regs().hq.fin[hq2::FIN3].store(1, Ordering::Release);
                     }
                     hq2::ReadDest::Gedma => {

@@ -2687,3 +2687,71 @@ fn iris_writepixels_fifo_chunk() {
     assert_eq!(row(21), vec![8, 7, 6, 5]);
     assert_eq!(gl_px(g, 14, 20) & 0xff, 0, "only width pixels, not the padding");
 }
+
+/// IRIS GL rectzoom (snoop): 0x0BB = 0.0 on the token, the zooms on DATA
+/// (OpenGL sends all three to the token; both forms must set the zoom).
+#[test]
+fn iris_rectzoom_token_then_data() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 10);
+    cmd(g, 0x005, 0xfff);
+    cmd(g, 0x0bb, 0.0f32.to_bits());
+    for v in [3.0f32, 3.0] { data(g, v.to_bits()); }
+    w32(g, 0x6a04c, 0);
+    cmd(g, 0x0b8, 100);
+    for v in [50, 2, 1, 1, 0, 0] { w32(g, 0x40000, v); }
+    w32(g, 0x6a068, 0x0300_0301);
+    assert_eq!(r32(g, 0x6a040) & 2, 2);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 102, 52) & 0xfff, 0x300, "first pixel covers 3x3");
+    assert_eq!(gl_px(g, 103, 50) & 0xfff, 0x301);
+}
+
+/// IRIS GL readpixels / rectread (snoop): 0x0AD x; DATA y, w, h, 1, 0, 0.
+/// The pixels land in shram from the mailbox (0x4022), one per word, and
+/// the microcode raises FIN3 itself (libgl polls without a Finish).
+#[test]
+fn iris_read_rect_to_mailbox_and_fin3() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 10);
+    cmd(g, 0x005, 0xfff);
+    w32(g, 0x6a04c, 0);
+    cmd(g, 0x0b5, 4);
+    for v in [10, 4, 2, 2, 0, 0] { w32(g, 0x40000, v); }
+    for v in [0x0204_0205, 0x0206_0207, 0x0210_0211, 0x0212_0213] { w32(g, 0x6a068, v); }
+    w32(g, 0x6b000, 0);
+    cmd(g, 0x0ad, 5);
+    for v in [10, 2, 2, 1, 0, 0] { data(g, v); }
+    let t = std::time::Instant::now();
+    while r32(g, 0x6a040) & 1 == 0 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "FIN3 never set");
+    }
+    let sh: Vec<u32> = (0..4).map(|i| r32(g, (0x4022 + i) * 4) & 0xfff).collect();
+    assert_eq!(sh, vec![0x205, 0x206, 0x211, 0x212], "top row first, one pixel per word");
+}
+
+/// Zoomed pixel DMA (0x0B8, snoop's rectzoom 6 view): the kernel's
+/// request-bit-0x10 path walks the lrectwrite array forward, so rows arrive
+/// BOTTOM first (0x0B5 gets them top first). Drawn top-first, snoop's
+/// magnified image was upside down.
+#[test]
+fn gl_pixel_dma_zoomed_rows_bottom_first() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    cmd(g, 0x004, 10);
+    cmd(g, 0x005, 0xfff);
+    for v in [0.0f32, 2.0, 2.0] { cmd(g, 0x0bb, v.to_bits()); }
+    w32(g, 0x6a04c, 0);
+    cmd(g, 0x0b8, 100);
+    for v in [50, 2, 2, 1, 0, 0] { w32(g, 0x40000, v); }
+    w32(g, 0x6a068, 0x0300_0301); // first DMA row
+    w32(g, 0x6a068, 0x0310_0311); // second DMA row
+    assert_eq!(r32(g, 0x6a040) & 2, 2);
+    g.wait_idle();
+    assert_eq!(gl_px(g, 100, 50) & 0xfff, 0x300, "first DMA row at the bottom (y 50..51)");
+    assert_eq!(gl_px(g, 101, 51) & 0xfff, 0x300);
+    assert_eq!(gl_px(g, 100, 52) & 0xfff, 0x310, "second row above it");
+    assert_eq!(gl_px(g, 103, 53) & 0xfff, 0x311);
+}
