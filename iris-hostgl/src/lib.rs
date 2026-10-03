@@ -35,6 +35,7 @@
 //! library says host GL is not available.
 
 #[cfg(target_os = "macos")]
+mod accum;
 mod backend;
 #[cfg(target_os = "macos")]
 mod calls;

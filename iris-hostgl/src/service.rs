@@ -283,6 +283,7 @@ impl GlService {
     ) -> Reply {
         let Some(c) = self.clients.get(&client) else { return Reply::Err(EINVAL) };
         let current_read = c.read;
+        let current_draw = c.draw;
         // No context current (or it went away between retries): GL calls
         // without one do nothing.
         let Some(id) = c.current else { return Reply::Ok(0, 0) };
@@ -295,7 +296,7 @@ impl GlService {
         let mut n = 0u64;
         let mut fault: Option<Fault> = None;
         {
-            let mut x = Exec::new(mem, &mut writes, funcs, reported, backend.as_ref(), &mut ctx.client, draws, current_read);
+            let mut x = Exec::new(mem, &mut writes, funcs, reported, backend.as_ref(), &mut ctx.client, draws, current_draw, current_read);
             while at + 4 <= len {
                 let head = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
                 let (op, words) = ((head >> 16) as usize, (head & 0xffff) as usize);

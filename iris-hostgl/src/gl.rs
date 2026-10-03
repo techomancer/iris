@@ -13,6 +13,7 @@ use std::ffi::c_void;
 extern "C" {
     pub fn glFlush();
     pub fn glFinish();
+    pub fn glClear(mask: u32);
     pub fn glGetString(name: u32) -> *const u8;
     pub fn glGetError() -> u32;
     pub fn glGetIntegerv(pname: u32, out: *mut i32);

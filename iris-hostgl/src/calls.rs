@@ -834,12 +834,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
         0 => { // glAccum
             let a0 = x.i32(c, 4) as u32;
             let a1 = x.f32(c, 8);
-            x.resolve_read();
-            let f = x.func(0)?;
-            let g: extern "C" fn(u32, f32) = unsafe { std::mem::transmute(f) };
-            g(a0, a1);
-            x.image_done();
-            Some(0)
+            x.accum(a0, a1); Some(0)
         }
         1 => { // glAlphaFunc
             let a0 = x.i32(c, 4) as u32;
@@ -983,22 +978,14 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
         }
         17 => { // glClear
             let a0 = x.i32(c, 4) as u32;
-            let f = x.func(17)?;
-            let g: extern "C" fn(u32) = unsafe { std::mem::transmute(f) };
-            g(a0);
-            x.image_done();
-            Some(0)
+            x.clear(a0); Some(0)
         }
         18 => { // glClearAccum
             let a0 = x.f32(c, 4);
             let a1 = x.f32(c, 8);
             let a2 = x.f32(c, 12);
             let a3 = x.f32(c, 16);
-            let f = x.func(18)?;
-            let g: extern "C" fn(f32, f32, f32, f32) = unsafe { std::mem::transmute(f) };
-            g(a0, a1, a2, a3);
-            x.image_done();
-            Some(0)
+            x.clear_accum(a0, a1, a2, a3); Some(0)
         }
         19 => { // glClearColor
             let a0 = x.f32(c, 4);

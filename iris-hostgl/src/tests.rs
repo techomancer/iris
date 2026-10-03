@@ -465,13 +465,13 @@ fn pixels_by_reference_across_pages_in_guest_byte_order() {
     assert_eq!(pixel(&out, 64, 3, 8), [0, 0, 0, 255], "just outside");
 }
 
-/// IRIX numbers UNSIGNED_SHORT_5_6_5 0x8362 and UNSIGNED_BYTE_2_3_3_REV
-/// 0x8363, the other way round from the standard. Each must be sized and
-/// drawn as the guest meant it, and read back the same way.
+/// UNSIGNED_SHORT_5_6_5 (0x8363) and UNSIGNED_BYTE_2_3_3_REV (0x8362), as
+/// IRIX 6.5.22's <GL/gl.h> and OpenGL 1.2 number them. Each must be sized
+/// and drawn as the guest meant it, and read back the same way.
 #[test]
-fn irix_packed_5_6_5_and_2_3_3_rev_keep_their_meaning() {
-    const IRIX_5_6_5: i32 = 0x8362;
-    const IRIX_2_3_3_REV: i32 = 0x8363;
+fn packed_5_6_5_and_2_3_3_rev_keep_their_meaning() {
+    const IRIX_5_6_5: i32 = 0x8363;
+    const IRIX_2_3_3_REV: i32 = 0x8362;
     const GL_RGB: i32 = 0x1907;
     let mut g = Guest::new(64);
     g.context(0x0040_0004, 32, 32);
@@ -527,7 +527,7 @@ fn addresses_above_4gb_arrive_whole() {
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
     assert_eq!(x.addr(&cmd, 16), out);
     assert_eq!(x.arr::<f32>(&cmd, 4).expect("decoded"), vec![1.5, -2.0, 3.25, 8.0]);
     x.put::<u32>(x.addr(&cmd, 16), &[0xdead_beef, 7]).expect("queued");
@@ -554,12 +554,12 @@ fn by_reference_array_decodes_across_a_page_boundary() {
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
     {
-        let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0);
+        let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
         assert!(x.arr::<f64>(&cmd, 4).is_none());
         assert_eq!(x.fault, Some(Fault { page: (at & !(PAGE - 1)) + PAGE, write: false }));
     }
     mem.touch(Fault { page: (at & !(PAGE - 1)) + PAGE, write: false });
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
     let v = x.arr::<f64>(&cmd, 4).expect("decoded");
     assert_eq!(x.fault, None);
     assert_eq!(v.len(), n);
@@ -594,7 +594,7 @@ fn array_arguments_hold_what_the_call_reads() {
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
     let slack = crate::exec::ARRAY_SLACK;
     let short = x.arr_padded::<f32>(&cmd, 4, 16).expect("decoded");
     assert_eq!(short.len(), 16 + slack);
@@ -1354,4 +1354,90 @@ fn glcheck_reference() {
         g.mem.next = frame; // reuse the address space frame after frame
     }
     println!("glcheck: all frames checksum {all:#010x} (glcheck {frames} {size})");
+}
+
+/// The accumulation buffer, which the host's framebuffer objects cannot
+/// have (accum.rs): each operation, its values kept past 0..1 between
+/// operations, the scissor box, the bits a program is told, and the
+/// program's own state left as it was.
+#[test]
+fn accumulation_buffer_operations() {
+    const GL_ACCUM: i32 = 0x0100;
+    const GL_LOAD: i32 = 0x0101;
+    const GL_RETURN: i32 = 0x0102;
+    const GL_MULT: i32 = 0x0103;
+    const GL_ADD: i32 = 0x0104;
+    const GL_ACCUM_BUFFER_BIT: i32 = 0x0200;
+    const GL_ACCUM_RED_BITS: i32 = 0x0D58;
+    const GL_SCISSOR_TEST: i32 = 0x0C11;
+    let mut g = Guest::new(64);
+    g.context(0x0040_0005, 32, 32);
+    let px = g.mem.alloc(32 * 32 * 4, 0);
+    let bits = g.mem.alloc(4, 0);
+    let read = |e: &mut Enc| {
+        e.cmd("glReadPixels", &[V::I(0), V::I(0), V::I(32), V::I(32), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px as u64)]);
+    };
+    let near = |p: [u8; 4], want: [u8; 3], what: &str| {
+        for i in 0..3 {
+            assert!((p[i] as i32 - want[i] as i32).abs() <= 2, "{what}: {p:?}, wanted {want:?}");
+        }
+    };
+
+    // Half of red loaded, half of blue added: purple comes back.
+    let mut e = Enc::default();
+    ortho(&mut e, 32, 32);
+    e.cmd("glClearColor", &[V::F(1.0), V::F(0.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glAccum", &[V::I(GL_LOAD), V::F(0.5)])
+        .cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glAccum", &[V::I(GL_ACCUM), V::F(0.5)])
+        .cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glAccum", &[V::I(GL_RETURN), V::F(1.0)]);
+    read(&mut e);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    near(pixel(g.mem.get(px, 32 * 32 * 4), 32, 16, 16), [128, 0, 128], "load + accum, returned");
+
+    // Past 1 and back: multiplied by 4 (2.0, unclamped in the buffer), then
+    // returned at a quarter.
+    let mut e = Enc::default();
+    e.cmd("glAccum", &[V::I(GL_MULT), V::F(4.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glAccum", &[V::I(GL_RETURN), V::F(0.25)]);
+    read(&mut e);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    near(pixel(g.mem.get(px, 32 * 32 * 4), 32, 16, 16), [128, 0, 128], "kept past 1.0");
+
+    // glClearAccum and glClear's bit, then an add; and the scissor box.
+    let mut e = Enc::default();
+    e.cmd("glClearAccum", &[V::F(0.25), V::F(0.25), V::F(0.25), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_ACCUM_BUFFER_BIT | GL_COLOR_BUFFER_BIT)])
+        .cmd("glAccum", &[V::I(GL_ADD), V::F(0.25)])
+        .cmd("glScissor", &[V::I(8), V::I(8), V::I(8), V::I(8)])
+        .cmd("glEnable", &[V::I(GL_SCISSOR_TEST)])
+        .cmd("glAccum", &[V::I(GL_RETURN), V::F(1.0)])
+        .cmd("glDisable", &[V::I(GL_SCISSOR_TEST)]);
+    read(&mut e);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let out = g.mem.get(px, 32 * 32 * 4).to_vec();
+    near(pixel(&out, 32, 10, 10), [128, 128, 128], "cleared to 0.25, 0.25 added, inside the scissor box");
+    near(pixel(&out, 32, 20, 20), [0, 0, 0], "outside the scissor box");
+
+    // A program asking how deep the buffer is is told; and what it set is
+    // as it set it: the colour it drew with last is still current.
+    let mut e = Enc::default();
+    e.cmd("glGetIntegerv", &[V::I(GL_ACCUM_RED_BITS), V::A(bits as u64)])
+        .cmd("glColor3ub", &[V::I(0), V::I(255), V::I(0)])
+        .cmd("glAccum", &[V::I(GL_RETURN), V::F(1.0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(4.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(4.0), V::F(4.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(4.0)])
+        .cmd("glEnd", &[]);
+    read(&mut e);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    assert_eq!(u32::from_be_bytes(g.mem.get(bits, 4).try_into().unwrap()), 16, "GL_ACCUM_RED_BITS");
+    near(pixel(g.mem.get(px, 32 * 32 * 4), 32, 2, 2), [0, 255, 0], "the program's colour after a pass");
 }

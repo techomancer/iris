@@ -27,6 +27,7 @@ use iris_hostcall::{Fault, GuestMemory, PAGE};
 use crate::backend::Backend;
 use crate::calls;
 use crate::draw::{self, Draw};
+use crate::accum;
 use crate::emul;
 use crate::gl::*;
 
@@ -95,6 +96,8 @@ pub struct ClientSide {
     pub interlace: bool,
     /// The SGI features the host has not got, done in the fragment stage.
     pub emul: emul::Emul,
+    /// The accumulation buffers framebuffer objects cannot have (accum.rs).
+    pub accum: accum::Accum,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -119,6 +122,7 @@ pub struct Exec<'a> {
     pub backend: &'a dyn Backend,
     pub client: &'a mut ClientSide,
     pub draws: &'a HashMap<u32, Draw>,
+    pub current_draw: u32,
     pub current_read: u32,
     /// Pixels on their way through, one buffer per image argument of the
     /// command (glSeparableFilter2D has two, glGetSeparableFilter three), so
@@ -199,25 +203,17 @@ pub fn reverse_components(buf: &mut [u8], row: usize, n: usize, s: usize) {
 }
 
 /// The types that hold a whole pixel in one packed word, and the size of that
-/// word, numbered as the guest numbers them (see `IRIX_5_6_5`). Their
+/// word (the numbers are the standard ones: see `gl_type`). Their
 /// components are fields of an integer rather than separate values, so
 /// `reverse_components` does not apply to them -- see `gl_type`.
 fn packed_type(ty: u32) -> Option<i64> {
     match ty {
-        0x8032 | IRIX_2_3_3_REV => Some(1), // UNSIGNED_BYTE_3_3_2, _2_3_3_REV
-        0x8033 | 0x8034 | IRIX_5_6_5 | 0x8364 | 0x8365 | 0x8366 => Some(2),
+        0x8032 | 0x8362 => Some(1), // UNSIGNED_BYTE_3_3_2, _2_3_3_REV
+        0x8033 | 0x8034 | 0x8363 | 0x8364 | 0x8365 | 0x8366 => Some(2),
         0x8035 | 0x8036 | 0x8367 | 0x8368 => Some(4),
         _ => None,
     }
 }
-
-/// EXT_packed_pixels' 5_6_5 and 2_3_3_REV types as IRIX 6.5's <GL/gl.h>
-/// numbers them: the other way round from OpenGL 1.2 and every later
-/// registry, where 0x8362 is UNSIGNED_BYTE_2_3_3_REV and 0x8363
-/// UNSIGNED_SHORT_5_6_5. A guest program passes these; the host is given the
-/// standard number (`gl_type`). The rest of the packed types agree.
-const IRIX_5_6_5: u32 = 0x8362;
-const IRIX_2_3_3_REV: u32 = 0x8363;
 
 /// An element of an array argument, as it comes from the guest.
 pub trait Elem: Copy + Default {
@@ -304,6 +300,7 @@ pub const MAX_TEXTURE_UNITS: i64 = 8;
 pub trait GetValue: Copy {
     fn to_i64(self) -> i64;
     fn from_i64(v: i64) -> Self;
+    fn from_f32(v: f32) -> Self;
 }
 
 macro_rules! get_value {
@@ -313,6 +310,9 @@ macro_rules! get_value {
                 self as i64
             }
             fn from_i64(v: i64) -> Self {
+                v as Self
+            }
+            fn from_f32(v: f32) -> Self {
                 v as Self
             }
         }
@@ -330,6 +330,7 @@ impl<'a> Exec<'a> {
         backend: &'a dyn Backend,
         client: &'a mut ClientSide,
         draws: &'a HashMap<u32, Draw>,
+        current_draw: u32,
         current_read: u32,
     ) -> Exec<'a> {
         Exec {
@@ -341,6 +342,7 @@ impl<'a> Exec<'a> {
             backend,
             client,
             draws,
+            current_draw,
             current_read,
             scratch: Vec::new(),
             staged: Vec::new(),
@@ -750,14 +752,14 @@ impl<'a> Exec<'a> {
 
     /// The pixel type to give the host, which depends on the format it goes
     /// with: ABGR packed into a word is RGBA packed the other way round, so
-    /// the type carries the reversal that the format no longer can. IRIX's
-    /// numbers for 5_6_5 and 2_3_3_REV become the standard ones.
+    /// the type carries the reversal that the format no longer can.
+    ///
+    /// The packed types' numbers are passed as they come. IRIX 6.5.22's
+    /// <GL/gl.h> numbers them as OpenGL 1.2 does (0x8362 UNSIGNED_BYTE_2_3_3_REV,
+    /// 0x8363 UNSIGNED_SHORT_5_6_5); earlier 6.5 releases' headers had those two
+    /// the other way round, and a program built with one of them gets the
+    /// standard meaning, as 6.5.22 gives it.
     pub fn gl_type(&self, format: u32, ty: u32) -> u32 {
-        let ty = match ty {
-            IRIX_5_6_5 => 0x8363,
-            IRIX_2_3_3_REV => 0x8362,
-            t => t,
-        };
         if format != GL_ABGR_EXT {
             return ty;
         }
@@ -1127,6 +1129,37 @@ impl<'a> Exec<'a> {
         r
     }
 
+    /// glAccum, on the drawable drawn into (accum.rs).
+    pub fn accum(&mut self, op: u32, value: f32) {
+        self.resolve_read();
+        let draws = self.draws;
+        self.client.accum.retain(|id| draws.contains_key(&id));
+        let Some(d) = self.draws.get(&self.current_draw) else { return };
+        // An operation that is not one does nothing (the specification's
+        // GL_INVALID_ENUM is not raised: the host has no accumulation
+        // buffer to raise it about).
+        self.client.accum.op(self.current_draw, d.w, d.h, op, value);
+    }
+
+    /// glClearAccum: the value is ours to keep, as the buffer is.
+    pub fn clear_accum(&mut self, r: f32, g: f32, b: f32, a: f32) {
+        self.client.accum.set_clear_value([r, g, b, a]);
+    }
+
+    /// glClear: the accumulation buffer's bit is ours, the rest the host's.
+    pub fn clear(&mut self, mask: u32) {
+        if mask & accum::GL_ACCUM_BUFFER_BIT != 0 {
+            if let Some(d) = self.draws.get(&self.current_draw) {
+                self.client.accum.clear(self.current_draw, d.w, d.h);
+            }
+        }
+        let rest = mask & !accum::GL_ACCUM_BUFFER_BIT;
+        if rest != 0 {
+            // SAFETY: the current context's GL.
+            unsafe { glClear(rest) };
+        }
+    }
+
     /// Before anything reads the framebuffer: a multisampled drawable's
     /// samples have to be resolved into the buffer reads come from.
     pub fn resolve_read(&mut self) {
@@ -1204,6 +1237,20 @@ impl<'a> Exec<'a> {
     /// 8 is far above what IRIX-era software asks for (Quake III wants 2), and
     /// a ceiling is easier to raise later than a wrong answer is to find.
     pub fn get_limit<T: GetValue>(&mut self, pname: u32, out: &mut [T]) {
+        // The accumulation buffer is this library's (accum.rs), not the
+        // host's, which has none to report.
+        if (accum::GL_ACCUM_RED_BITS..=accum::GL_ACCUM_ALPHA_BITS).contains(&pname) {
+            if let Some(v) = out.first_mut() {
+                *v = T::from_i64(accum::ACCUM_BITS);
+            }
+            return;
+        }
+        if pname == accum::GL_ACCUM_CLEAR_VALUE {
+            for (v, c) in out.iter_mut().zip(self.client.accum.clear_value()) {
+                *v = T::from_f32(c);
+            }
+            return;
+        }
         if pname != GL_MAX_TEXTURE_UNITS_ARB {
             return;
         }

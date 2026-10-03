@@ -565,6 +565,14 @@ def special_call(name, params, local):
         return f"x.client_state({a[0]}, {'true' if name.startswith('glEnable') else 'false'}); Some(0)"
     if name == "glGetError":
         return "Some(x.get_error() as u64)"
+    # The accumulation buffer is the executor's (accum.rs): framebuffer
+    # objects have none.
+    if name == "glAccum":
+        return f"x.accum({a[0]}, {a[1]}); Some(0)"
+    if name == "glClearAccum":
+        return f"x.clear_accum({a[0]}, {a[1]}, {a[2]}, {a[3]}); Some(0)"
+    if name == "glClear":
+        return f"x.clear({a[0]}); Some(0)"
     # SGIS_multitexture is ARB_multitexture under older names, and the Mac has
     # only the ARB/core ones: the executor maps the unit and calls those.
     if name == "glSelectTextureSGIS":
