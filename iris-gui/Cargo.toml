@@ -82,6 +82,13 @@ hostcall = ["iris/hostcall"]
 # replacement libGL (github.com/atomchild411/iris-guest-tools) reports host
 # GL as unavailable. Build with: cargo build -p iris-gui --features hostgl
 hostgl = ["hostcall", "iris/hostgl"]
+# Native macOS front-end: menus in the system menu bar, dialogs and the
+# configuration editor in their own OS windows, and the run state in the window
+# title, so the main window holds only the emulated display. An alternative to
+# the default in-window sidebar, not a replacement; off by default. Ignored on
+# other platforms, which always use the sidebar. See src/macos_native/.
+# Build with: cargo build -p iris-gui --features macos-gui
+macos-gui = ["dep:objc2-app-kit"]
 
 [dependencies]
 # Group A (additive) features are always on for iris-gui so the user can enable
@@ -121,6 +128,11 @@ if-addrs = "0.15"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSURL", "NSData", "NSError", "NSString", "NSArray",
+] }
+# AppKit menu bar and window tabbing for the `macos-gui` front-end only.
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "NSApplication", "NSCell", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder",
+    "NSWindow",
 ] }
 
 [[bin]]
