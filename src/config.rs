@@ -975,6 +975,13 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdb_port: Option<u16>,
 
+    /// TCP port of the monitor console on 127.0.0.1; None means the usual
+    /// 8888 (`crate::monitor::DEFAULT_PORT`). Two iris processes running at
+    /// once need different ports: the second can't bind the first's, and
+    /// then has no monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_port: Option<u16>,
+
     /// If Some(path), load this static ELF32 MSB binary into RAM at startup and
     /// set PC to its entry point (bare-metal test binaries; see --load-elf).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1188,6 +1195,7 @@ impl Default for MachineConfig {
             headless: false,
             no_audio: false,
             gdb_port: None,
+            monitor_port: None,
             load_elf: None,
             test_device: false,
             test_device_dump: None,
@@ -1548,6 +1556,11 @@ pub struct Cli {
     #[arg(long = "gdb-port", value_name = "PORT")]
     pub gdb_port: Option<u16>,
 
+    /// Monitor console port on 127.0.0.1 (default 8888). Give each iris
+    /// running at once its own.
+    #[arg(long = "monitor-port", value_name = "PORT")]
+    pub monitor_port: Option<u16>,
+
     /// Map the bare-metal test device into GIO expansion slot 0: SIGNATURE,
     /// PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT
     /// (terminate with the guest's exit code). Off by default.
@@ -1659,6 +1672,7 @@ impl Cli {
         }
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
+        if let Some(p) = self.monitor_port { cfg.monitor_port = Some(p); }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }

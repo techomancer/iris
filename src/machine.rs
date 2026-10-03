@@ -70,6 +70,8 @@ pub struct Machine {
     mc: MemoryController,
     hpc3: Hpc3,
     monitor: Arc<Monitor>,
+    /// TCP port the monitor serves on 127.0.0.1 (`cfg.monitor_port`).
+    monitor_port: u16,
     /// Sender for async machine events (HardReset, PowerOff) from devices.
     pub event_tx: mpsc::SyncSender<MachineEvent>,
     event_rx: Option<mpsc::Receiver<MachineEvent>>,
@@ -264,6 +266,7 @@ impl Machine {
         let jitv2_threads = cfg.jitv2.threads;
         let display_resolution = cfg.graphics.resolution;
         let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
+        let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let clock_fixed_mhz = cfg.clock.fixed_mhz;
         let cfg_cpu_model = cfg.machine.cpu;
 
@@ -969,6 +972,7 @@ impl Machine {
             mc,
             hpc3,
             monitor,
+            monitor_port,
             event_tx,
             event_rx: Some(event_rx),
             timer_manager,
@@ -1046,10 +1050,11 @@ impl Machine {
         if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
         if let Some(u64) = &self._phys.ultra64 { u64.start(); }
 
-        // Monitor server on localhost:8888 — always start, even in CI mode,
-        // so debug helpers (status/regs/bt/dis) stay reachable while iris-ci
-        // drives the serial console.
-        self.monitor.clone().start_server("127.0.0.1:8888".to_string());
+        // Monitor server on localhost (port 8888 unless `monitor_port` says
+        // otherwise) — always start, even in CI mode, so debug helpers
+        // (status/regs/bt/dis) stay reachable while iris-ci drives the serial
+        // console.
+        self.monitor.clone().start_server(format!("127.0.0.1:{}", self.monitor_port));
 
         // CI mode: the harness drives startup via `restore` / `start`. Don't
         // autostart the CPU so the first command finds a quiet machine.
@@ -1137,12 +1142,23 @@ impl Machine {
         if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
     }
 
-    pub fn run_console_client() {
+    /// The address this Machine's own monitor is serving on, or None when it
+    /// couldn't bind its port (another iris holding it) or has not started.
+    pub fn monitor_addr(&self) -> Option<std::net::SocketAddr> {
+        self.monitor.bound_addr()
+    }
+
+    /// The terminal console: relays stdin to the monitor at `addr` and the
+    /// monitor's output to stdout. When the monitor closes the connection
+    /// (`quit`) the process exits, so `addr` must be this process's own
+    /// monitor (`monitor_addr`): another iris's would take this one down
+    /// with it when it quits.
+    pub fn run_console_client(addr: std::net::SocketAddr) {
         println!("IRIS: {}", emulator_name());
         println!("Connecting to monitor socket...");
 
         let mut stream = loop {
-            match TcpStream::connect("127.0.0.1:8888") {
+            match TcpStream::connect(addr) {
                 Ok(s) => break s,
                 Err(_) => {
                     thread::sleep(std::time::Duration::from_millis(10));
@@ -1171,7 +1187,9 @@ impl Machine {
         let mut line = String::new();
         loop {
             line.clear();
-            if stdin.read_line(&mut line).is_err() {
+            // Ok(0) is end of input (stdin from /dev/null, say): stop
+            // relaying rather than spin; the monitor's output still prints.
+            if !matches!(stdin.read_line(&mut line), Ok(n) if n > 0) {
                 break;
             }
             if stream.write_all(line.as_bytes()).is_err() {
@@ -2168,7 +2186,7 @@ impl Drop for Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = std::ptr::null_mut();
         }
-        // Release port 8888 and this Machine's device handles, so the next
+        // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();
     }

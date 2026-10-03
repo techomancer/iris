@@ -6,6 +6,9 @@ use std::net::{TcpListener, TcpStream};
 use std::io::{Write, BufReader, BufRead, BufWriter};
 use crate::traits::Device;
 
+/// The monitor's TCP port on 127.0.0.1 when the config names none.
+pub const DEFAULT_PORT: u16 = 8888;
+
 pub struct Monitor {
     devices: Arc<Mutex<Vec<Arc<dyn Device>>>>,
     /// Set by `shutdown`; the accept loop exits (dropping its listener, which
@@ -46,28 +49,33 @@ impl Monitor {
         self.devices.lock().push(device);
     }
 
+    /// Bind `addr` and serve it on a new thread. The bind happens before
+    /// this returns, so `bound_addr` answers at once whether this monitor
+    /// has its port.
     pub fn start_server(self: Arc<Self>, addr: String) {
-        thread::spawn(move || {
-            // Fail soft (rather than panic-aborting the whole process) if the
-            // port can't be bound — most commonly because a previous machine
-            // instance's monitor thread from the same GUI session is still
-            // holding it. Dropping a Machine shuts its monitor down and frees
-            // the port, but a Machine that is merely stopped keeps it. The
-            // machine still boots; the monitor console is just unavailable.
-            let listener = match TcpListener::bind(&addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    log::warn!("monitor disabled: failed to bind {addr}: {e}");
-                    return;
-                }
-            };
-            // Publish the bound address before checking the flag: a concurrent
-            // shutdown() either sees the address (and wakes us) or we see the
-            // flag here.
-            *self.bound.lock() = listener.local_addr().ok();
-            if self.shutdown.load(Ordering::SeqCst) {
+        // Fail soft (rather than panic-aborting the whole process) if the
+        // port can't be bound — because another iris process is using it
+        // (give each its own `monitor_port`), or a previous machine
+        // instance's monitor thread from the same GUI session is still
+        // holding it. Dropping a Machine shuts its monitor down and frees
+        // the port, but a Machine that is merely stopped keeps it. The
+        // machine still boots; the monitor console is just unavailable.
+        let listener = match TcpListener::bind(&addr) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("monitor disabled: failed to bind {addr}: {e}");
+                eprintln!("iris: no monitor: can't bind {addr} ({e}); is another iris using it? Set monitor_port (--monitor-port) to run both.");
                 return;
             }
+        };
+        // Publish the bound address before checking the flag: a concurrent
+        // shutdown() either sees the address (and wakes us) or we see the
+        // flag here.
+        *self.bound.lock() = listener.local_addr().ok();
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        thread::spawn(move || {
             println!("Monitor listening on {}", addr);
             for stream in listener.incoming() {
                 if self.shutdown.load(Ordering::SeqCst) {
@@ -206,6 +214,18 @@ mod tests {
         let addr = wait_for("bind", || monitor.bound_addr());
         monitor.shutdown();
         wait_for("port release", || TcpListener::bind(addr).ok());
+    }
+
+    /// A port already in use (another iris's monitor) leaves this monitor
+    /// unbound, and says so as soon as `start_server` returns — the console
+    /// client must not go looking for a monitor on that port.
+    #[test]
+    fn taken_port_leaves_the_monitor_unbound() {
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = other.local_addr().unwrap();
+        let monitor = Arc::new(Monitor::new());
+        monitor.clone().start_server(addr.to_string());
+        assert_eq!(monitor.bound_addr(), None);
     }
 
     #[test]

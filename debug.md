@@ -1,6 +1,6 @@
 # IRIS debugger
 
-The IRIS emulator features a built-in monitor and debugger that allows for interactive inspection and control of the emulated machine. The monitor listens on TCP port 8888 by default, and is also available on the terminal `iris` was started from.
+The IRIS emulator features a built-in monitor and debugger that allows for interactive inspection and control of the emulated machine. The monitor listens on TCP port 8888 by default (`monitor_port` in the config or `--monitor-port` to change it, so that two iris processes can run at once), and is also available on the terminal `iris` was started from.
 
 This is a guided tour of the debugger. [HELP.md](HELP.md#monitor-console) has the complete command reference, and [HACKING.md](HACKING.md#9-gdb-stub) covers the GDB stub.
 

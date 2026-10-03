@@ -411,6 +411,7 @@ nat_subnet = "192.168.0.0/24"   # gateway .1, guest .2
 scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferred-int
 
 # gdb_port = 1234               # GDB RSP stub
+# monitor_port = 8888           # monitor console; give each iris run at once its own
 # ci = false                    # CI control socket (see README)
 # ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
 # ci_display = false

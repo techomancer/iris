@@ -125,10 +125,15 @@ fn main() {
     }
 
     machine.start();
+    // The terminal console talks to this process's own monitor only. Without
+    // one (its port taken by another iris), there is no console: attached to
+    // the other iris's monitor, it would exit along with that iris.
     if !ci_enabled {
-        std::thread::spawn(|| {
-            Machine::run_console_client();
-        });
+        if let Some(addr) = machine.monitor_addr() {
+            std::thread::spawn(move || {
+                Machine::run_console_client(addr);
+            });
+        }
     }
 
     let show_window = !headless && !(ci_enabled && !ci_display);
