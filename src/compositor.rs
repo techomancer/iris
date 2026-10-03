@@ -74,7 +74,7 @@ pub trait Compositor: Send {
 /// Pure-CPU compositor.  Runs the per-pixel loop into a `Vec<u32>`, uploads to
 /// a GL texture via `glTexSubImage2D`, and returns that texture.
 pub struct SwCompositor {
-    /// CPU pixel buffer: stride-2048 array, exactly 2048×1024 words.
+    /// CPU pixel buffer: stride 2048, `FB_MAX_H` rows.
     buf:    Vec<u32>,
     /// GL texture that holds the last uploaded frame.
     tex:    Option<glow::Texture>,
@@ -83,7 +83,7 @@ pub struct SwCompositor {
 impl SwCompositor {
     pub fn new() -> Self {
         Self {
-            buf: vec![0u32; 2048 * 1024],
+            buf: vec![0u32; crate::disp::FB_STRIDE * crate::disp::FB_MAX_H],
             tex: None,
         }
     }
@@ -101,7 +101,7 @@ impl SwCompositor {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                2048, 1024, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                2048, crate::disp::FB_MAX_H as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             t
         };
         self.tex = Some(t);

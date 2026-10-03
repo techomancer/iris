@@ -592,9 +592,9 @@ impl Renderer for GlRenderer {
             self.current_win_h = win_h;
             // Publish the display resolution for the event thread's aspect lock.
             *self.display_res.lock() = (width as u32, height as u32);
-            // UV coords into 2048×1024 texture
+            // UV coords into the 2048×FB_MAX_H output texture
             let max_u      = width  as f32 / 2048.0;
-            let max_v_main = height as f32 / 1024.0;
+            let max_v_main = height as f32 / crate::disp::FB_MAX_H as f32;
             unsafe {
                 // Main display quad (letterboxed).
                 Self::upload_quad(gl, state.main_vbo,

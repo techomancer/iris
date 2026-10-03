@@ -13,11 +13,9 @@ So when a new board lands in core and implements `GfxDisplay`
 (`src/gfx_display.rs`), the GUI's framebuffer path picks it up automatically.
 What *does* need GUI-side work for a new board:
 
-- A way to select it that doesn't collide with the existing board field(s).
-  IMPACT lives in a separate `[impact]` config section from `[graphics].board`
-  (they share the GIO gfx slot and `validate()` refuses both at once), so
-  `iris-gui/src/config_ui.rs` unifies them into one `GfxChoice` picker rather
-  than adding a second dropdown — see `show_board_picker`.
+- A way to select it in `[graphics] board`.
+  `iris-gui/src/config_ui.rs` iterates `GraphicsBoard::ALL` with `label()` and
+  `supports(profile)` in `show_board_picker`.
 - Hiding controls that don't apply (Newport heads, VC2 resolution presets)
   when the new board is active.
 - Any config field the new board doesn't share with existing ones (bank

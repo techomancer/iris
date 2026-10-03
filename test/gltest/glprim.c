@@ -55,6 +55,95 @@ static float line_w = 1.0f, point_sz = 1.0f;
 static int dither = 1;                /* --nodither */
 static int no_clear = 0;              /* --noclear */
 static int hold_ms = 2000;            /* --hold MS */
+/* Generic raster state, applied after the clear, just before drawing (the
+   clear colour is the destination for blend / logic op / mask tests). */
+static float vtx_alpha = -1.0f;       /* --alpha A: vertex alpha (glColor4f) */
+static GLenum blend_src = 0, blend_dst = 0;     /* --blendfunc S,D */
+static GLenum alpha_func = 0;         /* --alphafunc F,REF */
+static float alpha_ref = 0.0f;
+static GLenum logic_op = 0;           /* --logicop OP */
+static GLenum st_func = 0;            /* --stencilfunc F,REF,MASK */
+static int st_ref = 0, st_mask = 0xff;
+static GLenum st_ops[3] = { GL_KEEP, GL_KEEP, GL_KEEP };  /* --stencilop */
+static int line_stip_factor = 0;      /* --linestipple FACTOR,PATTERN */
+static unsigned line_stip_pattern = 0;
+static char color_mask[8] = "";       /* --colormask RGBA, e.g. 1010 */
+static int depth_mask = 1;            /* --depthmask 0|1 */
+/* Texture scenes: 0 = the scene's default. */
+static GLenum tex_min = 0, tex_mag = 0;  /* --texfilter MIN,MAG */
+static GLenum tex_wrap = 0, tex_wrap_t = 0;  /* --texwrap S[,T] repeat|clamp */
+static GLenum tex_env = 0;             /* --texenv replace|modulate|decal|blend */
+static int tex_abgr = 0;              /* --texabgr: host data as GL_ABGR_EXT */
+static int tex_ushort = 0;            /* --texushort: host data as GL_UNSIGNED_SHORT */
+static int tex_size = 8, tex_size_t = 0; /* --texsize W[xH] (powers of two, <= 256) */
+static float tex_bcolor[4] = { -1, 0, 0, 0 }; /* --texbcolor R,G,B,A */
+static int tex_border = 0;            /* --texborder: one-texel border, magenta */
+static char tex_gen[8] = "";          /* --texgen obj|eye|sphere */
+static int tex_fog = 0;               /* --texfog: linear fog, grey, over the scene */
+static int tex_lines = 0;             /* --texlines: textured lines and points */
+static int tex_read = 0;              /* --texread: glGetTexImage level 0, print it */
+static GLenum tex_ifmt = 0;           /* --texifmt NAME: sized internal format (RGBA data) */
+static int tex_sub = 0;               /* --texsub: glTexSubImage2D a yellow block */
+static int tex_subrect[4] = { 2, 2, 2, 2 };  /* --texsubrect X,Y,W,H (with --texsub) */
+static char tex_copy[8] = "";         /* --texcopy full|sub: texture from the screen */
+
+/* Sized internal formats by name (GL 1.1), for --texifmt. */
+static const struct { const char *n; GLenum e; } ifmt_names[] = {
+    { "alpha4", GL_ALPHA4 }, { "alpha8", GL_ALPHA8 }, { "alpha12", GL_ALPHA12 }, { "alpha16", GL_ALPHA16 },
+    { "luminance4", GL_LUMINANCE4 }, { "luminance8", GL_LUMINANCE8 }, { "luminance12", GL_LUMINANCE12 },
+    { "luminance16", GL_LUMINANCE16 }, { "luminance4_alpha4", GL_LUMINANCE4_ALPHA4 },
+    { "luminance6_alpha2", GL_LUMINANCE6_ALPHA2 }, { "luminance8_alpha8", GL_LUMINANCE8_ALPHA8 },
+    { "luminance12_alpha4", GL_LUMINANCE12_ALPHA4 }, { "luminance12_alpha12", GL_LUMINANCE12_ALPHA12 },
+    { "luminance16_alpha16", GL_LUMINANCE16_ALPHA16 }, { "intensity4", GL_INTENSITY4 },
+    { "intensity8", GL_INTENSITY8 }, { "intensity12", GL_INTENSITY12 }, { "intensity16", GL_INTENSITY16 },
+    { "r3_g3_b2", GL_R3_G3_B2 }, { "rgb4", GL_RGB4 }, { "rgb5", GL_RGB5 }, { "rgb8", GL_RGB8 },
+    { "rgb10", GL_RGB10 }, { "rgb12", GL_RGB12 }, { "rgb16", GL_RGB16 }, { "rgba2", GL_RGBA2 },
+    { "rgba4", GL_RGBA4 }, { "rgb5_a1", GL_RGB5_A1 }, { "rgba8", GL_RGBA8 }, { "rgb10_a2", GL_RGB10_A2 },
+    { "rgba12", GL_RGBA12 }, { "rgba16", GL_RGBA16 },
+};
+static GLenum tex_fmt = 0;             /* --texfmt rgba|rgb|luminance|luminance_alpha|alpha|intensity */
+
+/* GL enum names the state options take. */
+static const struct { const char *n; GLenum e; } enum_names[] = {
+    { "never", GL_NEVER }, { "less", GL_LESS }, { "equal", GL_EQUAL }, { "lequal", GL_LEQUAL },
+    { "greater", GL_GREATER }, { "notequal", GL_NOTEQUAL }, { "gequal", GL_GEQUAL }, { "always", GL_ALWAYS },
+    { "zero", GL_ZERO }, { "one", GL_ONE }, { "src_color", GL_SRC_COLOR },
+    { "one_minus_src_color", GL_ONE_MINUS_SRC_COLOR }, { "src_alpha", GL_SRC_ALPHA },
+    { "one_minus_src_alpha", GL_ONE_MINUS_SRC_ALPHA }, { "dst_alpha", GL_DST_ALPHA },
+    { "one_minus_dst_alpha", GL_ONE_MINUS_DST_ALPHA }, { "dst_color", GL_DST_COLOR },
+    { "one_minus_dst_color", GL_ONE_MINUS_DST_COLOR }, { "src_alpha_saturate", GL_SRC_ALPHA_SATURATE },
+    { "clear", GL_CLEAR }, { "and", GL_AND }, { "and_reverse", GL_AND_REVERSE }, { "copy", GL_COPY },
+    { "and_inverted", GL_AND_INVERTED }, { "noop", GL_NOOP }, { "xor", GL_XOR }, { "or", GL_OR },
+    { "nor", GL_NOR }, { "equiv", GL_EQUIV }, { "invert", GL_INVERT }, { "or_reverse", GL_OR_REVERSE },
+    { "copy_inverted", GL_COPY_INVERTED }, { "or_inverted", GL_OR_INVERTED }, { "nand", GL_NAND },
+    { "set", GL_SET }, { "keep", GL_KEEP }, { "replace", GL_REPLACE }, { "incr", GL_INCR }, { "decr", GL_DECR },
+    { "nearest", GL_NEAREST }, { "linear", GL_LINEAR },
+    { "nearest_mipmap_nearest", GL_NEAREST_MIPMAP_NEAREST }, { "linear_mipmap_nearest", GL_LINEAR_MIPMAP_NEAREST },
+    { "nearest_mipmap_linear", GL_NEAREST_MIPMAP_LINEAR }, { "linear_mipmap_linear", GL_LINEAR_MIPMAP_LINEAR },
+    { "repeat", GL_REPEAT }, { "clamp", GL_CLAMP }, { "border", 0x812D /* GL_CLAMP_TO_BORDER_SGIS */ }, { "modulate", GL_MODULATE }, { "decal", GL_DECAL },
+    { "blend", GL_BLEND }, { "rgba", GL_RGBA }, { "rgb", GL_RGB }, { "luminance", GL_LUMINANCE },
+    { "luminance_alpha", GL_LUMINANCE_ALPHA }, { "alpha", GL_ALPHA }, { "intensity", GL_INTENSITY },
+};
+
+static GLenum enum_by_name(const char *s) {
+    unsigned i;
+    for (i = 0; i < sizeof(enum_names) / sizeof(enum_names[0]); i++)
+        if (!strcmp(enum_names[i].n, s)) return enum_names[i].e;
+    fprintf(stderr, "unknown GL name %s\n", s);
+    exit(2);
+    return 0;
+}
+
+/* "a,b,c" -> up to n enum names. */
+static int parse_enums(const char *s, GLenum *out, int n) {
+    char buf[128], *p, *save;
+    int k = 0;
+    strncpy(buf, s, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = 0;
+    for (p = strtok_r(buf, ",", &save); p && k < n; p = strtok_r(NULL, ",", &save))
+        out[k++] = enum_by_name(p);
+    return k;
+}
 static int finish_first = 1;          /* glFinish between clear and draw */
 static int stipple = 0;               /* --stipple: 1 = test, 2 = half */
 static char scene[16] = "";           /* --scene depth|stencil|alphatest|blend */
@@ -165,20 +254,27 @@ static void draw_scene(float w, float h) {
         glVertex2f(0.6f * w, 0.9f * h);
         glEnd();
         glDisable(GL_BLEND);
-    } else if (!strcmp(scene, "lit") || !strcmp(scene, "litlocal")) {
+    } else if (!strcmp(scene, "lit") || !strcmp(scene, "litlocal") || !strcmp(scene, "litrgb")) {
         /* A fan around the window centre whose vertex normals tilt away
            from +z: centre (0,0,1), rim normals tilted 60 degrees outwards.
            lit: directional light from (1,1,2) (w = 0).
+           litrgb: lit with light and model colours whose components all
+           differ, to see their order in the command stream.
            litlocal: positional light at (0.25w, 0.75h, 100) with linear
            attenuation, plus a spot light pointing down -z. */
         static const GLfloat mat_amb[] = { 0.2f, 0.2f, 0.2f, 1 };
         static const GLfloat mat_dif[] = { 0.8f, 0.3f, 0.2f, 1 };
         static const GLfloat mat_spe[] = { 0.6f, 0.6f, 0.6f, 1 };
         static const GLfloat mat_emi[] = { 0.0f, 0.0f, 0.1f, 1 };
-        static const GLfloat lt_amb[] = { 0.1f, 0.1f, 0.1f, 1 };
-        static const GLfloat lt_dif[] = { 1, 1, 1, 1 };
-        static const GLfloat lt_spe[] = { 1, 1, 1, 1 };
-        static const GLfloat model_amb[] = { 0.2f, 0.2f, 0.2f, 1 };
+        static const GLfloat lt_grey[3][4] = { { 0.1f, 0.1f, 0.1f, 1 }, { 1, 1, 1, 1 }, { 1, 1, 1, 1 } };
+        static const GLfloat lt_rgb[3][4] = { { 0.3f, 0.2f, 0.1f, 1 }, { 1, 0.5f, 0.25f, 1 }, { 0.25f, 0.5f, 1, 1 } };
+        static const GLfloat model_grey[] = { 0.2f, 0.2f, 0.2f, 1 };
+        static const GLfloat model_rgb[] = { 0.05f, 0.1f, 0.15f, 1 };
+        int rgb = !strcmp(scene, "litrgb");
+        const GLfloat *lt_amb = rgb ? lt_rgb[0] : lt_grey[0];
+        const GLfloat *lt_dif = rgb ? lt_rgb[1] : lt_grey[1];
+        const GLfloat *lt_spe = rgb ? lt_rgb[2] : lt_grey[2];
+        const GLfloat *model_amb = rgb ? model_rgb : model_grey;
         GLfloat pos[4];
         int k;
         glEnable(GL_LIGHTING);
@@ -192,7 +288,7 @@ static void draw_scene(float w, float h) {
         glLightfv(GL_LIGHT0, GL_AMBIENT, lt_amb);
         glLightfv(GL_LIGHT0, GL_DIFFUSE, lt_dif);
         glLightfv(GL_LIGHT0, GL_SPECULAR, lt_spe);
-        if (!strcmp(scene, "lit")) {
+        if (strcmp(scene, "litlocal")) {
             pos[0] = 1; pos[1] = 1; pos[2] = 2; pos[3] = 0;
         } else {
             pos[0] = 0.25f * w; pos[1] = 0.75f * h; pos[2] = 100; pos[3] = 1;
@@ -264,6 +360,108 @@ static void draw_scene(float w, float h) {
         glVertex3f(0.9f * w, 0.8f * h, -1.0f); glVertex3f(0.1f * w, 0.8f * h, 0.0f);
         glEnd();
         glDisable(GL_FOG);
+    } else if (!strcmp(scene, "litcmat") || !strcmp(scene, "litnorm")) {
+        /* litcmat: colour material (front, ambient and diffuse) tracking
+           vertex colours R, G, B under a white light from +z.
+           litnorm: the lit fan's geometry scaled by 2 in the modelview with
+           GL_NORMALIZE on (without it the normals would be twice as long and
+           the fan twice as bright). */
+        static const GLfloat pos[] = { 0, 0, 1, 0 };
+        int k;
+        glEnable(GL_LIGHTING);
+        glShadeModel(GL_SMOOTH);
+        glLightfv(GL_LIGHT0, GL_POSITION, pos);
+        glEnable(GL_LIGHT0);
+        if (!strcmp(scene, "litcmat")) {
+            glColorMaterial(GL_FRONT, GL_AMBIENT_AND_DIFFUSE);
+            glEnable(GL_COLOR_MATERIAL);
+            glNormal3f(0, 0, 1);
+            glBegin(GL_TRIANGLES);
+            glColor3f(1, 0, 0); glVertex2f(0.2f * w, 0.2f * h);
+            glColor3f(0, 1, 0); glVertex2f(0.8f * w, 0.2f * h);
+            glColor3f(0, 0, 1); glVertex2f(0.5f * w, 0.8f * h);
+            glEnd();
+            glDisable(GL_COLOR_MATERIAL);
+        } else {
+            glEnable(GL_NORMALIZE);
+            glPushMatrix();
+            glTranslatef(0.5f * w, 0.5f * h, 0);
+            glScalef(2, 2, 2);
+            glBegin(GL_TRIANGLE_FAN);
+            glNormal3f(0, 0, 1);
+            glVertex3f(0, 0, 0);
+            for (k = 0; k <= 8; k++) {
+                float a = (float)k * 3.14159265f / 4.0f;
+                float cx = (float)cos(a), cy = (float)sin(a);
+                glNormal3f(0.866f * cx, 0.866f * cy, 0.5f);
+                glVertex3f(0.2f * h * cx, 0.2f * h * cy, 0);
+            }
+            glEnd();
+            glPopMatrix();
+            glDisable(GL_NORMALIZE);
+        }
+        glDisable(GL_LIGHTING);
+    } else if (!strcmp(scene, "dlist")) {
+        /* Display lists: list 1 a unit quad; list 2 calls list 1 three
+           times (red, blue, white squares in the upper half: nested calls);
+           list 3 a long green strip along the bottom (4000 vertices, long
+           enough to be split into chained segments). */
+        int k;
+        glNewList(1, GL_COMPILE);
+        glBegin(GL_QUADS);
+        glVertex2f(0, 0); glVertex2f(1, 0); glVertex2f(1, 1); glVertex2f(0, 1);
+        glEnd();
+        glEndList();
+        glNewList(2, GL_COMPILE);
+        glPushMatrix();
+        glTranslatef(0.1f * w, 0.55f * h, 0);
+        glScalef(0.2f * w, 0.3f * h, 1);
+        glColor3f(1, 0, 0); glCallList(1);
+        glTranslatef(1.5f, 0, 0);
+        glColor3f(0, 0, 1); glCallList(1);
+        glTranslatef(1.5f, 0, 0);
+        glColor3f(1, 1, 1); glCallList(1);
+        glPopMatrix();
+        glEndList();
+        glNewList(3, GL_COMPILE);
+        glColor3f(0, 1, 0);
+        glBegin(GL_TRIANGLE_STRIP);
+        for (k = 0; k < 2000; k++) {
+            float x = 0.05f * w + 0.9f * w * (float)k / 1999.0f;
+            glVertex2f(x, 0.1f * h);
+            glVertex2f(x, 0.3f * h);
+        }
+        glEnd();
+        glEndList();
+        glCallList(2);
+        glCallList(3);
+    } else if (!strcmp(scene, "clipplane")) {
+        /* User clip plane 0: keep x <= 0.5w (plane (-1, 0, 0, 0.5w) in
+           object space), so only the left half of a full quad remains. */
+        GLdouble eq[4];
+        eq[0] = -1; eq[1] = 0; eq[2] = 0; eq[3] = 0.5 * w;
+        glClipPlane(GL_CLIP_PLANE0, eq);
+        glEnable(GL_CLIP_PLANE0);
+        glBegin(GL_QUADS);
+        glColor3f(1, 1, 0);
+        glVertex2f(0.1f * w, 0.2f * h); glVertex2f(0.9f * w, 0.2f * h);
+        glVertex2f(0.9f * w, 0.8f * h); glVertex2f(0.1f * w, 0.8f * h);
+        glEnd();
+        glDisable(GL_CLIP_PLANE0);
+    } else if (!strcmp(scene, "fogexp") || !strcmp(scene, "fogexp2")) {
+        /* EXP / EXP2 fog, density 2, green, over the fog scene's quad. */
+        static const GLfloat fc[] = { 0, 1, 0, 1 };
+        glEnable(GL_FOG);
+        glFogi(GL_FOG_MODE, !strcmp(scene, "fogexp") ? GL_EXP : GL_EXP2);
+        glFogf(GL_FOG_DENSITY, 2.0f);
+        glFogfv(GL_FOG_COLOR, fc);
+        glShadeModel(GL_SMOOTH);
+        glBegin(GL_QUADS);
+        glColor3f(1, 1, 1);
+        glVertex3f(0.1f * w, 0.2f * h, 0.0f); glVertex3f(0.9f * w, 0.2f * h, -1.0f);
+        glVertex3f(0.9f * w, 0.8f * h, -1.0f); glVertex3f(0.1f * w, 0.8f * h, 0.0f);
+        glEnd();
+        glDisable(GL_FOG);
     } else if (!strcmp(scene, "blendsmooth")) {
         glShadeModel(GL_FLAT);
         glBegin(GL_QUADS);
@@ -324,6 +522,237 @@ static void draw_scene(float w, float h) {
         glEnd();
         glShadeModel(smooth ? GL_SMOOTH : GL_FLAT);
         glDisable(GL_STENCIL_TEST);
+    } else if (!strcmp(scene, "copycolor") || !strcmp(scene, "copydepth")) {
+        /* glCopyPixels. Left half: a smooth triangle (red, green, blue
+           corners) whose z runs from -0.9 (left) to 0.9 (right), depth
+           test on. copycolor: the left half's colour copied to the right
+           half (raster position 0.5w, 0). copydepth: its depth copied to
+           the right half, then a white quad at z 0 over the right half with
+           GL_LESS: white only where the copied depth is farther than 0
+           (right part of the triangle's copy and where it was cleared). */
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glShadeModel(GL_SMOOTH);
+        glBegin(GL_TRIANGLES);
+        glColor3f(1, 0, 0); glVertex3f(0.05f * w, 0.1f * h, 0.9f);
+        glColor3f(0, 1, 0); glVertex3f(0.45f * w, 0.1f * h, -0.9f);
+        glColor3f(0, 0, 1); glVertex3f(0.25f * w, 0.9f * h, 0.0f);
+        glEnd();
+        glShadeModel(smooth ? GL_SMOOTH : GL_FLAT);
+        glRasterPos2f(0.5f * w, 0);
+        if (!strcmp(scene, "copycolor")) {
+            glCopyPixels(0, 0, (GLsizei)(0.5f * w), (GLsizei)h, GL_COLOR);
+        } else {
+            glDisable(GL_DEPTH_TEST);
+            glDepthFunc(GL_ALWAYS);
+            glEnable(GL_DEPTH_TEST);
+            glCopyPixels(0, 0, (GLsizei)(0.5f * w), (GLsizei)h, GL_DEPTH);
+            glDepthFunc(GL_LESS);
+            glColor3f(1, 1, 1);
+            glBegin(GL_QUADS);
+            glVertex3f(0.5f * w, 0, 0); glVertex3f(w, 0, 0); glVertex3f(w, h, 0); glVertex3f(0.5f * w, h, 0);
+            glEnd();
+        }
+        glDisable(GL_DEPTH_TEST);
+    } else if (!strcmp(scene, "tex") || !strcmp(scene, "texmod")) {
+        /* tex: an 8x8 RGBA texture, texel (s, t) = (s*0x20, t*0x20, 0xa5,
+           0xff), GL_NEAREST, GL_REPLACE. Left: a quad over (0.1w..0.45w,
+           0.2h..0.8h), texcoords 0..1, so each texel is a block of about
+           (0.35w/8) x (0.6h/8) pixels. Right: a triangle (0.55w,0.2h)
+           (0.9w,0.2h) (0.725w,0.8h) with texcoords (-0.5,-0.5) (1.5,-0.5)
+           (0.5,1.5), so the wrap mode shows. The --tex* options change
+           filters, wrap, environment (blend colour blue) and format.
+           texmod: the same texture mipmapped (gluBuild2DMipmaps is not
+           used: levels 8x8..1x1 built here, each level a flat grey of
+           0xff >> level so the chosen level is visible),
+           GL_LINEAR_MIPMAP_LINEAR, GL_MODULATE with vertex colours red,
+           green, blue, white, on a quad tilted away in perspective. */
+        static GLubyte tex[258 * 258 * 4];
+        int s, t, l, i, k, NW = tex_size, NH = tex_size_t ? tex_size_t : tex_size, mod = !strcmp(scene, "texmod");
+        int B = tex_border, IW = NW + 2 * B, IH = NH + 2 * B;
+        GLenum fmt = tex_fmt ? tex_fmt : GL_RGBA;
+        GLenum ext = fmt == GL_INTENSITY ? GL_LUMINANCE : fmt;
+        GLenum ifmt = tex_ifmt ? tex_ifmt : fmt;
+        GLenum fmin = tex_min ? tex_min : mod ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST;
+        GLenum fmag = tex_mag ? tex_mag : mod ? GL_LINEAR : GL_NEAREST;
+        GLenum wrap = tex_wrap ? tex_wrap : GL_REPEAT, wrap_t = tex_wrap_t ? tex_wrap_t : wrap;
+        GLenum env = tex_env ? tex_env : mod ? GL_MODULATE : GL_REPLACE;
+        int nc = ext == GL_RGBA ? 4 : ext == GL_RGB ? 3 : ext == GL_LUMINANCE_ALPHA ? 2 : 1;
+        /* Components per format, from the RGBA texel: RGB drops alpha,
+           luminance (and intensity) is the red ramp, luminance-alpha adds
+           the green ramp as alpha, alpha is the green ramp. Border texels
+           (--texborder) are magenta. */
+        for (t = -B, i = 0; t < NH + B; t++)
+            for (s = -B; s < NW + B; s++) {
+                GLubyte rgba[4];
+                int border = s < 0 || t < 0 || s >= NW || t >= NH;
+                rgba[0] = border ? 0xff : (GLubyte)(s * 256 / NW);
+                rgba[1] = border ? 0x00 : (GLubyte)(t * 256 / NH);
+                rgba[2] = border ? 0xff : 0xa5; rgba[3] = 0xff;
+                if (ext == GL_ALPHA) tex[i++] = rgba[1];
+                else if (ext == GL_LUMINANCE) tex[i++] = rgba[0];
+                else if (ext == GL_LUMINANCE_ALPHA) { tex[i++] = rgba[0]; tex[i++] = rgba[1]; }
+                else for (l = 0; l < nc; l++) tex[i++] = rgba[l];
+            }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        if (tex_abgr && nc == 4)
+            for (i = 0; i < IW * IH * 4; i += 4) {
+                GLubyte r = tex[i], g = tex[i + 1];
+                tex[i] = tex[i + 3]; tex[i + 1] = tex[i + 2]; tex[i + 2] = g; tex[i + 3] = r;
+            }
+        if (tex_ushort) {
+            /* Each byte b becomes the short b * 0x101 (big-endian). */
+            static GLushort us[258 * 258 * 4];
+            for (i = 0; i < IW * IH * nc; i++) us[i] = (GLushort)(tex[i] * 0x101);
+            glTexImage2D(GL_TEXTURE_2D, 0, ifmt, IW, IH, B, tex_abgr && nc == 4 ? GL_ABGR_EXT : ext, GL_UNSIGNED_SHORT, us);
+        } else
+            glTexImage2D(GL_TEXTURE_2D, 0, ifmt, IW, IH, B, tex_abgr && nc == 4 ? GL_ABGR_EXT : ext, GL_UNSIGNED_BYTE, tex);
+        if (fmin != GL_NEAREST && fmin != GL_LINEAR) {
+            /* Levels down to 1x1, each a flat grey of 0xff >> level (alpha
+               0xff) so the level chosen shows; borders as level 0's. */
+            int lw = NW, lh = NH;
+            for (l = 1; lw > 1 || lh > 1; l++) {
+                lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
+                for (i = 0, k = 0; k < (lw + 2 * B) * (lh + 2 * B); k++)
+                    for (s = 0; s < nc; s++, i++)
+                        tex[i] = (nc == 4 && s == 3) || (nc == 2 && s == 1) ? 0xff : (GLubyte)(0xff >> l);
+                glTexImage2D(GL_TEXTURE_2D, l, ifmt, lw + 2 * B, lh + 2 * B, B, ext, GL_UNSIGNED_BYTE, tex);
+            }
+        }
+        if (tex_sub) {
+            static GLubyte sub[256 * 256 * 4];
+            int sx = tex_subrect[0], sy = tex_subrect[1], sw = tex_subrect[2], sh = tex_subrect[3], j;
+            static const GLubyte yellow[4] = { 255, 255, 0, 255 };
+            for (i = 0; i < sw * sh; i++)
+                for (k = 0; k < nc; k++) sub[i * nc + k] = yellow[nc == 1 ? (ext == GL_ALPHA ? 3 : 0) : k];
+            {
+                GLenum e = glGetError();
+                if (e) printf("texsub: error 0x%x pending before glTexSubImage2D\n", e);
+            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, sx, sy, sw, sh, tex_abgr && nc == 4 ? GL_ABGR_EXT : ext, GL_UNSIGNED_BYTE, sub);
+            printf("texsub: (%d,%d) %dx%d glGetError 0x%x\n", sx, sy, sw, sh, glGetError());
+            for (j = 0; j < sh; j++)   /* keep tex[] what level 0 now holds, for --texread */
+                for (i = 0; i < sw; i++) {
+                    int at = ((sy + j + B) * IW + sx + i + B) * nc;
+                    for (k = 0; k < nc; k++) tex[at + k] = sub[(j * sw + i) * nc + k];
+                }
+        }
+        if (tex_copy[0]) {
+            /* Draw the grid, then copy it (or one square) into level 0. */
+            int gx = (int)(0.1f * w), gy = (int)(0.2f * h), q;
+            static const GLfloat cols[4][3] = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 1, 1 } };
+            glDisable(GL_TEXTURE_2D);
+            for (q = 0; q < 4; q++) {
+                int qx = gx + (q % 2) * NW / 2, qy = gy + (q / 2) * NH / 2;
+                glColor3fv(cols[q]);
+                glRecti(qx, qy, qx + NW / 2, qy + NH / 2);
+            }
+            if (!strcmp(tex_copy, "sub")) glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gx, gy, NW / 2, NH / 2);
+            else glCopyTexImage2D(GL_TEXTURE_2D, 0, ifmt, gx, gy, NW, NH, 0);
+            printf("texcopy: glGetError 0x%x\n", glGetError());
+        }
+        if (tex_read && !B && nc == 4 && !tex_abgr && !tex_ushort && !tex_copy[0]) {
+            static GLubyte back[256 * 256 * 4];
+            int bad = 0;
+            memset(back, 0x11, sizeof(back));
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, back);
+            for (i = 0; i < NW * NH * 4; i++) bad += back[i] != tex[i];
+            printf("texread: %02x%02x%02x%02x %02x%02x%02x%02x ... %d of %d bytes differ\n",
+                   back[0], back[1], back[2], back[3], back[4], back[5], back[6], back[7], bad, NW * NH * 4);
+        }
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_t);
+        if (tex_bcolor[0] >= 0) glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, tex_bcolor);
+        if (tex_gen[0]) {
+            /* Object / eye planes mapping the quad (0.1w..0.45w, 0.2h..0.8h)
+               to s, t = 0..1 (eye = object here: identity modelview). */
+            GLfloat sp[4], tp[4];
+            GLenum mode = !strcmp(tex_gen, "sphere") ? GL_SPHERE_MAP : !strcmp(tex_gen, "eye") ? GL_EYE_LINEAR : GL_OBJECT_LINEAR;
+            sp[0] = 1.0f / (0.35f * w); sp[1] = 0; sp[2] = 0; sp[3] = -0.1f / 0.35f;
+            tp[0] = 0; tp[1] = 1.0f / (0.6f * h); tp[2] = 0; tp[3] = -0.2f / 0.6f;
+            glTexGeni(GL_S, GL_TEXTURE_GEN_MODE, mode);
+            glTexGeni(GL_T, GL_TEXTURE_GEN_MODE, mode);
+            if (mode != GL_SPHERE_MAP) {
+                GLenum pl = mode == GL_EYE_LINEAR ? GL_EYE_PLANE : GL_OBJECT_PLANE;
+                glTexGenfv(GL_S, pl, sp);
+                glTexGenfv(GL_T, pl, tp);
+            }
+            glEnable(GL_TEXTURE_GEN_S);
+            glEnable(GL_TEXTURE_GEN_T);
+        }
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, fmin);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, fmag);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, env);
+        if (env == GL_BLEND) {
+            static const GLfloat envc[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+            glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, envc);
+        }
+        glEnable(GL_TEXTURE_2D);
+        if (mod) {
+            glMatrixMode(GL_PROJECTION);
+            glPushMatrix();
+            glLoadIdentity();
+            glFrustum(-1.0, 1.0, -h / w, h / w, 1.0, 20.0);
+            glMatrixMode(GL_MODELVIEW);
+            glPushMatrix();
+            glLoadIdentity();
+            glTranslatef(0, -0.3f, -2.0f);
+            glRotatef(-70, 1, 0, 0);
+            glBegin(GL_QUADS);
+            glColor3f(1, 0, 0); glTexCoord2f(0, 0); glVertex3f(-1, -1, 0);
+            glColor3f(0, 1, 0); glTexCoord2f(4, 0); glVertex3f(1, -1, 0);
+            glColor3f(0, 0, 1); glTexCoord2f(4, 16); glVertex3f(1, 6, 0);
+            glColor3f(1, 1, 1); glTexCoord2f(0, 16); glVertex3f(-1, 6, 0);
+            glEnd();
+            glPopMatrix();
+            glMatrixMode(GL_PROJECTION);
+            glPopMatrix();
+            glMatrixMode(GL_MODELVIEW);
+        } else {
+            if (mono) glColor3f(mono_rgb[0], mono_rgb[1], mono_rgb[2]);
+            else glColor3f(1, 1, 1);
+            if (tex_fog) {
+                static const GLfloat grey[4] = { 0.5f, 0.5f, 0.5f, 1.0f };
+                glFogi(GL_FOG_MODE, GL_LINEAR);
+                glFogf(GL_FOG_START, 0.0f);
+                glFogf(GL_FOG_END, 1.0f);
+                glFogfv(GL_FOG_COLOR, grey);
+                glEnable(GL_FOG);
+                glTranslatef(0, 0, -0.5f);
+            }
+            if (tex_lines) {
+                int k;
+                glBegin(GL_LINES);
+                for (k = 0; k < 4; k++) {
+                    glTexCoord2f(0, k / 4.0f + 0.125f); glVertex2f(0.1f * w, (0.05f + 0.03f * k) * h);
+                    glTexCoord2f(1, k / 4.0f + 0.125f); glVertex2f(0.9f * w, (0.05f + 0.03f * k) * h);
+                }
+                glEnd();
+                glPointSize(4);
+                glBegin(GL_POINTS);
+                for (k = 0; k < 8; k++) {
+                    glTexCoord2f(k / 8.0f + 0.0625f, 0.5f); glVertex2f((0.1f + 0.1f * k) * w, 0.9f * h);
+                }
+                glEnd();
+                glPointSize(1);
+            }
+            glBegin(GL_QUADS);
+            glTexCoord2f(0, 0); glVertex2f(0.1f * w, 0.2f * h);
+            glTexCoord2f(1, 0); glVertex2f(0.45f * w, 0.2f * h);
+            glTexCoord2f(1, 1); glVertex2f(0.45f * w, 0.8f * h);
+            glTexCoord2f(0, 1); glVertex2f(0.1f * w, 0.8f * h);
+            glEnd();
+            glBegin(GL_TRIANGLES);
+            glTexCoord2f(-0.5f, -0.5f); glVertex2f(0.55f * w, 0.2f * h);
+            glTexCoord2f(1.5f, -0.5f); glVertex2f(0.9f * w, 0.2f * h);
+            glTexCoord2f(0.5f, 1.5f); glVertex2f(0.725f * w, 0.8f * h);
+            glEnd();
+        }
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_TEXTURE_GEN_S);
+        glDisable(GL_TEXTURE_GEN_T);
+        glDisable(GL_FOG);
     } else {
         printf("unknown scene %s\n", scene);
     }
@@ -380,7 +809,8 @@ static void geometry(GLenum mode, const struct vtx **v, int *n) {
 /* ---- emit one vertex/colour in the requested call form ------------------ */
 
 static void emit_color(float r, float g, float b) {
-    if (!strcmp(col_form, "3f")) glColor3f(r, g, b);
+    if (vtx_alpha >= 0.0f) glColor4f(r, g, b, vtx_alpha);
+    else if (!strcmp(col_form, "3f")) glColor3f(r, g, b);
     else if (!strcmp(col_form, "4f")) glColor4f(r, g, b, 1.0f);
     else if (!strcmp(col_form, "3ub")) glColor3ub((GLubyte)(r * 255), (GLubyte)(g * 255), (GLubyte)(b * 255));
     else if (!strcmp(col_form, "4ub")) glColor4ub((GLubyte)(r * 255), (GLubyte)(g * 255), (GLubyte)(b * 255), 255);
@@ -433,8 +863,49 @@ static void usage(void) {
            "  --hold MS            keep the window up this long before exit (default 2000)\n"
            "  --nofinish           no glFinish between clear and draw\n");
     printf("  --scene NAME         depth | stencil | alphatest | blend | blendsmooth |\n"
-           "                       lit | litlocal | twoside | fog (see source)\n"
-           "  --depthfunc F        never less equal lequal greater notequal gequal always\n");
+           "                       lit | litlocal | litrgb | dlist | twoside | fog | litcmat | litnorm |\n"
+           "                       clipplane | fogexp | fogexp2 | tex | texmod | copycolor |\n"
+           "                       copydepth (see source)\n"
+           "  --depthfunc F        never less equal lequal greater notequal gequal always\n"
+           "  Raster state, applied after the clear (GL names in lower case, without GL_):\n"
+           "  --alpha A            vertex alpha (glColor4f)\n"
+           "  --blendfunc S,D      glBlendFunc + enable, e.g. src_alpha,one_minus_src_alpha\n"
+           "  --alphafunc F,REF    glAlphaFunc + enable, e.g. greater,0.5\n"
+           "  --logicop OP         glLogicOp + enable, e.g. xor\n"
+           "  --stencilfunc F,REF[,MASK]  glStencilFunc + enable (asks for a stencil visual)\n"
+           "  --stencilop F,ZF,ZP  glStencilOp, e.g. keep,keep,replace\n"
+           "  --linestipple N,PAT  glLineStipple + enable, e.g. 2,0x0f0f\n"
+           "  --colormask RGBA     glColorMask, 1 = write, e.g. 1010\n"
+           "  --depthmask 0|1      glDepthMask\n"
+           "  Texture scenes (tex, texmod):\n"
+           "  --texfilter MIN,MAG  e.g. linear_mipmap_linear,linear (mipmap filters load levels)\n"
+           "  --texwrap S[,T]      repeat | clamp | border (GL_CLAMP_TO_BORDER_SGIS); T as S if\n"
+           "                       not given\n"
+           "  --texbcolor R,G,B,A  GL_TEXTURE_BORDER_COLOR\n"
+           "  --texborder          the image has a one-texel border (magenta)\n"
+           "  --texfog             linear fog (grey, start 0, end 1: depth 0 clear, 1 fogged;\n"
+           "                       the quad at z 0.5 half fogged)\n"
+           "  --texlines           also textured lines (along the bottom) and points (top)\n"
+           "  --texifmt NAME       sized internal format (RGBA data): alpha4..16, luminance4..16,\n"
+           "                       luminance4_alpha4 .. luminance16_alpha16, intensity4..16, r3_g3_b2,\n"
+           "                       rgb4 rgb5 rgb8 rgb10 rgb12 rgb16, rgba2 rgba4 rgb5_a1 rgba8 rgb10_a2\n"
+           "                       rgba12 rgba16\n"
+           "  --texsub             glTexSubImage2D: a yellow 2x2 block at texel (2, 2) of level 0\n"
+           "  --texsubrect X,Y,W,H the yellow block's place and size instead (implies --texsub)\n"
+           "  --texcopy full|sub   full: level 0 copied from the screen (glCopyTexImage2D) at\n"
+           "                       window (0.1w, 0.2h), where a red/green/blue/white 2x2 grid of\n"
+           "                       W/2 x H/2 pixel squares is drawn first; sub: the grid's lower\n"
+           "                       left W/2 x H/2 square copied into texel (0, 0) (glCopyTexSubImage2D)\n"
+           "  --texread            read level 0 back (glGetTexImage, RGBA ubyte) and print\n"
+           "                       its first texels and whether it matches what was loaded\n"
+           "  --texgen M           obj | eye | sphere: S and T generated (obj/eye planes map\n"
+           "                       the quad to 0..1)\n"
+           "  --texenv E           replace | modulate | decal | blend\n"
+           "  --texfmt F           rgba | rgb | luminance | luminance_alpha | alpha | intensity\n"
+           "  --texabgr            RGBA texels sent as GL_ABGR_EXT (same image)\n"
+           "  --texushort          texels sent as GL_UNSIGNED_SHORT (same image)\n"
+           "  --texsize W[xH]      level 0 is W x H (default 8), texel (s, t) = (s*256/W, t*256/H, 0xa5)\n"
+           "  (tex: --mono --rgb R,G,B sets the vertex colour, default white)\n");
     printf("  --read M[,M...]      after drawing, read back: ximage front back depth stencil\n"
            "  --readrect X,Y,W,H   area to read (GL window coords; default whole window)\n"
            "  --readfmt rgba|abgr  colour format for glReadPixels (default rgba)\n"
@@ -523,12 +994,50 @@ static void parse_args(int argc, char **argv) {
             if (sscanf(next, "%dx%d", &win_w, &win_h) != 2) { fprintf(stderr, "bad --size\n"); exit(2); }
         } else if (!strcmp(a, "--hold")) { NEED(); hold_ms = atoi(next); }
         else if (!strcmp(a, "--nofinish")) finish_first = 0;
+        else if (!strcmp(a, "--texfilter")) {
+            GLenum f[2];
+            NEED();
+            if (parse_enums(next, f, 2) != 2) { fprintf(stderr, "bad --texfilter\n"); exit(2); }
+            tex_min = f[0]; tex_mag = f[1];
+        } else if (!strcmp(a, "--texwrap")) {
+            GLenum wr[2];
+            int k;
+            NEED();
+            k = parse_enums(next, wr, 2);
+            tex_wrap = wr[0]; tex_wrap_t = k == 2 ? wr[1] : wr[0];
+        }
+        else if (!strcmp(a, "--texbcolor")) { NEED(); if (!parse_floats(next, tex_bcolor, 4)) { fprintf(stderr, "bad --texbcolor\n"); exit(2); } }
+        else if (!strcmp(a, "--texborder")) tex_border = 1;
+        else if (!strcmp(a, "--texfog")) tex_fog = 1;
+        else if (!strcmp(a, "--texlines")) tex_lines = 1;
+        else if (!strcmp(a, "--texread")) tex_read = 1;
+        else if (!strcmp(a, "--texifmt")) {
+            unsigned k;
+            NEED();
+            for (k = 0; k < sizeof(ifmt_names) / sizeof(ifmt_names[0]); k++)
+                if (!strcmp(ifmt_names[k].n, next)) tex_ifmt = ifmt_names[k].e;
+            if (!tex_ifmt) { fprintf(stderr, "unknown internal format %s\n", next); exit(2); }
+        }
+        else if (!strcmp(a, "--texsub")) tex_sub = 1;
+        else if (!strcmp(a, "--texsubrect")) { NEED(); if (!parse_ints(next, tex_subrect, 4)) { fprintf(stderr, "bad --texsubrect\n"); exit(2); } tex_sub = 1; }
+        else if (!strcmp(a, "--texcopy")) { NEED(); strncpy(tex_copy, next, sizeof(tex_copy) - 1); }
+        else if (!strcmp(a, "--texgen")) { NEED(); strncpy(tex_gen, next, sizeof(tex_gen) - 1); }
+        else if (!strcmp(a, "--texenv")) { NEED(); tex_env = enum_by_name(next); }
+        else if (!strcmp(a, "--texfmt")) { NEED(); tex_fmt = enum_by_name(next); }
+        else if (!strcmp(a, "--texabgr")) tex_abgr = 1;
+        else if (!strcmp(a, "--texushort")) tex_ushort = 1;
+        else if (!strcmp(a, "--texsize")) {
+            NEED();
+            if (sscanf(next, "%dx%d", &tex_size, &tex_size_t) < 2) tex_size_t = tex_size;
+            if (tex_size < 1 || tex_size > 256 || (tex_size & (tex_size - 1)) || tex_size_t < 1 || tex_size_t > 256 || (tex_size_t & (tex_size_t - 1))) { fprintf(stderr, "bad --texsize\n"); exit(2); }
+        }
         else if (!strcmp(a, "--scene")) {
             NEED();
             strncpy(scene, next, sizeof(scene) - 1);
             if (!strcmp(scene, "depth")) depth = 1;
             if (!strcmp(scene, "stencil")) want_stencil = 1;
             if (!strcmp(scene, "quadrants")) { depth = 1; want_stencil = 1; }
+            if (!strncmp(scene, "copy", 4)) depth = 1;
         } else if (!strcmp(a, "--read")) {
             char buf[64], *t;
             NEED();
@@ -548,6 +1057,29 @@ static void parse_args(int argc, char **argv) {
         else if (!strcmp(a, "--packrow")) { NEED(); pack_row = atoi(next); }
         else if (!strcmp(a, "--readout")) { NEED(); read_out = next; }
         else if (!strcmp(a, "--backclear")) { NEED(); if (!parse_floats(next, back_rgb, 3)) { fprintf(stderr, "bad --backclear\n"); exit(2); } }
+        else if (!strcmp(a, "--alpha")) { NEED(); vtx_alpha = (float)atof(next); }
+        else if (!strcmp(a, "--blendfunc")) {
+            GLenum e[2]; NEED();
+            if (parse_enums(next, e, 2) != 2) { fprintf(stderr, "bad --blendfunc\n"); exit(2); }
+            blend_src = e[0]; blend_dst = e[1];
+        } else if (!strcmp(a, "--alphafunc")) {
+            char f[32]; NEED();
+            if (sscanf(next, "%31[^,],%f", f, &alpha_ref) != 2) { fprintf(stderr, "bad --alphafunc\n"); exit(2); }
+            alpha_func = enum_by_name(f);
+        } else if (!strcmp(a, "--logicop")) { NEED(); logic_op = enum_by_name(next); }
+        else if (!strcmp(a, "--stencilfunc")) {
+            char f[32]; NEED();
+            if (sscanf(next, "%31[^,],%d,%i", f, &st_ref, &st_mask) < 2) { fprintf(stderr, "bad --stencilfunc\n"); exit(2); }
+            st_func = enum_by_name(f);
+            want_stencil = 1;
+        } else if (!strcmp(a, "--stencilop")) {
+            NEED();
+            if (parse_enums(next, st_ops, 3) != 3) { fprintf(stderr, "bad --stencilop\n"); exit(2); }
+        } else if (!strcmp(a, "--linestipple")) {
+            NEED();
+            if (sscanf(next, "%d,%i", &line_stip_factor, (int *)&line_stip_pattern) != 2) { fprintf(stderr, "bad --linestipple\n"); exit(2); }
+        } else if (!strcmp(a, "--colormask")) { NEED(); strncpy(color_mask, next, 4); }
+        else if (!strcmp(a, "--depthmask")) { NEED(); depth_mask = atoi(next); }
         else if (!strcmp(a, "--depthfunc")) {
             static const char *names[] = { "never", "less", "equal", "lequal", "greater", "notequal", "gequal", "always" };
             NEED();
@@ -893,6 +1425,28 @@ int main(int argc, char **argv) {
     if (!no_clear) glClear(GL_COLOR_BUFFER_BIT | (depth ? GL_DEPTH_BUFFER_BIT : 0)
                            | (want_stencil ? GL_STENCIL_BUFFER_BIT : 0));
     if (finish_first) glFinish();   /* separates clear from draw in the trace */
+
+    /* ---- generic raster state (after the clear) ---- */
+    if (blend_src) { glEnable(GL_BLEND); glBlendFunc(blend_src, blend_dst); }
+    if (alpha_func) { glEnable(GL_ALPHA_TEST); glAlphaFunc(alpha_func, alpha_ref); }
+    if (logic_op) {
+        /* GL 1.0's GL_LOGIC_OP is colour index only; RGBA needs 1.1's. */
+#ifdef GL_COLOR_LOGIC_OP
+        glEnable(GL_COLOR_LOGIC_OP);
+#else
+        glEnable(GL_LOGIC_OP);
+#endif
+        glLogicOp(logic_op);
+    }
+    if (st_func) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(st_func, st_ref, (GLuint)st_mask);
+        glStencilOp(st_ops[0], st_ops[1], st_ops[2]);
+    }
+    if (line_stip_factor) { glEnable(GL_LINE_STIPPLE); glLineStipple(line_stip_factor, (GLushort)line_stip_pattern); }
+    if (color_mask[0])
+        glColorMask(color_mask[0] == '1', color_mask[1] == '1', color_mask[2] == '1', color_mask[3] == '1');
+    if (!depth_mask) glDepthMask(GL_FALSE);
 
     /* ---- one primitive (or a scene) ---- */
     geometry(mode, &verts, &nverts);

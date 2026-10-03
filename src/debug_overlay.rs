@@ -58,7 +58,7 @@ pub struct DebugOverlay {
 impl DebugOverlay {
     pub fn new() -> Self {
         Self {
-            buf:              vec![0u32; 2048 * 1024],
+            buf:              vec![0u32; crate::disp::FB_STRIDE * crate::disp::FB_MAX_H],
             tex:              None,
             font:             crate::vga_font::VGA_8X16.to_vec(),
             show_cmap:        false,
@@ -418,7 +418,7 @@ impl DebugOverlay {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                2048, 1024, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                2048, crate::disp::FB_MAX_H as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             t
         };
         self.tex = Some(t);

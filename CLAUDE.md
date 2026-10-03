@@ -22,6 +22,7 @@ system (shell, networking, X11). It is **not** cycle-accurate
   `rules/irix/irix-install.md`. Check here before re-deriving a
   gotcha; when you confirm a non-obvious fix, write it up here as a short
   markdown note so the next session doesn't relearn it.
+- `ignore/rules` - local unpublished info
 
 ## Build & run
 

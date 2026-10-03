@@ -424,72 +424,112 @@ impl MachineProfile {
 }
 
 /// Indy / Indigo2 graphics board in the GIO gfx slot.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum GraphicsBoard {
     /// Newport (REX3) — fully emulated. Default.
     #[default]
+    #[clap(name = "newport", alias = "xl")]
     Newport,
     /// GR2 XZ (2 GE7) — Indy XZ or Indigo2 XZ (`src/dev/gr2`). In bring-up.
+    #[clap(name = "xz", alias = "gr2", alias = "gr2_xz", alias = "gr2-xz")]
     Xz,
     /// GR2 Extreme (8 GE7) — Indigo2 only (`src/dev/gr2`). In bring-up.
+    #[clap(name = "extreme", alias = "gr2_extreme", alias = "gr2-extreme")]
     Extreme,
+    /// Solid IMPACT (1 GE11, 1 RE4).
+    #[clap(name = "solidimpact", alias = "impact:solid", alias = "solid_impact")]
+    SolidImpact,
+    /// High IMPACT (2 GE11, 1 RE4).
+    #[clap(name = "highimpact", alias = "impact:high", alias = "high_impact")]
+    HighImpact,
+    /// Maximum IMPACT (2 GE11, 2 RE4).
+    #[clap(name = "maximpact", alias = "impact:max", alias = "max_impact")]
+    MaxImpact,
 }
 
 impl GraphicsBoard {
-    pub const ALL: [Self; 3] = [Self::Newport, Self::Xz, Self::Extreme];
+    pub const ALL: [Self; 6] = [
+        Self::Newport,
+        Self::Xz,
+        Self::Extreme,
+        Self::SolidImpact,
+        Self::HighImpact,
+        Self::MaxImpact,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Newport => "Newport (XL)",
             Self::Xz => "GR2 XZ",
             Self::Extreme => "GR2 Extreme",
+            Self::SolidImpact => "IMPACT Solid",
+            Self::HighImpact => "IMPACT High",
+            Self::MaxImpact => "IMPACT Maximum",
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Newport => "newport",
+            Self::Xz => "xz",
+            Self::Extreme => "extreme",
+            Self::SolidImpact => "solidimpact",
+            Self::HighImpact => "highimpact",
+            Self::MaxImpact => "maximpact",
+        }
+    }
+
+    pub fn is_impact(self) -> bool {
+        matches!(self, Self::SolidImpact | Self::HighImpact | Self::MaxImpact)
+    }
+
     /// Whether `validate()` accepts this board on `profile`.
     pub fn supports(self, profile: MachineProfile) -> bool {
         self != Self::Extreme || profile == MachineProfile::Indigo2Ip22
     }
 }
 
-/// IMPACT board occupying one GIO64 slot (Indigo2 preview scaffold).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ImpactSlot {
-    #[default]
-    None,
-    Solid,
-    High,
-    Max,
-}
+impl std::str::FromStr for GraphicsBoard {
+    type Err = String;
 
-/// `[impact]` section — IMPACT/MGRAS slot population (Indigo2 IP22 preview).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ImpactSection {
-    /// GIO gfx slot (`0x1F000000`). Solid IMPACT anchors here.
-    #[serde(default)]
-    pub gfx: ImpactSlot,
-    /// GIO expansion slot 0 (`0x1F400000`). Second board for High / Max configs.
-    #[serde(default)]
-    pub exp0: ImpactSlot,
-    /// GIO expansion slot 1 (`0x1F600000`). Third board for Maximum IMPACT.
-    #[serde(default)]
-    pub exp1: ImpactSlot,
-}
-
-impl ImpactSection {
-    pub fn any_enabled(&self) -> bool {
-        self.gfx != ImpactSlot::None
-            || self.exp0 != ImpactSlot::None
-            || self.exp1 != ImpactSlot::None
-    }
-
-    /// One IMPACT board, in the graphics slot; a second head is not modelled yet.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.exp0 != ImpactSlot::None || self.exp1 != ImpactSlot::None {
-            return Err("[impact] only the graphics slot (gfx) is supported so far".into());
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "newport" | "xl" => Ok(Self::Newport),
+            "xz" | "gr2" | "gr2_xz" | "gr2-xz" => Ok(Self::Xz),
+            "extreme" | "gr2_extreme" | "gr2-extreme" => Ok(Self::Extreme),
+            "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
+            "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
+            "maximpact" | "impact:max" | "max_impact" | "max-impact" | "maximumimpact" | "maximum_impact" | "maximum-impact" | "max" => Ok(Self::MaxImpact),
+            _ => Err(format!(
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max)"
+            )),
         }
-        Ok(())
+    }
+}
+
+impl Serialize for GraphicsBoard {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for GraphicsBoard {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<GraphicsBoard>().map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Display for GraphicsBoard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -1092,10 +1132,6 @@ pub struct MachineConfig {
     #[serde(default)]
     pub graphics: GraphicsSection,
 
-    /// IMPACT/MGRAS slot population (`[impact]` section, Indigo2 preview).
-    #[serde(default)]
-    pub impact: ImpactSection,
-
     /// Misc debug/capture runtime tuning (`[debug]` section).
     #[serde(default)]
     pub debug: DebugConfig,
@@ -1224,7 +1260,6 @@ impl Default for MachineConfig {
             audio: AudioConfig::default(),
             machine: MachineSection::default(),
             graphics: GraphicsSection::default(),
-            impact: ImpactSection::default(),
             debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
             perf: PerfConfig::default(),
@@ -1284,7 +1319,7 @@ impl MachineConfig {
             ));
         }
         if self.graphics.board != GraphicsBoard::Newport {
-            let name = if self.graphics.board == GraphicsBoard::Xz { "xz" } else { "extreme" };
+            let name = self.graphics.board.as_str();
             if self.graphics.board == GraphicsBoard::Extreme && self.machine.profile != MachineProfile::Indigo2Ip22 {
                 return Err(
                     "graphics.board \"extreme\" is only valid on Indigo2 (machine.profile = indigo2_ip22)".into(),
@@ -1296,18 +1331,7 @@ impl MachineConfig {
             if !self.graphics.resolution.is_guest() {
                 return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
             }
-            if self.impact.any_enabled() {
-                return Err(format!("graphics.board \"{name}\" and [impact] both claim the GIO gfx slot"));
-            }
         }
-        if self.impact.any_enabled()
-            && !matches!(self.machine.profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
-        {
-            return Err(
-                "[impact] slots need an Indigo2 (machine.profile = indigo2_ip22 or indigo2_ip28)".into(),
-            );
-        }
-        self.impact.validate()?;
         for (&id, dev) in &self.scsi {
             if dev.controller != 0 && self.machine.profile != MachineProfile::Indigo2Ip22 {
                 return Err(format!(
@@ -1568,6 +1592,10 @@ pub struct Cli {
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<CpuModel>,
 
+    /// Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`).
+    #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
+    pub graphics: Option<GraphicsBoard>,
+
     /// Enable GDB stub on the given TCP port (e.g. --gdb-port 1234).
     /// Connect with: target remote localhost:<port>
     #[arg(long = "gdb-port", value_name = "PORT")]
@@ -1674,6 +1702,7 @@ impl Cli {
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
+        if let Some(b) = self.graphics { cfg.graphics.board = b; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }

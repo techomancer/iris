@@ -436,14 +436,9 @@ profile = "indy_ip24"       # or "indigo2_ip22" (--ip22)
 cpu     = "r4400"           # or "r5000" (--cpu)
 
 [graphics]
-board      = "newport"      # "xz" = Indy XZ/Elan register stub (preview)
+board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max")
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
-
-# [impact]                  # Indigo2 IMPACT preview stub
-# gfx  = "none"             # "none" | "solid" | "high" | "max"
-# exp0 = "none"
-# exp1 = "none"
 
 [clock]
 # fixed_mhz = 33            # CP0 Count rate in MHz (default 33, IRIX shows 66 MHz)

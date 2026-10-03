@@ -17,10 +17,7 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
   maturing (use `console=d` + serial for debugging; see
   [docs/indigo2-ip22.md](docs/indigo2-ip22.md)).
 
-Pre-built binaries and the Mac App Store GUI are available at
-[danifunker/iris releases](https://github.com/danifunker/iris/releases) (upstream packaging).
-For latest code, build from source from upstream [techomancer/iris](https://github.com/techomancer/iris). Report bugs and issues in the upstream repository.
-
+Prebuilt releases are available in Github releases.
 
 ## Q&A
 

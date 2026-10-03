@@ -546,9 +546,8 @@ impl Machine {
         disk_provenance.sort_by_key(|d| d.id);
         let nvram_provenance = cfg.nvram.clone();
 
-        // REX3 Graphics — Newport only; skipped in headless mode or when XZ board selected
-        // An IMPACT board takes the graphics slot and the window; no Newport then.
-        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport || cfg.impact.any_enabled() {
+        // REX3 Graphics — Newport only; skipped in headless mode or when non-Newport board selected.
+        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
@@ -583,10 +582,9 @@ impl Machine {
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics.board {
-            crate::config::GraphicsBoard::Newport => None,
-            board => {
+            crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
                 use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant};
-                let variant = if board == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
+                let variant = if cfg.graphics.board == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
                 let g = Gr2::new(variant, Gr2Stats { heartbeat: heartbeat.clone(), fasttick: fasttick_count.clone() });
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
@@ -604,13 +602,17 @@ impl Machine {
                 }));
                 Some(g)
             }
+            _ => None,
         };
 
-        // Indigo2 IMPACT graphics in the GIO graphics slot.
-        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = if !guinness && cfg.impact.any_enabled() {
-            Some(Arc::new(crate::dev::mgras::Mgras::new(&cfg.impact, ioc.clone(), heartbeat.clone(), fasttick_count.clone())))
-        } else {
-            None
+        // IMPACT graphics in the GIO graphics slot.
+        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match cfg.graphics.board {
+            crate::config::GraphicsBoard::SolidImpact
+            | crate::config::GraphicsBoard::HighImpact
+            | crate::config::GraphicsBoard::MaxImpact => {
+                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, ioc.clone(), heartbeat.clone(), fasttick_count.clone()))
+            }
+            _ => None,
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000

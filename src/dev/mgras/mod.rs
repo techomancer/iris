@@ -12,7 +12,7 @@
 //! | `0x60000-0x67FFF` | display control bus devices (see `dcb`)           |
 //! | `0x68000-0x6FFFF` | per-device bus protocol registers                 |
 //! | `0x70000-0x7BFFF` | user registers: status, flags, command FIFO       |
-//! | `0x7C000-0x7FFFF` | raster registers, direct access (see `raster`);   |
+//! | `0x7C000-0x7FFFF` | raster registers, direct access (see `rss`);      |
 //! |                   | the alias at `+0x1000` also executes the IR       |
 //!
 //! Drawing arrives through the command FIFO as (command, data) pairs. Commands
@@ -27,18 +27,48 @@
 //!
 //! `IRIS_MGRAS_TRACE=<file>` logs every access to the board.
 
+//!
+//! Threads (rules/mgras/DESIGN.md): the CPU thread owns the host-side
+//! registers and the display control bus (`Front`). Command FIFO words and
+//! direct raster writes go into `hq_fifo`; the HQ3 thread runs the frontend
+//! and feeds raster writes into `rss_fifo`; the RSS thread draws. The display
+//! thread scans the framebuffer out unlocked.
+
 mod dcb;
-mod raster;
+mod debug;
+mod disp;
+mod frame;
+mod ge11;
+mod gl;
+mod hq3;
+mod pixmem;
+mod plain;
+mod record;
+mod rss;
+mod te1;
+
+#[cfg(test)]
+#[path = "mgras_tests.rs"]
+mod mgras_tests;
 
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::cell::UnsafeCell;
+use std::collections::HashSet;
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::mem::MaybeUninit;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
+use std::thread;
 
-use crate::config::{ImpactSection, ImpactSlot};
+use crate::config::GraphicsBoard;
 use crate::dev::ng1::rex3::Renderer;
-use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, Device, Saveable};
+use crate::gfifo::GFifo;
+use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_BUSY, BUS_OK, Device, Saveable};
+
+use ge11::Ge11;
+use hq3::{host, Hq3Engine, Hq3Regs, Hq3Sink};
+use rss::Rss;
 
 /// The graphics slot the board decodes.
 pub const MGRAS_SLOT_GFX_BASE: u32 = 0x1F00_0000;
@@ -49,463 +79,84 @@ const MAP_SIZE: u32 = 0x10_0000;
 /// GIO ID: product 0x10, 32-bit ID, revision 1, GIO64, no ROM, manufacturer 1.
 pub const GIO_ID: u32 = 0x0005_0190;
 
-/// Host interface register offsets.
-mod host {
-    pub const UCODE: u32 = 0x40000;
-    pub const UCODE_END: u32 = 0x46000;
-    pub const SET_FLAGS_PRIVILEGED: u32 = 0x50008;
-    pub const CLEAR_FLAGS_PRIVILEGED: u32 = 0x5000C;
-    pub const CFIFO_PRIVILEGED: u32 = 0x50080;
-    pub const STATUS: u32 = 0x70000;
-    pub const FIFOSTATUS: u32 = 0x70004;
-    pub const SET_FLAGS: u32 = 0x70008;
-    pub const CLEAR_FLAGS: u32 = 0x7000C;
-    pub const GE_READBACK_HI: u32 = 0x70010;
-    pub const GE_READBACK_LO: u32 = 0x70014;
-    pub const CFIFO: u32 = 0x70080;
-    pub const GIOSTATUS: u32 = 0x70100;
-    pub const DMABUSY: u32 = 0x70104;
-    pub const RASTER: u32 = 0x7C000;
-    pub const RASTER_END: u32 = 0x80000;
+const HQ_FIFO_DEPTH: usize = 65536;
+const RSS_FIFO_DEPTH: usize = 65536;
 
-    /// Status: raster idle and host idle, command and data FIFOs at or below
-    /// their low-water marks.
-    pub const STATUS_IDLE: u32 = 0x01 | 0x02 | 0x10 | 0x40;
-    pub const STATUS_VBLANK: u32 = 0x04;
-
-    /// Flag set by the "set flag" command (0xE04): DMA/sync completion.
-    pub const FLAG_DONE: u32 = 1 << 16;
-    /// Flag set when the geometry engine has data waiting to be read back.
-    pub const FLAG_GE_DATA: u32 = 1 << 17;
-    /// Flag set while a geometry engine diagnostic readback has data waiting.
-    pub const FLAG_GE_DIAG: u32 = 1 << 18;
-    /// Context switch: outgoing context saved (phase 1) and incoming context
-    /// loaded (phase 2).
-    pub const FLAG_CONTEXT_SAVED: u32 = 1 << 19;
-    pub const FLAG_CONTEXT_LOADED: u32 = 1 << 6;
-    /// Command-processor flag 0: a scheduled buffer swap has happened.
-    pub const FLAG_CP0: u32 = 1 << 10;
-    /// Flags that can raise the general interrupt.
-    pub const INTR_CAUSES: u32 = 0x7F_FFFF;
-
-    /// Flag and interrupt enables: read at the first address, write-1-to-set
-    /// there, write-1-to-clear at the second.
-    pub const FLAG_ENABLE_SET: u32 = 0x50010;
-    pub const FLAG_ENABLE_CLEAR: u32 = 0x50014;
-    pub const INTERRUPT_ENABLE_SET: u32 = 0x50018;
-    pub const INTERRUPT_ENABLE_CLEAR: u32 = 0x5001C;
-    /// Context switch request: starts the switch routine at the written
-    /// microcode address.
-    pub const CONTEXT_SWITCH: u32 = 0x50050;
-    /// Words of incoming context the host pushes after the save phase.
-    pub const CONTEXT_SWITCH_WORDS: u32 = 63;
-
-    /// Geometry engine diagnostic ports, per engine: data, then address.
-    pub const GE_DIAG: [(u32, u32); 2] = [(0x50040, 0x50044), (0x50048, 0x5004C)];
-    /// Diagnostic readback words: a discarded word, then the data word.
-    pub const GE_DIAG_READ_PAD: u32 = 0x50230;
-    pub const GE_DIAG_READ: u32 = 0x5022C;
-
-    /// Host DMA engine and raster-interface context, read back per register.
-    pub const DMA_CONTEXT: u32 = 0x50300;
-    pub const RASTER_IF_CONTEXT: u32 = 0x50200;
-    /// PIO pixel reads: the raster char registers, high word at the execute
-    /// alias (which takes the next doubleword), low word at the plain one.
-    pub const PIO_READ_HI: u32 = 0x7D1C0;
-    pub const PIO_READ_LO: u32 = 0x7C1C4;
+/// FIFO entry tags. `hq_fifo`: command FIFO words carry their port (0 user,
+/// 1 privileged); `RSS | entry` is a direct raster write for the HQ3 to
+/// forward in order. `rss_fifo`: a raster write is `entry` itself (register
+/// << 1 | execute), below `0x800`. Ops share numbers in both.
+mod tag {
+    pub const PORT_USER: u32 = 0;
+    pub const PORT_PRIVILEGED: u32 = 1;
+    pub const RSS: u32 = 0x0100_0000;
+    /// Context switch requested: the incoming context follows as FIFO words.
+    pub const CONTEXT_SWITCH: u32 = 0x8000_0001;
+    /// The host read the high half of a PIO read doubleword: next one.
+    pub const PIO_ADVANCE: u32 = 0x8000_0004;
+    /// DMA pixel line into the armed transfer: value is line | bytes << 32,
+    /// the bytes follow as payload, eight to an entry, first byte highest.
+    pub const DMA_LINE: u32 = 0x8000_0010;
+    /// A GL batch starts / ends: the RSS stashes the raster registers it
+    /// loads, and puts them back after (see `rss::Rss::gl_enter`).
+    pub const GL_ENTER: u32 = 0x8000_0020;
+    pub const GL_LEAVE: u32 = 0x8000_0021;
+    pub const EXIT: u32 = 0x8000_00FF;
 }
 
-/// A geometry engine as its diagnostic port sees it. The engine itself does
-/// not run; it only has to hold downloaded microcode, read it back, and
-/// answer "started".
-#[derive(Default)]
-struct GeDiag {
-    /// Current diagnostic address: a microcode line (from `UCODE_BASE`) or an
-    /// internal register.
-    addr: u32,
-    /// Which 32-bit word of the current 72-bit microcode line comes next.
-    word: usize,
-    ucode: HashMap<u32, [u32; 3]>,
+/// `rss_fifo` raster write from the CPU's direct register window (for the
+/// trace; the RSS treats both sources alike).
+const RSS_SRC_CPU: u32 = 0x800;
+
+/// A raster write as `rss_fifo` carries it.
+fn rss_entry(r: u32, exec: bool) -> u32 {
+    (r & 0x3FF) << 1 | exec as u32
 }
 
-impl GeDiag {
-    const UCODE_BASE: u32 = 0x20_0000;
-    /// Internal register: execution control; bit 0 starts the engine.
-    const EXEC_CONTROL: u32 = 0x4_0000;
-
-    /// Words a readback starting at `addr` delivers, in order: for each pair
-    /// of lines, word 0 and the top byte of the first, then word 1 of the
-    /// second. A readback starting on an odd line is preceded by two words
-    /// that carry nothing. (The driver's verifier reads exactly this; the
-    /// order is inferred from it.)
-    fn readback(&self, lines: u32) -> Vec<u32> {
-        let w = |l: u32, i: usize| self.ucode.get(&l).map(|x| x[i]).unwrap_or(0);
-        let mut out = Vec::new();
-        let mut l = self.addr;
-        if l.wrapping_sub(Self::UCODE_BASE) & 1 == 1 {
-            out.extend([0, 0]);
-        }
-        for _ in 0..lines / 2 {
-            out.extend([w(l, 0), w(l, 2) & 0xFF, w(l + 1, 1)]);
-            l += 2;
-        }
-        out
-    }
-}
-
-/// Command FIFO command numbers.
-mod cmd {
-    /// Command-processor token: schedule a buffer swap for the next retrace.
-    pub const CP_SCHEDULE_SWAP: u32 = 0x37;
-    pub const SET_DONE_FLAG: u32 = 0xE04;
-    pub const RASTER_BASE: u32 = 0x1000;
-    pub const RASTER_EXECUTE: u32 = 0x400;
-    pub const DMA_BASE: u32 = 0x800;
-    pub const RASTER_IF_BASE: u32 = 0xA00;
-    pub const FORMATTER: u32 = 0xC00;
-    /// Below this, commands are command-processor microcode tokens.
-    pub const CP_LIMIT: u32 = 0x200;
-}
-
-/// The command FIFO's word-stream parser: a command word, then the data words
-/// its byte count announces.
-#[derive(Default)]
-struct Cfifo {
-    cmd: u32,
-    pixel: bool,
-    need: u32,
-    data: Vec<u32>,
-}
-
-/// Host DMA engine registers.
-mod dma {
-    pub const PAGE_LIST: usize = 0x00;
-    pub const STRIDE: usize = 0x04;
-    pub const ROW_OFFSET: usize = 0x05;
-    pub const ROW_START: usize = 0x06;
-    pub const LINES: usize = 0x07;
-    pub const LINE_BYTES: usize = 0x08;
-    /// The start word: bit 0 run, bits 2:1 pool, bit 3 board to host.
-    pub const START: usize = 0x0B;
-    /// Page-table base of pool `p`: eight bytes at `TABLE_BASE + 2p`, the
-    /// address in the low word.
-    pub const TABLE_BASE: usize = 0x20;
-}
-
-/// Board state behind one lock.
-struct Board {
-    regs: HashMap<u32, u32>,
-    ucode: Vec<u32>,
-    flags: u32,
-    flag_enable: u32,
-    interrupt_enable: u32,
-    /// Context-switch packet words still to swallow from the FIFO.
-    context_words: u32,
-    ge_readback: [u32; 2],
-    ge: [GeDiag; 2],
-    /// Pending diagnostic readback words, oldest first.
-    ge_out: std::collections::VecDeque<u32>,
-    /// One parser per FIFO port (user, privileged): the two may interleave.
-    cfifo: [Cfifo; 2],
-    /// Host DMA engine registers as 32-bit words; an eight-byte register
-    /// takes two, high word first.
-    dma_regs: [u32; 0x80],
-    raster_if_regs: [u32; 0x10],
-    formatter: u32,
-    /// A board-to-host DMA started on the host side, waiting for the raster
-    /// engine to be started (xfrcontrol = 9).
-    dma_read_pending: Option<u32>,
-    /// System memory, for DMA.
-    mem: Option<Arc<dyn BusDevice>>,
-    /// DMA transfers logged so far (bring-up).
-    dma_logged: u32,
+/// CPU-side board state: host interface registers, the geometry engines'
+/// diagnostic ports, the display control bus. Plain data, valid zeroed.
+#[repr(C)]
+struct Front {
+    hq: Hq3Regs,
+    ge: Ge11,
     dcb: dcb::Dcb,
-    raster: raster::Raster,
-    /// Commands and registers not modelled yet, reported once each.
-    unhandled: HashSet<String>,
 }
 
-impl Board {
-    fn new(kind: ImpactSlot) -> Self {
-        // Board version bytes: [RA/RB boards + TRAMs, product + GE count].
+/// `Front` borrowed under its lock.
+struct FrontGuard<'a> {
+    _lock: parking_lot::MutexGuard<'a, ()>,
+    front: &'a mut Front,
+}
+
+impl std::ops::Deref for FrontGuard<'_> {
+    type Target = Front;
+    fn deref(&self) -> &Front { self.front }
+}
+
+impl std::ops::DerefMut for FrontGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Front { self.front }
+}
+
+impl Front {
+    fn init(&mut self, kind: GraphicsBoard) {
+        // Board version bytes: [RB revision (6:4, 7 = no RB board), RB TRAMs
+        // (3:2), RA TRAMs (1:0), as log2 of the TRAM count; product (6:5) +
+        // GE count (1:0)]. High and Max Impact get 4 TRAMs (4 MB) per board.
         let bdvers = match kind {
-            ImpactSlot::Solid => [0x70, 0x21],
-            ImpactSlot::High => [0x70, 0x01],
-            ImpactSlot::Max => [0x00, 0x02],
-            ImpactSlot::None => [0, 0],
+            GraphicsBoard::SolidImpact => [0x70, 0x21],
+            GraphicsBoard::HighImpact => [0x72, 0x01],
+            GraphicsBoard::MaxImpact => [0x0A, 0x02],
+            _ => [0, 0],
         };
-        Board {
-            regs: HashMap::new(),
-            ucode: vec![0; ((host::UCODE_END - host::UCODE) / 4) as usize],
-            flags: 0,
-            flag_enable: 0,
-            interrupt_enable: 0,
-            context_words: 0,
-            ge_readback: [0; 2],
-            ge: [GeDiag::default(), GeDiag::default()],
-            ge_out: std::collections::VecDeque::new(),
-            cfifo: [Cfifo::default(), Cfifo::default()],
-            dma_regs: [0; 0x80],
-            raster_if_regs: [0; 0x10],
-            formatter: 0,
-            dma_read_pending: None,
-            mem: None,
-            dma_logged: 0,
-            dcb: dcb::Dcb::new(bdvers, [0xFB, 0xFB]),
-            raster: raster::Raster::default(),
-            unhandled: HashSet::new(),
-        }
+        self.dcb.init(bdvers, [0xFB, 0xFB]);
     }
 
-    fn note(&mut self, what: String) {
-        if self.unhandled.len() < 256 && self.unhandled.insert(what.clone()) {
-            eprintln!("mgras: not modelled yet: {what}");
-        }
+    /// Flags derived from state, on top of the stored ones.
+    fn derived_flags(&self) -> u32 {
+        if self.ge.out.is_empty() { 0 } else { host::FLAG_GE_DIAG }
     }
 
-    /// Push one 32-bit word into the command FIFO. Returns true when the
-    /// framebuffer changed.
-    fn cfifo_word(&mut self, port: usize, w: u32) -> bool {
-        // A context switch's incoming state follows the save phase as raw
-        // words; the command processor would load it. Consume it here, and
-        // report the load done after the last word.
-        if self.context_words > 0 {
-            self.context_words -= 1;
-            if self.context_words == 0 {
-                self.flags |= host::FLAG_CONTEXT_LOADED;
-            }
-            return false;
-        }
-        let f = &mut self.cfifo[port];
-        if f.need == 0 {
-            if w & 0x8000_0000 != 0 {
-                // Pixel data: byte count in bits 19:0, sent as doublewords.
-                f.pixel = true;
-                f.cmd = w;
-                f.need = (((w & 0xF_FFFF) + 7) / 8) * 2;
-            } else {
-                f.pixel = false;
-                f.cmd = (w >> 8) & 0x1FFF;
-                f.need = ((w & 0xFF) + 3) / 4;
-            }
-            f.data.clear();
-            if f.need == 0 {
-                return self.dispatch(port);
-            }
-            return false;
-        }
-        f.need -= 1;
-        if f.data.len() < 64 {
-            f.data.push(w);
-        }
-        if f.need == 0 { self.dispatch(port) } else { false }
-    }
-
-    fn dispatch(&mut self, port: usize) -> bool {
-        let cmd = self.cfifo[port].cmd;
-        let data = std::mem::take(&mut self.cfifo[port].data);
-        if self.cfifo[port].pixel {
-            self.note(format!("pixel data command {cmd:#010x}"));
-            return false;
-        }
-        let changed = if cmd >= cmd::RASTER_BASE {
-            let r = cmd & 0x3FF;
-            let exec = cmd & cmd::RASTER_EXECUTE != 0;
-            let changed = match data.as_slice() {
-                [] => self.raster.write(r, 0, exec),
-                [d] => self.raster.write(r, *d, exec),
-                [hi, lo, ..] => {
-                    self.raster.write(r, *hi, false);
-                    self.raster.write(r + 1, *lo, exec)
-                }
-            };
-            if r == raster::reg::XFRCONTROL && data.first() == Some(&9) {
-                changed | self.start_read_dma()
-            } else {
-                changed
-            }
-        } else if cmd == cmd::SET_DONE_FLAG {
-            self.flags |= host::FLAG_DONE;
-            false
-        } else if cmd >= cmd::DMA_BASE {
-            let n = (cmd & 0x1FF) as usize;
-            let v = data.first().copied().unwrap_or(0);
-            if cmd >= cmd::FORMATTER {
-                self.formatter = v;
-                false
-            } else if cmd >= cmd::RASTER_IF_BASE {
-                self.raster_if_regs[n & 0xF] = v;
-                false
-            } else {
-                // Eight-byte registers arrive as a high word, then a low word,
-                // and fill two register slots.
-                let n = n & 0x7F;
-                for (i, d) in data.iter().take(2).enumerate() {
-                    self.dma_regs[(n + i) & 0x7F] = *d;
-                }
-                if data.is_empty() {
-                    self.dma_regs[n] = 0;
-                }
-                if n == dma::START { self.dma_start(v) } else { false }
-            }
-        } else if cmd == cmd::CP_SCHEDULE_SWAP {
-            // No retrace wait: the swap is reported done at once.
-            self.flags |= host::FLAG_CP0;
-            false
-        } else if cmd < cmd::CP_LIMIT {
-            self.note(format!("command-processor token {cmd:#x} ({} data words)", data.len()));
-            false
-        } else {
-            self.note(format!("command {cmd:#x}"));
-            false
-        };
-        self.cfifo[port].data = data;
-        changed
-    }
-
-    /// The host DMA engine's start word. Host to board runs now: the raster
-    /// engine was armed first. Board to host waits for the raster engine.
-    fn dma_start(&mut self, word: u32) -> bool {
-        if word & 1 == 0 {
-            return false;
-        }
-        if word & 8 != 0 {
-            self.dma_read_pending = Some(word);
-            return false;
-        }
-        match self.raster.transfer_armed() {
-            Some(false) => self.dma(word, false),
-            _ => {
-                self.note(format!("host DMA start {word:#x} with no write transfer armed"));
-                false
-            }
-        }
-    }
-
-    fn start_read_dma(&mut self) -> bool {
-        let Some(word) = self.dma_read_pending.take() else {
-            self.note("raster DMA read started with no host DMA pending".into());
-            return false;
-        };
-        if self.raster.transfer_armed() != Some(true) {
-            self.note(format!("host DMA read {word:#x} with no read transfer armed"));
-            return false;
-        }
-        self.dma(word, true)
-    }
-
-    /// Run a DMA between host memory and the armed raster transfer, a line at
-    /// a time. Host addresses are logical within the pool and translate
-    /// through its page table: one 32-bit frame number per 4 KB page.
-    fn dma(&mut self, word: u32, read: bool) -> bool {
-        let Some(mem) = self.mem.clone() else { return false };
-        let pool = ((word >> 1) & 3) as usize;
-        let table = self.dma_regs[dma::TABLE_BASE + 2 * pool + 1] & !3;
-        let base = self.dma_regs[dma::ROW_START].wrapping_add(self.dma_regs[dma::ROW_OFFSET]);
-        let stride = self.dma_regs[dma::STRIDE];
-        let lines = self.dma_regs[dma::LINES];
-        let len = self.dma_regs[dma::LINE_BYTES];
-        if self.dma_logged < 16 {
-            self.dma_logged += 1;
-            eprintln!(
-                "mgras: DMA {} pool {pool} table {table:#x} base {base:#x} stride {stride} lines {lines} bytes {len} pglist {:#x} shape {:?}",
-                if read { "read" } else { "write" },
-                self.dma_regs[dma::PAGE_LIST],
-                self.raster.transfer_shape()
-            );
-        }
-        let frame_of = |page: u32| -> Option<u32> {
-            let r = mem.read32(table.wrapping_add(4 * page));
-            r.is_ok().then_some(r.data << 12)
-        };
-        let mut cached: Option<(u32, u32)> = None;
-        let mut phys = |l: u32| -> Option<u32> {
-            let page = l >> 12;
-            let f = match cached {
-                Some((p, f)) if p == page => f,
-                _ => {
-                    let f = frame_of(page)?;
-                    cached = Some((page, f));
-                    f
-                }
-            };
-            Some(f | (l & 0xFFF))
-        };
-        let mut changed = false;
-        for i in 0..lines {
-            let a = base.wrapping_add(i.wrapping_mul(stride));
-            if read {
-                let bytes = self.raster.dma_read_line(i);
-                for (k, b) in bytes.iter().take(len as usize).enumerate() {
-                    let Some(pa) = phys(a + k as u32) else { return changed };
-                    mem.write8(pa, *b);
-                }
-            } else {
-                let mut bytes = Vec::with_capacity(len as usize);
-                for k in 0..len {
-                    let Some(pa) = phys(a + k) else { return changed };
-                    let r = mem.read8(pa);
-                    bytes.push(if r.is_ok() { r.data } else { 0 });
-                }
-                self.raster.dma_write_line(i, &bytes);
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// Flags as the host reads them, including those derived from state.
-    fn all_flags(&self) -> u32 {
-        self.flags | if self.ge_out.is_empty() { 0 } else { host::FLAG_GE_DIAG }
-    }
-
-    /// Whether the general interrupt (GIO line 1) is asserted: some enabled
-    /// flag is set. It is a level, held until the handler clears the flag or
-    /// its enable.
-    fn general_irq(&self) -> bool {
-        self.all_flags() & self.interrupt_enable & host::INTR_CAUSES != 0
-    }
-
-    /// Video timing chip display control bit 0: vertical retrace interrupts
-    /// enabled.
-    fn retrace_enabled(&self) -> bool {
-        self.dcb.vc3.regs[0x1E] & 1 != 0
-    }
-
-    /// A write to a geometry engine's diagnostic data or address port.
-    fn ge_diag_write(&mut self, off: u32, val: u32) {
-        let n = host::GE_DIAG.iter().position(|&(d, a)| off == d || off == a).unwrap();
-        let (data_port, _) = host::GE_DIAG[n];
-        let ge = &mut self.ge[n];
-        if off != data_port {
-            if val & 0x8000_0000 != 0 {
-                // Read request for `val & 0x7FFF_FFFF` lines from `addr`; it
-                // replaces anything a previous request left unread.
-                let words = ge.readback(val & 0x7FFF_FFFF);
-                self.ge_out.clear();
-                self.ge_out.extend(words);
-            } else {
-                ge.addr = val;
-                ge.word = 0;
-            }
-            return;
-        }
-        if ge.addr >= GeDiag::UCODE_BASE {
-            let line = ge.ucode.entry(ge.addr).or_insert([0; 3]);
-            line[ge.word] = val;
-            ge.word += 1;
-            if ge.word == 3 {
-                ge.word = 0;
-                ge.addr += 1;
-            }
-        } else if ge.addr == GeDiag::EXEC_CONTROL && val & 1 != 0 {
-            // Started: the version program's answer is waiting (revision 1).
-            self.ge_readback = [0, 1];
-            self.flags |= host::FLAG_GE_DATA;
-        }
-    }
-
-    fn status(&self) -> u32 {
+    fn status() -> u32 {
         // A vertical blank of about 1 ms in every 60 Hz frame.
         let us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -517,41 +168,34 @@ impl Board {
     fn read(&mut self, off: u32, bits: u32) -> u64 {
         match off {
             0 => GIO_ID as u64,
-            host::UCODE..=0x45FFF => self.ucode[((off - host::UCODE) / 4) as usize] as u64,
+            host::UCODE..=0x45FFF => self.hq.ucode[((off - host::UCODE) / 4) as usize] as u64,
             0x60000..=0x67FFF => {
                 let t = dcb::Txn::decode(off);
                 let d = self.dcb.read(t);
                 t.load_value(bits, d)
             }
-            host::STATUS => self.status() as u64,
-            host::FIFOSTATUS | host::GIOSTATUS | host::DMABUSY => 0,
-            host::SET_FLAGS | host::CLEAR_FLAGS | host::SET_FLAGS_PRIVILEGED | host::CLEAR_FLAGS_PRIVILEGED => self.all_flags() as u64,
-            host::FLAG_ENABLE_SET | host::FLAG_ENABLE_CLEAR => self.flag_enable as u64,
-            host::INTERRUPT_ENABLE_SET | host::INTERRUPT_ENABLE_CLEAR => self.interrupt_enable as u64,
-            host::GE_DIAG_READ => self.ge_out.pop_front().unwrap_or(0) as u64,
-            host::RASTER_IF_CONTEXT..=0x50228 => self.raster_if_regs[((off - host::RASTER_IF_CONTEXT) / 4) as usize] as u64,
-            host::DMA_CONTEXT..=0x504FF => self.dma_regs[((off - host::DMA_CONTEXT) / 4) as usize] as u64,
-            host::PIO_READ_HI => self.raster.pio_read_hi() as u64,
-            host::PIO_READ_LO => self.raster.pio_read_lo() as u64,
-            host::GE_READBACK_HI => self.ge_readback[0] as u64,
-            host::GE_READBACK_LO => self.ge_readback[1] as u64,
-            host::RASTER..=0x7FFFF => {
-                let r = (off & 0xFFC) >> 2;
+            0x68000..=0x6803F => {
+                let dev = ((off - 0x68000) >> 2) as usize;
                 if bits == 64 {
-                    ((self.raster.read(r) as u64) << 32) | self.raster.read(r + 1) as u64
+                    ((self.dcb.read_dcbctrl(dev) as u64) << 32) | (self.dcb.read_dcbctrl(dev + 1) as u64)
                 } else {
-                    self.raster.read(r) as u64
+                    self.dcb.read_dcbctrl(dev) as u64
                 }
             }
-            _ => self.regs.get(&off).copied().unwrap_or(0) as u64,
+            host::FLAG_ENABLE_SET | host::FLAG_ENABLE_CLEAR => self.hq.flag_enable as u64,
+            host::INTERRUPT_ENABLE_SET | host::INTERRUPT_ENABLE_CLEAR => self.hq.interrupt_enable as u64,
+            host::GE_DIAG_READ => self.ge.out.pop().unwrap_or(0) as u64,
+            host::GE_READBACK_HI => self.hq.ge_readback[0] as u64,
+            host::GE_READBACK_LO => self.hq.ge_readback[1] as u64,
+            _ => self.hq.regs.get(off) as u64,
         }
     }
 
-    /// Returns true when the framebuffer changed.
-    fn write(&mut self, off: u32, bits: u32, val: u64) -> bool {
+    /// Returns true when what is displayed changed.
+    fn write(&mut self, off: u32, bits: u32, val: u64, flags: &AtomicU32) -> bool {
         match off {
             host::UCODE..=0x45FFF => {
-                self.ucode[((off - host::UCODE) / 4) as usize] = val as u32 & 0xFF_FFFF;
+                self.hq.ucode[((off - host::UCODE) / 4) as usize] = val as u32 & 0xFF_FFFF;
                 false
             }
             0x60000..=0x67FFF => {
@@ -562,308 +206,33 @@ impl Board {
                 // writes (select 1 and below) change nothing by themselves.
                 t.crs >= 2 || t.dev == dcb::DEV_VC3
             }
-            off if host::GE_DIAG.iter().any(|&(d, a)| off == d || off == a) => {
-                self.ge_diag_write(off, val as u32);
-                false
-            }
-            host::FLAG_ENABLE_SET => { self.flag_enable |= val as u32; false }
-            host::FLAG_ENABLE_CLEAR => { self.flag_enable &= !(val as u32); false }
-            host::INTERRUPT_ENABLE_SET => { self.interrupt_enable |= val as u32; false }
-            host::INTERRUPT_ENABLE_CLEAR => { self.interrupt_enable &= !(val as u32); false }
-            host::CONTEXT_SWITCH => {
-                // The save phase completes at once; the incoming context
-                // follows through the FIFO (see `cfifo_word`).
-                self.flags |= host::FLAG_CONTEXT_SAVED;
-                self.context_words = host::CONTEXT_SWITCH_WORDS;
-                false
-            }
-            host::SET_FLAGS | host::SET_FLAGS_PRIVILEGED => { self.flags |= val as u32; false }
-            host::CLEAR_FLAGS | host::CLEAR_FLAGS_PRIVILEGED => { self.flags &= !(val as u32); false }
-            host::CFIFO | 0x70084 | host::CFIFO_PRIVILEGED | 0x50084 => {
-                let port = if off >= host::STATUS { 0 } else { 1 };
+            0x68000..=0x6803F => {
+                let dev = ((off - 0x68000) >> 2) as usize;
                 if bits == 64 {
-                    let a = self.cfifo_word(port, (val >> 32) as u32);
-                    let b = self.cfifo_word(port, val as u32);
-                    a | b
+                    self.dcb.write_dcbctrl(dev, (val >> 32) as u32);
+                    self.dcb.write_dcbctrl(dev + 1, val as u32);
                 } else {
-                    self.cfifo_word(port, val as u32)
+                    self.dcb.write_dcbctrl(dev, val as u32);
                 }
-            }
-            host::RASTER..=0x7FFFF => {
-                let r = (off & 0xFFC) >> 2;
-                // Registers at 0x7C000 + 4r; the same register at +0x1000
-                // also executes the primitive in the IR after the write.
-                let exec = off & 0x1000 != 0;
-                if bits == 64 {
-                    self.raster.write(r, (val >> 32) as u32, false);
-                    self.raster.write(r + 1, val as u32, exec)
-                } else {
-                    self.raster.write(r, val as u32, exec)
-                }
-            }
-            0x80000..=0xFFFFF => {
-                self.note(format!("fast-path command window write at {off:#x}"));
                 false
             }
+            off if Ge11::is_diag_port(off) => {
+                if self.ge.write(off, val as u32) {
+                    // Started: the version program's answer is waiting
+                    // (revision 1).
+                    self.hq.ge_readback = [0, 1];
+                    flags.fetch_or(host::FLAG_GE_DATA, Ordering::AcqRel);
+                }
+                false
+            }
+            host::FLAG_ENABLE_SET => { self.hq.flag_enable |= val as u32; false }
+            host::FLAG_ENABLE_CLEAR => { self.hq.flag_enable &= !(val as u32); false }
+            host::INTERRUPT_ENABLE_SET => { self.hq.interrupt_enable |= val as u32; false }
+            host::INTERRUPT_ENABLE_CLEAR => { self.hq.interrupt_enable &= !(val as u32); false }
             _ => {
-                self.regs.insert(off, val as u32);
+                self.hq.regs.insert(off, val as u32);
                 false
             }
-        }
-    }
-
-    /// The window ID a frame for the window at (`x`, `y`), `w` x `h` (screen
-    /// coordinates, top-down) should be painted through: the commonest ID
-    /// over a grid of samples inside it that has an RGB display mode. None
-    /// if no sampled pixel is in an RGB window.
-    fn window_did(&self, x: i32, y: i32, w: usize, h: usize) -> Option<u8> {
-        let mut counts = [0u32; 32];
-        let mut runs = Vec::new();
-        for sy in 0..16 {
-            let py = y + (h as i32 * (2 * sy + 1)) / 32;
-            if !(0..raster::HEIGHT as i32).contains(&py) {
-                continue;
-            }
-            self.dcb.vc3.main_did_runs(py as usize, &mut runs);
-            for sx in 0..16 {
-                let px = x + (w as i32 * (2 * sx + 1)) / 32;
-                if !(0..raster::WIDTH as i32).contains(&px) {
-                    continue;
-                }
-                let did = runs.iter().rev().find(|r| r.0 as i32 <= px).map_or(0, |r| r.1);
-                if self.dcb.xmap.main_mode(did as u32) & 0x1F >= 4 {
-                    counts[did as usize & 31] += 1;
-                }
-            }
-        }
-        let (did, n) = counts.iter().enumerate().max_by_key(|&(_, n)| *n)?;
-        (*n > 0).then_some(did as u8)
-    }
-
-    /// Paint a host GL frame (`bgra`: `h` rows, top first, `stride` bytes
-    /// each) into the framebuffer at screen position (`x`, `y`), wherever the
-    /// pixel belongs to the frame's window ID, so windows over it stay over it.
-    /// The pixels become part of the framebuffer, as GL's would on the board,
-    /// for anything that reads them back. False when no window ID fits.
-    fn composite(&mut self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
-        let Some(target) = self.window_did(x, y, w, h) else { return false };
-        let mut runs = Vec::new();
-        for row in 0..h {
-            let sy = y + row as i32;
-            if !(0..raster::HEIGHT as i32).contains(&sy) {
-                continue;
-            }
-            self.dcb.vc3.main_did_runs(sy as usize, &mut runs);
-            if runs.is_empty() || runs[0].0 != 0 {
-                runs.insert(0, (0, 0));
-            }
-            let fb_row = (raster::HEIGHT - 1 - sy as usize) * raster::WIDTH;
-            for (k, &(x0, did)) in runs.iter().enumerate() {
-                if did != target {
-                    continue;
-                }
-                let x1 = runs.get(k + 1).map_or(raster::WIDTH as i32, |r| r.0 as i32);
-                let lo = (x0 as i32).max(x).max(0);
-                let hi = x1.min(x + w as i32).min(raster::WIDTH as i32);
-                for sx in lo..hi {
-                    let i = row * stride + (sx - x) as usize * 4;
-                    let Some(p) = bgra.get(i..i + 4) else { break };
-                    self.raster.fb[fb_row + sx as usize] = p[2] as u32 | (p[1] as u32) << 8 | (p[0] as u32) << 16;
-                }
-            }
-        }
-        true
-    }
-
-    /// Scan the framebuffer out to `0xFF_BB_GG_RR` (the compositor's order,
-    /// red in the low byte), stride 2048, top row first. Each pixel's window
-    /// ID (from the video timing chip's tables) picks its display mode. Modes
-    /// with a pixel format (bits 4:0) of 4 and up are RGB; the others are
-    /// colour index, into the colormap block that bits 9:5 choose. Both go
-    /// through the DAC gamma.
-    fn scanout(&self, out: &mut [u32]) {
-        if self.dcb.dac.pixmask() == 0 {
-            out.iter_mut().for_each(|p| *p = 0xFF00_0000);
-            return;
-        }
-        let pal = &self.dcb.cmap[0].pal;
-        let gamma = &self.dcb.dac.gamma;
-        let gamma_rgb = |r: u32, g: u32, b: u32| -> u32 {
-            let g1 = |v: u32, comp: usize| (gamma[(v & 0xFF) as usize][comp] >> 2) as u32;
-            0xFF00_0000 | (g1(b, 2) << 16) | (g1(g, 1) << 8) | g1(r, 0)
-        };
-        // Per window ID: None for an RGB mode, else the colormap block's
-        // entries through the gamma tables.
-        let luts: Vec<Option<Vec<u32>>> = (0..32u32)
-            .map(|did| {
-                let mode = self.dcb.xmap.main_mode(did);
-                if mode & 0x1F >= 4 {
-                    return None;
-                }
-                let base = ((mode >> 5) & 0x1F) as usize * 256;
-                Some(
-                    (0..4096usize)
-                        .map(|i| {
-                            let c = pal.get((base + i) % pal.len().max(1)).copied().unwrap_or(0);
-                            gamma_rgb(c >> 16, c >> 8, c)
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        let mut runs = Vec::new();
-        for row in 0..raster::HEIGHT {
-            let y = raster::HEIGHT - 1 - row;
-            let src = &self.raster.fb[y * raster::WIDTH..(y + 1) * raster::WIDTH];
-            let dst = &mut out[row * 2048..row * 2048 + raster::WIDTH];
-            self.dcb.vc3.main_did_runs(row, &mut runs);
-            if runs.is_empty() || runs[0].0 != 0 {
-                runs.insert(0, (0, 0));
-            }
-            for (k, &(x0, did)) in runs.iter().enumerate() {
-                let x0 = (x0 as usize).min(raster::WIDTH);
-                let x1 = runs.get(k + 1).map(|r| (r.0 as usize).min(raster::WIDTH)).unwrap_or(raster::WIDTH);
-                if x1 <= x0 {
-                    continue;
-                }
-                match &luts[did as usize & 31] {
-                    Some(lut) => {
-                        for x in x0..x1 {
-                            dst[x] = lut[(src[x] & 0xFFF) as usize];
-                        }
-                    }
-                    None => {
-                        for x in x0..x1 {
-                            let v = src[x];
-                            dst[x] = gamma_rgb(v, v >> 8, v >> 16);
-                        }
-                    }
-                }
-            }
-        }
-        self.draw_overlay(out, &gamma_rgb);
-        self.draw_cursor(out, &gamma_rgb);
-    }
-
-    /// Overlay planes over the main scanout: a nonzero pixel is a colour
-    /// index into the block its overlay mode names (bits 7:3); zero, or a
-    /// window ID whose overlay is off, shows the main planes.
-    fn draw_overlay(&self, out: &mut [u32], gamma_rgb: &dyn Fn(u32, u32, u32) -> u32) {
-        let pal = &self.dcb.cmap[0].pal;
-        let bases: Vec<Option<usize>> = (0..32u32)
-            .map(|did| {
-                let mode = self.dcb.xmap.overlay_mode(did);
-                (mode != 0).then(|| ((mode >> 3) & 0x1F) as usize * 256)
-            })
-            .collect();
-        if bases.iter().all(Option::is_none) {
-            return;
-        }
-        let mut runs = Vec::new();
-        for row in 0..raster::HEIGHT {
-            let y = raster::HEIGHT - 1 - row;
-            let src = &self.raster.overlay[y * raster::WIDTH..(y + 1) * raster::WIDTH];
-            let dst = &mut out[row * 2048..row * 2048 + raster::WIDTH];
-            self.dcb.vc3.overlay_did_runs(row, &mut runs);
-            if runs.is_empty() || runs[0].0 != 0 {
-                runs.insert(0, (0, 0));
-            }
-            for (k, &(x0, did)) in runs.iter().enumerate() {
-                let Some(base) = bases[did as usize & 31] else { continue };
-                let x0 = (x0 as usize).min(raster::WIDTH);
-                let x1 = runs.get(k + 1).map(|r| (r.0 as usize).min(raster::WIDTH)).unwrap_or(raster::WIDTH);
-                for x in x0..x1 {
-                    let v = src[x] & 0xFF;
-                    if v != 0 {
-                        let c = pal.get((base + v as usize) % pal.len().max(1)).copied().unwrap_or(0);
-                        dst[x] = gamma_rgb(c >> 16, c >> 8, c);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Overlay the hardware cursor, its colours from the cursor colormap.
-    fn draw_cursor(&self, out: &mut [u32], gamma_rgb: &dyn Fn(u32, u32, u32) -> u32) {
-        let Some((cx, cy, size, glyph)) = self.dcb.vc3.cursor() else { return };
-        let sram = &self.dcb.vc3.sram;
-        let pal = &self.dcb.cmap[0].pal;
-        let base = self.dcb.xmap.cursor_cmap_base();
-        let words_per_row = size / 16;
-        let plane_words = size * words_per_row;
-        let bit = |plane: usize, row: usize, col: usize| -> u32 {
-            let w = sram[(glyph + plane * plane_words + row * words_per_row + col / 16) & 0x7FFF];
-            (w >> (15 - col % 16)) as u32 & 1
-        };
-        for row in 0..size {
-            let y = cy + row as i32;
-            if !(0..raster::HEIGHT as i32).contains(&y) {
-                continue;
-            }
-            for col in 0..size {
-                let x = cx + col as i32;
-                if !(0..raster::WIDTH as i32).contains(&x) {
-                    continue;
-                }
-                let c = bit(0, row, col) | bit(1, row, col) << 1;
-                if c != 0 {
-                    let rgb = pal.get(base + c as usize).copied().unwrap_or(0xFF_FFFF);
-                    out[y as usize * 2048 + x as usize] = gamma_rgb(rgb >> 16, rgb >> 8, rgb);
-                }
-            }
-        }
-    }
-}
-
-/// Access trace for bring-up: every access to the board, one line each
-/// (`R`/`W`, width in bits, physical address, value). Started from
-/// `IRIS_MGRAS_TRACE=<file>` or the monitor (`mgras trace <file>`, `mgras
-/// trace off`). Off, it costs one relaxed load per access.
-mod trace {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
-    use parking_lot::Mutex;
-
-    static ON: AtomicBool = AtomicBool::new(false);
-
-    fn sink() -> &'static Mutex<Option<std::io::BufWriter<std::fs::File>>> {
-        static SINK: OnceLock<Mutex<Option<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
-        SINK.get_or_init(|| {
-            let w = std::env::var_os("IRIS_MGRAS_TRACE").and_then(|p| open(&p).ok());
-            ON.store(w.is_some(), Ordering::Relaxed);
-            Mutex::new(w)
-        })
-    }
-
-    fn open(path: &std::ffi::OsStr) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(std::io::BufWriter::new(f))
-    }
-
-    /// Start tracing to `path`, or stop with `None`.
-    pub fn set(path: Option<&str>) -> std::io::Result<()> {
-        let mut s = sink().lock();
-        if let Some(mut w) = s.take() {
-            let _ = w.flush();
-        }
-        if let Some(p) = path {
-            *s = Some(open(std::ffi::OsStr::new(p))?);
-        }
-        ON.store(s.is_some(), Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn init() {
-        let _ = sink();
-    }
-
-    pub fn note(dir: char, bits: u32, addr: u32, val: u64) {
-        if !ON.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(w) = sink().lock().as_mut() {
-            let _ = writeln!(w, "{dir}{bits} {addr:08x} {val:x}");
         }
     }
 }
@@ -880,16 +249,43 @@ pub enum Line {
 }
 
 pub struct Mgras {
-    kind: ImpactSlot,
+    kind: GraphicsBoard,
     ioc: crate::dev::ioc::Ioc,
-    /// System memory, for the board's DMA (it is a GIO bus master).
-    sys_mem: Mutex<Option<Arc<dyn BusDevice>>>,
     /// Current level of the general interrupt line.
     general: AtomicBool,
-    board: Mutex<Board>,
+    /// CPU-side state and its lock. The display thread reads it unlocked
+    /// (plain data, tearing tolerated).
+    front_lock: Mutex<()>,
+    front: UnsafeCell<Front>,
+    /// Commands and registers not modelled yet, reported once each.
+    unhandled: Mutex<HashSet<String>>,
+    /// HQ3 flags: the HQ3 thread raises them, the CPU sets and clears them.
+    flags: AtomicU32,
+    /// Owned by the HQ3 thread (others only while the board is idle).
+    eng: UnsafeCell<Hq3Engine>,
+    /// Owned by the RSS thread (others only while the board is idle; the
+    /// display thread reads the framebuffer unlocked).
+    rss: UnsafeCell<Rss>,
+    /// System memory, for the board's DMA (it is a GIO bus master).
+    mem: Mutex<Option<Arc<dyn BusDevice>>>,
+    hq_fifo: GFifo<HQ_FIFO_DEPTH>,
+    rss_fifo: GFifo<RSS_FIFO_DEPTH>,
+    hq_busy: AtomicBool,
+    rss_busy: AtomicBool,
+    /// Held by every producer while it pushes, and by anyone who needs the
+    /// engines to stay idle (reads of drawing state, checkpoints, monitor).
+    /// Holds the recording, so records come out in FIFO order.
+    submit: Mutex<Option<record::RecHandle>>,
+    /// The recording again, for DMA memory accesses on the HQ3 thread (which
+    /// must not wait on `submit`: its holder may be waiting for idle).
+    mem_rec: Mutex<Option<record::RecHandle>>,
+    engines: AtomicBool,
+    threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    hq_thread: Mutex<Option<thread::Thread>>,
+    rss_thread: Mutex<Option<thread::Thread>>,
     dirty: AtomicBool,
     running: AtomicBool,
-    refresh: Mutex<Option<std::thread::JoinHandle<()>>>,
+    refresh: Mutex<Option<thread::JoinHandle<()>>>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     /// The finished frame, handed to the renderer as a prebuilt picture
     /// (`Rex3Screen::prebuilt`), as GR2 does.
@@ -898,42 +294,341 @@ pub struct Mgras {
     heartbeat: Arc<AtomicU64>,
     fasttick: Arc<AtomicU64>,
     cycles: Mutex<crate::cpu::mips_core::CyclesPtr>,
+    /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
+    trace: Mutex<debug::MgrasTrace>,
+    trace_mask: AtomicU32,
+}
+
+// SAFETY: `eng` is touched only by the HQ3 thread, `rss` only by the RSS
+// thread, except by holders of `submit` while the board is idle (no producer
+// can push, no engine is running). The display thread reads `rss`'s
+// framebuffer unlocked; tearing is tolerated, as with REX3 and GR2.
+unsafe impl Sync for Mgras {}
+unsafe impl Send for Mgras {}
+
+/// The HQ3 thread's view of the rest of the board.
+struct HqSink<'a>(&'a Mgras);
+
+impl Hq3Sink for HqSink<'_> {
+    fn rss_write(&mut self, r: u32, val: u32, exec: bool) {
+        self.0.rss_push(rss_entry(r, exec), val as u64);
+    }
+    fn transfer(&mut self) -> Option<(bool, (u32, u32))> {
+        self.0.drain_rss();
+        // SAFETY: the RSS is drained and idle; only the HQ3 feeds it now.
+        let rss = unsafe { &*self.0.rss.get() };
+        Some((rss.transfer_armed()?, rss.transfer_shape()?))
+    }
+    fn dma_write_line(&mut self, line: u32, bytes: &[u8]) {
+        let vals: Vec<u64> = bytes
+            .chunks(8)
+            .map(|c| c.iter().enumerate().fold(0u64, |a, (i, &b)| a | (b as u64) << (56 - 8 * i)))
+            .collect();
+        self.0.rss_fifo.push_batch(tag::DMA_LINE, line as u64 | (bytes.len() as u64) << 32, &vals);
+        Mgras::wake(&self.0.rss_thread);
+    }
+    fn dma_read_line(&mut self, line: u32) -> Vec<u8> {
+        self.0.drain_rss();
+        // SAFETY: as in `transfer`.
+        unsafe { &*self.0.rss.get() }.dma_read_line(line)
+    }
+    fn gl_bracket(&mut self, enter: bool) {
+        self.0.rss_push(if enter { tag::GL_ENTER } else { tag::GL_LEAVE }, 0);
+    }
+    fn set_flags(&mut self, bits: u32) {
+        self.0.flags.fetch_or(bits, Ordering::AcqRel);
+        self.0.refresh_general();
+    }
+    fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>> {
+        let mem = self.0.mem.lock().clone()?;
+        Some(match self.0.mem_rec.lock().clone() {
+            Some(rec) => Arc::new(record::RecordingMem { inner: mem, rec }),
+            None => mem,
+        })
+    }
+    fn note(&mut self, what: String) {
+        self.0.note(what);
+    }
+    fn tracing(&self) -> bool {
+        self.0.tracing(debug::TRACE_HQ)
+    }
+    fn tracing_tex(&self) -> bool {
+        self.0.tracing(debug::TRACE_TEX)
+    }
+    fn trace(&mut self, line: String) {
+        self.0.trace_hq(&line);
+    }
 }
 
 impl Mgras {
-    pub fn new(cfg: &ImpactSection, ioc: crate::dev::ioc::Ioc, heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Self {
-        trace::init();
-        Mgras {
-            kind: cfg.gfx,
-            ioc,
-            sys_mem: Mutex::new(None),
-            general: AtomicBool::new(false),
-            board: Mutex::new(Board::new(cfg.gfx)),
-            dirty: AtomicBool::new(true),
-            running: AtomicBool::new(false),
-            refresh: Mutex::new(None),
-            renderer: Mutex::new(None),
-            screen: Mutex::new(crate::disp::Rex3Screen::new()),
-            screenshot_pending: AtomicBool::new(false),
-            heartbeat,
-            fasttick,
-            cycles: Mutex::new(crate::cpu::mips_core::CyclesPtr::dangling()),
+    /// Build the board in place on the heap: its multi-megabyte state is
+    /// zero-initialised without touching the stack, and only the fields that
+    /// are not valid zeroed are written.
+    pub fn new(board: GraphicsBoard, ioc: crate::dev::ioc::Ioc, heartbeat: Arc<AtomicU64>, fasttick: Arc<AtomicU64>) -> Arc<Self> {
+        let mut a: Arc<MaybeUninit<Self>> = Arc::new_zeroed();
+        let p = Arc::get_mut(&mut a).unwrap().as_mut_ptr();
+        // SAFETY: `p` points at zeroed, exclusively owned memory. Every field
+        // that is not valid zeroed is written below, before assume_init.
+        let m = unsafe {
+            addr_of_mut!((*p).kind).write(board);
+            addr_of_mut!((*p).ioc).write(ioc);
+            addr_of_mut!((*p).general).write(AtomicBool::new(false));
+            addr_of_mut!((*p).front_lock).write(Mutex::new(()));
+            (*(*p).front.get()).init(board);
+            addr_of_mut!((*p).unhandled).write(Mutex::new(HashSet::new()));
+            addr_of_mut!((*p).flags).write(AtomicU32::new(0));
+            addr_of_mut!((*p).eng).write(UnsafeCell::new(Hq3Engine::new()));
+            Rss::init((*p).rss.get());
+            addr_of_mut!((*p).mem).write(Mutex::new(None));
+            addr_of_mut!((*p).submit).write(Mutex::new(None));
+            addr_of_mut!((*p).mem_rec).write(Mutex::new(None));
+            addr_of_mut!((*p).threads).write(Mutex::new(Vec::new()));
+            addr_of_mut!((*p).hq_thread).write(Mutex::new(None));
+            addr_of_mut!((*p).rss_thread).write(Mutex::new(None));
+            addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
+            addr_of_mut!((*p).refresh).write(Mutex::new(None));
+            addr_of_mut!((*p).renderer).write(Mutex::new(None));
+            addr_of_mut!((*p).screen).write(Mutex::new(crate::disp::Rex3Screen::new()));
+            addr_of_mut!((*p).heartbeat).write(heartbeat);
+            addr_of_mut!((*p).fasttick).write(fasttick);
+            addr_of_mut!((*p).cycles).write(Mutex::new(crate::cpu::mips_core::CyclesPtr::dangling()));
+            addr_of_mut!((*p).trace).write(Mutex::new(debug::MgrasTrace::new()));
+            a.assume_init()
+        };
+        if let Some(path) = std::env::var_os("IRIS_MGRAS_REC") {
+            let path = path.to_string_lossy();
+            match m.set_recording(Some(&path)) {
+                Ok(()) => eprintln!("mgras: recording to {path}"),
+                Err(e) => eprintln!("mgras: cannot record to {path}: {e}"),
+            }
+        }
+        if let Some(path) = std::env::var_os("IRIS_MGRAS_TRACE") {
+            let path = path.to_string_lossy();
+            match m.start_trace(&path, debug::TRACE_ALL) {
+                Ok(()) => eprintln!("mgras: tracing to {path}"),
+                Err(e) => eprintln!("mgras: cannot trace to {path}: {e}"),
+            }
+        }
+        m
+    }
+
+    /// The CPU-side state, locked.
+    fn front(&self) -> FrontGuard<'_> {
+        let lock = self.front_lock.lock();
+        // SAFETY: mutable access only under `front_lock`; the display
+        // thread's unlocked reads are of plain data (see `front_view`).
+        FrontGuard { _lock: lock, front: unsafe { &mut *self.front.get() } }
+    }
+
+    /// The CPU-side state without the lock, for the display thread: plain
+    /// data, so a concurrent write can only tear a value.
+    fn front_view(&self) -> &Front {
+        // SAFETY: see above.
+        unsafe { &*self.front.get() }
+    }
+
+    fn note(&self, what: String) {
+        let mut u = self.unhandled.lock();
+        if u.len() < 256 && u.insert(what.clone()) {
+            eprintln!("mgras: not modelled yet: {what}");
         }
     }
 
-    /// Composite a host GL frame at a screen position (see `Board::composite`).
+    fn wake(slot: &Mutex<Option<thread::Thread>>) {
+        if let Some(t) = slot.lock().as_ref() {
+            t.unpark();
+        }
+    }
+
+    /// True when neither FIFO holds work and neither engine is mid-entry.
+    /// The HQ3 is checked first: whatever it forwarded before going idle is
+    /// already in `rss_fifo` when that is checked.
+    fn idle(&self) -> bool {
+        self.hq_fifo.is_empty()
+            && !self.hq_busy.load(Ordering::Acquire)
+            && self.rss_fifo.is_empty()
+            && !self.rss_busy.load(Ordering::Acquire)
+    }
+
+    /// Wait until the board is idle. Holding `submit` keeps it idle.
+    fn wait_idle(&self) {
+        let backoff = crossbeam_utils::Backoff::new();
+        while !self.idle() {
+            backoff.snooze();
+        }
+    }
+
+    /// HQ3 thread: wait until the RSS has run everything queued to it.
+    fn drain_rss(&self) {
+        let backoff = crossbeam_utils::Backoff::new();
+        while !self.rss_fifo.is_empty() || self.rss_busy.load(Ordering::Acquire) {
+            backoff.snooze();
+        }
+    }
+
+    /// HQ3 thread: queue one entry for the RSS.
+    fn rss_push(&self, addr: u32, val: u64) {
+        self.rss_fifo.push(addr, val);
+        Self::wake(&self.rss_thread);
+    }
+
+    /// Everything a replay must reproduce, as one byte string, little-endian
+    /// u32s: the displayed main buffer's bottom-left 1280x1024 (row 0 at the
+    /// bottom), the overlay's, colormap 0, the 32 main XMAP modes, the video
+    /// timing chip's registers and SRAM, then, only if any other bit of
+    /// pixel memory is set, the hash of the rest. (This is the byte string
+    /// the old 1280x1024 plane model hashed, so older recordings keep their
+    /// hashes.) Call with `submit` held and the board idle.
+    fn state_bytes(&self) -> Vec<u8> {
+        const RW: u32 = 1280;
+        const RH: u32 = 1024;
+        // SAFETY: idle, and the caller holds `submit` (see the Sync impl).
+        let rss = unsafe { &*self.rss.get() };
+        let f = self.front();
+        let (main, overlay) = frame::scanout_buffers(rss, &f.dcb);
+        let mut out = Vec::with_capacity((2 * (RW * RH) as usize + 8192 + 32 + 32 + 0x8000) * 4 + 32);
+        let mut put = |v: u32| out.extend_from_slice(&v.to_le_bytes());
+        for b in [Some(main), overlay] {
+            for y in 0..RH {
+                for x in 0..RW {
+                    put(b.map_or(0, |b| rss.mem.get(&b, x, y) as u32));
+                }
+            }
+        }
+        for v in f.dcb.cmap[0].pal.iter() {
+            put(*v);
+        }
+        for d in 0..32 {
+            put(f.dcb.xmap.main_mode(d));
+        }
+        for v in f.dcb.vc3.regs.iter().chain(f.dcb.vc3.sram.iter()) {
+            put(*v as u32);
+        }
+        // The rest: pixel memory with the bits hashed above cleared.
+        let mut rest = plain::boxed_zeroed::<pixmem::PixMem>();
+        rest.words.copy_from_slice(&rss.mem.words);
+        for b in [Some(main), overlay].into_iter().flatten() {
+            for y in 0..RH {
+                for x in 0..RW {
+                    rest.put(&b, x, y, 0);
+                }
+            }
+        }
+        if rest.words.iter().any(|&w| w != 0) {
+            let mut h = blake3::Hasher::new();
+            for w in rest.words.iter() {
+                h.update(&w.to_le_bytes());
+            }
+            out.extend_from_slice(h.finalize().as_bytes());
+        }
+        out
+    }
+
+    /// Hash of `state_bytes`, waiting for the board to be idle. Call with
+    /// `submit` held.
+    fn idle_state_hash(&self) -> [u8; 32] {
+        self.wait_idle();
+        *blake3::hash(&self.state_bytes()).as_bytes()
+    }
+
+    /// Start a recording at `path` (checkpointing the state it starts from),
+    /// or stop the running one with `None` (checkpointing where it ends).
+    fn set_recording(&self, path: Option<&str>) -> std::io::Result<()> {
+        let mut sub = self.submit.lock();
+        if let Some(rec) = sub.take() {
+            *self.mem_rec.lock() = None;
+            let h = self.idle_state_hash();
+            let mut r = rec.lock();
+            r.put(record::Rec::Hash(h));
+            r.flush();
+        }
+        if let Some(p) = path {
+            let rec = record::Recorder::create(p)?;
+            rec.lock().put(record::Rec::Hash(self.idle_state_hash()));
+            *self.mem_rec.lock() = Some(rec.clone());
+            *sub = Some(rec);
+        }
+        Ok(())
+    }
+
+    /// Checkpoint the running recording now. Returns the hash and record
+    /// count, or None when not recording.
+    fn record_mark(&self) -> Option<([u8; 32], u64)> {
+        let sub = self.submit.lock();
+        let rec = sub.as_ref()?;
+        let h = self.idle_state_hash();
+        let mut r = rec.lock();
+        r.put(record::Rec::Hash(h));
+        r.flush();
+        Some((h, r.records))
+    }
+
+    /// Composite a host GL frame at a screen position (see `disp::composite`).
     pub fn composite(&self, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
-        let ok = self.board.lock().composite(x, y, bgra, stride, w, h);
+        let sub = self.submit.lock();
+        self.wait_idle();
+        // SAFETY: idle with `submit` held.
+        let rss = unsafe { &mut *self.rss.get() };
+        let ok = disp::composite(rss, &self.front().dcb, x, y, bgra, stride, w, h);
         if ok {
+            if let Some(rec) = sub.as_ref() {
+                rec.lock().put(record::Rec::Composite);
+            }
             self.dirty.store(true, Ordering::Release);
         }
         ok
     }
 
+
+    /// Framebuffer pixel (its 24 colour planes) at display (`x`, `y`), y = 0
+    /// the top row, once the board has run everything queued (tests).
+    #[cfg(test)]
+    pub(crate) fn fb_pixel(&self, x: usize, y: usize) -> u32 {
+        let _sub = self.submit.lock();
+        self.wait_idle();
+        // SAFETY: idle with `submit` held.
+        let dcb = &self.front().dcb;
+        let h = frame::display_size(dcb).1;
+        let rss = unsafe { &*self.rss.get() };
+        let (main, _) = frame::scanout_buffers(rss, dcb);
+        // The colour planes (alpha, in the top byte, is not displayed).
+        rss.mem.get(&main, x as u32, (h - 1 - y) as u32) as u32 & 0xFF_FFFF
+    }
+
+    /// The VC3's display size, from its timing tables and its DID table.
+    #[cfg(test)]
+    pub(crate) fn vc3_sizes(&self) -> (Option<(usize, usize)>, usize) {
+        let f = self.front();
+        (f.dcb.vc3.timing_size(), f.dcb.vc3.did_lines())
+    }
+
+    /// Hash of the state a replay must reproduce (`state_bytes`).
+    #[cfg(test)]
+    pub(crate) fn state_hash(&self) -> [u8; 32] {
+        let _sub = self.submit.lock();
+        self.idle_state_hash()
+    }
+
+    /// A frame snapshot of what is displayed now (monitor, screenshots).
+    fn snapshot_frame(&self) -> Box<frame::Frame> {
+        let mut f = plain::boxed_zeroed::<frame::Frame>();
+        // SAFETY: a read-only view; tearing tolerated.
+        let rss = unsafe { &*self.rss.get() };
+        f.snapshot(rss, &self.front().dcb);
+        f
+    }
+
+    /// Save the displayed frame as a PNG.
+    pub(crate) fn save_shot(&self, path: &str) -> Result<(), String> {
+        let mut out = vec![0u32; frame::OUT_STRIDE * frame::H];
+        let f = self.snapshot_frame();
+        f.compose(&mut out);
+        disp::save_png(path, &out, f.width, f.height)
+    }
+
     /// Give the board its path to system memory, for DMA.
     pub fn set_phys(&self, mem: Arc<dyn BusDevice>) {
-        self.board.lock().mem = Some(mem.clone());
-        *self.sys_mem.lock() = Some(mem);
+        *self.mem.lock() = Some(mem);
     }
 
     /// Drive one of the board's interrupt lines (graphics slot wiring).
@@ -957,146 +652,318 @@ impl Mgras {
         (off < MAP_SIZE).then_some(off)
     }
 
-    /// Bring the general interrupt line in line with the board's flags.
-    fn update_general(&self, level: bool) {
+    /// Flags as the host reads them.
+    fn all_flags(&self, f: &Front) -> u32 {
+        self.flags.load(Ordering::Acquire) | f.derived_flags()
+    }
+
+    /// Bring the general interrupt line (GIO line 1) in line with the flags:
+    /// asserted while some enabled flag is set, a level held until the
+    /// handler clears the flag or its enable. Decided and driven under the
+    /// front lock, so two threads cannot leave a stale level behind.
+    fn refresh_general(&self) {
+        let f = self.front();
+        let level = self.all_flags(&f) & f.hq.interrupt_enable & host::INTR_CAUSES != 0;
         if self.general.swap(level, Ordering::AcqRel) != level {
             self.set_line(Line::General, level);
         }
     }
 
-    fn do_read(&self, addr: u32, bits: u32) -> u64 {
-        let v = match self.offset(addr) {
-            Some(off) => {
-                let mut b = self.board.lock();
-                let v = b.read(off, bits);
-                let irq = b.general_irq();
-                drop(b);
-                self.update_general(irq);
-                v
-            }
-            None => 0,
-        };
-        trace::note('R', bits, addr, v);
-        v
+    /// Reads whose answer depends on what the engines have done wait for
+    /// them (bus busy) until the board is idle.
+    fn read_needs_idle(off: u32) -> bool {
+        matches!(off,
+            host::STATUS | host::FIFOSTATUS | host::GIOSTATUS | host::DMABUSY
+            | host::GE_READBACK_HI | host::GE_READBACK_LO
+            | host::RASTER_IF_CONTEXT..=0x50228 | host::DMA_CONTEXT..=0x504FF
+            | host::RASTER..=0x7FFFF)
     }
 
-    fn do_write(&self, addr: u32, bits: u32, val: u64) {
-        trace::note('W', bits, addr, val);
-        if let Some(off) = self.offset(addr) {
-            let mut b = self.board.lock();
-            let changed = b.write(off, bits, val);
-            let irq = b.general_irq();
-            drop(b);
+    /// One read, with `submit` held. None means "busy, retry".
+    fn read_locked(&self, off: u32, bits: u32) -> Option<u64> {
+        if Self::read_needs_idle(off) && !self.idle() {
+            return None;
+        }
+        // SAFETY (for both engines below): idle with `submit` held.
+        let v = match off {
+            host::STATUS => Front::status() as u64,
+            host::FIFOSTATUS | host::GIOSTATUS | host::DMABUSY => 0,
+            host::SET_FLAGS | host::CLEAR_FLAGS | host::SET_FLAGS_PRIVILEGED | host::CLEAR_FLAGS_PRIVILEGED => {
+                self.all_flags(&self.front()) as u64
+            }
+            host::RASTER_IF_CONTEXT..=0x50228 => {
+                unsafe { &*self.eng.get() }.raster_if_regs[((off - host::RASTER_IF_CONTEXT) / 4) as usize] as u64
+            }
+            host::DMA_CONTEXT..=0x504FF => {
+                unsafe { &*self.eng.get() }.dma_regs[((off - host::DMA_CONTEXT) / 4) as usize] as u64
+            }
+            host::PIO_READ_HI => {
+                // Taking the high half moves the stream on; the RSS does
+                // that, in order (the FIFO is empty, so this fits).
+                let v = unsafe { &*self.rss.get() }.pio_peek_hi();
+                self.hq_fifo.push(tag::PIO_ADVANCE, 0);
+                Self::wake(&self.hq_thread);
+                v as u64
+            }
+            host::PIO_READ_LO => unsafe { &*self.rss.get() }.pio_read_lo() as u64,
+            // A state readback's answer, once the HQ has given one; before
+            // that, the diagnostic port's.
+            host::GE_READBACK_HI | host::GE_READBACK_LO => match unsafe { &*self.eng.get() }.ge_return {
+                Some(r) => r[(off == host::GE_READBACK_LO) as usize] as u64,
+                None => self.front().read(off, bits),
+            },
+            host::RASTER..=0x7FFFF => {
+                let rss = unsafe { &*self.rss.get() };
+                let r = (off & 0xFFC) >> 2;
+                if bits == 64 {
+                    ((rss.read(r) as u64) << 32) | rss.read(r + 1) as u64
+                } else {
+                    rss.read(r) as u64
+                }
+            }
+            _ => self.front().read(off, bits),
+        };
+        Some(v)
+    }
+
+    /// One write, with `submit` held. False means "busy, retry".
+    fn write_locked(&self, off: u32, bits: u32, val: u64) -> bool {
+        let (hi, lo) = ((val >> 32) as u32, val as u32);
+        match off {
+            host::CFIFO | 0x70084 | host::CFIFO_GL | host::CFIFO_PRIVILEGED | 0x50084 => {
+                let port = if off >= host::STATUS { tag::PORT_USER } else { tag::PORT_PRIVILEGED };
+                let ok = if bits == 64 {
+                    // Both words or neither: a retried store must not push
+                    // the first twice.
+                    self.hq_fifo.try_push2(port, hi as u64, port, lo as u64)
+                } else {
+                    self.hq_fifo.try_push(port, lo as u64)
+                };
+                if !ok {
+                    return false;
+                }
+                Self::wake(&self.hq_thread);
+            }
+            host::RASTER..=0x7FFFF => {
+                let r = (off & 0xFFC) >> 2;
+                // Registers at 0x7C000 + 4r; the same register at +0x1000
+                // also executes the primitive in the IR after the write.
+                let exec = off & 0x1000 != 0;
+                let ok = if bits == 64 {
+                    self.hq_fifo.try_push2(tag::RSS | rss_entry(r, false), hi as u64, tag::RSS | rss_entry(r + 1, exec), lo as u64)
+                } else {
+                    self.hq_fifo.try_push(tag::RSS | rss_entry(r, exec), lo as u64)
+                };
+                if !ok {
+                    return false;
+                }
+                Self::wake(&self.hq_thread);
+            }
+            host::CONTEXT_SWITCH => {
+                // The save phase completes at once; the incoming context
+                // follows through the FIFO, after this marker.
+                if !self.hq_fifo.try_push(tag::CONTEXT_SWITCH, 0) {
+                    return false;
+                }
+                self.flags.fetch_or(host::FLAG_CONTEXT_SAVED, Ordering::AcqRel);
+                Self::wake(&self.hq_thread);
+            }
+            host::SET_FLAGS | host::SET_FLAGS_PRIVILEGED => {
+                self.flags.fetch_or(lo, Ordering::AcqRel);
+            }
+            host::CLEAR_FLAGS | host::CLEAR_FLAGS_PRIVILEGED => {
+                self.flags.fetch_and(!lo, Ordering::AcqRel);
+            }
+            0x80000..=0xFFFFF => self.note(format!("fast-path command window write at {off:#x}")),
+            _ => {
+                if self.front().write(off, bits, val, &self.flags) {
+                    self.dirty.store(true, Ordering::Release);
+                }
+            }
+        }
+        true
+    }
+
+    /// Writes that go through `hq_fifo` (traced as HQ/RSS lines instead).
+    fn is_fifo_write(off: u32) -> bool {
+        matches!(off, host::CFIFO | 0x70084 | host::CFIFO_GL | host::CFIFO_PRIVILEGED | 0x50084 | host::RASTER..=0x7FFFF)
+    }
+
+    fn do_read(&self, addr: u32, bits: u32) -> Option<u64> {
+        let Some(off) = self.offset(addr) else { return Some(0) };
+        let sub = self.submit.lock();
+        let v = self.read_locked(off, bits)?;
+        if let Some(rec) = sub.as_ref() {
+            rec.lock().put(record::Rec::Read { bits: bits as u8, off, val: v });
+        }
+        drop(sub);
+        if self.tracing(debug::TRACE_CPU) {
+            self.trace_cpu(false, off, v);
+        }
+        self.refresh_general();
+        Some(v)
+    }
+
+    fn do_write(&self, addr: u32, bits: u32, val: u64) -> u32 {
+        let Some(off) = self.offset(addr) else { return BUS_OK };
+        let sub = self.submit.lock();
+        if !self.write_locked(off, bits, val) {
+            return BUS_BUSY;
+        }
+        if let Some(rec) = sub.as_ref() {
+            let due = {
+                let mut r = rec.lock();
+                r.put(record::Rec::Write { bits: bits as u8, off, val });
+                r.checkpoint_due()
+            };
+            if due {
+                let h = self.idle_state_hash();
+                rec.lock().put(record::Rec::Hash(h));
+            }
+        }
+        drop(sub);
+        if self.tracing(debug::TRACE_CPU) && !Self::is_fifo_write(off) {
+            self.trace_cpu(true, off, val);
+        }
+        self.refresh_general();
+        BUS_OK
+    }
+
+    // ── engine threads ───────────────────────────────────────────────────────
+
+    fn hq_loop(&self) {
+        *self.hq_thread.lock() = Some(thread::current());
+        let mut sink = HqSink(self);
+        let backoff = crossbeam_utils::Backoff::new();
+        loop {
+            let Some((t, val)) = self.hq_fifo.peek() else {
+                self.hq_fifo.flush_head();
+                self.hq_busy.store(false, Ordering::Release);
+                if backoff.is_completed() {
+                    thread::park_timeout(std::time::Duration::from_millis(2));
+                } else {
+                    backoff.snooze();
+                }
+                continue;
+            };
+            self.hq_busy.store(true, Ordering::Release);
+            // SAFETY: the HQ3 thread owns the engine.
+            let eng = unsafe { &mut *self.eng.get() };
+            match t {
+                tag::EXIT => break,
+                tag::PORT_USER | tag::PORT_PRIVILEGED => eng.push(t as usize, val as u32, &mut sink),
+                tag::CONTEXT_SWITCH => eng.begin_context_switch(&mut sink),
+                tag::PIO_ADVANCE => self.rss_push(t, 0),
+                t if t & !0x7FF == tag::RSS => self.rss_push(t & 0x7FF | RSS_SRC_CPU, val),
+                _ => {}
+            }
+            self.hq_fifo.consume();
+            backoff.reset();
+        }
+        self.hq_fifo.consume();
+        self.hq_fifo.flush_head();
+        self.hq_busy.store(false, Ordering::Release);
+    }
+
+    fn rss_loop(&self) {
+        *self.rss_thread.lock() = Some(thread::current());
+        let backoff = crossbeam_utils::Backoff::new();
+        let mut stale_seen = 0u32;
+        let mut payload: Vec<u64> = Vec::new();
+        loop {
+            let Some((t, val)) = self.rss_fifo.peek() else {
+                self.rss_fifo.flush_head();
+                self.rss_busy.store(false, Ordering::Release);
+                if backoff.is_completed() {
+                    thread::park_timeout(std::time::Duration::from_millis(2));
+                } else {
+                    backoff.snooze();
+                }
+                continue;
+            };
+            self.rss_busy.store(true, Ordering::Release);
+            // SAFETY: the RSS thread owns the raster subsystem.
+            let rss = unsafe { &mut *self.rss.get() };
+            let changed = match t {
+                tag::EXIT => break,
+                t if t < 0x1000 => rss.write((t & 0x7FF) >> 1, val as u32, t & 1 != 0),
+                tag::PIO_ADVANCE => {
+                    rss.pio_read_hi();
+                    false
+                }
+                tag::GL_ENTER => {
+                    rss.gl_enter();
+                    false
+                }
+                tag::GL_LEAVE => {
+                    rss.gl_leave();
+                    false
+                }
+                tag::DMA_LINE => {
+                    let (line, len) = (val as u32, (val >> 32) as usize);
+                    payload.resize(len.div_ceil(8), 0);
+                    let n = payload.len();
+                    self.rss_fifo.drain_payload(n, &mut payload[..]);
+                    let bytes: Vec<u8> = payload.iter().flat_map(|w| w.to_be_bytes()).take(len).collect();
+                    rss.dma_write_line(line, &bytes);
+                    true
+                }
+                _ => false,
+            };
             if changed {
                 self.dirty.store(true, Ordering::Release);
             }
-            self.update_general(irq);
+            if self.tracing(debug::TRACE_RSS) {
+                self.trace_rss(t, val, rss, changed);
+            }
+            if rss.te.stale_events != stale_seen {
+                stale_seen = rss.te.stale_events;
+                if self.tracing(debug::TRACE_TEX) {
+                    let [want, have] = rss.te.stale_last;
+                    self.trace_hq(&format!("TEX stale sample #{stale_seen}: want {want:#x}, page holds {have:#x}"));
+                }
+            }
+            self.rss_fifo.consume();
+            backoff.reset();
         }
+        self.rss_fifo.consume();
+        self.rss_fifo.flush_head();
+        self.rss_busy.store(false, Ordering::Release);
     }
 
-    fn refresh_loop(self: &Arc<Self>) {
-        let frame = std::time::Duration::from_micros(16_667);
-        {
-            let mut screen = self.screen.lock();
-            screen.width = raster::WIDTH;
-            screen.height = raster::HEIGHT;
-            screen.fb_rgb.fill(0xFF00_0000);
-            screen.prebuilt = true;
-        }
-        let mut overlay = crate::debug_overlay::DebugOverlay::new();
-        let mut status_bar = crate::disp::StatusBar::new();
-        let mut sbtex = crate::disp::StatusBarTexture::new();
-        let mut sized = false;
-        let mut last_pending = 0u64;
-        let mut idle_frames = 0u32;
-        const PERSISTENT: u64 = crate::dev::ng1::rex3::Rex3::HB_LED_RED | crate::dev::ng1::rex3::Rex3::HB_LED_GREEN;
-
-        while self.running.load(Ordering::Relaxed) {
-            let start = std::time::Instant::now();
-            let stats = crate::disp::BarStats {
-                now: start,
-                hb: self.heartbeat.fetch_and(PERSISTENT, Ordering::Relaxed),
-                cycles: self.cycles.lock().get(),
-                fasttick: self.fasttick.load(Ordering::Relaxed),
-                decoded_delta: 0,
-                l1i_hits: 0,
-                l1i_fetches: 0,
-                uncached: 0,
-                count_hz: 0,
-                gfifo_pending: 0,
-            };
-            let retrace = {
-                let mut b = self.board.lock();
-                if b.raster.flush_if_stale(&mut last_pending) {
-                    self.dirty.store(true, Ordering::Release);
-                }
-                b.retrace_enabled()
-            };
-            // Vertical retrace: a pulse per frame. The handler acknowledges
-            // nothing on the board, so the line must drop again by itself.
-            if retrace {
-                self.set_line(Line::Retrace, true);
-                std::thread::sleep(std::time::Duration::from_micros(500));
-                self.set_line(Line::Retrace, false);
-            }
-            let dirty = self.dirty.swap(false, Ordering::AcqRel);
-            let shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
-            idle_frames += 1;
-            if dirty || shot || idle_frames >= 6 {
-                idle_frames = 0;
-                let mut screen = self.screen.lock();
-                if dirty || shot {
-                    let screen = &mut *screen;
-                    self.board.lock().scanout(&mut screen.fb_rgb);
-                    // The frame is already final RGB, so keep `rgba` (what CI
-                    // screenshots read) current without a renderer readback,
-                    // as GR2 does. This also makes screenshots work headless.
-                    for y in 0..raster::HEIGHT {
-                        let row = y * 2048;
-                        screen.rgba[row..row + raster::WIDTH].copy_from_slice(&screen.fb_rgb[row..row + raster::WIDTH]);
-                    }
-                    screen.status_bar_only = false;
-                } else {
-                    screen.status_bar_only = true;
-                }
-                if let Some(r) = self.renderer.lock().as_mut() {
-                    if !sized {
-                        r.resize(raster::WIDTH, raster::HEIGHT);
-                        sized = true;
-                    }
-                    r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, shot, None, None);
-                }
-            }
-            if let Some(rest) = frame.checked_sub(start.elapsed()) {
-                std::thread::sleep(rest);
-            }
-        }
-        // The renderer's GL state belongs to this thread (its context is
-        // current here), so it is torn down here and nowhere else.
-        if let Some(r) = self.renderer.lock().as_mut() {
-            r.stop();
-        }
-    }
-
-    /// Start the display refresh thread.
-    pub fn start_display(self: &Arc<Self>) {
-        if self.running.swap(true, Ordering::AcqRel) {
+    /// Start the HQ3 and RSS threads.
+    pub fn start_engines(self: &Arc<Self>) {
+        if self.engines.swap(true, Ordering::AcqRel) {
             return;
         }
+        let mut threads = self.threads.lock();
         let me = Arc::clone(self);
-        *self.refresh.lock() = Some(
-            std::thread::Builder::new()
-                .name("MGRAS-Refresh".into())
-                .spawn(move || me.refresh_loop())
-                .expect("spawn MGRAS refresh thread"),
-        );
+        threads.push(thread::Builder::new().name("MGRAS-HQ3".into()).spawn(move || me.hq_loop()).expect("spawn MGRAS HQ3 thread"));
+        let me = Arc::clone(self);
+        threads.push(thread::Builder::new().name("MGRAS-RSS".into()).spawn(move || me.rss_loop()).expect("spawn MGRAS RSS thread"));
     }
 
-    pub fn stop_display(&self) {
-        self.running.store(false, Ordering::Release);
-        if let Some(h) = self.refresh.lock().take() {
+    /// Stop the engine threads once they have run everything queued.
+    pub fn stop_engines(&self) {
+        if !self.engines.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let _sub = self.submit.lock();
+            self.hq_fifo.push(tag::EXIT, 0);
+            Self::wake(&self.hq_thread);
+        }
+        let mut threads = self.threads.lock();
+        if let Some(h) = (!threads.is_empty()).then(|| threads.remove(0)) {
             let _ = h.join();
         }
+        self.rss_fifo.push(tag::EXIT, 0);
+        Self::wake(&self.rss_thread);
+        for h in threads.drain(..) {
+            let _ = h.join();
+        }
+        self.hq_fifo.reset();
+        self.rss_fifo.reset();
     }
 }
 
@@ -1115,97 +982,19 @@ impl Device for Mgras {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("mgras".into(), "IMPACT graphics: mgras (board state) | mgras shot <file.png> (save the displayed frame) | mgras dump <file> (raw display state) | mgras trace <file>|off".into())]
+        vec![
+            ("mgras".into(), "IMPACT graphics: status|hq|gl|ge|ucode|vc3|xmap|cmap|dac|pix|stats|fbdump|shot|dump|trace|rec (mgras help)".into()),
+            ("rss".into(), "IMPACT raster subsystem: regs|pix".into()),
+        ]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn IoWrite + Send>) -> Result<(), String> {
-        if cmd != "mgras" {
-            return Err(format!("unknown command: {cmd}"));
-        }
-        if let ["trace", what] = args {
-            let r = if *what == "off" { trace::set(None) } else { trace::set(Some(what)) };
-            r.map_err(|e| format!("mgras trace: {e}"))?;
-            return writeln!(w, "trace {what}").map_err(|e| e.to_string());
-        }
-        if let ["dump", path] = args {
-            let b = self.board.lock();
-            dump_state(path, &b).map_err(|e| format!("mgras dump: {e}"))?;
-            return writeln!(w, "dumped {path}").map_err(|e| e.to_string());
-        }
-        if let ["shot", path] = args {
-            let mut frame = vec![0u32; 2048 * raster::HEIGHT];
-            self.board.lock().scanout(&mut frame);
-            save_png(path, &frame).map_err(|e| format!("mgras shot: {e}"))?;
-            return writeln!(w, "saved {path}").map_err(|e| e.to_string());
-        }
-        let b = self.board.lock();
-        let e = |r: std::io::Result<()>| r.map_err(|e| e.to_string());
-        e(writeln!(w, "IMPACT {:?} at {:#010x}", self.kind, MGRAS_SLOT_GFX_BASE))?;
-        e(writeln!(w, "  flags {:#010x}  DAC pixmask {:#04x}  XMAP DID0 mode {:#x}",
-            b.flags, b.dcb.dac.pixmask(), b.dcb.xmap.main_mode(0)))?;
-        e(writeln!(w, "  fill modes seen: {:x?}", b.raster.fillmodes_seen))?;
-        let mut hist: HashMap<u32, usize> = HashMap::new();
-        for v in &b.raster.fb {
-            *hist.entry(*v).or_default() += 1;
-        }
-        let mut top: Vec<_> = hist.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
-        e(writeln!(w, "  framebuffer values (value, pixels): {:x?}", &top[..top.len().min(12)]))?;
-        let pal = &b.dcb.cmap[0].pal;
-        let blocks: Vec<usize> = (0..pal.len() / 256)
-            .filter(|k| pal[k * 256..(k + 1) * 256].iter().any(|c| *c != 0))
-            .collect();
-        e(writeln!(w, "  colormap blocks in use (of {}): {:?}", pal.len() / 256, blocks))?;
-        for k in blocks.iter().take(4) {
-            e(writeln!(w, "    block {k}: {:06x?}", &pal[k * 256..k * 256 + 8]))?;
-        }
-        let modes: Vec<(u32, u32)> = (0..32).map(|d| (d, b.dcb.xmap.main_mode(d))).filter(|m| m.1 != 0).collect();
-        e(writeln!(w, "  XMAP main modes (did, mode): {:x?}", modes))?;
-        let mut runs = Vec::new();
-        for y in [0usize, 100, 400, 700, 1023] {
-            b.dcb.vc3.main_did_runs(y, &mut runs);
-            e(writeln!(w, "  scanline {y} DID runs: {:?}", runs))?;
-        }
-        for u in &b.unhandled {
-            e(writeln!(w, "  not modelled: {u}"))?;
-        }
-        Ok(())
-    }
-}
-
-/// Save the display state for offline study: little-endian u32 sections, in
-/// order: framebuffer (`WIDTH * HEIGHT`, row 0 at the bottom), overlay (same
-/// size), colormap 0, the 32 main XMAP modes, then the video timing chip's
-/// registers and SRAM as u32s.
-fn dump_state(path: &str, b: &Board) -> std::io::Result<()> {
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut put = |v: u32| f.write_all(&v.to_le_bytes());
-    for v in b.raster.fb.iter().chain(b.raster.overlay.iter()).chain(b.dcb.cmap[0].pal.iter()) {
-        put(*v)?;
-    }
-    for d in 0..32 {
-        put(b.dcb.xmap.main_mode(d))?;
-    }
-    for v in b.dcb.vc3.regs.iter().chain(b.dcb.vc3.sram.iter()) {
-        put(*v as u32)?;
-    }
-    Ok(())
-}
-
-/// Write a scanned-out frame (`0xFF_BB_GG_RR`, stride 2048) as a PNG.
-fn save_png(path: &str, frame: &[u32]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), raster::WIDTH as u32, raster::HEIGHT as u32);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut out = enc.write_header().map_err(|e| e.to_string())?;
-    let mut rows = Vec::with_capacity(raster::WIDTH * raster::HEIGHT * 3);
-    for y in 0..raster::HEIGHT {
-        for px in &frame[y * 2048..y * 2048 + raster::WIDTH] {
-            rows.extend_from_slice(&[*px as u8, (px >> 8) as u8, (px >> 16) as u8]);
+        match cmd {
+            "mgras" => self.cmd_mgras(args, &mut *w),
+            "rss" => self.cmd_rss(args, &mut *w),
+            _ => Err(format!("unknown command: {cmd}")),
         }
     }
-    out.write_image_data(&rows).map_err(|e| e.to_string())
 }
 
 impl Saveable for Mgras {
@@ -1219,19 +1008,38 @@ impl Saveable for Mgras {
     }
 }
 
+fn read_status(v: Option<u64>) -> (u32, u64) {
+    match v {
+        Some(v) => (BUS_OK, v),
+        None => (BUS_BUSY, 0),
+    }
+}
+
 impl BusDevice for Mgras {
-    fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.do_read(addr, 32) as u32) }
-    fn write32(&self, addr: u32, val: u32) -> u32 { self.do_write(addr, 32, val as u64); BUS_OK }
-    fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(self.do_read(addr, 8) as u8) }
-    fn write8(&self, addr: u32, val: u8) -> u32 { self.do_write(addr, 8, val as u64); BUS_OK }
-    fn read16(&self, addr: u32) -> BusRead16 { BusRead16::ok(self.do_read(addr, 16) as u16) }
-    fn write16(&self, addr: u32, val: u16) -> u32 { self.do_write(addr, 16, val as u64); BUS_OK }
-    fn read64(&self, addr: u32) -> BusRead64 { BusRead64::ok(self.do_read(addr, 64)) }
-    fn write64(&self, addr: u32, val: u64) -> u32 { self.do_write(addr, 64, val); BUS_OK }
+    fn read32(&self, addr: u32) -> BusRead32 {
+        let (status, data) = read_status(self.do_read(addr, 32));
+        BusRead32 { status, data: data as u32 }
+    }
+    fn write32(&self, addr: u32, val: u32) -> u32 { self.do_write(addr, 32, val as u64) }
+    fn read8(&self, addr: u32) -> BusRead8 {
+        let (status, data) = read_status(self.do_read(addr, 8));
+        BusRead8 { status, data: data as u8 }
+    }
+    fn write8(&self, addr: u32, val: u8) -> u32 { self.do_write(addr, 8, val as u64) }
+    fn read16(&self, addr: u32) -> BusRead16 {
+        let (status, data) = read_status(self.do_read(addr, 16));
+        BusRead16 { status, data: data as u16 }
+    }
+    fn write16(&self, addr: u32, val: u16) -> u32 { self.do_write(addr, 16, val as u64) }
+    fn read64(&self, addr: u32) -> BusRead64 {
+        let (status, data) = read_status(self.do_read(addr, 64));
+        BusRead64 { status, data }
+    }
+    fn write64(&self, addr: u32, val: u64) -> u32 { self.do_write(addr, 64, val) }
 }
 
 /// The board as the display host GL presents into: frames land in the
-/// framebuffer under their window (see `Board::composite`). It cannot know the
+/// framebuffer under their window (see `disp::composite`). It cannot know the
 /// guest X server's window ids, so only frames that say where their window is
 /// are taken; the rest go back to the program to put up itself.
 #[cfg(feature = "hostgl")]

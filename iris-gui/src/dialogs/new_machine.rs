@@ -336,10 +336,9 @@ impl NewMachineDialog {
                         };
                         // The IP28 IRIX kernel carries no Newport driver at all —
                         // default straight to IMPACT so a fresh machine has a working
-                        // display instead of a blank Newport head. See config_ui.rs's
-                        // GfxChoice picker, which the user can still change afterwards.
+                        // display instead of a blank Newport head.
                         if self.profile == MachineProfile::Indigo2Ip28 {
-                            cfg.impact.gfx = iris::config::ImpactSlot::Solid;
+                            cfg.graphics.board = iris::config::GraphicsBoard::SolidImpact;
                         }
                         // SCSI defaults: drop the built-in entries unless the
                         // user explicitly opted in.

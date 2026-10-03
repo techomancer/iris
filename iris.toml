@@ -219,6 +219,7 @@ mode           = "nat"
 
 # Graphics: board "newport" (default), or GR2 "xz" (Indy or Indigo2) /
 # "extreme" (Indigo2) - GR2 is in bring-up (PROM + single-user textport);
+# "solidimpact", "highimpact", "maximpact"
 # heads 1 or 2; resolution "guest" (IRIX/PROM programs VC2), "1024x768",
 # "1280x960" or "1280x1024".
 #[graphics]

@@ -96,7 +96,7 @@ impl Renderer for CaptureRenderer {
             return;
         }
 
-        let needed = 2048 * 1024;
+        let needed = iris::disp::FB_STRIDE * iris::disp::FB_MAX_H;
         if self.last_pixels.len() < needed {
             self.last_pixels.resize(needed, 0);
         }
@@ -160,7 +160,7 @@ impl Renderer for GlCaptureRenderer {
             return;
         }
 
-        let needed = 2048 * 1024;
+        let needed = iris::disp::FB_STRIDE * iris::disp::FB_MAX_H;
         if self.last_pixels.len() < needed {
             self.last_pixels.resize(needed, 0);
         }

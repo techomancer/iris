@@ -76,7 +76,7 @@ Shared GIO interrupt lines (FIFO full, graphics, retrace) are latched in the IOC
 
 ## Not implemented
 
-- IMPACT / MGRAS preview stub (`src/dev/mgras.rs`, `[impact]` config) — see `docs/impact-mgras-research.md`
+- IMPACT / MGRAS preview stub (`src/dev/mgras.rs`, `[graphics]` board config) — see `docs/impact-mgras-research.md`
 - Full EXTIO bus-error and EISA interrupt paths
 
 See also [`docs/interrupt_map.md`](interrupt_map.md) and [`rules/gui/machine-profile-vs-guest-ip22.md`](../rules/gui/machine-profile-vs-guest-ip22.md).

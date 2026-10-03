@@ -2,8 +2,8 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, ImpactSection,
-    ImpactSlot, MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
+    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard,
+    MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
 use iris::net::nfsudp::NfsVersion;
@@ -223,14 +223,6 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if !cfg.graphics.board.supports(cfg.machine.profile) {
         cfg.graphics.board = GraphicsBoard::Xz;
     }
-    // [impact] (IMPACT/MGRAS graphics) is Indigo2-only, either profile;
-    // moving to Indy falls back to Newport rather than leaving a config
-    // `validate()` would reject at Start.
-    if cfg.impact.any_enabled()
-        && !matches!(cfg.machine.profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
-    {
-        cfg.impact = Default::default();
-    }
     // 256 MB banks are the IP28 MC's granule only; moving away from it would
     // leave a config `validate()` rejects at Start. Compared against the
     // profile *variant*, not `.ip28()` (which also requires the `ip28` build
@@ -364,7 +356,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     ui.separator();
 
     show_board_picker(ui, cfg, mem_ctx.running);
-    if cfg.graphics.board == GraphicsBoard::Newport && !cfg.impact.any_enabled() {
+    if cfg.graphics.board == GraphicsBoard::Newport {
         ui.horizontal(|ui| {
             ui.label("Newport heads");
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -520,84 +512,8 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
     );
 }
 
-/// The graphics board picker unifies two independent config fields
-/// (`graphics.board` and `[impact]`) into one dropdown — they claim the same
-/// GIO gfx slot and `validate()` refuses a config that sets both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GfxChoice {
-    Newport,
-    Xz,
-    Extreme,
-    ImpactSolid,
-    ImpactHigh,
-    ImpactMax,
-}
-
-impl GfxChoice {
-    const ALL: [Self; 6] = [
-        Self::Newport, Self::Xz, Self::Extreme,
-        Self::ImpactSolid, Self::ImpactHigh, Self::ImpactMax,
-    ];
-
-    fn from_cfg(cfg: &MachineConfig) -> Self {
-        match cfg.impact.gfx {
-            ImpactSlot::Solid => Self::ImpactSolid,
-            ImpactSlot::High => Self::ImpactHigh,
-            ImpactSlot::Max => Self::ImpactMax,
-            ImpactSlot::None => match cfg.graphics.board {
-                GraphicsBoard::Newport => Self::Newport,
-                GraphicsBoard::Xz => Self::Xz,
-                GraphicsBoard::Extreme => Self::Extreme,
-            },
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Newport => "Newport (XL)",
-            Self::Xz => "GR2 XZ",
-            Self::Extreme => "GR2 Extreme",
-            Self::ImpactSolid => "IMPACT Solid",
-            Self::ImpactHigh => "IMPACT High",
-            Self::ImpactMax => "IMPACT Maximum",
-        }
-    }
-
-    /// Whether `validate()` accepts this choice on `profile`.
-    fn supports(self, profile: MachineProfile) -> bool {
-        match self {
-            Self::Newport | Self::Xz => true,
-            Self::Extreme => profile == MachineProfile::Indigo2Ip22,
-            Self::ImpactSolid | Self::ImpactHigh | Self::ImpactMax => {
-                matches!(profile, MachineProfile::Indigo2Ip22 | MachineProfile::Indigo2Ip28)
-            }
-        }
-    }
-
-    fn is_impact(self) -> bool {
-        matches!(self, Self::ImpactSolid | Self::ImpactHigh | Self::ImpactMax)
-    }
-
-    fn apply(self, cfg: &mut MachineConfig) {
-        cfg.graphics.board = match self {
-            Self::Xz => GraphicsBoard::Xz,
-            Self::Extreme => GraphicsBoard::Extreme,
-            Self::Newport | Self::ImpactSolid | Self::ImpactHigh | Self::ImpactMax => GraphicsBoard::Newport,
-        };
-        cfg.impact = ImpactSection {
-            gfx: match self {
-                Self::ImpactSolid => ImpactSlot::Solid,
-                Self::ImpactHigh => ImpactSlot::High,
-                Self::ImpactMax => ImpactSlot::Max,
-                Self::Newport | Self::Xz | Self::Extreme => ImpactSlot::None,
-            },
-            ..Default::default()
-        };
-    }
-}
-
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let before = GfxChoice::from_cfg(cfg);
+    let before = cfg.graphics.board;
     let mut choice = before;
     ui.horizontal(|ui| {
         ui.label("Graphics board");
@@ -605,7 +521,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
             ComboBox::from_id_salt("graphics_board")
                 .selected_text(choice.label())
                 .show_ui(ui, |ui| {
-                    for c in GfxChoice::ALL {
+                    for c in GraphicsBoard::ALL {
                         ui.add_enabled_ui(c.supports(cfg.machine.profile), |ui| {
                             ui.selectable_value(&mut choice, c, c.label())
                                 .on_disabled_hover_text("Indigo2 only");
@@ -614,12 +530,11 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 });
         });
     });
-    // Every non-Newport choice is single-head with no VC2 presets, and GR2 /
-    // IMPACT share the gfx slot; clear those so the config still passes
-    // `validate()`.
+    // Every non-Newport choice is single-head with no VC2 presets;
+    // clear those so the config still passes `validate()`.
     if choice != before {
-        choice.apply(cfg);
-        if choice != GfxChoice::Newport {
+        cfg.graphics.board = choice;
+        if choice != GraphicsBoard::Newport {
             cfg.graphics.heads = 1;
             cfg.graphics.resolution = NewportResolution::Guest;
         }
@@ -631,7 +546,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
                 .small(),
         );
     }
-    if matches!(choice, GfxChoice::Xz | GfxChoice::Extreme) {
+    if matches!(choice, GraphicsBoard::Xz | GraphicsBoard::Extreme) {
         ui.label(
             RichText::new(
                 "GR2 is newer than Newport: PROM, textport, X and GL work, with gaps. \
@@ -661,7 +576,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless && !cfg.impact.any_enabled();
+    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless;
     ui.horizontal(|ui| {
         ui.label("Display resolution");
         if !newport {

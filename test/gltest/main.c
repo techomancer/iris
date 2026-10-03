@@ -331,6 +331,12 @@ int main(int argc, char *argv[]) {
     int repeat = 1;     /* --repeat: timed runs, reported as min/median/max */
     int depth = 0;      /* --depth: enable depth testing (Z fill rate) */
     int warmup = 0;     /* --warmup: untimed runs before timing starts */
+    int nodepth = 0;    /* --nodepth: interactive mode without the depth test */
+    int cull = 0;       /* --cull: back-face culling */
+    int frames = 0;     /* --frames N: exit after N frames (0 = run until Esc) */
+    int hold_ms = 0;    /* --hold MS: keep the last frame up this long before exiting */
+    float spin[3] = { 0.0f, 0.0f, 0.0f };   /* --spin: degrees per frame */
+    int frame = 0;
     int                     i;
     Display                 *dpy;
     Window                  root;
@@ -361,6 +367,20 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             warmup = atoi(argv[++i]);
             if (warmup < 0) warmup = 0;
+        } else if (strcmp(argv[i], "--object") == 0 && i + 1 < argc) {
+            currentObject = atoi(argv[++i]) & 3;
+        } else if (strcmp(argv[i], "--rot") == 0 && i + 1 < argc) {
+            sscanf(argv[++i], "%f,%f,%f", &xRot, &yRot, &zRot);
+        } else if (strcmp(argv[i], "--spin") == 0 && i + 1 < argc) {
+            sscanf(argv[++i], "%f,%f,%f", &spin[0], &spin[1], &spin[2]);
+        } else if (strcmp(argv[i], "--nodepth") == 0) {
+            nodepth = 1;
+        } else if (strcmp(argv[i], "--cull") == 0) {
+            cull = 1;
+        } else if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
+            hold_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            frames = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("usage: gltest [options]\n"
                    "  --bench N          fill-rate benchmark: N full-screen quads\n"
@@ -369,7 +389,14 @@ int main(int argc, char *argv[]) {
                    "  --repeat N         run the benchmark N times, report min/median/max\n"
                    "  --warmup N         N untimed runs first (lets the JIT compile)\n"
                    "  --depth            enable depth testing (Z-buffered fill rate)\n"
-                   "  (no option)        interactive spinning-cube mode\n"
+                   "  (no option)        interactive mode (depth test on if the visual has Z)\n"
+                   "  --object N         0 triangle, 1 rectangle, 2 cube, 3 octahedron\n"
+                   "  --rot X,Y,Z        initial rotation in degrees\n"
+                   "  --spin DX,DY,DZ    rotate by this much every frame (no keyboard needed)\n"
+                   "  --nodepth          interactive mode without the depth test\n"
+                   "  --cull             back-face culling (glCullFace(GL_BACK))\n"
+                   "  --frames N         exit after N frames\n"
+                   "  --hold MS          with --frames: keep the last frame up MS ms first\n"
                    "\n"
                    "--tribench is the GFIFO-sensitive one; --bench is rasterizer-bound.\n");
             exit(0);
@@ -435,7 +462,14 @@ int main(int argc, char *argv[]) {
     }
 
     // Init OpenGL state
-    glEnable(GL_DEPTH_TEST);
+    if (nodepth)
+        glDisable(GL_DEPTH_TEST);
+    else
+        glEnable(GL_DEPTH_TEST);
+    if (cull) {
+        glCullFace(GL_BACK);
+        glEnable(GL_CULL_FACE);
+    }
     glShadeModel(GL_SMOOTH);
     glClearColor(0.4f, 0.1f, 0.6f, 1.0f); // Purple background
 
@@ -533,7 +567,23 @@ int main(int argc, char *argv[]) {
         }
 
         glFlush();
-        
+        xRot += spin[0];
+        yRot += spin[1];
+        zRot += spin[2];
+        if (frames > 0 && ++frame >= frames) {
+            glFinish();
+            /* IRIX usleep() rejects a second or more. */
+            if (hold_ms >= 1000)
+                sleep(hold_ms / 1000);
+            if (hold_ms % 1000)
+                usleep((hold_ms % 1000) * 1000);
+            glXMakeCurrent(dpy, None, NULL);
+            glXDestroyContext(dpy, glc);
+            XDestroyWindow(dpy, win);
+            XCloseDisplay(dpy);
+            return 0;
+        }
+
         // Sleep for a short time to prevent maxing out the CPU (~60 FPS cap)
         usleep(16000); 
     }

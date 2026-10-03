@@ -319,7 +319,7 @@ pub struct Physical {
     pub rex3_head1: Option<Arc<Rex3>>,
     /// GR2 graphics (`graphics.board = xz | extreme`), see src/dev/gr2.
     pub gr2: Option<Arc<Gr2>>,
-    /// Indigo2 IMPACT/MGRAS preview stub (`[impact]` section).
+    /// IMPACT/MGRAS graphics (`graphics.board = solidimpact | highimpact | maximpact`).
     pub mgras: Option<Arc<Mgras>>,
     pub ultra64: Option<Arc<Ultra64>>,
     /// Bare-metal test device (`--test-device`), in GIO expansion slot 0.

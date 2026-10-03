@@ -11,7 +11,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::config::{
-        GraphicsBoard, ImpactSection, ImpactSlot, MachineConfig, MachineProfile,
+        Cli, GraphicsBoard, MachineConfig, MachineProfile,
     };
     use crate::dev::eeprom_93c56::Eeprom93c56;
     use crate::dev::ioc::{Ioc, IOC_BASE, IOC_SYS_ID, l1_regs, IOC_INT3_L1_STAT};
@@ -43,24 +43,54 @@ mod tests {
     fn impact_solid_on_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.impact = ImpactSection {
-            gfx: ImpactSlot::Solid,
-            exp0: ImpactSlot::None,
-            exp1: ImpactSlot::None,
-        };
+        cfg.graphics.board = GraphicsBoard::SolidImpact;
         cfg.validate().expect("Solid IMPACT on Indigo2");
     }
 
     #[test]
-    fn impact_on_indy_rejected() {
+    fn impact_on_indy_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.impact.gfx = ImpactSlot::Solid;
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.contains("indigo2_ip22"),
-            "expected Indigo2-only guard, got: {err}"
-        );
+        cfg.graphics.board = GraphicsBoard::SolidImpact;
+        cfg.validate().expect("Solid IMPACT on Indy");
+    }
+
+    #[test]
+    fn newport_on_ip28_validates() {
+        let mut cfg = minimal_cfg();
+        cfg.machine.profile = MachineProfile::Indigo2Ip28;
+        cfg.graphics.board = GraphicsBoard::Newport;
+        cfg.validate().expect("Newport on IP28");
+    }
+
+    #[test]
+    fn xz_on_ip28_validates() {
+        let mut cfg = minimal_cfg();
+        cfg.machine.profile = MachineProfile::Indigo2Ip28;
+        cfg.graphics.board = GraphicsBoard::Xz;
+        cfg.validate().expect("XZ on IP28");
+    }
+
+    #[test]
+    fn impact_keywords_parse() {
+        assert_eq!("solidimpact".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::SolidImpact);
+        assert_eq!("impact:solid".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::SolidImpact);
+        assert_eq!("highimpact".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::HighImpact);
+        assert_eq!("impact:high".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::HighImpact);
+        assert_eq!("maximpact".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::MaxImpact);
+        assert_eq!("impact:max".parse::<GraphicsBoard>().unwrap(), GraphicsBoard::MaxImpact);
+    }
+
+    #[test]
+    fn cli_graphics_keywords() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["iris", "--graphics", "impact:high"]).unwrap();
+        let cfg = cli.apply(MachineConfig::default());
+        assert_eq!(cfg.graphics.board, GraphicsBoard::HighImpact);
+
+        let cli = Cli::try_parse_from(["iris", "--board", "solidimpact"]).unwrap();
+        let cfg = cli.apply(MachineConfig::default());
+        assert_eq!(cfg.graphics.board, GraphicsBoard::SolidImpact);
     }
 
     #[test]
@@ -186,10 +216,9 @@ mod tests {
 
     #[test]
     fn mgras_answers_the_gio_id_probe() {
-        let cfg = ImpactSection { gfx: ImpactSlot::Solid, exp0: ImpactSlot::None, exp1: ImpactSlot::None };
         let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let ioc = crate::dev::ioc::Ioc::new(false);
-        let m = Mgras::new(&cfg, ioc, hb.clone(), hb);
+        let m = Mgras::new(GraphicsBoard::SolidImpact, ioc, hb.clone(), hb);
         assert_eq!(m.read32(MGRAS_SLOT_GFX_BASE).data, GIO_ID);
     }
 

@@ -7,6 +7,8 @@ use crate::dev::ng1::vc2::{
 
 const FB_W: i32 = 2048;
 const FB_H: i32 = 1024;
+/// Output texture rows (prebuilt frames can be taller than Newport's 1024).
+const OUT_H: i32 = crate::disp::FB_MAX_H as i32;
 const CURSOR_TEX_SIZE: i32 = 64;
 
 const VERT_SRC: &str = "
@@ -314,7 +316,7 @@ impl GlCompositor {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
             gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32,
-                FB_W, FB_H, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+                FB_W, OUT_H, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
             self.tex_out = Some(tex_out);
 
             let fbo = gl.create_framebuffer().unwrap();

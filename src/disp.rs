@@ -16,6 +16,13 @@ use crate::debug_overlay::OverlaySource;
 /// Cached device state for the display pipeline.
 /// The refresh loop copies hardware state into this struct once per frame,
 /// then builds a `CompositorSource` from it for the active compositor.
+/// Row stride of every display buffer, in pixels.
+pub const FB_STRIDE: usize = 2048;
+/// Rows of the display buffers and output textures: the tallest frame a
+/// board can hand over (Newport and GR2 use the first 1024; IMPACT's
+/// 1600x1200 modes need more).
+pub const FB_MAX_H: usize = 2048;
+
 pub struct Rex3Screen {
     pub width:  usize,
     pub height: usize,
@@ -71,10 +78,10 @@ impl Rex3Screen {
         Self {
             width:            0,
             height:           0,
-            fb_rgb:           vec![0u32; 2048 * 1024],
-            fb_aux:           vec![0u32; 2048 * 1024],
-            did:              vec![0u8; 2048 * 1024],
-            rgba:             vec![0u32; 2048 * 1024],
+            fb_rgb:           vec![0u32; FB_STRIDE * FB_MAX_H],
+            fb_aux:           vec![0u32; FB_STRIDE * FB_MAX_H],
+            did:              vec![0u8; FB_STRIDE * FB_MAX_H],
+            rgba:             vec![0u32; FB_STRIDE * FB_MAX_H],
             vc2_ram:          vec![0u16; 32768],
             vc2_regs:         [0u16; 32],
             cmap:             [0u32; 8192],
@@ -181,8 +188,8 @@ impl Rex3Screen {
         // ── 1. Copy device state snapshots ──────────────────────────────────────
         if copy_fb {
             diag.fetch_or(Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
-            self.fb_rgb.copy_from_slice(fb_rgb);
-            self.fb_aux.copy_from_slice(fb_aux);
+            self.fb_rgb[..fb_rgb.len()].copy_from_slice(fb_rgb);
+            self.fb_aux[..fb_aux.len()].copy_from_slice(fb_aux);
             self.fb_borrowed = false;
             diag.fetch_and(!Rex3::DIAG_LOOP_FB_COPY, Ordering::Relaxed);
         } else {

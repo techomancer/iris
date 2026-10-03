@@ -144,7 +144,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform (Indy / Indigo2 / Indigo2 IMPACT with `ip28`), CPU (R4400 / R5000 / R10000 with `ip28`), graphics board (Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Max — one dropdown covers both `[graphics]` and `[impact]`, since they share the GIO gfx slot), Newport heads, display resolution, PROM, NVRAM, ttyd1 serial log |
+| **General** | Platform (Indy / Indigo2 / Indigo2 IMPACT with `ip28`), CPU (R4400 / R5000 / R10000 with `ip28`), graphics board (Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Max via `[graphics] board`), Newport heads, display resolution, PROM, NVRAM, ttyd1 serial log |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, controller (Indigo2) |
 | **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
