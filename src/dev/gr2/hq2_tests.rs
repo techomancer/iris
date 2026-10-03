@@ -1192,6 +1192,8 @@ fn gl_context_switch_through_kernel_memory() {
         cmd(g, 0x4f2, 0);
         for p in [[80.0f32, 60.], [320., 60.], [200., 240.]] {
             cmd(g, 0x6913, 0x0000_ff00); // IRIS GL cpack green
+            // A normal after the colour, or LMC_COLOR leaves it unlit.
+            for n in [0.0f32, 0.0, 1.0] { cmd(g, 0x035, fl(n)); }
             for x in [p[0], p[1], 0.0] { cmd(g, 0xa63, fl(x)); }
         }
         cmd(g, 0x0f1, 0);
@@ -2754,4 +2756,83 @@ fn gl_pixel_dma_zoomed_rows_bottom_first() {
     assert_eq!(gl_px(g, 101, 51) & 0xfff, 0x300);
     assert_eq!(gl_px(g, 100, 52) & 0xfff, 0x310, "second row above it");
     assert_eq!(gl_px(g, 103, 53) & 0xfff, 0x311);
+}
+
+/// IRIS GL lmcolor(LMC_COLOR) (Graphics Library Programming Guide 9.6.4):
+/// "if a color command follows the last normal before a primitive is drawn,
+/// that primitive is not lighted". The desktop X-logo background redraws its
+/// gradient with n3f once, then c3f per vertex, lighting still on from the
+/// logo (xlogo.log): unlit it is blue, lit it was white. A normal after the
+/// colour lights again; OpenGL colours (0x0??) do not unlight.
+#[test]
+fn iris_lmc_color_after_normal_is_unlit() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    // White material lit by a light along +z.
+    for v in [0.0f32, 0.0, 0.0, 1.0] { cmd(g, 0x07a, fl(v)); }
+    for t in [0x076u32, 0x078] { for _ in 0..3 { cmd(g, t, fl(0.0)); } }
+    for v in [1.0f32, 1.0, 1.0, 1.0] { cmd(g, 0x07a, fl(v)); }
+    cmd(g, 0x0db, 0);
+    data(g, 1);
+    for v in [0.0f32, 0.0, 0.0] { cmd(g, 0x081, fl(v)); } // LMC_COLOR
+    let quad = |g: &Gr2, normal_last: bool| {
+        cmd(g, 0x1a4, 0);
+        cmd(g, 0x5ae, 0);
+        if !normal_last {
+            for v in [0.0f32, 0.0, 1.0] { cmd(g, 0x035, fl(v)); }
+        }
+        for (x, y) in [(10.0f32, 10.0f32), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)] {
+            for c in [0.0f32, 0.0, 0.5] { cmd(g, 0x1913, fl(c)); }
+            if normal_last {
+                for v in [0.0f32, 0.0, 1.0] { cmd(g, 0x035, fl(v)); }
+            }
+            for v in [x, y, 0.0] { cmd(g, 0xa63, fl(v)); }
+        }
+        cmd(g, 0x041, 0);
+        cmd(g, 0x465, 0);
+        g.wait_idle();
+    };
+    quad(g, false);
+    assert_eq!(gl_px(g, 30, 30), 0x80_0000, "colour after the normal: unlit, the vertex colour");
+    quad(g, true);
+    assert_ne!(gl_px(g, 30, 30), 0x80_0000, "normal after the colour: lit");
+}
+
+/// lmcolor(LMC_DIFFUSE) writes the colour into the active material; binding
+/// another material afterwards replaces it (IRIS GL Programming Guide 9.6.4).
+/// X-logo background, first frame (xlogo.log): diffuse tracking on, colour
+/// gold, then the grey material is loaded and the logo is drawn with normals
+/// only. It must be grey; substituting the current colour drew it gold.
+#[test]
+fn iris_lmcolor_change_lost_on_material_bind() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    // Light along +z, colour (1, 1, 1); only diffuse matters below.
+    // As the trace: select light 0, end of list, list head 0, 1 light.
+    for (a, v) in [(5.0f32, 0.0f32), (6.0, -1.0), (4.0, 0.0), (10.0, 1.0)] {
+        cmd(g, 0x080, fl(a));
+        cmd(g, 0x080, fl(v));
+    }
+    for _ in 0..3 { cmd(g, 0x07e, fl(1.0)); }
+    for v in [0.0f32, 0.0, 1.0, 0.0] { cmd(g, 0x07f, fl(v)); }
+    for t in [0x076u32, 0x078, 0x07c] { for _ in 0..3 { cmd(g, t, fl(0.0)); } }
+    cmd(g, 0x0db, 0);
+    data(g, 1);
+    for v in [3u32, 0, 1] { cmd(g, 0x081, v); } // LMC_DIFFUSE
+    for c in [1.0f32, 0.0, 0.0, 1.0] { cmd(g, 0x2113, fl(c)); } // red: into the material
+    for v in [0.0f32, 1.0, 0.0, 1.0] { cmd(g, 0x07a, fl(v)); } // lmbind: green material
+    cmd(g, 0x1a4, 0);
+    cmd(g, 0x5ae, 0);
+    for v in [0.0f32, 0.0, 1.0] { cmd(g, 0x035, fl(v)); }
+    for (x, y) in [(10.0f32, 10.0f32), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)] {
+        for v in [x, y, 0.0] { cmd(g, 0xa63, fl(v)); }
+    }
+    cmd(g, 0x041, 0);
+    cmd(g, 0x465, 0);
+    g.wait_idle();
+    let p = gl_px(g, 30, 30);
+    assert_eq!(p & 0xff, 0, "no red: the bind replaced the tracked colour ({p:06x})");
+    assert!((p >> 8) & 0xff > 0x80, "green material ({p:06x})");
 }

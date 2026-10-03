@@ -444,6 +444,10 @@ pub struct GlState {
     uclip_on: u32,
     /// Read source from 0x10A: kind, buffer (0, 0 = front).
     read_src: [u32; 2],
+    /// IRIS GL lmcolor(LMC_COLOR) rule: an IRIS GL colour command after the
+    /// last IRIS GL normal leaves what follows unlit (see T_IRIS_COLOR).
+    /// [0] = set, [1] spare (keeps GlState free of padding).
+    iris_unlit: [u32; 2],
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
 }
@@ -1114,6 +1118,8 @@ impl Hq2Engine {
                     }
                     _ => g.color,
                 };
+                let c = g.color;
+                g.lt.track_color(c);
             }
             T_IRIS_INDEX | T_INDEX => {
                 g.color = [num(b[0]) / 255.0, 0.0, 0.0, 1.0];
@@ -1150,12 +1156,13 @@ impl Hq2Engine {
                     _ => [num(b[0]), num(b[1]), num(b[2]), num(b[3])],
                 };
                 let mut wv = g.transform(v);
-                if g.lt.on != 0 || g.lt.fog_on != 0 {
+                let lit = g.lt.on != 0 && g.iris_unlit[0] == 0;
+                if lit || g.lt.fog_on != 0 {
                     // Eye-space position for lighting and fog.
                     let m = &g.mv;
                     let e = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
                     let eye = [e(0), e(1), e(2), e(3)];
-                    if g.lt.on != 0 {
+                    if lit {
                         let (fc, bc) = g.lt.light_vertex(eye, g.normal, g.color);
                         wv.c = fc;
                         wv.cb = bc;
@@ -1179,8 +1186,20 @@ impl Hq2Engine {
                     d(format!("GL_BLEND on={} src={} dst={}", g.blend_on, g.blend_src, g.blend_dst));
                 }
             }
-            T_NORMAL | T_IRIS_NORMAL => g.normal = [f(b[0]), f(b[1]), f(b[2])],
+            T_NORMAL => g.normal = [f(b[0]), f(b[1]), f(b[2])],
+            T_IRIS_NORMAL => {
+                g.normal = [f(b[0]), f(b[1]), f(b[2])];
+                g.iris_unlit[0] = 0;
+            }
             T_IRIS_COLOR => {
+                // IRIS GL Programming Guide 9.6.4: in the default lmcolor
+                // mode LMC_COLOR (0x081 with tracking off), "if a color
+                // command follows the last normal before a primitive is
+                // drawn, that primitive is not lighted". The desktop's
+                // X-logo background draws its blue gradient this way with
+                // lighting still on from the logo; lit, it came out white.
+                // OpenGL's colour and normal tokens leave the flag alone.
+                g.iris_unlit[0] = (g.lt.cmat_on == 0 && g.lt.cmat_param == 0) as u32;
                 g.color = match conv {
                     3 | 4 => {
                         let s = |w: u32| if index & ITOF != 0 { (w as i32 as f32) / 255.0 } else { f(w) };
@@ -1193,6 +1212,8 @@ impl Hq2Engine {
                         [u(0), u(8), u(16), u(24)]
                     }
                 };
+                let c = g.color;
+                g.lt.track_color(c);
             }
             T_READ_BUFFER => {
                 g.read_src = [b[0], b[1]];
@@ -1214,7 +1235,14 @@ impl Hq2Engine {
                 }
             }
             T_TEXTURE_MATRIX => {}
-            t => g.lt.port(t, &b[..n as usize]),
+            t => {
+                g.lt.port(t, &b[..n as usize]);
+                // Turning colour material on takes the current colour.
+                if t == light::T_COLOR_MATERIAL {
+                    let c = g.color;
+                    g.lt.track_color(c);
+                }
+            }
         }
         true
     }

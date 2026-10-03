@@ -321,11 +321,31 @@ impl Lighting {
         self.local_viewer != 0 || self.two_sided != 0 || self.enabled().any(|l| l.pos[3] != 0.0)
     }
 
-    /// Material of `face` with colour material applied.
-    fn material(&self, face: usize, color: [f32; 4]) -> Material {
-        let mut m = self.mat[face];
-        if self.cmat_on != 0 && (self.cmat_face == 2 || self.cmat_face as usize == face) {
-            let c3 = [color[0], color[1], color[2]];
+    /// Material of `face`. Colour material has already been written into
+    /// it by `track_color`.
+    fn material(&self, face: usize, _color: [f32; 4]) -> Material {
+        self.mat[face]
+    }
+
+    /// Colour material (0x081; IRIS GL lmcolor, OpenGL glColorMaterial):
+    /// while tracking is on, a colour command WRITES the colour into the
+    /// tracked properties of the active material, and the change lasts
+    /// until the material is loaded again (IRIS GL Programming Guide 9.6.4:
+    /// lmcolor changes "are lost when you use lmbind() to bind another
+    /// material"; OpenGL likewise updates the material). Substituting the
+    /// current colour at lighting time instead drew the X-logo background's
+    /// first frame in the colour sent before its grey material was bound
+    /// (gold instead of grey).
+    pub fn track_color(&mut self, color: [f32; 4]) {
+        if self.cmat_on == 0 {
+            return;
+        }
+        let c3 = [color[0], color[1], color[2]];
+        for face in 0..2 {
+            if self.cmat_face != 2 && self.cmat_face as usize != face {
+                continue;
+            }
+            let m = &mut self.mat[face];
             match self.cmat_param {
                 1 => m.emission = c3,
                 2 => m.ambient = c3,
@@ -338,7 +358,6 @@ impl Lighting {
                 _ => {}
             }
         }
-        m
     }
 
     /// Lit colours (front, back) of a vertex: `eye` = eye-space position,
