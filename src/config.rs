@@ -982,6 +982,15 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitor_port: Option<u16>,
 
+    /// TCP ports of the serial channels on 127.0.0.1: A (tty2) and B (tty1,
+    /// the console). None means 8880 and 8881
+    /// (`crate::dev::z85c30::DEFAULT_PORTS`); like the monitor's, they have to
+    /// differ between iris processes running at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_port_a: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_port_b: Option<u16>,
+
     /// If Some(path), load this static ELF32 MSB binary into RAM at startup and
     /// set PC to its entry point (bare-metal test binaries; see --load-elf).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1196,6 +1205,8 @@ impl Default for MachineConfig {
             no_audio: false,
             gdb_port: None,
             monitor_port: None,
+            serial_port_a: None,
+            serial_port_b: None,
             load_elf: None,
             test_device: false,
             test_device_dump: None,
@@ -1226,6 +1237,12 @@ impl Default for MachineConfig {
 
 
 impl MachineConfig {
+    /// The serial channels' TCP ports (A, B), defaults filled in.
+    pub fn serial_ports(&self) -> [u16; 2] {
+        let [a, b] = crate::dev::z85c30::DEFAULT_PORTS;
+        [self.serial_port_a.unwrap_or(a), self.serial_port_b.unwrap_or(b)]
+    }
+
     /// Load from `iris.toml` if it exists, otherwise return defaults.
     ///
     /// A *missing* file is fine (defaults are used). A file that exists but
@@ -1561,6 +1578,14 @@ pub struct Cli {
     #[arg(long = "monitor-port", value_name = "PORT")]
     pub monitor_port: Option<u16>,
 
+    /// Serial channel A (tty2) port on 127.0.0.1 (default 8880).
+    #[arg(long = "serial-port-a", value_name = "PORT")]
+    pub serial_port_a: Option<u16>,
+
+    /// Serial channel B (tty1, the console) port on 127.0.0.1 (default 8881).
+    #[arg(long = "serial-port-b", value_name = "PORT")]
+    pub serial_port_b: Option<u16>,
+
     /// Map the bare-metal test device into GIO expansion slot 0: SIGNATURE,
     /// PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT
     /// (terminate with the guest's exit code). Off by default.
@@ -1673,6 +1698,8 @@ impl Cli {
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
         if let Some(p) = self.monitor_port { cfg.monitor_port = Some(p); }
+        if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
+        if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }

@@ -1045,10 +1045,10 @@ impl App {
                     // Fresh run: re-arm the one-shot PCAP permission prompt so a
                     // pcap-mode machine that can't open its capture re-prompts.
                     self.pcap_perm_prompted = false;
-                    // Stop drops the machine and its 8881 listener; reconnect the
+                    // Stop drops the machine and its serial listener; reconnect the
                     // in-app viewer so it attaches to the new VM, not a dead socket.
                     if self.serial_console.is_some() {
-                        self.serial_console = Some(serial_console::SerialConsole::connect());
+                        self.open_serial_console();
                     }
                     self.toast("emulator started");
                 }
@@ -1521,7 +1521,7 @@ impl App {
                     ui.close();
                 }
                 if ui.add_enabled(running, egui::Button::new("Serial console…"))
-                    .on_hover_text("Connect to the emulator's loopback serial server (127.0.0.1:8881)")
+                    .on_hover_text(format!("Connect to the emulator's loopback serial server (127.0.0.1:{})", self.cfg.serial_ports()[1]))
                     .on_disabled_hover_text("Start a machine first")
                     .clicked()
                 {
@@ -2509,12 +2509,12 @@ impl App {
     /// Open (or reconnect) the in-app IRIX serial-console viewer. Connects to
     /// the loopback serial server the running emulator exposes.
     fn open_serial_console(&mut self) {
-        self.serial_console = Some(serial_console::SerialConsole::connect());
+        self.serial_console = Some(serial_console::SerialConsole::connect(self.cfg.serial_ports()[1]));
     }
 
     /// Draw the in-app serial-console window (no-op when closed). Demonstrates
-    /// the loopback serial server: the emulator listens on 127.0.0.1:8881 and
-    /// this viewer connects to it.
+    /// the loopback serial server: the emulator listens on 127.0.0.1:8881 (or
+    /// the machine's `serial_port_b`) and this viewer connects to it.
     fn serial_console_window(&mut self, ctx: &egui::Context) {
         let Some(console) = &self.serial_console else { return };
         let (text, connected, error, _seq) = console.snapshot();
@@ -2534,7 +2534,7 @@ impl App {
                         ui.colored_label(Color32::from_rgb(200, 80, 80), e);
                     } else if connected {
                         ui.colored_label(Color32::from_rgb(90, 170, 90),
-                            format!("\u{2022} connected to {}", serial_console::SERIAL_ADDR));
+                            format!("\u{2022} connected to {}", console.addr()));
                     } else {
                         ui.label("disconnected");
                     }

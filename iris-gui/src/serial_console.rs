@@ -1,7 +1,7 @@
 //! In-app IRIX serial-console viewer.
 //!
 //! The emulated SGI Indy exposes its serial console (ttyd1) as a loopback TCP
-//! server on `127.0.0.1:8881` (see `iris::dev::z85c30`). This viewer connects to it
+//! server on `127.0.0.1:8881`, or the machine's `serial_port_b` (see `iris::dev::z85c30`). This viewer connects to it
 //! as a client and shows the live console stream, and lets the user type back
 //! into it — so the serial console works inside the app without an external
 //! terminal. It is also the visible demonstration of the app's network
@@ -22,8 +22,6 @@ use parking_lot::Mutex;
 
 use iris::net::telnet::{self, TelnetFilter};
 
-/// The loopback address the emulator binds for ttyd1 (IRIX serial console).
-pub const SERIAL_ADDR: &str = "127.0.0.1:8881";
 /// Cap on retained scrollback so a long boot doesn't grow the buffer forever.
 const MAX_TEXT: usize = 128 * 1024;
 
@@ -45,20 +43,28 @@ pub struct SerialConsole {
     /// Write half (a clone of the socket) for sending typed input.
     write: Arc<Mutex<Option<TcpStream>>>,
     worker: Option<JoinHandle<()>>,
+    /// The loopback address of the emulator's ttyd1 (IRIX serial console).
+    addr: SocketAddr,
 }
 
 impl SerialConsole {
-    /// Connect to the loopback serial console and start streaming.
-    pub fn connect() -> Self {
+    /// Connect to the loopback serial console on `port` (the machine's
+    /// channel B port, `MachineConfig::serial_ports()[1]`) and start streaming.
+    pub fn connect(port: u16) -> Self {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let shared = Arc::new(Mutex::new(Shared::default()));
         let running = Arc::new(AtomicBool::new(true));
         let write = Arc::new(Mutex::new(None));
         let (s2, r2, w2) = (shared.clone(), running.clone(), write.clone());
         let worker = std::thread::Builder::new()
             .name("iris-gui-serial".into())
-            .spawn(move || run(s2, r2, w2))
+            .spawn(move || run(addr, s2, r2, w2))
             .expect("spawn serial-console worker");
-        Self { shared, running, write, worker: Some(worker) }
+        Self { shared, running, write, worker: Some(worker), addr }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     /// (text, connected, error, seq) snapshot for rendering.
@@ -100,13 +106,12 @@ impl Drop for SerialConsole {
     }
 }
 
-fn run(shared: Arc<Mutex<Shared>>, running: Arc<AtomicBool>, write: Arc<Mutex<Option<TcpStream>>>) {
-    let addr: SocketAddr = SERIAL_ADDR.parse().expect("valid loopback addr");
+fn run(addr: SocketAddr, shared: Arc<Mutex<Shared>>, running: Arc<AtomicBool>, write: Arc<Mutex<Option<TcpStream>>>) {
     let stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
         Ok(s) => s,
         Err(e) => {
             shared.lock().error = Some(format!(
-                "could not connect to {SERIAL_ADDR}: {e}\nStart the emulator first, then reopen."
+                "could not connect to {addr}: {e}\nStart the emulator first, then reopen."
             ));
             return;
         }

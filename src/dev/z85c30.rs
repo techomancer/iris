@@ -602,11 +602,20 @@ pub struct Z85c30 {
 /// any single probe response; the buffer is drained on each read.
 const CONSOLE_TAP_CAP: usize = 64 * 1024;
 
+/// Loopback TCP ports of the serial channels unless the config says otherwise:
+/// channel A (tty2) on 8880, channel B (tty1, the console) on 8881.
+pub const DEFAULT_PORTS: [u16; 2] = [8880, 8881];
+
 impl Z85c30 {
     /// Default constructor: binds TCP serial backends on 127.0.0.1:8880
     /// (channel A / tty2) and 127.0.0.1:8881 (channel B / tty1).
     pub fn new(callback: Option<Arc<dyn IrqCallback>>) -> Self {
-        Self::new_inner(callback, true)
+        Self::new_with_ports(callback, DEFAULT_PORTS)
+    }
+
+    /// As `new`, with the TCP ports of channels A and B on 127.0.0.1.
+    pub fn new_with_ports(callback: Option<Arc<dyn IrqCallback>>, ports: [u16; 2]) -> Self {
+        Self::new_inner(callback, Some(ports))
     }
 
     /// CI-mode constructor: uses null backends instead of binding TCP. The
@@ -614,23 +623,26 @@ impl Z85c30 {
     /// `set_backend_b` before the first `start()`. Avoids port conflicts
     /// when multiple `--ci` instances run in parallel.
     pub fn new_null(callback: Option<Arc<dyn IrqCallback>>) -> Self {
-        Self::new_inner(callback, false)
+        Self::new_inner(callback, None)
     }
 
-    fn new_inner(callback: Option<Arc<dyn IrqCallback>>, bind_tcp: bool) -> Self {
+    fn new_inner(callback: Option<Arc<dyn IrqCallback>>, ports: Option<[u16; 2]>) -> Self {
         let ip_a = Arc::new(AtomicU8::new(0));
         let ip_b = Arc::new(AtomicU8::new(0));
 
-        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) = if bind_tcp {
-            let tcp_or_null = |addr| -> Arc<dyn SerialBackend> {
-                match TcpSocketBackend::new(addr) {
+        let (backend_a, backend_b): (Arc<dyn SerialBackend>, Arc<dyn SerialBackend>) = if let Some([a, b]) = ports {
+            let tcp_or_null = |port: u16, setting: &str| -> Arc<dyn SerialBackend> {
+                match TcpSocketBackend::new(("127.0.0.1", port)) {
                     Some(b) => Arc::new(b),
-                    None => Arc::new(NullBackend),
+                    None => {
+                        eprintln!("iris: serial port {port} unavailable; is another iris using it? Set {setting} to run both.");
+                        Arc::new(NullBackend)
+                    }
                 }
             };
             (
-                tcp_or_null("127.0.0.1:8880"),
-                tcp_or_null("127.0.0.1:8881"),
+                tcp_or_null(a, "serial_port_a (--serial-port-a)"),
+                tcp_or_null(b, "serial_port_b (--serial-port-b)"),
             )
         } else {
             (Arc::new(NullBackend), Arc::new(NullBackend))

@@ -453,15 +453,16 @@ impl Ioc {
 
     /// As `new`/`new_ci`, with the machine profile's IP28 flag: an IP28
     /// baseboard must report a high enough HPC3 board revision.
-    pub fn new_for_profile(guinness: bool, ci_mode: bool, ip28: bool) -> Self {
-        Self::new_inner_profile(guinness, ci_mode, ip28)
+    /// `serial_ports` are the SCC's TCP ports (channels A and B) outside CI mode.
+    pub fn new_for_profile(guinness: bool, ci_mode: bool, ip28: bool, serial_ports: [u16; 2]) -> Self {
+        Self::new_inner_profile(guinness, ci_mode, ip28, serial_ports)
     }
 
     fn new_inner(guinness: bool, ci_mode: bool) -> Self {
-        Self::new_inner_profile(guinness, ci_mode, false)
+        Self::new_inner_profile(guinness, ci_mode, false, crate::dev::z85c30::DEFAULT_PORTS)
     }
 
-    fn new_inner_profile(guinness: bool, ci_mode: bool, ip28: bool) -> Self {
+    fn new_inner_profile(guinness: bool, ci_mode: bool, ip28: bool, serial_ports: [u16; 2]) -> Self {
         // HPC3 SYS_ID: [7:5] chip rev, [4:1] board rev, [0] 1 = fullhouse.
         // The PROM looks at bit 0 to tell fullhouse from guinness. IRIX reads
         // the board revision to tell an IP28 baseboard from an IP26 one and
@@ -524,7 +525,7 @@ impl Ioc {
         let scc = if ci_mode {
             Z85c30::new_null(Some(serial_irq))
         } else {
-            Z85c30::new(Some(serial_irq))
+            Z85c30::new_with_ports(Some(serial_irq), serial_ports)
         };
 
         Self {

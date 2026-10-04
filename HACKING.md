@@ -403,7 +403,8 @@ Tests:
 **Breakpoints** don't survive emulator restart.
 
 **Monitor console** — available in the terminal or via telnet to `127.0.0.1:8888`.
-Serial ports are on 8880 (port A) and 8881 (port B / IRIX serial terminal).
+Serial ports are on 8880 (port A) and 8881 (port B / IRIX serial terminal); `serial_port_a`,
+`serial_port_b` and `monitor_port` move them.
 `debug.md` is a guided tour of the debugger; HELP.md has the full command list.
 `src/iris_mcp.py` exposes the monitor as MCP tools.
 

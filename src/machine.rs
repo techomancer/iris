@@ -348,7 +348,7 @@ impl Machine {
 
         // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
         // bindings so multiple `--ci` instances can coexist.
-        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28());
+        let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
@@ -368,7 +368,7 @@ impl Machine {
             Some(b)
         } else {
             // Non-CI mode: channel B already has its TCP listener on
-            // 127.0.0.1:8881.  If --serial-log was passed, wrap it in a
+            // 127.0.0.1:8881 (or `serial_port_b`).  If --serial-log was passed, wrap it in a
             // TeeBackend so guest-emitted bytes get mirrored to the file
             // in addition to whatever client is attached to the TCP socket.
             if let Some(path) = cfg.serial_log.as_deref() {

@@ -16,7 +16,7 @@ windows and menus? `cargo run -p iris-gui --release` (see
 Connect the monitor console (a second terminal):
 You have monitor console in the terminal or you can open extra ones telnetting to 127.0.0.1:8888
 
-Serial ports are on ports 8880 and 8881 (connect to 8881 for IRIX serial term)
+Serial ports are on ports 8880 and 8881 (connect to 8881 for IRIX serial term); `serial_port_a` / `serial_port_b` change them
 
 `iris.toml` in the repository root is a fully commented example configuration;
 `iris-irix53.toml` and `iris-irix65.toml` are templates for installing each
@@ -348,6 +348,10 @@ sockets on localhost.  Connect with `telnet`, `nc`, or any raw TCP client.
 variable is set to `d` (serial), all PROM and early-boot output goes to
 `/dev/ttyd1` → TCP port **8881**.
 
+The ports are the defaults: `serial_port_a` and `serial_port_b` in the config
+(or `--serial-port-a` / `--serial-port-b`) move them, as `monitor_port` moves the
+monitor, so that two iris processes can run at once.
+
 ### Connect to a serial port
 
 ```bash
@@ -412,6 +416,8 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 
 # gdb_port = 1234               # GDB RSP stub
 # monitor_port = 8888           # monitor console; give each iris run at once its own
+# serial_port_a = 8880          # serial channel A (ttyd2); likewise
+# serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
 # ci = false                    # CI control socket (see README)
 # ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
 # ci_display = false

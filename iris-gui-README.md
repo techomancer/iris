@@ -263,7 +263,9 @@ On Windows, `iris::crash_diag` records otherwise-silent deaths (e.g.
 ### Single instance and TCP ports
 
 iris binds the monitor (`8888`) and two serial listeners (`8880` channel A,
-`8881` channel B / ttyd1) on loopback, so two emulators can't share a host. On
+`8881` channel B / ttyd1) on loopback, so two emulators can't share a host
+unless their configs give them other ports (`monitor_port`, `serial_port_a`,
+`serial_port_b`; the serial console window follows `serial_port_b`). On
 startup iris-gui terminates a still-running previous instance (Unix; tracked
 with a pidfile) to reclaim those ports. A crashed instance needs no cleanup —
 the OS frees its ports.
