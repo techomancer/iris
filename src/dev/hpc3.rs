@@ -1367,6 +1367,7 @@ impl Device for Hpc3 {
         self.rtc.stop();
         self.ioc.stop();
         if let Some(hal2) = &self.hal2 { hal2.stop(); }
+        if !self.guinness { self.eeprom.lock().stop(); }
     }
 
     fn start(&self) {
@@ -2312,6 +2313,30 @@ impl Saveable for Hpc3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_saves_both_battery_backed_devices() {
+        let dir = std::env::temp_dir().join(format!("iris-hpc3-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nvram = dir.join("nvram.bin").to_str().unwrap().to_owned();
+        let nveeprom = dir.join("nveeprom.bin").to_str().unwrap().to_owned();
+        let ee = Arc::new(Mutex::new(Eeprom93c56::with_path(LogModule::Nveeprom, nveeprom.clone())));
+        let hpc = Hpc3::with_net(
+            ee.clone(), Ioc::new_ci(true), false, Arc::new(AtomicU64::new(0)),
+            NetworkConfig::default(), true, AudioConfig::default(), nvram.clone(),
+            RtcOffset::default(), true,
+        );
+        hpc.rtc.write8(500, 0x5a);
+        ee.lock().set_word(0x74, 0x3530);
+        hpc.stop();
+        drop(hpc);
+        drop(ee);
+        let rtc = Ds1x86::new(8192, nvram.clone(), RtcOffset::default());
+        assert_eq!(rtc.read8(500).data, 0x5a);
+        assert_eq!(std::fs::read(nveeprom).unwrap()[232..234], [b'5', b'0']);
+        assert_eq!(std::fs::metadata(nvram).unwrap().len(), 8192);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// One channel per ops group: PBUS, SCSI, enet RX, enet TX. All twelve go
     /// through the same record, so a group-specific field such as `even_high`

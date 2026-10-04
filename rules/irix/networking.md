@@ -91,7 +91,8 @@ Manual fallback (still works, e.g. to pick a different MAC without restarting):
 1. Boot to PROM monitor (press Escape during countdown)
 2. `>> setenv -f eaddr 08:00:69:de:ad:01` (any SGI OUI `08:00:69` MAC)
 3. From iris monitor (telnet 127.0.0.1 8888): `rtc save` (Indy) or
-   `nveeprom save` (Indigo2) to persist.
+   `nveeprom save` (Indigo2) to persist immediately. Stopping the VM also
+   saves both battery-backed devices to their configured paths.
 
 ## iris emulator network configuration
 

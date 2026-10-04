@@ -946,9 +946,9 @@ pub struct MachineConfig {
     #[serde(default = "default_nvram")]
     pub nvram: String,
 
-    /// Path to the Indigo2 (IP22) motherboard EEPROM file (93CS56 — NVRAM
+    /// Path to the Indigo2 (IP22/IP28) motherboard EEPROM file (93CS56 — NVRAM
     /// env vars + MAC, see `nveeprom` monitor command). Loaded at startup
-    /// if the file exists; `nveeprom save` writes back to it by default.
+    /// if the file exists; saved on Stop and by `nveeprom save` by default.
     /// Ignored on Indy (no such chip). Per-config files avoid the same
     /// cross-install footgun as `nvram`.
     #[serde(default = "default_nveeprom")]

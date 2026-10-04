@@ -34,7 +34,7 @@ pub struct Ds1x86 {
     data: Mutex<RtcData>,
     size: usize,
     /// On-disk NVRAM path, used by `load_nvram` at startup and by
-    /// `rtc-save` as the default destination. Wired from
+    /// Stop and `rtc-save` as the default destination. Wired from
     /// `MachineConfig::nvram` so different toml configs can use
     /// independent NVRAM files.
     nvram_path: String,
@@ -212,9 +212,7 @@ impl Ds1x86 {
         if (data.regs[CMD_REG_OFFSET] & TE_BIT) != 0 {
             self.update_time(&mut data);
         }
-        let mut file = File::create(filename)?;
-        file.write_all(&data.regs)?;
-        Ok(())
+        crate::nv_storage::save(filename, &data.regs)
     }
 
     pub fn load_nvram(&self, filename: &str) -> std::io::Result<()> {
@@ -322,7 +320,13 @@ impl Ds1x86 {
 
 impl Device for Ds1x86 {
     fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
+    fn stop(&self) {
+        if !self.nvram_path.is_empty() {
+            if let Err(err) = self.save_nvram(&self.nvram_path) {
+                eprintln!("Failed to save NVRAM to {}: {}", self.nvram_path, err);
+            }
+        }
+    }
     fn start(&self) {}
     fn is_running(&self) -> bool { true }
     fn get_clock(&self) -> u64 { 0 }

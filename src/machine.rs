@@ -400,7 +400,10 @@ impl Machine {
         if guinness {
             hpc3.rtc().backdoor_set_mac_if_blank(cfg.network().mac);
         } else {
-            eeprom_hpc3.lock().backdoor_set_mac_if_blank(cfg.network().mac);
+            let mut eeprom = eeprom_hpc3.lock();
+            let initialized = cfg.machine.profile.ip28() && eeprom.initialize_ip28_if_erased();
+            eeprom.backdoor_set_mac_if_blank(cfg.network().mac);
+            if initialized { eeprom.update_ip28_checksum(); }
         }
 
         // Attach SCSI devices from config (IDs 1–7).

@@ -189,7 +189,9 @@ pub fn write_nveeprom_mac(path: &str, mac: [u8; 6]) -> std::io::Result<bool> {
 /// Unlike [`ensure_nvram_seeded`], there's no baked-in asset to seed from —
 /// `0xFF`-erased is exactly a brand new 93C56's real power-on state, and
 /// `Eeprom93c56::backdoor_set_mac_if_blank` (core, at `Machine::new`) already
-/// fills in a MAC from a blank one, same as the DS1386 path.
+/// fills in a MAC from a blank one, same as the DS1386 path. On IP28 the
+/// core also initializes PROM defaults before the first boot, including
+/// volume and boottune; Stop persists the initialized image.
 pub fn ensure_nveeprom_exists(path: &str) -> bool {
     if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
         return false;
@@ -279,9 +281,9 @@ impl GuiSettings {
     /// against the process's working directory and silently finds a
     /// different (usually blank) file between `cargo run` and a bundled
     /// `.app`. This is the motherboard EEPROM Indigo2/IP28 actually read
-    /// `eaddr` from (`Eeprom93c56`, see `rules/irix/networking.md`) — unlike
-    /// `nvram`, it has no per-machine PROM-env asset to seed, so there's no
-    /// `ensure_nveeprom_seeded` counterpart; it's fine starting blank.
+    /// `eaddr` from (`Eeprom93c56`, see `rules/irix/networking.md`).
+    /// `ensure_nveeprom_exists` creates an erased chip; the IP28 core seeds
+    /// PROM defaults before its first boot and saves them on Stop.
     pub fn default_nveeprom_path() -> String {
         Self::data_dir()
             .map(|d| d.join("nveeprom.bin").to_string_lossy().into_owned())

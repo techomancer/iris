@@ -108,9 +108,55 @@ impl Eeprom93c56 {
     pub fn save(&self, filename: &str) -> std::io::Result<()> {
         let mut bytes = Vec::with_capacity(self.data.len() * 2);
         for w in &self.data { bytes.extend_from_slice(&w.to_be_bytes()); }
-        let mut file = File::create(filename)?;
-        file.write_all(&bytes)?;
-        Ok(())
+        crate::nv_storage::save(filename, &bytes)
+    }
+
+    /// Save the motherboard EEPROM when the machine stops. CPU EEPROMs have
+    /// no backing path and remain in memory.
+    pub fn stop(&self) {
+        if let Some(path) = self.path().filter(|p| !p.is_empty()) {
+            if let Err(err) = self.save(path) {
+                eprintln!("Failed to save NVEEPROM to {}: {}", path, err);
+            }
+        }
+    }
+
+    /// Initialize an erased IP28 motherboard EEPROM before the PROM's early
+    /// chime reads. Preserve its MAC, and leave existing guest settings alone.
+    /// Layout/defaults: SGI IP22nvram.h and libsk/ml/nvram.c; checksum:
+    /// IPXXprom/IPXXnvram.c nvchecksum(). This is not a CPU EEPROM image.
+    pub fn initialize_ip28_if_erased(&mut self) -> bool {
+        if self.data[..0x7D].iter().any(|&word| word != 0xFFFF) {
+            return false;
+        }
+        let mac = [self.data[0x7D], self.data[0x7E], self.data[0x7F]];
+        let mut bytes = [0u8; 256];
+        bytes[1] = 9; // IP26/IP28 NVRAM layout revision
+        for (offset, value) in [
+            (2, "g"), (116, "9600"), (121, "0"), (122, "PST8PDT"),
+            (178, "Y"), (232, "80"), (235, "0"), (236, "y"),
+            (239, "y"), (242, "1"),
+        ] {
+            bytes[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+        }
+        for (word, pair) in self.data.iter_mut().zip(bytes.chunks_exact(2)) {
+            *word = u16::from_be_bytes([pair[0], pair[1]]);
+        }
+        self.data[0x7D..].copy_from_slice(&mac);
+        self.update_ip28_checksum();
+        true
+    }
+
+    /// SGI XOR/rotate checksum, including the Ethernet address and excluding
+    /// only the checksum byte itself.
+    pub fn update_ip28_checksum(&mut self) {
+        let mut checksum = 0xA5u8;
+        for (i, &word) in self.data.iter().enumerate() {
+            checksum ^= word as u8;
+            if i != 0 { checksum ^= (word >> 8) as u8; }
+            checksum = checksum.rotate_left(1);
+        }
+        self.data[0] = (self.data[0] & 0xFF) | ((checksum as u16) << 8);
     }
 
     /// Load the full 128-word array from `filename` (raw big-endian bytes,
@@ -441,6 +487,56 @@ impl Eeprom93c56 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_persists_serial_writes_and_reloads() {
+        let path = std::env::temp_dir().join(format!("iris-eeprom-stop-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let filename = path.to_str().unwrap().to_owned();
+        let mut ee = Eeprom93c56::with_path(LogModule::Nveeprom, filename.clone());
+        ee.set_cs(true);
+        send_bits(&mut ee, 1, 1);
+        send_bits(&mut ee, 0, 2);
+        send_bits(&mut ee, 0b11000000, 8); // write enable
+        ee.set_cs(false);
+        ee.set_cs(true);
+        send_bits(&mut ee, 1, 1);
+        send_bits(&mut ee, 1, 2);
+        send_bits(&mut ee, 0x74, 8); // volume
+        send_bits(&mut ee, 0x3530, 16); // "50"
+        ee.set_cs(false);
+        ee.stop();
+        drop(ee);
+        let loaded = Eeprom93c56::with_path(LogModule::Nveeprom, filename);
+        assert_eq!(loaded.data[0x74], 0x3530);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn erased_ip28_gets_defaults_and_checksum_without_losing_mac() {
+        let mut ee = Eeprom93c56::new();
+        ee.backdoor_set_mac([8, 0, 0x69, 0x12, 0x34, 0x56]);
+        assert!(ee.initialize_ip28_if_erased());
+        assert_eq!(ee.data[0] & 0xff, 9);
+        assert_eq!(ee.data[0x74], 0x3830); // volume 80
+        assert_eq!(ee.data[0x79] >> 8, b'1' as u16);
+        assert_eq!(ee.data[0x7d..], [0x0800, 0x6912, 0x3456]);
+        // Independent byte formulation of the PROM checksum.
+        let bytes: Vec<u8> = ee.data.iter().flat_map(|w| w.to_be_bytes()).collect();
+        let mut sum = 0xa5u8;
+        for (i, pair) in bytes.chunks_exact(2).enumerate() {
+            for (j, &byte) in pair.iter().enumerate() {
+                if i != 0 || j != 0 { sum ^= byte; }
+            }
+            sum = (sum << 1) | (sum >> 7);
+        }
+        assert_eq!(bytes[0], sum);
+        ee.data[0x74] = 0x3000; // guest muted chime
+        let before = ee.data.clone();
+        assert!(!ee.initialize_ip28_if_erased());
+        assert_eq!(ee.data, before);
+    }
 
     fn send_bits(eeprom: &mut Eeprom93c56, bits: u32, count: u32) {
         for i in (0..count).rev() {
