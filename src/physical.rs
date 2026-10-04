@@ -1257,6 +1257,42 @@ mod ppmem_tests {
         }
     }
 
+    #[test]
+    fn ip28_512_mb_banks_map_full_gigabyte() {
+        use crate::dev::eeprom_93c56::Eeprom93c56;
+        use parking_lot::Mutex;
+        let mc = MemoryController::new_for_profile(
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [512, 512, 0, 0], true,
+        );
+        let addrs = mc.parse_memcfg(0x7f20_7f40, 0);
+        let banks = [RamBank::new(512), RamBank::new(512), RamBank::new(1), RamBank::new(1)];
+        let space = PpMemSpace::over(&banks).expect("reserve window");
+        let (plan, _) = plan_bank_slots(&addrs, &[]);
+        for (i, entry) in addrs.iter().enumerate() {
+            let Some((base, mask, limit)) = *entry else { continue };
+            banks[i].set_addr_mask(mask);
+            space.map_bank(i, base as u64, limit as u64, mask as u64 + 1).unwrap();
+            // Distinct words on both sides of the old 256 MB limit and at
+            // the end of each bank must survive on the bus and direct paths.
+            let offsets = [0, (256 << 20) - 8, 256 << 20, limit - 8];
+            for off in offsets {
+                let phys = base + off;
+                assert!(plan.contains(&(phys >> 16, BankSlot::Bank(i))));
+                let val = 0xC0DE_0000_0000_0000u64 | ((i as u64) << 32) | off as u64;
+                banks[i].write64(phys, val);
+            }
+            for off in offsets {
+                let phys = base + off;
+                let val = 0xC0DE_0000_0000_0000u64 | ((i as u64) << 32) | off as u64;
+                assert_eq!(banks[i].read64(phys).data, val);
+                assert_ne!(space.mapped_bitmap() & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)), 0);
+                let w = unsafe { *(space.window_base().add(phys as usize) as *const u64) };
+                assert_eq!(w.rotate_left(32), val, "physical {phys:#x}");
+            }
+        }
+        assert_eq!(plan.iter().filter(|(_, slot)| matches!(slot, BankSlot::Bank(_))).count(), 1024 << 4);
+    }
+
     /// The low-512KB alias must resolve to the SAME generation counter as
     /// LOMEM — through the ppmem window AND through the bus.
     ///

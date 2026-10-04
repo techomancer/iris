@@ -22,7 +22,7 @@ mod single_instance;
 use config_ui::{cfg_to_toml, show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
-use ram::{ram_summary, RAM_PRESETS};
+use ram::{ram_summary, ram_presets};
 use eframe::egui;
 use egui::{Color32, RichText, ViewportCommand};
 use handle::{Cmd, EmulatorHandle, Evt, NetState};
@@ -1372,7 +1372,7 @@ impl App {
                 let ip28_banks = self.cfg.machine.profile.ip28();
                 ui.separator();
                 ui.label("Quick presets (auto-distributed):");
-                for &p in RAM_PRESETS {
+                for &p in ram_presets(ip28_banks) {
                     if ui
                         .add_enabled(!running, egui::Button::new(format!("{p} MB")))
                         .on_disabled_hover_text("Stop the VM to change RAM")
@@ -1390,11 +1390,11 @@ impl App {
                     ui.menu_button(format!("Bank {i}: {} MB", self.cfg.banks[i]), |ui| {
                         for &sz in iris::config::VALID_BANK_SIZES {
                             if ui
-                                .add_enabled(!running && (sz != 256 || ip28_banks), egui::Button::new(format!("{sz} MB")))
+                                .add_enabled(!running && (sz <= 128 || ip28_banks), egui::Button::new(format!("{sz} MB")))
                                 .on_disabled_hover_text(if running {
                                     "Stop the VM to change RAM"
                                 } else {
-                                    "256 MB banks need the IP28 machine profile"
+                                    "256/512 MB banks need the IP28 machine profile"
                                 })
                                 .clicked()
                             {

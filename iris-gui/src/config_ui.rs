@@ -9,7 +9,7 @@ use iris::config::{
 use iris::net::nfsudp::NfsVersion;
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
-use crate::ram::{ram_summary, RAM_PRESETS};
+use crate::ram::{ram_summary, ram_presets};
 
 /// Memory-tab context: whether the VM is running and what banks were last started with.
 #[derive(Clone, Copy, Debug, Default)]
@@ -238,7 +238,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     // perfectly good IP28 machine's banks just because it can't run it.
     if cfg.machine.profile != MachineProfile::Indigo2Ip28 {
         for bank in &mut cfg.banks {
-            if *bank == 256 { *bank = 128; }
+            if *bank > 128 { *bank = 128; }
         }
     }
     ui.label(
@@ -732,7 +732,7 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
     ui.add_space(4.0);
     ui.label("Quick presets:");
     ui.horizontal_wrapped(|ui| {
-        for &p in RAM_PRESETS {
+        for &p in ram_presets(ip28_banks) {
             if ui
                 .add_enabled(!mem_ctx.running, egui::Button::new(format!("{p} MB")))
                 .on_disabled_hover_text("Stop the VM to change RAM")
@@ -743,9 +743,9 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
         }
     });
     ui.label(if ip28_banks {
-        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128, 256 — the IP28 MC only)"
+        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128, 256, 512 — the IP28 MC only)"
     } else {
-        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128 — 256 needs the IP28 machine profile)"
+        "RAM bank sizes in MB (valid: 0, 8, 16, 32, 64, 128 — 256/512 needs the IP28 machine profile)"
     });
     Grid::new("mem_grid").num_columns(2).striped(true).show(ui, |ui| {
         for i in 0..4 {
@@ -755,9 +755,9 @@ fn show_memory(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) {
                 ComboBox::from_id_salt(("bank", i)).selected_text(format!("{cur} MB"))
                     .show_ui(ui, |ui| {
                         for &sz in VALID_BANK_SIZES {
-                            ui.add_enabled_ui(sz != 256 || ip28_banks, |ui| {
+                            ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
                                 ui.selectable_value(&mut cfg.banks[i], sz, format!("{sz} MB"))
-                                    .on_disabled_hover_text("256 MB banks need the IP28 machine profile");
+                                    .on_disabled_hover_text("256/512 MB banks need the IP28 machine profile");
                             });
                         }
                     });

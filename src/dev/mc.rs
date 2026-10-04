@@ -322,13 +322,16 @@ impl MemoryController {
     /// cached for the life of the program.
     fn memcfg_size_rank_at(shift: u32, size_mb: u32) -> Option<(u32, u32)> {
         if shift == 24 {
-            // 16 MB granule.
+            // 16 MB granule. All five size bits are usable: field 31
+            // describes a 512 MB bank. POST sizes it as two 256 MB
+            // subbanks, so BNK must participate in alias detection.
             return match size_mb {
                 16  => Some((0,  0)),
                 32  => Some((1,  0)),
                 64  => Some((3,  0)),
                 128 => Some((7,  0)),
                 256 => Some((15, 0)),
+                512 => Some((31, 1)),
                 _   => None,
             };
         }
@@ -384,7 +387,7 @@ impl MemoryController {
 
         let conf_size = conf_total >> conf_rank;
         let minus_size = (simm_size_field + 1) << (shift - simm_rank);
-        let plus_size = (simm_size_field + 1) << (shift + simm_rank);
+        let plus_size = size_mb << 20;
         // BNK=0 (aliasing phase): wrap at inst_size so alias is detected at base+inst_size
         // BNK=1 (subbank/walkingbit): wrap at full bank size so both ranks are independent
         let addr_mask = if conf_rank == 0 { minus_size - 1 } else { plus_size - 1 };
@@ -1522,6 +1525,41 @@ mod tests {
             next = base + limit;
         }
         assert_eq!(next, 0x3000_0000, "256 MB total, ending where RAM ends");
+    }
+
+    #[test]
+    fn ip28_512_mb_banks_probe_and_decode() {
+        use crate::ppmem::PpMemory;
+        let mc = MemoryController::new_for_profile(
+            Arc::new(Mutex::new(Eeprom93c56::new())), false, [512, 512, 0, 0], true,
+        );
+        // Real POST probes 0x3f20, then 0x7f20. With BNK clear,
+        // the second subbank aliases the first; setting BNK exposes both.
+        let (base, mask, limit) = mc.parse_memcfg(0x3f20_0000, 0)[0].unwrap();
+        assert_eq!((base, mask, limit), (0x2000_0000, 0x0fff_ffff, 0x2000_0000));
+        let bank = PpMemory::new(512);
+        bank.set_addr_mask(mask);
+        bank.write32(base, 0x1234_5678);
+        assert_eq!(bank.read32(base + (256 << 20)).data, 0x1234_5678);
+        let (_, mask, limit) = mc.parse_memcfg(0x7f20_0000, 0)[0].unwrap();
+        assert_eq!((mask, limit), (0x1fff_ffff, 0x2000_0000));
+        bank.set_addr_mask(mask);
+        bank.write32(base + (256 << 20), 0x8765_4321);
+        assert_eq!(bank.read32(base).data, 0x1234_5678);
+        assert_eq!(bank.read32(base + (256 << 20)).data, 0x8765_4321);
+        assert_eq!(bank.read32(base + (512 << 20)).data, 0x1234_5678);
+
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x2000_0000, 512), Some(0x7f20));
+        assert_eq!(MemoryController::encode_memcfg_half_at(24, 0x4000_0000, 512), Some(0x7f40));
+        mc.write32(MC_BASE + REG_MEMCFG0, 0x7f20_7f40);
+        let (m0, m1) = mc.get_memcfg();
+        assert_eq!(m1, 0, "IP28 must leave the other banks to the PROM");
+        assert_eq!(mc.parse_memcfg(m0, m1), [
+            Some((0x2000_0000, 0x1fff_ffff, 0x2000_0000)),
+            Some((0x4000_0000, 0x1fff_ffff, 0x2000_0000)),
+            None, None,
+        ]);
+        assert_eq!(MemoryController::memcfg_bank_info_at(22, 0x3f20, 512), None);
     }
 
     /// The IP22 encodings are unchanged by the granule work.

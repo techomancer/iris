@@ -2,7 +2,7 @@ use eframe::egui::{self, Color32, ComboBox, Grid, RichText, TextEdit};
 use iris::config::{CpuModel, MachineConfig, MachineProfile, ScsiDeviceConfig, VALID_BANK_SIZES};
 use iris::dev::ng1::vc2_timings::NewportResolution;
 
-use crate::ram::RAM_PRESETS;
+use crate::ram::ram_presets;
 
 /// "New machine" startup dialog.
 /// Pops up at first run (or on `File → New machine…`) to bootstrap a config.
@@ -59,16 +59,16 @@ impl Default for NewMachineDialog {
 }
 
 /// Greedy-fill banks 0..3 with the largest valid bank size that fits.
-/// `allow_256` gates the 256 MB size, which only the IP28 MC can express
-/// (`validate()` rejects it on any other machine profile) — pass
+/// `ip28` gates the 256/512 MB sizes, which only the IP28 MC can express
+/// (`validate()` rejects them on other machine profiles) — pass
 /// `cfg.machine.profile.ip28()`.
-pub fn distribute_ram(total: u32, allow_256: bool) -> [u32; 4] {
+pub fn distribute_ram(total: u32, ip28: bool) -> [u32; 4] {
     let mut remaining = total;
     let mut banks = [0u32; 4];
     for slot in &mut banks {
         // Pick the largest size in VALID_BANK_SIZES that is <= remaining.
         let pick = VALID_BANK_SIZES.iter()
-            .filter(|&&s| s > 0 && s <= remaining && (s != 256 || allow_256))
+            .filter(|&&s| s > 0 && s <= remaining && (s <= 128 || ip28))
             .max().copied().unwrap_or(0);
         *slot = pick;
         remaining -= pick;
@@ -124,9 +124,10 @@ impl NewMachineDialog {
                             self.cpu = CpuModel::default();
                             self.use_embedded_prom = true;
                             if self.prom_path.is_empty() { self.prom_path = "prom.bin".into(); }
-                            // 256 MB banks are the IP28 MC's granule only.
+                            self.ram_total_mb = self.ram_total_mb.min(512);
+                            // Banks above 128 MB require the IP28 MC.
                             for bank in &mut self.ram_banks {
-                                if *bank == 256 { *bank = 128; }
+                                if *bank > 128 { *bank = 128; }
                             }
                         }
                     }
@@ -210,7 +211,7 @@ impl NewMachineDialog {
                         ComboBox::from_id_salt("ram_total")
                             .selected_text(format!("{} MB", self.ram_total_mb))
                             .show_ui(ui, |ui| {
-                                for &s in RAM_PRESETS {
+                                for &s in ram_presets(self.profile.ip28()) {
                                     ui.selectable_value(&mut self.ram_total_mb, s, format!("{s} MB"));
                                 }
                             });
@@ -223,9 +224,9 @@ impl NewMachineDialog {
                                 .selected_text(format!("{} MB", self.ram_banks[i]))
                                 .show_ui(ui, |ui| {
                                     for &sz in VALID_BANK_SIZES {
-                                        ui.add_enabled_ui(sz != 256 || ip28_banks, |ui| {
+                                        ui.add_enabled_ui(sz <= 128 || ip28_banks, |ui| {
                                             ui.selectable_value(&mut self.ram_banks[i], sz, format!("{sz} MB"))
-                                                .on_disabled_hover_text("256 MB banks need the IP28 machine profile");
+                                                .on_disabled_hover_text("256/512 MB banks need the IP28 machine profile");
                                         });
                                     }
                                 });
@@ -363,5 +364,17 @@ impl NewMachineDialog {
                 });
             });
         if close { self.open = false; }
+    }
+}
+
+#[cfg(test)]
+mod ram_tests {
+    use super::distribute_ram;
+
+    #[test]
+    fn ip28_gigabyte_uses_two_banks() {
+        assert_eq!(distribute_ram(1024, true), [512, 512, 0, 0]);
+        assert_eq!(distribute_ram(768, true), [512, 256, 0, 0]);
+        assert_eq!(distribute_ram(512, false), [128, 128, 128, 128]);
     }
 }

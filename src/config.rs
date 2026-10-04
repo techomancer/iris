@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
 /// Valid memory bank sizes in MB.
-pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256];
+pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
 /// `kind = "cdrom"`; either works and they mean the same thing.
@@ -1304,12 +1304,12 @@ impl MachineConfig {
                     i, sz, VALID_BANK_SIZES
                 ));
             }
-            // The IP22/IP24 MC cannot express a 256 MB bank at its base
+            // The IP22/IP24 MC cannot express banks larger than 128 MB at its base
             // shift; only the IP28's can.
-            if sz == 256 && !self.machine.profile.ip28() {
+            if sz > 128 && !self.machine.profile.ip28() {
                 return Err(format!(
-                    "bank{} size 256 MB needs the IP28 (machine.profile = indigo2_ip28)",
-                    i
+                    "bank{} size {} MB needs the IP28 (machine.profile = indigo2_ip28)",
+                    i, sz
                 ));
             }
         }
@@ -1434,19 +1434,19 @@ pub struct Cli {
     #[arg(long)]
     pub nveeprom: Option<String>,
 
-    /// RAM bank 0 size in MB (0/8/16/32/64/128)
+    /// RAM bank 0 size in MB (0/8/16/32/64/128; IP28 also supports 256/512)
     #[arg(long)]
     pub bank0: Option<u32>,
 
-    /// RAM bank 1 size in MB (0/8/16/32/64/128)
+    /// RAM bank 1 size in MB (0/8/16/32/64/128; IP28 also supports 256/512)
     #[arg(long)]
     pub bank1: Option<u32>,
 
-    /// RAM bank 2 size in MB (0/8/16/32/64/128)
+    /// RAM bank 2 size in MB (0/8/16/32/64/128; IP28 also supports 256/512)
     #[arg(long)]
     pub bank2: Option<u32>,
 
-    /// RAM bank 3 size in MB (0/8/16/32/64/128)
+    /// RAM bank 3 size in MB (0/8/16/32/64/128; IP28 also supports 256/512)
     #[arg(long)]
     pub bank3: Option<u32>,
 
@@ -1858,6 +1858,19 @@ mod export_tests {
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
         cfg.validate().expect("indigo2_ip22 should validate on default build");
         assert!(!cfg.machine.profile.guinness());
+    }
+
+    #[test]
+    fn two_512_mb_banks_require_ip28() {
+        let mut cfg = MachineConfig::default();
+        cfg.banks = [512, 512, 0, 0];
+        for profile in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
+            cfg.machine.profile = profile;
+            assert!(cfg.validate().unwrap_err().contains("512 MB needs the IP28"));
+        }
+        cfg.machine.profile = MachineProfile::Indigo2Ip28;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.validate().expect("IP28 accepts two 512 MB banks");
     }
 
     #[test]
