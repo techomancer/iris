@@ -351,7 +351,7 @@ impl App {
         let ip28_banks = self.cfg.machine.profile.ip28();
         items.push(Item::Separator);
         items.push(Item::Info("Quick presets (auto-distributed)".into()));
-        for &p in crate::RAM_PRESETS {
+        for &p in crate::ram::ram_presets(ip28_banks) {
             items.push(
                 act(format!("{p} MB"), Action::SetRam(p))
                     .enabled_if(!running)
@@ -364,7 +364,7 @@ impl App {
                 .iter()
                 .map(|&sz| {
                     act(format!("{sz} MB"), Action::SetBank(i, sz))
-                        .enabled_if(!running && (sz != 256 || ip28_banks))
+                        .enabled_if(!running && (sz <= 128 || ip28_banks))
                         .checked_if(self.cfg.banks[i] == sz)
                 })
                 .collect();
