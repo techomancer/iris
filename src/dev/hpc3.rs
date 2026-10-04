@@ -1604,6 +1604,18 @@ impl BusDevice for Hpc3 {
     fn read8(&self, addr: u32) -> BusRead8 {
         let offset = addr - HPC3_BASE;
 
+        // IP28's PROM copies the PBUS control bitfield with byte loads.
+        if offset < 8 * PBUS_DMA_STRIDE {
+            let idx = (offset / PBUS_DMA_STRIDE) as usize;
+            let reg = (offset % PBUS_DMA_STRIDE) & !3;
+            let lane = offset & 3;
+            // Status/interrupt flags are in the low byte. Reading another
+            // lane must not acknowledge an interrupt through PbusDmaOps::read.
+            if reg == HPC3_PDMA_CTRL && lane != 3 { return BusRead8::ok(0); }
+            let val = self.pdma_ops[idx].read(&mut self.pdma_channels[idx].lock(), reg);
+            return BusRead8::ok((val >> ((3 - lane) * 8)) as u8);
+        }
+
         // INT2 (fullhouse only, PBUS PIO channel 4) — forwarded to Ioc's
         // BusDevice::read8, which detects the INT2 window itself.
         if !self.guinness && (HPC3_INT2_BASE..HPC3_INT2_BASE + HPC3_INT2_SIZE).contains(&offset) {
@@ -1703,6 +1715,25 @@ impl BusDevice for Hpc3 {
 
     fn write8(&self, addr: u32, val: u8) -> u32 {
         let offset = addr - HPC3_BASE;
+
+        // IP28's PROM emits four sb instructions for its DMA control struct.
+        // Use the addressed big-endian byte lane, without reading CTRL back:
+        // its read status and write strobes have different bit assignments.
+        if offset < 8 * PBUS_DMA_STRIDE {
+            let idx = (offset / PBUS_DMA_STRIDE) as usize;
+            let reg = (offset % PBUS_DMA_STRIDE) & !3;
+            let lane = offset & 3;
+            let shift = (3 - lane) * 8;
+            let mut chan = self.pdma_channels[idx].lock();
+            match reg {
+                HPC3_PDMA_CBP => chan.cbp = (chan.cbp & !(0xff << shift)) | ((val as u32) << shift),
+                HPC3_PDMA_NBDP => chan.nbdp = (chan.nbdp & !(0xff << shift)) | ((val as u32) << shift),
+                HPC3_PDMA_CTRL if lane == 3 => self.pdma_ops[idx].write(&mut chan, reg, val as u32),
+                // Upper CTRL lanes configure the FIFO, which is not modeled.
+                _ => {}
+            }
+            return BUS_OK;
+        }
 
         // INT2 (fullhouse only, PBUS PIO channel 4) — forwarded to Ioc's
         // BusDevice::write8, which detects the INT2 window itself.
@@ -2301,6 +2332,63 @@ mod tests {
             RtcOffset::default(),
             true,
         )
+    }
+
+    #[test]
+    fn ip28_byte_control_writes_start_and_drain_audio_dma() {
+        struct TuneMemory;
+        impl BusDevice for TuneMemory {
+            fn read32(&self, addr: u32) -> BusRead32 {
+                match addr {
+                    0x1000 => BusRead32::ok(0x2000),
+                    0x1004 => BusRead32::ok(0x8000_0004), // one sample, EOX
+                    0x1008 => BusRead32::ok(0),
+                    0x2000 => BusRead32::ok(0x0012_3400), // PROM: sample << 8
+                    _ => BusRead32::err(),
+                }
+            }
+        }
+        let hpc = hpc3_for_test();
+        let base = HPC3_BASE + PBUS_DMA_STRIDE; // Codec A channel 1
+        hpc.pdma_channels[1].lock().sys_mem = Some(Arc::new(TuneMemory));
+        hpc.write32(HPC3_BASE + PBUS_CFGDMA_BASE + PBUS_CFGDMA_STRIDE, PBUS_DMACFG_DS16);
+        hpc.write32(base + PBUS_DMA_DP, 0x1000);
+        // InitiateDMA's four byte stores, with ACT/ACT_LD in the final lane.
+        for (lane, byte) in [0x07, 0x04, 0x0b, 0x70].into_iter().enumerate() {
+            assert_eq!(hpc.write8(base + PBUS_DMA_CTRL + lane as u32, byte), BUS_OK);
+            assert_eq!(hpc.pdma_channels[1].lock().is_active(), lane == 3);
+        }
+        assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + 3).data & 2, 2);
+        let (sample, status, _) = hpc.pdma_channels[1].lock().dma_read().expect("audio DMA sample");
+        assert_eq!(sample, 0x1234);
+        assert!(!status.refused());
+        assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + 3).data & 2, 0);
+        assert_eq!(hpc.read32(base + PBUS_DMA_BP).data, 0x2004);
+    }
+
+    #[test]
+    fn pbus_byte_lanes_preserve_addresses_and_control_side_effects() {
+        let hpc = hpc3_for_test();
+        let base = HPC3_BASE + PBUS_DMA_STRIDE;
+        for reg in [PBUS_DMA_BP, PBUS_DMA_DP] {
+            hpc.write32(base + reg, 0x1234_5678);
+            hpc.write8(base + reg + 1, 0xab);
+            assert_eq!(hpc.read32(base + reg).data, 0x12ab_5678);
+            for (lane, byte) in [0x12, 0xab, 0x56, 0x78].into_iter().enumerate() {
+                assert_eq!(hpc.read8(base + reg + lane as u32).data, byte);
+            }
+        }
+        hpc.write8(base + PBUS_DMA_CTRL + 3, PDMA_CTRL_LITTLE as u8);
+        hpc.pdma_channels[1].lock().ctrl |= PDMA_CTRL_INT;
+        for lane in 0..3 {
+            hpc.write8(base + PBUS_DMA_CTRL + lane, 0xff);
+            assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + lane).data, 0);
+            let c = hpc.pdma_channels[1].lock();
+            assert!(c.endian);
+            assert_ne!(c.ctrl & PDMA_CTRL_INT, 0);
+        }
+        assert_eq!(hpc.read8(base + PBUS_DMA_CTRL + 3).data & 1, 1);
+        assert_eq!(hpc.pdma_channels[1].lock().ctrl & PDMA_CTRL_INT, 0);
     }
 
     fn set_latched_flags(hpc3: &Hpc3) {

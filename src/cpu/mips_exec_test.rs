@@ -224,6 +224,27 @@ mod tests {
         assert_eq!(core.fpu_fir,  0x0000_2300, "R5000 FIR after reset");
     }
 
+    /// IP28's play_hello_tune returns before touching HAL2 on pre-2.0 CPUs.
+    /// Check both cache models and the live CP0 value after construction/reset.
+    #[test]
+    fn r10000_revision_allows_ip28_boot_tune() {
+        fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                mem, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            for reset in [false, true] {
+                if reset { exec.core.reset(false); }
+                // The PROM uses (r4k_getprid() & 0x00f0) < 0x0020.
+                let prid = exec.core.read_cp0(15);
+                assert_eq!(prid, 0x0925);
+                assert!((prid & 0x00f0) >= 0x0020);
+                assert_eq!(exec.core.fpu_fir, 0x0900);
+            }
+        }
+        check::<crate::cpu::mips_cache_v2::R10000Cache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+    }
+
     // Instruction builders
     fn make_r(op: u32, rs: u32, rt: u32, rd: u32, sa: u32, funct: u32) -> u32 {
         (op << 26) | ((rs & 0x1F) << 21) | ((rt & 0x1F) << 16) | ((rd & 0x1F) << 11) | ((sa & 0x1F) << 6) | (funct & 0x3F)

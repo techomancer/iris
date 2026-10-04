@@ -541,8 +541,9 @@ impl<
 /// instruction lines and 32-byte data lines, a 1 MB secondary with 128-byte
 /// lines — 64 TLB entries, MIPS IV, and the R10000 cache operation encodings.
 /// Nothing of the microarchitecture: no ways, no LRU, no out-of-order.
+/// Reports revision 2.5, matching R10000Cache and enabling the IP28 boot tune.
 pub type R10000ShadowCache =
-    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0900, 0x0000_0900, 64, true>;
+    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, true>;
 
 #[cfg(test)]
 mod tests {

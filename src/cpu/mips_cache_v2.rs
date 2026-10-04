@@ -1173,10 +1173,11 @@ pub type R5000Cache = CpuCache<32768, 32, 2, 1024,
 /// What is *not* faked is anything software reads back: the PRId, the TLB
 /// size, MIPS IV decoding, and the cache tag layout the PROM's diagnostics
 /// inspect directly.
+/// Reports revision 2.5; the IP28 PROM skips its boot tune on pre-2.0 CPUs.
 pub type R10000Cache = CpuCache<32768, 64, 1, 512,
                                 32768, 32, 1, 1024, 4096,
                                 1048576, 128, 8192, 131072, 262144, true,
-                                true, 0x0000_0900, 0x0000_0900, 64, { model::R10000 }>;
+                                true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
 impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_TAGS: usize,
     const DC_SIZE: usize, const DC_LINE: usize, const DC_WAYS: usize, const DC_TAGS: usize, const DC_DATA: usize,
