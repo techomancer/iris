@@ -101,7 +101,7 @@ pub struct Machine {
     nvram_path: String,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
     display_resolution: crate::dev::ng1::vc2_timings::NewportResolution,
-    /// Whether Newport compositor is active (not headless / not XZ board).
+    /// Whether Newport is active (not headless and Newport is selected).
     newport_active: bool,
     /// Indigo2 IP22 fullhouse layout (`!guinness`).
     fullhouse: bool,
@@ -510,9 +510,8 @@ impl Machine {
                 hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
-                // A configured disk that won't attach (a CHD path when built
-                // without --features chd, or a disk the macOS sandbox won't let
-                // us read) can't host this device.
+                // A configured disk that won't attach (missing/corrupt image,
+                // or a file the macOS sandbox denies) can't host this device.
                 //
                 // Standalone CLI fails loudly and exits — booting on with a
                 // silently-missing device only yields a confusing PROM "no such

@@ -77,7 +77,7 @@ old `default-features = false` config never had an equivalent either.
   saa7191, mips_exec) compile untouched.
 - **`libchdman-rs` 0.288 → 0.289** needs no code change. The `chd_disk` tests
   exercise it for real — they create compressed CHDs, write COW diffs, and
-  flatten them — so a green `cargo test --features chd chd_disk` is meaningful
+  flatten them — so a green `cargo test chd_disk` is meaningful
   coverage of the upgrade, not just a compile check.
 
 ## What this sweep deliberately left alone

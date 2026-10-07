@@ -289,7 +289,7 @@ static void t_xcontext_ptebase_writable(void)
 
 /*
  * Count is a free-running counter. On the R4400 it advances at half the
- * pipeline clock (src/mips_core.rs:589), so the only portable assertion is
+ * pipeline clock (src/cpu/mips_core.rs:589), so the only portable assertion is
  * that it moves forward.
  */
 static void t_count_advances(void)
@@ -349,7 +349,7 @@ static void t_compare_round_trip(void)
  * becoming *equal* to Compare, not on Count exceeding it — so a Compare
  * written "in the past" does not fire until Count wraps all the way through
  * 2^32 and climbs back. IRIS models that faithfully (see
- * schedule_compare_timer in src/mips_core.rs). An earlier version of this test
+ * schedule_compare_timer in src/cpu/mips_core.rs). An earlier version of this test
  * set Count to 0 and Compare to a small constant, which raced against the
  * wallclock-anchored counter: it passed from a cold --load-elf start and
  * failed after a PROM boot, where Count had already run far ahead.

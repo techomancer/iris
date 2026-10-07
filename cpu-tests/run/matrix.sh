@@ -12,8 +12,8 @@
 #
 # The CPU is chosen at runtime with --cpu; the engine is a compile-time cargo
 # feature. Builds are cached in build/iris-<cpu>-<engine> so a re-run only
-# relinks what changed. (The r5000 cells still pass the vestigial r5k feature;
-# it no longer selects the CPU.)
+# rebuilds only when FORCE_BUILD is set or the cached binary is absent.
+# CPU choice comes from --cpu; the retired r5k feature is not passed.
 #
 # usage: run/matrix.sh [cell ...]      (default: all cells)
 #        CELLS="r4400-interp r5000-interp" run/matrix.sh
@@ -36,9 +36,9 @@ feature_for() {
         # r5ksc_triton currently work (both fail mips_cache_v2's L1I tests;
         # src/lib.rs refuses to build either) and there is no known-working
         # R5000 secondary-cache config right now — see
-        # rules/testing/r5k-l1i-cache-bugs.md. Plain r5k (R5000 CPU/FPU
-        # semantics, no secondary cache) is what actually builds today.
-        r5000) echo "r5k" ;;
+        # rules/testing/r5k-l1i-cache-bugs.md. The default build supports
+        # --cpu r5000 without a secondary cache or a CPU feature flag.
+        r5000) echo "" ;;
     esac
 }
 

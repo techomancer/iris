@@ -32,8 +32,9 @@ with the verified platform findings: `rules/build/mmap-rs-fixed-address-aliasing
 
 **Non-goals**
 
-- Replacing `Memory`. ppmem is selected behind a feature flag; `Memory` stays
-  the default and the fallback for platforms/configs where ppmem can't build.
+- Original non-goal: replacing `Memory`. The implementation superseded that
+  plan: all machine RAM banks use `PpMemory`; `Memory` remains a fixture.
+  If the host window is unavailable, bank bus accesses still work.
 - Changing the endianness contract. ppmem stores the same
   `rotate_left(32)`-swapped u64 layout `Memory` does. Endianness still lives
   only at The Edge (HACKING.md).

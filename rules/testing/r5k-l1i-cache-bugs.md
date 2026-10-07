@@ -1,5 +1,9 @@
 # R5000 secondary cache: no working configuration currently exists
 
+> The `r5k` feature was removed on 2026-10-01. Use `--cpu r5000` with
+> the default build; `r5ksc` / `r5ksc_triton` still refuse to build.
+> The commands below reproduce historical configurations.
+
 ## Status: open, not investigated — all R5000 L1I/L2 configs are broken
 
 > **Since August 2026 the CPU model is a runtime setting** (`--cpu r5000`,

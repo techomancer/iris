@@ -48,7 +48,7 @@
 #define MyAppName "IRIS"
 #define MyAppId "{{A7F2C91E-3D8B-4F5A-8E2C-1B9D6A3E8F42}"
 #define MyAppPublisher "Dani Sarfati"
-#define MyAppURL "https://github.com/danifunker/iris"
+#define MyAppURL "https://github.com/techomancer/iris"
 #define MyAppExeName "iris-gui.exe"
 
 [Setup]

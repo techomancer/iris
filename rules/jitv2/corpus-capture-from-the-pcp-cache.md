@@ -1,5 +1,9 @@
 # Corpus capture: `j2 corpus`, and the two bitmaps that look interchangeable
 
+> Whole-page compilation is the only implementation since 2026-09-21.
+> References below to the default per-entry compiler describe its removed
+> predecessor; `j2 corpus` and `j2 dumppcp` remain available with `jitv2`.
+
 Replaces the old `jitv2_corpus_dump` Cargo feature (removed 2026-09-19).
 
 ## Why the old capture went away

@@ -25,18 +25,18 @@ first diagnosis was wrong in a way that only measurement caught.
 So with CID checking on, hardware ignores FASTCLEAR and the draw proceeds as an ordinary
 one — which is why the host is told to set up COLORI as well.
 
-## What IRIS actually does
+## Behaviour before the fix
 
-There are **three** fastclear implementations, and they do not agree:
+At diagnosis there were **three** fastclear implementations, and they did not agree:
 
 | Path | CID honoured? |
 |---|---|
-| `execute_go` processor select ([rex3.rs:3862](../../src/rex3.rs)) — `fastclear() && no_cid && no_host` | ✅ yes |
-| `rex3_simd::try_fastclear_block` (`src/dev/ng1/rex3_simd.rs`, since deleted) | ❌ **no** |
-| rex-jit `emit_pixel_write` ([compiler.rs:543](../../src/rex3_jit/compiler.rs)) — `dm1.fastclear() && !is_hostw` | ❌ **no** |
+| `execute_go` processor select ([rex3.rs:3862](../../src/dev/ng1/rex3.rs)) — `fastclear() && no_cid && no_host` | ✅ yes |
+| `rex3_simd::try_fastclear_block` (`src/rex3_simd.rs` at the time, since deleted) | ❌ **no** |
+| rex-jit `emit_pixel_write` ([compiler.rs:543](../../src/dev/ng1/rex3_jit/compiler.rs)) — `dm1.fastclear() && !is_hostw` | ❌ **no** |
 
 `try_fastclear_block` runs as a pre-loop bailout at the top of `draw_block`
-([rex3.rs:1772](../../src/rex3.rs)), *before* `execute_go` selects a pixel processor. It
+([rex3.rs:1772](../../src/dev/ng1/rex3.rs)), *before* `execute_go` selects a pixel processor. It
 gates on fastclear, patterns, host mode and BLOCK adrmode — but never on CIDMATCH — then
 fills the whole block with `fastclear_color` and returns `true`.
 

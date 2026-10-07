@@ -1,5 +1,9 @@
 # tcache: L2 decoded-instruction coherency, and how it was broken
 
+> Update: R5000 two-way inline/transparent-cache support landed in September;
+> `jitv2` implies `tcache` since 2026-10-01. References below to a missing
+> two-way path describe the earlier implementation.
+
 ## Status: bug found and fixed, 2026-08-24 — read before touching tcache's write path
 
 Symptom: IRIX boot panicked with `EXC_RMISS` on a nonsense address (0x78) with

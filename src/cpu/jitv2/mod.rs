@@ -11,7 +11,7 @@ pub mod opcode_support;
 pub mod analyzer;
 pub mod codegen;
 pub mod paged_memory;
-// Always compiled in, under both `comp.rs` implementations: `j2 dumppcp`
+// Always compiled with jitv2: `j2 dumppcp`
 // and `j2 corpus` are monitor-console diagnostics, and the corpus capture
 // they feed has to be available in the same production-shaped build whose
 // emitted code anyone would want to measure (see `zz_corpus_sizes` below,
@@ -94,8 +94,9 @@ mod zz_corpus {
                 core: core::num::NonZeroUsize::new(core as *mut MipsCore as usize),
             }
         };
-        // R4400 L1-D: 16 KiB direct-mapped, 32-byte lines; 1 MiB L2 with
-        // 128-byte lines. Matches `CpuCache::jit_dc_geometry` for the Indy.
+        // Synthetic corpus-measurement geometry: 16 KiB direct-mapped L1-D
+        // with 32-byte lines, 1 MiB L2 with 128-byte lines. The production
+        // R4400 has 16-byte L1-D lines; this fixture measures emitted size.
         let geom = crate::cpu::mips_cache_v2::JitDcGeometry {
             supported: true,
             line_shift: 5,

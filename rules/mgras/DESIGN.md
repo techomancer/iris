@@ -12,24 +12,19 @@ backend thread and a display thread, with two FIFOs.
 
 blocks (src/dev/mgras):
   mod.rs        Mgras: bus decode, shared state, threads, sync rules
-  hq3.rs        HQ3 engine, frontend thread: CFIFO word parser, command
-                processor tokens (HLE), host DMA (HAG), formatter, context
-                switch. GE11 HLE goes here later, as GE7 lives in hq2.rs.
-  ge11.rs       GE11 diagnostic port and microcode storage (inert)
-  rss.rs        raster subsystem, backend thread: RE4 register file and
-                primitives (block, line, stipple, transfers; later triangles),
-                PP1 pixel ops, the framebuffer planes. TE1 joins it later.
-  dcb.rs        display control bus decode; vc3/xmap/cmap/dac chips (inert,
-                CPU thread)
-  disp.rs       display thread: retrace, then a frame snapshot + compose, present
-  frame.rs      display composition, Newport-style: snapshot after vblank
-                decodes planes, per-pixel window IDs (VC3 runs), per-DID
-                descriptors (XMAP), cmap, 8-bit gamma and cursor into flat
-                buffers; one pass per pixel (cursor, overlay, main, gamma)
-                makes the frame. Shader-ready: per-pixel work reads only its
-                own position in the buffers plus small tables.
-  debug.rs      monitor commands and annotated trace
-  record.rs     replayable recording + replay test (regression goldens)
+  hq3.rs        HQ3 frontend: CFIFO parser, HLE tokens, host DMA,
+                formatting and context switch/ERAM storage
+  ge11.rs       GE11 diagnostic port and microcode storage (no microcode execution)
+  gl.rs         GE11 OpenGL HLE; shared math/vertex/lighting in src/dev/gl
+  rss.rs        RSS backend: RE4 registers, 2D primitives, triangles and PP1 ops
+  te1.rs        Texture downloads, sampling, filtering and texture environment
+  pixmem.rs     Tiled 36-bit and overlay pixel storage, DRB/XMAP buffer pointers
+  dcb.rs        Display bus; VC3/XMAP/colormap/DAC register state
+  disp.rs       Display thread: retrace, snapshot, compose, present
+  frame.rs      VC3 timing/DID-derived dimensions (1280x1024 default),
+                window IDs, XMAP descriptors, gamma, cursor and composition
+  debug.rs      Monitor commands and annotated trace
+  record.rs     Replayable recording and checkpoint regression tests
 
 data path:
   CPU -> DCB (0x60000), dcbctrl (0x68000), HQ3 ucode RAM, privileged flag
@@ -44,7 +39,7 @@ data path:
 
 sync rules:
   - every producer pushes while holding `submit` (the CPU's bus accesses,
-    the display thread's frame tick). Holding `submit` with the board idle
+    the display thread's synchronized operations). Holding `submit` with the board idle
     means nothing can change engine state: that is how reads of drawing
     state, checkpoints, composites and the monitor touch the engines. The
     HQ3 thread never takes `submit` (its holder may be waiting for idle);
@@ -158,7 +153,7 @@ phases:
     triangle over the desktop (gl_batch_leaves_x_instruction_alone).
     glFinish = __MGR_RETURN_MODE round trip (answered 0, address logged).
     glprim flat and smooth triangles render live on 6.5.22.
-  - then 3D
+  - complete 3D buffer/Z/stencil semantics (remaining gaps below)
 
 pixel memory (Octane technical report section 4.4.14, Table 4.2; our
 reading): RDRAM bytes are 9 bits, and the framebuffer is built from 36-bit

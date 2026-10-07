@@ -1,15 +1,16 @@
 # jitv2 persistent code cache — design
 
-Status, 2026-09-24: implemented behind `IRIS_JIT_CACHE=1` (`src/cpu/jitv2/pcache.rs`),
-under verification. Where the implementation departs from the plan below, the
+Implemented in `src/cpu/jitv2/pcache.rs`; landed on 2026-09-29 (`36ec12b`).
+The September 24 measurements below predate that landing. Where the implementation departs from the plan below, the
 section says so.
 
-Update, 2026-10-01: the toggle is now `[jitv2] cache`/`cache_dir` in
-`iris.toml` (also exposed in the iris-gui config editor), which
+Update, 2026-10-01: the toggle is `[jitv2] cache`/`cache_dir` in
+`iris.toml` (iris-gui **General → Persistent JIT code cache** since
+2026-10-02), which
 `Jitv2Config::apply_env` (`src/config.rs`) turns into the `IRIS_JIT_CACHE`/
-`IRIS_JIT_CACHE_DIR` env vars described below. The env vars still work as a
-direct override — same rule as the rest of `[debug]`/`[jitv2]` — but are no
-longer the documented interface.
+`IRIS_JIT_CACHE_DIR` env vars described below. False/blank config values
+preserve existing environment values; enabled/nonempty config replaces them.
+The supported configuration inventory is in [FEATURES.md](../FEATURES.md).
 
 The R10000 JIT recompiles the same pages in every run. This keeps compiled
 pages on disk, keyed by what they were compiled from, so a later run loads
@@ -18,7 +19,8 @@ ahead-of-time compiler would fill (the last section).
 
 ## Why: measured, not assumed
 
-Two identical sessions on our IP28 (R10000) machine, which comes in a later pull request (boot to login, two MIPSpro compiles, two
+Two identical sessions on an IP28 (R10000) machine (boot to login, two
+MIPSpro compiles, two
 `ls -lR /usr/include`, small utilities), every compile logged with its page
 content hash, FR mode and entry set (`IRIS_JIT_HASHSTATS_LOG`):
 

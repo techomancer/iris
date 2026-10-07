@@ -71,5 +71,5 @@ replays that exact pair of Transfer Info commands against a file-backed disk
 and asserts the sector reaches it. Reverted, it fails with status 0x02 —
 CHECK CONDITION, the real symptom.
 
-Related: [`../irix/netbsd-wd33c93-empty-cdb.md`](../irix/netbsd-wd33c93-empty-cdb.md) is the
+Related: [SCSI PIO and LUN findings](linux-lun-scan-and-mode-sense-gaps.md) is the
 PIO half of the same seam.

@@ -8,11 +8,12 @@ switches it at runtime, and lockstep forces it off
 failed attempts, whose real cause was a Cranelift verifier error (§10), not the
 emit strategy.
 
-Original status line: design, not implemented. Scope: aligned 8/16/32/64-bit loads and
-stores only. Unaligned (LWL/LWR/LDL/LDR/SWL/SWR/SDL/SDR) keeps calling out —
-rare, and `write64_masked` already handles it.
+Since 2026-10-01, `jitv2` always uses `tcache`; the old non-tcache inline
+path below has been removed. R10000 uses the transparent memory window
+without L1 tag/dirty probes. Aligned 8/16/32/64-bit accesses are inlined;
+unaligned instructions still use interpreter memory helpers.
 
-Why this matters: every guest memory access currently costs a C-ABI call
+Original motivation: before inline memory, every guest access cost a C-ABI call
 through `core.read{8,16,32,64}_fn` plus a `jit_mem_exc` check. No JIT reaches
 QEMU-TCG / MAME-DRC class performance while that holds. `nutlb` and `tcache`
 were built to make this possible; this is the payoff.

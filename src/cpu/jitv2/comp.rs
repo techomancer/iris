@@ -23,33 +23,10 @@ use crate::cpu::jitv2::codegen::Codegen;
 use crate::cpu::jitv2::{CompileRequest, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::traits::BusDevice;
 
-/// Instruction budget for a compile-from-arrival region (see module doc):
-/// head instructions only — a branch/jump's mandatory delay slot (or nested
-/// slot-chain) is free and always included regardless of this number
-/// (`Analyzer::visit_slot`). Raised incrementally from 1 (the original
-/// "smallest possible working JIT" milestone) through 2/3/4/8, all booted
-/// clean — a live `j2 status` histogram at 8 showed real regions landing
-/// anywhere from 1 to 16 instructions (the tail past the nominal budget
-/// comes from a branch's mandatory delay slot counting toward the total but
-/// not the budget itself), clustering 8-11, with only a handful ever
-/// reaching 16. Defaults to 128 — real regions cluster 8-11 instructions, so
-/// this is a generous headroom rather than a tight cap, chosen to bound the
-/// rare pathological case (long branch-free/self-chaining-delay-slot runs)
-/// where an unbounded walk would otherwise let the analyzer grow one region
-/// arbitrarily large, producing a single huge, slow-to-compile Cranelift
-/// function and a single huge arena allocation for it. Any value at or
-/// above `ENTRIES_PER_PAGE` (1024 words/page) is equivalent to no budget at
-/// all, since the walk was always going to decline rather than compile a
-/// region longer than fits on one physical page anyway (module doc: "runs
-/// off the page... declines the whole region") — the page boundary, not
-/// this constant, is the real ceiling past that point (same as
-/// `Analyzer::walk`'s own unbounded case). `j2 max-instrs [N]` tunes this at
-/// runtime (e.g. to shrink compiled regions further for debugging/bisection,
-/// or raise it back toward `usize::MAX`); both `Analyzer::walk_bounded` and
-/// `Codegen::compile_region` were already written generically against
-/// `max_instrs` (fallthrough-edge wiring for a multi-instruction
-/// straight-line region already exists, per `compile_region`'s Pass 2), so
-/// this is just a config read, not a redesign.
+/// Walk budget per compile, counting head instructions; mandatory branch
+/// delay slots are included without consuming this budget. Defaults to
+/// `ENTRIES_PER_PAGE` (1024), so the physical page bounds the walk.
+/// `j2 max-instrs [N]` can lower the budget for debugging or bisection.
 static MAX_INSTRS_PER_COMPILE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(ENTRIES_PER_PAGE);
 
 pub fn set_max_instrs_per_compile(n: usize) {
@@ -60,26 +37,10 @@ pub fn max_instrs_per_compile() -> usize {
     MAX_INSTRS_PER_COMPILE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Minimum walked-region instruction count a compile must reach to actually
-/// get compiled — regions shorter than this are sticky-denylisted instead,
-/// same treatment as any other decline (§6.4). Below this floor, the
-/// per-compile fixed overhead (Cranelift IR building + one arena allocation
-/// + one entry_table publish) very likely costs more than the region will
-/// ever save over just interpreting it: a true single-instruction region is
-/// the worst case for this tradeoff and, per `MAX_INSTRS_PER_COMPILE`'s own
-/// doc comment, real regions cluster 8-11 instructions anyway — a
-/// one-instruction region is far more often either a rare cold path or an
-/// analyzer/codegen edge case than a genuinely hot single-instruction loop
-/// body worth paying compile cost for. `j2 min-instrs [N]` tunes this at
-/// runtime. Applies identically to `handle_request` and
-/// `handle_request_deferred` — both consult `min_instrs_to_compile()` right
-/// after a successful, non-empty walk.
-///
-/// Defaults to 1 (no filtering) under `developer` — diagnostics builds want
-/// to see and measure every compile the analyzer/codegen would otherwise
-/// attempt, not have some silently skipped by a production-tuned floor — and
-/// to 2 otherwise, since real-world usage wants a *little* filtering by
-/// default rather than requiring a manual `j2 min-instrs` on every run.
+/// Minimum walked-region instruction count before codegen. Shorter regions
+/// are sticky-denylisted. Defaults to 0 (no filtering) in every build;
+/// `j2 min-instrs [N]` changes the floor at runtime. Both synchronous and
+/// deferred compilation use the same preparation check.
 static MIN_INSTRS_TO_COMPILE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_min_instrs_to_compile(n: usize) {

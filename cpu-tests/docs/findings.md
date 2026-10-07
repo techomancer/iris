@@ -1,5 +1,15 @@
 # Findings
 
+> This is a historical investigation, not a current list of failing checks.
+> Current code implements the condition-code extraction, Wired/FCSR masks,
+> trapped-result/Flag ordering, per-instruction Cause replacement, denormal/FS
+> handling, and signaling-NaN compare/ABS/NEG fixes described below.
+> MIPS IV selection follows the runtime CPU. See `src/cpu/mips_exec.rs`
+> (`fpu_update_fcsr_full`, `fpu_check_denorm_operand_s/d`, `exec_fcc_s/d`,
+> `exec_fabs_s/d`, `exec_fneg_s/d`) and [status.md](status.md).
+> The tables retain their recorded run results; CI failure ceilings are
+> budgets, not a fresh measurement of today's remaining failures.
+
 Deviations from the R4000/MIPS IV architecture that the suite has surfaced in
 IRIS. Each entry says what the manual requires, what IRIS did, and how much it
 matters in practice.
@@ -9,7 +19,7 @@ in [gotchas.md](gotchas.md) instead. Telling the two apart is most of the work.
 
 ---
 
-## 1. `c.cond.fmt` wrote the wrong FP condition code — **open here; fix on a branch**
+## 1. `c.cond.fmt` wrote the wrong FP condition code — **implemented; original branch report below**
 
 *Found by `mips4/multi_fp_cc`.*
 
@@ -76,9 +86,9 @@ This is also the case the whole R4400-vs-R5000 axis exists for.
 
 > **Status (August 2026):** fixed when the CPU model became a type. The
 > interpreter's decoder now consults `C::MIPS4`, so an R4400 raises Reserved
-> Instruction for these encodings and an R5000 executes them. jitv2 only
-> compiles them in a `--features mips4` build and otherwise falls back to the
-> interpreter. The `mips4/*` tests still failing on R4400 in the hardware
+> Instruction for these encodings and an R5000 executes them. jitv2 takes
+> the same ISA level from the configured CPU at runtime; the `mips4` Cargo
+> feature was removed on 2026-10-01. The `mips4/*` tests still failing on R4400 in the hardware
 > comparison below are a different bug: an unimplemented COP1 encoding must
 > raise `EXC_FPE`, and IRIS raises `EXC_RI`. The text below describes the
 > original finding.
@@ -121,7 +131,7 @@ expectations above are not being met vacuously by a CPU that traps everything.
 
 ---
 
-## 3. `Wired`'s reserved bits do not read back as zero — **open**
+## 3. `Wired`'s reserved bits do not read back as zero — **fixed**
 
 *Found by `cp0/wired_reserved_bits`.*
 
@@ -137,7 +147,7 @@ such things, not because anything depends on it.
 
 ---
 
-## 4. FCSR's reserved bits do not read back as zero — **open**
+## 4. FCSR's reserved bits do not read back as zero — **fixed**
 
 *Found by `fpu/fcsr_reserved`.*
 
@@ -195,7 +205,7 @@ kernel does — and reports the skip instead of failing on it.
 
 ---
 
-## 6. A trapped FP exception still writes its result and its Flag bit — **open**
+## 6. A trapped FP exception still writes its result and its Flag bit — **implemented; historical diagnosis below**
 
 *Found by the whole `fpu/trap_*` group. Two rules, one root cause.*
 
@@ -241,7 +251,7 @@ Cause.V and Flag.V together on the way out, so the *flag* rule does not.
 
 ---
 
-## 7. FCSR Cause bits accumulate instead of being rewritten — **open**
+## 7. FCSR Cause bits accumulate instead of being rewritten — **implemented; historical diagnosis below**
 
 *Found by `fpu/cause_per_instruction`.*
 
@@ -275,7 +285,7 @@ polls Cause after each step would get wrong, silently.
 
 ---
 
-## 8. Denormals never trap, and FCSR.FS is inert — **open**
+## 8. Denormals never trap, and FCSR.FS is inert — **implemented; historical diagnosis below**
 
 *Found by the `fpu/denorm_*` group.*
 
@@ -315,7 +325,7 @@ are permitted to differ on. See [oracle.md](oracle.md).
 
 ---
 
-## 9. A signalling NaN raises Invalid only where a quiet one would — **open**
+## 9. A signalling NaN raises Invalid only where a quiet one would — **implemented; historical diagnosis below**
 
 *Found by `fpu/cmp_snan_any_pred`.*
 
@@ -345,7 +355,7 @@ in code that is otherwise exactly right, which is the main reason to record it.
 
 ---
 
-## 10. ABS.fmt and NEG.fmt never raise Invalid — **open**
+## 10. ABS.fmt and NEG.fmt never raise Invalid — **implemented; historical diagnosis below**
 
 *Found by `fpu/snan_operands`.*
 
@@ -461,7 +471,7 @@ family-wide IRIS bugs rather than R4400 quirks.
 leaves the upper half of `rt` untouched on a partial `LWR`; an **R5000**
 sign-extends at every offset. Both measured, both now asserted.
 
-### Where the emulator now stands
+### Recorded hardware-comparison snapshot
 
 | | checks passed | failed | failing tests | bugs confirmed |
 |---|---:|---:|---:|---:|

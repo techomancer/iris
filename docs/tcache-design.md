@@ -1,10 +1,13 @@
 # tcache — transparent cache
 
-Status: **implemented (R4400 path), measured ~2% below baseline. Off by
-default.** Not dead — v3 recovered most of an earlier, much worse result that
-came from an implementation bug, so the remaining gap is small. See §0.
+Status: **implemented for R4400/R5000 and mandatory with `jitv2`** since
+2026-10-01. Interpreter builds can opt in with `--features tcache`; the
+default interpreter leaves it off. ppmem is unconditional. R10000 uses a
+shadow cache and a tagless direct memory window.
 
-Companion to `docs/ppmem-design.md`; depends on ppmem being available.
+The measurements and design discussion below record the earlier R4400
+interpreter experiment; they do not describe JIT performance. Companion to
+`docs/ppmem-design.md`.
 
 ---
 
@@ -20,7 +23,7 @@ Companion to `docs/ppmem-design.md`; depends on ppmem being available.
 | tcache v2 — gate hoisted into `tag.backed` | 38.2 | 47.0 | 100% |
 | tcache v3 — **L2 genuinely bypassed** | **39.6** | 46.1 | 100% |
 
-Still ~2% short of baseline, so it stays off — but the trajectory says the
+In that interpreter measurement it was ~2% short of baseline — but the trajectory says the
 remaining gap is small and the earlier "this idea is dead" conclusion was
 premature and based on a broken implementation.
 

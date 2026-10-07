@@ -1,6 +1,6 @@
 # A page's pinned FR mode must be re-derived, not pinned for life
 
-`j2wp` compiles one function per physical page, with FR mode baked into every
+`jitv2` compiles one function per physical page, with FR mode baked into every
 FPR-access emitter at compile time. `PhysicalCodePage::fr1` records which mode
 that function was built for. It used to be stored once at `claim` and **never
 reset by anything** — verified across `page_for` (ignores its `fr1` argument on

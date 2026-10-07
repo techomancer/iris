@@ -15,6 +15,9 @@ Release workflow, and a sandboxed build ships on the Mac App Store.
 
 ---
 
+See [FEATURES.md](FEATURES.md) for the complete GUI/core build-feature list,
+shared machine configuration, persisted GUI settings, defaults, and conflicts.
+
 ## 1. Build and run
 
 ### Default build (recommended)
@@ -23,10 +26,9 @@ Release workflow, and a sandboxed build ships on the Mac App Store.
 cargo run -p iris-gui --release
 ```
 
-The first build is slow because iris-gui always enables three heavyweight
-*additive* iris features so they're available at runtime: `chd`
-(libchdman-rs), `camera` (nokhwa / V4L), and `rex-jit` (Cranelift).
-Subsequent builds are fast.
+The first build compiles libchdman-rs, the camera backends (nokhwa / V4L),
+and Cranelift. CHD and camera support are unconditional in the core; iris-gui
+also enables `rex-jit`. Device use is configured at runtime.
 
 A debug build (`cargo run -p iris-gui` without `--release`) is fine for
 iterating on the GUI itself but uses an unoptimized iris core, which means
@@ -37,15 +39,16 @@ emulation will be noticeably slow.
 | Feature | What it does |
 |---|---|
 | `pcap` | PCAP bridged networking; the Networking tab lists host interfaces. Needs libpcap / a WinPcap-compatible SDK |
-| `daynaport` | DaynaPort SCSI/Link targets on the Disks tab (without it the option is shown with a rebuild hint) |
-| `ultra64` | N64 development board toggle and help window |
-| `ip28` | Indigo2 IMPACT (IP28) machine profile and R10000 CPU in the Machine model / Processor dropdowns. Bring-up status; implies `ppmem`. The IMPACT/MGRAS graphics board itself needs no feature — it's selectable in the Graphics board dropdown for any Indigo2 profile |
 | `hostcall` | Host services for IRIX programs over private syscalls 3000-3009. No per-machine setting — the Debug tab just reports it's built in |
 | `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) only for now — builds elsewhere but registers no backend |
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
 | `bundled` | Distributed build: hides the iris.toml import/export items. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
-| `r5k` | Vestigial. The CPU is a runtime setting (Machine menu / General tab) |
+
+DaynaPort, Ultra64, IP28/R10000, and the graphics board models are built in.
+The `chd`, `camera`, `daynaport`, `ultra64`, `ip28`, `ppmem`, `mips4`, and
+`r5k` features have been removed. Ultra64 needs the external gopher64 emulator
+and is hidden in App Store builds.
 
 Core features that change how the executor is built pass straight through to
 iris:
@@ -82,15 +85,19 @@ automatically. You'll be asked for:
 
 - **Name** — used for the machine entry in `gui.json`. Conflicts get a
   numeric suffix (`indy`, `indy-2`, …).
-- **Machine model** — Indy (IP24) or Indigo2 (IP22), the **Processor** (R4400
-  or R5000), and a display resolution (or leave it to IRIX).
+- **Machine model** — Indy (IP24), Indigo2 (IP22), or Indigo2 IMPACT (IP28).
+  **Processor** offers R4400, R5000, and R10000. Selecting IP28 defaults to
+  R10000 and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
-  needed. Untick to point at your own `prom.bin`.
+  needed for IP24/IP22. IP28 disables the embedded option and needs your own
+  dumped IP28 PROM.
 - **NVRAM file** — defaults to a stable per-user path (see Storage) and is
-  seeded with a default NVRAM on first use.
+  seeded with a default NVRAM on first use. Indigo2 profiles also have a
+  **NVRAM EEPROM file**, which stores their PROM environment and MAC.
 - **Total RAM** — preset totals. Tick **Advanced: configure individual banks**
-  to set each of the four banks yourself (valid sizes: 0, 8, 16, 32, 64, 128 MB).
+  to set each of the four banks yourself (0, 8, 16, 32, 64, 128 MB; IP28
+  also allows 256 and 512 MB). IP28 presets extend to 1024 MB.
 - **Boot disk (SCSI #1)** — optional path. For a fresh install, create a blank
   image afterwards from the SCSI menu (**Create blank HDD image…**).
 - **CD-ROM (SCSI #4)** — optional install media.
@@ -98,7 +105,8 @@ automatically. You'll be asked for:
 Hit **Create**. The machine is saved to `gui.json` and becomes active. Start it
 from the **Machine** menu.
 
-If the NVRAM has no Ethernet MAC, iris-gui writes one before boot and holds a
+If the NVRAM or motherboard EEPROM has no Ethernet MAC, iris-gui writes one
+before boot and holds a
 MAC-less machine at the PROM instead of booting IRIX into a network that can't
 work.
 
@@ -117,14 +125,15 @@ to fit.
 
 The control column holds, top to bottom: the drop-down menus, the capture
 button and hint, the configuration editor, and a status footer (run state,
-machine name, MIPS readout, and the **NET** light for the internal network).
+machine name, MIPS, kernel tick **Hz**, graphics FIFO depth, and the **NET**
+light for the internal network).
 
 ### Menus
 
 | Menu | Contents |
 | --- | --- |
 | **File** | New machine… / Switch to machine / Import iris.toml… / Export current to iris.toml… / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
-| **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (R4400 or R5000, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
+| **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (R4400, R5000, or R10000, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
 | **Memory** | Total presets, plus per-bank submenus |
 | **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions, plus per-disk **Commit changes to disk** / **Discard changes** for COW overlays and CHD diffs while stopped |
 | **View** | Fullscreen (F11), UI scale, VM screen scale |
@@ -144,8 +153,8 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform (Indy / Indigo2 / Indigo2 IMPACT with `ip28`), CPU (R4400 / R5000 / R10000 with `ip28`), graphics board (Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Max via `[graphics] board`), Newport heads, display resolution, PROM, NVRAM, ttyd1 serial log |
-| **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, controller (Indigo2) |
+| **General** | Platform, CPU, CP0 Count clock, persistent JIT code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log |
+| **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
 | **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering |
@@ -175,7 +184,7 @@ capture after a short grace period.
 ### Serial console and networking help
 
 **Serial console…** (Machine and Help menus) opens an in-app IRIX serial console
-(a client of `127.0.0.1:8881`). Networking has a "check / fix guest networking" flow that compares `ec0`
+(a client of the machine's `serial_port_b`, default `127.0.0.1:8881`). Networking has a "check / fix guest networking" flow that compares `ec0`
 against the NAT subnet and can issue the IRIX commands to fix it, and a mount
 helper that shows the exact `mount` command for the NFS share (including the
 PCAP-mode NFS IP).
@@ -291,7 +300,16 @@ These cases are treated as safe:
 - **CHD** (`*.chd`) — writes go to a `.diff.chd` sidecar; the base CHD is
   never modified.
 
-"Send IRIX halt" connects to `127.0.0.1:8881` and writes `halt\n`.
+"Send IRIX halt" uses the machine's channel B port (`serial_port_b`, default
+`8881`) and writes `halt\n`. This requires a guest shell ready to accept it.
+
+### NVRAM persistence
+
+Normal **Stop**, **Quit**, and guest power-off save the DS1386 NVRAM and, on
+Indigo2, the motherboard EEPROM. Writes use a temporary file and replacement
+so a failed save preserves the previous image. Forced process termination
+bypasses Stop; use `rtc save` / `nveeprom save` before terminating a process.
+See [Battery-backed state on Stop](rules/irix/nvram-persistence.md).
 
 ### Disk synchronization on exit
 
@@ -318,16 +336,16 @@ reclaims them at exit). The same bound is applied on **Quit**.
 
 ```
 iris/
-├── Cargo.toml         [workspace] { members = ["iris-gui"] }
+├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall; iris-hostgl excluded
 ├── src/               iris library + CLI
 └── iris-gui/
-    ├── Cargo.toml     depends on iris with chd, camera, rex-jit on
+    ├── Cargo.toml     depends on iris with rex-jit; CHD/camera built into core
     ├── build.rs       APP_VERSION (from RELEASE_VERSION or the crate version)
     ├── assets/        icons, default NVRAM
     └── src/
         ├── main.rs            App: control column, menus, modals, update loop
         ├── handle.rs          EmulatorHandle: worker thread, Cmd/Evt channels
-        ├── framebuffer.rs     CaptureRenderer + FrameSink (REX3 → egui texture)
+        ├── framebuffer.rs     CaptureRenderer + FrameSink (GfxDisplay → egui texture)
         ├── input.rs           capture, egui → PS/2 keyboard+mouse pump
         ├── config_ui.rs       configuration tabs
         ├── bench_ui.rs        Benchmark tab
@@ -364,10 +382,10 @@ iris/
 
 - The eframe app owns the single `winit::EventLoop` for the process.
   iris's own `src/ui.rs` event loop is **not** used — iris-gui never
-  calls `Ui::run`, so iris never opens its own window. REX3 still
-  runs its refresh loop; iris-gui intercepts the per-frame output via a
-  custom `Renderer` impl (`framebuffer.rs::CaptureRenderer`) installed
-  into `Rex3::renderer` before the CPU starts, and uploads it to an
+  calls `Ui::run`, so iris never opens its own window. The selected graphics
+  board runs its display loop; iris-gui installs a custom `Renderer`
+  (`framebuffer.rs::CaptureRenderer`) through `Machine::get_display()`
+  and the `GfxDisplay` trait before the CPU starts, then uploads frames to an
   `egui::TextureHandle`.
 - Window operations (resize, fullscreen, surface creation) must run on the
   main/event-loop thread; other threads send requests to it. Calling them from
@@ -397,11 +415,11 @@ enum Evt { Started, Stopped, PowerOff, StateSaved(name), StateRestored(name),
 
 ### Build-time feature detection
 
-`src/lib.rs` exposes `iris::build_features` (`CHD`, `CAMERA`, `PCAP`, `JITV2`,
-`REX_JIT`, `ULTRA64`, `DAYNAPORT`, `LIGHTNING`, `IDLE_PAUSE`, plus `enabled()`
-and `banner()` for the full list). iris-gui reads these to list the build in
-Help → Diagnostics, hide the Debug tab in lightning builds, gate the DaynaPort,
-PCAP and Ultra64 controls, and label the camera source. The emulated CPU is not
+`src/lib.rs` exposes `iris::build_features` (`PCAP`, `JITV2`, `REX_JIT`,
+`HOSTCALL`, `HOSTGL`, `LIGHTNING`, `IDLE_PAUSE`, plus `enabled()` and `banner()`
+for the full list). iris-gui reads these to list the build in
+Help → Diagnostics, hide the Debug tab in lightning builds, and gate PCAP
+and persistent JIT cache controls. The emulated CPU is not
 a build feature — read `MachineConfig::machine.cpu`.
 
 ### Conventions

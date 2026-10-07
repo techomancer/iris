@@ -1,5 +1,11 @@
 # Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`)
 
+> Historical implementation plan. The in-process NFSv2/v3 server is now
+> implemented in `src/net/nfsudp.rs`; external `unfsd` is no longer required.
+> Use [networking guide](../rules/irix/networking.md) for current setup and
+> [TODO.md](../TODO.md) for outstanding verification. The checklist below
+> records the original plan, not the current implementation status.
+
 Status: **shipped.** It is the only NFS path (HELP.md, "NFS file sharing"). Real
 IRIX mounts have since turned up and fixed
 READDIR `count` handling (`rules/irix/nfs-readdir-must-respect-count-and-fit-one-datagram.md`),

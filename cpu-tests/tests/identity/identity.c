@@ -44,7 +44,7 @@ static void t_fir(void)
 
 /* Config.IC/DC encode cache size as 2^(12+n) bytes; IB/DB are the line size,
  * 0 = 16 bytes, 1 = 32 bytes. R4400: 16 KB/16 B direct-mapped. R5000:
- * 32 KB/32 B two-way. (src/mips_cache_v2.rs:41-100, src/mips_exec.rs:89-90)
+ * 32 KB/32 B two-way. (src/cpu/mips_cache_v2.rs:41-100, src/cpu/mips_exec.rs:89-90)
  * R4600: 16 KB/32 B two-way, from the IDT79R4600 data sheet — no R4600 has
  * run this suite yet. */
 static void t_config_cache_geometry(void)

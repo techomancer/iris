@@ -2,7 +2,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
-/// Valid memory bank sizes in MB.
+/// Memory bank sizes in MB; validation restricts 256/512 MB banks to IP28.
 pub const VALID_BANK_SIZES: &[u32] = &[0, 8, 16, 32, 64, 128, 256, 512];
 
 /// What sits at a SCSI id. `cdrom = true` remains the historical spelling for
@@ -16,7 +16,7 @@ pub enum ScsiKind {
     /// CD-ROM drive (may start with an empty tray).
     Cdrom,
     /// DaynaPort SCSI/Link — a SCSI-attached Ethernet adapter. Has no disk
-    /// image at all. Requires a build with `--features daynaport`.
+    /// image at all. Built in; attach it with `kind = "daynaport"`.
     Daynaport,
 }
 
@@ -332,7 +332,7 @@ pub struct NetworkSection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum VinoSource {
-    /// Live host camera capture (requires building with `--features camera`).
+    /// Live host camera capture (built in; selected through `[vino] source`).
     /// First run on macOS triggers the camera permission dialog.
     Camera,
     /// SMPTE-style colour bars + animated luma ramp.  No host capture needed.
@@ -393,8 +393,8 @@ pub enum MachineProfile {
     /// the HPC3 board revision have to read high enough for the kernel to
     /// call the board an IP28.
     ///
-    /// Graphics is IMPACT, which is a register stub — an IP28 kernel carries
-    /// no Newport driver, so REX3 is not an alternative here.
+    /// Use an IMPACT board (`src/dev/mgras/`): an IP28 kernel carries no
+    /// Newport driver, so REX3 is not an alternative for that guest.
     Indigo2Ip28,
 }
 
@@ -537,7 +537,9 @@ impl std::fmt::Display for GraphicsBoard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
-    /// Graphics board: `newport` (default), or GR2 `xz` (Indy/Indigo2) / `extreme` (Indigo2).
+    /// Graphics board: Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Maximum.
+    /// Extreme is restricted to IP22; non-Newport boards require one head
+    /// and Guest resolution. See [`MachineConfig::validate`].
     #[serde(default)]
     pub board: GraphicsBoard,
     /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
@@ -581,7 +583,8 @@ pub enum CpuModel {
     /// MIPS R5000, 2-way 32K L1s, no secondary cache, MIPS IV.
     R5000,
     /// MIPS R10000, 2-way 32K L1s, 1 MB secondary cache, MIPS IV. The CPU in
-    /// the Indigo2 IMPACT (IP28). Bring-up only — see docs/ip28-bringup.md.
+    /// the Indigo2 IMPACT (IP28). The machine uses shadow cache arrays;
+    /// see `docs/indigo2-ip28.md` and `src/cpu/mips_cache_shadow.rs`.
     R10000,
 }
 
@@ -642,8 +645,9 @@ impl Default for DebugConfig {
 
 impl DebugConfig {
     /// Apply to current process environment (CLI and iris-gui before Machine::new).
-    /// Publish `[debug]` into the environment, **without** overwriting a
-    /// variable the caller set.
+    /// Publish enabled/nonempty `[debug]` values into the environment.
+    /// Default false/blank values preserve variables the caller already set;
+    /// explicit nonempty values overwrite the corresponding variable.
     ///
     /// The caller's comment has always promised "env vars still override if
     /// set externally" and the code did the opposite: a config with no
@@ -652,7 +656,8 @@ impl DebugConfig {
     /// logging at all — devlog looked dead when only its bootstrap was.
     ///
     /// This governs all three `[debug]` keys, not just `debug_log`: a caller
-    /// who sets `IRIS_NO_IDLE` or `IRIS_GUI_GL` keeps it too.
+    /// who sets `IRIS_NO_IDLE` or `IRIS_GUI_GL` keeps it when the corresponding
+    /// config value is false; an enabled setting publishes `1`.
     pub fn apply_env(&self) {
         set_or_remove_env("IRIS_NO_IDLE", if self.no_idle { "1" } else { "" });
         set_or_remove_env("IRIS_GUI_GL", if self.gui_gl_capture { "1" } else { "" });
@@ -660,12 +665,11 @@ impl DebugConfig {
     }
 }
 
-/// Set `key` from the config, unless the environment already says otherwise.
+/// Publish nonempty config values; preserve existing env values for blank config.
 ///
 /// An empty config value means "the config does not mention this", which is
-/// not the same as "unset it": only a variable this function itself could
-/// have set is cleared, and one that arrived from the caller's environment is
-/// left alone.
+/// not the same as "unset it": an existing variable is left alone regardless
+/// of who originally set it. A nonempty config value replaces it.
 fn set_or_remove_env(key: &str, val: &str) {
     if std::env::var_os(key).is_some() && val.is_empty() {
         return;
@@ -684,8 +688,8 @@ fn set_or_remove_env(key: &str, val: &str) {
 /// process environment at `Start` the same way `DebugConfig` applies
 /// `[debug]` (see `Jitv2Config::apply_env`). `cache`/`cache_dir` used to be
 /// the undocumented `IRIS_JIT_CACHE`/`IRIS_JIT_CACHE_DIR` env vars; those
-/// still work as a direct override (same "env wins if externally set" rule
-/// as `[debug]`), but the config is now the documented interface.
+/// still work when config is false/blank. Explicit enabled/nonempty config
+/// values replace them, as with `[debug]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Jitv2Config {
@@ -714,8 +718,8 @@ impl Default for Jitv2Config {
 
 impl Jitv2Config {
     /// Apply to current process environment (CLI and iris-gui before
-    /// Machine::new). Same "doesn't overwrite a variable the caller set"
-    /// rule as `DebugConfig::apply_env` — see its doc comment.
+    /// Machine::new). False/blank config preserves existing environment values;
+    /// enabled/nonempty config replaces them, as in `DebugConfig::apply_env`.
     pub fn apply_env(&self) {
         set_or_remove_env("IRIS_JIT_CACHE", if self.cache { "1" } else { "" });
         set_or_remove_env("IRIS_JIT_CACHE_DIR", &self.cache_dir);
@@ -727,10 +731,9 @@ impl Jitv2Config {
 #[serde(deny_unknown_fields)]
 pub struct ClockConfig {
     /// CP0 Count frequency in MHz. Count ticks at a fixed rate; there is no
-    /// runtime inference. None = `DEFAULT_COUNT_HZ` (33 MHz), which is what
-    /// IRIX expects — it reports a 66 MHz CPU for a 33 MHz Count, and since
-    /// these systems are interrupt-driven the emulator running at a different
-    /// real speed has no ill effects.
+    /// runtime inference. None selects the profile default: 33 MHz on
+    /// IP22/IP24 or 97.5 MHz on IP28. IRIX reports twice the Count rate as
+    /// CPU MHz; host emulation throughput is independent of this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_mhz: Option<f64>,
 }
@@ -1060,11 +1063,12 @@ pub struct MachineConfig {
     pub nat_subnet: Option<String>,
 
     /// CI mode: opens a control socket for automation, applies speed-favoring
-    /// fidelity shortcuts. Implies headless unless ci_display is also set.
+    /// fidelity shortcuts. Hides the host window unless ci_display is set;
+    /// offscreen graphics remain active unless headless is explicitly set.
     #[serde(default)]
     pub ci: bool,
 
-    /// Unix socket path for CI control. Used only when `ci` is true.
+    /// Unix socket path or TCP host:port for CI control. Used only when `ci` is true.
     #[serde(default = "default_ci_socket")]
     pub ci_socket: String,
 
@@ -1583,12 +1587,11 @@ pub struct Cli {
     #[arg(long = "no-scsi-deferred-int", default_value_t = false)]
     pub no_scsi_deferred_int: bool,
 
-    /// Emulated CPU: `r4400` (default) or `r5000`. Overrides `[machine] cpu`.
+    /// Emulated CPU: `r4400` (default), `r5000`, or `r10000`. Overrides `[machine] cpu`.
     ///
-    /// Both models are compiled into every build — each is its own
+    /// All three models are compiled into every build — each is its own
     /// monomorphisation, so the hot path carries no per-model branch — and this
-    /// picks between them at construction. The `r5k` cargo feature no longer
-    /// selects the model and is vestigial for that purpose.
+    /// picks between them at construction. The `r5k` Cargo feature is removed.
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<CpuModel>,
 
@@ -1642,7 +1645,8 @@ pub struct Cli {
     pub load_elf: Option<String>,
 
     /// CI mode: enable the control socket and apply speed-favoring fidelity
-    /// shortcuts. Implies --headless unless --ci-display is also set.
+    /// shortcuts. Hides the window unless --ci-display is set; offscreen
+    /// graphics remain active unless --headless is explicitly set.
     #[arg(long, default_value_t = false)]
     pub ci: bool,
 
@@ -1660,8 +1664,8 @@ pub struct Cli {
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
 
-    /// Override the fixed CP0 Count frequency in MHz (default 33, which IRIX
-    /// reports as a 66 MHz CPU), e.g. --clock-fixed-mhz 50.
+    /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
+    /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
     pub clock_fixed_mhz: Option<f64>,
 }

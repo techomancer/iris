@@ -532,8 +532,8 @@ fn start_transaction(&mut self) {
         if !self.is_active() { return None; }
         self.dev_reads += 1;
 
-        // PBUS DMA (Channels 0-7) always operates on 32-bit words
-        // but only uses the most significant 8 or 16 bits.
+        // PBUS DMA (channels 0-7) reads 32-bit words; 16-bit samples occupy
+        // bits 23:8, while 8-bit transfers use bits 31:24.
         if self.id < 8 {
             let addr = self.cbp;
             let mem_val = if let Some(mem) = &self.sys_mem {
@@ -1357,7 +1357,7 @@ impl Hpc3 {
 
 impl Device for Hpc3 {
     fn step(&self, _cycles: u64) {
-        // TODO: Implement DMA stepping
+        // DMA is driven by clients and peripheral workers, not CPU cycles.
     }
 
     fn stop(&self) {

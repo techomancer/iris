@@ -1,6 +1,27 @@
 # IRIS JIT v2 — Design Plan (draft for discussion)
 
-Status: **implementation in progress, doc tracks as-built reality** (last reconciled against `src/cpu/jitv2/` 2026-08-07). Open questions marked `[Q]` throughout and collected at the end. Sections marked *(as-built)* describe what the implementation actually does where it diverged from the original plan; §12 is the divergence map and the code-cache locality investigation.
+Status: **implemented, with historical design notes retained**. The original
+plan and dated experiments below explain earlier implementations. For current
+operational defaults, see [HACKING.md](../../HACKING.md#7-jit-v2---features-jitv2--experimental).
+
+As of 2026-10-07 (`src/cpu/jitv2/`):
+
+- Whole-page/multi-entry compilation is the only implementation (since
+  2026-09-21); `j2wp` is a compatibility alias. The per-entry `JitEntry`
+  protocol and claims that both implementations coexist are historical.
+- The walk budget defaults to 1024 words, the minimum-instruction floor to 0.
+  Per-entry hotness counting is absent; `j2 min-calls` stores a legacy value
+  but dispatch does not consult it.
+- Safe CP0 operations and LL/SC can stay in regions as interpreter-handler
+  calls. BC1 and MIPS IV/FPU compute instructions have native emitters;
+  ISA selection follows the runtime CPU, not a Cargo feature.
+- `jitv2` implies `tcache`; ppmem is unconditional. The non-tcache dirty-page
+  probe is removed, and R10000 uses tagless inline memory.
+- Optional `[jitv2] cache` reuses compiled pages across runs (see
+  [Persistent cache](../../docs/jitv2-persistent-cache.md)).
+
+Open `[Q]` questions and *(as-built)* annotations are retained with their
+original context; they are not a substitute for the source or this status.
 
 ---
 
@@ -638,6 +659,8 @@ Every exit from this gate resolves to a real status before returning — `step_j
 
 ## Appendix A — fallback: single-function-per-page with `br_table` head
 
-**As-built (`j2wp` feature, §13): this is what got built.** Per-entry duplication (the primary §2–§8 design, still the non-`j2wp` default) and this fallback now coexist behind a Cargo feature rather than one superseding the other — see §13 for how the shared dispatch gate handles both. Original rationale, still accurate:
+**As-built (whole-page, §13): this is the only compiler since 2026-09-21.**
+The original per-entry design in §2–§8 was removed. The rationale below records
+why whole-page compilation was introduced.
 
 Retained in case Phase 0 sizing shows per-entry duplication is pathological (arena churn, compile-thread saturation). One Cranelift function per page; external entries dispatch through a `br_table` over the known-entry set; a newly discovered entry queues a **recompile of the page with the entry added** (gen bump on publish; the new offset interprets until it lands); entry sets converge to function entries + post-call return points after warmup. Costs vs. the primary design: recompile churn during warmup, a dispatch `br_table` on every entry, an entry-set convergence assumption, and dispatcher-side entry lookup gains an indirection (one function serves many entries, so the entry_table maps offsets to (function, br_table index) instead of directly to code). Everything else in this document (§3–§5, §7–§8) is unchanged under this variant.

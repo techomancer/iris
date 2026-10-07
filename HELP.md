@@ -1,5 +1,8 @@
 # IRIS — SGI Indy and Indigo2 emulator
 
+The complete core/GUI feature and configuration inventory is in
+[FEATURES.md](FEATURES.md). This guide explains everyday use and monitor commands.
+
 ## Quick start
 
 ```
@@ -36,12 +39,13 @@ host. `lightning` builds and the JIT stack (`--features jitv2,rex-jit`) give
 higher MIPS; the hinv MHz string stays the same.
 
 The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
-33 MHz of host wall-clock time, and IRIX reports that as a 66 MHz CPU. There is
+33 MHz on IP22/IP24 (66 MHz CPU inventory) or 97.5 MHz on IP28
+(195 MHz CPU inventory), anchored to host wall-clock time. There is
 no calibration or inference. Override it with `[clock] fixed_mhz` or
 `--clock-fixed-mhz` if a guest needs something else.
 
-The status bar **Hz** value is the CP0 Compare (IP7) interrupt rate — the kernel
-scheduler tick — not CPU MHz.
+The status bar **Hz** value counts the guest's clock ticks: CP0 Compare (IP7)
+matches or IOC 8254 timer interrupts, depending on the kernel's timer source.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
@@ -49,6 +53,11 @@ Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
 ---
 
 ## RAM banks (config vs guest)
+
+On IP22/IP24, each bank is at most 128 MB. IP28 also supports 256 MB and
+512 MB banks. For 1 GB on IP28, use `[512, 512, 0, 0]`; see
+[IP28 512 MB banks](rules/irix/ip28-512mb-banks.md). The table below describes
+the IP22/IP24 extended layouts.
 
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
 Changing RAM while IRIX is running updates the config but not the live guest —
@@ -98,7 +107,9 @@ To set it by hand from the PROM instead:
    The value only needs to be unique on your virtual network, e.g.
    `08:00:69:de:ad:01`.
 
-3. Save NVRAM from the IRIS monitor console (telnet 8888):
+3. Normal Stop or guest power-off saves battery-backed state automatically.
+   To save immediately, or before forced process termination, use the IRIS
+   monitor console (default port 8888):
 
    ```
    rtc save
@@ -109,7 +120,8 @@ To set it by hand from the PROM instead:
    working directory). IRIS loads it on startup, so the MAC address persists
    across restarts. On an Indigo2 use `nveeprom save` instead. Give each
    config its own NVRAM file, or two installs will overwrite each other's PROM
-   environment.
+   environment. Automatic and manual saves replace the image through a flushed
+   temporary file; a failed save preserves the previous image.
 
 4. Verify from IRIX after boot:
 
@@ -402,7 +414,7 @@ prom     = "prom.bin"       # PROM image; the embedded one is used if missing
 nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 
-# RAM bank sizes in MB. Valid values: 0 (absent), 8, 16, 32, 64, 128.
+# RAM bank sizes in MB: 0 (absent), 8, 16, 32, 64, 128; IP28 also 256/512.
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale; --2x overrides
@@ -432,8 +444,8 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # or "indigo2_ip22" (--ip22)
-cpu     = "r4400"           # or "r5000" (--cpu)
+profile = "indy_ip24"       # "indigo2_ip22" (--ip22) or "indigo2_ip28"
+cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 
 [graphics]
 board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max")
@@ -441,7 +453,7 @@ heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 [clock]
-# fixed_mhz = 33            # CP0 Count rate in MHz (default 33, IRIX shows 66 MHz)
+# fixed_mhz = 33            # Count MHz: default 33 on IP22/IP24, 97.5 on IP28
 
 # [rtc_offset]              # guest clock start, relative to host time (all signed)
 # years   = -18             # years/months step the calendar (Mar 31 -1 month = Feb 28/29)
@@ -519,6 +531,8 @@ thread_affinity = false     # pin threads to cores
 
 [jitv2]
 threads = 1                 # compile-pool threads, --features jitv2
+cache = false               # reuse compiled pages across runs (opt-in)
+# cache_dir = ""            # blank: platform user cache directory / iris/jitv2
 
 [debug]
 no_idle = false             # disable idle park (idle-pause builds); IRIS_NO_IDLE
@@ -561,9 +575,10 @@ Configuration
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
-  --cpu <MODEL>               r4400 (default) or r5000
-  --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128)
-  --clock-fixed-mhz <MHZ>     CP0 Count frequency (default 33)
+  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact
+  --cpu <MODEL>               r4400 (default), r5000, or r10000
+  --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
+  --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)
 
 Storage
   --scsi1/2/3/7 <FILE>        Hard disk image at that SCSI ID
@@ -585,10 +600,13 @@ Networking
   --tftp-dir <DIR>            Serve DIR read-only over TFTP at the gateway
 
 Automation and debugging
-  --ci                        Enable the CI control socket (implies --headless)
+  --ci                        Enable the CI socket; hide the window unless --ci-display
   --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
+  --monitor-port <PORT>       Monitor TCP port (default 8888)
+  --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
+  --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --gdb-port <PORT>           Start the GDB stub
   --jitv2-threads <N>         jitv2 compile-pool thread count
   --load-elf <FILE>           Load a static big-endian ELF32 and start at its entry
@@ -642,7 +660,8 @@ nc 127.0.0.1 8888
 usage string. The following tables list the same set, grouped.
 
 > **`[DEV]`** marks commands or features that require a developer build
-> (`cargo build --features developer` or `cargo build --profile developer`).
+> (`cargo build --features developer`, optionally with `--profile developer`).
+> Selecting the profile alone does not enable developer instrumentation.
 > The command is accepted in all builds but produces no output / has no effect
 > without the feature enabled.
 >
@@ -793,8 +812,14 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `bt445 status` | BT445 RAMDAC state |
 | `bt445 identity` | Reset RAMDAC palette to linear identity ramp |
 | `bt445 debug <on\|off>` | BT445 trace **[DEV]** |
-| `xz status` | Indy XZ/Elan preview stub |
-| `mgras` / `impact` | Indigo2 IMPACT preview stub / hinv-style summary |
+| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace |
+| `gr2 fbdump [DIR]` | GR2 framebuffer dump, including composed screen |
+| `re3 ...` | GR2 raster register inspection (see monitor `help`) |
+| `mgras [status]` | IMPACT state and inventory summary |
+| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace |
+| `mgras fbdump [DIR]` / `mgras shot <path>` | IMPACT framebuffer dump / screenshot |
+| `mgras rec <file>` / `mgras rec off` | Record / stop recording board accesses |
+| `rss ...` | IMPACT raster inspection (see monitor `help`) |
 
 ### Hardware devices
 
@@ -820,6 +845,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `hal2 status` | HAL2 audio controller state |
 | `ps2 status` | PS/2 controller state |
 | `ps2 type <ascii>` / `ps2 enter` | Type text / press Enter on the guest keyboard |
+| `ps2 mouse <dx> <dy> [buttons]` | Inject relative mouse motion and optional button mask |
 | `ps2 debug <on\|off>` | PS/2 keyboard/mouse trace |
 | `serial status` | SCC channel A/B registers and FIFO state |
 | `vino status` | VINO video-in registers, channel state, descriptor cache |
@@ -922,12 +948,13 @@ development board IPC bridge.  The IRIS-compatible fork lives at:
 
 ## Snapshots
 
-The emulator saves and restores full machine state: RAM, every device, and the
-copy-on-write disk overlay. From the monitor:
+The emulator saves and restores RAM, supported device state, and the
+copy-on-write disk overlay. Graphics/device coverage has limits described
+below. From the monitor:
 
 ```
 save base/desktop       # writes saves/base/desktop/
-load base/desktop       # restore everything
+load base/desktop       # restore saved state (graphics limitations below)
 ```
 
 `iris-ci` adds restore/rollback checkpoints, `tree`, `diff`, `gc`, `validate`
@@ -935,4 +962,6 @@ and HTTP `push`/`pull`; iris-gui has Save/Restore under the Machine menu. The
 on-disk format is schema version 3 — a `snapshot.toml` manifest, postcard-encoded
 device state, and RAM stored as content-addressed chunks under `saves/.cas/`.
 A snapshot refuses to load onto a different CPU model or host architecture. See
-README.md and `rules/snapshot/`.
+[snapshot coverage](STORAGE.md#snapshots-and-rollback) and `rules/snapshot/`.
+GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
+See [TODO.md](TODO.md) for device/checkpoint completion work.

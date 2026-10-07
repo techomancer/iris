@@ -104,4 +104,5 @@ works through the ordinary per-`InstrKind` ENABLED table — `Mfc0`/`Dmfc0`/
 enabled there, *not* because they have emitters. They do not, and must not.
 
 Related: [`instructions-jitv2-still-interprets.md`](instructions-jitv2-still-interprets.md),
-[`../perf/guest-cpu-time-accounting-undercounts.md`](../perf/guest-cpu-time-accounting-undercounts.md).
+The guest-CPU-time accounting note cited by the original investigation was
+not committed; use host wall-clock timing for these comparisons.

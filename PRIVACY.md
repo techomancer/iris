@@ -1,8 +1,8 @@
 # Privacy Policy
 
-_Last updated: June 10, 2026_
+_Last updated: October 7, 2026_
 
-IRIS is an emulator of the SGI Indy workstation. It does **not** collect, store, transmit, or share any personal information.
+IRIS is an emulator of the SGI Indy and Indigo2 workstations. It does **not** collect, store, transmit, or share any personal information.
 
 **No data collection.** IRIS contains no analytics, telemetry, advertising, or tracking. It creates no accounts and sends no information about you or your usage to the developer or any third party.
 
@@ -16,4 +16,4 @@ IRIS is an emulator of the SGI Indy workstation. It does **not** collect, store,
 
 **Changes.** Any updates to this policy will be posted on this page.
 
-**Contact.** Questions about this policy: https://github.com/danifunker/iris/issues
+**Contact.** Questions about this policy: https://github.com/techomancer/iris/issues

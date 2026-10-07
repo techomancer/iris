@@ -1,5 +1,9 @@
 # The cpu-tests scorecard in README.md is stale
 
+> Historical September 10 scorecard check. The user-facing table was later
+> refreshed against the hardware oracle. CI now uses per-engine limits; see
+> [Current CI baseline](cpu-tests-known-failure-baseline.md).
+
 `cpu-tests/README.md` publishes an "Expected results" table. Measured on
 2026-09-10 from a clean build of the current tree, both rows are wrong:
 

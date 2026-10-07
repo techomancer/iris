@@ -120,7 +120,7 @@ static void t_trap_immediate(void)
  * Primary opcodes 0x1C..0x1F are the real holes on R4400/R5000. (Later MIPS32
  * revisions claimed 0x1C and 0x1F as SPECIAL2/SPECIAL3, but neither of these
  * parts implements them.) 0x1E is skipped: IRIS's own jitv2 uses it as a
- * region-boundary sentinel (src/mips_isa.rs:64), so testing it would measure
+ * region-boundary sentinel (src/cpu/mips_isa.rs:64), so testing it would measure
  * the JIT's tooling rather than the CPU.
  */
 static void t_reserved_instruction(void)

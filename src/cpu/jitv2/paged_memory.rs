@@ -259,17 +259,13 @@ fn set_readable_and_executable(ptr: *mut u8, len: usize, branch_protection: Bran
 #[derive(Clone, Copy, Debug)]
 pub struct PublishInfo {
     pub page: *mut crate::cpu::jitv2::PhysicalCodePage,
-    /// Single entry-point offset — the default (`not(feature = "j2wp")`)
-    /// path's one-function-per-entry-point model, consumed by
-    /// `PhysicalCodePage::publish(offset_word, ...)`. Unused (left `0`) by
-    /// the `j2wp` path, which uses `new_entries` instead.
     /// Every entry offset this compile covers. Consumed by
     /// `PhysicalCodePage::publish(new_entries, ...)`.
     pub new_entries: [u64; crate::cpu::jitv2::BITMAP_WORDS],
     pub gen_snap: u64,
     pub instr_count: usize,
     pub code_size: u32,
-    /// Dev diagnostic only (`JitEntry::compiled_for_fr1`, `j2 pcp`): the
+    /// FR mode of the whole-page compilation (reported by `j2 pcp`): the
     /// `STATUS_FR` value this region was compiled against. Carried through the
     /// seal queue so the eventual `page.publish` can stamp it on the entry.
     pub compiled_for_fr1: bool,

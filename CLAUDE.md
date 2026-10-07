@@ -1,7 +1,7 @@
 # Claude Instructions — IRIS
 
-IRIS is an SGI Indy (IP24) and Indigo2 (IP22) emulator written in Rust, with an
-R4400 or R5000 CPU selected at runtime. It boots IRIX 6.5 and 5.3 to a usable
+IRIS is an SGI Indy (IP24) and Indigo2 (IP22/IP28) emulator written in Rust, with an
+R4400, R5000, or R10000 CPU selected at runtime. It boots IRIX 6.5 and 5.3 to a usable
 system (shell, networking, X11). It is **not** cycle-accurate
 — IRIX doesn't need it and accuracy would only make it slower.
 
@@ -75,5 +75,10 @@ Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
   poking. See `rules/snapshot/` and the CI section of `README.md`.
 - Install IRIX only from original media (see `rules/irix/irix-install.md`). Never use a
   pre-built MAME CHD as a shortcut.
-- After changing PROM env (`setenv`/`unsetenv`) or NVRAM, run `rtc save` from the
-  monitor console before halting, or the change is lost.
+- Normal `Machine::stop` (GUI Stop/Quit and guest power-off) saves NVRAM and
+  the Indigo2 motherboard EEPROM. Before forced termination, run `rtc save`
+  (Indy) or `nveeprom save` (Indigo2) from the monitor to retain PROM changes.
+- Whole-page compilation is the only jitv2 implementation; `j2wp` is an alias.
+  Persistent compiled-page reuse is opt-in via `[jitv2] cache` / `cache_dir`.
+- CHD, camera, DaynaPort, Ultra64, IP28, and ppmem are unconditional in core;
+  do not use their retired Cargo features in build commands.

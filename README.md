@@ -12,18 +12,23 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
 
 - **Indy IP24** — primary daily-driver; IRIX desktop, X11, networking all work.
   R4400 (default) or R5000, picked at runtime.
-- **Indigo2 IP22** — boots IRIX with its own PROM (embedded fallback), both SCSI
-  controllers and the fullhouse interrupt layout; framebuffer/desktop path still
-  maturing (use `console=d` + serial for debugging; see
-  [docs/indigo2-ip22.md](docs/indigo2-ip22.md)).
+- **Indigo2 IP22** — embedded PROM fallback, two SCSI controllers, and the
+  fullhouse interrupt layout. Choose Newport XL, GR2 XZ/Extreme, or IMPACT
+  graphics; GR2 and IMPACT use command interpreters and software rasterizers
+  (see [Indigo2 IP22](docs/indigo2-ip22.md)).
+- **Indigo2 IMPACT IP28** — R10000 CPU and IMPACT graphics, with IRIX 6.5
+  booting to the desktop. Requires your own IP28 PROM; there is no embedded
+  fallback. Two 512 MB banks provide 1 GB of RAM
+  (see [Indigo2 IP28](docs/indigo2-ip28.md)).
 
-Prebuilt releases are available in Github releases.
+Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
 
 ## Q&A
 
 **Q: What is it?**
 
-**A:** An SGI Indy (MIPS R4400) emulator. Emulates enough hardware that IRIX
+**A:** An SGI Indy / Indigo2 emulator with runtime-selectable R4400, R5000,
+or R10000 CPUs. Emulates enough hardware that IRIX
 boots to a usable system: shell, networking, X11, the works.
 
 **Q: But why?**
@@ -57,8 +62,9 @@ boots to a usable system: shell, networking, X11, the works.
 - IRIX 5.3 works too
 - **Indy IP24:** X11 / Newport (REX3) graphics works, with mouse and keyboard input
   (IntelliMouse wheel included), HAL2 audio, and IndyCam video-in through VINO
-- **Indigo2 IP22:** hardware emulation + serial boot (see [docs/indigo2-ip22.md](docs/indigo2-ip22.md)); GUI framebuffer still maturing
-- R4400 or R5000 CPU (R10000 for the IP28 bring-up), selected per machine at runtime
+- **Indigo2 IP22:** Newport, GR2 XZ/Extreme, and IMPACT graphics; two SCSI controllers
+- **Indigo2 IP28:** R10000, IMPACT graphics, and up to 1 GB with two 512 MB banks
+- R4400, R5000, or R10000 CPU, selected per machine at runtime
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental),
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
   optional REX3 shader JIT (`rex-jit`)
@@ -79,10 +85,13 @@ boots to a usable system: shell, networking, X11, the works.
 
 ## Getting started
 
-Super easy mode -> Thanks to Dani we have Windows/Mac/Linux builds at https://github.com/danifunker/iris/releases
-So if you dont feel comfortable building it yourself, please head there. Also, he submitted IRIS-GUI to Mac App Store!
+Download Windows, macOS, and Linux builds from
+[techomancer/iris releases](https://github.com/techomancer/iris/releases).
+The CLI and iris-gui are developed in this repository. Dani Sarfati contributed
+the GUI and its Mac App Store distribution support.
 
 You need:
+
 - A hard-disk image with IRIX 6.5.22 (or 5.3) for Indy. To produce one, follow
   [rules/irix/irix-install.md](rules/irix/irix-install.md) (install from the
   original media CDs into an empty CHD/raw disk).
@@ -98,431 +107,105 @@ cargo run --release
 The project pins a nightly toolchain (`rust-toolchain.toml`); rustup picks it up
 automatically.
 
-Build variants:
-```
-cargo run --release --features lightning,rex-jit     # recommended for best speed
-cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
-cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
-cargo run --release --features jitv2,rex-jit         # MIPS JIT v2 (experimental; see "JIT compilers")
-cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
-cargo run --release --features ci_clock              # synthetic deterministic CP0 Count clock (CI/snapshot validator only; loses realtime desktop timing)
-cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
-cargo run -p iris-gui --release                      # the egui front-end, see iris-gui-README.md
-```
+For the complete core/GUI build-feature lists, configuration keys, CLI
+options, defaults, conflicts, and environment controls, see
+[FEATURES.md](FEATURES.md). It also contains build examples, CPU details,
+and JIT implementation notes. The GUI tour is in
+[iris-gui-README.md](iris-gui-README.md); Windows/WSL launch guidance is in
+[wsl/README.md](wsl/README.md).
 
-`lightning` and `developer` are mutually exclusive, and `lightning` implies the
-interpreter's `opcodefusion`. The emulator prints the features it was built with
-at startup.
+See [CHANGELOG.md](CHANGELOG.md) for dated changes and [TODO.md](TODO.md) for
+the feature-completion backlog; the original scratch list is preserved in
+[TODO_archive.md](TODO_archive.md).
 
-CHD images, the host camera (IndyCam source), DaynaPort, the Ultra64 dev board
-and the IP28 / R10000 machine are always built in; nothing to enable. MIPS IV
-follows the configured CPU (R4400 is MIPS III, R5000/R10000 are MIPS IV) in
-both the interpreter and jitv2.
 
-<details>
-<summary>Diagnostic and experimental features</summary>
+## Documentation
 
-| Feature | What it does |
+Start with **[FEATURES.md](FEATURES.md)** for the complete build-feature and
+configuration inventory for both `iris` and `iris-gui`.
+
+| Guide | Contents |
 |---|---|
-| `developer` | Undo buffer, execution trace, extra monitor commands; CPU starts paused. Also `--profile developer`. |
-| `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
-| `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
-| `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
-| `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
-| `fetchverify` | Check every executed instruction word against memory (stale-code detector); lightning-compatible |
-| `opcodefusion` | Interpreter branch+NOP, LUI+ORI/ADDIU and address-calc+load/store fusion. Breakpoints on a fused second instruction never fire |
-| `tlbstats` / `tlbcheck` | TLB translation counters / full JTLB consistency check after every TLB write |
-| `jitstats` | Counts how far each load/store gets through the JIT inline-memory checks |
-| `instr_stats` | Per-opcode decode/execute counters (interpreter only; refused with `jitv2`) |
-| `tcache` / `tcache_verify` | Transparent cache over the ppmem window ([docs/tcache-design.md](docs/tcache-design.md)) / its self-check. Always on with `jitv2`; optional for an interpreter build |
-| `jitv2_lockstep` | Verify every JIT instruction against the interpreter (implies `developer`) |
-| `jitv2_smc_check` | Report writes into the page the CPU is executing (run with `j2 inline_mem off`) |
-| `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
-| `j2wp` | jitv2 whole-page compile instead of one function per entry point (not production-ready) |
-| `debug_cache` | Track one cache line across all operations |
-| `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
-| `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`rules/testing/r5k-l1i-cache-bugs.md`) |
+| [HELP.md](HELP.md) | CLI usage, TOML examples, monitor commands, serial access, and guest setup. |
+| [iris-gui-README.md](iris-gui-README.md) | GUI build, machine management, input, disks, networking, benchmarks, and distribution. |
+| [FEATURES.md](FEATURES.md) | All build features, profiles, configuration keys, CLI switches, GUI settings, diagnostic environment controls, CPU specifications, and JIT behavior. |
+| [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
+| [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
+| [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
+| [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
+| [TODO.md](TODO.md) / [TODO_archive.md](TODO_archive.md) | Current feature-completion backlog and the original scratch list. |
+| [wsl/README.md](wsl/README.md) | Windows/WSL build, launch, and troubleshooting. |
+| [PRIVACY.md](PRIVACY.md) | Privacy policy; [App Store review notes](docs/appstore-review-response.md) describe distribution constraints. |
 
-</details>
+Hardware, testing, and development references:
+
+| Area | Documentation |
+|---|---|
+| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/indy-xz-elan.md). |
+| Graphics and peripherals | [REX3](docs/rex3.md), [HAL2 audio](docs/hal2.md), [WD33C93A SCSI](docs/wd33c93a.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/ultra64.md) / [N64 GIO specifications](docs/n64_gio_specs.md). |
+| CPU test suite | [Suite README](cpu-tests/README.md), [current status](cpu-tests/docs/status.md), [findings](cpu-tests/docs/findings.md), [gotchas](cpu-tests/docs/gotchas.md), and [emulator support](docs/cpu-test-support.md). |
+| CPU test infrastructure | [Toolchain](cpu-tests/docs/toolchain.md), [memory map](cpu-tests/docs/memory-map.md), [oracle overview](cpu-tests/docs/oracle.md), [hardware oracle](cpu-tests/oracle/README.md), [R4600 notes](cpu-tests/docs/r4600.md), and [original test plan](cpu-tests/PLAN.md). |
+| Benchmarks and memory tests | [Benchmark suite](bench/README.md), [prebuilt assets](bench/prebuilt/README.md), [reference results](data/bench_reference.README.md), [GUI benchmark design](docs/gui-benchmark-plan.md), and [memory stress utility](test/memstress/README.md). |
+| Architecture and debugging | [HACKING.md](HACKING.md), [runtime debugging](debug.md), [CPU debug notes](src/debug.md), [contributor instructions](CLAUDE.md), and the [rules/](rules/) folder. |
+| Memory and JIT design | [Persistent JIT cache](docs/jitv2-persistent-cache.md), [inline memory](docs/jit-inline-memory.md), [JIT performance analysis](docs/jitv2_performance_analysis.md), [physical RAM](docs/ppmem-design.md), [transparent cache](docs/tcache-design.md), and [historical TLB design](docs/nutlb-design.md). |
+| Networking and storage designs | [CHD sync](docs/cow-chd-sync-plan.md), [NFS server](docs/nfsudp-plan.md), [networking GUI](docs/networking-tab-redesign.md), [DaynaPort implementation plan](docs/iris-daynaport-target.md), and [PCAP distribution plan](docs/pcap-release-plan.md). These documents retain design history; read their status notes first. |
+| HostGL tooling | [Khronos ABI registry tooling](iris-hostgl/tools/khronos/README.md). |
 
 ### CHD image support
 
-IRIS mounts `.chd` hard-disk and CD-ROM images directly without first
-extracting to raw. Compressed parent CHDs stay untouched — writes go to a
-MAME-style `.diff.chd` sidecar.
-
-The CHD backend (`libchdman-rs` >= 0.288.8) and the MAME CHD core it vendors
-are BSD-3-Clause licensed, so IRIS stays fully BSD-3-Clause (see
-`LICENSE-libchdman-rs.txt`).
-
-See [HELP.md](HELP.md) for the full rundown: serial ports, monitor console,
-NVRAM/MAC address setup, disk image prep, and more.
-
-**Windows 11:** full build/launch guide in [wsl/README.md](wsl/README.md).
-
-
-## PCAP bridged networking (`--features pcap`)
-
-By default IRIS gives the guest networking through a built-in software NAT
-gateway (DHCP/DNS/TCP/UDP routing + port forwarding). As an alternative you can
-bridge the guest's raw Ethernet frames directly onto a real host interface. The
-guest then appears as an independent L2 host on your physical LAN and can be
-pinged from other machines and can use your real DHCP and DNS servers.
-
-### Library and licensing
-
-The `pcap` crate links the generic `wpcap` import library on Windows (NOT a
-driver-specific one), so IRIS is not tied to any single provider. You can
-build/link against **the BSD-licensed WinPcap Developer Pack** as well as Npcap.
-IRIS links dynamically and never bundles the driver, so the runtime driver's
-license (e.g. Npcap's redistribution terms) does not attach to IRIS.
-
-To point the linker at the WinPcap Developer Pack SDK on Windows:
-```
-set LIBPCAP_LIBDIR=C:\path\to\WpdPack\Lib\x64
-cargo build --release --features pcap
-```
-
-On Linux/macOS you need the libpcap headers and library (e.g. `libpcap-dev` on
-Debian/Ubuntu, or the macOS system libpcap).
-
-### Enable PCAP mode
-
-1. **Build** with `--features pcap`:
-   ```
-   cargo build --release --features pcap
-   ```
-
-2. **Configure** in `iris.toml` (or pass CLI flags):
-   ```toml
-   [network]
-   mode = "pcap"
-   pcap_interface = "1"    # 1-based index (recommended), or exact name, or omit to auto-pick
-   ```
-
-   On Windows, if you prefer the full device name (`\Device\NPF_{GUID}`), use a
-   TOML *single-quoted* literal string (backslashes are escape characters in
-   `"double-quoted"` strings):
-   ```toml
-   pcap_interface = '\Device\NPF_{8D30ACAE-AC0F-4E05-BF89-F35AD7950663}'
-   ```
-
-3. **List interfaces**:
-   ```
-   iris --list-net-interfaces
-   ```
-   Or from the monitor console:
-   ```
-   net interfaces
-   ```
-
-Alternatively specify on the command line (the index form works here too):
-```
-./target/release/iris --net-mode pcap --pcap-interface 1
-./target/release/iris --net-mode pcap --pcap-interface eth0
-```
-
-Caveats:
-- Requires elevated privileges to open a raw capture: root or `CAP_NET_RAW`
-  on Linux, root on macOS, Administrator + a WinPcap-compatible driver
-  (WinPcap or Npcap) on Windows.
-- No NAT services (DHCP/DNS/NFS/port-forward) are provided in PCAP mode — the
-  guest uses the real network's services. Configure IRIX networking for your
-  LAN accordingly.
-- Wired bridges work best. Many Wi-Fi access points reject the guest's extra
-  MAC address, so bridging onto a wireless interface may not pass traffic.
-- The guest needs a MAC address in NVRAM. IRIS writes `[network] mac` (default
-  `08:00:69:12:34:56`) into a blank slot before boot; give each emulated machine
-  on the same LAN its own (see `rules/irix/networking.md`).
-
-Without `--features pcap`, selecting `mode = "pcap"` logs a warning and falls
-back to the NAT gateway, and `--list-net-interfaces` reports that the feature
-is missing.
-
-
-## DaynaPort SCSI/Link
-
-A SCSI-attached Ethernet adapter (SCSI type 3, Processor) selectable on any
-SCSI id — a second network path for the guest that goes over the SCSI bus
-instead of the onboard SEEQ. Only attached when configured, because it is only
-useful with a guest driver; IRIX has none in the box (see
-[irixdayna](https://github.com/techomancer/irixdayna), where it appears as
-`dp0`).
-
-```toml
-[scsi.3]
-kind = "daynaport"            # default "disk"; "cdrom" / cdrom = true unchanged
-mac  = "00:80:19:12:34:56"    # optional; default derived from the SCSI id
-subnet = "192.168.10.0/24"    # optional; this target's own NAT subnet
-```
-
-Each DaynaPort runs its own NAT gateway (or PCAP bridge, in a `--features pcap`
-build) on its own subnet, so `dp0` and `ec0` never share a network. `scsi dayna`
-in the monitor shows its MAC, addresses and counters. Full protocol and
-verification notes: [docs/daynaport.md](docs/daynaport.md).
-
-
-## Emulated CPU
-
-R4400 (the default) or R5000, chosen per machine at runtime — not at build time.
-Both cache models are compiled into every binary and the machine picks between
-them when it starts, so there is no separate R5000 build or download.
-
-| | R4400 | R5000 |
-|---|---|---|
-| L1 I/D | 16KB direct-mapped, 16B lines | 32KB 2-way, 32B lines |
-| Secondary cache | 1MB unified L2 | none (Config `SC=1`) |
-| ISA | MIPS III | MIPS IV |
-| PRId / FPU FIR | `0x00000440` / `0x00000500` | `0x00002321` / `0x00002300` |
-
-This is a different machine to the guest, not a speed knob: IRIX reads PRId and
-configures itself from it, and an R4400 raises Reserved Instruction on the MIPS IV
-opcodes an R5000 executes.
-
-Which one is faster depends on the engine, so don't compare scores across CPUs.
-On the bare-metal suite the R5000 is about 17% slower under the interpreter —
-2-way associativity means probing both ways on every fetch, read and write — but
-about 10% faster under jitv2, where the larger cache and 32-byte lines pay off
-and the probe is not on the critical path.
-
-Pick it in the GUI (Machine menu, or the General tab of the configuration area),
-in a config file, or on the command line:
-
-```
-cargo run --release -- --cpu r5000        # or r4400, the default
-```
-
-```toml
-[machine]
-cpu = "r5000"
-```
-
-A snapshot records the CPU it was taken on and refuses to restore onto the other
-one, since the captured state assumes that machine.
-
-
-## JIT compilers
-
-### MIPS JIT v2 (`--features jitv2`) — experimental
-
-A physical-page compiler built on Cranelift, with memory-resident
-registers and no speculation — compiled code is either exactly
-equivalent to the interpreter or it never gets published. Not the default
-engine yet. Enabled automatically at runtime once the feature is compiled in.
-See `rules/jitv2/jit-v2-design.md` for the full design and `HACKING.md`'s
-JIT v2 section for tuning. (The original speculative, tiered MIPS JIT was
-removed in August 2026; jitv2 replaces it.)
-
-```
-cargo run --release --features jitv2,rex-jit
-```
-
-What it does today: compiles on a pool of background threads (`[jitv2]
-threads` / `--jitv2-threads`, default 1), inlines L1 data-cache loads and stores
-for both CPU models, detects self-modifying code through per-page generation
-counters, and falls back to the interpreter for anything it has no emitter for.
-
-Extra features: `jitv2_lockstep` (cross-checks every compiled instruction
-against the interpreter — slow, diagnostic only), `jitv2_smc_check`,
-`j2wp` (whole-page compile, experimental), and `jitv2_opcodefusion` (LUI+ORI/ADDIU and
-branch/jump+NOP delay-slot fusion, jitv2's counterparts to the interpreter's
-`opcodefusion` — OFF by default, unlike the interpreter's own fusion, due to a
-history of live-boot bugs; see
-`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`). Developer tools:
-`jitv2_analyze`, `jitv2_verify` and `jitv2_pcp_dump` binaries, and the `j2`
-monitor command.
-
-#### Measuring emitted code against a real corpus
-
-`j2 corpus [dir]` (default `jitv2_corpus/`) writes every page in the live JIT
-page cache to a `.pcp` file — the same format `j2 dumppcp` produces for a
-single page, carrying the page's bytes, its entry-point bitmaps, its
-generation and its dispatch count. Boot the guest, do whatever workload you
-care about, then take the dump; the pages are already cached, so this costs
-nothing until you ask for it.
-
-```
-(monitor) j2 corpus                 # -> jitv2_corpus/pcp_<pfn>.pcp, one per page
-IRIS_CORPUS_DIR=jitv2_corpus IRIS_OPT_SPEED=1   cargo test --release --features jitv2 zz_corpus_sizes -- --nocapture
-```
-
-That compiles every entry point of every captured page and reports total
-emitted bytes, plus a dispatch-weighted total, so a codegen change can be
-measured against real guest code instead of a microbenchmark.
-
-**Do not measure under `developer`.** It forces `opt_level=none` and injects a
-per-instruction trace callout, so its output describes code production never
-emits — this has produced a completely wrong conclusion before, and the test
-prints a warning if you try. See
-`rules/jitv2/block-fragmentation-blocks-cse.md`.
-
-### REX3 drawing and the graphics JIT (`--features rex-jit`)
-
-Every build draws through one generic REX3 draw routine that is specialised
-ahead of time into 400+ native draw functions (`src/dev/ng1/rex3_shaders.rs`, generated
-by `tools/gen_rex3_shaders.py` from a corpus of the DrawMode0/DrawMode1/clip
-combinations the IRIX desktop actually uses). Most desktop drawing already runs
-through one of those, with no JIT involved.
-
-`rex-jit` adds a Cranelift JIT for combinations outside that corpus. It compiles
-a specialised native "shader" per unique draw mode, inlining the entire draw
-loop — coordinate stepping, clipping, shade DDA, pattern advance — into a single
-function. Shaders compile in the background on first use and share the dispatch
-table with the precompiled set; the profile of modes seen persists across
-sessions (`~/.iris/rex-jit-profile.bin`) for instant warm-up on next boot. `rex jit status|list|on|off` in the
-monitor inspects and controls it.
-
-```
-cargo run --release --features rex-jit
-```
-
-## Copy-on-write disk overlay
-
-Protects disk images from corruption during development and testing. The base
-`.raw` file is opened read-only and writes go to a sparse overlay file. Kill
-the emulator whenever you want. Delete the overlay to reset to the clean base.
-
-Enable in `iris.toml`:
-```toml
-[scsi.1]
-path = "scsi1.raw"
-cdrom = false
-overlay = true
-```
-
-Writes go to `scsi1.raw.overlay`. Monitor commands:
-- `cow status` - show dirty sector count
-- `cow commit [id]` - merge overlay into base image (permanent)
-- `cow reset [id]` - discard all overlay writes
-
-CHD images get the same protection automatically: writes go
-to a `.diff.chd` sidecar. `iris-ci chd-sync` (or `iris-ci quit --sync-chd`, or
-the GUI's "Commit changes to disk") folds the diff back into the base.
-
-
-## Snapshots and rollback
-
-Capture the full machine state — RAM, every device, plus the COW overlay — into
-`saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
-SCSI controller, and the Seeq Ethernet chip all round-trip. Current schema
-version is 3: postcard-encoded binary device state plus content-addressable
-chunked RAM under `saves/.cas/`. A second snapshot taken from the same parent
-adds **zero bytes** to disk for any RAM region that didn't change — same
-storage model as Docker layers. A snapshot records which CPU it was taken on
-(R4400/R5000) and refuses to restore onto the other.
-
-From the interactive monitor (`telnet 127.0.0.1 8888`):
-```
-save base/desktop          # writes saves/base/desktop/
-load base/desktop          # restore everything (RAM, devices, disk overlay)
-```
-
-From `iris-ci` (the wrapper; see "CI control socket and `iris-ci`"):
-```bash
-iris-ci save base/desktop
-iris-ci restore base/desktop          # full disk-backed reload (~150 ms cold)
-iris-ci rollback                      # in-memory rewind to last restore (~40 ms)
-iris-ci diff base/desktop tests/grep  # what changed: devices, RAM chunks, COW sectors
-iris-ci validate base/desktop -n 1000000  # bit-deterministic re-execution check (build with --features ci_clock)
-iris-ci tree                          # snapshot parent-chain hierarchy
-iris-ci gc                            # sweep CAS chunks no kept snapshot references
-iris-ci pull http://reg/snapshots/base   # fetch a snapshot from another machine
-```
-
-Two restore tiers:
-- **`restore <name>`** — full disk-backed reload. ~150 ms. Use after a hard
-  reset or to switch to a different snapshot.
-- **`rollback`** — in-memory rewind to the last `restore` checkpoint. ~40 ms,
-  no disk I/O. Use this in tight inner test loops where you keep returning to
-  the same starting state.
-
-Reflinks are used on APFS / btrfs / xfs so capturing a snapshot of a 4 GB disk
-image takes <10 ms and uses ~18 MB of actual disk.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and `rules/snapshot/`
-for the format and its gotchas.
-
-
-## CI control socket and `iris-ci`
-
-`--ci` enables a control socket for headless automation, plus a
-small in-process serial backend so the harness can drive the IRIX console
-directly. The default is the Unix socket `/tmp/iris.sock`; on Windows it is TCP
-`127.0.0.1:19851`. `--ci` implies `--headless` unless you add `--ci-display`,
-and `--serial-log FILE` keeps a transcript of the IRIX console.
-
-```
-cargo run --release --features lightning -- --ci
-```
-
-`cargo build` produces a companion binary, `iris-ci`, that's the **canonical
-way** to drive the socket. Don't bother with raw `nc` + JSON unless you're
-debugging the wrapper itself.
-
-```bash
-# In one terminal: launch iris (Newport window opens; --ci adds a control channel)
-./target/release/iris --ci
-
-# In another terminal: drive it
-./target/release/iris-ci boot          # PROM menu → IRIS console login (one cmd)
-./target/release/iris-ci login         # send root + dismiss vt100 prompt + wait #
-./target/release/iris-ci run 'ls /'    # send shell command, get stdout + exit code
-./target/release/iris-ci save base/multiuser
-./target/release/iris-ci put localfile.tar   # copy file into guest, no bs=512 math
-./target/release/iris-ci get /tmp/out --to ./out.tar
-./target/release/iris-ci diff base mutated   # per-device + chunk + cow-sector deltas
-./target/release/iris-ci tree
-./target/release/iris-ci script tests/scenario.iris   # batch-run a sequence of cmds
-./target/release/iris-ci cdrom-load 4 disc2.iso       # swap a CD at runtime
-./target/release/iris-ci rtc-save                     # persist NVRAM
-./target/release/iris-ci quit --sync-chd              # fold CHD diffs, then exit
-```
-
-Run `iris-ci --help` for the full list, or `iris-ci <subcmd> --help` for any
-subcommand. Every operation has a typed clap arg — no JSON quoting, no
-hand-managed timeouts.
-
-For automation that doesn't want to depend on `iris-ci`, the underlying socket
-protocol is newline-delimited JSON; `cmd` and `args` per request, `{ok, data,
-error}` per response. See `src/ci.rs` for the dispatch table.
-
-
-## Scratch volume — file injection without networking
-
-A SCSI device with `scratch = true` is a host-controlled raw block device for
-pushing files into the guest (and pulling artifacts back out) without bringing
-up NFS or anything else. iris pre-formats the underlying file with a minimal
-SGI Volume Header on first run, and exposes it inside IRIX as
-`/dev/rdsk/dks0d2s0`.
-
-Enable in `iris.toml`:
-```toml
-[scsi.2]
-path    = "scratch.raw"
-cdrom   = false
-overlay = false
-scratch = true
-size_mb = 64
-```
-
-With `iris-ci` (recommended):
-```bash
-iris-ci put localfile.tar                 # copies host file into the guest
-iris-ci get /tmp/output.log --to ./out.log  # pulls a guest file out
-```
-
-`iris-ci put`/`get` handle the IRIX `dd bs=512` sector-alignment quirk
-transparently — they compute the right block count from the host file size,
-issue the right `dd` recipe to the guest, and truncate to the original byte
-length on the receiving end.
-
-Manual/raw paths (if you want to drive `dd` yourself):
-- Reads MUST use `bs=512` (or any 512-multiple); `bs=64` returns "I/O error".
-- Writes must be padded to `bs`; add `conv=sync` for short inputs.
-- Inside IRIX: `dd if=/dev/rdsk/dks0d2s0 bs=512 | tar xf -`
-
-
-## Input
+CHD hard disks and CD-ROMs mount directly. Compressed parents stay untouched;
+writes use MAME-style diff sidecars. See [STORAGE.md](STORAGE.md#chd-image-support)
+for the backend/licensing details and [HELP.md](HELP.md) for disk preparation.
+
+### PCAP bridged networking (`--features pcap`)
+
+PCAP places the guest on a physical LAN through a host capture interface.
+Library/driver requirements, permissions, licensing, setup, and caveats are in
+[NETWORKING.md](NETWORKING.md#pcap-bridged-networking---features-pcap).
+
+### DaynaPort SCSI/Link
+
+The SCSI Ethernet adapter is built in and attached per machine. See
+[NETWORKING.md](NETWORKING.md#daynaport-scsilink) for its configuration,
+driver links, and network isolation requirements.
+
+### Emulated CPU
+
+R4400, R5000, and R10000 are selected at runtime. The specifications,
+configuration examples, performance context, and snapshot compatibility rules
+are in [FEATURES.md](FEATURES.md#emulated-cpu).
+
+### JIT compilers
+
+Optional `jitv2` compiles MIPS code; `rex-jit` compiles Newport draw shaders
+alongside the precompiled drawing routines. See
+[FEATURES.md](FEATURES.md#jit-compilers) for their behavior, defaults,
+limitations, persistent caches, and corpus-measurement tools.
+
+### Copy-on-write disk overlay
+
+Overlay modes keep base images clean while the guest writes. Configuration,
+commit/discard behavior, and CHD sidecar rules are in
+[STORAGE.md](STORAGE.md#copy-on-write-disk-overlay).
+
+### Snapshots and rollback
+
+Save/restore, rollback, deduplication, and HTTP snapshot transfer are documented
+in [STORAGE.md](STORAGE.md#snapshots-and-rollback). GR2/IMPACT snapshot coverage
+is incomplete; that guide states the limits.
+
+### CI control socket and `iris-ci`
+
+Use [STORAGE.md](STORAGE.md#ci-control-socket-and-iris-ci) for Unix/TCP setup,
+commands, serial capture, and scripts. `--ci` keeps offscreen graphics alive
+unless `--headless` is explicitly selected.
+
+### Scratch volume — file injection without networking
+
+Host-to-guest file transfer through a raw scratch disk is described in
+[STORAGE.md](STORAGE.md#scratch-volume--file-injection-without-networking).
+
+### Input
 
 Click the window to grab mouse and keyboard. In the `iris` window Right Ctrl
 releases the grab; in `iris-gui` it is Ctrl+Alt (Option+Command on macOS), with
@@ -535,79 +218,16 @@ terminal apps. Use `telnet 127.0.0.1 2323` (with port forwarding configured)
 for a clean terminal instead.
 
 
-## Testing and benchmarking
+### Testing and benchmarking
 
-Two bare-metal MIPS suites run on the emulated CPU with no operating system in
-the way. They answer different questions and neither replaces the other.
+See [TESTING.md](TESTING.md) for Rust tests, bare-metal CPU/benchmark suites,
+matrix runs, reference hardware, and performance methodology.
 
-**`cpu-tests/`** — is this instruction correct? ~250 self-checking tests over
-ALU, FPU, TLB, caches, exceptions and the MIPS IV additions, one instruction at
-a time with clean state. The expectations are validated on real Indys (R4400
-and R5000, both passing every check); see
-[cpu-tests/README.md](cpu-tests/README.md).
+### Rules
 
-```sh
-sudo apt-get install gcc-mips-linux-gnu binutils-mips-linux-gnu   # or: make -C cpu-tests toolchain-local
-make -C cpu-tests && make -C cpu-tests run
-cpu-tests/run/matrix.sh                 # R4400/R5000 x interp/jitv2
-```
-
-**`bench/`** — how fast is this build, and is it still right after ten million
-of them? 46 kernels covering integer, FPU, the cache hierarchy, image and video
-editing inner loops, compression, and the emulator-only paths (TLB refill,
-exception round trip, cache maintenance, uncached I/O). Every kernel checksums
-its result against a golden value computed by building the same C natively, so
-each run reports an accuracy percentage next to its throughput — and per-kernel
-**guest instructions per host second**, which is directly comparable between the
-interpreter and jitv2.
-
-```sh
-cargo build --release --bin iris-bench
-./target/release/iris-bench run         # ~60 s; --quick for about half that
-./target/release/iris-bench run --quick
-
-make -C bench && make -C bench hostbench            # only to change the suite
-./target/release/iris-bench matrix      # builds and runs every CPU x engine cell
-./target/release/iris-bench host        # the same kernels, natively, for the ratio
-```
-
-`run` needs **no MIPS toolchain and no build step**: a known-good guest binary
-is checked in at `bench/prebuilt/` and linked into `iris`, and the run happens
-in-process on a headless machine the emulator builds for itself. That is also
-what the GUI's **Benchmark tab** does, on every platform and inside the App
-Store sandbox — one button, and the accuracy score sits next to the speed.
-
-Includes Dhrystone 2.1 (DMIPS) and LINPACK 100x100 (MFLOPS), so an emulated
-Indy can be put next to published figures for a real one, plus a Whetstone mix
-(reported in passes/s — see bench/README.md for why not MWIPS). See
-[bench/README.md](bench/README.md) — and
-[rules/testing/benchmark-suite-gotchas.md](rules/testing/benchmark-suite-gotchas.md)
-before adding a kernel.
-
-`bench/irix/` is the other half: real workloads under a booted IRIX (filesystem,
-buffer cache, IRIX's own tools, X on REX3), driven over `iris-ci`.
-
-
-## Rules
-
-The `rules/` directory contains hard-won lessons from debugging the JIT and
-getting IRIX running. These are meant for both humans and AI assistants working
-on the codebase.
-
-- `rules/jitv2/` - jitv2 compiler design, codegen gotchas, delay slots, fusion hazards, lockstep
-- `rules/irix/` - the IRIX install guide, networking config, NFS, VINO/IndyCam, keyboard quirks, csh + scratch raw-device gotchas
-- `rules/testing/` - cpu-tests/bench harness gotchas, CPU-model findings, disk image handling, benchmark-kernel gotchas
-- `rules/snapshot/` - snapshot binary format, scratch-volume conventions, round-trip tests, CI overlay paths, **iris-ci as the canonical CI interface**
-- `rules/rex3/` - REX3 drawing engine findings (CID match, blending, FIFO batching)
-- `rules/gui/` - iris-gui threading, input capture, keyboard layouts, Windows crash diagnostics
-- `rules/macos/` - App Store / sandbox constraints
-- `rules/perf/` - idle park, REX3 thread parking, first benchmark numbers
-- `rules/scsi/` - WD33C93A behaviour under OpenBSD and Linux, DaynaPort
-- `rules/build/` - dependency-upgrade and platform build gotchas
-
-If you're about to touch the jitv2 compiler, read `rules/jitv2/jit-v2-design.md`
-first. It'll save you a few days.
-
+The [rules/](rules/) folder records debugging lessons and subsystem design
+constraints for contributors. Its subsystem map and JIT reading guidance are
+in [HACKING.md](HACKING.md#debugging-rules).
 
 ## License
 
@@ -626,5 +246,3 @@ Dominik Behr and contributors
 
 We have no problems with LLM generated code. In fact most of IRIS is made with LLMs.
 But that doesn't mean we don't do proper software engineering. So lets keep PRs small and reasonable to review. One issue/fix per PR, preferably in one commit, since LLM code churn doesn't help with clarity. Lets keep this bisectable too.
-
-

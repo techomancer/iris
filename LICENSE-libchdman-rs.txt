@@ -1,7 +1,7 @@
 Third-party license — CHD disk-image backend
 =============================================
 
-The optional `--features chd` build links the `libchdman-rs` crate, a Rust
+All builds of IRIS link the `libchdman-rs` crate, a Rust
 wrapper around MAME's CHD (Compressed Hunks of Data) core. As of
 libchdman-rs 0.288.8 the crate and the CHD core files it vendors are
 distributed under the BSD 3-Clause License (the same family as IRIS itself),

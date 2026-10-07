@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=IRIS
-Comment=SGI Indy (MIPS R4400) emulator
+Comment=SGI Indy and Indigo2 emulator
 Exec=iris-gui
 Icon=iris-gui
 Categories=Emulator;Game;

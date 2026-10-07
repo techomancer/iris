@@ -4,7 +4,7 @@ The IRIS emulator features a built-in monitor and debugger that allows for inter
 
 This is a guided tour of the debugger. [HELP.md](HELP.md#monitor-console) has the complete command reference, and [HACKING.md](HACKING.md#9-gdb-stub) covers the GDB stub.
 
-> **Build flavour matters.** `lightning` builds (and the official releases) strip breakpoint checks and the traceback buffer, so breakpoints and `dt` do nothing there. The undo buffer, `si`, `debug` tracing and `trace` recording need a `developer` build (`cargo run --profile developer`), which also starts with the CPU paused.
+> **Build flavour matters.** `lightning` builds (and the official releases) strip breakpoint checks and the traceback buffer, so breakpoints and `dt` do nothing there. The undo buffer, `si`, `debug` tracing and `trace` recording need a `developer` build (`cargo run --profile developer --features developer`), which also starts with the CPU paused.
 
 ## Connecting
 
@@ -135,6 +135,9 @@ The debugger can load symbol maps (e.g., `prom.map`, `unix.map`) to display func
 ## Cache debugging
 
 Commands to inspect the internal state of the emulated caches. The R4400 has L1I, L1D and an L2; the R5000 has only 2-way L1I/L1D.
+R10000 uses a shadow cache model for diagnostic CACHE/tag/data operations;
+ordinary memory accesses go directly to physical RAM. See
+[CPU specifications](FEATURES.md#emulated-cpu).
 
 | Command | Description |
 | :--- | :--- |

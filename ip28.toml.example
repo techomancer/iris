@@ -1,16 +1,18 @@
-# Indigo2 IMPACT R10000 (IP28) bring-up.
-# Runs the real IP28 PROM against the existing fullhouse (IP22) machine.
-# The CPU is still an R4400/R5000 model — the point of this run is to find
-# out what the PROM objects to first, not to boot anything.
-headless   = true
-no_audio   = true
-banks      = [64, 64, 64, 64]
+# Indigo2 IMPACT R10000 (IP28). Supply your own IP28 PROM and IRIX disk.
+# See docs/indigo2-ip28.md. Paths are relative to the working directory.
+headless   = false
+no_audio   = false
+banks      = [512, 512, 0, 0]
 prom       = "ip28/ip28prom.070-1477-002.bin"
 nveeprom   = "ip28/nveeprom-ip28.bin"
 serial_log = "ip28/console-ip28.log"
 [machine]
-profile = "indigo2_ip22"
+profile = "indigo2_ip28"
 cpu     = "r10000"
+[graphics]
+board = "solidimpact"
+heads = 1
+resolution = "guest"
 [scsi.1]
 path    = "ip28/blank.raw"
 cdrom   = false

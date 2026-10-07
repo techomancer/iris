@@ -17,7 +17,8 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 - **NVRAM and MAC:** the Indigo2 keeps its PROM environment and Ethernet address
   in a 93CS56 serial EEPROM, not the Indy's DS1386. It is loaded from `nveeprom`
   (default `nveeprom.bin`, `--nveeprom`) and written back with the monitor's
-  `nveeprom save`. `[network] mac` is injected into it before boot.
+  `nveeprom save` or automatically on normal Stop. `[network] mac` is
+  injected into a blank slot before boot; an existing MAC is retained.
 - **SCSI:** two WD33C93A controllers. Put a device on the second one with
   `controller = 1` in its `[scsi.N]` section; `scsi0` / `scsi1` in the monitor
   address each controller.
@@ -34,7 +35,7 @@ No separate build is required — the same `iris` / `iris-gui` binary supports I
 | IOC sys_id | `0x26` | `0x11` |
 | MAP bits 6–7 | GIO expansion IRQs | GFX DRAIN0/1 feedback |
 | Primary vblank IRQ | L1 `VERTICAL_RETRACE` (extio `SG_RETRACE` on fullhouse) | same — MAP `GFX_DRAIN0` is FIFO drain only |
-| Graphics | Integrated Newport @ `0x1F000000` | XL card in GIO slot (same REX3 stack) |
+| Graphics | Newport or GR2 XZ @ `0x1F000000` | Newport XL, GR2 XZ/Extreme, or IMPACT |
 | Audio | HAL2 (shared A2 architecture) | HAL2 |
 
 ## Boot checklist
@@ -74,9 +75,20 @@ Head 0 vblank → `VerticalRetrace` (Indy direct L1; fullhouse via extio `SG_RET
 
 Shared GIO interrupt lines (FIFO full, graphics, retrace) are latched in the IOC `extio` shadow and muxed by `gc_select` bit 0 (0 = graphics/SG slot, 1 = expansion S0). MAP bits 6–7 carry GFX drain feedback for Newport heads.
 
-## Not implemented
+## GR2 and IMPACT graphics
 
-- IMPACT / MGRAS preview stub (`src/dev/mgras.rs`, `[graphics]` board config) — see `docs/impact-mgras-research.md`
+Set `[graphics] board` to `xz`, `extreme`, `solidimpact`, `highimpact`, or
+`maximpact`. The GUI exposes the same choices in General. GR2 and IMPACT have
+command interpreters, software rasterizers, and a display path; they are no
+longer preview stubs. Require `heads = 1` and `resolution = "guest"` for these
+boards. There is no separate `[impact]` section. See
+[GR2 graphics](indy-xz-elan.md) and [MGRAS design](../rules/mgras/DESIGN.md).
+
+For the R10000 Indigo2 profile and larger RAM banks, see
+[Indigo2 IP28](indigo2-ip28.md). IP28 requires a separate PROM image.
+
+## Remaining gaps
+
 - Full EXTIO bus-error and EISA interrupt paths
 
 See also [`docs/interrupt_map.md`](interrupt_map.md) and [`rules/gui/machine-profile-vs-guest-ip22.md`](../rules/gui/machine-profile-vs-guest-ip22.md).

@@ -1,5 +1,9 @@
 # The jitv2 dirty-page probe must be retired when its cache dies
 
+> **Historical fix.** The probe itself was removed on 2026-10-01 when
+> `jitv2` began implying `tcache`. No non-tcache JIT build exists now;
+> the lifetime lesson below still applies to callbacks into a cache.
+
 > **Retired (October 2026).** `jitv2` now implies `tcache`, which closes this
 > hole by construction, so the probe and everything below it were deleted.
 > Kept for the history.

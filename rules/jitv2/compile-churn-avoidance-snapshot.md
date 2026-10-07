@@ -1,6 +1,6 @@
 # Compile churn avoidance: skip a recompile whose inputs did not change
 
-`j2wp` only (the whole-page design). Measured on an IRIX 6.5 boot:
+Whole-page JIT design (the only implementation since 2026-09-21). Measured on an IRIX 6.5 boot:
 **~286k compiles skipped, 98.0% of everything checked.**
 
 ## The problem

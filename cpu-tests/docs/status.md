@@ -1,5 +1,10 @@
 # Status
 
+> Current CI failing-check limits (2026-10-01): R4400 interpreter/JIT
+> 124/126; R5000 108/110. `jitv2` implies `tcache` and has two extra
+> dirty-data-discard failures. The result tables below are the September 11
+> historical run, not a new measurement. Coverage counts describe the source.
+
 *Last full run: 2026-09-11, all four matrix cells, on `main`.*
 *A full run is a few minutes per cell on a quiet machine.*
 
@@ -57,8 +62,8 @@ before writing (`make vectors`). That is what makes it practical to assert the
 
 ## Results
 
-Measured on this branch, which carries **tests only** — no emulator changes, so
-the suite reports every finding rather than hiding any.
+Historical measurement on 2026-09-11, before the later tests and JIT/cache
+changes. These numbers are not the current CI baselines.
 
 | cell | pass | fail | failing tests |
 |---|---:|---:|---|
@@ -163,11 +168,9 @@ predicate results in `fpu_compare.c` still pass on both CPUs.
   runs the whole suite — but an EFS writer does not exist yet. See PLAN.md §12.
 - ~~**The JIT cells.**~~ Run as of 2026-09-11: both `r4400-jitv2` and
   `r5000-jitv2` agree exactly with their interpreter counterparts (same 15
-  failing tests). What remains unrun is the **`j2wp` whole-page** variant, which
-  `matrix.sh` does not define a cell for.
-- **Interrupt delivery.** Everything runs with `Status.IE` clear, so the suite
-  tests that interrupts become *pending* but never that one is *taken*. That
-  needs a handler that can distinguish an interrupt from a fault, and is the
-  most valuable single addition left.
-- **Supervisor and user mode.** Everything runs in kernel mode. The privileged-
-  instruction and address-space tests that need a mode switch are absent.
+  failing tests). Whole-page compilation became the only implementation on
+  2026-09-21; the ordinary JIT cells now exercise it.
+- **Broader interrupt/privilege coverage.** The later `umode` group now checks
+  taken interrupts, exception vectors, and User mode with UX enabled while
+  KX/SX are disabled. CP0 usability tests cover User and Supervisor modes.
+  The September 11 results above predate these additions.

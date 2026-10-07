@@ -92,7 +92,7 @@ pub mod build_features {
     /// this is `false` off macOS even in a `--features hostgl` build.
     pub const HOSTGL: bool = cfg!(feature = "hostgl") && cfg!(target_os = "macos");
     // There is deliberately no `CPU` constant here any more. The emulated CPU
-    // stopped being a build-time property in 96e5ddd: both cache models are
+    // stopped being a build-time property: all three CPU/cache models are
     // monomorphised into every binary and `Machine::new` picks between them
     // from `cfg.machine.cpu`. A constant derived from cargo features could only
     // report how the binary was compiled, which is no longer the same question

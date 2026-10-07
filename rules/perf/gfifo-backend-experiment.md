@@ -1,9 +1,9 @@
 # GFIFO backend: swappable ring for benchmarking — 2026-09-14
 
-> **Not in this tree.** The swappable backend below (`src/gfifo.rs` and the
-> `gfifo-*` features) was an experiment that did not land; the GFIFO is the
-> hand-written `GFifo` in `src/dev/ng1/rex3.rs`. The measurements are kept because they
-> are why the custom ring stayed.
+> **Swappable backends did not land.** The `gfifo-*` features below are
+> historical experiments. The hand-written ring stayed and has since been
+> extracted to `src/gfifo.rs`, shared by Newport, GR2, and IMPACT. The
+> measurements explain the backend choice, not the current module layout.
 
 The CPU→REX3-painter command queue (`src/gfifo.rs`) can be built on any of four
 ring implementations, picked at compile time:

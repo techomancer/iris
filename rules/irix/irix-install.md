@@ -8,7 +8,7 @@ with the corrections and shortcuts we found running it through iris.
 
 ## What you need
 
-- `iris` built with `--features chd,camera,lightning` (the WD33C93 +
+- `iris` built with `--features lightning` (the WD33C93 +
   HPC3 fixes for the miniroot install path are part of mainline now;
   see `rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
 - An **empty** boot disk at SCSI ID 1.

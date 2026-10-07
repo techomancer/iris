@@ -2,8 +2,8 @@
 //!
 //! `ll`, `lld`, `sc` and `scd` classify as `Excluded`, and an excluded word
 //! ended the region: every one cost an exit to the dispatcher and a re-entry.
-//! Measured with cpu-tests/jitcov on our IP28 / R10000 (a later pull
-//! request), that made them *slower* compiled than interpreted (0.6-0.8x),
+//! Measured with cpu-tests/jitcov on IP28 / R10000, that made them
+//! *slower* compiled than interpreted (0.6-0.8x),
 //! and that kernel's idle loop is an
 //! `lld`/`scd` compare-and-swap behind a cache barrier, so it paid that on
 //! every pass.

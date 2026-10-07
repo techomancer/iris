@@ -249,19 +249,10 @@ const WORKER_IDLE_POLL_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// for why an unbounded `cv.wait` would be unsafe here.
 const BARRIER_FOLLOWER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Minimum interpreter dispatches an offset must accumulate before
-/// `exec_decoded`'s dispatch gate (`mips_exec.rs`) will send its first
-/// `CompileRequest` — `j2 min-calls [N]` tunes this at runtime.
-///
-/// **Disabled for the §13 page-consolidation experiment**: always 0
-/// ("always ready" — every eligible offset gets a `CompileRequest` on its
-/// first arrival, no per-offset arrival counting). §13.1's `PhysicalCodePage`
-/// no longer has a spare pre-publish field to borrow as a counter (the old
-/// mechanism reused each `JitEntry`'s own `gen` slot, which doesn't exist per-
-/// offset anymore — see §13.7 for the page-level replacement this needs
-/// eventually). `set_min_calls_before_compile` is kept as a no-op setter so
-/// `j2 min-calls` doesn't need to be ripped out of the monitor console while
-/// this lands.
+/// Legacy arrival-count setting, exposed by `j2 min-calls [N]`.
+/// The setter stores the value and the monitor reads it back, but whole-page
+/// dispatch does not consult it: eligible offsets request compilation on
+/// their first arrival. Defaults to 0.
 static MIN_CALLS_BEFORE_COMPILE: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_min_calls_before_compile(n: u64) {
@@ -595,16 +586,6 @@ impl JitStats {
     }
 }
 
-/// Per-physical-page code cache metadata, as tracked by the mips executor
-/// (§2.4). One instance per physical RAM/ROM page that has ever been a JIT
-/// compilation target; the executor holds a pointer to the page it is
-/// currently executing out of.
-///
-/// Does not yet own `queued_bits`/`artifact_list` (§2.4) — those land with
-/// the compile-thread/dispatcher work. `entries` (`JitEntry::flags` plus
-/// `func`/`gen`) is the `entry_bits`/`entry_table` pair from the design
-/// doc, laid out AoS per-entry rather than the document's literal SoA
-/// split.
 /// Fallback generation counter for a page whose backing `BusDevice` doesn't
 /// implement `gen_ptr` (MMIO, etc — the trait's default returns null). A
 /// single `static`, shared by every such page rather than one dummy per page:
@@ -2212,12 +2193,8 @@ impl PhysicalCodePage {
 
     // ---- `pcp_dump` capture accessors (`j2 dumppcp` / `j2 corpus`) ----
     //
-    // Thin forwarders to this implementation's real fields. They exist so
-    // `PcpDump::capture` can be written once against a single accessor set
-    // and work under both `comp.rs` implementations — the default one has no
-    // `requested`/`compiled`/`denied` bitmaps and no page-level `entry_gen`,
-    // and reconstructs all of it from its per-`JitEntry` state behind these
-    // same names (see its own copy for what each reconstruction assumes).
+    // Read-only accessors for whole-page bitmaps, generation, and FPU mode.
+    // PcpDump uses these to capture the live compiler state for offline tools.
     pub fn dump_requested(&self) -> [u64; BITMAP_WORDS] { self.snapshot_requested() }
     pub fn dump_compiled(&self) -> [u64; BITMAP_WORDS] { self.snapshot_compiled() }
     pub fn dump_denied_raw(&self) -> [u64; BITMAP_WORDS] { self.snapshot_denied_raw() }
@@ -2848,9 +2825,8 @@ impl CompileQueue {
     /// queue is ever `start()`-ed (later calls are a no-op, guarded by
     /// `debug_assert!`, since the whole point is "fixed at startup, no
     /// runtime mutation"). `Machine::new` is the only real caller today
-    /// (reading `[jitv2].threads`/`--jitv2-threads` from config — not yet
-    /// wired; still hardcoded to the default of 1 everywhere until that
-    /// config plumbing lands). `n.max(1)`: a misconfigured 0 would
+    /// (reading `[jitv2].threads`/`--jitv2-threads` from config, default 1).
+    /// `n.max(1)`: a misconfigured 0 would
     /// otherwise silently degrade to "no compile threads at all."
     pub fn set_thread_count(&mut self, n: usize) {
         debug_assert!(self.threads.is_empty(), "set_thread_count must be called before the pool ever starts");

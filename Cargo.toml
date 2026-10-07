@@ -113,6 +113,8 @@ tlbcheck = []
 # jitv2::opcode_support depends on it unconditionally for its own
 # emitter-coverage gating. See mips_instr_stats.rs.
 instr_stats = []
+# Secondary cache variants are currently refused by src/lib.rs pending fixes.
+# The intended model below describes the disabled implementation.
 # Secondary cache present. Without this flag the CPU reports SC=1 (no secondary cache)
 # and the L2 is bypassed entirely. Use alone for external R4600SC-style cache sized via
 # EEPROM, or together with r5ksc_triton for Triton on-die L2.
@@ -148,7 +150,7 @@ default = ["tlbvmap", "rexdiag"]
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
 # Unconditionally-correct-at-publish redesign, replacing the speculative v1
-# tiered JIT. Built incrementally behind this flag; does not imply `jit`.
+# tiered JIT (removed). Whole-page compilation implies transparent caching.
 jitv2 = ["tcache", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
 # jitv2 opcode fusion: LUI+ORI/ADDIU (32-bit immediate materialization) and
 # branch/jump+NOP delay-slot collapsing, jitv2's counterparts to the
@@ -170,7 +172,7 @@ jitv2_opcodefusion = ["jitv2"]
 j2wp = ["jitv2"]
 # jitv2 dev tool: temporary in-process lockstep verifier. On every dispatch,
 # classifies the current instruction (alu/branch/load-store/fpu) and, for the
-# categories currently wired up (alu only, to start), inline-compiles just
+# categories currently wired up (ALU, load/store, CP1), inline-compiles just
 # that one instruction, runs it against a saved core snapshot, restores real
 # core state, then runs the interpreter and asserts the two agree — a much
 # faster way to bisect a live-boot divergence into single instructions than
@@ -197,7 +199,7 @@ jitv2_lockstep = ["jitv2", "developer"]
 # Diagnostic only — it reports, it does not invalidate (jitv2's real
 # invalidation is the write-protect/generation machinery). Adds a compare to
 # every write, so it is off by default. **Run it with `j2 inline_mem off`**: the
-# inline store fast path writes the L1-D array directly and never goes through
+# inline store fast path writes the ppmem RAM window directly and bypasses
 # `write_data_impl`, so stores that take it are invisible to this check.
 jitv2_smc_check = ["jitv2"]
 # PCAP/bridged networking backend: instead of the built-in software NAT gateway,
@@ -311,9 +313,9 @@ codegen-units = 1
 panic = "abort"
 debug = 1
 
-# Developer profile: release optimizations + debug symbols. Default build target.
-# Enables the "developer" feature flag for dev-only tooling.
-# Usage: cargo build  (or explicitly: cargo build --profile developer)
+# Developer profile: release optimizations + debug symbols.
+# Profiles do not enable Cargo features. Select the developer feature explicitly
+# for dev-only tooling: cargo build --profile developer --features developer.
 [profile.developer]
 inherits = "release"
 debug = true
@@ -374,10 +376,10 @@ required-features = ["jitv2", "j2wp"]
 # SkyLight API `CGSSetWindowBackgroundBlurRadius`, whose symbol Apple's binary
 # scan rejects. Our vendored copy stubs WindowDelegate::set_blur to a no-op and
 # drops the private extern declarations; iris-gui never requests window blur,
-# so behaviour is unchanged. Only the 0.30.x requirement (eframe → egui-winit →
-# glutin-winit) matches this patch; iris's own winit 0.29 dependency is the
-# keyboard-KeyCode type only and creates no window in iris-gui, so its blur code
-# is dead-stripped. See rules/macos/appstore-private-api.md.
+# so behaviour is unchanged. Both iris and eframe/glutin-winit now use 0.30
+# and resolve through this patch. The GUI owns the process's event loop;
+# the embedded core does not create a second window.
+# See rules/macos/appstore-private-api.md.
 [patch.crates-io]
 winit = { path = "third_party/winit-0.30.13" }
 # block 0.1.6 is that crate's final release (2016) and declares a static of an
@@ -385,6 +387,5 @@ winit = { path = "third_party/winit-0.30.13" }
 # nokhwa -> cocoa/metal. The vendored copy makes `Class` opaque-but-inhabited, as
 # its maintained successor block2 does. Drop when nokhwa stops pulling `block`.
 block = { path = "third_party/block-0.1.6" }
-
 
 

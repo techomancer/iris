@@ -10,7 +10,7 @@ easy to break.
 
 - The eframe app owns the **single** `winit::EventLoop` in the process. iris's
   own `src/ui.rs` event loop is **not** used by iris-gui. The GUI does *not*
-  force `headless = true`: REX3 still runs its refresh thread, and the GUI
+  force `headless = true`: the selected board still runs its refresh thread, and the GUI
   installs a capture `Renderer` to receive frames.
 - **Window calls belong to the event-loop thread.** Resize, fullscreen, surface
   creation and the first GL `make_current` must run there; other threads send
@@ -31,11 +31,12 @@ easy to break.
 
 ## Frames and input
 
-The GUI installs `framebuffer.rs::CaptureRenderer` in `Rex3::renderer`
-immediately after `Machine::new`, before the CPU starts. Each `render` call from
-the REX3 refresh thread does a stride-aware copy into a `FrameSink`; the main
-thread uploads it to an `egui::TextureHandle`. `IRIS_GUI_GL=1`
-(`[debug] gui_gl_capture`) uses the GL compositor's capture path instead.
+The GUI installs `framebuffer.rs::CaptureRenderer` through
+`Machine::get_display()` / `GfxDisplay::install_renderer` immediately after
+construction, before the CPU starts. Newport, GR2, and IMPACT share this
+interface. Each `render` call copies frames into a `FrameSink`; the event-loop
+thread uploads the pixels to an `egui::TextureHandle`. `IRIS_GUI_GL=1`
+(`[debug] gui_gl_capture`) selects the board's available GL capture path.
 
 PS/2 input flows through `input.rs::pump`, only while captured:
 
@@ -58,7 +59,7 @@ data straight into its base image. CD-ROMs, COW overlays, scratch volumes and
 CHDs (`.diff.chd` sidecars) are all safe; a plain read-write hard disk is not.
 The decision is config-based: the core exposes no live dirty-sector count.
 Otherwise a modal offers **Cancel / Send IRIX halt / Force stop**; "Send IRIX
-halt" writes `halt\n` to `127.0.0.1:8881`.
+halt" writes `halt\n` to channel B at `127.0.0.1:<serial_port_b>` (default `8881`).
 
 The standalone binary exits the process on soft power-off; iris-gui sets
 `IRIS_NO_EXIT_ON_POWEROFF=1` so the machine only stops. A wedged `Machine::stop`

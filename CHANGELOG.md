@@ -4,69 +4,156 @@ All notable user-facing and developer-facing changes to iris.
 
 IRIS has no numbered releases. Binary builds are tagged `v<YYYY-MM-DD-HH-MM>` by
 the Release workflow when someone publishes one. This file is grouped by month,
-newest first, and within a month by area. Commit hashes are given where a change
-is easiest to understand by reading the commit.
+newest first, and within a month by area. Dates use the Git committer date
+(`git show -s --format=%cs`), which records when a change landed in this
+history; author dates can differ after rebases or cherry-picks. Historical
+feature names describe the build at the time, not flags to use today. Commit
+hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
-### Build / features
+### Graphics and host OpenGL
 
-- **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,
-  `mips4` and `r5k` cargo features.** CHD images, the host camera, the
-  Ultra64 dev board, DaynaPort and the IP28 / R10000 machine are always built
-  in and enabled per machine in the config. Physical RAM is always ppmem
-  (host-MMU mapped); RAM banks stay bus devices, so DMA and other bus-path
-  accesses are unchanged. iris-gui drops its matching passthrough features
-  and the "rebuild with --features ..." hints. Old snapshots that recorded
-  `chd`/`camera` in their manifest still restore.
-- **MIPS IV is purely a property of the configured CPU.** The interpreter
-  already monomorphised on `C::MIPS4` (R4400 gets its own MIPS III decoder);
-  jitv2's `Analyzer` carries the same answer as a runtime flag, now defaulting
-  to MIPS IV for tools that have no CPU to ask.
-- **`jitv2` implies `tcache`.** The JIT now always runs over the transparent
-  cache. The compile-time dirty-page probe (`jit_page_has_dirty_lines`,
-  `RejectReason::PageDirtyInCache`) and the non-tcache inline load/store path
-  (`jit_dc_data`) existed only for jitv2 without tcache and are gone.
-  `tcache` can still be enabled alone for an interpreter build.
+- **2026-10-06 — IMPACT OpenGL and texture pipeline** (`862d0fe`): GE11
+  command HLE, shared matrix/clipping/lighting routines in `src/dev/gl/`,
+  triangle rasterization, context storage and eviction through ERAM, and
+  tiled pixel memory selected by DRB/XMAP pointers. TE1 handles texture
+  downloads, RGBA4 decoding, wrapping, interpolation, and LOD for workloads
+  including OKR. Scanout follows guest VC3 timings, with 2048×2048 raster
+  storage and larger shared display buffers. Double-buffer selection,
+  Z/stencil, and complete board snapshots remain unfinished.
+- **2026-10-03 — HostGL accumulation buffer** (`6bc2082`): implements
+  `glAccum` operations with a software accumulation buffer and pixel readback;
+  restores GL state after returning accumulated pixels to the colour buffer.
+- **2026-10-03 — HostGL packed pixel enums** (`181c8b1`): keep the standard
+  numeric values for packed pixel types instead of conflicting definitions.
+- **2026-10-02 — GR2 rendering and transfer fixes** (`0cd1bae`, `7728ca2`,
+  `f9eceab`): Mandelbrot/XZ rendering, pixel read/write DMA for snoop, and
+  irisGL vertex colour, lighting, and ambient-light behaviour for X backgrounds.
+- **2026-10-02 — IMPACT opaque line stipples** (`2231d58`): stipple gaps draw
+  in the background colour instead of remaining transparent.
 
-### iris-gui
+### IP28, memory, and battery-backed state
 
-- **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
-  (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
-  on those profiles, not in the NVRAM file) used to default to a bare
-  `"nveeprom.bin"` with no anchoring, no migration, and no config-editor field,
-  unlike `nvram`. Since iris-gui never changes its working directory, that bare
-  default resolved against whatever CWD the OS happened to launch it with —
-  often not the same place twice between `cargo run` and a bundled `.app` — so
-  a machine could silently load a different (usually blank) EEPROM each
-  launch, and "Reset NVRAM"'s MAC write (which only ever touched `nvram`) had
-  no effect on Indigo2/IP28's actual `eaddr`. Now: a stable
-  `<config dir>/iris/nveeprom.bin` default (`GuiSettings::default_nveeprom_path`),
-  the same relative-path migration `nvram` gets on load, and a "NVRAM EEPROM
-  file" row on the General tab right below NVRAM file.
-- **"Reset NVRAM" and the no-MAC-yet pre-flight now also patch the NVRAM
-  EEPROM.** Both only ever touched the DS1386 `nvram` file — on Indigo2/IP28,
-  which read `eaddr` from `nveeprom` instead (see above), this had no effect
-  on the guest's actual Ethernet MAC at all: the toast would report a fresh
-  MAC, but IRIX kept reporting the static `config::DEFAULT_MAC` because
-  `nveeprom` stayed blank and core's own blank-EEPROM fallback filled it in
-  with that default on every boot. Added `nveeprom`-side equivalents of every
-  `nvram` MAC helper (`nveeprom_has_mac`, `write_nveeprom_mac`,
-  `ensure_nveeprom_exists`, `reset_nveeprom`) and call them alongside the
-  `nvram` ones, so both chips get a real MAC regardless of machine profile.
+- **2026-10-04 — IP28 512 MB banks** (`c16e18d`): the MEMCFG installed-size
+  decoder accepts the PROM's `(size_field=31, rank=1)` encoding. Two 512 MB
+  banks provide 1 GB; IRIX 6.5 reports 1024 MB after POST. The GUI offers
+  512 MB banks and 768/1024 MB totals. IP22/IP24 still reject banks above
+  128 MB; the fourth-bank policy is unchanged. See
+  [IP28 512 MB banks](rules/irix/ip28-512mb-banks.md).
+- **2026-10-04 — IP28 boot chime** (`ce56123`): report R10000 revision 2.5
+  so the PROM takes its supported audio path; correct PBUS register decoding
+  and masking used by the tune's DMA setup.
+- **2026-10-04 — Save NVRAM and EEPROM on Stop** (`5abfa7f`): after the CPU
+  stops, HPC3 saves the DS1386 and the Indigo2 motherboard EEPROM to their
+  configured paths. Normal GUI Stop/Quit and guest power-off retain PROM
+  changes. Automatic and manual saves use a flushed temporary file followed
+  by replacement, preserving the previous image on failure. Fresh IP28 EEPROMs
+  get PROM defaults and a valid checksum before boot, including volume `80`
+  and boottune `1`; existing settings are preserved.
+- **2026-10-04 — IRIX memory stress utility** (`e966d54`): adds
+  `test/memstress/` for walking an allocated mapping in both directions,
+  verifying indexed 64-bit patterns, and checking pages after discard/refill.
+
+### Monitor and serial ports
+
+- **2026-10-04 — Configurable monitor port** (`d8b8131`): top-level
+  `monitor_port` / `--monitor-port`, default `8888`. The terminal connects
+  only to its own machine's bound listener; a failed bind no longer attaches
+  it to another emulator's monitor.
+- **2026-10-04 — Configurable serial ports** (`d6184b8`):
+  `serial_port_a` / `--serial-port-a` and `serial_port_b` / `--serial-port-b`,
+  defaults `8880` and `8881`. The GUI serial console and halt action follow
+  channel B's configured port. Occupied serial ports warn and use null backends.
+
+### Build, features, and CI
+
+- **2026-10-01 — Retired device and CPU Cargo features** (`4d6e97c`): `chd`,
+  `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`, `mips4`, and `r5k` are
+  removed. Devices are built in and selected per machine. Physical RAM always
+  uses ppmem; banks remain bus devices for DMA. MIPS IV follows the configured
+  CPU in both engines. Old snapshots listing `chd`/`camera` still restore.
+  `jitv2` implies `tcache`; the non-tcache JIT memory path and dirty-page probe
+  are removed. Interpreter builds can enable `tcache` separately.
+- **2026-10-01 — Source layout** (`af9433f`, `51789b2`, `484ca1a`, `e9e52c6`,
+  `061b347`): CPU and JIT code move to `src/cpu/`, devices to `src/dev/`,
+  Newport to `src/dev/ng1/`, GR2/IMPACT to their device directories, and
+  network services to `src/net/`.
+- **2026-10-01 — Bare-metal CI expectations** (`2414459`, `320c38a`): build
+  matrix drops retired flags; cpu-tests baselines account for `jitv2`'s
+  mandatory transparent-cache semantics. Failing-check limits are 124/126
+  for R4400 interpreter/JIT and 108/110 for R5000 interpreter/JIT.
+- **2026-10-02 — Workflow runtime updates** (`e0f0e66`, `0529517`): opt
+  GitHub Actions into Node.js 24 and update App Store artifact upload.
+
+### iris-gui and configuration
+
+- **2026-10-01 — Stable motherboard EEPROM paths** (`9f17c3d`): default
+  `nveeprom` to `<config dir>/iris/nveeprom.bin`, migrate relative paths on
+  load, and expose the file in General. Indigo2/IP28 PROM environment and
+  MAC live in this chip; Indy uses the DS1386 instead.
+- **2026-10-01 — Reset both battery-backed chips** (`36bfb4c`): Reset NVRAM
+  and the no-MAC pre-flight also seed and patch the motherboard EEPROM, so
+  the GUI's selected MAC reaches Indigo2/IP28's actual `eaddr`.
+- **2026-10-01 — Persistent JIT cache settings** (`71790bd`): expose
+  `[jitv2] cache` and `cache_dir` rather than a Debug-only environment toggle.
+  Default false/blank settings preserve externally supplied `IRIS_JIT_CACHE`
+  / `IRIS_JIT_CACHE_DIR`; explicit enabled/nonempty settings replace them.
+  With no environment override, defaults leave the cache off.
+- **2026-10-02 — Cache control in General** (`5582e96`): persistent JIT cache
+  controls remain accessible in lightning builds, which hide the Debug tab.
 
 ## September 2026
+
+### Configuration and desktop usability
+
+- **2026-09-29 — Debug environment precedence** (`e6bde88`): externally
+  supplied debug environment variables survive default false/blank GUI/TOML
+  settings. Explicit enabled/nonempty settings still replace those variables.
+- **2026-09-30 — Desktop and GUI refinements** (`e38f38a`, `05242a6`,
+  `6aa3a21`): UI updates, resize locking, and gr_osview startup fixes.
+- **2026-09-30 — Example configuration defaults** (`08be293`): restore
+  standard settings in `iris.toml` after diagnostic runs.
+
+### Graphics (GR2 and IMPACT)
+
+- **2026-09-28 — GR2 XZ/Extreme** (`5d07b4d`): replaces the XZ preview stub
+  with an HQ2 command interpreter, RE3 software rasterizer, GE7 diagnostic
+  storage, VC1/XMAP5/Bt457 display path, and framebuffer presentation.
+  XZ is selectable on Indy/IP22; Extreme is restricted to IP22. Later
+  September fixes add irisGL tokens, glyphs, polygons, window-ID clipping,
+  context state, and homogeneous clipping (`2383f26`, `30fb4ff`, `a528f18`,
+  `e806066`, `95b7ad0`, landed 2026-09-29). The GUI gains the corresponding
+  GR2 board picker on the same date (`bb286ea`).
+- **2026-09-30 — IMPACT/MGRAS board model** (`0b1ea38`): replaces the ID stub
+  with HQ3 command processing, GE11 diagnostic storage, RSS 2D rasterization,
+  VC3/XMAP/colormap/DAC scanout, interrupts, tracing, and replayable recordings.
+  The OpenGL, TE1, and tiled pixel-memory work lands on October 6 (above).
+  Solid, High, and Maximum configurations share the generic `GfxDisplay`
+  output used by the CLI and GUI. See [MGRAS design](rules/mgras/DESIGN.md).
+- **2026-09-30 — Graphics DMA and FIFO fixes** (`5787d02`, `b5cc363`): improved
+  DMA reads, FIFO handling, and fillrate benchmark crash fixes.
+
+### Host services
+
+- **2026-09-30 — Host calls and HostGL** (`c8dc330`, `1a93808`, `0be4d1c`):
+  optional `hostcall` traps private user-mode syscalls 3000–3009; `hostgl`
+  registers service 3000 to replay the guest replacement libGL's commands on
+  the host GPU. The backend is macOS CGL; other platforms register no GL
+  service. Guest libraries live in `atomchild411/iris-guest-tools`.
+  `iris-hostcall` is a workspace member; `iris-hostgl` is excluded and builds
+  only when requested through the feature.
 
 ### Graphics (REX3)
 
 - **Drawing engine refactor** (`35a3b18`). One generic draw routine
-  (`src/rex3_generic.rs`, mode decoding in `src/rex3_shape.rs`) is specialised
-  ahead of time into 462 native draw functions (`src/rex3_shaders.rs`, generated
+  (`src/dev/ng1/rex3_generic.rs`, mode decoding in `src/dev/ng1/rex3_shape.rs`) is specialised
+  ahead of time into 462 native draw functions (`src/dev/ng1/rex3_shaders.rs`, generated
   by `tools/gen_rex3_shaders.py` from a corpus of the draw modes the IRIX desktop
   uses). Most desktop drawing now runs through LLVM-optimised specialised code in
   every build, not only with `rex-jit`. The REX3 JIT and the precompiled set share
   one dispatch table. `src/rex3_simd.rs` is gone; the JIT profile moved to
-  `src/rex3_profile.rs`.
+  `src/dev/ng1/rex3_profile.rs`.
 - VDMA copes with REX3 reporting busy; `advlast` fixed in the JIT; the REX3
   diagnostic counters were moved off the hot path behind the new default-on
   `rexdiag` feature, so a last-drops build can drop them with
@@ -77,6 +164,7 @@ is easiest to understand by reading the commit.
   reading `fb_aux + (fb_aux - fb_rgb) + off` — a wild pointer that segfaulted the
   REX3 thread under X11. `Dm1::use_aux()` now picks the base in both shader
   emitters (`rules/rex3/cidmatch-aux-plane-base.md`).
+  Landed 2026-09-18 (`44f4b24`).
 - The GFIFO push is retryable, and a shader rejected by a full compile queue can
   be requested again (`rules/testing/rex-jit-queue-retry.md`).
 - `CIDMATCH` is a mask of permitted CIDs, not an equality value
@@ -84,13 +172,38 @@ is easiest to understand by reading the commit.
 - Blend-alpha handling fixed (`rules/rex3/blendalpha-and-alpha-blending.md`).
 - REX3 benchmarking tests; a triangle benchmark in `gltest`.
 
-### CPU and timing
+### CPU, timing, and audio
+
+- **2026-09-30 — Indigo2 IMPACT IP28 / R10000** (`8579614`): fullhouse machine
+  variant with 16 MB MEMCFG granules, RAM at `0x20000000`, board revisions,
+  R10000 cache-operation semantics, 64 TLB entries, and 44-bit virtual
+  addresses. Loads/stores/fetches use memory directly; shadow tag/data arrays
+  answer CACHE operations and PROM diagnostics. Default Count is 97.5 MHz.
+  Requires an external IP28 PROM and IMPACT graphics for the IP28 kernel.
+- **2026-09-29 — CPU/cache correctness** (`a09186a`, `b7d2a18`, `70a5e39`):
+  MTC0 retains full values for 64-bit CP0 registers, XContext fields follow
+  the CPU's VA width, and Index_Store_Tag discards old line data without
+  writing it back. MEMCFG changes update only affected device-map slots
+  (`772e01c`).
+- **2026-09-29 — Compare deadline handling** (`da4223a`): a far-future Compare
+  value is not treated as a missed deadline; writing Compare acknowledges
+  its pending match without delivering it again (`18109d8`, 2026-09-19).
+- **2026-09-18 — Idle-pause interrupt handling** (`f1a561d`, `1390bf6`): wake
+  a parked CPU as soon as a device raises an interrupt, and do not park when
+  all interrupt sources are masked.
+- **2026-09-29 — HAL2 pacing and output** (`38e510c`): wall-clock frame pacing
+  on 250 µs timer wakes, bounded catch-up, DMA read-ahead tied to guest polls,
+  a persistent host output stream, and resampling to its rate. Fixes stretched
+  audio, repeated stale chunks, and lock-related hangs. Codec CLKID uses BRES
+  generator numbers 1–3 (`39d304f`, 2026-09-19).
+- **2026-09-18 — VDMA implementation split** (`e603daf`): specialised transfer
+  paths in `src/dev/mc_vdma.rs` preserve translation and GIO packing rules.
 
 - **CP0 Count runs at a fixed 33 MHz** (`066935b`). The slow/fast tick detection
   and Count/IP7 frequency inference are gone; a constant rate proved more stable.
   IRIX reports it as a 66 MHz CPU. `[clock] fixed_mhz` / `--clock-fixed-mhz`
   override it.
-- **Guest clock offset** (`[rtc_offset]`, iris-gui General → Real-time clock).
+- **2026-09-19 — Guest clock offset** (`eab2df2`, `[rtc_offset]`, iris-gui General → Real-time clock).
   Start the DS1386 RTC shifted from host time by signed years, months, days,
   hours, minutes and seconds, e.g. `years = -18`. Applied only when the RTC is
   seeded from the host at startup; clamped to the chip's 1970–2039 range.
@@ -103,7 +216,31 @@ is easiest to understand by reading the commit.
 
 ### JIT v2
 
-- **Corpus capture moved to the pcp cache; `jitv2_corpus_dump` removed.** The
+- **2026-09-21 — Whole-page compilation becomes the only implementation**
+  (`8dfc365`): remove per-entry compilation; `j2wp` remains a compatibility
+  alias for `jitv2`. Flushes no longer requeue preserved entry sets, and
+  dispatch uses fast page lookup (`44e9b9e`, 2026-09-20; `da2bb7d`,
+  2026-09-21). Shared absolute-PC exit blocks reduce code size (`e03b9b8`).
+- **2026-09-29 — Broader compiled regions and persistent cache** (`36ec12b`):
+  safe CP0 operations and LL/SC stay in regions through their interpreter
+  handlers; add MIPS IV/FPU coverage and fix flush/reclamation failures.
+  An optional disk cache reuses verified compiled pages between runs, keyed
+  by build identity, page bytes, FR mode, and codegen settings. See
+  [Persistent JIT cache](docs/jitv2-persistent-cache.md).
+- **2026-09-30 — R10000 inline memory** (`839155a`, `afb8d1b`): direct loads
+  and stores use the transparent memory window without cache-tag probes;
+  the transparent-region gate tests the bitmap in one load.
+- **2026-09-21 — FPU codegen** (`bea0af6`): CP1 usability checks in delay
+  slots, conditional FPU moves, additional FP loads/stores, and literal zero
+  IR operands.
+- **2026-09-20 — Interrupt-check coalescing** (`3f51ff0`): `j2 intrun` can
+  combine checks across eligible short instruction runs; default remains 1,
+  and lockstep forces per-instruction checks.
+- **2026-09-18 — Verifier and diagnostics** (`66d5151`, `156936a`): poison
+  the verifier with its region-boundary sentinel and report JIT verification
+  and policy flags in the build feature list.
+
+- **2026-09-20 — Corpus capture moved to the pcp cache; `jitv2_corpus_dump` removed** (`e76520e`). The
   old Cargo feature dumped a raw 4KB page per compile request from inside the
   compile worker, with one entry offset encoded per filename and a
   `PhysicalCodePage::saved_bits` bitmap to dedup them. It had to be compiled in
@@ -118,10 +255,8 @@ is easiest to understand by reading the commit.
   was. The format stays entirely physical: no virtual address is recorded,
   because jitv2 compiles PIC precisely because one physical page is shared
   across processes, so no single VA is meaningful. `IRISPCP1` files still
-  read. Both
-  `j2 dumppcp` and `j2 corpus` now work under **both** `comp.rs`
-  implementations, not just `j2wp`: the default impl reconstructs the entry
-  bitmaps from its per-`JitEntry` state. `zz_corpus_sizes` consumes a directory
+  read. At introduction both compiler implementations could capture pages;
+  the per-entry implementation was removed the following day. `zz_corpus_sizes` consumes a directory
   of `.pcp` files via `IRIS_CORPUS_DIR` instead of a file of filenames.
 
   Also fixed along the way: `Codegen::last_code_size` was `developer`-gated,
@@ -132,7 +267,7 @@ is easiest to understand by reading the commit.
   to measure. See `rules/jitv2/corpus-capture-from-the-pcp-cache.md`, including
   the `requested`-vs-`compiled` trap that silently discards 99.5% of a corpus.
 
-- **Compile churn avoidance (`j2wp`).** Each page now remembers the bytes its
+- **2026-09-19 — Compile churn avoidance** (`d1bf817`). Each page now remembers the bytes its
   last compile decoded, the entry points it published and the FR mode it was
   built for. A later compile request whose generation moved but whose *decoded*
   words are all unchanged re-validates the installed function instead of
@@ -149,14 +284,37 @@ is easiest to understand by reading the commit.
   PC/BD stores are emitted only when needed; the last instruction on a page and
   excluded instructions share one path (early September).
 
-### Networking
+### Networking and SCSI
 
-- **Guest DNS goes to the host's DNS server** (`src/host_dns.rs`): the first IPv4
+- **2026-09-29 — NAT TCP backpressure** (`3e38408`): retain guest TCP data
+  when a host reader is slow, instead of acknowledging bytes before the host
+  has accepted them.
+- **2026-09-19 — DNS response source** (`2b55ed6`): replies use the resolver
+  address the guest queried, even when the host's upstream resolver differs.
+- **2026-09-19 — Ethernet RX descriptors** (`b7bca7c`): stop the receive
+  channel when its descriptor chain is exhausted so the guest can restart it.
+- **2026-09-19 — SCSI write data phases** (`8434446`, `a68e7a3`): outbound
+  PIO does not inherit DMA direction; data after a WRITE CDB is retained as
+  data rather than decoded as a second command. Fixes Linux/NetBSD paths.
+
+- **Guest DNS goes to the host's DNS server** (`src/net/host_dns.rs`): the first IPv4
   `nameserver` in `/etc/resolv.conf`, or the active adapter's server on Windows,
   re-read every few seconds so a VPN coming or going needs no restart. `8.8.8.8`
   is only the fallback.
 
-### Testing
+### Testing and builds
+
+- **2026-09-30 — Bare-metal suite coverage** (`2a796e2`, `5038af9`,
+  `98a523e`): consecutive load/store and TLB-load cases, plus User-mode tests
+  with UX enabled under KX/SX disabled, matching IRIX 6 n32 execution.
+  Prebuilt benchmark provenance refreshed (`0f5c65c`; earlier `b6440aa`,
+  2026-09-19).
+- **2026-09-27 — Linux packaging** (`c5e3ad4`): riscv64 deb/rpm packages and
+  pinned Ubuntu 24.04 runners; Anylinux/AppImage build fixes landed
+  2026-09-25 (`b0e6f7b`).
+- **2026-09-18 — CLI logging backend** (`edccb81`): install `env_logger` so
+  warnings are visible; developer-mode CPU startup crash workaround
+  (`45f26b8`).
 
 - **cpu-tests validated on real SGI hardware** (`5150db0`). An Indy R4400 rev 6.0
   and an Indy R5000 rev 1.0 both pass every check; the logs are in
@@ -173,39 +331,38 @@ is easiest to understand by reading the commit.
 
 ### iris-gui
 
-- **Graphics board picker** in Configuration → General: Newport, GR2 XZ or GR2
+- **2026-09-30 — UI consistency** (`e38f38a`): shared graphics board picker,
+  memory controls, and processor clock controls across machine setup paths.
+  Kernel tick rate appears next to MIPS; mouse injection is available from
+  the monitor (`837b048`). The status bar also visualizes graphics FIFO depth
+  (`a6f773e`, 2026-09-20).
+- **2026-09-30 — First-frame resize locking** (`05242a6`): release the window
+  size lock before calling `inner_size()` to avoid a recursive lock.
+- **2026-09-19 — Machine lifetime cleanup** (`6ab3f11`): monitor/CI handles
+  share the machine drop slot rather than retaining a dead `Machine` pointer.
+
+- **2026-09-29 — Graphics board picker** in Configuration → General: Newport, GR2 XZ or GR2
   Extreme (Indigo2 only). Picking a GR2 board resets heads, resolution and
   `[impact]` to values `validate()` accepts; the Newport heads control is
   hidden for GR2.
-- **IP28 / R10000 and IMPACT graphics wired into the GUI.** A new `ip28`
-  crate feature (`cargo build -p iris-gui --features ip28`, passes through to
-  `iris/ip28`) puts the Indigo2 IMPACT (IP28) machine profile and R10000 CPU
-  in the Machine model / Processor dropdowns, gates the 256 MB RAM bank size
-  (the IP28 MC's own granule) with a hint everywhere banks are picked, and
-  reports build status on the Debug tab. The New Machine dialog nudges
-  Processor to R10000 and turns off "use embedded PROM" when IP28 is picked
-  (there is no embedded IP28 PROM — only IP22/IP24 — so it needs a real
-  dumped image), and pre-sets IMPACT graphics so a fresh machine has a
-  display.
-- **The graphics board picker above now also covers IMPACT** (Solid / High /
-  Maximum, Indigo2 only — either IP22 or IP28; no feature needed, since the
-  `[impact]` config section and the `mgras` board model it drives already
-  existed). It's the same dropdown, now unifying `[graphics].board` and
-  `[impact]` since they claim the same GIO gfx slot: picking a non-Newport
-  choice resets heads, resolution, and the other of the two config sections
-  to values `validate()` accepts, and the Newport heads/resolution controls
-  are hidden whenever either is active. Moving the machine profile off
-  Indigo2 falls the picker back to Newport instead of leaving a config
-  `validate()` would reject at Start.
-- **CP0 Count clock (Processor section, General tab):** a `[clock] fixed_mhz`
+- **2026-09-30 — IP28 / R10000 and IMPACT in the GUI.** The machine and CPU
+  dropdowns include IP28 and R10000. New Machine selects R10000, disables the
+  embedded PROM option, and presets IMPACT graphics for IP28. Initially gated
+  by `ip28`; all profiles are built in after the October 1 feature cleanup.
+- **2026-09-30 — Unified graphics selection.** The picker writes
+  `[graphics] board` for Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Maximum;
+  there is no separate `[impact]` section. Non-Newport boards reset heads and
+  resolution to supported values. Extreme is restricted to IP22; changing to
+  an unsupported profile falls back to XZ.
+- **2026-09-30 — CP0 Count clock (Processor section, General tab):** a `[clock] fixed_mhz`
   control (was CLI/TOML only) with an "Auto" reset to the profile's default
   (33 MHz, or 97.5 MHz on IP28).
-- **Kernel Hz next to MIPS in the status footer** (`Machine::fasttick_count`,
+- **2026-09-30 — Kernel Hz next to MIPS in the status footer** (`Machine::fasttick_count`,
   new in core): the guest's own clock-tick rate — CP0 Compare matches, or the
   IOC's 8254 timer interrupts when IRIX uses those instead — distinct from
   the MIPS readout's host emulation throughput. The CLI's baked status bar
   has shown this since `837b048`; iris-gui had no equivalent readout at all.
-- **Host services / host OpenGL build status on the Debug tab.** New passthrough
+- **2026-09-30 — Host services / host OpenGL build status on the Debug tab.** New passthrough
   `hostcall`/`hostgl` crate features (`iris/hostcall`, `iris/hostgl` — see
   `c8dc330`, `1a93808`): private syscalls 3000-3009 let an IRIX program built
   against the replacement libGL (iris-guest-tools) ask the host for something
@@ -288,7 +445,7 @@ is easiest to understand by reading the commit.
 - Emulator support for it: `--load-elf` and the `loadelf`/`loadbin` monitor
   commands (`src/elf.rs`); a default-off **test device** in GIO slot 0 with guest
   console, machine-state JSON dump and exit code (`--test-device`,
-  `src/testdev.rs`), later with a host clock and a retired-instruction counter.
+  `src/dev/testdev.rs`), later with a host clock and a retired-instruction counter.
 - **bench/** (`07d8a3b`): 46 kernels in six groups, each checksummed against a
   golden value, reporting throughput, guest MIPS and an accuracy score.
   **iris-bench** runs, compares and sweeps builds (`matrix`, `host`).
@@ -335,7 +492,7 @@ is easiest to understand by reading the commit.
   SCSI bus as a per-ID target with its own NAT or PCAP backend
   (`docs/daynaport.md`, `docs/iris-daynaport-target.md`).
 - **TFTP server** in the NAT gateway for PROM network boot (`--tftp-dir`,
-  `src/tftp.rs`).
+  `src/net/tftp.rs`).
 - **SGI volume headers**: volume-directory support and the `mkvh` tool.
 - SCSI fixes for Linux (phantom LUNs, mode pages, MODE SENSE(10)) and the Indigo2.
 - PS/2: report that the aux mux is unsupported (fixes the mouse in Debian 7);
@@ -393,8 +550,8 @@ is easiest to understand by reading the commit.
 ### Platforms and devices
 
 - **Indigo2 IP22 platform** (`f2d0bff`): `[machine] profile`, fullhouse MC/IOC,
-  a Newport XL on the GIO graphics slot, plus preview stubs for the Indy XZ/Elan
-  board (`src/xz.rs`) and Indigo2 IMPACT (`src/mgras.rs`), dual-head Newport and
+  a Newport XL on the GIO graphics slot, plus the then-existing Indy XZ/Elan
+  and Indigo2 IMPACT preview stubs (removed/replaced in September), dual-head Newport and
   forced Newport resolutions.
 - IndyCam CDMC register map and power-on defaults corrected
   (`rules/irix/indycam-cdmc-register-map.md`).
@@ -405,13 +562,12 @@ is easiest to understand by reading the commit.
 - `libchdman-rs` 0.288.8 (BSD-3-Clause; drops GPL-3.0), then 0.288.9 (bin/cue fix).
 - Machine and other large objects are constructed with bigger stacks (#60).
 
-## June 2026 (and late May)
+## June 2026
 
 ### iris-gui (new)
 
-- **Optional egui front-end** (`a8b8262`, contributed via danifunker's fork):
-  named machines with autosave in `gui.json`, iris.toml import/export, embedded
-  framebuffer, mouse and keyboard capture, safe-stop dialog, icons.
+- The optional egui front-end introduced on May 31 continued to gain
+  machine management, display, input, and distribution improvements.
 - Live MIPS readout; fewer framebuffer copies; X11 mouse capture fix;
   IntelliMouse wheel support in the core.
 - **Mac App Store support**: security-scoped bookmarks, interpreter-only under the
@@ -430,17 +586,16 @@ is easiest to understand by reading the commit.
 
 ### Networking
 
-- **In-process NFS server** (`src/nfsudp.rs`, eight increments ending `685f534`):
+- **In-process NFS server** (`src/net/nfsudp.rs`, eight increments ending `685f534`):
   NFSv2 for IRIX 5.3 and NFSv3 for 6.x, MOUNT v1/v3, a duplicate-request cache,
   IP-fragment reassembly, and READDIR that respects `count`. The external
   `unfsd` and its `--unfsd`, `--nfs-port` and `--mountd-port` options are gone.
 - **PCAP bridged networking** (`--features pcap`, `2c83ac8`), with capture-
   permission elevation and installer plumbing, an NFS responder on a virtual LAN
   IP (`nfs_pcap_ip`), live NIC changes, and a fix for RX starvation on busy LANs.
-- **XDMCP** reverse-proxy helper (`src/xdmcp.rs`, `docs/xdmcp.md`).
+- **XDMCP** reverse-proxy helper (`src/net/xdmcp.rs`, `docs/xdmcp.md`).
 - FTP passive-mode helper for inbound port forwards; port forwards can be
   rebound live; NAT adoption and "networking off" diagnostics.
-- Time and NTP answered by the gateway (late May).
 
 ### Storage
 
@@ -462,7 +617,13 @@ is easiest to understand by reading the commit.
   JIT; compositor modularised.
 - Indycam capture works on Linux hosts (V4L).
 
-### Late May
+## May 2026 — snapshots, CHD and CI
+
+### Late May: GUI and devices
+
+- **2026-05-31 — Optional egui front-end** (`a8b8262`, contributed by Dani
+  Sarfati): named machines with autosave in `gui.json`, iris.toml import/export,
+  embedded framebuffer, input capture, safe-stop dialog, and icons.
 
 - **VINO / IndyCam** end to end: pixel pipeline, CDMC and SAA7191, host camera
   capture on macOS, SYSID bit 4 so IRIX attaches the driver, I2C fixes, capture
@@ -487,11 +648,12 @@ is easiest to understand by reading the commit.
 - Enabled build features are printed at startup.
 - A configured SCSI device that can't attach is a fatal error.
 
-## May 2026 — snapshots, CHD and CI
+### Storage and automation
 
 - **CHD images** (`--features chd`, May 18–20) for SCSI disks and CD-ROMs, via the
   `libchdman-rs` crate.
 - Configurable NAT subnet; unprivileged ICMP on macOS.
+- Time and NTP answered by the gateway (late May).
 - `tlbvmap` on by default, TLB translation statistics, a shadow TLB with cooked
   values.
 - `gr_osview` and `jot` fixed on IRIX 5.3; 12bpp colour-index decoding fixed.
@@ -625,7 +787,7 @@ compute the live chunk set.
 
 - **`cp0_compare` write recalibration: synthetic clock available behind
   `--features ci_clock`.** The previous implementation in
-  `src/mips_core.rs` measured `Instant::now()` between successive
+  `src/cpu/mips_core.rs` measured `Instant::now()` between successive
   Compare writes to compute a wallclock-stretched `count_step`. Two
   passes from the same starting state would see different host
   scheduling → different `dt_ns` → different `count_step` → different
@@ -643,7 +805,7 @@ compute the live chunk set.
   local `pending: Option<u8>` slot and retrying instead of dropping —
   proper flow control: bytes only leave `host_to_guest` when there's
   downstream space. Regression test `long_input_round_trips_without_loss`
-  in `src/z85c30.rs`.
+  in `src/dev/z85c30.rs`.
 - **EEPROM round-trip**: discovered during 1.7 testing that the EEPROM
   has 128 words (not 256). Test corrected.
 - **IOC round-trip**: `load_state` re-runs `update_interrupts()` which
@@ -657,7 +819,8 @@ compute the live chunk set.
 
 ### Deprecated / Descoped
 
-- **Persistent JIT cache** (was Phase 2.5): descoped. Interp on M2 hits
+- **Persistent JIT cache** (was Phase 2.5): descoped at the time; a different
+  compiled-page cache for JIT v2 landed on 2026-09-29 (see September). Interp on M2 hits
   Indy parity (60–100 MIPS for integer code). The plan-cited 1.5–2× JIT
   win wasn't worth the maintenance burden of an unstable JIT (still-open
   POST hang on M2, prior Loads-tier and store-correctness issues). At the

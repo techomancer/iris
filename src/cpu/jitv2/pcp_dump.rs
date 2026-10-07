@@ -5,8 +5,7 @@
 //! `zz_corpus_sizes` (`jitv2/mod.rs`) measures emitted code volume against.
 //!
 //! Always compiled in — a monitor-console diagnostic, not a dev-build-only
-//! tool — and available under **both** `comp.rs` implementations (`j2wp` and
-//! the default one-function-per-entry protocol). It captures the full
+//! tool. Whole-page compilation is the only protocol. It captures the full
 //! `PhysicalCodePage` state (bitmaps, gen, pinned FR mode) alongside the
 //! memory, for debugging a live divergence/panic where the *page's own
 //! bookkeeping*, not just its bytes, might be the story ("was this offset

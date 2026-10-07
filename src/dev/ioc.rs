@@ -695,7 +695,7 @@ impl Ioc {
 
 impl Device for Ioc {
     fn step(&self, _cycles: u64) {
-        // TODO: Implement timer stepping
+        // PIT, serial, and PS/2 use their own timers/threads, not CPU cycles.
     }
 
     fn stop(&self) { self.scc.stop(); self.pit.stop(); self.ps2.stop(); }

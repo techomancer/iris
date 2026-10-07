@@ -3,7 +3,9 @@
 > **Since 2026-10-01 `jitv2` implies `tcache`**, so every jitv2 build — including
 > the CI jitv2 cells — fails these 2 checks. The CI baselines are per engine:
 > r4400 124 interp / 126 jitv2, r5000 108 / 110 (`.github/workflows/suites.yml`).
-> The tables below are the historical 2026-08-26 measurement.
+> The tables below are the historical 2026-08-26 measurement. CPU selection
+> no longer uses `r5k`; several FPU gaps described below are now fixed. See
+> [current findings](../../cpu-tests/docs/findings.md).
 
 `cpu-tests` `cache/hit_inv_discards` **fails under `--features tcache`** (2 extra
 failed checks: 63 instead of the baseline 61) and passes in every non-tcache

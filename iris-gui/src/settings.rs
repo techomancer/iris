@@ -3,18 +3,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// GUI-only persisted state. Lives at `~/.config/iris/gui.json`.
+/// GUI-only persisted state at `<dirs::config_dir()>/iris/gui.json`.
 ///
 /// This is the **system of record** for machines: each named machine is a
 /// `MachineConfig` stored here. `iris.toml` is treated as import/export
 /// only, for compatibility with the standalone `iris` CLI.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GuiSettings {
-    /// egui UI scale (1.0 = default).
+    /// egui UI scale (default `UI_SCALE_DEFAULT`, currently 1.25).
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
-    /// Emulated-display (VM screen) magnification: 1.0 = native (1 emulated
-    /// pixel : 1 logical point). Driven by the View-menu slider (0.5×–3× in 0.5
+    /// Emulated-display (VM screen) magnification (default `VM_SCALE_DEFAULT`,
+    /// currently 0.75). Driven by the View-menu slider (0.5×–3× in 0.25
     /// steps), **independent of `ui_scale`** — scaling the controls doesn't
     /// resize the picture, and vice-versa.
     #[serde(default = "default_vm_scale")]

@@ -1,5 +1,10 @@
 # CHD disk images require `--features chd` at build time
 
+> **Superseded on 2026-10-01 (`4d6e97c`).** Every build includes CHD support;
+> the `chd` feature no longer exists. Use `cargo build --release --bin iris`
+> (optionally `--features lightning,rex-jit`). The diagnosis below applies
+> to older binaries only; attach failures still abort startup.
+
 If a `.chd` is configured for any `[scsi.N]` in the toml but the binary was
 built **without** `--features chd` (e.g. a bare `cargo build --release --bin
 iris`), the disk **cannot be attached**. `ChdHd::open` returns

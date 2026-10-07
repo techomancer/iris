@@ -1,5 +1,8 @@
 # What jitv2 still interprets, and which of it is worth compiling
 
+Historical measurements; current builds select MIPS IV through the CPU model,
+not a Cargo feature. IP28/R10000 is now a supported runtime profile.
+
 Surveyed 2026-09-22, after enabling `mips4` turned out to be worth ~20% on
 integer code and exactly nothing on FP. This is the follow-on question: what
 else is left on the table.
@@ -67,7 +70,7 @@ FP program calls:
 
 ## DONE 2026-09-22: the multiply-add family, RECIP/RSQRT and PREFX
 
-Thirteen emitters landed. Measured on our IP28 (R10000; a later pull request), 5 reps, fresh clone and boot,
+Thirteen emitters landed. Measured on IP28 (R10000), 5 reps, fresh clone and boot,
 host wall clock:
 
 | | Dhrystone 50M | Whetstone 1M |
@@ -118,10 +121,10 @@ What remains is the privileged/atomic set — `Bc1` landed too (below).
    [`bc1-is-an-ordinary-branch.md`](bc1-is-an-ordinary-branch.md), including
    why measuring it required writing the kernel in assembly.
 
-3. **RECIP/RSQRT — 4 emitters, 17 sites.** Low value, but trivial next to the
+3. **RECIP/RSQRT — done; 4 emitters, 17 sites.** Low value, but trivial next to the
    MADD work and shares its shape.
 
-4. **`Prefx` — 1 emitter, emits nothing.** A prefetch is architecturally a
+4. **`Prefx` — done; 1 emitter, emits nothing after the CU1 check.** A prefetch is architecturally a
    hint; `Pref` is already in the compiled set and `Prefx` is its indexed
    form. Near-zero sites in what we run, but it is a one-line arm.
 
@@ -129,11 +132,11 @@ What remains is the privileged/atomic set — `Bc1` landed too (below).
 
 These are all MIPS IV, and the `mips4` cargo feature that used to gate them
 was on the wrong axis: ISA level belongs to the CPU model, which is a runtime
-choice. jitv2 now asks `jitv2::isa::mips4_enabled()` (published from
-`C::MIPS4` by `MipsExecutor::new`) at one point —
-`opcode_support::has_emitter` — and every MIPS IV emitter is compiled into
-every build. See
-[`../build/the-three-builds-we-actually-use.md`](../build/the-three-builds-we-actually-use.md).
+choice. `MipsExecutor::new` passes `C::MIPS4` to its inline analyzer
+and compile pool; each worker uses that model's ISA at
+`opcode_support::has_emitter`. The `jitv2::isa` global is only a default
+for constructors/tools without a CPU. Every MIPS IV emitter is built in. See
+[Build and execution settings](../../HACKING.md).
 
-Related: [`../perf/guest-cpu-time-accounting-undercounts.md`](../perf/guest-cpu-time-accounting-undercounts.md)
-for why these must be timed by host wall clock.
+Use host wall-clock timing for these comparisons. The guest-CPU-time
+accounting note cited by the original investigation was not committed.

@@ -35,7 +35,7 @@ cargo build --release       # in the repo root, first
 make run                    # loads the ELF straight into RAM and runs it
 ```
 
-`make run` takes a few minutes — 240 tests, some of which take real exceptions
+`make run` takes a few minutes — 262 tests, some of which take real exceptions
 or sweep the caches. You get a line per test and a summary:
 
 ```
@@ -64,7 +64,10 @@ cargo build --release --features jitv2               # jitv2 (no env var needed)
 `run/matrix.sh` does all four CPU × engine combinations and builds what it
 needs; `CELLS="r4400-jitv2" run/matrix.sh` runs just one. The *Bare-metal
 suites* CI workflow (`.github/workflows/suites.yml`) runs every cell on each
-push that touches the CPU, and gates on the known failing count per CPU.
+push that touches the CPU, and gates on known failing-check limits per CPU
+and engine: R4400 124 interpreter / 126 JIT; R5000 108 / 110. The JIT adds two
+transparent-cache failures (dirty-data discard semantics). These limits are
+not a fresh scorecard for every test added since the hardware runs.
 
 ### Booting it like real hardware
 
@@ -83,8 +86,8 @@ emulated. The harness is written for that machine: it links and self-relocates
 to a fixed KSEG0 address chosen because IP22/IP24 RAM begins at `0x08000000`
 (`harness/link.ld` explains why at length), it drives the console through the
 Z85C30 SCC via IOC2 at `0x1FBD9800`, and the exception vectors and TLB work
-assume that map. Under IRIS none of that costs anything, because IP22/IP24 is
-what IRIS emulates.
+assume that map. Use the IP22/IP24 profiles under IRIS for this suite. IP28 has a different
+RAM map and an R10000, which this harness does not accept.
 
 Unlike `bench/`, this suite also **legitimately refuses an unrecognised CPU**
 (exit 127). That is not the same limitation and should not be "fixed" the same

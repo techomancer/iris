@@ -1553,7 +1553,7 @@ impl App {
                 ui.separator();
                 ui.label(RichText::new("Legal").strong());
                 if ui.button("Licenses…")
-                    .on_hover_text("BSD 3-Clause (IRIS, and the CHD backend when built in)")
+                    .on_hover_text("BSD 3-Clause (IRIS and the CHD backend)")
                     .clicked()
                 {
                     self.show_license = true;
@@ -1565,16 +1565,12 @@ impl App {
                 }
                 ui.separator();
                 ui.label(RichText::new("Authors").strong());
-                ui.label("Original: techomancer");
-                ui.label("iris-gui fork: Dani Sarfati (danifunker)");
+                ui.label("IRIS: Dominik Behr (techomancer) and contributors");
+                ui.label("iris-gui contributor: Dani Sarfati (danifunker)");
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Upstream:");
+                    ui.label("Repository:");
                     ui.hyperlink_to("techomancer/iris", "https://github.com/techomancer/iris");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("This fork:");
-                    ui.hyperlink_to("danifunker/iris", "https://github.com/danifunker/iris");
                 });
                 ui.separator();
                 ui.label(RichText::new("Build features:").strong());
@@ -2597,7 +2593,7 @@ impl App {
     fn license_window(&mut self, ctx: &egui::Context) {
         const LICENSE_BSD: &str = include_str!("../../LICENSE");
         // The CHD backend (libchdman-rs >= 0.288.8) is BSD-3-Clause, as is the
-        // MAME CHD core it vendors, so a CHD build stays fully BSD-3-Clause.
+        // MAME CHD core it vendors, so every build stays fully BSD-3-Clause.
         const LICENSE_CHD: &str = include_str!("../../LICENSE-libchdman-rs.txt");
         if !self.show_license { return; }
         let mut open = true;
@@ -2616,7 +2612,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("Source:");
-                    ui.hyperlink_to("danifunker/iris", "https://github.com/danifunker/iris");
+                    ui.hyperlink_to("techomancer/iris", "https://github.com/techomancer/iris");
                     ui.label("·");
                     ui.hyperlink_to("libchdman-rs", "https://crates.io/crates/libchdman-rs");
                 });

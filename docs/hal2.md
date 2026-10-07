@@ -46,8 +46,8 @@ ISR ← 0x18          (release global + codec reset)
 The IAR word encodes both the target register group and the read/write direction.
 
 ```
-Bit 15:    1 = read from indirect register → IDR,  0 = write IDR → indirect register
-Bits 14:12 + 11:8: register group and index (see table below)
+Bit 7:     1 = read from indirect register → IDR,  0 = write IDR → indirect register
+Bits 15:12 + 11:8: register group and index (see table below)
 Bits 3:2:  parameter selector within the group (1 = control word 1, 2 = control word 2)
 ```
 
@@ -56,23 +56,23 @@ Bits 3:2:  parameter selector within the group (1 = control word 1, 2 = control 
 | IAR value  | Symbol                  | IDR words used | Description                         |
 |------------|-------------------------|----------------|-------------------------------------|
 | `0x9104`   | `HAL2_DMA_ENABLE_W`     | IDR0           | DMA enable bitmask (write)          |
-| `0x9904`   | `HAL2_DMA_ENABLE_R`     | IDR0           | DMA enable bitmask (read-back)      |
+| `0x9184`   | `HAL2_DMA_ENABLE_R`     | IDR0           | DMA enable bitmask (read-back)      |
 | `0x910C`   | `HAL2_DMA_DRIVE_W`      | IDR0           | DMA drive bitmask (write)           |
-| `0x990C`   | `HAL2_DMA_DRIVE_R`      | IDR0           | DMA drive bitmask (read-back)       |
+| `0x918C`   | `HAL2_DMA_DRIVE_R`      | IDR0           | DMA drive bitmask (read-back)       |
 | `0x9108`   | `HAL2_DMA_ENDIAN_W`     | IDR0           | DMA endian (0 = big-endian)         |
 | `0x1404`   | `HAL2_CODECA_CTRL1_W`   | IDR0           | Codec A channel / clock / mode      |
 | `0x1408`   | `HAL2_CODECA_CTRL2_W`   | IDR0,IDR1      | Codec A gain / attenuation / mute   |
 | `0x1504`   | `HAL2_CODECB_CTRL1_W`   | IDR0           | Codec B channel / clock / mode      |
 | `0x1508`   | `HAL2_CODECB_CTRL2_W`   | IDR0,IDR1      | Codec B gain / attenuation / mute   |
-| `0x0304`   | `HAL2_AESTX_CTRL_W`     | IDR0           | AES TX channel / clock / mode       |
-| `0x0204`   | `HAL2_AESRX_CTRL_W`     | IDR0           | AES RX channel / clock              |
+| `0x1304`   | `HAL2_AESTX_CTRL_W`     | IDR0           | AES TX channel / clock / mode       |
+| `0x1204`   | `HAL2_AESRX_CTRL_W`     | IDR0           | AES RX channel / clock              |
 | `0x2104`   | `HAL2_BRES1_CTRL1_W`    | IDR0           | BRES 1 master clock select          |
 | `0x2108`   | `HAL2_BRES1_CTRL2_W`    | IDR0,IDR1      | BRES 1 inc / modctrl                |
 | `0x2204`   | `HAL2_BRES2_CTRL1_W`    | IDR0           | BRES 2 master clock select          |
 | `0x2208`   | `HAL2_BRES2_CTRL2_W`    | IDR0,IDR1      | BRES 2 inc / modctrl                |
 | `0x2304`   | `HAL2_BRES3_CTRL1_W`    | IDR0           | BRES 3 master clock select          |
 | `0x2308`   | `HAL2_BRES3_CTRL2_W`    | IDR0,IDR1      | BRES 3 inc / modctrl                |
-| `0x1504`   | `HAL2_RELAY_CONTROL_W`  | IDR0           | Headphone relay (1 = headphone out) |
+| `0x9100`   | `HAL2_RELAY_CONTROL_W`  | IDR0           | Headphone relay (1 = headphone out) |
 
 ---
 
@@ -147,7 +147,7 @@ Written to IDR0 then strobed via `HAL2_CODECA_CTRL1_W` / `HAL2_CODECB_CTRL1_W`.
 
 ```
 Bits  2:0  — HPC3 PDMA channel number (0–7) that feeds this codec
-Bits  4:3  — Bresenham clock ID: 0=BRES1, 1=BRES2, 2=BRES3
+Bits  4:3  — Bresenham clock ID: 1=BRES1, 2=BRES2, 3=BRES3 (0 = none)
 Bits  9:8  — Channel mode (see below)
 Bit  10    — Timestamp enable (used by clock-test diagnostics)
 ```
@@ -186,8 +186,9 @@ HAL2 DMA transfers 32-bit words.  The audio data is **24-bit signed PCM, left-ju
 
 In the diagnostics this is constructed as `sintab_value << 8`.
 The HPC3 PDMA layer on the Indy delivers **16-bit values** to the HAL2 (it strips the
-low 8 bits of each 32-bit word), so the emulator's `DmaClient::read()` already
-returns the upper 16 bits ready for use as `i16`.
+low 8 padding bits in 16-bit PBUS mode), so the emulator's `DmaClient::read()`
+returns `(word >> 8) as u16`, ready for use as `i16`. In 8-bit PBUS mode it
+returns the word's top byte.
 
 ---
 
@@ -237,8 +238,8 @@ IDR1 bits 1:0  — Mic select / headphone power
                  0x00 = mic input × 10 gain
 ```
 
-The emulator does not need to implement gain/attenuation — these affect only the
-real analog signal chain, not the digital sample values.
+The emulator stores CTRL2 but does not apply gain, attenuation, or mute to host
+output. Reproducing the audible controls remains a fidelity task.
 
 ---
 
@@ -256,30 +257,34 @@ Example from Test_Rx_Clock: `IDR0 = 0x213` → channel 3, BRES clock 2, stereo.
 
 ---
 
-## Emulator Implementation Notes
+## Emulator implementation (October 2026)
 
-### What is correctly implemented
+`src/dev/hal2.rs` uses the shared high-precision timer manager. Codec A is
+paced from host elapsed time in 250 µs wakeups with bounded catch-up, rather
+than one fixed DMA burst per wakeup. DMA demand tracks the guest's polls to
+avoid advancing into descriptors the guest has not prepared.
 
-- ISR global/codec reset handling
-- IAR decode for codec A/B, AES TX/RX, BRES 1–3, global DMA enable/drive
-- Bresenham clock rate computation (master × inc / mod)
-- Per-codec cpal output stream opened at the exact configured sample rate (no resampling)
-- DMA burst of 4 stereo frames per loop iteration
-- Ring buffer large enough to absorb OS scheduling jitter
-- Mono (mode=1) and stereo (mode=2) sample demux
-- Quad single-stream (mode=3) — rear channels consumed and discarded
-- Codec B input — silence written back at configured rate
+- ISR reset and IAR decoding cover Codec A/B, AES TX/RX, BRES 1–3, and global
+  DMA controls. Enable/drive/endian/relay values and codec controls read back.
+- BRES rate is derived from its selected master, increment, and modulus.
+  Codec CLKID is the generator number 1–3, not a zero-based index.
+- Codec A keeps a host cpal stream open across enable/disable cycles and
+  resamples guest-rate stereo samples to the host output rate. `[audio]`
+  selects prebuffering and host buffer size.
+- Mono is duplicated to L/R. Stereo consumes interleaved pairs. Single-stream
+  quad consumes all four samples but discards the rear pair.
+- Codec B is an input DMA silence writer, not a second host output stream.
+- AES TX drains DMA into an internal queue; AES RX writes that loopback data
+  (or silence) to DMA. This is not host digital audio I/O.
 
-### Known gaps / not implemented
+### Remaining fidelity and validation
 
-- **`HAL2_DMA_ENABLE_R` / `HAL2_DMA_DRIVE_R` read-back** — drivers OR new bits into
-  the existing value.  If they read back 0 they will still OR in their bits so this
-  is unlikely to cause failures in practice, but is not strictly correct.
-- **`HAL2_DMA_ENDIAN_W`** — always treated as big-endian (correct default).
-- **`HAL2_RELAY_CONTROL_W`** — headphone relay, no analog hardware to emulate.
-- **Dual-stream quad mode** (`ISR.CODEC_MODE = 1`) — Codec B can open a second cpal stream when quad layout is enabled; rear channels play from Codec B DMA.
-- **AES TX/RX clock locking** — AESRX recovered clock as BRES master (mode `0x2` in
-  CTRL1) is not implemented; the emulator falls back to 44100 Hz.
-- **Codec CTRL2 (gain/atten/mute)** — not emulated; all analog processing is bypassed.
-- **Timestamp mode** (bit 10 of codec CTRL1) — used by the clock diagnostic test to
-  interleave timing data into the DMA buffer; not implemented.
+- Host capture and rear-channel/dual-stream quad output are not implemented.
+- DMA endian is stored/read back; the current sample path assumes big-endian.
+- Recovered AES master-clock locking is not modeled; `update_rates` uses the
+  48 kHz/44.1 kHz masters and defaults other selectors to 48 kHz.
+- CTRL2 gain/attenuation/mute and relay state have no audible host effect.
+- Timestamp mode does not interleave clock-test timestamps into DMA.
+- End-to-end rate changes, underruns, reboot/stop/start, and host-device changes
+  need recorded audio checks on supported platforms; register readback alone
+  does not prove playback fidelity. See [TODO.md](../TODO.md).

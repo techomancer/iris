@@ -18,9 +18,9 @@
 //! Drawing arrives through the command FIFO as (command, data) pairs. Commands
 //! at `0x1000` and up write raster registers directly, with bit `0x400`
 //! meaning "execute"; lower numbers go to the command processor's microcode,
-//! which this model does not run (the PROM, the kernel's console and the X
-//! server's 2D paths never need it). The FIFO is drained as it is written, so
-//! it always reads as empty.
+//! which this model interprets at the command/GE level rather than executing
+//! the uploaded microcode. FIFO words are queued to the HQ3 thread, which
+//! forwards raster work to the RSS thread; FIFO status reflects queued work.
 //!
 //! The model scans its framebuffer out through the colormap and DAC gamma into
 //! the same window and status bar Newport uses (`GfxDisplay`).

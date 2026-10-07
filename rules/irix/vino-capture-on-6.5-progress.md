@@ -1,5 +1,10 @@
 # VINO capture on IRIX 6.5.22 — campaign progress
 
+> Historical investigation log. CHD and camera support are unconditional
+> after 2026-10-01; remove `chd,camera` from the recorded build flags.
+> `lightning` and `developer` are mutually exclusive: use `developer` for
+> tracing or `lightning` for throughput, never both.
+
 Companion to [indycam-end-to-end-capture.md](indycam-end-to-end-capture.md)
 (which got capture working on **IRIX 5.3**). This note covers making it work
 on **6.5.22**, where it currently does NOT fully work yet.

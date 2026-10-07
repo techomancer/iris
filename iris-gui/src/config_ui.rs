@@ -223,11 +223,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if !cfg.graphics.board.supports(cfg.machine.profile) {
         cfg.graphics.board = GraphicsBoard::Xz;
     }
-    // 256 MB banks are the IP28 MC's granule only; moving away from it would
-    // leave a config `validate()` rejects at Start. Compared against the
-    // profile *variant*, not `.ip28()` (which also requires the `ip28` build
-    // feature) — a build without the feature must not silently rewrite a
-    // perfectly good IP28 machine's banks just because it can't run it.
+    // Only IP28 can express 256/512 MB banks. Clamp them when switching to
+    // IP22/IP24 so the new profile passes `validate()` at Start.
     if cfg.machine.profile != MachineProfile::Indigo2Ip28 {
         for bank in &mut cfg.banks {
             if *bank > 128 { *bank = 128; }
@@ -264,7 +261,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         ui.label(
             RichText::new(
                 "Bring-up: an R10000 module in the Indigo2 chassis, 16 MB MEMCFG \
-                 granule (256 MB banks below), RAM at 0x20000000. IRIX carries no \
+                 granule (256/512 MB banks below), RAM at 0x20000000. IRIX carries no \
                  Newport driver for this board — set Graphics board to an IMPACT \
                  option below, not Newport.",
             )
@@ -276,7 +273,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     Grid::new("cpu_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("CPU");
         // A real setting, not a read-out of how this binary was built. Both
-        // cache models are compiled in and `Machine::new` picks between them at
+        // CPU models are compiled in and `Machine::new` picks between them at
         // construction, so the choice belongs to the machine's config the same
         // way its RAM does.
         ui.add_enabled_ui(!mem_ctx.running, |ui| {
@@ -1556,7 +1553,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.heading("Build features");
     Grid::new("build_features_grid").num_columns(2).striped(true).show(ui, |ui| {
         // What this machine is configured to be, not how the binary was built —
-        // both cache models are always compiled in and selected at start.
+        // all CPU models are always compiled in and selected at start.
         ui.label("CPU (configured)");
         ui.label(cfg.machine.cpu.label());
         ui.end_row();
@@ -1913,4 +1910,3 @@ const DISK_FILTERS:   &[(&str, &[&str])] = &[
     ("All",         &["*"]),
 ];
 const ANY_FILTERS:    &[(&str, &[&str])] = &[("All", &["*"])];
-

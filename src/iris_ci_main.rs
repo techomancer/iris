@@ -43,7 +43,7 @@ const RC_MARKER: &str = "IRIS-CI-RC=";
     version
 )]
 struct Cli {
-    /// Path to the iris CI Unix socket. Override with $IRIS_SOCKET.
+    /// CI Unix socket path or host:port for TCP. Override with $IRIS_SOCKET.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
 

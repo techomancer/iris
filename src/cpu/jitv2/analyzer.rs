@@ -106,12 +106,11 @@ pub enum Classify {
     Jump { target: Option<WordOffset> },
     /// JR/JALR — register-indirect, always page-leaving/region-end (§2.3).
     RegJump,
-    /// CP0 moves/TLB ops/CACHE/ERET/SYSCALL/BREAK/WAIT (§4.4), LL/SC, CP1's
-    /// conditional branch (RS_BC1 — condition-code-dependent target, not
-    /// resolved by this walker), and CP2 (unimplemented on this platform).
-    /// Note this is narrower than §4.4's literal "all CP1/FPU" — plain CP1
-    /// arithmetic/move/compare/load/store ops classify as `Sequential`
-    /// instead (see `classify`'s doc comment for the rationale).
+    /// CP0, CACHE, LL/SC, SYSCALL/BREAK, CP2, or disabled/missing emitters.
+    /// The walker can admit safe CP0 and atomic instructions as interpreter
+    /// fallback heads (`cop0.rs`, `atomics.rs`); other excluded words end a
+    /// region unless the general fallback policy admits them. BC1 normally
+    /// classifies as a native PC-relative branch, not an excluded instruction.
     Excluded,
     /// The `JIT_REGION_BOUNDARY_SENTINEL` word — a hard region end that is
     /// never visited, never compiled, and never run through the interpreter
@@ -205,7 +204,7 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32, mips4: bool) -> Clas
 /// `interp_dispatch_one` can leave `core.in_delay_slot = true` with a pending
 /// `delay_slot_target`, so its successor (the delay slot) must be treated as an
 /// entry-like word (honor the pending transfer) rather than a plain fallthrough.
-/// Today the only such excluded opcode is `BC1` (branch on CP1 condition):
+/// BC1 can need this path when native branch compilation is disabled:
 /// SYSCALL/BREAK/COP2/CACHE/LL/SC don't transfer control; ERET/COP0 move `core.pc`
 /// but never arm a delay slot (the fallback's off-page / pc-moved check already
 /// handles those). Kept as a standalone predicate (not a `CompiledInstr` field)

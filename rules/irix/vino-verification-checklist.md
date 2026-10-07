@@ -4,7 +4,7 @@ Consolidates guidance from `rules/irix/vino-*.md`.
 
 ## Prerequisites
 
-- `[vino]` configured in TOML; `camera` feature for host UVC source
+- `[vino]` configured in TOML; host camera support is built in (no `camera` feature)
 - MC SYSID bit 4 set (`rules/irix/vino-attach-via-sysid-bit4.md`)
 - GIO alias `0x1F080000` → VINO (`rules/irix/vino-gio-alias-offset.md`)
 
@@ -15,7 +15,7 @@ Consolidates guidance from `rules/irix/vino-*.md`.
 
 ## I2C
 
-- Repeated-start reads: START → addr → subaddr → RE-START → read-addr → READ (`vino.rs` tests)
+- Repeated-start reads: START → addr → subaddr → RE-START → read-addr → READ (`src/dev/vino.rs` tests)
 - Mid-transaction streaming: `I2C_DATA` writes while `NOT_IDLE` set
 
 ## Frame rate mask
@@ -31,9 +31,8 @@ Consolidates guidance from `rules/irix/vino-*.md`.
 
 ## Known gaps
 
-- IRIX `impact` kernel module attach and GLX remain unimplemented (preview registers only)
-- 6.5 interlace capture may show a thin diagonal artifact (`vino.rs` comments)
-- HPC1 region black-holed to avoid capture panic (`physical.rs`)
+- 6.5 interlace capture may show a thin diagonal artifact (`src/dev/vino.rs` comments)
+- HPC1 region black-holed to avoid capture panic (`src/physical.rs`)
 
 ## CDMC → VideoSource (implemented)
 

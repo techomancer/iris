@@ -117,7 +117,7 @@ R4400 vs R5000 is a **compile-time cargo feature in IRIS** (`r5k`, plus
 `rules/perf/hardware-profiles.md`. So the *suite* must run unmodified on both
 and decide expectations at runtime:
 
-| | R4400 (default build) | R5000 (`--features r5k`) |
+| | R4400 (default build) | R5000 (`--cpu r5000`) |
 |---|---|---|
 | `PRId` | `0x00000440` | `0x00002321` |
 | FPU `FIR` | `0x00000500` | `0x00002300` |

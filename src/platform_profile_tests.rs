@@ -1,4 +1,4 @@
-//! Headless acceptance tests for IP22/IP24 profile wiring, GR2 (XZ/Extreme), and IMPACT stubs.
+//! Profile wiring tests for IP22/IP24/IP28 and GR2/IMPACT board selection.
 //!
 //! These run in `cargo test --lib` without booting the guest. For live boot
 //! checks, point `iris-indigo2-smoke-ci.toml` at a local IRIX root disk (raw or

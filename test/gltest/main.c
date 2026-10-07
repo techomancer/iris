@@ -151,7 +151,7 @@ static void report_stats(const char *label, const char *unit, double *vals, int 
    the GL driver performs the depth comparison in software on the MIPS side,
    then hands REX3 the 32-bit result as a ZPATTERN coverage mask for a 32-pixel
    span. REX3 draws only the pixels whose bit is set (see process_pixel_zpattern
-   in src/rex3.rs). All rendering goes out in 32-pixel spans, which is why
+   in src/dev/ng1/rex3.rs). All rendering goes out in 32-pixel spans, which is why
    ZPATTERN is a 32-bit rotate reset per row and why LENGTH32 exists.
 
    That makes --depth interesting for GFIFO work specifically: each span now

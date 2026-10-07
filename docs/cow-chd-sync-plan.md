@@ -275,7 +275,7 @@ New `ChdHd::flatten()` (or a free fn in `chd_disk.rs`):
 
 ## Test plan
 
-- Unit (`cargo test --lib --features chd`):
+- Unit (`cargo test --lib `):
   - COW-on over uncompressed CHD: writes go to diff, base bytes unchanged; after
     flatten, base reflects writes and is still a valid uncompressed CHD; diff gone.
   - COW-on over compressed CHD: same, output still a valid **compressed** CHD

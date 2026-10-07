@@ -1,4 +1,24 @@
-GR2 design
+# GR2 design
+
+## Implemented state (October 2026)
+
+`src/dev/gr2/` implements HQ2 command HLE, RE3 2D/3D rasterization, irisGL
+tokens, lighting, homogeneous clipping, contexts, pixel transfers, and a
+VC1/XMAP5/Bt457 display compositor. XZ and Extreme are selectable graphics
+boards. HQ2, RE3, and display each have a worker thread. GE7 stores diagnostic
+microcode but does not execute it. `gl.rs` and `gl_light.rs` hold the geometry
+and lighting HLE; this is functional emulation, not GE7 instruction emulation.
+
+Saveable currently covers register/microcode/display tables, not VRAM or full
+drawing/context state. See [current board guide](../../docs/indy-xz-elan.md)
+and [feature-completion backlog](../../TODO.md) for remaining work.
+
+## Original implementation proposal
+
+The proposal below records the initial partitioning. Its future tense and
+phase list describe the original plan, not missing implementations today.
+Large plain-data objects are now initialized in place on the heap; the old
+stack-only initialization requirement below is superseded.
 
 docs: ignore/gr2/*.h files contain both headers and documentation of GR2 operation
 there are also decompiled gr2 kernel modules ource s in ignore/gr2/gr2_kernel

@@ -9,7 +9,7 @@ use crate::ram::ram_presets;
 pub struct NewMachineDialog {
     open: bool,
     pub name: String,
-    /// Emulated SGI machine model (Indy IP24 / Indigo2 IP22).
+    /// Emulated SGI machine model (Indy IP24 / Indigo2 IP22/IP28).
     pub profile: MachineProfile,
     pub cpu: CpuModel,
     /// Host-forced Newport video mode (`Guest` leaves it to IRIX/setmon).

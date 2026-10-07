@@ -1,5 +1,9 @@
 # Silent IRIX app quit — debug capture checklist
 
+> The four-bank 512 MB caution below is for IP22/IP24. IP28 supports
+> two 512 MB banks and boots IRIX 6.5 with 1 GB; see
+> [IP28 banks](../irix/ip28-512mb-banks.md).
+
 **Keywords:** userspace, app quit, monitor, SYSLOG, 512 MB, IRIX 6.5
 **Category:** testing
 

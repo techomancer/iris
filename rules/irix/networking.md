@@ -113,7 +113,7 @@ bind = "localhost"
 
 ## PCAP bridged networking (alternative to NAT)
 
-Build with `cargo build --features chd,pcap`. Then in `iris.toml`, set
+Build with `cargo build --features pcap`. Then in `iris.toml`, set
 `[network] mode = "pcap"` and optionally specify a host interface with
 `pcap_interface = "<name-or-index>"`. The interface choice can be a numeric
 index (recommended, esp. on Windows where names are `\Device\NPF_{GUID}`), an

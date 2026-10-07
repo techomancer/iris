@@ -5,7 +5,7 @@
 //!
 //! The interpreter has always gated MIPS IV on `C::MIPS4`, an associated
 //! const on the `CpuModel` trait: `R4400Cache` sets it false, `R5000Cache`
-//! sets it true. jitv2 instead gated on the `mips4` cargo
+//! sets it true, as does R10000. Earlier jitv2 gated on the `mips4` Cargo
 //! feature, and read `C::MIPS4` exactly zero times.
 //!
 //! Those are different axes and could only agree by coincidence. The CPU is
@@ -13,9 +13,9 @@
 //! every model, so a `mips4` build pointed at an R4400 config had jitv2
 //! executing `MOVZ`/`COP1X` where the interpreter raised Reserved
 //! Instruction — a real divergence, and exactly what `jitv2_lockstep` exists
-//! to catch. The reverse is the common case: a default build runs an R5000
-//! with MIPS IV compilation switched off, worth ~20% of integer throughput
-//! (measured on our IP28 / R10000, which comes in a later pull request).
+//! to catch. Conversely, the old default build ran an R5000
+//! with MIPS IV compilation switched off, costing ~20% of integer throughput
+//! (measured on IP28 / R10000, now a runtime machine profile).
 //!
 //! ## How it is set
 //!
@@ -39,23 +39,23 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// MIPS IV until a CPU is constructed; `set_mips4` then publishes the real
-/// model's value.
+/// Default ISA for tools and constructors without a CPU model. Live executor
+/// compilation passes its own model's ISA directly to each analyzer/worker.
 static MIPS4: AtomicBool = AtomicBool::new(true);
 
-/// True when the running CPU model implements MIPS IV — i.e. when
-/// `C::MIPS4` is set for the model the guest was configured with.
+/// Default ISA for callers without an explicit CPU model. This global is not
+/// the ISA selector for live executor compilation.
 #[inline]
 pub fn mips4_enabled() -> bool {
     MIPS4.load(Ordering::Relaxed)
 }
 
-/// Publish the CPU model's ISA level. Called from `MipsExecutor::new` with
-/// `C::MIPS4`.
+/// Set the default ISA used by constructors/tools without a CPU model.
+/// Live executors pass `C::MIPS4` directly instead of publishing here.
 ///
-/// Changing this after regions have been compiled would leave code around
-/// that was built for the other ISA level, so it is only ever called during
-/// CPU construction, before any compilation can have happened.
+/// This does not update existing analyzers, workers, or compiled regions.
+/// Set it before constructing a tool that relies on the default; tests use
+/// `test_isa` to restore the previous value.
 pub fn set_mips4(on: bool) {
     MIPS4.store(on, Ordering::Relaxed);
 }
@@ -109,10 +109,8 @@ mod tests {
         assert!(<R5000Cache as CpuModel>::MIPS4, "R5000 is MIPS IV");
     }
 
-    /// `MipsExecutor::new` publishes `C::MIPS4` here. It cannot do that under
-    /// `cfg(test)` (see the comment at that call site — the harness builds
-    /// several models concurrently), so this covers the publish itself for
-    /// both polarities.
+    /// Verify explicit updates to the default ISA for both polarities. Live
+    /// executors pass their model directly; the wiring test below covers that.
     #[test]
     fn publishes_the_cpu_models_isa_level_to_jitv2() {
         let _isa = test_isa(false);

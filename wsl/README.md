@@ -1,6 +1,7 @@
 # IRIS on Windows / WSL
 
-This folder is the **Windows 11 daily-driver guide** for this repo copy (`CURSOR-PROJECTS/iris-main`). A parallel WSL build often lives at `~/iris-wsl-build`.
+This folder contains Windows 11 and WSL launch/build guidance. The examples
+use a WSL checkout at `~/iris-wsl-build`; adjust paths for your own checkout.
 
 ## One-click launch (Windows)
 
@@ -19,9 +20,9 @@ This folder is the **Windows 11 daily-driver guide** for this repo copy (`CURSOR
 
 ---
 
-## Local mods (this tree)
+## Runtime and build settings
 
-Changes beyond upstream IRIS that affect how you run and configure the Indy:
+These settings are part of this repository and share the core configuration schema:
 
 ### Performance stack
 
@@ -31,8 +32,8 @@ Changes beyond upstream IRIS that affect how you run and configure the Indy:
 | **Premiere GUI** | `cargo build -p iris-gui --features premiere` — embedded `lightning` + `idle-pause`; `run-iris-gui-premiere.bat` |
 | **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in `gui.json`; **File → Prepare for premiere…** exports TOML |
 | **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [rules/perf/gui-idle-refresh.md](../rules/perf/gui-idle-refresh.md) |
-| **Audio** | hptimer late-fire catch-up; Display tab `[audio]` prebuf / cpal buffer |
-| **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); tuning via `--features jitv2_lockstep,jitv2_opcodefusion` and `[jitv2] threads` in TOML |
+| **Audio** | HAL2 wall-clock pacing/resampling; Display tab `[audio]` prebuf / cpal buffer |
+| **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` configures the pool |
 
 See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 
@@ -40,7 +41,7 @@ See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 
 | Area | What |
 |------|------|
-| **RAM presets** | Memory menu + Memory tab: **384 MB** and **512 MB** (plus 32–256 MB) |
+| **RAM presets** | Memory menu + Memory tab: 32–512 MB on IP24/IP22; IP28 also offers 768/1024 MB |
 | **RAM workflow** | Edits disabled while VM is running; **“Applied at next Start”** when stopped; shows config vs last-started total |
 | **Extended RAM fix** | If PROM only POSTs lomem, core **synthesizes MEMCFG** for himem banks 2–3 when configured (`src/dev/mc.rs`) — see [rules/irix/extended-ram-memcfg.md](../rules/irix/extended-ram-memcfg.md) |
 | **MHz vs MIPS** | Status-bar **MIPS** = real host speed; IRIX System Manager **MHz** = `hinv` inventory (cosmetic). Debug tab explains build features |
@@ -53,7 +54,7 @@ See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 |---------|---------|
 | System Manager **~166 MHz** | Guest inventory from PROM/kernel — **not** PC emulation speed |
 | Status bar **MIPS** | Instructions per wall-clock second on your PC |
-| Status bar **Hz** | CP0 Compare tick rate — **not** CPU MHz |
+| Status bar **Hz** | Guest kernel tick rate (CP0 Compare or PIT) — **not** CPU MHz |
 
 Enabling `rex-jit`/`jitv2` raises MIPS; hinv MHz stays the same. That is expected.
 
@@ -150,7 +151,11 @@ Uses `GlCompositor` on the refresh thread instead of the CPU path. Still slower 
 |------|---------|---------------------|
 | Authentic Indy max | `[128, 128, 0, 0]` | 256 MB |
 | IRIX 6.5 extended | `[128, 128, 64, 64]` | 384 MB — use `iris-windows-384.toml` |
-| IRIX 5.3 / emulator max | `[128, 128, 128, 128]` | 512 MB — **not for IRIX 6.5** |
+| IP24/IP22 IRIX 5.3 maximum | `[128, 128, 128, 128]` | 512 MB — **not for IRIX 6.5** |
+
+For IP28, two 512 MB banks (`[512, 512, 0, 0]`) provide 1 GB and have separate
+PROM/IRIX validation; the IP24/IP22 four-bank warning above does not apply.
+See [IP28 guide](../docs/indigo2-ip28.md).
 
 After any change: **Stop → cold Start** (fully quit iris, relaunch). Verify:
 
@@ -170,8 +175,8 @@ Send `premiere-debug.log`, monitor `status`/`bt`/`dt 80`, and `hinv -t memory` a
 
 ### R5000 Indy
 
-The CPU is a runtime setting, not a build feature: every build contains both the
-R4400 and the R5000. Pick **R5000** in iris-gui (Machine menu or General tab),
+The CPU is a runtime setting, not a build feature: every build contains the
+R4400, R5000, and R10000 (IP28 default). Pick **R5000** in iris-gui (Machine menu or General tab),
 or in the TOML / on the command line:
 
 ```toml
@@ -186,8 +191,8 @@ target\release\iris.exe --config irix-install\iris-windows.toml --cpu r5000
 The emulated R5000 has 32 KB 2-way L1 caches and **no** secondary cache. The
 R5000SC variant (external L2) is not available: `iris/r5ksc` deliberately fails
 to build until its L1I cache bugs are fixed (`rules/testing/r5k-l1i-cache-bugs.md`).
-The old `iris/r5k` feature no longer selects the CPU. A snapshot taken on one
-CPU refuses to restore onto the other.
+The old `iris/r5k` feature is removed. A snapshot refuses to restore onto a
+different CPU model.
 
 ---
 
@@ -244,7 +249,14 @@ $env:IRIS_DEBUG_LOG = "all"
 
 ### CI (`iris-ci`)
 
-The CI control socket is **Unix-only** (`#![cfg(unix)]` in `src/ci.rs`). On native Windows, use **WSL** for `iris-ci`; on Windows use **monitor telnet** (`127.0.0.1:8888`) for manual/debug work.
+The CI server and `iris-ci` support both Unix-domain and loopback TCP sockets.
+Native Windows uses `127.0.0.1:19851` by default; Linux/macOS use
+`/tmp/iris.sock`. For example, with the native Windows emulator running in CI
+mode:
+
+```powershell
+.\target\release\iris-ci.exe --socket 127.0.0.1:19851 ping
+```
 
 **WSL workflow:**
 

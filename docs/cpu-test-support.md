@@ -1,7 +1,8 @@
 # Emulator support for bare-metal CPU tests
 
-Four additive, default-off features for running a self-checking bare-metal MIPS
-binary under IRIS. None of them changes an ordinary IRIX boot.
+Four facilities for running a self-checking bare-metal MIPS
+binary under IRIS. They are built in; CLI/config options activate the
+loader and test device. They do not require Cargo features.
 
 ## A — `mkvh`: bootable volume headers
 
@@ -30,14 +31,15 @@ its entry point — no image to rebuild between edits.
 iris --load-elf ./cputest.elf          # cold start, no PROM involved
 ```
 ```
-> cpu stop
+> stop
 > loadelf ./cputest.elf                # segments + entry are printed
 > loadbin ./blob.bin 0x88300000        # raw bytes, PC untouched
 > run
 ```
 
 Loading requires a stopped CPU — that is what keeps the JIT honest, since its
-block cache is owned by the dispatch loop and dies with the CPU thread. The
+loader must update memory and invalidate compiled pages without racing
+execution. Pausing the CPU does not destroy the JIT cache. The
 loaded range is flushed out of L1D/L2 and invalidated out of L1I, so reloading a
 different binary at the same address runs the new code.
 

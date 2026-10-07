@@ -1,5 +1,9 @@
 # `installed_probe_round_trips_to_the_compile_side` is load-flaky
 
+> **Retired on 2026-10-01.** The non-tcache JIT dirty-page probe and its tests
+> were removed when `jitv2` began implying `tcache`. This is a historical
+> failure report, not a failing test in the present suite.
+
 Observed 2026-09-19 under `--features jitv2,j2wp`.
 
 `mips_cache_v2::tests::installed_probe_round_trips_to_the_compile_side` fails

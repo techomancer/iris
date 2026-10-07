@@ -2,14 +2,14 @@
 name = "iris-gui"
 version = "0.1.0"
 edition = "2021"
-description = "SGI Indy (MIPS R4400) emulator"
+description = "SGI Indy and Indigo2 emulator"
 license = "BSD-3-Clause"
 
 [package.metadata.deb]
 maintainer = "Dani Sarfati <dani@funkervogt.com>"
 copyright = "2025 Dani Sarfati"
 license-file = "../LICENSE"
-extended-description = "IRIS emulates an SGI Indy workstation (MIPS R4400) and boots IRIX 6.5 and 5.3 to a usable system with shell, networking, and X11."
+extended-description = "IRIS emulates SGI Indy and Indigo2 workstations with runtime-selectable MIPS R4400, R5000, or R10000 CPUs and boots IRIX 6.5 and 5.3 to a usable system with shell, networking, and X11."
 # `$auto` runs dpkg-shlibdeps, which resolves the pcap variant's libpcap link to
 # the correctly-versioned package name for the build's distro — including the
 # Ubuntu 24.04 `t64` rename (libpcap0.8 -> libpcap0.8t64). That's why we DON'T
@@ -84,11 +84,9 @@ hostcall = ["iris/hostcall"]
 hostgl = ["hostcall", "iris/hostgl"]
 
 [dependencies]
-# Group A (additive) features are always on for iris-gui so the user can enable
-# them at runtime via the config UI: chd (.chd disk paths), camera (vino source),
-# rex-jit (REX3 draw-shader compiler). They add code paths and native deps but no
-# runtime cost when unused. `ultra64` used to be here too; it is now an opt-in
-# passthrough feature (above), since it needs an external gopher64 to be usable.
+# The GUI always enables REX3 shader compilation. CHD, camera, DaynaPort,
+# and Ultra64 device support are unconditional in the core and selected at
+# runtime; Ultra64 requires an external gopher64 bridge peer.
 iris = { path = "..", features = ["rex-jit"] }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"

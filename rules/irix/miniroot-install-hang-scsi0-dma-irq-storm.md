@@ -44,7 +44,7 @@ miniroots.
 
 ## Reproducer
 
-1. `cargo build --release --features chd,camera,lightning`
+1. `cargo build --release --features lightning`
 2. `iris.toml`: HDD (any fx-labeled empty SGI-VH disk, ≥4 GB) at `scsi.1`,
    CD changer at `scsi.4` with `IRIX_6.5.22 Overlay 1 of 3.iso` (or
    `IRIX_6.5.18_Installation_Tools_And_Overlays_(1_Of_4).iso`) as the

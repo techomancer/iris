@@ -3847,8 +3847,9 @@ struct InlineMemPath {
 ///   4. tcache: region is mapped RAM, else slow
 ///
 /// Returns `None` when the inline path must not be emitted at all — the cache
-/// reports an unsupported geometry (R5000 2-way, PassthroughCache), in which
-/// case the caller emits only the callout, exactly as before.
+/// reports an unsupported geometry (for example, a test cache without a
+/// ppmem window). R4400, two-way R5000, and tagless R10000 have inline paths;
+/// unsupported geometries use only the callout.
 fn emit_inline_mem_guard<const STORE: bool>(
     ctx: &mut EmitCtx,
     vaddr: Value,
@@ -4493,7 +4494,7 @@ pub fn set_mem_helpers_enabled(on: bool) {
     MEM_HELPERS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and/// Whether `IRIS_JIT_DISASM=1` asked for machine-code dumps. Read once and
+/// Whether `IRIS_JIT_DISASM` is present to request machine-code dumps. Read once and
 /// cached — `compile_region` consults it per region, and this keeps that to
 /// an atomic load rather than a `getenv` walk.
 fn jit_disasm_enabled() -> bool {
