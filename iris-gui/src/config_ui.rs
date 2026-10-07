@@ -2,7 +2,7 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard,
+    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
     MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
@@ -700,6 +700,18 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 
         ui.label("No audio (disable HAL2)");
         ui.checkbox(&mut cfg.no_audio, "");
+        ui.end_row();
+
+        ui.label("Keyboard")
+            .on_hover_text("The shape of your keyboard, not its language: pick the character layout in the PROM (keybd). ISO and JIS boards have a key left of Enter that the host reports as the US backslash.");
+        ui.add_enabled_ui(!running, |ui| {
+            ComboBox::from_id_salt("keyboard_layout").selected_text(cfg.keyboard.label())
+                .show_ui(ui, |ui| {
+                    for k in KeyboardLayout::ALL {
+                        ui.selectable_value(&mut cfg.keyboard, k, k.label());
+                    }
+                });
+        });
         ui.end_row();
     });
     if !cfg.no_audio {

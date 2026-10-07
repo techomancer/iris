@@ -21,6 +21,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   window now releases everything the guest still sees held.
 - **Right Cmd releases the grab on macOS**, like Right Ctrl, which Mac
   keyboards lack.
+- **Japanese (JIS) keyboards.** With the PROM set to the Japanese layout, `]`
+  typed `\`, `}` typed `|` and `_` typed nothing. The new `keyboard = "jis"`
+  setting (`--keyboard jis`; also `iso`) sends the set-3 code of an SGI
+  keyboard for the key left of Enter (`0x53`, not the US backslash's `0x5C`).
+  In iris-gui it's **Keyboard** on the Display tab. ろ, ¥, 無変換, 変換 and
+  かな now send keys in all three scancode sets. Codes
+  are from xkeyboard-config's `sgi_vndr/indy(jp106)`.
 
 ### Build / features
 

@@ -571,6 +571,40 @@ impl Default for GraphicsSection {
     }
 }
 
+/// Physical shape of the host keyboard: which keys it has, not what they print.
+/// The guest applies the character layout itself (PROM `keybd`, IRIX X11
+/// keymaps); this only matters because the host reports the US `\|` key
+/// (ANSI, above Enter) and the key left of Enter on ISO/JIS boards (`#~` on
+/// UK, `]}` on JIS) as the same `Backslash` keycode, while an SGI keyboard
+/// sends set-3 `0x5C` for the first and `0x53` for the second
+/// (xkeyboard-config `sgi_vndr/indy`: pc101 `<BKSL>` = 100, pc102 `<BKSL>` and
+/// jp106 `<AC12>` = 91; X keycode = set-3 code + 8).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "lower")]
+pub enum KeyboardLayout {
+    /// US-style: `\|` above Enter.
+    #[default]
+    Ansi,
+    /// European ISO: extra key left of Z, `#~`-style key left of Enter.
+    Iso,
+    /// Japanese JIS 106/109: `]}` left of Enter, plus `¥`, `ろ` and the
+    /// conversion keys.
+    Jis,
+}
+
+impl KeyboardLayout {
+    pub const ALL: [Self; 3] = [Self::Ansi, Self::Iso, Self::Jis];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ansi => "ANSI (US)",
+            Self::Iso => "ISO (European)",
+            Self::Jis => "JIS (Japanese)",
+        }
+    }
+}
+
 /// Emulated CPU. Runtime-selectable: each model is its own monomorphisation,
 /// so the hot path carries no per-model branch.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -1034,6 +1068,12 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_port_b: Option<u16>,
 
+    /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Set `jis`
+    /// with a Japanese keyboard and the PROM's `keybd` set to Japanese. See
+    /// [`KeyboardLayout`].
+    #[serde(default, skip_serializing_if = "is_default_keyboard")]
+    pub keyboard: KeyboardLayout,
+
     /// If Some(path), load this static ELF32 MSB binary into RAM at startup and
     /// set PC to its entry point (bare-metal test binaries; see --load-elf).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1247,6 +1287,7 @@ impl Default for MachineConfig {
             monitor_port: None,
             serial_port_a: None,
             serial_port_b: None,
+            keyboard: KeyboardLayout::default(),
             load_elf: None,
             test_device: false,
             test_device_dump: None,
@@ -1274,6 +1315,8 @@ impl Default for MachineConfig {
     }
 }
 
+
+fn is_default_keyboard(k: &KeyboardLayout) -> bool { *k == KeyboardLayout::default() }
 
 impl MachineConfig {
     /// The serial channels' TCP ports (A, B), defaults filled in.
@@ -1617,6 +1660,11 @@ pub struct Cli {
     #[arg(long = "serial-port-b", value_name = "PORT")]
     pub serial_port_b: Option<u16>,
 
+    /// Physical host keyboard: `ansi` (default), `iso` or `jis`. Use `jis`
+    /// for a Japanese keyboard with the PROM's `keybd` set to JP.
+    #[arg(long = "keyboard", value_name = "LAYOUT")]
+    pub keyboard: Option<KeyboardLayout>,
+
     /// Map the bare-metal test device into GIO expansion slot 0: SIGNATURE,
     /// PUTC (guest console → stdout), DUMP (machine state → JSON) and EXIT
     /// (terminate with the guest's exit code). Off by default.
@@ -1733,6 +1781,7 @@ impl Cli {
         if let Some(p) = self.monitor_port { cfg.monitor_port = Some(p); }
         if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
+        if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }

@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use winit::keyboard::KeyCode;
 use std::io::Write;
 use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, toml_bool, hex_u8};
 use crate::devlog::LogModule;
+use crate::config::KeyboardLayout;
 
 /// Callback trait for PS/2 interrupts
 pub trait Ps2Callback: Send + Sync {
@@ -53,6 +54,9 @@ pub struct Ps2Controller {
     state: Mutex<Ps2State>,
     callback: Option<Arc<dyn Ps2Callback>>,
     running: AtomicBool,
+    /// Host keyboard shape (`KeyboardLayout as u8`). Host config, not guest
+    /// state, so it is not in snapshots.
+    layout: AtomicU8,
 }
 
 impl Ps2Controller {
@@ -75,7 +79,13 @@ impl Ps2Controller {
             }),
             callback,
             running: AtomicBool::new(false),
+            layout: AtomicU8::new(KeyboardLayout::Ansi as u8),
         }
+    }
+
+    /// Set the host keyboard's physical shape; see [`KeyboardLayout`].
+    pub fn set_layout(&self, layout: KeyboardLayout) {
+        self.layout.store(layout as u8, Ordering::Relaxed);
     }
 
     /// Update interrupt state based on queue status
@@ -523,6 +533,11 @@ impl Ps2Controller {
             KeyCode::BracketRight => Some(ScancodeSet2::RBracket),
             KeyCode::Backslash => Some(ScancodeSet2::Backslash),
             KeyCode::IntlBackslash => Some(ScancodeSet2::IntlBackslash),
+            KeyCode::IntlRo => Some(ScancodeSet2::IntlRo),
+            KeyCode::IntlYen => Some(ScancodeSet2::IntlYen),
+            KeyCode::NonConvert => Some(ScancodeSet2::NonConvert),
+            KeyCode::Convert => Some(ScancodeSet2::Convert),
+            KeyCode::KanaMode => Some(ScancodeSet2::KanaMode),
             KeyCode::Semicolon => Some(ScancodeSet2::Semicolon),
             KeyCode::Quote => Some(ScancodeSet2::Quote),
             KeyCode::Comma => Some(ScancodeSet2::Comma),
@@ -631,6 +646,11 @@ impl Ps2Controller {
             KeyCode::BracketRight => Some(ScancodeSet1::RBracket),
             KeyCode::Backslash => Some(ScancodeSet1::Backslash),
             KeyCode::IntlBackslash => Some(ScancodeSet1::IntlBackslash),
+            KeyCode::IntlRo => Some(ScancodeSet1::IntlRo),
+            KeyCode::IntlYen => Some(ScancodeSet1::IntlYen),
+            KeyCode::NonConvert => Some(ScancodeSet1::NonConvert),
+            KeyCode::Convert => Some(ScancodeSet1::Convert),
+            KeyCode::KanaMode => Some(ScancodeSet1::KanaMode),
             KeyCode::Semicolon => Some(ScancodeSet1::Semicolon),
             KeyCode::Quote => Some(ScancodeSet1::Quote),
             KeyCode::Comma => Some(ScancodeSet1::Comma),
@@ -737,8 +757,19 @@ impl Ps2Controller {
             KeyCode::Equal => Some(ScancodeSet3::Equals),
             KeyCode::BracketLeft => Some(ScancodeSet3::LBracket),
             KeyCode::BracketRight => Some(ScancodeSet3::RBracket),
+            // Sets 1 and 2 give the ANSI `\|` key and the ISO/JIS key left of
+            // Enter one code; set 3 does not, and the host can't tell them apart.
+            KeyCode::Backslash if self.layout.load(Ordering::Relaxed) != KeyboardLayout::Ansi as u8 =>
+                Some(ScancodeSet3::NonUsHash),
             KeyCode::Backslash => Some(ScancodeSet3::Backslash),
             KeyCode::IntlBackslash => Some(ScancodeSet3::IntlBackslash),
+            // An SGI JIS keyboard sends the US backslash code for its `¥|` key
+            // (xkeyboard-config sgi_vndr/indy(jp106): <AE13> = <BKSL>).
+            KeyCode::IntlYen => Some(ScancodeSet3::Backslash),
+            KeyCode::IntlRo => Some(ScancodeSet3::IntlRo),
+            KeyCode::NonConvert => Some(ScancodeSet3::NonConvert),
+            KeyCode::Convert => Some(ScancodeSet3::Convert),
+            KeyCode::KanaMode => Some(ScancodeSet3::KanaMode),
             KeyCode::Semicolon => Some(ScancodeSet3::Semicolon),
             KeyCode::Quote => Some(ScancodeSet3::Quote),
             KeyCode::Comma => Some(ScancodeSet3::Comma),
@@ -1237,6 +1268,29 @@ mod tests {
         ps2.push_mouse_input(0, 5, 5, 0);
         assert!(ps2.state.lock().rx_queue.len() > 0, "mouse packet should be queued once AUX port re-enabled");
     }
+
+    /// Set-3 make codes for the JIS keys, against xkeyboard-config
+    /// sgi_vndr/indy(jp106) (X keycode - 8). IRIX drives the keyboard in set 3.
+    #[test]
+    fn jis_keys_set3() {
+        let make = |ps2: &Ps2Controller, k: KeyCode| -> Vec<u8> {
+            ps2.state.lock().rx_queue.clear();
+            ps2.push_kb(k, true);
+            ps2.state.lock().rx_queue.iter().map(|(b, _)| *b).collect()
+        };
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        { let mut s = ps2.state.lock(); s.scanning_enabled = true; s.scancode_set = 3; }
+
+        assert_eq!(make(&ps2, KeyCode::Backslash), [0x5C], "ANSI \\| key");
+        ps2.set_layout(KeyboardLayout::Jis);
+        assert_eq!(make(&ps2, KeyCode::Backslash), [0x53], "JIS ]}} key (<AC12> = 91)");
+        assert_eq!(make(&ps2, KeyCode::IntlYen), [0x5C], "JIS yen key (<AE13> = <BKSL> = 100)");
+        assert_eq!(make(&ps2, KeyCode::IntlRo), [0x51], "JIS ro key (<AB11> = 89)");
+        assert_eq!(make(&ps2, KeyCode::NonConvert), [0x85]);
+        assert_eq!(make(&ps2, KeyCode::Convert), [0x86]);
+        assert_eq!(make(&ps2, KeyCode::KanaMode), [0x87]);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1328,6 +1382,12 @@ pub enum ScancodeSet1 {
     IntlBackslash = 0x56, // ISO 102nd key (< > |), left of Z on European keyboards
     F11 = 0x57,
     F12 = 0x58,
+    // JIS 106/109 keys
+    KanaMode = 0x70,
+    IntlRo = 0x73,     // \ _ left of right Shift
+    Convert = 0x79,    // Henkan
+    NonConvert = 0x7B, // Muhenkan
+    IntlYen = 0x7D,    // ¥ | left of Backspace
 
     // Extended
     KeypadEnter = 0xE01C,
@@ -1418,6 +1478,11 @@ pub enum ScancodeSet2 {
     RBracket = 0x5B,
     Backslash = 0x5D,
     IntlBackslash = 0x61, // ISO 102nd key (< > |), left of Z on European keyboards
+    KanaMode = 0x13,   // JIS
+    IntlRo = 0x51,     // JIS \ _ left of right Shift
+    Convert = 0x64,    // JIS Henkan
+    NonConvert = 0x67, // JIS Muhenkan
+    IntlYen = 0x6A,    // JIS ¥ | left of Backspace
     Backspace = 0x66,
     Keypad1 = 0x69,
     Keypad4 = 0x6B,
@@ -1503,6 +1568,12 @@ pub enum ScancodeSet3 {
     Equals = 0x55,
     Backslash = 0x5C,
     IntlBackslash = 0x13, // ISO 102nd key (< > |), left of Z on European keyboards
+    // Codes from xkeyboard-config sgi_vndr/indy (X keycode - 8).
+    NonUsHash = 0x53,  // key left of Enter on ISO (# ~) and JIS (] }) boards
+    IntlRo = 0x51,     // JIS \ _ left of right Shift
+    NonConvert = 0x85, // JIS Muhenkan
+    Convert = 0x86,    // JIS Henkan
+    KanaMode = 0x87,   // JIS Katakana/Hiragana
     Backspace = 0x66,
     Space = 0x29,
     Tab = 0x0D,

@@ -104,7 +104,15 @@ pub fn pump(ctx: &egui::Context, fb_clicked: bool, ps2: &Ps2Controller, state: &
                 // Prefer the physical position: `key` is already layout-translated by the host, and the guest applies its own `keybd=` layout on top, which mangles every non-US layout.
                 Event::Key { key, physical_key, pressed, repeat, .. } => {
                     let k = physical_key.unwrap_or(*key);
-                    if k == Key::F11 {
+                    // egui has no Key for the JIS-only keys (IntlYen, IntlRo, Henkan...),
+                    // so they arrive here with no physical key and their logical `\` or `|`.
+                    // A physical `\|` key always has a physical_key, so this is the ¥ (or ろ)
+                    // key: send ¥, which is the ANSI backslash code in set 3 but not the JIS
+                    // `]}` key that Backslash becomes with `keyboard = "jis"`.
+                    let jis_fallback = physical_key.is_none() && matches!(k, Key::Backslash | Key::Pipe);
+                    if jis_fallback {
+                        keys.push((KeyCode::IntlYen, *pressed));
+                    } else if k == Key::F11 {
                         // Plain F11 is the GUI's fullscreen toggle; Ctrl+Alt+F11 is the escape hatch that sends a bare F11 to IRIX.
                         if *pressed && !*repeat && i.modifiers.ctrl && i.modifiers.alt {
                             f11_to_guest = true;

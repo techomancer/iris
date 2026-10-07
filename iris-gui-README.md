@@ -157,7 +157,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
 | **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
-| **Display** | Display resolution, window scale, headless, audio on/off and buffering |
+| **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
 | **Debug** | Build features, GDB stub port, capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
 | **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |

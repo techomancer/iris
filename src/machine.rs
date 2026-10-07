@@ -349,6 +349,7 @@ impl Machine {
         // HPC3 (512KB at 0x1FB80000). CI mode skips the SCC TCP backend
         // bindings so multiple `--ci` instances can coexist.
         let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
+        ioc.ps2().set_layout(cfg.keyboard);
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket

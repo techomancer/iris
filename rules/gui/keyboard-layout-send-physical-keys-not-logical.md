@@ -109,3 +109,25 @@ See [../macos/appstore-private-api.md](../macos/appstore-private-api.md).
 
 iris-gui depends on no third-party egui plugin crates, so nothing else gates the
 bump.
+
+## The key left of Enter (ISO `#~`, JIS `]}`), and the JIS keys
+
+The host can't tell the ANSI `\|` key (above Enter) from ISO/JIS key 42 (left
+of Enter). Linux evdev, Windows and macOS all give both the same `Backslash` code.
+Sets 1 and 2 also give them one code, but **set 3 doesn't**: an SGI keyboard
+sends `0x5C` for ANSI and `0x53` for key 42. With the PROM on the JP layout,
+`0x5C` is the ¥ key, so JIS `]}` typed `\|`. Fix: the `keyboard =
+"ansi"|"iso"|"jis"` config (`Ps2Controller::set_layout`) maps `Backslash` to
+`0x53` when it isn't `ansi`.
+
+**Authoritative source for SGI set-3 codes:** xkeyboard-config
+`/usr/share/X11/xkb/keycodes/sgi_vndr/indy`. Indy X keycode = set-3 code + 8
+(check: `A` 0x1C → 36). jp106: `<AC12>` (`]}`) 91 → 0x53, `<AE13>` (¥) =
+`<BKSL>` 100 → **0x5C**, `<AB11>` (ろ) 89 → 0x51, NFER/XFER/HKTG → 0x85/0x86/0x87,
+HZTG = 0x0E (the Backquote position). pc102 `<BKSL>` = 91 → ISO key 42 is 0x53.
+
+egui (0.36) has no `Key` for IntlRo/IntlYen/Convert/NonConvert/KanaMode, so in
+iris-gui those keys arrive with no `physical_key` and only a logical fallback.
+`pump()` sends a physical-less `\`/`|` as `IntlYen`, so ¥ works and ろ types `\`. Shifted ろ (`_`)
+and the conversion keys are lost in the GUI. Fixing that needs egui-winit
+changes.

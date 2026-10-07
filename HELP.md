@@ -395,6 +395,24 @@ Right Ctrl releases mouse grab. iris-gui has its own bindings; see
 | **Right Ctrl + F11** | Toggle borderless fullscreen |
 | **Right Ctrl + F12** | Pick an ISO/CHD and load it into the CD-ROM (hot-swap) |
 
+### Non-US keyboards
+
+iris sends the guest the *position* of each key; the guest applies the
+character layout (the PROM's `keybd` variable, then IRIX's X11 keymap). One
+thing iris can't tell from the host is the key left of Enter on ISO and JIS
+keyboards (`#~` on UK, `]}` on JIS), which the host reports as the US `\|`
+key. Say which keyboard you have:
+
+```toml
+keyboard = "jis"   # "ansi" (default), "iso" or "jis"; also --keyboard jis
+```
+
+With a Japanese keyboard set `keyboard = "jis"` and select the Japanese layout
+in the PROM. The ¥, ろ (`\_`), 無変換, 変換 and かな keys are sent too.
+In iris-gui the setting is **Keyboard** on the Display tab. There, ろ and the conversion keys aren't seen by its toolkit (egui):
+ろ types `\` (never `_`) and 無変換/変換/かな do nothing. Use the
+standalone `iris` window if you need them.
+
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing.
 
 ---
@@ -430,6 +448,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # monitor_port = 8888           # monitor console; give each iris run at once its own
 # serial_port_a = 8880          # serial channel A (ttyd2); likewise
 # serial_port_b = 8881          # serial channel B (ttyd1, the console); likewise
+# keyboard = "ansi"             # host keyboard shape: "ansi", "iso" or "jis" (see Keyboard)
 # ci = false                    # CI control socket (see README)
 # ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
 # ci_display = false
