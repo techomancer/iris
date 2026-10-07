@@ -1474,6 +1474,78 @@ fn gl_batch_leaves_x_instruction_alone() {
     m.stop_engines();
 }
 
+/// Twilight is a full-screen GL root painter. X paints CID 1 only in its
+/// visible region; its context image's PP1winmode is 0x20. Iconifying a
+/// console changes that region, then Twilight redraws the whole screen.
+/// The geometric screen mask alone cannot protect the other X windows.
+#[test]
+fn gl_root_painter_respects_clipping_ids_after_iconify() {
+    use super::rss::reg;
+    let m = live_board();
+    x_server(&m);
+    direct_rss(&m, reg::PP1WINMODE, 0xC00, false);
+    direct_rss(&m, FILLMODE, FILL_FAST, false);
+    direct_rss(&m, FILL_COLOR_R, 0x77, false);
+    block(&m, 0, 724, 399, 1023);
+
+    // The visible root, with two occluding windows left at CID 0.
+    let paint_cid = |x0, y0, x1, y1, cid| {
+        direct_rss(&m, PP1FILLMODE, 0x142600, false);
+        direct_rss(&m, reg::COLORMASKMSBS, 0xFF, false);
+        direct_rss(&m, FILL_COLOR_R, cid, false);
+        block(&m, x0, y0, x1, y1);
+    };
+    paint_cid(0, 724, 399, 1023, 1);
+    paint_cid(40, 800, 79, 839, 0);
+    paint_cid(140, 800, 179, 839, 0);
+
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 400, 300);
+    // Reload the same context with the PP1 window word from the trace.
+    write(&m, 32, 0x50050, 0x4FC);
+    let mut img = [0u32; 63];
+    img[0] = SLOT_A;
+    img[3] = 0x11;
+    img[4] = 0x20;
+    img[11] = 399;
+    img[12] = 299;
+    img[13] = 0x240;
+    for wd in img { write(&m, 32, CFIFO, wd as u64); }
+    wait_flag(&m, 1 << 6);
+    gl_setup_window(&m, 400, 300, [1.0, 0.0, 0.0]);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(m.fb_pixel(20, 820) & 0xFF_FFFF, 0xFF);
+    assert_eq!(m.fb_pixel(50, 820), 0x77, "console protected from GL clear");
+    assert_eq!(m.fb_pixel(150, 820), 0x77, "other X window protected");
+
+    // Expose the console rectangle, then validate the current context with
+    // CP_WINDOW (same PP1 word, different token layout) and draw a quad.
+    paint_cid(40, 800, 79, 839, 1);
+    let mut win = [0u32; 15];
+    win[1] = 0x20;
+    win[2] = 0x11;
+    win[9] = 399;
+    win[10] = 299;
+    win[11] = 0x240;
+    fifo_token(&m, 0xE4, &win);
+    fifo_token(&m, 0x2A, &[0x1701]);
+    fifo_token(&m, 0x2C, &[]);
+    fifo_token(&m, 0x35, &[f(0.0), f(400.0), f(0.0), f(300.0), f(-1.0), f(1.0)]);
+    fifo_token(&m, 0x2A, &[0x1700]);
+    fifo_token(&m, 0x2C, &[]);
+    gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(m.fb_pixel(50, 820) & 0xFF_FFFF, 0xFF00, "exposed root repainted");
+    assert_eq!(m.fb_pixel(150, 820), 0x77, "other window survives GL triangles");
+
+    // X's bypass state must also survive the GL bracket: its next fill
+    // changes neither PP1winmode nor the CID planes.
+    direct_rss(&m, PP1FILLMODE, 0x0C00_4504, false);
+    direct_rss(&m, FILL_COLOR_R, 0x55, false);
+    block(&m, 150, 820, 150, 820);
+    assert_eq!(m.fb_pixel(150, 820), 0x55);
+    m.stop_engines();
+}
+
 // ---- texture (TE1) ---------------------------------------------------------
 
 /// FIFO pixel data: one pixel command carrying `words`, padded to whole

@@ -329,6 +329,8 @@ pub struct Window {
     /// x | y << 16, y bottom-up (window's lower left in framebuffer rows).
     pub origin: u32,
     pub mode: u32,
+    /// PP1 clipping-ID match and bypass controls, supplied by the kernel.
+    pub pp1winmode: u32,
     /// Screen masks 1-4: (x, y) ranges `min << 16 | max`.
     pub masks: [[u32; 2]; 4],
     pub drb: u32,
@@ -499,11 +501,11 @@ impl Gl {
     pub fn describe(&self) -> String {
         let w = &self.window;
         format!(
-            "  window: valid {} origin {:#x} mode {:#x} DRBpointers {:#x} masks {:x?}\n  \
+            "  window: valid {} origin {:#x} mode {:#x} PP1winmode {:#x} DRBpointers {:#x} masks {:x?}\n  \
              draw buffer bits {:#x}, swapped {}, colour mask {:#x}\n  \
              viewport x {}..{} y {}..{}, scissor {} {:?}\n  \
              colour {:?}, clear colour {:?}, lighting {} (lights {:#x}), depth test {}",
-            w.valid, w.origin, w.mode, w.drb, w.masks, self.draw_bits, self.swapped, self.color_mask,
+            w.valid, w.origin, w.mode, w.pp1winmode, w.drb, w.masks, self.draw_bits, self.swapped, self.color_mask,
             self.vp.x0, self.vp.x1, self.vp.y0, self.vp.y1, self.scissor_test, self.scissor,
             self.color, self.clear_color, self.lt.on, self.lights_on, self.depth_test)
     }
@@ -1762,6 +1764,7 @@ impl Gl {
                 sink.rss_write(re::SCRMSK1X + 2 * n as u32 + 1, *y, false);
             }
             sink.rss_write(re::WINMODE, w.mode, false);
+            sink.rss_write(super::rss::reg::PP1WINMODE, w.pp1winmode, false);
             sink.rss_write(re::DRBPOINTERS, self.draw_pointers(), false);
         }
         self.fill_loaded = 0;

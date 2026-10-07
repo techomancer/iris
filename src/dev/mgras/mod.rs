@@ -476,7 +476,8 @@ impl Mgras {
     /// u32s: the displayed main buffer's bottom-left 1280x1024 (row 0 at the
     /// bottom), the overlay's, colormap 0, the 32 main XMAP modes, the video
     /// timing chip's registers and SRAM, then, only if any other bit of
-    /// pixel memory is set, the hash of the rest. (This is the byte string
+    /// pixel memory is set, the hash of the rest, then nonzero clipping IDs.
+    /// (This is the byte string
     /// the old 1280x1024 plane model hashed, so older recordings keep their
     /// hashes.) Call with `submit` held and the board idle.
     fn state_bytes(&self) -> Vec<u8> {
@@ -520,6 +521,12 @@ impl Mgras {
                 h.update(&w.to_le_bytes());
             }
             out.extend_from_slice(h.finalize().as_bytes());
+        }
+        // Clipping IDs affect future rendering even when the colour planes
+        // are identical. Keep zero-CID recordings' historical hashes.
+        if rss.cid.iter().any(|&c| c != 0) {
+            out.extend_from_slice(b"CID\0");
+            out.extend_from_slice(blake3::hash(&rss.cid).as_bytes());
         }
         out
     }
