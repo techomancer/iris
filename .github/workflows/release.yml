@@ -1,7 +1,8 @@
 # Build and release pipeline for IRIS.
 #
-# Manual trigger (workflow_dispatch) in one of two modes, plus a fortnightly
-# schedule (see "Scheduled releases" below):
+# Manual trigger (workflow_dispatch) in one of two modes, a fortnightly
+# schedule (see "Scheduled releases" below), and a build-only run on every push
+# to main (see "Push builds" below):
 #
 #   publish_release UNCHECKED (the default)
 #     Builds every artifact on every platform and verifies the release contents,
@@ -17,6 +18,15 @@
 # dispatching from a topic branch tests that branch and dispatching from main
 # builds main. Set build_branch to override; a published tag follows the commit
 # that was actually built.
+#
+# ── Push builds ───────────────────────────────────────────────────────────────
+#
+# Every push (or merged PR) to main runs the full build in build-only mode:
+# signed + notarized artifacts on every platform, attached to the run, no tag,
+# no release. A push has no inputs, so the gate's publish_release default
+# ("false") applies and it can never publish. Pushes that only touch docs skip
+# the run (paths-ignore). A newer push to main cancels an in-flight push build;
+# manual and scheduled runs are never cancelled (see `concurrency`).
 #
 # ── Scheduled releases ────────────────────────────────────────────────────────
 #
@@ -58,6 +68,12 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'rules/**'
   schedule:
     - cron: "0 15 * * 5"  # Fridays 15:00 UTC; fortnightly gate in generate-version
   workflow_dispatch:
@@ -83,6 +99,13 @@ on:
         description: "macOS runner image (default macos-26; override with macos-latest/macos-15)"
         required: false
         default: macos-26
+
+# Push builds share one group, so a newer push to main cancels the older build.
+# Every other run gets its own group (its run id) and is never cancelled - a
+# publishing run must not be killed halfway through by a merge.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'release-push-main' || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
