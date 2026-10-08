@@ -691,6 +691,34 @@ impl Gl {
         match addr {
             4 if self.ci != 0 => Some(self.current_index.to_bits()),
             4..=7 => Some(self.color[(addr - 4) as usize].to_bits()),
+            // libGLcore glPushAttrib/glPopAttrib read these GE words rather
+            // than its software state. Placeholder zeros erase write masks,
+            // viewports and scissor boxes when applications restore them.
+            0x29 => Some(self.matrix_mode.wrapping_sub(0x1701)),
+            0x83 => Some(0x899 + self.mv.top * 16),
+            0x896 => Some(0xA99 + self.proj.top * 16),
+            0x897 => Some(0xAB9 + self.tex.top * 16),
+            0x29F => Some(if self.ci != 0 { self.index_mask } else { self.color_mask }),
+            0xB7E..=0xB81 => Some(self.clear_color[(addr - 0xB7E) as usize].to_bits()),
+            0xB86 => Some((self.clear_depth as f32 / ZMAX).to_bits()),
+            0xB87 => Some((self.clear_index as f32).to_bits()),
+            0xB88 => Some(self.clear_stencil),
+            0xB91..=0xB94 => Some(match addr {
+                0xB91 => self.vp.x0 as i32 as u32,
+                0xB92 => self.vp.y0 as i32 as u32,
+                0xB93 => (self.vp.x1 - self.vp.x0 + 1.0) as i32 as u32,
+                _ => (self.vp.y1 - self.vp.y0 + 1.0) as i32 as u32,
+            }),
+            0xB95..=0xB96 => Some(self.depth_range[(addr - 0xB95) as usize].to_bits()),
+            // glGet(GL_SCISSOR_BOX) reads x, y, xmax, ymax, then computes
+            // width/height. SCISSOR tokens carry x, width-1, y, height-1.
+            0xB98..=0xB9B => {
+                let [x0, x1, y0, y1] = self.scissor_rect();
+                Some([x0, y0, x1, y1][(addr - 0xB98) as usize] as u32)
+            }
+            0xBB1 => Some(self.point_size.to_bits()),
+            0xBB2 => Some(self.line_width.to_bits()),
+            0xBBA => Some(self.line_repeat + 1),
             0x1FC => Some(self.dither),
             // Scissor box 0 (window coordinates inclusive: xmin, xmax, ymin, ymax):
             // 0x200 returns (xmax << 16) | xmin, 0x202 returns (ymax << 16) | ymin.
@@ -725,6 +753,8 @@ impl Gl {
                 };
                 Some(m[(addr - 0x3A) as usize].to_bits())
             }
+            0x4A..=0x59 => Some(self.proj.get()[(addr - 0x4A) as usize].to_bits()),
+            0x6A..=0x79 => Some(self.tex.get()[(addr - 0x6A) as usize].to_bits()),
             _ => None,
         }
     }

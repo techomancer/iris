@@ -1335,6 +1335,52 @@ fn gl_raster_position_queries_valid_bias_and_update() {
 }
 
 #[test]
+fn gl_attribute_queries_restore_scissor_viewport_and_index_mask() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x0A, &[12]);
+    fifo_token(&m, 0x3D, &[0xFFF]);
+    fifo_token(&m, 0x33, &[10, 20, 400, 300]);
+    fifo_token(&m, 0x39, &[30, 99, 40, 49]);
+    let vp = [0xB91, 0xB92, 0xB93, 0xB94].map(|a| gl_return_mode(&m, a));
+    let sc = [0xB98, 0xB99, 0xB9A, 0xB9B].map(|a| gl_return_mode(&m, a));
+    let mask = gl_return_mode(&m, 0x29F);
+    assert_eq!(vp, [10, 20, 400, 300]);
+    assert_eq!(sc, [30, 40, 129, 89]);
+    assert_eq!(mask, 0xFFF);
+
+    // Alias uses glPushAttrib/glPopAttrib around its UI drawing. Restore
+    // the queried values after a nested draw changed the relevant state.
+    fifo_token(&m, 0x33, &[0, 0, 1, 1]);
+    fifo_token(&m, 0x39, &[0, 0, 0, 0]);
+    fifo_token(&m, 0x3D, &[0]);
+    fifo_token(&m, 0x33, &vp);
+    fifo_token(&m, 0x39, &[sc[0], sc[2] - sc[0], sc[1], sc[3] - sc[1]]);
+    fifo_token(&m, 0x3D, &[mask]);
+    fifo_token(&m, 0x6E, &[1]);
+    fifo_token(&m, 0xBD, &[f(2044.0)]);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(gl_px(&m, 30, 40), 2044);
+    assert_eq!(gl_px(&m, 129, 89), 2044);
+    assert_eq!(gl_px(&m, 130, 89), 0);
+    assert_eq!(gl_px(&m, 29, 40), 0);
+    assert_eq!([0xB91, 0xB92, 0xB93, 0xB94].map(|a| gl_return_mode(&m, a)), vp);
+
+    fifo_token(&m, 0x09, &[]);
+    fifo_token(&m, 0x3B, &[0x5]);
+    assert_eq!(gl_return_mode(&m, 0x29F), 0x5, "RGB component mask");
+    fifo_token(&m, 0x2A, &[0x1700]);
+    assert_eq!(gl_return_mode(&m, 0x29), u32::MAX, "modelview mode encoding");
+    assert_eq!(gl_return_mode(&m, 0x83), 0x899);
+    fifo_token(&m, 0x2F, &[]);
+    assert_eq!(gl_return_mode(&m, 0x83), 0x8A9);
+    fifo_token(&m, 0x2A, &[0x1701]);
+    assert_eq!(gl_return_mode(&m, 0x29), 0);
+    assert_eq!(gl_return_mode(&m, 0x896), 0xA99);
+    assert_eq!(gl_return_mode(&m, 0x4A), gl_return_mode(&m, 0x3A));
+    m.stop_engines();
+}
+
+#[test]
 fn gl_colour_index_mask_applies_to_clear() {
     let m = live_board();
     x_server(&m);
