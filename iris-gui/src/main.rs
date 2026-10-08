@@ -1507,7 +1507,7 @@ impl App {
                 ui.label(RichText::new("1× = native pixels; ¼× steps (½-integers crispest on Retina)").weak().small());
             });
             ui.menu_button("Help  ▶", |ui| {
-                ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
+                ui.label(RichText::new("IRIS — Emulator for various SGI machines").strong());
                 ui.label(format!("Version {} ({})", env!("APP_VERSION"), env!("APP_COMMIT")));
                 ui.separator();
                 ui.label(RichText::new("Diagnostics").strong());
