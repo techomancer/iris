@@ -477,6 +477,9 @@ fn switch_to_gl_context_cid(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32, 
     img[11] = x << 16 | (x + w - 1);
     img[12] = y << 16 | (y + h - 1);
     img[13] = 0x240;
+    // The banks drawn into, B and B, as the kernel stores them in a new
+    // context (MgrasValidateBanks).
+    (img[16], img[17]) = (1, 1);
     for wd in img {
         write(m, 32, CFIFO, wd as u64);
     }
@@ -1607,6 +1610,7 @@ fn gl_root_painter_respects_clipping_ids_after_iconify() {
     img[11] = 399;
     img[12] = 299;
     img[13] = 0x240;
+    (img[16], img[17]) = (1, 1);
     for wd in img { write(&m, 32, CFIFO, wd as u64); }
     wait_flag(&m, 1 << 6);
     gl_setup_window(&m, 400, 300, [1.0, 0.0, 0.0]);
@@ -2444,8 +2448,39 @@ fn gl_back_buffer_alternates_with_swaps() {
         let (drawn, other) = if k % 2 == 0 { (0x140, 0x240) } else { (0x240, 0x140) };
         assert_eq!(page(&m, drawn), want, "frame {k} draws the back buffer");
         assert_ne!(page(&m, other), want, "frame {k} leaves the front alone");
+        // The kernel's swap: the next frame's bank, then SCHEDULE_SWAP.
+        let next = (k as u32 + 1) % 2 ^ 1;
+        fifo_token(&m, 0x98, &[next, next]);
         write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
     }
+    m.stop_engines();
+}
+
+/// The bank comes from the kernel (VALIDATE_BANKS), not from counting
+/// swaps: a swap the kernel did not pair with a bank (or one the GE never
+/// saw) leaves the drawing where the kernel last said.
+#[test]
+fn gl_draw_bank_follows_the_kernel_not_the_swap_count() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x49, &[4, 1, 0]);
+    let page = |m: &Mgras, p: u32| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(p, super::pixmem::Kind::Wide, 0x31E), 50, 50) as u32 & 0xFF_FFFF
+    };
+    fifo_token(&m, 0x98, &[0, 0]);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(page(&m, 0x240), 0xFF, "bank 0: A, whatever the swaps");
+    assert_ne!(page(&m, 0x140), 0xFF);
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(page(&m, 0x140), 0xFF00, "bank 1: B");
     m.stop_engines();
 }
 

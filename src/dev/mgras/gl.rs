@@ -169,6 +169,10 @@ mod tok {
     /// glDrawBuffer: buffer bits (1 front left, 2 front right, 4 back
     /// left, 8 back right; 0 none), then 2 words not decoded (1, 0 seen).
     pub const DRAW_BUFFER: u32 = 0x049;
+    /// Kernel token (MgrasValidateBanks, at every swap and window
+    /// validation): the bank GL draws into from now on, main buffers then
+    /// the second set (see `Gl::set_draw_bank`).
+    pub const VALIDATE_BANKS: u32 = 0x098;
     /// IRIS GL through IGLOO (libGLcore mgras_igloo.c): swaptmesh,
     /// lmcolor(LMC_COLOR) on / off, n3f (a normal, 3 floats).
     pub const SWAPTMESH: u32 = 0x0DC;
@@ -385,6 +389,9 @@ pub struct Gl {
     /// The driver's PP1 pixel-format and buffer-size fields.
     pixel_format: u32,
     swapped: u32,
+    /// The kernel has named the bank drawn into (`set_draw_bank`): swaps
+    /// leave `swapped` to it.
+    banks_known: u32,
     smooth: u32,
     clear_color: [f32; 4],
     /// Depth: test on, function index, write mask on, clear value (24-bit).
@@ -965,6 +972,7 @@ impl Gl {
                 self.set_state(|g| g.stipple_rows = rows, sink);
             }
             tok::FLUSH => self.end_raster(sink),
+            tok::VALIDATE_BANKS => self.set_draw_bank(w0, sink),
             tok::DRAW_BUFFER => {
                 self.end_raster(sink);
                 self.draw_bits = w0;
@@ -1791,7 +1799,24 @@ impl Gl {
     pub fn swap_buffers(&mut self, sink: &mut dyn Hq3Sink) {
         self.ensure_init();
         self.end_raster(sink);
-        self.swapped ^= 1;
+        if self.banks_known == 0 {
+            self.swapped ^= 1;
+        }
+    }
+
+    /// The bank GL draws into, as the kernel tracks it (MgrasValidateBanks:
+    /// the window's displayed bank xor 1, sent as VALIDATE_BANKS before
+    /// each SCHEDULE_SWAP for the frame after it, or stored in a parked
+    /// context's image, words 16-17). 1 is B (DRBpointers bits 19:10),
+    /// where GL_BACK draws unswapped (DRAW_BUFFER [4, 1]); 0 is A. Traced
+    /// with Maya: [1, 1], swap, frame drawn in B; [0, 0], swap, frame in
+    /// A. Counting swaps instead loses the phase for good on any swap the
+    /// GE does not see, and every other frame then lands in the shown
+    /// buffer.
+    pub fn set_draw_bank(&mut self, bank: u32, sink: &mut dyn Hq3Sink) {
+        self.end_raster(sink);
+        self.swapped = (bank & 1 == 0) as u32;
+        self.banks_known = 1;
     }
 
     /// The buffers drawn into, from DRAW_BUFFER (libGLcore's
@@ -1811,7 +1836,12 @@ impl Gl {
     /// field 3 writes both pages) and for the overlay.
     fn draw_pointers(&self) -> u32 {
         let drb = self.window.drb;
-        let (a, b) = (drb & 0x3FF, (drb >> 10) & 0x3FF);
+        let a = drb & 0x3FF;
+        // A single-buffered window has no second page: B is A.
+        let b = match (drb >> 10) & 0x3FF {
+            0 => a,
+            b => b,
+        };
         let page = match self.draw_mask() {
             Some(m) if m & 0x70 == 0x40 => return drb,
             Some(m) if m & 1 != 0 && m & 0xE != 0 => return drb,

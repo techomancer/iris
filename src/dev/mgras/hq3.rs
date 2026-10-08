@@ -637,6 +637,8 @@ impl Hq3Engine {
                     sink.trace(format!("context {:#x}: window changed", img[0]));
                 }
                 self.apply_window(img[2], img[3], masks, img[13], img[4], sink);
+                // Words 16-17: the banks drawn into (MgrasValidateBanks).
+                self.gl.set_draw_bank(img[16], sink);
                 sink.set_flags(host::FLAG_CONTEXT_LOADED);
             }
             return;
@@ -1318,6 +1320,7 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         0x047 => "SHADE_MODEL",
         0x048 => "DEPTH_RANGE",
         0x049 => "DRAW_BUFFER",
+        0x098 => "VALIDATE_BANKS",
         0x04A => "CLEAR_DEPTH_BUFFER",
         0x04C => "CLEAR_STENCIL_BUFFER",
         0x04D => "POINT_SIZE",
