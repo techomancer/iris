@@ -478,7 +478,7 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
     match format {
         (8, 8) => pack_rgb(c4(0), c4(4), c4(8)),
         (8, 10) => pack_rgb(c5(0), c5(5), c5(10)),
-        (8, 0) => v & 0xFF_FFFF,
+        (8, 0) => v,
         (0, 1) => v & 0xFFF,
         _ => v,
     }

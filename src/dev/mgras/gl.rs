@@ -1580,6 +1580,11 @@ impl Gl {
                 let i = r * wpr * 4 + c * bpp + k;
                 *b = words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
             }
+            // GE pixels have component order RGBA after HQ formatting;
+            // the RSS's byte RGBA transfer is a packed ABGR X pixel.
+            if bpp == 4 && self.xfrmode & 0xFF == 0x80 {
+                px[..4].reverse();
+            }
             px
         };
         for (line, oy) in (cy0 - y0..=cy1 - y0).enumerate() {

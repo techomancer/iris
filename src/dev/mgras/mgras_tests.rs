@@ -2284,3 +2284,25 @@ fn gl_texture_clamp_to_border() {
     assert_eq!(gl_px(&m, 105, 137), 0x00_FF00, "border colour only");
     m.stop_engines();
 }
+
+/// SEND_PIXELS receives RGBA components after HQ formatting, whereas X
+/// transfers use packed ABGR. Opaque black must not turn into red.
+#[test]
+fn gl_draw_pixels_rgba8_component_order() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0x00C1_0080]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x8D, &[3, 0, 0, 1, 0, 1, 0x49D0, 0x99]);
+    fifo_pixel_data(&m, &[0x0000_00FF, 0x1234_5678, 0xFF00_00FF]);
+    assert_eq!(gl_px(&m, 10, 20), 0, "opaque black");
+    assert_eq!(gl_px(&m, 11, 20), 0x56_3412, "RGB order");
+    assert_eq!(gl_px(&m, 12, 20), 0x00_00FF, "red");
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let b = super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E);
+    assert_eq!(rss.mem.get(&b, 11, 20) as u32, 0x7856_3412, "alpha survives upload");
+    drop(_sub);
+    m.stop_engines();
+}
