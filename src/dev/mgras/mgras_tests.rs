@@ -2391,6 +2391,28 @@ fn gl_draw_pixels_rgba8_component_order() {
 }
 
 #[test]
+fn gl_draw_pixels_flat_transport_keeps_image_shape_and_offset() {
+    for (words_per_row, transport_rows) in [(6, 1), (2, 3)] {
+        let m = gl_board([0.0, 0.0, 0.0]);
+        fifo_token(&m, 0x7F, &[1, 2]);
+        fifo_pixel_data(&m, &[0x159, 0x00C1_0080]);
+        fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+        // StudioPaint sends narrow tile edges as one transport row, with the
+        // two-dimensional image rectangle still in GE pixel state.
+        fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 2, 6, 5, 7, 7, 8, 0x2_0003, 1]);
+        fifo_token(&m, 0x8D, &[words_per_row, 0, 0, transport_rows, 0, 1, 0x49D0, 0x18]);
+        fifo_pixel_data(&m, &[0xFF00_00FF, 0x00FF_00FF, 0x0000_FFFF,
+            0xFFFF_00FF, 0x00FF_FFFF, 0xFF00_FFFF]);
+        let got: Vec<u32> = [(15, 27), (16, 27), (17, 27), (15, 28), (16, 28), (17, 28)]
+            .iter().map(|&(x, y)| gl_px(&m, x, y)).collect();
+        assert_eq!(got, [0xFF, 0xFF00, 0xFF0000, 0xFFFF, 0xFFFF00, 0xFF00FF]);
+        assert_eq!(gl_px(&m, 10, 20), 0, "transport shape must not overwrite the raster origin");
+        assert_eq!(gl_px(&m, 18, 27), 0, "image ends at its rectangle edge");
+        m.stop_engines();
+    }
+}
+
+#[test]
 fn gl_fifo_abgr_rows_ignore_doubleword_padding() {
     let m = gl_board([0.0, 0.0, 0.0]);
     fifo_token(&m, 0x7F, &[1, 2]);

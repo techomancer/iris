@@ -1597,20 +1597,31 @@ impl Gl {
     /// zoom) are taken as identity.
     fn draw_pixels(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
         self.send_pixels_pending = 0;
-        let wpr = self.send_pixels[0] as usize;
+        let mut wpr = self.send_pixels[0] as usize;
         if self.raster_valid == 0 || wpr == 0 || words.len() < wpr {
             return;
         }
         // Rows: header words 3 + 3 * 4 (mandel 1 + 0, snoop 2 + 3 * 18 =
         // 56), else what came.
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
-        let rows = if hdr_rows > 0 { hdr_rows.min(words.len() / wpr) } else { words.len() / wpr };
+        let mut rows = if hdr_rows > 0 { hdr_rows.min(words.len() / wpr) } else { words.len() / wpr };
         let bpp = super::rss::bytes_per_pixel(self.xfrmode) as usize;
+        // SEND_PIXELS counts transport rows. Narrow StudioPaint tile edges
+        // arrive flattened (e.g. 6x11 pixels as one 66-word row); 0xDA8
+        // still gives the image shape and its offset from the raster position.
+        let xs = self.tl_rect[4];
+        let (image_w, image_h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
+        if image_w > 0 && image_h > 0 && image_h != rows
+            && image_w * bpp % 4 == 0
+            && image_w * image_h * bpp == wpr * rows * 4
+        {
+            wpr = image_w * bpp / 4;
+            rows = image_h;
+        }
         // The host's pixels may carry fewer components than the raster
         // engine's format: glCopyPixels draws RGB16 back in RGBA16 (the GE's
         // pixel pipeline adds alpha). The image's size (pixel state 0xDA8's
         // transfer size, when its rows match) gives the host's pixel size.
-        let xs = self.tl_rect[4];
         let host_bpp = match (xs & 0xFFFF) as usize {
             w if w > 0 && (xs >> 16) as usize == rows && wpr * 4 % w == 0 => wpr * 4 / w,
             _ => bpp,
