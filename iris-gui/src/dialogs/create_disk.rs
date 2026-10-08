@@ -25,8 +25,7 @@ impl Default for CreateDiskDialog {
 impl CreateDiskDialog {
     pub fn open_for(&mut self, scsi_id: u8) {
         self.scsi_id = scsi_id;
-        // Absolute, app-managed default location (writable in the App Store
-        // sandbox too) so a new disk never lands in the working dir.
+        // Relative to the selected machine folder, writable in the sandbox.
         self.filename = crate::settings::GuiSettings::default_disk_path(scsi_id);
         self.size_mb = 1024.0;
         self.overwrite = false;
@@ -58,7 +57,7 @@ impl CreateDiskDialog {
                                 crate::filedialog::Purpose::Save,
                                 &[("Disk image", &["raw", "img"])]);
                             if let Some(p) = dlg.save_file() {
-                                self.filename = p.to_string_lossy().into_owned();
+                                self.filename = crate::picked_path(&p);
                             }
                         }
                     });
@@ -92,7 +91,7 @@ impl CreateDiskDialog {
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         // Create file on disk now (making the parent dir first,
-                        // e.g. the managed <data_dir>/disks on first use).
+                        // e.g. the managed <machine dir>/disks on first use).
                         let path = PathBuf::from(&self.filename);
                         if let Some(parent) = path.parent() {
                             let _ = std::fs::create_dir_all(parent);

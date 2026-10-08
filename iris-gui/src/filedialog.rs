@@ -47,14 +47,14 @@
 //!
 //! Three kinds of location, and they behave differently:
 //!
-//! - **The managed folder** (`<container>/…/iris/disks`). `dirs::config_dir()`
-//!   is redirected into the container, so this is ours, always readable and
+//! - **The managed folder** (`<container>/…/iris/machines/<name>/disks`). `GuiSettings::data_dir()`
+//!   selects the sandbox container, so this is ours, always readable and
 //!   always creatable. Nothing special needed.
 //! - **A folder the user granted.** `macos_sandbox::restore` asserts every
 //!   stored bookmark at startup and holds it for the process lifetime, so by
 //!   the time a picker opens we can stat it like any other path.
 //! - **An absolute path we hold no bookmark for** — typed in, or carried over
-//!   in `gui.json` from another machine. We cannot stat it, and that is the
+//!   in a machine TOML. We cannot stat it, and that is the
 //!   case `nearest_existing` has to get right; see there.
 
 use std::path::{Path, PathBuf};
@@ -65,9 +65,9 @@ use crate::settings::GuiSettings;
 /// usable folder of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
-    /// Disk images — `<data_dir>/disks`.
+    /// Disk images — `<machine dir>/disks`.
     Disks,
-    /// Everything else the app owns: PROM, NVRAM, logs, exports, screenshots.
+    /// Everything else the app owns: PROM, NVRAM, logs, and screenshots.
     Data,
 }
 
@@ -82,7 +82,7 @@ impl Anchor {
     fn managed(self) -> Option<PathBuf> {
         let dir = match self {
             Anchor::Disks => GuiSettings::disks_dir()?,
-            Anchor::Data => GuiSettings::data_dir()?,
+            Anchor::Data => GuiSettings::working_dir()?,
         };
         if !dir.is_dir() {
             let _ = std::fs::create_dir_all(&dir);
@@ -122,19 +122,17 @@ fn name_to_prefill(current: &str, purpose: Purpose, name_breaks_dir: bool) -> Op
 
 /// The folder a dialog for `current` should open in. Always exists.
 pub fn start_dir(current: &str, anchor: Anchor) -> PathBuf {
-    start_dir_in(current, anchor.managed())
+    start_dir_in(current, anchor.managed(), GuiSettings::working_dir().as_deref())
 }
 
 /// `start_dir` with the managed directory supplied, so the logic is testable
 /// without touching the real one.
-fn start_dir_in(current: &str, managed: Option<PathBuf>) -> PathBuf {
+fn start_dir_in(current: &str, managed: Option<PathBuf>, base: Option<&Path>) -> PathBuf {
     let current = current.trim();
     if !current.is_empty() {
-        // A bare or relative name means the managed directory, not the process
-        // working directory — that differs between `cargo run` and a bundled
-        // .app, which is the same trap `GuiSettings::default_nvram_path`
-        // documents.
-        let p = match (Path::new(current).is_absolute(), &managed) {
+        // Relative config paths use the machine folder, independent of the
+        // picker's fallback (disks/ for images, the machine folder otherwise).
+        let p = match (Path::new(current).is_absolute(), base) {
             (false, Some(base)) => base.join(current),
             _ => PathBuf::from(current),
         };
@@ -193,13 +191,35 @@ fn last_resort() -> PathBuf {
 /// save panel, and only where that does not cost us the directory — see the
 /// module docs.
 pub fn dialog(title: &str, current: &str, anchor: Anchor, purpose: Purpose) -> rfd::FileDialog {
-    let mut d = rfd::FileDialog::new()
-        .set_title(title)
-        .set_directory(start_dir(current, anchor));
+    dialog_seeded(title, current, purpose, start_dir(current, anchor))
+}
+
+fn dialog_seeded(title: &str, current: &str, purpose: Purpose, dir: PathBuf) -> rfd::FileDialog {
+    let mut d = rfd::FileDialog::new().set_title(title).set_directory(dir);
     if let Some(name) = name_to_prefill(current, purpose, NAME_FIELD_BREAKS_DIRECTORY) {
         d = d.set_file_name(name);
     }
     d
+}
+
+/// New-machine pickers use a prospective folder without creating it or reserving
+/// its name. Their fallback must not create disks in the previous machine.
+pub fn dialog_with_base(
+    title: &str,
+    current: &str,
+    base: &Path,
+    anchor: Anchor,
+    purpose: Purpose,
+    filters: &[(&str, &[&str])],
+) -> rfd::FileDialog {
+    let fallback = match anchor {
+        Anchor::Disks => nearest_existing(&base.join("disks")),
+        Anchor::Data => nearest_existing(base),
+    };
+    let dir = start_dir_in(current, fallback, Some(base));
+    let mut dialog = dialog_seeded(title, current, purpose, dir);
+    for (label, exts) in filters { dialog = dialog.add_filter(*label, exts); }
+    dialog
 }
 
 /// A picker opened *at* `dir` rather than at its parent.
@@ -250,7 +270,7 @@ mod tests {
         let managed = tmp("existing");
         let img = managed.join("scsi1.raw");
         std::fs::write(&img, b"x").unwrap();
-        assert_eq!(start_dir_in(&img.to_string_lossy(), Some(managed.clone())), managed);
+        assert_eq!(start_dir_in(&img.to_string_lossy(), Some(managed.clone()), Some(&managed)), managed);
         std::fs::remove_dir_all(&managed).ok();
     }
 
@@ -261,32 +281,41 @@ mod tests {
     fn a_destination_that_does_not_exist_yet_walks_up_to_one_that_does() {
         let managed = tmp("walkup");
         let deep = managed.join("indy").join("disks").join("root.raw");
-        assert_eq!(start_dir_in(&deep.to_string_lossy(), Some(managed.clone())), managed,
+        assert_eq!(start_dir_in(&deep.to_string_lossy(), Some(managed.clone()), Some(&managed)), managed,
                    "must climb to the nearest real folder, not give up");
 
         // One level materialises: now that is the answer.
         let mid = managed.join("indy");
         std::fs::create_dir_all(&mid).unwrap();
-        assert_eq!(start_dir_in(&deep.to_string_lossy(), Some(managed.clone())), mid);
+        assert_eq!(start_dir_in(&deep.to_string_lossy(), Some(managed.clone()), Some(&managed)), mid);
         std::fs::remove_dir_all(&managed).ok();
     }
 
     #[test]
-    fn a_bare_name_resolves_against_the_managed_folder_not_the_working_directory() {
+    fn a_relative_name_resolves_against_the_supplied_machine_folder() {
         let managed = tmp("bare");
-        // `scsi1.raw` with no directory means the managed one. Resolving it
-        // against the process cwd would differ between `cargo run` and a
-        // bundled .app.
-        assert_eq!(start_dir_in("scsi1.raw", Some(managed.clone())), managed);
-        assert_eq!(start_dir_in("sub/scsi1.raw", Some(managed.clone())), managed);
+        // Relative paths use the explicit machine base in every launch context.
+        assert_eq!(start_dir_in("scsi1.raw", Some(managed.clone()), Some(&managed)), managed);
+        assert_eq!(start_dir_in("sub/scsi1.raw", Some(managed.clone()), Some(&managed)), managed);
         std::fs::remove_dir_all(&managed).ok();
+    }
+
+    #[test]
+    fn a_disk_path_is_relative_to_the_machine_not_its_disks_subfolder() {
+        let machine = tmp("machine-base");
+        let disks = machine.join("disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        assert_eq!(start_dir_in("disks/scsi1.raw", Some(disks.clone()), Some(&machine)), disks);
+        // A bare filename in a hand-written TOML is also machine-relative.
+        assert_eq!(start_dir_in("scsi1.raw", Some(disks), Some(&machine)), machine);
+        std::fs::remove_dir_all(machine).unwrap();
     }
 
     #[test]
     fn an_empty_value_falls_back_to_the_managed_folder() {
         let managed = tmp("empty");
-        assert_eq!(start_dir_in("", Some(managed.clone())), managed);
-        assert_eq!(start_dir_in("   ", Some(managed.clone())), managed);
+        assert_eq!(start_dir_in("", Some(managed.clone()), Some(&managed)), managed);
+        assert_eq!(start_dir_in("   ", Some(managed.clone()), Some(&managed)), managed);
         std::fs::remove_dir_all(&managed).ok();
     }
 
@@ -334,7 +363,7 @@ mod tests {
         std::fs::write(&img, b"x").unwrap();
         for breaks in [true, false] {
             for purpose in [Purpose::Open, Purpose::Save] {
-                assert_eq!(start_dir_in(&img.to_string_lossy(), Some(managed.clone())), managed);
+                assert_eq!(start_dir_in(&img.to_string_lossy(), Some(managed.clone()), Some(&managed)), managed);
                 let _ = name_to_prefill(&img.to_string_lossy(), purpose, breaks);
             }
         }
@@ -357,7 +386,7 @@ mod tests {
         std::fs::write(&img, b"x").unwrap();
 
         let value = img.to_string_lossy().into_owned();
-        assert_eq!(start_dir_in(&value, Some(disks.clone())), disks,
+        assert_eq!(start_dir_in(&value, Some(disks.clone()), Some(&disks)), disks,
                    "Browse must open the disks folder, not anywhere else");
 
         // And on macOS no name may ride along, or AppKit throws that directory
@@ -367,7 +396,7 @@ mod tests {
 
         // Still right if the image has not been created yet.
         std::fs::remove_file(&img).unwrap();
-        assert_eq!(start_dir_in(&value, Some(disks.clone())), disks);
+        assert_eq!(start_dir_in(&value, Some(disks.clone()), Some(&disks)), disks);
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -394,7 +423,7 @@ mod tests {
         let img = disks.join("scsi1.raw");
         std::fs::write(&img, b"x").unwrap();
         let value = img.to_string_lossy().into_owned();
-        let dir = start_dir_in(&value, Some(disks.clone()));
+        let dir = start_dir_in(&value, Some(disks.clone()), Some(&disks));
 
         // What the old code did: directory *and* name. The backend joins them
         // and setDirectoryURL: receives a file, which AppKit discards — the
@@ -443,7 +472,7 @@ mod tests {
             assert_eq!(nearest_existing(&inner).unwrap(), inner,
                        "a denied folder must not be walked past");
             let img = inner.join("scsi1.raw");
-            assert_eq!(start_dir_in(&img.to_string_lossy(), Some(root.clone())), inner);
+            assert_eq!(start_dir_in(&img.to_string_lossy(), Some(root.clone()), Some(&root)), inner);
         }
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -466,7 +495,7 @@ mod tests {
         let cases = ["", "   ", "scsi1.raw", "/nonexistent/deep/path/x.raw", "relative/x.raw"];
         for managed in [None, Some(PathBuf::from("/nonexistent/managed"))] {
             for c in cases {
-                let d = start_dir_in(c, managed.clone());
+                let d = start_dir_in(c, managed.clone(), None);
                 assert!(d.is_dir(), "start_dir_in({c:?}, {managed:?}) = {d:?}, which is not a directory");
             }
         }

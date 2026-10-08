@@ -3,12 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// GUI-only persisted state at `<dirs::config_dir()>/iris/gui.json`.
-///
-/// This is the **system of record** for machines: each named machine is a
-/// `MachineConfig` stored here. `iris.toml` is treated as import/export
-/// only, for compatibility with the standalone `iris` CLI.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// GUI preferences at `<config dir>/iris/gui.json`. Machine configurations
+/// use the core TOML schema in `machines/<name>/<name>.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuiSettings {
     /// egui UI scale (default `UI_SCALE_DEFAULT`, currently 1.25).
     #[serde(default = "default_ui_scale")]
@@ -20,21 +17,21 @@ pub struct GuiSettings {
     #[serde(default = "default_vm_scale")]
     pub vm_scale: f32,
 
-    /// All saved machines keyed by user-visible name. BTreeMap so menus
-    /// list them in stable alphabetical order.
-    #[serde(default)]
+    /// Runtime machine list, discovered from TOML folders. Deserialize the old
+    /// JSON field for migration, but never serialize configs back into JSON.
+    /// BTreeMap keeps menu entries in alphabetical order.
+    #[serde(default, skip_serializing)]
     pub machines: BTreeMap<String, MachineConfig>,
     /// Currently-selected machine (key into `machines`). None = no
     /// machine loaded yet (first run).
     #[serde(default)]
     pub active_machine: Option<String>,
 
-    // --- Legacy iris.toml workflow (still supported for users who had it). ---
-    /// Most-recently-imported iris.toml files (newest first, max ~10).
+    // Retained for compatibility with existing GUI preferences.
+    /// Legacy recent TOML files; no longer updated by the GUI.
     #[serde(default)]
     pub recent_configs: Vec<PathBuf>,
-    /// Last-imported TOML path; one-shot migration source on first launch
-    /// of the new machine-store world.
+    /// Legacy TOML pointer, consumed once during migration.
     #[serde(default)]
     pub last_config: Option<PathBuf>,
 
@@ -55,6 +52,34 @@ pub struct GuiSettings {
     /// Store build. See [`crate::macos_sandbox`].
     #[serde(default)]
     pub disk_folders: Vec<String>,
+
+    /// Runtime storage root, captured before the working directory changes.
+    #[serde(skip)]
+    root: Option<PathBuf>,
+    /// Load/migration errors shown by the launcher and logged.
+    #[serde(skip)]
+    pub errors: Vec<String>,
+    /// Protect the legacy JSON if any conversion or preference read failed.
+    #[serde(skip)]
+    migration_pending: bool,
+}
+
+impl Default for GuiSettings {
+    fn default() -> Self {
+        Self {
+            ui_scale: UI_SCALE_DEFAULT,
+            vm_scale: VM_SCALE_DEFAULT,
+            machines: BTreeMap::new(),
+            active_machine: None,
+            recent_configs: Vec::new(),
+            last_config: None,
+            bookmarks: BTreeMap::new(),
+            disk_folders: Vec::new(),
+            root: None,
+            errors: Vec::new(),
+            migration_pending: false,
+        }
+    }
 }
 
 /// Byte offset of the Indy's 6-byte Ethernet MAC inside the NVRAM. The PROM
@@ -252,182 +277,153 @@ fn default_ui_scale() -> f32 { UI_SCALE_DEFAULT }
 fn default_vm_scale() -> f32 { VM_SCALE_DEFAULT }
 
 impl GuiSettings {
-    pub fn config_path() -> Option<PathBuf> {
-        Self::data_dir().map(|d| d.join("gui.json"))
-    }
-
-    /// Stable per-user directory for GUI state (gui.json, nvram.bin, …). The OS
-    /// maps this into the sandbox container automatically on the App Store
-    /// build, so the *same* code resolves the right place for `cargo run` and
-    /// the bundled app alike.
+    /// Foundation returns the actual container home for sandboxed macOS apps,
+    /// including launches from a shell whose HOME still points outside it.
     pub fn data_dir() -> Option<PathBuf> {
+        #[cfg(all(target_os = "macos", feature = "appstore"))]
+        {
+            let home = objc2_foundation::NSHomeDirectory().to_string();
+            Some(PathBuf::from(home).join("Library/Application Support/iris"))
+        }
+        #[cfg(not(all(target_os = "macos", feature = "appstore")))]
         dirs::config_dir().map(|d| d.join("iris"))
     }
 
-    /// Default absolute NVRAM path: `<data_dir>/nvram.bin`. Absolute on purpose
-    /// — a relative `nvram.bin` resolves against the process's working
-    /// directory, which differs between `cargo run` (repo root) and a bundled
-    /// `.app`, silently loading different (often blank, MAC-less) NVRAMs. Anchor
-    /// it once and every launch shares one NVRAM.
-    pub fn default_nvram_path() -> String {
-        Self::data_dir()
-            .map(|d| d.join("nvram.bin").to_string_lossy().into_owned())
-            .unwrap_or_else(|| "nvram.bin".to_string())
+    pub fn root(&self) -> Result<&Path, String> {
+        self.root.as_deref().ok_or_else(|| "No GUI config directory".into())
     }
 
-    /// Default absolute NVRAM EEPROM path: `<data_dir>/nveeprom.bin`. Same
-    /// reasoning as [`default_nvram_path`] — the core default is a bare
-    /// `"nveeprom.bin"` (`src/config.rs::default_nveeprom`), which resolves
-    /// against the process's working directory and silently finds a
-    /// different (usually blank) file between `cargo run` and a bundled
-    /// `.app`. This is the motherboard EEPROM Indigo2/IP28 actually read
-    /// `eaddr` from (`Eeprom93c56`, see `rules/irix/networking.md`).
-    /// `ensure_nveeprom_exists` creates an erased chip; the IP28 core seeds
-    /// PROM defaults before its first boot and saves them on Stop.
-    pub fn default_nveeprom_path() -> String {
-        Self::data_dir()
-            .map(|d| d.join("nveeprom.bin").to_string_lossy().into_owned())
-            .unwrap_or_else(|| "nveeprom.bin".to_string())
+    pub fn machine_dir(&self, name: &str) -> Result<PathBuf, String> {
+        crate::machines::directory(self.root()?, name)
     }
 
-    /// Managed directory for newly-created disk images: `<data_dir>/disks`.
-    /// Absolute and writable in every launch context — the OS maps it into the
-    /// sandbox container on the App Store build, so creating a disk here needs
-    /// no permission prompt. Users can still pick another location.
-    pub fn disks_dir() -> Option<PathBuf> {
-        Self::data_dir().map(|d| d.join("disks"))
+    pub fn machine_path(&self, name: &str) -> Result<PathBuf, String> {
+        crate::machines::config_path(self.root()?, name)
     }
 
-    /// Default absolute path for a new SCSI disk image: `<disks_dir>/scsiN.raw`.
-    pub fn default_disk_path(scsi_id: u8) -> String {
-        Self::disks_dir()
-            .map(|d| d.join(format!("scsi{scsi_id}.raw")).to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("scsi{scsi_id}.raw"))
-    }
+    pub fn default_nvram_path() -> String { "nvram.bin".into() }
+    pub fn default_nveeprom_path() -> String { "nveeprom.bin".into() }
 
-    /// Anchor a machine's NVRAM path to [`data_dir`] if it's relative (the
-    /// legacy default was a bare `"nvram.bin"`). Best-effort: if the anchored
-    /// file doesn't exist yet but the old cwd-relative one does, copy it over so
-    /// the PROM env (boot settings, any MAC) carries forward instead of starting
-    /// blank. Idempotent — absolute paths are left untouched.
-    pub fn migrate_nvram_path(nvram: &mut String) {
-        if !nvram.is_empty() && Path::new(&nvram).is_absolute() {
-            return;
-        }
-        let Some(dir) = Self::data_dir() else { return; };
-        let _ = std::fs::create_dir_all(&dir);
-        let leaf = Path::new(nvram.as_str())
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("nvram.bin");
-        let dst = dir.join(leaf);
-        let src = PathBuf::from(nvram.as_str()); // relative to cwd
-        if !dst.exists() && !nvram.is_empty() && src.exists() {
-            let _ = std::fs::copy(&src, &dst);
-        }
-        *nvram = dst.to_string_lossy().into_owned();
-    }
-
-    /// Same anchoring as [`migrate_nvram_path`], for the NVRAM EEPROM path.
-    /// The legacy default was a bare `"nveeprom.bin"`, which could be
-    /// anywhere depending on how iris-gui was launched (no `set_current_dir`
-    /// call of its own) — this was never anchored at all before, so most
-    /// existing machines will have nothing to find at the old relative path
-    /// and just start a fresh EEPROM at the new stable location, same as a
-    /// brand new machine would.
-    pub fn migrate_nveeprom_path(nveeprom: &mut String) {
-        if !nveeprom.is_empty() && Path::new(&nveeprom).is_absolute() {
-            return;
-        }
-        let Some(dir) = Self::data_dir() else { return; };
-        let _ = std::fs::create_dir_all(&dir);
-        let leaf = Path::new(nveeprom.as_str())
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("nveeprom.bin");
-        let dst = dir.join(leaf);
-        let src = PathBuf::from(nveeprom.as_str()); // relative to cwd
-        if !dst.exists() && !nveeprom.is_empty() && src.exists() {
-            let _ = std::fs::copy(&src, &dst);
-        }
-        *nveeprom = dst.to_string_lossy().into_owned();
-    }
+    /// The selected machine's folder is the process working directory.
+    pub fn working_dir() -> Option<PathBuf> { std::env::current_dir().ok() }
+    pub fn disks_dir() -> Option<PathBuf> { Self::working_dir().map(|d| d.join("disks")) }
+    pub fn default_disk_path(scsi_id: u8) -> String { format!("disks/scsi{scsi_id}.raw") }
 
     pub fn load() -> Self {
-        // Load from disk when present, else start from defaults — but ALWAYS
-        // fall through to the sanitizer below. A missing or unreadable file used
-        // to early-return `Self::default()`, which leaves `vm_scale`/`ui_scale`
-        // at the struct's zero `Default` (0.0, not the serde field defaults).
-        // A 0.0 vm_scale then panics the window-fit math (`clamp` min > max), so
-        // a first-ever run with no gui.json crashed instead of using defaults.
-        let mut s: Self = Self::config_path()
-            .and_then(|path| std::fs::read_to_string(&path).ok())
-            .and_then(|text| serde_json::from_str::<Self>(&text).ok())
-            .unwrap_or_default();
-        // Sanitize a stale/out-of-range persisted scale. A value below the
-        // minimum is junk left by an older build whose keyboard zoom floored
-        // at 0.5 (the UI can no longer produce sub-minimum values), so reset
-        // it to the default rather than honoring it — likewise for a
-        // non-finite value from a corrupt file. Only the high end is clamped.
+        match (Self::data_dir(), std::env::current_dir()) {
+            (Some(root), Ok(cwd)) => Self::load_in(root, &cwd),
+            _ => Self { errors: vec!["Cannot locate GUI storage or working directory".into()], ..Default::default() },
+        }
+    }
+
+    pub(crate) fn load_in(root: PathBuf, old_cwd: &Path) -> Self {
+        let directory_error = std::fs::create_dir_all(&root).err();
+        // cwd follows symlinks; use the same base for relative TOML paths.
+        let root = root.canonicalize().unwrap_or(root);
+        let path = root.join("gui.json");
+        let mut s = match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Self>(&text) {
+                Ok(s) => s,
+                Err(e) => Self { migration_pending: true, errors: vec![format!("{}: {e}", path.display())], ..Default::default() },
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => Self { migration_pending: true, errors: vec![format!("{}: {e}", path.display())], ..Default::default() },
+        };
+        s.root = Some(root.clone());
+        if let Some(e) = directory_error {
+            s.migration_pending = true;
+            s.errors.push(format!("Cannot create GUI storage: {e}"));
+        }
+        // Restore access before migrating any external battery-backed files.
+        crate::macos_sandbox::restore(&s.bookmarks);
         s.ui_scale = if !s.ui_scale.is_finite() || s.ui_scale < UI_SCALE_MIN {
             UI_SCALE_DEFAULT
-        } else {
-            s.ui_scale.min(UI_SCALE_MAX)
-        };
+        } else { s.ui_scale.min(UI_SCALE_MAX) };
         s.vm_scale = if !s.vm_scale.is_finite() || s.vm_scale < VM_SCALE_MIN {
             VM_SCALE_DEFAULT
-        } else {
-            s.vm_scale.min(VM_SCALE_MAX)
-        };
-        // Anchor every machine's NVRAM to the stable data dir so all launch
-        // methods share one file (the persisted path becomes absolute on the
-        // next save).
-        for m in s.machines.values_mut() {
-            Self::migrate_nvram_path(&mut m.nvram);
-            Self::migrate_nveeprom_path(&mut m.nveeprom);
+        } else { s.vm_scale.min(VM_SCALE_MAX) };
+
+        if !s.migration_pending && (!s.machines.is_empty() || s.last_config.is_some()) {
+            // Leave this original backup intact across retries.
+            let backup = root.join("gui.json.pre-toml.bak");
+            let result = (|| -> Result<(), String> {
+                if !backup.exists() {
+                    std::fs::copy(&path, &backup).map_err(|e| format!("Cannot back up GUI preferences: {e}"))?;
+                }
+                for (old_name, cfg) in &s.machines {
+                    let name = crate::machines::legacy_name(old_name);
+                    crate::machines::migrate(&root, &name, cfg, old_cwd)?;
+                    if s.active_machine.as_deref() == Some(old_name) { s.active_machine = Some(name); }
+                }
+                if s.machines.is_empty() {
+                    if let Some(legacy) = &s.last_config {
+                        let source = old_cwd.join(legacy);
+                        let cfg = crate::machines::read(&source)?;
+                        let stem = source.file_stem().and_then(|n| n.to_str()).unwrap_or("imported");
+                        let base = crate::machines::legacy_name(stem);
+                        let name = if crate::machines::config_path(&root, &base)?.exists() { base } else { s.unique_name(&base) };
+                        crate::machines::migrate(&root, &name, &cfg, old_cwd)?;
+                        s.active_machine = Some(name);
+                    }
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    s.last_config = None;
+                    s.machines.clear();
+                    if let Err(e) = s.save() { s.migration_pending = true; s.errors.push(e); }
+                }
+                Err(e) => { s.migration_pending = true; s.errors.push(format!("Machine migration failed: {e}")); }
+            }
         }
+        let (machines, errors) = crate::machines::discover(&root);
+        s.machines = machines;
+        s.errors.extend(errors);
+        for e in &s.errors { log::error!("{e}"); }
         s
     }
 
+    pub fn ensure_writable(&self) -> Result<(), String> {
+        if self.migration_pending {
+            Err("Resolve the GUI preference/migration error before changing machines".into())
+        } else { Ok(()) }
+    }
+
+    pub fn save_machine(&mut self, name: &str, cfg: &mut MachineConfig) -> Result<(), String> {
+        self.ensure_writable()?;
+        crate::machines::save(self.root()?, name, cfg)?;
+        self.machines.insert(name.into(), cfg.clone());
+        self.save()
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
-        // Refresh macOS security-scoped bookmarks for every machine's reachable
-        // files so they reopen under the App Sandbox next launch. No-op off the
-        // Mac App Store build.
-        let paths: Vec<String> = self
-            .machines
-            .values()
-            .flat_map(crate::macos_sandbox::config_paths)
-            .collect();
-        // Harvest both per-file bookmarks and the user-granted disk folders (a
-        // directory bookmark is recursive — see `disk_folders`).
+        if self.migration_pending { return Err("GUI preferences retained because loading or migration failed".into()); }
+        let root = self.root()?.to_path_buf();
+        let paths: Vec<String> = self.machines.iter().flat_map(|(name, cfg)| {
+            let dir = crate::machines::directory(&root, name).unwrap();
+            crate::macos_sandbox::config_paths(cfg, &dir)
+        }).collect();
         crate::macos_sandbox::harvest(
             paths.iter().map(String::as_str).chain(self.disk_folders.iter().map(String::as_str)),
             &mut self.bookmarks,
         );
-
-        let path = Self::config_path().ok_or("no config dir")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text).map_err(|e| e.to_string())
+        crate::machines::write(&root.join("gui.json"), &text)
     }
 
-    pub fn push_recent(&mut self, path: PathBuf) {
-        self.recent_configs.retain(|p| p != &path);
-        self.recent_configs.insert(0, path.clone());
-        self.recent_configs.truncate(10);
-        self.last_config = Some(path);
+    fn name_taken(&self, name: &str) -> bool {
+        self.machines.contains_key(name)
+            || self.machine_dir(name).map(|d| d.exists()).unwrap_or(true)
     }
 
     /// Pick a free name like "indy", "indy-2", "indy-3", …
     pub fn unique_name(&self, base: &str) -> String {
-        if !self.machines.contains_key(base) { return base.to_string(); }
+        if !self.name_taken(base) { return base.to_string(); }
         for n in 2..1000 {
             let candidate = format!("{base}-{n}");
-            if !self.machines.contains_key(&candidate) { return candidate; }
+            if !self.name_taken(&candidate) { return candidate; }
         }
         format!("{base}-{}", uuid_like())
     }
@@ -436,4 +432,132 @@ impl GuiSettings {
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0).to_string()
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use crate::machines::{self, tests::TempRoot};
+
+    #[test]
+    fn legacy_json_migration_keeps_preferences_and_removes_only_machine_payloads() {
+        let root = TempRoot::new("json");
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.get_mut(&1).unwrap().path = "boot.raw".into();
+        let original = serde_json::json!({
+            "ui_scale": 1.5, "vm_scale": 1.0, "active_machine": "indy",
+            "machines": {"indy": cfg}, "recent_configs": ["old.toml"],
+            "last_config": null, "bookmarks": {"/old/disk": [1,2,3]},
+            "disk_folders": ["/old/folder"]
+        });
+        let original_text = serde_json::to_string(&original).unwrap();
+        std::fs::write(root.0.join("gui.json"), &original_text).unwrap();
+        let mut prefs = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert!(prefs.errors.is_empty(), "{:?}", prefs.errors);
+        assert_eq!(prefs.active_machine.as_deref(), Some("indy"));
+        assert_eq!(prefs.machines["indy"].scsi[&1].path, "../../boot.raw");
+        assert_eq!(std::fs::read_to_string(root.0.join("gui.json.pre-toml.bak")).unwrap(), original_text);
+        prefs.save().unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.0.join("gui.json")).unwrap()).unwrap();
+        assert!(persisted.get("machines").is_none());
+        for key in ["ui_scale", "vm_scale", "active_machine", "recent_configs", "last_config", "bookmarks", "disk_folders"] {
+            assert_eq!(persisted[key], original[key], "{key}");
+        }
+        // Preference saves do not overwrite externally edited machine TOMLs.
+        let path = prefs.machine_path("indy").unwrap();
+        let mut cfg = machines::read(&path).unwrap();
+        cfg.banks = [8, 8, 0, 0];
+        machines::save(&root.0, "indy", &mut cfg).unwrap();
+        prefs.save().unwrap();
+        let reloaded = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert_eq!(reloaded.machines["indy"].banks, [8, 8, 0, 0]);
+        assert_eq!(std::fs::read_to_string(root.0.join("gui.json.pre-toml.bak")).unwrap(), original_text);
+    }
+
+    #[test]
+    fn failed_migration_leaves_original_json_intact() {
+        let root = TempRoot::new("failed");
+        // A non-directory machines entry forces a real filesystem failure.
+        std::fs::write(root.0.join("machines"), b"occupied").unwrap();
+        let text = serde_json::json!({"machines": {"indy": MachineConfig::default()}, "active_machine": "indy"}).to_string();
+        std::fs::write(root.0.join("gui.json"), &text).unwrap();
+        let mut prefs = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert!(prefs.migration_pending);
+        assert!(prefs.save().is_err());
+        assert_eq!(std::fs::read_to_string(root.0.join("gui.json")).unwrap(), text);
+        assert_eq!(std::fs::read_to_string(root.0.join("gui.json.pre-toml.bak")).unwrap(), text);
+    }
+
+    #[test]
+    fn corrupt_preferences_are_reported_and_never_overwritten() {
+        let root = TempRoot::new("corrupt");
+        std::fs::write(root.0.join("gui.json"), "{ invalid json").unwrap();
+        let mut prefs = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert!(!prefs.errors.is_empty());
+        assert!(prefs.save().is_err());
+        assert_eq!(std::fs::read_to_string(root.0.join("gui.json")).unwrap(), "{ invalid json");
+    }
+
+    #[test]
+    fn legacy_toml_pointer_migrates_once_and_preserves_source_file() {
+        let root = TempRoot::new("legacy-toml");
+        let source = root.0.join("old.toml");
+        std::fs::write(&source, "banks = [8, 8, 0, 0]").unwrap();
+        std::fs::write(root.0.join("gui.json"), serde_json::json!({"last_config": source}).to_string()).unwrap();
+        let prefs = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert!(prefs.errors.is_empty(), "{:?}", prefs.errors);
+        assert_eq!(prefs.active_machine.as_deref(), Some("old"));
+        assert_eq!(prefs.machines["old"].banks, [8, 8, 0, 0]);
+        assert!(prefs.last_config.is_none());
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "banks = [8, 8, 0, 0]");
+        assert_eq!(GuiSettings::load_in(root.0.clone(), &root.0).machines.len(), 1);
+    }
+
+    #[test]
+    fn legacy_names_that_are_not_filenames_migrate_deterministically() {
+        let root = TempRoot::new("old-name");
+        let old_name = "IRIX / 6.5";
+        std::fs::write(root.0.join("gui.json"), serde_json::json!({
+            "machines": {old_name: MachineConfig::default()}, "active_machine": old_name
+        }).to_string()).unwrap();
+        let prefs = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert!(prefs.errors.is_empty(), "{:?}", prefs.errors);
+        let name = machines::legacy_name(old_name);
+        machines::validate_name(&name).unwrap();
+        assert_eq!(prefs.active_machine.as_deref(), Some(name.as_str()));
+        assert!(prefs.machine_path(&name).unwrap().exists());
+        assert_eq!(GuiSettings::load_in(root.0.clone(), &root.0).machines.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_roots_with_symlinked_parents_use_the_actual_working_directory_base() {
+        let temp = TempRoot::new("symlink-root");
+        let actual = temp.0.join("actual");
+        std::fs::create_dir_all(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, temp.0.join("alias")).unwrap();
+        let mut prefs = GuiSettings::load_in(temp.0.join("alias/iris"), &temp.0);
+        assert_eq!(prefs.root().unwrap(), actual.join("iris"));
+        let disk = temp.0.join("external.raw");
+        std::fs::write(&disk, b"external disk").unwrap();
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.get_mut(&1).unwrap().path = disk.to_string_lossy().into_owned();
+        prefs.save_machine("indy", &mut cfg).unwrap();
+        let dir = prefs.machine_dir("indy").unwrap();
+        assert_eq!(std::fs::read(dir.join(&cfg.scsi[&1].path)).unwrap(), b"external disk");
+    }
+
+    #[test]
+    fn folder_discovery_does_not_need_gui_json_and_names_reserve_retained_data() {
+        let root = TempRoot::new("no-json");
+        let mut cfg = MachineConfig::default();
+        machines::save(&root.0, "indy", &mut cfg).unwrap();
+        let prefs = GuiSettings::load_in(root.0.clone(), &root.0);
+        assert!(prefs.machines.contains_key("indy"));
+        assert_eq!(prefs.ui_scale, UI_SCALE_DEFAULT);
+        assert_eq!(prefs.vm_scale, VM_SCALE_DEFAULT);
+        assert_eq!(prefs.unique_name("indy"), "indy-2");
+        std::fs::create_dir_all(root.0.join("machines/indy-2/disks")).unwrap();
+        assert_eq!(prefs.unique_name("indy"), "indy-3");
+    }
 }

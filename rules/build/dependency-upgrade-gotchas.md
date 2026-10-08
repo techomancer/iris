@@ -70,8 +70,9 @@ old `default-features = false` config never had an equivalent either.
 
 - **`dirs` 5 → 6 does not move any user data.** `config_dir()` and `data_dir()`
   are byte-identical in both versions on Linux (XDG), macOS (Application
-  Support), and Windows (Roaming AppData). iris-gui's `gui.json` machine store
-  and `iris-gui.pid` stay exactly where they were; no migration needed.
+  Support), and Windows (Roaming AppData). iris-gui's `gui.json` preferences
+  and `iris-gui.pid` stay where they were; the dirs upgrade needs no migration.
+  Machine TOML folders are a separate GUI storage change.
 - **`bitfield` 0.14 → 0.19 is a clean drop-in** despite five major versions.
   All eight `bitfield! { ... }` blocks (rex3, vc2, mips_cache_v2, hal2,
   saa7191, mips_exec) compile untouched.

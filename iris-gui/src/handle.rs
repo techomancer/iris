@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 #[derive(Debug)]
@@ -143,6 +144,8 @@ fn net_state_for(running: bool, halted: bool, net_seen: u64) -> NetState {
 
 pub struct EmulatorHandle {
     cmd_tx: Sender<Cmd>,
+    pending_commands: Arc<AtomicUsize>,
+    abandoned_machine: Arc<AtomicBool>,
     evt_rx: Receiver<Evt>,
     thread: Option<JoinHandle<()>>,
     /// Shared latest-framebuffer slot, written by the CaptureRenderer
@@ -164,6 +167,10 @@ pub struct EmulatorHandle {
 impl EmulatorHandle {
     pub fn spawn() -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
+        let pending_commands = Arc::new(AtomicUsize::new(0));
+        let pending_for_worker = pending_commands.clone();
+        let abandoned_machine = Arc::new(AtomicBool::new(false));
+        let abandoned_for_worker = abandoned_machine.clone();
         let (evt_tx, evt_rx) = unbounded::<Evt>();
         let frame_sink = FrameSink::new();
         let frame_sink_head1 = FrameSink::new();
@@ -181,10 +188,12 @@ impl EmulatorHandle {
             // worker generous headroom. This is virtual address space, lazily
             // committed, so the large reservation has no real cost.
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, sink_head1_for_worker, ps2_for_worker))
+            .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, sink_head1_for_worker, ps2_for_worker, pending_for_worker, abandoned_for_worker))
             .expect("spawn iris-gui-emu thread");
         Self {
             cmd_tx,
+            pending_commands,
+            abandoned_machine,
             evt_rx,
             thread: Some(thread),
             frame_sink,
@@ -196,7 +205,8 @@ impl EmulatorHandle {
     }
 
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.send(cmd);
+        self.pending_commands.fetch_add(1, Ordering::AcqRel);
+        if self.cmd_tx.send(cmd).is_err() { self.pending_commands.fetch_sub(1, Ordering::Release); }
     }
 
     /// Drain pending events; return them for the UI to consume.
@@ -246,6 +256,14 @@ impl EmulatorHandle {
 
     pub fn is_running(&self) -> bool { self.status.running }
 
+    /// Directory changes must wait for queued Start, Stop, snapshot, and disk
+    /// operations as well as a live machine. Unconsumed events can include a
+    /// Started notification, so check those before trusting the cached status.
+    pub fn can_change_directory(&self) -> bool {
+        !self.is_running() && self.pending_commands.load(Ordering::Acquire) == 0
+            && self.evt_rx.is_empty() && !self.abandoned_machine.load(Ordering::Acquire)
+    }
+
     /// Whether a clean exit needs a "Synchronizing disks" step (a CHD has
     /// diff-borne changes to fold back into its base). Latest reported status.
     pub fn has_pending_chd_sync(&self) -> bool { self.status.chd_sync_pending }
@@ -270,7 +288,7 @@ impl EmulatorHandle {
     /// The worker's Quit handler bounds the stop with a timeout, so this can't
     /// hang on a wedged guest.
     pub fn shutdown(&mut self) {
-        let _ = self.cmd_tx.send(Cmd::Quit);
+        self.send(Cmd::Quit);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -312,6 +330,8 @@ fn worker_loop(
     frame_sink: FrameSink,
     frame_sink_head1: FrameSink,
     ps2_slot: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
+    pending_commands: Arc<AtomicUsize>,
+    abandoned_machine: Arc<AtomicBool>,
 ) {
     let mut machine: Option<Box<Machine>> = None;
     // Live MIPS estimate: read REX3's free-running cycle counter and divide
@@ -328,7 +348,10 @@ fn worker_loop(
     // Tick cadence for the status poll while idle on the command channel.
     const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(500);
     loop {
-        match cmd_rx.recv_timeout(STATUS_TICK) {
+        let command = cmd_rx.recv_timeout(STATUS_TICK);
+        // RAII covers all early continues and returns in command handlers.
+        let _in_flight = command.as_ref().ok().map(|_| CommandInFlight(&pending_commands));
+        match command {
             // Periodic tick (no command pending): refresh the MIPS estimate.
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if let Some(c) = cycles {
@@ -466,6 +489,7 @@ fn worker_loop(
                     // Always report the machine as stopped so the user regains
                     // control, even if the stop failed or had to be abandoned.
                     if let Err(msg) = stop_machine_timed(m) {
+                        abandoned_machine.store(true, Ordering::Release);
                         let _ = evt_tx.send(Evt::Error(msg));
                     }
                     let _ = evt_tx.send(Evt::Stopped);
@@ -676,6 +700,11 @@ fn worker_loop(
     }
 }
 
+struct CommandInFlight<'a>(&'a AtomicUsize);
+impl Drop for CommandInFlight<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Release); }
+}
+
 /// Stop a machine, but never block longer than `STOP_TIMEOUT`. `Machine::stop()`
 /// starts with `cpu.stop()`, which waits for the CPU thread to acknowledge the
 /// halt; a wedged guest can make that never return. We run it on a detached
@@ -688,7 +717,10 @@ fn stop_machine_timed(m: Box<Machine>) -> Result<(), String> {
         .name("iris-gui-stop".into())
         .spawn(move || {
             let mut m = m;
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.stop()));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                m.stop();
+                drop(m); // Complete teardown before allowing a directory change.
+            }));
             let _ = done_tx.send(r.map_err(|p| panic_msg(&p)));
         })
         .is_err()
