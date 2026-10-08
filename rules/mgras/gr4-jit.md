@@ -26,6 +26,11 @@ an emitter.
   `band_not` on them give 0xFE/0xFF, which branch as true. That made every
   texture skip. Negate a comparison by flipping its condition code.
 
+- Colour is 12.16 fixed point end to end (`src/dev/mgras/fixed.rs`):
+  iterators, texels widened to 12 bits, 8-bit bilinear weights, the 8-bit
+  mip fraction, texture environment, fog and blending, then a shift down
+  on write. Z and S/T/W are still f64.
+
 ## Speed
 
 - Cranelift rematerialises ALU ops that take an immediate (`iadd`, `band`,

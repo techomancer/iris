@@ -31,6 +31,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **IMPACT colour pipeline in 12.16 fixed point.** Colour iterators,
+  texel filtering (texels widened to 12 bits, 8-bit bilinear and mip
+  weights), the texture environment, fog and blending now compute in
+  integers, as the RE4/TE1 do, and shift down to the pixel's size on
+  write. Half-alpha blends now give 0x7F where they gave 0x80. With
+  `gr4-jit`, bilinear-textured triangles draw 5x faster than the
+  interpreter, up from 3x.
 - **IMPACT raster JIT (`gr4-jit`).** The registers that shape an IMPACT
   primitive's pixel pipeline reduce to a 64-bit key, and Cranelift compiles
   one shader per key. It covers fills, X lines, character stipple, transfer

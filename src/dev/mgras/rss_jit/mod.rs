@@ -184,7 +184,8 @@ pub struct CommonCtx {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct GlCtx {
-    pub aref: f64,
+    /// Alpha reference, 12.16.
+    pub aref: i32,
     pub sref: u32,
     pub scmask: u32,
     pub swmask: u32,
@@ -198,10 +199,10 @@ pub struct GlCtx {
     /// Shared-page offsets by log2 of a level's larger side (0 above 16).
     pub small_off: [u32; 16],
     pub small_boff: [u32; 16],
-    /// Texture environment colour and alpha; fog colour.
-    pub env_c: [f64; 3],
-    pub env_a: f64,
-    pub fog_c: [f64; 3],
+    /// Texture environment colour and alpha; fog colour (12.16).
+    pub env_c: [i32; 3],
+    pub env_a: i32,
+    pub fog_c: [i32; 3],
 }
 
 /// Everything a shader reads that is not in its key: one per board
@@ -365,7 +366,7 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
     k.rgb = rss.rgb_mode();
     let af = rss.reg(reg::AFUNCMODE);
     k.alpha = (af & rss::TEST_ENABLE != 0).then_some((af & 7) as u8);
-    c.aref = ((af >> 4) & 0xFFF) as f64 / 4096.0;
+    c.aref = (((af >> 4) & 0xFFF) << 16) as i32;
     let st = rss.reg(reg::STENCILMODE);
     k.stencil = (st & rss::TEST_ENABLE != 0).then_some(Stencil {
         func: (st & 7) as u8,
@@ -411,14 +412,14 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
                 c.small_boff[l] = te1::small_border_offset(n) as u32;
             }
         }
-        let e = |v: u32| (v & 0xFFF) as f64 / 4095.0;
+        let e = super::fixed::field12;
         let (rg, b) = (rss.reg(te_reg::TXENV_RG), rss.reg(te_reg::TXENV_B));
         c.env_c = [e(rg), e(rg >> 12), e(b)];
         c.env_a = e(b >> 12);
     }
     k.fog = rss.reg(reg::FOG_ON) != 0;
     if k.fog {
-        let f = |v: u32| (v & 0xFFF) as f64 / 4095.0;
+        let f = super::fixed::field12;
         let (rg, b) = (rss.reg(reg::FOG_RG), rss.reg(reg::FOG_B));
         c.fog_c = [f(rg), f(rg >> 12), f(b)];
     }

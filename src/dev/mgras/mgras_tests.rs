@@ -710,12 +710,13 @@ fn gl_blend_src_alpha_over_the_clear_colour() {
     gl_color4(&m, [0.0, 0.0, 1.0, 0.5]);
     gl_full_quad(&m);
     let p = gl_px(&m, 200, 150);
-    assert_eq!((p & 0xFF, (p >> 8) & 0xFF, p >> 16), (0x80, 0, 0x80), "{p:#x}");
+    // Half of each in 12.16, shifted down to a byte: 0x7F (truncated).
+    assert_eq!((p & 0xFF, (p >> 8) & 0xFF, p >> 16), (0x7F, 0, 0x7F), "{p:#x}");
     // ONE, ONE adds.
     fifo_token(&m, 0x3F, &[1, 1]);
     gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
     gl_full_quad(&m);
-    assert_eq!(gl_px(&m, 200, 150), 0x80_FF80);
+    assert_eq!(gl_px(&m, 200, 150), 0x7F_FF7F);
     m.stop_engines();
 }
 

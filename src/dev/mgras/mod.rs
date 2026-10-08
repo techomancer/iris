@@ -35,6 +35,7 @@
 //! thread scans the framebuffer out unlocked.
 
 mod dcb;
+mod fixed;
 mod debug;
 mod disp;
 mod frame;

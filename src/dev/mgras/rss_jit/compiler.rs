@@ -12,8 +12,9 @@
 //! - `f64::clamp` and `min` let NaN through or prefer the number
 //!   (`clamp`, `min_num`); `fmin`/`fmax` propagate NaN.
 //! - The level of detail is `te1::lod` emitted inline (sqrt and a cubic
-//!   log2, no libm); component and byte scaling come from tables filled
-//!   by the interpreter's divisions. Shaders make no calls.
+//!   log2, no libm). Shaders make no calls.
+//! - Colour, from the iterators through texturing, fog and blending, is
+//!   12.16 fixed point (`mgras::fixed`), integer code on both sides.
 //!
 //! What the key fixes is decided here, at compile time; what the context
 //! holds is loaded once, in the entry block, and stays in registers.
@@ -36,32 +37,13 @@ use cranelift_module::{Linkage, Module};
 use super::{ClipRect, Draw, PipeKey, Pix, Prim, RasterCtx, ShaderFn, Target, Tex, XFmt};
 use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
+use crate::dev::mgras::fixed;
 use crate::dev::mgras::te1::{PAGE_NIBBLES, TRAM_NIBBLES};
 
 macro_rules! off {
     ($($f:tt)+) => {
         offset_of!(RasterCtx, $($f)+) as i32
     };
-}
-
-/// Component values as `Te1::component` computes them, by depth in
-/// nibbles: `v as f32 / (2^(4d) - 1) as f32`, the very division, done once.
-/// A load instead of a division per component.
-fn comp_table(d: usize) -> &'static [f32] {
-    static T: std::sync::OnceLock<[Vec<f32>; 3]> = std::sync::OnceLock::new();
-    let t = T.get_or_init(|| {
-        [1usize, 2, 3].map(|d| {
-            let n = 1u32 << (4 * d);
-            (0..n).map(|v| v as f32 / (n - 1) as f32).collect()
-        })
-    });
-    &t[d - 1]
-}
-
-/// A destination byte as `Rss::fragment_color` reads it: `v as f64 / 255.0`.
-fn byte_table() -> &'static [f64; 256] {
-    static T: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| std::array::from_fn(|v| v as f64 / 255.0))
 }
 
 pub struct Compiler {
@@ -243,19 +225,20 @@ impl<'a> E<'a> {
         };
         let mut invs = std::collections::HashMap::new();
         if k.prim.is_gl() {
-            let mut f64s = vec![off!(gl.aref), off!(gl.smp_w), off!(gl.smp_h), off!(gl.env_a)];
-            f64s.extend((0..3).map(|k| off!(gl.env_c) + 8 * k));
-            f64s.extend((0..3).map(|k| off!(gl.fog_c) + 8 * k));
-            for o in f64s {
+            for o in [off!(gl.smp_w), off!(gl.smp_h)] {
                 invs.insert(o, ld(&mut b, F64, o));
             }
-            for o in [off!(gl.sref), off!(gl.scmask), off!(gl.swmask), off!(gl.smp.max_level), off!(gl.smp.ls), off!(gl.smp.lt)] {
+            let mut i32s = vec![off!(gl.aref), off!(gl.env_a), off!(gl.sref), off!(gl.scmask), off!(gl.swmask)];
+            i32s.extend([off!(gl.smp.max_level), off!(gl.smp.ls), off!(gl.smp.lt)]);
+            i32s.extend((0..3).map(|k| off!(gl.env_c) + 4 * k));
+            i32s.extend((0..3).map(|k| off!(gl.fog_c) + 4 * k));
+            for o in i32s {
                 invs.insert(o, ld(&mut b, I32, o));
             }
             invs.insert(off!(gl.zmask), ld(&mut b, I64, off!(gl.zmask)));
             for k in 0..4 {
                 let o = off!(gl.smp.border_color) + 4 * k;
-                invs.insert(o, ld(&mut b, F32, o));
+                invs.insert(o, ld(&mut b, I32, o));
             }
         }
         E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles }
@@ -1050,6 +1033,11 @@ impl<'a> E<'a> {
 
     // ── GL primitives ────────────────────────────────────────────────────
 
+    /// A 12.16 plane (three i32s).
+    fn iplane(&mut self, base: i32) -> [Value; 3] {
+        [self.ld(I32, base), self.ld(I32, base + 4), self.ld(I32, base + 8)]
+    }
+
     fn plane(&mut self, base: i32) -> [Value; 3] {
         [self.ld(F64, base), self.ld(F64, base + 8), self.ld(F64, base + 16)]
     }
@@ -1086,11 +1074,12 @@ impl<'a> E<'a> {
         let (x0, x1, x2) = (t!(x0), t!(x1), t!(x2));
         let (ymid, yref, yref2) = (t!(ymid), t!(yref), t!(yref2));
         let (s0, s1, s2, xs) = (t!(s0), t!(s1), t!(s2), t!(xs));
-        let planes: Vec<[Value; 3]> = (0..4).map(|c| self.plane(off!(tri.planes) + 24 * c)).collect();
+        let cplanes: Vec<[Value; 3]> = (0..4).map(|c| self.iplane(off!(tri.cplanes) + 12 * c)).collect();
+        let (xs_i, yref_i) = (self.ld(I32, off!(tri.xs_i)), self.ld(I32, off!(tri.yref_i)));
         let zplane = self.plane(off!(tri.zplane));
         let tplanes: Vec<[Value; 3]> =
             if k.tex.is_some() { (0..3).map(|c| self.plane(off!(tri.tplanes) + 24 * c)).collect() } else { Vec::new() };
-        let fplane = k.fog.then(|| self.plane(off!(tri.fplane)));
+        let fogp = k.fog.then(|| self.iplane(off!(tri.fogp)));
         let ltor = self.ld(I32, off!(tri.ltor));
         let ltor = self.b.ins().icmp_imm_s(IntCC::NotEqual, ltor, 0);
         let (j0, j1) = (self.ld(I32, off!(tri.j0)), self.ld(I32, off!(tri.j1)));
@@ -1105,9 +1094,16 @@ impl<'a> E<'a> {
             let half = e.f64c(0.5);
             let yc = e.b.ins().fadd(jf, half);
             let dy = e.b.ins().fsub(yref, yc);
-            // The rows's share of the colour and depth planes, once a row.
-            let terms: Vec<Value> = planes.iter().chain(std::iter::once(&zplane)).map(|p| e.b.ins().fmul(p[2], dy)).collect();
+            // The row's share of the colour, fog and depth planes, once a
+            // row: colours `p0 + p2 (yref - j)` (12.16), depth `p2 dy`.
+            let dj = e.b.ins().isub(yref_i, j);
+            let mut terms: Vec<Value> = cplanes.iter().chain(fogp.iter()).map(|p| {
+                let m = e.b.ins().imul(p[2], dj);
+                e.b.ins().iadd(p[0], m)
+            }).collect();
+            terms.push(e.b.ins().fmul(zplane[2], dy));
             let terms = e.pin(&terms);
+            let zterm = *terms.last().unwrap();
             let m = e.b.ins().fmul(s0, dy);
             let major = e.b.ins().fadd(x0, m);
             let m1 = e.b.ins().fmul(s1, dy);
@@ -1148,10 +1144,15 @@ impl<'a> E<'a> {
                 let xc = e.b.ins().fadd(xf, half);
                 let dx = e.b.ins().fsub(xc, xs);
                 let at = At::Tri { dx, dy };
+                let di = e.b.ins().isub(i, xs_i);
+                let fixed_at = |e: &mut Self, p: &[Value; 3], row: Value| {
+                    let m = e.b.ins().imul(p[1], di);
+                    e.b.ins().iadd(row, m)
+                };
                 let rgba: Vec<Variable> = (0..4)
                     .map(|c| {
-                        let v = e.at_row(&planes[c], at, Some(terms[c]));
-                        e.var(F64, v)
+                        let v = fixed_at(e, &cplanes[c], terms[c]);
+                        e.var(I32, v)
                     })
                     .collect();
                 let rgba: [Variable; 4] = rgba.try_into().unwrap();
@@ -1160,11 +1161,11 @@ impl<'a> E<'a> {
                     e.textured(&tp, at, rgba);
                 }
                 let mut c: [Value; 4] = rgba.map(|v| e.get(v));
-                if let Some(fp) = fplane {
-                    let f = e.at(&fp, at);
+                if let Some(fp) = fogp {
+                    let f = fixed_at(e, &fp, terms[4]);
                     c = e.fogged(c, f);
                 }
-                let z = e.at_row(&zplane, at, Some(terms[4]));
+                let z = e.at_row(&zplane, at, Some(zterm));
                 let fx = e.b.ins().iadd(e.ox, i);
                 e.fragment(&span, fx, c, z, cont);
             });
@@ -1179,19 +1180,20 @@ impl<'a> E<'a> {
                 self.ld($t, off!(gll.$($f)+))
             };
         }
-        let c0: Vec<Value> = (0..4).map(|c| self.ld(F64, off!(gll.c0) + 8 * c)).collect();
-        let dc: Vec<Value> = (0..4).map(|c| self.ld(F64, off!(gll.dc) + 8 * c)).collect();
+        let cbase: Vec<Value> = (0..4).map(|c| self.ld(I32, off!(gll.cbase) + 4 * c)).collect();
+        let cstep: Vec<Value> = (0..4).map(|c| self.ld(I32, off!(gll.cstep) + 4 * c)).collect();
         let (z0, dz) = (g!(F64, z0), g!(F64, dz));
         let tplanes: Vec<[Value; 3]> =
             if k.tex.is_some() { (0..3).map(|c| self.plane(off!(gll.tplanes) + 24 * c)).collect() } else { Vec::new() };
-        let (f0, df) = (g!(F64, f0), g!(F64, df));
+        let (fbase, fstep) = (g!(I32, fbase), g!(I32, fstep));
         let (a0, b0, slope) = (g!(F64, a0), g!(F64, b0), g!(F64, slope));
         let (width, dir, p0, p1) = (g!(I32, width), g!(I32, dir), g!(I32, p0), g!(I32, p1));
         let xmajor = g!(I32, xmajor);
         let xmajor = self.b.ins().icmp_imm_s(IntCC::NotEqual, xmajor, 0);
         let (pattern, repeat) = (g!(I32, pattern), g!(I32, repeat));
         let pos0 = self.ld_rw(I32, off!(stipple_pos));
-        let (pv, posv) = (self.var(I32, p0), self.var(I32, pos0));
+        let zero = self.i32c(0);
+        let (pv, posv, kv) = (self.var(I32, p0), self.var(I32, pos0), self.var(I32, zero));
         let head = self.b.create_block();
         let next = self.b.create_block();
         let exit = self.b.create_block();
@@ -1225,11 +1227,13 @@ impl<'a> E<'a> {
         let q = self.b.ins().fadd(q, half);
         let q = self.b.ins().floor(q);
         let q0 = self.b.ins().fcvt_to_sint_sat(I32, q);
+        // Colours and fog `base + step k`, k pixels along (12.16).
+        let kk = self.get(kv);
         let rgba: Vec<Variable> = (0..4)
             .map(|c| {
-                let m = self.b.ins().fmul(dc[c], t);
-                let v = self.b.ins().fadd(c0[c], m);
-                self.var(F64, v)
+                let m = self.b.ins().imul(cstep[c], kk);
+                let v = self.b.ins().iadd(cbase[c], m);
+                self.var(I32, v)
             })
             .collect();
         let rgba: [Variable; 4] = rgba.try_into().unwrap();
@@ -1239,8 +1243,8 @@ impl<'a> E<'a> {
         }
         let mut c: [Value; 4] = rgba.map(|v| self.get(v));
         if k.fog {
-            let m = self.b.ins().fmul(df, t);
-            let f = self.b.ins().fadd(f0, m);
+            let m = self.b.ins().imul(fstep, kk);
+            let f = self.b.ins().iadd(fbase, m);
             c = self.fogged(c, f);
         }
         let m = self.b.ins().fmul(dz, t);
@@ -1259,6 +1263,9 @@ impl<'a> E<'a> {
         let p = self.get(pv);
         let p = self.b.ins().iadd(p, dir);
         self.set(pv, p);
+        let kk = self.get(kv);
+        let kk = self.b.ins().iadd_imm_s(kk, 1);
+        self.set(kv, kk);
         self.b.ins().jump(head, &[]);
         self.b.seal_block(head);
         self.b.switch_to_block(exit);
@@ -1267,17 +1274,44 @@ impl<'a> E<'a> {
         self.st(pos, off!(stipple_pos));
     }
 
+    // ── 12.16 colour arithmetic (`mgras::fixed`) ─────────────────────────
+
+    /// `fixed::mul`.
+    fn fmul16(&mut self, a: Value, b: Value) -> Value {
+        let a = self.b.ins().sextend(I64, a);
+        let b = self.b.ins().sextend(I64, b);
+        let p = self.b.ins().imul(a, b);
+        let p = self.b.ins().sshr_imm_s(p, 28);
+        self.b.ins().ireduce(I32, p)
+    }
+
+    /// `fixed::clamp`.
+    fn fclamp16(&mut self, v: Value) -> Value {
+        let zero = self.i32c(0);
+        let v = self.b.ins().smax(v, zero);
+        let max = self.i32c(fixed::MAX as i64);
+        self.b.ins().smin(v, max)
+    }
+
+    /// `fixed::ONE - v`.
+    fn fone_minus(&mut self, v: Value) -> Value {
+        let one = self.i32c(fixed::ONE as i64);
+        self.b.ins().isub(one, v)
+    }
+
     /// `Rss::fogged`.
     fn fogged(&mut self, rgba: [Value; 4], f: Value) -> [Value; 4] {
-        let f = self.clamp01(f);
-        let one = self.f64c(1.0);
-        let nf = self.b.ins().fsub(one, f);
+        let zero = self.i32c(0);
+        let one = self.i32c(fixed::ONE as i64);
+        let f = self.b.ins().smax(f, zero);
+        let f = self.b.ins().smin(f, one);
+        let nf = self.b.ins().isub(one, f);
         let mut out = rgba;
         for (k, o) in out.iter_mut().enumerate().take(3) {
-            let fc = self.inv(off!(gl.fog_c) + 8 * k as i32);
-            let a = self.b.ins().fmul(f, rgba[k]);
-            let b = self.b.ins().fmul(nf, fc);
-            *o = self.b.ins().fadd(a, b);
+            let fc = self.inv(off!(gl.fog_c) + 4 * k as i32);
+            let a = self.fmul16(f, rgba[k]);
+            let b = self.fmul16(nf, fc);
+            *o = self.b.ins().iadd(a, b);
         }
         out
     }
@@ -1287,10 +1321,11 @@ impl<'a> E<'a> {
     fn fragment(&mut self, r: &Row, fx: Value, rgba: [Value; 4], z: Value, kill: Block) {
         let k = self.k;
         self.visible_x(r, fx, kill);
-        let rgba = rgba.map(|c| self.clamp01(c));
+        let rgba = rgba.map(|c| self.fclamp16(c));
         if let Some(func) = k.alpha {
+            // Both non-negative 12.16.
             let aref = self.inv(off!(gl.aref));
-            let pass = self.fcompare(func, rgba[3], aref);
+            let pass = self.icompare(func, rgba[3], aref);
             self.need(pass, kill);
         }
         if k.stencil.is_some() || k.z.is_some() {
@@ -1379,7 +1414,7 @@ impl<'a> E<'a> {
         }
     }
 
-    /// `Rss::fragment_color`.
+    /// `Rss::fragment_color`: blend (12.16) or not, shift down, write.
     fn fragment_color(&mut self, r: &Row, t: usize, x: Value, rgba: [Value; 4]) {
         let k = self.k;
         let src = if k.rgb {
@@ -1389,73 +1424,58 @@ impl<'a> E<'a> {
                     let (a, sh) = self.locate_x(r.tgt[t], x, overlay);
                     let dst = self.get_px(a, sh);
                     let dst = self.b.ins().ireduce(I32, dst);
-                    // `dst >> 24` is a byte too: dst is at most 32 bits.
-                    let table = self.b.ins().iconst(I64, byte_table().as_ptr() as i64);
+                    // Destination bytes widened to 12 bits, 12.16.
                     let d: Vec<Value> = (0..4)
                         .map(|c| {
                             let v = self.b.ins().ushr_imm_s(dst, 8 * c);
                             let v = self.b.ins().band_imm_s(v, 0xFF);
-                            let v = self.b.ins().uextend(I64, v);
-                            let off = self.b.ins().ishl_imm_s(v, 3);
-                            let a = self.b.ins().iadd(table, off);
-                            self.b.ins().load(F64, self.mr, a, 0)
+                            let hi = self.b.ins().ishl_imm_s(v, 4);
+                            let lo = self.b.ins().ushr_imm_s(v, 4);
+                            let w = self.b.ins().bor(hi, lo);
+                            self.b.ins().ishl_imm_s(w, 16)
                         })
                         .collect();
-                    let one = self.f64c(1.0);
-                    let nd3 = self.b.ins().fsub(one, d[3]);
-                    let sat = self.min_num(rgba[3], nd3);
+                    let nd3 = self.fone_minus(d[3]);
+                    let sat = self.b.ins().smin(rgba[3], nd3);
                     let mut out = [rgba[0]; 4];
                     for (kk, o) in out.iter_mut().enumerate() {
                         let f = |e: &mut Self, code: u8| -> Value {
-                            let one = e.f64c(1.0);
                             match code {
-                                0 => e.f64c(0.0),
-                                1 => one,
+                                0 => e.i32c(0),
                                 2 => rgba[kk],
-                                3 => e.b.ins().fsub(one, rgba[kk]),
+                                3 => e.fone_minus(rgba[kk]),
                                 4 => rgba[3],
-                                5 => e.b.ins().fsub(one, rgba[3]),
+                                5 => e.fone_minus(rgba[3]),
                                 6 => d[3],
-                                7 => e.b.ins().fsub(one, d[3]),
+                                7 => e.fone_minus(d[3]),
                                 8 => d[kk],
-                                9 => e.b.ins().fsub(one, d[kk]),
-                                10 => {
-                                    if kk == 3 {
-                                        one
-                                    } else {
-                                        sat
-                                    }
-                                }
-                                _ => one,
+                                9 => e.fone_minus(d[kk]),
+                                10 if kk != 3 => sat,
+                                _ => e.i32c(fixed::ONE as i64),
                             }
                         };
                         let fs = f(self, bl.src);
                         let fd = f(self, bl.dst);
-                        let a = self.b.ins().fmul(rgba[kk], fs);
-                        let b = self.b.ins().fmul(d[kk], fd);
-                        let s = self.b.ins().fadd(a, b);
-                        *o = self.clamp01(s);
+                        let a = self.fmul16(rgba[kk], fs);
+                        let b = self.fmul16(d[kk], fd);
+                        let s = self.b.ins().iadd(a, b);
+                        *o = self.fclamp16(s);
                     }
                     out
                 }
                 None => rgba,
             };
+            // Clamped 12.16 shifted down to bytes (`fixed::to_byte`).
             let mut src = self.i32c(0);
             for (kk, v) in c.iter().enumerate() {
-                // Clamped to [0, 1] (or NaN): non-negative, in i32 range.
-                let c255 = self.f64c(255.0);
-                let m = self.b.ins().fmul(*v, c255);
-                let r = self.round_nonneg(m);
-                let q = self.b.ins().fcvt_to_sint_sat(I32, r);
+                let q = self.b.ins().ushr_imm_s(*v, 20);
                 let q = if kk > 0 { self.b.ins().ishl_imm_s(q, 8 * kk as i64) } else { q };
                 src = self.b.ins().bor(src, q);
             }
             src
         } else {
-            let c = self.f64c(4095.0);
-            let m = self.b.ins().fmul(rgba[0], c);
-            let r = self.round_nonneg(m);
-            let q = self.b.ins().fcvt_to_sint_sat(I32, r);
+            // `fixed::to_index`.
+            let q = self.b.ins().ushr_imm_s(rgba[0], 16);
             self.b.ins().band_imm_s(q, 0xFFF)
         };
         self.put_in(r, t, x, src);
@@ -1569,9 +1589,8 @@ impl<'a> E<'a> {
         self.b.ins().fadd(e, p)
     }
 
-    /// `te1::tex_env`.
-    fn tex_env(&mut self, tex: &Tex, f: [Value; 4], texel: [Value; 4]) -> [Value; 4] {
-        let tx = texel.map(|c| self.b.ins().fpromote(F64, c));
+    /// `te1::tex_env`, 12.16.
+    fn tex_env(&mut self, tex: &Tex, f: [Value; 4], tx: [Value; 4]) -> [Value; 4] {
         let nc = tex.nc;
         let (ct, at): (Option<[Value; 3]>, Option<Value>) = match tex.class {
             1 => (None, Some(tx[0])),
@@ -1580,55 +1599,52 @@ impl<'a> E<'a> {
             _ if nc >= 3 => (Some([tx[0], tx[1], tx[2]]), (nc == 4).then_some(tx[3])),
             _ => (Some([tx[0]; 3]), (nc == 2).then_some(tx[1])),
         };
-        let one = self.f64c(1.0);
         let mut out = f;
+        // `a (1 - w) + b w`
+        let lerp = |e: &mut Self, a: Value, b: Value, w: Value| {
+            let nw = e.fone_minus(w);
+            let x = e.fmul16(a, nw);
+            let y = e.fmul16(b, w);
+            e.b.ins().iadd(x, y)
+        };
         match tex.env & 3 {
             1 => {
                 if let Some(ct) = ct {
-                    let a = at.unwrap_or(one);
-                    let na = self.b.ins().fsub(one, a);
+                    let a = at.unwrap_or_else(|| self.i32c(fixed::ONE as i64));
                     for k in 0..3 {
-                        let x = self.b.ins().fmul(f[k], na);
-                        let y = self.b.ins().fmul(ct[k], a);
-                        out[k] = self.b.ins().fadd(x, y);
+                        out[k] = lerp(self, f[k], ct[k], a);
                     }
                 }
             }
             2 => {
                 if let Some(ct) = ct {
                     for k in 0..3 {
-                        let cc = self.inv(off!(gl.env_c) + 8 * k as i32);
-                        let n = self.b.ins().fsub(one, ct[k]);
-                        let x = self.b.ins().fmul(f[k], n);
-                        let y = self.b.ins().fmul(cc, ct[k]);
-                        out[k] = self.b.ins().fadd(x, y);
+                        let cc = self.inv(off!(gl.env_c) + 4 * k as i32);
+                        out[k] = lerp(self, f[k], cc, ct[k]);
                     }
                 }
                 if let Some(at) = at {
                     out[3] = if tex.class == 3 {
                         let ac = self.inv(off!(gl.env_a));
-                        let n = self.b.ins().fsub(one, at);
-                        let x = self.b.ins().fmul(f[3], n);
-                        let y = self.b.ins().fmul(ac, at);
-                        self.b.ins().fadd(x, y)
+                        lerp(self, f[3], ac, at)
                     } else {
-                        self.b.ins().fmul(f[3], at)
+                        self.fmul16(f[3], at)
                     };
                 }
             }
             3 => {
                 if let Some(at) = at {
-                    out[3] = self.b.ins().fmul(f[3], at);
+                    out[3] = self.fmul16(f[3], at);
                 }
             }
             _ => {
                 if let Some(ct) = ct {
                     for k in 0..3 {
-                        out[k] = self.b.ins().fmul(f[k], ct[k]);
+                        out[k] = self.fmul16(f[k], ct[k]);
                     }
                 }
                 if let Some(at) = at {
-                    out[3] = self.b.ins().fmul(f[3], at);
+                    out[3] = self.fmul16(f[3], at);
                 }
             }
         }
@@ -1641,8 +1657,8 @@ impl<'a> E<'a> {
             let l0 = self.i32c(0);
             return self.level(tex, l0, s, t, tex.mag_linear);
         }
-        let zf = self.f32c(0.0);
-        let res: [Variable; 4] = [0, 1, 2, 3].map(|_| self.var(F32, zf));
+        let zi = self.i32c(0);
+        let res: [Variable; 4] = [0, 1, 2, 3].map(|_| self.var(I32, zi));
         let join = self.b.create_block();
         let zero = self.f64c(0.0);
         let minify = self.b.ins().fcmp(FloatCC::GreaterThan, lambda, zero);
@@ -1693,18 +1709,24 @@ impl<'a> E<'a> {
                 let one = self.f64c(1.0);
                 let l1 = self.b.ins().fadd(l0, one);
                 let l1 = self.min_num(l1, top);
+                // Between the levels by an 8-bit fraction.
                 let fr = self.b.ins().fsub(lambda, l0);
                 let fr = self.clamp01(fr);
-                let fr = self.b.ins().fdemote(F32, fr);
+                let c256 = self.f64c(256.0);
+                let fr = self.b.ins().fmul(fr, c256);
+                let fr = self.b.ins().fcvt_to_sint_sat(I64, fr);
                 let li0 = self.b.ins().fcvt_to_uint_sat(I32, l0);
                 let li1 = self.b.ins().fcvt_to_uint_sat(I32, l1);
                 let a = self.level(tex, li0, s, t, tex.min_linear);
                 let b = self.level(tex, li1, s, t, tex.min_linear);
                 let mut r = a;
                 for k in 0..4 {
-                    let d = self.b.ins().fsub(b[k], a[k]);
-                    let m = self.b.ins().fmul(d, fr);
-                    r[k] = self.b.ins().fadd(a[k], m);
+                    let d = self.b.ins().isub(b[k], a[k]);
+                    let d = self.b.ins().sextend(I64, d);
+                    let m = self.b.ins().imul(d, fr);
+                    let m = self.b.ins().sshr_imm_s(m, 8);
+                    let m = self.b.ins().ireduce(I32, m);
+                    r[k] = self.b.ins().iadd(a[k], m);
                 }
                 self.def_all(&res, r);
             }
@@ -1780,17 +1802,21 @@ impl<'a> E<'a> {
             };
             let i = cap(self, u, wi, tex.clamp_s);
             let j = cap(self, v, hi, tex.clamp_t);
-            return self.texel(tex, &geo, i, j);
+            return self.texel(tex, &geo, i, j).map(|c| self.b.ins().ishl_imm_s(c, 16));
         }
         let half = self.f64c(0.5);
         let u = self.b.ins().fsub(u, half);
         let v = self.b.ins().fsub(v, half);
         let fi = self.b.ins().floor(u);
         let fj = self.b.ins().floor(v);
+        // 8-bit weights: the four products sum to 12.16.
+        let c256 = self.f64c(256.0);
         let a = self.b.ins().fsub(u, fi);
-        let a = self.b.ins().fdemote(F32, a);
+        let a = self.b.ins().fmul(a, c256);
+        let a = self.b.ins().fcvt_to_sint_sat(I32, a);
         let b = self.b.ins().fsub(v, fj);
-        let b = self.b.ins().fdemote(F32, b);
+        let b = self.b.ins().fmul(b, c256);
+        let b = self.b.ins().fcvt_to_sint_sat(I32, b);
         let i = self.b.ins().fcvt_to_sint_sat(I64, fi);
         let j = self.b.ins().fcvt_to_sint_sat(I64, fj);
         let i1 = self.b.ins().iadd_imm_s(i, 1);
@@ -1799,22 +1825,22 @@ impl<'a> E<'a> {
         let t10 = self.texel(tex, &geo, i1, j);
         let t01 = self.texel(tex, &geo, i, j1);
         let t11 = self.texel(tex, &geo, i1, j1);
-        let one = self.f32c(1.0);
-        let na = self.b.ins().fsub(one, a);
-        let nb = self.b.ins().fsub(one, b);
-        let w00 = self.b.ins().fmul(na, nb);
-        let w10 = self.b.ins().fmul(a, nb);
-        let w01 = self.b.ins().fmul(na, b);
-        let w11 = self.b.ins().fmul(a, b);
+        let c256 = self.i32c(256);
+        let na = self.b.ins().isub(c256, a);
+        let nb = self.b.ins().isub(c256, b);
+        let w00 = self.b.ins().imul(na, nb);
+        let w10 = self.b.ins().imul(a, nb);
+        let w01 = self.b.ins().imul(na, b);
+        let w11 = self.b.ins().imul(a, b);
         let mut c = t00;
         for k in 0..4 {
-            let x = self.b.ins().fmul(w00, t00[k]);
-            let y = self.b.ins().fmul(w10, t10[k]);
-            let s = self.b.ins().fadd(x, y);
-            let z = self.b.ins().fmul(w01, t01[k]);
-            let s = self.b.ins().fadd(s, z);
-            let q = self.b.ins().fmul(w11, t11[k]);
-            c[k] = self.b.ins().fadd(s, q);
+            let x = self.b.ins().imul(w00, t00[k]);
+            let y = self.b.ins().imul(w10, t10[k]);
+            let s = self.b.ins().iadd(x, y);
+            let z = self.b.ins().imul(w01, t01[k]);
+            let s = self.b.ins().iadd(s, z);
+            let q = self.b.ins().imul(w11, t11[k]);
+            c[k] = self.b.ins().iadd(s, q);
         }
         c
     }
@@ -1904,16 +1930,23 @@ impl<'a> E<'a> {
         let le = self.mr.with_endianness(ir::Endianness::Little);
         let cell = self.b.ins().load(cty, le, p, 0);
         let cell = if cty == I64 { cell } else { self.b.ins().uextend(I64, cell) };
-        let zero = self.f32c(0.0);
+        // Components widened to 12 bits (`fixed::widen`).
+        let zero = self.i32c(0);
         let mut c = [zero; 4];
-        let table = self.b.ins().iconst(I64, comp_table(d as usize).as_ptr() as i64);
         for (k, o) in c.iter_mut().enumerate().take(nc) {
             let co = (slot + k as i64).min(3) * d;
             let v = self.b.ins().ushr_imm_s(cell, 4 * co);
             let v = self.b.ins().band_imm_s(v, (1i64 << (4 * d)) - 1);
-            let off = self.b.ins().ishl_imm_s(v, 2);
-            let a = self.b.ins().iadd(table, off);
-            *o = self.b.ins().load(F32, self.mr, a, 0);
+            let v = self.b.ins().ireduce(I32, v);
+            *o = match d {
+                1 => self.b.ins().imul_imm_s(v, 0x111),
+                2 => {
+                    let hi = self.b.ins().ishl_imm_s(v, 4);
+                    let lo = self.b.ins().ushr_imm_s(v, 4);
+                    self.b.ins().bor(hi, lo)
+                }
+                _ => v,
+            };
         }
         if let (Some(out), true) = (outside, tex.no_border) {
             for (k, o) in c.iter_mut().enumerate() {

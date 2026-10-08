@@ -22,6 +22,7 @@
 //! iterator), stipple it with character data, or move pixels in or out of it
 //! (by PIO through the character registers, or by DMA).
 
+use super::fixed;
 use super::pixmem::{Buffer, Kind, PixMem};
 use super::plain::{RegMap, Slot};
 use super::te1::{reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
@@ -700,8 +701,8 @@ pub struct Rss {
 }
 
 /// A triangle's setup (`Rss::tri_setup`): what both the interpreter and
-/// the JIT (`rss_jit`) draw it from. Planes are (value at (xs, yref),
-/// d/dx, d/(-y)).
+/// the JIT (`rss_jit`) draw it from. Float planes are (value at (xs,
+/// yref), d/dx, d/(-y)) at pixel centres.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct TriSetup {
@@ -715,10 +716,14 @@ pub(super) struct TriSetup {
     pub s1: f64,
     pub s2: f64,
     pub xs: f64,
-    pub planes: [[f64; 3]; 4],
+    /// Colour planes and the fog factor's, 12.16 (`fixed::plane`): pixel
+    /// (i, j) is `p[0] + p[1] (i - xs_i) + p[2] (yref_i - j)`.
+    pub cplanes: [[i32; 3]; 4],
+    pub fogp: [i32; 3],
+    pub xs_i: i32,
+    pub yref_i: i32,
     pub zplane: [f64; 3],
     pub tplanes: [[f64; 3]; 3],
-    pub fplane: [f64; 3],
     pub j0: i32,
     pub j1: i32,
     pub ltor: u32,
@@ -732,13 +737,15 @@ pub(super) struct TriSetup {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub(super) struct GlLineSetup {
-    pub c0: [f64; 4],
-    pub dc: [f64; 4],
+    /// Colours and the fog factor at the first pixel and their steps per
+    /// pixel, 12.16: pixel k of the line is `base + step k`, wrapping.
+    pub cbase: [i32; 4],
+    pub cstep: [i32; 4],
+    pub fbase: i32,
+    pub fstep: i32,
     pub z0: f64,
     pub dz: f64,
     pub tplanes: [[f64; 3]; 3],
-    pub f0: f64,
-    pub df: f64,
     pub a0: f64,
     pub b0: f64,
     pub slope: f64,
@@ -1311,6 +1318,7 @@ impl Rss {
         }
         let smp = (t.tex != 0).then(|| self.te.sampler(&self.regs));
         for j in t.j0..t.j1 {
+            let dj = t.yref_i.wrapping_sub(j);
             let yc = j as f64 + 0.5;
             let major = t.x0 + t.s0 * (t.yref - yc);
             let minor = if yc >= t.ymid { t.x1 + t.s1 * (t.yref - yc) } else { t.x2 + t.s2 * (t.yref2 - yc) };
@@ -1328,12 +1336,13 @@ impl Rss {
                 }
                 let xc = i as f64 + 0.5;
                 let at = |p: [f64; 3]| p[0] + p[1] * (xc - t.xs) + p[2] * (t.yref - yc);
-                let mut rgba = [at(t.planes[0]), at(t.planes[1]), at(t.planes[2]), at(t.planes[3])];
+                let di = i.wrapping_sub(t.xs_i);
+                let mut rgba = t.cplanes.map(|p| fixed::at(p, di, dj));
                 if let Some(smp) = &smp {
                     rgba = self.textured(&t.tplanes, smp, at, rgba);
                 }
                 if t.fog != 0 {
-                    rgba = self.fogged(rgba, at(t.fplane));
+                    rgba = self.fogged(rgba, fixed::at(t.fogp, di, dj));
                 }
                 self.gl_fragment(i, j, rgba, at(t.zplane));
             }
@@ -1419,10 +1428,12 @@ impl Rss {
             s1,
             s2,
             xs,
-            planes,
+            cplanes: planes.map(|p| fixed::plane(p, fixed::colour)),
+            fogp: fixed::plane(tplane(self, reg::FOG_F, reg::FOG_F + 4, reg::FOG_F + 2), fixed::fraction),
+            xs_i: xs as i32,
+            yref_i: yref as i32,
             zplane,
             tplanes,
-            fplane: tplane(self, reg::FOG_F, reg::FOG_F + 4, reg::FOG_F + 2),
             j0: (ymin - 0.5).ceil() as i32,
             j1: (ymax - 0.5).ceil() as i32,
             ltor: ltor as u32,
@@ -1436,7 +1447,7 @@ impl Rss {
     /// d/dx, d/(-y)) evaluated by `at`; the level of detail from the
     /// derivatives of s and t in level-0 texels; the texel through the
     /// texture environment.
-    fn textured(&self, p: &[[f64; 3]; 3], smp: &Sampler, at: impl Fn([f64; 3]) -> f64, rgba: [f64; 4]) -> [f64; 4] {
+    fn textured(&self, p: &[[f64; 3]; 3], smp: &Sampler, at: impl Fn([f64; 3]) -> f64, rgba: [i32; 4]) -> [i32; 4] {
         let (sw, tw, wi) = (at(p[0]), at(p[1]), at(p[2]));
         if wi == 0.0 || !wi.is_finite() {
             return rgba;
@@ -1454,12 +1465,12 @@ impl Rss {
 
     /// Fog applied to a fragment: factor `f` (1 = none) toward the fog
     /// colour (FOG_RG / FOG_B), alpha kept.
-    fn fogged(&self, rgba: [f64; 4], f: f64) -> [f64; 4] {
-        let f = f.clamp(0.0, 1.0);
-        let c = |v: u32| (v & 0xFFF) as f64 / 4095.0;
+    fn fogged(&self, rgba: [i32; 4], f: i32) -> [i32; 4] {
+        use fixed::{mul, ONE};
+        let f = f.clamp(0, ONE);
         let (rg, b) = (self.reg(reg::FOG_RG), self.reg(reg::FOG_B));
-        let fc = [c(rg), c(rg >> 12), c(b)];
-        [0, 1, 2, 3].map(|k| if k < 3 { f * rgba[k] + (1.0 - f) * fc[k] } else { rgba[3] })
+        let fc = [fixed::field12(rg), fixed::field12(rg >> 12), fixed::field12(b)];
+        [0, 1, 2, 3].map(|k| if k < 3 { mul(f, rgba[k]).wrapping_add(mul(ONE - f, fc[k])) } else { rgba[3] })
     }
 
     /// A GL line (our GE11 HLE, IR `OP_GL_LINE`): from gline_xstartf/ystartf
@@ -1480,6 +1491,8 @@ impl Rss {
         }
         let smp = (l.tex != 0).then(|| self.te.sampler(&self.regs));
         let mut p = l.p0;
+        // Pixels along the line since the first (colour and fog steps).
+        let mut k = 0i32;
         while p != l.p1 {
             let t = ((p as f64 + 0.5) - l.a0).abs();
             let draw = l.stipple == 0 || {
@@ -1490,13 +1503,13 @@ impl Rss {
             if draw {
                 let b = l.b0 + l.slope * ((p as f64 + 0.5) - l.a0);
                 let q0 = (b - 0.5 * l.width as f64 + 0.5).floor() as i32;
-                let mut rgba = [0, 1, 2, 3].map(|k| l.c0[k] + l.dc[k] * t);
+                let mut rgba = [0, 1, 2, 3].map(|c| l.cbase[c].wrapping_add(l.cstep[c].wrapping_mul(k)));
                 if let Some(smp) = &smp {
                     // Planes (value, d/major, 0) evaluated at t along it.
                     rgba = self.textured(&l.tplanes, smp, |q: [f64; 3]| q[0] + q[1] * t, rgba);
                 }
                 if l.fog != 0 {
-                    rgba = self.fogged(rgba, l.f0 + l.df * t);
+                    rgba = self.fogged(rgba, l.fbase.wrapping_add(l.fstep.wrapping_mul(k)));
                 }
                 for q in q0..q0.wrapping_add(l.width) {
                     let (wx, wy) = if l.xmajor != 0 { (p, q) } else { (q, p) };
@@ -1504,6 +1517,7 @@ impl Rss {
                 }
             }
             p = p.wrapping_add(l.dir);
+            k = k.wrapping_add(1);
         }
         true
     }
@@ -1530,14 +1544,20 @@ impl Rss {
         let dir = if a1 > a0 { 1 } else { -1 };
         // First and one-past-last pixel along the major axis.
         let (p0, p1) = if dir > 0 { ((a0 - 0.5).ceil() as i32, (a1 - 0.5).ceil() as i32) } else { ((a0 - 0.5).floor() as i32, (a1 - 0.5).floor() as i32) };
+        // Colours and fog at the first pixel's centre, t0 along the line;
+        // each pixel after it is one further.
+        let t0 = ((p0 as f64 + 0.5) - a0).abs();
+        let c0 = [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)];
+        let dc = [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)];
+        let (f0, df) = (fix64t(self, reg::FOG_F), fix64t(self, reg::FOG_F + 2));
         Some(GlLineSetup {
-            c0: [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)],
-            dc: [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)],
+            cbase: [0, 1, 2, 3].map(|k| fixed::colour(c0[k] + dc[k] * t0)),
+            cstep: dc.map(fixed::colour),
+            fbase: fixed::fraction(f0 + df * t0),
+            fstep: fixed::fraction(df),
             z0: fix64(self, 0x068),
             dz: fix64(self, 0x06C),
             tplanes: [q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)],
-            f0: fix64t(self, reg::FOG_F),
-            df: fix64t(self, reg::FOG_F + 2),
             a0,
             b0,
             slope: (b1 - b0) / (a1 - a0),
@@ -1560,14 +1580,14 @@ impl Rss {
     /// blending or the logic op, and the colour write masks. `rgba` is
     /// 0..1 (red alone is the index in colour-index windows), `z` window
     /// depth (0..2^24 - 1).
-    fn gl_fragment(&mut self, wx: i32, wy: i32, rgba: [f64; 4], z: f64) {
+    fn gl_fragment(&mut self, wx: i32, wy: i32, rgba: [i32; 4], z: f64) {
         let (fx, fy) = self.to_fb(wx, wy);
         if draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_CID || !self.visible(fx, fy) {
             return;
         }
-        let rgba = rgba.map(|c| c.clamp(0.0, 1.0));
+        let rgba = rgba.map(fixed::clamp);
         let af = self.reg(reg::AFUNCMODE);
-        if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3], ((af >> 4) & 0xFFF) as f64 / 4096.0) {
+        if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
             return;
         }
         let st = self.reg(reg::STENCILMODE);
@@ -1623,7 +1643,10 @@ impl Rss {
         }
     }
 
-    fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [f64; 4], pp1: u32, back: bool) {
+    /// A fragment's colour (12.16, clamped) blended or not, shifted down
+    /// to the pixel, and written.
+    fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
+        use fixed::{mul, ONE};
         let dst = self.mem.get(&b, ux, uy) as u32;
         // A logic op other than copy replaces blending (OpenGL).
         let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
@@ -1631,33 +1654,31 @@ impl Rss {
         let src = if rgb {
             let blend = self.reg(reg::BLENDFACTOR);
             let c = if blend & BLEND_ENABLE != 0 && !logic {
-                let d = [dst & 0xFF, (dst >> 8) & 0xFF, (dst >> 16) & 0xFF, dst >> 24].map(|v| v as f64 / 255.0);
-                let f = |code: u32, k: usize| -> f64 {
-                    let sat = rgba[3].min(1.0 - d[3]);
+                let d = [0, 8, 16, 24].map(|s| (fixed::widen((dst >> s) & 0xFF, 2) << 16) as i32);
+                let f = |code: u32, k: usize| -> i32 {
                     match code {
-                        0 => 0.0,
-                        1 => 1.0,
+                        0 => 0,
+                        1 => ONE,
                         2 => rgba[k],
-                        3 => 1.0 - rgba[k],
+                        3 => ONE - rgba[k],
                         4 => rgba[3],
-                        5 => 1.0 - rgba[3],
+                        5 => ONE - rgba[3],
                         6 => d[3],
-                        7 => 1.0 - d[3],
+                        7 => ONE - d[3],
                         8 => d[k],
-                        9 => 1.0 - d[k],
-                        10 => if k == 3 { 1.0 } else { sat },
-                        _ => 1.0,
+                        9 => ONE - d[k],
+                        10 => if k == 3 { ONE } else { rgba[3].min(ONE - d[3]) },
+                        _ => ONE,
                     }
                 };
                 let (sf, df) = (blend & 0xF, (blend >> 4) & 0xF);
-                [0, 1, 2, 3].map(|k| (rgba[k] * f(sf, k) + d[k] * f(df, k)).clamp(0.0, 1.0))
+                [0, 1, 2, 3].map(|k| fixed::clamp(mul(rgba[k], f(sf, k)).wrapping_add(mul(d[k], f(df, k)))))
             } else {
                 rgba
             };
-            let q = |v: f64| (v * 255.0).round() as u32;
-            q(c[0]) | q(c[1]) << 8 | q(c[2]) << 16 | q(c[3]) << 24
+            fixed::to_byte(c[0]) | fixed::to_byte(c[1]) << 8 | fixed::to_byte(c[2]) << 16 | fixed::to_byte(c[3]) << 24
         } else {
-            (rgba[0] * 4095.0).round() as u32 & 0xFFF
+            fixed::to_index(rgba[0]) & 0xFFF
         };
         self.put_in(b, ux as i32, uy as i32, src, back);
     }
@@ -2038,7 +2059,7 @@ mod tests {
         let b = Buffer::new(0x140, Kind::Wide, r.reg(reg::DRBSIZE));
         r.mem.put(&a, 10, 1018, 0x123456);
         r.mem.put(&b, 10, 1018, 0x654321);
-        r.gl_fragment(10, 5, [1.0, 1.0, 1.0, 1.0], 0.0);
+        r.gl_fragment(10, 5, [fixed::colour(1.0); 4], 0.0);
         assert_eq!(r.mem.get(&a, 10, 1018), 0x1234FF);
         assert_eq!(r.mem.get(&b, 10, 1018), 0xFF4321);
     }

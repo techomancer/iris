@@ -41,8 +41,12 @@
 //! arms a read transfer on the texture side; each line is a row of texels,
 //! RGBA bytes (`read_line`).
 //!
+//! Colour arithmetic is 12.16 fixed point (`fixed`).
+//!
 //! Not yet: detail and sharpen textures, 3D textures, texture lookup tables,
 //! video texture.
+
+use super::fixed;
 
 /// TE1 / texture-related RSS registers.
 #[cfg(test)]
@@ -274,10 +278,10 @@ impl Te1 {
         *b = if a & 1 == 0 { (*b & 0xF0) | (v as u8 & 0xF) } else { (*b & 0x0F) | (v as u8) << 4 };
     }
 
-    /// Component of `d` nibbles at nibble address `a`, as 0..1.
-    fn component(&self, a: usize, d: usize) -> f32 {
+    /// Component of `d` nibbles at nibble address `a`, widened to 12 bits.
+    fn component(&self, a: usize, d: usize) -> u32 {
         let v = (0..d).fold(0, |v, i| v | self.nibble((a + i) % TRAM_NIBBLES) << (4 * i));
-        v as f32 / ((1u32 << (4 * d)) - 1) as f32
+        fixed::widen(v, d)
     }
 
     /// A table write (TXMIPMAP, TXBORDER, DETAILSCALE) at `index`.
@@ -413,26 +417,26 @@ impl Te1 {
         let wide = xfrmode & 0xF == 1;
         let mut out = Vec::with_capacity((w * Self::read_texel_bytes(xfrmode)) as usize);
         for k in 0..w {
+            // 12-bit components: 16 bits by repeating them, bytes their top.
             let c = smp.texel(self, 0, k as i64, line as i64);
             let rgba = match class {
-                1 => [0.0, 0.0, 0.0, c[0]],
-                2 => [c[0], 0.0, 0.0, if smp.nc == 2 { c[1] } else { 1.0 }],
-                3 => [c[0], 0.0, 0.0, 1.0],
-                _ => [c[0], c[1], c[2], if smp.nc == 4 { c[3] } else { 1.0 }],
+                1 => [0, 0, 0, c[0]],
+                2 => [c[0], 0, 0, if smp.nc == 2 { c[1] } else { 0xFFF }],
+                3 => [c[0], 0, 0, 0xFFF],
+                _ => [c[0], c[1], c[2], if smp.nc == 4 { c[3] } else { 0xFFF }],
             };
             // Two 8-bit components travel as one 16-bit unit, alpha in the
             // high byte (traced: libGLcore reads LA8 as A, L; LA12 as L, A).
             let comps = match n {
                 4 => rgba,
-                2 if !wide => [c[1], c[0], 0.0, 0.0],
+                2 if !wide => [c[1], c[0], 0, 0],
                 _ => c,
             };
             for &v in comps.iter().take(n) {
-                let v = v.clamp(0.0, 1.0);
                 if wide {
-                    out.extend(((v * 65535.0).round() as u16).to_be_bytes());
+                    out.extend(((v << 4 | v >> 8) as u16).to_be_bytes());
                 } else {
-                    out.push((v * 255.0).round() as u8);
+                    out.push((v >> 4) as u8);
                 }
             }
         }
@@ -464,14 +468,14 @@ impl Te1 {
             *p = self.tables[0][k] & 0xFF;
             border_pages[k] = self.tables[1][k] & 0xFF;
         }
-        // The border colour as the texel class's components.
-        let c = |v: u32| (v & 0xFFF) as f32 / 4095.0;
+        // The border colour as the texel class's components (12 bits).
+        let c = |v: u32| v & 0xFFF;
         let (rg, ba) = (regs[reg::TXBCOLOR_RG as usize], regs[reg::TXBCOLOR_BA as usize]);
         let (r, g, b, a) = (c(rg), c(rg >> 12), c(ba), c(ba >> 12));
         let border_color = match (m1 >> 9) & 7 {
-            1 => [a, 0.0, 0.0, 0.0],
-            2 => [r, a, 0.0, 0.0],
-            3 => [r, 0.0, 0.0, 0.0],
+            1 => [a, 0, 0, 0],
+            2 => [r, a, 0, 0],
+            3 => [r, 0, 0, 0],
             _ => [r, g, b, a],
         };
         let mipmaps = m2 & TM2_MM_ENABLE != 0 && m2 & TM2_MIPMAP != 0;
@@ -507,7 +511,8 @@ pub struct Sampler {
     pub d: u32,
     pub pages: [u32; 16],
     pub border_pages: [u32; 16],
-    pub border_color: [f32; 4],
+    /// 12-bit components.
+    pub border_color: [u32; 4],
 }
 
 impl Sampler {
@@ -516,9 +521,10 @@ impl Sampler {
         ((1u32 << self.ls) as f64, (1u32 << self.lt) as f64)
     }
 
-    /// Texel (i, j) of `level`, its components: wrapped (repeat), or
-    /// outside the level (clamp) the border texel or the border colour.
-    fn texel(&self, te: &Te1, level: u32, i: i64, j: i64) -> [f32; 4] {
+    /// Texel (i, j) of `level`, its components widened to 12 bits: wrapped
+    /// (repeat), or outside the level (clamp) the border texel or the
+    /// border colour.
+    fn texel(&self, te: &Te1, level: u32, i: i64, j: i64) -> [u32; 4] {
         let w = 1usize << self.ls.saturating_sub(level);
         let h = 1usize << self.lt.saturating_sub(level);
         let axis = |v: i64, n: usize, clamp: bool| if clamp { v.clamp(-1, n as i64) } else { v.rem_euclid(n as i64) };
@@ -534,7 +540,7 @@ impl Sampler {
         } else {
             texel_addr(self.pages[level as usize & 15], w, h, s as usize, t as usize, tn)
         };
-        let mut c = [0.0f32; 4];
+        let mut c = [0u32; 4];
         for (k, o) in c.iter_mut().enumerate().take(nc) {
             *o = te.component(a + comp_offset(sel, nc, k, d), d);
         }
@@ -542,8 +548,9 @@ impl Sampler {
     }
 
     /// A level, sampled at (s, t) (texture coordinates, 0..1 over the
-    /// texture), nearest or bilinear.
-    fn level(&self, te: &Te1, level: u32, s: f64, t: f64, linear: bool) -> [f32; 4] {
+    /// texture), nearest or bilinear, in 12.16. Bilinear weights have 8
+    /// fraction bits, so the four products sum to 12.16 exactly.
+    fn level(&self, te: &Te1, level: u32, s: f64, t: f64, linear: bool) -> [i32; 4] {
         let w = (1u32 << self.ls.saturating_sub(level)) as f64;
         let h = (1u32 << self.lt.saturating_sub(level)) as f64;
         // GL_CLAMP: coordinates clamped to [0, 1]; nearest then stays in
@@ -556,19 +563,21 @@ impl Sampler {
         if !linear {
             // At s = 1 exactly, clamped nearest stays on the last texel.
             let cap = |x: f64, n: f64, clamp: bool| if clamp && gl_clamp { (x.floor() as i64).min(n as i64 - 1) } else { x.floor() as i64 };
-            return self.texel(te, level, cap(u, w, self.mode2 & TM2_CLAMP_S != 0), cap(v, h, self.mode2 & TM2_CLAMP_T != 0));
+            let c = self.texel(te, level, cap(u, w, self.mode2 & TM2_CLAMP_S != 0), cap(v, h, self.mode2 & TM2_CLAMP_T != 0));
+            return c.map(|v| (v << 16) as i32);
         }
         let (u, v) = (u - 0.5, v - 0.5);
         let (i, j) = (u.floor(), v.floor());
-        let (a, b) = ((u - i) as f32, (v - j) as f32);
+        let (a, b) = (((u - i) * 256.0) as i32, ((v - j) * 256.0) as i32);
         let (i, j) = (i as i64, j as i64);
         // Wrapping: a coordinate far outside saturates to i64::MAX.
         let (i1, j1) = (i.wrapping_add(1), j.wrapping_add(1));
         let (t00, t10) = (self.texel(te, level, i, j), self.texel(te, level, i1, j));
         let (t01, t11) = (self.texel(te, level, i, j1), self.texel(te, level, i1, j1));
-        let mut c = [0.0f32; 4];
+        let (w00, w10, w01, w11) = ((256 - a) * (256 - b), a * (256 - b), (256 - a) * b, a * b);
+        let mut c = [0i32; 4];
         for k in 0..4 {
-            c[k] = (1.0 - a) * (1.0 - b) * t00[k] + a * (1.0 - b) * t10[k] + (1.0 - a) * b * t01[k] + a * b * t11[k];
+            c[k] = t00[k] as i32 * w00 + t10[k] as i32 * w10 + t01[k] as i32 * w01 + t11[k] as i32 * w11;
         }
         c
     }
@@ -576,7 +585,7 @@ impl Sampler {
     /// The filtered texel at (s, t) for level of detail `lambda` (log2 of
     /// texels per pixel at level 0): magnification below 0, minification
     /// (with mipmaps when on) above.
-    pub fn sample(&self, te: &Te1, s: f64, t: f64, lambda: f64) -> [f32; 4] {
+    pub fn sample(&self, te: &Te1, s: f64, t: f64, lambda: f64) -> [i32; 4] {
         let m = self.mode2;
         if !(lambda > 0.0) {
             return self.level(te, 0, s, t, m & TM2_MAG_LINEAR != 0);
@@ -592,9 +601,10 @@ impl Sampler {
         }
         let l0 = lambda.floor().clamp(0.0, top);
         let l1 = (l0 + 1.0).min(top);
-        let f = (lambda - l0).clamp(0.0, 1.0) as f32;
+        // Between the levels by an 8-bit fraction.
+        let f = ((lambda - l0).clamp(0.0, 1.0) * 256.0) as i64;
         let (a, b) = (self.level(te, l0 as u32, s, t, linear), self.level(te, l1 as u32, s, t, linear));
-        [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * f)
+        [0, 1, 2, 3].map(|k| a[k] + (((b[k] - a[k]) as i64 * f) >> 8) as i32)
     }
 }
 
@@ -627,12 +637,12 @@ pub fn lod(sx: f64, tx: f64, sy: f64, ty: f64) -> f64 {
     if rho > 0.0 { lod_log2(rho) } else { f64::NEG_INFINITY }
 }
 
-/// The texture environment (RE4): fragment colour `f` (0..1) and texel
+/// The texture environment (RE4), in 12.16: fragment colour `f` and texel
 /// components `tex`, per TEXMODE1 (environment mode, components, texel
 /// class) and the environment colour (TXENV_RG: red 11:0, green 23:12;
 /// TXENV_B: blue 11:0, alpha 23:12).
-pub fn tex_env(mode1: u32, env_rg: u32, env_b: u32, f: [f64; 4], tex: [f32; 4]) -> [f64; 4] {
-    let tex = tex.map(|c| c as f64);
+pub fn tex_env(mode1: u32, env_rg: u32, env_b: u32, f: [i32; 4], tex: [i32; 4]) -> [i32; 4] {
+    use fixed::{mul, ONE};
     let nc = ((mode1 >> 3) & 3) + 1;
     // (texel colour, texel alpha), each if the format has it.
     let (ct, at) = match (mode1 >> 9) & 7 {
@@ -642,18 +652,17 @@ pub fn tex_env(mode1: u32, env_rg: u32, env_b: u32, f: [f64; 4], tex: [f32; 4]) 
         _ if nc >= 3 => (Some([tex[0], tex[1], tex[2]]), (nc == 4).then_some(tex[3])),
         _ => (Some([tex[0]; 3]), (nc == 2).then_some(tex[1])),
     };
-    let e = |v: u32| (v & 0xFFF) as f64 / 4095.0;
-    let cc = [e(env_rg), e(env_rg >> 12), e(env_b)];
-    let ac = e(env_b >> 12);
+    let cc = [fixed::field12(env_rg), fixed::field12(env_rg >> 12), fixed::field12(env_b)];
+    let ac = fixed::field12(env_b >> 12);
     let intensity = (mode1 >> 9) & 7 == 3;
     let mut out = f;
     match (mode1 >> 1) & 3 {
         // Decal: RGB replaces; RGBA blends by the texel's alpha; alpha kept.
         1 => {
             if let Some(ct) = ct {
-                let a = at.unwrap_or(1.0);
+                let a = at.unwrap_or(ONE);
                 for k in 0..3 {
-                    out[k] = f[k] * (1.0 - a) + ct[k] * a;
+                    out[k] = mul(f[k], ONE - a).wrapping_add(mul(ct[k], a));
                 }
             }
         }
@@ -662,28 +671,28 @@ pub fn tex_env(mode1: u32, env_rg: u32, env_b: u32, f: [f64; 4], tex: [f32; 4]) 
         2 => {
             if let Some(ct) = ct {
                 for k in 0..3 {
-                    out[k] = f[k] * (1.0 - ct[k]) + cc[k] * ct[k];
+                    out[k] = mul(f[k], ONE - ct[k]).wrapping_add(mul(cc[k], ct[k]));
                 }
             }
             if let Some(at) = at {
-                out[3] = if intensity { f[3] * (1.0 - at) + ac * at } else { f[3] * at };
+                out[3] = if intensity { mul(f[3], ONE - at).wrapping_add(mul(ac, at)) } else { mul(f[3], at) };
             }
         }
         // Alpha-only modulate (alpha textures).
         3 => {
             if let Some(at) = at {
-                out[3] = f[3] * at;
+                out[3] = mul(f[3], at);
             }
         }
         // Modulate (and GL_REPLACE, which libGLcore sends as modulate).
         _ => {
             if let Some(ct) = ct {
                 for k in 0..3 {
-                    out[k] = f[k] * ct[k];
+                    out[k] = mul(f[k], ct[k]);
                 }
             }
             if let Some(at) = at {
-                out[3] = f[3] * at;
+                out[3] = mul(f[3], at);
             }
         }
     }
