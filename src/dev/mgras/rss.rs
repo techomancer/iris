@@ -372,7 +372,6 @@ fn draw_buffer(pp1fillmode: u32) -> u32 {
 }
 const DRAW_B: u32 = 0x02;
 const DRAW_A_AND_B: u32 = 0x03;
-const DRAW_OVERLAY: u32 = 0x4F;
 const DRAW_CID: u32 = 0x50;
 
 /// PP1 window mode (`pp1winmode`; SGI's fields WINxLSBs, WINyLSBs,
@@ -953,7 +952,14 @@ impl Rss {
         // Other formats keep their decoded values: their masks describe
         // a packed storage layout this model does not keep.
         let v = if b.kind == Kind::Overlay {
-            let mask = (self.reg(reg::COLORMASKMSBS) >> 4) & 0xF;
+            // Native GL CI8 overlays select the upper overlay planes
+            // (DRAW_BUFFER 0x48). X's 4-bit overlay/popup selector 0x4f
+            // presents those planes as indices 0..15.
+            let mask = if draw_buffer(pp1) == 0x48 {
+                self.reg(reg::COLORMASKMSBS) & 0xFF
+            } else {
+                (self.reg(reg::COLORMASKMSBS) >> 4) & 0xF
+            };
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
             let mask = if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24 };
@@ -969,7 +975,7 @@ impl Rss {
 
     /// Drawing goes to the overlay planes.
     fn draws_overlay(&self) -> bool {
-        draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_OVERLAY
+        draw_buffer(self.reg(reg::PP1FILLMODE)) & 0x70 == 0x40
     }
 
     /// Pixel reads select A, B, or the overlay independently of drawing.

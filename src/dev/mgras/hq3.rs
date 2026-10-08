@@ -182,10 +182,9 @@ mod cmd {
     /// at GE_READBACK_LO.
     pub const CP_RETURN_MODE: u32 = 0xA2;
     /// Command-processor token: wait for the pipeline, then return the
-    /// argument word (libGLcore spin_and_return; same protocol as
-    /// CP_RETURN_MODE). IRIS GL programs (powerflip) block on it. That the
-    /// answer is the argument echoed is our reading of the name; its callers
-    /// are not in the decompiled libraries.
+    /// state word at the argument's GE address (same readback protocol as
+    /// CP_RETURN_MODE). Native IRIS GL getcolor() and clear() request address
+    /// 4: the current index as a float, not the address itself.
     pub const CP_SPIN_AND_RETURN: u32 = 0xA1;
     /// Kernel token (MgrasValidateClip, current context): a GL window's
     /// raster state, 15 words: origin, window mode, PP1 window mode (the
@@ -821,7 +820,9 @@ impl Hq3Engine {
         } else if cmd == cmd::CP_SPIN_AND_RETURN {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.gl.end_raster(sink);
-            self.ge_return = Some([0, data.first().copied().unwrap_or(0)]);
+            let addr = data.first().copied().unwrap_or(0);
+            let v = self.gl.state_word(addr).unwrap_or(addr);
+            self.ge_return = Some([0, v]);
             sink.set_flags(host::FLAG_GE_DATA);
         } else if cmd == cmd::CP_RETURN_MODE {
             self.stats.cp_tokens[cmd as usize] += 1;
@@ -1207,7 +1208,7 @@ impl DmaPeer<'_> {
 /// Tokens the kernel sends to set up and save the GE11s (and the HQ DMA
 /// setup token), which nothing in this model needs.
 fn is_ge_plumbing(t: u32) -> bool {
-    matches!(t, 0x006 | 0x07C | 0x07F | 0x082 | 0x08C | 0x09A | 0x0EC | 0x0ED | 0x0F2 | 0x0F3..=0x0FF)
+    matches!(t, 0x006 | 0x07C | 0x07F | 0x082 | 0x08C | 0x0EC | 0x0ED | 0x0F2 | 0x0F3..=0x0FF)
 }
 
 /// One command FIFO command, decoded for the trace.

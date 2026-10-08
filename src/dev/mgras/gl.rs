@@ -54,6 +54,7 @@ mod tok {
     /// 8 or 12, presumably the index bits).
     pub const INIT_RGB: u32 = 0x009;
     pub const INIT_CI: u32 = 0x00A;
+    pub const INIT_FORMAT_VALUES: u32 = 0x09A;
     /// glClearIndex.
     pub const CLEAR_INDEX: u32 = 0x0BD;
     /// glRasterPos (object x, y [, z [, w]]).
@@ -281,6 +282,7 @@ mod re {
     pub const PP1FILLMODE: u32 = 0x161;
     pub const COLORMASKMSBS: u32 = 0x162;
     pub const COLORMASKLSBSA: u32 = 0x163;
+    pub const COLORMASKLSBSB: u32 = 0x164;
     pub const BLENDFACTOR: u32 = 0x165;
     pub const STENCILMODE: u32 = 0x166;
     pub const STENCILMASK: u32 = 0x167;
@@ -374,6 +376,12 @@ pub struct Gl {
     /// glDrawBuffer bits, and whether the buffers have swapped an odd
     /// number of times (front = B, back = A).
     draw_bits: u32,
+    /// Absolute PP1 draw selector supplied in DRAW_BUFFER word 1.
+    draw_selector: u32,
+    draw_selector_valid: u32,
+    buffer_count: u32,
+    /// The driver's PP1 pixel-format and buffer-size fields.
+    pixel_format: u32,
     swapped: u32,
     smooth: u32,
     clear_color: [f32; 4],
@@ -430,6 +438,8 @@ pub struct Gl {
     /// Colour-index context (INIT_CI): colours are indices (red / 4095 in
     /// `color`), drawn as 12-bit colour index pixels; and the clear index.
     ci: u32,
+    /// Unnormalized current index for GE state readback.
+    current_index: f32,
     clear_index: u32,
     index_mask: u32,
     /// A glBitmap header waiting for its rows (pixel data).
@@ -524,6 +534,7 @@ impl Gl {
         self.depth_range = [0.0, 1.0];
         self.vp.set(0.0, 0.0, 1.0, 1.0, 0.0, 1.0, ZMAX);
         self.color = [1.0; 4];
+        self.current_index = 1.0;
         self.normal = [0.0, 0.0, 1.0];
         self.lt.init();
         self.nm_dirty = 1;
@@ -676,6 +687,8 @@ impl Gl {
     pub fn state_word(&mut self, addr: u32) -> Option<u32> {
         self.ensure_init();
         match addr {
+            4 if self.ci != 0 => Some(self.current_index.to_bits()),
+            4..=7 => Some(self.color[(addr - 4) as usize].to_bits()),
             0x1FC => Some(self.dither),
             // Scissor box 0 (window coordinates inclusive: xmin, xmax, ymin, ymax):
             // 0x200 returns (xmax << 16) | xmin, 0x202 returns (ymax << 16) | ymin.
@@ -772,7 +785,8 @@ impl Gl {
                 if self.ci != 0 {
                     // An index: red carries it to the raster engine, which
                     // writes red * 4095 in colour-index pixels.
-                    self.color = [self.color[0] / 4095.0, 0.0, 0.0, 1.0];
+                    self.current_index = self.color[0];
+                    self.color = [self.current_index / 4095.0, 0.0, 0.0, 1.0];
                 }
                 // The raster colour follows the current colour: IRIS GL
                 // programs (gr_osview's colour-keyed legend, through IGLOO)
@@ -922,6 +936,9 @@ impl Gl {
             tok::DRAW_BUFFER => {
                 self.end_raster(sink);
                 self.draw_bits = w0;
+                self.draw_selector_valid = (d.len() >= 3) as u32;
+                self.draw_selector = d.get(1).copied().unwrap_or(1) & 0x7F;
+                self.buffer_count = d.get(2).copied().unwrap_or(0) & 1;
             }
             tok::BEGIN_POINTS..=tok::BEGIN_POLYGON => {
                 self.prim = cmd - tok::BEGIN_POINTS;
@@ -933,6 +950,7 @@ impl Gl {
                 self.end_raster(sink);
             }
             tok::VERTEX4F => self.vertex(args_f32(d), sink),
+            tok::INIT_FORMAT_VALUES => self.set_state(|g| g.pixel_format = w0 & 0x2700, sink),
             tok::INIT_RGB => self.ci = 0,
             tok::INIT_CI => self.ci = 1,
             tok::CLEAR_INDEX => self.clear_index = if w0 >> 16 == 0 { w0 } else { f32::from_bits(w0) as u32 },
@@ -951,6 +969,7 @@ impl Gl {
             }
             tok::LOAD_RASTER_POS_INFO => {
                 self.color = self.raster_color;
+                if self.ci != 0 { self.current_index = self.color[0] * 4095.0; }
             }
             tok::INDEX_MASK => self.set_state(|g| g.index_mask = w0 & 0xFFF, sink),
             tok::READ_BUFFER => self.read_back = (d.get(2) == Some(&0x405)) as u32,
@@ -1704,10 +1723,10 @@ impl Gl {
         sink.rss_write(re::BLENDFACTOR, if self.blend != 0 { 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 }, false);
         let op = if self.logic != 0 { self.logic_op } else { 3 };
         sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0xF << 26)) | op << 26, false);
-        let cm = self.color_mask;
-        let rgb = if self.ci != 0 { self.index_mask & 0xFFF } else { (cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000 };
-        sink.rss_write(re::COLORMASKLSBSA, rgb, false);
-        sink.rss_write(re::COLORMASKMSBS, (cm >> 3 & 1) * 0xFF, false);
+        let (lsb, msb) = self.color_write_masks();
+        sink.rss_write(re::COLORMASKLSBSA, lsb, false);
+        sink.rss_write(re::COLORMASKLSBSB, lsb, false);
+        sink.rss_write(re::COLORMASKMSBS, msb, false);
         sink.rss_write(re::LSPAT, self.line_pattern, false);
         if self.poly_stipple != 0 {
             for (i, row) in self.stipple_rows.iter().enumerate() {
@@ -1744,11 +1763,11 @@ impl Gl {
     }
 
     /// The DRBpointers value for the colour buffer drawn into: the window's
-    /// pointers with bits 9:0 set to the front or back buffer's page (A in
-    /// bits 9:0, B in 19:10 of the window's value). Front and back both:
-    /// the back buffer (not drawn twice yet).
+    /// pointers unchanged when the driver supplies an absolute PP1 selector.
+    /// Older one-word tokens choose the front/back page in bits 9:0.
     fn draw_pointers(&self) -> u32 {
         let drb = self.window.drb;
+        if self.draw_selector_valid != 0 { return drb; }
         let (a, b) = (drb & 0x3FF, (drb >> 10) & 0x3FF);
         let back = self.draw_bits & 0xC != 0;
         let page = if back != (self.swapped != 0) { b } else { a };
@@ -1818,6 +1837,7 @@ impl Gl {
         sink.rss_write(re::PP1FILLMODE, self.pp1_base(), false);
         sink.rss_write(re::DRBPOINTERS, drb, false);
         sink.rss_write(re::COLORMASKLSBSA, lsb, false);
+        sink.rss_write(re::COLORMASKLSBSB, lsb, false);
         sink.rss_write(re::COLORMASKMSBS, msb, false);
         self.fill_mode(FILL_FAST, sink);
         for (k, c) in color.iter().enumerate() {
@@ -1832,24 +1852,41 @@ impl Gl {
     }
 
     /// The PP1 fill mode GL drawing uses: 24-bit RGB, or 12-bit colour
-    /// index (pixel type 6) in a colour-index context.
+    /// index (pixel type 6) in a colour-index context. Main pixels use our
+    /// canonical storage format; overlays retain the driver's CI8 format.
     fn pp1_base(&self) -> u32 {
-        if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A }
+        let mut pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
+        if self.draw_selector_valid != 0 {
+            pp1 = (pp1 & !((0x7F << 14) | (1 << 11))) | self.draw_selector << 14 | self.buffer_count << 11;
+            if self.draw_selector & 0x70 == 0x40 {
+                pp1 = (pp1 & !0x2700) | self.pixel_format;
+            }
+        }
+        pp1
+    }
+
+    /// Plane masks in the RSS storage layout for the selected GL buffer.
+    fn color_write_masks(&self) -> (u32, u32) {
+        if self.draw_selector_valid != 0 {
+            if self.draw_selector == 0 { return (0, 0); }
+            if self.draw_selector & 0x70 == 0x40 { return (0, self.index_mask & 0xFF); }
+        }
+        if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
+        let cm = self.color_mask;
+        ((cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000, (cm >> 3 & 1) * 0xFF)
     }
 
     /// glClear's colour part: the clear colour through the colour mask.
     fn clear_color_buffer(&mut self, sink: &mut dyn Hq3Sink) {
+        let drb = self.draw_pointers();
+        let (lsb, msb) = self.color_write_masks();
         if self.ci != 0 {
-            let drb = self.draw_pointers();
-            self.clear_block([self.clear_index & 0xFFF, 0, 0, 0], self.index_mask & 0xFFF, 0, drb, sink);
+            self.clear_block([self.clear_index & 0xFFF, 0, 0, 0], lsb, msb, drb, sink);
             return;
         }
         let q = |c: f32| ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << 4;
         let c = self.clear_color;
-        let cm = self.color_mask;
-        let lsb = (cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000;
-        let drb = self.draw_pointers();
-        self.clear_block([q(c[0]), q(c[1]), q(c[2]), q(c[3])], lsb, (cm >> 3 & 1) * 0xFF, drb, sink);
+        self.clear_block([q(c[0]), q(c[1]), q(c[2]), q(c[3])], lsb, msb, drb, sink);
     }
 
     /// glClear's depth (24-bit Z, planes 23:0) or stencil (planes 31:24,

@@ -2306,3 +2306,106 @@ fn gl_draw_pixels_rgba8_component_order() {
     drop(_sub);
     m.stop_engines();
 }
+
+/// Softimage's CI8 overlay has a separate pointer, upper-plane index mask,
+/// and absolute draw selector. Clears and geometry must leave main intact.
+#[test]
+fn gl_native_overlay_clear_geometry_and_bitmap() {
+    let m = gl_board([0.25, 0.5, 0.75]);
+    let main_before = gl_px(&m, 100, 100);
+    {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &mut *m.rss.get() };
+        let b = super::pixmem::Buffer::new(0x1C0, super::pixmem::Kind::Overlay, 0x31E);
+        rss.mem.put(&b, 100, 100, 1); // another overlay plane must survive
+    }
+    fifo_token(&m, 0xE4, &[0, 0, 0x11, 0, 0, 0, 0, 0, 0, 399, 299, 0x101C0, 0, 0, 0]);
+    fifo_token(&m, 0x0A, &[8]);
+    fifo_token(&m, 0x9A, &[0x2500, 0x2500]);
+    fifo_token(&m, 0x49, &[0x48, 0x48, 1]);
+    fifo_token(&m, 0x3D, &[0xF0]);
+    fifo_token(&m, 0xBD, &[0x30]);
+    fifo_token(&m, 0x15, &[]);
+    fifo_token(&m, 0x02, &[f(16.0)]);
+    fifo_token(&m, 0x1D, &[]);
+    for p in [[0.0, 0.0], [200.0, 0.0], [200.0, 300.0], [0.0, 300.0]] {
+        fifo_token(&m, 0x00, &[f(p[0]), f(p[1]), f(0.0)]);
+    }
+    fifo_token(&m, 0x27, &[]);
+    fifo_token(&m, 0x02, &[f(32.0)]);
+    fifo_token(&m, 0x38, &[f(250.0), f(100.0), f(0.0)]);
+    fifo_token(&m, 0x94, &[0x18000, 16, 1, f(0.0), f(0.0), f(0.0), f(0.0), 1]);
+    fifo_pixel_data(&m, &[0x8000_0000]);
+    assert_eq!(gl_px(&m, 100, 100), main_before);
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let b = super::pixmem::Buffer::new(0x1C0, super::pixmem::Kind::Overlay, 0x31E);
+    assert_eq!(rss.mem.get(&b, 100, 100), 0x11, "overlay polygon preserves other planes");
+    assert_eq!(rss.mem.get(&b, 300, 100), 0x30, "overlay clear");
+    assert_eq!(rss.mem.get(&b, 250, 100), 0x20, "overlay glyph");
+    drop(_sub);
+    m.stop_engines();
+}
+
+#[test]
+fn gl_native_draw_buffer_selects_both_absolute_pages() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0, 0x11, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x49, &[3, 3, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    fifo_token(&m, 0x49, &[2, 1, 0]); // logical back, physical A
+    gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
+    gl_tri(&m, [0.0, 1.0, 0.0], [[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [0.0, 200.0, 0.0]]);
+    fifo_token(&m, 0x49, &[0, 0, 0]);
+    fifo_token(&m, 0xBA, &[f(0.0), f(0.0), f(1.0), f(1.0)]);
+    fifo_token(&m, 0x15, &[]);
+    gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
+    gl_full_quad(&m); // DRAW_NONE preserves both pages
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let a = super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E);
+    let b = super::pixmem::Buffer::new(0x140, super::pixmem::Kind::Wide, 0x31E);
+    assert_eq!(rss.mem.get(&a, 300, 100) as u32 & 0xFF_FFFF, 0xFF);
+    assert_eq!(rss.mem.get(&b, 300, 100) as u32 & 0xFF_FFFF, 0xFF, "both pages drawn");
+    assert_eq!(rss.mem.get(&a, 50, 50) as u32 & 0xFF_FFFF, 0xFF00, "physical A wins over logical back");
+    assert_eq!(rss.mem.get(&b, 50, 50) as u32 & 0xFF_FFFF, 0xFF, "physical B preserved");
+    drop(_sub);
+    m.stop_engines();
+}
+
+/// Native IRIS GL clear() reads the current index with SPIN_AND_RETURN,
+/// then uses the returned float for CLEAR_INDEX. Echoing address 4 reads
+/// as a denormal/zero and erases Softimage's background and grid planes.
+#[test]
+fn gl_spin_and_return_reads_current_color_for_index_clear() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    let spin = |addr: u32| {
+        write(&m, 32, 0x7000C, 1 << 17);
+        fifo_token(&m, 0xA1, &[addr]);
+        wait_flag(&m, 1 << 17);
+        read(&m, 32, 0x70014) as u32
+    };
+    gl_color4(&m, [0.25, 0.5, 0.75, 1.0]);
+    for (addr, value) in [(4, 0.25), (5, 0.5), (6, 0.75), (7, 1.0)] {
+        assert_eq!(spin(addr), f(value));
+    }
+    fifo_token(&m, 0x0A, &[12]);
+    for index in [21.0, 31.0, 19.0] {
+        fifo_token(&m, 0x02, &[f(index)]);
+        let got = spin(4);
+        assert_eq!(got, f(index), "getcolor must return the index, not its address");
+        fifo_token(&m, 0x3D, &[0x3F]);
+        fifo_token(&m, 0xBD, &[got]);
+        fifo_token(&m, 0x15, &[]);
+        assert_eq!(gl_px(&m, 100, 100), index as u32, "background clear");
+        fifo_token(&m, 0x3D, &[0x1C0]);
+        fifo_token(&m, 0xBD, &[got]);
+        fifo_token(&m, 0x15, &[]);
+        assert_eq!(gl_px(&m, 100, 100), index as u32, "other planes preserve background");
+    }
+    m.stop_engines();
+}
