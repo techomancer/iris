@@ -103,6 +103,10 @@ mod tok {
     /// glBitmap: format, row length in bits, rows, x / y origin and x / y
     /// move (floats), data words; the rows follow as FIFO pixel data.
     pub const BITMAP: u32 = 0x094;
+    /// Large glBitmap images: header, row batches, then raster advance.
+    pub const GENERAL_BITMAP: u32 = 0x091;
+    pub const BITMAP_ROWS: u32 = 0x090;
+    pub const BITMAP_MOVE: u32 = 0x092;
     /// glDrawPixels through the GE's pixel path (libGLcore
     /// __glMgrSendPixels), 8 words: data words per row, two skips, the
     /// pixel-state counts, rows (provisional), the GE routine (0x49D0 for
@@ -455,6 +459,9 @@ pub struct Gl {
     /// A glBitmap header waiting for its rows (pixel data).
     bitmap: [u32; 8],
     bitmap_pending: u32,
+    /// GENERAL_BITMAP rows are padded to 64 bits and arrive in batches.
+    bitmap_general: u32,
+    bitmap_row: u32,
     /// A SEND_PIXELS header waiting for its rows, and the raster engine's
     /// transfer mode as the driver last set it (host pixel format).
     send_pixels: [u32; 8],
@@ -1116,7 +1123,27 @@ impl Gl {
             }
             tok::BITMAP if d.len() >= 8 => {
                 self.bitmap.copy_from_slice(&d[..8]);
+                self.bitmap_general = 0;
+                self.bitmap_row = 0;
                 self.bitmap_pending = 1;
+            }
+            tok::GENERAL_BITMAP if d.len() >= 5 => {
+                self.bitmap = [d[0], d[1], d[2], d[3], d[4], 0, 0, 0];
+                self.bitmap_general = 1;
+                self.bitmap_row = 0;
+                self.bitmap_pending = 0;
+            }
+            tok::BITMAP_ROWS if d.len() >= 2 && self.bitmap_general != 0 => {
+                self.bitmap[7] = d[1];
+                self.bitmap_pending = 1;
+            }
+            tok::BITMAP_MOVE if d.len() >= 2 => {
+                if self.raster_valid != 0 {
+                    self.raster[0] += f32::from_bits(d[0]);
+                    self.raster[1] += f32::from_bits(d[1]);
+                }
+                self.bitmap_general = 0;
+                self.bitmap_pending = 0;
             }
             _ => return false,
         }
@@ -1527,7 +1554,7 @@ impl Gl {
     /// glBitmap, drawn as it comes).
     pub fn pixel_words_needed(&self) -> usize {
         if self.send_pixels_pending == 0 {
-            return 0;
+            return if self.bitmap_pending != 0 { self.bitmap[7] as usize } else { 0 };
         }
         let rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         (self.send_pixels[0] as usize * rows).min(1 << 22)
@@ -1692,15 +1719,21 @@ impl Gl {
         }
         self.bitmap_pending = 0;
         let h = self.bitmap;
-        let (bits, rows) = (h[1] as usize, h[2] as usize);
+        let bits = h[1] as usize;
+        let stride = if self.bitmap_general != 0 { bits.div_ceil(64) * 8 } else { bits.div_ceil(8) };
+        if stride == 0 { return; }
+        let rows = if self.bitmap_general != 0 {
+            (words.len() * 4 / stride).min(h[2].saturating_sub(self.bitmap_row) as usize)
+        } else {
+            h[2] as usize
+        };
         let f = |i: usize| f32::from_bits(h[i]);
         let (xorig, yorig, xmove, ymove) = (f(3), f(4), f(5), f(6));
         if self.raster_valid == 0 {
             return;
         }
         let x0 = (self.raster[0] - xorig).floor();
-        let y0 = (self.raster[1] - yorig).floor();
-        let stride = bits.div_ceil(8);
+        let y0 = (self.raster[1] - yorig).floor() + self.bitmap_row as f32;
         let byte = |i: usize| words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
         let mut v = Wv { z: self.raster[2], c: self.raster_color, cb: self.raster_color, ok: 1, ..Default::default() };
         for r in 0..rows {
@@ -1733,8 +1766,12 @@ impl Gl {
                 }
             }
         }
-        self.raster[0] += xmove;
-        self.raster[1] += ymove;
+        if self.bitmap_general != 0 {
+            self.bitmap_row += rows as u32;
+        } else {
+            self.raster[0] += xmove;
+            self.raster[1] += ymove;
+        }
     }
 
     fn point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {

@@ -1248,6 +1248,32 @@ fn gl_bitmap_draws_set_bits_at_the_raster_position() {
     m.stop_engines();
 }
 
+/// StudioTools uses GENERAL_BITMAP for text: rows padded to 64 bits,
+/// split across pixel commands, with a separate raster advance at the end.
+#[test]
+fn gl_general_bitmap_batches_and_raster_advance() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x91, &[0x1800F, 65, 3, f(2.0), f(1.0)]);
+    fifo_token(&m, 0x90, &[1, 8]);
+    fifo_pixel_data(&m, &[0x8000_0000, 0, 0x8000_0000, 0]);
+    assert_eq!(gl_px(&m, 8, 19), 0, "wait for the complete batch");
+    fifo_pixel_data(&m, &[0x4000_0000, 0, 0, 0]);
+    assert_eq!(gl_px(&m, 8, 19), 0xFF_FFFF);
+    assert_eq!(gl_px(&m, 72, 19), 0xFF_FFFF, "last bit of the wide row");
+    assert_eq!(gl_px(&m, 9, 20), 0xFF_FFFF, "second padded row");
+    assert_eq!(gl_px(&m, 8, 21), 0, "third row still pending");
+    fifo_token(&m, 0x90, &[1, 4]);
+    fifo_pixel_data(&m, &[0x2000_0000, 0, 0, 0]);
+    assert_eq!(gl_px(&m, 10, 21), 0xFF_FFFF, "next batch continues above");
+    fifo_token(&m, 0x92, &[f(100.0), f(4.0)]);
+    fifo_token(&m, 0x94, &[0x1800F, 8, 1, f(0.0), f(0.0), f(0.0), f(0.0), 1]);
+    fifo_pixel_data(&m, &[0x8000_0000, 0]);
+    assert_eq!(gl_px(&m, 110, 24), 0xFF_FFFF, "separate raster advance");
+    m.stop_engines();
+}
+
 /// A colour-index GL context (INIT_CI, as gr_osview's IRIS GL window
 /// sends): colours are indices and land in the pixels as 12-bit indices,
 /// for the colour-index visual's colormap; the clear uses the clear index.
