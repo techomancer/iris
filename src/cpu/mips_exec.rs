@@ -4375,7 +4375,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         { self.core.syscall_pending = false; }
 
         // Architectural effect (Cause/EPC/Status/vector) — the portable part
-        // shared with jitv2_verify (§4.2 single-implementation delivery).
+        // shared with jitv2-verify (§4.2 single-implementation delivery).
         crate::cpu::mips_core::deliver_exception(&mut self.core, status);
 
         // deliver_exception forces kernel privilege by setting EXL directly on
@@ -11444,7 +11444,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             ("l2".to_string(), "L2 Cache commands: l2 <check|dump> <addr|index>".to_string()),
             ("ll".to_string(), "LL/SC state: ll (llbit/lladdr) | ll stats | ll clear (histogram needs --features llstats)".to_string()),
             #[cfg(feature = "jitv2")]
-            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2_pcp_dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 memhelpers [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
+            ("j2".to_string(), "JIT v2 introspection: j2 pcp | j2 dumppcp [addr] [path] (capture page+memory for the jitv2-pcp-dump offline analyzer) | j2 corpus [dir] (dump every cached page to a corpus dir for offline codegen measurement) | j2 intrun [N] (instructions sharing one pending-interrupt check; 1 = per-instruction) | j2 status (alias: stats) | j2 inline [on|off] | j2 dispatch [on|off] | j2 fallback [on|off] | j2 inline_mem [on|off] | j2 memhelpers [on|off] | j2 pagewb [on|off] | j2 threads (read-only) | j2 <alu|fpu|branch|loadstore|cop0> [on|off] | j2 instrs [category] | j2 flush | j2 clear <paddr> | j2 deny <paddr> | j2 html [path] | j2 lockstep (status only; always on when built) | j2 lstate [full] [N] (recent lockstep step history, state entering each instr) (see also: jitcheck <n> for JIT-vs-interpreter determinism checking)".to_string()),
             #[cfg(feature = "developer")]
             ("trace".to_string(), "Execution trace capture: trace start <path> | trace stop | trace status".to_string()),
         ]
@@ -13090,7 +13090,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     // behind `PhysicalCodePage::dump_*`).
                     "dumppcp" => {
                         // Capture a PhysicalCodePage + its raw 4KB of memory to
-                        // a file for offline analysis with the `jitv2_pcp_dump`
+                        // a file for offline analysis with the `jitv2-pcp-dump`
                         // binary (which re-runs the real reachability walker and
                         // disassembles every requested/compiled/denylisted
                         // offset). `PcpDump` already had capture/to_bytes/
@@ -13145,7 +13145,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                             .map_err(|e| format!("write {}: {}", path, e))?;
                         writeln!(writer, "wrote {} (pfn {:#x}, gen {} entry_gen {}, fr1={})",
                             path, dump.pfn, dump.current_gen, dump.entry_gen, dump.fr1).unwrap();
-                        writeln!(writer, "analyse with: jitv2_pcp_dump {} [--offset <hex>] [--compile]", path).unwrap();
+                        writeln!(writer, "analyse with: jitv2-pcp-dump {} [--offset <hex>] [--compile]", path).unwrap();
                     }
                     // Bulk corpus capture, replacing the old
                     // `jitv2_corpus_dump` Cargo feature (see
@@ -13387,7 +13387,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // printed the bare word index instead, silently 4x
                         // too small (found live: reported 0x240 when the
                         // real byte offset, matching everything else this
-                        // command and jitv2_pcp_dump print, was 0x900).
+                        // command and jitv2-pcp-dump print, was 0x900).
                         if requested > 0 || published > 0 || denylisted > 0 {
                             writeln!(writer, "  offsets (R=requested C=compiled D=denylisted):").unwrap();
                             for off in 0..crate::cpu::jitv2::ENTRIES_PER_PAGE {

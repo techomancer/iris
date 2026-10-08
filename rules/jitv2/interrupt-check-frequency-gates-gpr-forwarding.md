@@ -340,10 +340,10 @@ shows up in guest MIPS.
 
 `IRIS_INTRUN=<n>` seeds the knob process-wide, read once via `Once` in
 `Codegen::interrupt_run()`. That seeding exists because the equivalence tests
-and `jitv2_pcp_dump` build their own `Codegen` and never call the setter — an
+and `jitv2-pcp-dump` build their own `Codegen` and never call the setter — an
 earlier version only wired the env var into `zz_corpus_sizes`, so
 `IRIS_INTRUN=8 cargo test equiv_test` silently verified the default and
-`jitv2_pcp_dump` printed two byte-identical listings for different settings.
+`jitv2-pcp-dump` printed two byte-identical listings for different settings.
 Both now report the effective `opt_level`/`intrun` they used.
 
 **Do not run full-corpus sweeps unbounded.** Cranelift parallelizes hard: four

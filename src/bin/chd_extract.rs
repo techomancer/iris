@@ -1,6 +1,6 @@
 //! One-shot tool: extract a SCSI HD CHD to a raw disk image.
 //!
-//! Usage: chd_extract <input.chd> <output.raw>
+//! Usage: chd-extract <input.chd> <output.raw>
 
 use std::env;
 use std::io::Write;

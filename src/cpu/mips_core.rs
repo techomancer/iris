@@ -2502,7 +2502,7 @@ impl MipsCore {
 /// `branch_delay`/`handle_exec_complete` set it on the plain dispatch path,
 /// and jitv2's `emit_slot_semantics` (`jitv2/codegen.rs`) sets it directly
 /// around a delay slot's inlined body, since the JIT has no separate
-/// dispatch step of its own to hang it on. `jitv2_verify` (no executor, only
+/// dispatch step of its own to hang it on. `jitv2-verify` (no executor, only
 /// a bare `MipsCore` reconstructed from a trace record) leaves it at
 /// whatever `MipsCore::new()`/the trace's seeded state left it as — a trace
 /// record's pre-state has no delay-slot context to recover, the same
@@ -2512,7 +2512,7 @@ impl MipsCore {
 /// Does NOT perform the two executor-level side effects the real
 /// `handle_exception` also does (`cache.set_llbit(false)`,
 /// `nanotlb_invalidate()`) — neither affects any field `CoreState`
-/// (`src/cpu/trace.rs`) tracks, and `jitv2_verify` has no cache/TLB to touch in
+/// (`src/cpu/trace.rs`) tracks, and `jitv2-verify` has no cache/TLB to touch in
 /// the first place. `handle_exception` remains responsible for those; this
 /// function only owns the part that's genuinely portable.
 ///

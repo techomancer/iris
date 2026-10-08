@@ -349,7 +349,7 @@ console command:
 | `j2 flush` | drop all compiled code and reset the arena (stop the CPU first) | — |
 | `j2 clear <paddr>` / `j2 deny <paddr>` | reset one physical code page / deny one entry | — |
 | `j2 status` (alias `j2 stats`) | arena usage, compile counts, reject reasons | — |
-| `j2 pcp` / `j2 dumppcp [addr] [path]` | physical code page introspection / capture for `jitv2_pcp_dump` | — |
+| `j2 pcp` / `j2 dumppcp [addr] [path]` | physical code page introspection / capture for `jitv2-pcp-dump` | — |
 | `j2 html [path]` | render the physical code page visualiser | — |
 | `j2 lockstep` / `j2 lstate [full] [N]` | lockstep status / recent lockstep history (`jitv2_lockstep`) | — |
 
@@ -401,8 +401,8 @@ Binaries:
 | `iris-bench` | benchmark driver (`bench/README.md`) |
 | `coffdump` | dump MIPS COFF executables |
 | `mkvh` | build and inspect SGI volume headers (`src/sgi_vh.rs`) |
-| `chd_extract` | extract CHD images |
-| `jitv2_analyze`, `jitv2_verify`, `jitv2_pcp_dump` | offline jitv2 analyzer/codegen tools (`--features jitv2`; `jitv2_pcp_dump` still declares the `j2wp` compatibility alias as a required feature) |
+| `chd-extract` | extract CHD images |
+| `jitv2-analyze`, `jitv2-verify`, `jitv2-pcp-dump` | offline jitv2 analyzer/codegen tools (`--features jitv2`; `jitv2-pcp-dump` still declares the `j2wp` compatibility alias as a required feature) |
 | `iris-gui` | the egui front-end (`-p iris-gui`) |
 
 Tests:

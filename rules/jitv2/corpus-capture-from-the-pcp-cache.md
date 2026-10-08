@@ -45,7 +45,7 @@ pages with requested==0 but compiled>0: 1337 of 1427
 
 Keying the walk off `requested` alone discards **99.5%** of the corpus — and
 it fails silently, reporting a smaller-but-plausible `total_bytes` rather than
-an error. Use the union, which is what `jitv2_pcp_dump`'s offline walk already
+an error. Use the union, which is what `jitv2-pcp-dump`'s offline walk already
 did:
 
 ```rust

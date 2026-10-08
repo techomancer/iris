@@ -1,6 +1,6 @@
 //! `j2 dumppcp` / `j2 corpus`: serialize a `PhysicalCodePage`'s full
 //! material state plus its backing 4KB physical memory to a single file, for
-//! later offline analysis by the standalone `jitv2_pcp_dump` tool
+//! later offline analysis by the standalone `jitv2-pcp-dump` tool
 //! (`src/bin/jitv2_pcp_dump.rs`) and as the corpus format that
 //! `zz_corpus_sizes` (`jitv2/mod.rs`) measures emitted code volume against.
 //!
@@ -95,7 +95,7 @@ pub const MAGIC_V1: &[u8; 8] = b"IRISPCP1";
 /// the writer here and the standalone tool's reader (`jitv2_pcp_dump.rs`
 /// duplicates this struct rather than depending on the `iris` lib's private
 /// `mips_exec`-adjacent glue; this module itself is `pub` and reused as a
-/// library dependency by that binary, same pattern as `jitv2_analyze`
+/// library dependency by that binary, same pattern as `jitv2-analyze`
 /// depending on `iris::cpu::jitv2::analyzer`).
 pub struct PcpDump {
     pub pfn: u32,

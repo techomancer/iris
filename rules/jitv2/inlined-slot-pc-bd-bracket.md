@@ -60,7 +60,7 @@ EPC and BD as arguments instead of through memory.**
 
 - `mips_core::deliver_exception_at(core, status, fault_pc, bd)` holds the
   logic; `deliver_exception(core, status)` is now a two-line wrapper reading
-  the fields, so interpreter and `jitv2_verify` callers are untouched.
+  the fields, so interpreter and `jitv2-verify` callers are untouched.
 - `MipsExecutor::handle_exception_at`, and a new
   `MipsCore::handle_exception_at_fn` FFI hook `(ctx, status, fault_pc, bd)`.
 - Codegen splits the exit into two wrappers over **one** shared call block

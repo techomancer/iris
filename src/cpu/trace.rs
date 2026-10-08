@@ -70,7 +70,7 @@ pub struct CoreState {
     pub fpu_fenr: u32,
     /// Whether the recorded instruction is a branch/jump's delay slot —
     /// `MipsCore::in_delay_slot` at capture time. Needed by
-    /// `jitv2_verify`'s `deliver_exception` call for a record whose
+    /// `jitv2-verify`'s `deliver_exception` call for a record whose
     /// instruction traps: without it, every trap looks like it happened
     /// outside a delay slot (EPC/Cause.BD both computed wrong for the
     /// records that actually were slots) — `MipsCore::new()`'s default
@@ -97,7 +97,7 @@ impl TraceRecord {
     }
 
     /// Build a record directly from a `pc`/`raw`/`state` triple — used by
-    /// tests and tools (e.g. `jitv2_verify`'s own test suite) that construct
+    /// tests and tools (e.g. `jitv2-verify`'s own test suite) that construct
     /// trace records synthetically rather than capturing from a live
     /// `MipsCore`. `state.pc` should normally equal `pc`.
     pub fn new(pc: u64, raw: u32, state: CoreState) -> Self {

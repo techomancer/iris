@@ -233,7 +233,7 @@ PAGE_SIZE (0x1000)`, whose bit 12 collides with `vbase`'s own bit 12 —
 silently dropping the page carry and landing the JIT back on the *same*
 page instead of the next one.
 
-Found via `jitv2_verify` against a real IRIX 5.3 boot trace, showing up as
+Found via `jitv2-verify` against a real IRIX 5.3 boot trace, showing up as
 an "UNEXPLAINED control-flow diverged" line with the JIT's pc exactly one
 page behind the trace's — e.g. a Sequential instruction at `0x...9fc0fffc`
 landed the JIT at `0x9fc0f000` instead of the correct `0x9fc10000`. Confirmed
@@ -248,7 +248,7 @@ identical result for every in-range `word_offset`, correct carry at the
 bit is set so a reverted fix fails loudly instead of hiding behind a
 lucky-bit-pattern page address.
 
-## Self-looping backward branches can't be validated by single-instruction jitv2_verify mode (not a codegen bug) — resolved by chain mode's back-edge guard
+## Self-looping backward branches can't be validated by single-instruction jitv2-verify mode (not a codegen bug) — resolved by chain mode's back-edge guard
 
 A branch whose taken target lands on an already-visited word within the same
 walked region (most commonly a literal self-loop, e.g. `BGTZ r2,-1` with a
@@ -295,7 +295,7 @@ first pass.
 
 A real IRIX boot hit `panicked at src/cpu/jitv2/codegen.rs:1749:18: exit_reason
 is None -> analyzer guarantees target_word continues into the region` —
-not in `jitv2_verify`, in the *live* JIT compiler thread. Root cause: a
+not in `jitv2-verify`, in the *live* JIT compiler thread. Root cause: a
 branch/jump whose target word coincides with a word that's *also* someone's
 delay slot (§6.1.4's "same-offset dual semantics" — the design doc already
 named this case, but the implementation didn't actually handle it).
@@ -372,7 +372,7 @@ termination fix, and (as a byproduct) confirm the self-loop-convergence
 behavior described in the section above actually produces the
 hand-computed-correct final register state, not just "doesn't crash."
 
-## jitv2_verify's multi-instruction chain mode (`--chain N`) — real bugs found building it
+## jitv2-verify's multi-instruction chain mode (`--chain N`) — real bugs found building it
 
 Added `--chain N` to `src/bin/jitv2_verify.rs`: instead of verifying one
 instruction (or one branch+slot unit) per compiled region, grow each

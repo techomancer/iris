@@ -38,7 +38,7 @@
 //!   reconstructible from the trace alone). Reported separately from
 //!   register-content mismatches since it's not necessarily a bug.
 //!
-//! Usage: jitv2_verify <trace_file> [--limit N] [--verbose]
+//! Usage: jitv2-verify <trace_file> [--limit N] [--verbose]
 
 use std::path::PathBuf;
 
@@ -213,7 +213,7 @@ fn parse_args() -> Args {
         }
     }
     let trace_path = trace_path.unwrap_or_else(|| {
-        eprintln!("Usage: jitv2_verify <trace_file> [--skip N] [--limit N] [--verbose] [--chain N]");
+        eprintln!("Usage: jitv2-verify <trace_file> [--skip N] [--limit N] [--verbose] [--chain N]");
         std::process::exit(2);
     });
     Args { trace_path, limit, skip, verbose, chain }
@@ -277,7 +277,7 @@ fn main() {
     } else {
         run_chain(&args.trace_path, args.skip, args.limit, args.verbose, args.chain)
     }.unwrap_or_else(|e| {
-        eprintln!("jitv2_verify: {}", e);
+        eprintln!("jitv2-verify: {}", e);
         std::process::exit(1);
     });
 

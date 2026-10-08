@@ -3564,7 +3564,7 @@ mod tests {
         // set whenever the *previous* page's own address does, and more
         // fundamentally OR is not addition: `vbase | PAGE_SIZE` is only
         // `vbase + PAGE_SIZE` when vbase's PAGE_SIZE bit is 0, which is not
-        // guaranteed for every page. Found via jitv2_verify against a real
+        // guaranteed for every page. Found via jitv2-verify against a real
         // IRIX 5.3 boot trace: a Sequential instruction at 0x...9fc0fffc
         // landed the JIT back on page 0x9fc0f000 instead of advancing to
         // 0x9fc10000.
@@ -3996,7 +3996,7 @@ mod tests {
         // *same* Cranelift block (§2.2/§3.1 "loops stay native"), so the
         // compiled function runs the whole loop to convergence in one call
         // rather than one iteration per call. This is intentional per the
-        // design (not a jitv2_verify-checkable shape — see
+        // design (not a jitv2-verify-checkable shape — see
         // rules/jitv2/codegen-gotchas.md's self-loop note) but must still
         // produce the architecturally correct final state: same as running
         // the interpreter for the same number of iterations by hand.

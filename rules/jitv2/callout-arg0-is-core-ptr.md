@@ -64,7 +64,7 @@ Dereferencing a callout's `ctx` raw reads `MipsCore` at a 4-byte offset —
 every field lands on the wrong bytes, silently, with no fault. A
 `debug_assert!` in `core_from_arg` catches null/garbage but cannot catch an
 unbiased-but-valid pointer, so the rule is procedural: **one entry point, no
-exceptions.** `jitv2_verify`'s shim uses it too, even though it only wants the
+exceptions.** `jitv2-verify`'s shim uses it too, even though it only wants the
 `MipsCore` and never the executor.
 
 ### Why the bias exists

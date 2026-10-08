@@ -732,7 +732,7 @@ impl Gr2 {
                 if is_fin3_token(index) {
                     // Executed (FIN3 raised if it was a Finish): no longer
                     // pending. Saturating: tests and replays push directly.
-                    let _ = self.fin3_pending.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                    let _ = self.fin3_pending.try_update(Ordering::AcqRel, Ordering::Acquire,
                         |n| Some(n.saturating_sub(1)));
                 }
                 self.hq_fifo.consume();

@@ -1091,7 +1091,7 @@ impl Codegen {
     /// exact PC, in the interpreter loop, immediately before ever calling
     /// into compiled code; repeating them here would just recheck the same
     /// state a second time for no reason. `false` for every other caller
-    /// (the equivalence-test harness, `jitv2_verify`): none of them are
+    /// (the equivalence-test harness, `jitv2-verify`): none of them are
     /// preceded by a real interpreter dispatch loop, so the entry word's
     /// preamble is the *only* place those checks would ever run for it —
     /// omitting them there would silently under-test/under-implement the
@@ -2402,7 +2402,7 @@ impl Codegen {
     /// `compile_region_uncommitted` + an immediate one-function
     /// `finalize_batch` call.
     /// Single-entry compatibility wrapper: used by test suites
-    /// (equivalence tests, `jitv2_verify`, this module's own
+    /// (equivalence tests, `jitv2-verify`, this module's own
     /// unit tests) — takes an `instrs` buffer produced by a
     /// plain `Analyzer::walk`/`walk_bounded` call (which knows nothing about
     /// `is_entry_point` or `has_fpu`) and adapts it
@@ -3429,7 +3429,7 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
     // vbase's own PAGE_SIZE bit happens to already be set, landing back on
     // this page instead of the next one. iadd carries correctly there and is
     // equivalent to bor for every in-range word_offset, so this isn't a
-    // behavior change elsewhere. (Found via jitv2_verify against a real
+    // behavior change elsewhere. (Found via jitv2-verify against a real
     // IRIX 5.3 boot trace.)
     let exit_pc = builder.ins().iadd(vbase, byte_offset);
     builder.ins().store(mem, exit_pc, core_ptr, pc_off);

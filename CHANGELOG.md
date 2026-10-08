@@ -492,8 +492,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   default** after it broke Linux (`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 - `j2wp` whole-page compile, `jitv2_lockstep`, `jitv2_smc_check`,
   the `j2` monitor command (`clear`, `deny`, `pagewb`,
-  `html` physical code page visualiser, …) and the `jitv2_analyze`,
-  `jitv2_verify`, `jitv2_pcp_dump` tools.
+  `html` physical code page visualiser, …) and the `jitv2-analyze`,
+  `jitv2-verify`, `jitv2-pcp-dump` tools.
 - Status-bar feedback for JIT activity.
 - **The original tiered MIPS JIT was removed** (`33c4e68`), along with its
   `jit` feature, `IRIS_JIT*` environment variables and `rules/jit/`.
@@ -704,7 +704,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `iris-ci rtc-save`, `cdrom-eject`, `cdrom-load`; `get`/`put` work under a
   `/bin/sh` guest shell.
 - Monitor: `ps2 type`/`enter`/`status`, `proc info`.
-- `chd_extract` tool.
+- `chd-extract` tool.
 - First R5000 support (slower than R4400 under the interpreter because every
   cache access probes two ways).
 - Enabled build features are printed at startup.

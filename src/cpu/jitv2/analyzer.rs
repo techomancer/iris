@@ -673,7 +673,7 @@ impl Analyzer {
     /// A branch/jump whose taken and/or fallthrough targets are cut off by
     /// the budget gets [`StopReason::Truncated`] on that edge — a distinct
     /// reason from `Excluded`, so callers (and the region-size stats in
-    /// `jitv2_analyze`) never confuse "hit the instruction budget" with a
+    /// `jitv2-analyze`) never confuse "hit the instruction budget" with a
     /// genuine excluded-instruction boundary.
     pub fn walk_bounded(&mut self, page: &[u32; ENTRIES_PER_PAGE], entry_word: WordOffset, page_base: u32, max_instrs: usize) -> (&[CompiledInstr; ENTRIES_PER_PAGE], bool) {
         self.instrs.fill(CompiledInstr::default());
@@ -1680,7 +1680,7 @@ mod tests {
 
     #[test]
     fn region_boundary_is_declined_even_with_fallback_on() {
-        // jitv2_verify poisons a branch's untaken arm so the analyzer bails on
+        // jitv2-verify poisons a branch's untaken arm so the analyzer bails on
         // that edge. An `Excluded` word is not enough: with fallback on it is
         // admitted as a fallback head (see the test below, which asserts
         // exactly that for a COP0 word). RegionBoundary is declined first.

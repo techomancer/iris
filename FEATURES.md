@@ -583,7 +583,7 @@ branch/jump+NOP delay-slot fusion, jitv2's counterparts to the interpreter's
 `opcodefusion` — OFF by default, unlike the interpreter's own fusion, due to a
 history of live-boot bugs; see
 `rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`). Developer tools:
-`jitv2_analyze`, `jitv2_verify` and `jitv2_pcp_dump` binaries, and the `j2`
+`jitv2-analyze`, `jitv2-verify` and `jitv2-pcp-dump` binaries, and the `j2`
 monitor command.
 
 Compiled pages can be reused across runs with the optional persistent cache:

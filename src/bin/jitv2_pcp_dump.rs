@@ -7,7 +7,7 @@
 //! machine that already crashed/stopped and isn't available to query live
 //! anymore.
 //!
-//! Usage: jitv2_pcp_dump <dump_file> [--offset <hex>] [--compile]
+//! Usage: jitv2-pcp-dump <dump_file> [--offset <hex>] [--compile]
 //!   --offset <hex>  also walk+disassemble starting from this specific word
 //!                    offset (page-relative, e.g. 0x60), regardless of
 //!                    whether it was requested/compiled/denylisted at dump
@@ -25,7 +25,7 @@ use iris::cpu::jitv2::{ENTRIES_PER_PAGE, PAGE_SIZE};
 use iris::cpu::mips_dis::disassemble;
 
 fn print_usage_and_exit() -> ! {
-    eprintln!("Usage: jitv2_pcp_dump <dump_file> [--offset <hex>] [--compile]");
+    eprintln!("Usage: jitv2-pcp-dump <dump_file> [--offset <hex>] [--compile]");
     std::process::exit(1);
 }
 
@@ -45,7 +45,7 @@ fn main() {
                 let v = args.get(i + 1).unwrap_or_else(|| print_usage_and_exit());
                 let v = v.strip_prefix("0x").unwrap_or(v);
                 extra_offset = Some(u16::from_str_radix(v, 16).unwrap_or_else(|_| {
-                    eprintln!("jitv2_pcp_dump: bad --offset value '{}'", args[i + 1]);
+                    eprintln!("jitv2-pcp-dump: bad --offset value '{}'", args[i + 1]);
                     std::process::exit(1);
                 }));
                 i += 2;
@@ -55,7 +55,7 @@ fn main() {
                 i += 1;
             }
             other => {
-                eprintln!("jitv2_pcp_dump: unknown argument '{}'", other);
+                eprintln!("jitv2-pcp-dump: unknown argument '{}'", other);
                 print_usage_and_exit();
             }
         }
@@ -64,14 +64,14 @@ fn main() {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("jitv2_pcp_dump: cannot read '{}': {}", path, e);
+            eprintln!("jitv2-pcp-dump: cannot read '{}': {}", path, e);
             std::process::exit(1);
         }
     };
     let dump = match PcpDump::from_bytes(&bytes) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("jitv2_pcp_dump: {}: {}", path, e);
+            eprintln!("jitv2-pcp-dump: {}: {}", path, e);
             std::process::exit(1);
         }
     };

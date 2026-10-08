@@ -40,7 +40,7 @@ build.
 
 Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
 `iris-bench` (benchmark driver), `coffdump`, `mkvh` (SGI volume headers),
-`chd_extract` (`chd`), `jitv2_analyze`/`jitv2_verify`/`jitv2_pcp_dump`
+`chd-extract` (`chd`), `jitv2-analyze`/`jitv2-verify`/`jitv2-pcp-dump`
 (`jitv2`), and `iris-gui` in the workspace. Feature flags are documented in
 `README.md`.
 

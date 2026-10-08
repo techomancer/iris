@@ -122,7 +122,7 @@ mod zz_corpus {
         // some entries are being dropped silently — which is exactly what
         // happened when only `n_decl` existed: 178 entries went missing
         // between `entries=77690` and `ok=77512` with nothing accounting for
-        // them, while `jitv2_pcp_dump` showed 13 walk-declined entries on the
+        // them, while `jitv2-pcp-dump` showed 13 walk-declined entries on the
         // very first page of the corpus.
         let mut n_walk_decl = 0u64;
         let mut n_pages = 0u64;
@@ -192,7 +192,7 @@ mod zz_corpus {
             // the filename.
             //
             // The UNION of `requested` and `compiled`, not `requested`
-            // alone — same entry set `jitv2_pcp_dump`'s offline walk uses,
+            // alone — same entry set `jitv2-pcp-dump`'s offline walk uses,
             // and for the same reason. `requested` is not a cumulative
             // record of every entry ever asked for: a bit is
             // cleared once a compile covers it, so on a page whose compiles

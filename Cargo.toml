@@ -350,7 +350,7 @@ name = "iris-bench"
 path = "src/bin/iris_bench.rs"
 
 [[bin]]
-name = "chd_extract"
+name = "chd-extract"
 path = "src/bin/chd_extract.rs"
 
 [[bin]]
@@ -358,17 +358,17 @@ name = "mkvh"
 path = "src/bin/mkvh.rs"
 
 [[bin]]
-name = "jitv2_analyze"
+name = "jitv2-analyze"
 path = "src/bin/jitv2_analyze.rs"
 required-features = ["jitv2"]
 
 [[bin]]
-name = "jitv2_verify"
+name = "jitv2-verify"
 path = "src/bin/jitv2_verify.rs"
 required-features = ["jitv2"]
 
 [[bin]]
-name = "jitv2_pcp_dump"
+name = "jitv2-pcp-dump"
 path = "src/bin/jitv2_pcp_dump.rs"
 required-features = ["jitv2", "j2wp"]
 

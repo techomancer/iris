@@ -4,7 +4,7 @@
 //! measurements the design doc calls for (§9): region-size histogram,
 //! exclusion-reason counts, 0xFFC hit rate.
 //!
-//! Usage: jitv2_analyze [corpus_dir]   (default: jitv2_corpus)
+//! Usage: jitv2-analyze [corpus_dir]   (default: jitv2_corpus)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -74,7 +74,7 @@ fn main() {
     let read_dir = match std::fs::read_dir(corpus_dir) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("jitv2_analyze: cannot read corpus dir '{}': {}", corpus_dir, e);
+            eprintln!("jitv2-analyze: cannot read corpus dir '{}': {}", corpus_dir, e);
             std::process::exit(1);
         }
     };
@@ -89,7 +89,7 @@ fn main() {
         }
     }
 
-    eprintln!("jitv2_analyze: {} corpus entries found in '{}'", entries.len(), corpus_dir);
+    eprintln!("jitv2-analyze: {} corpus entries found in '{}'", entries.len(), corpus_dir);
 
     let mut stats = Stats::default();
     // One Analyzer, reused across every corpus entry — its scratch buffer is
@@ -101,7 +101,7 @@ fn main() {
         let page = match load_page(&entry.path) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("jitv2_analyze: failed to read {}: {}", entry.path.display(), e);
+                eprintln!("jitv2-analyze: failed to read {}: {}", entry.path.display(), e);
                 stats.files_failed += 1;
                 continue;
             }
