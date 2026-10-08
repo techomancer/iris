@@ -313,8 +313,9 @@ const PP1_RGB24_BUFFER_A: u32 = 0x0C00_6204;
 const IR_AREA_LTOR: u32 = super::rss::OP_AREA_LTOR;
 const IR_AREA_RTOL: u32 = super::rss::OP_AREA_RTOL;
 const IR_GL_LINE: u32 = super::rss::OP_GL_LINE;
-/// SEND_PIXELS' routine for a texture image (glDrawPixels' is 0x49D0).
+/// SEND_PIXELS' routine for a texture image, and glDrawPixels'.
 const SEND_PIXELS_TEXTURE: u32 = 0x511A;
+const SEND_PIXELS_DRAW: u32 = 0x49D0;
 /// XFRCONTROL: start a DMA transfer to the texture side (te1.rs, rss.rs).
 const TE_LOAD_START: u32 = 0x5;
 /// XFRCONTROL: a DMA read from the texture side (glGetTexImage starts it
@@ -1039,6 +1040,19 @@ impl Gl {
                 let (w, h) = (self.tl_rect[2], self.tl_rect[3]);
                 let words = (w * te1::Te1::read_texel_bytes(self.xfrmode)).div_ceil(4);
                 self.send_pixels = [words, 0, 0, h, 0, 1, SEND_PIXELS_TEXTURE, 0];
+                self.send_pixels_pending = 1;
+            }
+            // glDrawPixels whose image comes by host DMA in one transfer:
+            // the write half of glCopyPixels (Maya copies the front buffer
+            // to the back after a full redraw, then redraws only what
+            // changes: 0xDA8 rectangle 780 x 490, CI 16 bits a pixel, one
+            // DMA line of 0xBA9F0 bytes, start 0xA7). The 0xDA8 transfer
+            // size gives the rows and their width in transfer mode pixels.
+            tok::WRITE_DMAGESETUP if d.len() >= 4 && d[3] == SEND_PIXELS_DRAW => {
+                let xs = self.tl_rect[4];
+                let (w, h) = (xs & 0xFFFF, xs >> 16);
+                let words = (w * super::rss::bytes_per_pixel(self.xfrmode)).div_ceil(4);
+                self.send_pixels = [words, 0, 0, h, 0, 1, SEND_PIXELS_DRAW, 0];
                 self.send_pixels_pending = 1;
             }
             tok::RESTORE_RSS => {

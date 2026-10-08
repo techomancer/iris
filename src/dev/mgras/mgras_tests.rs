@@ -2357,6 +2357,35 @@ fn gl_draw_pixels_rgba8_component_order() {
     m.stop_engines();
 }
 
+/// glCopyPixels' write half by host DMA (Maya copies the front buffer to
+/// the back after a full redraw, then redraws only what changes): the
+/// image size from pixel state 0xDA8, the transfer mode from the RSS
+/// register list, _WRITE_DMAGESETUP with glDrawPixels' routine (0x49D0),
+/// then one DMA line with every row. Without it the back buffer keeps
+/// whatever it held, and every other frame shows that.
+#[test]
+fn gl_draw_pixels_by_host_dma() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x0A, &[12]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0xC0_0001]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 2, 6, 0, 0, 3, 1, 2 << 16 | 4, 1, 0]);
+    fifo_token(&m, 0x9D, &[0, 0x175, 0x7C, 0x49D0]);
+    let mem = eram_dma_setup(&m, 16);
+    for (i, v) in [0x801u16, 0x802, 0x803, 0x804, 0x805, 0x806, 0x807, 0x808].iter().enumerate() {
+        let [hi, lo] = v.to_be_bytes();
+        mem.bytes.lock().insert(0x2000 + 2 * i as u32, hi);
+        mem.bytes.lock().insert(0x2001 + 2 * i as u32, lo);
+    }
+    fifo_dma(&m, 0x0B, 0x1);
+    fifo_token(&m, 0xD3, &[]);
+    let got: Vec<u32> = [(10, 20), (13, 20), (10, 21), (13, 21)].iter().map(|&(x, y)| gl_px(&m, x, y) & 0xFFF).collect();
+    assert_eq!(got, [0x801, 0x804, 0x805, 0x808], "bottom row first");
+    drop(mem);
+    m.stop_engines();
+}
+
 /// Softimage's CI8 overlay has a separate pointer, upper-plane index mask,
 /// and absolute draw selector. Clears and geometry must leave main intact.
 #[test]
