@@ -1508,7 +1508,7 @@ impl App {
             });
             ui.menu_button("Help  ▶", |ui| {
                 ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
-                ui.label(format!("Version {}", env!("APP_VERSION")));
+                ui.label(format!("Version {} ({})", env!("APP_VERSION"), env!("APP_COMMIT")));
                 ui.separator();
                 ui.label(RichText::new("Diagnostics").strong());
                 let running = self.emu.is_running();
