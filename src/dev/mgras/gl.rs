@@ -376,9 +376,11 @@ pub struct Gl {
     /// glDrawBuffer bits, and whether the buffers have swapped an odd
     /// number of times (front = B, back = A).
     draw_bits: u32,
-    /// Absolute PP1 draw selector supplied in DRAW_BUFFER word 1.
-    draw_selector: u32,
-    draw_selector_valid: u32,
+    /// DRAW_BUFFER's second word, the buffers drawn after an odd number of
+    /// swaps (see `draw_mask`), and its third, the buffers drawn less one;
+    /// `draw_words` is set when the token carried them.
+    draw_bits_swapped: u32,
+    draw_words: u32,
     buffer_count: u32,
     /// The driver's PP1 pixel-format and buffer-size fields.
     pixel_format: u32,
@@ -936,8 +938,8 @@ impl Gl {
             tok::DRAW_BUFFER => {
                 self.end_raster(sink);
                 self.draw_bits = w0;
-                self.draw_selector_valid = (d.len() >= 3) as u32;
-                self.draw_selector = d.get(1).copied().unwrap_or(1) & 0x7F;
+                self.draw_words = (d.len() >= 3) as u32;
+                self.draw_bits_swapped = d.get(1).copied().unwrap_or(1) & 0x7F;
                 self.buffer_count = d.get(2).copied().unwrap_or(0) & 1;
             }
             tok::BEGIN_POINTS..=tok::BEGIN_POLYGON => {
@@ -1762,15 +1764,34 @@ impl Gl {
         self.swapped ^= 1;
     }
 
+    /// The buffers drawn into, from DRAW_BUFFER (libGLcore's
+    /// __glMgrasDrawBuffer always sends three words): the first word
+    /// before an odd number of swaps, the second after. 1 is buffer A; B is
+    /// 2 in 12-bit visuals and 4 in 24-bit ones (GL_FRONT [1, 2] or [1, 4],
+    /// GL_BACK [2, 1] or [4, 1], both [3, 3] or [5, 5], traced: every
+    /// double-buffered demo sends [4, 1]); 0x4N the overlay planes (aux
+    /// buffers, [0x48, 0x48]); 0 nothing. None for one-word tokens.
+    fn draw_mask(&self) -> Option<u32> {
+        (self.draw_words != 0).then(|| if self.swapped != 0 { self.draw_bits_swapped } else { self.draw_bits & 0x7F })
+    }
+
     /// The DRBpointers value for the colour buffer drawn into: the window's
-    /// pointers unchanged when the driver supplies an absolute PP1 selector.
-    /// Older one-word tokens choose the front/back page in bits 9:0.
+    /// pointers with bits 9:0 set to the page drawn (A in bits 9:0, B in
+    /// 19:10 of the window's value); unchanged for both buffers (PP1 draw
+    /// field 3 writes both pages) and for the overlay.
     fn draw_pointers(&self) -> u32 {
         let drb = self.window.drb;
-        if self.draw_selector_valid != 0 { return drb; }
         let (a, b) = (drb & 0x3FF, (drb >> 10) & 0x3FF);
-        let back = self.draw_bits & 0xC != 0;
-        let page = if back != (self.swapped != 0) { b } else { a };
+        let page = match self.draw_mask() {
+            Some(m) if m & 0x70 == 0x40 => return drb,
+            Some(m) if m & 1 != 0 && m & 0xE != 0 => return drb,
+            Some(m) => if m & 0xE != 0 { b } else { a },
+            None => {
+                // One-word tokens: the back bits, from the swap state.
+                let back = self.draw_bits & 0xC != 0;
+                if back != (self.swapped != 0) { b } else { a }
+            }
+        };
         (drb & !0x3FF) | page
     }
 
@@ -1855,21 +1876,26 @@ impl Gl {
     /// index (pixel type 6) in a colour-index context. Main pixels use our
     /// canonical storage format; overlays retain the driver's CI8 format.
     fn pp1_base(&self) -> u32 {
-        let mut pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
-        if self.draw_selector_valid != 0 {
-            pp1 = (pp1 & !((0x7F << 14) | (1 << 11))) | self.draw_selector << 14 | self.buffer_count << 11;
-            if self.draw_selector & 0x70 == 0x40 {
-                pp1 = (pp1 & !0x2700) | self.pixel_format;
+        let pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
+        match self.draw_mask() {
+            // The overlay: its draw field, buffer count and the driver's
+            // pixel format.
+            Some(m) if m & 0x70 == 0x40 => {
+                let pp1 = (pp1 & !((0x7F << 14) | (1 << 11))) | m << 14 | self.buffer_count << 11;
+                (pp1 & !0x2700) | self.pixel_format
             }
+            // A and B: draw field 3.
+            Some(m) if m & 1 != 0 && m & 0xE != 0 => (pp1 & !(0x7F << 14)) | 3 << 14,
+            _ => pp1,
         }
-        pp1
     }
 
     /// Plane masks in the RSS storage layout for the selected GL buffer.
     fn color_write_masks(&self) -> (u32, u32) {
-        if self.draw_selector_valid != 0 {
-            if self.draw_selector == 0 { return (0, 0); }
-            if self.draw_selector & 0x70 == 0x40 { return (0, self.index_mask & 0xFF); }
+        match self.draw_mask() {
+            Some(0) => return (0, 0),
+            Some(m) if m & 0x70 == 0x40 => return (0, self.index_mask & 0xFF),
+            _ => {}
         }
         if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
         let cm = self.color_mask;

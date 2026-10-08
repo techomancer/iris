@@ -2320,7 +2320,7 @@ fn gl_native_overlay_clear_geometry_and_bitmap() {
         let b = super::pixmem::Buffer::new(0x1C0, super::pixmem::Kind::Overlay, 0x31E);
         rss.mem.put(&b, 100, 100, 1); // another overlay plane must survive
     }
-    fifo_token(&m, 0xE4, &[0, 0, 0x11, 0, 0, 0, 0, 0, 0, 399, 299, 0x101C0, 0, 0, 0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x101C0, 0, 0, 0]);
     fifo_token(&m, 0x0A, &[8]);
     fifo_token(&m, 0x9A, &[0x2500, 0x2500]);
     fifo_token(&m, 0x49, &[0x48, 0x48, 1]);
@@ -2350,13 +2350,13 @@ fn gl_native_overlay_clear_geometry_and_bitmap() {
 }
 
 #[test]
-fn gl_native_draw_buffer_selects_both_absolute_pages() {
+fn gl_native_draw_buffer_masks_follow_the_swap() {
     let m = gl_board([0.0, 0.0, 0.0]);
-    fifo_token(&m, 0xE4, &[0, 0, 0x11, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
     fifo_token(&m, 0x49, &[3, 3, 1]);
     gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
     gl_full_quad(&m);
-    fifo_token(&m, 0x49, &[2, 1, 0]); // logical back, physical A
+    fifo_token(&m, 0x49, &[2, 1, 0]); // GL_BACK, 12-bit: B until a swap
     gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
     gl_tri(&m, [0.0, 1.0, 0.0], [[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [0.0, 200.0, 0.0]]);
     fifo_token(&m, 0x49, &[0, 0, 0]);
@@ -2371,9 +2371,35 @@ fn gl_native_draw_buffer_selects_both_absolute_pages() {
     let b = super::pixmem::Buffer::new(0x140, super::pixmem::Kind::Wide, 0x31E);
     assert_eq!(rss.mem.get(&a, 300, 100) as u32 & 0xFF_FFFF, 0xFF);
     assert_eq!(rss.mem.get(&b, 300, 100) as u32 & 0xFF_FFFF, 0xFF, "both pages drawn");
-    assert_eq!(rss.mem.get(&a, 50, 50) as u32 & 0xFF_FFFF, 0xFF00, "physical A wins over logical back");
-    assert_eq!(rss.mem.get(&b, 50, 50) as u32 & 0xFF_FFFF, 0xFF, "physical B preserved");
+    assert_eq!(rss.mem.get(&b, 50, 50) as u32 & 0xFF_FFFF, 0xFF00, "back before a swap: B");
+    assert_eq!(rss.mem.get(&a, 50, 50) as u32 & 0xFF_FFFF, 0xFF, "front A preserved");
     drop(_sub);
+    m.stop_engines();
+}
+
+/// Every double-buffered demo traced (atlantis, powerflip, solidview)
+/// draws with DRAW_BUFFER [4, 1, 0], GL_BACK in a 24-bit visual: buffer B
+/// (4) until a swap, A (1) after it, B again after the next.
+#[test]
+fn gl_back_buffer_alternates_with_swaps() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x49, &[4, 1, 0]);
+    let page = |m: &Mgras, p: u32| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(p, super::pixmem::Kind::Wide, 0x31E), 50, 50) as u32 & 0xFF_FFFF
+    };
+    for (k, c) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].iter().enumerate() {
+        gl_color4(&m, [c[0], c[1], c[2], 1.0]);
+        gl_full_quad(&m);
+        let want = (c[0] as u32) * 0xFF | (c[1] as u32) * 0xFF00 | (c[2] as u32) * 0xFF_0000;
+        let (drawn, other) = if k % 2 == 0 { (0x140, 0x240) } else { (0x240, 0x140) };
+        assert_eq!(page(&m, drawn), want, "frame {k} draws the back buffer");
+        assert_ne!(page(&m, other), want, "frame {k} leaves the front alone");
+        write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    }
     m.stop_engines();
 }
 
