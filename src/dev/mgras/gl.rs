@@ -467,7 +467,8 @@ pub struct Gl {
     pub pixel_block: [u32; 2],
     read_back: u32,
     /// Between SAVE_RSS and RESTORE_RSS: a GL pixel operation, whose
-    /// register lists belong inside the raster bracket.
+    /// register lists belong inside the raster bracket. 2 denotes a
+    /// framebuffer read, whose DMA bytes need GE component ordering.
     pub pixel_op: u32,
     /// Primitive assembly: the open primitive (`prim`), vertices since its
     /// BEGIN, and the buffered vertices (strips and fans keep the first
@@ -1538,6 +1539,7 @@ impl Gl {
     /// (raster interface register 5, see hq3.rs). The raster state stays
     /// loaded until RESTORE_RSS.
     fn get_pixels(&mut self, sink: &mut dyn Hq3Sink) {
+        self.pixel_op = 2;
         self.begin_raster(sink);
         let depth = (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3;
         let drb = if depth {

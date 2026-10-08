@@ -1124,6 +1124,16 @@ impl Hq3Engine {
                         stream.drain(..n).collect()
                     }
                 };
+                // The RSS exposes X's packed ABGR byte pixels. A GE
+                // framebuffer read returns RGBA components before the HQ
+                // formatter (as RGB/16-bit reads already do in to_host).
+                // Without this, glCopyPixels rotates alpha into red each
+                // time it draws the saved image back.
+                if matches!(peer, DmaPeer::Raster) && self.gl.pixel_op == 2 && self.gl.xfrmode & 0xFF == 0x80 {
+                    for px in bytes.chunks_exact_mut(4) {
+                        px.reverse();
+                    }
+                }
                 format_pixels(self.formatter, &mut bytes);
                 for (k, b) in bytes.iter().take(len as usize).enumerate() {
                     let Some(pa) = phys(a + k as u32) else { return };
