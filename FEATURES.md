@@ -63,7 +63,7 @@ turn off those dependency defaults.
 
 | GUI feature | Purpose | Enables |
 |---|---|---|
-| `bundled` | Distribution UI: hides TOML import/export; named machines remain in gui.json. | — |
+| `bundled` | Distribution UI: hides source-checkout tools; machine TOML storage is shared by all builds. | — |
 | `appstore` | Mac App Store UI, sandbox bookmarks, private-API patch, CHD diff redirection, and REX3 JIT disabled at startup; hides CI/Ultra64 controls. | `bundled` |
 | `pcap` | Expose PCAP NIC selection and bridge support in the embedded core. | `iris/pcap` |
 | `premiere` | Performance bundle for the embedded core; lightning plus idle parking. | `iris/lightning`, `iris/idle-pause` |
@@ -117,11 +117,11 @@ separate from the runtime environment inventory below.
 ## Shared machine configuration inventory
 
 Source: [src/config.rs](src/config.rs), `MachineConfig` and nested structs.
-The CLI reads `iris.toml` (or `--config FILE`); iris-gui stores the same schema
-inside its named machines in `<config dir>/iris/gui.json`. TOML import/export
-is available in GUI source builds. Relative core paths resolve from the process
-working directory; the GUI anchors its default battery-backed paths in its
-user config directory.
+The CLI reads `iris.toml` (or `--config FILE`); iris-gui reads and saves the same
+TOML schema in `<config dir>/iris/machines/<name>/<name>.toml`. `gui.json` holds
+GUI preferences. The GUI uses the selected machine folder as the working
+directory, stores config paths as relative paths, and defaults to `disks/` for
+disk images and `nvram.bin`/`nveeprom.bin` for private battery-backed state.
 
 Defaults below are **core schema/runtime defaults**, not this checkout's
 sample iris.toml or the GUI New Machine dialog. GUI IP28 creation selects
@@ -369,17 +369,16 @@ not Cargo build features.
 ## iris-gui persisted settings inventory
 
 Source: [iris-gui/src/settings.rs](iris-gui/src/settings.rs). These keys belong
-to GUI JSON rather than iris.toml. View controls update the scales; the GUI
-writes machine configs and sandbox access state for you.
+to GUI JSON rather than machine TOML files. View controls update the scales;
+the GUI saves machine TOMLs and sandbox access state for you.
 
 | GUI JSON key | Normal load default | Purpose |
 |---|---|---|
 | `ui_scale` | `1.25` | egui controls scale; sanitized to supported range. |
 | `vm_scale` | `0.75` | Maximum framebuffer magnification, independent of UI scale. |
-| `machines` | empty map | Named shared MachineConfig objects. |
-| `active_machine` | unset | Selected key in machines. |
-| `recent_configs` | empty list | Recent TOML imports. |
-| `last_config` | unset | Legacy one-shot TOML migration source. |
+| `active_machine` | unset | Selected machine folder name. |
+| `recent_configs` | empty list | Legacy recent TOML paths; retained for compatibility. |
+| `last_config` | unset | Legacy TOML migration source; cleared after conversion. |
 | `bookmarks` | empty map | macOS sandbox security-scoped bookmarks by absolute path. |
 | `disk_folders` | empty list | Granted recursive sandbox disk-folder access. |
 

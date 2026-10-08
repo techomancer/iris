@@ -800,10 +800,11 @@ mod dev {
     fn locate(rel: &str) -> Option<PathBuf> {
         let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from));
         let name = Path::new(rel).file_name()?.to_owned();
-        let mut candidates = vec![PathBuf::from(rel), PathBuf::from("..").join(rel)];
+        let mut candidates = vec![crate::launch_dir().join(rel), crate::launch_dir().join("..").join(rel)];
         if let Some(d) = exe_dir {
             candidates.push(d.join(&name));
             candidates.push(d.join(rel));
+            if let Some(root) = d.parent().and_then(Path::parent) { candidates.push(root.join(rel)); }
         }
         candidates.into_iter().find(|p| p.exists())
     }

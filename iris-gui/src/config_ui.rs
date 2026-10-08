@@ -163,7 +163,7 @@ pub enum ConfigAction {
     /// User picked a disc image for a CD-ROM while the machine is running —
     /// send Cmd::LoadDisc immediately without waiting for restart.
     LoadDisc { id: u8, path: String, remount: bool },
-    /// Export TOML and spawn headless iris with ci=true, then iris-ci ping.
+    /// Spawn headless iris with the machine TOML and ci=true, then iris-ci ping.
     TestCi,
     /// Spawn ensure-build.bat for CLI or GUI premiere profile.
     RebuildProfile { gui: bool },
@@ -831,7 +831,7 @@ fn show_disks(ui: &mut Ui, cfg: &mut MachineConfig) -> (PathEdit, ConfigAction) 
                 // clear the auto-generated HDD placeholder path so it doesn't
                 // look like a (missing) disc. Load media via "Insert disc…" in
                 // the SCSI menu, or just type a path here.
-                if dev.cdrom && !was_cd && dev.path == format!("scsi{id}.raw") {
+                if dev.cdrom && !was_cd && (dev.path == crate::settings::GuiSettings::default_disk_path(id) || dev.path == format!("scsi{id}.raw")) {
                     dev.path.clear();
                 }
                 ui.end_row();
@@ -1712,9 +1712,12 @@ fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.add_space(8.0);
     let mut action = ConfigAction::None;
     if ui.button("Test CI connection (iris-ci ping)").clicked() {
-        let socket = cfg.ci_socket.clone();
+        let socket = if iris::config::ci_socket_is_tcp(&cfg.ci_socket) { cfg.ci_socket.clone() } else { crate::abs_path(&cfg.ci_socket) };
+        let client = crate::developer_binary("iris-ci");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         std::thread::spawn(move || {
-            let status = std::process::Command::new("target/release/iris-ci.exe")
+            let status = std::process::Command::new(client)
+                .current_dir(cwd)
                 .arg("ping")
                 .env("IRIS_CI_SOCKET", &socket)
                 .output();
@@ -1726,16 +1729,11 @@ fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         });
         ui.ctx().request_repaint();
     }
-    if ui.button("Test in CI (export + headless boot + ping)").clicked() {
+    if ui.button("Test in CI (headless boot + ping)").clicked() {
         action = ConfigAction::TestCi;
     }
-    ui.label(RichText::new("Export TOML, start iris with ci=true, then ping.").weak().small());
+    ui.label(RichText::new("Start iris with this machine TOML and ci=true, then ping.").weak().small());
     action
-}
-
-/// Serialize `cfg` back to TOML string in the same style as iris.toml.
-pub fn cfg_to_toml(cfg: &MachineConfig) -> Result<String, String> {
-    toml::to_string_pretty(cfg).map_err(|e| e.to_string())
 }
 
 /// How a Browse button should pick a path.
@@ -1753,7 +1751,7 @@ pub fn reveal_in_file_manager(path: &str) {
     #[cfg(target_os = "macos")]
     {
         // NSWorkspace, not `open` — sandbox-safe (see macos_sandbox::reveal_in_finder).
-        crate::macos_sandbox::reveal_in_finder(path);
+        crate::macos_sandbox::reveal_in_finder(&crate::abs_path(path));
     }
     #[cfg(target_os = "windows")]
     {
@@ -1846,7 +1844,7 @@ fn path_row_in(
                     Pick::Dir      => d.pick_folder(),
                 };
                 if let Some(p) = picked {
-                    *value = p.to_string_lossy().into_owned();
+                    *value = crate::picked_path(&p);
                     out.changed = true;
                     out.picked = true;
                 }
