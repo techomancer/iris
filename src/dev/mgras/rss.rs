@@ -1042,25 +1042,11 @@ impl Rss {
         } else {
             v
         };
-        // Plane write masks where the pixel format matches our storage
-        // (pixel type 2, RGBA8888: R G B in the low 24 planes, alpha in the
-        // top 8): ColorMaskLSBsA the low 24 planes (all 32 when it is all
-        // ones), ColorMaskMSBs the top 8. Overlay writes: the X server
-        // sends ColorMaskLSBsA 0 and ColorMaskMSBs 0xF0 (overlay visuals,
-        // values 0-15) or 0x70 (popup menus, values 0-3, colormap entries
-        // 0-3); read as the high nibble masking overlay planes 3:0 (our
-        // reading: the stored values stay as the X server wrote them).
-        // Other formats keep their decoded values: their masks describe
-        // a packed storage layout this model does not keep.
+        // Native GL masks name overlay index bits. X uses packed PP1 plane
+        // masks; its decoded CI8 indices include values above the low nibble.
         let v = if b.kind == Kind::Overlay {
-            // Native GL CI8 overlays select the upper overlay planes
-            // (DRAW_BUFFER 0x48). X's 4-bit overlay/popup selector 0x4f
-            // presents those planes as indices 0..15.
-            let mask = if draw_buffer(pp1) == 0x48 {
-                self.reg(reg::COLORMASKMSBS) & 0xFF
-            } else {
-                (self.reg(reg::COLORMASKMSBS) >> 4) & 0xF
-            };
+            let msbs = self.reg(reg::COLORMASKMSBS);
+            let mask = if draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 };
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
             let mask = if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24 };
@@ -1976,6 +1962,25 @@ mod tests {
         r.write(reg::FILL_COLOR_R, 5, false);
         block(&mut r, 15, 671, 15, 671);
         assert_eq!(px(&r, 15, 671), 0xAB5);
+    }
+
+    #[test]
+    fn maya_popup_hover_preserves_upper_overlay_color_bits() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C13_F504, false);
+        r.write(reg::DRBPOINTERS, 0x101C0, false);
+        r.write(reg::COLORMASKLSBSA, 0, false);
+        r.write(reg::COLORMASKMSBS, 0x70, false);
+        let b = r.target();
+        let y = (SCREEN_H - 1 - 139) as u32;
+        r.mem.put(&b, 18, y, 4);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 0x10, false);
+        block(&mut r, 18, 139, 18, 139);
+        assert_eq!(r.mem.get(&b, 18, y), 0x10);
+        r.write(reg::FILL_COLOR_R, 0, false);
+        block(&mut r, 18, 139, 18, 139);
+        assert_eq!(r.mem.get(&b, 18, y), 0);
     }
 
     #[test]

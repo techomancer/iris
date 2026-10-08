@@ -265,7 +265,7 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     let wide = rss::rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
     let ptype = (pp1 >> 8) & 7;
     let mask = if b.kind == Kind::Overlay {
-        if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else { (msbs >> 4) & 0xF }
+        if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 }
     } else if ptype == 2 {
         if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (msbs & 0xFF) << 24 }
     } else if matches!(ptype, 4 | 6) {
