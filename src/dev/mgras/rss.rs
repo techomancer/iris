@@ -388,13 +388,17 @@ fn cid_write_mask(pp1winmode: u32) -> u8 {
     ((pp1winmode >> 10) & 3) as u8
 }
 
-/// PP1 fill mode read-buffer field (bits 25:21): 0 for every read of the
-/// main buffer traced; 4 when the X server reads the overlay back (with the
-/// draw field 0 and DRBpointers at the overlay's pages: it copies popup
-/// menu pixels through host memory).
+/// PP1 fill mode read-buffer field (bits 25:21): 0 the drawing target (A
+/// for every read traced); 1 the second buffer, DRBpointers bits 19:10
+/// (the file manager scrolls its double-buffered 12-bit window, drawn with
+/// draw field 2, by reading it with read field 1 and draw field 0 and
+/// writing it back a line up); 4 the overlay, when the X server reads it
+/// back (with draw field 0 and DRBpointers at the overlay's pages: it
+/// copies popup menu pixels through host memory).
 fn read_buffer(pp1fillmode: u32) -> u32 {
     (pp1fillmode >> 21) & 0x1F
 }
+const READ_B: u32 = 1;
 const READ_OVERLAY: u32 = 4;
 
 /// Block types (fill mode bits 24:22).
@@ -467,7 +471,10 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
         return (v as u32 >> 8) & 0xFF_FFFF;
     }
     let v = v as u32;
-    let c4 = |s: u32| ((v >> s) & 0xF) * 0x11;
+    // 4/4/4 (12-bit visuals): a component's four bits are the top of its
+    // byte, as the X server's fast fills store them (0x502020, 0xF0F0F0),
+    // so a read and write back keeps the pixel.
+    let c4 = |s: u32| ((v >> s) & 0xF) << 4;
     let c5 = |s: u32| ((v >> s) & 0x1F) << 3 | ((v >> s) & 0x1F) >> 2;
     match format {
         (8, 8) => pack_rgb(c4(0), c4(4), c4(8)),
@@ -496,7 +503,7 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
         return (z << 8 | z >> 16) as u64;
     }
     (match format {
-        (8, 8) => c(0) / 0x11 | (c(8) / 0x11) << 4 | (c(16) / 0x11) << 8,
+        (8, 8) => c(0) >> 4 | (c(8) >> 4) << 4 | (c(16) >> 4) << 8,
         (8, 10) => c(0) >> 3 | (c(8) >> 3) << 5 | (c(16) >> 3) << 10,
         _ => v,
     }) as u64
@@ -951,13 +958,14 @@ impl Rss {
         draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_OVERLAY
     }
 
-    /// The buffer pixel reads (transfers to the host) come from: the
-    /// overlay when the read-buffer field says so, else the drawing target.
+    /// The buffer pixel reads (transfers to the host) come from, by the
+    /// read-buffer field: the overlay, the second buffer, else the drawing
+    /// target.
     fn source(&self) -> Buffer {
-        if read_buffer(self.reg(reg::PP1FILLMODE)) == READ_OVERLAY {
-            Buffer::new(self.reg(reg::DRBPOINTERS), Kind::Overlay, self.reg(reg::DRBSIZE))
-        } else {
-            self.target()
+        match (read_buffer(self.reg(reg::PP1FILLMODE)), self.second_buffer()) {
+            (READ_OVERLAY, _) => Buffer::new(self.reg(reg::DRBPOINTERS), Kind::Overlay, self.reg(reg::DRBSIZE)),
+            (READ_B, Some(b)) => Buffer::new(b, Kind::Wide, self.reg(reg::DRBSIZE)),
+            _ => self.target(),
         }
     }
 
@@ -1762,6 +1770,13 @@ mod tests {
         assert_eq!([read(&r, a, 10, 5), read(&r, b_page, 10, 5)], [0x11, 0], "field 1: A");
         assert_eq!([read(&r, a, 20, 5), read(&r, b_page, 20, 5)], [0, 0x22], "field 2: B");
         assert_eq!([read(&r, a, 30, 5), read(&r, b_page, 30, 5)], [0x33, 0x33], "field 3: both");
+        // Reads: read field 1 (bits 25:21) is B, whatever the draw field;
+        // 0 the drawing target.
+        let fb_y = (SCREEN_H - 1 - 5) as i32;
+        r.write(reg::PP1FILLMODE, fm | READ_B << 21, false);
+        assert_eq!(r.get(20, fb_y) & 0xFFF, 0x22, "read field 1: B");
+        r.write(reg::PP1FILLMODE, fm | 1 << 14, false);
+        assert_eq!(r.get(20, fb_y) & 0xFFF, 0, "read field 0, draw field 1: A");
     }
 
     #[test]
@@ -1840,7 +1855,11 @@ mod tests {
         for (fmt, v) in [((8, 8), 0x0ABCu64), ((8, 10), 0x7FFF), ((8, 0), 0x00C0_FFEE), ((0, 1), 0xFFF), ((7, 1), 0x1212_3434_5656), ((7, 0), 0x12_3456), ((2, 3), 0x1234_5612), ((8, 1), 0x1212_3434_5656_FFFF)] {
             assert_eq!(to_host(fmt, from_host(fmt, v)), v, "{fmt:?}");
         }
-        assert_eq!(from_host((8, 8), 0x0F0), pack_rgb(0, 0xFF, 0));
+        assert_eq!(from_host((8, 8), 0x0F0), pack_rgb(0, 0xF0, 0));
+        // A 12-bit visual's pixel (the file manager's background, filled as
+        // 0x502020) reads back as its top nibbles and writes back unchanged.
+        assert_eq!(to_host((8, 8), 0x50_2020), 0x522);
+        assert_eq!(from_host((8, 8), 0x522), 0x50_2020);
         // 8-8-8 host pixels are X pixel values of the visuals, red in 7:0.
         assert_eq!(from_host((8, 0), 0x00_00FF), pack_rgb(0xFF, 0, 0));
     }
