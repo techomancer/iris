@@ -273,6 +273,7 @@ mod re {
     pub const GLINECONFIG: u32 = 0x146;
     pub const SCRMSK1X: u32 = 0x147;
     pub const WINMODE: u32 = 0x14F;
+    pub const PP1WINMODE: u32 = 0x17B;
     pub const LSPAT: u32 = 0x15A;
     pub const LSCRL: u32 = 0x15B;
     pub const DEVICE_ADDR: u32 = 0x15C;
@@ -329,11 +330,12 @@ pub struct Window {
     /// x | y << 16, y bottom-up (window's lower left in framebuffer rows).
     pub origin: u32,
     pub mode: u32,
-    /// PP1 clipping-ID match and bypass controls, supplied by the kernel.
-    pub pp1winmode: u32,
     /// Screen masks 1-4: (x, y) ranges `min << 16 | max`.
     pub masks: [[u32; 2]; 4],
     pub drb: u32,
+    /// PP1 window mode: the origin's low bits and the clip ID the window's
+    /// pixels must carry (see rss.rs `cid_match`).
+    pub pp1winmode: u32,
 }
 
 /// GL state held by the GE. Plain data, valid zeroed (`ensure_init` sets
@@ -1764,7 +1766,7 @@ impl Gl {
                 sink.rss_write(re::SCRMSK1X + 2 * n as u32 + 1, *y, false);
             }
             sink.rss_write(re::WINMODE, w.mode, false);
-            sink.rss_write(super::rss::reg::PP1WINMODE, w.pp1winmode, false);
+            sink.rss_write(re::PP1WINMODE, w.pp1winmode, false);
             sink.rss_write(re::DRBPOINTERS, self.draw_pointers(), false);
         }
         self.fill_loaded = 0;

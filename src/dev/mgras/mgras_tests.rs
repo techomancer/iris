@@ -31,6 +31,7 @@ const DRBSIZE: u32 = 0x16E;
 const XFRSIZE: u32 = 0x153;
 const XFRMODE: u32 = 0x159;
 const PP1FILLMODE: u32 = 0x161;
+const PP1WINMODE: u32 = 0x17B;
 const FILL_COLOR_R: u32 = 0x176;
 const FILL_FAST: u32 = 1 << 20;
 
@@ -367,7 +368,7 @@ fn f(v: f32) -> u32 {
 fn gl_glprim_triangle(m: &Mgras, shade: u32) {
     x_server(m);
     let mut win = vec![0u32; 15];
-    win[2] = 0x11;
+    win[1] = 0x11;
     (win[9], win[10]) = (399, 299);
     win[11] = 0x240;
     fifo_token(m, 0xE4, &win);
@@ -421,7 +422,7 @@ fn gl_flat_triangle_and_clear() {
     // Window: origin (0, 0) bottom-up, mask 1 = the window, kept inside.
     let mut win = vec![0u32; 15];
     win[0] = 0;
-    win[2] = 0x11;
+    win[1] = 0x11;
     (win[9], win[10]) = (399, 299);
     win[11] = 0x240;
     fifo_token(&m, 0xE4, &win);
@@ -462,11 +463,17 @@ const SLOT_C: u32 = 0xA9B + 2 * 0x17C7;
 const SLOT_D: u32 = 0xA9B + 3 * 0x17C7;
 
 fn switch_to_gl_context(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32) {
+    switch_to_gl_context_cid(m, id, x, y, w, h, 0);
+}
+
+/// The same, the window's PP1 window mode (image word 4) `pp1winmode`.
+fn switch_to_gl_context_cid(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32, pp1winmode: u32) {
     write(m, 32, 0x50050, 0x4FC);
     let mut img = [0u32; 63];
     img[0] = id;
     img[2] = x | y << 16;
     img[3] = 0x11;
+    img[4] = pp1winmode;
     img[11] = x << 16 | (x + w - 1);
     img[12] = y << 16 | (y + h - 1);
     img[13] = 0x240;
@@ -509,6 +516,51 @@ fn gl_state_and_window_follow_the_context() {
     fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
     block(&m, 5, 5, 5, 5);
     assert_eq!(m.fb_pixel(5, 5), 0x2A, "X draws top-down at its own origin again");
+    m.stop_engines();
+}
+
+/// A window whose visible region is too complex for the screen masks: the
+/// X server paints it with a clip ID (mgrasDrawCID: draw field 0x50, the ID
+/// in the fill colour, pp1winmode 0xC00, left set), and the kernel has the
+/// window's GL drawing match that ID (pp1winmode 1 << (4 + id)). The clear
+/// lands only on the window's pixels with the ID; a window without one, and
+/// the X server, draw everywhere.
+#[test]
+fn gl_draws_only_where_the_clip_id_matches() {
+    let m = live_board();
+    x_server(&m);
+    let x_fillmode = 0x0C00_4504;
+    direct_rss(&m, PP1WINMODE, 0, false);
+    // Clip ID 0 over the screen, then 1 over the window's left half
+    // (screen rows top-down: GL rows 0..99 are 924..1023).
+    direct_rss(&m, PP1WINMODE, 0xC00, false);
+    direct_rss(&m, PP1FILLMODE, 0x14_2600, false);
+    fifo_rss(&m, FILLMODE, FILL_FAST, false);
+    fifo_rss(&m, FILL_COLOR_R, 0, false);
+    block(&m, 0, 0, 1279, 1023);
+    fifo_rss(&m, FILL_COLOR_R, 1, false);
+    block(&m, 0, 924, 49, 1023);
+    direct_rss(&m, PP1FILLMODE, x_fillmode, false);
+    assert_eq!(m.fb_pixel(10, 1000), 0, "clip IDs are not colour");
+
+    switch_to_gl_context_cid(&m, SLOT_A, 0, 0, 100, 100, 0x20);
+    gl_setup_window(&m, 100, 100, [1.0, 0.0, 0.0]);
+    fifo_token(&m, 0x15, &[]);
+    let at = |x: usize, y_gl: usize| m.fb_pixel(x, 1023 - y_gl) & 0xFF_FFFF;
+    assert_eq!(at(10, 50), 0x00_00FF, "clip ID 1: the window's own pixels");
+    assert_eq!(at(49, 99), 0x00_00FF);
+    assert_eq!(at(50, 50), 0, "clip ID 0: another window's pixels");
+
+    switch_to_gl_context_cid(&m, SLOT_B, 0, 0, 100, 100, 0);
+    gl_setup_window(&m, 100, 100, [0.0, 0.0, 1.0]);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(at(50, 50), 0xFF_0000, "no clip ID to match: all of it");
+
+    // The X server draws anywhere with its pp1winmode back.
+    fifo_rss(&m, FILLMODE, FILL_FAST, false);
+    fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
+    block(&m, 60, 1000, 60, 1000);
+    assert_eq!(m.fb_pixel(60, 1000), 0x2A);
     m.stop_engines();
 }
 
@@ -1518,11 +1570,13 @@ fn gl_root_painter_respects_clipping_ids_after_iconify() {
     assert_eq!(m.fb_pixel(150, 820), 0x77, "other X window protected");
 
     // Expose the console rectangle, then validate the current context with
-    // CP_WINDOW (same PP1 word, different token layout) and draw a quad.
+    // CP_WINDOW (window mode in word 1, the same PP1 word in word 2: the
+    // kernel stores them as one doubleword, window mode high) and draw a
+    // quad.
     paint_cid(40, 800, 79, 839, 1);
     let mut win = [0u32; 15];
-    win[1] = 0x20;
-    win[2] = 0x11;
+    win[1] = 0x11;
+    win[2] = 0x20;
     win[9] = 399;
     win[10] = 299;
     win[11] = 0x240;

@@ -362,8 +362,8 @@ const FILL_CHAR_STIPPLE_OPAQUE: u32 = 1 << 4;
 /// PP1 fill mode draw-buffer field (bits 20:14), as the drivers use it:
 /// 0x01 the main colour buffer (A), 0x02 the second (B), 0x03 both (see
 /// `Rss::target`), 0x4F the overlay planes (4Dwm menus, overlay
-/// clears), 0x50 the clipping-ID planes. The 6.5.22 TrueColor server keeps
-/// `DRBpointers` at 0xB81C0
+/// clears), 0x50 the clip-ID planes (see `Rss::cid`). The 6.5.22
+/// TrueColor server keeps `DRBpointers` at 0xB81C0
 /// (A 0x1C0, B 0x2E0) for all drawing and picks the buffer here.
 fn draw_buffer(pp1fillmode: u32) -> u32 {
     (pp1fillmode >> 14) & 0x7F
@@ -372,6 +372,21 @@ const DRAW_B: u32 = 0x02;
 const DRAW_A_AND_B: u32 = 0x03;
 const DRAW_OVERLAY: u32 = 0x4F;
 const DRAW_CID: u32 = 0x50;
+
+/// PP1 window mode (`pp1winmode`; SGI's fields WINxLSBs, WINyLSBs,
+/// CIDmatch, CIDdata, CIDmask). Bits 3:0 are the window origin's low x and
+/// y bits (not modelled). Bits 7:4 (CIDmatch) are one bit per clip ID:
+/// bit 4 + n lets a pixel whose clip ID is n be drawn; all clear, no
+/// check. The kernel (MgrasValidateClip) sets 1 << (4 + n) for a window
+/// that X gave clip ID n, else 0. Bits 11:10 (CIDmask, our reading) write
+/// enable the two clip-ID planes: the X server (mgrasDrawCID) sets 0xC00
+/// to draw clip IDs and leaves it set.
+fn cid_match(pp1winmode: u32) -> u32 {
+    (pp1winmode >> 4) & 0xF
+}
+fn cid_write_mask(pp1winmode: u32) -> u8 {
+    ((pp1winmode >> 10) & 3) as u8
+}
 
 /// PP1 fill mode read-buffer field (bits 25:21): 0 for every read of the
 /// main buffer traced; 4 when the X server reads the overlay back (with the
@@ -641,9 +656,6 @@ pub struct Rss {
     device: RegMap<256>,
     /// Pixel memory. In colour-index modes a pixel's low byte is the index.
     pub mem: PixMem,
-    /// Per-pixel clipping IDs, separate from colour and VC3 display IDs.
-    /// Framebuffer coordinates, shared by the colour buffers.
-    pub cid: [u8; WIDTH * HEIGHT],
     /// The PIO write line being assembled.
     line_buf: [u8; MAX_LINE_BYTES],
     stipple: Option<Stipple>,
@@ -663,6 +675,14 @@ pub struct Rss {
     te_load: u32,
     /// A texture read transfer is armed: armed, texels a line, lines.
     te_read: [u32; 3],
+    /// The clip-ID planes: two bits a framebuffer pixel, index `y * WIDTH +
+    /// x`. The X server paints a window's visible region with an ID (1-3)
+    /// when its clip is too complex for the four screen masks, and the
+    /// kernel has that window's GL drawing match it (`pp1winmode`). Where
+    /// the board keeps them in RDRAM is not known (X draws them with
+    /// DRBpointers at the main buffer); nothing reads them back, so they
+    /// are kept apart here. Separate from the VC3's display IDs.
+    pub cid: [u8; WIDTH * HEIGHT],
 }
 
 /// XFRCONTROL (provisional layout, from the IDE's TRAM load writing 5):
@@ -810,13 +830,17 @@ impl Rss {
         }
     }
 
-    /// Whether a framebuffer pixel may be written: on screen, and passing
-    /// every enabled screen mask and the PP1 clipping-ID test.
-    /// Window mode bit `n - 1` enables mask `n`
-    /// (1..4, `scrmsk{n}x` / `scrmsk{n}y`, each `min << 16 | max`), and bit
-    /// `n + 3` keeps the pixels inside it rather than outside.
+    /// Whether a framebuffer pixel may be written: on screen, passing
+    /// every enabled screen mask, and its clip ID matching (`cid_match`).
+    /// Window mode bit `n - 1` enables mask `n` (1..4, `scrmsk{n}x` /
+    /// `scrmsk{n}y`, each `min << 16 | max`), and bit `n + 3` keeps the
+    /// pixels inside it rather than outside.
     fn visible(&self, x: i32, y: i32) -> bool {
         if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
+            return false;
+        }
+        let m = cid_match(self.reg(reg::PP1WINMODE));
+        if m != 0 && (m >> self.cid[y as usize * WIDTH + x as usize]) & 1 == 0 {
             return false;
         }
         let mode = self.reg(reg::CLIP_MODE);
@@ -831,15 +855,7 @@ impl Rss {
                 return false;
             }
         }
-        // X uses 0xc00 to bypass both PP1 clipping-ID tests. Traced on
-        // Twilight: visible root pixels are painted with CID 1, and its
-        // kernel window image carries PP1winmode 0x20. The match starts
-        // at bit 5. CID writes pass only the rectangular masks.
-        let pp1win = self.reg(reg::PP1WINMODE);
-        let bypass = if self.draws_overlay() { 1 << 11 } else { 1 << 10 };
-        draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_CID
-            || pp1win & bypass != 0
-            || self.cid[y as usize * WIDTH + x as usize] == ((pp1win >> 5) & 0x1F) as u8
+        true
     }
 
     /// The buffer drawing and pixel reads go to: the page pointer in
@@ -869,16 +885,17 @@ impl Rss {
     }
 
     /// Store `v` at framebuffer `(x, y)` in the buffer (or both buffers)
-    /// the pixel processors are drawing to, or into the clipping-ID planes.
+    /// the pixel processors are drawing to, or its low two bits in the
+    /// clip-ID planes.
     fn put(&mut self, x: i32, y: i32, v: u32) {
         let field = draw_buffer(self.reg(reg::PP1FILLMODE));
         if !self.visible(x, y) {
             return;
         }
         if field == DRAW_CID {
-            let p = &mut self.cid[y as usize * WIDTH + x as usize];
-            let mask = (self.regs[reg::COLORMASKMSBS as usize] & 0x1F) as u8;
-            *p = (*p & !mask) | (v as u8 & mask);
+            let m = cid_write_mask(self.reg(reg::PP1WINMODE));
+            let c = &mut self.cid[y as usize * WIDTH + x as usize];
+            *c = (*c & !m) | (v as u8 & m);
             return;
         }
         let b = self.target();
@@ -1984,29 +2001,37 @@ mod tests {
         assert_eq!(drawn, [10, 11, 12, 13, 16, 17, 18, 19, 20]);
     }
 
+    /// Clip-ID drawing (draw field 0x50) writes the fill colour's low two
+    /// bits under pp1winmode bits 11:10, not the colour planes; CIDmatch
+    /// (bits 7:4, one bit per ID) limits other drawing to the IDs it names,
+    /// and with no bit set nothing is checked.
     #[test]
-    fn clipping_id_writes_masks_and_bypass() {
+    fn clipping_id_writes_masks_and_match() {
         let mut r = x_server();
         r.write(reg::FILLMODE, FILL_FAST, false);
         r.write(reg::PP1FILLMODE, 0x142600, false);
-        r.write(reg::COLORMASKMSBS, 0x1F, false);
+        r.write(reg::PP1WINMODE, 0xC00, false);
         r.write(reg::FILL_COLOR_R, 7, false);
-        block(&mut r, 10, 5, 11, 5);
+        block(&mut r, 10, 5, 12, 5);
         assert_eq!(px(&r, 10, 5), 0, "CID drawing keeps colour planes");
-        r.write(reg::COLORMASKMSBS, 1, false);
+        assert_eq!(r.cid[1018 * WIDTH + 10], 3, "two clip-ID planes");
+        r.write(reg::PP1WINMODE, 0x400, false);
         r.write(reg::FILL_COLOR_R, 0, false);
         block(&mut r, 10, 5, 10, 5);
-        assert_eq!(r.cid[1018 * WIDTH + 10], 6, "masked CID update");
+        assert_eq!(r.cid[1018 * WIDTH + 10], 2, "plane 0 alone written");
+        r.write(reg::PP1WINMODE, 0xC00, false);
+        block(&mut r, 11, 5, 11, 5);
 
         r.write(reg::PP1FILLMODE, 0x0C00_4504, false);
         r.write(reg::COLORMASKLSBSA, 0xFF, false);
-        r.write(reg::PP1WINMODE, 6 << 5, false);
+        // IDs now 2, 0, 3 at x 10, 11, 12.
+        r.write(reg::PP1WINMODE, 1 << (4 + 2) | 1 << (4 + 3), false);
         r.write(reg::FILL_COLOR_R, 0x55, false);
-        block(&mut r, 10, 5, 11, 5);
-        assert_eq!((px(&r, 10, 5), px(&r, 11, 5)), (0x55, 0));
+        block(&mut r, 10, 5, 12, 5);
+        assert_eq!((px(&r, 10, 5), px(&r, 11, 5), px(&r, 12, 5)), (0x55, 0, 0x55));
         r.write(reg::PP1WINMODE, 0xC00, false);
         block(&mut r, 11, 5, 11, 5);
-        assert_eq!(px(&r, 11, 5), 0x55, "X bypasses the ID comparison");
+        assert_eq!(px(&r, 11, 5), 0x55, "no CIDmatch bit: no check");
     }
 
     /// Without the opaque bit, BG_COLOR plays no part.
