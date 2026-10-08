@@ -415,7 +415,7 @@ mod block {
 /// Whether the pixel processors' pixel type (fill mode bits 10:8) is an RGB
 /// one; the others are colour index.
 pub(super) fn rgb_pixtype(pp1fillmode: u32) -> bool {
-    matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2 | 4)
+    matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2)
 }
 
 /// Pixel processor logic op (fill mode bit 2 enables it; bits 29:26 hold
@@ -1065,7 +1065,7 @@ impl Rss {
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
             let mask = if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24 };
             (old & !mask) | (v & mask)
-        } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 6 {
+        } else if b.kind == Kind::Wide && matches!((pp1 >> 8) & 7, 4 | 6) {
             let mask = lsb & 0xFFF;
             (old & !mask) | (v & mask)
         } else {
@@ -1954,6 +1954,28 @@ mod tests {
         r.write(reg::IR_ALIAS, 0x18, false);
         r.write(reg::BLOCKXYSTARTI, x0 << 16 | y0, false);
         r.write(reg::BLOCKXYENDI, x1 << 16 | y1, true);
+    }
+
+    #[test]
+    fn marquee_ci12_fill_and_stipple_preserve_indices_and_masks() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_4404, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 3, false);
+        block(&mut r, 15, 671, 16, 671);
+        assert_eq!(px(&r, 15, 671), 3);
+        r.write(reg::FILLMODE, 1 << 22 | FILL_CHAR_STIPPLE, false);
+        r.write(reg::RED, 0xABC << 12, false);
+        block(&mut r, 15, 671, 16, 671);
+        r.write(reg::CHAR_H, 0x8000_0000, true);
+        assert_eq!(px(&r, 15, 671), 0xABC);
+        assert_eq!(px(&r, 16, 671), 3);
+        r.write(reg::COLORMASKLSBSA, 0xF, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 5, false);
+        block(&mut r, 15, 671, 15, 671);
+        assert_eq!(px(&r, 15, 671), 0xAB5);
     }
 
     #[test]

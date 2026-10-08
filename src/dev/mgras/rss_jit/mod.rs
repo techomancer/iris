@@ -268,7 +268,7 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
         if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else { (msbs >> 4) & 0xF }
     } else if ptype == 2 {
         if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (msbs & 0xFF) << 24 }
-    } else if ptype == 6 {
+    } else if matches!(ptype, 4 | 6) {
         lsb & 0xFFF
     } else {
         u32::MAX
@@ -313,7 +313,7 @@ fn common(rss: &mut Rss) -> PipeKey {
     let pix = match ptype {
         0 if pp1 & (1 << 13) == 0 => Pix::Rgb12,
         2 => Pix::Rgba8,
-        6 => Pix::Ci12,
+        4 | 6 => Pix::Ci12,
         _ => Pix::Plain,
     };
     let winmode = rss.reg(reg::PP1WINMODE);
