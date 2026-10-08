@@ -49,22 +49,6 @@
 use super::fixed;
 
 /// TE1 / texture-related RSS registers.
-#[cfg(test)]
-mod lod_tests {
-    use super::*;
-
-    #[test]
-    fn lod_log2_is_close_and_exact_on_powers_of_two() {
-        for e in -20..20 {
-            assert_eq!(lod_log2(2f64.powi(e)), e as f64);
-        }
-        for i in 1..10_000 {
-            let x = i as f64 * 0.0137;
-            assert!((lod_log2(x) - x.log2()).abs() < 0.0011, "{x}");
-        }
-    }
-}
-
 pub mod reg {
     pub const TEXMODE1: u32 = 0x111;
     pub const TXENV_RG: u32 = 0x142;
@@ -547,30 +531,32 @@ impl Sampler {
         c
     }
 
-    /// A level, sampled at (s, t) (texture coordinates, 0..1 over the
-    /// texture), nearest or bilinear, in 12.16. Bilinear weights have 8
-    /// fraction bits, so the four products sum to 12.16 exactly.
-    fn level(&self, te: &Te1, level: u32, s: f64, t: f64, linear: bool) -> [i32; 4] {
-        let w = (1u32 << self.ls.saturating_sub(level)) as f64;
-        let h = (1u32 << self.lt.saturating_sub(level)) as f64;
+    /// A level, sampled at (s, t) (texture coordinates in Q31, 1.0 over
+    /// the texture), nearest or bilinear, in 12.16. Per level the
+    /// coordinate is texels in Q16: its integer part picks the texel, the
+    /// fraction's top 8 bits are the bilinear weight, so the four products
+    /// sum to 12.16 exactly.
+    fn level(&self, te: &Te1, level: u32, s: i64, t: i64, linear: bool) -> [i32; 4] {
+        let (lw, lh) = (self.ls.saturating_sub(level), self.lt.saturating_sub(level));
+        let (w, h) = (1i64 << lw, 1i64 << lh);
         // GL_CLAMP: coordinates clamped to [0, 1]; nearest then stays in
         // the texture, linear reaches half a texel past its edge. Clamp to
         // border leaves them be: the texel index clamp reads border there.
         let gl_clamp = self.mode2 & TM2_GL_CLAMP != 0;
-        let s = if gl_clamp && self.mode2 & TM2_CLAMP_S != 0 { s.clamp(0.0, 1.0) } else { s };
-        let t = if gl_clamp && self.mode2 & TM2_CLAMP_T != 0 { t.clamp(0.0, 1.0) } else { t };
-        let (u, v) = (s * w, t * h);
+        let (cs, ct) = (self.mode2 & TM2_CLAMP_S != 0, self.mode2 & TM2_CLAMP_T != 0);
+        let s = if gl_clamp && cs { s.clamp(0, 1 << 31) } else { s };
+        let t = if gl_clamp && ct { t.clamp(0, 1 << 31) } else { t };
+        let (u, v) = (s >> (15 - lw), t >> (15 - lh));
         if !linear {
             // At s = 1 exactly, clamped nearest stays on the last texel.
-            let cap = |x: f64, n: f64, clamp: bool| if clamp && gl_clamp { (x.floor() as i64).min(n as i64 - 1) } else { x.floor() as i64 };
-            let c = self.texel(te, level, cap(u, w, self.mode2 & TM2_CLAMP_S != 0), cap(v, h, self.mode2 & TM2_CLAMP_T != 0));
+            let cap = |x: i64, n: i64, clamp: bool| if clamp && gl_clamp { (x >> 16).min(n - 1) } else { x >> 16 };
+            let c = self.texel(te, level, cap(u, w, cs), cap(v, h, ct));
             return c.map(|v| (v << 16) as i32);
         }
-        let (u, v) = (u - 0.5, v - 0.5);
-        let (i, j) = (u.floor(), v.floor());
-        let (a, b) = (((u - i) * 256.0) as i32, ((v - j) * 256.0) as i32);
-        let (i, j) = (i as i64, j as i64);
-        // Wrapping: a coordinate far outside saturates to i64::MAX.
+        let (u, v) = (u.wrapping_sub(0x8000), v.wrapping_sub(0x8000));
+        let (i, j) = (u >> 16, v >> 16);
+        let (a, b) = (((u >> 8) & 0xFF) as i32, ((v >> 8) & 0xFF) as i32);
+        // Wrapping: a coordinate far outside can sit at i64::MAX.
         let (i1, j1) = (i.wrapping_add(1), j.wrapping_add(1));
         let (t00, t10) = (self.texel(te, level, i, j), self.texel(te, level, i1, j));
         let (t01, t11) = (self.texel(te, level, i, j1), self.texel(te, level, i1, j1));
@@ -582,59 +568,31 @@ impl Sampler {
         c
     }
 
-    /// The filtered texel at (s, t) for level of detail `lambda` (log2 of
-    /// texels per pixel at level 0): magnification below 0, minification
-    /// (with mipmaps when on) above.
-    pub fn sample(&self, te: &Te1, s: f64, t: f64, lambda: f64) -> [i32; 4] {
+    /// The filtered texel at (s, t) (Q31) for level of detail `lambda`
+    /// (Q8 log2 of level-0 texels per pixel): magnification at or below 0,
+    /// minification (with mipmaps when on) above.
+    pub fn sample(&self, te: &Te1, s: i64, t: i64, lambda: i32) -> [i32; 4] {
         let m = self.mode2;
-        if !(lambda > 0.0) {
+        if lambda <= 0 {
             return self.level(te, 0, s, t, m & TM2_MAG_LINEAR != 0);
         }
         let linear = m & TM2_MIN_LINEAR != 0;
         if self.max_level == 0 {
             return self.level(te, 0, s, t, linear);
         }
-        let top = self.max_level as f64;
+        let top = self.max_level as i32;
         if m & TM2_MIP_LINEAR == 0 {
-            let l = ((lambda + 0.5).ceil() - 1.0).clamp(0.0, top) as u32;
-            return self.level(te, l, s, t, linear);
+            // The nearest level: ceil(lambda + 0.5) - 1.
+            let l = (((lambda + 128 + 255) >> 8) - 1).clamp(0, top);
+            return self.level(te, l as u32, s, t, linear);
         }
-        let l0 = lambda.floor().clamp(0.0, top);
-        let l1 = (l0 + 1.0).min(top);
         // Between the levels by an 8-bit fraction.
-        let f = ((lambda - l0).clamp(0.0, 1.0) * 256.0) as i64;
+        let l0 = (lambda >> 8).clamp(0, top);
+        let l1 = (l0 + 1).min(top);
+        let f = (lambda - (l0 << 8)).clamp(0, 256) as i64;
         let (a, b) = (self.level(te, l0 as u32, s, t, linear), self.level(te, l1 as u32, s, t, linear));
         [0, 1, 2, 3].map(|k| a[k] + (((b[k] - a[k]) as i64 * f) >> 8) as i32)
     }
-}
-
-/// The level-of-detail log2: what the TE needs, not libm's last bit. The
-/// exponent, plus a cubic in the mantissa (exact at both ends of each
-/// octave, within 0.0011 between). Plain bit and float operations in a
-/// fixed order, so the raster JIT emits exactly the same sequence
-/// (`rss_jit::compiler`, `E::lod_log2`): keep them in step. Only called on
-/// positive values; subnormals and infinity give what the bits give.
-pub fn lod_log2(x: f64) -> f64 {
-    let b = x.to_bits();
-    let e = ((b >> 52) & 0x7FF) as i64 - 1023;
-    let m = f64::from_bits((b & LOD_MANTISSA) | LOD_ONE);
-    let t = m - 1.0;
-    e as f64 + t * (LOD_C1 + t * (LOD_C2 + t * LOD_C3))
-}
-
-pub const LOD_MANTISSA: u64 = 0x000F_FFFF_FFFF_FFFF;
-pub const LOD_ONE: u64 = 0x3FF0_0000_0000_0000;
-pub const LOD_C1: f64 = 1.42086;
-pub const LOD_C2: f64 = -0.57725;
-pub const LOD_C3: f64 = 0.15639;
-
-/// The level of detail from a footprint's scaled derivatives (s and t,
-/// along x and along y): log2 of the longer axis, -inf when it is not
-/// positive. The hardware does not use libm either; the longer axis is
-/// the square root of the larger sum of squares (one root, not two).
-pub fn lod(sx: f64, tx: f64, sy: f64, ty: f64) -> f64 {
-    let rho = (sx * sx + tx * tx).max(sy * sy + ty * ty).sqrt();
-    if rho > 0.0 { lod_log2(rho) } else { f64::NEG_INFINITY }
 }
 
 /// The texture environment (RE4), in 12.16: fragment colour `f` and texel

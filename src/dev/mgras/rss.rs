@@ -724,7 +724,8 @@ pub(super) struct TriSetup {
     pub yref_i: i32,
     /// Depth, z.12 (`fixed::zplane`), at pixels like `cplanes`.
     pub zp: [i64; 3],
-    pub tplanes: [[f64; 3]; 3],
+    /// S/W, T/W, 1/W at 2^32 (`fixed::iter_plane`), at pixels likewise.
+    pub tp: [[i64; 3]; 3],
     pub j0: i32,
     pub j1: i32,
     pub ltor: u32,
@@ -747,7 +748,9 @@ pub(super) struct GlLineSetup {
     /// Depth at the first pixel and per pixel, z.12.
     pub zbase: i64,
     pub zstep: i64,
-    pub tplanes: [[f64; 3]; 3],
+    /// S/W, T/W, 1/W at the first pixel and per pixel, at 2^32.
+    pub tbase: [i64; 3],
+    pub tstep: [i64; 3],
     pub a0: f64,
     pub b0: f64,
     pub slope: f64,
@@ -1336,12 +1339,11 @@ impl Rss {
                         continue;
                     }
                 }
-                let xc = i as f64 + 0.5;
-                let at = |p: [f64; 3]| p[0] + p[1] * (xc - t.xs) + p[2] * (t.yref - yc);
                 let di = i.wrapping_sub(t.xs_i);
                 let mut rgba = t.cplanes.map(|p| fixed::at(p, di, dj));
                 if let Some(smp) = &smp {
-                    rgba = self.textured(&t.tplanes, smp, at, rgba);
+                    let v = t.tp.map(|p| fixed::at64(p, di, dj));
+                    rgba = self.textured(v, t.tp.map(|p| [p[1], p[2]]), smp, rgba);
                 }
                 if t.fog != 0 {
                     rgba = self.fogged(rgba, fixed::at(t.fogp, di, dj));
@@ -1435,7 +1437,7 @@ impl Rss {
             xs_i: xs as i32,
             yref_i: yref as i32,
             zp: fixed::zplane(zplane),
-            tplanes,
+            tp: tplanes.map(fixed::iter_plane),
             j0: (ymin - 0.5).ceil() as i32,
             j1: (ymax - 0.5).ceil() as i32,
             ltor: ltor as u32,
@@ -1445,22 +1447,29 @@ impl Rss {
         })
     }
 
-    /// A fragment's colour textured: S/W, T/W, 1/W from their planes (value,
-    /// d/dx, d/(-y)) evaluated by `at`; the level of detail from the
-    /// derivatives of s and t in level-0 texels; the texel through the
-    /// texture environment.
-    fn textured(&self, p: &[[f64; 3]; 3], smp: &Sampler, at: impl Fn([f64; 3]) -> f64, rgba: [i32; 4]) -> [i32; 4] {
-        let (sw, tw, wi) = (at(p[0]), at(p[1]), at(p[2]));
-        if wi == 0.0 || !wi.is_finite() {
+    /// A fragment's colour textured, in integers: S/W, T/W, 1/W (`v`, at
+    /// 2^32) and their steps across x and down y (`d`: d/dx and d/(-y));
+    /// the reciprocal unit divides out W (`fixed::recip`), the level of
+    /// detail comes from the footprint in level-0 texels
+    /// (`fixed::lod_q8`), the texel through the texture environment. No
+    /// texturing where 1/W is not positive.
+    fn textured(&self, v: [i64; 3], d: [[i64; 2]; 3], smp: &Sampler, rgba: [i32; 4]) -> [i32; 4] {
+        let [sw, tw, wi] = v;
+        if wi <= 0 {
             return rgba;
         }
-        let (s, t) = (sw / wi, tw / wi);
+        let (y, n) = fixed::recip(wi);
+        let (s, t) = (fixed::persp(sw, y, n), fixed::persp(tw, y, n));
         // d(a/w) = (da' - a dw') / w for a' = a/w, w' = 1/w; y runs down
-        // the plane's third term.
-        let d = |q: &[f64; 3], v: f64| ((q[1] - v * p[2][1]) / wi, (v * p[2][2] - q[2]) / wi);
-        let ((dsx, dsy), (dtx, dty)) = (d(&p[0], s), d(&p[1], t));
-        let (w, h) = smp.size();
-        let lambda = super::te1::lod(dsx * w, dtx * h, dsy * w, dty * h);
+        // the planes' second step.
+        let dx = |q: [i64; 2], c: i64| q[0].wrapping_sub(fixed::scale31(c, d[2][0]));
+        let dy = |q: [i64; 2], c: i64| fixed::scale31(c, d[2][1]).wrapping_sub(q[1]);
+        let lambda = fixed::lod_q8(
+            fixed::deriv(dx(d[0], s), y, n, smp.ls),
+            fixed::deriv(dx(d[1], t), y, n, smp.lt),
+            fixed::deriv(dy(d[0], s), y, n, smp.ls),
+            fixed::deriv(dy(d[1], t), y, n, smp.lt),
+        );
         let texel = smp.sample(&self.te, s, t, lambda);
         tex_env(self.reg(te_reg::TEXMODE1), self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
     }
@@ -1507,8 +1516,9 @@ impl Rss {
                 let q0 = (b - 0.5 * l.width as f64 + 0.5).floor() as i32;
                 let mut rgba = [0, 1, 2, 3].map(|c| l.cbase[c].wrapping_add(l.cstep[c].wrapping_mul(k)));
                 if let Some(smp) = &smp {
-                    // Planes (value, d/major, 0) evaluated at t along it.
-                    rgba = self.textured(&l.tplanes, smp, |q: [f64; 3]| q[0] + q[1] * t, rgba);
+                    // Steps along the line, none across it.
+                    let v = [0, 1, 2].map(|c| l.tbase[c].wrapping_add(l.tstep[c].wrapping_mul(k as i64)));
+                    rgba = self.textured(v, l.tstep.map(|d| [d, 0]), smp, rgba);
                 }
                 if l.fog != 0 {
                     rgba = self.fogged(rgba, l.fbase.wrapping_add(l.fstep.wrapping_mul(k)));
@@ -1537,7 +1547,8 @@ impl Rss {
         // Texture along the line: S/W, T/W, Q/W at the start, steps per
         // pixel in the edge step registers; the fog factor likewise.
         let fix64t = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / ITER_ONE;
-        let q = |c: u32, d: u32| [fix64t(self, c), fix64t(self, d), 0.0];
+        let q = |c: u32, d: u32| [fix64t(self, c), fix64t(self, d)];
+        let tq = [q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)];
         let xmajor = (x1 - x0).abs() >= (y1 - y0).abs();
         let (a0, a1, b0, b1) = if xmajor { (x0, x1, y0, y1) } else { (y0, y1, x0, x1) };
         if a0 == a1 {
@@ -1560,7 +1571,8 @@ impl Rss {
             fstep: fixed::fraction(df),
             zbase: zfix(fix64(self, 0x068) + fix64(self, 0x06C) * t0),
             zstep: zfix(fix64(self, 0x06C)),
-            tplanes: [q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)],
+            tbase: tq.map(|q| fixed::iter(q[0] + q[1] * t0)),
+            tstep: tq.map(|q| fixed::iter(q[1])),
             a0,
             b0,
             slope: (b1 - b0) / (a1 - a0),

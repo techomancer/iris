@@ -18,9 +18,9 @@ an emitter.
   - `clamp` and `min` let NaN through or prefer the number, while
     `fmin`/`fmax` propagate NaN.
   - `as` conversions saturate (`fcvt_to_*_sat`).
-- No libm: the texture LOD is `te1::lod` (sqrt and a cubic `lod_log2`), and
-  the JIT emits the same operations in the same order. Change one and you
-  must change the other. Component and byte scaling come from tables
+- No libm and no float in the pixel path: everything a fragment computes
+  is defined in `src/dev/mgras/fixed.rs`, and the JIT emits the same
+  integer operations. Change one and you must change the other. Component and byte scaling come from tables
   filled by the interpreter's own divisions. Shaders make no calls.
 - Booleans from `icmp`/`fcmp` are 0/1 bytes. `bnot`, `bor_not` and
   `band_not` on them give 0xFE/0xFF, which branch as true. That made every
@@ -29,7 +29,11 @@ an emitter.
 - Colour is 12.16 fixed point end to end (`src/dev/mgras/fixed.rs`):
   iterators, texels widened to 12 bits, 8-bit bilinear weights, the 8-bit
   mip fraction, texture environment, fog and blending, then a shift down
-  on write. Z and S/T/W are still f64.
+  on write. Depth is a z.12 integer DDA. Texture coordinates are integer
+  too: S/W, T/W, 1/W planes at 2^32, a reciprocal unit (1024-entry seed
+  table plus one Newton step, `fixed::recip`), s and t in Q31, texels in
+  Q16 per level, and the level of detail in Q8 from a log2 table. Only
+  the triangle edge walk is still f64.
 
 ## Speed
 
