@@ -1549,6 +1549,10 @@ impl Gl {
         self.bitmap_pending != 0 || self.send_pixels_pending != 0
     }
 
+    pub fn wants_pixel_rows(&self) -> bool {
+        self.send_pixels_pending != 0
+    }
+
     /// Words a pending SEND_PIXELS image needs before it can be drawn or
     /// loaded (words per row times rows, when the header says; 0 for
     /// glBitmap, drawn as it comes).

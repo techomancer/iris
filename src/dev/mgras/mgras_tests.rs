@@ -2390,6 +2390,22 @@ fn gl_draw_pixels_rgba8_component_order() {
     m.stop_engines();
 }
 
+#[test]
+fn gl_fifo_abgr_rows_ignore_doubleword_padding() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0x00C1_0080]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_dma(&m, 0xC00, 0xE8D);
+    fifo_token(&m, 0x8D, &[3, 0, 0, 2, 0, 1, 0x49D0, 0x99]);
+    fifo_pixel_data(&m, &[0xFF00_0000, 0xFF56_3412, 0xFF00_00FF]);
+    fifo_pixel_data(&m, &[0xFF00_FF00, 0xFFFF_0000, 0xFFFF_FFFF]);
+    let got: Vec<u32> = [(10, 20), (11, 20), (12, 20), (10, 21), (11, 21), (12, 21)]
+        .iter().map(|&(x, y)| gl_px(&m, x, y)).collect();
+    assert_eq!(got, [0, 0x56_3412, 0xFF, 0xFF00, 0xFF0000, 0xFFFFFF]);
+    m.stop_engines();
+}
+
 /// glCopyPixels' write half by host DMA (Maya copies the front buffer to
 /// the back after a full redraw, then redraws only what changes): the
 /// image size from pixel state 0xDA8, the transfer mode from the RSS

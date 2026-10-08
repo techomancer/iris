@@ -664,7 +664,7 @@ impl Hq3Engine {
             return;
         }
         f.need -= 1;
-        if f.pixel {
+        if f.pixel && !(f.need == 0 && (f.cmd & 0xF_FFFF).div_ceil(4) & 1 != 0) {
             if let Some(buf) = self.eram_in.as_mut() {
                 buf.push(w);
             } else if self.gl.wants_bitmap_rows() {
@@ -692,6 +692,16 @@ impl Hq3Engine {
             if self.eram_in.is_none() && self.gl.wants_bitmap_rows() {
                 // An image bigger than one pixel command (255 bytes) comes
                 // in several: wait for all of it.
+                if self.gl.wants_pixel_rows() {
+                    let n = (cmd & 0xF_FFFF).div_ceil(4) as usize;
+                    let start = self.bitmap_in.len().saturating_sub(n);
+                    let tail = &mut self.bitmap_in[start..];
+                    let mut bytes: Vec<u8> = tail.iter().flat_map(|w| w.to_be_bytes()).collect();
+                    format_pixels(self.formatter, &mut bytes[..(cmd & 0xF_FFFF) as usize]);
+                    for (w, b) in tail.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *w = u32::from_be_bytes(b.try_into().unwrap());
+                    }
+                }
                 if self.bitmap_in.len() >= self.gl.pixel_words_needed() {
                     let rows = std::mem::take(&mut self.bitmap_in);
                     self.gl.bitmap_rows(&rows, sink);
