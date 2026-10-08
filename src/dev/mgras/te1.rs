@@ -111,31 +111,31 @@ pub const TEXMODE1_ENABLE: u32 = 1;
 
 /// TEXMODE2: magnification / minification within a level linear, mipmaps
 /// (nearest level; with bit 6 blending two), clamp S and T, mipmapping on.
-const TM2_MAG_LINEAR: u32 = 1 << 7;
-const TM2_MIN_LINEAR: u32 = 1 << 8;
-const TM2_MIPMAP: u32 = 1 << 5;
-const TM2_MIP_LINEAR: u32 = 1 << 6;
+pub(crate) const TM2_MAG_LINEAR: u32 = 1 << 7;
+pub(crate) const TM2_MIN_LINEAR: u32 = 1 << 8;
+pub(crate) const TM2_MIPMAP: u32 = 1 << 5;
+pub(crate) const TM2_MIP_LINEAR: u32 = 1 << 6;
 /// Clamp S / T (and R, bit 13) instead of repeating; with bit 14
 /// GL_CLAMP's coordinate clamp to [0, 1] (linear filtering at the edge is
 /// half border), without it GL_CLAMP_TO_BORDER_SGIS (coordinates may pass
 /// the edge, so samples there are all border). libGLcore
 /// __glMgrim_TexParameter: GL_CLAMP sets axis bit | 0x4000, clamp to border
 /// the axis bit alone.
-const TM2_CLAMP_S: u32 = 1 << 11;
-const TM2_CLAMP_T: u32 = 1 << 12;
-const TM2_GL_CLAMP: u32 = 1 << 14;
+pub(crate) const TM2_CLAMP_S: u32 = 1 << 11;
+pub(crate) const TM2_CLAMP_T: u32 = 1 << 12;
+pub(crate) const TM2_GL_CLAMP: u32 = 1 << 14;
 /// The texture has no border: clamped fetches outside it read TXBCOLOR.
-const TM2_NO_BORDER: u32 = 1 << 16;
-const TM2_MM_ENABLE: u32 = 1 << 19;
+pub(crate) const TM2_NO_BORDER: u32 = 1 << 16;
+pub(crate) const TM2_MM_ENABLE: u32 = 1 << 19;
 
 pub const TRAM_BYTES: usize = 4 << 20;
-const TRAM_NIBBLES: usize = TRAM_BYTES * 2;
+pub(crate) const TRAM_NIBBLES: usize = TRAM_BYTES * 2;
 /// A TRAM page: 16 KB with 4 TRAMs.
-const PAGE_NIBBLES: usize = 16384 * 2;
+pub(crate) const PAGE_NIBBLES: usize = 16384 * 2;
 
 /// Texel offset in a shared page of a level whose larger side is `n` (<=
 /// 16): 16x16 first, then 8x8, 4x4, 2x2, 1x1.
-fn small_offset(n: usize) -> usize {
+pub(crate) fn small_offset(n: usize) -> usize {
     let (mut off, mut k) = (0, 16);
     while k > n {
         off += k * k;
@@ -181,7 +181,7 @@ fn texel_addr(page: u32, w: usize, h: usize, s: usize, t: usize, tn: usize) -> u
 
 /// Border texel offset in a shared border page for a level whose larger
 /// side is `n` (<= 16): each level's border is 4n + 4 texels.
-fn small_border_offset(n: usize) -> usize {
+pub(crate) fn small_border_offset(n: usize) -> usize {
     let (mut off, mut k) = (0, 16);
     while k > n {
         off += 4 * k + 4;
@@ -213,7 +213,7 @@ fn border_addr(page: u32, w: usize, h: usize, s: i64, t: i64, tn: usize) -> usiz
 /// A component's depth in nibbles, from TL_MODE bits 6:5 / TEXMODE2 bits
 /// 3:2: 0, 1, 2 = 4, 8, 12 bits (traced: libGLcore stores RGBA8 at 0 with 1
 /// TRAM, at 1 with 4).
-fn depth_nibbles(field: u32) -> usize {
+pub(crate) fn depth_nibbles(field: u32) -> usize {
     match field & 3 {
         0 => 1,
         2 => 3,
@@ -237,6 +237,17 @@ pub struct Te1 {
 }
 
 impl Te1 {
+    /// TRAM, for the JIT's texel fetches.
+    pub fn tram_ptr(&self) -> *const u8 {
+        self.tram.as_ptr()
+    }
+
+    /// TRAM, writable (tests).
+    #[cfg(test)]
+    pub fn tram_mut(&mut self) -> &mut [u8] {
+        &mut self.tram
+    }
+
     fn nibble(&self, a: usize) -> u32 {
         let b = self.tram[a / 2] as u32;
         if a & 1 == 0 { b & 0xF } else { b >> 4 }
@@ -453,9 +464,9 @@ impl Te1 {
             ls: size & 0xF,
             lt: (size >> 4) & 0xF,
             max_level: if mipmaps { (regs[reg::TXLOD as usize] & 0xF).min(15) } else { 0 },
-            nc: ((m1 >> 3) & 3) as usize + 1,
-            sel: ((m1 >> 7) & 3) as usize,
-            d: depth_nibbles(m2 >> 2),
+            nc: ((m1 >> 3) & 3) + 1,
+            sel: (m1 >> 7) & 3,
+            d: depth_nibbles(m2 >> 2) as u32,
             pages,
             border_pages,
             border_color,
@@ -463,21 +474,24 @@ impl Te1 {
     }
 }
 
-/// What the TE needs to sample one primitive's fragments.
-#[derive(Clone, Copy)]
+/// What the TE needs to sample one primitive's fragments. Plain data: the
+/// JIT (`rss_jit`) reads it by offset.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct Sampler {
-    mode2: u32,
+    pub mode2: u32,
     /// log2 of level 0's size.
     pub ls: u32,
     pub lt: u32,
-    max_level: u32,
-    nc: usize,
+    pub max_level: u32,
+    pub nc: u32,
     /// Select slot (TEXMODE1 bits 8:7, see `comp_offset`).
-    sel: usize,
-    d: usize,
-    pages: [u32; 16],
-    border_pages: [u32; 16],
-    border_color: [f32; 4],
+    pub sel: u32,
+    /// Component depth in nibbles.
+    pub d: u32,
+    pub pages: [u32; 16],
+    pub border_pages: [u32; 16],
+    pub border_color: [f32; 4],
 }
 
 impl Sampler {
@@ -494,7 +508,8 @@ impl Sampler {
         let axis = |v: i64, n: usize, clamp: bool| if clamp { v.clamp(-1, n as i64) } else { v.rem_euclid(n as i64) };
         let s = axis(i, w, self.mode2 & TM2_CLAMP_S != 0);
         let t = axis(j, h, self.mode2 & TM2_CLAMP_T != 0);
-        let tn = cell_nibbles(self.d);
+        let (nc, sel, d) = (self.nc as usize, self.sel as usize, self.d as usize);
+        let tn = cell_nibbles(d);
         let a = if s < 0 || t < 0 || s >= w as i64 || t >= h as i64 {
             if self.mode2 & TM2_NO_BORDER != 0 {
                 return self.border_color;
@@ -504,8 +519,8 @@ impl Sampler {
             texel_addr(self.pages[level as usize & 15], w, h, s as usize, t as usize, tn)
         };
         let mut c = [0.0f32; 4];
-        for (k, o) in c.iter_mut().enumerate().take(self.nc) {
-            *o = te.component(a + comp_offset(self.sel, self.nc, k, self.d), self.d);
+        for (k, o) in c.iter_mut().enumerate().take(nc) {
+            *o = te.component(a + comp_offset(sel, nc, k, d), d);
         }
         c
     }
@@ -531,8 +546,10 @@ impl Sampler {
         let (i, j) = (u.floor(), v.floor());
         let (a, b) = ((u - i) as f32, (v - j) as f32);
         let (i, j) = (i as i64, j as i64);
-        let (t00, t10) = (self.texel(te, level, i, j), self.texel(te, level, i + 1, j));
-        let (t01, t11) = (self.texel(te, level, i, j + 1), self.texel(te, level, i + 1, j + 1));
+        // Wrapping: a coordinate far outside saturates to i64::MAX.
+        let (i1, j1) = (i.wrapping_add(1), j.wrapping_add(1));
+        let (t00, t10) = (self.texel(te, level, i, j), self.texel(te, level, i1, j));
+        let (t01, t11) = (self.texel(te, level, i, j1), self.texel(te, level, i1, j1));
         let mut c = [0.0f32; 4];
         for k in 0..4 {
             c[k] = (1.0 - a) * (1.0 - b) * t00[k] + a * (1.0 - b) * t10[k] + (1.0 - a) * b * t01[k] + a * b * t11[k];

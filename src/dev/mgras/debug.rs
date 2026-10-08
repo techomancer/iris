@@ -259,6 +259,8 @@ impl Mgras {
                 });
             }
             ["stats"] => return e(self.stats(w)),
+            #[cfg(feature = "gr4-jit")]
+            ["jit", rest @ ..] => return self.cmd_jit(rest, w),
             _ => {}
         }
         let f = self.front();
@@ -468,7 +470,53 @@ impl Mgras {
         let blocks: Vec<String> = r.blocks.iter().enumerate().filter(|(_, n)| **n != 0).map(|(k, n)| format!("{k}:{n}")).collect();
         writeln!(w, "  blocks by type {}  fast fills {}", blocks.join(" "), r.fast_fills)?;
         writeln!(w, "  stipple chunks {}  PIO dw written {} read {}  DMA lines in {}",
-            r.stipple_chunks, r.pio_write_dw, r.pio_read_dw, r.dma_lines_in)
+            r.stipple_chunks, r.pio_write_dw, r.pio_read_dw, r.dma_lines_in)?;
+        #[cfg(feature = "gr4-jit")]
+        {
+            // SAFETY: as above.
+            let j = unsafe { &*self.rss.get() }.jit;
+            let (compiled, queued, failed, bytes) = super::rss_jit::store().summary();
+            writeln!(w, "JIT: {} shader runs, {} while compiling, {} not covered; {compiled} shaders ({bytes} bytes), {queued} queued, {failed} failed",
+                j.hits, j.misses, j.declined)?;
+        }
+        Ok(())
+    }
+
+    /// `mgras jit [on|off|sync|list]`: the raster JIT's mode and shaders.
+    #[cfg(feature = "gr4-jit")]
+    fn cmd_jit(&self, args: &[&str], w: &mut dyn Write) -> Result<(), String> {
+        use super::rss_jit::{self, PipeKey, MODE_ASYNC, MODE_OFF, MODE_SYNC};
+        let e = |r: std::io::Result<()>| r.map_err(|e| e.to_string());
+        let mode = match args {
+            ["on"] | ["async"] => Some(MODE_ASYNC),
+            ["off"] => Some(MODE_OFF),
+            ["sync"] => Some(MODE_SYNC),
+            ["list"] => {
+                for (k, bytes) in rss_jit::store().compiled() {
+                    e(writeln!(w, "{k:#018x} {bytes:6}B  {}", PipeKey::unpack(k)))?;
+                }
+                return Ok(());
+            }
+            [] => None,
+            _ => return Err("usage: mgras jit [on|off|sync|list]".into()),
+        };
+        if let Some(m) = mode {
+            // The RSS thread reads the mode: change it with the board idle.
+            let _sub = self.submit.lock();
+            self.wait_idle();
+            // SAFETY: the board is idle and `submit` keeps it so.
+            unsafe { &mut *self.rss.get() }.jit.mode = m;
+        }
+        // SAFETY: read-only peek (may tear).
+        let j = unsafe { &*self.rss.get() }.jit;
+        let name = match j.mode {
+            MODE_OFF => "off",
+            MODE_SYNC => "sync",
+            _ => "on",
+        };
+        let (compiled, queued, failed, bytes) = rss_jit::store().summary();
+        e(writeln!(w, "raster JIT {name}: {} shader runs, {} while compiling, {} not covered; {compiled} shaders ({bytes} bytes), {queued} queued, {failed} failed",
+            j.hits, j.misses, j.declined))
     }
 
     /// `mgras fbdump`: the raw page memory (pixmem.bin, big-endian u64s),

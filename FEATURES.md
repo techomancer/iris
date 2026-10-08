@@ -38,6 +38,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `jitv2` | Experimental whole-page MIPS compiler; implies transparent caching. | `tcache`, `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `target-lexicon`, `region`, `wasmtime-jit-icache-coherence` |
 | `jitv2_opcodefusion` | Optional JIT fusion, off by default after live delay-slot failures. | `jitv2` |
 | `j2wp` | Compatibility alias for `jitv2`; no separate compiler mode. | `jitv2` |
@@ -642,4 +643,32 @@ monitor inspects and controls it.
 
 ```
 cargo run --release --features rex-jit
+```
+
+### IMPACT raster JIT (`--features gr4-jit`)
+
+`gr4-jit` compiles IMPACT's raster pipelines (`src/dev/mgras/rss_jit`). The
+registers that shape a primitive's pipeline reduce to a 64-bit key, and each
+key gets its own monomorphised shader. The key covers the primitive (fills,
+X lines, character stipple, transfer lines, GL triangles and GL lines),
+clipping, draw buffers, pixel format, logic op, and the alpha, stencil and
+depth tests, blending, texture environment, texture format, filtering and
+wrap modes, and fog. Colours, masks, references, page pointers and plane
+coefficients reach a shader as data in a per-board context.
+
+Shaders compile on a background thread. Until a primitive's shader is ready
+the interpreter draws it. Shaders are bit-exact with the interpreter:
+`src/dev/mgras/rss_jit_tests.rs` sweeps the key space and compares whole
+boards (`GR4_JIT_SWEEP=<factor>` and `GR4_JIT_SEED=<n>` widen it). Measured
+on representative primitives, they are 2.5-6x faster than the interpreter:
+fills and transfers 5-6x, lines and text about 3x, shaded and textured
+triangles 2.5x.
+
+- `IRIS_GR4_JIT=off|on|sync` sets the starting mode. `sync` compiles on
+  first use and waits.
+- `mgras jit [on|off|sync|list]` in the monitor shows and changes it.
+- `GR4_JIT_DISASM=1` prints each shader's machine code as it compiles.
+
+```
+cargo run --release --features lightning,rex-jit,gr4-jit
 ```

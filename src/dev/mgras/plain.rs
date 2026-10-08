@@ -103,6 +103,46 @@ impl<const N: usize> Ring<N> {
     }
 }
 
+/// A plain-data `Option<T>`: empty when zeroed, `#[repr(C)]`, so state that
+/// holds one stays a flat block a JIT can address by offset. `T` must be
+/// valid zeroed.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Slot<T: Copy> {
+    full: u32,
+    val: T,
+}
+
+impl<T: Copy> Slot<T> {
+    pub fn get(&self) -> Option<T> {
+        (self.full != 0).then_some(self.val)
+    }
+
+    pub fn as_ref(&self) -> Option<&T> {
+        (self.full != 0).then_some(&self.val)
+    }
+
+    pub fn as_mut(&mut self) -> Option<&mut T> {
+        (self.full != 0).then_some(&mut self.val)
+    }
+
+    pub fn set(&mut self, v: Option<T>) {
+        match v {
+            Some(v) => {
+                self.val = v;
+                self.full = 1;
+            }
+            None => self.full = 0,
+        }
+    }
+
+    pub fn take(&mut self) -> Option<T> {
+        let v = self.get();
+        self.full = 0;
+        v
+    }
+}
+
 /// Build a `T` in place on the heap, all zero. `T` must be valid zeroed
 /// (plain data built from these containers, integers, arrays and bools).
 pub fn boxed_zeroed<T>() -> Box<T> {

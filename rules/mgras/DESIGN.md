@@ -17,6 +17,8 @@ blocks (src/dev/mgras):
   ge11.rs       GE11 diagnostic port and microcode storage (no microcode execution)
   gl.rs         GE11 OpenGL HLE; shared math/vertex/lighting in src/dev/gl
   rss.rs        RSS backend: RE4 registers, 2D primitives, triangles and PP1 ops
+  rss_jit/      raster JIT (`gr4-jit`): pipeline key, context, Cranelift
+                emitters; equivalence sweep in rss_jit_tests.rs
   te1.rs        Texture downloads, sampling, filtering and texture environment
   pixmem.rs     Tiled 36-bit and overlay pixel storage, DRB/XMAP buffer pointers
   dcb.rs        Display bus; VC3/XMAP/colormap/DAC register state

@@ -45,11 +45,17 @@ mod pixmem;
 mod plain;
 mod record;
 mod rss;
+#[cfg(feature = "gr4-jit")]
+mod rss_jit;
 mod te1;
 
 #[cfg(test)]
 #[path = "mgras_tests.rs"]
 mod mgras_tests;
+
+#[cfg(all(test, feature = "gr4-jit"))]
+#[path = "rss_jit_tests.rs"]
+mod rss_jit_tests;
 
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
@@ -990,7 +996,7 @@ impl Device for Mgras {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("mgras".into(), "IMPACT graphics: status|hq|gl|ge|ucode|vc3|xmap|cmap|dac|pix|stats|fbdump|shot|dump|trace|rec (mgras help)".into()),
+            ("mgras".into(), "IMPACT graphics: status|hq|gl|ge|ucode|vc3|xmap|cmap|dac|pix|stats|jit|fbdump|shot|dump|trace|rec (mgras help)".into()),
             ("rss".into(), "IMPACT raster subsystem: regs|pix".into()),
         ]
     }

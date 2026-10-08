@@ -67,7 +67,8 @@ boots to a usable system: shell, networking, X11, the works.
 - R4400, R5000, or R10000 CPU, selected per machine at runtime
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental),
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
-  optional REX3 shader JIT (`rex-jit`)
+  optional REX3 shader JIT (`rex-jit`), and an IMPACT raster pipeline JIT
+  (`gr4-jit`)
 - Copy-on-write disk overlay, and CHD images with MAME-style `.diff.chd` sidecars.
   Crash all day, base image stays clean
 - Hot-swappable CD-ROM with runtime disc switching
@@ -178,7 +179,8 @@ are in [FEATURES.md](FEATURES.md#emulated-cpu).
 ### JIT compilers
 
 Optional `jitv2` compiles MIPS code; `rex-jit` compiles Newport draw shaders
-alongside the precompiled drawing routines. See
+alongside the precompiled drawing routines; `gr4-jit` compiles IMPACT raster
+pipelines. See
 [FEATURES.md](FEATURES.md#jit-compilers) for their behavior, defaults,
 limitations, persistent caches, and corpus-measurement tools.
 

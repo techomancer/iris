@@ -31,6 +31,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **IMPACT raster JIT (`gr4-jit`).** The registers that shape an IMPACT
+  primitive's pixel pipeline reduce to a 64-bit key, and Cranelift compiles
+  one shader per key. It covers fills, X lines, character stipple, transfer
+  lines, and GL triangles and lines with their tests, blending, texturing
+  and fog. Shaders are bit-exact with the interpreter, which a key-space
+  sweep proves board by board (`src/dev/mgras/rss_jit_tests.rs`). They are
+  2.5-6x faster on representative primitives. Shaders compile in the
+  background, and `mgras jit` in the monitor shows and switches the JIT. The
+  RSS and TE1 state is now plain `#[repr(C)]` data: `Option`s gave way to a
+  plain `Slot`, and the sampler and setup structs became flat.
 - **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,
   `mips4` and `r5k` cargo features.** CHD images, the host camera, the
   Ultra64 dev board, DaynaPort and the IP28 / R10000 machine are always built

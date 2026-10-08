@@ -35,6 +35,7 @@ pub fn xtiles(drbsize: u32) -> (u32, u32) {
     }
 }
 
+#[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// A 36-bit buffer: one pixel a word.
@@ -44,6 +45,7 @@ pub enum Kind {
 }
 
 /// Where a buffer is and how its words hold pixels.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Buffer {
     pub ptr: u32,
