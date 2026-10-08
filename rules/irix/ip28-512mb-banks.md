@@ -10,8 +10,8 @@ profile = "indigo2_ip28"
 cpu = "r10000"
 ```
 
-Supply an IP28 PROM through the `prom` setting. In the GUI, select the IP28
-profile and the **1024 MB** preset, or set banks 0 and 1 to **512 MB**.
+IP28 has an embedded PROM fallback; use `prom` to override it. In the GUI,
+select the IP28 profile and the **1024 MB** preset, or set banks 0 and 1 to **512 MB**.
 Stop and start the machine to apply the configuration.
 
 IP28 uses a 16 MB memory configuration (MEMCFG) granule. Its five-bit size

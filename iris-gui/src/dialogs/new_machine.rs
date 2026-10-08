@@ -113,17 +113,10 @@ impl NewMachineDialog {
                         // nudge rather than stranding the user on R10000 elsewhere.
                         if self.profile == MachineProfile::Indigo2Ip28 {
                             self.cpu = CpuModel::R10000;
-                            self.use_embedded_prom = false;
-                            // There is no embedded IP28 PROM (only IP22/IP24) — clear the
-                            // IP22/IP24 placeholder path so Create can't silently ship a
-                            // machine that falls back to the wrong embedded PROM.
-                            self.prom_path.clear();
                             // Newport resolution presets don't apply to IMPACT.
                             self.resolution = NewportResolution::Guest;
                         } else if profile_before == MachineProfile::Indigo2Ip28 {
                             self.cpu = CpuModel::default();
-                            self.use_embedded_prom = true;
-                            if self.prom_path.is_empty() { self.prom_path = "prom.bin".into(); }
                             self.ram_total_mb = self.ram_total_mb.min(512);
                             // Banks above 128 MB require the IP28 MC.
                             for bank in &mut self.ram_banks {
@@ -248,19 +241,12 @@ impl NewMachineDialog {
                         RichText::new(
                             "Bring-up. The new machine is set up with IMPACT graphics — the \
                              IP28 IRIX kernel has no Newport driver at all; change it from the \
-                             General tab after creation if needed. The embedded PROM is \
-                             IP22/IP24 only — point PROM image at a real dumped IP28 PROM.",
+                             General tab after creation if needed. The embedded IP28 PROM \
+                             is used when no external PROM file is available.",
                         )
                         .color(Color32::from_rgb(220, 170, 90))
                         .small(),
                     );
-                    if !crate::disk_readable(&self.prom_path) {
-                        ui.label(
-                            RichText::new("PROM image doesn't point at a readable file yet.")
-                                .color(Color32::from_rgb(220, 120, 90))
-                                .small(),
-                        );
-                    }
                 }
 
                 ui.separator();

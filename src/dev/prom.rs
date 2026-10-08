@@ -56,14 +56,29 @@ impl Prom {
         }
     }
 
-    /// IP22 (Indigo2) variant: try `cfg_path` (as configured via `[machine].prom`
+    /// IP22 (Indigo2) variant: try `cfg_path` (as configured via top-level `prom`
     /// / `--prom`), then the default `070-1367-012.bin` in the current directory,
     /// then fall back to the embedded PROM0701367012 image.
     pub fn from_file_or_embedded_ip22(cfg_path: &str) -> Self {
-        const IP22_DEFAULT: &str = "070-1367-012.bin";
+        Self::from_file_or_embedded_indigo2(
+            cfg_path, "070-1367-012.bin", &crate::prombini2::PROM0701367012, "IP22",
+        )
+    }
+
+    /// IP28 (Indigo2 IMPACT) variant: try the configured path, then
+    /// `070-1477-002.bin` in the current directory, then the embedded image.
+    pub fn from_file_or_embedded_ip28(cfg_path: &str) -> Self {
+        Self::from_file_or_embedded_indigo2(
+            cfg_path, "070-1477-002.bin", &crate::prombinip28::PROM0701477002, "IP28",
+        )
+    }
+
+    fn from_file_or_embedded_indigo2(
+        cfg_path: &str, default_path: &str, embedded: &[u8], profile: &str,
+    ) -> Self {
         let mut paths = vec![cfg_path];
-        if cfg_path != IP22_DEFAULT {
-            paths.push(IP22_DEFAULT);
+        if cfg_path != default_path {
+            paths.push(default_path);
         }
         for path in paths {
             match fs::read(path) {
@@ -76,8 +91,8 @@ impl Prom {
                 }
             }
         }
-        eprintln!("Warning: falling back to embedded IP22 PROM");
-        Self::from_bytes(&crate::prombini2::PROM0701367012)
+        eprintln!("Warning: falling back to embedded {} PROM", profile);
+        Self::from_bytes(embedded)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
@@ -228,6 +243,56 @@ impl BusDevice for PromPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_indigo2_fallback_order(profile: &str, embedded: &[u8]) {
+        // Absolute fixture paths avoid changing the process working directory
+        // or depending on any PROM files in the developer's checkout.
+        let dir = std::env::temp_dir().join(format!(
+            "iris-prom-{}-{}-{}", profile, std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir(&dir).unwrap();
+        let configured = dir.join("configured.bin");
+        let default = dir.join("default.bin");
+        let load = |path: &str| Prom::from_file_or_embedded_indigo2(
+            path, default.to_str().unwrap(), embedded, profile,
+        ).get_port();
+
+        // Missing and empty configured paths both reach the correct embedded
+        // image when the default file is also absent. Check the whole ROM
+        // through the guest bus, including its final word and erased padding.
+        for path in [configured.to_str().unwrap(), ""] {
+            let port = load(path);
+            for (i, word) in embedded.chunks_exact(4).enumerate() {
+                let read = port.read32(PROM_BASE + (i * 4) as u32);
+                assert!(read.is_ok());
+                assert_eq!(read.data, u32::from_be_bytes(word.try_into().unwrap()));
+            }
+            assert_eq!(port.read32(PROM_BASE + embedded.len() as u32).data, u32::MAX);
+        }
+
+        // A default file wins over the embedded image, including when the
+        // configured path is empty or is itself the default path.
+        fs::write(&default, [0x12, 0x34, 0x56, 0x78]).unwrap();
+        for path in [configured.to_str().unwrap(), "", default.to_str().unwrap()] {
+            assert_eq!(load(path).read32(PROM_BASE).data, 0x12345678);
+        }
+
+        // An explicit file wins over both the default and embedded images.
+        fs::write(&configured, [0x87, 0x65, 0x43, 0x21]).unwrap();
+        assert_eq!(load(configured.to_str().unwrap()).read32(PROM_BASE).data, 0x87654321);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ip22_prom_fallback_order() {
+        check_indigo2_fallback_order("IP22", &crate::prombini2::PROM0701367012);
+    }
+
+    #[test]
+    fn ip28_prom_fallback_order() {
+        check_indigo2_fallback_order("IP28", &crate::prombinip28::PROM0701477002);
+    }
 
     #[test]
     fn test_prom_behavior() {

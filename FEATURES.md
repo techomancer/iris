@@ -124,7 +124,7 @@ user config directory.
 
 Defaults below are **core schema/runtime defaults**, not this checkout's
 sample iris.toml or the GUI New Machine dialog. GUI IP28 creation selects
-R10000/Solid IMPACT and an external PROM; changing `machine.profile` in TOML
+R10000/Solid IMPACT and the embedded IP28 PROM; changing `machine.profile` in TOML
 does not automatically replace every other hardware setting. Omit optional
 keys to use defaults; TOML has no `null` value. Put top-level scalars before
 the first `[section]`, because TOML tables continue until the next header.
@@ -133,7 +133,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path; IP24/IP22 have embedded fallback, IP28 requires an external image. |
+| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory. |
 | `nvram` | `"nvram.bin"` | DS1386 backing file; GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
 | `banks` | `[128,128,0,0]` | Four RAM bank sizes in MB; see profile constraints below. |
@@ -288,7 +288,8 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 Bank values are 0, 8, 16, 32, 64, or 128 MB; only IP28 accepts 256/512 MB.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
-`heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT and its own PROM.
+`heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
+embedded fallback.
 The config validator currently permits SCSI controller 1 only on IP22.
 
 Standalone CLI options update the loaded config where supplied; boolean enable
@@ -513,7 +514,7 @@ both the interpreter and jitv2.
 
 R4400 (the default), R5000, or R10000, chosen per machine at runtime.
 All three models are compiled into every binary; there is no separate CPU build
-or download. Pair R10000 with the IP28 profile and an IP28 PROM.
+or download. Pair R10000 with the IP28 profile, which has an embedded IP28 PROM.
 
 | | R4400 | R5000 | R10000 |
 |---|---|---|---|

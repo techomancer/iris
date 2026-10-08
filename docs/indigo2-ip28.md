@@ -7,11 +7,13 @@ the repository's validation notes. Device and graphics coverage is still evolvin
 
 ## Configure the machine
 
-Supply your own IP28 PROM. The embedded Indigo2 PROM is for IP22 and cannot
-replace it. Set top-level paths and banks before the TOML sections:
+IP28 includes the embedded `070-1477-002` PROM in `src/prombinip28.rs`.
+The loader tries the configured `prom` path, then `070-1477-002.bin` in the
+working directory, then the embedded IP28 image. An external PROM is optional.
+Set top-level paths and banks before the TOML sections:
 
 ```toml
-prom = "indigo2_prom_ip28.bin"
+prom = ""                 # use the default-file / embedded IP28 fallback
 nvram = "ip28-nvram.bin"
 nveeprom = "ip28-nveeprom.bin"
 banks = [512, 512, 0, 0]
@@ -30,7 +32,7 @@ path = "irix65.chd"
 ```
 
 In iris-gui, select **SGI Indigo2 IMPACT (IP28)**. New Machine selects R10000,
-disables the embedded PROM option, and defaults to IMPACT Solid. Choose High
+uses the embedded PROM by default, and defaults to IMPACT Solid. Choose High
 or Maximum in General if needed. Stop and start to apply hardware changes.
 IP28's IRIX kernel has no Newport driver; choose an IMPACT board.
 

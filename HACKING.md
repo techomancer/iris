@@ -116,8 +116,8 @@ other things.
 **Machine profiles** — `[machine] profile` selects Indy IP24 ("Guinness" MC/IOC,
 one WD33C93A) or Indigo2 IP22 ("Fullhouse" MC/IOC, two SCSI controllers, INT2,
 serial EEPROM for NVRAM and MAC). IP28 adds the R10000, a 16 MB MEMCFG
-granule, RAM at `0x20000000`, and IMPACT graphics. An IP28 PROM must be
-supplied separately; IP22/IP24 have embedded fallbacks. `src/platform.rs`/`machine.rs` wire the
+granule, RAM at `0x20000000`, and IMPACT graphics. All three profiles have
+their own embedded PROM fallbacks. `src/platform.rs`/`machine.rs` wire the
 difference; `platform_profile_tests.rs` pins it down.
 
 **Memory** — emulated as real host mappings (`src/ppmem/`,

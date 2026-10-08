@@ -22,7 +22,7 @@ profile = "indy_ip24"   # default — enforced at Machine::new (guinness=true)
 `profile` is **not cosmetic**: it sets MC/IOC/HPC3 Guinness layout. IRIX still reports **IP22** as the platform family on Indy — see [`rules/gui/machine-profile-vs-guest-ip22.md`](../gui/machine-profile-vs-guest-ip22.md).
 
 R4400, R5000, and R10000 are runtime CPU settings; all models are built in.
-Pair R10000 with `indigo2_ip28` and an external IP28 PROM. GR2 XZ/Extreme
+Pair R10000 with `indigo2_ip28`, which has an embedded IP28 PROM. GR2 XZ/Extreme
 and IMPACT boards are built in; choose them with `[graphics] board`.
 
 ## RAM presets (stability)

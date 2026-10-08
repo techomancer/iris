@@ -97,6 +97,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### IP28, memory, and battery-backed state
 
+- **Embedded IP28 PROM fallback.** `src/prombinip28.rs` embeds the 512 KB
+  `070-1477-002` image. IP28 tries the configured PROM path, then
+  `070-1477-002.bin` in the working directory, then its embedded image.
+  New Machine defaults to **Use embedded PROM** for IP28, and the GUI treats
+  external PROM files as optional for all three profiles.
 - **2026-10-04 — IP28 512 MB banks** (`c16e18d`): the MEMCFG installed-size
   decoder accepts the PROM's `(size_field=31, rank=1)` encoding. Two 512 MB
   banks provide 1 GB; IRIX 6.5 reports 1024 MB after POST. The GUI offers
@@ -241,7 +246,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   R10000 cache-operation semantics, 64 TLB entries, and 44-bit virtual
   addresses. Loads/stores/fetches use memory directly; shadow tag/data arrays
   answer CACHE operations and PROM diagnostics. Default Count is 97.5 MHz.
-  Requires an external IP28 PROM and IMPACT graphics for the IP28 kernel.
+  Requires IMPACT graphics for the IP28 kernel.
 - **2026-09-29 — CPU/cache correctness** (`a09186a`, `b7d2a18`, `70a5e39`):
   MTC0 retains full values for 64-bit CP0 registers, XContext fields follow
   the CPU's VA width, and Index_Store_Tag discards old line data without
@@ -408,8 +413,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   `[impact]` to values `validate()` accepts; the Newport heads control is
   hidden for GR2.
 - **2026-09-30 — IP28 / R10000 and IMPACT in the GUI.** The machine and CPU
-  dropdowns include IP28 and R10000. New Machine selects R10000, disables the
-  embedded PROM option, and presets IMPACT graphics for IP28. Initially gated
+  dropdowns include IP28 and R10000. New Machine selects R10000 and presets
+  IMPACT graphics for IP28. Initially gated
   by `ip28`; all profiles are built in after the October 1 feature cleanup.
 - **2026-09-30 — Unified graphics selection.** The picker writes
   `[graphics] board` for Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Maximum;

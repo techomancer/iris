@@ -325,10 +325,11 @@ impl Machine {
             RamBank::new(cfg.banks[3].max(1) as usize),
         ];
 
-        // PROM (1MB at 0x1FC00000). IP22 (Indigo2) uses a different PROM image
-        // than Indy: try cfg.prom, then 070-1367-012.bin in cwd, then fall back
-        // to the embedded PROM0701367012 (see prombini2.rs) rather than Indy's PROM.
-        let prom = if guinness {
+        // PROM (1MB at 0x1FC00000). Each profile has its own embedded fallback.
+        // Indigo2 also tries its profile's default filename after cfg.prom.
+        let prom = if cfg.machine.profile.ip28() {
+            Prom::from_file_or_embedded_ip28(&cfg.prom)
+        } else if guinness {
             Prom::from_file_or_embedded(&cfg.prom)
         } else {
             Prom::from_file_or_embedded_ip22(&cfg.prom)

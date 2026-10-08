@@ -85,7 +85,7 @@ boards. There is no separate `[impact]` section. See
 [GR2 graphics](indy-xz-elan.md) and [MGRAS design](../rules/mgras/DESIGN.md).
 
 For the R10000 Indigo2 profile and larger RAM banks, see
-[Indigo2 IP28](indigo2-ip28.md). IP28 requires a separate PROM image.
+[Indigo2 IP28](indigo2-ip28.md). IP28 has its own embedded PROM fallback.
 
 ## Remaining gaps
 

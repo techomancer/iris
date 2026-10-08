@@ -90,8 +90,7 @@ automatically. You'll be asked for:
   R10000 and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
-  needed for IP24/IP22. IP28 disables the embedded option and needs your own
-  dumped IP28 PROM.
+  needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
 - **NVRAM file** — defaults to a stable per-user path (see Storage) and is
   seeded with a default NVRAM on first use. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
