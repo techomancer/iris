@@ -1076,7 +1076,7 @@ impl<'a> E<'a> {
         let (s0, s1, s2, xs) = (t!(s0), t!(s1), t!(s2), t!(xs));
         let cplanes: Vec<[Value; 3]> = (0..4).map(|c| self.iplane(off!(tri.cplanes) + 12 * c)).collect();
         let (xs_i, yref_i) = (self.ld(I32, off!(tri.xs_i)), self.ld(I32, off!(tri.yref_i)));
-        let zplane = self.plane(off!(tri.zplane));
+        let zp = [self.ld(I64, off!(tri.zp)), self.ld(I64, off!(tri.zp) + 8), self.ld(I64, off!(tri.zp) + 16)];
         let tplanes: Vec<[Value; 3]> =
             if k.tex.is_some() { (0..3).map(|c| self.plane(off!(tri.tplanes) + 24 * c)).collect() } else { Vec::new() };
         let fogp = k.fog.then(|| self.iplane(off!(tri.fogp)));
@@ -1095,13 +1095,15 @@ impl<'a> E<'a> {
             let yc = e.b.ins().fadd(jf, half);
             let dy = e.b.ins().fsub(yref, yc);
             // The row's share of the colour, fog and depth planes, once a
-            // row: colours `p0 + p2 (yref - j)` (12.16), depth `p2 dy`.
+            // row: `p0 + p2 (yref - j)` (colours 12.16, depth z.12).
             let dj = e.b.ins().isub(yref_i, j);
             let mut terms: Vec<Value> = cplanes.iter().chain(fogp.iter()).map(|p| {
                 let m = e.b.ins().imul(p[2], dj);
                 e.b.ins().iadd(p[0], m)
             }).collect();
-            terms.push(e.b.ins().fmul(zplane[2], dy));
+            let dj64 = e.b.ins().sextend(I64, dj);
+            let zm = e.b.ins().imul(zp[2], dj64);
+            terms.push(e.b.ins().iadd(zp[0], zm));
             let terms = e.pin(&terms);
             let zterm = *terms.last().unwrap();
             let m = e.b.ins().fmul(s0, dy);
@@ -1165,7 +1167,9 @@ impl<'a> E<'a> {
                     let f = fixed_at(e, &fp, terms[4]);
                     c = e.fogged(c, f);
                 }
-                let z = e.at_row(&zplane, at, Some(zterm));
+                let di64 = e.b.ins().sextend(I64, di);
+                let zm = e.b.ins().imul(zp[1], di64);
+                let z = e.b.ins().iadd(zterm, zm);
                 let fx = e.b.ins().iadd(e.ox, i);
                 e.fragment(&span, fx, c, z, cont);
             });
@@ -1182,7 +1186,7 @@ impl<'a> E<'a> {
         }
         let cbase: Vec<Value> = (0..4).map(|c| self.ld(I32, off!(gll.cbase) + 4 * c)).collect();
         let cstep: Vec<Value> = (0..4).map(|c| self.ld(I32, off!(gll.cstep) + 4 * c)).collect();
-        let (z0, dz) = (g!(F64, z0), g!(F64, dz));
+        let (zbase, zstep) = (g!(I64, zbase), g!(I64, zstep));
         let tplanes: Vec<[Value; 3]> =
             if k.tex.is_some() { (0..3).map(|c| self.plane(off!(gll.tplanes) + 24 * c)).collect() } else { Vec::new() };
         let (fbase, fstep) = (g!(I32, fbase), g!(I32, fstep));
@@ -1247,8 +1251,9 @@ impl<'a> E<'a> {
             let f = self.b.ins().iadd(fbase, m);
             c = self.fogged(c, f);
         }
-        let m = self.b.ins().fmul(dz, t);
-        let z = self.b.ins().fadd(z0, m);
+        let k64 = self.b.ins().sextend(I64, kk);
+        let zm = self.b.ins().imul(zstep, k64);
+        let z = self.b.ins().iadd(zbase, zm);
         let qend = self.b.ins().iadd(q0, width);
         self.for_range(q0, qend, |e, q, cont| {
             let wx = e.b.ins().select(xmajor, p, q);
@@ -1335,14 +1340,13 @@ impl<'a> E<'a> {
             let s_old = self.b.ins().band_imm_s(s_old, 0xFF);
             let s_old = self.b.ins().ireduce(I32, s_old);
             let zold = self.b.ins().band_imm_s(zst, 0xFF_FFFF);
-            // `z.round().clamp(0, 2^24 - 1) as u64`: clamping first rounds
-            // the same (the bounds are integers), and in range a signed
-            // conversion is the same and cheaper.
-            let lo = self.f64c(0.0);
-            let hi = self.f64c(16_777_215.0);
-            let zc = self.clamp(z, lo, hi);
-            let zr = self.round_nonneg(zc);
-            let zi = self.b.ins().fcvt_to_sint_sat(I64, zr);
+            // `fixed::zbuf`: z.12 rounded to 24 bits.
+            let zr = self.b.ins().iadd_imm_s(z, 1 << (fixed::Z_FRAC - 1));
+            let zr = self.b.ins().sshr_imm_s(zr, fixed::Z_FRAC as i64);
+            let zero = self.i64c(0);
+            let zr = self.b.ins().smax(zr, zero);
+            let top = self.i64c(0xFF_FFFF);
+            let zi = self.b.ins().smin(zr, top);
             let sref = self.inv(off!(gl.sref));
             let true_ = self.b.ins().iconst(I8, 1);
             let spass = match k.stencil {

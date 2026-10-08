@@ -722,7 +722,8 @@ pub(super) struct TriSetup {
     pub fogp: [i32; 3],
     pub xs_i: i32,
     pub yref_i: i32,
-    pub zplane: [f64; 3],
+    /// Depth, z.12 (`fixed::zplane`), at pixels like `cplanes`.
+    pub zp: [i64; 3],
     pub tplanes: [[f64; 3]; 3],
     pub j0: i32,
     pub j1: i32,
@@ -743,8 +744,9 @@ pub(super) struct GlLineSetup {
     pub cstep: [i32; 4],
     pub fbase: i32,
     pub fstep: i32,
-    pub z0: f64,
-    pub dz: f64,
+    /// Depth at the first pixel and per pixel, z.12.
+    pub zbase: i64,
+    pub zstep: i64,
     pub tplanes: [[f64; 3]; 3],
     pub a0: f64,
     pub b0: f64,
@@ -1344,7 +1346,7 @@ impl Rss {
                 if t.fog != 0 {
                     rgba = self.fogged(rgba, fixed::at(t.fogp, di, dj));
                 }
-                self.gl_fragment(i, j, rgba, at(t.zplane));
+                self.gl_fragment(i, j, rgba, fixed::zat(t.zp, di, dj));
             }
         }
         true
@@ -1432,7 +1434,7 @@ impl Rss {
             fogp: fixed::plane(tplane(self, reg::FOG_F, reg::FOG_F + 4, reg::FOG_F + 2), fixed::fraction),
             xs_i: xs as i32,
             yref_i: yref as i32,
-            zplane,
+            zp: fixed::zplane(zplane),
             tplanes,
             j0: (ymin - 0.5).ceil() as i32,
             j1: (ymax - 0.5).ceil() as i32,
@@ -1513,7 +1515,7 @@ impl Rss {
                 }
                 for q in q0..q0.wrapping_add(l.width) {
                     let (wx, wy) = if l.xmajor != 0 { (p, q) } else { (q, p) };
-                    self.gl_fragment(wx, wy, rgba, l.z0 + l.dz * t);
+                    self.gl_fragment(wx, wy, rgba, l.zbase.wrapping_add(l.zstep.wrapping_mul(k as i64)));
                 }
             }
             p = p.wrapping_add(l.dir);
@@ -1547,6 +1549,7 @@ impl Rss {
         // Colours and fog at the first pixel's centre, t0 along the line;
         // each pixel after it is one further.
         let t0 = ((p0 as f64 + 0.5) - a0).abs();
+        let zfix = |v: f64| (v * (1u64 << fixed::Z_FRAC) as f64).round() as i64;
         let c0 = [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)];
         let dc = [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)];
         let (f0, df) = (fix64t(self, reg::FOG_F), fix64t(self, reg::FOG_F + 2));
@@ -1555,8 +1558,8 @@ impl Rss {
             cstep: dc.map(fixed::colour),
             fbase: fixed::fraction(f0 + df * t0),
             fstep: fixed::fraction(df),
-            z0: fix64(self, 0x068),
-            dz: fix64(self, 0x06C),
+            zbase: zfix(fix64(self, 0x068) + fix64(self, 0x06C) * t0),
+            zstep: zfix(fix64(self, 0x06C)),
             tplanes: [q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)],
             a0,
             b0,
@@ -1578,9 +1581,9 @@ impl Rss {
     /// GE11 HLE programs (layouts provisional, see GL_RASTER_STATE): screen
     /// masks, alpha test, stencil test, depth test, stencil update, then
     /// blending or the logic op, and the colour write masks. `rgba` is
-    /// 0..1 (red alone is the index in colour-index windows), `z` window
-    /// depth (0..2^24 - 1).
-    fn gl_fragment(&mut self, wx: i32, wy: i32, rgba: [i32; 4], z: f64) {
+    /// 12.16 (red alone is the index in colour-index windows), `z` window
+    /// depth in z.12 (`fixed::zbuf` rounds it to the buffer's 24 bits).
+    fn gl_fragment(&mut self, wx: i32, wy: i32, rgba: [i32; 4], z: i64) {
         let (fx, fy) = self.to_fb(wx, wy);
         if draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_CID || !self.visible(fx, fy) {
             return;
@@ -1601,7 +1604,7 @@ impl Rss {
             let masks = self.reg(reg::STENCILMASK);
             let (cmask, wmask) = (masks & 0xFF, (masks >> 8) & 0xFF);
             let sref = (st >> 16) & 0xFF;
-            let z = z.round().clamp(0.0, 16_777_215.0) as u64;
+            let z = fixed::zbuf(z);
             let zold = zst & 0xFF_FFFF;
             let spass = !sten || compare(st & 7, (sref & cmask) as f64, (s_old & cmask) as f64);
             let zpass = spass && (!ztest || compare(zm & 7, z as f64, zold as f64));
@@ -2059,7 +2062,7 @@ mod tests {
         let b = Buffer::new(0x140, Kind::Wide, r.reg(reg::DRBSIZE));
         r.mem.put(&a, 10, 1018, 0x123456);
         r.mem.put(&b, 10, 1018, 0x654321);
-        r.gl_fragment(10, 5, [fixed::colour(1.0); 4], 0.0);
+        r.gl_fragment(10, 5, [fixed::colour(1.0); 4], 0);
         assert_eq!(r.mem.get(&a, 10, 1018), 0x1234FF);
         assert_eq!(r.mem.get(&b, 10, 1018), 0xFF4321);
     }

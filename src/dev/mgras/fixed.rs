@@ -87,6 +87,27 @@ pub fn at(p: [i32; 3], di: i32, dj: i32) -> i32 {
     p[0].wrapping_add(p[1].wrapping_mul(di)).wrapping_add(p[2].wrapping_mul(dj))
 }
 
+/// Depth: z.12 in an `i64`, as the Z registers hold it.
+pub const Z_FRAC: u32 = 12;
+
+/// A depth plane (window z units) in z.12, like `plane`.
+pub fn zplane(p: [f64; 3]) -> [i64; 3] {
+    let c = |v: f64| (v * (1u64 << Z_FRAC) as f64).round() as i64;
+    [c(p[0] + 0.5 * p[1] - 0.5 * p[2]), c(p[1]), c(p[2])]
+}
+
+/// A depth plane at pixel (xs + di, yref - dj).
+#[inline]
+pub fn zat(p: [i64; 3], di: i32, dj: i32) -> i64 {
+    p[0].wrapping_add(p[1].wrapping_mul(di as i64)).wrapping_add(p[2].wrapping_mul(dj as i64))
+}
+
+/// A z.12 depth rounded to the 24-bit buffer value.
+#[inline]
+pub fn zbuf(z: i64) -> u64 {
+    (z.wrapping_add(1 << (Z_FRAC - 1)) >> Z_FRAC).clamp(0, 0xFF_FFFF) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
