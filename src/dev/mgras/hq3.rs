@@ -1134,12 +1134,11 @@ impl Hq3Engine {
                         stream.drain(..n).collect()
                     }
                 };
-                // The RSS exposes X's packed ABGR byte pixels. A GE
-                // framebuffer read returns RGBA components before the HQ
-                // formatter (as RGB/16-bit reads already do in to_host).
-                // Without this, glCopyPixels rotates alpha into red each
-                // time it draws the saved image back.
-                if matches!(peer, DmaPeer::Raster) && self.gl.pixel_op == 2 && self.gl.xfrmode & 0xFF == 0x80 {
+                // Byte RGBA transfers request component reversal with XFRMODE
+                // bit 22 (libGLcore: GL_RGBA uses 0xC00080, GL_ABGR_EXT
+                // 0x800080). The RSS exposes packed ABGR. Preserve that
+                // order for ABGR reads, including Dynamation menu saves.
+                if matches!(peer, DmaPeer::Raster) && self.gl.pixel_op == 2 && self.gl.xfrmode & 0xFF == 0x80 && self.gl.xfrmode & (1 << 22) != 0 {
                     for px in bytes.chunks_exact_mut(4) {
                         px.reverse();
                     }

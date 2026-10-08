@@ -1489,6 +1489,15 @@ fn gl_draw_pixels_zoomed() {
 /// interface register 5 (0x4009).
 #[test]
 fn gl_read_pixels_to_host_memory() {
+    gl_read_pixels_component_order(true);
+}
+
+#[test]
+fn gl_read_pixels_abgr_to_host_memory() {
+    gl_read_pixels_component_order(false);
+}
+
+fn gl_read_pixels_component_order(rgba: bool) {
     let m = gl_board([0.0, 0.0, 0.0]);
     gl_color4(&m, [1.0, 0.5, 0.25, 1.0]);
     gl_full_quad(&m);
@@ -1507,7 +1516,7 @@ fn gl_read_pixels_to_host_memory() {
     }
     fifo_token(&m, 0x7F, &[2, 4]);
     write(&m, 32, CFIFO, 0x8000_0010);
-    for w in [0x158, 0x0001_0001, 0x159, 0x0088_0080] {
+    for w in [0x158, 0x0001_0001, 0x159, 0x0088_0080 | if rgba { 1 << 22 } else { 0 }] {
         write(&m, 32, CFIFO, w);
     }
     fifo_token(&m, 0xDB, &[0x4009]);
@@ -1518,14 +1527,17 @@ fn gl_read_pixels_to_host_memory() {
     m.state_hash();
     let b = mem.bytes.lock();
     let got: Vec<u8> = (0..4).map(|i| b.get(&(0x2000 + i)).copied().unwrap_or(0)).collect();
-    assert_eq!(got, [px as u8, (px >> 8) as u8, (px >> 16) as u8, 255], "GE RGBA component order");
+    let mut expected = [px as u8, (px >> 8) as u8, (px >> 16) as u8, 255];
+    if !rgba { expected.reverse(); }
+    assert_eq!(got, expected, "GE requested component order");
     drop(b);
     // Feed the readback to glDrawPixels: repeated UI background copies
     // must preserve their colour rather than rotate alpha into red.
     fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
     fifo_token(&m, 0x8D, &[1, 0, 0, 1, 0, 1, 0x49D0, 0x99]);
+    fifo_token(&m, 0xC00, &[if rgba { 0xE0D } else { 0xE8D }]);
     fifo_pixel_data(&m, &[u32::from_be_bytes(got.try_into().unwrap())]);
-    assert_eq!(gl_px(&m, 10, 20), px, "RGBA read/draw round trip");
+    assert_eq!(gl_px(&m, 10, 20), px, "read/draw round trip");
     m.stop_engines();
 }
 
