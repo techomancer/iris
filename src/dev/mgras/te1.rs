@@ -45,6 +45,22 @@
 //! video texture.
 
 /// TE1 / texture-related RSS registers.
+#[cfg(test)]
+mod lod_tests {
+    use super::*;
+
+    #[test]
+    fn lod_log2_is_close_and_exact_on_powers_of_two() {
+        for e in -20..20 {
+            assert_eq!(lod_log2(2f64.powi(e)), e as f64);
+        }
+        for i in 1..10_000 {
+            let x = i as f64 * 0.0137;
+            assert!((lod_log2(x) - x.log2()).abs() < 0.0011, "{x}");
+        }
+    }
+}
+
 pub mod reg {
     pub const TEXMODE1: u32 = 0x111;
     pub const TXENV_RG: u32 = 0x142;
@@ -580,6 +596,35 @@ impl Sampler {
         let (a, b) = (self.level(te, l0 as u32, s, t, linear), self.level(te, l1 as u32, s, t, linear));
         [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * f)
     }
+}
+
+/// The level-of-detail log2: what the TE needs, not libm's last bit. The
+/// exponent, plus a cubic in the mantissa (exact at both ends of each
+/// octave, within 0.0011 between). Plain bit and float operations in a
+/// fixed order, so the raster JIT emits exactly the same sequence
+/// (`rss_jit::compiler`, `E::lod_log2`): keep them in step. Only called on
+/// positive values; subnormals and infinity give what the bits give.
+pub fn lod_log2(x: f64) -> f64 {
+    let b = x.to_bits();
+    let e = ((b >> 52) & 0x7FF) as i64 - 1023;
+    let m = f64::from_bits((b & LOD_MANTISSA) | LOD_ONE);
+    let t = m - 1.0;
+    e as f64 + t * (LOD_C1 + t * (LOD_C2 + t * LOD_C3))
+}
+
+pub const LOD_MANTISSA: u64 = 0x000F_FFFF_FFFF_FFFF;
+pub const LOD_ONE: u64 = 0x3FF0_0000_0000_0000;
+pub const LOD_C1: f64 = 1.42086;
+pub const LOD_C2: f64 = -0.57725;
+pub const LOD_C3: f64 = 0.15639;
+
+/// The level of detail from a footprint's scaled derivatives (s and t,
+/// along x and along y): log2 of the longer axis, -inf when it is not
+/// positive. The hardware does not use libm either; the longer axis is
+/// the square root of the larger sum of squares (one root, not two).
+pub fn lod(sx: f64, tx: f64, sy: f64, ty: f64) -> f64 {
+    let rho = (sx * sx + tx * tx).max(sy * sy + ty * ty).sqrt();
+    if rho > 0.0 { lod_log2(rho) } else { f64::NEG_INFINITY }
 }
 
 /// The texture environment (RE4): fragment colour `f` (0..1) and texel

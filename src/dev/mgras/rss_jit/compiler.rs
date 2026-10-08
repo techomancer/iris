@@ -11,9 +11,9 @@
 //!   `nearest` rounds them to even.
 //! - `f64::clamp` and `min` let NaN through or prefer the number
 //!   (`clamp`, `min_num`); `fmin`/`fmax` propagate NaN.
-//! - The level of detail (`hypot`, `log2`) is computed by a Rust helper
-//!   with the interpreter's expression; component and byte scaling come
-//!   from tables filled by the interpreter's divisions.
+//! - The level of detail is `te1::lod` emitted inline (sqrt and a cubic
+//!   log2, no libm); component and byte scaling come from tables filled
+//!   by the interpreter's divisions. Shaders make no calls.
 //!
 //! What the key fixes is decided here, at compile time; what the context
 //! holds is loaded once, in the entry block, and stays in registers.
@@ -26,7 +26,7 @@ use std::mem::{offset_of, size_of};
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F32, F64, I32, I64, I8};
-use cranelift_codegen::ir::{self, AbiParam, Block, InstBuilder, MemFlagsData, SigRef, Signature, Type, Value};
+use cranelift_codegen::ir::{self, AbiParam, Block, InstBuilder, MemFlagsData, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -42,14 +42,6 @@ macro_rules! off {
     ($($f:tt)+) => {
         offset_of!(RasterCtx, $($f)+) as i32
     };
-}
-
-/// `Rss::textured`'s level of detail from the footprint's scaled
-/// derivatives, the interpreter's very expression. One call, not three: a
-/// call clobbers every float register the shader holds.
-extern "C" fn jit_lambda(sx: f64, tx: f64, sy: f64, ty: f64) -> f64 {
-    let rho = sx.hypot(tx).max(sy.hypot(ty));
-    if rho > 0.0 { rho.log2() } else { f64::NEG_INFINITY }
 }
 
 /// Component values as `Te1::component` computes them, by depth in
@@ -70,12 +62,6 @@ fn comp_table(d: usize) -> &'static [f32] {
 fn byte_table() -> &'static [f64; 256] {
     static T: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
     T.get_or_init(|| std::array::from_fn(|v| v as f64 / 255.0))
-}
-
-/// The same, when only `lambda > 0` matters: 1 or -1.
-extern "C" fn jit_lambda_sign(sx: f64, tx: f64, sy: f64, ty: f64) -> f64 {
-    let rho = sx.hypot(tx).max(sy.hypot(ty));
-    if rho > 1.0 { 1.0 } else { -1.0 }
 }
 
 pub struct Compiler {
@@ -121,8 +107,7 @@ impl Compiler {
             b.switch_to_block(entry);
             b.seal_block(entry);
             let ctx = b.block_params(entry)[0];
-            let cc = self.module.target_config().default_call_conv;
-            let mut e = E::new(b, key, ctx, ptr, cc);
+            let mut e = E::new(b, key, ctx, ptr);
             match key.prim {
                 Prim::Fill => e.fill(),
                 Prim::Line => e.line(),
@@ -197,11 +182,10 @@ struct E<'a> {
     clips: Vec<[Value; 5]>,
     tgt: [[Value; 4]; 2],
     zxtiles: Value,
-    sig4: SigRef,
 }
 
 impl<'a> E<'a> {
-    fn new(mut b: FunctionBuilder<'a>, k: PipeKey, ctx: Value, ptr: Type, cc: cranelift_codegen::isa::CallConv) -> Self {
+    fn new(mut b: FunctionBuilder<'a>, k: PipeKey, ctx: Value, ptr: Type) -> Self {
         let m = MemFlagsData::trusted();
         let mr = m.with_readonly();
         let ld = |b: &mut FunctionBuilder, ty: Type, off: i32| b.ins().load(ty, mr, ctx, off);
@@ -252,11 +236,6 @@ impl<'a> E<'a> {
                 row[3] = f(&mut b, offset_of!(Target, lop_width));
             }
         }
-        // The host's C convention (the ISA's default), for the helpers.
-        let mut s4 = Signature::new(cc);
-        s4.params.extend([AbiParam::new(F64); 4]);
-        s4.returns.push(AbiParam::new(F64));
-        let sig4 = b.import_signature(s4);
         let blk = if matches!(k.prim, Prim::Fill | Prim::Stipple | Prim::Xfer) {
             [ld(&mut b, I32, off!(bxs)), ld(&mut b, I32, off!(bys)), ld(&mut b, I32, off!(bdx)), ld(&mut b, I32, off!(bdy))]
         } else {
@@ -279,7 +258,7 @@ impl<'a> E<'a> {
                 invs.insert(o, ld(&mut b, F32, o));
             }
         }
-        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles, sig4 }
+        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles }
     }
 
     // ── small helpers ────────────────────────────────────────────────────
@@ -432,11 +411,6 @@ impl<'a> E<'a> {
         self.b.seal_block(join);
     }
 
-    fn call4(&mut self, f: extern "C" fn(f64, f64, f64, f64) -> f64, args: [Value; 4]) -> Value {
-        let p = self.b.ins().iconst(I64, f as usize as i64);
-        let inst = self.b.ins().call_indirect(self.sig4, p, &args);
-        self.b.inst_results(inst)[0]
-    }
 
     // ── Rust float semantics ─────────────────────────────────────────────
 
@@ -477,6 +451,14 @@ impl<'a> E<'a> {
     fn clamp01(&mut self, x: Value) -> Value {
         let (lo, hi) = if self.b.func.dfg.value_type(x) == F32 { (self.f32c(0.0), self.f32c(1.0)) } else { (self.f64c(0.0), self.f64c(1.0)) };
         self.clamp(x, lo, hi)
+    }
+
+    /// `f64::max`: the number when one side is NaN.
+    fn max_num(&mut self, a: Value, b: Value) -> Value {
+        let gt = self.b.ins().fcmp(FloatCC::GreaterThan, a, b);
+        let bnan = self.b.ins().fcmp(FloatCC::Unordered, b, b);
+        let alt = self.b.ins().select(bnan, a, b);
+        self.b.ins().select(gt, a, alt)
     }
 
     /// `f64::min`: the number when one side is NaN.
@@ -1540,8 +1522,51 @@ impl<'a> E<'a> {
         let tx = self.b.ins().fmul(dtx, h);
         let sy = self.b.ins().fmul(dsy, w);
         let ty = self.b.ins().fmul(dty, h);
-        let _ = zero;
-        self.call4(if need_log { jit_lambda } else { jit_lambda_sign }, [sx, tx, sy, ty])
+        // `te1::lod`, inline: no call, so nothing spills around it.
+        let sq = |e: &mut Self, a: Value, b: Value| {
+            let a2 = e.b.ins().fmul(a, a);
+            let b2 = e.b.ins().fmul(b, b);
+            e.b.ins().fadd(a2, b2)
+        };
+        let ax = sq(self, sx, tx);
+        let ay = sq(self, sy, ty);
+        let m = self.max_num(ax, ay);
+        let rho = self.b.ins().sqrt(m);
+        if !need_log {
+            // Only `lambda > 0` matters: it is `rho > 1`.
+            let one = self.f64c(1.0);
+            let gt = self.b.ins().fcmp(FloatCC::GreaterThan, rho, one);
+            let m1 = self.f64c(-1.0);
+            return self.b.ins().select(gt, one, m1);
+        }
+        let pos = self.b.ins().fcmp(FloatCC::GreaterThan, rho, zero);
+        let l2 = self.lod_log2(rho);
+        let ninf = self.f64c(f64::NEG_INFINITY);
+        self.b.ins().select(pos, l2, ninf)
+    }
+
+    /// `te1::lod_log2`, the same operations in the same order.
+    fn lod_log2(&mut self, x: Value) -> Value {
+        use crate::dev::mgras::te1::{LOD_C1, LOD_C2, LOD_C3, LOD_MANTISSA, LOD_ONE};
+        let b = self.b.ins().bitcast(I64, MemFlagsData::new(), x);
+        let e = self.b.ins().ushr_imm_s(b, 52);
+        let e = self.b.ins().band_imm_s(e, 0x7FF);
+        let e = self.b.ins().iadd_imm_s(e, -1023);
+        let e = self.b.ins().fcvt_from_sint(F64, e);
+        let m = self.b.ins().band_imm_s(b, LOD_MANTISSA as i64);
+        let m = self.b.ins().bor_imm_s(m, LOD_ONE as i64);
+        let m = self.b.ins().bitcast(F64, MemFlagsData::new(), m);
+        let one = self.f64c(1.0);
+        let t = self.b.ins().fsub(m, one);
+        let c3 = self.f64c(LOD_C3);
+        let p = self.b.ins().fmul(t, c3);
+        let c2 = self.f64c(LOD_C2);
+        let p = self.b.ins().fadd(c2, p);
+        let p = self.b.ins().fmul(t, p);
+        let c1 = self.f64c(LOD_C1);
+        let p = self.b.ins().fadd(c1, p);
+        let p = self.b.ins().fmul(t, p);
+        self.b.ins().fadd(e, p)
     }
 
     /// `te1::tex_env`.

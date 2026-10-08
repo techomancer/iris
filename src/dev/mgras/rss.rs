@@ -1447,8 +1447,7 @@ impl Rss {
         let d = |q: &[f64; 3], v: f64| ((q[1] - v * p[2][1]) / wi, (v * p[2][2] - q[2]) / wi);
         let ((dsx, dsy), (dtx, dty)) = (d(&p[0], s), d(&p[1], t));
         let (w, h) = smp.size();
-        let rho = (dsx * w).hypot(dtx * h).max((dsy * w).hypot(dty * h));
-        let lambda = if rho > 0.0 { rho.log2() } else { f64::NEG_INFINITY };
+        let lambda = super::te1::lod(dsx * w, dtx * h, dsy * w, dty * h);
         let texel = smp.sample(&self.te, s, t, lambda);
         tex_env(self.reg(te_reg::TEXMODE1), self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
     }
