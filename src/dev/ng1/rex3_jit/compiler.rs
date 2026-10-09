@@ -2856,11 +2856,11 @@ fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value 
 /// Mirrors Rex3::blend but specialized — constant factors let Cranelift fold all
 /// the factor-selection branches away.
 ///
-/// BLENDALPHA (DRAWMODE1 bit 27) selects what BF_SA resolves to for the SOURCE
-/// multiplier only: '1' = the real source alpha, '0' = 1.0 (spec Table 11).
-/// §3.8 adds "...and destination multiplier is defined by DFACTOR", so DFACTOR
-/// keeps its own definition and still evaluates against the real source alpha.
-/// Substituting into both factors would zero BF_MSA and discard the destination.
+/// BLENDALPHA (DRAWMODE1 bit 27) selects what BF_SA resolves to in the source
+/// multiplier of the ALPHA channel only: '1' = the real source alpha, '0' = 1.0
+/// (spec Table 11, §3.8 "alpha component can be blended in two different
+/// ways"). Red, green and blue always use the real source alpha, and DFACTOR
+/// is unaffected.
 fn emit_blend_ir(
     b: &mut FunctionBuilder,
     src: Value,
@@ -2871,8 +2871,8 @@ fn emit_blend_ir(
 ) -> Value {
     let sa   = b.ins().ushr_imm_s(src, 24); // alpha from src bits[31:24]
     let c255 = b.ins().iconst(types::I32, 255);
-    // Source-side alpha: real alpha when BLENDALPHA=1, otherwise 1.0 (255).
-    let sa_src = if blendalpha { sa } else { c255 };
+    // The alpha channel's source alpha: real when BLENDALPHA=1, otherwise 1.0.
+    let sa_alpha = if blendalpha { sa } else { c255 };
 
     // Extract each 8-bit channel (no nesting)
     let sr   = b.ins().band_imm_s(src, 0xFF);
@@ -2904,8 +2904,8 @@ fn emit_blend_ir(
 
     // Blend one channel: (sc*sf + dc*df)/255, clamped to 255, shifted
     macro_rules! blend_ch {
-        ($sc:expr, $dc:expr, $shift:literal) => {{
-            let sf = get_factor_ir(b, sfactor, $dc, sa_src, c255);
+        ($sc:expr, $dc:expr, $sa:expr, $shift:literal) => {{
+            let sf = get_factor_ir(b, sfactor, $dc, $sa, c255);
             let df = get_factor_ir(b, dfactor, $sc, sa, c255);
             let sc_sf = b.ins().imul($sc, sf);
             let dc_df = b.ins().imul($dc, df);
@@ -2916,10 +2916,10 @@ fn emit_blend_ir(
         }}
     }
 
-    let r_out = blend_ch!(sr, dr, 0);
-    let g_out = blend_ch!(sg, dg, 8);
-    let b_out = blend_ch!(sb, db, 16);
-    let a_out = blend_ch!(sa, da, 24);
+    let r_out = blend_ch!(sr, dr, sa, 0);
+    let g_out = blend_ch!(sg, dg, sa, 8);
+    let b_out = blend_ch!(sb, db, sa, 16);
+    let a_out = blend_ch!(sa, da, sa_alpha, 24);
 
     let t1 = b.ins().bor(r_out, g_out);
     let t2 = b.ins().bor(t1, b_out);

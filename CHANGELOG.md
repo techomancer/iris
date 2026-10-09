@@ -93,6 +93,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **2026-10-09 — Newport (REX3) blends again under IRIX OpenGL.**
+  DRAWMODE1's BLENDALPHA bit was applied to every channel, so with it clear
+  `BF_SA` was 1.0 for red, green and blue too and nothing was ever
+  attenuated. It only changes how the alpha component is blended (rex3.pdf
+  §3.8). IRIX's GL draws `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` with it
+  clear, so every blend came out opaque: half-transparent quads, antialiased
+  text, and the dark halo around `blast`'s nebula billboard.
 - **2026-10-06 — IMPACT OpenGL and texture pipeline** (`862d0fe`): GE11
   command HLE, shared matrix/clipping/lighting routines in `src/dev/gl/`,
   triangle rasterization, context storage and eviction through ERAM, and

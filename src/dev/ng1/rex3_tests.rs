@@ -4692,10 +4692,10 @@ mod jit_tests {
     }
 
     /// BLENDALPHA (DRAWMODE1 bit 27) must be honoured identically by the JIT and
-    /// the interpreter: it selects what BF_SA resolves to for the SOURCE
-    /// multiplier only ('1' = real source alpha, '0' = 1.0), while DFACTOR keeps
-    /// its own definition against the real alpha. Runs both polarities over a
-    /// spread of alphas against a lit destination, where the two differ most.
+    /// the interpreter: it selects what BF_SA resolves to in the alpha
+    /// component's source multiplier ('1' = real source alpha, '0' = 1.0), and
+    /// leaves the colour channels alone. Runs both polarities over a spread of
+    /// alphas against a lit destination.
     #[test]
     fn jit_blend_blendalpha_matches_interp() {
         for blendalpha in [false, true] {
@@ -5121,14 +5121,17 @@ fn test_blend_alpha_test_discards_zero_alpha() {
 }
 
 // ============================================================================
-// BLENDALPHA (DRAWMODE1 bit 27) selects the VALUE of BF_SA
+// BLENDALPHA (DRAWMODE1 bit 27) selects the VALUE of BF_SA for the alpha
+// component only
 //
 // Spec Table 11: "Selects SFACTOR BF_SA source alpha: '1' = source alpha,
-// '0' = 1.0", and §3.8 adds the load-bearing qualifier: when BLENDALPHA=0 "the
-// source multiplier ... is one instead of source alpha AND DESTINATION
-// MULTIPLIER IS DEFINED BY DFACTOR". So the substitution applies to SFACTOR
-// only — DFACTOR keeps its own definition and still evaluates against the real
-// source alpha. These tests pin that asymmetry.
+// '0' = 1.0", qualified by §3.8: "alpha component can be blended in two
+// different ways depending on how BLENDALPHA ... is set. When BLENDALPHA is set
+// to 0, the source multiplier for blending alpha is one instead of source alpha
+// and destination multiplier is defined by DFACTOR." The pin table calls it
+// "Blend source alpha with alpha". Red, green and blue always use the real
+// source alpha; IRIX's OpenGL draws GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA with
+// BLENDALPHA=0 and expects a normal blend.
 // ============================================================================
 
 /// Build a 24bpp RGB blend DRAWMODE1 with the given factors and BLENDALPHA.
@@ -5165,43 +5168,56 @@ fn test_blendalpha1_sa_msa_attenuates() {
         "BLENDALPHA=1 + alpha 8 should attenuate src heavily, got {px:#08x}");
 }
 
-/// BF_SA/BF_ONE with BLENDALPHA=0 is ADDITIVE (`1*src + 1*dst`), not a no-op.
-/// Treating BLENDALPHA=0 as "skip the blend" would wrongly discard dst here.
+/// BF_SA/BF_ONE with BLENDALPHA=0 still attenuates the source colour by the
+/// real alpha: `alpha*src + dst`.
 #[test]
-fn test_blendalpha0_sa_one_is_additive() {
+fn test_blendalpha0_sa_one_attenuates_rgb() {
     let rex = make_rex3();
     rex3init(&rex);
     // Lay down a destination first, with blending off.
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
         | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
     blend_one(&rex, 32, 40, dm1_src, 255, 0x202020);
-    // Now blend additively over it.
+    // Now blend over it: (0x10*128 + 0x20*255)/255 = 0x28 per channel.
     let px = blend_one(&rex, 32, 40,
-        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_ONE, false), 8, 0x101010);
-    assert_eq!(px, 0x303030,
-        "BLENDALPHA=0 + BF_SA/BF_ONE must add src and dst, got {px:#08x}");
+        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_ONE, false), 128, 0x101010);
+    assert_eq!(px, 0x282828,
+        "BLENDALPHA=0 + BF_SA/BF_ONE must give alpha*src + dst, got {px:#08x}");
 }
 
-/// BLENDALPHA=0 substitutes only the SOURCE multiplier: SFACTOR BF_SA becomes
-/// 1.0, but DFACTOR BF_MSA still evaluates 1 - real source alpha. So a low-alpha
-/// source over a lit destination keeps most of the destination, rather than
-/// replacing it (which is what substituting in both factors would do).
+/// The colour channels come out the same whichever way BLENDALPHA is set.
 #[test]
-fn test_blendalpha0_substitutes_sfactor_only() {
+fn test_blendalpha_leaves_rgb_alone() {
     let rex = make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
         | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
-    // Destination 0x404040, source 0x101010 at alpha 8.
-    blend_one(&rex, 50, 50, dm1_src, 255, 0x404040);
-    let px = blend_one(&rex, 50, 50,
-        dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, false), 8, 0x101010);
-    // out = 1.0*src + (1 - 8/255)*dst = 0x10 + ~0x3E = ~0x4E per channel.
-    let ch = px & 0xFF;
-    assert!((0x48..=0x52).contains(&ch),
-        "expected src + (1-alpha)*dst ≈ 0x4E per channel, got {px:#08x}");
-    assert_ne!(px, 0x101010,
-        "destination must still contribute — BLENDALPHA=0 must not zero DFACTOR");
+    let mut got = [0u32; 2];
+    for (i, blendalpha) in [false, true].iter().enumerate() {
+        let x = 50 + i as i32;
+        blend_one(&rex, x, 52, dm1_src, 255, 0x404040);
+        got[i] = blend_one(&rex, x, 52,
+            dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, *blendalpha), 8, 0x101010);
+    }
+    assert_eq!(got[0], got[1], "BLENDALPHA must not change RGB: {got:08x?}");
+}
+
+/// The alpha component: with BLENDALPHA=0 its source multiplier is 1.0, with
+/// BLENDALPHA=1 it is the source alpha; DFACTOR uses the real alpha in both.
+#[test]
+fn test_blendalpha_selects_the_alpha_channels_factor() {
+    use crate::dev::ng1::rex3_generic::{blend, DynMode};
+    let src = 0x8010_1010; // alpha 0x80
+    let dst = 0x4040_4040; // alpha 0x40
+    for (blendalpha, want) in [(0, 0x9F), (1, 0x60)] {
+        let m = DynMode { sfactor: DRAWMODE1_BF_SA, dfactor: DRAWMODE1_BF_MSA,
+            blendalpha, ..Default::default() };
+        let out = blend(&m, src, dst);
+        // 0x80*sf + 0x40*(255-0x80), over 255.
+        assert_eq!(out >> 24, want, "BLENDALPHA={blendalpha}: alpha {out:#010x}");
+        // Red: (0x10*0x80 + 0x40*0x7F)/255 = 0x27, both ways.
+        assert_eq!(out & 0xFF, 0x27, "BLENDALPHA={blendalpha}: red {out:#010x}");
+    }
 }
 
 /// With BLENDALPHA=1 both factors use the real alpha, giving a classic blend.
@@ -5221,10 +5237,9 @@ fn test_blendalpha1_uses_alpha_in_both_factors() {
 }
 
 /// AFUNCTION compares the REAL source alpha (from DDA or host per ALPHAHOST) —
-/// spec §3.3 — and is unaffected by BLENDALPHA, which only substitutes the blend's
-/// source multiplier. With BLENDALPHA=0 the blender sees BF_SA=1.0, but the alpha
-/// test must still see the true alpha: alpha 0 vs ALPHAREF 0 under COMPARE='!='
-/// must inhibit the write regardless of BLENDALPHA.
+/// spec §3.3 — and is unaffected by BLENDALPHA, which only changes how the alpha
+/// component is blended: alpha 0 vs ALPHAREF 0 under COMPARE='!=' must inhibit
+/// the write regardless of BLENDALPHA.
 #[test]
 fn test_afunction_uses_real_alpha_not_blendalpha() {
     let rex = make_rex3();

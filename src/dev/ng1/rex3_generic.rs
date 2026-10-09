@@ -777,16 +777,17 @@ pub fn blend<M: Mode>(m: &M, src: u32, dst: u32) -> u32 {
     let s_factor_sel = m.sfactor();
     let d_factor_sel = m.dfactor();
 
-    // BLENDALPHA (DRAWMODE1 bit 27) substitutes the SOURCE multiplier only.
-    // Spec §3.8: "When source multiplier is set to source alpha (SFACTOR=4) ...
+    // BLENDALPHA (DRAWMODE1 bit 27) changes how the ALPHA component is blended,
+    // nothing else. Spec §3.8: "When source multiplier is set to source alpha
+    // (SFACTOR=4), alpha component can be blended in two different ways ...
     // When BLENDALPHA is set to 0, the source multiplier for blending alpha is
-    // one instead of source alpha AND DESTINATION MULTIPLIER IS DEFINED BY
-    // DFACTOR." The trailing clause is load-bearing: DFACTOR keeps its own
-    // definition, so a DFACTOR of BF_MSA still evaluates 1 - source alpha
-    // against the real alpha. Substituting in both factors would zero BF_MSA
-    // and discard the destination entirely, which the spec does not say.
+    // one instead of source alpha and destination multiplier is defined by
+    // DFACTOR." The pin table calls the bit "Blend source alpha with alpha".
+    // So red, green and blue always use the real source alpha; only the alpha
+    // channel's source multiplier becomes 1.0. IRIX's OpenGL relies on this:
+    // it draws GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA with BLENDALPHA=0.
     let sa_real = (src >> 24) & 0xFF;
-    let sa_src = if m.blendalpha() != 0 { sa_real } else { 255 };
+    let sa_alpha = if m.blendalpha() != 0 { sa_real } else { 255 };
 
     // `c` is the *other* operand's channel — destination when computing the
     // source factor, source when computing the destination factor — which is
@@ -811,7 +812,7 @@ pub fn blend<M: Mode>(m: &M, src: u32, dst: u32) -> u32 {
         let s_c = (src >> shift) & 0xFF;
         let d_c = (dst >> shift) & 0xFF;
         
-        let sf = get_factor(s_factor_sel, d_c, sa_src);
+        let sf = get_factor(s_factor_sel, d_c, if i == 3 { sa_alpha } else { sa_real });
         let df = get_factor(d_factor_sel, s_c, sa_real);
         
         let val = (s_c * sf + d_c * df) / 255;

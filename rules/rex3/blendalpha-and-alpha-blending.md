@@ -1,5 +1,21 @@
 # REX3 BLENDALPHA: what it selects, and why the `blast` billboard exposes it
 
+> **Corrected 2026-10-09.** BLENDALPHA changes the source multiplier of the
+> **alpha component only**; red, green and blue always use the real source
+> alpha. §3.8 says "*alpha component* can be blended in two different ways",
+> and the pin table names the bit "Blend source alpha with alpha". Reading it as
+> "BF_SA = 1.0 for every channel" (below) made every IRIX OpenGL blend opaque:
+> IRIX's Newport GL sets `GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA` with
+> BLENDALPHA=0, so a 50% quad, antialiased text and transparent texels all
+> wrote at full strength. With the fix, a GL probe (textured and untextured
+> quads, 12-bit double-buffered and 24-bit single-buffered) blends exactly as
+> on the XZ. It is also what the `blast` billboard below was showing: run
+> textured (`blast -T -p` from its `data` directory, as `blast_audio` does),
+> the nebula's dark surround drew as a brown/pink haze across the whole quad
+> before the fix and is gone after it. The sections below that call the haze
+> "not a REX3 bug" predate this. The white triangle and smeared rows along the
+> quad's upper-left edge are still there with the fix: a separate problem.
+
 ## The bit
 
 `DRAWMODE1` bit 27, `BLENDALPHA`. Register table (spec Table 11):
