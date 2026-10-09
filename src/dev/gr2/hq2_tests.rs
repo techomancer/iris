@@ -2664,6 +2664,22 @@ fn iris_getcpos_status_and_setcpos() {
     assert_eq!((sh(0), sh(1)), (164, 662));
 }
 
+/// IRIS GL gRGBcolor / getcolor (solid.log; blast per frame): 0x0CF, Finish,
+/// then libgl reads shram 0x4022..0x4024 and takes (w >> 11) & 0xff of each.
+/// Answering nothing returned black.
+#[test]
+fn iris_get_color_reads_back_the_current_colour() {
+    let g = live_gr2(Gr2Variant::Xz);
+    gl_setup_window(g);
+    let fl = |v: f32| v.to_bits();
+    // IRIS GL colour, three floats (conversion 3), all on the port's index.
+    for v in [1.0f32, 0.5, 0.0] { cmd(g, 0x1913, fl(v)); }
+    cmd(g, 0x0cf, 0);
+    g.wait_idle();
+    let sh = |i: u32| (r32(g, (0x4022 + i) * 4) >> 11) & 0xff;
+    assert_eq!((sh(0), sh(1), sh(2)), (255, 128, 0));
+}
+
 /// IRIS GL writepixels row (mandel2.log): 0x0B1; 0x071 blocks of 16 words,
 /// one colour index per word; 0x0B2 x; DATA y, width, width, flag; 0x0B3.
 /// The chunk lands at window (x, y); flag set = right to left.

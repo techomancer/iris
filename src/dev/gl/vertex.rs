@@ -1,9 +1,12 @@
 //! The transformed vertex, clipping and the viewport mapping.
 
 /// A vertex after transform: window coordinates (GL: y up), colour 0..1.
-#[derive(Clone, Copy, Default, Debug)]
+/// `T` texture coordinates and `F` fog factors ride along and are
+/// interpolated by clipping; a board without them uses 0 (GR2: `Wv<0, 0>`,
+/// IMPACT: `Wv<4, 1>`).
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct Wv {
+pub struct Wv<const T: usize, const F: usize> {
     pub x: f32,
     pub y: f32,
     pub z: f32,
@@ -22,9 +25,28 @@ pub struct Wv {
     pub h: [f32; 4],
     pub e: [f32; 4],
     /// Texture coordinates (s, t, r, q), after the texture matrix.
-    pub t: [f32; 4],
+    pub t: [f32; T],
     /// Fog factor (1 = no fog), when fog is applied per fragment.
-    pub f: f32,
+    pub f: [f32; F],
+}
+
+// Not derived: `[f32; N]: Default` exists only for literal sizes.
+impl<const T: usize, const F: usize> Default for Wv<T, F> {
+    fn default() -> Self {
+        Wv {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            c: [0.0; 4],
+            cb: [0.0; 4],
+            ok: 0,
+            oc: 0,
+            h: [0.0; 4],
+            e: [0.0; 4],
+            t: [0.0; T],
+            f: [0.0; F],
+        }
+    }
 }
 
 /// Clip planes: 0..5 the view volume -w <= x, y, z <= w, 6..11 the user
@@ -38,7 +60,7 @@ pub const MAX_POLY: usize = 32 + CLIP_PLANES;
 /// Point on a-b at the crossing of a plane where the signed distances are
 /// da and db: positions and colours interpolated, window position still to
 /// be computed (`Viewport::project`).
-pub fn clip_cross(a: &Wv, b: &Wv, da: f32, db: f32) -> Wv {
+pub fn clip_cross<const T: usize, const F: usize>(a: &Wv<T, F>, b: &Wv<T, F>, da: f32, db: f32) -> Wv<T, F> {
     let t = da / (da - db);
     let l = |x: f32, y: f32| x + (y - x) * t;
     let mut v = *a;
@@ -48,9 +70,13 @@ pub fn clip_cross(a: &Wv, b: &Wv, da: f32, db: f32) -> Wv {
         v.e[k] = l(a.e[k], b.e[k]);
         v.c[k] = l(a.c[k], b.c[k]);
         v.cb[k] = l(a.cb[k], b.cb[k]);
+    }
+    for k in 0..T {
         v.t[k] = l(a.t[k], b.t[k]);
     }
-    v.f = l(a.f, b.f);
+    for k in 0..F {
+        v.f[k] = l(a.f[k], b.f[k]);
+    }
     v
 }
 
@@ -65,7 +91,7 @@ pub struct Clip {
 
 impl Clip {
     /// Signed distance of `v` to clip plane `i` (>= 0 inside).
-    pub fn dist(&self, v: &Wv, i: usize) -> f32 {
+    pub fn dist<const T: usize, const F: usize>(&self, v: &Wv<T, F>, i: usize) -> f32 {
         let h = &v.h;
         match i {
             0 => h[3] + h[0],
@@ -87,7 +113,7 @@ impl Clip {
     }
 
     /// Bit i set when `v` is outside plane i.
-    pub fn outcode(&self, v: &Wv) -> u32 {
+    pub fn outcode<const T: usize, const F: usize>(&self, v: &Wv<T, F>) -> u32 {
         let mask = self.mask();
         (0..CLIP_PLANES).filter(|&i| mask & (1 << i) != 0 && self.dist(v, i) < 0.0)
             .fold(0, |o, i| o | (1 << i))
@@ -96,7 +122,7 @@ impl Clip {
     /// Clip the polygon `v[..n]` against every plane its vertices are
     /// outside of, in place (Sutherland-Hodgman). Returns the new vertex
     /// count (0: nothing left). New vertices still need projecting.
-    pub fn clip_polygon(&self, v: &mut [Wv; MAX_POLY], n: usize) -> usize {
+    pub fn clip_polygon<const T: usize, const F: usize>(&self, v: &mut [Wv<T, F>; MAX_POLY], n: usize) -> usize {
         let any = v[..n].iter().fold(0, |o, w| o | w.oc);
         if any == 0 {
             return n;
@@ -127,7 +153,7 @@ impl Clip {
     }
 
     /// Clip the segment a-b; None when it is entirely outside.
-    pub fn clip_line(&self, mut a: Wv, mut b: Wv) -> Option<(Wv, Wv)> {
+    pub fn clip_line<const T: usize, const F: usize>(&self, mut a: Wv<T, F>, mut b: Wv<T, F>) -> Option<(Wv<T, F>, Wv<T, F>)> {
         let any = a.oc | b.oc;
         for plane in 0..CLIP_PLANES {
             if any & (1 << plane) == 0 {
@@ -171,7 +197,7 @@ impl Viewport {
     /// offset by `origin` and snapped to 1/`subpixel` of a pixel (the
     /// raster engine's fixed-point precision; removes float noise such as
     /// 319.99998 on edges).
-    pub fn project(&self, mut out: Wv, origin: [f32; 2], subpixel: f32) -> Wv {
+    pub fn project<const T: usize, const F: usize>(&self, mut out: Wv<T, F>, origin: [f32; 2], subpixel: f32) -> Wv<T, F> {
         let [cx, cy, cz, cw] = out.h;
         out.ok = 0;
         if cw <= 1e-6 {
@@ -190,6 +216,8 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Wv = super::Wv<4, 1>;
 
     fn at(x: f32, y: f32) -> Wv {
         let mut v = Wv { h: [x, y, 0.0, 1.0], ..Default::default() };

@@ -15,12 +15,20 @@
 //! libglcore rasterizes alpha-tested primitives on the CPU and sends the
 //! surviving fragments (T_FRAGMENT). See GR2.h "BLENDING AND ALPHA TEST".
 //!
-//! Current scope: RGB windows, no lighting (colours from glColor), no
-//! clipping beyond the window/scissor rectangle (vertices behind the eye
-//! reject the whole primitive), lines and points without Z.
+//! Transform, view-volume and user clipping, the viewport mapping, lighting
+//! and fog use the board-independent GL core (`crate::dev::gl`); this file
+//! and gl_light.rs decode the GR2 token protocol into it and keep what is
+//! GR2's own: primitive assembly, polygon clipping on vertex-buffer indices
+//! (with GL_LINE edge flags), window clipping (0x1E5) and RE3 rasterization.
 
 use super::re3;
 use super::{Hq2Engine, Re3Sink, SCREEN_H};
+use crate::dev::gl::math::{self, Mat4};
+use crate::dev::gl::light::Lighting;
+use crate::dev::gl::vertex::{self, clip_cross, Clip, Viewport, CLIP_PLANES};
+
+/// GR2 vertices: no texture, fog applied per vertex.
+pub type Wv = vertex::Wv<0, 0>;
 
 #[path = "gl_light.rs"]
 mod light;
@@ -114,6 +122,11 @@ pub const T_IRIS_SETCPOS: u32 = 0x0d0;
 /// setcpos use the same screen space: writepixels places its row at
 /// getcpos - getorigin.
 pub const T_GET_ORIGIN: u32 = 0x0cd;
+/// Current colour readback (IRIS GL gRGBcolor, getcolor; blast per frame):
+/// token 0; Finish; the mailbox holds R, G, B as the RE3's 8.11 iterator
+/// values (libgl takes (w >> 11) & 0xff of each; getcolor masks R with the
+/// write mask, the colour index in CI mode).
+pub const T_IRIS_GET_COLOR: u32 = 0x0cf;
 /// FIFO pixel writes (IRIS GL writepixels / writeRGB via rectwrite; OpenGL
 /// glDrawPixels, __glExpDrawPixelsUnpack*), per chunk of <= 48 pixels:
 ///   0x0B1 = 0                    start (the chunk's data follows)
@@ -281,33 +294,10 @@ const USEV: u32 = 0x200;
 const LOADV: u32 = 0x400;
 const ITOF: u32 = 0x4000;
 
-/// A vertex after transform: window coordinates (GL: y up), colour 0..1.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct Wv {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub c: [f32; 4],
-    /// Back-face colour (two-sided lighting; = c otherwise).
-    pub cb: [f32; 4],
-    /// 0 when the vertex is behind the eye (w <= 0): it has no window
-    /// position and its primitive must be clipped (gl_poly / gl_line).
-    pub ok: u32,
-    /// Clip planes the vertex is outside of (bit i = plane i), computed once
-    /// at transform; 0 for vertices made by clipping or in window space.
-    pub oc: u32,
-    /// Clip-space position (frustum clipping) and eye-space position (user
-    /// clip planes). Both are linear in the object position, so clipping
-    /// interpolates them along an edge exactly.
-    pub h: [f32; 4],
-    pub e: [f32; 4],
-}
-
-/// Clip planes: 0..5 the view volume -w <= x, y, z <= w (GL and IRIS GL
-/// alike; their different Z ranges come after clipping, in the viewport
-/// transform), 6..11 the user planes (0x02E / 0x02F, eye space).
-const CLIP_PLANES: usize = 12;
+// Clip planes (vertex::CLIP_PLANES): 0..5 the view volume -w <= x, y, z
+// <= w (GL and IRIS GL alike; their different Z ranges come after
+// clipping, in the viewport transform), 6..11 the user planes (0x02E /
+// 0x02F, eye space).
 
 /// Most visible rectangles a 0x1E5 clip decomposes into (visible_rects).
 const MAX_VIS: usize = 32;
@@ -324,23 +314,6 @@ const RING: usize = 8;
 const MAXP: usize = VB + CLIP_PLANES;
 const SCRATCH: usize = 2 * CLIP_PLANES;
 const ALL_EDGES: u64 = u64::MAX;
-
-/// Point on a-b at the crossing of a plane where the signed distances are
-/// da and db: positions and colours interpolated, window position still to
-/// be computed (GlState::project).
-fn clip_cross(a: &Wv, b: &Wv, da: f32, db: f32) -> Wv {
-    let t = da / (da - db);
-    let l = |x: f32, y: f32| x + (y - x) * t;
-    let mut v = *a;
-    v.oc = 0;
-    for k in 0..4 {
-        v.h[k] = l(a.h[k], b.h[k]);
-        v.e[k] = l(a.e[k], b.e[k]);
-        v.c[k] = l(a.c[k], b.c[k]);
-        v.cb[k] = l(a.cb[k], b.cb[k]);
-    }
-    v
-}
 
 /// GL state held by the HQ2/GE7. Plain data, valid when zeroed.
 #[derive(Clone, Copy)]
@@ -363,11 +336,11 @@ pub struct GlState {
     wid_sent: u32,
     /// Window: x0, y0 (screen, GL y up), w, h.
     win: [i32; 4],
-    /// Viewport (window relative): x0, x1, y0, y1, zscale, zcenter.
-    vp: [f32; 6],
-    mv: [f32; 16],
-    proj: [f32; 16],
-    mvp: [f32; 16],
+    /// Viewport (window relative); 0x03B carries its fields in order.
+    vp: Viewport,
+    mv: Mat4,
+    proj: Mat4,
+    mvp: Mat4,
     mvp_dirty: u32,
     smooth: u32,
     color: [f32; 4],
@@ -404,8 +377,9 @@ pub struct GlState {
     blend_fast: u32,
     logic_op: u32,
     normal: [f32; 3],
-    /// Lighting and fog (gl_light.rs).
-    lt: light::Lighting,
+    /// Lighting and fog (shared core), and where gl_light.rs's loads go.
+    lt: Lighting,
+    ltl: light::Loader,
     front_ccw: u32,
     polymode: u32,
     /// Self-streaming port being assembled.
@@ -440,19 +414,20 @@ pub struct GlState {
     /// Pixel zoom (0x0BB): x, y; 0 = 1.
     pzoom: [f32; 2],
     /// User clip planes (eye space) and their enable bits.
-    uclip: [[f32; 4]; 6],
-    uclip_on: u32,
+    clip: Clip,
     /// Read source from 0x10A: kind, buffer (0, 0 = front).
     read_src: [u32; 2],
     /// IRIS GL lmcolor(LMC_COLOR) rule: an IRIS GL colour command after the
     /// last IRIS GL normal leaves what follows unlit (see T_IRIS_COLOR).
     /// [0] = set, [1] spare (keeps GlState free of padding).
     iris_unlit: [u32; 2],
+    /// Spare word: GlState is 8-byte aligned (`span`), so its 4-byte
+    /// fields must add up to an even count or the struct gets tail padding
+    /// (asserted below). Drop or add one when a field changes size.
+    pad: u32,
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
 }
-
-const IDENT: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
 
 impl GlState {
     /// Range of the R channel in GL colour units (see to_fixed).
@@ -463,22 +438,23 @@ impl GlState {
     fn ensure_init(&mut self) {
         if self.inited == 0 {
             self.inited = 1;
-            self.mv = IDENT;
-            self.proj = IDENT;
-            self.mvp = IDENT;
+            self.mv = math::IDENT;
+            self.proj = math::IDENT;
+            self.mvp = math::IDENT;
             self.color = [1.0; 4];
             self.smooth = 1;
             self.colormask = 0x00ff_ffff;
             self.masks = [0x00ff_ffff; 2];
             self.logic_op = 3;
             self.lt.init();
+            self.ltl.init(&mut self.lt);
             self.blend_src = 1;
             self.normal = [0.0, 0.0, 1.0];
             self.front_ccw = 1;
             self.polymode = 1;
             self.scissor = [0, 0, 0x7ff, 0x7ff];
             self.win = [0, 0, re3::FB_W as i32, SCREEN_H];
-            self.vp = [0.0, re3::FB_W as f32 - 1.0, 0.0, SCREEN_H as f32 - 1.0, 1.0, 0.0];
+            self.vp = Viewport { x0: 0.0, x1: re3::FB_W as f32 - 1.0, y0: 0.0, y1: SCREEN_H as f32 - 1.0, zscale: 1.0, zcenter: 0.0 };
         }
     }
 
@@ -497,28 +473,17 @@ impl GlState {
         if self.mvp_dirty != 0 {
             self.mvp_dirty = 0;
             // Column-major (glLoadMatrix order): clip = P * MV * v.
-            let (a, b) = (&self.proj, &self.mv);
-            let mut m = [0.0f32; 16];
-            for c in 0..4 {
-                for r in 0..4 {
-                    m[c * 4 + r] = (0..4).map(|k| a[k * 4 + r] * b[c * 4 + k]).sum();
-                }
-            }
-            self.mvp = m;
+            self.mvp = math::mul(&self.proj, &self.mv);
         }
     }
 
     /// Object coordinates -> window vertex (screen pixels, GL y up).
     fn transform(&mut self, v: [f32; 4]) -> Wv {
         self.update_mvp();
-        let m = &self.mvp;
-        let clip = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-        let h = [clip(0), clip(1), clip(2), clip(3)];
-        let m = &self.mv;
-        let eye = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-        let e = [eye(0), eye(1), eye(2), eye(3)];
+        let h = math::xform(&self.mvp, v);
+        let e = math::xform(&self.mv, v);
         let mut out = Wv { c: self.color, cb: self.color, h, e, ..Default::default() };
-        out.oc = self.outcode(&out);
+        out.oc = self.clip.outcode(&out);
         self.project(out)
     }
 
@@ -535,52 +500,11 @@ impl GlState {
         0
     }
 
-    /// Signed distance of `v` to clip plane `i` (>= 0 inside).
-    fn clip_dist(&self, v: &Wv, i: usize) -> f32 {
-        let h = &v.h;
-        match i {
-            0 => h[3] + h[0],
-            1 => h[3] - h[0],
-            2 => h[3] + h[1],
-            3 => h[3] - h[1],
-            4 => h[3] + h[2],
-            5 => h[3] - h[2],
-            _ => {
-                let p = &self.uclip[i - 6];
-                p[0] * v.e[0] + p[1] * v.e[1] + p[2] * v.e[2] + p[3] * v.e[3]
-            }
-        }
-    }
-
-    /// Planes in use: the view volume plus the enabled user planes.
-    fn clip_mask(&self) -> u32 {
-        0x3f | ((self.uclip_on & 0x3f) << 6)
-    }
-
-    /// Bit i set when `v` is outside plane i.
-    fn outcode(&self, v: &Wv) -> u32 {
-        let mask = self.clip_mask();
-        (0..CLIP_PLANES).filter(|&i| mask & (1 << i) != 0 && self.clip_dist(v, i) < 0.0)
-            .fold(0, |o, i| o | (1 << i))
-    }
-
-    /// Window position of `v` from its clip position (`ok` = 0 if w <= 0).
-    fn project(&self, mut out: Wv) -> Wv {
-        let [cx, cy, cz, cw] = out.h;
-        out.ok = 0;
-        if cw <= 1e-6 {
-            return out;
-        }
-        let (nx, ny, nz) = (cx / cw, cy / cw, cz / cw);
-        let [vx0, vx1, vy0, vy1, zs, zc] = self.vp;
-        // Snap to 1/16 pixel, like the hardware's fixed-point subpixel
-        // coordinates (removes float noise such as 319.99998 on edges).
-        let snap = |v: f32| (v * 16.0).round() / 16.0;
-        out.x = snap(self.win[0] as f32 + vx0 + (nx + 1.0) * 0.5 * (vx1 - vx0 + 1.0));
-        out.y = snap(self.win[1] as f32 + vy0 + (ny + 1.0) * 0.5 * (vy1 - vy0 + 1.0));
-        out.z = zc + nz * zs;
-        out.ok = 1;
-        out
+    /// Window position of `v` from its clip position (`ok` = 0 if w <= 0),
+    /// snapped to 1/16 pixel like the hardware's fixed-point subpixel
+    /// coordinates.
+    fn project(&self, v: Wv) -> Wv {
+        self.vp.project(v, [self.win[0] as f32, self.win[1] as f32], 16.0)
     }
 
     /// Window clipping by the RE3 WID test: more visible pieces than the 4
@@ -741,7 +665,7 @@ fn port_words(index: u32) -> Option<u32> {
         T_NORMAL | T_IRIS_NORMAL => Some(3),
         T_COLOR_WRITEMASK | T_READ_BUFFER => Some(2),
         T_BLEND_FACTOR => Some(3),
-        t => light::Lighting::port_words(t),
+        t => light::port_words(t),
     }
 }
 
@@ -1000,7 +924,7 @@ impl Hq2Engine {
             T_DEPTH_CLEAR => 3,
             T_IRIS_SETCPOS | T_PIXEL_ZOOM => 3,
             T_READ_RECT => 7,
-            T_GET_ORIGIN | T_PIX_START | T_PIX_END => 1,
+            T_GET_ORIGIN | T_IRIS_GET_COLOR | T_PIX_START | T_PIX_END => 1,
             T_PIX_RECT => 5,
             T_RASTER_POS => 4,
             T_BITMAP => (BITMAP_HDR + 9) as u32,
@@ -1159,9 +1083,7 @@ impl Hq2Engine {
                 let lit = g.lt.on != 0 && g.iris_unlit[0] == 0;
                 if lit || g.lt.fog_on != 0 {
                     // Eye-space position for lighting and fog.
-                    let m = &g.mv;
-                    let e = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-                    let eye = [e(0), e(1), e(2), e(3)];
+                    let eye = math::xform(&g.mv, v);
                     if lit {
                         let (fc, bc) = g.lt.light_vertex(eye, g.normal, g.color);
                         wv.c = fc;
@@ -1236,7 +1158,7 @@ impl Hq2Engine {
             }
             T_TEXTURE_MATRIX => {}
             t => {
-                g.lt.port(t, &b[..n as usize]);
+                g.ltl.port(&mut g.lt, t, &b[..n as usize]);
                 // Turning colour material on takes the current colour.
                 if t == light::T_COLOR_MATERIAL {
                     let c = g.color;
@@ -1277,7 +1199,9 @@ impl Hq2Engine {
                                        ((w0 >> 11) & 0x7ff) as i32 + 1, ((w1 >> 10) & 0x3ff) as i32 + 1];
                 }
             }
-            T_VIEWPORT => g.vp = [f(a[1]), f(a[2]), f(a[3]), f(a[4]), f(a[5]), f(a[6])],
+            T_VIEWPORT => {
+                g.vp = Viewport { x0: f(a[1]), x1: f(a[2]), y0: f(a[3]), y1: f(a[4]), zscale: f(a[5]), zcenter: f(a[6]) };
+            }
             T_SCISSOR => g.scissor = [a[0] as i32, a[1] as i32, a[2] as i32, a[3] as i32],
             T_SHADE_MODEL => g.smooth = a[0] & 1,
             T_FRONT_FACE => g.front_ccw = a[0] & 1,
@@ -1312,7 +1236,7 @@ impl Hq2Engine {
             T_IRIS_ENDPOLYGON | T_IRIS_PCLOS => {}
             light::T_LIGHTING | light::T_TWO_SIDED | light::T_NORMALIZE | light::T_NORMALIZE_B
             | light::T_FOG_ON | light::T_MATERIAL_COMMIT => {
-                g.lt.command(cmd, &a[..]);
+                light::command(&mut g.lt, cmd, &a[..]);
             }
             T_LOGIC_OP => g.logic_op = a[0] & 0xf,
             T_READ_DONE | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE => {}
@@ -1331,10 +1255,10 @@ impl Hq2Engine {
             T_IRIS_MOVE => g.pen = 0,
             T_CLIP_PLANE_ENABLE => if a[1] < 6 {
                 let bit = 1 << a[1];
-                g.uclip_on = if a[0] & 1 != 0 { g.uclip_on | bit } else { g.uclip_on & !bit };
+                g.clip.user_on = if a[0] & 1 != 0 { g.clip.user_on | bit } else { g.clip.user_on & !bit };
             },
             T_CLIP_PLANE => if a[0] < 6 {
-                g.uclip[a[0] as usize] = [f(a[1]), f(a[2]), f(a[3]), f(a[4])];
+                g.clip.user[a[0] as usize] = [f(a[1]), f(a[2]), f(a[3]), f(a[4])];
             },
             T_IRIS_SWAPTMESH => {
                 g.pv.swap(0, 1);
@@ -1371,6 +1295,11 @@ impl Hq2Engine {
             T_GET_ORIGIN => {
                 out.shram(READBACK_SHRAM, g.win[0] as u32);
                 out.shram(READBACK_SHRAM + 1, g.win[1] as u32);
+            }
+            T_IRIS_GET_COLOR => {
+                for (k, w) in to_fixed(g.color, g.cmax()).into_iter().enumerate() {
+                    out.shram(READBACK_SHRAM + k, w);
+                }
             }
             T_PIX_START | T_PIX_END => self.pix_n = 0,
             T_PIX_DATA => {
@@ -1503,7 +1432,7 @@ impl Hq2Engine {
         let g = &self.gl;
         Some(match cmd {
             T_WINDOW => format!("GL_WINDOW origin ({}, {}) {}x{}", g.win[0], g.win[1], g.win[2], g.win[3]),
-            T_VIEWPORT => format!("GL_VIEWPORT x {}..{} y {}..{} zscale {} zcenter {}", g.vp[0], g.vp[1], g.vp[2], g.vp[3], g.vp[4], g.vp[5]),
+            T_VIEWPORT => format!("GL_VIEWPORT x {}..{} y {}..{} zscale {} zcenter {}", g.vp.x0, g.vp.x1, g.vp.y0, g.vp.y1, g.vp.zscale, g.vp.zcenter),
             T_SCISSOR => format!("GL_SCISSOR ({}, {})-({}, {})", g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]),
             T_SHADE_MODEL => format!("GL_SHADE_MODEL {}", if g.smooth != 0 { "smooth" } else { "flat" }),
             T_CLEAR_CI => format!("GL_CLEAR index {} rect {:?}", f(a[0]), g.clip_rect()),
@@ -1521,6 +1450,10 @@ impl Hq2Engine {
                 a[0] as i32 - FRAGMENT_BIAS, a[1] as i32 - FRAGMENT_BIAS, a[2], f(a[3]), f(a[4]), f(a[5]), f(a[6])),
             T_IRIS_MOVE => "IRISGL_MOVE".to_string(),
             T_GET_ORIGIN => format!("GL_GET_ORIGIN -> ({}, {})", g.win[0], g.win[1]),
+            T_IRIS_GET_COLOR => {
+                let c = to_fixed(g.color, g.cmax());
+                format!("IRISGL_GET_COLOR -> ({}, {}, {})", c[0] >> 11, c[1] >> 11, c[2] >> 11)
+            }
             T_PIX_START => "GL_PIXELS_START".to_string(),
             T_PIX_END => "GL_PIXELS_END".to_string(),
             T_PIX_DATA => format!("GL_PIXEL_DATA {} words (chunk {})", self.last_nargs, self.pix_n),
@@ -1950,7 +1883,7 @@ impl Hq2Engine {
                 if (oa | ob) & (1 << plane) == 0 {
                     continue;
                 }
-                let (da, db) = (self.gl.clip_dist(&a, plane), self.gl.clip_dist(&b, plane));
+                let (da, db) = (self.gl.clip.dist(&a, plane), self.gl.clip.dist(&b, plane));
                 let t = da / (da - db);
                 if da < 0.0 { t0 = t0.max(t) } else { t1 = t1.min(t) }
             }
@@ -2152,7 +2085,7 @@ impl Hq2Engine {
                 for i in 0..cn {
                     let (ia, ib) = (cur[i], cur[(i + 1) % cn]);
                     let (a, b) = (vtx(&scratch, ia), vtx(&scratch, ib));
-                    let (da, db) = (g.clip_dist(&a, plane), g.clip_dist(&b, plane));
+                    let (da, db) = (g.clip.dist(&a, plane), g.clip.dist(&b, plane));
                     let e = redges >> i & 1;
                     if da >= 0.0 && m < MAXP {
                         // The edge from an inside vertex is (part of) edge i.

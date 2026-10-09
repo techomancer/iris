@@ -45,7 +45,11 @@ use super::hq3::Hq3Sink;
 use super::te1::{self, reg as te_reg};
 use crate::dev::gl::light::{Lighting, MAX_LIGHTS};
 use crate::dev::gl::math::{self, Mat4, Stack};
-use crate::dev::gl::vertex::{Clip, Viewport, Wv, MAX_POLY};
+use crate::dev::gl::vertex::{self, Clip, Viewport, MAX_POLY};
+
+/// IMPACT vertices: texture coordinates (s, t, r, q) and a fog factor, for
+/// the TE and per-fragment fog.
+type Wv = vertex::Wv<4, 1>;
 
 /// GL tokens the GE handles (numbers as in `hq3::token_name`).
 mod tok {
@@ -1176,7 +1180,7 @@ impl Gl {
                 cb = self.lt.fog_color(e, cb);
             }
         }
-        let mut w = Wv { c, cb, h, e, f, ..Default::default() };
+        let mut w = Wv { c, cb, h, e, f: [f], ..Default::default() };
         if self.tex_on != 0 {
             let tc = self.texgen(v, e);
             w.t = math::xform(self.tex.get(), tc);
@@ -1532,7 +1536,7 @@ impl Gl {
                 put64(sink, dr, (qb[k] - qa[k]) / len as f64 * te1::ITER_ONE);
             }
         }
-        self.fog_plane(a.f as f64, (b.f as f64 - a.f as f64) / len as f64, 0.0, sink);
+        self.fog_plane(a.f[0] as f64, (b.f[0] as f64 - a.f[0] as f64) / len as f64, 0.0, sink);
         sink.rss_write(re::IR, IR_GL_LINE, true);
     }
 
@@ -2142,7 +2146,7 @@ impl Gl {
             }
         }
         if self.fog_after_texture() {
-            let (a, b, c) = (aw.f as f64, bw.f as f64, cw.f as f64);
+            let (a, b, c) = (aw.f[0] as f64, bw.f[0] as f64, cw.f[0] as f64);
             let mid = c + perc as f64 * (a - c);
             let dx = if span_x != 0.0 { (b - mid) / span_x as f64 } else { 0.0 };
             let ddown = (a - c - dx * major_x as f64) / major_y as f64;
@@ -2438,7 +2442,7 @@ fn lerp_window(a: &Wv, b: &Wv, t: f32) -> Wv {
         v.cb[k] = l(a.cb[k], b.cb[k]);
         v.t[k] = l(a.t[k], b.t[k]);
     }
-    v.f = l(a.f, b.f);
+    v.f[0] = l(a.f[0], b.f[0]);
     v
 }
 

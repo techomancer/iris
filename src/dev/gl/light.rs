@@ -1,6 +1,5 @@
-//! The OpenGL 1.1 lighting equation and fog, per vertex. Copied from GR2's
-//! GE7 HLE (`src/dev/gr2/gl_light.rs`), without its FIFO token loader: a
-//! board fills `Lighting` from its own protocol.
+//! The OpenGL 1.1 lighting equation and fog, per vertex. A board fills
+//! `Lighting` from its own protocol (GR2: `src/dev/gr2/gl_light.rs`).
 //!
 //! Two things vary between boards' libglcore and are parameters here:
 //! - specular and spot exponents arrive either as numbers (`shininess`,
@@ -86,7 +85,8 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn norm(a: [f32; 3]) -> [f32; 3] {
+/// `a` scaled to unit length (unchanged if ~0).
+pub fn norm(a: [f32; 3]) -> [f32; 3] {
     let l = dot(a, a).sqrt();
     if l > 1e-20 { [a[0] / l, a[1] / l, a[2] / l] } else { a }
 }
