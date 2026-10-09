@@ -81,7 +81,16 @@ impl NewMachineDialog {
     pub fn open(&mut self) { self.open = true; self.result = None; }
     pub fn take_result(&mut self) -> Option<NewMachineResult> { self.result.take() }
 
-    pub fn show(&mut self, ctx: &egui::Context) {
+    /// Resolve picker defaults in the prospective folder, before creation.
+    fn machine_dir(&self, prefs: &crate::settings::GuiSettings) -> std::path::PathBuf {
+        let name = if self.name.trim().is_empty() { "indy" } else { self.name.trim() };
+        if crate::machines::validate_name(name).is_ok() {
+            if let Ok(dir) = prefs.machine_dir(&prefs.unique_name(name)) { return dir; }
+        }
+        prefs.root().map(std::path::Path::to_path_buf).unwrap_or_else(|_| std::path::PathBuf::from("."))
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, prefs: &crate::settings::GuiSettings) {
         if !self.open { return; }
         let mut close = false;
         egui::Window::new("New machine")
@@ -151,8 +160,8 @@ impl NewMachineDialog {
                         ui.add_enabled(!self.use_embedded_prom,
                             TextEdit::singleline(&mut self.prom_path).desired_width(260.0));
                         if ui.add_enabled(!self.use_embedded_prom, egui::Button::new("📁")).clicked() {
-                            if let Some(p) = crate::filedialog::dialog_with(
-                                "PROM image", &self.prom_path,
+                            if let Some(p) = crate::filedialog::dialog_with_base(
+                                "PROM image", &self.prom_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Data,
                                 crate::filedialog::Purpose::Open,
                                 &[("PROM image", &["bin"])]).pick_file()
@@ -170,8 +179,8 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.nvram_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = crate::filedialog::dialog_with(
-                                "NVRAM file", &self.nvram_path,
+                            if let Some(p) = crate::filedialog::dialog_with_base(
+                                "NVRAM file", &self.nvram_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Data,
                                 crate::filedialog::Purpose::Save,
                                 &[("NVRAM", &["bin"])]).save_file()
@@ -187,8 +196,8 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.nveeprom_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = crate::filedialog::dialog_with(
-                                "NVRAM EEPROM file", &self.nveeprom_path,
+                            if let Some(p) = crate::filedialog::dialog_with_base(
+                                "NVRAM EEPROM file", &self.nveeprom_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Data,
                                 crate::filedialog::Purpose::Save,
                                 &[("NVRAM EEPROM", &["bin"])]).save_file()
@@ -256,8 +265,8 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.scsi1_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = crate::filedialog::dialog_with(
-                                "Hard disk image", &self.scsi1_path,
+                            if let Some(p) = crate::filedialog::dialog_with_base(
+                                "Hard disk image", &self.scsi1_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Disks,
                                 crate::filedialog::Purpose::Open,
                                 &[("Disk image", &["raw", "img", "chd"])]).pick_file()
@@ -277,8 +286,8 @@ impl NewMachineDialog {
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.cdrom4_path).desired_width(260.0));
                         if ui.button("📁").clicked() {
-                            if let Some(p) = crate::filedialog::dialog_with(
-                                "CD-ROM image", &self.cdrom4_path,
+                            if let Some(p) = crate::filedialog::dialog_with_base(
+                                "CD-ROM image", &self.cdrom4_path, &self.machine_dir(prefs),
                                 crate::filedialog::Anchor::Disks,
                                 crate::filedialog::Purpose::Open,
                                 &[("ISO", &["iso"]), ("CD image", &["iso", "chd"])]).pick_file()
@@ -302,7 +311,10 @@ impl NewMachineDialog {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() { close = true; }
-                    if ui.add(egui::Button::new(RichText::new("Create").strong())
+                    let name = if self.name.trim().is_empty() { "indy" } else { self.name.trim() };
+                    let valid = crate::machines::validate_name(name);
+                    if let Err(e) = &valid { ui.colored_label(Color32::from_rgb(230, 140, 70), e); }
+                    if ui.add_enabled(valid.is_ok(), egui::Button::new(RichText::new("Create").strong())
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         let mut cfg = MachineConfig::default();

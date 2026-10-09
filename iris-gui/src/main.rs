@@ -10,6 +10,7 @@ mod framebuffer;
 mod handle;
 mod input;
 mod macos_sandbox;
+mod machines;
 mod netfix;
 mod netplan;
 mod ram;
@@ -19,7 +20,7 @@ mod serial_console;
 mod settings;
 mod single_instance;
 
-use config_ui::{cfg_to_toml, show_tab, ConfigAction, MemoryUiContext, Tab};
+use config_ui::{show_tab, ConfigAction, MemoryUiContext, Tab};
 use dialogs::create_disk::CreateDiskDialog;
 use dialogs::new_machine::{distribute_ram, NewMachineDialog};
 use ram::{ram_summary, ram_presets};
@@ -49,6 +50,18 @@ fn load_icon() -> egui::IconData {
     }
 }
 
+/// Developer tools retain the source launch directory when machine selection
+/// changes the process cwd. Child processes receive an explicit directory.
+fn launch_dir() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn developer_binary(name: &str) -> PathBuf {
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    launch_dir().join(format!("target/release/{name}{suffix}"))
+}
+
 /// Largest aspect-preserving size (egui points) that fits `avail` for a
 /// framebuffer whose native pixel dimensions are `px`.
 fn fb_fit_size(avail: egui::Vec2, px: egui::Vec2) -> egui::Vec2 {
@@ -71,6 +84,13 @@ fn abs_path(p: &str) -> String {
     std::env::current_dir()
         .map(|d| d.join(path).to_string_lossy().into_owned())
         .unwrap_or_else(|_| p.to_string())
+}
+
+/// Picker results use the same path spelling as the saved config, including
+/// live CD-ROM commands and snapshot provenance.
+fn picked_path(path: &std::path::Path) -> String {
+    let relative = std::env::current_dir().ok().and_then(|dir| machines::relative(&dir, path).ok());
+    relative.unwrap_or_else(|| path.to_path_buf()).to_string_lossy().into_owned()
 }
 
 /// How far (in device pixels per emulated pixel) the fit may exceed a whole
@@ -133,18 +153,8 @@ fn main() -> eframe::Result<()> {
     // copy that would otherwise keep the monitor/serial ports bound) and claim
     // the single-instance lock for ourselves.
     single_instance::acquire();
+    launch_dir(); // Capture the source launch directory before selecting a machine.
     let prefs = GuiSettings::load();
-    // Re-acquire macOS sandbox access to previously user-selected files (disk
-    // images, PROM, ISOs, …) before any machine can open them. No-op elsewhere.
-    macos_sandbox::restore(&prefs.bookmarks);
-    // Under the App Sandbox a compressed HD CHD's `.diff.chd` sidecar can't be
-    // created next to the parent (its directory isn't writable). Redirect diffs
-    // into our writable data dir (container-redirected under the sandbox). Off
-    // the App Store build the diff stays beside the parent (no sandbox).
-    #[cfg(feature = "appstore")]
-    if let Some(d) = dirs::data_dir() {
-        std::env::set_var("IRIS_CHD_DIFF_DIR", d.join("iris").join("chd-diffs"));
-    }
     // Force the interpreter on the Mac App Store build. Cranelift (MIPS JIT and
     // the always-on REX3 draw-shader JIT) allocates executable memory with
     // mmap+mprotect, not MAP_JIT. The App Sandbox only permits MAP_JIT pages
@@ -192,9 +202,6 @@ fn main() -> eframe::Result<()> {
 struct App {
     prefs: GuiSettings,
     cfg: MachineConfig,
-    /// Path to an iris.toml that was *imported* (for re-export). None for
-    /// machines that originated from the GUI.
-    cfg_path: Option<PathBuf>,
     /// Marks the current cfg as having unsaved (in-memory) changes.
     cfg_dirty: bool,
     /// Timestamp of the most recent edit; used to debounce auto-save.
@@ -452,49 +459,28 @@ struct ChdGrantModal {
 
 impl App {
     fn new(mut prefs: GuiSettings) -> Self {
-        // Resolution order on startup:
-        //   1. prefs.active_machine present + in prefs.machines → load it.
-        //   2. legacy prefs.last_config TOML still on disk → migrate it as
-        //      a new named machine and adopt it.
-        //   3. otherwise: open the New Machine dialog.
         let mut cfg = MachineConfig::default();
-        let mut cfg_path: Option<PathBuf> = None;
-        let mut opened_new_machine = false;
         let mut new_machine = NewMachineDialog::default();
-
+        let mut startup_errors = prefs.errors.clone();
         if let Some(name) = prefs.active_machine.clone() {
             if let Some(stored) = prefs.machines.get(&name).cloned() {
                 cfg = stored;
             } else {
-                // Stale pointer — fall through to migrate / dialog.
                 prefs.active_machine = None;
             }
         }
         if prefs.active_machine.is_none() {
-            if let Some(p) = prefs.last_config.clone() {
-                if p.exists() {
-                    cfg = MachineConfig::load_toml(&p.to_string_lossy());
-                    cfg_path = Some(p.clone());
-                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("imported");
-                    let name = prefs.unique_name(stem);
-                    prefs.machines.insert(name.clone(), cfg.clone());
-                    prefs.active_machine = Some(name);
-                    // Clear the legacy pointer so we don't re-migrate next run.
-                    prefs.last_config = None;
-                    let _ = prefs.save();
-                }
-            }
+            prefs.active_machine = prefs.machines.keys().next().cloned();
+            if let Some(name) = &prefs.active_machine { cfg = prefs.machines[name].clone(); }
+            else { new_machine.open(); }
         }
-        if prefs.active_machine.is_none() {
-            new_machine.open();
-            opened_new_machine = true;
-        }
-        let _ = opened_new_machine; // (kept for future telemetry)
-        // Anchor the live config's NVRAM (and NVRAM EEPROM) to the stable data
-        // dir too — covers the legacy-TOML import path above, which doesn't go
-        // through load()'s per-machine migration.
-        GuiSettings::migrate_nvram_path(&mut cfg.nvram);
-        GuiSettings::migrate_nveeprom_path(&mut cfg.nveeprom);
+        let dir = match prefs.active_machine.as_deref() {
+            Some(name) => prefs.machine_dir(name),
+            None => prefs.root().map(std::path::Path::to_path_buf),
+        };
+        if let Err(e) = dir.and_then(|dir| Self::enter_directory(&dir)) { startup_errors.push(e); }
+        let startup_toast = (!startup_errors.is_empty())
+            .then(|| (startup_errors.join("\n"), std::time::Instant::now()));
 
         Self {
             fullscreen: false,
@@ -505,7 +491,6 @@ impl App {
             startup_frame: 0,
             prefs,
             cfg,
-            cfg_path,
             cfg_dirty: false,
             cfg_dirty_since: None,
             started_banks: None,
@@ -513,7 +498,7 @@ impl App {
             tab: Tab::General,
             bench: bench_ui::BenchState::default(),
             emu: EmulatorHandle::spawn(),
-            toast: None,
+            toast: startup_toast,
             stop_modal: None,
             missing_modal: None,
             chd_grant_modal: None,
@@ -587,91 +572,87 @@ impl App {
 
     /// Mark the in-memory config as edited and arm the auto-save debounce.
     fn mark_dirty(&mut self) {
+        if let Some(name) = &self.prefs.active_machine {
+            if let Err(e) = self.prefs.machine_dir(name).and_then(|dir| machines::make_relative(&mut self.cfg, &dir)) {
+                self.toast(e);
+            }
+        }
         self.cfg_dirty = true;
         self.cfg_dirty_since = Some(std::time::Instant::now());
     }
 
-    /// Persist the current machine to disk and clear the dirty flag.
-    fn flush_machine(&mut self) {
-        if let Some(name) = self.prefs.active_machine.clone() {
-            self.prefs.machines.insert(name, self.cfg.clone());
-            if let Err(e) = self.prefs.save() {
-                self.toast(format!("autosave failed: {e}"));
-                return;
-            }
+    fn enter_directory(dir: &std::path::Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir.join("disks")).map_err(|e| e.to_string())?;
+        std::env::set_current_dir(dir).map_err(|e| format!("Cannot select {}: {e}", dir.display()))?;
+        #[cfg(feature = "appstore")]
+        std::env::set_var("IRIS_CHD_DIFF_DIR", dir.join("chd-diffs"));
+        Ok(())
+    }
+
+    fn can_select_machine(&mut self) -> bool {
+        if let Err(e) = self.prefs.ensure_writable() { self.toast(e); return false; }
+        if !self.emu.can_change_directory() || self.syncing.is_some() {
+            self.toast("Stop the emulator and wait for disk operations before changing machines");
+            false
+        } else { true }
+    }
+
+    /// Persist edits through the core TOML schema and retain failed edits.
+    fn flush_machine(&mut self) -> bool {
+        let Some(name) = self.prefs.active_machine.clone() else { return false; };
+        if let Err(e) = self.prefs.save_machine(&name, &mut self.cfg) {
+            self.toast(format!("autosave failed: {e}"));
+            return false;
         }
         self.cfg_dirty = false;
         self.cfg_dirty_since = None;
+        true
     }
 
-    /// Debounced auto-save: flush ~600 ms after the most recent edit.
     fn maybe_autosave(&mut self) {
         if let Some(t) = self.cfg_dirty_since {
             if t.elapsed().as_millis() >= 600 { self.flush_machine(); }
         }
     }
 
-    /// Switch the active machine in-memory and on disk.
+    /// Reload from TOML when selecting a machine, including external edits.
     fn switch_to(&mut self, name: &str) {
-        // Flush whatever we were holding first.
-        if self.cfg_dirty { self.flush_machine(); }
-        if let Some(cfg) = self.prefs.machines.get(name).cloned() {
-            self.cfg = cfg;
-            self.cfg_path = None;
-            self.prefs.active_machine = Some(name.to_string());
-            let _ = self.prefs.save();
-            self.toast(format!("loaded '{name}'"));
+        if !self.can_select_machine() { return; }
+        if self.cfg_dirty && !self.flush_machine() { return; }
+        let result = (|| -> Result<MachineConfig, String> {
+            let mut cfg = machines::read(&self.prefs.machine_path(name)?)?;
+            let dir = self.prefs.machine_dir(name)?;
+            machines::make_relative(&mut cfg, &dir)?;
+            Self::enter_directory(&dir)?;
+            Ok(cfg)
+        })();
+        match result {
+            Ok(cfg) => {
+                self.cfg = cfg;
+                self.prefs.machines.insert(name.into(), self.cfg.clone());
+                self.prefs.active_machine = Some(name.into());
+                if let Err(e) = self.prefs.save() { self.toast(format!("save failed: {e}")); }
+                else { self.toast(format!("loaded '{name}'")); }
+            }
+            Err(e) => self.toast(format!("Cannot load machine: {e}")),
         }
     }
 
-    fn save_config(&mut self, path: PathBuf) {
-        match cfg_to_toml(&self.cfg) {
-            Ok(s) => match std::fs::write(&path, s) {
-                Ok(_) => {
-                    self.prefs.push_recent(path.clone());
-                    self.cfg_path = Some(path);
-                    self.cfg_dirty = false;
-                    self.toast("config saved");
-                }
-                Err(e) => self.toast(format!("save failed: {e}")),
-            },
-            Err(e) => self.toast(format!("serialize failed: {e}")),
-        }
-    }
-
-    /// Export config for the premiere CLI recording workflow.
+    /// Premiere uses the machine's existing TOML and working directory.
     fn prepare_for_premiere(&mut self) {
-        if self.emu.is_running() {
-            self.toast("Stop the VM first — premiere CLI uses its own iris.exe process");
-            return;
-        }
+        if !self.can_select_machine() { return; }
         self.cfg.scale = 1;
         self.mark_dirty();
-        if self.cfg_dirty { self.flush_machine(); }
-        let path = PathBuf::from("irix-install/iris-windows.toml");
-        match cfg_to_toml(&self.cfg) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
-                    self.toast(format!("export failed: {e}"));
-                    return;
-                }
-                self.cfg_path = Some(path);
-                self.cfg_dirty = false;
-            }
-            Err(e) => {
-                self.toast(format!("serialize failed: {e}"));
-                return;
+        if !self.flush_machine() { return; }
+        if let Some(name) = self.prefs.active_machine.as_deref() {
+            if let Ok(path) = self.prefs.machine_path(name) {
+                self.toast(format!("Premiere config: {}. Run iris with --config from this machine's folder.", path.display()));
             }
         }
-        let _ = self.prefs.save();
-        self.toast(
-            "Premiere ready: iris-windows.toml exported. Warm JIT (wsl\\warm-jit-profiles.ps1), \
-             then run wsl\\run-iris-premiere.bat for 3D recording.",
-        );
     }
 
     fn spawn_rebuild_profile(&mut self, gui: bool) {
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = launch_dir().to_path_buf();
         let bat = if gui {
             root.join("wsl").join("ensure-build.bat")
         } else {
@@ -696,34 +677,21 @@ impl App {
             self.toast("Stop the embedded VM first — CI test spawns a separate iris.exe");
             return;
         }
-        let mut cfg = self.cfg.clone();
-        cfg.ci = true;
-        cfg.headless = true;
-        let path = PathBuf::from("irix-install/iris-ci-test.toml");
-        match cfg_to_toml(&cfg) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
-                    self.toast(format!("export failed: {e}"));
-                    return;
-                }
-            }
-            Err(e) => {
-                self.toast(format!("serialize failed: {e}"));
-                return;
-            }
-        }
-        let socket = cfg.ci_socket.clone();
-        let config = path.to_string_lossy().to_string();
+        if self.cfg_dirty && !self.flush_machine() { return; }
+        let Some(name) = self.prefs.active_machine.as_deref() else { return; };
+        let Ok(path) = self.prefs.machine_path(name) else { return; };
+        let Ok(dir) = self.prefs.machine_dir(name) else { return; };
+        let socket = if iris::config::ci_socket_is_tcp(&self.cfg.ci_socket) { self.cfg.ci_socket.clone() } else { abs_path(&self.cfg.ci_socket) };
+        let iris = developer_binary("iris");
+        let client = developer_binary("iris-ci");
         self.toast("CI test: starting headless iris…");
         std::thread::spawn(move || {
-            let _child = std::process::Command::new("target/release/iris.exe")
-                .args(["--config", &config])
-                .spawn();
+            let _child = std::process::Command::new(iris)
+                .args(["--config", path.to_string_lossy().as_ref(), "--ci", "--headless"])
+                .current_dir(&dir).spawn();
             std::thread::sleep(std::time::Duration::from_secs(8));
-            let out = std::process::Command::new("target/release/iris-ci.exe")
-                .arg("ping")
-                .env("IRIS_CI_SOCKET", &socket)
-                .output();
+            let out = std::process::Command::new(client)
+                .arg("ping").env("IRIS_CI_SOCKET", &socket).current_dir(&dir).output();
             match out {
                 Ok(o) if o.status.success() => eprintln!("CI test: ping OK"),
                 Ok(o) => eprintln!("CI test ping failed: {}", String::from_utf8_lossy(&o.stderr)),
@@ -736,7 +704,29 @@ impl App {
         // Flush any pending edits before the machine starts so the on-disk
         // copy matches what we're about to boot. This also harvests a
         // security-scoped bookmark for any newly user-selected file.
-        if self.cfg_dirty { self.flush_machine(); }
+        if !self.can_select_machine() { return; }
+        if self.cfg_dirty && !self.flush_machine() { return; }
+        let Some(name) = self.prefs.active_machine.clone() else { return; };
+        let result = (|| -> Result<MachineConfig, String> {
+            let cfg = machines::read(&self.prefs.machine_path(&name)?)?;
+            Self::enter_directory(&self.prefs.machine_dir(&name)?)?;
+            Ok(cfg)
+        })();
+        match result {
+            Ok(mut cfg) => {
+                // Files added by hand can contain absolute paths; normalize them
+                // before either the GUI or the emulator uses the saved config.
+                let before = toml::to_string(&cfg).unwrap_or_default();
+                let dir = self.prefs.machine_dir(&name).unwrap();
+                if let Err(e) = machines::make_relative(&mut cfg, &dir) { self.toast(e); return; }
+                if toml::to_string(&cfg).unwrap_or_default() != before {
+                    if let Err(e) = self.prefs.save_machine(&name, &mut cfg) { self.toast(e); return; }
+                }
+                self.cfg = cfg;
+            },
+            Err(e) => { self.toast(format!("Cannot start machine: {e}")); return; }
+        }
+        self.prefs.machines.insert(name, self.cfg.clone());
         // (Re)assert macOS sandbox access to every bookmarked file *before* the
         // preflight opens them. The startup restore() ran before any bookmark
         // for a freshly-picked file existed, and the file picker's grant does
@@ -794,7 +784,6 @@ impl App {
         });
         self.started_banks = Some(self.cfg.banks);
         self.started_cpu = Some(self.cfg.machine.cpu);
-        self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
         // Don't resize the window when the VM launches — its size is latched at
         // app load (the saved window size, or the first-launch fit to vm_scale)
         // and the guest display is letterboxed into it. Only the VM-scale slider
@@ -851,6 +840,7 @@ impl App {
                 notes.push(format!("no Ethernet MAC in NVRAM EEPROM — wrote {}", settings::mac_to_string(mac)));
             }
         }
+        self.emu.send(Cmd::Start(Box::new(self.cfg.clone())));
         if !notes.is_empty() {
             self.toast(notes.join("; "));
         }
@@ -939,7 +929,8 @@ impl App {
             // writable container. Only writable HDD CHDs ever get folded.
             if dev.scratch || dev.cdrom { continue; }
             if !dev.path.ends_with(".chd") { continue; }
-            let Some(parent) = std::path::Path::new(&dev.path).parent() else { continue };
+            let absolute = abs_path(&dev.path);
+            let Some(parent) = std::path::Path::new(&absolute).parent() else { continue };
             if !dir_writable(parent) {
                 out.push(ChdNeedsGrant {
                     id,
@@ -1104,7 +1095,7 @@ impl App {
         ui.vertical(|ui| {
             ui.menu_button("File  ▶", |ui| {
                 ui.set_min_width(220.0);
-                if ui.button("New machine…").clicked() {
+                if ui.add_enabled(self.emu.can_change_directory(), egui::Button::new("New machine…")).clicked() {
                     self.new_machine.open();
                     ui.close();
                 }
@@ -1120,14 +1111,14 @@ impl App {
                         // selectable_label highlights the active machine — no
                         // marker glyph (a leading ● rendered as tofu).
                         let is_active = active.as_deref() == Some(name.as_str());
-                        if ui.selectable_label(is_active, name.as_str()).clicked() {
+                        if ui.add_enabled(self.emu.can_change_directory(), egui::Button::selectable(is_active, name.as_str())).clicked() {
                             want_switch = Some(name);
                             ui.close();
                         }
                     }
                     if let Some(n) = want_switch { self.switch_to(&n); }
                 });
-                if ui.add_enabled(self.prefs.active_machine.is_some(),
+                if ui.add_enabled(self.prefs.active_machine.is_some() && self.emu.can_change_directory(),
                         egui::Button::new("Rename current…"))
                     .on_disabled_hover_text("No active machine")
                     .clicked()
@@ -1139,47 +1130,13 @@ impl App {
                     ui.close();
                 }
                 let active = self.prefs.active_machine.clone();
-                if ui.add_enabled(active.is_some(), egui::Button::new("Delete current machine")).clicked() {
-                    if let Some(name) = active {
-                        self.prefs.machines.remove(&name);
-                        self.prefs.active_machine = self.prefs.machines.keys().next().cloned();
-                        if let Some(next) = self.prefs.active_machine.clone() {
-                            self.cfg = self.prefs.machines[&next].clone();
-                        } else {
-                            self.cfg = MachineConfig::default();
-                            self.new_machine.open();
-                        }
-                        let _ = self.prefs.save();
-                        self.toast(format!("deleted '{name}'"));
-                    }
+                if ui.add_enabled(active.is_some() && self.emu.can_change_directory(),
+                        egui::Button::new("Delete current machine")).clicked() {
+                    if let Some(name) = active { self.delete_machine(&name); }
                     ui.close();
                 }
-                // iris.toml import/export is a source-build affordance for users
-                // who also run the standalone `iris` CLI; the GUI's own gui.json
-                // machine store is the system of record. Hidden in pre-compiled /
-                // App Store builds (the `bundled` feature). See iris-gui Cargo.toml.
                 if !cfg!(feature = "bundled") {
                     ui.separator();
-                    if ui.button("Import iris.toml…").clicked() {
-                        if let Some(path) = native_open_dialog("Import iris.toml", &[("TOML", &["toml"])]) {
-                            let cfg = MachineConfig::load_toml(&path.to_string_lossy());
-                            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("imported");
-                            let name = self.prefs.unique_name(stem);
-                            self.prefs.machines.insert(name.clone(), cfg.clone());
-                            self.prefs.active_machine = Some(name.clone());
-                            self.cfg = cfg;
-                            self.cfg_path = Some(path);
-                            self.flush_machine();
-                            self.toast(format!("imported as '{name}'"));
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Export current to iris.toml…").clicked() {
-                        if let Some(path) = native_save_dialog("Export iris.toml", &[("TOML", &["toml"])]) {
-                            self.save_config(path);
-                        }
-                        ui.close();
-                    }
                     if ui.button("Prepare for premiere…").clicked() {
                         self.prepare_for_premiere();
                         ui.close();
@@ -1507,7 +1464,7 @@ impl App {
                 ui.label(RichText::new("1× = native pixels; ¼× steps (½-integers crispest on Retina)").weak().small());
             });
             ui.menu_button("Help  ▶", |ui| {
-                ui.label(RichText::new("IRIS — SGI Indy (MIPS R4400) Emulator").strong());
+                ui.label(RichText::new("IRIS — Emulator for various SGI machines").strong());
                 ui.label(format!("Version {} ({})", env!("APP_VERSION"), env!("APP_COMMIT")));
                 ui.separator();
                 ui.label(RichText::new("Diagnostics").strong());
@@ -2296,22 +2253,51 @@ impl App {
     /// Apply a rename of the active machine to `new_name` (from the modal).
     /// No-op for an empty/unchanged name or when there's no active machine.
     fn apply_rename(&mut self, new_name: &str) {
+        if !self.can_select_machine() { return; }
         let new = new_name.trim();
         let Some(old) = self.prefs.active_machine.clone() else { return; };
-        if new.is_empty() || new == old { return; }
-        let n = self.prefs.unique_name(new);
-        if let Some(cfg) = self.prefs.machines.remove(&old) {
-            self.prefs.machines.insert(n.clone(), cfg);
-            self.prefs.active_machine = Some(n.clone());
-            let _ = self.prefs.save();
-            self.toast(format!("renamed to '{n}'"));
+        if new == old { return; }
+        if let Err(e) = machines::validate_name(new) { self.toast(e); return; }
+        if self.cfg_dirty && !self.flush_machine() { return; }
+        let name = self.prefs.unique_name(new);
+        let result = self.prefs.root().and_then(|root| machines::rename(root, &old, &name));
+        if let Err(e) = result { self.toast(format!("Rename failed: {e}")); return; }
+        self.prefs.machines.remove(&old);
+        self.prefs.machines.insert(name.clone(), self.cfg.clone());
+        self.prefs.active_machine = Some(name.clone());
+        if let Err(e) = self.prefs.machine_dir(&name).and_then(|d| Self::enter_directory(&d)) {
+            self.toast(e);
+            return;
         }
+        if let Err(e) = self.prefs.save() { self.toast(e); }
+        else { self.toast(format!("renamed to '{name}'")); }
+    }
+
+    /// Remove the TOML registration and retain disks/battery-backed state.
+    fn delete_machine(&mut self, name: &str) {
+        if !self.can_select_machine() { return; }
+        let result = self.prefs.machine_path(name).and_then(|p| std::fs::remove_file(p).map_err(|e| e.to_string()));
+        if let Err(e) = result { self.toast(format!("Delete failed: {e}")); return; }
+        self.cfg_dirty = false;
+        self.cfg_dirty_since = None;
+        self.prefs.machines.remove(name);
+        self.prefs.active_machine = None;
+        if let Some(next) = self.prefs.machines.keys().next().cloned() {
+            self.switch_to(&next);
+        } else {
+            self.cfg = MachineConfig::default();
+            if let Err(e) = self.prefs.root().and_then(Self::enter_directory) { self.toast(e); }
+            self.new_machine.open();
+            if let Err(e) = self.prefs.save() { self.toast(e); }
+        }
+        self.toast(format!("deleted '{name}' (disk and NVRAM files retained)"));
     }
 
     /// Heading + tabbed config editor body, used both as the right side panel
     /// (while a machine runs) and full-width in the central panel (while idle).
     /// The header names the active machine ("default" if unset).
     fn config_editor_panel(&mut self, ui: &mut egui::Ui) {
+        for error in &self.prefs.errors { ui.colored_label(Color32::from_rgb(230, 140, 70), error); }
         let machine = self.prefs.active_machine.as_deref().unwrap_or("default").to_string();
         ui.horizontal(|ui| {
             ui.heading(format!("Configuration — {machine}"));
@@ -3067,6 +3053,7 @@ impl App {
     }
 
     fn welcome_panel(&mut self, ui: &mut egui::Ui) {
+        for error in &self.prefs.errors { ui.colored_label(Color32::from_rgb(230, 140, 70), error); }
         ui.add_space(8.0);
         ui.heading("iris — SGI Indy emulator");
         ui.add_space(4.0);
@@ -3394,15 +3381,22 @@ impl eframe::App for App {
         }
 
         // New machine dialog.
-        self.new_machine.show(ctx);
+        self.new_machine.show(ctx, &self.prefs);
         if let Some(result) = self.new_machine.take_result() {
-            let name = self.prefs.unique_name(&result.name);
-            self.prefs.machines.insert(name.clone(), result.cfg.clone());
-            self.prefs.active_machine = Some(name.clone());
-            self.cfg = result.cfg;
-            self.cfg_path = None;
-            self.flush_machine();
-            self.toast(format!("created machine '{name}'"));
+            if self.can_select_machine() {
+                if let Err(e) = machines::validate_name(&result.name) { self.toast(e); }
+                else if !self.cfg_dirty || self.flush_machine() {
+                    let name = self.prefs.unique_name(&result.name);
+                    let mut cfg = result.cfg;
+                    match self.prefs.save_machine(&name, &mut cfg) {
+                        Ok(()) => {
+                            self.switch_to(&name);
+                            self.toast(format!("created machine '{name}'"));
+                        }
+                        Err(e) => self.toast(format!("Cannot create machine: {e}")),
+                    }
+                }
+            }
         }
 
         // Create blank disk dialog.
@@ -3791,16 +3785,7 @@ impl eframe::App for App {
 
 // --- platform dialogs ------------------------------------------------------
 //
-// We avoid `rfd` as a dependency for now to keep the dep tree slim. Use
-// `zenity` / `osascript` if available; otherwise return None and let the
-// caller paste a path into the recent-files / save-state fields.
-// Anchored on the app's data folder rather than left to the OS's remembered
-// location — see `crate::filedialog`. These handle iris.toml import/export and
-// screenshots, none of which are disk images.
-fn native_open_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
-    filedialog::dialog_with(title, "", filedialog::Anchor::Data,
-                            filedialog::Purpose::Open, filters).pick_file()
-}
+// Screenshot save panels open in the selected machine folder.
 fn native_save_dialog(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
     filedialog::dialog_with(title, "", filedialog::Anchor::Data,
                             filedialog::Purpose::Save, filters).save_file()
@@ -3917,5 +3902,93 @@ mod fb_scaling_tests {
         let (size, nearest) = fb_draw_size(egui::vec2(1000.0, 800.0), FB, 1.0, 1.0);
         assert!(!nearest);
         assert!(size.y <= 800.0);
+    }
+}
+
+#[cfg(test)]
+mod machine_storage_integration {
+    use super::*;
+
+    // Run the App/worker integration in a child: cwd and environment are process
+    // global, and must not disturb other concurrently running unit tests.
+    #[test]
+    fn machine_storage_child() {
+        let Some(root) = std::env::var_os("IRIS_GUI_STORAGE_TEST") else { return; };
+        let root = PathBuf::from(root);
+        std::env::set_var("IRIS_NO_EXIT_ON_POWEROFF", "1");
+        let mut prefs = GuiSettings::load_in(root.clone(), launch_dir());
+        let mut cfg = MachineConfig::default();
+        cfg.banks = [8, 8, 0, 0];
+        cfg.scsi.clear();
+        cfg.headless = true;
+        cfg.monitor_port = Some(0);
+        cfg.serial_port_a = Some(0);
+        cfg.serial_port_b = Some(0);
+        cfg.ci_socket = "control.sock".into();
+        prefs.save_machine("alpha", &mut cfg).unwrap();
+        prefs.save_machine("beta", &mut cfg).unwrap();
+        prefs.active_machine = Some("alpha".into());
+        prefs.save().unwrap();
+        let mut app = App::new(prefs);
+        let alpha = app.prefs.machine_dir("alpha").unwrap();
+        let beta = app.prefs.machine_dir("beta").unwrap();
+        assert_eq!(std::env::current_dir().unwrap(), alpha);
+        app.cfg.serial_log = Some(alpha.join("serial.log").to_string_lossy().into_owned());
+        app.mark_dirty();
+        assert!(app.flush_machine());
+        assert_eq!(machines::read(&app.prefs.machine_path("alpha").unwrap()).unwrap().serial_log.as_deref(), Some("serial.log"));
+        let ctx = egui::Context::default();
+        for name in ["alpha", "beta"] {
+            app.switch_to(name);
+            assert_eq!(std::env::current_dir().unwrap(), app.prefs.machine_dir(name).unwrap());
+            app.start_emulator();
+            assert!(!app.emu.can_change_directory(), "queued Start must lock cwd");
+            app.switch_to(if name == "alpha" { "beta" } else { "alpha" });
+            assert_eq!(app.prefs.active_machine.as_deref(), Some(name));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !app.emu.is_running() && std::time::Instant::now() < deadline {
+                app.handle_events(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(app.emu.is_running(), "start failed: {:?}", app.toast);
+            assert!(std::fs::metadata("nvram.bin").unwrap().len() > 0);
+            assert!(std::fs::metadata("nveeprom.bin").unwrap().len() > 0);
+            app.emu.send(Cmd::Stop);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while !app.emu.can_change_directory() && std::time::Instant::now() < deadline {
+                app.handle_events(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(app.emu.can_change_directory(), "stop failed: {:?}", app.toast);
+        }
+        assert_ne!(settings::nvram_mac(alpha.join("nvram.bin").to_str().unwrap()), settings::nvram_mac(beta.join("nvram.bin").to_str().unwrap()));
+        // Switch rereads external TOML edits rather than the startup map.
+        let mut edited = machines::read(&app.prefs.machine_path("alpha").unwrap()).unwrap();
+        edited.banks = [16, 16, 0, 0];
+        machines::save(&root, "alpha", &mut edited).unwrap();
+        app.switch_to("alpha");
+        assert_eq!(app.cfg.banks, [16, 16, 0, 0]);
+        app.apply_rename("renamed");
+        assert_eq!(app.prefs.active_machine.as_deref(), Some("renamed"));
+        assert_eq!(std::env::current_dir().unwrap(), root.join("machines/renamed"));
+        assert!(root.join("machines/renamed/renamed.toml").is_file());
+        app.delete_machine("renamed");
+        assert_eq!(app.prefs.active_machine.as_deref(), Some("beta"));
+        assert_eq!(std::env::current_dir().unwrap(), beta);
+        assert!(root.join("machines/renamed/nvram.bin").is_file());
+        assert!(!root.join("machines/renamed/renamed.toml").exists());
+        app.emu.shutdown();
+        let restored = GuiSettings::load_in(root.clone(), launch_dir());
+        assert_eq!(restored.active_machine.as_deref(), Some("beta"));
+        assert_eq!(restored.machines.len(), 1);
+    }
+
+    #[test]
+    fn toml_machine_lifecycle_and_emulator_paths() {
+        let root = machines::tests::TempRoot::new("app-lifecycle");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "machine_storage_integration::machine_storage_child", "--nocapture"])
+            .env("IRIS_GUI_STORAGE_TEST", &root.0).current_dir(&root.0).output().unwrap();
+        assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
 }

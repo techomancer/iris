@@ -52,12 +52,8 @@ assets = [
 ]
 
 [features]
-# Pre-compiled / distributed build. Hides developer-only affordances that don't
-# make sense for users running an official binary — currently the iris.toml
-# import/export menu items (the GUI's gui.json machine store is the system of
-# record; iris.toml is only useful alongside the standalone `iris` CLI, i.e. a
-# source checkout). Set by the Release and App Store workflows. A no-op for
-# source builds, where the iris.toml workflow stays available.
+# Distributed build. Hides source-checkout tools such as rebuild/premiere.
+# Machine TOML storage is shared by source, Release, and App Store builds.
 bundled = []
 # Mac App Store distribution build. Implies `bundled`, and additionally hides
 # the CI/Automation config tab (the iris-ci socket is a developer automation
@@ -118,7 +114,7 @@ if-addrs = "0.15"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
-    "NSURL", "NSData", "NSError", "NSString", "NSArray",
+    "NSURL", "NSData", "NSError", "NSString", "NSArray", "NSPathUtilities",
 ] }
 
 [[bin]]

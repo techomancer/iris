@@ -25,9 +25,12 @@ easy to break.
   `Machine` call on the worker is wrapped in `catch_unwind`.
 - `CyclesPtr` (the live MIPS readout) must be cleared before the `Machine` is
   dropped (`cycles-ptr-must-be-cleared-before-dropping-the-machine.md`).
-- Settings **and machine configs** persist to `<config dir>/iris/gui.json`
-  (`dirs::config_dir()`), which is the system of record. `iris.toml` is
-  import/export only, hidden in `bundled` builds.
+- GUI preferences persist to `<config dir>/iris/gui.json`; machine configs use
+  the core TOML schema at `machines/<name>/<name>.toml`. The selected machine
+  folder is the process working directory. Keep config paths relative, and
+  wait for queued worker operations and machine teardown before changing cwd.
+  App Store builds use Foundation's container home for storage and resolve
+  external relative paths before harvesting security-scoped bookmarks.
 
 ## Frames and input
 

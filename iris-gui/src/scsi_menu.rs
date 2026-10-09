@@ -167,7 +167,7 @@ fn pick_disk(title: &str, cur: &str) -> Option<String> {
         .add_filter("Disk images", &["raw", "img", "chd"])
         .add_filter("All", &["*"])
         .pick_file()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| crate::picked_path(&p))
 }
 
 pub fn pick_iso(title: &str, cur: &str) -> Option<String> {
@@ -175,7 +175,7 @@ pub fn pick_iso(title: &str, cur: &str) -> Option<String> {
         .add_filter("ISO images", &["iso", "chd"])
         .add_filter("All", &["*"])
         .pick_file()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| crate::picked_path(&p))
 }
 
 /// Apply an action to the config.

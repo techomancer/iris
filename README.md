@@ -77,7 +77,8 @@ boots to a usable system: shell, networking, X11, the works.
   in-process NFSv2/v3 server, TFTP for PROM network boot, and FTP/XDMCP helpers;
   or PCAP bridging onto a real LAN
 - Headless mode and a CI control socket (`iris-ci`) for automation
-- Optional egui front-end (`iris-gui`) with machine management and a benchmark tab
+- Optional egui front-end (`iris-gui`) with machine management and a benchmark tab;
+  machines use the CLI TOML schema in isolated folders with relative paths
 - DaynaPort SCSI/Link Ethernet and the N64 development board (Ultra64), both enabled per machine in the config
 - Other guests: Linux (Debian 7, Gentoo), NetBSD and OpenBSD have had SCSI,
   interrupt and timer fixes land for them. They are not regularly tested, so

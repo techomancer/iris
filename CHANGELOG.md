@@ -68,6 +68,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **Machine TOML files and private machine folders.** The GUI discovers and
+  saves `machines/<name>/<name>.toml` using the standalone emulator's schema.
+  `gui.json` retains GUI preferences and the active machine name. Each machine
+  runs from its own folder, with relative config paths, default disks under
+  `disks/`, and private `nvram.bin`/`nveeprom.bin` files. Existing JSON machines
+  migrate with a preferences backup; external disks stay in place. App Store
+  storage uses the container home, bookmarks cover external relative paths,
+  and CHD diffs migrate to each machine's folder. Renaming moves the folder and
+  TOML together. Import/export menu actions are removed. Directory changes wait
+  for emulator teardown and queued file operations, and startup seeds NVRAM
+  before machine construction.
 - **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
   (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
   on those profiles, not in the NVRAM file) used to default to a bare

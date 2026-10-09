@@ -2,7 +2,7 @@
 //!
 //! Under the App Sandbox the app may only touch files the user explicitly hands
 //! it through an NSOpenPanel/NSSavePanel. That grant lasts only for the current
-//! launch: the absolute paths we persist in `gui.json` (disk images, PROM, ISOs,
+//! launch: the file paths in each machine TOML (disk images, PROM, ISOs,
 //! an NFS export directory, …) are *not* reachable on the next launch.
 //!
 //! The fix is the standard one: at save time we mint a **security-scoped
@@ -23,33 +23,21 @@ use iris::config::MachineConfig;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Absolute, currently-existing file paths in `cfg` that are worth bookmarking.
-///
-/// Relative/default paths (`prom.bin`, `scsi1.raw`, `nvram.bin`) resolve inside
-/// the sandbox container, which is always accessible, so they're skipped — only
-/// user-chosen absolute paths outside the container need a bookmark.
-pub fn config_paths(cfg: &MachineConfig) -> Vec<String> {
+/// Existing resources, resolved against their own machine folder. Relative
+/// paths can reach outside the container via `..` and still need bookmarks.
+pub fn config_paths(cfg: &MachineConfig, dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let mut add = |p: &str| {
-        let path = Path::new(p);
-        if path.is_absolute() && path.exists() {
-            out.push(p.to_string());
+    let mut cfg = cfg.clone();
+    crate::machines::visit_paths(&mut cfg, |p| {
+        if p.is_empty() || p == "(embedded)" { return; }
+        let path = crate::machines::resolve(dir, p);
+        if path.exists() {
+            // Bookmarks use a stable absolute key, independent of the selected
+            // machine's cwd. Canonicalize only this key, never the TOML path.
+            let path = path.canonicalize().unwrap_or(path);
+            out.push(path.to_string_lossy().into_owned());
         }
-    };
-    add(&cfg.prom);
-    add(&cfg.nvram);
-    if let Some(s) = &cfg.serial_log {
-        add(s);
-    }
-    for dev in cfg.scsi.values() {
-        add(&dev.path);
-        for disc in &dev.discs {
-            add(disc);
-        }
-    }
-    if let Some(nfs) = &cfg.nfs {
-        add(&nfs.shared_dir);
-    }
+    });
     out
 }
 
@@ -205,15 +193,16 @@ mod tests {
         let path = temp_file(".raw");
         let mut cfg = MachineConfig::default();
         cfg.scsi.get_mut(&1).unwrap().path = path.clone();
-        cfg.prom = "prom.bin".into(); // relative → skipped
+        cfg.prom = "prom.bin".into(); // missing → skipped
 
-        let paths = config_paths(&cfg);
-        assert!(paths.contains(&path), "absolute scsi image should be collected");
+        let paths = config_paths(&cfg, Path::new("/tmp/iris-machine"));
+        let key = Path::new(&path).canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(paths.contains(&key), "absolute scsi image should be collected");
         assert!(!paths.iter().any(|p| p == "prom.bin"), "relative paths should be skipped");
 
         let mut bm = BTreeMap::new();
         harvest(paths.iter().map(String::as_str), &mut bm);
-        assert!(bm.contains_key(&path), "accessible image should be bookmarked");
+        assert!(bm.contains_key(&key), "accessible image should be bookmarked");
 
         restore(&bm); // must not panic
         let _ = std::fs::remove_file(&path);
