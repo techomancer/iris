@@ -64,10 +64,10 @@ pub mod reg {
     pub const CONFIG: u32 = 0x112;
     pub const XYWIN: u32 = 0x115;
     /// Background colour, where an opaque stipple draws its 0 bits: a colour
-    /// index, or in RGB modes blue (bits 23:12) and green (11:0), 12 bits
-    /// each, with red in the next register.
+    /// index, or in RGB modes green (bits 23:12) and red (11:0), 12 bits
+    /// each, with blue in bits 11:0 of the next register (bkgrd_rg/ba).
     pub const BG_COLOR: u32 = 0x140;
-    pub const BG_COLOR_RED: u32 = 0x141;
+    pub const BG_COLOR_BLUE: u32 = 0x141;
     /// The clip rectangle: x and y ranges, each `min << 16 | max`, and its
     /// control (bit 0 enable, bit 4 keep the inside rather than the outside).
     pub const CLIP_X: u32 = 0x147;
@@ -1275,8 +1275,8 @@ impl Rss {
     pub(super) fn background(&self) -> u32 {
         let bg = self.reg(reg::BG_COLOR);
         if self.rgb_mode() {
-            let red = self.reg(reg::BG_COLOR_RED) & 0xFFF;
-            pack_rgb(red >> 4, (bg & 0xFFF) >> 4, ((bg >> 12) & 0xFFF) >> 4)
+            let blue = self.reg(reg::BG_COLOR_BLUE) & 0xFFF;
+            pack_rgb((bg & 0xFFF) >> 4, ((bg >> 12) & 0xFFF) >> 4, blue >> 4)
         } else {
             bg & 0xFFF
         }
@@ -2261,24 +2261,54 @@ mod tests {
     }
 
     /// In RGB modes the background is three 12-bit components across two
-    /// registers, as IRIX writes it for a 12-bit window's icon: white
-    /// is 0xf00f00 (blue, green) and 0xf00 (red). These are the values from
-    /// a trace of the desktop repainting its Icon Catalog.
+    /// registers, red lowest like the packed colour. The values are the
+    /// syserrpanel stop sign from a trace of the desktop repainting its
+    /// Icon Catalog: red 0xf0 dithered with a light red (0xc0, 0x70, 0x70),
+    /// which hardware shows as a red sign.
     #[test]
     fn opaque_stipple_background_in_rgb_modes() {
         let mut r = x_server();
         r.write(reg::PP1FILLMODE, 0x0C00_4004, false); // RGB pixel type
         r.write(reg::COLORMASKLSBSA, 0xFFF, false);
         r.write(reg::FILLMODE, FILL_LINE_STIPPLE | FILL_LINE_STIPPLE_OPAQUE, false);
-        r.write(reg::PACKEDCOLOR, 0xA0_A0A0, false);
-        r.write(reg::BG_COLOR, 0xC00_700, false);
-        r.write(reg::BG_COLOR_RED, 0x300, false);
+        r.write(reg::PACKEDCOLOR, 0xF0, false);
+        r.write(reg::BG_COLOR, 0x700_C00, false);
+        r.write(reg::BG_COLOR_BLUE, 0x700, false);
         r.write(reg::LINE_STIPPLE, 0xAAAA_AAAA, false);
         r.write(reg::IR_ALIAS, 0x15, false);
         r.write(reg::LINE_START, 300 << 16 | 40, false);
         r.write(reg::LINE_END, 301 << 16 | 40, true);
-        assert_eq!(px(&r, 300, 40), 0xAA_AAAA);
-        assert_eq!(px(&r, 301, 40), pack_rgb(0x33, 0x77, 0xCC), "expanded RGB444 background");
+        assert_eq!(px(&r, 300, 40), 0xFF);
+        assert_eq!(px(&r, 301, 40), pack_rgb(0xCC, 0x77, 0x77), "expanded RGB444 background");
+    }
+
+    /// The syserrpanel stop sign as traced from 4Dwm (testdata): every
+    /// pixel of the dithered sign is red or light red, half each, never the
+    /// green the old background decode gave.
+    #[test]
+    fn syserrpanel_stop_sign_trace_dithers_red() {
+        let mut r = x_server();
+        for line in include_str!("testdata/syserrpanel_stop_sign.txt").lines() {
+            let mut f = line.split_whitespace();
+            let Some(name) = f.next().filter(|n| !n.starts_with('#')) else { continue };
+            let reg = REG_NAMES.iter().position(|&n| n == name).unwrap_or_else(|| panic!("register {name}"));
+            let val = u32::from_str_radix(f.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+            r.write(reg as u32, val, f.next() == Some("x"));
+        }
+        let buf = r.target();
+        let (red, light) = (pack_rgb(0xFF, 0, 0), pack_rgb(0xCC, 0x77, 0x77));
+        let (mut n_red, mut n_light) = (0u32, 0u32);
+        for y in 266..=294 {
+            for x in 740..800 {
+                match r.mem.get(&buf, x, 767 - y) as u32 {
+                    0 => {}
+                    p if p == red => n_red += 1,
+                    p if p == light => n_light += 1,
+                    p => panic!("({x}, {y}) is {p:#08x}, not red or light red"),
+                }
+            }
+        }
+        assert!(n_red > 200 && n_red.abs_diff(n_light) < 10, "red {n_red}, light red {n_light}");
     }
 
     /// Block type 0 is a fill in the iterated colour, drawn at once (the

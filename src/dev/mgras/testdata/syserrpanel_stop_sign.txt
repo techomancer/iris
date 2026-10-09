@@ -1,0 +1,105 @@
+# The syserrpanel stop sign in the IRIX 6.5 Icon Catalog (12-bit RGB window),
+# from an RSS trace (mgras trace, rss): 4Dwm dithers the sign 50/50 with an
+# opaque line stipple, red 0xf0 on a light red background (bkgrd_rg 0x700c00,
+# bkgrd_ba 0x700). Hardware shows a red sign.
+# One RSS register write per line: name value, "x" for the execute address.
+xywin 0x2ff0000
+winmode 0x0
+pp1fillmode 0xc008004
+ColorMaskLSBsA 0xfff000
+ColorMaskLSBsB 0xfff000
+ColorMaskMSBs 0x0
+packed_color 0xf0
+bkgrd_rg 0x700c00
+bkgrd_ba 0x700
+DRBpointers 0xb81c0
+fillmode 0x60
+ir_alias 0x15
+lscrl 0xf0000
+lspat 0x55555555
+xline_xystarti 0x30c010a
+xline_xyendi 0x30f010a x
+lspat 0xaaaaaaaa
+xline_xystarti 0x30a010b
+xline_xyendi 0x310010b x
+lspat 0x55555555
+xline_xystarti 0x308010c
+xline_xyendi 0x311010c x
+lspat 0x55555555
+xline_xystarti 0x305010d
+xline_xyendi 0x312010d x
+lspat 0xaaaaaaaa
+xline_xystarti 0x305010e
+xline_xyendi 0x313010e x
+lspat 0xaaaaaaaa
+xline_xystarti 0x304010f
+xline_xyendi 0x313010f x
+lspat 0x55555555
+xline_xystarti 0x3040110
+xline_xyendi 0x3130110 x
+lspat 0x55555555
+xline_xystarti 0x3030111
+xline_xyendi 0x3130111 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x3030112
+xline_xyendi 0x3130112 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x3020113
+xline_xyendi 0x3130113 x
+lspat 0x55555555
+xline_xystarti 0x3020114
+xline_xyendi 0x3130114 x
+lspat 0x55555555
+xline_xystarti 0x3010115
+xline_xyendi 0x3130115 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x3010116
+xline_xyendi 0x3130116 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x3000117
+xline_xyendi 0x3130117 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x2ff0118
+xline_xyendi 0x3130118 x
+lspat 0x55555555
+xline_xystarti 0x2ff0119
+xline_xyendi 0x3130119 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x2ff011a
+xline_xyendi 0x312011a x
+lspat 0x55555555
+xline_xystarti 0x2ff011b
+xline_xyendi 0x312011b x
+lspat 0xaaaaaaaa
+xline_xystarti 0x2ff011c
+xline_xyendi 0x311011c x
+lspat 0x55555555
+xline_xystarti 0x2ff011d
+xline_xyendi 0x311011d x
+lspat 0xaaaaaaaa
+xline_xystarti 0x2ff011e
+xline_xyendi 0x310011e x
+lspat 0x55555555
+xline_xystarti 0x2ff011f
+xline_xyendi 0x310011f x
+lspat 0xaaaaaaaa
+xline_xystarti 0x2ff0120
+xline_xyendi 0x30f0120 x
+lspat 0x55555555
+xline_xystarti 0x2ff0121
+xline_xyendi 0x30f0121 x
+lspat 0xaaaaaaaa
+xline_xystarti 0x2ff0122
+xline_xyendi 0x30e0122 x
+lspat 0x55555555
+xline_xystarti 0x3010123
+xline_xyendi 0x30d0123 x
+lspat 0x55555555
+xline_xystarti 0x3020124
+xline_xyendi 0x30b0124 x
+lspat 0x55555555
+xline_xystarti 0x3030125
+xline_xyendi 0x3090125 x
+lspat 0x55555555
+xline_xystarti 0x3040126
+xline_xyendi 0x3070126 x

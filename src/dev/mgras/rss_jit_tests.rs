@@ -261,7 +261,7 @@ fn common_regs(rng: &mut Rng, regs: &mut Regs, gl: bool) {
 
 /// Colours, whichever the primitive uses (data: not in the key).
 fn colour_regs(rng: &mut Rng, regs: &mut Regs) {
-    for r in [reg::FILL_COLOR_R, reg::FILL_COLOR_G, reg::FILL_COLOR_B, reg::FILL_COLOR_B + 1, reg::RED, reg::PACKEDCOLOR, reg::BG_COLOR, reg::BG_COLOR_RED] {
+    for r in [reg::FILL_COLOR_R, reg::FILL_COLOR_G, reg::FILL_COLOR_B, reg::FILL_COLOR_B + 1, reg::RED, reg::PACKEDCOLOR, reg::BG_COLOR, reg::BG_COLOR_BLUE] {
         regs.push((r, rng.u32()));
     }
 }
