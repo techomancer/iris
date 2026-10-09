@@ -136,7 +136,7 @@ fn pio_read_through_the_bus() {
     direct_rss(&m, XFRMODE, 2 << 8, false);
     direct_rss(&m, XFRSIZE, 2 << 16 | 3, false);
     block(&m, 100, 50, 102, 51);
-    let mut dw = || (read(&m, 32, 0x7D1C0) << 32) | read(&m, 32, 0x7C1C4);
+    let dw = || (read(&m, 32, 0x7D1C0) << 32) | read(&m, 32, 0x7C1C4);
     assert_eq!(dw(), 0x0000_0102_0300_0000);
     assert_eq!(dw(), 0x0000_0000_0004_0506);
     assert_eq!(dw(), 0);

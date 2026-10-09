@@ -1910,7 +1910,7 @@ mod line_bulk_tests_support {
         }
     }
 
-    pub(super) fn mc_with(sink: Arc<GioSink>) -> MemoryController {
+    fn mc_with(sink: Arc<GioSink>) -> MemoryController {
         let phys: Arc<dyn BusDevice> = sink;
         let mc = MemoryController::new(
             Arc::new(PlMutex::new(Eeprom93c56::new())), true, [1, 0, 0, 0]);
