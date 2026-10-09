@@ -1305,7 +1305,13 @@ fn emit_shader(
             // independent of RGB/CI plane format — mirrors combine_host_dda in rex3.rs.
             // Always overlay bits 31:24 so px_afunc/afunc_cmp below see the right value;
             // CI write paths mask down to the plane-depth index and never see these bits.
-            let alpha_byte = if dm0.alphahost() {
+            let alpha_byte = if dm0.alphahost() && !dm0.colorhost() && dm1.hostdepth() <= 1 {
+                // 8-bit host fields carrying alpha alone: the field's whole
+                // leading byte (mirrors fetch_host_pixel).
+                let hi = b.ins().ushr_imm_s(host_shifter_v, 32);
+                let hi32 = b.ins().ireduce(types::I32, hi);
+                b.ins().band_imm_s(hi32, 0xFF00_0000u64 as i64)
+            } else if dm0.alphahost() {
                 b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64)
             } else {
                 // Hoisted to the entry block — constant for the whole draw.
@@ -2068,10 +2074,15 @@ fn emit_draw_iline(
 
         // Afunction source alpha for lines is always DDA (lines never use host mode —
         // see compile_shader guard), independent of RGB/CI plane format. Mirrors the
-        // block/span shader's alpha_byte overlay.
-        let ca = ld32!(ctx_off!(coloralpha));
-        let ca_c = clamp_color_component(&mut b, ca);
-        let alpha_byte = b.ins().ishl_imm_s(ca_c, 24);
+        // block/span shader's alpha_byte overlay. A_LINE alpha is the pixel
+        // coverage instead, which is not modelled: full (mirrors combine_host_dda).
+        let alpha_byte = if dm0.adrmode() == DRAWMODE0_ADRMODE_A_LINE {
+            b.ins().iconst(types::I32, 0xFF00_0000u32 as i64)
+        } else {
+            let ca = ld32!(ctx_off!(coloralpha));
+            let ca_c = clamp_color_component(&mut b, ca);
+            b.ins().ishl_imm_s(ca_c, 24)
+        };
         let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
         let raw_src = b.ins().bor(color24, alpha_byte);
 

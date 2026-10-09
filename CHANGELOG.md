@@ -99,7 +99,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   attenuated. It only changes how the alpha component is blended (rex3.pdf
   §3.8). IRIX's GL draws `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` with it
   clear, so every blend came out opaque: half-transparent quads, antialiased
-  text, and the dark halo around `blast`'s nebula billboard.
+  text, and the dark halo around `blast`'s nebula billboard. Two things the
+  old reading hid are fixed with it: with ALPHAHOST and 8-bit host fields the
+  field is now the alpha (it was unpacked as a 4-bit colour, so IRIX's smooth
+  points, `blast`'s stars among them, had alpha 0), and A_LINE pixels take
+  full coverage as their alpha instead of a stale COLORALPHA (IRIX's
+  GL_LINE_SMOOTH lines faded to nearly nothing; coverage is not modelled yet).
 - **2026-10-06 — IMPACT OpenGL and texture pipeline** (`862d0fe`): GE11
   command HLE, shared matrix/clipping/lighting routines in `src/dev/gl/`,
   triangle rasterization, context storage and eviction through ERAM, and

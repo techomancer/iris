@@ -304,5 +304,5 @@ The frame buffer memory (controlled by RB2 chips) contains distinct functional p
   outside that set; `src/dev/ng1/rex3_profile.rs` persists the modes seen to
   `~/.iris/rex-jit-profile.bin`.
 - `src/dev/ng1/rex3_tests.rs` — interpreter/JIT equivalence and drawing tests.
-- `rules/rex3/` — findings: CIDMATCH is a mask, blend alpha, fastclear and CID,
+- `rules/rex3/` — findings: CIDMATCH is a mask, blend alpha, host and line alpha, fastclear and CID,
   GFIFO batching, HOSTRW batching, LINE+HOST not being JIT-able.

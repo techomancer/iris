@@ -1755,8 +1755,8 @@ const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LIN
 // DM0 for a full F_LINE draw — fractional-endpoint Bresenham correction.
 const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DM0 for a full A_LINE draw — F_LINE plus AWEIGHT-LUT endpoint suppression (needs ENDPTFILTER, bit 22, set separately).
-// A_LINE tests are out of scope for this pass (see rules/testing/rex3-fline-fractional-bresenham.md) —
-// kept for a future session, not yet exercised by any test.
+// Its Bresenham walk is not tested yet (see rules/testing/rex3-fline-fractional-bresenham.md);
+// the blend tests use it for its alpha.
 #[allow(dead_code)]
 const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 #[allow(dead_code)]
@@ -4762,6 +4762,115 @@ mod jit_tests {
         }
     }
 
+
+    /// Runs `setup` on an interpreter REX3 and on a JIT one (after the JIT has
+    /// compiled `dm0`/`dm1`), returning the pixels at `xs` on row `y` from each.
+    fn interp_and_jit(dm0: u32, dm1: u32, xs: &[i32], y: i32, setup: &dyn Fn(&Rex3)) -> (Vec<u32>, Vec<u32>) {
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        wait(rex_i);
+        let interp = xs.iter().map(|&x| read_pixel(rex_i, x, y) & 0xFFFFFF).collect();
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        clear_region(rex_j, 0, y, 31, y);
+        rex3init(rex_j);
+        setup(rex_j);
+        wait(rex_j);
+        let jit = xs.iter().map(|&x| read_pixel(rex_j, x, y) & 0xFFFFFF).collect();
+        (interp, jit)
+    }
+
+    /// ALPHAHOST without COLORHOST at a 4-bit host depth: the 8-bit host field
+    /// is the alpha that blends the DDA colour (spec §3.9, §3.10). IRIX's smooth
+    /// points send their per-pixel coverage this way; unpacking the field as a
+    /// 4-bit colour lost it, so every such pixel had alpha 0.
+    #[test]
+    fn alphahost_field_is_the_alpha() {
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+            | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+            | DRAWMODE1_LOGICOP_SRC_SH; // host depth 0: 4 bits, 8-bit fields
+        let dm0 = DM0_DRAW_BLOCK | (1 << 7); // ALPHAHOST, colour from the DDA
+        let alphas: [u32; 3] = [0x00, 0x80, 0xFF];
+        let setup = |rex: &Rex3| {
+            for (i, a) in alphas.iter().enumerate() {
+                let x = i as i32;
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK, 0xFFFFFF);
+                reg(rex, REX3_COLORRED, 0xC0 << 11);
+                reg(rex, REX3_COLORGRN, 0xC0 << 11);
+                reg(rex, REX3_COLORBLUE, 0xC0 << 11);
+                reg(rex, REX3_XYENDI, xy(x, 0));
+                reg(rex, REX3_XYSTARTI, xy(x, 0));
+                reg(rex, REX3_DRAWMODE0, dm0);
+                write_hostrw32(rex, a << 24);
+                wait(rex);
+            }
+        };
+        let (interp, jit) = interp_and_jit(dm0, dm1, &[0, 1, 2], 0, &setup);
+        // Over black: 0xC0 * alpha / 255.
+        assert_eq!(interp, vec![0x000000, 0x606060, 0xC0C0C0], "interp {interp:08x?}");
+        assert_eq!(interp, jit, "JIT/interp mismatch: interp={interp:08x?} jit={jit:08x?}");
+    }
+
+    /// A_LINE takes its alpha from pixel coverage, not COLORALPHA: IRIX's
+    /// OpenGL draws GL_LINE_SMOOTH with blending on and COLORALPHA left at
+    /// whatever the last primitive set. Coverage is not modelled, so the line
+    /// must draw at full strength even with COLORALPHA 0.
+    #[test]
+    fn aline_alpha_is_coverage_not_coloralpha() {
+        let dm1 = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
+            | DRAWMODE1_COMPARE_DISABLE_SH | (1 << 18)
+            | (DRAWMODE1_BF_SA << 19) | (DRAWMODE1_BF_MSA << 22)
+            | DRAWMODE1_LOGICOP_SRC_SH;
+        let dm0 = DM0_DRAW_ALINE;
+        let setup = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK, 0xFFFFFF);
+            reg(rex, REX3_COLORALPHA, 0);
+            reg(rex, REX3_COLORRED, 0xC0 << 11);
+            reg(rex, REX3_COLORGRN, 0xC0 << 11);
+            reg(rex, REX3_COLORBLUE, 0xC0 << 11);
+            reg(rex, REX3_XYSTARTI, xy(10, 4));
+            reg(rex, REX3_XYENDI, xy(20, 4));
+            reg_go(rex, REX3_DRAWMODE0, dm0);
+        };
+        // Where the line lands is not what this checks (the interpreter and
+        // the JIT walk an integer-coordinate A_LINE one row apart): every pixel
+        // it lit must be at full strength, in both.
+        let lit = |rex: &Rex3| -> Vec<u32> {
+            (0..10).flat_map(|y| (8..23).map(move |x| (x, y)))
+                .map(|(x, y)| read_pixel(rex, x, y) & 0xFFFFFF)
+                .filter(|&p| p != 0).collect()
+        };
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        setup(rex_i);
+        wait(rex_i);
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        setup(rex_j);
+        wait(rex_j);
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
+                "JIT compile failed dm0={dm0:#010x} dm1={dm1:#010x}");
+        }
+        clear_region(rex_j, 0, 0, 31, 9);
+        rex3init(rex_j);
+        setup(rex_j);
+        wait(rex_j);
+        for (name, px) in [("interp", lit(rex_i)), ("jit", lit(rex_j))] {
+            assert!(px.len() >= 10, "{name}: line not drawn ({} pixels)", px.len());
+            assert!(px.iter().all(|&p| p == 0xC0C0C0), "{name}: not full strength: {px:08x?}");
+        }
+    }
 
     /// FASTCLEAR with CID checking ENABLED must draw as an ordinary draw.
     ///

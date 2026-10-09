@@ -1200,7 +1200,17 @@ pub fn fetch_host_pixel<M: Mode>(ctx: &mut Rex3Context, m: &M) -> u32 {
         ctx.hostcnt = host_count(m);
     }
 
-    let pixel = host_unpack(m, ctx.host_shifter);
+    let mut pixel = host_unpack(m, ctx.host_shifter);
+    // ALPHAHOST without COLORHOST: the host fields are alpha, blending the DDA
+    // colour (spec §3.9). Fields are 8 bits wide for host depths 4 and 8
+    // (§3.10: "a field of 8, 16, or 32 bits"), so the whole leading byte is
+    // the alpha; unpacking it as a 4- or 8-bit colour would lose it. IRIX's
+    // smooth points send their per-pixel coverage this way.
+    if m.alphahost() != 0 && m.colorhost() == 0
+        && matches!(m.hostdepth(), DRAWMODE1_HOSTDEPTH_12 | DRAWMODE1_HOSTDEPTH_8)
+    {
+        pixel = (pixel & 0x00FF_FFFF) | ((ctx.host_shifter >> 32) as u32 & 0xFF00_0000);
+    }
     ctx.host_shifter <<= host_shift(m);
     ctx.hostcnt -= 1;
     pixel
@@ -1261,6 +1271,12 @@ fn combine_host_dda<M: Mode>(ctx: &Rex3Context, m: &M, host_pixel: u32) -> u32 {
     // mask down to the plane-depth index and never look at these bits.
     let a = if m.alphahost() != 0 {
         (host_pixel >> 24) & 0xFF
+    } else if m.adrmode() == DRAWMODE0_ADRMODE_A_LINE {
+        // Antialiased lines take their alpha from the line's pixel coverage
+        // (§3.6), not the DDA: IRIX's OpenGL draws GL_LINE_SMOOTH this way
+        // without loading COLORALPHA. Coverage is not modelled, so every pixel
+        // counts as fully covered.
+        0xFF
     } else {
         Rex3Context::clamp_color_component(ctx.coloralpha)
     };
