@@ -7472,4 +7472,82 @@ mod tests {
         // target), ADDIU3 = 3 dispatches.
         assert_jit_matches_interpreter_page(&page, gpr, pc, entry_word, 3, 4);
     }
+
+
+    /// A delay slot whose memory access returns BUS_BUSY (a full graphics
+    /// FIFO, in the field) must still take the branch once the access
+    /// succeeds. The retry bail used to land on the slot with no transfer
+    /// armed, so the retried slot fell through to slot + 4.
+    fn busy_slot_case(branch: u32, gpr_in: [u64; 32], expect_pc: u64) {
+        let addr: u64 = 0xFFFF_FFFF_9F0F_0200;
+        let pc = 0xFFFF_FFFF_8000_0000u64;
+        let mut gpr = gpr_in;
+        gpr[16] = addr - 64;
+        let slot = make_i(crate::cpu::mips_isa::OP_LW, 16, 12, 64); // lw t4, 64(s0)
+        let page = vec![(0u16, branch), (1u16, slot)];
+        let responses = vec![(BUS_BUSY, 0), (BUS_BUSY, 0), (BUS_OK, 0x1234_5678)];
+
+        let interp = {
+            let (mut exec, mem) = seeded_executor_over(
+                MockMemory::new_not_compilable().with_magic_responses(addr, responses.clone()), gpr, pc);
+            for &(w, r) in &page { mem.set_word((pc & 0x1FFF_FFFF) + w as u64 * 4, r); }
+            let mut n = 0;
+            while exec.core.pc == pc || exec.core.pc == pc + 4 {
+                let instr = mem.get_word(exec.core.pc & 0x1FFF_FFFF);
+                exec.exec(instr);
+                n += 1;
+                assert!(n < 20);
+            }
+            CoreSnapshot::capture(&exec.core)
+        };
+
+        let jit = {
+            let mut page_words = [0u32; ENTRIES_PER_PAGE];
+            for &(w, r) in &page { page_words[w as usize] = r; }
+            let mut analyzer = Analyzer::new();
+            let (walked, _) = analyzer.walk_bounded(&page_words, 0, (pc & !(PAGE_SIZE as u64 - 1)) as u32, 1);
+            let mut instrs_owned = *walked;
+            let mut codegen = Codegen::new();
+            let jit_fn: JitFn = codegen.compile_region(&mut instrs_owned, 0, true, false).expect("compilable");
+            let (exec, mem) = seeded_executor_over(
+                MockMemory::new().with_magic_responses(addr, responses), gpr, pc);
+            let mut exec = Box::new(exec);
+            for &(w, r) in &page { mem.set_word((pc & 0x1FFF_FFFF) + w as u64 * 4, r); }
+            exec.install_jit_hooks();
+            unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+            // A bail hands the rest to the dispatcher: finish in the interpreter.
+            let mut n = 0;
+            while exec.core.pc == pc || exec.core.pc == pc + 4 {
+                let instr = mem.get_word(exec.core.pc & 0x1FFF_FFFF);
+                exec.exec(instr);
+                n += 1;
+                assert!(n < 20);
+            }
+            std::mem::forget(codegen);
+            CoreSnapshot::capture(&exec.core)
+        };
+
+        assert_eq!(interp.pc, expect_pc, "interpreter must take the branch");
+        assert_eq!(jit.pc, expect_pc, "JIT must take the branch after a retried delay slot, not fall through");
+        assert_eq!(jit, interp);
+    }
+
+    #[test]
+    fn jr_with_busy_delay_slot_still_jumps() {
+        let mut gpr = [0u64; 32];
+        gpr[31] = 0xFFFF_FFFF_8000_2000;
+        busy_slot_case(0x03e00008 /* jr ra */, gpr, 0xFFFF_FFFF_8000_2000);
+    }
+
+    #[test]
+    fn beq_with_busy_delay_slot_still_branches() {
+        // beq zero, zero, +0x40 -> slot addr + 0x100
+        busy_slot_case(make_i(crate::cpu::mips_isa::OP_BEQ, 0, 0, 0x40), [0u64; 32], 0xFFFF_FFFF_8000_0104);
+    }
+
+    #[test]
+    fn bne_not_taken_with_busy_delay_slot_skips_to_fallthrough() {
+        // bne zero, zero never taken: lands on word 2 after the slot.
+        busy_slot_case(make_i(crate::cpu::mips_isa::OP_BNE, 0, 0, 0x40), [0u64; 32], 0xFFFF_FFFF_8000_0008);
+    }
 }

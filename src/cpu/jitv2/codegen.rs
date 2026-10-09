@@ -227,6 +227,12 @@ struct EmitCtx<'a, 'b> {
     /// L1-D geometry for the inline memory path, copied from `Codegen`.
     dc_geometry: crate::cpu::mips_cache_v2::JitDcGeometry,
     bd: bool,
+    /// The pending transfer of the branch whose inlined delay slot is being
+    /// emitted (`Some` exactly when `bd` is). A retry bail out of the slot
+    /// (`emit_check_mem_status`) lands on the slot word for the interpreter
+    /// to re-run, and must arm this as `delay_slot_target` so the retried
+    /// slot still retires into the branch instead of falling through.
+    slot_target: Option<Value>,
     /// `true` iff an exception raised while emitting with this `ctx` must
     /// **trust the live `core.pc`/`core.in_delay_slot`** (route through
     /// `exception_entry_word_block`) rather than overwriting them from the
@@ -1276,6 +1282,7 @@ impl Codegen {
                 word: 0,
                 dc_geometry,
                 bd: false,
+                slot_target: None,
                 trust_live_pc_bd_on_exc: true,
                 exit_block: dead,
                 exception_call_block: dead,
@@ -1606,7 +1613,7 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1637,7 +1644,7 @@ impl Codegen {
         // start, because the armed foreign-slot transfer was destroyed.
         if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1717,7 +1724,7 @@ impl Codegen {
             builder.switch_to_block(stub);
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
@@ -1851,7 +1858,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -4861,6 +4868,22 @@ fn emit_check_mem_status(ctx: &mut EmitCtx, exc: Value) {
     ctx.builder.switch_to_block(true_retry_block);
     ctx.builder.set_cold_block(true_retry_block);
     ctx.builder.seal_block(true_retry_block);
+    // Inside an inlined delay slot the branch's transfer only exists in
+    // compiled code: nothing armed `in_delay_slot`/`delay_slot_target` for
+    // the interpreter. Arm them here, as `branch_delay` would have, so the
+    // retried slot retires into the branch target. Without this the slot
+    // re-runs as a plain instruction and falls through to slot + 4 (a
+    // GL client whose `jr ra` slot hit a full GR2 FIFO ran on into the next
+    // function). An entry word reached as a foreign slot (`bd` false) already
+    // has both fields live from the dispatch that reached it.
+    if let Some(target) = ctx.slot_target.filter(|_| ctx.bd) {
+        let mem = MemFlagsData::trusted();
+        let target_off = ir::immediates::Offset32::new(core_offset_of_delay_slot_target());
+        let flag_off = ir::immediates::Offset32::new(core_offset_of_in_delay_slot());
+        ctx.builder.ins().store(mem, target, ctx.core_ptr, target_off);
+        let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+        ctx.builder.ins().store(mem, one, ctx.core_ptr, flag_off);
+    }
     emit_bail(ctx, ctx.exit_block, ctx.word, EXEC_COMPLETE);
 
     ctx.builder.switch_to_block(continue_block);
@@ -6884,6 +6907,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
     // restored back to false afterward: ctx is not reused for anything else
     // once this returns (the pass-2 loop constructs a fresh ctx per head).
     ctx.bd = true;
+    ctx.slot_target = Some(delay_slot_target);
     // ...and for the same reason, this slot's fault state is now fully
     // compile-time known (`slot_word`, `bd = true`), so it must NOT be taken
     // from live memory even when the *branch* it belongs to is an entry word
@@ -10469,7 +10493,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, slot_target: None, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
