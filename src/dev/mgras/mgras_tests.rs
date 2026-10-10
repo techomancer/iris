@@ -1919,6 +1919,47 @@ fn gl_texture_far_quad_maps_as_near() {
     assert!(differ < textured / 200, "{differ} of {textured} pixels differ");
 }
 
+/// A luminance-alpha texture sent as libGLcore sends a direct load
+/// (traced, glprim 64x64 GL_LUMINANCE_ALPHA): SEND_PIXELS words 0 and 1
+/// both half a row's words, the rows as words 3 + 3 * 4. Each texel is
+/// its own luminance (s * 0x20), not texel s / 2's.
+#[test]
+fn gl_texture_rows_are_send_pixels_words_0_and_1() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    // 8x8 texels of (L, A) bytes: 16 bytes = 4 words a row.
+    let bytes: Vec<u8> = (0..8).flat_map(|_t| (0..8u8).flat_map(|s| [s * 0x20, 0xFF])).collect();
+    let words: Vec<u32> = bytes.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let n = 8u32;
+    fifo_token(&m, 0x0C, &[]);
+    rss_shadow_list(&m, &[(0x1A0, 0), (0x18B, 0), (0x111, 0x40449)]);
+    rss_shadow_list(&m, &[(0x1A1, 0x34E22)]);
+    rss_shadow_list(&m, &[(0x1A2, 3 << 8 | 3 << 4)]);
+    fifo_token(&m, 0xD2, &[0xFFFF_FFFF, 0x0140_0000, 0, 0, 3]);
+    fifo_token(&m, 0xCD, &[1, 1, 0x14, 0xDA8, 0, 2, 5, 0, 0, n, n, n << 16 | n, 0]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDB1, 0, 2, 6, n, 0, 0, 0, 0, 0, 0]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDB7, 0, 2, 6, 0, 0, 0, 0, 1, 0, 0]);
+    // Words a row 2 + 2, rows 2 + 3 * 2 = 8.
+    fifo_token(&m, 0x8D, &[2, 2, 0, 2, 2, 1, 0x511A, 0x98]);
+    fifo_pixel_data(&m, &words);
+    fifo_token(&m, 0xD3, &[]);
+    // Luminance-alpha class (2), two components; 8x8 level 0 at page 0.
+    fifo_token(&m, 0x0B, &[]);
+    rss_shadow_list(&m, &[(0x180, 0x10004)]);
+    rss_shadow_list(&m, &[(0x111, 0x40449)]);
+    rss_shadow_list(&m, &[(0x184, 0), (0x185, 0), (0x190, 0)]);
+    fifo_token(&m, 0xEC, &[0xBC6, 0xBC7, 0x191, 0]);
+    rss_shadow_list(&m, &[(0x181, 0x3333), (0x183, 1), (0x18C, 0x8004)]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    gl_tex_quad(&m);
+    // The quad is 200 x 100 pixels: 25 x 12.5 a texel.
+    for s in [1u32, 3, 6, 7] {
+        let (x, y) = (100 + 25 * s as usize + 12, 150);
+        let l = s * 0x20;
+        assert_eq!(gl_px(&m, x, y), l << 16 | l << 8 | l, "texel ({s}, 4) at ({x}, {y})");
+    }
+    m.stop_engines();
+}
+
 /// SGIS_texture_select (traced, TyrQuake's lightmaps): one-component
 /// textures share cells, each in the slot TL_MODE bits 4:3 give at load
 /// and TEXMODE1 bits 8:7 when drawn. Two luminance textures on the same

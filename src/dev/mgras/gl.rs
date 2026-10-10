@@ -2437,7 +2437,12 @@ impl Gl {
             return;
         }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        let wpr = self.send_pixels[0] as usize * 4;
+        // A row is SEND_PIXELS words 0 + 1 (traced, direct loads of 64x64
+        // luminance-alpha and 128-wide RGBA strips: [0x10, 0x10, ..] with
+        // 128-byte rows, [0x40, 0x40, ..] with 512-byte rows; the TRAM
+        // restores send word 1 as 0). Reading word 0 alone halved the row:
+        // texel s took texel s / 2's bytes.
+        let wpr = (self.send_pixels[0] + self.send_pixels[1]) as usize * 4;
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         let (pitch, bpt) = if hdr_rows == h && wpr >= w { (wpr, wpr / w) } else { (0, bytes.len() / (w * h)) };
         let pitch = if pitch == 0 { w * bpt } else { pitch };
