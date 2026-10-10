@@ -317,6 +317,8 @@ const FILL_LINE_STIPPLE: u32 = 1 << 5;
 /// server's TrueColor value: pixel type 2, logic op copy enabled, draw
 /// buffer 0x01); bits 29:26 hold the logic op.
 const PP1_RGB24_BUFFER_A: u32 = 0x0C00_6204;
+/// `Gl::pixel_format`: INIT_FORMAT_VALUES has come (0 is a format).
+const PIXEL_FORMAT_SENT: u32 = 1 << 31;
 /// Area / GL line IR opcodes (provisional numbers, see rss.rs).
 const IR_AREA_LTOR: u32 = super::rss::OP_AREA_LTOR;
 const IR_AREA_RTOL: u32 = super::rss::OP_AREA_RTOL;
@@ -395,7 +397,8 @@ pub struct Gl {
     draw_bits_swapped: u32,
     draw_words: u32,
     buffer_count: u32,
-    /// The driver's PP1 pixel-format and buffer-size fields.
+    /// The driver's PP1 pixel-format and buffer-size fields
+    /// (INIT_FORMAT_VALUES), with `PIXEL_FORMAT_SENT` once it has sent them.
     pixel_format: u32,
     swapped: u32,
     /// The kernel has named the bank drawn into (`set_draw_bank`): swaps
@@ -1003,7 +1006,7 @@ impl Gl {
                 self.end_raster(sink);
             }
             tok::VERTEX4F => self.vertex(args_f32(d), sink),
-            tok::INIT_FORMAT_VALUES => self.set_state(|g| g.pixel_format = w0 & 0x2700, sink),
+            tok::INIT_FORMAT_VALUES => self.set_state(|g| g.pixel_format = PIXEL_FORMAT_SENT | w0 & 0x2700, sink),
             tok::INIT_RGB => self.ci = 0,
             tok::INIT_CI => self.ci = 1,
             tok::CLEAR_INDEX => self.clear_index = if w0 >> 16 == 0 { w0 } else { f32::from_bits(w0) as u32 },
@@ -2027,7 +2030,7 @@ impl Gl {
     /// canonical storage format; overlays retain the driver's CI8 format.
     fn pp1_base(&self) -> u32 {
         if self.rgb12_pair() {
-            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format | self.pair_field() << 14;
+            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format & 0x2700 | self.pair_field() << 14;
         }
         let pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
         match self.draw_mask() {
@@ -2035,7 +2038,7 @@ impl Gl {
             // pixel format.
             Some(m) if m & 0x70 == 0x40 => {
                 let pp1 = (pp1 & !((0x7F << 14) | (1 << 11))) | m << 14 | self.buffer_count << 11;
-                (pp1 & !0x2700) | self.pixel_format
+                (pp1 & !0x2700) | self.pixel_format & 0x2700
             }
             // A and B: draw field 3.
             Some(m) if m & 1 != 0 && m & 0xE != 0 => (pp1 & !(0x7F << 14)) | 3 << 14,
@@ -2044,12 +2047,16 @@ impl Gl {
     }
 
     /// An RGB context whose visual is 12 bits a pixel (INIT_FORMAT_VALUES
-    /// 0x100, traced with octahedra's double-buffered visual on a
-    /// HighImpact at 1280x1024): it draws 12-bit pixel pairs, buffer A in
-    /// a word's low half and B in its high half (see `rss::rgb12_pair`).
-    /// Its overlay drawing keeps the overlay's own format.
+    /// 0x100 or 0, traced on a HighImpact at 1280x1024: octahedra's and
+    /// electropaint's double-buffered visuals, XMAP formats 7 and 5): it
+    /// draws 12-bit pixel pairs, buffer A in a word's low half and B in
+    /// its high half (see `rss::rgb12_pair`). Its overlay drawing keeps
+    /// the overlay's own format.
     fn rgb12_pair(&self) -> bool {
-        self.ci == 0 && self.pixel_format == 0x100 && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+        self.ci == 0
+            && self.pixel_format & PIXEL_FORMAT_SENT != 0
+            && super::rss::rgb12_pair(self.pixel_format & 0x2700)
+            && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
     }
 
     /// A 12-bit pair context's draw field: 1 A, 2 B, 3 both (DRAW_BUFFER

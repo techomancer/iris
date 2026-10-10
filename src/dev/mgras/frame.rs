@@ -40,23 +40,18 @@ pub const CURSOR_MAX: usize = 64;
 pub struct MainMode {
     pub rgb: bool,
     pub cmap_base: u16,
-    /// 12-bit RGB pixel pairs (see `rss::rgb12_pair`): 0 no, 1 buffer A
-    /// (bits 11:0) always, 2 A or B (bits 23:12) by BUF_SELECT.
-    pub rgb12: u8,
+    /// 12-bit RGB pixel pairs (see `rss::rgb12_pair`): buffer A (bits
+    /// 11:0), or B (bits 23:12) when the window ID's BUF_SELECT bit is set.
+    pub rgb12: bool,
 }
 
-/// XMAP main mode formats (bits 4:0) that display 12-bit pixel pairs:
-/// 7 double-buffered (the kernel's swap flips BUF_SELECT: traced, GL's
-/// 12-bit double-buffered visual on a HighImpact at 1280x1024), 5 single.
-/// Provisional: inferred from the 6.5.22 PseudoColor server's window IDs
-/// (formats 4, 5, 7, 8) and the GL window's 7; 0x15 is GL's 24-bit
+/// XMAP main mode formats (bits 4:0) that display 12-bit pixel pairs,
+/// traced on a HighImpact at 1280x1024 with GL's 12-bit double-buffered
+/// visuals, the kernel's swaps flipping BUF_SELECT: 7 (octahedra, PP1
+/// pixel type 1) and 5 (electropaint, pixel type 0). 0x15 is GL's 24-bit
 /// double-buffered visual (two pages).
-pub(super) fn rgb12_format(mode: u32) -> u8 {
-    match mode & 0x1F {
-        7 => 2,
-        5 => 1,
-        _ => 0,
-    }
+pub(super) fn rgb12_format(mode: u32) -> bool {
+    matches!(mode & 0x1F, 5 | 7)
 }
 
 /// How a window ID's overlay planes display: off, or a non-zero 8-bit value
@@ -135,13 +130,11 @@ impl Frame {
             for x in 0..w {
                 let did = self.did_main[dst + x] & 31;
                 let b = select >> did & 1 != 0;
-                match self.main_mode[did as usize].rgb12 {
-                    0 if b => self.main[dst + x] = row_b[x],
-                    0 => {}
-                    k => {
-                        let half = if k == 2 && b { 12 } else { 0 };
-                        self.main[dst + x] = rss::from_rgb12(self.main[dst + x] >> half & 0xFFF);
-                    }
+                if self.main_mode[did as usize].rgb12 {
+                    let half = if b { 12 } else { 0 };
+                    self.main[dst + x] = rss::from_rgb12(self.main[dst + x] >> half & 0xFFF);
+                } else if b {
+                    self.main[dst + x] = row_b[x];
                 }
             }
             match overlay {

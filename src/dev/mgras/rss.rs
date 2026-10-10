@@ -1238,6 +1238,11 @@ impl Rss {
                     if op == OP_AREA_LTOR { "left to right" } else { "right to left" },
                     pos(0x003), pos(0x004), pos(0x005), pos(0x000))
             }
+            OP_GL_LINE => {
+                let pos = |n: u32| f32::from_bits(self.reg(n)) - 49151.5;
+                format!("GL LINE ({}, {})-({}, {}) config={:#x} {target}",
+                    pos(0x00C), pos(0x00D), pos(0x00E), pos(0x00F), self.reg(reg::GLINECONFIG))
+            }
             op => format!("IR {ir:#x} (opcode {op:#x} not modelled) fm={fm:#x} {target}"),
         }
     }
