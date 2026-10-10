@@ -773,6 +773,36 @@ fn gl_stencil_masks_a_later_draw() {
     m.stop_engines();
 }
 
+/// One pixel through glReadPixels as libGLcore sends it (traced): SAVE_RSS
+/// with the planes word, the block and transfer through RSS_REG_SHADOW /
+/// SET, GET_PIXELS, the host DMA, RESTORE_RSS. The first `n` bytes.
+fn gl_read_one(m: &Mgras, x: u64, y: u64, planes: u32, xfrmode: u64, n: u32) -> Vec<u8> {
+    fifo_token(m, 0xD2, &[0x11E2_3929, 0x100_0000, if planes != 0 { 0x1E0_00FF } else { 0xFF }, planes, 2]);
+    fifo_token(m, 0x7C, &[1, 4]);
+    write(m, 32, CFIFO, 0x8000_0010);
+    for w in [0x153, 0x0001_0001, 0x226, 0x47] {
+        write(m, 32, CFIFO, w);
+    }
+    fifo_token(m, 0x7C, &[2, 6]);
+    write(m, 32, CFIFO, 0x8000_0018);
+    for w in [0x46, x << 16 | y, 0x28E, 0x47, x << 16 | y, 0x290] {
+        write(m, 32, CFIFO, w);
+    }
+    fifo_token(m, 0x7F, &[2, 4]);
+    write(m, 32, CFIFO, 0x8000_0010);
+    for w in [0x158, 0x0001_0001, 0x159, xfrmode] {
+        write(m, 32, CFIFO, w);
+    }
+    fifo_token(m, 0xDB, &[0x4009]);
+    let mem = eram_dma_setup(m, 4);
+    fifo_dma(m, 0x0B, 0x9);
+    fifo_token(m, 0xA05, &[0x4009]);
+    fifo_token(m, 0xD3, &[]);
+    m.state_hash();
+    let b = mem.bytes.lock();
+    (0..n).map(|i| b.get(&(0x2000 + i)).copied().unwrap_or(0)).collect()
+}
+
 /// glReadPixels of GL_STENCIL_INDEX (traced, glprim --scene quadrants):
 /// SAVE_RSS's fourth word 0x1800000 names the stencil planes, the transfer
 /// is one byte a pixel (format 1, type 0), and the bytes are the ZST
@@ -787,32 +817,7 @@ fn gl_read_stencil_index() {
     fifo_token(&m, 0x42, &[0, 0, 2]);
     gl_tri(&m, [0.0, 1.0, 0.0], [[100.0, 50.0, 0.0], [300.0, 50.0, 0.0], [200.0, 250.0, 0.0]]);
     fifo_token(&m, 0x6F, &[0]);
-    let read = |x: u64, y: u64, planes: u32| -> u8 {
-        fifo_token(&m, 0xD2, &[0x11E2_3929, 0x100_0000, 0x1E0_00FF, planes, 2]);
-        fifo_token(&m, 0x7C, &[1, 4]);
-        write(&m, 32, CFIFO, 0x8000_0010);
-        for w in [0x153, 0x0001_0001, 0x226, 0x47] {
-            write(&m, 32, CFIFO, w);
-        }
-        fifo_token(&m, 0x7C, &[2, 6]);
-        write(&m, 32, CFIFO, 0x8000_0018);
-        for w in [0x46, x << 16 | y, 0x28E, 0x47, x << 16 | y, 0x290] {
-            write(&m, 32, CFIFO, w);
-        }
-        fifo_token(&m, 0x7F, &[2, 4]);
-        write(&m, 32, CFIFO, 0x8000_0010);
-        for w in [0x158, 0x0001_0001, 0x159, 0x0040_0010] {
-            write(&m, 32, CFIFO, w);
-        }
-        fifo_token(&m, 0xDB, &[0x4009]);
-        let mem = eram_dma_setup(&m, 4);
-        fifo_dma(&m, 0x0B, 0x9);
-        fifo_token(&m, 0xA05, &[0x4009]);
-        fifo_token(&m, 0xD3, &[]);
-        m.state_hash();
-        let b = mem.bytes.lock();
-        b.get(&0x2000).copied().unwrap_or(0)
-    };
+    let read = |x: u64, y: u64, planes: u32| gl_read_one(&m, x, y, planes, 0x0040_0010, 1)[0];
     assert_eq!(read(200, 100, 0x180_0000), 3, "inside the triangle");
     assert_eq!(read(20, 20, 0x180_0000), 0, "cleared");
     // The same transfer with the colour planes: red's byte as before.
@@ -2644,6 +2649,34 @@ fn gl_12bit_double_buffer_draws_word_halves() {
         assert_eq!(word(&m), 0x00F_F00, "format {format:#x}, bank 0: blue in A, B kept");
         m.stop_engines();
     }
+}
+
+/// glReadPixels of a 12-bit double-buffered window whose DRBpointers do
+/// name a separate B page (1024x768, traced glprim --visual 4,4,4,4): both
+/// buffers are still halves of A's page, so the read stays there and the
+/// read field picks the half.
+#[test]
+fn gl_12bit_pairs_read_from_their_halves() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x2E0 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0, 0]);
+    fifo_token(&m, 0x49, &[2, 1, 0]);
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    fifo_token(&m, 0x98, &[0, 0]);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
+    gl_full_quad(&m);
+    let rgba8 = 0x0041_0080;
+    fifo_token(&m, 0x44, &[0, 0, 0x404]);
+    let front = gl_read_one(&m, 50, 50, 0, rgba8, 3);
+    fifo_token(&m, 0x44, &[0, 0, 0x405]);
+    let back = gl_read_one(&m, 50, 50, 0, rgba8, 3);
+    let mut got = [front, back];
+    got.sort();
+    assert_eq!(got, [vec![0, 0, 0xFF], vec![0xFF, 0, 0]], "one buffer red, the other blue");
+    m.stop_engines();
 }
 
 /// The bank comes from the kernel (VALIDATE_BANKS), not from counting

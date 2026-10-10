@@ -1610,7 +1610,10 @@ impl Gl {
         } else {
             let w = self.window.drb;
             let (a, b) = (w & 0x3FF, (w >> 10) & 0x3FF);
-            (w & !0x3FF) | if (self.read_back != 0) != (self.swapped != 0) { b } else { a }
+            // 12-bit pairs: both buffers are halves of A's page (the read
+            // field below picks the half), whatever DRB's B page says.
+            let back = (self.read_back != 0) != (self.swapped != 0) && !self.rgb12_pair();
+            (w & !0x3FF) | if back { b } else { a }
         };
         sink.rss_write(re::DRBPOINTERS, drb, false);
         if stencil {
