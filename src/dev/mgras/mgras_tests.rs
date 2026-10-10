@@ -2693,6 +2693,33 @@ fn gl_12bit_pairs_read_from_their_halves() {
     m.stop_engines();
 }
 
+/// GL's RGBA 12,12,12 visual (INIT_FORMAT_VALUES 0x2300, traced with
+/// gltest --visual 12,12,12): 36-bit pixels that keep twelve bits a
+/// component, drawn to the second page as GL_BACK [4, 1] like 24-bit.
+#[test]
+fn gl_12_12_12_keeps_twelve_bits() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0x2300, 0x2300]);
+    fifo_token(&m, 0x49, &[4, 1, 0]);
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [0.25, 0.5, 1.0 / 3.0, 1.0]);
+    gl_full_quad(&m);
+    let word = |p: u32| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(p, super::pixmem::Kind::Wide, 0x31E), 50, 50)
+    };
+    let c = super::rss::unpack36(word(0x140));
+    let want = [1024, 2048, 1365];
+    for k in 0..3 {
+        assert!(c[k].abs_diff(want[k]) <= 1, "component {k}: {:#x}, want about {:#x}", c[k], want[k]);
+    }
+    assert_eq!(word(0x240) & 0xFF_FFFF, 0, "the front page untouched");
+    m.stop_engines();
+}
+
 /// The bank comes from the kernel (VALIDATE_BANKS), not from counting
 /// swaps: a swap the kernel did not pair with a bank (or one the GE never
 /// saw) leaves the drawing where the kernel last said.

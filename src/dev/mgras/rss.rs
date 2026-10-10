@@ -421,6 +421,34 @@ pub(super) fn rgb_pixtype(pp1fillmode: u32) -> bool {
     matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2)
 }
 
+/// 36-bit RGB pixels (pixel type 3 with bit 13): 12 bits a component,
+/// the top 8 of each where 8-8-8 keeps them (red 7:0, green 15:8, blue
+/// 23:16) and the low nibbles in planes 35:24 (red 27:24, green 31:28,
+/// blue 35:32; their order is our guess). The X server draws its 24-bit
+/// windows in this type (fill mode 0xC006304) through plane mask 0xFFFFFF,
+/// the 8-bit parts; GL's RGBA 12,12,12 visual (INIT_FORMAT_VALUES 0x2300)
+/// writes all 36 planes (libGLcore: LSB masks all ones, MSBs 0xF), and its
+/// window's XMAP format is 0x19, not 24-bit's 0x15. Double buffered like
+/// 24-bit: a second page (DRAW_BUFFER [4, 1]).
+pub(super) fn rgb36(pp1fillmode: u32) -> bool {
+    (pp1fillmode >> 8) & 7 == 3 && pp1fillmode & (1 << 13) != 0
+}
+
+/// Three 12-bit components (red first) as a 36-bit pixel.
+pub(super) fn pack36(c: [u32; 3]) -> u64 {
+    (0..3).fold(0u64, |w, k| w | ((c[k] >> 4 & 0xFF) as u64) << (8 * k) | ((c[k] & 0xF) as u64) << (24 + 4 * k))
+}
+
+/// A 36-bit pixel's three 12-bit components.
+pub(super) fn unpack36(w: u64) -> [u32; 3] {
+    [0, 1, 2].map(|k| ((w >> (8 * k) & 0xFF) as u32) << 4 | (w >> (24 + 4 * k) & 0xF) as u32)
+}
+
+/// An 8-8-8 colour as a 36-bit pixel, components widened (c << 4 | c >> 4).
+pub(super) fn rgb36_from8(v: u32) -> u64 {
+    pack36([0, 1, 2].map(|k| { let c = (v >> (8 * k)) & 0xFF; c << 4 | c >> 4 }))
+}
+
 /// 12-bit RGB pixels (pixel type 0 or 1, buffer size bit 13 clear) come in
 /// pairs: one word holds buffer A in bits 11:0 and buffer B in bits 23:12,
 /// on one page. The pixel processors put the colour in both halves and
@@ -1048,7 +1076,15 @@ impl Rss {
     /// with other pixel types; colour-index drawing masks 8 or 12 planes, or
     /// all 32 when the PROM and kernel draw).
     pub(super) fn rgb_mode(&self) -> bool {
-        rgb_pixtype(self.reg(reg::PP1FILLMODE)) || self.reg(reg::COLORMASKLSBSA) == 0xFF_FFFF
+        rgb_pixtype(self.reg(reg::PP1FILLMODE)) || self.reg(reg::COLORMASKLSBSA) == 0xFF_FFFF || self.deep36()
+    }
+
+    /// A 36-bit RGB write that reaches the low-nibble planes (35:24):
+    /// 12:12:12 drawing, which keeps all twelve bits. Writes of the 8-bit
+    /// planes alone (the X server's) store the value as it is.
+    pub(super) fn deep36(&self) -> bool {
+        let lsb = self.reg(reg::COLORMASKLSBSA) | self.reg(reg::COLORMASKLSBSB);
+        rgb36(self.reg(reg::PP1FILLMODE)) && (lsb & 0xFF00_0000 != 0 || self.reg(reg::COLORMASKMSBS) & 0xF != 0)
     }
 
     /// Window coordinates to framebuffer coordinates.
@@ -1147,6 +1183,10 @@ impl Rss {
 
     fn put_in(&mut self, b: Buffer, x: i32, y: i32, v: u32, back: bool) {
         let pp1 = self.reg(reg::PP1FILLMODE);
+        if b.kind == Kind::Wide && self.deep36() {
+            self.put_in36(b, x, y, rgb36_from8(v), back);
+            return;
+        }
         let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA });
         // A write through all planes (window moves copy the screen that way,
         // 24 bits a pixel) keeps the whole value; so does RGB.
@@ -1155,8 +1195,9 @@ impl Rss {
         if let (Kind::Wide, Some(pair)) = (b.kind, Pair::of(pp1)) {
             let v = pair.pack(pp1, v, x, y);
             let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 { logic_op(pp1 >> 26, v, old) } else { v };
-            // ColorMaskMSBs are planes 31:24: alpha, and 5:5:5's B colour.
-            let mask = lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24;
+            // ColorMaskLSBs are planes 31:0 (libGLcore's pair masks name
+            // the alpha bits there: 0x0F000FFF, 0x40007FFF).
+            let mask = lsb;
             self.mem.put(&b, x as u32, y as u32, ((old & !mask) | (v & mask)) as u64);
             return;
         }
@@ -1173,7 +1214,7 @@ impl Rss {
             let mask = if draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 };
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
-            let mask = if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24 };
+            let mask = lsb;
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && matches!((pp1 >> 8) & 7, 4 | 6) {
             let mask = lsb & 0xFFF;
@@ -1182,6 +1223,42 @@ impl Rss {
             v
         };
         self.mem.put(&b, x as u32, y as u32, v as u64);
+    }
+
+    /// A 12:12:12 write (see `rgb36`) through the 36-bit plane mask:
+    /// ColorMaskLSBs for planes 31:0, ColorMaskMSBs for 35:32 (libGLcore
+    /// writes the visual's 0xF there and all ones to the LSB masks).
+    fn put_in36(&mut self, b: Buffer, x: i32, y: i32, v: u64, back: bool) {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA }) as u64;
+        let mask = lsb | ((self.reg(reg::COLORMASKMSBS) & 0xF) as u64) << 32;
+        let old = self.mem.get(&b, x as u32, y as u32);
+        let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 {
+            let op = pp1 >> 26;
+            logic_op(op, v as u32, old as u32) as u64 | (logic_op(op, (v >> 32) as u32, (old >> 32) as u32) as u64) << 32
+        } else {
+            v
+        };
+        self.mem.put(&b, x as u32, y as u32, (old & !mask) | (v & mask));
+    }
+
+    /// `put` of a 12:12:12 pixel: the target buffer, and B as well for
+    /// draw field 3.
+    fn put36(&mut self, x: i32, y: i32, v: u64) {
+        let field = draw_buffer(self.reg(reg::PP1FILLMODE));
+        if !self.visible(x, y) || field == DRAW_CID {
+            return;
+        }
+        let b = self.target();
+        self.put_in36(b, x, y, v, field == DRAW_B);
+        if field == DRAW_A_AND_B {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.put_in36(b2, x, y, v, true);
+                }
+            }
+        }
     }
 
     /// Drawing goes to the overlay planes.
@@ -1218,6 +1295,9 @@ impl Rss {
             return w >> 24;
         }
         let pp1 = self.reg(reg::PP1FILLMODE);
+        if rgb36(pp1) && read_buffer(pp1) != READ_OVERLAY {
+            return w & 0xFF_FFFF;
+        }
         match (read_buffer(pp1), Pair::of(pp1)) {
             (r @ (0 | READ_B), Some(pair)) => pair.unpack(w, r == READ_B),
             _ => w,
@@ -1795,6 +1875,10 @@ impl Rss {
     fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
         use fixed::{mul, ONE};
         let dst = self.mem.get(&b, ux, uy) as u32;
+        if b.kind == Kind::Wide && self.deep36() {
+            self.fragment_color36(b, ux, uy, rgba, pp1, back);
+            return;
+        }
         // Pixel pairs: blend with this buffer's half and alpha.
         let dst = match (b.kind, Pair::of(pp1)) {
             (Kind::Wide, Some(pair)) => pair.unpack(dst, back),
@@ -1835,7 +1919,55 @@ impl Rss {
         self.put_in(b, ux as i32, uy as i32, src, back);
     }
 
+    /// `fragment_color` into a 12:12:12 buffer: blending reads and the
+    /// result keeps all twelve bits a component (no alpha planes: the
+    /// destination alpha is 1).
+    fn fragment_color36(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
+        use fixed::{mul, ONE};
+        let dst = self.mem.get(&b, ux, uy);
+        let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
+        let blend = self.reg(reg::BLENDFACTOR);
+        let c = if blend & BLEND_ENABLE != 0 && !logic {
+            let d = unpack36(dst).map(|c| (c << 16) as i32);
+            let d = [d[0], d[1], d[2], ONE];
+            let f = |code: u32, k: usize| -> i32 {
+                match code {
+                    0 => 0,
+                    1 => ONE,
+                    2 => rgba[k],
+                    3 => ONE - rgba[k],
+                    4 => rgba[3],
+                    5 => ONE - rgba[3],
+                    6 => d[3],
+                    7 => ONE - d[3],
+                    8 => d[k],
+                    9 => ONE - d[k],
+                    10 => if k == 3 { ONE } else { rgba[3].min(ONE - d[3]) },
+                    _ => ONE,
+                }
+            };
+            let (sf, df) = (blend & 0xF, (blend >> 4) & 0xF);
+            [0, 1, 2, 3].map(|k| fixed::clamp(mul(rgba[k], f(sf, k)).wrapping_add(mul(d[k], f(df, k)))))
+        } else {
+            rgba
+        };
+        let v = pack36([0, 1, 2].map(|k| (fixed::clamp(c[k]) >> 16) as u32));
+        self.put_in36(b, ux as i32, uy as i32, v, back);
+    }
+
     fn fill(&mut self, b: &Block) {
+        // 12:12:12 fast fills keep the fill colour's twelve bits.
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        if self.deep36() && !self.draws_overlay() && self.reg(reg::FILLMODE) & FILL_FAST != 0 {
+            let v = pack36([0, 1, 2].map(|k| self.reg(reg::FILL_COLOR_R + k) & 0xFFF));
+            for row in 0..b.rows() {
+                for col in 0..b.cols() {
+                    let (x, y) = self.block_px(b, col, row);
+                    self.put36(x, y, v);
+                }
+            }
+            return;
+        }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::fill(self, b) {
             return;
@@ -1972,7 +2104,16 @@ impl Rss {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
         // Depth: the ZST word as it is, never a 12-bit pair's half.
         let px = if x.format == DEPTH_FORMAT { self.get_word(fx, fy) } else { self.get(fx, fy) };
-        let v = to_host(x.format, px);
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let v = match x.format {
+            // 16-bit components from a 12:12:12 pixel: all twelve bits.
+            (7, 1) | (8, 1) if rgb36(pp1) && (0..WIDTH as i32).contains(&fx) && (0..HEIGHT as i32).contains(&fy) => {
+                let u = unpack36(self.mem.get(&self.source(), fx as u32, fy as u32));
+                let c = |k: usize| (u[k] << 4 | u[k] >> 8) as u64;
+                if x.format == (7, 1) { c(0) << 32 | c(1) << 16 | c(2) } else { c(0) << 48 | c(1) << 32 | c(2) << 16 | 0xFFFF }
+            }
+            _ => to_host(x.format, px),
+        };
         (v >> (8 * (x.bpp - 1 - i))) as u8
     }
 
@@ -2286,7 +2427,7 @@ mod tests {
 
     /// Pixel type 1 pairs are 5:5:5 with a 1-bit alpha (libGLcore's plane
     /// masks 0x40007FFF / 0xBFFF8000): A in 14:0 and bit 30, B in 29:15
-    /// and bit 31; ColorMaskMSBs cover B's top colour bits and the alphas.
+    /// and bit 31, all under the 32-bit ColorMaskLSBs.
     #[test]
     fn rgb555_pairs_with_alpha_planes() {
         let mut r = x_server();
@@ -2294,9 +2435,9 @@ mod tests {
         r.write(reg::FILLMODE, FILL_FAST, false);
         let fill = |r: &mut Rss, field: u32, mask: u32, rgba: [u32; 4]| {
             r.write(reg::PP1FILLMODE, 0x0C00_0104 | field << 14, false);
-            r.write(reg::COLORMASKLSBSA, mask & 0xFF_FFFF, false);
-            r.write(reg::COLORMASKLSBSB, mask & 0xFF_FFFF, false);
-            r.write(reg::COLORMASKMSBS, mask >> 24, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::COLORMASKLSBSB, mask, false);
+            r.write(reg::COLORMASKMSBS, 0, false);
             for (k, c) in rgba.iter().enumerate() {
                 r.write(reg::FILL_COLOR_R + k as u32, *c, false);
             }
@@ -2310,6 +2451,35 @@ mod tests {
         assert_eq!(r.get(10, y), 0xFF00_0084, "A: red widened (0x10 -> 0x84), alpha 0xFF");
         r.write(reg::PP1FILLMODE, 0x0C00_0104 | 1 << 21, false);
         assert_eq!(r.get(10, y), 0x00FF_0000, "B: blue, alpha 0");
+    }
+
+    /// 36-bit RGB (pixel type 3, bit 13): X's 24-bit fills write the 8-bit
+    /// planes; a 12:12:12 write through all 36 planes (LSBs all ones, MSBs
+    /// 0xF) keeps the low nibbles in 35:24, and the 8-bit parts stay where
+    /// 24-bit readers look.
+    #[test]
+    fn rgb36_keeps_twelve_bits() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_6304, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        for (k, c) in [0x123u32, 0x456, 0x789].iter().enumerate() {
+            r.write(reg::FILL_COLOR_R + k as u32, *c, false);
+        }
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKMSBS, 0xF, false);
+        block(&mut r, 3, 3, 3, 3);
+        let w = r.mem.get(&main_buffer(), 3, (SCREEN_H - 1 - 3) as u32);
+        assert_eq!(w, 0x9_6378_4512, "8-bit parts 0x784512, nibbles 9 6 3 in 35:24");
+        assert_eq!(unpack36(w), [0x123, 0x456, 0x789]);
+        let y = (SCREEN_H - 1 - 3) as i32;
+        assert_eq!(r.get(3, y), 0x78_4512, "reads see 8-8-8");
+        // X's 24-plane fill over it: the 8-bit parts (we store X's value
+        // as it is, nibbles cleared; the board presumably keeps them).
+        r.write(reg::COLORMASKLSBSA, 0xFF_FFFF, false);
+        r.write(reg::COLORMASKMSBS, 0, false);
+        r.write(reg::FILL_COLOR_R, 0xFF0, false);
+        block(&mut r, 3, 3, 3, 3);
+        assert_eq!(r.mem.get(&main_buffer(), 3, y as u32) & 0xFF_FFFF, 0x78_45FF);
     }
 
     /// Dithered 12-bit pairs: a grey of 0x7F (7.5 in 4 bits) splits evenly

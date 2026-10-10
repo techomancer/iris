@@ -2061,7 +2061,13 @@ impl Gl {
             let dither = if self.dither != 0 { super::rss::PP1_DITHER } else { 0 };
             return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format & 0x2700 | self.pair_field() << 14 | dither;
         }
-        let pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
+        let pp1 = if self.ci != 0 {
+            (PP1_RGB24_BUFFER_A & !0x700) | 0x600
+        } else if self.rgb36() {
+            (PP1_RGB24_BUFFER_A & !0x2700) | 0x2300
+        } else {
+            PP1_RGB24_BUFFER_A
+        };
         match self.draw_mask() {
             // The overlay: its draw field, buffer count and the driver's
             // pixel format.
@@ -2085,6 +2091,15 @@ impl Gl {
         self.ci == 0
             && self.pixel_format & PIXEL_FORMAT_SENT != 0
             && super::rss::rgb12_pair(self.pixel_format & 0x2700)
+            && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+    }
+
+    /// An RGB context whose visual is 12:12:12 (INIT_FORMAT_VALUES 0x2300,
+    /// see `rss::rgb36`).
+    fn rgb36(&self) -> bool {
+        self.ci == 0
+            && self.pixel_format & PIXEL_FORMAT_SENT != 0
+            && self.pixel_format & 0x2700 == 0x2300
             && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
     }
 
@@ -2124,12 +2139,18 @@ impl Gl {
                 (if b { c << pair.shift_b() } else { c }) | (cm >> 3 & 1) * (((1 << aw) - 1) << a)
             };
             let f = self.pair_field();
-            let m = (f & 1) * half(false) | (f >> 1 & 1) * half(true);
-            return (m & 0xFF_FFFF, m >> 24);
+            return ((f & 1) * half(false) | (f >> 1 & 1) * half(true), 0);
         }
         if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
         let cm = self.color_mask;
-        ((cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000, (cm >> 3 & 1) * 0xFF)
+        // ColorMaskLSBs are planes 31:0, ColorMaskMSBs 35:32 (libGLcore:
+        // 8,8,8,8 all ones and 0; 12,12,12 all ones and 0xF).
+        if self.rgb36() {
+            // Each component: its 8-bit planes and its low nibble's.
+            let m = (0..3).fold(0u64, |m, k| m | (cm >> k & 1) as u64 * (0xFF << (8 * k) | 0xF << (24 + 4 * k)));
+            return (m as u32, (m >> 32) as u32);
+        }
+        ((cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000 | (cm >> 3 & 1) * 0xFF00_0000, 0)
     }
 
     /// glClear's colour part: the clear colour through the colour mask.
@@ -2140,7 +2161,8 @@ impl Gl {
             self.clear_block([self.clear_index & 0xFFF, 0, 0, 0], lsb, msb, drb, sink);
             return;
         }
-        let q = |c: f32| ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << 4;
+        // Fill colours are 12 bits: 12:12:12 keeps them all.
+        let q = |c: f32| if self.rgb36() { (c.clamp(0.0, 1.0) * 4095.0).round() as u32 } else { ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << 4 };
         let c = self.clear_color;
         self.clear_block([q(c[0]), q(c[1]), q(c[2]), q(c[3])], lsb, msb, drb, sink);
     }
@@ -2159,7 +2181,7 @@ impl Gl {
         } else {
             let s = self.clear_stencil << 4;
             let m = self.st_wmask;
-            self.clear_block([0, 0, 0, s], 0, m, zst, sink);
+            self.clear_block([0, 0, 0, s], m << 24, 0, zst, sink);
         }
     }
 

@@ -267,10 +267,9 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     let pair = b.kind == Kind::Wide && rss::rgb12_pair(pp1);
     let mask = if b.kind == Kind::Overlay {
         if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 }
-    } else if pair {
-        lsb & 0xFF_FFFF | (msbs & 0xFF) << 24
-    } else if ptype == 2 {
-        if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (msbs & 0xFF) << 24 }
+    } else if pair || ptype == 2 {
+        // Planes 31:0 (ColorMaskMSBs are 35:32, outside these pixels).
+        lsb
     } else if matches!(ptype, 4 | 6) {
         lsb & 0xFFF
     } else {
@@ -478,6 +477,10 @@ const BIT_SKIP_LAST: u32 = 4;
 /// primitive's own fields. Returns the key bits the primitive adds to the
 /// cached key (`key`), or None when no shader covers it.
 pub(super) fn prepare(rss: &mut Rss, a: &Args) -> Option<u32> {
+    // 12:12:12 pixels need the 36-bit word: the interpreter draws them.
+    if rss.deep36() {
+        return None;
+    }
     RasterCtx::set_pointers(rss);
     if rss.jit.ok2d == 0 {
         // A GL primitive key, to keep the GL fields when packed.
