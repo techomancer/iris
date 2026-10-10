@@ -13,7 +13,77 @@ float xRot = 0.0f;
 float yRot = 0.0f;
 float zRot = 0.0f;
 float scale = 1.0f;
-int currentObject = 0; // 0=Triangle, 1=Rectangle, 2=Cube, 3=Octahedron
+int currentObject = 0; // 0=Triangle, 1=Rectangle, 2=Cube, 3=Octahedron, 4=Gradient
+
+/* --visual R,G,B[,A] (exact bits, no A = alpha 0), --visualid ID, --db */
+static int want_rgba[4] = { -1, -1, -1, 0 };
+static long want_vid = -1;
+static int want_db = 0;
+
+/* Black to full ramps of red, green, blue and grey in four bands, drawn
+   flat on the screen whatever the rotation: shows a visual's colour
+   resolution (4-bit components give 16 visible steps, 5-bit 32). */
+void drawGradient() {
+    static const float c[4][3] = { {1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 1} };
+    int k;
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, 1.0, 0.0, 4.0, -1.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+    glBegin(GL_QUADS);
+    for (k = 0; k < 4; k++) {
+        float y0 = (float)(3 - k), y1 = y0 + 0.9f;
+        glColor3f(0.0f, 0.0f, 0.0f); glVertex2f(0.0f, y0);
+        glColor3f(c[k][0], c[k][1], c[k][2]); glVertex2f(1.0f, y0);
+        glColor3f(c[k][0], c[k][1], c[k][2]); glVertex2f(1.0f, y1);
+        glColor3f(0.0f, 0.0f, 0.0f); glVertex2f(0.0f, y1);
+    }
+    glEnd();
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+}
+
+/* The visual for --visual / --visualid / --db: exact colour bits (or the
+   deepest RGB), the buffering asked for, a depth buffer unless nodepth.
+   NULL when none fits. */
+static XVisualInfo *pick_visual(Display *dpy, int nodepth) {
+    XVisualInfo tmpl, *vs, *best = NULL, *one;
+    int n, i, best_score = -1;
+    tmpl.screen = DefaultScreen(dpy);
+    vs = XGetVisualInfo(dpy, VisualScreenMask, &tmpl, &n);
+    for (i = 0; vs && i < n; i++) {
+        int gl = 0, rgba = 0, level = 0, r = 0, g = 0, b = 0, a = 0, db = 0, z = 0, score;
+        glXGetConfig(dpy, &vs[i], GLX_USE_GL, &gl);
+        if (!gl) continue;
+        glXGetConfig(dpy, &vs[i], GLX_RGBA, &rgba);
+        glXGetConfig(dpy, &vs[i], GLX_LEVEL, &level);
+        glXGetConfig(dpy, &vs[i], GLX_RED_SIZE, &r);
+        glXGetConfig(dpy, &vs[i], GLX_GREEN_SIZE, &g);
+        glXGetConfig(dpy, &vs[i], GLX_BLUE_SIZE, &b);
+        glXGetConfig(dpy, &vs[i], GLX_ALPHA_SIZE, &a);
+        glXGetConfig(dpy, &vs[i], GLX_DOUBLEBUFFER, &db);
+        glXGetConfig(dpy, &vs[i], GLX_DEPTH_SIZE, &z);
+        if (want_vid >= 0) {
+            if ((long)vs[i].visualid != want_vid) continue;
+            score = 0;
+        } else {
+            if (!rgba || level != 0 || db != want_db) continue;
+            if (want_rgba[0] >= 0 && (r != want_rgba[0] || g != want_rgba[1] || b != want_rgba[2] || a != want_rgba[3]))
+                continue;
+            score = (want_rgba[0] >= 0 ? 0 : 4096 - 64 * (r + g + b)) + (nodepth ? (z != 0) : (z == 0)) * 2;
+        }
+        if (best_score < 0 || score < best_score) { best_score = score; best = &vs[i]; }
+    }
+    one = best ? malloc(sizeof(*one)) : NULL;
+    if (one) *one = *best;
+    if (vs) XFree(vs);
+    return one;
+}
 
 void drawTriangle() {
     glBegin(GL_TRIANGLES);
@@ -368,7 +438,8 @@ int main(int argc, char *argv[]) {
             warmup = atoi(argv[++i]);
             if (warmup < 0) warmup = 0;
         } else if (strcmp(argv[i], "--object") == 0 && i + 1 < argc) {
-            currentObject = atoi(argv[++i]) & 3;
+            currentObject = atoi(argv[++i]);
+            if (currentObject < 0 || currentObject > 4) currentObject = 0;
         } else if (strcmp(argv[i], "--rot") == 0 && i + 1 < argc) {
             sscanf(argv[++i], "%f,%f,%f", &xRot, &yRot, &zRot);
         } else if (strcmp(argv[i], "--spin") == 0 && i + 1 < argc) {
@@ -379,6 +450,14 @@ int main(int argc, char *argv[]) {
             cull = 1;
         } else if (strcmp(argv[i], "--hold") == 0 && i + 1 < argc) {
             hold_ms = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--visual") == 0 && i + 1 < argc) {
+            int k = sscanf(argv[++i], "%d%*[,:]%d%*[,:]%d%*[,:]%d", &want_rgba[0], &want_rgba[1], &want_rgba[2], &want_rgba[3]);
+            if (k < 3) { fprintf(stderr, "bad --visual\n"); exit(2); }
+            if (k == 3) want_rgba[3] = 0;
+        } else if (strcmp(argv[i], "--visualid") == 0 && i + 1 < argc) {
+            want_vid = strtol(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--db") == 0) {
+            want_db = 1;
         } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             frames = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -390,7 +469,12 @@ int main(int argc, char *argv[]) {
                    "  --warmup N         N untimed runs first (lets the JIT compile)\n"
                    "  --depth            enable depth testing (Z-buffered fill rate)\n"
                    "  (no option)        interactive mode (depth test on if the visual has Z)\n"
-                   "  --object N         0 triangle, 1 rectangle, 2 cube, 3 octahedron\n"
+                   "  --object N         0 triangle, 1 rectangle, 2 cube, 3 octahedron,\n"
+                   "                     4 gradient (colour ramps: shows the visual's bits)\n"
+                   "  --visual R,G,B[,A] exactly these colour bits (no A: alpha 0), e.g.\n"
+                   "                     4,4,4,4 5,5,5,1 8,8,8,8 12,12,12\n"
+                   "  --visualid ID      this GLX visual (see glprim --listvisuals)\n"
+                   "  --db               double buffered, glXSwapBuffers each frame\n"
                    "  --rot X,Y,Z        initial rotation in degrees\n"
                    "  --spin DX,DY,DZ    rotate by this much every frame (no keyboard needed)\n"
                    "  --nodepth          interactive mode without the depth test\n"
@@ -410,7 +494,15 @@ int main(int argc, char *argv[]) {
     }
 
     root = DefaultRootWindow(dpy);
-    vi = glXChooseVisual(dpy, 0, att);
+    if (want_rgba[0] >= 0 || want_vid >= 0 || want_db) {
+        vi = pick_visual(dpy, nodepth);
+        if (vi == NULL) {
+            printf("No visual with rgba %d,%d,%d,%d db=%d (or id %#lx)\n",
+                   want_rgba[0], want_rgba[1], want_rgba[2], want_rgba[3], want_db, want_vid);
+            exit(1);
+        }
+    } else
+        vi = glXChooseVisual(dpy, 0, att);
     if(vi == NULL) {
         printf("24-bit depth buffer visual not found, trying 16-bit...\n");
         vi = glXChooseVisual(dpy, 0, att_fb1);
@@ -449,9 +541,16 @@ int main(int argc, char *argv[]) {
        then report a perfectly ordinary number that measures nothing at all, so
        check the granted config rather than trusting the request. */
     {
-        int granted = 0;
+        int granted = 0, r = 0, g = 0, b = 0, a = 0, db = 0;
         glXGetConfig(dpy, vi, GLX_DEPTH_SIZE, &granted);
-        printf("Visual: depth %d bits\n", granted);
+        glXGetConfig(dpy, vi, GLX_RED_SIZE, &r);
+        glXGetConfig(dpy, vi, GLX_GREEN_SIZE, &g);
+        glXGetConfig(dpy, vi, GLX_BLUE_SIZE, &b);
+        glXGetConfig(dpy, vi, GLX_ALPHA_SIZE, &a);
+        glXGetConfig(dpy, vi, GLX_DOUBLEBUFFER, &db);
+        want_db = db;
+        printf("Visual 0x%lx: rgba %d,%d,%d,%d, %s, depth %d bits\n",
+               (unsigned long)vi->visualid, r, g, b, a, db ? "double" : "single", granted);
         if (depth && granted == 0) {
             printf("ERROR: --depth requested but this visual has no depth buffer;\n"
                    "       the depth test would silently pass every fragment and the\n"
@@ -564,9 +663,11 @@ int main(int argc, char *argv[]) {
             case 1: drawRectangle(); break;
             case 2: drawCube(); break;
             case 3: drawOctahedron(); break;
+            case 4: drawGradient(); break;
         }
 
-        glFlush();
+        if (want_db) glXSwapBuffers(dpy, win);
+        else glFlush();
         xRot += spin[0];
         yRot += spin[1];
         zRot += spin[2];
