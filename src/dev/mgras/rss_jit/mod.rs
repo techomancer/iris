@@ -268,7 +268,7 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     let mask = if b.kind == Kind::Overlay {
         if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 }
     } else if pair {
-        lsb & 0xFF_FFFF
+        lsb & 0xFF_FFFF | (msbs & 0xFF) << 24
     } else if ptype == 2 {
         if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (msbs & 0xFF) << 24 }
     } else if matches!(ptype, 4 | 6) {
@@ -314,7 +314,10 @@ fn common(rss: &mut Rss) -> PipeKey {
     };
     let ptype = (pp1 >> 8) & 7;
     let pix = match ptype {
-        _ if rss::rgb12_pair(pp1) => Pix::of_pair(field == rss::DRAW_B, pp1 & rss::PP1_DITHER != 0),
+        _ if rss::rgb12_pair(pp1) => {
+            let layout = rss::Pair::of(pp1).unwrap_or(rss::Pair::P444);
+            Pix::of_pair(layout, field == rss::DRAW_B, pp1 & rss::PP1_DITHER != 0)
+        }
         2 => Pix::Rgba8,
         4 | 6 => Pix::Ci12,
         _ => Pix::Plain,

@@ -442,11 +442,94 @@ pub(super) fn rgb12_pair(pp1fillmode: u32) -> bool {
 /// sets this bit in any trace. The GL front-end sets it.
 pub(super) const PP1_DITHER: u32 = 1 << 3;
 
-/// The 12-bit pixel for an 8-8-8 colour at framebuffer (x, y), dithered
-/// when the fill mode says so.
-pub(super) fn rgb12_pixel(pp1fillmode: u32, v: u32, x: i32, y: i32) -> u32 {
-    use crate::dev::ng1::rex3_generic::{bayer_pack, rgb24_to_rgb12_dither};
-    if pp1fillmode & PP1_DITHER != 0 { rgb24_to_rgb12_dither(bayer_pack(v, x, y)) } else { to_rgb12(v) }
+/// The two pixel-pair layouts (libGLcore InitFormatValues' plane masks,
+/// A | B): pixel type 0 holds 4:4:4 RGB in bits 11:0 / 23:12 and a 4-bit
+/// alpha in 27:24 / 31:28 (0x0F000FFF | 0xF0FFF000, the RGBA 4,4,4,4
+/// visual and the X server's 12-bit windows); pixel type 1 holds 5:5:5 RGB
+/// in 14:0 / 29:15 and a 1-bit alpha in 30 / 31 (0x40007FFF | 0xBFFF8000,
+/// the RGBA 5,5,5,1 visual). Red is lowest (as X's 12-bit host format;
+/// unconfirmed for 5:5:5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pair {
+    P444,
+    P555,
+}
+
+impl Pair {
+    /// The layout a fill mode draws pairs in, if it does.
+    pub(super) fn of(pp1fillmode: u32) -> Option<Pair> {
+        rgb12_pair(pp1fillmode).then(|| if (pp1fillmode >> 8) & 7 == 1 { Pair::P555 } else { Pair::P444 })
+    }
+
+    /// Bits a colour component.
+    pub(super) fn bits(self) -> u32 {
+        match self {
+            Pair::P444 => 4,
+            Pair::P555 => 5,
+        }
+    }
+
+    /// Where buffer B's colour starts (A's ends).
+    pub(super) fn shift_b(self) -> u32 {
+        3 * self.bits()
+    }
+
+    /// Buffer `b`'s alpha: its bit position and width.
+    pub(super) fn alpha(self, b: bool) -> (u32, u32) {
+        match self {
+            Pair::P444 => (if b { 28 } else { 24 }, 4),
+            Pair::P555 => (if b { 31 } else { 30 }, 1),
+        }
+    }
+
+    /// The word with an 8-8-8-8 colour in both halves (the plane mask picks
+    /// what is written), dithered when the fill mode says so.
+    pub(super) fn pack(self, pp1fillmode: u32, v: u32, x: i32, y: i32) -> u32 {
+        let t = (pp1fillmode & PP1_DITHER != 0).then(|| crate::dev::ng1::rex3_generic::bayer_threshold(((y as u32 & 3) << 2) | (x as u32 & 3)));
+        self.pack_with(v, t)
+    }
+
+    /// `pack` at Bayer threshold `t` (None: truncate).
+    pub(super) fn pack_with(self, v: u32, t: Option<u32>) -> u32 {
+        let n = self.bits();
+        let c = (0..3).fold(0, |c, k| c | quantise((v >> (8 * k)) & 0xFF, n, t) << (n * k));
+        let (a0, aw) = self.alpha(false);
+        let (a1, _) = self.alpha(true);
+        let a = (v >> 24) >> (8 - aw);
+        c | c << self.shift_b() | a << a0 | a << a1
+    }
+
+    /// Buffer `b`'s half of a word as 8-8-8-8, components widened by
+    /// repeating their bits.
+    pub(super) fn unpack(self, w: u32, b: bool) -> u32 {
+        let n = self.bits();
+        let c = if b { w >> self.shift_b() } else { w };
+        let rgb = (0..3).fold(0, |o, k| o | widen((c >> (n * k)) & ((1 << n) - 1), n) << (8 * k));
+        let (a0, aw) = self.alpha(b);
+        rgb | widen((w >> a0) & ((1 << aw) - 1), aw) << 24
+    }
+}
+
+/// An 8-bit component to `n` bits: truncated, or dithered against the
+/// 4-bit Bayer threshold `t` as REX3 does (scaled to the fraction's width).
+pub(super) fn quantise(ch: u32, n: u32, t: Option<u32>) -> u32 {
+    match t {
+        None => ch >> (8 - n),
+        Some(t) => {
+            let s = ch - (ch >> n);
+            let f = s & ((1 << (8 - n)) - 1);
+            ((s >> (8 - n)) + (f > t >> (n - 4)) as u32).min((1 << n) - 1)
+        }
+    }
+}
+
+/// An `n`-bit component to 8 bits, its bits repeated.
+pub(super) fn widen(v: u32, n: u32) -> u32 {
+    match n {
+        0 => 0,
+        1 => v * 0xFF,
+        _ => (v << (8 - n) | v >> (2 * n - 8)) & 0xFF,
+    }
 }
 
 /// An 8-8-8 colour (red in 7:0) to a 12-bit pixel, red in 3:0 (the host
@@ -1069,10 +1152,11 @@ impl Rss {
         // 24 bits a pixel) keeps the whole value; so does RGB.
         let wide = rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
         let old = self.mem.get(&b, x as u32, y as u32) as u32;
-        if b.kind == Kind::Wide && rgb12_pair(pp1) {
-            let v = rgb12_pixel(pp1, v, x, y) * 0x1001;
+        if let (Kind::Wide, Some(pair)) = (b.kind, Pair::of(pp1)) {
+            let v = pair.pack(pp1, v, x, y);
             let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 { logic_op(pp1 >> 26, v, old) } else { v };
-            let mask = lsb & 0xFF_FFFF;
+            // ColorMaskMSBs are planes 31:24: alpha, and 5:5:5's B colour.
+            let mask = lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24;
             self.mem.put(&b, x as u32, y as u32, ((old & !mask) | (v & mask)) as u64);
             return;
         }
@@ -1134,8 +1218,8 @@ impl Rss {
             return w >> 24;
         }
         let pp1 = self.reg(reg::PP1FILLMODE);
-        match read_buffer(pp1) {
-            r @ (0 | READ_B) if rgb12_pair(pp1) => from_rgb12(w >> (12 * r) & 0xFFF),
+        match (read_buffer(pp1), Pair::of(pp1)) {
+            (r @ (0 | READ_B), Some(pair)) => pair.unpack(w, r == READ_B),
             _ => w,
         }
     }
@@ -1711,11 +1795,10 @@ impl Rss {
     fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
         use fixed::{mul, ONE};
         let dst = self.mem.get(&b, ux, uy) as u32;
-        // 12-bit pairs: blend with this buffer's half (no alpha planes).
-        let dst = if b.kind == Kind::Wide && rgb12_pair(pp1) {
-            from_rgb12(dst >> if back { 12 } else { 0 } & 0xFFF) | 0xFF << 24
-        } else {
-            dst
+        // Pixel pairs: blend with this buffer's half and alpha.
+        let dst = match (b.kind, Pair::of(pp1)) {
+            (Kind::Wide, Some(pair)) => pair.unpack(dst, back),
+            _ => dst,
         };
         // A logic op other than copy replaces blending (OpenGL).
         let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
@@ -2182,7 +2265,7 @@ mod tests {
         r.write(reg::DRBPOINTERS, 0x240 | 0x140 << 10, false);
         r.write(reg::FILLMODE, FILL_FAST, false);
         let fill = |r: &mut Rss, field: u32, mask: u32, rgb: [u32; 3]| {
-            r.write(reg::PP1FILLMODE, 0x0C00_0104 | field << 14, false);
+            r.write(reg::PP1FILLMODE, 0x0C00_0004 | field << 14, false);
             r.write(reg::COLORMASKLSBSA, mask, false);
             r.write(reg::COLORMASKLSBSB, mask, false);
             for (k, c) in rgb.iter().enumerate() {
@@ -2197,8 +2280,36 @@ mod tests {
         assert_eq!(r.mem.get(&page_b, 10, (SCREEN_H - 1 - 5) as u32), 0, "the second page is not B");
         let y = (SCREEN_H - 1 - 5) as i32;
         assert_eq!(r.get(10, y), 0xFF, "read field 0: A");
-        r.write(reg::PP1FILLMODE, 0x0C00_0104 | 1 << 21, false);
+        r.write(reg::PP1FILLMODE, 0x0C00_0004 | 1 << 21, false);
         assert_eq!(r.get(10, y), 0xFF_0000, "read field 1: B");
+    }
+
+    /// Pixel type 1 pairs are 5:5:5 with a 1-bit alpha (libGLcore's plane
+    /// masks 0x40007FFF / 0xBFFF8000): A in 14:0 and bit 30, B in 29:15
+    /// and bit 31; ColorMaskMSBs cover B's top colour bits and the alphas.
+    #[test]
+    fn rgb555_pairs_with_alpha_planes() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        let fill = |r: &mut Rss, field: u32, mask: u32, rgba: [u32; 4]| {
+            r.write(reg::PP1FILLMODE, 0x0C00_0104 | field << 14, false);
+            r.write(reg::COLORMASKLSBSA, mask & 0xFF_FFFF, false);
+            r.write(reg::COLORMASKLSBSB, mask & 0xFF_FFFF, false);
+            r.write(reg::COLORMASKMSBS, mask >> 24, false);
+            for (k, c) in rgba.iter().enumerate() {
+                r.write(reg::FILL_COLOR_R + k as u32, *c, false);
+            }
+            block(r, 10, 5, 10, 5);
+        };
+        // A: red 0x84 (5 bits: 0x10), alpha 1. B: blue, alpha 0.
+        fill(&mut r, 1, 0x4000_7FFF, [0x840, 0, 0, 0xFF0]);
+        fill(&mut r, 2, 0xBFFF_8000, [0, 0, 0xFF0, 0]);
+        assert_eq!(px(&r, 10, 5), 0x1F << 25 | 1 << 30 | 0x10, "B blue in 29:25, A alpha, A red 0x10");
+        let y = (SCREEN_H - 1 - 5) as i32;
+        assert_eq!(r.get(10, y), 0xFF00_0084, "A: red widened (0x10 -> 0x84), alpha 0xFF");
+        r.write(reg::PP1FILLMODE, 0x0C00_0104 | 1 << 21, false);
+        assert_eq!(r.get(10, y), 0x00FF_0000, "B: blue, alpha 0");
     }
 
     /// Dithered 12-bit pairs: a grey of 0x7F (7.5 in 4 bits) splits evenly
@@ -2223,10 +2334,10 @@ mod tests {
             }
             n
         };
-        r.write(reg::PP1FILLMODE, 0x0C00_4104, false);
+        r.write(reg::PP1FILLMODE, 0x0C00_4004, false);
         block(&mut r, 20, 8, 23, 11);
         assert_eq!(tile(&r)[7], 16, "undithered: truncated");
-        r.write(reg::PP1FILLMODE, 0x0C00_4104 | PP1_DITHER, false);
+        r.write(reg::PP1FILLMODE, 0x0C00_4004 | PP1_DITHER, false);
         block(&mut r, 20, 8, 23, 11);
         let n = tile(&r);
         assert_eq!((n[7], n[8]), (8, 8), "dithered: half each");

@@ -67,9 +67,10 @@ impl Draw {
 
 /// How a 36-bit buffer write treats the value (PP1 pixel type): kept as is,
 /// merged under the RGBA8888 plane masks (`Rgba8`: type 2), under the
-/// 12-bit colour-index mask (`Ci12`: type 6), or as a 12-bit pixel pair
-/// (`rss::rgb12_pair`: types 0 and 1) whose blending reads buffer A's half
-/// (`Rgb12`) or B's (`Rgb12B`, draw field 2), each also dithered (`..D`).
+/// 12-bit colour-index mask (`Ci12`: type 6), or as a pixel pair
+/// (`rss::Pair`: type 0 4:4:4 `Rgb12..`, type 1 5:5:5 `Rgb15..`) whose
+/// blending reads buffer A's half or B's (`..B`, draw field 2), each also
+/// dithered (`..D`).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Pix {
@@ -81,32 +82,63 @@ pub enum Pix {
     Rgb12B = 4,
     Rgb12D = 5,
     Rgb12BD = 6,
+    Rgb15 = 7,
+    Rgb15B = 8,
+    Rgb15D = 9,
+    Rgb15BD = 10,
 }
 
 impl Pix {
-    pub const ALL: [Pix; 7] = [Pix::Plain, Pix::Rgb12, Pix::Rgba8, Pix::Ci12, Pix::Rgb12B, Pix::Rgb12D, Pix::Rgb12BD];
+    pub const ALL: [Pix; 11] = [
+        Pix::Plain,
+        Pix::Rgb12,
+        Pix::Rgba8,
+        Pix::Ci12,
+        Pix::Rgb12B,
+        Pix::Rgb12D,
+        Pix::Rgb12BD,
+        Pix::Rgb15,
+        Pix::Rgb15B,
+        Pix::Rgb15D,
+        Pix::Rgb15BD,
+    ];
 
-    /// A 12-bit pixel pair write.
-    pub fn pair(self) -> bool {
-        matches!(self, Pix::Rgb12 | Pix::Rgb12B | Pix::Rgb12D | Pix::Rgb12BD)
+    /// The pixel pair layout written, if any.
+    pub fn pair_layout(self) -> Option<crate::dev::mgras::rss::Pair> {
+        use crate::dev::mgras::rss::Pair;
+        match self {
+            Pix::Rgb12 | Pix::Rgb12B | Pix::Rgb12D | Pix::Rgb12BD => Some(Pair::P444),
+            Pix::Rgb15 | Pix::Rgb15B | Pix::Rgb15D | Pix::Rgb15BD => Some(Pair::P555),
+            _ => None,
+        }
     }
 
-    /// Blending reads buffer B's half (bits 23:12).
+    /// A pixel pair write.
+    pub fn pair(self) -> bool {
+        self.pair_layout().is_some()
+    }
+
+    /// Blending reads buffer B's half.
     pub fn pair_b(self) -> bool {
-        matches!(self, Pix::Rgb12B | Pix::Rgb12BD)
+        matches!(self, Pix::Rgb12B | Pix::Rgb12BD | Pix::Rgb15B | Pix::Rgb15BD)
     }
 
     pub fn dither(self) -> bool {
-        matches!(self, Pix::Rgb12D | Pix::Rgb12BD)
+        matches!(self, Pix::Rgb12D | Pix::Rgb12BD | Pix::Rgb15D | Pix::Rgb15BD)
     }
 
-    /// The pair variant for half B or A, dithered or not.
-    pub fn of_pair(b: bool, dither: bool) -> Pix {
-        match (b, dither) {
-            (false, false) => Pix::Rgb12,
-            (true, false) => Pix::Rgb12B,
-            (false, true) => Pix::Rgb12D,
-            (true, true) => Pix::Rgb12BD,
+    /// The pair variant for a layout, half B or A, dithered or not.
+    pub fn of_pair(layout: crate::dev::mgras::rss::Pair, b: bool, dither: bool) -> Pix {
+        use crate::dev::mgras::rss::Pair;
+        match (layout, b, dither) {
+            (Pair::P444, false, false) => Pix::Rgb12,
+            (Pair::P444, true, false) => Pix::Rgb12B,
+            (Pair::P444, false, true) => Pix::Rgb12D,
+            (Pair::P444, true, true) => Pix::Rgb12BD,
+            (Pair::P555, false, false) => Pix::Rgb15,
+            (Pair::P555, true, false) => Pix::Rgb15B,
+            (Pair::P555, false, true) => Pix::Rgb15D,
+            (Pair::P555, true, true) => Pix::Rgb15BD,
         }
     }
 }

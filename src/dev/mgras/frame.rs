@@ -40,18 +40,22 @@ pub const CURSOR_MAX: usize = 64;
 pub struct MainMode {
     pub rgb: bool,
     pub cmap_base: u16,
-    /// 12-bit RGB pixel pairs (see `rss::rgb12_pair`): buffer A (bits
-    /// 11:0), or B (bits 23:12) when the window ID's BUF_SELECT bit is set.
-    pub rgb12: bool,
+    /// Pixel pairs (see `rss::Pair`) in this layout: buffer A, or B when
+    /// the window ID's BUF_SELECT bit is set.
+    pub pair: Option<rss::Pair>,
 }
 
-/// XMAP main mode formats (bits 4:0) that display 12-bit pixel pairs,
-/// traced on a HighImpact at 1280x1024 with GL's 12-bit double-buffered
-/// visuals, the kernel's swaps flipping BUF_SELECT: 7 (octahedra, PP1
-/// pixel type 1) and 5 (electropaint, pixel type 0). 0x15 is GL's 24-bit
-/// double-buffered visual (two pages).
-pub(super) fn rgb12_format(mode: u32) -> bool {
-    matches!(mode & 0x1F, 5 | 7)
+/// XMAP main mode formats (bits 4:0) that display pixel pairs, traced
+/// with GL's 12-bit double-buffered visuals, the kernel's swaps flipping
+/// BUF_SELECT: 5 the 4:4:4 layout (RGBA 4,4,4,4: electropaint, PP1 pixel
+/// type 0) and 7 the 5:5:5 one (RGBA 5,5,5,1: octahedra, pixel type 1).
+/// 0x15 is GL's 24-bit double-buffered visual (two pages).
+pub(super) fn pair_format(mode: u32) -> Option<rss::Pair> {
+    match mode & 0x1F {
+        5 => Some(rss::Pair::P444),
+        7 => Some(rss::Pair::P555),
+        _ => None,
+    }
 }
 
 /// How a window ID's overlay planes display: off, or a non-zero 8-bit value
@@ -114,7 +118,7 @@ impl Frame {
         }
         for did in 0..32u32 {
             let m = dcb.xmap.main_mode(did);
-            self.main_mode[did as usize] = MainMode { rgb: m & 0x1F >= 4, cmap_base: (((m >> 5) & 0x1F) * 256) as u16, rgb12: rgb12_format(m) };
+            self.main_mode[did as usize] = MainMode { rgb: m & 0x1F >= 4, cmap_base: (((m >> 5) & 0x1F) * 256) as u16, pair: pair_format(m) };
             let o = dcb.xmap.overlay_mode(did);
             self.overlay_mode[did as usize] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
         }
@@ -130,9 +134,8 @@ impl Frame {
             for x in 0..w {
                 let did = self.did_main[dst + x] & 31;
                 let b = select >> did & 1 != 0;
-                if self.main_mode[did as usize].rgb12 {
-                    let half = if b { 12 } else { 0 };
-                    self.main[dst + x] = rss::from_rgb12(self.main[dst + x] >> half & 0xFFF);
+                if let Some(pair) = self.main_mode[did as usize].pair {
+                    self.main[dst + x] = pair.unpack(self.main[dst + x], b) & 0xFF_FFFF;
                 } else if b {
                     self.main[dst + x] = row_b[x];
                 }

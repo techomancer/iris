@@ -320,8 +320,8 @@ fn frame_composes_runs_overlay_and_cursor() {
     }
     f.cmap[0x100 + 5] = 0x11_2233;
     f.cmap[0x200 + 7] = 0x44_5566;
-    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100, rgb12: false };
-    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0, rgb12: false };
+    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100, pair: None };
+    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0, pair: None };
     f.overlay_mode[2] = OverlayMode { on: true, cmap_base: 0x200 };
     f.did_main[10] = 3;
     f.main[10] = 5;
@@ -2641,12 +2641,14 @@ fn gl_12bit_double_buffer_draws_word_halves() {
         fifo_token(&m, 0x98, &[1, 1]);
         gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
         gl_full_quad(&m);
-        assert_eq!(word(&m), 0x00F_000, "format {format:#x}, bank 1: red in B, the high half");
+        // 4:4:4 (format 0) or 5:5:5 (0x100) halves.
+        let (red_b, blue_a) = if format == 0x100 { (0x1F << 15, 0x1F << 10) } else { (0xF << 12, 0xF << 8) };
+        assert_eq!(word(&m), red_b, "format {format:#x}, bank 1: red in B, the high half");
         fifo_token(&m, 0x98, &[0, 0]);
         write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
         gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
         gl_full_quad(&m);
-        assert_eq!(word(&m), 0x00F_F00, "format {format:#x}, bank 0: blue in A, B kept");
+        assert_eq!(word(&m), red_b | blue_a, "format {format:#x}, bank 0: blue in A, B kept");
         m.stop_engines();
     }
 }

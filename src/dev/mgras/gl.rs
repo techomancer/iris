@@ -2088,6 +2088,11 @@ impl Gl {
             && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
     }
 
+    /// The pair layout a 12-bit pair context draws in (its pixel type).
+    fn pair_layout(&self) -> Option<super::rss::Pair> {
+        if self.rgb12_pair() { super::rss::Pair::of(self.pixel_format & 0x2700) } else { None }
+    }
+
     /// A 12-bit pair context's draw field: 1 A, 2 B, 3 both (DRAW_BUFFER
     /// sends these values), 0 none.
     fn pair_field(&self) -> u32 {
@@ -2107,11 +2112,20 @@ impl Gl {
             Some(m) if m & 0x70 == 0x40 => return (0, self.index_mask & 0xFF),
             _ => {}
         }
-        if self.rgb12_pair() {
+        if let Some(pair) = self.pair_layout() {
+            // Per buffer: its colour components and alpha (libGLcore's
+            // masks: 4:4:4 A 0x0F000FFF B 0xF0FFF000, 5:5:5 A 0x40007FFF B
+            // 0xBFFF8000), split into the LSB (23:0) and MSB (31:24) planes.
             let cm = self.color_mask;
-            let c = (cm & 1) * 0xF | (cm >> 1 & 1) * 0xF0 | (cm >> 2 & 1) * 0xF00;
+            let n = pair.bits();
+            let c = (0..3).fold(0, |c, k| c | (cm >> k & 1) * (((1 << n) - 1) << (n * k)));
+            let half = |b: bool| {
+                let (a, aw) = pair.alpha(b);
+                (if b { c << pair.shift_b() } else { c }) | (cm >> 3 & 1) * (((1 << aw) - 1) << a)
+            };
             let f = self.pair_field();
-            return ((f & 1) * c | (f >> 1 & 1) * (c << 12), 0);
+            let m = (f & 1) * half(false) | (f >> 1 & 1) * half(true);
+            return (m & 0xFF_FFFF, m >> 24);
         }
         if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
         let cm = self.color_mask;

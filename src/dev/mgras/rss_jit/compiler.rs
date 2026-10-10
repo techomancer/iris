@@ -35,6 +35,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use super::{ClipRect, Draw, PipeKey, Pix, Prim, RasterCtx, ShaderFn, Target, Tex, XFmt};
+use crate::dev::mgras::rss::Pair;
 use crate::dev::ng1::rex3_generic::BAYER_PACKED;
 use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
@@ -594,11 +595,8 @@ impl<'a> E<'a> {
             self.b.ins().ireduce(I32, w)
         });
         let mut v = v;
-        if pair {
-            // `rss::rgb12_pixel`, in both halves.
-            let c = self.rgb12_pixel(r, x, v);
-            let hi = self.b.ins().ishl_imm_s(c, 12);
-            v = self.b.ins().bor(c, hi);
+        if let (true, Some(layout)) = (pair, k.pix.pair_layout()) {
+            v = self.pair_pack(r, x, v, layout);
         }
         if let Some(op) = k.logic {
             let r = self.logic_op(op, v, old.unwrap());
@@ -613,10 +611,11 @@ impl<'a> E<'a> {
         self.put_px(addr, shift, v);
     }
 
-    /// `rss::rgb12_pixel`: an 8-8-8 colour to 12 bits, red in 3:0, through
-    /// the REX3 4x4 Bayer matrix when the key dithers
-    /// (`rex3_generic::rgb24_to_rgb12_dither`).
-    fn rgb12_pixel(&mut self, r: &Row, x: Value, v: Value) -> Value {
+    /// `rss::Pair::pack`: an 8-8-8-8 colour in both halves of a pair word
+    /// (components truncated, or dithered through the REX3 4x4 Bayer matrix
+    /// when the key dithers, `rss::quantise`), alpha in both alpha fields.
+    fn pair_pack(&mut self, r: &Row, x: Value, v: Value, layout: Pair) -> Value {
+        let n = layout.bits();
         let thr = r.bayer.map(|row| {
             let xi = self.b.ins().band_imm_s(x, 3);
             let idx = self.b.ins().bor(row, xi);
@@ -625,30 +624,40 @@ impl<'a> E<'a> {
             let m = self.i64c(BAYER_PACKED as i64);
             let t = self.b.ins().ushr(m, sh);
             let t = self.b.ins().ireduce(I32, t);
-            self.b.ins().band_imm_s(t, 0xF)
+            let t = self.b.ins().band_imm_s(t, 0xF);
+            if n > 4 { self.b.ins().ushr_imm_s(t, (n - 4) as i64) } else { t }
         });
-        let mut out = self.i32c(0);
-        for c in 0..3 {
-            let ch = self.b.ins().ushr_imm_s(v, 8 * c);
+        let mut c = self.i32c(0);
+        for k in 0..3u32 {
+            let ch = self.b.ins().ushr_imm_s(v, (8 * k) as i64);
             let ch = self.b.ins().band_imm_s(ch, 0xFF);
-            let n = match thr {
+            let q = match thr {
                 Some(t) => {
-                    let q = self.b.ins().ushr_imm_s(ch, 4);
-                    let s = self.b.ins().isub(ch, q);
-                    let d = self.b.ins().ushr_imm_s(s, 4);
-                    let f = self.b.ins().band_imm_s(s, 0xF);
+                    let hi = self.b.ins().ushr_imm_s(ch, n as i64);
+                    let s = self.b.ins().isub(ch, hi);
+                    let d = self.b.ins().ushr_imm_s(s, (8 - n) as i64);
+                    let f = self.b.ins().band_imm_s(s, ((1 << (8 - n)) - 1) as i64);
                     let up = self.b.ins().icmp(IntCC::UnsignedGreaterThan, f, t);
                     let up = self.b.ins().uextend(I32, up);
                     let d = self.b.ins().iadd(d, up);
-                    let max = self.i32c(15);
+                    let max = self.i32c((1 << n) - 1);
                     self.b.ins().umin(d, max)
                 }
-                None => self.b.ins().ushr_imm_s(ch, 4),
+                None => self.b.ins().ushr_imm_s(ch, (8 - n) as i64),
             };
-            let n = if c > 0 { self.b.ins().ishl_imm_s(n, 4 * c) } else { n };
-            out = self.b.ins().bor(out, n);
+            let q = if k > 0 { self.b.ins().ishl_imm_s(q, (n * k) as i64) } else { q };
+            c = self.b.ins().bor(c, q);
         }
-        out
+        let hi = self.b.ins().ishl_imm_s(c, layout.shift_b() as i64);
+        let mut w = self.b.ins().bor(c, hi);
+        let (a0, aw) = layout.alpha(false);
+        let (a1, _) = layout.alpha(true);
+        let a = self.b.ins().ushr_imm_s(v, (32 - aw) as i64);
+        for at in [a0, a1] {
+            let f = self.b.ins().ishl_imm_s(a, at as i64);
+            w = self.b.ins().bor(w, f);
+        }
+        w
     }
 
     /// The parts of `Rss::visible` and of every address that depend on the
@@ -1444,20 +1453,36 @@ impl<'a> E<'a> {
         }
     }
 
-    /// A 12-bit pair's half as 8-8-8-8, nibbles repeated, alpha 0xFF
-    /// (`Rss::fragment_color`).
-    fn rgb12_half(&mut self, w: Value, b: bool) -> Value {
-        let c = if b { self.b.ins().ushr_imm_s(w, 12) } else { w };
-        let r = self.b.ins().band_imm_s(c, 0xF);
-        let g = self.b.ins().band_imm_s(c, 0xF0);
-        let g = self.b.ins().ishl_imm_s(g, 4);
-        let bl = self.b.ins().band_imm_s(c, 0xF00);
-        let bl = self.b.ins().ishl_imm_s(bl, 8);
-        let n = self.b.ins().bor(r, g);
-        let n = self.b.ins().bor(n, bl);
-        let hi = self.b.ins().ishl_imm_s(n, 4);
-        let n = self.b.ins().bor(n, hi);
-        self.b.ins().bor_imm_u(n, 0xFF00_0000)
+    /// `rss::Pair::unpack`: buffer A's or B's half of a pair word as
+    /// 8-8-8-8, every component (alpha too) widened by repeating its bits.
+    fn pair_half(&mut self, w: Value, layout: Pair, b: bool) -> Value {
+        let n = layout.bits();
+        let c = if b { self.b.ins().ushr_imm_s(w, layout.shift_b() as i64) } else { w };
+        let mut out = self.i32c(0);
+        for k in 0..3 {
+            let comp = self.b.ins().ushr_imm_s(c, (n * k) as i64);
+            let comp = self.b.ins().band_imm_s(comp, ((1 << n) - 1) as i64);
+            let v = self.widen(comp, n);
+            let v = if k > 0 { self.b.ins().ishl_imm_s(v, (8 * k) as i64) } else { v };
+            out = self.b.ins().bor(out, v);
+        }
+        let (a0, aw) = layout.alpha(b);
+        let a = self.b.ins().ushr_imm_s(w, a0 as i64);
+        let a = self.b.ins().band_imm_s(a, ((1 << aw) - 1) as i64);
+        let a = self.widen(a, aw);
+        let a = self.b.ins().ishl_imm_s(a, 24);
+        self.b.ins().bor(out, a)
+    }
+
+    /// `rss::widen`: an `n`-bit component to 8 bits.
+    fn widen(&mut self, v: Value, n: u32) -> Value {
+        if n == 1 {
+            return self.b.ins().imul_imm_s(v, 0xFF);
+        }
+        let hi = self.b.ins().ishl_imm_s(v, (8 - n) as i64);
+        let lo = self.b.ins().ushr_imm_s(v, (2 * n - 8) as i64);
+        let o = self.b.ins().bor(hi, lo);
+        self.b.ins().band_imm_s(o, 0xFF)
     }
 
     /// `Rss::fragment_color`: blend (12.16) or not, shift down, write.
@@ -1470,7 +1495,10 @@ impl<'a> E<'a> {
                     let (a, sh) = self.locate_x(r.tgt[t], x, overlay);
                     let dst = self.get_px(a, sh);
                     let dst = self.b.ins().ireduce(I32, dst);
-                    let dst = if k.pix.pair() && !overlay { self.rgb12_half(dst, k.pix.pair_b()) } else { dst };
+                    let dst = match k.pix.pair_layout() {
+                        Some(layout) if !overlay => self.pair_half(dst, layout, k.pix.pair_b()),
+                        _ => dst,
+                    };
                     // Destination bytes widened to 12 bits, 12.16.
                     let d: Vec<Value> = (0..4)
                         .map(|c| {
