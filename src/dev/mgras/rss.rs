@@ -432,6 +432,20 @@ pub(super) fn rgb12_pair(pp1fillmode: u32) -> bool {
     matches!((pp1fillmode >> 8) & 7, 0 | 1) && pp1fillmode & (1 << 13) == 0
 }
 
+/// PP1 fill mode bit 3: dither 12-bit pixels down from 8 bits a component
+/// with the 4x4 Bayer matrix REX3 and GR2's RE3 use. Our choice of bit:
+/// glEnable(GL_DITHER) reaches the GE as a token (0x067) whose effect on
+/// the pixel processors is microcode we have not seen, and no driver
+/// sets this bit in any trace. The GL front-end sets it.
+pub(super) const PP1_DITHER: u32 = 1 << 3;
+
+/// The 12-bit pixel for an 8-8-8 colour at framebuffer (x, y), dithered
+/// when the fill mode says so.
+pub(super) fn rgb12_pixel(pp1fillmode: u32, v: u32, x: i32, y: i32) -> u32 {
+    use crate::dev::ng1::rex3_generic::{bayer_pack, rgb24_to_rgb12_dither};
+    if pp1fillmode & PP1_DITHER != 0 { rgb24_to_rgb12_dither(bayer_pack(v, x, y)) } else { to_rgb12(v) }
+}
+
 /// An 8-8-8 colour (red in 7:0) to a 12-bit pixel, red in 3:0 (the host
 /// format X uses for its 12-bit visual).
 pub(super) fn to_rgb12(v: u32) -> u32 {
@@ -1053,7 +1067,7 @@ impl Rss {
         let wide = rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
         let old = self.mem.get(&b, x as u32, y as u32) as u32;
         if b.kind == Kind::Wide && rgb12_pair(pp1) {
-            let v = to_rgb12(v) * 0x1001;
+            let v = rgb12_pixel(pp1, v, x, y) * 0x1001;
             let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 { logic_op(pp1 >> 26, v, old) } else { v };
             let mask = lsb & 0xFF_FFFF;
             self.mem.put(&b, x as u32, y as u32, ((old & !mask) | (v & mask)) as u64);
@@ -2149,6 +2163,37 @@ mod tests {
         assert_eq!(r.get(10, y), 0xFF, "read field 0: A");
         r.write(reg::PP1FILLMODE, 0x0C00_0104 | 1 << 21, false);
         assert_eq!(r.get(10, y), 0xFF_0000, "read field 1: B");
+    }
+
+    /// Dithered 12-bit pairs: a grey of 0x7F (7.5 in 4 bits) splits evenly
+    /// between 7 and 8 over each 4x4 Bayer tile; undithered it truncates.
+    #[test]
+    fn rgb12_dither_spreads_over_the_bayer_tile() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        for k in 0..3 {
+            r.write(reg::FILL_COLOR_R + k, 0x7F0, false);
+        }
+        let tile = |r: &Rss| {
+            let mut n = [0u32; 16];
+            for y in 0..4 {
+                for x in 0..4 {
+                    let c = px(r, 20 + x, 8 + y) & 0xFFF;
+                    assert!(c & 0xF == c >> 4 & 0xF && c & 0xF == c >> 8, "grey stays grey: {c:#05x}");
+                    n[(c & 0xF) as usize] += 1;
+                }
+            }
+            n
+        };
+        r.write(reg::PP1FILLMODE, 0x0C00_4104, false);
+        block(&mut r, 20, 8, 23, 11);
+        assert_eq!(tile(&r)[7], 16, "undithered: truncated");
+        r.write(reg::PP1FILLMODE, 0x0C00_4104 | PP1_DITHER, false);
+        block(&mut r, 20, 8, 23, 11);
+        let n = tile(&r);
+        assert_eq!((n[7], n[8]), (8, 8), "dithered: half each");
     }
 
     #[test]

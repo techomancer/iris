@@ -35,6 +35,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use super::{ClipRect, Draw, PipeKey, Pix, Prim, RasterCtx, ShaderFn, Target, Tex, XFmt};
+use crate::dev::ng1::rex3_generic::BAYER_PACKED;
 use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
 use crate::dev::mgras::fixed;
@@ -194,7 +195,7 @@ impl<'a> E<'a> {
             Draw::Dual => 2,
             _ => 1,
         };
-        let masked = k.draw == Draw::Overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12);
+        let masked = k.draw == Draw::Overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12) || k.pix.pair();
         for (t, row) in tgt.iter_mut().enumerate().take(ntgt) {
             let base = off!(common.tgt) + (t * size_of::<Target>()) as i32;
             let f = |b: &mut FunctionBuilder, o: usize| b.ins().load(I32, mr, ctx, base + o as i32);
@@ -584,8 +585,8 @@ impl<'a> E<'a> {
     fn put_in(&mut self, r: &Row, t: usize, x: Value, v: Value) {
         let k = self.k;
         let overlay = t == 0 && k.draw == Draw::Overlay;
-        let rep12 = !overlay && k.pix == Pix::Rgb12;
-        let masked = overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12);
+        let pair = !overlay && k.pix.pair();
+        let masked = overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12) || pair;
         let [_, _, mask, lop_width] = self.tgt[t];
         let (addr, shift) = self.locate_x(r.tgt[t], x, overlay);
         let old = (k.logic.is_some() || masked).then(|| {
@@ -593,14 +594,15 @@ impl<'a> E<'a> {
             self.b.ins().ireduce(I32, w)
         });
         let mut v = v;
+        if pair {
+            // `rss::rgb12_pixel`, in both halves.
+            let c = self.rgb12_pixel(r, x, v);
+            let hi = self.b.ins().ishl_imm_s(c, 12);
+            v = self.b.ins().bor(c, hi);
+        }
         if let Some(op) = k.logic {
             let r = self.logic_op(op, v, old.unwrap());
             v = self.b.ins().band(r, lop_width);
-        }
-        if rep12 {
-            let n = self.b.ins().band_imm_s(v, 0xF0_F0F0);
-            let lo = self.b.ins().ushr_imm_s(n, 4);
-            v = self.b.ins().bor(n, lo);
         }
         if masked {
             let keep = self.b.ins().band_not(old.unwrap(), mask);
@@ -609,6 +611,44 @@ impl<'a> E<'a> {
         }
         let v = self.b.ins().uextend(I64, v);
         self.put_px(addr, shift, v);
+    }
+
+    /// `rss::rgb12_pixel`: an 8-8-8 colour to 12 bits, red in 3:0, through
+    /// the REX3 4x4 Bayer matrix when the key dithers
+    /// (`rex3_generic::rgb24_to_rgb12_dither`).
+    fn rgb12_pixel(&mut self, r: &Row, x: Value, v: Value) -> Value {
+        let thr = r.bayer.map(|row| {
+            let xi = self.b.ins().band_imm_s(x, 3);
+            let idx = self.b.ins().bor(row, xi);
+            let sh = self.b.ins().ishl_imm_s(idx, 2);
+            let sh = self.b.ins().uextend(I64, sh);
+            let m = self.i64c(BAYER_PACKED as i64);
+            let t = self.b.ins().ushr(m, sh);
+            let t = self.b.ins().ireduce(I32, t);
+            self.b.ins().band_imm_s(t, 0xF)
+        });
+        let mut out = self.i32c(0);
+        for c in 0..3 {
+            let ch = self.b.ins().ushr_imm_s(v, 8 * c);
+            let ch = self.b.ins().band_imm_s(ch, 0xFF);
+            let n = match thr {
+                Some(t) => {
+                    let q = self.b.ins().ushr_imm_s(ch, 4);
+                    let s = self.b.ins().isub(ch, q);
+                    let d = self.b.ins().ushr_imm_s(s, 4);
+                    let f = self.b.ins().band_imm_s(s, 0xF);
+                    let up = self.b.ins().icmp(IntCC::UnsignedGreaterThan, f, t);
+                    let up = self.b.ins().uextend(I32, up);
+                    let d = self.b.ins().iadd(d, up);
+                    let max = self.i32c(15);
+                    self.b.ins().umin(d, max)
+                }
+                None => self.b.ins().ushr_imm_s(ch, 4),
+            };
+            let n = if c > 0 { self.b.ins().ishl_imm_s(n, 4 * c) } else { n };
+            out = self.b.ins().bor(out, n);
+        }
+        out
     }
 
     /// The parts of `Rss::visible` and of every address that depend on the
@@ -641,7 +681,11 @@ impl<'a> E<'a> {
             let zp = self.i32c(crate::dev::mgras::rss::ZST_PAGE as i64);
             self.locate_row(zp, self.zxtiles, fy)
         });
-        let mut r = Row { cid, clip, tgt, z };
+        let bayer = self.k.pix.dither().then(|| {
+            let y = self.b.ins().band_imm_s(fy, 3);
+            self.b.ins().ishl_imm_s(y, 2)
+        });
+        let mut r = Row { cid, clip, tgt, z, bayer };
         // Pin it all, so it is computed once per row.
         let mut vals: Vec<Value> = Vec::new();
         vals.extend(r.cid);
@@ -654,6 +698,7 @@ impl<'a> E<'a> {
         if let Some((a, b)) = r.z {
             vals.extend([a, b]);
         }
+        vals.extend(r.bayer);
         let mut p = self.pin(&vals).into_iter();
         if r.cid.is_some() {
             r.cid = p.next();
@@ -666,6 +711,9 @@ impl<'a> E<'a> {
         }
         if r.z.is_some() {
             r.z = Some((p.next().unwrap(), p.next().unwrap()));
+        }
+        if r.bayer.is_some() {
+            r.bayer = p.next();
         }
         r
     }
@@ -1396,6 +1444,22 @@ impl<'a> E<'a> {
         }
     }
 
+    /// A 12-bit pair's half as 8-8-8-8, nibbles repeated, alpha 0xFF
+    /// (`Rss::fragment_color`).
+    fn rgb12_half(&mut self, w: Value, b: bool) -> Value {
+        let c = if b { self.b.ins().ushr_imm_s(w, 12) } else { w };
+        let r = self.b.ins().band_imm_s(c, 0xF);
+        let g = self.b.ins().band_imm_s(c, 0xF0);
+        let g = self.b.ins().ishl_imm_s(g, 4);
+        let bl = self.b.ins().band_imm_s(c, 0xF00);
+        let bl = self.b.ins().ishl_imm_s(bl, 8);
+        let n = self.b.ins().bor(r, g);
+        let n = self.b.ins().bor(n, bl);
+        let hi = self.b.ins().ishl_imm_s(n, 4);
+        let n = self.b.ins().bor(n, hi);
+        self.b.ins().bor_imm_u(n, 0xFF00_0000)
+    }
+
     /// `Rss::fragment_color`: blend (12.16) or not, shift down, write.
     fn fragment_color(&mut self, r: &Row, t: usize, x: Value, rgba: [Value; 4]) {
         let k = self.k;
@@ -1406,6 +1470,7 @@ impl<'a> E<'a> {
                     let (a, sh) = self.locate_x(r.tgt[t], x, overlay);
                     let dst = self.get_px(a, sh);
                     let dst = self.b.ins().ireduce(I32, dst);
+                    let dst = if k.pix.pair() && !overlay { self.rgb12_half(dst, k.pix.pair_b()) } else { dst };
                     // Destination bytes widened to 12 bits, 12.16.
                     let d: Vec<Value> = (0..4)
                         .map(|c| {
@@ -1983,6 +2048,8 @@ struct Row {
     clip: Vec<(Value, Value)>,
     tgt: [(Value, Value); 2],
     z: Option<(Value, Value)>,
+    /// Dithering: the Bayer matrix row, (fy & 3) << 2.
+    bayer: Option<Value>,
 }
 
 /// A level's geometry (i64): its size, its page and offset in it, and its

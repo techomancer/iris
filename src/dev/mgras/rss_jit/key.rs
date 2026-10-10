@@ -66,9 +66,10 @@ impl Draw {
 }
 
 /// How a 36-bit buffer write treats the value (PP1 pixel type): kept as is,
-/// replicated as 4/4/4 (`Rgb12`: type 0, 12-bit), merged under the
-/// RGBA8888 plane masks (`Rgba8`: type 2), or under the 12-bit colour-index
-/// mask (`Ci12`: type 6).
+/// merged under the RGBA8888 plane masks (`Rgba8`: type 2), under the
+/// 12-bit colour-index mask (`Ci12`: type 6), or as a 12-bit pixel pair
+/// (`rss::rgb12_pair`: types 0 and 1) whose blending reads buffer A's half
+/// (`Rgb12`) or B's (`Rgb12B`, draw field 2), each also dithered (`..D`).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Pix {
@@ -77,10 +78,37 @@ pub enum Pix {
     Rgb12 = 1,
     Rgba8 = 2,
     Ci12 = 3,
+    Rgb12B = 4,
+    Rgb12D = 5,
+    Rgb12BD = 6,
 }
 
 impl Pix {
-    pub const ALL: [Pix; 4] = [Pix::Plain, Pix::Rgb12, Pix::Rgba8, Pix::Ci12];
+    pub const ALL: [Pix; 7] = [Pix::Plain, Pix::Rgb12, Pix::Rgba8, Pix::Ci12, Pix::Rgb12B, Pix::Rgb12D, Pix::Rgb12BD];
+
+    /// A 12-bit pixel pair write.
+    pub fn pair(self) -> bool {
+        matches!(self, Pix::Rgb12 | Pix::Rgb12B | Pix::Rgb12D | Pix::Rgb12BD)
+    }
+
+    /// Blending reads buffer B's half (bits 23:12).
+    pub fn pair_b(self) -> bool {
+        matches!(self, Pix::Rgb12B | Pix::Rgb12BD)
+    }
+
+    pub fn dither(self) -> bool {
+        matches!(self, Pix::Rgb12D | Pix::Rgb12BD)
+    }
+
+    /// The pair variant for half B or A, dithered or not.
+    pub fn of_pair(b: bool, dither: bool) -> Pix {
+        match (b, dither) {
+            (false, false) => Pix::Rgb12,
+            (true, false) => Pix::Rgb12B,
+            (false, true) => Pix::Rgb12D,
+            (true, true) => Pix::Rgb12BD,
+        }
+    }
 }
 
 /// Host transfer pixel formats (`rss::from_host`), by (PixelFormat,
@@ -399,7 +427,7 @@ impl PipeKey {
         e.put(k.cid_test as u64, 2);
         e.put(k.nclip as u64, 5);
         e.put(k.draw as u64, 4);
-        e.put(k.pix as u64, 4);
+        e.put(k.pix as u64, Pix::ALL.len() as u64);
         e.put(k.logic.map_or(0, |op| op as u64 + 1), 17);
         e.put(k.stipple as u64, 2);
         if k.prim.is_gl() {
@@ -432,7 +460,7 @@ impl PipeKey {
             cid_test: d.get(2) != 0,
             nclip: d.get(5) as u8,
             draw: Draw::ALL[d.get(4) as usize],
-            pix: Pix::ALL[d.get(4) as usize],
+            pix: Pix::ALL[d.get(Pix::ALL.len() as u64) as usize],
             logic: match d.get(17) {
                 0 => None,
                 n => Some(n as u8 - 1),
@@ -480,7 +508,7 @@ impl PipeKey {
     /// The radix product of the largest key (a GL key with every optional
     /// group on): the packed form must stay below it.
     pub fn max_packed() -> u128 {
-        let common: u128 = 6 * 2 * 5 * 4 * 4 * 17 * 2;
+        let common: u128 = 6 * 2 * 5 * 4 * Pix::ALL.len() as u128 * 17 * 2;
         let gl: u128 = 2 * 9 * (1 + 8 * 216) * 9 * 122 * (1 + Tex::RADIX as u128) * 2;
         let d2: u128 = 2 * 2 * 8 * 6;
         common * gl.max(d2)

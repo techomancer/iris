@@ -19,7 +19,7 @@
 //! Run with `cargo test --release --features gr4-jit --lib rss_jit_tests`.
 
 use super::rss::{self, reg, Rss, TriSetup};
-use super::rss_jit::{self, key::XBPP, Draw, PipeKey, Prim, MODE_OFF, MODE_SYNC};
+use super::rss_jit::{self, key::XBPP, Draw, PipeKey, Pix, Prim, MODE_OFF, MODE_SYNC};
 use super::te1::reg as te;
 use std::collections::{HashMap, HashSet};
 
@@ -496,7 +496,7 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
                 r(4)
             }
         }
-        4 => r(4),
+        4 => r(Pix::ALL.len() as u32),
         5 => r(17),
         11 => r(8),
         12 | 16 => r(9),

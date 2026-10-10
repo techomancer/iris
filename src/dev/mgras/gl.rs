@@ -2030,7 +2030,8 @@ impl Gl {
     /// canonical storage format; overlays retain the driver's CI8 format.
     fn pp1_base(&self) -> u32 {
         if self.rgb12_pair() {
-            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format & 0x2700 | self.pair_field() << 14;
+            let dither = if self.dither != 0 { super::rss::PP1_DITHER } else { 0 };
+            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format & 0x2700 | self.pair_field() << 14 | dither;
         }
         let pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
         match self.draw_mask() {

@@ -264,8 +264,11 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     let msbs = rss.reg(reg::COLORMASKMSBS);
     let wide = rss::rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
     let ptype = (pp1 >> 8) & 7;
+    let pair = b.kind == Kind::Wide && rss::rgb12_pair(pp1);
     let mask = if b.kind == Kind::Overlay {
         if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 }
+    } else if pair {
+        lsb & 0xFF_FFFF
     } else if ptype == 2 {
         if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (msbs & 0xFF) << 24 }
     } else if matches!(ptype, 4 | 6) {
@@ -277,7 +280,7 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
         ptr: b.ptr,
         xtiles: b.xtiles,
         mask,
-        lop_width: if ptype == 2 { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF },
+        lop_width: if ptype == 2 || pair { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF },
     }
 }
 
@@ -297,7 +300,7 @@ fn common(rss: &mut Rss) -> PipeKey {
         Draw::Overlay
     } else {
         match rss.second_buffer() {
-            Some(p) if field == rss::DRAW_A_AND_B => {
+            Some(p) if field == rss::DRAW_A_AND_B && !rss::rgb12_pair(pp1) => {
                 let b2 = Buffer::new(p, Kind::Wide, drbsize);
                 if b2 != b {
                     c.tgt[1] = target(rss, b2, true);
@@ -311,7 +314,7 @@ fn common(rss: &mut Rss) -> PipeKey {
     };
     let ptype = (pp1 >> 8) & 7;
     let pix = match ptype {
-        0 if pp1 & (1 << 13) == 0 => Pix::Rgb12,
+        _ if rss::rgb12_pair(pp1) => Pix::of_pair(field == rss::DRAW_B, pp1 & rss::PP1_DITHER != 0),
         2 => Pix::Rgba8,
         4 | 6 => Pix::Ci12,
         _ => Pix::Plain,
@@ -580,12 +583,6 @@ pub(super) fn run(rss: &mut Rss, a: &Args) -> bool {
         return false;
     }
     let prim = a.prim();
-    // 12-bit pixel pairs (see `rss::rgb12_pair`) are the interpreter's.
-    let pp1 = rss.reg(reg::PP1FILLMODE);
-    if rss::rgb12_pair(pp1) && rss::draw_buffer(pp1) & 0x70 != 0x40 && rss::draw_buffer(pp1) != rss::DRAW_CID {
-        rss.jit.declined += 1;
-        return false;
-    }
     let Some(bits) = prepare(rss, a) else {
         rss.jit.declined += 1;
         return false;
