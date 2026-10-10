@@ -1232,14 +1232,33 @@ fn emit_shader(
 
     // depth_mask used by scr2scr src read and by emit_pixel_write.
     let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+    // DBLSRC reads the second buffer of a double-buffered depth: the plane's
+    // upper half of the pixel (the interpreter's plane_shift_mask).
+    let dblsrc_shift: i64 = match dm1.drawdepth() { 0 => 4, 1 => 8, 2 => 12, _ => 0 };
 
     // ── HOSTR (READ opcode): read fb pixel, pack into host shifter, jump to skip ──
     // Mirrors process_pixel_read: calculate_fb_address + expand + store_host_pixel.
     // No fb write; jump to skip_block with updated shifter.
     let new_shifter_after_pixel: Value = if is_hostr {
         let fb_raw = b.ins().load(types::I32, memv, px_ptr, ir::immediates::Offset32::new(0));
-        let depth_mask_i: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
-        let masked = b.ins().band_imm_s(fb_raw, depth_mask_i);
+        // The plane's bits, as the interpreter's read_plane takes them: an aux
+        // plane by its own shift (DBLSRC picks the second one), an RGB depth
+        // shifted to its second buffer under DBLSRC, then masked.
+        let masked = if dm1.use_aux() {
+            let (shift0, shift1, mask): (i64, i64, i64) = match dm1.planes() {
+                p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
+                p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
+                p if p == DRAWMODE1_PLANES_PUP  => (2,  6,  0x3),
+                _                               => (0,  0,  0),
+            };
+            let shift = if dm1.dblsrc() { shift1 } else { shift0 };
+            let v = if shift > 0 { b.ins().ushr_imm_s(fb_raw, shift) } else { fb_raw };
+            b.ins().band_imm_s(v, mask)
+        } else {
+            let depth_mask_i: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+            let v = if dm1.dblsrc() && dblsrc_shift > 0 { b.ins().ushr_imm_s(fb_raw, dblsrc_shift) } else { fb_raw };
+            b.ins().band_imm_s(v, depth_mask_i)
+        };
         let expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
             emit_expand_ir(&mut b, masked, dm1.drawdepth())
         } else { masked };
@@ -1272,8 +1291,12 @@ fn emit_shader(
                 let extracted  = if read_shift > 0 { b.ins().ushr_imm_s(src_raw, read_shift) } else { src_raw };
                 b.ins().band_imm_s(extracted, aux_read_mask)
             } else {
-                // RGB plane: mask to depth bits then expand to 24-bit if needed.
-                let src_masked = b.ins().band_imm_s(src_raw, depth_mask as i64);
+                // RGB plane: the DBLSRC buffer, masked to depth bits, then
+                // expanded to 24-bit if needed.
+                let src_plane = if dm1.dblsrc() && dblsrc_shift > 0 {
+                    b.ins().ushr_imm_s(src_raw, dblsrc_shift)
+                } else { src_raw };
+                let src_masked = b.ins().band_imm_s(src_plane, depth_mask as i64);
                 if dm1.rgbmode() && dm1.drawdepth() != 3 {
                     emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
                 } else { src_masked }

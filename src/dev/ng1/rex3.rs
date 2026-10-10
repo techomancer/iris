@@ -380,6 +380,8 @@ bitfield! {
     pub ystride, _: 23;
 }
 
+pub const DRAWMODE0_ENZPATTERN: u32 = 1 << 12;
+
 pub const DRAWMODE0_OPCODE_NOOP: u32 = 0x0;
 pub const DRAWMODE0_OPCODE_READ: u32 = 0x1;
 pub const DRAWMODE0_OPCODE_DRAW: u32 = 0x2;
@@ -1323,11 +1325,11 @@ pub struct Rex3 {
     /// True while the REX3-Processor thread is parked on an empty gfifo. The
     /// producer (`gfifo_push`) checks this and unparks the consumer so a fresh
     /// command is picked up immediately instead of after the park timeout.
-    #[cfg(feature = "idle-pause")]
+    #[cfg(any(feature = "idle-pause", test))]
     processor_parked: AtomicBool,
     /// Handle to the REX3-Processor thread, set once when it starts, used by
     /// `gfifo_push` to unpark it. OnceLock gives lock-free reads on the hot path.
-    #[cfg(feature = "idle-pause")]
+    #[cfg(any(feature = "idle-pause", test))]
     processor_unparker: std::sync::OnceLock<thread::Thread>,
     /// Set by the gfifo consumer whenever it processes activity that may have
     /// changed the framebuffer. The refresh thread renders only when this (or a
@@ -1375,6 +1377,19 @@ pub struct Rex3 {
     pub shaders: Arc<RwLock<crate::dev::ng1::rex3_shape::ShapeMap<crate::dev::ng1::rex3_shaders::ShaderFn>>>,
     /// One-entry memo in front of `shaders`, on the GFIFO consumer thread only.
     pub shader_last: std::cell::Cell<(u32, u32, u32, Option<crate::dev::ng1::rex3_shaders::ShaderFn>)>,
+    /// `shader_epoch` when `shader_last` was filled: the memo is trusted only
+    /// while they match. GFIFO consumer thread only.
+    pub shader_last_epoch: std::cell::Cell<u32>,
+    /// Bumped whenever a shape is taken out of `shaders` or put back
+    /// (`rex jit disable|enable`), from the monitor thread, so the consumer
+    /// drops a memo that may hold a disabled shader.
+    pub shader_epoch: AtomicU32,
+    /// Shapes taken out of dispatch by `rex jit disable`, with the shader they
+    /// had (prebuilt or Cranelift), restored by `rex jit enable`. While a shape
+    /// is here it runs on the generic path and is not compiled again.
+    pub disabled_shaders: Mutex<crate::dev::ng1::rex3_shape::ShapeMap<Option<crate::dev::ng1::rex3_shaders::ShaderFn>>>,
+    /// Whether `disabled_shaders` is non-empty: spares the lookup miss path the lock.
+    pub any_disabled: AtomicBool,
     /// Every draw shape this run has dispatched — the corpus the shader
     /// generator consumes.
     ///
@@ -1507,9 +1522,9 @@ impl Rex3 {
             gfxbusy: Arc::new(AtomicBool::new(false)),
             processor_thread: Mutex::new(None),
             refresh_thread: Mutex::new(None),
-            #[cfg(feature = "idle-pause")]
+            #[cfg(any(feature = "idle-pause", test))]
             processor_parked: AtomicBool::new(false),
-            #[cfg(feature = "idle-pause")]
+            #[cfg(any(feature = "idle-pause", test))]
             processor_unparker: std::sync::OnceLock::new(),
             fb_dirty: AtomicBool::new(true),
             screen,
@@ -1558,6 +1573,10 @@ impl Rex3 {
             // `rex3_shaders::lookup` directly.
             shaders: Arc::clone(&shaders_shared),
             shader_last: std::cell::Cell::new((0, 0, 0, None)),
+            shader_last_epoch: std::cell::Cell::new(0),
+            shader_epoch: AtomicU32::new(0),
+            disabled_shaders: Mutex::new(crate::dev::ng1::rex3_shape::ShapeMap::default()),
+            any_disabled: AtomicBool::new(false),
             seen_shapes: Mutex::new(crate::dev::ng1::rex3_shape::ShapeSet::default()),
             #[cfg(feature = "rex-jit")]
             jit_last: std::cell::Cell::new((0, 0, 0, None)),
@@ -2409,7 +2428,7 @@ impl Rex3 {
         // Wake the consumer if it parked on an empty fifo (idle desktop). Cheap
         // on the hot path: a relaxed-ish load that is false whenever the
         // processor is actively draining.
-        #[cfg(feature = "idle-pause")]
+        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2436,7 +2455,7 @@ impl Rex3 {
         if !self.gfifo.try_push(addr, val) {
             return false;
         }
-        #[cfg(feature = "idle-pause")]
+        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2468,7 +2487,7 @@ impl Rex3 {
         if !self.gfifo.try_push2(addr0, val0, addr1, val1) {
             return false;
         }
-        #[cfg(feature = "idle-pause")]
+        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2490,7 +2509,7 @@ impl Rex3 {
             });
         }
         self.gfifo.push_batch(token, vals.len() as u64, vals);
-        #[cfg(feature = "idle-pause")]
+        #[cfg(any(feature = "idle-pause", test))]
         if self.processor_parked.load(Ordering::Acquire) {
             if let Some(t) = self.processor_unparker.get() {
                 t.unpark();
@@ -2515,7 +2534,7 @@ impl Rex3 {
 
     fn register_processor(&self) {
         // Publish our thread handle so gfifo_push can unpark us when we park.
-        #[cfg(feature = "idle-pause")]
+        #[cfg(any(feature = "idle-pause", test))]
         let _ = self.processor_unparker.set(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
@@ -2579,7 +2598,11 @@ impl Rex3 {
                 }
 
                 if is_go {
-                    self.execute_go();
+                    if reg_offset == REX3_STEPZ {
+                        self.execute_stepz_go();
+                    } else {
+                        self.execute_go();
+                    }
                 }
 
                 // Advance head and release busy atomically — CPU thread sees all writes
@@ -2605,8 +2628,10 @@ impl Rex3 {
                 // (crossbeam's backoff completes), stop burning a host core on
                 // yield_now() and actually park. An idle IRIX desktop leaves this
                 // fifo empty indefinitely, so without parking this thread pins a
-                // CPU at ~100%.
-                #[cfg(feature = "idle-pause")]
+                // CPU at ~100%. Test builds always park: every test leaks its
+                // Rex3, processor thread included, and a few hundred of them
+                // yield-spinning starve a CI runner.
+                #[cfg(any(feature = "idle-pause", test))]
                 if backoff.is_completed() {
                     // Set parked BEFORE the final emptiness re-check so a racing
                     // gfifo_push either (a) is seen by the peek below, or (b) sees
@@ -2621,9 +2646,38 @@ impl Rex3 {
                     self.processor_parked.store(false, Ordering::Release);
                     backoff.reset();
                 } else { backoff.snooze(); }
-                #[cfg(not(feature = "idle-pause"))]
+                #[cfg(not(any(feature = "idle-pause", test)))]
                 backoff.snooze();
             }
+        }
+    }
+
+    /// A GO on STEPZ fails the Z pattern test for the current pixel only
+    /// (rex3.pdf: "Enables ZPATTERN (Z test fail) for one iteration"). IRIX's
+    /// software rasteriser on Newport steps over the pixels it must not write
+    /// this way, one GO per pixel (blast's billboards: transparent texels): the
+    /// iterators advance, and the pixel is not written, or is written in
+    /// COLORBACK under ZPOPAQUE. Run as a GO with ENZPATTERN on and only the
+    /// current pattern bit clear; the guest's ZPATTERN, and its bit position
+    /// when it had not enabled the pattern itself, are put back afterwards.
+    pub(crate) fn execute_stepz_go(&self) {
+        let (dm0, zpattern, bit, had) = {
+            let ctx = unsafe { &mut *self.context.get() };
+            let dm0 = ctx.drawmode0;
+            let had = dm0.enzpattern();
+            // execute_go restarts the pattern at bit 31 on DOSETUP
+            let bit = if dm0.dosetup() { 31 } else { ctx.zpat_bit };
+            let zpattern = ctx.zpattern;
+            ctx.zpattern = if had { zpattern } else { !0 } & !(1u32 << bit);
+            ctx.drawmode0 = DrawMode0(dm0.0 | DRAWMODE0_ENZPATTERN);
+            (dm0, zpattern, bit, had)
+        };
+        self.execute_go();
+        let ctx = unsafe { &mut *self.context.get() };
+        ctx.drawmode0 = dm0;
+        ctx.zpattern = zpattern;
+        if !had {
+            ctx.zpat_bit = bit;
         }
     }
 
@@ -2738,20 +2792,29 @@ impl Rex3 {
                 let cm = ctx.clipmode & CLIPMODE_JIT_KEY_MASK;
                 // Fast path: same key as the last GO — skip the map lookup.
                 let last = self.shader_last.get();
-                let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some() {
+                let epoch = self.shader_epoch.load(Ordering::Relaxed);
+                let entry = if last.0 == dm0 && last.1 == dm1 && last.2 == cm && last.3.is_some()
+                    && self.shader_last_epoch.get() == epoch
+                {
                     last.3
                 } else {
                     let e = self.shaders.read().get(&(dm0, dm1, cm)).copied();
                     if e.is_some() {
                         self.shader_last.set((dm0, dm1, cm, e));
+                        self.shader_last_epoch.set(epoch);
                     } else {
                         // Nothing precompiled for this shape. Ask Cranelift to
                         // build one (if it is compiled in) and run the generic
                         // path meanwhile; without rex-jit the generic path is
-                        // simply what always runs for uncovered shapes.
+                        // simply what always runs for uncovered shapes. A shape
+                        // `rex jit disable` took out stays on the generic path.
                         #[cfg(feature = "rex-jit")]
                         if let Some(ref jit) = self.rex_jit {
-                            jit.request_compile(dm0, dm1, cm);
+                            if !(self.any_disabled.load(Ordering::Relaxed)
+                                && self.disabled_shaders.lock().contains_key(&(dm0, dm1, cm)))
+                            {
+                                jit.request_compile(dm0, dm1, cm);
+                            }
                         }
                     }
                     e
@@ -3843,12 +3906,31 @@ impl Device for Rex3 {
                         u32::from_str_radix(cm_s.trim_start_matches("0x"), 16)
                             .map_err(|_| format!("bad cm: {cm_s}"))?
                     } else { 0 };
+                    // Dispatch reads `shaders`, prebuilt and Cranelift entries
+                    // alike, so that is where a shape is taken out and put back;
+                    // the JIT's own record follows.
+                    let key = (dm0, dm1, cm);
+                    let mut disabled = self.disabled_shaders.lock();
+                    let had = if enable {
+                        disabled.remove(&key).map(|f| {
+                            if let Some(f) = f { self.shaders.write().insert(key, f); }
+                        }).is_some()
+                    } else if !disabled.contains_key(&key) {
+                        let f = self.shaders.write().remove(&key);
+                        disabled.insert(key, f);
+                        f.is_some()
+                    } else {
+                        false
+                    };
+                    self.any_disabled.store(!disabled.is_empty(), Ordering::Relaxed);
+                    drop(disabled);
+                    self.shader_epoch.fetch_add(1, Ordering::Relaxed);
                     if let Some(ref jit) = self.rex_jit {
                         if enable { jit.enable_shader(dm0, dm1, cm); } else { jit.disable_shader(dm0, dm1, cm); }
-                        self.jit_last.set((0, 0, 0, None));
-                        writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {}",
-                            if enable { "enabled" } else { "disabled" }).unwrap();
                     }
+                    writeln!(writer, "Shader dm0={dm0:#010x} dm1={dm1:#010x} cm={cm:#010x}: {}{}",
+                        if enable { "enabled" } else { "disabled" },
+                        if had { "" } else { " (no shader was dispatched for it)" }).unwrap();
                 }
                 _ => return Err("Usage: rex jit <on|off|status|list> | rex jit <disable|enable> <dm0_hex> <dm1_hex> [cm_hex]".to_string()),
             }

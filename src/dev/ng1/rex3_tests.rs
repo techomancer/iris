@@ -3935,6 +3935,76 @@ mod jit_tests {
         );
     }
 
+    /// SCR2SCR from the second buffer of a 12-bit double-buffered RGB window
+    /// (DBLSRC): the compiled source read took the first buffer.
+    #[test]
+    fn jit_scr2scr_rgb12_dblsrc() {
+        let dm1 = DRAWMODE1_PLANES_RGB | DRAWMODE1_DRAWDEPTH_12 << 3 | 1 << 5 | 1 << 15
+            | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
+        compare_jit_interp(16, 0, 23, 3,
+            |rex| {
+                unsafe {
+                    let fb = &mut *rex.fb_rgb.get();
+                    for y in 0..4u32 {
+                        for x in 0..8u32 {
+                            fb[(y * 2048 + x) as usize] = 0x0012_3456u32.wrapping_mul(y * 8 + x + 3) & 0xFF_FFFF;
+                        }
+                    }
+                }
+                reg(rex, REX3_DRAWMODE1, dm1);
+                reg(rex, REX3_WRMASK,   0xFFFFFF);
+                reg(rex, REX3_XYMOVE,   (16u32 << 16) | 0);
+                reg(rex, REX3_XYSTARTI, xy(0, 0));
+                reg(rex, REX3_XYENDI,   xy(7, 3));
+            },
+            DM0_SCR2SCR, dm1,
+        );
+    }
+
+    /// `rex jit disable` takes a shape out of dispatch, where prebuilt and
+    /// Cranelift shaders both live, keeps it from being compiled again, and
+    /// `rex jit enable` puts the same shader back. It used to change only the
+    /// JIT's own record, so a "disabled" shader went on drawing.
+    #[test]
+    fn rex_jit_disable_takes_a_shape_out_of_dispatch() {
+        use crate::traits::Device;
+        let dm1 = DM1_CI8_SRC;
+        let dm0 = DM0_DRAW_BLOCK;
+        let rex = make_rex3_jit();
+        rex3init(rex);
+        let draw = |rex: &Rex3| {
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,   0xFF);
+            reg(rex, REX3_COLORI,   0x5A);
+            reg(rex, REX3_XYSTARTI, xy(0, 0));
+            reg(rex, REX3_XYENDI,   xy(3, 3));
+            reg_go(rex, REX3_DRAWMODE0, dm0);
+        };
+        draw(rex);
+        let cm = unsafe { (*rex.context.get()).clipmode } & CLIPMODE_JIT_KEY_MASK;
+        let jit = rex.rex_jit.as_ref().unwrap();
+        assert!(jit.wait_compiled(dm0, dm1, cm), "compile failed");
+        let key = (dm0, dm1, cm);
+        let f = *rex.shaders.read().get(&key).expect("compiled shader not published");
+        let args = |verb: &'static str| -> Vec<String> {
+            vec!["jit".into(), verb.into(), format!("{dm0:x}"), format!("{dm1:x}"), format!("{cm:x}")]
+        };
+        let run = |verb: &'static str| {
+            let a = args(verb);
+            let a: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+            rex.execute_command("rex", &a, Box::new(std::io::sink())).unwrap();
+        };
+        run("disable");
+        assert!(rex.shaders.read().get(&key).is_none(), "disabled shape still dispatched");
+        draw(rex); // generic path; must not compile it back in
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(rex.shaders.read().get(&key).is_none(), "disabled shape was compiled again");
+        assert!(dump_region(rex, 0, 0, 3, 3).iter().all(|&p| p & 0xFF == 0x5A), "generic path did not draw");
+        run("enable");
+        let back = *rex.shaders.read().get(&key).expect("enabled shape not dispatched");
+        assert!(back as usize == f as usize, "enable restored a different shader");
+    }
+
     /// I_LINE CI8 solid line — covers the basic Bresenham loop.
     #[test]
     fn jit_iline_ci8_solid() {
@@ -4383,6 +4453,91 @@ mod jit_tests {
 
         assert_eq!(words_interp, words_jit,
             "RGB24 HOSTR JIT/interp mismatch:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    /// A HOSTR READ of one row, `width` pixels from (0, 0) with RGB and aux
+    /// planes filled with distinct values, must hand back the same words from
+    /// the compiled shader as from the interpreter.
+    fn assert_hostr_jit_matches_interp(dm0_read: u32, dm1: u32, width: i32) {
+        let rgb: Vec<u32> = (0..width as u32).map(|i| 0x0012_3456u32.wrapping_mul(i + 3) & 0xFF_FFFF).collect();
+        let aux: Vec<u32> = (0..width as u32).map(|i| 0x0009_A5C3u32.wrapping_mul(i + 5) & 0xFF_FFFF).collect();
+        let setup_read = |rex: &Rex3| {
+            unsafe {
+                (&mut *rex.fb_rgb.get())[..width as usize].copy_from_slice(&rgb);
+                (&mut *rex.fb_aux.get())[..width as usize].copy_from_slice(&aux);
+            }
+            reg(rex, REX3_DRAWMODE1, dm1);
+            reg(rex, REX3_WRMASK,    0xFFFFFF);
+            reg(rex, REX3_XYENDI,    xy(width - 1, 0));
+            reg(rex, REX3_XYSTARTI,  xy(0, 0));
+        };
+        let host_count = {
+            let m = crate::dev::ng1::rex3_shape::unpack(dm0_read, dm1, 0);
+            match (m.rwpacked != 0, m.hostdepth) {
+                (false, _) => 1,
+                (true, DRAWMODE1_HOSTDEPTH_4) => 8,
+                (true, DRAWMODE1_HOSTDEPTH_8) => 4,
+                (true, DRAWMODE1_HOSTDEPTH_12) => 2,
+                (true, _) => 1,
+            }
+        };
+        let words = (width + host_count - 1) / host_count;
+        let read_words = |rex: &Rex3| -> Vec<u32> {
+            setup_read(rex);
+            reg_go(rex, REX3_DRAWMODE0, dm0_read);
+            (0..words).map(|i| if i < words - 1 { read_hostrw32(rex) } else { read_hostrw32_last(rex) }).collect()
+        };
+        let rex_i = make_rex3();
+        rex3init(rex_i);
+        let words_interp = read_words(rex_i);
+        assert!(words_interp.iter().any(|&w| w != 0), "interpreter read nothing: vacuous");
+
+        let rex_j = make_rex3_jit();
+        rex3init(rex_j);
+        let _ = read_words(rex_j); // trigger compile
+        if let Some(ref jit) = rex_j.rex_jit {
+            assert!(jit.wait_compiled(dm0_read, dm1, 0xF << CLIPMODE_CIDMATCH_SHIFT),
+                "JIT compile failed dm0={dm0_read:#010x} dm1={dm1:#010x}");
+        }
+        let words_jit = read_words(rex_j);
+        assert_eq!(words_interp, words_jit,
+            "HOSTR JIT/interp mismatch dm0={dm0_read:#010x} dm1={dm1:#010x}:\n  interp={words_interp:08x?}\n  jit   ={words_jit:08x?}");
+    }
+
+    /// IRIX's glReadPixels from a 12-bit double-buffered RGB window: DRAWMODE0
+    /// 0x65 (READ BLOCK DOSETUP COLORHOST), DRAWMODE1 0x3565fbb1 (12-bit RGB,
+    /// 32-bit host words, DBLSRC, RWPACKED, SWAPENDIAN, plus the DITHER and
+    /// BLEND bits a READ ignores) exactly as captured from the guest. The
+    /// compiled shader read the first buffer whatever DBLSRC said, so the
+    /// readback after warm-up was the other buffer's pixels.
+    #[test]
+    fn jit_hostr_rgb12_dblsrc_swapendian_irix_readpixels() {
+        assert_hostr_jit_matches_interp(0x65, 0x3565_fbb1, 8);
+    }
+
+    /// The same read from the first buffer, and from the second buffer of the
+    /// 4- and 8-bit RGB depths.
+    #[test]
+    fn jit_hostr_rgb_depths_and_buffers() {
+        let base = 0x3565_fbb1 & !0x3f; // planes, drawdepth, dblsrc cleared
+        for depth in [DRAWMODE1_DRAWDEPTH_4, DRAWMODE1_DRAWDEPTH_8, DRAWMODE1_DRAWDEPTH_12] {
+            for dblsrc in [0, 1u32] {
+                assert_hostr_jit_matches_interp(0x65, base | DRAWMODE1_PLANES_RGB | depth << 3 | dblsrc << 5, 8);
+            }
+        }
+    }
+
+    /// Overlay, popup and CID planes live in the aux framebuffer at their own
+    /// bit offsets (and DBLSRC picks the second one): the compiled HOSTR read
+    /// took the raw low bits instead.
+    #[test]
+    fn jit_hostr_aux_planes() {
+        let base = 0x3565_fbb1 & !(0x3f | 1 << 15); // CI: rgbmode off
+        for planes in [DRAWMODE1_PLANES_OLAY, DRAWMODE1_PLANES_PUP, DRAWMODE1_PLANES_CID] {
+            for dblsrc in [0, 1u32] {
+                assert_hostr_jit_matches_interp(0x65, base | planes | DRAWMODE1_DRAWDEPTH_8 << 3 | dblsrc << 5, 8);
+            }
+        }
     }
 
     /// Multi-row HOSTR block with STOPONY *not* set — mirrors the real cursor
@@ -7313,3 +7468,56 @@ fn precompiled_shaders_handle_batched_transfers() {
     }
 }
 
+
+/// A GO on STEPZ fails the Z pattern for its one pixel: IRIX's software
+/// rasteriser on Newport draws textured spans one GO per pixel and steps over
+/// transparent texels with STEPZ (blast's billboards drew their transparent
+/// corners, as smeared rows and solid white triangles, when STEPZ was ignored).
+/// The stepped pixel is left alone, or gets COLORBACK under ZPOPAQUE; the
+/// iteration still advances, so the next pixels land in place; and the
+/// guest's ZPATTERN is untouched.
+#[test]
+fn stepz_go_skips_its_pixel() {
+    const Y: i32 = 300;
+    const N: usize = 9;
+    const SENTINEL: u32 = 0x0012_3456;
+    const BACK: u32 = 0x0055_6677;
+    // A span with no STOPONX: one pixel per GO (DOSETUP, as IRIX sends it).
+    let one_px = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN_SH | DM0_DOSETUP;
+    for zpopaque in [false, true] {
+        let rex = make_rex3();
+        rex3init(rex);
+        {
+            let fb = unsafe { &mut *rex.fb_rgb.get() };
+            for x in 0..N { fb[Y as usize * 2048 + x] = SENTINEL; }
+        }
+        let dm0 = one_px | if zpopaque { 1 << 16 } else { 0 };
+        reg(rex, REX3_DRAWMODE0, dm0);
+        reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
+        reg(rex, REX3_WRMASK, 0xFFFFFF);
+        reg(rex, REX3_ZPATTERN, 0x1234_5678);
+        reg(rex, REX3_COLORBACK, BACK);
+        reg(rex, REX3_COLORRED, 200u32 << 11);
+        reg(rex, REX3_COLORGRN, 150u32 << 11);
+        reg(rex, REX3_COLORBLUE, 100u32 << 11);
+        reg(rex, REX3_XYENDI, xy(N as i32 - 1, Y));
+        reg_go(rex, REX3_XYSTARTI, xy(0, Y)); // pixel 0, drawn
+        for x in 1..N {
+            if x % 2 == 1 {
+                reg_go(rex, REX3_STEPZ, 0);
+            } else {
+                reg_go(rex, REX3_DRAWMODE0, dm0);
+            }
+        }
+        rex.wait_idle();
+        let fb = unsafe { &*rex.fb_rgb.get() };
+        let drawn = fb[Y as usize * 2048];
+        assert!(drawn != SENTINEL && drawn != BACK, "pixel 0 not drawn: {drawn:#08x}");
+        for x in 0..N {
+            let got = fb[Y as usize * 2048 + x];
+            let want = if x % 2 == 0 { drawn } else if zpopaque { BACK } else { SENTINEL };
+            assert_eq!(got, want, "zpopaque={zpopaque} pixel {x}: {got:#08x}, want {want:#08x}");
+        }
+        assert_eq!(read_reg(rex, REX3_ZPATTERN), 0x1234_5678, "STEPZ changed the guest's ZPATTERN");
+    }
+}

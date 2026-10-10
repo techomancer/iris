@@ -99,6 +99,20 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **Newport glReadPixels from a double-buffered window reads the right
+  buffer with the REX JIT.** The compiled READ shader ignored DBLSRC (and the
+  bit offsets of the overlay, popup and CID planes), so once a 12-bit
+  double-buffered readback shape was compiled, every read after the first
+  returned the other buffer's pixels. Its screen-to-screen copy had the same
+  gap for RGB. Both now take the plane's bits as the interpreter does. See
+  `rules/rex3/jit-reads-take-the-plane-bits.md`.
+- **Newport (REX3) honours STEPZ.** A GO on STEPZ fails the Z pattern test
+  for its one pixel (rex3.pdf): the iteration advances but the pixel is not
+  written (COLORBACK under ZPOPAQUE). IRIX's software rasteriser draws
+  textured, alpha-tested spans one GO per pixel and skips rejected texels
+  this way; the emulator drew them, so `blast -T`'s billboards showed their
+  transparent corners as smeared rows and solid white triangles. See
+  `rules/rex3/stepz-steps-over-one-pixel.md`.
 - **2026-10-09 — Newport (REX3) blends again under IRIX OpenGL.**
   DRAWMODE1's BLENDALPHA bit was applied to every channel, so with it clear
   `BF_SA` was 1.0 for red, green and blue too and nothing was ever
@@ -159,6 +173,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Monitor and serial ports
 
+- **`rex jit disable` works again.** Since prebuilt and Cranelift shaders
+  share one dispatch map, disabling a shape only changed the JIT's own record
+  and the shader went on drawing. It now takes the shape out of dispatch
+  (whichever engine built it), keeps it from being compiled again, and
+  `rex jit enable` puts the same shader back.
 - **`ioc ticks`**: how the guest keeps up with the 8254 timers. Per timer:
   ticks fired, ticks the guest acknowledged, ticks that landed on a still
   pending one (merged, never seen by the guest) and a histogram of
