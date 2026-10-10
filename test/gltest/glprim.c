@@ -150,6 +150,22 @@ static char scene[16] = "";           /* --scene depth|stencil|alphatest|blend *
 static GLenum depth_func = GL_LESS;   /* --depthfunc */
 static int want_stencil = 0;
 
+/* An exact configuration: --visual R,G,B[,A] (no A: alpha 0), --zs (depth
+   and stencil bits, 0 allowed). Unset (-1) keeps glXChooseVisual's "at
+   least 1 bit" request. What the run got goes in got_*. */
+static int want_rgba[4] = { -1, -1, -1, -1 };
+static int want_z = -1, want_s = -1;
+static int list_visuals = 0;          /* --listvisuals */
+static int use_pbuffer = 0;           /* --pbuffer */
+static int do_check = 0;              /* --check */
+static int check_fails = 0;
+static int got_rgba[4], got_z, got_s, got_dbl;
+
+/* GLX_SGIX_fbconfig + GLX_SGIX_pbuffer: IRIX's libGL has them. */
+#if defined(__sgi) && defined(GLX_SGIX_fbconfig) && defined(GLX_SGIX_pbuffer)
+#define HAVE_PBUFFER 1
+#endif
+
 /* ---- readback (--read) ---------------------------------------------------
    After the draw (and glFinish), read pixels back and print what came back:
      ximage   XGetImage of the window (Xsgi, front buffer)
@@ -915,6 +931,15 @@ static void usage(void) {
            "  --readout PREFIX     also write PREFIX_<mode>.ppm (colour) / .pgm (depth, stencil)\n"
            "  --backclear R,G,B    with --db: back buffer colour for the back read (default 0,.75,.75)\n"
            "  (--scene quadrants is the readback pattern: depth + stencil, see source)\n");
+    printf("  --visual R,G,B[,A]   exactly these colour bits (no A: alpha 0), e.g. 3,3,2\n"
+           "                       4,4,4 4,4,4,4 8,8,8,8 10,10,10,2 12,12,12\n"
+           "  --zs SPEC            exactly these depth/stencil bits: none | Z,S | s8z24 z32\n"
+           "                       z24 s4z20 z16 s8z16 (sets --depth / stencil use)\n"
+           "  --pbuffer            draw into a GLX_SGIX_pbuffer (window size) instead of a\n"
+           "                       window; reads come from the pbuffer\n"
+           "  --listvisuals        list the GLX visuals and pbuffer fbconfigs, then exit\n"
+           "  --check              with --scene quadrants: check the readbacks against the\n"
+           "                       scene; prints check PASS / FAIL, exit status = failures\n");
 }
 
 static int parse_ints(const char *s, int *out, int n) {
@@ -938,6 +963,46 @@ static int parse_floats(const char *s, float *out, int n) {
         s = end;
         if (i < n - 1) { if (*s != ',') return 0; s++; }
     }
+    return 1;
+}
+
+/* --visual R,G,B[,A] (':' also separates): exact channel bits, alpha 0
+   when not given. */
+static int parse_visual(const char *s) {
+    int v[4] = { -1, -1, -1, 0 }, k = 0;
+    while (k < 4) {
+        char *end;
+        long n = strtol(s, &end, 10);
+        if (end == s) return 0;
+        v[k++] = (int)n;
+        s = end;
+        if (!*s) break;
+        if (*s != ',' && *s != ':') return 0;
+        s++;
+    }
+    if (k < 3 || *s) return 0;
+    for (k = 0; k < 4; k++) want_rgba[k] = v[k];
+    return 1;
+}
+
+/* --zs: none, Z,S, or letters: s8z24, z32, z24, s4z20, z16, s8z16 (a part
+   not named is 0 bits). */
+static int parse_zs(const char *s) {
+    int v[2] = { 0, 0 };
+    if (!strcmp(s, "none")) { want_z = 0; want_s = 0; return 1; }
+    if (strchr(s, ',')) {
+        if (!parse_ints(s, v, 2)) return 0;
+    } else {
+        while (*s) {
+            char c = *s++, *end;
+            long n = strtol(s, &end, 10);
+            if (end == s || (c != 'z' && c != 's')) return 0;
+            v[c == 's'] = (int)n;
+            s = end;
+        }
+    }
+    want_z = v[0];
+    want_s = v[1];
     return 1;
 }
 
@@ -1087,10 +1152,17 @@ static void parse_args(int argc, char **argv) {
             if (k == 8) { fprintf(stderr, "bad --depthfunc\n"); exit(2); }
             depth_func = GL_NEVER + k;
         }
+        else if (!strcmp(a, "--visual")) { NEED(); if (!parse_visual(next)) { fprintf(stderr, "bad --visual\n"); exit(2); } }
+        else if (!strcmp(a, "--zs")) { NEED(); if (!parse_zs(next)) { fprintf(stderr, "bad --zs\n"); exit(2); } }
+        else if (!strcmp(a, "--listvisuals")) list_visuals = 1;
+        else if (!strcmp(a, "--pbuffer")) use_pbuffer = 1;
+        else if (!strcmp(a, "--check")) do_check = 1;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); exit(0); }
         else { fprintf(stderr, "unknown option %s\n", a); usage(); exit(2); }
 #undef NEED
     }
+    /* An exact depth/stencil request decides which buffers are used. */
+    if (want_z >= 0) { depth = want_z > 0; want_stencil = want_s > 0; }
 }
 
 /* ---- readback ------------------------------------------------------------ */
@@ -1131,6 +1203,7 @@ static int read_pixels(Display *dpy, Window win, XVisualInfo *vi, const char *m,
     if (!strcmp(m, "ximage")) {
         XImage *im;
         int rs, rb, gs, gb, bs, bb;
+        if (!win || !vi) { printf("  ximage: no window (pbuffer)\n"); return -1; }
         mask_bits(vi->red_mask, &rs, &rb);
         mask_bits(vi->green_mask, &gs, &gb);
         mask_bits(vi->blue_mask, &bs, &bb);
@@ -1245,6 +1318,78 @@ static void write_image(const char *m, int kind, int w, int h, const unsigned lo
     printf("  wrote %s\n", name);
 }
 
+/* --check: one sample against the scene. Colour channels may be off by one
+   step of the channel's bits (rounding, dither) plus 2/255; depth by 0.004
+   (the quadrants are 0.25 apart); stencil must match in its bits. */
+static void check_sample(const char *m, const char *lbl, int kind, unsigned long v,
+                         double r, double g, double b) {
+    int bad = 0, k;
+    if (kind == RB_COLOR) {
+        double want[3];
+        want[0] = r; want[1] = g; want[2] = b;
+        for (k = 0; k < 3; k++) {
+            int bits = got_rgba[k] > 0 ? got_rgba[k] : 1;
+            int tol = 255 / ((1 << (bits > 8 ? 8 : bits)) - 1) + 2;
+            int have = (int)((v >> (24 - 8 * k)) & 0xff);
+            int w8 = (int)(want[k] * 255.0 + 0.5);
+            if (have - w8 > tol || w8 - have > tol) bad = 1;
+        }
+        if (bad) printf("glprim: check %s %s FAIL %08lx, want %.3f,%.3f,%.3f\n", m, lbl, v, r, g, b);
+    } else if (kind == RB_DEPTH) {
+        double d = (double)v / 4294967295.0;
+        if (d - r > 0.004 || r - d > 0.004) {
+            bad = 1;
+            printf("glprim: check %s %s FAIL %08lx (%.4f), want %.4f\n", m, lbl, v, d, r);
+        }
+    } else {
+        unsigned long want = (unsigned long)r & ((1UL << got_s) - 1);
+        if (v != want) {
+            bad = 1;
+            printf("glprim: check %s %s FAIL %lu, want %lu\n", m, lbl, v, want);
+        }
+    }
+    check_fails += bad;
+}
+
+/* The quadrants scene (see draw_scene) at the do_reads sample points, or
+   for "back" with --db the re-cleared back buffer and its white marker. */
+static void check_read(const char *m, int kind, GLenum err, const unsigned long *vals,
+                       int w, const int *sx, const int *sy) {
+    static const char *lbl[9] = { "bl", "br", "tl", "tr", "centre", "q.bl", "q.br", "q.tl", "q.tr" };
+    double x2 = w * 0.5 + 4, x3 = w - 8;
+    double t = (sx[8] + 0.5 - x2) / (x3 - x2);
+    int before = check_fails;
+#define V(k) vals[sy[k] * w + sx[k]]
+    if (err != GL_NO_ERROR) {
+        printf("glprim: check %s FAIL gl error 0x%x\n", m, (unsigned)err);
+        check_fails++;
+    }
+    if (kind == RB_COLOR && !strcmp(m, "back") && got_dbl) {
+        check_sample(m, lbl[0], kind, V(0), 1, 1, 1);
+        check_sample(m, lbl[4], kind, V(4), back_rgb[0], back_rgb[1], back_rgb[2]);
+    } else if (kind == RB_COLOR) {
+        if (!no_clear) check_sample(m, lbl[0], kind, V(0), clear_rgb[0], clear_rgb[1], clear_rgb[2]);
+        check_sample(m, lbl[5], kind, V(5), 1, 0, 0);
+        check_sample(m, lbl[6], kind, V(6), 0, 1, 0);
+        check_sample(m, lbl[7], kind, V(7), 0, 0, 1);
+        check_sample(m, lbl[8], kind, V(8), t, t, 0);
+    } else if (kind == RB_DEPTH) {
+        check_sample(m, lbl[0], kind, V(0), 1.0, 0, 0);
+        check_sample(m, lbl[5], kind, V(5), 0.25, 0, 0);
+        check_sample(m, lbl[6], kind, V(6), 0.5, 0, 0);
+        check_sample(m, lbl[7], kind, V(7), 0.75, 0, 0);
+        check_sample(m, lbl[8], kind, V(8), 0.05 + 0.9 * t, 0, 0);
+    } else {
+        check_sample(m, lbl[0], kind, V(0), 0, 0, 0);
+        check_sample(m, lbl[5], kind, V(5), 1, 0, 0);
+        check_sample(m, lbl[6], kind, V(6), 2, 0, 0);
+        check_sample(m, lbl[7], kind, V(7), 3, 0, 0);
+        check_sample(m, lbl[8], kind, V(8), 4, 0, 0);
+    }
+#undef V
+    if (check_fails == before) printf("glprim: check %s ok\n", m);
+}
+
 static void do_reads(Display *dpy, Window win, XVisualInfo *vi) {
     int x = 0, y = 0, w = win_w, h = win_h, i;
     unsigned long *vals;
@@ -1288,26 +1433,208 @@ static void do_reads(Display *dpy, Window win, XVisualInfo *vi) {
             print_val(kind, vals[sy[k] * w + sx[k]]);
             printf("\n");
         }
+        if (do_check && rrect[0] < 0 && !strcmp(scene, "quadrants"))
+            check_read(reads[i], kind, err, vals, w, sx, sy);
         if (read_out) write_image(reads[i], kind, w, h, vals);
         fflush(stdout);
     }
     free(vals);
 }
 
+/* ---- visuals and fbconfigs ---------------------------------------------- */
+
+struct cfg {
+    int gl, rgba, level, bufsize, r, g, b, a, db, stereo, z, s, accum, aux;
+    long id;                          /* visual id, or fbconfig id */
+    int drawable, pbmax_w, pbmax_h;   /* fbconfigs only */
+};
+
+static void visual_cfg(Display *dpy, XVisualInfo *v, struct cfg *c) {
+    memset(c, 0, sizeof(*c));
+    c->id = (long)v->visualid;
+    glXGetConfig(dpy, v, GLX_USE_GL, &c->gl);
+    if (!c->gl) return;
+    glXGetConfig(dpy, v, GLX_RGBA, &c->rgba);
+    glXGetConfig(dpy, v, GLX_LEVEL, &c->level);
+    glXGetConfig(dpy, v, GLX_BUFFER_SIZE, &c->bufsize);
+    glXGetConfig(dpy, v, GLX_RED_SIZE, &c->r);
+    glXGetConfig(dpy, v, GLX_GREEN_SIZE, &c->g);
+    glXGetConfig(dpy, v, GLX_BLUE_SIZE, &c->b);
+    glXGetConfig(dpy, v, GLX_ALPHA_SIZE, &c->a);
+    glXGetConfig(dpy, v, GLX_DOUBLEBUFFER, &c->db);
+    glXGetConfig(dpy, v, GLX_STEREO, &c->stereo);
+    glXGetConfig(dpy, v, GLX_DEPTH_SIZE, &c->z);
+    glXGetConfig(dpy, v, GLX_STENCIL_SIZE, &c->s);
+    glXGetConfig(dpy, v, GLX_ACCUM_RED_SIZE, &c->accum);
+    glXGetConfig(dpy, v, GLX_AUX_BUFFERS, &c->aux);
+}
+
+/* How well a configuration fits the request: -1 does not, else lower is
+   better. Without --visual the deepest colour wins; parts not asked for
+   (alpha, depth, stencil, accumulation, aux, stereo) count against. */
+static int cfg_score(const struct cfg *c) {
+    int s = 0;
+    if (!c->gl || !c->rgba || c->level != 0 || c->db != dbl) return -1;
+    if (want_rgba[0] >= 0) {
+        if (c->r != want_rgba[0] || c->g != want_rgba[1] || c->b != want_rgba[2] || c->a != want_rgba[3])
+            return -1;
+    } else s += 4096 - 64 * (c->r + c->g + c->b) + c->a;
+    if (want_z >= 0) {
+        if (c->z != want_z || c->s != want_s) return -1;
+    } else {
+        if ((depth && !c->z) || (want_stencil && !c->s)) return -1;
+        s += (depth ? 0 : c->z) + (want_stencil ? 0 : c->s);
+    }
+    return s + c->accum + c->aux + 64 * c->stereo;
+}
+
+static void print_cfg(const char *what, const struct cfg *c) {
+    printf("%s 0x%lx ", what, c->id);
+    if (c->rgba) printf("rgba %d,%d,%d,%d", c->r, c->g, c->b, c->a);
+    else printf("ci %d", c->bufsize);
+    printf(" z%d s%d %s level %d", c->z, c->s, c->db ? "db" : "sb", c->level);
+    if (c->stereo) printf(" stereo");
+    if (c->accum) printf(" accum %d", c->accum);
+    if (c->aux) printf(" aux %d", c->aux);
+    if (c->drawable)
+        printf(" drawable %s%s%s pbuffer max %dx%d",
+               c->drawable & 1 ? "w" : "", c->drawable & 2 ? "p" : "", c->drawable & 4 ? "P" : "",
+               c->pbmax_w, c->pbmax_h);
+    printf("\n");
+}
+
+/* The visual for an exact request (--visual / --zs). */
+static XVisualInfo *pick_visual(Display *dpy, struct cfg *out) {
+    XVisualInfo tmpl, *vs, *best = NULL;
+    int n, i, best_score = -1;
+    struct cfg c;
+    tmpl.screen = DefaultScreen(dpy);
+    vs = XGetVisualInfo(dpy, VisualScreenMask, &tmpl, &n);
+    for (i = 0; vs && i < n; i++) {
+        int s;
+        visual_cfg(dpy, &vs[i], &c);
+        s = cfg_score(&c);
+        if (s >= 0 && (best_score < 0 || s < best_score)) { best_score = s; best = &vs[i]; *out = c; }
+    }
+    if (best) {
+        /* Keep it past XFree. */
+        XVisualInfo *one = malloc(sizeof(*one));
+        if (one) *one = *best;
+        best = one;
+    }
+    if (vs) XFree(vs);
+    return best;
+}
+
+#ifdef HAVE_PBUFFER
+static void fb_cfg(Display *dpy, GLXFBConfigSGIX f, struct cfg *c) {
+    int rt = 0, id = 0;
+    memset(c, 0, sizeof(*c));
+    c->gl = 1;
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_FBCONFIG_ID_SGIX, &id);
+    c->id = id;
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_RENDER_TYPE_SGIX, &rt);
+    c->rgba = (rt & GLX_RGBA_BIT_SGIX) != 0;
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_DRAWABLE_TYPE_SGIX, &c->drawable);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_LEVEL, &c->level);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_BUFFER_SIZE, &c->bufsize);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_RED_SIZE, &c->r);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_GREEN_SIZE, &c->g);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_BLUE_SIZE, &c->b);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_ALPHA_SIZE, &c->a);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_DOUBLEBUFFER, &c->db);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_STEREO, &c->stereo);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_DEPTH_SIZE, &c->z);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_STENCIL_SIZE, &c->s);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_ACCUM_RED_SIZE, &c->accum);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_AUX_BUFFERS, &c->aux);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_MAX_PBUFFER_WIDTH_SGIX, &c->pbmax_w);
+    glXGetFBConfigAttribSGIX(dpy, f, GLX_MAX_PBUFFER_HEIGHT_SGIX, &c->pbmax_h);
+}
+
+/* The pbuffer-capable fbconfigs (RGBA, or every render type for the list). */
+static GLXFBConfigSGIX *pbuffer_configs(Display *dpy, int rgba_only, int *n) {
+    int att[8], k = 0;
+    att[k++] = GLX_DRAWABLE_TYPE_SGIX; att[k++] = GLX_PBUFFER_BIT_SGIX;
+    att[k++] = GLX_RENDER_TYPE_SGIX;
+    att[k++] = rgba_only ? GLX_RGBA_BIT_SGIX : GLX_RGBA_BIT_SGIX | GLX_COLOR_INDEX_BIT_SGIX;
+    att[k++] = None;
+    *n = 0;
+    return glXChooseFBConfigSGIX(dpy, DefaultScreen(dpy), att, n);
+}
+
+static GLXFBConfigSGIX pick_fbconfig(Display *dpy, struct cfg *out) {
+    int n, i, best = -1, best_score = -1;
+    struct cfg c;
+    GLXFBConfigSGIX *fs = pbuffer_configs(dpy, 1, &n), f = 0;
+    for (i = 0; fs && i < n; i++) {
+        int s;
+        fb_cfg(dpy, fs[i], &c);
+        s = cfg_score(&c);
+        if (s >= 0 && (best_score < 0 || s < best_score)) { best_score = s; best = i; *out = c; }
+    }
+    if (best >= 0) f = fs[best];
+    if (fs) XFree(fs);
+    return f;
+}
+#endif
+
+static void list_configs(Display *dpy) {
+    XVisualInfo tmpl, *vs;
+    int n, i;
+    struct cfg c;
+    tmpl.screen = DefaultScreen(dpy);
+    vs = XGetVisualInfo(dpy, VisualScreenMask, &tmpl, &n);
+    printf("glprim: %d visuals\n", vs ? n : 0);
+    for (i = 0; vs && i < n; i++) {
+        visual_cfg(dpy, &vs[i], &c);
+        if (!c.gl) { printf("visual 0x%lx depth %d: no GL\n", c.id, vs[i].depth); continue; }
+        print_cfg("visual", &c);
+    }
+    if (vs) XFree(vs);
+#ifdef HAVE_PBUFFER
+    {
+        GLXFBConfigSGIX *fs = pbuffer_configs(dpy, 0, &n);
+        printf("glprim: %d pbuffer fbconfigs (drawable w window, p pixmap, P pbuffer)\n", fs ? n : 0);
+        for (i = 0; fs && i < n; i++) {
+            fb_cfg(dpy, fs[i], &c);
+            print_cfg("fbconfig", &c);
+        }
+        if (fs) XFree(fs);
+    }
+#else
+    printf("glprim: built without GLX_SGIX_pbuffer\n");
+#endif
+}
+
+#ifdef HAVE_PBUFFER
+static int x_error = 0;
+static int on_xerror(Display *d, XErrorEvent *e) {
+    (void)d;
+    x_error = e->error_code;
+    return 0;
+}
+#endif
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
     Display *dpy;
-    Window root, win;
-    XVisualInfo *vi;
+    Window root, win = 0;
+    GLXDrawable draw;
+    XVisualInfo *vi = NULL;
     XSetWindowAttributes swa;
     GLXContext glc;
     XEvent xev;
     int att[16], n = 0;
     GLenum mode;
     const struct vtx *verts;
-    int nverts, i, got_depth = 0, got_db = 0;
+    int nverts, i;
     float w, h;
+    struct cfg got;
+#ifdef HAVE_PBUFFER
+    GLXPbufferSGIX pb = 0;
+#endif
 
     parse_args(argc, argv);
     mode = prims[prim_idx].mode;
@@ -1315,48 +1642,92 @@ int main(int argc, char **argv) {
     dpy = XOpenDisplay(NULL);
     if (!dpy) { printf("Cannot connect to X server\n"); return 1; }
     root = DefaultRootWindow(dpy);
+    if (list_visuals) { list_configs(dpy); XCloseDisplay(dpy); return 0; }
 
-    att[n++] = GLX_RGBA;
-    att[n++] = GLX_RED_SIZE; att[n++] = 1;
-    att[n++] = GLX_GREEN_SIZE; att[n++] = 1;
-    att[n++] = GLX_BLUE_SIZE; att[n++] = 1;
-    if (dbl) att[n++] = GLX_DOUBLEBUFFER;
-    if (depth) { att[n++] = GLX_DEPTH_SIZE; att[n++] = 1; }
-    if (want_stencil) { att[n++] = GLX_STENCIL_SIZE; att[n++] = 1; }
-    att[n++] = None;
-    vi = glXChooseVisual(dpy, DefaultScreen(dpy), att);
-    if (!vi) { printf("No matching RGBA visual (db=%d depth=%d)\n", dbl, depth); return 1; }
-    glXGetConfig(dpy, vi, GLX_DEPTH_SIZE, &got_depth);
-    glXGetConfig(dpy, vi, GLX_DOUBLEBUFFER, &got_db);
+    if (use_pbuffer) {
+#ifdef HAVE_PBUFFER
+        GLXFBConfigSGIX fc = pick_fbconfig(dpy, &got);
+        int pbatt[4];
+        int (*old)(Display *, XErrorEvent *);
+        if (!fc) {
+            printf("glprim: no matching pbuffer config (rgba %d,%d,%d,%d z%d s%d db=%d)\n",
+                   want_rgba[0], want_rgba[1], want_rgba[2], want_rgba[3], want_z, want_s, dbl);
+            return 1;
+        }
+        pbatt[0] = GLX_PRESERVED_CONTENTS_SGIX; pbatt[1] = True; pbatt[2] = None;
+        old = XSetErrorHandler(on_xerror);
+        pb = glXCreateGLXPbufferSGIX(dpy, fc, (unsigned)win_w, (unsigned)win_h, pbatt);
+        XSync(dpy, False);
+        glc = pb && !x_error ? glXCreateContextWithConfigSGIX(dpy, fc, GLX_RGBA_TYPE_SGIX, NULL, GL_TRUE) : NULL;
+        XSync(dpy, False);
+        XSetErrorHandler(old);
+        if (!pb || !glc || x_error) {
+            printf("glprim: pbuffer %dx%d on fbconfig 0x%lx failed (pbuffer %s, context %s, X error %d)\n",
+                   win_w, win_h, got.id, pb ? "ok" : "none", glc ? "ok" : "none", x_error);
+            return 1;
+        }
+        if (!glXMakeCurrent(dpy, pb, glc)) { printf("glprim: glXMakeCurrent on the pbuffer failed\n"); return 1; }
+        draw = pb;
+        printf("glprim: pbuffer %dx%d\n", win_w, win_h);
+#else
+        printf("glprim: pbuffers need GLX_SGIX_pbuffer (IRIX)\n");
+        return 1;
+#endif
+    } else {
+        if (want_rgba[0] >= 0 || want_z >= 0) {
+            vi = pick_visual(dpy, &got);
+            if (!vi) {
+                printf("glprim: no matching visual (rgba %d,%d,%d,%d z%d s%d db=%d)\n",
+                       want_rgba[0], want_rgba[1], want_rgba[2], want_rgba[3], want_z, want_s, dbl);
+                return 1;
+            }
+        } else {
+            att[n++] = GLX_RGBA;
+            att[n++] = GLX_RED_SIZE; att[n++] = 1;
+            att[n++] = GLX_GREEN_SIZE; att[n++] = 1;
+            att[n++] = GLX_BLUE_SIZE; att[n++] = 1;
+            if (dbl) att[n++] = GLX_DOUBLEBUFFER;
+            if (depth) { att[n++] = GLX_DEPTH_SIZE; att[n++] = 1; }
+            if (want_stencil) { att[n++] = GLX_STENCIL_SIZE; att[n++] = 1; }
+            att[n++] = None;
+            vi = glXChooseVisual(dpy, DefaultScreen(dpy), att);
+            if (!vi) { printf("No matching RGBA visual (db=%d depth=%d)\n", dbl, depth); return 1; }
+            visual_cfg(dpy, vi, &got);
+        }
 
-    swa.colormap = XCreateColormap(dpy, root, vi->visual, AllocNone);
-    swa.event_mask = ExposureMask | StructureNotifyMask;
-    swa.border_pixel = 0;
-    win = XCreateWindow(dpy, root, 100, 100, win_w, win_h, 0, vi->depth, InputOutput,
-                        vi->visual, CWColormap | CWEventMask | CWBorderPixel, &swa);
-    XStoreName(dpy, win, "glprim");
-    XMapWindow(dpy, win);
-    /* Draw only once the window is really on screen. */
-    do { XNextEvent(dpy, &xev); } while (xev.type != Expose);
+        swa.colormap = XCreateColormap(dpy, root, vi->visual, AllocNone);
+        swa.event_mask = ExposureMask | StructureNotifyMask;
+        swa.border_pixel = 0;
+        win = XCreateWindow(dpy, root, 100, 100, win_w, win_h, 0, vi->depth, InputOutput,
+                            vi->visual, CWColormap | CWEventMask | CWBorderPixel, &swa);
+        XStoreName(dpy, win, "glprim");
+        XMapWindow(dpy, win);
+        /* Draw only once the window is really on screen. */
+        do { XNextEvent(dpy, &xev); } while (xev.type != Expose);
 
-    glc = glXCreateContext(dpy, vi, NULL, GL_TRUE);
-    glXMakeCurrent(dpy, win, glc);
+        glc = glXCreateContext(dpy, vi, NULL, GL_TRUE);
+        glXMakeCurrent(dpy, win, glc);
+        draw = win;
 
-    /* Where the window really is (the window manager may move it): screen
-       coordinates of the client area's top-left pixel, X convention. A GL
-       pixel (gx, gy) is at screen (ox + gx, oy + win_h - 1 - gy). */
-    {
-        int ox = 0, oy = 0;
-        Window child;
-        XTranslateCoordinates(dpy, win, root, 0, 0, &ox, &oy, &child);
-        printf("glprim: window origin %d,%d size %dx%d\n", ox, oy, win_w, win_h);
+        /* Where the window really is (the window manager may move it): screen
+           coordinates of the client area's top-left pixel, X convention. A GL
+           pixel (gx, gy) is at screen (ox + gx, oy + win_h - 1 - gy). */
+        {
+            int ox = 0, oy = 0;
+            Window child;
+            XTranslateCoordinates(dpy, win, root, 0, 0, &ox, &oy, &child);
+            printf("glprim: window origin %d,%d size %dx%d\n", ox, oy, win_w, win_h);
+        }
     }
+    got_rgba[0] = got.r; got_rgba[1] = got.g; got_rgba[2] = got.b; got_rgba[3] = got.a;
+    got_z = got.z; got_s = got.s; got_dbl = got.db;
+    print_cfg(use_pbuffer ? "glprim: config fbconfig" : "glprim: config visual", &got);
 
     printf("glprim: prim=%s %s %s vtx=%s color=%s%s visual=0x%lx depth=%d/%d bits db=%d/%d "
            "%s%s%s%s clear=%.2f,%.2f,%.2f\n",
            prims[prim_idx].name, smooth ? "smooth" : "flat", persp ? "persp" : "ortho",
-           vtx_form, col_form, mono ? " mono" : "", (unsigned long)vi->visualid,
-           depth, got_depth, dbl, got_db,
+           vtx_form, col_form, mono ? " mono" : "", got.id,
+           depth, got_z, dbl, got_dbl,
            cull ? "cull " : "", sc[0] >= 0 ? "scissor " : "", vp[0] >= 0 ? "viewport " : "",
            polymode == GL_FILL ? "" : (polymode == GL_LINE ? "polymode=line " : "polymode=point "),
            clear_rgb[0], clear_rgb[1], clear_rgb[2]);
@@ -1461,7 +1832,7 @@ int main(int argc, char **argv) {
         glEnd();
     }
 
-    if (dbl) glXSwapBuffers(dpy, win);
+    if (dbl) glXSwapBuffers(dpy, draw);
     else glFlush();
     glFinish();
 
@@ -1496,7 +1867,14 @@ int main(int argc, char **argv) {
 
     glXMakeCurrent(dpy, None, NULL);
     glXDestroyContext(dpy, glc);
-    XDestroyWindow(dpy, win);
+#ifdef HAVE_PBUFFER
+    if (pb) glXDestroyGLXPbufferSGIX(dpy, pb);
+#endif
+    if (win) XDestroyWindow(dpy, win);
     XCloseDisplay(dpy);
+    if (do_check && nreads > 0) {
+        printf("glprim: check %s (%d failures)\n", check_fails ? "FAIL" : "PASS", check_fails);
+        return check_fails > 125 ? 125 : check_fails;
+    }
     return 0;
 }
