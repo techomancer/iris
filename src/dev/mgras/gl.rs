@@ -529,6 +529,9 @@ pub struct Gl {
     point_size: f32,
     /// A texture read transfer is armed (READ_TEXTURE .. RESTORE_RSS).
     tex_reading: u32,
+    /// SAVE_RSS's fourth word: the planes the pixel operation transfers
+    /// (traced, glReadPixels: 0 colour, 0x1C00000 depth, 0x1800000 stencil).
+    pixel_planes: u32,
     pub stats_triangles: u64,
 }
 
@@ -1029,7 +1032,10 @@ impl Gl {
             }
             tok::INDEX_MASK => self.set_state(|g| g.index_mask = w0 & 0xFFF, sink),
             tok::READ_BUFFER => self.read_back = (d.get(2) == Some(&0x405)) as u32,
-            tok::SAVE_RSS => self.pixel_op = 1,
+            tok::SAVE_RSS => {
+                self.pixel_op = 1;
+                self.pixel_planes = d.get(3).copied().unwrap_or(0);
+            }
             tok::READ_TEXTURE if d.len() >= 5 => {
                 if sink.tracing_tex() {
                     sink.trace(format!("TEX read {}x{} page {:#x} xfrmode {:#x}", d[0], d[1], self.te_tables[0][0], d[4]));
@@ -1085,6 +1091,10 @@ impl Gl {
                     sink.rss_write(re::XFRCONTROL, 0, false);
                     sink.rss_write(super::rss::reg::TE_RAW, 0, false);
                 }
+                if self.stencil_pixels() {
+                    sink.rss_write(super::rss::reg::ZST_STENCIL, 0, false);
+                }
+                self.pixel_planes = 0;
                 self.pixel_op = 0;
                 self.end_raster(sink);
             }
@@ -1580,6 +1590,11 @@ impl Gl {
         (self.send_pixels[0] as usize * rows).min(1 << 22)
     }
 
+    /// The pixel operation transfers stencil indices (SAVE_RSS's planes).
+    fn stencil_pixels(&self) -> bool {
+        self.pixel_planes & 0x1C0_0000 == 0x180_0000
+    }
+
     /// glReadPixels: a DMA read block over the pixel block, in the read
     /// buffer (the depth buffer for the depth format, transfer mode format
     /// 2 / type 3, our reading); the host starts the transfer itself
@@ -1588,7 +1603,8 @@ impl Gl {
     fn get_pixels(&mut self, sink: &mut dyn Hq3Sink) {
         self.pixel_op = 2;
         self.begin_raster(sink);
-        let depth = (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3;
+        let stencil = self.stencil_pixels();
+        let depth = stencil || (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3;
         let drb = if depth {
             super::rss::ZST_PAGE
         } else {
@@ -1597,6 +1613,9 @@ impl Gl {
             (w & !0x3FF) | if (self.read_back != 0) != (self.swapped != 0) { b } else { a }
         };
         sink.rss_write(re::DRBPOINTERS, drb, false);
+        if stencil {
+            sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
+        }
         if !depth && self.rgb12_pair() {
             // 12-bit pairs: the read field picks the half.
             let b = (self.read_back != 0) != (self.swapped != 0);
@@ -1705,6 +1724,9 @@ impl Gl {
         if (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3 {
             // Depth pixels (glCopyPixels of depth draws them back).
             sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+        } else if self.stencil_pixels() {
+            sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+            sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
         }
         self.fill_mode(FILL_DMA_WRITE, sink);
         sink.rss_write(re::XFRMODE, self.xfrmode, false);

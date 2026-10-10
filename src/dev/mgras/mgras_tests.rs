@@ -773,6 +773,53 @@ fn gl_stencil_masks_a_later_draw() {
     m.stop_engines();
 }
 
+/// glReadPixels of GL_STENCIL_INDEX (traced, glprim --scene quadrants):
+/// SAVE_RSS's fourth word 0x1800000 names the stencil planes, the transfer
+/// is one byte a pixel (format 1, type 0), and the bytes are the ZST
+/// buffer's top byte, not the colour buffer's red.
+#[test]
+fn gl_read_stencil_index() {
+    let m = gl_board([1.0, 0.0, 0.0]);
+    fifo_token(&m, 0xBE, &[0]);
+    fifo_token(&m, 0x4C, &[]);
+    fifo_token(&m, 0x6F, &[1]);
+    fifo_token(&m, 0x41, &[7, 3, 0xFF]);
+    fifo_token(&m, 0x42, &[0, 0, 2]);
+    gl_tri(&m, [0.0, 1.0, 0.0], [[100.0, 50.0, 0.0], [300.0, 50.0, 0.0], [200.0, 250.0, 0.0]]);
+    fifo_token(&m, 0x6F, &[0]);
+    let read = |x: u64, y: u64, planes: u32| -> u8 {
+        fifo_token(&m, 0xD2, &[0x11E2_3929, 0x100_0000, 0x1E0_00FF, planes, 2]);
+        fifo_token(&m, 0x7C, &[1, 4]);
+        write(&m, 32, CFIFO, 0x8000_0010);
+        for w in [0x153, 0x0001_0001, 0x226, 0x47] {
+            write(&m, 32, CFIFO, w);
+        }
+        fifo_token(&m, 0x7C, &[2, 6]);
+        write(&m, 32, CFIFO, 0x8000_0018);
+        for w in [0x46, x << 16 | y, 0x28E, 0x47, x << 16 | y, 0x290] {
+            write(&m, 32, CFIFO, w);
+        }
+        fifo_token(&m, 0x7F, &[2, 4]);
+        write(&m, 32, CFIFO, 0x8000_0010);
+        for w in [0x158, 0x0001_0001, 0x159, 0x0040_0010] {
+            write(&m, 32, CFIFO, w);
+        }
+        fifo_token(&m, 0xDB, &[0x4009]);
+        let mem = eram_dma_setup(&m, 4);
+        fifo_dma(&m, 0x0B, 0x9);
+        fifo_token(&m, 0xA05, &[0x4009]);
+        fifo_token(&m, 0xD3, &[]);
+        m.state_hash();
+        let b = mem.bytes.lock();
+        b.get(&0x2000).copied().unwrap_or(0)
+    };
+    assert_eq!(read(200, 100, 0x180_0000), 3, "inside the triangle");
+    assert_eq!(read(20, 20, 0x180_0000), 0, "cleared");
+    // The same transfer with the colour planes: red's byte as before.
+    assert_eq!(read(20, 20, 0), 0xFF, "colour index read of the colour buffer");
+    m.stop_engines();
+}
+
 /// Depth GREATER with depth writes off: a far quad passes against a
 /// cleared-to-0 depth buffer, and leaves it at 0 for the next one.
 #[test]

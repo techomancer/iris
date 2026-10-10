@@ -1446,7 +1446,7 @@ static void do_reads(Display *dpy, Window win, XVisualInfo *vi) {
 struct cfg {
     int gl, rgba, level, bufsize, r, g, b, a, db, stereo, z, s, accum, aux;
     long id;                          /* visual id, or fbconfig id */
-    int drawable, pbmax_w, pbmax_h;   /* fbconfigs only */
+    int drawable, render, pbmax_w, pbmax_h;   /* fbconfigs only */
 };
 
 static void visual_cfg(Display *dpy, XVisualInfo *v, struct cfg *c) {
@@ -1497,8 +1497,9 @@ static void print_cfg(const char *what, const struct cfg *c) {
     if (c->accum) printf(" accum %d", c->accum);
     if (c->aux) printf(" aux %d", c->aux);
     if (c->drawable)
-        printf(" drawable %s%s%s pbuffer max %dx%d",
+        printf(" drawable %s%s%s render %s%s buffer %d pbuffer max %dx%d",
                c->drawable & 1 ? "w" : "", c->drawable & 2 ? "p" : "", c->drawable & 4 ? "P" : "",
+               c->render & 1 ? "rgba" : "", c->render & 2 ? "ci" : "", c->bufsize,
                c->pbmax_w, c->pbmax_h);
     printf("\n");
 }
@@ -1534,6 +1535,7 @@ static void fb_cfg(Display *dpy, GLXFBConfigSGIX f, struct cfg *c) {
     glXGetFBConfigAttribSGIX(dpy, f, GLX_FBCONFIG_ID_SGIX, &id);
     c->id = id;
     glXGetFBConfigAttribSGIX(dpy, f, GLX_RENDER_TYPE_SGIX, &rt);
+    c->render = rt;
     c->rgba = (rt & GLX_RGBA_BIT_SGIX) != 0;
     glXGetFBConfigAttribSGIX(dpy, f, GLX_DRAWABLE_TYPE_SGIX, &c->drawable);
     glXGetFBConfigAttribSGIX(dpy, f, GLX_LEVEL, &c->level);

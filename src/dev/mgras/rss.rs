@@ -60,6 +60,9 @@ pub mod reg {
     /// Model-private: a TE read returns TRAM's bytes as they lie (the
     /// texture manager's save of pages), not texels.
     pub const TE_RAW: u32 = 0x3F7;
+    /// Model-private: pixel transfers move stencil indices, the top byte
+    /// of the ZST buffer (DRBpointers aimed at it); the depth stays.
+    pub const ZST_STENCIL: u32 = 0x3F8;
     pub const FILLMODE: u32 = 0x110;
     pub const CONFIG: u32 = 0x112;
     pub const XYWIN: u32 = 0x115;
@@ -1119,6 +1122,9 @@ impl Rss {
             return 0;
         }
         let w = self.mem.get(&self.source(), x as u32, y as u32) as u32;
+        if self.regs[reg::ZST_STENCIL as usize] != 0 {
+            return w >> 24;
+        }
         let pp1 = self.reg(reg::PP1FILLMODE);
         match read_buffer(pp1) {
             r @ (0 | READ_B) if rgb12_pair(pp1) => from_rgb12(w >> (12 * r) & 0xFFF),
@@ -1828,6 +1834,10 @@ impl Rss {
     }
 
     fn put_line(&mut self, x: &Xfer, line: u32, bytes: &[u8]) {
+        if self.regs[reg::ZST_STENCIL as usize] != 0 {
+            self.put_stencil_line(x, line, bytes);
+            return;
+        }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::xfer_line(self, x, line, bytes) {
             return;
@@ -1847,6 +1857,22 @@ impl Rss {
                 continue;
             }
             self.put(fx, fy, from_host(x.format, v));
+        }
+    }
+
+    /// Stencil indices (the transfer's low byte a pixel) into the ZST
+    /// buffer's top byte, through the stencil write mask.
+    fn put_stencil_line(&mut self, x: &Xfer, line: u32, bytes: &[u8]) {
+        let zbuf = Buffer::new(ZST_PAGE, Kind::Wide, self.reg(reg::DRBSIZE));
+        let wmask = ((self.reg(reg::STENCILMASK) >> 8) & 0xFF) as u64;
+        for (k, px) in bytes.chunks(x.bpp as usize).enumerate().take(x.width as usize) {
+            let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+            if self.visible(fx, fy) {
+                let s = *px.last().unwrap_or(&0) as u64;
+                let old = self.mem.get(&zbuf, fx as u32, fy as u32);
+                let new = (old & !(wmask << 24)) | (s & wmask) << 24;
+                self.mem.put(&zbuf, fx as u32, fy as u32, new);
+            }
         }
     }
 
