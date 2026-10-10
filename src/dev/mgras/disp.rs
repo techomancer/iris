@@ -49,6 +49,8 @@ pub fn composite(rss: &mut Rss, dcb: &Dcb, x: i32, y: i32, bgra: &[u8], stride: 
     let mut runs = Vec::new();
     let (screen_w, screen_h) = frame::display_size(dcb);
     let (main, _) = frame::scanout_buffers(rss, dcb);
+    // A 12-bit pair window shows the frame in both buffers.
+    let pair = frame::rgb12_format(dcb.xmap.main_mode(target as u32)) != 0;
     for row in 0..h {
         let sy = y + row as i32;
         if !(0..screen_h as i32).contains(&sy) {
@@ -70,6 +72,7 @@ pub fn composite(rss: &mut Rss, dcb: &Dcb, x: i32, y: i32, bgra: &[u8], stride: 
                 let i = row * stride + (sx - x) as usize * 4;
                 let Some(p) = bgra.get(i..i + 4) else { break };
                 let v = p[2] as u32 | (p[1] as u32) << 8 | (p[0] as u32) << 16;
+                let v = if pair { rss::to_rgb12(v) * 0x1001 } else { v };
                 rss.mem.put(&main, sx as u32, fb_y, v as u64);
             }
         }

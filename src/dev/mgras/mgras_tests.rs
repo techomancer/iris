@@ -320,8 +320,8 @@ fn frame_composes_runs_overlay_and_cursor() {
     }
     f.cmap[0x100 + 5] = 0x11_2233;
     f.cmap[0x200 + 7] = 0x44_5566;
-    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100 };
-    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0 };
+    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100, rgb12: 0 };
+    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0, rgb12: 0 };
     f.overlay_mode[2] = OverlayMode { on: true, cmap_base: 0x200 };
     f.did_main[10] = 3;
     f.main[10] = 5;
@@ -2565,6 +2565,34 @@ fn gl_back_buffer_alternates_with_swaps() {
         fifo_token(&m, 0x98, &[next, next]);
         write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
     }
+    m.stop_engines();
+}
+
+/// octahedra on a HighImpact at 1280x1024 (traced): a 12-bit
+/// double-buffered visual (INIT_FORMAT_VALUES 0x100, DRAW_BUFFER [2, 1])
+/// in a window whose DRBpointers name one page for A and B (0x90240).
+/// Each frame goes to the half of the word the screen is not showing.
+#[test]
+fn gl_12bit_double_buffer_draws_word_halves() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x90240, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0x100, 0x100]);
+    fifo_token(&m, 0x49, &[2, 1, 0]);
+    let word = |m: &Mgras| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E), 50, 50) as u32 & 0xFF_FFFF
+    };
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(word(&m), 0x00F_000, "bank 1: red in B, the high half");
+    fifo_token(&m, 0x98, &[0, 0]);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(word(&m), 0x00F_F00, "bank 0: blue in A, B kept");
     m.stop_engines();
 }
 

@@ -40,6 +40,23 @@ pub const CURSOR_MAX: usize = 64;
 pub struct MainMode {
     pub rgb: bool,
     pub cmap_base: u16,
+    /// 12-bit RGB pixel pairs (see `rss::rgb12_pair`): 0 no, 1 buffer A
+    /// (bits 11:0) always, 2 A or B (bits 23:12) by BUF_SELECT.
+    pub rgb12: u8,
+}
+
+/// XMAP main mode formats (bits 4:0) that display 12-bit pixel pairs:
+/// 7 double-buffered (the kernel's swap flips BUF_SELECT: traced, GL's
+/// 12-bit double-buffered visual on a HighImpact at 1280x1024), 5 single.
+/// Provisional: inferred from the 6.5.22 PseudoColor server's window IDs
+/// (formats 4, 5, 7, 8) and the GL window's 7; 0x15 is GL's 24-bit
+/// double-buffered visual (two pages).
+pub(super) fn rgb12_format(mode: u32) -> u8 {
+    match mode & 0x1F {
+        7 => 2,
+        5 => 1,
+        _ => 0,
+    }
 }
 
 /// How a window ID's overlay planes display: off, or a non-zero 8-bit value
@@ -100,6 +117,12 @@ impl Frame {
             dcb.vc3.main_did_runs(y, &mut runs);
             fill_did_row(&mut self.did_main[y * W..(y + 1) * W], &mut runs);
         }
+        for did in 0..32u32 {
+            let m = dcb.xmap.main_mode(did);
+            self.main_mode[did as usize] = MainMode { rgb: m & 0x1F >= 4, cmap_base: (((m >> 5) & 0x1F) * 256) as u16, rgb12: rgb12_format(m) };
+            let o = dcb.xmap.overlay_mode(did);
+            self.overlay_mode[did as usize] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
+        }
         let mut row = [0u32; W];
         let mut row_b = [0u32; W];
         for y in 0..h {
@@ -108,9 +131,16 @@ impl Frame {
             rss.mem.read_row(&main, fb_y, &mut self.main[dst..dst + w]);
             if select != 0 {
                 rss.mem.read_row(&back, fb_y, &mut row_b[..w]);
-                for x in 0..w {
-                    if select >> (self.did_main[dst + x] & 31) & 1 != 0 {
-                        self.main[dst + x] = row_b[x];
+            }
+            for x in 0..w {
+                let did = self.did_main[dst + x] & 31;
+                let b = select >> did & 1 != 0;
+                match self.main_mode[did as usize].rgb12 {
+                    0 if b => self.main[dst + x] = row_b[x],
+                    0 => {}
+                    k => {
+                        let half = if k == 2 && b { 12 } else { 0 };
+                        self.main[dst + x] = rss::from_rgb12(self.main[dst + x] >> half & 0xFFF);
                     }
                 }
             }
@@ -127,12 +157,6 @@ impl Frame {
         for y in 0..h {
             dcb.vc3.overlay_did_runs(y, &mut runs);
             fill_did_row(&mut self.did_overlay[y * W..(y + 1) * W], &mut runs);
-        }
-        for did in 0..32u32 {
-            let m = dcb.xmap.main_mode(did);
-            self.main_mode[did as usize] = MainMode { rgb: m & 0x1F >= 4, cmap_base: (((m >> 5) & 0x1F) * 256) as u16 };
-            let o = dcb.xmap.overlay_mode(did);
-            self.overlay_mode[did as usize] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
         }
         self.cmap.copy_from_slice(&dcb.cmap[0].pal);
         for (g, d) in self.gamma.iter_mut().zip(dcb.dac.gamma.iter()) {

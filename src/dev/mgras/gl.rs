@@ -1594,6 +1594,11 @@ impl Gl {
             (w & !0x3FF) | if (self.read_back != 0) != (self.swapped != 0) { b } else { a }
         };
         sink.rss_write(re::DRBPOINTERS, drb, false);
+        if !depth && self.rgb12_pair() {
+            // 12-bit pairs: the read field picks the half.
+            let b = (self.read_back != 0) != (self.swapped != 0);
+            sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0x1F << 21)) | (b as u32) << 21, false);
+        }
         self.fill_mode(FILL_DMA_READ, sink);
         sink.rss_write(re::XFRMODE, self.xfrmode, false);
         sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
@@ -1917,6 +1922,10 @@ impl Gl {
     /// field 3 writes both pages) and for the overlay.
     fn draw_pointers(&self) -> u32 {
         let drb = self.window.drb;
+        // 12-bit pairs: both buffers are in A's pages.
+        if self.rgb12_pair() {
+            return drb;
+        }
         let a = drb & 0x3FF;
         // A single-buffered window has no second page: B is A.
         let b = match (drb >> 10) & 0x3FF {
@@ -2017,6 +2026,9 @@ impl Gl {
     /// index (pixel type 6) in a colour-index context. Main pixels use our
     /// canonical storage format; overlays retain the driver's CI8 format.
     fn pp1_base(&self) -> u32 {
+        if self.rgb12_pair() {
+            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format | self.pair_field() << 14;
+        }
         let pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
         match self.draw_mask() {
             // The overlay: its draw field, buffer count and the driver's
@@ -2031,12 +2043,39 @@ impl Gl {
         }
     }
 
+    /// An RGB context whose visual is 12 bits a pixel (INIT_FORMAT_VALUES
+    /// 0x100, traced with octahedra's double-buffered visual on a
+    /// HighImpact at 1280x1024): it draws 12-bit pixel pairs, buffer A in
+    /// a word's low half and B in its high half (see `rss::rgb12_pair`).
+    /// Its overlay drawing keeps the overlay's own format.
+    fn rgb12_pair(&self) -> bool {
+        self.ci == 0 && self.pixel_format == 0x100 && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+    }
+
+    /// A 12-bit pair context's draw field: 1 A, 2 B, 3 both (DRAW_BUFFER
+    /// sends these values), 0 none.
+    fn pair_field(&self) -> u32 {
+        match self.draw_mask() {
+            Some(m) => m & 3,
+            None => {
+                let back = self.draw_bits & 0xC != 0;
+                if back != (self.swapped != 0) { 2 } else { 1 }
+            }
+        }
+    }
+
     /// Plane masks in the RSS storage layout for the selected GL buffer.
     fn color_write_masks(&self) -> (u32, u32) {
         match self.draw_mask() {
             Some(0) => return (0, 0),
             Some(m) if m & 0x70 == 0x40 => return (0, self.index_mask & 0xFF),
             _ => {}
+        }
+        if self.rgb12_pair() {
+            let cm = self.color_mask;
+            let c = (cm & 1) * 0xF | (cm >> 1 & 1) * 0xF0 | (cm >> 2 & 1) * 0xF00;
+            let f = self.pair_field();
+            return ((f & 1) * c | (f >> 1 & 1) * (c << 12), 0);
         }
         if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
         let cm = self.color_mask;

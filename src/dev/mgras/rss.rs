@@ -418,6 +418,32 @@ pub(super) fn rgb_pixtype(pp1fillmode: u32) -> bool {
     matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2)
 }
 
+/// 12-bit RGB pixels (pixel type 0 or 1, buffer size bit 13 clear) come in
+/// pairs: one word holds buffer A in bits 11:0 and buffer B in bits 23:12,
+/// on one page. The pixel processors put the colour in both halves and
+/// the plane mask picks which are written. The X server draws A with
+/// draw field 1 and mask 0xFFF, B with field 2 and 0xFFF000, both with
+/// field 3 and 0xFFFFFF (traced, 6.5.22 TrueColor). GL's 12-bit
+/// double-buffered visual (INIT_FORMAT_VALUES 0x100, DRAW_BUFFER [2, 1])
+/// draws that way on a HighImpact at 1280x1024, where DRBpointers and
+/// the XMAP DIB name the same page for A and B (0x90240), there being no
+/// room for a second 24-bit buffer.
+pub(super) fn rgb12_pair(pp1fillmode: u32) -> bool {
+    matches!((pp1fillmode >> 8) & 7, 0 | 1) && pp1fillmode & (1 << 13) == 0
+}
+
+/// An 8-8-8 colour (red in 7:0) to a 12-bit pixel, red in 3:0 (the host
+/// format X uses for its 12-bit visual).
+pub(super) fn to_rgb12(v: u32) -> u32 {
+    (v >> 4 & 0xF) | (v >> 8 & 0xF0) | (v >> 12 & 0xF00)
+}
+
+/// A 12-bit pixel to 8-8-8, each nibble repeated.
+pub(super) fn from_rgb12(c: u32) -> u32 {
+    let n = (c & 0xF) | (c & 0xF0) << 4 | (c & 0xF00) << 8;
+    n | n << 4
+}
+
 /// Pixel processor logic op (fill mode bit 2 enables it; bits 29:26 hold
 /// the X11 function number) applied to source `s` and destination `d`.
 fn logic_op(op: u32, s: u32, d: u32) -> u32 {
@@ -977,8 +1003,9 @@ impl Rss {
     pub fn target(&self) -> Buffer {
         let kind = if self.draws_overlay() { Kind::Overlay } else { Kind::Wide };
         let drb = self.reg(reg::DRBPOINTERS);
+        let pp1 = self.reg(reg::PP1FILLMODE);
         let ptr = match self.second_buffer() {
-            Some(b) if kind == Kind::Wide && draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_B => b,
+            Some(b) if kind == Kind::Wide && draw_buffer(pp1) == DRAW_B && !rgb12_pair(pp1) => b,
             _ => drb,
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
@@ -1006,7 +1033,7 @@ impl Rss {
         }
         let b = self.target();
         self.put_in(b, x, y, v, field == DRAW_B);
-        if field == DRAW_A_AND_B {
+        if field == DRAW_A_AND_B && !(b.kind == Kind::Wide && rgb12_pair(self.reg(reg::PP1FILLMODE))) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 // The 12-bit X visuals can give A and B the same page.
@@ -1025,20 +1052,16 @@ impl Rss {
         // 24 bits a pixel) keeps the whole value; so does RGB.
         let wide = rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
         let old = self.mem.get(&b, x as u32, y as u32) as u32;
+        if b.kind == Kind::Wide && rgb12_pair(pp1) {
+            let v = to_rgb12(v) * 0x1001;
+            let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 { logic_op(pp1 >> 26, v, old) } else { v };
+            let mask = lsb & 0xFF_FFFF;
+            self.mem.put(&b, x as u32, y as u32, ((old & !mask) | (v & mask)) as u64);
+            return;
+        }
         let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 {
             let width = if (pp1 >> 8) & 7 == 2 { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF };
             logic_op(pp1 >> 26, v, old) & width
-        } else {
-            v
-        };
-        // X's 12-bit TrueColor visual uses RGB444 (pixel type 0, buffer
-        // size 0). Keep expanded nibbles in our RGB888 storage, whether
-        // the pixel came from a fill, an iterator, or a host transfer.
-        // Otherwise a scroll through RGBA4444 changes a fresh fill's
-        // 0x20/0x60/0x50 into a different shade on every round trip.
-        let v = if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 0 && pp1 & (1 << 13) == 0 {
-            let nibbles = v & 0xF0_F0F0;
-            nibbles | nibbles >> 4
         } else {
             v
         };
@@ -1068,9 +1091,10 @@ impl Rss {
     /// Pixel reads select A, B, or the overlay independently of drawing.
     fn source(&self) -> Buffer {
         let drb = self.reg(reg::DRBPOINTERS);
-        let (ptr, kind) = match read_buffer(self.reg(reg::PP1FILLMODE)) {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let (ptr, kind) = match read_buffer(pp1) {
             READ_OVERLAY => (drb, Kind::Overlay),
-            READ_B => (self.second_buffer().unwrap_or(drb), Kind::Wide),
+            READ_B if !rgb12_pair(pp1) => (self.second_buffer().unwrap_or(drb), Kind::Wide),
             _ => (drb, Kind::Wide),
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
@@ -1080,7 +1104,12 @@ impl Rss {
         if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
             return 0;
         }
-        self.mem.get(&self.source(), x as u32, y as u32) as u32
+        let w = self.mem.get(&self.source(), x as u32, y as u32) as u32;
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        match read_buffer(pp1) {
+            r @ (0 | READ_B) if rgb12_pair(pp1) => from_rgb12(w >> (12 * r) & 0xFFF),
+            _ => w,
+        }
     }
 
     /// Block pixel `(col, row)` in framebuffer coordinates.
@@ -1634,7 +1663,7 @@ impl Rss {
         let pp1 = self.reg(reg::PP1FILLMODE);
         let b = self.target();
         self.fragment_color(b, ux, uy, rgba, pp1, draw_buffer(pp1) == DRAW_B);
-        if draw_buffer(pp1) == DRAW_A_AND_B {
+        if draw_buffer(pp1) == DRAW_A_AND_B && !rgb12_pair(pp1) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 if b2 != b {
@@ -1649,6 +1678,12 @@ impl Rss {
     fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
         use fixed::{mul, ONE};
         let dst = self.mem.get(&b, ux, uy) as u32;
+        // 12-bit pairs: blend with this buffer's half (no alpha planes).
+        let dst = if b.kind == Kind::Wide && rgb12_pair(pp1) {
+            from_rgb12(dst >> if back { 12 } else { 0 } & 0xFFF) | 0xFF << 24
+        } else {
+            dst
+        };
         // A logic op other than copy replaces blending (OpenGL).
         let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
         let rgb = self.rgb_mode();
@@ -1922,6 +1957,11 @@ mod tests {
         r.mem.get(&main_buffer(), x as u32, (SCREEN_H - 1 - y_top) as u32) as u32
     }
 
+    /// A 12-bit pixel pair's buffer A (low half) as 8-8-8.
+    fn px12(r: &Rss, x: usize, y_top: usize) -> u32 {
+        from_rgb12(px(r, x, y_top) & 0xFFF)
+    }
+
     /// The X server's setup: window origin at the top row, Y-flip on, so
     /// block coordinates are X's top-down ones.
     fn x_server() -> Box<Rss> {
@@ -2060,7 +2100,8 @@ mod tests {
             r.write(reg::FILL_COLOR_B, colour & 0xF00, false);
             block(&mut r, 10, 5, 10, 5);
             let expected = from_host((8, 8), colour as u64);
-            assert_eq!(px(&r, 10, 5), expected, "fresh fill {colour:#x}");
+            assert_eq!(px12(&r, 10, 5), expected, "fresh fill {colour:#x}");
+            assert_eq!(px(&r, 10, 5) >> 12, px(&r, 10, 5) & 0xFFF, "field 3: both halves");
             for _ in 0..3 {
                 r.write(reg::PP1FILLMODE, 0, false);
                 r.write(reg::COLORMASKLSBSA, 0xFFF, false);
@@ -2072,9 +2113,37 @@ mod tests {
                 r.write(reg::FILLMODE, 5 << 22, false);
                 block(&mut r, 10, 5, 10, 5);
                 r.dma_write_line(0, &bytes);
-                assert_eq!(px(&r, 10, 5), expected, "scroll {colour:#x}");
+                assert_eq!(px12(&r, 10, 5), expected, "scroll {colour:#x}");
             }
         }
+    }
+
+    /// 12-bit pixel pairs: A in a word's low half, B in its high half, on
+    /// A's page whatever DRBpointers' second field says; reads pick the
+    /// half with the read field.
+    #[test]
+    fn rgb12_pairs_share_a_word() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x140 << 10, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        let fill = |r: &mut Rss, field: u32, mask: u32, rgb: [u32; 3]| {
+            r.write(reg::PP1FILLMODE, 0x0C00_0104 | field << 14, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::COLORMASKLSBSB, mask, false);
+            for (k, c) in rgb.iter().enumerate() {
+                r.write(reg::FILL_COLOR_R + k as u32, *c, false);
+            }
+            block(r, 10, 5, 10, 5);
+        };
+        fill(&mut r, 1, 0xFFF, [0xF00, 0, 0]);
+        fill(&mut r, 2, 0xFFF000, [0, 0, 0xF00]);
+        assert_eq!(px(&r, 10, 5), 0xF00_00F, "B blue high, A red low");
+        let page_b = Buffer::new(0x140, Kind::Wide, r.reg(reg::DRBSIZE));
+        assert_eq!(r.mem.get(&page_b, 10, (SCREEN_H - 1 - 5) as u32), 0, "the second page is not B");
+        let y = (SCREEN_H - 1 - 5) as i32;
+        assert_eq!(r.get(10, y), 0xFF, "read field 0: A");
+        r.write(reg::PP1FILLMODE, 0x0C00_0104 | 1 << 21, false);
+        assert_eq!(r.get(10, y), 0xFF_0000, "read field 1: B");
     }
 
     #[test]
@@ -2109,13 +2178,13 @@ mod tests {
     #[test]
     fn rgb_fast_fill_packs_components() {
         let mut r = x_server();
-        r.write(reg::PP1FILLMODE, 3 << 26 | 0x104, false); // RGB pixel type, copy
+        r.write(reg::PP1FILLMODE, 3 << 26 | 0x2204, false); // RGBA8888, copy
         r.write(reg::FILLMODE, FILL_FAST, false);
         r.write(reg::FILL_COLOR_R, 0xF00, false);
         r.write(reg::FILL_COLOR_G, 0x800, false);
         r.write(reg::FILL_COLOR_B, 0x100, false);
         block(&mut r, 0, 0, 0, 0);
-        assert_eq!(px(&r, 0, 0), 0x10_80F0);
+        assert_eq!(px(&r, 0, 0) & 0xFF_FFFF, 0x10_80F0);
     }
 
     #[test]
@@ -2278,8 +2347,8 @@ mod tests {
         r.write(reg::IR_ALIAS, 0x15, false);
         r.write(reg::LINE_START, 300 << 16 | 40, false);
         r.write(reg::LINE_END, 301 << 16 | 40, true);
-        assert_eq!(px(&r, 300, 40), 0xFF);
-        assert_eq!(px(&r, 301, 40), pack_rgb(0xCC, 0x77, 0x77), "expanded RGB444 background");
+        assert_eq!(px12(&r, 300, 40), 0xFF);
+        assert_eq!(px12(&r, 301, 40), pack_rgb(0xCC, 0x77, 0x77), "expanded RGB444 background");
     }
 
     /// The syserrpanel stop sign as traced from 4Dwm (testdata): every
@@ -2300,10 +2369,12 @@ mod tests {
         let (mut n_red, mut n_light) = (0u32, 0u32);
         for y in 266..=294 {
             for x in 740..800 {
+                // Draw field 2, mask 0xFFF000: buffer B, the high half.
                 match r.mem.get(&buf, x, 767 - y) as u32 {
                     0 => {}
-                    p if p == red => n_red += 1,
-                    p if p == light => n_light += 1,
+                    p if p & 0xFFF != 0 => panic!("({x}, {y}) wrote buffer A: {p:#08x}"),
+                    p if from_rgb12(p >> 12) == red => n_red += 1,
+                    p if from_rgb12(p >> 12) == light => n_light += 1,
                     p => panic!("({x}, {y}) is {p:#08x}, not red or light red"),
                 }
             }

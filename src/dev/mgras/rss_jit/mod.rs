@@ -580,6 +580,12 @@ pub(super) fn run(rss: &mut Rss, a: &Args) -> bool {
         return false;
     }
     let prim = a.prim();
+    // 12-bit pixel pairs (see `rss::rgb12_pair`) are the interpreter's.
+    let pp1 = rss.reg(reg::PP1FILLMODE);
+    if rss::rgb12_pair(pp1) && rss::draw_buffer(pp1) & 0x70 != 0x40 && rss::draw_buffer(pp1) != rss::DRAW_CID {
+        rss.jit.declined += 1;
+        return false;
+    }
     let Some(bits) = prepare(rss, a) else {
         rss.jit.declined += 1;
         return false;
