@@ -37,7 +37,7 @@ use cranelift_module::{Linkage, Module};
 use super::{ClipRect, Draw, PipeKey, Pix, Prim, RasterCtx, ShaderFn, Target, Tex, XFmt};
 use crate::dev::mgras::rss::Pair;
 use crate::dev::ng1::rex3_generic::BAYER_PACKED;
-use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, TILE_H, TILE_W, WORD_MASK};
+use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, RE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
 use crate::dev::mgras::fixed;
 use crate::dev::mgras::te1::{PAGE_NIBBLES, TRAM_NIBBLES};
@@ -155,6 +155,10 @@ struct E<'a> {
     clips: Vec<[Value; 5]>,
     tgt: [[Value; 4]; 2],
     zxtiles: Value,
+    yshift: Value,
+    remask: Value,
+    engine: Value,
+    own_mask: Value,
 }
 
 impl<'a> E<'a> {
@@ -177,6 +181,10 @@ impl<'a> E<'a> {
         let cidmatch = if k.cid_test { ld(&mut b, I32, off!(common.cidmatch)) } else { zero };
         let cidwmask = if k.draw == Draw::Cid { ld(&mut b, I32, off!(common.cidwmask)) } else { zero };
         let zxtiles = if zbuf { ld(&mut b, I32, off!(common.zxtiles)) } else { zero };
+        let yshift = ld(&mut b, I32, off!(common.yshift));
+        let remask = ld(&mut b, I32, off!(common.remask));
+        let engine = ld(&mut b, I32, off!(common.engine));
+        let own_mask = ld(&mut b, I32, off!(common.own_mask));
         let clips = (0..k.nclip as i32)
             .map(|n| {
                 let base = off!(common.clip) + n * size_of::<ClipRect>() as i32;
@@ -232,7 +240,7 @@ impl<'a> E<'a> {
                 invs.insert(o, ld(&mut b, I32, o));
             }
         }
-        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles }
+        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles, yshift, remask, engine, own_mask }
     }
 
     // ── small helpers ────────────────────────────────────────────────────
@@ -347,6 +355,12 @@ impl<'a> E<'a> {
     /// `for v in start..end` (signed i32); the body gets `v` and the block
     /// that continues the loop, and may branch there.
     fn for_range(&mut self, start: Value, end: Value, body: impl FnOnce(&mut Self, Value, Block)) {
+        let one = self.i32c(1);
+        self.for_range_step(start, end, one, body)
+    }
+
+    /// `for_range` counting up by `step` (> 0).
+    fn for_range_step(&mut self, start: Value, end: Value, step: Value, body: impl FnOnce(&mut Self, Value, Block)) {
         let iv = self.var(I32, start);
         let head = self.b.create_block();
         let bodyb = self.b.create_block();
@@ -364,7 +378,7 @@ impl<'a> E<'a> {
         self.b.switch_to_block(cont);
         self.b.seal_block(cont);
         let i = self.get(iv);
-        let i1 = self.b.ins().iadd_imm_s(i, 1);
+        let i1 = self.b.ins().iadd(i, step);
         self.set(iv, i1);
         self.b.ins().jump(head, &[]);
         self.b.seal_block(head);
@@ -480,13 +494,17 @@ impl<'a> E<'a> {
     // ── pixel memory (pixmem) ────────────────────────────────────────────
 
     /// `Buffer::locate`, the y half: the page of the row's first tile and
-    /// the row's offset within its page.
+    /// the row's offset within its page, plus its raster engine's memory.
     fn locate_row(&mut self, ptr: Value, xt: Value, y: Value) -> (Value, Value) {
+        let re = self.b.ins().band(y, self.remask);
+        let y = self.b.ins().ushr(y, self.yshift);
         let ty = self.b.ins().ushr_imm_s(y, 4);
         let row = self.b.ins().imul(ty, xt);
         let page = self.b.ins().iadd(ptr, row);
         let yin = self.b.ins().band_imm_s(y, TILE_H as i64 - 1);
         let yoff = self.b.ins().imul_imm_s(yin, TILE_W as i64);
+        let reoff = self.b.ins().imul_imm_s(re, RE_WORDS as i64);
+        let yoff = self.b.ins().iadd(yoff, reoff);
         (page, yoff)
     }
 
@@ -665,6 +683,11 @@ impl<'a> E<'a> {
     fn row(&mut self, fy: Value, kill: Block) -> Row {
         let yo = self.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, fy, WIDTH as i64);
         self.bail(yo, kill);
+        // Another raster engine's scanline.
+        let other = self.b.ins().bxor(fy, self.engine);
+        let other = self.b.ins().band(other, self.own_mask);
+        let other = self.b.ins().icmp_imm_s(IntCC::NotEqual, other, 0);
+        self.bail(other, kill);
         let cid = (self.k.cid_test || self.k.draw == Draw::Cid).then(|| {
             let rowoff = self.b.ins().imul_imm_s(fy, WIDTH as i64);
             let rowoff = self.b.ins().uextend(I64, rowoff);
@@ -805,8 +828,16 @@ impl<'a> E<'a> {
         let color = self.ld(I32, off!(color));
         let [bxs, bys, bdx, bdy] = self.blk;
         let fx0 = self.b.ins().iadd(self.ox, bxs);
-        let zero = self.i32c(0);
-        self.for_range(zero, rows, |e, row, next_row| {
+        // Only this engine's scanlines (`row` still checks): with an odd
+        // row step the rows alternate engines, so take every other one.
+        let odd = self.b.ins().band_imm_s(bdy, 1);
+        let m = self.b.ins().band(self.own_mask, odd);
+        let sy0 = self.b.ins().imul(self.ysign, bys);
+        let fy0 = self.b.ins().iadd(self.oy, sy0);
+        let first = self.b.ins().bxor(fy0, self.engine);
+        let first = self.b.ins().band(first, m);
+        let step = self.b.ins().iadd_imm_s(m, 1);
+        self.for_range_step(first, rows, step, |e, row, next_row| {
             let ry = e.b.ins().imul(row, bdy);
             let y = e.b.ins().iadd(bys, ry);
             let sy = e.b.ins().imul(e.ysign, y);
@@ -1110,7 +1141,15 @@ impl<'a> E<'a> {
         let vis: Vec<Value> = (0..4).map(|n| self.ld(I32, off!(common.vis) + 4 * n)).collect();
         let jlo = self.b.ins().smax(j0, vis[2]);
         let jhi = self.b.ins().smin(j1, vis[3]);
-        self.for_range(jlo, jhi, |e, j, next_row| {
+        // Only this engine's scanlines (`row` still checks): every other
+        // row, from the first one it owns.
+        let sy0 = self.b.ins().imul(self.ysign, jlo);
+        let fy0 = self.b.ins().iadd(self.oy, sy0);
+        let skip = self.b.ins().bxor(fy0, self.engine);
+        let skip = self.b.ins().band(skip, self.own_mask);
+        let jlo = self.b.ins().iadd(jlo, skip);
+        let step = self.b.ins().iadd_imm_s(self.own_mask, 1);
+        self.for_range_step(jlo, jhi, step, |e, j, next_row| {
             let sy = e.b.ins().imul(e.ysign, j);
             let fy = e.b.ins().iadd(e.oy, sy);
             let span = e.row(fy, next_row);

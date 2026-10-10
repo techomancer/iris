@@ -1,9 +1,13 @@
 ---
 name: gr2-gl-loop
-description: Autonomous GR2 (XZ/Extreme) OpenGL bring-up loop on IRIX 6.5.22 - boot IRIS, build and run test/gltest/glprim in the guest over telnet, capture gr2 traces around each run, and verify rendered pixels. Use when iterating GL pipeline configurations (primitives, shading, vertex/colour forms, depth, scissor, viewport) against the GR2 HLE.
+description: Autonomous graphics loop on IRIX 6.5.22 for GR2 (XZ/Extreme) and IMPACT (Solid/High/Maximum, MGRAS) - boot IRIS, build and run test/gltest (glprim, gltest) in the guest over telnet, capture board traces around each run, verify rendered pixels, record/replay sessions. Use for any autonomous gfx work: GL pipeline configurations (primitives, shading, vertex/colour forms, depth, scissor, viewport), board bring-up, visuals, performance.
 ---
 
-# GR2 OpenGL test loop
+# GR2 / IMPACT OpenGL test loop
+
+Written for GR2 first; everything carries over to IMPACT with the board's
+own monitor commands (`mgras ...` for `gr2 ...`). See "IMPACT (MGRAS)"
+below for what differs.
 
 Drive one GL configuration at a time through the real IRIX GL stack
 (libglcore EXPRESS -> HQ2 FIFO -> our HLE in `src/dev/gr2/{hq2,gl}.rs`) and
@@ -19,6 +23,50 @@ trace is short and every option flips one piece of state or one address bit.
 | File exchange | built-in NFS: host `./shared` = guest `/shared` (mount with `tools/irix-sh.py mount-shared`). **noexec**: copy to `/tmp` before building/running |
 | Monitor | iris MCP (`mcp__iris__run_command`), i.e. the monitor on 127.0.0.1:8888 |
 | Token map | `ignore/gr2/HQ2.h` "OpenGL token addressing" (source of truth; add findings there) |
+
+## IMPACT (MGRAS) on the Indigo2 R10000 (IP28)
+
+- Config `ignore/ip28/iris.toml` (`[graphics] board = "solidimpact" |
+  "highimpact" | "maximpact"`), disk `ip28_6522_realhw.raw` written
+  directly (never kill iris while IRIX runs). Root has a password:
+  `p00pp00p`. `tools/irix-sh.py` takes `--password` or
+  `IRIS_ROOT_PASSWORD=p00pp00p` (glprim-case.py passes the environment on).
+- The user builds `target/release/iris` with `--features
+  gr4-jit,jitv2,lightning,opcodefusion,rex-jit`: do not overwrite it. Build
+  your own with `--target-dir target/claude` (same features) and run
+  `target/claude/release/iris --config ignore/ip28/iris.toml` from the
+  repo root (the Bash `cd` wrapper is broken: `cd ... && exec ...` inside
+  one command works, as does `run_in_background`). The CPU starts by
+  itself; this build exits on guest power-off, so after `shutdown` just
+  wait for the pid to go.
+- Monitor from the shell: `tools/mon.py "mgras status" "rss regs" ...`
+  (the MCP `run_command` has been seen returning the previous command's
+  output). Useful: `mgras status|xmap|pix X Y|stats|jit|fbdump DIR|shot
+  F.png|trace F [hq,rss,cpu,tex|all]|rec F|rec off`, `rss regs` (decodes
+  the IR, shows each raster engine's backlog), `locks` (who holds what).
+- `/tmp` is emptied at boot: re-copy and rebuild gltest each boot
+  (`cp /shared/gltest/* /tmp/gltest/ && sh irix.sh gltest glprim`).
+  `/shared` mounts by itself on this image.
+- Desktop readiness: telnet comes up first; wait for `4Dwm` and then
+  `toolchest` in `ps -ef`, plus ~15 s, before screenshots; then `xset s
+  off`.
+- `tools/glprim-case.py` detects the board. IMPACT's scanout applies the
+  DAC gamma (SGI default 1.7), so mid-level colours read back brighter
+  than GR2's (the pink clear 1, 0.5, 0.75 shows as ffaad7); probe
+  saturated colours, or check values with glprim `--read ... --check`.
+  glprim picks the deepest visual by default (12,12,12, which the raster
+  JIT leaves to the interpreter): use `--visual 8,8,8,8` for the JIT path.
+- Performance: guest-side `gltest --bench` cannot time the board (see
+  rules/mgras/guest-gl-benchmarks-miss-board-time.md). Record the session
+  (`mgras rec F` ... `mgras rec off`) and time its replay offline with
+  `MGRAS_REPLAY_NOCHECK=1 MGRAS_REPLAY_BOARD=high|max MGRAS_REPLAY=F cargo
+  test --release --target-dir target/claude --lib --features gr4-jit
+  mgras_replay_file -- --nocapture` (wall time + final state hash).
+- Goldens: `MGRAS_REPLAY=ignore/mgras-golden/desktop2.rec` must pass every
+  checkpoint (also with `MGRAS_REPLAY_BOARD=max`). irix6522-boot.rec is
+  stale (11 of 16 checkpoints fail at 35a40840 too).
+- Hardware findings go in ignore/gr4/*.h (its own git repo; the user
+  commits it), design notes in rules/mgras/.
 
 ## Boot
 

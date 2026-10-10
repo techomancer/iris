@@ -811,14 +811,50 @@ pub const ZST_PAGE: u32 = 0;
 /// Longest PIO line, in bytes (2048 pixels of 6 bytes, with room to spare).
 const MAX_LINE_BYTES: usize = 16384;
 
-/// The raster subsystem's state. Plain data, valid zeroed: build it in
-/// place on zeroed memory and run `Rss::init`, or use `new_boxed`.
+/// Clip-ID planes: two bits a framebuffer pixel, index `y * WIDTH + x`.
+pub type CidPlanes = [u8; WIDTH * HEIGHT];
+
+/// What a board's raster engines draw into: pixel memory and the clip-ID
+/// planes. One per board, shared by its engines, each of which writes only
+/// the scanlines it owns (`Rss::owns_row`). Plain data, valid zeroed.
+#[repr(C)]
+pub struct Planes {
+    pub mem: PixMem,
+    pub cid: CidPlanes,
+}
+
+/// A raster engine's handle on part of its board's `Planes`. The engines'
+/// threads share it the way they share the framebuffer with the display
+/// thread: plain data, disjoint rows, tearing tolerated.
+#[repr(transparent)]
+pub struct Plane<T>(*mut T);
+
+impl<T> std::ops::Deref for Plane<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: set by `Rss::init` to the board's planes, which outlive it.
+        unsafe { &*self.0 }
+    }
+}
+
+impl<T> std::ops::DerefMut for Plane<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as above; each engine writes only its own rows.
+        unsafe { &mut *self.0 }
+    }
+}
+
+/// The raster subsystem's state: one raster engine (RE4, its PP1s and its
+/// TE1/TRAM). Plain data, valid zeroed: build it in place on zeroed memory
+/// and run `Rss::init`, or use `new_boxed`.
 #[repr(C)]
 pub struct Rss {
     regs: [u32; 0x400],
     device: RegMap<256>,
     /// Pixel memory. In colour-index modes a pixel's low byte is the index.
-    pub mem: PixMem,
+    pub mem: Plane<PixMem>,
     /// The PIO write line being assembled.
     line_buf: [u8; MAX_LINE_BYTES],
     stipple: Slot<Stipple>,
@@ -838,20 +874,35 @@ pub struct Rss {
     te_load: u32,
     /// A texture read transfer is armed: armed, texels a line, lines.
     te_read: [u32; 3],
-    /// The clip-ID planes: two bits a framebuffer pixel, index `y * WIDTH +
-    /// x`. The X server paints a window's visible region with an ID (1-3)
+    /// The clip-ID planes (`CidPlanes`). The X server paints a window's visible region with an ID (1-3)
     /// when its clip is too complex for the four screen masks, and the
     /// kernel has that window's GL drawing match it (`pp1winmode`). Where
     /// the board keeps them in RDRAM is not known (X draws them with
     /// DRBpointers at the main buffer); nothing reads them back, so they
     /// are kept apart here. Separate from the VC3's display IDs.
-    pub cid: [u8; WIDTH * HEIGHT],
+    pub cid: Plane<CidPlanes>,
+    /// Which scanlines this engine draws: those with `(y ^ engine) &
+    /// own_mask == 0`. A board with one engine draws them all (mask 0);
+    /// Maximum Impact's two alternate (mask 1), as their RE4s do.
+    pub engine: u32,
+    pub own_mask: u32,
+    /// Planes this engine allocated itself (`new_boxed`), freed on drop.
+    owned_planes: *mut Planes,
     /// The raster JIT's per-board state (mode, cached keys, counters), and
     /// the context its shaders draw from.
     #[cfg(feature = "gr4-jit")]
     pub jit: super::rss_jit::JitState,
     #[cfg(feature = "gr4-jit")]
     pub jit_ctx: super::rss_jit::RasterCtx,
+}
+
+impl Drop for Rss {
+    fn drop(&mut self) {
+        if !self.owned_planes.is_null() {
+            // SAFETY: allocated by `new_boxed` with `Box::into_raw`.
+            drop(unsafe { Box::from_raw(self.owned_planes) });
+        }
+    }
 }
 
 /// A triangle's setup (`Rss::tri_setup`): what both the interpreter and
@@ -932,11 +983,25 @@ impl Rss {
     ///
     /// # Safety
     /// `p` points at a zeroed, exclusively owned `Rss`.
-    pub unsafe fn init(p: *mut Rss) {
+    pub unsafe fn init(p: *mut Rss, planes: *mut Planes) {
+        std::ptr::addr_of_mut!((*p).mem).write(Plane(std::ptr::addr_of_mut!((*planes).mem)));
+        std::ptr::addr_of_mut!((*p).cid).write(Plane(std::ptr::addr_of_mut!((*planes).cid)));
         #[cfg(feature = "gr4-jit")]
         std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
-        #[cfg(not(feature = "gr4-jit"))]
-        let _ = p;
+    }
+
+    /// Draw only the scanlines `y` with `(y ^ engine) & mask == 0`.
+    pub fn set_engine(&mut self, engine: u32, mask: u32) {
+        self.engine = engine;
+        self.own_mask = mask;
+        #[cfg(feature = "gr4-jit")]
+        self.jit.invalidate();
+    }
+
+    /// Whether this engine draws framebuffer row `y`.
+    #[inline]
+    pub fn owns_row(&self, y: i32) -> bool {
+        ((y as u32) ^ self.engine) & self.own_mask == 0
     }
 
     /// A GL batch begins (our GE11 HLE): save the raster registers and
@@ -970,10 +1035,12 @@ impl Rss {
     #[cfg(test)]
     pub fn new_boxed() -> Box<Rss> {
         let mut b = Box::<Rss>::new_zeroed();
+        let planes = Box::into_raw(super::plain::boxed_zeroed::<Planes>());
         // SAFETY: zeroed and exclusively owned; `init` writes the fields that
-        // are not valid zeroed.
+        // are not valid zeroed. The planes are this engine's to free.
         unsafe {
-            Rss::init(b.as_mut_ptr());
+            Rss::init(b.as_mut_ptr(), planes);
+            std::ptr::addr_of_mut!((*b.as_mut_ptr()).owned_planes).write(planes);
             b.assume_init()
         }
     }
@@ -1104,7 +1171,7 @@ impl Rss {
     /// `scrmsk{n}y`, each `min << 16 | max`), and bit `n + 3` keeps the
     /// pixels inside it rather than outside.
     fn visible(&self, x: i32, y: i32) -> bool {
-        if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
+        if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) || !self.owns_row(y) {
             return false;
         }
         let m = cid_match(self.reg(reg::PP1WINMODE));
@@ -1535,6 +1602,9 @@ impl Rss {
         }
         let smp = (t.tex != 0).then(|| self.te.sampler(&self.regs));
         for j in t.j0..t.j1 {
+            if self.own_mask != 0 && !self.owns_row(self.to_fb(0, j).1) {
+                continue;
+            }
             let dj = t.yref_i.wrapping_sub(j);
             let yc = j as f64 + 0.5;
             let major = t.x0 + t.s0 * (t.yref - yc);
@@ -1973,6 +2043,9 @@ impl Rss {
             return;
         }
         for row in 0..b.rows() {
+            if self.own_mask != 0 && !self.owns_row(self.block_px(b, 0, row).1) {
+                continue;
+            }
             for col in 0..b.cols() {
                 let (x, y) = self.block_px(b, col, row);
                 self.put(x, y, b.color);

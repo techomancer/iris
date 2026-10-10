@@ -954,6 +954,7 @@ impl Machine {
             hpc3.register_locks();
             if let Some(rex3) = &phys.rex3 { rex3.register_locks(); }
             if let Some(rex3) = &phys.rex3_head1 { rex3.register_locks(); }
+            if let Some(mgras) = &phys.mgras { mgras.register_locks(); }
             cpu.register_locks();
         }
         {

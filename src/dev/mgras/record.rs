@@ -291,10 +291,18 @@ pub(super) mod tests {
     use crate::dev::mgras::{Mgras, MGRAS_SLOT_GFX_BASE};
     use crate::traits::BUS_BUSY;
 
-    /// A High IMPACT board with its engine threads running (no display).
+    /// A High IMPACT board with its engine threads running (no display);
+    /// Maximum Impact's two raster engines with `MGRAS_TEST_BOARD=max`, to
+    /// run the board tests on them.
     pub fn live_board() -> Arc<Mgras> {
+        let max = std::env::var("MGRAS_TEST_BOARD").is_ok_and(|v| v == "max");
+        live_board_of(if max { GraphicsBoard::MaxImpact } else { GraphicsBoard::HighImpact })
+    }
+
+    /// A board of kind `kind` with its engine threads running (no display).
+    pub fn live_board_of(kind: GraphicsBoard) -> Arc<Mgras> {
         let hb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let m = Mgras::new(GraphicsBoard::HighImpact, crate::dev::ioc::Ioc::new(false), hb.clone(), hb);
+        let m = Mgras::new(kind, crate::dev::ioc::Ioc::new(false), hb.clone(), hb);
         m.start_engines();
         m
     }
@@ -405,18 +413,40 @@ pub(super) mod tests {
     /// checkpoint.
     pub fn replay(path: &str, png: Option<&str>) -> Result<(), String> {
         let recs = load(path).map_err(|e| format!("{path}: {e}"))?;
-        let m = live_board();
+        // MGRAS_REPLAY_BOARD=max: replay on Maximum Impact's two raster
+        // engines (the recording's drawing must come out the same).
+        let kind = match std::env::var("MGRAS_REPLAY_BOARD").as_deref() {
+            Ok("max") => GraphicsBoard::MaxImpact,
+            _ => GraphicsBoard::HighImpact,
+        };
+        let m = live_board_of(kind);
         // MGRAS_REPLAY_TRACE=<file>: the annotated trace of the replay
         // (`mgras trace`), all categories.
         if let Ok(t) = std::env::var("MGRAS_REPLAY_TRACE") {
             m.start_trace(&t, crate::dev::mgras::debug::TRACE_ALL).map_err(|e| format!("{t}: {e}"))?;
         }
-        let rep = replay_recs(&m, &recs, true)?;
+        // MGRAS_REPLAY_NOCHECK=1: a recording that starts mid-session (its
+        // checkpoints cannot match a fresh board's): replay it for timing
+        // and the final state, unchecked.
+        let check = std::env::var("MGRAS_REPLAY_NOCHECK").is_err();
+        let t0 = std::time::Instant::now();
+        let rep = replay_recs(&m, &recs, check)?;
+        let took = t0.elapsed();
         m.trace_flush(true);
         if let Some(p) = png {
             m.save_shot(p)?;
         }
+        let h = m.state_hash();
         m.stop_engines();
+        eprintln!(
+            "{path}: {kind:?} with {} raster engine(s), {:.3} s, final state {}",
+            m.nrss,
+            took.as_secs_f64(),
+            h.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        if !check {
+            return Ok(());
+        }
         eprintln!(
             "{path}: {} records, {} checkpoints, {} failed {:?}, DMA reads {}/{} ({} mismatched), {} bus reads differ",
             rep.records, rep.checked, rep.failed.len(), &rep.failed[..rep.failed.len().min(8)],

@@ -170,6 +170,13 @@ pub struct CommonCtx {
     pub cidwmask: u32,
     /// Depth buffer tiles per row.
     pub zxtiles: u32,
+    /// log2 of the raster engines rows alternate over (`pixmem::re_shift`),
+    /// and the mask of y's engine bits.
+    pub yshift: u32,
+    pub remask: u32,
+    /// The rows this engine draws (`Rss::owns_row`).
+    pub engine: u32,
+    pub own_mask: u32,
     /// The window coordinates that land on screen: x in [vis[0], vis[1]),
     /// y in [vis[2], vis[3]). Triangles skip the rest (they draw nothing
     /// there and nothing else depends on visiting them).
@@ -352,6 +359,10 @@ fn common(rss: &mut Rss) -> PipeKey {
     let cl = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     c.vis = [cl(-ox), cl(w - ox), cl(ylo), cl(yhi)];
     c.zxtiles = pixmem::xtiles(drbsize).0;
+    c.yshift = pixmem::re_shift(drbsize);
+    c.remask = (1 << c.yshift) - 1;
+    c.engine = rss.engine;
+    c.own_mask = rss.own_mask;
     let key = PipeKey {
         cid_test: c.cidmatch != 0,
         nclip: nclip as u8,

@@ -36,8 +36,56 @@ data path:
   CPU -> RSS registers (0x7C000, +0x1000 = execute) -> hq_fifo too: the
          HQ3 forwards them, so they stay in program order with CFIFO
          raster commands (the old model ran both synchronously)
-  RSS thread owns the framebuffer; the display thread reads it unlocked
+  RSS thread(s) own the framebuffer; the display thread reads it unlocked
   (tearing tolerated, as REX3 and GR2)
+
+two raster engines (Maximum Impact, 2026-10-10): the board has two RE4s,
+each with its own 12MB; scanline y belongs to RE4 y % 2 (ignore/gr4/PP1.h
+"MAXIMUM IMPACT"). Modelled the way the board works, Voodoo2-SLI style:
+  - pixmem always has room for two engines' memory (RES = 2); Buffer::locate
+    takes the engine from y and the engine's row y >> yshift, yshift from
+    DRBsize bits 7:6 (engines - 1). The JIT's locate_row does the same with
+    CommonCtx.yshift/remask. A one-engine board leaves the second half zero;
+    state_bytes hashes it only when non-zero, so old goldens keep hashes.
+  - the pixel memory and clip-ID planes live in Mgras.planes (rss::Planes);
+    each Rss reaches them through Plane<T> pointers (Rss::init). Rss itself
+    is one engine: registers, transfer state, TE1 and its own TRAM (the real
+    board has RA and RB TRAMs, so the copy is faithful and keeps each
+    engine's texture cache to itself).
+  - rss_fifo is GFifo<_, 2>: a broadcast queue, each engine's thread
+    consuming every entry through its own head (gfifo.rs "HEADS"); one-engine
+    boards set_heads(1). Both engines keep identical register state; each
+    draws only rows with (y ^ engine) & own_mask == 0 (Rss::owns_row, in
+    visible() for the interpreter and in the JIT's row()). Triangle and fill
+    row loops step by 2 from the first owned row (JIT for_range_step; the
+    interpreter skips whole rows).
+  - nothing an engine draws reads another scanline: blending, depth, stencil
+    and logic ops read the pixel being drawn, and screen copies go through
+    the host (PIO/DMA read, then write). So the engines never wait for each
+    other, except at a PIO read advance (pio_read_hi reads the next
+    doubleword from both engines' rows): engine 1 waits there until engine 0
+    has latched it (Mgras.pio_advances). The CPU and the HQ3 read the
+    framebuffer only with every engine idle (idle/rss_idle/drain_rss check
+    both heads and both busy flags), and read raster state through engine 0.
+    Engine 0 alone traces and counts.
+  - IRIS_MGRAS_ENGINES=1 runs a Maximum Impact on one RSS thread (same
+    memory layout). MGRAS_TEST_BOARD=max runs mgras_tests on two engines;
+    MGRAS_REPLAY_BOARD=max replays goldens on them (desktop2: 35/35, same
+    hashes), MGRAS_REPLAY_NOCHECK=1 times a mid-session recording. A 2-engine
+    replay of a gltest fill/triangle session: same final state, 1.75x faster.
+  - not modelled: the GE count (both GE11s' work is one HLE in the HQ3
+    thread; ERAM slot 1 is unused), per-RE4 register access (config DestRE),
+    the DMA line-count mask.
+
+locks: Mgras' locks are crate::locks::SpinLock (an atomic flag with backoff
+that records its holder's thread and call site) and are registered with the
+`locks` monitor command (Mgras::register_locks); a waiter stuck 5 s prints
+both sides on stderr. renderer and screen stay parking_lot (the GfxDisplay
+trait's). Lock order: submit, then front / mem_rec / rec; front is a leaf
+except for the IOC's state lock (refresh_general drives the line under it);
+the HQ3 and RSS threads never take submit. None is reentrant: never call
+front() (or anything that does: snapshot_frame, save_shot,
+refresh_general) while holding it.
 
 sync rules:
   - every producer pushes while holding `submit` (the CPU's bus accesses,
@@ -184,6 +232,5 @@ scanout to the XMAP DIB pointers ([9:0] main, [31:20] overlay; PROM value
 until written); DRBsize gives tiles per row (PROM 1280x1024 layout until
 written). state_bytes rebuilds the old 1280x1024 fb/overlay views through
 the scanout pointers plus a hash of any other set bit, so desktop2.rec
-still replays 35/35. Not yet: the second pointer field ([19:10]), double
-buffering, Z/stencil, the raw RDRAM window (device space is still a
-register map), two raster engines.
+still replays 35/35. Not yet: the raw RDRAM window (device space is still a
+register map). Two raster engines: see above.

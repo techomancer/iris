@@ -71,6 +71,7 @@ use std::thread;
 use crate::config::GraphicsBoard;
 use crate::dev::ng1::rex3::Renderer;
 use crate::gfifo::GFifo;
+use crate::locks::SpinLock;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_BUSY, BUS_OK, Device, Saveable};
 
 use ge11::Ge11;
@@ -131,7 +132,7 @@ struct Front {
 
 /// `Front` borrowed under its lock.
 struct FrontGuard<'a> {
-    _lock: parking_lot::MutexGuard<'a, ()>,
+    _lock: crate::locks::SpinGuard<'a, ()>,
     front: &'a mut Front,
 }
 
@@ -262,37 +263,49 @@ pub struct Mgras {
     general: AtomicBool,
     /// CPU-side state and its lock. The display thread reads it unlocked
     /// (plain data, tearing tolerated).
-    front_lock: Mutex<()>,
+    front_lock: SpinLock<()>,
     front: UnsafeCell<Front>,
     /// Commands and registers not modelled yet, reported once each.
-    unhandled: Mutex<HashSet<String>>,
+    unhandled: SpinLock<HashSet<String>>,
     /// HQ3 flags: the HQ3 thread raises them, the CPU sets and clears them.
     flags: AtomicU32,
     /// Owned by the HQ3 thread (others only while the board is idle).
     eng: UnsafeCell<Hq3Engine>,
-    /// Owned by the RSS thread (others only while the board is idle; the
-    /// display thread reads the framebuffer unlocked).
+    /// Raster engine 0, owned by its RSS thread (others only while the
+    /// board is idle; the display thread reads the framebuffer unlocked).
+    /// The HQ3, the CPU and the monitor read raster state through it.
     rss: UnsafeCell<Rss>,
+    /// Maximum Impact's second raster engine, on its own thread: both take
+    /// every `rss_fifo` entry, and each draws only its own scanlines
+    /// (engine 0 the even ones), as the board's two RE4s do.
+    rss1: UnsafeCell<Rss>,
+    /// The pixel memory and clip-ID planes the engines draw into.
+    planes: UnsafeCell<rss::Planes>,
+    /// Raster engines running (2 on Maximum Impact, else 1).
+    nrss: usize,
+    /// PIO read advances engine 0 has done; engine 1 waits for each before
+    /// it goes on drawing (see `rss_loop`).
+    pio_advances: AtomicU64,
     /// System memory, for the board's DMA (it is a GIO bus master).
-    mem: Mutex<Option<Arc<dyn BusDevice>>>,
+    mem: SpinLock<Option<Arc<dyn BusDevice>>>,
     hq_fifo: GFifo<HQ_FIFO_DEPTH>,
-    rss_fifo: GFifo<RSS_FIFO_DEPTH>,
+    rss_fifo: GFifo<RSS_FIFO_DEPTH, 2>,
     hq_busy: AtomicBool,
-    rss_busy: AtomicBool,
+    rss_busy: [AtomicBool; 2],
     /// Held by every producer while it pushes, and by anyone who needs the
     /// engines to stay idle (reads of drawing state, checkpoints, monitor).
     /// Holds the recording, so records come out in FIFO order.
-    submit: Mutex<Option<record::RecHandle>>,
+    submit: SpinLock<Option<record::RecHandle>>,
     /// The recording again, for DMA memory accesses on the HQ3 thread (which
     /// must not wait on `submit`: its holder may be waiting for idle).
-    mem_rec: Mutex<Option<record::RecHandle>>,
+    mem_rec: SpinLock<Option<record::RecHandle>>,
     engines: AtomicBool,
-    threads: Mutex<Vec<thread::JoinHandle<()>>>,
-    hq_thread: Mutex<Option<thread::Thread>>,
-    rss_thread: Mutex<Option<thread::Thread>>,
+    threads: SpinLock<Vec<thread::JoinHandle<()>>>,
+    hq_thread: SpinLock<Option<thread::Thread>>,
+    rss_thread: [SpinLock<Option<thread::Thread>>; 2],
     dirty: AtomicBool,
     running: AtomicBool,
-    refresh: Mutex<Option<thread::JoinHandle<()>>>,
+    refresh: SpinLock<Option<thread::JoinHandle<()>>>,
     renderer: Mutex<Option<Box<dyn Renderer>>>,
     /// The finished frame, handed to the renderer as a prebuilt picture
     /// (`Rex3Screen::prebuilt`), as GR2 does.
@@ -300,9 +313,9 @@ pub struct Mgras {
     screenshot_pending: AtomicBool,
     heartbeat: Arc<AtomicU64>,
     fasttick: Arc<AtomicU64>,
-    cycles: Mutex<crate::cpu::mips_core::CyclesPtr>,
+    cycles: SpinLock<crate::cpu::mips_core::CyclesPtr>,
     /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
-    trace: Mutex<debug::MgrasTrace>,
+    trace: SpinLock<debug::MgrasTrace>,
     trace_mask: AtomicU32,
 }
 
@@ -332,7 +345,7 @@ impl Hq3Sink for HqSink<'_> {
             .map(|c| c.iter().enumerate().fold(0u64, |a, (i, &b)| a | (b as u64) << (56 - 8 * i)))
             .collect();
         self.0.rss_fifo.push_batch(tag::DMA_LINE, line as u64 | (bytes.len() as u64) << 32, &vals);
-        Mgras::wake(&self.0.rss_thread);
+        self.0.wake_rss();
     }
     fn dma_read_line(&mut self, line: u32) -> Vec<u8> {
         self.0.drain_rss();
@@ -380,26 +393,33 @@ impl Mgras {
             addr_of_mut!((*p).kind).write(board);
             addr_of_mut!((*p).ioc).write(ioc);
             addr_of_mut!((*p).general).write(AtomicBool::new(false));
-            addr_of_mut!((*p).front_lock).write(Mutex::new(()));
+            addr_of_mut!((*p).front_lock).write(SpinLock::new(()));
             (*(*p).front.get()).init(board);
-            addr_of_mut!((*p).unhandled).write(Mutex::new(HashSet::new()));
+            addr_of_mut!((*p).unhandled).write(SpinLock::new(HashSet::new()));
             addr_of_mut!((*p).flags).write(AtomicU32::new(0));
             addr_of_mut!((*p).eng).write(UnsafeCell::new(Hq3Engine::new()));
-            Rss::init((*p).rss.get());
-            addr_of_mut!((*p).mem).write(Mutex::new(None));
-            addr_of_mut!((*p).submit).write(Mutex::new(None));
-            addr_of_mut!((*p).mem_rec).write(Mutex::new(None));
-            addr_of_mut!((*p).threads).write(Mutex::new(Vec::new()));
-            addr_of_mut!((*p).hq_thread).write(Mutex::new(None));
-            addr_of_mut!((*p).rss_thread).write(Mutex::new(None));
+            let planes = (*p).planes.get();
+            Rss::init((*p).rss.get(), planes);
+            Rss::init((*p).rss1.get(), planes);
+            let nrss = Self::engines_for(board);
+            addr_of_mut!((*p).nrss).write(nrss);
+            (*(*p).rss.get()).set_engine(0, (nrss > 1) as u32);
+            (*(*p).rss1.get()).set_engine(1, 1);
+            (*p).rss_fifo.set_heads(nrss);
+            addr_of_mut!((*p).mem).write(SpinLock::new(None));
+            addr_of_mut!((*p).submit).write(SpinLock::new(None));
+            addr_of_mut!((*p).mem_rec).write(SpinLock::new(None));
+            addr_of_mut!((*p).threads).write(SpinLock::new(Vec::new()));
+            addr_of_mut!((*p).hq_thread).write(SpinLock::new(None));
+            addr_of_mut!((*p).rss_thread).write([SpinLock::new(None), SpinLock::new(None)]);
             addr_of_mut!((*p).dirty).write(AtomicBool::new(true));
-            addr_of_mut!((*p).refresh).write(Mutex::new(None));
+            addr_of_mut!((*p).refresh).write(SpinLock::new(None));
             addr_of_mut!((*p).renderer).write(Mutex::new(None));
             addr_of_mut!((*p).screen).write(Mutex::new(crate::disp::Rex3Screen::new()));
             addr_of_mut!((*p).heartbeat).write(heartbeat);
             addr_of_mut!((*p).fasttick).write(fasttick);
-            addr_of_mut!((*p).cycles).write(Mutex::new(crate::cpu::mips_core::CyclesPtr::dangling()));
-            addr_of_mut!((*p).trace).write(Mutex::new(debug::MgrasTrace::new()));
+            addr_of_mut!((*p).cycles).write(SpinLock::new(crate::cpu::mips_core::CyclesPtr::dangling()));
+            addr_of_mut!((*p).trace).write(SpinLock::new(debug::MgrasTrace::new()));
             a.assume_init()
         };
         if let Some(path) = std::env::var_os("IRIS_MGRAS_REC") {
@@ -419,7 +439,27 @@ impl Mgras {
         m
     }
 
+    /// Put the board's locks in the `locks` monitor listing.
+    pub fn register_locks(self: &Arc<Self>) {
+        use crate::locks::{register_mutex_fn, register_spin};
+        register_spin("mgras::submit", self, |m| &m.submit);
+        register_spin("mgras::front", self, |m| &m.front_lock);
+        register_spin("mgras::mem", self, |m| &m.mem);
+        register_spin("mgras::mem_rec", self, |m| &m.mem_rec);
+        register_spin("mgras::unhandled", self, |m| &m.unhandled);
+        register_spin("mgras::threads", self, |m| &m.threads);
+        register_spin("mgras::hq_thread", self, |m| &m.hq_thread);
+        register_spin("mgras::rss_thread[0]", self, |m| &m.rss_thread[0]);
+        register_spin("mgras::rss_thread[1]", self, |m| &m.rss_thread[1]);
+        register_spin("mgras::refresh", self, |m| &m.refresh);
+        register_spin("mgras::cycles", self, |m| &m.cycles);
+        register_spin("mgras::trace", self, |m| &m.trace);
+        register_mutex_fn("mgras::renderer", self, |m| m.renderer.is_locked());
+        register_mutex_fn("mgras::screen", self, |m| m.screen.is_locked());
+    }
+
     /// The CPU-side state, locked.
+    #[track_caller]
     fn front(&self) -> FrontGuard<'_> {
         let lock = self.front_lock.lock();
         // SAFETY: mutable access only under `front_lock`; the display
@@ -441,20 +481,36 @@ impl Mgras {
         }
     }
 
-    fn wake(slot: &Mutex<Option<thread::Thread>>) {
+    fn wake(slot: &SpinLock<Option<thread::Thread>>) {
         if let Some(t) = slot.lock().as_ref() {
             t.unpark();
         }
     }
 
-    /// True when neither FIFO holds work and neither engine is mid-entry.
+    /// Raster engines for a board: Maximum Impact's two, unless
+    /// `IRIS_MGRAS_ENGINES=1` asks for one thread to draw every scanline.
+    fn engines_for(board: GraphicsBoard) -> usize {
+        let one = std::env::var("IRIS_MGRAS_ENGINES").is_ok_and(|v| v.trim() == "1");
+        if board == GraphicsBoard::MaxImpact && !one { 2 } else { 1 }
+    }
+
+    /// True when the raster engines have run everything queued to them.
+    fn rss_idle(&self) -> bool {
+        self.rss_fifo.is_empty() && self.rss_busy[..self.nrss].iter().all(|b| !b.load(Ordering::Acquire))
+    }
+
+    /// True when neither FIFO holds work and no engine is mid-entry.
     /// The HQ3 is checked first: whatever it forwarded before going idle is
     /// already in `rss_fifo` when that is checked.
     fn idle(&self) -> bool {
-        self.hq_fifo.is_empty()
-            && !self.hq_busy.load(Ordering::Acquire)
-            && self.rss_fifo.is_empty()
-            && !self.rss_busy.load(Ordering::Acquire)
+        self.hq_fifo.is_empty() && !self.hq_busy.load(Ordering::Acquire) && self.rss_idle()
+    }
+
+    /// Wake the raster engine threads.
+    fn wake_rss(&self) {
+        for t in &self.rss_thread[..self.nrss] {
+            Self::wake(t);
+        }
     }
 
     /// Wait until the board is idle. Holding `submit` keeps it idle.
@@ -465,10 +521,10 @@ impl Mgras {
         }
     }
 
-    /// HQ3 thread: wait until the RSS has run everything queued to it.
+    /// HQ3 thread: wait until the engines have run everything queued.
     fn drain_rss(&self) {
         let backoff = crossbeam_utils::Backoff::new();
-        while !self.rss_fifo.is_empty() || self.rss_busy.load(Ordering::Acquire) {
+        while !self.rss_idle() {
             backoff.snooze();
         }
     }
@@ -476,7 +532,7 @@ impl Mgras {
     /// HQ3 thread: queue one entry for the RSS.
     fn rss_push(&self, addr: u32, val: u64) {
         self.rss_fifo.push(addr, val);
-        Self::wake(&self.rss_thread);
+        self.wake_rss();
     }
 
     /// Everything a replay must reproduce, as one byte string, little-endian
@@ -523,8 +579,12 @@ impl Mgras {
             }
         }
         if rest.words.iter().any(|&w| w != 0) {
+            // The second raster engine's memory only when it holds anything,
+            // so one-engine recordings keep their hashes.
+            let (re0, re1) = rest.words.split_at(pixmem::RE_WORDS);
+            let n = if re1.iter().any(|&w| w != 0) { rest.words.len() } else { re0.len() };
             let mut h = blake3::Hasher::new();
-            for w in rest.words.iter() {
+            for w in rest.words[..n].iter() {
                 h.update(&w.to_le_bytes());
             }
             out.extend_from_slice(h.finalize().as_bytes());
@@ -533,7 +593,7 @@ impl Mgras {
         // are identical. Keep zero-CID recordings' historical hashes.
         if rss.cid.iter().any(|&c| c != 0) {
             out.extend_from_slice(b"CID\0");
-            out.extend_from_slice(blake3::hash(&rss.cid).as_bytes());
+            out.extend_from_slice(blake3::hash(&rss.cid[..]).as_bytes());
         }
         out
     }
@@ -879,15 +939,28 @@ impl Mgras {
         self.hq_busy.store(false, Ordering::Release);
     }
 
-    fn rss_loop(&self) {
-        *self.rss_thread.lock() = Some(thread::current());
+    /// Raster engine `id`'s thread: every `rss_fifo` entry, through head
+    /// `id`. With two engines both see the same stream and keep the same
+    /// register state; each draws only its own scanlines. Nothing they draw
+    /// reads another scanline (blending, depth and stencil read the pixel
+    /// being drawn; screen copies go through the host), so they never wait
+    /// for each other, except at a PIO read advance: engine 0 reads the
+    /// next doubleword from both engines' rows there, so engine 1 must not
+    /// draw past it until engine 0 has. (Everything before it is drawn: the
+    /// CPU reads only with the board idle.) Engine 0 does the counting,
+    /// tracing and statistics the monitor shows.
+    fn rss_loop(&self, id: usize) {
+        *self.rss_thread[id].lock() = Some(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
         let mut stale_seen = 0u32;
+        let mut advances = 0u64;
         let mut payload: Vec<u64> = Vec::new();
+        let cell = if id == 0 { &self.rss } else { &self.rss1 };
+        let busy = &self.rss_busy[id];
         loop {
-            let Some((t, val)) = self.rss_fifo.peek() else {
-                self.rss_fifo.flush_head();
-                self.rss_busy.store(false, Ordering::Release);
+            let Some((t, val)) = self.rss_fifo.peek_at(id) else {
+                self.rss_fifo.flush_head_at(id);
+                busy.store(false, Ordering::Release);
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {
@@ -895,14 +968,24 @@ impl Mgras {
                 }
                 continue;
             };
-            self.rss_busy.store(true, Ordering::Release);
-            // SAFETY: the RSS thread owns the raster subsystem.
-            let rss = unsafe { &mut *self.rss.get() };
+            busy.store(true, Ordering::Release);
+            // SAFETY: this engine's thread owns its raster state.
+            let rss = unsafe { &mut *cell.get() };
             let changed = match t {
                 tag::EXIT => break,
                 t if t < 0x1000 => rss.write((t & 0x7FF) >> 1, val as u32, t & 1 != 0),
                 tag::PIO_ADVANCE => {
-                    rss.pio_read_hi();
+                    advances += 1;
+                    if id == 0 {
+                        rss.pio_read_hi();
+                        self.pio_advances.store(advances, Ordering::Release);
+                    } else {
+                        let wait = crossbeam_utils::Backoff::new();
+                        while self.pio_advances.load(Ordering::Acquire) < advances {
+                            wait.snooze();
+                        }
+                        rss.pio_read_hi();
+                    }
                     false
                 }
                 tag::GL_ENTER => {
@@ -917,7 +1000,7 @@ impl Mgras {
                     let (line, len) = (val as u32, (val >> 32) as usize);
                     payload.resize(len.div_ceil(8), 0);
                     let n = payload.len();
-                    self.rss_fifo.drain_payload(n, &mut payload[..]);
+                    self.rss_fifo.drain_payload_at(id, n, &mut payload[..]);
                     let bytes: Vec<u8> = payload.iter().flat_map(|w| w.to_be_bytes()).take(len).collect();
                     rss.dma_write_line(line, &bytes);
                     true
@@ -927,22 +1010,24 @@ impl Mgras {
             if changed {
                 self.dirty.store(true, Ordering::Release);
             }
-            if self.tracing(debug::TRACE_RSS) {
-                self.trace_rss(t, val, rss, changed);
-            }
-            if rss.te.stale_events != stale_seen {
-                stale_seen = rss.te.stale_events;
-                if self.tracing(debug::TRACE_TEX) {
-                    let [want, have] = rss.te.stale_last;
-                    self.trace_hq(&format!("TEX stale sample #{stale_seen}: want {want:#x}, page holds {have:#x}"));
+            if id == 0 {
+                if self.tracing(debug::TRACE_RSS) {
+                    self.trace_rss(t, val, rss, changed);
+                }
+                if rss.te.stale_events != stale_seen {
+                    stale_seen = rss.te.stale_events;
+                    if self.tracing(debug::TRACE_TEX) {
+                        let [want, have] = rss.te.stale_last;
+                        self.trace_hq(&format!("TEX stale sample #{stale_seen}: want {want:#x}, page holds {have:#x}"));
+                    }
                 }
             }
-            self.rss_fifo.consume();
+            self.rss_fifo.consume_at(id);
             backoff.reset();
         }
-        self.rss_fifo.consume();
-        self.rss_fifo.flush_head();
-        self.rss_busy.store(false, Ordering::Release);
+        self.rss_fifo.consume_at(id);
+        self.rss_fifo.flush_head_at(id);
+        busy.store(false, Ordering::Release);
     }
 
     /// Start the HQ3 and RSS threads.
@@ -953,8 +1038,12 @@ impl Mgras {
         let mut threads = self.threads.lock();
         let me = Arc::clone(self);
         threads.push(thread::Builder::new().name("MGRAS-HQ3".into()).spawn(move || me.hq_loop()).expect("spawn MGRAS HQ3 thread"));
-        let me = Arc::clone(self);
-        threads.push(thread::Builder::new().name("MGRAS-RSS".into()).spawn(move || me.rss_loop()).expect("spawn MGRAS RSS thread"));
+        self.pio_advances.store(0, Ordering::Release);
+        for id in 0..self.nrss {
+            let me = Arc::clone(self);
+            let name = if self.nrss == 1 { "MGRAS-RSS".to_string() } else { format!("MGRAS-RSS{id}") };
+            threads.push(thread::Builder::new().name(name).spawn(move || me.rss_loop(id)).expect("spawn MGRAS RSS thread"));
+        }
     }
 
     /// Stop the engine threads once they have run everything queued.
@@ -972,7 +1061,7 @@ impl Mgras {
             let _ = h.join();
         }
         self.rss_fifo.push(tag::EXIT, 0);
-        Self::wake(&self.rss_thread);
+        self.wake_rss();
         for h in threads.drain(..) {
             let _ = h.join();
         }

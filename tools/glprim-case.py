@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Run one glprim case in the IRIX guest and check the result (GR2 GL loop).
+"""Run one glprim case in the IRIX guest and check the result (GL loop).
 
-Steps: start `gr2 trace` on the IRIS monitor, run /tmp/gltest/glprim with the
-given options in the background in the guest (tools/irix-sh.py), wait for it
-to draw, probe pixels with `gr2 pix`, dump the framebuffer, crop the glprim
-window to <out>/<case>.png, stop the trace (<out>/<case>.log).
+Works on GR2 (XZ/Extreme) and IMPACT (MGRAS): the board is detected from
+the monitor (`--board` overrides), and its commands used (`gr2 ...` or
+`mgras ...`).
+
+Steps: start the board's trace on the IRIS monitor, run /tmp/gltest/glprim
+with the given options in the background in the guest (tools/irix-sh.py),
+wait for it to draw, probe pixels with `<board> pix`, dump the framebuffer,
+crop the glprim window to <out>/<case>.png, stop the trace (<out>/<case>.log).
 
 Probes are in GL window coordinates (origin bottom-left of the client area):
   --probe 200,120=0000ff      expect rgb (hex, +-tolerance per channel)
@@ -62,6 +66,7 @@ def main():
     p.add_argument("--tol", type=int, default=2)
     p.add_argument("--settle", type=float, default=6.0, help="seconds to wait for the draw")
     p.add_argument("--notrace", action="store_true")
+    p.add_argument("--board", choices=["auto", "gr2", "mgras"], default="auto")
     argv = sys.argv[1:]
     split = argv.index("--") if "--" in argv else len(argv)
     a = p.parse_args(argv[:split])
@@ -71,8 +76,11 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     log = os.path.join(a.out, a.case + ".log")
     mon = Monitor()
+    board = a.board
+    if board == "auto":
+        board = "mgras" if "IMPACT" in mon.cmd("mgras status") else "gr2"
     if not a.notrace:
-        print(mon.cmd(f"gr2 trace {log} all"))
+        print(mon.cmd(f"{board} trace {log} all"))
     quoted = " ".join("'" + x.replace("'", "'\\''") + "'" for x in gargs)
     rc, out = guest(f"cd /tmp/gltest && (./glprim {quoted} > /tmp/glprim.out 2>&1 &)",
                     f"sleep {int(a.settle)}; cat /tmp/glprim.out")
@@ -81,7 +89,7 @@ def main():
     if not m:
         print("glprim did not report a window (see output above)")
         if not a.notrace:
-            mon.cmd("gr2 trace off")
+            mon.cmd(f"{board} trace off")
         return 101
     ox, oy, w, h = map(int, m.groups())
     fails = 0
@@ -89,8 +97,13 @@ def main():
         pos, _, want = pr.partition("=")
         gx, gy = map(int, pos.split(","))
         dx, dy = ox + gx, oy + h - 1 - gy
-        res = mon.cmd(f"gr2 pix {dx} {dy}")
+        res = mon.cmd(f"{board} pix {dx} {dy}")
         mm = re.search(r"rgb=([0-9a-f]{6})", res)
+        if not mm:
+            # mgras: "screen r=R g=G b=B" in decimal.
+            md = re.search(r"r=(\d+) g=(\d+) b=(\d+)", res)
+            if md:
+                mm = re.match(r"(.*)", "%02x%02x%02x" % tuple(int(v) for v in md.groups()))
         got = mm.group(1) if mm else "??????"
         status = ""
         if want:
@@ -101,7 +114,7 @@ def main():
             fails += 0 if ok else 1
         print(f"  {status} gl ({gx:4d},{gy:4d}) screen ({dx:4d},{dy:4d}) rgb={got} {('want ' + want) if want else ''}")
     dump = os.path.join(a.out, a.case + "-fb")
-    mon.cmd(f"gr2 fbdump {dump}")
+    mon.cmd(f"{board} fbdump {dump}")
     try:
         from PIL import Image
         im = Image.open(os.path.join(dump, "screen.png"))
@@ -110,7 +123,7 @@ def main():
     except Exception as e:  # noqa: BLE001
         print(f"  (crop failed: {e})")
     if not a.notrace:
-        print(mon.cmd("gr2 trace off"))
+        print(mon.cmd(f"{board} trace off"))
     # Let glprim exit before the next case.
     guest("sleep 1; ps -ef | grep -v grep | grep glprim >/dev/null && kill `ps -ef | grep -v grep | grep glprim | awk '{print $2}'`; true")
     print(f"{a.case}: {'PASS' if fails == 0 else f'{fails} FAILED'}")

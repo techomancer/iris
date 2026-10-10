@@ -308,6 +308,30 @@ fn xsetroot_red_trace() {
     m.stop_engines();
 }
 
+/// Maximum Impact's two raster engines each draw half the scanlines of
+/// one picture: the captures come out the same as on one engine, word for
+/// word (the state hash covers all pixel memory and the clip IDs).
+#[test]
+fn two_raster_engines_draw_what_one_does() {
+    use crate::config::GraphicsBoard;
+    for text in [include_str!("testdata/xsetroot_red.txt")] {
+        let recs = load_text(text).unwrap();
+        let hashes: Vec<[u8; 32]> = [GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact]
+            .into_iter()
+            .map(|kind| {
+                let m = super::record::tests::live_board_of(kind);
+                let rep = replay_recs(&m, &recs, false).unwrap();
+                assert!(!rep.diverged(), "{kind:?}: {rep:?}");
+                assert_eq!(m.nrss, if kind == GraphicsBoard::MaxImpact { 2 } else { 1 });
+                let h = m.state_hash();
+                m.stop_engines();
+                h
+            })
+            .collect();
+        assert_eq!(hashes[0], hashes[1]);
+    }
+}
+
 /// Window-ID runs: no run at x = 0 starts in ID 0; each run lasts to the
 /// next one; the overlay ID picks the overlay mode.
 #[test]

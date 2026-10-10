@@ -99,6 +99,23 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **Maximum Impact draws correctly, on two raster engines.** Its two RE4s
+  each own every other scanline in their own 12MB, so a buffer takes half
+  the pages per engine. The model assumed one engine; buffers overlapped,
+  and the desktop came up in 16-row bands. Pixel memory now has room for
+  both engines and follows the RSS count in DRBsize. Each engine also runs
+  on its own thread, like Voodoo2 SLI. Both take every raster command from
+  a broadcast FIFO (`GFifo<DEPTH, HEADS>`), each keeps its own TRAM as the
+  board does, and each draws only its scanlines (triangle and fill loops
+  step by two). Replays come out identical to one engine, desktop2.rec
+  passes every checkpoint, and a recorded gltest fill/triangle session
+  replays 1.75x faster. `IRIS_MGRAS_ENGINES=1` keeps one RSS thread. See
+  `rules/mgras/DESIGN.md`.
+- **IMPACT locks show in `locks`, with their holders.** The board's locks
+  are now light spinlocks (`locks::SpinLock`) that record the holding thread
+  and call site. A thread stuck waiting 5 s prints both sides, so a deadlock
+  names itself instead of just hanging.
+
 - **Newport glReadPixels from a double-buffered window reads the right
   buffer with the REX JIT.** The compiled READ shader ignored DBLSRC (and the
   bit offsets of the overlay, popup and CID planes), so once a 12-bit

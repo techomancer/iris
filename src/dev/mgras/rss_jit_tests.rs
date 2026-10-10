@@ -106,10 +106,13 @@ impl Pair {
     /// New random pixels and clip IDs where the tests draw (both boards).
     fn refresh(&mut self) {
         let n = LIVE_PAGES * super::pixmem::PAGE_WORDS;
-        for w in self.interp.mem.words[..n].iter_mut() {
-            *w = self.rng.next() & super::pixmem::WORD_MASK;
+        for re in 0..super::pixmem::RES {
+            let live = re * super::pixmem::RE_WORDS..re * super::pixmem::RE_WORDS + n;
+            for w in self.interp.mem.words[live.clone()].iter_mut() {
+                *w = self.rng.next() & super::pixmem::WORD_MASK;
+            }
+            self.jit.mem.words[live.clone()].copy_from_slice(&self.interp.mem.words[live]);
         }
-        self.jit.mem.words[..n].copy_from_slice(&self.interp.mem.words[..n]);
         for y in 0..512 {
             for x in 0..1024 {
                 // Mostly one ID per 16-pixel run, so CID tests pass some.
@@ -117,7 +120,7 @@ impl Pair {
                 self.interp.cid[y * rss::WIDTH + x] = v;
             }
         }
-        self.jit.cid.copy_from_slice(&self.interp.cid);
+        self.jit.cid.copy_from_slice(&self.interp.cid[..]);
     }
 
     fn write(&mut self, r: u32, v: u32) {
@@ -217,7 +220,8 @@ fn common_regs(rng: &mut Rng, regs: &mut Regs, gl: bool) {
     }
     regs.push((reg::PP1FILLMODE, pp1));
     regs.push((reg::DRBPOINTERS, drb));
-    regs.push((reg::DRBSIZE, (rng.range(1, 3) as u32) << 2 | rng.range(1, 2) as u32));
+    // Tiles per row, and sometimes two raster engines (Maximum Impact).
+    regs.push((reg::DRBSIZE, (rng.chance(0.3) as u32) << 6 | (rng.range(1, 3) as u32) << 2 | rng.range(1, 2) as u32));
     let mask = |rng: &mut Rng| {
         let r = rng.u32();
         rng.pick(&[0xFF_FFFFu32, u32::MAX, 0xFFF, 0xFF, 0, r])
@@ -661,11 +665,16 @@ fn candidate(p: &mut Pair, prim: Prim, tex_bias: f64) -> Option<Candidate> {
 fn draw(p: &mut Pair, prim: Prim, c: &Candidate, step: usize) {
     p.apply(&c.mode);
     p.apply(&c.data);
+    // Sometimes draw as one of Maximum Impact's two raster engines, which
+    // takes only its own (even or odd) scanlines.
+    let (engine, own_mask) = if p.rng.chance(0.3) { (p.rng.below(2) as u32, 1) } else { (0, 0) };
+    p.interp.set_engine(engine, own_mask);
+    p.jit.set_engine(engine, own_mask);
     p.snapshot();
     let hits0 = p.jit.jit.hits;
     let what = |extra: &str| {
         let regs: Vec<String> = c.mode.iter().chain(&c.data).map(|(r, v)| format!("{r:#05x}={v:#x}")).collect();
-        format!("step {step}, key {} ({:#x}){extra}\nregisters: {}", c.key, c.key.pack(), regs.join(" "))
+        format!("step {step}, key {} ({:#x}), engine {engine} mask {own_mask}{extra}\nregisters: {}", c.key, c.key.pack(), regs.join(" "))
     };
     match prim {
         Prim::Fill | Prim::Line | Prim::Tri | Prim::GlLine => {

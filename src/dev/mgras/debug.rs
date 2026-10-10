@@ -281,7 +281,7 @@ impl Mgras {
                 let rif: Vec<String> = eng.raster_if_regs.iter().enumerate().filter(|(_, v)| **v != 0).map(|(i, v)| format!("{i:#x}={v:#x}")).collect();
                 e(writeln!(w, "  raster interface: {}  formatter {:#x}", rif.join(" "), eng.formatter))?;
                 e(writeln!(w, "  fifo: hq {} (busy {})  rss {} (busy {})  idle={}", self.hq_fifo.len(),
-                    self.hq_busy.load(Ordering::Relaxed), self.rss_fifo.len(), self.rss_busy.load(Ordering::Relaxed), self.idle()))
+                    self.hq_busy.load(Ordering::Relaxed), self.rss_fifo.len(), self.rss_busy_text(), self.idle()))
             }
             "gl" => {
                 drop(f);
@@ -384,7 +384,7 @@ impl Mgras {
         let num = |i: usize, d: u32| args.get(i).and_then(|s| s.parse::<u32>().ok()).unwrap_or(d);
         match args.first().copied().unwrap_or("regs") {
             "regs" => {
-                e(writeln!(w, "RSS: fifo {} pending, busy={}", self.rss_fifo.len(), self.rss_busy.load(Ordering::Relaxed)))?;
+                e(writeln!(w, "RSS: fifo {} pending, busy={}", self.rss_fifo.len(), self.rss_busy_text()))?;
                 for r in 0..0x400u32 {
                     let v = rss.reg(r);
                     let name = REG_NAMES.get(r as usize).copied().unwrap_or("");
@@ -411,6 +411,17 @@ impl Mgras {
         }
     }
 
+    /// The engines' busy flags, and with two engines each one's backlog.
+    fn rss_busy_text(&self) -> String {
+        let b: Vec<String> = (0..self.nrss)
+            .map(|i| {
+                let busy = self.rss_busy[i].load(Ordering::Relaxed);
+                if self.nrss == 1 { busy.to_string() } else { format!("RE{i} {busy} ({} queued)", self.rss_fifo.len_at(i)) }
+            })
+            .collect();
+        b.join(", ")
+    }
+
     fn mgras_status(&self, w: &mut dyn Write) -> std::io::Result<()> {
         // SAFETY: read-only peek at the RSS (may tear while drawing).
         let rss = unsafe { &*self.rss.get() };
@@ -425,8 +436,12 @@ impl Mgras {
             None => writeln!(w, "  cursor hidden")?,
         }
         writeln!(w, "  fill modes seen: {:x?}", rss.fillmodes_seen())?;
-        let mut hist: HashMap<u32, usize> = HashMap::new();
         let (main, _) = super::frame::scanout_buffers(rss, &f.dcb);
+        let pal = &f.dcb.cmap[0].pal;
+        let blocks: Vec<usize> = (0..pal.len() / 256).filter(|k| pal[k * 256..(k + 1) * 256].iter().any(|c| *c != 0)).collect();
+        // Not under the front lock: the scan takes a while.
+        drop(f);
+        let mut hist: HashMap<u32, usize> = HashMap::new();
         for y in 0..1024 {
             for x in 0..1280 {
                 *hist.entry(rss.mem.get(&main, x, y) as u32).or_default() += 1;
@@ -435,10 +450,7 @@ impl Mgras {
         let mut top: Vec<_> = hist.into_iter().collect();
         top.sort_by(|a, b| b.1.cmp(&a.1));
         writeln!(w, "  main buffer (page {}) values over 1280x1024 (value, pixels): {:x?}", main.ptr, &top[..top.len().min(8)])?;
-        let pal = &f.dcb.cmap[0].pal;
-        let blocks: Vec<usize> = (0..pal.len() / 256).filter(|k| pal[k * 256..(k + 1) * 256].iter().any(|c| *c != 0)).collect();
         writeln!(w, "  colormap blocks in use: {blocks:?}")?;
-        drop(f);
         if let Some(r) = self.submit.lock().as_ref() {
             let r = r.lock();
             writeln!(w, "  recording: {} ({} records)", r.path, r.records)?;
@@ -506,6 +518,7 @@ impl Mgras {
             self.wait_idle();
             // SAFETY: the board is idle and `submit` keeps it so.
             unsafe { &mut *self.rss.get() }.jit.mode = m;
+            unsafe { &mut *self.rss1.get() }.jit.mode = m;
         }
         // SAFETY: read-only peek (may tear).
         let j = unsafe { &*self.rss.get() }.jit;
