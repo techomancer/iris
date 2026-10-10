@@ -235,9 +235,6 @@ pub struct Te1 {
     /// Diagnostic: per page, the last level loaded there (page << 16 |
     /// TL_SPEC's sizes), for `stale`.
     owner: [u32; 256],
-    /// Diagnostic: stale samples seen, and the last one's (want, have).
-    pub stale_events: u32,
-    pub stale_last: [u32; 2],
 }
 
 impl Te1 {

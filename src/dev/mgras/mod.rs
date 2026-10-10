@@ -1014,10 +1014,10 @@ impl Mgras {
                 if self.tracing(debug::TRACE_RSS) {
                     self.trace_rss(t, val, rss, changed);
                 }
-                if rss.te.stale_events != stale_seen {
-                    stale_seen = rss.te.stale_events;
+                if rss.stale_events != stale_seen {
+                    stale_seen = rss.stale_events;
                     if self.tracing(debug::TRACE_TEX) {
-                        let [want, have] = rss.te.stale_last;
+                        let [want, have] = rss.stale_last;
                         self.trace_hq(&format!("TEX stale sample #{stale_seen}: want {want:#x}, page holds {have:#x}"));
                     }
                 }
@@ -1039,6 +1039,11 @@ impl Mgras {
         let me = Arc::clone(self);
         threads.push(thread::Builder::new().name("MGRAS-HQ3".into()).spawn(move || me.hq_loop()).expect("spawn MGRAS HQ3 thread"));
         self.pio_advances.store(0, Ordering::Release);
+        // SAFETY: the engine threads are not running yet.
+        unsafe {
+            (*self.rss.get()).share_te(self.nrss > 1);
+            (*self.rss1.get()).share_te(self.nrss > 1);
+        }
         for id in 0..self.nrss {
             let me = Arc::clone(self);
             let name = if self.nrss == 1 { "MGRAS-RSS".to_string() } else { format!("MGRAS-RSS{id}") };

@@ -821,6 +821,19 @@ pub type CidPlanes = [u8; WIDTH * HEIGHT];
 pub struct Planes {
     pub mem: PixMem,
     pub cid: CidPlanes,
+    /// The texture engine's tables and TRAM, likewise shared: the engines
+    /// only sample it, and its writes (`Rss::te_write`) are synchronised.
+    pub te: Te1,
+    pub te_sync: TeSync,
+}
+
+/// Two engines' handshake around a write to their shared `Te1`: engine 1
+/// says how many writes it has reached (`arrived`), engine 0 how many it
+/// has made (`done`). Valid zeroed.
+#[repr(C)]
+pub struct TeSync {
+    pub arrived: std::sync::atomic::AtomicU64,
+    pub done: std::sync::atomic::AtomicU64,
 }
 
 /// A raster engine's handle on part of its board's `Planes`. The engines'
@@ -867,8 +880,16 @@ pub struct Rss {
     /// Fill modes seen with a block, for bring-up logging.
     fillmodes: [u32; 32],
     fillmodes_n: usize,
-    /// The texture engine and TRAM.
-    pub te: Te1,
+    /// The texture engine and TRAM (`Planes::te`, shared by the engines).
+    pub te: Plane<Te1>,
+    te_sync: Plane<TeSync>,
+    /// With two engines on one `Te1`: 1, and the writes made so far.
+    pub te_shared: u32,
+    te_writes: u64,
+    /// Diagnostic: stale texture samples seen, and the last one's (want,
+    /// have) (`Te1::stale`).
+    pub stale_events: u32,
+    pub stale_last: [u32; 2],
     /// A texture load transfer is armed (XFRCONTROL to the texture side):
     /// DMA lines go to the texture loader.
     te_load: u32,
@@ -986,6 +1007,8 @@ impl Rss {
     pub unsafe fn init(p: *mut Rss, planes: *mut Planes) {
         std::ptr::addr_of_mut!((*p).mem).write(Plane(std::ptr::addr_of_mut!((*planes).mem)));
         std::ptr::addr_of_mut!((*p).cid).write(Plane(std::ptr::addr_of_mut!((*planes).cid)));
+        std::ptr::addr_of_mut!((*p).te).write(Plane(std::ptr::addr_of_mut!((*planes).te)));
+        std::ptr::addr_of_mut!((*p).te_sync).write(Plane(std::ptr::addr_of_mut!((*planes).te_sync)));
         #[cfg(feature = "gr4-jit")]
         std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
     }
@@ -996,6 +1019,43 @@ impl Rss {
         self.own_mask = mask;
         #[cfg(feature = "gr4-jit")]
         self.jit.invalidate();
+    }
+
+    /// Share `Te1` with another engine (`te_write`), counting writes from
+    /// zero. Call with both engines stopped, on both.
+    pub fn share_te(&mut self, shared: bool) {
+        self.te_shared = shared as u32;
+        self.te_writes = 0;
+        self.te_sync.arrived.store(0, std::sync::atomic::Ordering::Release);
+        self.te_sync.done.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Change the texture engine's state (a table write, a texel load).
+    /// With two engines on one `Te1`, engine 0 makes the write once engine
+    /// 1 has reached it too (so engine 1 has finished drawing with what it
+    /// replaces), and engine 1 goes on only once it is made. Both meet the
+    /// same writes in the same order: they read one stream.
+    fn te_write(&mut self, f: impl FnOnce(&mut Te1, &[u32; 0x400])) {
+        use std::sync::atomic::Ordering;
+        if self.te_shared == 0 {
+            f(&mut self.te, &self.regs);
+            return;
+        }
+        self.te_writes += 1;
+        let n = self.te_writes;
+        let wait = crossbeam_utils::Backoff::new();
+        if self.engine == 0 {
+            while self.te_sync.arrived.load(Ordering::Acquire) < n {
+                wait.snooze();
+            }
+            f(&mut self.te, &self.regs);
+            self.te_sync.done.store(n, Ordering::Release);
+        } else {
+            self.te_sync.arrived.store(n, Ordering::Release);
+            while self.te_sync.done.load(Ordering::Acquire) < n {
+                wait.snooze();
+            }
+        }
     }
 
     /// Whether this engine draws framebuffer row `y`.
@@ -1113,9 +1173,9 @@ impl Rss {
                 self.te_read = [read as u32, size & 0xFFFF, size >> 16];
             }
             te_reg::TXMIPMAP | te_reg::TXBORDER | te_reg::DETAILSCALE => {
-                let i = &mut self.regs[te_reg::TXADDR as usize];
-                self.te.table_write(r, *i, val);
-                *i = i.wrapping_add(1);
+                let i = self.regs[te_reg::TXADDR as usize];
+                self.te_write(|te, _| te.table_write(r, i, val));
+                self.regs[te_reg::TXADDR as usize] = i.wrapping_add(1);
             }
             _ => {}
         }
@@ -1698,8 +1758,8 @@ impl Rss {
         ];
         if texture {
             if let Some((want, have)) = self.te.stale(&self.regs) {
-                self.te.stale_events += 1;
-                self.te.stale_last = [want, have];
+                self.stale_events += 1;
+                self.stale_last = [want, have];
             }
         }
         let fog = self.reg(reg::FOG_ON) != 0;
@@ -2272,7 +2332,7 @@ impl Rss {
     pub fn dma_write_line(&mut self, line: u32, bytes: &[u8]) {
         self.stats.dma_lines_in += 1;
         if self.te_load != 0 {
-            self.te.load_line(&self.regs, line, bytes);
+            self.te_write(|te, regs| te.load_line(regs, line, bytes));
             return;
         }
         if let Some(x) = self.xfer.take() {
