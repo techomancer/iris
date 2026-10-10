@@ -1028,6 +1028,9 @@ impl Gl {
             tok::READ_BUFFER => self.read_back = (d.get(2) == Some(&0x405)) as u32,
             tok::SAVE_RSS => self.pixel_op = 1,
             tok::READ_TEXTURE if d.len() >= 5 => {
+                if sink.tracing_tex() {
+                    sink.trace(format!("TEX read {}x{} page {:#x} xfrmode {:#x}", d[0], d[1], self.te_tables[0][0], d[4]));
+                }
                 self.begin_raster(sink);
                 sink.rss_write(re::XFRMODE, d[4], false);
                 sink.rss_write(re::XFRSIZE, d[1] << 16 | (d[0] & 0xFFFF), false);
@@ -1039,6 +1042,12 @@ impl Gl {
             tok::READ_TEXTURE_RAW if d.len() >= 3 => {
                 self.begin_raster(sink);
                 let size = self.te[te1::CONTEXT_REGS.iter().position(|&r| r == te_reg::TXSIZE).unwrap_or(0)];
+                if sink.tracing_tex() {
+                    sink.trace(format!(
+                        "TEX save {} rows x {} page {:#x} txsize {size:#x} xfrmode {:#x}",
+                        d[0], 1u32 << (size & 0xF), self.te_tables[0][0], d[1]
+                    ));
+                }
                 sink.rss_write(re::XFRMODE, d[1], false);
                 sink.rss_write(re::XFRSIZE, d[0] << 16 | 1 << (size & 0xF), false);
                 sink.rss_write(super::rss::reg::TE_RAW, 1, false);
@@ -2249,6 +2258,18 @@ impl Gl {
     /// it loaded. False for other registers.
     pub fn te_write(&mut self, r: u32, v: u32, sink: &mut dyn Hq3Sink) -> bool {
         self.ensure_init();
+        // The driver's texture placement, for following libGLcore's TRAM
+        // bookkeeping over a long run (`mgras trace <file> tex`).
+        if sink.tracing_tex()
+            && matches!(r, te_reg::TXSIZE | te_reg::TXADDR | te_reg::TXMIPMAP | te_reg::TL_ADDR | te_reg::TL_SPEC | te_reg::TL_MIPMAP)
+        {
+            let idx = match r {
+                te_reg::TXMIPMAP => format!(" [{}]", self.te_index),
+                te_reg::TL_MIPMAP => format!(" [{}]", self.te[te1::CONTEXT_REGS.iter().position(|&c| c == te_reg::TL_ADDR).unwrap_or(0)]),
+                _ => String::new(),
+            };
+            sink.trace(format!("TEX reg {r:#05x}{idx} = {v:#x}"));
+        }
         if r == te_reg::TXADDR {
             self.te_index = v;
         } else if let Some(i) = te1::CONTEXT_REGS.iter().position(|&x| x == r) {
@@ -2352,7 +2373,18 @@ impl Gl {
             ));
         }
         self.begin_raster(sink);
-        if !raw {
+        if raw {
+            // The driver set the loader registers in the context (a TRAM
+            // restore, glCopyTexSubImage's destination): send them, as an
+            // earlier load since the batch began may have left its own
+            // page in the TE (traced: TyrQuake's lightmap loads to page 7,
+            // then its warp copy to 0x37 landed on the lightmaps).
+            for r in [te_reg::TL_MODE, te_reg::TL_SPEC, te_reg::TL_MIPMAP, te_reg::TL_BORDER] {
+                if let Some(i) = te1::CONTEXT_REGS.iter().position(|&c| c == r) {
+                    sink.rss_write(r, self.te[i], false);
+                }
+            }
+        } else {
             sink.rss_write(te_reg::TL_MIPMAP, self.tl_dest[3], false);
             sink.rss_write(te_reg::TL_BORDER, self.tl_dest[4], false);
         }
