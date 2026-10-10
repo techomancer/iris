@@ -56,6 +56,11 @@ trace is short and every option flips one piece of state or one address bit.
   saturated colours, or check values with glprim `--read ... --check`.
   glprim picks the deepest visual by default (12,12,12, which the raster
   JIT leaves to the interpreter): use `--visual 8,8,8,8` for the JIT path.
+- Textures: `tools/gltex-matrix.py` runs glprim's tex scene over formats
+  and sizes and checks every texel's raw framebuffer word (all pass as of
+  48089c43). Several GL clients share TRAM through the texture manager's
+  page saves and restores (`tl_spec 0xd60` loads in `mgras trace F
+  hq,tex`): a bug there damages every client.
 - Performance: board-bound runs slow the guest clock (lost ticks), so guest-side `gltest --bench` is meaningless (see
   rules/mgras/guest-gl-benchmarks-miss-board-time.md). Record the session
   (`mgras rec F` ... `mgras rec off`) and time its replay offline with

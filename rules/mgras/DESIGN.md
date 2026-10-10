@@ -47,11 +47,15 @@ each with its own 12MB; scanline y belongs to RE4 y % 2 (ignore/gr4/PP1.h
     DRBsize bits 7:6 (engines - 1). The JIT's locate_row does the same with
     CommonCtx.yshift/remask. A one-engine board leaves the second half zero;
     state_bytes hashes it only when non-zero, so old goldens keep hashes.
-  - the pixel memory and clip-ID planes live in Mgras.planes (rss::Planes);
-    each Rss reaches them through Plane<T> pointers (Rss::init). Rss itself
-    is one engine: registers, transfer state, TE1 and its own TRAM (the real
-    board has RA and RB TRAMs, so the copy is faithful and keeps each
-    engine's texture cache to itself).
+  - the pixel memory, clip-ID planes and the TE1 (tables + TRAM) live in
+    Mgras.planes (rss::Planes); each Rss reaches them through Plane<T>
+    pointers (Rss::init). Rss itself is one engine: registers, transfer
+    state. The real board has RA and RB TRAMs, but the engines only sample
+    texture memory, so one copy serves both: its two writers (TE table
+    writes, texel load lines) go through Rss::te_write, where engine 0
+    writes once engine 1 has reached the same write and engine 1 waits for
+    it (Planes.te_sync). Texture uploads reached both copies before this
+    too (they come through the broadcast FIFO).
   - rss_fifo is GFifo<_, 2>: a broadcast queue, each engine's thread
     consuming every entry through its own head (gfifo.rs "HEADS"); one-engine
     boards set_heads(1). Both engines keep identical register state; each
