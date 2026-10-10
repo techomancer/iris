@@ -1117,11 +1117,19 @@ impl Rss {
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
     }
 
+    /// The read source's word at (x, y), undecoded.
+    fn get_word(&self, x: i32, y: i32) -> u32 {
+        if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
+            return 0;
+        }
+        self.mem.get(&self.source(), x as u32, y as u32) as u32
+    }
+
     fn get(&self, x: i32, y: i32) -> u32 {
         if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
             return 0;
         }
-        let w = self.mem.get(&self.source(), x as u32, y as u32) as u32;
+        let w = self.get_word(x, y);
         if self.regs[reg::ZST_STENCIL as usize] != 0 {
             return w >> 24;
         }
@@ -1879,7 +1887,9 @@ impl Rss {
     /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
     fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
-        let v = to_host(x.format, self.get(fx, fy));
+        // Depth: the ZST word as it is, never a 12-bit pair's half.
+        let px = if x.format == DEPTH_FORMAT { self.get_word(fx, fy) } else { self.get(fx, fy) };
+        let v = to_host(x.format, px);
         (v >> (8 * (x.bpp - 1 - i))) as u8
     }
 

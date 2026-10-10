@@ -2676,6 +2676,18 @@ fn gl_12bit_pairs_read_from_their_halves() {
     let mut got = [front, back];
     got.sort();
     assert_eq!(got, [vec![0, 0, 0xFF], vec![0xFF, 0, 0]], "one buffer red, the other blue");
+    // Depth of the same window: the ZST word, not a pair's half. Format
+    // (2, 3), 32 bits full scale on the host.
+    fifo_token(&m, 0x66, &[1]);
+    fifo_token(&m, 0xBC, &[0x40_0000]);
+    fifo_token(&m, 0x4A, &[]);
+    let z = gl_read_one(&m, 50, 50, 0x1C0_0000, 0x0041_0023, 4);
+    assert_eq!(z[..3], [0x40, 0, 0], "depth 0.25");
+    // Stencil cleared to 5 beside it, the depth kept.
+    fifo_token(&m, 0xBE, &[5]);
+    fifo_token(&m, 0x4C, &[]);
+    assert_eq!(gl_read_one(&m, 50, 50, 0x180_0000, 0x0040_0010, 1), [5], "stencil");
+    assert_eq!(gl_read_one(&m, 50, 50, 0x1C0_0000, 0x0041_0023, 3), [0x40, 0, 0], "depth kept");
     m.stop_engines();
 }
 

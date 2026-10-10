@@ -2033,7 +2033,10 @@ impl Gl {
         sink.rss_write(re::AFUNCMODE, 7, false);
         sink.rss_write(re::STENCILMODE, 7, false);
         sink.rss_write(re::BLENDFACTOR, 0, false);
-        sink.rss_write(re::PP1FILLMODE, self.pp1_base(), false);
+        // The ZST buffer takes its words as they are: never a 12-bit pair's
+        // packing, a colour-index pixel type or dither.
+        let pp1 = if drb == super::rss::ZST_PAGE { PP1_RGB24_BUFFER_A } else { self.pp1_base() };
+        sink.rss_write(re::PP1FILLMODE, pp1, false);
         sink.rss_write(re::DRBPOINTERS, drb, false);
         sink.rss_write(re::COLORMASKLSBSA, lsb, false);
         sink.rss_write(re::COLORMASKLSBSB, lsb, false);
