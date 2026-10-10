@@ -56,7 +56,7 @@ trace is short and every option flips one piece of state or one address bit.
   saturated colours, or check values with glprim `--read ... --check`.
   glprim picks the deepest visual by default (12,12,12, which the raster
   JIT leaves to the interpreter): use `--visual 8,8,8,8` for the JIT path.
-- Performance: guest-side `gltest --bench` cannot time the board (see
+- Performance: board-bound runs slow the guest clock (lost ticks), so guest-side `gltest --bench` is meaningless (see
   rules/mgras/guest-gl-benchmarks-miss-board-time.md). Record the session
   (`mgras rec F` ... `mgras rec off`) and time its replay offline with
   `MGRAS_REPLAY_NOCHECK=1 MGRAS_REPLAY_BOARD=high|max MGRAS_REPLAY=F cargo
