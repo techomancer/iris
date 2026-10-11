@@ -190,6 +190,13 @@ impl ShaderCompiler {
             eprintln!("REX JIT: not jittable (line+host) for dm0={dm0_val:#010x}");
             return None;
         }
+        // A host DRAW block with STOPONY is a full block that keeps reloading
+        // HOSTRW (rex3_generic stop_on_word); the shader's host_xstop assumes one
+        // word per call. Rare (glPixelZoom), so leave it to the interpreter.
+        if is_hostw && dm0.colorhost() && dm0.stopony() && adrmode == DRAWMODE0_ADRMODE_BLOCK {
+            eprintln!("REX JIT: not jittable (full host primitive) for dm0={dm0_val:#010x}");
+            return None;
+        }
         if !is_line && adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK {
             eprintln!("REX JIT: not jittable (adrmode={adrmode:#x}) for dm0={dm0_val:#010x}");
             return None;

@@ -1400,7 +1400,15 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
     // In host mode (READ or DRAW+colorhost), each GO processes exactly one word's worth
     // of pixels (host_count pixels). stop_on_word causes the loop to exit after the
     // word boundary so the next GO picks up where we left off.
-    let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || colorhost;
+    //
+    // Except a host DRAW block with STOPONY: that is a full block, not Segments I
+    // (rex3.pdf §3.5.4.1 has STOPONX=STOPONY=0). It runs to its end on one GO and
+    // reloads the shifter from HOSTRW whenever it empties; a single PIO word is
+    // re-read, so its pixels replicate across the block. IRIX's glPixelZoom path
+    // (snoop) draws each zoomed pixel this way: a 6x6 STOPONX|STOPONY block fed
+    // one 32bpp word. MAME's block loop behaves the same.
+    // See rules/rex3/host-full-block-replicates.md.
+    let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || (colorhost && !stopony);
 
     // stop_on_word takes priority over stoponx — host mode governs its own stop.
     let stoponx = m.stoponx() != 0 || stop_on_word;
@@ -1487,6 +1495,11 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
             // divergence the JIT/interpreter HOSTR stress test catches.
             if stop_on_word && ctx.hostcnt > 0 {
                 break;
+            }
+            // Full host block: each row starts on a fresh word too, but the
+            // primitive carries on into it.
+            if colorhost && !stop_on_word {
+                ctx.hostcnt = 0;
             }
 
             first = true; // pixel in next row will be first

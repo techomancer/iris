@@ -240,7 +240,7 @@ const DM0_DRAW_BLOCK:  u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH 
 const DM0_DRAW_SPAN:   u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN_SH  | DM0_STOPONX;
 const DM0_SCR2SCR:     u32 = DRAWMODE0_OPCODE_SCR2SCR | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DRAW with COLORHOST: pixels come from host write FIFO
-const DM0_HOSTW_BLOCK: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY | DM0_COLORHOST;
+const DM0_HOSTW_BLOCK: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_COLORHOST;
 // READ with COLORHOST: reads fb → host read FIFO
 const DM0_READ_BLOCK:  u32 = DRAWMODE0_OPCODE_READ | DRAWMODE0_ADRMODE_BLOCK_SH | DM0_STOPONXY | DM0_COLORHOST | DM0_DOSETUP;
 
@@ -7585,4 +7585,34 @@ fn test_recording_replays_bit_exact() {
         assert_eq!(rep.reads_differ, 0, "replayed reads differ: {:x?}", rep.differ_at);
         assert_eq!(replay.rec_state_hash(), live);
     }
+}
+
+/// IRIX glPixelZoom (snoop): each zoomed pixel is a DRAW BLOCK COLORHOST
+/// STOPONX|STOPONY fed by a single 32bpp HOSTRW GO. The block must fill with
+/// that one colour, not paint one pixel and wait for more words.
+#[test]
+fn test_hostw_full_block_replicates_single_word() {
+    let rex = make_rex3();
+    rex3init(&rex);
+
+    const DM0: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH
+        | DM0_STOPONXY | DM0_COLORHOST;
+    let (x0, y0, x1, y1) = (10i32, 20i32, 15i32, 25i32); // 6x6
+
+    reg(&rex, REX3_DRAWMODE1, DM1_RGB24_HOSTRW);
+    reg(&rex, REX3_WRMASK, 0xFFFFFF);
+    reg(&rex, REX3_XYENDI,   xy(x1, y1));
+    reg(&rex, REX3_XYSTARTI, xy(x0, y0));
+    reg(&rex, REX3_DRAWMODE0, DM0);
+    write_hostrw32(&rex, 0x00AA6D6D); // one GO
+    wait(&rex);
+
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let got = read_pixel(&rex, x, y) & 0xFFFFFF;
+            assert_eq!(got, 0xAA6D6D, "({x},{y}): got {got:#08x}");
+        }
+    }
+    assert_eq!(read_pixel(&rex, x1 + 1, y0) & 0xFFFFFF, 0, "spilled past XEND");
+    assert_eq!(read_pixel(&rex, x0, y1 + 1) & 0xFFFFFF, 0, "spilled past YEND");
 }
