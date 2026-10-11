@@ -152,6 +152,11 @@ pub struct Gr2Stats {
 
 pub struct Gr2 {
     variant: Gr2Variant,
+    /// Perfetto edge trackers (zero-valid, so `new`'s zeroed allocation
+    /// initialises them): a guest read stalled on the engines, a store
+    /// stalled on a full FIFO.
+    pf_wait: crate::PfLevel,
+    pf_fifo_full: crate::PfLevel,
     regs: UnsafeCell<Gr2Regs>,
     re3: UnsafeCell<Re3>,
     hq_engine: UnsafeCell<Hq2Engine>,
@@ -850,10 +855,14 @@ impl Resettable for Gr2 {
 
 impl BusDevice for Gr2 {
     fn read32(&self, addr: u32) -> BusRead32 {
-        self.reg_read((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4))
+        let r = self.reg_read((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4));
+        crate::pf_level!(self.pf_wait, crate::perfetto::events::GR2_WAIT, r.status == BUS_BUSY);
+        r
     }
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        self.reg_write((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val)
+        let st = self.reg_write((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val);
+        self.pf_write(st);
+        st
     }
     // Narrow accesses hit 8/16-bit peripheral chips on word addresses: the
     // access carries the register value whatever its width or lane (GR2.h).
@@ -883,6 +892,21 @@ impl BusDevice for Gr2 {
         BusRead64::ok(((hi.data as u64) << 32) | lo.data as u64)
     }
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        let st = self.write64_inner(addr, val);
+        self.pf_write(st);
+        st
+    }
+}
+
+impl Gr2 {
+    /// Perfetto: a store refused with BUS_BUSY is the CPU stalled on a
+    /// full FIFO; the next accepted one ends the stall.
+    #[inline]
+    fn pf_write(&self, st: u32) {
+        crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::GR2_FIFO_FULL, st == BUS_BUSY);
+    }
+
+    fn write64_inner(&self, addr: u32, val: u64) -> u32 {
         let off = (addr - GR2_BASE) & (GR2_SLOT_SIZE - 8);
         let (hi, lo) = ((val >> 32) as u32, val as u32);
         if (FIFO..FIFO_END).contains(&off) {

@@ -432,6 +432,7 @@ pub fn handle_request(
     codegen: &mut Codegen,
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> bool {
+    crate::pf_scope!(crate::perfetto::events::JIT_COMPILE);
     let page = unsafe { &*req.page };
 
     // Clears the page-level in-flight flag on every return path, including
@@ -625,6 +626,7 @@ pub fn handle_request_deferred(
     pending: &mut PendingCount,
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> bool {
+    crate::pf_scope!(crate::perfetto::events::JIT_COMPILE);
     let page = unsafe { &*req.page };
 
     struct ClearScheduledOnDrop<'a> { page: &'a crate::cpu::jitv2::PhysicalCodePage }

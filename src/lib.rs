@@ -138,6 +138,7 @@ pub mod build_features {
             ("fetchverify", cfg!(feature = "fetchverify")),
             ("j2wp", cfg!(feature = "j2wp")),
             ("llstats", cfg!(feature = "llstats")),
+            ("perfetto", cfg!(feature = "perfetto")),
         ];
         FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect()
     }
@@ -198,6 +199,11 @@ pub mod ultra_proto;
 pub mod crash_diag;
 mod nv_storage;
 pub mod hwwatch;
+#[macro_use]
+mod perfetto_macros;
+pub use perfetto_macros::{PfBits, PfLevel, PfValue};
+#[cfg(feature = "perfetto")]
+pub mod perfetto;
 
 #[cfg(test)]
 mod platform_profile_tests;

@@ -1033,6 +1033,9 @@ impl Hq3Engine {
     fn dma(&mut self, word: u32, mut peer: DmaPeer, sink: &mut dyn Hq3Sink) {
         let Some(mem) = sink.sys_mem() else { return };
         let read = word & 8 != 0;
+        #[cfg(feature = "perfetto")]
+        let def = if read { &crate::perfetto::events::MGRAS_DMA_TO_HOST } else { &crate::perfetto::events::MGRAS_DMA_TO_BOARD };
+        crate::pf_scope!(*def, word);
         let pool = ((word >> 1) & 3) as usize;
         let table = self.dma_regs[dma::TABLE_BASE + 2 * pool + 1] & !3;
         // Between transfers the kernel parks a pool's table at a dummy

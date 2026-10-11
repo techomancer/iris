@@ -1079,6 +1079,16 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_elf: Option<String>,
 
+    /// Start a Perfetto trace into this file at startup (`--perfetto`;
+    /// needs the `perfetto` feature). Categories and clock as for the
+    /// monitor's `perfetto start`.
+    #[serde(skip)]
+    pub perfetto: Option<String>,
+    #[serde(skip)]
+    pub perfetto_cats: Option<String>,
+    #[serde(skip)]
+    pub perfetto_clock: Option<String>,
+
     /// Map the bare-metal test device (guest console, machine-state dump, exit
     /// code) into GIO expansion slot 0. Off by default; see src/dev/testdev.rs.
     #[serde(default)]
@@ -1289,6 +1299,9 @@ impl Default for MachineConfig {
             serial_port_b: None,
             keyboard: KeyboardLayout::default(),
             load_elf: None,
+            perfetto: None,
+            perfetto_cats: None,
+            perfetto_clock: None,
             test_device: false,
             test_device_dump: None,
             cheritest_dump_hook: false,
@@ -1692,6 +1705,19 @@ pub struct Cli {
     #[arg(long = "load-elf", value_name = "FILE")]
     pub load_elf: Option<String>,
 
+    /// Record a Perfetto trace into FILE from startup (build with
+    /// `--features perfetto`). Open it at ui.perfetto.dev.
+    #[arg(long, value_name = "FILE")]
+    pub perfetto: Option<String>,
+
+    /// Perfetto categories, e.g. `irq,gfx` or `all,-jit` [default: all]
+    #[arg(long = "perfetto-cats", value_name = "LIST")]
+    pub perfetto_cats: Option<String>,
+
+    /// Perfetto timeline: `host` (ns) or `guest` (instructions) [default: host]
+    #[arg(long = "perfetto-clock", value_name = "CLOCK")]
+    pub perfetto_clock: Option<String>,
+
     /// CI mode: enable the control socket and apply speed-favoring fidelity
     /// shortcuts. Hides the window unless --ci-display is set; offscreen
     /// graphics remain active unless --headless is explicitly set.
@@ -1783,6 +1809,9 @@ impl Cli {
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
         if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
+        if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
+        if let Some(ref p) = self.perfetto_cats { cfg.perfetto_cats = Some(p.clone()); }
+        if let Some(ref p) = self.perfetto_clock { cfg.perfetto_clock = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }
         if let Some(ref p) = self.test_device_dump { cfg.test_device_dump = Some(p.clone()); }

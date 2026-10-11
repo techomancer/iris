@@ -555,6 +555,7 @@ impl Machine {
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
+                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
                 ioc_clone.set_interrupt(wiring.retrace, active);
             }));
             let ioc_ff = ioc.clone();
@@ -571,6 +572,7 @@ impl Machine {
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
+                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
                 ioc_clone.set_interrupt(wiring.retrace, active);
             }));
             let ioc_ff = ioc.clone();
@@ -598,6 +600,7 @@ impl Machine {
                 // EXTIO SG_STAT_0 is the board's vertical status level (low in
                 // blank); the PROM and the kernel retrace handler poll it.
                 g.set_retrace_callback(Arc::new(move |vblank| {
+                    if vblank { crate::pf_instant!(crate::perfetto::events::GR2_VBLANK); }
                     if vblank { ioc_r.set_interrupt(line, true); }
                     if !guinness { ioc_r.set_ext_io_level(crate::dev::ioc::ext_io_regs::SG_STAT_0, !vblank); }
                 }));
@@ -936,6 +939,11 @@ impl Machine {
         if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
         if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
         monitor.register_device(Arc::new(phys.vino.clone()));
+        #[cfg(feature = "perfetto")]
+        {
+            crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
+            monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
+        }
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
             cpu.running_flag(),
             cpu.cycles_ptr(),
@@ -2190,6 +2198,9 @@ impl Drop for Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = std::ptr::null_mut();
         }
+        // The guest clock points into this Machine's CPU core.
+        #[cfg(feature = "perfetto")]
+        crate::perfetto::set_guest_cycles(None);
         // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();

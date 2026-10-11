@@ -1562,6 +1562,7 @@ impl Wd33c93aState {
             // Deferred: worker clears CIP and spins 10000 CPU cycles before calling
             // update_irq, giving wd33c93_loop time to exit before INT fires.
             self.update_asr(asr::CIP | asr::DBR, asr::INT);
+            crate::pf_instant!(crate::perfetto::events::SCSI_INT, status);
             wdt!("QUEUE_IRQ phase={:02x} stat={:02x} deferred={} (fifo_remaining={})",
                 self.regs[regs::COMMAND_PHASE as usize], status, deferred, self.irq_fifo.len());
             true
@@ -1606,6 +1607,7 @@ impl Wd33c93aState {
     }
 
     fn process_wd_command(&mut self, raw_cmd: u8, dma: Option<&dyn DmaClient>) {
+        crate::pf_scope!(crate::perfetto::events::SCSI_WD_CMD, raw_cmd);
         // Strip SBT (Single Byte Transfer) qualifier bit. SBT changes the host
         // polling protocol but not the logical operation — treat as the base command.
         let cmd = raw_cmd & !0x80;
@@ -1935,6 +1937,7 @@ impl Wd33c93aState {
             cdb[1] |= self.target_lun << 5;
         }
         let cdb = cdb.as_slice();
+        crate::pf_scope!(crate::perfetto::events::SCSI_CDB, (self.target_id as u64) << 8 | cdb.first().copied().unwrap_or(0) as u64);
         if cdb.is_empty() {
             dlog!(self.log_module(), "WD33C93A({}): Empty CDB!", self.id);
             self.update_asr(0, asr::LCI);

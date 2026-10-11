@@ -1911,6 +1911,7 @@ impl Gl {
     /// follows (the display flips at the next retrace, by the kernel's
     /// BUF_SELECT write).
     pub fn swap_buffers(&mut self, sink: &mut dyn Hq3Sink) {
+        crate::pf_instant!(crate::perfetto::events::MGRAS_SWAP);
         self.ensure_init();
         self.end_raster(sink);
         if self.banks_known == 0 {

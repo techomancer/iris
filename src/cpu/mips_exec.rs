@@ -2511,6 +2511,7 @@ macro_rules! step_cycles {
             $self.core.count_fire_cycle = $self.core.hot.cycles
                 .saturating_add(wrap_ns as u64 / crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
             $self.core.hot.interrupts.fetch_or(crate::cpu::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
+            crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
             $self.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }};
@@ -2608,6 +2609,7 @@ macro_rules! step_preamble {
                 let ip = $self.core.cp0_cause & crate::cpu::mips_core::CAUSE_IP_MASK;
                 let im = $self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
                 if (ip & im) != 0 {
+                    crate::pf_instant!(crate::perfetto::events::INT_TAKEN, (ip & im) >> 8);
                     let s = exec_exception(EXC_INT);
                     return $self.handle_exception(s);
                 }
@@ -4013,13 +4015,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         // (confirmed live: starves the page of compiles
                         // forever otherwise).
                         if !crate::cpu::jitv2::jitv2::push_compile_request(&self.jitv2_compile_queue_handle, req, &self.jitv2_stats) {
+                            crate::pf_level!(crate::perfetto::events::JIT_QUEUE_FULL_LEVEL, crate::perfetto::events::JIT_QUEUE_FULL, true, pc);
                             page.clear_scheduled();
                             #[cfg(feature = "developer")]
                             page.mark_send_dropped_queue_full();
+                        } else {
+                            crate::pf_level!(crate::perfetto::events::JIT_QUEUE_FULL_LEVEL, crate::perfetto::events::JIT_QUEUE_FULL, false);
+                            crate::pf_instant!(crate::perfetto::events::JIT_REQUEST, pc);
                         }
                     } else if page.note_waiting_arrival() {
                         // Already queued, and being executed hard while it
                         // waits: jump the queue (jitv2::HOT_QUEUE).
+                        crate::pf_instant!(crate::perfetto::events::JIT_HOT_REQUEST, pc);
                         crate::cpu::jitv2::jitv2::push_hot_request(req);
                     }
                     break 'gate self.step_int();

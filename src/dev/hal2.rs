@@ -463,12 +463,14 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
                 .and_then(|p| std::fs::File::create(p).ok())
                 .map(std::io::BufWriter::new);
             let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut short = false;
                 for sample in data.iter_mut() {
                     let v = match c.pop() {
                         Ok(v) => v,
                         Err(_) => {
                             if playing_cb.load(Ordering::Relaxed) {
                                 underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                short = true;
                             }
                             0
                         }
@@ -479,6 +481,9 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
                     }
                     *sample = v as f32 / 32768.0;
                 }
+                if short {
+                    crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
+                }
             };
             match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
                 Ok(s) => (p, s),
@@ -488,16 +493,21 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
                     let underruns_cb = underruns.clone();
                     let playing_cb = playing.clone();
                     let data_fn = move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        let mut short = false;
                         for sample in data.iter_mut() {
                             *sample = match c.pop() {
                                 Ok(v) => v,
                                 Err(_) => {
                                     if playing_cb.load(Ordering::Relaxed) {
                                         underruns_cb.fetch_add(1, Ordering::Relaxed);
+                                        short = true;
                                     }
                                     0
                                 }
                             };
+                        }
+                        if short {
+                            crate::pf_instant!(crate::perfetto::events::HAL2_UNDERRUN, underruns_cb.load(Ordering::Relaxed));
                         }
                     };
                     match device.build_output_stream(config, data_fn, err_fn.clone(), None) {
@@ -613,6 +623,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 0 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
@@ -635,6 +646,7 @@ impl Hal2 {
             if due == 0 {
                 return TimerReturn::Continue;
             }
+            crate::pf_scope!(crate::perfetto::events::HAL2_PACE, due);
             let mut st = ca_state.lock();
             st.calls += 1;
 
@@ -716,6 +728,7 @@ impl Hal2 {
         let id = self.ca_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 0);
         }
         self.ca_state.lock().reset_audio(); // keeps `out` (stream stays open)
     }
@@ -734,6 +747,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 1 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let mut pacer = Pacer::new(rate);
@@ -759,6 +773,7 @@ impl Hal2 {
         let id = self.cb_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 1);
         }
     }
 
@@ -776,6 +791,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 2 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
@@ -799,6 +815,7 @@ impl Hal2 {
         let id = self.at_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 2);
         }
     }
 
@@ -816,6 +833,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 3 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
@@ -836,6 +854,7 @@ impl Hal2 {
         let id = self.ar_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 3);
         }
         self.ar_state.lock().loopback.clear();
     }

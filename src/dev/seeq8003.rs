@@ -349,6 +349,7 @@ impl Seeq8003 {
 
         dlog_dev!(LogModule::Seeq, "SEEQ TX {} dma_st={:#x}", eth_summary(&frame), dma_st.0);
 
+        crate::pf_instant!(crate::perfetto::events::ENET_TX, frame.len());
         let _ = tx_prod.push(frame);
         tx_wake.1.notify_one();
 
@@ -377,6 +378,7 @@ impl Seeq8003 {
         if !Self::address_filter(rx_cmd_snap, &station_addr_snap, frame) {
             dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: address filter dropped {}", eth_summary(frame));
             let _ = rx_cons.pop(); // discard filtered frame
+            crate::pf_instant!(crate::perfetto::events::ENET_RX_FILTERED);
             return RxPumpResult::Filtered;
         }
 
@@ -385,10 +387,12 @@ impl Seeq8003 {
         let (dst, _) = rx_dma.write(0, false); // pad[0]
         if dst.refused() {
             dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: DMA not ready ({:#x}), will retry: {}", dst.0, eth_summary(frame));
+            crate::pf_instant!(crate::perfetto::events::ENET_RX_REFUSED);
             return RxPumpResult::Refused; // frame stays in rx_cons for next iteration
         }
         // DMA is committed (pad[0] written); pop the frame now and finish writing it.
         let frame = rx_cons.pop().expect("peek succeeded so pop must succeed");
+        crate::pf_instant!(crate::perfetto::events::ENET_RX, frame.len());
         let _ = rx_dma.write(0, false); // pad[1]
         for b in &frame {
             let _ = rx_dma.write(*b as u32, false);

@@ -145,6 +145,7 @@ impl Mgras {
             // Vertical retrace: a pulse per frame. The handler acknowledges
             // nothing on the board, so the line must drop again by itself.
             if retrace {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
                 self.set_line(Line::Retrace, true);
                 std::thread::sleep(std::time::Duration::from_micros(500));
                 self.set_line(Line::Retrace, false);

@@ -1236,7 +1236,14 @@ impl MemoryController {
                 self.log_vdma_start(&job, tlb_hi, tlb_lo);
             }
 
-            let result = self.dma_dispatch(&job);
+            let result = {
+                #[cfg(feature = "perfetto")]
+                let def = if job.fill { &crate::perfetto::events::VDMA_FILL }
+                    else if job.to_host { &crate::perfetto::events::VDMA_TO_HOST }
+                    else { &crate::perfetto::events::VDMA_TO_GIO };
+                crate::pf_scope!(*def, job.line_count as u64 * job.line_width as u64);
+                self.dma_dispatch(&job)
+            };
 
             let end_time = crate::platform::get_host_ticks();
             let elapsed = end_time.wrapping_sub(start_time);

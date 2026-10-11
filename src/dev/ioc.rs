@@ -179,6 +179,9 @@ pub mod ext_io_regs {
 /// PIO6 — one chip, two address windows, per `ioc2_device`'s single
 /// `m_pit` in MAME).
 pub const INT2_REG_COUNT: u32 = 16;
+
+/// Perfetto: the interrupt lines as last traced (one IOC per process).
+static IOC_PF_LINES: crate::PfBits = crate::PfBits::new();
 const INT2_TMR_CLR_IDX: u32 = 8;
 const INT2_PIT_BASE_IDX: u32 = 12;
 
@@ -1234,6 +1237,10 @@ impl IocState {
 
         // Level 4: Bus Error -> IP6
         let ip6 = self.err_stat != 0;
+
+        crate::pf_bits!(IOC_PF_LINES, crate::perfetto::events::IOC_LINES,
+            self.l0_stat as u32 | (self.l1_stat as u32) << 8 | (self.map_stat as u32) << 16
+            | (ip2 as u32 | (ip3 as u32) << 1 | (ip4 as u32) << 2 | (ip5 as u32) << 3 | (ip6 as u32) << 4) << 24);
 
         // 3. Signal CPU
         // Safety: interrupts points into the CPU executor's MipsCore, which

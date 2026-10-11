@@ -258,6 +258,11 @@ pub enum Line {
 
 pub struct Mgras {
     kind: GraphicsBoard,
+    /// Perfetto edge trackers (zero-valid, so `new`'s zeroed allocation
+    /// initialises them): a guest read waiting for idle, a store stalled on
+    /// a full FIFO.
+    pf_wait: crate::PfLevel,
+    pf_fifo_full: crate::PfLevel,
     ioc: crate::dev::ioc::Ioc,
     /// Current level of the general interrupt line.
     general: AtomicBool,
@@ -870,7 +875,9 @@ impl Mgras {
     fn do_read(&self, addr: u32, bits: u32) -> Option<u64> {
         let Some(off) = self.offset(addr) else { return Some(0) };
         let sub = self.submit.lock();
-        let v = self.read_locked(off, bits)?;
+        let v = self.read_locked(off, bits);
+        crate::pf_level!(self.pf_wait, crate::perfetto::events::MGRAS_WAIT, v.is_none());
+        let v = v?;
         if let Some(rec) = sub.as_ref() {
             rec.lock().put(record::Rec::Read { bits: bits as u8, off, val: v });
         }
@@ -885,7 +892,9 @@ impl Mgras {
     fn do_write(&self, addr: u32, bits: u32, val: u64) -> u32 {
         let Some(off) = self.offset(addr) else { return BUS_OK };
         let sub = self.submit.lock();
-        if !self.write_locked(off, bits, val) {
+        let ok = self.write_locked(off, bits, val);
+        crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::MGRAS_FIFO_FULL, !ok);
+        if !ok {
             return BUS_BUSY;
         }
         if let Some(rec) = sub.as_ref() {
@@ -913,10 +922,12 @@ impl Mgras {
         *self.hq_thread.lock() = Some(thread::current());
         let mut sink = HqSink(self);
         let backoff = crossbeam_utils::Backoff::new();
+        let pf_busy = crate::PfLevel::new();
         loop {
             let Some((t, val)) = self.hq_fifo.peek() else {
                 self.hq_fifo.flush_head();
                 self.hq_busy.store(false, Ordering::Release);
+                crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, false);
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {
@@ -925,6 +936,7 @@ impl Mgras {
                 continue;
             };
             self.hq_busy.store(true, Ordering::Release);
+            crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, true);
             // SAFETY: the HQ3 thread owns the engine.
             let eng = unsafe { &mut *self.eng.get() };
             match t {
@@ -961,10 +973,12 @@ impl Mgras {
         let mut payload: Vec<u64> = Vec::new();
         let cell = if id == 0 { &self.rss } else { &self.rss1 };
         let busy = &self.rss_busy[id];
+        let pf_busy = crate::PfLevel::new();
         loop {
             let Some((t, val)) = self.rss_fifo.peek_at(id) else {
                 self.rss_fifo.flush_head_at(id);
                 busy.store(false, Ordering::Release);
+                crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, false);
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {
@@ -973,6 +987,7 @@ impl Mgras {
                 continue;
             };
             busy.store(true, Ordering::Release);
+            crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, true);
             // SAFETY: this engine's thread owns its raster state.
             let rss = unsafe { &mut *cell.get() };
             let changed = match t {

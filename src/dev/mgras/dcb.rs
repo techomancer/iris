@@ -228,6 +228,9 @@ impl Xmap {
                 self.config = (self.config & !mask) | ((d << shift) & mask);
             }
             crs => {
+                if crs == xmap::BUF_SELECT {
+                    crate::pf_instant!(crate::perfetto::events::MGRAS_BUF_SELECT, d);
+                }
                 self.regs.insert(key(crs, self.index), d);
                 self.autoinc(t);
             }

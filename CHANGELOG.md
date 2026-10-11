@@ -37,6 +37,26 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **Perfetto tracing (`--features perfetto`).** `--perfetto FILE` or the
+  monitor's `perfetto start FILE` records a trace that opens in
+  ui.perfetto.dev. Events go into per-thread rings and a writer thread
+  encodes them, so an event costs about 20 ns recorded and under 1 ns when
+  its category is off. The timeline is host time, aligned with system
+  traces on Linux, or guest instructions (`clock=guest`). Traced:
+  - every IOC interrupt line and the CPU's IP2-IP7 pins, including the
+    8254 slow and fast ticks and Count/Compare
+  - interrupts taken
+  - HPC3 PDMA channels (HAL2, SCSI, ethernet): activity, descriptors and
+    completion interrupts
+  - VDMA
+  - WD33C93A commands, CDBs and interrupts
+  - ethernet frames
+  - HAL2 pacing and host underruns
+  - REX3, GR2 and IMPACT vblank, flips, busy-waits and FIFO-full stalls
+  - IMPACT engine busy and host DMA
+  - jitv2 compile requests, compiles and compile-queue-full stretches
+
+  See `docs/perfetto.md`.
 - **IMPACT colour pipeline in 12.16 fixed point.** Colour iterators,
   texel filtering (texels widened to 12 bits, 8-bit bilinear and mip
   weights), the texture environment, fog and blending now compute in

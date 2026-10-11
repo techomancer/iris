@@ -114,6 +114,7 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
         .is_ok()
     {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
         #[cfg(feature = "idle-pause")]
         crate::cpu::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
@@ -251,6 +252,12 @@ impl CyclesPtr {
     /// `CyclesPtr` hasn't been wired up yet (`dangling()`/not yet set).
     pub fn get(self) -> u64 {
         if self.0.is_null() { 0 } else { unsafe { std::ptr::read_volatile(self.0) } }
+    }
+
+    /// The counter's address (null when dangling), for readers that keep it
+    /// somewhere a `CyclesPtr` cannot go, such as an `AtomicPtr`.
+    pub fn raw(self) -> *const u64 {
+        self.0
     }
 }
 
@@ -2004,6 +2011,7 @@ impl MipsCore {
                 // re-raise it).
                 self.cp0_cause &= !CAUSE_IP7;
                 self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
+                crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, false);
 
                 // Now classify what the guest actually asked for. Count here
                 // is virtual and materialized in lumps from the wall clock,

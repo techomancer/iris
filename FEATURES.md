@@ -21,6 +21,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
 | `developerx` | Extended exception diagnostics; break on IBE/DBE/ADEL/ADES/TLB errors. | — |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible. | — |
+| `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
 | `fetchverify` | Compare executed instruction bytes with memory in interpreter/JIT; expensive stale-code detector. | — |
 | `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. | — |
@@ -350,6 +351,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
 | `--tftp-dir` | Serve this directory read-only over TFTP at the gateway address, so the PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset. |
+| `--perfetto FILE` | Record a Perfetto trace from startup (`perfetto` builds). `--perfetto-cats LIST` (default `all`) and `--perfetto-clock host\|guest` (default `host`) select what and on which timeline. See [docs/perfetto.md](docs/perfetto.md). |
 | `--load-elf` | Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the CPU starts and set PC to its entry point, instead of booting the PROM. For bare-metal test binaries; see also the monitor's `loadelf`. |
 | `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |
 | `--ci-socket` | Override the default control-socket path (/tmp/iris.sock). |
@@ -494,6 +496,7 @@ both the interpreter and jitv2.
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
+| `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |
 | `fetchverify` | Check every executed instruction word against memory (stale-code detector); lightning-compatible |
 | `opcodefusion` | Interpreter branch+NOP, LUI+ORI/ADDIU and address-calc+load/store fusion. Breakpoints on a fused second instruction never fire |
 | `tlbstats` / `tlbcheck` | TLB translation counters / full JTLB consistency check after every TLB write |

@@ -126,13 +126,13 @@ impl TimerManager {
         let thread_inner = inner.clone();
         let thread_added = new_timer_added.clone();
 
-        let thread_handle = thread::spawn(move || {
+        let thread_handle = thread::Builder::new().name("hptimer".into()).spawn(move || {
             {
                 let mut guard = thread_inner.lock();
                 guard.worker_thread = Some(thread::current());
             }
             timer_thread_loop(thread_inner, thread_added);
-        });
+        }).expect("spawn hptimer thread");
 
         Self {
             inner,

@@ -1344,6 +1344,11 @@ pub struct Rex3 {
     /// interrupt — one physical pin for both directions, selected by
     /// `CONFIG_GFIFOABOVEINT`; see `update_gfifo_irqs`).
     pub fifo_full_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    /// Perfetto edge trackers: guest sees GFXBUSY, CPU stalled on a full
+    /// GFIFO, GFIFO level as STATUS reports it.
+    pf_wait: crate::PfLevel,
+    pf_fifo_full: crate::PfLevel,
+    pf_gfifo_level: crate::PfValue,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
     /// Payload of GFIFO_DISP_SYNC pushed to the GFIFO on each such write.
     pub xmap_fence: AtomicU32,
@@ -1529,6 +1534,9 @@ impl Rex3 {
             fb_dirty: AtomicBool::new(true),
             screen,
             vblank_cb: Mutex::new(None),
+            pf_wait: crate::PfLevel::new(),
+            pf_fifo_full: crate::PfLevel::new(),
+            pf_gfifo_level: crate::PfValue::new(),
             fifo_full_cb: Mutex::new(None),
             xmap_fence: AtomicU32::new(0),
             gfifo_fence: AtomicU32::new(0),
@@ -2686,6 +2694,7 @@ impl Rex3 {
         self.diag.fetch_or(Self::DIAG_LOOP_EXECUTE_GO, Ordering::Relaxed);
         let ctx = unsafe { &mut *self.context.get() };
         let opcode = ctx.drawmode0.opcode();
+        crate::pf_scope!(crate::perfetto::events::REX3_GO, opcode);
 
         // Pattern bit positions reset only on DOSETUP (new primitive).  Connected
         // stippled line segments keep pat_bit across GO via LSSAVE/LSRESTORE.
@@ -3123,6 +3132,7 @@ impl Rex3 {
                 // Present: compositor → overlay → status bar → swap
                 if screen.width > 0 && screen.height > 0 {
                     if let Some(ref mut r) = *renderer {
+                        crate::pf_scope!(crate::perfetto::events::REX3_PRESENT);
                         self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                         let borrow = screen.fb_borrowed;
                         r.present(
@@ -4106,6 +4116,8 @@ impl BusDevice for Rex3 {
                     (pending.saturating_sub(GFIFO_DEPTH - GFIFO_HW_DEPTH) as u32).max(1)
                 };
                 val = (val & !STATUS_GFIFOLEVEL_MASK) | ((level << STATUS_GFIFOLEVEL_SHIFT) & STATUS_GFIFOLEVEL_MASK);
+                crate::pf_level!(self.pf_wait, crate::perfetto::events::REX3_WAIT_IDLE, val & STATUS_GFXBUSY != 0);
+                crate::pf_value!(self.pf_gfifo_level, crate::perfetto::events::REX3_GFIFO_LEVEL, level);
                 if reg_offset == REX3_STATUS {
                     let had_vrint = self.config.status.fetch_and(!STATUS_VRINT, Ordering::Relaxed) & STATUS_VRINT != 0;
                     if had_vrint {
@@ -4372,8 +4384,10 @@ impl BusDevice for Rex3 {
                 // would starve IP7 — and with it the guest clock — for as long
                 // as the queue stays full.
                 if !self.gfifo_try_push(offset, val as u64) {
+                    crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::REX3_FIFO_FULL, true);
                     return BUS_BUSY;
                 }
+                crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::REX3_FIFO_FULL, false);
                 return BUS_OK;
             }
         }

@@ -44,6 +44,7 @@ fn main() {
     let ci_display = cfg.ci_display;
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
+    let perfetto = (cfg.perfetto.clone(), cfg.perfetto_cats.clone(), cfg.perfetto_clock.clone());
 
     // Apply [debug] and [jitv2] from TOML (env vars still override if set externally).
     cfg.debug.apply_env();
@@ -124,6 +125,8 @@ fn main() {
         iris::gdb_stub::start_gdb_server(port, cpu_debug);
     }
 
+    start_perfetto(perfetto);
+
     machine.start();
     // The terminal console talks to this process's own monitor only. Without
     // one (its port taken by another iris), there is no console: attached to
@@ -158,6 +161,41 @@ fn main() {
     }
 
     machine.stop();
+    #[cfg(feature = "perfetto")]
+    iris::perfetto::shutdown();
+}
+
+/// `--perfetto FILE [--perfetto-cats LIST] [--perfetto-clock CLOCK]`.
+fn start_perfetto((path, cats, clock): (Option<String>, Option<String>, Option<String>)) {
+    let Some(path) = path else {
+        if cats.is_some() || clock.is_some() {
+            eprintln!("iris: --perfetto-cats/--perfetto-clock need --perfetto FILE");
+        }
+        return;
+    };
+    #[cfg(feature = "perfetto")]
+    {
+        use iris::perfetto;
+        let res = (|| {
+            let cats = cats.as_deref().map_or(Ok(perfetto::cat::ALL), perfetto::cat::parse)?;
+            let clock = clock.as_deref().map_or(Ok(perfetto::Clock::Host), perfetto::Clock::parse)?;
+            perfetto::start(&path, cats, clock)?;
+            Ok::<_, String>(format!("iris: perfetto recording to {path} (clock={}, cats={})",
+                clock.name(), perfetto::cat::format(cats)))
+        })();
+        match res {
+            Ok(msg) => eprintln!("{msg}"),
+            Err(e) => {
+                eprintln!("iris: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    #[cfg(not(feature = "perfetto"))]
+    {
+        eprintln!("iris: --perfetto {path}: this build has no perfetto support (rebuild with --features perfetto)");
+        std::process::exit(1);
+    }
 }
 
 /// Print which compile-time feature flags this binary was built with. Handy

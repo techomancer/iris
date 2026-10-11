@@ -74,6 +74,7 @@ impl Xmap9 {
                 let addr = (val >> 24) & 0x1F; // 5 bits
                 let data = val & 0xFFFFFF;
                 self.mode_table[addr as usize] = data;
+                crate::pf_instant!(crate::perfetto::events::REX3_XMAP_MODE, addr << 24 | data);
             }
             XMAP9_REG_MODE_ADDR => self.mode_addr = val as u8,
             _ => {}

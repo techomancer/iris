@@ -24,6 +24,11 @@ developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TL
 # reproduces at full JIT speed. Cheap enough to carry in a `lightning` build —
 # a fixed-size direct-mapped table, no allocation, no hashing.
 llstats = []
+# Perfetto tracing: per-thread event rings drained by a writer thread into a
+# .pftrace file for ui.perfetto.dev (src/perfetto/, docs/perfetto.md).
+# Without it the pf_* macros compile to nothing. Controlled at run time with
+# `perfetto start|stop|status|cats` on the monitor or `--perfetto FILE`.
+perfetto = []
 # REX3 per-GO activity bits and dispatch counters (`rex status`, `perf
 # snapshot`): the DIAG_LOOP_EXECUTE_GO / DIAG_LOOP_DRAW_BLOCK flips and the
 # jit_go_count / interp_go_count / simd_fill_rows increments.
