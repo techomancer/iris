@@ -449,8 +449,12 @@ impl Mgras {
         register_spin("mgras::unhandled", self, |m| &m.unhandled);
         register_spin("mgras::threads", self, |m| &m.threads);
         register_spin("mgras::hq_thread", self, |m| &m.hq_thread);
-        register_spin("mgras::rss_thread[0]", self, |m| &m.rss_thread[0]);
-        register_spin("mgras::rss_thread[1]", self, |m| &m.rss_thread[1]);
+        if self.nrss == 1 {
+            register_spin("mgras::rss_thread", self, |m| &m.rss_thread[0]);
+        } else {
+            register_spin("mgras::rss_thread[0]", self, |m| &m.rss_thread[0]);
+            register_spin("mgras::rss_thread[1]", self, |m| &m.rss_thread[1]);
+        }
         register_spin("mgras::refresh", self, |m| &m.refresh);
         register_spin("mgras::cycles", self, |m| &m.cycles);
         register_spin("mgras::trace", self, |m| &m.trace);
