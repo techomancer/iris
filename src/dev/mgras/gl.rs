@@ -1587,7 +1587,18 @@ impl Gl {
             return if self.bitmap_pending != 0 { self.bitmap[7] as usize } else { 0 };
         }
         let rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
-        (self.send_pixels[0] as usize * rows).min(1 << 22)
+        (self.send_pixels_row_words() * rows).min(1 << 22)
+    }
+
+    /// Words in one SEND_PIXELS row: header words 0 + 1. Texture loads
+    /// split their rows evenly between the two ([0x10, 0x10] for 128-byte
+    /// rows); so does glDrawPixels by DMA (Advanced Visualizer's window
+    /// restore, 156-pixel RGBA strips: [0x4E, 0x4E, ..]), while FIFO
+    /// glDrawPixels and TRAM restores send word 1 as 0. Word 0 alone gave
+    /// half a row: a draw then took the pixels for 2-byte ones and widened
+    /// each with 0xFF (purple/blue columns in a restored window).
+    fn send_pixels_row_words(&self) -> usize {
+        (self.send_pixels[0] + self.send_pixels[1]) as usize
     }
 
     /// The pixel operation transfers stencil indices (SAVE_RSS's planes).
@@ -1631,7 +1642,7 @@ impl Gl {
         sink.rss_write(re::BLOCK_XYENDI, self.pixel_block[1], true);
     }
 
-    /// glDrawPixels' rows (FIFO pixel data, `send_pixels[0]` words a row,
+    /// glDrawPixels' rows (FIFO pixel data, `send_pixels_row_words` a row,
     /// bottom row first) at the raster position, as the GE streams them:
     /// a raster-engine DMA write block the size of the image, the host
     /// format from the transfer mode (the driver sets `xfrmode` itself), so
@@ -1640,7 +1651,7 @@ impl Gl {
     /// zoom) are taken as identity.
     fn draw_pixels(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
         self.send_pixels_pending = 0;
-        let mut wpr = self.send_pixels[0] as usize;
+        let mut wpr = self.send_pixels_row_words();
         if self.raster_valid == 0 || wpr == 0 || words.len() < wpr {
             return;
         }
@@ -2444,12 +2455,11 @@ impl Gl {
             return;
         }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        // A row is SEND_PIXELS words 0 + 1 (traced, direct loads of 64x64
-        // luminance-alpha and 128-wide RGBA strips: [0x10, 0x10, ..] with
-        // 128-byte rows, [0x40, 0x40, ..] with 512-byte rows; the TRAM
-        // restores send word 1 as 0). Reading word 0 alone halved the row:
-        // texel s took texel s / 2's bytes.
-        let wpr = (self.send_pixels[0] + self.send_pixels[1]) as usize * 4;
+        // A row is SEND_PIXELS words 0 + 1 (`send_pixels_row_words`; traced
+        // 64x64 luminance-alpha and 128-wide RGBA strips: [0x10, 0x10, ..]
+        // with 128-byte rows, [0x40, 0x40, ..] with 512-byte rows). Word 0
+        // alone halved the row: texel s took texel s / 2's bytes.
+        let wpr = self.send_pixels_row_words() * 4;
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         let (pitch, bpt) = if hdr_rows == h && wpr >= w { (wpr, wpr / w) } else { (0, bytes.len() / (w * h)) };
         let pitch = if pitch == 0 { w * bpt } else { pitch };

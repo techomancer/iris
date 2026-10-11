@@ -1570,6 +1570,38 @@ fn gl_draw_pixels_colour_index_shorts() {
     m.stop_engines();
 }
 
+/// glDrawPixels can split a row's words between SEND_PIXELS words 0 and 1
+/// (traced, Advanced Visualizer restoring its window from 156-pixel RGBA
+/// strips: [0x4E, 0x4E, ..], 624-byte rows), as texture loads do. Taking
+/// word 0 alone made the 0xDA8 image width read as 2-byte pixels, and
+/// each was widened with 0xFF: purple and blue columns.
+#[test]
+fn gl_draw_pixels_rows_are_send_pixels_words_0_and_1() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x15, &[]);
+    let pixels = [0xB2B2_B200u32, 0x4C4C_4C00, 0x1020_3000, 0xFFEE_DD00];
+    let mut rows = Vec::new();
+    for (y, header) in [(20.0f32, [4u32, 0]), (21.0, [2, 2])] {
+        fifo_token(&m, 0x7F, &[1, 2]);
+        write(&m, 32, CFIFO, 0x8000_0008);
+        write(&m, 32, CFIFO, 0x159);
+        write(&m, 32, CFIFO, 0x00C0_0080);
+        fifo_token(&m, 0x38, &[f(10.0), f(y), f(0.0)]);
+        // The image: 4 x 1 pixels (0xDA8 transfer size).
+        fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 0, 6, 0, 0, 3, 0, 1 << 16 | 4, 0]);
+        fifo_token(&m, 0x8D, &[header[0], header[1], 0, 1, 0, 1, 0x49D0, 0x88]);
+        fifo_pixel_data(&m, &pixels);
+        let py = 1023 - y as usize;
+        rows.push((10..15).map(|x| m.fb_pixel(x, py)).collect::<Vec<_>>());
+    }
+    assert_ne!(rows[0][..4], [0; 4], "the reference row was drawn");
+    assert_eq!(rows[0][4], 0);
+    assert_eq!(rows[1], rows[0], "[2, 2] draws what [4, 0] does");
+    m.stop_engines();
+}
+
 /// Pixel zoom (snoop's magnifier): the GE pixel state at 0x192 holds
 /// 1 / zoom (token 0x080, traced: 1/6 at zoom 6); each pixel and row of a
 /// SEND_PIXELS image is repeated.
