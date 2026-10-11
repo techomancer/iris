@@ -30,7 +30,14 @@ fixes, none made yet: answer FIFOSTATUS with the real level without waiting;
 model the high-water interrupt; bound the queued work so writers block on
 BUS_BUSY in user mode.
 
-Until then:
+Fixed 2026-10-10 (612ab398): the status registers answer at once, with
+the command FIFO level faked REX3-style and the FIFO water-mark interrupt
+(GIO interrupt 0) modelled, so the kernel's own poll-then-sleep runs.
+Only raster/PIO reads (whole board) and HQ3 context/GE readback reads (HQ3
+only) still wait. Not yet re-measured with `ioc ticks`; if ticks are still
+lost, look for those reads in a masked section.
+
+Until it is re-measured:
 - Compare raster performance offline: record the session in the guest
   (`mgras rec <file>` ... `mgras rec off`) and time its replay:
   `MGRAS_REPLAY_NOCHECK=1 MGRAS_REPLAY_BOARD=high|max MGRAS_REPLAY=<file>
