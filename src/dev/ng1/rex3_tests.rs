@@ -7161,35 +7161,29 @@ fn test_gfifo_sentinels_carry_go_and_have_names() {
     }
 }
 
-/// A bulk transfer must leave something usable in the bus log.
+/// A bulk transfer must leave something usable in the trace.
 ///
 /// The batch protocol replaces N `HOSTRW64` pushes with ONE token, and the
 /// payload words are consumed inside `drain_payload` without ever reaching the
-/// logger. So where the scalar path printed a line per word, the bulk path
+/// trace hook. So where the scalar path printed a line per word, the bulk path
 /// printed a single opaque token line — exactly the path the wallpaper and
-/// icons now take, and the one hardest to debug from a log.
+/// icons now take, and the one hardest to debug from a trace.
 ///
 /// This pins that both directions leave a line carrying the word count and a
 /// data sample, so "the data arrived" can be told from "the data was wrong".
 #[test]
-#[cfg(feature = "developer")]
-fn test_bulk_transfers_appear_in_the_bus_log() {
+#[cfg(feature = "gputrace")]
+fn test_bulk_transfers_appear_in_the_trace() {
     use crate::traits::BusDevice;
-    use std::io::Read;
 
-    let dir = std::env::temp_dir().join(format!("iris-buslog-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("tmpdir");
-    let prev = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&dir).expect("chdir");
+    let path = std::env::temp_dir().join(format!("iris-rex3-trace-{}.txt", std::process::id()));
+    let path = path.to_str().unwrap().to_string();
 
     let rex = make_rex3();
     rex3init(rex);
 
-    // `rex buslog on` — same path the monitor command takes.
-    {
-        let mut log = rex.rex3_log.lock();
-        *log = Some(std::fs::File::create("rex3.log").expect("create log"));
-    }
+    // `rex trace <file>` — same path the monitor command takes.
+    rex.start_trace(&path, super::trace::TRACE_ALL).expect("start trace");
 
     let (w, h) = (8i32, 4i32);
     let words = counter_words(w, h);
@@ -7208,25 +7202,25 @@ fn test_bulk_transfers_appear_in_the_bus_log() {
     reg(rex, REX3_DRAWMODE0, DM0_HOSTR_NO_STOPONY);
     let mut back = vec![0u64; words.len()];
     assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut back), crate::traits::BUS_OK);
+    wait(rex);
 
-    { *rex.rex3_log.lock() = None; }
-
-    let mut text = String::new();
-    std::fs::File::open("rex3.log").expect("open log")
-        .read_to_string(&mut text).expect("read log");
-    std::env::set_current_dir(&prev).ok();
-    let _ = std::fs::remove_dir_all(&dir);
+    rex.stop_trace().expect("trace was running");
+    let text = std::fs::read_to_string(&path).expect("read trace");
+    let _ = std::fs::remove_file(&path);
 
     assert!(text.contains("DMA_BATCH_W"),
-        "bulk write left no named token in the bus log:\n{text}");
+        "bulk write left no named token in the trace:\n{text}");
     assert!(text.contains(&format!("batch write {} qwords", words.len())),
-        "bulk write logged no word count:\n{text}");
+        "bulk write traced no word count:\n{text}");
     assert!(text.contains(&format!("first={:016x}", words[0])),
-        "bulk write logged no data sample:\n{text}");
+        "bulk write traced no data sample:\n{text}");
     assert!(text.contains(&format!("BATCH_R done: {} qwords", back.len())),
-        "bulk read logged no result line — a readback's data never appears:\n{text}");
+        "bulk read traced no result line — a readback's data never appears:\n{text}");
     assert!(text.contains(&format!("last={:016x}", back[back.len() - 1])),
         "bulk read result line carries no data sample:\n{text}");
+    // The GO decodes with the registers it ran with.
+    assert!(text.contains("GF  #") && text.contains("-> DRAW BLOCK"),
+        "no decoded GO in the trace:\n{text}");
 }
 
 /// JIT/interpreter equivalence for **batched** HOSTRW transfers.
@@ -7519,5 +7513,76 @@ fn stepz_go_skips_its_pixel() {
             assert_eq!(got, want, "zpopaque={zpopaque} pixel {x}: {got:#08x}, want {want:#08x}");
         }
         assert_eq!(read_reg(rex, REX3_ZPATTERN), 0x1234_5678, "STEPZ changed the guest's ZPATTERN");
+    }
+}
+
+/// A recording replays to the same board state, checkpoint by checkpoint:
+/// PIO draws, a DCB write, register reads and bulk DMA in both directions,
+/// recorded through the bus taps mid-session (so the start state record is
+/// what the replay board begins from), and replayed through the bus.
+#[test]
+#[cfg(feature = "gputrace")]
+fn test_recording_replays_bit_exact() {
+    use super::rec::{self, tests::{board, replay_recs, start_state}};
+    use crate::traits::BusDevice;
+
+    let path = std::env::temp_dir().join(format!("iris-rex3-rec-{}.rec", std::process::id()));
+    let path = path.to_str().unwrap().to_string();
+
+    let rex = make_rex3();
+    rex3init(rex);
+    // Something on screen before the recording starts: the start state must carry it.
+    reg(rex, REX3_DRAWMODE1, 0x0000_7006 | (3 << 13)); // CI8, logicop SRC
+    reg(rex, REX3_COLORI, 0x42);
+    reg(rex, REX3_XYSTARTI, xy(10, 10));
+    reg(rex, REX3_DRAWMODE0, 0x26); // DRAW BLOCK DOSETUP STOPONX/Y
+    reg_go(rex, REX3_XYENDI, xy(200, 120));
+
+    rex.set_recording(Some(&path), true).expect("start recording");
+    for i in 0..20 {
+        reg(rex, REX3_COLORI, 0x10 + i);
+        reg(rex, REX3_XYSTARTI, xy(5 * i as i32, 300 + 3 * i as i32));
+        reg_go(rex, REX3_XYENDI, xy(5 * i as i32 + 40, 330 + 3 * i as i32));
+    }
+    let _ = read_reg(rex, REX3_COLORI);
+    rex.record_mark().expect("recording");
+    // A DCB write (CMAP index) and a 64-bit register pair.
+    w32(rex, set_addr(REX3_DCBMODE), (2 << DCBMODE_DCBADDR_SHIFT) | DCBMODE_DATAWIDTH_1);
+    rex.write8(set_addr(REX3_DCBDATA0), 0x12);
+    w64(rex, set_addr(REX3_XYSTARTI), ((xy(0, 0) as u64) << 32) | xy(31, 3) as u64);
+    // Bulk DMA both ways.
+    let (w, h) = (8i32, 4i32);
+    let words = counter_words(w, h);
+    reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
+    reg(rex, REX3_WRMASK, 0xFF);
+    reg(rex, REX3_XYENDI, xy(500 + w - 1, 500 + h - 1));
+    reg(rex, REX3_XYSTARTI, xy(500, 500));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTW_NO_STOPONY);
+    assert_eq!(rex.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words), crate::traits::BUS_OK);
+    wait(rex);
+    reg(rex, REX3_XYENDI, xy(500 + w - 1, 500 + h - 1));
+    reg(rex, REX3_XYSTARTI, xy(500, 500));
+    reg(rex, REX3_DRAWMODE0, DM0_HOSTR_NO_STOPONY);
+    let mut back = vec![0u64; words.len()];
+    assert_eq!(rex.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut back), crate::traits::BUS_OK);
+    wait(rex);
+    let live = rex.rec_state_hash();
+    let (_, n) = rex.set_recording(None, false).expect("stop").expect("was recording");
+
+    let recs = rec::load(&path).expect("load recording");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(recs.len() as u64, n);
+    assert!(matches!(recs.last(), Some(rec::Rec::Hash(h)) if *h == live), "closing checkpoint is the live state");
+    assert!(recs.iter().any(|r| matches!(r, rec::Rec::BulkWrite { .. })));
+    assert!(recs.iter().any(|r| matches!(r, rec::Rec::BulkRead { .. })));
+
+    let engines: &[bool] = if cfg!(feature = "rex-jit") { &[false, true] } else { &[false] };
+    for &jit in engines {
+        let replay = board(start_state(&recs), jit);
+        let rep = replay_recs(replay, &recs, true);
+        assert_eq!(rep.checked, 3, "start, mark and end checkpoints");
+        assert!(!rep.diverged(), "replay (jit={jit}) diverged at records {:?}", rep.failed);
+        assert_eq!(rep.reads_differ, 0, "replayed reads differ: {:x?}", rep.differ_at);
+        assert_eq!(replay.rec_state_hash(), live);
     }
 }

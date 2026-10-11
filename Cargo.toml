@@ -14,7 +14,13 @@ default-run = "iris"
 [features]
 # Uncomment to enable cache debug tracking (tracks specific cache line across all operations)
 debug_cache = []
-developer = []
+developer = ["gputrace"]
+# Graphics bus taps: REX3 annotated trace (`rex trace`) and replayable
+# recording (`rex rec`, src/dev/ng1/rex3_rec.rs). Without it every REX3 bus
+# access goes straight to the device, with not even the relaxed load that
+# checks whether a trace runs. On with `developer`; opt in for plain and
+# `lightning` builds with `--features gputrace`.
+gputrace = []
 developer_ip7 = []  # CP0 Compare/timer calibration stats and debug prints
 developerx = []     # Extended developer logging: breaks on IBE/DBE/ADEL/ADES/TLB errors
 # Per-LL-address LL/SC reservation histogram, queryable with `ll stats`.

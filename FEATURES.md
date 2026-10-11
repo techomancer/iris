@@ -17,7 +17,8 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | Feature | Purpose | Enables |
 |---|---|---|
 | `debug_cache` | Track a selected cache line through cache operations. | — |
-| `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | — |
+| `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | `gputrace` |
+| `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [rules/rex3/trace-and-recording.md](rules/rex3/trace-and-recording.md). Off: no per-access check at all. Lightning-compatible. | — |
 | `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
 | `developerx` | Extended exception diagnostics; break on IBE/DBE/ADEL/ADES/TLB errors. | — |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible. | — |
@@ -435,6 +436,8 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
+| `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
 | `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_NO_IDLE` | Any presence disables idle parking. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
@@ -495,6 +498,7 @@ both the interpreter and jitv2.
 | `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
+| `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`). On with `developer`; opt in for plain and `lightning` builds |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
 | `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |
 | `fetchverify` | Check every executed instruction word against memory (stale-code detector); lightning-compatible |

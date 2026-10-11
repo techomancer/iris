@@ -1436,9 +1436,18 @@ pub struct Rex3 {
     /// Optional log file for block/span draws (set when block_debug is enabled).
     #[cfg(feature = "developer")]
     block_log: Mutex<Option<std::fs::File>>,
-    /// GFIFO log (written by painter thread on process_register, one line per entry).
-    #[cfg(feature = "developer")]
-    rex3_log: Mutex<Option<std::fs::File>>,
+    /// What the bus and processor paths must report: `rec::TAP_REC` while a
+    /// recording runs, `trace::TRACE_*` categories while a trace does. One
+    /// relaxed load of zero is all either costs when off.
+    #[cfg(feature = "gputrace")]
+    tap: AtomicU32,
+    /// Replayable recording (`rex rec`). Held across a recorded access and
+    /// its record, so records come out in GFIFO order.
+    #[cfg(feature = "gputrace")]
+    rec: Mutex<Option<rec::Recorder>>,
+    /// Annotated trace (`rex trace`).
+    #[cfg(feature = "gputrace")]
+    trace: Mutex<trace::Rex3Trace>,
     /// When true, the refresh thread overlays a 16x16 grid of 8x8 CMAP swatches.
     pub show_cmap: AtomicBool,
     /// When true, overlay decoded DID/XMAP mode info near the bottom of the screen.
@@ -1597,8 +1606,12 @@ impl Rex3 {
             uncached_fetch_count,
             #[cfg(feature = "developer")]
             block_log: Mutex::new(None),
-            #[cfg(feature = "developer")]
-            rex3_log: Mutex::new(None),
+            #[cfg(feature = "gputrace")]
+            tap: AtomicU32::new(0),
+            #[cfg(feature = "gputrace")]
+            rec: Mutex::new(None),
+            #[cfg(feature = "gputrace")]
+            trace: Mutex::new(trace::Rex3Trace::new()),
             show_cmap: AtomicBool::new(false),
             show_disp_debug: AtomicBool::new(false),
             screenshot_pending: AtomicBool::new(false),
@@ -2566,43 +2579,11 @@ impl Rex3 {
                 let reg_offset = addr & !0x0800;
                 let exit = self.process_register(reg_offset, val);
 
-                // Log to rex3_log after processing.
-                #[cfg(feature = "developer")]
-                if let Some(f) = self.rex3_log.lock().as_mut() {
-                    if addr == GFIFO_PURE_GO {
-                        let _ = writeln!(f, "------- PURE_GO -------");
-                    } else {
-                        let val32 = val as u32;
-                        let extra = match reg_offset {
-                            REX3_DRAWMODE0 => format!("  ; {}", decode_dm0(val32)),
-                            REX3_DRAWMODE1 => format!("  ; {}", decode_dm1(val32)),
-                            _ => String::new(),
-                        };
-                        if is_go {
-                            // A batch token stands in for N HOSTRW pushes that
-                            // never appear individually in this log — the
-                            // payload is consumed inside drain_payload. Without
-                            // the word count and a sample here, a bulk transfer
-                            // is a single opaque line, while the scalar path it
-                            // replaced printed every word. Show enough to tell
-                            // "the data arrived" from "the data was wrong".
-                            let batch = match reg_offset {
-                                REX3_DMA_BATCH_W_REG => {
-                                    let ctxr = unsafe { &*self.context.get() };
-                                    format!("  ; batch write {} qwords, first={:016x}",
-                                        val, ctxr.hostrw[0])
-                                }
-                                REX3_DMA_BATCH_R_REG =>
-                                    format!("  ; batch read {} qwords (filled after GO)", val),
-                                _ => String::new(),
-                            };
-                            let _ = writeln!(f, "------- GO reg={:04x}({}) val={:016x}{}{} -------",
-                                reg_offset, rex3_reg_name(reg_offset), val, extra, batch);
-                        } else {
-                            let _ = writeln!(f, "reg={:04x}({}) val={:016x}{}",
-                                reg_offset, rex3_reg_name(reg_offset), val, extra);
-                        }
-                    }
+                // Traced after the register is applied and before its GO
+                // runs, so a GO decodes with the registers it draws with.
+                #[cfg(feature = "gputrace")]
+                if self.tracing(trace::TRACE_GFIFO) {
+                    self.trace_gfifo(addr, val);
                 }
 
                 if is_go {
@@ -2976,6 +2957,8 @@ impl Rex3 {
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
+            #[cfg(feature = "gputrace")]
+            self.trace_flush(false);
 
             // Poll and clear activity bits; preserve persistent LED bits.
             let bar_stats = crate::disp::BarStats {
@@ -3567,6 +3550,18 @@ impl Device for Rex3 {
     }
 
     fn stop(&self) {
+        // Close a recording and trace while the processor can still drain,
+        // so the final checkpoint sees everything queued.
+        #[cfg(feature = "gputrace")]
+        match self.set_recording(None, false) {
+            Ok(Some((path, n))) => eprintln!("REX3: recording {path} closed ({n} records)"),
+            Ok(None) => {}
+            Err(e) => eprintln!("REX3: closing recording: {e}"),
+        }
+        #[cfg(feature = "gputrace")]
+        if let Some(s) = self.stop_trace() {
+            eprintln!("REX3: trace closed: {s}");
+        }
         self.running.store(false, Ordering::SeqCst);
 
         // Send exit command to ensure processor thread wakes up and terminates.
@@ -3610,6 +3605,26 @@ impl Device for Rex3 {
             crate::thread_affinity::pin_current(crate::thread_affinity::PerfRole::Rex3Refresh);
             rex3.refresh_loop();
         }).unwrap());
+
+        // Started here rather than at construction: the machine resets the
+        // board (power_on) in between, and a recording's start state must be
+        // the state its first record applies to.
+        #[cfg(feature = "gputrace")]
+        if let Some(path) = std::env::var_os("IRIS_REX3_REC") {
+            let path = path.to_string_lossy();
+            match self.set_recording(Some(&path), true) {
+                Ok(_) => eprintln!("REX3: recording to {path}"),
+                Err(e) => eprintln!("REX3: cannot record to {path}: {e}"),
+            }
+        }
+        #[cfg(feature = "gputrace")]
+        if let Some(path) = std::env::var_os("IRIS_REX3_TRACE") {
+            let path = path.to_string_lossy();
+            match self.start_trace(&path, trace::TRACE_ALL) {
+                Ok(()) => eprintln!("REX3: tracing to {path}"),
+                Err(e) => eprintln!("REX3: cannot trace to {path}: {e}"),
+            }
+        }
     }
 
     fn is_running(&self) -> bool {
@@ -3623,7 +3638,7 @@ impl Device for Rex3 {
     fn register_commands(&self) -> Vec<(String, String)> {
         #[allow(unused_mut)]
         let mut cmds = vec![
-            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex buslog <on|off> [DEV] | rex fbdump [DIR]".to_string()),
+            ("rex".to_string(), "REX3 commands: rex status | rex jit <on|off|status|list> | rex jit <disable|enable> <dm0> <dm1> | rex debug <on|off> [DEV] | rex cmap <on|off> | rex trace <file> [gfifo,cpu|all] | rex trace off|flush | rex rec <file>[.txt] | rex rec mark|off | rex fbdump [DIR]".to_string()),
             ("dcb".to_string(), "DCB commands: dcb debug <on|off> [DEV]".to_string()),
             ("vc2".to_string(), "VC2 commands: vc2 status | vc2 ramdump | vc2 debug <on|off> [DEV]".to_string()),
             ("xmap".to_string(), "XMAP commands: xmap status | xmap debug <on|off> [DEV]".to_string()),
@@ -3828,28 +3843,17 @@ impl Device for Rex3 {
             return Ok(());
         }
 
-        #[cfg(feature = "developer")]
-        if cmd == "rex" && args[0] == "buslog" {
-            let val = match args.get(1).map(|s| *s) {
-                Some("on")  => true,
-                Some("off") => false,
-                _ => return Err("Usage: rex buslog <on|off>".to_string()),
-            };
-            let mut log = self.rex3_log.lock();
-            if val {
-                match std::fs::File::create("rex3.log") {
-                    Ok(f) => { *log = Some(f); writeln!(writer, "REX3 GFIFO logging enabled (rex3.log)").unwrap(); }
-                    Err(e) => { writeln!(writer, "Failed to open rex3.log: {}", e).unwrap(); }
-                }
-            } else {
-                *log = None;
-                writeln!(writer, "REX3 GFIFO logging disabled").unwrap();
-            }
-            return Ok(());
+        #[cfg(feature = "gputrace")]
+        if cmd == "rex" && args[0] == "trace" {
+            return self.cmd_trace(&args[1..], &mut writer);
         }
-        #[cfg(not(feature = "developer"))]
-        if cmd == "rex" && args[0] == "buslog" {
-            return Err("rex buslog is only available in developer builds".to_string());
+        #[cfg(feature = "gputrace")]
+        if cmd == "rex" && args[0] == "rec" {
+            return self.cmd_rec(&args[1..], &mut writer);
+        }
+        #[cfg(not(feature = "gputrace"))]
+        if cmd == "rex" && (args[0] == "trace" || args[0] == "rec") {
+            return Err(format!("rex {} needs a build with the gputrace feature (on with developer)", args[0]));
         }
 
         // Shader reporting works in every build: the precompiled table serves
@@ -4068,8 +4072,11 @@ impl Device for Rex3 {
     }
 }
 
-impl BusDevice for Rex3 {
-    fn read32(&self, addr: u32) -> BusRead32 {
+/// The bus interface proper. `BusDevice for Rex3` (below) wraps each of
+/// these with the recording and trace taps; calls between them stay
+/// in here, so a 64-bit access is recorded once, as itself.
+impl Rex3 {
+    fn bus_read32(&self, addr: u32) -> BusRead32 {
         let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
         let is_go      = offset & 0x0800 != 0;
@@ -4284,7 +4291,7 @@ impl BusDevice for Rex3 {
         result
     }
 
-    fn read8(&self, addr: u32) -> BusRead8 {
+    fn bus_read8(&self, addr: u32) -> BusRead8 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
@@ -4304,7 +4311,7 @@ impl BusDevice for Rex3 {
         res
     }
 
-    fn write8(&self, addr: u32, val: u8) -> u32 {
+    fn bus_write8(&self, addr: u32, val: u8) -> u32 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         dlog_dev!(LogModule::Rex3, "REX3 Write8: Offset {:04x} Val {:02x}", offset, val);
@@ -4318,7 +4325,7 @@ impl BusDevice for Rex3 {
         BUS_ERR
     }
 
-    fn read16(&self, addr: u32) -> BusRead16 {
+    fn bus_read16(&self, addr: u32) -> BusRead16 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         let res = if is_dcb {
@@ -4338,7 +4345,7 @@ impl BusDevice for Rex3 {
         res
     }
 
-    fn write16(&self, addr: u32, val: u16) -> u32 {
+    fn bus_write16(&self, addr: u32, val: u16) -> u32 {
         let offset = addr & (REX3_SIZE - 1);
         let is_dcb = (offset & !7) == REX3_DCBDATA0;
         dlog_dev!(LogModule::Rex3, "REX3 Write16: Offset {:04x} Val {:04x}", offset, val);
@@ -4352,7 +4359,7 @@ impl BusDevice for Rex3 {
         BUS_ERR
     }
 
-    fn write32(&self, addr: u32, val: u32) -> u32 {
+    fn bus_write32(&self, addr: u32, val: u32) -> u32 {
         let offset     = addr & (REX3_SIZE - 1);
         let reg_offset = offset & !0x0800;
         dlog_dev!(LogModule::Rex3, "REX3 Write32: Offset {:04x} (Reg {:04x} {}) Val {:08x}", offset, reg_offset, rex3_reg_name(reg_offset), val);
@@ -4398,7 +4405,7 @@ impl BusDevice for Rex3 {
         BUS_OK
     }
 
-    fn read64(&self, addr: u32) -> BusRead64 {
+    fn bus_read64(&self, addr: u32) -> BusRead64 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
@@ -4424,9 +4431,9 @@ impl BusDevice for Rex3 {
         }
 
         // Two-register 64-bit read: read high word first WITHOUT go, then low word with go.
-        let r_high = self.read32(addr & !0x0800);
+        let r_high = self.bus_read32(addr & !0x0800);
         if !r_high.is_ok() { return BusRead64 { status: r_high.status, data: 0 }; }
-        let r_low = self.read32(addr + 4);
+        let r_low = self.bus_read32(addr + 4);
         if !r_low.is_ok() { return BusRead64 { status: r_low.status, data: 0 }; }
         BusRead64::ok(((r_high.data as u64) << 32) | r_low.data as u64)
     }
@@ -4444,12 +4451,12 @@ impl BusDevice for Rex3 {
     /// must already be real data. So here we invert the ordering: push a
     /// GO-only entry, wait for it to execute (arms/advances the pipeline),
     /// THEN read the now-current ctx.hostrw — instead of read-then-advance.
-    fn dma_read64(&self, addr: u32) -> BusRead64 {
+    fn bus_dma_read64(&self, addr: u32) -> BusRead64 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go64r = (offset & 0x0800) != 0;
         let reg_offset64r = offset & !0x0800;
         if reg_offset64r != REX3_HOSTRW0 || !is_go64r {
-            return self.read64(addr);
+            return self.bus_read64(addr);
         }
 
         #[cfg(feature = "developer")]
@@ -4476,7 +4483,7 @@ impl BusDevice for Rex3 {
     /// All-or-nothing, as the trait requires: the capacity check and the single
     /// token push both happen before anything is consumed, so a refusal leaves
     /// no state behind for the caller's retry to duplicate.
-    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+    fn bus_dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go = (offset & 0x0800) != 0;
         if (offset & !0x0800) != REX3_HOSTRW0 || !is_go {
@@ -4510,7 +4517,7 @@ impl BusDevice for Rex3 {
     /// Keeps `dma_read64`'s ordering inversion at transfer granularity: the
     /// token is pushed and waited on *before* anything is read out, so the
     /// array is already filled when we copy from it.
-    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+    fn bus_dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go64r = (offset & 0x0800) != 0;
         if (offset & !0x0800) != REX3_HOSTRW0 || !is_go64r {
@@ -4535,19 +4542,19 @@ impl BusDevice for Rex3 {
         // `out.len()` words came back in this one call — count them all, or the
         // overlay under-reports a bulk readback the same way it did writes.
         self.note_hostrw_reads(out.len() as u32);
-        // The token line in the bus log is written before the shader runs, so
-        // it cannot show what came back. Close the loop here, where the data
-        // exists: otherwise a bulk readback is the only transfer in the log
+        // The token's GF trace line is written before the shader runs, so it
+        // cannot show what came back. Close the loop here, where the data
+        // exists: otherwise a bulk readback is the only transfer in the trace
         // whose result is never visible.
-        #[cfg(feature = "developer")]
-        if let Some(f) = self.rex3_log.lock().as_mut() {
-            let _ = writeln!(f, "------- BATCH_R done: {} qwords, first={:016x} last={:016x} -------",
-                out.len(), out[0], out[out.len() - 1]);
+        #[cfg(feature = "gputrace")]
+        if self.tracing(trace::TRACE_CPU) {
+            self.trace_dma(format_args!("BATCH_R done: {} qwords, first={:016x} last={:016x}",
+                out.len(), out[0], out[out.len() - 1]));
         }
         BUS_OK
     }
 
-    fn write64(&self, addr: u32, val: u64) -> u32 {
+    fn bus_write64(&self, addr: u32, val: u64) -> u32 {
         let offset = addr & (REX3_SIZE - 1);
         let is_go = (offset & 0x0800) != 0;
         let reg_offset64 = offset & !0x0800;
@@ -4578,8 +4585,8 @@ impl BusDevice for Rex3 {
         // Registers with CPU-thread side effects cannot take the queue path;
         // they are rare (CONFIG, DCB*) and never part of a hot pair.
         if Self::reg_needs_cpu_side_effect(off_hi) || Self::reg_needs_cpu_side_effect(off_lo) {
-            return match self.write32(addr & !0x0800, high) {
-                BUS_OK => self.write32(addr + 4, low),
+            return match self.bus_write32(addr & !0x0800, high) {
+                BUS_OK => self.bus_write32(addr + 4, low),
                 status => status,
             };
         }
@@ -4592,6 +4599,244 @@ impl BusDevice for Rex3 {
         BUS_OK
     }
 
+}
+
+// ============================================================================
+// Bus taps: recording and trace
+// ============================================================================
+
+#[cfg(feature = "gputrace")]
+impl Rex3 {
+    /// DCBMODE before a DCBDATA access, for the CPU trace line.
+    fn tap_dcbmode(&self, tap: u32, reg: u32) -> Option<u32> {
+        (tap & trace::TRACE_CPU != 0 && (reg & !7) == REX3_DCBDATA0).then(|| self.dcb.lock().dcbmode)
+    }
+
+    /// A bus read with a recording or trace running.
+    #[cold]
+    #[inline(never)]
+    fn tapped_read<T>(&self, tap: u32, bits: u32, addr: u32, read: impl FnOnce() -> (u32, u64, T)) -> T {
+        let off = addr & (REX3_SIZE - 1);
+        let reg = off & !0x0800;
+        let dcb = self.tap_dcbmode(tap, reg);
+        let mut rec = self.rec_guard(tap);
+        let (status, val, r) = read();
+        if status == BUS_OK {
+            // Plain STATUS polls change nothing a checkpoint hashes, and a
+            // driver waiting for idle makes millions of them.
+            let poll = matches!(reg, REX3_STATUS | REX3_USER_STATUS) && off & 0x0800 == 0;
+            if let Some(r) = rec.as_deref_mut().and_then(Option::as_mut) {
+                if !poll {
+                    r.access(b'R', bits as u8, off, val);
+                }
+            }
+            drop(rec);
+            if tap & trace::TRACE_CPU != 0 {
+                self.trace_cpu(false, bits, off, val, dcb);
+            }
+        }
+        r
+    }
+
+    /// A bus write with a recording or trace running.
+    #[cold]
+    #[inline(never)]
+    fn tapped_write(&self, tap: u32, bits: u32, addr: u32, val: u64, write: impl FnOnce() -> u32) -> u32 {
+        let off = addr & (REX3_SIZE - 1);
+        let reg = off & !0x0800;
+        let dcb = self.tap_dcbmode(tap, reg);
+        let mut rec = self.rec_guard(tap);
+        let status = write();
+        if status != BUS_BUSY {
+            if let Some(r) = rec.as_deref_mut().and_then(Option::as_mut) {
+                r.access(b'W', bits as u8, off, val);
+                self.rec_checkpoint_if_due(r);
+            }
+            drop(rec);
+            // Writes that go through the GFIFO are traced as GF lines.
+            let direct = Self::reg_needs_cpu_side_effect(reg) || (reg & !7) == REX3_DCBDATA0;
+            if tap & trace::TRACE_CPU != 0 && direct {
+                self.trace_cpu(true, bits, off, val, dcb);
+            }
+        }
+        status
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn tapped_dma_read64(&self, tap: u32, addr: u32) -> BusRead64 {
+        let off = addr & (REX3_SIZE - 1);
+        let mut rec = self.rec_guard(tap);
+        let r = self.bus_dma_read64(addr);
+        if r.is_ok() {
+            if let Some(g) = rec.as_deref_mut().and_then(Option::as_mut) {
+                g.dma_read(off, r.data);
+            }
+            drop(rec);
+            if tap & trace::TRACE_CPU != 0 {
+                let go = if off & 0x0800 != 0 { " GO" } else { "" };
+                self.trace_dma(format_args!("rd {}{go} = {:#018x}", rex3_reg_name(off & !0x0800), r.data));
+            }
+        }
+        r
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn tapped_dma_write64_bulk(&self, tap: u32, addr: u32, vals: &[u64]) -> u32 {
+        let off = addr & (REX3_SIZE - 1);
+        let mut rec = self.rec_guard(tap);
+        let status = self.bus_dma_write64_bulk(addr, vals);
+        if status == BUS_OK && !vals.is_empty() {
+            if let Some(g) = rec.as_deref_mut().and_then(Option::as_mut) {
+                g.bulk(b'B', off, vals);
+                self.rec_checkpoint_if_due(g);
+            }
+            drop(rec);
+            if tap & trace::TRACE_CPU != 0 {
+                self.trace_dma(format_args!("BATCH_W {} qwords, first={:016x} last={:016x}",
+                    vals.len(), vals[0], vals[vals.len() - 1]));
+            }
+        }
+        status
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn tapped_dma_read64_bulk(&self, tap: u32, addr: u32, out: &mut [u64]) -> u32 {
+        let off = addr & (REX3_SIZE - 1);
+        let mut rec = self.rec_guard(tap);
+        let status = self.bus_dma_read64_bulk(addr, out);
+        if status == BUS_OK && !out.is_empty() {
+            if let Some(g) = rec.as_deref_mut().and_then(Option::as_mut) {
+                g.bulk(b'b', off, out);
+            }
+        }
+        status
+    }
+}
+
+impl BusDevice for Rex3 {
+    fn read8(&self, addr: u32) -> BusRead8 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_read(tap, 8, addr, || { let r = self.bus_read8(addr); (r.status, r.data as u64, r) });
+            }
+        }
+        self.bus_read8(addr)
+    }
+
+    fn read16(&self, addr: u32) -> BusRead16 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_read(tap, 16, addr, || { let r = self.bus_read16(addr); (r.status, r.data as u64, r) });
+            }
+        }
+        self.bus_read16(addr)
+    }
+
+    fn read32(&self, addr: u32) -> BusRead32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_read(tap, 32, addr, || { let r = self.bus_read32(addr); (r.status, r.data as u64, r) });
+            }
+        }
+        self.bus_read32(addr)
+    }
+
+    fn read64(&self, addr: u32) -> BusRead64 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_read(tap, 64, addr, || { let r = self.bus_read64(addr); (r.status, r.data, r) });
+            }
+        }
+        self.bus_read64(addr)
+    }
+
+    fn write8(&self, addr: u32, val: u8) -> u32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_write(tap, 8, addr, val as u64, || self.bus_write8(addr, val));
+            }
+        }
+        self.bus_write8(addr, val)
+    }
+
+    fn write16(&self, addr: u32, val: u16) -> u32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_write(tap, 16, addr, val as u64, || self.bus_write16(addr, val));
+            }
+        }
+        self.bus_write16(addr, val)
+    }
+
+    fn write32(&self, addr: u32, val: u32) -> u32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_write(tap, 32, addr, val as u64, || self.bus_write32(addr, val));
+            }
+        }
+        self.bus_write32(addr, val)
+    }
+
+    fn write64(&self, addr: u32, val: u64) -> u32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_write(tap, 64, addr, val, || self.bus_write64(addr, val));
+            }
+        }
+        self.bus_write64(addr, val)
+    }
+
+    fn dma_read64(&self, addr: u32) -> BusRead64 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_dma_read64(tap, addr);
+            }
+        }
+        self.bus_dma_read64(addr)
+    }
+
+    fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_dma_write64_bulk(tap, addr, vals);
+            }
+        }
+        self.bus_dma_write64_bulk(addr, vals)
+    }
+
+    fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
+        #[cfg(feature = "gputrace")]
+        {
+            let tap = self.tap.load(Ordering::Relaxed);
+            if tap != 0 {
+                return self.tapped_dma_read64_bulk(tap, addr, out);
+            }
+        }
+        self.bus_dma_read64_bulk(addr, out)
+    }
 }
 
 // ============================================================================
@@ -4910,3 +5155,10 @@ fn load_bt445(dac: &mut crate::dev::ng1::bt445::Bt445, v: &toml::Value) {
 #[cfg(test)]
 #[path = "rex3_tests.rs"]
 mod tests;
+
+#[cfg(feature = "gputrace")]
+#[path = "rex3_rec.rs"]
+pub mod rec;
+#[cfg(feature = "gputrace")]
+#[path = "rex3_trace.rs"]
+pub mod trace;

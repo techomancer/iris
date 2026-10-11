@@ -5,6 +5,9 @@
 //!   rex3_shape.rs    canonical DrawMode decoding
 //!   rex3_shaders.rs  generated, precompiled draw functions
 //!   rex3_profile.rs  draw-shape corpus persistence
+//!   rex3_rec.rs      replayable bus recording (`rex rec`), replay tests
+//!   rex3_trace.rs    annotated GFIFO/CPU trace (`rex trace`)
+//!                    (both are submodules of rex3.rs, for its private state)
 //!   rex3_jit/        Cranelift shader JIT (`rex-jit`)
 //!   vc2.rs           VC2 video controller (+ vc2_timings.rs presets)
 //!   xmap9.rs         XMAP9 cross-map

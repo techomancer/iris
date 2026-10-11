@@ -174,6 +174,7 @@ pub mod ui;
 pub mod cpu;
 pub mod dev;
 pub mod gfifo;
+pub mod trace_writer;
 pub mod gfx_display;
 pub mod compositor;
 pub mod gl_compositor;
