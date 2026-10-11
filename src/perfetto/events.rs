@@ -154,6 +154,11 @@ pub static GR2_VBLANK: EventDef = EventDef::new("vblank", cat::GFX).on_track("GR
 /// A read that needs the board idle is being retried.
 pub static MGRAS_WAIT: EventDef = EventDef::new("guest read waits idle", cat::GFX).on_track("IMPACT busy wait").in_group(GFX_GROUP);
 pub static MGRAS_FIFO_FULL: EventDef = EventDef::new("fifo full", cat::GFX).on_track("IMPACT fifo full").in_group(GFX_GROUP);
+/// Command FIFO level as FIFOSTATUS reports it (0 empty, 1 until it is
+/// nearly full for real).
+pub static MGRAS_CFIFO_LEVEL: EventDef = EventDef::new("IMPACT cfifo level", cat::GFX).in_group(GFX_GROUP);
+/// The FIFO interrupt line (GIO interrupt 0) is asserted.
+pub static MGRAS_FIFO_INTR: EventDef = EventDef::new("fifo interrupt", cat::GFX).on_track("IMPACT fifo interrupt").in_group(GFX_GROUP);
 /// HQ3 / raster engine thread has work (from first entry to empty FIFO).
 pub static MGRAS_HQ_BUSY: EventDef = EventDef::new("HQ3 busy", cat::GFX);
 pub static MGRAS_RSS_BUSY: EventDef = EventDef::new("RSS busy", cat::GFX);

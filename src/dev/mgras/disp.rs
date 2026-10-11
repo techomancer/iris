@@ -140,6 +140,7 @@ impl Mgras {
                 last_rec_flush = std::time::Instant::now();
             }
             self.trace_flush(false);
+            self.begin_frame();
             // Video timing chip display control bit 0: retrace interrupts.
             let retrace = self.front_view().dcb.vc3.regs[0x1E] & 1 != 0;
             // Vertical retrace: a pulse per frame. The handler acknowledges

@@ -89,6 +89,9 @@ pub const GIO_ID: u32 = 0x0005_0190;
 
 const HQ_FIFO_DEPTH: usize = 65536;
 const RSS_FIFO_DEPTH: usize = 65536;
+/// Command FIFO words FIFOSTATUS counts at the top of `hq_fifo`
+/// (`cfifo_level`): room above the kernel's high-water mark of 32.
+const CFIFO_WORDS: usize = 64;
 
 /// FIFO entry tags. `hq_fifo`: command FIFO words carry their port (0 user,
 /// 1 privileged); `RSS | entry` is a direct raster write for the HQ3 to
@@ -162,15 +165,6 @@ impl Front {
     /// Flags derived from state, on top of the stored ones.
     fn derived_flags(&self) -> u32 {
         if self.ge.out.is_empty() { 0 } else { host::FLAG_GE_DIAG }
-    }
-
-    fn status() -> u32 {
-        // A vertical blank of about 1 ms in every 60 Hz frame.
-        let us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64 % 16_667)
-            .unwrap_or(0);
-        host::STATUS_IDLE | if us < 1000 { host::STATUS_VBLANK } else { 0 }
     }
 
     fn read(&mut self, off: u32, bits: u32) -> u64 {
@@ -266,6 +260,19 @@ pub struct Mgras {
     ioc: crate::dev::ioc::Ioc,
     /// Current level of the general interrupt line.
     general: AtomicBool,
+    /// The FIFO interrupt's inputs, kept apart from `front` for the HQ3
+    /// thread: the INTR_*FIFO_* enables (their own bits), the command
+    /// FIFO's high-water mark in 6:0 and its low-water mark in 14:8.
+    fifo_cfg: AtomicU32,
+    /// Current level of the FIFO interrupt line, decided under the lock so
+    /// the CPU and HQ3 threads cannot leave a stale level behind.
+    fifo_line: SpinLock<bool>,
+    /// `fifo_line`'s level, for checking without the lock.
+    fifo_asserted: AtomicBool,
+    /// When the refresh thread began the current frame (its retrace pulse),
+    /// in ns since `epoch`: STATUS reads vertical blank for 1 ms after it.
+    epoch: std::time::Instant,
+    frame_start: AtomicU64,
     /// CPU-side state and its lock. The display thread reads it unlocked
     /// (plain data, tearing tolerated).
     front_lock: SpinLock<()>,
@@ -322,6 +329,8 @@ pub struct Mgras {
     /// Annotated trace (`mgras trace`); `trace_mask` gates the hot paths.
     trace: SpinLock<debug::MgrasTrace>,
     trace_mask: AtomicU32,
+    pf_cfifo_level: crate::PfValue,
+    pf_fifo_intr: crate::PfLevel,
 }
 
 // SAFETY: `eng` is touched only by the HQ3 thread, `rss` only by the RSS
@@ -398,6 +407,10 @@ impl Mgras {
             addr_of_mut!((*p).kind).write(board);
             addr_of_mut!((*p).ioc).write(ioc);
             addr_of_mut!((*p).general).write(AtomicBool::new(false));
+            addr_of_mut!((*p).fifo_cfg).write(AtomicU32::new(0));
+            addr_of_mut!((*p).fifo_line).write(SpinLock::new(false));
+            addr_of_mut!((*p).fifo_asserted).write(AtomicBool::new(false));
+            addr_of_mut!((*p).epoch).write(std::time::Instant::now());
             addr_of_mut!((*p).front_lock).write(SpinLock::new(()));
             (*(*p).front.get()).init(board);
             addr_of_mut!((*p).unhandled).write(SpinLock::new(HashSet::new()));
@@ -449,6 +462,7 @@ impl Mgras {
         use crate::locks::{register_mutex_fn, register_spin};
         register_spin("mgras::submit", self, |m| &m.submit);
         register_spin("mgras::front", self, |m| &m.front_lock);
+        register_spin("mgras::fifo_line", self, |m| &m.fifo_line);
         register_spin("mgras::mem", self, |m| &m.mem);
         register_spin("mgras::mem_rec", self, |m| &m.mem_rec);
         register_spin("mgras::unhandled", self, |m| &m.unhandled);
@@ -753,24 +767,149 @@ impl Mgras {
     }
 
     /// Reads whose answer depends on what the engines have done wait for
-    /// them (bus busy) until the board is idle.
-    fn read_needs_idle(off: u32) -> bool {
-        matches!(off,
-            host::STATUS | host::FIFOSTATUS | host::GIOSTATUS | host::DMABUSY
-            | host::GE_READBACK_HI | host::GE_READBACK_LO
-            | host::RASTER_IF_CONTEXT..=0x50228 | host::DMA_CONTEXT..=0x504FF
-            | host::RASTER..=0x7FFFF)
+    /// them (bus busy): raster state for the raster engines too, HQ3 state
+    /// only for the HQ3. Status registers answer at once (`status_read`):
+    /// the drivers poll them with their own timeouts and sleep on the FIFO
+    /// interrupt when the board stays busy, so making the read itself wait
+    /// would hold the CPU in one load, often with interrupts masked.
+    fn read_wait(&self, off: u32) -> bool {
+        match off {
+            host::RASTER..=0x7FFFF => !self.idle(),
+            host::GE_READBACK_HI | host::GE_READBACK_LO
+            | host::RASTER_IF_CONTEXT..=0x50228 | host::DMA_CONTEXT..=0x504FF => !self.hq_idle(),
+            _ => false,
+        }
+    }
+
+    /// The HQ3 has run every command it was given.
+    fn hq_idle(&self) -> bool {
+        self.hq_fifo.is_empty() && !self.hq_busy.load(Ordering::Acquire)
+    }
+
+    /// The command FIFO's level as FIFOSTATUS reports it, in words. The
+    /// real CFIFO holds a few dozen; ours holds `HQ_FIFO_DEPTH`. As with
+    /// REX3's GFIFO, anything queued reads 1 until the queue is within
+    /// `CFIFO_WORDS` of really full, then the level climbs with it, so the
+    /// drivers' high-water handling starts only when a writer is about to
+    /// be held off for real.
+    fn cfifo_level(&self) -> u32 {
+        match self.hq_fifo.len() {
+            0 => 0,
+            n => (n.saturating_sub(HQ_FIFO_DEPTH - 1 - CFIFO_WORDS) as u32).clamp(1, CFIFO_WORDS as u32),
+        }
+    }
+
+    /// STATUS, FIFOSTATUS, GIOSTATUS and DMABUSY from the live state.
+    fn status_read(&self, off: u32) -> u32 {
+        let cfg = self.fifo_cfg.load(Ordering::Acquire);
+        let level = self.cfifo_level();
+        crate::pf_value!(self.pf_cfifo_level, crate::perfetto::events::MGRAS_CFIFO_LEVEL, level);
+        match off {
+            host::STATUS => {
+                let mut v = host::STATUS_FIXED | self.vblank();
+                if self.hq_idle() {
+                    v |= host::STATUS_HQ_IDLE;
+                }
+                if self.idle() {
+                    v |= host::STATUS_BOARD_IDLE;
+                }
+                if Self::cfifo_high(cfg, level) {
+                    v |= host::STATUS_CFIFO_HIGH;
+                }
+                if Self::cfifo_low(cfg, level) {
+                    v |= host::STATUS_CFIFO_LOW;
+                }
+                v
+            }
+            host::FIFOSTATUS => level | (cfg & 0x7F) << host::FIFOSTATUS_HIGH_SHIFT,
+            host::DMABUSY => {
+                let mut v = 0;
+                if !self.hq_fifo.is_empty() {
+                    v |= host::DMABUSY_CFIFO;
+                }
+                if self.hq_busy.load(Ordering::Acquire) {
+                    v |= host::DMABUSY_HIF;
+                }
+                if !self.rss_idle() {
+                    v |= host::DMABUSY_REIF;
+                }
+                v
+            }
+            _ => 0,
+        }
+    }
+
+    /// STATUS's vertical blank bit: the first 1 ms of the refresh thread's
+    /// frame, the time of the retrace pulse.
+    fn vblank(&self) -> u32 {
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        if now.wrapping_sub(self.frame_start.load(Ordering::Relaxed)) < 1_000_000 { host::STATUS_VBLANK } else { 0 }
+    }
+
+    /// Mark the start of a displayed frame (`vblank`).
+    fn begin_frame(&self) {
+        self.frame_start.store(self.epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// At or above the high-water mark (a mark of 0 is not programmed yet).
+    fn cfifo_high(cfg: u32, level: u32) -> bool {
+        let hw = cfg & 0x7F;
+        hw != 0 && level >= hw
+    }
+
+    /// Below the low-water mark.
+    fn cfifo_low(cfg: u32, level: u32) -> bool {
+        level < (cfg >> 8) & 0x7F
+    }
+
+    /// Take the FIFO interrupt's enables and marks from the registers
+    /// after the CPU wrote one of them.
+    fn sync_fifo_cfg(&self, f: &Front) {
+        const ENABLES: u32 = host::INTR_CFIFO_HIGH | host::INTR_CFIFO_LOW | host::INTR_DFIFO_HIGH | host::INTR_DFIFO_LOW;
+        let cfg = (f.hq.interrupt_enable & ENABLES)
+            | (f.hq.regs.get(host::CFIFO_HIGH_MARK) & 0x7F)
+            | (f.hq.regs.get(host::CFIFO_LOW_MARK) & 0x7F) << 8;
+        self.fifo_cfg.store(cfg, Ordering::Release);
+    }
+
+    /// Whether the FIFO line can change as the HQ3 drains the FIFO: a
+    /// low-water interrupt is enabled, or the line is up.
+    fn fifo_watched(&self) -> bool {
+        self.fifo_cfg.load(Ordering::Relaxed) & host::INTR_CFIFO_LOW != 0 || self.fifo_asserted.load(Ordering::Relaxed)
+    }
+
+    /// Bring the FIFO interrupt line (GIO interrupt 0) in line with the
+    /// command FIFO: asserted while an enabled water-mark condition holds.
+    /// The data FIFO is not modelled; it never fills.
+    fn refresh_fifo(&self) {
+        let want = |cfg: u32, level: u32| {
+            cfg & host::INTR_CFIFO_HIGH != 0 && Self::cfifo_high(cfg, level)
+                || cfg & host::INTR_CFIFO_LOW != 0 && Self::cfifo_low(cfg, level)
+        };
+        // Most calls change nothing: check without the lock first.
+        let level = self.cfifo_level();
+        if want(self.fifo_cfg.load(Ordering::Acquire), level) == self.fifo_asserted.load(Ordering::Acquire) {
+            return;
+        }
+        let mut line = self.fifo_line.lock();
+        let level = want(self.fifo_cfg.load(Ordering::Acquire), self.cfifo_level());
+        if *line != level {
+            *line = level;
+            self.fifo_asserted.store(level, Ordering::Release);
+            crate::pf_level!(self.pf_fifo_intr, crate::perfetto::events::MGRAS_FIFO_INTR, level);
+            self.set_line(Line::Fifo, level);
+        }
     }
 
     /// One read, with `submit` held. None means "busy, retry".
     fn read_locked(&self, off: u32, bits: u32) -> Option<u64> {
-        if Self::read_needs_idle(off) && !self.idle() {
+        if self.read_wait(off) {
             return None;
         }
-        // SAFETY (for both engines below): idle with `submit` held.
+        // SAFETY (for the engines below): what `read_wait` waited for is
+        // idle, with `submit` held.
         let v = match off {
-            host::STATUS => Front::status() as u64,
-            host::FIFOSTATUS | host::GIOSTATUS | host::DMABUSY => 0,
+            host::STATUS | host::FIFOSTATUS | host::GIOSTATUS | host::DMABUSY => self.status_read(off) as u64,
             host::SET_FLAGS | host::CLEAR_FLAGS | host::SET_FLAGS_PRIVILEGED | host::CLEAR_FLAGS_PRIVILEGED => {
                 self.all_flags(&self.front()) as u64
             }
@@ -859,11 +998,20 @@ impl Mgras {
             }
             0x80000..=0xFFFFF => self.note(format!("fast-path command window write at {off:#x}")),
             _ => {
-                if self.front().write(off, bits, val, &self.flags) {
+                let mut f = self.front();
+                if f.write(off, bits, val, &self.flags) {
                     self.dirty.store(true, Ordering::Release);
                 }
+                if matches!(off, host::INTERRUPT_ENABLE_SET | host::INTERRUPT_ENABLE_CLEAR | host::CFIFO_HIGH_MARK | host::CFIFO_LOW_MARK) {
+                    self.sync_fifo_cfg(&f);
+                    drop(f);
+                    self.refresh_fifo();
+                }
+                return true;
             }
         }
+        // A FIFO push: the level may have crossed a water mark.
+        self.refresh_fifo();
         true
     }
 
@@ -923,11 +1071,17 @@ impl Mgras {
         let mut sink = HqSink(self);
         let backoff = crossbeam_utils::Backoff::new();
         let pf_busy = crate::PfLevel::new();
+        let mut taken = 0u32;
         loop {
             let Some((t, val)) = self.hq_fifo.peek() else {
                 self.hq_fifo.flush_head();
                 self.hq_busy.store(false, Ordering::Release);
                 crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_HQ_BUSY, false);
+                // Drained: a low-water interrupt may be due (the kernel
+                // sleeps on one until the FIFO empties).
+                if self.fifo_watched() {
+                    self.refresh_fifo();
+                }
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {
@@ -949,6 +1103,12 @@ impl Mgras {
             }
             self.hq_fifo.consume();
             backoff.reset();
+            // The head is published every 64 entries; follow the level as
+            // it falls while the FIFO interrupt cares.
+            taken = taken.wrapping_add(1);
+            if taken % 64 == 0 && self.fifo_watched() {
+                self.refresh_fifo();
+            }
         }
         self.hq_fifo.consume();
         self.hq_fifo.flush_head();

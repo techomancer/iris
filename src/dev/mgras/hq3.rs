@@ -40,10 +40,43 @@ pub mod host {
     pub const RASTER: u32 = 0x7C000;
     pub const RASTER_END: u32 = 0x80000;
 
-    /// Status: raster idle and host idle, command and data FIFOs at or below
-    /// their low-water marks.
-    pub const STATUS_IDLE: u32 = 0x01 | 0x02 | 0x10 | 0x40;
+    /// Status bits, read live. The HQ3 has run every command (libGLcore
+    /// waits for this before a read DMA); the whole board has (glFinish
+    /// spins on it); vertical blank; the command FIFO at or above its
+    /// high-water mark, and below its low-water mark (the kernel's FIFO
+    /// interrupt handler polls these two). Bit 6 has always read set; its
+    /// meaning is not known.
+    pub const STATUS_HQ_IDLE: u32 = 0x01;
+    pub const STATUS_BOARD_IDLE: u32 = 0x02;
     pub const STATUS_VBLANK: u32 = 0x04;
+    pub const STATUS_CFIFO_HIGH: u32 = 0x08;
+    pub const STATUS_CFIFO_LOW: u32 = 0x10;
+    pub const STATUS_FIXED: u32 = 0x40;
+
+    /// FIFOSTATUS: command FIFO words in 6:0 (0x7F tells the kernel the
+    /// board is wedged), its high-water mark in 28:22.
+    pub const FIFOSTATUS_HIGH_SHIFT: u32 = 22;
+
+    /// DMABUSY bits the kernel polls until clear (MgrasFlushHQ3Poll):
+    /// host interface, command FIFO, raster interface.
+    pub const DMABUSY_HIF: u32 = 0x02;
+    pub const DMABUSY_CFIFO: u32 = 0x04;
+    pub const DMABUSY_REIF: u32 = 0x10;
+
+    /// The FIFO interrupt (GIO interrupt 0, MgrasFIFOInterrupt) enables in
+    /// INTERRUPT_ENABLE: command FIFO at/above high water, below low water;
+    /// the same for the data FIFO. The kernel enables the two high-water
+    /// ones (0x4400E200); when the FIFO stays high it blocks the writer and
+    /// swaps the command FIFO's high-water enable for the low-water one,
+    /// and MgrasFlushHQ3 sleeps on the low-water one (its mark set to the
+    /// level it waits for, plus one).
+    pub const INTR_CFIFO_HIGH: u32 = 1 << 26;
+    pub const INTR_CFIFO_LOW: u32 = 1 << 27;
+    pub const INTR_DFIFO_HIGH: u32 = 1 << 30;
+    pub const INTR_DFIFO_LOW: u32 = 1 << 31;
+    /// Command FIFO water marks, in words (6.5.22 programs 0x20 and 0x14).
+    pub const CFIFO_HIGH_MARK: u32 = 0x50020;
+    pub const CFIFO_LOW_MARK: u32 = 0x50024;
 
     /// Flag set by the "set flag" command (0xE04): DMA/sync completion.
     pub const FLAG_DONE: u32 = 1 << 16;
