@@ -792,11 +792,21 @@ impl Mgras {
     /// `CFIFO_WORDS` of really full, then the level climbs with it, so the
     /// drivers' high-water handling starts only when a writer is about to
     /// be held off for real.
+    ///
+    /// It reads 0 only once the whole board is idle, not when the HQ3 has
+    /// drained: on the board an empty CFIFO means the shallow pipe behind
+    /// it finishes within microseconds, and the kernel relies on that. It
+    /// flushes to level 0 before a buffer swap (an immediate DCB write)
+    /// and before a context switch, then polls DMABUSY for at most ~70 ms;
+    /// with our deep `rss_fifo` still drawing, swaps showed half-drawn
+    /// frames and the context switch failed ("FlushHQ (rss_sh) failed for
+    /// ctxsw").
     fn cfifo_level(&self) -> u32 {
-        match self.hq_fifo.len() {
-            0 => 0,
-            n => (n.saturating_sub(HQ_FIFO_DEPTH - 1 - CFIFO_WORDS) as u32).clamp(1, CFIFO_WORDS as u32),
+        if self.idle() {
+            return 0;
         }
+        let n = self.hq_fifo.len();
+        (n.saturating_sub(HQ_FIFO_DEPTH - 1 - CFIFO_WORDS) as u32).clamp(1, CFIFO_WORDS as u32)
     }
 
     /// STATUS, FIFOSTATUS, GIOSTATUS and DMABUSY from the live state.
@@ -1139,6 +1149,12 @@ impl Mgras {
                 self.rss_fifo.flush_head_at(id);
                 busy.store(false, Ordering::Release);
                 crate::pf_level!(pf_busy, crate::perfetto::events::MGRAS_RSS_BUSY, false);
+                // The board may have just gone idle: the command FIFO's
+                // level drops to 0 (`cfifo_level`), which a low-water
+                // interrupt may be waiting for.
+                if self.fifo_watched() {
+                    self.refresh_fifo();
+                }
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {

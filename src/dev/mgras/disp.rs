@@ -131,7 +131,9 @@ impl Mgras {
                 l1i_fetches: 0,
                 uncached: 0,
                 count_hz: 0,
-                gfifo_pending: 0,
+                // Both queues: the HQ3's usually drains at once, and the
+                // backlog waits in front of the raster engines.
+                gfifo_pending: self.hq_fifo.len() + self.rss_fifo.len(),
             };
             if last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
                 if let Some(rec) = self.mem_rec.lock().clone() {
