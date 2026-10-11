@@ -298,3 +298,43 @@ impl Device for LockMonitor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Uncontended lock/unlock cost: SpinLock (with holder tracking), the
+    /// bare flag it is built on, and parking_lot's Mutex.
+    /// `cargo test --release --lib spinlock_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn spinlock_cost() {
+        const N: u64 = 50_000_000;
+        let spin = SpinLock::new(0u64);
+        let pl = PLMutex::new(0u64);
+        let flag = AtomicBool::new(false);
+        let mut bare = 0u64;
+        for round in 0..2 {
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                *std::hint::black_box(&spin).lock() += 1;
+            }
+            let ts = t.elapsed().as_secs_f64() * 1e9 / N as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                *std::hint::black_box(&pl).lock() += 1;
+            }
+            let tp = t.elapsed().as_secs_f64() * 1e9 / N as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                let f = std::hint::black_box(&flag);
+                while f.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {}
+                bare += 1;
+                f.store(false, Ordering::Release);
+            }
+            let tb = t.elapsed().as_secs_f64() * 1e9 / N as f64;
+            println!("round {round}: SpinLock {ts:.2} ns, bare flag {tb:.2} ns, parking_lot {tp:.2} ns");
+        }
+        assert!(*spin.lock() == 2 * N && *pl.lock() == 2 * N && bare == 2 * N);
+    }
+}
