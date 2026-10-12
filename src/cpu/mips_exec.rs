@@ -14278,6 +14278,8 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn set_hw_read_fixup_replay(&self, f: Option<Vec<(u64, u8, u64)>>) -> Result<(), String>;
     /// CPU model name, as the guest and the benchmark report see it.
     fn model_name(&self) -> &'static str;
+    /// Cache model: "full" or "shadow" (`CpuModel::CACHE_KIND`).
+    fn cache_kind(&self) -> &'static str;
     fn set_cheritest_dump_hook(&self, on: bool);
     fn running_flag(&self) -> Arc<AtomicBool>;
     fn fasttick_count(&self) -> Arc<AtomicU64>;
@@ -14327,6 +14329,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
         MipsCpu::set_hw_read_fixup_replay(self, f)
     }
     fn model_name(&self) -> &'static str { C::NAME }
+    fn cache_kind(&self) -> &'static str { C::CACHE_KIND }
     fn set_cheritest_dump_hook(&self, on: bool) { MipsCpu::set_cheritest_dump_hook(self, on) }
     fn running_flag(&self) -> Arc<AtomicBool> { MipsCpu::running_flag(self) }
     fn fasttick_count(&self) -> Arc<AtomicU64> { Arc::clone(&self.fasttick_count) }

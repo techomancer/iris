@@ -31,7 +31,7 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
 use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -806,7 +806,12 @@ impl Machine {
         Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::cpu::mips_exec::CpuDevice>
         }}}
 
+        let shadow = cfg.machine.cache.is_shadow(cfg_cpu_model);
         let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
+            // R4400/R5000: the functional caches, or the shadow ones that
+            // keep only what CACHE instructions observe — see CacheModel.
+            crate::config::CpuModel::R4400 if shadow => build_cpu!(R4400ShadowCache),
+            crate::config::CpuModel::R5000 if shadow => build_cpu!(R5000ShadowCache),
             crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
             // IP28 uses the shadow cache: out of the data path entirely, with
@@ -1798,6 +1803,7 @@ impl Machine {
         manifest.nvram = Some(self.nvram_path.clone());
         // The CPU is a runtime choice now, so it is state the restore must match.
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
+        manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
 
@@ -1997,6 +2003,8 @@ impl Machine {
                     // no longer a build flag, so a mismatch is as fatal as a feature one.
                     if let Some(e) = crate::snapshot::cpu_model_mismatch(
                         m.cpu_model.as_deref(), self.cpu.model_name()) { fatal.push(e); }
+                    if let Some(e) = crate::snapshot::cache_model_mismatch(
+                        m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) { fatal.push(e); }
                     // Every recorded disk must still be configured at the same SCSI
                     // id with the same size. The host *path* is only where the file
                     // happens to live (it moves when disks are relocated, e.g. into a

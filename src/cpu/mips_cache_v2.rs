@@ -359,6 +359,44 @@ pub fn l2_data_ecc(v: u64) -> u8 {
         .fold(0, |ecc, (i, &m)| ecc | (((v & m).count_ones() & 1) as u8) << i)
 }
 
+/// R4400/R5000 Index_Store_Tag: the TagLo a later Index_Load_Tag returns,
+/// without its check bits. A tag is only as wide as its fields, so this is
+/// what a cache keeping raw TagLo words must store to read back what the
+/// full model does (see `CpuCache::cache_op`, which keeps them as fields):
+///
+/// - primary: PTag[31:8] and PState[7:6]. An invalid line keeps nothing. Any
+///   valid I-cache state reads back as 2; on the R5000, which has no Shared
+///   state, a stored 1 reads back as 2.
+/// - secondary (R4400): STag[31:13], SState[12:10] (reserved 1-3 read back as
+///   0), PIdx[9:7].
+pub fn r4k_store_taglo(r5k: bool, sel: u32, taglo: u32) -> u32 {
+    if matches!(sel, CACH_SI | CACH_SD) {
+        let state = match (taglo >> 10) & 7 { s @ 4..=7 => s, _ => 0 };
+        return (taglo & 0xFFFF_E000) | state << 10 | (taglo & 0x380);
+    }
+    let pstate = match (taglo >> 6) & 3 {
+        0 => return 0,
+        _ if sel == CACH_PI => 2,
+        1 if r5k => 2,
+        p => p,
+    };
+    (taglo & 0xFFFF_FF00) | pstate << 6
+}
+
+/// [`r4k_store_taglo`]'s word as Index_Load_Tag returns it: with the check
+/// bits the hardware generates (TagLo[0] P on a primary, TagLo[6:0] ECC on
+/// the R4400 secondary).
+pub fn r4k_load_taglo(r5k: bool, sel: u32, stored: u32) -> u32 {
+    if matches!(sel, CACH_SI | CACH_SD) {
+        let fields = (stored >> 10 & 7) << 22 | (stored >> 7 & 7) << 19 | stored >> 13;
+        return stored | l2_tag_ecc(fields);
+    }
+    let pstate = (stored >> 6) & 3;
+    let p = even_parity(stored >> 8)
+        ^ if r5k { 0 } else if sel == CACH_PI { (pstate != 0) as u32 } else { even_parity(pstate) };
+    stored | p
+}
+
 // L2 Cache Tag
 //   [31:25] ECC  - Error correction code; not stored, see `l2_tag_ecc`
 //   [24:22] CS   - Cache State (0=Invalid, 4=CleanExcl, 5=DirtyExcl, 6=Shared, 7=DirtyShared)
@@ -493,6 +531,10 @@ pub trait CpuModel: MipsCache {
     const VA_BITS: u32 = 40;
     /// Name as the guest and the benchmark report see it.
     const NAME: &'static str;
+    /// "full" for the model whose arrays loads, stores and fetches consult;
+    /// "shadow" for one that keeps only what CACHE ops observe. Recorded in
+    /// snapshots: a full cache's state does not load into a shadow one.
+    const CACHE_KIND: &'static str = "full";
     /// Cache ops 5/6/7 carry their R10000 meanings rather than their R4000 ones.
     /// The executor needs this: `Index_Store_Data` takes its value from TagLo
     /// and `Index_Load_Data` returns into it, neither of which is true of the

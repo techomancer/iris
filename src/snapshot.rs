@@ -74,6 +74,20 @@ pub fn cpu_model_mismatch(snapshot: Option<&str>, current: &str) -> Option<Strin
     }
 }
 
+/// `Some(reason)` if a snapshot taken with cache model `snapshot` cannot load
+/// into one running `current`. A full cache's state holds line data and dirty
+/// lines a shadow cache has nowhere to put, and a shadow snapshot has none of
+/// the tags a full cache would need, so the two never mix.
+///
+/// Manifests from before the choice existed carry no cache model; theirs was
+/// the only one for the CPU: shadow on the R10000 (named "shadow"), full
+/// otherwise.
+pub fn cache_model_mismatch(snapshot: Option<&str>, snapshot_cpu: Option<&str>, current: &str) -> Option<String> {
+    let snapshot = snapshot.unwrap_or(if snapshot_cpu == Some("shadow") { "shadow" } else { "full" });
+    (snapshot != current).then(|| format!(
+        "cache model differs: snapshot {snapshot} vs current {current} — set [machine] cache = \"{snapshot}\""))
+}
+
 /// Feature names older builds recorded that are no longer cargo features (the
 /// code they gated is now always built). Ignored when comparing a snapshot's
 /// recorded features against the running build.
@@ -126,6 +140,9 @@ pub struct Manifest {
     /// Emulated CPU at capture time. None for legacy manifests, and for those
     /// the check is skipped — the model was a build flag before it was config.
     pub cpu_model: Option<String>,
+    /// Cache model at capture time, `CpuModel::CACHE_KIND`: "full" or
+    /// "shadow". None for manifests from before it was a choice.
+    pub cpu_cache: Option<String>,
 }
 
 impl Manifest {
@@ -150,6 +167,7 @@ impl Manifest {
             disks: Vec::new(),
             nvram: None,
             cpu_model: None,
+            cpu_cache: None,
         }
     }
 
@@ -188,6 +206,9 @@ impl Manifest {
         }
         if let Some(cm) = &self.cpu_model {
             tbl.insert("cpu_model".into(), Value::String(cm.clone()));
+        }
+        if let Some(cc) = &self.cpu_cache {
+            tbl.insert("cpu_cache".into(), Value::String(cc.clone()));
         }
         if let Some(nv) = &self.nvram {
             tbl.insert("nvram".into(), Value::String(nv.clone()));
@@ -234,6 +255,7 @@ impl Manifest {
             .unwrap_or_default();
         let nvram = tbl.get("nvram").and_then(|x| x.as_str()).map(String::from);
         let cpu_model = tbl.get("cpu_model").and_then(|x| x.as_str()).map(String::from);
+        let cpu_cache = tbl.get("cpu_cache").and_then(|x| x.as_str()).map(String::from);
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -246,6 +268,7 @@ impl Manifest {
             disks,
             nvram,
             cpu_model,
+            cpu_cache,
         })
     }
 }
@@ -615,6 +638,7 @@ mod tests {
             disks: vec![DiskRef { id: 1, path: "irix53.raw".into(), size_bytes: 4294967296 }],
             nvram: Some("nvram-irix53.bin".into()),
             cpu_model: Some("R5000".into()),
+            cpu_cache: Some("shadow".into()),
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -645,6 +669,7 @@ mod tests {
             disks: vec![],
             nvram: None,
             cpu_model: None,
+            cpu_cache: None,
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -670,6 +695,19 @@ mod tests {
         assert!(e.contains("R4400") && e.contains("R5000"), "{}", e);
         assert!(e.contains(r#"cpu = "r4400""#), "must name the config fix: {}", e);
         assert!(cpu_model_mismatch(Some("R5000"), "R4400").is_some());
+    }
+
+    #[test]
+    fn cache_model_mismatch_is_fatal_and_legacy_means_the_old_default() {
+        assert!(cache_model_mismatch(Some("full"), Some("R4400"), "full").is_none());
+        assert!(cache_model_mismatch(Some("shadow"), Some("R5000"), "shadow").is_none());
+        assert!(cache_model_mismatch(Some("full"), Some("R4400"), "shadow").is_some());
+        assert!(cache_model_mismatch(Some("shadow"), Some("R4400"), "full").is_some());
+        // Before the choice: R4400/R5000 ran the full cache, the R10000 the shadow one.
+        assert!(cache_model_mismatch(None, Some("R4400"), "full").is_none());
+        assert!(cache_model_mismatch(None, Some("R4400"), "shadow").is_some());
+        assert!(cache_model_mismatch(None, Some("shadow"), "shadow").is_none());
+        assert!(cache_model_mismatch(None, None, "full").is_none());
     }
 
     /// The CPU model must survive a manifest round trip, and a legacy manifest

@@ -60,6 +60,8 @@ pub struct BenchOptions {
     /// Emulated CPU. Runtime config since 96e5ddd, so the in-process runner picks
     /// it like any other machine setting rather than needing its own build.
     pub cpu: CpuModel,
+    /// Cache model, as `[machine] cache`.
+    pub cache: crate::config::CacheModel,
     /// Set this to abort. The machine is stopped and `run` returns an error —
     /// there is no partial report, because the suite prints its block only at
     /// the end. Exists so an interactive caller's Stop button does something
@@ -74,6 +76,7 @@ impl Default for BenchOptions {
             label: "local".to_string(),
             banks: BENCH_BANKS,
             cpu: CpuModel::default(),
+            cache: crate::config::CacheModel::default(),
             timeout: Duration::from_secs(1800),
             cancel: None,
         }
@@ -146,10 +149,9 @@ fn run_inner(
     };
 
     let started = Instant::now();
-    let mut machine = Box::new(Machine::new_with_testdev(
-        bench_config(opts.banks, opts.cpu),
-        Some(testdev),
-    ));
+    let mut cfg = bench_config(opts.banks, opts.cpu);
+    cfg.machine.cache = opts.cache;
+    let mut machine = Box::new(Machine::new_with_testdev(cfg, Some(testdev)));
     // Deliberately no `register_system_controller`: it hands a raw pointer to
     // this Machine to a thread that outlives the call, and this one is dropped
     // when the run finishes. Nothing here needs `reset`/`save`/`load` anyway.

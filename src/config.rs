@@ -634,6 +634,40 @@ impl CpuModel {
     }
 }
 
+/// How the CPU's caches are modelled. A runtime choice: each is its own
+/// monomorphisation, picked when the machine is built.
+///
+/// - `full`: the functional caches (`mips_cache_v2`): tags, line data, LRU,
+///   write-back, VCE. What the interpreter is fastest with, since its decoded
+///   instructions live in the cache lines.
+/// - `shadow`: memory is the only store; tag arrays exist only to answer
+///   CACHE instructions (`mips_cache_shadow`). jitv2's inline loads and stores
+///   need no tag check against it.
+/// - `auto`: `shadow` in a `jitv2` build, `full` otherwise.
+///
+/// The R10000 (IP28) only has the shadow model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "lower")]
+pub enum CacheModel {
+    #[default]
+    Auto,
+    Full,
+    Shadow,
+}
+
+impl CacheModel {
+    /// Whether `cpu` runs the shadow cache under this setting.
+    pub fn is_shadow(self, cpu: CpuModel) -> bool {
+        match (cpu, self) {
+            (CpuModel::R10000, _) => true,
+            (_, Self::Full) => false,
+            (_, Self::Shadow) => true,
+            (_, Self::Auto) => cfg!(feature = "jitv2"),
+        }
+    }
+}
+
 /// `[machine]` section — platform identity (not performance knobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -642,11 +676,13 @@ pub struct MachineSection {
     pub profile: MachineProfile,
     #[serde(default)]
     pub cpu: CpuModel,
+    #[serde(default)]
+    pub cache: CacheModel,
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: CpuModel::default() }
+        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default() }
     }
 }
 
@@ -1651,6 +1687,12 @@ pub struct Cli {
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<CpuModel>,
 
+    /// Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`),
+    /// `full` or `shadow`. Overrides `[machine] cache`. The R10000 is always
+    /// `shadow`.
+    #[arg(long = "cache", value_name = "MODEL")]
+    pub cache: Option<CacheModel>,
+
     /// Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`).
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
     pub graphics: Option<GraphicsBoard>,
@@ -1780,6 +1822,7 @@ impl Cli {
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
+        if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = b; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }

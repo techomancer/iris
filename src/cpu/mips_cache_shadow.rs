@@ -33,8 +33,8 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
-    cache_op_name, CpuModel, FetchInstrResult, MipsCache, C_ILT, C_IST, C_R10K_CBARRIER,
-    C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
+    C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
 use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 use crate::traits::{BusDevice, BusRead64};
@@ -86,8 +86,9 @@ impl Shadow {
 /// nothing, because the way that is read is never the way that was written.
 const MRU_BIT: u64 = 1 << 63;
 
-/// Ways per set, as CACHE index operations address them. Bit 0 of the index
-/// selects the way on an R10000; the set starts above the line offset.
+/// R10000 only: ways per set, as CACHE index operations address them. Bit 0
+/// of the index selects the way; the set starts above the line offset. The
+/// R4400 and R5000 index differently — see `tag_slot`.
 const WAYS: usize = 2;
 
 /// Bits a secondary-cache tag retains.
@@ -122,6 +123,10 @@ fn l2_op_log(bit: u32) -> bool {
 ///
 /// Const parameters carry the geometry that software can read back, and the
 /// processor identity. Nothing here affects the speed of a load.
+///
+/// `MODEL` is `mips_cache_v2::model`, as for `CpuCache`, and decides
+/// everything shape cannot: how a CACHE index op picks its line and way, what
+/// a tag keeps, and the R10000's MRU bit, data arrays and op encodings.
 pub struct ShadowCache<
     const IC_SIZE: usize,
     const IC_LINE: usize,
@@ -133,7 +138,7 @@ pub struct ShadowCache<
     const PRID: u32,
     const FIR: u32,
     const TLB_ENTRIES: usize,
-    const R10K_OPS: bool,
+    const MODEL: u8,
 > {
     downstream: Arc<dyn BusDevice>,
     llbit: UnsafeCell<bool>,
@@ -164,26 +169,28 @@ pub struct ShadowCache<
 unsafe impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > Send
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
 }
 unsafe impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > Sync
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
 }
 
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
-    > ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
+    > ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
+    const R10K: bool = MODEL == model::R10000;
+    const R5K: bool = MODEL == model::R5000;
     const IC_LINES: usize = if IC_LINE == 0 { 0 } else { IC_SIZE / IC_LINE };
     const DC_LINES: usize = if DC_LINE == 0 { 0 } else { DC_SIZE / DC_LINE };
     const L2_LINES: usize = if L2_LINE == 0 { 0 } else { L2_SIZE / L2_LINE };
@@ -198,9 +205,10 @@ impl<
             ecc_out: UnsafeCell::new(0),
             ic: UnsafeCell::new(Shadow::new(Self::IC_LINES, 0)),
             dc: UnsafeCell::new(Shadow::new(Self::DC_LINES, 0)),
-            // Only the secondary keeps a data shadow: it is the one a PROM
-            // walks with Index_Store_Data, and a 1 MB array is cheap once.
-            l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, L2_SIZE / 8)),
+            // Only the R10000 secondary keeps a data shadow: it is the one
+            // the IP28 PROM walks with Index_Store_Data, and a 1 MB array is
+            // cheap once. The R4000 family has no index data ops.
+            l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
             #[cfg(feature = "tcache")]
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             #[cfg(feature = "tcache")]
@@ -232,6 +240,10 @@ impl<
     /// line granularity — made the two ways of a set alias onto one slot, so
     /// a tag written to way 1 overwrote way 0 and the PROM read back the
     /// wrong one. That is the whole of the "TAG walking 1s" failure.
+    ///
+    /// That is the R10000. The R4400 is direct-mapped throughout: the index
+    /// is the set. The R5000's 2-way primaries take the way from VA[14], above
+    /// the 16 KB a way spans (VR5000 UM 3.4), as `CpuCache` does.
     fn tag_slot(&self, sel: u32, virt_addr: u64) -> usize {
         let (line, lines) = match sel {
             CACH_PI => (IC_LINE, Self::IC_LINES),
@@ -240,6 +252,14 @@ impl<
         };
         if line == 0 || lines == 0 {
             return 0;
+        }
+        if !Self::R10K {
+            let va = virt_addr as usize;
+            if Self::R5K && matches!(sel, CACH_PI | CACH_PD) {
+                let sets = lines / 2;
+                return ((va >> 14) & 1) * sets + (va / line) % sets;
+            }
+            return (va / line) % lines;
         }
         let way = (virt_addr as usize) & (WAYS - 1);
         let set = ((virt_addr as usize) / line) % (lines / WAYS).max(1);
@@ -264,9 +284,9 @@ impl<
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > From<Arc<dyn BusDevice>>
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
@@ -276,9 +296,9 @@ impl<
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > CpuModel
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = PRID;
@@ -287,17 +307,26 @@ impl<
     // The R10000 implements 44 virtual address bits where the R4x00 implements
     // 40; the shadow cache is only used for it, but key this off the same flag
     // that selects its cache encodings rather than asserting it unconditionally.
-    const VA_BITS: u32 = if R10K_OPS { 44 } else { 40 };
-    const NAME: &'static str = "shadow";
-    const R10K_CACHE_OPS: bool = R10K_OPS;
+    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
+    // The CPU's name, which snapshots check: the same as the full model's, so
+    // a mismatch reads as a cache-kind difference rather than a different CPU.
+    // The R10000 keeps its historical "shadow", which existing IP28
+    // snapshots carry.
+    const NAME: &'static str = match MODEL {
+        model::R4400 => "R4400",
+        model::R5000 => "R5000",
+        _ => "shadow",
+    };
+    const CACHE_KIND: &'static str = "shadow";
+    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
 }
 
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > MipsCache
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
     const IC_SIZE: usize = IC_SIZE;
     const IC_LINE: usize = IC_LINE;
@@ -418,6 +447,22 @@ impl<
                 cache_op_name(cache_op));
         }
 
+        // R4400/R5000: a tag keeps only its fields, and reads back with
+        // generated check bits — exactly what the full model returns.
+        if !Self::R10K && matches!(op, C_IST | C_ILT) {
+            let lines = match sel { CACH_PI => Self::IC_LINES, CACH_PD => Self::DC_LINES, _ => Self::L2_LINES };
+            if lines == 0 {
+                return 0; // no secondary on the R5000
+            }
+            let idx = self.tag_slot(sel, virt_addr);
+            let s = self.shadow(sel);
+            if op == C_IST {
+                s.tags[idx] = r4k_store_taglo(Self::R5K, sel, phys_addr as u32) as u64;
+                return 0;
+            }
+            return r4k_load_taglo(Self::R5K, sel, s.tags[idx] as u32) as u64;
+        }
+
         match op {
             // Index_Store_Tag / Index_Load_Tag. Stored and returned verbatim:
             // a tag test is a round trip, and round trips do not require
@@ -461,8 +506,8 @@ impl<
             }
 
             // R10000 reassigns 5/6/7, scoped to particular cache selects.
-            C_R10K_CBARRIER if R10K_OPS && sel == CACH_PI => 0,
-            C_R10K_ILD if R10K_OPS && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
+            C_R10K_CBARRIER if Self::R10K && sel == CACH_PI => 0,
+            C_R10K_ILD if Self::R10K && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                 let s = self.shadow(sel);
                 let slot = self.data_slot(s.data.len(), virt_addr);
                 if s.data.is_empty() {
@@ -476,7 +521,7 @@ impl<
                     s.data[slot]
                 }
             }
-            C_R10K_ISD if R10K_OPS && matches!(sel, CACH_SI | CACH_SD) => {
+            C_R10K_ISD if Self::R10K && matches!(sel, CACH_SI | CACH_SD) => {
                 let s = self.shadow(sel);
                 let slot = self.data_slot(s.data.len(), virt_addr);
                 if !s.data.is_empty() {
@@ -543,7 +588,19 @@ impl<
 /// Nothing of the microarchitecture: no ways, no LRU, no out-of-order.
 /// Reports revision 2.5, matching R10000Cache and enabling the IP28 boot tune.
 pub type R10000ShadowCache =
-    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, true>;
+    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
+/// SGI Indy / Indigo2 R4400: the full model's geometry and identity — 16 KB
+/// direct-mapped primaries with 16-byte lines, a 1 MB secondary with 128-byte
+/// lines, PRId/FIR, 48 TLB entries, MIPS III — so CP0 Config and a PROM's
+/// cache sizing see the same part. `shadow_matches_the_full_models` pins it.
+pub type R4400ShadowCache =
+    ShadowCache<16384, 16, 16384, 16, 1048576, 128, false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }>;
+
+/// SGI Indy R5000: 2-way 32 KB primaries with 32-byte lines, no secondary,
+/// MIPS IV, the full model's PRId/FIR and TLB.
+pub type R5000ShadowCache =
+    ShadowCache<32768, 32, 32768, 32, 0, 128, true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }>;
 
 #[cfg(test)]
 mod tests {
@@ -729,6 +786,54 @@ mod tests {
         assert_eq!(c.get_config(CACH_PI), (32768, 64));
         assert_eq!(c.get_config(CACH_PD), (32768, 32));
         assert_eq!(c.get_config(CACH_SD), (1048576, 128));
+    }
+
+    /// The R4400 and R5000 shadows stand in for the full models, so everything
+    /// software can read — CP0 Config geometry, PRId/FIR, ISA level, TLB size,
+    /// the name snapshots check — must be the full model's.
+    #[test]
+    fn shadow_matches_the_full_models() {
+        use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
+        fn same<S: CpuModel, F: CpuModel>() {
+            assert_eq!((S::IC_SIZE, S::IC_LINE, S::DC_SIZE, S::DC_LINE, S::L2_SIZE, S::L2_LINE),
+                       (F::IC_SIZE, F::IC_LINE, F::DC_SIZE, F::DC_LINE, F::L2_SIZE, F::L2_LINE), "geometry");
+            assert_eq!((S::PRID, S::FIR, S::MIPS4, S::TLB_ENTRIES, S::VA_BITS, S::R10K_CACHE_OPS),
+                       (F::PRID, F::FIR, F::MIPS4, F::TLB_ENTRIES, F::VA_BITS, F::R10K_CACHE_OPS), "identity");
+            assert_eq!(S::NAME, F::NAME, "snapshot name");
+            assert_eq!((S::CACHE_KIND, F::CACHE_KIND), ("shadow", "full"));
+        }
+        same::<R4400ShadowCache, R4400Cache>();
+        same::<R5000ShadowCache, R5000Cache>();
+        assert_eq!(<R10000ShadowCache as CpuModel>::NAME, "shadow", "existing IP28 snapshots");
+    }
+
+    /// Index_Store_Tag then Index_Load_Tag returns exactly what the full model
+    /// returns, for random TagLo words at random indexes: the shadow must not
+    /// be observably different to a PROM, IDE or IRIX reading tags. Both
+    /// caches start with every tag invalid, so a store followed by a load is
+    /// the whole of what software can see.
+    #[test]
+    fn tags_read_back_as_the_full_model_does() {
+        use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
+        fn check<S: MipsCache + From<Arc<dyn BusDevice>>, F: MipsCache + From<Arc<dyn BusDevice>>>(
+            name: &str, sels: &[u32]) {
+            let mem = || -> Arc<dyn BusDevice> { Arc::new(Memory::new(1)) };
+            let (shadow, full) = (S::from(mem()), F::from(mem()));
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            for _ in 0..20_000 {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                let sel = sels[(x >> 60) as usize % sels.len()];
+                let index = 0x8000_0000 | (x >> 20 & 0xF_FFF8);
+                let taglo = x as u32 as u64;
+                shadow.cache_op(C_IST | sel, index, taglo);
+                full.cache_op(C_IST | sel, index, taglo);
+                let probe = 0x8000_0000 | (x >> 40 & 0xF_FFF8);
+                assert_eq!(shadow.cache_op(C_ILT | sel, probe, probe), full.cache_op(C_ILT | sel, probe, probe),
+                           "{name}: sel {sel} TagLo {taglo:#x} stored at {index:#x}, loaded at {probe:#x}");
+            }
+        }
+        check::<R4400ShadowCache, R4400Cache>("R4400", &[CACH_PI, CACH_PD, CACH_SD]);
+        check::<R5000ShadowCache, R5000Cache>("R5000", &[CACH_PI, CACH_PD]);
     }
 
     /// Under tcache the JIT serves this model through the window alone, and
