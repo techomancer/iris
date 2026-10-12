@@ -32,7 +32,7 @@ why `auto` keeps the full cache there.
 `mem/latency_dram` and `mem/random` (×0.7) did not obviously fit that pattern;
 both recovered once the shadow read RAM through the ppmem window (below).
 
-## Decode cache and ppmem window (`decode-cache`)
+## Decode cache and ppmem window (always on)
 
 `src/cpu/decode_cache.rs`: decoded instructions by physical page, plugged into
 `ShadowCache::fetch` only, never touching the shadow's tag arrays. The shadow

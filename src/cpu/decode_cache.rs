@@ -1,4 +1,4 @@
-//! Decoded-instruction cache for the shadow cache (`decode-cache`).
+//! Decoded-instruction cache for the shadow cache.
 //!
 //! The full cache model keeps decoded instructions in its cache lines, so the
 //! interpreter decodes each instruction once per fill. The shadow cache has no

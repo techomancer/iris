@@ -36,7 +36,6 @@ use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
     C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
-use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
@@ -143,8 +142,6 @@ pub struct ShadowCache<
     downstream: Arc<dyn BusDevice>,
     llbit: UnsafeCell<bool>,
     lladdr: UnsafeCell<u32>,
-    /// Somewhere to decode into. Not a cache line — there is no caching.
-    fetch_scratch: UnsafeCell<DecodedInstr>,
     /// CP0 ECC on the way in to a store, and on the way out of a load.
     ecc_in: UnsafeCell<u32>,
     ecc_out: UnsafeCell<u32>,
@@ -162,7 +159,6 @@ pub struct ShadowCache<
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
     /// Decoded instructions, by physical page. Never touches the shadow
     /// arrays above — see `decode_cache`.
-    #[cfg(feature = "decode-cache")]
     decode: UnsafeCell<crate::cpu::decode_cache::DecodeCache>,
 }
 
@@ -202,7 +198,6 @@ impl<
             downstream,
             llbit: UnsafeCell::new(false),
             lladdr: UnsafeCell::new(0),
-            fetch_scratch: UnsafeCell::new(DecodedInstr::default()),
             ecc_in: UnsafeCell::new(0),
             ecc_out: UnsafeCell::new(0),
             ic: UnsafeCell::new(Shadow::new(Self::IC_LINES, 0)),
@@ -215,7 +210,6 @@ impl<
             tc_bitmap: UnsafeCell::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
-            #[cfg(feature = "decode-cache")]
             decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
         }
     }
@@ -401,28 +395,16 @@ impl<
 
     #[inline(always)]
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
-        #[cfg(feature = "decode-cache")]
-        {
-            let dc = unsafe { &mut *self.decode.get() };
-            let word = |a: u32| {
-                let r = self.downstream.read32(a);
-                if r.is_ok() { Ok(r.data) } else { Err(r.status) }
-            };
-            let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, *self.tc_bitmap.get()) };
-            return match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
-                Ok(p) => FetchInstrResult::hit(p),
-                Err(status) => FetchInstrResult::exception(status),
-            };
-        }
-        #[allow(unreachable_code)]
-        let r = self.downstream.read32(phys_addr as u32);
-        if r.is_ok() {
-            let slot = unsafe { &mut *self.fetch_scratch.get() };
-            slot.flags = FLAG_NOT_DECODED;
-            slot.raw = r.data;
-            FetchInstrResult::hit(slot as *const DecodedInstr)
-        } else {
-            FetchInstrResult::exception(r.status)
+        // Decoded instructions by physical page — see `decode_cache`.
+        let dc = unsafe { &mut *self.decode.get() };
+        let word = |a: u32| {
+            let r = self.downstream.read32(a);
+            if r.is_ok() { Ok(r.data) } else { Err(r.status) }
+        };
+        let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, *self.tc_bitmap.get()) };
+        match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
+            Ok(p) => FetchInstrResult::hit(p),
+            Err(status) => FetchInstrResult::exception(status),
         }
     }
 
@@ -634,14 +616,12 @@ impl<
             s.tags.fill(0);
             s.mru.fill(false);
         }
-        #[cfg(feature = "decode-cache")]
         unsafe { (*self.decode.get()).flush() };
     }
 
     /// A restore replaces RAM wholesale; drop every decoded instruction. The
     /// shadow arrays are not snapshotted (nothing reads them but diagnostics).
     fn load_cache_state(&self, _v: &toml::Value) -> Result<(), String> {
-        #[cfg(feature = "decode-cache")]
         unsafe { (*self.decode.get()).flush() };
         Ok(())
     }

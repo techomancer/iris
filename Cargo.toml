@@ -165,12 +165,8 @@ tcache_verify = ["tcache"]
 # sync on every exception, so it is off by default.
 cache-ecc = []
 # Decoded-instruction cache for the shadow cache (src/cpu/decode_cache.rs).
-# The shadow keeps no cache lines, so without it the interpreter decodes every
-# instruction on every fetch — about half speed. Keyed by physical page and
-# exactly coherent with memory: each fetch re-reads the word through ppmem's
-# window and reuses the decode only if it is unchanged. Affects only
-# `--cache shadow`; the full cache keeps its decodes in its lines. Implied by
-# jitv2, whose `auto` cache is the shadow.
+# Always built now; this flag does nothing and is kept so command lines that
+# still pass `--features decode-cache` keep working.
 decode-cache = []
 default = ["tlbvmap", "rexdiag"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
@@ -183,7 +179,7 @@ gpujit = ["rex-jit", "gr4-jit"]
 # JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
 # Unconditionally-correct-at-publish redesign, replacing the speculative v1
 # tiered JIT (removed). Whole-page compilation implies transparent caching.
-jitv2 = ["tcache", "decode-cache", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
+jitv2 = ["tcache", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
 # jitv2 opcode fusion: LUI+ORI/ADDIU (32-bit immediate materialization) and
 # branch/jump+NOP delay-slot collapsing, jitv2's counterparts to the
 # interpreter's `opcodefusion` feature. OFF by default (unlike the
