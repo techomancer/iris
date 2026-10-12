@@ -109,11 +109,16 @@ pub fn register() {
 /// Never from glGenTextures. An old GL program names its textures itself --
 /// Quake binds 1, 2, 3 and so on without ever generating a name, which GL 1
 /// allows -- and glGenTextures hands out exactly those small numbers to
-/// whoever asks first. Names from a high range no program picks by hand cannot
-/// collide, and a program that does generate names is still given ones the
-/// host knows are free.
+/// whoever asks first. Names no program picks by hand cannot collide.
+///
+/// They count down from the very top, because a program that does generate
+/// names must not be handed ours. Apple's GL gives out the lowest free name;
+/// Mesa gives out one above the highest in use, so after a name of ours at
+/// 0x7F000000 it handed the program 0x7F000001 -- the next one we took. With
+/// ours at the top there is no "one above", and Mesa goes back to the lowest
+/// free name too.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn internal_texture_name() -> u32 {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x7F00_0000);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    NEXT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
 }
