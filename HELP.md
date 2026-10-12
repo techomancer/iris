@@ -35,7 +35,7 @@ emulating the Indy.
 
 The **iris-gui status bar MIPS** figure (or the CLI window title `MIPS` readout)
 is **real throughput**: MIPS instructions executed per wall-clock second on the
-host. `lightning` builds and the JIT stack (`--features jitv2,rex-jit`) give
+host. `lightning` builds and the JIT stack (`--features jitv2,gpujit`) give
 higher MIPS; the hinv MHz string stays the same.
 
 The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at

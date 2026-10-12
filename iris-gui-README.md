@@ -28,7 +28,7 @@ cargo run -p iris-gui --release
 
 The first build compiles libchdman-rs, the camera backends (nokhwa / V4L),
 and Cranelift. CHD and camera support are unconditional in the core; iris-gui
-also enables `rex-jit`. Device use is configured at runtime.
+also enables `gpujit` (the REX3 and IMPACT graphics JITs). Device use is configured at runtime.
 
 A debug build (`cargo run -p iris-gui` without `--release`) is fine for
 iterating on the GUI itself but uses an unoptimized iris core, which means
@@ -338,7 +338,7 @@ iris/
 ├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall; iris-hostgl excluded
 ├── src/               iris library + CLI
 └── iris-gui/
-    ├── Cargo.toml     depends on iris with rex-jit; CHD/camera built into core
+    ├── Cargo.toml     depends on iris with gpujit; CHD/camera built into core
     ├── build.rs       APP_VERSION (from RELEASE_VERSION or the crate version)
     ├── assets/        icons, default NVRAM
     └── src/

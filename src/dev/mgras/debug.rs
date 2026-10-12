@@ -531,6 +531,9 @@ impl Mgras {
             [] => None,
             _ => return Err("usage: mgras jit [on|off|sync|list]".into()),
         };
+        if mode.is_some_and(|m| m != MODE_OFF) && rss_jit::forbidden() {
+            return Err("mgras jit: IRIS_NO_JIT is set (this host does not allow JIT code)".into());
+        }
         if let Some(m) = mode {
             // The RSS thread reads the mode: change it with the board idle.
             let _sub = self.submit.lock();

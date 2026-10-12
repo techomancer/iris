@@ -32,11 +32,11 @@
 #
 # ── What ships ────────────────────────────────────────────────────────────────
 #
-# One build variant per platform/arch: lightning + rex-jit + camera + chd.
+# One build variant per platform/arch: lightning + gpujit + camera + chd.
 #
 # It is a lightning build (interpreter with breakpoint checks and the traceback
-# buffer stripped — no interactive debugging) and carries the REX3 draw-shader
-# JIT. It does not carry the experimental MIPS JIT (`jitv2`) or the N64 dev
+# buffer stripped — no interactive debugging) and carries the graphics JITs
+# (`gpujit`: REX3 draw shaders, IMPACT raster pipelines). It does not carry the experimental MIPS JIT (`jitv2`) or the N64 dev
 # board (`ultra64`); those are source-build opt-ins (see iris-gui/Cargo.toml).
 # (The v1 MIPS JIT, `jit`, was removed from the tree in 33c4e68.) The
 # former "standard" (non-lightning), `pcap`, `-jitv2`, and separate `-r5000`
@@ -214,11 +214,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
             arch: x64
             runs-on: windows-latest
-            cli_features: "rex-jit,lightning"
+            cli_features: "gpujit,lightning"
           - target: aarch64-pc-windows-msvc
             arch: arm64
             runs-on: windows-11-arm
-            cli_features: "rex-jit,lightning"
+            cli_features: "gpujit,lightning"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -383,8 +383,8 @@ jobs:
       - name: Build all binaries
         run: |
           cargo build --release --target ${{ matrix.target }} -p iris-gui --features iris/lightning,bundled
-          cargo build --release --bin iris --target ${{ matrix.target }} --features rex-jit,lightning
-          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features rex-jit,lightning
+          cargo build --release --bin iris --target ${{ matrix.target }} --features gpujit,lightning
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features gpujit,lightning
 
       # ── Code signing setup ──────────────────────────────────────────────────
 
@@ -522,7 +522,7 @@ jobs:
 
             if [ "$IDENTITY" != "-" ]; then
               # See the GUI bundle signing above: the JIT entitlement keeps the
-              # notarized CLI binaries (built with rex-jit) from being killed by
+              # notarized CLI binaries (built with gpujit) from being killed by
               # the hardened runtime on their first JITed REX3 draw.
               codesign --force --options runtime --timestamp \
                 --entitlements installer/iris-gui-notarized.entitlements \
@@ -808,8 +808,8 @@ jobs:
 
       - name: Build iris CLI and iris-ci
         run: |
-          cargo build --release --bin iris --target ${{ matrix.target }} --features rex-jit,lightning
-          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features rex-jit,lightning
+          cargo build --release --bin iris --target ${{ matrix.target }} --features gpujit,lightning
+          cargo build --release --bin iris-ci --target ${{ matrix.target }} --features gpujit,lightning
 
       - name: Package Core tarball
         run: |
@@ -935,8 +935,8 @@ jobs:
       - name: Build iris CLI + iris-ci (cross)
         run: |
           set -eux
-          cargo build --release --bin iris --target "$TARGET" --features rex-jit,lightning
-          cargo build --release --bin iris-ci --target "$TARGET" --features rex-jit,lightning
+          cargo build --release --bin iris --target "$TARGET" --features gpujit,lightning
+          cargo build --release --bin iris-ci --target "$TARGET" --features gpujit,lightning
 
       # The release profile keeps debug info (debug = 1) and the host `strip`
       # can't read a riscv64 ELF, so strip iris-gui with the cross strip here and

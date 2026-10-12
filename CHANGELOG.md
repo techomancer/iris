@@ -42,8 +42,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
-- **`gpujit` turns on every graphics JIT** (`rex-jit` and `gr4-jit`):
-  `--features lightning,gpujit`.
+- **`gpujit` turns on every graphics JIT** (`rex-jit` and `gr4-jit`) and is
+  the recommended build: `--features lightning,gpujit`. The GUI and the
+  release binaries now carry it, so IMPACT gets its raster JIT out of the
+  box. `IRIS_NO_JIT` now turns the IMPACT JIT off too (and `mgras jit on`
+  refuses), which keeps the Mac App Store build interpreter-only.
 - **`gr2 trace` and `mgras trace` need `gputrace`, like `rex trace`.** On with
   `developer`; plain and `lightning` builds add `--features gputrace`.
   Without it the per-access trace check on GR2 and IMPACT register reads

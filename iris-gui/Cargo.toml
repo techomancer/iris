@@ -84,10 +84,12 @@ hostcall = ["iris/hostcall"]
 hostgl = ["hostcall", "iris/hostgl"]
 
 [dependencies]
-# The GUI always enables REX3 shader compilation. CHD, camera, DaynaPort,
-# and Ultra64 device support are unconditional in the core and selected at
-# runtime; Ultra64 requires an external gopher64 bridge peer.
-iris = { path = "..", features = ["rex-jit"] }
+# The GUI always enables the graphics JITs (`gpujit`: REX3 draw shaders and
+# IMPACT raster pipelines); the `appstore` build turns both off at run time
+# with IRIS_NO_JIT. CHD, camera, DaynaPort, and Ultra64 device support are
+# unconditional in the core and selected at runtime; Ultra64 requires an
+# external gopher64 bridge peer.
+iris = { path = "..", features = ["gpujit"] }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"
 crossbeam-channel = "0.5"

@@ -41,7 +41,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
-| `gpujit` | Every graphics JIT, so one name covers both. | `rex-jit`, `gr4-jit` |
+| `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit` |
 | `jitv2` | Experimental whole-page MIPS compiler; implies transparent caching. | `tcache`, `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `target-lexicon`, `region`, `wasmtime-jit-icache-coherence` |
 | `jitv2_opcodefusion` | Optional JIT fusion, off by default after live delay-slot failures. | `jitv2` |
 | `j2wp` | Compatibility alias for `jitv2`; no separate compiler mode. | `jitv2` |
@@ -53,15 +53,15 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 
 Cargo also exposes these **implicit optional-dependency features**:
 `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `region`, `target-lexicon`, `wasmtime-jit-icache-coherence`. They enable library dependencies,
-not complete emulator capabilities; use `jitv2` or `rex-jit` for a working
+not complete emulator capabilities; use `jitv2` or `gpujit` for a working
 compiler configuration. `dep:` entries above suppress implicit feature names
 for PCAP/host-service dependencies.
 
 ### iris-gui
 
 Source: [iris-gui/Cargo.toml](iris-gui/Cargo.toml). There is no GUI-specific
-default feature bundle. Its `iris` dependency always enables `rex-jit` and
-retains the core default features. GUI `--no-default-features` alone does not
+default feature bundle. Its `iris` dependency always enables `gpujit` (the
+App Store build turns the JITs off at run time with `IRIS_NO_JIT`) and retains the core default features. GUI `--no-default-features` alone does not
 turn off those dependency defaults.
 
 | GUI feature | Purpose | Enables |
@@ -443,7 +443,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_NO_IDLE` | Any presence disables idle parking. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
-| `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
+| `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT and the IMPACT raster JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_OPT_SPEED` | Presence selects speed optimization in offline PCP/corpus measurements. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
 | `IRIS_PRINT_OFFSETS` | Presence runs the opt-in layout-offset print test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
@@ -471,10 +471,10 @@ both crates; these examples and implementation notes explain the tradeoffs.
 
 Build variants:
 ```
-cargo run --release --features lightning,rex-jit     # recommended for best speed
+cargo run --release --features lightning,gpujit      # recommended for best speed
 cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
-cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
-cargo run --release --features jitv2,rex-jit         # MIPS JIT v2 (experimental; see "JIT compilers")
+cargo run --release --features gpujit                # enable the graphics JITs (rex-jit + gr4-jit)
+cargo run --release --features jitv2,gpujit          # MIPS JIT v2 (experimental; see "JIT compilers")
 cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
 cargo run --release --features ci_clock              # synthetic deterministic CP0 Count clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
@@ -575,7 +575,7 @@ JIT v2 section for tuning. (The original speculative, tiered MIPS JIT was
 removed in August 2026; jitv2 replaces it.)
 
 ```
-cargo run --release --features jitv2,rex-jit
+cargo run --release --features jitv2,gpujit
 ```
 
 What it does today: compiles on a pool of background threads (`[jitv2]

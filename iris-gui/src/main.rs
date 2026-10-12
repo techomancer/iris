@@ -146,7 +146,7 @@ fn main() -> eframe::Result<()> {
         std::env::set_var("IRIS_CHD_DIFF_DIR", d.join("iris").join("chd-diffs"));
     }
     // Force the interpreter on the Mac App Store build. Cranelift (MIPS JIT and
-    // the always-on REX3 draw-shader JIT) allocates executable memory with
+    // the always-on REX3 draw-shader and IMPACT raster JITs) allocates executable memory with
     // mmap+mprotect, not MAP_JIT. The App Sandbox only permits MAP_JIT pages
     // (com.apple.security.cs.allow-jit is the sole code-signing entitlement MAS
     // allows; allow-unsigned-executable-memory / disable-executable-page-

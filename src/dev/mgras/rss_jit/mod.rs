@@ -22,6 +22,8 @@
 //! process-wide map; a primitive whose shader is not ready yet runs in the
 //! interpreter. `IRIS_GR4_JIT=off|sync|async` picks the mode (`sync`
 //! compiles on first use and waits, for tests and comparisons).
+//! `IRIS_NO_JIT` (set by the Mac App Store build, whose sandbox kills
+//! Cranelift's executable pages) forces it off, as it does the REX3 JIT.
 
 pub mod compiler;
 pub mod key;
@@ -45,9 +47,20 @@ pub const MODE_ASYNC: u32 = 0;
 /// Compile on first use and wait (tests, comparisons).
 pub const MODE_SYNC: u32 = 2;
 
-/// The mode a new board starts in: `IRIS_GR4_JIT`, else async (off in unit
-/// tests, so the interpreter's tests stay deterministic unless asked).
+/// Whether the host forbids JIT code (`IRIS_NO_JIT`): off then, whatever
+/// `IRIS_GR4_JIT` or `mgras jit` ask for. Off never reaches `store()`, so
+/// no compiler thread or executable page is ever made.
+pub fn forbidden() -> bool {
+    std::env::var_os("IRIS_NO_JIT").is_some()
+}
+
+/// The mode a new board starts in: off if `forbidden`, else `IRIS_GR4_JIT`,
+/// else async (off in unit tests, so the interpreter's tests stay
+/// deterministic unless asked).
 pub fn default_mode() -> u32 {
+    if forbidden() {
+        return MODE_OFF;
+    }
     match std::env::var("IRIS_GR4_JIT").as_deref() {
         Ok("off") | Ok("0") => MODE_OFF,
         Ok("sync") => MODE_SYNC,
