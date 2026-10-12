@@ -157,6 +157,13 @@ tcache = []
 # Panics at the exact diverging access instead of letting corruption surface as
 # a guest crash much later. Very slow; diagnostic only.
 tcache_verify = ["tcache"]
+# Cache parity/ECC injection and the Cache Error exception, for SGI's IDE
+# cache diagnostics (dcache1, icache1, scache1): Status.CE forcing the ECC
+# register into stored check bits, Index_Load_Tag loading check bits into CP0
+# ECC, and the Cache Error a mismatch raises. Nothing but a diagnostic ever
+# observes any of it, and it costs a check on every D-cache miss and a Status
+# sync on every exception, so it is off by default.
+cache-ecc = []
 default = ["tlbvmap", "rexdiag"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]

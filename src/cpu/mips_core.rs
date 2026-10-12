@@ -2563,6 +2563,19 @@ pub fn deliver_exception(core: &mut MipsCore, status: u32) {
 pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd: bool) {
     const EXEC_IS_TLB_REFILL: u32 = 1 << 28;
     const EXEC_IS_XTLB_REFILL: u32 = 1 << 29;
+    const EXEC_IS_CACHE_ERR: u32 = 1 << 30;
+
+    // Cache Error: ERL and ErrorEPC, the uncached vector, and nothing else —
+    // Cause, EPC and EXL are untouched (R4000 UM ch. 5, VR5000 UM 7.3.9).
+    // The caller has already loaded CacheErr.
+    if status & EXEC_IS_CACHE_ERR != 0 {
+        core.cp0_errorepc = if bd { fault_pc.wrapping_sub(4) } else { fault_pc };
+        core.cp0_status |= STATUS_ERL;
+        let base = if core.cp0_status & STATUS_BEV != 0 { 0xFFFFFFFF_BFC00200u64 } else { 0xFFFFFFFF_A0000000u64 };
+        core.pc = base + 0x100;
+        core.in_delay_slot = false;
+        return;
+    }
 
     let is_tlb_refill = status & EXEC_IS_TLB_REFILL != 0;
     let is_xtlb_refill = status & EXEC_IS_XTLB_REFILL != 0;

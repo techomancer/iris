@@ -949,6 +949,10 @@ pub static LOCKSTEP_VERIFICATIONS: std::sync::atomic::AtomicU64 = std::sync::ato
 pub const EXEC_IS_EXCEPTION:       ExecStatus = 1 << 27; // 0x0800_0000
 pub const EXEC_IS_TLB_REFILL:      ExecStatus = 1 << 28; // 0x1000_0000
 pub const EXEC_IS_XTLB_REFILL:     ExecStatus = 1 << 29; // 0x2000_0000
+/// A Cache Error exception: ErrorEPC/ERL and the uncached vector, not the
+/// common one. CacheErr comes from the cache (`MipsCache::take_cache_err`).
+pub const EXEC_IS_CACHE_ERR:       ExecStatus = 1 << 30; // 0x4000_0000
+pub const EXEC_CACHE_ERR: ExecStatus = EXEC_IS_EXCEPTION | EXEC_IS_CACHE_ERR;
 
 // Bus error ExecStatus values — also exported as BUS_ERR / BUS_VCE in traits.rs.
 // The values MUST stay identical; enforced by compile-time asserts in traits.rs.
@@ -3622,6 +3626,19 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.update_translate_fn();
         self.update_fpr_mode();
         self.nanotlb_invalidate();
+        #[cfg(feature = "cache-ecc")]
+        self.sync_cache_error_control();
+    }
+
+    /// Tell the cache which Status bits govern parity: CE forces the ECC
+    /// register into stored check bits, and DE or ERL turn detection off.
+    /// Every Status change comes through `resync_privilege_state`.
+    #[cfg(feature = "cache-ecc")]
+    #[inline]
+    fn sync_cache_error_control(&self) {
+        let s = self.core.cp0_status;
+        self.cache.set_error_control(s & STATUS_CE != 0, s & (STATUS_DE | STATUS_ERL) == 0);
+        self.cache.set_cache_ecc(self.core.cp0_ecc);
     }
 
     /// Store a new CP0 Status word and re-derive everything cached off it.
@@ -4381,6 +4398,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         #[cfg(feature = "jitv2")]
         { self.core.syscall_pending = false; }
 
+        if status & EXEC_IS_CACHE_ERR != 0 {
+            self.core.cp0_cacheerr = self.cache.take_cache_err();
+        }
         // Architectural effect (Cause/EPC/Status/vector) — the portable part
         // shared with jitv2-verify (§4.2 single-implementation delivery).
         crate::cpu::mips_core::deliver_exception(&mut self.core, status);
@@ -4466,6 +4486,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // wrong one; the `ad{e,s}l_*_matches_interpreter` equivalence tests
         // caught it as a one-field divergence. Every caller that needs
         // BadVAddr sets it before calling.
+        if status & EXEC_IS_CACHE_ERR != 0 {
+            self.core.cp0_cacheerr = self.cache.take_cache_err();
+        }
         crate::cpu::mips_core::deliver_exception_at(&mut self.core, status, fault_pc, bd);
         self.resync_privilege_state();
         status
@@ -5086,8 +5109,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     if r.is_ok() {
                         Ok(r.data)
                     } else {
-                        if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
-                        Err(r.status) // BUS_BUSY, BUS_VCE, or BUS_ERR — all valid ExecStatus
+                        // A Cache Error leaves BadVAddr alone; it changes
+                        // only CacheErr, ErrorEPC and ERL.
+                        if !DEBUG && r.status & EXEC_IS_CACHE_ERR == 0 { self.core.cp0_badvaddr = virt_addr; }
+                        Err(r.status) // BUS_BUSY, BUS_VCE, BUS_ERR or EXEC_CACHE_ERR — all valid ExecStatus
                     }
                 } else {
                     // Uncached access
@@ -6840,8 +6865,21 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         // Call unified cache interface
         let result = self.cache.cache_op(cache_op, virt_addr, phys_addr_or_taglo);
-        if C::R10K_CACHE_OPS && op == C_R10K_ILD {
+        // An I-cache write-back of a line with bad parity raises a Cache
+        // Error from the CACHE instruction itself.
+        #[cfg(feature = "cache-ecc")]
+        {
+            let op_status = self.cache.take_op_status();
+            if op_status != 0 {
+                return self.handle_exception(op_status);
+            }
+        }
+        // Index_Load_Tag also loads CP0 ECC with the selected doubleword's
+        // check bits (R4000 UM A-42); the R10000 does this on Index_Load_Data.
+        if (C::R10K_CACHE_OPS && op == C_R10K_ILD)
+            || (cfg!(feature = "cache-ecc") && !C::R10K_CACHE_OPS && op == C_ILT) {
             self.core.cp0_ecc = self.cache.cache_op_ecc();
+            self.cache.set_cache_ecc(self.core.cp0_ecc);
         }
 
         // For Index_Load_Tag, update CP0 TagLo from result
@@ -7219,6 +7257,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         // cheritest: a write to CP0 26 triggers the test device's dump. Routed
         // over the bus, so with no test device mapped it's an ignored GIO access.
+        // CP0 ECC: what a store writes as check bits while Status.CE is set.
+        if reg == 26 {
+            self.cache.set_cache_ecc(self.core.cp0_ecc);
+        }
         if reg == 26 && self.cheritest_dump_hook {
             self.sysad.write32(crate::dev::testdev::TEST_DEV_BASE + crate::dev::testdev::REG_DUMP,
                                self.core.cp0_ecc);

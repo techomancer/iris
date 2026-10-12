@@ -8,7 +8,7 @@
 
 use crate::traits::{BusRead64, BusDevice, Resettable, BUS_OK, BUS_BUSY, BUS_ERR, BUS_VCE};
 use crate::snapshot::{u32_slice_to_toml, u64_slice_to_toml, load_u32_slice, load_u64_slice, get_field, toml_bool, toml_u32, hex_u32};
-use crate::cpu::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT};
+use crate::cpu::mips_exec::{DecodedInstr, ExecStatus, EXEC_COMPLETE, EXEC_RETRY, exec_exception_const, EXC_VCEI, EXC_VCED, EXC_IBE, FLAG_NOT_DECODED, FLAG_IMM_IS_NEXT, EXEC_CACHE_ERR};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_MISS, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -256,9 +256,29 @@ impl L1DTag {
 
     /// True iff this tag is valid and covers the same physical line as `phys_addr`.
     /// Branchless: one AND+OR on phys_addr, one 64-bit compare. No cs load, no branch.
+    ///
+    /// A line carrying [`Self::SLOW`] never matches here, by design: that is
+    /// how it reaches the miss path. Anything that must find the line
+    /// regardless (CACHE hit ops, write-back and invalidation scans) uses
+    /// [`Self::matches_line`].
     #[inline(always)]
     pub fn matches_phys(&self, phys_addr: u64) -> bool {
         self.ptag == (phys_addr & !0xFFF) | 1
+    }
+
+    /// Bit 1 of `ptag`: send every access to this line through the miss path.
+    ///
+    /// Parity forcing (Status.CE) and forced-parity lines need a check on
+    /// each access, and the hit path cannot afford one. A marked line fails
+    /// the exact compare in `matches_phys`, in the interpreter and in jitv2's
+    /// inline guard alike, so the check lives in the miss path at no cost to
+    /// anything else. Bit 1 of a page-aligned address is free, like bit 0.
+    pub const SLOW: u64 = 2;
+
+    /// [`Self::matches_phys`], ignoring the [`Self::SLOW`] mark.
+    #[inline]
+    pub fn matches_line(&self, phys_addr: u64) -> bool {
+        self.ptag & !Self::SLOW == (phys_addr & !0xFFF) | 1
     }
 
     /// True iff this tag is valid (for non-hot-path use only).
@@ -323,6 +343,20 @@ const L2_TAG_ECC_MASKS: [u32; 7] = [
 pub fn l2_tag_ecc(tag: u32) -> u32 {
     L2_TAG_ECC_MASKS.iter().enumerate()
         .fold(0, |ecc, (i, &m)| ecc | even_parity(tag & m) << i)
+}
+
+/// R4000 secondary-cache data check matrix, UM Figure 16-1: entry `i` selects
+/// the data bits check bit `i` covers. Pinned by
+/// `l2_data_ecc_matrix_is_the_manuals`.
+const L2_DATA_ECC_MASKS: [u64; 8] = [
+    0x145011110ff014ff, 0x24ff2222f000249f, 0x4c9f444400ff44d0, 0x84d08888ff0f8c50,
+    0x0931f0ff11110b21, 0x0b22ff002222fa32, 0xfa24000f4444ff24, 0xff280ff088880928,
+];
+
+/// The 8 check bits the R4400 computes for a secondary-cache doubleword.
+pub fn l2_data_ecc(v: u64) -> u8 {
+    L2_DATA_ECC_MASKS.iter().enumerate()
+        .fold(0, |ecc, (i, &m)| ecc | (((v & m).count_ones() & 1) as u8) << i)
 }
 
 // L2 Cache Tag
@@ -624,6 +658,18 @@ pub trait MipsCache: Send + Sync {
     /// takes them from this register and `Index_Load_Data` returns them
     /// there. Models that do not keep them ignore both of these.
     fn set_cache_ecc(&self, _v: u32) {}
+    /// The Status bits that govern cache error checking: CE (store the ECC
+    /// register as check bits instead of computing them) and whether errors
+    /// are detected at all (neither DE nor ERL set). Pushed by the executor on
+    /// every Status change. Models that keep no check bits ignore it.
+    fn set_error_control(&self, _ce: bool, _detect: bool) {}
+    /// CacheErr for the Cache Error exception the last access reported
+    /// (`EXEC_CACHE_ERR`).
+    fn take_cache_err(&self) -> u32 { 0 }
+    /// A Cache Error raised by the CACHE instruction just executed (an I-cache
+    /// write-back of a line with bad parity), as an exception status, or 0.
+    /// Reading it clears it.
+    fn take_op_status(&self) -> u32 { 0 }
     /// CP0 `ECC` after the last cache operation.
     fn cache_op_ecc(&self) -> u32 { 0 }
 
@@ -1046,6 +1092,78 @@ const DEBUG_TRACK_ADDR: Option<u64> = Some(0x080165d4);
 #[cfg(not(feature = "debug_cache"))]
 const DEBUG_TRACK_ADDR: Option<u64> = None;
 
+/// Primary data parity, as far as software can observe it: what Status.CE
+/// and the ECC register do to the D-cache's check bits, and the Cache Error
+/// exception a mismatch raises (R4000 UM ch. 5, VR5000 UM 7.2.9).
+///
+/// Check bits are not stored for ordinary data: unless forced, they always
+/// match the data, so they are computed when needed. Only doublewords whose
+/// check bits were forced are recorded, in `forced`, and their lines carry
+/// [`L1DTag::SLOW`] so every access reaches the check. While CE is set every
+/// valid line is marked, since any store may force bits.
+#[derive(Default)]
+struct ParityState {
+    /// Status.CE: stores take the ECC register as check bits.
+    ce: bool,
+    /// Errors raise a Cache Error exception: Status.DE and Status.ERL clear.
+    detect: bool,
+    /// CP0 ECC, low 8 bits: one even-parity bit per byte, byte 0 the least
+    /// significant.
+    ecc: u8,
+    /// (L1-D extended index, doubleword within the line, its check bits).
+    forced: Vec<(usize, u8, u8)>,
+    /// Secondary data: per doubleword (physical address within the cache,
+    /// `>> 3`), the ECC register value XOR'd into its check bits by a CE
+    /// write-back. Empty until first used; `l2_xor_live` counts non-zero
+    /// entries so everything else can skip it.
+    l2_xor: Vec<u8>,
+    l2_xor_live: usize,
+    /// CP0 ECC after the last Index_Load_Tag.
+    ecc_out: u32,
+    /// I-cache lines a CE Fill gave forced parity: (extended index, the bits,
+    /// the same for every doubleword of the line).
+    ic_forced: Vec<(usize, u8)>,
+    /// See `MipsCache::take_op_status`.
+    op_status: u32,
+    /// The way `l1d_slow_resolve` found, for the access it is serving.
+    way: u32,
+    /// CacheErr for the error last reported.
+    cacheerr: u32,
+}
+
+/// `fill_l1d_line` result: the line is resolved (way in `ParityState::way`)
+/// and the access must take the parity-checking path. Not a status: real
+/// statuses are exceptions (bit 27) or retry (0x100), and a way is 0 or 1.
+const L1D_SLOW: u32 = 2;
+
+/// Parity/ECC injection and checking (`cache-ecc`). Off, every hook below
+/// folds away: nothing on a miss, an invalidate or an exception looks at
+/// `ParityState`. Only diagnostics ever observe it.
+const ECC: bool = cfg!(feature = "cache-ecc");
+
+/// `EXEC_IS_CACHE_ERR`, for telling a Cache Error apart from other fill
+/// statuses.
+const EXEC_IS_CACHE_ERR_BIT: u32 = EXEC_CACHE_ERR & !crate::cpu::mips_exec::EXEC_IS_EXCEPTION;
+
+/// CacheErr: data reference (ER), data field error (ED). R4000 UM Table 5-10;
+/// the VR5000 has both at the same positions.
+const CACHEERR_ER: u32 = 1 << 31;
+const CACHEERR_EC: u32 = 1 << 30;
+const CACHEERR_ED: u32 = 1 << 29;
+
+/// Even parity per byte of `v`: bit `i` covers byte `i`, least significant
+/// first, as the ECC register lays them out.
+fn byte_parity(v: u64) -> u8 {
+    (0..8).fold(0, |p, i| p | ((((v >> (8 * i)) as u8).count_ones() & 1) as u8) << i)
+}
+
+/// The byte lanes (as in [`byte_parity`]) an access of `size` bytes at `addr`
+/// touches. Big-endian: the byte at offset 0 is the most significant.
+fn lane_mask(addr: u64, size: usize) -> u8 {
+    let off = (addr & 7) as usize;
+    (off..off + size).fold(0, |m, k| m | 1 << (7 - k))
+}
+
 /// R4000 cache with proper 2-level hierarchy
 ///
 /// This implementation keeps L1-I, L1-D, and L2 in a single object
@@ -1093,6 +1211,8 @@ pub struct CpuCache<
     /// keeps its own copy until refilled. The 2-way model's `ic_instrs` already
     /// is that copy. Empty on a 2-way model.
     ic_raw: UnsafeCell<Box<[u32]>>,
+    /// Status.CE / ECC parity forcing and Cache Error reporting. Cold.
+    perr: UnsafeCell<ParityState>,
     dc_lru: UnsafeCell<Box<[u64]>>,
 
     /// tcache: base of ppmem's 4GB window, or null when unavailable.
@@ -1341,6 +1461,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 if Self::IS_R5K { vec![0u64; Self::IC_NUM_SETS.div_ceil(64)] } else { Vec::new() }.into_boxed_slice()),
             ic_raw: UnsafeCell::new(
                 if Self::IS_R5K { Vec::new() } else { vec![0u32; IC_SIZE / 4] }.into_boxed_slice()),
+            perr: UnsafeCell::new(ParityState::default()),
             dc_lru: UnsafeCell::new(
                 if Self::IS_R5K { vec![0u64; Self::DC_NUM_SETS.div_ceil(64)] } else { Vec::new() }.into_boxed_slice()),
             #[cfg(feature = "debug_cache")]
@@ -1715,6 +1836,12 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
     /// Invalidate L1 instruction cache line by index
     fn invalidate_l1i_line(&self, idx: usize, cascade: bool) {
+        if ECC {
+            let e = self.perr();
+            if !e.ic_forced.is_empty() {
+                e.ic_forced.retain(|f| f.0 != idx);
+            }
+        }
         let tag: L1ITag = self.ic.get_tag(idx);
 
         #[cfg(feature = "debug_cache")]
@@ -1738,6 +1865,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// `coherent` = true for software-initiated CACHE ops (may clear llbit);
     /// false for hardware-induced evictions (fills, L2 cascades) which must not clear llbit.
     fn invalidate_l1d_line(&self, idx: usize, coherent: bool, cascade: bool) {
+        self.l1d_unforce(idx);
         let tag: L1DTag = self.dc.get_tag(idx);
 
         #[cfg(feature = "debug_cache")]
@@ -1769,6 +1897,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// Invalidate L2 cache line by index
     /// This also invalidates any matching L1 lines (inclusive cache property)
     fn invalidate_l2_line(&self, idx: usize) {
+        self.clear_l2_xor((idx << Self::L2_LINE_SHIFT) as u64, L2_LINE);
         let l2_tag: L2Tag = self.l2.get_tag(idx);
 
         #[cfg(feature = "debug_cache")]
@@ -1822,7 +1951,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let phys_addr = phys_base + ((i as u64) << Self::DC_LINE_SHIFT);
                 let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
 
-                if dc_tag.matches_phys(phys_addr) {
+                if dc_tag.matches_line(phys_addr) {
                     self.invalidate_l1d_line(dc_idx, false, false); // hardware cascade, not coherent
                 }
             }
@@ -2033,6 +2162,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
         }
 
+        // L2 recomputes the check bits of what it was just written.
+        self.clear_l2_xor(phys_addr, Self::DC_LINE);
+
         // Mark L2 line as dirty. Unconditional: tcache changes *where the data
         // lives*, never the cache state machine. A dirty transparent L2 line is
         // harmless — flushing it reads RAM and writes RAM.
@@ -2082,7 +2214,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let dc_idx = (dc_base_idx + i) & Self::DC_NUM_LINES_MASK;
                 let phys_addr_l1 = phys_addr + ((i as u64) << Self::DC_LINE_SHIFT);
                 let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
-                if dc_tag.matches_phys(phys_addr_l1) {
+                if dc_tag.matches_line(phys_addr_l1) {
                     self.writeback_l1d_line(dc_idx, false);
                 }
             }
@@ -2327,9 +2459,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     fn fill_l1i_line(&self, index_addr: u64, phys_addr: u64) -> u32 {
         let set = self.ic.get_index(index_addr);
 
-        // 2-way picks the LRU way; direct-mapped has one way, so eidx == set.
+        // 2-way picks the LRU way, unless a way already holds this line: a
+        // CACHE Fill then refills that way. IDE's icache test relies on it on
+        // the R4600/R5000, placing a line with Index_Store_Tag into the way
+        // VA[14] selects and then filling it. A fetch only gets here on a
+        // miss, so for it this is always the LRU way. Direct-mapped has one
+        // way, so eidx == set.
         let ic_eidx = if Self::IS_R5K {
-            set | (unsafe { Self::lru_get(self.ic_lru.get(), set) } as usize) << Self::IC_NUM_LINES_SHIFT
+            (0..IC_WAYS)
+                .map(|w| set | w << Self::IC_NUM_LINES_SHIFT)
+                .find(|&e| self.ic.get_tag(e).matches_phys(phys_addr))
+                .unwrap_or_else(|| set | (unsafe { Self::lru_get(self.ic_lru.get(), set) } as usize) << Self::IC_NUM_LINES_SHIFT)
         } else { set };
 
         // Invalidate victim slot unconditionally — clears tag before any early return.
@@ -2436,6 +2576,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             unsafe { Self::lru_set(self.ic_lru.get(), set, way ^ 1); }
         }
 
+        // The refill from L2 checks the ECC of the line it transfers.
+        if let Some(status) = self.l2_refill_check(index_addr, phys_addr, IC_LINE, false) {
+            return status;
+        }
+
         // Direct-mapped: keep the words this fill captured — see `ic_raw`.
         // L2 holds the line by now, and its decode slots carry its words.
         if !Self::IS_R5K && self.l2_active() {
@@ -2491,7 +2636,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         }
         let dc_idx = self.dc.get_index(virt_addr);
         let tag: L1DTag = self.dc.get_tag(dc_idx);
-        if !tag.matches_phys(phys_addr) {
+        if !tag.matches_line(phys_addr) {
             return;
         }
         // If L2 also holds this line, its data must agree with RAM, or an L2
@@ -2582,6 +2727,273 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// runs the VCE check but copies nothing — the bytes are read from RAM at
     /// access time instead.
     fn fill_l1d_line(&self, virt_addr: u64, phys_addr: u64) -> u32 {
+        if ECC {
+            let e = self.perr();
+            if e.ce || !e.forced.is_empty() || e.l2_xor_live != 0 {
+                return self.l1d_slow_resolve(virt_addr, phys_addr);
+            }
+        }
+        self.fill_l1d_line_raw(virt_addr, phys_addr)
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    #[inline(always)]
+    fn perr(&self) -> &mut ParityState {
+        unsafe { &mut *self.perr.get() }
+    }
+
+    /// A miss while parity state is live: either the line is resident but
+    /// marked [`L1DTag::SLOW`], or it is not resident and is filled (and
+    /// marked, if CE is set). Returns [`L1D_SLOW`] with the way in
+    /// `ParityState::way`, or a fill's exception status.
+    #[cold]
+    fn l1d_slow_resolve(&self, virt_addr: u64, phys_addr: u64) -> u32 {
+        let set = self.dc.get_index(virt_addr);
+        let found = (0..DC_WAYS)
+            .find(|&w| self.dc.get_tag(set | w << Self::DC_NUM_LINES_SHIFT).matches_line(phys_addr));
+        let way = match found {
+            Some(w) => w as u32,
+            None => {
+                if let Some(status) = self.l2_refill_check(virt_addr, phys_addr, Self::DC_LINE, true) {
+                    return status;
+                }
+                let r = self.fill_l1d_line_raw(virt_addr, phys_addr);
+                if r > 1 { return r; }
+                r
+            }
+        };
+        let eidx = set | (way as usize) << Self::DC_NUM_LINES_SHIFT;
+        let mut tag: L1DTag = self.dc.get_tag(eidx);
+        let marked = self.perr().ce || self.l1d_forced(eidx);
+        tag.ptag = if marked { tag.ptag | L1DTag::SLOW } else { tag.ptag & !L1DTag::SLOW };
+        self.dc.set_tag(eidx, tag);
+        self.perr().way = way;
+        L1D_SLOW
+    }
+
+    fn l1d_forced(&self, eidx: usize) -> bool {
+        self.perr().forced.iter().any(|f| f.0 == eidx)
+    }
+
+    /// Drop forced check bits for line `eidx`: its contents are gone.
+    #[inline]
+    fn l1d_unforce(&self, eidx: usize) {
+        if !ECC { return; }
+        let e = self.perr();
+        if !e.forced.is_empty() {
+            e.forced.retain(|f| f.0 != eidx);
+        }
+    }
+
+    /// Set or clear the [`L1DTag::SLOW`] mark on every valid L1-D line. A line
+    /// with forced check bits stays marked either way.
+    fn mark_l1d_lines(&self, on: bool) {
+        for eidx in 0..DC_WAYS * Self::DC_NUM_LINES {
+            let mut tag: L1DTag = self.dc.get_tag(eidx);
+            if !tag.is_valid() { continue; }
+            tag.ptag = if on || self.l1d_forced(eidx) { tag.ptag | L1DTag::SLOW } else { tag.ptag & !L1DTag::SLOW };
+            self.dc.set_tag(eidx, tag);
+        }
+    }
+
+    /// The whole doubleword at `virt_addr` in resolved line `eidx`.
+    fn l1d_dword(&self, eidx: usize, virt_addr: u64, phys_addr: u64) -> u64 {
+        let _ = (eidx, virt_addr);
+        #[cfg(feature = "tcache")]
+        { self.tc_read::<8>(phys_addr & !7) }
+        #[cfg(not(feature = "tcache"))]
+        { let _ = phys_addr; self.dc.dc_read::<8>(Self::dc_data_addr(eidx, virt_addr & !7)) }
+    }
+
+    /// Check a load of the `lanes` of the doubleword at `virt_addr` against its
+    /// forced check bits. Returns the Cache Error status if they disagree and
+    /// errors are being detected.
+    fn l1d_parity_check(&self, eidx: usize, virt_addr: u64, phys_addr: u64, lanes: u8) -> Option<u32> {
+        let e = self.perr();
+        if !e.detect { return None; }
+        let dw = ((virt_addr as usize & Self::DC_LINE_MASK) >> 3) as u8;
+        let forced = e.forced.iter().find(|f| f.0 == eidx && f.1 == dw)?.2;
+        if (byte_parity(self.l1d_dword(eidx, virt_addr, phys_addr)) ^ forced) & lanes == 0 {
+            return None;
+        }
+        // SIdx: pAddr[21:3]; PIdx: vAddr[14:12].
+        self.perr().cacheerr = CACHEERR_ER | CACHEERR_ED
+            | (phys_addr as u32 & 0x003F_FFF8) | ((virt_addr >> 12) as u32 & 7);
+        Some(EXEC_CACHE_ERR)
+    }
+
+    /// After a store to the `lanes` of the doubleword at `virt_addr` (`before`
+    /// is the doubleword it replaced): with CE set those lanes take the ECC
+    /// register's bits, otherwise freshly computed ones. A doubleword whose
+    /// bits agree with its data again is forgotten.
+    fn l1d_parity_store(&self, eidx: usize, virt_addr: u64, phys_addr: u64, before: u64, lanes: u8) {
+        let after = byte_parity(self.l1d_dword(eidx, virt_addr, phys_addr));
+        let dw = ((virt_addr as usize & Self::DC_LINE_MASK) >> 3) as u8;
+        let e = self.perr();
+        let pos = e.forced.iter().position(|f| f.0 == eidx && f.1 == dw);
+        let prev = pos.map_or(byte_parity(before), |i| e.forced[i].2);
+        let src = if e.ce { e.ecc } else { after };
+        let bits = (prev & !lanes) | (src & lanes);
+        match (pos, bits == after) {
+            (Some(i), true) => { e.forced.swap_remove(i); }
+            (Some(i), false) => e.forced[i].2 = bits,
+            (None, false) => e.forced.push((eidx, dw, bits)),
+            (None, true) => {}
+        }
+        if !e.ce && !self.l1d_forced(eidx) {
+            let mut tag: L1DTag = self.dc.get_tag(eidx);
+            tag.ptag &= !L1DTag::SLOW;
+            self.dc.set_tag(eidx, tag);
+        }
+    }
+
+    #[cold]
+    fn read_slow<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
+        let eidx = self.dc.get_index(virt_addr) | (self.perr().way as usize) << Self::DC_NUM_LINES_SHIFT;
+        if let Some(status) = self.l1d_parity_check(eidx, virt_addr, phys_addr, lane_mask(virt_addr, SIZE)) {
+            return BusRead64 { status, data: 0 };
+        }
+        #[cfg(feature = "tcache")]
+        let result = self.tc_read::<SIZE>(phys_addr);
+        #[cfg(not(feature = "tcache"))]
+        let result = self.dc.dc_read::<SIZE>(Self::dc_data_addr(eidx, virt_addr));
+        BusRead64::ok(result)
+    }
+
+    #[cold]
+    fn write_slow(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
+        let eidx = self.dc.get_index(virt_addr) | (self.perr().way as usize) << Self::DC_NUM_LINES_SHIFT;
+        let before = self.l1d_dword(eidx, virt_addr, phys_addr);
+        let merged = (before & !mask) | (val & mask);
+        #[cfg(feature = "tcache")]
+        {
+            self.tc_write::<8>(phys_addr & !7, merged);
+            self.tc_invalidate_l2_code(phys_addr);
+        }
+        #[cfg(not(feature = "tcache"))]
+        self.dc.dc_write::<8>(Self::dc_data_addr(eidx, virt_addr & !7), merged);
+        self.mark_l1d_dirty(eidx);
+        let lanes = (0..8).fold(0u8, |l, i| if (mask >> (8 * i)) & 0xff != 0 { l | 1 << i } else { l });
+        self.l1d_parity_store(eidx, virt_addr, phys_addr, before, lanes);
+        BUS_OK
+    }
+
+    /// The doubleword mask for a `SIZE`-byte store at `virt_addr`, and the
+    /// value shifted into place.
+    fn store_mask<const SIZE: usize>(virt_addr: u64, val: u64) -> (u64, u64) {
+        if SIZE == 8 { return (u64::MAX, val); }
+        let shift = (8 - SIZE - (virt_addr & 7) as usize) * 8;
+        let bits = (1u64 << (SIZE * 8)) - 1;
+        (bits << shift, (val & bits) << shift)
+    }
+
+    /// The check bits Index_Load_Tag loads into CP0 ECC: those of the
+    /// doubleword vAddr[LINEBITS:3] selects in the indexed line (R4000 UM
+    /// A-42). Secondary: data ECC, with any CE-forced bits XOR'd in. Primary
+    /// data: byte parity, or the forced bits. Primary instruction: byte parity
+    /// on the R4400, one bit per word on the R5000 (VR5000 UM Table 7-8).
+    fn ilt_ecc(&self, is_icache: bool, is_l2: bool, idx: usize, virt_addr: u64) -> u32 {
+        if is_l2 {
+            let tag: L2Tag = self.l2.get_tag(idx);
+            let off = virt_addr as usize & Self::L2_LINE_MASK & !7;
+            let phys = l2_tag_to_phys(tag, ((idx << Self::L2_LINE_SHIFT) | off) as u64);
+            #[cfg(feature = "tcache")]
+            let data = self.downstream.read64(phys as u32).data;
+            #[cfg(not(feature = "tcache"))]
+            let data = self.l2.data()[(idx << Self::L2_CHUNKS_PER_LINE_SHIFT) + (off >> 3)];
+            return (l2_data_ecc(data) ^ self.l2_xor(phys)) as u32;
+        }
+        if is_icache {
+            if let Some(&(_, forced)) = self.perr().ic_forced.iter().find(|f| f.0 == idx) {
+                return forced as u32;
+            }
+            let k = (virt_addr as usize & Self::IC_LINE_MASK & !7) >> 2;
+            let (hi, lo) = (self.l1i_word(idx, k), self.l1i_word(idx, k + 1));
+            return if Self::IS_R5K {
+                (lo.count_ones() & 1) | (hi.count_ones() & 1) << 1
+            } else {
+                byte_parity((hi as u64) << 32 | lo as u64) as u32
+            };
+        }
+        let tag: L1DTag = self.dc.get_tag(idx);
+        let phys = l1d_tag_to_phys(tag, ((idx & Self::DC_NUM_LINES_MASK) << Self::DC_LINE_SHIFT) as u64)
+            | (virt_addr & Self::DC_LINE_MASK as u64 & !7);
+        let dw = ((virt_addr as usize & Self::DC_LINE_MASK) >> 3) as u8;
+        let forced = self.perr().forced.iter().find(|f| f.0 == idx && f.1 == dw).map(|f| f.2);
+        forced.unwrap_or_else(|| byte_parity(self.l1d_dword(idx, virt_addr, phys))) as u32
+    }
+
+    /// Slot of the secondary doubleword holding `phys_addr`.
+    fn l2_slot(phys_addr: u64) -> usize {
+        (phys_addr as usize & (L2_CACHE_SIZE - 1)) >> 3
+    }
+
+    /// The bits XOR'd into the check bits of the doubleword at `phys_addr`.
+    fn l2_xor(&self, phys_addr: u64) -> u8 {
+        let e = self.perr();
+        if e.l2_xor_live == 0 { return 0; }
+        e.l2_xor[Self::l2_slot(phys_addr)]
+    }
+
+    fn set_l2_xor(&self, phys_addr: u64, v: u8) {
+        let e = self.perr();
+        if e.l2_xor.is_empty() {
+            if v == 0 { return; }
+            e.l2_xor = vec![0; L2_CACHE_SIZE / 8];
+        }
+        let slot = &mut e.l2_xor[Self::l2_slot(phys_addr)];
+        e.l2_xor_live = e.l2_xor_live + (v != 0) as usize - (*slot != 0) as usize;
+        *slot = v;
+    }
+
+    /// Recomputed check bits for `len` bytes of secondary data at `phys_addr`:
+    /// a write into L2, a fill or an invalidate.
+    #[inline]
+    fn clear_l2_xor(&self, phys_addr: u64, len: usize) {
+        if !ECC || self.perr().l2_xor_live == 0 { return; }
+        let base = phys_addr & !7;
+        for i in 0..len / 8 {
+            self.set_l2_xor(base + 8 * i as u64, 0);
+        }
+    }
+
+    /// A primary refill from L2 checks the ECC of the `len`-byte line it
+    /// transfers. Returns the Cache Error if any doubleword carries forced bits
+    /// and errors are being detected.
+    fn l2_refill_check(&self, virt_addr: u64, phys_addr: u64, len: usize, data: bool) -> Option<u32> {
+        if !ECC { return None; }
+        let e = self.perr();
+        if e.l2_xor_live == 0 || !e.detect || !HAS_L2 || self.hit_l2(phys_addr).is_none() {
+            return None;
+        }
+        let base = phys_addr & !(len as u64 - 1);
+        (0..len / 8).find(|&i| self.l2_xor(base + 8 * i as u64) != 0)?;
+        self.perr().cacheerr = if data { CACHEERR_ER } else { 0 } | CACHEERR_EC | CACHEERR_ED
+            | (phys_addr as u32 & 0x003F_FFF8) | ((virt_addr >> 12) as u32 & 7);
+        Some(EXEC_CACHE_ERR)
+    }
+
+    /// A D-cache write-back done by a CACHE op. With CE set, the ECC register
+    /// is XOR'd into the check bits of the doubleword the op addresses as the
+    /// line is written to L2 (R4000 UM A-45).
+    fn l1d_writeback_op(&self, eidx: usize, virt_addr: u64, cascade: bool) {
+        if !ECC {
+            self.writeback_l1d_line(eidx, cascade);
+            return;
+        }
+        let tag: L1DTag = self.dc.get_tag(eidx);
+        let phys = l1d_tag_to_phys(tag, ((eidx & Self::DC_NUM_LINES_MASK) << Self::DC_LINE_SHIFT) as u64)
+            | (virt_addr & Self::DC_LINE_MASK as u64 & !7);
+        let written = tag.is_valid() && tag.dirty;
+        self.writeback_l1d_line(eidx, cascade);
+        let e = self.perr();
+        if written && e.ce && HAS_L2 && self.hit_l2(phys).is_some() {
+            let ecc = e.ecc;
+            self.set_l2_xor(phys, ecc);
+        }
+    }
+
+    fn fill_l1d_line_raw(&self, virt_addr: u64, phys_addr: u64) -> u32 {
         #[cfg(feature = "tcache")]
         let transparent = true;
         #[cfg(not(feature = "tcache"))]
@@ -2794,8 +3206,25 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// unconditionally"). IDE's `icache2` depends on it: it fills the I-cache,
     /// changes memory under it through the D-cache, and expects the write-back
     /// to put the I-cache's words back.
-    fn writeback_l1i_line(&self, eidx: usize, line_base: u64) {
+    fn writeback_l1i_line(&self, eidx: usize, virt_addr: u64, line_base: u64) {
         let n = Self::IC_INSTRS_PER_LINE;
+        // A line a CE Fill gave forced parity fails its check here, which is
+        // how IDE `icache1` observes it (R4000 UM Table 16-1: primary cache
+        // to secondary, parity checked, trap on error).
+        let e = self.perr();
+        if ECC && e.detect {
+            if let Some(&(_, forced)) = e.ic_forced.iter().find(|f| f.0 == eidx) {
+                let bad = (0..n / 2).any(|c| {
+                    let dw = (self.l1i_word(eidx, 2 * c) as u64) << 32 | self.l1i_word(eidx, 2 * c + 1) as u64;
+                    byte_parity(dw) != forced
+                });
+                if bad {
+                    e.cacheerr = CACHEERR_ED | (line_base as u32 & 0x003F_FFF8) | ((virt_addr >> 12) as u32 & 7);
+                    e.op_status = EXEC_CACHE_ERR;
+                    return;
+                }
+            }
+        }
         let mut chunks = [0u64; 16];
         let chunks = &mut chunks[..n / 2];
         for (c, chunk) in chunks.iter_mut().enumerate() {
@@ -2833,6 +3262,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 }
             }
         }
+        self.clear_l2_xor(line_base, n * 4);
         let mut tag: L2Tag = self.l2.get_tag(l2_idx);
         let cs = match tag.cs() {
             L2_CS_CLEAN_EXCLUSIVE => L2_CS_DIRTY_EXCLUSIVE,
@@ -2887,7 +3317,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         for way in 0..DC_WAYS {
             let eidx = set | (way << Self::DC_NUM_LINES_SHIFT);
             let tag: L1DTag = self.dc.get_tag(eidx);
-            if tag.matches_phys(phys_addr) { return Some(eidx); }
+            if tag.matches_line(phys_addr) { return Some(eidx); }
         }
         None
     }
@@ -2937,7 +3367,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             for way in 0..DC_WAYS {
                 let eidx = set | (way << Self::DC_NUM_LINES_SHIFT);
                 let tag: L1DTag = self.dc.get_tag(eidx);
-                if tag.dirty && tag.matches_phys(phys_line) {
+                if tag.dirty && tag.matches_line(phys_line) {
                     self.writeback_l1d_line(eidx, true);
                     n += 1;
                 }
@@ -3268,7 +3698,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let dc_idx = self.dc.get_index(virt_addr);
             if !self.dc.get_tag(dc_idx).matches_phys(phys_addr) {
                 let r = self.fill_l1d_line(virt_addr, phys_addr);
-                if r > 1 { return BusRead64 { status: r, data: 0 }; }
+                if r > 1 {
+                    if r == L1D_SLOW { return self.read_slow::<SIZE>(virt_addr, phys_addr); }
+                    return BusRead64 { status: r, data: 0 };
+                }
             }
             #[cfg(not(feature = "lightning"))]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
@@ -3290,7 +3723,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // R5K (2-way): use generic path with way encoding.
         {
             let way = self.ensure_l1d_line(virt_addr, phys_addr);
-            if way > 1 { return BusRead64 { status: way, data: 0 }; }
+            if way > 1 {
+                if way == L1D_SLOW { return self.read_slow::<SIZE>(virt_addr, phys_addr); }
+                return BusRead64 { status: way, data: 0 };
+            }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
             #[cfg(not(feature = "lightning"))]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
@@ -3330,7 +3766,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let dc_idx = self.dc.get_index(virt_addr);
             if !self.dc.get_tag(dc_idx).matches_phys(phys_addr) {
                 let r = self.fill_l1d_line(virt_addr, phys_addr);
-                if r > 1 { return r; }
+                if r > 1 {
+                if r == L1D_SLOW {
+                    let (mask, v) = Self::store_mask::<SIZE>(virt_addr, val);
+                    return self.write_slow(virt_addr, phys_addr, v, mask);
+                }
+                    return r;
+                }
             }
             #[cfg(not(feature = "lightning"))]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
@@ -3365,7 +3807,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // already requires for self-modifying code.
         {
             let way = self.ensure_l1d_line(virt_addr, phys_addr);
-            if way > 1 { return way; }
+            if way > 1 {
+                if way == L1D_SLOW {
+                    let (mask, v) = Self::store_mask::<SIZE>(virt_addr, val);
+                    return self.write_slow(virt_addr, phys_addr, v, mask);
+                }
+                return way;
+            }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
             #[cfg(not(feature = "lightning"))]
             if devlog_is_active(LogModule::L1d) && devlog_mask(LogModule::L1d) & CACHE_LOG_HIT != 0 {
@@ -3402,7 +3850,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let dc_idx = self.dc.get_index(virt_addr);
             if !self.dc.get_tag(dc_idx).matches_phys(phys_addr) {
                 let r = self.fill_l1d_line(virt_addr, phys_addr);
-                if r > 1 { return r; }
+                if r > 1 {
+                    if r == L1D_SLOW { return self.write_slow(virt_addr, phys_addr, val, mask); }
+                    return r;
+                }
             }
             #[cfg(feature = "tcache")]
             {
@@ -3422,7 +3873,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // R5K (2-way): generic path.
         {
             let way = self.ensure_l1d_line(virt_addr, phys_addr);
-            if way > 1 { return way; }
+            if way > 1 {
+                if way == L1D_SLOW { return self.write_slow(virt_addr, phys_addr, val, mask); }
+                return way;
+            }
             let dc_eidx = self.dc.get_index(virt_addr) | (way as usize) << Self::DC_NUM_LINES_SHIFT;
             #[cfg(feature = "tcache")]
             {
@@ -3558,6 +4012,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         //let cascade = !is_l2;
         let cascade = false;
 
+        if ECC && operation == C_ILT {
+            self.perr().ecc_out = self.ilt_ecc(is_icache, is_l2, idx, virt_addr);
+        }
+
         match operation {
             // Index Invalidate (I, SI) or Index Writeback Invalidate (D, SD).
             // R5K/Triton SI/SD: reinterpreted as C_INVALL — invalidate the entire L2
@@ -3566,7 +4024,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 if is_icache {
                     self.invalidate_l1i_line(idx, cascade);
                 } else if !is_l2 {
-                    self.writeback_l1d_line(idx, cascade);
+                    self.l1d_writeback_op(idx, virt_addr, cascade);
                     self.invalidate_l1d_line(idx, true, cascade);
                 } else {
                     // Triton C_INVALL (SI/SD, index op): invalidate entire L2.
@@ -3704,7 +4162,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         // writes back; the L2 path here already gets this
                         // right.
                         self.invalidate_l1d_line(idx, true, cascade);
-                        self.dc.set_tag(idx, if cs != L1D_CS_INVALID as u8 { L1DTag::valid(ptag_line, cs, dirty) } else { L1DTag::default() });
+                        let mut tag = if cs != L1D_CS_INVALID as u8 { L1DTag::valid(ptag_line, cs, dirty) } else { L1DTag::default() };
+                        if self.perr().ce && tag.is_valid() { tag.ptag |= L1DTag::SLOW; }
+                        self.dc.set_tag(idx, tag);
                     }
                 }
                 0
@@ -3729,7 +4189,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 } else {
                     // Writeback the old L1D occupant before overwriting its tag.
                     self.writeback_l1d_line(idx, false); // CDX: claiming line, no cascade needed
-                    self.dc.set_tag(idx, L1DTag::valid(phys_addr, L1D_CS_DIRTY_EXCLUSIVE as u8, true));
+                    self.l1d_unforce(idx);
+                    let mut tag = L1DTag::valid(phys_addr, L1D_CS_DIRTY_EXCLUSIVE as u8, true);
+                    if self.perr().ce { tag.ptag |= L1DTag::SLOW; }
+                    self.dc.set_tag(idx, tag);
                 }
                 0
             }
@@ -3758,7 +4221,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             C_HWBINV => { // same as C_FILL
                 if is_icache {
                     // Fill operation: L1I is virtually indexed, use virt_addr for index.
-                    let _ = self.fill_l1i_line(virt_addr, phys_addr);
+                    // With CE set the ECC register replaces the computed
+                    // parity of the filled line (R4000 UM ch. 5, VR5000 UM 7.2.9).
+                    let r = self.fill_l1i_line(virt_addr, phys_addr);
+                    if ECC && r <= 1 && self.perr().ce {
+                        if let Some(eidx) = self.hit_l1i(virt_addr, phys_addr) {
+                            let ecc = self.perr().ecc;
+                            self.perr().ic_forced.push((eidx, ecc));
+                        }
+                    } else if r > 1 && r & EXEC_IS_CACHE_ERR_BIT != 0 {
+                        self.perr().op_status = r;
+                    }
                 } else if is_l2 {
                     if let Some(idx) = self.hit_l2(phys_addr) {
                         // Triton C_INVPAGE (SD, hit op): invalidate all L2 lines in the page.
@@ -3770,7 +4243,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                     }
                 } else {
                     if let Some(eidx) = self.hit_l1d(virt_addr, phys_addr) {
-                        self.writeback_l1d_line(eidx, cascade);
+                        self.l1d_writeback_op(eidx, virt_addr, cascade);
                         self.invalidate_l1d_line(eidx, true, cascade);
                     }
                 }
@@ -3781,7 +4254,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             C_HWB => {
                 if is_icache {
                     if let Some(eidx) = self.hit_l1i(virt_addr, phys_addr) {
-                        self.writeback_l1i_line(eidx, phys_addr & !(Self::IC_LINE_MASK as u64));
+                        self.writeback_l1i_line(eidx, virt_addr, phys_addr & !(Self::IC_LINE_MASK as u64));
                     }
                 } else {
                     if is_l2 {
@@ -3790,7 +4263,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                         }
                     } else {
                         if let Some(eidx) = self.hit_l1d(virt_addr, phys_addr) {
-                            self.writeback_l1d_line(eidx, cascade);
+                            self.l1d_writeback_op(eidx, virt_addr, cascade);
                         }
                     }
                 }
@@ -3815,6 +4288,35 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
     fn writeback(&self, virt_addr: Option<u64>, phys_addr: u64, size: u64) -> usize {
         self.writeback_range(virt_addr, phys_addr, size)
+    }
+
+    fn set_cache_ecc(&self, v: u32) {
+        self.perr().ecc = v as u8;
+    }
+
+    /// CE toggles the [`L1DTag::SLOW`] mark on every line, so this is cheap
+    /// unless CE actually changes — which only diagnostics do.
+    fn set_error_control(&self, ce: bool, detect: bool) {
+        if !ECC { return; }
+        let e = self.perr();
+        e.detect = detect;
+        if e.ce != ce {
+            e.ce = ce;
+            self.mark_l1d_lines(ce);
+        }
+    }
+
+    fn take_cache_err(&self) -> u32 {
+        self.perr().cacheerr
+    }
+
+    fn take_op_status(&self) -> u32 {
+        if !ECC { return 0; }
+        std::mem::take(&mut self.perr().op_status)
+    }
+
+    fn cache_op_ecc(&self) -> u32 {
+        self.perr().ecc_out
     }
 
     fn get_config(&self, cache_target: u32) -> (usize, usize) {
@@ -3897,14 +4399,14 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 // front" fix.
                 let any_hit = (0..num_ways).any(|way| {
                     let eidx = set + way * sets_per_way;
-                    self.dc.get_tag(eidx).matches_phys(phys_addr)
+                    self.dc.get_tag(eidx).matches_line(phys_addr)
                 });
                 let mut s = format!("L1-D probe virt 0x{:016x} phys 0x{:016x} set=0x{:x}: {}\n",
                     virt_addr, phys_addr, set, if any_hit { "HIT" } else { "MISS" });
                 for way in 0..num_ways {
                     let eidx = set + way * sets_per_way;
                     let tag: L1DTag = self.dc.get_tag(eidx);
-                    let hit = tag.matches_phys(phys_addr);
+                    let hit = tag.matches_line(phys_addr);
                     let cs_str = match tag.cs as u32 {
                         L1D_CS_INVALID => "Invalid",
                         L1D_CS_SHARED => "Shared",
@@ -5049,6 +5551,13 @@ mod tests {
             // the D-cache's words all the way to memory.
             for i in 0..words { cache.write::<4>(va + 4 * i as u64, (phys + 4 * i) as u64, 0xdead_0000 + i as u64); }
             cache.cache_op(C_HWBINV | CACH_PI, va, phys as u64); // Fill(I)
+            // IDE on R4600/R4700/R5000: pin the line into the way VA[14]
+            // selects — load its tag, invalidate it, store the tag back by
+            // index, Fill again. The Fill must refill the pinned way.
+            let tag = cache.cache_op(C_ILT | CACH_PI, va, 0);
+            cache.cache_op(C_HINV | CACH_PI, va, phys as u64);
+            cache.cache_op(C_IST | CACH_PI, va, tag);
+            cache.cache_op(C_HWBINV | CACH_PI, va, phys as u64);
             cache.cache_op(C_HWBINV | CACH_PD, va, phys as u64);
             cache.cache_op(C_HWB | CACH_SD, va, phys as u64);
             assert_eq!(mem_read(&mem, phys), 0xdead_0000, "{name}: D-cache words reached memory");
@@ -5088,6 +5597,198 @@ mod tests {
         }
         check::<R4400Cache>("R4400");
         check::<R5000Cache>("R5000");
+    }
+
+    /// IDE `dcache1`, one word: with Status.CE set a store takes the ECC
+    /// register as its check bits, and the next load of it, with DE and ERL
+    /// clear, takes a Cache Error with CacheErr.ED set. Both CPUs implement
+    /// CE the same way (R4000 UM ch. 5, VR5000 UM 7.2.9).
+    #[cfg(feature = "cache-ecc")]
+    #[test]
+    fn forced_parity_raises_a_cache_error_on_the_next_load() {
+        fn check<C: MipsCache + From<Arc<dyn BusDevice>>>(name: &str) {
+            let mem = Arc::new(Memory::new(MEM_MB));
+            let cache: C = make_cache_of(mem.clone());
+            let phys: u32 = 0xa000;
+            let va = kseg0(phys);
+            cache.set_error_control(false, true);
+            assert_eq!(cache.write::<4>(va, phys as u64, 0), BUS_OK);
+
+            // IDE: set_ecc(0x55), SetSR(SR_FORCE_ON), store, load.
+            cache.set_cache_ecc(0x55);
+            cache.set_error_control(true, true);
+            assert_eq!(cache.write::<4>(va, phys as u64, 0x1010_1010), BUS_OK);
+            let r = cache.read::<4>(va, phys as u64);
+            assert_eq!(r.status, EXEC_CACHE_ERR, "{name}: load of a forced word");
+            let err = cache.take_cache_err();
+            assert_ne!(err & CACHEERR_ED, 0, "{name}: CacheErr.ED");
+            assert_ne!(err & CACHEERR_ER, 0, "{name}: CacheErr.ER (data)");
+
+            // DE (or ERL) masks it: the load completes with the data.
+            cache.set_error_control(true, false);
+            assert_eq!(cache.read::<4>(va, phys as u64).data, 0x1010_1010, "{name}: DE masks");
+
+            // The other word of the doubleword was not stored with CE.
+            cache.set_error_control(false, true);
+            assert!(cache.read::<4>(va + 4, phys as u64 + 4).is_ok(), "{name}: untouched lanes");
+
+            // IDE's handler: clear CE, Hit_Invalidate, store again.
+            cache.cache_op(C_HINV | CACH_PD, va, phys as u64);
+            assert_eq!(cache.write::<4>(va, phys as u64, 0x1010_1010), BUS_OK);
+            assert!(cache.read::<4>(va, phys as u64).is_ok(), "{name}: invalidated, refilled");
+
+            // Rewriting a forced word with CE clear also repairs it.
+            cache.set_error_control(true, true);
+            assert_eq!(cache.write::<4>(va, phys as u64, 0), BUS_OK);
+            cache.set_error_control(false, true);
+            assert_eq!(cache.write::<4>(va, phys as u64, 7), BUS_OK);
+            assert_eq!(cache.read::<4>(va, phys as u64).data, 7, "{name}: repaired by a clean store");
+
+        }
+        check::<R4400Cache>("R4400");
+        check::<R5000Cache>("R5000");
+    }
+
+    /// The parity machinery must leave the hit path alone: with CE clear and
+    /// nothing forced, no line carries the slow mark.
+    #[cfg(feature = "cache-ecc")]
+    #[test]
+    fn no_line_stays_marked_once_ce_clears_and_nothing_is_forced() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        let phys: u32 = 0xb000;
+        let va = kseg0(phys);
+        cache.set_error_control(false, true);
+        let _ = cache.read::<4>(va, phys as u64);
+        cache.set_error_control(true, true);
+        let idx = cache.dc.get_index(va);
+        assert_ne!(cache.dc.get_tag(idx).ptag & L1DTag::SLOW, 0, "CE marks resident lines");
+        cache.set_error_control(false, true);
+        assert!(cache.dc.get_tag(idx).matches_phys(phys as u64), "unmarked again");
+    }
+
+    /// IDE `icache1`, one line: with CE set, Fill(I) takes the ECC register as
+    /// the line's parity, and Hit_Writeback(I) then raises a Cache Error from
+    /// the CACHE instruction itself. With DE set it writes back normally; a
+    /// refill without CE clears it.
+    #[cfg(feature = "cache-ecc")]
+    #[test]
+    fn forced_icache_parity_faults_on_writeback() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        let phys: u32 = 0xe000;
+        let va = kseg0(phys);
+        cache.set_cache_ecc(0x55);
+        cache.set_error_control(true, true);              // SR_FORCE_ON
+        cache.cache_op(C_HWBINV | CACH_PI, va, phys as u64); // Fill(I)
+        cache.set_error_control(false, true);             // SR_FORCE_OFF
+        cache.cache_op(C_HWB | CACH_PI, va, phys as u64);
+        assert_eq!(cache.take_op_status(), EXEC_CACHE_ERR);
+        assert_ne!(cache.take_cache_err() & CACHEERR_ED, 0);
+        assert_eq!(cache.take_op_status(), 0, "reading the status clears it");
+
+        cache.set_error_control(false, false);            // DE: no fault
+        cache.cache_op(C_HWB | CACH_PI, va, phys as u64);
+        assert_eq!(cache.take_op_status(), 0);
+
+        cache.set_error_control(false, true);
+        cache.cache_op(C_HINV | CACH_PI, va, phys as u64);
+        cache.cache_op(C_HWBINV | CACH_PI, va, phys as u64); // Fill, CE clear
+        cache.cache_op(C_HWB | CACH_PI, va, phys as u64);
+        assert_eq!(cache.take_op_status(), 0, "a refill without CE computes parity");
+    }
+
+    /// Fill(I) refills the way that already holds the line, not the LRU way:
+    /// IDE pins a line into the way VA[14] selects with Index_Store_Tag and
+    /// then fills it.
+    #[test]
+    fn icache_fill_refills_the_way_holding_the_line() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache: R5000Cache = make_cache_of(mem.clone());
+        let phys: u32 = 0x8000;
+        let va = kseg0(phys);
+        mem_write(&mem, phys, 0x2400_0042);
+        let raw_ptag = (phys >> L1_PTAG_SHIFT) & L1_PTAG_MASK;
+        let way1 = va | 1 << 14;
+        cache.cache_op(C_IST | CACH_PI, way1, ((raw_ptag << 8) | 0x80) as u64);
+        cache.cache_op(C_HWBINV | CACH_PI, va, phys as u64); // Fill(I)
+        let eidx1 = cache.ic.get_index(va) | 1 << R5000Cache::IC_NUM_LINES_SHIFT;
+        assert_eq!(cache.l1i_word(eidx1, 0), 0x2400_0042, "way 1 was refilled");
+        let eidx0 = cache.ic.get_index(va);
+        assert!(!cache.ic.get_tag(eidx0).is_valid(), "way 0 untouched");
+    }
+
+    /// `L2_DATA_ECC_MASKS` is R4000 UM Figure 16-1, checked against what the
+    /// figure states: 27 ones per row with the check bit, weight-3 syndromes
+    /// except weight 5 for data bits 59, 58, 53, 52, 11, 10, 5 and 4, all
+    /// distinct, and the text's example (data bit 0 is `0001 0011`).
+    #[test]
+    fn l2_data_ecc_matrix_is_the_manuals() {
+        assert!(L2_DATA_ECC_MASKS.iter().all(|m| m.count_ones() + 1 == 27));
+        let mut seen = std::collections::HashSet::new();
+        for bit in 0..64 {
+            let syndrome = l2_data_ecc(1 << bit);
+            let weight = if [59, 58, 53, 52, 11, 10, 5, 4].contains(&bit) { 5 } else { 3 };
+            assert_eq!(syndrome.count_ones(), weight, "data bit {bit}");
+            assert!(seen.insert(syndrome), "data bit {bit} shares a syndrome");
+        }
+        assert_eq!(l2_data_ecc(1), 0b0001_0011);
+    }
+
+    /// IDE `scache1`, both halves, one doubleword.
+    ///
+    /// `scache_ecc_ram`: with CE set, a D-cache Index_Writeback_Invalidate XORs
+    /// the ECC register into the check bits of the doubleword it addresses as
+    /// the line goes to L2, and Index_Load_Tag(SD) reads them back into ECC.
+    /// `scache_ecc_intr`: with DE clear, refilling the primary from that line
+    /// takes a Cache Error with CacheErr.EC and ED set; Hit_Invalidate(SD)
+    /// clears it.
+    #[cfg(feature = "cache-ecc")]
+    #[test]
+    fn forced_secondary_ecc_reads_back_and_faults_on_refill() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        let phys: u32 = 0xc000;
+        let va = kseg0(phys);
+        cache.set_error_control(false, false); // SR_NOERR: DE set
+        assert_eq!(cache.write::<4>(va, phys as u64, 0), BUS_OK);
+        cache.set_cache_ecc(0x55);
+        cache.set_error_control(true, false); // SR_FORCE_NOERR
+        cache.cache_op(C_IWBINV | CACH_PD, va, va);
+        cache.set_error_control(false, false);
+        let _ = cache.read::<4>(va, phys as u64); // DE: no fault
+        cache.set_cache_ecc(0);
+        cache.cache_op(C_ILT | CACH_SD, va, va);
+        assert_eq!(cache.cache_op_ecc(), 0x55, "data 0 has check bits 0, so ECC reads the forced pattern");
+        // Other doublewords of the line were written back with computed bits.
+        cache.cache_op(C_ILT | CACH_SD, va + 8, va + 8);
+        assert_eq!(cache.cache_op_ecc(), 0);
+
+        // scache_ecc_intr: refill with detection on.
+        cache.cache_op(C_HINV | CACH_PD, va, phys as u64);
+        cache.set_error_control(false, true);
+        let r = cache.read::<4>(va, phys as u64);
+        assert_eq!(r.status, EXEC_CACHE_ERR);
+        let err = cache.take_cache_err();
+        assert_eq!(err & (CACHEERR_EC | CACHEERR_ED), CACHEERR_EC | CACHEERR_ED, "secondary, data field");
+
+        cache.cache_op(C_HINV | CACH_SD, va, phys as u64);
+        assert!(cache.read::<4>(va, phys as u64).is_ok(), "Hit_Invalidate(SD) clears it");
+    }
+
+    /// Index_Load_Tag(SD) on ordinary data loads the computed data ECC.
+    #[test]
+    #[cfg(all(feature = "cache-ecc", not(feature = "tcache")))]
+    fn index_load_tag_returns_the_data_ecc() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache = make_cache(mem.clone());
+        let phys: u32 = 0xd000;
+        let va = kseg0(phys);
+        mem_write(&mem, phys, 0x1234_5678);
+        mem_write(&mem, phys + 4, 0x9abc_def0);
+        let _ = cache.read::<4>(va, phys as u64);
+        cache.cache_op(C_ILT | CACH_SD, va, va);
+        assert_eq!(cache.cache_op_ecc(), l2_data_ecc(0x1234_5678_9abc_def0) as u32);
     }
 
     /// `L2_TAG_ECC_MASKS` is a transcription of R4000 UM Figure 16-4, and

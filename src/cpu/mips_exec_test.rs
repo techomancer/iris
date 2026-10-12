@@ -1774,6 +1774,30 @@ mod tests {
                    "EPC must point at the branch, i.e. fault_pc - 4");
     }
 
+    /// A Cache Error goes to the uncached vector (0xA000_0100, or 0xBFC0_0300
+    /// under BEV) with ERL and ErrorEPC, and changes nothing else: Cause, EPC
+    /// and EXL keep whatever they held (R4000 UM ch. 5, VR5000 UM 7.3.9).
+    #[test]
+    fn test_cache_error_takes_the_uncached_vector_with_erl() {
+        use crate::cpu::mips_core::{MipsCore, deliver_exception_at, STATUS_BEV, STATUS_ERL, STATUS_EXL};
+        use crate::cpu::mips_exec::EXEC_CACHE_ERR;
+
+        for (bev, vector) in [(false, 0xFFFF_FFFF_A000_0100u64), (true, 0xFFFF_FFFF_BFC0_0300)] {
+            let mut core = MipsCore::new();
+            core.cp0_status = if bev { STATUS_BEV } else { 0 };
+            core.cp0_cause = 0x1234;
+            core.cp0_epc = 0x5678;
+            deliver_exception_at(&mut core, EXEC_CACHE_ERR, 0xFFFF_FFFF_8800_0010, true);
+
+            assert_eq!(core.pc, vector, "BEV={bev}");
+            assert_eq!(core.cp0_errorepc, 0xFFFF_FFFF_8800_000C, "ErrorEPC: the branch, for a delay slot");
+            assert_ne!(core.cp0_status & STATUS_ERL, 0, "ERL set");
+            assert_eq!(core.cp0_status & STATUS_EXL, 0, "EXL untouched");
+            assert_eq!((core.cp0_cause, core.cp0_epc), (0x1234, 0x5678), "Cause/EPC untouched");
+            assert!(!core.in_delay_slot);
+        }
+    }
+
     /// CP0 instructions must be refused in user mode unless Status.CU0 is set.
     ///
     /// `exec_cop0` is the single dispatch point for MFC0/MTC0/TLB*/ERET/WAIT, and
