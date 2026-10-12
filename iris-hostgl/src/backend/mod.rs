@@ -3,15 +3,25 @@
 //!
 //! Everything else in the crate -- the call replay, drawables, the swap -- is
 //! OpenGL itself (legacy/compatibility profile, EXT_framebuffer_object and
-//! EXT_framebuffer_blit), so a second backend (EGL + Zink, say) implements
-//! this trait and nothing more. Its GL entry points must then be the ones the
-//! `gl` module links: that module names OpenGL.framework today and would
-//! grow a `cfg` for the other library.
+//! EXT_framebuffer_blit), so a backend implements this trait and nothing
+//! more. Its GL entry points must be the ones the `gl` module links:
+//! OpenGL.framework with CGL on the Mac, libGL (glvnd) with EGL on Linux.
 
 use std::ffi::c_void;
 
 #[cfg(target_os = "macos")]
 pub mod cgl;
+#[cfg(target_os = "linux")]
+pub mod egl;
+
+/// This platform's backend, or `None` if the host cannot make the contexts.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn native() -> Option<Box<dyn Backend>> {
+    #[cfg(target_os = "macos")]
+    return Some(Box::new(cgl::Cgl::new()));
+    #[cfg(target_os = "linux")]
+    return egl::EglBackend::new().map(|b| Box::new(b) as Box<dyn Backend>);
+}
 
 /// A GL context, opaque to everything but the backend that made it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

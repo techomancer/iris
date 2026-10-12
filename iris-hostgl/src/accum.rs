@@ -27,14 +27,15 @@
 //! state is saved around each pass and put back, so nothing it can see moves.
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CString};
 
 use crate::gl::*;
 
-#[link(name = "OpenGL", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
+#[cfg_attr(target_os = "linux", link(name = "GL"))]
 extern "C" {
     fn glCreateShader(kind: u32) -> u32;
-    fn glShaderSource(s: u32, count: i32, strings: *const *const i8, lengths: *const i32);
+    fn glShaderSource(s: u32, count: i32, strings: *const *const c_char, lengths: *const i32);
     fn glCompileShader(s: u32);
     fn glGetShaderiv(s: u32, pname: u32, out: *mut i32);
     fn glCreateProgram() -> u32;
@@ -42,7 +43,7 @@ extern "C" {
     fn glLinkProgram(p: u32);
     fn glGetProgramiv(p: u32, pname: u32, out: *mut i32);
     fn glUseProgram(p: u32);
-    fn glGetUniformLocation(p: u32, name: *const i8) -> i32;
+    fn glGetUniformLocation(p: u32, name: *const c_char) -> i32;
     fn glUniform1i(loc: i32, v: i32);
     fn glUniform4f(loc: i32, a: f32, b: f32, c: f32, d: f32);
     fn glGenTextures(n: i32, ids: *mut u32);

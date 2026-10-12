@@ -88,10 +88,10 @@ pub mod build_features {
     /// or doesn't, decided at build time.
     pub const HOSTCALL: bool = cfg!(feature = "hostcall");
     /// Host OpenGL for IRIX programs over host call 3000 (`iris-hostgl`).
-    /// Implies `hostcall`. Only macOS has a backend (CGL) — `hostgl` can be
-    /// built elsewhere, but `register()` then has nothing to register, so
-    /// this is `false` off macOS even in a `--features hostgl` build.
-    pub const HOSTGL: bool = cfg!(feature = "hostgl") && cfg!(target_os = "macos");
+    /// Implies `hostcall`. macOS (CGL) and Linux (EGL) have backends —
+    /// `hostgl` can be built elsewhere, but `register()` then has nothing to
+    /// register, so this is `false` there even in a `--features hostgl` build.
+    pub const HOSTGL: bool = cfg!(feature = "hostgl") && cfg!(any(target_os = "macos", target_os = "linux"));
     // There is deliberately no `CPU` constant here any more. The emulated CPU
     // stopped being a build-time property: all three CPU/cache models are
     // monomorphised into every binary and `Machine::new` picks between them

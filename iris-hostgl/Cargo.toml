@@ -9,7 +9,7 @@ license = "BSD-3-Clause"
 iris-hostcall = { path = "../iris-hostcall" }
 log = "0.4"
 
-# The only backend so far is Apple's OpenGL.framework (CGL); elsewhere the
-# crate builds and registers nothing.
-[target.'cfg(target_os = "macos")'.dependencies]
+# Backends: Apple's OpenGL.framework (CGL) on the Mac, EGL with libGL (glvnd)
+# on Linux; elsewhere the crate builds and registers nothing.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 libc = "0.2"

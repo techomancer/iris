@@ -17,9 +17,14 @@ use std::sync::Mutex;
 
 use iris_hostcall::{Fault, GuestMemory, PageAccess, Reply, Service, PAGE};
 
-use crate::backend::cgl::Cgl;
+use crate::backend::Backend;
 use crate::calls;
 use crate::service::*;
+
+/// This host's backend; the tests need one.
+fn backend() -> Box<dyn Backend> {
+    crate::backend::native().expect("this host makes OpenGL contexts")
+}
 
 const GL_COLOR_BUFFER_BIT: i32 = 0x4000;
 const GL_TRIANGLES: i32 = 0x0004;
@@ -231,7 +236,7 @@ pub(crate) struct Guest {
 
 impl Guest {
     pub(crate) fn new(pages: usize) -> Guest {
-        Guest::on(Rc::new(RefCell::new(GlService::new(Box::new(Cgl::new())))), pages)
+        Guest::on(Rc::new(RefCell::new(GlService::new(backend()))), pages)
     }
 
     /// Another process of the same service.
@@ -523,11 +528,11 @@ fn addresses_above_4gb_arrive_whole() {
     let out = mem.alloc(8, 0);
     cmd[16..24].copy_from_slice(&out.to_be_bytes());
 
-    let backend = Cgl::new();
+    let backend = backend();
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
     assert_eq!(x.addr(&cmd, 16), out);
     assert_eq!(x.arr::<f32>(&cmd, 4).expect("decoded"), vec![1.5, -2.0, 3.25, 8.0]);
     x.put::<u32>(x.addr(&cmd, 16), &[0xdead_beef, 7]).expect("queued");
@@ -549,17 +554,17 @@ fn by_reference_array_decodes_across_a_page_boundary() {
     cmd[4..8].copy_from_slice(&(n as u32 | 0x8000_0000).to_be_bytes());
     cmd[8..16].copy_from_slice(&at.to_be_bytes());
 
-    let backend = Cgl::new();
+    let backend = backend();
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
     {
-        let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+        let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
         assert!(x.arr::<f64>(&cmd, 4).is_none());
         assert_eq!(x.fault, Some(Fault { page: (at & !(PAGE - 1)) + PAGE, write: false }));
     }
     mem.touch(Fault { page: (at & !(PAGE - 1)) + PAGE, write: false });
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
     let v = x.arr::<f64>(&cmd, 4).expect("decoded");
     assert_eq!(x.fault, None);
     assert_eq!(v.len(), n);
@@ -590,11 +595,11 @@ fn array_arguments_hold_what_the_call_reads() {
     cmd[8..16].copy_from_slice(&16u64.to_be_bytes());
     cmd[16..20].copy_from_slice(&2.5f32.to_be_bytes());
 
-    let backend = Cgl::new();
+    let backend = backend();
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
     let slack = crate::exec::ARRAY_SLACK;
     let short = x.arr_padded::<f32>(&cmd, 4, 16).expect("decoded");
     assert_eq!(short.len(), 16 + slack);
@@ -997,7 +1002,7 @@ fn inline_and_by_reference_arrays_and_results() {
 
 #[test]
 fn hello_and_unknown_clients() {
-    let mut svc = GlService::new(Box::new(Cgl::new()));
+    let mut svc = GlService::new(backend());
     let mut mem = Proc::new(4);
     assert_eq!(svc.call(&mut mem, &[OP_HELLO, PROTOCOL + 1, 0, 0, 0, 0, 0, 0]), Reply::Ok(0, PROTOCOL), "a mismatch gets no client");
     assert_eq!(svc.call(&mut mem, &[OP_FINISH, 0, 99, 1, 0, 0, 0, 0]), Reply::Err(22));
@@ -1205,7 +1210,7 @@ impl Tlb {
 /// each far more pages than the TLB holds.
 #[test]
 fn through_the_framework_with_a_48_entry_tlb() {
-    iris_hostcall::register(iris_hostcall::GL, Box::new(GlService::new(Box::new(Cgl::new()))));
+    iris_hostcall::register(iris_hostcall::GL, Box::new(GlService::new(backend())));
     let mut t = Tlb { proc_: Proc::new(2048), entries: VecDeque::new() };
     let slots = t.proc_.alloc(64, 0);
     let (r, _) = t.call([OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]);
@@ -1468,7 +1473,7 @@ struct Threads {
 
 impl Threads {
     fn new() -> Threads {
-        let mut svc = crate::threaded::Threaded::spawn(GlService::new(Box::new(Cgl::new())));
+        let mut svc = crate::threaded::Threaded::spawn(GlService::new(backend()));
         let mut mem = Proc::new(512);
         let slots = mem.alloc(64, 0);
         let Reply::Ok(client, PROTOCOL) = call_on(&mut svc, &mut mem, [OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]) else {

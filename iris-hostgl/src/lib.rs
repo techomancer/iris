@@ -29,45 +29,47 @@
 //! - `threaded`: the service on its own thread, so the emulated CPU is not
 //!   held while a command buffer runs.
 //! - `backend`: what is platform-specific -- contexts, entry point lookup, a
-//!   CPU-addressable render target. Apple's CGL today.
-//! - `calls`, `ext`: generated tables.
+//!   CPU-addressable render target. CGL on the Mac, EGL on Linux.
+//! - `calls`, `ext`, `avail`: generated tables.
 //!
-//! Only macOS has a backend so far. Elsewhere the crate builds and
-//! [`register`] does nothing, so the host call keeps answering EINVAL and the
-//! library says host GL is not available.
+//! macOS and Linux have backends. Elsewhere the crate builds and [`register`]
+//! does nothing, so the host call keeps answering EINVAL and the library says
+//! host GL is not available.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod accum;
+#[cfg(target_os = "linux")]
+mod avail;
 mod backend;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod calls;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod draw;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(dead_code)] // enumerants and entry points kept for the extensions they document
 mod emul;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod exec;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod ext;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod gl;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod present;
 pub mod qos;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod service;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod threaded;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
 
 /// The generated decoder names its executor as `super::Exec`.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use exec::Exec;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use service::{
     GlService, OP_BATCH, OP_BATCH_ASYNC, OP_CREATE, OP_DESTROY, OP_DRAWABLE_GONE, OP_FINISH, OP_GETSTRING, OP_GLX_STRING, OP_GOODBYE, OP_HELLO,
     OP_MAKECURRENT, OP_PBUFFER, OP_RELEASE, OP_SWAP, OP_SWAP_INTERVAL, OP_VIDEO_SYNC, PROTOCOL,
@@ -82,19 +84,22 @@ pub use service::{
 /// on the thread that makes the calls (the CPU thread), so call this from that
 /// thread or before it starts.
 pub fn register() {
-    #[cfg(target_os = "macos")]
-    {
-        let backend = Box::new(backend::cgl::Cgl::new());
-        let svc = GlService::new(backend);
-        if std::env::var_os("IRIS_HOSTGL_INLINE").is_some() {
-            iris_hostcall::register(iris_hostcall::GL, Box::new(svc));
-            log::info!("host GL: service registered (CGL backend, on the CPU thread)");
-        } else {
-            iris_hostcall::register(iris_hostcall::GL, Box::new(threaded::Threaded::spawn(svc)));
-            log::info!("host GL: service registered (CGL backend, on its own thread)");
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    match backend::native() {
+        Some(backend) => {
+            let name = backend.name();
+            let svc = GlService::new(backend);
+            if std::env::var_os("IRIS_HOSTGL_INLINE").is_some() {
+                iris_hostcall::register(iris_hostcall::GL, Box::new(svc));
+                log::info!("host GL: service registered ({name} backend, on the CPU thread)");
+            } else {
+                iris_hostcall::register(iris_hostcall::GL, Box::new(threaded::Threaded::spawn(svc)));
+                log::info!("host GL: service registered ({name} backend, on its own thread)");
+            }
         }
+        None => log::warn!("host GL: this host cannot make OpenGL contexts; host call {} stays unanswered", iris_hostcall::GL),
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     log::info!("host GL: no backend for this platform; host call {} stays unanswered", iris_hostcall::GL);
 }
 
@@ -107,7 +112,7 @@ pub fn register() {
 /// whoever asks first. Names from a high range no program picks by hand cannot
 /// collide, and a program that does generate names is still given ones the
 /// host knows are free.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn internal_texture_name() -> u32 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x7F00_0000);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

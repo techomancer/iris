@@ -10,6 +10,7 @@
 use std::ffi::c_void;
 
 #[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
+#[cfg_attr(target_os = "linux", link(name = "GL"))]
 extern "C" {
     pub fn glFlush();
     pub fn glFinish();

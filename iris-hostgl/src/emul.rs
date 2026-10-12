@@ -18,22 +18,23 @@
 //! program that turns a feature on and off pays for the build once.
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CString};
 
-#[link(name = "OpenGL", kind = "framework")]
+#[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
+#[cfg_attr(target_os = "linux", link(name = "GL"))]
 extern "C" {
     fn glCreateShader(kind: u32) -> u32;
-    fn glShaderSource(s: u32, count: i32, strings: *const *const i8, lengths: *const i32);
+    fn glShaderSource(s: u32, count: i32, strings: *const *const c_char, lengths: *const i32);
     fn glCompileShader(s: u32);
     fn glGetShaderiv(s: u32, pname: u32, out: *mut i32);
-    fn glGetShaderInfoLog(s: u32, max: i32, len: *mut i32, log: *mut i8);
+    fn glGetShaderInfoLog(s: u32, max: i32, len: *mut i32, log: *mut c_char);
     fn glCreateProgram() -> u32;
     fn glAttachShader(p: u32, s: u32);
     fn glLinkProgram(p: u32);
     fn glGetProgramiv(p: u32, pname: u32, out: *mut i32);
-    fn glGetProgramInfoLog(p: u32, max: i32, len: *mut i32, log: *mut i8);
+    fn glGetProgramInfoLog(p: u32, max: i32, len: *mut i32, log: *mut c_char);
     fn glUseProgram(p: u32);
-    fn glGetUniformLocation(p: u32, name: *const i8) -> i32;
+    fn glGetUniformLocation(p: u32, name: *const c_char) -> i32;
     fn glUniform1i(loc: i32, v: i32);
     fn glUniform4f(loc: i32, a: f32, b: f32, c: f32, d: f32);
     fn glUniform1f(loc: i32, v: f32);
@@ -1719,7 +1720,7 @@ void main()
             return;
         }
         self.reported = true;
-        let mut buf = vec![0i8; 2048];
+        let mut buf: Vec<c_char> = vec![0; 2048];
         let mut n = 0;
         let log = unsafe {
             if program {

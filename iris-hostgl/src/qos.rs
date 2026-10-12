@@ -25,6 +25,7 @@
 //! measured both ways. That is the point: a difference between two builds
 //! proves much less than a difference between two runs of one.
 
+#[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
 /// `QOS_CLASS_USER_INTERACTIVE` from `<sys/qos.h>`.
