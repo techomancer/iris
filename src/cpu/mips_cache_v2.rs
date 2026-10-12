@@ -2495,6 +2495,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// Ensures data is in L2 first, then populates L1-I.
     /// For C_FILL operation, phys_addr is used for indexing.
     /// Returns 0 = way0 ok, 1 = way1 ok (R5K), >1 = exception status (EXC_VCEI or EXC_IBE).
+    ///
+    /// The miss path: kept out of line and cold so its size never decides
+    /// whether `fetch` inlines into the interpreter loop. When the `ic_raw`
+    /// snapshot grew this function, `fetch` stopped inlining and every
+    /// instruction paid a call — about x0.84 on the whole interpreter suite.
+    #[inline(never)]
+    #[cold]
     fn fill_l1i_line(&self, index_addr: u64, phys_addr: u64) -> u32 {
         let set = self.ic.get_index(index_addr);
 
@@ -3587,6 +3594,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const L2_SIZE: usize = if HAS_L2 { L2_CACHE_SIZE } else { 0 };
     const L2_LINE: usize = L2_LINE;
 
+    /// The interpreter's per-instruction hit path: must inline into
+    /// `step_int`. See `fill_l1i_line` for what happened when it did not.
+    #[inline(always)]
     fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         if Self::IS_R5K {
             #[cfg(feature = "debug_cache")]
