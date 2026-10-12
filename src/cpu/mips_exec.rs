@@ -2928,13 +2928,11 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_window`: `base` must be ppmem's
     /// window base and `bitmap` a live `u64` outliving this cache.
-    #[cfg(feature = "tcache")]
     pub unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { self.cache.set_tcache_window(base) };
     }
 
     /// tcache: pointer to the cache's inline bitmap field.
-    #[cfg(feature = "tcache")]
     pub fn tcache_bitmap_ptr(&self) -> *mut u64 {
         self.cache.tcache_bitmap_ptr()
     }
@@ -10542,13 +10540,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
     ///
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_window`.
-    #[cfg(feature = "tcache")]
     pub unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { self.executor.lock().set_tcache_window(base) };
     }
 
     /// tcache: pointer to the cache's inline bitmap field.
-    #[cfg(feature = "tcache")]
     pub fn tcache_bitmap_ptr(&self) -> *mut u64 {
         self.executor.lock().tcache_bitmap_ptr()
     }
@@ -14247,10 +14243,8 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     ///
     /// # Safety
     /// Same contract as `CpuCache::set_tcache_window`.
-    #[cfg(feature = "tcache")]
     unsafe fn set_tcache_window(&self, base: *mut u8);
     /// tcache: pointer to the cache's inline mapped-region bitmap.
-    #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64;
     /// tcache + jitv2: hand the cache ppmem's generation-window base.
     ///
@@ -14296,11 +14290,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr { MipsCpu::cycles_ptr(self) }
     fn interrupts_ptr(&self) -> *const AtomicU64 { MipsCpu::interrupts_ptr(self) }
     fn ppmem_bitmap_ptr(&self) -> *mut u64 { MipsCpu::ppmem_bitmap_ptr(self) }
-    #[cfg(feature = "tcache")]
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { MipsCpu::set_tcache_window(self, base) }
     }
-    #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { MipsCpu::tcache_bitmap_ptr(self) }
     #[cfg(feature = "jitv2")]
     unsafe fn set_tcache_gen_window(&self, gen_base: *mut AtomicU64) {

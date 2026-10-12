@@ -554,17 +554,14 @@ pub trait MipsCache: Send + Sync {
     /// # Safety
     /// `base` must be ppmem's window base and `bitmap` a live `u64` that
     /// outlives this cache.
-    #[cfg(feature = "tcache")]
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
 
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
-    #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
 
     /// tcache: base of the ppmem window this cache reads/writes through
     /// (`tc_base + phys`). Null until `set_transparent_base` runs.
-    #[cfg(feature = "tcache")]
     fn tcache_base_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
 
     /// tcache: base of the jitv2 per-page generation array (`[AtomicU64]`,

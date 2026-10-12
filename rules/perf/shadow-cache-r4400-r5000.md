@@ -29,8 +29,44 @@ full model keeps decoded instructions in its lines. On a pure interpreter
 build the shadow is about ×0.55–0.6 (measured 2026-10-11, `--quick`), which is
 why `auto` keeps the full cache there.
 
-`mem/latency_dram` and `mem/random` (×0.7) do not obviously fit that pattern.
-Unexplained, worth checking with the decode cache.
+`mem/latency_dram` and `mem/random` (×0.7) did not obviously fit that pattern;
+both recovered once the shadow read RAM through the ppmem window (below).
+
+## Decode cache and ppmem window (`decode-cache`)
+
+`src/cpu/decode_cache.rs`: decoded instructions by physical page, plugged into
+`ShadowCache::fetch` only, never touching the shadow's tag arrays. The shadow
+also reads and writes RAM through ppmem's window in every build (the window
+hand-over is no longer gated on `tcache`). PROM, MMIO and the low-512KB alias
+are not RAM in ppmem's bitmap and go through the bus.
+
+Shadow vs full, measured 2026-10-12 (interpreter: `--quick`, best of 2;
+jitv2: full-length):
+
+| step | interp R4400 | interp R5000 |
+|---|---|---|
+| shadow alone | ×0.71 | ×0.53 |
+| + decode cache, bus reads | ×0.77 | ×0.57 |
+| + ppmem window | ×1.03 | ×0.72 |
+| + inlined fetch fast path | **×1.36** | **×1.03** |
+
+jitv2, shadow + both: **×1.52** on both CPUs; accuracy identical.
+
+Lessons, each measured:
+- **Decode was not the main cost.** Bus reads were: every raw-compare fetch
+  and every data access through the dynamic `BusDevice` call. Profile first.
+- **Validate by compare, not by jitv2's write-generation counters.** Through
+  the window a compare is one host load, and it measured equal or faster
+  (raw/gen ×1.05 R4400, ×1.00 R5000). It also works without jitv2 and outside
+  RAM.
+- **Inline the hit path, keep the fill cold.** `ShadowCache::fetch` was a call
+  taking 34% of R5000 interpreter time; `#[inline(always)]` on a small hit
+  path, with `#[inline(never)] #[cold]` on the rest, closed most of the gap.
+- **Each decoded page keeps a pointer to its window page** (null for bus
+  pages), taken once at page fill; the cache records the region bitmap it was
+  filled under and starts over when it changes (remap).
+
+Still lagging: `sys/tlb_miss` (×0.66–0.76 jitv2, ×0.73 R5000 interp).
 
 ## What software sees
 

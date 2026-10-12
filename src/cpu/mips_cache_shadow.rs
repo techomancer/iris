@@ -37,7 +37,7 @@ use crate::cpu::mips_cache_v2::{
     C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
 use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
-use crate::traits::{BusDevice, BusRead64};
+use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
 /// Shadow tag and data arrays for one cache.
@@ -156,12 +156,14 @@ pub struct ShadowCache<
     /// reads nothing through them — `read`/`write` go to `downstream`, whose
     /// ppmem path uses the same window — they are here only so jitv2's inline
     /// tcache path can serve this model too (`jit_dc_geometry`).
-    #[cfg(feature = "tcache")]
     tc_base: UnsafeCell<*mut u8>,
-    #[cfg(feature = "tcache")]
     tc_bitmap: UnsafeCell<u64>,
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
+    /// Decoded instructions, by physical page. Never touches the shadow
+    /// arrays above — see `decode_cache`.
+    #[cfg(feature = "decode-cache")]
+    decode: UnsafeCell<crate::cpu::decode_cache::DecodeCache>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -209,12 +211,38 @@ impl<
             // the IP28 PROM walks with Index_Store_Data, and a 1 MB array is
             // cheap once. The R4000 family has no index data ops.
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
-            #[cfg(feature = "tcache")]
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
-            #[cfg(feature = "tcache")]
             tc_bitmap: UnsafeCell::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
+            #[cfg(feature = "decode-cache")]
+            decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
+        }
+    }
+
+    /// ppmem's window base if `phys` is RAM the window maps, as the region
+    /// bitmap says; `None` for the PROM, MMIO and the low-512KB alias, which go
+    /// through the bus. The bitmap stays zero until the window is wired, so a
+    /// set bit also means the base is valid.
+    #[inline(always)]
+    fn ram(&self, phys: u64) -> Option<*mut u8> {
+        if unsafe { *self.tc_bitmap.get() } & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)) != 0 {
+            Some(unsafe { *self.tc_base.get() })
+        } else {
+            None
+        }
+    }
+
+    /// A window store skips `BusDevice`, so it bumps the page's jitv2
+    /// generation counter itself, as `PpMemory`'s writes do.
+    #[inline(always)]
+    fn bump_gen(&self, _phys: u64) {
+        #[cfg(feature = "jitv2")]
+        {
+            let g = unsafe { *self.tc_gen.get() };
+            if !g.is_null() {
+                unsafe { (*g.add((_phys >> 12) as usize)).fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
+            }
         }
     }
 
@@ -337,15 +365,14 @@ impl<
     const L2_SIZE: usize = L2_SIZE;
     const L2_LINE: usize = L2_LINE;
 
-    #[cfg(feature = "tcache")]
+    // ppmem's window, in every build: memory is this cache's only store, and
+    // reading RAM through the window is one host load instead of a bus call.
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { *self.tc_base.get() = base };
     }
 
-    #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.get() }
 
-    #[cfg(feature = "tcache")]
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
     #[cfg(feature = "jitv2")]
@@ -372,7 +399,22 @@ impl<
         crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()
     }
 
+    #[inline(always)]
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
+        #[cfg(feature = "decode-cache")]
+        {
+            let dc = unsafe { &mut *self.decode.get() };
+            let word = |a: u32| {
+                let r = self.downstream.read32(a);
+                if r.is_ok() { Ok(r.data) } else { Err(r.status) }
+            };
+            let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, *self.tc_bitmap.get()) };
+            return match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
+                Ok(p) => FetchInstrResult::hit(p),
+                Err(status) => FetchInstrResult::exception(status),
+            };
+        }
+        #[allow(unreachable_code)]
         let r = self.downstream.read32(phys_addr as u32);
         if r.is_ok() {
             let slot = unsafe { &mut *self.fetch_scratch.get() };
@@ -388,6 +430,24 @@ impl<
         const {
             assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE")
         };
+        // RAM: one load out of ppmem's window. Its layout is u32 words in
+        // native order — byte at `off ^ 3`, halfword at `(off >> 1) ^ 1`,
+        // u64 as rotate_left(32) — the same as CpuCache::tc_read.
+        if let Some(base) = self.ram(phys_addr) {
+            let off = phys_addr as usize;
+            let data = unsafe {
+                if SIZE == 8 {
+                    (*(base.add(off) as *const u64)).rotate_left(32)
+                } else if SIZE == 4 {
+                    *(base.add(off) as *const u32) as u64
+                } else if SIZE == 2 {
+                    *((base as *const u16).add((off >> 1) ^ 1)) as u64
+                } else {
+                    *base.add(off ^ 3) as u64
+                }
+            };
+            return BusRead64::ok(data);
+        }
         let a = phys_addr as u32;
         if SIZE == 1 {
             let r = self.downstream.read8(a);
@@ -407,6 +467,22 @@ impl<
         const {
             assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE")
         };
+        if let Some(base) = self.ram(phys_addr) {
+            let off = phys_addr as usize;
+            unsafe {
+                if SIZE == 8 {
+                    *(base.add(off) as *mut u64) = val.rotate_left(32);
+                } else if SIZE == 4 {
+                    *(base.add(off) as *mut u32) = val as u32;
+                } else if SIZE == 2 {
+                    *((base as *mut u16).add((off >> 1) ^ 1)) = val as u16;
+                } else {
+                    *base.add(off ^ 3) = val as u8;
+                }
+            }
+            self.bump_gen(phys_addr);
+            return BUS_OK;
+        }
         let a = phys_addr as u32;
         if SIZE == 1 {
             self.downstream.write8(a, val as u8)
@@ -420,6 +496,15 @@ impl<
     }
 
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
+        if let Some(base) = self.ram(phys_addr) {
+            let p = unsafe { base.add((phys_addr & !7) as usize) as *mut u64 };
+            unsafe {
+                let cur = (*p).rotate_left(32);
+                *p = ((cur & !mask) | (val & mask)).rotate_left(32);
+            }
+            self.bump_gen(phys_addr);
+            return BUS_OK;
+        }
         let aligned = (phys_addr & !7) as u32;
         let r = self.downstream.read64(aligned);
         if !r.is_ok() {
@@ -539,6 +624,26 @@ impl<
             // no-ops: there is nothing held that could be stale or dirty.
             _ => 0,
         }
+    }
+
+    /// Power-on: tags read back invalid, and nothing decoded survives — RAM
+    /// may be reloaded without a write counter moving.
+    fn power_on(&self) {
+        for sel in [CACH_PI, CACH_PD, CACH_SD] {
+            let s = self.shadow(sel);
+            s.tags.fill(0);
+            s.mru.fill(false);
+        }
+        #[cfg(feature = "decode-cache")]
+        unsafe { (*self.decode.get()).flush() };
+    }
+
+    /// A restore replaces RAM wholesale; drop every decoded instruction. The
+    /// shadow arrays are not snapshotted (nothing reads them but diagnostics).
+    fn load_cache_state(&self, _v: &toml::Value) -> Result<(), String> {
+        #[cfg(feature = "decode-cache")]
+        unsafe { (*self.decode.get()).flush() };
+        Ok(())
     }
 
     fn get_config(&self, cache_target: u32) -> (usize, usize) {

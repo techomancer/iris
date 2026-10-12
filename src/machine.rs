@@ -845,15 +845,20 @@ impl Machine {
                 let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
                 (*phys_ptr).resync_ppmem_bitmap();
             }
-            // tcache: the cache reads RAM straight out of the same window.
-            // Must come after set_bitmap_sink, so it captures the CPU's inline
-            // field rather than the sink the space just abandoned.
-            #[cfg(feature = "tcache")]
+            // The cache reads RAM straight out of the same window: the full
+            // cache under tcache, the shadow cache always. A cache that does
+            // not (the full cache without tcache) has no bitmap field and
+            // returns null. Must come after set_bitmap_sink, so it captures
+            // the CPU's inline field rather than the sink the space just
+            // abandoned.
             if let Some(sp) = phys.ppmem_space() {
                 unsafe { cpu.set_tcache_window(sp.window_base()) };
                 // The cache keeps the bitmap inline; ppmem publishes into it
                 // directly on every remap, so the hot path needs no indirection.
-                unsafe { sp.set_bitmap_sink2(cpu.tcache_bitmap_ptr()) };
+                let bitmap = cpu.tcache_bitmap_ptr();
+                if !bitmap.is_null() {
+                    unsafe { sp.set_bitmap_sink2(bitmap) };
+                }
                 // Window writes bypass BusDevice, so the cache needs the gen
                 // window to bump page counters itself — otherwise jitv2 keeps
                 // running compiled code for pages the guest has modified.
