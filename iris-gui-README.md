@@ -40,7 +40,7 @@ emulation will be noticeably slow.
 |---|---|
 | `pcap` | PCAP bridged networking; the Networking tab lists host interfaces. Needs libpcap / a WinPcap-compatible SDK |
 | `hostcall` | Host services for IRIX programs over private syscalls 3000-3009. No per-machine setting — the Debug tab just reports it's built in |
-| `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) only for now — builds elsewhere but registers no backend |
+| `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) and Linux (EGL; needs libGL to build, libEGL and Mesa's EGL/DRI drivers at run time; see CHANGELOG) — builds elsewhere but registers no backend |
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
 | `bundled` | Distributed build: hides the iris.toml import/export items. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |

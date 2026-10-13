@@ -150,6 +150,26 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **Host GL on Linux.** `--features hostgl` now has an EGL backend
+  (`iris-hostgl/src/backend/egl.rs`): headless contexts in the compatibility
+  profile with no surface at all (every drawable was already a framebuffer
+  object), on Mesa's surfaceless platform, so no X or Wayland session is
+  involved. libEGL is opened at run time; building links libGL (glvnd):
+  `libgl-dev` on Debian/Ubuntu, `libglvnd-devel` on Fedora, `libglvnd` on
+  Arch. Running needs libEGL and Mesa's EGL and DRI drivers: `libegl1
+  libegl-mesa0 libgl1-mesa-dri` on Debian/Ubuntu (`libegl-mesa0` alone does
+  not bring libEGL), `mesa-libEGL mesa-dri-drivers` on Fedora, `mesa` on
+  Arch. glvnd and Mesa hand
+  out a stub for any `gl*` name, so entry points are looked up only when the
+  context's version or extensions provide them (`src/avail.rs`, generated
+  from the pinned registry by `tools/gl_avail.py`). The service's own texture
+  names now count down from the top, out of the way of Mesa's, which come
+  from the bottom whatever the program asked for. Debian 12 arm64 (Mesa
+  22.3, virgl, GL 4.0 compatibility): hostgl tests 31/31, gltest 167/167 n32
+  and o32, glcheck with the reference checksum, irisgltest, Quake 3. Fedora
+  44, Arch and Ubuntu 24.04 (x86_64, Mesa's software renderer, no GPU):
+  builds, hostgl tests 31/31. See
+  `rules/hostgl/linux-egl-and-mesa.md`.
 - **Host GL no longer stops the machine while it draws.** A host call is
   answered on the emulated CPU's thread, so while host GL replayed a
   command buffer (2-5 ms for a big one) no instruction ran and no interrupt

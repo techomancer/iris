@@ -232,9 +232,9 @@ condition; update the linked guide and changelog when it lands.
 
 ## Host services, GUI, and delivery
 
-- [ ] **Implementation — HostGL platform and extension coverage.** macOS CGL
-  is the only backend; Linux/Windows builds register no GL service. Either add
-  those backends or keep availability explicit. Inventory unavailable GL
+- [ ] **Implementation — HostGL platform and extension coverage.** macOS (CGL)
+  and Linux (EGL) have backends; Windows builds register no GL service. Either
+  add that backend or keep availability explicit. Inventory unavailable GL
   entry points and finish SGIS detail/sharpen/filter query result lengths,
   which currently report unsupported. Complete when guest capability queries,
   marshalling/readback, contexts/drawables, and representative GL apps behave

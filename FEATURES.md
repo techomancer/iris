@@ -49,7 +49,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `jitv2_smc_check` | Report writes to the executing code page; disable inline memory to observe all stores. | `jitv2` |
 | `pcap` | Raw Ethernet bridge backend; needs host capture library/driver and capture permissions. | `dep:pcap` |
 | `hostcall` | Private user-mode guest syscall services 3000–3009; IRIX handles other calls. | `dep:iris-hostcall` |
-| `hostgl` | Guest replacement-libGL command replay; macOS CGL backend only. | `hostcall`, `dep:iris-hostgl` |
+| `hostgl` | Guest replacement-libGL command replay; macOS (CGL) and Linux (EGL) backends. | `hostcall`, `dep:iris-hostgl` |
 
 Cargo also exposes these **implicit optional-dependency features**:
 `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `region`, `target-lexicon`, `wasmtime-jit-icache-coherence`. They enable library dependencies,
@@ -515,7 +515,7 @@ both the interpreter and jitv2.
 | `jitv2_smc_check` | Report writes into the page the CPU is executing (run with `j2 inline_mem off`) |
 | `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
 | `j2wp` | Compatibility alias for `jitv2`; whole-page compilation is the only implementation |
-| `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has a macOS CGL backend |
+| `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has macOS (CGL) and Linux (EGL) backends |
 | `debug_cache` | Track one cache line across all operations |
 | `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
 | `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`rules/testing/r5k-l1i-cache-bugs.md`) |

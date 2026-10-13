@@ -1587,11 +1587,11 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.end_row();
         ui.label("Host services / Host GL");
         ui.label(match (build_features::HOSTCALL, build_features::HOSTGL) {
-            (_, true) => "built in — IRIX OpenGL programs render on the host GPU (CGL)",
-            (true, false) if cfg!(target_os = "macos") =>
+            (_, true) => "built in — IRIX OpenGL programs render on the host GPU",
+            (true, false) if cfg!(any(target_os = "macos", target_os = "linux")) =>
                 "hostcall only — rebuild with --features hostgl for host OpenGL",
             (true, false) =>
-                "hostcall only — host GL has no backend on this OS yet (macOS/CGL only)",
+                "hostcall only — host GL has no backend on this OS yet (macOS and Linux only)",
             (false, _) => "not built — rebuild with --features hostgl for host OpenGL",
         });
         ui.end_row();
