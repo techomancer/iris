@@ -1811,8 +1811,8 @@ impl Gl {
         sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
         sink.rss_write(re::BLOCK_XYSTARTI, xy(cx0, cy0), false);
         sink.rss_write(re::BLOCK_XYENDI, xy(cx1, cy1), true);
-        let src_px = |r: usize, c: usize| -> [u8; 8] {
-            let mut px = [0u8; 8];
+        let src_px = |r: usize, c: usize| -> [u8; 16] {
+            let mut px = [0u8; 16];
             for (k, b) in px.iter_mut().enumerate().take(bpp) {
                 let i = r * wpr * 4 + c * bpp + k;
                 *b = words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);

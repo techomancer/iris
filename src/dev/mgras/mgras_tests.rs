@@ -1726,6 +1726,46 @@ fn gl_draw_pixels_negative_zoom_runs_down() {
     m.stop_engines();
 }
 
+/// A GE pixel state block as libGLcore writes it (0x080 GE memory, 0x0CD
+/// ERAM): [?, ?, bytes, address, 0, 0, count, values, count, values].
+fn ge_state(m: &Mgras, token: u32, addr: u32, vals: &[u32]) {
+    let mut d = vec![1, 2, 4 * vals.len() as u32, addr, 0, 0, vals.len() as u32];
+    d.extend_from_slice(vals);
+    d.push(vals.len() as u32);
+    d.extend_from_slice(vals);
+    fifo_token(m, token, &d);
+}
+
+/// glDrawPixels(GL_RGBA, GL_FLOAT) through the GE pixel pipeline as
+/// libGLcore programs it (traced: colmatrix, clamp to 2^32 - 1,
+/// pipecontrol; 32-bit components to the raster engine, 16 bytes a pixel).
+#[test]
+fn gl_draw_pixels_float_through_the_pipeline() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x15, &[]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    write(&m, 32, CFIFO, 0x8000_0008);
+    write(&m, 32, CFIFO, 0x159);
+    write(&m, 32, CFIFO, 0x00C0_0083);
+    ge_state(&m, 0x80, 0x13B, &[0x3E65, 0, 0x156A, 0x1B4, 0x352D, 0xD67]);
+    ge_state(&m, 0x80, 0x1B4, &[0xF, 0, 0x4064, 0x50C, 0x1E4]);
+    let mut clamp = vec![0x50C, 0x1A000, 0x50C, 5, 0];
+    clamp.extend([0x4F7F_FFFFu32; 12]);
+    ge_state(&m, 0xCD, 0xD67, &clamp);
+    ge_state(&m, 0xCD, 0xDB7, &[0, 0, 0, 0, 4, 0]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    ge_state(&m, 0xCD, 0xDA8, &[0, 0, 0, 0, 1 << 16 | 1, 1]);
+    fifo_token(&m, 0x8D, &[4, 0, 0, 1, 0, 1, 0x49D0, 0x8]);
+    fifo_pixel_data(&m, &[f(0.5), f(0.25), f(1.5), f(-1.0)]);
+    m.state_hash();
+    // Red 0.5 is 127, not 128: libGLcore's scale, 2^32 - 1 as a float,
+    // is 4294967040, which puts 0.5 just under half way.
+    assert_eq!(gl_px(&m, 10, 20) & 0xFF_FFFF, 0xFF_407F, "R 0.5, G 0.25, B clamped to 1");
+    m.stop_engines();
+}
+
 /// Pixel zoom (snoop's magnifier): the GE pixel state at 0x192 holds
 /// 1 / zoom (token 0x080, traced: 1/6 at zoom 6); each pixel and row of a
 /// SEND_PIXELS image is repeated.
