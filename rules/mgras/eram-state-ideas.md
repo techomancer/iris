@@ -9,32 +9,39 @@ eviction transfers touch and nothing reads (see
 
 ## 1. Run the GL state in place in ERAM
 
-Make the live `Gl` a view of the loaded context's slot (`words[0][slot..]`
-cast to `&mut Gl`) instead of a copy, so a switch changes a slot offset
-instead of copying the record twice.
+How the board seems to work: the GE11 microcode runs on its working
+state inside the chip (WRAM, CRAM, registers). On a context switch the
+microcode saves the outgoing state to that context's ERAM slot and
+loads the incoming one's (HQ3.h, "Where the state lives"). The rest of
+ERAM holds resources (libGLcore's imaging tables and the like). So ERAM
+is the save area, not where the GE runs. Before the first context
+switch after boot, the GE still has state, its internal one, but no
+slot owns it. Our live `Gl` struct plays the part of that internal
+state, and copying it on a switch matches the hardware.
+
+The idea, purely as an emulator shortcut: make the live `Gl` a view of
+the loaded context's slot (`words[0][slot..]` cast to `&mut Gl`), so a
+switch changes an offset instead of copying the record twice.
 
 - `Gl` is already plain `repr(C)` numbers, valid for any bit pattern,
-  and the record fits the kernel's 0x17C7-word slot (const assert). It
-  must stay u32-aligned with no padding-sensitive fields.
-- The borrow has to be re-derived from `eram` plus the slot on each use
-  (or `Hq3Engine` hands out `&mut Gl` through one accessor). Do not keep
-  a long-lived pointer: `eram` is boxed, but the slot changes.
-- No slot yet (before the first context load), or a slot outside ERAM:
-  this needs a scratch `Gl` to point at.
-- First load (image word 1 bit 31): zero the slot in place, as
-  `load_context` zeroes the copy today.
-- `CP_GE_NOSAVE_NEXT_SWITCH` changes meaning: there is no save left to
-  skip, and anything the kernel's context does to its `Gl` lands in its
-  slot. Harmless, since that is its own slot, but check
-  `swap_buffers` / `set_draw_bank` on the kernel context.
-- The kernel's ERAM reads and writes must see and replace the live state
-  if they ever target the loaded slot. In place they do, without a copy.
-  Today a pass-through read of the loaded slot returns the state as of
-  the last switch.
+  and the record fits the kernel's 0x17C7-word slot (const assert).
+- Re-derive the borrow from `eram` plus the slot on each use. Do not keep
+  a long-lived pointer.
+- Before the first context load (`slot: None`), and for a slot outside
+  ERAM, the view needs a scratch `Gl`: the "internal" state above.
+- First load (image word 1 bit 31): zero the slot in place.
+- Behaviour that differs from the hardware's save/load model:
+  - `CP_GE_NOSAVE_NEXT_SWITCH` has nothing left to skip.
+  - A kernel ERAM read of the loaded slot sees live state, where the
+    board (and today's code) gives the state as of the last save.
+  - A kernel ERAM write to the loaded slot changes live state, where the
+    board would overwrite it at the next save.
+  The kernel probably never touches the loaded slot, but check before
+  relying on it.
 - Gain: two copies of the record (GL_WORDS; `mgras gl` prints it) per
-  switch, about 750 switches in a two-minute Matador trace. Small. The
-  better reason is that the board's GE state becomes plain memory, which
-  helps snapshots later.
+  switch, about 750 switches in a two-minute Matador trace. Small.
+  Snapshots would gain little too: the live state has to be saved
+  either way.
 
 ## 2. Alias GE1 onto GE0: reads from GE0, writes dropped
 
