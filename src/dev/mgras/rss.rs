@@ -633,7 +633,10 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
         (8, 8) => pack_rgb(c4(0), c4(4), c4(8)),
         (8, 10) => pack_rgb(c5(0), c5(5), c5(10)),
         (8, 0) => v,
-        (0, 1) => v & 0xFFF,
+        // Colour indices in any integer type (libGLcore: bytes, shorts,
+        // 32-bit, signed or not): the index's bits, up to a 12-bit visual's.
+        (0, 0 | 4) => v & 0xFF,
+        (0, _) => v & 0xFFF,
         _ => v,
     }
 }
@@ -658,6 +661,9 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
     (match format {
         (8, 8) => c(0) >> 4 | (c(8) >> 4) << 4 | (c(16) >> 4) << 8,
         (8, 10) => c(0) >> 3 | (c(8) >> 3) << 5 | (c(16) >> 3) << 10,
+        // A colour index in the element's low bits (a byte keeps the low 8).
+        (0, 0 | 4) => v & 0xFF,
+        (0, _) => v & 0xFFF,
         _ => v,
     }) as u64
 }
@@ -693,6 +699,10 @@ pub(crate) fn generic_format(f: (u32, u32)) -> bool {
 /// Whether the raster JIT knows this format (its `XFmt` set; its RGBA16 is
 /// red first, RGBorder set).
 pub(crate) fn jit_xfer_ok(f: (u32, u32)) -> bool {
+    // Colour indices beyond the X server's bytes and shorts: interpreter.
+    if f.0 == 0 && !matches!(f.1, 0 | 1) {
+        return false;
+    }
     !generic_format(f) || f == (8, 0x11)
 }
 
@@ -910,8 +920,9 @@ pub(crate) fn bytes_per_pixel(xfrmode: u32) -> u32 {
         return (format_comps(f).len() * type_size(f.1)) as u32;
     }
     match ((xfrmode >> 4) & 0xF, xfrmode & 0xF) {
-        (0, 0) => 1,
-        (0, 1) | (8, 8) | (8, 10) => 2,
+        (0, 0) | (0, 4) => 1,
+        (0, 1) | (0, 5) | (8, 8) | (8, 10) => 2,
+        (0, 3) | (0, 7) => 4,
         (8, 0) | (2, 3) => 4,
         (7, 0) => 3,
         (8, 1) => 8,

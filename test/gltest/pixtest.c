@@ -72,6 +72,25 @@ static const struct { const char *name; const char *why; } xfails[] = {
       "libGLcore refuses sub-images under 32 texels wide unless full width (GL_INVALID_VALUE)" },
     { "copytexsub/RGBA8/narrow",
       "libGLcore refuses sub-images under 32 texels wide unless full width (GL_INVALID_VALUE)" },
+    { "ci8/read/UNSIGNED_INT/high-planes",
+      "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/BYTE", "libGLcore truncates 32-bit indices to signed types (GL masks them to 2^(n-1) - 1)" },
+    { "ci8/read/SHORT", "libGLcore truncates 32-bit indices to signed types (GL masks them to 2^(n-1) - 1)" },
+    { "ci8/read/UNSIGNED_INT/shift1-offset4", "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "ci8/read/UNSIGNED_INT/map256", "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "ci12/read/BYTE", "libGLcore truncates 32-bit indices to signed types (GL masks them to 2^(n-1) - 1)" },
+    { "ci12/read/UNSIGNED_INT/shift1-offset4", "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "ci12/read/UNSIGNED_INT/map256", "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "ci12/draw/UNSIGNED_BYTE/shift1", "libGLcore sends UNSIGNED_BYTE indices to the raster engine as bytes: a shifted index past 255 wraps" },
+    { "ci8/read/UNSIGNED_SHORT", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/UNSIGNED_INT", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/INT", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/FLOAT", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/UNSIGNED_SHORT/align8", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/UNSIGNED_SHORT/rowlen20-skip3,2", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/UNSIGNED_SHORT/swap", "IMPACT reads the 12-bit index field; libGLcore does not mask it to an 8-bit visual (planes 11:8 keep old contents; our model, unverified on hardware)" },
+    { "ci8/read/RGBA/via-maps", "libGLcore refuses glReadPixels of RGBA from a colour-index visual (GL_INVALID_OPERATION)" },
+    { "ci12/read/RGBA/via-maps", "libGLcore refuses glReadPixels of RGBA from a colour-index visual (GL_INVALID_OPERATION)" },
     { "bitmap/rowlen40-skip3,2",
       "libGLcore's glBitmap starts at UNPACK_SKIP_PIXELS / 8 bytes, dropping the bits" },
     { "bitmap/lsb-rowlen40-skip11,1",
@@ -432,6 +451,7 @@ static void reset_state(void)
     glColorMask(1, 1, 1, 1);
     glDepthMask(1);
     glStencilMask(~0u);
+    glIndexMask(~0u);
     glShadeModel(GL_FLAT);
     glDrawBuffer(have_db ? GL_BACK : GL_FRONT);
     glReadBuffer(have_db ? GL_BACK : GL_FRONT);
@@ -1856,6 +1876,465 @@ static void t_gettex(void)
     }
 }
 
+/* ---- colour-index visuals (--ci 8 | 12) ---------------------------------------------------- */
+
+static int ci_bits = 0;          /* GL_INDEX_BITS of a colour-index visual, 0 = RGBA run */
+static unsigned ci_mask = 0;
+#define CI_BG 3u                 /* clear index */
+
+/* Reference index pattern at (i, j), within the visual's bits. */
+static unsigned ci_pat(int i, int j)
+{
+    return (unsigned)(i * 53 + j * 29 + 17 + i * j * 7 + (i + 3 * j) * 311) & ci_mask;
+}
+
+static void ci_clear(void)
+{
+    glClearIndex((float)CI_BG);
+    glClearDepth(1.0);
+    glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | (have_depth ? GL_DEPTH_BUFFER_BIT : 0) |
+            (have_stencil ? GL_STENCIL_BUFFER_BIT : 0));
+}
+
+/* The framebuffer's indices, as UNSIGNED_INT with no transfer, masked to
+   the visual's index bits: IMPACT returns the 12-bit index field, and an
+   8-bit window's planes 11:8 hold whatever was there before (see
+   "ci8/read/UNSIGNED_INT/high-planes"). */
+static void ci_read(int x, int y, int w, int h, GLuint *out)
+{
+    int i;
+    reset_state();
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(x, y, w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, out);
+    for (i = 0; i < w * h; i++)
+        out[i] &= ci_mask;
+}
+
+/* Compare a w x h block read back with the expected indices. */
+static void ci_compare(const char *what, int x, int y, int w, int h, const unsigned *exp)
+{
+    GLuint *got = malloc(w * h * sizeof *got);
+    int i;
+    ci_read(x, y, w, h, got);
+    for (i = 0; i < w * h; i++)
+        if (got[i] != exp[i])
+            note("%s (%d,%d) index %u want %u", what, i % w, i / w, got[i], exp[i]);
+    free(got);
+}
+
+/* Nothing outside the block changed (b pixels around it). */
+static void ci_border(int x, int y, int w, int h, int b)
+{
+    int bw = w + 2 * b, bh = h + 2 * b, i, j;
+    GLuint *got = malloc(bw * bh * sizeof *got);
+    ci_read(x - b, y - b, bw, bh, got);
+    for (j = 0; j < bh; j++)
+        for (i = 0; i < bw; i++) {
+            int inside = i >= b && i < b + w && j >= b && j < b + h;
+            if (!inside && got[j * bw + i] != CI_BG) {
+                note("border (%d,%d) index %u", x - b + i, y - b + j, got[j * bw + i]);
+                j = bh;
+                break;
+            }
+        }
+    free(got);
+}
+
+/* Store index v as an element of type t at p. */
+static void ci_put(unsigned char *p, const Type *t, double v)
+{
+    switch (t->type) {
+    case GL_UNSIGNED_BYTE: *p = (unsigned char)v; break;
+    case GL_BYTE: *(signed char *)p = (signed char)v; break;
+    case GL_UNSIGNED_SHORT: *(unsigned short *)p = (unsigned short)v; break;
+    case GL_SHORT: *(short *)p = (short)v; break;
+    case GL_UNSIGNED_INT: *(unsigned int *)p = (unsigned int)v; break;
+    case GL_INT: *(int *)p = (int)v; break;
+    case GL_FLOAT: *(float *)p = (float)v; break;
+    }
+}
+
+static double ci_get(const unsigned char *p, const Type *t)
+{
+    switch (t->type) {
+    case GL_UNSIGNED_BYTE: return *p;
+    case GL_BYTE: return *(const signed char *)p;
+    case GL_UNSIGNED_SHORT: return *(const unsigned short *)p;
+    case GL_SHORT: return *(const short *)p;
+    case GL_UNSIGNED_INT: return *(const unsigned int *)p;
+    case GL_INT: return *(const int *)p;
+    default: return *(const float *)p;
+    }
+}
+
+/* Largest index a type carries without sign trouble. */
+static unsigned ci_type_mask(const Type *t)
+{
+    if (t->isfloat || t->size == 4)
+        return ci_mask;
+    return (unsigned)type_max(t) & ci_mask;
+}
+
+/* GL 1.1 4.3.2: an index read into an integer type is masked to the
+   type's bits (signed types: one fewer). */
+static double ci_pack_expect(const Type *t, unsigned idx)
+{
+    if (t->isfloat)
+        return idx;
+    if (t->size == 4)
+        return t->sgn ? (double)(idx & 0x7FFFFFFFu) : idx;
+    return (double)(idx & (unsigned)type_max(t));
+}
+
+static GLenum ci_types[] = { GL_UNSIGNED_BYTE, GL_BYTE, GL_UNSIGNED_SHORT, GL_SHORT,
+                             GL_UNSIGNED_INT, GL_INT, GL_FLOAT };
+#define NCITYPES (sizeof ci_types / sizeof ci_types[0])
+
+/* Draw a w x h index image of type t (pattern masked to the type) with
+   store s at (x, y); fill exp with what the framebuffer should hold
+   given shift, offset and an optional I_TO_I map. */
+static void ci_draw_case(const Type *t, const Store *s, int shift, int offset, int map_n,
+                         float zx, float zy, const char *tag)
+{
+    int w = 13, h = 5, x = 40, y = 50, i, j, nb, epg = 1;
+    unsigned char *img;
+    unsigned *exp;
+    unsigned tmask = ci_type_mask(t);
+    float *map = 0;
+    if (!begin("ci%d/draw/%s%s", ci_bits, t->name, tag))
+        return;
+    reset_state();
+    ci_clear();
+    nb = image_bytes(s, w, h, epg, t->size);
+    img = malloc(nb);
+    memset(img, 0xcd, nb);
+    exp = malloc(w * h * sizeof *exp);
+    if (map_n) {
+        map = malloc(map_n * sizeof *map);
+        for (i = 0; i < map_n; i++)
+            map[i] = (float)((i * 97 + 5) % map_n & ci_mask);
+        glPixelMapfv(GL_PIXEL_MAP_I_TO_I, map_n, map);
+        glPixelTransferi(GL_MAP_COLOR, 1);
+    }
+    for (j = 0; j < h; j++)
+        for (i = 0; i < w; i++) {
+            unsigned v = ci_pat(i, j) & tmask;
+            long e = v;
+            unsigned char *p = img + px_offset(s, w, i, j, epg, t->size);
+            ci_put(p, t, v);
+            if (s->swap && t->size > 1) {
+                unsigned char tb[4];
+                int k;
+                memcpy(tb, p, t->size);
+                for (k = 0; k < t->size; k++)
+                    p[k] = tb[t->size - 1 - k];
+            }
+            e = shift >= 0 ? e << shift : e >> -shift;
+            e += offset;
+            if (map_n)
+                e = (long)map[e & (map_n - 1)];
+            exp[j * w + i] = (unsigned)e & ci_mask;
+        }
+    glPixelTransferi(GL_INDEX_SHIFT, shift);
+    glPixelTransferi(GL_INDEX_OFFSET, offset);
+    set_unpack(s);
+    glRasterPos2i(x, y);
+    if (zx != 1.0f || zy != 1.0f)
+        glPixelZoom(zx, zy);
+    glDrawPixels(w, h, GL_COLOR_INDEX, t->type, img);
+    if (zx == 1.0f && zy == 1.0f) {
+        ci_compare("pixel", x, y, w, h, exp);
+        ci_border(x, y, w, h, 2);
+    } else {
+        /* Integer zooms only: each source pixel covers a zx x zy block. */
+        int W = (int)(w * zx), H = (int)(h * zy);
+        unsigned *zexp = malloc(W * H * sizeof *zexp);
+        for (j = 0; j < H; j++)
+            for (i = 0; i < W; i++)
+                zexp[j * W + i] = exp[(int)(j / zy) * w + (int)(i / zx)];
+        ci_compare("zoomed pixel", x, y, W, H, zexp);
+        ci_border(x, y, W, H, 2);
+        free(zexp);
+    }
+    free(img);
+    free(exp);
+    free(map);
+    end();
+}
+
+/* Read a CI pattern back as type t with store s (and read transfer). */
+static void ci_read_case(const Type *t, const Store *s, int shift, int offset, int map_n, const char *tag)
+{
+    int w = 13, h = 5, x = 20, y = 30, i, j, nb;
+    unsigned char *buf, *mark;
+    GLuint *src;
+    float *map = 0;
+    if (!begin("ci%d/read/%s%s", ci_bits, t->name, tag))
+        return;
+    reset_state();
+    ci_clear();
+    src = malloc(w * h * sizeof *src);
+    for (i = 0; i < w * h; i++)
+        src[i] = ci_pat(i % w, i / w);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glRasterPos2i(x, y);
+    glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, src);
+    nb = image_bytes(s, w, h, 1, t->size);
+    buf = malloc(nb);
+    memset(buf, 0xcd, nb);
+    if (map_n) {
+        map = malloc(map_n * sizeof *map);
+        for (i = 0; i < map_n; i++)
+            map[i] = (float)((i * 61 + 9) % map_n);
+        glPixelMapfv(GL_PIXEL_MAP_I_TO_I, map_n, map);
+        glPixelTransferi(GL_MAP_COLOR, 1);
+    }
+    glPixelTransferi(GL_INDEX_SHIFT, shift);
+    glPixelTransferi(GL_INDEX_OFFSET, offset);
+    glPixelStorei(GL_PACK_ALIGNMENT, s->alignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH, s->row_length);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, s->skip_pixels);
+    glPixelStorei(GL_PACK_SKIP_ROWS, s->skip_rows);
+    glPixelStorei(GL_PACK_SWAP_BYTES, s->swap);
+    glReadPixels(x, y, w, h, GL_COLOR_INDEX, t->type, buf);
+    reset_state();
+    for (j = 0; j < h && cur_bad < 4; j++)
+        for (i = 0; i < w && cur_bad < 4; i++) {
+            unsigned char *p = buf + px_offset(s, w, i, j, 1, t->size), tb[4];
+            long e = src[j * w + i];
+            double got, want;
+            e = shift >= 0 ? e << shift : e >> -shift;
+            e += offset;
+            if (map_n)
+                e = (long)map[e & (map_n - 1)];
+            memcpy(tb, p, t->size);
+            if (s->swap && t->size > 1) {
+                int k;
+                for (k = 0; k < t->size; k++)
+                    tb[k] = p[t->size - 1 - k];
+            }
+            got = ci_get(tb, t);
+            want = ci_pack_expect(t, (unsigned)e);
+            if (got != want)
+                note("(%d,%d) got %.0f want %.0f (framebuffer %u)", i, j, got, want, src[j * w + i]);
+        }
+    mark = calloc(nb, 1);
+    for (j = 0; j < h; j++)
+        for (i = 0; i < w; i++)
+            memset(mark + px_offset(s, w, i, j, 1, t->size), 1, t->size);
+    for (i = 0; i < nb; i++)
+        if (!mark[i] && buf[i] != 0xcd) {
+            note("byte %d outside the pixels written (0x%02x)", i, buf[i]);
+            break;
+        }
+    free(mark);
+    free(buf);
+    free(src);
+    free(map);
+    end();
+}
+
+static void t_ci(void)
+{
+    unsigned ti;
+    Store s;
+    int w = 13, h = 5, i, j, k;
+    /* Baseline: geometry in glIndex colours, read back. */
+    if (begin("ci%d/baseline/rects", ci_bits)) {
+        unsigned exp[13 * 5];
+        reset_state();
+        ci_clear();
+        for (j = 0; j < h; j++)
+            for (i = 0; i < w; i++) {
+                glIndexi((int)ci_pat(i, j));
+                glRecti(10 + i, 20 + j, 11 + i, 21 + j);
+                exp[j * w + i] = ci_pat(i, j);
+            }
+        ci_compare("rect", 10, 20, w, h, exp);
+        ci_border(10, 20, w, h, 2);
+        end();
+    }
+    if (begin("ci%d/baseline/clear", ci_bits)) {
+        GLuint got[16];
+        reset_state();
+        glClearIndex(5.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ci_read(100, 100, 4, 4, got);
+        for (i = 0; i < 16; i++)
+            if (got[i] != 5)
+                note("clear index %u want 5", got[i]);
+        end();
+    }
+    /* GL masks a read index to the visual's bits (GL 1.1 4.3.2). */
+    if (begin("ci%d/read/UNSIGNED_INT/high-planes", ci_bits)) {
+        GLuint got[64 * 64];
+        reset_state();
+        glClearIndex(5.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(0, 0, 64, 64, GL_COLOR_INDEX, GL_UNSIGNED_INT, got);
+        for (i = 0; i < 64 * 64; i++)
+            if (got[i] != 5) {
+                note("(%d,%d) index 0x%x want 5", i % 64, i / 64, got[i]);
+                break;
+            }
+        end();
+    }
+    /* Every type, plain. */
+    for (ti = 0; ti < NCITYPES; ti++)
+        ci_draw_case(type_of(ci_types[ti]), &store_default, 0, 0, 0, 1, 1, "");
+    for (ti = 0; ti < NCITYPES; ti++)
+        ci_read_case(type_of(ci_types[ti]), &store_default, 0, 0, 0, "");
+    /* Index shift and offset (wrapping past the visual's bits). */
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &store_default, 1, 0, 0, 1, 1, "/shift1");
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &store_default, -2, 0, 0, 1, 1, "/shift-2");
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &store_default, 0, 7, 0, 1, 1, "/offset7");
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &store_default, 3, 100, 0, 1, 1, "/shift3-offset100");
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &store_default, 0, -5, 0, 1, 1, "/offset-5");
+    ci_draw_case(type_of(GL_FLOAT), &store_default, 2, 1, 0, 1, 1, "/shift2-offset1");
+    ci_draw_case(type_of(GL_INT), &store_default, -1, 3, 0, 1, 1, "/shift-1-offset3");
+    /* I_TO_I maps. */
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &store_default, 0, 0, 16, 1, 1, "/map16");
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &store_default, 0, 0, 256, 1, 1, "/map256");
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &store_default, 0, 0, 1 << ci_bits, 1, 1, "/mapfull");
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &store_default, 1, 2, 64, 1, 1, "/shift1-offset2-map64");
+    /* Unpack layouts. */
+    s = store_default; s.alignment = 1;
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &s, 0, 0, 0, 1, 1, "/align1");
+    s.alignment = 2;
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &s, 0, 0, 0, 1, 1, "/align2");
+    s.alignment = 8;
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &s, 0, 0, 0, 1, 1, "/align8");
+    s = store_default; s.row_length = 20; s.skip_pixels = 3; s.skip_rows = 2;
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &s, 0, 0, 0, 1, 1, "/rowlen20-skip3,2");
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &s, 0, 0, 0, 1, 1, "/rowlen20-skip3,2");
+    s = store_default; s.swap = 1;
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &s, 0, 0, 0, 1, 1, "/swap");
+    ci_draw_case(type_of(GL_UNSIGNED_INT), &s, 0, 0, 0, 1, 1, "/swap");
+    /* Zoom. */
+    ci_draw_case(type_of(GL_UNSIGNED_SHORT), &store_default, 0, 0, 0, 2, 2, "/zoom2,2");
+    ci_draw_case(type_of(GL_UNSIGNED_BYTE), &store_default, 0, 0, 0, 3, 1, "/zoom3,1");
+    /* Reads: pack layouts and read transfer. */
+    s = store_default; s.alignment = 1;
+    ci_read_case(type_of(GL_UNSIGNED_BYTE), &s, 0, 0, 0, "/align1");
+    s.alignment = 8;
+    ci_read_case(type_of(GL_UNSIGNED_SHORT), &s, 0, 0, 0, "/align8");
+    s = store_default; s.row_length = 20; s.skip_pixels = 3; s.skip_rows = 2;
+    ci_read_case(type_of(GL_UNSIGNED_SHORT), &s, 0, 0, 0, "/rowlen20-skip3,2");
+    s = store_default; s.swap = 1;
+    ci_read_case(type_of(GL_UNSIGNED_SHORT), &s, 0, 0, 0, "/swap");
+    ci_read_case(type_of(GL_UNSIGNED_INT), &store_default, 1, 4, 0, "/shift1-offset4");
+    ci_read_case(type_of(GL_UNSIGNED_INT), &store_default, 0, 0, 256, "/map256");
+    /* GL_BITMAP: 0 and 1, through offset. */
+    if (begin("ci%d/draw/BITMAP/offset9", ci_bits)) {
+        unsigned char bits[5 * 4];
+        unsigned exp[13 * 5];
+        reset_state();
+        ci_clear();
+        for (i = 0; i < 20; i++)
+            bits[i] = pat8(i, 3, 1);
+        for (j = 0; j < h; j++)
+            for (i = 0; i < w; i++)
+                exp[j * w + i] = ((bits[j * 4 + i / 8] >> (7 - i % 8)) & 1) + 9;
+        glPixelTransferi(GL_INDEX_OFFSET, 9);
+        glRasterPos2i(40, 50);
+        glDrawPixels(w, h, GL_COLOR_INDEX, GL_BITMAP, bits);
+        ci_compare("pixel", 40, 50, w, h, exp);
+        end();
+    }
+    /* glBitmap in the raster index. */
+    if (begin("ci%d/bitmap/raster-index", ci_bits)) {
+        unsigned char bits[5 * 4];
+        unsigned exp[13 * 5], idx = 0x1A5 & ci_mask;
+        reset_state();
+        ci_clear();
+        for (i = 0; i < 20; i++)
+            bits[i] = pat8(i, 5, 2);
+        for (j = 0; j < h; j++)
+            for (i = 0; i < w; i++)
+                exp[j * w + i] = (bits[j * 4 + i / 8] >> (7 - i % 8)) & 1 ? idx : CI_BG;
+        glIndexi((int)idx);
+        glRasterPos2i(40, 50);
+        glBitmap(w, h, 0, 0, 0, 0, bits);
+        ci_compare("pixel", 40, 50, w, h, exp);
+        end();
+    }
+    /* glIndexMask: only the enabled bits change. */
+    if (begin("ci%d/draw/indexmask", ci_bits)) {
+        GLuint src[13 * 5];
+        unsigned exp[13 * 5], m = 0x0F0 & ci_mask;
+        reset_state();
+        ci_clear();
+        for (i = 0; i < w * h; i++) {
+            src[i] = ci_pat(i % w, i / w);
+            exp[i] = (CI_BG & ~m) | (src[i] & m);
+        }
+        glIndexMask(m);
+        glRasterPos2i(40, 50);
+        glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, src);
+        glIndexMask(~0u);
+        ci_compare("pixel", 40, 50, w, h, exp);
+        end();
+    }
+    /* glCopyPixels GL_COLOR, plain and with offset. */
+    for (k = 0; k < 2; k++) {
+        GLuint src[13 * 5];
+        unsigned exp[13 * 5];
+        if (!begin("ci%d/copy%s", ci_bits, k ? "/offset6" : ""))
+            continue;
+        reset_state();
+        ci_clear();
+        for (i = 0; i < w * h; i++) {
+            src[i] = ci_pat(i % w, i / w);
+            exp[i] = (src[i] + (k ? 6 : 0)) & ci_mask;
+        }
+        glRasterPos2i(20, 30);
+        glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, src);
+        if (k)
+            glPixelTransferi(GL_INDEX_OFFSET, 6);
+        glRasterPos2i(100, 60);
+        glCopyPixels(20, 30, w, h, GL_COLOR);
+        ci_compare("pixel", 100, 60, w, h, exp);
+        ci_border(100, 60, w, h, 2);
+        end();
+    }
+    /* Reading a CI buffer as RGBA goes through the I_TO_RGBA maps. */
+    if (begin("ci%d/read/RGBA/via-maps", ci_bits)) {
+        GLuint src[13 * 5];
+        unsigned char got[13 * 5 * 4];
+        GLenum mp[4] = { GL_PIXEL_MAP_I_TO_R, GL_PIXEL_MAP_I_TO_G, GL_PIXEL_MAP_I_TO_B, GL_PIXEL_MAP_I_TO_A };
+        float m[256];
+        int n = 256;
+        reset_state();
+        ci_clear();
+        for (i = 0; i < w * h; i++)
+            src[i] = ci_pat(i % w, i / w) & 0xFF;
+        glRasterPos2i(20, 30);
+        glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, src);
+        for (k = 0; k < 4; k++) {
+            for (i = 0; i < n; i++)
+                m[i] = (float)(((i * (k + 3) * 37) % 255) / 255.0);
+            glPixelMapfv(mp[k], n, m);
+        }
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        memset(got, 0xcd, sizeof got);
+        glReadPixels(20, 30, w, h, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        {
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR)
+                note("glReadPixels(GL_RGBA): GL error 0x%x", (unsigned)e);
+        }
+        for (i = 0; i < w * h && cur_bad < 4; i++)
+            for (k = 0; k < 4; k++) {
+                int want = to8(((src[i] * (k + 3) * 37) % 255) / 255.0);
+                if (abs(got[i * 4 + k] - want) > 1)
+                    note("(%d,%d) comp %d got %d want %d (index %u)", i % w, i / w, k, got[i * 4 + k], want, src[i]);
+            }
+        end();
+    }
+}
+
 /* ---- main ------------------------------------------------------------------------------------ */
 
 static Bool wait_map(Display *d, XEvent *e, char *arg)
@@ -1886,8 +2365,10 @@ int main(int argc, char **argv)
             hold = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v"))
             verbose = 1;
+        else if (!strcmp(argv[i], "--ci") && i + 1 < argc)
+            ci_bits = atoi(argv[++i]);
         else {
-            fprintf(stderr, "usage: pixtest [--only SUBSTR]... [--skip SUBSTR]... [--list] [--hold MS] [-v]\n");
+            fprintf(stderr, "usage: pixtest [--ci 8|12] [--only SUBSTR]... [--skip SUBSTR]... [--list] [--hold MS] [-v]\n");
             return 255;
         }
     }
@@ -1896,9 +2377,31 @@ int main(int argc, char **argv)
         fprintf(stderr, "no display\n");
         return 255;
     }
-    vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_full);
-    if (!vi)
-        vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_noalpha);
+    if (ci_bits) {
+        /* The first colour-index visual of exactly that many bits,
+           double buffered with depth and stencil if there is one. */
+        int attr_ci[] = { GLX_BUFFER_SIZE, 0, GLX_DOUBLEBUFFER, GLX_DEPTH_SIZE, 16,
+                          GLX_STENCIL_SIZE, 1, None };
+        int attr_ci_plain[] = { GLX_BUFFER_SIZE, 0, None };
+        int bs = 0;
+        attr_ci[1] = attr_ci_plain[1] = ci_bits;
+        vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_ci);
+        if (vi)
+            glXGetConfig(dpy, vi, GLX_BUFFER_SIZE, &bs);
+        if (!vi || bs != ci_bits) {
+            vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_ci_plain);
+            if (vi)
+                glXGetConfig(dpy, vi, GLX_BUFFER_SIZE, &bs);
+        }
+        if (!vi || bs != ci_bits) {
+            fprintf(stderr, "no %d-bit colour-index visual (got %d)\n", ci_bits, bs);
+            return 255;
+        }
+    } else {
+        vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_full);
+        if (!vi)
+            vi = glXChooseVisual(dpy, DefaultScreen(dpy), attr_noalpha);
+    }
     if (!vi) {
         fprintf(stderr, "no RGB visual\n");
         return 255;
@@ -1938,6 +2441,17 @@ int main(int argc, char **argv)
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
+    if (ci_bits) {
+        GLint ib = 0;
+        glGetIntegerv(GL_INDEX_BITS, &ib);
+        printf("colour-index visual: %d index bits\n", (int)ib);
+        if (ib != ci_bits)
+            printf("note: GL_INDEX_BITS %d differs from the buffer size %d\n", (int)ib, ci_bits);
+        ci_bits = ib;
+        ci_mask = (1u << ib) - 1u;
+        t_ci();
+        goto done;
+    }
     t_baseline();
     t_read();
     t_read_xfer();
@@ -1953,6 +2467,7 @@ int main(int argc, char **argv)
     t_copytex();
     t_gettex();
 
+done:
     if (!list_only)
         printf("pixtest: %d passed, %d failed, %d expected failures, %d skipped\n", npass, nfail, nxfail, nskip);
     if (hold > 0) {

@@ -7,8 +7,10 @@ call a case. Each case checks its own result. As of 2026-10-13 the IP28
 MaxImpact (6.5.22) result is 348 pass, 0 fail, 12 XFAIL, 108 skipped (the
 skips are format/type pairs GL rejects).
 
-Run: `sh irix.sh pixtest` in the guest, then `./pixtest [--only S]
-[--skip S] [--list]`. Record with `mgras rec F` and read the
+Run: `sh irix.sh pixtest` in the guest, then `./pixtest [--ci 8|12]
+[--only S] [--skip S] [--list]`. `--ci` picks a colour-index visual of that
+depth and runs the CI suite instead (8-bit: 36 pass, 13 XFAIL; 12-bit:
+44 pass, 5 XFAIL). Record with `mgras rec F` and read the
 recording with `tools/mgras-pixdecode.py F --ucode shared/ucode/mgras_ge.u
 --results pix.txt --summary [--case N|NAME]`. The summary lists each
 operation's GE module chain with its states, plus the raster registers.
@@ -41,5 +43,12 @@ Gotchas that cost time:
   keep the low bits of the pipeline's value (shift/offset past 255).
 - **Texture loads into L/LA/A/I/RGB** read RGBA from the host and end in
   COMPRESS. The input is 4 components, not the output count.
+- **Colour-index draws**: 16-bit index rows are padded to words. The
+  pixel count comes from 0xDA8's transfer width (`Gl::row_pixels`), not
+  the padded row (13 indices drew 14 wide).
+- **The LUT belongs to the board** (`pixpipe::Lut` in the HQ engine), not
+  to the per-context `Gl` record: a 4096-entry I_TO_I map does not fit
+  the kernel's context slot. The LUT state's offsets end at the 2^23
+  word; [5] is not always the cycle (14 on 12-bit CI).
 - The decompiler's function boundaries in libglcore/decomp are wrong in
   places (labels lag by a function). Read `asm/` when the C makes no sense.

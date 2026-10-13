@@ -1664,7 +1664,7 @@ impl Gl {
     /// the pixels go through the raster engine's format conversion, plane
     /// masks and clipping. Pixel transfer stages (index shift/offset, maps,
     /// zoom) are taken as identity.
-    fn draw_pixels(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
+    fn draw_pixels(&mut self, words: &[u32], lut: &[u32], sink: &mut dyn Hq3Sink) {
         self.send_pixels_pending = 0;
         let mut wpr = self.send_pixels_row_words();
         if self.raster_valid == 0 || wpr == 0 || words.len() < wpr {
@@ -1678,7 +1678,7 @@ impl Gl {
         // libGLcore's draws come with their GE pixel pipeline: the host's
         // elements in, the raster engine's pixels out.
         if self.pix.has_program() {
-            if let Some((ws, wpr2, rows2)) = self.run_pixel_pipeline(words, wpr, rows, bpp) {
+            if let Some((ws, wpr2, rows2)) = self.run_pixel_pipeline(lut, words, wpr, rows, bpp) {
                 self.draw_pixels_words(&ws, wpr2, rows2, bpp, sink);
                 return;
             }
@@ -1739,7 +1739,7 @@ impl Gl {
     /// what came. The image is 0xDA8's transfer size; its rows come one a
     /// transport row, or packed together in fewer (libGLcore sends a
     /// short-row image as one).
-    fn run_pixel_pipeline(&self, words: &[u32], wpr: usize, rows: usize, bpp: usize) -> Option<(Vec<u32>, usize, usize)> {
+    fn run_pixel_pipeline(&self, lut: &[u32], words: &[u32], wpr: usize, rows: usize, bpp: usize) -> Option<(Vec<u32>, usize, usize)> {
         let xs = self.tl_rect[4];
         let (mut w, mut h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
         // Zoomed: 0xDA8's size is the GE's output (rows repeated, columns
@@ -1776,7 +1776,7 @@ impl Gl {
         let mut rb = Vec::with_capacity(wpr_out * 4);
         for r in 0..h {
             rb.clear();
-            for v in self.pix.run_row(&bytes[r * stride..r * stride + row_in], w, out_comps) {
+            for v in self.pix.run_row(lut, &bytes[r * stride..r * stride + row_in], w, out_comps) {
                 let v = if index { (v.round() as i64 & wrap) as f64 } else { v };
                 super::rss::pack_comp(ty, v, &mut rb);
             }
@@ -1795,7 +1795,7 @@ impl Gl {
         let (nx, ny) = ((r[2] - r[0]).abs() + 1, (r[3] - r[1]).abs() + 1);
         let (dx, dy) = (if r[2] < r[0] { -1 } else { 1 }, if r[3] < r[1] { -1 } else { 1 });
         let (fx0, fy0) = ((self.raster[0] + r[0] as f32).floor() as i32, (self.raster[1] + r[1] as f32).floor() as i32);
-        let src_w = wpr * 4 / bpp.max(1);
+        let src_w = self.row_pixels(wpr, bpp);
         if src_w == 0 || rows == 0 {
             return;
         }
@@ -1857,6 +1857,20 @@ impl Gl {
 
     /// glDrawPixels' rows, `wpr` words each, in the raster engine's format
     /// (`bpp` bytes a pixel).
+    /// Pixels a row of `wpr` words holds at `bpp` bytes a pixel: 0xDA8's
+    /// transfer width when the padded row is that many pixels rounded up
+    /// to words (13 16-bit indices come as 7 words, not 14 pixels), else
+    /// as many as fit.
+    fn row_pixels(&self, wpr: usize, bpp: usize) -> usize {
+        let fit = wpr * 4 / bpp.max(1);
+        let w = (self.tl_rect[4] & 0xFFFF) as usize;
+        if w > 0 && w < fit && (w * bpp).div_ceil(4) == wpr {
+            w
+        } else {
+            fit
+        }
+    }
+
     fn draw_pixels_words(&mut self, words: &[u32], wpr: usize, rows: usize, bpp: usize, sink: &mut dyn Hq3Sink) {
         // Pixel zoom (same both ways, any factor): output pixel i takes
         // source pixel floor(i / zoom), as OpenGL's zoomed rectangles do
@@ -1881,7 +1895,8 @@ impl Gl {
         if xs != 0 && (re_zoom != 0 || ge_rep > 1 || (self.zoom_inv > 0.0 && self.zoom_inv != 1.0)) {
             return self.draw_pixels_zoomed(words, wpr, rows, bpp, ge_rep, re_zoom, sink);
         }
-        let rect = xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == wpr * 4 / bpp.max(1);
+        let src_w = self.row_pixels(wpr, bpp);
+        let rect = xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == src_w;
         let (ox, oy) = if rect {
             (self.tl_rect[0] as i32 as f32 * zoom, self.tl_rect[1] as i32 as f32 * zoom)
         } else {
@@ -1890,7 +1905,6 @@ impl Gl {
         let flip_x = rect && (self.tl_rect[2] as i32) < (self.tl_rect[0] as i32);
         let flip_y = rect && (self.tl_rect[3] as i32) < (self.tl_rect[1] as i32);
         let (x0, y0) = ((self.raster[0] + ox).floor() as i32, (self.raster[1] + oy).floor() as i32);
-        let src_w = wpr * 4 / bpp;
         let out_w = ((src_w as f32 * zoom).round() as i32).max(1);
         let out_h = ((rows as f32 * zoom).round() as i32).max(1);
         let span = |o: i32, n: i32, flip: bool| if flip { (o - n + 1, o) } else { (o, o + n - 1) };
@@ -1954,13 +1968,13 @@ impl Gl {
     /// colour and depth at the raster position less the origin; the raster
     /// position then moves. Each run of set bits goes through the GL
     /// fragment path as a one-pixel-high rectangle.
-    pub fn bitmap_rows(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
+    pub fn bitmap_rows(&mut self, words: &[u32], lut: &[u32], sink: &mut dyn Hq3Sink) {
         self.ensure_init();
         if self.send_pixels_pending != 0 {
             if self.send_pixels[6] == SEND_PIXELS_TEXTURE {
-                self.tex_load(words, sink);
+                self.tex_load(words, lut, sink);
             } else {
-                self.draw_pixels(words, sink);
+                self.draw_pixels(words, lut, sink);
             }
             return;
         }
@@ -2644,7 +2658,7 @@ impl Gl {
     /// else packed; host components are 8 or 16 bits (the pixel format's
     /// scale, 0xD0A) or floats, and become the internal format's
     /// (luminance replicated, alpha picked out, missing alpha 1).
-    fn tex_load(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
+    fn tex_load(&mut self, words: &[u32], lut: &[u32], sink: &mut dyn Hq3Sink) {
         self.send_pixels_pending = 0;
         let [s0, t0, w, h, _] = self.tl_rect;
         let (w, h) = (w as usize, h as usize);
@@ -2655,7 +2669,7 @@ impl Gl {
         // texels in the internal format's components, as the TE takes
         // them (4 bytes a texel, its components first).
         if self.tl_dest[0] != 0 && self.pix.has_program() {
-            if let Some(lines) = self.run_tex_pipeline(words, w, h) {
+            if let Some(lines) = self.run_tex_pipeline(lut, words, w, h) {
                 self.tex_load_lines(&lines, s0, t0, w, h, sink);
                 return;
             }
@@ -2813,7 +2827,7 @@ impl Gl {
 impl Gl {
     /// A texture load's rows through the GE pixel pipeline: per row, 4
     /// bytes a texel (the pipeline's components, then zeros).
-    fn run_tex_pipeline(&self, words: &[u32], w: usize, h: usize) -> Option<Vec<Vec<u8>>> {
+    fn run_tex_pipeline(&self, lut: &[u32], words: &[u32], w: usize, h: usize) -> Option<Vec<Vec<u8>>> {
         let wpr = self.send_pixels_row_words() * 4;
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
@@ -2828,7 +2842,7 @@ impl Gl {
         let ty = self.xfrmode & 0xF;
         let mut lines = Vec::with_capacity(h);
         for r in 0..h {
-            let v = self.pix.run_row(&bytes[r * stride..r * stride + row_in], w, out_comps);
+            let v = self.pix.run_row(lut, &bytes[r * stride..r * stride + row_in], w, out_comps);
             let n = (v.len() / w).max(1);
             let mut line = vec![0u8; w * 4];
             for (k, px) in v.chunks(n).take(w).enumerate() {

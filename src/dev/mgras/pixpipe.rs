@@ -43,7 +43,8 @@
 //!   mask        [5] AND mask (stencil indices)
 //!   colmatrix   a pass-through when its state has no matrix (5 words)
 //!   bitmaptofloat  GL_BITMAP images: a bit a pixel, most significant
-//!               first, to 0 or 1 (the index maps follow)
+//!               first, to 0 or 1 (the index maps follow); bitmaptoint
+//!               the same as integers (colour-index visuals)
 //!   compress    texture loads: [5] the internal format's components out
 //!               of RGBA (0 alpha, 1 red, 2 red and alpha, 4 RGB)
 //!   pipecontrol the output to the raster engine
@@ -70,6 +71,9 @@ pub mod entry {
     pub const COLMATRIX: u32 = 0x3E65;
     pub const COMPRESS: u32 = 0x399A;
     pub const BITMAPTOFLOAT: u32 = 0x24D7;
+    /// GL_BITMAP colour indices on a colour-index visual: bits to the
+    /// integers 0 / 1 (shiftadd and mask follow).
+    pub const BITMAPTOINT: u32 = 0x25A0;
     pub const XZOOM: u32 = 0x3EF5;
 }
 
@@ -80,7 +84,11 @@ pub const GE_WORDS: usize = 0x100;
 pub const ERAM_BASE: u32 = 0xC00;
 pub const ERAM_WORDS: usize = 0x200;
 /// Lookup table RAM (INIT_COLOR_TABLE), words of two 16-bit entries.
-pub const LUT_WORDS: usize = 0x400;
+/// LUT memory in words: four 256-entry colour maps, or one 4096-entry
+/// I_TO_I map on a 12-bit colour-index visual (sent as 16 blocks of 256).
+pub const LUT_WORDS: usize = 0x1000;
+/// The LUT state's terminator, 2^23 as a float (the float-to-int step).
+const F2_23: u32 = 0x4B00_0000;
 /// GE address of the pipeline program.
 pub const PROGRAM: u32 = 0x13B;
 /// ERAM word typing the host elements.
@@ -93,10 +101,38 @@ pub const ELEMENT_TYPE: u32 = 0xDBB;
 pub struct PixMem {
     pub ge: [u32; GE_WORDS],
     pub eram: [u32; ERAM_WORDS],
-    pub lut: [u32; LUT_WORDS],
     /// Words in the program at 0x13B, as its last write gave them (a
     /// shorter program leaves the end of the one before it in memory).
     pub prog_len: u32,
+}
+
+/// The GE's colour-table memory (glPixelMap tables, INIT_COLOR_TABLE
+/// 0x089). It belongs to the board, not to a context: a 12-bit visual's
+/// 4096-entry I_TO_I map is too big for the kernel's per-context ERAM
+/// slot, and libGLcore sends the tables before each pixel operation that
+/// uses them.
+pub struct Lut(pub Box<[u32; LUT_WORDS]>);
+
+impl Default for Lut {
+    fn default() -> Self {
+        Lut(Box::new([0; LUT_WORDS]))
+    }
+}
+
+impl Lut {
+    /// An INIT_COLOR_TABLE payload: [?, bytes, table id, ?, offset,
+    /// count, entries...], each entry word a pair of 16-bit values.
+    pub fn load_table(&mut self, payload: &[u32]) {
+        if payload.len() < 6 {
+            return;
+        }
+        let (off, n) = (payload[4] as usize, payload[5] as usize);
+        for (k, &w) in payload[6..].iter().take(n).enumerate() {
+            if let Some(slot) = self.0.get_mut(off + k) {
+                *slot = w;
+            }
+        }
+    }
 }
 
 impl PixMem {
@@ -134,17 +170,6 @@ impl PixMem {
 
     /// INIT_COLOR_TABLE's payload: [0, bytes, table id, 0, offset, count,
     /// words].
-    pub fn load_table(&mut self, payload: &[u32]) {
-        if payload.len() < 6 {
-            return;
-        }
-        let (off, n) = (payload[4] as usize, payload[5] as usize);
-        for (k, &w) in payload[6..].iter().take(n).enumerate() {
-            if let Some(slot) = self.lut.get_mut(off + k) {
-                *slot = w;
-            }
-        }
-    }
 
     /// A block write starting at `addr`, `n` words (the program's length
     /// is kept when one starts at 0x13B).
@@ -219,7 +244,7 @@ impl PixMem {
                 _ => Elem::F32,
             },
         };
-        if first == entry::BITMAPTOFLOAT {
+        if first == entry::BITMAPTOFLOAT || first == entry::BITMAPTOINT {
             return (1, 0, Elem::Bit);
         }
         let comps = if mods.iter().any(|m| m.0 == entry::UNPACK) {
@@ -242,7 +267,7 @@ impl PixMem {
     /// Run one row of `pixels` pixels of host bytes through the pipeline:
     /// the components the raster engine gets, in order, as numbers of its
     /// transfer type (rounded by the caller's packing).
-    pub fn run_row(&self, input: &[u8], pixels: usize, out_comps: usize) -> Vec<f64> {
+    pub fn run_row(&self, lut: &[u32], input: &[u8], pixels: usize, out_comps: usize) -> Vec<f64> {
         let (comps, esize, elem) = self.input_shape_fit(out_comps, Some((input.len(), pixels)));
         let n = pixels * comps;
         let mut v: Vec<f64> = if elem == Elem::Bit {
@@ -340,13 +365,18 @@ impl PixMem {
                     per_px = 4;
                 }
                 entry::LUT => {
-                    let cycle = (self.read(st + 5) as usize).max(2);
+                    // The table offsets run up to the 2^23 word. [5] is the
+                    // cycle on RGBA pipelines (12, six offsets) but reads
+                    // 14 on a 12-bit colour-index visual with six offsets
+                    // all the same, so the terminator decides.
+                    let n = (0..16).take_while(|&k| self.read(st + 7 + k) != F2_23).count();
+                    let cycle = if n > 0 && n < 16 { 2 * n } else { (self.read(st + 5) as usize).max(2) };
                     let offs: Vec<usize> = (0..cycle / 2).map(|k| self.read(st + 7 + k as u32) as usize).collect();
                     for (i, x) in v.iter_mut().enumerate() {
                         let pos = i % cycle;
                         let off = offs[pos / 2];
                         let idx = x.round().max(0.0) as usize;
-                        let w = self.lut.get(off + idx).copied().unwrap_or(0);
+                        let w = lut.get(off + idx).copied().unwrap_or(0);
                         *x = if pos % 2 == 0 { (w >> 16) as f64 } else { (w & 0xFFFF) as f64 };
                     }
                 }
@@ -452,13 +482,14 @@ mod tests {
     /// clamped and scaled back to bytes.
     #[test]
     fn rgba_bytes_round_trip() {
+        let lut = Lut::default();
         let mut m = mem(&[entry::INTTOFLOAT, 0, entry::COLMATRIX, 0xD05, entry::CLAMP, 0x1B4, entry::PIPECONTROL, 0xD67]);
         put(&mut m, 0xD05, &[0x34, 0x4064, 0x50C, 2, 4, (1.0f32 / 255.0).to_bits()]);
         put(&mut m, 0x1B4, &[6, 4, 0, 0x50C, 0x50C]);
         put(&mut m, 0xD67, &[0x50C, 0x1A000, 0x50C, 2, 4]);
         put(&mut m, 0xD67 + 5, &[255.0f32.to_bits(); 12]);
         m.write(ELEMENT_TYPE, 1);
-        let out = m.run_row(&[0x11, 0x6C, 0xC7, 0x22], 1, 4);
+        let out = m.run_row(&lut.0[..], &[0x11, 0x6C, 0xC7, 0x22], 1, 4);
         assert_eq!(out.iter().map(|x| x.round() as u32).collect::<Vec<_>>(), [0x11, 0x6C, 0xC7, 0x22]);
     }
 
@@ -466,6 +497,7 @@ mod tests {
     /// 1/255 bias, then the missing components from the fills.
     #[test]
     fn red_signed_bytes_expand() {
+        let lut = Lut::default();
         let mut m = mem(&[
             entry::INTTOFLOAT, 0, entry::SCALEBIAS, 0xD05, entry::EXPAND, 0xC68, entry::COLMATRIX, 0x1D6,
             entry::CLAMP, 0x1B4, entry::PIPECONTROL, 0xD67,
@@ -483,7 +515,7 @@ mod tests {
         put(&mut m, 0xD67 + 5, &[127.0f32.to_bits(); 12]);
         m.write(ELEMENT_TYPE, 0);
         // -111 clamps to 0; 63 is (2 * 63 + 1) / 255 = 0.498 -> 63.
-        let out = m.run_row(&[(-111i8) as u8, 63], 2, 4);
+        let out = m.run_row(&lut.0[..], &[(-111i8) as u8, 63], 2, 4);
         let r: Vec<u32> = out.iter().map(|x| x.round() as u32).collect();
         assert_eq!(r, [0, 0, 0, 127, 63, 0, 0, 127]);
     }
@@ -491,6 +523,7 @@ mod tests {
     /// GL_UNSIGNED_SHORT_4_4_4_4, traced: one element, four fields.
     #[test]
     fn packed_4444() {
+        let lut = Lut::default();
         let mut m = mem(&[entry::UNPACK, 0, entry::COLMATRIX, 0xD78, entry::CLAMP, 0x1B4, entry::PIPECONTROL, 0xD67]);
         let f = |x: f32| x.to_bits();
         put(&mut m, 0xD78, &[0x1C, 0x4064, 0x50C, 3, 1, 0,
@@ -499,7 +532,7 @@ mod tests {
         put(&mut m, 0xD67, &[0x50C, 0x1A000, 0x50C, 2, 4]);
         put(&mut m, 0xD67 + 5, &[255.0f32.to_bits(); 12]);
         m.write(ELEMENT_TYPE, 3);
-        let out = m.run_row(&[0x1F, 0x8A], 1, 4);
+        let out = m.run_row(&lut.0[..], &[0x1F, 0x8A], 1, 4);
         let r: Vec<u32> = out.iter().map(|x| x.round() as u32).collect();
         assert_eq!(r, [0x11, 0xFF, 0x88, 0xAA]);
     }
@@ -508,6 +541,7 @@ mod tests {
     /// table word, back to floats by 1/65535.
     #[test]
     fn lut_pairs() {
+        let mut lut = Lut::default();
         let mut m = mem(&[
             entry::INTTOFLOAT, 0, entry::CLAMP, 0xD05, entry::LUT, 0xD23, entry::INTTOFLOAT, 0xCBF,
             entry::CLAMP, 0xD0B, entry::PIPECONTROL, 0xD67,
@@ -522,12 +556,12 @@ mod tests {
         // R|G at 0 (R map 1 - c, G identity), B|A at 0x100.
         let mut t = vec![0, 0x400, 0xC0D, 0, 0, 0x100];
         t.extend((0..0x100u32).map(|i| (0xFFFF - i * 257) << 16 | i * 257));
-        m.load_table(&t);
+        lut.load_table(&t);
         let mut t = vec![0, 0x400, 0xC0D, 0, 0x100, 0x100];
         t.extend((0..0x100u32).map(|i| (i * 257) << 16 | 0xFFFF));
-        m.load_table(&t);
+        lut.load_table(&t);
         m.write(ELEMENT_TYPE, 1);
-        let out = m.run_row(&[0x20, 0x40, 0x60, 0x80], 1, 4);
+        let out = m.run_row(&lut.0[..], &[0x20, 0x40, 0x60, 0x80], 1, 4);
         let r: Vec<u32> = out.iter().map(|x| x.round() as u32).collect();
         assert_eq!(r, [0xDF, 0x40, 0x60, 0xFF]);
     }

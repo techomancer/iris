@@ -524,6 +524,8 @@ pub struct Hq3Engine {
     /// that came for it so far, by FIFO pixel data or host DMA, until
     /// CP_PASS_THROUGH_GE_FIFO_3 says where they go.
     eram_in: Option<Vec<u32>>,
+    /// The GE's colour tables, shared by every context (`pixpipe::Lut`).
+    lut: super::pixpipe::Lut,
     /// GE11s on the board (2 on Maximum Impact): ERAM transfers come once
     /// per GE (`cmd::CP_ERAM_WRITE`). The GE HLE keeps its state in GE0's.
     ges: usize,
@@ -578,6 +580,7 @@ impl Hq3Engine {
             slot: None,
             nosave_next: false,
             eram_in: None,
+            lut: Default::default(),
             ges: ges.clamp(1, 2),
             eram_write_ge: None,
             eram_write_ge0: None,
@@ -840,7 +843,7 @@ impl Hq3Engine {
             if let Some(t) = self.payload_for.take() {
                 let p = std::mem::take(&mut self.payload);
                 match t {
-                    0x089 => self.gl.pix.load_table(&p),
+                    0x089 => self.lut.load_table(&p),
                     _ => self.gl.pixel_state_block(&p),
                 }
                 return;
@@ -860,7 +863,7 @@ impl Hq3Engine {
                 }
                 if self.bitmap_in.len() >= self.gl.pixel_words_needed() {
                     let rows = std::mem::take(&mut self.bitmap_in);
-                    self.gl.bitmap_rows(&rows, sink);
+                    self.gl.bitmap_rows(&rows, &self.lut.0[..], sink);
                 }
             } else if self.eram_in.is_none() {
                 // libGLcore __glMgrFlushImageRegs: RSS_REG_SET (0x07F)
@@ -1062,7 +1065,7 @@ impl Hq3Engine {
             let mut buf = std::mem::take(&mut self.bitmap_in);
             self.dma(word, DmaPeer::EramIn(&mut buf), sink);
             if buf.len() >= self.gl.pixel_words_needed() {
-                self.gl.bitmap_rows(&buf, sink);
+                self.gl.bitmap_rows(&buf, &self.lut.0[..], sink);
             } else {
                 self.bitmap_in = buf;
             }
