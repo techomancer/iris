@@ -742,6 +742,11 @@ impl Gl {
                 let [x0, x1, y0, y1] = self.scissor_rect();
                 Some([x0, y0, x1, y1][(addr - 0xB98) as usize] as u32)
             }
+            // glIsEnabled(GL_SCISSOR_TEST): libGLcore asks the GE. Mirai
+            // reads it before copying its front buffer to the back and
+            // turns the test off for the copy only when this says it is on;
+            // a 0 left the last widget's scissor box clipping the copy.
+            0xB9C => Some(self.scissor_test),
             0xBB1 => Some(self.point_size.to_bits()),
             0xBB2 => Some(self.line_width.to_bits()),
             0xBBA => Some(self.line_repeat + 1),
@@ -1713,19 +1718,27 @@ impl Gl {
         // A large image comes in chunks (glCopyPixels draws back 80 pixels
         // wide): pixel state 0xDA8 holds the chunk's place in the image
         // (x0, y0, x1, y1, transfer size), relative to the raster position.
+        // The first row and column are at (x0, y0), the last at (x1, y1):
+        // a negative pixel zoom reverses them (Mirai's splash, drawn with
+        // zoom (1, -1): y from -1 down to -395 for 395 rows).
         let xs = self.tl_rect[4];
-        let (ox, oy) = if xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == wpr * 4 / bpp.max(1) {
+        let rect = xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == wpr * 4 / bpp.max(1);
+        let (ox, oy) = if rect {
             (self.tl_rect[0] as i32 as f32 * zoom, self.tl_rect[1] as i32 as f32 * zoom)
         } else {
             (0.0, 0.0)
         };
+        let flip_x = rect && (self.tl_rect[2] as i32) < (self.tl_rect[0] as i32);
+        let flip_y = rect && (self.tl_rect[3] as i32) < (self.tl_rect[1] as i32);
         let (x0, y0) = ((self.raster[0] + ox).floor() as i32, (self.raster[1] + oy).floor() as i32);
         let src_w = wpr * 4 / bpp;
         let out_w = ((src_w as f32 * zoom).round() as i32).max(1);
         let out_h = ((rows as f32 * zoom).round() as i32).max(1);
+        let span = |o: i32, n: i32, flip: bool| if flip { (o - n + 1, o) } else { (o, o + n - 1) };
+        let ((ex0, ex1), (ey0, ey1)) = (span(x0, out_w, flip_x), span(y0, out_h, flip_y));
         // The scissor box (window coordinates, inclusive) cuts the
         // rectangle, as it does every fragment.
-        let (mut cx0, mut cx1, mut cy0, mut cy1) = (x0, x0 + out_w - 1, y0, y0 + out_h - 1);
+        let (mut cx0, mut cx1, mut cy0, mut cy1) = (ex0, ex1, ey0, ey1);
         if self.scissor_test != 0 {
             let [sx0, sx1, sy0, sy1] = self.scissor_rect();
             (cx0, cx1, cy0, cy1) = (cx0.max(sx0), cx1.min(sx1), cy0.max(sy0), cy1.min(sy1));
@@ -1761,11 +1774,14 @@ impl Gl {
             }
             px
         };
-        for (line, oy) in (cy0 - y0..=cy1 - y0).enumerate() {
-            let sr = ((oy as f32 / zoom) as usize).min(rows - 1);
+        // Output pixel i from the first row / column takes source pixel
+        // floor(i / zoom).
+        let from = |p: i32, o: i32, flip: bool| if flip { o - p } else { p - o };
+        for (line, y) in (cy0..=cy1).enumerate() {
+            let sr = ((from(y, y0, flip_y) as f32 / zoom) as usize).min(rows - 1);
             let mut bytes = Vec::with_capacity(w as usize * bpp);
-            for ox in cx0 - x0..=cx1 - x0 {
-                let sc = ((ox as f32 / zoom) as usize).min(src_w - 1);
+            for x in cx0..=cx1 {
+                let sc = ((from(x, x0, flip_x) as f32 / zoom) as usize).min(src_w - 1);
                 bytes.extend_from_slice(&src_px(sr, sc)[..bpp]);
             }
             sink.dma_write_line(line as u32, &bytes);

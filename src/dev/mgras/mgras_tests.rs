@@ -1523,6 +1523,12 @@ fn gl_raster_position_queries_valid_bias_and_update() {
     assert_eq!(sc_x, (100 << 16) | 10);
     assert_eq!(sc_y, (200 << 16) | 20);
 
+    // glIsEnabled(GL_SCISSOR_TEST) at 0xB9C (Mirai, traced).
+    fifo_token(&m, 0x6E, &[1]);
+    assert_eq!(gl_return_mode(&m, 0xB9C), 1);
+    fifo_token(&m, 0x6E, &[0]);
+    assert_eq!(gl_return_mode(&m, 0xB9C), 0);
+
     m.stop_engines();
 }
 
@@ -1646,6 +1652,36 @@ fn gl_draw_pixels_rows_are_send_pixels_words_0_and_1() {
     assert_ne!(rows[0][..4], [0; 4], "the reference row was drawn");
     assert_eq!(rows[0][4], 0);
     assert_eq!(rows[1], rows[0], "[2, 2] draws what [4, 0] does");
+    m.stop_engines();
+}
+
+/// glPixelZoom(1, -1) (Mirai's splash, traced): the GE pixel state 0xDA8
+/// gives the first row at y -1 and the last at y -rows, so the image runs
+/// down from the raster position, first row on top. The same image drawn
+/// the usual way (y 0 to rows - 1) runs up.
+#[test]
+fn gl_draw_pixels_negative_zoom_runs_down() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x15, &[]);
+    let pixels = [0xB2B2_B200u32, 0x4C4C_4C00, 0x1020_3000, 0xFFEE_DD00];
+    for (x, rect) in [(10.0f32, [0u32, 0, 1, 1]), (30.0, [0, (-1i32) as u32, 1, (-2i32) as u32])] {
+        fifo_token(&m, 0x7F, &[1, 2]);
+        write(&m, 32, CFIFO, 0x8000_0008);
+        write(&m, 32, CFIFO, 0x159);
+        write(&m, 32, CFIFO, 0x00C0_0080);
+        fifo_token(&m, 0x38, &[f(x), f(20.0), f(0.0)]);
+        fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 0, 6, rect[0], rect[1], rect[2], rect[3], 2 << 16 | 2, 0]);
+        fifo_token(&m, 0x8D, &[2, 0, 0, 2, 0, 1, 0x49D0, 0x88]);
+        fifo_pixel_data(&m, &pixels);
+    }
+    let row = |x: usize, y: usize| [m.fb_pixel(x, 1023 - y), m.fb_pixel(x + 1, 1023 - y)];
+    assert_ne!(row(10, 20), [0, 0], "the upright image was drawn");
+    assert_ne!(row(10, 20), row(10, 21), "its rows differ");
+    assert_eq!(row(30, 19), row(10, 20), "first row just below the raster position");
+    assert_eq!(row(30, 18), row(10, 21), "second row below it");
+    assert_eq!(row(30, 20), [0, 0], "nothing above the raster position");
     m.stop_engines();
 }
 
