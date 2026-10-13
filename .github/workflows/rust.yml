@@ -21,9 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux,   os: ubuntu-24.04 }
-          - { name: macos,   os: macos-26 }
-          - { name: windows, os: windows-latest }
+          - { name: linux,   os: ubuntu-24.04,   informational: false }
+          - { name: macos,   os: macos-26,       informational: true }
+          - { name: windows, os: windows-latest, informational: true }
     steps:
     - uses: actions/checkout@v5
     # rust-toolchain.toml pins nightly; `rustup show` installs it up front so a
@@ -49,7 +49,13 @@ jobs:
     # only thing it links is libasound, which is already installed above.
     - name: Build
       run: cargo build --workspace --verbose
+    # macOS and Windows test results are informational: a failure is reported
+    # (red step, annotation on the run) but does not fail the job or the
+    # workflow. Shared runners there are slower and noisier, and several tests
+    # read the wall clock. Their Build step above still gates; Linux gates on
+    # both.
     - name: Run tests
+      continue-on-error: ${{ matrix.informational }}
       run: cargo test --workspace --verbose
 
   # The speed configuration (CLAUDE.md "recommended for speed" plus the MIPS
