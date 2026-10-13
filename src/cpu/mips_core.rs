@@ -2676,8 +2676,13 @@ mod ip7_ticket_tests {
     #[test]
     fn a_compare_write_leaves_its_one_shots_ticket_claimable() {
         let mut core = core_past_its_compare();
-        let before = core.cp0_count as u32;
-        core.write_cp0(11, (before.wrapping_add(330_000)) as u64);
+        // The live Count, not the `cp0_count` field: that is still the stale
+        // 0 here, which put the "future" deadline at an absolute ~10 ms of
+        // wall clock. A loaded CI runner (macOS) overshot the 3 ms sleep past
+        // it, so the write saw a genuine crossing. One second ahead of now
+        // can't be reached before write_cp0 looks.
+        let before = core.count_peek();
+        core.write_cp0(11, (before.wrapping_add(33_000_000)) as u64);
 
         let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
         assert_ne!(

@@ -9,6 +9,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use libchdman_rs::cd::CdCookedReader;
 use libchdman_rs::hd::HdImage;
@@ -148,8 +149,15 @@ impl ChdHd {
 
 /// A sequential `Read` over the merged (parent + diff) sectors of an [`HdImage`],
 /// used to feed [`flatten_diff`]'s rebuild. Reads one sector at a time.
+///
+/// The image sits in a slot shared with `flatten_diff` rather than being owned
+/// here: libchdman-rs's `ChdCompressor::new` hands the reader to C++ with
+/// `Box::into_raw` and never frees it, so anything the reader owns stays alive
+/// — base and diff open — after `create_from_reader` returns. Windows will not
+/// rename over an open file ("Access is denied"), so `flatten_diff` empties the
+/// slot itself to close both before the rename.
 struct MergedReader {
-    img: HdImage,
+    img: Arc<Mutex<Option<HdImage>>>,
     sector_size: usize,
     sector_count: u64,
     next_lba: u64,
@@ -159,7 +167,7 @@ struct MergedReader {
 }
 
 impl MergedReader {
-    fn new(img: HdImage, sector_size: usize, sector_count: u64) -> Self {
+    fn new(img: Arc<Mutex<Option<HdImage>>>, sector_size: usize, sector_count: u64) -> Self {
         Self { img, sector_size, sector_count, next_lba: 0, buf: vec![0u8; sector_size], pos: 0, len: 0 }
     }
 }
@@ -170,7 +178,9 @@ impl Read for MergedReader {
             if self.next_lba >= self.sector_count {
                 return Ok(0); // EOF — every sector streamed
             }
-            self.img.read_sector(self.next_lba, &mut self.buf).map_err(map_err)?;
+            let mut img = self.img.lock().unwrap();
+            let img = img.as_mut().ok_or_else(|| io::Error::other("CHD image closed mid-read"))?;
+            img.read_sector(self.next_lba, &mut self.buf).map_err(map_err)?;
             self.next_lba += 1;
             self.pos = 0;
             self.len = self.sector_size;
@@ -225,8 +235,10 @@ pub fn flatten_diff(
     let sector_count = merged.sector_count();
 
     // Rebuild into a temp file next to the base (same filesystem → the rename is
-    // atomic). The reader (and the merged HdImage it owns) is dropped when
-    // create_from_reader returns, closing the base+diff handles before rename.
+    // atomic). The reader is never dropped (see MergedReader), so the merged
+    // image goes in a shared slot that is emptied below, closing the base+diff
+    // handles before the rename.
+    let merged = Arc::new(Mutex::new(Some(merged)));
     let tmp = temp_sync_path_for(base);
     let opts = HdCreateOptions {
         logical_size: logical,
@@ -236,12 +248,14 @@ pub fn flatten_diff(
         geometry: geom,
         ident: None,
     };
-    let reader = MergedReader::new(merged, sector_size, sector_count);
+    let reader = MergedReader::new(Arc::clone(&merged), sector_size, sector_count);
     let total = logical.max(1);
     let mut cb = |cp: CompressionProgress| {
         progress((cp.bytes_done as f64 / total as f64).min(1.0) as f32);
     };
-    if let Err(e) = create_from_reader(reader, &tmp, opts, &mut cb, cancel) {
+    let created = create_from_reader(reader, &tmp, opts, &mut cb, cancel);
+    drop(merged.lock().unwrap().take());
+    if let Err(e) = created {
         let _ = std::fs::remove_file(&tmp); // base + diff untouched
         return Err(map_err(e));
     }
