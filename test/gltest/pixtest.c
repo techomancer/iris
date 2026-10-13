@@ -1082,6 +1082,62 @@ static void zoom_case(double zx, double zy)
     end();
 }
 
+/* Large images (libGLcore sends them by DMA in column chunks, 156 RGBA
+   or 144 RGB pixels wide, each with its 0xDA8 rectangle) under zoom. */
+static void zoom_big_case(int ncomp, int w, int h, double zx, double zy)
+{
+    int rx = 2, ry = 2, i, j, k;
+    int W = (int)ceil(w * zx) + 3, H = (int)ceil(h * zy) + 3;
+    unsigned char *img, *got;
+    if (!begin("zoombig/%s/%dx%d/%g,%g", ncomp == 4 ? "RGBA" : "RGB", w, h, zx, zy))
+        return;
+    if (rx + W > WIN || ry + H > WIN) {
+        skip("does not fit the window");
+        return;
+    }
+    reset_state();
+    clear_all();
+    img = malloc(w * h * ncomp);
+    got = malloc(W * H * 4);
+    for (j = 0; j < h; j++)
+        for (i = 0; i < w; i++)
+            for (k = 0; k < ncomp; k++)
+                img[(j * w + i) * ncomp + k] = pat8(i, j, k);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glRasterPos2i(rx, ry);
+    glPixelZoom((float)zx, (float)zy);
+    glDrawPixels(w, h, ncomp == 4 ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, img);
+    reset_state();
+    read_rgba8(rx, ry, W, H, got);
+    /* As zoom_case: the GL source pixel or a neighbour (or background). */
+    for (j = 0; j < H && cur_bad < 4; j++)
+        for (i = 0; i < W && cur_bad < 4; i++) {
+            double cx = rx + i + 0.5, cy = ry + j + 0.5;
+            int si = (int)floor((cx - rx) / zx), sj = (int)floor((cy - ry) / zy);
+            const unsigned char *g = got + (j * W + i) * 4;
+            int ok = 0, a, b, n = ncomp == 4 && have_alpha ? 4 : 3;
+            for (b = -1; b <= 1 && !ok; b++)
+                for (a = -1; a <= 1 && !ok; a++) {
+                    int ti = si + a, tj = sj + b;
+                    unsigned char src[4];
+                    if (ti >= 0 && ti < w && tj >= 0 && tj < h) {
+                        for (k = 0; k < 4; k++)
+                            src[k] = k < ncomp ? img[(tj * w + ti) * ncomp + k] : 255;
+                    } else {
+                        memcpy(src, bg8, 4);
+                    }
+                    if (!memcmp(src, g, n))
+                        ok = 1;
+                }
+            if (!ok)
+                note("pixel (%d,%d) %02x%02x%02x%02x is no source pixel near (%d,%d)",
+                     i, j, g[0], g[1], g[2], g[3], si, sj);
+        }
+    free(img);
+    free(got);
+    end();
+}
+
 static void t_zoom(void)
 {
     zoom_case(2, 2);
@@ -1094,6 +1150,19 @@ static void t_zoom(void)
     zoom_case(0.5, 0.5);
     zoom_case(1.5, 1.5);
     zoom_case(2.5, 0.75);
+    zoom_big_case(4, 200, 60, 1, 1);
+    zoom_big_case(4, 200, 60, 1, 2);
+    zoom_big_case(4, 200, 60, 1, 3.2);
+    zoom_big_case(4, 200, 40, 1.2, 1);
+    zoom_big_case(4, 120, 60, 2, 2);
+    zoom_big_case(4, 160, 50, 1.5, 1.5);
+    zoom_big_case(3, 200, 60, 1, 1);
+    zoom_big_case(3, 200, 60, 1, 3.2);
+    zoom_big_case(3, 200, 40, 1.2, 1);
+    zoom_big_case(3, 120, 60, 2, 2);
+    zoom_big_case(4, 75, 40, 3.2, 1);
+    zoom_big_case(3, 75, 40, 3.2, 1);
+    zoom_big_case(4, 70, 50, 3.2, 3.2);
 }
 
 /* ---- cases: glCopyPixels ------------------------------------------------------------------ */
@@ -1673,6 +1742,12 @@ static void t_tex(void)
     tex_case(&texfmts[6], &fmts[0], type_of(GL_UNSIGNED_BYTE), &s, 16, 8, "/rowlen27-skip5,3");
     s = store_default; s.swap = 1;
     tex_case(&texfmts[6], &fmts[0], type_of(GL_UNSIGNED_SHORT), &s, 16, 8, "/swap");
+    /* Tiny RGB rows (3 or 6 bytes) come by DMA padded to words. */
+    s = store_default; s.alignment = 1;
+    tex_case(&texfmts[6], &fmts[1], type_of(GL_UNSIGNED_BYTE), &s, 1, 1, "/1x1-align1");
+    tex_case(&texfmts[6], &fmts[1], type_of(GL_UNSIGNED_BYTE), &s, 2, 2, "/2x2-align1");
+    tex_case(&texfmts[11], &fmts[1], type_of(GL_UNSIGNED_BYTE), &s, 2, 2, "/2x2-align1");
+    tex_case(&texfmts[6], &fmts[1], type_of(GL_UNSIGNED_BYTE), &s, 4, 4, "/4x4-align1");
 }
 
 static void t_texsub(void)
