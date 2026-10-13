@@ -1390,7 +1390,11 @@ pub(super) fn format_pixels(mode: u32, bytes: &mut [u8]) {
     let n = ((mode >> 2) & 3) as usize + 1;
     for px in bytes.chunks_exact_mut(size * n) {
         if mode & SWAP_BYTES != 0 {
-            for c in px.chunks_exact_mut(size) {
+            // Byte components swap in pairs: libGLcore byte-swaps 16-bit
+            // packed pixels (GL_UNSIGNED_SHORT_5_5_5_1 with
+            // GL_UNPACK_SWAP_BYTES) with mode 0xE4D, byte size, four a
+            // pixel.
+            for c in px.chunks_exact_mut(size.max(2)) {
                 c.reverse();
             }
         }

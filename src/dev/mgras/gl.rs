@@ -1612,8 +1612,10 @@ impl Gl {
     }
 
     /// The pixel operation transfers stencil indices (SAVE_RSS's planes).
+    /// SAVE_RSS word 3 has the planes in bits 24:22 for a read (word 4
+    /// = 2) and in bits 20:18 for a draw (word 4 = 3): 6 stencil, 7 depth.
     fn stencil_pixels(&self) -> bool {
-        self.pixel_planes & 0x1C0_0000 == 0x180_0000
+        self.pixel_planes & 0x1C0_0000 == 0x180_0000 || self.pixel_planes & 0x1C_0000 == 0x18_0000
     }
 
     /// glReadPixels: a DMA read block over the pixel block, in the read
@@ -1755,7 +1757,7 @@ impl Gl {
         let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
         let fit = if rows == h { wpr * 4 } else { bytes.len() / h };
         let (comps, esize, _) = self.pix.input_shape_fit(out_comps, Some((fit, w)));
-        let row_in = w * comps * esize;
+        let row_in = if esize == 0 { (w * comps).div_ceil(8) } else { w * comps * esize };
         let stride = if rows == h { wpr * 4 } else { row_in };
         if row_in == 0 || bytes.len() < stride * (h - 1) + row_in {
             return None;
@@ -1789,10 +1791,11 @@ impl Gl {
             return;
         }
         let f = (self.xfr_factor & 0xFFFF).max(1) as usize;
+        // Each destination pixel samples at its centre.
         let src_col = |j: usize| -> usize {
             let g = match re_zoom {
-                z if z & 1 << 19 != 0 => j * 256 / f,
-                z if z & 1 << 20 != 0 => j * f / 256,
+                z if z & 1 << 19 != 0 => (2 * j + 1) * 256 / (2 * f),
+                z if z & 1 << 20 != 0 => (2 * j + 1) * f / 512,
                 _ => j,
             };
             (g / ge_rep.max(1)).min(src_w - 1)
@@ -2639,6 +2642,15 @@ impl Gl {
         if w == 0 || h == 0 || w > 4096 || h > 4096 {
             return;
         }
+        // libGLcore's loads come through the GE pixel pipeline: the
+        // texels in the internal format's components, as the TE takes
+        // them (4 bytes a texel, its components first).
+        if self.tl_dest[0] != 0 && self.pix.has_program() {
+            if let Some(lines) = self.run_tex_pipeline(words, w, h) {
+                self.tex_load_lines(&lines, s0, t0, w, h, sink);
+                return;
+            }
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
         // A row is SEND_PIXELS words 0 + 1 (`send_pixels_row_words`; traced
         // 64x64 luminance-alpha and 128-wide RGBA strips: [0x10, 0x10, ..]
@@ -2784,6 +2796,58 @@ impl Gl {
                 line.extend_from_slice(&px);
             }
             sink.dma_write_line(row as u32, &line);
+        }
+        sink.rss_write(re::XFRCONTROL, 0, false);
+    }
+}
+
+impl Gl {
+    /// A texture load's rows through the GE pixel pipeline: per row, 4
+    /// bytes a texel (the pipeline's components, then zeros).
+    fn run_tex_pipeline(&self, words: &[u32], w: usize, h: usize) -> Option<Vec<Vec<u8>>> {
+        let wpr = self.send_pixels_row_words() * 4;
+        let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
+        let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
+        let out_comps = super::rss::xfer_comps(self.xfrmode);
+        let fit = if hdr_rows == h && wpr > 0 { wpr } else { bytes.len() / h };
+        let (comps, esize, _) = self.pix.input_shape_fit(out_comps, Some((fit, w)));
+        let row_in = w * comps * esize;
+        let stride = if hdr_rows == h && wpr >= row_in { wpr } else { row_in };
+        if row_in == 0 || bytes.len() < stride * (h - 1) + row_in {
+            return None;
+        }
+        let ty = self.xfrmode & 0xF;
+        let mut lines = Vec::with_capacity(h);
+        for r in 0..h {
+            let v = self.pix.run_row(&bytes[r * stride..r * stride + row_in], w, out_comps);
+            let n = (v.len() / w).max(1);
+            let mut line = vec![0u8; w * 4];
+            for (k, px) in v.chunks(n).take(w).enumerate() {
+                for (c, &x) in px.iter().take(4).enumerate() {
+                    let mut b = Vec::with_capacity(4);
+                    super::rss::pack_comp(ty, x, &mut b);
+                    line[k * 4 + c] = b[0];
+                }
+            }
+            lines.push(line);
+        }
+        Some(lines)
+    }
+
+    /// Texture rows (4 bytes a texel) into the level the loader points at.
+    fn tex_load_lines(&mut self, lines: &[Vec<u8>], s0: u32, t0: u32, w: usize, h: usize, sink: &mut dyn Hq3Sink) {
+        self.begin_raster(sink);
+        sink.rss_write(te_reg::TL_MIPMAP, self.tl_dest[3], false);
+        sink.rss_write(te_reg::TL_BORDER, self.tl_dest[4], false);
+        sink.rss_write(te_reg::TL_ADDR, 0, false);
+        sink.rss_write(te_reg::TL_S_SIZE, w as u32, false);
+        sink.rss_write(te_reg::TL_T_SIZE, h as u32, false);
+        sink.rss_write(te_reg::TL_S_LEFT, s0, false);
+        sink.rss_write(te_reg::TL_T_BOTTOM, t0, false);
+        sink.rss_write(re::XFRSIZE, (h as u32) << 16 | w as u32, false);
+        sink.rss_write(re::XFRCONTROL, TE_LOAD_START, false);
+        for (row, line) in lines.iter().enumerate() {
+            sink.dma_write_line(row as u32, line);
         }
         sink.rss_write(re::XFRCONTROL, 0, false);
     }

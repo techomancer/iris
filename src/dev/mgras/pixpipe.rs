@@ -42,6 +42,10 @@
 //!               value is clamped to [0, 1] first
 //!   mask        [5] AND mask (stencil indices)
 //!   colmatrix   a pass-through when its state has no matrix (5 words)
+//!   bitmaptofloat  GL_BITMAP images: a bit a pixel, most significant
+//!               first, to 0 or 1 (the index maps follow)
+//!   compress    texture loads: [5] the internal format's components out
+//!               of RGBA (0 alpha, 1 red, 2 red and alpha, 4 RGB)
 //!   pipecontrol the output to the raster engine
 //! The host elements are typed by ERAM 0xDBB (0 signed and 1 unsigned
 //! bytes, 2 signed and 3 unsigned shorts, 4 32-bit); a pipeline whose first
@@ -64,6 +68,8 @@ pub mod entry {
     pub const ZOOM: [u32; 3] = [0x3663, 0x3715, 0x374A];
     pub const UNPACK: u32 = 0x3874;
     pub const COLMATRIX: u32 = 0x3E65;
+    pub const COMPRESS: u32 = 0x399A;
+    pub const BITMAPTOFLOAT: u32 = 0x24D7;
     pub const XZOOM: u32 = 0x3EF5;
 }
 
@@ -162,8 +168,10 @@ impl PixMem {
         if !self.has_program() {
             return 1;
         }
+        // The state's index table (from word 7) gives each output pixel's
+        // source offset: the first source pixel's run is the replication.
         match self.modules().iter().find(|m| m.0 == entry::XZOOM) {
-            Some(&(_, st)) => (self.read(st + 4) as usize).clamp(1, 64),
+            Some(&(_, st)) => (0..64).take_while(|&k| self.read(st + 7 + k) == 0).count().clamp(1, 64),
             None => 1,
         }
     }
@@ -181,6 +189,9 @@ impl PixMem {
     pub fn input_shape_fit(&self, out_comps: usize, fit: Option<(usize, usize)>) -> (usize, usize, Elem) {
         let (comps, size, elem) = self.input_shape(out_comps);
         let Some((bytes, px)) = fit else { return (comps, size, elem) };
+        if elem == Elem::Bit {
+            return (comps, size, elem);
+        }
         if px == 0 || comps * size * px <= bytes || !matches!(elem, Elem::S32 | Elem::U32) {
             return (comps, size, elem);
         }
@@ -208,6 +219,9 @@ impl PixMem {
                 _ => Elem::F32,
             },
         };
+        if first == entry::BITMAPTOFLOAT {
+            return (1, 0, Elem::Bit);
+        }
         let comps = if mods.iter().any(|m| m.0 == entry::UNPACK) {
             1
         } else if let Some(&(_, st)) = mods.iter().find(|m| m.0 == entry::EXPAND) {
@@ -228,7 +242,13 @@ impl PixMem {
     pub fn run_row(&self, input: &[u8], pixels: usize, out_comps: usize) -> Vec<f64> {
         let (comps, esize, elem) = self.input_shape_fit(out_comps, Some((input.len(), pixels)));
         let n = pixels * comps;
-        let mut v: Vec<f64> = (0..n).map(|i| elem.get(input, i * esize)).collect();
+        let mut v: Vec<f64> = if elem == Elem::Bit {
+            // glDrawPixels(GL_COLOR_INDEX / GL_STENCIL_INDEX, GL_BITMAP):
+            // one bit a pixel, the first the most significant.
+            (0..n).map(|i| (input.get(i / 8).copied().unwrap_or(0) >> (7 - i % 8) & 1) as f64).collect()
+        } else {
+            (0..n).map(|i| elem.get(input, i * esize)).collect()
+        };
         let mut per_px = comps;
         for (e, st) in self.modules() {
             match e {
@@ -334,6 +354,21 @@ impl PixMem {
                         *x = x.clamp(0.0, 1.0) * sc;
                     }
                 }
+                entry::COMPRESS => {
+                    // Texture loads: the internal format's components out
+                    // of RGBA ([5]: 0 alpha, 1 red (luminance, intensity),
+                    // 2 red and alpha, 4 RGB).
+                    let keep: &[usize] = match self.read(st + 5) {
+                        0 => &[3],
+                        1 => &[0],
+                        2 => &[0, 3],
+                        4 => &[0, 1, 2],
+                        _ => &[0, 1, 2, 3],
+                    };
+                    let n = per_px.max(1);
+                    v = v.chunks(n).flat_map(|p| keep.iter().map(move |&k| p.get(k).copied().unwrap_or(0.0))).collect();
+                    per_px = keep.len();
+                }
                 entry::MASK => {
                     let m = self.read(st + 5);
                     for x in v.iter_mut() {
@@ -353,6 +388,8 @@ impl PixMem {
 /// A host element type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Elem {
+    /// One bit a pixel (GL_BITMAP), `size` 0.
+    Bit,
     S8,
     U8,
     S16,
@@ -365,6 +402,7 @@ pub enum Elem {
 impl Elem {
     pub fn size(self) -> usize {
         match self {
+            Elem::Bit => 0,
             Elem::S8 | Elem::U8 => 1,
             Elem::S16 | Elem::U16 => 2,
             _ => 4,
@@ -375,6 +413,7 @@ impl Elem {
     fn get(self, b: &[u8], at: usize) -> f64 {
         let byte = |k: usize| b.get(at + k).copied().unwrap_or(0);
         match self {
+            Elem::Bit => byte(0) as f64,
             Elem::S8 => byte(0) as i8 as f64,
             Elem::U8 => byte(0) as f64,
             Elem::S16 => i16::from_be_bytes([byte(0), byte(1)]) as f64,

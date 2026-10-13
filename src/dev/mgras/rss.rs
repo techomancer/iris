@@ -796,6 +796,8 @@ pub(crate) fn xfer_comps(mode: u32) -> usize {
     match (mode >> 4) & 0xF {
         7 => 3,
         8 => 4,
+        // Texture loads: one-component (L, I, A) and two-component texels.
+        10 => 2,
         _ => 1,
     }
 }
@@ -2423,6 +2425,18 @@ impl Rss {
     /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
     fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+        // PIO reads of RGB(A) come last component first whatever RGBorder
+        // says (libGLcore's packed-type reads, one row at a time, unpack
+        // them so: traced 4-4-4-4, 5-5-5-1, 8-8-8-8, 10-10-10-2, 3-3-2).
+        if x.pio_read && matches!(x.format.0, 7 | 8) && x.format != (8, 0) {
+            let c = self.comps16(fx, fy);
+            let mut out = Vec::with_capacity(x.bpp as usize);
+            let order: &[usize] = if x.format.0 == 8 { &[3, 2, 1, 0] } else { &[2, 1, 0] };
+            for &k in order {
+                host_comp(x.format.1, c[k], &mut out);
+            }
+            return out.get(i as usize).copied().unwrap_or(0);
+        }
         if generic_format(x.format) {
             let mut out = Vec::with_capacity(x.bpp as usize);
             host_pixel(x.format, self.comps16(fx, fy), &mut out);

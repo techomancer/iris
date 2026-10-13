@@ -61,6 +61,10 @@ static const struct { const char *name; const char *why; } xfails[] = {
       "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
     { "read/RGBA/UNSIGNED_BYTE/map256",
       "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "bitmap/rowlen40-skip3,2",
+      "libGLcore's glBitmap starts at UNPACK_SKIP_PIXELS / 8 bytes, dropping the bits" },
+    { "bitmap/lsb-rowlen40-skip11,1",
+      "libGLcore's glBitmap starts at UNPACK_SKIP_PIXELS / 8 bytes, dropping the bits" },
 };
 
 static const char *xfail_why(const char *name)
@@ -1642,9 +1646,9 @@ static void t_texsub(void)
 {
     int tw = 32, th = 16, sw = 13, sh = 5, ox = 7, oy = 6, i, j, k, tol = 1;
     unsigned char *base, *sub, *subexp, got[32 * 16 * 4], exp[32 * 16 * 4];
-    const char *tags[3] = { "", "/rowlen20-skip2,1", "/RGB-FLOAT" };
+    const char *tags[4] = { "", "/rowlen20-skip2,1", "/RGB-FLOAT", "/resident" };
     int c;
-    for (c = 0; c < 3; c++) {
+    for (c = 0; c < 4; c++) {
         Store s = store_default;
         const Fmt *f = &fmts[0];
         const Type *t = type_of(GL_UNSIGNED_BYTE);
@@ -1664,8 +1668,21 @@ static void t_texsub(void)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, base);
         sub = make_image(f, t, &s, sw, sh, &xfer_none, &subexp);
+        if (c == 3) {
+            /* Use the texture once first: the sub-image then updates a
+               texture the board holds. */
+            glEnable(GL_TEXTURE_2D);
+            draw_tex_quad(40, 40, tw, th, 1, 1);
+            glDisable(GL_TEXTURE_2D);
+            glFinish();
+        }
         set_unpack(&s);
         glTexSubImage2D(GL_TEXTURE_2D, 0, ox, oy, sw, sh, f->fmt, t->type, sub);
+        {
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR)
+                note("glTexSubImage2D: GL error 0x%x", (unsigned)e);
+        }
         reset_state();
         tex_setup();
         glEnable(GL_TEXTURE_2D);
