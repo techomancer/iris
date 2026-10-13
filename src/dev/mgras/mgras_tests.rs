@@ -2693,6 +2693,26 @@ fn gl_draw_pixels_chunk_offset() {
     m.stop_engines();
 }
 
+/// A chunk whose RGB16 rows do not fill whole words (Mirai's last strip of
+/// a front-to-back copy, traced: 93 pixels, 558 bytes sent as 140 words):
+/// still 6-byte pixels, and still at its 0xDA8 offset.
+#[test]
+fn gl_draw_pixels_rgb16_padded_rows() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0x00C0_0081]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 2, 6, 0x50, 0, 0x52, 0, 0x1_0003, 1]);
+    fifo_token(&m, 0x8D, &[5, 0, 0, 1, 0, 1, 0x49D0, 0x98]);
+    fifo_pixel_data(&m, &[0xFFFF_8080, 0xBFBF_0000, 0xFFFF_0000, 0, 0xFFFF_0000]);
+    m.state_hash();
+    assert_eq!(gl_px(&m, 90, 20), 0xBF_80FF, "pink at the raster position + 80");
+    assert_eq!(gl_px(&m, 91, 20), 0x00_FF00, "green");
+    assert_eq!(gl_px(&m, 92, 20), 0xFF_0000, "blue");
+    assert_eq!(gl_px(&m, 10, 20), 0, "not at the raster position");
+    m.stop_engines();
+}
+
 /// GL_CLAMP_TO_BORDER_SGIS (TEXMODE2 clamp bits without bit 14, libGLcore's
 /// mapping): past the edge the samples are all border colour, where
 /// GL_CLAMP gives half border, half edge texel.

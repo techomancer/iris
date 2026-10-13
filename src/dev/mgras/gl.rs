@@ -1681,8 +1681,15 @@ impl Gl {
         // engine's format: glCopyPixels draws RGB16 back in RGBA16 (the GE's
         // pixel pipeline adds alpha). The image's size (pixel state 0xDA8's
         // transfer size, when its rows match) gives the host's pixel size.
+        // Rows are padded to whole words: Mirai's front-to-back copies
+        // send RGB16 strips 160 pixels wide and a narrower last one (93
+        // pixels, 558 bytes in 140 words). Taken as raster-format pixels,
+        // the last strip came out 70 pixels wide at the window's left edge.
         let host_bpp = match (xs & 0xFFFF) as usize {
             w if w > 0 && (xs >> 16) as usize == rows && wpr * 4 % w == 0 => wpr * 4 / w,
+            w if w > 0 && (xs >> 16) as usize == rows => {
+                (1..=bpp).rev().find(|hb| (w * hb).div_ceil(4) == wpr).unwrap_or(bpp)
+            }
             _ => bpp,
         };
         let comp = if self.xfrmode & 0xF == 1 { 2 } else { 1 };

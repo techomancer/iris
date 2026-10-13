@@ -34,3 +34,16 @@ kept a stale menu bar. It showed whenever the bank was displayed.
 Unknown readbacks are answered 0 and noted once (`hq3.rs`, CP_RETURN_MODE).
 A wrong 0 can steer an application like this, so check the notes when an
 app misbehaves. Mirai also asks 0x293, 0x3, 0x240 and 0x2d0.
+
+## Host rows are padded to whole words
+
+glDrawPixels rows arrive word-padded. Mirai's copies send RGB16 (6 bytes
+a pixel) into the RGBA16 transfer mode (8 bytes). Its strips are 160
+pixels wide (960 bytes, no padding). Narrower ones are padded: the
+dialog's last strip is 93 pixels, 558 bytes sent as 140 words; menu-bar
+labels are 87 and 39 pixels, 131 and 59 words. The host-pixel-size guess
+required row bytes to divide by the width, so these were taken as
+8-byte pixels. That made them too short (70 pixels for 93), mixed the
+components across channels, and lost the 0xDA8 offset, so a strip landed
+at the window's left edge. Now the guess accepts any size whose padded
+row matches. Test: `gl_draw_pixels_rgb16_padded_rows`.
