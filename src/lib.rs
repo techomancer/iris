@@ -208,3 +208,5 @@ pub mod perfetto;
 
 #[cfg(test)]
 mod platform_profile_tests;
+#[cfg(test)]
+pub(crate) mod test_board;

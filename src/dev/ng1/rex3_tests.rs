@@ -13,35 +13,37 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use crate::traits::{BusRead32, BusRead64};
 use super::*;
+use crate::test_board::TestBoard;
 
 // ---------------------------------------------------------------------------
 // Test harness helpers
 // ---------------------------------------------------------------------------
 
-/// Build a running Rex3 with the GFIFO processor thread started.
-/// Uses Box::leak to get a 'static reference — memory is reclaimed by the OS after the test
-/// process exits. The processor thread also holds a 'static ref via start()'s transmute.
+/// Build a running Rex3 with the GFIFO processor thread started. The returned
+/// `TestBoard` stops it and frees it when the test ends — bind it with
+/// `let rex = &make_rex3();` so helpers taking `&Rex3` coerce.
 /// Construction runs on a thread with a 64MB stack: Rex3 is large enough to overflow the
 /// default Rust test thread stack (2MB), and Rex3Context now embeds the 1 MiB HOSTRW
 /// data-port array, which construction moves through several temporaries.
-fn make_rex3() -> &'static Rex3 {
+fn make_rex3() -> TestBoard<Rex3> {
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
-            let rex = Box::leak(Box::new(Rex3::new(
+            let rex = Box::new(Rex3::new(
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU64::new(0)),
-            )));
+            ));
             unsafe {
                 (*rex.fb_rgb.get()).fill(0);
                 (*rex.fb_aux.get()).fill(0);
             }
             #[cfg(feature = "rex-jit")]
             rex.jit_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+            let rex = TestBoard::new(Arc::<Rex3>::from(rex));
             rex.start();
             rex
         })
@@ -332,7 +334,7 @@ fn check_cid_write_masks(rex: &Rex3, compiled: bool) {
 
 #[test]
 fn cid_write_masks_interpreter() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     #[cfg(feature = "rex-jit")]
     rex.jit_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
     check_cid_write_masks(rex, false);
@@ -351,7 +353,7 @@ fn cid_write_masks_interpreter() {
 ///         wrmask, smask1-4 x/y, topscan, xywin, clipmode, xstarti→xstart readback.
 #[test]
 fn test_rex3_register_rw() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Walking patterns: 0x00000000, 0x55555555, 0xAAAAAAAA, 0xFFFFFFFF
@@ -457,7 +459,7 @@ fn test_rex3_register_rw() {
 /// from fb_rgb (in-emulator we skip the hostrw FIFO path and read memory directly).
 #[test]
 fn test_vram_fill_readback_ci8() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // CI 8-bit mode: test patterns 0x00, 0x55, 0xAA, 0xFF
@@ -491,7 +493,7 @@ fn test_vram_fill_readback_ci8() {
 /// Walking-ones VRAM test (port of vram3.c walking 1's section), CI8 mode.
 #[test]
 fn test_vram_walking_ones_ci8() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     for bit in 0..8u32 {
@@ -519,7 +521,7 @@ fn test_vram_walking_ones_ci8() {
 /// VRAM test with varying colors per block (small-chunk section of vram3.c).
 #[test]
 fn test_vram_varying_color_blocks_ci8() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Test a 128×4 region with different colors per 64-pixel-wide column
@@ -552,7 +554,7 @@ fn test_vram_varying_color_blocks_ci8() {
 /// ng1_block() in CI8 mode: verify that fill writes exactly the right rectangle.
 #[test]
 fn test_ng1_block_boundary() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Fill a background color across the test area
@@ -586,7 +588,7 @@ fn test_ng1_block_boundary() {
 /// ng1_span(): single horizontal span draws exactly one row.
 #[test]
 fn test_ng1_span_one_row() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Clear background
@@ -618,7 +620,7 @@ fn test_ng1_span_one_row() {
 /// Port of the SCR2SCR path in minigl3.c/ng1_scrtoscr().
 #[test]
 fn test_ng1_scrtoscr() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Paint source block at (0,0)..(7,7) with color 0xCC
@@ -665,7 +667,7 @@ fn test_ng1_scrtoscr() {
 /// SCR2SCR with a non-zero Y offset.
 #[test]
 fn test_ng1_scrtoscr_y_offset() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Paint source (0,0)..(7,3) = color 0x33
@@ -697,7 +699,7 @@ fn test_ng1_scrtoscr_y_offset() {
 /// Basic single-pixel CI8 draw — simplest possible drawing test.
 #[test]
 fn test_block_fill_single_pixel() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
     reg(&rex, REX3_WRMASK, 0xFF);
@@ -711,7 +713,7 @@ fn test_block_fill_single_pixel() {
 /// WRMASK=0 must block all writes.
 #[test]
 fn test_wrmask_zero_blocks_write() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
     reg(&rex, REX3_WRMASK, 0x00);
@@ -725,7 +727,7 @@ fn test_wrmask_zero_blocks_write() {
 /// Partial write mask — only masked bits written.
 #[test]
 fn test_wrmask_partial() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
     reg(&rex, REX3_WRMASK, 0x0F);  // low nibble only
@@ -739,7 +741,7 @@ fn test_wrmask_partial() {
 /// LOGICOP_ZERO always produces 0, regardless of source color.
 #[test]
 fn test_logicop_zero_clears() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // First paint with SRC
@@ -764,7 +766,7 @@ fn test_logicop_zero_clears() {
 /// XOR twice with same color returns to zero.
 #[test]
 fn test_logicop_xor_roundtrip() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm1_xor = DRAWMODE1_PLANES_RGB | (1 << 3) | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_XOR_SH;
 
@@ -785,7 +787,7 @@ fn test_logicop_xor_roundtrip() {
 /// Draw at the rightmost valid screen column.
 #[test]
 fn test_draw_at_right_edge() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let x = REX3_SCREEN_WIDTH - 1;
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
@@ -800,7 +802,7 @@ fn test_draw_at_right_edge() {
 /// Draw one past the right edge — must not panic, pixel stays unwritten.
 #[test]
 fn test_draw_past_right_edge_clipped() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
     reg(&rex, REX3_WRMASK, 0xFF);
@@ -815,7 +817,7 @@ fn test_draw_past_right_edge_clipped() {
 /// NOOP opcode draws nothing even with valid coordinates.
 #[test]
 fn test_noop_opcode_draws_nothing() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
     reg(&rex, REX3_WRMASK, 0xFF);
@@ -834,7 +836,7 @@ fn test_noop_opcode_draws_nothing() {
 /// XYSTARTI/XYENDI updates xstart/ystart and xend/yend in context.
 #[test]
 fn test_register_state_update() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_CI8_SRC);
     reg(&rex, REX3_WRMASK, 0xDEADBEEF & 0xFFFFFF);
@@ -853,7 +855,7 @@ fn test_register_state_update() {
 /// Fills N equal-width columns with color i % 256, verifies center pixel of each.
 #[test]
 fn test_ng1bars_ci8() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Use 4 columns of width 8 for speed
@@ -895,7 +897,7 @@ fn test_ng1bars_ci8() {
 /// Verifies that RGB24 block fills produce the correct pixel value.
 #[test]
 fn test_patterns_rgb24_solid_fills() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let (x0, y0, x1, y1) = (0i32, 0i32, 31i32, 15i32);
@@ -934,7 +936,7 @@ fn test_patterns_rgb24_solid_fills() {
 /// black background with white center block, then white background with black center.
 #[test]
 fn test_patterns_rgb24_nested_blocks() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
@@ -997,7 +999,7 @@ fn test_patterns_rgb24_nested_blocks() {
 /// Each bar spans 1/8 of the screen width (using width=16 per bar for test).
 #[test]
 fn test_patterns_rgb24_color_bars() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     reg(&rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
@@ -1051,7 +1053,7 @@ fn test_patterns_rgb24_color_bars() {
 /// Each pixel: colorred += slopered (wrapping integer add). Integer part = colorred >> 11.
 #[test]
 fn test_patterns_gouraud_shade_span() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let span_len = 8i32;    // pixels to draw
@@ -1138,7 +1140,7 @@ const DM1_RGB24_HOSTRW64: u32 = DM1_RGB24_HOSTRW | (1 << 10);
 /// Port of ng1giobustest(): walk a 1 through all 32 bits of HOSTRW0 via SET path.
 #[test]
 fn test_hostrw_gio_bus_walking_ones_32bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     for b in 0..32u32 {
@@ -1157,7 +1159,7 @@ fn test_hostrw_gio_bus_walking_ones_32bit() {
 /// Same for HOSTRW1.
 #[test]
 fn test_hostrw_gio_bus_walking_ones_hostrw1() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     for b in 0..32u32 {
@@ -1187,7 +1189,7 @@ fn test_hostrw_gio_bus_walking_ones_hostrw1() {
 /// CI8 + rwpacked: 4 CI8 pixels per 32-bit word.
 #[test]
 fn test_hostr_ci8_read_block_32bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let color = 0x5Au8;
@@ -1228,7 +1230,7 @@ fn test_hostr_ci8_read_block_32bit() {
 /// RGB24 + hostdepth32: 1 pixel per 32-bit word.
 #[test]
 fn test_hostr_rgb24_read_block_32bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let (r, g, b) = (0xAAu32, 0x55u32, 0xCCu32);
@@ -1265,7 +1267,7 @@ fn test_hostr_rgb24_read_block_32bit() {
 /// Multi-color HOSTR readback: fill each row with a different color, read back per-row.
 #[test]
 fn test_hostr_rgb24_multicolor_readback() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let (x0, x1) = (0i32, 3i32);
@@ -1322,7 +1324,7 @@ fn test_hostr_rgb24_multicolor_readback() {
 /// CI8 + rwpacked + hostdepth8: 4 CI8 pixels per word (MSB first).
 #[test]
 fn test_hostw_ci8_write_block_32bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Pixels: [x=0]=0x11, [x=1]=0x22, [x=2]=0x33, [x=3]=0x44
@@ -1352,7 +1354,7 @@ fn test_hostw_ci8_write_block_32bit() {
 /// RGB24 + hostdepth32: 1 pixel per word.
 #[test]
 fn test_hostw_rgb24_write_block_32bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let pixels: &[u32] = &[0x0000FF, 0x00FF00, 0xFF0000, 0xAABBCC];
@@ -1380,7 +1382,7 @@ fn test_hostw_rgb24_write_block_32bit() {
 /// RWDOUBLE: high 32 bits = first pixel, low 32 bits = second pixel.
 #[test]
 fn test_hostw_rgb24_write_block_64bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // p0=blue (0xFF0000 in BGR), p1=green (0x00FF00 in BGR)
@@ -1409,7 +1411,7 @@ fn test_hostw_rgb24_write_block_64bit() {
 /// RWDOUBLE packs two pixels per 64-bit word: high 32 bits = first pixel.
 #[test]
 fn test_hostr_rgb24_read_block_64bit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let (r, g, b) = (0x12u32, 0x34u32, 0x56u32);
@@ -1448,7 +1450,7 @@ fn test_hostr_rgb24_read_block_64bit() {
 /// HOSTR+HOSTW round-trip: write pixels via HOSTW (one GO per pixel), read back via HOSTR.
 #[test]
 fn test_hostrw_roundtrip_rgb24() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let (x0, y0, x1, y1) = (0i32, 0i32, 3i32, 1i32);
@@ -1504,7 +1506,7 @@ fn test_hostrw_roundtrip_rgb24() {
 /// Expects one flush with 3 pixels left-aligned and one zero byte at LSB.
 #[test]
 fn test_hostr_ci8_partial_word() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Fill 3 pixels at y=0 with distinct colors
@@ -1538,7 +1540,7 @@ fn test_hostr_ci8_partial_word() {
 /// No y-wrap: pixels after x_end are NOT written.
 #[test]
 fn test_hostw_ci8_partial_word() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Pack 4 CI8 pixels in word but only draw 3 (x=0..2).
@@ -1586,7 +1588,7 @@ fn test_hostw_ci8_partial_word() {
 /// 2 words per row, 6 words total.  Each row uses a different set of colors.
 #[test]
 fn test_hostw_ci8_multiline_32bit_packed() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Three rows of 8 unique CI8 colors each (MSB-first within each word).
@@ -1629,7 +1631,7 @@ fn test_hostw_ci8_multiline_32bit_packed() {
 /// 5 words per row, 15 words total.
 #[test]
 fn test_hostw_rgb24_multiline_32bit_unpacked() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Three rows of 5 distinct RGB24 colors.
@@ -1668,7 +1670,7 @@ fn test_hostw_rgb24_multiline_32bit_unpacked() {
 /// per 64-bit word → 1 word per row, 3 words total.
 #[test]
 fn test_hostw_ci8_multiline_64bit_packed() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let rows: [[u8; 8]; 3] = [
@@ -1709,7 +1711,7 @@ fn test_hostw_ci8_multiline_64bit_packed() {
 /// word (high 32 bits = first pixel) → 3 words per row, 9 words total.
 #[test]
 fn test_hostw_rgb24_multiline_64bit_unpacked() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // Three rows of 6 distinct RGB24 colors.
@@ -2037,7 +2039,7 @@ fn bres_pixels(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
 
 #[test]
 fn test_iline_single_pixel() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let pts = draw_iline_pixels(&rex, 10, 10, 10, 10, 0xAB, DM0_DRAW_ILINE);
     assert_eq!(pts, vec![(10, 10)], "single-pixel line should write exactly one pixel");
@@ -2047,7 +2049,7 @@ fn test_iline_single_pixel() {
 
 #[test]
 fn test_iline_horizontal_2px() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let pts = draw_iline_pixels(&rex, 10, 10, 11, 10, 0xAB, DM0_DRAW_ILINE);
     assert_eq!(pts, vec![(10, 10), (11, 10)], "2-pixel horizontal line");
@@ -2055,7 +2057,7 @@ fn test_iline_horizontal_2px() {
 
 #[test]
 fn test_iline_horizontal_8px() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let pts = draw_iline_pixels(&rex, 10, 20, 17, 20, 0xCD, DM0_DRAW_ILINE);
     let expected: Vec<_> = (10..=17).map(|x| (x, 20)).collect();
@@ -2066,7 +2068,7 @@ fn test_iline_horizontal_8px() {
 
 #[test]
 fn test_iline_vertical_2px() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let pts = draw_iline_pixels(&rex, 20, 10, 20, 11, 0xAB, DM0_DRAW_ILINE);
     assert_eq!(pts, vec![(20, 10), (20, 11)], "2-pixel vertical line");
@@ -2074,7 +2076,7 @@ fn test_iline_vertical_2px() {
 
 #[test]
 fn test_iline_vertical_8px() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let pts = draw_iline_pixels(&rex, 20, 10, 20, 17, 0xCD, DM0_DRAW_ILINE);
     let expected: Vec<_> = (10..=17).map(|y| (20, y)).collect();
@@ -2085,7 +2087,7 @@ fn test_iline_vertical_8px() {
 
 #[test]
 fn test_iline_skipfirst() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm0 = DM0_DRAW_ILINE | (1 << 10); // skipfirst
     let pts = draw_iline_pixels(&rex, 10, 30, 14, 30, 0xEE, dm0);
@@ -2096,7 +2098,7 @@ fn test_iline_skipfirst() {
 
 #[test]
 fn test_iline_skiplast() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm0 = DM0_DRAW_ILINE | (1 << 11); // skiplast
     let pts = draw_iline_pixels(&rex, 10, 30, 14, 30, 0xEE, dm0);
@@ -2107,7 +2109,7 @@ fn test_iline_skiplast() {
 
 #[test]
 fn test_iline_skipfirst_skiplast() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm0 = DM0_DRAW_ILINE | (1 << 10) | (1 << 11); // skipfirst+skiplast
     let pts = draw_iline_pixels(&rex, 10, 30, 14, 30, 0xEE, dm0);
@@ -2118,7 +2120,7 @@ fn test_iline_skipfirst_skiplast() {
 
 #[test]
 fn test_iline_lspattern_stipple() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     // DRAW I_LINE with ENLSPATTERN; pattern has only MSB set.
     let dm0 = DM0_DRAW_ILINE | (1 << 13); // enlspattern
@@ -2152,7 +2154,7 @@ fn test_iline_lspattern_stipple() {
 
 #[test]
 fn test_iline_lsadvlast_advances_on_last_pixel() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let y = 50i32;
     let dm0 = DM0_DRAW_ILINE | (1 << 13) | (1 << 14); // enlspattern + lsadvlast
@@ -2187,7 +2189,7 @@ fn test_iline_lsadvlast_advances_on_last_pixel() {
 
 #[test]
 fn test_iline_all_octants_full() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let cx = 100i32;
@@ -2238,7 +2240,7 @@ fn test_iline_all_octants_full() {
 
 #[test]
 fn test_iline_all_octants_step() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let cx = 200i32;
@@ -2308,7 +2310,7 @@ fn test_iline_all_octants_step() {
 /// `fline_apply_fract`'s octant-dependent xf/yf swap-and-mirror logic.
 #[test]
 fn test_fline_all_octants_half_pixel() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let cx = 100i32;
@@ -2367,7 +2369,7 @@ fn test_fline_all_octants_half_pixel() {
 /// correction term), not just treated as a single boolean "is fractional".
 #[test]
 fn test_fline_quarter_pixel_offsets() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     let cx = 150i32;
@@ -2438,7 +2440,7 @@ fn test_fline_quarter_pixel_offsets() {
 /// We test all four starting corners × clockwise + counter-clockwise = 8 rects.
 #[test]
 fn test_iline_line_loop_rect() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     // DM0: DRAW | I_LINE | DOSETUP | STOPONXY | SKIPLAST
@@ -2540,7 +2542,7 @@ mod jit_tests {
 
     #[test]
     fn cid_write_masks_jit() {
-        let rex = make_rex3_jit();
+        let rex = &make_rex3_jit();
         check_cid_write_masks(rex, true);
         rex.stop();
     }
@@ -2552,7 +2554,7 @@ mod jit_tests {
     /// JIT-vs-generic comparison tests need Cranelift to actually run — so a
     /// benchmark that wants to measure the precompiled path has to load them
     /// explicitly.
-    fn make_rex3_precompiled() -> &'static Rex3 {
+    fn make_rex3_precompiled() -> TestBoard<Rex3> {
         let rex = make_rex3();
         {
             let mut map = rex.shaders.write();
@@ -2568,18 +2570,18 @@ mod jit_tests {
         rex
     }
 
-    pub(super) fn make_rex3_jit() -> &'static Rex3 {
+    pub(super) fn make_rex3_jit() -> TestBoard<Rex3> {
         std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(|| {
-                let rex = Box::leak(Box::new(Rex3::new(
+                let mut rex = Box::new(Rex3::new(
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
-                )));
+                ));
                 unsafe {
                     (*rex.fb_rgb.get()).fill(0);
                     (*rex.fb_aux.get()).fill(0);
@@ -2589,6 +2591,7 @@ mod jit_tests {
                 rex.rex_jit = Some(std::sync::Arc::new(RexJit::new(
                     std::sync::Arc::clone(&rex.shaders),
                 )));
+                let rex = TestBoard::new(Arc::<Rex3>::from(rex));
                 rex.start();
                 rex
             })
@@ -2658,14 +2661,14 @@ mod jit_tests {
         expect_blank: bool,
     ) {
         // Interpreter run with JIT dispatch disabled.
-        let rex_interp = make_rex3();
+        let rex_interp = &make_rex3();
         rex3init(rex_interp);
         setup(rex_interp);
         reg_go(rex_interp, REX3_DRAWMODE0, dm0);
         let fb_interp = dump_region(rex_interp, x0, y0, x1, y1);
 
         // JIT run
-        let rex_jit = make_rex3_jit();
+        let rex_jit = &make_rex3_jit();
         rex3init(rex_jit);
         setup(rex_jit);
         // Drain GFIFO so ctx.clipmode is committed, then read clipmode_key.
@@ -3224,12 +3227,12 @@ mod jit_tests {
         };
 
         // ── interpreter run ───────────────────────────────────────────────────
-        let rex_interp = make_rex3();
+        let rex_interp = &make_rex3();
         rex3init(rex_interp);
         let interp_ns = run(rex_interp);
 
         // ── JIT run: trigger compile on first scanline, wait, then run timed loop ──
-        let rex_jit = make_rex3_jit();
+        let rex_jit = &make_rex3_jit();
         rex3init(rex_jit);
         reg(rex_jit, REX3_DRAWMODE1,  dm1);
         reg(rex_jit, REX3_WRMASK,     0xFFFFFF);
@@ -3360,7 +3363,7 @@ mod jit_tests {
                  interpreted as o12.11 components and this check is vacuous");
         };
 
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         unsafe {
             let ctx = &mut *rex_i.context.get();
@@ -3370,7 +3373,7 @@ mod jit_tests {
         let interp = run(rex_i);
         check(&interp, "interpreter");
 
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         let _ = run(rex_j); // request compile
         {
@@ -3460,11 +3463,11 @@ mod jit_tests {
         };
 
         for clip in [true, false] {
-            let rex_i = make_rex3();
+            let rex_i = &make_rex3();
             rex3init(rex_i);
             let interp = draw(rex_i, clip);
 
-            let rex_j = make_rex3_jit();
+            let rex_j = &make_rex3_jit();
             rex3init(rex_j);
             let _ = draw(rex_j, clip); // request compile
             {
@@ -3629,13 +3632,13 @@ mod jit_tests {
             (spans * drawn, spans * per_span, ns)
         };
 
-        let rex_interp = make_rex3();
+        let rex_interp = &make_rex3();
         rex3init(rex_interp);
         // Same device, but with the generated LLVM shaders loaded — the path a
         // shipping build actually takes for a covered shape.
-        let rex_pre = make_rex3_precompiled();
+        let rex_pre = &make_rex3_precompiled();
         rex3init(rex_pre);
-        let rex_jit = make_rex3_jit();
+        let rex_jit = &make_rex3_jit();
         rex3init(rex_jit);
 
         // Force both shader variants compiled before timing.
@@ -3829,12 +3832,12 @@ mod jit_tests {
         };
 
         // Interpreter
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         check(rex_i, "interp");
 
         // JIT
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         // First draw triggers compile + interp fallback; wait then re-draw
         reg(rex_j, REX3_DRAWMODE0,  dm0);
@@ -3970,7 +3973,7 @@ mod jit_tests {
         use crate::traits::Device;
         let dm1 = DM1_CI8_SRC;
         let dm0 = DM0_DRAW_BLOCK;
-        let rex = make_rex3_jit();
+        let rex = &make_rex3_jit();
         rex3init(rex);
         let draw = |rex: &Rex3| {
             reg(rex, REX3_DRAWMODE1, dm1);
@@ -4211,7 +4214,7 @@ mod jit_tests {
         };
 
         // Interpreter run
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup(rex_i);
         write_hostrw32(rex_i, word);
@@ -4219,7 +4222,7 @@ mod jit_tests {
         let fb_interp: Vec<u32> = (0..4).map(|x| read_pixel(rex_i, x, 0) & 0xFF).collect();
 
         // JIT run: trigger compile, wait, replay
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup(rex_j);
         write_hostrw32(rex_j, word); // triggers compile request
@@ -4257,7 +4260,7 @@ mod jit_tests {
         };
 
         // Interpreter run
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup(rex_i);
         for &p in pixels { write_hostrw32(rex_i, p); }
@@ -4265,7 +4268,7 @@ mod jit_tests {
         let fb_interp: Vec<u32> = (0..4).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
 
         // JIT run
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup(rex_j);
         write_hostrw32(rex_j, pixels[0]); // trigger compile
@@ -4303,14 +4306,14 @@ mod jit_tests {
             reg(rex, REX3_DRAWMODE0, dm0);
         };
 
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup(rex_i);
         write_hostrw64(rex_i, word64);
         wait(rex_i);
         let fb_interp: Vec<u32> = (0..2).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
 
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup(rex_j);
         write_hostrw64(rex_j, word64);
@@ -4339,7 +4342,7 @@ mod jit_tests {
         let dm1 = DM1_CI8_HOSTRW;
 
         // Fill 4 pixels with known CI8 values using interpreter
-        let fill_rex = make_rex3();
+        let fill_rex = &make_rex3();
         rex3init(fill_rex);
         reg(fill_rex, REX3_DRAWMODE1, DM1_CI8_SRC);
         reg(fill_rex, REX3_WRMASK, 0xFF);
@@ -4364,14 +4367,14 @@ mod jit_tests {
         };
 
         // Interpreter HOSTR read
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup_read(rex_i);
         reg_go(rex_i, REX3_DRAWMODE0, dm0_read); // triggers first batch
         let word_interp = read_hostrw32_last(rex_i);
 
         // JIT HOSTR read
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup_read(rex_j);
         reg_go(rex_j, REX3_DRAWMODE0, dm0_read); // triggers compile + first batch
@@ -4399,7 +4402,7 @@ mod jit_tests {
         let width = pixels_in.len() as i32;
 
         // Fill pixels
-        let fill_rex = make_rex3();
+        let fill_rex = &make_rex3();
         rex3init(fill_rex);
         reg(fill_rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
         reg(fill_rex, REX3_WRMASK, 0xFFFFFF);
@@ -4435,11 +4438,11 @@ mod jit_tests {
             words
         };
 
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         let words_interp = read_words(rex_i);
 
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         // Trigger compile
         setup_read(rex_j);
@@ -4487,12 +4490,12 @@ mod jit_tests {
             reg_go(rex, REX3_DRAWMODE0, dm0_read);
             (0..words).map(|i| if i < words - 1 { read_hostrw32(rex) } else { read_hostrw32_last(rex) }).collect()
         };
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         let words_interp = read_words(rex_i);
         assert!(words_interp.iter().any(|&w| w != 0), "interpreter read nothing: vacuous");
 
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         let _ = read_words(rex_j); // trigger compile
         if let Some(ref jit) = rex_j.rex_jit {
@@ -4562,7 +4565,7 @@ mod jit_tests {
         // Fill a width x height region with distinct per-pixel values so any
         // word/row misalignment shows up as a mismatch rather than coincidentally
         // matching (e.g. an all-same-value fill would hide an off-by-one).
-        let fill_rex = make_rex3();
+        let fill_rex = &make_rex3();
         rex3init(fill_rex);
         unsafe {
             let fb = &mut *fill_rex.fb_rgb.get();
@@ -4608,7 +4611,7 @@ mod jit_tests {
             words
         };
 
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup_read(rex_i);
         let words_interp = read_all_words(rex_i);
@@ -4623,7 +4626,7 @@ mod jit_tests {
         // already ran on the interpreter — this priming pass reproduces that
         // "already compiled by the time the real primitive runs" end state
         // without relying on racy mid-primitive timing.
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup_read(rex_j);
         let _ = read_all_words(rex_j); // throwaway: triggers compile request
@@ -4655,7 +4658,7 @@ mod jit_tests {
     fn hostr_stress(dm1: u32, width: i32, height: i32, words_per_pixel_row: u32) {
         // Distinct per-pixel values (not a solid fill) so any word/row
         // misalignment shows up as a mismatch instead of coincidentally matching.
-        let fill_rex = make_rex3();
+        let fill_rex = &make_rex3();
         rex3init(fill_rex);
         unsafe {
             let fb = &mut *fill_rex.fb_rgb.get();
@@ -4698,7 +4701,7 @@ mod jit_tests {
             out
         };
 
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup_read(rex_i);
         let words_interp = read_all_words(rex_i);
@@ -4708,7 +4711,7 @@ mod jit_tests {
         // every GO below dispatches via JIT from word 0 — reproducing the "already
         // compiled by the time the real primitive runs" end state deterministically
         // instead of relying on racy mid-primitive compile timing.
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup_read(rex_j);
         let _ = read_all_words(rex_j);
@@ -4756,7 +4759,7 @@ mod jit_tests {
             1 + (i % 0xFE)
         };
 
-        let fill_rex = make_rex3();
+        let fill_rex = &make_rex3();
         rex3init(fill_rex);
         unsafe {
             let fb = &mut *fill_rex.fb_rgb.get();
@@ -4820,13 +4823,13 @@ mod jit_tests {
             }
         };
 
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup_read(rex_i);
         let words_interp = read_all_words(rex_i);
         check_alignment(&words_interp, "interp");
 
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup_read(rex_j);
         let _ = read_all_words(rex_j); // throwaway: triggers compile request
@@ -4889,14 +4892,14 @@ mod jit_tests {
                 }
             };
 
-            let rex_i = make_rex3();
+            let rex_i = &make_rex3();
             rex3init(rex_i);
             setup(rex_i);
             wait(rex_i);
             let fb_interp: Vec<u32> =
                 (0..alphas.len() as i32).map(|x| read_pixel(rex_i, x, 0) & 0xFFFFFF).collect();
 
-            let rex_j = make_rex3_jit();
+            let rex_j = &make_rex3_jit();
             rex3init(rex_j);
             setup(rex_j);
             wait(rex_j);
@@ -4921,12 +4924,12 @@ mod jit_tests {
     /// Runs `setup` on an interpreter REX3 and on a JIT one (after the JIT has
     /// compiled `dm0`/`dm1`), returning the pixels at `xs` on row `y` from each.
     fn interp_and_jit(dm0: u32, dm1: u32, xs: &[i32], y: i32, setup: &dyn Fn(&Rex3)) -> (Vec<u32>, Vec<u32>) {
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup(rex_i);
         wait(rex_i);
         let interp = xs.iter().map(|&x| read_pixel(rex_i, x, y) & 0xFFFFFF).collect();
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup(rex_j);
         wait(rex_j);
@@ -5005,11 +5008,11 @@ mod jit_tests {
                 .map(|(x, y)| read_pixel(rex, x, y) & 0xFFFFFF)
                 .filter(|&p| p != 0).collect()
         };
-        let rex_i = make_rex3();
+        let rex_i = &make_rex3();
         rex3init(rex_i);
         setup(rex_i);
         wait(rex_i);
-        let rex_j = make_rex3_jit();
+        let rex_j = &make_rex3_jit();
         rex3init(rex_j);
         setup(rex_j);
         wait(rex_j);
@@ -5097,8 +5100,8 @@ mod jit_tests {
             unsafe { (*rex.fb_aux.get())[(y as u32 * 2048 + x as u32) as usize] }
         }
 
-        let rex_interp = make_rex3();
-        let rex_jit    = make_rex3_jit();
+        let rex_interp = &make_rex3();
+        let rex_jit    = &make_rex3_jit();
         let dst = 20 * 2048 + 10;
         let mut drew_something = false;
 
@@ -5285,7 +5288,7 @@ const DM1_RGB12_BLEND: u32 = DRAWMODE1_PLANES_RGB
 /// there, so the drawn pixel came out black.
 #[test]
 fn test_blend_12bpp_writes_high_slot() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_RGB12_BLEND);
     reg(&rex, REX3_WRMASK, 0xfff000);   // high slot only
@@ -5309,7 +5312,7 @@ fn test_blend_12bpp_writes_high_slot() {
 /// Same, with WRMASK covering both packed slots: both must receive the colour.
 #[test]
 fn test_blend_12bpp_writes_both_slots() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     reg(&rex, REX3_DRAWMODE1, DM1_RGB12_BLEND);
     reg(&rex, REX3_WRMASK, 0xffffff);   // both slots
@@ -5333,7 +5336,7 @@ fn test_blend_12bpp_writes_both_slots() {
 /// source — same colour, same slot packing, whichever path produced it.
 #[test]
 fn test_blend_opaque_matches_logicop_src() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (2 << 3) | (1 << 15)
         | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
@@ -5363,7 +5366,7 @@ fn test_blend_opaque_matches_logicop_src() {
 /// leaving the framebuffer untouched.
 #[test]
 fn test_blend_alpha_test_discards_zero_alpha() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     // compare = 0b101 (!=) instead of the disable pattern.
     let dm1 = (DM1_RGB12_BLEND & !DRAWMODE1_COMPARE_DISABLE_SH) | (0b101 << 12);
@@ -5424,7 +5427,7 @@ fn blend_one(rex: &Rex3, x: i32, y: i32, dm1: u32, alpha: u32, rgb: u32) -> u32 
 /// source over a black destination is heavily attenuated.
 #[test]
 fn test_blendalpha1_sa_msa_attenuates() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let px = blend_one(&rex, 31, 40,
         dm1_blend24(DRAWMODE1_BF_SA, DRAWMODE1_BF_MSA, true), 8, 0x808080);
@@ -5436,7 +5439,7 @@ fn test_blendalpha1_sa_msa_attenuates() {
 /// real alpha: `alpha*src + dst`.
 #[test]
 fn test_blendalpha0_sa_one_attenuates_rgb() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     // Lay down a destination first, with blending off.
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
@@ -5452,7 +5455,7 @@ fn test_blendalpha0_sa_one_attenuates_rgb() {
 /// The colour channels come out the same whichever way BLENDALPHA is set.
 #[test]
 fn test_blendalpha_leaves_rgb_alone() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
         | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
@@ -5487,7 +5490,7 @@ fn test_blendalpha_selects_the_alpha_channels_factor() {
 /// With BLENDALPHA=1 both factors use the real alpha, giving a classic blend.
 #[test]
 fn test_blendalpha1_uses_alpha_in_both_factors() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
         | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
@@ -5506,7 +5509,7 @@ fn test_blendalpha1_uses_alpha_in_both_factors() {
 /// the write regardless of BLENDALPHA.
 #[test]
 fn test_afunction_uses_real_alpha_not_blendalpha() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
     let dm1_src = DRAWMODE1_PLANES_RGB | (3 << 3) | (1 << 15)
         | DRAWMODE1_COMPARE_DISABLE_SH | DRAWMODE1_LOGICOP_SRC_SH;
@@ -5607,7 +5610,7 @@ fn write_masked_preserves_unmasked_bits() {
 /// runs, which is precisely the build most users have.
 #[test]
 fn corpus_records_shapes_without_jit() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
 
     reg(rex, REX3_DRAWMODE1, DM1_RGB24_SRC);
@@ -5655,7 +5658,7 @@ fn corpus_records_shapes_without_jit() {
 fn gfifo_push_cost() {
     use std::time::{Duration, Instant};
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
 
     const BUDGET: Duration = Duration::from_millis(500);
@@ -5702,7 +5705,7 @@ fn gfifo_push_cost() {
 fn gfifo_push64_cost() {
     use std::time::{Duration, Instant};
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     const BUDGET: Duration = Duration::from_millis(500);
 
@@ -5872,7 +5875,7 @@ fn gfifo_push_breakdown() {
     let _ = h.join();
 
     // 3. Through the real bus entry point, for reference.
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     let c = bench("write32 (full bus path + consumer)", &|| {
         while rex.write32(REX3_COLORRED, 0x40 << 11) == crate::traits::BUS_BUSY {
@@ -5918,13 +5921,13 @@ fn test_hostw_batch_matches_scalar_writes() {
     };
 
     // Reference: one PIO write per word.
-    let rex_scalar = make_rex3();
+    let rex_scalar = &make_rex3();
     setup(rex_scalar);
     for &w in &words { write_hostrw64(rex_scalar, w); }
     wait(rex_scalar);
 
     // Batched: one bulk call carrying the whole run.
-    let rex_batch = make_rex3();
+    let rex_batch = &make_rex3();
     setup(rex_batch);
     let st = rex_batch.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words);
     assert_eq!(st, crate::traits::BUS_OK, "bulk write should be accepted");
@@ -5962,12 +5965,12 @@ fn test_hostw_batch_of_one_equals_single_write() {
         reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
     };
 
-    let rex_scalar = make_rex3();
+    let rex_scalar = &make_rex3();
     setup(rex_scalar);
     write_hostrw64(rex_scalar, word);
     wait(rex_scalar);
 
-    let rex_batch = make_rex3();
+    let rex_batch = &make_rex3();
     setup(rex_batch);
     assert_eq!(rex_batch.dma_write64_bulk(go_addr(REX3_HOSTRW0), &[word]),
                crate::traits::BUS_OK);
@@ -5986,7 +5989,7 @@ fn test_hostw_batch_of_one_equals_single_write() {
 fn test_pio_write_after_batch_is_unaffected() {
     use crate::traits::BusDevice;
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
     reg(rex, REX3_WRMASK, 0xFF);
@@ -6040,7 +6043,7 @@ fn test_hostr_batch_matches_scalar_dma_reads() {
         reg_go(rex, REX3_DRAWMODE0, DM0_READ_BLOCK);
     };
 
-    let rex_scalar = make_rex3();
+    let rex_scalar = &make_rex3();
     setup_read(rex_scalar);
     let mut scalar = [0u64; NWORDS];
     for slot in scalar.iter_mut() {
@@ -6049,7 +6052,7 @@ fn test_hostr_batch_matches_scalar_dma_reads() {
         *slot = r.data;
     }
 
-    let rex_batch = make_rex3();
+    let rex_batch = &make_rex3();
     setup_read(rex_batch);
     let mut batched = [0u64; NWORDS];
     let st = rex_batch.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut batched);
@@ -6111,7 +6114,7 @@ fn test_hostr_dma_readback_phase_matches_framebuffer() {
     ];
 
     // Scalar: one GO per word, GO before each read.
-    let rex_s = make_rex3();
+    let rex_s = &make_rex3();
     rex3init(rex_s);
     seed(rex_s);
     arm(rex_s);
@@ -6125,7 +6128,7 @@ fn test_hostr_dma_readback_phase_matches_framebuffer() {
         "scalar dma_read64 phase wrong:\n got {scalar:#018x?}\nwant {want:#018x?}");
 
     // Batched: one token for the whole run.
-    let rex_b = make_rex3();
+    let rex_b = &make_rex3();
     rex3init(rex_b);
     seed(rex_b);
     arm(rex_b);
@@ -6148,7 +6151,7 @@ fn test_hostr_dma_bulk_keeps_phase_across_chunks() {
 
     // 32px wide CI8 = 4 words/row, 2 rows = 8 words total.
     let (w, h) = (32i32, 2i32);
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     unsafe {
         let fb = &mut *rex.fb_rgb.get();
@@ -6190,7 +6193,7 @@ fn test_hostrw_dma_save_restore_round_trip() {
     use crate::traits::BusDevice;
 
     let (w, h) = (32i32, 4i32);
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
 
     let orig: Vec<u32> = (0..(w * h)).map(|i| (1 + i) as u32 & 0xFF).collect();
@@ -6253,7 +6256,7 @@ fn test_hostr_bulk_consumes_exactly_its_count() {
     use crate::traits::BusDevice;
 
     let (w, h) = (32i32, 2i32);
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     unsafe {
         let fb = &mut *rex.fb_rgb.get();
@@ -6309,12 +6312,12 @@ fn test_hostw_batch_matches_scalar_on_a_multiword_row() {
         reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
     };
 
-    let rex_s = make_rex3();
+    let rex_s = &make_rex3();
     setup(rex_s);
     for &v in &words { write_hostrw64(rex_s, v); }
     wait(rex_s);
 
-    let rex_b = make_rex3();
+    let rex_b = &make_rex3();
     setup(rex_b);
     assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
                crate::traits::BUS_OK);
@@ -6364,12 +6367,12 @@ fn test_hostw_batch_paints_every_row_of_a_multirow_block() {
     // Reference: the CPU's one-word-per-GO feed, which is what the batch must
     // reproduce. Its output defines correct — including whatever the row
     // boundary does to a partial word.
-    let rex_s = make_rex3();
+    let rex_s = &make_rex3();
     setup(rex_s);
     for &v in &words { write_hostrw64(rex_s, v); }
     wait(rex_s);
 
-    let rex_b = make_rex3();
+    let rex_b = &make_rex3();
     setup(rex_b);
     assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
                crate::traits::BUS_OK);
@@ -6424,12 +6427,12 @@ fn test_hostw_batch_matches_scalar_on_the_icon_upload_shape() {
         reg(rex, REX3_DRAWMODE0, DM0_HOSTW_BLOCK);
     };
 
-    let rex_s = make_rex3();
+    let rex_s = &make_rex3();
     setup(rex_s);
     for &v in &words { write_hostrw64(rex_s, v); }
     wait(rex_s);
 
-    let rex_b = make_rex3();
+    let rex_b = &make_rex3();
     setup(rex_b);
     assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
                crate::traits::BUS_OK);
@@ -6587,7 +6590,7 @@ fn test_gfifo_drain_payload_returns_the_exact_promised_count() {
 #[test]
 #[cfg(feature = "developer")]
 fn test_draw_debug_ring_records_a_host_block() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
     rex.draw_ring.lock().count = 0;
@@ -6610,7 +6613,7 @@ fn test_draw_debug_ring_records_a_host_block() {
 #[test]
 #[cfg(feature = "developer")]
 fn test_draw_debug_ring_records_a_plain_block() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
     rex.draw_ring.lock().count = 0;
@@ -6638,7 +6641,7 @@ fn test_draw_debug_ring_records_a_plain_block() {
 fn test_draw_debug_ring_records_a_batched_host_block() {
     use crate::traits::BusDevice;
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
     rex.draw_ring.lock().count = 0;
@@ -6673,7 +6676,7 @@ fn test_draw_debug_counts_every_word_of_a_batch() {
     use crate::traits::BusDevice;
 
     // 8px CI8 rows, 4 rows = 4 words, all delivered in one batch.
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
     rex.draw_ring.lock().count = 0;
@@ -6714,7 +6717,7 @@ fn test_draw_debug_counts_every_word_of_a_batch() {
 fn test_draw_debug_batch_count_does_not_leak_to_the_next_draw() {
     use crate::traits::BusDevice;
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     rex.draw_debug.store(true, std::sync::atomic::Ordering::Relaxed);
     rex.draw_ring.lock().count = 0;
@@ -6784,12 +6787,12 @@ fn test_hostw_batch_without_stopony_paints_all_rows() {
     };
 
     // Reference: one GO per word, which is what the hardware feed does.
-    let rex_s = make_rex3();
+    let rex_s = &make_rex3();
     setup(rex_s);
     for &v in &words { write_hostrw64(rex_s, v); }
     wait(rex_s);
 
-    let rex_b = make_rex3();
+    let rex_b = &make_rex3();
     setup(rex_b);
     assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
                crate::traits::BUS_OK);
@@ -6926,13 +6929,13 @@ fn test_hostw_bulk_matches_scalar_and_counter_pattern() {
         };
 
         // Reference engine: one GO per word, as the hardware feed does.
-        let rex_s = make_rex3();
+        let rex_s = &make_rex3();
         setup(rex_s);
         for &v in &words { write_hostrw64(rex_s, v); }
         wait(rex_s);
 
         // Under test: one bulk DMA write, exactly as mc_vdma issues it.
-        let rex_b = make_rex3();
+        let rex_b = &make_rex3();
         setup(rex_b);
         assert_eq!(rex_b.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
                    crate::traits::BUS_OK, "{w}x{h}: bulk write refused");
@@ -6978,7 +6981,7 @@ fn test_hostr_bulk_matches_scalar_and_counter_pattern() {
         };
 
         // Scalar: one GO-wait-read per word.
-        let rex_s = make_rex3();
+        let rex_s = &make_rex3();
         arm(rex_s);
         let mut scalar = Vec::with_capacity(nwords);
         for k in 0..nwords {
@@ -6988,7 +6991,7 @@ fn test_hostr_bulk_matches_scalar_and_counter_pattern() {
         }
 
         // Bulk: one token, one pipeline drain, copy the array out.
-        let rex_b = make_rex3();
+        let rex_b = &make_rex3();
         arm(rex_b);
         let mut bulk = vec![0u64; nwords];
         assert_eq!(rex_b.dma_read64_bulk(go_addr(REX3_HOSTRW0), &mut bulk),
@@ -7020,7 +7023,7 @@ fn test_hostrw_bulk_round_trip_preserves_the_image() {
     for &(w, h) in SWEEP_SHAPES {
         let src = counter_words(w, h);
 
-        let rex = make_rex3();
+        let rex = &make_rex3();
         rex3init(rex);
         reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
         reg(rex, REX3_WRMASK, 0xFF);
@@ -7068,7 +7071,7 @@ fn test_hostw_stopony_flushes_partial_word_at_row_boundary() {
     for &(w, h) in &[(12, 4), (20, 3), (4, 6), (33, 2), (12, 9)] {
         let words = counter_words(w, h);
 
-        let rex = make_rex3();
+        let rex = &make_rex3();
         rex3init(rex);
         reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
         reg(rex, REX3_WRMASK, 0xFF);
@@ -7107,7 +7110,7 @@ fn test_hostr_stopony_flushes_partial_word_at_row_boundary() {
         let nwords = per_row * h as usize;
         let want = counter_words(w, h);
 
-        let rex = make_rex3();
+        let rex = &make_rex3();
         rex3init(rex);
         prefill_counter_image(rex, w, h);
         reg(rex, REX3_DRAWMODE1, DM1_CI8_HOSTRW64);
@@ -7179,7 +7182,7 @@ fn test_bulk_transfers_appear_in_the_trace() {
     let path = std::env::temp_dir().join(format!("iris-rex3-trace-{}.txt", std::process::id()));
     let path = path.to_str().unwrap().to_string();
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
 
     // `rex trace <file>` — same path the monitor command takes.
@@ -7275,10 +7278,10 @@ mod batch_jit_equivalence {
         for &(w, h) in &[(8i32, 4i32), (16, 3), (12, 4), (20, 3), (33, 2)] {
             let words = counter_words(w, h);
 
-            let rex_i = make_rex3();            // interpreter (jit_enabled = false)
+            let rex_i = &make_rex3();            // interpreter (jit_enabled = false)
             let interp = run_hostw(rex_i, w, h, &words);
 
-            let rex_j = make_rex3_jit();
+            let rex_j = &make_rex3_jit();
             rex_j.jit_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
             // The first run only *requests* the compile — it happens on another
             // thread, so this run still executes on the interpreter. Wait for
@@ -7327,11 +7330,11 @@ mod batch_jit_equivalence {
             let n = (((w as usize) + 7) / 8) * h as usize;
             let want = counter_words(w, h);
 
-            let rex_i = make_rex3();
+            let rex_i = &make_rex3();
             rex3init(rex_i);
             let interp = run_hostr(rex_i, w, h, n);
 
-            let rex_j = make_rex3_jit();
+            let rex_j = &make_rex3_jit();
             rex_j.jit_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
             rex3init(rex_j);
             let _ = run_hostr(rex_j, w, h, n);
@@ -7413,14 +7416,14 @@ fn precompiled_shaders_handle_batched_transfers() {
     };
 
     // Reference: empty shader map, so this is the interpreter.
-    let rex_i = make_rex3();
+    let rex_i = &make_rex3();
     setup(rex_i);
     assert_eq!(rex_i.dma_write64_bulk(go_addr(REX3_HOSTRW0), &words),
                crate::traits::BUS_OK);
     wait(rex_i);
 
     // Under test: seed the generated table, as a non-test build does.
-    let rex_s = make_rex3();
+    let rex_s = &make_rex3();
     {
         let mut map = rex_s.shaders.write();
         for (k, f) in crate::dev::ng1::rex3_shaders::SHADERS { map.insert(*k, *f); }
@@ -7479,7 +7482,7 @@ fn stepz_go_skips_its_pixel() {
     // A span with no STOPONX: one pixel per GO (DOSETUP, as IRIX sends it).
     let one_px = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_SPAN_SH | DM0_DOSETUP;
     for zpopaque in [false, true] {
-        let rex = make_rex3();
+        let rex = &make_rex3();
         rex3init(rex);
         {
             let fb = unsafe { &mut *rex.fb_rgb.get() };
@@ -7529,7 +7532,7 @@ fn test_recording_replays_bit_exact() {
     let path = std::env::temp_dir().join(format!("iris-rex3-rec-{}.rec", std::process::id()));
     let path = path.to_str().unwrap().to_string();
 
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(rex);
     // Something on screen before the recording starts: the start state must carry it.
     reg(rex, REX3_DRAWMODE1, 0x0000_7006 | (3 << 13)); // CI8, logicop SRC
@@ -7592,7 +7595,7 @@ fn test_recording_replays_bit_exact() {
 /// that one colour, not paint one pixel and wait for more words.
 #[test]
 fn test_hostw_full_block_replicates_single_word() {
-    let rex = make_rex3();
+    let rex = &make_rex3();
     rex3init(&rex);
 
     const DM0: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_BLOCK_SH

@@ -648,15 +648,43 @@ impl Gr2 {
 
     fn hq_loop(&self) {
         struct Sink<'a>(&'a Gr2);
+        // Every wait on RE3 gives up once `stop()` clears `running`: RE3 exits
+        // on its sentinel, and anything HQ2 queues behind that is never drained.
+        impl Sink<'_> {
+            fn stopped(&self) -> bool {
+                !self.0.running.load(Ordering::Relaxed)
+            }
+            fn push(&self, op: u32, val: u64) {
+                while !self.0.re3_fifo.try_push(op, val) {
+                    if self.stopped() {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+                Gr2::wake(&self.0.re3_thread);
+            }
+            /// Wait for RE3 to finish everything queued; false if stopped first.
+            fn drain_re3(&self) -> bool {
+                while !self.0.re3_fifo.is_empty() || self.0.re3_busy.load(Ordering::Acquire) {
+                    if self.stopped() {
+                        return false;
+                    }
+                    std::hint::spin_loop();
+                }
+                true
+            }
+        }
         impl Re3Sink for Sink<'_> {
             fn reg(&mut self, reg: usize, val: u32) {
-                self.0.re3_fifo.push(reg as u32 | re3::RE3_SRC_HQ, val as u64);
-                Gr2::wake(&self.0.re3_thread);
+                self.push(reg as u32 | re3::RE3_SRC_HQ, val as u64);
             }
             fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32) {
                 let a = (sx as u16 as u64) | ((sy as u16 as u64) << 16) | ((w as u16 as u64) << 32) | ((h as u16 as u64) << 48);
                 let b = (dx as u16 as u64) | ((dy as u16 as u64) << 16);
                 while !self.0.re3_fifo.try_push2(re3::RE3_OP_COPY_A, a, re3::RE3_OP_COPY_B, b) {
+                    if self.stopped() {
+                        return;
+                    }
                     std::hint::spin_loop();
                 }
                 Gr2::wake(&self.0.re3_thread);
@@ -664,8 +692,8 @@ impl Gr2 {
             fn finish(&mut self, flag: usize) {
                 // The host polls the flag to learn the request is done, so it
                 // must not be seen before the drawing it follows: drain RE3.
-                while !self.0.re3_fifo.is_empty() || self.0.re3_busy.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                if !self.drain_re3() {
+                    return;
                 }
                 self.0.regs().hq.fin[flag].store(1, Ordering::Release);
             }
@@ -683,12 +711,11 @@ impl Gr2 {
                 }
             }
             fn op(&mut self, op: u32, val: u64) {
-                self.0.re3_fifo.push(op, val);
-                Gr2::wake(&self.0.re3_thread);
+                self.push(op, val);
             }
             fn read_image(&mut self, req: &hq2::ReadImage, dest: hq2::ReadDest) {
-                while !self.0.re3_fifo.is_empty() || self.0.re3_busy.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                if !self.drain_re3() {
+                    return;
                 }
                 // SAFETY: RE3 is drained and idle; VRAM and Z are only read
                 // here, as the display thread does.

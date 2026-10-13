@@ -174,12 +174,14 @@ fn writebuf_then_readbuf_stream() {
 
 // ── Through the bus: CPU register window -> RE3 FIFO -> RE3 thread ─────────
 
-pub(super) fn live_gr2(variant: Gr2Variant) -> &'static Gr2 {
+/// A started board, stopped and freed when the test ends. Bind it with
+/// `let g = &live_gr2(..);` so helpers taking `&Gr2` coerce.
+pub(super) fn live_gr2(variant: Gr2Variant) -> crate::test_board::TestBoard<Gr2> {
     let g = Gr2::new(variant, Gr2Stats {
         heartbeat: Arc::new(AtomicU64::new(0)),
         fasttick: Arc::new(AtomicU64::new(0)),
     });
-    let g: &'static Gr2 = Box::leak(Box::new(g));
+    let g = crate::test_board::TestBoard::new(g);
     g.start();
     g
 }
@@ -206,7 +208,7 @@ fn re3_reg(reg: usize) -> u32 {
 
 #[test]
 fn cpu_register_window_draws_and_reads_back() {
-    let g = live_gr2(Gr2Variant::Xz);
+    let g = &live_gr2(Gr2Variant::Xz);
     w32(g, re3_reg(REG_FUNC), ROP_COPY);
     w32(g, re3_reg(REG_PIXMASK), 0xffffff);
     w32(g, re3_reg(REG_XMAX), 1279);
