@@ -33,9 +33,9 @@ Gotchas that cost time:
   sub-image updates "do nothing", check this first.
 - **PIO read order is set per client by XFRMODE bit 18.** Without it
   (libGLcore), RGB(A) comes in the reverse of the DMA order. With it (the
-  X server's XGetImage, 0x40080), it comes in the DMA order. Check
-  XGetImage after changing any read path: `test`-style probe xgetpix
-  (XGetImage of a root pixel) against `mgras pix`. The unit test is
+  X server's XGetImage, 0x40080), it comes in the DMA order. After
+  changing any read path, check XGetImage: run `test/gltest/xgetpix X Y`
+  (XGetImage of a root pixel) and compare it with `mgras pix X Y`. The unit test is
   `pio_read_order_follows_rgborder_and_bit_18`.
 - **Index outputs wrap, colours clamp**: stencil and colour-index draws
   keep the low bits of the pipeline's value (shift/offset past 255).
