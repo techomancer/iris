@@ -410,6 +410,7 @@ fn key_of(rss: &mut Rss, prim: Prim) -> Option<PipeKey> {
         format: rss::xfer_format(mode),
         begin_skip: 0,
         stride_skip: 0,
+        pio_dma_order: false,
         line: 0,
         line_begin: 0,
         pending: 0,

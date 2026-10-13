@@ -1763,12 +1763,21 @@ impl Gl {
             return None;
         }
         let ty = self.xfrmode & 0xF;
+        // Colour and stencil indices keep their low bits (GL masks them),
+        // components clamp.
+        let index = matches!((self.xfrmode >> 4) & 0xF, 0 | 1);
+        let wrap = match ty {
+            0 => 0xFF,
+            1 => 0xFFFF,
+            _ => 0xFFFF_FFFF,
+        };
         let wpr_out = (w * bpp).div_ceil(4);
         let mut out = Vec::with_capacity(wpr_out * h);
         let mut rb = Vec::with_capacity(wpr_out * 4);
         for r in 0..h {
             rb.clear();
             for v in self.pix.run_row(&bytes[r * stride..r * stride + row_in], w, out_comps) {
+                let v = if index { (v.round() as i64 & wrap) as f64 } else { v };
                 super::rss::pack_comp(ty, v, &mut rb);
             }
             rb.resize(wpr_out * 4, 0);

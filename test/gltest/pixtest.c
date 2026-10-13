@@ -61,6 +61,17 @@ static const struct { const char *name; const char *why; } xfails[] = {
       "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
     { "read/RGBA/UNSIGNED_BYTE/map256",
       "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "read/RGBA/UNSIGNED_SHORT_5_5_5_1", "libGLcore's PIO packer puts the last component in the top bits (a reversed layout)" },
+    { "read/RGBA/UNSIGNED_INT_10_10_10_2", "libGLcore's PIO packer puts the last component in the top bits (a reversed layout)" },
+    { "read/RGB/UNSIGNED_BYTE_3_3_2", "libGLcore's PIO packer puts the last component in the top bits (a reversed layout)" },
+    { "read/ABGR_EXT/UNSIGNED_SHORT_5_5_5_1", "libGLcore's PIO packer puts the last component in the top bits (a reversed layout)" },
+    { "read/ABGR_EXT/UNSIGNED_INT_10_10_10_2", "libGLcore's PIO packer puts the last component in the top bits (a reversed layout)" },
+    { "gettex/RGBA8/ALPHA/UNSIGNED_BYTE",
+      "libGLcore's glGetTexImage refuses GL_ALPHA (GL_INVALID_OPERATION)" },
+    { "texsub/RGBA8/narrow",
+      "libGLcore refuses sub-images under 32 texels wide unless full width (GL_INVALID_VALUE)" },
+    { "copytexsub/RGBA8/narrow",
+      "libGLcore refuses sub-images under 32 texels wide unless full width (GL_INVALID_VALUE)" },
     { "bitmap/rowlen40-skip3,2",
       "libGLcore's glBitmap starts at UNPACK_SKIP_PIXELS / 8 bytes, dropping the bits" },
     { "bitmap/lsb-rowlen40-skip11,1",
@@ -1519,9 +1530,11 @@ static void tex_base(const TexFmt *tf, const double c[4], double tc[4])
    (at least that many: an implementation may keep more). */
 static int bits_tol(int bits)
 {
+    /* A full step of the stored precision: IMPACT's TE keeps a
+       component's top bits rather than rounding. */
     if (bits <= 0 || bits >= 8)
         return 1;
-    return (int)ceil(255.0 / ((1 << bits) - 1) / 2.0) + 1;
+    return (int)ceil(255.0 / ((1 << bits) - 1)) + 1;
 }
 
 static void draw_tex_quad(int x, int y, int w, int h, float s1, float t1)
@@ -1644,21 +1657,35 @@ static void t_tex(void)
 
 static void t_texsub(void)
 {
-    int tw = 32, th = 16, sw = 13, sh = 5, ox = 7, oy = 6, i, j, k, tol = 1;
-    unsigned char *base, *sub, *subexp, got[32 * 16 * 4], exp[32 * 16 * 4];
-    const char *tags[4] = { "", "/rowlen20-skip2,1", "/RGB-FLOAT", "/resident" };
+    int tw = 64, th = 16, sw, sh, ox, oy, i, j, k, tol = 1;
+    unsigned char *base, *sub, *subexp, got[64 * 16 * 4], exp[64 * 16 * 4];
+    /* libGLcore (mgrTM_TexSubImage2D_setup) takes a sub-image only at
+       least 32 texels wide (or the texture's full width) whose right edge
+       is a multiple of 32 or the texture's edge; anything else is
+       GL_INVALID_VALUE. "/narrow" checks that refusal. */
+    const char *tags[8] = { "", "/rowlen50-skip2,1", "/RGB-FLOAT", "/resident",
+                            "/32x4@0,4", "/64x4@0,9", "/narrow", "/object" };
+    static const int geom[8][4] = { { 40, 5, 24, 6 }, { 40, 5, 24, 6 }, { 40, 5, 24, 6 }, { 40, 5, 24, 6 },
+                                    { 32, 4, 0, 4 }, { 64, 4, 0, 9 }, { 13, 5, 7, 6 }, { 40, 5, 24, 6 } };
     int c;
-    for (c = 0; c < 4; c++) {
+    GLuint tobj = 0;
+    for (c = 0; c < 8; c++) {
         Store s = store_default;
         const Fmt *f = &fmts[0];
         const Type *t = type_of(GL_UNSIGNED_BYTE);
         unsigned char *bexp;
+        sw = geom[c][0]; sh = geom[c][1]; ox = geom[c][2]; oy = geom[c][3];
         if (!begin("texsub/RGBA8%s", tags[c]))
             continue;
-        if (c == 1) { s.row_length = 20; s.skip_pixels = 2; s.skip_rows = 1; s.alignment = 1; }
+        if (c == 1) { s.row_length = 50; s.skip_pixels = 2; s.skip_rows = 1; s.alignment = 1; }
         if (c == 2) { f = &fmts[1]; t = type_of(GL_FLOAT); }
         reset_state();
         clear_all();
+        if (c == 7) {
+            /* A texture object instead of the default texture. */
+            glGenTextures(1, &tobj);
+            glBindTexture(GL_TEXTURE_2D, tobj);
+        }
         tex_setup();
         base = malloc(tw * th * 4);
         bexp = base;
@@ -1667,6 +1694,11 @@ static void t_texsub(void)
         }
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, base);
+        {
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR)
+                note("glTexImage2D: GL error 0x%x", (unsigned)e);
+        }
         sub = make_image(f, t, &s, sw, sh, &xfer_none, &subexp);
         if (c == 3) {
             /* Use the texture once first: the sub-image then updates a
@@ -1700,6 +1732,11 @@ static void t_texsub(void)
                 tex_expect(&texfmts[6], cc, exp + (j * tw + i) * 4, &tol);
             }
         compare8("texel", 0, 0, tw, th, got, exp, tol);
+        if (tobj) {
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glDeleteTextures(1, &tobj);
+            tobj = 0;
+        }
         free(base);
         free(sub);
         free(subexp);
@@ -1709,7 +1746,7 @@ static void t_texsub(void)
 
 static void t_copytex(void)
 {
-    int tw = 16, th = 8, i, k, tol = 1;
+    int tw = 16, th = 8, i, k, tol = 1, cw;
     unsigned char fb[16 * 8 * 4], got[16 * 8 * 4], exp[16 * 8 * 4];
     if (begin("copytex/RGBA8")) {
         reset_state();
@@ -1731,8 +1768,12 @@ static void t_copytex(void)
         compare8("texel", 0, 0, tw, th, got, exp, tol);
         end();
     }
-    if (begin("copytexsub/RGBA8")) {
+    for (cw = 0; cw < 2; cw++) {
+        /* Full-width rows; then libGLcore's narrow-copy refusal. */
+        int cx = cw ? 4 : 0, cwid = cw ? 8 : 16;
         unsigned char base[16 * 8 * 4];
+        if (!begin("copytexsub/RGBA8%s", cw ? "/narrow" : ""))
+            continue;
         reset_state();
         clear_all();
         draw_pattern(100, 100, tw, th);
@@ -1743,7 +1784,12 @@ static void t_copytex(void)
         }
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, base);
-        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 4, 2, 100, 100, 8, 4);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, cx, 2, 100, 100, cwid, 4);
+        {
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR)
+                note("glCopyTexSubImage2D: GL error 0x%x", (unsigned)e);
+        }
         glEnable(GL_TEXTURE_2D);
         draw_tex_quad(40, 40, tw, th, 1, 1);
         reset_state();
@@ -1751,9 +1797,9 @@ static void t_copytex(void)
         for (i = 0; i < tw * th; i++) {
             int x = i % tw, y = i / tw;
             double c[4];
-            if (x >= 4 && x < 12 && y >= 2 && y < 6)
+            if (x >= cx && x < cx + cwid && y >= 2 && y < 6)
                 for (k = 0; k < 4; k++)
-                    c[k] = fb_comp(fb + ((y - 2) * tw + (x - 4)) * 4, k);
+                    c[k] = fb_comp(fb + ((y - 2) * tw + (x - cx)) * 4, k);
             else
                 for (k = 0; k < 4; k++)
                     c[k] = base[i * 4 + k] / 255.0;
@@ -1788,6 +1834,11 @@ static void t_gettex(void)
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         memset(out, 0xcd, sizeof out);
         glGetTexImage(GL_TEXTURE_2D, 0, f->fmt, GL_UNSIGNED_BYTE, out);
+        {
+            GLenum e = glGetError();
+            if (e != GL_NO_ERROR)
+                note("glGetTexImage: GL error 0x%x", (unsigned)e);
+        }
         for (i = 0; i < tw * th && !cur_bad; i++)
             for (k = 0; k < f->n; k++) {
                 const unsigned char *p = src + i * 4;

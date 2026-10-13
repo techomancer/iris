@@ -857,6 +857,8 @@ pub(super) struct Xfer {
     pub format: (u32, u32),
     pub begin_skip: u32,
     pub stride_skip: u32,
+    /// XFRMODE bit 18: a PIO read in the DMA order (the X server's).
+    pub pio_dma_order: bool,
     /// PIO write stream: the line being assembled, its byte offset within
     /// its first doubleword, the bytes collected (in `Rss::line_buf`), and
     /// filler still to skip.
@@ -2327,10 +2329,11 @@ impl Rss {
             bpp: bytes_per_pixel(mode),
             format: xfer_format(mode),
             begin_skip: begin,
-            // Bits 18:14 (traced up to 6, the row padding to a
-            // doubleword); 19 and 20 enable zoom and decimation, 22 is
-            // RGBorder.
-            stride_skip: (mode >> 14) & 0x1F,
+            // Bits 17:14 (traced up to 6, the row padding to a
+            // doubleword); 18 keeps a PIO read in the DMA order, 19 and 20
+            // enable zoom and decimation, 22 is RGBorder.
+            stride_skip: (mode >> 14) & 0xF,
+            pio_dma_order: mode & 1 << 18 != 0,
             line: 0,
             line_begin: begin,
             pending: 0,
@@ -2425,13 +2428,20 @@ impl Rss {
     /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
     fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
-        // PIO reads of RGB(A) come last component first whatever RGBorder
-        // says (libGLcore's packed-type reads, one row at a time, unpack
-        // them so: traced 4-4-4-4, 5-5-5-1, 8-8-8-8, 10-10-10-2, 3-3-2).
-        if x.pio_read && matches!(x.format.0, 7 | 8) && x.format != (8, 0) {
+        // PIO reads of RGB(A) come in the reverse of the DMA order: RGBA
+        // (RGBorder set) alpha first, ABGR (clear) red first. libGLcore's
+        // packed-type reads (__glMgr_PackPixels, one row at a time) unpack
+        // them so: its 4-4-4-4 and 8-8-8-8 come out right in both orders.
+        // The X server's reads (XGetImage, xfrmode 0x40080) set bit 18 and
+        // take the pixel word in the DMA order (traced: colours right).
+        if x.pio_read && !x.pio_dma_order && matches!(x.format.0, 7 | 8) {
             let c = self.comps16(fx, fy);
             let mut out = Vec::with_capacity(x.bpp as usize);
-            let order: &[usize] = if x.format.0 == 8 { &[3, 2, 1, 0] } else { &[2, 1, 0] };
+            let order: &[usize] = match x.format.0 {
+                8 if x.format.1 & 0x10 == 0 => &[0, 1, 2, 3],
+                8 => &[3, 2, 1, 0],
+                _ => &[2, 1, 0],
+            };
             for &k in order {
                 host_comp(x.format.1, c[k], &mut out);
             }
@@ -2704,12 +2714,32 @@ mod tests {
         r.mem.put(&ba, 10, 1018, 0x123456);
         r.mem.put(&bb, 10, 1018, 0x654321);
         r.write(reg::FILLMODE, 2 << 22, false);
-        r.write(reg::XFRMODE, 0x80, false);
+        r.write(reg::XFRMODE, 0x40080, false);
         r.write(reg::XFRSIZE, 1 << 16 | 1, false);
         for (read, draw, expected) in [(0, 2, 0x123456), (1, 1, 0x654321), (0, 3, 0x123456), (1, 3, 0x654321)] {
             r.write(reg::PP1FILLMODE, 0x0C00_0204 | read << 21 | draw << 14, false);
             block(&mut r, 10, 5, 10, 5);
             assert_eq!(r.pio_read_hi(), expected, "read {read}, draw {draw}");
+        }
+    }
+
+    /// PIO reads of RGBA come in the reverse of the DMA order (libGLcore's
+    /// packed-type reads: RGBA alpha first, ABGR red first) unless XFRMODE
+    /// bit 18 asks for the DMA order (the X server's XGetImage).
+    #[test]
+    fn pio_read_order_follows_rgborder_and_bit_18() {
+        let mut r = x_server();
+        let a = 0x240;
+        r.write(reg::DRBPOINTERS, a | a << 10, false);
+        let ba = Buffer::new(a, Kind::Wide, r.reg(reg::DRBSIZE));
+        r.mem.put(&ba, 10, 1018, 0x4433_2211);
+        r.write(reg::FILLMODE, 2 << 22, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 1, false);
+        r.write(reg::PP1FILLMODE, 0x0C00_0204 | 2 << 14, false);
+        for (mode, expected) in [(0x40_0080, 0x4433_2211), (0x80, 0x1122_3344), (0x4_0080, 0x4433_2211)] {
+            r.write(reg::XFRMODE, mode, false);
+            block(&mut r, 10, 5, 10, 5);
+            assert_eq!(r.pio_read_hi(), expected, "xfrmode {mode:#x}");
         }
     }
 

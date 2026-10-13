@@ -230,6 +230,9 @@ impl PixMem {
                 6 => 3,
                 _ => 1,
             }
+        } else if mods.iter().any(|m| m.0 == entry::COMPRESS) {
+            // A texture load into fewer components: RGBA comes in.
+            4
         } else {
             out_comps
         };
