@@ -494,6 +494,10 @@ fn switch_to_gl_context(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32) {
 
 /// The same, the window's PP1 window mode (image word 4) `pp1winmode`.
 fn switch_to_gl_context_cid(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32, pp1winmode: u32) {
+    // Clear the switch-done flag first: left set by the last switch, the
+    // wait below would return before this one ran (and a test's next
+    // register write would race the HQ thread; seen on CI).
+    write(m, 32, 0x7000C, 1 << 6);
     write(m, 32, 0x50050, 0x4FC);
     let mut img = [0u32; 63];
     img[0] = id;
