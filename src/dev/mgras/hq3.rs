@@ -891,6 +891,7 @@ impl Hq3Engine {
                         }
                         match g[0] & 0x3FF {
                             0x159 => self.gl.xfrmode = g[1],
+                            0x155 => self.gl.xfr_factor = g[1],
                             0x046 => self.gl.pixel_block[0] = g[1],
                             0x047 => self.gl.pixel_block[1] = g[1],
                             _ => {}

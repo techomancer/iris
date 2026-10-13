@@ -1760,9 +1760,10 @@ fn gl_draw_pixels_float_through_the_pipeline() {
     fifo_token(&m, 0x8D, &[4, 0, 0, 1, 0, 1, 0x49D0, 0x8]);
     fifo_pixel_data(&m, &[f(0.5), f(0.25), f(1.5), f(-1.0)]);
     m.state_hash();
-    // Red 0.5 is 127, not 128: libGLcore's scale, 2^32 - 1 as a float,
-    // is 4294967040, which puts 0.5 just under half way.
-    assert_eq!(gl_px(&m, 10, 20) & 0xFF_FFFF, 0xFF_407F, "R 0.5, G 0.25, B clamped to 1");
+    // The raster engine keeps a component's top bits, and libGLcore's
+    // scale (2^32 - 1 as a float, 4294967040) puts 0.5 and 0.25 just under
+    // 128 and 64.
+    assert_eq!(gl_px(&m, 10, 20) & 0xFF_FFFF, 0xFF_3F7F, "R 0.5, G 0.25, B clamped to 1");
     m.stop_engines();
 }
 

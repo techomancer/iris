@@ -51,7 +51,26 @@ static int n_only = 0;
 static const char *skips[32];
 static int n_skips = 0;
 static int list_only = 0;
-static int npass = 0, nfail = 0, nskip = 0;
+static int npass = 0, nfail = 0, nskip = 0, nxfail = 0;
+
+/* Cases where IRIX's libGLcore itself departs from GL 1.1 on IMPACT (the
+   board does what it is told): reported XFAIL / XPASS, not counted as
+   failures. */
+static const struct { const char *name; const char *why; } xfails[] = {
+    { "read/RGBA/UNSIGNED_BYTE/scale-bias",
+      "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+    { "read/RGBA/UNSIGNED_BYTE/map256",
+      "libGLcore sends no pixel transfer for glReadPixels (plain read)" },
+};
+
+static const char *xfail_why(const char *name)
+{
+    unsigned i;
+    for (i = 0; i < sizeof xfails / sizeof xfails[0]; i++)
+        if (!strcmp(name, xfails[i].name))
+            return xfails[i].why;
+    return 0;
+}
 static int have_alpha = 0, have_depth = 0, have_stencil = 0, have_db = 0;
 static int ext_abgr = 0, ext_packed = 0;
 
@@ -117,7 +136,10 @@ static void end(void)
         note("GL error 0x%x", (unsigned)e);
     while (glGetError() != GL_NO_ERROR)
         ;
-    if (cur_bad) {
+    if (cur_bad && xfail_why(cur_name)) {
+        nxfail++;
+        printf("XFAIL #%d %s: %s [%s]\n", case_no, cur_name, cur_detail, xfail_why(cur_name));
+    } else if (cur_bad) {
         nfail++;
         printf("FAIL #%d %s: %s", case_no, cur_name, cur_detail);
         if (cur_bad > 1)
@@ -125,7 +147,7 @@ static void end(void)
         printf("\n");
     } else {
         npass++;
-        printf("PASS #%d %s\n", case_no, cur_name);
+        printf("%s #%d %s\n", xfail_why(cur_name) ? "XPASS" : "PASS", case_no, cur_name);
     }
     fflush(stdout);
 }
@@ -997,18 +1019,29 @@ static void zoom_case(double zx, double zy)
     exp = malloc(W * H * 4);
     read_rgba8(X0, Y0, W, H, got);
     /* GL 1.1 3.6.5: pixel (i, j) covers [rx + zx i, rx + zx (i+1)) x ...;
-       a fragment is produced for each pixel centre inside. */
-    for (j = 0; j < H; j++)
-        for (i = 0; i < W; i++) {
+       a fragment is produced for each pixel centre inside. IMPACT zooms
+       x by replicating ceil(zx) and decimating in the raster engine, so a
+       pixel may take the neighbouring source pixel (or the background) at
+       a boundary: accept the GL source pixel +-1 in each direction. */
+    for (j = 0; j < H && !cur_bad; j++)
+        for (i = 0; i < W && !cur_bad; i++) {
             double cx = X0 + i + 0.5, cy = Y0 + j + 0.5;
-            double fi = (cx - rx) / zx, fj = (cy - ry) / zy;
-            int si = (int)floor(fi), sj = (int)floor(fj);
-            const unsigned char *src = bg8;
-            if (si >= 0 && si < w && sj >= 0 && sj < h)
-                src = img + (sj * w + si) * 4;
-            memcpy(exp + (j * W + i) * 4, src, 4);
+            int si = (int)floor((cx - rx) / zx), sj = (int)floor((cy - ry) / zy);
+            const unsigned char *g = got + (j * W + i) * 4;
+            int ok = 0, a, b;
+            for (b = -1; b <= 1 && !ok; b++)
+                for (a = -1; a <= 1 && !ok; a++) {
+                    int ti = si + a, tj = sj + b;
+                    const unsigned char *src = bg8;
+                    if (ti >= 0 && ti < w && tj >= 0 && tj < h)
+                        src = img + (tj * w + ti) * 4;
+                    if (!memcmp(src, g, have_alpha ? 4 : 3))
+                        ok = 1;
+                }
+            if (!ok)
+                note("pixel (%d,%d) %02x%02x%02x%02x is no source pixel near (%d,%d)",
+                     X0 + i, Y0 + j, g[0], g[1], g[2], g[3], si, sj);
         }
-    compare8("pixel", X0, Y0, W, H, got, exp, 0);
     free(got);
     free(exp);
     end();
@@ -1456,17 +1489,18 @@ static const TexFmt texfmts[] = {
 };
 #define NTEXFMTS (sizeof texfmts / sizeof texfmts[0])
 
-/* Fragment colour for REPLACE with texture components tc (RGBA after the
-   internal format's base conversion), fragment colour fc. */
+/* Fragment colour for MODULATE (GL 1.1 table 3.18) with texture
+   components tc (RGBA after the internal format's base conversion),
+   fragment colour fc. */
 static void tex_replace(const TexFmt *tf, const double tc[4], const double fc[4], double out[4])
 {
     switch (tf->base) {
-    case 0: out[0] = tc[0]; out[1] = tc[1]; out[2] = tc[2]; out[3] = tc[3]; break;
-    case 1: out[0] = tc[0]; out[1] = tc[1]; out[2] = tc[2]; out[3] = fc[3]; break;
-    case 2: out[0] = out[1] = out[2] = tc[0]; out[3] = fc[3]; break;
-    case 3: out[0] = out[1] = out[2] = tc[0]; out[3] = tc[3]; break;
-    case 4: out[0] = fc[0]; out[1] = fc[1]; out[2] = fc[2]; out[3] = tc[3]; break;
-    default: out[0] = out[1] = out[2] = out[3] = tc[0]; break;
+    case 0: out[0] = fc[0] * tc[0]; out[1] = fc[1] * tc[1]; out[2] = fc[2] * tc[2]; out[3] = fc[3] * tc[3]; break;
+    case 1: out[0] = fc[0] * tc[0]; out[1] = fc[1] * tc[1]; out[2] = fc[2] * tc[2]; out[3] = fc[3]; break;
+    case 2: out[0] = fc[0] * tc[0]; out[1] = fc[1] * tc[0]; out[2] = fc[2] * tc[0]; out[3] = fc[3]; break;
+    case 3: out[0] = fc[0] * tc[0]; out[1] = fc[1] * tc[0]; out[2] = fc[2] * tc[0]; out[3] = fc[3] * tc[3]; break;
+    case 4: out[0] = fc[0]; out[1] = fc[1]; out[2] = fc[2]; out[3] = fc[3] * tc[3]; break;
+    default: out[0] = fc[0] * tc[0]; out[1] = fc[1] * tc[0]; out[2] = fc[2] * tc[0]; out[3] = fc[3] * tc[0]; break;
     }
 }
 
@@ -1496,16 +1530,19 @@ static void draw_tex_quad(int x, int y, int w, int h, float s1, float t1)
     glEnd();
 }
 
+/* GL_MODULATE with a white fragment shows the texels as they are. (IRIX's
+   libGLcore turns GL_REPLACE into GL_MODULATE on IMPACT, __glMgrim_TexEnviv,
+   so REPLACE would show them modulated by the current colour.) */
 static void tex_setup(void)
 {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
-    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
 }
 
-static const double frag_c[4] = { 0.2, 0.4, 0.6, 0.8 };
+static const double frag_c[4] = { 1.0, 1.0, 1.0, 1.0 };
 
 /* Expected texel values -> expected framebuffer bytes and per-component
    tolerance for the internal format. */
@@ -1849,7 +1886,7 @@ int main(int argc, char **argv)
     t_gettex();
 
     if (!list_only)
-        printf("pixtest: %d passed, %d failed, %d skipped\n", npass, nfail, nskip);
+        printf("pixtest: %d passed, %d failed, %d expected failures, %d skipped\n", npass, nfail, nxfail, nskip);
     if (hold > 0) {
         glXSwapBuffers(dpy, win);
         glFinish();

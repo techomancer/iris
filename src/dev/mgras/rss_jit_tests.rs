@@ -407,7 +407,7 @@ fn key_of(rss: &mut Rss, prim: Prim) -> Option<PipeKey> {
         pio_read: false,
         width: 1,
         bpp: rss::bytes_per_pixel(mode),
-        format: ((mode >> 4) & 0xF, mode & 0xF),
+        format: rss::xfer_format(mode),
         begin_skip: 0,
         stride_skip: 0,
         line: 0,
@@ -603,7 +603,9 @@ fn mode_regs(rng: &mut Rng, prim: Prim, tex_bias: f64) -> Regs {
         Prim::Stipple => (rng.u32() & !(7 << 22) & !(1 << 20)) | 1 << 22 | 1 << 3,
         Prim::Xfer => {
             let (f, c) = rng.pick(&[(0u32, 0u32), (0, 1), (8, 8), (8, 10), (8, 0), (2, 3), (7, 0), (8, 1), (7, 1), (5, 5)]);
-            regs.push((reg::XFRMODE, (rng.u32() & 0x7FF00) | f << 4 | c));
+            // RGBA16 red first (RGBorder, bit 22), as the JIT keys it.
+            let order = if (f, c) == (8, 1) { 1 << 22 } else { 0 };
+            regs.push((reg::XFRMODE, (rng.u32() & 0x7FF00) | f << 4 | c | order));
             (rng.u32() & !(7 << 22) & !(1 << 20)) | 5 << 22
         }
         Prim::Tri => {

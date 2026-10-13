@@ -18,13 +18,16 @@
 //! 0-4 are working-RAM pointers and batch counts (input, ?, output, whole
 //! batches, remainder), the parameters follow:
 //!   inttofloat  [5] scale (1/255, 2/255 for signed, 1/65535, 2^-31 ...)
-//!   shiftadd    [5] mask, [6] add (UNSIGNED_INT ahead of a signed int to
-//!               float: halved, so 2^-31 scales it to [0, 1])
+//!   shiftadd    [5] shift (signed: left, or right when negative), [6]
+//!               add: GL's index shift and offset; UNSIGNED_INT colour
+//!               ahead of a signed int-to-float shifts by -1 (2^-31 then
+//!               scales it to [0, 1])
 //!   scalebias   [5..] 12 (bias, scale) pairs, cycling
 //!   expand      [5] mode: 0 alpha, 1 blue, 2 green, 3 red (the missing
 //!               components take fills [7..] in order from the one after
 //!               the present one), 4 luminance (alpha fill [7]), 5
-//!               luminance-alpha, 6 RGB (alpha fill [7]); [6] a pointer
+//!               luminance-alpha, 6 RGB (alpha fill [7]), 7 an index to
+//!               all four (ahead of the I_TO_* maps); [6] a pointer
 //!               adjustment. The fills already carry any scale/bias that
 //!               ran before expand (BYTE's 1/255 bias: fills 1/255, 1/255,
 //!               1 + 1/255 for RED).
@@ -153,13 +156,43 @@ impl PixMem {
         (0..n).map(|k| (prog[2 * k], if 2 * k + 3 < prog.len() { prog[2 * k + 3] } else { 0 })).collect()
     }
 
+    /// The GE's x replication for a fractional zoom (`xzoom`, its state
+    /// word 4: ceil(zx)), 1 without.
+    pub fn xzoom_rep(&self) -> usize {
+        if !self.has_program() {
+            return 1;
+        }
+        match self.modules().iter().find(|m| m.0 == entry::XZOOM) {
+            Some(&(_, st)) => (self.read(st + 4) as usize).clamp(1, 64),
+            None => 1,
+        }
+    }
+
     /// Whether a program is loaded.
     pub fn has_program(&self) -> bool {
         self.prog_len >= 2 && self.read(PROGRAM) != 0
     }
 
     /// Host components a pixel carries into the pipeline (packed types: 1
-    /// element), and their element size in bytes.
+    /// element), their element size in bytes, and the element type. With
+    /// `fit` (row bytes available, pixels) the size is the largest whose
+    /// row fits: a stencil or colour-index image's type word reads 4 for
+    /// bytes.
+    pub fn input_shape_fit(&self, out_comps: usize, fit: Option<(usize, usize)>) -> (usize, usize, Elem) {
+        let (comps, size, elem) = self.input_shape(out_comps);
+        let Some((bytes, px)) = fit else { return (comps, size, elem) };
+        if px == 0 || comps * size * px <= bytes || !matches!(elem, Elem::S32 | Elem::U32) {
+            return (comps, size, elem);
+        }
+        // Integer elements narrower than the type word says.
+        let signed = elem == Elem::S32;
+        match [2usize, 1].into_iter().find(|&s| comps * s * px <= bytes) {
+            Some(2) => (comps, 2, if signed { Elem::S16 } else { Elem::U16 }),
+            Some(_) => (comps, 1, if signed && self.modules().first().map(|m| m.0) != Some(entry::MASK) { Elem::S8 } else { Elem::U8 }),
+            None => (comps, size, elem),
+        }
+    }
+
     pub fn input_shape(&self, out_comps: usize) -> (usize, usize, Elem) {
         let mods = self.modules();
         let first = mods.first().map(|m| m.0).unwrap_or(0);
@@ -193,17 +226,21 @@ impl PixMem {
     /// the components the raster engine gets, in order, as numbers of its
     /// transfer type (rounded by the caller's packing).
     pub fn run_row(&self, input: &[u8], pixels: usize, out_comps: usize) -> Vec<f64> {
-        let (comps, esize, elem) = self.input_shape(out_comps);
+        let (comps, esize, elem) = self.input_shape_fit(out_comps, Some((input.len(), pixels)));
         let n = pixels * comps;
         let mut v: Vec<f64> = (0..n).map(|i| elem.get(input, i * esize)).collect();
         let mut per_px = comps;
         for (e, st) in self.modules() {
             match e {
                 entry::SHIFTADD => {
-                    let s = self.state(st, 7);
+                    // Shift (left for positive, right for negative), then
+                    // add: GL's index shift and offset; UNSIGNED_INT colour
+                    // ahead of a signed int-to-float shifts by -1.
+                    let (sh, add) = (self.read(st + 5) as i32, self.read(st + 6) as i32 as f64);
                     for x in v.iter_mut() {
-                        let u = (*x as i64 as u64 as u32) & s[5];
-                        *x = (u >> 1) as f64 + s[6] as i32 as f64;
+                        let i = *x as i64;
+                        let y = if sh >= 0 { i << sh.min(32) } else { i >> (-sh).min(63) };
+                        *x = y as f64 + add;
                     }
                 }
                 entry::INTTOFLOAT => {
@@ -255,6 +292,13 @@ impl PixMem {
                         4 => {
                             for &x in &v {
                                 out.extend_from_slice(&[x, x, x, fill(0)]);
+                            }
+                        }
+                        7 => {
+                            // A colour index to all four components (the
+                            // I_TO_R/G/B/A maps follow).
+                            for &x in &v {
+                                out.extend_from_slice(&[x, x, x, x]);
                             }
                         }
                         5 => {

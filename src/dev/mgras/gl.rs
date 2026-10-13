@@ -310,6 +310,8 @@ const FILL_FAST: u32 = 1 << 20;
 const FILL_DMA_WRITE: u32 = 0x1140_0000;
 /// Fill mode: block type 4, a DMA read transfer (SAVE_RSS's value).
 const FILL_DMA_READ: u32 = 0x0100_0000;
+/// Fill mode: block type 2, a PIO read transfer.
+const FILL_PIO_READ: u32 = 0x0080_0000;
 /// Fill mode: polygon stipple (provisional bit, see rss.rs) / line stipple.
 const FILL_POLY_STIPPLE: u32 = 1 << 2;
 const FILL_LINE_STIPPLE: u32 = 1 << 5;
@@ -536,6 +538,9 @@ pub struct Gl {
     /// The GE pixel pipeline's memory (program, module states, lookup
     /// tables), the context's own.
     pub pix: super::pixpipe::PixMem,
+    /// XFRFACTOR as libGLcore set it (the raster engine's x zoom /
+    /// decimation step, 8.8).
+    pub xfr_factor: u32,
 }
 
 impl Gl {
@@ -1106,7 +1111,7 @@ impl Gl {
                 self.pixel_op = 0;
                 self.end_raster(sink);
             }
-            tok::GET_PIXELS => self.get_pixels(sink),
+            tok::GET_PIXELS => self.get_pixels(w0 & 2 != 0, sink),
             tok::PIXEL_STATE | tok::INIT_PIXEL_STATE_ERAM if d.len() >= 7 => {
                 self.pixel_state_block(d);
             }
@@ -1616,7 +1621,7 @@ impl Gl {
     /// 2 / type 3, our reading); the host starts the transfer itself
     /// (raster interface register 5, see hq3.rs). The raster state stays
     /// loaded until RESTORE_RSS.
-    fn get_pixels(&mut self, sink: &mut dyn Hq3Sink) {
+    fn get_pixels(&mut self, pio: bool, sink: &mut dyn Hq3Sink) {
         self.pixel_op = 2;
         self.begin_raster(sink);
         let stencil = self.stencil_pixels();
@@ -1640,7 +1645,10 @@ impl Gl {
             let b = (self.read_back != 0) != (self.swapped != 0);
             sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0x1F << 21)) | (b as u32) << 21, false);
         }
-        self.fill_mode(FILL_DMA_READ, sink);
+        // GET_PIXELS' word is the transfer control the host starts it
+        // with: 0x4009 a DMA read, 0x400A a PIO read through the char
+        // registers (libGLcore reads packed-type rows so, one a time).
+        self.fill_mode(if pio { FILL_PIO_READ } else { FILL_DMA_READ }, sink);
         sink.rss_write(re::XFRMODE, self.xfrmode, false);
         sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
         sink.rss_write(re::BLOCK_XYSTARTI, self.pixel_block[0], false);
@@ -1731,14 +1739,23 @@ impl Gl {
     /// short-row image as one).
     fn run_pixel_pipeline(&self, words: &[u32], wpr: usize, rows: usize, bpp: usize) -> Option<(Vec<u32>, usize, usize)> {
         let xs = self.tl_rect[4];
-        let (w, h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
+        let (mut w, mut h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
+        // Zoomed: 0xDA8's size is the GE's output (rows repeated, columns
+        // replicated); the source is the transport rows of columns / the
+        // replication.
+        let rep = self.pix.xzoom_rep();
+        if rep > 1 || self.xfrmode & (3 << 19) != 0 || (self.zoom_inv > 0.0 && self.zoom_inv != 1.0) {
+            w /= rep;
+            h = rows;
+        }
         if w == 0 || h == 0 {
             return None;
         }
         let out_comps = super::rss::xfer_comps(self.xfrmode);
-        let (comps, esize, _) = self.pix.input_shape(out_comps);
-        let row_in = w * comps * esize;
         let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
+        let fit = if rows == h { wpr * 4 } else { bytes.len() / h };
+        let (comps, esize, _) = self.pix.input_shape_fit(out_comps, Some((fit, w)));
+        let row_in = w * comps * esize;
         let stride = if rows == h { wpr * 4 } else { row_in };
         if row_in == 0 || bytes.len() < stride * (h - 1) + row_in {
             return None;
@@ -1758,6 +1775,74 @@ impl Gl {
         Some((out, wpr_out, h))
     }
 
+    /// A zoomed image (see `draw_pixels_words`): destination pixels from
+    /// 0xDA8's first to last, each taking the source pixel the GE's and the
+    /// raster engine's steps give it.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pixels_zoomed(&mut self, words: &[u32], wpr: usize, rows: usize, bpp: usize, ge_rep: usize, re_zoom: u32, sink: &mut dyn Hq3Sink) {
+        let r = [0, 1, 2, 3].map(|k| self.tl_rect[k] as i32);
+        let (nx, ny) = ((r[2] - r[0]).abs() + 1, (r[3] - r[1]).abs() + 1);
+        let (dx, dy) = (if r[2] < r[0] { -1 } else { 1 }, if r[3] < r[1] { -1 } else { 1 });
+        let (fx0, fy0) = ((self.raster[0] + r[0] as f32).floor() as i32, (self.raster[1] + r[1] as f32).floor() as i32);
+        let src_w = wpr * 4 / bpp.max(1);
+        if src_w == 0 || rows == 0 {
+            return;
+        }
+        let f = (self.xfr_factor & 0xFFFF).max(1) as usize;
+        let src_col = |j: usize| -> usize {
+            let g = match re_zoom {
+                z if z & 1 << 19 != 0 => j * 256 / f,
+                z if z & 1 << 20 != 0 => j * f / 256,
+                _ => j,
+            };
+            (g / ge_rep.max(1)).min(src_w - 1)
+        };
+        let inv = if self.zoom_inv > 0.0 { self.zoom_inv as f64 } else { 1.0 };
+        let src_row = |j: usize| -> usize { (((j as f64 + 0.5) * inv) as usize).min(rows - 1) };
+        let (ex0, ex1) = (fx0.min(fx0 + dx * (nx - 1)), fx0.max(fx0 + dx * (nx - 1)));
+        let (ey0, ey1) = (fy0.min(fy0 + dy * (ny - 1)), fy0.max(fy0 + dy * (ny - 1)));
+        let (mut cx0, mut cx1, mut cy0, mut cy1) = (ex0, ex1, ey0, ey1);
+        if self.scissor_test != 0 {
+            let [sx0, sx1, sy0, sy1] = self.scissor_rect();
+            (cx0, cx1, cy0, cy1) = (cx0.max(sx0), cx1.min(sx1), cy0.max(sy0), cy1.min(sy1));
+        }
+        if cx0 > cx1 || cy0 > cy1 {
+            return;
+        }
+        let (w, h) = (cx1 - cx0 + 1, cy1 - cy0 + 1);
+        self.begin_raster(sink);
+        if (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3 {
+            sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+        } else if self.stencil_pixels() {
+            sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+            sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
+        }
+        self.fill_mode(FILL_DMA_WRITE, sink);
+        // The raster engine's zoom is done here: plain transfer.
+        sink.rss_write(re::XFRMODE, self.xfrmode & !(3 << 19), false);
+        sink.rss_write(re::XFRSIZE, (h as u32) << 16 | w as u32, false);
+        sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
+        sink.rss_write(re::BLOCK_XYSTARTI, xy(cx0, cy0), false);
+        sink.rss_write(re::BLOCK_XYENDI, xy(cx1, cy1), true);
+        let byte = |i: usize| words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
+        let rev = bpp == 4 && self.xfrmode & 0xFF == 0x80 && self.xfrmode & 1 << 22 == 0;
+        for (line, y) in (cy0..=cy1).enumerate() {
+            let sr = src_row(((y - fy0) * dy) as usize);
+            let mut bytes = Vec::with_capacity(w as usize * bpp);
+            for x in cx0..=cx1 {
+                let sc = src_col(((x - fx0) * dx) as usize);
+                let base = sr * wpr * 4 + sc * bpp;
+                let start = bytes.len();
+                bytes.extend((0..bpp).map(|k| byte(base + k)));
+                if rev {
+                    bytes[start..start + 4].reverse();
+                }
+            }
+            sink.dma_write_line(line as u32, &bytes);
+        }
+        self.end_raster(sink);
+    }
+
     /// glDrawPixels' rows, `wpr` words each, in the raster engine's format
     /// (`bpp` bytes a pixel).
     fn draw_pixels_words(&mut self, words: &[u32], wpr: usize, rows: usize, bpp: usize, sink: &mut dyn Hq3Sink) {
@@ -1772,6 +1857,18 @@ impl Gl {
         // a negative pixel zoom reverses them (Mirai's splash, drawn with
         // zoom (1, -1): y from -1 down to -395 for 395 rows).
         let xs = self.tl_rect[4];
+        // Zoomed images, as the board draws them (traced, pixtest zoom
+        // cases): the GE repeats rows by its 1 / zy step (pixel state
+        // 0x192) and, for a fractional x zoom, each pixel ceil(zx) times
+        // (`xzoom`); the raster engine then zooms x by XFRFACTOR / 256
+        // (XFRMODE bit 19) or decimates by it (bit 20: 256 x the GE's
+        // columns / the destination's). 0xDA8 holds the destination's
+        // first and last pixel, so its extents and direction.
+        let ge_rep = self.pix.xzoom_rep();
+        let re_zoom = self.xfrmode & (3 << 19);
+        if xs != 0 && (re_zoom != 0 || ge_rep > 1 || (self.zoom_inv > 0.0 && self.zoom_inv != 1.0)) {
+            return self.draw_pixels_zoomed(words, wpr, rows, bpp, ge_rep, re_zoom, sink);
+        }
         let rect = xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == wpr * 4 / bpp.max(1);
         let (ox, oy) = if rect {
             (self.tl_rect[0] as i32 as f32 * zoom, self.tl_rect[1] as i32 as f32 * zoom)
@@ -1874,8 +1971,14 @@ impl Gl {
         let y0 = (self.raster[1] - yorig).floor() + self.bitmap_row as f32;
         let byte = |i: usize| words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
         let mut v = Wv { z: self.raster[2], c: self.raster_color, cb: self.raster_color, ok: 1, ..Default::default() };
+        // Format word bit 17: GL_UNPACK_LSB_FIRST (bit 0 of each byte is
+        // the leftmost pixel).
+        let lsb = h[0] & 1 << 17 != 0;
         for r in 0..rows {
-            let set = |c: usize| byte(r * stride + c / 8) >> (7 - c % 8) & 1 != 0;
+            let set = |c: usize| {
+                let b = byte(r * stride + c / 8);
+                (if lsb { b >> (c % 8) } else { b >> (7 - c % 8) }) & 1 != 0
+            };
             let mut c = 0;
             while c < bits {
                 if !set(c) {

@@ -683,16 +683,17 @@ pub(crate) fn xfer_format(mode: u32) -> (u32, u32) {
 pub(crate) fn generic_format(f: (u32, u32)) -> bool {
     let t = f.1 & 0xF;
     match f.0 {
-        8 => f.1 & 0x10 != 0 || matches!(t, 3 | 4 | 5 | 7),
+        8 => f.1 & 0x10 != 0 || matches!(t, 1 | 3 | 4 | 5 | 7),
         7 => matches!(t, 3 | 4 | 5 | 7),
         3..=6 => matches!(t, 0 | 1 | 3 | 4 | 5 | 7),
         _ => false,
     }
 }
 
-/// Whether the raster JIT knows this format (its `XFmt` set).
+/// Whether the raster JIT knows this format (its `XFmt` set; its RGBA16 is
+/// red first, RGBorder set).
 pub(crate) fn jit_xfer_ok(f: (u32, u32)) -> bool {
-    !generic_format(f)
+    !generic_format(f) || f == (8, 0x11)
 }
 
 /// Framebuffer components (0 red .. 3 alpha) of a generic format, in host
@@ -718,43 +719,54 @@ fn type_size(t: u32) -> usize {
     }
 }
 
-/// An 8-bit framebuffer component as a host component of type `t`
-/// (big-endian): unsigned types replicate the byte, signed ones carry
-/// seven bits of magnitude (GL's (2^b - 1) c - 1) / 2 within a step).
-fn host_comp(t: u32, p: u8, out: &mut Vec<u8>) {
-    let c = p as f64 / 255.0;
+/// A framebuffer component, widened to 16 bits (an 8-bit one replicated,
+/// a 12-bit one c << 4 | c >> 8), as a host component of type `t`
+/// (big-endian): unsigned types replicate it, signed ones carry one bit
+/// less of magnitude (GL's ((2^b - 1) c - 1) / 2 within a step).
+fn host_comp(t: u32, v: u16, out: &mut Vec<u8>) {
+    let c = v as f64 / 65535.0;
     match t & 0xF {
-        0 => out.push(p),
+        0 => out.push((v >> 8) as u8),
         4 => out.push(((c * 127.0).round() as i8) as u8),
-        1 => out.extend((p as u16 * 0x101).to_be_bytes()),
+        1 => out.extend(v.to_be_bytes()),
         5 => out.extend(((c * 32767.0).round() as i16).to_be_bytes()),
-        3 => out.extend((p as u32 * 0x0101_0101).to_be_bytes()),
+        3 => out.extend((v as u32 * 0x1_0001).to_be_bytes()),
         7 => out.extend(((c * 2147483647.0).round() as i32).to_be_bytes()),
-        _ => out.push(p),
+        _ => out.push((v >> 8) as u8),
     }
 }
 
 /// A host component of type `t` (big-endian bytes) as an 8-bit
-/// framebuffer component, negative values 0.
+/// framebuffer component: its top bits (the X server's 16-bit transfers
+/// and the raster JIT take them so), negative values 0.
 fn fb_comp(t: u32, b: &[u8]) -> u8 {
     let g = |k: usize| b.get(k).copied().unwrap_or(0);
-    let (v, max) = match t & 0xF {
-        0 => (g(0) as f64, 255.0),
-        4 => (g(0) as i8 as f64, 127.0),
-        1 => (u16::from_be_bytes([g(0), g(1)]) as f64, 65535.0),
-        5 => (i16::from_be_bytes([g(0), g(1)]) as f64, 32767.0),
-        3 => (u32::from_be_bytes([g(0), g(1), g(2), g(3)]) as f64, 4294967295.0),
-        7 => (i32::from_be_bytes([g(0), g(1), g(2), g(3)]) as f64, 2147483647.0),
-        _ => (g(0) as f64, 255.0),
-    };
-    ((v / max).clamp(0.0, 1.0) * 255.0).round() as u8
+    match t & 0xF {
+        0 => g(0),
+        4 => {
+            let v = (g(0) as i8).max(0) as u8;
+            v << 1 | v >> 6
+        }
+        1 | 3 => g(0),
+        5 | 7 => {
+            let v = if g(0) & 0x80 != 0 { 0 } else { (g(0) << 1) | (g(1) >> 7) };
+            v
+        }
+        _ => g(0),
+    }
 }
 
-/// A framebuffer pixel (0xAABBGGRR) as host bytes of a generic format.
-pub(crate) fn host_pixel(f: (u32, u32), px: u32, out: &mut Vec<u8>) {
+/// A framebuffer pixel's components (red .. alpha) widened to 16 bits, as
+/// host bytes of a generic format.
+pub(crate) fn host_pixel(f: (u32, u32), comps: [u16; 4], out: &mut Vec<u8>) {
     for &k in format_comps(f) {
-        host_comp(f.1, (px >> (8 * k)) as u8, out);
+        host_comp(f.1, comps[k], out);
     }
+}
+
+/// An 0xAABBGGRR pixel's components widened to 16 bits.
+fn comps16(px: u32) -> [u16; 4] {
+    [0, 1, 2, 3].map(|k| ((px >> (8 * k)) & 0xFF) as u16 * 0x101)
 }
 
 /// Host bytes of a generic format as a framebuffer pixel; components the
@@ -2313,8 +2325,10 @@ impl Rss {
             bpp: bytes_per_pixel(mode),
             format: xfer_format(mode),
             begin_skip: begin,
-            // Bits 21:14; bit 22 is RGBorder.
-            stride_skip: (mode >> 14) & 0xFF,
+            // Bits 18:14 (traced up to 6, the row padding to a
+            // doubleword); 19 and 20 enable zoom and decimation, 22 is
+            // RGBorder.
+            stride_skip: (mode >> 14) & 0x1F,
             line: 0,
             line_begin: begin,
             pending: 0,
@@ -2394,12 +2408,24 @@ impl Rss {
         }
     }
 
+    /// The read pixel's components at (fx, fy) widened to 16 bits: a
+    /// 12:12:12 visual's twelve bits, else the 8-bit framebuffer value.
+    fn comps16(&self, fx: i32, fy: i32) -> [u16; 4] {
+        let px = self.get(fx, fy);
+        if rgb36(self.reg(reg::PP1FILLMODE)) && (0..WIDTH as i32).contains(&fx) && (0..HEIGHT as i32).contains(&fy) {
+            let u = unpack36(self.mem.get(&self.source(), fx as u32, fy as u32));
+            let w = |c: u32| (c << 4 | c >> 8) as u16;
+            return [w(u[0]), w(u[1]), w(u[2]), comps16(px)[3]];
+        }
+        comps16(px)
+    }
+
     /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
     fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
         if generic_format(x.format) {
             let mut out = Vec::with_capacity(x.bpp as usize);
-            host_pixel(x.format, self.get(fx, fy), &mut out);
+            host_pixel(x.format, self.comps16(fx, fy), &mut out);
             return out.get(i as usize).copied().unwrap_or(0);
         }
         // Depth: the ZST word as it is, never a 12-bit pair's half.
@@ -2422,7 +2448,7 @@ impl Rss {
             let mut out = Vec::with_capacity((x.width * x.bpp) as usize);
             for k in 0..x.width {
                 let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
-                host_pixel(x.format, self.get(fx, fy), &mut out);
+                host_pixel(x.format, self.comps16(fx, fy), &mut out);
             }
             return out;
         }
