@@ -230,6 +230,13 @@ mod cmd {
     /// data, or a host to board DMA), ERAM_WRITE_AT (address, count), and
     /// ERAM_WRITE_END after the last chunk. Read: a board to host DMA armed
     /// first, then ERAM_READ (address, count) feeds it.
+    /// With two GE11s (Maximum Impact) every transfer comes once per GE,
+    /// GE0 first (traced eviction, IRIX 6.5.22): reads of 0x17C8 words at
+    /// slot S, then at S - 1, each DMAing 0x17C7 words to consecutive
+    /// halves of one host buffer; the restore writes the first half to S,
+    /// ERAM_WRITE_END, the second half to S, ERAM_WRITE_END. Nothing
+    /// selects the GE; the kernel's offset says GE1's read output runs a
+    /// word late.
     pub const CP_ERAM_WRITE: u32 = 0x0FD;
     pub const CP_ERAM_WRITE_AT: u32 = 0x0FB;
     pub const CP_ERAM_WRITE_END: u32 = 0x0FA;
@@ -507,6 +514,15 @@ pub struct Hq3Engine {
     /// that came for it so far, by FIFO pixel data or host DMA, until
     /// CP_PASS_THROUGH_GE_FIFO_3 says where they go.
     eram_in: Option<Vec<u32>>,
+    /// GE11s on the board (2 on Maximum Impact): ERAM transfers come once
+    /// per GE (`cmd::CP_ERAM_WRITE`). The GE HLE keeps its state in GE0's.
+    ges: usize,
+    /// The ERAM write set in progress goes to this GE; none between sets.
+    eram_write_ge: Option<usize>,
+    /// Where GE0's last write set started, and its last read (address,
+    /// count): the same transfer next is GE1's.
+    eram_write_ge0: Option<usize>,
+    eram_read_ge0: Option<(usize, usize)>,
     /// glBitmap / glDrawPixels rows arriving as FIFO pixel data, and those
     /// of switched-out contexts, by slot (a switch can land halfway
     /// through a client's pixel data; with two clients drawing text, their
@@ -522,7 +538,7 @@ pub struct Hq3Engine {
 }
 
 impl Hq3Engine {
-    pub fn new() -> Self {
+    pub fn new(ges: usize) -> Self {
         Hq3Engine {
             context_words: 0,
             context_image: [0; host::CONTEXT_SWITCH_WORDS as usize],
@@ -540,6 +556,10 @@ impl Hq3Engine {
             slot: None,
             nosave_next: false,
             eram_in: None,
+            ges: ges.clamp(1, 2),
+            eram_write_ge: None,
+            eram_write_ge0: None,
+            eram_read_ge0: None,
             bitmap_in: Vec::new(),
             bitmap_parked: Vec::new(),
             eram: super::plain::boxed_zeroed(),
@@ -961,33 +981,46 @@ impl Hq3Engine {
         self.dma(word, DmaPeer::Raster, sink);
     }
 
-    /// The ERAM pass-through commands (see `cmd::CP_ERAM_*`), on GE0's
-    /// ERAM (a board with two GE11s gets the same transfer once per GE).
+    /// The ERAM pass-through commands (see `cmd::CP_ERAM_*`). A transfer
+    /// repeating GE0's last one is GE1's (two-GE boards); GE1's ERAM is
+    /// kept for the round trip but nothing reads it.
     fn eram_pass_through(&mut self, cmd: u32, data: &[u32], sink: &mut dyn Hq3Sink) {
         let arg = |i: usize| data.get(i).copied().unwrap_or(0) as usize;
         match cmd {
             cmd::CP_ERAM_WRITE => self.eram_in = Some(Vec::with_capacity(arg(0))),
             cmd::CP_ERAM_WRITE_AT => {
                 let (addr, n) = (arg(0), arg(1));
+                let ge = *self.eram_write_ge.get_or_insert_with(|| {
+                    let ge = (self.ges > 1 && self.eram_write_ge0 == Some(addr)) as usize;
+                    self.eram_write_ge0 = (ge == 0).then_some(addr);
+                    ge
+                });
                 let buf = self.eram_in.replace(Vec::new()).unwrap_or_default();
                 let n = n.min(buf.len()).min(ERAM_WORDS.saturating_sub(addr));
-                self.eram.words[0][addr..addr + n].copy_from_slice(&buf[..n]);
+                self.eram.words[ge][addr..addr + n].copy_from_slice(&buf[..n]);
                 if sink.tracing() {
-                    sink.trace(format!("ERAM write {n} words at {addr:#x} ({} came)", buf.len()));
+                    sink.trace(format!("ERAM write GE{ge} {n} words at {addr:#x} ({} came)", buf.len()));
                 }
             }
-            cmd::CP_ERAM_WRITE_END => self.eram_in = None,
+            cmd::CP_ERAM_WRITE_END => {
+                self.eram_in = None;
+                self.eram_write_ge = None;
+            }
             _ => {
                 let (addr, n) = (arg(0).min(ERAM_WORDS), arg(1));
+                let ge = (self.ges > 1 && self.eram_read_ge0 == Some((addr + 1, n))) as usize;
+                self.eram_read_ge0 = (ge == 0).then_some((addr, n));
+                // GE1's output runs a word late (see `cmd::CP_ERAM_WRITE`).
+                let addr = (addr + ge).min(ERAM_WORDS);
                 let n = n.min(ERAM_WORDS - addr);
                 let Some(word) = self.dma_read_pending.take() else {
                     sink.note(format!("ERAM read at {addr:#x} with no host DMA armed"));
                     return;
                 };
                 if sink.tracing() {
-                    sink.trace(format!("ERAM read {n} words at {addr:#x}"));
+                    sink.trace(format!("ERAM read GE{ge} {n} words at {addr:#x}"));
                 }
-                let words: Vec<u32> = self.eram.words[0][addr..addr + n].to_vec();
+                let words: Vec<u32> = self.eram.words[ge][addr..addr + n].to_vec();
                 self.dma(word, DmaPeer::EramOut(&words, 0), sink);
             }
         }

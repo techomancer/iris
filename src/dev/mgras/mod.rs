@@ -434,7 +434,7 @@ impl Mgras {
             (*(*p).front.get()).init(board);
             addr_of_mut!((*p).unhandled).write(SpinLock::new(HashSet::new()));
             addr_of_mut!((*p).flags).write(AtomicU32::new(0));
-            addr_of_mut!((*p).eng).write(UnsafeCell::new(Hq3Engine::new()));
+            addr_of_mut!((*p).eng).write(UnsafeCell::new(Hq3Engine::new(if board == GraphicsBoard::MaxImpact { 2 } else { 1 })));
             let planes = (*p).planes.get();
             let nrss = Self::engines_for(board);
             addr_of_mut!((*p).nrss).write(nrss);

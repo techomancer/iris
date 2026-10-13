@@ -1285,6 +1285,53 @@ fn gl_context_survives_eviction_to_another_slot() {
     m.stop_engines();
 }
 
+/// Maximum Impact's eviction (traced, IRIX 6.5.22): every ERAM transfer
+/// once per GE11, GE0 first. The slot goes to two halves of one host
+/// buffer, GE1's read starting a word early, and both halves come back to
+/// the new slot, each set closed by ERAM_WRITE_END. GE1's half must not
+/// land over GE0's (it did, a word off: Matador came back from being
+/// iconified with its GL state shifted by a register).
+#[test]
+fn gl_context_survives_two_ge_eviction() {
+    let m = super::record::tests::live_board_of(crate::config::GraphicsBoard::MaxImpact);
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    gl_setup_window(&m, 100, 100, [1.0, 0.0, 0.0]);
+    switch_to_gl_context(&m, SLOT_B, 200, 0, 100, 100);
+    let mem = Arc::new(TestMem::default());
+    for p in 0..16 {
+        mem.words.lock().insert(0x1000 + 4 * p, 2 + p);
+    }
+    m.set_phys(mem.clone());
+    let half = 0x17C7 * 4;
+    let dma = |off: u32, bytes: u32, run: u32| {
+        fifo_dma(&m, 0x21, 0x1000);
+        fifo_dma(&m, 0x06, 0);
+        fifo_dma(&m, 0x05, off);
+        fifo_dma(&m, 0x04, 0);
+        fifo_dma(&m, 0x07, 1);
+        fifo_dma(&m, 0x08, bytes);
+        fifo_dma(&m, 0x0B, run);
+    };
+    // Evict A: GE0 at A, GE1 at A - 1, into consecutive halves.
+    dma(0, half, 0x9);
+    fifo_token(&m, 0xFC, &[SLOT_A, 0x17C8]);
+    dma(half, half, 0x9);
+    fifo_token(&m, 0xFC, &[SLOT_A - 1, 0x17C8]);
+    // Back into slot C, one half per GE.
+    for off in [0, half] {
+        fifo_token(&m, 0xFD, &[0x17C8]);
+        dma(off, half, 0x1);
+        fifo_token(&m, 0xFB, &[SLOT_C, 0x17C7]);
+        fifo_token(&m, 0xFA, &[]);
+    }
+    m.state_hash();
+    switch_to_gl_context(&m, SLOT_C, 400, 0, 100, 100);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(m.fb_pixel(450, 1023 - 50), 0x00_00FF, "A's clear colour, from its new slot");
+    m.stop_engines();
+}
+
 /// Display lists as libGLcore lays them out (traced): each segment starts
 /// with its link, the body following, and the engine runs the body before
 /// the link. Here: a segment sets red and calls list 1 (DL_PUSH of the
