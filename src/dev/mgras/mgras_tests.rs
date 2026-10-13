@@ -1467,6 +1467,47 @@ fn gl_return_mode(m: &Mgras, addr: u32) -> u32 {
     read(m, 32, 0x70014) as u32
 }
 
+/// An unaligned pixel data command (libGLcore's rows at UNPACK_ALIGNMENT
+/// 1, traced): byte count 16 starting at byte 1 of the first word comes as
+/// five words and a pad. The command after it must parse (here a readback
+/// that gets its answer); taking only the declared four words read the
+/// fifth as a command and swallowed what followed.
+#[test]
+fn unaligned_pixel_data_keeps_the_fifo_in_step() {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    write(&m, 32, CFIFO, 0x8000_0000 | 1 << 22 | 16);
+    for w in [0x1122_3344u32, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00, 0x0000_00FF, 0] {
+        write(&m, 32, CFIFO, w as u64);
+    }
+    fifo_token(&m, 0x6E, &[1]);
+    assert_eq!(gl_return_mode(&m, 0xB9C), 1);
+    m.stop_engines();
+}
+
+/// The readback flag and answer belong to the context: A asks the GE for
+/// its scissor state, B is switched in and clears the flag (as a client
+/// does before its own readback), and when A is back its answer is still
+/// waiting behind a set flag.
+#[test]
+fn gl_readback_flag_follows_the_context() {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    fifo_token(&m, 0x6E, &[1]);
+    write(&m, 32, 0x7000C, 1 << 17);
+    fifo_token(&m, 0x0A2, &[0xB9C, 1, 1]);
+    wait_flag(&m, 1 << 17);
+    switch_to_gl_context(&m, SLOT_B, 200, 0, 100, 100);
+    write(&m, 32, 0x7000C, 1 << 17);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    m.state_hash();
+    assert_ne!(read(&m, 32, 0x70008) & 1 << 17, 0, "A's flag is back");
+    assert_eq!(read(&m, 32, 0x70014), 1, "with A's answer");
+    m.stop_engines();
+}
+
 #[test]
 fn gl_raster_position_queries_valid_bias_and_update() {
     let m = live_board();

@@ -392,6 +392,11 @@ impl Hq3Sink for HqSink<'_> {
         self.0.flags.fetch_or(bits, Ordering::AcqRel);
         self.0.refresh_general();
     }
+    fn take_flags(&mut self, mask: u32) -> u32 {
+        let was = self.0.flags.fetch_and(!mask, Ordering::AcqRel) & mask;
+        self.0.refresh_general();
+        was
+    }
     fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>> {
         let mem = self.0.mem.lock().clone()?;
         Some(match self.0.mem_rec.lock().clone() {

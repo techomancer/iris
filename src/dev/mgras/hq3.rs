@@ -345,6 +345,10 @@ pub trait Hq3Sink {
     /// DMA out of the armed transfer: one line of pixel bytes.
     fn dma_read_line(&mut self, line: u32) -> Vec<u8>;
     fn set_flags(&mut self, bits: u32);
+    /// Clear flags `mask` and return which of them were set.
+    fn take_flags(&mut self, _mask: u32) -> u32 {
+        0
+    }
     /// A GL batch starts (true) or ends: the RSS saves / restores the raster
     /// registers the batch loads.
     fn gl_bracket(&mut self, _enter: bool) {}
@@ -473,6 +477,12 @@ impl Cfifo {
     }
 }
 
+/// Pixel data command: the byte its data starts at within the first word
+/// (bits 24:22).
+fn pixel_align(cmd: u32) -> u32 {
+    (cmd >> 22) & 7
+}
+
 /// The words of a context's record in ERAM, if the slot holds it.
 fn slot_range(slot: u32) -> Option<std::ops::Range<usize>> {
     let s = slot as usize;
@@ -529,6 +539,13 @@ pub struct Hq3Engine {
     /// rows mixed into broken glyphs).
     bitmap_in: Vec<u32>,
     bitmap_parked: Vec<(u32, Vec<u32>)>,
+    /// The words of an unaligned pixel data command so far.
+    pix_unaligned: Vec<u32>,
+    /// Switched-out contexts' readback state, by slot: their GE_DATA flag
+    /// and the answer waiting behind it. A GL client polls the flag after
+    /// a readback token; another client's flag clear wiped it while the
+    /// flags were the board's, and the first waited forever (two pixtests).
+    readback_parked: Vec<(u32, u32, Option<[u32; 2]>)>,
     pub eram: Box<Eram>,
     /// The geometry engine's last answer to a state readback
     /// (`__MGR_RETURN_MODE`), read at the GE readback registers once set.
@@ -562,6 +579,8 @@ impl Hq3Engine {
             eram_read_ge0: None,
             bitmap_in: Vec::new(),
             bitmap_parked: Vec::new(),
+            pix_unaligned: Vec::new(),
+            readback_parked: Vec::new(),
             eram: super::plain::boxed_zeroed(),
             stats: Hq3Stats::ZERO,
         }
@@ -584,6 +603,14 @@ impl Hq3Engine {
             }
         }
         self.bitmap_in.clear();
+        let flags = sink.take_flags(host::FLAG_GE_DATA);
+        let answer = self.ge_return.take();
+        if let Some(slot) = self.slot {
+            self.readback_parked.retain(|(s, _, _)| *s != slot);
+            if flags != 0 || answer.is_some() {
+                self.readback_parked.push((slot, flags, answer));
+            }
+        }
         let parser = std::mem::replace(&mut self.cfifo[0], Cfifo::EMPTY);
         match self.slot.and_then(slot_range) {
             Some(r) => {
@@ -622,6 +649,13 @@ impl Hq3Engine {
             Some(i) if !first => self.bitmap_parked.remove(i).1,
             _ => Vec::new(),
         };
+        if let Some(i) = self.readback_parked.iter().position(|(s, _, _)| *s == slot) {
+            let (_, flags, answer) = self.readback_parked.remove(i);
+            if !first {
+                self.ge_return = answer;
+                sink.set_flags(flags);
+            }
+        }
         // SAFETY (both): plain numbers, valid zeroed and for any bit pattern.
         self.gl = unsafe { std::mem::zeroed() };
         self.cfifo[0] = Cfifo::EMPTY;
@@ -714,10 +748,16 @@ impl Hq3Engine {
         let f = &mut self.cfifo[port];
         if f.need == 0 {
             if w & 0x8000_0000 != 0 {
-                // Pixel data: byte count in bits 19:0, sent as doublewords.
+                // Pixel data: byte count in bits 19:0, starting `align`
+                // (bits 24:22) bytes into the first word, sent as
+                // doublewords. libGLcore's unaligned rows (UNPACK_ALIGNMENT
+                // 1, a 13-byte row at byte 13) declare the row's words and
+                // send one more, then a pad word: taking the declared count
+                // only parsed the rest as commands and the client hung.
                 f.pixel = true;
                 f.cmd = w;
-                f.need = (((w & 0xF_FFFF) + 7) / 8) * 2;
+                f.need = (((w & 0xF_FFFF) + pixel_align(w) + 7) / 8) * 2;
+                self.pix_unaligned.clear();
             } else {
                 f.pixel = false;
                 f.cmd = (w >> 8) & 0x1FFF;
@@ -732,6 +772,34 @@ impl Hq3Engine {
             return;
         }
         f.need -= 1;
+        if f.pixel && pixel_align(f.cmd) != 0 {
+            // Realigned when complete.
+            self.pix_unaligned.push(w);
+            if f.need == 0 {
+                let (cmd, align) = (f.cmd, pixel_align(f.cmd) as usize);
+                let count = (cmd & 0xF_FFFF) as usize;
+                let bytes: Vec<u8> = self.pix_unaligned.iter().flat_map(|w| w.to_be_bytes()).collect();
+                let mut words: Vec<u32> = bytes[align.min(bytes.len())..(align + count).min(bytes.len())]
+                    .chunks(4)
+                    .map(|c| {
+                        let mut b = [0u8; 4];
+                        b[..c.len()].copy_from_slice(c);
+                        u32::from_be_bytes(b)
+                    })
+                    .collect();
+                if let Some(buf) = self.eram_in.as_mut() {
+                    buf.extend_from_slice(&words);
+                } else if self.gl.wants_bitmap_rows() {
+                    self.bitmap_in.extend_from_slice(&words);
+                }
+                words.truncate(CFIFO_KEEP);
+                let f = &mut self.cfifo[port];
+                f.len = words.len();
+                f.data[..words.len()].copy_from_slice(&words);
+                self.dispatch(port, sink);
+            }
+            return;
+        }
         if f.pixel && !(f.need == 0 && (f.cmd & 0xF_FFFF).div_ceil(4) & 1 != 0) {
             if let Some(buf) = self.eram_in.as_mut() {
                 buf.push(w);
