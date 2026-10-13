@@ -541,6 +541,11 @@ pub struct Hq3Engine {
     bitmap_parked: Vec<(u32, Vec<u32>)>,
     /// The words of an unaligned pixel data command so far.
     pix_unaligned: Vec<u32>,
+    /// A token whose data comes as the next pixel data command (a GE
+    /// pixel state block too big for the token, PIXEL_STATE / 0x0CD with
+    /// no words; INIT_COLOR_TABLE's table), and that data so far.
+    payload_for: Option<u32>,
+    payload: Vec<u32>,
     /// Switched-out contexts' readback state, by slot: their GE_DATA flag
     /// and the answer waiting behind it. A GL client polls the flag after
     /// a readback token; another client's flag clear wiped it while the
@@ -580,6 +585,8 @@ impl Hq3Engine {
             bitmap_in: Vec::new(),
             bitmap_parked: Vec::new(),
             pix_unaligned: Vec::new(),
+            payload_for: None,
+            payload: Vec::new(),
             readback_parked: Vec::new(),
             eram: super::plain::boxed_zeroed(),
             stats: Hq3Stats::ZERO,
@@ -758,6 +765,7 @@ impl Hq3Engine {
                 f.cmd = w;
                 f.need = (((w & 0xF_FFFF) + pixel_align(w) + 7) / 8) * 2;
                 self.pix_unaligned.clear();
+                self.payload.clear();
             } else {
                 f.pixel = false;
                 f.cmd = (w >> 8) & 0x1FFF;
@@ -787,7 +795,9 @@ impl Hq3Engine {
                         u32::from_be_bytes(b)
                     })
                     .collect();
-                if let Some(buf) = self.eram_in.as_mut() {
+                if self.payload_for.is_some() {
+                    self.payload.extend_from_slice(&words);
+                } else if let Some(buf) = self.eram_in.as_mut() {
                     buf.extend_from_slice(&words);
                 } else if self.gl.wants_bitmap_rows() {
                     self.bitmap_in.extend_from_slice(&words);
@@ -801,7 +811,9 @@ impl Hq3Engine {
             return;
         }
         if f.pixel && !(f.need == 0 && (f.cmd & 0xF_FFFF).div_ceil(4) & 1 != 0) {
-            if let Some(buf) = self.eram_in.as_mut() {
+            if self.payload_for.is_some() {
+                self.payload.push(w);
+            } else if let Some(buf) = self.eram_in.as_mut() {
                 buf.push(w);
             } else if self.gl.wants_bitmap_rows() {
                 self.bitmap_in.push(w);
@@ -825,6 +837,14 @@ impl Hq3Engine {
         }
         if f.pixel {
             self.stats.pixel_cmds += 1;
+            if let Some(t) = self.payload_for.take() {
+                let p = std::mem::take(&mut self.payload);
+                match t {
+                    0x089 => self.gl.pix.load_table(&p),
+                    _ => self.gl.pixel_state_block(&p),
+                }
+                return;
+            }
             if self.eram_in.is_none() && self.gl.wants_bitmap_rows() {
                 // An image bigger than one pixel command (255 bytes) comes
                 // in several: wait for all of it.
@@ -886,6 +906,11 @@ impl Hq3Engine {
             return;
         }
         self.last_token = Some(cmd);
+        self.payload_for = match cmd {
+            0x080 | 0x0CD if data.is_empty() => Some(cmd),
+            0x089 => Some(cmd),
+            _ => None,
+        };
         if cmd >= cmd::RASTER_BASE {
             let r = cmd & 0x3FF;
             let exec = cmd & cmd::RASTER_EXECUTE != 0;
@@ -1288,15 +1313,8 @@ impl Hq3Engine {
                         stream.drain(..n).collect()
                     }
                 };
-                // Byte RGBA transfers request component reversal with XFRMODE
-                // bit 22 (libGLcore: GL_RGBA uses 0xC00080, GL_ABGR_EXT
-                // 0x800080). The RSS exposes packed ABGR. Preserve that
-                // order for ABGR reads, including Dynamation menu saves.
-                if matches!(peer, DmaPeer::Raster) && self.gl.pixel_op == 2 && self.gl.xfrmode & 0xFF == 0x80 && self.gl.xfrmode & (1 << 22) != 0 {
-                    for px in bytes.chunks_exact_mut(4) {
-                        px.reverse();
-                    }
-                }
+                // RGBorder (XFRMODE bit 22) is the raster engine's: it sends
+                // RGBA red first (`rss::xfer_format`).
                 format_pixels(self.formatter, &mut bytes);
                 for (k, b) in bytes.iter().take(len as usize).enumerate() {
                     let Some(pa) = phys(a + k as u32) else { return };

@@ -1025,8 +1025,13 @@ impl<'a> E<'a> {
                 pack(self, r, g, b)
             }
             XFmt::Rgba16 => {
+                // Alpha too (bits 31:24 of the pixel).
                 let (r, g, b) = (comp64(self, 56), comp64(self, 40), comp64(self, 24));
-                pack(self, r, g, b)
+                let rgb = pack(self, r, g, b);
+                let a = comp64(self, 8);
+                let a = self.b.ins().band_imm_s(a, 0xFF);
+                let a = self.b.ins().ishl_imm_s(a, 24);
+                self.b.ins().bor(rgb, a)
             }
             XFmt::Rgb8 => {
                 let (r, g, b) = (comp64(self, 16), comp64(self, 8), comp64(self, 0));

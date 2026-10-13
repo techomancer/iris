@@ -43,6 +43,7 @@ mod ge11;
 mod gl;
 mod hq3;
 mod pixmem;
+mod pixpipe;
 mod plain;
 mod record;
 mod rss;

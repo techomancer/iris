@@ -533,6 +533,9 @@ pub struct Gl {
     /// (traced, glReadPixels: 0 colour, 0x1C00000 depth, 0x1800000 stencil).
     pixel_planes: u32,
     pub stats_triangles: u64,
+    /// The GE pixel pipeline's memory (program, module states, lookup
+    /// tables), the context's own.
+    pub pix: super::pixpipe::PixMem,
 }
 
 impl Gl {
@@ -1105,10 +1108,7 @@ impl Gl {
             }
             tok::GET_PIXELS => self.get_pixels(sink),
             tok::PIXEL_STATE | tok::INIT_PIXEL_STATE_ERAM if d.len() >= 7 => {
-                let (addr, n) = (d[3], d[6] as usize);
-                for (k, &v) in d[7..].iter().take(n).enumerate() {
-                    self.pixel_state(addr + k as u32, v);
-                }
+                self.pixel_state_block(d);
             }
             tok::TEX_COORD => self.texcoord = args_f32(d),
             tok::POINT_SIZE => self.point_size = f32::from_bits(w0),
@@ -1665,6 +1665,14 @@ impl Gl {
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         let mut rows = if hdr_rows > 0 { hdr_rows.min(words.len() / wpr) } else { words.len() / wpr };
         let bpp = super::rss::bytes_per_pixel(self.xfrmode) as usize;
+        // libGLcore's draws come with their GE pixel pipeline: the host's
+        // elements in, the raster engine's pixels out.
+        if self.pix.has_program() {
+            if let Some((ws, wpr2, rows2)) = self.run_pixel_pipeline(words, wpr, rows, bpp) {
+                self.draw_pixels_words(&ws, wpr2, rows2, bpp, sink);
+                return;
+            }
+        }
         // SEND_PIXELS counts transport rows. Narrow StudioPaint tile edges
         // arrive flattened (e.g. 6x11 pixels as one 66-word row); 0xDA8
         // still gives the image shape and its offset from the raster position.
@@ -1713,6 +1721,41 @@ impl Gl {
             std::borrow::Cow::Borrowed(words)
         };
         self.draw_pixels_words(&words, wpr, rows, bpp, sink);
+    }
+
+    /// SEND_PIXELS' image through the GE pixel pipeline (`pixpipe`): the
+    /// raster engine's pixels (`bpp` bytes each), a row of words per image
+    /// row, and the row count; None when the image's shape does not fit
+    /// what came. The image is 0xDA8's transfer size; its rows come one a
+    /// transport row, or packed together in fewer (libGLcore sends a
+    /// short-row image as one).
+    fn run_pixel_pipeline(&self, words: &[u32], wpr: usize, rows: usize, bpp: usize) -> Option<(Vec<u32>, usize, usize)> {
+        let xs = self.tl_rect[4];
+        let (w, h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let out_comps = super::rss::xfer_comps(self.xfrmode);
+        let (comps, esize, _) = self.pix.input_shape(out_comps);
+        let row_in = w * comps * esize;
+        let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
+        let stride = if rows == h { wpr * 4 } else { row_in };
+        if row_in == 0 || bytes.len() < stride * (h - 1) + row_in {
+            return None;
+        }
+        let ty = self.xfrmode & 0xF;
+        let wpr_out = (w * bpp).div_ceil(4);
+        let mut out = Vec::with_capacity(wpr_out * h);
+        let mut rb = Vec::with_capacity(wpr_out * 4);
+        for r in 0..h {
+            rb.clear();
+            for v in self.pix.run_row(&bytes[r * stride..r * stride + row_in], w, out_comps) {
+                super::rss::pack_comp(ty, v, &mut rb);
+            }
+            rb.resize(wpr_out * 4, 0);
+            out.extend(rb.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])));
+        }
+        Some((out, wpr_out, h))
     }
 
     /// glDrawPixels' rows, `wpr` words each, in the raster engine's format
@@ -1774,9 +1817,9 @@ impl Gl {
                 let i = r * wpr * 4 + c * bpp + k;
                 *b = words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
             }
-            // GE pixels have component order RGBA after HQ formatting;
-            // the RSS's byte RGBA transfer is a packed ABGR X pixel.
-            if bpp == 4 && self.xfrmode & 0xFF == 0x80 {
+            // GE pixels are RGBA; byte RGBA with RGBorder clear goes to the
+            // raster engine alpha first (`rss::xfer_format`).
+            if bpp == 4 && self.xfrmode & 0xFF == 0x80 && self.xfrmode & 1 << 22 == 0 {
                 px[..4].reverse();
             }
             px
@@ -2385,9 +2428,25 @@ impl Gl {
         sink.rss_write(rr::FOG_ON, 1, false);
     }
 
+    /// A GE pixel state block (PIXEL_STATE / INIT_PIXEL_STATE_ERAM, or
+    /// such a token's payload sent as pixel data): [?, ?, bytes, address,
+    /// 0, 0, count, values, count, values again].
+    pub fn pixel_state_block(&mut self, d: &[u32]) {
+        if d.len() < 7 {
+            return;
+        }
+        let (addr, n) = (d[3], d[6] as usize);
+        self.pix.note_block(addr, n.min(d.len() - 7));
+        for (k, &v) in d[7..].iter().take(n).enumerate() {
+            self.pixel_state(addr + k as u32, v);
+        }
+    }
+
     /// A GE pixel state word (PIXEL_STATE / INIT_PIXEL_STATE_ERAM) at
-    /// `addr`: the pixel zoom and the texture loader's blocks are kept.
+    /// `addr`: into the pixel pipeline's memory; the pixel zoom and the
+    /// texture loader's blocks are kept apart as well.
     fn pixel_state(&mut self, addr: u32, v: u32) {
+        self.pix.write(addr, v);
         match addr {
             0x192 => self.zoom_inv = f32::from_bits(v),
             0xDA8..=0xDAC => self.tl_rect[(addr - 0xDA8) as usize] = v,

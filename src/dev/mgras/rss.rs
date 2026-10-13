@@ -613,9 +613,9 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
     if format == (7, 1) {
         return pack_rgb((v >> 40) as u32, (v >> 24) as u32, (v >> 8) as u32);
     }
-    // RGBA with 16-bit components (glCopyPixels draws back so).
+    // RGBA with 16-bit components (glCopyPixels draws back so), alpha too.
     if format == (8, 1) {
-        return pack_rgb((v >> 56) as u32, (v >> 40) as u32, (v >> 24) as u32);
+        return pack_rgb((v >> 56) as u32, (v >> 40) as u32, (v >> 24) as u32) | ((v >> 8) as u32 & 0xFF) << 24;
     }
     // RGB, a byte each, red first (glCopyTexImage reads the screen so).
     if format == (7, 0) {
@@ -649,7 +649,7 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
     }
     if format == (8, 1) {
         let w = |s: u32| c(s) as u64 * 0x101;
-        return w(0) << 48 | w(8) << 32 | w(16) << 16 | 0xFFFF;
+        return w(0) << 48 | w(8) << 32 | w(16) << 16 | w(24);
     }
     if format == DEPTH_FORMAT {
         let z = v & 0xFF_FFFF;
@@ -660,6 +660,132 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
         (8, 10) => c(0) >> 3 | (c(8) >> 3) << 5 | (c(16) >> 3) << 10,
         _ => v,
     }) as u64
+}
+
+/// XFRMODE's transfer format as `Xfer` keeps it: (PixelFormat,
+/// CompType), and for RGBA (format 8) RGBorder (bit 22) as CompType bit 4.
+/// Traced with libGLcore (`test/gltest/pixtest.c`): formats 3 red, 4 green,
+/// 5 blue, 6 alpha, 7 RGB, 8 RGBA (2 depth, 1 stencil, 0 colour index);
+/// types 0 / 4 unsigned / signed bytes, 1 / 5 shorts, 3 / 7 32-bit (8 and
+/// 10 the X server's packed 4-4-4-4 and 5-5-5). RGBorder 1 sends red
+/// first, 0 alpha first (SGI: "RGBorder = 0; /* ABGR */"); RGB formats
+/// are red first either way.
+pub(crate) fn xfer_format(mode: u32) -> (u32, u32) {
+    let (f, t) = ((mode >> 4) & 0xF, mode & 0xF);
+    if f == 8 && mode & 1 << 22 != 0 && matches!(t, 0 | 1 | 3 | 4 | 5 | 7) {
+        return (8, t | 0x10);
+    }
+    (f, t)
+}
+
+/// A transfer format converted component by component (`host_pixel`,
+/// `fb_pixel`), not one of the X server's and the kernel's own.
+pub(crate) fn generic_format(f: (u32, u32)) -> bool {
+    let t = f.1 & 0xF;
+    match f.0 {
+        8 => f.1 & 0x10 != 0 || matches!(t, 3 | 4 | 5 | 7),
+        7 => matches!(t, 3 | 4 | 5 | 7),
+        3..=6 => matches!(t, 0 | 1 | 3 | 4 | 5 | 7),
+        _ => false,
+    }
+}
+
+/// Whether the raster JIT knows this format (its `XFmt` set).
+pub(crate) fn jit_xfer_ok(f: (u32, u32)) -> bool {
+    !generic_format(f)
+}
+
+/// Framebuffer components (0 red .. 3 alpha) of a generic format, in host
+/// order.
+fn format_comps(f: (u32, u32)) -> &'static [usize] {
+    match f.0 {
+        3 => &[0],
+        4 => &[1],
+        5 => &[2],
+        6 => &[3],
+        7 => &[0, 1, 2],
+        _ if f.1 & 0x10 != 0 => &[0, 1, 2, 3],
+        _ => &[3, 2, 1, 0],
+    }
+}
+
+/// Bytes of one component of CompType `t`.
+fn type_size(t: u32) -> usize {
+    match t & 0xF {
+        1 | 5 => 2,
+        3 | 7 => 4,
+        _ => 1,
+    }
+}
+
+/// An 8-bit framebuffer component as a host component of type `t`
+/// (big-endian): unsigned types replicate the byte, signed ones carry
+/// seven bits of magnitude (GL's (2^b - 1) c - 1) / 2 within a step).
+fn host_comp(t: u32, p: u8, out: &mut Vec<u8>) {
+    let c = p as f64 / 255.0;
+    match t & 0xF {
+        0 => out.push(p),
+        4 => out.push(((c * 127.0).round() as i8) as u8),
+        1 => out.extend((p as u16 * 0x101).to_be_bytes()),
+        5 => out.extend(((c * 32767.0).round() as i16).to_be_bytes()),
+        3 => out.extend((p as u32 * 0x0101_0101).to_be_bytes()),
+        7 => out.extend(((c * 2147483647.0).round() as i32).to_be_bytes()),
+        _ => out.push(p),
+    }
+}
+
+/// A host component of type `t` (big-endian bytes) as an 8-bit
+/// framebuffer component, negative values 0.
+fn fb_comp(t: u32, b: &[u8]) -> u8 {
+    let g = |k: usize| b.get(k).copied().unwrap_or(0);
+    let (v, max) = match t & 0xF {
+        0 => (g(0) as f64, 255.0),
+        4 => (g(0) as i8 as f64, 127.0),
+        1 => (u16::from_be_bytes([g(0), g(1)]) as f64, 65535.0),
+        5 => (i16::from_be_bytes([g(0), g(1)]) as f64, 32767.0),
+        3 => (u32::from_be_bytes([g(0), g(1), g(2), g(3)]) as f64, 4294967295.0),
+        7 => (i32::from_be_bytes([g(0), g(1), g(2), g(3)]) as f64, 2147483647.0),
+        _ => (g(0) as f64, 255.0),
+    };
+    ((v / max).clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// A framebuffer pixel (0xAABBGGRR) as host bytes of a generic format.
+pub(crate) fn host_pixel(f: (u32, u32), px: u32, out: &mut Vec<u8>) {
+    for &k in format_comps(f) {
+        host_comp(f.1, (px >> (8 * k)) as u8, out);
+    }
+}
+
+/// Host bytes of a generic format as a framebuffer pixel; components the
+/// format lacks are 0.
+pub(crate) fn fb_pixel(f: (u32, u32), b: &[u8]) -> u32 {
+    let n = type_size(f.1);
+    format_comps(f).iter().enumerate().fold(0, |px, (i, &k)| px | (fb_comp(f.1, &b[(i * n).min(b.len())..]) as u32) << (8 * k))
+}
+
+/// A pipeline component for the raster engine: `v` in CompType `t`'s
+/// range (the GE's clamp scaled it), as big-endian bytes.
+pub(crate) fn pack_comp(t: u32, v: f64, out: &mut Vec<u8>) {
+    let r = v.round();
+    match t & 0xF {
+        0 => out.push(r.clamp(0.0, 255.0) as u8),
+        4 => out.push(r.clamp(-128.0, 127.0) as i8 as u8),
+        1 => out.extend((r.clamp(0.0, 65535.0) as u16).to_be_bytes()),
+        5 => out.extend((r.clamp(-32768.0, 32767.0) as i16).to_be_bytes()),
+        3 => out.extend((r.clamp(0.0, 4294967295.0) as u32).to_be_bytes()),
+        7 => out.extend((r.clamp(-2147483648.0, 2147483647.0) as i32).to_be_bytes()),
+        _ => out.push(r.clamp(0.0, 255.0) as u8),
+    }
+}
+
+/// Components a pixel of this XFRMODE has (for the GE pipeline's output).
+pub(crate) fn xfer_comps(mode: u32) -> usize {
+    match (mode >> 4) & 0xF {
+        7 => 3,
+        8 => 4,
+        _ => 1,
+    }
 }
 
 pub(super) fn signed16(v: u32) -> i32 {
@@ -763,6 +889,10 @@ impl Xfer {
 
 /// Bytes per pixel for an xfrmode (PixelFormat, PixelCompType) pair.
 pub(crate) fn bytes_per_pixel(xfrmode: u32) -> u32 {
+    let f = xfer_format(xfrmode);
+    if generic_format(f) {
+        return (format_comps(f).len() * type_size(f.1)) as u32;
+    }
     match ((xfrmode >> 4) & 0xF, xfrmode & 0xF) {
         (0, 0) => 1,
         (0, 1) | (8, 8) | (8, 10) => 2,
@@ -2181,9 +2311,10 @@ impl Rss {
             pio_read,
             width: self.reg(reg::XFRSIZE) & 0xFFFF,
             bpp: bytes_per_pixel(mode),
-            format: ((mode >> 4) & 0xF, mode & 0xF),
+            format: xfer_format(mode),
             begin_skip: begin,
-            stride_skip: (mode >> 14) & 0x1FF,
+            // Bits 21:14; bit 22 is RGBorder.
+            stride_skip: (mode >> 14) & 0xFF,
             line: 0,
             line_begin: begin,
             pending: 0,
@@ -2223,6 +2354,13 @@ impl Rss {
             return;
         }
         let bpp = x.bpp as usize;
+        if generic_format(x.format) {
+            for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
+                let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+                self.put(fx, fy, fb_pixel(x.format, px));
+            }
+            return;
+        }
         for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
             // Big-endian bytes.
             let v = px.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
@@ -2259,6 +2397,11 @@ impl Rss {
     /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
     fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+        if generic_format(x.format) {
+            let mut out = Vec::with_capacity(x.bpp as usize);
+            host_pixel(x.format, self.get(fx, fy), &mut out);
+            return out.get(i as usize).copied().unwrap_or(0);
+        }
         // Depth: the ZST word as it is, never a 12-bit pair's half.
         let px = if x.format == DEPTH_FORMAT { self.get_word(fx, fy) } else { self.get(fx, fy) };
         let pp1 = self.reg(reg::PP1FILLMODE);
@@ -2275,6 +2418,14 @@ impl Rss {
     }
 
     fn get_line(&self, x: &Xfer, line: u32) -> Vec<u8> {
+        if generic_format(x.format) {
+            let mut out = Vec::with_capacity((x.width * x.bpp) as usize);
+            for k in 0..x.width {
+                let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+                host_pixel(x.format, self.get(fx, fy), &mut out);
+            }
+            return out;
+        }
         (0..x.width).flat_map(|k| (0..x.bpp).map(move |i| (k, i))).map(|(k, i)| self.line_byte(x, line, k, i)).collect()
     }
 

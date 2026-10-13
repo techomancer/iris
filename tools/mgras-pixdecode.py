@@ -182,6 +182,8 @@ def main():
     ap.add_argument("--case", action="append", default=[])
     ap.add_argument("--results")
     ap.add_argument("--all", action="store_true", help="show every token, not just pixel-path ones")
+    ap.add_argument("--summary", action="store_true",
+                    help="per pixel operation: the module chain, each module's state, xfrmode")
     a = ap.parse_args()
     names = token_names()
     uc = load_ucode(a.ucode) if a.ucode else {}
@@ -200,6 +202,8 @@ def main():
     quiet = {0x2A, 0x2C, 0x35, 0x2B, 0xA2, 0x47, 0x3B, 0x3C, 0x3A, 0x66, 0x6F, 0x65,
              0x64, 0x67, 0x6E, 0xED, 0x02, 0x00, 0x1D, 0x27, 0x15, 0x4C, 0x4A, 0xBA,
              0xBC, 0xBE, 0x12, 0x39, 0x33}
+    if a.summary:
+        return summary(a, names, uc, case_names, want)
     cur = 0
     show = not want
     pending_pix = None
@@ -241,6 +245,71 @@ def main():
                 nb, (w >> 20) & 3, (w >> 22) & 7, " packed" if w & 1 << 25 else "",
                 " last" if w & 1 << 26 else "", " ".join("%08x" % x for x in d[:12]),
                 " ..." if len(d) > 12 else ""))
+
+
+def summary(a, names, uc, case_names, want):
+    """One block per pixel operation (SEND_PIXELS 0x08D, GET_PIXELS 0x0DB,
+    READ_TEXTURE 0x0F0, 0x0E5): the GE pipeline at 0x13B with each module's
+    state (module k's state address is in pair k + 1: [entry, prev state])."""
+    ge, eram = {}, {}
+    xfrmode = None
+    cur, show = 0, not want
+    ops = {0x8D: "SEND_PIXELS", 0xDB: "GET_PIXELS", 0xF0: "READ_TEXTURE", 0xE5: "READ_TEXTURE_RAW",
+           0x9D: "WRITE_DMAGESETUP", 0x94: "BITMAP"}
+    regs = {}
+    group = 0
+    rnames = {0x46: "block_xystart", 0x47: "block_xyend", 0x153: "xfrsize", 0x154: "xfrinitfactor",
+              0x155: "xfrfactor", 0x156: "xfrmasklow", 0x157: "xfrmaskhigh", 0x158: "xfrcounters",
+              0x159: "xfrmode", 0x15A: "lspat"}
+    late = None
+    for kind, w, d, slot in commands(a.rec):
+        if kind == "pix":
+            if group and slot is not None:
+                for i in range(0, len(d) - group + 1, group):
+                    regs[d[i] & 0x3FF] = d[i + 1]
+            if late is not None:
+                addr, vals = ge_write(d)
+                (ge if late == 0x80 else eram)[addr] = vals
+            group = 0
+            late = None
+            continue
+        cmd = (w >> 8) & 0x1FFF
+        group = {0x7F: 2, 0x7C: 3}.get(cmd, 0)
+        late = cmd if cmd in (0x80, 0xCD) and not d else None
+        if cmd == 0x38 and len(d) >= 2 and d[1] == 30000:
+            cur = d[0]
+            show = not want or cur in want
+            if show:
+                info = case_names.get(cur)
+                print("\n==== case #%d %s" % (cur, info[2] if info else ""))
+            ge, eram, regs = {}, {}, {}
+            continue
+        if cmd in (0x80, 0xCD):
+            addr, vals = ge_write(d)
+            (ge if cmd == 0x80 else eram)[addr] = vals
+            continue
+        if cmd == 0x7F or cmd == 0x7C:
+            continue
+        if not show or cmd not in ops:
+            continue
+        print("  %s %s" % (ops[cmd], " ".join("%#x" % v for v in d)))
+        if regs:
+            print("    raster: " + " ".join("%s=%#x" % (rnames.get(r, "r%#x" % r), v) for r, v in sorted(regs.items())))
+        prog = ge.get(0x13B, [])
+        for k in range(0, len(prog) - 1, 2):
+            entry = prog[k]
+            st = prog[k + 3] if k + 3 < len(prog) else None
+            nm = uc.get(entry, "%#x" % entry).split(":")[0] if uc else "%#x" % entry
+            if st is None:
+                print("    %-18s (last)" % nm)
+                continue
+            vals = (eram if st >= 0xC00 else ge).get(st)
+            sp = "ERAM" if st >= 0xC00 else "GE"
+            print("    %-18s %s[%#x] = %s" % (nm, sp, st, " ".join(fmt_val(v) for v in vals) if vals else "?"))
+        for addr in (0x187, 0x191, 0x1EF, 0xDA8, 0xDB7):
+            sp = eram if addr >= 0xC00 else ge
+            if addr in sp:
+                print("    %s[%#x] = %s" % ("ERAM" if addr >= 0xC00 else "GE", addr, " ".join(fmt_val(v) for v in sp[addr])))
 
 
 if __name__ == "__main__":

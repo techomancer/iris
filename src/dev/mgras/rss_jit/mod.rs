@@ -568,6 +568,9 @@ pub(super) fn prepare(rss: &mut Rss, a: &Args) -> Option<u32> {
             if bytes.len() % bpp != 0 && bytes.len().div_ceil(bpp) <= x.width as usize {
                 return None;
             }
+            if !rss::jit_xfer_ok(x.format) {
+                return None;
+            }
             let fmt = XFmt::of(x.format.0 << 4 | x.format.1);
             let code = key::XBPP.iter().position(|&b| b as u32 == x.bpp)? as u32;
             let c = &mut rss.jit_ctx;
