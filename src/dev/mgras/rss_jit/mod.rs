@@ -312,14 +312,14 @@ fn common(rss: &mut Rss) -> PipeKey {
     let drbsize = rss.reg(reg::DRBSIZE);
     let b = rss.target();
     c.tgt = [Target::default(); 2];
-    c.tgt[0] = target(rss, b, field == rss::DRAW_B);
+    c.tgt[0] = target(rss, b, rss::draws_b(field));
     let draw = if field == rss::DRAW_CID {
         Draw::Cid
     } else if b.kind == Kind::Overlay {
         Draw::Overlay
     } else {
         match rss.second_buffer() {
-            Some(p) if field == rss::DRAW_A_AND_B && !rss::rgb12_pair(pp1) => {
+            Some(p) if rss::draws_a_and_b(field) && !rss::rgb12_pair(pp1) => {
                 let b2 = Buffer::new(p, Kind::Wide, drbsize);
                 if b2 != b {
                     c.tgt[1] = target(rss, b2, true);
@@ -335,7 +335,7 @@ fn common(rss: &mut Rss) -> PipeKey {
     let pix = match ptype {
         _ if rss::rgb12_pair(pp1) => {
             let layout = rss::Pair::of(pp1).unwrap_or(rss::Pair::P444);
-            Pix::of_pair(layout, field == rss::DRAW_B, pp1 & rss::PP1_DITHER != 0)
+            Pix::of_pair(layout, rss::draws_b(field), pp1 & rss::PP1_DITHER != 0)
         }
         2 => Pix::Rgba8,
         4 | 6 => Pix::Ci12,

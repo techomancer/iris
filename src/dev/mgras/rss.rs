@@ -376,6 +376,22 @@ pub(super) fn draw_buffer(pp1fillmode: u32) -> u32 {
 }
 pub(super) const DRAW_B: u32 = 0x02;
 pub(super) const DRAW_A_AND_B: u32 = 0x03;
+/// Draw field 4: buffer B as DRBpointers' second page, 5: A and that page.
+/// GL's 24-bit double-buffered visuals use them (DRAW_BUFFER [4, 1]), and
+/// so does the X server for a double-buffered 24-bit window (System
+/// Manager's panes, fill mode 0xC012204 / 0xC016A04; traced 2026-10-13).
+pub(super) const DRAW_B_PAGE: u32 = 0x04;
+pub(super) const DRAW_A_AND_B_PAGE: u32 = 0x05;
+
+/// Whether draw field `f` writes buffer B only (2, or 4 as a second page).
+pub(super) fn draws_b(f: u32) -> bool {
+    f == DRAW_B || f == DRAW_B_PAGE
+}
+
+/// Whether draw field `f` writes both buffers (3, or 5).
+pub(super) fn draws_a_and_b(f: u32) -> bool {
+    f == DRAW_A_AND_B || f == DRAW_A_AND_B_PAGE
+}
 pub(super) const DRAW_CID: u32 = 0x50;
 
 /// PP1 window mode (`pp1winmode`; SGI's fields WINxLSBs, WINyLSBs,
@@ -1449,7 +1465,7 @@ impl Rss {
         let drb = self.reg(reg::DRBPOINTERS);
         let pp1 = self.reg(reg::PP1FILLMODE);
         let ptr = match self.second_buffer() {
-            Some(b) if kind == Kind::Wide && draw_buffer(pp1) == DRAW_B && !rgb12_pair(pp1) => b,
+            Some(b) if kind == Kind::Wide && draws_b(draw_buffer(pp1)) && !rgb12_pair(pp1) => b,
             _ => drb,
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
@@ -1476,8 +1492,8 @@ impl Rss {
             return;
         }
         let b = self.target();
-        self.put_in(b, x, y, v, field == DRAW_B);
-        if field == DRAW_A_AND_B && !(b.kind == Kind::Wide && rgb12_pair(self.reg(reg::PP1FILLMODE))) {
+        self.put_in(b, x, y, v, draws_b(field));
+        if draws_a_and_b(field) && !(b.kind == Kind::Wide && rgb12_pair(self.reg(reg::PP1FILLMODE))) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 // The 12-bit X visuals can give A and B the same page.
@@ -1558,8 +1574,8 @@ impl Rss {
             return;
         }
         let b = self.target();
-        self.put_in36(b, x, y, v, field == DRAW_B);
-        if field == DRAW_A_AND_B {
+        self.put_in36(b, x, y, v, draws_b(field));
+        if draws_a_and_b(field) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 if b2 != b {
@@ -2170,8 +2186,8 @@ impl Rss {
         }
         let pp1 = self.reg(reg::PP1FILLMODE);
         let b = self.target();
-        self.fragment_color(b, ux, uy, rgba, pp1, draw_buffer(pp1) == DRAW_B);
-        if draw_buffer(pp1) == DRAW_A_AND_B && !rgb12_pair(pp1) {
+        self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
+        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 if b2 != b {
@@ -2704,7 +2720,7 @@ mod tests {
             r.mem.get(&buf, x, (SCREEN_H - 1 - y as usize) as u32) as u32 & 0xFFF
         };
         r.write(reg::FILLMODE, FILL_FAST, false);
-        for (field, x, c) in [(1u32, 10, 0x11), (2, 20, 0x22), (3, 30, 0x33)] {
+        for (field, x, c) in [(1u32, 10, 0x11), (2, 20, 0x22), (3, 30, 0x33), (4, 40, 0x44), (5, 50, 0x55)] {
             r.write(reg::PP1FILLMODE, fm | field << 14, false);
             r.write(reg::FILL_COLOR_R, c, false);
             block(&mut r, x, 5, x, 5);
@@ -2712,6 +2728,10 @@ mod tests {
         assert_eq!([read(&r, a, 10, 5), read(&r, b_page, 10, 5)], [0x11, 0], "field 1: A");
         assert_eq!([read(&r, a, 20, 5), read(&r, b_page, 20, 5)], [0, 0x22], "field 2: B");
         assert_eq!([read(&r, a, 30, 5), read(&r, b_page, 30, 5)], [0x33, 0x33], "field 3: both");
+        // A double-buffered 24-bit X window (System Manager's panes) and
+        // GL's 24-bit visuals: 4 the second page, 5 both.
+        assert_eq!([read(&r, a, 40, 5), read(&r, b_page, 40, 5)], [0, 0x44], "field 4: B's page");
+        assert_eq!([read(&r, a, 50, 5), read(&r, b_page, 50, 5)], [0x55, 0x55], "field 5: both");
     }
 
     #[test]
