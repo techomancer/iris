@@ -52,7 +52,7 @@ assets = [
 ]
 
 [features]
-# Distributed build. Hides source-checkout tools such as rebuild/premiere.
+# Distributed build. Hides source-checkout tools such as premiere preparation.
 # Machine TOML storage is shared by source, Release, and App Store builds.
 bundled = []
 # Mac App Store distribution build. Implies `bundled`, and additionally hides

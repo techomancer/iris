@@ -16,7 +16,11 @@ use a WSL checkout at `~/iris-wsl-build`; adjust paths for your own checkout.
 | `run-iris.bat` | IRIS CLI via WSL (iris-ci, Linux tools) |
 | `run-iris-gui.bat` | iris-gui via WSL |
 
-**For YouTube / max graphics:** tune the machine in **iris-gui**, **export** to `irix-install/iris-windows.toml`, **stop** the GUI VM, then run **`run-iris-premiere.bat`** for the 3D segment (native CLI OpenGL — faster than the GUI CPU compositor).
+**For YouTube / max graphics:** tune the machine in **iris-gui**, **stop** the
+VM, then run the CLI from that machine's own folder (see "GUI ↔ TOML ↔ CI
+sync" below) for the 3D segment (native CLI OpenGL — faster than the GUI CPU
+compositor). `run-iris-premiere.bat` runs a fixed `irix-install\iris-windows.toml`
+from the repo root — a separate, hand-maintained TOML, not a GUI machine's.
 
 ---
 
@@ -30,7 +34,7 @@ These settings are part of this repository and share the core configuration sche
 |------|------|
 | **Launch scripts** | `run-iris-premiere.bat` / `run-iris-windows.bat` build with `lightning,rex-jit,idle-pause`; **feature stamp** rebuild via `ensure-build.bat` |
 | **Premiere GUI** | `cargo build -p iris-gui --features premiere` — embedded `lightning` + `idle-pause`; `run-iris-gui-premiere.bat` |
-| **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in `gui.json`; **File → Prepare for premiere…** exports TOML |
+| **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in the machine's own TOML; **File → Prepare for premiere…** flushes it to disk and reports the path to run the CLI `--config` against, from that machine's folder |
 | **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [rules/perf/gui-idle-refresh.md](../rules/perf/gui-idle-refresh.md) |
 | **Audio** | HAL2 wall-clock pacing/resampling; Display tab `[audio]` prebuf / cpal buffer |
 | **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` configures the pool |
@@ -95,7 +99,7 @@ Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 stat
 
 ### Phase 3 unified config
 
-Export from iris-gui includes `[perf]` and `[machine]` sections (plus `[jitv2]` if built with the `jitv2` feature). See [rules/perf/phase3-platform.md](../rules/perf/phase3-platform.md).
+A GUI machine's TOML includes `[perf]` and `[machine]` sections (plus `[jitv2]` if built with the `jitv2` feature). See [rules/perf/phase3-platform.md](../rules/perf/phase3-platform.md).
 
 Windows CI default socket: `127.0.0.1:19851` (TCP). Unix: `/tmp/iris.sock`.
 
@@ -133,8 +137,9 @@ Uses `GlCompositor` on the refresh thread instead of the CPU path. Still slower 
 
 | File | Role |
 |------|------|
-| `irix-install/iris-windows.toml` | **Shared canonical TOML** for CLI / premiere.bat (export from GUI to keep in sync) |
-| `%APPDATA%\iris\gui.json` | **GUI system of record** — named machines, autosaved edits |
+| `irix-install/iris-windows.toml` | Hand-maintained TOML for `run-iris-premiere.bat`, independent of any GUI machine |
+| `%APPDATA%\iris\machines\<name>\<name>.toml` | **GUI system of record** per machine — autosaved edits, same schema the CLI's `--config` loads |
+| `%APPDATA%\iris\gui.json` | GUI preferences and the active machine name only |
 | `irix-install/iris-wsl.toml` | WSL / Linux CLI |
 
 **Ports (native Windows):**
@@ -198,44 +203,72 @@ different CPU model.
 
 ## GUI ↔ TOML ↔ CI sync
 
-The GUI and CLI use the same **`MachineConfig`** schema but **different files** unless you sync them. **`iris-ci` loads no config** — it only drives an already-running `iris` process.
+The GUI and CLI use the same **`MachineConfig`** schema, and since the GUI
+moved to per-machine TOML storage they can share the *same file* directly —
+no export/import step needed. The catch: the core CLI resolves every relative
+path in the TOML (`nvram`, `nveeprom`, `disks/...`, `prom`, …) against its own
+**current directory**, not against the TOML's location — it's the GUI that
+`cd`s into each machine's folder before loading its config (whenever that
+machine is selected, not just at Start). So the only reliable way to point
+the CLI at a GUI machine's TOML is to run the CLI *from that machine's
+folder*. **`iris-ci` loads no config** — it only drives an already-running
+`iris` process.
+
+A GUI machine's folder is `<name>` under:
+
+- Windows native build: `%APPDATA%\iris\machines\<name>\`
+- WSL/Linux build: `$XDG_CONFIG_HOME/iris/machines/<name>/` (default `~/.config/iris/machines/<name>/`)
+- macOS: `~/Library/Application Support/iris/machines/<name>/` (sandboxed App
+  Store build: the app container's own Application Support)
 
 | Layer | Stores |
 |-------|--------|
-| **iris-gui** | `%APPDATA%\iris\gui.json` |
-| **iris CLI** | `iris.toml` via `--config` |
+| **iris-gui** | `<data dir>/iris/machines/<name>/<name>.toml` (one folder per machine, with its own `disks/`, `nvram.bin`, `nveeprom.bin`); `gui.json` keeps only GUI preferences and the active machine name |
+| **iris CLI** | Any TOML via `--config`, including a GUI machine's own `<name>.toml` — run from inside that machine's folder so its relative paths resolve |
 | **Debug settings** | `[debug]` TOML section (`gui_gl_capture`, `no_idle`, `debug_log`) — GUI Debug tab edits it; maps to `IRIS_GUI_GL`/`IRIS_NO_IDLE`/`IRIS_DEBUG_LOG` at Start |
 | **iris-ci** | Nothing (socket client only) |
 
 ### Recommended: one canonical TOML
 
-Treat **`irix-install/iris-windows.toml`** as the shared file:
+Point the CLI straight at the GUI machine's own file — there's nothing to
+export — but run it from inside that machine's folder:
 
 ```
-GUI edits  →  File → Export  →  iris-windows.toml  →  premiere.bat / iris.exe
-     ↑                                                      ↓
-     └──────── File → Import when TOML changed on disk ─────┘
+GUI edits  →  %APPDATA%\iris\machines\iris-windows\iris-windows.toml
+                              ↓  (cd into that folder first)
+                    iris.exe --config iris-windows.toml
 ```
 
 ### Path A — GUI → CLI (after tuning in the UI)
 
 1. **Stop** the VM.
-2. Set RAM, disks, network in the GUI (Memory tab presets, etc.).
-3. **File → Export current to iris.toml…** → save as `irix-install/iris-windows.toml`.
-4. Run CLI from repo root (paths in TOML are relative to cwd):
+2. Set RAM, disks, network in the GUI (Memory tab presets, etc.) — each edit
+   saves straight to `iris-windows.toml` in that machine's folder.
+3. `cd` into the machine's folder and run the CLI from there, pointed at the
+   bare filename:
 
    ```powershell
-   wsl\run-iris-premiere.bat
+   Set-Location "$env:APPDATA\iris\machines\iris-windows"
+   & "<repo>\target\release\iris.exe" --config iris-windows.toml
    ```
 
-5. Optional: enable **CI mode** on the CI / Automation tab before export if you need `ci = true` in TOML.
-
-**Export/Import** appear under **File** in source builds (hidden in App Store `bundled` builds).
+   `wsl\run-iris-premiere.bat` is not this — it always runs the repo's own
+   `irix-install\iris-windows.toml` from the repo root, independent of any GUI
+   machine. Use it for that fixed TOML, or do the `cd` + `--config` above for
+   a GUI machine.
+4. Optional: enable **CI mode** on the CI / Automation tab if you need
+   `ci = true` in the TOML.
 
 ### Path B — TOML → GUI
 
-1. **File → Import iris.toml…** → pick `irix-install/iris-windows.toml`.
-2. **Stop → Start** so guest RAM matches imported `banks`.
+1. Copy (not symlink — the GUI's autosave replaces the file, which breaks a
+   link) an existing TOML to `<data dir>/iris/machines/<name>/<name>.toml` —
+   the GUI discovers it on the next launch — or create a new machine and
+   paste its settings in. Paths inside it are relative to *that* folder, so a
+   TOML copied from elsewhere (e.g. `irix-install/iris-windows.toml`, whose
+   paths are relative to the repo root) needs its disk/NVRAM files moved
+   alongside it, or the GUI will report them missing.
+2. **Stop → Start** so guest RAM matches the TOML's `banks`.
 
 ### Debug parity (GUI vs CLI)
 
@@ -261,30 +294,33 @@ mode:
 **WSL workflow:**
 
 1. TOML includes `ci = true` (and `ci_socket` if non-default).
-2. Start iris in WSL with that config.
+2. Start iris in WSL with that config — from the machine's own folder if it's
+   a GUI machine's TOML (Path A above).
 3. In another WSL terminal: `iris-ci ping`, `iris-ci boot`, etc.
 
 See [rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md](../rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md).
 
 ### Sync checklist
 
-- [ ] Same `banks` in exported TOML and GUI Memory tab
-- [ ] Same `nvram`, `scsi.*.path`, `prom` paths (run from repo root or use absolute paths)
+- [ ] CLI and GUI point at the *same* TOML file, not a stale copy
+- [ ] CLI is launched from that machine's own folder (relative paths resolve against CWD) or its paths are absolute
 - [ ] **Stop → Start** in GUI after RAM changes
 - [ ] Same Debug env for CLI as GUI Debug tab
 - [ ] `mc regs` shows expected MEMCFG for extended RAM
-- [ ] Re-export after GUI changes you want CLI/CI to keep
 
 ---
 
 ## iris-gui first time
 
 1. Run `run-iris-gui-windows.bat`
-2. **File → Import iris.toml…** → `irix-install/iris-windows.toml` (or create a machine and configure)
+2. Create a machine named `iris-windows` and configure it, or copy an existing
+   TOML to `%APPDATA%\iris\machines\iris-windows\iris-windows.toml` before
+   launch so the GUI picks it up (rewrite its paths first — see Path B above)
 3. **Memory** tab: pick **256 MB** (authentic) or **384 MB** (IRIX 6.5 extended)
 4. **Debug** tab: set GL capture / no-idle / debug-log if needed (defaults are fine for normal use)
 5. **Start**
-6. After further edits: **File → Export** so CLI/premiere.bat stay aligned
+6. Further edits save straight to that same `iris-windows.toml` — point the
+   CLI at it from its own folder (Path A above) to stay aligned
 
 ---
 
