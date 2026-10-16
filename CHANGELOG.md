@@ -166,7 +166,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   Debug tab lists the GR2 and IMPACT graphics JITs and jitv2 next to the REX3
   JIT, and a `perfetto` iris-gui feature adds Start/Stop for a Perfetto trace
   (file, categories, host or guest clock). Network tab text says "guest"
-  rather than "Indy", since Indigo2s use it too.
+  rather than "Indy", since Indigo2s use it too. jitv2 builds also set the
+  compile thread count (`[jitv2] threads`), an August setting with no control.
 - **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
   (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
   on those profiles, not in the NVRAM file) used to default to a bare

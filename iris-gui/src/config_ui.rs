@@ -362,6 +362,11 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     if build_features::JITV2 {
         ui.add_space(4.0);
         Grid::new("jitv2_cache_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("JIT compile threads");
+            let max = std::thread::available_parallelism().map_or(8, |n| n.get()).max(1);
+            ui.add(DragValue::new(&mut cfg.jitv2.threads).range(1..=max))
+                .on_hover_text("Background threads compiling guest pages ([jitv2] threads). Applied at next Start.");
+            ui.end_row();
             ui.label("Persistent JIT code cache (IRIS_JIT_CACHE)");
             ui.checkbox(&mut cfg.jitv2.cache, "")
                 .on_hover_text("Keep compiled pages on disk across runs and load them instead of recompiling. See docs/jitv2-persistent-cache.md.");
