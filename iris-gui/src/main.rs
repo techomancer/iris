@@ -1583,6 +1583,9 @@ impl App {
                 let jit_off = std::env::var_os("IRIS_NO_JIT").is_some();
                 let jit_state = |feat: bool| if !feat { "off" } else if jit_off { "off (sandbox)" } else { "on" };
                 ui.label(format!("  rex-jit:   {}", jit_state(bf::REX_JIT)));
+                ui.label(format!("  gr2-jit:   {}", jit_state(bf::GR2_JIT)));
+                ui.label(format!("  gr4-jit:   {}", jit_state(bf::GR4_JIT)));
+                ui.label(format!("  jitv2:     {}", jit_state(bf::JITV2)));
                 ui.label(format!("  lightning: {}", if bf::LIGHTNING { "on (no debug)" } else { "off" }));
             });
         });
@@ -2700,8 +2703,10 @@ impl App {
                     ui.label(RichText::new("The serial console is NOT the network").strong());
                     ui.label("• Help > Diagnostics > Serial console is the guest's serial terminal — for login");
                     ui.label("   and the PROM monitor — and works the same with or without guest networking.");
-                    ui.label("• It's carried over host loopback TCP (127.0.0.1:8881 = guest serial / ttyd1;");
-                    ui.label("   8888 is the IRIS debug monitor, not the guest console). That loopback is not the");
+                    ui.label(format!("• It's carried over host loopback TCP (127.0.0.1:{} = guest serial / ttyd1;",
+                        self.cfg.serial_ports()[1]));
+                    ui.label(format!("   {} is the IRIS debug monitor, not the guest console). That loopback is not the",
+                        config_ui::monitor_port(&self.cfg)));
                     ui.label("   guest's network connection.");
                     ui.add_space(6.0);
                     ui.label(RichText::new("Guest IP & subnets").strong());
@@ -3783,6 +3788,10 @@ impl eframe::App for App {
         // pressing Stop (rather than relying on Drop ordering / racing
         // process teardown). Bounded by the worker's stop timeout.
         self.emu.shutdown();
+        // Finish a Perfetto trace started from the Debug tab, so the file is
+        // complete rather than cut off mid-buffer.
+        #[cfg(feature = "perfetto")]
+        iris::perfetto::shutdown();
         // Release the single-instance lock so the next launch sees a clean
         // start (a crash that skips this just leaves a stale, harmless pidfile).
         single_instance::release();

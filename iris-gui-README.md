@@ -42,6 +42,7 @@ emulation will be noticeably slow.
 | `hostcall` | Host services for IRIX programs over private syscalls 3000-3009. No per-machine setting — the Debug tab just reports it's built in |
 | `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) and Linux (EGL; needs libGL to build, libEGL and Mesa's EGL/DRI drivers at run time; see CHANGELOG) — builds elsewhere but registers no backend |
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
+| `perfetto` | Perfetto trace recording; the Debug tab gains Start/Stop for a `.pftrace` (see `docs/perfetto.md`) |
 | `bundled` | Distributed build: hides the iris.toml import/export items. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
 
@@ -152,13 +153,13 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform, CPU, CP0 Count clock, persistent JIT code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log |
+| **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, persistent JIT code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
-| **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
+| **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
-| **Debug** | Build features, GDB stub port, capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
+| **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
 | **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |
 | **Benchmark** | The bare-metal benchmark suite, run in-process on a headless machine (see `bench/README.md`) |
 

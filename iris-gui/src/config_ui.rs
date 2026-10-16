@@ -1,7 +1,7 @@
 use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, Ui};
 use iris::build_features;
 use std::path::Path;
-use iris::config::{AudioHost, 
+use iris::config::{AudioHost, CacheModel,
     format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
     MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
@@ -195,7 +195,7 @@ pub fn show_tab(
         Tab::General => TabOutcome { action: show_general(ui, cfg, mem_ctx), ..Default::default() },
         Tab::Disks   => { let (e, a) = show_disks(ui, cfg); TabOutcome { action: a, disks_changed: e.changed, disk_picked: e.picked, ..Default::default() } }
         Tab::Network => {
-            let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces);
+            let net = show_network(ui, cfg, host, disk_folders, pcap_ifaces, mem_ctx.running);
             TabOutcome { action: net.action.clone(), net, ..Default::default() }
         }
         Tab::Memory  => { show_memory(ui, cfg, mem_ctx); TabOutcome::default() }
@@ -239,10 +239,11 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         .small(),
     );
     ui.label(
-        RichText::new(
-            "The main viewport is the Newport framebuffer (X11 / gfx), not the serial console. \
-             PROM and login appear on the monitor (127.0.0.1:8888) or IRIX serial until X starts.",
-        )
+        RichText::new(format!(
+            "The main viewport is the graphics framebuffer (X11 / gfx), not the serial console. \
+             The PROM and login appear on the IRIX serial console (127.0.0.1:{}) until X starts.",
+            cfg.serial_ports()[1],
+        ))
         .weak()
         .small(),
     );
@@ -284,6 +285,28 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
                         ui.selectable_value(&mut cfg.machine.cpu, c, c.label());
                     }
                 });
+        });
+        ui.end_row();
+
+        // `[machine] cache`. The R10000 only has the shadow model, so the
+        // choice is fixed there.
+        ui.label("Cache model");
+        let r10k = cfg.machine.cpu == CpuModel::R10000;
+        ui.add_enabled_ui(!mem_ctx.running && !r10k, |ui| {
+            let shown = if r10k { "Shadow (the only R10000 model)".to_string() } else { cache_model_label(cfg.machine.cache, cfg.machine.cpu) };
+            ComboBox::from_id_salt("cache_model")
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    for m in [CacheModel::Auto, CacheModel::Full, CacheModel::Shadow] {
+                        ui.selectable_value(&mut cfg.machine.cache, m, cache_model_label(m, cfg.machine.cpu));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Full models the caches' tags, data and write-back, which the interpreter \
+                     is fastest with. Shadow keeps data in memory only, with tag arrays just for \
+                     CACHE instructions, which is what jitv2 is fastest with. Auto picks Shadow \
+                     in a jitv2 build and Full otherwise.");
         });
         ui.end_row();
 
@@ -406,6 +429,8 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         ui.end_row();
     });
 
+    show_host_ports(ui, cfg);
+
     show_rtc_offset(ui, &mut cfg.rtc_offset, mem_ctx.running);
 
     // N64 development board (Ultra64). A single runtime toggle — the GIO device
@@ -433,6 +458,67 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     }
 
     action
+}
+
+/// The monitor console's loopback port, default filled in.
+pub fn monitor_port(cfg: &MachineConfig) -> u16 {
+    cfg.monitor_port.unwrap_or(iris::monitor::DEFAULT_PORT)
+}
+
+/// `monitor_port`, `serial_port_a`, `serial_port_b`: the loopback TCP ports of
+/// the monitor console and the two serial channels. Two machines running at
+/// once (this app and a CLI `iris`, say) need different ones. Read at Start.
+fn show_host_ports(ui: &mut Ui, cfg: &mut MachineConfig) {
+    ui.separator();
+    ui.heading("Host ports");
+    let [def_a, def_b] = iris::dev::z85c30::DEFAULT_PORTS;
+    Grid::new("host_ports_grid").num_columns(2).striped(true).show(ui, |ui| {
+        port_row(ui, "Monitor console", "IRIS's debug monitor: telnet 127.0.0.1 on this port.",
+                 &mut cfg.monitor_port, iris::monitor::DEFAULT_PORT);
+        port_row(ui, "Serial port 1 (console, ttyd1)",
+                 "Channel B: the PROM and IRIX console. Help » Serial console connects here.",
+                 &mut cfg.serial_port_b, def_b);
+        port_row(ui, "Serial port 2 (ttyd2)", "Channel A.", &mut cfg.serial_port_a, def_a);
+    });
+    let mut ports = vec![monitor_port(cfg), cfg.serial_ports()[0], cfg.serial_ports()[1]];
+    if let Some(g) = cfg.gdb_port { ports.push(g); }
+    let mut sorted = ports.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != ports.len() {
+        ui.label(RichText::new("Two of these share a port; only the first to start gets it.")
+            .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)).small());
+    }
+    ui.label(RichText::new(
+        "Loopback (127.0.0.1) only. Give each machine you run at the same time its own ports. \
+         Applied at next Start.").weak().small());
+}
+
+/// One loopback port setting, where `None` means `default`.
+fn port_row(ui: &mut Ui, label: &str, hover: &str, value: &mut Option<u16>, default: u16) {
+    ui.label(label).on_hover_text(hover);
+    ui.horizontal(|ui| {
+        let mut port = value.unwrap_or(default);
+        if ui.add(DragValue::new(&mut port).range(1..=65535)).changed() {
+            *value = (port != default).then_some(port);
+        }
+        if ui.add_enabled(value.is_some(), egui::Button::new("Default"))
+            .on_hover_text(format!("Use {default}"))
+            .clicked()
+        {
+            *value = None;
+        }
+    });
+    ui.end_row();
+}
+
+/// A cache model's menu label; Auto says what it resolves to in this build.
+fn cache_model_label(m: CacheModel, cpu: CpuModel) -> String {
+    match m {
+        CacheModel::Auto => format!("Auto ({})", if m.is_shadow(cpu) { "shadow" } else { "full" }),
+        CacheModel::Full => "Full".into(),
+        CacheModel::Shadow => "Shadow".into(),
+    }
 }
 
 /// `[rtc_offset]`: six signed fields, shown and typed as `-n` / `+n`, with a
@@ -706,7 +792,7 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
         ui.separator();
         ui.heading("Audio (HAL2)");
         ui.label(
-            RichText::new("Underrun count: monitor telnet 127.0.0.1:8888 → hal2 status")
+            RichText::new(format!("Underrun count: monitor telnet 127.0.0.1:{} → hal2 status", monitor_port(cfg)))
                 .weak()
                 .small(),
         );
@@ -942,10 +1028,14 @@ fn show_network(
     host: &[crate::netplan::HostIface],
     disk_folders: &[String],
     pcap_ifaces: &Option<Result<Vec<PcapIface>, String>>,
+    running: bool,
 ) -> NetworkOutcome {
     use crate::netplan;
     let mut out = NetworkOutcome::default();
     ui.heading("Networking");
+
+    ethernet_address_row(ui, cfg, running);
+    ui.add_space(4.0);
 
     // The backend selector (and the entire PCAP UI) is only shown when this
     // build actually has PCAP support. App Store / bundled builds compile
@@ -1008,8 +1098,8 @@ fn show_network(
     // works in both modes.)
     if cfg.network.mode != NetMode::Pcap {
     ui.label(RichText::new(
-        "IRIS gives the Indy its own private NAT network, the same trick your home router uses. \
-         The Indy reaches the internet through IRIS, but nothing on your real network can see it. \
+        "IRIS gives the guest its own private NAT network, the same trick your home router uses. \
+         The guest reaches the internet through IRIS, but nothing on your real network can see it. \
          Pick a subnet that does not overlap a network your computer already uses (Wi-Fi, Ethernet, \
          VPN, Docker, etc.). If it does, IRIS flags it below.")
         .weak());
@@ -1124,7 +1214,7 @@ fn show_network(
         ui.label(RichText::new(format!("Invalid: {msg}")).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)));
     } else if let Some(d) = &assess.derived {
         ui.label(RichText::new(format!(
-            "Gateway (IRIS host) {}, Indy ec0 {}, {} usable hosts, broadcast {}",
+            "Gateway (IRIS host) {}, guest ec0 {}, {} usable hosts, broadcast {}",
             d.gateway, d.client, netplan::commas(d.usable_hosts), d.broadcast)).weak());
         if let Some(typed) = assess.off_boundary {
             ui.label(RichText::new(format!(
@@ -1235,18 +1325,21 @@ fn show_network(
     if let Some(pf) = add { cfg.port_forward.push(pf); out.changed = true; out.forwards_changed = true; }
 
     ui.label(RichText::new(
-        "A port forward maps a port on your computer to a port on the Indy, so host tools can reach \
+        "A port forward maps a port on your computer to a port on the guest, so host tools can reach \
          guest services (log in, copy files, and so on). Inbound only, and it works once the guest is \
          up on the NAT subnet. None exist by default.")
         .weak());
+
+    ui.separator();
+    out.changed |= tftp_section(ui, cfg, host);
     } // end: NAT-only section (hidden in PCAP mode)
 
     ui.separator();
     ui.strong("NFS share");
     ui.label(RichText::new(
-        "The Indy speaks NFS natively — the easiest way to move files between your computer and the \
+        "IRIX speaks NFS natively — the easiest way to move files between your computer and the \
          emulated machine. IRIS serves NFS itself, in-process, backed by the folder you pick below: \
-         nothing to install on any platform, and no NFS setup on the Indy side.")
+         nothing to install on any platform, and no NFS setup on the guest side.")
         .weak());
     let mut has_nfs = cfg.nfs.is_some();
     if ui.checkbox(&mut has_nfs, "Enable NFS").changed() {
@@ -1323,12 +1416,160 @@ fn show_network(
                 .map(|d| d.gateway.to_string())
                 .unwrap_or_else(|| "192.168.0.1".into())
         };
-        ui.label(RichText::new("Pick a folder, boot the Indy, then mount it:").weak());
+        ui.label(RichText::new("Pick a folder, boot the guest, then mount it:").weak());
         ui.code(format!("mkdir /shared\nmount {gw}:/ /shared"));
-        ui.label(RichText::new("Your files then appear at /shared on the Indy.").weak());
+        ui.label(RichText::new("Your files then appear at /shared on the guest.").weak());
     }
 
     out
+}
+
+/// The guest's Ethernet address (`eaddr`), which IRIX needs to attach `ec0`.
+/// It lives in the NVRAM on Indy and in the motherboard EEPROM (`nveeprom`) on
+/// Indigo2/IP28 (rules/irix/networking.md), so this reads and writes the chip
+/// the profile boots from, the same bytes the Start pre-flight and Reset NVRAM
+/// patch. Only editable while stopped: a running machine saves its NVRAM on
+/// Stop, which would undo the edit.
+fn ethernet_address_row(ui: &mut Ui, cfg: &MachineConfig, running: bool) {
+    use crate::settings;
+    let eeprom = !cfg.machine.profile.guinness();
+    let path = if eeprom { cfg.nveeprom.as_str() } else { cfg.nvram.as_str() };
+    let read = |p: &str| if eeprom { settings::nveeprom_mac(p) } else { settings::nvram_mac(p) };
+
+    // Re-read the chip at most once a second: the PROM's `setenv eaddr` and a
+    // Stop both rewrite it behind this tab's back.
+    let cache_id = ui.make_persistent_id("eaddr_cache");
+    let buf_id   = ui.make_persistent_id("eaddr_buf");
+    let last_id  = ui.make_persistent_id("eaddr_last");
+    let msg_id   = ui.make_persistent_id("eaddr_msg");
+    let now = ui.input(|i| i.time);
+    let cached: Option<(String, Option<[u8; 6]>, f64)> = ui.data_mut(|d| d.get_temp(cache_id));
+    let current = match cached {
+        Some((p, m, t)) if p == path && now - t < 1.0 => m,
+        _ => {
+            let m = read(path);
+            ui.data_mut(|d| d.insert_temp(cache_id, (path.to_string(), m, now)));
+            m
+        }
+    };
+    let cur_text = current.map(settings::mac_to_string).unwrap_or_default();
+    let mut buf: String = ui.data_mut(|d| d.get_temp(buf_id)).unwrap_or_else(|| cur_text.clone());
+    let last: Option<String> = ui.data_mut(|d| d.get_temp(last_id));
+    let mut msg: String = ui.data_mut(|d| d.get_temp(msg_id)).unwrap_or_default();
+    if last.as_deref() != Some(cur_text.as_str()) {
+        buf = cur_text.clone(); // the chip changed underneath us: show what it holds now
+    }
+
+    let mut commit: Option<[u8; 6]> = None;
+    Grid::new("eaddr_grid").num_columns(2).striped(true).show(ui, |ui| {
+        ui.label("Ethernet address (eaddr)")
+            .on_hover_text(format!("Stored in the {} ({path}).",
+                if eeprom { "NVRAM EEPROM" } else { "NVRAM" }));
+        ui.add_enabled_ui(!running, |ui| {
+            ui.horizontal(|ui| {
+                let resp = ui.add(TextEdit::singleline(&mut buf)
+                    .hint_text("08:00:69:xx:xx:xx").desired_width(150.0));
+                let entered = resp.lost_focus() && buf != cur_text;
+                if entered {
+                    match iris::config::parse_mac(buf.trim()) {
+                        Ok(m) => commit = Some(m),
+                        Err(e) => msg = e,
+                    }
+                }
+                if ui.button("Generate").on_hover_text("A new address in SGI's 08:00:69 range").clicked() {
+                    commit = Some(settings::generate_mac_bytes(&format!("{path}{now}")));
+                }
+            });
+        });
+        ui.end_row();
+    });
+
+    if let Some(mac) = commit {
+        let r = if eeprom {
+            settings::ensure_nveeprom_exists(path);
+            settings::write_nveeprom_mac(path, mac)
+        } else {
+            settings::ensure_nvram_seeded(path);
+            settings::write_nvram_mac(path, mac)
+        };
+        msg = match r {
+            Ok(true) => String::new(),
+            Ok(false) => format!("couldn't write {path}: no usable file there yet"),
+            Err(e) => format!("couldn't write {path}: {e}"),
+        };
+        buf = settings::mac_to_string(mac);
+        ui.data_mut(|d| d.remove::<(String, Option<[u8; 6]>, f64)>(cache_id));
+    }
+
+    if running {
+        ui.label(RichText::new("Stop the machine to change the Ethernet address.").weak().small());
+    } else if !msg.is_empty() {
+        ui.label(RichText::new(&msg).color(Color32::from_rgb(0xd9, 0x4a, 0x3d)).small());
+    } else if current.is_none() && commit.is_none() {
+        ui.label(RichText::new("None set yet. One is generated when the machine starts.").weak().small());
+    }
+    ui.data_mut(|d| {
+        d.insert_temp(buf_id, buf);
+        d.insert_temp(last_id, commit.map(settings::mac_to_string).unwrap_or(cur_text));
+        d.insert_temp(msg_id, msg);
+    });
+}
+
+/// NAT mode: the gateway's read-only TFTP server (`[network] tftp_dir`), for
+/// PROM network boot (`boot -f bootp()/unix`) and guest tftp clients. Unset
+/// turns the server off. Read at Start. Returns true if the setting changed.
+fn tftp_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> bool {
+    let mut changed = false;
+    ui.strong("TFTP boot server");
+    ui.label(RichText::new(
+        "Serves a folder read-only over TFTP at the gateway, so the PROM can boot a kernel \
+         or standalone program over the network, and guest tftp clients can fetch files. \
+         Applied at next Start.")
+        .weak());
+    let mut on = cfg.network.tftp_dir.is_some();
+    if ui.checkbox(&mut on, "Enable TFTP").changed() {
+        cfg.network.tftp_dir = if on {
+            // Start from a folder that exists, so an enabled server never
+            // serves an empty path (the working directory).
+            let dir = crate::settings::GuiSettings::data_dir()
+                .map(|d| d.join("tftpboot"))
+                .unwrap_or_else(|| "tftpboot".into());
+            let _ = std::fs::create_dir_all(&dir);
+            Some(dir.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        changed = true;
+    }
+    if let Some(dir) = cfg.network.tftp_dir.as_mut() {
+        Grid::new("tftp_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("TFTP folder");
+            changed |= path_row(ui, "tftp_dir", dir, Pick::Dir, ANY_FILTERS).changed;
+            ui.end_row();
+        });
+        if dir.trim().is_empty() {
+            ui.label(RichText::new("Pick a folder, or TFTP stays off.").weak().small());
+        } else if !Path::new(dir.trim()).is_dir() {
+            ui.label(RichText::new("That folder doesn't exist.")
+                .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)).small());
+        }
+        let (b, p) = crate::netplan::parse_cidr(cfg.nat_subnet.as_deref());
+        let gw = crate::netplan::classify(b, p, host).derived
+            .map(|d| d.gateway.to_string())
+            .unwrap_or_else(|| "192.168.0.1".into());
+        ui.label(RichText::new(
+            "Put a kernel in the folder and boot it from the PROM's Command Monitor \
+             (press Esc at \"Starting up the system\"):").weak());
+        ui.code("boot -f bootp()/unix");
+        ui.label(RichText::new(format!("From IRIX, the server is at {gw}:")).weak());
+        ui.code(format!("tftp {gw}"));
+    }
+    // A blank field means off, not "serve the working directory".
+    if cfg.network.tftp_dir.as_deref().is_some_and(|d| d.trim().is_empty()) && !ui.memory(|m| m.focused().is_some()) {
+        cfg.network.tftp_dir = None;
+        changed = true;
+    }
+    changed
 }
 
 /// PCAP mode: edit the virtual NFS host's IPv4 address (`cfg.network.nfs_pcap_ip`).
@@ -1373,8 +1614,8 @@ fn pcap_nfs_ip_row(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan:
         }
     });
     ui.label(RichText::new(
-        "Give the NFS server a free address on the same subnet your Indy uses (your real LAN). \
-         Then on the Indy: mount it from this IP. No gateway needed — it's reachable directly.")
+        "Give the NFS server a free address on the same subnet your guest uses (your real LAN). \
+         Then on the guest: mount it from this IP. No gateway needed — it's reachable directly.")
         .weak());
 
     ui.data_mut(|d| {
@@ -1573,8 +1814,29 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.label("CPU (configured)");
         ui.label(cfg.machine.cpu.label());
         ui.end_row();
-        ui.label("REX3 JIT");
-        ui.label(if build_features::REX_JIT { "enabled at compile time" } else { "not built" });
+        // `gpujit` = all three graphics JITs. The App Store build turns them
+        // off at run time with IRIS_NO_JIT, so report what will actually run.
+        let jit = |built: bool| if !built {
+            "not built"
+        } else if std::env::var_os("IRIS_NO_JIT").is_some() {
+            "built, off (IRIS_NO_JIT)"
+        } else {
+            "enabled at compile time"
+        };
+        ui.label("REX3 JIT (Newport)");
+        ui.label(jit(build_features::REX_JIT));
+        ui.end_row();
+        ui.label("RE3 JIT (GR2 XZ / Extreme)");
+        ui.label(jit(build_features::GR2_JIT));
+        ui.end_row();
+        ui.label("Raster JIT (IMPACT)");
+        ui.label(jit(build_features::GR4_JIT));
+        ui.end_row();
+        ui.label("MIPS JIT (jitv2)");
+        ui.label(jit(build_features::JITV2));
+        ui.end_row();
+        ui.label("Perfetto tracing");
+        ui.label(if cfg!(feature = "perfetto") { "yes" } else { "no — rebuild with --features perfetto" });
         ui.end_row();
         ui.label("Lightning");
         ui.label(if build_features::LIGHTNING { "yes (no GDB)" } else { "no" });
@@ -1633,6 +1895,8 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
             ui.end_row();
         });
     }
+    #[cfg(feature = "perfetto")]
+    show_perfetto(ui);
     ui.separator();
     ui.label("Capture (iris-gui framebuffer path)");
     Grid::new("capture_grid").num_columns(2).striped(true).show(ui, |ui| {
@@ -1642,7 +1906,7 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.end_row();
     });
     ui.label(
-        RichText::new("After audio-heavy demos: telnet 127.0.0.1:8888 → hal2 status (cpal underruns).")
+        RichText::new(format!("After audio-heavy demos: telnet 127.0.0.1:{} → hal2 status (cpal underruns).", monitor_port(cfg)))
             .weak()
             .small(),
     );
@@ -1693,6 +1957,78 @@ fn show_debug(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
         ui.end_row();
     });
     action
+}
+
+/// Perfetto trace recording (`iris::perfetto`), the GUI's `--perfetto` and
+/// monitor `perfetto start|stop`. The session is process-wide, so it runs
+/// across machine Start/Stop until stopped here or the app quits.
+#[cfg(feature = "perfetto")]
+fn show_perfetto(ui: &mut Ui) {
+    use iris::perfetto;
+    ui.separator();
+    ui.heading("Perfetto trace");
+    let path_id  = ui.make_persistent_id("pf_path");
+    let cats_id  = ui.make_persistent_id("pf_cats");
+    let clock_id = ui.make_persistent_id("pf_guest_clock");
+    let msg_id   = ui.make_persistent_id("pf_msg");
+    let mut path: String = ui.data_mut(|d| d.get_temp(path_id)).unwrap_or_else(|| {
+        crate::settings::GuiSettings::data_dir()
+            .map(|d| d.join("iris.pftrace").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "iris.pftrace".into())
+    });
+    let mut cats: String = ui.data_mut(|d| d.get_temp(cats_id)).unwrap_or_else(|| "all".into());
+    let mut guest_clock: bool = ui.data_mut(|d| d.get_temp(clock_id)).unwrap_or(false);
+    let mut msg: String = ui.data_mut(|d| d.get_temp(msg_id)).unwrap_or_default();
+    let status = perfetto::status();
+    let recording = status != "perfetto: idle";
+
+    ui.add_enabled_ui(!recording, |ui| {
+        Grid::new("perfetto_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label("Trace file");
+            path_row(ui, "pf_path_row", &mut path, Pick::SaveFile, &[("Perfetto trace", &["pftrace"]), ("All", &["*"])]);
+            ui.end_row();
+            ui.label("Categories");
+            ui.add(TextEdit::singleline(&mut cats).hint_text("all, or e.g. irq,gfx or all,-jit").desired_width(280.0))
+                .on_hover_text(format!("all, or a comma list of: {}",
+                    perfetto::cat::NAMES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")));
+            ui.end_row();
+            ui.label("Clock");
+            ComboBox::from_id_salt("pf_clock")
+                .selected_text(if guest_clock { "Guest instructions" } else { "Host time" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut guest_clock, false, "Host time");
+                    ui.selectable_value(&mut guest_clock, true, "Guest instructions");
+                })
+                .response
+                .on_hover_text("Guest draws one retired instruction as 1 ns, so slices line up with guest work rather than host speed.");
+            ui.end_row();
+        });
+    });
+    ui.horizontal(|ui| {
+        if !recording && ui.button("Start trace").clicked() {
+            let clock = if guest_clock { perfetto::Clock::Guest } else { perfetto::Clock::Host };
+            msg = match perfetto::cat::parse(&cats).and_then(|c| perfetto::start(path.trim(), c, clock)) {
+                Ok(()) => String::new(),
+                Err(e) => e,
+            };
+        }
+        if recording && ui.button("Stop trace").clicked() {
+            msg = perfetto::stop().unwrap_or_else(|e| e);
+        }
+    });
+    if recording {
+        ui.label(RichText::new(status).small());
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    } else if !msg.is_empty() {
+        ui.label(RichText::new(&msg).small());
+    }
+    ui.label(RichText::new("Open the file at ui.perfetto.dev. See docs/perfetto.md.").weak().small());
+    ui.data_mut(|d| {
+        d.insert_temp(path_id, path);
+        d.insert_temp(cats_id, cats);
+        d.insert_temp(clock_id, guest_clock);
+        d.insert_temp(msg_id, msg);
+    });
 }
 
 fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {

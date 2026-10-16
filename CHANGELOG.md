@@ -155,6 +155,18 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **GUI settings for this month's core changes.** The Networking tab sets the
+  TFTP boot folder (`[network] tftp_dir`; NAT mode, with the `boot -f
+  bootp()/unix` line to use) and shows and edits the Ethernet address
+  (`eaddr`) in whichever chip the profile boots from: NVRAM on Indy, the
+  NVRAM EEPROM on Indigo2/IP28. The General tab sets the monitor and serial
+  ports (`monitor_port`, `serial_port_a`, `serial_port_b`) and the cache model
+  (`[machine] cache`: auto, full, shadow; fixed to shadow on the R10000), and
+  the help text that named 8888 and 8881 now shows the configured ports. The
+  Debug tab lists the GR2 and IMPACT graphics JITs and jitv2 next to the REX3
+  JIT, and a `perfetto` iris-gui feature adds Start/Stop for a Perfetto trace
+  (file, categories, host or guest clock). Network tab text says "guest"
+  rather than "Indy", since Indigo2s use it too.
 - **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
   (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
   on those profiles, not in the NVRAM file) used to default to a bare

@@ -50,6 +50,9 @@ pub fn config_paths(cfg: &MachineConfig) -> Vec<String> {
     if let Some(nfs) = &cfg.nfs {
         add(&nfs.shared_dir);
     }
+    if let Some(dir) = &cfg.network.tftp_dir {
+        add(dir);
+    }
     out
 }
 

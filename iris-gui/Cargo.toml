@@ -77,11 +77,15 @@ premiere = ["iris/lightning", "iris/idle-pause"]
 # doesn't. Build with: cargo build -p iris-gui --features hostcall
 hostcall = ["iris/hostcall"]
 # Host OpenGL for IRIX programs (`iris-hostgl`), replaying the guest's GL
-# command stream on the host GPU; implies hostcall. Only macOS has a backend
-# (CGL) today — elsewhere this builds but registers nothing, and the guest's
+# command stream on the host GPU; implies hostcall. macOS (CGL) and Linux (EGL)
+# have backends — elsewhere this builds but registers nothing, and the guest's
 # replacement libGL (github.com/atomchild411/iris-guest-tools) reports host
 # GL as unavailable. Build with: cargo build -p iris-gui --features hostgl
 hostgl = ["hostcall", "iris/hostgl"]
+# Perfetto trace recording (src/perfetto/, docs/perfetto.md): the Debug tab
+# gains Start/Stop for a .pftrace to open at ui.perfetto.dev.
+# Build with: cargo build -p iris-gui --features perfetto
+perfetto = ["iris/perfetto"]
 
 [dependencies]
 # The GUI always enables the graphics JITs (`gpujit`: REX3 draw shaders and
