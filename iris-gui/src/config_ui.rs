@@ -1534,13 +1534,14 @@ fn tftp_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
     let mut on = cfg.network.tftp_dir.is_some();
     if ui.checkbox(&mut on, "Enable TFTP").changed() {
         cfg.network.tftp_dir = if on {
-            // Start from a folder that exists, so an enabled server never
-            // serves an empty path (the working directory).
-            let dir = crate::settings::GuiSettings::data_dir()
-                .map(|d| d.join("tftpboot"))
-                .unwrap_or_else(|| "tftpboot".into());
-            let _ = std::fs::create_dir_all(&dir);
-            Some(dir.to_string_lossy().into_owned())
+            // A bare relative name, like `nvram`/`disks` — it lives in this
+            // machine's own folder (the working directory tracks whichever
+            // machine is selected; see `switch_to`/`enter_directory`), not a
+            // folder shared by every machine. Create it now so an enabled
+            // server never serves an empty path.
+            let dir = "tftpboot";
+            let _ = std::fs::create_dir_all(dir);
+            Some(dir.to_string())
         } else {
             None
         };
@@ -2038,7 +2039,7 @@ fn show_perfetto(ui: &mut Ui) {
 
 fn show_ci(ui: &mut Ui, cfg: &mut MachineConfig) -> ConfigAction {
     ui.heading("CI / Automation");
-    ui.label("Export TOML then run iris with ci=true — same hardware as GUI. Windows default socket: 127.0.0.1:19851");
+    ui.label("Run `iris --config <machine folder>/<name>.toml` with ci=true from that folder — same hardware as GUI. Windows default socket: 127.0.0.1:19851");
     Grid::new("ci_grid").num_columns(2).striped(true).show(ui, |ui| {
         ui.label("Enable CI mode");
         ui.checkbox(&mut cfg.ci, "");

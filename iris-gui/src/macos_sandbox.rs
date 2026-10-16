@@ -193,18 +193,40 @@ mod tests {
         let path = temp_file(".raw");
         let mut cfg = MachineConfig::default();
         cfg.scsi.get_mut(&1).unwrap().path = path.clone();
-        cfg.prom = "prom.bin".into(); // missing → skipped
+        cfg.prom = "prom.bin".into(); // relative, and missing → skipped
 
         let paths = config_paths(&cfg, Path::new("/tmp/iris-machine"));
         let key = Path::new(&path).canonicalize().unwrap().to_string_lossy().into_owned();
         assert!(paths.contains(&key), "absolute scsi image should be collected");
-        assert!(!paths.iter().any(|p| p == "prom.bin"), "relative paths should be skipped");
+        assert!(
+            !paths.iter().any(|p| p.ends_with("prom.bin")),
+            "a relative path that doesn't exist anywhere should be skipped"
+        );
 
         let mut bm = BTreeMap::new();
         harvest(paths.iter().map(String::as_str), &mut bm);
         assert!(bm.contains_key(&key), "accessible image should be bookmarked");
 
         restore(&bm); // must not panic
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_paths_resolves_relative_against_machine_dir() {
+        let path = temp_file(".bin");
+        let machine_dir = Path::new(&path).parent().unwrap().to_path_buf();
+        let relative_name = Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+
+        let mut cfg = MachineConfig::default();
+        cfg.nveeprom = relative_name.clone();
+
+        let paths = config_paths(&cfg, &machine_dir);
+        let key = Path::new(&path).canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(
+            paths.contains(&key),
+            "an existing relative nveeprom path should resolve against the machine folder, not be skipped"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }
