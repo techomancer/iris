@@ -826,7 +826,9 @@ impl Gl {
             }
             0x4A..=0x59 => Some(self.proj.get()[(addr - 0x4A) as usize].to_bits()),
             0x6A..=0x79 => Some(self.tex.get()[(addr - 0x6A) as usize].to_bits()),
-            _ => self.query_word(addr),
+            // Pixel pipeline memory (PIXEL_STATE / INIT_PIXEL_STATE_ERAM
+            // words) as loaded; test/gltest/gepeek.c reads it this way.
+            _ => self.query_word(addr).or_else(|| self.pix.loaded(addr).then(|| self.pix.read(addr))),
         }
     }
 

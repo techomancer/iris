@@ -1582,6 +1582,28 @@ fn gl_return_mode(m: &Mgras, addr: u32) -> u32 {
     read(m, 32, 0x70014) as u32
 }
 
+/// Pixel pipeline memory reads back as loaded (test/gltest/gepeek.c's
+/// ge:ADDR): a PIXEL_STATE block at 0x1D6 (libGLcore's colour-index host
+/// draw, traced), then __MGR_RETURN_MODE of each word; a word never loaded
+/// answers 0.
+#[test]
+fn pixel_state_reads_back_as_loaded() {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    let block = [0x204u32, 0x1A000, 0, 5, 8, 0xFFFF_FFFF];
+    let mut d = vec![1, 1, 0x18, 0x1D6, 0, 0, 6];
+    d.extend_from_slice(&block);
+    d.push(6);
+    d.extend_from_slice(&block);
+    fifo_token(&m, 0x080, &d);
+    for (k, &w) in block.iter().enumerate() {
+        assert_eq!(gl_return_mode(&m, 0x1D6 + k as u32), w, "word {k}");
+    }
+    assert_eq!(gl_return_mode(&m, 0x1DC), 0, "never loaded");
+    m.stop_engines();
+}
+
 /// An unaligned pixel data command (libGLcore's rows at UNPACK_ALIGNMENT
 /// 1, traced): byte count 16 starting at byte 1 of the first word comes as
 /// five words and a pad. The command after it must parse (here a readback
