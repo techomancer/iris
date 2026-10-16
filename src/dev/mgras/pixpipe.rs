@@ -104,6 +104,11 @@ pub struct PixMem {
     /// Words in the program at 0x13B, as its last write gave them (a
     /// shorter program leaves the end of the one before it in memory).
     pub prog_len: u32,
+    /// Which words of `ge` then `eram` a state write has loaded, a bit
+    /// each. libGLcore's fast glCopyPixels runs a program whose module
+    /// states it never sends (the MASK state at 0x1D6, the element type
+    /// at 0xDBB): it counts on what the GE holds, which we do not have.
+    pub loaded: [u32; (GE_WORDS + ERAM_WORDS) / 32],
 }
 
 /// The GE's colour-table memory (glPixelMap tables, INIT_COLOR_TABLE
@@ -141,7 +146,26 @@ impl PixMem {
     pub fn write(&mut self, addr: u32, v: u32) {
         if let Some(w) = self.word_mut(addr) {
             *w = v;
+            if let Some(i) = Self::slot(addr) {
+                self.loaded[i / 32] |= 1 << (i % 32);
+            }
         }
+    }
+
+    /// `addr`'s index in `loaded`.
+    fn slot(addr: u32) -> Option<usize> {
+        if (GE_BASE..GE_BASE + GE_WORDS as u32).contains(&addr) {
+            return Some((addr - GE_BASE) as usize);
+        }
+        if (ERAM_BASE..ERAM_BASE + ERAM_WORDS as u32).contains(&addr) {
+            return Some(GE_WORDS + (addr - ERAM_BASE) as usize);
+        }
+        None
+    }
+
+    /// Whether a state write has loaded the word at `addr`.
+    pub fn loaded(&self, addr: u32) -> bool {
+        Self::slot(addr).is_some_and(|i| self.loaded[i / 32] >> (i % 32) & 1 != 0)
     }
 
     fn word_mut(&mut self, addr: u32) -> Option<&mut u32> {
@@ -232,7 +256,9 @@ impl PixMem {
     pub fn input_shape(&self, out_comps: usize) -> (usize, usize, Elem) {
         let mods = self.modules();
         let first = mods.first().map(|m| m.0).unwrap_or(0);
-        let code = self.read(ELEMENT_TYPE);
+        // Never loaded (a fast glCopyPixels): as the 32-bit code, its
+        // size then taken from the bytes that came (`input_shape_fit`).
+        let code = if self.loaded(ELEMENT_TYPE) { self.read(ELEMENT_TYPE) } else { 4 };
         let elem = match code {
             0 => Elem::S8,
             1 => Elem::U8,
@@ -402,6 +428,10 @@ impl PixMem {
                     v = v.chunks(n).flat_map(|p| keep.iter().map(move |&k| p.get(k).copied().unwrap_or(0.0))).collect();
                     per_px = keep.len();
                 }
+                // A state never loaded (a fast glCopyPixels' MASK): the
+                // indices as they are, GL's copy without transfer
+                // operations (libGLcore's own host draws load all ones).
+                entry::MASK if !self.loaded(st + 5) => {}
                 entry::MASK => {
                     let m = self.read(st + 5);
                     for x in v.iter_mut() {
@@ -476,6 +506,23 @@ mod tests {
         for (k, &w) in words.iter().enumerate() {
             m.write(addr + k as u32, w);
         }
+    }
+
+    /// A fast glCopyPixels on a colour-index visual (PowerAnimator's front
+    /// to back copies, test/gltest/cicopy.c): the program is MASK then
+    /// pipecontrol, and libGLcore sends neither MASK's state nor the
+    /// element type. The 16-bit indices the readback produced come through
+    /// as they are.
+    #[test]
+    fn ci_copy_with_unloaded_mask_state() {
+        let lut = Lut::default();
+        let m = mem(&[entry::MASK, 0, entry::PIPECONTROL, 0x1D6]);
+        let row = [0x08u8, 0x06, 0x08, 0x00, 0x0F, 0xFF];
+        assert_eq!(m.run_row(&lut.0[..], &row, 3, 1), [0x806 as f64, 0x800 as f64, 0xFFF as f64]);
+        // Once a host draw has loaded it, the mask applies.
+        let mut m = m;
+        put(&mut m, 0x1D6, &[0x204, 0x1A000, 0, 5, 8, 0xFF]);
+        assert_eq!(m.run_row(&lut.0[..], &row, 3, 1), [6.0, 0.0, 255.0]);
     }
 
     /// glDrawPixels(GL_RGBA, GL_UNSIGNED_BYTE), traced: bytes to floats,

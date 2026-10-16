@@ -2407,6 +2407,104 @@ static void t_ci(void)
         ci_border(100, 60, w, h, 2);
         end();
     }
+    /* PowerAnimator's front/back copies: glCopyPixels between the buffers
+       of a double-buffered window, under the index masks and logic ops it
+       draws with. Variant bits: 1 back to front (else front to back),
+       2 index mask 0x807 set before the copy, 4 mask 0xF80 left set and
+       full mask restored, 8 logic op XOR during an earlier draw, 16 zoom
+       1,1 set explicitly. */
+    if (have_db) {
+        static const char *vn[] = { "front-to-back", "back-to-front" };
+        int v;
+        for (v = 0; v < 32; v++) {
+            GLuint src[13 * 5];
+            unsigned exp[13 * 5];
+            unsigned m = (v & 2) ? 0x807u & ci_mask : ci_mask;
+            GLenum from = (v & 1) ? GL_BACK : GL_FRONT, to = (v & 1) ? GL_FRONT : GL_BACK;
+            if (!begin("ci%d/copy/%s%s%s%s%s", ci_bits, vn[v & 1], (v & 2) ? "/mask807" : "",
+                       (v & 4) ? "/mask-f80-restored" : "", (v & 8) ? "/xor-before" : "", (v & 16) ? "/zoom1" : ""))
+                continue;
+            reset_state();
+            glDrawBuffer(GL_FRONT_AND_BACK);
+            ci_clear();
+            for (i = 0; i < w * h; i++)
+                src[i] = ci_pat(i % w, i / w);
+            if (v & 8) {
+                glEnable(GL_INDEX_LOGIC_OP);
+                glLogicOp(GL_XOR);
+                glIndexi(5);
+                glRecti(0, 0, 4, 4);
+                glDisable(GL_INDEX_LOGIC_OP);
+            }
+            if (v & 4) {
+                glIndexMask(0xF80);
+                glIndexi(0x80);
+                glRecti(200, 200, 204, 204);
+                glIndexMask(~0u);
+            }
+            glDrawBuffer(from);
+            glRasterPos2i(20, 30);
+            glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, src);
+            glReadBuffer(from);
+            glDrawBuffer(to);
+            glIndexMask(m);
+            if (v & 16)
+                glPixelZoom(1.0f, 1.0f);
+            glRasterPos2i(100, 60);
+            glCopyPixels(20, 30, w, h, GL_COLOR);
+            glIndexMask(~0u);
+            for (i = 0; i < w * h; i++)
+                exp[i] = (CI_BG & ~m) | (src[i] & m);
+            glFinish();
+            glReadBuffer(to);
+            {
+                GLuint *got = malloc(w * h * sizeof *got);
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                glReadPixels(100, 60, w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, got);
+                for (i = 0; i < w * h && cur_bad < 4; i++)
+                    if ((got[i] & ci_mask) != exp[i])
+                        note("(%d,%d) index %u want %u", i % w, i / w, got[i] & ci_mask, exp[i]);
+                free(got);
+            }
+            end();
+        }
+        /* The same through the host, as glReadPixels + glDrawPixels with
+           16-bit indices (what PowerAnimator's copies look like on the bus). */
+        for (v = 0; v < 2; v++) {
+            GLushort buf[13 * 5];
+            GLuint src[13 * 5];
+            unsigned exp[13 * 5];
+            if (!begin("ci%d/readdraw/%s/UNSIGNED_SHORT", ci_bits, vn[v]))
+                continue;
+            reset_state();
+            glDrawBuffer(GL_FRONT_AND_BACK);
+            ci_clear();
+            for (i = 0; i < w * h; i++)
+                src[i] = exp[i] = ci_pat(i % w, i / w);
+            glDrawBuffer(v ? GL_BACK : GL_FRONT);
+            glRasterPos2i(20, 30);
+            glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, src);
+            glReadBuffer(v ? GL_BACK : GL_FRONT);
+            glPixelStorei(GL_PACK_ALIGNMENT, 2);
+            glReadPixels(20, 30, w, h, GL_COLOR_INDEX, GL_UNSIGNED_SHORT, buf);
+            glDrawBuffer(v ? GL_FRONT : GL_BACK);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+            glRasterPos2i(100, 60);
+            glDrawPixels(w, h, GL_COLOR_INDEX, GL_UNSIGNED_SHORT, buf);
+            glFinish();
+            glReadBuffer(v ? GL_FRONT : GL_BACK);
+            {
+                GLuint *got = malloc(w * h * sizeof *got);
+                glPixelStorei(GL_PACK_ALIGNMENT, 4);
+                glReadPixels(100, 60, w, h, GL_COLOR_INDEX, GL_UNSIGNED_INT, got);
+                for (i = 0; i < w * h && cur_bad < 4; i++)
+                    if ((got[i] & ci_mask) != exp[i])
+                        note("(%d,%d) index %u want %u (host %u)", i % w, i / w, got[i] & ci_mask, exp[i], buf[i]);
+                free(got);
+            }
+            end();
+        }
+    }
     /* Reading a CI buffer as RGBA goes through the I_TO_RGBA maps. */
     if (begin("ci%d/read/RGBA/via-maps", ci_bits)) {
         GLuint src[13 * 5];
