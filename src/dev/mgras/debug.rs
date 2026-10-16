@@ -513,6 +513,12 @@ impl Mgras {
         writeln!(w, "  blocks by type {}  fast fills {}", blocks.join(" "), r.fast_fills)?;
         writeln!(w, "  stipple chunks {}  PIO dw written {} read {}  DMA lines in {} (dropped, no write armed: {})",
             r.stipple_chunks, r.pio_write_dw, r.pio_read_dw, r.dma_lines_in, r.dma_lines_dropped)?;
+        for id in 0..self.nrss {
+            // SAFETY: as above.
+            let r = unsafe { &*self.engine_cell(id).get() }.stats;
+            writeln!(w, "  engine {id}: DMA lines in {}, to the texture engine {}, by the JIT {}, dropped {}; interpreted pixels stored {} clipped {}",
+                r.dma_lines_in, r.dma_lines_te, r.dma_lines_jit, r.dma_lines_dropped, r.dma_px_put, r.dma_px_clipped)?;
+        }
         #[cfg(feature = "gr4-jit")]
         {
             // SAFETY: as above.

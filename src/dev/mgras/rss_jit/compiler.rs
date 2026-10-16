@@ -617,6 +617,11 @@ impl<'a> E<'a> {
         if let (true, Some(layout)) = (pair, k.pix.pair_layout()) {
             v = self.pair_pack(r, x, v, layout);
         }
+        // Colour index: the index in both 12-bit halves (`rss::ci_pixtype`).
+        if !overlay && k.pix == Pix::Ci12 {
+            let i = self.b.ins().band_imm_s(v, 0xFFF);
+            v = self.b.ins().imul_imm_s(i, 0x1001);
+        }
         if let Some(op) = k.logic {
             let r = self.logic_op(op, v, old.unwrap());
             v = self.b.ins().band(r, lop_width);

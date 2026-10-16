@@ -455,6 +455,17 @@ pub(super) const DRAW_A_AND_B: u32 = 0x03;
 pub(super) const DRAW_B_PAGE: u32 = 0x04;
 pub(super) const DRAW_A_AND_B_PAGE: u32 = 0x05;
 
+/// Colour-index pixel types (fill mode bits 10:8 = 4..=7: libGLcore's CI12
+/// 0x400, CI8 0x500 / 0x600, the X server's CI8 windows 0xC004504). A
+/// double-buffered colour-index window keeps both buffers in one word, A
+/// in bits 11:0 and B in bits 23:12 (libGLcore's masks 0xFFF / 0xFFF000,
+/// DRAW_BUFFER 2 for B as in the other 12-bit visuals), so the X server's
+/// whole-word copies (window moves) carry both. Writes put the index in
+/// both halves and the plane mask picks; draw field 2 / 3 stay on the page.
+pub(super) fn ci_pixtype(pp1fillmode: u32) -> bool {
+    !rgb_pixtype(pp1fillmode)
+}
+
 /// Whether draw field `f` writes buffer B only (2, or 4 as a second page).
 pub(super) fn draws_b(f: u32) -> bool {
     f == DRAW_B || f == DRAW_B_PAGE
@@ -503,10 +514,13 @@ mod block {
     pub const DMA_WRITE: u32 = 5;
 }
 
-/// Whether the pixel processors' pixel type (fill mode bits 10:8) is an RGB
-/// one; the others are colour index.
+/// Whether the pixel processors' pixel type (PP1 fill mode bits 10:8, SGI's
+/// PixType) is an RGB one: 0 4:4:4 pairs, 1 5:5:5 pairs, 2 RGBA8888
+/// (SGI's diagnostics: "32-bit rgba"), 3 RGB121212 (also the X server's
+/// 24-bit windows, fill mode 0xC006304). 4-7 are colour index (`ci_pixtype`).
+/// The pixel type alone says which; the plane masks do not.
 pub(super) fn rgb_pixtype(pp1fillmode: u32) -> bool {
-    matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2)
+    (pp1fillmode >> 8) & 7 <= 3
 }
 
 /// 36-bit RGB pixels (pixel type 3 with bit 13): 12 bits a component,
@@ -1034,6 +1048,14 @@ pub struct RssStats {
     pub dma_lines_in: u64,
     /// DMA lines that came with no write transfer armed, dropped.
     pub dma_lines_dropped: u64,
+    /// DMA lines that went to the texture engine (a TE load armed).
+    pub dma_lines_te: u64,
+    /// DMA lines drawn by the raster JIT.
+    pub dma_lines_jit: u64,
+    /// Pixels of interpreted DMA lines: stored, and outside the visible
+    /// region (screen masks, clip IDs, the other engine's rows).
+    pub dma_px_put: u64,
+    pub dma_px_clipped: u64,
 }
 
 /// Registers a GL batch leaves as it set them when it ends (`gl_leave`
@@ -1472,7 +1494,7 @@ impl Rss {
     /// with other pixel types; colour-index drawing masks 8 or 12 planes, or
     /// all 32 when the PROM and kernel draw).
     pub(super) fn rgb_mode(&self) -> bool {
-        rgb_pixtype(self.reg(reg::PP1FILLMODE)) || self.reg(reg::COLORMASKLSBSA) == 0xFF_FFFF || self.deep36()
+        rgb_pixtype(self.reg(reg::PP1FILLMODE))
     }
 
     /// A 36-bit RGB write that reaches the low-nibble planes (35:24):
@@ -1537,7 +1559,7 @@ impl Rss {
         let drb = self.reg(reg::DRBPOINTERS);
         let pp1 = self.reg(reg::PP1FILLMODE);
         let ptr = match self.second_buffer() {
-            Some(b) if kind == Kind::Wide && draws_b(draw_buffer(pp1)) && !rgb12_pair(pp1) => b,
+            Some(b) if kind == Kind::Wide && draws_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) => b,
             _ => drb,
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
@@ -1565,7 +1587,7 @@ impl Rss {
         }
         let b = self.target();
         self.put_in(b, x, y, v, draws_b(field));
-        if draws_a_and_b(field) && !(b.kind == Kind::Wide && rgb12_pair(self.reg(reg::PP1FILLMODE))) {
+        if draws_a_and_b(field) && !(b.kind == Kind::Wide && (rgb12_pair(self.reg(reg::PP1FILLMODE)) || ci_pixtype(self.reg(reg::PP1FILLMODE)))) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 // The 12-bit X visuals can give A and B the same page.
@@ -1584,9 +1606,7 @@ impl Rss {
             return;
         }
         let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA });
-        // A write through all planes (window moves copy the screen that way,
-        // 24 bits a pixel) keeps the whole value; so does RGB.
-        let wide = rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
+        let wide = rgb_pixtype(pp1);
         let old = self.mem.get(&b, x as u32, y as u32) as u32;
         if let (Kind::Wide, Some(pair)) = (b.kind, Pair::of(pp1)) {
             let v = pair.pack(pp1, v, x, y);
@@ -1597,8 +1617,12 @@ impl Rss {
             self.mem.put(&b, x as u32, y as u32, ((old & !mask) | (v & mask)) as u64);
             return;
         }
+        // Colour index: the index in both 12-bit halves (A 11:0, B 23:12;
+        // the plane mask picks, see `ci_pixtype`).
+        let ci = b.kind == Kind::Wide && ci_pixtype(pp1);
+        let v = if ci { (v & 0xFFF) * 0x1001 } else { v };
         let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 {
-            let width = if (pp1 >> 8) & 7 == 2 { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF };
+            let width = if (pp1 >> 8) & 7 == 2 { u32::MAX } else if wide || ci { 0xFF_FFFF } else { 0xFFF };
             logic_op(pp1 >> 26, v, old) & width
         } else {
             v
@@ -1612,8 +1636,8 @@ impl Rss {
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
             let mask = lsb;
             (old & !mask) | (v & mask)
-        } else if b.kind == Kind::Wide && matches!((pp1 >> 8) & 7, 4 | 6) {
-            let mask = lsb & 0xFFF;
+        } else if ci {
+            let mask = lsb & 0xFF_FFFF;
             (old & !mask) | (v & mask)
         } else {
             v
@@ -1668,7 +1692,8 @@ impl Rss {
         let pp1 = self.reg(reg::PP1FILLMODE);
         let (ptr, kind) = match read_buffer(pp1) {
             READ_OVERLAY => (drb, Kind::Overlay),
-            READ_B if !rgb12_pair(pp1) => (self.second_buffer().unwrap_or(drb), Kind::Wide),
+            // 12-bit pairs and colour index keep B in A's words.
+            READ_B if !rgb12_pair(pp1) && !ci_pixtype(pp1) => (self.second_buffer().unwrap_or(drb), Kind::Wide),
             _ => (drb, Kind::Wide),
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
@@ -1693,6 +1718,10 @@ impl Rss {
         let pp1 = self.reg(reg::PP1FILLMODE);
         if rgb36(pp1) && read_buffer(pp1) != READ_OVERLAY {
             return w & 0xFF_FFFF;
+        }
+        // A colour-index window's B buffer: the word's high half.
+        if ci_pixtype(pp1) && read_buffer(pp1) == READ_B {
+            return (w >> 12) & 0xFFF;
         }
         match (read_buffer(pp1), Pair::of(pp1)) {
             (r @ (0 | READ_B), Some(pair)) => pair.unpack(w, r == READ_B),
@@ -2259,7 +2288,7 @@ impl Rss {
         let pp1 = self.reg(reg::PP1FILLMODE);
         let b = self.target();
         self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
-        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) {
+        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 if b2 != b {
@@ -2440,9 +2469,18 @@ impl Rss {
         }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::xfer_line(self, x, line, bytes) {
+            self.stats.dma_lines_jit += 1;
             return;
         }
         let bpp = x.bpp as usize;
+        for k in 0..(bytes.len() / bpp.max(1)).min(x.width as usize) {
+            let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+            if self.visible(fx, fy) {
+                self.stats.dma_px_put += 1;
+            } else if self.owns_row(fy) {
+                self.stats.dma_px_clipped += 1;
+            }
+        }
         if generic_format(x.format) {
             for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
                 let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
@@ -2627,6 +2665,7 @@ impl Rss {
     pub fn dma_write_line(&mut self, line: u32, bytes: &[u8]) {
         self.stats.dma_lines_in += 1;
         if self.te_load != 0 {
+            self.stats.dma_lines_te += 1;
             self.te_write(true, |te, regs| te.load_line(regs, line, bytes));
             return;
         }
@@ -2683,8 +2722,11 @@ mod tests {
         r.write(reg::XYWIN, 1023 << 16, false);
         r.write(reg::DRBSIZE, 0x31E, false);
         r.write(reg::DRBPOINTERS, 0x240, false);
-        // All planes writable, as the X server sets them.
-        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        // A colour-index window's buffer A, planes 11:0 (the X server's CI8
+        // windows write through 0xFF; colour index takes no other planes,
+        // see `ci_pixtype`).
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFFF, false);
         r.write(reg::PP1FILLMODE, 0x0C00_4504, false);
         r
     }
@@ -2751,21 +2793,114 @@ mod tests {
     /// The draw-buffer field picks DRBpointers' first page (1), its second
     /// (2) or both (3): an X double-buffered window draws its back buffer
     /// with 2 while the screen shows A.
+    /// PowerAnimator's back-to-front copy: fill B (field 2), read B by
+    /// DMA (read field B, 16-bit index), write the bytes into A (field 1).
+    #[test]
+    fn ci_back_to_front_copy_through_the_host() {
+        let mut r = x_server();
+        #[cfg(feature = "gr4-jit")]
+        {
+            r.jit.mode = super::super::rss_jit::MODE_SYNC;
+        }
+        r.write(reg::PP1FILLMODE, 0x0C00_8404, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF000, false);
+        r.write(reg::COLORMASKLSBSB, 0xFFF000, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 0x800, false);
+        block(&mut r, 10, 5, 11, 5);
+        assert_eq!(px(&r, 10, 5) & 0xFF_FFFF, 0x800_000);
+        r.write(reg::XFRSIZE, 1 << 16 | 2, false);
+        r.write(reg::XFRMODE, 0xC1_8001, false);
+        r.write(reg::PP1FILLMODE, 0x0C20_4404, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFFF, false);
+        r.write(reg::FILLMODE, 0x100_0000, false);
+        block(&mut r, 10, 5, 11, 5);
+        let bytes = r.dma_read_line(0);
+        assert_eq!(bytes, [0x08, 0x00, 0x08, 0x00], "B's index, 16 bits");
+        r.write(reg::PP1FILLMODE, 0x0C00_4404, false);
+        r.write(reg::FILLMODE, 0x1140_0000, false);
+        block(&mut r, 10, 5, 11, 5);
+        r.dma_write_line(0, &bytes);
+        assert_eq!(px(&r, 10, 5) & 0xFF_FFFF, 0x800_800, "A now holds the copy");
+        // And back into B with PowerAnimator's whole context (traced).
+        for (k, v) in [
+            (reg::PP1WINMODE, 1),
+            (reg::ZMODE, 0),
+            (reg::AFUNCMODE, 7),
+            (reg::STENCILMODE, 7),
+            (reg::STENCILMASK, 0xFFFF),
+            (crate::dev::mgras::te1::reg::TEXMODE1, 0x40440),
+            (reg::PP1FILLMODE, 0x0C00_8404),
+            (reg::COLORMASKLSBSA, 0xFFF000),
+            (reg::COLORMASKLSBSB, 0xFFF000),
+            (reg::FILLMODE, 0x1140_0000),
+            (reg::XFRMODE, 0xC0_8001),
+        ] {
+            r.write(k, v, false);
+        }
+        block(&mut r, 10, 5, 11, 5);
+        r.dma_write_line(0, &[0x08, 0x06, 0x08, 0x02]);
+        assert_eq!(px(&r, 10, 5) & 0xFF_FFFF, 0x806_800, "B by DMA in PowerAnimator's context");
+    }
+
+    /// A double-buffered colour-index window keeps both buffers in one
+    /// word (A 11:0, B 23:12), not on a second page: the X server moves
+    /// windows with whole-word copies, which must carry both (PowerAnimator
+    /// lost its menus to a window move when B lived on the second page).
+    #[test]
+    fn ci_double_buffer_is_two_halves_of_one_word() {
+        let mut r = x_server();
+        let a = r.reg(reg::DRBPOINTERS) & 0x3FF;
+        let b_page = a + 0x100;
+        r.write(reg::DRBPOINTERS, (r.reg(reg::DRBPOINTERS) & !0xF_FFFF) | b_page << 10 | a, false);
+        let ci = (r.reg(reg::PP1FILLMODE) & !((0x7F << 14) | 0x700)) | 0x600;
+        let word = |r: &Rss, page: u32| {
+            let buf = Buffer::new(page, Kind::Wide, r.reg(reg::DRBSIZE));
+            r.mem.get(&buf, 10, (SCREEN_H - 1 - 5) as u32) as u32
+        };
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        for (field, mask, c) in [(1u32, 0xFFFu32, 0x123u32), (2, 0xFFF000, 0x456)] {
+            r.write(reg::PP1FILLMODE, ci | field << 14, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::COLORMASKLSBSB, mask, false);
+            r.write(reg::FILL_COLOR_R, c, false);
+            block(&mut r, 10, 5, 10, 5);
+        }
+        assert_eq!(word(&r, a) & 0xFF_FFFF, 0x456_123, "A in 11:0, B in 23:12 of A's page");
+        assert_eq!(word(&r, b_page), 0, "the second page untouched");
+        // Field 3 writes both halves of the same word.
+        r.write(reg::PP1FILLMODE, ci | 3 << 14, false);
+        r.write(reg::COLORMASKLSBSA, 0xFF_FFFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFF_FFFF, false);
+        r.write(reg::FILL_COLOR_R, 0x789, false);
+        block(&mut r, 10, 5, 10, 5);
+        assert_eq!(word(&r, a) & 0xFF_FFFF, 0x789_789);
+        assert_eq!(word(&r, b_page), 0);
+        // Reading B (read field 1) takes the high half.
+        r.write(reg::PP1FILLMODE, ci | 1 << 21, false);
+        assert_eq!(r.get(10, (SCREEN_H - 1 - 5) as i32), 0x789);
+    }
+
     #[test]
     fn draw_buffer_field_picks_a_b_or_both() {
         let mut r = x_server();
         let a = r.reg(reg::DRBPOINTERS) & 0x3FF;
         let b_page = a + 0x100;
         r.write(reg::DRBPOINTERS, (r.reg(reg::DRBPOINTERS) & !0xF_FFFF) | b_page << 10 | a, false);
-        let fm = r.reg(reg::PP1FILLMODE) & !(0x7F << 14);
+        // An RGB window (RGBA8888): fields 2 and 3 name the second page here
+        // (colour index keeps B in the word's high half instead).
+        let fm = (r.reg(reg::PP1FILLMODE) & !((0x7F << 14) | 0x700)) | 0x200;
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKLSBSB, u32::MAX, false);
         let read = |r: &Rss, page: u32, x: u32, y: u32| {
             let buf = Buffer::new(page, Kind::Wide, r.reg(reg::DRBSIZE));
-            r.mem.get(&buf, x, (SCREEN_H - 1 - y as usize) as u32) as u32 & 0xFFF
+            r.mem.get(&buf, x, (SCREEN_H - 1 - y as usize) as u32) as u32 & 0xFF
         };
         r.write(reg::FILLMODE, FILL_FAST, false);
         for (field, x, c) in [(1u32, 10, 0x11), (2, 20, 0x22), (3, 30, 0x33), (4, 40, 0x44), (5, 50, 0x55)] {
             r.write(reg::PP1FILLMODE, fm | field << 14, false);
-            r.write(reg::FILL_COLOR_R, c, false);
+            r.write(reg::FILL_COLOR_R, c << 4, false);
             block(&mut r, x, 5, x, 5);
         }
         assert_eq!([read(&r, a, 10, 5), read(&r, b_page, 10, 5)], [0x11, 0], "field 1: A");
@@ -3004,6 +3139,7 @@ mod tests {
     fn rgb_fast_fill_packs_components() {
         let mut r = x_server();
         r.write(reg::PP1FILLMODE, 3 << 26 | 0x2204, false); // RGBA8888, copy
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
         r.write(reg::FILLMODE, FILL_FAST, false);
         r.write(reg::FILL_COLOR_R, 0xF00, false);
         r.write(reg::FILL_COLOR_G, 0x800, false);

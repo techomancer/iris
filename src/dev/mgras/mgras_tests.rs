@@ -61,8 +61,10 @@ fn x_server(m: &Mgras) {
     // The PROM's 1280x1024 layout: draw into the main buffer at page 0x240.
     direct_rss(m, DRBSIZE, 0x31E, false);
     direct_rss(m, DRBPOINTERS, 0x240, false);
-    // All planes writable, as the X server sets them.
-    direct_rss(m, 0x163, u32::MAX, false);
+    // A colour-index window's buffer A, planes 11:0 (the X server's CI8
+    // windows write through 0xFF; colour index takes no other planes, see
+    // `rss::ci_pixtype`).
+    direct_rss(m, 0x163, 0xFFF, false);
     direct_rss(m, PP1FILLMODE, 0x0C00_4504, false);
 }
 
@@ -190,6 +192,32 @@ fn dma_write_from_host_memory() {
     m.stop_engines();
 }
 
+/// PowerAnimator's front-to-back copy on both boards: 16-bit indices by
+/// DMA into buffer B (draw field 2, planes 23:12) of a CI12 window.
+#[test]
+fn ci_dma_write_into_buffer_b() {
+    for kind in [crate::config::GraphicsBoard::HighImpact, crate::config::GraphicsBoard::MaxImpact] {
+        let m = super::record::tests::live_board_of(kind);
+        x_server(&m);
+        let mem = dma_setup(&m);
+        fifo_dma(&m, 0x08, 2); // bytes a line
+        for (a, b) in [(0x2000, 0x08u8), (0x2001, 0x06), (0x2004, 0x08), (0x2005, 0x02)] {
+            mem.bytes.lock().insert(a, b);
+        }
+        direct_rss(&m, PP1FILLMODE, 0x0C00_8404, false);
+        direct_rss(&m, 0x163, 0xFFF000, false); // ColorMaskLSBsA
+        direct_rss(&m, 0x164, 0xFFF000, false); // ColorMaskLSBsB
+        direct_rss(&m, FILLMODE, 0x1140_0000, false);
+        direct_rss(&m, XFRMODE, 0xC0_8001, false);
+        direct_rss(&m, XFRSIZE, 2 << 16 | 1, false);
+        block(&m, 10, 10, 10, 11);
+        fifo_dma(&m, 0x0B, 1); // start: run, pool 0, host to board
+        let got = [m.fb_pixel(10, 10) & 0xFFF000, m.fb_pixel(10, 11) & 0xFFF000];
+        assert_eq!(got, [0x806_000, 0x802_000], "{kind:?}");
+        m.stop_engines();
+    }
+}
+
 #[test]
 fn dma_read_to_host_memory() {
     let m = live_board();
@@ -273,7 +301,7 @@ fn text_recording_replays() {
          W 32 7c584 c004504
          W 32 7c5b8 31e
          W 32 7c5b4 240
-         W 32 7c58c ffffffff
+         W 32 7c58c fff
          W 32 7c440 100000
          W 32 7c5d8 44
          W 32 7c114 18
@@ -346,8 +374,8 @@ fn frame_composes_runs_overlay_and_cursor() {
     }
     f.cmap[0x100 + 5] = 0x11_2233;
     f.cmap[0x200 + 7] = 0x44_5566;
-    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100, pair: None };
-    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0, pair: None };
+    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100, index_mask: 0xFFF, pair: None };
+    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0, index_mask: 0xFFF, pair: None };
     f.overlay_mode[2] = OverlayMode { on: true, cmap_base: 0x200 };
     f.did_main[10] = 3;
     f.main[10] = 5;
@@ -362,6 +390,28 @@ fn frame_composes_runs_overlay_and_cursor() {
     assert_eq!(out[10], 0xFF33_2211, "CI through cmap block, red in the low byte");
     assert_eq!(out[11], 0xFF80_4020 & 0xFFFF_FFFF, "RGB as stored");
     assert_eq!(out[12], 0xFF66_5544, "overlay over the main planes");
+}
+
+/// A CI8 window ID (XMAP format 1) shows planes 7:0 only: the X server
+/// draws it through mask 0xFF, so the planes above keep what an earlier
+/// window left there (a 24-bit login screen, a 12-bit pair window).
+#[test]
+fn ci8_window_shows_eight_planes() {
+    use super::frame::{Frame, H, OUT_STRIDE, W};
+    let mut f = super::plain::boxed_zeroed::<Frame>();
+    (f.width, f.height) = (W, H);
+    for (i, g) in f.gamma.iter_mut().enumerate() {
+        *g = [i as u8; 3];
+    }
+    f.cmap[0x23] = 0x56_5656;
+    // The desktop's mode word from an IRIX 6.5.22 boot (format 1, block 0).
+    f.main_mode[1] = super::frame::MainMode::of(0x601 & !(0x1F << 5));
+    assert_eq!(super::frame::MainMode::of(0x403).index_mask, 0xFFF, "format 3: 12 planes");
+    f.did_main[10] = 1;
+    f.main[10] = 0x00A0_8523;
+    let mut out = vec![0u32; OUT_STRIDE * H];
+    f.compose(&mut out);
+    assert_eq!(out[10], 0xFF56_5656, "index 0x23, stale planes 23:8 ignored");
 }
 
 /// Probe: the display size a recording's final state programs into the VC3.
@@ -593,7 +643,7 @@ fn gl_draws_only_where_the_clip_id_matches() {
     fifo_rss(&m, FILLMODE, FILL_FAST, false);
     fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
     block(&m, 60, 1000, 60, 1000);
-    assert_eq!(m.fb_pixel(60, 1000), 0x2A);
+    assert_eq!(m.fb_pixel(60, 1000) & 0xFFF, 0x2A, "buffer A's index");
     m.stop_engines();
 }
 

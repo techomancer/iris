@@ -1685,14 +1685,14 @@ impl Gl {
             let (a, b) = (w & 0x3FF, (w >> 10) & 0x3FF);
             // 12-bit pairs: both buffers are halves of A's page (the read
             // field below picks the half), whatever DRB's B page says.
-            let back = (self.read_back != 0) != (self.swapped != 0) && !self.rgb12_pair();
+            let back = (self.read_back != 0) != (self.swapped != 0) && !self.rgb12_pair() && !self.ci_pair();
             (w & !0x3FF) | if back { b } else { a }
         };
         sink.rss_write(re::DRBPOINTERS, drb, false);
         if stencil {
             sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
         }
-        if !depth && self.rgb12_pair() {
+        if !depth && (self.rgb12_pair() || self.ci_pair()) {
             // 12-bit pairs: the read field picks the half.
             let b = (self.read_back != 0) != (self.swapped != 0);
             sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0x1F << 21)) | (b as u32) << 21, false);
@@ -2225,8 +2225,8 @@ impl Gl {
     /// field 3 writes both pages) and for the overlay.
     fn draw_pointers(&self) -> u32 {
         let drb = self.window.drb;
-        // 12-bit pairs: both buffers are in A's pages.
-        if self.rgb12_pair() {
+        // 12-bit pairs and colour index: both buffers are in A's pages.
+        if self.rgb12_pair() || self.ci_pair() {
             return drb;
         }
         let a = drb & 0x3FF;
@@ -2342,8 +2342,12 @@ impl Gl {
             let dither = if self.dither != 0 { super::rss::PP1_DITHER } else { 0 };
             return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format & 0x2700 | self.pair_field() << 14 | dither;
         }
+        if self.ci_pair() {
+            // Colour index: A, B or both halves of A's words.
+            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.ci_format() | self.pair_field() << 14;
+        }
         let pp1 = if self.ci != 0 {
-            (PP1_RGB24_BUFFER_A & !0x700) | 0x600
+            (PP1_RGB24_BUFFER_A & !0x2700) | self.ci_format()
         } else if self.rgb36() {
             (PP1_RGB24_BUFFER_A & !0x2700) | 0x2300
         } else {
@@ -2373,6 +2377,21 @@ impl Gl {
             && self.pixel_format & PIXEL_FORMAT_SENT != 0
             && super::rss::rgb12_pair(self.pixel_format & 0x2700)
             && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+    }
+
+    /// A colour-index context's PP1 pixel format (bits 13, 10:8): what
+    /// INIT_FORMAT_VALUES sent (CI12 0x400, CI8 0x500 / 0x600), CI8 before
+    /// it has.
+    fn ci_format(&self) -> u32 {
+        let f = self.pixel_format & 0x2700;
+        if self.pixel_format & PIXEL_FORMAT_SENT != 0 && super::rss::ci_pixtype(f) { f } else { 0x600 }
+    }
+
+    /// A colour-index context drawing its colour buffers (not the
+    /// overlay): both buffers are halves of A's words, as for the 12-bit
+    /// RGB pairs (`rss::ci_pixtype`).
+    fn ci_pair(&self) -> bool {
+        self.ci != 0 && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
     }
 
     /// An RGB context whose visual is 12:12:12 (INIT_FORMAT_VALUES 0x2300,
@@ -2422,7 +2441,12 @@ impl Gl {
             let f = self.pair_field();
             return ((f & 1) * half(false) | (f >> 1 & 1) * half(true), 0);
         }
-        if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
+        if self.ci != 0 {
+            // A in planes 11:0, B in 23:12 (`rss::ci_pixtype`).
+            let m = self.index_mask & 0xFFF;
+            let f = if self.ci_pair() { self.pair_field() } else { 1 };
+            return ((f & 1) * m | (f >> 1 & 1) * (m << 12), 0);
+        }
         let cm = self.color_mask;
         // ColorMaskLSBs are planes 31:0, ColorMaskMSBs 35:32 (libGLcore:
         // 8,8,8,8 all ones and 0; 12,12,12 all ones and 0xF).

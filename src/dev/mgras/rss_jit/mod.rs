@@ -284,7 +284,7 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     let pp1 = rss.reg(reg::PP1FILLMODE);
     let lsb = rss.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA });
     let msbs = rss.reg(reg::COLORMASKMSBS);
-    let wide = rss::rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
+    let wide = rss::rgb_pixtype(pp1);
     let ptype = (pp1 >> 8) & 7;
     let pair = b.kind == Kind::Wide && rss::rgb12_pair(pp1);
     let mask = if b.kind == Kind::Overlay {
@@ -292,8 +292,9 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     } else if pair || ptype == 2 {
         // Planes 31:0 (ColorMaskMSBs are 35:32, outside these pixels).
         lsb
-    } else if matches!(ptype, 4 | 6) {
-        lsb & 0xFFF
+    } else if rss::ci_pixtype(pp1) {
+        // Both 12-bit halves (`rss::ci_pixtype`).
+        lsb & 0xFF_FFFF
     } else {
         u32::MAX
     };
@@ -301,7 +302,13 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
         ptr: b.ptr,
         xtiles: b.xtiles,
         mask,
-        lop_width: if ptype == 2 || pair { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF },
+        lop_width: if ptype == 2 || pair {
+            u32::MAX
+        } else if wide || b.kind == Kind::Wide {
+            0xFF_FFFF
+        } else {
+            0xFFF
+        },
     }
 }
 
@@ -321,7 +328,7 @@ fn common(rss: &mut Rss) -> PipeKey {
         Draw::Overlay
     } else {
         match rss.second_buffer() {
-            Some(p) if rss::draws_a_and_b(field) && !rss::rgb12_pair(pp1) => {
+            Some(p) if rss::draws_a_and_b(field) && !rss::rgb12_pair(pp1) && !rss::ci_pixtype(pp1) => {
                 let b2 = Buffer::new(p, Kind::Wide, drbsize);
                 if b2 != b {
                     c.tgt[1] = target(rss, b2, true);
@@ -340,7 +347,7 @@ fn common(rss: &mut Rss) -> PipeKey {
             Pix::of_pair(layout, rss::draws_b(field), pp1 & rss::PP1_DITHER != 0)
         }
         2 => Pix::Rgba8,
-        4 | 6 => Pix::Ci12,
+        4..=7 => Pix::Ci12,
         _ => Pix::Plain,
     };
     let winmode = rss.reg(reg::PP1WINMODE);

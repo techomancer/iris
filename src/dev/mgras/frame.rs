@@ -34,15 +34,32 @@ pub const DEFAULT_SIZE: (usize, usize) = (1280, 1024);
 pub const CURSOR_MAX: usize = 64;
 
 /// How a window ID's main planes display. `rgb`: the pixel is `0x00BBGGRR`;
-/// otherwise its low 12 bits index the colormap from `cmap_base`.
+/// otherwise its low `index_mask` bits index the colormap from `cmap_base`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MainMode {
     pub rgb: bool,
     pub cmap_base: u16,
+    /// Colour index planes shown: 8 for format 1 (the X server's CI8
+    /// windows draw through mask 0xFF and leave the planes above alone,
+    /// so they hold whatever an earlier window wrote), 12 otherwise.
+    pub index_mask: u16,
     /// Pixel pairs (see `rss::Pair`) in this layout: buffer A, or B when
     /// the window ID's BUF_SELECT bit is set.
     pub pair: Option<rss::Pair>,
+}
+
+impl MainMode {
+    /// Decode an XMAP main mode word: format in bits 4:0 (4 and up RGB),
+    /// colormap block in 9:5.
+    pub fn of(m: u32) -> Self {
+        MainMode {
+            rgb: m & 0x1F >= 4,
+            cmap_base: (((m >> 5) & 0x1F) * 256) as u16,
+            index_mask: if m & 0x1F == 1 { 0xFF } else { 0xFFF },
+            pair: pair_format(m),
+        }
+    }
 }
 
 /// XMAP main mode formats (bits 4:0) that display pixel pairs, traced
@@ -118,7 +135,7 @@ impl Frame {
         }
         for did in 0..32u32 {
             let m = dcb.xmap.main_mode(did);
-            self.main_mode[did as usize] = MainMode { rgb: m & 0x1F >= 4, cmap_base: (((m >> 5) & 0x1F) * 256) as u16, pair: pair_format(m) };
+            self.main_mode[did as usize] = MainMode::of(m);
             let o = dcb.xmap.overlay_mode(did);
             self.overlay_mode[did as usize] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
         }
@@ -134,8 +151,13 @@ impl Frame {
             for x in 0..w {
                 let did = self.did_main[dst + x] & 31;
                 let b = select >> did & 1 != 0;
-                if let Some(pair) = self.main_mode[did as usize].pair {
+                let mode = self.main_mode[did as usize];
+                if let Some(pair) = mode.pair {
                     self.main[dst + x] = pair.unpack(self.main[dst + x], b) & 0xFF_FFFF;
+                } else if b && !mode.rgb {
+                    // Colour index: B is the word's high 12 bits
+                    // (`rss::ci_pixtype`).
+                    self.main[dst + x] = (self.main[dst + x] >> 12) & 0xFFF;
                 } else if b {
                     self.main[dst + x] = row_b[x];
                 }
@@ -205,7 +227,7 @@ impl Frame {
                 if m.rgb {
                     self.gamma_rgb(v, v >> 8, v >> 16)
                 } else {
-                    let c = self.cmap[(m.cmap_base as usize + (v & 0xFFF) as usize) & 0x1FFF];
+                    let c = self.cmap[(m.cmap_base as usize + (v & m.index_mask as u32) as usize) & 0x1FFF];
                     self.gamma_rgb(c >> 16, c >> 8, c)
                 }
             }
