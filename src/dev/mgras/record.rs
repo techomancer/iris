@@ -10,6 +10,9 @@
 //! off`). Replay: `MGRAS_REPLAY=<file> cargo test --release mgras_replay_file
 //! -- --nocapture` (`MGRAS_REPLAY_OUT=<file.png>` saves the final screen,
 //! `MGRAS_REPLAY_TRACE=<file>` writes the annotated trace of the replay).
+//! After a deliberate change to the board state, `MGRAS_REBASELINE=<in>
+//! MGRAS_REBASELINE_OUT=<out> cargo test --release mgras_rebaseline_file`
+//! re-takes a recording's checkpoints (`rebaseline`).
 //!
 //! File: `MGRASREC` + u32 version, then records, little-endian:
 //!
@@ -462,6 +465,51 @@ pub(super) mod tests {
             return Err(format!("replay diverged: {} of {} checkpoints failed", rep.failed.len(), rep.checked));
         }
         Ok(())
+    }
+
+    /// Re-take a recording's checkpoints after a deliberate change to the
+    /// board state (`state_bytes`): replay on HighImpact taking each
+    /// checkpoint's hash, check Maximum Impact reaches the same hashes,
+    /// and write the recording to `out` with them. Refuses when the
+    /// replay's DMA reads do not match the recording (then it is not the
+    /// same session any more).
+    pub fn rebaseline(path: &str, out: &str) -> Result<usize, String> {
+        let recs = load(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut hashes = Vec::new();
+        let m = live_board_of(GraphicsBoard::HighImpact);
+        let rep = replay_recs_with(&m, &recs, false, &mut |m| hashes.push(m.state_hash()))?;
+        m.stop_engines();
+        if rep.dma_mismatched != 0 || rep.dma_used != rep.dma_total {
+            return Err(format!("{path}: DMA reads {}/{} ({} mismatched): not the recorded session", rep.dma_used, rep.dma_total, rep.dma_mismatched));
+        }
+        let mut k = 0;
+        let new: Vec<Rec> = recs.iter().map(|r| match r {
+            Rec::Hash(_) => { k += 1; Rec::Hash(hashes[k - 1]) }
+            r => *r,
+        }).collect();
+        let m = live_board_of(GraphicsBoard::MaxImpact);
+        let rep = replay_recs(&m, &new, true)?;
+        m.stop_engines();
+        if rep.diverged() {
+            return Err(format!("{path}: Maximum Impact differs at {} of {} checkpoints {:?}", rep.failed.len(), rep.checked, &rep.failed[..rep.failed.len().min(8)]));
+        }
+        let rec = Recorder::create(out).map_err(|e| format!("{out}: {e}"))?;
+        let mut r = rec.lock();
+        for x in new {
+            r.put(x);
+        }
+        r.flush();
+        Ok(hashes.len())
+    }
+
+    /// MGRAS_REBASELINE=<in> MGRAS_REBASELINE_OUT=<out> cargo test --release
+    /// mgras_rebaseline_file -- --nocapture: see `rebaseline`.
+    #[test]
+    fn mgras_rebaseline_file() {
+        let Ok(path) = std::env::var("MGRAS_REBASELINE") else { return };
+        let out = std::env::var("MGRAS_REBASELINE_OUT").expect("MGRAS_REBASELINE_OUT");
+        let n = rebaseline(&path, &out).unwrap();
+        eprintln!("{path}: {n} checkpoints re-taken into {out}");
     }
 
     #[test]
