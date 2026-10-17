@@ -39,7 +39,9 @@ group_start "installer"
 WORK=$(stage_dir)
 printf '%s\n\n\n---\n\n\n' "$(cat LICENSE)" > "$WORK/COMBINED-LICENSE.txt"
 cat LICENSE-libchdman-rs.txt >> "$WORK/COMBINED-LICENSE.txt"
-"$ISCC" "/DMyAppVersion=$VERSION" "/DTargetArch=$ARCH" \
+# Git Bash rewrites arguments that look like POSIX paths, and ISCC's /D, /O and
+# /F switches do; without this it sees them as extra script filenames.
+MSYS2_ARG_CONV_EXCL='*' "$ISCC" "/DMyAppVersion=$VERSION" "/DTargetArch=$ARCH" \
     "/DSourceDir=$(winpath "$REL")" \
     "/DAssetsDir=$(winpath "$DIST_ROOT/iris-gui/assets/icons")" \
     "/DLicenseFile=$(winpath "$WORK/COMBINED-LICENSE.txt")" \
