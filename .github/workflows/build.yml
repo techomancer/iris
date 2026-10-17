@@ -1,0 +1,380 @@
+# Build every distribution artifact on every platform.
+#
+# Each job installs a toolchain and system packages, then calls one script in
+# scripts/dist/. The scripts do the building and packaging, so running one by
+# hand gives you the same files (see scripts/dist/README.md).
+#
+# Called by nightly.yml and release.yml, which then publish what this leaves
+# behind as workflow artifacts. Run it by hand (Actions > Build > Run workflow)
+# to check that a branch builds everywhere without publishing anything.
+#
+# Runner images are pinned: a glibc-linked Linux binary needs at least the
+# build host's glibc, so ubuntu-24.04 decides which distros our packages run on,
+# and macos-26 keeps the macOS job off GitHub's moving `macos-latest`.
+
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version to stamp into every binary and file name
+        type: string
+        required: true
+      ref:
+        description: Commit to build
+        type: string
+        required: true
+      gui_features:
+        type: string
+        required: true
+      cli_features:
+        type: string
+        required: true
+      macos_runner:
+        type: string
+        default: macos-26
+      require_notarization:
+        description: Fail the macOS job instead of shipping an unnotarized app
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      gui_features:
+        description: iris-gui features
+        default: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
+      cli_features:
+        description: iris and iris-ci features
+        default: lightning,jitv2,gpujit,idle-pause,hostgl
+      macos_runner:
+        description: macOS runner image
+        default: macos-26
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Anylinux-AppImages revision for the AppImage tools. quick-sharun sha256-pins
+  # what it downloads, so tracking main keeps the two in step; set a commit SHA
+  # here to hold back an upstream change.
+  ANYLINUX_REF: refs/heads/main
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      ref: ${{ steps.v.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: v
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [ -n "$VERSION" ] || VERSION=$(scripts/dist/version.sh dev)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Building \`$VERSION\` from \`$(git rev-parse --short HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   target: x86_64-pc-windows-msvc,  runner: windows-latest }
+          - { arch: arm64, target: aarch64-pc-windows-msvc, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Toolchain
+        shell: bash
+        run: rustup show && rustup target add ${{ matrix.target }}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: dist-${{ matrix.target }}-
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build and package
+        shell: bash
+        run: >
+          scripts/dist/package-windows.sh
+          --target ${{ matrix.target }}
+          --version "${{ needs.version.outputs.version }}"
+          --gui-features "${{ inputs.gui_features }}"
+          --cli-features "${{ inputs.cli_features }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal)
+    needs: version
+    runs-on: ${{ inputs.macos_runner || 'macos-26' }}
+    # Two slices of three binaries plus three notarization round trips. The
+    # ceiling leaves room for an Apple-side queue without hiding a hang.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Toolchain
+        run: rustup show && rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-macos-universal-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: dist-macos-universal-
+
+      # Signing and notarization switch on when the secrets exist. Without
+      # them the app is signed ad hoc and Gatekeeper warns on first launch.
+      - name: Import the Developer ID certificate
+        id: signing
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE" ]; then
+            echo "::warning::MACOS_CERTIFICATE is not set: the macOS build is signed ad hoc and not notarized."
+            echo "identity=-" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+               | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$ID" ]; then
+            echo "::error::MACOS_CERTIFICATE imported, but it holds no 'Developer ID Application' identity (certificate plus private key). Export the identity from Keychain Access as a .p12."
+            exit 1
+          fi
+          echo "identity=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Write the notarization key
+        env:
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APP_STORE_CONNECT_PRIVATE_KEY" ]; then
+            echo "$APP_STORE_CONNECT_PRIVATE_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          fi
+
+      - name: Build, sign, notarize and package
+        env:
+          MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          # API key notarization (preferred; the same key the App Store
+          # workflow uses), or Apple ID + app-specific password.
+          NOTARY_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          NOTARY_KEY_PATH: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY != '' && format('{0}/notary.p8', runner.temp) || '' }}
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARIZE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          REQUIRE_NOTARIZATION: ${{ inputs.require_notarization && '1' || '0' }}
+        run: >
+          scripts/dist/package-macos.sh
+          --version "${{ needs.version.outputs.version }}"
+          --gui-features "${{ inputs.gui_features }}"
+          --cli-features "${{ inputs.cli_features }}"
+
+      - name: Remove the signing keychain and key
+        if: always()
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          [ -f "$KEYCHAIN" ] && security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/notary.p8"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux packages (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
+          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang libclang-dev libasound2-dev libgtk-3-dev \
+            libssl-dev libv4l-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl-dev dpkg-dev liblzma-dev rpm zstd
+      - name: Toolchain and packagers
+        run: |
+          rustup show
+          cargo install --locked cargo-deb cargo-generate-rpm
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: dist-${{ matrix.target }}-
+      - name: Build and package
+        run: >
+          scripts/dist/package-linux.sh
+          --target ${{ matrix.target }}
+          --version "${{ needs.version.outputs.version }}"
+          --gui-features "${{ inputs.gui_features }}"
+          --cli-features "${{ inputs.cli_features }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  appimage:
+    name: Linux AppImage (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    container: ghcr.io/pkgforge-dev/archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
+          - { arch: arm64, target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+    steps:
+      # git first, so checkout makes a real clone (build.rs reads the commit).
+      - name: git
+        run: pacman -Syu --noconfirm git
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dist-appimage-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: dist-appimage-${{ matrix.arch }}-
+      - name: Build and bundle
+        run: >
+          scripts/dist/appimage.sh --install-deps
+          --target ${{ matrix.target }}
+          --version "${{ needs.version.outputs.version }}"
+          --gui-features "${{ inputs.gui_features }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-appimage-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # No GitHub-hosted riscv64 runner exists, so this cross-compiles on x86_64
+  # Debian 13, where riscv64 is a release architecture and the :riscv64 -dev
+  # packages install next to the host's. No AppImage: the sharun tooling has no
+  # riscv64 path.
+  riscv64:
+    name: Linux riscv64 (cross)
+    needs: version
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    env:
+      # The container runs as root but Actions sets HOME=/github/home; rustup
+      # refuses that mismatch, so pin HOME and the rustup/cargo paths.
+      HOME: /root
+      RUSTUP_HOME: /usr/local/rustup
+      CARGO_HOME: /usr/local/cargo
+      CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+      CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+      CXX_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-g++
+      AR_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-ar
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_SYSROOT_DIR: "/"
+      PKG_CONFIG_PATH: /usr/lib/riscv64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      BINDGEN_EXTRA_CLANG_ARGS: "--target=riscv64-unknown-linux-gnu -I/usr/include/riscv64-linux-gnu"
+    steps:
+      - name: Host toolchain and riscv64 sysroot
+        run: |
+          set -eux
+          dpkg --add-architecture riscv64
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl xz-utils git pkg-config file rpm zstd \
+            build-essential crossbuild-essential-riscv64 clang libclang-dev llvm \
+            libasound2-dev:riscv64 libgtk-3-dev:riscv64 libssl-dev:riscv64 libv4l-dev:riscv64 \
+            libxcb-render0-dev:riscv64 libxcb-shape0-dev:riscv64 libxcb-xfixes0-dev:riscv64 \
+            libxkbcommon-dev:riscv64 libwayland-dev:riscv64 libgl-dev:riscv64
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Rust
+        run: |
+          set -eux
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          rustup show
+          rustup target add riscv64gc-unknown-linux-gnu
+          # Host tools: drop the riscv64 pkg-config/bindgen settings or any -sys
+          # crate they build would link against the riscv64 sysroot.
+          env -u PKG_CONFIG_PATH -u PKG_CONFIG_SYSROOT_DIR -u PKG_CONFIG_ALLOW_CROSS -u BINDGEN_EXTRA_CLANG_ARGS \
+            cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Build and package
+        run: >
+          scripts/dist/package-linux.sh --formats deb,rpm,tar
+          --target riscv64gc-unknown-linux-gnu
+          --version "${{ needs.version.outputs.version }}"
+          --gui-features "${{ inputs.gui_features }}"
+          --cli-features "${{ inputs.cli_features }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-linux-riscv64
+          path: dist/*
+          if-no-files-found: error
+
+  # Everything the downloads table links to must exist before anyone publishes.
+  check:
+    name: Check the release files
+    needs: [version, windows, macos, linux, appimage, riscv64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: ls -lh dist
+      - run: scripts/dist/release-notes.sh --version "${{ needs.version.outputs.version }}" --check dist

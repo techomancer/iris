@@ -418,8 +418,9 @@ Tests:
   tests driven over `iris-ci`.
 - CI (`.github/workflows/`): `rust.yml` builds and tests the workspace,
   `suites.yml` runs cpu-tests and bench across CPU × engine and gates cpu-tests
-  on a per-CPU failure baseline, `release.yml` and `appstore.yml` build the
-  distributed packages.
+  on a per-CPU failure baseline, `build.yml` builds the distributed packages
+  through `scripts/dist/` (see `scripts/dist/README.md`), `nightly.yml` and
+  `release.yml` publish them, and `appstore.yml` builds the App Store app.
 
 **Breakpoints** don't survive emulator restart.
 

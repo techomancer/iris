@@ -58,11 +58,11 @@ jobs:
       continue-on-error: ${{ matrix.informational }}
       run: cargo test --workspace --verbose
 
-  # The speed configuration (CLAUDE.md "recommended for speed" plus the MIPS
-  # JIT): a build check only, so a platform-specific break in the Cranelift
-  # JITs or the lightning interpreter path turns CI red before a release does.
+  # The nightly/release CLI feature set (scripts/dist/lib.sh): a build check
+  # only, so a platform-specific break in the Cranelift JITs or the lightning
+  # interpreter path turns CI red before a nightly does.
   features:
-    name: Build lightning,gpujit,jitv2 (${{ matrix.name }})
+    name: Build release features (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -88,4 +88,20 @@ jobs:
         key: ${{ runner.os }}-features-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-features-cargo-
     - name: Build
-      run: cargo build --release -p iris --bins --features lightning,gpujit,jitv2
+      run: cargo build --release -p iris --bins --features lightning,jitv2,gpujit,idle-pause,hostgl
+
+  # The distribution scripts run only in nightly and release builds, so lint
+  # them here where a mistake shows up on the pull request.
+  dist-scripts:
+    name: Lint scripts/dist
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v5
+    - run: shellcheck -x -S warning scripts/dist/*.sh scripts/build-macos.sh
+    - name: Version strings
+      run: |
+        [ "$(scripts/dist/version.sh release v1.2.3)" = 1.2.3 ]
+        [ "$(scripts/dist/version.sh nightly 2026-01-05)" = nightly.2026.01.05 ]
+        ! scripts/dist/version.sh release v1.2 2>/dev/null
+    - name: Release notes render
+      run: scripts/dist/release-notes.sh --channel nightly --version nightly.2026.01.05 --tag nightly

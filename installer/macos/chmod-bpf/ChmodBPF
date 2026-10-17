@@ -6,7 +6,7 @@
 #
 # Installed by IRIS's in-app "Enable packet capture" step:
 #   - this script -> /Library/Application Support/IRIS/ChmodBPF/ChmodBPF
-#   - the LaunchDaemon io.github.danifunker.iris.ChmodBPF.plist -> /Library/LaunchDaemons/
+#   - the LaunchDaemon io.techomancer.iris.ChmodBPF.plist -> /Library/LaunchDaemons/
 # The daemon runs this at every boot (RunAtLoad): macOS recreates the bpf nodes on
 # demand with default (root-only) permissions, so the grant is re-applied each boot.
 #

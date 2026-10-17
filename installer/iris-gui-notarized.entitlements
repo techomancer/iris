@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Developer ID / notarized distribution (the DMG + CLI tarballs from
-         release.yml) — NOT the Mac App Store. These builds are signed with the
+    <!-- Developer ID / notarized distribution (the nightly and release DMG,
+         zip and CLI tarball from scripts/dist/package-macos.sh) — NOT the Mac App Store. These builds are signed with the
          hardened runtime (codesign option `runtime`), which blocks executable
          memory the kernel can't validate. IRIS's Cranelift JIT (the MIPS JIT and
          the always-on REX3 draw-shader JIT) allocates code pages with
@@ -27,8 +27,8 @@
          drives a one-time admin install of Wireshark-style ChmodBPF via
          `osascript … "do shell script … with administrator privileges"`, which
          sends Apple Events; the hardened runtime requires this entitlement (plus
-         NSAppleEventsUsageDescription in Info.plist, added by release.yml's
-         make_dmg) or the osascript call is blocked. Harmless for non-PCAP builds.
+         NSAppleEventsUsageDescription in Info.plist, which a PCAP build must
+         add in scripts/dist/macos-bundle.sh) or the osascript call is blocked. Harmless for non-PCAP builds.
          REJECTED for the Mac App Store, which is fine — PCAP never ships there. -->
     <key>com.apple.security.automation.apple-events</key>
     <true/>

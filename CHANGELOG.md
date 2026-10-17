@@ -2,8 +2,9 @@
 
 All notable user-facing and developer-facing changes to iris.
 
-IRIS has no numbered releases. Binary builds are tagged `v<YYYY-MM-DD-HH-MM>` by
-the Release workflow when someone publishes one. This file is grouped by month,
+Binary builds are published as a daily `nightly` pre-release
+(`nightly.YYYY.MM.DD`) and as releases for `vX.Y.Z` tags. Builds before
+October 2026 were tagged `v<YYYY-MM-DD-HH-MM>`. This file is grouped by month,
 newest first, and within a month by area. Dates use the Git committer date
 (`git show -s --format=%cs`), which records when a change landed in this
 history; author dates can differ after rebases or cherry-picks. Historical
@@ -24,6 +25,22 @@ hashes are given where a change is easiest to understand by reading the commit.
   adding one is adding a `locales/<lang>/` folder (`iris-gui/locales/README.md`),
   and View → Language switches between installed languages, defaulting to the
   system's.
+
+### Releases and packaging
+
+- **Nightly and tagged releases, built by scripts.** A nightly build of `main`
+  replaces the single `nightly` pre-release every day, versioned
+  `nightly.YYYY.MM.DD`; pushing a `vX.Y.Z` tag publishes release `X.Y.Z`. The
+  version shows in the About window, `iris-ci --version`, the macOS app and
+  every file name. Both ship iris-gui with
+  `iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl` and the CLI
+  with `lightning,jitv2,gpujit,idle-pause,hostgl`. All building and packaging
+  lives in `scripts/dist/`, which the workflows call and you can run locally.
+- **macOS ships one universal app** (`IRIS-gui-macos-universal-*.dmg` and
+  `.zip`) and a universal CLI tarball, signed and notarized when the
+  repository has Apple credentials. The bundle ID is now
+  `io.techomancer.iris`; the App Store app keeps its own.
+- The App Store build takes its version from the newest `vX.Y.Z` tag.
 
 ### Networking
 

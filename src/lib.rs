@@ -71,6 +71,15 @@ compile_error!(
      cache (`--cpu r5000`) is unaffected."
 );
 
+/// The version this binary was built as: `RELEASE_VERSION` from the
+/// distribution build (`nightly.YYYY.MM.DD` or `X.Y.Z`, see
+/// scripts/dist/version.sh), or the crate version for a plain `cargo build`.
+/// Cargo tracks `option_env!`, so changing it rebuilds this crate.
+pub const VERSION: &str = match option_env!("RELEASE_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 /// Compile-time feature flags exposed for tooling (e.g. iris-gui) so it can
 /// surface "rebuild with ..." hints without duplicating the cargo feature set.
 pub mod build_features {

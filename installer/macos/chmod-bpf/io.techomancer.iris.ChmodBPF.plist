@@ -4,20 +4,20 @@
   LaunchDaemon for IRIS's ChmodBPF helper (PCAP bridged networking, macOS).
 
   Installed at runtime by the in-app "Enable packet capture" step to
-  /Library/LaunchDaemons/io.github.danifunker.iris.ChmodBPF.plist and bootstrapped
+  /Library/LaunchDaemons/io.techomancer.iris.ChmodBPF.plist and bootstrapped
   with `launchctl bootstrap system …`. It runs the ChmodBPF script at every boot
   (RunAtLoad) because macOS recreates the /dev/bpf* nodes on demand with default,
   root-only permissions — so the group-read grant must be re-applied each boot.
 
   The emulator itself never runs as root; only this small daemon does. The label
-  matches the app bundle id (io.github.danifunker.iris) used by release.yml's
-  make_dmg. The ProgramArguments path is the script's *installed* location, not
+  matches the app bundle id (io.techomancer.iris) used by scripts/dist/macos-bundle.sh.
+  The ProgramArguments path is the script's *installed* location, not
   its location in the repo.
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>io.github.danifunker.iris.ChmodBPF</string>
+    <string>io.techomancer.iris.ChmodBPF</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Library/Application Support/IRIS/ChmodBPF/ChmodBPF</string>

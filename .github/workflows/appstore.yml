@@ -3,6 +3,13 @@
 # Manual trigger only — run this when you're ready to submit a new build,
 # not on every commit.
 #
+# Version: the App Store build carries the same X.Y.Z as the matching release
+# (release.yml). By default that is the newest vX.Y.Z tag reachable from the
+# commit being built; set the `version` input to pick another. The About window
+# and CFBundleShortVersionString show X.Y.Z; CFBundleVersion is a UTC
+# timestamp (YYYYMMDD.HHMM), because App Store Connect needs every uploaded
+# build number to be new.
+#
 # Required repository secrets:
 #   APP_STORE_APP_CERT          base64-encoded Mac App Distribution .p12
 #   APP_STORE_APP_CERT_PWD      password for the above
@@ -31,6 +38,10 @@ on:
     inputs:
       build_branch:
         description: Branch to build from (leave empty for workflow branch)
+        required: false
+        default: ''
+      version:
+        description: Release version X.Y.Z (leave empty for the newest vX.Y.Z tag on the built commit)
         required: false
         default: ''
       validate_only:
@@ -72,16 +83,24 @@ jobs:
       # Stamp the version here, in the first job, so the arm64/x64 build jobs can
       # bake it into the binary (RELEASE_VERSION → APP_VERSION, shown in About)
       # AND the packaging job writes the *same* value into Info.plist's
-      # CFBundleVersion. Generating it in the later package job left the builds
+      # CFBundleShortVersionString. Generating it in the later package job left the builds
       # with no RELEASE_VERSION, so About fell back to CARGO_PKG_VERSION (0.1.0).
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.build_branch || 'main' }}
+          fetch-depth: 0   # the version comes from the newest vX.Y.Z tag
       - name: Generate version
         id: version
+        env:
+          VERSION_INPUT: ${{ github.event.inputs.version }}
         run: |
-          VERSION=$(date -u +"%Y-%m-%d-%H-%M")
-          # App Store requires numeric integers separated by dots (e.g. 20250609.0200)
-          BUNDLE_VERSION=$(echo "$VERSION" | sed 's/\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)-\([0-9]*\)/\1\2\3.\4\5/')
+          # X.Y.Z, the same version the matching release ships as.
+          VERSION=$(scripts/dist/version.sh appstore "$VERSION_INPUT")
+          # App Store Connect wants a new, numeric build number per upload.
+          BUNDLE_VERSION=$(date -u +"%Y%m%d.%H%M")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "bundle_version=$BUNDLE_VERSION" >> $GITHUB_OUTPUT
+          echo "App Store build $VERSION ($BUNDLE_VERSION)" >> $GITHUB_STEP_SUMMARY
       - name: Verify certificates, provisioning profile, and API key
         env:
           APP_STORE_APP_CERT: ${{ secrets.APP_STORE_APP_CERT }}
@@ -315,8 +334,8 @@ jobs:
       - name: Build iris-gui for both arches (lightning + CHD, App Store)
         env:
           # Baked into APP_VERSION by iris-gui/build.rs and shown in About.
-          # Must equal the CFBundleVersion the packaging job writes.
-          RELEASE_VERSION: ${{ needs.preflight.outputs.bundle_version }}
+          # Must equal the CFBundleShortVersionString the packaging job writes.
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           cargo build --release --target aarch64-apple-darwin -p iris-gui \
             --features iris/lightning,appstore
@@ -474,50 +493,23 @@ jobs:
           echo "App identity:       $APP_ID"
           echo "Installer identity: $INSTALLER_ID"
 
+      # scripts/dist/macos-bundle.sh assembles every IRIS.app, this one
+      # included; --appstore adds the export-compliance key. Signing stays in
+      # the next step, with the App Store entitlements.
       - name: Embed provisioning profile and build .app bundle
         env:
           APP_STORE_PROVISIONING_PROFILE: ${{ secrets.APP_STORE_PROVISIONING_PROFILE }}
           VER: ${{ steps.version.outputs.version }}
           BUNDLE_VER: ${{ steps.version.outputs.bundle_version }}
         run: |
-          BUNDLE="IRIS.app"
-          mkdir -p "${BUNDLE}/Contents/MacOS" "${BUNDLE}/Contents/Resources"
-
-          cp iris-gui-universal "${BUNDLE}/Contents/MacOS/iris-gui"
-          chmod +x "${BUNDLE}/Contents/MacOS/iris-gui"
-          cp "iris-gui/assets/icons/icon.icns" "${BUNDLE}/Contents/Resources/AppIcon.icns"
-
-          # Embed provisioning profile (required for App Store)
-          echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode \
-            > "${BUNDLE}/Contents/embedded.provisionprofile"
-
-          cat > "${BUNDLE}/Contents/Info.plist" << PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>IRIS</string>
-            <key>CFBundleDisplayName</key><string>IRIS</string>
-            <key>CFBundleIdentifier</key><string>${{ env.BUNDLE_ID }}</string>
-            <key>CFBundleVersion</key><string>${BUNDLE_VER}</string>
-            <key>CFBundleShortVersionString</key><string>${BUNDLE_VER}</string>
-            <key>CFBundleExecutable</key><string>iris-gui</string>
-            <key>CFBundleIconFile</key><string>AppIcon.icns</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>NSHighResolutionCapable</key><true/>
-            <key>LSMinimumSystemVersion</key><string>10.13</string>
-            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
-            <key>NSCameraUsageDescription</key><string>Provides the IndyCam video input for SGI Indy emulation (VINO device).</string>
-            <!-- Export compliance: the shipping app uses no non-exempt
-                 encryption. Its own network path is plaintext (src/registry.rs
-                 is explicitly no-TLS); the only TLS-capable crates (rustls/ring)
-                 are BUILD-time deps of libchdman-rs's downloader and are not in
-                 the runtime binary. Setting this false suppresses the per-build
-                 export-compliance question in App Store Connect. -->
-            <key>ITSAppUsesNonExemptEncryption</key><false/>
-          </dict>
-          </plist>
-          PLIST
+          echo "$APP_STORE_PROVISIONING_PROFILE" | base64 --decode > "$RUNNER_TEMP/embedded.provisionprofile"
+          scripts/dist/macos-bundle.sh --appstore --no-sign \
+            --binary iris-gui-universal --out . \
+            --bundle-id "${{ env.BUNDLE_ID }}" \
+            --version "$VER" --short-version "$VER" --build-version "$BUNDLE_VER" \
+            --provisioning-profile "$RUNNER_TEMP/embedded.provisionprofile"
+          rm -f "$RUNNER_TEMP/embedded.provisionprofile"
+          cat IRIS.app/Contents/Info.plist
 
       - name: Sign .app with entitlements
         env:

@@ -1,0 +1,97 @@
+# Nightly build: every day at 05:00 UTC, build main and replace the single
+# "nightly" pre-release with it. The version is nightly.YYYY.MM.DD (UTC).
+#
+# A scheduled run does nothing when main has not moved since the last nightly.
+# Run it by hand (Actions > Nightly > Run workflow) to build and publish now,
+# changed or not.
+#
+# GitHub stops running schedules on a public repo after 60 days without a commit.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      sha: ${{ steps.v.outputs.sha }}
+      skip: ${{ steps.v.outputs.skip }}
+      # The feature sets nightlies ship with. Change them here.
+      gui_features: iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl
+      cli_features: lightning,jitv2,gpujit,idle-pause,hostgl
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          VERSION=$(scripts/dist/version.sh nightly)
+          LAST=$(gh api "repos/$GITHUB_REPOSITORY/commits/nightly" --jq .sha 2>/dev/null || true)
+          SKIP=false
+          if [ "$EVENT" = schedule ] && [ "$LAST" = "$SHA" ]; then
+            SKIP=true
+            echo "main has not moved since the last nightly (\`${SHA:0:8}\`). Nothing to build." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Building \`$VERSION\` from \`${SHA:0:8}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      ref: ${{ needs.prepare.outputs.sha }}
+      gui_features: ${{ needs.prepare.outputs.gui_features }}
+      cli_features: ${{ needs.prepare.outputs.cli_features }}
+
+  publish:
+    name: Publish
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Release notes
+        run: >
+          scripts/dist/release-notes.sh --channel nightly
+          --version "${{ needs.prepare.outputs.version }}" --tag nightly
+          --commit "${{ needs.prepare.outputs.sha }}" --gui-features "${{ needs.prepare.outputs.gui_features }}"
+          --cli-features "${{ needs.prepare.outputs.cli_features }}"
+          -o "$RUNNER_TEMP/notes.md"
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          scripts/dist/publish-github.sh --tag nightly --move-tag --prerelease
+          --previous nightly
+          --sha "${{ needs.prepare.outputs.sha }}"
+          --title nightly
+          --notes "$RUNNER_TEMP/notes.md" --dir dist

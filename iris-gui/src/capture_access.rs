@@ -158,10 +158,10 @@ mod imp {
     /// flow needs no .app bundle layout at runtime.
     const CHMODBPF_SCRIPT: &str = include_str!("../../installer/macos/chmod-bpf/ChmodBPF");
     const CHMODBPF_PLIST: &str =
-        include_str!("../../installer/macos/chmod-bpf/io.github.danifunker.iris.ChmodBPF.plist");
+        include_str!("../../installer/macos/chmod-bpf/io.techomancer.iris.ChmodBPF.plist");
 
-    const PLIST_NAME: &str = "io.github.danifunker.iris.ChmodBPF.plist";
-    const DAEMON_PLIST: &str = "/Library/LaunchDaemons/io.github.danifunker.iris.ChmodBPF.plist";
+    const PLIST_NAME: &str = "io.techomancer.iris.ChmodBPF.plist";
+    const DAEMON_PLIST: &str = "/Library/LaunchDaemons/io.techomancer.iris.ChmodBPF.plist";
     const SUPPORT_DIR: &str = "/Library/Application Support/IRIS/ChmodBPF";
 
     pub fn enable() -> EnableOutcome {

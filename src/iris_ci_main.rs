@@ -40,7 +40,7 @@ const RC_MARKER: &str = "IRIS-CI-RC=";
 #[command(
     name = "iris-ci",
     about = "Drive the iris CI control socket without raw nc + JSON.",
-    version
+    version = iris::VERSION
 )]
 struct Cli {
     /// CI Unix socket path or host:port for TCP. Override with $IRIS_SOCKET.

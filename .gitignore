@@ -15,6 +15,7 @@ Cargo.lock
 iris.toml
 screenshot_*.png
 IRIS.app/
+/dist/
 *.log
 .DS_Store
 
