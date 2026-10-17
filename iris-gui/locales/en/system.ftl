@@ -11,7 +11,6 @@ machines-name-invalid = Machine names can't contain slashes or colons, start wit
 machines-name-reserved = This name is reserved on Windows or uses characters that aren't allowed in file names.
 # A file that couldn't be read or written, followed by the system's error text.
 machines-file-error = { $path }: { $error }
-machines-relative-error = Can't store { $path } relative to { $base }.
 machines-list-error = Can't read the machines folder: { $error }
 machines-migrate-error = Couldn't copy { $path } into the machine folder: { $error }
 machines-folder-exists = A machine named { $name } already exists.

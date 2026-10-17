@@ -1,5 +1,5 @@
-//! Machine folders and the core's TOML schema. Paths stay relative on disk and
-//! in the editor; the selected machine folder is the emulator's working directory.
+//! Machine folders and the core's TOML schema. Paths inside the machine folder stay relative on
+//! disk and in the editor; external paths keep the spelling the user chose; the selected machine folder is the emulator's working directory.
 
 use iris::config::MachineConfig;
 use std::path::{Component, Path, PathBuf};
@@ -126,45 +126,31 @@ pub fn resolve(base: &Path, path: &str) -> PathBuf {
     base.join(path)
 }
 
-/// Compute a relative path without requiring the destination to exist. Keep
-/// symlinks intact: lexical normalization would change `symlink/../file`.
-pub fn relative(base: &Path, path: &Path) -> Result<PathBuf, String> {
-    let base_parts: Vec<_> = base.components().collect();
-    let path_parts: Vec<_> = path.components().collect();
-    if !base.is_absolute() || !path.is_absolute() || base_parts.first() != path_parts.first() {
-        return Err(t!("machines-relative-error", path = path.display(), base = base.display()));
+/// Express `path` relative to `base` only when it lives inside `base`. Paths
+/// elsewhere stay absolute: a `../../..` chain to reach them is fragile, and
+/// the user's choice of absolute spelling must survive a reload.
+pub fn relative(base: &Path, path: &Path) -> Option<PathBuf> {
+    if !base.is_absolute() || !path.is_absolute() {
+        return None;
     }
-    let common = base_parts
-        .iter()
-        .zip(&path_parts)
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut out = PathBuf::new();
-    for part in &base_parts[common..] {
-        if *part != Component::CurDir {
-            out.push("..");
-        }
+    let rest = path.strip_prefix(base).ok()?;
+    if rest.components().any(|c| c == Component::ParentDir) {
+        return None;
     }
-    for part in &path_parts[common..] {
-        out.push(part.as_os_str());
-    }
-    if out.as_os_str().is_empty() {
-        out.push(".");
-    }
-    Ok(out)
+    Some(if rest.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        rest.to_path_buf()
+    })
 }
 
 pub fn make_relative(cfg: &mut MachineConfig, dir: &Path) -> Result<(), String> {
-    let mut error = None;
     visit_paths(cfg, |path| {
-        if Path::new(path).is_absolute() {
-            match relative(dir, Path::new(path)) {
-                Ok(p) => *path = p.to_string_lossy().into_owned(),
-                Err(e) => error = Some(e),
-            }
+        if let Some(p) = relative(dir, Path::new(path)) {
+            *path = p.to_string_lossy().into_owned();
         }
     });
-    error.map_or(Ok(()), Err)
+    Ok(())
 }
 
 pub fn save(root: &Path, name: &str, cfg: &mut MachineConfig) -> Result<(), String> {
@@ -376,17 +362,19 @@ pub(crate) mod tests {
         cfg.network.mac = Some("08:00:69:12:34:56".into());
         save(&root.0, "Indigo2 IP28", &mut cfg).unwrap();
         let path = config_path(&root.0, "Indigo2 IP28").unwrap();
-        let mut back = read(&path).unwrap();
+        let back = read(&path).unwrap();
         assert_eq!(back.scsi[&1].path, "disks/root.chd");
         assert_eq!(back.scsi[&4].path, "");
-        assert_eq!(back.scsi[&4].discs[0], "../../install.iso");
+        // External paths keep their absolute spelling.
+        assert_eq!(back.scsi[&4].discs[0], root.0.join("install.iso").to_string_lossy());
         assert_eq!(back.nvram, "nvram.bin");
         assert_eq!(back.nveeprom, "nveeprom.bin");
         assert_eq!(back.ci_socket, "tcp:127.0.0.1:19851");
         assert_eq!(back.debug.debug_log, cfg.debug.debug_log);
         assert_eq!(back.network.pcap_interface, cfg.network.pcap_interface);
         assert_eq!(back.network.mac, cfg.network.mac);
-        visit_paths(&mut back, |p| assert!(!Path::new(p).is_absolute(), "{p}"));
+        assert_eq!(back.nfs.as_ref().unwrap().shared_dir, root.0.join("shared").to_string_lossy());
+        assert_eq!(back.serial_log.as_deref(), Some("console.log"));
         assert!(dir.join("disks").is_dir());
     }
 
@@ -513,6 +501,20 @@ pub(crate) mod tests {
         for name in ["Indigo2 IP28", "indy", "マシン", "irix-6.5"] {
             validate_name(name).unwrap();
         }
+    }
+
+    #[test]
+    fn only_paths_inside_the_machine_folder_become_relative() {
+        let dir = Path::new("/m/machines/indy");
+        assert_eq!(
+            relative(dir, Path::new("/m/machines/indy/disks/a.raw")),
+            Some(PathBuf::from("disks/a.raw"))
+        );
+        assert_eq!(relative(dir, Path::new("/Volumes/X/a.chd")), None);
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.get_mut(&1).unwrap().path = "/Volumes/X/a.chd".into();
+        make_relative(&mut cfg, dir).unwrap();
+        assert_eq!(cfg.scsi[&1].path, "/Volumes/X/a.chd");
     }
 
     #[test]

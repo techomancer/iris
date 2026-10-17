@@ -92,7 +92,7 @@ fn abs_path(p: &str) -> String {
 /// Picker results use the same path spelling as the saved config, including
 /// live CD-ROM commands and snapshot provenance.
 fn picked_path(path: &std::path::Path) -> String {
-    let relative = std::env::current_dir().ok().and_then(|dir| machines::relative(&dir, path).ok());
+    let relative = std::env::current_dir().ok().and_then(|dir| machines::relative(&dir, path));
     relative.unwrap_or_else(|| path.to_path_buf()).to_string_lossy().into_owned()
 }
 

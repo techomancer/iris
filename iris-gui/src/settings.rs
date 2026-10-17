@@ -460,7 +460,8 @@ mod storage_tests {
         let mut prefs = GuiSettings::load_in(root.0.clone(), &root.0);
         assert!(prefs.errors.is_empty(), "{:?}", prefs.errors);
         assert_eq!(prefs.active_machine.as_deref(), Some("indy"));
-        assert_eq!(prefs.machines["indy"].scsi[&1].path, "../../boot.raw");
+        // Resolved against the old launch directory; outside the machine folder, so absolute.
+        assert_eq!(prefs.machines["indy"].scsi[&1].path, root.0.join("boot.raw").to_string_lossy());
         assert_eq!(std::fs::read_to_string(root.0.join("gui.json.pre-toml.bak")).unwrap(), original_text);
         prefs.save().unwrap();
         let persisted: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.0.join("gui.json")).unwrap()).unwrap();

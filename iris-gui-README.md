@@ -226,7 +226,7 @@ machine is unavailable, it selects the first available machine or opens
 errors and remain untouched.
 
 The selected machine folder is the emulator's working directory. Config paths
-stay relative to that folder, including files selected with **Browse**:
+inside that folder stay relative to it, including files selected with **Browse**:
 
 ```toml
 prom = "(embedded)"
@@ -238,12 +238,12 @@ path = "disks/scsi1.raw"
 ```
 
 New disk images default to `disks/scsiN.raw`. External images stay in place;
-the TOML references them with relative paths such as `../../../../media/root.chd`.
+the TOML keeps them as absolute paths (`/Volumes/Media/root.chd`), exactly as
+selected or typed. A hand-written relative path such as `../../media/root.chd`
+is also preserved as written.
 The same resolution applies to disc changers, NFS shares, TFTP folders, serial
 logs, ELF binaries, test dumps, filesystem CI sockets, and JIT cache folders.
 TCP CI addresses and network interface names retain their original spelling.
-On Windows, external paths must be on the same volume as the machine folder
-to be expressible as relative paths.
 
 NVRAM and motherboard EEPROM default to separate files in each machine folder.
 App Store CHD diffs use that machine's `chd-diffs/` folder. Security-scoped

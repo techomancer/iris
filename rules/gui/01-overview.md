@@ -27,8 +27,8 @@ easy to break.
   dropped (`cycles-ptr-must-be-cleared-before-dropping-the-machine.md`).
 - GUI preferences persist to `<config dir>/iris/gui.json`; machine configs use
   the core TOML schema at `machines/<name>/<name>.toml`. The selected machine
-  folder is the process working directory. Keep config paths relative, and
-  wait for queued worker operations and machine teardown before changing cwd.
+  folder is the process working directory. Paths inside the folder are stored relative; external paths stay absolute and are never rewritten to `../..` chains. Wait for
+  queued worker operations and machine teardown before changing cwd.
   App Store builds use Foundation's container home for storage and resolve
   external relative paths before harvesting security-scoped bookmarks.
 
