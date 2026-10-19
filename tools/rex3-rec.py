@@ -28,6 +28,7 @@ import struct
 import sys
 
 MAGIC = b'REX3REC\0'
+VERSION = 1
 REX3_RS = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'dev', 'ng1', 'rex3.rs')
 
 
@@ -52,6 +53,11 @@ def records(path):
                 f = line.split()
                 yield f[0], f[1:]
         return
+    if len(data) < 12:
+        sys.exit(f'{path}: truncated REX3 recording header')
+    version, = struct.unpack_from('<I', data, 8)
+    if version != VERSION:
+        sys.exit(f'{path}: unsupported REX3 recording version {version}')
     i = 12
     while i < len(data):
         t = chr(data[i])
