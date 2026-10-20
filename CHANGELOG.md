@@ -16,8 +16,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### NAT gateway
 
 - **A built-in rsh server at the gateway.** `[network] rsh_dir = "DIR"` (or
-  `--rsh-dir DIR`) answers TCP 514 at the gateway with `cat`, `ls`, `echo` and
-  `pwd` on DIR, read-only, so the guest can pull files with
+  `--rsh-dir DIR`) answers TCP 514 at the gateway with `cat`, `dd`, `ls`, `echo`
+  and `pwd` on DIR, read-only, so the guest can pull files with
   `rsh 192.168.0.1 cat /file` without a host `rshd`. It is not a shell and runs
   nothing on the host. It speaks the BSD `rcmd` protocol, including the
   stderr connection back to the guest from a reserved port. `src/net/rsh.rs`

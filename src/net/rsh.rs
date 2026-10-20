@@ -5,7 +5,7 @@
 //! TCP connection and hands the byte stream to an [`RshSession`].
 //!
 //! **This is not a shell and does not run host programs.** `rsh gateway cmd`
-//! runs one of a few built-in commands (`cat`, `ls`, `echo`, `pwd`) against a
+//! runs one of a few built-in commands (`cat`, `dd`, `ls`, `echo`, `pwd`) against a
 //! single configured directory, read-only, the way the TFTP server serves one
 //! directory. Nothing is ever executed on the host, nothing outside the root is
 //! reachable (`..` and symlinks leading out are refused), and nothing is written.
@@ -30,10 +30,17 @@
 //! connection, so a client that asked for one must get it. That connection is
 //! requested through [`TcpService::side_connect`]. The protocol carries no exit
 //! status, so a failing command is reported only in its error text.
+//!
+//! `dd if=FILE [bs=N] [ibs=N] [count=N] [iseek=N|skip=N]` is what IRIX `inst`
+//! uses to read a distribution from a remote host: it restarts the remote `dd`
+//! with `iseek` for a long forward seek (see inst(1), `network_seek_threshold`).
+//! Output is only ever the file's bytes; dd's "records in/out" report goes to
+//! the stderr connection and is dropped when there is none, so it can never
+//! end up inside the data.
 
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -221,6 +228,21 @@ fn resolve(root: &Path, name: &str) -> io::Result<PathBuf> {
     }
 }
 
+/// A dd number: decimal digits with an optional `b` (512), `k` (1024) or `w`
+/// (2) suffix, as IRIX dd takes them.
+fn parse_size(s: &str) -> Option<u64> {
+    let (digits, mult) = match s.chars().last()? {
+        'b' => (&s[..s.len() - 1], 512),
+        'k' => (&s[..s.len() - 1], 1024),
+        'w' => (&s[..s.len() - 1], 2),
+        _ => (s, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(mult)
+}
+
 fn errstr(e: &io::Error) -> String {
     match e.kind() {
         io::ErrorKind::NotFound => "No such file or directory".into(),
@@ -272,6 +294,9 @@ enum Phase {
 enum Job {
     None,
     Cat { files: VecDeque<PathBuf>, cur: Option<File> },
+    /// `dd`: `left` input bytes still to copy (None = to the end of the file),
+    /// `total` copied so far, `ibs` for the records report.
+    Dd { file: File, left: Option<u64>, total: u64, ibs: u64 },
 }
 
 pub struct RshSession {
@@ -346,6 +371,7 @@ impl RshSession {
         };
         match name.as_str() {
             "cat" => self.cmd_cat(args),
+            "dd" => self.cmd_dd(args),
             "ls" => self.cmd_ls(args),
             "echo" => self.cmd_echo(args),
             "pwd" => {
@@ -388,6 +414,50 @@ impl RshSession {
             return self.finish();
         }
         self.job = Job::Cat { files, cur: None };
+    }
+
+    fn cmd_dd(&mut self, args: &[String]) {
+        match self.parse_dd(args) {
+            Ok(job) => self.job = job,
+            Err(msg) => {
+                self.err(&format!("dd: {msg}\n"));
+                self.finish();
+            }
+        }
+    }
+
+    /// Open the input and position it, or say what is wrong with the operands.
+    fn parse_dd(&self, args: &[String]) -> Result<Job, String> {
+        let (mut input, mut ibs, mut count, mut seek) = (None, 512u64, None, 0u64);
+        for a in args {
+            let (key, val) = a.split_once('=').ok_or_else(|| format!("bad arg: {a}"))?;
+            let num = || parse_size(val).ok_or_else(|| format!("bad numeric arg: {a}"));
+            match key {
+                "if" => input = Some(val),
+                "bs" | "ibs" => ibs = num()?,
+                "obs" | "cbs" => {
+                    num()?;
+                }
+                "count" => count = Some(num()?),
+                "iseek" | "skip" => seek = num()?,
+                "of" if val == "/dev/stdout" || val == "-" => {}
+                "of" => return Err("writing files is not supported".into()),
+                _ => return Err(format!("bad arg: {a}")),
+            }
+        }
+        let name = input.ok_or("reading standard input is not supported")?;
+        if ibs == 0 {
+            return Err("bad block size".into());
+        }
+        let path = resolve(&self.root, name).map_err(|e| format!("{name}: {}", errstr(&e)))?;
+        if path.is_dir() {
+            return Err(format!("{name}: Is a directory"));
+        }
+        let mut file = File::open(&path).map_err(|e| format!("{name}: {}", errstr(&e)))?;
+        let start = seek.checked_mul(ibs).ok_or("seek too large")?;
+        let left = count.map(|c| c.checked_mul(ibs).ok_or("count too large")).transpose()?;
+        file.seek(SeekFrom::Start(start)).map_err(|e| format!("{name}: {}", errstr(&e)))?;
+        Ok(Job::Dd { file, left, total: 0, ibs })
     }
 
     fn cmd_ls(&mut self, args: &[String]) {
@@ -463,6 +533,53 @@ impl RshSession {
 
     /// Move up to `want` bytes of a streaming job into `out`.
     fn advance_job(&mut self, want: usize) {
+        match self.job {
+            Job::None => {}
+            Job::Cat { .. } => self.advance_cat(want),
+            Job::Dd { .. } => self.advance_dd(want),
+        }
+    }
+
+    fn advance_dd(&mut self, want: usize) {
+        let Job::Dd { file, left, total, ibs } = &mut self.job else { return };
+        let cap = left.map_or(want as u64, |l| l.min(want as u64)) as usize;
+        let mut buf = vec![0u8; cap];
+        let res = loop {
+            if cap == 0 {
+                break Ok(0);
+            }
+            match file.read(&mut buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                r => break r,
+            }
+        };
+        match res {
+            Ok(n) if n > 0 => {
+                *total += n as u64;
+                if let Some(l) = left {
+                    *l -= n as u64;
+                }
+                self.out.extend(&buf[..n]);
+            }
+            Ok(_) => {
+                // The report goes to the stderr connection only: with none, it
+                // would land in the middle of the data.
+                let (full, partial) = (*total / *ibs, u64::from(*total % *ibs != 0));
+                if let Some(c) = &self.chan {
+                    let report = format!("{full}+{partial} records in\n{full}+{partial} records out\n");
+                    c.lock().data.extend(report.as_bytes());
+                }
+                self.finish();
+            }
+            Err(e) => {
+                let msg = format!("dd: read error: {}\n", errstr(&e));
+                self.err(&msg);
+                self.finish();
+            }
+        }
+    }
+
+    fn advance_cat(&mut self, want: usize) {
         let mut buf = vec![0u8; want];
         loop {
             let Job::Cat { files, cur } = &mut self.job else { return };
@@ -765,6 +882,90 @@ mod tests {
         assert_eq!(String::from_utf8(err.unwrap()).unwrap(),
                    "ls: nothing: No such file or directory\nls: ..: Permission denied\n");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn dd_fixture(tag: &str) -> (PathBuf, Vec<u8>) {
+        let root = tmp_root(tag);
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(root.join("dist"), &data).unwrap();
+        (root, data)
+    }
+
+    #[test]
+    fn dd_copies_the_whole_file_and_reports_on_stderr() {
+        let (root, data) = dd_fixture("dd1");
+        let (out, err) = run(&root, &req("4000", "dd if=/dist bs=10240"));
+        let mut want = vec![0u8];
+        want.extend_from_slice(&data);
+        assert_eq!(out, want);
+        // 100000 = 9 full 10240-byte records and a partial one.
+        assert_eq!(err.unwrap(), b"9+1 records in\n9+1 records out\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dd_seeks_and_counts_in_blocks() {
+        let (root, data) = dd_fixture("dd2");
+        // inst restarts the remote dd like this after a long forward seek.
+        let (out, err) = run(&root, &req("1", "dd if=dist bs=10240 iseek=3 count=2"));
+        assert_eq!(&out[1..], &data[30720..51200]);
+        assert_eq!(err.unwrap(), b"2+0 records in\n2+0 records out\n");
+        // skip= is the same thing; ibs= alone sets the input block size; k suffix.
+        let (out, _) = run(&root, &req("1", "dd if=dist ibs=1k skip=2 count=3"));
+        assert_eq!(&out[1..], &data[2048..5120]);
+        // Default block size is 512; a seek past the end copies nothing.
+        let (out, _) = run(&root, &req("1", "dd if=dist count=1"));
+        assert_eq!(&out[1..], &data[..512]);
+        let (out, err) = run(&root, &req("1", "dd if=dist iseek=100000"));
+        assert_eq!(out, b"\0");
+        assert_eq!(err.unwrap(), b"0+0 records in\n0+0 records out\n");
+        let (out, _) = run(&root, &req("1", "dd if=dist count=0"));
+        assert_eq!(out, b"\0");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dd_never_puts_its_report_in_the_data() {
+        let (root, data) = dd_fixture("dd3");
+        let (out, err) = run(&root, &req("0", "dd if=dist bs=4k"));
+        assert!(err.is_none());
+        assert_eq!(&out[1..], &data[..], "with no stderr connection the stream is exactly the file");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dd_refuses_what_it_cannot_do() {
+        let (root, _) = dd_fixture("dd4");
+        for (cmd, msg) in [
+            ("dd", "dd: reading standard input is not supported\n"),
+            ("dd if=dist of=/tmp/x", "dd: writing files is not supported\n"),
+            ("dd if=nothing", "dd: nothing: No such file or directory\n"),
+            ("dd if=../dist", "dd: ../dist: Permission denied\n"),
+            ("dd if=/", "dd: /: Is a directory\n"),
+            ("dd if=dist bs=0", "dd: bad block size\n"),
+            ("dd if=dist bs=x", "dd: bad numeric arg: bs=x\n"),
+            ("dd if=dist conv=sync", "dd: bad arg: conv=sync\n"),
+            ("dd if=dist junk", "dd: bad arg: junk\n"),
+            ("dd if=dist iseek=99999999999999999999", "dd: bad numeric arg: iseek=99999999999999999999\n"),
+        ] {
+            let (out, err) = run(&root, &req("9", cmd));
+            assert_eq!(out, b"\0", "{cmd}");
+            assert_eq!(String::from_utf8(err.unwrap()).unwrap(), msg, "{cmd}");
+        }
+        // of=/dev/stdout is what a caller might spell out; accepted.
+        assert_eq!(run(&root, &req("0", "dd if=dist count=1 of=/dev/stdout")).0.len(), 513);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dd_sizes() {
+        assert_eq!(parse_size("512"), Some(512));
+        assert_eq!(parse_size("2b"), Some(1024));
+        assert_eq!(parse_size("10k"), Some(10240));
+        assert_eq!(parse_size("3w"), Some(6));
+        for bad in ["", "k", "1m", "-1", "1.5", "x", "99999999999999999999k"] {
+            assert_eq!(parse_size(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

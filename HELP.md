@@ -196,11 +196,15 @@ the PROM says "Starting up the system" (from the monitor console:
 
 `rsh_dir = "DIR"` under `[network]` (or `--rsh-dir DIR`) starts a small rsh
 server at the gateway (`192.168.0.1`, TCP 514). It is not a shell and runs
-nothing on the host: it understands four built-in commands, read-only, on DIR.
+nothing on the host: it understands a few built-in commands, read-only, on DIR. `dd` is the one
+IRIX's `inst` uses to read a remote distribution (it restarts it with `iseek`
+after a long forward seek); its "records in/out" report goes only to the stderr
+connection, never into the data.
 
 ```
 rsh 192.168.0.1 ls /            # one name per line; -a, -l (type, mode, size)
 rsh 192.168.0.1 cat /dist/file  # any number of files, streamed
+rsh 192.168.0.1 dd if=/dist/file bs=10k iseek=3 count=2   # bs/ibs, count, iseek|skip; b k w suffixes
 rsh 192.168.0.1 echo hello
 rsh 192.168.0.1 pwd             # always /
 ```
