@@ -13,6 +13,18 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### NAT gateway
+
+- **A built-in rsh server at the gateway.** `[network] rsh_dir = "DIR"` (or
+  `--rsh-dir DIR`) answers TCP 514 at the gateway with `cat`, `ls`, `echo` and
+  `pwd` on DIR, read-only, so the guest can pull files with
+  `rsh 192.168.0.1 cat /file` without a host `rshd`. It is not a shell and runs
+  nothing on the host. It speaks the BSD `rcmd` protocol, including the
+  stderr connection back to the guest from a reserved port. `src/net/rsh.rs`
+  is the protocol and the sandbox; `TcpService` gained `pull` (stream output
+  instead of holding it) and `side_connect` (a service asks for a connection
+  to the guest).
+
 ### CPU idle parking
 
 - **An idle-park build no longer hangs IRIX at a raised spl.** The idle

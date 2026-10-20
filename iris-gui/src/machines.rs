@@ -102,6 +102,7 @@ pub fn visit_paths(cfg: &mut MachineConfig, mut visit: impl FnMut(&mut String)) 
         &mut cfg.load_elf,
         &mut cfg.test_device_dump,
         &mut cfg.network.tftp_dir,
+        &mut cfg.network.rsh_dir,
     ] {
         if let Some(path) = path {
             visit(path);

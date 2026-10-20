@@ -126,10 +126,30 @@ pub(super) trait TcpService: Send {
     }
     /// Bytes from the guest; returns bytes to send back.
     fn input(&mut self, data: &[u8]) -> Vec<u8>;
+    /// Output the service produces on its own, at most `max` bytes, asked for
+    /// whenever the guest's window has room and nothing is queued. This is how
+    /// a service streams something larger than it wants to hold in memory.
+    /// Empty means nothing right now (`done` says whether there will be more).
+    fn pull(&mut self, _max: usize) -> Vec<u8> {
+        Vec::new()
+    }
     /// True when the service has nothing more to say: we FIN once the output drains.
     fn done(&self) -> bool;
     /// The guest closed its side.
     fn guest_closed(&mut self) {}
+    /// A second connection the service wants opened toward the guest, polled
+    /// after each input (rsh's stderr channel). Returned at most once.
+    fn side_connect(&mut self) -> Option<SideConnect> {
+        None
+    }
+}
+
+/// A connection a [`TcpService`] asks the gateway to open to the guest, from
+/// the same gateway address the guest connected to, and the service that runs
+/// on it.
+pub(super) struct SideConnect {
+    pub guest_port: u16,
+    pub service: Box<dyn TcpService>,
 }
 
 pub(super) struct ServiceConn {
@@ -168,6 +188,10 @@ impl Backend {
         match self {
             Backend::Host(h) => h.stream.as_mut().ok_or(io::ErrorKind::NotConnected)?.read(buf),
             Backend::Service(s) => {
+                if s.out.is_empty() {
+                    let more = s.svc.pull(buf.len());
+                    s.out.extend(more);
+                }
                 if s.out.is_empty() {
                     return if s.svc.done() { Ok(0) } else { Err(io::ErrorKind::WouldBlock.into()) };
                 }
@@ -661,6 +685,15 @@ impl TcpConn {
 
     pub(super) fn backend(&self) -> &Backend {
         &self.backend
+    }
+
+    /// A connection the in-core service behind this one wants opened toward
+    /// the guest. Host-socket backends never ask.
+    pub(super) fn take_side_connect(&mut self) -> Option<SideConnect> {
+        match &mut self.backend {
+            Backend::Service(s) => s.svc.side_connect(),
+            Backend::Host(_) => None,
+        }
     }
 
     /// The next retransmission or handshake timer.

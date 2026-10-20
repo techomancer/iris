@@ -206,6 +206,7 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
 | `network.tftp_dir` | `unset` | Read-only TFTP root at the NAT gateway for PROM network boot. |
+| `network.rsh_dir` | `unset` | Root for the built-in rsh server at the NAT gateway (TCP 514): `rsh <gateway> cat\|ls\|echo\|pwd`, read-only, nothing runs on the host. |
 
 ### [nfs]
 
@@ -356,6 +357,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
 | `--tftp-dir` | Serve this directory read-only over TFTP at the gateway address, so the PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset. |
+| `--rsh-dir` | Let the guest `rsh <gateway> cat\|ls\|echo\|pwd` against this directory, read-only, through a built-in rsh server at the gateway (TCP 514). Nothing is executed on the host. Off when unset. |
 | `--perfetto FILE` | Record a Perfetto trace from startup (`perfetto` builds). `--perfetto-cats LIST` (default `all`) and `--perfetto-clock host\|guest` (default `host`) select what and on which timeline. See [docs/perfetto.md](docs/perfetto.md). |
 | `--load-elf` | Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the CPU starts and set PC to its entry point, instead of booting the PROM. For bare-metal test binaries; see also the monitor's `loadelf`. |
 | `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |

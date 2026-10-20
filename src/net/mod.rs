@@ -18,6 +18,7 @@
 //!   nfsudp.rs    in-core NFSv2/v3 server
 //!   nfs_pcap.rs  the NFS server as its own LAN host (PCAP mode)
 //!   tftp.rs      read-only TFTP for PROM network boot
+//!   rsh.rs       read-only rsh (TCP 514): a few built-in commands over one directory
 //!   xdmcp.rs     XDMCP gateway into the guest's xdm
 //!   host_dns.rs  host DNS server discovery for DNS relaying
 //!   net_pcap.rs  PCAP bridged backend (`pcap` feature)
@@ -37,6 +38,7 @@ pub mod net_pcap;
 pub mod nfsudp;
 pub mod packet;
 mod portmap;
+mod rsh;
 mod services;
 mod tcp;
 pub mod wake;
@@ -89,6 +91,10 @@ pub struct GatewayConfig {
     /// Root directory served read-only over TFTP at the gateway, for PROM
     /// network boot (`boot -f bootp()<file>`). None disables TFTP entirely.
     pub tftp_dir: Option<std::path::PathBuf>,
+    /// Root directory for the built-in read-only rsh server (TCP 514 at the
+    /// gateway): `rsh <gateway> cat|ls|echo|pwd`. Nothing is executed on the
+    /// host. None disables it, and 514 is then relayed to the host like any port.
+    pub rsh_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -106,6 +112,7 @@ impl Default for GatewayConfig {
             pcap_interface: None,
             nfs_pcap_ip:  None,
             tftp_dir:     None,
+            rsh_dir:      None,
         }
     }
 }

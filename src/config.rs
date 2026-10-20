@@ -277,6 +277,9 @@ pub struct NetworkConfig {
     /// Directory served read-only over TFTP at the gateway, for PROM network
     /// boot. None (the default) disables the TFTP server.
     pub tftp_dir: Option<std::path::PathBuf>,
+    /// Directory served read-only by the gateway's built-in rsh server (TCP
+    /// 514). None (the default) disables it.
+    pub rsh_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for NetworkConfig {
@@ -289,6 +292,7 @@ impl Default for NetworkConfig {
             pcap_interface: None,
             nfs_pcap_ip: None,
             tftp_dir: None,
+            rsh_dir: None,
             mac: DEFAULT_MAC,
         }
     }
@@ -326,6 +330,11 @@ pub struct NetworkSection {
     /// the PROM can `boot -f bootp()<file>`. Unset disables TFTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tftp_dir: Option<String>,
+    /// Directory the gateway's built-in rsh server (TCP 514) works on, so the
+    /// guest can `rsh <gateway> cat|ls|echo|pwd`. Read-only; nothing is
+    /// executed on the host. Unset disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsh_dir: Option<String>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -1555,6 +1564,7 @@ impl MachineConfig {
             nfs_pcap_ip:  self.network.nfs_pcap_ip,
             mac,
             tftp_dir:     self.network.tftp_dir.as_ref().map(std::path::PathBuf::from),
+            rsh_dir:      self.network.rsh_dir.as_ref().map(std::path::PathBuf::from),
         }
     }
 
@@ -1763,6 +1773,12 @@ pub struct Cli {
     #[arg(long = "tftp-dir", value_name = "DIR")]
     pub tftp_dir: Option<String>,
 
+    /// Let the guest `rsh <gateway> cat|ls|echo|pwd` against this directory,
+    /// read-only, through a built-in rsh server at the gateway (TCP 514).
+    /// Nothing is executed on the host. Off when unset.
+    #[arg(long = "rsh-dir", value_name = "DIR")]
+    pub rsh_dir: Option<String>,
+
     /// Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the
     /// CPU starts and set PC to its entry point, instead of booting the PROM.
     /// For bare-metal test binaries; see also the monitor's `loadelf`.
@@ -1879,6 +1895,7 @@ impl Cli {
         if let Some(ref p) = self.perfetto_cats { cfg.perfetto_cats = Some(p.clone()); }
         if let Some(ref p) = self.perfetto_clock { cfg.perfetto_clock = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
+        if let Some(ref d) = self.rsh_dir { cfg.network.rsh_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }
         if let Some(ref p) = self.test_device_dump { cfg.test_device_dump = Some(p.clone()); }
         if self.cheritest_dump_hook { cfg.cheritest_dump_hook = true; }

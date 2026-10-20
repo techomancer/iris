@@ -9,8 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use super::engine::{FlowKey, NatEngine};
 use super::packet::{MacAddr, Tcp, TcpFlags, TcpHeader};
 use super::portmap::PORTMAP_PORT;
+use super::rsh::{RshSession, RSH_PORT};
 use super::services::TIME_PORT;
-use super::tcp::{Backend, Endpoints, HostConn, PortmapService, ServiceConn, State, TcpConn, TimeService};
+use super::tcp::{Backend, Endpoints, HostConn, PortmapService, ServiceConn, SideConnect, State, TcpConn, TimeService};
 use crate::devlog::LogModule;
 
 /// The guest's FTP server port, for the passive-mode ALG on inbound forwards.
@@ -128,6 +129,8 @@ impl NatEngine {
             Backend::Service(ServiceConn::new(Box::new(TimeService(super::services::rfc868_time()))))
         } else if to_gw && dport == PORTMAP_PORT && self.config.nfs.is_some() {
             Backend::Service(ServiceConn::new(Box::new(PortmapService::default())))
+        } else if let Some(root) = self.config.rsh_dir.as_ref().filter(|_| to_gw && dport == RSH_PORT) {
+            Backend::Service(ServiceConn::new(Box::new(RshSession::new(root.clone()))))
         } else {
             let (host_ip, host_port) = self.gateway_to_host(dst_ip, dport);
             dlog_dev!(LogModule::Net, "NAT TCP connect {}:{} → {}:{}", src_ip, syn.sport(), host_ip, host_port);
@@ -149,10 +152,15 @@ impl NatEngine {
         let gw_mac = self.config.gateway_mac;
         let mut frames = Vec::new();
         let mut budget = self.queue_room();
+        let mut side_connects = Vec::new();
         for conn in self.tcp_nat.values_mut() {
             let out = conn.poll(gw_mac, budget);
             budget = budget.saturating_sub(out.len());
             frames.extend(out);
+            // A service (rsh) may have just asked for a connection back to the guest.
+            if let Some(side) = conn.take_side_connect() {
+                side_connects.push((conn.ends, side));
+            }
         }
         self.tcp_nat.retain(|key, c| {
             let keep = !c.is_done();
@@ -164,6 +172,27 @@ impl NatEngine {
         for f in frames {
             self.send(f);
         }
+        for (main, side) in side_connects {
+            self.open_side_connection(main, side);
+        }
+    }
+
+    /// Open the connection a service asked for toward the guest: from the
+    /// gateway address the guest connected to, at the port the service named.
+    /// rsh's stderr channel is the case: `rcmd` waits to accept it, and checks
+    /// that it comes from a reserved port.
+    fn open_side_connection(&mut self, main: Endpoints, side: SideConnect) {
+        let Some(sport) = self.alloc_sport(side.guest_port, true) else {
+            dlog_dev!(LogModule::Net, "NAT TCP: no reserved source port for a connection to guest :{}", side.guest_port);
+            return;
+        };
+        dlog_dev!(LogModule::Net, "NAT TCP side connection {}:{} → guest {}:{}",
+                  main.remote_ip, sport, main.guest_ip, side.guest_port);
+        let ends = Endpoints { guest_port: side.guest_port, remote_port: sport, ..main };
+        let conn = TcpConn::open(ends, Backend::Service(ServiceConn::new(side.service)));
+        let syn = conn.syn(self.config.gateway_mac);
+        self.tcp_nat.insert((u32::from(ends.remote_ip), ends.remote_port, ends.guest_port), conn);
+        self.send(syn);
     }
 
     /// Open a connection toward the guest for an accepted forward.

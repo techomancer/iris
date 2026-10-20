@@ -162,6 +162,9 @@ src/net/
                  real source, aliases for gateway/loopback and the DNS relay
   nat_icmp.rs    echo: local at the gateway, relayed elsewhere
   services.rs    UdpService (time, NTP, portmap, NFS+mountd, TFTP) and BOOTP
+  rsh.rs         TcpService: read-only rsh (cat, ls, echo, pwd) on one directory;
+                 streams files with `pull`, opens rsh's stderr connection back
+                 to the guest with `side_connect`
   fwd.rs         inbound forwards (+ XDMCP ALG)
   frag.rs, portmap.rs, nfs_pcap.rs (the NFS server as a LAN host in PCAP mode)
   testnet.rs     directed tests: a scripted guest against a real engine
@@ -202,6 +205,9 @@ Each step kept `cargo test` and `test/net` green and was measured against §2.
   HTTP/ping, FTP to a LAN server, telnet to a LAN host, and the stall probe.
 - `test/net/host.sh` (host) — the same through inbound port forwards.
 - `test/tftp/` — TFTP and PROM network boot.
+- `rsh_*` in `testnet.rs` — the rsh server end to end (request, stdout, the
+  stderr connection from a reserved port); `net::rsh::tests` — the protocol
+  and the sandbox.
 
 ## 8. Left to do
 

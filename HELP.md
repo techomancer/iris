@@ -192,6 +192,33 @@ To reach the Command Monitor on a machine that autoboots, press Esc while
 the PROM says "Starting up the system" (from the monitor console:
 `ps2 esc`). `test/tftp/` has a guest-side client and a test script.
 
+### rsh (files from the host)
+
+`rsh_dir = "DIR"` under `[network]` (or `--rsh-dir DIR`) starts a small rsh
+server at the gateway (`192.168.0.1`, TCP 514). It is not a shell and runs
+nothing on the host: it understands four built-in commands, read-only, on DIR.
+
+```
+rsh 192.168.0.1 ls /            # one name per line; -a, -l (type, mode, size)
+rsh 192.168.0.1 cat /dist/file  # any number of files, streamed
+rsh 192.168.0.1 echo hello
+rsh 192.168.0.1 pwd             # always /
+```
+
+Names are relative to DIR even when they start with `/`, and nothing outside
+DIR (`..`, symlinks out) is reachable, as with TFTP. Pipes, redirects,
+wildcards and `$` are refused rather than guessed at, and an unknown command
+says `Command not found.` The rsh protocol has no exit status, so a failing
+command shows only in its error text. There is no login check (the user names
+are logged, not tested): like TFTP and NFS here, the service exists only on the
+guest side of the NAT.
+
+IRIX's `rsh` asks for a second connection for stderr; the gateway opens it back
+to the guest from a reserved port, which `rcmd` insists on. With `rsh_dir` set,
+guest connections to gateway port 514 are answered here instead of being
+relayed to a host `rshd`. NAT mode only. Run `rsh -n` if the command should not
+read the terminal.
+
 ### NAT
 
 All outbound TCP, UDP, and ICMP traffic from the guest is NATed through the
@@ -538,6 +565,7 @@ mode = "nat"                # or "pcap" (--features pcap)
 # nfs_pcap_ip = "192.168.1.250"   # PCAP only: LAN IP the NFS server answers on
 # mac = "08:00:69:12:34:56" # ec0 MAC, injected into blank NVRAM before boot
 # tftp_dir = "tftpboot"     # serve read-only over TFTP at the gateway
+# rsh_dir = "shared"        # `rsh <gateway> cat|ls|echo|pwd` on this dir, read-only
 
 # [nfs]
 # shared_dir = "./shared"
@@ -642,6 +670,7 @@ Networking
   --list-net-interfaces       Print bridgeable interfaces and exit
   --nfs-dir <DIR>             Export DIR over the in-process NFS server
   --tftp-dir <DIR>            Serve DIR read-only over TFTP at the gateway
+  --rsh-dir <DIR>             Built-in read-only rsh server on DIR at the gateway (cat, ls, echo, pwd)
 
 Automation and debugging
   --ci                        Enable the CI socket; hide the window unless --ci-display
