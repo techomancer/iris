@@ -16,6 +16,14 @@ use std::io::Write;
 pub const IOC_BASE: u32 = 0x1FBD9800;
 pub const IOC_SIZE: u32 = 0x100;
 
+/// The CPU interrupt lines this controller drives: IP2..IP6, the same set
+/// `update_interrupts` publishes. The atomic word they live in is shared —
+/// IP7 is the compare timer's (raised on the hptimer thread) and bit 63 is
+/// the soft-reset request a device sets through `CpuDevice::signal` — so
+/// anything that touches the word on the IOC's behalf must mask to these.
+const IOC_OWNED_LINES: u64 =
+    (CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6) as u64;
+
 /// Fullhouse-only: real physical base of the INT2 register block (HPC3 PBUS
 /// PIO channel 4 — same address `crate::dev::hpc3::HPC3_BASE + HPC3_INT2_BASE`
 /// resolves to). Lower than `IOC_BASE` (PIO channel 6), so `read8`/`write8`
@@ -1326,11 +1334,15 @@ impl Resettable for Ioc {
         state.dma_sel = 0;
         state.reset_reg = 0;
         state.write_reg = 0;
-        // Clear CPU interrupt lines
+        // Clear the CPU lines this controller drives — and only those. The
+        // word is shared: a blanket store(0) also drops IP7, which the
+        // compare timer raises from the hptimer thread, and bit 63, a
+        // soft-reset request set through `CpuDevice::signal`. Either can land
+        // between the CPU's own reset and this one and would then be lost.
         // Safety: see IocState.interrupts's doc comment.
         if let Some(irqs) = state.interrupts.map(|p| unsafe { &*p }) {
             use std::sync::atomic::Ordering;
-            irqs.store(0, Ordering::SeqCst);
+            irqs.fetch_and(!IOC_OWNED_LINES, Ordering::SeqCst);
         }
     }
 }
@@ -1440,6 +1452,27 @@ mod tests {
         assert!(text.contains("fast clock") && text.contains("fired 1 ") && text.contains("acked 1 "), "{text}");
         let s = ioc.state.lock();
         assert_eq!((s.ticks[1].fired, s.ticks[1].acked), (0, 0), "a new window starts empty");
+    }
+
+    /// A power-on reset drops exactly the CPU lines the IOC drives. The word
+    /// is shared: IP7 is the compare timer's (raised on the hptimer thread)
+    /// and bit 63 is a soft-reset request set through `CpuDevice::signal`,
+    /// neither of which the IOC owns, so a reset must leave both alone.
+    #[test]
+    fn power_on_clears_only_the_cpu_lines_the_ioc_drives() {
+        use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
+        assert_eq!(
+            IOC_OWNED_LINES,
+            (CAUSE_IP2 | CAUSE_IP3 | CAUSE_IP4 | CAUSE_IP5 | CAUSE_IP6) as u64,
+            "the IOC drives IP2..IP6; IP7 and bit 63 belong to the CPU");
+
+        let ioc = Ioc::new_ci(false);
+        let word = AtomicU64::new(u64::MAX); // every line pending, including the CPU's
+        ioc.set_interrupts(&word);
+        ioc.power_on();
+
+        assert_eq!(word.load(Ordering::SeqCst), !IOC_OWNED_LINES,
+            "a reset clears the IOC's own lines and nothing else");
     }
 
     /// Phase 1.7 round-trip: a fresh IOC loaded from a captured save_state must
