@@ -42,7 +42,9 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -299,7 +301,25 @@ enum Job {
     Dd { file: File, left: Option<u64>, total: u64, ibs: u64 },
 }
 
+/// With `IRIS_RSH_TRACE` set, every request and how it ended is written to
+/// stderr, in any build (`dlog_dev!` output exists only in `developer` builds).
+/// It shows what a client asks for, how many bytes each request moved and how
+/// long it took, and requests that never finished, which is what slow or hung
+/// installs need.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_RSH_TRACE").is_some())
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct RshSession {
+    id: u64,
+    trace: bool,
+    started: Instant,
+    command: String,
+    /// Stdout bytes handed to the connection so far.
+    sent: u64,
     root: PathBuf,
     phase: Phase,
     inbuf: Vec<u8>,
@@ -315,6 +335,8 @@ impl RshSession {
     /// Serve the built-in commands out of `root`. Nothing outside it is reachable.
     pub fn new(root: PathBuf) -> Self {
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed), trace: trace_enabled(),
+            started: Instant::now(), command: String::new(), sent: 0,
             root, phase: Phase::Header, inbuf: Vec::new(), out: VecDeque::new(),
             job: Job::None, chan: None, side: None, finished: false,
         }
@@ -349,6 +371,11 @@ impl RshSession {
         dlog_dev!(LogModule::Net, "NAT rsh local user {:?}, remote user {:?}: {:?}",
                   req.local_user, req.remote_user, req.command);
         self.phase = Phase::Running;
+        if self.trace {
+            eprintln!("iris: rsh #{} {}@{}: {:?} (stderr port {})", self.id, req.remote_user,
+                      req.local_user, req.command, req.stderr_port);
+        }
+        self.command = req.command.clone();
         if req.stderr_port != 0 {
             let chan = Arc::new(Mutex::new(Chan::default()));
             self.side = Some(SideConnect {
@@ -646,6 +673,22 @@ fn mode_string(m: &fs::Metadata) -> String {
     s
 }
 
+impl Drop for RshSession {
+    fn drop(&mut self) {
+        if !self.trace {
+            return;
+        }
+        let ms = self.started.elapsed().as_millis();
+        let how = match (&self.phase, self.finished) {
+            (Phase::Header, _) => format!("never sent a whole request ({} bytes of header)", self.inbuf.len()),
+            (_, true) if self.out.is_empty() => "complete".to_string(),
+            (_, true) => format!("closed with {} bytes unsent", self.out.len()),
+            (_, false) => "closed by the guest before the command finished".to_string(),
+        };
+        eprintln!("iris: rsh #{} {:?}: {} bytes in {} ms, {}", self.id, self.command, self.sent, ms, how);
+    }
+}
+
 impl TcpService for RshSession {
     fn input(&mut self, data: &[u8]) -> Vec<u8> {
         // Anything after the header is the client's stdin: there is no process
@@ -670,6 +713,7 @@ impl TcpService for RshSession {
             self.advance_job(max - self.out.len());
         }
         let n = max.min(self.out.len());
+        self.sent += n as u64;
         self.out.drain(..n).collect()
     }
 

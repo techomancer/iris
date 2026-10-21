@@ -220,7 +220,13 @@ guest side of the NAT.
 IRIX's `rsh` asks for a second connection for stderr; the gateway opens it back
 to the guest from a reserved port, which `rcmd` insists on. With `rsh_dir` set,
 guest connections to gateway port 514 are answered here instead of being
-relayed to a host `rshd`. NAT mode only. Run `rsh -n` if the command should not
+relayed to a host `rshd`. NAT mode only.
+
+To see what a client (IRIX `inst`, say) asks for, start iris with
+`IRIS_RSH_TRACE=1`. Each request is written to stderr when it arrives and again
+when it ends, with the bytes moved, the time taken, and whether it completed,
+was cut short by the guest, or never sent a whole request. This works in any
+build; the `net debug` logging needs a `developer` build. Run `rsh -n` if the command should not
 read the terminal.
 
 ### NAT
