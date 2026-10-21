@@ -96,6 +96,9 @@ impl NatEngine {
             }
             udp_services.push(svc);
         }
+        if let Some(dir) = &config.rsh_dir {
+            eprintln!("iris: rsh server (read-only: cat, dd, ls, echo, pwd) serving {}", dir.display());
+        }
         Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false,

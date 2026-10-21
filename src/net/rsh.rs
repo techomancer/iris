@@ -306,7 +306,7 @@ enum Job {
 /// It shows what a client asks for, how many bytes each request moved and how
 /// long it took, and requests that never finished, which is what slow or hung
 /// installs need.
-fn trace_enabled() -> bool {
+pub(super) fn trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("IRIS_RSH_TRACE").is_some())
 }

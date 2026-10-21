@@ -226,7 +226,11 @@ To see what a client (IRIX `inst`, say) asks for, start iris with
 `IRIS_RSH_TRACE=1`. Each request is written to stderr when it arrives and again
 when it ends, with the bytes moved, the time taken, and whether it completed,
 was cut short by the guest, or never sent a whole request. This works in any
-build; the `net debug` logging needs a `developer` build. Run `rsh -n` if the command should not
+build; the `net debug` logging needs a `developer` build.
+At startup iris prints `iris: rsh server ... serving DIR` when `rsh_dir` is on.
+Every guest connection to port 514 is also reported with where it went, so a
+trace with no requests means the guest never reached the built-in server (the
+`rsh_dir` is unset, or `inst` is pointed at an address other than the gateway). Run `rsh -n` if the command should not
 read the terminal.
 
 ### NAT
