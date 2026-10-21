@@ -1307,8 +1307,11 @@ fn rsh_cat_with_a_stderr_connection() {
     let gw = net.gw_ip;
     let (mut out, flags) = GuestTcp::connect(&mut net, gw, 514, 1023);
     assert!(flags.syn(), "the gateway answers on 514");
-    out.send_all(&mut net, b"5000\0guest\0root\0cat /hello.txt nope ../hello.txt\0");
+    // rcmd sends the port alone and waits for the connection back before it
+    // sends the user names and the command.
+    out.send_all(&mut net, b"5000\0");
     let mut err = accept_side_connection(&mut net, 5000);
+    out.send_all(&mut net, b"guest\0root\0cat /hello.txt nope ../hello.txt\0");
 
     let want_err = b"cat: nope: No such file or directory\ncat: ../hello.txt: Permission denied\n";
     out.recv(&mut net, Some(1 + data.len()));

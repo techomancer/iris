@@ -26,10 +26,16 @@
 //! ```
 //!
 //! A stderr port of `0` means the client wants no second connection; error
-//! text then goes down the main connection. `rcmd` blocks accepting the second
-//! connection, so a client that asked for one must get it. That connection is
-//! requested through [`TcpService::side_connect`]. The protocol carries no exit
-//! status, so a failing command is reported only in its error text.
+//! text then goes down the main connection. That connection is requested
+//! through [`TcpService::side_connect`]. The protocol carries no exit status,
+//! so a failing command is reported only in its error text.
+//!
+//! **The connection back must not wait for the rest of the request.** `rcmd`
+//! sends *only* the stderr port, then blocks accepting the second connection,
+//! and sends the user names and the command only after that. A server that
+//! waits for the whole request before connecting back deadlocks with it until
+//! the client gives up (inst's 120 s timeout). So the connection is requested
+//! as soon as the first field has arrived.
 //!
 //! `dd if=FILE [bs=N] [ibs=N] [count=N] [iseek=N|skip=N]` is what IRIX `inst`
 //! uses to read a distribution from a remote host: it restarts the remote `dd`
@@ -137,6 +143,17 @@ pub fn parse_request(buf: &[u8]) -> Parse {
         remote_user: text(fields[2]),
         command: text(fields[3]),
     })
+}
+
+/// The stderr port field: empty (rcmd's "none") or up to five decimal digits.
+fn parse_port(field: &[u8]) -> Option<u16> {
+    if field.len() > 5 || !field.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    match std::str::from_utf8(field).ok()? {
+        "" => Some(0),
+        s => s.parse::<u16>().ok(),
+    }
 }
 
 /// Split a command line into words: whitespace separates, single and double
@@ -329,6 +346,12 @@ pub struct RshSession {
     chan: Option<Arc<Mutex<Chan>>>,
     side: Option<SideConnect>,
     finished: bool,
+    /// The stderr port field has arrived and been acted on.
+    port_seen: bool,
+    /// A whole request has arrived and the command was started.
+    requested: bool,
+    /// The stderr port the client named, for the trace.
+    stderr_port: u16,
 }
 
 impl RshSession {
@@ -339,6 +362,7 @@ impl RshSession {
             started: Instant::now(), command: String::new(), sent: 0,
             root, phase: Phase::Header, inbuf: Vec::new(), out: VecDeque::new(),
             job: Job::None, chan: None, side: None, finished: false,
+            port_seen: false, requested: false, stderr_port: 0,
         }
     }
 
@@ -367,6 +391,20 @@ impl RshSession {
         self.finish();
     }
 
+    /// Ask for the connection back to the client's stderr port, once.
+    fn open_stderr(&mut self, port: u16) {
+        self.stderr_port = port;
+        if port == 0 || self.chan.is_some() {
+            return;
+        }
+        if self.trace {
+            eprintln!("iris: rsh #{} stderr port {}: connecting back to the guest", self.id, port);
+        }
+        let chan = Arc::new(Mutex::new(Chan::default()));
+        self.side = Some(SideConnect { guest_port: port, service: Box::new(StderrService(chan.clone())) });
+        self.chan = Some(chan);
+    }
+
     fn start(&mut self, req: Request) {
         dlog_dev!(LogModule::Net, "NAT rsh local user {:?}, remote user {:?}: {:?}",
                   req.local_user, req.remote_user, req.command);
@@ -376,14 +414,8 @@ impl RshSession {
                       req.local_user, req.command, req.stderr_port);
         }
         self.command = req.command.clone();
-        if req.stderr_port != 0 {
-            let chan = Arc::new(Mutex::new(Chan::default()));
-            self.side = Some(SideConnect {
-                guest_port: req.stderr_port,
-                service: Box::new(StderrService(chan.clone())),
-            });
-            self.chan = Some(chan);
-        }
+        self.requested = true;
+        self.open_stderr(req.stderr_port); // a no-op: the first field already did
         self.out.push_back(0); // accepted
         let words = match split_words(&req.command) {
             Ok(w) => w,
@@ -679,11 +711,15 @@ impl Drop for RshSession {
             return;
         }
         let ms = self.started.elapsed().as_millis();
-        let how = match (&self.phase, self.finished) {
-            (Phase::Header, _) => format!("never sent a whole request ({} bytes of header)", self.inbuf.len()),
-            (_, true) if self.out.is_empty() => "complete".to_string(),
-            (_, true) => format!("closed with {} bytes unsent", self.out.len()),
-            (_, false) => "closed by the guest before the command finished".to_string(),
+        let how = if !self.requested {
+            format!("the guest never sent a whole request ({} bytes received, stderr port {})",
+                    self.inbuf.len(), if self.port_seen { self.stderr_port.to_string() } else { "not yet seen".into() })
+        } else if self.finished && self.out.is_empty() {
+            "complete".to_string()
+        } else if self.finished {
+            format!("closed with {} bytes unsent", self.out.len())
+        } else {
+            "closed by the guest before the command finished".to_string()
         };
         eprintln!("iris: rsh #{} {:?}: {} bytes in {} ms, {}", self.id, self.command, self.sent, ms, how);
     }
@@ -697,6 +733,29 @@ impl TcpService for RshSession {
             return Vec::new();
         }
         self.inbuf.extend_from_slice(data);
+        // rcmd sends the stderr port alone and waits for us to connect back
+        // before it sends anything else: act on it as soon as it is here.
+        if !self.port_seen {
+            match self.inbuf.iter().position(|&b| b == 0) {
+                Some(end) => match parse_port(&self.inbuf[..end]) {
+                    Some(port) => {
+                        self.port_seen = true;
+                        self.open_stderr(port);
+                    }
+                    None => {
+                        self.phase = Phase::Running;
+                        self.reject(PROTOCOL_FAILURE);
+                        return Vec::new();
+                    }
+                },
+                None if self.inbuf.len() > 5 => {
+                    self.phase = Phase::Running;
+                    self.reject(PROTOCOL_FAILURE);
+                    return Vec::new();
+                }
+                None => return Vec::new(),
+            }
+        }
         match parse_request(&self.inbuf) {
             Parse::Need => {}
             Parse::Bad(msg) => {
@@ -781,6 +840,55 @@ mod tests {
         }));
         // An empty stderr port is "none".
         assert!(matches!(parse_request(&req("", "pwd")), Parse::Done(Request { stderr_port: 0, .. })));
+    }
+
+    /// rcmd sends the stderr port alone and waits for the connection back
+    /// before it sends the rest. Waiting for the whole request deadlocks.
+    #[test]
+    fn the_connection_back_does_not_wait_for_the_command() {
+        let root = tmp_root("handshake");
+        fs::write(root.join("f"), b"data").unwrap();
+        let mut s = RshSession::new(root.clone());
+        assert!(s.input(b"40").is_empty());
+        assert!(s.side_connect().is_none(), "half a port number is not a port");
+        s.input(b"00\0");
+        let side = s.side_connect().expect("asked for as soon as the port is complete");
+        assert_eq!(side.guest_port, 4000);
+        assert!(s.pull(64).is_empty() && !s.done(), "nothing is accepted before the command");
+        s.input(b"guest\0root\0cat f\0");
+        assert!(s.side_connect().is_none(), "asked for once");
+        let mut out = Vec::new();
+        while !s.done() {
+            out.extend(s.pull(64));
+        }
+        assert_eq!(out, b"\0data");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rcmd_without_a_stderr_connection_sends_an_empty_port() {
+        let root = tmp_root("noerr");
+        let mut s = RshSession::new(root.clone());
+        s.input(b"\0");
+        assert!(s.side_connect().is_none());
+        s.input(b"a\0b\0pwd\0");
+        let mut out = Vec::new();
+        while !s.done() {
+            out.extend(s.pull(64));
+        }
+        assert_eq!(out, b"\0/\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bad_port_is_refused_at_once() {
+        for bad in [&b"12x\0"[..], b"123456\0", b"99999\0", b"abcdefg"] {
+            let mut s = RshSession::new(std::env::temp_dir());
+            s.input(bad);
+            assert!(s.side_connect().is_none());
+            assert_eq!(s.pull(100)[0], 1, "{bad:?}");
+            assert!(s.done());
+        }
     }
 
     #[test]
