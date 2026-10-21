@@ -352,6 +352,17 @@ pub struct RshSession {
     requested: bool,
     /// The stderr port the client named, for the trace.
     stderr_port: u16,
+    /// Shell mode: `exec /bin/sh` and friends. The client's stdin is a script,
+    /// run line by line against the built-in commands.
+    shell: bool,
+    /// The current shell command (if any) is over; the next line may run.
+    cmd_done: bool,
+    /// Stdin received and not yet run.
+    stdin: Vec<u8>,
+    /// The client closed its side of stdin.
+    stdin_eof: bool,
+    /// `2>/dev/null` on the running line: error text is dropped.
+    quiet: bool,
 }
 
 impl RshSession {
@@ -363,11 +374,23 @@ impl RshSession {
             root, phase: Phase::Header, inbuf: Vec::new(), out: VecDeque::new(),
             job: Job::None, chan: None, side: None, finished: false,
             port_seen: false, requested: false, stderr_port: 0,
+            shell: false, cmd_done: true, stdin: Vec::new(), stdin_eof: false, quiet: false,
         }
     }
 
     /// The command is over: no more output, and the stderr channel can close.
     fn finish(&mut self) {
+        if self.shell && !self.finished {
+            // A command in a shell session: the shell carries on.
+            self.job = Job::None;
+            self.cmd_done = true;
+            return;
+        }
+        self.end_session();
+    }
+
+    /// The whole session is over.
+    fn end_session(&mut self) {
         self.finished = true;
         self.job = Job::None;
         if let Some(c) = &self.chan {
@@ -378,6 +401,9 @@ impl RshSession {
     /// Error text for the client: on the stderr connection when it has one,
     /// else down the main connection.
     fn err(&mut self, msg: &str) {
+        if self.quiet {
+            return;
+        }
         match &self.chan {
             Some(c) => c.lock().data.extend(msg.as_bytes()),
             None => self.out.extend(msg.as_bytes()),
@@ -424,11 +450,33 @@ impl RshSession {
                 return self.finish();
             }
         };
+        if is_shell(&words) {
+            // The installer runs `exec /bin/sh` and sends its commands as
+            // stdin; there is no shell to give it, but the read-only commands
+            // can be run from what it sends.
+            self.shell = true;
+            self.cmd_done = true;
+            return;
+        }
+        self.run_words(&words);
+    }
+
+    /// Run one command (already split into words).
+    fn run_words(&mut self, words: &[String]) {
+        let words = match words.split_first() {
+            Some((e, rest)) if e == "exec" => rest,
+            _ => words,
+        };
         let Some((name, args)) = words.split_first() else {
+            if self.shell {
+                return self.finish();
+            }
             self.err("rshd: no command given (interactive login is not supported)\n");
             return self.finish();
         };
         match name.as_str() {
+            "true" | ":" | "cd" | "export" | "set" | "umask" | "unset" => self.finish(),
+            "exit" | "logout" => self.end_session(),
             "cat" => self.cmd_cat(args),
             "dd" => self.cmd_dd(args),
             "ls" => self.cmd_ls(args),
@@ -440,6 +488,52 @@ impl RshSession {
             other => {
                 self.err(&format!("{other}: Command not found.\n"));
                 self.finish();
+            }
+        }
+    }
+
+    /// Run the complete lines of stdin, one command at a time, while the
+    /// previous one is over. At end of stdin the session ends.
+    fn pump_shell(&mut self) {
+        while self.shell && !self.finished && self.cmd_done {
+            let Some(nl) = self.stdin.iter().position(|&b| b == b'\n') else {
+                if self.stdin_eof {
+                    self.end_session();
+                }
+                return;
+            };
+            let raw: Vec<u8> = self.stdin.drain(..=nl).collect();
+            let mut line = String::from_utf8_lossy(&raw).trim().to_string();
+            if self.trace {
+                eprintln!("iris: rsh #{} stdin: {:?}", self.id, line);
+            }
+            self.quiet = false;
+            for pat in ["2>/dev/null", "2> /dev/null"] {
+                if line.contains(pat) {
+                    line = line.replace(pat, " ");
+                    self.quiet = true;
+                }
+            }
+            line = line.replace("2>&1", " ").replace("</dev/null", " ");
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            self.cmd_done = false;
+            // `;` separates commands; the rest of the line waits its turn by
+            // going back on the front of stdin.
+            let (first, rest) = split_semicolon(&line);
+            if let Some(rest) = rest {
+                let mut again = rest.into_bytes();
+                again.push(b'\n');
+                again.extend_from_slice(&self.stdin);
+                self.stdin = again;
+            }
+            match split_words(&first) {
+                Ok(w) => self.run_words(&w),
+                Err(e) => {
+                    self.err(&format!("sh: {e}\n"));
+                    self.finish();
+                }
             }
         }
     }
@@ -676,6 +770,31 @@ impl RshSession {
     }
 }
 
+/// `sh`, `/bin/ksh`, `-sh` ...: a command that wants a shell on stdin.
+fn is_shell(words: &[String]) -> bool {
+    let words = match words.split_first() {
+        Some((e, rest)) if e == "exec" => rest,
+        _ => words,
+    };
+    words.first().is_some_and(|w| {
+        matches!(w.rsplit('/').next().unwrap_or(""), "sh" | "ksh" | "bash" | "csh" | "tcsh" | "-sh")
+    })
+}
+
+/// Split a line at its first `;` outside quotes.
+fn split_semicolon(line: &str) -> (String, Option<String>) {
+    let mut quote = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, ';') => return (line[..i].to_string(), Some(line[i + 1..].to_string())),
+            _ => {}
+        }
+    }
+    (line.to_string(), None)
+}
+
 /// One `ls` output line: the bare name, or a long line with type/permissions
 /// and size (there is no owner or date: the host's are meaningless to IRIX).
 fn ls_line(name: &str, m: &fs::Metadata, long: bool) -> String {
@@ -729,6 +848,11 @@ impl TcpService for RshSession {
     fn input(&mut self, data: &[u8]) -> Vec<u8> {
         // Anything after the header is the client's stdin: there is no process
         // to feed it to.
+        if self.shell && !self.finished {
+            self.stdin.extend_from_slice(data);
+            self.pump_shell();
+            return Vec::new();
+        }
         if self.phase != Phase::Header || self.finished {
             return Vec::new();
         }
@@ -762,14 +886,34 @@ impl TcpService for RshSession {
                 self.phase = Phase::Running;
                 self.reject(msg);
             }
-            Parse::Done(req) => self.start(req),
+            Parse::Done(req) => {
+                // Whatever followed the fourth NUL is already stdin.
+                let mut nuls = 0;
+                let end = self.inbuf.iter().position(|&b| {
+                    nuls += usize::from(b == 0);
+                    nuls == 4
+                });
+                let extra = end.map(|e| self.inbuf[e + 1..].to_vec()).unwrap_or_default();
+                self.start(req);
+                if self.shell {
+                    self.stdin.extend_from_slice(&extra);
+                    self.pump_shell();
+                }
+            }
         }
         Vec::new()
     }
 
     fn pull(&mut self, max: usize) -> Vec<u8> {
-        if self.out.len() < max {
+        for _ in 0..4 {
+            if self.out.len() >= max {
+                break;
+            }
             self.advance_job(max - self.out.len());
+            self.pump_shell();
+            if matches!(self.job, Job::None) {
+                break;
+            }
         }
         let n = max.min(self.out.len());
         self.sent += n as u64;
@@ -786,6 +930,12 @@ impl TcpService for RshSession {
         if self.phase == Phase::Header {
             self.phase = Phase::Running;
             self.finish();
+        } else if self.shell {
+            self.stdin_eof = true;
+            if !self.stdin.is_empty() && !self.stdin.ends_with(b"\n") {
+                self.stdin.push(b'\n');
+            }
+            self.pump_shell();
         }
     }
 
@@ -830,6 +980,27 @@ mod tests {
         }
         assert!(s.done());
         (out, side.map(|_| err))
+    }
+
+    #[test]
+    fn exec_sh_runs_stdin_as_a_script() {
+        let root = tmp_root("shell");
+        fs::write(root.join("a"), b"AAA").unwrap();
+        let mut s = RshSession::new(root.clone());
+        // Header and the first script lines arrive together; the rest later.
+        let mut first = req("1000", "exec /bin/sh");
+        first.extend_from_slice(b"cat a; echo hi 2>/dev/null\nnosuch\n");
+        s.input(&first);
+        s.input(b"echo -n x");
+        s.guest_closed();
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            out.extend(s.pull(4));
+            if s.done() { break; }
+        }
+        assert!(s.done());
+        assert_eq!(out, b"\0AAAhi\nx");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
