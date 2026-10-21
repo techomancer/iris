@@ -279,11 +279,25 @@ impl NatEngine {
     /// file whenever the TFTP root has it. With no TFTP, or no such file, the
     /// fields stay empty.
     fn bootp_boot_file(&self, req: &[u8], rep: &mut [u8]) {
-        let Some(root) = self.config.tftp_dir.as_ref() else { return };
+        let trace = super::tftp::trace_enabled();
         let file = bootp_str(&req[108..236]);
+        let Some(root) = self.config.tftp_dir.as_ref() else {
+            if trace && !file.is_empty() {
+                eprintln!("iris: tftp BOOTP asks for {:?}: no boot file named, tftp_dir is not set", file);
+            }
+            return;
+        };
         if file.is_empty() || !super::tftp::file_exists(root, &file) {
             dlog_dev!(LogModule::Net, "NAT BOOTP file {:?} not in the TFTP root", file);
+            if trace {
+                eprintln!("iris: tftp BOOTP asks for {:?}: no boot file named, {}", file,
+                          if file.is_empty() { "the request names no file".to_string() }
+                          else { format!("it is not a file under {}", root.display()) });
+            }
             return;
+        }
+        if trace {
+            eprintln!("iris: tftp BOOTP asks for {:?}: named as the boot file", file);
         }
         // Echo a requested server name (bootp()host:file), else name ourselves.
         let sname = match bootp_str(&req[44..108]) {

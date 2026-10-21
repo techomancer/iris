@@ -192,6 +192,14 @@ To reach the Command Monitor on a machine that autoboots, press Esc while
 the PROM says "Starting up the system" (from the monitor console:
 `ps2 esc`). `test/tftp/` has a guest-side client and a test script.
 
+To see what the PROM or a client actually does, start iris with
+`IRIS_TFTP_TRACE=1`. It writes to stderr, in any build: what BOOTP was asked to
+boot, each read request and whether the file was found, and how each transfer
+ended (bytes, blocks, retransmits, duplicate ACKs, the slowest ACK, total
+time), plus any ACK slower than 500 ms as it happens. A read request sent to
+the host's port 69 instead (no `tftp_dir`, or a server address other than the
+gateway) is reported too, so silence means no request arrived at all.
+
 ### rsh (files from the host)
 
 `rsh_dir = "DIR"` under `[network]` (or `--rsh-dir DIR`) starts a small rsh

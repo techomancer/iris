@@ -60,6 +60,14 @@ impl NatEngine {
             _ if to_gw && self.udp_service_ports.contains_key(&dport) =>
                 self.udp_service(src_mac, src_ip, sport, dport, payload),
             _ => {
+                // A read request that is not ours: say where it goes, since
+                // "no TFTP trace" otherwise looks the same as "no request".
+                if dport == super::services::TFTP_PORT && payload.starts_with(&[0, 1]) && super::tftp::trace_enabled() {
+                    eprintln!("iris: tftp: guest {}:{} -> {}:{} read request {}",
+                              src_ip, sport, dst_ip, dport,
+                              if to_gw { "relayed to the host's port 69: tftp_dir is not set" }
+                              else { "relayed to that address: it is not the gateway" });
+                }
                 let (ip, port) = self.gateway_to_host(dst_ip, dport);
                 self.udp_relay(src_mac, src_ip, sport, visible, SocketAddrV4::new(ip, port), payload);
             }
