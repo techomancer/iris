@@ -156,7 +156,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 | --- | --- |
 | **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, JIT compile threads and persistent code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
-| **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
+| **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder and rsh install folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
@@ -241,7 +241,7 @@ New disk images default to `disks/scsiN.raw`. External images stay in place;
 the TOML keeps them as absolute paths (`/Volumes/Media/root.chd`), exactly as
 selected or typed. A hand-written relative path such as `../../media/root.chd`
 is also preserved as written.
-The same resolution applies to disc changers, NFS shares, TFTP folders, serial
+The same resolution applies to disc changers, NFS shares, TFTP and rsh folders, serial
 logs, ELF binaries, test dumps, filesystem CI sockets, and JIT cache folders.
 TCP CI addresses and network interface names retain their original spelling.
 

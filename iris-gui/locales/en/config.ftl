@@ -247,6 +247,15 @@ config-tftp-boot = To boot a kernel from it, press Esc at “Starting up the sys
 # $gateway is the server's IP address.
 config-tftp-irix = From IRIX, the server is { $gateway }:
 
+config-rsh = rsh server
+config-rsh-subtitle =
+config-rsh-enable = Serve a folder over rsh (install source)
+config-rsh-dir = Folder
+config-rsh-dir-empty = Choose a folder to turn the rsh server on.
+config-rsh-dir-missing = That folder doesn't exist.
+config-rsh-inst = To install from it, give inst this location (the folder is the root):
+config-rsh-readonly = Read-only: the guest can list and read files, nothing else.
+
 config-nfs = NFS share
 config-nfs-subtitle =
 config-nfs-enable = Share a folder over NFS

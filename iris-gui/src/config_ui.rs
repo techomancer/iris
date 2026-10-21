@@ -1212,6 +1212,8 @@ fn show_network(
 
     ui.separator();
     out.changed |= tftp_section(ui, cfg, host);
+    ui.separator();
+    out.changed |= rsh_section(ui, cfg, host);
     } // end: NAT-only section (hidden in PCAP mode)
 
     ui.separator();
@@ -1437,6 +1439,56 @@ fn tftp_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::Ho
     // A blank field means off, not "serve the working directory".
     if cfg.network.tftp_dir.as_deref().is_some_and(|d| d.trim().is_empty()) && !ui.memory(|m| m.focused().is_some()) {
         cfg.network.tftp_dir = None;
+        changed = true;
+    }
+    changed
+}
+
+/// NAT mode: the gateway's built-in read-only rsh server (`[network] rsh_dir`),
+/// a network installation source for IRIX `inst`. Unset turns the server off
+/// (rsh connections then go to the host). Read at Start. Returns true if the
+/// setting changed.
+fn rsh_section(ui: &mut Ui, cfg: &mut MachineConfig, host: &[crate::netplan::HostIface]) -> bool {
+    let mut changed = false;
+    ui.strong(t!("config-rsh"));
+    subtitle(ui, t!("config-rsh-subtitle"));
+    let mut on = cfg.network.rsh_dir.is_some();
+    if ui.checkbox(&mut on, t!("config-rsh-enable")).changed() {
+        cfg.network.rsh_dir = if on {
+            // A bare relative name in this machine's own folder, like
+            // `tftpboot`; created now so an enabled server never serves an
+            // empty path.
+            let dir = "rshroot";
+            let _ = std::fs::create_dir_all(dir);
+            Some(dir.to_string())
+        } else {
+            None
+        };
+        changed = true;
+    }
+    if let Some(dir) = cfg.network.rsh_dir.as_mut() {
+        Grid::new("rsh_grid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.label(t!("config-rsh-dir"));
+            changed |= path_row(ui, "rsh_dir", dir, Pick::Dir, &any_filters()).changed;
+            ui.end_row();
+        });
+        if dir.trim().is_empty() {
+            ui.label(RichText::new(t!("config-rsh-dir-empty")).weak().small());
+        } else if !Path::new(dir.trim()).is_dir() {
+            ui.label(RichText::new(t!("config-rsh-dir-missing"))
+                .color(Color32::from_rgb(0xd9, 0x9a, 0x3d)).small());
+        }
+        let (b, p) = crate::netplan::parse_cidr(cfg.nat_subnet.as_deref());
+        let gw = crate::netplan::classify(b, p, host).derived
+            .map(|d| d.gateway.to_string())
+            .unwrap_or_else(|| "192.168.0.1".into());
+        ui.label(RichText::new(t!("config-rsh-inst")).weak());
+        ui.code(format!("{gw}:/"));
+        ui.label(RichText::new(t!("config-rsh-readonly")).weak().small());
+    }
+    // A blank field means off, not "serve the working directory".
+    if cfg.network.rsh_dir.as_deref().is_some_and(|d| d.trim().is_empty()) && !ui.memory(|m| m.focused().is_some()) {
+        cfg.network.rsh_dir = None;
         changed = true;
     }
     changed
