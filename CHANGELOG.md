@@ -20,8 +20,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   and `pwd` on DIR, read-only, so the guest can pull files with
   `rsh 192.168.0.1 cat /file` without a host `rshd`. It is not a shell and runs
   nothing on the host. `exec /bin/sh` (what `inst` runs) is accepted: stdin is
-  run line by line against the same commands (`;`, `2>/dev/null`, `cd`/`exit`
-  accepted), and with `IRIS_RSH_TRACE` each line is logged. It speaks the BSD `rcmd` protocol, including the
+  run line by line against the same commands, including the
+  `( status=$? ; ... echo 'MARK\c' ; echo 'MARK'$status 1>&2 )` tail `inst`
+  waits for, `trap`, `echo X | dd`, `dd ... | fgrep STR` and the IRIX
+  `ls -inld` format; with `IRIS_RSH_TRACE` each line is logged. It speaks the BSD `rcmd` protocol, including the
   stderr connection back to the guest from a reserved port. `src/net/rsh.rs`
   is the protocol and the sandbox; `TcpService` gained `pull` (stream output
   instead of holding it) and `side_connect` (a service asks for a connection
