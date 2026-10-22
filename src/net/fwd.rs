@@ -51,6 +51,7 @@ pub(super) fn bind_forwards(rules: &[PortForwardConfig]) -> (Vec<TcpFwdListener>
             ForwardProto::Udp => match UdpSocket::bind(addr) {
                 Ok(sock) => {
                     let _ = sock.set_nonblocking(true);
+                    super::nat_udp::allow_large_datagrams(&sock);
                     eprintln!("iris: UDP port forward {}:{} → guest:{}", bind_addr, rule.host_port, rule.guest_port);
                     udp.push(UdpFwdListener { sock, guest_port: rule.guest_port, host_port: rule.host_port,
                                               last_sender: None });

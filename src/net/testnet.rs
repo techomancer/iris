@@ -542,6 +542,8 @@ fn udp_echo_host() -> (u16, thread::JoinHandle<()>) {
     let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = s.local_addr().unwrap().port();
     s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    // The echo must send back what the engine relayed, 20 KB included.
+    super::nat_udp::allow_large_datagrams(&s);
     let h = thread::spawn(move || {
         let mut buf = vec![0u8; 65536];
         while let Ok((n, from)) = s.recv_from(&mut buf) {
