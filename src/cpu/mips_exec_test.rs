@@ -5981,6 +5981,9 @@ mod tests {
         crate::cpu::mips_exec::MipsCpu::new(exec)
     }
 
+    // `lightning` compiles breakpoint checks out of the run loop, so nothing
+    // would ever stop the CPU at the breakpoint.
+    #[cfg(not(feature = "lightning"))]
     #[test]
     fn breakpoints_can_be_set_while_running_and_report_their_hit() {
         let cpu = nop_cpu();
