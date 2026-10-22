@@ -7,7 +7,7 @@
 //! address arithmetic on every access.
 //!
 //! Full design and rationale: `docs/ppmem-design.md`.
-//! Verified platform findings: `rules/build/mmap-rs-fixed-address-aliasing.md`.
+//! Verified platform findings: `clanker/build/mmap-rs-fixed-address-aliasing.md`.
 
 pub mod map;
 #[allow(clippy::module_inception)]

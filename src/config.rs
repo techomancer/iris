@@ -149,7 +149,7 @@ pub struct DaynaportParams {
 
 /// Default Ethernet station address for `ec0` when `[network] mac` is unset.
 /// SGI's registered OUI (08:00:69) plus an arbitrary host part; matches the
-/// address used throughout `rules/irix/networking.md` and CI test fixtures.
+/// address used throughout `clanker/irix/networking.md` and CI test fixtures.
 pub const DEFAULT_MAC: [u8; 6] = [0x08, 0x00, 0x69, 0x12, 0x34, 0x56];
 
 /// Parse `"00:80:19:12:34:56"` (or `-` separated) into six octets.

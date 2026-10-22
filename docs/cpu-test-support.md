@@ -18,7 +18,7 @@ mkvh dump /path/to/sgi.iso                              # parse real media
 `--part slot:type:first:nblks[=file]`; `first` may be `+`, meaning "start where
 the volume header ends", which is what SGI's own media does. **An EFS filesystem
 partition is type 5 (`PT_SYSV`)**, not 7 — see
-`rules/testing/sgi-volume-directory-layout-verified-on-real-media.md`.
+`clanker/testing/sgi-volume-directory-layout-verified-on-real-media.md`.
 
 From the PROM: `boot -f dksc(0,<scsi-id>,8)<name>`.
 
@@ -46,7 +46,7 @@ different binary at the same address runs the new code.
 Link at **0x88000000+** (Indy RAM starts at physical 0x08000000). Before POST no
 RAM is mapped at all; `--load-elf` maps the banks the way POST does, and every
 load probes the bus first and refuses rather than writing into the void. See
-`rules/testing/loading-code-before-post-ram-is-unmapped.md`.
+`clanker/testing/loading-code-before-post-ram-is-unmapped.md`.
 
 ## C — TFTP for PROM network boot
 
@@ -99,4 +99,4 @@ Exit code for the verdict, stdout for the log, the dump for diagnosis:
 
 Prefer `--serial-log` over scraping TCP 8881: the serial backend holds one
 client and only notices a dead one on a failed write
-(`rules/testing/scc-serial-output-from-bare-metal-code.md`).
+(`clanker/testing/scc-serial-output-from-bare-metal-code.md`).

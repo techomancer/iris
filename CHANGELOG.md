@@ -39,7 +39,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   `splx`. Seen as an IRIX 6.5.22 Indy going dead (keyboard, serial, telnet)
   after hours, with the CPU thread idle. The CPU now parks only while
   nothing is pending and wakes on any pending line, masked or not
-  (`rules/perf/idle-pause-masked-interrupt-must-wake.md`).
+  (`clanker/perf/idle-pause-masked-interrupt-must-wake.md`).
 
 ### iris-gui text and languages
 
@@ -87,7 +87,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   UDP replies now keep their real source port (TFTP to an outside server),
   and portmap answers only at the gateway. Tests: `net::testnet` (directed,
   frames in and out against real host sockets) and `test/net` (guest and
-  host, with `nettest.c`). Design and numbers: `docs/net-stack.md`.
+  host, with `nettest.c`). Design and numbers: `clanker/plans/net-stack.md`.
 - **TFTP works for PROM network boot and for guest clients.** `boot -f
   bootp()/unix` failed in two places. The BOOTP reply left the boot file
   empty, which the PROM treats as "File not found on server". Its second
@@ -139,7 +139,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   plugin and the card's own device alike: the poll descriptor stays ready
   while there is no room to write), starving the emulator into a stream of
   underruns, while the PulseAudio client used 0.01 s of CPU in 5 s. See
-  `rules/testing/cpal-alsa-busy-poll.md`. `[audio] cpal_buffer_frames`,
+  `clanker/devices/cpal-alsa-busy-poll.md`. `[audio] cpal_buffer_frames`,
   which was parsed but never reached HAL2, now sets the host buffer size; a
   size the device refuses falls back to the host's default. Unset,
   PulseAudio gets 512 frames (two of them, ~21 ms at 48 kHz) instead of its
@@ -280,7 +280,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   visual, mailbox reads bottom row first, 3:3:2 widening by bit
   replication, and depth reads of z20 s4 visuals with the stencil above Z.
   The suites flag libGLcore EXPRESS's own bugs as GR2 XFAILs
-  (rules/gr2/gl-test-suites.md).
+  (clanker/gr2/gl-test-suites.md).
 
 - **Host GL on Linux.** `--features hostgl` now has an EGL backend
   (`iris-hostgl/src/backend/egl.rs`): headless contexts in the compatibility
@@ -301,7 +301,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   and o32, glcheck with the reference checksum, irisgltest, Quake 3. Fedora
   44, Arch and Ubuntu 24.04 (x86_64, Mesa's software renderer, no GPU):
   builds, hostgl tests 31/31. See
-  `rules/hostgl/linux-egl-and-mesa.md`.
+  `clanker/hostgl/linux-egl-and-mesa.md`.
 - **Host GL no longer stops the machine while it draws.** A host call is
   answered on the emulated CPU's thread, so while host GL replayed a
   command buffer (2-5 ms for a big one) no instruction ran and no interrupt
@@ -317,7 +317,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   33.9 fps; boot, idle CPU, sound without GL and SGI's own libGL on the
   emulated board are unchanged. Libraries without `OP_BATCH_ASYNC` work
   unchanged. `IRIS_HOSTGL_INLINE=1` keeps the service on the CPU thread.
-  See `rules/hostgl/host-calls-hold-the-cpu-thread.md`.
+  See `clanker/hostgl/host-calls-hold-the-cpu-thread.md`.
 - **Maximum Impact draws correctly, on two raster engines.** Its two RE4s
   each own every other scanline in their own 12MB, so a buffer takes half
   the pages per engine. The model assumed one engine; buffers overlapped,
@@ -329,7 +329,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   step by two). Replays come out identical to one engine, desktop2.rec
   passes every checkpoint, and a recorded gltest fill/triangle session
   replays 1.75x faster. `IRIS_MGRAS_ENGINES=1` keeps one RSS thread. See
-  `rules/mgras/DESIGN.md`.
+  `clanker/mgras/DESIGN.md`.
 - **IMPACT locks show in `locks`, with their holders.** The board's locks
   are now light spinlocks (`locks::SpinLock`) that record the holding thread
   and call site. A thread stuck waiting 5 s prints both sides, so a deadlock
@@ -341,14 +341,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   double-buffered readback shape was compiled, every read after the first
   returned the other buffer's pixels. Its screen-to-screen copy had the same
   gap for RGB. Both now take the plane's bits as the interpreter does. See
-  `rules/rex3/jit-reads-take-the-plane-bits.md`.
+  `clanker/rex3/jit-reads-take-the-plane-bits.md`.
 - **Newport (REX3) honours STEPZ.** A GO on STEPZ fails the Z pattern test
   for its one pixel (rex3.pdf): the iteration advances but the pixel is not
   written (COLORBACK under ZPOPAQUE). IRIX's software rasteriser draws
   textured, alpha-tested spans one GO per pixel and skips rejected texels
   this way; the emulator drew them, so `blast -T`'s billboards showed their
   transparent corners as smeared rows and solid white triangles. See
-  `rules/rex3/stepz-steps-over-one-pixel.md`.
+  `clanker/rex3/stepz-steps-over-one-pixel.md`.
 - **2026-10-09 — Newport (REX3) blends again under IRIX OpenGL.**
   DRAWMODE1's BLENDALPHA bit was applied to every channel, so with it clear
   `BF_SA` was 1.0 for red, green and blue too and nothing was ever
@@ -392,7 +392,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   banks provide 1 GB; IRIX 6.5 reports 1024 MB after POST. The GUI offers
   512 MB banks and 768/1024 MB totals. IP22/IP24 still reject banks above
   128 MB; the fourth-bank policy is unchanged. See
-  [IP28 512 MB banks](rules/irix/ip28-512mb-banks.md).
+  [IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md).
 - **2026-10-04 — IP28 boot chime** (`ce56123`): report R10000 revision 2.5
   so the PROM takes its supported audio path; correct PBUS register decoding
   and masking used by the tune's DMA setup.
@@ -493,7 +493,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   VC3/XMAP/colormap/DAC scanout, interrupts, tracing, and replayable recordings.
   The OpenGL, TE1, and tiled pixel-memory work lands on October 6 (above).
   Solid, High, and Maximum configurations share the generic `GfxDisplay`
-  output used by the CLI and GUI. See [MGRAS design](rules/mgras/DESIGN.md).
+  output used by the CLI and GUI. See [MGRAS design](clanker/mgras/DESIGN.md).
 - **2026-09-30 — Graphics DMA and FIFO fixes** (`5787d02`, `b5cc363`): improved
   DMA reads, FIFO handling, and fillrate benchmark crash fixes.
 
@@ -526,13 +526,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   offset against `fb_rgb` while the pixel pointer was already `fb_aux`-based,
   reading `fb_aux + (fb_aux - fb_rgb) + off` — a wild pointer that segfaulted the
   REX3 thread under X11. `Dm1::use_aux()` now picks the base in both shader
-  emitters (`rules/rex3/cidmatch-aux-plane-base.md`).
+  emitters (`clanker/rex3/cidmatch-aux-plane-base.md`).
   Landed 2026-09-18 (`44f4b24`).
 - The GFIFO push is retryable, and a shader rejected by a full compile queue can
-  be requested again (`rules/testing/rex-jit-queue-retry.md`).
+  be requested again (`clanker/rex3/rex-jit-queue-retry.md`).
 - `CIDMATCH` is a mask of permitted CIDs, not an equality value
-  (`rules/rex3/cidmatch-is-a-mask.md`).
-- Blend-alpha handling fixed (`rules/rex3/blendalpha-and-alpha-blending.md`).
+  (`clanker/rex3/cidmatch-is-a-mask.md`).
+- Blend-alpha handling fixed (`clanker/rex3/blendalpha-and-alpha-blending.md`).
 - REX3 benchmarking tests; a triangle benchmark in `gltest`.
 
 ### CPU, timing, and audio
@@ -572,10 +572,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   seeded from the host at startup; clamped to the chip's 1970–2039 range.
 - IP7 delivery improved for Linux guests' timer checks and calibration.
 - Misaligned-fetch exception, and Config.K0 cache modes including the reserved
-  ones (`rules/irix/cache-attributes-and-fetch-alignment.md`).
+  ones (`clanker/cpu/cache-attributes-and-fetch-alignment.md`).
 - FR=1 FPU mode handled better, with a guard for `MOVCI`
-  (`rules/jitv2/fr1-pin-must-be-re-derived.md`,
-  `rules/testing/movci-is-cp1-by-behaviour-not-encoding.md`).
+  (`clanker/jitv2/fr1-pin-must-be-re-derived.md`,
+  `clanker/cpu/movci-is-cp1-by-behaviour-not-encoding.md`).
 
 ### JIT v2
 
@@ -609,7 +609,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   `PhysicalCodePage::saved_bits` bitmap to dedup them. It had to be compiled in
   *before* the run that would produce the interesting pages, so a corpus could
   only be captured by deciding in advance you wanted one — and the corpus every
-  `rules/jitv2/` measurement cites was a local artifact that got lost, with no
+  `clanker/jitv2/` measurement cites was a local artifact that got lost, with no
   way to reproduce it.
 
   `j2 corpus [dir]` now walks the live JIT page cache on demand and writes one
@@ -627,7 +627,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   the build that invalidates such a measurement (`developer` forces
   `opt_level=none` and injects a per-instruction trace callout) — so
   `zz_corpus_sizes` reported `total_bytes=0` in exactly the build it was meant
-  to measure. See `rules/jitv2/corpus-capture-from-the-pcp-cache.md`, including
+  to measure. See `clanker/jitv2/corpus-capture-from-the-pcp-cache.md`, including
   the `requested`-vs-`compiled` trap that silently discards 99.5% of a corpus.
 
 - **2026-09-19 — Compile churn avoidance** (`d1bf817`). Each page now remembers the bytes its
@@ -641,7 +641,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   (`PhysicalCodePage` 720 → 4976 bytes across the 4096-slot pool). `j2 status`
   and `j2 pcp` report the skipped/recompiled split (since last flush, and
   available in `lightning` builds, not just `developer`). See
-  `rules/jitv2/compile-churn-avoidance-snapshot.md`.
+  `clanker/jitv2/compile-churn-avoidance-snapshot.md`.
 - Inline load/store for the R5000 cache model, not only the R4400.
 - Physical code pages are found through a flat pfn array instead of a hash map;
   PC/BD stores are emitted only when needed; the last instruction on a page and
@@ -740,7 +740,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   thread instead of being called from other threads, the GL surface and the first
   `make_current` happen on the main thread, and further cross-thread UI fixes.
 - `crash_diag`: silent Windows deaths (`0xC000041D`) are logged with a symbolised
-  stack to `iris-crash.log` (`rules/gui/windows-silent-exit-0xc000041d.md`).
+  stack to `iris-crash.log` (`clanker/gui/windows-silent-exit-0xc000041d.md`).
 
 ## August 2026
 
@@ -764,7 +764,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `MipsCore` reorganised: the interrupt word, `in_delay_slot` and its target live
   in the core; fields reordered for cache locality; the cycles counter is a plain
   variable. Cranelift upgraded 0.116 → 0.134, and every dependency except the
-  egui stack updated (`rules/build/dependency-upgrade-gotchas.md`).
+  egui stack updated (`clanker/build/dependency-upgrade-gotchas.md`).
 - IP7 is driven by a host timer instead of instruction counting (`1e05210`), and a
   fixed CP0 Count clock option was added (superseded in September).
 
@@ -782,7 +782,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### JIT v2 (new) and the old JIT (removed)
 
 - **jitv2** (`c340118`): a physical-page Cranelift compiler with memory-resident
-  registers and no speculation (`rules/jitv2/jit-v2-design.md`). Over the month:
+  registers and no speculation (`clanker/jitv2/jit-v2-design.md`). Over the month:
   a multi-threaded compile pool with a lock-free queue (`[jitv2] threads`,
   `--jitv2-threads`), compiles triggered on page transitions, FMOVCF and DADDIU
   emitters, interpreter fallbacks that don't break streaks, NOP elimination,
@@ -790,14 +790,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   cache, a dirty-cache-page probe, self-modifying-code detection, and a Windows
   x64 callout ABI that returns status in registers.
 - `jitv2_opcodefusion` (LUI+ORI/ADDIU, branch+NOP) exists but is **off by
-  default** after it broke Linux (`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
+  default** after it broke Linux (`clanker/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 - `j2wp` whole-page compile, `jitv2_lockstep`, `jitv2_smc_check`,
   the `j2` monitor command (`clear`, `deny`, `pagewb`,
   `html` physical code page visualiser, …) and the `jitv2-analyze`,
   `jitv2-verify`, `jitv2-pcp-dump` tools.
 - Status-bar feedback for JIT activity.
 - **The original tiered MIPS JIT was removed** (`33c4e68`), along with its
-  `jit` feature, `IRIS_JIT*` environment variables and `rules/jit/`.
+  `jit` feature, `IRIS_JIT*` environment variables and `clanker/jit/`.
 
 ### Bare-metal testing and benchmarking
 
@@ -828,7 +828,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   lightning run). `--load-elf` skips the PROM, so the SCC's transmitter was never
   enabled and every character the guest printed burned a 100,000-iteration spin
   waiting for a TX-empty bit that would never come. `cpu-tests` gets the same
-  speedup. See `rules/testing/scc-serial-output-from-bare-metal-code.md`.
+  speedup. See `clanker/testing/scc-serial-output-from-bare-metal-code.md`.
 - **Quick mode** (`iris-bench run --quick`, and the GUI's default): about half
   the wall clock for the same numbers to within a couple of percent. It never
   runs fewer kernels, it only shortens the timed passes. Requested through a
@@ -841,7 +841,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   R4700, R5000, R8000, R10000, R12000, R14000, RM5200 and RM7000 from PRId and
   runs on anything else too; `golden.h` was always CPU-independent.
 - **Platform limits documented** in
-  `rules/testing/bare-metal-harness-platform-assumptions.md`.
+  `clanker/testing/bare-metal-harness-platform-assumptions.md`.
 - `iris::bench_report` holds the report parser, data model and reference table,
   shared by the CLI, the runner and the GUI.
 
@@ -853,7 +853,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   retrace delivery for Indigo2 graphics.
 - **DaynaPort SCSI/Link** (`--features daynaport`, `734660b`): Ethernet over the
   SCSI bus as a per-ID target with its own NAT or PCAP backend
-  (`docs/daynaport.md`, `docs/iris-daynaport-target.md`).
+  (`docs/daynaport.md`, `clanker/plans/iris-daynaport-target.md`).
 - **TFTP server** in the NAT gateway for PROM network boot (`--tftp-dir`,
   `src/net/tftp.rs`).
 - **SGI volume headers**: volume-directory support and the `mkvh` tool.
@@ -917,10 +917,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   and Indigo2 IMPACT preview stubs (removed/replaced in September), dual-head Newport and
   forced Newport resolutions.
 - IndyCam CDMC register map and power-on defaults corrected
-  (`rules/irix/indycam-cdmc-register-map.md`).
+  (`clanker/video/indycam-cdmc-register-map.md`).
 - NFS resolves `.` and `..` server-side.
 - NAT: port forwards to rsh/rlogin use a reserved source port, probing for a free
-  one (`rules/irix/rsh-forward-needs-reserved-source-port.md`).
+  one (`clanker/net/rsh-forward-needs-reserved-source-port.md`).
 - Recent HAL2 changes reverted after they broke audio.
 - `libchdman-rs` 0.288.8 (BSD-3-Clause; drops GPL-3.0), then 0.288.9 (bin/cue fix).
 - Machine and other large objects are constructed with bigger stacks (#60).
@@ -935,7 +935,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   IntelliMouse wheel support in the core.
 - **Mac App Store support**: security-scoped bookmarks, interpreter-only under the
   App Sandbox, notarised-distribution entitlements, winit's private blur API
-  stubbed out (guideline 2.5.1, `rules/macos/appstore-private-api.md`), camera
+  stubbed out (guideline 2.5.1, `clanker/macos/appstore-private-api.md`), camera
   and network entitlements made testable, keyboard capture, CHD folder grants,
   licenses window, and `PRIVACY.md`.
 - Adaptive framebuffer filtering and the left control column; windowed-first
@@ -990,16 +990,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 - **VINO / IndyCam** end to end: pixel pipeline, CDMC and SAA7191, host camera
   capture on macOS, SYSID bit 4 so IRIX attaches the driver, I2C fixes, capture
-  on IRIX 6.5, colour and interlace fixes (`rules/irix/vino-*`,
-  `rules/irix/indycam-end-to-end-capture.md`).
+  on IRIX 6.5, colour and interlace fixes (`clanker/irix/vino-*`,
+  `clanker/video/indycam-end-to-end-capture.md`).
 - **Idle park** (`--features idle-pause`, off by default): the CPU thread sleeps
   while IRIX idles. The REX3 GFIFO consumer parks instead of spinning, the refresh
   thread skips unchanged frames, and the winit loop waits when idle.
-- IRIX install guide for 5.3 and 6.5.22 (`rules/irix/irix-install.md`) with
+- IRIX install guide for 5.3 and 6.5.22 (`clanker/irix/irix-install.md`) with
   `tools/inst-*.py` helpers; config templates `iris-irix53.toml` and
   `iris-irix65.toml`; per-config `nvram = "..."`.
 - SCSI: IRIX miniroot install hang fixed
-  (`rules/irix/miniroot-install-hang-scsi0-dma-irq-storm.md`).
+  (`clanker/scsi/miniroot-install-hang-scsi0-dma-irq-storm.md`).
 - `--serial-log` mirrors ttyd1 output; the monitor port stays bound under `--ci`;
   telnet option negotiation on the serial and monitor listeners.
 - `iris-ci rtc-save`, `cdrom-eject`, `cdrom-load`; `get`/`put` work under a

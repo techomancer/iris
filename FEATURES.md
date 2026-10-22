@@ -18,7 +18,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 |---|---|---|
 | `debug_cache` | Track a selected cache line through cache operations. | — |
 | `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | `gputrace` |
-| `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [rules/rex3/trace-and-recording.md](rules/rex3/trace-and-recording.md). GR2 and IMPACT annotated traces (`gr2 trace`, `mgras trace`). Off: no per-access check at all. Lightning-compatible. | — |
+| `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [clanker/rex3/trace-and-recording.md](clanker/rex3/trace-and-recording.md). GR2 and IMPACT annotated traces (`gr2 trace`, `mgras trace`). Off: no per-access check at all. Lightning-compatible. | — |
 | `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
 | `developerx` | Extended exception diagnostics; break on IBE/DBE/ADEL/ADES/TLB errors. | — |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible. | — |
@@ -306,7 +306,7 @@ variable; enabled/nonempty config values replace it. This applies even when a
 previous GUI Start set the variable. Do not assume environment values always
 override explicit config, or that an unchecked GUI option always clears them.
 Hardware edits take effect on Stop/Start; GUI networking/forward controls have
-live-update paths. See [HELP.md](HELP.md) for procedures and [TODO.md](TODO.md)
+live-update paths. See [HELP.md](HELP.md) for procedures and [TODO.md](clanker/TODO.md)
 for fidelity and validation gaps.
 
 ## Standalone iris CLI inventory
@@ -372,7 +372,7 @@ Board aliases include `xl`, `gr2`, `gr2_xz`, `gr2-xz`, `gr2_extreme`,
 `gr2-extreme`, `impact:solid`, `solid_impact`, `impact:high`, `high_impact`,
 `impact:max`, and `max_impact`. TOML board parsing also accepts hyphenated
 IMPACT names and `solid`, `high`, `max`; canonical values are in the table.
-See [HELP.md](HELP.md) for iris-ci/monitor commands; they are runtime tools,
+See [debug.md](debug.md) for monitor commands and [STORAGE.md](STORAGE.md) for iris-ci; they are runtime tools,
 not Cargo build features.
 
 ## iris-gui persisted settings inventory
@@ -520,7 +520,7 @@ both the interpreter and jitv2.
 | `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has macOS (CGL) and Linux (EGL) backends |
 | `debug_cache` | Track one cache line across all operations |
 | `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
-| `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`rules/testing/r5k-l1i-cache-bugs.md`) |
+| `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`clanker/cpu/r5k-l1i-cache-bugs.md`) |
 
 </details>
 
@@ -575,7 +575,7 @@ A physical-page compiler built on Cranelift, with memory-resident
 registers and no speculation, with generation checks at publication and
 dispatch. Equivalence tests check agreement with the interpreter. Not the default
 engine yet. Enabled automatically at runtime once the feature is compiled in.
-See `rules/jitv2/jit-v2-design.md` for the full design and `HACKING.md`'s
+See `clanker/jitv2/jit-v2-design.md` for the full design and `HACKING.md`'s
 JIT v2 section for tuning. (The original speculative, tiered MIPS JIT was
 removed in August 2026; jitv2 replaces it.)
 
@@ -597,7 +597,7 @@ against the interpreter — slow, diagnostic only), `jitv2_smc_check`,
 branch/jump+NOP delay-slot fusion, jitv2's counterparts to the interpreter's
 `opcodefusion` — OFF by default, unlike the interpreter's own fusion, due to a
 history of live-boot bugs; see
-`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`). Developer tools:
+`clanker/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`). Developer tools:
 `jitv2-analyze`, `jitv2-verify` and `jitv2-pcp-dump` binaries, and the `j2`
 monitor command.
 
@@ -637,7 +637,7 @@ measured against real guest code instead of a microbenchmark.
 per-instruction trace callout, so its output describes code production never
 emits — this has produced a completely wrong conclusion before, and the test
 prints a warning if you try. See
-`rules/jitv2/block-fragmentation-blocks-cse.md`.
+`clanker/jitv2/block-fragmentation-blocks-cse.md`.
 
 ### REX3 drawing and the graphics JIT (`--features rex-jit`)
 

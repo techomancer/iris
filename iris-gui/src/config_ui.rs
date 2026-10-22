@@ -1300,7 +1300,7 @@ fn show_network(
 
 /// The guest's Ethernet address (`eaddr`), which IRIX needs to attach `ec0`.
 /// It lives in the NVRAM on Indy and in the motherboard EEPROM (`nveeprom`) on
-/// Indigo2/IP28 (rules/irix/networking.md), so this reads and writes the chip
+/// Indigo2/IP28 (clanker/irix/networking.md), so this reads and writes the chip
 /// the profile boots from, the same bytes the Start pre-flight and Reset NVRAM
 /// patch. Only editable while stopped: a running machine saves its NVRAM on
 /// Stop, which would undo the edit.

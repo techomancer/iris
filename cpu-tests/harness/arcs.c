@@ -9,8 +9,8 @@
  *   vector entry 27   Write(FileId, Buffer, Length, &Count)
  *
  * The 35-entry length is itself the cross-check that the layout is the ARC
- * one, and SPB + 0x10 (DebugBlock) reads 0 exactly as the IRIX source in
- * src/debug.md expects when symmon is absent.
+ * one, and SPB + 0x10 (DebugBlock) reads 0, which is how the IRIX kernel's
+ * early print routine tells that symmon is absent.
  *
  * exc_install() writes three trampolines and flushes 0x200 bytes from
  * 0x80000000, so it never reaches the SPB at 0x1000 or the vector table at

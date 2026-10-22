@@ -209,7 +209,7 @@ pub trait BusDevice: Send + Sync {
         BUS_OK
     }
 
-    /// JIT v2 (rules/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
+    /// JIT v2 (clanker/jitv2/jit-v2-design.md §2.4): pointer to the generation counter
     /// for the 4KB physical page containing `addr`, or null if this device doesn't
     /// back JIT-compilable memory (MMIO, etc). RAM devices return one counter per
     /// page, bumped on every mutation to that page; ROM devices may point every

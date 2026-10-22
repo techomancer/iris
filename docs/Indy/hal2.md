@@ -290,4 +290,4 @@ avoid advancing into descriptors the guest has not prepared.
 - Timestamp mode does not interleave clock-test timestamps into DMA.
 - End-to-end rate changes, underruns, reboot/stop/start, and host-device changes
   need recorded audio checks on supported platforms; register readback alone
-  does not prove playback fidelity. See [TODO.md](../TODO.md).
+  does not prove playback fidelity. See [TODO.md](../../clanker/TODO.md).

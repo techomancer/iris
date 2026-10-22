@@ -177,7 +177,7 @@ pub fn reset_nvram(path: &str) -> std::io::Result<()> {
 /// here, not from [`NVRAM_MAC_OFFSET`]** — that offset is the DS1386 chip,
 /// which those profiles don't use for the MAC at all. A build that only ever
 /// patches `NVRAM_MAC_OFFSET` silently has no effect on those profiles' guest
-/// networking; see `rules/irix/networking.md`.
+/// networking; see `clanker/irix/networking.md`.
 pub const NVEEPROM_MAC_OFFSET: usize = 0x7D * 2;
 
 /// The blank/erased size of a 93C56: 128 words × 2 bytes.

@@ -372,14 +372,14 @@ Normal **Stop**, **Quit**, and guest power-off save the DS1386 NVRAM and, on
 Indigo2, the motherboard EEPROM. Writes use a temporary file and replacement
 so a failed save preserves the previous image. Forced process termination
 bypasses Stop; use `rtc save` / `nveeprom save` before terminating a process.
-See [Battery-backed state on Stop](rules/irix/nvram-persistence.md).
+See [Battery-backed state on Stop](clanker/devices/nvram-persistence.md).
 
 ### Disk synchronization on exit
 
 CHD diffs are folded back into their base images when you quit ("Synchronizing
 disks…", with per-disk progress). Under the macOS App Sandbox the fold needs
 write access to the *folder* holding the CHD, which is why the App Store build
-asks for folder grants (`rules/macos/chd-fold-needs-folder-grant-not-file-grant.md`).
+asks for folder grants (`clanker/macos/chd-fold-needs-folder-grant-not-file-grant.md`).
 
 ### Stop timeout for a wedged machine
 
@@ -454,8 +454,8 @@ iris/
 - Window operations (resize, fullscreen, surface creation) must run on the
   main/event-loop thread; other threads send requests to it. Calling them from
   elsewhere crashed on Windows and macOS
-  (`rules/gui/winit-window-calls-must-be-on-event-thread.md`,
-  `rules/macos/winit-030-window-handle-main-thread-only.md`).
+  (`clanker/gui/winit-window-calls-must-be-on-event-thread.md`,
+  `clanker/macos/winit-030-window-handle-main-thread-only.md`).
 - A dedicated worker thread (64 MB stack — machine construction builds large
   objects on the stack) owns the `Machine` when one exists. Commands go over a
   `crossbeam_channel::Sender<Cmd>`; events come back over a `Receiver<Evt>`
@@ -500,6 +500,6 @@ a build feature — read `MachineConfig::machine.cpu`.
 - `crossbeam-channel` for cross-thread messaging.
 - `parking_lot::Mutex` where sharing is needed.
 
-`rules/gui/` collects the hard-won findings (drop order of `CyclesPtr`, GL
+`clanker/gui/` collects the hard-won findings (drop order of `CyclesPtr`, GL
 teardown on the refresh thread, keyboard capture, layouts, mouse integration,
-Windows silent exits); `rules/macos/` covers the App Store and sandbox.
+Windows silent exits); `clanker/macos/` covers the App Store and sandbox.

@@ -3,7 +3,7 @@
  *
  * All checksums fold in the raw bit patterns of the results, so a one-ulp
  * disagreement with the host reference fails rather than passing quietly. That
- * is the point: rules/testing/fpu-exception-model-vs-r4400.md records that the
+ * is the point: clanker/cpu/fpu-exception-model-vs-r4400.md records that the
  * FPU flag model is the part of this emulator known to be imperfect, and an
  * instruction-level test suite exercises operations one at a time, in
  * isolation, with clean state. These kernels run millions of operations with

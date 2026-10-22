@@ -112,7 +112,7 @@ mod tests {
         /// a later call, which would silently break that count once a real
         /// compile actually landed in time (previously only ever true by
         /// luck, since the async compile thread rarely won the race within
-        /// these short loops — see rules/jitv2/codegen-gotchas.md).
+        /// these short loops — see clanker/jitv2/codegen-gotchas.md).
         #[cfg(feature = "jitv2")]
         no_jitv2: bool,
     }
@@ -382,7 +382,7 @@ mod tests {
         // codegen derives absolute virtual addresses from it (off-page
         // branch/jump targets, delay-slot exception EPC) — a fake all-zero
         // page silently produces wrong addresses for any test that exercises
-        // those paths (see rules/jitv2/codegen-gotchas.md).
+        // those paths (see clanker/jitv2/codegen-gotchas.md).
         let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
         let mut analyzer = Analyzer::new();
         let (walked, non_empty) = analyzer.walk_bounded(&page, word_offset, page_base, 1);
@@ -1249,7 +1249,7 @@ mod tests {
     /// plain `exec.exec()` call (as `jitv2_lockstep`'s `lockstep_check`
     /// already does unconditionally for ALU ops, with FPU ops a natural next
     /// target — see `add_overflow_traps_and_matches_interpreter`'s
-    /// pre-fix history in rules/jitv2/codegen-gotchas.md). Always
+    /// pre-fix history in clanker/jitv2/codegen-gotchas.md). Always
     /// denylisted, unconditionally, is simplest and safe for every caller
     /// here.
     fn fpu_seeded_executor(gpr: [u64; 32], fpr: [u64; 32], pc: u64, fr1: bool) -> (MipsExecutor<PassthroughTlb, PassthroughCache>, Arc<MockMemory>) {
@@ -3122,7 +3122,7 @@ mod tests {
     // (set core.pc back to its own address, return EXEC_COMPLETE), which
     // published and dispatched again would infinite-loop without ever
     // reaching the interpreter fallback it was meant to defer to (observed
-    // live on an IRIX boot, rules/jitv2/codegen-gotchas.md).
+    // live on an IRIX boot, clanker/jitv2/codegen-gotchas.md).
     //
     // Now that every exit already materializes core.pc/in_delay_slot/
     // delay_slot_target explicitly (the entry_offset==0 foreign-slot work,
@@ -3997,7 +3997,7 @@ mod tests {
         // compiled function runs the whole loop to convergence in one call
         // rather than one iteration per call. This is intentional per the
         // design (not a jitv2-verify-checkable shape — see
-        // rules/jitv2/codegen-gotchas.md's self-loop note) but must still
+        // clanker/jitv2/codegen-gotchas.md's self-loop note) but must still
         // produce the architecturally correct final state: same as running
         // the interpreter for the same number of iterations by hand.
         let word: u16 = 10;
@@ -6028,7 +6028,7 @@ mod tests {
     /// (release-build interpreter, and trunc/ceil/floor in any profile)
     /// rather than chasing whichever the current interpreter build happens
     /// to produce for `.round()` specifically. See
-    /// rules/jitv2/codegen-gotchas.md.
+    /// clanker/jitv2/codegen-gotchas.md.
     const FCSR_INEXACT_MASK: u32 = (1 << 12) | (1 << 2);
 
     fn cvt_to_int_case(funct: u32, fmt: u32, fs_val: f64) {
@@ -6277,7 +6277,7 @@ mod tests {
     }
 
     /// Isolated repro for a live-boot divergence caught by
-    /// `MipsExecutor::lockstep_check_branch` (rules/jitv2/): `BNE $5,$0,+7`
+    /// `MipsExecutor::lockstep_check_branch` (clanker/jitv2/): `BNE $5,$0,+7`
     /// with `$5==0` (not taken) and a delay slot that's an ordinary ALU op
     /// (`LUI $1,0xc0`, not a NOP) — first seen at PROM pc=0xbfc00434 during a
     /// real boot. Drives the exact code path (`exec.exec(instr)` through

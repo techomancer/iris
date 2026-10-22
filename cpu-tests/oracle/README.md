@@ -14,7 +14,7 @@ the only way to tell an emulator bug from a bad test, and it settled both.
 Both booted from a BlueSCSI v2 at SCSI ID 2 through the machine's own PROM,
 `console=g`, with no serial cable attached. Output reached the screen through
 ARCS and the log reached the disk through the PROM's own driver — see
-`rules/testing/arcs-console-from-bare-metal.md`.
+`clanker/testing/arcs-console-from-bare-metal.md`.
 
 ## The logs
 

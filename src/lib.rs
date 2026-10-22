@@ -57,7 +57,7 @@ compile_error!(
      fails mips_cache_v2::tests::cache_op_index_inv_l1i. Refusing to build \
      rather than silently shipping a broken cache model for a machine this \
      emulator doesn't target. See src/cpu/mips_cache_v2.rs and \
-     rules/testing/r5k-l1i-cache-bugs.md."
+     clanker/cpu/r5k-l1i-cache-bugs.md."
 );
 
 #[cfg(feature = "r5ksc")]
@@ -67,7 +67,7 @@ compile_error!(
      r5ksc` fails mips_cache_v2's L1I tests. There is currently no working \
      R5000 secondary-cache configuration. Refusing to build rather than silently \
      shipping a broken cache model. See src/cpu/mips_cache_v2.rs and \
-     rules/testing/r5k-l1i-cache-bugs.md. The R5000 without a secondary \
+     clanker/cpu/r5k-l1i-cache-bugs.md. The R5000 without a secondary \
      cache (`--cpu r5000`) is unaffected."
 );
 

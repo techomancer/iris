@@ -124,7 +124,7 @@ mod tests {
         // this helper's `MockMemory`/`create_executor_with_r4000cache`.
         // Without disabling both gates, a jitv2 gate variant that runs
         // unconditionally (jitv2_lockstep's lockstep_check, in particular —
-        // see rules/jitv2/codegen-gotchas.md) can compile and run a function
+        // see clanker/jitv2/codegen-gotchas.md) can compile and run a function
         // against an executor whose `core.handle_exception_fn` was never
         // installed, aborting the whole process the moment that function
         // raises an exception (`jit_hooks_not_installed_exception`,
@@ -1035,7 +1035,7 @@ mod tests {
     /// Historical note: the superseded self-describing-tag design *failed*
     /// this test, because its permission AND shared a set-in-every-tag guard
     /// bit with the mode mask and so never rejected anything. See
-    /// rules/testing/nutlb-erl-guard-defeats-permission-test.md.
+    /// clanker/cpu/nutlb-erl-guard-defeats-permission-test.md.
     #[test]
     fn test_nutlb_kernel_entry_unreachable_from_user() {
         std::thread::Builder::new()
@@ -1225,7 +1225,7 @@ mod tests {
     }
 
     // Regression test for a real vmap bug tlbcheck surfaced (now fixed via
-    // MipsTlb::vmap_replace, see rules/testing/tlbcheck-vmap-dangling-slot-bug.md):
+    // MipsTlb::vmap_replace, see clanker/cpu/tlbcheck-vmap-dangling-slot-bug.md):
     // when two entries transiently share a VPN2 (e.g. mid TLBWR churn picks a
     // colliding victim index) and the later one then moves to a new VPN2,
     // the vmap must NOT simply blank the shared slot — it needs to re-derive
@@ -2635,7 +2635,7 @@ mod tests {
     /// R4000/VR5000 manuals: a denormalized operand to a computational
     /// instruction is Unimplemented Operation (Cause.E) — the hardware never
     /// computes an answer, so the destination is left untouched. See
-    /// rules/testing/fpu-exception-model-vs-r4400.md.
+    /// clanker/cpu/fpu-exception-model-vs-r4400.md.
     #[test]
     fn test_fpu_denorm_operand_is_unimplemented() {
         let (mut exec, _) = create_executor();
@@ -6040,7 +6040,7 @@ mod tests {
     /// later at `splx` - for good. This runs the guest, the 1000-step
     /// batches and the park exactly as `MipsCpu::start`'s loop does, raises
     /// IP4 from another thread the way a device does, and requires the loop
-    /// to finish. See rules/perf/idle-pause-masked-interrupt-must-wake.md.
+    /// to finish. See clanker/perf/idle-pause-masked-interrupt-must-wake.md.
     #[cfg(feature = "idle-pause")]
     #[test]
     fn idle_park_wakes_for_an_interrupt_masked_by_a_raised_spl() {

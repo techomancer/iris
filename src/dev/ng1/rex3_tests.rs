@@ -1757,7 +1757,7 @@ const DM0_DRAW_ILINE_STEP: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_I_LIN
 // DM0 for a full F_LINE draw — fractional-endpoint Bresenham correction.
 const DM0_DRAW_FLINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_F_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
 // DM0 for a full A_LINE draw — F_LINE plus AWEIGHT-LUT endpoint suppression (needs ENDPTFILTER, bit 22, set separately).
-// Its Bresenham walk is not tested yet (see rules/testing/rex3-fline-fractional-bresenham.md);
+// Its Bresenham walk is not tested yet (see clanker/rex3/rex3-fline-fractional-bresenham.md);
 // the blend tests use it for its alpha.
 #[allow(dead_code)]
 const DM0_DRAW_ALINE: u32 = DRAWMODE0_OPCODE_DRAW | DRAWMODE0_ADRMODE_A_LINE_SH | DM0_DOSETUP | DM0_STOPONXY;
@@ -1844,7 +1844,7 @@ fn draw_iline_step(rex: &Rex3, x0: i32, y0: i32, x1: i32, y1: i32, color: u8) ->
 /// end point's, the row holding the true line at the column's centre (pixel n
 /// covers [n, n+1)), moving at most one row per column. That is the pixel set
 /// IRIS GL computes for its software Z buffer (fsn.rec: see
-/// rules/rex3/soft-z-lines-zpattern-and-bresround.md). Endpoints in 1/16
+/// clanker/rex3/soft-z-lines-zpattern-and-bresround.md). Endpoints in 1/16
 /// pixels. None when the line passes exactly through a row boundary at some
 /// column centre: which side wins there is BRESROUND's choice.
 fn fline_geom(x1: i32, y1: i32, x2: i32, y2: i32) -> Option<Vec<(i32, i32)>> {
@@ -2317,7 +2317,7 @@ fn test_fline_quarter_pixel_offsets() {
     }
 }
 
-// A_LINE tests: out of scope for this pass — see rules/testing/rex3-fline-fractional-bresenham.md.
+// A_LINE tests: out of scope for this pass — see clanker/rex3/rex3-fline-fractional-bresenham.md.
 // aline_endpoint_skip() (the AWEIGHT-LUT oracle helper) is kept for a future session.
 
 // ============================================================================
@@ -4942,7 +4942,7 @@ mod jit_tests {
     /// rex3_simd::try_fastclear_block intercepted BLOCK draws before
     /// execute_go's processor selection and never checked CID, so BOTH engines
     /// wrote COLORVRAM and agreed. Removing that path exposed the real
-    /// divergence. See rules/rex3/fastclear-cid-divergence.md.
+    /// divergence. See clanker/rex3/fastclear-cid-divergence.md.
     ///
     /// Colour registers are o12.11 DDA values (get_colori shifts right by 11),
     /// so they are written as `component << 11`, not as packed RGB24 — writing

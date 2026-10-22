@@ -3,7 +3,7 @@
 //!
 //! A NIC model (seeq8003, DaynaPort) hands guest frames to a [`NetBackend`]
 //! over an rtrb ring and takes frames back on another. The NAT backend is
-//! [`NatEngine`]; see `docs/net-stack.md` for its design.
+//! [`NatEngine`]; see `clanker/plans/net-stack.md` for its design.
 //!
 //!   packet.rs    Ethernet/ARP/IPv4/ICMP/UDP/TCP views and builders
 //!   engine.rs    NatEngine: the loop, ARP, IP dispatch, frames to the guest

@@ -7,7 +7,7 @@ the RGBA the host loaded into COLORRED/GRN/BLUE/ALPHA. The point is to see the
 application's intent — where it thinks the rock is opaque and where transparent —
 so pipeline bugs can be told apart from bad input.
 
-Key trace facts this relies on (see rules/rex3/blendalpha-and-alpha-blending.md):
+Key trace facts this relies on (see clanker/rex3/blendalpha-and-alpha-blending.md):
   * STOPONX=0 on every billboard draw, so ONE GO == ONE PIXEL at (xstart, ystart).
     xend is the remaining distance to the polygon edge, NOT a span width.
   * Colour registers are IEEE floats biased by +4096; the hardware masks off the

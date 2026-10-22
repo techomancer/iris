@@ -47,7 +47,7 @@ RAM begins at `0x20000000`. MEMCFG has a 16 MB granule; IP28 accepts 256 MB
 and 512 MB banks in addition to the smaller sizes. Two 512 MB banks provide
 1 GB, verified through PROM POST and IRIX `hinv -t memory`. This does not
 change the IP22/IP24 four-bank IRIX 6.5 limitation. See
-[IP28 512 MB banks](../rules/irix/ip28-512mb-banks.md).
+[IP28 512 MB banks](../clanker/devices/ip28-512mb-banks.md).
 
 CP0 Count defaults to 97.5 MHz, which IRIX reports as 195 MHz CPU inventory.
 Override with `[clock] fixed_mhz` or `--clock-fixed-mhz`. MIPS in the status
@@ -59,7 +59,7 @@ PROM environment and MAC live in the motherboard EEPROM (`nveeprom`), while
 the DS1386 uses `nvram`. Normal Stop saves both. `nveeprom save` and `rtc save`
 save immediately before forced termination. Fresh IP28 EEPROMs get PROM
 defaults, including a boot-tune volume; existing settings are retained. See
-[Battery-backed state on Stop](../rules/irix/nvram-persistence.md).
+[Battery-backed state on Stop](../clanker/devices/nvram-persistence.md).
 
 IMPACT uses HQ3/GE11 command interpretation, RSS software rasterization, TE1
 texturing, and VC3/XMAP/colormap/DAC display composition. The GUI and CLI use
@@ -68,6 +68,6 @@ the same `GfxDisplay` interface. Select Solid, High, or Maximum through
 defaults to 1280×1024 before the guest programs VC3; scanout then follows the
 guest's timing and DID tables, backed by 2048×2048 raster storage. Newport
 resolution presets and dual-head mode do not apply. IMPACT board state is not
-saved in snapshots yet. See [MGRAS design](../rules/mgras/DESIGN.md) for coverage and
+saved in snapshots yet. See [MGRAS design](../clanker/mgras/DESIGN.md) for coverage and
 synchronization, and `mgras help` in the monitor for tracing and framebuffer
 inspection.

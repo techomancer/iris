@@ -6,7 +6,7 @@
  * address translation, exception entry and exit, cache maintenance, and
  * uncached device access. They are the kernels most likely to move when the
  * emulator's own internals change, and the ones an ALU benchmark can never
- * see. rules/perf and rules/jitv2 are full of work whose payoff shows up here
+ * see. clanker/perf and clanker/jitv2 are full of work whose payoff shows up here
  * and nowhere else.
  */
 
@@ -36,7 +36,7 @@ static u32 va_to_pfn(unsigned char *p) { return ((u32)(unsigned long)p & 0x1FFFF
 /* Park every entry on a distinct invalid VPN before writing real ones. Leaving
  * the power-on state in place risks two entries claiming the same VPN2, which
  * on real silicon is undefined and in IRIS trips the duplicate-entry checks
- * that rules/testing exists because of. */
+ * that clanker/testing exists because of. */
 static void tlb_reset_all(void)
 {
     int i;

@@ -73,7 +73,7 @@ static void t_geometry_matches_cpu(void)
  * Only the round-trip is asserted. The exact tag *format* — which bits hold
  * the physical tag and which the cache state — is implementation-specific
  * (R4400 manual Figure 11-4), and IRIS documents its own layout in
- * rules/snapshot/l1d-tag-must-match-the-cache-line-layout.md; asserting a
+ * clanker/snapshot/l1d-tag-must-match-the-cache-line-layout.md; asserting a
  * particular encoding here would test that note rather than the architecture.
  */
 static void t_index_store_load_tag(void)

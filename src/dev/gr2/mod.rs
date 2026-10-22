@@ -1,6 +1,6 @@
 //! GR2 graphics (Indy XZ / Indigo2 XZ / Indigo2 Extreme).
 //!
-//! Block layout (rules/gr2/DESIGN.md):
+//! Block layout (clanker/gr2/DESIGN.md):
 //!   hq2.rs     HQ2 registers + HLE command interpreter (HQ2 thread)
 //!   re3.rs     RE3 registers, VRAM, drawing (RE3 thread)
 //!   ge7.rs     GE7 windows + microcode storage (inert)
@@ -169,7 +169,7 @@ pub struct Gr2 {
     /// has not executed yet. FIN3 reads as clear while any is pending: with
     /// our deep FIFO an older Finish would otherwise raise FIN3 for a newer
     /// wait, and the pipeline would run a whole frame behind every swap
-    /// (ideas flicker, IRIX 6.5.22). See rules/gr2/fin3-must-track-pending-finish.md.
+    /// (ideas flicker, IRIX 6.5.22). See clanker/gr2/fin3-must-track-pending-finish.md.
     fin3_pending: AtomicU32,
     /// Set when the kernel acks FIN2 (write to 0x6A04C), which it does right
     /// before issuing a FIN2 command (pixel DMA 0x147, context save/restore)
@@ -179,7 +179,7 @@ pub struct Gr2 {
     /// graphics error and detached Xsgi. While set, a version read with FIN2
     /// clear stalls (bus busy) as long as the HQ2 still has work, so the
     /// kernel sees FIN2 as soon as the HQ2 gets there. See
-    /// rules/gr2/fin2-wait-must-stall.md.
+    /// clanker/gr2/fin2-wait-must-stall.md.
     fin2_wait: AtomicU32,
     /// Host time (fin2_clock ns) of the last progress seen by a stalled FIN2
     /// poll since the wait was armed (0 = no stalled poll yet). The stall
@@ -199,7 +199,7 @@ pub struct Gr2 {
     /// (the kernel's VDMA) drains; head / tail count words since reset.
     /// A read with the ring empty waits (bus busy) while the HQ2 still has
     /// work, since the kernel starts the VDMA right after queuing the
-    /// request. See rules/gr2/gedma-read-port.md.
+    /// request. See clanker/gr2/gedma-read-port.md.
     gedma_out: [AtomicU32; GEDMA_OUT_WORDS],
     gedma_out_head: AtomicU32,
     gedma_out_tail: AtomicU32,

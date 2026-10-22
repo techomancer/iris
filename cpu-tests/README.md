@@ -101,7 +101,7 @@ part.
 
 The assumptions, which of them were tested, and what a port to another SGI
 family would actually involve, are written up once in
-[`rules/testing/bare-metal-harness-platform-assumptions.md`](../rules/testing/bare-metal-harness-platform-assumptions.md)
+[`clanker/testing/bare-metal-harness-platform-assumptions.md`](../clanker/testing/bare-metal-harness-platform-assumptions.md)
 — the harness is shared with `bench/`, so the limitations are shared too.
 
 ## Expected results

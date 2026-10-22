@@ -137,7 +137,7 @@ r5ksc = []
 r5ksc_triton = ["r5ksc"]
 # Idle detection + in-place CPU park: when the guest sits in its interrupt-enabled
 # idle loop, sleep the CPU thread until the next timer tick / device interrupt
-# rather than spinning the host core (see rules/perf/idle-pause-work.md). Wallclock-
+# rather than spinning the host core (see clanker/perf/idle-pause-work.md). Wallclock-
 # anchored timing; the IRIS_NO_IDLE env var disables it at runtime when compiled
 # in. OFF by default (the CPU thread spins) — opt in with --features idle-pause;
 # off keeps deterministic-clock and raw-benchmark builds simple.
@@ -179,7 +179,7 @@ gr4-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelif
 gr2-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]
 # Every graphics JIT: `--features gpujit` for `rex-jit,gr4-jit,gr2-jit`.
 gpujit = ["rex-jit", "gr4-jit", "gr2-jit"]
-# JIT v2: physical-page PIC region compiler (see rules/jitv2/jit-v2-design.md).
+# JIT v2: physical-page PIC region compiler (see clanker/jitv2/jit-v2-design.md).
 # Unconditionally-correct-at-publish redesign, replacing the speculative v1
 # tiered JIT (removed). Whole-page compilation implies transparent caching.
 jitv2 = ["tcache", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native", "target-lexicon", "region", "wasmtime-jit-icache-coherence"]
@@ -190,13 +190,13 @@ jitv2 = ["tcache", "cranelift-codegen", "cranelift-frontend", "cranelift-jit", "
 # with a live bug (silently corrupting a register and dropping a pending
 # foreign delay-slot transfer whenever the standalone-compiled LUI word was
 # actually running as someone else's delay slot at runtime; see
-# rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md) that was hit on
+# clanker/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md) that was hit on
 # real IRIX boot/shutdown traces even after a first fix landed. Not worth the
 # debuggability/complexity cost for the perf it buys in the jitv2 pipeline
 # specifically; opt in with --features jitv2_opcodefusion once it's earned
 # more confidence.
 jitv2_opcodefusion = ["jitv2"]
-# jitv2 whole-page compile (§13, rules/jitv2/jit-v2-design.md): whole-page
+# jitv2 whole-page compile (§13, clanker/jitv2/jit-v2-design.md): whole-page
 # compilation is now the standard and only JIT v2 design. Kept as a compatibility
 # alias for `jitv2` so downstream scripts and builds specifying `--features j2wp`
 # continue to work.
@@ -415,7 +415,7 @@ required-features = ["jitv2", "j2wp"]
 # so behaviour is unchanged. Both iris and eframe/glutin-winit now use 0.30
 # and resolve through this patch. The GUI owns the process's event loop;
 # the embedded core does not create a second window.
-# See rules/macos/appstore-private-api.md.
+# See clanker/macos/appstore-private-api.md.
 [patch.crates-io]
 winit = { path = "third_party/winit-0.30.13" }
 # block 0.1.6 is that crate's final release (2016) and declares a static of an

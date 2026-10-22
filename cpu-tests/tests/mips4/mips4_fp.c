@@ -53,7 +53,7 @@ static volatile u64 *dw(void) { return (volatile u64 *)_scratch_start; }
  * valid instruction that coprocessor 1 must decode and reject itself.
  * Confirmed on an Indy R4400 rev 6.0 (PRId 0x460) — the emulator and this
  * suite previously agreed on EXC_RI, and both were wrong. See
- * rules/testing/running-cpu-tests-on-real-hardware.md.
+ * clanker/testing/running-cpu-tests-on-real-hardware.md.
  */
 #define CHECK_COP1_UNIMPL(word_literal)                                    \
     do {                                                                   \

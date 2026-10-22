@@ -29,7 +29,7 @@ pub struct Memory {
     /// Byte mask applied to addr for indexing. Initialized to mem_size_bytes-1.
     /// Always kept masked to mem_size_bytes-1 so it can never exceed the buffer.
     addr_mask: u32,
-    /// JIT v2: one generation counter per 4KB physical page (rules/jitv2/jit-v2-design.md
+    /// JIT v2: one generation counter per 4KB physical page (clanker/jitv2/jit-v2-design.md
     /// §2.4, §7). Bumped atomically on every write to that page. A compiled artifact for
     /// a page is valid iff its recorded generation still matches this counter (§4.1, §6.5).
     #[cfg(feature = "jitv2")]
@@ -60,7 +60,7 @@ impl Memory {
 
     /// JIT v2: bump the generation counter for the page containing `addr` (post-mask).
     /// Must be called on every mutating access so a compiled artifact can detect
-    /// staleness (rules/jitv2/jit-v2-design.md §7 — "gen bumps ride on the RAM write").
+    /// staleness (clanker/jitv2/jit-v2-design.md §7 — "gen bumps ride on the RAM write").
     #[cfg(feature = "jitv2")]
     #[inline(always)]
     fn bump_gen(&self, addr: u32) {

@@ -177,7 +177,7 @@ pub fn classify(raw: u32, offset_word: u16, page_base: u32, mips4: bool) -> Clas
         // predicate is equally a runtime value. (This used to be `Excluded`,
         // described as having a "condition-code-dependent target"; that
         // conflated the condition with the target. The target never depended
-        // on the condition code. See rules/jitv2/bc1-is-an-ordinary-branch.md.)
+        // on the condition code. See clanker/jitv2/bc1-is-an-ordinary-branch.md.)
         //
         // `rs == RS_BC1` (0x08) is only meaningful as a format selector for
         // OP_COP1 — for OP_COP1X the same bit position is the *base register*
@@ -239,7 +239,7 @@ pub fn is_fpu_instruction(raw: u32) -> bool {
 /// coverage matched that blanket assumption, which it didn't (several
 /// opcodes, e.g. MOVZ/MOVN/DADDI/the unaligned load-store family/all of
 /// OP_COP1X, had no emitter at all — see
-/// `rules/jitv2/unsupported-instructions.md`). `compile_region`'s upfront
+/// `clanker/jitv2/unsupported-instructions.md`). `compile_region`'s upfront
 /// rejection loop declines the *whole* region if any visited instruction
 /// lacks an emitter, so a wrongly-`Sequential` opcode didn't just fail to
 /// compile itself — it silently poisoned every other instruction in
@@ -496,7 +496,7 @@ pub struct CompiledInstr {
     /// much does this word contribute to the pending cycles count" and
     /// "does this word flush that pending count to memory"
     /// (`cycles_flush`) stay visibly independent concerns. See the
-    /// cycles-batching design: `rules/jitv2/` (or this module's own
+    /// cycles-batching design: `clanker/jitv2/` (or this module's own
     /// `compute_cycles_flush` doc comment) for the full rationale — in
     /// short, `Hot::cycles` must be current at every region exit and at
     /// every loop re-entry point (for cross-thread observability of a

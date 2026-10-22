@@ -413,7 +413,7 @@ from.
 On 2026-09-11 the suite ran on a physical **SGI Indy, R4400 rev 6.0**
 (PRId `0x460`, Config `0x20c1c483`), booted from a BlueSCSI v2 through the
 machine's own PROM. Method and bring-up are in
-[`rules/testing/running-cpu-tests-on-real-hardware.md`](../../rules/testing/running-cpu-tests-on-real-hardware.md);
+[`clanker/testing/running-cpu-tests-on-real-hardware.md`](../../clanker/testing/running-cpu-tests-on-real-hardware.md);
 the logs are archived under [`oracle/`](../oracle/).
 
 The result settles what this file exists to ask. **All 15 tests that fail under

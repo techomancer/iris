@@ -8,7 +8,7 @@
 # After changing banks: Stop iris completely, then cold-start (not hot reload).
 # Verify in monitor: mc status  |  in IRIX: hinv -t memory
 # R5000SC build: currently unavailable — see wsl/README.md and
-# rules/testing/r5k-l1i-cache-bugs.md
+# clanker/cpu/r5k-l1i-cache-bugs.md
 
 headless = false
 no_audio = false
@@ -38,7 +38,7 @@ prebuf_ms = 40
 [scsi.1]
 path    = "irix-install/scsi1.raw"
 cdrom   = false
-# Protect root disk from kernel-panic corruption (see rules/testing/disk-image-hygiene.md).
+# Protect root disk from kernel-panic corruption (see clanker/testing/disk-image-hygiene.md).
 overlay = true
 
 [scsi.4]

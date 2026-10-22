@@ -26,7 +26,7 @@ IRIS.app/
 bench/build/
 
 # `j2 corpus` captures: tens of MB of binary page dumps, regenerated on demand
-# from any boot (see rules/jitv2/corpus-capture-from-the-pcp-cache.md).
+# from any boot (see clanker/jitv2/corpus-capture-from-the-pcp-cache.md).
 jitv2_corpus/
 *.pcp
 pcp_dump_pfn_*.bin

@@ -62,7 +62,7 @@ does.
 **The `sys` group is the other point.** TLB refills, exception round trips,
 cache maintenance and uncached device reads are where an emulator can be
 catastrophically slower than the hardware it stands in for, and they are
-invisible to every conventional benchmark. `rules/perf/` and `rules/jitv2/` are
+invisible to every conventional benchmark. `clanker/perf/` and `clanker/jitv2/` are
 full of work whose payoff shows up here and nowhere else.
 
 ### Industry-standard figures
@@ -418,7 +418,7 @@ the whole family, and it can be developed under emulation because IRIS runs a
 real PROM.
 
 Full detail, including which parts of that were tested and which are reasoning:
-[`rules/testing/bare-metal-harness-platform-assumptions.md`](../rules/testing/bare-metal-harness-platform-assumptions.md).
+[`clanker/testing/bare-metal-harness-platform-assumptions.md`](../clanker/testing/bare-metal-harness-platform-assumptions.md).
 None of it touches the measurement, which is already platform-independent.
 
 **Filtering.** `--quick` aside, there is no runtime kernel selector beyond the

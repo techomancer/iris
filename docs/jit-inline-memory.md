@@ -4,7 +4,7 @@ Status: **working and on by default** (§10). Inline loads and stores run for L1
 lines already in cache and fall back to the Rust callouts otherwise; the R5000
 cache model got the same path in September 2026. `j2 inline_mem [on|off]`
 switches it at runtime, and lockstep forces it off
-(`rules/jitv2/lockstep-must-disable-inline-memory.md`). §7–§9 record the two
+(`clanker/jitv2/lockstep-must-disable-inline-memory.md`). §7–§9 record the two
 failed attempts, whose real cause was a Cranelift verifier error (§10), not the
 emit strategy.
 
@@ -211,7 +211,7 @@ is not compile thrash or region rejection. It is the emitted code being slow.
 
 ### Mechanism
 
-`rules/jitv2/jit-v2-design.md:25` names this exact failure as the reason the v1
+`clanker/jitv2/jit-v2-design.md:25` names this exact failure as the reason the v1
 JIT was abandoned:
 
 > Register pressure: 34 live guest values into 15 x86_64 registers with

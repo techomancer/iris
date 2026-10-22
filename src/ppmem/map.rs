@@ -8,7 +8,7 @@
 //! No mapping crate does this portably — `memmap2` has no fixed-address
 //! mapping at all, and `mmap-rs` silently ignores the requested address for
 //! file-backed mappings on Windows (see
-//! `rules/build/mmap-rs-fixed-address-aliasing.md`). So this is hand-written
+//! `clanker/build/mmap-rs-fixed-address-aliasing.md`). So this is hand-written
 //! over `libc` / `windows-sys`, both of which are already dependencies.
 //!
 //! # Why a shared-memory handle rather than anonymous memory

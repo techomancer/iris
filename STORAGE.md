@@ -2,7 +2,7 @@
 
 Disk images, overlays, snapshots, the CI control interface, and scratch-volume
 workflows. The full configuration inventory is in [FEATURES.md](FEATURES.md);
-[HELP.md](HELP.md) covers image preparation and monitor commands. The sections
+[HELP.md](HELP.md) covers image preparation and [debug.md](debug.md) the monitor commands. The sections
 below retain the detailed material previously in README.md.
 
 ### CHD image support
@@ -50,7 +50,7 @@ the GUI's "Commit changes to disk") folds the diff back into the base.
 Graphics coverage is incomplete: GR2 saves register/microcode/display tables
 but omits VRAM and full drawing-engine state; IMPACT board state is not saved
 yet. A snapshot of either board cannot reproduce its complete graphics state.
-See [TODO.md](TODO.md) for remaining device and restore work.
+See [TODO.md](clanker/TODO.md) for remaining device and restore work.
 
 Capture RAM, supported device state, and the COW overlay into
 `saves/<name>/`, and restore it later. CPU, MC, IOC, HPC3, REX3, RTC, EEPROM,
@@ -89,7 +89,7 @@ Two restore tiers:
 Reflinks are used on APFS / btrfs / xfs so capturing a snapshot of a 4 GB disk
 image takes <10 ms and uses ~18 MB of actual disk.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and `rules/snapshot/`
+See [CHANGELOG.md](CHANGELOG.md) for the full feature set, and `clanker/snapshot/`
 for the format and its gotchas.
 
 

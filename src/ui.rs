@@ -108,7 +108,7 @@ struct GlRenderer {
     // `ensure_init()` consumes this on the true first frame; on a stop()/start()
     // respawn it is already `None` and a fresh surface is made on the refresh
     // thread (safe by then — the driver's window state exists).
-    // See rules/gui/windows-silent-exit-0xc000041d.md.
+    // See clanker/gui/windows-silent-exit-0xc000041d.md.
     initial_surface: Option<Surface<WindowSurface>>,
     // Captured on the main thread in Ui::new(): winit 0.30 macOS returns
     // HandleError::Unavailable from window_handle() on any other thread, and
@@ -135,7 +135,7 @@ struct GlRenderer {
     // a monitor/CI socket thread. Swapping means `glDeleteTextures` on the old
     // compositor, and GL calls belong to the refresh thread that owns the
     // context — so the request is only recorded here and serviced at the top of
-    // `present()`. See rules/gui/gl-teardown-must-run-on-the-refresh-thread.md.
+    // `present()`. See clanker/gui/gl-teardown-must-run-on-the-refresh-thread.md.
     pending_compositor: Option<bool>,
     current_w:     usize,
     current_h:     usize,

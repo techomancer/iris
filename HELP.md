@@ -1,7 +1,7 @@
 # IRIS — SGI Indy and Indigo2 emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). This guide explains everyday use and monitor commands.
+[FEATURES.md](FEATURES.md). This guide explains everyday use; the monitor's full command reference is in [debug.md](debug.md).
 
 ## Quick start
 
@@ -11,7 +11,7 @@ scsi1.raw        # Hard disk image (raw or .chd)
 cargo run --release
 ```
 
-No disk image yet? [rules/irix/irix-install.md](rules/irix/irix-install.md)
+No disk image yet? [clanker/irix/irix-install.md](clanker/irix/irix-install.md)
 walks through installing IRIX 5.3 or 6.5.22 from the original CDs. Prefer
 windows and menus? `cargo run -p iris-gui --release` (see
 [iris-gui-README.md](iris-gui-README.md)).
@@ -59,7 +59,7 @@ Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
 
 On IP22/IP24, each bank is at most 128 MB. IP28 also supports 256 MB and
 512 MB banks. For 1 GB on IP28, use `[512, 512, 0, 0]`; see
-[IP28 512 MB banks](rules/irix/ip28-512mb-banks.md). The table below describes
+[IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md). The table below describes
 the IP22/IP24 extended layouts.
 
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
@@ -74,7 +74,7 @@ Changing RAM while IRIX is running updates the config but not the live guest —
 
 If extended himem banks are configured but IRIX still reports 256 MB, check
 monitor `mc regs` for MEMCFG on banks 2–3. IRIS synthesizes himem MEMCFG when
-the PROM skips them (see `rules/irix/extended-ram-memcfg.md`).
+the PROM skips them (see `clanker/devices/extended-ram-memcfg.md`).
 
 ---
 
@@ -744,263 +744,32 @@ iris --tftp-dir ./tftpboot
 
 ## Monitor console
 
-Connect on **localhost:8888** with any TCP client:
+The monitor is IRIS's built-in debugger and control console. It runs in the
+terminal iris was started from and on **127.0.0.1:8888** (`monitor_port`,
+`--monitor-port`):
 
 ```
 telnet 127.0.0.1 8888
 nc 127.0.0.1 8888
 ```
 
-`help` lists every command the running machine registered, with a one-line
-usage string. The following tables list the same set, grouped.
-
-> **`[DEV]`** marks commands or features that require a developer build
-> (`cargo build --features developer`, optionally with `--profile developer`).
-> Selecting the profile alone does not enable developer instrumentation.
-> The command is accepted in all builds but produces no output / has no effect
-> without the feature enabled.
->
-> Developer builds also start with the **CPU paused** at the monitor prompt,
-> and show extended performance counters in the status bar
-> (D:% decode rate, I$:% L1I hit rate, UC:% uncached fetches, cs: step count).
-
-### Machine
+`help` lists every command the running build registered. Commands you are
+likely to need while just using IRIS:
 
 | Command | Description |
 |---------|-------------|
-| `machine-start` / `machine-stop` | Start / stop the CPU and all peripherals |
+| `start` / `stop` / `status` | Start, pause, or query the CPU |
 | `reset` | Reset all hardware to power-on state |
 | `save <name>` / `load <name>` | Save / load a snapshot under `saves/<name>/` |
-| `locks` | Show the state of all registered locks |
-| `perf snapshot` | Performance counters snapshot |
-| `testdev` | Bare-metal test device status |
+| `rtc save` / `nveeprom save` | Write the Indy NVRAM / Indigo2 EEPROM to disk now |
+| `scsi status` / `scsi eject <id>` / `scsi add <id> <path>` | Show disks and CD queues, change CDs |
+| `ps2 type <text>` / `ps2 enter` / `ps2 esc` | Type on the guest keyboard (Esc stops PROM autoboot) |
+| `net status` | NAT connections |
+| `mc regs` | Memory configuration, including MEMCFG |
 
-### CPU / execution
-
-Every command works the same way against a running CPU: `start`, `stop`,
-`status`, `wait` and `help` never touch the core; run control (`run`, `step`,
-`next`, `finish`) needs a stopped CPU and says so; everything else pauses a
-running CPU for the duration of the command and resumes it afterwards. So
-`bp add`, `regs`, `mem` and friends work at any time and never hang.
-
-| Command | Description |
-|---------|-------------|
-| `start` | Start CPU execution |
-| `stop` | Stop (pause) CPU execution |
-| `status` | Running or stopped, the PC, why it last stopped (which breakpoint, its condition and hit count), and the CP0 Count rate. Never blocks |
-| `wait [ms]` | Block until the CPU stops (breakpoint, exception catch) or `ms` pass (default 10000), then say where and why |
-| `run [addr]` / `c` / `cont` | Run until breakpoint or exception (or until `addr`) |
-| `step [n\|addr]` / `s` | Step n instructions (default 1), or until `addr` |
-| `si` | Step without taking interrupts **[DEV]** |
-| `next [n]` / `n` | Step over function calls |
-| `finish` / `fin` | Run until function return (`jr ra`) |
-| `regs` / `r` | Dump general-purpose registers |
-| `cop0` | Dump CP0 (system) registers |
-| `cop1` | Dump CP1 (FPU) registers |
-| `jump <addr>` | Set PC |
-| `setreg <reg> <val>` | Set a register value |
-| `ip7` | Make the CP0 Compare (IP7) interrupt pending, for stepping through timer delivery |
-| `debug <on\|off\|file <path>>` | Per-instruction trace **[DEV]** |
-| `trace start <path>` / `trace stop` / `trace status` | Record a per-instruction execution trace **[DEV]** |
-| `exception <class\|code\|all> <on\|off>` / `ex` | Break on exceptions. Classes: `int tlb addr bus sys ri arith watch vce` |
-| `idleprof <on\|off\|report [n]>` | Find idle/spin loops by PC sampling (`--features idle-pause`) |
-| `instrstats [report\|clear\|dump]` | Per-instruction counters (`--features instr_stats`) **[DEV]** |
-| `jitcheck <n> [skip]` | Run n instructions interpreter-only vs JIT and stop at the first divergence **[DEV]** |
-
-### Memory and loading
-
-| Command | Description |
-|---------|-------------|
-| `mem <addr> [n] [b\|h\|w\|d]` / `m` | Dump virtual memory in bytes, halves, words (default) or doublewords |
-| `mw <addr> <val> [b\|h\|w\|d]` | Write virtual memory |
-| `stack [addr] [n]` | Dump stack |
-| `ms <addr> [max]` | Read string from virtual memory |
-| `dis [addr] [n]` / `d` | Disassemble |
-| `translate <addr>` / `t` | Translate virtual → physical address |
-| `loadelf <file>` | Load a static ELF32 MSB binary and set PC to its entry |
-| `loadbin <file> <addr>` | Load raw bytes at a virtual address |
-
-### Symbols and IRIX introspection
-
-| Command | Description |
-|---------|-------------|
-| `sym <addr>` | Look up nearest symbol |
-| `sym <name>` | Every copy of a name, with the map file it came from |
-| `loadsym <file>` | Load symbol map from file |
-| `proc info` | IRIX kernel utsname and friends (needs `loadsym` first) |
-| `eframe <addr> [o32\|64]` / `ef` | Decode an IRIX exception frame (the `ep` of a panic): registers, cause, sr, EPC, then a backtrace of the interrupted context |
-| `putbuf [size]` / `dmesg` | The IRIX kernel console log, i.e. what a panic printed (needs the kernel's map) |
-
-A name defined in more than one loaded map (the PROM and the kernel both have
-`bcopy`) is ambiguous in expressions: the error lists the copies, and
-`bcopy:1` picks one. Internal lookups (`proc`, `putbuf`) use the copy from the
-map loaded last.
-
-### Breakpoints
-
-| Command | Description |
-|---------|-------------|
-| `bp add <addr> [type] [if <expr>]` / `b` | Add breakpoint. Types: `pc` (default), `r`, `w`, `f` (virtual read/write/fetch), `pr`, `pw`, `pf` (physical). The condition may use registers (`a0`, `c0_badvaddr`, ...) and symbols; a name that is neither is refused |
-| `bp list` / `bl` | List breakpoints with type, symbol, condition and hit count |
-| `bp del <id>` / `bb` | Delete breakpoint |
-| `bp enable <id>` / `be` | Enable breakpoint |
-| `bp disable <id>` / `bd` | Disable breakpoint |
-| `bp ignore <id> <n>` | Let the next n hits pass without stopping |
-| `bp clear` | Delete all breakpoints |
-| `bp save <file>` / `bp load <file>` | Write the breakpoints as `bp add` lines / read them back (survives a restart) |
-
-A breakpoint hit while the CPU runs freely is reported by `status` and
-`wait`, not printed (the terminal is a monitor console too).
-
-### Undo / traceback
-
-| Command | Description |
-|---------|-------------|
-| `undo [n]` / `u` | Undo n instructions **[DEV]** |
-| `undo <on\|off\|clear\|resize <n>>` | Control undo buffer **[DEV]** |
-| `bt [n]` | Print call backtrace |
-| `dt [n]` / `dt file <path> [n]` | Disassemble traceback buffer (the history holds 1,048,576 instructions; asking for more says so) |
-
-### TLB / cache
-
-| Command | Description |
-|---------|-------------|
-| `tlb dump` | Dump the TLB entries this CPU has (48 on R4400/R5000, 64 on R10000) |
-| `tlb trans <vaddr> [asid]` | Translate via TLB |
-| `tlb debug <on\|off>` | TLB trace logging **[DEV]** |
-| `l1i <check\|dump> <addr\|index>` | L1 instruction cache |
-| `l1d <check\|dump> <addr\|index>` | L1 data cache |
-| `l1d wb <vaddr> <size>` / `l1d pwb <paddr> <size>` | Write L1D contents back to RAM (virtual / physical range) |
-| `l2 <check\|dump> <addr\|index>` | L2 unified cache (R4400) |
-| `ll` / `ll stats` / `ll clear` | LL/SC state; the histogram needs `--features llstats` |
-
-### JIT v2 (`--features jitv2`)
-
-`j2` covers compile/dispatch toggles, per-category switches and page
-introspection. See HACKING.md §7 for the full table.
-
-### SCSI / CD-ROM / disks
-
-| Command | Description |
-|---------|-------------|
-| `scsi status` | Show attached devices, disc lists, and queue positions |
-| `scsi regs` | WD33C93A register dump |
-| `scsi eject <id>` | Cycle to next disc on CD-ROM `id` |
-| `scsi add <id> <path>` | Add disc image to queue (inserted as next after current) |
-| `scsi list <id>` | List all discs in queue with ordinal numbers |
-| `scsi del <id> <ord>` | Remove disc at ordinal `ord` from queue (does not eject active disc) |
-| `scsi next <id> <ord>` | Move disc at ordinal `ord` to next position (position 1) |
-| `scsi defer <on\|off>` | Deferred SCSI status interrupts (see `scsi_deferred_int`) |
-| `scsi dayna` | DaynaPort MAC, addresses and counters |
-| `scsi wdt [N]` / `scsi wdt file <path>` | Dump the WD33C93A transaction ring (last N / all to a file) **[DEV]** |
-| `scsi debug <on\|off>` | Per-command SCSI trace logging **[DEV]** |
-| `scsi0 …` / `scsi1 …` | Same, for controller 0 / controller 1 (Indigo2) |
-| `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlay |
-
-Queue positions: `[0]` = active (currently mounted), `[1]` = next on eject, higher = queued.
-`scsi add` verifies the file exists before inserting.
-Disc change signals IRIX via SCSI Unit Attention (sense 06/28/00 "Medium
-Changed") on the next `TEST UNIT READY` poll — no restart required.
-
-### Graphics (REX3 / Newport)
-
-| Command | Description |
-|---------|-------------|
-| `rex status` | Dump all REX3 drawing registers |
-| `rex jit <on\|off\|status\|list>` | REX3 shader JIT control (`--features rex-jit`) |
-| `rex jit <disable\|enable> <dm0> <dm1>` | Disable/enable one compiled draw mode |
-| `rex fbdump [DIR]` | Dump the framebuffers to files in DIR (default `.`) |
-| `rex debug <on\|off>` | REX3 register trace **[DEV]** |
-| `rex buslog <on\|off>` | Log all GIO bus accesses to `rex3.log` **[DEV]** |
-| `rex cmap <on\|off>` | CMAP access trace |
-| `vc2 status` | Dump VC2 (video timing) state |
-| `vc2 ramdump` | Dump VC2 RAM |
-| `vc2 debug <on\|off>` | VC2 trace **[DEV]** |
-| `xmap status` | Dump XMAP9 state |
-| `xmap debug <on\|off>` | XMAP9 trace **[DEV]** |
-| `cmap status` | Dump CMAP state |
-| `cmap debug <on\|off>` | CMAP trace **[DEV]** |
-| `dcb debug <on\|off>` | DCB (display control bus) trace **[DEV]** |
-| `block debug <on\|off>` | Block/span draw logging to `block.log` **[DEV]** |
-| `draw debug <on\|off>` | Draw debug overlay on framebuffer **[DEV]** |
-| `disp status` / `disp debug <on\|off>` | Display timing / framebuffer state |
-| `disp compositor <gl\|sw>` | Switch between the GL and software compositor |
-| `bt445 status` | BT445 RAMDAC state |
-| `bt445 identity` | Reset RAMDAC palette to linear identity ramp |
-| `bt445 debug <on\|off>` | BT445 trace **[DEV]** |
-| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace (trace: `gputrace` builds) |
-| `gr2 fbdump [DIR]` | GR2 framebuffer dump, including composed screen |
-| `re3 ...` | GR2 raster register inspection (see monitor `help`) |
-| `mgras [status]` | IMPACT state and inventory summary |
-| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace (`gputrace` builds) |
-| `mgras fbdump [DIR]` / `mgras shot <path>` | IMPACT framebuffer dump / screenshot |
-| `mgras rec <file>` / `mgras rec off` | Record / stop recording board accesses |
-| `rss ...` | IMPACT raster inspection (see monitor `help`) |
-
-### Hardware devices
-
-| Command | Description |
-|---------|-------------|
-| `mc regs` | Memory Controller registers (incl. MEMCFG) |
-| `mc dma` | MC GIO DMA (VDMA) state |
-| `mc dma xlate [vaddr] [w]` | Walk the VDMA address translation (µTLB, PTE) for `vaddr` (default MEMADR) without side effects; `w` = transfer writes memory |
-| `mc vdma <on\|off>` | VDMA trace to `vdma.log` |
-| `eeprom <on\|off\|dump\|r <word>\|w <word> <val>>` | CPU/MC boot-config EEPROM (93C56) |
-| `nveeprom <on\|off\|dump\|r\|w\|save [file]>` | Indigo2 NVRAM EEPROM (93CS56: env vars + MAC) |
-| `hpc3 status` | HPC3 peripheral controller state |
-| `pdma status` | PBUS DMA channel state |
-| `pdma dump <on\|off\|hal\|scsi\|enet\|MASK>` | PDMA trace **[DEV]** |
-| `pdma chain <addr>` | Decode DMA descriptor chain at physical address |
-| `ioc status` | IOC interrupt controller state |
-| `ioc ticks` | 8254 timer service since the last call: ticks fired, acknowledged and merged, fire-to-acknowledge waits |
-| `rtc status` / `rtc dump` | Real-time clock registers (and any `[rtc_offset]`) / NVRAM dump |
-| `rtc save [file]` | Save RTC NVRAM to file |
-| `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
-| `rtc debug <on\|off>` | RTC trace **[DEV]** |
-| `pit status` | PIT 8254 timer state |
-| `pit debug <on\|off>` | PIT trace **[DEV]** |
-| `hal2 status` | HAL2 audio controller state |
-| `ps2 status` | PS/2 controller state |
-| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (stops PROM autoboot) on the guest keyboard |
-| `ps2 mouse <dx> <dy> [buttons]` | Inject relative mouse motion and optional button mask |
-| `ps2 debug <on\|off>` | PS/2 keyboard/mouse trace |
-| `serial status` | SCC channel A/B registers and FIFO state |
-| `vino status` | VINO video-in registers, channel state, descriptor cache |
-| `vino debug <on\|off>` | VINO register/I2C trace |
-
-### Networking
-
-| Command | Description |
-|---------|-------------|
-| `seeq status` | SEEQ 8003 Ethernet MAC state |
-| `net status [tcp\|udp\|icmp\|all]` | NAT connection table |
-| `net interfaces` | Host interfaces available for PCAP |
-| `net debug <tcp\|udp\|icmp> <on\|off>` | Per-packet trace **[DEV]** |
-
-### Physical bus / memory
-
-| Command | Description |
-|---------|-------------|
-| `phys mem <addr> [n]` / `mm` | Physical memory dump |
-| `phys dis <addr> [n]` / `md` | Physical memory disassemble |
-| `phys trace` / `trace <on\|off>` | Bus access trace |
-| `phys error <on\|off>` | Break on bus errors |
-| `phys hole <on\|off>` | Break on unmapped access |
-| `phys bench` / `bench` | Memory bandwidth benchmark |
-
-### Logging
-
-All `log` commands require a developer build to produce output. **[DEV]**
-
-| Command | Description |
-|---------|-------------|
-| `log status` | Show per-module log state |
-| `log <module\|all> <on\|off>` | Enable/disable module logging |
-| `log <module> mask <cat\|hex>` | Set log category mask |
-| `log <module> file <path\|off>` | Redirect module log to file |
-
-`log status` lists the modules. PDMA mask categories: `hal enet scsi on/all off/none <hex>`.
-MIPS mask categories: `insn tlb mem on/all off/none <hex>`.
+The complete command reference (execution control, breakpoints, memory, TLB
+and caches, JIT, graphics, devices, logging), the GDB stub and the MCP server
+are documented in [debug.md](debug.md).
 
 ---
 
@@ -1079,6 +848,6 @@ and HTTP `push`/`pull`; iris-gui has Save/Restore under the Machine menu. The
 on-disk format is schema version 3 — a `snapshot.toml` manifest, postcard-encoded
 device state, and RAM stored as content-addressed chunks under `saves/.cas/`.
 A snapshot refuses to load onto a different CPU model or host architecture. See
-[snapshot coverage](STORAGE.md#snapshots-and-rollback) and `rules/snapshot/`.
+[snapshot coverage](STORAGE.md#snapshots-and-rollback) and `clanker/snapshot/`.
 GR2 currently omits VRAM/full drawing state; IMPACT saves no board state yet.
-See [TODO.md](TODO.md) for device/checkpoint completion work.
+See [TODO.md](clanker/TODO.md) for device/checkpoint completion work.

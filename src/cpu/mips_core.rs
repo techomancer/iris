@@ -271,7 +271,7 @@ impl CyclesPtr {
 /// a CP0 Compare write, not every dispatch) trail at the end.
 ///
 /// `#[repr(C)]`: JIT v2 compiled code addresses fields directly via a pinned
-/// base pointer + fixed byte offset (`mov [base+disp]`, rules/jitv2/jit-v2-design.md
+/// base pointer + fixed byte offset (`mov [base+disp]`, clanker/jitv2/jit-v2-design.md
 /// §5 — "memory-resident registers", no copy-in/copy-out shadow struct like v1's
 /// `JitContext`). That requires deterministic, ABI-stable field layout, which
 /// `repr(Rust)` does not guarantee. Offsets must be computed via
@@ -2629,7 +2629,7 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
     // which left `bin/jitv2_verify.rs`'s bare-`MipsCore` call — no wrapper — able
     // to enter a handler with `in_delay_slot` still set. Same
     // "every caller must remember" shape as the CP0-Status resync bug; see
-    // rules/testing/cp0-status-writes-must-resync-privilege-state.md.
+    // clanker/cpu/cp0-status-writes-must-resync-privilege-state.md.
     core.in_delay_slot = false;
 }
 

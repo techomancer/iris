@@ -176,7 +176,7 @@ impl MemoryController {
         // that's clear per the spec — but the IRIX 5.3 vino driver's
         // vino_init() checks bit 4 of SYSID at 0xBFA0001C as a gate before
         // any further probing, and silently bails if it's clear (see
-        // rules/irix/vino-attach-via-sysid-bit4.md). Setting bit 4
+        // clanker/video/vino-attach-via-sysid-bit4.md). Setting bit 4
         // unconditionally lets vino_init proceed; with it set, `vlinfo`
         // reports `vino 0` with 5 nodes (digital input = IndyCam, analog
         // input, two memory drains, controls).

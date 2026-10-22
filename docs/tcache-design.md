@@ -291,7 +291,7 @@ The whole point. Before/after on the same host:
 
 Expected shape: the gain scales with miss rate. Kernels that fit in L1 see
 little; anything streaming memory should see the fill/writeback memcpy vanish.
-`rules/testing/benchmark-suite-gotchas.md` before adding any kernel.
+`clanker/testing/benchmark-suite-gotchas.md` before adding any kernel.
 
 ---
 

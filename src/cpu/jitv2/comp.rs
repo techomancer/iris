@@ -1,4 +1,4 @@
-//! JIT v2 compiler-thread logic. See `rules/jitv2/jit-v2-design.md`.
+//! JIT v2 compiler-thread logic. See `clanker/jitv2/jit-v2-design.md`.
 //!
 //! `handle_request` is the compile-from-snapshot protocol (§6.5): read the
 //! page's 4KB snapshot off the bus, bounded-walk it from the requested

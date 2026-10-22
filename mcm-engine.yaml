@@ -1,6 +1,6 @@
 project_name: iris
 db_path: .claude/knowledge.db
-rules_path: rules/
+rules_path: clanker/
 plugins: []
 nudges:
   # Tuned for 1M context (Opus 4.6) — sessions can safely run 400+ turns.
@@ -35,7 +35,7 @@ server_instructions: |
   3. MUST delegate to a sub-agent after 2 failed fix attempts for the same error.
      Long debug sessions destroy parent context.
 
-  4. DB is CACHE, files are AUTHORITATIVE. The markdown notes under rules/ (jit/, snapshot/,
+  4. DB is CACHE, files are AUTHORITATIVE. The markdown notes under clanker/ (jit/, snapshot/,
      irix/, testing/) are the source of truth. When using add_rule, provide file_path pointing
      to the authoritative rule file.
 

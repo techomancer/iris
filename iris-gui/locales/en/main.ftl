@@ -394,7 +394,7 @@ help-ultra64-cmd-reset = Reset the N64
 help-ultra64-cmd-load = Load a file straight into RAMROM
 help-ultra64-cmd-dump = Show RAMROM contents in hex
 help-ultra64-cmd-disasm = Disassemble RAMROM
-help-ultra64-footer = This is a developer feature for N64 homebrew and research. IRIS doesn't include any ROMs. Hardware notes are in docs/ultra64.md.
+help-ultra64-footer = This is a developer feature for N64 homebrew and research. IRIS doesn't include any ROMs. Hardware notes are in docs/Indy/ultra64.md.
 
 ## Disk sync and discard dialogs
 

@@ -175,7 +175,7 @@ configured" — true when booting through the PROM, and false under `--load-elf`
 which is precisely the path that skips it. An unprogrammed channel has
 `WR5.TX_ENABLE` clear, so the byte is queued and the TX thread never latches
 it, and nothing reaches the backend to be teed
-(`rules/testing/scc-serial-output-from-bare-metal-code.md` §2).
+(`clanker/testing/scc-serial-output-from-bare-metal-code.md` §2).
 
 Confirmed by running with `--serial-log` and *without* `--test-device`: the log
 is still empty and the machine sits there, so the SCC really is the silent one

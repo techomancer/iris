@@ -96,7 +96,7 @@ the GUI and its Mac App Store distribution support.
 You need:
 
 - A hard-disk image with IRIX 6.5.22 (or 5.3) for Indy. To produce one, follow
-  [rules/irix/irix-install.md](rules/irix/irix-install.md) (install from the
+  [clanker/irix/irix-install.md](clanker/irix/irix-install.md) (install from the
   original media CDs into an empty CHD/raw disk).
 - An external PROM image (optional): `070-9101-011.bin` for Indy,
   `070-1367-012.bin` for Indigo2 IP22, or `070-1477-002.bin` for Indigo2 IP28.
@@ -118,9 +118,8 @@ and JIT implementation notes. The GUI tour is in
 [iris-gui-README.md](iris-gui-README.md); Windows/WSL launch guidance is in
 [wsl/README.md](wsl/README.md).
 
-See [CHANGELOG.md](CHANGELOG.md) for dated changes and [TODO.md](TODO.md) for
-the feature-completion backlog; the original scratch list is preserved in
-[TODO_archive.md](TODO_archive.md).
+See [CHANGELOG.md](CHANGELOG.md) for dated changes and
+[clanker/TODO.md](clanker/TODO.md) for the feature-completion backlog.
 
 
 ## Documentation
@@ -130,14 +129,16 @@ configuration inventory for both `iris` and `iris-gui`.
 
 | Guide | Contents |
 |---|---|
-| [HELP.md](HELP.md) | CLI usage, TOML examples, monitor commands, serial access, and guest setup. |
+| [HELP.md](HELP.md) | CLI usage, TOML examples, serial access, and guest setup. |
+| [debug.md](debug.md) | The monitor console's full command reference, the GDB stub, the MCP server, traces and other introspection. |
+| [HACKING.md](HACKING.md) | How the emulator is built: bus and device traits, threads and locks, the GFIFO, jitv2. |
 | [iris-gui-README.md](iris-gui-README.md) | GUI build, machine management, input, disks, networking, benchmarks, and distribution. |
 | [FEATURES.md](FEATURES.md) | All build features, profiles, configuration keys, CLI switches, GUI settings, diagnostic environment controls, CPU specifications, and JIT behavior. |
 | [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
 | [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
 | [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
 | [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
-| [TODO.md](TODO.md) / [TODO_archive.md](TODO_archive.md) | Current feature-completion backlog and the original scratch list. |
+| [clanker/TODO.md](clanker/TODO.md) | Current feature-completion backlog. |
 | [wsl/README.md](wsl/README.md) | Windows/WSL build, launch, and troubleshooting. |
 | [PRIVACY.md](PRIVACY.md) | Privacy policy; [App Store review notes](docs/appstore-review-response.md) describe distribution constraints. |
 
@@ -146,13 +147,13 @@ Hardware, testing, and development references:
 | Area | Documentation |
 |---|---|
 | Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/indy-xz-elan.md). |
-| Graphics and peripherals | [REX3](docs/rex3.md), [HAL2 audio](docs/hal2.md), [WD33C93A SCSI](docs/wd33c93a.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/ultra64.md) / [N64 GIO specifications](docs/n64_gio_specs.md). |
+| Graphics and peripherals | [REX3](docs/Indy/rex3.md), [HAL2 audio](docs/Indy/hal2.md), [WD33C93A SCSI](docs/Indy/wd33c93a.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/Indy/ultra64.md) / [N64 GIO specifications](docs/Indy/n64_gio_specs.md). |
 | CPU test suite | [Suite README](cpu-tests/README.md), [current status](cpu-tests/docs/status.md), [findings](cpu-tests/docs/findings.md), [gotchas](cpu-tests/docs/gotchas.md), and [emulator support](docs/cpu-test-support.md). |
 | CPU test infrastructure | [Toolchain](cpu-tests/docs/toolchain.md), [memory map](cpu-tests/docs/memory-map.md), [oracle overview](cpu-tests/docs/oracle.md), [hardware oracle](cpu-tests/oracle/README.md), [R4600 notes](cpu-tests/docs/r4600.md), and [original test plan](cpu-tests/PLAN.md). |
-| Benchmarks and memory tests | [Benchmark suite](bench/README.md), [prebuilt assets](bench/prebuilt/README.md), [reference results](data/bench_reference.README.md), [GUI benchmark design](docs/gui-benchmark-plan.md), and [memory stress utility](test/memstress/README.md). |
-| Architecture and debugging | [HACKING.md](HACKING.md), [runtime debugging](debug.md), [CPU debug notes](src/debug.md), [contributor instructions](CLAUDE.md), and the [rules/](rules/) folder. |
-| Memory and JIT design | [Persistent JIT cache](docs/jitv2-persistent-cache.md), [inline memory](docs/jit-inline-memory.md), [JIT performance analysis](docs/jitv2_performance_analysis.md), [physical RAM](docs/ppmem-design.md), [transparent cache](docs/tcache-design.md), and [historical TLB design](docs/nutlb-design.md). |
-| Networking and storage designs | [CHD sync](docs/cow-chd-sync-plan.md), [NFS server](docs/nfsudp-plan.md), [networking GUI](docs/networking-tab-redesign.md), [DaynaPort implementation plan](docs/iris-daynaport-target.md), and [PCAP distribution plan](docs/pcap-release-plan.md). These documents retain design history; read their status notes first. |
+| Benchmarks and memory tests | [Benchmark suite](bench/README.md), [prebuilt assets](bench/prebuilt/README.md), [reference results](data/bench_reference.README.md), [GUI benchmark design](clanker/plans/gui-benchmark-plan.md), and [memory stress utility](test/memstress/README.md). |
+| Architecture and debugging | [HACKING.md](HACKING.md), [runtime debugging](debug.md), [agent instructions](clanker/CLANKER.md), and the [clanker/](clanker/INDEX.md) notes. |
+| Memory and JIT design | [Persistent JIT cache](docs/jitv2-persistent-cache.md), [inline memory](docs/jit-inline-memory.md), [JIT performance analysis](clanker/plans/jitv2_performance_analysis.md), [physical RAM](docs/ppmem-design.md), [transparent cache](docs/tcache-design.md), and [historical TLB design](docs/nutlb-design.md). |
+| Plans and task briefs | [clanker/plans/](clanker/plans/): CHD sync, the NFS server, the networking GUI, the DaynaPort target, PCAP distribution, the NAT stack redesign, jitv2 performance analysis. Written as working documents; read their status notes first. |
 | HostGL tooling | [Khronos ABI registry tooling](iris-hostgl/tools/khronos/README.md). |
 
 ### CHD image support
@@ -232,11 +233,16 @@ for a clean terminal instead.
 See [TESTING.md](TESTING.md) for Rust tests, bare-metal CPU/benchmark suites,
 matrix runs, reference hardware, and performance methodology.
 
-### Rules
+### Agent notes (`clanker/`)
 
-The [rules/](rules/) folder records debugging lessons and subsystem design
-constraints for contributors. Its subsystem map and JIT reading guidance are
-in [HACKING.md](HACKING.md#debugging-rules).
+The [clanker/](clanker/INDEX.md) folder holds working notes written mainly
+for AI coding agents: debugging lessons, subsystem gotchas, investigation
+logs, plans, the backlog, agent skills and the MCP server. They are terse and
+dated, but often the fastest way to learn why something is the way it is.
+[clanker/INDEX.md](clanker/INDEX.md) lists them by subsystem.
+[CLAUDE.md](CLAUDE.md) and [AGENTS.md](AGENTS.md) link to the agent
+instructions, `clanker/CLANKER.md`; `rules/` links to `clanker/` for old
+references.
 
 ## License
 

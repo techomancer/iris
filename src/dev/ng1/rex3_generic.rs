@@ -832,7 +832,7 @@ pub fn blend<M: Mode>(m: &M, src: u32, dst: u32) -> u32 {
 /// CICLAMP, and only at 8/12bpp. The DDA advances whether or not the pixel was
 /// drawn. Whether the clamp writes back into the accumulator (as here) or only
 /// affects the value sent downstream is an open hardware question — see
-/// `rules/rex3/shade-dda-clamp-open-question.md`.
+/// `clanker/rex3/shade-dda-clamp-open-question.md`.
 #[inline(always)]
 pub fn iterate_shade<M: Mode>(ctx: &mut Rex3Context, m: &M) {
     if m.shade() == 0 {
@@ -1380,7 +1380,7 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
     // the interpreter's. try_fastclear_block never checked CIDMATCH, which
     // made execute_go's `no_cid` term unreachable for BLOCK draws and let a
     // fastclear block ignore CID checking entirely, against the spec. See
-    // rules/rex3/fastclear-cid-divergence.md.
+    // clanker/rex3/fastclear-cid-divergence.md.
 
     let _w = (ctx.xend - ctx.xstart).abs();
     let _h = (ctx.yend - ctx.ystart).abs();
@@ -1407,7 +1407,7 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
     // re-read, so its pixels replicate across the block. IRIX's glPixelZoom path
     // (snoop) draws each zoomed pixel this way: a 6x6 STOPONX|STOPONY block fed
     // one 32bpp word. MAME's block loop behaves the same.
-    // See rules/rex3/host-full-block-replicates.md.
+    // See clanker/rex3/host-full-block-replicates.md.
     let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || (colorhost && !stopony);
 
     // stop_on_word takes priority over stoponx — host mode governs its own stop.
@@ -1647,7 +1647,7 @@ pub fn draw_span_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
 ///   where the rules disagree (fsn.rec; the rest are 1-pixel strokes next to
 ///   others).
 ///
-/// See rules/rex3/soft-z-lines-zpattern-and-bresround.md.
+/// See clanker/rex3/soft-z-lines-zpattern-and-bresround.md.
 pub fn fline_setup(ctx: &mut Rex3Context) {
     use crate::dev::ng1::rex3::{OCTANT_XDEC, OCTANT_XMAJOR, OCTANT_YDEC, REX3_BRES_OCTANTS};
     // 21.11 -> 16.4

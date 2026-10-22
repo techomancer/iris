@@ -501,7 +501,7 @@ and pixel data is being lost", slot.addr, GFIFO_PAYLOAD);
     /// the current topology — but it is the hook a deferred/batched tail needs,
     /// and taking the lock is what makes it safe to call from a thread that is
     /// neither the producer nor the consumer. See
-    /// `rules/rex3/gfifo-batching-constraints.md`: a batched producer must
+    /// `clanker/rex3/gfifo-batching-constraints.md`: a batched producer must
     /// publish before any `busy_or_val!` or STATUS read, or the reader sees an
     /// emptier queue than reality and skips the retry it owed.
     ///

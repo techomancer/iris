@@ -13,7 +13,7 @@
 //! silently poisoning (declining, not just excluding-in-place) every
 //! region that happened to walk through them (`compile_region`'s upfront
 //! rejection loop declines the *whole* region if any visited instruction
-//! lacks an emitter — see `rules/jitv2/unsupported-instructions.md` for the
+//! lacks an emitter — see `clanker/jitv2/unsupported-instructions.md` for the
 //! inventory that motivated this fix). Routing `classify()` through
 //! `has_emitter()` instead makes that drift structurally impossible: an
 //! opcode without an emitter is `Excluded` (the analyzer never walks past

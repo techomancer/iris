@@ -894,7 +894,7 @@ impl WindowDelegate {
         // iris-gui never requests window blur (ViewportBuilder leaves blur =
         // false), so this is a no-op. Removing the call also drops the
         // `_CGSSetWindowBackgroundBlurRadius` / `_CGSMainConnectionID` imports
-        // from the linked binary. See rules/macos/appstore-private-api.md.
+        // from the linked binary. See clanker/macos/appstore-private-api.md.
     }
 
     pub fn set_visible(&self, visible: bool) {

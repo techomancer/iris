@@ -627,7 +627,7 @@ impl Vino {
             // Deferring completion to the second field lets the kernel's parity go
             // odd and the frame deliver. Both fields still render their own rows
             // into the shared buffer; only the DESC interrupt is deferred.
-            // (Full derivation: rules/irix/vino-capture-on-6.5-progress.md cont.12.)
+            // (Full derivation: clanker/video/vino-capture-on-6.5-progress.md cont.12.)
             //
             // 5.3 GATE: IRIX 5.3 capture is EOF-driven and page-steps NEXT_4_DESC
             // per field, so it never reaches a STOP descriptor here — this branch

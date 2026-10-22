@@ -5,7 +5,7 @@ values (`mgras probe`) while test/gltest/glstate queries the state.
   tools/mgras-probe-states.py OUTDIR [--ranges 0x1fa-0x1fc,...] [--only SUBSTR]...
 
 Needs a running iris (this tree's build) with the guest logged in and
-glstate built in /tmp/gltest (see rules/mgras/gl-state-map.md).
+glstate built in /tmp/gltest (see clanker/mgras/gl-state-map.md).
 
 Bit runs: run r (0..4) answers mask_r = OR of 1 << k for every k whose bit
 r is set; plus all ones and zero. A boolean query that tests bit k of its

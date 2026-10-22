@@ -74,7 +74,7 @@ pub enum ShaderState {
     Disabled(CompiledShader),
     /// Cranelift declined this shape. Never retried. Not an error: the line
     /// emitter has no host-pixel support, for instance — see
-    /// rules/rex3/line-plus-host-not-jittable.md.
+    /// clanker/rex3/line-plus-host-not-jittable.md.
     Failed,
 }
 
@@ -365,7 +365,7 @@ impl RexJit {
             // A full channel did not accept this shader. Drop the Queued marker
             // so a later draw retries, rather than leaving a phantom entry that
             // suppresses every future request (see
-            // rules/testing/rex-jit-queue-retry.md).
+            // clanker/rex3/rex-jit-queue-retry.md).
             //
             // This path must not block: it runs on the GFIFO consumer thread,
             // and stalling there stalls the guest. Warm-up uses

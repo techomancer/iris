@@ -1,6 +1,6 @@
 //! JIT v2 core data structures.
 //!
-//! See `rules/jitv2/jit-v2-design.md` for the full design. This module holds the
+//! See `clanker/jitv2/jit-v2-design.md` for the full design. This module holds the
 //! per-page metadata the rest of the engine builds on (§2.4):
 //!
 //! - [`PhysicalCodePage`]: the mips executor's view of "what's compiled here" for
@@ -797,7 +797,7 @@ pub struct PhysicalCodePage {
     /// Cost of keeping them always-on: 8 bytes per pooled page (two u32),
     /// i.e. 32 KiB at the default 4096-page capacity, written once per
     /// successful `publish`. Nothing reads them on any hot path. See
-    /// `rules/jitv2/block-fragmentation-blocks-cse.md`'s "measure without
+    /// `clanker/jitv2/block-fragmentation-blocks-cse.md`'s "measure without
     /// `developer`" rule, which this makes possible to actually follow.
     pub instr_count: std::sync::atomic::AtomicU32,
     pub code_size: std::sync::atomic::AtomicU32,
@@ -2471,7 +2471,7 @@ impl Jitv2 {
     /// from added that: `j2 status` is read on `lightning` builds, and
     /// gating a statistic to `developer` is how `last_code_size` came to
     /// report 0 bytes in the only build worth measuring (see
-    /// rules/build/the-three-builds-we-actually-use.md).
+    /// clanker/build/the-three-builds-we-actually-use.md).
     pub fn code_bytes_used(&self) -> u64 {
         self.pages.iter()
             .filter(|page| !page.func().is_null())

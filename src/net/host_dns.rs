@@ -1,6 +1,6 @@
 //! The host's configured DNS server. NAT forwards guest DNS queries here, so the
 //! guest resolves names the way the host does — including through a VPN that
-//! only permits its own resolver. See rules/irix/nat-dns-host-resolver.md.
+//! only permits its own resolver. See clanker/net/nat-dns-host-resolver.md.
 use std::net::Ipv4Addr;
 
 /// The host's first usable IPv4 DNS server, if one is configured.

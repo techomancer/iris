@@ -1,7 +1,7 @@
 //! Kernel idle-loop detection and in-place CPU thread parking.
 //!
 //! Shared by the interpreter run loop (`mips_exec.rs`) and the JIT dispatch
-//! loop (`jit/dispatch.rs`). See `rules/perf/idle-pause-work.md`.
+//! loop (`jit/dispatch.rs`). See `clanker/perf/idle-pause-work.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};

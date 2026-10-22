@@ -35,7 +35,7 @@ These settings are part of this repository and share the core configuration sche
 | **Launch scripts** | `run-iris-premiere.bat` / `run-iris-windows.bat` build with `lightning,rex-jit,idle-pause`; **feature stamp** rebuild via `ensure-build.bat` |
 | **Premiere GUI** | `cargo build -p iris-gui --features premiere` — embedded `lightning` + `idle-pause`; `run-iris-gui-premiere.bat` |
 | **GUI prefs** | Debug tab settings (`gui_gl_capture`, `no_idle`, `debug_log`) persisted in the machine's own TOML; **File → Prepare for premiere…** flushes it to disk and reports the path to run the CLI `--config` against, from that machine's folder |
-| **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [rules/perf/gui-idle-refresh.md](../rules/perf/gui-idle-refresh.md) |
+| **Idle refresh** | Status-bar-only heartbeat skips full compositor + partial egui upload — [clanker/perf/gui-idle-refresh.md](../clanker/perf/gui-idle-refresh.md) |
 | **Audio** | HAL2 wall-clock pacing/resampling; Display tab `[audio]` prebuf / cpal buffer |
 | **jitv2 (experimental)** | `--features jitv2` — physical-page region compiler, auto-enabled at runtime once compiled in (no env-var toggle); use `jitv2_lockstep` for diagnostics or `jitv2_opcodefusion` separately (they conflict); `[jitv2] threads` configures the pool |
 
@@ -47,7 +47,7 @@ See [HELP.md](../HELP.md) for monitor commands, serial ports, NVRAM, etc.
 |------|------|
 | **RAM presets** | Memory menu + Memory tab: 32–512 MB on IP24/IP22; IP28 also offers 768/1024 MB |
 | **RAM workflow** | Edits disabled while VM is running; **“Applied at next Start”** when stopped; shows config vs last-started total |
-| **Extended RAM fix** | If PROM only POSTs lomem, core **synthesizes MEMCFG** for himem banks 2–3 when configured (`src/dev/mc.rs`) — see [rules/irix/extended-ram-memcfg.md](../rules/irix/extended-ram-memcfg.md) |
+| **Extended RAM fix** | If PROM only POSTs lomem, core **synthesizes MEMCFG** for himem banks 2–3 when configured (`src/dev/mc.rs`) — see [clanker/devices/extended-ram-memcfg.md](../clanker/devices/extended-ram-memcfg.md) |
 | **MHz vs MIPS** | Status-bar **MIPS** = real host speed; IRIX System Manager **MHz** = `hinv` inventory (cosmetic). Debug tab explains build features |
 
 **Important:** `banks` in config is applied only when the VM **Starts**. Changing RAM in the GUI while IRIX is running updates the saved config, not the live guest — **Stop → change → Start**.
@@ -99,7 +99,7 @@ Monitor (telnet `127.0.0.1:8888`): `perf snapshot`, `rex jit status`, `hal2 stat
 
 ### Phase 3 unified config
 
-A GUI machine's TOML includes `[perf]` and `[machine]` sections (plus `[jitv2]` if built with the `jitv2` feature). See [rules/perf/phase3-platform.md](../rules/perf/phase3-platform.md).
+A GUI machine's TOML includes `[perf]` and `[machine]` sections (plus `[jitv2]` if built with the `jitv2` feature). See [clanker/perf/phase3-platform.md](../clanker/perf/phase3-platform.md).
 
 Windows CI default socket: `127.0.0.1:19851` (TCP). Unix: `/tmp/iris.sock`.
 
@@ -171,7 +171,7 @@ For **IRIX 6.5**, prefer **384 MB** over 512 MB. The 512 MB preset is documented
 
 ### Silent app quits (debug)
 
-See [rules/testing/silent-app-quit-debug.md](../rules/testing/silent-app-quit-debug.md).
+See [clanker/testing/silent-app-quit-debug.md](../clanker/testing/silent-app-quit-debug.md).
 
 1. **Capture log:** `wsl\capture-app-crash.ps1`
 2. **RAM A/B:** `--config irix-install\iris-windows-384.toml` if you were on 512 MB
@@ -195,7 +195,7 @@ target\release\iris.exe --config irix-install\iris-windows.toml --cpu r5000
 
 The emulated R5000 has 32 KB 2-way L1 caches and **no** secondary cache. The
 R5000SC variant (external L2) is not available: `iris/r5ksc` deliberately fails
-to build until its L1I cache bugs are fixed (`rules/testing/r5k-l1i-cache-bugs.md`).
+to build until its L1I cache bugs are fixed (`clanker/cpu/r5k-l1i-cache-bugs.md`).
 The old `iris/r5k` feature is removed. A snapshot refuses to restore onto a
 different CPU model.
 
@@ -298,7 +298,7 @@ mode:
    a GUI machine's TOML (Path A above).
 3. In another WSL terminal: `iris-ci ping`, `iris-ci boot`, etc.
 
-See [rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md](../rules/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md).
+See [clanker/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md](../clanker/snapshot/iris-ci-is-the-canonical-ci-socket-interface.md).
 
 ### Sync checklist
 

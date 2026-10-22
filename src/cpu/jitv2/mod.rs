@@ -1,4 +1,4 @@
-//! JIT v2: physical-page PIC region compiler. See `rules/jitv2/jit-v2-design.md`.
+//! JIT v2: physical-page PIC region compiler. See `clanker/jitv2/jit-v2-design.md`.
 
 pub mod jitv2;
 pub mod comp;
@@ -15,7 +15,7 @@ pub mod paged_memory;
 // and `j2 corpus` are monitor-console diagnostics, and the corpus capture
 // they feed has to be available in the same production-shaped build whose
 // emitted code anyone would want to measure (see `zz_corpus_sizes` below,
-// and `rules/jitv2/block-fragmentation-blocks-cse.md` on why measuring a
+// and `clanker/jitv2/block-fragmentation-blocks-cse.md` on why measuring a
 // `developer` build answers the wrong question).
 pub mod pcp_dump;
 pub mod equiv_test;
@@ -52,7 +52,7 @@ mod zz_corpus {
     /// has, not just whichever one happened to be dumped first.
     ///
     /// **Do not run this under `developer`** — see
-    /// `rules/jitv2/block-fragmentation-blocks-cse.md`: that feature flips
+    /// `clanker/jitv2/block-fragmentation-blocks-cse.md`: that feature flips
     /// `opt_level` to `none` and injects a per-instruction trace callout, so
     /// the numbers describe code production never emits.
     #[test]
@@ -267,7 +267,7 @@ mod zz_corpus {
         if cfg!(feature = "developer") {
             println!("WARNING: `developer` is on — opt_level=none plus a per-instruction trace callout. \
                       These numbers do not describe production codegen; see \
-                      rules/jitv2/block-fragmentation-blocks-cse.md.");
+                      clanker/jitv2/block-fragmentation-blocks-cse.md.");
         }
     }
 }
@@ -276,7 +276,7 @@ mod zz_corpus {
 /// straight-line runs that could share one Cranelift block.
 ///
 /// Answers "is it worth building" for the optimization
-/// `rules/jitv2/block-fragmentation-blocks-cse.md` ranks first. That note
+/// `clanker/jitv2/block-fragmentation-blocks-cse.md` ranks first. That note
 /// established the *symptom* (median machine block of 3 instructions, 11,522
 /// cross-block duplicate loads of which 58% are separated by a block boundary
 /// and nothing else) but not how much of the instruction stream is actually
@@ -468,7 +468,7 @@ mod zz_runs {
 /// This is the question block merging hinges on. Merging straight-line runs
 /// into one Cranelift block only pays if, once they share a block, Cranelift's
 /// redundant-load-elimination actually promotes `core.gpr[n]` traffic to
-/// registers. `rules/jitv2/block-fragmentation-blocks-cse.md` measured that it
+/// registers. `clanker/jitv2/block-fragmentation-blocks-cse.md` measured that it
 /// does *within* a block (zero redundant same-address loads inside any machine
 /// block) — but every block there was one instruction, so that finding says
 /// nothing about whether the preamble sitting between two merged instructions
@@ -495,7 +495,7 @@ mod zz_forwarding {
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// Byte offsets mirroring `MipsCore`'s real layout, per the field-traffic
-    /// table in `rules/jitv2/block-fragmentation-blocks-cse.md`.
+    /// table in `clanker/jitv2/block-fragmentation-blocks-cse.md`.
     const OFF_INTERRUPTS: i32 = 0x0;
     const OFF_GPR_A: i32 = 0x68 + 8 * 4;
     const OFF_GPR_B: i32 = 0x68 + 8 * 5;

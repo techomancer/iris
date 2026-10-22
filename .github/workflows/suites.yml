@@ -86,7 +86,7 @@ jobs:
       # Doubles as a determinism check on the suite itself: a kernel whose
       # result depends on uninitialised memory or on the host's byte order
       # produces a different table on a different runner. Every one of those has
-      # already happened once — rules/testing/benchmark-suite-gotchas.md.
+      # already happened once — clanker/testing/benchmark-suite-gotchas.md.
       - name: bench — golden checksums up to date
         run: |
           make -C bench golden
@@ -171,7 +171,7 @@ jobs:
       # The JIT is a compile-time cargo feature; the CPU is not — the run
       # steps below pass `--cpu`. The R5000 cell is the R5000 without a
       # secondary cache: r5ksc / r5ksc_triton are refused at compile time
-      # (src/lib.rs, rules/testing/r5k-l1i-cache-bugs.md), and CPU/FPU
+      # (src/lib.rs, clanker/cpu/r5k-l1i-cache-bugs.md), and CPU/FPU
       # correctness (what cpu-tests exercises) doesn't depend on it.
       #
       # jitv2 is the only MIPS JIT (the v1 tiered compiler was removed in
@@ -318,7 +318,7 @@ jobs:
       # counter-example — see cpu-tests/docs/findings.md. jitv2 implies tcache
       # (since 2026-10-01), which makes L1-D write-through, so
       # cache/hit_inv_discards fails its 2 checks there by design — see
-      # rules/testing/tcache-discards-dirty-data-semantics.md. Otherwise jitv2
+      # clanker/cpu/tcache-discards-dirty-data-semantics.md. Otherwise jitv2
       # matches the interpreter check-for-check.
       #
       # Gate on CPUTEST_FAILED, not CPUTEST_RC: the exit code saturates at 100

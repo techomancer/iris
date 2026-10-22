@@ -2,7 +2,7 @@
 # Emit a build manifest: every crate version that went into a specific build,
 # plus the toolchain and git state that produced it.
 #
-# Why: Cargo.lock is gitignored (see rules/build/dependency-upgrade-gotchas.md),
+# Why: Cargo.lock is gitignored (see clanker/build/dependency-upgrade-gotchas.md),
 # so every CI run re-resolves the whole graph from scratch. A build that was
 # green yesterday can go red today because a transitive crate five levels down
 # shipped a new minor — and nothing in the diff shows it. Shipping this file

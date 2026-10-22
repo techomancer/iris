@@ -389,7 +389,7 @@ mod tests {
     /// Hardware disables FASTCLEAR when CID checking is on (rex3.pdf bit 17,
     /// §3.5.5, and the programming notes), so the fold must not apply there —
     /// the draw is an ordinary one and its fields stay live.
-    /// See rules/rex3/fastclear-cid-divergence.md.
+    /// See clanker/rex3/fastclear-cid-divergence.md.
     #[test]
     fn fastclear_does_not_fold_when_cid_checking_enabled() {
         let dm1 = DM1_FASTCLEAR | (0x6 << 28); // logicop XOR left live

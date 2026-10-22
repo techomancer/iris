@@ -12,7 +12,7 @@
 > `build/iris-<cpu>-<engine>` binary, and a stale one fails in a way that looks
 > like a test failure rather than a skipped cell (an Aug-21 binary here predated
 > the `--cpu` flag and every r4400 cell reported `error: unexpected argument
-> '--cpu'`). See `rules/testing/cpu-tests-known-failure-baseline.md`.
+> '--cpu'`). See `clanker/testing/cpu-tests-known-failure-baseline.md`.
 
 ## Coverage
 
@@ -143,13 +143,13 @@ compute for ordinary arithmetic, and nothing in IRIX depends on them").
 
 So this is a **known gap, not a regression**, even though these tests were
 passing at the 2026-08-19 measurement. Full writeup:
-`rules/jitv2/fpu-flags-are-computed-not-read.md`. Read it before attempting a
+`clanker/jitv2/fpu-flags-are-computed-not-read.md`. Read it before attempting a
 fix — setting Inexact means computing it in *both* engines, including in emitted
 IR, which is exactly the cost the current design declined.
 
 What remains is now entirely FPU, and entirely the same on all four cells. Most
 of it is the exception model rather than the arithmetic (see
-`rules/testing/fpu-exception-model-vs-r4400.md`): IRIS computes on the host FPU
+`clanker/cpu/fpu-exception-model-vs-r4400.md`): IRIS computes on the host FPU
 and delivers the correct IEEE answer where an R4400 would refuse denormals and
 trap for software assist, so it looks *more* conformant than the hardware, not
 less.

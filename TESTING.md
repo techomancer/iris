@@ -3,7 +3,7 @@
 The suite commands and benchmarking guidance previously in README.md.
 Build-feature and configuration combinations are listed in
 [FEATURES.md](FEATURES.md); outstanding functionality is tracked in
-[TODO.md](TODO.md).
+[TODO.md](clanker/TODO.md).
 
 ## Testing and benchmarking
 
@@ -51,7 +51,7 @@ Includes Dhrystone 2.1 (DMIPS) and LINPACK 100x100 (MFLOPS), so an emulated
 Indy can be put next to published figures for a real one, plus a Whetstone mix
 (reported in passes/s — see bench/README.md for why not MWIPS). See
 [bench/README.md](bench/README.md) — and
-[rules/testing/benchmark-suite-gotchas.md](rules/testing/benchmark-suite-gotchas.md)
+[clanker/testing/benchmark-suite-gotchas.md](clanker/testing/benchmark-suite-gotchas.md)
 before adding a kernel.
 
 `bench/irix/` is the other half: real workloads under a booted IRIX (filesystem,

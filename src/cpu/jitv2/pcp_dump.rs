@@ -55,7 +55,7 @@
 //! It weights the corpus, and it is free at capture time (an
 //! already-maintained counter, no new bookkeeping). Emitted-code measurements
 //! over a corpus (`zz_corpus_sizes`, and every codegen size claim in
-//! `rules/jitv2/`) otherwise treat all pages equally, but a page dispatched
+//! `clanker/jitv2/`) otherwise treat all pages equally, but a page dispatched
 //! two million times and one dispatched twice contribute the same one page of
 //! bytes to a flat total — which makes a flat byte count a poor proxy for
 //! what a change does to the code that actually *runs*. Recording the count
@@ -257,7 +257,7 @@ impl PcpDump {
 
 /// Default directory `j2 corpus` writes its per-page `.pcp` files into.
 /// Same name the removed `jitv2_corpus_dump` feature used, so existing notes
-/// in `rules/jitv2/` that refer to `jitv2_corpus/` still point at the right
+/// in `clanker/jitv2/` that refer to `jitv2_corpus/` still point at the right
 /// place.
 pub const CORPUS_DIR: &str = "jitv2_corpus";
 

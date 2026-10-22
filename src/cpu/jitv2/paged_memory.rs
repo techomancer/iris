@@ -1,5 +1,5 @@
 //! Custom `cranelift_jit::JITMemoryProvider` for lazy, page-batched
-//! finalization (see `rules/jitv2/jit-v2-design.md`'s memory-packing notes).
+//! finalization (see `clanker/jitv2/jit-v2-design.md`'s memory-packing notes).
 //!
 //! `cranelift_jit::ArenaMemoryProvider` (the stock implementation) already
 //! does everything we need *except* tell the caller when a new host-page

@@ -308,7 +308,7 @@ jobs:
       # the KeyCode type) stays unpatched. It has historically been dead-stripped
       # — but it is exactly the copy that regressed on 2026-08-03, so it is worth
       # naming. The nm gate after the build is the authoritative check.
-      # Detail: rules/macos/appstore-private-api.md
+      # Detail: clanker/macos/appstore-private-api.md
       - name: Resolve the graph and verify the winit patch applied
         run: |
           cargo fetch
@@ -323,12 +323,12 @@ jobs:
           echo "winit in the resolved graph:"
           printf '%s\n' "$winits" | sed 's/^/  /'
           if ! printf '%s\n' "$winits" | grep -q ' patched$'; then
-            echo "::error::No path-patched winit in the resolved graph — [patch.crates-io] winit = { path = \"third_party/winit-0.30.13\" } did not apply, so this build links the UNPATCHED winit and imports the private SkyLight API. App Store review rejects that under guideline 2.5.1. See rules/macos/appstore-private-api.md."
+            echo "::error::No path-patched winit in the resolved graph — [patch.crates-io] winit = { path = \"third_party/winit-0.30.13\" } did not apply, so this build links the UNPATCHED winit and imports the private SkyLight API. App Store review rejects that under guideline 2.5.1. See clanker/macos/appstore-private-api.md."
             exit 1
           fi
           unpatched=$(printf '%s\n' "$winits" | grep -c ' registry$' || true)
           if [ "$unpatched" != "0" ]; then
-            echo "::warning::${unpatched} winit copy/copies resolve from the registry and are NOT covered by [patch.crates-io] (it matches the 0.30.x requirement only). Their set_blur still calls the private SkyLight API; it is dead-stripped today, but this is the condition that regressed on 2026-08-03. Unifying the graph on winit 0.30.13 removes the risk — see rules/macos/appstore-private-api.md."
+            echo "::warning::${unpatched} winit copy/copies resolve from the registry and are NOT covered by [patch.crates-io] (it matches the 0.30.x requirement only). Their set_blur still calls the private SkyLight API; it is dead-stripped today, but this is the condition that regressed on 2026-08-03. Unifying the graph on winit 0.30.13 removes the risk — see clanker/macos/appstore-private-api.md."
           fi
 
       - name: Build iris-gui for both arches (lightning + CHD, App Store)
@@ -375,7 +375,7 @@ jobs:
               fail=1; return
             fi
             if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
-              echo "::error::Private SkyLight API symbol found in $bin — App Store guideline 2.5.1 will reject this build. See rules/macos/appstore-private-api.md."
+              echo "::error::Private SkyLight API symbol found in $bin — App Store guideline 2.5.1 will reject this build. See clanker/macos/appstore-private-api.md."
               printf '%s\n' "$undef" | grep -E '_CGS' || true
               fail=1; return
             fi
@@ -536,7 +536,7 @@ jobs:
             exit 1
           fi
           if printf '%s\n' "$undef" | grep -qE '_CGSSetWindowBackgroundBlurRadius|_CGSMainConnectionID'; then
-            echo "::error::Private SkyLight API symbol found in the shipping bundle $BIN — App Store guideline 2.5.1 will reject this. See rules/macos/appstore-private-api.md."
+            echo "::error::Private SkyLight API symbol found in the shipping bundle $BIN — App Store guideline 2.5.1 will reject this. See clanker/macos/appstore-private-api.md."
             printf '%s\n' "$undef" | grep -E '_CGS' || true
             exit 1
           fi

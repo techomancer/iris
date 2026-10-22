@@ -826,7 +826,7 @@ impl App {
         // so IRIX attaches ec0 on the first boot, no PROM monitor / reboot.
         //
         // Indigo2/IP28 read `eaddr` from the NVRAM *EEPROM* instead
-        // (`nveeprom`, see `rules/irix/networking.md`) — the DS1386 write
+        // (`nveeprom`, see `clanker/irix/networking.md`) — the DS1386 write
         // above has no effect on those profiles' guest networking at all.
         // Patch whichever chip(s) the config carries; harmless on a profile
         // that doesn't use one (core's own `backdoor_set_mac_if_blank` simply
@@ -1221,7 +1221,7 @@ impl App {
                 {
                     // Indigo2/IP28 read eaddr and PROM env from the NVRAM
                     // EEPROM (nveeprom), not the DS1386 nvram file below — see
-                    // rules/irix/networking.md. Reset and re-MAC both, so this
+                    // clanker/irix/networking.md. Reset and re-MAC both, so this
                     // button actually works regardless of machine profile
                     // instead of only ever touching the Indy chip. `toast`
                     // holds one message, so collect both outcomes into a
@@ -1826,7 +1826,7 @@ impl App {
         let mut want_check = false;
         ui.horizontal(|ui| {
             // U+2022 (bullet) as a status light. NOT U+25CF (●), which renders as
-            // tofu in egui's font chain. See rules/gui/egui-…-tofu.md.
+            // tofu in egui's font chain. See clanker/gui/egui-…-tofu.md.
             ui.label(RichText::new("\u{2022}").size(18.0).color(net_color)).tip(net_tip.clone());
             ui.label(net_label).tip(net_tip);
             if nat_running && ui.small_button(t!("status-net-check")).tip(t!("status-net-check-tip")).clicked() {

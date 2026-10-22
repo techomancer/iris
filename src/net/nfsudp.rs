@@ -5,7 +5,7 @@
 //! virtual-network frames — there are **no host network sockets**. The only host
 //! interaction is file I/O against the user-chosen backing folder.
 //!
-//! Plan + open questions: `docs/nfsudp-plan.md`. Wire structs/semantics are
+//! Plan + open questions: `clanker/plans/nfsudp-plan.md`. Wire structs/semantics are
 //! modelled on `nfsserve` (BSD-3-Clause), re-implemented synchronously here.
 //!
 //! This file is built bottom-up. **Increment 1 (this commit): the

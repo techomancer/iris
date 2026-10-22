@@ -4,7 +4,7 @@ Status: **shipped, unconditional (no feature flag).** Replaces the Read/Write
 slots of the old 3-entry `nanotlb`; the Fetch slot survives as a separate,
 specialised one-entry structure.
 
-Companion reading: `HACKING.md` (data path), `rules/testing/` (TLB findings),
+Companion reading: `HACKING.md` (data path), `clanker/testing/` (TLB findings),
 and an earlier nanotlb-associativity note (never checked in) — a previous 4-way/AVX2
 experiment **lost** to the 1-way nanotlb, so any new structure has to justify
 itself against a very cheap incumbent.
@@ -491,7 +491,7 @@ it, and the ERET/exception flushes stay, so the invalidation cadence
 
 Option A would have *reduced* that cadence (fetch entry surviving ERET), which
 is the single riskiest interaction in the change and would need validating
-against `rules/jitv2/` first. Option B sidesteps that risk entirely. The two new
+against `clanker/jitv2/` first. Option B sidesteps that risk entirely. The two new
 flush sites only *add* invalidations, which is always safe for `pcp`.
 
 ## 8. Sizing — measured
@@ -783,7 +783,7 @@ permission bits exist, and the flush at every privilege transition is what
 enforces the property. `test_nutlb_kernel_entry_unreachable_from_user`
 (`mips_exec_test.rs`) is the regression test, verified to fail when the flush
 is removed. Full writeup:
-`rules/testing/nutlb-erl-guard-defeats-permission-test.md`.
+`clanker/cpu/nutlb-erl-guard-defeats-permission-test.md`.
 
 ---
 

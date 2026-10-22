@@ -10,7 +10,7 @@ CD image** the PROM loads directly, and runnable headless in CI.
 > [docs/status.md](docs/status.md) for where it stands. Two things below have
 > changed since it was written: the CPU model is now a **runtime** setting
 > (`--cpu r4400|r5000`, not the `r5k` cargo feature), and the old tiered JIT
-> (`--features jit`, `IRIS_JIT=1`, verify mode, `rules/jit/`) was removed —
+> (`--features jit`, `IRIS_JIT=1`, verify mode, `clanker/jit/`) was removed —
 > jitv2 is the JIT cell.
 
 This document was the roadmap.
@@ -114,7 +114,7 @@ Three things this settles, two of which contradict the obvious guess:
 
 R4400 vs R5000 is a **compile-time cargo feature in IRIS** (`r5k`, plus
 `r5ksc` / `r5ksc_triton`), not a runtime switch — see `Cargo.toml` and
-`rules/perf/hardware-profiles.md`. So the *suite* must run unmodified on both
+`clanker/perf/hardware-profiles.md`. So the *suite* must run unmodified on both
 and decide expectations at runtime:
 
 | | R4400 (default build) | R5000 (`--cpu r5000`) |
@@ -272,7 +272,7 @@ Create_Dirty_Excl, Fill) on I, D and (where present) S; **TagLo/TagHi
 round-trip through Index_Store_Tag / Index_Load_Tag**; **KSEG0 vs KSEG1 view
 coherency** (write cached, read uncached, and the reverse, with the right
 flushes); associativity probe by controlled eviction; dirty-line writeback on
-eviction. `rules/snapshot/l1d-tag-must-match-the-cache-line-layout.md` shows
+eviction. `clanker/snapshot/l1d-tag-must-match-the-cache-line-layout.md` shows
 this area has already bitten once.
 
 **fpu/** — FR=0 register aliasing vs FR=1 (the odd-register rules) for
@@ -390,7 +390,7 @@ image/
 - `boot -f dksc(0,4,8)cputest` from the PROM — the same path a real SGI
   distribution CD uses (`part(8)sashARCS`).
 - IRIX can also `mount -t efs -o ro /dev/dsk/dks0d4s7 /CDROM` and run the
-  binaries or read the docs (see `rules/irix/cdrom-changer-eject-no-mediad-remount.md`).
+  binaries or read the docs (see `clanker/irix/cdrom-changer-eject-no-mediad-remount.md`).
 - **EFS writing**: no host tool exists. Options, in order of preference:
   (a) write `tools/mkefs` (Rust or Python) — EFS is a simple extent-based FFS
   derivative, ~600 lines, and Linux's read-only `fs/efs` driver plus IRIX
@@ -420,14 +420,14 @@ make -C cpu-tests            # build the ELF + image
 matrix:
   cpu:  [r4400, r5000]       # cargo features: "" vs "r5k" (r5ksc/r5ksc_triton
                              # both refuse to build — see
-                             # rules/testing/r5k-l1i-cache-bugs.md)
+                             # clanker/cpu/r5k-l1i-cache-bugs.md)
   exec: [interp, jit]        # IRIS_JIT=1 --features jit
 run: iris --ci --headless … ; iris-ci …; expect "IRIS-CPUTEST-DONE rc=0"
 ```
 
 Four cells. The interp-vs-JIT axis is the point: a guest-visible ISA suite is
 the cleanest possible JIT differential test, and today nothing runs one
-automatically. (Note `rules/jit/verify-mode.md`: JIT verify mode is invalid for
+automatically. (Note `clanker/jit/verify-mode.md`: JIT verify mode is invalid for
 blocks containing stores, so a full-machine suite covers ground verify mode
 structurally cannot.)
 

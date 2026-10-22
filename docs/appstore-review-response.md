@@ -63,7 +63,7 @@ nm -u target/release/iris-gui | grep CGSSetWindowBackgroundBlurRadius   # → no
 ```
 
 (`_CGShieldingWindowLevel` remains; it is a public CoreGraphics API and was not
-flagged.) See `rules/macos/appstore-private-api.md`.
+flagged.) See `clanker/macos/appstore-private-api.md`.
 
 A new binary is required for this fix, so we also strengthened the two
 entitlements below with visible, testable functionality rather than removing

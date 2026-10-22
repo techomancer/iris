@@ -665,7 +665,7 @@ impl MipsTlb {
 
     /// Replace the vmap's claim on TLB slot `index` with the entry now
     /// stored there (`write()` has already updated `self.entries[index]`).
-    /// Algorithm (see rules/testing/ for the bug this replaces a simpler,
+    /// Algorithm (see clanker/cpu/tlbcheck-vmap-dangling-slot-bug.md for the bug this replaces a simpler,
     /// broken erase+fill with): the entry being overwritten may have been
     /// the sole owner of some VPN2 slots that *other* still-valid entries
     /// also cover — naive erase-by-tag left those slots dangling at

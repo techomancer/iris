@@ -28,7 +28,7 @@
 //! `IRIS_MGRAS_TRACE=<file>` logs every access to the board.
 
 //!
-//! Threads (rules/mgras/DESIGN.md): the CPU thread owns the host-side
+//! Threads (clanker/mgras/DESIGN.md): the CPU thread owns the host-side
 //! registers and the display control bus (`Front`). Command FIFO words and
 //! direct raster writes go into `hq_fifo`; the HQ3 thread runs the frontend
 //! and feeds raster writes into `rss_fifo`; the RSS thread draws. The display

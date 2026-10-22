@@ -217,7 +217,7 @@ impl ShaderCompiler {
         //
         // This was invisible until rex3_simd::try_fastclear_block was removed:
         // that pre-loop bailout also ignored CID, so both engines wrote
-        // COLORVRAM and agreed. See rules/rex3/fastclear-cid-divergence.md.
+        // COLORVRAM and agreed. See clanker/rex3/fastclear-cid-divergence.md.
         let dm1_val = if (clipmode_key >> CLIPMODE_CIDMATCH_SHIFT) & 0xF != 0xF {
             dm1_val & !(1 << 17)
         } else {
@@ -1221,7 +1221,7 @@ fn emit_shader(
             // fb_rgb and fb_aux share the same stride/layout (2048 u32 entries per row),
             // so the byte offset into fb_aux is the same as into fb_rgb. Subtracting
             // the wrong base is a wild pointer, not a wrong pixel — see
-            // rules/rex3/cidmatch-aux-plane-base.md.
+            // clanker/rex3/cidmatch-aux-plane-base.md.
             let byte_off64 = b.ins().isub(px_ptr, pctx.fb_rgb);
             b.ins().iadd(pctx.fb_aux, byte_off64)
         };
@@ -2298,7 +2298,7 @@ fn emit_draw_iline(
     // MAME is no reference: newport.cpp models the stipple as a local
     // `bit = 31` per draw with no persistent cursor, no lsrcount, and no
     // LSADVLAST (it only logs bit 14). Spec text for bit 14 is just "Enables
-    // stipple advance at the end of a line" (docs/rex3.md). To be checked
+    // stipple advance at the end of a line" (docs/Indy/rex3.md). To be checked
     // against a real XL Indy before treating either behaviour as settled.
     let advance_pattern: Value = if dm0.lsadvlast() || iterate_one {
         b.ins().iconst(types::I8, 1)

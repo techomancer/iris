@@ -933,7 +933,7 @@ fn branch_or_jump_taken_word(class: Classify, _raw: u32, _word: u16) -> Option<u
 /// word already in `heads`. If so, `analyzer::visit`'s "already visited,
 /// continue into compiled code" fast path would wire a genuine Cranelift
 /// back-edge there (§2.2/§3.1 "loops stay native" —
-/// rules/jitv2/codegen-gotchas.md's self-loop section) — the compiled
+/// clanker/jitv2/codegen-gotchas.md's self-loop section) — the compiled
 /// function would then run that loop to convergence natively inside one
 /// call, silently advancing far more architectural state than the single
 /// trace record a chain attempt's comparison point represents. Checked at
@@ -1549,7 +1549,7 @@ mod tests {
         // both as chain heads would give the analyzer's walk a genuine
         // Cranelift back-edge from the branch's taken arm straight into
         // the ADDI's already-visited block ("loops stay native" —
-        // rules/jitv2/codegen-gotchas.md's self-loop section) — the
+        // clanker/jitv2/codegen-gotchas.md's self-loop section) — the
         // compiled function would then run to convergence natively in one
         // call while this attempt's comparison point still assumed a
         // single trace-record step, producing a false "control flow

@@ -14,7 +14,7 @@
          Developer ID + notarization. It is REJECTED for the Mac App Store, which
          is why the App Store build (installer/iris-gui.entitlements, app-sandbox)
          instead runs interpreter-only via IRIS_NO_JIT (set under the `appstore`
-         feature). See rules/jit/macos-app-sandbox-kills-cranelift-jit-no-map_jit.md.
+         feature). See clanker/jit/macos-app-sandbox-kills-cranelift-jit-no-map_jit.md.
 
          No app-sandbox / app-identifier keys here: the notarized DMG is not
          sandboxed and is not tied to an App Store provisioning profile. -->

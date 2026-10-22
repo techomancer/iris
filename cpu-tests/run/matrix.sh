@@ -36,7 +36,7 @@ feature_for() {
         # r5ksc_triton currently work (both fail mips_cache_v2's L1I tests;
         # src/lib.rs refuses to build either) and there is no known-working
         # R5000 secondary-cache config right now — see
-        # rules/testing/r5k-l1i-cache-bugs.md. The default build supports
+        # clanker/cpu/r5k-l1i-cache-bugs.md. The default build supports
         # --cpu r5000 without a secondary cache or a CPU feature flag.
         r5000) echo "" ;;
     esac

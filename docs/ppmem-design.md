@@ -6,7 +6,7 @@ RAM banks are `PpMemory`; `Memory` (`Vec<u32>`) survives only as a test/bus
 fixture. `tcache` builds on it (`docs/tcache-design.md`). The rest of this
 document is the design as proposed; the original status was: design draft for
 discussion, no implementation yet. Companion note
-with the verified platform findings: `rules/build/mmap-rs-fixed-address-aliasing.md`.
+with the verified platform findings: `clanker/build/mmap-rs-fixed-address-aliasing.md`.
 
 ---
 

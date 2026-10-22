@@ -54,7 +54,7 @@ programs using the replacement guest libGL.
 
 GR2 save/load covers selected registers, microcode, SRAM, and display tables.
 VRAM and full drawing/context state are not saved yet, so snapshots do not
-reproduce the complete rendered scene. See [TODO.md](../TODO.md).
+reproduce the complete rendered scene. See [TODO.md](../clanker/TODO.md).
 
 ## Inspect and trace
 
@@ -71,7 +71,7 @@ gr2 fbdump gr2dump
 ```
 
 Coverage and synchronization rules are in
-[GR2 design](../rules/gr2/DESIGN.md),
-[bring-up notes](../rules/gr2/bringup.md), and the individual notes under
-`rules/gr2/`. Treat those recorded workloads as validation of specific paths,
+[GR2 design](../clanker/gr2/DESIGN.md),
+[bring-up notes](../clanker/gr2/bringup.md), and the individual notes under
+`clanker/gr2/`. Treat those recorded workloads as validation of specific paths,
 not a claim that every Express application or diagnostic is implemented.

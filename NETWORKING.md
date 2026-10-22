@@ -2,7 +2,7 @@
 
 The built-in NAT gateway needs no optional build feature. For IRIX interface,
 DNS, NFS, and port-forward setup, see [HELP.md](HELP.md) and
-[IRIX networking guide](rules/irix/networking.md). The full option inventory
+[IRIX networking guide](clanker/irix/networking.md). The full option inventory
 is in [FEATURES.md](FEATURES.md). This guide retains the PCAP and DaynaPort
 details previously in README.md.
 
@@ -78,7 +78,7 @@ Caveats:
   MAC address, so bridging onto a wireless interface may not pass traffic.
 - The guest needs a MAC address in NVRAM. IRIS writes `[network] mac` (default
   `08:00:69:12:34:56`) into a blank slot before boot; give each emulated machine
-  on the same LAN its own (see `rules/irix/networking.md`).
+  on the same LAN its own (see `clanker/irix/networking.md`).
 
 Without `--features pcap`, selecting `mode = "pcap"` logs a warning and falls
 back to the NAT gateway, and `--list-net-interfaces` reports that the feature

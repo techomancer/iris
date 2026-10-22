@@ -121,7 +121,7 @@ extern "C" {
     // `CGSMainConnectionID` / `CGSSetWindowBackgroundBlurRadius` were declared
     // here and called from WindowDelegate::set_blur. The Mac App Store rejects
     // those symbols, so the declarations are removed and set_blur is a no-op.
-    // See rules/macos/appstore-private-api.md.
+    // See clanker/macos/appstore-private-api.md.
 }
 
 mod core_video {
