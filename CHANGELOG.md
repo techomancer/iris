@@ -15,6 +15,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### NAT gateway
 
+- **Gateway replies no longer wait for a poll tick.** A reply to a guest
+  frame is still held for one engine pass, but the engine now comes back for
+  it after 150 µs instead of a whole 1 ms `poll(2)` tick (about 15.6 ms on
+  Windows). Lock-step exchanges paid that tick on every packet: the built-in
+  TFTP server was capped near 450 KB/s on Linux and 30 KB/s on Windows, and
+  NFS and DNS replies were delayed the same way.
 - **A built-in rsh server at the gateway.** `[network] rsh_dir = "DIR"` (or
   `--rsh-dir DIR`) answers TCP 514 at the gateway with `cat`, `dd`, `ls`, `echo`
   and `pwd` on DIR, read-only, so the guest can pull files with

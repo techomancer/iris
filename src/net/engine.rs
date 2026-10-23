@@ -35,6 +35,11 @@ const SNAPSHOT_EVERY: Duration = Duration::from_millis(200);
 /// Longest sleep with nothing to do: the coarse timers (UDP and service
 /// expiry, TFTP retransmission, reassembly, half-closed TCP) run at this rate.
 const HOUSEKEEPING: Duration = Duration::from_millis(100);
+/// How long a reply to a guest frame is held before it goes on the ring
+/// (see the FIXME in `step`). Long enough to land after IRIX's TX-completion
+/// interrupt, about a LAN round trip; far shorter than a 1 ms poll tick, which
+/// paced every lock-step exchange (TFTP, NFS, DNS) at one reply per tick.
+pub(super) const REPLY_HOLD: Duration = Duration::from_micros(150);
 
 pub struct NatEngine {
     pub(super) config: GatewayConfig,
@@ -180,11 +185,16 @@ impl NatEngine {
         }
     }
 
-    /// How long the next wait may last: until the earliest timer, or a
-    /// moment if frames are still queued for the guest.
-    fn idle_timeout(&self) -> Duration {
-        if !self.to_guest.is_empty() || !self.next_pass.is_empty() {
+    /// How long the next wait may last: until the earliest timer, a moment
+    /// if frames are waiting for room on the ring, or just the reply hold if
+    /// only held replies are pending. The guest is usually idle waiting for
+    /// exactly that reply, so nothing else would end the wait early.
+    pub(super) fn idle_timeout(&self) -> Duration {
+        if !self.to_guest.is_empty() {
             return Duration::from_millis(1);
+        }
+        if !self.next_pass.is_empty() {
+            return REPLY_HOLD;
         }
         let now = Instant::now();
         self.tcp_nat.values()
@@ -197,6 +207,9 @@ impl NatEngine {
     #[cfg(unix)]
     fn wait_for_work(&mut self, timeout: Duration) {
         use std::os::fd::AsRawFd;
+        if self.short_wait(timeout) {
+            return;
+        }
         let mut fds: Vec<libc::pollfd> = Vec::with_capacity(8 + self.tcp_nat.len() + self.udp_nat.len());
         let mut add = |fd: i32, events: i16| fds.push(libc::pollfd { fd, events, revents: 0 });
         match self.tx_wake.fd() {
@@ -235,8 +248,27 @@ impl NatEngine {
 
     #[cfg(not(unix))]
     fn wait_for_work(&mut self, timeout: Duration) {
+        if self.short_wait(timeout) {
+            return;
+        }
         // Host sockets can't join the wait here: poll them at a 1 ms tick.
         self.tx_wake.wait(timeout.min(Duration::from_millis(1)));
+    }
+
+    /// A wait shorter than a millisecond (the reply hold) can't go through
+    /// `poll(2)` or a condvar: both round it up to a whole tick, and Windows
+    /// to its ~15.6 ms timer. Sleep instead. Host sockets and guest frames are
+    /// not watched for that long, which costs nothing: the pass that follows
+    /// handles whatever arrived. Returns true if it handled the wait.
+    fn short_wait(&mut self, timeout: Duration) -> bool {
+        if timeout >= Duration::from_millis(1) {
+            return false;
+        }
+        if !timeout.is_zero() {
+            std::thread::sleep(timeout);
+        }
+        self.tx_wake.consume(); // step() drains tx_cons whatever the signal said
+        true
     }
 
     /// Drop every flow and its host socket (machine reset, subnet change).

@@ -42,6 +42,20 @@ the drain eats the byte, the flag stays set, and every later notify skips its
 write because the flag is already set. A `poll(2)` sleeper then never wakes
 again.
 
+## The reply hold cost a whole tick (2026-10-23)
+
+Replies generated while draining guest frames go to `next_pass` (the
+CLRINT FIXME in `step`). `idle_timeout` then returned 1 ms, and nothing
+wakes the engine early because the guest is idle waiting for exactly that
+reply, so every lock-step exchange paid one full `poll(2)` tick per packet
+(Windows: one ~15.6 ms condvar tick). Built-in TFTP: 512 B per tick, about
+450 KB/s at best. Now a held reply asks for `REPLY_HOLD` (150 µs), and waits
+under 1 ms are a plain `thread::sleep` (`short_wait`), since poll and the
+condvar round them up to a tick. Test:
+`testnet::tftp_blocks_are_not_paced_by_the_poll_tick`. If the CLRINT race is
+real, a hold this short is where it would show: check NetBSD bulk receive
+and IRIX flood ping after changing it.
+
 ## Still open
 
 - seeq-enet keeps its 1 ms wait (0.9% of a core idle): HPC3 kicks it only when
