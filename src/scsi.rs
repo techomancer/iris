@@ -73,6 +73,12 @@ fn alloc_len_10(cdb: &[u8]) -> usize {
     ((cdb[7] as usize) << 8) | cdb[8] as usize
 }
 
+/// The allocation length of a REQUEST SENSE CDB (byte 4). SCSI-2 keeps
+/// SCSI-1's rule that 0 asks for 4 bytes of sense data.
+pub fn request_sense_alloc_len(cdb: &[u8]) -> usize {
+    if cdb[4] == 0 { 4 } else { cdb[4] as usize }
+}
+
 /// Disk I/O backend: either direct file access or copy-on-write overlay.
 pub enum DiskBackend {
     /// Direct read-write access to a single file (current default behavior).
@@ -749,15 +755,12 @@ impl ScsiDevice {
     }
 
     fn exec_request_sense(&mut self, cdb: &[u8]) -> Result<ScsiResponse, std::io::Error> {
-        let alloc_len = cdb[4] as usize;
+        let alloc_len = request_sense_alloc_len(cdb);
         // Return stored sense data and clear it
         let sense = self.pending_sense;
         self.pending_sense = [0u8; 18];
         self.pending_sense[0] = 0x70; // Leave valid response code for next time
-        // An allocation length of 0 keeps the old behaviour (the whole
-        // block); any other is honoured, short or not.
-        let n = if alloc_len == 0 { sense.len() } else { alloc_len.min(sense.len()) };
-        let data = sense[..n].to_vec();
+        let data = sense[..alloc_len.min(sense.len())].to_vec();
         Ok(ScsiResponse { status: 0x00, data })
     }
 
@@ -1470,6 +1473,6 @@ mod tests {
     fn request_sense_honours_a_short_allocation_length() {
         let mut dev = cdrom();
         assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 8, 0]).data.len(), 8);
-        assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 0, 0]).data.len(), 18, "0 still means the whole block");
+        assert_eq!(run(&mut dev, &[0x03, 0, 0, 0, 0, 0]).data.len(), 4, "SCSI-2: 0 means 4 bytes");
     }
 }

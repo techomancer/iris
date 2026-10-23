@@ -1964,7 +1964,8 @@ impl Wd33c93aState {
 
         // Determine data_len based on command
         let data_len = match cdb[0] {
-            scsi_cmd::INQUIRY | scsi_cmd::REQUEST_SENSE | scsi_cmd::MODE_SENSE_6 => {
+            scsi_cmd::REQUEST_SENSE => ScsiDataLength::Fixed(crate::scsi::request_sense_alloc_len(&cdb)),
+            scsi_cmd::INQUIRY | scsi_cmd::MODE_SENSE_6 => {
                 ScsiDataLength::Fixed(cdb[4] as usize)
             }
             scsi_cmd::READ_BUFFER => {
