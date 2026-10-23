@@ -56,6 +56,10 @@ condvar round them up to a tick. Test:
 real, a hold this short is where it would show: check NetBSD bulk receive
 and IRIX flood ping after changing it.
 
+Verified 2026-10-23 on IRIX: TFTP download much faster; flood ping
+(`ping -f -q -c 20000 -s 1400` to the gateway) lost 1 packet on the first
+run and 0 on five more. No sign of the CLRINT race at 150 µs.
+
 ## Still open
 
 - seeq-enet keeps its 1 ms wait (0.9% of a core idle): HPC3 kicks it only when
