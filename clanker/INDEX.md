@@ -219,6 +219,14 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
 
+## odyssey/
+
+Odyssey (VPro V6/V8/V10/V12): the Octane2/Fuel/Tezro graphics board. Not emulated; references and groundwork only.
+
+| Note | Kind | Title |
+|---|---|---|
+| [public-references.md](odyssey/public-references.md) | open | Odyssey (VPro) public references: two console-level drivers, no GL stream |
+
 ## hostgl/
 
 Host GL pass-through for guest GL programs (`iris-hostgl`).
