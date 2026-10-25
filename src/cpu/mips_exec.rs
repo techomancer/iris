@@ -1061,6 +1061,59 @@ pub const TR_UNCACHED:        u32 = 2; // C=2: Uncached
 pub const TR_CACHEABLE:       u32 = 3; // C=3: Cacheable (write-back)
 pub const TR_CACHEABLE_COH:   u32 = 5; // C=5: Cacheable Coherent Exclusive
 
+/// Decode a 3-bit cache-coherency attribute with the model's tables passed as
+/// data rather than as a const generic. [`MipsExecutor::decode_cache_attr`] is
+/// the same function with `C` in scope; the split exists so
+/// [`k0_cached_mask_for`] can build its membership mask from *this* table
+/// instead of a second copy of it.
+///
+/// `mips4` is `C::MIPS4`, `r10k` is `C::R10K_CACHE_OPS`; the table itself is
+/// documented on `decode_cache_attr`.
+pub(crate) const fn decode_cache_attr_for(c: u32, mips4: bool, r10k: bool) -> u32 {
+    if r10k {
+        // R10000 UM Table 4-1: MIPS IV like the R5000, but its own table.
+        // 4 and 5 are the coherent algorithms, not reserved: the O2's IRIX
+        // runs KSEG0 with K0=5, and reading that as uncached sent every
+        // kernel fetch, load and store to the bus. 7 (uncached accelerated)
+        // only gathers stores; a load is a plain uncached one.
+        match c & 0x7 {
+            3     => TR_CACHEABLE,
+            4 | 5 => TR_CACHEABLE_COH,
+            _     => TR_UNCACHED, // 2 and 7; 0, 1, 6 reserved
+        }
+    } else if mips4 {
+        // VR5000 Table 6-6.
+        match c & 0x7 {
+            0 | 1 => TR_CACHEABLE, // write-through -> write-back (see above)
+            3     => TR_CACHEABLE,
+            _     => TR_UNCACHED,  // 2 = Uncached; 4,5,6,7 reserved
+        }
+    } else {
+        // R4400 Table 4-6.
+        match c & 0x7 {
+            3         => TR_CACHEABLE,
+            4 | 5 | 6 => TR_CACHEABLE_COH, // coherent variants
+            _         => TR_UNCACHED,      // 2 = Uncached; 0,1,7 reserved
+        }
+    }
+}
+
+/// `Config.K0` values that select a cached algorithm for a model with these
+/// capability flags, one bit per 3-bit code. The JIT's KSEG0 direct-address
+/// fast path consults it to decide whether a KSEG0 access may take the inline
+/// path at all, exactly as the nutlb probe's cacheable test does.
+pub(crate) const fn k0_cached_mask_for(mips4: bool, r10k: bool) -> u8 {
+    let mut mask = 0u8;
+    let mut c = 0u32;
+    while c < 8 {
+        if decode_cache_attr_for(c, mips4, r10k) != TR_UNCACHED {
+            mask |= 1u8 << c;
+        }
+        c += 1;
+    }
+    mask
+}
+
 /// **Contract:** these two flags are set only on the `translate_fn` slow
 /// path, and are read only by `nutlb_fill`. A nutlb *hit* returns them clear
 /// regardless of the underlying page, because a hit never fills and nothing
@@ -2958,6 +3011,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         { executor.core.fetch_verify_on = fetch_verify_env_default(); }
         executor.update_translate_fn();
         executor.update_fpr_mode();
+        // K0 is uncached at reset (see `config` above), so this starts at
+        // `KSEG0_RULE_NEVER` — but derive it rather than assume, so the rule can
+        // never disagree with the state the rest of this constructor just set.
+        executor.refresh_kseg0_direct_rule();
 
         executor
     }
@@ -3680,6 +3737,32 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// Re-derive `core.jit_kseg0_rule` from the live `Status` and `Config`.
+    ///
+    /// The rule is the JIT inline load/store guard's KSEG0 fast path — see
+    /// [`crate::cpu::mips_core::kseg0_direct_rule`]. It is derived state, so
+    /// the only thing that matters is that every writer of the two registers it
+    /// reads runs this afterwards:
+    ///
+    /// * **Status** — every change goes through [`Self::resync_privilege_state`]
+    ///   (that function's own doc comment states the invariant), which is why
+    ///   the call sits there. That covers `MTC0 Status`, all exception-delivery
+    ///   paths, `ERET`, soft reset, snapshot/digest restore and gdb.
+    /// * **Config** — `MTC0 Config` is the only writer (`MipsCore::write_cp0`
+    ///   reg 16), and every one of them is followed by
+    ///   [`Self::handle_cp0_side_effects`], which calls this.
+    ///
+    /// A missed refresh would be a correctness bug, not a slowdown, so both
+    /// call sites are on paths that already exist for the same reason (the
+    /// nutlb's privilege flush and its K0 flush respectively) rather than being
+    /// new hooks. `MipsCore::new` starts at `KSEG0_RULE_NEVER`, so anything
+    /// that fails to refresh declines the fast path instead of misusing it.
+    #[inline]
+    pub fn refresh_kseg0_direct_rule(&mut self) {
+        self.core.jit_kseg0_rule = crate::cpu::mips_core::kseg0_direct_rule(
+            self.core.cp0_status, self.core.cp0_config, Self::k0_cached_mask());
+    }
+
     /// Re-derive every piece of executor state cached off CP0 Status: `translate_fn`
     /// (privilege x 32/64-bit), the six `fpr_*` accessors (STATUS_FR), and the untagged
     /// translation caches that carry no permission bits of their own (nanotlb + nutlb +
@@ -3704,6 +3787,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn resync_privilege_state(&mut self) {
         self.update_translate_fn();
         self.update_fpr_mode();
+        self.refresh_kseg0_direct_rule();
         self.nanotlb_invalidate();
         #[cfg(feature = "cache-ecc")]
         self.sync_cache_error_control();
@@ -4719,6 +4803,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.is_64bit_mode() && (virt_addr >> 62) != 2
     }
 
+    /// `Config.K0` values that select a cached algorithm on this model, one bit
+    /// per 3-bit code — `decode_cache_attr`'s table as membership, for
+    /// `kseg0_direct_rule`.
+    #[inline]
+    pub(crate) const fn k0_cached_mask() -> u8 {
+        k0_cached_mask_for(C::MIPS4, C::R10K_CACHE_OPS)
+    }
+
     /// Decode a 3-bit cache-coherency attribute (EntryLo's C field, or
     /// `Config.K0`, which uses the same encoding) into a `TR_*` value.
     ///
@@ -4766,32 +4858,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// (`R10000 UM` Table 4-1), selected by `C::R10K_CACHE_OPS`.
     #[inline]
     pub(crate) fn decode_cache_attr(c: u32) -> u32 {
-        if C::R10K_CACHE_OPS {
-            // R10000 UM Table 4-1: MIPS IV like the R5000, but its own table.
-            // 4 and 5 are the coherent algorithms, not reserved: the O2's
-            // IRIX runs KSEG0 with K0=5, and reading that as uncached sent
-            // every kernel fetch, load and store to the bus. 7 (uncached
-            // accelerated) only gathers stores; a load is a plain uncached one.
-            match c & 0x7 {
-                3     => TR_CACHEABLE,
-                4 | 5 => TR_CACHEABLE_COH,
-                _     => TR_UNCACHED, // 2 and 7; 0, 1, 6 reserved
-            }
-        } else if C::MIPS4 {
-            // VR5000 Table 6-6.
-            match c & 0x7 {
-                0 | 1 => TR_CACHEABLE, // write-through -> write-back (see above)
-                3     => TR_CACHEABLE,
-                _     => TR_UNCACHED,  // 2 = Uncached; 4,5,6,7 reserved
-            }
-        } else {
-            // R4400 Table 4-6.
-            match c & 0x7 {
-                3         => TR_CACHEABLE,
-                4 | 5 | 6 => TR_CACHEABLE_COH, // coherent variants
-                _         => TR_UNCACHED,      // 2 = Uncached; 0,1,7 reserved
-            }
-        }
+        decode_cache_attr_for(c, C::MIPS4, C::R10K_CACHE_OPS)
     }
 
     /// KSEG0's cache attribute, from `Config.K0` (bits 2:0) rather than a
@@ -7424,6 +7491,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.sysad.write32(crate::dev::testdev::TEST_DEV_BASE + crate::dev::testdev::REG_DUMP,
                                self.core.cp0_ecc);
         }
+        // Every `MTC0/DMTC0` runs this hook, and Config (16) is the only writer
+        // of the K0 field the JIT's KSEG0 fast path reads — the same argument
+        // the K0 nutlb flush above rests on. Unconditional for the same reason:
+        // the events are a handful per boot, and a change gate would be another
+        // field to keep in sync across every path that writes `cp0_config`.
+        self.refresh_kseg0_direct_rule();
         #[cfg(feature = "r5ksc_triton")]
         if reg == 16 {
             // CONFIG_SE (bit 12): wire L2 enable/disable to cache.

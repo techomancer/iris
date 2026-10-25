@@ -186,6 +186,87 @@ R4400 vs R5000), not hardcode R4400's.
 
 ---
 
+## 6a. The KSEG0 direct-address fast path
+
+Status: **shipped, on by default.** `IRIS_NO_KSEG0_FAST=1` forces it off at
+emit time; a `j2 flush` is what makes a change take effect.
+
+KSEG0 is *unmapped*: `translate_32bit_impl` and `translate_64bit_impl` compute
+its physical address as `virt_addr & 0x1FFF_FFFF`, with no TLB entry, no ASID
+and no generation to consult. Probing the nutlb for it was therefore pure
+overhead — an index computation, two dependent loads and the validity-bitmask
+load — on every kernel load and store.
+
+The guard now tests one thing first:
+
+```
+if (virt_addr >> 29) == core.jit_kseg0_rule   ->  phys = virt_addr & 0x1FFF_FFFF
+else                                          ->  the nutlb probe, unchanged
+```
+
+`0xFFFF_FFFF_8800_0000 >> 29` is `0x7_FFFF_FFFC`: bits 63:32 all ones and bits
+31:29 = `0b100`. One compare covers both halves of the address test in 64-bit
+mode, which is exactly `translate_64bit_impl`'s xkseg compatibility arm — the
+only route to this translation there. In 32-bit mode the translator ignores
+bits 63:32, so the same compare accepts a *conservative subset* of what it
+translates (it demands the sign-extended form, which is what `lui`/`la`
+produce); anything else falls through to the nutlb probe.
+
+`jit_kseg0_rule` is derived state: compiled code reads it, and only Rust
+writes it. `MipsExecutor::refresh_kseg0_direct_rule` recomputes it from `Status` and
+`Config` at the two hooks those registers already have — `resync_privilege_state`
+(every Status change, by that function's own documented invariant) and
+`handle_cp0_side_effects` (every `MTC0 Config`) — and `kseg0_direct_rule` is the
+executable specification: kernel mode only (EXL/ERL force it, else KSU == 0),
+and `Config.K0` must select a cached algorithm in the *model's* table, so an
+uncached KSEG0 still goes to the bus. When either fails the rule is `1 << 63`,
+which `virt_addr >> 29` cannot produce (the shift result is at most 35 bits),
+so every access in that state takes the nutlb probe exactly as before.
+
+Everything downstream of `phys` — L1-D tag, dirty bit, LRU, tcache mapped test,
+swizzle, store generation bump — is the same code on both arms, so cache
+behaviour, VCE, aliases and the cache model are untouched. Only *how* `phys`
+was obtained differs.
+
+**Why a mirrored field and not a computed predicate.** The predicate evaluated
+per access (two CP0 loads, a dozen ALU ops) measured *worse than the nutlb probe
+it replaced*: an access in the tcache path is only a handful of host
+instructions, so a dozen more is a net loss. Hoisting the same computation to
+region entry was worse still — `iris-bench` enters regions often enough that a
+dozen instructions per entry costs more than it saves. One memory operand
+compare is the shape that wins.
+
+### Measured
+
+`iris-bench run --cpu r4400`, in-process, `lightning,jitv2`, median of three
+interleaved runs per binary; ns per work unit, lower is better.
+
+| kernel | before | after | ratio |
+|---|---:|---:|---:|
+| `mem/latency_l1` (scalar-load chase, 8 KB) | 8.81 | 5.28 | **1.67x** |
+| `mem/copy` (load+store stream) | 1.44 | 0.99 | **1.45x** |
+| `mem/fill` (store stream) | 1.58 | 0.98 | **1.61x** |
+| `mem/stream_copy` | 0.77 | 0.58 | **1.32x** |
+| `mem/random` (random-page scalar loads) | 100.7 | 51.3 | **1.96x** |
+| `mem/latency_dram` (chase) | 88.9 | 81.2 | **1.09x** |
+| `int/dhrystone` (string/record traffic) | 1088 | 662 | **1.64x** |
+| whole suite | 473 MIPS | 609 MIPS | **1.29x** |
+| whole suite, DMIPS | 526 | 859 | **1.63x** |
+
+With `--cache full` (where the L2 model, not the guard, is the dominant cost)
+the same build gives 1.02x on the suite, 1.70x on `mem/latency_l1`, 1.22x on
+`mem/random` and 1.06x on `mem/copy`.
+
+`sys/tlb_hit` (one word per 4 KB page) is 3-10% *slower*: nearly every access
+there is an L1-D tag miss, so the guard's compare is pure overhead before a
+callout that was going to happen anyway. `sys/uncached` pays a similar ~10%,
+for the same reason — a KSEG1 access declines past the compare. That is the
+trade the study predicted: the callout is the better path for miss-heavy work,
+and it is untouched. Individual non-memory kernels move by up to ~10% either
+way from host load and code layout.
+
+---
+
 ## 7. Attempt 1: why the obvious emit is 9x SLOWER
 
 Implemented exactly as §2 describes — per-access guard chain, fast block, slow

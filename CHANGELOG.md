@@ -64,6 +64,20 @@ hashes are given where a change is easiest to understand by reading the commit.
   page in six. IRIX on an R5000 O2 panicked with "init died" for the same
   reason; it now boots to the desktop.
 
+### CPU and JIT
+
+- **The jitv2 inline load/store guard takes a direct-address fast path for
+  KSEG0.** That segment is unmapped, so its physical address is arithmetic
+  (`virt_addr & 0x1FFF_FFFF`) and the nutlb probe was pure overhead on every
+  kernel load and store. One compare against a mirrored rule —
+  `(virt_addr >> 29) == core.jit_kseg0_rule`, recomputed from `Status` and
+  `Config` at the hooks those registers already have — now covers the address
+  shape, the kernel-only privilege check and KSEG0's cacheability; anything it
+  cannot prove takes the existing nutlb probe. Measured on `iris-bench`:
+  1.7x on the scalar-load chase, 1.5x on copy, 1.6x on fill, 1.3x on the
+  suite overall and 1.6x on DMIPS, with DRAM latency unchanged. See
+  [docs/jit-inline-memory.md](docs/jit-inline-memory.md) §6a.
+
 ### Physical address decoding
 
 - **The decode table is sparse and spans 40 bits.** `Physical` used to embed

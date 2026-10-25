@@ -485,6 +485,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_NO_IDLE` | Any presence disables idle parking. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
+| `IRIS_NO_KSEG0_FAST` | Any presence disables the JIT's KSEG0 direct-address fast path (see [docs/jit-inline-memory.md](docs/jit-inline-memory.md)). Affects regions compiled afterwards; `j2 flush` applies it. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT and the IMPACT raster JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_OPT_SPEED` | Presence selects speed optimization in offline PCP/corpus measurements. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
 | `IRIS_PRINT_OFFSETS` | Presence runs the opt-in layout-offset print test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |

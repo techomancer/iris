@@ -1001,6 +1001,77 @@ pub struct MipsCore {
     /// is ever in flight.
     #[cfg(feature = "jitv2")]
     pub jit_read_scratch: u64,
+    /// KSEG0 direct-address rule for the JIT's inline load/store guard:
+    /// `(virt_addr >> 29) == jit_kseg0_rule` is true exactly for an access the
+    /// translator would serve from `va & 0x1FFF_FFFF` **and** cache.
+    ///
+    /// **Derived state, never written by compiled code.** It is recomputed by
+    /// `MipsExecutor::refresh_kseg0_direct_rule` from `cp0_status` and
+    /// `cp0_config` at the two points those can change — see
+    /// `mips_core::kseg0_direct_rule` for the predicate and
+    /// `MipsExecutor::resync_privilege_state` (every Status change, by that
+    /// function's own documented invariant) and
+    /// `MipsExecutor::handle_cp0_side_effects` (every Config write).
+    ///
+    /// Read by compiled code at a fixed `offset_of!` offset, so it stays a
+    /// plain field rather than moving into `hot`. It is deliberately adjacent
+    /// to the other jitv2 scratch fields: every inline load and store reads it,
+    /// and a cache line that is not already hot would cost more than the probe
+    /// it replaces.
+    ///
+    /// `KSEG0_RULE_NEVER` (not zero) is the "decline" value: `va >> 29` can be
+    /// zero, so a zeroed field would accept a KUSEG address. `MipsCore::new`
+    /// initialises it, and it is refreshed before any compiled code can run.
+    pub jit_kseg0_rule: u64,
+}
+
+/// The value of `virt_addr >> 29` for a sign-extended KSEG0 address —
+/// `0xFFFF_FFFF_8800_0000 >> 29`. One compare against it tests both halves of
+/// the address test in 64-bit mode; see [`kseg0_direct_rule`].
+pub const KSEG0_RULE_HIT: u64 = 0x7_FFFF_FFFC;
+
+/// The rule's "decline" value: `virt_addr >> 29` is at most 35 bits wide, so a
+/// value with bit 63 set can never match. Used instead of `0`, which a KUSEG
+/// address can produce.
+pub const KSEG0_RULE_NEVER: u64 = 1 << 63;
+
+/// The KSEG0 direct-address rule implied by a CP0 state, or
+/// [`KSEG0_RULE_NEVER`] when no KSEG0 access may take the inline path.
+///
+/// This is the executable specification of the JIT's KSEG0 fast path; the
+/// emitted test is a single `(virt_addr >> 29) == rule` compare against the
+/// value returned here. It answers the same three questions
+/// `translate_32bit_impl`'s `4 =>` arm and `translate_64bit_impl`'s xkseg
+/// compatibility arm answer, plus the cacheability check the inline guard owes
+/// on top:
+///
+/// 1. **Privilege** — `get_privilege_mode() == Kernel`. KSEG0 is kernel-only;
+///    user and supervisor accesses raise AdEL/AdES instead of translating.
+///    EXL or ERL force kernel; otherwise KSU must be 0.
+/// 2. **Address shape** — bits 63:32 all ones (the sign-extended form) and
+///    bits 31:29 = 0b100. In 64-bit mode that is exactly the xkseg
+///    compatibility arm; a zero-extended `0x0000_0000_8xxx_xxxx` is *xuseg*
+///    there and TLB-mapped, so it must not match. In 32-bit mode the
+///    translator ignores bits 63:32, so this is a conservative subset: an
+///    address that fails it falls through to the nutlb probe, which handles
+///    every 32-bit form.
+/// 3. **Cacheability** — `Config.K0` selects a cached algorithm, per
+///    `decode_cache_attr`'s per-model table. `k0_cached_mask` bit `c` is set
+///    when `Config.K0 == c` is cached on this model; see
+///    [`crate::cpu::mips_exec::k0_cached_mask_for`].
+pub fn kseg0_direct_rule(status: u32, config: u32, k0_cached_mask: u8) -> u64 {
+    // `get_privilege_mode`: EXL/ERL force kernel, otherwise KSU == 0 is
+    // kernel. KSU == 3 is reserved — `get_privilege_mode` calls it kernel, this
+    // calls it not-kernel, and declining is the safe direction: the nutlb probe
+    // still serves it.
+    let kernel = (status & (STATUS_EXL | STATUS_ERL)) != 0
+        || (status & STATUS_KSU_MASK) == 0;
+    let k0_cached = (k0_cached_mask >> (config & 0x7)) & 1 != 0;
+    if kernel && k0_cached {
+        KSEG0_RULE_HIT
+    } else {
+        KSEG0_RULE_NEVER
+    }
 }
 
 /// A completed real memory access, captured for `jitv2_lockstep`'s
@@ -1414,6 +1485,9 @@ impl MipsCore {
             gpr_scratch: 0,
             #[cfg(feature = "jitv2")]
             jit_read_scratch: 0,
+            // Declines the KSEG0 fast path until `MipsExecutor::new` derives the
+            // real value. `KSEG0_RULE_NEVER`, not 0: `va >> 29` can be zero.
+            jit_kseg0_rule: KSEG0_RULE_NEVER,
         };
         core.reset_registers(false);
         core

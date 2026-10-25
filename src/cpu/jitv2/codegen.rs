@@ -3812,6 +3812,7 @@ pub static INLINE_MEM_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// Offsets of the inline load/store fast-path pointers in `MipsCore`.
 fn core_offset_of_jit_dc_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_tags) as i32 }
 fn core_offset_of_jit_dc_lru() -> i32 { std::mem::offset_of!(MipsCore, jit_dc_lru) as i32 }
+fn core_offset_of_jit_kseg0_rule() -> i32 { std::mem::offset_of!(MipsCore, jit_kseg0_rule) as i32 }
 fn core_offset_of_jit_tc_base() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_base) as i32 }
 fn core_offset_of_jit_tc_gen() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_gen) as i32 }
 fn core_offset_of_jit_l2_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_l2_tags) as i32 }
@@ -3844,10 +3845,26 @@ struct InlineMemPath {
     join_block: ir::Block,
 }
 
+/// KSEG0's physical-address mask: `translate_*bit_impl` computes a KSEG0
+/// access's physical address as `(va as u32) & 0x1FFF_FFFF`.
+const KSEG0_PHYS_MASK: i64 = 0x1FFF_FFFF;
+
+/// Whether the KSEG0 direct-address fast path is emitted. **On by default.**
+///
+/// Read at *emit* time only, like [`inline_mem_enabled`]: flipping it affects
+/// regions compiled afterwards, not ones already published, so `j2 flush` is
+/// what makes a change take effect. `IRIS_NO_KSEG0_FAST=1` forces it off at
+/// startup, for A/B runs on a binary that has no monitor.
+fn kseg0_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("IRIS_NO_KSEG0_FAST").is_none())
+}
+
 /// Emit the guard chain shared by inline loads and stores.
 ///
 /// Sequence (docs/jit-inline-memory.md §2):
-///   1. nutlb probe: VA -> phys, else slow
+///   0. KSEG0 direct-address fast path: `phys` is arithmetic, no entry to read
+///   1. otherwise nutlb probe: VA -> phys, else slow
 ///   2. L1D tag compare on phys, else slow
 ///   3. stores: line already dirty, else slow (the clean->dirty tag RMW stays
 ///      in Rust)
@@ -3877,6 +3894,10 @@ fn emit_inline_mem_guard<const STORE: bool>(
     let slow_block = ctx.builder.create_block();
     let join_block = ctx.builder.create_block();
     let fast_block = ctx.builder.create_block();
+    // Both translation arms deliver `phys` here; the cache-model half of the
+    // guard is written once and cannot tell which arm produced the address.
+    let phys_block = ctx.builder.create_block();
+    let phys_param = ctx.builder.append_block_param(phys_block, i64t);
 
     // ---- alignment ---------------------------------------------------
     // Misaligned accesses raise AdEL/AdES; that whole path stays in Rust.
@@ -3890,6 +3911,47 @@ fn emit_inline_mem_guard<const STORE: bool>(
         ctx.builder.switch_to_block(aligned_block);
         ctx.builder.seal_block(aligned_block);
     }
+
+    // ---- 0. KSEG0 direct-address fast path ---------------------------
+    //
+    // KSEG0 is *unmapped*: `translate_32bit_impl` and `translate_64bit_impl`
+    // compute its physical address as `(va & 0x1FFF_FFFF)` with no TLB entry,
+    // no ASID and no generation to consult. Probing the nutlb for it is
+    // therefore pure overhead — an index computation, two dependent loads and
+    // the validity-bitmask load — on every kernel load and store. Take the
+    // arithmetic translation directly when the conditions the translator would
+    // have checked all hold; anything else falls into the nutlb probe below,
+    // which is unchanged.
+    //
+    // `phys_block` is joined by both arms, so the cache-model half of the guard
+    // (tag check, dirty bit, LRU, tcache mapped test, swizzle, store
+    // generation bump) is identical on either path. Only how `phys` was
+    // obtained differs.
+    let direct_block = ctx.builder.create_block();
+    let xlat_block = ctx.builder.create_block();
+    if kseg0_fast_enabled() {
+        // `(va >> 29) == core.jit_kseg0_rule`, which is `KSEG0_RULE_HIT` only
+        // when this access is a cacheable KSEG0 translation in the current
+        // mode. See `MipsCore::jit_kseg0_rule` and `kseg0_direct_rule` for the
+        // rule itself, why it is mirrored rather than computed here, and why
+        // one compare covers both halves of the address test.
+        let rule = ctx.builder.ins().load(i64t, mem, ctx.core_ptr,
+            ir::immediates::Offset32::new(core_offset_of_jit_kseg0_rule()));
+        let shifted = ctx.builder.ins().ushr_imm_s(vaddr, 29);
+        let hit = ctx.builder.ins().icmp(IntCC::Equal, shifted, rule);
+        ctx.builder.ins().brif(hit, direct_block, &[], xlat_block, &[]);
+    } else {
+        ctx.builder.ins().jump(xlat_block, &[]);
+    }
+
+    ctx.builder.switch_to_block(direct_block);
+    ctx.builder.seal_block(direct_block);
+
+    let direct_phys = ctx.builder.ins().band_imm_s(vaddr, KSEG0_PHYS_MASK);
+    ctx.builder.ins().jump(phys_block, &[direct_phys.into()]);
+
+    ctx.builder.switch_to_block(xlat_block);
+    ctx.builder.seal_block(xlat_block);
 
     // ---- 1. nutlb probe ----------------------------------------------
     // Mirrors MipsExecutor::nutlb_translate exactly (mips_exec.rs). Any
@@ -3957,7 +4019,13 @@ fn emit_inline_mem_guard<const STORE: bool>(
     // phys = (e.phys & !0xFFF) | (va & 0xFFF)
     let phys_page = ctx.builder.ins().band_imm_s(e_phys, !0xFFFi64);
     let va_off = ctx.builder.ins().band_imm_s(vaddr, 0xFFF);
-    let phys = ctx.builder.ins().bor(phys_page, va_off);
+    let xlat_phys = ctx.builder.ins().bor(phys_page, va_off);
+    ctx.builder.ins().jump(phys_block, &[xlat_phys.into()]);
+
+    // ---- both arms join here with `phys` -----------------------------
+    ctx.builder.switch_to_block(phys_block);
+    ctx.builder.seal_block(phys_block);
+    let phys = phys_param;
 
     if geom.tagless {
         return Some(emit_tagless_tail(ctx, phys, size, fast_block, slow_block, join_block));

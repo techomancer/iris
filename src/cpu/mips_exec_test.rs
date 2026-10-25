@@ -2,7 +2,10 @@
 mod tests {
     use std::sync::Mutex;
     use std::collections::HashMap;
-    use crate::cpu::mips_core::{STATUS_KX, STATUS_CU1, STATUS_FR};
+    use crate::cpu::mips_core::{
+        STATUS_KX, STATUS_CU1, STATUS_FR, STATUS_EXL, STATUS_ERL, STATUS_KSU_SHIFT,
+        KSU_USER, KSU_SUPERVISOR,
+    };
     use crate::cpu::mips_exec::{MipsExecutor, MipsCpuConfig, DecodedInstr, EXEC_COMPLETE, EXEC_BREAKPOINT, EXEC_IS_EXCEPTION, EXEC_IS_TLB_REFILL, exec_exception, EXC_SYS, EXC_BP, EXC_TR, EXC_OV, EXC_RI, EXC_ADEL};
     use crate::cpu::mips_isa::*;
     use crate::cpu::mips_tlb::PassthroughTlb;
@@ -6206,4 +6209,176 @@ mod tests {
                                parked through an interrupt masked only by the spl"),
         }
     }
+    // ── KSEG0 direct-address rule (jitv2 inline load/store fast path) ──────
+
+    /// The rule's hit constant must be exactly `KSEG0_VA >> 29` for any
+    /// sign-extended KSEG0 address. Pinned as a test because the constant is
+    /// easy to write one `F` short, which makes the fast path *never* fire —
+    /// a silent, total performance loss with no functional symptom.
+    #[test]
+    fn kseg0_rule_hit_constant_is_the_shifted_kseg0_base() {
+        use crate::cpu::mips_core::{KSEG0_RULE_HIT, KSEG0_RULE_NEVER};
+        assert_eq!(KSEG0_RULE_HIT, 0xFFFF_FFFF_8800_0000u64 >> 29);
+        // Every KSEG0 address in the segment shifts to the same value...
+        for off in [0u64, 4, 0x1000, 0x1FFF_FFFF] {
+            assert_eq!(0xFFFF_FFFF_8000_0000u64.wrapping_add(off) >> 29, KSEG0_RULE_HIT);
+        }
+        for off in [0u64, 4, 0x1000, 0x17FF_FFFF] {
+            assert_eq!(0xFFFF_FFFF_8800_0000u64.wrapping_add(off) >> 29, KSEG0_RULE_HIT);
+        }
+        // ...and KSEG1, one segment up, must not.
+        assert_ne!(0xFFFF_FFFF_A000_0000u64 >> 29, KSEG0_RULE_HIT);
+        // ...and the "decline" value is unreachable, which is what lets a
+        // disallowed region keep the same emitted compare.
+        assert!(KSEG0_RULE_NEVER > 0x7_FFFF_FFFF, "never-value must not be a reachable shift result");
+    }
+
+    /// The rule must follow every writer of the two registers it reads:
+    /// Status through `resync_privilege_state` (the documented funnel for every
+    /// Status change), Config through `handle_cp0_side_effects`. A missed
+    /// refresh would let a user-mode access take the KSEG0 direct path, so this
+    /// asserts the mirror rather than only the pure function.
+    #[test]
+    fn kseg0_direct_rule_mirror_tracks_status_and_config() {
+        use crate::cpu::mips_core::{KSEG0_RULE_HIT, KSEG0_RULE_NEVER};
+        let (mut exec, mem) = create_executor_with_r4000cache();
+
+        // Kernel, KX, K0 = 3 (the R4400 constructor's cacheable default).
+        exec.set_cp0_status(STATUS_KX);
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_HIT, "kernel + K0=3");
+
+        // Supervisor and user mode must both decline: KSEG0 is kernel-only.
+        exec.set_cp0_status(STATUS_KX | (KSU_SUPERVISOR << STATUS_KSU_SHIFT));
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_NEVER, "supervisor");
+        exec.set_cp0_status(STATUS_KX | (KSU_USER << STATUS_KSU_SHIFT));
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_NEVER, "user");
+
+        // EXL and ERL force kernel mode even with KSU still naming the
+        // interrupted mode — the syscall and TLB-refill case.
+        exec.set_cp0_status(STATUS_KX | (KSU_USER << STATUS_KSU_SHIFT) | STATUS_EXL);
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_HIT, "user + EXL");
+        exec.set_cp0_status(STATUS_KX | (KSU_USER << STATUS_KSU_SHIFT) | STATUS_ERL);
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_HIT, "user + ERL");
+
+        // KSU = 3 is reserved; `get_privilege_mode` says kernel, the rule
+        // declines. Conservative, so assert the decline and the callout that
+        // still serves it.
+        exec.set_cp0_status(STATUS_KX | (3 << STATUS_KSU_SHIFT));
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_NEVER, "reserved KSU 3");
+
+        // Config.K0 goes through the *real* instruction path — `MTC0 Config`
+        // must leave the mirror consistent, since `handle_cp0_side_effects` is
+        // the only hook it runs through.
+        exec.set_cp0_status(STATUS_KX);
+
+        // K0 = 2 (uncached) must decline: an uncached KSEG0 access belongs on
+        // the bus, never in an L1-D line.
+        exec.core.write_gpr(8, 0xc08482);
+        mem.set_word(0x00000000, 0x4088_8000); // MTC0 t0($8), Config($16)
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.cp0_config & 0x7, 2, "K0=2");
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_NEVER, "K0 uncached");
+
+        // K0 = 5 is a coherent cached algorithm on an R4400...
+        exec.core.write_gpr(8, 0xc08485);
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_HIT, "R4400 K0=5 coherent");
+    }
+
+    /// On an R5000 the same `Config.K0` codes decode differently (VR5000 Table
+    /// 6-6: 0/1/3 cached, 4/5/6 reserved). The rule must use the model's table,
+    /// not R4400's — hence `k0_cached_mask_for` taking the model's flags.
+    #[test]
+    fn kseg0_direct_rule_uses_the_models_k0_table() {
+        use crate::cpu::mips_core::{KSEG0_RULE_HIT, KSEG0_RULE_NEVER};
+        use crate::cpu::mips_cache_v2::R5000Cache;
+        let mem = Arc::new(MockMemory::new());
+        let bus: Arc<dyn BusDevice> = mem.clone();
+        let mut exec: MipsExecutor<PassthroughTlb, R5000Cache> =
+            MipsExecutor::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        exec.set_cp0_status(STATUS_KX);
+        exec.core.write_gpr(8, 0xc08485); // K0 = 5: coherent on R4400, reserved here
+        mem.set_word(0x00000000, 0x4088_8000); // MTC0 t0($8), Config($16)
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_NEVER, "R5000 K0=5 is uncached");
+        exec.core.write_gpr(8, 0xc08483); // K0 = 3: cached on every model
+        exec.core.pc = 0xFFFFFFFF_80000000u64;
+        assert_eq!(exec.step_int(), EXEC_COMPLETE);
+        assert_eq!(exec.core.jit_kseg0_rule, KSEG0_RULE_HIT, "R5000 K0=3");
+    }
+
+    /// The address half of the rule, checked against the translator itself:
+    /// in 64-bit kernel mode the emitted compare must accept exactly the
+    /// addresses `translate_impl` serves from KSEG0 out of cache, and nothing
+    /// else. `TR_MAPPED` distinguishes the TLB-mapped arms (which set it) from
+    /// the unmapped ones, and `is_cached()` excludes KSEG1 and the ERL identity
+    /// window.
+    #[test]
+    fn kseg0_rule_address_test_agrees_with_the_translator() {
+        use crate::cpu::mips_core::KSEG0_RULE_HIT;
+        let (mut exec, _mem) = create_executor_with_r4000cache();
+        exec.set_cp0_status(STATUS_KX); // 64-bit kernel, K0=3
+
+        let mut cases: Vec<u64> = Vec::new();
+        for a in [
+            0x0000_0000_0000_0000u64, 0x0000_0000_1000_0000, 0x0000_0000_7FFF_FFFF,
+            0x0000_0000_8000_0000, // KSEG0, zero-extended -> xuseg in 64-bit mode
+            0x0000_0000_8800_0000, 0x0000_0000_9FFF_FFFF,
+            0x0000_0000_A000_0000, // KSEG1, zero-extended
+            0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_8800_0000, 0xFFFF_FFFF_9FFF_FFFC,
+            0xFFFF_FFFF_A000_0000, // KSEG1 sign-extended
+            0xFFFF_FFFF_BFFF_FFFF,
+            0xFFFF_FFFF_C000_0000, // KSSEG
+            0xFFFF_FFFF_E000_0000, // KSEG3
+            0x8000_0000_0000_0000, // xkphys
+            0x0000_00FF_FFFF_FFFF, // top of xuseg
+        ] {
+            cases.push(a);
+            cases.push(a + 4);
+            cases.push(a & !0xFFF);
+            cases.push(a | 0xFFF);
+        }
+
+        for va in cases {
+            let got = (va >> 29) == KSEG0_RULE_HIT;
+            let want = match exec.debug_translate(va) {
+                r if r.is_exception() => false,
+                r => {
+                    let unmapped = (r.status & crate::cpu::mips_exec::TR_MAPPED) == 0;
+                    unmapped && r.is_cached()
+                        && r.phys == (va as u32 & 0x1FFF_FFFF)
+                }
+            };
+            assert_eq!(got, want, "va={va:#018x}: rule says {got}, translator says {want}");
+        }
+    }
+
+    /// In 32-bit mode `translate_32bit_impl` ignores bits 63:32, so the rule is
+    /// allowed to be *narrower* than the translator (it demands the
+    /// sign-extended form) but must never be wider: a rule hit has to be an
+    /// access the translator would have served identically.
+    #[test]
+    fn kseg0_rule_is_a_subset_in_32bit_mode() {
+        use crate::cpu::mips_core::KSEG0_RULE_HIT;
+        let (mut exec, _mem) = create_executor_with_r4000cache();
+        exec.set_cp0_status(0); // 32-bit kernel, K0=3
+
+        for va in [
+            0x0000_0000_8000_0000u64, 0x0000_0000_8800_1234,
+            0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_8800_1234,
+            0xFFFF_FFFF_9FFF_FFFF, 0xFFFF_FFFF_A000_0000,
+            0x0000_0000_0000_1000, 0x0000_0000_7FFF_FFFF,
+        ] {
+            if (va >> 29) == KSEG0_RULE_HIT {
+                let r = exec.debug_translate(va);
+                assert!(!r.is_exception(), "va={va:#018x}: rule hit on a faulting address");
+                assert_eq!(r.phys, va as u32 & 0x1FFF_FFFF, "va={va:#018x}");
+                assert!(r.is_cached(), "va={va:#018x}: rule hit on an uncached translation");
+            }
+        }
+    }
+
 }
