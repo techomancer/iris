@@ -146,7 +146,7 @@ Hardware, testing, and development references:
 
 | Area | Documentation |
 |---|---|
-| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/indy-xz-elan.md), and the [SGI O2 (IP32)](docs/o2-ip32.md). |
+| Machine profiles | [Indigo2 IP22](docs/indigo2-ip22.md), [Indigo2 IMPACT IP28](docs/indigo2-ip28.md), and [GR2 XZ/Extreme](docs/indy-xz-elan.md), the [SGI O2 (IP32)](docs/o2-ip32.md), and the [Octane (IP30) address map](docs/Octane/ip30-address-map.md). |
 | Graphics and peripherals | [REX3](docs/Indy/rex3.md), [HAL2 audio](docs/Indy/hal2.md), [WD33C93A SCSI](docs/Indy/wd33c93a.md), [QLogic ISP1040 SCSI (Octane)](docs/Octane/qla1040.md), [interrupt map](docs/interrupt_map.md), and [Ultra64](docs/Indy/ultra64.md) / [N64 GIO specifications](docs/Indy/n64_gio_specs.md). |
 | CPU test suite | [Suite README](cpu-tests/README.md), [current status](cpu-tests/docs/status.md), [findings](cpu-tests/docs/findings.md), [gotchas](cpu-tests/docs/gotchas.md), and [emulator support](docs/cpu-test-support.md). |
 | CPU test infrastructure | [Toolchain](cpu-tests/docs/toolchain.md), [memory map](cpu-tests/docs/memory-map.md), [oracle overview](cpu-tests/docs/oracle.md), [hardware oracle](cpu-tests/oracle/README.md), [R4600 notes](cpu-tests/docs/r4600.md), and [original test plan](cpu-tests/PLAN.md). |
