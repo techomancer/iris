@@ -55,7 +55,7 @@ pub fn set_emulator_profile(profile: MachineProfile) {
 
 fn emulator_profile() -> Option<MachineProfile> {
     let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
-    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32]
+    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30]
         .into_iter().find(|p| *p as u8 == raw)
 }
 
@@ -69,6 +69,7 @@ fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static s
         Some(MachineProfile::Indigo2Ip22) => &["IRIX", "Iris", "Indigo2", "IP22"],
         Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "Indigo2", "IP28"],
         Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IP32"],
+        Some(MachineProfile::OctaneIp30) => &["IRIX", "Iris", "IP30"],
         None => &["IRIX", "Iris"],
     }
 }
@@ -2168,12 +2169,13 @@ mod emulator_name_tests {
                 Some(MachineProfile::IndyIp24) => &["Indigo2", "IP22", "IP28", "IP32", "O2"],
                 Some(MachineProfile::Indigo2Ip22) => &["Indy", "IP24", "IP28", "IP32", "O2"],
                 Some(MachineProfile::Indigo2Ip28) => &["Indy", "IP24", "IP22", "IP32", "O2"],
-                Some(MachineProfile::O2Ip32) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "O2"],
-                None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
+                Some(MachineProfile::O2Ip32) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "O2"],
+                Some(MachineProfile::OctaneIp30) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
+                None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP30", "IP32", "O2"],
             }
         };
         for p in [None, Some(MachineProfile::IndyIp24), Some(MachineProfile::Indigo2Ip22),
-                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32)] {
+                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32), Some(MachineProfile::OctaneIp30)] {
             let thirds = emulator_name_thirds(p);
             assert!(!thirds.is_empty());
             for w in thirds {
@@ -2185,7 +2187,7 @@ mod emulator_name_tests {
 
     #[test]
     fn profile_round_trips_through_the_global() {
-        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32] {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
             set_emulator_profile(p);
             assert_eq!(emulator_profile(), Some(p));
         }

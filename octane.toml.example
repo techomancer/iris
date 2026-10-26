@@ -1,0 +1,26 @@
+# An SGI Octane (IP30). In bring-up: the PROM runs on the serial console;
+# there is no graphics, Ethernet or SCSI yet. See
+# docs/Octane/ip30-address-map.md and FEATURES.md ([octane]).
+#
+# Run:  iris --config octane.toml
+# Then: telnet 127.0.0.1 2291 for the PROM's console.
+
+headless = true
+no_audio = true
+prom     = "IP30prom.bin"      # the 1 MB flash image (IRIX: /usr/cpu/firmware/IP30prom.bin)
+nvram    = "octane-nvram.bin"  # the DS1687's RAM: the PROM's environment
+banks    = [1024, 0, 0, 0]     # the DIMM pair in each of HEART's four banks, MB
+
+serial_port_a = 2291           # the console: IOC3 UART A
+serial_port_b = 2292
+serial_log    = "octane-console.log"
+
+[machine]
+profile = "octane_ip30"
+cpu     = "r10000"
+
+[octane]
+flash = "octane-flash.bin"     # the flash between runs (the PROM's data store lives in it)
+
+[network]
+mode = "off"

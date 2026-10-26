@@ -129,6 +129,17 @@ impl PciConfig {
     /// once the command register enables that space, and only for a BAR
     /// that has been assigned an address.
     pub fn decode(&self, space: Space, addr: u32) -> Option<(usize, u32)> {
+        self.decode_with(space, addr, false)
+    }
+
+    /// [`Self::decode`], but a BAR left at zero decodes at zero: what a
+    /// function does on a bus whose firmware enables it without moving it
+    /// (the Octane's PROM reaches the RAD that way).
+    pub fn decode_unmoved(&self, space: Space, addr: u32) -> Option<(usize, u32)> {
+        self.decode_with(space, addr, true)
+    }
+
+    fn decode_with(&self, space: Space, addr: u32, zero_ok: bool) -> Option<(usize, u32)> {
         let enable = match space {
             Space::Io => PCI_COMMAND_IO,
             Space::Mem => PCI_COMMAND_MEMORY,
@@ -141,7 +152,7 @@ impl PciConfig {
             let in_space = matches!((bar, space), (Bar::Io(_), Space::Io) | (Bar::Mem(_), Space::Mem));
             let base = self.bar_base(i);
             let size = bar.size();
-            (in_space && base != 0 && addr.wrapping_sub(base) < size).then(|| (i, addr - base))
+            (in_space && (base != 0 || zero_ok) && addr.wrapping_sub(base) < size).then(|| (i, addr - base))
         })
     }
 }

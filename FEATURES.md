@@ -167,7 +167,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)). |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (in bring-up: the PROM on the serial console; `[octane]`, see [the address map](docs/Octane/ip30-address-map.md)). |
 | `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. |
 
 ### [graphics]
@@ -316,6 +316,22 @@ the file is loaded, with a note, and never written back.
 | `o2.mouse` | `true` | PS/2 mouse on the second port (with the graphics console). |
 | `o2.control_port` | unset | TCP port on 127.0.0.1 serving the `o2` monitor commands for scripts. |
 | `o2.arcs_fpu` | `false` | Test aid: lend a kernel the FPU while it runs inside the PROM. |
+
+### [octane]
+
+Used with `machine.profile = "octane_ip30"`. The Octane is configured by
+the shared keys: `prom` is the 1 MB flash image (`IP30prom.bin`, as IRIX
+ships it in `/usr/cpu/firmware`, is tried when `prom` is left unset; there
+is no embedded Octane PROM), `nvram` the DS1687's RAM (the PROM's
+environment), `banks` the DIMM pair in each of HEART's four banks in 32 MB
+steps up to 2048, `serial_port_a` the console (UART A of the IOC3) and
+`serial_port_b` the second port, `[clock] fixed_mhz` CP0 Count (97.5, half
+a 195 MHz R10000, unless set), `[network] mode = "off"` (there is no
+Ethernet yet). `[machine] cpu` must be `r10000`. Headless only.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `octane.flash` | `flash.bin` | Where the flash is kept between runs: a copy of `prom` whose last segment, the PROM's data store, the guest rewrites (`setenv`). Empty keeps the flash in memory only. |
 
 ### Hardware constraints and precedence
 

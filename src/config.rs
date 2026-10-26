@@ -487,6 +487,11 @@ pub enum MachineProfile {
     /// the `[o2]` section, not the fullhouse/Guinness options above; see
     /// `src/ip32_machine.rs`.
     O2Ip32,
+    /// SGI Octane IP30: HEART, the Xbow and the Bridge with the IOC3 behind
+    /// it, with an R10000. Built from the shared keys and `[octane]`; see
+    /// `src/ip30_machine.rs` and `docs/Octane/ip30-address-map.md`. In
+    /// bring-up: the PROM on the serial console.
+    OctaneIp30,
 }
 
 impl MachineProfile {
@@ -501,6 +506,7 @@ impl MachineProfile {
             Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
             Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
             Self::O2Ip32 => "SGI O2 (IP32)",
+            Self::OctaneIp30 => "SGI Octane (IP30)",
         }
     }
 
@@ -510,9 +516,14 @@ impl MachineProfile {
     /// connector), one on the Indy.
     pub fn scsi_controllers(self) -> u8 {
         match self {
-            Self::Indigo2Ip22 | Self::O2Ip32 => 2,
+            Self::Indigo2Ip22 | Self::O2Ip32 | Self::OctaneIp30 => 2,
             _ => 1,
         }
+    }
+
+    /// The Octane: HEART and XIO in place of the MC and GIO.
+    pub fn ip30(self) -> bool {
+        matches!(self, Self::OctaneIp30)
     }
 
     /// How many memory banks the machine has: four on all of them (the MC's
@@ -857,6 +868,38 @@ pub struct O2Section {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// The Octane (`[octane]`), used with `machine.profile = "octane_ip30"`.
+/// The shared keys do the rest: `prom` is the 1 MB flash image (IRIX's
+/// `IP30prom.bin` is tried when it is left unset), `nvram` the DS1687's
+/// RAM, `banks` the DIMM pair in each of HEART's four banks (multiples of
+/// 32 MB), `serial_port_a` the console, `[clock] fixed_mhz` CP0 Count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OctaneSection {
+    /// Where the flash is kept between runs: a copy of `prom` whose last
+    /// 64 KB segment, the PROM's data store, the guest rewrites. Empty: the
+    /// flash lives in memory only and every start is from `prom`.
+    #[serde(default = "octane_flash")]
+    pub flash: String,
+}
+
+fn octane_flash() -> String {
+    "flash.bin".to_string()
+}
+
+impl Default for OctaneSection {
+    fn default() -> Self {
+        Self { flash: octane_flash() }
+    }
+}
+
+impl OctaneSection {
+    /// Left out of a written config when nothing in it was set.
+    fn is_default(&self) -> bool {
+        self.flash == octane_flash()
+    }
 }
 
 /// An entry of the deprecated `o2.disks` list; see [`O2Section::disks`].
@@ -1481,6 +1524,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub o2: O2Section,
 
+    /// The Octane (`[octane]` section), used when `[machine] profile = "octane_ip30"`.
+    #[serde(default, skip_serializing_if = "OctaneSection::is_default")]
+    pub octane: OctaneSection,
+
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
     pub perf: PerfConfig,
@@ -1651,6 +1698,7 @@ impl Default for MachineConfig {
             debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
             o2: O2Section::default(),
+            octane: OctaneSection::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -1868,6 +1916,19 @@ impl MachineConfig {
                 }
             }
             crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
+        } else if self.machine.profile == MachineProfile::OctaneIp30 {
+            // A bank is the DIMM pair in one of HEART's four banks: 32 MB
+            // units, up to 2 GB.
+            for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
+                if sz % 32 != 0 || sz > 2048 {
+                    return Err(format!(
+                        "bank{i} size {sz} MB: an Octane bank is a DIMM pair of up to 2048 MB in 32 MB steps"
+                    ));
+                }
+            }
+            if self.banks[..bank_count].iter().all(|&b| b == 0) {
+                return Err("banks: an Octane needs memory in at least one bank".into());
+            }
         } else {
             for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
                 if !VALID_BANK_SIZES.contains(&sz) {
@@ -1887,11 +1948,14 @@ impl MachineConfig {
             }
         }
         match (self.network.mode, self.machine.profile) {
-            (NetMode::Off, p) if p != MachineProfile::O2Ip32 => {
-                return Err("network.mode = \"off\" is only available on the O2 for now; the Indy and Indigo2 always have their Ethernet".into());
+            (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 => {
+                return Err("network.mode = \"off\" is only available on the O2 and the Octane for now; the Indy and Indigo2 always have their Ethernet".into());
             }
             (NetMode::Pcap, MachineProfile::O2Ip32) => {
                 return Err("network.mode = \"pcap\" is not available on the O2 yet (its Ethernet runs on the NAT gateway)".into());
+            }
+            (NetMode::Pcap, MachineProfile::OctaneIp30) => {
+                return Err("network.mode = \"pcap\" is not available on the Octane (it has no Ethernet yet)".into());
             }
             _ => {}
         }
