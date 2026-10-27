@@ -19,7 +19,9 @@ Behaviour follows the public Linux and OpenBSD drivers (Linux's `ioc3.c`,
 Bridge setup in `pci-xtalk-bridge.c`; OpenBSD's `sys/arch/sgi/pci/ioc.c` and
 `iocreg.h`) and register traces from a real Octane2. The chip's specification
 is not public. Where the model approximates, the section says so. The keyboard
-and mouse registers are described in [ioc3-ps2.md](ioc3-ps2.md).
+and mouse registers are described in [ioc3-ps2.md](ioc3-ps2.md), and the
+Ethernet MAC, its rings, SSRAM and PHY and each driver's sequence in
+[ioc3-ethernet.md](ioc3-ethernet.md).
 
 ## Parent and children
 
