@@ -359,6 +359,7 @@ impl Ip32Bus {
         // and finds nothing, so it has no disk and cannot boot. Putting the
         // controller a real O2 has there is how we learn how much of it the
         // PROM insists on.
+        bus.gbe.connect_irq(bus.crime.regs.clone());
         if opts.scsi {
             // The controller fetches its work from host memory, which it
             // reaches through the PCI bridge it is attached to.
@@ -431,56 +432,16 @@ impl Ip32Bus {
         addr < LOW_ALIAS_SIZE || addr >= RAM_BASE
     }
 
-    #[inline]
-    fn before_read(&self, addr: u32) {
-        if self.crime.regs.has_output() && CrimeSpace::in_regs(addr) {
-            self.refresh_irq();
-        }
-    }
-
-    /// After a device write, bring interrupts up to date. Not after the
-    /// rendering engine's or GBE's registers: neither drives a device line
-    /// (GBE's vertical-timing interrupts come from the beam, which the
-    /// service thread watches), and a GL scene writes the engine millions
-    /// of times a second, each refresh taking the interrupt lock the
-    /// service thread holds too.
-    #[inline]
-    fn after_write(&self, addr: u32) {
-        if self.crime.regs.has_output() && !Self::is_ram_addr(addr) && !CrimeSpace::in_re(addr) && !self.in_gbe(addr) {
-            self.refresh_irq();
-        }
-    }
-
-    /// Device lines into CRIME, which hands its output on if it changed.
-    /// Returns whether CRIME is interrupting the CPU (IP2).
-    pub fn refresh_irq(&self) -> bool {
-        self.update_lines();
-        self.crime.regs.update_output()
-    }
-
-    /// The interrupts that are not yet driven by their devices' own state
-    /// changes: GBE's beam crossings (time passing), and the ISA devices
-    /// whose state moves from outside the guest (typed keys and console
-    /// input, audio buffers draining).
-    fn update_lines(&self) {
-        // GBE's vertical-timing interrupts: the beam crossed a VT_INTRn line.
-        let crossed = self.gbe.vt_crossings();
-        for n in 0..4 {
-            if crossed & (1 << n) != 0 {
-                crate::irq::InterruptController::set_line(&*self.crime.regs, 16 + n, true);
-            }
-        }
-        self.mace.update_lines();
-    }
-
-    /// Bring every device interrupt up to date in CRIME: the SCSI
-    /// controllers, the Ethernet (and its frames from the network), com0 and
-    /// the PS/2 ports. Returns whether CRIME is interrupting the CPU (IP2).
-    /// The harness calls it every 256 instructions, the machine from its
-    /// service thread.
+    /// What time and the outside world have done since the last call:
+    /// frames from the network, console input, audio and serial DMA moving,
+    /// and the beam's timing interrupts. As on the Indy, there is no
+    /// refresh of interrupt lines: each device drives its own when its state
+    /// changes, from the register access, the event or this tick that
+    /// changed it. Returns whether CRIME is interrupting the CPU (IP2).
     pub fn service(&self) -> bool {
         self.mace.service();
-        self.refresh_irq()
+        self.gbe.service();
+        self.crime.regs.interrupting()
     }
 
     /// Plug in a PS/2 keyboard on port 0, and a mouse on port 1 if `mouse`.
@@ -929,40 +890,28 @@ impl BusDevice for Ip32Bus {
     }
 
     fn read8(&self, addr: u64) -> BusRead8 {
-        self.before_read(addr as u32);
         self.read8_raw(addr)
     }
     fn read16(&self, addr: u64) -> BusRead16 {
-        self.before_read(addr as u32);
         self.read16_raw(addr)
     }
     fn read32(&self, addr: u64) -> BusRead32 {
-        self.before_read(addr as u32);
         self.read32_raw(addr)
     }
     fn read64(&self, addr: u64) -> BusRead64 {
-        self.before_read(addr as u32);
         self.read64_raw(addr)
     }
     fn write8(&self, addr: u64, val: u8) -> u32 {
-        let r = self.write8_raw(addr, val);
-        self.after_write(addr as u32);
-        r
+        self.write8_raw(addr, val)
     }
     fn write16(&self, addr: u64, val: u16) -> u32 {
-        let r = self.write16_raw(addr, val);
-        self.after_write(addr as u32);
-        r
+        self.write16_raw(addr, val)
     }
     fn write32(&self, addr: u64, val: u32) -> u32 {
-        let r = self.write32_raw(addr, val);
-        self.after_write(addr as u32);
-        r
+        self.write32_raw(addr, val)
     }
     fn write64(&self, addr: u64, val: u64) -> u32 {
-        let r = self.write64_raw(addr, val);
-        self.after_write(addr as u32);
-        r
+        self.write64_raw(addr, val)
     }
 }
 

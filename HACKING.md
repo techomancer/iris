@@ -179,7 +179,13 @@ state may have changed; the controller decides what that means (a status bit
 behind a mask, an OR of several inputs, or a cascade further up). HPC3's
 interrupt status, the IOC's local and mappable interrupts and the Indigo2's
 INT2 cascade all work this way, and the IOC finally drives the CPU's
-interrupt pins.
+interrupt pins. The O2 is built the same way: its devices drive MACE's ISA
+status, the PCI bridge's pin router or CRIME directly, and CRIME drives
+IP2. Each controller updates its state and drives the next one up under
+its own lock, so two threads cannot deliver levels out of order. Nothing
+re-polls the lines: a device drives its line from the register access,
+the host event (a key, a frame, console input) or the timer tick that
+changed it.
 
 The CPU side is an `AtomicU64` bitmask in `MipsCore` that any thread may set
 or clear. The CPU polls it between instructions (jitv2 at region boundaries

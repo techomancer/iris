@@ -57,6 +57,29 @@ pub const CRIME_LATCHED_BITS: u64 = 0x41cf_0000;
 /// modelled; a headless machine differs only in its console.
 pub const CRIME_REV: u64 = 0x0000_0000_0000_00a1;
 
+/// CRIME's interrupt controller: what the level-type inputs drive (INTSTAT's
+/// hardware bits), INTMASK, SOFTINT, and the edge-triggered sources CRIME
+/// holds until software writes a 0 to the bit in HARDINT: GBE's four timing
+/// lines (16..19), the rendering engine's empty/full/idle edges (22..24) and
+/// bit 30.
+#[derive(Default)]
+struct IntState {
+    levels: u64,
+    mask: u64,
+    soft: u64,
+    latched: u64,
+}
+
+impl IntState {
+    fn intstat(&self) -> u64 {
+        self.levels | self.soft | self.latched
+    }
+
+    fn pending(&self) -> bool {
+        self.intstat() & self.mask != 0
+    }
+}
+
 /// Minimal CRIME: a 64-bit register file that remembers what it is told, with
 /// the handful of reads the PROM cannot be fobbed off with zero for.
 pub struct Crime {
@@ -68,10 +91,11 @@ pub struct Crime {
     /// Values written, in order, as `(offset, value)` — the bank programming
     /// is only meaningful if you can see what it was told.
     writes: Mutex<Vec<(u32, u64)>>,
-    /// Edge-triggered sources CRIME holds until software writes a 0 to the
-    /// bit in HARDINT: GBE's four timing lines (16..19), the rendering
-    /// engine's empty/full/idle edges (22..24) and bit 30.
-    latched: Mutex<u64>,
+    /// The interrupt state, apart from `regs`. Every change to it, an input
+    /// driven or a mask written, recomputes the output and hands it to IP2
+    /// under this lock, so two threads cannot deliver it out of order.
+    /// `regs` keeps no copy of INTSTAT, INTMASK or SOFTINT.
+    int: Mutex<IntState>,
     /// The guest's last accesses to the interrupt registers (status, mask,
     /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
     /// control port's `crimelog` (chasing interrupt storms).
@@ -82,15 +106,11 @@ pub struct Crime {
     ust: std::sync::Arc<MaceUst>,
     /// Subtracted from the counter, so a write sets what the next read sees.
     time_base: Mutex<u64>,
-    /// CRIME's one output, to the CPU's IP2 (`connect_output`), the level
-    /// last handed to it, and the lock that makes computing and handing on
-    /// one step. Unlocked, one thread could record "low" while another
-    /// raised IP2, after which every update saw no change and IP2 stayed up
-    /// with nothing behind it: IRIX re-entered its CRIME dispatcher forever
-    /// and the clock interrupt starved (the O2's input stall).
+    /// CRIME's one output, to the CPU's IP2 (`connect_output`). Driven under
+    /// `int`: computed and handed on as one step, a "low" and a "high" from
+    /// two threads cannot cross and leave IP2 up with nothing behind it (the
+    /// O2's input stall, when IRIX re-entered its CRIME dispatcher forever).
     out: std::sync::OnceLock<crate::irq::IrqLine>,
-    out_level: std::sync::atomic::AtomicBool,
-    out_lock: Mutex<()>,
     /// Software asked for a cold reset (CONTROL bit 11); the machine takes
     /// it ([`Crime::take_reset_request`]).
     reset_request: std::sync::atomic::AtomicBool,
@@ -107,14 +127,12 @@ impl Crime {
             regs: Mutex::new(vec![0u64; (CRIME_SIZE / 8) as usize]),
             trace: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
-            latched: Mutex::new(0),
+            int: Mutex::new(IntState::default()),
             irqlog: Mutex::new(std::collections::VecDeque::new()),
             revision: std::sync::atomic::AtomicU64::new(CRIME_REV),
             ust,
             time_base: Mutex::new(0),
             out: std::sync::OnceLock::new(),
-            out_level: std::sync::atomic::AtomicBool::new(false),
-            out_lock: Mutex::new(()),
             reset_request: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -144,49 +162,47 @@ impl Crime {
         self.out.get().is_some()
     }
 
-    /// Hand the output on if it changed. Whoever changes CRIME's state calls
-    /// this after the change, so a caller that finds no change can leave it
-    /// to them; a change is computed and handed on under the lock.
-    pub fn update_output(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        let Some(out) = self.out.get() else { return self.interrupting() };
-        if self.interrupting() == self.out_level.load(Ordering::Acquire) {
-            return self.out_level.load(Ordering::Acquire);
-        }
-        let _held = self.out_lock.lock().unwrap();
-        let level = self.interrupting();
-        if self.out_level.swap(level, Ordering::AcqRel) != level {
+    /// Hand IP2 the output as `s` stands, with `int` held. Returns it.
+    fn drive(&self, s: &IntState) -> bool {
+        let level = s.pending();
+        if let Some(out) = self.out.get() {
             out.set(level);
         }
         level
     }
 
-    /// Raise or lower one of CRIME's interrupt inputs.
-    pub fn set_int(&self, bit: u32, on: bool) {
-        let mut r = self.regs.lock().unwrap();
-        let i = (crime_reg::INTSTAT / 8) as usize;
-        if on {
-            r[i] |= 1u64 << bit;
-        } else {
-            r[i] &= !(1u64 << bit);
-        }
+    /// Hand IP2 the output as it stands (after a snapshot restores the
+    /// state, or a CPU reset re-wires IP2). Returns it.
+    pub fn update_output(&self) -> bool {
+        self.drive(&self.int.lock().unwrap())
     }
 
-    /// Latch an edge-triggered source until software clears it in HARDINT.
-    pub fn latch_int(&self, bit: u32) {
-        *self.latched.lock().unwrap() |= (1u64 << bit) & CRIME_LATCHED_BITS;
+    /// Change the interrupt state and drive IP2 from the result.
+    fn change(&self, f: impl FnOnce(&mut IntState)) {
+        let mut s = self.int.lock().unwrap();
+        f(&mut s);
+        self.drive(&s);
     }
 
     /// INTSTAT: the level sources, the latched ones and the software ones.
     pub(crate) fn intstat(&self) -> u64 {
-        let r = self.regs.lock().unwrap();
-        r[(crime_reg::INTSTAT / 8) as usize] | r[(crime_reg::SOFTINT / 8) as usize] | *self.latched.lock().unwrap()
+        self.int.lock().unwrap().intstat()
     }
 
     /// True when something is pending that the mask lets through.
     pub fn interrupting(&self) -> bool {
-        let mask = self.regs.lock().unwrap()[(crime_reg::INTMASK / 8) as usize];
-        self.intstat() & mask != 0
+        self.int.lock().unwrap().pending()
+    }
+
+    /// The register file as the guest sees it, the interrupt registers
+    /// included: for the monitor and snapshots.
+    fn regs_view(&self) -> Vec<u64> {
+        let mut r = self.regs.lock().unwrap().clone();
+        let s = self.int.lock().unwrap();
+        r[(crime_reg::INTSTAT / 8) as usize] = s.levels;
+        r[(crime_reg::INTMASK / 8) as usize] = s.mask;
+        r[(crime_reg::SOFTINT / 8) as usize] = s.soft;
+        r
     }
 
     /// The raw counter, before the offset a write installs.
@@ -233,7 +249,12 @@ impl Crime {
             // a PROM decide it is running on hardware it does not recognise.
             crime_reg::REVISION => self.revision(),
             crime_reg::INTSTAT => self.intstat(),
-            crime_reg::HARDINT => self.regs.lock().unwrap()[(crime_reg::INTSTAT / 8) as usize] | *self.latched.lock().unwrap(),
+            crime_reg::INTMASK => self.int.lock().unwrap().mask,
+            crime_reg::SOFTINT => self.int.lock().unwrap().soft,
+            crime_reg::HARDINT => {
+                let s = self.int.lock().unwrap();
+                s.levels | s.latched
+            }
             // A free-running microsecond-ish counter. POST loops on this to time
             // out, so a constant would hang it forever.
             crime_reg::TIME => {
@@ -247,9 +268,6 @@ impl Crime {
     fn store(&self, off: u32, val: u64) {
         self.log_irq(true, off, val);
         self.store_inner(off, val);
-        if matches!(off, crime_reg::INTMASK | crime_reg::SOFTINT | crime_reg::HARDINT) {
-            self.update_output();
-        }
     }
 
     /// Whether software has asked for a cold reset since the last call.
@@ -266,15 +284,9 @@ impl Crime {
             }
             // Read-only: the sources set it, not the CPU.
             crime_reg::INTSTAT => return,
-            crime_reg::HARDINT => {
-                let mut l = self.latched.lock().unwrap();
-                *l &= val | !CRIME_LATCHED_BITS;
-                return;
-            }
-            crime_reg::SOFTINT => {
-                self.regs.lock().unwrap()[(off / 8) as usize] = val & 0xf1ff_ffff;
-                return;
-            }
+            crime_reg::HARDINT => return self.change(|s| s.latched &= val | !CRIME_LATCHED_BITS),
+            crime_reg::SOFTINT => return self.change(|s| s.soft = val & 0xf1ff_ffff),
+            crime_reg::INTMASK => return self.change(|s| s.mask = val),
             _ => {}
         }
         if off == crime_reg::TIME {
@@ -301,14 +313,18 @@ impl Crime {
 /// them in HARDINT; the rest follow their level.
 impl crate::irq::InterruptController for Crime {
     fn set_line(&self, line: u32, level: bool) {
-        if (1u64 << line) & CRIME_LATCHED_BITS != 0 {
-            if level {
-                self.latch_int(line);
+        let bit = 1u64 << line;
+        self.change(|s| {
+            if bit & CRIME_LATCHED_BITS != 0 {
+                if level {
+                    s.latched |= bit;
+                }
+            } else if level {
+                s.levels |= bit;
+            } else {
+                s.levels &= !bit;
             }
-        } else {
-            self.set_int(line, level);
-        }
-        self.update_output();
+        });
     }
 }
 
@@ -327,20 +343,21 @@ impl Device for Crime {
         if cmd != "crime" {
             return Err("Command not found".to_string());
         }
-        let reg = |off: u32| self.regs.lock().unwrap()[(off / 8) as usize];
+        let regs = self.regs_view();
+        let reg = |off: u32| regs[(off / 8) as usize];
         match args.first().copied().unwrap_or("status") {
             "status" => {
                 let (stat, mask) = (self.intstat(), reg(crime_reg::INTMASK));
                 writeln!(w, "CRIME revision {:#x}", self.revision()).ok();
                 writeln!(w, "  interrupts: status {stat:#010x} mask {mask:#010x} pending {:#010x} latched {:#010x} soft {:#010x}",
-                    stat & mask, *self.latched.lock().unwrap(), reg(crime_reg::SOFTINT)).ok();
+                    stat & mask, self.int.lock().unwrap().latched, reg(crime_reg::SOFTINT)).ok();
                 writeln!(w, "  control {:#x} time {:#x}", reg(crime_reg::CONTROL), self.load_inner(crime_reg::TIME)).ok();
                 for i in 0..8u32 {
                     writeln!(w, "  bank {i}: ctrl {:#06x}", reg(crime_reg::MEM_BANK_CTRL0 + 8 * i)).ok();
                 }
             }
             "regs" => {
-                for (i, &v) in self.regs.lock().unwrap().iter().enumerate() {
+                for (i, &v) in regs.iter().enumerate() {
                     if v != 0 {
                         writeln!(w, "  {:#06x}: {v:#018x}", i * 8).ok();
                     }
@@ -370,7 +387,7 @@ impl Resettable for Crime {
     /// the revision is the chip's and stays.
     fn power_on(&self) {
         self.regs.lock().unwrap().fill(0);
-        *self.latched.lock().unwrap() = 0;
+        self.change(|s| *s = IntState::default());
         *self.time_base.lock().unwrap() = 0;
         self.irqlog.lock().unwrap().clear();
     }
@@ -382,18 +399,24 @@ impl Resettable for Crime {
 impl Saveable for Crime {
     fn save_state(&self) -> toml::Value {
         let mut t = toml::map::Map::new();
-        t.insert("regs".into(), u64_slice_to_toml(&self.regs.lock().unwrap()));
-        t.insert("latched".into(), hex_u64(*self.latched.lock().unwrap()));
+        t.insert("regs".into(), u64_slice_to_toml(&self.regs_view()));
+        t.insert("latched".into(), hex_u64(self.int.lock().unwrap().latched));
         t.insert("revision".into(), hex_u64(self.revision()));
         t.insert("time_base".into(), hex_u64(*self.time_base.lock().unwrap()));
         toml::Value::Table(t)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        let mut int = IntState { latched: get_field(v, "latched").and_then(toml_u64).unwrap_or(0), ..Default::default() };
         if let Some(r) = get_field(v, "regs") {
-            load_u64_slice(r, &mut self.regs.lock().unwrap());
+            let mut regs = self.regs.lock().unwrap();
+            load_u64_slice(r, &mut regs);
+            let mut take = |off: u32| std::mem::take(&mut regs[(off / 8) as usize]);
+            int.levels = take(crime_reg::INTSTAT);
+            int.mask = take(crime_reg::INTMASK);
+            int.soft = take(crime_reg::SOFTINT);
         }
-        *self.latched.lock().unwrap() = get_field(v, "latched").and_then(toml_u64).unwrap_or(0);
+        *self.int.lock().unwrap() = int;
         if let Some(rev) = get_field(v, "revision").and_then(toml_u64) {
             self.set_revision(rev);
         }

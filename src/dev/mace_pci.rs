@@ -438,9 +438,8 @@ impl Saveable for MacePci {
         let mut t = toml::map::Map::new();
         t.insert("config_addr".into(), hex_u32(*self.config_addr.lock().unwrap()));
         t.insert("regs".into(), u32_slice_to_toml(&*self.regs.lock().unwrap()));
-        let levels = self.irq.levels.lock().unwrap();
+        let levels = *self.irq.levels.lock().unwrap();
         t.insert("pins".into(), toml::Value::Array(levels.iter().map(|&b| toml::Value::Boolean(b)).collect()));
-        drop(levels);
         let mut slots = toml::map::Map::new();
         for (n, s) in self.slots.lock().unwrap().iter() {
             slots.insert(n.to_string(), s.dev.config().save_state());

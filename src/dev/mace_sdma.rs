@@ -272,13 +272,17 @@ impl MaceSerialDma {
     /// accesses (the TCP console, a script's `feed`), and any transmit work
     /// left over.
     pub fn poll(&self, io: &SdmaIo) {
-        let mut st = self.ports.lock().unwrap();
-        for (p, port) in st.iter_mut().enumerate() {
-            if port.owned {
-                Self::tx_run(p, port, io);
-                Self::rx_run(p, port, io);
+        {
+            let mut st = self.ports.lock().unwrap();
+            for (p, port) in st.iter_mut().enumerate() {
+                if port.owned {
+                    Self::tx_run(p, port, io);
+                    Self::rx_run(p, port, io);
+                }
             }
         }
+        // Blocks moved: thresholds and overruns may have changed.
+        self.update_irq();
     }
 
     /// Send every block between the read and write pointers.

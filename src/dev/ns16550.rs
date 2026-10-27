@@ -114,14 +114,20 @@ impl Com16550 {
     /// driver polling for data sees it at once.
     pub fn pump(&self) {
         let backend = self.backend.lock().unwrap().clone();
+        let mut got = false;
         while let Ok(b) = backend.recv_byte() {
             self.input.lock().unwrap().push_back(b);
+            got = true;
+        }
+        if got {
+            self.update_irq();
         }
     }
 
     /// Queue characters for the guest to read.
     pub fn feed(&self, bytes: &[u8]) {
         self.input.lock().unwrap().extend(bytes.iter().copied());
+        self.update_irq();
     }
 
     /// Characters still unread by the guest.
@@ -368,6 +374,20 @@ impl Resettable for Com16550 {
     }
 }
 
+impl Com16550 {
+    fn access_read(&self, addr: u64) -> u8 {
+        let v = self.read_reg((addr | 7) as u32);
+        self.update_irq();
+        v
+    }
+
+    fn access_write(&self, addr: u64, val: u8) -> u32 {
+        self.write_reg((addr | 7) as u32, val);
+        self.update_irq();
+        BUS_OK
+    }
+}
+
 impl BusDevice for Com16550 {
     // Every width must be answered. An unimplemented one falls through to the
     // trait default, which reports a bus error — and a DBE inside POST looks
@@ -375,14 +395,17 @@ impl BusDevice for Com16550 {
     // The UART sits on MACE's 8-bit ISA bus, so its byte answers on any lane
     // of the doubleword: IRIX and the BSDs use +7, Linux's 8250 driver +0
     // (mapbase 0x1f390000, regshift 8).
-    fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.read_reg((addr | 7) as u32)) }
-    fn read16(&self, addr: u64) -> BusRead16 { BusRead16::ok(self.read_reg((addr | 7) as u32) as u16) }
-    fn write16(&self, addr: u64, val: u16) -> u32 { self.write_reg((addr | 7) as u32, val as u8); BUS_OK }
-    fn write8(&self, addr: u64, val: u8) -> u32 { self.write_reg((addr | 7) as u32, val); BUS_OK }
-    fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.read_reg((addr | 7) as u32) as u32) }
-    fn write32(&self, addr: u64, val: u32) -> u32 { self.write_reg((addr | 7) as u32, val as u8); BUS_OK }
-    fn read64(&self, addr: u64) -> BusRead64 { BusRead64::ok(self.read_reg((addr | 7) as u32) as u64) }
-    fn write64(&self, addr: u64, val: u64) -> u32 { self.write_reg((addr | 7) as u32, val as u8); BUS_OK }
+    // Reading the data or IIR register and writing IER can each move the
+    // interrupt, so every access drives it again: nothing else does on an
+    // access (the service thread covers input arriving from the host).
+    fn read8(&self, addr: u64) -> BusRead8 { BusRead8::ok(self.access_read(addr)) }
+    fn read16(&self, addr: u64) -> BusRead16 { BusRead16::ok(self.access_read(addr) as u16) }
+    fn write16(&self, addr: u64, val: u16) -> u32 { self.access_write(addr, val as u8) }
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.access_write(addr, val) }
+    fn read32(&self, addr: u64) -> BusRead32 { BusRead32::ok(self.access_read(addr) as u32) }
+    fn write32(&self, addr: u64, val: u32) -> u32 { self.access_write(addr, val as u8) }
+    fn read64(&self, addr: u64) -> BusRead64 { BusRead64::ok(self.access_read(addr) as u64) }
+    fn write64(&self, addr: u64, val: u64) -> u32 { self.access_write(addr, val as u8) }
 }
 
 #[cfg(test)]

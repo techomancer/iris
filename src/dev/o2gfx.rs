@@ -129,15 +129,36 @@ pub struct Gbe {
     /// The control port's `pixel X Y`: the point to describe on the next
     /// frame, and what the scan-out found there.
     pub probe: Mutex<(Option<(usize, usize)>, String)>,
+    /// The four vertical-timing interrupts, into CRIME's latched inputs
+    /// 16..19 ([`Self::connect_irq`]).
+    irq: std::sync::OnceLock<[crate::irq::IrqLine; 4]>,
 }
 
 impl Gbe {
+    /// Wire the vertical-timing interrupts into CRIME.
+    pub fn connect_irq(&self, crime: Arc<dyn crate::irq::InterruptController>) {
+        let _ = self.irq.set(std::array::from_fn(|n| crate::irq::IrqLine::new(crime.clone(), 16 + n as u32)));
+    }
+
+    /// Raise the timing interrupts whose line the beam has crossed since the
+    /// last call. The beam runs on guest time, so the machine's service
+    /// thread calls this as its clock.
+    pub fn service(&self) {
+        let Some(lines) = self.irq.get() else { return };
+        let crossed = self.vt_crossings();
+        for (n, line) in lines.iter().enumerate() {
+            if crossed & (1 << n) != 0 {
+                line.set(true);
+            }
+        }
+    }
+
     pub fn new(now: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         let mut r = vec![0u32; GBE_WORDS];
         // GPIO pins unconfigured (inputs), chip id 1.
         r[(CTRLSTAT / 4) as usize] = 0x03ff_ffc1;
         r[(VT_XY / 4) as usize] = VT_FREEZE;
-        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())) }
+        Self { s: Mutex::new(GbeState { r, t0: 0, reads: 0, seen_dots: 0, pending: Vec::new() }), hot: Mutex::new(BTreeMap::new()), now, cpu_clock: std::sync::OnceLock::new(), probe: Mutex::new((None, String::new())), irq: std::sync::OnceLock::new() }
     }
 
     /// Run the beam on the CPU's instruction count at `mhz` rather than on

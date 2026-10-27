@@ -374,6 +374,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [jitv2_performance_analysis.md](plans/jitv2_performance_analysis.md) | plan | jitv2 performance — where to spend effort next |
 | [net-stack.md](plans/net-stack.md) | plan | The NAT network stack: analysis and redesign plan |
 | [pci-dma-port.md](plans/pci-dma-port.md) | plan | PCI bus masters: one `PciDma` trait, shared on the O2, per device on the Octane's Bridge; Bridge/Xbridge DMA, PIO, interrupt and swap facts; step 1 done |
+| [o2-memory-and-locks.md](plans/o2-memory-and-locks.md) | plan | O2 disk I/O gap vs Indy: interrupt re-drive on every access (~205 locks), PCI BAR decode locks, debug logs on hot paths, RAM onto Physical/SparseDeviceMap/PpMemory like the Indy, remaining locks; hardware facts on memory masters |
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |

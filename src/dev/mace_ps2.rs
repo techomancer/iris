@@ -1,7 +1,8 @@
 //! MACE's two PS/2 ports, around the shared `Ps2Controller`.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 use std::io::Write;
 
@@ -16,7 +17,18 @@ use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, Device
 /// still drains its transmit register whether or not a keyboard is listening,
 /// and the PROM waits for exactly that. Reporting zero makes every probe take
 /// its full 20834-iteration timeout instead of returning at once.
-pub struct MacePs2 {
+pub struct MacePs2(Arc<Ps2Ports>);
+
+impl std::ops::Deref for MacePs2 {
+    type Target = Ps2Ports;
+    fn deref(&self) -> &Ps2Ports {
+        &self.0
+    }
+}
+
+/// The ports themselves, shared with [`Ps2Wake`] so the device model's
+/// "byte waiting" line can reach them.
+pub struct Ps2Ports {
     ports: [Mutex<Ps2Port>; 2],
     /// The keyboard (port 0) and, when `mouse` is set, the mouse (port 1),
     /// as one PS/2 device model. None: nothing plugged in, which is how the
@@ -59,22 +71,70 @@ pub mod ps2_ctl {
     pub const RESET: u64 = 1 << 5;
 }
 
+thread_local! {
+    /// Set while this thread holds a port and may take bytes from the device
+    /// model, whose queue then drives its line again: [`Ps2Wake`] must not
+    /// take the port a second time on the same thread, and needs not, since
+    /// the holder drives the bits after.
+    static IN_PORT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as inside a port until dropped.
+struct InPort(bool);
+
+impl InPort {
+    fn enter() -> Self {
+        InPort(IN_PORT.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for InPort {
+    fn drop(&mut self) {
+        IN_PORT.with(|c| c.set(self.0));
+    }
+}
+
+/// The device model's interrupt, "a byte is waiting", as the Indy's IOC
+/// takes it: a key or mouse movement from the host latches into an empty
+/// port and raises its bits at once, rather than when something next polls.
+struct Ps2Wake(Weak<Ps2Ports>);
+
+impl crate::irq::InterruptController for Ps2Wake {
+    fn set_line(&self, _line: u32, level: bool) {
+        if !level || IN_PORT.with(|c| c.get()) {
+            return;
+        }
+        if let Some(ports) = self.0.upgrade() {
+            ports.update_irq();
+        }
+    }
+}
+
 impl MacePs2 {
     pub fn new() -> Self {
-        Self {
-            ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())],
-            dev: None,
-            mouse: false,
-            traffic: Mutex::new(std::collections::VecDeque::new()),
-            irq: std::sync::OnceLock::new(),
-        }
+        MacePs2(Arc::new(Ps2Ports::empty(None, false)))
     }
 
     /// With a keyboard on port 0 (and a mouse on port 1 if `mouse`).
     pub fn with_devices(mouse: bool) -> Self {
-        let dev = std::sync::Arc::new(crate::dev::ps2::Ps2Controller::new(None));
-        crate::traits::Device::start(&*dev);
-        Self { dev: Some(dev), mouse, ..Self::new() }
+        MacePs2(Arc::new_cyclic(|me: &Weak<Ps2Ports>| {
+            let wake = crate::irq::IrqLine::new(Arc::new(Ps2Wake(me.clone())), 0);
+            let dev = Arc::new(crate::dev::ps2::Ps2Controller::new(Some(wake)));
+            crate::traits::Device::start(&*dev);
+            Ps2Ports::empty(Some(dev), mouse)
+        }))
+    }
+}
+
+impl Ps2Ports {
+    fn empty(dev: Option<Arc<crate::dev::ps2::Ps2Controller>>, mouse: bool) -> Self {
+        Self {
+            ports: [Mutex::new(Ps2Port::default()), Mutex::new(Ps2Port::default())],
+            dev,
+            mouse,
+            traffic: Mutex::new(std::collections::VecDeque::new()),
+            irq: std::sync::OnceLock::new(),
+        }
     }
 
     /// The device model, for the host side to push keys into.
@@ -124,6 +184,7 @@ impl MacePs2 {
 
     pub fn read(&self, addr: u32) -> u64 {
         let (p, reg) = Self::decode(addr);
+        let _in = InPort::enter();
         let mut port = self.ports[p].lock().unwrap();
         self.latch(p, &mut port);
         match reg {
@@ -153,6 +214,7 @@ impl MacePs2 {
 
     pub fn write(&self, addr: u32, val: u64) {
         let (p, reg) = Self::decode(addr);
+        let _in = InPort::enter();
         let mut port = self.ports[p].lock().unwrap();
         match reg {
             0 => {
@@ -218,8 +280,8 @@ impl MacePs2 {
 
     /// Drive the ports' status bits. A level left high after the handler
     /// drained the port reads as a spurious interrupt to OpenBSD, so this
-    /// follows every register access, and the service loop's poll of what
-    /// the host has typed.
+    /// follows every register access, and every byte the host sends
+    /// ([`Ps2Wake`]).
     pub fn update_irq(&self) {
         let (Some(lines), Some(_)) = (self.irq.get(), self.dev.as_ref()) else { return };
         let bits = self.isa_bits();
@@ -229,6 +291,7 @@ impl MacePs2 {
     }
 
     pub fn isa_bits(&self) -> u64 {
+        let _in = InPort::enter();
         let mut bits = 0;
         for p in 0..2 {
             let mut port = self.ports[p].lock().unwrap();

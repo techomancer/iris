@@ -73,6 +73,32 @@ fn a_waiting_byte_raises_the_keyboard_interrupt_only_when_enabled() {
     assert_eq!(k.isa_bits(), 0);
 }
 
+/// A key from the host raises the keyboard's ISA bits as it arrives, the
+/// way the Indy's IOC hears its PS/2 controller: nothing polls the port.
+#[test]
+fn a_key_from_the_host_interrupts_without_a_poll() {
+    #[derive(Default)]
+    struct Bits(std::sync::Mutex<u64>);
+    impl crate::irq::InterruptController for Bits {
+        fn set_line(&self, line: u32, level: bool) {
+            let mut b = self.0.lock().unwrap();
+            if level { *b |= 1 << line } else { *b &= !(1 << line) }
+        }
+    }
+    let bits = std::sync::Arc::new(Bits::default());
+    let k = MacePs2::with_devices(false);
+    k.connect_irq(bits.clone());
+    ps2_send(&k, 0, 0xf4); // enable scanning
+    assert_eq!(ps2_recv(&k, 0), Some(0xfa));
+    k.write(MACE_PS2 + 0x10, ps2_ctl::TX_ENABLE | ps2_ctl::CLKEN | ps2_ctl::RX_INT);
+    k.update_irq();
+    assert_eq!(*bits.0.lock().unwrap() & (1 << 9), 0, "nothing waiting yet");
+    k.devices().unwrap().push_kb(winit::keyboard::KeyCode::KeyA, true);
+    assert_eq!(*bits.0.lock().unwrap() & ((1 << 9) | (1 << 10)), (1 << 9) | (1 << 10),
+        "the make code latched and raised the port's request at once");
+    assert!(ps2_recv(&k, 0).is_some());
+}
+
 #[test]
 fn crime_is_a_64_bit_register_file() {
     let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
@@ -90,8 +116,8 @@ fn crime_save_load_round_trip() {
     let src = Crime::new(std::sync::Arc::new(MaceUst::new()));
     src.write64((CRIME_BASE + crime_reg::INTMASK) as u64, 0x0000_ff00);
     src.write64((CRIME_BASE + crime_reg::SOFTINT) as u64, 0x0000_0100);
-    src.set_int(9, true);
-    src.latch_int(16);
+    crate::irq::InterruptController::set_line(&src, 9, true);
+    crate::irq::InterruptController::set_line(&src, 16, true);
     src.write64((CRIME_BASE + crime_reg::TIME) as u64, 12345);
     src.set_revision(0xa1);
     let v1 = src.save_state();

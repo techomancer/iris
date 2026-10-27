@@ -547,6 +547,8 @@ impl MaceAudio {
             }
         }
         drop(st);
+        // The pointers moved: a ring may have crossed its threshold.
+        self.update_irq();
         if tracing() {
             let mut last = self.last_report.lock();
             if last.is_none_or(|t| t.elapsed().as_secs() >= 1) {
@@ -715,10 +717,16 @@ impl crate::traits::BusDevice for MaceAudio {
         crate::traits::BusRead32::ok(if addr & 4 == 0 { (v >> 32) as u32 } else { v as u32 })
     }
     fn read64(&self, addr: u64) -> crate::traits::BusRead64 { crate::traits::BusRead64::ok(self.read(addr as u32)) }
-    fn write8(&self, addr: u64, val: u8) -> u32 { self.write(addr as u32, val as u64); crate::traits::BUS_OK }
-    fn write16(&self, addr: u64, val: u16) -> u32 { self.write(addr as u32, val as u64); crate::traits::BUS_OK }
-    fn write32(&self, addr: u64, val: u32) -> u32 { self.write(addr as u32, val as u64); crate::traits::BUS_OK }
-    fn write64(&self, addr: u64, val: u64) -> u32 { self.write(addr as u32, val); crate::traits::BUS_OK }
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.write64(addr, val as u64) }
+    fn write16(&self, addr: u64, val: u16) -> u32 { self.write64(addr, val as u64) }
+    fn write32(&self, addr: u64, val: u32) -> u32 { self.write64(addr, val as u64) }
+    /// A write can start, stop or acknowledge a channel, so the ISA bits
+    /// are driven again after it.
+    fn write64(&self, addr: u64, val: u64) -> u32 {
+        self.write(addr as u32, val);
+        self.update_irq();
+        crate::traits::BUS_OK
+    }
 }
 
 impl crate::traits::Device for MaceAudio {

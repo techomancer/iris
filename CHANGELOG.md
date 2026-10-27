@@ -135,6 +135,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   data and does the disk I/O; the CPU's register write only queues the tag.
   Before, a whole transfer ran inside that write and the guest stopped for
   it. `scsi regs` reports the worker.
+- **O2 interrupts are delivered like the Indy's.** Devices drive their
+  line when an access, a host event or a timer tick changes it, through
+  MACE's ISA status or the PCI router into CRIME and on to IP2, each
+  controller under one lock. Before, every CRIME register read and MACE
+  write re-drove every MACE device's lines (about 200 lock operations), and
+  the service thread did it again 10,000 times a second. IRIX `diskperf -D`
+  gains 30-45% at every request size (4 KiB: 1.46 to 2.11 MB/s writes;
+  4 MiB: 14.0 to 18.0), and boot to login is about 10% faster. A key typed
+  on the host now interrupts as it arrives.
 - **O2 memory has no lock.** Devices and the CPU's slow path reach RAM
   without taking a mutex, as the hardware's masters do; PCI DMA decodes
   once per page instead of once per byte. A disk transfer on the SCSI

@@ -113,15 +113,6 @@ impl Mace {
         }
     }
 
-    /// The ISA interrupts whose state moves from outside the guest (typed
-    /// keys and console input, audio buffers draining).
-    pub fn update_lines(&self) {
-        self.com0.update_irq();
-        self.sdma.update_irq();
-        self.ps2.update_irq();
-        self.audio.update_irq();
-    }
-
     /// The devices answering the monitor, as HPC3 passes its children's
     /// commands through on the Indigo2.
     pub fn devices(&self) -> Vec<&dyn crate::traits::Device> {

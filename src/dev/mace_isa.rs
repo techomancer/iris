@@ -114,21 +114,25 @@ impl MaceIsa {
 
     /// The serial DMA engine's ports and their status bits, before the mask.
     pub fn set_serial_dma(&self, owned: [bool; 2], bits: u64) {
-        self.st.lock().unwrap().serial_dma = (owned, bits);
-        self.update();
+        let mut st = self.st.lock().unwrap();
+        st.serial_dma = (owned, bits);
+        self.drive(&st);
     }
 
-    /// Recompute the status and drive the cascade into CRIME. The
-    /// miscellaneous group reaches CRIME only once a device drives one of
-    /// its bits: a serial-console O2 has no PS/2 behind it, and software's
-    /// own writes there never interrupted.
     fn update(&self) {
-        let (s, mask, misc_driven) = {
-            let st = self.st.lock().unwrap();
-            (st.status(), st.mask, st.driven & 0xff00 != 0)
-        };
+        self.drive(&self.st.lock().unwrap());
+    }
+
+    /// Drive the cascade into CRIME from `st`, with `st` locked: two threads
+    /// computing levels under the lock and driving after it could deliver
+    /// them out of order and leave a stale one standing. The miscellaneous
+    /// group reaches CRIME only once a device drives one of its bits: a
+    /// serial-console O2 has no PS/2 behind it, and software's own writes
+    /// there never interrupted.
+    fn drive(&self, st: &State) {
+        let (s, mask) = (st.status(), st.mask);
         self.crime[0].set(s & 0xffff_0000 != 0);
-        if misc_driven {
+        if st.driven & 0xff00 != 0 {
             self.crime[1].set(s & mask & 0xff00 != 0);
         }
         self.crime[2].set(s & mask & 0xff != 0);
@@ -144,14 +148,12 @@ impl MaceIsa {
     /// Every width writes the whole register, as MACE's other cells take
     /// them.
     fn put(&self, addr: u32, val: u64) {
-        {
-            let mut st = self.st.lock().unwrap();
-            match addr & !7 {
-                MACE_ISA_INT_STATUS => st.guest = val,
-                _ => st.mask = val,
-            }
+        let mut st = self.st.lock().unwrap();
+        match addr & !7 {
+            MACE_ISA_INT_STATUS => st.guest = val,
+            _ => st.mask = val,
         }
-        self.update();
+        self.drive(&st);
     }
 }
 
@@ -159,17 +161,15 @@ impl MaceIsa {
 /// the console UART's interrupt while it is driven by PIO.
 impl InterruptController for MaceIsa {
     fn set_line(&self, line: u32, level: bool) {
-        {
-            let mut st = self.st.lock().unwrap();
-            if line == ISA_SERIAL0_PIO {
-                st.serial0_pio = level;
-            } else {
-                let bit = 1u64 << line;
-                st.driven |= bit;
-                if level { st.levels |= bit } else { st.levels &= !bit }
-            }
+        let mut st = self.st.lock().unwrap();
+        if line == ISA_SERIAL0_PIO {
+            st.serial0_pio = level;
+        } else {
+            let bit = 1u64 << line;
+            st.driven |= bit;
+            if level { st.levels |= bit } else { st.levels &= !bit }
         }
-        self.update();
+        self.drive(&st);
     }
 }
 
