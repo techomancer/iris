@@ -257,6 +257,7 @@ through its event channel. `HACKING.md` lists the thread names.
 ## Chips
 
 - [The IOC3 and its children](dev/ioc3.md)
+- [IOC3 Ethernet](dev/ioc3-ethernet.md)
 - [IOC3 PS/2 keyboard and mouse](dev/ioc3-ps2.md)
 - [QLogic ISP1040 SCSI controllers](dev/isp1040.md)
 

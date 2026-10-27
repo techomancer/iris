@@ -12,7 +12,10 @@ console, or loops. The bus is `Ip30Bus` (`src/ip30.rs`), the machine's
 monitor's `ip30` command (memory, the Bridge, the graphics link, refused
 Crossbow accesses, unmapped accesses) and `heart unsupported` show what the
 PROM touched that the model does not answer. `IRIS_IP30_TRACE=1` prints the
-accesses nothing answers as they happen.
+accesses nothing answers as they happen. `docs/dev/ioc3-ethernet.md` is
+the Ethernet from the drivers' side, with where the PROM stalled before the
+model came; `ip30-promdrive.py` here drives the PROM's serial console to the
+command monitor and runs commands.
 
 **What the PROM insists on.**
 
