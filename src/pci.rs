@@ -139,6 +139,25 @@ impl PciConfig {
         (self.regs.lock().unwrap()[15] >> 8) as u8
     }
 
+    /// The windows this function decodes: (space, BAR, base, size) for
+    /// each BAR that has been assigned an address in a space the command
+    /// register enables, in BAR order. A bridge caches these and rebuilds
+    /// them after a configuration write.
+    pub fn windows(&self) -> Vec<(Space, usize, u32, u32)> {
+        let cmd = self.command();
+        (0..6)
+            .filter_map(|i| {
+                let (space, size) = match self.bars[i] {
+                    Bar::Io(n) if cmd & PCI_COMMAND_IO != 0 => (Space::Io, n),
+                    Bar::Mem(n) if cmd & PCI_COMMAND_MEMORY != 0 => (Space::Mem, n),
+                    _ => return None,
+                };
+                let base = self.bar_base(i);
+                (base != 0).then_some((space, i, base, size))
+            })
+            .collect()
+    }
+
     /// The BAR decoding `addr` in `space`, and the offset within it: only
     /// once the command register enables that space, and only for a BAR
     /// that has been assigned an address.

@@ -1,7 +1,7 @@
 # O2: memory on the established path, and locks only where the hardware has them
 
-Status: plan, 2026-10-27. Phase 1 implemented (uncommitted as of
-writing; see its own status line); the rest is plan. Follows `d80ea42e` (O2Memory lock-free) and `5b4992af`
+Status: plan, 2026-10-27. Phases 1 and 2 done (see their status lines);
+the rest is plan. Follows `d80ea42e` (O2Memory lock-free) and `5b4992af`
 (AIC-7880 worker thread). Related: [pci-dma-port.md](pci-dma-port.md).
 
 ## Why
@@ -90,6 +90,13 @@ with a keyboard and mouse attached (`ip32.rs:435-483`, `mace.rs:118`).
 Measure: diskperf ×3 before/after, perf profile, boot-to-telnet time.
 
 ## Phase 2 — PCI register access
+
+Status: items 1-3 done 2026-10-27 (decode table in `MacePci`, rebuilt on
+attach, config writes and snapshot load; AIC `read`/`write` lock once;
+`PciConfig` locked only for config cycles and rebuilds). diskperf showed
+no measurable change: the pair of runs was noisier than phase 1's (the
+phase-1 build itself fell from 2.11 to 1.19 MB/s at 4 KiB), so the gain,
+if any, is below the noise. Profile before claiming one.
 
 An AIC BAR access walks 5 range checks in `Mace`, takes `slots` (BTreeMap)
 plus ~7–14 `PciConfig` locks to find the BAR, clones an `Arc`, then

@@ -3,7 +3,8 @@
 //! byte lanes on the way, since PCI is little-endian and the CPU is not), and
 //! wires each slot's interrupt pin to its CRIME input.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::irq::{InterruptController, IrqLine};
 use crate::dev::crime_mem::O2Memory;
@@ -203,6 +204,41 @@ struct Slot {
     touched: Mutex<Vec<(u8, bool)>>,
 }
 
+/// The most BAR windows open at once (two AIC-7880s open two each).
+const MAX_WINDOWS: usize = 16;
+
+/// A BAR window as the bridge's decode table holds it, packed into one
+/// word: base (bits 0-31), log2 of the size (32-37), I/O space (38), slot
+/// (40-44), BAR (48-50).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Window {
+    space: Space,
+    slot: u8,
+    bar: usize,
+    base: u32,
+    size: u32,
+}
+
+impl Window {
+    fn pack(self) -> u64 {
+        self.base as u64
+            | (self.size.trailing_zeros() as u64) << 32
+            | ((self.space == Space::Io) as u64) << 38
+            | (self.slot as u64) << 40
+            | (self.bar as u64) << 48
+    }
+
+    fn unpack(w: u64) -> Self {
+        Self {
+            space: if w & (1 << 38) != 0 { Space::Io } else { Space::Mem },
+            slot: ((w >> 40) & 0x1f) as u8,
+            bar: ((w >> 48) & 7) as usize,
+            base: w as u32,
+            size: 1u32 << ((w >> 32) & 0x3f),
+        }
+    }
+}
+
 pub struct MacePci {
     config_addr: Mutex<u32>,
     regs: Mutex<[u32; (MACEPCI_SIZE / 4) as usize]>,
@@ -210,6 +246,16 @@ pub struct MacePci {
     probed: Mutex<Vec<u32>>,
     /// Functions by device number on bus 0.
     slots: Mutex<std::collections::BTreeMap<u8, Arc<Slot>>>,
+    /// The function in each slot, for the CPU's window accesses, which
+    /// look it up without a lock.
+    funcs: [OnceLock<Arc<dyn PciBusDevice>>; 32],
+    /// The BAR windows the functions decode, rebuilt from their headers
+    /// after every configuration write. A function's BAR comparators are
+    /// its own registers on the bus, not anything the bridge locks, so
+    /// window accesses read the table without one; configuration writes
+    /// and window accesses both come from the CPU.
+    windows: [AtomicU64; MAX_WINDOWS],
+    nwindows: AtomicUsize,
     /// The slots' interrupt pins, routed to CRIME.
     irq: Arc<PciIrqRouter>,
     /// Host memory, for the functions that master the bus.
@@ -229,6 +275,9 @@ impl MacePci {
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
             probed: Mutex::new(Vec::new()),
             slots: Mutex::new(std::collections::BTreeMap::new()),
+            funcs: std::array::from_fn(|_| OnceLock::new()),
+            windows: std::array::from_fn(|_| AtomicU64::new(0)),
+            nwindows: AtomicUsize::new(0),
             irq: Arc::new(PciIrqRouter { intc, route, levels: Mutex::new([false; PCI_PINS]) }),
             dma: Arc::new(HostMemory::new(ram)),
         }
@@ -242,7 +291,27 @@ impl MacePci {
         if (1..=4).contains(&pin) {
             dev.connect_interrupt(IrqLine::new(self.irq.clone(), PciIrqRouter::line(slot, pin)));
         }
-        self.slots.lock().unwrap().insert(slot, Arc::new(Slot { name, dev, touched: Mutex::new(Vec::new()) }));
+        assert!(self.funcs[slot as usize].set(dev.clone()).is_ok(), "pci: slot {slot} is taken");
+        let mut slots = self.slots.lock().unwrap();
+        slots.insert(slot, Arc::new(Slot { name, dev, touched: Mutex::new(Vec::new()) }));
+        self.rebuild_windows(&slots);
+    }
+
+    /// Rebuild the decode table from the functions' headers, slot by slot
+    /// and BAR by BAR, the order in which an overlap resolves.
+    fn rebuild_windows(&self, slots: &std::collections::BTreeMap<u8, Arc<Slot>>) {
+        let mut n = 0;
+        for (&slot, s) in slots {
+            for (space, bar, base, size) in s.dev.config().windows() {
+                if n == MAX_WINDOWS {
+                    log::warn!("pci: more than {MAX_WINDOWS} BAR windows open; slot {slot} BAR {bar} ignored");
+                    continue;
+                }
+                self.windows[n].store(Window { space, slot, bar, base, size }.pack(), Ordering::Relaxed);
+                n += 1;
+            }
+        }
+        self.nwindows.store(n, Ordering::Release);
     }
 
     /// The function in a slot: its name and the registers the guest touched.
@@ -289,16 +358,21 @@ impl MacePci {
 
     /// The function decoding a PCI memory address: it, the BAR and the
     /// offset within it.
-    fn mem_target(&self, space: Space, pci_addr: u32) -> Option<(Arc<dyn PciBusDevice>, usize, u32)> {
-        self.slots.lock().unwrap().values().find_map(|s| {
-            let (bar, off) = s.dev.config().decode(space, pci_addr)?;
-            Some((s.dev.clone(), bar, off))
+    fn mem_target(&self, space: Space, pci_addr: u32) -> Option<(&Arc<dyn PciBusDevice>, usize, u32)> {
+        let n = self.nwindows.load(Ordering::Acquire);
+        self.windows[..n].iter().find_map(|w| {
+            let w = Window::unpack(w.load(Ordering::Relaxed));
+            let off = pci_addr.wrapping_sub(w.base);
+            if w.space != space || off >= w.size {
+                return None;
+            }
+            Some((self.funcs[w.slot as usize].get()?, w.bar, off))
         })
     }
 
     /// The function and BAR a CPU address in a window reaches, in whichever
     /// space that window opens onto.
-    fn window_target(&self, addr: u32) -> Option<(Arc<dyn PciBusDevice>, usize, u32)> {
+    fn window_target(&self, addr: u32) -> Option<(&Arc<dyn PciBusDevice>, usize, u32)> {
         if Self::in_io_window(addr) {
             return self.mem_target(Space::Io, addr - PCI_IO_BASE);
         }
@@ -410,6 +484,7 @@ impl BusDevice for MacePci {
                 if let Some((s, reg)) = self.selected() {
                     s.note(reg, true);
                     s.dev.config().write(reg, val);
+                    self.rebuild_windows(&self.slots.lock().unwrap());
                 }
             }
             _ => self.regs.lock().unwrap()[(off / 4) as usize] = val,
@@ -460,6 +535,7 @@ impl Saveable for MacePci {
                     .ok_or_else(|| format!("pci: saved state has slot {n}, which is empty here"))?;
                 s.dev.config().load_state(cfg)?;
             }
+            self.rebuild_windows(&ours);
         }
         if let Some(toml::Value::Array(pins)) = get_field(v, "pins") {
             for (line, level) in pins.iter().enumerate().take(PCI_PINS) {

@@ -144,6 +144,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   gains 30-45% at every request size (4 KiB: 1.46 to 2.11 MB/s writes;
   4 MiB: 14.0 to 18.0), and boot to login is about 10% faster. A key typed
   on the host now interrupts as it arrives.
+- **O2 PCI register accesses take no bridge locks.** MACE's bridge keeps a
+  table of the functions' open BAR windows, rebuilt after each
+  configuration write, and a CPU access reads it without locking; the
+  AIC-7880 locks its state once per access rather than once per byte.
 - **O2 memory has no lock.** Devices and the CPU's slow path reach RAM
   without taking a mutex, as the hardware's masters do; PCI DMA decodes
   once per page instead of once per byte. A disk transfer on the SCSI

@@ -1424,8 +1424,7 @@ impl Aic7880 {
         (st.regs[reg::SCBPTR as usize] as usize) % SCB_COUNT
     }
 
-    fn read8(&self, off: u32) -> u8 {
-        let mut st = self.st.lock();
+    fn read8_locked(st: &mut State, off: u32) -> u8 {
         match off {
             reg::INTSTAT => st.intstat,
             reg::SSTAT0 => st.sstat0,
@@ -1447,36 +1446,28 @@ impl Aic7880 {
             reg::SEQADDR0 => st.seqaddr as u8,
             reg::SEQADDR1 => (st.seqaddr >> 8) as u8,
             reg::SCBARRAY_FIRST..=reg::SCBARRAY_LAST => {
-                let i = Self::scb_index(&st);
+                let i = Self::scb_index(st);
                 st.scb[i][(off - reg::SCBARRAY_FIRST) as usize]
             }
             _ => st.regs[off as usize],
         }
     }
 
-    fn write8(&self, off: u32, val: u8) {
-        // SCSIRSTO: the controller drives a SCSI bus reset, and every device
-        // returns to its power-on state. What that is for a CD-ROM depends on
-        // whose drive it is: an SGI drive comes up in 512-byte blocks, which
-        // SGI's own driver (the HIM, in the PROM and in IRIX) relies on --
-        // IRIX resets the bus when it attaches and never sends MODE SELECT
-        // again, then reads 512-byte sectors. The BSDs' driver expects the
-        // common 2048 after its reset (the PROM had left 512 behind).
-        if off == reg::SCSISEQ && val & 0x01 != 0 {
-            let sgi = Self::him(&self.st.lock());
-            for d in self.targets.lock().unwrap().iter_mut().flatten() {
-                if sgi && d.is_cdrom() {
-                    d.set_logical_block_size(512);
-                } else {
-                    d.power_on_block_size();
-                }
+    /// SCSIRSTO: the controller drives a SCSI bus reset, and every device
+    /// returns to its power-on state. What that is for a CD-ROM depends on
+    /// whose drive it is: an SGI drive comes up in 512-byte blocks, which
+    /// SGI's own driver (the HIM, in the PROM and in IRIX) relies on --
+    /// IRIX resets the bus when it attaches and never sends MODE SELECT
+    /// again, then reads 512-byte sectors. The BSDs' driver expects the
+    /// common 2048 after its reset (the PROM had left 512 behind).
+    fn reset_targets(&self) {
+        let sgi = Self::him(&self.st.lock());
+        for d in self.targets.lock().unwrap().iter_mut().flatten() {
+            if sgi && d.is_cdrom() {
+                d.set_logical_block_size(512);
+            } else {
+                d.power_on_block_size();
             }
-        }
-        let mut st = self.st.lock();
-        let kick = self.write8_locked(&mut st, off, val);
-        drop(st);
-        if kick {
-            self.kick();
         }
     }
 
@@ -1620,23 +1611,34 @@ impl Aic7880 {
 }
 
 impl Aic7880 {
-    /// A register access of `width` bytes at `off`.
+    /// A register access of `width` bytes at `off`, as one bus cycle: the
+    /// state is locked once for all of its bytes.
     pub fn read(&self, off: u32, width: usize) -> u32 {
         // Everything here is byte-wide; a wider access reads consecutive
         // registers, most significant first, the way the bus presents them.
+        let mut st = self.st.lock();
         let mut v = 0u32;
         for i in 0..width as u32 {
-            v = (v << 8) | self.read8(off + i) as u32;
+            v = (v << 8) | Self::read8_locked(&mut st, off + i) as u32;
         }
         v
     }
 
     pub fn write(&self, off: u32, val: u32, width: usize) {
-        for i in 0..width as u32 {
-            let shift = 8 * (width as u32 - 1 - i);
-            self.write8(off + i, (val >> shift) as u8);
+        let byte = |i: u32| (val >> (8 * (width as u32 - 1 - i))) as u8;
+        if (0..width as u32).any(|i| off + i == reg::SCSISEQ && byte(i) & 0x01 != 0) {
+            self.reset_targets();
         }
-        self.update_irq();
+        let mut st = self.st.lock();
+        let mut kick = false;
+        for i in 0..width as u32 {
+            kick |= self.write8_locked(&mut st, off + i, byte(i));
+        }
+        self.drive_irq(&st);
+        drop(st);
+        if kick {
+            self.kick();
+        }
     }
 }
 
