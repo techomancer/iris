@@ -310,7 +310,9 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 | `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays (`cow1 ...` on the O2's second controller) |
 
 On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
-interrupt status, queues and command totals, and `wdt`, `defer`, `debug` and
+interrupt status, queues and command totals, whether its worker thread is
+running (commands run on it, off the CPU's thread), any completions held
+for a paused sequencer and NetBSD's doorbell, and `wdt`, `defer`, `debug` and
 `dayna` are not there. Ids are per controller, as in the `[scsi.N]` tables
 (`[scsi.17]` is id 1 on controller 1, so `scsi1 eject 1`).
 

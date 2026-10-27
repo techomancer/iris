@@ -130,6 +130,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   now gives a busy engine up to 100 us of host time before it answers.
   Tested to login with 32, 64, 128, 256, 224 (128+64+32), 384, 512 MB and
   1 GB, and headless.
+- **O2 SCSI commands run on their own thread.** Each AIC-7880 now has a
+  worker (`AIC-7880-0`, `AIC-7880-1`) that fetches the command, moves the
+  data and does the disk I/O; the CPU's register write only queues the tag.
+  Before, a whole transfer ran inside that write and the guest stopped for
+  it. `diskperf` with direct I/O gains about 2x at 16-64 KiB requests;
+  large requests are unchanged. `scsi regs` reports the worker.
 - **The AIC-7880 is specified.** [docs/o2/aic7880.md](docs/o2/aic7880.md)
   describes the O2's SCSI controller from the Adaptec data books, the
   open-source drivers, the MACE spec and what the PROM and IRIX download: principles of operation, PCI

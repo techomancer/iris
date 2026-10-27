@@ -362,11 +362,11 @@ impl Ip32Bus {
         if opts.scsi {
             // The controller fetches its work from host memory, which it
             // reaches through the PCI bridge it is attached to.
-            let scsi = std::sync::Arc::new(crate::dev::aic7880::Aic7880::new());
+            let scsi = crate::dev::aic7880::Aic7880::new();
             // The second controller. Real hardware has it whether or not
             // anything is plugged into it, and a kernel that expects two
             // waits on the one that is missing.
-            let scsi_b = std::sync::Arc::new(crate::dev::aic7880::Aic7880::new_at(1));
+            let scsi_b = crate::dev::aic7880::Aic7880::new_at(1);
             bus.mace.pci.attach(IP32_SCSI_SLOT_B, "aic7880-b", scsi_b.clone());
             bus.mace.pci.attach(IP32_SCSI_SLOT, "aic7880", scsi.clone());
             let mut list = bus.scsi.lock().unwrap();

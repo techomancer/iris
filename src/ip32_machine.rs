@@ -543,6 +543,7 @@ impl O2Machine {
         let running = self.running.clone();
         let events = (self.events.clone(), self.controller_up.clone());
         let paused = self.paused.clone();
+        self.start_scsi();
         self.threads.push(
             std::thread::Builder::new()
                 .name("O2-Service".into())
@@ -617,6 +618,11 @@ impl O2Machine {
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
         self.paused.store(true, Ordering::SeqCst);
+        // After the CPU, so nothing queues more; each finishes the command
+        // it is running, so a snapshot finds none half done.
+        for ctl in self.bus.scsi.lock().unwrap().iter() {
+            ctl.stop();
+        }
         if !self.bus.crime.re.drain(Duration::from_secs(2)) {
             eprintln!("iris: O2 stopped with rendering engine writes still queued");
         }
@@ -630,6 +636,15 @@ impl O2Machine {
     /// Let the service thread look after the devices again.
     pub fn restart_peripherals(&mut self) {
         self.paused.store(false, Ordering::SeqCst);
+        self.start_scsi();
+    }
+
+    /// Give each SCSI controller its own thread, so disk transfers do not
+    /// run on the CPU's.
+    fn start_scsi(&self) {
+        for ctl in self.bus.scsi.lock().unwrap().iter() {
+            ctl.start();
+        }
     }
 
     /// The hardware as at power-on, with the CPU stopped: what a CRIME cold

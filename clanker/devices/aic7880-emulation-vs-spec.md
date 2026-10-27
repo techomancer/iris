@@ -69,14 +69,26 @@ design; the rest are register-level details that could be fixed inside it.
    the program's contents (its first words are fixed) rather than on
    placeholder pointers, and remove or mark dead the hybrid path.
 
-6. **Commands run to completion inside the register write that queues
-   them** (`run_queue` from `QINFIFO`/`KERNEL_QINPOS` writes). The
-   completion DMA and `CMDCMPLT` are visible before the write returns. Real
-   hardware takes microseconds to milliseconds and the host may still be
-   programming scratch RAM or unpausing. Both drivers tolerate it today; a
-   driver that writes the doorbell before finishing the SCB would not.
-   Fix: defer execution to the device's `step()` or a worker, which the
-   sequencer model would do naturally.
+6. **Commands run on the controller's own thread, with no SCSI-side
+   latency** (fixed 2026-10-26: was "inside the register write that queues
+   them"). `QINFIFO`, the NetBSD doorbell and an unpause with work queued
+   now only *kick* the worker (`AIC-7880-<n>`, started by `O2Machine`).
+   The worker takes a tag under the state `SpinLock`, runs every SCB/CDB
+   fetch, scatter-gather and disk transfer with it released, and posts
+   the result under it: completion byte, cursor, `CMDCMPLT` and the pin in
+   one section, so the host never sees the tag before its data. What
+   remains of the deviation: a command takes host time, not SCSI time
+   (no selection delay, no transfer rate), so it can complete well before
+   the guest could have expected.
+   Rules the threading follows, each from the spec: a paused sequencer
+   posts nothing, so a result that finds `PAUSE` set is held (`State.held`,
+   saved in snapshots) and posted at the next unpause (§4.2, §7.5); the
+   doorbell is acted on only while running, since NetBSD rings with the
+   sequencer paused; a `CHIPRST` bumps `State.generation` and a command
+   running across it is dropped on completion (its data DMA may still
+   land). Without a running worker (unit tests, the harness) `kick` runs
+   the work inline, so the old synchronous tests keep their meaning.
+   `scsi regs` shows the worker, held results and doorbell.
 
 7. **The SCSI bus reset side effect depends on the driver** (`SCSISEQ.SCSIRSTO`
    sets CD-ROM block size 512 for the HIM, power-on size otherwise). The

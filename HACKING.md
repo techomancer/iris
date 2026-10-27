@@ -205,6 +205,7 @@ Every device that has real work to do runs on its own thread:
 | `MIPS-CPU` | the interpreter or jitv2 dispatch loop |
 | jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
 | `WD33C93A` | SCSI command execution and DMA |
+| `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
 | `seeq-enet`, `seeq-nat` | ethernet DMA pump; the NAT engine and its built-in services |
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
