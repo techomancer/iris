@@ -29,7 +29,7 @@ use crate::snapshot::get_field;
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Saveable, BUS_OK};
 
 pub struct Mace {
-    ram: Arc<Mutex<O2Memory>>,
+    ram: Arc<O2Memory>,
     /// The ISA block's interrupt status and mask, cascading into CRIME.
     pub isa: Arc<MaceIsa>,
     /// Registers with no model of their own yet: they keep what is written
@@ -56,7 +56,7 @@ impl Mace {
     /// MACE with its blocks reset, its interrupts wired into `crime`: the
     /// Ethernet straight in, the ISA peripherals (the PS/2 ports, audio, the
     /// console UART while driven by PIO, serial DMA) through the ISA block.
-    pub fn new(ram: Arc<Mutex<O2Memory>>, crime: Arc<Crime>, ust: Arc<MaceUst>) -> Self {
+    pub fn new(ram: Arc<O2Memory>, crime: Arc<Crime>, ust: Arc<MaceUst>) -> Self {
         let isa = Arc::new(MaceIsa::new(crime.clone()));
         let mace = Self {
             isa,

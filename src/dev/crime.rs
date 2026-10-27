@@ -448,11 +448,11 @@ impl BusDevice for Crime {
 pub struct CrimeSpace {
     pub regs: std::sync::Arc<Crime>,
     pub re: crate::dev::o2gfx::CrimeRe,
-    ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
+    ram: std::sync::Arc<crate::dev::crime_mem::O2Memory>,
 }
 
 impl CrimeSpace {
-    pub fn new(regs: std::sync::Arc<Crime>, ram: std::sync::Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
+    pub fn new(regs: std::sync::Arc<Crime>, ram: std::sync::Arc<crate::dev::crime_mem::O2Memory>) -> Self {
         Self { re: crate::dev::o2gfx::CrimeRe::new(ram.clone()), regs, ram }
     }
 
@@ -473,7 +473,7 @@ impl CrimeSpace {
         let off = (addr - CRIME_BASE) & !7;
         if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
             let v = self.regs.load(off);
-            self.ram.lock().unwrap().set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
+            self.ram.set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
         }
     }
 }

@@ -136,11 +136,11 @@ pub const PCI_HOST_END: u32 = 0x8000_0000;
 /// view's 32-bit words broke OpenBSD's writes (programs crashed after a
 /// reboot). Word order is the device's business, settled per driver.
 pub struct HostMemory {
-    ram: Arc<Mutex<O2Memory>>,
+    ram: Arc<O2Memory>,
 }
 
 impl HostMemory {
-    pub fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
+    pub fn new(ram: Arc<O2Memory>) -> Self {
         Self { ram }
     }
 
@@ -153,31 +153,44 @@ impl HostMemory {
     }
 }
 
+impl HostMemory {
+    /// Run `f` over the transfer `[addr, addr + len)` a page at a time,
+    /// with the offset each page starts at in memory, or None where the bus
+    /// address is not memory. A page never straddles a bank slot, so its
+    /// bytes are contiguous: one decode per page, not per byte.
+    fn each_page(&self, addr: u64, len: usize, mut f: impl FnMut(std::ops::Range<usize>, Option<usize>)) {
+        const PAGE: usize = 4096;
+        let mut done = 0;
+        while done < len {
+            let a = addr.wrapping_add(done as u64);
+            let n = (PAGE - (a as usize & (PAGE - 1))).min(len - done);
+            f(done..done + n, Self::locate(&self.ram, a));
+            done += n;
+        }
+    }
+}
+
+/// No lock: the controller's thread and the CPU share memory the way the
+/// hardware's masters do.
 impl PciDma for HostMemory {
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
-        let m = self.ram.lock().unwrap();
         let mut st = PciDmaStatus::Ok;
-        for (k, b) in buf.iter_mut().enumerate() {
-            match Self::locate(&m, addr.wrapping_add(k as u64)) {
-                Some(i) => *b = m[i],
-                None => {
-                    *b = 0;
-                    st = PciDmaStatus::MasterAbort;
-                }
+        self.each_page(addr, buf.len(), |r, at| match at {
+            Some(i) => self.ram.read_into(i, &mut buf[r]),
+            None => {
+                buf[r].fill(0);
+                st = PciDmaStatus::MasterAbort;
             }
-        }
+        });
         st
     }
 
     fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
-        let mut m = self.ram.lock().unwrap();
         let mut st = PciDmaStatus::Ok;
-        for (k, &b) in data.iter().enumerate() {
-            match Self::locate(&m, addr.wrapping_add(k as u64)) {
-                Some(i) => m.write(i, &[b]),
-                None => st = PciDmaStatus::MasterAbort,
-            }
-        }
+        self.each_page(addr, data.len(), |r, at| match at {
+            Some(i) => self.ram.write(i, &data[r]),
+            None => st = PciDmaStatus::MasterAbort,
+        });
         st
     }
 }
@@ -204,13 +217,13 @@ pub struct MacePci {
 }
 
 impl MacePci {
-    pub fn new(intc: Arc<dyn InterruptController>, ram: Arc<Mutex<O2Memory>>) -> Self {
+    pub fn new(intc: Arc<dyn InterruptController>, ram: Arc<O2Memory>) -> Self {
         Self::with_routing(intc, crime_input, ram)
     }
 
     /// A bridge with its own routing of slot pins (1 = INTA) to `intc`'s
     /// inputs.
-    fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>, ram: Arc<Mutex<O2Memory>>) -> Self {
+    fn with_routing(intc: Arc<dyn InterruptController>, route: fn(u8, u8) -> Option<u32>, ram: Arc<O2Memory>) -> Self {
         Self {
             config_addr: Mutex::new(0),
             regs: Mutex::new([0u32; (MACEPCI_SIZE / 4) as usize]),
@@ -543,8 +556,8 @@ mod tests {
     /// A bridge register, as the bus address it sits at.
     fn bridge(reg: u32) -> u64 { (MACEPCI_BASE + reg) as u64 }
 
-    fn test_ram() -> Arc<Mutex<O2Memory>> {
-        Arc::new(Mutex::new(O2Memory::single(1 << 20)))
+    fn test_ram() -> Arc<O2Memory> {
+        Arc::new(O2Memory::single(1 << 20))
     }
 
     /// A bus master reaches the same memory through both views, bytes in
@@ -552,7 +565,7 @@ mod tests {
     #[test]
     fn bus_masters_reach_memory_through_both_views() {
         let ram = test_ram();
-        ram.lock().unwrap().write(0x100, &[0x11, 0x22, 0x33, 0x44]);
+        ram.write(0x100, &[0x11, 0x22, 0x33, 0x44]);
         let host = HostMemory::new(ram.clone());
         let mut b = [0u8; 4];
         assert!(host.dma_read((PCI_SWAPPED_VIEW + 0x100) as u64, &mut b).is_ok());
@@ -560,7 +573,7 @@ mod tests {
         assert!(host.dma_read((PCI_NATIVE_VIEW + 0x100) as u64, &mut b).is_ok());
         assert_eq!(b, [0x11, 0x22, 0x33, 0x44]);
         assert!(host.dma_write((PCI_NATIVE_VIEW + 0x102) as u64, &[0xaa, 0xbb]).is_ok());
-        assert_eq!(ram.lock().unwrap().bytes(0x100, 4), [0x11, 0x22, 0xaa, 0xbb]);
+        assert_eq!(ram.bytes(0x100, 4), [0x11, 0x22, 0xaa, 0xbb]);
         assert_eq!(host.dma_read((PCI_HOST_END + 0x100) as u64, &mut b), PciDmaStatus::MasterAbort,
             "not host memory");
         assert_eq!(b, [0; 4]);

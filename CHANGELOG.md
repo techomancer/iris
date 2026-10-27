@@ -134,8 +134,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   worker (`AIC-7880-0`, `AIC-7880-1`) that fetches the command, moves the
   data and does the disk I/O; the CPU's register write only queues the tag.
   Before, a whole transfer ran inside that write and the guest stopped for
-  it. `diskperf` with direct I/O gains about 2x at 16-64 KiB requests;
-  large requests are unchanged. `scsi regs` reports the worker.
+  it. `scsi regs` reports the worker.
+- **O2 memory has no lock.** Devices and the CPU's slow path reach RAM
+  without taking a mutex, as the hardware's masters do; PCI DMA decodes
+  once per page instead of once per byte. A disk transfer on the SCSI
+  thread no longer holds up the CPU. Disk throughput under IRIX is bounded
+  by the emulated CPU, not by SCSI or DMA (the controller's thread uses
+  about 1% of a core while IRIX reads at its full rate).
 - **The AIC-7880 is specified.** [docs/o2/aic7880.md](docs/o2/aic7880.md)
   describes the O2's SCSI controller from the Adaptec data books, the
   open-source drivers, the MACE spec and what the PROM and IRIX download: principles of operation, PCI

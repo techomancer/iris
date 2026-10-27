@@ -236,7 +236,7 @@ struct Link {
 }
 
 pub struct Mec {
-    ram: Arc<Mutex<crate::dev::crime_mem::O2Memory>>,
+    ram: Arc<crate::dev::crime_mem::O2Memory>,
     st: Mutex<State>,
     link: Mutex<Option<Link>>,
     /// CRIME's Ethernet input.
@@ -244,7 +244,7 @@ pub struct Mec {
 }
 
 impl Mec {
-    pub fn new(ram: Arc<Mutex<crate::dev::crime_mem::O2Memory>>) -> Self {
+    pub fn new(ram: Arc<crate::dev::crime_mem::O2Memory>) -> Self {
         Self { ram, st: Mutex::new(State::new()), link: Mutex::new(None), irq: std::sync::OnceLock::new() }
     }
 
@@ -309,14 +309,14 @@ impl Mec {
     }
 
     fn ram_read(&self, addr: u64, out: &mut [u8]) {
-        let r = self.ram.lock().unwrap();
+        let r = &*self.ram;
         for (k, b) in out.iter_mut().enumerate() {
             *b = r.dma_offset((addr + k as u64) as u32).map_or(0, |i| r[i]);
         }
     }
 
     fn ram_write(&self, addr: u64, data: &[u8]) {
-        let mut r = self.ram.lock().unwrap();
+        let r = &*self.ram;
         for (k, &b) in data.iter().enumerate() {
             if let Some(i) = r.dma_offset((addr + k as u64) as u32) {
                 r.write(i, &[b]);
@@ -783,17 +783,17 @@ mod tests {
     use super::*;
     use crate::ip32::RAM_BASE;
 
-    fn mec() -> (Mec, Arc<Mutex<crate::dev::crime_mem::O2Memory>>) {
-        let ram = Arc::new(Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+    fn mec() -> (Mec, Arc<crate::dev::crime_mem::O2Memory>) {
+        let ram = Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         (Mec::new(ram.clone()), ram)
     }
 
-    fn put(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, b: &[u8]) {
-        ram.lock().unwrap().write(off, b);
+    fn put(ram: &Arc<crate::dev::crime_mem::O2Memory>, off: usize, b: &[u8]) {
+        ram.write(off, b);
     }
 
-    fn get(ram: &Arc<Mutex<crate::dev::crime_mem::O2Memory>>, off: usize, n: usize) -> Vec<u8> {
-        ram.lock().unwrap().bytes(off, (off + n) - (off)).to_vec()
+    fn get(ram: &Arc<crate::dev::crime_mem::O2Memory>, off: usize, n: usize) -> Vec<u8> {
+        ram.bytes(off, (off + n) - (off)).to_vec()
     }
 
     fn mii_read(m: &Mec, phy: u32, r: u32) -> u64 {

@@ -1784,7 +1784,7 @@ mod tests {
     use super::*;
 
     fn chip() -> Arc<Aic7880> {
-        on(std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20))))
+        on(std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20)))
     }
 
     /// A chip that masters host memory `ram` through the bridge.
@@ -1892,7 +1892,7 @@ mod tests {
     /// driver rather than a datasheet, so it is worth pinning down.
     #[test]
     fn a_queued_tag_fetches_the_command_and_answers_it() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
 
         // A controller with nothing attached answers nothing, so the test
@@ -1905,25 +1905,25 @@ mod tests {
         let (array, scb_addr, cdb_addr, sg_addr, buf, qout) =
             (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
         {
-            let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+            let m = &*ram;
+            let put32 = |m: &crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
                 m.write(at as usize, &v.to_be_bytes());
             };
             // array[1] = the SCB's bus address
-            put32(&mut m, array + 4, base + scb_addr);
+            put32(m, array + 4, base + scb_addr);
             // SCB: pointers to the scatter-gather list and the CDB
-            put32(&mut m, scb_addr + scb::SG_PTR as u32, base + sg_addr);
-            put32(&mut m, scb_addr + scb::CMD_PTR as u32, base + cdb_addr);
+            put32(m, scb_addr + scb::SG_PTR as u32, base + sg_addr);
+            put32(m, scb_addr + scb::CMD_PTR as u32, base + cdb_addr);
             // The driver's control flags: disconnect allowed.
-            m[(scb_addr + scb::CONTROL as u32) as usize] = 0x40;
+            m.write((scb_addr + scb::CONTROL as u32) as usize, &[0x40]);
             // Address the id the disk was attached at.
-            m[(scb_addr + scb::TCL as u32) as usize] = 1 << 4;
+            m.write((scb_addr + scb::TCL as u32) as usize, &[1 << 4]);
             // INQUIRY, 64 bytes
-            m[cdb_addr as usize] = 0x12;
-            m[cdb_addr as usize + 4] = 0x40;
+            m.write(cdb_addr as usize, &[0x12]);
+            m.write(cdb_addr as usize + 4, &[0x40]);
             // One scatter-gather entry
-            put32(&mut m, sg_addr, base + buf);
-            put32(&mut m, sg_addr + 4, 64);
+            put32(m, sg_addr, base + buf);
+            put32(m, sg_addr + 4, 64);
         }
         // Tell the chip where the array and the completion FIFO are, the way
         // the driver does: a scratch register at a time, little end first.
@@ -1936,14 +1936,13 @@ mod tests {
 
         c.write(reg::QINFIFO, 1, 1);
 
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(m[buf as usize], 0x00, "a direct access device");
         assert_eq!(&m.bytes(buf as usize + 8, (buf as usize + 11) - (buf as usize + 8)), b"SGI",
                    "the inquiry data must land in the buffer the driver listed");
         assert_eq!(m[(scb_addr + scb::CONTROL as u32) as usize], 0x40,
                    "and the SCB is the driver's: nothing is written back into it");
         assert_eq!(m[qout as usize], 1, "the tag goes into the host completion FIFO");
-        drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8 & intstat::CMDCMPLT, intstat::CMDCMPLT,
                    "and the driver is told to look");
     }
@@ -1952,7 +1951,7 @@ mod tests {
     /// must reach the image rather than growing it.
     #[test]
     fn a_write_reaches_the_disk_and_reads_back() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-write.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -1963,21 +1962,21 @@ mod tests {
             (0x1000u32, 0x2000u32, 0x2100u32, 0x2200u32, 0x3000u32, 0x4000u32);
         let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
         {
-            let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+            let m = &*ram;
+            let put32 = |m: &crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
                 m.write(at as usize, &v.to_be_bytes());
             };
-            put32(&mut m, array + 4, base + scb);
-            put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
-            put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
-            m[(scb + scb::CDB_LEN as u32) as usize] = 10;
-            m[(scb + scb::TCL as u32) as usize] = 1 << 4;
+            put32(m, array + 4, base + scb);
+            put32(m, scb + scb::SG_PTR as u32, base + sg);
+            put32(m, scb + scb::CMD_PTR as u32, base + cdb);
+            m.write((scb + scb::CDB_LEN as u32) as usize, &[10]);
+            m.write((scb + scb::TCL as u32) as usize, &[1 << 4]);
             // WRITE(10), one block at LBA 5.
-            m[cdb as usize] = 0x2a;
-            m[cdb as usize + 5] = 5;
-            m[cdb as usize + 8] = 1;
-            put32(&mut m, sg, base + buf);
-            put32(&mut m, sg + 4, BLOCK_SIZE as u32);
+            m.write(cdb as usize, &[0x2a]);
+            m.write(cdb as usize + 5, &[5]);
+            m.write(cdb as usize + 8, &[1]);
+            put32(m, sg, base + buf);
+            put32(m, sg + 4, BLOCK_SIZE as u32);
             m.write(buf as usize, &pattern);
         }
         for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
@@ -2005,7 +2004,7 @@ mod tests {
     /// program.
     #[test]
     fn a_long_scatter_gather_list_is_followed_to_the_end() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(4 << 20)));
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(4 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-sg.img");
         let pattern: Vec<u8> = (0..264 * BLOCK_SIZE).map(|i| (i % 253) as u8).collect();
@@ -2019,22 +2018,22 @@ mod tests {
         let pages = 264 * BLOCK_SIZE / 4096;
         assert!(pages > 32, "the test must cross the bound it is checking");
         {
-            let mut m = ram.lock().unwrap();
-            let put32 = |m: &mut crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
+            let m = &*ram;
+            let put32 = |m: &crate::dev::crime_mem::O2Memory, at: u32, v: u32| {
                 m.write(at as usize, &v.to_be_bytes());
             };
-            put32(&mut m, array + 4, base + scb);
-            put32(&mut m, scb + scb::SG_PTR as u32, base + sg);
-            put32(&mut m, scb + scb::CMD_PTR as u32, base + cdb);
-            m[(scb + scb::CDB_LEN as u32) as usize] = 10;
-            m[(scb + scb::TCL as u32) as usize] = 1 << 4;
+            put32(m, array + 4, base + scb);
+            put32(m, scb + scb::SG_PTR as u32, base + sg);
+            put32(m, scb + scb::CMD_PTR as u32, base + cdb);
+            m.write((scb + scb::CDB_LEN as u32) as usize, &[10]);
+            m.write((scb + scb::TCL as u32) as usize, &[1 << 4]);
             // READ(10), 264 blocks from LBA 0.
-            m[cdb as usize] = 0x28;
-            m[cdb as usize + 7] = (264 >> 8) as u8;
-            m[cdb as usize + 8] = (264 & 0xff) as u8;
+            m.write(cdb as usize, &[0x28]);
+            m.write(cdb as usize + 7, &[(264 >> 8) as u8]);
+            m.write(cdb as usize + 8, &[(264 & 0xff) as u8]);
             for i in 0..pages as u32 {
-                put32(&mut m, sg + i * 8, base + buf + i * 4096);
-                put32(&mut m, sg + i * 8 + 4, 4096);
+                put32(m, sg + i * 8, base + buf + i * 4096);
+                put32(m, sg + i * 8 + 4, 4096);
             }
         }
         for (i, b) in (base + array).to_le_bytes().iter().enumerate() {
@@ -2045,7 +2044,7 @@ mod tests {
         }
         c.write(reg::QINFIFO, 1, 1);
 
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         let got = &m.bytes(buf as usize, (buf as usize + pattern.len()) - (buf as usize));
         assert_eq!(got, &pattern[..], "every page of the transfer must arrive");
     }
@@ -2067,8 +2066,8 @@ mod tests {
     /// an all-zero command.
     #[test]
     fn dma_resolves_the_low_memory_alias() {
-        let ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 16)));
-        ram.lock().unwrap().write(0x40, &[0xa5]);
+        let ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 16));
+        ram.write(0x40, &[0xa5]);
         let c = on(ram);
         assert_eq!(c.dma_read8(0x40), 0xa5, "the low alias");
         assert_eq!(c.dma_read8(crate::ip32::RAM_BASE + 0x40), 0xa5, "and memory's own base");
@@ -2086,7 +2085,7 @@ mod tests {
                    "clearing one interrupt must not clear the others");
     }
 
-    type Ram = std::sync::Arc<std::sync::Mutex<crate::dev::crime_mem::O2Memory>>;
+    type Ram = std::sync::Arc<crate::dev::crime_mem::O2Memory>;
 
     /// Where the HIM rig keeps things in host memory.
     const ARRAY: u32 = 0x1000;
@@ -2097,7 +2096,7 @@ mod tests {
     fn buf_at(tag: u8) -> u32 { 0x8000 + tag as u32 * 0x200 }
 
     fn put32(ram: &Ram, at: u32, v: u32) {
-        ram.lock().unwrap().write(at as usize, &v.to_be_bytes());
+        ram.write(at as usize, &v.to_be_bytes());
     }
 
     /// The HIM's signature, as it writes it: a byte at a time, little end
@@ -2115,7 +2114,7 @@ mod tests {
     /// full of 0x7f, the queue-out array full of 0xff, and its own id 0, as
     /// on an O2. One disk, at id 1.
     fn him_rig(name: &str) -> (Arc<Aic7880>, Ram) {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join(format!("iris-aic7880-{name}.img"));
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -2133,7 +2132,7 @@ mod tests {
             c.write(off, 0x7f, 1);
         }
         c.write(reg::SCSIID, 0, 1);
-        ram.lock().unwrap().write(QOUT as usize, &vec![QOUTFIFO_EMPTY; (QOUT as usize + 256) - (QOUT as usize)]);
+        ram.write(QOUT as usize, &vec![QOUTFIFO_EMPTY; (QOUT as usize + 256) - (QOUT as usize)]);
         (c, ram)
     }
 
@@ -2144,12 +2143,12 @@ mod tests {
         let scb = scb_at(tag);
         put32(ram, ARRAY + tag as u32 * 4, base + scb);
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             m.write(scb as usize, &vec![0; (scb as usize + 32) - (scb as usize)]);
-            m[(scb + scb::SEG_COUNT as u32) as usize] = 1;
-            m[(scb + scb::CDB_LEN as u32) as usize] = cdb.len() as u8;
-            m[(scb + scb::CONTROL as u32) as usize] = 0x40;
-            m[(scb + scb::TCL as u32) as usize] = target << 4;
+            m.write((scb + scb::SEG_COUNT as u32) as usize, &[1]);
+            m.write((scb + scb::CDB_LEN as u32) as usize, &[cdb.len() as u8]);
+            m.write((scb + scb::CONTROL as u32) as usize, &[0x40]);
+            m.write((scb + scb::TCL as u32) as usize, &[target << 4]);
             m.write(cdb_at(tag) as usize, cdb);
         }
         put32(ram, scb + scb::SG_PTR as u32, base + sg_at(tag));
@@ -2160,7 +2159,7 @@ mod tests {
     }
 
     fn qout(ram: &Ram) -> Vec<u8> {
-        ram.lock().unwrap().bytes(QOUT as usize, (QOUT as usize + 256) - (QOUT as usize)).to_vec()
+        ram.bytes(QOUT as usize, (QOUT as usize + 256) - (QOUT as usize)).to_vec()
     }
 
     const TUR: [u8; 6] = [0x00, 0, 0, 0, 0, 0];
@@ -2185,7 +2184,7 @@ mod tests {
         assert_eq!(c.read(sram::QOUTFIFO, 1), 0xf8, "the cursor moved down by 4 twice, wrapping");
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
         assert_eq!(c.read(reg::QINCNT, 1), 0, "both were taken");
-        assert_eq!(ram.lock().unwrap()[(scb_at(0) + scb::CONTROL as u32) as usize], 0x40,
+        assert_eq!(ram[(scb_at(0) + scb::CONTROL as u32) as usize], 0x40,
                    "and the SCB's control flags are left alone");
     }
 
@@ -2208,7 +2207,7 @@ mod tests {
     /// a command.
     #[test]
     fn the_netbsd_doorbell_still_runs_commands() {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         let c = on(ram.clone());
         let img = std::env::temp_dir().join("iris-aic7880-nb.img");
         std::fs::write(&img, vec![0u8; 64 * BLOCK_SIZE]).expect("test image");
@@ -2216,12 +2215,12 @@ mod tests {
         let (hscbs, shared) = (0x2000u32, 0x4000u32);
         let tag = 3u8;
         {
-            let mut m = ram.lock().unwrap();
-            m[(shared + nb::FIFO_LEN) as usize] = tag;
+            let m = &*ram;
+            m.write((shared + nb::FIFO_LEN) as usize, &[tag]);
             let h = (hscbs + tag as u32 * nb::HSCB_STRIDE) as usize;
-            m[h + nb::CDB_LEN as usize] = 6; // TEST UNIT READY
-            m[h + nb::SCSIID as usize] = 0x17;
-            m[h + nb::STATUS as usize] = 0xaa;
+            m.write(h + nb::CDB_LEN as usize, &[6]); // TEST UNIT READY
+            m.write(h + nb::SCSIID as usize, &[0x17]);
+            m.write(h + nb::STATUS as usize, &[0xaa]);
         }
         for (off, v) in [(nb::HSCB_ADDR, hscbs), (nb::SHARED_DATA_ADDR, shared)] {
             for (i, b) in v.to_le_bytes().iter().enumerate() {
@@ -2229,10 +2228,9 @@ mod tests {
             }
         }
         c.write(nb::KERNEL_QINPOS, 1, 1);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(m[shared as usize], tag, "the tag comes back on the queue-out ring");
         assert_eq!(m[(hscbs + tag as u32 * nb::HSCB_STRIDE + nb::STATUS) as usize], 0, "with GOOD status");
-        drop(m);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
     }
 
@@ -2246,15 +2244,15 @@ mod tests {
         c.attach_disk_at(1, &img).expect("attach");
         let (hscbs, shared, tag) = (0x2000u32, 0x4000u32, 3u8);
         {
-            let mut m = ram.lock().unwrap();
-            m[(shared + nb::FIFO_LEN) as usize] = tag;
+            let m = &*ram;
+            m.write((shared + nb::FIFO_LEN) as usize, &[tag]);
             let h = (hscbs + tag as u32 * nb::HSCB_STRIDE) as usize;
             m.write(h + nb::CDB as usize, cdb);
-            m[h + nb::CDB_LEN as usize] = cdb.len() as u8;
+            m.write(h + nb::CDB_LEN as usize, &[cdb.len() as u8]);
             m.write(h + nb::DATAPTR as usize, &dataptr.to_le_bytes());
             m.write(h + nb::DATACNT as usize, &datacnt.to_le_bytes());
             m.write(h + nb::SGPTR as usize, &sgptr.to_le_bytes());
-            m[h + nb::SCSIID as usize] = 0x17;
+            m.write(h + nb::SCSIID as usize, &[0x17]);
         }
         for (off, v) in [(nb::HSCB_ADDR, hscbs), (nb::SHARED_DATA_ADDR, shared)] {
             for (i, b) in v.to_le_bytes().iter().enumerate() {
@@ -2272,9 +2270,9 @@ mod tests {
     /// NetBSD's file-system metadata.
     #[test]
     fn a_one_segment_netbsd_command_ends_at_its_segment() {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             // The stale entry 1: a 256-byte buffer at 0x8000, holding 0x5a.
             m.write(0x7000, &0x8000u32.to_le_bytes());
             m.write(0x7004, &(0x100u32 | nb::LAST_SEG).to_le_bytes());
@@ -2284,20 +2282,19 @@ mod tests {
         // INQUIRY for 36 bytes into an 8-byte segment marked last.
         let c = netbsd_command(&ram, &vec![0u8; 64 * BLOCK_SIZE], &[0x12, 0, 0, 0, 36, 0],
             0x6000, 8 | nb::LAST_SEG, 0x7000);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert!(m.bytes(0x8000, 0x100).iter().all(|&b| b == 0x5a), "nothing lands in the stale entry's buffer");
         assert_eq!(m.bytes(0x6008, 8), [0x77; 8], "nothing past the segment either");
         assert_ne!(m.bytes(0x6000, 8), [0x77; 8], "the segment itself is filled");
-        drop(m);
         assert!(c.notes().iter().any(|n| n.starts_with("nb overrun")), "the overrun is reported");
     }
 
     /// A real two-entry list still fills both buffers in order.
     #[test]
     fn a_two_segment_netbsd_read_fills_both_buffers() {
-        let ram: Ram = std::sync::Arc::new(std::sync::Mutex::new(crate::dev::crime_mem::O2Memory::single(1 << 20)));
+        let ram: Ram = std::sync::Arc::new(crate::dev::crime_mem::O2Memory::single(1 << 20));
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             m.write(0x7000, &0x9000u32.to_le_bytes());
             m.write(0x7004, &(BLOCK_SIZE as u32 | nb::LAST_SEG).to_le_bytes());
         }
@@ -2306,7 +2303,7 @@ mod tests {
         img[BLOCK_SIZE..2 * BLOCK_SIZE].fill(0x22);
         // READ(10) of blocks 0 and 1.
         netbsd_command(&ram, &img, &[0x28, 0, 0, 0, 0, 0, 0, 0, 2, 0], 0x6000, BLOCK_SIZE as u32, 0x7000);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert!(m.bytes(0x6000, BLOCK_SIZE).iter().all(|&b| b == 0x11));
         assert!(m.bytes(0x9000, BLOCK_SIZE).iter().all(|&b| b == 0x22));
     }
@@ -2354,7 +2351,7 @@ mod tests {
         assert_ne!(c.read(reg::HCNTRL, 1) as u8 & hcntrl::PAUSE, 0, "and the sequencer has stopped");
         assert!(c.interrupting() && irq.level(), "the pin follows the chip");
         assert!(qout(&ram).iter().all(|b| *b == QOUTFIFO_EMPTY), "nothing completed");
-        assert!(ram.lock().unwrap().bytes(buf_at(2) as usize, (buf_at(2) as usize + 36) - (buf_at(2) as usize)).iter().all(|b| *b == 0),
+        assert!(ram.bytes(buf_at(2) as usize, (buf_at(2) as usize + 36) - (buf_at(2) as usize)).iter().all(|b| *b == 0),
                 "and no data moved");
 
         // A restart before the interrupt is cleared does not take.
@@ -2393,7 +2390,7 @@ mod tests {
         put32(&ram, sense_list, sense_buf);
         put32(&ram, sense_list + 4, 18 | SG_LAST);
         put32(&ram, scb_at(tag) + scb::SG_PTR as u32, crate::ip32::RAM_BASE + sense_list);
-        ram.lock().unwrap().write(cdb_at(tag) as usize, &[0x03, 0, 0, 0, 18, 0]);
+        ram.write(cdb_at(tag) as usize, &[0x03, 0, 0, 0, 18, 0]);
         c.write(reg::QINFIFO, tag as u32, 1);
         assert_eq!(c.read(reg::QINCNT, 1), 1, "held while the sequencer is stopped");
 
@@ -2401,10 +2398,9 @@ mod tests {
         assert_eq!(c.read(reg::INTSTAT, 1), 0, "clearing SEQINT clears its code too");
         c.write(reg::HCNTRL, hcntrl::INTEN as u32, 1);
 
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(m[sense_buf as usize + 2], 0x05, "ILLEGAL REQUEST");
         assert_eq!(m[sense_buf as usize + 12], 0x20, "invalid command operation code");
-        drop(m);
         assert_eq!(qout(&ram)[7], tag, "and the tag completes through the queue-out");
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
         assert_eq!(c.read(reg::QINCNT, 1), 0);
@@ -2423,7 +2419,7 @@ mod tests {
         put_cmd(&ram, 1, 3, &[0x12, 0, 0, 0, 36, 0], 36);
         c.write(reg::QINFIFO, 1, 1);
         assert_eq!(c.read(reg::INTSTAT, 1) as u8, intstat::CMDCMPLT);
-        assert_eq!(ram.lock().unwrap()[buf_at(1) as usize], 0x7f, "nothing here");
+        assert_eq!(ram[buf_at(1) as usize], 0x7f, "nothing here");
         assert_eq!(qout(&ram)[7], 1, "completed where the HIM looks");
     }
 

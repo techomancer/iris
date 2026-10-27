@@ -46,9 +46,18 @@
 //! window as the decode stands, one 32 MB slot at a time, which is what the
 //! CPU's cache and the JIT read and write directly, with no lock and no bus,
 //! and what the rendering engine draws through ([`RamWindow`]).
+//!
+//! `O2Memory` takes no lock of its own and is shared as a plain `Arc`. Its
+//! bytes are a host mapping every master already reaches directly, racing
+//! the way the hardware's masters do. The decode is atomics: the firmware
+//! programs the bank controls once at power-on, and a guest that moved a
+//! bank while a master was using it would be undefined on the real machine
+//! too, so readers never wait. Only two rebuilds of the decode are kept
+//! from interleaving.
 
 use crate::ip32::{LOW_ALIAS_SIZE, RAM_BASE, RAM_WINDOW_SIZE};
 use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The unit the bank controls count in, and the size of a small bank.
 const SLOT: u32 = 32 << 20;
@@ -71,10 +80,29 @@ enum Slot {
     None,
     /// The first match is a bank with nothing fitted.
     Empty,
-    /// Memory: `start` is the bank's first byte in `bytes`, `chunk` how far
-    /// into the bank this slot begins, before wrapping, and `mask` the bank's
-    /// real size less one.
-    Ram { start: u32, chunk: u32, mask: u32 },
+    /// Memory: bank `bank`, beginning `chunk` 32 MB slots into it before
+    /// wrapping at its real size.
+    Ram { bank: u8, chunk: u8 },
+}
+
+impl Slot {
+    /// Packed for the decode table: 0 none, 1 empty, else
+    /// `0x100 | bank << 4 | chunk`.
+    fn pack(self) -> u32 {
+        match self {
+            Slot::None => 0,
+            Slot::Empty => 1,
+            Slot::Ram { bank, chunk } => 0x100 | (bank as u32) << 4 | chunk as u32,
+        }
+    }
+
+    fn unpack(v: u32) -> Self {
+        match v {
+            0 => Slot::None,
+            1 => Slot::Empty,
+            _ => Slot::Ram { bank: ((v >> 4) & 7) as u8, chunk: (v & 0xf) as u8 },
+        }
+    }
 }
 
 /// Where an address lands.
@@ -100,23 +128,26 @@ pub struct O2Memory {
     /// rebuilt whenever a bank control changes.
     space: PpMemSpace,
     /// Each CRIME bank's real size in bytes (0 for nothing fitted) and where
-    /// it starts in `bytes`.
+    /// it starts in `bytes`. Fixed when the memory is built.
     size: [u32; 8],
     start: [u32; 8],
     /// The bank controls as last written.
-    ctrl: [u64; 8],
-    slots: [Slot; SLOTS],
+    ctrl: [AtomicU64; 8],
+    /// Each 32 MB slot's decode, [`Slot::pack`]ed.
+    slots: [AtomicU32; SLOTS],
     /// Bumped whenever the decode changes, so a device can cache an offset.
-    decode_gen: u64,
+    decode_gen: AtomicU64,
+    /// Held while the decode is rebuilt, so two rebuilds cannot interleave.
+    /// Readers never take it.
+    rebuilding: std::sync::Mutex<()>,
     /// What [`RamWindow`]s need to know of the decode, published as it
     /// changes.
     shared: std::sync::Arc<WindowState>,
 }
 
-// The raw pointer is into `store`, which lives as long as this does; writers
-// through it hold the memory's lock, and the CPU and the rendering engine,
-// which reach the same bytes through the window, race only the way the
-// hardware's own masters do.
+// The raw pointer is into `store`, which lives as long as this does. Every
+// master writes through it, or through the window onto the same bytes, with
+// no lock: they race only the way the hardware's own masters do.
 unsafe impl Send for O2Memory {}
 unsafe impl Sync for O2Memory {}
 
@@ -165,7 +196,19 @@ impl O2Memory {
         let store = PpMemory::new((total as usize).div_ceil(1 << 20).max(1));
         let space = PpMemSpace::over(std::slice::from_ref(&store)).expect("ppmem: O2 memory window");
         let host = store.host_ptr();
-        let mut m = Self { store, host, total: total as usize, space, size, start, ctrl: [0; 8], slots: [Slot::None; SLOTS], decode_gen: 0, shared: Default::default() };
+        let m = Self {
+            store,
+            host,
+            total: total as usize,
+            space,
+            size,
+            start,
+            ctrl: Default::default(),
+            slots: std::array::from_fn(|_| AtomicU32::new(0)),
+            decode_gen: AtomicU64::new(0),
+            rebuilding: std::sync::Mutex::new(()),
+            shared: Default::default(),
+        };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
         m.rebuild();
@@ -176,7 +219,7 @@ impl O2Memory {
     /// [`Self::dma_offset`]) and bump the generation of every page it touches.
     /// CPU stores and DMA both come here, so compiled code never outlives the
     /// bytes it was compiled from.
-    pub fn write(&mut self, off: usize, data: &[u8]) {
+    pub fn write(&self, off: usize, data: &[u8]) {
         assert!(off + data.len() <= self.total, "O2 memory write past the end");
         for (k, &b) in data.iter().enumerate() {
             unsafe { *self.host.add((off + k) ^ 3) = b };
@@ -187,12 +230,20 @@ impl O2Memory {
         }
     }
 
+    /// Read `buf.len()` bytes from offset `off`, in guest order.
+    pub fn read_into(&self, off: usize, buf: &mut [u8]) {
+        assert!(off + buf.len() <= self.total, "O2 memory read past the end");
+        for (k, b) in buf.iter_mut().enumerate() {
+            *b = unsafe { *self.host.add((off + k) ^ 3) };
+        }
+    }
+
     /// Write the bytes of `off..off + len` that `byte(k)` (k from 0) gives
     /// a value for, leaving the rest, and bump each page once: the memory
     /// engine fills and copies spans a tile row at a time, and a call per
     /// byte through [`Self::write`] was most of its time.
     #[inline]
-    pub fn write_span(&mut self, off: usize, len: usize, mut byte: impl FnMut(usize) -> Option<u8>) {
+    pub fn write_span(&self, off: usize, len: usize, mut byte: impl FnMut(usize) -> Option<u8>) {
         if len == 0 {
             return;
         }
@@ -210,7 +261,7 @@ impl O2Memory {
     /// Store `val` through `mask` into `words` aligned 32-bit words from
     /// `off` (big-endian, as [`Self::put_be`]), each page bumped once: the
     /// memory engine's clears and fills.
-    pub fn fill_words_masked(&mut self, off: usize, words: usize, val: u32, mask: u32) {
+    pub fn fill_words_masked(&self, off: usize, words: usize, val: u32, mask: u32) {
         if words == 0 {
             return;
         }
@@ -234,7 +285,7 @@ impl O2Memory {
 
     /// The bytes [`Self::save_raw`] wrote, back, with every page's
     /// generation bumped so no compiled code outlives them.
-    pub fn load_raw(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+    pub fn load_raw(&self, path: &std::path::Path) -> std::io::Result<()> {
         let data = std::fs::read(path)?;
         self.restore_raw(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -246,14 +297,14 @@ impl O2Memory {
     }
 
     /// [`Self::restore_raw`] for words [`Self::words`] gave.
-    pub fn restore_words(&mut self, words: &[u32]) -> Result<(), String> {
+    pub fn restore_words(&self, words: &[u32]) -> Result<(), String> {
         // SAFETY: a view of the same bytes; u8 has no alignment to keep.
         self.restore_raw(unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) })
     }
 
     /// Put back bytes [`Self::raw`] or [`Self::words`] gave, with every
     /// page's generation bumped so no compiled code outlives them.
-    pub fn restore_raw(&mut self, data: &[u8]) -> Result<(), String> {
+    pub fn restore_raw(&self, data: &[u8]) -> Result<(), String> {
         if data.len() != self.total {
             return Err(format!("saved memory is {} bytes, this machine has {}", data.len(), self.total));
         }
@@ -266,7 +317,7 @@ impl O2Memory {
 
     /// Page `page` was written: bump its generation.
     #[inline]
-    fn touch(&mut self, page: usize) {
+    fn touch(&self, page: usize) {
         #[cfg(feature = "jitv2")]
         self.store.bump_gen_off(page * PAGE);
         #[cfg(not(feature = "jitv2"))]
@@ -293,7 +344,7 @@ impl O2Memory {
     /// Store the low `n` bytes of `v` (1, 2 or 4) at `off`, aligned to `n`,
     /// big-endian, as [`Self::write`] would.
     #[inline]
-    pub fn put_be(&mut self, off: usize, n: u32, v: u32) {
+    pub fn put_be(&self, off: usize, n: u32, v: u32) {
         assert!(off + n as usize <= self.total && off % n as usize == 0, "O2 memory write {off:#x}/{n}");
         unsafe {
             match n {
@@ -326,7 +377,7 @@ impl O2Memory {
 
     /// Changes whenever an address may decode differently.
     pub fn decode_gen(&self) -> u64 {
-        self.decode_gen
+        self.decode_gen.load(Ordering::Acquire)
     }
 
     /// Bytes fitted.
@@ -352,47 +403,63 @@ impl O2Memory {
 
     /// The bank controls as last written.
     pub fn ctrls(&self) -> [u64; 8] {
-        self.ctrl
+        std::array::from_fn(|i| self.ctrl[i].load(Ordering::Acquire))
     }
 
     /// Bank `i`'s control register was written.
-    pub fn set_ctrl(&mut self, i: usize, val: u64) {
-        if self.ctrl[i] != val {
-            self.ctrl[i] = val;
-            self.rebuild();
+    pub fn set_ctrl(&self, i: usize, val: u64) {
+        let _one = self.rebuilding.lock().unwrap();
+        if self.ctrl[i].swap(val, Ordering::AcqRel) != val {
+            self.rebuild_locked();
         }
     }
 
-    fn rebuild(&mut self) {
-        self.decode_gen += 1;
-        self.slots = [Slot::None; SLOTS];
+    fn rebuild(&self) {
+        let _one = self.rebuilding.lock().unwrap();
+        self.rebuild_locked();
+    }
+
+    /// Recompute every slot from the controls. A reader racing this sees
+    /// some slots old and some new, each still inside fitted memory.
+    fn rebuild_locked(&self) {
+        self.decode_gen.fetch_add(1, Ordering::AcqRel);
+        let mut slots = [Slot::None; SLOTS];
         // Highest bank first, so the lowest-numbered match is the one left.
         for i in (0..8).rev() {
-            let base = (self.ctrl[i] & CTRL_BASE) as usize;
-            let span = if self.ctrl[i] & CTRL_128M != 0 { (BIG / SLOT) as usize } else { 1 };
+            let ctrl = self.ctrl[i].load(Ordering::Acquire);
+            let base = (ctrl & CTRL_BASE) as usize;
+            let span = if ctrl & CTRL_128M != 0 { (BIG / SLOT) as usize } else { 1 };
             for j in 0..span {
-                let Some(slot) = self.slots.get_mut(base + j) else { break };
-                *slot = if self.size[i] == 0 {
-                    Slot::Empty
-                } else {
-                    Slot::Ram { start: self.start[i], chunk: j as u32 * SLOT, mask: self.size[i] - 1 }
-                };
+                let Some(slot) = slots.get_mut(base + j) else { break };
+                *slot = if self.size[i] == 0 { Slot::Empty } else { Slot::Ram { bank: i as u8, chunk: j as u8 } };
             }
         }
-        self.remap();
+        for (dst, s) in self.slots.iter().zip(slots) {
+            dst.store(s.pack(), Ordering::Release);
+        }
+        self.remap(&slots);
+    }
+
+    /// For a slot of bank `bank` beginning `chunk` slots into it: the
+    /// bank's first byte in the store, the slot's offset into the bank
+    /// before wrapping, and the bank's size less one.
+    fn ram_slot(&self, bank: u8, chunk: u8) -> (u32, u32, u32) {
+        let b = bank as usize;
+        (self.start[b], chunk as u32 * SLOT, self.size[b] - 1)
     }
 
     /// Lay the window out as the decode now stands: every slot that decodes
     /// to RAM mapped from its bank's bytes in the store, at its place in the
     /// window and again in the low alias. Empty and unmatched slots stay
     /// unmapped, so the CPU reaches them through the bus as before.
-    fn remap(&mut self) {
+    fn remap(&self, slots: &[Slot; SLOTS]) {
         use std::sync::atomic::Ordering::Release;
         self.shared.mapped.store(0, Release);
         self.space.clear_mappings();
         let mut mapped = 0u32;
-        for (s, slot) in self.slots.iter().enumerate() {
-            let Slot::Ram { start, chunk, mask } = *slot else { continue };
+        for (s, slot) in slots.iter().enumerate() {
+            let Slot::Ram { bank, chunk } = *slot else { continue };
+            let (start, chunk, mask) = self.ram_slot(bank, chunk);
             if mask < SLOT - 1 {
                 continue; // a test's bank smaller than a slot: bus only
             }
@@ -405,7 +472,7 @@ impl O2Memory {
                 let _ = self.space.map_range(0, src, at, SLOT as u64);
             }
         }
-        self.shared.decode_gen.store(self.decode_gen, Release);
+        self.shared.decode_gen.store(self.decode_gen.load(Ordering::Acquire), Release);
         self.shared.mapped.store(mapped, Release);
     }
 
@@ -434,10 +501,13 @@ impl O2Memory {
         } else {
             return Decode::None;
         };
-        match self.slots[(off / SLOT) as usize] {
+        match Slot::unpack(self.slots[(off / SLOT) as usize].load(Ordering::Acquire)) {
             Slot::None => Decode::None,
             Slot::Empty => Decode::Empty,
-            Slot::Ram { start, chunk, mask } => Decode::Ram((start + ((chunk + off % SLOT) & mask)) as usize),
+            Slot::Ram { bank, chunk } => {
+                let (start, chunk, mask) = self.ram_slot(bank, chunk);
+                Decode::Ram((start + ((chunk + off % SLOT) & mask)) as usize)
+            }
         }
     }
 
@@ -758,7 +828,7 @@ mod tests {
 
     #[test]
     fn word_access_matches_the_byte_view() {
-        let mut m = O2Memory::single(1 << 20);
+        let m = O2Memory::single(1 << 20);
         m.write(0x100, &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
         assert_eq!(m.get_be(0x100, 4), 0x1122_3344);
         assert_eq!(m.get_be(0x104, 2), 0x5566);
@@ -776,7 +846,7 @@ mod tests {
     /// JIT tests covers exactly those regions.
     #[test]
     fn the_window_shows_ram_where_the_decode_puts_it() {
-        let mut m = O2Memory::from_kits(&[256]).unwrap();
+        let m = O2Memory::from_kits(&[256]).unwrap();
         m.set_ctrl(0, 0x100);
         m.set_ctrl(1, 0x100 | 4);
         let (lo, hi) = (RAM_BASE + 0x0012_3450, RAM_BASE + 0x0900_0010);
@@ -847,7 +917,7 @@ mod tests {
                 }
             }
         }
-        let c0 = m.ctrl[0];
+        let c0 = m.ctrl[0].load(Ordering::Relaxed);
         for bank in 0..8 {
             if found[bank] == 0 {
                 m.set_ctrl(bank, c0);
@@ -927,7 +997,7 @@ mod tests {
 
     #[test]
     fn a_small_bank_repeats_across_a_large_setting() {
-        let mut m = O2Memory::with_total(32).unwrap();
+        let m = O2Memory::with_total(32).unwrap();
         m.set_ctrl(0, CTRL_128M);
         assert_eq!(m.offset(RAM_BASE + 8), m.offset(RAM_BASE + 3 * SLOT + 8));
     }

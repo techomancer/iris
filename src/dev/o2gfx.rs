@@ -342,9 +342,9 @@ impl Gbe {
     }
 
     /// Render from `ram` holding its lock only to copy the frame's pages.
-    pub fn render_from(&self, ram: &Mutex<O2Memory>, out: &mut [u8]) -> Option<(u32, u32)> {
+    pub fn render_from(&self, ram: &O2Memory, out: &mut [u8]) -> Option<(u32, u32)> {
         let snap = {
-            let m = ram.lock().unwrap();
+            let m = &*ram;
             self.snapshot(&m)
         };
         self.render(&snap, out)
@@ -1151,7 +1151,7 @@ impl Clip {
 }
 
 impl CrimeRe {
-    pub fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
+    pub fn new(ram: Arc<O2Memory>) -> Self {
         // byteMask resets to all ones: NetBSD's MTE clears never write it.
         let mut regs = vec![0; RE_WORDS];
         regs[(MTE_BYTEMASK / 4) as usize] = 0xffff_ffff;
@@ -1166,7 +1166,7 @@ impl CrimeRe {
             started: std::sync::atomic::AtomicBool::new(false),
             engine: std::sync::OnceLock::new(),
             hot: Mutex::new(BTreeMap::new()),
-            win: Mutex::new(ram.lock().unwrap().window()),
+            win: Mutex::new(ram.window()),
             unhandled: Mutex::new(BTreeMap::new()),
             drawn: std::sync::atomic::AtomicU64::new(0),
             trace: Mutex::new(std::collections::VecDeque::new()),
@@ -2842,7 +2842,7 @@ mod tests {
     struct TestRe(Arc<CrimeRe>);
 
     impl TestRe {
-        fn new(ram: Arc<Mutex<O2Memory>>) -> Self {
+        fn new(ram: Arc<O2Memory>) -> Self {
             let re = Arc::new(CrimeRe::new(ram));
             re.start(re.clone(), |r| r);
             TestRe(re)
@@ -2900,7 +2900,7 @@ mod tests {
 
     #[test]
     fn re_save_load_round_trip() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let src = TestRe::new(ram.clone());
         src.write32(0x1500_0000 + FG, 0x1234_5678);
         src.write32(0x1500_0000 + BG, 0x9abc_def0);
@@ -2957,10 +2957,10 @@ mod tests {
                 (u32::from_str_radix(off, 16).unwrap(), u64::from_str_radix(val, 16).unwrap(), w == "w64")
             })
             .collect();
-        let mut m = O2Memory::from_kits(&[128, 128]).unwrap();
+        let m = O2Memory::from_kits(&[128, 128]).unwrap();
         m.set_ctrl(0, 0x100);
         m.set_ctrl(2, 0x100 | 4);
-        let ram = Arc::new(Mutex::new(m));
+        let ram = Arc::new(m);
         let re = TestRe::new(ram.clone());
         let mut best = f64::MAX;
         for _ in 0..passes {
@@ -2979,7 +2979,7 @@ mod tests {
         // A hash of all of memory, to check a change draws exactly the same.
         let hash = {
             use std::hash::{Hash, Hasher};
-            let m = ram.lock().unwrap();
+            let m = &*ram;
             let mut h = std::collections::hash_map::DefaultHasher::new();
             m.raw(0, m.len()).hash(&mut h);
             h.finish()
@@ -3001,7 +3001,7 @@ mod tests {
         }
         let out = std::env::var("RE_REPLAY_PNG").unwrap_or("replay.png".into());
         // 256 MB as two 128 MB banks, placed the way the PROM places them.
-        let mut m = O2Memory::from_kits(&[128, 128]).unwrap();
+        let m = O2Memory::from_kits(&[128, 128]).unwrap();
         m.set_ctrl(0, 0x100);
         m.set_ctrl(2, 0x100 | 4);
         // RE_REPLAY_PRELOAD="0849:tex-0849.bin,...": 64 KB tiles (by tile
@@ -3018,7 +3018,7 @@ mod tests {
                 (m.dma_offset(u32::from_str_radix(tile, 16).unwrap() << 16).unwrap(), std::fs::read(file).unwrap())
             })
             .collect();
-        let ram = Arc::new(Mutex::new(m));
+        let ram = Arc::new(m);
         let re = TestRe::new(ram.clone());
         // RE_REPLAY_PRELOAD_EVERY=N: put the tiles back every N writes
         // (2000 by default; a large trace with many tiles wants fewer).
@@ -3026,7 +3026,7 @@ mod tests {
         for (n, line) in std::fs::read_to_string(path).unwrap().lines().enumerate() {
             if n % every == 0 {
                 re.wait_idle();
-                let mut m = ram.lock().unwrap();
+                let m = &*ram;
                 for (o, data) in &preload {
                     m.write(*o, data);
                 }
@@ -3042,7 +3042,7 @@ mod tests {
         }
         re.wait_idle();
         let r = re.regs.lock().unwrap().clone();
-        let mut mem = ram.lock().unwrap().window();
+        let mut mem = ram.window();
         mem.begin();
         let (w, h) = (1280u32, 1024u32);
         let mut rgba = vec![0u8; (w * h * 4) as usize];
@@ -3091,7 +3091,7 @@ mod tests {
     /// the registers IRIX used.
     #[test]
     fn an_8bit_pixmap_copies_out_of_linear_b_into_the_root_window() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         // Screen: TLB A entry 0 at 0x0100_0000. Pixmap page at 0x0050_0000.
@@ -3101,7 +3101,7 @@ mod tests {
         let idx = (src >> 12) & 31;
         re.write64(base + TLB_LINEAR_A + 0x80 + 8 * (idx / 2), if idx & 1 == 1 { 0x8000_0000 | (page >> 12) as u64 } else { (0x8000_0000 | (page >> 12) as u64) << 32 });
         for i in 0..88u32 {
-            ram.lock().unwrap().write((page | (src & 0xfff)) as usize + i as usize, &[0x21]);
+            ram.write((page | (src & 0xfff)) as usize + i as usize, &[0x21]);
         }
         re.write32(base + BUFMODE_SRC, 0x1400);
         re.write32(base + BUFMODE_DST, 0x8000_0200);
@@ -3113,7 +3113,7 @@ mod tests {
         re.write32(base + XFER_STEP_X, 1);
         re.write32(base + XFER_STEP_ROW, 4);
         re.write32(base + (XFER_SRC | 0x800), src);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         // Pixel (10, 0): word 10 of the first tile row.
         assert_eq!(&m.bytes(0x0100_0000 + 40, (0x0100_0000 + 44) - (0x0100_0000 + 40)), &[0, 0, 0, 0x21]);
     }
@@ -3124,7 +3124,7 @@ mod tests {
     /// registers its crime driver used.
     #[test]
     fn transfers_blend_onto_the_screen() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3134,8 +3134,8 @@ mod tests {
         re.write64(base + TLB_LINEAR_A + 0x80 + 8 * (idx / 2), if idx & 1 == 1 { 0x8000_0000 | (page >> 12) as u64 } else { (0x8000_0000 | (page >> 12) as u64) << 32 });
         let screen = 0x0100_0000 + 10 * 4;
         let xfer = |smode: u32, func: u32, step: u32, data: &[u8]| {
-            ram.lock().unwrap().write(screen, &[0xff; 12]);
-            ram.lock().unwrap().write(page as usize, data);
+            ram.write(screen, &[0xff; 12]);
+            ram.write(page as usize, data);
             re.write32(base + BUFMODE_SRC, smode);
             re.write32(base + BUFMODE_DST, 0x228);
             re.write32(base + BLEND_CONST, 0);
@@ -3147,7 +3147,7 @@ mod tests {
             re.write32(base + XFER_STEP_X, step);
             re.write32(base + XFER_STEP_ROW, 0);
             re.write32(base + (XFER_SRC | 0x800), src);
-            ram.lock().unwrap().bytes(screen, 12)
+            ram.bytes(screen, 12)
         };
         // Alpha 0, half and whole: white, grey and black.
         assert_eq!(xfer(0x1428, 0x05, 1, &[0, 0x80, 0xff]), [255, 255, 255, 255, 127, 127, 127, 127, 0, 0, 0, 0]);
@@ -3187,7 +3187,7 @@ mod tests {
     /// and 2 (NEAREST_MIPMAP_NEAREST), at 128 the base magnified.
     #[test]
     fn mip_levels_come_from_their_places() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3195,7 +3195,7 @@ mod tests {
         re.write64(base + TLB_TEX + 8 * 23, (0x8060u64 << 48) | (0x8061u64 << 32));
         let cols: [[u8; 4]; 3] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             for (level, (tile, off)) in [(0x60usize, 0usize), (0x61, 0x8000), (0x60, 0xc000)].into_iter().enumerate() {
                 let n = 64u32 >> level;
                 for y in 0..n {
@@ -3230,7 +3230,7 @@ mod tests {
             re.write32(base + TEX_DQDX, 0);
             re.write32(base + (TEX_DQDY | 0x800), 0);
         };
-        let px = |ram: &Arc<Mutex<O2Memory>>| ram.lock().unwrap().bytes(0x0100_0000 + 512 + 4, 3);
+        let px = |ram: &Arc<O2Memory>| ram.bytes(0x0100_0000 + 512 + 4, 3);
         tri(128);
         assert_eq!(px(&ram), &[255, 0, 0]);
         tri(32);
@@ -3244,13 +3244,13 @@ mod tests {
     /// entry: Quake 3's 32 x 32 HUD digits were missing.
     #[test]
     fn a_small_map_is_found_whichever_entries_are_valid() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         re.write64(base + TLB_TEX + 8 * 23, (0x8060u64 << 48) | (0x8061u64 << 32));
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             for y in 0..32 {
                 for x in 0..32 {
                     m.write((0x61 << 16) + 0x8000 + subtile_offset(x * 4, y) as usize, &[30, 160, 90, 255]);
@@ -3276,7 +3276,7 @@ mod tests {
         re.write64(base + TEX_DTQDY, 512);
         re.write32(base + TEX_DQDX, 0);
         re.write32(base + (TEX_DQDY | 0x800), 0);
-        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000 + 512 + 4, 3), &[30, 160, 90]);
+        assert_eq!(ram.bytes(0x0100_0000 + 512 + 4, 3), &[30, 160, 90]);
     }
 
     /// A map smaller than 64 x 64 without mip levels is read from where its
@@ -3285,13 +3285,13 @@ mod tests {
     /// for one (textest, 2026-10-21). Read from offset 0, it drew black.
     #[test]
     fn a_small_map_is_read_from_its_place_in_the_tile() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         re.write64(base + TLB_TEX + 8 * 23, 0x8060u64 << 48);
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             for y in 0..16 {
                 for x in 0..16 {
                     m.write((0x60 << 16) + 0xc000 + subtile_offset(x * 4, y) as usize, &[200, 100, 50, 255]);
@@ -3317,7 +3317,7 @@ mod tests {
         re.write64(base + TEX_DTQDY, 1024);
         re.write32(base + TEX_DQDX, 0);
         re.write32(base + (TEX_DQDY | 0x800), 0);
-        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000 + 512 + 4, 3), &[200, 100, 50]);
+        assert_eq!(ram.bytes(0x0100_0000 + 512 + 4, 3), &[200, 100, 50]);
     }
 
     /// Ordered dithering to 5 bits: exact steps stay exact, and a value
@@ -3368,12 +3368,12 @@ mod tests {
     /// half-transparent one draws nothing.
     #[test]
     fn triangles_blend_and_alpha_test() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         let o = 0x0100_0000 + 512 + 2 * 4;
-        ram.lock().unwrap().write(o, &[0, 0, 200, 255]);
+        ram.write(o, &[0, 0, 200, 255]);
         re.write32(base + BUFMODE_DST, 0x220);
         re.write32(base + PRIMITIVE, 0x0200_0000);
         re.write32(base + BLEND_FUNC, 0x45);
@@ -3389,18 +3389,18 @@ mod tests {
             re.write32(base + (FG | 0x800), 0);
         };
         tri(0x0041_0478);
-        assert_eq!(&ram.lock().unwrap().bytes(o, 4), &[100, 0, 100, 191]);
+        assert_eq!(&ram.bytes(o, 4), &[100, 0, 100, 191]);
         re.write32(base + ALPHA_TEST, (4 << 8) | 0x80);
-        ram.lock().unwrap().write(o, &[0, 0, 200, 255]);
+        ram.write(o, &[0, 0, 200, 255]);
         tri(0x0041_0878);
-        assert_eq!(&ram.lock().unwrap().bytes(o, 4), &[0, 0, 200, 255]);
+        assert_eq!(&ram.bytes(o, 4), &[0, 0, 200, 255]);
     }
 
     /// A shaded GL point takes its colour from the shade registers and
     /// lands in its double-pix half, as bz's world needs.
     #[test]
     fn a_shaded_gl_point_takes_the_shade_colour() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3414,7 +3414,7 @@ mod tests {
         re.write64(base + SHADE_R + 8, 0);
         re.write32(base + (FG | 0x800), 0);
         let o = 0x0100_0000 + 512 + 2 * 4;
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert_eq!(&m.bytes(o + 2, 2), &[0x7c, 0x00], "red 31 in the half at offset 2");
     }
 
@@ -3423,7 +3423,7 @@ mod tests {
     /// destination at an odd byte and stopped the emulator.
     #[test]
     fn a_shaded_gl_point_into_an_8bit_buffer_keeps_fg() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3434,14 +3434,14 @@ mod tests {
         re.write64(base + TRI_V0, (gl(3) as u64) << 32 | gl(1) as u64);
         re.write64(base + SHADE_R, (248u64 << 12) << 32);
         re.write32(base + (FG | 0x800), 7);
-        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000 + 512 + 3, 1), vec![7]);
+        assert_eq!(ram.bytes(0x0100_0000 + 512 + 3, 1), vec![7]);
     }
 
     /// An unblended GL line is drawn whatever its colour's alpha: amesh's
     /// mesh, Gouraud lines with alpha 0 (IRIS GL RGB colours), drew nothing.
     #[test]
     fn an_unblended_gl_line_ignores_its_alpha() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3457,14 +3457,14 @@ mod tests {
         re.write64(base + SHADE_R + 8, (50u64 << 12) << 32);
         re.write32(base + (FG | 0x800), 0);
         let o = 0x0100_0000 + 512 + 2 * 4;
-        assert_eq!(&ram.lock().unwrap().bytes(o, 3), &[200, 100, 50]);
+        assert_eq!(&ram.bytes(o, 3), &[200, 100, 50]);
     }
 
     /// A flat colour-index GL triangle stores FG's index as it stands, as
     /// gr_osview's bars ask (FG 2 into a pixel-type-0 buffer).
     #[test]
     fn a_flat_colour_index_triangle_stores_fg_as_its_index() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3476,7 +3476,7 @@ mod tests {
         re.write64(base + TRI_V0 + 8, (gl(16) as u64) << 32 | gl(0) as u64);
         re.write64(base + TRI_V0 + 16, (gl(0) as u64) << 32 | gl(8) as u64);
         re.write32(base + (FG | 0x800), 2);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         // Pixel (2, 1): row 1 of the first tile, 512 bytes a row.
         let o = 0x0100_0000 + 512 + 2 * 4;
         assert_eq!(&m.bytes(o, 4), &[0, 0, 0, 2]);
@@ -3488,7 +3488,7 @@ mod tests {
     /// drawn over the whole scene.
     #[test]
     fn a_stencilled_triangle_draws_only_where_the_stencil_was_marked() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3510,7 +3510,7 @@ mod tests {
         tri(8, 1);
         re.write32(base + STENCIL_MODE, 0x01ff_2000);
         tri(32, 2);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         let px = |x: usize, y: usize| m.bytes(0x0100_0000 + y * 512 + x * 4 + 3, 1)[0];
         let st = |x: usize, y: usize| m.bytes(0x0110_0000 + y * 512 + x * 4, 1)[0];
         assert_eq!((px(2, 1), st(2, 1)), (2, 1), "inside the mark: drawn, stencil 1");
@@ -3522,12 +3522,12 @@ mod tests {
     /// emulator on a write to 0x...001. Its pixels then follow a word apart.
     #[test]
     fn a_32bit_linear_end_off_its_word_does_not_abort() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             for x in 0..8u32 {
                 m.write((0x0100_0000 + x * 4) as usize, &(0x1100_0000 | x).to_be_bytes());
             }
@@ -3546,7 +3546,7 @@ mod tests {
         re.write32(base + XFER_STEP_ROW, 0);
         re.write32(base + XFER_DST, dst);
         re.write32(base + (XFER_SRC | 0x800), 0);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         let at = (page + (dst & 0xfff & !3)) as usize;
         for x in 0..8u32 {
             let v = u32::from_be_bytes(m.bytes(at + 4 * x as usize, 4).try_into().unwrap());
@@ -3604,9 +3604,9 @@ mod tests {
                 w(base + (VERTEX_1 | 0x800), ((i % 100) + 3) << 16 | (i / 100));
             }
         };
-        let one_ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let one_ram = Arc::new(O2Memory::single(32 << 20));
         draw(&TestRe::new(one_ram.clone()), true);
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         draw(&re, false);
         let mut spins = 0;
@@ -3615,7 +3615,7 @@ mod tests {
             assert!(spins < 50_000_000, "never idle");
         }
         assert_eq!(re.read32((0x1500_0000 + FG) as u64).data, 0x1020_3000 | 199, "a read when idle sees the last write");
-        assert_eq!(ram.lock().unwrap().bytes(0x0100_0000, 0x1000), one_ram.lock().unwrap().bytes(0x0100_0000, 0x1000));
+        assert_eq!(ram.bytes(0x0100_0000, 0x1000), one_ram.bytes(0x0100_0000, 0x1000));
     }
 
     /// A full interface buffer holds the CPU's write back (BUS_BUSY) with
@@ -3623,7 +3623,7 @@ mod tests {
     /// entries would: what is queued below that, one entry past it.
     #[test]
     fn a_full_interface_buffer_asks_the_cpu_to_retry() {
-        let re = CrimeRe::new(Arc::new(Mutex::new(O2Memory::single(32 << 20))));
+        let re = CrimeRe::new(Arc::new(O2Memory::single(32 << 20)));
         let level = |re: &CrimeRe| re.read32((0x1500_0000 + STATUS) as u64).data;
         for i in 0..(IB_DEPTH as u32 - 1) {
             assert_eq!(re.write32((0x1500_0000 + FG) as u64, i), BUS_OK, "write {i}");
@@ -3648,7 +3648,7 @@ mod tests {
     /// shows, and into an RGBA window FG goes in unchanged.
     #[test]
     fn rectangles_store_fg_in_the_destination_pixel_type() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         re.write64(base + TLB_A, (0x8000u64 | 0x100) << 48);
@@ -3660,7 +3660,7 @@ mod tests {
             re.write32(base + FG, fg);
             re.write32(base + VERTEX_0, (4 << 16) | 0);
             re.write32(base + (VERTEX_1 | 0x800), (5 << 16) | 0);
-            let m = ram.lock().unwrap();
+            let m = &*ram;
             assert_eq!(&m.bytes(0x0100_0000 + 16, 4), &want, "mode {mode:#x}");
         }
     }
@@ -3672,7 +3672,7 @@ mod tests {
     /// carries the 4096 guard band, places it modulo 4096.
     #[test]
     fn a_read_back_fills_the_linear_buffer_bottom_row_first() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         // One 64 KB tile at 0x0010_0000: 128 x 128 pixels of 32 bits.
@@ -3680,7 +3680,7 @@ mod tests {
         re.write64(base + TLB_A, (0x8000u64 | (tile >> 16) as u64) << 48);
         let px = |x: u32, y: u32| 0xaa00_0000 | x << 8 | y;
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             for y in 60..70u32 {
                 for x in 60..70u32 {
                     m.write((tile + y * 512 + x * 4) as usize, &px(x, y).to_be_bytes());
@@ -3708,7 +3708,7 @@ mod tests {
         re.write32(base + XFER_STEP_ROW, 1);
         re.write32(base + XFER_DST_STRIDE, 4);
         re.write32(base + (XFER_DST | 0x800), 0x2000);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         let got = |i: u32| u32::from_be_bytes(m.bytes((buf + 4 * i) as usize, 4).try_into().unwrap());
         for (j, row) in [65u32, 64].into_iter().enumerate() {
             for i in 0..4u32 {
@@ -3721,8 +3721,8 @@ mod tests {
     /// pairs, then a clear from DST0 to DST1 with the fill colour.
     #[test]
     fn the_mte_clears_pages_through_linear_a_as_irix_asks() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
-        ram.lock().unwrap().write(0x0011_3fff, &[0x55; 0x2_0002]);
+        let ram = Arc::new(O2Memory::single(32 << 20));
+        ram.write(0x0011_3fff, &[0x55; 0x2_0002]);
         let re = TestRe::new(ram.clone());
         let base = 0x1500_0000;
         let addr = 0x0011_4000u32;
@@ -3737,7 +3737,7 @@ mod tests {
         re.write32(base + MTE_FG, 0);
         re.write32(base + MTE_BYTEMASK, 0xffff_ffff);
         re.write32(base + (MTE_MODE | 0x800), 0x11);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         assert!(m.bytes(addr as usize, ((addr + 32 * 4096) as usize) - (addr as usize)).iter().all(|&b| b == 0), "all 128 KB cleared");
         assert_eq!(m[addr as usize - 1], 0x55, "the byte before is untouched");
         assert_eq!(m[(addr + 32 * 4096) as usize], 0x55, "the byte after is untouched");
@@ -3765,13 +3765,13 @@ mod tests {
     /// Fill a rectangle through TLB A, then scan it out through a tile list.
     #[test]
     fn a_filled_rectangle_comes_out_of_scanout_in_its_cmap_colour() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let g = gbe();
         // One 64 KB tile at 0x0010_0000, so a 512 x 128 screen at 8 bpp.
         let tile = 0x0010_0000u32;
         let list = 0x0020_0000u32;
-        ram.lock().unwrap().write(list as usize, &((tile >> 16) as u16).to_be_bytes());
+        ram.write(list as usize, &((tile >> 16) as u16).to_be_bytes());
         // TLB A entry 0: valid, tile address >> 16.
         re.write64(0x1500_0000 + TLB_A, (0x8000u64 | (tile >> 16) as u64) << 48);
         re.write32(0x1500_0000 + BUFMODE_DST, 0);
@@ -3781,7 +3781,7 @@ mod tests {
         re.write32(0x1500_0000 + VERTEX_0, (10 << 16) | 20);
         re.write32(0x1500_0000 + (VERTEX_1 | 0x800), (19 << 16) | 29);
         {
-            let m = ram.lock().unwrap();
+            let m = &*ram;
             assert_eq!(m[(tile + 20 * 512 + 10) as usize], 5);
             assert_eq!(m[(tile + 29 * 512 + 19) as usize], 5, "inclusive corner");
             assert_eq!(m[(tile + 29 * 512 + 20) as usize], 0);
@@ -3805,7 +3805,7 @@ mod tests {
             g.write32((0x1600_0000 + off) as u64, v);
         }
         let mut out = vec![0u8; 2048 * 2048 * 4];
-        let (w, h) = g.render(&*ram.lock().unwrap(), &mut out).expect("display on");
+        let (w, h) = g.render(&*ram, &mut out).expect("display on");
         assert_eq!((w, h), (512, 128));
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(10, 20), [0x11, 0x22, 0x33]);
@@ -3816,7 +3816,7 @@ mod tests {
     /// FG 0x00000002: every set bit is index 2, whatever its byte in the word.
     #[test]
     fn an_8bit_stippled_line_takes_its_colour_from_the_low_byte() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let re = TestRe::new(ram.clone());
         let tile = 0x0010_0000u32;
         let b = 0x1500_0000;
@@ -3830,19 +3830,19 @@ mod tests {
         re.write32(b + STIPPLE_MODE, 0x001f_0000);
         re.write64(b + VERTEX_0, 0x0081_00b4_0089_00b4);
         re.write32(b + (STIPPLE_PATTERN | 0x800), 0xff00_0000);
-        let m = ram.lock().unwrap();
+        let m = &*ram;
         let row = (tile + (0xb4 - 128) * 512 + 0x81) as usize;
         assert_eq!(&m.bytes(row, (row + 9) - (row)), &[2, 2, 2, 2, 2, 2, 2, 2, 0], "eight pixels, the end one skipped");
     }
 
     #[test]
     fn overlay_pixels_cover_the_normal_planes_and_zero_is_clear() {
-        let ram = Arc::new(Mutex::new(O2Memory::single(32 << 20)));
+        let ram = Arc::new(O2Memory::single(32 << 20));
         let g = gbe();
         // Normal planes: one tile of 5s. Overlay: its own tile, one pixel 7.
         let (tile, list, otile, olist) = (0x0010_0000u32, 0x0020_0000u32, 0x0030_0000u32, 0x0020_0100u32);
         {
-            let mut m = ram.lock().unwrap();
+            let m = &*ram;
             m.write(list as usize, &((tile >> 16) as u16).to_be_bytes());
             m.write(olist as usize, &((otile >> 16) as u16).to_be_bytes());
             m.write(tile as usize, &[5u8; 0x10000]);
@@ -3871,7 +3871,7 @@ mod tests {
             g.write32((0x1600_0000 + off) as u64, v);
         }
         let mut out = vec![0u8; 2048 * 2048 * 4];
-        g.render(&*ram.lock().unwrap(), &mut out).expect("display on");
+        g.render(&*ram, &mut out).expect("display on");
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(3, 4), [0xaa, 0xbb, 0xcc], "overlay colour from entry 0x1100 + 7");
         assert_eq!(px(4, 4), [0x11, 0x22, 0x33], "overlay 0 shows the normal planes");

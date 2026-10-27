@@ -129,12 +129,14 @@ its sources and sends set/clear packets to Heart.
 
 1. **Done.** `PciDma` takes `u64` addresses and returns `PciDmaStatus`;
    `HostMemory` and the AIC-7880 follow. No behaviour change.
-2. `HostMemory` copies runs: resolve the first byte, copy up to the end of
-   the RAM slot, repeat, instead of one lock-protected `dma_offset` per
-   byte.
+2. **Done (2026-10-26).** `O2Memory` has no lock: it is shared as a plain
+   `Arc`, byte ops take `&self`, the bank decode is atomics, and only
+   `set_ctrl` rebuilds serialise. `HostMemory` decodes once per 4 KiB page
+   and copies the page with one `write`/`read_into` (one jitv2 generation
+   bump per page, not per byte).
 3. MACE's internal engines (MEC, audio, serial DMA) take a shared
    `Arc<dyn PciDma>`-like memory view onto CRIME physical addresses instead
-   of `Arc<Mutex<O2Memory>>` (a second fixed view, not the PCI one; a
+   of `Arc<O2Memory>` (a second fixed view, not the PCI one; a
    separate trait or the same one with CRIME addresses, decide then).
 4. The O2's views as the spec has them: settle `^3` vs `^7` and why a
    swapped native view broke OpenBSD, then move the AIC's per-driver word

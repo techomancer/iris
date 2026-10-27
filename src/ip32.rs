@@ -288,7 +288,7 @@ impl BusDevice for Stub {
 /// of range checks rather than the 64 KB dispatch table `Physical` uses:
 /// there are five regions, and an unmapped access is easy to log.
 pub struct Ip32Bus {
-    pub(crate) ram: std::sync::Arc<Mutex<O2Memory>>,
+    pub(crate) ram: std::sync::Arc<O2Memory>,
     /// The flash. Writable, because an O2 keeps its environment variables in
     /// it -- there is no separate NVRAM chip -- and the installer saves
     /// settings there. The user's PROM file is never touched: this is a copy.
@@ -315,7 +315,7 @@ pub struct Ip32Bus {
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
     /// The ppmem window's base and the RAM bitmap the memory space keeps
     /// (one bit per 64 MB region it has fully mapped), once the machine has
-    /// wired them: aligned RAM reads then skip the RAM lock. See `read_bytes`.
+    /// wired them: aligned RAM reads then skip the decode. See `read_bytes`.
     fast_ram: std::sync::OnceLock<(usize, usize)>,
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
@@ -336,7 +336,7 @@ impl Ip32Bus {
 
     /// A machine with `mem` fitted, configured by `opts`.
     pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options) -> Self {
-        let ram = std::sync::Arc::new(Mutex::new(mem));
+        let ram = std::sync::Arc::new(mem);
         let ust = std::sync::Arc::new(MaceUst::new());
         let crime = std::sync::Arc::new(Crime::new(ust.clone()));
         let bus = Self {
@@ -403,7 +403,7 @@ impl Ip32Bus {
 
     /// Memory fitted, in bytes.
     pub fn ram_len(&self) -> u32 {
-        self.ram.lock().unwrap().total()
+        self.ram.total()
     }
 
     /// A CRIME write that may have moved a memory bank.
@@ -555,7 +555,7 @@ impl Ip32Bus {
         let addr = self.resolve(addr);
         // Mapped RAM, read straight from the window: IRIX's idle loop and
         // uncached kernel loads came here thousands of times a second, each
-        // taking the RAM lock and assembling the value a byte at a time.
+        // decoding the address and assembling the value a byte at a time.
         // An aligned word is a host u32 in the window's layout (see
         // O2Memory::get_be).
         if let Some(&(win, bm)) = self.fast_ram.get() {
@@ -574,7 +574,7 @@ impl Ip32Bus {
             }
         }
         {
-            let r = self.ram.lock().unwrap();
+            let r = &*self.ram;
             match r.decode(addr) {
                 // A bank control matches but nothing is fitted: what is left
                 // on the memory bus, which POST has just cleared to zero.
@@ -584,7 +584,6 @@ impl Ip32Bus {
                     for k in 0..n {
                         v = (v << 8) | r[i + k] as u64;
                     }
-                    drop(r);
                     return Some(v);
                 }
                 Decode::None => {}
@@ -608,7 +607,7 @@ impl Ip32Bus {
     fn write_bytes(&self, addr: u32, n: usize, val: u64) -> bool {
         let addr = self.resolve(addr);
         {
-            let mut r = self.ram.lock().unwrap();
+            let r = &*self.ram;
             match r.decode(addr) {
                 // Writes into an empty bank are swallowed by the memory controller.
                 Decode::Empty => return true,
@@ -878,13 +877,13 @@ impl Ip32Bus {
 
     /// RAM and the flash, as `ram.bin` and `flash.bin` in `dir`.
     pub fn save_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.ram.lock().unwrap().save_raw(&dir.join("ram.bin"))?;
+        self.ram.save_raw(&dir.join("ram.bin"))?;
         std::fs::write(dir.join("flash.bin"), &*self.prom.lock().unwrap())
     }
 
     /// What [`Self::save_raw`] wrote, back.
     pub fn load_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.ram.lock().unwrap().load_raw(&dir.join("ram.bin"))?;
+        self.ram.load_raw(&dir.join("ram.bin"))?;
         let flash = std::fs::read(dir.join("flash.bin"))?;
         let mut prom = self.prom.lock().unwrap();
         if flash.len() != prom.len() {
@@ -922,7 +921,7 @@ impl BusDevice for Ip32Bus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
         let addr = self.resolve(addr as u32);
-        let r = self.ram.lock().unwrap();
+        let r = &*self.ram;
         match r.decode(addr) {
             Decode::Ram(i) => r.gen_ptr(i),
             _ => std::ptr::null(),

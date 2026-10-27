@@ -355,7 +355,7 @@ impl O2Machine {
         // control write), which is the window's contract.
         {
             use crate::ppmem::MappedMemory;
-            let ram = bus.ram.lock().unwrap();
+            let ram = &*bus.ram;
             let sp = ram.space();
             unsafe {
                 sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
@@ -692,7 +692,7 @@ impl O2Machine {
         snap.write_bin("flash.bin", &self.bus.flash_bytes()).map_err(|e| e.to_string())?;
         let store = ChunkStore::new("saves");
         let mut chunks = ChunksManifest::default();
-        chunks.bank_chunks[0] = put_words_as_chunks(&store, self.bus.ram.lock().unwrap().words())
+        chunks.bank_chunks[0] = put_words_as_chunks(&store, self.bus.ram.words())
             .map_err(|e| format!("CAS memory put: {e}"))?;
         snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
         for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
@@ -770,9 +770,9 @@ impl O2Machine {
         let chunks = snap.read_chunks_manifest().map_err(|e| format!("chunks.bin: {e}"))?;
         let memory = get_chunks_as_words(&ChunkStore::new("saves"), &chunks.bank_chunks[0])
             .map_err(|e| format!("CAS memory get: {e}"))?;
-        if memory.len() * 4 != self.bus.ram.lock().unwrap().len() {
+        if memory.len() * 4 != self.bus.ram.len() {
             return Err(format!("snapshot memory is {} MB, this O2 has {} MB",
-                memory.len() >> 18, self.bus.ram.lock().unwrap().len() >> 20));
+                memory.len() >> 18, self.bus.ram.len() >> 20));
         }
         let ctrls = self.bus.scsi.lock().unwrap().len();
         let overlays = (0..ctrls)
@@ -799,7 +799,7 @@ impl O2Machine {
         self.bus.load_state(&s.bus)?;
         self.boot.load(&s.boot);
         self.bus.set_flash(&s.flash)?;
-        self.bus.ram.lock().unwrap().restore_words(&s.memory)?;
+        self.bus.ram.restore_words(&s.memory)?;
         for (i, ctl) in self.bus.scsi.lock().unwrap().iter().enumerate() {
             if let Some(Some(sets)) = s.overlays.get(i) {
                 ctl.import_overlays(&s.dir.join(format!("ctrl{i}")), sets)
