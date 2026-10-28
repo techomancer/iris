@@ -19,8 +19,15 @@ use crate::ip32::*;
 /// Transmit only. The line status register always reports the holding register
 /// empty, so the PROM never waits on us, and bytes are appended to a buffer
 /// rather than going anywhere.
+/// How much of a UART's output it keeps.
+pub const OUT_KEEP: usize = 64 * 1024;
+
 pub struct Com16550 {
-    out: Mutex<Vec<u8>>,
+    /// The last [`OUT_KEEP`] bytes sent, for the monitor and tests, and how
+    /// many were sent in all. A console left running for days would
+    /// otherwise keep every byte it ever printed.
+    out: Mutex<std::collections::VecDeque<u8>>,
+    sent: std::sync::atomic::AtomicUsize,
     /// The host end of the serial line, as the Z85C30's channels have:
     /// a TCP console, a log tee, or nothing.
     backend: Mutex<std::sync::Arc<dyn SerialBackend>>,
@@ -93,7 +100,8 @@ impl Com16550 {
     /// A UART answering monitor commands as `name`.
     pub fn named(name: &'static str) -> Self {
         Self {
-            out: Mutex::new(Vec::new()),
+            out: Mutex::new(std::collections::VecDeque::new()),
+            sent: std::sync::atomic::AtomicUsize::new(0),
             backend: Mutex::new(crate::dev::z85c30::null_serial_backend()),
             input: Default::default(),
             regs: Mutex::new([0u8; 8]),
@@ -135,19 +143,22 @@ impl Com16550 {
         self.input.lock().unwrap().len()
     }
 
-    /// Everything written to the transmit register so far.
+    /// What was written to the transmit register, the last [`OUT_KEEP`]
+    /// bytes of it.
     pub fn output(&self) -> String {
-        String::from_utf8_lossy(&self.out.lock().unwrap()).to_string()
+        self.output_tail(OUT_KEEP)
     }
 
+    /// Bytes sent in all, including those no longer kept.
     pub fn bytes_out(&self) -> usize {
-        self.out.lock().unwrap().len()
+        self.sent.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The last `n` bytes written, without copying the whole history.
+    /// The last `n` bytes written (at most [`OUT_KEEP`]).
     pub fn output_tail(&self, n: usize) -> String {
         let o = self.out.lock().unwrap();
-        String::from_utf8_lossy(&o[o.len().saturating_sub(n)..]).to_string()
+        let tail: Vec<u8> = o.iter().skip(o.len().saturating_sub(n)).copied().collect();
+        String::from_utf8_lossy(&tail).to_string()
     }
 
     /// Decode a MACE ISA address into a 16550 register number, if it names one.
@@ -275,7 +286,13 @@ impl Com16550 {
             self.input.lock().unwrap().push_back(val);
             return;
         }
-        self.out.lock().unwrap().push(val);
+        let mut o = self.out.lock().unwrap();
+        if o.len() == OUT_KEEP {
+            o.pop_front();
+        }
+        o.push_back(val);
+        drop(o);
+        self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let backend = self.backend.lock().unwrap().clone();
         backend.send_byte(val);
     }

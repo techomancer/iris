@@ -115,9 +115,25 @@ Status: CRIME and the bus done 2026-10-27, on the `physical.rs` pattern
 (`#[cfg(not(feature = "lightning"))]` plus a relaxed flag): `irqlog` behind
 `crime irqlog on`, `trace` behind a per-register bitmap, `writes` deleted
 (unused; `crime status` shows the banks), `time_base` atomic, the bogus
-read in `write32` gone, `Ip32Bus.unmapped` behind a "full" flag. Left: the
-`Stub` counters, ns16550 `out`, `MaceUst.ticks`, `CrimeRe.win`, the GFIFO
-CAS, `Ip32Bus.scsi`.
+read in `write32` gone, `Ip32Bus.unmapped` behind a "full" flag. Then:
+`MaceUst` lock-free outside 1-Wire work (it locked on every UST and CRIME
+TIME read; the mutex now serialises only reads inside the PROM's 1-Wire
+window), `ticks` atomic, ns16550 `out` capped at 64 KiB with a total
+counter, `Stub` totals out of `lightning`. Not done, not worth it:
+`CrimeRe.win` (RE thread only, once per primitive, uncontended),
+`Ip32Bus.scsi` (snapshots only), the GFIFO CAS.
+
+Measured 2026-10-27 with raw `dd` from `/dev/rdsk/dks0d1vol` (3 reps each,
+within 2%): 4 KiB ~1.0 MB/s and 1 MiB ~11 MB/s on the phase-1 build and on
+phase 3 alike. Profiles of both: CRIME `log_irq` + `note` were ~0.5% of
+the CPU thread, locks invisible after phase 1. The guest runs ~15.5 M
+instructions/s during a 4 KiB read (~62k instructions per I/O) and the CPU
+thread is saturated; a quarter of it is `Ip32Bus::read_bytes`/`read32`
+(the shadow cache sends every load to the bus) and ~18% instruction fetch
+(`DecodeCache::fetch_slow`, `HandoverCache::fetch`). Phase 4 is where the
+time is. Guest PCs are spread (spl/CRIME, cache maintenance, delayloop),
+no single hot spot. Also: `O2-Display` composes the frame at 60 Hz even
+headless, a whole host core.
 
 Each of these runs on every access today:
 - CRIME `trace` (lock + linear scan), `irqlog` (lock + push), `writes`

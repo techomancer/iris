@@ -1,5 +1,7 @@
 //! MACE's UST counter: the O2's guest-visible time base.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Mutex;
 
 use crate::traits::{BusDevice, BusRead32, BusRead64, BUS_OK};
@@ -17,7 +19,7 @@ use crate::snapshot::{get_field, hex_u64, toml_u64};
 /// elapsed time to mean something, so the harness advances this from its step
 /// count and the rate below fixes the relationship.
 pub struct MaceUst {
-    ticks: Mutex<u64>,
+    ticks: AtomicU64,
     /// When set, the clock is the host's: microseconds since this instant,
     /// read live. The 1-Wire ID chip's slots are tens of microseconds, so a
     /// clock stepped from another thread cannot time them.
@@ -25,19 +27,16 @@ pub struct MaceUst {
     /// Added to the host clock, so a restored machine's time runs on from
     /// where it was saved rather than from when this process started.
     base: std::sync::atomic::AtomicI64,
-    /// The guest's own view of time: see [`MaceUst::guest_us`].
-    guest: Mutex<GuestClock>,
-}
-
-/// [`MaceUst::guest_us`]'s state, in host microseconds.
-#[derive(Default)]
-struct GuestClock {
-    /// The host time at the last guest clock read.
-    last: u64,
-    /// Host time the guest clock has dropped: stalls during 1-Wire work.
-    lost: u64,
-    /// The 1-Wire bus counts as busy until then.
-    onewire_until: u64,
+    /// The guest's own view of time ([`MaceUst::guest_us`]), in host
+    /// microseconds: the host time at the last guest clock read, the host
+    /// time the guest clock has dropped (stalls during 1-Wire work), and
+    /// until when the 1-Wire bus counts as busy. Outside 1-Wire work a read
+    /// is two loads and a store; `onewire` serialises the reads inside it,
+    /// which only the PROM makes.
+    last: AtomicU64,
+    lost: AtomicU64,
+    onewire_until: AtomicU64,
+    onewire: Mutex<()>,
 }
 
 /// While the PROM bit-banges 1-Wire, the longest step the guest clock takes
@@ -69,10 +68,13 @@ impl Default for MaceUst {
 impl MaceUst {
     pub fn new() -> Self {
         Self {
-            ticks: Mutex::new(0),
+            ticks: AtomicU64::new(0),
             host: std::sync::OnceLock::new(),
             base: std::sync::atomic::AtomicI64::new(0),
-            guest: Mutex::new(GuestClock::default()),
+            last: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            onewire_until: AtomicU64::new(0),
+            onewire: Mutex::new(()),
         }
     }
 
@@ -84,12 +86,12 @@ impl MaceUst {
     /// Set the clock to `us` microseconds, for a machine that keeps time by
     /// the host clock rather than by instructions run.
     pub fn set_us(&self, us: u64) {
-        *self.ticks.lock().unwrap() = us;
+        self.ticks.store(us, Relaxed);
     }
 
     /// Advance the clock to match `instructions` executed so far.
     pub fn advance_to(&self, instructions: u64) {
-        *self.ticks.lock().unwrap() = instructions * UST_TICKS_NUM / UST_TICKS_DEN;
+        self.ticks.store(instructions * UST_TICKS_NUM / UST_TICKS_DEN, Relaxed);
     }
 
     /// The counter as MACE presents it: one count per 960 ns (the 33.3 MHz
@@ -113,29 +115,34 @@ impl MaceUst {
     /// the guest's time never runs backwards.
     pub fn guest_us(&self) -> u64 {
         let now = self.now();
-        let mut g = self.guest.lock().unwrap();
-        if g.last != 0 && now < g.onewire_until {
-            let step = now.saturating_sub(g.last);
+        if now >= self.onewire_until.load(Relaxed) {
+            self.last.store(now, Relaxed);
+            return now - self.lost.load(Relaxed);
+        }
+        let _one = self.onewire.lock().unwrap();
+        let last = self.last.load(Relaxed);
+        if last != 0 {
+            let step = now.saturating_sub(last);
             if step > GUEST_CLOCK_STEP_CAP_US {
-                g.lost += step - GUEST_CLOCK_STEP_CAP_US;
+                self.lost.fetch_add(step - GUEST_CLOCK_STEP_CAP_US, Relaxed);
             }
         }
-        g.last = now;
-        now - g.lost
+        self.last.store(now, Relaxed);
+        now - self.lost.load(Relaxed)
     }
 
     /// The PROM touched the 1-Wire bus: hold stalls out of the guest's clock
     /// for a while.
     pub fn onewire_busy(&self) {
         let now = self.now();
-        self.guest.lock().unwrap().onewire_until = now + ONEWIRE_BUSY_US;
+        self.onewire_until.store(now + ONEWIRE_BUSY_US, Relaxed);
     }
 
     pub fn now(&self) -> u64 {
         match self.host.get() {
             Some(t0) => (t0.elapsed().as_micros() as i64
                 + self.base.load(std::sync::atomic::Ordering::Relaxed)) as u64,
-            None => *self.ticks.lock().unwrap(),
+            None => self.ticks.load(Relaxed),
         }
     }
 }
@@ -159,10 +166,10 @@ impl Device for MaceUst {
             "status" => {
                 // Read without advancing the guest clock (guest_us does).
                 let now = self.now();
-                let g = self.guest.lock().unwrap();
-                writeln!(w, "UST: {} clock, now {now} us, guest {} us ({} us held out for 1-Wire), counter {:#x} ({} ns a count)",
+                let lost = self.lost.load(Relaxed);
+                writeln!(w, "UST: {} clock, now {now} us, guest {} us ({lost} us held out for 1-Wire), counter {:#x} ({} ns a count)",
                     if self.host.get().is_some() { "host" } else { "instruction" },
-                    now - g.lost, g.lost, (now - g.lost) * 1000 / MACE_UST_PERIOD_NS, MACE_UST_PERIOD_NS).ok();
+                    now - lost, (now - lost) * 1000 / MACE_UST_PERIOD_NS, MACE_UST_PERIOD_NS).ok();
                 Ok(())
             }
             _ => Err("Usage: ust status".to_string()),
@@ -176,22 +183,23 @@ impl Device for MaceUst {
 impl Saveable for MaceUst {
     fn save_state(&self) -> toml::Value {
         let now = self.now();
-        let g = self.guest.lock().unwrap();
         let mut t = toml::map::Map::new();
         t.insert("now".into(), hex_u64(now));
-        t.insert("last".into(), hex_u64(g.last));
-        t.insert("lost".into(), hex_u64(g.lost));
-        t.insert("onewire_until".into(), hex_u64(g.onewire_until));
+        t.insert("last".into(), hex_u64(self.last.load(Relaxed)));
+        t.insert("lost".into(), hex_u64(self.lost.load(Relaxed)));
+        t.insert("onewire_until".into(), hex_u64(self.onewire_until.load(Relaxed)));
         toml::Value::Table(t)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         let u = |k: &str| get_field(v, k).and_then(toml_u64).unwrap_or(0);
         let now = u("now");
-        *self.ticks.lock().unwrap() = now;
+        self.ticks.store(now, Relaxed);
         let elapsed = self.host.get().map_or(0, |t0| t0.elapsed().as_micros() as i64);
         self.base.store(now as i64 - elapsed, std::sync::atomic::Ordering::Relaxed);
-        *self.guest.lock().unwrap() = GuestClock { last: u("last"), lost: u("lost"), onewire_until: u("onewire_until") };
+        self.last.store(u("last"), Relaxed);
+        self.lost.store(u("lost"), Relaxed);
+        self.onewire_until.store(u("onewire_until"), Relaxed);
         Ok(())
     }
 }
@@ -220,7 +228,9 @@ mod tests {
     fn save_load_round_trip() {
         let src = MaceUst::new();
         src.set_us(5_000_000);
-        *src.guest.lock().unwrap() = GuestClock { last: 4_999_000, lost: 1234, onewire_until: 5_003_000 };
+        src.last.store(4_999_000, Relaxed);
+        src.lost.store(1234, Relaxed);
+        src.onewire_until.store(5_003_000, Relaxed);
         let v1 = src.save_state();
 
         let dst = MaceUst::new();

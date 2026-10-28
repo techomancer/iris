@@ -215,10 +215,16 @@ impl Stub {
         v.sort_by_key(|&(_, r, w)| std::cmp::Reverse(r + w));
         v
     }
+    // The totals are for the bring-up report; a `lightning` build keeps
+    // none.
+    #[inline]
     pub(crate) fn r(&self) {
+        #[cfg(not(feature = "lightning"))]
         self.reads.fetch_add(1, Ordering::Relaxed);
     }
+    #[inline]
     pub(crate) fn w(&self) {
+        #[cfg(not(feature = "lightning"))]
         self.writes.fetch_add(1, Ordering::Relaxed);
     }
     pub(crate) fn cell(&self, addr: u32) -> u64 {
@@ -538,7 +544,8 @@ impl Ip32Bus {
         // O2Memory::get_be).
         if let Some(&(win, bm)) = self.fast_ram.get() {
             let bits = unsafe { std::ptr::read_volatile(bm as *const u64) };
-            if bits & (1u64 << (addr >> crate::ppmem::BITMAP_SHIFT)) != 0 && addr as usize % n == 0 {
+            // `n` is a power of two; `%` by a variable is a divide.
+            if bits & (1u64 << (addr >> crate::ppmem::BITMAP_SHIFT)) != 0 && addr as usize & (n - 1) == 0 {
                 let p = win + addr as usize;
                 let v = unsafe {
                     match n {

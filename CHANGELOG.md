@@ -152,6 +152,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   its unmapped-access list once it holds 64 entries. A `lightning` build
   keeps none of them. A 32-bit CRIME store no longer logs a read the guest
   never made.
+- **The O2's clock reads take no lock.** UST and CRIME's counter lock only
+  while the PROM bit-bangs the 1-Wire ID chip, the one time the guest clock
+  holds host stalls out. A UART keeps the last 64 KiB it sent, not every
+  byte since boot.
 - **O2 PCI register accesses take no bridge locks.** MACE's bridge keeps a
   table of the functions' open BAR windows, rebuilt after each
   configuration write, and a CPU access reads it without locking; the
