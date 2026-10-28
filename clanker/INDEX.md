@@ -30,6 +30,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cp0-status-writes-must-resync-privilege-state.md](cpu/cp0-status-writes-must-resync-privilege-state.md) | rule | Every `cp0_status` write must call `resync_privilege_state()` |
 | [cpu-count-is-wallclock-derived.md](cpu/cpu-count-is-wallclock-derived.md) | rule | CP0 Count is wallclock-derived, so Count tests flake |
 | [cpu-model-is-runtime-not-compile-time.md](cpu/cpu-model-is-runtime-not-compile-time.md) | design | The emulated CPU is a runtime flag now, not a cargo feature |
+| [decode-cache-index-must-survive-page-colouring.md](cpu/decode-cache-index-must-survive-page-colouring.md) | rule | Decode cache indexed by `pfn % 64` thrashed on the O2's coloured text pages; hash the page number. Also: O2 shadow model ran with an empty RAM bitmap in interpreter builds |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |

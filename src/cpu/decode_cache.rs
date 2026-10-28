@@ -32,7 +32,8 @@ use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
 #[cfg(feature = "opcodefusion")]
 use crate::cpu::mips_exec::FLAG_IMM_IS_NEXT;
 
-/// Decoded pages held at once. Direct-mapped on the page number.
+/// Decoded pages held at once. Direct-mapped on a hash of the page number
+/// ([`index`]).
 pub const PAGES: usize = 64;
 const SLOTS: usize = 1024; // 4 KB / 4
 const WORDS: usize = SLOTS / 64;
@@ -117,7 +118,7 @@ impl DecodeCache {
             let pfn = phys >> 12;
             let k = (phys as usize >> 2) & (SLOTS - 1);
             let (w, bit) = (k >> 6, 1u64 << (k & 63));
-            let page = &self.pages[pfn as usize % PAGES];
+            let page = &self.pages[index(pfn)];
             if page.pfn == pfn && !page.host.is_null() && page.valid[w] & bit != 0 {
                 let now = unsafe { *page.host.add(k) };
                 if now == page.slots[k].raw
@@ -148,7 +149,7 @@ impl DecodeCache {
         let pfn = phys >> 12;
         let k = (phys as usize >> 2) & (SLOTS - 1);
         let (w, bit) = (k >> 6, 1u64 << (k & 63));
-        let page = &mut self.pages[pfn as usize % PAGES];
+        let page = &mut self.pages[index(pfn)];
         let _ = ic_line;
         let host_for = || -> *const u32 {
             if !window.is_null() && crate::ppmem::bitmap_maps(bitmap, phys) {
@@ -192,6 +193,17 @@ impl DecodeCache {
         page.valid[w] |= bit;
         Ok(slot as *const DecodedInstr)
     }
+}
+
+/// The table entry for page `pfn`: a multiplicative hash, not the low bits.
+/// A kernel that colours pages (the O2's IRIX gives a page the physical
+/// colour of its virtual address, and program text starts on aligned
+/// addresses) hands out text pages that agree in their low bits, and with
+/// `pfn % PAGES` Dhrystone's and libc's text all took entry 0 and evicted
+/// each other on every call.
+#[inline(always)]
+fn index(pfn: u64) -> usize {
+    (pfn.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PAGES.trailing_zeros())) as usize
 }
 
 /// Word `k` of a page: one load from its window pointer, or a bus read at
@@ -244,13 +256,22 @@ mod tests {
     #[test]
     fn colliding_pages_do_not_alias() {
         let a = 0x1000u64;
-        let b = a + (PAGES as u64) * 4096;
+        let b = (1..).map(|n| a + n * 4096).find(|&b| index(b >> 12) == index(a >> 12)).unwrap();
         let m = mem(&[(a, 0x1111_1111), (b, 0x2222_2222)]);
         let read = |x: u64| Ok(*m.borrow().get(&x).unwrap_or(&0));
         let mut dc = DecodeCache::new();
         assert_eq!(unsafe { (*dc.fetch(a, std::ptr::null(), 0, 16, read).unwrap()).raw }, 0x1111_1111);
         assert_eq!(unsafe { (*dc.fetch(b, std::ptr::null(), 0, 16, read).unwrap()).raw }, 0x2222_2222);
         assert_eq!(unsafe { (*dc.fetch(a, std::ptr::null(), 0, 16, read).unwrap()).raw }, 0x1111_1111);
+    }
+
+    /// Coloured pages, which agree in their low page-number bits, spread over
+    /// the table instead of sharing one entry.
+    #[test]
+    fn coloured_pages_spread_over_the_table() {
+        const { assert!(PAGES.is_power_of_two()) };
+        let used: std::collections::HashSet<usize> = (0..PAGES as u64).map(|n| index(0x50000 + n * 64)).collect();
+        assert!(used.len() > PAGES / 2, "{} of {PAGES} entries", used.len());
     }
 
     /// A page in a RAM region reads its words through the window pointer, not

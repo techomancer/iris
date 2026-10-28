@@ -152,6 +152,20 @@ hashes are given where a change is easiest to understand by reading the commit.
   its unmapped-access list once it holds 64 entries. A `lightning` build
   keeps none of them. A 32-bit CRIME store no longer logs a read the guest
   never made.
+- **The O2 interpreter is about 2.5x faster.** Three faults compounded, so
+  O2 R10000 interpreter builds ran IRIX at about a third of an IP28's speed:
+  - Without `tcache` (every build without `jitv2`), the cache model the
+    kernel runs on never learned where RAM was, so every load, store and
+    instruction fetch went through the bus.
+  - Every fetch, load and store went through an out-of-line call that
+    switched between the PROM's cache model and the kernel's.
+  - The decoded-instruction cache was indexed by the low bits of the page
+    number. The O2's IRIX places program and library code on pages that
+    share those bits, so they evicted each other on every call. The index is
+    now a hash of the page number, which every machine uses.
+
+  Dhrystone (4M loops) went from about 35 000/s, after the first fix, to
+  42 000/s; an IP28 runs 47 000/s.
 - **The O2's clock reads take no lock.** UST and CRIME's counter lock only
   while the PROM bit-bangs the 1-Wire ID chip, the one time the guest clock
   holds host stalls out. A UART keeps the last 64 KiB it sent, not every

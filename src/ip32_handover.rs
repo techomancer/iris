@@ -87,6 +87,7 @@ macro_rules! live {
 
 impl<F: MipsCache, S: MipsCache> HandoverCache<F, S> {
     /// Whether the shadow model is live.
+    #[inline(always)]
     pub fn on_shadow(&self) -> bool {
         self.on_shadow.load(Ordering::Relaxed)
     }
@@ -112,6 +113,26 @@ impl<F: MipsCache, S: MipsCache> HandoverCache<F, S> {
             }
         }
         self.on_shadow.store(true, Ordering::Relaxed);
+    }
+
+    // The full model runs only the PROM: kept out of line, so the shadow
+    // model's fetch, load and store inline into the interpreter as they do
+    // on IP28 (an outlined forwarder carrying both models cost the O2 about
+    // a sixth of its interpreter time).
+    #[cold]
+    #[inline(never)]
+    fn full_fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
+        self.full.fetch(virt_addr, phys_addr)
+    }
+    #[cold]
+    #[inline(never)]
+    fn full_read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
+        self.full.read::<SIZE>(virt_addr, phys_addr)
+    }
+    #[cold]
+    #[inline(never)]
+    fn full_write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
+        self.full.write::<SIZE>(virt_addr, phys_addr, val)
     }
 
     /// Whether POST has started over since the last call: an Index Store Tag
@@ -162,17 +183,20 @@ impl<F: MipsCache + CpuModel, S: MipsCache> MipsCache for HandoverCache<F, S> {
         self.full.set_l1i_counters(hit.clone(), fetch.clone());
         self.shadow.set_l1i_counters(hit, fetch);
     }
+    #[inline(always)]
     fn fetch(&self, virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
-        live!(self, c => c.fetch(virt_addr, phys_addr))
+        if self.on_shadow() { self.shadow.fetch(virt_addr, phys_addr) } else { self.full_fetch(virt_addr, phys_addr) }
     }
     fn fetch_is_pure(&self) -> bool {
         live!(self, c => c.fetch_is_pure())
     }
+    #[inline(always)]
     fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
-        live!(self, c => c.read::<SIZE>(virt_addr, phys_addr))
+        if self.on_shadow() { self.shadow.read::<SIZE>(virt_addr, phys_addr) } else { self.full_read::<SIZE>(virt_addr, phys_addr) }
     }
+    #[inline(always)]
     fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
-        live!(self, c => c.write::<SIZE>(virt_addr, phys_addr, val))
+        if self.on_shadow() { self.shadow.write::<SIZE>(virt_addr, phys_addr, val) } else { self.full_write::<SIZE>(virt_addr, phys_addr, val) }
     }
     fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
         live!(self, c => c.write64_masked(virt_addr, phys_addr, val, mask))
@@ -276,10 +300,14 @@ impl<F: MipsCache + CpuModel, S: MipsCache> MipsCache for HandoverCache<F, S> {
             self.shadow.set_tcache_gen_window(gen_base);
         }
     }
-    /// The full model's: the one the machine registers with the memory
-    /// space, which keeps it up to date. `hand_over` copies it across.
+    /// The one the machine registers with the memory space, which keeps it
+    /// up to date: the full model's under tcache (`hand_over` copies it
+    /// across), else the shadow model's own. Without tcache the full model
+    /// has none, and the shadow model ran with an empty bitmap: every load,
+    /// store and instruction fetch went through the bus.
     fn tcache_bitmap_ptr(&self) -> *mut u64 {
-        self.full.tcache_bitmap_ptr()
+        let p = self.full.tcache_bitmap_ptr();
+        if p.is_null() { self.shadow.tcache_bitmap_ptr() } else { p }
     }
     fn tcache_base_ptr(&self) -> *mut u8 {
         live!(self, c => c.tcache_base_ptr())
@@ -326,6 +354,23 @@ mod tests {
         same::<F, S>();
         assert_eq!(<F as MipsCache>::L2_LINE, 64);
         same::<R5000O2Cache, R5000ShadowCache>();
+    }
+
+    /// The memory space publishes the RAM bitmap into whichever pointer this
+    /// hands it, and after the handover the shadow model must see it, with or
+    /// without tcache: an empty bitmap sends every access through the bus.
+    #[test]
+    fn after_the_handover_ram_is_read_from_the_window() {
+        let c = R10000Handover::from(Arc::new(crate::dev::mem::UnmappedRam) as Arc<dyn BusDevice>);
+        let mut window = [0u32; 4];
+        window[1] = 0x1234_5678;
+        unsafe {
+            c.set_tcache_window(window.as_mut_ptr() as *mut u8);
+            // What `set_bitmap_sink2` and a remap do: region 0 is RAM.
+            *c.tcache_bitmap_ptr() = 1;
+        }
+        c.hand_over();
+        assert_eq!(c.read::<4>(0x8000_0004, 4).data, 0x1234_5678, "a load reads the window, not the bus");
     }
 
     fn same<F: MipsCache + CpuModel, S: MipsCache + CpuModel>() {
