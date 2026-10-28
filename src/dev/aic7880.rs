@@ -2241,7 +2241,10 @@ mod tests {
     /// `sgptr`. Returns the chip; the caller inspects `ram`.
     fn netbsd_command(ram: &Ram, img_blocks: &[u8], cdb: &[u8], dataptr: u32, datacnt: u32, sgptr: u32) -> Arc<Aic7880> {
         let c = on(ram.clone());
-        let img = std::env::temp_dir().join(format!("iris-aic7880-nb-{}.img", std::process::id()));
+        // One file per call: these tests run in parallel in one process.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let img = std::env::temp_dir().join(format!("iris-aic7880-nb-{}-{n}.img", std::process::id()));
         std::fs::write(&img, img_blocks).expect("test image");
         c.attach_disk_at(1, &img).expect("attach");
         let (hscbs, shared, tag) = (0x2000u32, 0x4000u32, 3u8);
