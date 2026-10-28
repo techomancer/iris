@@ -145,7 +145,17 @@ screenshots), `CpuDevice` (what `Machine` holds for the CPU).
 
 ### The physical address map
 
-`Physical` (`src/physical.rs`) decodes physical addresses through a table of
+`Physical` (`src/physical.rs`) is the physical bus, and it belongs to no
+machine: a decode table, the RAM banks with ppmem's window over them, and the
+plain devices every machine needs (memory that reads zero, a black hole,
+aliases that re-dispatch a range elsewhere on the bus). A machine builds its
+devices and banks, creates a `Physical` over the banks and maps everything
+where its hardware decodes it. For the Indy and Indigo2 that is
+`src/ip22_bus.rs` (`Ip22Bus`): the address map, the MC's error reporting, and
+the MEMCFG remap that places the banks in the table and the window. The CPU
+and every DMA master reach memory through `Physical` as a `BusDevice`.
+
+`Physical` decodes physical addresses through a table of
 64 KB slots (one `*const dyn BusDevice` per `addr >> 16`), so finding the
 device for an access is one indexed load. The table itself is sparse and
 host-mapped (`SparseDeviceMap`, `src/ppmem/devmap.rs`): it spans a 40-bit

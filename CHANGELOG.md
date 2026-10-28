@@ -221,6 +221,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Physical address decoding
 
+- **`Physical` belongs to no machine.** It is the decode table, the RAM
+  banks with ppmem's window, and the plain devices every machine needs; each
+  machine maps its own devices and memory on it. The Indy and Indigo2 address
+  map and MEMCFG remap moved to `src/ip22_bus.rs`, so the O2 and the Octane
+  can build their buses from the same parts. `phys bench` now fills the first
+  fully mapped 64 MB of RAM instead of the Indy's high-memory window.
 - **The decode table is sparse and spans 40 bits.** `Physical` used to embed
   a 1 MB array of device pointers covering a 32-bit physical space. It is now
   a host-mapped table over a 40-bit space (`SparseDeviceMap`,

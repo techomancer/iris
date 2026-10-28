@@ -12,15 +12,10 @@ use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
 use crate::dev::eeprom_93c56::Eeprom93c56;
 use crate::physical::Physical;
+use crate::ip22_bus::{Ip22Bus, Ip22Devices};
 
 // Helper for passing *mut Physical into a Send+Sync closure (MEMCFG callback).
 // Safety: Physical is Send+Sync, and the Arc keeps it alive for the callback's lifetime.
-struct PhysPtr(*mut Physical);
-unsafe impl Send for PhysPtr {}
-unsafe impl Sync for PhysPtr {}
-impl PhysPtr {
-    fn get(&self) -> *mut Physical { self.0 }
-}
 use crate::physical::RamBank;
 use crate::dev::prom::Prom;
 use crate::dev::mc::MemoryController;
@@ -108,7 +103,8 @@ pub fn emulator_name() -> String {
 
 pub struct Machine {
     cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice>,
-    _phys: Arc<Physical>, // Keep reference to Physical Bus
+    /// The physical bus and the Indy's or Indigo2's devices on it.
+    board: Arc<Ip22Bus>,
     mc: MemoryController,
     hpc3: Hpc3,
     monitor: Arc<Monitor>,
@@ -669,51 +665,41 @@ impl Machine {
             None
         };
 
-        let phys_raw = Physical::new(
-            banks,
-            rex3.clone(),
-            rex3_head1.clone(),
-            gr2.clone(),
-            mgras.clone(),
+        let phys = Physical::new(banks.into());
+        let board = Arc::new(Ip22Bus::new(phys.clone(), Ip22Devices {
+            rex3: rex3.clone(),
+            rex3_head1: rex3_head1.clone(),
+            gr2: gr2.clone(),
+            mgras: mgras.clone(),
             ultra64,
             testdev,
             vino,
-            mc.clone(),
-            hpc3.clone(),
-            prom_port,
-            cfg.machine.profile.ip28(),
-        );
-
-        // Wrap Physical in Arc
-        let phys = Arc::new(phys_raw);
-
-        // Initialize device map now that Physical is in final location
-        // SAFETY: We have exclusive access since Arc was just created and not shared yet
-        unsafe {
-            let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
-            (*phys_ptr).init();
-        }
+            mc: mc.clone(),
+            hpc3: hpc3.clone(),
+            prom: prom_port,
+        }, cfg.machine.profile.ip28()));
 
         // Connect Physical to MC (for VDMA)
         mc.set_phys(phys.clone());
         mc.set_dma_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::McDma));
 
-        // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap banks in Physical.
-        // SAFETY: Physical is pinned in Arc; remap_banks(&mut self) is only invoked
-        // from the CPU thread (same thread that writes MEMCFG), never concurrently.
+        // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap the banks. Runs
+        // on the CPU thread (the thread that writes MEMCFG). Weak: the MC is
+        // one of the board's devices.
         {
-            let phys_ptr = PhysPtr(Arc::as_ptr(&phys) as *mut Physical);
+            let board = Arc::downgrade(&board);
             mc.set_memcfg_callback(Box::new(move |addrs| {
-                unsafe { (*phys_ptr.get()).remap_banks(addrs); }
+                if let Some(board) = board.upgrade() {
+                    board.remap_banks(addrs);
+                }
             }));
         }
 
         // Fire initial remap using MC's boot-time MEMCFG values
         {
-            let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
             let (memcfg0, memcfg1) = mc.get_memcfg();
             let addrs = mc.parse_memcfg(memcfg0, memcfg1);
-            unsafe { (*phys_ptr).remap_banks(addrs); }
+            board.remap_banks(addrs);
         }
         
         // Connect HPC3 to System Memory (via Physical)
@@ -721,11 +707,11 @@ impl Machine {
 
         // Connect VINO to System Memory, install a video source, start DMA.
         // Source kind + broadcast standard come from `[vino]` in iris.toml.
-        phys.vino.set_phys(phys.clone());
-        if let Some(mgras) = &phys.mgras { mgras.set_phys(phys.clone()); }
+        board.vino.set_phys(phys.clone());
+        if let Some(mgras) = &board.mgras { mgras.set_phys(phys.clone()); }
         // Host GL frames composite straight into the IMPACT framebuffer.
         #[cfg(feature = "hostgl")]
-        if let Some(mgras) = &phys.mgras {
+        if let Some(mgras) = &board.mgras {
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(mgras.clone())));
         }
         let standard = match cfg.vino.standard {
@@ -754,9 +740,9 @@ impl Machine {
         };
         if let Some(source) = source {
             let adjusted: Arc<dyn crate::video_source::VideoSource> =
-                Arc::new(crate::video_source::CdmcAdjustedSource::new(source, phys.vino.clone()));
-            phys.vino.set_source(adjusted);
-            phys.vino.start();
+                Arc::new(crate::video_source::CdmcAdjustedSource::new(source, board.vino.clone()));
+            board.vino.set_source(adjusted);
+            board.vino.start();
         }
 
         // 5. CPU config + TLB + Executor. The model is a runtime choice, but each
@@ -825,7 +811,7 @@ impl Machine {
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
-        if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
+        if let Some(rex3) = &board.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
 
         // Connect CPU to MC and IOC for signaling
         let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -843,11 +829,8 @@ impl Machine {
             }
             // Point Physical's cached bitmap at the CPU's field too, or its
             // direct-access fast path would keep reading the sink the space
-            // just abandoned. Same &mut-through-Arc discipline as init().
-            unsafe {
-                let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
-                (*phys_ptr).resync_ppmem_bitmap();
-            }
+            // just abandoned.
+            phys.resync_ppmem_bitmap();
             // The cache reads RAM straight out of the same window: the full
             // cache under tcache, the shadow cache always. A cache that does
             // not (the full cache without tcache) has no bitmap field and
@@ -875,13 +858,13 @@ impl Machine {
         // be a constructor parameter (see Hot::cycles's doc comment). Must
         // happen before hpc3.scsi().start() (called later, from
         // Machine::start) actually spawns the worker thread that reads it.
-        if let Some(rex3) = &phys.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(mgras) = &phys.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(rex3) = &phys.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(gr2) = &phys.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
-        if let Some(td) = &phys.testdev { td.attach_core(cpu.core_ptr()); }
+        if let Some(rex3) = &board.rex3 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(mgras) = &board.mgras { mgras.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(rex3) = &board.rex3_head1 { rex3.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(gr2) = &board.gr2 { gr2.set_cpu_cycles(cpu.cycles_ptr()); }
+        if let Some(td) = &board.testdev { td.attach_core(cpu.core_ptr()); }
         if cheritest_hook {
-            if phys.testdev.is_none() {
+            if board.testdev.is_none() {
                 eprintln!("iris: --cheritest-dump-hook needs --test-device; ignoring");
             } else {
                 cpu.set_cheritest_dump_hook(true);
@@ -945,13 +928,13 @@ impl Machine {
         monitor.register_device(Arc::new(mc.clone()));
         monitor.register_device(Arc::new(hpc3.clone()));
         monitor.register_device(phys.clone());
-        if let Some(rex3) = &phys.rex3 { monitor.register_device(rex3.clone()); }
-        if let Some(rex3) = &phys.rex3_head1 { monitor.register_device(rex3.clone()); }
-        if let Some(td) = &phys.testdev { monitor.register_device(td.clone()); }
-        if let Some(gr2) = &phys.gr2 { monitor.register_device(gr2.clone()); }
-        if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
-        if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
-        monitor.register_device(Arc::new(phys.vino.clone()));
+        if let Some(rex3) = &board.rex3 { monitor.register_device(rex3.clone()); }
+        if let Some(rex3) = &board.rex3_head1 { monitor.register_device(rex3.clone()); }
+        if let Some(td) = &board.testdev { monitor.register_device(td.clone()); }
+        if let Some(gr2) = &board.gr2 { monitor.register_device(gr2.clone()); }
+        if let Some(mgras) = &board.mgras { monitor.register_device(mgras.clone()); }
+        if let Some(u64) = &board.ultra64 { monitor.register_device(u64.clone()); }
+        monitor.register_device(Arc::new(board.vino.clone()));
         #[cfg(feature = "perfetto")]
         {
             crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
@@ -961,7 +944,7 @@ impl Machine {
             cpu.running_flag(),
             cpu.cycles_ptr(),
             cpu.fasttick_count(),
-            phys.rex3.clone(),
+            board.rex3.clone(),
             hpc3.hal2().cloned(),
         ));
         let monitor = Arc::new(monitor);
@@ -973,9 +956,9 @@ impl Machine {
             register_lock_fn("mc::eeprom", move || ep.is_locked());
             mc.register_locks();
             hpc3.register_locks();
-            if let Some(rex3) = &phys.rex3 { rex3.register_locks(); }
-            if let Some(rex3) = &phys.rex3_head1 { rex3.register_locks(); }
-            if let Some(mgras) = &phys.mgras { mgras.register_locks(); }
+            if let Some(rex3) = &board.rex3 { rex3.register_locks(); }
+            if let Some(rex3) = &board.rex3_head1 { rex3.register_locks(); }
+            if let Some(mgras) = &board.mgras { mgras.register_locks(); }
             cpu.register_locks();
         }
         {
@@ -993,7 +976,7 @@ impl Machine {
 
         Self {
             cpu,
-            _phys: phys,
+            board,
             mc,
             hpc3,
             monitor,
@@ -1033,10 +1016,10 @@ impl Machine {
         } else {
             self.display_resolution
         };
-        if let Some(rex3) = &self._phys.rex3 {
+        if let Some(rex3) = &self.board.rex3 {
             rex3.apply_display_resolution(mode);
         }
-        if let Some(rex3) = &self._phys.rex3_head1 {
+        if let Some(rex3) = &self.board.rex3_head1 {
             rex3.apply_display_resolution(mode);
         }
     }
@@ -1061,11 +1044,11 @@ impl Machine {
         self.hpc3.start();
         // Program VC2 before the refresh thread runs so the first frame has size.
         self.apply_host_display_resolution();
-        if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
-        if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
-        if let Some(u64) = &self._phys.ultra64 { u64.start(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.start(); }
+        if let Some(mgras) = &self.board.mgras { mgras.start_display(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.start(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.start(); }
+        if let Some(u64) = &self.board.ultra64 { u64.start(); }
 
         // Monitor server on localhost (port 8888 unless `monitor_port` says
         // otherwise) — always start, even in CI mode, so debug helpers
@@ -1108,13 +1091,13 @@ impl Machine {
 
     pub fn stop(&mut self) {
         self.cpu.stop();
-        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
-        if let Some(mgras) = &self._phys.mgras { mgras.stop_display(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
+        if let Some(mgras) = &self.board.mgras { mgras.stop_display(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
         self.hpc3.stop();
         self.mc.stop();
-        if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
+        if let Some(u64) = &self.board.ultra64 { u64.stop(); }
         // Idle -> Halted is not a lifecycle transition: a machine that was
         // never started has nothing to halt, and the monitor is not up to ask.
         if self.lifecycle != GuestState::Idle {
@@ -1191,31 +1174,31 @@ impl Machine {
     }
 
     pub fn get_rex3(&self) -> Option<Arc<crate::dev::ng1::rex3::Rex3>> {
-        self._phys.rex3.clone()
+        self.board.rex3.clone()
     }
 
     pub fn get_rex3_head1(&self) -> Option<Arc<crate::dev::ng1::rex3::Rex3>> {
-        self._phys.rex3_head1.clone()
+        self.board.rex3_head1.clone()
     }
 
     /// The graphics board driving the primary display, whichever it is.
     pub fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        if let Some(g) = &self._phys.gr2 {
+        if let Some(g) = &self.board.gr2 {
             return Some(g.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
         }
-        if let Some(m) = &self._phys.mgras {
+        if let Some(m) = &self.board.mgras {
             return Some(m.clone() as Arc<dyn crate::gfx_display::GfxDisplay>);
         }
-        self._phys.rex3.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
+        self.board.rex3.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
     }
 
     pub fn get_gr2(&self) -> Option<Arc<crate::dev::gr2::Gr2>> {
-        self._phys.gr2.clone()
+        self.board.gr2.clone()
     }
 
     /// The second head's display (Newport dual-head only).
     pub fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
-        self._phys.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
+        self.board.rex3_head1.clone().map(|r| r as Arc<dyn crate::gfx_display::GfxDisplay>)
     }
 
     pub fn get_timer_manager(&self) -> Arc<TimerManager> {
@@ -1458,17 +1441,17 @@ impl Machine {
         let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
 
         let bank_words: [Vec<u32>; 4] = [
-            self._phys.snapshot_bank_inmem(0),
-            self._phys.snapshot_bank_inmem(1),
-            self._phys.snapshot_bank_inmem(2),
-            self._phys.snapshot_bank_inmem(3),
+            self.board.phys.snapshot_bank_inmem(0),
+            self.board.phys.snapshot_bank_inmem(1),
+            self.board.phys.snapshot_bank_inmem(2),
+            self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self._phys.rex3.as_ref()
+        let framebuffers = self.board.rex3.as_ref()
             .map(|r| r.snapshot_framebuffers_inmem());
 
         // Re-read cow.toml (and cow1.toml, for controller 1) so rollback
@@ -1513,17 +1496,17 @@ impl Machine {
         }
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
             rex3.load_state(rex3_toml)?;
         }
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3_head1, &cp.rex3_head1) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
             rex3.load_state(rex3_toml)?;
         }
 
         for (i, words) in cp.bank_words.iter().enumerate() {
-            self._phys.restore_bank_inmem(i, words);
+            self.board.phys.restore_bank_inmem(i, words);
         }
-        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
             rex3.restore_framebuffers_inmem(rgb, aux);
         }
 
@@ -1567,17 +1550,17 @@ impl Machine {
         let eeprom = self.hpc3.eeprom().lock().save_state_owned();
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
-        let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
-        let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
+        let rex3 = self.board.rex3.as_ref().map(|r| r.save_state());
+        let rex3_head1 = self.board.rex3_head1.as_ref().map(|r| r.save_state());
 
         let bank_words: [Vec<u32>; 4] = [
-            self._phys.snapshot_bank_inmem(0),
-            self._phys.snapshot_bank_inmem(1),
-            self._phys.snapshot_bank_inmem(2),
-            self._phys.snapshot_bank_inmem(3),
+            self.board.phys.snapshot_bank_inmem(0),
+            self.board.phys.snapshot_bank_inmem(1),
+            self.board.phys.snapshot_bank_inmem(2),
+            self.board.phys.snapshot_bank_inmem(3),
         ];
 
-        let framebuffers = self._phys.rex3.as_ref()
+        let framebuffers = self.board.rex3.as_ref()
             .map(|r| r.snapshot_framebuffers_inmem());
 
         // Deliberately NOT restart_peripherals()/cpu.start() here — see this
@@ -1616,17 +1599,17 @@ impl Machine {
         self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3, &cp.rex3) {
             rex3.load_state(rex3_toml)?;
         }
-        if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3_head1, &cp.rex3_head1) {
+        if let (Some(rex3), Some(rex3_toml)) = (&self.board.rex3_head1, &cp.rex3_head1) {
             rex3.load_state(rex3_toml)?;
         }
 
         for (i, words) in cp.bank_words.iter().enumerate() {
-            self._phys.restore_bank_inmem(i, words);
+            self.board.phys.restore_bank_inmem(i, words);
         }
-        if let (Some(rex3), Some((rgb, aux))) = (&self._phys.rex3, &cp.framebuffers) {
+        if let (Some(rex3), Some((rgb, aux))) = (&self.board.rex3, &cp.framebuffers) {
             rex3.restore_framebuffers_inmem(rgb, aux);
         }
 
@@ -1641,18 +1624,18 @@ impl Machine {
     fn restart_peripherals(&mut self) {
         self.mc.start();
         self.hpc3.start();
-        if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
-        if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
-        if let Some(u64) = &self._phys.ultra64 { u64.start(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.start(); }
+        if let Some(mgras) = &self.board.mgras { mgras.start_display(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.start(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.start(); }
+        if let Some(u64) = &self.board.ultra64 { u64.start(); }
     }
 
     /// Helper to power-on reset all devices.
     /// Must be called with threads stopped.
     fn power_on_devices(&mut self) {
         self.cpu.power_on();
-        self._phys.reset_memory();
+        self.board.phys.reset_memory();
         self.mc.power_on();
         self.hpc3.ioc().power_on();
         // SCC: clears channel regs; backend socket kept alive so console survives.
@@ -1673,10 +1656,10 @@ impl Machine {
         // HAL2: reset all audio registers and channel state (timers already stopped).
         if let Some(hal2) = self.hpc3.hal2() { hal2.power_on(); }
         self.hpc3.power_on();
-        if let Some(rex3) = &self._phys.rex3 { rex3.power_on(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.power_on(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.power_on(); }
-        if let Some(td) = &self._phys.testdev { td.power_on(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.power_on(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.power_on(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.power_on(); }
+        if let Some(td) = &self.board.testdev { td.power_on(); }
         self.apply_host_display_resolution();
     }
 
@@ -1735,26 +1718,26 @@ impl Machine {
         // REX3 (optional — absent in headless config). Framebuffers are
         // included in the chunks manifest below for v3+; v2 wrote them as
         // standalone .bin files.
-        if let Some(rex3) = &self._phys.rex3 {
+        if let Some(rex3) = &self.board.rex3 {
             snap.write_state("rex3", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
             if sv < 3 {
                 rex3.save_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
-        if let Some(td) = &self._phys.testdev {
+        if let Some(td) = &self.board.testdev {
             snap.write_state("testdev", &td.save_state(), sv).map_err(|e| e.to_string())?;
         }
-        if let Some(rex3) = &self._phys.rex3_head1 {
+        if let Some(rex3) = &self.board.rex3_head1 {
             snap.write_state("rex3_head1", &rex3.save_state(), sv).map_err(|e| e.to_string())?;
             if sv < 3 {
                 let dir = &snap.dir;
                 rex3.save_framebuffers_named(dir, "rex3_head1").map_err(|e| e.to_string())?;
             }
         }
-        if let Some(gr2) = &self._phys.gr2 {
+        if let Some(gr2) = &self.board.gr2 {
             snap.write_state("gr2", &gr2.save_state(), sv).map_err(|e| e.to_string())?;
         }
-        if let Some(mgras) = &self._phys.mgras {
+        if let Some(mgras) = &self.board.mgras {
             snap.write_state("mgras", &mgras.save_state(), sv).map_err(|e| e.to_string())?;
         }
 
@@ -1766,11 +1749,11 @@ impl Machine {
             let store = ChunkStore::new("saves");
             let mut chunks = ChunksManifest::default();
             for i in 0..4 {
-                let words = self._phys.snapshot_bank_inmem(i);
+                let words = self.board.phys.snapshot_bank_inmem(i);
                 chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
                     .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
             }
-            if let Some(rex3) = &self._phys.rex3 {
+            if let Some(rex3) = &self.board.rex3 {
                 let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
                 let rgb_chunks = put_words_as_chunks(&store, &rgb)
                     .map_err(|e| format!("CAS rex3 rgb put: {}", e))?;
@@ -1781,7 +1764,7 @@ impl Machine {
             snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
         } else {
             for i in 0..4 {
-                self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+                self.board.phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
             }
         }
 
@@ -1831,9 +1814,9 @@ impl Machine {
         // load_snapshot_inner restarted peripherals; stop them again.
         self.hpc3.stop();
         self.mc.stop();
-        if let Some(rex3) = &self._phys.rex3 { rex3.stop(); }
-        if let Some(rex3) = &self._phys.rex3_head1 { rex3.stop(); }
-        if let Some(gr2) = &self._phys.gr2 { gr2.stop(); }
+        if let Some(rex3) = &self.board.rex3 { rex3.stop(); }
+        if let Some(rex3) = &self.board.rex3_head1 { rex3.stop(); }
+        if let Some(gr2) = &self.board.gr2 { gr2.stop(); }
         Ok(())
     }
 
@@ -2002,19 +1985,19 @@ impl Machine {
         let hpc3 = snap.read_state("hpc3", schema_version).map_err(|e| e.to_string())?;
         self.hpc3.load_state(&hpc3)?;
 
-        if let Some(rex3) = &self._phys.rex3 {
+        if let Some(rex3) = &self.board.rex3 {
             let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
             rex3.load_state(&rex3_v)?;
             if schema_version < 3 {
                 rex3.load_framebuffers(&snap.dir).map_err(|e| e.to_string())?;
             }
         }
-        if let Some(td) = &self._phys.testdev {
+        if let Some(td) = &self.board.testdev {
             if let Ok(v) = snap.read_state("testdev", schema_version) {
                 td.load_state(&v)?;
             }
         }
-        if let Some(rex3) = &self._phys.rex3_head1 {
+        if let Some(rex3) = &self.board.rex3_head1 {
             if let Ok(rex3_v) = snap.read_state("rex3_head1", schema_version) {
                 rex3.load_state(&rex3_v)?;
                 if schema_version < 3 {
@@ -2022,12 +2005,12 @@ impl Machine {
                 }
             }
         }
-        if let Some(gr2) = &self._phys.gr2 {
+        if let Some(gr2) = &self.board.gr2 {
             if let Ok(gr2_v) = snap.read_state("gr2", schema_version) {
                 gr2.load_state(&gr2_v)?;
             }
         }
-        if let Some(mgras) = &self._phys.mgras {
+        if let Some(mgras) = &self.board.mgras {
             if let Ok(mgras_v) = snap.read_state("mgras", schema_version) {
                 mgras.load_state(&mgras_v)?;
             }
@@ -2043,9 +2026,9 @@ impl Machine {
                 if hashes.is_empty() { continue; }
                 let words = get_chunks_as_words(&store, hashes)
                     .map_err(|e| format!("CAS bank{} get: {}", i, e))?;
-                self._phys.restore_bank_inmem(i, &words);
+                self.board.phys.restore_bank_inmem(i, &words);
             }
-            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self._phys.rex3, &chunks.framebuffer_chunks) {
+            if let (Some(rex3), Some((rgb_h, aux_h))) = (&self.board.rex3, &chunks.framebuffer_chunks) {
                 let rgb = get_chunks_as_words(&store, rgb_h)
                     .map_err(|e| format!("CAS rex3 rgb get: {}", e))?;
                 let aux = get_chunks_as_words(&store, aux_h)
@@ -2054,7 +2037,7 @@ impl Machine {
             }
         } else {
             for i in 0..4 {
-                self._phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
+                self.board.phys.load_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
             }
         }
 

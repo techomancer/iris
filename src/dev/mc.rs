@@ -402,7 +402,7 @@ impl MemoryController {
     /// are synthesized at HIMEM by the MEMCFG0 write itself. No-op once any
     /// bank is valid, so this never overrides what POST decided.
     pub fn post_map_banks(&self) -> bool {
-        use crate::physical::{BANK_SIZE, LOMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, LOMEM_BASE};
         let (m0, m1) = self.get_memcfg();
         if m0 != 0 || m1 != 0 {
             return false;
@@ -432,7 +432,7 @@ impl MemoryController {
     /// If the embedded PROM POSTed lomem (banks 0–1) but skipped himem, synthesize
     /// MEMCFG1 entries for configured banks 2–3 so IRIX sees extended RAM.
     fn synthesize_himem_banks(&self, state: &mut MemoryControllerState) -> bool {
-        use crate::physical::{BANK_SIZE, HIMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, HIMEM_BASE};
 
         // Only for a PROM that POSTs lomem and stops. The IP28 PROM sizes all
         // four banks itself, walking them one at a time through a probe window
@@ -1451,7 +1451,7 @@ mod tests {
 
     #[test]
     fn memcfg_encode_decode_roundtrip() {
-        use crate::physical::{BANK_SIZE, HIMEM_BASE, LOMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, HIMEM_BASE, LOMEM_BASE};
         for (base, size) in [
             (LOMEM_BASE, 128u32),
             (LOMEM_BASE + BANK_SIZE, 128),
@@ -1467,7 +1467,7 @@ mod tests {
 
     #[test]
     fn himem_synthesis_after_lomem_post() {
-        use crate::physical::{BANK_SIZE, LOMEM_BASE};
+        use crate::ip22_bus::{BANK_SIZE, LOMEM_BASE};
 
         let eeprom = Arc::new(Mutex::new(Eeprom93c56::new()));
         let mc = MemoryController::new(eeprom, true, [128, 128, 64, 64]);
@@ -1481,7 +1481,7 @@ mod tests {
         assert!(addrs[0].is_some() && addrs[1].is_some());
         assert!(addrs[2].is_some(), "bank 2 should be synthesized");
         assert!(addrs[3].is_some(), "bank 3 should be synthesized");
-        assert_eq!(addrs[2].unwrap().0, crate::physical::HIMEM_BASE);
+        assert_eq!(addrs[2].unwrap().0, crate::ip22_bus::HIMEM_BASE);
     }
 
     /// The IP28 PROM's own MEMCFG0 write, copied from a POST trace:
@@ -1570,9 +1570,9 @@ mod tests {
         for (size_mb, want) in [(8, (0, 1)), (16, (3, 0)), (32, (3, 1)), (64, (15, 0)), (128, (15, 1))] {
             assert_eq!(MemoryController::memcfg_size_rank_at(22, size_mb), Some(want), "{size_mb} MB");
         }
-        let half = MemoryController::encode_memcfg_half_at(22, crate::physical::LOMEM_BASE, 64).unwrap();
+        let half = MemoryController::encode_memcfg_half_at(22, crate::ip22_bus::LOMEM_BASE, 64).unwrap();
         let (base, _, limit) = MemoryController::memcfg_bank_info_at(22, half, 64).unwrap();
-        assert_eq!(base, crate::physical::LOMEM_BASE);
+        assert_eq!(base, crate::ip22_bus::LOMEM_BASE);
         assert_eq!(limit, 64 << 20);
     }
 }

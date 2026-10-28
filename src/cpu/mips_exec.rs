@@ -7,7 +7,7 @@ use crate::cpu::mips_tlb::*;
 use crate::cpu::mips_cache_v2::*;
 use crate::devlog::{LogModule, devlog_mask, devlog_is_active};
 use crate::cpu::mips_dis;
-use crate::physical::{HIMEM_BASE, HIMEM_END, LOMEM_BASE, LOMEM_END};
+use crate::ip22_bus::{HIMEM_BASE, HIMEM_END, LOMEM_BASE, LOMEM_END};
 use std::fmt::Write as FmtWrite;
 use crate::cpu::mips_dis::SymbolTable;
 use std::sync::Arc;

@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::cpu::jitv2::Jitv2;
-use crate::physical::HIMEM_BASE;
+use crate::ip22_bus::HIMEM_BASE;
 use crate::traits::BusDevice;
 
 pub mod jitv2_html {
