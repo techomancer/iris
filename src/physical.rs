@@ -142,6 +142,109 @@ impl BusDevice for AliasBus {
     }
 }
 
+/// A RAM bank answering `delta` bytes up the bus from where its own address
+/// mask would put it: `addr - delta` reaches the bank, which wraps it at its
+/// size. For a memory controller that places a bank at a base and counts
+/// offsets from there (CRIME), where the base is not a multiple of the bank's
+/// size.
+struct BankView {
+    bank: *const RamBank,
+    delta: u64,
+}
+
+unsafe impl Send for BankView {}
+unsafe impl Sync for BankView {}
+
+impl BankView {
+    #[inline(always)]
+    fn bank(&self) -> &RamBank {
+        unsafe { &*self.bank }
+    }
+    #[inline(always)]
+    fn at(&self, addr: u64) -> u64 {
+        addr.wrapping_sub(self.delta)
+    }
+}
+
+impl BusDevice for BankView {
+    #[inline] fn read8(&self, a: u64) -> BusRead8 { self.bank().read8(self.at(a)) }
+    #[inline] fn write8(&self, a: u64, v: u8) -> u32 { self.bank().write8(self.at(a), v) }
+    #[inline] fn read16(&self, a: u64) -> BusRead16 { self.bank().read16(self.at(a)) }
+    #[inline] fn write16(&self, a: u64, v: u16) -> u32 { self.bank().write16(self.at(a), v) }
+    #[inline] fn read32(&self, a: u64) -> BusRead32 { self.bank().read32(self.at(a)) }
+    #[inline] fn write32(&self, a: u64, v: u32) -> u32 { self.bank().write32(self.at(a), v) }
+    #[inline] fn read64(&self, a: u64) -> BusRead64 { self.bank().read64(self.at(a)) }
+    #[inline] fn write64(&self, a: u64, v: u64) -> u32 { self.bank().write64(self.at(a), v) }
+    #[inline] fn write64_masked(&self, a: u64, v: u64, m: u64) -> u32 { self.bank().write64_masked(self.at(a), v, m) }
+    #[inline] fn mem_ptr(&self, a: u64) -> Option<*const u64> { self.bank().mem_ptr(self.at(a)) }
+    #[inline] fn read_block(&self, a: u64, buf: &mut [u64]) -> u32 { self.bank().read_block(self.at(a), buf) }
+    #[inline] fn write_block(&self, a: u64, buf: &[u64]) -> u32 { self.bank().write_block(self.at(a), buf) }
+    #[cfg(feature = "jitv2")]
+    fn gen_ptr(&self, a: u64) -> *const std::sync::atomic::AtomicU64 { self.bank().gen_ptr(self.at(a)) }
+}
+
+/// Guest memory from `addr` into `buf`, through `bus` as a DMA master sees
+/// it: whole qwords with `read_block` a page at a time, single bytes at the
+/// ragged ends. Returns `BUS_OK` or the first other status.
+pub fn read_bytes(bus: &dyn BusDevice, addr: u64, buf: &mut [u8]) -> u32 {
+    const PAGE: u64 = 4096;
+    let mut done = 0usize;
+    let mut words = [0u64; (PAGE / 8) as usize];
+    while done < buf.len() {
+        let a = addr.wrapping_add(done as u64);
+        let left = buf.len() - done;
+        if a & 7 != 0 || left < 8 {
+            let r = bus.read8(a);
+            if !r.is_ok() {
+                return r.status;
+            }
+            buf[done] = r.data;
+            done += 1;
+            continue;
+        }
+        let n = (((PAGE - (a & (PAGE - 1))) / 8) as usize).min(left / 8);
+        let st = bus.read_block(a, &mut words[..n]);
+        if st != BUS_OK {
+            return st;
+        }
+        for (k, w) in words[..n].iter().enumerate() {
+            buf[done + 8 * k..done + 8 * k + 8].copy_from_slice(&w.to_be_bytes());
+        }
+        done += 8 * n;
+    }
+    BUS_OK
+}
+
+/// `data` into guest memory from `addr`, through `bus`: the write twin of
+/// [`read_bytes`].
+pub fn write_bytes(bus: &dyn BusDevice, addr: u64, data: &[u8]) -> u32 {
+    const PAGE: u64 = 4096;
+    let mut done = 0usize;
+    let mut words = [0u64; (PAGE / 8) as usize];
+    while done < data.len() {
+        let a = addr.wrapping_add(done as u64);
+        let left = data.len() - done;
+        if a & 7 != 0 || left < 8 {
+            let st = bus.write8(a, data[done]);
+            if st != BUS_OK {
+                return st;
+            }
+            done += 1;
+            continue;
+        }
+        let n = (((PAGE - (a & (PAGE - 1))) / 8) as usize).min(left / 8);
+        for (k, w) in words[..n].iter_mut().enumerate() {
+            *w = u64::from_be_bytes(data[done + 8 * k..done + 8 * k + 8].try_into().unwrap());
+        }
+        let st = bus.write_block(a, &words[..n]);
+        if st != BUS_OK {
+            return st;
+        }
+        done += 8 * n;
+    }
+    BUS_OK
+}
+
 /// Physical Bus (Physical)
 ///
 /// Routes every bus access to the device the decode table holds for its
@@ -189,6 +292,12 @@ pub struct Physical {
     /// Address ranges that re-dispatch into this bus at an offset. Boxed so
     /// the table's pointers survive the vector growing.
     aliases: Mutex<Vec<(Box<AliasBus>, String)>>,
+    /// Bank views handed out by [`Self::bank_view`], kept for the life of
+    /// the bus: a device thread may be dispatching through one a remap has
+    /// just replaced.
+    bank_views: Mutex<Vec<Box<BankView>>>,
+    /// What [`Self::set_default`] installed, for a remap to put back.
+    default: Mutex<Option<Entry>>,
 
     unmapped_ram: UnmappedRam,
     black_hole: BlackHoleRegion,
@@ -252,6 +361,8 @@ impl Physical {
             devices: Mutex::new(Vec::new()),
             borrowed: Mutex::new(Vec::new()),
             aliases: Mutex::new(Vec::new()),
+            bank_views: Mutex::new(Vec::new()),
+            default: Mutex::new(None),
             unmapped_ram: UnmappedRam,
             black_hole: BlackHoleRegion::new(),
             error_bus: ErrorBus::new(),
@@ -280,6 +391,7 @@ impl Physical {
     /// now, and any slot above it the first time the guest reaches it.
     pub fn set_default(&self, dev: Arc<dyn BusDevice>, name: &str) {
         let p = self.keep(dev, name);
+        *self.default.lock().unwrap() = Some(p);
         self.devmap.set_default(p)
             .unwrap_or_else(|e| panic!("physical: setting the default device: {e}"));
         self.devmap.fill(0, 1 << (32 - SLOT_SHIFT), p)
@@ -333,6 +445,25 @@ impl Physical {
     /// The table entry for RAM bank `i`, for a remap.
     pub fn bank_entry(&self, i: usize) -> Entry {
         &self.banks[i]
+    }
+
+    /// The table entry for RAM bank `i` answering `delta` bytes up the bus
+    /// (`addr - delta` reaches the bank), for a remap. One view per
+    /// `(i, delta)`, kept for the life of the bus.
+    pub fn bank_view(&self, i: usize, delta: u64) -> Entry {
+        let bank: *const RamBank = &self.banks[i];
+        let mut v = self.bank_views.lock().unwrap();
+        if let Some(b) = v.iter().find(|b| std::ptr::eq(b.bank, bank) && b.delta == delta) {
+            return &**b as Entry;
+        }
+        v.push(Box::new(BankView { bank, delta }));
+        &**v.last().unwrap() as Entry
+    }
+
+    /// The table entry for what answers where nothing is mapped, for a
+    /// remap to put back. Panics before [`Self::set_default`].
+    pub fn default_entry(&self) -> Entry {
+        self.default.lock().unwrap().expect("physical: no default device set")
     }
 
     /// The table entry for memory that reads zero, for a remap.
@@ -431,6 +562,10 @@ impl Physical {
         }
         for (a, n) in self.aliases.lock().unwrap().iter() {
             known.push((&**a as Entry, n.clone()));
+        }
+        for v in self.bank_views.lock().unwrap().iter() {
+            let i = self.banks.iter().position(|b| std::ptr::eq(b, v.bank)).unwrap_or(usize::MAX);
+            known.push((&**v as Entry, format!("bank {i} at +{:#x}", v.delta)));
         }
         known
             .into_iter()
@@ -894,6 +1029,29 @@ mod tests {
         assert!(phys.read32(0x20_0000).is_ok(), "the black hole answers");
         assert!(!phys.read32(0x30_0000).is_ok(), "the default is a bus error");
         assert!(!phys.read32(0x1_0000_0000).is_ok(), "above 4 GB too");
+    }
+
+    /// A bank view reaches the bank counting from its base, and the byte
+    /// copies agree with word accesses across a page and at ragged ends.
+    #[test]
+    fn bank_views_and_byte_copies() {
+        let phys = Physical::new(vec![RamBank::new(1)]);
+        phys.set_default(Arc::new(ErrorBus::new()), "error");
+        // The 1 MB bank at 3 MB: offsets count from there, not from its mask.
+        phys.fill_slots(0x30, 0x10, phys.bank_view(0, 0x30_0000));
+        assert_eq!(phys.bank_view(0, 0x30_0000), phys.bank_view(0, 0x30_0000), "one view per placement");
+        assert_eq!(phys.write32(0x30_0010, 0xdead_beef), BUS_OK);
+        assert_eq!(phys.banks()[0].read32(0x10).data, 0xdead_beef);
+
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+        assert_eq!(write_bytes(&*phys, 0x30_0ffd, &data), BUS_OK);
+        let mut back = vec![0u8; data.len()];
+        assert_eq!(read_bytes(&*phys, 0x30_0ffd, &mut back), BUS_OK);
+        assert_eq!(back, data);
+        assert_eq!(phys.read8(0x30_0ffd).data, data[0]);
+        assert_eq!(phys.read32(0x30_1000).data, u32::from_be_bytes(data[3..7].try_into().unwrap()));
+        let mut none = [0u8; 4];
+        assert_ne!(read_bytes(&*phys, 0x50_0000, &mut none), BUS_OK, "nothing there");
     }
 
     /// The low-512KB alias must resolve to the SAME generation counter as

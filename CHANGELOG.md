@@ -112,6 +112,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2 is on `Physical`.** Its bus is the same decode table and memory
+  window as the Indy's: CRIME's banks are RAM banks a bank-control write
+  remaps, CRIME, GBE, VICE, MACE and the flash are table entries, and
+  addresses nothing claims still read zero and show in `o2 unmapped`. The
+  Ethernet, serial and audio DMA, the PCI bridge's bus masters and GBE's
+  scan-out reach memory through the bus; the rendering engine draws through
+  the window. The monitor has the `phys` commands. Raw disk reads went from
+  about 1 to 1.9 MB/s with 4 KiB blocks and from about 11 to 19 MB/s with
+  1 MiB blocks, together with the interpreter fixes below. Snapshots are
+  unchanged.
 - **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`
   section ([guide](docs/o2-ip32.md)): R10000 or R5000, CRIME memory and
   rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,

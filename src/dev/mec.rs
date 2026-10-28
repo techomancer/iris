@@ -308,20 +308,38 @@ impl Mec {
         tx || rx
     }
 
-    fn ram_read(&self, addr: u64, out: &mut [u8]) {
-        let r = &*self.ram;
-        for (k, b) in out.iter_mut().enumerate() {
-            *b = r.dma_offset((addr + k as u64) as u32).map_or(0, |i| r[i]);
+    /// Run `f` over `[addr, addr + len)` a page at a time, with where each
+    /// page is on the bus, or None where its bus address is not memory.
+    fn each_page(&self, addr: u64, len: usize, mut f: impl FnMut(std::ops::Range<usize>, Option<u64>)) {
+        const PAGE: usize = 4096;
+        let mut done = 0;
+        while done < len {
+            let a = addr.wrapping_add(done as u64);
+            let n = (PAGE - (a as usize & (PAGE - 1))).min(len - done);
+            f(done..done + n, self.ram.dma_offset(a as u32).map(|p| p as u64));
+            done += n;
         }
     }
 
-    fn ram_write(&self, addr: u64, data: &[u8]) {
-        let r = &*self.ram;
-        for (k, &b) in data.iter().enumerate() {
-            if let Some(i) = r.dma_offset((addr + k as u64) as u32) {
-                r.write(i, &[b]);
+    /// Memory the ring and buffers name, as a DMA master reads it; what is
+    /// not memory reads as zero.
+    fn ram_read(&self, addr: u64, out: &mut [u8]) {
+        let bus = &**self.ram.phys();
+        self.each_page(addr, out.len(), |r, at| match at {
+            Some(p) => {
+                crate::physical::read_bytes(bus, p, &mut out[r]);
             }
-        }
+            None => out[r].fill(0),
+        });
+    }
+
+    fn ram_write(&self, addr: u64, data: &[u8]) {
+        let bus = &**self.ram.phys();
+        self.each_page(addr, data.len(), |r, at| {
+            if let Some(p) = at {
+                crate::physical::write_bytes(bus, p, &data[r]);
+            }
+        });
     }
 
     fn ram_read64(&self, addr: u64) -> u64 {

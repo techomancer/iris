@@ -54,20 +54,11 @@ pub mod gbe_reg {
 
 use gbe_reg::*;
 
-/// What scan-out reads memory through: all of RAM, or a [`ScanSnapshot`] of
-/// the pages one frame needs.
+/// What scan-out reads memory through: a [`ScanSnapshot`] of the pages one
+/// frame needs.
 pub trait ScanMem {
     fn dma_offset(&self, addr: u32) -> Option<usize>;
     fn len(&self) -> usize;
-}
-
-impl ScanMem for O2Memory {
-    fn dma_offset(&self, addr: u32) -> Option<usize> {
-        O2Memory::dma_offset(self, addr)
-    }
-    fn len(&self) -> usize {
-        O2Memory::len(self)
-    }
 }
 
 /// The 64 KB pages one frame of scan-out reads (tile lists, tiles, the DID
@@ -362,7 +353,7 @@ impl Gbe {
         )
     }
 
-    /// Render from `ram` holding its lock only to copy the frame's pages.
+    /// Render from `ram`: copy the frame's pages, then scan them.
     pub fn render_from(&self, ram: &O2Memory, out: &mut [u8]) -> Option<(u32, u32)> {
         let snap = {
             let m = &*ram;
@@ -381,9 +372,8 @@ impl Gbe {
         let g = |off: u32| Self::get(&r, off);
         let h = ((g(VT_VCMAP) >> 12) & 0xfff) as u32;
         let mut pages: Vec<u32> = Vec::new();
-        let rd16 = |a: u32| {
-            mem.dma_offset(a).filter(|&o| o + 1 < mem.len()).map(|o| u16::from_be_bytes([mem[o], mem[o + 1]])).unwrap_or(0)
-        };
+        let bus = mem.phys();
+        let rd16 = |a: u32| mem.dma_offset(a).map(|p| bus.read16(p as u64).data).unwrap_or(0);
         // A tile list and its tiles: `ctl` holds the list address and the
         // DMA enable, `tile` the width in tiles and the partial tile.
         let list = |ctl: u32, tile: u32, rows: u32, pages: &mut Vec<u32>| {
@@ -412,10 +402,19 @@ impl Gbe {
         pages.sort_unstable();
         pages.dedup();
         let mut snap = ScanSnapshot { slot: std::collections::HashMap::new(), bytes: Vec::with_capacity(pages.len() * 0x10000) };
+        let mut words = vec![0u64; 0x10000 / 8];
         for p in pages {
-            if let Some(o) = mem.dma_offset(p << 16).filter(|&o| o + 0x10000 <= mem.len()) {
+            if let Some(o) = mem.dma_offset(p << 16) {
+                // A page never crosses a bank. Kept as RAM keeps it: each
+                // word a host u32, so byte `o` is at `o ^ 3`.
+                if bus.read_block(o as u64, &mut words) != BUS_OK {
+                    continue;
+                }
                 snap.slot.insert(p, snap.slot.len());
-                snap.bytes.extend_from_slice(mem.raw(o, 0x10000));
+                for w in &words {
+                    snap.bytes.extend_from_slice(&((w >> 32) as u32).to_ne_bytes());
+                    snap.bytes.extend_from_slice(&(*w as u32).to_ne_bytes());
+                }
             }
         }
         snap
@@ -643,7 +642,20 @@ impl Gbe {
     }
 }
 
+/// Narrower accesses reach the 32-bit register holding them.
 impl BusDevice for Gbe {
+    fn read8(&self, addr: u64) -> crate::traits::BusRead8 {
+        crate::traits::BusRead8::ok(self.read32(addr & !3).data as u8)
+    }
+    fn read16(&self, addr: u64) -> crate::traits::BusRead16 {
+        crate::traits::BusRead16::ok(self.read32(addr & !3).data as u16)
+    }
+    fn write8(&self, addr: u64, val: u8) -> u32 {
+        self.write32(addr & !3, val as u32)
+    }
+    fn write16(&self, addr: u64, val: u16) -> u32 {
+        self.write32(addr & !3, val as u32)
+    }
     fn read32(&self, addr: u64) -> BusRead32 {
         BusRead32::ok(self.read_reg((addr as u32) & 0xffffc))
     }
@@ -3826,7 +3838,7 @@ mod tests {
             g.write32((0x1600_0000 + off) as u64, v);
         }
         let mut out = vec![0u8; 2048 * 2048 * 4];
-        let (w, h) = g.render(&*ram, &mut out).expect("display on");
+        let (w, h) = g.render_from(&ram, &mut out).expect("display on");
         assert_eq!((w, h), (512, 128));
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(10, 20), [0x11, 0x22, 0x33]);
@@ -3892,7 +3904,7 @@ mod tests {
             g.write32((0x1600_0000 + off) as u64, v);
         }
         let mut out = vec![0u8; 2048 * 2048 * 4];
-        g.render(&*ram, &mut out).expect("display on");
+        g.render_from(&ram, &mut out).expect("display on");
         let px = |x: usize, y: usize| &out[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3];
         assert_eq!(px(3, 4), [0xaa, 0xbb, 0xcc], "overlay colour from entry 0x1100 + 7");
         assert_eq!(px(4, 4), [0x11, 0x22, 0x33], "overlay 0 shows the normal planes");

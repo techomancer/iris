@@ -152,8 +152,13 @@ aliases that re-dispatch a range elsewhere on the bus). A machine builds its
 devices and banks, creates a `Physical` over the banks and maps everything
 where its hardware decodes it. For the Indy and Indigo2 that is
 `src/ip22_bus.rs` (`Ip22Bus`): the address map, the MC's error reporting, and
-the MEMCFG remap that places the banks in the table and the window. The CPU
-and every DMA master reach memory through `Physical` as a `BusDevice`.
+the MEMCFG remap that places the banks in the table and the window. For the
+O2 it is `src/ip32.rs` (`Ip32Bus`) with CRIME's bank logic in
+`src/dev/crime_mem.rs` (`O2Memory`), whose remap points the table at bank
+views (a bank counted from where CRIME placed it) and maps the window to
+match. The CPU and every DMA master reach memory through `Physical` as a
+`BusDevice`; `physical::read_bytes`/`write_bytes` move byte ranges a page
+at a time with `read_block`/`write_block`.
 
 `Physical` decodes physical addresses through a table of
 64 KB slots (one `*const dyn BusDevice` per `addr >> 16`), so finding the

@@ -210,7 +210,7 @@ fn a_bus_saves_and_loads_whole() {
     let v2 = dst.save_state();
     assert_eq!(first_difference(&v1, &v2, "bus"), None, "Ip32Bus save_state mismatch after load_state round-trip");
     assert_eq!(dst.ram.bytes(0x1234, 11), b"saved bytes");
-    assert_eq!(dst.prom.lock().unwrap()[0x100], 0x42);
+    assert_eq!(dst.flash_bytes()[0x100], 0x42);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -378,7 +378,7 @@ const RX_RPTR: u32 = 5;
 const RX_WPTR: u32 = 6;
 const RX_DEPTH: u32 = 7;
 
-fn sdma_bus() -> Ip32Bus {
+fn sdma_bus() -> std::sync::Arc<Ip32Bus> {
     let bus = Ip32Bus::new(16 << 20, vec![0u8; PROM_SIZE as usize]);
     bus.write64(MACE_ISA_RING_BASE as u64, SDMA_RING as u64);
     bus

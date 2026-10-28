@@ -565,20 +565,27 @@ impl Saveable for CrimeSpace {
 
 // Narrow accesses reach both as the 32-bit word they fall in: neither has a
 // byte-wide register, and the engine's busy status passes through.
+/// CRIME's registers and its rendering engine are smaller than a slot of
+/// the bus's decode table, so the space takes whole slots and answers the
+/// rest as the bus does where nothing is: reads find zero, writes fail.
 impl BusDevice for CrimeSpace {
     fn read8(&self, addr: u64) -> crate::traits::BusRead8 {
-        let r = if Self::in_re(addr as u32) { self.re.read32(addr & !3) } else { self.regs.read32(addr & !3) };
+        let r = self.read32(addr & !3);
         crate::traits::BusRead8 { status: r.status, data: r.data as u8 }
     }
     fn read16(&self, addr: u64) -> crate::traits::BusRead16 {
-        let r = if Self::in_re(addr as u32) { self.re.read32(addr & !3) } else { self.regs.read32(addr & !3) };
+        let r = self.read32(addr & !3);
         crate::traits::BusRead16 { status: r.status, data: r.data as u16 }
     }
     fn read32(&self, addr: u64) -> BusRead32 {
-        if Self::in_re(addr as u32) { self.re.read32(addr) } else { self.regs.read32(addr) }
+        if Self::in_re(addr as u32) { self.re.read32(addr) }
+        else if Self::in_regs(addr as u32) { self.regs.read32(addr) }
+        else { BusRead32::ok(0) }
     }
     fn read64(&self, addr: u64) -> BusRead64 {
-        if Self::in_re(addr as u32) { self.re.read64(addr) } else { self.regs.read64(addr) }
+        if Self::in_re(addr as u32) { self.re.read64(addr) }
+        else if Self::in_regs(addr as u32) { self.regs.read64(addr) }
+        else { BusRead64::ok(0) }
     }
     fn write8(&self, addr: u64, val: u8) -> u32 {
         self.write32(addr & !3, val as u32)
@@ -590,6 +597,9 @@ impl BusDevice for CrimeSpace {
         if Self::in_re(addr as u32) {
             return self.re.write32(addr, val);
         }
+        if !Self::in_regs(addr as u32) {
+            return crate::traits::BUS_ERR;
+        }
         let r = self.regs.write32(addr, val);
         self.regs_wrote(addr as u32);
         r
@@ -597,6 +607,9 @@ impl BusDevice for CrimeSpace {
     fn write64(&self, addr: u64, val: u64) -> u32 {
         if Self::in_re(addr as u32) {
             return self.re.write64(addr, val);
+        }
+        if !Self::in_regs(addr as u32) {
+            return crate::traits::BUS_ERR;
         }
         let r = self.regs.write64(addr, val);
         self.regs_wrote(addr as u32);

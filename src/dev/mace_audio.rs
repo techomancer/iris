@@ -35,6 +35,7 @@ use std::time::Instant;
 use parking_lot::Mutex;
 use crate::config::AudioConfig;
 use crate::dev::crime_mem::O2Memory;
+use crate::traits::BusDevice;
 use crate::host_audio::{HostOut, Resampler};
 
 /// Where the audio registers sit, and their 16 KB block.
@@ -487,10 +488,10 @@ impl MaceAudio {
                         break; // full: the engine never fills the last slot
                     }
                     let addr = io.ring_base | c.wptr | c.sub * 8;
-                    if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
+                    if let Some(o) = ram.dma_offset(addr).map(|o| o as u64) {
                         // Each half: sign extension, the sample, 0xff.
-                        ram.put_be(o, 4, 0xff);
-                        ram.put_be(o + 4, 4, 0xff);
+                        ram.phys().write32(o, 0xff);
+                        ram.phys().write32(o + 4, 0xff);
                     }
                     c.sub += 1;
                     if c.sub == 4 {
@@ -526,9 +527,9 @@ impl MaceAudio {
                     }
                     c.dry = 0;
                     let addr = io.ring_base | (n as u32) << 12 | c.rptr | c.sub * 8;
-                    if let Some(o) = ram.dma_offset(addr).filter(|&o| o + 8 <= ram.len()) {
+                    if let Some(o) = ram.dma_offset(addr).map(|o| o as u64) {
                         let half = |w: u32| ((w as i32) >> 8).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                        let (l, r) = (half(ram.get_be(o, 4)), half(ram.get_be(o + 4, 4)));
+                        let (l, r) = (half(ram.phys().read32(o).data), half(ram.phys().read32(o + 4).data));
                         let scale = |v: i16, g: f32| (v as f32 * g).round() as i16;
                         item = (scale(l, gain_l), scale(r, gain_r));
                         if l != 0 || r != 0 {

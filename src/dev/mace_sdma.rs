@@ -137,11 +137,10 @@ pub struct SdmaIo<'a> {
 }
 
 impl SdmaIo<'_> {
-    /// Where block `ptr` of ring `ring` is in memory, as an offset into it.
-    /// The rings are a DMA master's view of memory, as the Ethernet's are.
-    fn block(&self, ram: &O2Memory, ring: u32, ptr: u32) -> Option<usize> {
-        let i = ram.dma_offset(self.ring_base | (ring << 12) | ptr)?;
-        (i + sdma::BLOCK as usize <= ram.len()).then_some(i)
+    /// Where block `ptr` of ring `ring` is on the bus, if it is memory. The
+    /// rings are a DMA master's view of memory, as the Ethernet's are.
+    fn block(&self, ram: &O2Memory, ring: u32, ptr: u32) -> Option<u64> {
+        ram.dma_offset(self.ring_base | (ring << 12) | ptr).map(|p| p as u64)
     }
 }
 
@@ -299,7 +298,7 @@ impl MaceSerialDma {
                     port.tx.ctrl &= !sdma::CTRL_ENABLE;
                     return;
                 };
-                b.copy_from_slice(&ram.bytes(i, sdma::BLOCK as usize));
+                crate::physical::read_bytes(&**ram.phys(), i, &mut b);
             }
             for pair in b.chunks_exact(8) {
                 for slot in 0..4 {
@@ -347,7 +346,7 @@ impl MaceSerialDma {
                 b[8 * (j / 4) + j % 4] = ctrl;
                 b[8 * (j / 4) + 4 + j % 4] = data;
             }
-            ram.write(i, &b);
+            crate::physical::write_bytes(&**ram.phys(), i, &b);
             port.rx.blocks += 1;
             port.rx.bytes += n as u64;
             port.rx.wptr = (port.rx.wptr + sdma::BLOCK) & sdma::PTR_MASK;

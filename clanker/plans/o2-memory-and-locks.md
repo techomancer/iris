@@ -149,6 +149,16 @@ producer; `Ip32Bus.scsi` → set once.
 
 ## Phase 4 — memory on the established path
 
+Status (2026-10-27): done for the CPU, the table and the DMA masters.
+`Physical` is machine-independent (089d1c27); the O2 maps on it, CRIME's
+banks are `PpMemory` banks placed through `Physical::bank_view` (CRIME counts
+offsets from a bank's base, which a plain address mask does not for a 128 MB
+bank on a 32 MB boundary), `O2Memory` is the bank logic plus test-only
+accessors. MEC, SDMA, audio, PCI `HostMemory` and GBE scan-out use the bus
+(`physical::read_bytes`/`write_bytes`); the RE stays on the window through
+`RamWindow`. Not done: the bulk path in item 5 (`read_block` per page is what
+the masters use now), and the Octane.
+
 Today the O2 has three ways into RAM: the bus (`Ip32Bus` range checks), the
 ppmem window (CPU fast path, `RamWindow` for the RE), and `O2Memory`'s own
 decode + store pointer, used by MEC, audio, serial DMA, PCI `HostMemory`,

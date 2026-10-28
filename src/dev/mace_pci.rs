@@ -156,9 +156,9 @@ impl HostMemory {
 
 impl HostMemory {
     /// Run `f` over the transfer `[addr, addr + len)` a page at a time,
-    /// with the offset each page starts at in memory, or None where the bus
-    /// address is not memory. A page never straddles a bank slot, so its
-    /// bytes are contiguous: one decode per page, not per byte.
+    /// with where each page starts on the host bus, or None where the PCI
+    /// address is not memory. A page never straddles a bank slot: one decode
+    /// per page, not per byte.
     fn each_page(&self, addr: u64, len: usize, mut f: impl FnMut(std::ops::Range<usize>, Option<usize>)) {
         const PAGE: usize = 4096;
         let mut done = 0;
@@ -177,7 +177,9 @@ impl PciDma for HostMemory {
     fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
         let mut st = PciDmaStatus::Ok;
         self.each_page(addr, buf.len(), |r, at| match at {
-            Some(i) => self.ram.read_into(i, &mut buf[r]),
+            Some(i) => {
+                crate::physical::read_bytes(&**self.ram.phys(), i as u64, &mut buf[r]);
+            }
             None => {
                 buf[r].fill(0);
                 st = PciDmaStatus::MasterAbort;
@@ -189,7 +191,9 @@ impl PciDma for HostMemory {
     fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
         let mut st = PciDmaStatus::Ok;
         self.each_page(addr, data.len(), |r, at| match at {
-            Some(i) => self.ram.write(i, &data[r]),
+            Some(i) => {
+                crate::physical::write_bytes(&**self.ram.phys(), i as u64, &data[r]);
+            }
             None => st = PciDmaStatus::MasterAbort,
         });
         st

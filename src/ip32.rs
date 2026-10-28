@@ -3,11 +3,11 @@
 //! (`dev::o2gfx`), VICE and MACE (`dev::mace`), which subdivide their own
 //! space as HPC3 does on the Indy.
 //!
-//! The O2 is not wired into `Physical`: its memory map has little in common
-//! with the Indy's (RAM at 0x40000000 with a low alias, CRIME and MACE where
-//! the Indy has GIO and HPC3), and `MipsCpu::new` takes any
-//! `Arc<dyn BusDevice>`, so the CPU runs against this bus without touching
-//! the IP22/IP24 path. `ip32_machine` drives it.
+//! The O2 builds its bus from the same parts as the Indy: a [`Physical`]
+//! over CRIME's memory banks ([`O2Memory`] places them as the bank controls
+//! say), with CRIME, GBE, VICE, MACE (and the PCI bridge's windows, which
+//! MACE decodes itself) and the flash mapped where the hardware decodes them.
+//! `ip32_machine` drives it.
 //!
 //! Everything was derived from observing the PROM's own behaviour, the O2
 //! ASIC specifications and NetBSD's published register names.
@@ -15,7 +15,9 @@
 //! See `docs/o2-ip32.md`; the bring-up log is `clanker/devices/ip32-o2-bringup-log.md`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use crate::physical::Physical;
 
 use crate::dev::mace::Mace;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR};
@@ -115,7 +117,7 @@ pub const CRIME_RE_SIZE: u32 = 0x0000_6000;
 /// The memory window CRIME decodes: 1 GB from [`RAM_BASE`], which its eight
 /// bank controls place banks of 32 or 128 MB in. How, and what an absent bank
 /// answers, is in [`crate::dev::crime_mem`].
-use crate::dev::crime_mem::{Decode, O2Memory};
+use crate::dev::crime_mem::O2Memory;
 
 // The O2's devices live one to a file under `crate::dev`; their names stay
 // reachable here for the bus and the machine.
@@ -166,6 +168,10 @@ pub struct Ip32Options {
     pub scsi: bool,
     /// A file holding the flash, so `setenv` survives from run to run.
     pub flash_file: Option<std::path::PathBuf>,
+    /// A PS/2 keyboard on port 0, and a mouse on port 1 if `Some(true)`.
+    pub keyboard: Option<bool>,
+    /// The Ethernet address in the 1-Wire ID chip, if not the default.
+    pub mac: Option<[u8; 6]>,
 }
 
 /// Whether the per-register access counters (MACE's, GBE's, the rendering
@@ -288,20 +294,116 @@ impl BusDevice for Stub {
     fn write64(&self, a: u64, v: u64) -> u32 { self.w(); self.hit(a as u32, true); self.set_cell(a as u32, v); BUS_OK }
 }
 
-/// The IP32 physical bus: RAM and the PROM, and the chips that claim the
-/// rest, CRIME (with its rendering engine), GBE, VICE and MACE, each of
-/// which decodes its own space as HPC3 does on the Indigo2. A short chain
-/// of range checks rather than the 64 KB dispatch table `Physical` uses:
-/// there are five regions, and an unmapped access is easy to log.
-pub struct Ip32Bus {
-    pub(crate) ram: std::sync::Arc<O2Memory>,
-    /// The flash. Writable, because an O2 keeps its environment variables in
-    /// it -- there is no separate NVRAM chip -- and the installer saves
-    /// settings there. The user's PROM file is never touched: this is a copy.
-    prom: Mutex<Vec<u8>>,
+/// The flash at [`PROM_BASE`]: the PROM and, behind it, the environment the
+/// O2 keeps there instead of an NVRAM chip.
+pub struct O2Flash {
+    /// Writable, because an O2 keeps its environment variables in it -- there
+    /// is no separate NVRAM chip -- and the installer saves settings there.
+    /// The user's PROM file is never touched: this is a copy.
+    bytes: Mutex<Vec<u8>>,
     /// Writes into the flash, so a command protocol would be visible rather
     /// than silently corrupting the image.
-    prom_writes: Mutex<Vec<(u32, u8)>>,
+    writes: Mutex<Vec<(u32, u8)>>,
+}
+
+impl O2Flash {
+    fn read(&self, addr: u64, n: usize) -> u64 {
+        let p = self.bytes.lock().unwrap();
+        let i = (addr as u32).wrapping_sub(PROM_BASE) as usize;
+        if i + n > p.len() {
+            return 0;
+        }
+        (0..n).fold(0u64, |v, k| (v << 8) | p[i + k] as u64)
+    }
+
+    fn write(&self, addr: u64, n: usize, val: u64) -> u32 {
+        let a = addr as u32;
+        let mut p = self.bytes.lock().unwrap();
+        let i = a.wrapping_sub(PROM_BASE) as usize;
+        if i + n > p.len() {
+            return BUS_ERR;
+        }
+        {
+            let mut log = self.writes.lock().unwrap();
+            for k in 0..n {
+                if log.len() < 512 {
+                    log.push((a + k as u32, (val >> (8 * (n - 1 - k))) as u8));
+                }
+            }
+        }
+        for k in 0..n {
+            p[i + k] = (val >> (8 * (n - 1 - k))) as u8;
+        }
+        BUS_OK
+    }
+}
+
+impl BusDevice for O2Flash {
+    fn read8(&self, a: u64) -> BusRead8 { BusRead8::ok(self.read(a, 1) as u8) }
+    fn read16(&self, a: u64) -> BusRead16 { BusRead16::ok(self.read(a, 2) as u16) }
+    fn read32(&self, a: u64) -> BusRead32 { BusRead32::ok(self.read(a, 4) as u32) }
+    fn read64(&self, a: u64) -> BusRead64 { BusRead64::ok(self.read(a, 8)) }
+    fn write8(&self, a: u64, v: u8) -> u32 { self.write(a, 1, v as u64) }
+    fn write16(&self, a: u64, v: u16) -> u32 { self.write(a, 2, v as u64) }
+    fn write32(&self, a: u64, v: u32) -> u32 { self.write(a, 4, v as u64) }
+    fn write64(&self, a: u64, v: u64) -> u32 { self.write(a, 8, v) }
+}
+
+/// What answers where nothing on the O2's bus does: a read finds zero, a
+/// write a bus error, and the first 64 distinct addresses are kept, as
+/// `(addr, is_write, pc)`, for `o2 unmapped`. Once full, a miss costs one
+/// relaxed load; a guest polling an absent device would otherwise lock and
+/// scan the list on every poll. Not kept in a `lightning` build.
+#[derive(Default)]
+pub struct Misses {
+    list: Mutex<Vec<(u32, bool, u32)>>,
+    full: AtomicBool,
+}
+
+impl Misses {
+    #[inline]
+    fn note(&self, addr: u64, write: bool) {
+        #[cfg(not(feature = "lightning"))]
+        {
+            if self.full.load(Ordering::Relaxed) {
+                return;
+            }
+            let addr = addr as u32;
+            let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
+            let mut u = self.list.lock().unwrap();
+            if !u.iter().any(|&(a, w, _)| a == addr && w == write) {
+                u.push((addr, write, pc));
+                if u.len() == 64 {
+                    self.full.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(feature = "lightning")]
+        let _ = (addr, write);
+    }
+}
+
+impl BusDevice for Misses {
+    fn read8(&self, a: u64) -> BusRead8 { self.note(a, false); BusRead8::ok(0) }
+    fn read16(&self, a: u64) -> BusRead16 { self.note(a, false); BusRead16::ok(0) }
+    fn read32(&self, a: u64) -> BusRead32 { self.note(a, false); BusRead32::ok(0) }
+    fn read64(&self, a: u64) -> BusRead64 { self.note(a, false); BusRead64::ok(0) }
+    fn write8(&self, a: u64, _: u8) -> u32 { self.note(a, true); BUS_ERR }
+    fn write16(&self, a: u64, _: u16) -> u32 { self.note(a, true); BUS_ERR }
+    fn write32(&self, a: u64, _: u32) -> u32 { self.note(a, true); BUS_ERR }
+    fn write64(&self, a: u64, _: u64) -> u32 { self.note(a, true); BUS_ERR }
+}
+
+/// The O2's devices on its physical bus: RAM (CRIME's banks, placed by
+/// [`O2Memory`]), the flash, and the chips that claim the rest, CRIME (with
+/// its rendering engine), GBE, VICE and MACE, each of which decodes its own
+/// space as HPC3 does on the Indigo2. MACE also takes the PCI bridge's
+/// windows and decodes them itself.
+pub struct Ip32Bus {
+    /// The bus everything is mapped on: what the CPU and the DMA masters use.
+    pub phys: Arc<Physical>,
+    pub(crate) ram: Arc<O2Memory>,
+    pub(crate) flash: O2Flash,
     /// Where to keep the flash between runs, if anywhere. Never the image the
     /// caller supplied: settings written by a guest belong in the user's
     /// working directory, not in their copy of the PROM.
@@ -317,26 +419,18 @@ pub struct Ip32Bus {
     pub vice: Stub,
     /// MACE, the I/O ASIC, and every block behind it.
     pub mace: Mace,
-    /// Accesses that hit nothing, first 64 distinct kept, as `(addr,
-    /// is_write, pc)`. Once full, a miss costs one relaxed load; a guest
-    /// polling an absent device would otherwise lock and scan the list on
-    /// every poll. Not kept in a `lightning` build.
-    unmapped: Mutex<Vec<(u32, bool, u32)>>,
-    unmapped_full: std::sync::atomic::AtomicBool,
-    /// The ppmem window's base and the RAM bitmap the memory space keeps
-    /// (one bit per 64 MB region it has fully mapped), once the machine has
-    /// wired them: aligned RAM reads then skip the decode. See `read_bytes`.
-    fast_ram: std::sync::OnceLock<(usize, usize)>,
+    /// What answers where nothing does, and the addresses it was asked for.
+    misses: Arc<Misses>,
     /// The SCSI controller, when one is attached, so the trace can report
     /// what the driver asked it for.
-    pub scsi: Mutex<Vec<std::sync::Arc<crate::dev::aic7880::Aic7880>>>,
+    pub scsi: Mutex<Vec<Arc<crate::dev::aic7880::Aic7880>>>,
 }
 
 impl Ip32Bus {
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
     /// size no O2 can have, one bank of it (power-of-two sizes only). `prom`
     /// must be the raw 512 KiB IP32 PROM image.
-    pub fn new(ram_bytes: usize, prom: Vec<u8>) -> Self {
+    pub fn new(ram_bytes: usize, prom: Vec<u8>) -> Arc<Self> {
         let mem = O2Memory::with_total((ram_bytes >> 20) as u32)
             .ok()
             .filter(|m| m.total() as usize == ram_bytes)
@@ -344,32 +438,37 @@ impl Ip32Bus {
         Self::with_options(mem, prom, Ip32Options::default())
     }
 
-    /// A machine with `mem` fitted, configured by `opts`.
-    pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options) -> Self {
-        let ram = std::sync::Arc::new(mem);
-        let ust = std::sync::Arc::new(MaceUst::new());
-        let crime = std::sync::Arc::new(Crime::new(ust.clone()));
-        let bus = Self {
+    /// A machine with `mem` fitted, configured by `opts`, its devices mapped
+    /// on `mem`'s bus.
+    pub fn with_options(mem: O2Memory, prom: Vec<u8>, opts: Ip32Options) -> Arc<Self> {
+        let ram = Arc::new(mem);
+        let phys = ram.phys().clone();
+        let ust = Arc::new(MaceUst::new());
+        let crime = Arc::new(Crime::new(ust.clone()));
+        let mut bus = Self {
+            phys: phys.clone(),
             ram: ram.clone(),
-            prom: Mutex::new(prom),
-            prom_writes: Mutex::new(Vec::new()),
+            flash: O2Flash { bytes: Mutex::new(prom), writes: Mutex::new(Vec::new()) },
             flash_file: opts.flash_file.clone(),
             crime: CrimeSpace::new(crime.clone(), ram.clone()),
             vice: Stub::new("vice"),
             gbe: {
                 let ust = ust.clone();
-                crate::dev::o2gfx::Gbe::new(std::sync::Arc::new(move || ust.now()))
+                crate::dev::o2gfx::Gbe::new(Arc::new(move || ust.now()))
             },
             mace: Mace::new(ram.clone(), crime, ust),
-            unmapped: Mutex::new(Vec::new()),
-            unmapped_full: std::sync::atomic::AtomicBool::new(false),
-            fast_ram: std::sync::OnceLock::new(),
+            misses: Arc::new(Misses::default()),
             scsi: Mutex::new(Vec::new()),
         };
-        // An experiment for now: the PROM probes slots 1..3 for a vendor ID
-        // and finds nothing, so it has no disk and cannot boot. Putting the
-        // controller a real O2 has there is how we learn how much of it the
-        // PROM insists on.
+        if let Some(mac) = opts.mac {
+            bus.mace.onewire = crate::dev::onewire::OneWireId::from_mac(mac);
+        }
+        if let Some(mouse) = opts.keyboard {
+            // With a keyboard the PROM and IRIX take the graphics console;
+            // without one, the serial console. The graphics hardware is
+            // there either way.
+            bus.mace.enable_ps2(mouse);
+        }
         bus.gbe.connect_irq(bus.crime.regs.clone());
         if opts.scsi {
             // The controller fetches its work from host memory, which it
@@ -391,38 +490,50 @@ impl Ip32Bus {
         if let Some(path) = bus.flash_file.clone() {
             match std::fs::read(&path) {
                 Ok(saved) if saved.len() == PROM_SIZE as usize => {
-                    *bus.prom.lock().unwrap() = saved;
+                    *bus.flash.bytes.lock().unwrap() = saved;
                     eprintln!("ip32: flash restored from {}", path.display());
                 }
                 Ok(_) => eprintln!("ip32: flash {} is the wrong size; ignoring", path.display()),
                 Err(_) => {}
             }
         }
+        let bus = Arc::new(bus);
+        bus.map();
         bus
     }
 
-    pub fn unmapped(&self) -> Vec<(u32, bool, u32)> {
-        self.unmapped.lock().unwrap().clone()
+    /// Put everything where CRIME and MACE decode it. The devices are fields
+    /// of this bus, which is in its `Arc` and keeps them as long as the
+    /// physical bus is used.
+    fn map(&self) {
+        use crate::dev::mace_pci::{PCI_HI_MEM_BASE, PCI_IO_BASE, PCI_IO_SIZE, PCI_MEM_BASE, PCI_MEM_SIZE};
+        use crate::ppmem::devmap::{Entry, SLOT_SHIFT};
+        let phys = &*self.phys;
+        // Whatever nothing claims reads as zero and logs. That covers every
+        // slot, RAM's too, so the memory is laid out again below.
+        phys.set_default(self.misses.clone(), "nothing (o2 unmapped)");
+        let set = |base: u32, size: u32, dev: Entry, name: &str| {
+            // A device smaller than a table slot (CRIME's registers and the
+            // rendering engine) takes the whole slot and checks its range.
+            let end = (base as u64 + size as u64).next_multiple_of(1 << SLOT_SHIFT);
+            unsafe { phys.map_borrowed(base as u64, end, dev, name) };
+        };
+        set(CRIME_BASE, CRIME_SIZE, &self.crime, "crime");
+        set(CRIME_RE_BASE, CRIME_RE_SIZE, &self.crime, "crime");
+        set(GBE_BASE, GBE_SIZE, &self.gbe, "gbe");
+        set(VICE_BASE, VICE_SIZE, &self.vice, "vice");
+        set(MACE_BASE, MACE_SIZE, &self.mace, "mace");
+        set(PCI_IO_BASE, PCI_IO_SIZE, &self.mace, "mace (pci i/o)");
+        set(PCI_MEM_BASE, PCI_MEM_SIZE, &self.mace, "mace (pci memory)");
+        // PCI memory's one-to-one window: 0x2_8000_0000 as 32 bits.
+        unsafe { phys.map_borrowed(PCI_HI_MEM_BASE as u64, 1 << 32, &self.mace, "mace (pci memory)") };
+        set(PROM_BASE, PROM_SIZE, &self.flash, "flash");
+        self.ram.rebuild();
     }
 
-    #[inline]
-    fn miss(&self, addr: u32, write: bool) {
-        #[cfg(not(feature = "lightning"))]
-        {
-            if self.unmapped_full.load(Ordering::Relaxed) {
-                return;
-            }
-            let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
-            let mut u = self.unmapped.lock().unwrap();
-            if !u.iter().any(|&(a, w, _)| a == addr && w == write) {
-                u.push((addr, write, pc));
-                if u.len() == 64 {
-                    self.unmapped_full.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-        #[cfg(feature = "lightning")]
-        let _ = (addr, write);
+    /// Accesses that hit nothing, the first 64 distinct ones.
+    pub fn unmapped(&self) -> Vec<(u32, bool, u32)> {
+        self.misses.list.lock().unwrap().clone()
     }
 
     /// Memory fitted, in bytes.
@@ -430,7 +541,6 @@ impl Ip32Bus {
         self.ram.total()
     }
 
-    /// A CRIME write that may have moved a memory bank.
     /// GBE's picture out of RAM into `out` (R, G, B, A bytes), or None while
     /// the display is off. See [`crate::dev::o2gfx::Gbe::render`].
     pub fn render_screen(&self, out: &mut [u8]) -> Option<(u32, u32)> {
@@ -441,18 +551,6 @@ impl Ip32Bus {
     /// runs on its own thread. Without it (the harness) nothing is pushed.
     pub fn connect_cpu_irq(&self, line: crate::irq::IrqLine) {
         self.crime.regs.connect_output(line);
-    }
-
-    /// Let aligned RAM reads go straight to the ppmem window: its base and
-    /// the bitmap the memory space publishes (the CPU's, as `ppmem_bitmap_ptr`).
-    pub fn set_fast_ram(&self, window: *mut u8, bitmap: *mut u64) {
-        if !window.is_null() && !bitmap.is_null() {
-            let _ = self.fast_ram.set((window as usize, bitmap as usize));
-        }
-    }
-
-    fn is_ram_addr(addr: u32) -> bool {
-        addr < LOW_ALIAS_SIZE || addr >= RAM_BASE
     }
 
     /// What time and the outside world have done since the last call:
@@ -467,17 +565,10 @@ impl Ip32Bus {
         self.crime.regs.interrupting()
     }
 
-    /// Plug in a PS/2 keyboard on port 0, and a mouse on port 1 if `mouse`.
-    /// With a keyboard the PROM and IRIX take the graphics console; without
-    /// one, the serial console. The graphics hardware is there either way.
-    pub fn attach_keyboard(&mut self, mouse: bool) {
-        self.mace.enable_ps2(mouse);
-    }
-
     /// Write the flash out, if a file was named for it.
     pub fn save_flash(&self) {
         let Some(path) = &self.flash_file else { return };
-        let p = self.prom.lock().unwrap();
+        let p = self.flash.bytes.lock().unwrap();
         match std::fs::write(path, &p[..]) {
             Ok(()) => eprintln!("ip32: flash saved to {}", path.display()),
             Err(e) => eprintln!("ip32: flash {}: {e}", path.display()),
@@ -486,13 +577,13 @@ impl Ip32Bus {
 
     /// The whole flash, PROM and environment, for a snapshot.
     pub fn flash_bytes(&self) -> Vec<u8> {
-        self.prom.lock().unwrap().clone()
+        self.flash.bytes.lock().unwrap().clone()
     }
 
     /// Put back a flash [`Self::flash_bytes`] took from a machine with the
     /// same PROM size.
     pub fn set_flash(&self, bytes: &[u8]) -> Result<(), String> {
-        let mut p = self.prom.lock().unwrap();
+        let mut p = self.flash.bytes.lock().unwrap();
         if bytes.len() != p.len() {
             return Err(format!("saved flash is {} bytes, this machine's {}", bytes.len(), p.len()));
         }
@@ -502,295 +593,15 @@ impl Ip32Bus {
 
     /// How many bytes have been written into the flash so far.
     pub fn flash_writes(&self) -> usize {
-        self.prom_writes.lock().unwrap().len()
+        self.flash.writes.lock().unwrap().len()
     }
 
     /// Everything written into the flash, in order.
     pub fn prom_writes(&self) -> Vec<(u32, u8)> {
-        self.prom_writes.lock().unwrap().clone()
-    }
-
-
-    fn in_prom(&self, addr: u32) -> bool {
-        addr >= PROM_BASE && addr < PROM_BASE + PROM_SIZE
-    }
-
-    fn in_vice(&self, addr: u32) -> bool {
-        addr >= VICE_BASE && addr < VICE_BASE + VICE_SIZE
-    }
-
-    fn in_gbe(&self, addr: u32) -> bool {
-        addr >= GBE_BASE && addr < GBE_BASE + GBE_SIZE
-    }
-
-    /// Map an address through the low-memory alias, if it falls in it. The
-    /// alias covers the first 256 MB only, as on an O2: above that, CRIME and
-    /// MACE live at 0x14000000 and 0x1f000000, and memory beyond 256 MB is
-    /// reached at its own address above `RAM_BASE`.
-    fn resolve(&self, addr: u32) -> u32 {
-        if addr < LOW_ALIAS_SIZE {
-            RAM_BASE.wrapping_add(addr)
-        } else {
-            addr
-        }
-    }
-
-    fn read_bytes(&self, addr: u32, n: usize) -> Option<u64> {
-        let addr = self.resolve(addr);
-        // Mapped RAM, read straight from the window: IRIX's idle loop and
-        // uncached kernel loads came here thousands of times a second, each
-        // decoding the address and assembling the value a byte at a time.
-        // An aligned word is a host u32 in the window's layout (see
-        // O2Memory::get_be).
-        if let Some(&(win, bm)) = self.fast_ram.get() {
-            let bits = unsafe { std::ptr::read_volatile(bm as *const u64) };
-            // `n` is a power of two; `%` by a variable is a divide.
-            if bits & (1u64 << (addr >> crate::ppmem::BITMAP_SHIFT)) != 0 && addr as usize & (n - 1) == 0 {
-                let p = win + addr as usize;
-                let v = unsafe {
-                    match n {
-                        1 => *((p ^ 3) as *const u8) as u64,
-                        2 => ((p ^ 2) as *const u16).read_unaligned() as u64,
-                        4 => (p as *const u32).read_unaligned() as u64,
-                        _ => ((p as *const u32).read_unaligned() as u64) << 32 | ((p + 4) as *const u32).read_unaligned() as u64,
-                    }
-                };
-                return Some(v);
-            }
-        }
-        {
-            let r = &*self.ram;
-            match r.decode(addr) {
-                // A bank control matches but nothing is fitted: what is left
-                // on the memory bus, which POST has just cleared to zero.
-                Decode::Empty => return Some(0),
-                Decode::Ram(i) => {
-                    let mut v = 0u64;
-                    for k in 0..n {
-                        v = (v << 8) | r[i + k] as u64;
-                    }
-                    return Some(v);
-                }
-                Decode::None => {}
-            }
-        }
-        if self.in_prom(addr) {
-            let p = self.prom.lock().unwrap();
-            let i = (addr - PROM_BASE) as usize;
-            if i + n > p.len() {
-                return None;
-            }
-            let mut v = 0u64;
-            for k in 0..n {
-                v = (v << 8) | p[i + k] as u64;
-            }
-            return Some(v);
-        }
-        None
-    }
-
-    fn write_bytes(&self, addr: u32, n: usize, val: u64) -> bool {
-        let addr = self.resolve(addr);
-        {
-            let r = &*self.ram;
-            match r.decode(addr) {
-                // Writes into an empty bank are swallowed by the memory controller.
-                Decode::Empty => return true,
-                Decode::Ram(i) => {
-                    r.write(i, &val.to_be_bytes()[8 - n..]);
-                    return true;
-                }
-                Decode::None => {}
-            }
-        }
-        if self.in_prom(addr) {
-            let mut p = self.prom.lock().unwrap();
-            let i = (addr - PROM_BASE) as usize;
-            if i + n > p.len() {
-                return false;
-            }
-            {
-                let mut log = self.prom_writes.lock().unwrap();
-                for k in 0..n {
-                    if log.len() < 512 {
-                        log.push((addr + k as u32, (val >> (8 * (n - 1 - k))) as u8));
-                    }
-                }
-            }
-            for k in 0..n {
-                p[i + k] = (val >> (8 * (n - 1 - k))) as u8;
-            }
-            return true;
-        }
-        false
+        self.flash.writes.lock().unwrap().clone()
     }
 }
 
-macro_rules! bus_read {
-    ($self:ident, $addr:expr, $n:expr, $ok:path, $conv:expr) => {{
-        let addr = $addr;
-        if CrimeSpace::contains(addr) || crate::dev::mace::Mace::contains(addr) {
-            unreachable!("device reads are dispatched before this point")
-        }
-        match $self.read_bytes(addr, $n) {
-            Some(v) => $ok($conv(v)),
-            None => {
-                $self.miss(addr, false);
-                $ok($conv(0u64))
-            }
-        }
-    }};
-}
-
-// The address map: CRIME (its registers and the rendering engine), GBE,
-// VICE and MACE (with the PCI bridge's windows) each decode their own
-// space; what is left is memory and the PROM.
-// The decode is 32 bits wide (see [`NO_ECC_BASE`] and `PCI_HI_MEM_BASE` for
-// the two places above 4 GB this folds): `a` is the address the decode
-// helpers, memory and the PROM take; devices get the bus address.
-impl Ip32Bus {
-    fn read8_raw(&self, addr: u64) -> BusRead8 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.read8(addr);
-        }
-        if self.in_gbe(a) {
-            return BusRead8::ok(self.gbe.read32(addr & !3).data as u8);
-        }
-        if self.in_vice(a) {
-            return self.vice.read8(addr);
-        }
-        if Mace::contains(a) {
-            return self.mace.read8(addr);
-        }
-        bus_read!(self, a, 1, BusRead8::ok, |v: u64| v as u8)
-    }
-
-    fn read16_raw(&self, addr: u64) -> BusRead16 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.read16(addr);
-        }
-        if self.in_gbe(a) {
-            return BusRead16::ok(self.gbe.read32(addr & !3).data as u16);
-        }
-        if self.in_vice(a) {
-            return self.vice.read16(addr);
-        }
-        if Mace::contains(a) {
-            return self.mace.read16(addr);
-        }
-        bus_read!(self, a, 2, BusRead16::ok, |v: u64| v as u16)
-    }
-
-    fn read32_raw(&self, addr: u64) -> BusRead32 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.read32(addr);
-        }
-        if self.in_gbe(a) {
-            return self.gbe.read32(addr);
-        }
-        if self.in_vice(a) {
-            return self.vice.read32(addr);
-        }
-        if Mace::contains(a) {
-            return self.mace.read32(addr);
-        }
-        bus_read!(self, a, 4, BusRead32::ok, |v: u64| v as u32)
-    }
-
-    fn read64_raw(&self, addr: u64) -> BusRead64 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.read64(addr);
-        }
-        if self.in_gbe(a) {
-            return self.gbe.read64(addr);
-        }
-        if self.in_vice(a) {
-            return self.vice.read64(addr);
-        }
-        if Mace::contains(a) {
-            return self.mace.read64(addr);
-        }
-        bus_read!(self, a, 8, BusRead64::ok, |v: u64| v)
-    }
-
-    fn write8_raw(&self, addr: u64, val: u8) -> u32 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.write8(addr, val);
-        }
-        if self.in_gbe(a) {
-            return self.gbe.write32(addr & !3, val as u32);
-        }
-        if self.in_vice(a) {
-            return self.vice.write8(addr, val);
-        }
-        if Mace::contains(a) {
-            return self.mace.write8(addr, val);
-        }
-        if self.write_bytes(a, 1, val as u64) { BUS_OK } else { self.miss(a, true); BUS_ERR }
-    }
-
-    fn write16_raw(&self, addr: u64, val: u16) -> u32 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.write16(addr, val);
-        }
-        if self.in_gbe(a) {
-            return self.gbe.write32(addr & !3, val as u32);
-        }
-        if self.in_vice(a) {
-            return self.vice.write16(addr, val);
-        }
-        if Mace::contains(a) {
-            return self.mace.write16(addr, val);
-        }
-        if self.write_bytes(a, 2, val as u64) { BUS_OK } else { self.miss(a, true); BUS_ERR }
-    }
-
-    fn write32_raw(&self, addr: u64, val: u32) -> u32 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.write32(addr, val);
-        }
-        if self.in_gbe(a) {
-            return self.gbe.write32(addr, val);
-        }
-        if self.in_vice(a) {
-            return self.vice.write32(addr, val);
-        }
-        if Mace::contains(a) {
-            return self.mace.write32(addr, val);
-        }
-        if self.write_bytes(a, 4, val as u64) { BUS_OK } else { self.miss(a, true); BUS_ERR }
-    }
-
-    fn write64_raw(&self, addr: u64, val: u64) -> u32 {
-        let a = addr as u32;
-        if CrimeSpace::contains(a) {
-            return self.crime.write64(addr, val);
-        }
-        if self.in_gbe(a) {
-            return self.gbe.write64(addr, val);
-        }
-        if self.in_vice(a) {
-            return self.vice.write64(addr, val);
-        }
-        if Mace::contains(a) {
-            return self.mace.write64(addr, val);
-        }
-        if self.write_bytes(a, 8, val) { BUS_OK } else { self.miss(a, true); BUS_ERR }
-    }
-}
-
-/// Every access goes to the `_raw` decode above. Around it, a machine with
-/// an interrupt sink (`set_irq_sink`) gets its lines recomputed: before a
-/// read of CRIME, so INTSTAT is live, and after any write that is not RAM,
-/// so a handler's acknowledgement drops IP2 at once instead of leaving it up
-/// until the next service tick (OpenBSD: "spurious crime interrupt").
 /// The O2's devices answer the monitor through the bus that holds them,
 /// as the IOC and HPC3 pass their children's commands through on the
 /// other machines.
@@ -863,14 +674,14 @@ impl Ip32Bus {
     /// RAM and the flash, as `ram.bin` and `flash.bin` in `dir`.
     pub fn save_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
         self.ram.save_raw(&dir.join("ram.bin"))?;
-        std::fs::write(dir.join("flash.bin"), &*self.prom.lock().unwrap())
+        std::fs::write(dir.join("flash.bin"), &*self.flash.bytes.lock().unwrap())
     }
 
     /// What [`Self::save_raw`] wrote, back.
     pub fn load_raw(&self, dir: &std::path::Path) -> std::io::Result<()> {
         self.ram.load_raw(&dir.join("ram.bin"))?;
         let flash = std::fs::read(dir.join("flash.bin"))?;
-        let mut prom = self.prom.lock().unwrap();
+        let mut prom = self.flash.bytes.lock().unwrap();
         if flash.len() != prom.len() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "saved flash is the wrong size"));
         }
@@ -900,43 +711,22 @@ impl crate::traits::Device for Ip32Bus {
     }
 }
 
+/// The bus, for code that holds the machine's bus structure: every access
+/// goes to [`Ip32Bus::phys`].
 impl BusDevice for Ip32Bus {
-    /// Memory pages have generations jitv2 can compile against; the PROM and
-    /// devices have none, so nothing there is compiled.
     #[cfg(feature = "jitv2")]
-    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 {
-        let addr = self.resolve(addr as u32);
-        let r = &*self.ram;
-        match r.decode(addr) {
-            Decode::Ram(i) => r.gen_ptr(i),
-            _ => std::ptr::null(),
-        }
-    }
-
-    fn read8(&self, addr: u64) -> BusRead8 {
-        self.read8_raw(addr)
-    }
-    fn read16(&self, addr: u64) -> BusRead16 {
-        self.read16_raw(addr)
-    }
-    fn read32(&self, addr: u64) -> BusRead32 {
-        self.read32_raw(addr)
-    }
-    fn read64(&self, addr: u64) -> BusRead64 {
-        self.read64_raw(addr)
-    }
-    fn write8(&self, addr: u64, val: u8) -> u32 {
-        self.write8_raw(addr, val)
-    }
-    fn write16(&self, addr: u64, val: u16) -> u32 {
-        self.write16_raw(addr, val)
-    }
-    fn write32(&self, addr: u64, val: u32) -> u32 {
-        self.write32_raw(addr, val)
-    }
-    fn write64(&self, addr: u64, val: u64) -> u32 {
-        self.write64_raw(addr, val)
-    }
+    fn gen_ptr(&self, addr: u64) -> *const std::sync::atomic::AtomicU64 { self.phys.gen_ptr(addr) }
+    fn read8(&self, addr: u64) -> BusRead8 { self.phys.read8(addr) }
+    fn read16(&self, addr: u64) -> BusRead16 { self.phys.read16(addr) }
+    fn read32(&self, addr: u64) -> BusRead32 { self.phys.read32(addr) }
+    fn read64(&self, addr: u64) -> BusRead64 { self.phys.read64(addr) }
+    fn write8(&self, addr: u64, val: u8) -> u32 { self.phys.write8(addr, val) }
+    fn write16(&self, addr: u64, val: u16) -> u32 { self.phys.write16(addr, val) }
+    fn write32(&self, addr: u64, val: u32) -> u32 { self.phys.write32(addr, val) }
+    fn write64(&self, addr: u64, val: u64) -> u32 { self.phys.write64(addr, val) }
+    fn mem_ptr(&self, addr: u64) -> Option<*const u64> { self.phys.mem_ptr(addr) }
+    fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 { self.phys.read_block(addr, buf) }
+    fn write_block(&self, addr: u64, buf: &[u64]) -> u32 { self.phys.write_block(addr, buf) }
 }
 
 #[cfg(test)]

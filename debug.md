@@ -452,7 +452,7 @@ a forced termination; a normal stop saves them automatically.
 |---|---|
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
-| `phys map` | The decode table: pages by kind (untouched, shared, private), memory in use, slots faulted in, and the table as runs of devices |
+| `phys map` | The decode table: pages by kind (untouched, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses |
 | `phys error <on\|off>` | Stop on bus errors |
 | `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
