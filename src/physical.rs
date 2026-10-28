@@ -2,7 +2,7 @@
 //!
 //! `Physical` belongs to no machine. It holds:
 //!
-//! - the decode table, one device per 64 KB slot of a 40-bit physical space
+//! - the decode table, one device per 4 KB slot of a 40-bit physical space
 //!   (`SparseDeviceMap`), so a bus access is one indexed load and a call;
 //! - the RAM banks (`PpMemory`, each a `BusDevice`) and ppmem's 4 GB window
 //!   over them, which the CPU's cache and the JIT read and write directly, and
@@ -248,7 +248,7 @@ pub fn write_bytes(bus: &dyn BusDevice, addr: u64, data: &[u8]) -> u32 {
 /// Physical Bus (Physical)
 ///
 /// Routes every bus access to the device the decode table holds for its
-/// 64 KB slot: one indexed load from a table that is sparse and
+/// 4 KB slot: one indexed load from a table that is sparse and
 /// host-MMU-backed (`SparseDeviceMap`), so it spans a 40-bit space while
 /// costing a few pages. Built by [`Physical::new`] over a machine's RAM banks
 /// and filled in by the machine; see the module notes.
@@ -274,7 +274,7 @@ pub struct Physical {
     /// that; null only without a window.
     ppmem_bitmap: AtomicPtr<u64>,
 
-    /// The decode table: one device per 64 KB slot of a 40-bit physical
+    /// The decode table: one device per 4 KB slot of a 40-bit physical
     /// space, sparse and host-MMU-backed (`src/ppmem/devmap.rs`). Slots the
     /// machine fills in are filled at configuration; a slot nobody filled is
     /// faulted in as the default device the first time it is touched.
@@ -398,7 +398,7 @@ impl Physical {
             .unwrap_or_else(|e| panic!("physical: filling the 32-bit space: {e}"));
     }
 
-    /// `dev` answers at `base..end` (64 KB granular). The bus keeps it alive.
+    /// `dev` answers at `base..end` (4 KB granular). The bus keeps it alive.
     pub fn map(&self, base: u64, end: u64, dev: Arc<dyn BusDevice>, name: &str) {
         let p = self.keep(dev, name);
         self.fill_range(base, end, p);
@@ -471,7 +471,7 @@ impl Physical {
         &self.unmapped_ram
     }
 
-    /// Point `count` slots from `first` (64 KB slot numbers) at `dev`, unless
+    /// Point `count` slots from `first` (slot numbers, `addr >> SLOT_SHIFT`) at `dev`, unless
     /// they already all answer that way. A slot that does change is swapped
     /// in whole table pages, so a device thread dispatching through the table
     /// meanwhile sees the old entry or the new one, never a torn pointer.
@@ -707,9 +707,9 @@ impl Device for Physical {
             "map" => {
                 let s = self.devmap.stats();
                 writeln!(writer,
-                    "decode table: {} pages of {} KB ({} MB of guest space each): {} untouched, {} shared, {} private",
+                    "decode table: {} pages of {} KB ({} MB of guest space each): {} untouched, {} filled, not yet mapped, {} shared, {} private",
                     s.pages, s.page_bytes >> 10, ((s.page_bytes as u64 / 16) << SLOT_SHIFT) >> 20,
-                    s.unmapped, s.shared, s.private).unwrap();
+                    s.unmapped, s.lazy, s.shared, s.private).unwrap();
                 writeln!(writer,
                     "  {} constant page(s), {} pool page(s) ({} free), {} KB in use, {} fault(s)",
                     s.const_pages, s.pool_pages, s.pool_free, s.in_use_bytes() >> 10, s.faults).unwrap();
@@ -1019,7 +1019,7 @@ mod tests {
     fn mapped_ranges_answer_as_configured() {
         let phys = Physical::new(vec![RamBank::new(1)]);
         phys.set_default(Arc::new(ErrorBus::new()), "error");
-        phys.fill_slots(0x10, 0x10, phys.bank_entry(0));
+        phys.fill_slots(0x10_0000 >> SLOT_SHIFT, 0x10_0000 >> SLOT_SHIFT, phys.bank_entry(0));
         phys.map_alias(0, 0x10_0000, 0x10_0000, "alias");
         phys.map_black_hole(0x20_0000, 0x21_0000);
 
@@ -1038,7 +1038,7 @@ mod tests {
         let phys = Physical::new(vec![RamBank::new(1)]);
         phys.set_default(Arc::new(ErrorBus::new()), "error");
         // The 1 MB bank at 3 MB: offsets count from there, not from its mask.
-        phys.fill_slots(0x30, 0x10, phys.bank_view(0, 0x30_0000));
+        phys.fill_slots(0x30_0000 >> SLOT_SHIFT, 0x10_0000 >> SLOT_SHIFT, phys.bank_view(0, 0x30_0000));
         assert_eq!(phys.bank_view(0, 0x30_0000), phys.bank_view(0, 0x30_0000), "one view per placement");
         assert_eq!(phys.write32(0x30_0010, 0xdead_beef), BUS_OK);
         assert_eq!(phys.banks()[0].read32(0x10).data, 0xdead_beef);

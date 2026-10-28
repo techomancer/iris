@@ -1,14 +1,20 @@
 //! A sparse, host-MMU-backed physical address decode table.
 //!
 //! `Physical` finds the device behind a physical address with one indexed
-//! load: `table[addr >> 16]`, a `*const dyn BusDevice` per 64 KB. As a plain
-//! array that is 1 MB for a 32-bit space and 256 MB for the 40-bit space an
-//! Octane has, almost all of it the same few pointers repeated. This keeps
-//! the one-load lookup and makes the array virtual:
+//! load: `table[addr >> 12]`, a `*const dyn BusDevice` per 4 KB, the
+//! guest's page size and the smallest window a device or a PCI BAR gets. As
+//! a plain array that is 16 MB for a 32-bit space and 4 GB for the 40-bit
+//! space an Octane has, almost all of it the same few pointers repeated.
+//! This keeps the one-load lookup and makes the array virtual:
 //!
 //! - **Reserved, not allocated.** The whole table is one `AddrSpace`
 //!   reservation (`PROT_NONE` / a placeholder). A page nobody has written is
 //!   not backed by anything.
+//! - **Mapped when used.** Each table page is one host mapping, and hosts
+//!   limit how many a process has (`vm.max_map_count`, 65530 by default on
+//!   Linux). A whole page filled with one device is only recorded; the
+//!   fault handler maps it on the first access. An Octane's 64 GiB widget
+//!   windows cost nothing until the guest reaches into them.
 //! - **Shared where it repeats.** A table page whose entries are all the same
 //!   pointer is a view of one shared "constant page" for that pointer. Four
 //!   banks and three error sinks cost seven pages however much address space
@@ -22,13 +28,14 @@
 //!   and every table view is read-only so that cannot happen by accident.
 //! - **Faults fill in the rest.** A load from a page that was never written
 //!   is a host access violation. The handler installed here recognises the
-//!   reservation, maps that page to the table's default device (the
-//!   bus-error sink), prints the guest address once, and resumes the load.
+//!   reservation, maps that page to what was filled there (or, where
+//!   nothing was, to the table's default device, the bus-error sink, and
+//!   prints the guest address once), and resumes the load.
 //!   So an unmapped region costs nothing until the guest probes it, and a
 //!   probe costs one fault.
 //!
 //! One table page is 64 KB (the Windows allocation granularity, and a
-//! multiple of every Unix page size), 4096 entries, 256 MB of guest address
+//! multiple of every Unix page size), 4096 entries, 16 MB of guest address
 //! space. Every mapping is exactly one page, which is what the Windows
 //! placeholder backend in `map_windows.rs` can split and replace.
 //!
@@ -44,7 +51,7 @@ use std::cell::UnsafeCell;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
-/// One table entry: the device that answers a 64 KB slot.
+/// One table entry: the device that answers a 4 KB slot.
 pub type Entry = *const dyn BusDevice;
 
 /// Width of the physical address space the table covers.
@@ -52,8 +59,8 @@ pub const PHYS_BITS: u32 = 40;
 /// The bits of a physical address the table decodes. `Physical` masks every
 /// address with this before dispatch, so a device never sees bits above it.
 pub const PHYS_MASK: u64 = (1 << PHYS_BITS) - 1;
-/// Bytes of guest address space per entry: 64 KB.
-pub const SLOT_SHIFT: u32 = 16;
+/// Bytes of guest address space per entry: 4 KB.
+pub const SLOT_SHIFT: u32 = 12;
 /// Entries in the table.
 pub const SLOTS: u64 = 1 << (PHYS_BITS - SLOT_SHIFT);
 
@@ -89,6 +96,12 @@ pub fn entry_eq(a: Entry, b: Entry) -> bool {
 enum PageState {
     /// Never written: reserved, faults on access.
     Unmapped,
+    /// Filled whole with constant page `consts[k]` but never touched: still
+    /// reserved, and the fault handler maps the view on first access. A
+    /// table page is one host mapping, so mapping only what the guest uses
+    /// keeps a 40-bit table with small slots well inside the host's mapping
+    /// limit (`vm.max_map_count`).
+    Lazy(u32),
     /// A view of constant page `consts[k]`.
     Const(u32),
     /// A view of pool page `slot` (object `slot / POOL_PAGES`, page within it
@@ -160,6 +173,8 @@ pub struct MapStats {
     pub pages: usize,
     pub unmapped: usize,
     pub shared: usize,
+    /// Filled with one device but not yet touched, so not yet mapped.
+    pub lazy: usize,
     pub private: usize,
     pub const_pages: usize,
     pub pool_pages: usize,
@@ -272,12 +287,17 @@ impl Inner {
     fn map_const(&self, st: &mut State, page: usize, dev: Entry) -> io::Result<()> {
         let k = self.const_for(st, dev)?;
         let old = st.pages[page];
-        if old == PageState::Const(k) {
-            return Ok(());
+        match old {
+            PageState::Const(j) | PageState::Lazy(j) if j == k => return Ok(()),
+            // Nothing mapped yet: leave it to the first access.
+            PageState::Unmapped | PageState::Lazy(_) => st.pages[page] = PageState::Lazy(k),
+            // Replace the view in one step, so a reader sees old or new.
+            PageState::Const(_) | PageState::Private(_) => {
+                unsafe { self.view(page, &st.consts[k as usize].mem, 0)? };
+                st.pages[page] = PageState::Const(k);
+                self.release(st, old);
+            }
         }
-        unsafe { self.view(page, &st.consts[k as usize].mem, 0)? };
-        st.pages[page] = PageState::Const(k);
-        self.release(st, old);
         Ok(())
     }
 
@@ -293,7 +313,7 @@ impl Inner {
                 };
                 vec![st.consts[k as usize].dev; self.per_page]
             }
-            PageState::Const(k) => vec![st.consts[k as usize].dev; self.per_page],
+            PageState::Const(k) | PageState::Lazy(k) => vec![st.consts[k as usize].dev; self.per_page],
             PageState::Private(_) => {
                 let mut v = Vec::with_capacity(self.per_page);
                 // SAFETY: a private page is mapped and readable; only this
@@ -354,9 +374,19 @@ impl Inner {
         };
         // SAFETY: lock held.
         let st = unsafe { &mut *self.st.get() };
-        if st.pages[page] != PageState::Unmapped {
+        match st.pages[page] {
+            PageState::Unmapped => {}
+            PageState::Lazy(k) => {
+                // A filled page's first access: no message, it is not a miss.
+                if unsafe { self.view(page, &st.consts[k as usize].mem, 0) }.is_err() {
+                    fault_message(b"devmap: could not map a filled page at ", slot << SLOT_SHIFT);
+                    return false;
+                }
+                st.pages[page] = PageState::Const(k);
+                return true;
+            }
             // Another thread mapped it between the fault and the lock.
-            return true;
+            PageState::Const(_) | PageState::Private(_) => return true,
         }
         let Some(k) = st.default else {
             fault_message(b"devmap: unmapped physical region and no default device at ", slot << SLOT_SHIFT);
@@ -471,12 +501,15 @@ impl SparseDeviceMap {
 
     /// The entry at `slot`, without faulting an untouched page in.
     pub fn get(&self, slot: u64) -> Option<Entry> {
-        if !self.is_mapped(slot) {
-            return None;
+        let _g = self.inner.lock();
+        let st = unsafe { &*self.inner.st.get() };
+        match st.pages[(slot / self.inner.per_page as u64) as usize] {
+            PageState::Unmapped => None,
+            PageState::Lazy(k) => Some(st.consts[k as usize].dev),
+            // SAFETY: mapped pages stay mapped (views are replaced, never
+            // removed), and the load is one the hot path does without a lock.
+            PageState::Const(_) | PageState::Private(_) => Some(unsafe { *self.inner.entries().add(slot as usize) }),
         }
-        // SAFETY: mapped pages stay mapped (views are replaced, never
-        // removed), and the load is one the hot path does without a lock.
-        Some(unsafe { *self.inner.entries().add(slot as usize) })
     }
 
     /// Whether every slot in `first..first + count` already answers with
@@ -492,7 +525,7 @@ impl SparseDeviceMap {
             let hi = end.min((page as u64 + 1) * per);
             match st.pages[page] {
                 PageState::Unmapped => return false,
-                PageState::Const(k) => {
+                PageState::Const(k) | PageState::Lazy(k) => {
                     if !same(st.consts[k as usize].dev, dev) {
                         return false;
                     }
@@ -536,7 +569,7 @@ impl SparseDeviceMap {
             let start = page as u64 * per;
             match state {
                 PageState::Unmapped => push(start, start + per, None),
-                PageState::Const(k) => push(start, start + per, Some(st.consts[k as usize].dev)),
+                PageState::Const(k) | PageState::Lazy(k) => push(start, start + per, Some(st.consts[k as usize].dev)),
                 PageState::Private(_) => unsafe {
                     let p = self.inner.entries().add(start as usize);
                     let mut run_start = start;
@@ -572,6 +605,7 @@ impl SparseDeviceMap {
             match p {
                 PageState::Unmapped => s.unmapped += 1,
                 PageState::Const(_) => s.shared += 1,
+                PageState::Lazy(_) => s.lazy += 1,
                 PageState::Private(_) => s.private += 1,
             }
         }
@@ -791,10 +825,13 @@ mod tests {
         let per = m.page_slots();
         m.fill(0, 4 * per, d1).unwrap();
         let s = m.stats();
-        assert_eq!((s.shared, s.private, s.const_pages, s.pool_pages), (4, 0, 2, 0));
+        assert_eq!((s.lazy, s.shared, s.private, s.const_pages, s.pool_pages), (4, 0, 0, 2, 0), "nothing mapped yet");
         for slot in [0, per - 1, per, 3 * per + 7, 4 * per - 1] {
             assert!(same(entry_at(&m, slot), d1), "slot {slot:#x}");
         }
+        let s = m.stats();
+        assert_eq!((s.lazy, s.shared, s.faults), (1, 3, 0), "the pages read were mapped, silently; page 2 waits");
+        assert!(same(m.get(2 * per + 5).unwrap(), d1), "get answers a filled page without mapping it");
         assert!(!m.is_mapped(4 * per));
         // A second identical fill maps nothing new.
         m.fill(0, 4 * per, d1).unwrap();
@@ -862,8 +899,9 @@ mod tests {
         let s = m.stats();
         assert_eq!(s.faults, 1);
         assert_eq!(s.first_faults, vec![slot << SLOT_SHIFT]);
-        // The page is a shared view of the default's constant page.
-        assert_eq!((s.shared, s.private), (2, 0));
+        // The page is a shared view of the default's constant page; the
+        // filled page was never read, so it is still waiting.
+        assert_eq!((s.shared, s.lazy, s.private), (1, 1, 0));
         // Loading it again is an ordinary load.
         assert!(same(entry_at(&m, slot + 1), d0));
         assert_eq!(m.stats().faults, 1);
@@ -877,16 +915,16 @@ mod tests {
         let per = m.page_slots();
         m.fill(0, 2 * per, d1).unwrap();
         m.fill(2 * per - 3, 5, d2).unwrap(); // straddles pages 1 and 2
-        m.fill_bytes(0x1FC0_0000, 0x1FD0_0000, d0).unwrap(); // 16 slots inside page 0
+        m.fill(0x7c0, 0x40, d0).unwrap(); // 64 slots inside page 0
         let runs = m.runs();
         let mapped: Vec<_> = runs.iter().filter(|r| r.dev.is_some()).collect();
         let starts: Vec<(u64, u64)> = mapped.iter().map(|r| (r.start, r.end)).collect();
         assert_eq!(
             starts,
             vec![
-                (0, 0x1FC0),
-                (0x1FC0, 0x1FD0),
-                (0x1FD0, 2 * per - 3),
+                (0, 0x7c0),
+                (0x7c0, 0x800),
+                (0x800, 2 * per - 3),
                 (2 * per - 3, 2 * per + 2),
                 (2 * per + 2, 3 * per),
             ]

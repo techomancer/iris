@@ -18,7 +18,7 @@
 //! graphics ports.
 //!
 //! The decode is one table, built the way `Physical` is for the Indy: a
-//! `SparseDeviceMap` of 64 KiB slots over the R10000's 40-bit physical
+//! `SparseDeviceMap` of 4 KiB slots over the R10000's 40-bit physical
 //! space, each pointing at the device that answers it.
 //!
 //! Set IRIS_IP30_TRACE=1 to log unmapped accesses as they happen.
@@ -75,14 +75,15 @@ impl BusDevice for Unmapped {
     fn write64(&self, _: u64, _: u64) -> u32 { BUS_ERR }
 }
 
-/// The Octane's processor-side physical bus: a `SparseDeviceMap` of 64 KiB
+/// The Octane's processor-side physical bus: a `SparseDeviceMap` of 4 KiB
 /// slots over the 40-bit space, each pointing at the device that answers
 /// it. Every access is one mask, one table load and a call; there is no
 /// lock and no decode chain.
 ///
 /// Devices see full physical addresses (masked to 40 bits), not offsets,
 /// and mask to their own window. A device that fills only part of a slot
-/// answers the rest of it itself (low memory bus-errors 0x4000..0x10000).
+/// answers the rest of it itself (low memory is mapped over 64 KiB and
+/// bus-errors 0x4000..0x10000).
 ///
 /// Built in three steps, as `Physical` is: `new`, then the machine
 /// registers devices (`map`, `attach_widget`), then `init` fills the table
@@ -144,7 +145,7 @@ impl Ip30Physical {
     }
 
     /// Put `dev` at physical `start..end` (`end` exclusive, rounded up to a
-    /// 64 KiB slot): HEART's PIU registers, the Crossbow's window (widget 0)
+    /// 4 KiB slot): HEART's PIU registers, the Crossbow's window (widget 0)
     /// and HEART's widget registers (widget 8), none of which a link gates.
     /// Takes effect at once; a later `map` over the same slots wins.
     pub fn map(&self, start: u64, end: u64, dev: Arc<dyn BusDevice>) {
@@ -165,7 +166,7 @@ impl Ip30Physical {
     /// every attached widget's windows as its link stands (dead). Call once,
     /// after the devices are registered and before the CPU runs.
     pub fn init(&self) {
-        self.fill(0, 1 << SLOT_SHIFT, Arc::as_ptr(&self.low) as *const dyn BusDevice);
+        self.fill(0, 0x1_0000, Arc::as_ptr(&self.low) as *const dyn BusDevice);
         self.fill(RAM_BASE, SDRAM_SPACE_END, Arc::as_ptr(&self.ram) as *const dyn BusDevice);
         for w in 9..16 {
             self.set_widget_link(w, false);

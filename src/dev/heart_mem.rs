@@ -611,7 +611,7 @@ impl BusDevice for DmaView {
 /// SDRAM at `RAM_BASE`, with the same jitv2 page generations, so code the
 /// kernel rewrites at its exception vectors is recompiled. This is the only
 /// way the processor reaches them, so it takes `HeartRam`'s unguarded path.
-/// It fills the 64 KiB decode slot at 0, so it answers 0x4000..0x10000 with
+/// It is mapped over the first 64 KiB, so it answers 0x4000..0x10000 with
 /// a bus error itself, and where no bank descriptor covers `RAM_BASE` it
 /// answers as SDRAM does there.
 pub struct LowAlias(Arc<HeartRam>);

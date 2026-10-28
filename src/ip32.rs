@@ -507,15 +507,15 @@ impl Ip32Bus {
     /// physical bus is used.
     fn map(&self) {
         use crate::dev::mace_pci::{PCI_HI_MEM_BASE, PCI_IO_BASE, PCI_IO_SIZE, PCI_MEM_BASE, PCI_MEM_SIZE};
-        use crate::ppmem::devmap::{Entry, SLOT_SHIFT};
+        use crate::ppmem::devmap::Entry;
         let phys = &*self.phys;
         // Whatever nothing claims reads as zero and logs. That covers every
         // slot, RAM's too, so the memory is laid out again below.
         phys.set_default(self.misses.clone(), "nothing (o2 unmapped)");
         let set = |base: u32, size: u32, dev: Entry, name: &str| {
-            // A device smaller than a table slot (CRIME's registers and the
-            // rendering engine) takes the whole slot and checks its range.
-            let end = (base as u64 + size as u64).next_multiple_of(1 << SLOT_SHIFT);
+            // CRIME's registers and its rendering engine answer a whole
+            // 64 KB and check their own range inside it.
+            let end = (base as u64 + size as u64).next_multiple_of(0x1_0000);
             unsafe { phys.map_borrowed(base as u64, end, dev, name) };
         };
         set(CRIME_BASE, CRIME_SIZE, &self.crime, "crime");

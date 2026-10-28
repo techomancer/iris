@@ -161,7 +161,7 @@ fn plan_bank_slots(
     };
     let mut plan = std::collections::BTreeMap::new();
     for base in [LOMEM_BASE, HIMEM_BASE] {
-        for idx in (base >> 16)..((base + WINDOW) >> 16) {
+        for idx in (base >> SLOT_SHIFT)..((base + WINDOW) >> SLOT_SHIFT) {
             plan.insert(idx, BankSlot::Unmapped);
         }
     }
@@ -171,11 +171,11 @@ fn plan_bank_slots(
     let mut outside = Vec::new();
     for (bank, entry) in bank_addrs.iter().enumerate() {
         let Some((conf_base, _addr_mask, limit)) = *entry else { continue };
-        for slot in 0..(limit >> 16) {
-            let phys = conf_base.wrapping_add(slot << 16);
-            plan.insert(phys >> 16, BankSlot::Bank(bank));
+        for slot in 0..(limit >> SLOT_SHIFT) {
+            let phys = conf_base.wrapping_add(slot << SLOT_SHIFT);
+            plan.insert(phys >> SLOT_SHIFT, BankSlot::Bank(bank));
             if !in_window(phys) {
-                outside.push(phys >> 16);
+                outside.push(phys >> SLOT_SHIFT);
             }
         }
     }
@@ -266,8 +266,8 @@ impl Ip22Bus {
         // remap_banks() is called by the MC when MEMCFG is written.
         // At boot, the MC's initial MEMCFG values trigger an initial remap.
 
-        // Map VINO (physical 0x00080000, one 64KB slot)
-        set(crate::dev::vino::VINO_BASE, crate::dev::vino::VINO_BASE + (1 << SLOT_SHIFT),
+        // Map VINO (64KB at 0x00080000)
+        set(crate::dev::vino::VINO_BASE, crate::dev::vino::VINO_BASE + 0x1_0000,
             Arc::new(d.vino.clone()), "vino");
 
         // Map Mystery Hole
@@ -583,7 +583,7 @@ mod ppmem_tests {
             let offsets = [0, (256 << 20) - 8, 256 << 20, limit - 8];
             for off in offsets {
                 let phys = base + off;
-                assert!(plan.contains(&(phys >> 16, BankSlot::Bank(i))));
+                assert!(plan.contains(&(phys >> SLOT_SHIFT, BankSlot::Bank(i))));
                 let val = 0xC0DE_0000_0000_0000u64 | ((i as u64) << 32) | off as u64;
                 banks[i].write64(phys as u64, val);
             }
@@ -596,7 +596,7 @@ mod ppmem_tests {
                 assert_eq!(w.rotate_left(32), val, "physical {phys:#x}");
             }
         }
-        assert_eq!(plan.iter().filter(|(_, slot)| matches!(slot, BankSlot::Bank(_))).count(), 1024 << 4);
+        assert_eq!(plan.iter().filter(|(_, slot)| matches!(slot, BankSlot::Bank(_))).count(), (1024 << 20) >> SLOT_SHIFT);
     }
 
     /// The bitmap must never claim a region that contains MMIO — otherwise the
@@ -638,7 +638,7 @@ mod bank_plan_tests {
     use super::*;
 
     const MB: u32 = 1 << 20;
-    const SLOTS_PER_128MB: usize = (128 * MB >> 16) as usize;
+    const SLOTS_PER_128MB: usize = (128 * MB >> SLOT_SHIFT) as usize;
 
     fn bank(base: u32, size: u32) -> Option<(u32, u32, u32)> {
         Some((base, size - 1, size))
@@ -665,7 +665,7 @@ mod bank_plan_tests {
         let addrs = [bank(LOMEM_BASE, 128 * MB), None, bank(HIMEM_BASE, 128 * MB), None];
         let (plan, _) = plan_bank_slots(&addrs, &[]);
         assert!(plan.windows(2).all(|w| w[0].0 < w[1].0), "slots sorted and unique");
-        let lo = (LOMEM_BASE >> 16) as usize;
+        let lo = (LOMEM_BASE >> SLOT_SHIFT) as usize;
         let at = |idx: usize| plan.iter().find(|p| p.0 as usize == idx).unwrap().1;
         assert_eq!(at(lo), BankSlot::Bank(0));
         assert_eq!(at(lo + SLOTS_PER_128MB), BankSlot::Unmapped, "past bank 0's limit");
@@ -674,7 +674,7 @@ mod bank_plan_tests {
     #[test]
     fn a_repeated_memcfg_write_stores_nothing() {
         let addrs = [bank(LOMEM_BASE, 128 * MB), bank(LOMEM_BASE + 128 * MB, 128 * MB), None, None];
-        let mut map = vec![BankSlot::Unmapped; 65536];
+        let mut map = vec![BankSlot::Unmapped; 1 << (32 - SLOT_SHIFT)];
         let (plan, outside) = plan_bank_slots(&addrs, &[]);
         assert_eq!(apply(&mut map, &plan), 2 * SLOTS_PER_128MB);
         let (plan, _) = plan_bank_slots(&addrs, &outside);
@@ -685,7 +685,7 @@ mod bank_plan_tests {
     fn moving_one_bank_stores_only_that_banks_slots() {
         let before = [bank(LOMEM_BASE, 128 * MB), bank(LOMEM_BASE + 128 * MB, 128 * MB), None, None];
         let after = [bank(LOMEM_BASE, 128 * MB), bank(HIMEM_BASE, 128 * MB), None, None];
-        let mut map = vec![BankSlot::Unmapped; 65536];
+        let mut map = vec![BankSlot::Unmapped; 1 << (32 - SLOT_SHIFT)];
         let (plan, outside) = plan_bank_slots(&before, &[]);
         apply(&mut map, &plan);
         let (plan, _) = plan_bank_slots(&after, &outside);
@@ -701,16 +701,16 @@ mod bank_plan_tests {
         const PARKED: u32 = 0x6000_0000;
         let parked = [bank(LOMEM_BASE, 128 * MB), None, None, bank(PARKED, 16 * MB)];
         let moved = [bank(LOMEM_BASE, 128 * MB), None, None, bank(HIMEM_BASE, 16 * MB)];
-        let mut map = vec![BankSlot::Unmapped; 65536];
+        let mut map = vec![BankSlot::Unmapped; 1 << (32 - SLOT_SHIFT)];
 
         let (plan, outside) = plan_bank_slots(&parked, &[]);
         apply(&mut map, &plan);
-        assert_eq!(map[(PARKED >> 16) as usize], BankSlot::Bank(3));
-        assert_eq!(outside.len(), (16 * MB >> 16) as usize);
+        assert_eq!(map[(PARKED >> SLOT_SHIFT) as usize], BankSlot::Bank(3));
+        assert_eq!(outside.len(), (16 * MB >> SLOT_SHIFT) as usize);
 
         let (plan, outside) = plan_bank_slots(&moved, &outside);
         apply(&mut map, &plan);
-        assert_eq!(map[(PARKED >> 16) as usize], BankSlot::Unmapped,
+        assert_eq!(map[(PARKED >> SLOT_SHIFT) as usize], BankSlot::Unmapped,
                    "a slot outside the windows kept pointing at a bank that moved");
         assert!(outside.is_empty());
     }

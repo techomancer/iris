@@ -30,7 +30,7 @@ IRIS keeps the observable part and drops the timing.
 ```
                        ┌──────────────────── Machine ────────────────────┐
   CPU thread           │                                                 │
-  MipsExecutor ──SysAd──▶ Physical (64 KB address decode table)           │
+  MipsExecutor ──SysAd──▶ Physical (4 KB address decode table)            │
   (interp / jitv2)     │    ├── RAM banks (host-mapped, ppmem)           │
                        │    ├── MC: memory config, VDMA, GIO arbitration  │
                        │    ├── HPC3 ── IOC (interrupts, PIT, PS/2, SCC) │
@@ -161,11 +161,11 @@ match. The CPU and every DMA master reach memory through `Physical` as a
 at a time with `read_block`/`write_block`.
 
 `Physical` decodes physical addresses through a table of
-64 KB slots (one `*const dyn BusDevice` per `addr >> 16`), so finding the
+4 KB slots (one `*const dyn BusDevice` per `addr >> 12`), so finding the
 device for an access is one indexed load. The table itself is sparse and
 host-mapped (`SparseDeviceMap`, `src/ppmem/devmap.rs`): it spans a 40-bit
-physical space as a 256 MB reservation, pages full of one pointer are views
-of one shared page, a change swaps a whole page in rather than storing into
+physical space as a 4 GB reservation, pages full of one pointer are views
+of one shared page mapped on first use, a change swaps a whole page in rather than storing into
 it (so threads dispatching through it never see a torn pointer), and a page
 nobody filled is faulted in as the bus-error device the first time the guest
 touches it. [docs/devmap-design.md](docs/devmap-design.md) has the details.
