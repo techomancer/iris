@@ -34,6 +34,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **Pages above 4 GB keep their nutlb entries.** The inline memory path's
+  window test now bounds the region number itself, so translations of
+  physical addresses past the 4 GB window are cached for the interpreter
+  like any other; compiled code still sends those accesses to the bus.
 - **FPU integer conversions are compiled inline.** `CVT.W/L.S/D`,
   `ROUND/TRUNC/CEIL/FLOOR.W/L.S/D` and the reverse `CVT.S/D.W/L` each emitted
   a `call_indirect` into the interpreter's own conversion helper, so a guest

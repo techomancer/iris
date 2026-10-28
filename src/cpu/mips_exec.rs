@@ -3362,13 +3362,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             return;
         }
 
-        // Compiled code's inline path tests `phys` against ppmem's bitmap
-        // with a shift that wraps above 4GB, so pages up there stay out of
-        // the nutlb and always take the callout.
-        if result.phys >= crate::ppmem::WINDOW_SIZE {
-            return;
-        }
-
         let idx = nutlb_index(va);
         let arr = if W { NUTLB_WRITE } else { NUTLB_READ };
         let e = &mut self.core.nutlb[arr][idx];
