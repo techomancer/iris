@@ -402,6 +402,9 @@ impl BusDevice for Misses {
 pub struct Ip32Bus {
     /// The bus everything is mapped on: what the CPU and the DMA masters use.
     pub phys: Arc<Physical>,
+    /// The runs of the PCI windows a BAR decodes whole, mapped over MACE
+    /// (`MacePci::on_bar_runs`).
+    pci_runs: Mutex<Vec<crate::pci::BarRun>>,
     pub(crate) ram: Arc<O2Memory>,
     pub(crate) flash: O2Flash,
     /// Where to keep the flash between runs, if anywhere. Never the image the
@@ -447,6 +450,7 @@ impl Ip32Bus {
         let crime = Arc::new(Crime::new(ust.clone()));
         let mut bus = Self {
             phys: phys.clone(),
+            pci_runs: Mutex::new(Vec::new()),
             ram: ram.clone(),
             flash: O2Flash { bytes: Mutex::new(prom), writes: Mutex::new(Vec::new()) },
             flash_file: opts.flash_file.clone(),
@@ -499,7 +503,28 @@ impl Ip32Bus {
         }
         let bus = Arc::new(bus);
         bus.map();
+        // Window pages a PCI BAR decodes whole go straight to the function.
+        let weak = Arc::downgrade(&bus);
+        bus.mace.pci.on_bar_runs(Box::new(move |runs| {
+            if let Some(b) = weak.upgrade() {
+                b.set_pci_runs(runs);
+            }
+        }));
         bus
+    }
+
+    /// MACE says which runs of its PCI windows a BAR decodes whole: map
+    /// them over MACE, giving the runs it named before back to it.
+    fn set_pci_runs(&self, new: Vec<crate::pci::BarRun>) {
+        let mut runs = self.pci_runs.lock().unwrap();
+        for r in runs.iter() {
+            // SAFETY: MACE is a field of this bus, alive as long as it is.
+            unsafe { self.phys.map_borrowed(r.start, r.end, &self.mace, "mace") };
+        }
+        for r in &new {
+            self.phys.map(r.start, r.end, r.dev.clone(), "pci bar");
+        }
+        *runs = new;
     }
 
     /// Put everything where CRIME and MACE decode it. The devices are fields

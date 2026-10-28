@@ -5,7 +5,7 @@ Status: open (started 2026-10-19 on branch ip30 of slaapliedje/iris, rebuilt
 command monitor work on the serial console).
 
 **Where it stands.** `[machine] profile = "octane_ip30"` builds an
-`OctaneMachine` (`src/ip30_machine.rs`) over `Ip30Physical` (`src/ip30.rs`):
+`OctaneMachine` (`src/ip30_machine.rs`) over `Ip30Bus` (`src/ip30.rs`, on `Physical` since 2026-10-28):
 HEART, the Xbow, the Bridge with its PCI configuration space and device
 windows, the IOC3's two 16550s, DS1687 and 1-wire parts, the flash, and
 memory placed by MEMCFG. The QL1040s, the RAD and the graphics widget are

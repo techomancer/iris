@@ -322,8 +322,9 @@ shows the command total and anything odd the driver did; `regs`, `wdt`,
 (interrupt bits, mask, counter, bank descriptors), `heart unsupported`
 (HEART registers touched but not modelled) and `ip30 memcfg|bridge|gfx|xbow|unmapped`
 (the banks as HEART places them, the Bridge's interrupt routing, the graphics
-widget's link, refused Crossbow accesses, and failed physical accesses with
-the PC).
+widget's link, refused Crossbow accesses, and accesses to physical addresses
+nothing is mapped at, with the PC). The `phys` commands work on the Octane as
+well.
 
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
 change reaches IRIX as a Unit Attention ("medium changed") on its next
@@ -452,7 +453,7 @@ a forced termination; a normal stop saves them automatically.
 |---|---|
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
-| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2) |
+| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses |
 | `phys error <on\|off>` | Stop on bus errors |
 | `phys hole <on\|off>` | Stop on accesses to unmapped addresses |

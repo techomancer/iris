@@ -30,7 +30,7 @@ use std::sync::Arc;
 use super::*;
 use crate::dev::bridge::*;
 use crate::dev::heart::{Heart, HeartConfig, PIU_BASE, PIU_SIZE};
-use crate::dev::heart_mem::{dma_read_bytes, dma_write_bytes};
+use crate::physical::{read_bytes, write_bytes, Physical};
 use crate::dev::ioc3::{self, Ioc3};
 use crate::dev::ioc3_eth::{bits as ebit, reg as ereg, Ioc3Eth};
 use crate::dev::isp1040::{mbox, reg as ireg, Isp1040, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, ENTRY_SIZE, ENTRY_TYPE_REQUEST, ENTRY_TYPE_STATUS};
@@ -48,7 +48,8 @@ const WIDGET_GFX: u8 = 11;
 /// HEART, the Crossbow (HEART and the Bridge alive), the Bridge with `prom`
 /// in its flash.
 struct Board {
-    phys: Arc<Ip30Physical>,
+    bus: Arc<Ip30Bus>,
+    phys: Arc<Physical>,
     heart: Arc<Heart>,
 }
 
@@ -59,10 +60,10 @@ fn board(prom: &[u8]) -> Board {
     xbow.connect_heart(heart.clone());
     let bridge = Bridge::new(ram.dma_view(), heart.clone());
     bridge.attach_flash(Arc::new(RawFlash::new(prom, FLASH_SIZE)), FLASH_SIZE as u32);
-    let phys = Ip30Physical::new(ram).unwrap();
-    phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone());
-    phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone());
-    phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone());
+    let phys = Ip30Bus::new(ram);
+    phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
+    phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone(), "xbow");
+    phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
     phys.attach_widget(WIDGET_BRIDGE, bridge, false);
     let phys = Arc::new(phys);
     phys.init();
@@ -75,7 +76,7 @@ fn board(prom: &[u8]) -> Board {
             p.remap_banks(m);
         }
     }));
-    Board { phys, heart }
+    Board { phys: phys.phys.clone(), bus: phys, heart }
 }
 
 /// The PROM stores to its own variables at their cached flash addresses.
@@ -130,7 +131,7 @@ fn low_memory_is_the_first_16_kib_of_sdram_on_the_bus() {
     assert_eq!(p.write32(PIU_BASE + 0x20, 0x8003_0000), BUS_OK);
     // The processor reaches those bytes only at physical 0; a bus master's
     // view shows where they are.
-    let dma = p.memory();
+    let dma = b.bus.memory();
     assert_eq!(p.read64(0).data, 0);
     assert_eq!(p.write32(0x100, 0x1234_5678), BUS_OK);
     assert_eq!(dma.read32(0x2000_0100).data, 0x1234_5678, "a low store is in SDRAM");
@@ -140,7 +141,9 @@ fn low_memory_is_the_first_16_kib_of_sdram_on_the_bus() {
     assert_eq!(dma.write64(0x2000_0200, 0x0102_0304_0506_0708), BUS_OK);
     assert_eq!(p.read64(0x200).data, 0x0102_0304_0506_0708, "and the reverse");
     assert_eq!(p.mem_ptr(0x100), dma.mem_ptr(0x2000_0100), "one word");
-    assert!(p.mem_ptr(0x2000_0100).is_none(), "no direct pointer at the SDRAM address");
+    // The ppmem window maps whole 32 MiB units, so `mem_ptr` (the cache's
+    // line-fill path) reaches the guard's bytes, as the cache always has;
+    // the processor's uncached accesses there are bus errors.
     assert_eq!(p.write64(0x2000_0000, 1), BUS_ERR);
     assert_eq!(p.read8(0x2000_3fff).status, BUS_ERR);
     assert_eq!(p.read8(0x3fff).status, BUS_OK);
@@ -148,7 +151,7 @@ fn low_memory_is_the_first_16_kib_of_sdram_on_the_bus() {
     assert_eq!(p.read8(0x10000).status, BUS_ERR);
     assert_eq!(p.write64(0x2000_4000, 1), BUS_OK);
     assert_eq!(p.read64(0x4000).status, BUS_ERR, "SDRAM past 16 KiB is not aliased");
-    assert!(p.unmapped().iter().any(|&(a, w, _)| a == 0x4000 && !w), "misses are logged");
+    assert!(b.bus.unmapped().iter().any(|&(a, w, _)| a == 0x4000 && !w), "misses are logged");
 }
 
 /// Code in low memory and SDRAM is compiled against a per-page
@@ -162,9 +165,10 @@ fn stores_through_the_bus_invalidate_compiled_code() {
     assert_eq!(p.write32(PIU_BASE + 0x20, 0x8003_0000), BUS_OK);
     let (g0, g1) = (p.gen_ptr(0x180), p.gen_ptr(0x1000));
     assert!(!g0.is_null() && !g1.is_null() && g0 != g1);
-    let dma = p.memory();
+    let dma = b.bus.memory();
     assert_eq!(g0, dma.gen_ptr(0x2000_0180), "low memory shares SDRAM's counter");
-    assert!(p.gen_ptr(0x2000_0180).is_null(), "the processor has none at the SDRAM address");
+    // At the SDRAM address the window's counter answers (the window maps
+    // whole 32 MiB units); it is the same memory, so it moves with g0.
     let (a, c) = (gen(g0), gen(g1));
     assert_eq!(p.write64(0x180, 0xdf5a_c000_0340_0008), BUS_OK);
     assert_ne!(gen(g0), a, "a store advances its page");
@@ -235,7 +239,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
     for (links, alive) in [(0x8100u16, false), (0x8100 | 1 << WIDGET_GFX, true)] {
         let xbow = Arc::new(Xbow::new(XBOW_REVISION, links));
         xbow.connect_heart(heart.clone());
-        let p = Arc::new(Ip30Physical::new(ram.clone()).unwrap());
+        let p = Arc::new(Ip30Bus::new(ram.clone()));
         p.attach_widget(WIDGET_GFX, gfx.clone(), false);
         p.init();
         let weak = Arc::downgrade(&p);
@@ -247,7 +251,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         for w in 9..16 {
             p.set_widget_link(w, xbow.carries(w));
         }
-        let r = p.read32(id);
+        let r = p.phys.read32(id);
         if alive {
             assert_eq!(r.status, BUS_OK);
             assert_eq!(r.data >> 12 & 0xffff, 0xc003, "HQ4's widget part number");
@@ -256,7 +260,7 @@ fn the_graphics_port_reaches_impact_with_its_link_up() {
         }
         // The Crossbow attaching a board brings its windows up.
         xbow.attach(WIDGET_GFX);
-        assert_eq!(p.read32(id).status, BUS_OK, "a link that comes up is routed");
+        assert_eq!(p.phys.read32(id).status, BUS_OK, "a link that comes up is routed");
     }
 }
 
@@ -407,12 +411,12 @@ impl Octane {
     // ---- RAM, as the bytes sit in memory ----
 
     fn ram_put(&self, off: u64, data: &[u8]) {
-        assert!(dma_write_bytes(&*self.mem, RAM + off, data));
+        assert_eq!(write_bytes(&*self.mem, RAM + off, data), BUS_OK);
     }
 
     fn ram_get(&self, off: u64, n: usize) -> Vec<u8> {
         let mut v = vec![0; n];
-        assert!(dma_read_bytes(&*self.mem, RAM + off, &mut v));
+        assert_eq!(read_bytes(&*self.mem, RAM + off, &mut v), BUS_OK);
         v
     }
 
@@ -892,4 +896,34 @@ fn flash_serves_the_stock_prom_as_the_processor_sees_it() {
     let o = Octane::new();
     o.bridge.attach_flash(Arc::new(RawFlash::new(&image, 0x10_0000)), 0x10_0000);
     assert_eq!(o.bridge.read32(u64::from(FLASH_BASE)).data, 0x0bf0_00f0);
+}
+
+/// A device window a BAR decodes whole is published as a run, and the
+/// processor's access through it is the access through the Bridge's own
+/// window, lane for lane; a window aimed elsewhere drops the run.
+#[test]
+fn a_bar_run_answers_as_the_window_does() {
+    let o = Octane::new();
+    let runs = Arc::new(parking_lot::Mutex::new(Vec::<crate::pci::BarRun>::new()));
+    let sink = runs.clone();
+    o.bridge.on_bar_runs(Box::new(move |r| *sink.lock() = r));
+    assert!(runs.lock().is_empty(), "nothing decodes before the PROM places a BAR");
+    o.ioc3_map();
+    let win = Octane::ioc3_win() as u64;
+    let run = runs.lock().iter().find(|r| r.start <= win && win < r.end).cloned().expect("IOC3's window is a run");
+    assert_eq!((run.start, run.end), (win, win + (1 << 20)), "the whole 1 MB window");
+    let at = win + RTC_DATA as u64;
+    o.w8(RTC_INDEX, 0x0e); // a byte of the clock's RAM
+    assert_eq!(run.dev.write32(at, 0xaabb_ccdd), BUS_OK);
+    assert_eq!(o.i8(RTC_DATA), 0xaa, "a word store through the run lands as through the window");
+    o.w8(RTC_DATA + 3, 0x77);
+    assert_eq!(run.dev.read8(at).data, o.bridge.read8(at).data);
+    assert_eq!(run.dev.read16(at).data, o.bridge.read16(at).data);
+    assert_eq!(run.dev.read32(at).data, o.bridge.read32(at).data);
+    assert_eq!(run.dev.read64(at).data, o.bridge.read64(at).data);
+    assert_eq!(run.dev.read32(at).data, 0x7777_7777);
+    // The window aimed at PCI space nothing decodes: no run, and the
+    // Bridge's master time-out is what answers there.
+    o.set(reg::device(SLOT_IOC3), 0x1000 | (0x3000_0000 >> 20));
+    assert!(runs.lock().iter().all(|r| !(r.start <= win && win < r.end)));
 }

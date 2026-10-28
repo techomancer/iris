@@ -156,9 +156,26 @@ the MEMCFG remap that places the banks in the table and the window. For the
 O2 it is `src/ip32.rs` (`Ip32Bus`) with CRIME's bank logic in
 `src/dev/crime_mem.rs` (`O2Memory`), whose remap points the table at bank
 views (a bank counted from where CRIME placed it) and maps the window to
-match. The CPU and every DMA master reach memory through `Physical` as a
-`BusDevice`; `physical::read_bytes`/`write_bytes` move byte ranges a page
-at a time with `read_block`/`write_block`.
+match. The Octane is built the same way: `src/ip30.rs` (`Ip30Bus`) maps
+HEART, the Crossbow and the widget windows (switched as links come and go),
+and HEART's bank descriptors place the banks through `src/dev/heart_mem.rs`
+(`HeartRam`), 32 MB at a time, with the 16 KB low-memory window as a view
+of the same bank. The CPU and every DMA master reach memory through
+`Physical` as a `BusDevice` (on the Octane, masters get `HeartRam`'s DMA
+view of it); `physical::read_bytes`/`write_bytes` move byte ranges a page
+at a time with `read_block`/`write_block`, and both PCI host bridges'
+`PciDma` use them.
+
+PCI is shaped the same way on both machines that have it. A host bridge
+(the Octane's Bridge, the O2's MACE) works out which pages of its CPU
+windows one BAR decodes whole (`pci::bar_runs`) and hands them to the
+machine's bus through a callback (`on_bar_runs`); the bus maps each run on
+`Physical` as a `pci::PciBar` entry, which drives the function directly
+through the bridge's byte-lane rules (`pci::PciLanes`). The bridge
+recomputes the runs after a configuration write, a write to a window
+register and a reset. Everything else in a window (BARs smaller than a
+page, shared pages, unclaimed addresses and their master aborts) stays with
+the bridge's own decode.
 
 `Physical` decodes physical addresses through a table of
 4 KB slots (one `*const dyn BusDevice` per `addr >> 12`), so finding the

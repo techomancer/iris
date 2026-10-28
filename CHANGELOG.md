@@ -247,6 +247,23 @@ hashes are given where a change is easiest to understand by reading the commit.
   swap whole pages in, so the DMA worker dispatching through the table during
   a MEMCFG remap can no longer read a torn pointer. `phys map` in the monitor
   shows the table. Groundwork for machines with a 40-bit address space.
+- **4 KB slots.** The table has one entry per 4 KB, the guest's page size
+  and the smallest window a PCI BAR gets, so small devices no longer need
+  to answer a whole 64 KB. A page filled with one device is only recorded
+  and mapped the first time it is used, which keeps host mappings in
+  proportion to what the guest touches (an Octane's 64 GB widget windows
+  cost nothing until used).
+- **The Octane uses `Physical`.** Its bus (`Ip30Bus`) and HEART's memory
+  placement are built from the same parts as the Indy's and the O2's: RAM
+  banks placed as bank views, the low-memory window as a view of the same
+  bank, and `phys` monitor commands on the Octane too. Bus masters still
+  reach memory through HEART's DMA view, now with `physical::read_bytes`
+  and `write_bytes`.
+- **PCI BARs go on the bus.** The Octane's Bridge and the O2's MACE publish
+  the pages of their windows that one BAR decodes whole, and the machine
+  maps them on `Physical`, so a CPU access to a PCI register goes straight
+  to the function through the bridge's lane rules, with no search of the
+  slots and no bridge lock.
 - **The bus takes 64-bit addresses.** Every `BusDevice` method now takes
   `addr: u64`. `Physical` masks to the table's 40 bits before dispatch, and
   devices below 4 GB turn the address into a 32-bit offset from their base,

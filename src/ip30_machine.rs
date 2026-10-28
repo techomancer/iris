@@ -7,7 +7,7 @@
 //! Octane has (see [`crate::config::OctaneSection`]).
 //!
 //! Built as the Indy is: the devices first, then the bus over them
-//! (`ip30::Ip30Physical`), then `init`, then the CPU. On the Bridge's PCI
+//! (`ip30::Ip30Bus`, which configures the machine's `Physical`), then `init`, then the CPU. On the Bridge's PCI
 //! bus, as on the board: the two ISP1040 SCSI controllers in slots 0 and 1,
 //! IOC3 (serial, keyboard and mouse, the clock, Ethernet) in slot 2, RAD1
 //! audio in slot 3. IMPACT sits on a graphics port.
@@ -33,7 +33,7 @@ use crate::dev::w1;
 use crate::dev::xbow::Xbow;
 use crate::hptimer::TimerManager;
 use crate::ip30::{
-    widget_small_base, CachedFlashLines, Ip30Physical, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
+    widget_small_base, CachedFlashLines, Ip30Bus, LAST_PC, WIDGET_BRIDGE, WIDGET_HEART, WIDGET_SMALL_SIZE,
     WIDGET_XBOW,
 };
 use crate::traits::{BusDevice, Device, MachineEvent, Resettable};
@@ -76,7 +76,7 @@ fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64
 }
 
 pub struct OctaneMachine {
-    pub phys: Arc<Ip30Physical>,
+    pub phys: Arc<Ip30Bus>,
     pub heart: Arc<Heart>,
     pub ram: Arc<HeartRam>,
     pub xbow: Arc<Xbow>,
@@ -184,12 +184,12 @@ impl OctaneMachine {
         let gfx = board.map(|_| ImpactXio::new(WIDGET_GFX, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
 
         // The bus over them, then the table.
-        let phys = Ip30Physical::new(ram.clone()).map_err(|e| format!("ip30: decode table: {e}"))?;
-        phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone());
-        phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone());
+        let phys = Ip30Bus::new(ram.clone());
+        phys.map(PIU_BASE, PIU_BASE + PIU_SIZE, heart.clone(), "heart piu");
+        phys.map(widget_small_base(WIDGET_XBOW), widget_small_base(WIDGET_XBOW) + WIDGET_SMALL_SIZE, xbow.clone(), "xbow");
         // The processor reaches its own HEART without a trip through the
         // switch.
-        phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone());
+        phys.map(widget_small_base(WIDGET_HEART), widget_small_base(WIDGET_HEART) + WIDGET_SMALL_SIZE, heart.clone(), "heart widget");
         phys.attach_widget(WIDGET_BRIDGE, bridge.clone(), false);
         if let Some(g) = &gfx {
             phys.attach_widget(WIDGET_GFX, g.clone(), false);
@@ -213,6 +213,14 @@ impl OctaneMachine {
                 p.set_widget_link(w, alive);
             }
         }));
+        // Device-window pages a PCI BAR decodes whole go straight to the
+        // function.
+        let weak = Arc::downgrade(&phys);
+        bridge.on_bar_runs(Box::new(move |runs| {
+            if let Some(p) = weak.upgrade() {
+                p.set_widget_runs(WIDGET_BRIDGE, runs);
+            }
+        }));
         let weak = Arc::downgrade(&bridge);
         xbow.on_link_reset(Box::new(move |w| {
             if w == WIDGET_BRIDGE {
@@ -231,8 +239,8 @@ impl OctaneMachine {
         );
 
         let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
-        let flash_lines = Arc::new(CachedFlashLines::new(phys.clone()));
-        let cpu = Self::build_cpu(phys.clone(), flash_lines.clone(), &timer_manager, count_hz.max(1), fasttick);
+        let flash_lines = Arc::new(CachedFlashLines::new(phys.phys.clone()));
+        let cpu = Self::build_cpu(phys.phys.clone(), flash_lines.clone(), &timer_manager, count_hz.max(1), fasttick);
         if let Some(g) = &gfx {
             g.mgras().set_cpu_cycles(cpu.cycles_ptr());
             // Host GL frames composite straight into the IMPACT framebuffer.
@@ -251,16 +259,15 @@ impl OctaneMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(phys.clone() as Arc<dyn BusDevice>, stats);
+                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
             }
             std::mem::forget(cpu_device);
         }
 
         // The shadow cache and the JIT read RAM straight from the ppmem
         // window; descriptor writes lay it out again on the CPU thread.
-        {
+        if let Some(sp) = phys.phys.ppmem_space() {
             use crate::ppmem::MappedMemory;
-            let sp = ram.space();
             unsafe {
                 sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
                 cpu.set_tcache_window(sp.window_base());
@@ -271,9 +278,10 @@ impl OctaneMachine {
                 #[cfg(feature = "jitv2")]
                 cpu.set_tcache_gen_window(sp.gen_window_base());
             }
-            // Publish the descriptors as they stand into the sinks just set.
-            ram.set_memcfg(heart.memcfg());
+            phys.phys.resync_ppmem_bitmap();
         }
+        // Publish the descriptors as they stand into the sinks just set.
+        ram.set_memcfg(heart.memcfg());
 
         // HEART's levels 0 to 4 are the CPU's IP2 to IP6.
         heart.set_interrupts(cpu.interrupts_ptr());
@@ -282,6 +290,7 @@ impl OctaneMachine {
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(cpu.clone().as_device());
         monitor.register_device(heart.clone());
+        monitor.register_device(phys.phys.clone());
         monitor.register_device(Arc::new(Ip30Monitor {
             phys: phys.clone(),
             ram: ram.clone(),
@@ -347,7 +356,7 @@ impl OctaneMachine {
 
     /// Point every switched port's windows at its widget or at the bus
     /// error, as the Crossbow's links stand.
-    fn sync_links(phys: &Ip30Physical, xbow: &Xbow) {
+    fn sync_links(phys: &Ip30Bus, xbow: &Xbow) {
         for w in 9..16 {
             phys.set_widget_link(w, xbow.carries(w));
         }
@@ -651,7 +660,7 @@ impl Workstation for OctaneMachine {
 
 /// The monitor's `ip30` command: the board as a whole.
 struct Ip30Monitor {
-    phys: Arc<Ip30Physical>,
+    phys: Arc<Ip30Bus>,
     ram: Arc<HeartRam>,
     xbow: Arc<Xbow>,
     bridge: Arc<Bridge>,

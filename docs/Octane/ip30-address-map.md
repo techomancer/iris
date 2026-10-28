@@ -435,17 +435,18 @@ graphics widget interrupt the same way.
 
 ## 11. In IRIS
 
-The Octane is its own machine, like the O2: `src/ip30.rs` is the processor's
-bus (`Ip30Physical`), `src/ip30_machine.rs` the machine (`OctaneMachine`,
-`[machine] profile = "octane_ip30"`), and the chips are one file each under
-`src/dev/`. The decode is one table, a `SparseDeviceMap` of 64 KB slots over
-the 40-bit space, as on the Indy: each slot points at the device that
-answers it, a device sees the full physical address and masks it to its own
-window, and what it does not fill it answers with a bus error itself.
+The Octane is its own machine, like the O2: `src/ip30.rs` configures the
+processor's bus (`Ip30Bus`), `src/ip30_machine.rs` is the machine
+(`OctaneMachine`, `[machine] profile = "octane_ip30"`), and the chips are one
+file each under `src/dev/`. The decode is the machine's `Physical`, as on the
+Indy and the O2: one table of 4 KB slots over the 40-bit space, each pointing
+at the device that answers it. A device sees the full physical address and
+masks it to its own window; an address nothing is mapped at is a bus error,
+noted with the PC for `ip30 unmapped`.
 
 | Physical | IRIS |
 |---|---|
-| 0x0000_0000 – 0x0000_3FFF | low memory: the first 16 KB of SDRAM, which the processor reaches only here (`dev/heart_mem.rs`, `LowAlias`) |
+| 0x0000_0000 – 0x0000_3FFF | low memory: the first 16 KB of SDRAM, which the processor reaches only here (`dev/heart_mem.rs`: a view of the bank HEART places at 0x2000_0000) |
 | 0x0FF0_0000 – 0x0FFF_FFFF | `dev/heart.rs`: the PIU registers, MEMCFG (which places the banks), the 64 vectors as an interrupt controller driving the CPU's pins, the 12.5 MHz counter and compare, the MicroLAN with the processor module's record |
 | 0x1000_0000 | `dev/xbow.rs`: widget 0; link status says which widgets are fitted, and a link change swaps the widget's windows in the table |
 | 0x1800_0000 | `dev/heart.rs`: HEART's widget registers |
@@ -455,7 +456,7 @@ window, and what it does not fill it answers with a bus error itself.
 | 0x1F60_0000 | device window 2: `dev/ioc3.rs` with its own UARTs, the DS1685 on its byte bus, the keyboard and mouse controller, the parallel port and the MAC part on its MicroLAN; the Ethernet MAC and PHY are `dev/ioc3_eth.rs` |
 | 0x1F70_0000 | device window 3: RAD, `dev/rad1.rs` |
 | 0x1FC0_0000 – 0x1FFF_FFFF | `dev/sflash.rs`: the boot flash with its command set; the CPU's cached view (`CachedFlashLines`) keeps the PROM's cached stores into it. `[octane] flash` keeps the part between runs |
-| 0x2000_0000 up | `dev/heart_mem.rs`: SDRAM as MEMCFG places it, its first 16 KB a processor bus error; `remap_banks` redraws the table when a descriptor is written |
+| 0x2000_0000 up | `dev/heart_mem.rs`: SDRAM as MEMCFG places it, each 32 MB unit a view of one run of a bank, its first 16 KB a bus error to uncached processor accesses; `remap_banks` redraws the table and the ppmem window when a descriptor is written |
 | widgets 9, 10, 12, 13, 14 | bus error |
 
 The bus is 40 bits wide end to end, so memory beyond 4 GB and the 64 GB
@@ -464,7 +465,9 @@ are in the table; a widget is attached with or without that window (the
 Bridge's is not). Bus masters
 (the Bridge's PCI functions, HQ4) do not see the processor's map: they get
 SDRAM only, by 64-bit physical address, through HEART's DMA view; an absent
-bank is a bus error where the CPU reads 0.
+bank is a bus error where the CPU reads 0. A device window page that one PCI
+BAR decodes whole is its own table entry, which reaches the function without
+going through the Bridge's slot search.
 
 Where IRIS differs from the notes above, or settles what they leave open:
 

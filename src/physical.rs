@@ -534,6 +534,13 @@ impl Physical {
         }
     }
 
+    /// The table entry answering `addr` (masked to the table's bits), for
+    /// a view that routes by what the machine mapped there: compare it with
+    /// [`Self::unmapped_entry`] or [`Self::default_entry`].
+    pub fn entry_at(&self, addr: u64) -> Entry {
+        self.dev_at(addr & PHYS_MASK)
+    }
+
     /// The device behind `addr`: one indexed load from the decode table.
     #[inline(always)]
     fn dev_at(&self, addr: u64) -> Entry {
