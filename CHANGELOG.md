@@ -82,6 +82,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
 ### SGI Octane (IP30)
 
+- **User programs run from the caches, two to four times faster.** The
+  Octane's IRIX maps user pages with cache attribute 4 (cacheable coherent
+  exclusive), which the TLB read as uncached, so every user fetch, load and
+  store went over the bus and skipped the decode cache, the memory window
+  and the JIT's inline path. The TLB and xkphys now decode the attribute
+  with the CPU model's own table. With jitv2 on a quiet guest, Dhrystone
+  went from 111k to 317k per second, Whetstone from 210 to 500 MIPS, and a
+  memory-bound benchmark from 12.2 s to 4.1 s.
 - **A new machine: the SGI Octane.** `[machine] profile = "octane_ip30"` with
   an `[octane]` section ([guide](docs/octane-ip30.md)): a 195 MHz R10000 on
   HEART, the Crossbow, the onboard Bridge with two QLogic ISP1040 SCSI

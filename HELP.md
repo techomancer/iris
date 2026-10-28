@@ -48,7 +48,10 @@ The status bar **Hz** value counts the guest kernel's fast clock: CP0 Compare
 (IP7) matches, or IOC 8254 timer 1 interrupts, depending on the kernel's timer
 source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
 100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
-needs it), so the figure reads 1000 while the fast clock runs.
+needs it), so the figure reads 1000 while the fast clock runs. IRIX on the
+Octane runs both clocks on CP0 Compare, which fires for whichever is due
+next, so there the figure reads about 1100: every Compare match is one
+interrupt, and the two clocks cannot be told apart from outside the guest.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).

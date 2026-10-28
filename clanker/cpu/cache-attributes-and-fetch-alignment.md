@@ -1,6 +1,8 @@
 # Cache attributes and fetch alignment: three hardcodings, all wrong
 
-*cpucritique.md T2, T3, C1. Fixed 2026-09-12, landed as one batch.*
+*cpucritique.md T2, T3, C1. Fixed 2026-09-12, landed as one batch. T2 was later
+narrowed again and is superseded by
+[tlb-c-field-uses-the-models-table.md](tlb-c-field-uses-the-models-table.md).*
 
 Three unrelated-looking findings that share a shape: a place where the
 emulator substituted a constant for a value the architecture says to read.

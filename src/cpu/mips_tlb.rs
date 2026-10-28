@@ -349,6 +349,8 @@ pub trait Tlb {
 
     // State management
     fn power_on(&mut self) {}
+    /// Install the CPU model's meaning for each EntryLo C value.
+    fn set_cache_attrs(&mut self, _table: [CacheAttr; 8]) {}
     fn save_state(&self) -> toml::Value { toml::Value::Table(Default::default()) }
     fn load_state(&mut self, _v: &toml::Value) -> Result<(), String> { Ok(()) }
 
@@ -414,6 +416,14 @@ const MRU_NONE: u8 = 0xFF;
 /// One MRU list per AccessType discriminant (Fetch=0, Read=1, Write=2, Debug=3).
 const MRU_LISTS: usize = 4;
 
+/// The C values every MIPS III/IV part agrees on: 2 uncached, 3 cacheable
+/// noncoherent, 5 cacheable coherent. The rest are model-specific, so until
+/// the executor installs its model's table they read as uncached.
+const DEFAULT_C_ATTR: [CacheAttr; 8] = [
+    CacheAttr::Uncached, CacheAttr::Uncached, CacheAttr::Uncached, CacheAttr::Cacheable,
+    CacheAttr::Uncached, CacheAttr::CacheableCoherent, CacheAttr::Uncached, CacheAttr::Uncached,
+];
+
 /// Cache-friendly shadow of a TLB entry containing only the fields needed for
 /// address translation.  All values are pre-decoded so the hot scan touches no
 /// architectural TlbEntry data at all.
@@ -460,41 +470,13 @@ impl ShadowEntry {
         }
     }
 
-    fn from_entry(e: &TlbEntry) -> Self {
-        // EntryLo's C field. Deliberately decodes **only** the two encodings
-        // that occur in practice, and treats everything else as uncached:
-        //
-        //   2 = Uncached, 3 = Cacheable noncoherent, 5 = Cacheable coherent
-        //
-        // The remaining encodings differ *between parts* and cannot be decoded
-        // correctly here, because `ShadowEntry` is model-agnostic — it has no
-        // `CpuModel` parameter and threading one through the TLB would touch
-        // every shadow/vmap path. Verified against `docs/`:
-        //
-        //   C | R4400 (UM Table 4-6)              | VR5000 (UM Table 6-6)
-        //   --+-----------------------------------+------------------------------
-        //   0 | Reserved                          | Cacheable, write-through, no WA
-        //   1 | Reserved                          | Cacheable, write-through, WA
-        //   4 | Cacheable coherent exclusive      | Reserved
-        //   6 | Cacheable coherent update-on-write| Reserved
-        //
-        // So 0/1 are cacheable on R5000 and reserved on R4400, and 4/6 are the
-        // exact reverse. A single table is wrong for one part or the other; an
-        // earlier revision mapped 4/6 to cacheable on both, which is backwards
-        // for R5000 (whose cacheable write-through modes are 0/1).
-        //
-        // Uncached is the safe default for the undecodable cases: IRIX maps
-        // pages C=3 and the PROM flips K0 between 3 and 2, so nothing reachable
-        // uses them, and treating a reserved encoding as uncached costs
-        // performance rather than correctness. `MipsExecutor::decode_cache_attr`
-        // has the full per-model tables for the KSEG0/`Config.K0` path, where
-        // the model *is* in scope.
-        let decode_cache_attr = |lo: u64| match (lo >> 3) & 0x7 {
-            2 => CacheAttr::Uncached,
-            3 => CacheAttr::Cacheable,
-            5 => CacheAttr::CacheableCoherent,
-            _ => CacheAttr::Uncached,
-        };
+    fn from_entry(e: &TlbEntry, c_attr: &[CacheAttr; 8]) -> Self {
+        // EntryLo's C field, through the CPU model's own table (see
+        // `MipsTlb::set_cache_attrs`). The encodings differ between parts:
+        // 4 and 6 are coherent on the R4400, 0 and 1 write-through on the
+        // R5000, and 4 and 5 coherent on the R10000, which the Octane's IRIX
+        // maps every user page with.
+        let decode_cache_attr = |lo: u64| c_attr[((lo >> 3) & 0x7) as usize];
         Self {
             vcmp32:             e.vcmp32,
             vpn_hi32:           e.vpn_hi32,
@@ -552,6 +534,9 @@ pub struct MipsTlb {
 
     /// Live JTLB entries for the CPU model in use (<= TLB_MAX_ENTRIES).
     num_entries: usize,
+    /// What each EntryLo C value means on the CPU model in use; the
+    /// executor installs its table with `set_cache_attrs`.
+    c_attr: [CacheAttr; 8],
     /// O(1) lookup for 32-bit (and sign-extended 64-bit) VAs.
     /// Indexed by VA[31:13] (19 bits).  Value = entry index or VMAP_MISS.
     vmap: [u8; VMAP_SIZE],
@@ -579,6 +564,7 @@ impl MipsTlb {
             mru_head: [0u8; MRU_LISTS],
             mru_next: [[MRU_NONE; TLB_MAX_ENTRIES]; MRU_LISTS],
             num_entries,
+            c_attr: DEFAULT_C_ATTR,
             vmap: [VMAP_MISS; VMAP_SIZE],
             #[cfg(feature = "tlbcheck")]
             vmap_touched: std::collections::HashSet::new(),
@@ -761,7 +747,7 @@ impl MipsTlb {
         // Both are correctly unmatchable — the bit patterns just differ by
         // construction — so comparing them here would be a false positive.
         for i in 0..self.num_entries {
-            let expected = ShadowEntry::from_entry(&self.entries[i]);
+            let expected = ShadowEntry::from_entry(&self.entries[i], &self.c_attr);
             let s = &self.shadow[i];
             if s.valid_dirty != expected.valid_dirty || s.asid != expected.asid
                 || s.global != expected.global || s.selector_bit_shift != expected.selector_bit_shift {
@@ -1089,7 +1075,7 @@ impl Tlb for MipsTlb {
             ];
             let old_range = Self::vmap_range(&self.entries[index]);
             self.entries[index] = entry;
-            self.shadow[index] = ShadowEntry::from_entry(&entry);
+            self.shadow[index] = ShadowEntry::from_entry(&entry, &self.c_attr);
             self.vmap_replace(index, old_range);
         }
     }
@@ -1208,6 +1194,13 @@ impl Tlb for MipsTlb {
         output
     }
 
+    fn set_cache_attrs(&mut self, table: [CacheAttr; 8]) {
+        self.c_attr = table;
+        for i in 0..self.num_entries {
+            self.shadow[i] = ShadowEntry::from_entry(&self.entries[i], &self.c_attr);
+        }
+    }
+
     fn power_on(&mut self) {
         self.entries = [TlbEntry::new(); TLB_MAX_ENTRIES];
         self.shadow  = [ShadowEntry::invalid(); TLB_MAX_ENTRIES];
@@ -1264,7 +1257,7 @@ impl Tlb for MipsTlb {
             }
         }
         for i in 0..self.num_entries {
-            self.shadow[i] = ShadowEntry::from_entry(&self.entries[i]);
+            self.shadow[i] = ShadowEntry::from_entry(&self.entries[i], &self.c_attr);
         }
         // Reset MRU lists to canonical order so snapshot restores are deterministic.
         for list in 0..MRU_LISTS {

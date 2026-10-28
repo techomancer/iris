@@ -5803,6 +5803,63 @@ mod tests {
         }
     }
 
+    /// A mapped page decodes its C field with the model's table, as KSEG0
+    /// does. The Octane's IRIX maps every user page C=4; when the TLB read
+    /// that as uncached, each user fetch, load and store went to the bus.
+    #[test]
+    fn test_a_mapped_page_uses_the_models_cache_attr_table() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+                use crate::cpu::mips_tlb::MipsTlb;
+                fn cached<C: CpuModel + From<Arc<dyn BusDevice>>>(c: u64) -> bool {
+                    let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+                    let mut exec = MipsExecutor::<MipsTlb, C>::new(mem, MipsTlb::default(), &MipsCpuConfig::indy());
+                    disable_jitv2(&mut exec);
+                    // Out of reset ERL makes kuseg an uncached identity window.
+                    exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+                    exec.resync_privilege_state();
+                    exec.core.cp0_index = 3;
+                    exec.core.cp0_pagemask = 0;
+                    exec.core.cp0_entryhi = 0x100 << 13;
+                    exec.core.cp0_entrylo0 = (0x50 << 6) | (c << 3) | (1 << 2) | (1 << 1);
+                    exec.core.cp0_entrylo1 = 0;
+                    assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE);
+                    let tr = exec.debug_translate(0x100 << 13);
+                    assert!(!tr.is_exception(), "C={c}: the page must translate");
+                    assert_eq!(tr.phys, 0x50000, "C={c}: through the TLB");
+                    tr.is_cached()
+                }
+                assert!(cached::<R10000ShadowCache>(4), "R10000 C=4 is coherent, cached");
+                assert!(cached::<R10000ShadowCache>(5), "R10000 C=5 is coherent, cached");
+                assert!(!cached::<R10000ShadowCache>(6), "R10000 C=6 is reserved");
+                assert!(cached::<R4400Cache>(6), "R4400 C=6 is coherent update-on-write");
+                assert!(cached::<PassthroughCacheM4>(0), "R5000 C=0 is write-through, cached");
+                assert!(!cached::<PassthroughCacheM4>(4), "R5000 C=4 is reserved");
+            })
+            .unwrap().join().unwrap();
+    }
+
+    /// xkphys takes its C field from address bits 61:59 with the same table.
+    #[test]
+    fn test_xkphys_uses_the_models_cache_attr_table() {
+        type E = MipsExecutor<PassthroughTlb, crate::cpu::mips_cache_shadow::R10000ShadowCache>;
+        let mem: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+        let mut exec = E::new(mem, PassthroughTlb::default(), &MipsCpuConfig::indy());
+        disable_jitv2(&mut exec);
+        exec.core.cp0_status |= STATUS_KX;
+        exec.resync_privilege_state();
+        for (va, want) in [(0x9000_0000_2000_0000u64, false), (0x9800_0000_2000_0000, true),
+                           (0xa000_0000_2000_0000, true), (0xa800_0000_2000_0000, true),
+                           (0xb800_0000_2000_0000, false)] {
+            let tr = exec.debug_translate(va);
+            assert!(!tr.is_exception(), "{va:#x} must translate");
+            assert_eq!(tr.is_cached(), want, "{va:#x}");
+            assert_eq!(tr.phys, 0x2000_0000, "{va:#x}");
+        }
+    }
+
     #[test]
     fn test_decode_cache_attr_matches_the_vr5000_table() {
         let (exec, _mem) = create_executor_m4(); // PassthroughCacheM4 => MIPS4 = true

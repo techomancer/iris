@@ -2692,11 +2692,14 @@ macro_rules! step_preamble {
 impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// Create a new executor from a config and a bus (sysad) and a TLB.
     /// The cache hierarchy is constructed internally as a unified R4000Cache.
-    pub fn new(sysad: Arc<dyn BusDevice>, tlb: T, cfg: &MipsCpuConfig) -> Self
+    pub fn new(sysad: Arc<dyn BusDevice>, mut tlb: T, cfg: &MipsCpuConfig) -> Self
     where
         C: From<Arc<dyn BusDevice>>
     {
         let mut core = MipsCore::new();
+        // Mapped pages decode their C field with this model's table, as KSEG0
+        // and xkphys do.
+        tlb.set_cache_attrs(Self::cache_attr_table());
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
@@ -4817,6 +4820,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// [`Self::decode_cache_attr`] for every C value, for the TLB.
+    pub(crate) fn cache_attr_table() -> [CacheAttr; 8] {
+        std::array::from_fn(|c| match Self::decode_cache_attr(c as u32) {
+            TR_UNCACHED => CacheAttr::Uncached,
+            TR_CACHEABLE => CacheAttr::Cacheable,
+            _ => CacheAttr::CacheableCoherent,
+        })
+    }
+
     /// KSEG0's cache attribute, from `Config.K0` (bits 2:0) rather than a
     /// hardcoded "cacheable".
     ///
@@ -4984,8 +4996,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 if bits_61_59 >= 2 && bits_61_59 <= 7 {
                     if PRIV == PRIV_KERNEL {
                         let phys_addr = virt_addr & 0x07FF_FFFF_FFFF_FFFF;
-                        // bits_61_59 is the C field directly: 2=Uncached, 3=Cacheable, 5=CacheableCoherent
-                        let c = match bits_61_59 { 3 | 5 => bits_61_59 as u32, _ => TR_UNCACHED };
+                        // bits_61_59 is the C field, with this model's meaning:
+                        // the Octane's IRIX reaches memory through 0xa000... (C=4).
+                        let c = Self::decode_cache_attr(bits_61_59 as u32);
                         TranslateResult::ok(self.fold_phys(phys_addr), c)
                     } else {
                         if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
