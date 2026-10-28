@@ -502,7 +502,7 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 
 | Command | Description |
 |---|---|
-| `crime status` / `crime regs` / `crime irqlog [n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / recent interrupt changes / registers the guest used |
+| `crime status` / `crime regs` / `crime irqlog [on\|off\|n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / the last *n* interrupt-register accesses (recorded only after `crime irqlog on`, which clears the old log; never in a `lightning` build) / registers the guest used (not kept in a `lightning` build) |
 | `re status` / `re notes` | CRIME rendering engine state / notes on unusual commands |
 | `gbe status` | GBE display engine: timing, frame buffer, tiles |
 | `isa status` | MACE ISA interrupts |
@@ -529,8 +529,8 @@ its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described unde
 | `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
 | `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |
 | `o2 scsi PATH` | The SCSI controllers' recent commands |
-| `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each |
-| `o2 ps2log PATH` / `o2 crimelog PATH` / `o2 nictrace PATH` | PS/2 traffic / recent CRIME interrupt-register accesses / the MAC-address chip's register trace and 1-Wire protocol log |
+| `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each (not kept in a `lightning` build) |
+| `o2 ps2log PATH` / `o2 crimelog PATH` / `o2 nictrace PATH` | PS/2 traffic / CRIME interrupt-register accesses recorded since `crime irqlog on` / the MAC-address chip's register trace and 1-Wire protocol log |
 
 ## Recipes
 

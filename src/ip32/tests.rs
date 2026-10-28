@@ -260,6 +260,24 @@ fn the_time_counter_tracks_the_clock_and_can_be_reset() {
 }
 
 #[test]
+#[cfg(not(feature = "lightning"))]
+fn the_interrupt_log_records_only_while_on() {
+    let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
+    let mask = (CRIME_BASE + crime_reg::INTMASK) as u64;
+    c.write64(mask, 1);
+    assert_eq!(c.irqlog_text(), "", "off until asked for");
+    c.set_irqlog(true).unwrap();
+    // A 32-bit store merges into the register without reading it as the
+    // guest: one write, no read.
+    c.write32(mask + 4, 2);
+    assert_eq!(c.irqlog_text(), format!("W {:#04x} 0x0000000000000002\n", crime_reg::INTMASK));
+    c.set_irqlog(false).unwrap();
+    let _ = c.read64(mask);
+    assert_eq!(c.irqlog_text().lines().count(), 1, "stopped");
+}
+
+#[test]
+#[cfg(not(feature = "lightning"))]
 fn every_touched_register_is_recorded_once_per_direction() {
     let c = Crime::new(std::sync::Arc::new(MaceUst::new()));
     c.write64((CRIME_BASE + crime_reg::MEM_CONTROL) as u64, 1);

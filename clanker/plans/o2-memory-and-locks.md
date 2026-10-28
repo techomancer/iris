@@ -1,7 +1,7 @@
 # O2: memory on the established path, and locks only where the hardware has them
 
-Status: plan, 2026-10-27. Phases 1 and 2 done (see their status lines);
-the rest is plan. Follows `d80ea42e` (O2Memory lock-free) and `5b4992af`
+Status: plan, 2026-10-27. Phases 1 and 2 done, 3 mostly (see their
+status lines); the rest is plan. Follows `d80ea42e` (O2Memory lock-free) and `5b4992af`
 (AIC-7880 worker thread). Related: [pci-dma-port.md](pci-dma-port.md).
 
 ## Why
@@ -110,6 +110,14 @@ plus ~7–14 `PciConfig` locks to find the BAR, clones an `Arc`, then
 3. `PciConfig` registers: atomics or a lock only for config cycles.
 
 ## Phase 3 — debug bookkeeping off the hot paths
+
+Status: CRIME and the bus done 2026-10-27, on the `physical.rs` pattern
+(`#[cfg(not(feature = "lightning"))]` plus a relaxed flag): `irqlog` behind
+`crime irqlog on`, `trace` behind a per-register bitmap, `writes` deleted
+(unused; `crime status` shows the banks), `time_base` atomic, the bogus
+read in `write32` gone, `Ip32Bus.unmapped` behind a "full" flag. Left: the
+`Stub` counters, ns16550 `out`, `MaceUst.ticks`, `CrimeRe.win`, the GFIFO
+CAS, `Ip32Bus.scsi`.
 
 Each of these runs on every access today:
 - CRIME `trace` (lock + linear scan), `irqlog` (lock + push), `writes`

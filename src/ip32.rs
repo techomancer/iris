@@ -311,8 +311,12 @@ pub struct Ip32Bus {
     pub vice: Stub,
     /// MACE, the I/O ASIC, and every block behind it.
     pub mace: Mace,
-    /// Accesses that hit nothing, first 64 kept, as `(addr, is_write, pc)`.
+    /// Accesses that hit nothing, first 64 distinct kept, as `(addr,
+    /// is_write, pc)`. Once full, a miss costs one relaxed load; a guest
+    /// polling an absent device would otherwise lock and scan the list on
+    /// every poll. Not kept in a `lightning` build.
     unmapped: Mutex<Vec<(u32, bool, u32)>>,
+    unmapped_full: std::sync::atomic::AtomicBool,
     /// The ppmem window's base and the RAM bitmap the memory space keeps
     /// (one bit per 64 MB region it has fully mapped), once the machine has
     /// wired them: aligned RAM reads then skip the decode. See `read_bytes`.
@@ -352,6 +356,7 @@ impl Ip32Bus {
             },
             mace: Mace::new(ram.clone(), crime, ust),
             unmapped: Mutex::new(Vec::new()),
+            unmapped_full: std::sync::atomic::AtomicBool::new(false),
             fast_ram: std::sync::OnceLock::new(),
             scsi: Mutex::new(Vec::new()),
         };
@@ -394,12 +399,24 @@ impl Ip32Bus {
         self.unmapped.lock().unwrap().clone()
     }
 
+    #[inline]
     fn miss(&self, addr: u32, write: bool) {
-        let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
-        let mut u = self.unmapped.lock().unwrap();
-        if u.len() < 64 && !u.iter().any(|&(a, w, _)| a == addr && w == write) {
-            u.push((addr, write, pc));
+        #[cfg(not(feature = "lightning"))]
+        {
+            if self.unmapped_full.load(Ordering::Relaxed) {
+                return;
+            }
+            let pc = crate::ip32_machine::LAST_PC.load(Ordering::Relaxed);
+            let mut u = self.unmapped.lock().unwrap();
+            if !u.iter().any(|&(a, w, _)| a == addr && w == write) {
+                u.push((addr, write, pc));
+                if u.len() == 64 {
+                    self.unmapped_full.store(true, Ordering::Relaxed);
+                }
+            }
         }
+        #[cfg(feature = "lightning")]
+        let _ = (addr, write);
     }
 
     /// Memory fitted, in bytes.

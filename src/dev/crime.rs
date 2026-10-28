@@ -2,6 +2,7 @@
 //! bank control (the rendering engine is `o2gfx`).
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::snapshot::{get_field, hex_u64, load_u64_slice, toml_u64, u64_slice_to_toml};
@@ -80,17 +81,21 @@ impl IntState {
     }
 }
 
+/// Words of `Crime::touched_bits`: a bit per 64-bit register and direction.
+const TOUCHED_WORDS: usize = (CRIME_SIZE / 8 * 2 / 64) as usize;
+
 /// Minimal CRIME: a 64-bit register file that remembers what it is told, with
 /// the handful of reads the PROM cannot be fobbed off with zero for.
 pub struct Crime {
     regs: Mutex<Vec<u64>>,
     /// Every distinct offset the guest has touched, in first-touch order, with
     /// whether it was read or written. This is the actual product of the first
-    /// milestone: the list of CRIME registers POST depends on.
+    /// milestone: the list of CRIME registers POST depends on. `touched_bits`
+    /// has a bit per register and direction, so an access already recorded
+    /// costs one relaxed load and the list is locked only on a first touch.
+    /// Not kept in a `lightning` build.
     trace: Mutex<Vec<(u32, bool)>>,
-    /// Values written, in order, as `(offset, value)` — the bank programming
-    /// is only meaningful if you can see what it was told.
-    writes: Mutex<Vec<(u32, u64)>>,
+    touched_bits: [AtomicU64; TOUCHED_WORDS],
     /// The interrupt state, apart from `regs`. Every change to it, an input
     /// driven or a mask written, recomputes the output and hands it to IP2
     /// under this lock, so two threads cannot deliver it out of order.
@@ -99,13 +104,17 @@ pub struct Crime {
     /// The guest's last accesses to the interrupt registers (status, mask,
     /// HARDINT, SOFTINT): `(write, offset, value)`, newest last, for the
     /// control port's `crimelog` (chasing interrupt storms).
+    /// Off until the monitor's `crime irqlog on`, and not kept in a
+    /// `lightning` build: IRIX reads INTSTAT and writes INTMASK on every
+    /// interrupt and every spl change.
     irqlog: Mutex<std::collections::VecDeque<(bool, u32, u64)>>,
+    irqlog_on: AtomicBool,
     revision: std::sync::atomic::AtomicU64,
     /// The clock CRIME's free-running counter is derived from, so the PROM's
     /// delays take the time they ask for rather than a number of reads.
     ust: std::sync::Arc<MaceUst>,
     /// Subtracted from the counter, so a write sets what the next read sees.
-    time_base: Mutex<u64>,
+    time_base: AtomicU64,
     /// CRIME's one output, to the CPU's IP2 (`connect_output`). Driven under
     /// `int`: computed and handed on as one step, a "low" and a "high" from
     /// two threads cannot cross and leave IP2 up with nothing behind it (the
@@ -126,12 +135,13 @@ impl Crime {
         Self {
             regs: Mutex::new(vec![0u64; (CRIME_SIZE / 8) as usize]),
             trace: Mutex::new(Vec::new()),
-            writes: Mutex::new(Vec::new()),
+            touched_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             int: Mutex::new(IntState::default()),
             irqlog: Mutex::new(std::collections::VecDeque::new()),
+            irqlog_on: AtomicBool::new(false),
             revision: std::sync::atomic::AtomicU64::new(CRIME_REV),
             ust,
-            time_base: Mutex::new(0),
+            time_base: AtomicU64::new(0),
             out: std::sync::OnceLock::new(),
             reset_request: std::sync::atomic::AtomicBool::new(false),
         }
@@ -210,11 +220,18 @@ impl Crime {
         self.ust.guest_us().wrapping_mul(CRIME_TICKS_PER_US)
     }
 
+    #[inline]
     fn note(&self, off: u32, write: bool) {
-        let mut t = self.trace.lock().unwrap();
-        if !t.iter().any(|&(o, w)| o == off && w == write) {
-            t.push((off, write));
+        #[cfg(not(feature = "lightning"))]
+        {
+            let bit = (off / 8) * 2 + write as u32;
+            let (word, mask) = (&self.touched_bits[(bit / 64) as usize], 1u64 << (bit % 64));
+            if word.load(Ordering::Relaxed) & mask == 0 && word.fetch_or(mask, Ordering::Relaxed) & mask == 0 {
+                self.trace.lock().unwrap().push((off, write));
+            }
         }
+        #[cfg(feature = "lightning")]
+        let _ = (off, write);
     }
 
     /// Registers touched so far, in first-touch order: `(offset, was_write)`.
@@ -222,14 +239,33 @@ impl Crime {
         self.trace.lock().unwrap().clone()
     }
 
+    #[inline]
     fn log_irq(&self, write: bool, off: u32, val: u64) {
-        if matches!(off, crime_reg::INTSTAT | crime_reg::INTMASK | crime_reg::HARDINT | crime_reg::SOFTINT) {
+        #[cfg(not(feature = "lightning"))]
+        if self.irqlog_on.load(Ordering::Relaxed)
+            && matches!(off, crime_reg::INTSTAT | crime_reg::INTMASK | crime_reg::HARDINT | crime_reg::SOFTINT)
+        {
             let mut l = self.irqlog.lock().unwrap();
             if l.len() >= 8192 {
                 l.pop_front();
             }
             l.push_back((write, off, val));
         }
+        #[cfg(feature = "lightning")]
+        let _ = (write, off, val);
+    }
+
+    /// Start or stop recording interrupt-register accesses. Starting clears
+    /// what an earlier recording left. A `lightning` build records nothing.
+    pub fn set_irqlog(&self, on: bool) -> Result<(), String> {
+        if cfg!(feature = "lightning") {
+            return Err("crime: a lightning build does not record the interrupt log".into());
+        }
+        if on {
+            self.irqlog.lock().unwrap().clear();
+        }
+        self.irqlog_on.store(on, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The interrupt-register log, one access per line, oldest first.
@@ -243,7 +279,9 @@ impl Crime {
         v
     }
 
-    fn load_inner(&self, off: u32) -> u64 {
+    /// A register's value, as a read would return it, without recording
+    /// the access.
+    pub(crate) fn load_inner(&self, off: u32) -> u64 {
         match off {
             // Identity. Returning zero here is the one thing guaranteed to make
             // a PROM decide it is running on hardware it does not recognise.
@@ -258,7 +296,7 @@ impl Crime {
             // A free-running microsecond-ish counter. POST loops on this to time
             // out, so a constant would hang it forever.
             crime_reg::TIME => {
-                let base = *self.time_base.lock().unwrap();
+                let base = self.time_base.load(Ordering::Relaxed);
                 self.raw_time().wrapping_sub(base) & 0x0000_ffff_ffff_ffff
             }
             _ => self.regs.lock().unwrap()[(off / 8) as usize],
@@ -292,18 +330,9 @@ impl Crime {
         if off == crime_reg::TIME {
             // The PROM zeroes the counter and then waits for it to reach a
             // deadline, so a write has to set where it counts from.
-            *self.time_base.lock().unwrap() = self.raw_time().wrapping_sub(val);
+            self.time_base.store(self.raw_time().wrapping_sub(val), Ordering::Relaxed);
         }
         self.regs.lock().unwrap()[(off / 8) as usize] = val;
-        let mut w = self.writes.lock().unwrap();
-        if w.len() < 256 {
-            w.push((off, val));
-        }
-    }
-
-    /// Values written, in order.
-    pub fn written(&self) -> Vec<(u32, u64)> {
-        self.writes.lock().unwrap().clone()
     }
 }
 
@@ -336,7 +365,7 @@ impl Device for Crime {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [n] | crime touched".to_string())]
+        vec![("crime".to_string(), "CRIME: crime status | crime regs | crime irqlog [on|off|n] | crime touched".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -363,7 +392,15 @@ impl Device for Crime {
                     }
                 }
             }
+            "irqlog" if matches!(args.get(1).copied(), Some("on" | "off")) => {
+                let on = args[1] == "on";
+                self.set_irqlog(on)?;
+                writeln!(w, "  interrupt-register log {}", if on { "recording" } else { "stopped" }).ok();
+            }
             "irqlog" => {
+                if !self.irqlog_on.load(Ordering::Relaxed) {
+                    writeln!(w, "  (not recording; `crime irqlog on` starts)").ok();
+                }
                 let n: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(32);
                 let log = self.irqlog_text();
                 let lines: Vec<&str> = log.lines().collect();
@@ -376,7 +413,7 @@ impl Device for Crime {
                     writeln!(w, "  {off:#06x} {}", if write { "W" } else { "R" }).ok();
                 }
             }
-            _ => return Err("Usage: crime status | regs | irqlog [n] | touched".to_string()),
+            _ => return Err("Usage: crime status | regs | irqlog [on|off|n] | touched".to_string()),
         }
         Ok(())
     }
@@ -388,7 +425,7 @@ impl Resettable for Crime {
     fn power_on(&self) {
         self.regs.lock().unwrap().fill(0);
         self.change(|s| *s = IntState::default());
-        *self.time_base.lock().unwrap() = 0;
+        self.time_base.store(0, Ordering::Relaxed);
         self.irqlog.lock().unwrap().clear();
     }
 }
@@ -402,7 +439,7 @@ impl Saveable for Crime {
         t.insert("regs".into(), u64_slice_to_toml(&self.regs_view()));
         t.insert("latched".into(), hex_u64(self.int.lock().unwrap().latched));
         t.insert("revision".into(), hex_u64(self.revision()));
-        t.insert("time_base".into(), hex_u64(*self.time_base.lock().unwrap()));
+        t.insert("time_base".into(), hex_u64(self.time_base.load(Ordering::Relaxed)));
         toml::Value::Table(t)
     }
 
@@ -420,7 +457,7 @@ impl Saveable for Crime {
         if let Some(rev) = get_field(v, "revision").and_then(toml_u64) {
             self.set_revision(rev);
         }
-        *self.time_base.lock().unwrap() = get_field(v, "time_base").and_then(toml_u64).unwrap_or(0);
+        self.time_base.store(get_field(v, "time_base").and_then(toml_u64).unwrap_or(0), Ordering::Relaxed);
         self.update_output();
         Ok(())
     }
@@ -452,7 +489,7 @@ impl BusDevice for Crime {
 
     fn write32(&self, addr: u64, val: u32) -> u32 {
         let off = (addr as u32) & (CRIME_SIZE - 1) & !7;
-        let cur = self.load(off);
+        let cur = self.load_inner(off);
         let merged = if (addr & 4) == 0 {
             (cur & 0x0000_0000_ffff_ffff) | ((val as u64) << 32)
         } else {
@@ -495,7 +532,7 @@ impl CrimeSpace {
     fn regs_wrote(&self, addr: u32) {
         let off = (addr - CRIME_BASE) & !7;
         if (crime_reg::MEM_BANK_CTRL0..crime_reg::MEM_BANK_CTRL0 + 8 * 8).contains(&off) {
-            let v = self.regs.load(off);
+            let v = self.regs.load_inner(off);
             self.ram.set_ctrl(((off - crime_reg::MEM_BANK_CTRL0) / 8) as usize, v);
         }
     }

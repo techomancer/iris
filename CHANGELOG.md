@@ -144,6 +144,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   gains 30-45% at every request size (4 KiB: 1.46 to 2.11 MB/s writes;
   4 MiB: 14.0 to 18.0), and boot to login is about 10% faster. A key typed
   on the host now interrupts as it arrives.
+- **CRIME's debug records are off the register path.** The
+  interrupt-register log records only after `crime irqlog on` (IRIX touches
+  those registers on every interrupt and priority change), the
+  touched-register list costs one relaxed load after a register's first
+  access, CRIME's counter offset is an atomic, and the bus stops looking at
+  its unmapped-access list once it holds 64 entries. A `lightning` build
+  keeps none of them. A 32-bit CRIME store no longer logs a read the guest
+  never made.
 - **O2 PCI register accesses take no bridge locks.** MACE's bridge keeps a
   table of the functions' open BAR windows, rebuilt after each
   configuration write, and a CPU access reads it without locking; the
