@@ -275,6 +275,20 @@ pub(super) mod tok {
     pub const CLEAR_COLOR: u32 = 0x0BA;
     pub const CLEAR_DEPTH: u32 = 0x0BC;
     pub const CLEAR_STENCIL: u32 = 0x0BE;
+    /// Selection (glRenderMode(GL_SELECT)), as libGLcore drives the GE:
+    /// enter with SELECT_MODE (1 word), the name stack operations, leave
+    /// with RENDER_MODE, then read the hit records back word by word
+    /// (__MGR_RETURN_MODE with 0xFFFFFFFF as its second word). SELECT_NEXT
+    /// turns the reads to the second GE's records on a two-GE board,
+    /// SELECT_DONE ends a read and empties the records.
+    pub const INIT_NAMES: u32 = 0x0C4;
+    pub const LOAD_NAME: u32 = 0x0C5;
+    pub const POP_NAME: u32 = 0x0C6;
+    pub const PUSH_NAME: u32 = 0x0C7;
+    pub const RENDER_MODE: u32 = 0x0C9;
+    pub const SELECT_MODE: u32 = 0x0CB;
+    pub const SELECT_NEXT: u32 = 0x061;
+    pub const SELECT_DONE: u32 = 0x062;
 }
 
 /// Primitive kinds, BEGIN_* minus BEGIN_POINTS (GL_POINTS .. GL_POLYGON).
@@ -388,6 +402,36 @@ pub struct Window {
     /// PP1 window mode: the origin's low bits and the clip ID the window's
     /// pixels must carry (see rss.rs `cid_match`).
     pub pp1winmode: u32,
+}
+
+/// The GE's name stack, at most this deep (GL_MAX_NAME_STACK_DEPTH;
+/// libGLcore caps its own count there).
+const NAME_STACK: usize = 64;
+/// Hit-record words kept. libGLcore reads the records back before its own
+/// estimate of their size reaches about 2000 words; the context's slot
+/// has room for 1536 beside the rest of `Gl`, so a burst of more than
+/// about 300 one-name hits between reads loses the rest.
+const SELECT_WORDS: usize = 1536;
+
+/// Selection state (GL_SELECT). Hit records are [name-stack epoch, name
+/// count, z min, z max, names...], the depths floats in [0, 1] (libGLcore
+/// scales them to 32 bits); the epoch orders and pairs records when two
+/// GEs' lists are merged. Plain data, valid zeroed.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Select {
+    on: u32,
+    depth: u32,
+    names: [u32; NAME_STACK],
+    /// A primitive hit since the last record, and its depth range.
+    hit: u32,
+    zmin: f32,
+    zmax: f32,
+    epoch: u32,
+    len: u32,
+    /// Reads are of the second GE's records (empty: one list here).
+    second: u32,
+    buf: [u32; SELECT_WORDS],
 }
 
 /// GL state held by the GE. Plain data, valid zeroed (`ensure_init` sets
@@ -572,6 +616,8 @@ pub struct Gl {
     point_smooth: u32,
     /// A texture read transfer is armed (READ_TEXTURE .. RESTORE_RSS).
     tex_reading: u32,
+    /// glRenderMode(GL_SELECT): the name stack and the hit records.
+    sel: Select,
     /// SAVE_RSS's fourth word: the planes the pixel operation transfers
     /// (traced, glReadPixels: 0 colour, 0x1C00000 depth, 0x1800000 stencil).
     pixel_planes: u32,
@@ -789,6 +835,10 @@ impl Gl {
             // than its software state. Placeholder zeros erase write masks,
             // viewports and scissor boxes when applications restore them.
             0x29 => Some(self.matrix_mode.wrapping_sub(0x1701)),
+            // GL_NAME_STACK_DEPTH, and the hit-record words held (for the
+            // GE whose records the reads are of).
+            0xC59 => Some(self.sel.depth),
+            0xC60 => Some(if self.sel.second != 0 { 0 } else { self.sel.len }),
             0x83 => Some(0x899 + self.mv.top * 16),
             0x896 => Some(0xA99 + self.proj.top * 16),
             0x897 => Some(0xAB9 + self.tex.top * 16),
@@ -866,6 +916,43 @@ impl Gl {
         let w0 = d.first().copied().unwrap_or(0);
         let on = (w0 != 0) as u32;
         match cmd {
+            tok::SELECT_MODE => {
+                self.sel.on = 1;
+                self.sel.depth = 0;
+                self.sel.hit = 0;
+                self.sel.len = 0;
+                self.sel.second = 0;
+            }
+            tok::RENDER_MODE => {
+                self.select_record();
+                self.sel.on = 0;
+            }
+            tok::INIT_NAMES => {
+                self.select_record();
+                self.sel.depth = 0;
+            }
+            tok::LOAD_NAME => {
+                self.select_record();
+                if self.sel.depth > 0 {
+                    self.sel.names[self.sel.depth as usize - 1] = w0;
+                }
+            }
+            tok::PUSH_NAME => {
+                self.select_record();
+                if (self.sel.depth as usize) < NAME_STACK {
+                    self.sel.names[self.sel.depth as usize] = w0;
+                    self.sel.depth += 1;
+                }
+            }
+            tok::POP_NAME => {
+                self.select_record();
+                self.sel.depth = self.sel.depth.saturating_sub(1);
+            }
+            tok::SELECT_NEXT => self.sel.second = 1,
+            tok::SELECT_DONE => {
+                self.sel.len = 0;
+                self.sel.second = 0;
+            }
             tok::MATRIX_MODE => self.matrix_mode = if d.is_empty() { 0x1700 } else { w0 },
             tok::LOAD_IDENTITY => self.matrix_op(|s| s.load(math::IDENT)),
             tok::PUSH_MATRIX => self.matrix_op(|s| { s.push(); }),
@@ -1363,6 +1450,50 @@ impl Gl {
         tc
     }
 
+    /// In GL_SELECT a primitive that survives clipping draws nothing and
+    /// makes a hit over its clipped vertices' window depths.
+    fn select_hit(&mut self, vs: &[Wv]) -> bool {
+        if self.sel.on == 0 {
+            return false;
+        }
+        for v in vs {
+            let z = (v.z / ZMAX).clamp(0.0, 1.0);
+            if self.sel.hit == 0 {
+                (self.sel.zmin, self.sel.zmax) = (z, z);
+                self.sel.hit = 1;
+            } else {
+                self.sel.zmin = self.sel.zmin.min(z);
+                self.sel.zmax = self.sel.zmax.max(z);
+            }
+        }
+        true
+    }
+
+    /// The name stack is about to change (or selection ends): a hit since
+    /// the last change becomes a record, if it fits.
+    fn select_record(&mut self) {
+        let s = &mut self.sel;
+        if s.hit != 0 {
+            let n = s.depth as usize;
+            let at = s.len as usize;
+            if at + 4 + n <= SELECT_WORDS {
+                s.buf[at..at + 4].copy_from_slice(&[s.epoch, n as u32, s.zmin.to_bits(), s.zmax.to_bits()]);
+                s.buf[at + 4..at + 4 + n].copy_from_slice(&s.names[..n]);
+                s.len += 4 + n as u32;
+            }
+            s.hit = 0;
+        }
+        s.epoch = s.epoch.wrapping_add(1);
+    }
+
+    /// Hit-record word `i` (__MGR_RETURN_MODE's select-buffer reads).
+    pub fn select_word(&self, i: u32) -> u32 {
+        if self.sel.second != 0 || i >= self.sel.len {
+            return 0;
+        }
+        self.sel.buf[i as usize]
+    }
+
     fn vertex(&mut self, obj: [f32; 4], sink: &mut dyn Hq3Sink) {
         if self.prim == prim::NONE {
             return;
@@ -1475,6 +1606,9 @@ impl Gl {
             *w = self.vp.project(*w, [0.0, 0.0], 256.0);
         }
         if n < 3 || v[..n].iter().any(|w| w.ok == 0) {
+            return;
+        }
+        if self.select_hit(&v[..n]) {
             return;
         }
         // Window-space signed area: > 0 counter-clockwise (y up).
@@ -1592,6 +1726,9 @@ impl Gl {
         if a.ok == 0 || b.ok == 0 {
             return;
         }
+        if self.select_hit(&[a, b]) {
+            return;
+        }
         // Flat lines take the segment's second vertex colour.
         if self.smooth == 0 {
             a.c = b.c;
@@ -1666,6 +1803,9 @@ impl Gl {
     /// A point (size 1): the pixel containing it, as a one-pixel GL line.
     fn point(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
         if v.oc != 0 || v.ok == 0 {
+            return;
+        }
+        if self.select_hit(&[v]) {
             return;
         }
         self.point_window(v, sink);

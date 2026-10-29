@@ -231,6 +231,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [hq4-microcode-moves-eram-state.md](mgras/hq4-microcode-moves-eram-state.md) | rule | The Octane's IMPACT microcode keeps ERAM state 0x8C words higher |
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
+| [texture-readback-follows-libglcore.md](mgras/texture-readback-follows-libglcore.md) | rule | glGetTexImage of ALPHA, LUMINANCE, INTENSITY and RGB textures is libGLcore's, not the board's |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
 
 ## odyssey/

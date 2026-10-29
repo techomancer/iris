@@ -133,6 +133,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   hinv and gfxinfo name them as on the real machine. glstate, pixtest and
   blendtest pass on both as on the Indigo2's High and Maximum IMPACT;
   iris-gui offers them too.
+- **OpenGL selection works on IMPACT** (both machines): glRenderMode
+  (GL_SELECT) keeps the name stack in the GE and records hits, so picking
+  with glSelectBuffer returns the objects under the cursor instead of
+  nothing. glstate now passes all 398 cases on IRIX 6.5.22, and
+  `test/gltest/seltest` checks hit records against GL's rules.
 - **GR2 takes its display frame before the retrace too**, for the same
   reason as IMPACT.
 - **`mgras status` and the log name the microcode the kernel loaded**: a

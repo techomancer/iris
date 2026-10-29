@@ -5,8 +5,10 @@ default has, reads it back with the matching getter, and checks the
 answer. It is board-neutral (GL, GLX, Xlib only), so the same program
 maps GR2 later; only the decoders are per board.
 
-As of 2026-10-13 on MaxImpact (6.5.22): 397 pass, 1 fail (selection-mode
-name stack, not modelled), 15 XFAIL (libGLcore's own departures, listed in
+As of 2026-10-28 on IRIX 6.5.22 (IP28 High IMPACT, Octane SI with texture
+and MXI): 398 pass, 0 fail; the selection name stack is modelled
+(`Gl::sel`, test/gltest/seltest.c). Earlier (2026-10-13, MaxImpact): 397
+pass, 1 fail (name stack), 15 XFAIL (libGLcore's own departures, listed in
 the test), 20 skipped (extensions IMPACT rejects).
 
 The map itself is in ignore/gr4/GE11.h "STATE READBACK". The model is

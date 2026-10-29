@@ -1052,7 +1052,9 @@ impl Hq3Engine {
             // Addresses the GE HLE knows answer from its state; others read
             // 0 and are reported once each, so the layout can be mapped.
             let addr = data.first().copied().unwrap_or(0);
-            let v = sink.readback_probe(addr).or_else(|| self.ge_state(addr)).unwrap_or_else(|| {
+            let select = data.get(1) == Some(&0xFFFF_FFFF);
+            let v = if select { Some(self.gl.select_word(addr)) } else { sink.readback_probe(addr) };
+            let v = v.or_else(|| self.ge_state(addr)).unwrap_or_else(|| {
                 sink.note(format!("GE state readback at {addr:#x} ({:x?}) answered 0", data.get(1..).unwrap_or(&[])));
                 0
             });

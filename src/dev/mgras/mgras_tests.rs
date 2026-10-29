@@ -3392,3 +3392,39 @@ fn a_new_busy_stretch_is_timed_from_its_first_store() {
     assert!(!m.busy_overdue(false), "the new stretch starts at its store");
     m.stop_engines();
 }
+
+/// glRenderMode(GL_SELECT) as libGLcore drives the GE (traced, glstate):
+/// SELECT_MODE, the name stack tokens, primitives (which draw nothing),
+/// RENDER_MODE, then the hit records read back with __MGR_RETURN_MODE's
+/// second word 0xFFFFFFFF. GL_NAME_STACK_DEPTH reads GE word 0xC59 and the
+/// records' length 0xC60. A record is [epoch, names, z min, z max, names].
+#[test]
+fn gl_select_mode_keeps_a_name_stack_and_records_hits() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    let ret = |a: u32, b: u32| {
+        write(&m, 32, 0x7000C, 1 << 17);
+        fifo_token(&m, 0xA2, &[a, b, 1]);
+        wait_flag(&m, 1 << 17);
+        read(&m, 32, 0x70014) as u32
+    };
+    fifo_token(&m, 0xCB, &[0]);
+    fifo_token(&m, 0xC4, &[]);
+    fifo_token(&m, 0xC7, &[3]);
+    fifo_token(&m, 0xC7, &[4]);
+    assert_eq!(ret(0xC59, 1), 2, "name stack depth");
+    // Inside the window: a hit. Outside it: none.
+    gl_tri(&m, [1.0, 0.0, 0.0], [[100.0, 50.0, 0.0], [300.0, 50.0, 0.0], [200.0, 250.0, 0.0]]);
+    fifo_token(&m, 0xC6, &[]);
+    gl_tri(&m, [1.0, 0.0, 0.0], [[-900.0, -900.0, 0.0], [-800.0, -900.0, 0.0], [-850.0, -800.0, 0.0]]);
+    fifo_token(&m, 0xC9, &[]);
+    assert_eq!(gl_px(&m, 200, 100), 0, "selection draws nothing");
+    let len = ret(0xC60, 1);
+    assert_eq!(len, 6, "one record of two names");
+    let rec: Vec<u32> = (0..len).map(|i| ret(i, 0xFFFF_FFFF)).collect();
+    assert_eq!(rec[1], 2);
+    assert!(f32::from_bits(rec[2]) <= f32::from_bits(rec[3]));
+    assert_eq!(rec[4..], [3, 4]);
+    fifo_token(&m, 0x62, &[]);
+    assert_eq!(ret(0xC60, 1), 0, "read out and emptied");
+    m.stop_engines();
+}
