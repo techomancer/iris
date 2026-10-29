@@ -382,7 +382,7 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 
 | Command | Description |
 |---|---|
-| `mgras [status]` | Board summary and inventory |
+| `mgras [status]` | Board summary and inventory, with the microcode fingerprints (HQ, each GE11) and the IRIX release they came with when known |
 | `mgras hq` | HQ3 flags, enables, DMA and raster-interface registers, FIFOs |
 | `mgras gl` | The GL front end's current state |
 | `mgras probe <lo> <hi> <value>` / `mgras probe off` | Make GE readbacks in `lo..=hi` answer `value` (to map what libGLcore decodes) |

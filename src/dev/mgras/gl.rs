@@ -55,7 +55,7 @@ use crate::dev::gl::vertex::{self, Clip, Viewport, MAX_POLY};
 type Wv = vertex::Wv<4, 1>;
 
 /// GL tokens the GE handles (numbers as in `hq3::token_name`).
-mod tok {
+pub(super) mod tok {
     pub const VERTEX4F: u32 = 0x000;
     /// Context set-up for an RGB visual, or a colour-index one (one word:
     /// 8 or 12, presumably the index bits).

@@ -456,8 +456,10 @@ impl Mgras {
         // SAFETY: read-only peek at the RSS (may tear while drawing).
         let rss = unsafe { &*self.rss.get() };
         let f = self.front();
+        let microcode = self.microcode_fingerprints();
         let flags = self.all_flags(&f);
         writeln!(w, "IMPACT {:?} at {:#010x}", self.kind, MGRAS_SLOT_GFX_BASE)?;
+        writeln!(w, "  microcode: {microcode}")?;
         writeln!(w, "  flags {flags:#010x} [{}]  interrupt enable {:#010x}", flag_names(flags), f.hq.interrupt_enable)?;
         writeln!(w, "  fifo: hq {} rss {}  idle={}", self.hq_fifo.len(), self.rss_fifo.len(), self.idle())?;
         writeln!(w, "  DAC pixmask {:#04x}  XMAP DID0 mode {:#x}", f.dcb.dac.pixmask(), f.dcb.xmap.main_mode(0))?;

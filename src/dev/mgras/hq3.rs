@@ -330,6 +330,12 @@ pub trait Hq3Board: Send + Sync {
     /// Whether the raster command `cmd` is dropped instead of executed; the
     /// reason is reported.
     fn drop_raster_write(&self, cmd: u32) -> Option<String>;
+    /// A pixel-state address (PIXEL_STATE, INIT_PIXEL_STATE_ERAM, and the
+    /// module state addresses in the pipeline program) in the Indigo2
+    /// microcode's layout, which the pixel HLE is written for.
+    fn pixel_state_address(&self, addr: u32) -> u32 {
+        addr
+    }
 }
 
 /// CPU-side HQ3 registers (the flags are atomic, in `Mgras`). Plain data,
@@ -339,6 +345,8 @@ pub struct Hq3Regs {
     /// Registers not modelled otherwise, read back as written.
     pub regs: RegMap<256>,
     pub ucode: [u32; ((host::UCODE_END - host::UCODE) / 4) as usize],
+    /// The microcode's fingerprint, kept as it is written.
+    pub ucode_hash: super::microcode::Running,
     pub flag_enable: u32,
     pub interrupt_enable: u32,
     pub ge_readback: [u32; 2],
@@ -872,7 +880,10 @@ impl Hq3Engine {
                 let p = std::mem::take(&mut self.payload);
                 match t {
                     0x089 => self.lut.load_table(&p),
-                    _ => self.gl.pixel_state_block(&p),
+                    _ => {
+                        let p = self.canonical_pixel_state(&p);
+                        self.gl.pixel_state_block(&p)
+                    }
                 }
                 return;
             }
@@ -1056,6 +1067,9 @@ impl Hq3Engine {
                     sink.trace(format!("  converted ({conv:#x}): {:?}", floats.iter().map(|w| f32::from_bits(*w)).collect::<Vec<_>>()));
                 }
                 self.gl.token(cmd, &floats, sink)
+            } else if matches!(cmd, super::gl::tok::PIXEL_STATE | super::gl::tok::INIT_PIXEL_STATE_ERAM) {
+                let data = self.canonical_pixel_state(data);
+                self.gl.token(cmd, &data, sink)
             } else {
                 self.gl.token(cmd, data, sink)
             }
@@ -1073,6 +1087,31 @@ impl Hq3Engine {
             self.stats.other_cmds += 1;
             sink.note(format!("command {cmd:#x}"));
         }
+    }
+
+    /// A pixel-state block (`Gl::pixel_state_block`'s words: 3 the
+    /// address, 6 the count, then the values) with its address, and the
+    /// module state addresses of a pipeline program, in the Indigo2 layout.
+    fn canonical_pixel_state<'a>(&self, d: &'a [u32]) -> std::borrow::Cow<'a, [u32]> {
+        let Some(b) = self.board.as_ref() else { return d.into() };
+        if d.len() < 7 {
+            return d.into();
+        }
+        let mut d = d.to_vec();
+        let addr = d[3];
+        d[3] = b.pixel_state_address(addr);
+        // The program's pairs are (entry, state address); the first pair's
+        // state is 0.
+        if addr <= super::pixpipe::PROGRAM {
+            let first = (super::pixpipe::PROGRAM - addr) as usize;
+            let n = (d[6] as usize).min(d.len() - 7);
+            for k in (first + 1..n).step_by(2) {
+                if d[7 + k] != 0 {
+                    d[7 + k] = b.pixel_state_address(d[7 + k]);
+                }
+            }
+        }
+        d.into()
     }
 
     /// The GE state word a readback at `addr` answers, in the layout of the

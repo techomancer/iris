@@ -219,6 +219,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [DESIGN.md](mgras/DESIGN.md) | design | MGRAS (IMPACT / GR4) design |
 | [ci-copypixels-unloaded-mask.md](mgras/ci-copypixels-unloaded-mask.md) | rule | Colour-index glCopyPixels runs a pipeline whose state is never loaded |
 | [dcb-device-numbers.md](mgras/dcb-device-numbers.md) | design | DCB device numbers: trust the kernel's dcbctrl writes, not header names |
+| [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | rule | Take the IMPACT display frame before the retrace pulse, not after |
 | [engine-pipeline-performance.md](mgras/engine-pipeline-performance.md) | measure | The CPU -> HQ -> raster pipeline: what made it slow |
 | [eram-state-ideas.md](mgras/eram-state-ideas.md) | open | GE state and ERAM: ideas for later (not built) |
 | [eram-transfers-come-once-per-ge.md](mgras/eram-transfers-come-once-per-ge.md) | rule | ERAM transfers come once per GE11 (Maximum Impact) |
@@ -227,6 +228,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [gr4-jit.md](mgras/gr4-jit.md) | design | The raster JIT (`gr4-jit`) and its Cranelift pitfalls |
 | [guest-gl-benchmarks-miss-board-time.md](mgras/guest-gl-benchmarks-miss-board-time.md) | rule | Board-bound GL work slows the guest clock (and guest benchmarks lie) |
 | [header-errata.md](mgras/header-errata.md) | design | ignore/gr4 headers: known errata (fold back into the headers) |
+| [hq4-microcode-moves-eram-state.md](mgras/hq4-microcode-moves-eram-state.md) | rule | The Octane's IMPACT microcode keeps ERAM state 0x8C words higher |
 | [mirai-pixel-zoom-and-scissor-query.md](mgras/mirai-pixel-zoom-and-scissor-query.md) | rule | Mirai: flipped glDrawPixels and the scissor-enable readback |
 | [pixel-path-pixtest.md](mgras/pixel-path-pixtest.md) | howto | IMPACT pixel path: pixtest and what it settled |
 | [window-origin-is-signed.md](mgras/window-origin-is-signed.md) | rule | The GL window origin's halves are signed |
@@ -349,6 +351,7 @@ Running IRIX as a guest: install, network setup, shell quirks, X defaults.
 | Note | Kind | Title |
 |---|---|---|
 | [cdrom-changer-eject-no-mediad-remount.md](irix/cdrom-changer-eject-no-mediad-remount.md) | open | CD changer `cdrom-eject` does not trigger a `mediad` remount |
+| [delay-loop-calibrated-cold.md](irix/delay-loop-calibrated-cold.md) | open | IRIX calibrates its microsecond delay loop cold, so JIT runs make every delay short (Octane "RAD UST not incrementing") |
 | [default-visual-24bit.md](irix/default-visual-24bit.md) | rule | The ip28 guest's X server defaults to 24-bit TrueColor |
 | [irix-csh-scratch-raw-device-gotchas-when-you-cant-use-iris-ci.md](irix/irix-csh-scratch-raw-device-gotchas-when-you-cant-use-iris-ci.md) | howto | IRIX csh + scratch raw-device gotchas (when you can't use iris-ci) |
 | [irix-install.md](irix/irix-install.md) | howto | Installing IRIX on iris (from scratch) |

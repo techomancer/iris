@@ -43,6 +43,7 @@ mod ge11;
 mod gl;
 mod hq3;
 pub mod hq4;
+pub mod microcode;
 mod pixmem;
 mod pixpipe;
 mod plain;
@@ -210,7 +211,9 @@ impl Front {
     fn write(&mut self, off: u32, bits: u32, val: u64, flags: &AtomicU32) -> bool {
         match off {
             host::UCODE..=0x45FFF => {
-                self.hq.ucode[((off - host::UCODE) / 4) as usize] = val as u32 & 0xFF_FFFF;
+                let i = ((off - host::UCODE) / 4) as usize;
+                self.hq.ucode[i] = val as u32 & 0xFF_FFFF;
+                self.hq.ucode_hash.word(i, val as u32 & 0xFF_FFFF);
                 false
             }
             0x60000..=0x67FFF => {
@@ -267,6 +270,10 @@ pub enum Line {
 /// IP30 kernel's waits on its idle bits.
 const BUSY_STATUS_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a STATUS or DMABUSY read waits for a busy board to go idle
+/// before it answers (`settle`).
+const POLL_SETTLE: std::time::Duration = std::time::Duration::from_micros(100);
+
 pub struct Mgras {
     kind: GraphicsBoard,
     /// Perfetto edge trackers (zero-valid, so `new`'s zeroed allocation
@@ -292,6 +299,10 @@ pub struct Mgras {
     /// in ns since `epoch`: STATUS reads vertical blank for 1 ms after it.
     epoch: std::time::Instant,
     frame_start: AtomicU64,
+    /// The GE11 programs' fingerprints as a front-end that keeps its own
+    /// copy of the download (the Octane's HQ4) reports them; 0 when it
+    /// does not, and the GE11 diagnostic ports' copy is used.
+    ge_upload_fingerprint: [AtomicU64; 2],
     /// CPU-side state and its lock. The display thread reads it unlocked
     /// (plain data, tearing tolerated).
     front_lock: SpinLock<()>,
@@ -681,6 +692,27 @@ impl Mgras {
         }
     }
 
+    /// A guest polling STATUS or DMABUSY for an idle board: give a busy
+    /// board up to `POLL_SETTLE` to finish first. The drivers' idle waits
+    /// count polls (a microsecond delay loop between them), not time, and
+    /// the model draws far slower than the board: a context switch's wait
+    /// (DMABUSY, 6 x 15000 polls 10 us apart, about 0.9 s) timed out
+    /// behind long drawing and the kernel killed the X server ("hq idle
+    /// wait timeout"). Under jitv2 the delay loop also runs about five
+    /// times short (clanker/irix/delay-loop-calibrated-cold.md). Waiting
+    /// here turns each poll into board time, so the budget is counted in
+    /// work done; an idle board answers at once.
+    fn settle(&self) {
+        if self.idle() {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let backoff = crossbeam_utils::Backoff::new();
+        while !self.idle() && t.elapsed() < POLL_SETTLE {
+            backoff.snooze();
+        }
+    }
+
     /// HQ3 thread: wait until the engines have run everything queued.
     fn drain_rss(&self) {
         let backoff = crossbeam_utils::Backoff::new();
@@ -1063,6 +1095,26 @@ impl Mgras {
         }
     }
 
+    /// Fingerprints of the microcode the kernel loaded (see `microcode`),
+    /// read without the front lock: a download in progress gives a value
+    /// that does not repeat.
+    pub fn microcode_fingerprints(&self) -> microcode::Fingerprints {
+        let f = self.front_view();
+        let up = |ge: usize| self.ge_upload_fingerprint[ge].load(Ordering::Relaxed);
+        microcode::Fingerprints {
+            hq: f.hq.ucode_hash.get(),
+            ge: [0, 1].map(|ge| match up(ge) {
+                0 => f.ge.fingerprint(ge),
+                fp => fp,
+            }),
+        }
+    }
+
+    /// A front-end's own copy of GE11 program `ge` has this fingerprint.
+    pub fn set_ge_upload_fingerprint(&self, ge: usize, fp: u64) {
+        self.ge_upload_fingerprint[ge & 1].store(fp, Ordering::Relaxed);
+    }
+
     /// STATUS's vertical blank bit: the first 1 ms of the refresh thread's
     /// frame, the time of the retrace pulse.
     fn vblank(&self) -> u32 {
@@ -1246,6 +1298,9 @@ impl Mgras {
 
     fn do_read(&self, addr: u64, bits: u32) -> Option<u64> {
         let Some(off) = self.offset(addr) else { return Some(0) };
+        if matches!(off, host::STATUS | host::DMABUSY) {
+            self.settle();
+        }
         let sub = self.submit.lock();
         let v = self.read_locked(off, bits);
         crate::pf_level!(self.pf_wait, crate::perfetto::events::MGRAS_WAIT, v.is_none());

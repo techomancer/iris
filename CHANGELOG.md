@@ -112,6 +112,25 @@ hashes are given where a change is easiest to understand by reading the commit.
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
 ### SGI Octane (IP30)
 
+- **IMPACT on the Octane passes the GL pixel and state suites.** On IRIX
+  6.5.22 pixtest went from 52 to 366 passing cases (the two left fail on the
+  Indigo2 too) and glstate from 393 to 394. The Octane's microcode keeps the
+  pixel pipeline's state blocks 0x8C words higher than the Indigo2's, so
+  glDrawPixels drew RGB images as RGBA; the colour matrix reads back where
+  the Indigo2's does. Both boards: RGBA 12,12,12 has no alpha planes, and
+  glReadPixels now returns alpha 1 from it instead of colour bits.
+- **No more "hq idle wait timeout" killing the X server.** The kernel waits
+  for an idle board by counting polls of a status register, and a context
+  switch behind long drawing ran out of polls. A status poll of a busy board
+  now gives it up to 100 µs first, so the wait is counted in work done.
+- **Double-buffered GL on IMPACT no longer tears** (the Indigo2's too).
+  The display took its frame just after the retrace, racing the kernel's
+  buffer flip and the next frame's drawing; it now takes it just before,
+  as scanout does.
+- **`mgras status` and the log name the microcode the kernel loaded**: a
+  fingerprint of the HQ microcode and of each GE11 program, kept as they are
+  written, and the IRIX release when it is a known one.
+
 - **User programs run from the caches, two to four times faster.** The
   Octane's IRIX maps user pages with cache attribute 4 (cacheable coherent
   exclusive), which the TLB read as uncached, so every user fetch, load and

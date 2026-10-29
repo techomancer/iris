@@ -317,12 +317,18 @@ impl Hq3Board for Hq4Quirks {
     /// stack index, all below 0x84, do not move. Where between 0x84 and
     /// 0x1FA the shift starts is not known; this shifts every Indigo2
     /// address from 0x84 up. An approximation, inferred from the two
-    /// layouts' known addresses. Pixel pipeline words answer at the address
-    /// they were loaded at.
+    /// layouts' known addresses. Pixel pipeline words answer where they
+    /// were loaded. The colour matrix (`0x1B9-0x1C8`) does not move
+    /// either: the 6.5.22 Octane libGLcore reads it where the Indigo2's
+    /// does (glstate `pixel/COLOR_MATRIX_SGI`), and no Indigo2 state sits
+    /// 0x8C below it.
     fn ge_state(&self, gl: &mut Gl, addr: u32) -> Option<u32> {
         const SHIFT: u32 = 0x8C;
-        let hq3 = if addr >= 0x84 + SHIFT { addr - SHIFT } else { addr };
-        let v = gl.state_word_in(hq3, addr)?;
+        const COLOR_MATRIX: std::ops::RangeInclusive<u32> = 0x1B9..=0x1C8;
+        let hq3 = if addr >= 0x84 + SHIFT && !COLOR_MATRIX.contains(&addr) { addr - SHIFT } else { addr };
+        // Pixel pipeline words are kept in the Indigo2 layout (see
+        // `pixel_state_address`).
+        let v = gl.state_word_in(hq3, self.pixel_state_address(addr))?;
         // The matrix-stack depths answer with an address in the GE's stack,
         // which moved with the rest.
         Some(if matches!(hq3, 0x83 | 0x896 | 0x897) { v + SHIFT } else { v })
@@ -336,6 +342,19 @@ impl Hq3Board for Hq4Quirks {
     /// with it is unknown, so it is dropped and reported.
     fn drop_raster_write(&self, cmd: u32) -> Option<String> {
         (cmd & 0x200 != 0).then(|| format!("raster command {cmd:#x} past register 0x1FF dropped"))
+    }
+
+    /// The pixel pipeline's ERAM blocks moved up by the same 0x8C: libGLcore
+    /// on the 6.5.22 Octane writes the expand state, the transfer size and
+    /// the texture-load blocks at 0xD91, 0xE34 and 0xE43 where the Indigo2's
+    /// uses 0xD05, 0xDA8 and 0xDB7 (traced, pixtest). GE memory below the
+    /// ERAM (the program at 0x13B, the module states at 0x187-0x1EF, the
+    /// zoom at 0x191) did not move. Without this the HLE missed the host
+    /// pixel shape, and glDrawPixels' rows reached the raster engine as
+    /// RGBA when the host sent RGB.
+    fn pixel_state_address(&self, addr: u32) -> u32 {
+        const SHIFT: u32 = 0x8C;
+        if addr >= super::pixpipe::ERAM_BASE + SHIFT { addr - SHIFT } else { addr }
     }
 }
 
@@ -452,11 +471,16 @@ struct GeUpload {
     read_odd: [bool; 2],
     load_mode: [bool; 2],
     active: usize,
+    /// Each slot's download fingerprint, kept as it is written.
+    hash: [super::microcode::Running; 2],
 }
 
 impl GeUpload {
-    fn control(&mut self, slot: usize, v: u32) {
+    /// A control write. When it ends a download, the fingerprint of the
+    /// words loaded.
+    fn control(&mut self, slot: usize, v: u32) -> Option<u64> {
         self.active = slot;
+        let finished = self.load_mode[slot].then(|| self.hash[slot].get());
         if v & !1 == ge::LOAD {
             self.write_ptr[slot] = 0;
             self.read_ptr[slot] = 0;
@@ -468,6 +492,7 @@ impl GeUpload {
             }
             self.load_mode[slot] = false;
         }
+        finished
     }
 
     /// False when the slot is full.
@@ -481,6 +506,7 @@ impl GeUpload {
         }
         let w = &mut self.words[slot];
         if p < w.len() { w[p] = v } else { w.push(v) }
+        self.hash[slot].word(p, v);
         self.write_ptr[slot] = p + 1;
         true
     }
@@ -831,7 +857,11 @@ impl ImpactXio {
                 let slot = (off == ge::DATA_B || off == ge::CTRL_B) as usize;
                 let mut s = self.shared.hq4.lock();
                 if off == ge::CTRL_A || off == ge::CTRL_B {
-                    s.ge.control(slot, v);
+                    if let Some(fp) = s.ge.control(slot, v) {
+                        drop(s);
+                        // GE 0 loads through slot B, GE 1 through slot A.
+                        self.mgras.set_ge_upload_fingerprint(1 - slot, fp);
+                    }
                 } else if !s.ge.data(slot, v) {
                     drop(s);
                     self.shared.note("GE program download past the end of its slot".into());
@@ -1667,6 +1697,17 @@ mod tests {
             // Not acknowledged: the board is reset instead.
             r.b.reset();
         }
+    }
+
+    /// The pixel pipeline's ERAM blocks sit 0x8C higher on the Octane; GE
+    /// memory below the ERAM and the program do not move.
+    #[test]
+    fn pixel_state_maps_to_the_indigo2_layout() {
+        let q = Hq4Quirks;
+        assert_eq!(q.pixel_state_address(0xE34), 0xDA8, "transfer size");
+        assert_eq!(q.pixel_state_address(0xD91), 0xD05, "a module state");
+        assert_eq!(q.pixel_state_address(0x1D6), 0x1D6, "GE memory");
+        assert_eq!(q.pixel_state_address(0x13B), 0x13B, "the program");
     }
 
     #[test]

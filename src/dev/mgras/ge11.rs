@@ -17,6 +17,8 @@ struct GeDiag {
     /// Which 32-bit word of the current 72-bit microcode line comes next.
     word: usize,
     ucode: [[u32; 3]; UCODE_LINES],
+    /// The downloaded program's fingerprint, kept as it is written.
+    hash: super::microcode::Running,
 }
 
 impl GeDiag {
@@ -69,6 +71,11 @@ impl Ge11 {
         self.ge[ge & 1].ucode.get(i).copied()
     }
 
+    /// A fingerprint of engine `ge`'s downloaded program (0 if none).
+    pub fn fingerprint(&self, ge: usize) -> u64 {
+        self.ge[ge & 1].hash.get()
+    }
+
     /// Whether `off` is one of the engines' diagnostic data or address ports.
     pub fn is_diag_port(off: u32) -> bool {
         host::GE_DIAG.iter().any(|&(d, a)| off == d || off == a)
@@ -97,9 +104,11 @@ impl Ge11 {
             return false;
         }
         if ge.addr >= GeDiag::UCODE_BASE {
-            if let Some(line) = ge.ucode.get_mut((ge.addr - GeDiag::UCODE_BASE) as usize) {
+            let l = (ge.addr - GeDiag::UCODE_BASE) as usize;
+            if let Some(line) = ge.ucode.get_mut(l) {
                 line[ge.word] = val;
             }
+            ge.hash.word(l * 3 + ge.word, val);
             ge.word += 1;
             if ge.word == 3 {
                 ge.word = 0;
