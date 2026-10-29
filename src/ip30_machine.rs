@@ -121,7 +121,11 @@ impl OctaneMachine {
             return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
         }
         let banks = heart_banks(cfg);
-        let board = cfg.octane.graphics_board()?;
+        let board = match cfg.graphics_board() {
+            crate::config::GraphicsBoard::None => None,
+            b if b.is_impact() => Some(b),
+            b => return Err(format!("graphics.board \"{}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)", b.as_str())),
+        };
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
         let timer_manager = Arc::new(TimerManager::new());
 

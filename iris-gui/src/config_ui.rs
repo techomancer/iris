@@ -222,10 +222,12 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         octane_defaults(cfg);
     }
     let octane = cfg.machine.profile == MachineProfile::OctaneIp30;
-    // GR2 Extreme is Indigo2-only; moving to Indy keeps the closest board
-    // rather than leaving a config `validate()` would reject at Start.
-    if !cfg.graphics.board.supports(cfg.machine.profile) {
-        cfg.graphics.board = GraphicsBoard::Xz;
+    // A board the new machine does not take would fail `validate()` at
+    // Start: GR2 Extreme moving to Indy keeps the closest board (XZ); any
+    // other falls back to the machine's default.
+    let board = cfg.graphics_board();
+    if !board.supports(cfg.machine.profile) {
+        cfg.graphics.board = (board == GraphicsBoard::Extreme && !octane).then_some(GraphicsBoard::Xz);
     }
     // Only IP28 can express 256/512 MB banks. Clamp them when switching to
     // IP22/IP24 so the new profile passes `validate()` at Start.
@@ -351,7 +353,7 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
     } else {
         show_board_picker(ui, cfg, mem_ctx.running);
     }
-    if !octane && cfg.graphics.board == GraphicsBoard::Newport {
+    if !octane && cfg.graphics_board() == GraphicsBoard::Newport {
         ui.horizontal(|ui| {
             ui.label(t!("config-newport-heads"));
             ui.add(egui::DragValue::new(&mut cfg.graphics.heads).range(1..=2).speed(0.1));
@@ -546,7 +548,7 @@ fn show_rtc_offset(ui: &mut Ui, off: &mut RtcOffset, running: bool) {
 }
 
 fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let before = cfg.graphics.board;
+    let before = cfg.graphics_board();
     let mut choice = before;
     ui.horizontal(|ui| {
         ui.label(t!("config-graphics-board"));
@@ -566,7 +568,7 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     // Every non-Newport choice is single-head with no VC2 presets;
     // clear those so the config still passes `validate()`.
     if choice != before {
-        cfg.graphics.board = choice;
+        cfg.graphics.board = Some(choice);
         if choice != GraphicsBoard::Newport {
             cfg.graphics.heads = 1;
             cfg.graphics.resolution = NewportResolution::Guest;
@@ -592,12 +594,12 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 }
 
 /// The Octane's graphics port holds an IMPACT board (Solid, High as the SI
-/// with texture option, Maximum as the MXI) or nothing (`[octane]
-/// graphics`); the other boards are not modelled there.
+/// with texture option, Maximum as the MXI) or nothing (`[graphics] board
+/// = "none"`); the other boards are not modelled there.
 fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let fitted = cfg.octane.graphics_board().unwrap_or(Some(GraphicsBoard::SolidImpact));
+    let fitted = cfg.graphics_board();
     let mut choice = fitted;
-    let name = |b: Option<GraphicsBoard>| b.map_or_else(|| t!("config-octane-graphics-none"), |b| b.label().to_string());
+    let name = |b: GraphicsBoard| if b == GraphicsBoard::None { t!("config-octane-graphics-none") } else { b.label().to_string() };
     ui.horizontal(|ui| {
         ui.label(t!("config-graphics-board"));
         ui.add_enabled_ui(!running, |ui| {
@@ -605,14 +607,16 @@ fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bo
                 .selected_text(name(choice))
                 .show_ui(ui, |ui| {
                     for b in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
-                        ui.selectable_value(&mut choice, Some(b), b.label());
+                        ui.selectable_value(&mut choice, b, b.label());
                     }
-                    ui.selectable_value(&mut choice, None, t!("config-octane-graphics-none"));
+                    ui.selectable_value(&mut choice, GraphicsBoard::None, t!("config-octane-graphics-none"));
                 });
         });
     });
     if choice != fitted {
-        cfg.octane.graphics = Some(choice.map_or("none", |b| b.as_str()).into());
+        cfg.graphics.board = Some(choice);
+        cfg.graphics.heads = 1;
+        cfg.graphics.resolution = NewportResolution::Guest;
     }
     if running {
         ui.label(
@@ -637,13 +641,16 @@ fn octane_defaults(cfg: &mut MachineConfig) {
         let total: u32 = banks.iter().sum();
         cfg.banks = crate::dialogs::new_machine::distribute_ram(total.clamp(64, 2048), MachineProfile::OctaneIp30);
     }
-    if cfg.octane.graphics_board().is_err() {
-        cfg.octane.graphics = None;
+    if !cfg.graphics_board().supports(MachineProfile::OctaneIp30) {
+        cfg.graphics.board = None;
     }
+    cfg.graphics.heads = 1;
+    cfg.graphics.resolution = NewportResolution::Guest;
+    cfg.octane.graphics = None;
 }
 
 fn show_resolution_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let newport = cfg.graphics.board == GraphicsBoard::Newport && !cfg.headless;
+    let newport = cfg.graphics_board() == GraphicsBoard::Newport && !cfg.headless;
     ui.horizontal(|ui| {
         let label = ui.label(t!("config-resolution"));
         if !newport {

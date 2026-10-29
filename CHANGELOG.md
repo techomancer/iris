@@ -132,13 +132,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   drains the board before each swap, so it never showed this. The display
   also takes its frame just before the retrace now, as scanout does, so a
   flip shows from the next frame.
+- **The Octane's board is `[graphics] board`, as on every other machine**,
+  and `--graphics` works on it. `[octane] graphics` is retired: a config
+  that still sets it is refused with a message naming the new key. Unset,
+  the Octane gets the SI; Newport, XZ and Extreme are refused there, and
+  `board = "none"` (Octane only) leaves the port empty.
 - **Perfetto traces on the Octane and the O2** (`--features perfetto`):
   the `perfetto` monitor command was registered only on the Indy and
   Indigo2. IMPACT traces now show frame capture and present, STATUS reads,
   flags, window-ID modes and VC3 tables, the draw bank, the interrupt lines
   and, on the Octane, the HEART packets and acknowledgements
   (docs/perfetto.md).
-- **The Octane takes the textured IMPACT boards.** `[octane] graphics =
+- **The Octane takes the textured IMPACT boards.** `[graphics] board =
   "highimpact"` is the SI with texture option and `"maximpact"` the MXI
   (two GEs, two REs), with the board version bytes the IP30 kernel decodes;
   hinv and gfxinfo name them as on the real machine. glstate, pixtest and

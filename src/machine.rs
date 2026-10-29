@@ -311,7 +311,7 @@ impl Machine {
         #[cfg(feature = "jitv2")]
         let jitv2_threads = cfg.jitv2.threads;
         let display_resolution = cfg.graphics.resolution;
-        let newport_active = !cfg.headless && cfg.graphics.board == GraphicsBoard::Newport;
+        let newport_active = !cfg.headless && cfg.graphics_board() == GraphicsBoard::Newport;
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let clock_fixed_mhz = cfg.clock.fixed_mhz;
         let cfg_cpu_model = cfg.machine.cpu;
@@ -564,7 +564,7 @@ impl Machine {
         let nvram_provenance = cfg.nvram.clone();
 
         // REX3 Graphics — Newport only; skipped in headless mode or when non-Newport board selected.
-        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics.board != crate::config::GraphicsBoard::Newport {
+        let rex3: Option<Arc<Rex3>> = if cfg.headless || cfg.graphics_board() != crate::config::GraphicsBoard::Newport {
             None
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
@@ -586,10 +586,10 @@ impl Machine {
 
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
-        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics.board {
+        let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::Xz | crate::config::GraphicsBoard::Extreme => {
                 use crate::dev::gr2::{Gr2, Gr2Stats, Gr2Variant};
-                let variant = if cfg.graphics.board == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
+                let variant = if cfg.graphics_board() == crate::config::GraphicsBoard::Extreme { Gr2Variant::Extreme } else { Gr2Variant::Xz };
                 let g = Gr2::new(variant, Gr2Stats { heartbeat: heartbeat.clone(), fasttick: fasttick_count.clone() });
                 // GR2 retrace is GIO interrupt 2 (LIO_GIO_2): on Indigo2 through
                 // the EXTIO SG_RETRACE fan-out, on Indy the direct line. It is a
@@ -612,11 +612,11 @@ impl Machine {
         };
 
         // IMPACT graphics in the GIO graphics slot.
-        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match cfg.graphics.board {
+        let mgras: Option<Arc<crate::dev::mgras::Mgras>> = match cfg.graphics_board() {
             crate::config::GraphicsBoard::SolidImpact
             | crate::config::GraphicsBoard::HighImpact
             | crate::config::GraphicsBoard::MaxImpact => {
-                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, {
+                Some(crate::dev::mgras::Mgras::new(cfg.graphics_board(), {
                     use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
                     [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
                 }, heartbeat.clone(), fasttick_count.clone()))

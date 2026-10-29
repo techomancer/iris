@@ -43,7 +43,7 @@ mod tests {
     fn impact_solid_on_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.graphics.board = GraphicsBoard::SolidImpact;
+        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
         cfg.validate().expect("Solid IMPACT on Indigo2");
     }
 
@@ -51,7 +51,7 @@ mod tests {
     fn impact_on_indy_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.graphics.board = GraphicsBoard::SolidImpact;
+        cfg.graphics.board = Some(GraphicsBoard::SolidImpact);
         cfg.validate().expect("Solid IMPACT on Indy");
     }
 
@@ -59,7 +59,7 @@ mod tests {
     fn newport_on_ip28_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.graphics.board = GraphicsBoard::Newport;
+        cfg.graphics.board = Some(GraphicsBoard::Newport);
         cfg.validate().expect("Newport on IP28");
     }
 
@@ -67,7 +67,7 @@ mod tests {
     fn xz_on_ip28_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip28;
-        cfg.graphics.board = GraphicsBoard::Xz;
+        cfg.graphics.board = Some(GraphicsBoard::Xz);
         cfg.validate().expect("XZ on IP28");
     }
 
@@ -86,18 +86,18 @@ mod tests {
         use clap::Parser;
         let cli = Cli::try_parse_from(["iris", "--graphics", "impact:high"]).unwrap();
         let cfg = cli.apply(MachineConfig::default());
-        assert_eq!(cfg.graphics.board, GraphicsBoard::HighImpact);
+        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::HighImpact));
 
         let cli = Cli::try_parse_from(["iris", "--board", "solidimpact"]).unwrap();
         let cfg = cli.apply(MachineConfig::default());
-        assert_eq!(cfg.graphics.board, GraphicsBoard::SolidImpact);
+        assert_eq!(cfg.graphics.board, Some(GraphicsBoard::SolidImpact));
     }
 
     #[test]
     fn xz_on_indy_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.graphics.board = GraphicsBoard::Xz;
+        cfg.graphics.board = Some(GraphicsBoard::Xz);
         cfg.graphics.heads = 1;
         cfg.validate().expect("XZ board on Indy");
     }
@@ -106,7 +106,7 @@ mod tests {
     fn xz_on_indigo2_validates() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.graphics.board = GraphicsBoard::Xz;
+        cfg.graphics.board = Some(GraphicsBoard::Xz);
         cfg.validate().expect("XZ board on Indigo2");
     }
 
@@ -114,7 +114,7 @@ mod tests {
     fn extreme_on_indy_rejected() {
         let mut cfg = minimal_cfg();
         cfg.machine.profile = MachineProfile::IndyIp24;
-        cfg.graphics.board = GraphicsBoard::Extreme;
+        cfg.graphics.board = Some(GraphicsBoard::Extreme);
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("indigo2_ip22"), "got: {err}");
     }

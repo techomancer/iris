@@ -570,6 +570,10 @@ pub enum GraphicsBoard {
     /// Maximum IMPACT (2 GE11, 2 RE4).
     #[clap(name = "maximpact", alias = "impact:max", alias = "max_impact")]
     MaxImpact,
+    /// No graphics board: the machine runs on its serial console. Octane
+    /// only.
+    #[clap(name = "none")]
+    None,
 }
 
 impl GraphicsBoard {
@@ -590,6 +594,7 @@ impl GraphicsBoard {
             Self::SolidImpact => "IMPACT Solid",
             Self::HighImpact => "IMPACT High",
             Self::MaxImpact => "IMPACT Maximum",
+            Self::None => "None",
         }
     }
 
@@ -601,6 +606,7 @@ impl GraphicsBoard {
             Self::SolidImpact => "solidimpact",
             Self::HighImpact => "highimpact",
             Self::MaxImpact => "maximpact",
+            Self::None => "none",
         }
     }
 
@@ -608,9 +614,23 @@ impl GraphicsBoard {
         matches!(self, Self::SolidImpact | Self::HighImpact | Self::MaxImpact)
     }
 
-    /// Whether `validate()` accepts this board on `profile`.
+    /// Whether `validate()` accepts this board on `profile`. The Octane
+    /// models only IMPACT (High as the SI with texture option, Maximum as
+    /// the MXI) or no board.
     pub fn supports(self, profile: MachineProfile) -> bool {
-        self != Self::Extreme || profile == MachineProfile::Indigo2Ip22
+        match profile {
+            MachineProfile::OctaneIp30 => self.is_impact() || self == Self::None,
+            MachineProfile::Indigo2Ip22 => self != Self::None,
+            _ => !matches!(self, Self::Extreme | Self::None),
+        }
+    }
+
+    /// The board a machine gets when `[graphics] board` is not set.
+    pub fn default_for(profile: MachineProfile) -> Self {
+        match profile {
+            MachineProfile::OctaneIp30 => Self::SolidImpact,
+            _ => Self::Newport,
+        }
     }
 }
 
@@ -626,8 +646,9 @@ impl std::str::FromStr for GraphicsBoard {
             "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
             "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
             "maximpact" | "impact:max" | "max_impact" | "max-impact" | "maximumimpact" | "maximum_impact" | "maximum-impact" | "max" => Ok(Self::MaxImpact),
+            "none" => Ok(Self::None),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, none)"
             )),
         }
     }
@@ -662,11 +683,14 @@ impl std::fmt::Display for GraphicsBoard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphicsSection {
-    /// Graphics board: Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Maximum.
-    /// Extreme is restricted to IP22; non-Newport boards require one head
+    /// Graphics board: Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum,
+    /// or none (Octane only). Unset: the machine's default
+    /// ([`GraphicsBoard::default_for`]); read it with
+    /// [`MachineConfig::graphics_board`]. Extreme is restricted to IP22,
+    /// the Octane to IMPACT or none; non-Newport boards require one head
     /// and Guest resolution. See [`MachineConfig::validate`].
-    #[serde(default)]
-    pub board: GraphicsBoard,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<GraphicsBoard>,
     /// Newport heads to emulate (1 or 2). Dual-head maps a second REX3 at GIO slot 1.
     #[serde(default = "default_graphics_heads")]
     pub heads: u8,
@@ -689,7 +713,7 @@ fn default_graphics_heads() -> u8 { 1 }
 impl Default for GraphicsSection {
     fn default() -> Self {
         Self {
-            board: GraphicsBoard::default(),
+            board: None,
             heads: default_graphics_heads(),
             resolution: crate::dev::ng1::vc2_timings::NewportResolution::default(),
         }
@@ -890,31 +914,16 @@ pub struct OctaneSection {
     /// flash lives in memory only and every start is from `prom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flash: Option<String>,
-    /// The board in the first graphics port: `"solidimpact"` (the default)
-    /// or `"none"`. As on the O2, `headless` changes only the window; the
-    /// board stays, and the PROM's `console` variable picks the console.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Retired: the board is `[graphics] board` on every machine. Kept
+    /// only so an old config gets an error naming the new key.
+    #[serde(default, skip_serializing)]
     pub graphics: Option<String>,
 }
 
 impl OctaneSection {
-    /// The graphics board `graphics` names, or None for `"none"`.
-    pub fn graphics_board(&self) -> Result<Option<GraphicsBoard>, String> {
-        match self.graphics.as_deref().map(str::trim) {
-            None => Ok(Some(GraphicsBoard::SolidImpact)),
-            Some(s) if s.eq_ignore_ascii_case("none") => Ok(None),
-            Some(s) => match s.parse::<GraphicsBoard>() {
-                // High IMPACT is the Octane's SI with texture option, Maximum its MXI.
-                Ok(b @ (GraphicsBoard::SolidImpact | GraphicsBoard::HighImpact | GraphicsBoard::MaxImpact)) => Ok(Some(b)),
-                Ok(b) => Err(format!("octane.graphics \"{s}\": {} is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)", b.label())),
-                Err(e) => Err(format!("octane.graphics: {e}")),
-            },
-        }
-    }
-
     /// Left out of a written config when nothing in it was set.
     fn is_default(&self) -> bool {
-        self.flash.is_none() && self.graphics.is_none()
+        self.flash.is_none()
     }
 }
 
@@ -1856,6 +1865,12 @@ impl MachineConfig {
     }
 
     /// Validate bank sizes, returns a description of any errors.
+    /// The graphics board: `[graphics] board`, or the machine's default
+    /// when it is not set (Solid IMPACT on the Octane, Newport elsewhere).
+    pub fn graphics_board(&self) -> GraphicsBoard {
+        self.graphics.board.unwrap_or_else(|| GraphicsBoard::default_for(self.machine.profile))
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
             return Err(format!(
@@ -1863,12 +1878,20 @@ impl MachineConfig {
                 self.graphics.heads
             ));
         }
-        if self.graphics.board != GraphicsBoard::Newport {
-            let name = self.graphics.board.as_str();
-            if self.graphics.board == GraphicsBoard::Extreme && self.machine.profile != MachineProfile::Indigo2Ip22 {
+        let board = self.graphics_board();
+        if board != GraphicsBoard::Newport {
+            let name = board.as_str();
+            if board == GraphicsBoard::Extreme && self.machine.profile != MachineProfile::Indigo2Ip22 {
                 return Err(
                     "graphics.board \"extreme\" is only valid on Indigo2 (machine.profile = indigo2_ip22)".into(),
                 );
+            }
+            if !board.supports(self.machine.profile) {
+                return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
+                    format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)")
+                } else {
+                    format!("graphics.board \"{name}\" is only valid on the Octane")
+                });
             }
             if self.graphics.heads != 1 {
                 return Err(format!("graphics.board \"{name}\" does not support dual-head (graphics.heads must be 1)"));
@@ -1949,7 +1972,15 @@ impl MachineConfig {
                     return Err(format!("bank{i} size {sz} MB is invalid for an Octane (valid: 64, 128, 256, 512)"));
                 }
             }
-            self.octane.graphics_board()?;
+            if let Some(old) = &self.octane.graphics {
+                return Err(format!(
+                    "octane.graphics has moved: set the board in [graphics] as board = \"{}\"",
+                    old.trim()
+                ));
+            }
+            if self.graphics.board == Some(GraphicsBoard::Newport) {
+                return Err("graphics.board \"newport\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)".into());
+            }
         } else {
             for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
                 if !VALID_BANK_SIZES.contains(&sz) {
@@ -2358,7 +2389,7 @@ impl Cli {
 
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
         if let Some(cache) = self.cache { cfg.machine.cache = cache; }
-        if let Some(b) = self.graphics { cfg.graphics.board = b; }
+        if let Some(b) = self.graphics { cfg.graphics.board = Some(b); }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }
@@ -2499,18 +2530,31 @@ mod export_tests {
 
     #[test]
     fn octane_graphics_defaults_to_solid_impact() {
+        let octane = |t: &str| -> MachineConfig {
+            let mut c: MachineConfig =
+                toml::from_str(&format!("banks = [128, 0, 0, 0]\n[machine]\nprofile = \"octane_ip30\"\ncpu = \"r10000\"\n{t}"))
+                    .expect("parse");
+            c.scsi.clear();
+            c
+        };
+        let cfg = octane("");
+        assert_eq!(cfg.graphics_board(), GraphicsBoard::SolidImpact);
+        cfg.validate().expect("default Octane");
+        for (t, b) in [("none", GraphicsBoard::None), ("impact:solid", GraphicsBoard::SolidImpact),
+                       ("maximpact", GraphicsBoard::MaxImpact), ("highimpact", GraphicsBoard::HighImpact)] {
+            let cfg = octane(&format!("[graphics]\nboard = \"{t}\""));
+            assert_eq!(cfg.graphics_board(), b, "{t}");
+            cfg.validate().expect(t);
+        }
+        for t in ["xz", "extreme", "newport"] {
+            assert!(octane(&format!("[graphics]\nboard = \"{t}\"")).validate().is_err(), "{t} is not modelled on the Octane");
+        }
+        let err = octane("[octane]\ngraphics = \"maximpact\"").validate().unwrap_err();
+        assert!(err.contains("[graphics]"), "the retired key names its replacement: {err}");
+        // Elsewhere the default stays Newport, and none is the Octane's alone.
         let cfg: MachineConfig = toml::from_str("").expect("parse");
-        assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::SolidImpact)));
-        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"none\"").expect("parse");
-        assert_eq!(cfg.octane.graphics_board(), Ok(None));
-        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"impact:solid\"").expect("parse");
-        assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::SolidImpact)));
-        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"maximpact\"").expect("parse");
-        assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::MaxImpact)), "the MXI");
-        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"highimpact\"").expect("parse");
-        assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::HighImpact)), "SI with texture");
-        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"xz\"").expect("parse");
-        assert!(cfg.octane.graphics_board().is_err(), "only IMPACT is modelled");
+        assert_eq!(cfg.graphics_board(), GraphicsBoard::Newport);
+        assert!(!GraphicsBoard::None.supports(MachineProfile::IndyIp24));
     }
 
     #[test]

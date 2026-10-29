@@ -174,7 +174,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `graphics.board` | `newport` | newport, xz, extreme, solidimpact, highimpact, maximpact. |
+| `graphics.board` | `newport`; `solidimpact` on the Octane | newport, xz, extreme, solidimpact, highimpact, maximpact, none. Extreme is Indigo2 only. The Octane takes only `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI) or `none` (no board: the machine runs on its serial console, with no window). |
 | `graphics.heads` | `1` | 1 or 2; dual-head requires Newport. |
 | `graphics.resolution` | `guest` | guest, 1024x768, 1280x960, 1280x1024; presets require Newport. |
 
@@ -326,13 +326,12 @@ DS1685's NVRAM, behind IOC3), `banks` (the MB in each HEART bank: 64, 128, 256
 or 512, filled from bank 0 with no gap, 2048 in all), `serial_port_a` and
 `serial_port_b`/`serial_log` (IOC3's two ports, the first the console),
 `headless`, `[clock] fixed_mhz` (CP0 Count; 97.5 for the 195 MHz R10000),
-`[network]`, `[[port_forward]]`, `nat_subnet` and `[scsi.N]` (`controller` 0
-is the internal bus, 1 the external). See [the Octane guide](docs/octane-ip30.md).
+`[network]`, `[[port_forward]]`, `nat_subnet`, `[scsi.N]` (`controller` 0
+is the internal bus, 1 the external) and `[graphics] board`. See [the Octane guide](docs/octane-ip30.md).
 
 | Key | Default | Values and behavior |
 |---|---|---|
 | `octane.flash` | unset | Boot flash file, keeping the PROM's records between runs. Created from `prom` when missing and then used as it is, so delete it after changing `prom`; a file of another size is refused. Unset, the flash is in memory and every start is from `prom`. |
-| `octane.graphics` | `"solidimpact"` | `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI) or `none`. With `none` the machine runs on its serial console, with no window. |
 
 ### Hardware constraints and precedence
 

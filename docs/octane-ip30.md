@@ -44,7 +44,9 @@ cpu = "r10000"
 
 [octane]
 flash = "flash-ip30.bin"      # keep the PROM's flash records between runs
-# graphics = "maximpact"      # "solidimpact" (default), "highimpact", "maximpact" or "none"
+
+[graphics]
+# board = "maximpact"         # "solidimpact" (default), "highimpact", "maximpact" or "none"
 
 [[port_forward]]
 proto = "tcp"
@@ -116,7 +118,8 @@ controller works and what each driver does with it is in
 
 The graphics board sits on widget 11: the same raster chips as the Indigo2
 IP28's IMPACT boards behind the Octane's XIO host interface (the HQ4), with
-interrupts and DMA through HEART. `[octane] graphics` picks the board:
+interrupts and DMA through HEART. `[graphics] board` (or `--graphics`) picks
+the board, as on the other machines:
 
 | Value | The PROM's name | GEs / REs | Texture |
 |---|---|---|---|
@@ -126,7 +129,7 @@ interrupts and DMA through HEART. `[octane] graphics` picks the board:
 
 The two textured boards are new and less tested than the SI. Its screen is the iris window
 and what iris-ci screenshots show; the keyboard and mouse are IOC3's PS/2
-ports. `[octane] graphics = "none"` leaves the port empty, and the machine
+ports. `board = "none"` leaves the port empty, and the machine
 then runs on its serial console with no window.
 
 ## Networking

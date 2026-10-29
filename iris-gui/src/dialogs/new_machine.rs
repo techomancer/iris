@@ -354,7 +354,7 @@ impl NewMachineDialog {
                         // default straight to IMPACT so a fresh machine has a working
                         // display instead of a blank Newport head.
                         if self.profile == MachineProfile::Indigo2Ip28 {
-                            cfg.graphics.board = iris::config::GraphicsBoard::SolidImpact;
+                            cfg.graphics.board = Some(iris::config::GraphicsBoard::SolidImpact);
                         }
                         // Keep the PROM's flash records between runs.
                         if self.profile == MachineProfile::OctaneIp30 {
