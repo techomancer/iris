@@ -36,6 +36,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [cvt-to-int-inexact-is-judged-against-the-source.md](cpu/cvt-to-int-inexact-is-judged-against-the-source.md) | rule | A float-to-integer conversion's Inexact is judged against the source, in both engines |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
+| [fused-load-store-passes-retry-through.md](cpu/fused-load-store-passes-retry-through.md) | rule | A fused ADDU/ADDIU+load/store must pass EXEC_RETRY through; raising it gave IP22+IMPACT a spurious ExcCode 0 PROM panic under `lightning` (#270) |
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
 | [intrfast-self-overwrite-investigation.md](cpu/intrfast-self-overwrite-investigation.md) | open | intrfast (0x08016xxx) gets overwritten with data mid-boot — investigation in progress |
 | [movci-is-cp1-by-behaviour-not-encoding.md](cpu/movci-is-cp1-by-behaviour-not-encoding.md) | rule | MOVF/MOVT are CP1 accesses with an integer encoding |
