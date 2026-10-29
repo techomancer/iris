@@ -87,6 +87,29 @@ back to the NAT gateway, and `--list-net-interfaces` reports that the feature
 is missing.
 
 
+## Stream segment (`mode = "stream"`)
+
+`[network] mode = "stream"` plugs the Ethernet into a private segment served
+by another program, using the framing of QEMU's `-netdev stream`: each frame
+is a 32-bit big-endian length and then the Ethernet frame, without FCS. iris
+is the client and connects to `stream`:
+
+```toml
+[network]
+mode = "stream"
+stream = "tcp:127.0.0.1:7000"     # or "unix:/run/segment.sock"
+```
+
+Anything that speaks that framing works as the peer, for example another
+emulator or an install server with its own user-space TCP/IP stack. iris
+answers nothing on the segment itself: no DHCP, DNS, TFTP, `[nfs]` or
+`[[port_forward]]`, and `nat_subnet` is unused. It needs no host privileges.
+The connection is retried once a second until the peer listens, so the server
+may start after iris, and made again if the peer goes away; frames the guest
+sends while disconnected are dropped. It works on every machine with an
+onboard Ethernet: the Indy and Indigo2 (SEEQ), the O2 (MEC) and the Octane
+(IOC3). A DaynaPort has its own subnet and cannot join the segment.
+
 ## DaynaPort SCSI/Link
 
 A SCSI-attached Ethernet adapter (SCSI type 3, Processor) selectable on any
