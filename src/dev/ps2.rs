@@ -519,6 +519,18 @@ impl Ps2Controller {
         Some(byte)
     }
 
+    /// Whether the guest has turned the mouse on: until it has, moves and
+    /// clicks are dropped.
+    pub fn mouse_enabled(&self) -> bool {
+        let state = self.state.lock();
+        state.mouse_enabled && state.config & 0x20 == 0
+    }
+
+    /// Mouse bytes queued that the guest has not read yet.
+    pub fn mouse_pending(&self) -> usize {
+        self.state.lock().mouse_queue_bytes
+    }
+
     /// Push a scancode byte to the keyboard queue (called from UI)
     pub fn push_kb(&self, key: KeyCode, pressed: bool) {
         if !self.running.load(Ordering::Relaxed) { return; }

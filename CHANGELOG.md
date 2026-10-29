@@ -13,6 +13,44 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### VNC, and screen and pointer commands
+
+- **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the
+  guest's screen, keyboard and mouse to any VNC viewer (RFB 3.8, Raw and
+  ZRLE, desktop resizing, QEMU's key-position extension; no password, so it
+  stays on loopback by default). It serves every machine and board the same
+  way, with the window open or under `--ci` with no window. It reads the
+  frame the board composed and finds what changed by comparing frames in
+  64x64 tiles; drawing code is untouched. Standalone `iris` only. See
+  [HELP.md](HELP.md#vnc). (`src/vnc/`)
+- **Clicks land where you point.** The guest mouse is relative and X
+  accelerates it; iris now steers the guest pointer onto an absolute
+  position by reading back the board's hardware cursor (VC2, VC1, VC3, GBE),
+  learning the cursor's hotspot from the screen corner. VNC uses it, and so
+  do new monitor commands for scripts and assistants: `screen
+  info|shot|pix|wait|cursor`, `ptr move|click|drag|down|up|rel|calibrate`,
+  `key <chord>|type|names`, on every machine
+  ([debug.md](debug.md#graphics)). The MCP server wraps them as
+  `screenshot` (returns the image), `click`, `drag`, `move_pointer`,
+  `type_text`, `press_key`, `wait_screen`, `screen_info`, `screen_pixel`.
+  (`src/hostinput.rs`, `src/keysym.rs`, `clanker/iris_mcp.py`)
+- `GfxDisplay` gained `request_frame`, `set_capture`, `hw_cursor` and a
+  frame sequence number, so a consumer can follow the composed frame on any
+  board. The CI socket's `screenshot` uses it and no longer also writes a
+  `screenshot_NNNN.png` into the working directory on Newport. While a VNC
+  viewer is connected, Newport's window composes in software, and goes back
+  to GL when the last one leaves. (`src/gfx_display.rs`,
+  `src/dev/ng1/rex3.rs`, `src/ci.rs`)
+- **Empty GIO slots answer reads with a bus error** (Indy, Indigo2), as the
+  MC does once the PROM has enabled GIO time-outs. They returned all ones,
+  so the PROM's probe took an absent board for a Newport and polled its
+  status 200 000 times on every headless boot (one log line each) before
+  giving up. Headless Indy and Indigo2 now reach the IRIX serial login
+  without the flood. (`src/ip22_bus.rs`, `src/dev/mc.rs`)
+- **The O2's cursor no longer vanishes at the top and left edges.** GBE's
+  cursor position fields are 12-bit signed; they were read as unsigned, so a
+  cursor partly off the edge was drawn 4000 pixels away. (`src/dev/o2gfx.rs`)
+
 ### Host efficiency on small machines
 
 - **Threads that have nothing to do now sleep in milliseconds, not

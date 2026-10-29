@@ -42,20 +42,32 @@ impl BusDevice for CpuBusErrorDevice {
     fn write64(&self, addr: u64, _v: u64) -> u32 { self.mc.report_cpu_error(addr); BUS_OK }
 }
 
-/// GIO bus timeout sink: reports to MC (GIO_ERROR_STAT bit 10 TIME) then returns 0/Ready.
-/// Covers GIO space 0x18000000..0x1FA00000 (reserved future GIO + empty expansion slots).
+/// GIO bus timeout sink: an address in GIO space no device answers (reserved
+/// GIO space and empty expansion or graphics slots, 0x18000000..0x1FA00000).
+/// The MC records the timeout in GIO_ERROR_ADDR/STAT and, with time-outs
+/// enabled (CPUCTRL1.ABORT_EN, set by the PROM at power-on), aborts a read
+/// with a bus error: that is how the PROM's and the kernel's `badaddr`
+/// probes find a slot empty. Writes are dropped.
 struct GioBusErrorDevice {
     mc: MemoryController,
 }
 
 impl BusDevice for GioBusErrorDevice {
-    fn read8(&self, addr: u64) -> BusRead8   { self.mc.report_gio_timeout(addr); BusRead8::ok(0xFF) }
-    fn write8(&self, addr: u64, _v: u8) -> u32  { self.mc.report_gio_timeout(addr); BUS_OK }
-    fn read16(&self, addr: u64) -> BusRead16  { self.mc.report_gio_timeout(addr); BusRead16::ok(0xFFFF) }
+    fn read8(&self, addr: u64) -> BusRead8 {
+        if self.mc.report_gio_timeout(addr) { BusRead8::err() } else { BusRead8::ok(0xFF) }
+    }
+    fn write8(&self, addr: u64, _v: u8) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
+    fn read16(&self, addr: u64) -> BusRead16 {
+        if self.mc.report_gio_timeout(addr) { BusRead16::err() } else { BusRead16::ok(0xFFFF) }
+    }
     fn write16(&self, addr: u64, _v: u16) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
-    fn read32(&self, addr: u64) -> BusRead32  { self.mc.report_gio_timeout(addr); BusRead32::ok(0xFFFFFFFF) }
+    fn read32(&self, addr: u64) -> BusRead32 {
+        if self.mc.report_gio_timeout(addr) { BusRead32::err() } else { BusRead32::ok(0xFFFF_FFFF) }
+    }
     fn write32(&self, addr: u64, _v: u32) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
-    fn read64(&self, addr: u64) -> BusRead64  { self.mc.report_gio_timeout(addr); BusRead64::ok(0xFFFFFFFFFFFFFFFF) }
+    fn read64(&self, addr: u64) -> BusRead64 {
+        if self.mc.report_gio_timeout(addr) { BusRead64::err() } else { BusRead64::ok(u64::MAX) }
+    }
     fn write64(&self, addr: u64, _v: u64) -> u32 { self.mc.report_gio_timeout(addr); BUS_OK }
 }
 

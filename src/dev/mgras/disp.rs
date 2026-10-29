@@ -288,6 +288,7 @@ impl Mgras {
                         let row = y * 2048;
                         screen.rgba[row..row + w].copy_from_slice(&screen.fb_rgb[row..row + w]);
                     }
+                    screen.frame_seq = screen.frame_seq.wrapping_add(1);
                     screen.width = w;
                     screen.height = h;
                     screen.status_bar_only = false;

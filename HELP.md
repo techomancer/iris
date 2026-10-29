@@ -494,6 +494,55 @@ standalone `iris` window if you need them.
 
 The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
+## VNC
+
+iris has a built-in VNC server. Any VNC viewer (TigerVNC, RealVNC, Remmina,
+noVNC, macOS Screen Sharing) then shows the guest's screen and types and
+clicks into it:
+
+```sh
+iris --vnc                    # 127.0.0.1:5900
+iris --ci --vnc               # no window at all: VNC is the screen
+iris --vnc 0.0.0.0:5901       # reachable from other machines (no password!)
+vncviewer localhost:5900
+```
+
+or in `iris.toml`:
+
+```toml
+[vnc]
+listen  = "127.0.0.1:5900"   # absent: no VNC server
+max_fps = 30                 # most updates a second per viewer
+```
+
+It works on every machine and graphics board (Newport, XZ/Extreme, IMPACT,
+the O2), with the normal window open or under `--ci` with no window. Not with
+`--headless`, which has no screen to serve. The window, the monitor and any
+number of viewers can type and click at the same time. iris-gui has no VNC
+server.
+
+What you see is the guest's screen, without the window's status bar. Only
+the parts of the screen that change are sent, so an idle desktop costs next
+to nothing. With Newport, the window uses the software compositor while a
+viewer is connected (`disp compositor gl` is refused) and switches back when
+the last one leaves.
+
+**The mouse.** The guest's mouse sends movements, not positions, and IRIX
+accelerates fast ones. iris steers the guest pointer onto the spot you point
+at by watching where the board draws the cursor, so a click lands where you
+clicked. The first time you point, the guest pointer jumps to the top-left
+corner and back: that teaches iris where the tip of the cursor is. The
+viewer's own cursor (a dot or an arrow) runs a little ahead of the guest's;
+it catches up within a fraction of a second.
+
+**The keyboard.** Viewers that send key positions (TigerVNC, noVNC, QEMU's
+extension) work with any host layout. Others send characters, which iris
+types on a US layout.
+
+**Security.** There is no password. Leave the server on `127.0.0.1` and use
+an SSH tunnel (`ssh -L 5900:localhost:5900 host`) to reach it from
+elsewhere.
+
 ---
 
 ## Configuration file (`iris.toml`)
@@ -716,6 +765,7 @@ Automation and debugging
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
   --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
+  --vnc [ADDR]                VNC server on ADDR (host:port or port; default 127.0.0.1:5900)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)
   --gdb-port <PORT>           Start the GDB stub

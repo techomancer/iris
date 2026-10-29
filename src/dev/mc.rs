@@ -508,7 +508,9 @@ impl MemoryController {
         eprintln!("MC: CPU Error at {:08x}", addr);
     }
 
-    pub fn report_gio_timeout(&self, addr: u64) {
+    /// A GIO access nobody answered. Returns whether the MC aborts it with a
+    /// bus error (`CPUCTRL1.ABORT_EN`, which the PROM sets at power-on).
+    pub fn report_gio_timeout(&self, addr: u64) -> bool {
         let mut state = self.state.lock();
         state.regs[(REG_GIO_ERROR_ADDR / 4) as usize] = addr as u32;
         // TIME bit (10) only set when ABORT_EN (CPUCTRL1 bit 4) is enabled
@@ -518,6 +520,7 @@ impl MemoryController {
         }
         dlog_dev!(LogModule::Mc, "MC: GIO Timeout at {:08x} (abort_en={})", addr, abort_en);
         eprintln!("MC: GIO Timeout at {:08x}", addr);
+        abort_en
     }
 
     // ── Accessors for the DMA engine in mc_vdma.rs ──────────────────────────

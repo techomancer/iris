@@ -296,7 +296,7 @@ impl OctaneMachine {
         // HEART's levels 0 to 4 are the CPU's IP2 to IP6.
         heart.set_interrupts(cpu.interrupts_ptr());
 
-        let mut monitor = crate::monitor::Monitor::new();
+        let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(cpu.clone().as_device());
         monitor.register_device(heart.clone());
@@ -629,6 +629,7 @@ impl Workstation for OctaneMachine {
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> {
         self.gfx.as_ref().map(|g| g.display())
     }
+    fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> {
         self.ioc3.ps2()
     }

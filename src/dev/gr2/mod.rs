@@ -992,6 +992,18 @@ impl crate::gfx_display::GfxDisplay for Gr2 {
     fn screen(&self) -> &Mutex<Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn cycles(&self) -> CyclesPtr { self.cycles.get() }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        // A racy read of the registers, as the display thread's compose does.
+        let vc1 = &self.regs().vc1;
+        if !vc1.cursor_visible() {
+            return None;
+        }
+        let (x, y) = vc1.cursor_pos();
+        let mask = (0..32).map(|cy| (0..32).fold(0u64, |m, cx| {
+            m | ((vc1.cursor_pixel(cx, cy) != 0) as u64) << cx
+        })).collect();
+        Some(crate::gfx_display::HwCursor { x, y, size: 32, mask })
+    }
 }
 
 impl Resettable for Gr2 {

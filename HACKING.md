@@ -253,7 +253,8 @@ Every device that has real work to do runs on its own thread:
 | graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS RSS` ×1-4 | consumers of the graphics FIFOs (section 7) |
 | `REX3-Refresh`, `GR2-Display`, MGRAS refresh | scanout and composition; the refresh thread owns the GL context |
 | `hptimer` | host timer callbacks (Compare, PIT ticks, HAL2 audio pacing) |
-| listeners | debug console, serial ports, CI socket, GDB stub |
+| listeners | debug console, serial ports, CI socket, GDB stub, VNC |
+| `VNC-Grab`, `VNC-Pointer`, `VNC-Client`/`VNC-Read` | with `--vnc`: frame diffing, pointer steering, one pair per viewer |
 | `machine-events` | power-off and reset requests from devices |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
@@ -417,6 +418,31 @@ Scanout is decoupled from drawing: the display thread reads the framebuffer
 without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
+
+### The composed frame and the hardware cursor
+
+`GfxDisplay` (`src/gfx_display.rs`) is what the window, the CI socket, the
+monitor's `screen`/`ptr` commands and the VNC server see of a board, whichever
+board it is. The display thread leaves the composed guest frame in
+`screen().rgba` (stride 2048, `0xAABBGGRR`, no status bar) and bumps
+`screen().frame_seq` each time it rewrites it. GR2, IMPACT and the O2 compose
+on the CPU and do this every frame. Newport composes inside the window's
+renderer, so it fills `rgba` only when asked: `request_frame` for one frame,
+`set_capture(true)` for every frame while a consumer (VNC) watches. While
+capture is on, Newport's window uses the software compositor so the copy is a
+slice copy; with no window (`--ci`) the refresh thread composes in software
+itself. `copy_frame`/`fresh_frame` are the helpers that read it.
+
+Nothing downstream looks inside the drawing code. The VNC server
+(`src/vnc/`) finds damage by comparing frames in 64x64 tiles, so every board
+is served the same way and drawing paths carry no bookkeeping.
+
+`hw_cursor` reads the board's cursor registers live (VC2, VC1, VC3, GBE):
+the glyph's top-left and its opaque pixels. `src/hostinput.rs` uses it to
+steer the guest's relative PS/2 mouse onto absolute positions (the X server
+accelerates what it reads, so positions cannot be sent), learning each
+glyph's hotspot from the top-left screen corner, where X pins the pointer
+at 0,0.
 
 ## 8. jitv2: the MIPS JIT
 

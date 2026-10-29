@@ -420,6 +420,38 @@ impl Gbe {
         snap
     }
 
+    /// CRS_POS: x in bits 11:0 and y in bits 27:16, each a 12-bit signed
+    /// number (the X server puts the glyph at -6 to keep a hotspot on the
+    /// edge).
+    fn cursor_xy(crs: u32) -> (i32, i32) {
+        let sext12 = |v: u32| ((v & 0xfff) as i32) << 20 >> 20;
+        (sext12(crs), sext12(crs >> 16))
+    }
+
+    /// The hardware cursor when enabled: its glyph's top-left on screen and
+    /// one opaque-pixel mask word per row (bit `c` = column `c`), 32x32.
+    pub fn cursor(&self) -> Option<(i32, i32, Vec<u64>)> {
+        let r = {
+            let mut s = self.s.lock().unwrap();
+            self.latch(&mut s);
+            [Self::get(&s.r, CRS_CTL), Self::get(&s.r, CRS_POS)]
+                .into_iter()
+                .chain((0..64).map(|i| Self::get(&s.r, CRS_GLYPH + 4 * i)))
+                .collect::<Vec<u32>>()
+        };
+        if r[0] & 1 == 0 {
+            return None;
+        }
+        let (x, y) = Self::cursor_xy(r[1]);
+        // Two bits a pixel, 16 pixels a word, leftmost in the top bits; as
+        // `render` draws it.
+        let mask = (0..32usize).map(|dy| (0..32usize).fold(0u64, |m, dx| {
+            let word = r[2 + 2 * dy + dx / 16];
+            m | (((word >> (30 - 2 * (dx % 16))) & 3 != 0) as u64) << dx
+        })).collect();
+        Some((x, y, mask))
+    }
+
     /// Scan the frame out of RAM into `out` (R, G, B, A bytes, row 0 at the
     /// top), as GBE would. Returns the size drawn, or None when the display
     /// is off. `out` must hold the largest mode (2048 x 2048 pixels).
@@ -538,7 +570,7 @@ impl Gbe {
         let crs_on = g(CRS_CTL) & 1 != 0;
         let crs = g(CRS_POS);
         let probe_at = self.probe.lock().unwrap().0;
-        let (cx, cy) = ((crs & 0xffff) as i16 as i32, (crs >> 16) as i16 as i32);
+        let (cx, cy) = Self::cursor_xy(crs);
 
         for y in 0..h {
             if use_did {

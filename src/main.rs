@@ -44,6 +44,7 @@ fn main() {
     let ci_display = cfg.ci_display;
     let ci_socket_path = cfg.ci_socket.clone();
     let load_elf = cfg.load_elf.clone();
+    let vnc = cfg.vnc.clone();
     let perfetto = (cfg.perfetto.clone(), cfg.perfetto_cats.clone(), cfg.perfetto_clock.clone());
 
     // Apply [debug] and [jitv2] from TOML (env vars still override if set externally).
@@ -137,6 +138,17 @@ fn main() {
     } else {
         None
     };
+
+    // The monitor's `screen`, `ptr` and `key` commands, and the VNC server's
+    // hands on the guest.
+    let host_input = iris::hostinput::HostInput::attach(&*machine);
+    let _vnc_server = vnc.listen.as_deref().map(|listen| {
+        iris::vnc::VncServer::start(host_input.clone(), listen, vnc.max_fps, "IRIS")
+            .unwrap_or_else(|e| {
+                eprintln!("iris: {e}");
+                std::process::exit(1);
+            })
+    });
 
     // The terminal console talks to this process's own monitor only. Without
     // one (its port taken by another iris), there is no console: attached to

@@ -63,6 +63,7 @@ impl Gr2 {
                         let row = y * gr2comp::OUT_STRIDE;
                         screen.rgba[row..row + FB_W].copy_from_slice(&screen.fb_rgb[row..row + FB_W]);
                     }
+                    screen.frame_seq = screen.frame_seq.wrapping_add(1);
                 }
                 screen.prebuilt = true;
                 screen.width = FB_W;

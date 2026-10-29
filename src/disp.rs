@@ -71,6 +71,9 @@ pub struct Rex3Screen {
     /// board's own compositor (GR2's `gr2comp`). The renderer's compositor
     /// then presents it as-is instead of decoding Newport state.
     pub prebuilt: bool,
+    /// Bumped each time `rgba` is rewritten with a composed frame, so frame
+    /// consumers (VNC) can skip unchanged ones without comparing pixels.
+    pub frame_seq: u64,
 }
 
 impl Rex3Screen {
@@ -95,6 +98,7 @@ impl Rex3Screen {
             status_bar_only:  false,
             fb_borrowed:      false,
             prebuilt:         false,
+            frame_seq:        0,
         }
     }
 

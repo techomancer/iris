@@ -41,6 +41,8 @@ pub trait Renderer: Send {
     fn switch_compositor(&mut self, _use_gl: bool) -> &'static str { "sw" }
     /// Return a short status string: "compositor=gl shader=integer" etc.
     fn compositor_status(&self) -> String { "compositor=sw shader=n/a".to_string() }
+    /// Whether the GL compositor is in use, or is about to be.
+    fn gl_compositor(&self) -> bool { false }
 }
 
 pub const REX3_SIZE: u32 = 0x2000; // 8KB
@@ -1471,6 +1473,12 @@ pub struct Rex3 {
     pub screenshot_pending: AtomicBool,
     /// Monotonically incrementing screenshot counter for unique filenames.
     pub screenshot_counter: AtomicU32,
+    /// One-shot "compose the next frame into `screen.rgba`" (no file), for
+    /// the CI socket and the monitor's `screen` commands.
+    frame_request: AtomicBool,
+    /// Frame consumers (VNC) that want `screen.rgba` kept current; while
+    /// non-zero every full frame is read back and the compositor is software.
+    capture_users: AtomicUsize,
     /// Atomic shadow of MipsCore::count_hz — updated by CPU thread, read by refresh thread.
     /// Wrapped in Mutex so machine.rs can swap in the real Arc from MipsCore after construction.
     #[cfg(feature = "developer")]
@@ -1631,6 +1639,8 @@ impl Rex3 {
             show_disp_debug: AtomicBool::new(false),
             screenshot_pending: AtomicBool::new(false),
             screenshot_counter: AtomicU32::new(0),
+            frame_request: AtomicBool::new(false),
+            capture_users: AtomicUsize::new(0),
             #[cfg(feature = "developer")]
             count_hz_atomic: Mutex::new(Arc::new(AtomicU64::new(crate::cpu::mips_core::DEFAULT_COUNT_HZ))),
         }
@@ -2958,6 +2968,12 @@ impl Rex3 {
         let mut last_topscan: usize = usize::MAX;
         let mut frames_since_render: u32 = u32::MAX;
         let mut full_presents: u32 = 0;
+        // Composes `screen.rgba` when a frame is wanted and no front-end
+        // renderer is installed (`--ci`); made on first use.
+        let mut capture_compositor: Option<crate::compositor::SwCompositor> = None;
+        // While capture forces the renderer onto the software compositor:
+        // whether it used GL before, to switch back when capture ends.
+        let mut restore_gl: Option<bool> = None;
 
         while self.running.load(Ordering::Relaxed) {
             let start = std::time::Instant::now();
@@ -3052,6 +3068,7 @@ impl Rex3 {
                 || dbg_overlay
                 || topscan != last_topscan
                 || self.screenshot_pending.load(Ordering::Relaxed)
+                || self.frame_request.load(Ordering::Relaxed)
                 || frames_since_render >= IDLE_HEARTBEAT_FRAMES;
 
             if should_render {
@@ -3064,7 +3081,8 @@ impl Rex3 {
                     && !fb_was_dirty
                     && !palette_dirty
                     && !dbg_overlay
-                    && !self.screenshot_pending.load(Ordering::Relaxed);
+                    && !self.screenshot_pending.load(Ordering::Relaxed)
+                    && !self.frame_request.load(Ordering::Relaxed);
 
                 // Push debug state into overlay
                 overlay.show_cmap       = self.show_cmap.load(Ordering::Relaxed);
@@ -3098,6 +3116,12 @@ impl Rex3 {
 
                 // Screenshot: grab pixels from the compositor before presenting.
                 let take_screenshot = self.screenshot_pending.swap(false, Ordering::Relaxed);
+                // Frame consumers: a one-shot request, or capture (VNC) on
+                // every full frame. Heartbeats change nothing in the picture.
+                let capture = self.capture_users.load(Ordering::Relaxed) > 0;
+                let want_frame = self.frame_request.load(Ordering::Relaxed)
+                    || (capture && !screen.status_bar_only);
+                let need_readback = take_screenshot || want_frame;
 
                 // Assert VBLANK: device state is now copied into screen caches, so
                 // the CPU gets the maximum window to react before the next refresh.
@@ -3125,17 +3149,45 @@ impl Rex3 {
                         crate::pf_scope!(crate::perfetto::events::REX3_PRESENT);
                         self.diag.fetch_or(Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
                         let borrow = screen.fb_borrowed;
+                        // Capture reads every frame back: keep it a slice copy
+                        // out of the software compositor, never a GL readback.
+                        if capture {
+                            restore_gl.get_or_insert_with(|| r.gl_compositor());
+                            r.switch_compositor(false);
+                        } else if let Some(gl) = restore_gl.take() {
+                            if gl {
+                                r.switch_compositor(true);
+                            }
+                        }
                         r.present(
                             &mut *screen,
                             &mut overlay,
                             &mut status_bar,
                             &mut sbtex,
                             &bar_stats,
-                            take_screenshot,
+                            need_readback,
                             if borrow { Some(&**fb_rgb) } else { None },
                             if borrow { Some(&**fb_aux) } else { None },
                         );
                         self.diag.fetch_and(!Self::DIAG_LOOP_GL_RENDER, Ordering::Relaxed);
+                    } else if need_readback {
+                        // No front-end (`--ci`): compose the guest screen here.
+                        // No status bar or overlay: this is the guest's screen.
+                        let comp = capture_compositor.get_or_insert_with(crate::compositor::SwCompositor::new);
+                        let borrow = screen.fb_borrowed;
+                        comp.compose_pixels(&screen.compositor_source_from(
+                            if borrow { Some(&**fb_rgb) } else { None },
+                            if borrow { Some(&**fb_aux) } else { None },
+                        ));
+                        let (w, h) = (screen.width, screen.height);
+                        let px = comp.pixels();
+                        for y in 0..h {
+                            let row = y * crate::disp::FB_STRIDE;
+                            screen.rgba[row..row + w].copy_from_slice(&px[row..row + w]);
+                        }
+                    }
+                    if need_readback {
+                        screen.frame_seq = screen.frame_seq.wrapping_add(1);
                     }
 
                     if !screen.status_bar_only {
@@ -3157,6 +3209,9 @@ impl Rex3 {
                     }
                 }
 
+                // Cleared after the copy above, under the screen lock, so a
+                // waiter that sees it clear then reads the finished frame.
+                self.frame_request.store(false, Ordering::Relaxed);
                 self.diag.fetch_and(!(Self::DIAG_LOCK_SCREEN | Self::DIAG_LOCK_RENDERER), Ordering::Relaxed);
             } else {
                 // Nothing visible changed — skip the full refresh + GL upload and
@@ -4001,6 +4056,9 @@ impl Device for Rex3 {
                 Some("sw") => false,
                 _ => return Err("Usage: disp compositor <gl|sw>".to_string()),
             };
+            if use_gl && self.capture_users.load(Ordering::Relaxed) > 0 {
+                return Err("the VNC server needs the software compositor while it runs".to_string());
+            }
             let active = if let Some(renderer) = self.renderer.lock().as_mut() {
                 renderer.switch_compositor(use_gl)
             } else {
@@ -4878,6 +4936,49 @@ impl crate::gfx_display::GfxDisplay for Rex3 {
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn screenshot_pending(&self) -> bool { self.screenshot_pending.load(Ordering::Relaxed) }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { self.cycles.get() }
+    fn request_frame(&self) { self.frame_request.store(true, Ordering::Relaxed); }
+    fn frame_pending(&self) -> bool { self.frame_request.load(Ordering::Relaxed) }
+    fn set_capture(&self, on: bool) {
+        if on {
+            self.capture_users.fetch_add(1, Ordering::Relaxed);
+            // Repaint at once so the new consumer gets a frame.
+            self.fb_dirty.store(true, Ordering::Release);
+        } else {
+            let _ = self.capture_users.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        }
+    }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        use crate::dev::ng1::vc2::{VC2_REG_CURRENT_CURSOR_X, VC2_REG_CURSOR_Y_LOC,
+            VC2_REG_CURSOR_ENTRY_PTR, VC2_REG_DISPLAY_CONTROL, VC2_CTRL_CURSOR_EN, VC2_CTRL_CURSOR_SIZE};
+        let x_adjust = self.screen.lock().cursor_x_adjust;
+        let vc2 = self.vc2.lock();
+        let ctrl = vc2.regs[VC2_REG_DISPLAY_CONTROL as usize];
+        if ctrl & VC2_CTRL_CURSOR_EN == 0 {
+            return None;
+        }
+        let entry = vc2.regs[VC2_REG_CURSOR_ENTRY_PTR as usize] as usize;
+        let ram = &vc2.ram;
+        let word = |a: usize| ram.get(a).copied().unwrap_or(0) as u64;
+        // The same glyph layout the compositor draws (compositor.rs).
+        let (size, mask): (usize, Vec<u64>) = if ctrl & VC2_CTRL_CURSOR_SIZE != 0 {
+            (64, (0..64).map(|y| (0..4).fold(0u64, |m, w| {
+                m | (word(entry + y * 4 + w).reverse_bits() >> 48) << (w * 16)
+            })).collect())
+        } else {
+            (32, (0..32).map(|y| (0..2).fold(0u64, |m, w| {
+                let a = entry + y * 2 + w;
+                m | ((word(a) | word(a + 64)).reverse_bits() >> 48) << (w * 16)
+            })).collect())
+        };
+        Some(crate::gfx_display::HwCursor {
+            // The compositor latches Y at retrace; the live location register
+            // is where it will be drawn next.
+            x: vc2.regs[VC2_REG_CURRENT_CURSOR_X as usize] as i32 - 31 + x_adjust,
+            y: vc2.regs[VC2_REG_CURSOR_Y_LOC as usize] as i32 - 31,
+            size,
+            mask,
+        })
+    }
 }
 
 impl Resettable for Rex3 {

@@ -1,6 +1,8 @@
 import asyncio
+import os
 import sys
-from mcp.server.fastmcp import FastMCP
+import tempfile
+from mcp.server.fastmcp import FastMCP, Image
 
 # Initialize FastMCP server
 mcp = FastMCP("iris-monitor")
@@ -271,6 +273,90 @@ async def undo(count: int = 1) -> str:
 async def traceback(count: int = 10) -> str:
     """Show execution traceback (history of executed instructions)."""
     return await client.send_command(f"dt {count}")
+
+# ---- The guest's screen, pointer and keyboard (any board) ----------------
+# These wrap the monitor's `screen`, `ptr` and `key` commands. Coordinates are
+# screen pixels, as in a screenshot. The pointer is steered onto the target
+# by reading back the hardware cursor, so X's acceleration does not matter.
+
+_shot_dir = tempfile.mkdtemp(prefix="iris-mcp-")
+
+@mcp.tool()
+async def screenshot(x: int = 0, y: int = 0, width: int = 0, height: int = 0, max_width: int = 0) -> Image:
+    """A PNG of the guest's screen as the board composes it (no host status
+    bar). Optionally cropped to x, y, width, height, and scaled down to
+    max_width (needs Pillow). Coordinates in the image are screen pixels
+    unless scaled."""
+    path = os.path.join(_shot_dir, "shot.png")
+    crop = f" {x} {y} {width} {height}" if width and height else ""
+    out = await client.send_command(f"screen shot {path}{crop}")
+    if not out.startswith("saved"):
+        raise RuntimeError(out)
+    if max_width:
+        try:
+            from PIL import Image as PILImage
+            im = PILImage.open(path)
+            if im.width > max_width:
+                im.resize((max_width, im.height * max_width // im.width)).save(path)
+        except ImportError:
+            pass
+    with open(path, "rb") as f:
+        return Image(data=f.read(), format="png")
+
+@mcp.tool()
+async def screen_info() -> str:
+    """Screen size, hardware cursor and pointer position, whether the guest
+    has enabled the mouse, and buttons held."""
+    return await client.send_command("screen info")
+
+@mcp.tool()
+async def screen_pixel(x: int, y: int) -> str:
+    """The colour (rrggbb) of one screen pixel."""
+    return await client.send_command(f"screen pix {x} {y}")
+
+@mcp.tool()
+async def wait_screen(quiet_ms: int = 500, timeout_ms: int = 10000) -> str:
+    """Wait until the screen stops changing for quiet_ms (an app finished
+    drawing, a window opened), at most timeout_ms."""
+    return await client.send_command(f"screen wait {quiet_ms} {timeout_ms}")
+
+@mcp.tool()
+async def click(x: int, y: int, button: str = "left", count: int = 1) -> str:
+    """Move the pointer to screen pixel (x, y) and click. button: left,
+    middle or right (IRIX: right opens the toolchest/root menus, middle
+    pastes/moves). count 2 for a double click."""
+    return await client.send_command(f"ptr click {x} {y} {button} {count}")
+
+@mcp.tool()
+async def move_pointer(x: int, y: int) -> str:
+    """Move the pointer to screen pixel (x, y) without clicking."""
+    return await client.send_command(f"ptr move {x} {y}")
+
+@mcp.tool()
+async def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> str:
+    """Press button at (x1, y1), move to (x2, y2), release."""
+    return await client.send_command(f"ptr drag {x1} {y1} {x2} {y2} {button}")
+
+@mcp.tool()
+async def type_text(text: str) -> str:
+    """Type text on the guest keyboard (US layout, ASCII; newline is Enter).
+    Runs of spaces are typed as one."""
+    out = []
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if line:
+            out.append(await client.send_command(f"key type {line}"))
+        if i < len(lines) - 1:
+            out.append(await client.send_command("key Return"))
+    return "\n".join(out)
+
+@mcp.tool()
+async def press_key(keys: str, action: str = "") -> str:
+    """Press a key or chord: 'Return', 'Escape', 'F1', 'ctrl+c',
+    'ctrl+alt+Delete', 'Up'. X keysym names and short aliases (ctrl, alt,
+    shift, enter, esc, tab, bs, del, pgup...). action: '' to press and
+    release, 'down' or 'up' to hold or let go."""
+    return await client.send_command(f"key {keys} {action}".strip())
 
 if __name__ == "__main__":
     mcp.run()

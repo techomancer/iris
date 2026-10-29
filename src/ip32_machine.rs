@@ -403,7 +403,7 @@ impl O2Machine {
         }
         // The shared monitor, as the other machines have it: the CPU's
         // commands (registers, breakpoints, memory) and the O2's devices'.
-        let mut monitor = crate::monitor::Monitor::new();
+        let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
         monitor.register_device(cpu.clone().as_device());
         monitor.register_device(bus.clone());
@@ -920,6 +920,7 @@ impl Workstation for O2Machine {
 
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Some(O2Machine::get_display(self)) }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { O2Machine::get_ps2(self) }
+    fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }
     fn get_cpu_debug(&self) -> Arc<dyn crate::gdb_stub::CpuDebug> { self.cpu.clone().debug_adapter() }
     fn fasttick_count(&self) -> Arc<std::sync::atomic::AtomicU64> { self.cpu.fasttick_count() }
@@ -1006,6 +1007,7 @@ impl O2Display {
                         screen.rgba[y * stride + x] = v;
                     }
                 }
+                screen.frame_seq = screen.frame_seq.wrapping_add(1);
                 screen.prebuilt = true;
                 screen.width = w;
                 screen.height = h;
@@ -1063,6 +1065,10 @@ impl crate::gfx_display::GfxDisplay for O2Display {
     }
     fn cycles(&self) -> CyclesPtr {
         self.cycles.clone()
+    }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        let (x, y, mask) = self.bus.gbe.cursor()?;
+        Some(crate::gfx_display::HwCursor { x, y, size: 32, mask })
     }
 }
 

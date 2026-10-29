@@ -284,6 +284,8 @@ toml = "1.0.3"
 postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
 png = "0.18"
+# The VNC server's ZRLE encoding (zlib).
+flate2 = "1"
 parking_lot = "0.12"
 spin = "0.9"
 # rfd >= 0.16 dropped the async-std/tokio runtime features: `xdg-portal` now

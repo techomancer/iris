@@ -98,6 +98,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 
 | Note | Kind | Title |
 |---|---|---|
+| [empty-gio-slot-reads-bus-error.md](devices/empty-gio-slot-reads-bus-error.md) | rule | Reads of an empty GIO slot end in a bus error (ABORT_EN); all ones made the PROM poll a phantom Newport 200 000 times headless |
 | [cpal-alsa-busy-poll.md](devices/cpal-alsa-busy-poll.md) | rule | cpal's ALSA backend can spin a core: `[audio] host = "pulseaudio"` |
 | [decode-table-is-host-mapped.md](devices/decode-table-is-host-mapped.md) | rule | The physical decode table is a sparse host mapping over 40 bits: change it only through `fill`, set the default first, compare entries with `entry_eq` |
 | [mc-decodes-32-physical-bits.md](devices/mc-decodes-32-physical-bits.md) | rule | Indy/Indigo2/O2 decode 32 physical bits; IRIX PTE software bits reach PA[35:32]; fold with `MipsExecutor::phys_mask`, never decode them |
@@ -170,6 +171,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 
 | Note | Kind | Title |
 |---|---|---|
+| [cursor-drawn-3px-right-of-x-pointer.md](rex3/cursor-drawn-3px-right-of-x-pointer.md) | open | Newport draws the hardware cursor 3 px right of the X pointer (measured by corner pinning) |
 | [alphahost-fields-and-aline-alpha.md](rex3/alphahost-fields-and-aline-alpha.md) | rule | REX3 source alpha: host fields and antialiased lines |
 | [batched-hostrw-in-the-jit.md](rex3/batched-hostrw-in-the-jit.md) | rule | Batched HOSTRW in the REX3 JIT — and how the equivalence test lied twice |
 | [blendalpha-and-alpha-blending.md](rex3/blendalpha-and-alpha-blending.md) | rule | REX3 BLENDALPHA: what it selects, and why the `blast` billboard exposes it |
@@ -272,6 +274,15 @@ Host GL pass-through for guest GL programs (`iris-hostgl`).
 | [machine-profile-vs-guest-ip22.md](gui/machine-profile-vs-guest-ip22.md) | design | Machine profile vs guest "IP22" in Software Manager |
 | [windows-silent-exit-0xc000041d.md](gui/windows-silent-exit-0xc000041d.md) | rule | Windows: CLI vanishes with exit 0xC000041D and no message |
 | [winit-window-calls-must-be-on-event-thread.md](gui/winit-window-calls-must-be-on-event-thread.md) | rule | Window methods must only be called on the event-loop thread (Windows crash) |
+
+## vnc/
+
+The VNC server, the host input layer (`screen`/`ptr`/`key`) and pointer steering.
+
+| Note | Kind | Title |
+|---|---|---|
+| [pointer-steering-and-hotspots.md](vnc/pointer-steering-and-hotspots.md) | design | Steering the relative mouse by the hardware cursor: X's acceleration curve, hotspots from corner pinning, busy guests |
+| [frame-capture-and-damage.md](vnc/frame-capture-and-damage.md) | design | What VNC reads (rgba + frame_seq), Newport capture and forced SW compositor, tile damage |
 
 ## macos/
 
@@ -387,3 +398,4 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 | [networking-tab-redesign.md](plans/networking-tab-redesign.md) | plan | Networking tab redesign — design & plan |
 | [nfsudp-plan.md](plans/nfsudp-plan.md) | plan | Plan: in-core NFSv3-over-UDP server (`src/net/nfsudp.rs`) |
 | [pcap-release-plan.md](plans/pcap-release-plan.md) | plan | PCAP release + elevation plan |
+| [vnc-server-plan.md](plans/vnc-server-plan.md) | plan | Built-in VNC server: board-agnostic frame tap, damage from frame diffs, pointer steered by the HW cursor, monitor/MCP screenshot + click for agents |

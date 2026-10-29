@@ -91,9 +91,11 @@ tools/irix-sh.py run 'cd /tmp/gltest && ./glprim <options> --hold 4000'
 ```
 
 Run the captures while `--hold` keeps the window up (background the guest
-command with `&` if you need to sample during the hold). Newport has no
-`rex pix`: use `rex fbdump DIR` and read the PNG, `xgetpix X Y [W H]` in the
-guest, or `iris-ci screenshot`.
+command with `&` if you need to sample during the hold). On every board,
+`screen pix <x> <y>` reads one composed display pixel and `screen shot
+<file.png> [x y w h]` saves the composed screen (or a crop); Newport has no
+`rex pix`, so use these there. The MCP `screenshot` tool returns the image
+directly.
 
 glprim prints its **real window origin** (`window origin OX,OY size WxH`);
 the window manager moves windows. GL window pixel (gx, gy) is display pixel
@@ -164,11 +166,24 @@ Time replays on the host instead.
 
 ## 8. Driving input
 
-- **Monitor, any PS/2 machine**: `ps2 mouse <dx> <dy> [buttons]` (1 left,
-  2 right, 4 middle; send the press, then a packet with 0 to release),
-  `ps2 type <text>`, `ps2 enter`, `ps2 esc`. Moves are relative and go
-  through X pointer acceleration: push into the top-left corner with a few
-  large negative moves, then step to the target in small ones.
+- **Monitor, any machine and board**: `ptr click <x> <y> [left|middle|right]
+  [count]`, `ptr move`, `ptr drag`, `ptr down|up`, `key <chord>` (`Return`,
+  `ctrl+c`, `F1`), `key type <text>`, `screen wait [quiet_ms]` (until the
+  screen settles), `screen info` (where the pointer is, whether the guest
+  has enabled the mouse). Coordinates are screen pixels. `ptr` steers the
+  relative PS/2 mouse by reading back the hardware cursor, so X's
+  acceleration does not matter; the first move pins the pointer in the
+  top-left corner once to learn the cursor's hotspot. MCP: `click`, `drag`,
+  `type_text`, `press_key`, `wait_screen`.
+- Windows on the IRIX desktop take keyboard focus on a click, not when the
+  pointer enters them: click into a winterm before `key type`.
+- `ptr` errors with "the hardware cursor is off" before X is up, and "the
+  guest is not reading the mouse" while it is busy (desktop start-up):
+  `screen wait`, then retry.
+- Raw PS/2 is still there: `ps2 mouse <dx> <dy> [buttons]`, `ps2 type`.
+- **VNC**: start iris with `--vnc` to watch or drive the guest from a VNC
+  viewer; `tools/vnc-check.py shot|watch|click|key` exercises the server
+  from scripts.
 - **In the guest, XTest**: `xclick NAME [BUTTON [X Y]]` or `xclick NAME key
   KEYSYM` clicks at exact window coordinates in the first window whose name
   starts with NAME; `xresize NAME W1 H1 W2 H2 [COUNT] [DELAY_MS]` resizes

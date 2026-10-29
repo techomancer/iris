@@ -922,7 +922,7 @@ impl Machine {
         let devlog = crate::devlog::init_devlog();
 
         // Setup Monitor
-        let mut monitor = Monitor::new();
+        let monitor = Monitor::new();
         monitor.register_device(devlog.clone());
         monitor.register_device(cpu.clone());
         monitor.register_device(Arc::new(mc.clone()));
@@ -2099,6 +2099,7 @@ impl Workstation for Machine {
     fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display(self) }
     fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display_head1(self) }
     fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { Machine::get_ps2(self) }
+    fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>) { self.monitor.register_device(device); }
     fn get_timer_manager(&self) -> Arc<TimerManager> { Machine::get_timer_manager(self) }
     fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> { Machine::get_cpu_debug(self) }
     fn fasttick_count(&self) -> Arc<AtomicU64> { Machine::fasttick_count(self) }

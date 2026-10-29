@@ -60,6 +60,7 @@ found or what to watch out for while changing code, it goes in `clanker/`.
 | `clanker/INDEX.md` | categorized index of every note |
 | `clanker/cpu/`, `jitv2/` | CPU architecture findings; the MIPS JIT |
 | `clanker/devices/`, `scsi/`, `net/`, `video/` | device models, storage, the NAT stack and its services, VINO/IndyCam |
+| `clanker/vnc/` | the VNC server, the host input layer (`screen`/`ptr`/`key`) and pointer steering |
 | `clanker/rex3/`, `gr2/`, `mgras/`, `odyssey/`, `hostgl/` | graphics boards and host GL (`odyssey/` is references only) |
 | `clanker/gui/`, `macos/` | front-ends and platform packaging |
 | `clanker/snapshot/`, `perf/`, `testing/`, `build/` | snapshots and `iris-ci`, host performance, test harnesses, builds |

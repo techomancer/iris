@@ -404,6 +404,34 @@ in the `irix-gfx-loop` skill (`clanker/skills/irix-gfx-loop/SKILL.md`).
 `iris-ci screenshot` captures the composed screen from any board, also
 headless.
 
+**Screen, pointer and keyboard (any board)**
+
+These work the same on Newport, GR2, IMPACT and the O2, with a window, with
+`--ci`, or alongside VNC viewers. Coordinates are screen pixels as a
+screenshot shows them (0,0 top-left). The guest's mouse is relative and X
+accelerates it, so `ptr` steers: it sends a move, reads back where the
+board's hardware cursor went, and corrects until the pointer is on the
+target. The first `ptr` move pins the pointer in the top-left corner once,
+to learn the cursor's hotspot exactly.
+
+| Command | Description |
+|---|---|
+| `screen info` | Size, hardware cursor, pointer position, whether the guest has enabled the mouse, buttons held |
+| `screen shot <file.png> [x y w h]` | The composed screen as PNG (no host status bar), optionally cropped |
+| `screen pix <x> <y>` | One pixel, `rrggbb` |
+| `screen wait [quiet_ms] [timeout_ms]` | Wait until the screen has not changed for `quiet_ms` (default 500, at most 10000 ms) |
+| `screen cursor` | The cursor glyph as text, with its hotspot |
+| `ptr pos` | Where the pointer is |
+| `ptr move <x> <y>` | Put the pointer on a pixel |
+| `ptr click <x> <y> [left\|middle\|right] [count]` | Move, then click (`count` 2 for a double click) |
+| `ptr down\|up [button]` | Press or release a button where the pointer is |
+| `ptr drag <x1> <y1> <x2> <y2> [button]` | Press at one point, release at the other |
+| `ptr rel <dx> <dy>` | Raw relative motion, as a mouse sends it |
+| `ptr calibrate` | Pin the pointer in the top-left corner and learn the current cursor's hotspot |
+| `key <name>[+<name>...] [down\|up]` | Press a key or chord (`Return`, `F1`, `ctrl+c`, `ctrl+alt+Delete`): X keysym names, short aliases (`ctrl`, `alt`, `shift`, `enter`, `esc`, `tab`, `bs`, `del`, `pgup`), single characters, or winit names (`KeyA`) |
+| `key type <text>` | Type ASCII text on a US layout |
+| `key names` | Every key name `key` accepts |
+
 ### Hardware devices
 
 | Command | Description |
@@ -659,11 +687,19 @@ Register it with your client, for example in `.mcp.json`:
 | `translate_address(address)`, `dump_tlb()` | `translate`, `tlb dump` |
 | `lookup_symbol(name_or_addr)` | `sym` |
 | `read_eframe(address, layout)`, `kernel_log(size)` | `eframe`, `putbuf` |
+| `screenshot(x, y, width, height, max_width)` (returns the image) | `screen shot` |
+| `screen_info()`, `screen_pixel(x, y)`, `wait_screen(quiet_ms, timeout_ms)` | `screen info`, `screen pix`, `screen wait` |
+| `click(x, y, button, count)`, `move_pointer(x, y)`, `drag(x1, y1, x2, y2, button)` | `ptr click`, `ptr move`, `ptr drag` |
+| `type_text(text)`, `press_key(keys, action)` | `key type`, `key` |
 
 Commands without a dedicated tool (graphics, devices, `j2`) go through
 `run_command`.
 
 ## Other introspection
+
+- **VNC**: `--vnc` (or `[vnc] listen`) serves the screen, keyboard and mouse
+  to any VNC viewer, from any board, with a window or under `--ci`. See
+  [HELP.md](HELP.md#vnc).
 
 - **`iris-ci`**: the CI control socket drives a running machine from scripts:
   boot and log in, run guest commands, copy files in and out, screenshots,

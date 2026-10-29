@@ -155,6 +155,9 @@ pub trait Workstation: Send {
     }
     /// The keyboard and mouse the host window types into.
     fn get_ps2(&self) -> Arc<Ps2Controller>;
+    /// Add a host-side command set (the screen, pointer and key commands)
+    /// to this machine's monitor.
+    fn register_monitor_device(&self, device: Arc<dyn crate::traits::Device>);
     fn get_timer_manager(&self) -> Arc<TimerManager>;
     /// The CPU's debug interface, for the GDB stub.
     fn get_cpu_debug(&self) -> Arc<dyn CpuDebug>;

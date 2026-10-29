@@ -105,7 +105,11 @@ tools/irix-sh.py run 'echo root > /etc/autologin' 'touch /etc/autologin.on'
   boot stops at the login window.
 - The session appears about a minute after telnet comes up. Wait until
   `ps -ef | grep 4Dwm` shows the window manager (and `toolchest` for the
-  full desktop), then give it another ~15 s before taking screenshots.
+  full desktop), then `screen wait 2000 60000` on the monitor (returns once
+  the screen has been still for 2 s) before taking screenshots.
+- Without autologin you can log in on the screen itself: `ptr click X Y` on
+  the user's icon in the xdm window, then `key Return` (see `screen`, `ptr`
+  and `key` in debug.md; MCP `screenshot`, `click`, `press_key`).
 - The screen saver blanks the screen after 10 minutes idle and every pixel
   probe then reads black. The desktop re-applies its saver settings after
   login, so run `/usr/bin/X11/xset s off` once the session is up and check

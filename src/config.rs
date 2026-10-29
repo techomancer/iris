@@ -1290,6 +1290,19 @@ impl Default for AudioConfig {
     }
 }
 
+/// The built-in VNC server (`[vnc]` section). Off unless `listen` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VncConfig {
+    /// Address to serve on, `host:port` (a bare port means 127.0.0.1).
+    /// Without a password, keep it on loopback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// Most frames a second sent to a viewer (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fps: Option<u32>,
+}
+
 /// VINO video-in configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VinoConfig {
@@ -1516,6 +1529,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub vino: VinoConfig,
 
+    /// Built-in VNC server (`[vnc]` section).
+    #[serde(default)]
+    pub vnc: VncConfig,
+
     /// Networking backend selection (`[network]` section). Defaults to NAT.
     #[serde(default)]
     pub network: NetworkSection,
@@ -1713,6 +1730,7 @@ impl Default for MachineConfig {
             serial_log: None,
             serial_log_timestamps: Default::default(),
             vino: VinoConfig::default(),
+            vnc: VncConfig::default(),
             network: NetworkSection::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
             lock_aspect_ratio: default_lock_aspect_ratio(),
@@ -2262,6 +2280,12 @@ pub struct Cli {
     #[arg(long = "monitor-port", value_name = "PORT")]
     pub monitor_port: Option<u16>,
 
+    /// Serve the screen, keyboard and mouse over VNC on ADDR (`host:port`,
+    /// or a port on 127.0.0.1; default 127.0.0.1:5900). Works with a
+    /// window, with --ci, and on every graphics board.
+    #[arg(long = "vnc", value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:5900")]
+    pub vnc: Option<String>,
+
     /// Serial channel A (tty2) port on 127.0.0.1 (default 8880).
     #[arg(long = "serial-port-a", value_name = "PORT")]
     pub serial_port_a: Option<u16>,
@@ -2416,6 +2440,7 @@ impl Cli {
 
         if let Some(p) = self.gdb_port { cfg.gdb_port = Some(p); }
         if let Some(p) = self.monitor_port { cfg.monitor_port = Some(p); }
+        if let Some(a) = &self.vnc { cfg.vnc.listen = Some(a.clone()); }
         if let Some(p) = self.serial_port_a { cfg.serial_port_a = Some(p); }
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
         if let Some(k) = self.keyboard { cfg.keyboard = k; }

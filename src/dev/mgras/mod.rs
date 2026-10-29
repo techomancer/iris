@@ -1588,6 +1588,19 @@ impl crate::gfx_display::GfxDisplay for Mgras {
     fn screen(&self) -> &Mutex<crate::disp::Rex3Screen> { &self.screen }
     fn request_screenshot(&self) { self.screenshot_pending.store(true, Ordering::Relaxed); }
     fn cycles(&self) -> crate::cpu::mips_core::CyclesPtr { *self.cycles.lock() }
+    fn hw_cursor(&self) -> Option<crate::gfx_display::HwCursor> {
+        // A racy read of the VC3, as the display thread's snapshot does.
+        let vc3 = &self.front_view().dcb.vc3;
+        let (x, y, size, glyph) = vc3.cursor()?;
+        // The glyph layout `frame.rs` draws: two planes, MSB leftmost.
+        let words_per_row = size / 16;
+        let plane_words = size * words_per_row;
+        let word = |plane: usize, row: usize, w: usize| vc3.sram[(glyph + plane * plane_words + row * words_per_row + w) & 0x7FFF] as u64;
+        let mask = (0..size).map(|row| (0..words_per_row).fold(0u64, |m, w| {
+            m | ((word(0, row, w) | word(1, row, w)).reverse_bits() >> 48) << (w * 16)
+        })).collect();
+        Some(crate::gfx_display::HwCursor { x, y, size, mask })
+    }
 }
 
 impl Device for Mgras {

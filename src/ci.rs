@@ -612,48 +612,15 @@ fn cmd_screenshot(server: &CiServer, args: &Value) -> Response {
         return Response::err("screenshot: missing 'path' arg");
     };
 
-    display.request_screenshot();
-    // The board consumes the request when its refresh thread next renders.
-    // Wait for that (bounded) instead of guessing a frame time; the screen
-    // lock below then waits for that render to finish copying into `rgba`.
-    // Boards that do not consume the request report no pending work and fall
-    // through immediately.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-    while display.screenshot_pending() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-    // Snapshot the framebuffer under the screen lock; unlock before the PNG
-    // encode so the refresh thread isn't blocked during disk I/O.
-    let has_renderer = display.renderer_slot().lock().is_some();
-    let (width, height, rgba_copy) = {
-        let screen = display.screen().lock();
-        let w = screen.width;
-        let h = screen.height;
-        if w == 0 || h == 0 {
-            return Response::err("screenshot: the display has no video mode yet");
-        }
-        let mut out = Vec::with_capacity(w * h);
-        if has_renderer {
-            // The front-end's renderer already composited this frame into
-            // `rgba`; copy the visible window (row stride 2048).
-            for y in 0..h {
-                let base = y * 2048;
-                out.extend_from_slice(&screen.rgba[base..base + w]);
-            }
-        } else {
-            // `--ci` installs no renderer, so nothing has filled `rgba`.
-            // Composite the guest screen here from the caches the refresh
-            // thread just updated. The host status bar and debug overlay are
-            // deliberately absent: this is the guest's screen.
-            let mut compositor = crate::compositor::SwCompositor::new();
-            compositor.compose_pixels(&screen.compositor_source());
-            let pixels = compositor.pixels();
-            for y in 0..h {
-                let base = y * 2048;
-                out.extend_from_slice(&pixels[base..base + w]);
-            }
-        }
-        (w, h, out)
+    // The board composes the next frame into `rgba` (Newport with no
+    // front-end composes in software on its refresh thread). The host
+    // status bar and debug overlay are never in it: this is the guest's
+    // screen.
+    let mut rgba_copy = Vec::new();
+    let Some((width, height, _)) = crate::gfx_display::fresh_frame(
+        &**display, &mut rgba_copy, std::time::Duration::from_millis(250))
+    else {
+        return Response::err("screenshot: the display has no video mode yet");
     };
 
     let mut rgb = Vec::with_capacity(width * height * 3);

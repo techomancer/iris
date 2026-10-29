@@ -631,7 +631,11 @@ impl Renderer for GlRenderer {
             // the GL framebuffer back would only replace it (it came back black).
             if need_readback && !screen.prebuilt {
                 if let Some(pixels) = self.compositor.read_pixels() {
-                    screen.rgba.copy_from_slice(pixels);
+                    // Visible rows only: VNC capture reads every frame back.
+                    for y in 0..height {
+                        let row = y * crate::disp::FB_STRIDE;
+                        screen.rgba[row..row + width].copy_from_slice(&pixels[row..row + width]);
+                    }
                 } else {
                     self.compositor.readback_to_screen(&mut screen.rgba, width, height, gl);
                 }
@@ -719,6 +723,10 @@ impl Renderer for GlRenderer {
         self.current_h     = 0;
         self.current_win_w = 0;
         self.current_win_h = 0;
+    }
+
+    fn gl_compositor(&self) -> bool {
+        self.pending_compositor.unwrap_or(self.use_gl_compositor)
     }
 
     fn compositor_status(&self) -> String {

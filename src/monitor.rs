@@ -45,7 +45,7 @@ impl Monitor {
         *self.bound.lock()
     }
 
-    pub fn register_device(&mut self, device: Arc<dyn Device>) {
+    pub fn register_device(&self, device: Arc<dyn Device>) {
         self.devices.lock().push(device);
     }
 

@@ -109,7 +109,7 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 1_000_000)]
         n: u64,
     },
-    /// Save the REX3 framebuffer to a PNG.
+    /// Save the guest screen (any graphics board) to a PNG.
     Screenshot { path: PathBuf },
 
     /// Send keystrokes to the IRIX serial console.
