@@ -1,10 +1,11 @@
 //! GR2 display thread: vertical retrace, composition, presentation.
 //!
-//! Every ~16.7 ms the thread pulses the retrace line. The IOC latches it until
-//! the host acknowledges: PORT_CONFIG on Indigo2, HPC3_GEN_CONTROL on Indy
-//! (GR2.h "INTERRUPTS"). When something visible changed, or on a periodic
-//! heartbeat for the status bar, it composes VRAM into `screen.fb_rgb`
-//! (`prebuilt`) and presents through the installed renderer.
+//! Every ~16.7 ms the thread composes VRAM into `screen.fb_rgb` (`prebuilt`)
+//! when something visible changed, or on a periodic heartbeat for the status
+//! bar, presents through the installed renderer, and then pulses the retrace
+//! line, so a flip the guest makes in the blank shows from the next frame.
+//! The IOC latches the retrace until the host acknowledges: PORT_CONFIG on
+//! Indigo2, HPC3_GEN_CONTROL on Indy (GR2.h "INTERRUPTS").
 
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -32,16 +33,6 @@ impl Gr2 {
 
         while self.running.load(Ordering::Relaxed) {
             let start = Instant::now();
-
-            // Vertical retrace. The interrupt stays latched in the IOC until
-            // the guest clears it. The vertical status level (EXTIO SG_STAT_0)
-            // is held for the blanking interval (~40 of 1066 lines at 60 Hz),
-            // long enough for a polling CPU to see both edges.
-            if let Some(cb) = self.retrace_cb.lock().clone() {
-                cb(true);
-                thread::sleep(VBLANK);
-                cb(false);
-            }
 
             let dirty = self.dirty.swap(false, Ordering::Acquire);
             let shot = self.screenshot_pending.load(Ordering::Relaxed);
@@ -99,6 +90,20 @@ impl Gr2 {
                 }
             } else {
                 frames_since_render = frames_since_render.saturating_add(1);
+            }
+
+            // Vertical retrace, after the frame is composed: scanout reads
+            // VRAM during the frame, and the guest flips buffers in the
+            // blank. Composed after the pulse, the copy raced the flip and
+            // the next frame's drawing into the buffer just shown. The
+            // interrupt stays latched in the IOC until the guest clears it.
+            // The vertical status level (EXTIO SG_STAT_0) is held for the
+            // blanking interval (~40 of 1066 lines at 60 Hz), long enough
+            // for a polling CPU to see both edges.
+            if let Some(cb) = self.retrace_cb.lock().clone() {
+                cb(true);
+                thread::sleep(VBLANK);
+                cb(false);
             }
 
             self.trace_flush(false);
