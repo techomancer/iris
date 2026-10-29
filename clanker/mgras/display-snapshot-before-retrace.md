@@ -20,3 +20,7 @@ status 700 us, then compose) and now composes first too. REX3 was already
 right: it copies the framebuffer and the XMAP/VC2 state into the screen
 caches, then raises VBLANK; it only presents the live framebuffer when no
 pixel changed since the last copy.
+
+This was not the whole Octane tearing: the main cause was the swap being
+reported before the raster engines finished the frame
+(`swap-waits-for-raster.md`).

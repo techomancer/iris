@@ -375,6 +375,8 @@ pub trait Hq3Sink {
     /// A GL batch starts (true) or ends: the RSS saves / restores the raster
     /// registers the batch loads.
     fn gl_bracket(&mut self, _enter: bool) {}
+    /// Wait until the raster engines have drawn everything queued so far.
+    fn finish_raster(&mut self) {}
     /// System memory for DMA, if connected.
     fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>>;
     /// Something not modelled yet (reported once).
@@ -1021,9 +1023,18 @@ impl Hq3Engine {
                 }
             }
         } else if cmd == cmd::CP_SCHEDULE_SWAP {
-            // No retrace wait: the swap is reported done at once. The GE's
-            // front and back trade places for the drawing that follows.
+            // No retrace wait: the swap is reported as soon as the frame
+            // before it is drawn. The GE's front and back trade places for
+            // the drawing that follows.
             self.gl.swap_buffers(sink);
+            // The Octane kernel flips at the next retrace once this flag is
+            // up, without checking that the board is idle (it flips on a
+            // STATUS of HQ idle, board busy): behind the HQ the board's
+            // pipe is shallow. Our raster queue is deep, so the frame must
+            // be finished first or the flip shows it half drawn. The
+            // Indigo2 kernel drains the FIFO before the swap, so this
+            // costs it nothing.
+            sink.finish_raster();
             self.stats.swaps += 1;
             self.stats.cp_tokens[cmd as usize] += 1;
             sink.set_flags(host::FLAG_CP0);

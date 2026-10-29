@@ -123,10 +123,21 @@ hashes are given where a change is easiest to understand by reading the commit.
   for an idle board by counting polls of a status register, and a context
   switch behind long drawing ran out of polls. A status poll of a busy board
   now gives it up to 100 µs first, so the wait is counted in work done.
-- **Double-buffered GL on IMPACT no longer tears** (the Indigo2's too).
-  The display took its frame just after the retrace, racing the kernel's
-  buffer flip and the next frame's drawing; it now takes it just before,
-  as scanout does.
+- **Double-buffered GL on the Octane's IMPACT no longer shows half-drawn
+  frames** (the octahedra / `bongo` saver flickered and tore). The Octane
+  kernel flips buffers at the retrace after the swap is reported, without
+  waiting for the board to go idle; the swap was reported when the command
+  processor reached it, while the raster engine was still drawing the
+  frame. It is now reported once the frame is drawn. The Indigo2 kernel
+  drains the board before each swap, so it never showed this. The display
+  also takes its frame just before the retrace now, as scanout does, so a
+  flip shows from the next frame.
+- **Perfetto traces on the Octane and the O2** (`--features perfetto`):
+  the `perfetto` monitor command was registered only on the Indy and
+  Indigo2. IMPACT traces now show frame capture and present, STATUS reads,
+  flags, window-ID modes and VC3 tables, the draw bank, the interrupt lines
+  and, on the Octane, the HEART packets and acknowledgements
+  (docs/perfetto.md).
 - **The Octane takes the textured IMPACT boards.** `[octane] graphics =
   "highimpact"` is the SI with texture option and `"maximpact"` the MXI
   (two GEs, two REs), with the board version bytes the IP30 kernel decodes;

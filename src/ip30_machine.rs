@@ -304,6 +304,11 @@ impl OctaneMachine {
         }
         // `ps2 type` and friends: the keyboard and mouse from the monitor.
         monitor.register_device(ioc3.ps2());
+        #[cfg(feature = "perfetto")]
+        {
+            crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
+            monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
+        }
         heart.register_locks();
         xbow.register_locks();
         bridge.register_locks();
@@ -510,6 +515,9 @@ impl OctaneMachine {
         for d in self.devices().iter().rev() {
             d.stop();
         }
+        // The guest clock points into this machine's CPU core.
+        #[cfg(feature = "perfetto")]
+        crate::perfetto::set_guest_cycles(None);
         if self.lifecycle != crate::machine_state::GuestState::Idle {
             self.lifecycle = crate::machine_state::GuestState::Halted;
         }

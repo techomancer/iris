@@ -2425,6 +2425,7 @@ impl Gl {
     /// GE does not see, and every other frame then lands in the shown
     /// buffer.
     pub fn set_draw_bank(&mut self, bank: u32, sink: &mut dyn Hq3Sink) {
+        crate::pf_instant!(crate::perfetto::events::MGRAS_DRAW_BANK, bank);
         self.end_raster(sink);
         self.swapped = (bank & 1 == 0) as u32;
         self.banks_known = 1;

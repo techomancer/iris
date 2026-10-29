@@ -169,7 +169,40 @@ pub static MGRAS_DMA_TO_HOST: EventDef = EventDef::new("host dma -> host", cat::
 pub static MGRAS_SWAP: EventDef = EventDef::new("schedule swap", cat::GFX).on_track("IMPACT display").in_group(GFX_GROUP);
 /// The kernel's BUF_SELECT write: the flip itself (arg: value).
 pub static MGRAS_BUF_SELECT: EventDef = EventDef::new("buf select", cat::GFX).on_track("IMPACT display").in_group(GFX_GROUP).with_arg("val");
+/// SCHEDULE_SWAP waiting for the raster engines to finish the frame
+/// before the swap is reported (arg: raster entries queued).
+pub static MGRAS_SWAP_WAIT: EventDef = EventDef::new("swap waits raster", cat::GFX).on_track("IMPACT swap wait").in_group(GFX_GROUP).with_arg("rss_queued");
 pub static MGRAS_RETRACE: EventDef = EventDef::new("retrace", cat::GFX).on_track("IMPACT display").in_group(GFX_GROUP);
+/// The refresh thread copying the shown frame out of the framebuffer
+/// (snapshot and compose), and handing it to the window.
+pub static MGRAS_CAPTURE: EventDef = EventDef::new("frame capture", cat::GFX).on_track("IMPACT capture").in_group(GFX_GROUP);
+pub static MGRAS_PRESENT: EventDef = EventDef::new("present", cat::GFX).on_track("IMPACT present").in_group(GFX_GROUP);
+/// An XMAP display mode written: the mode of one window ID, main or
+/// overlay (arg: register << 40 | index << 32 | value).
+pub static MGRAS_XMAP_MODE: EventDef = EventDef::new("xmap mode write", cat::GFX).on_track("IMPACT display").in_group(GFX_GROUP).with_arg("reg<<40|index<<32|val");
+/// A VC3 register write (arg: index << 16 | value) and a VC3 SRAM write,
+/// the window-ID tables among others (arg: address << 16 | value).
+pub static MGRAS_VC3_WRITE: EventDef = EventDef::new("vc3 write", cat::GFX).on_track("IMPACT vc3").in_group(GFX_GROUP).with_arg("index<<16|val");
+pub static MGRAS_VC3_SRAM: EventDef = EventDef::new("vc3 sram write", cat::GFX).on_track("IMPACT vc3").in_group(GFX_GROUP).with_arg("addr<<16|val");
+/// The VC3 current-line register read (arg: the line answered).
+pub static MGRAS_VC3_LINE: EventDef = EventDef::new("vc3 line read", cat::GFX).on_track("IMPACT vc3").in_group(GFX_GROUP).with_arg("line");
+/// A STATUS read (arg: the value; bit 2 vertical blank).
+pub static MGRAS_STATUS_READ: EventDef = EventDef::new("status read", cat::GFX).on_track("IMPACT status").in_group(GFX_GROUP).with_arg("val");
+/// Flags raised by the engines or a host SET_FLAGS write (arg: raster
+/// entries still queued << 32 | bits), and a host CLEAR_FLAGS write (arg:
+/// bits).
+pub static MGRAS_FLAG_SET: EventDef = EventDef::new("flags set", cat::GFX).on_track("IMPACT flags").in_group(GFX_GROUP).with_arg("rss_queued<<32|bits");
+pub static MGRAS_FLAG_CLEAR: EventDef = EventDef::new("flags cleared", cat::GFX).on_track("IMPACT flags").in_group(GFX_GROUP).with_arg("bits");
+/// The bank GL draws into, from VALIDATE_BANKS or a context image (arg:
+/// bank, 1 = B).
+pub static MGRAS_DRAW_BANK: EventDef = EventDef::new("draw bank", cat::GFX).on_track("IMPACT display").in_group(GFX_GROUP).with_arg("bank");
+/// One of the board's interrupt lines changed (arg: line << 1 | level; 0
+/// FIFO, 1 general, 2 retrace).
+pub static MGRAS_IRQ_LINE: EventDef = EventDef::new("irq line", cat::GFX).on_track("IMPACT irq").in_group(GFX_GROUP).with_arg("line<<1|level");
+/// Octane: an interrupt packet to HEART (arg: vector << 1 | set), and the
+/// kernel's acknowledgements (arg: offset << 32 | bits written).
+pub static MGRAS_HEART_PACKET: EventDef = EventDef::new("heart packet", cat::GFX).on_track("IMPACT irq").in_group(GFX_GROUP).with_arg("vector<<1|set");
+pub static MGRAS_HQ4_ACK: EventDef = EventDef::new("hq4 ack", cat::GFX).on_track("IMPACT irq").in_group(GFX_GROUP).with_arg("off<<32|val");
 
 // ── jitv2 ────────────────────────────────────────────────────────────────────
 

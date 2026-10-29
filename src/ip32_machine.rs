@@ -414,6 +414,11 @@ impl O2Machine {
             monitor.register_device(ctl.clone());
         }
         monitor.register_device(Arc::new(O2Control::new(bus.clone())));
+        #[cfg(feature = "perfetto")]
+        {
+            crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
+            monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
+        }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
 
         let (events, event_rx) = std::sync::mpsc::sync_channel(4);
@@ -644,6 +649,9 @@ impl O2Machine {
     pub fn stop(&mut self) {
         self.cpu.clone().as_device().stop();
         self.paused.store(true, Ordering::SeqCst);
+        // The guest clock points into this machine's CPU core.
+        #[cfg(feature = "perfetto")]
+        crate::perfetto::set_guest_cycles(None);
         // After the CPU, so nothing queues more; each finishes the command
         // it is running, so a snapshot finds none half done.
         for ctl in self.bus.scsi.lock().unwrap().iter() {

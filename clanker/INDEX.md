@@ -220,6 +220,7 @@ IMPACT (MGRAS/GR4): HQ3/GE HLE, RSS raster, pixel memory, the raster JIT. Hardwa
 | [ci-copypixels-unloaded-mask.md](mgras/ci-copypixels-unloaded-mask.md) | rule | Colour-index glCopyPixels runs a pipeline whose state is never loaded |
 | [dcb-device-numbers.md](mgras/dcb-device-numbers.md) | design | DCB device numbers: trust the kernel's dcbctrl writes, not header names |
 | [display-snapshot-before-retrace.md](mgras/display-snapshot-before-retrace.md) | rule | Take the IMPACT display frame before the retrace pulse, not after |
+| [swap-waits-for-raster.md](mgras/swap-waits-for-raster.md) | rule | Report SCHEDULE_SWAP only once the raster engines have drawn the frame |
 | [engine-pipeline-performance.md](mgras/engine-pipeline-performance.md) | measure | The CPU -> HQ -> raster pipeline: what made it slow |
 | [eram-state-ideas.md](mgras/eram-state-ideas.md) | open | GE state and ERAM: ideas for later (not built) |
 | [eram-transfers-come-once-per-ge.md](mgras/eram-transfers-come-once-per-ge.md) | rule | ERAM transfers come once per GE11 (Maximum Impact) |

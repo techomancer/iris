@@ -230,6 +230,9 @@ impl Xmap {
             crs => {
                 if crs == xmap::BUF_SELECT {
                     crate::pf_instant!(crate::perfetto::events::MGRAS_BUF_SELECT, d);
+                } else if crs == xmap::MAIN_MODE || crs == xmap::OVERLAY_MODE {
+                    crate::pf_instant!(crate::perfetto::events::MGRAS_XMAP_MODE,
+                        (crs as u64) << 40 | (self.index as u64) << 32 | d as u64);
                 }
                 self.regs.insert(key(crs, self.index), d);
                 self.autoinc(t);
@@ -389,6 +392,7 @@ impl Vc3 {
 
     fn sram_write(&mut self, v: u16) {
         let a = self.regs[VC3_SRAM_POINTER] as usize & 0x7FFF;
+        crate::pf_instant!(crate::perfetto::events::MGRAS_VC3_SRAM, (a as u64) << 16 | v as u64);
         self.sram[a] = v;
         self.regs[VC3_SRAM_POINTER] = self.regs[VC3_SRAM_POINTER].wrapping_add(1);
     }
@@ -406,8 +410,12 @@ impl Vc3 {
             (0, _) => {
                 self.index = (d >> 16) & 0x1F;
                 self.regs[self.index as usize] = d as u16;
+                crate::pf_instant!(crate::perfetto::events::MGRAS_VC3_WRITE, (self.index as u64) << 16 | (d & 0xFFFF) as u64);
             }
-            (1, _) => self.regs[self.index as usize] = d as u16,
+            (1, _) => {
+                self.regs[self.index as usize] = d as u16;
+                crate::pf_instant!(crate::perfetto::events::MGRAS_VC3_WRITE, (self.index as u64) << 16 | (d & 0xFFFF) as u64);
+            }
             (3, 4) => { self.sram_write((d >> 16) as u16); self.sram_write(d as u16); }
             (3, _) => self.sram_write(d as u16),
             _ => {}
@@ -420,6 +428,7 @@ impl Vc3 {
             (1, _) if self.index as usize == VC3_CURRENT_LINE => {
                 // Keep moving so vertical-blank polls terminate.
                 self.line_counter = (self.line_counter + 1) % 1066;
+                crate::pf_instant!(crate::perfetto::events::MGRAS_VC3_LINE, self.line_counter);
                 self.line_counter as u32
             }
             (1, _) => self.regs[self.index as usize] as u32,

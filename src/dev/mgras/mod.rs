@@ -422,7 +422,14 @@ impl Hq3Sink for HqSink<'_> {
     fn gl_bracket(&mut self, enter: bool) {
         self.0.rss_push(if enter { tag::GL_ENTER } else { tag::GL_LEAVE }, 0);
     }
+    fn finish_raster(&mut self) {
+        if !self.0.rss_idle() {
+            crate::pf_scope!(crate::perfetto::events::MGRAS_SWAP_WAIT, self.0.rss_fifo.len());
+            self.0.drain_rss();
+        }
+    }
     fn set_flags(&mut self, bits: u32) {
+        crate::pf_instant!(crate::perfetto::events::MGRAS_FLAG_SET, (self.0.rss_fifo.len() as u64) << 32 | bits as u64);
         self.0.flags.fetch_or(bits, Ordering::AcqRel);
         self.0.refresh_general();
     }
@@ -958,6 +965,7 @@ impl Mgras {
             Line::General => 1,
             Line::Retrace => 2,
         };
+        crate::pf_instant!(crate::perfetto::events::MGRAS_IRQ_LINE, n << 1 | active as usize);
         self.irqs[n].set(active);
     }
 
@@ -1075,6 +1083,7 @@ impl Mgras {
                 if Self::cfifo_low(cfg, level) {
                     v |= host::STATUS_CFIFO_LOW;
                 }
+                crate::pf_instant!(crate::perfetto::events::MGRAS_STATUS_READ, v);
                 v
             }
             host::FIFOSTATUS => level | (cfg & 0x7F) << host::FIFOSTATUS_HIGH_SHIFT,
@@ -1267,9 +1276,11 @@ impl Mgras {
                 self.wake_hq();
             }
             host::SET_FLAGS | host::SET_FLAGS_PRIVILEGED => {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_FLAG_SET, (self.rss_fifo.len() as u64) << 32 | lo as u64);
                 self.flags.fetch_or(lo, Ordering::AcqRel);
             }
             host::CLEAR_FLAGS | host::CLEAR_FLAGS_PRIVILEGED => {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_FLAG_CLEAR, lo);
                 self.flags.fetch_and(!lo, Ordering::AcqRel);
             }
             0x80000..=0xFFFFF => self.note(format!("fast-path command window write at {off:#x}")),

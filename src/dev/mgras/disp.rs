@@ -276,8 +276,10 @@ impl Mgras {
                     // SAFETY: a read-only view of the framebuffer; tearing
                     // tolerated.
                     let rss = unsafe { &*self.rss.get() };
+                    crate::pf_begin!(crate::perfetto::events::MGRAS_CAPTURE, self.rss_fifo.len());
                     snap.snapshot(rss, &self.front_view().dcb);
                     snap.compose(&mut screen.fb_rgb);
+                    crate::pf_end!(crate::perfetto::events::MGRAS_CAPTURE);
                     // The frame is already final RGB, so keep `rgba` (what CI
                     // screenshots read) current without a renderer readback,
                     // as GR2 does. This also makes screenshots work headless.
@@ -297,7 +299,9 @@ impl Mgras {
                         shown = (screen.width, screen.height);
                         r.resize(shown.0, shown.1);
                     }
+                    crate::pf_begin!(crate::perfetto::events::MGRAS_PRESENT);
                     r.present(&mut screen, &mut overlay, &mut status_bar, &mut sbtex, &stats, shot, None, None);
+                    crate::pf_end!(crate::perfetto::events::MGRAS_PRESENT);
                 }
                 // The screenshot hotkey (Right Ctrl + Print Screen), as REX3
                 // and GR2 do: the frame just composed, written off-thread.

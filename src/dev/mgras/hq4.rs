@@ -464,6 +464,7 @@ impl Hq4 {
         } else if widget != WIDGET_HEART {
             "its destination is not HEART"
         } else {
+            crate::pf_instant!(crate::perfetto::events::MGRAS_HEART_PACKET, (vector as u64) << 1 | set as u64);
             out.push((vector, set));
             return;
         };
@@ -954,6 +955,7 @@ impl ImpactXio {
                 }
                 hq4::PENDING => s.status_extra = v,
                 hq4::ACK => {
+                    crate::pf_instant!(crate::perfetto::events::MGRAS_HQ4_ACK, (off as u64) << 32 | v as u64);
                     s.pending &= !v;
                     if v & pending::FLAGS != 0 {
                         s.first_ack = true;
@@ -1010,7 +1012,9 @@ impl ImpactXio {
                     let level = w1::slot::slot(bus, pulse, sample);
                     s.nic_control = v & NIC_WRITABLE | NIC_DONE | level as u32;
                 }
-                hq4::RETRACE_ACK => {}
+                hq4::RETRACE_ACK => {
+                    crate::pf_instant!(crate::perfetto::events::MGRAS_HQ4_ACK, (off as u64) << 32 | v as u64);
+                }
                 hq4::RE_STATUS => board.push((hq3::RASTER + (hq4::RE_STATUS - hq4::RASTER), v)),
                 o if is_plain(o) => {
                     s.plain.insert(o, v);
