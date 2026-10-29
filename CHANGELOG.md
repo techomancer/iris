@@ -13,6 +13,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Interpreter
+
+- An Indigo2 (IP22, R4400) with an IMPACT board no longer panics in the PROM
+  in `lightning` builds (#270).
+
 ### Freeing the Fuel, Tezro and Origin 3200
 
 - Under jitv2, dropping a Fuel, Tezro or Origin 3200 now frees the machine: it

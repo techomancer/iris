@@ -17,6 +17,9 @@ mod tests {
         pub narrow_writes: Mutex<Vec<(usize, u64, u64)>>,
         /// `write_narrow_from` calls as (width, address, source register).
         pub narrow_from_writes: Mutex<Vec<(usize, u64, u64)>>,
+        /// A read of the 8-byte block holding this address answers BUS_BUSY
+        /// once (a device asking the CPU to retry), then reads normally.
+        pub busy_once: Mutex<Option<u64>>,
     }
 
     impl MockMemory {
@@ -25,7 +28,17 @@ mod tests {
                 data: Mutex::new(HashMap::new()),
                 narrow_writes: Mutex::new(Vec::new()),
                 narrow_from_writes: Mutex::new(Vec::new()),
+                busy_once: Mutex::new(None),
             }
+        }
+
+        fn take_busy(&self, addr: u64) -> bool {
+            let mut busy = self.busy_once.lock().unwrap();
+            if busy.is_some_and(|a| a & !7 == addr & !7) {
+                *busy = None;
+                return true;
+            }
+            false
         }
 
         pub fn set_byte(&self, addr: u64, val: u8) {
@@ -69,6 +82,9 @@ mod tests {
 
     impl BusDevice for MockMemory {
         fn read8(&self, addr: u64) -> BusRead8 {
+            if self.take_busy(addr) {
+                return BusRead8::busy();
+            }
             BusRead8::ok(self.get_byte(addr as u64))
         }
 
@@ -79,6 +95,9 @@ mod tests {
         }
 
         fn read16(&self, addr: u64) -> BusRead16 {
+            if self.take_busy(addr) {
+                return BusRead16::busy();
+            }
             let aligned_addr = (addr & !1) as u64;
             let mut bytes = [0u8; 2];
             for i in 0..2 {
@@ -98,6 +117,9 @@ mod tests {
         }
 
         fn read32(&self, addr: u64) -> BusRead32 {
+            if self.take_busy(addr) {
+                return BusRead32::busy();
+            }
             let aligned_addr = (addr & !3) as u64;
             BusRead32::ok(self.get_word(aligned_addr))
         }
@@ -109,6 +131,9 @@ mod tests {
         }
 
         fn read64(&self, addr: u64) -> BusRead64 {
+            if self.take_busy(addr) {
+                return BusRead64::busy();
+            }
             let aligned_addr = (addr & !7) as u64;
             BusRead64::ok(self.get_double(aligned_addr))
         }
@@ -6145,6 +6170,45 @@ mod tests {
         assert_eq!(exec.core.cp0_epc, pc_base + 4,
             "cp0_epc must point at the LOAD's address (pc_base+4), not the ADDIU's (pc_base)");
         assert_eq!(exec.core.read_gpr(8), 0x3000, "ADDIU result must still have been written before the fault");
+    }
+
+    #[test]
+    #[cfg(feature = "opcodefusion")]
+    fn test_addr_calc_load_store_fusion_retry() {
+        // A device that answers a fused pair's load with BUS_BUSY (IMPACT's
+        // registers do while its FIFO is full) wants a retry, not an
+        // exception. The pair must return EXEC_RETRY with PC on the load and
+        // the ADDU retired, and the next step must run only the load. #270:
+        // the IP22 PROM took this as an ExcCode 0 exception and panicked.
+        let (mut exec, mem) = create_executor_with_r4000cache();
+        let pc_base: u64 = 0xFFFFFFFF80000000;
+        let nop = 0u32;
+
+        // ADDU t0, a0, a1 ; LBU v0, 3(t0)   (the PROM's own pattern)
+        let addu = make_r(OP_SPECIAL as u32, 4, 5, 8, 0, FUNCT_ADDU as u32);
+        let lbu = make_i(OP_LBU as u32, 8, 2, 3);
+        mem.set_double(0, ((addu as u64) << 32) | lbu as u64);
+        mem.set_double(8, ((nop as u64) << 32) | nop as u64);
+
+        // Uncached (kseg1), so the read reaches the device on every try.
+        mem.set_byte(0x5003, 0x5A);
+        *mem.busy_once.lock().unwrap() = Some(0x5003);
+        exec.core.write_gpr(4, 0xFFFFFFFFA0005000);
+        exec.core.write_gpr(5, 0);
+        let cause = exec.core.cp0_cause;
+
+        exec.core.pc = pc_base;
+        let s = exec.step_int();
+        assert_eq!(s, crate::cpu::mips_exec::EXEC_RETRY, "a busy device is a retry, not an exception");
+        assert_eq!(exec.core.pc, pc_base + 4, "PC must stay on the load");
+        assert_eq!(exec.core.cp0_cause, cause, "no exception may be raised");
+        assert_eq!(exec.core.read_gpr(8), 0xFFFFFFFFA0005000, "ADDU has retired");
+        assert_eq!(exec.core.read_gpr(2), 0, "the load has not");
+
+        let s = exec.step_int();
+        assert_eq!(s, EXEC_COMPLETE, "the retried load completes");
+        assert_eq!(exec.core.pc, pc_base + 8);
+        assert_eq!(exec.core.read_gpr(2), 0x5A);
     }
 
     #[test]
