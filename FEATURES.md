@@ -209,7 +209,8 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `network.mode` | `nat` | nat, pcap or off (no Ethernet; O2 and Octane only). PCAP needs build support and host capture permissions; it works on every machine with an Ethernet. |
+| `network.mode` | `nat` | nat, pcap, stream or off (no Ethernet; O2 and Octane only). Stream needs `network.stream`. PCAP needs build support and host capture permissions. PCAP works on every Ethernet; stream on every onboard one, not on a DaynaPort. |
+| `network.stream` | `unset` | `tcp:IP:PORT` or `unix:PATH`: the server of the private segment for `mode = "stream"` (QEMU `-netdev stream` framing). See NETWORKING.md. |
 | `network.pcap_interface` | `auto-pick when unset` | Interface name or numeric list index; PCAP only. |
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
