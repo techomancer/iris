@@ -97,9 +97,26 @@ pub struct ImpactBoard {
     pub record_revision: &'static str,
 }
 
-/// Solid IMPACT, the one board the raster model behind this front is built
-/// as. Its values are inferred from an SI with texture, with the TRAM
-/// taken away: no textureless board's values are on record.
+/// How IRIX reads the two version bytes on the Octane's boards (the IP30
+/// kernel's board probe, and the PROM's names for what it finds):
+///
+/// - `version1`: GE11 count in bits 1:0, board revision in 4:2, product in
+///   6:5. The Indigo2's products are 0 (High and Maximum) and 1 (Solid,
+///   MG10); the Octane's are its own pair, GM10 and GM20. The SI's 0x45
+///   makes GM10 product 2; GM20 as 3 is an inference (the kernel treats
+///   the two alike).
+/// - `version0`: TRAMs on raster board A in bits 1:0 and on B in 3:2, each
+///   3 for none fitted and anything else for four. On these products the
+///   kernel takes as many REs as GEs.
+///
+/// The PROM names 1 GE without TRAMs "SI", with them "SI with texture
+/// option", 2 GEs without "SSI", with them "MXI", each prefixed "E" when
+/// the GE11 revision is above 2. The serial-number record names the base
+/// board: GM10 for one RE (SI, plus a texture mezzanine for SI with
+/// texture), GM20 for two (SSI, plus two mezzanines for MXI).
+///
+/// Solid IMPACT. Its values are inferred from an SI with texture, with the
+/// TRAM taken away: no textureless board's values are on record.
 pub const SOLID_IMPACT: ImpactBoard = ImpactBoard {
     name: "SI",
     version1: 0x45,
@@ -113,6 +130,40 @@ pub const SOLID_IMPACT: ImpactBoard = ImpactBoard {
     record_part: "030-0938-003",
     record_revision: "U",
 };
+
+/// SI with texture option: the GM10 base board with a texture mezzanine,
+/// four TRAMs on raster board A (`version0` 0x0C). The raster model is the
+/// Indigo2's High IMPACT (one GE, one RE, a TE with TRAM).
+pub const SI_TEXTURE: ImpactBoard = ImpactBoard {
+    name: "SI with texture option",
+    version0: 0x0C,
+    ..SOLID_IMPACT
+};
+
+/// MXI: the GM20 base board (two GEs, two REs) with two texture
+/// mezzanines, four TRAMs behind each RE (`version0` 0x00). The raster
+/// model is the Indigo2's Maximum IMPACT. The record's part number is not
+/// on record: this one is made up and marked so (all zeros).
+pub const MXI: ImpactBoard = ImpactBoard {
+    name: "MXI",
+    version1: 0x3 << 5 | 1 << 2 | 2,
+    version0: 0x00,
+    record_name: "GM20",
+    record_part: "030-0000-000",
+    ..SOLID_IMPACT
+};
+
+impl ImpactBoard {
+    /// The Octane board for a configured board kind, if there is one.
+    pub fn for_kind(kind: GraphicsBoard) -> Option<ImpactBoard> {
+        match kind {
+            GraphicsBoard::SolidImpact => Some(SOLID_IMPACT),
+            GraphicsBoard::HighImpact => Some(SI_TEXTURE),
+            GraphicsBoard::MaxImpact => Some(MXI),
+            _ => None,
+        }
+    }
+}
 
 /// The serial-number chip's ROM serial and the record's barcode: made up
 /// and marked so (letter G, instance 0), so nothing mistakes them for a
@@ -606,10 +657,7 @@ enum Phase {
 }
 
 impl ImpactXio {
-    /// A Solid IMPACT board at `widget` (one of the four graphics ports):
-    /// its interrupts are vectors on `irq` (HEART), its DMA reaches `mem`
-    /// (the bus masters' view of memory). `heartbeat` and `fasttick` feed
-    /// the status bar, as for the Indigo2 board. `Device::start` starts it.
+    /// A Solid IMPACT board (see `with_board`).
     pub fn new(
         widget: u8,
         irq: Arc<dyn InterruptController>,
@@ -617,7 +665,23 @@ impl ImpactXio {
         heartbeat: Arc<AtomicU64>,
         fasttick: Arc<AtomicU64>,
     ) -> Arc<Self> {
-        let board = SOLID_IMPACT;
+        Self::with_board(widget, GraphicsBoard::SolidImpact, irq, mem, heartbeat, fasttick)
+    }
+
+    /// An IMPACT board of kind `kind` (Solid, High for SI with texture,
+    /// Maximum for MXI) at `widget` (one of the four graphics ports):
+    /// its interrupts are vectors on `irq` (HEART), its DMA reaches `mem`
+    /// (the bus masters' view of memory). `heartbeat` and `fasttick` feed
+    /// the status bar, as for the Indigo2 board. `Device::start` starts it.
+    pub fn with_board(
+        widget: u8,
+        kind: GraphicsBoard,
+        irq: Arc<dyn InterruptController>,
+        mem: Arc<dyn BusDevice>,
+        heartbeat: Arc<AtomicU64>,
+        fasttick: Arc<AtomicU64>,
+    ) -> Arc<Self> {
+        let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
         let shared = Arc::new(Shared {
             hq4: Mutex::new(Hq4::default()),
             nic: Mutex::new(None),
@@ -627,7 +691,7 @@ impl ImpactXio {
         });
         let lines: Arc<dyn InterruptController> = Arc::new(Lines(shared.clone()));
         let mgras = Mgras::new(
-            GraphicsBoard::SolidImpact,
+            kind,
             [IrqLine::new(lines.clone(), 0), IrqLine::new(lines.clone(), 1), IrqLine::new(lines, 2)],
             heartbeat,
             fasttick,

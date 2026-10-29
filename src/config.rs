@@ -904,8 +904,9 @@ impl OctaneSection {
             None => Ok(Some(GraphicsBoard::SolidImpact)),
             Some(s) if s.eq_ignore_ascii_case("none") => Ok(None),
             Some(s) => match s.parse::<GraphicsBoard>() {
-                Ok(GraphicsBoard::SolidImpact) => Ok(Some(GraphicsBoard::SolidImpact)),
-                Ok(b) => Err(format!("octane.graphics \"{s}\": {} is not modelled on the Octane (valid: solidimpact, none)", b.label())),
+                // High IMPACT is the Octane's SI with texture option, Maximum its MXI.
+                Ok(b @ (GraphicsBoard::SolidImpact | GraphicsBoard::HighImpact | GraphicsBoard::MaxImpact)) => Ok(Some(b)),
+                Ok(b) => Err(format!("octane.graphics \"{s}\": {} is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)", b.label())),
                 Err(e) => Err(format!("octane.graphics: {e}")),
             },
         }
@@ -2505,7 +2506,11 @@ mod export_tests {
         let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"impact:solid\"").expect("parse");
         assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::SolidImpact)));
         let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"maximpact\"").expect("parse");
-        assert!(cfg.octane.graphics_board().is_err(), "only Solid IMPACT is modelled");
+        assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::MaxImpact)), "the MXI");
+        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"highimpact\"").expect("parse");
+        assert_eq!(cfg.octane.graphics_board(), Ok(Some(GraphicsBoard::HighImpact)), "SI with texture");
+        let cfg: MachineConfig = toml::from_str("[octane]\ngraphics = \"xz\"").expect("parse");
+        assert!(cfg.octane.graphics_board().is_err(), "only IMPACT is modelled");
     }
 
     #[test]

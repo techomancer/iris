@@ -591,24 +591,28 @@ fn show_board_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
     }
 }
 
-/// The Octane's graphics port holds the Solid IMPACT board or nothing
-/// (`[octane] graphics`); the other boards are not modelled there.
+/// The Octane's graphics port holds an IMPACT board (Solid, High as the SI
+/// with texture option, Maximum as the MXI) or nothing (`[octane]
+/// graphics`); the other boards are not modelled there.
 fn show_octane_graphics_picker(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
-    let fitted = !matches!(cfg.octane.graphics_board(), Ok(None));
+    let fitted = cfg.octane.graphics_board().unwrap_or(Some(GraphicsBoard::SolidImpact));
     let mut choice = fitted;
+    let name = |b: Option<GraphicsBoard>| b.map_or_else(|| t!("config-octane-graphics-none"), |b| b.label().to_string());
     ui.horizontal(|ui| {
         ui.label(t!("config-graphics-board"));
         ui.add_enabled_ui(!running, |ui| {
             ComboBox::from_id_salt("octane_graphics")
-                .selected_text(if choice { GraphicsBoard::SolidImpact.label().to_string() } else { t!("config-octane-graphics-none") })
+                .selected_text(name(choice))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut choice, true, GraphicsBoard::SolidImpact.label());
-                    ui.selectable_value(&mut choice, false, t!("config-octane-graphics-none"));
+                    for b in [GraphicsBoard::SolidImpact, GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact] {
+                        ui.selectable_value(&mut choice, Some(b), b.label());
+                    }
+                    ui.selectable_value(&mut choice, None, t!("config-octane-graphics-none"));
                 });
         });
     });
     if choice != fitted {
-        cfg.octane.graphics = Some(if choice { "solidimpact" } else { "none" }.into());
+        cfg.octane.graphics = Some(choice.map_or("none", |b| b.as_str()).into());
     }
     if running {
         ui.label(

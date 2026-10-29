@@ -127,6 +127,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   The display took its frame just after the retrace, racing the kernel's
   buffer flip and the next frame's drawing; it now takes it just before,
   as scanout does.
+- **The Octane takes the textured IMPACT boards.** `[octane] graphics =
+  "highimpact"` is the SI with texture option and `"maximpact"` the MXI
+  (two GEs, two REs), with the board version bytes the IP30 kernel decodes;
+  hinv and gfxinfo name them as on the real machine. glstate, pixtest and
+  blendtest pass on both as on the Indigo2's High and Maximum IMPACT;
+  iris-gui offers them too.
+- **GR2 takes its display frame before the retrace too**, for the same
+  reason as IMPACT.
 - **`mgras status` and the log name the microcode the kernel loaded**: a
   fingerprint of the HQ microcode and of each GE11 program, kept as they are
   written, and the IRIX release when it is a known one.

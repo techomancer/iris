@@ -14,3 +14,9 @@ that copy, and the client began drawing into the buffer being copied.
 **Rule.** Snapshot first, then pulse the retrace (`Mgras::refresh_loop`).
 A flip made at retrace N shows from frame N+1, as scanout does. The STATUS
 vertical-blank window (`begin_frame`) moves with the pulse.
+
+GR2 (`Gr2::display_loop`) had the same order (pulse, hold the vertical
+status 700 us, then compose) and now composes first too. REX3 was already
+right: it copies the framebuffer and the XMAP/VC2 state into the screen
+caches, then raises VBLANK; it only presents the live framebuffer when no
+pixel changed since the last copy.

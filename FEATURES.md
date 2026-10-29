@@ -332,7 +332,7 @@ is the internal bus, 1 the external). See [the Octane guide](docs/octane-ip30.md
 | Key | Default | Values and behavior |
 |---|---|---|
 | `octane.flash` | unset | Boot flash file, keeping the PROM's records between runs. Created from `prom` when missing and then used as it is, so delete it after changing `prom`; a file of another size is refused. Unset, the flash is in memory and every start is from `prom`. |
-| `octane.graphics` | `"solidimpact"` | `solidimpact` or `none`. With `none` the machine runs on its serial console, with no window. |
+| `octane.graphics` | `"solidimpact"` | `solidimpact` (SI), `highimpact` (SI with texture option), `maximpact` (MXI) or `none`. With `none` the machine runs on its serial console, with no window. |
 
 ### Hardware constraints and precedence
 

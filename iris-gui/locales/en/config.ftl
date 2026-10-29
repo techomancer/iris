@@ -403,5 +403,5 @@ config-octane-subtitle = An R10000 at 195 MHz. Needs the IP30 PROM image; there 
 config-octane-flash = Flash file
 config-octane-flash-tip = Keeps the PROM's saved records between runs. Created from the PROM image when missing.
 config-octane-graphics-none = None
-config-octane-graphics-subtitle = The Octane models the Solid IMPACT board, or no graphics board and a serial console.
+config-octane-graphics-subtitle = The Octane models IMPACT as SI (Solid), SI with texture option (High) and MXI (Maximum), or no graphics board and a serial console.
 config-ram-banks-octane-subtitle = Each bank is a pair of DIMMs of 64, 128, 256 or 512 MB. Fill the banks from bank 0 with no gaps.

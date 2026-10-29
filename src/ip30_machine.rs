@@ -181,7 +181,7 @@ impl OctaneMachine {
         // shared with the graphics board before the CPU exists.
         let heartbeat = Arc::new(AtomicU64::new(0));
         let fasttick = Arc::new(AtomicU64::new(0));
-        let gfx = board.map(|_| ImpactXio::new(WIDGET_GFX, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
+        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());

@@ -20,8 +20,8 @@ example `playaiff`) comes out of the host's audio device; `no_audio` turns it
 off. `reboot` comes back to the login prompt. jitv2 builds run it too.
 
 iris-gui runs the Octane as well: choose "SGI Octane (IP30)" as the platform.
-The editor fixes the CPU at the R10000, offers Solid IMPACT or no graphics
-board, limits banks to 64 to 512 MB filled from bank 0, and asks for the IP30
+The editor fixes the CPU at the R10000, offers the three IMPACT boards or no
+graphics board, limits banks to 64 to 512 MB filled from bank 0, and asks for the IP30
 PROM image and an optional flash file. The Indy and Indigo2 NVRAM seeding and
 Ethernet-address row do not apply and are skipped.
 
@@ -44,7 +44,7 @@ cpu = "r10000"
 
 [octane]
 flash = "flash-ip30.bin"      # keep the PROM's flash records between runs
-# graphics = "none"           # no graphics board (default: "solidimpact")
+# graphics = "maximpact"      # "solidimpact" (default), "highimpact", "maximpact" or "none"
 
 [[port_forward]]
 proto = "tcp"
@@ -114,9 +114,17 @@ controller works and what each driver does with it is in
 
 ## Graphics
 
-The graphics board is Solid IMPACT on widget 11: the same raster chips as
-the Indigo2 IP28's Solid IMPACT behind the Octane's XIO host interface (the
-HQ4), with interrupts and DMA through HEART. Its screen is the iris window
+The graphics board sits on widget 11: the same raster chips as the Indigo2
+IP28's IMPACT boards behind the Octane's XIO host interface (the HQ4), with
+interrupts and DMA through HEART. `[octane] graphics` picks the board:
+
+| Value | The PROM's name | GEs / REs | Texture |
+|---|---|---|---|
+| `solidimpact` (default) | SI | 1 / 1 | none |
+| `highimpact` | SI with texture option | 1 / 1 | 4 TRAMs |
+| `maximpact` | MXI | 2 / 2 | 4 TRAMs per RE |
+
+The two textured boards are new and less tested than the SI. Its screen is the iris window
 and what iris-ci screenshots show; the keyboard and mouse are IOC3's PS/2
 ports. `[octane] graphics = "none"` leaves the port empty, and the machine
 then runs on its serial console with no window.
