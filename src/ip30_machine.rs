@@ -491,7 +491,11 @@ impl OctaneMachine {
         let (mut nat, mut frames) = (None, None);
         let net = crate::net::GatewayConfig::from_network(&cfg.network());
         if let Some(link) = crate::net::Link::with_gateway(net.clone())? {
-            eprintln!("iris: Octane Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
+            if net.mode == crate::config::NetMode::Stream {
+                eprintln!("iris: Octane Ethernet on {}", link.describe());
+            } else {
+                eprintln!("iris: Octane Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
+            }
             frames = Some(link.frames());
             nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
             eth.attach(link);

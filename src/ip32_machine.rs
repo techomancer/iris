@@ -224,7 +224,11 @@ impl O2Machine {
         let (mut nat, mut frames) = (None, None);
         let net = crate::net::GatewayConfig::from_network(&cfg.network());
         if let Some(link) = crate::net::Link::with_gateway(net.clone())? {
-            eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
+            if net.mode == crate::config::NetMode::Stream {
+                eprintln!("iris: O2 Ethernet on {}", link.describe());
+            } else {
+                eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
+            }
             frames = Some(link.frames());
             nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
             bus.mace.mec.attach(link);
