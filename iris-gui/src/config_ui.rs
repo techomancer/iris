@@ -1109,6 +1109,8 @@ fn show_network(
                     NetMode::Pcap => t!("config-net-mode-pcap"),
                     // Only an O2 config can say this, and the GUI does not run one yet.
                     NetMode::Off  => "off".to_string(),
+                    // Set in the config file only; the GUI offers no field for the peer.
+                    NetMode::Stream => "stream".to_string(),
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut cfg.network.mode, NetMode::Nat, t!("config-net-mode-nat"));

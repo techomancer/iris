@@ -331,6 +331,10 @@ pub enum NetMode {
     /// only (`MachineConfig::validate`); the Indy and Indigo2 always have a
     /// network.
     Off,
+    /// A private segment carried over a stream socket in QEMU's `-netdev
+    /// stream` framing, to a peer that serves it (`[network] stream`). iris
+    /// provides no gateway services on it.
+    Stream,
 }
 
 impl Default for NetMode {
@@ -364,6 +368,8 @@ pub struct NetworkConfig {
     pub rsh_dir: Option<std::path::PathBuf>,
     /// Hold frames for the guest while its receive ring is about to end (Indy).
     pub rx_hold: bool,
+    /// The peer for `NetMode::Stream`, as `tcp:IP:PORT` or `unix:PATH`.
+    pub stream: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -378,6 +384,7 @@ impl Default for NetworkConfig {
             tftp_dir: None,
             rsh_dir: None,
             rx_hold: true,
+            stream: None,
             mac: DEFAULT_MAC,
         }
     }
@@ -427,6 +434,10 @@ pub struct NetworkSection {
     /// driver's interrupt pass. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rx_hold: Option<bool>,
+    /// With `mode = "stream"`: the server of the private segment, as
+    /// `tcp:IP:PORT` or `unix:PATH` (QEMU `-netdev stream` framing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// Where VINO's video-in capture should come from.
@@ -2076,6 +2087,11 @@ impl MachineConfig {
                     "scsi.{}: kind = \"daynaport\" is not available on the O2 (its Ethernet is built in)", key
                 ));
             }
+            if dev.is_daynaport() && self.network.mode == NetMode::Stream {
+                return Err(format!(
+                    "scsi.{}: kind = \"daynaport\" cannot join a stream segment: [network] stream names the onboard Ethernet's peer", key
+                ));
+            }
         }
         self.validate_serial_sockets()?;
         if self.scale < 1 || self.scale > 4 {
@@ -2150,6 +2166,11 @@ impl MachineConfig {
         match (self.network.mode, self.machine.profile) {
             (NetMode::Off, p) if p != MachineProfile::O2Ip32 && p != MachineProfile::OctaneIp30 => {
                 return Err("network.mode = \"off\" is only available on the O2 and the Octane for now; the Indy and Indigo2 always have their Ethernet".into());
+            }
+            (NetMode::Stream, _) => {
+                let ep = self.network.stream.as_deref()
+                    .ok_or_else(|| "network.mode = \"stream\" needs [network] stream = \"tcp:IP:PORT\" or \"unix:PATH\"".to_string())?;
+                crate::net::stream::StreamEndpoint::parse(ep).map_err(|e| format!("network.stream: {e}"))?;
             }
             _ => {}
         }
@@ -2255,6 +2276,7 @@ impl MachineConfig {
             tftp_dir:     self.network.tftp_dir.as_ref().map(std::path::PathBuf::from),
             rsh_dir:      self.network.rsh_dir.as_ref().map(std::path::PathBuf::from),
             rx_hold:      self.network.rx_hold.unwrap_or(true),
+            stream:       self.network.stream.clone(),
         }
     }
 
@@ -2935,6 +2957,28 @@ mod export_tests {
         cfg.machine.cpu = CpuModel::R10000;
         cfg.scsi.insert(3, ScsiDeviceConfig { kind_field: ScsiKind::Daynaport, ..Default::default() });
         assert!(cfg.validate().unwrap_err().contains("daynaport"));
+    }
+
+    /// `mode = "stream"` needs a parseable `stream` peer, on every machine.
+    #[test]
+    fn stream_mode_needs_a_peer() {
+        for profile in [MachineProfile::default(), MachineProfile::O2Ip32, MachineProfile::OctaneIp30] {
+            let mut cfg = MachineConfig::default();
+            cfg.machine.profile = profile;
+            if profile != MachineProfile::default() { cfg.machine.cpu = CpuModel::R10000; }
+            cfg.network.mode = NetMode::Stream;
+            assert!(cfg.validate().unwrap_err().contains("needs [network] stream"), "{profile:?}");
+            cfg.network.stream = Some("tcp:nope".into());
+            assert!(cfg.validate().unwrap_err().contains("network.stream"), "{profile:?}");
+            cfg.network.stream = Some("udp:127.0.0.1:7000".into());
+            assert!(cfg.validate().unwrap_err().contains("network.stream"), "{profile:?}");
+            cfg.network.stream = Some("tcp:127.0.0.1:7000".into());
+            cfg.validate().unwrap_or_else(|e| panic!("{profile:?}: {e}"));
+        }
+        let mut cfg: MachineConfig = toml::from_str("[network]\nmode = \"stream\"\nstream = \"unix:/run/x\"\n[scsi.4]\nkind = \"daynaport\"").unwrap();
+        assert!(cfg.validate().unwrap_err().contains("cannot join a stream segment"));
+        cfg.scsi.clear();
+        assert_eq!(cfg.network().stream.as_deref(), Some("unix:/run/x"));
     }
 
     /// `banks` reads one to eight entries and pads; it writes four or more

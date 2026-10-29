@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::config::{NetMode, NetworkConfig};
 
+use super::stream::StreamBackend;
 use super::{GatewayConfig, NatControl, NatEngine, NetBackend, Wake};
 
 /// The adapter's ends of a link.
@@ -29,9 +30,12 @@ pub struct Link {
     far: Option<(rtrb::Consumer<Vec<u8>>, rtrb::Producer<Vec<u8>>)>,
     /// Guest frames processed, whichever the backend: the GUI's indicator.
     frames: Arc<AtomicU64>,
-    /// The backend's controls and status (the NAT's counters and tables, the
-    /// PCAP bridge's state); renewed links share them.
+    /// The NAT's and PCAP bridge's controls and status (counters, tables,
+    /// bridge state); renewed links share them. A stream segment leaves them idle.
     nat: Arc<NatControl>,
+    /// The built backend, for its status report; only a backend with
+    /// something to say is kept.
+    reporter: Option<Arc<dyn NetBackend + Send + Sync>>,
     /// Cleared to stop the backend.
     running: Arc<AtomicBool>,
     config: GatewayConfig,
@@ -64,7 +68,7 @@ impl Link {
         let (to_net, tx_cons) = rtrb::RingBuffer::new(256);
         let (rx_prod, from_net) = rtrb::RingBuffer::new(256);
         let rings = Rings { to_net, from_net, tx_wake, rx_wake };
-        Link { rings, far: Some((tx_cons, rx_prod)), frames, nat, running: Arc::new(AtomicBool::new(false)), config }
+        Link { rings, far: Some((tx_cons, rx_prod)), frames, nat, reporter: None, running: Arc::new(AtomicBool::new(false)), config }
     }
 
     /// Which backend, for the adapter's log line.
@@ -72,6 +76,10 @@ impl Link {
         match self.config.mode {
             NetMode::Pcap if cfg!(feature = "pcap") => "PCAP (bridged)".into(),
             NetMode::Pcap => "NAT (software gateway): mode = \"pcap\" needs a build with --features pcap".into(),
+            NetMode::Stream => match self.config.stream_endpoint() {
+                Ok(ep) => format!("stream segment {ep}"),
+                Err(e) => e,
+            },
             _ => "NAT (software gateway)".into(),
         }
     }
@@ -94,20 +102,34 @@ impl Link {
         self.rings.rx_wake.clone()
     }
 
+    /// The built backend's status report, once it is built (`spawn` builds it):
+    /// `None` for a backend that has none, as the NAT's tables are read from
+    /// `nat` instead. The handle outlives the link, which `into_rings` consumes.
+    pub fn reporter(&self) -> Option<Arc<dyn NetBackend + Send + Sync>> {
+        self.reporter.clone()
+    }
+
     /// The adapter's ends of the rings, once the backend has its own.
     pub fn into_rings(self) -> Rings {
         self.rings
     }
 
-    /// The backend `config.mode` names: the NAT gateway or a PCAP bridge,
-    /// which needs `--features pcap` (without it the NAT runs instead). It is
-    /// built here, not when the link is made: the NAT binds its host listeners
-    /// when built. `None` if it was built already.
+    /// The backend `config.mode` names: the NAT gateway, a PCAP bridge, which
+    /// needs `--features pcap` (without it the NAT runs instead), or a stream
+    /// segment (`validate` has parsed its peer). It is built here, not when
+    /// the link is made: the NAT binds its host listeners when built. `None`
+    /// if it was built already.
     pub fn backend(&mut self) -> Option<Box<dyn NetBackend>> {
         let (tx_cons, rx_prod) = self.far.take()?;
         let config = self.config.clone();
         let (rx_wake, tx_wake) = (self.rings.rx_wake.clone(), self.rings.tx_wake.clone());
         let (running, ctl) = (self.running.clone(), self.nat.clone());
+        if config.mode == NetMode::Stream {
+            let endpoint = config.stream_endpoint().expect("validated stream peer");
+            let b = Arc::new(StreamBackend::new(endpoint, tx_cons, rx_prod, tx_wake, rx_wake, running, self.frames.clone()));
+            self.reporter = Some(b.clone());
+            return Some(Box::new(b));
+        }
         #[cfg(feature = "pcap")]
         if config.mode == NetMode::Pcap {
             return Some(Box::new(super::net_pcap::PcapEngine::new(config, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl)));
@@ -152,6 +174,21 @@ mod tests {
         let mut link = Link::open(&NetworkConfig::default()).unwrap().unwrap();
         assert!(link.backend().is_some());
         assert!(link.backend().is_none());
+    }
+
+    /// A stream link names its peer, reports once its backend is built, and
+    /// is renewed without one.
+    #[test]
+    fn a_stream_link_reports_its_segment() {
+        let net = NetworkConfig { mode: NetMode::Stream, stream: Some("tcp:127.0.0.1:1".into()), ..NetworkConfig::default() };
+        let mut link = Link::open(&net).unwrap().unwrap();
+        assert_eq!(link.describe(), "stream segment tcp:127.0.0.1:1");
+        assert!(link.reporter().is_none());
+        link.backend().unwrap();
+        let mut text = Vec::new();
+        link.reporter().expect("a stream reports").report(&mut text).unwrap();
+        assert!(String::from_utf8(text).unwrap().contains("waiting for the peer"));
+        assert!(link.renew().unwrap().reporter().is_none());
     }
 
     #[test]

@@ -23,6 +23,7 @@
 //!   host_dns.rs  host DNS server discovery for DNS relaying
 //!   link.rs      an adapter's connection to the backend `[network]` selects
 //!   net_pcap.rs  PCAP bridged backend (`pcap` feature)
+//!   stream.rs    a private segment over QEMU's `-netdev stream` framing
 //!   telnet.rs    telnet option negotiation for the monitor/serial consoles
 
 mod engine;
@@ -42,6 +43,7 @@ pub mod packet;
 mod portmap;
 mod rsh;
 mod services;
+pub mod stream;
 mod tcp;
 pub mod wake;
 pub mod telnet;
@@ -102,6 +104,8 @@ pub struct GatewayConfig {
     /// where the hardware would stop its channel (`[network] rx_hold`; the Indy's
     /// SEEQ only).
     pub rx_hold: bool,
+    /// The peer of `NetMode::Stream`, as `tcp:IP:PORT` or `unix:PATH`.
+    pub stream: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -121,6 +125,7 @@ impl Default for GatewayConfig {
             tftp_dir:     None,
             rsh_dir:      None,
             rx_hold:      true,
+            stream:       None,
         }
     }
 }
@@ -142,6 +147,7 @@ impl GatewayConfig {
             tftp_dir: net.tftp_dir.clone(),
             rsh_dir: net.rsh_dir.clone(),
             rx_hold: net.rx_hold,
+            stream: net.stream.clone(),
             ..Self::default()
         }
     }
@@ -152,14 +158,23 @@ impl GatewayConfig {
 // The SEEQ 8003 chip is backend-agnostic: it hands outbound Ethernet frames to a
 // backend over an rtrb ring and receives inbound frames back over another. Any
 // type that owns those endpoints and a run loop can serve as the backend. Today
-// there are two implementations:
+// there are three implementations:
 //   - `NatEngine` (this file): a software NAT gateway/router.
 //   - `PcapEngine` (net_pcap.rs, `--features pcap`): bridges frames onto a real
 //     host interface via libpcap.
+//   - `StreamBackend` (stream.rs): a private segment served by a peer over
+//     QEMU's `-netdev stream` framing.
 pub trait NetBackend: Send {
     /// Run the backend loop until the shared `running` flag goes false. Blocks
     /// the calling thread (the `seeq-net` thread).
     fn run(&mut self);
+
+    /// Write the backend's own account of itself, for an adapter's status
+    /// command. The default says nothing: the NAT's tables are read from its
+    /// controls instead.
+    fn report(&self, _w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Live status of the PCAP bridged-capture backend, surfaced to an embedder (the

@@ -780,6 +780,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   named `seeq-net`, `daynaN-net`, `ip32-mec-net` and `ip30-eth-net`.
 - `mode = "pcap"` is allowed on the O2 and the Octane, untested on a real
   interface.
+- `[network] mode = "stream"` connects an Ethernet to a program speaking
+  QEMU's `-netdev stream` framing (not a DaynaPort).
 
 ### UI / input
 
