@@ -392,7 +392,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 px[y * w + x] = match (x / 40, y / 30) {
-                    (0, _) => 0xff00_0000 | ((x * 7 + y * 13) as u32 * 2_654_435_761) & 0xff_ffff, // noise
+                    (0, _) => 0xff00_0000 | ((x * 7 + y * 13) as u32).wrapping_mul(2_654_435_761) & 0xff_ffff, // noise
                     (1, _) => if (x + y) % 2 == 0 { 0xffff_ffff } else { 0xff00_0000 },      // 2 colours
                     (2, _) => [0xff11_2233, 0xff44_5566, 0xff77_8899][(x / 3 + y) % 3],      // 3 colours
                     (3, _) => 0xff00_0000 | ((x / 10) as u32 * 0x30_1020),                   // runs
