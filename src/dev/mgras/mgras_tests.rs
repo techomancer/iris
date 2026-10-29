@@ -3261,6 +3261,25 @@ fn gl_12_12_12_keeps_twelve_bits() {
     m.stop_engines();
 }
 
+/// The RGBA 12,12,12 visual has no alpha planes, so glReadPixels' alpha
+/// is full scale (GL's rule), in both component orders. Planes 31:24
+/// hold red's and green's low nibbles, which used to come back as alpha
+/// (a Solid IMPACT's deepest visual: pixtest failed most of its cases).
+#[test]
+fn gl_12_12_12_reads_alpha_as_full_scale() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0x2300, 0x2300]);
+    fifo_token(&m, 0x49, &[1, 1, 0]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    let rgba = gl_read_one(&m, 50, 50, 0, 0x0041_0080, 4);
+    assert_eq!(rgba, [0xFF, 0, 0, 0xFF], "RGBA order");
+    let abgr = gl_read_one(&m, 50, 50, 0, 0x0001_0080, 4);
+    assert_eq!(abgr, [0xFF, 0, 0, 0xFF], "ABGR order");
+    m.stop_engines();
+}
+
 /// The bank comes from the kernel (VALIDATE_BANKS), not from counting
 /// swaps: a swap the kernel did not pair with a bank (or one the GE never
 /// saw) leaves the drawing where the kernel last said.

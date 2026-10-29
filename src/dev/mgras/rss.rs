@@ -2611,13 +2611,16 @@ impl Rss {
 
     /// The read pixel's components at (fx, fy) widened to 16 bits: a
     /// 12:12:12 visual's twelve bits, else the 8-bit framebuffer value.
+    /// A 12:12:12 pixel has no alpha planes (planes 31:24 hold red's and
+    /// green's low nibbles), so its alpha reads as full scale, GL's value
+    /// for a visual without alpha.
     fn comps16(&self, fx: i32, fy: i32) -> [u16; 4] {
-        let px = self.get(fx, fy);
         if rgb36(self.reg(reg::PP1FILLMODE)) && (0..WIDTH as i32).contains(&fx) && (0..HEIGHT as i32).contains(&fy) {
             let u = unpack36(self.mem.get(&self.source(), fx as u32, fy as u32));
             let w = |c: u32| (c << 4 | c >> 8) as u16;
-            return [w(u[0]), w(u[1]), w(u[2]), comps16(px)[3]];
+            return [w(u[0]), w(u[1]), w(u[2]), 0xFFFF];
         }
+        let px = self.get(fx, fy);
         comps16(px)
     }
 
@@ -2649,8 +2652,15 @@ impl Rss {
             return out.get(i as usize).copied().unwrap_or(0);
         }
         // Depth: the ZST word as it is, never a 12-bit pair's half.
-        let px = if x.format == DEPTH_FORMAT { self.get_word(fx, fy) } else { self.get(fx, fy) };
         let pp1 = self.reg(reg::PP1FILLMODE);
+        let px = if x.format == DEPTH_FORMAT {
+            self.get_word(fx, fy)
+        } else if rgb36(pp1) && (3..=8).contains(&x.format.0) {
+            // No alpha planes: alpha reads full scale (see `comps16`).
+            self.get(fx, fy) | 0xFF00_0000
+        } else {
+            self.get(fx, fy)
+        };
         let v = match x.format {
             // 16-bit components from a 12:12:12 pixel: all twelve bits.
             (7, 1) | (8, 1) if rgb36(pp1) && (0..WIDTH as i32).contains(&fx) && (0..HEIGHT as i32).contains(&fy) => {
