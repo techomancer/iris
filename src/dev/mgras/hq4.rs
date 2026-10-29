@@ -52,7 +52,7 @@
 //! Ported from hw/misc/sgi-mgras.c and hw/misc/sgi-mgras-display.c in jamesbraid/qemu-sgi-origami.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -579,6 +579,11 @@ impl GeUpload {
 /// What the front and the board's interrupt lines share.
 struct Shared {
     hq4: Mutex<Hq4>,
+    /// The command port is in its command phase: a context switch has
+    /// completed and no selection has started another (`Hq4::ready` and
+    /// `protocol != 1`, kept with them under `hq4`). Command words, nearly
+    /// every write the port takes, check this instead of taking the lock.
+    commands: AtomicBool,
     /// The board's MicroLAN, built on the first access.
     nic: Mutex<Option<w1::Bus>>,
     irq: Arc<dyn InterruptController>,
@@ -685,6 +690,7 @@ impl ImpactXio {
         let board = ImpactBoard::for_kind(kind).expect("an IMPACT board kind");
         let shared = Arc::new(Shared {
             hq4: Mutex::new(Hq4::default()),
+            commands: AtomicBool::new(false),
             nic: Mutex::new(None),
             irq,
             order: Mutex::new(()),
@@ -753,7 +759,10 @@ impl ImpactXio {
         self.board_write(32, hq3::INTERRUPT_ENABLE_SET, hq3::FLAG_CP0 as u64);
         self.board_write(32, hq3::CFIFO_HIGH_MARK, 0);
         self.board_write(32, hq3::CFIFO_LOW_MARK, 0);
-        *self.shared.hq4.lock() = Hq4::default();
+        let mut s = self.shared.hq4.lock();
+        *s = Hq4::default();
+        self.shared.commands.store(false, Ordering::Release);
+        drop(s);
         *self.shared.nic.lock() = None;
     }
 
@@ -1063,6 +1072,7 @@ impl ImpactXio {
             s.entry = v;
             s.entry_selected = true;
             s.protocol = 1;
+            self.shared.commands.store(false, Ordering::Release);
             s.first_ack = false;
             s.context_words = 0;
             s.pending |= pending::FLAGS;
@@ -1075,6 +1085,9 @@ impl ImpactXio {
     /// context image words; once a switch has completed, command words of
     /// 32 or 64 bits.
     fn command_write(&self, bits: u32, val: u64) -> u32 {
+        if self.shared.commands.load(Ordering::Acquire) {
+            return self.board_write(bits, hq3::CFIFO, val);
+        }
         let phase = {
             let s = self.shared.hq4.lock();
             if s.ready && s.protocol != 1 {
@@ -1114,6 +1127,7 @@ impl ImpactXio {
                         // closing word follows.
                         s.ready = true;
                         s.protocol = 3;
+                        self.shared.commands.store(true, Ordering::Release);
                         s.pending |= pending::CONTEXT;
                         s.update(out);
                     }
