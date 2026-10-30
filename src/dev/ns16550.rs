@@ -592,6 +592,21 @@ impl Ns16550 {
     /// and on status and data reads, so a driver polling for data sees it at
     /// once.
     pub fn pump(&mut self) -> bool {
+        if self.loopback() {
+            // Loopback disconnects the serial input: what arrives on the
+            // line goes nowhere and only the looped-back characters reach
+            // the receiver. It is dropped when the host offers it, rather
+            // than a character time later as on the line, an approximation.
+            let mut dropped = self.typed.len();
+            self.typed.clear();
+            while self.backend.recv_byte().is_ok() {
+                dropped += 1;
+            }
+            if dropped != 0 {
+                log::debug!("16550: dropped {dropped} input characters while in loopback");
+            }
+            return false;
+        }
         let mut moved = false;
         loop {
             let n = self.can_receive();
@@ -799,6 +814,27 @@ mod tests {
         assert_eq!(u.read(LSR) & 3, 1, "reading made room for it");
         assert_eq!(u.read(THR), b'b');
         assert_eq!(u.read(LSR) & 1, 0);
+    }
+
+    /// With modem-control bit 4 set the part disconnects its serial input: a
+    /// character from the line goes nowhere, whether the host typed it or its
+    /// backend offered it, and only looped-back ones reach the receiver.
+    ///
+    /// QEMU: sn0/ioc3-serial/loopback-discards-external-input.
+    #[test]
+    fn loopback_discards_input_from_the_line() {
+        let (mut u, w) = uart();
+        u.write(MCR, MCR_LOOP);
+        w.inp.lock().unwrap().extend(b"o");
+        u.type_in(b"t");
+        assert!(!u.pump());
+        assert_eq!(u.read(LSR) & 1, 0, "nothing reached the receiver");
+        assert!(w.inp.lock().unwrap().is_empty(), "the backend's character was taken and dropped");
+        u.write(THR, b'l');
+        assert_eq!((u.read(LSR) & 1, u.read(THR)), (1, b'l'), "a looped-back one still lands");
+        u.write(MCR, 0);
+        u.type_in(b"x");
+        assert_eq!(u.read(THR), b'x', "and the line works again outside loopback");
     }
 
     #[test]
