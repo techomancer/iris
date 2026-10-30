@@ -814,6 +814,42 @@ fn the_last_reference_released_on_another_thread_stops_the_mac() {
     assert!(!running.load(Ordering::SeqCst), "the last release stops it");
 }
 
+#[test]
+fn fuel_phy_mdio_decoder_and_machine_reset() {
+    let eth = Ioc3Eth::new_fuel(STATION);
+    assert_eq!(eth.mac(), STATION);
+    let read = |phy: u32, r: u32| {
+        eth.write32(MII_CONTROL, MII_READ | (phy << 5) | r);
+        eth.read32(MII_DATA_R)
+    };
+    assert_eq!(read(1, 2), 0x2000);
+    assert_eq!(read(1, 3), 0x5c10);
+    assert_eq!(read(0, 2), 0xffff);
+    eth.write32(MII_DATA_W, 7);
+    eth.write32(MII_CONTROL, (1 << 5) | 0x19);
+    assert_eq!(read(1, 2), 0xffff);
+    assert_eq!(read(7, 2), 0x2000);
+    // A wrong-address reset has no effect.
+    eth.write32(MII_DATA_W, 0x8000);
+    eth.write32(MII_CONTROL, 1 << 5);
+    assert_eq!(read(7, 2), 0x2000);
+    eth.reset();
+    assert_eq!(read(1, 3), 0x5c10);
+    assert_eq!(read(7, 2), 0xffff);
+    // The MAC soft reset leaves PHY programming intact.
+    eth.write32(MII_DATA_W, 0x21);
+    eth.write32(MII_CONTROL, (1 << 5) | 4);
+    eth.write32(MAC_CONTROL, MCR_RESET);
+    assert_eq!(read(1, 4), 0x21);
+    // Forced mode exposes the configured backend cable without waiting.
+    eth.write32(MII_DATA_W, 0x2100);
+    eth.write32(MII_CONTROL, 1 << 5);
+    for up in [false, true] {
+        eth.set_backend_link(up);
+        assert_eq!(read(1, 1) & 4 != 0, up);
+    }
+}
+
 /// A guest that does nothing but ACK: the whole host side of a lock-step
 /// TFTP read (transmit descriptor, NAT thread, built-in server, receive
 /// thread, receive ring), with the guest's own software left out. Every
