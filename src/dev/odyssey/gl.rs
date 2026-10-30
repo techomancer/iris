@@ -620,11 +620,19 @@ impl GlDrawFields {
 
 /// One GL primitive set up for the raster unit: everything Board::gl_draw()
 /// read of the board, owned.
-struct GlDrawJob {
+///
+/// The raster unit hands a finished job back (RasterQueue::give_back) and
+/// the front end fills it again for a later draw, keeping its vertex
+/// buffer and texture chain: allocating them per draw on the front end and
+/// freeing them on the raster thread had the two threads contending for
+/// the allocator.
+pub struct GlDrawJob {
     rules: RasterRules,
     target: RasterTarget<'static>,
     image: GlTexImage<'static>,
+    /// Kept across reuse; the draw reads it only when `textured`.
     chain: Option<Box<TextureChain>>,
+    textured: bool,
     tables: TexelTables,
     state: GlDrawState,
     vertices: Vec<f32>,
@@ -635,9 +643,10 @@ struct GlDrawJob {
 
 impl GlDrawJob {
     /// Draw it; the result, and the line-stipple phase the context keeps.
-    fn run(&self, ctx: &mut RasterCtx) -> (GlDrawResult, Option<u32>) {
+    pub fn run(&self, ctx: &mut RasterCtx) -> (GlDrawResult, Option<u32>) {
         let mut t = self.target.clone();
-        t.texture = self.chain.as_deref().map(|chain| chain.image(&self.image));
+        let chain = self.chain.as_deref().filter(|_| self.textured);
+        t.texture = chain.map(|chain| chain.image(&self.image));
         let mut d = self.fields.draw(&self.vertices, &self.state, &self.polygon_stipple);
         if d.line_phase == Some(LINE_PHASE_ON_RASTER) {
             d.line_phase = Some(ctx.line_phase);
@@ -645,7 +654,7 @@ impl GlDrawJob {
         // SAFETY: the raster unit owns the planes while the job runs
         // (PlaneSpans).
         let mut pixels = unsafe { self.pixels.pixels() };
-        let texels = self.chain.as_deref().map(|chain| unsafe { self.tables.texels(chain, self.pixels.spans.obj) });
+        let texels = chain.map(|chain| unsafe { self.tables.texels(chain, self.pixels.spans.obj) });
         let texels: &dyn Texels = match &texels {
             Some(texels) => texels,
             None => &NoTexels,
@@ -1879,15 +1888,22 @@ impl Board {
         let rules = self.gl_operation_rules();
         let mut state: GlDrawState = *d.state;
         let mut image = GlTexImage::default();
+        // A job the raster unit has finished with, if one is back.
+        let mut spare = self.raster.take_draw();
         // Some 7 KB that only a textured draw uses, and Board::texture_setup()
         // clears before it fills any of it, so it is not built for every
-        // primitive.
-        let mut texture: Option<Box<TextureChain>> = None;
+        // primitive, and a reused job's is reused.
+        let mut texture: Option<Box<TextureChain>> = spare.as_mut().and_then(|j| j.chain.take());
+        let textured = d.state.texture_2d != 0 || d.state.texture_3d != 0;
 
-        if d.state.texture_2d != 0 || d.state.texture_3d != 0 {
-            let chain = texture.insert(Box::default());
+        if textured {
+            let chain = texture.get_or_insert_with(Box::default);
 
             if !self.texture_setup(&mut image, chain) {
+                if let Some(mut j) = spare {
+                    j.chain = texture;
+                    self.raster.give_back(j);
+                }
                 crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: GL draw path: backend scalar-skip result {} called=0", SGI_GL_DRAW_OK);
                 return SGI_GL_DRAW_OK;
             }
@@ -1909,32 +1925,50 @@ impl Board {
         state.fog_index = ((self.gl_fog[0] >> 12) & 0xfff) as f32;
         self.gl_report_refusals(true);
         t.texture = None;
-        let tables = TexelTables::of(self, texture.as_deref());
-        let job = Box::new(GlDrawJob {
-            rules,
-            target: t,
-            image,
-            chain: texture,
-            tables,
-            state,
-            vertices: d.vertices.to_vec(),
-            polygon_stipple: *d.polygon_stipple,
-            fields: GlDrawFields::of(d),
-            pixels: self.gl_pixel_job(),
-        });
+        let tables = TexelTables::of(self, texture.as_deref().filter(|_| textured));
+        let pixels = self.gl_pixel_job();
+        let job = match spare {
+            Some(mut j) => {
+                j.rules = rules;
+                j.target = t;
+                j.image = image;
+                j.chain = texture;
+                j.textured = textured;
+                j.tables = tables;
+                j.state = state;
+                j.vertices.clear();
+                j.vertices.extend_from_slice(d.vertices);
+                j.polygon_stipple = *d.polygon_stipple;
+                j.fields = GlDrawFields::of(d);
+                j.pixels = pixels;
+                j
+            }
+            None => Box::new(GlDrawJob {
+                rules,
+                target: t,
+                image,
+                chain: texture,
+                textured,
+                tables,
+                state,
+                vertices: d.vertices.to_vec(),
+                polygon_stipple: *d.polygon_stipple,
+                fields: GlDrawFields::of(d),
+                pixels,
+            }),
+        };
         self.scanout.invalidate_all();
         if !self.raster.threaded() {
             let (result, phase) = self.raster.run_now(|ctx| job.run(ctx));
             d.line_phase = phase;
+            self.raster.give_back(job);
             return result;
         }
         // The raster unit draws it later, so the context hears no result:
         // every result but out-of-memory is only reported, and that one
         // needs a polygon of more vertices than the host can address. The
         // raster unit keeps the line-stipple phase the draw advances.
-        self.raster.submit(move |ctx| {
-            job.run(ctx);
-        });
+        self.raster.submit_draw(job);
         if d.line_phase.is_some() {
             d.line_phase = Some(LINE_PHASE_ON_RASTER);
         }

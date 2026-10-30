@@ -191,3 +191,43 @@ fn the_stipple_phase_carries_across_draws_on_the_raster_thread() {
     assert!(inline.iter().any(|&p| p != 0) && inline.iter().any(|&p| p == 0), "a stippled line");
     assert_eq!(threaded, inline);
 }
+
+/// The raster unit gives a drawn GL job back and the next draw fills it
+/// again; the refilled job draws only the new primitive, with its own
+/// vertex count, whether it ran on the raster thread or inside its submit.
+#[test]
+fn a_reused_draw_job_draws_only_its_new_primitive() {
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    fn draws(h: &BoardLocks, st: &GlDrawState) -> Vec<u32> {
+        let stipple = [0u32; 32];
+        let (w, ht) = (SGI_ODYSSEY_WIDTH as f32, SGI_ODYSSEY_HEIGHT as f32);
+        // A six-vertex pair of triangles, then once that is drawn a
+        // three-vertex one that covers less.
+        let quad = vertices(&[(0.0, 0.0), (64.0, 0.0), (0.0, 64.0), (64.0, 0.0), (64.0, 64.0), (0.0, 64.0)], RED);
+        let mut d = GlDraw::new(SGI_GL_TRIANGLES, 6, &quad, st, &stipple);
+        assert_eq!(h.board.lock().gl_draw(&mut d), SGI_GL_DRAW_OK);
+        h.board.lock().raster_wait();
+        let tri = vertices(&[(w - 64.0, ht - 64.0), (w, ht - 64.0), (w - 64.0, ht)], BLUE);
+        let mut d = GlDraw::new(SGI_GL_TRIANGLES, 3, &tri, st, &stipple);
+        assert_eq!(h.board.lock().gl_draw(&mut d), SGI_GL_DRAW_OK);
+        let s = h.board.lock();
+        s.raster_wait();
+        let mut px = Vec::new();
+        for y in (0..SGI_ODYSSEY_HEIGHT as i32).step_by(8) {
+            for x in (0..SGI_ODYSSEY_WIDTH as i32).step_by(8) {
+                px.push(pixel(&s, 0, x, y));
+            }
+        }
+        px
+    }
+
+    let (s, st) = gl_board();
+    let inline = draws(&BoardLocks::new(s), &st);
+    let (h, st) = slow_raster(0);
+    let threaded = draws(&h, &st);
+    eventually("the second job did not come back", || h.raster.spare_draws() == 1);
+    h.raster.stop();
+    let colours: std::collections::BTreeSet<u32> = inline.iter().copied().filter(|&p| p != 0).collect();
+    assert_eq!(colours.len(), 2, "both primitives drew, each in its own colour");
+    assert_eq!(threaded, inline);
+}

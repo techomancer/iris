@@ -76,6 +76,13 @@ pub type RasterJob = Box<dyn FnOnce(&mut RasterCtx) + Send>;
 
 /// The ring entry's address word: the value is a boxed `RasterJob`.
 const ENTRY_JOB: u32 = 1;
+/// The value is a boxed `GlDrawJob`, which goes back to the front end
+/// when drawn.
+const ENTRY_DRAW: u32 = 2;
+
+/// Finished GL draw jobs kept for the front end to fill again. A draw
+/// that finds none allocates; one finished while this many wait is freed.
+const SPARE_DRAWS: usize = 1024;
 
 thread_local! {
     /// This thread holds the raster unit's context lock and reads the
@@ -100,6 +107,10 @@ impl Drop for PlanesHeld<'_> {
 /// IMPACT model's two engines interleave scanlines.
 pub struct RasterQueue<const HEADS: usize = 1> {
     ring: Box<GFifo<ODSY_RASTER_QUEUE_MAX, HEADS>>,
+    /// Finished draw jobs, from the raster thread (or a draw run inside
+    /// its submit) back to the front end, which takes them under the board
+    /// lock.
+    spare: Box<GFifo<SPARE_DRAWS>>,
     /// Held by the raster thread for a slice of jobs, by a job run inside
     /// the submit, and by the display while it reads the planes.
     ctx: Mutex<RasterCtx>,
@@ -139,6 +150,8 @@ impl<const HEADS: usize> Default for RasterQueue<HEADS> {
             // SAFETY: a zeroed GFifo is an empty one (GFifo::new); built in
             // place because the ring is too big for the stack.
             ring: unsafe { Box::new_zeroed().assume_init() },
+            // SAFETY: as the ring.
+            spare: unsafe { Box::new_zeroed().assume_init() },
             ctx: Mutex::new(RasterCtx::default()),
             pending: AtomicU32::new(0),
             pushed: AtomicU64::new(0),
@@ -161,10 +174,30 @@ impl<const HEADS: usize> Default for RasterQueue<HEADS> {
 impl<const HEADS: usize> Drop for RasterQueue<HEADS> {
     fn drop(&mut self) {
         // Jobs never run still own their captures.
-        while let Some((_, value)) = self.ring.peek() {
+        while let Some((kind, value)) = self.ring.peek() {
             self.ring.consume();
-            // SAFETY: every entry holds a job from submit(), taken once.
-            drop(unsafe { Box::from_raw(value as *mut RasterJob) });
+            // SAFETY: every entry holds a job from submit() or
+            // submit_draw(), taken once.
+            unsafe { drop_entry(kind, value) };
+        }
+        while let Some((_, value)) = self.spare.peek() {
+            self.spare.consume();
+            // SAFETY: give_back() put each there, taken once.
+            drop(unsafe { Box::from_raw(value as *mut GlDrawJob) });
+        }
+    }
+}
+
+/// Free a ring entry's job without running it.
+///
+/// # Safety
+/// The entry came from submit() or submit_draw() and is taken once.
+unsafe fn drop_entry(kind: u32, value: u64) {
+    unsafe {
+        if kind == ENTRY_DRAW {
+            drop(Box::from_raw(value as *mut GlDrawJob));
+        } else {
+            drop(Box::from_raw(value as *mut RasterJob));
         }
     }
 }
@@ -191,16 +224,53 @@ impl RasterQueue {
             return;
         }
         let entry = Box::into_raw(Box::new(Box::new(job) as RasterJob)) as u64;
+        self.push(ENTRY_JOB, entry);
+    }
+
+    /// Hand a GL draw to the raster unit, behind every job before it. The
+    /// raster thread gives the job back when drawn (`take_draw`). The
+    /// caller is the front end, under the board lock, with the raster
+    /// thread running.
+    pub fn submit_draw(&self, job: Box<GlDrawJob>) {
+        debug_assert!(self.threaded());
+        self.push(ENTRY_DRAW, Box::into_raw(job) as u64);
+    }
+
+    fn push(&self, kind: u32, entry: u64) {
         self.pending.fetch_add(1, SeqCst);
         // The ring is deep; it fills only when the raster unit is far behind,
         // and then the front end waits for it, as the board's would.
-        while !self.ring.try_push(ENTRY_JOB, entry) {
+        while !self.ring.try_push(kind, entry) {
             std::thread::yield_now();
         }
         self.pushed.fetch_add(1, SeqCst);
         if self.sleeping.load(SeqCst) {
             let _g = self.wake.lock();
             self.kick.notify_one();
+        }
+    }
+
+    /// A finished draw job to fill again, if one is back. The caller is the
+    /// front end, under the board lock: the only taker.
+    pub fn take_draw(&self) -> Option<Box<GlDrawJob>> {
+        let (_, value) = self.spare.peek()?;
+        self.spare.consume();
+        // SAFETY: give_back() put it there, and it is taken once.
+        Some(unsafe { Box::from_raw(value as *mut GlDrawJob) })
+    }
+
+    /// Keep a finished draw job for a later draw, or free it when enough
+    /// wait already.
+    pub fn give_back(&self, job: Box<GlDrawJob>) {
+        let entry = Box::into_raw(job) as u64;
+        while !self.spare.try_push(0, entry) {
+            if self.spare.len() >= SPARE_DRAWS - 1 {
+                // SAFETY: the entry was not pushed, so it is still ours.
+                drop(unsafe { Box::from_raw(entry as *mut GlDrawJob) });
+                return;
+            }
+            // The other giver holds the push lock for a moment.
+            std::hint::spin_loop();
         }
     }
 
@@ -234,6 +304,12 @@ impl RasterQueue {
         let ctx = self.ctx.lock();
         PLANES_HELD.with(|h| h.set(true));
         PlanesHeld { _ctx: ctx }
+    }
+
+    /// Tests: finished draw jobs waiting to be filled again.
+    #[cfg(test)]
+    pub fn spare_draws(&self) -> usize {
+        self.spare.len()
     }
 
     /// Tests: a slice holds the raster unit's context.
@@ -306,12 +382,19 @@ impl RasterQueue {
             }
             let deadline = Instant::now() + RASTER_SLICE;
             crate::pf_begin!(crate::perfetto::events::ODSY_RASTER_SLICE, self.pending());
-            while let Some((_, value)) = self.ring.peek() {
+            while let Some((kind, value)) = self.ring.peek() {
                 self.ring.consume();
                 self.taken.fetch_add(1, SeqCst);
-                // SAFETY: every entry holds a job from submit(), taken once.
-                let job = unsafe { Box::from_raw(value as *mut RasterJob) };
-                job(&mut ctx);
+                if kind == ENTRY_DRAW {
+                    // SAFETY: submit_draw() put it there, and it is taken once.
+                    let job = unsafe { Box::from_raw(value as *mut GlDrawJob) };
+                    job.run(&mut ctx);
+                    self.give_back(job);
+                } else {
+                    // SAFETY: submit() put it there, and it is taken once.
+                    let job = unsafe { Box::from_raw(value as *mut RasterJob) };
+                    job(&mut ctx);
+                }
                 self.drawn.store(true, SeqCst);
                 if self.pending.fetch_sub(1, SeqCst) == 1 {
                     let _g = self.idle.lock();
