@@ -288,6 +288,9 @@ when the guest is in its idle loop. A producer that adds work, or a device
 that raises an interrupt, unparks the thread it is waiting on. See
 `clanker/perf/` for what went wrong each time a parking rule was missed.
 
+`hptimer` sleeps to 50 µs short of its next deadline and spins only the rest,
+so a 1 kHz tick costs a few percent of a core, not all of it.
+
 The idle detector samples the guest PC every 32 sample calls (about 320
 instructions in the batch loop) and parks only when one long kernel cluster of
 code dominates the sample ring (at least 12 of 32 samples and 12 distinct PCs,

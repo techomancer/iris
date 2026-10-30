@@ -111,6 +111,12 @@ hashes are given where a change is easiest to understand by reading the commit.
   yield-spun at ~100 % of a host core on an idle desktop in every build but
   `idle-pause`; it now parks when its queue is empty, and the producer wakes
   it on the next write. (`src/dev/ng1/rex3.rs`)
+- **The timer thread sleeps between deadlines instead of spinning.** On the
+  Indigo2 the `hptimer` thread kept a host core at ~100 %: it spun for every
+  wait under 200 µs, and the machine's tick timers keep the waits that short.
+  It now sleeps to 50 µs short of a deadline and spins the rest, and an Indigo2
+  at the login screen uses a few percent of a core.
+  (`src/hptimer.rs`)
 
 ### Idle parking
 
