@@ -3794,6 +3794,100 @@ mod tests {
         });
     }
 
+    /// The R10000 writes zeros into the PFN bits a page size leaves out of the
+    /// address, so TLBR returns them as zero (R10000 UM v2.0 pp. 299-300, TLBWI
+    /// and TLBWR); the later parts do the same as a model choice, since no
+    /// manual describes their TLB write. The R4400 keeps the whole PFN. The values are the PROM
+    /// diagnostic's patterns on 16 KB pages, where EntryLo bits 7:6 go unused.
+    /// Translation is the same on both: those bits never reach the address.
+    #[test]
+    fn tlb_write_clears_pfn_bits_below_the_page_size_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        // Write (lo0, lo1) with PageMask 0x6000 through TLBWI or TLBWR, then
+        // find the entry with TLBP and TLBR it back. Returns (EntryLo0, EntryLo1, physical address of
+        // VA + 0x3000).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32, lo0: u64, lo1: u64) -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<crate::cpu::mips_tlb::MipsTlb, C>::new(
+                Arc::new(MockMemory::new()) as Arc<dyn BusDevice>, crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.install_status_cb();
+            let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+            let dmtc0 = |rd: u32| (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11);
+            for (rd, value) in [(12, status as u64), (10, VA), (0, 0), (5, 0x6000), (2, lo0), (3, lo1)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec(dmtc0(rd)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
+            let phys = exec.debug_translate(VA + 0x3000).phys;
+            // TLBWR picked the slot: find it with TLBP.
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            for rd in [2, 3] {
+                exec.core.write_gpr(1, 0);
+                assert_eq!(exec.exec(dmtc0(rd)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (exec.core.read_cp0(2), exec.core.read_cp0(3), phys)
+        }
+        on_big_stack(|| {
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                let (lo0, lo1) = (0xFFFF_FFFF_A5A5_A5A4, 0x5A5A_5A58);
+                // EntryLo 7:6 cleared; 63:62 and 33:6 otherwise kept.
+                assert_eq!(entry::<R10000ShadowCache>(funct, lo0, lo1).0, 0xC000_0003_A5A5_A524, "R10000 {funct:#x}");
+                assert_eq!(entry::<R10000ShadowCache>(funct, lo0, lo1).1, 0x5A5A_5A18, "R10000 {funct:#x}");
+                assert_eq!(entry::<R10000ShadowCache>(funct, lo1, lo0).0, 0x5A5A_5A18, "R10000 {funct:#x}");
+                // The R4400 keeps bits 29:0 as written.
+                assert_eq!(entry::<R4400Cache>(funct, lo0, lo1).0, 0x25A5_A5A4, "R4400 {funct:#x}");
+                assert_eq!(entry::<R4400Cache>(funct, lo0, lo1).1, 0x1A5A_5A58, "R4400 {funct:#x}");
+
+                // A 16 KB page at 0x0300_4000 written with PFN bits for
+                // 0x0300_7000: both parts translate from the 16 KB frame.
+                let lo = ((0x0300_7000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                let (r10k, _, r10k_pa) = entry::<R10000ShadowCache>(funct, lo, 0);
+                let (r4k, _, r4k_pa) = entry::<R4400Cache>(funct, lo, 0);
+                assert_eq!((r10k, r10k_pa), (lo & !0xC0, 0x0300_7000), "R10000 {funct:#x}");
+                assert_eq!((r4k, r4k_pa), (lo, 0x0300_7000), "R4400 {funct:#x}");
+            }
+        });
+    }
+
+    /// On the R10000 family EntryLo holds a 28-bit PFN (33:6) and the uncached
+    /// attribute in 63:62 (R10000 UM v2.0 pp. 239-240); the R4400 and R5000 keep a
+    /// 24-bit PFN and nothing above it. The TLB carries the whole PFN.
+    #[test]
+    fn entrylo_covers_the_pfn_and_attribute_bits_of_the_r10000_family() {
+        fn readback<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, u64::MAX);
+            // DMTC0 $1, EntryLo0 and EntryLo1; both read back the same field.
+            for reg in [2u32, 3] {
+                assert_eq!(exec.exec((0x10 << 26) | (5 << 21) | (1 << 16) | (reg << 11)), EXEC_COMPLETE);
+            }
+            let (lo0, lo1) = (exec.core.read_cp0(2), exec.core.read_cp0(3));
+            assert_eq!(lo0, lo1);
+            lo0
+        }
+        assert_eq!(readback::<R4400Cache>(), 0x3FFF_FFFF);
+        // Bits 61:34 are not PFN: they read back as zero, so only 33:32 reach physical 39:38.
+        assert_eq!(readback::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(), 0xC000_0003_FFFF_FFFF);
+
+        // The TLB carries the whole PFN: bits 33:32 are physical 39:38, and FrameMask
+        // is what keeps software flags there out of the address.
+        on_big_stack(|| {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000);
+            assert_eq!(exec.debug_translate(VA).phys, 0xC0_2054_C000);
+            // FrameMask 0xC000 is EntryLo 33:32: the page lands where its PFN says.
+            let mut exec = map_page_masked::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000, 0xC000);
+            assert_eq!(exec.debug_translate(VA).phys, 0x2054_C000);
+        });
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
