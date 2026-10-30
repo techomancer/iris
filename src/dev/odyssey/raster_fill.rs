@@ -680,6 +680,7 @@ const RGBA: u32 = SGI_GL_RGBA;
 const RGB: u32 = SGI_GL_RGB;
 const LESS: u32 = SGI_GL_LESS;
 const LEQUAL: u32 = SGI_GL_LEQUAL;
+const ALWAYS: u32 = SGI_GL_ALWAYS;
 
 fill_rows! {
     // The fallbacks: any state the loops take, tested per pixel.
@@ -713,6 +714,13 @@ fill_rows! {
     TrilinearReplaceRgbLequal = (true, TRILINEAR, true, REPLACE, RGB, 1, LEQUAL, 1, D, OFF, 0, D, D);
     TrilinearModulateRgbaLequal = (true, TRILINEAR, true, MODULATE, RGBA, 1, LEQUAL, 1, D, OFF, 0, D, D);
     TrilinearModulateRgbLequal = (true, TRILINEAR, true, MODULATE, RGB, 1, LEQUAL, 1, D, OFF, 0, D, D);
+
+
+    // Blended alpha-over and depth tested: Smoke & Mirrors' bilinear RGB
+    // glass, depth LESS and written, and perfly's trilinear RGBA sky,
+    // depth ALWAYS and not written.
+    LinearModulateRgbLessOver = (true, LINEAR, true, MODULATE, RGB, 1, LESS, 1, D, OVER, 0, D, D);
+    TrilinearModulateRgbaAlwaysOver = (true, TRILINEAR, true, MODULATE, RGBA, 1, ALWAYS, 0, D, OVER, 0, D, D);
 
     // Untextured: no depth test, or LESS or LEQUAL written; flat or
     // smooth; unblended or blended alpha-over; no fog.
@@ -823,8 +831,8 @@ impl SoftDraw<'_> {
     /// None for the general loop: under SGI_RASTER_TEXTURE_SPANS, for state
     /// SoftDraw::fill_admits() takes (the fixed-point sampler already
     /// excludes the rest). A loop of its own for the common states
-    /// SOFT_TEXTURE_SPANS names; the others take the loop that tests the
-    /// state per pixel.
+    /// SOFT_TEXTURE_SPANS and the two blended entries name; the others take
+    /// the loop that tests the state per pixel.
     pub fn fixed_span_select(&self, f: &SoftFixedTex) -> Option<FillRow> {
         let st: &GlDrawState = self.st;
 
@@ -864,15 +872,24 @@ impl SoftDraw<'_> {
         if SOFT_FILL_PATH.with(|p| p.get()) == SGI_RASTER_FILL_DYNAMIC
             || kernel < 0
             || env < 0
-            || format < 0
-            || func < 0
-            || f.wrap_s != SGI_GL_REPEAT
-            || f.wrap_t != SGI_GL_REPEAT
             || st.depth_test == 0
-            || st.depth_mask == 0
-            || self.blend
             || st.fog != 0
         {
+            return Some(FillRow::TextureAny);
+        }
+        let repeat = f.wrap_s == SGI_GL_REPEAT && f.wrap_t == SGI_GL_REPEAT;
+        if self.blend {
+            // The two blended states named for themselves.
+            let over = repeat && env == 1 && self.fill_blend_over();
+            if over && kernel == 1 && format == 1 && st.depth_func == SGI_GL_LESS && st.depth_mask != 0 {
+                return Some(FillRow::LinearModulateRgbLessOver);
+            }
+            if over && kernel == 2 && format == 0 && st.depth_func == SGI_GL_ALWAYS && st.depth_mask == 0 {
+                return Some(FillRow::TrilinearModulateRgbaAlwaysOver);
+            }
+            return Some(FillRow::TextureAny);
+        }
+        if !repeat || format < 0 || func < 0 || st.depth_mask == 0 {
             return Some(FillRow::TextureAny);
         }
         Some(SOFT_TEXTURE_SPANS[func as usize][kernel as usize][env as usize][format as usize])
@@ -1100,11 +1117,12 @@ mod tests {
     }
 
     // Each textured specialisation, in the state it names, smooth shaded,
-    // draws what the general loop draws.
+    // draws what the general loop draws; with s clamped to the edge, so
+    // does the fallback.
     #[test]
     fn every_texture_row_matches_the_general_path() {
         let mut seed = 200u64;
-        for func in [SGI_GL_LESS, SGI_GL_LEQUAL] {
+        for (wrap, func) in [SGI_GL_REPEAT, SGI_GL_CLAMP_TO_EDGE].into_iter().flat_map(|w| [(w, SGI_GL_LESS), (w, SGI_GL_LEQUAL)]) {
             for (min, mag) in [(SGI_GL_NEAREST, SGI_GL_NEAREST), (SGI_GL_LINEAR, SGI_GL_LINEAR), (SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR)] {
                 for env in [SGI_GL_REPLACE, SGI_GL_MODULATE] {
                     for format in [SGI_GL_RGBA, SGI_GL_RGB] {
@@ -1121,7 +1139,9 @@ mod tests {
                                 random_stencil(&mut Lcg(seed), &mut b.st);
                             }
                             b.st.texture_env_mode = env;
-                            b.tex = Some(BenchTexture::new(32, min, mag, format));
+                            let mut tex = BenchTexture::new(32, min, mag, format);
+                            tex.wrap_s = wrap;
+                            b.tex = Some(tex);
                             b
                         };
                         let want = draw_bench(make(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_FIXED);
@@ -1203,6 +1223,76 @@ mod tests {
         assert_eq!(r.fill_select(), Some(FillRow::FillAny));
         let f = SoftFixedTex { min: SGI_GL_LINEAR, mag: SGI_GL_LINEAR, format: SGI_GL_RGB, wrap_s: SGI_GL_REPEAT, wrap_t: SGI_GL_REPEAT, ..Default::default() };
         assert_eq!(r.fixed_span_select(&f), Some(FillRow::LinearModulateRgbLess));
+    }
+
+    // The two blended textured specialisations, each in the state it names,
+    // some stencil tested or clipped, draw what the general loop draws.
+    #[test]
+    fn blended_texture_rows_match_the_general_path() {
+        for seed in 500..=520u64 {
+            let sky = seed % 2 == 0;
+            let make = || {
+                let mut b = case(seed, true);
+                b.st.depth_test = 1;
+                b.st.depth_func = if sky { SGI_GL_ALWAYS } else { SGI_GL_LESS };
+                b.st.depth_mask = (!sky) as u32;
+                b.st.blend = 1;
+                b.st.blend_src = SGI_GL_SRC_ALPHA;
+                b.st.blend_dst = SGI_GL_ONE_MINUS_SRC_ALPHA;
+                b.st.blend_equation = SGI_GL_FUNC_ADD;
+                b.st.fog = 0;
+                b.st.texture_env_mode = SGI_GL_MODULATE;
+                b.tex = Some(if sky {
+                    BenchTexture::new(32, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA)
+                } else {
+                    BenchTexture::new(32, SGI_GL_LINEAR, SGI_GL_LINEAR, SGI_GL_RGB)
+                });
+                b
+            };
+            let want = draw_bench(make(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_FIXED);
+            let table = draw_bench(make(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
+
+            compare(seed, "blended textured loop", &want, &table);
+        }
+    }
+
+    // Each textured specialisation is reachable from the state it names.
+    #[test]
+    fn selection_reaches_each_texture_entry() {
+        let mut seen = Vec::new();
+        let mut b = Bench::empty();
+        b.st.depth_test = 1;
+        for blend in [false, true] {
+            for wrap in [SGI_GL_REPEAT, SGI_GL_CLAMP_TO_EDGE] {
+                for (func, mask) in [(SGI_GL_LESS, 1), (SGI_GL_LEQUAL, 1), (SGI_GL_ALWAYS, 0)] {
+                    for (min, mag) in [(SGI_GL_NEAREST, SGI_GL_NEAREST), (SGI_GL_LINEAR, SGI_GL_LINEAR), (SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR)] {
+                        for env in [SGI_GL_REPLACE, SGI_GL_MODULATE] {
+                            for format in [SGI_GL_RGBA, SGI_GL_RGB] {
+                                b.st.depth_func = func;
+                                b.st.depth_mask = mask;
+                                b.st.texture_env_mode = env;
+                                b.st.blend = blend as u32;
+                                b.st.blend_src = SGI_GL_SRC_ALPHA;
+                                b.st.blend_dst = SGI_GL_ONE_MINUS_SRC_ALPHA;
+                                let t = b.board.gl_target();
+                                let reports = SoftReports::default();
+                                let mut r = SoftDraw::new(&b.rules, &t, &b.st, &reports);
+                                r.ntargets = 1;
+                                assert!(r.setup_ops());
+                                let lod = min != mag;
+                                let f = SoftFixedTex { min, mag, lod, format, wrap_s: wrap, wrap_t: SGI_GL_REPEAT, ..Default::default() };
+                                let row = r.fixed_span_select(&f).expect("a row loop");
+                                if !seen.contains(&row) {
+                                    seen.push(row);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 24 unblended, 2 blended and the fallback.
+        assert_eq!(seen.len(), 27, "{seen:?}");
     }
 
     // The board's own pixel tests: an id test that passes some pixels of a

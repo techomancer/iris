@@ -55,15 +55,16 @@ impl VolumeVertex {
 /// keeps its inside end and adds the point where it crosses the plane.
 /// A value that is not a number is outside.
 pub fn volume_clip_triangle(in_: &[VolumeVertex; 3], out: &mut [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX]) -> u32 {
+    out[..3].clone_from_slice(in_);
+    if in_[0].contains() && in_[1].contains() && in_[2].contains() {
+        return 3;
+    }
+    // Only a triangle that crosses a plane needs the working polygons.
     let mut src: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = std::array::from_fn(|_| VolumeVertex::default());
     let mut dst: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = std::array::from_fn(|_| VolumeVertex::default());
     let mut n: usize = 3;
 
-    out[..3].clone_from_slice(in_);
     src[..3].clone_from_slice(in_);
-    if in_[0].contains() && in_[1].contains() && in_[2].contains() {
-        return 3;
-    }
     for p in 0..SGI_VOLUME_PLANES {
         let mut m: usize = 0;
 
@@ -768,11 +769,36 @@ impl SoftDraw<'_> {
         if self.bounds().is_none() || !self.clip_triangle(va, vb, vc, &mut poly, &mut n) {
             return;
         }
+        self.clipped_fan(&poly, n, provoking);
+    }
+
+    /// Rasterize what clipping left of a triangle, n vertices of poly, as a
+    /// fan from its first vertex, each flat shaded from provoking.
+    pub fn clipped_fan(&self, poly: &[VolumeVertex; SGI_VOLUME_TRIANGLE_MAX], n: u32, provoking: &[f32]) {
         let mut i = 1usize;
         while i + 1 < n as usize {
             self.clipped_triangle(&poly[0], &poly[i], &poly[i + 1], provoking);
             i += 1;
         }
+    }
+
+    /// A textured quad's two triangles, a b c and a c d, each flat shaded
+    /// from provoking: both are validated before either is drawn
+    /// (SoftDraw::texture_triangle_valid()), and drawn from the clipping
+    /// that validated them.
+    pub fn texture_quad(&self, a: &[f32], b: &[f32], c: &[f32], d: &[f32], provoking: [&[f32]; 2]) {
+        let mut first: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
+        let mut second: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
+        let (mut n1, mut n2) = (0u32, 0u32);
+
+        if !self.clip_triangle(a, b, c, &mut first, &mut n1) || !self.clip_triangle(a, c, d, &mut second, &mut n2) {
+            return;
+        }
+        if self.bounds().is_none() {
+            return;
+        }
+        self.clipped_fan(&first, n1, provoking[0]);
+        self.clipped_fan(&second, n2, provoking[1]);
     }
 }
 
@@ -1530,10 +1556,8 @@ impl SoftDraw<'_> {
             SGI_GL_QUADS => {
                 let mut i = 0usize;
                 while i + 3 < n {
-                    if self.texture.is_some()
-                        && (!self.texture_triangle_valid(v(i), v(i + 1), v(i + 2))
-                            || !self.texture_triangle_valid(v(i), v(i + 2), v(i + 3)))
-                    {
+                    if self.texture.is_some() {
+                        self.texture_quad(v(i), v(i + 1), v(i + 2), v(i + 3), [v(i + 3), v(i + 3)]);
                         i += 4;
                         continue;
                     }
@@ -1546,10 +1570,8 @@ impl SoftDraw<'_> {
                 // Vertices 2i - 1, 2i, 2i + 2 and 2i + 1 in order (2.6.1).
                 let mut i = 0usize;
                 while i + 3 < n {
-                    if self.texture.is_some()
-                        && (!self.texture_triangle_valid(v(i), v(i + 1), v(i + 3))
-                            || !self.texture_triangle_valid(v(i), v(i + 3), v(i + 2)))
-                    {
+                    if self.texture.is_some() {
+                        self.texture_quad(v(i), v(i + 1), v(i + 3), v(i + 2), [v(i + 3), v(i + 3)]);
                         i += 2;
                         continue;
                     }
@@ -1575,5 +1597,93 @@ impl SoftDraw<'_> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev::odyssey::raster_bench::*;
+
+    const SIDE: i32 = 160;
+
+    /// A vertex at window pixel (x, y) with w, depth d, colour c and
+    /// texture coordinates s and t.
+    fn vertex(x: f32, y: f32, w: f32, d: f32, c: [f32; 4], s: f32, t: f32) -> [f32; SGI_GL_VERTEX_FLOATS] {
+        let mut o = [0.0f32; SGI_GL_VERTEX_FLOATS];
+
+        o[SGI_GL_V_POSITION..SGI_GL_V_POSITION + 4]
+            .copy_from_slice(&[(x / BENCH_W as f32 * 2.0 - 1.0) * w, (y / BENCH_H as f32 * 2.0 - 1.0) * w, 2.0 * d - w, w]);
+        o[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&c);
+        o[SGI_GL_V_TEXCOORD..SGI_GL_V_TEXCOORD + 4].copy_from_slice(&[s * w, t * w, 0.0, w]);
+        o
+    }
+
+    /// Smooth-shaded, depth-tested, trilinear modulated draws of mode, one
+    /// draw for each of prims, and the colour and depth planes after.
+    fn draw(mode: u32, prims: Vec<Vec<f32>>) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut b = Bench::empty();
+
+        b.st.depth_test = 1;
+        b.st.texture_2d = 1;
+        b.st.texture_env_mode = SGI_GL_MODULATE;
+        b.tex = Some(BenchTexture::new(32, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
+        b.mode = mode;
+        b.prims = prims;
+        b.prepare();
+        b.run();
+        b.snapshot(SIDE)
+    }
+
+    /// n random vertices in perspective inside the square, some crossing
+    /// the near or far plane.
+    fn vertices(rng: &mut Lcg, n: usize) -> Vec<[f32; SGI_GL_VERTEX_FLOATS]> {
+        (0..n)
+            .map(|_| {
+                let c = [rng.range(0.0, 1.0), rng.range(0.0, 1.0), rng.range(0.0, 1.0), 1.0];
+                vertex(rng.range(0.0, SIDE as f32), rng.range(0.0, SIDE as f32), rng.range(0.5, 3.0), rng.range(-0.2, 1.2), c, rng.range(-1.0, 2.0), rng.range(-1.0, 2.0))
+            })
+            .collect()
+    }
+
+    // A textured quad, or a quad strip's quad, draws its two triangles,
+    // each clipped as a triangle of its own would be.
+    #[test]
+    fn textured_quads_draw_their_two_triangles() {
+        let mut rng = Lcg(77);
+        let mut drawn = 0;
+        for _ in 0..30 {
+            let v = vertices(&mut rng, 4);
+            let quad: Vec<f32> = v.iter().flatten().copied().collect();
+            let tris = |order: [usize; 6]| -> Vec<Vec<f32>> { vec![order.iter().flat_map(|&i| v[i]).collect()] };
+
+            let want = draw(SGI_GL_TRIANGLES, tris([0, 1, 2, 0, 2, 3]));
+            assert!(draw(SGI_GL_QUADS, vec![quad.clone()]) == want, "quads");
+            // Strip vertices 0 1 3 2 make the quad 0 1 2 3.
+            let strip: Vec<f32> = [0, 1, 3, 2].iter().flat_map(|&i| v[i]).collect();
+            assert!(draw(SGI_GL_QUAD_STRIP, vec![strip]) == want, "quad strip");
+            drawn += want.0.iter().filter(|&&c| c != 0).count();
+        }
+        assert!(drawn > 20000, "the quads drew too little: {drawn}");
+    }
+
+    // A textured quad one of whose triangles has no valid texture planes is
+    // dropped whole, the valid triangle too.
+    #[test]
+    fn a_textured_quad_with_an_invalid_triangle_draws_nothing() {
+        let white = [1.0; 4];
+        let mut v = [
+            vertex(10.0, 10.0, 1.0, 0.5, white, 0.0, 0.0),
+            vertex(150.0, 10.0, 1.0, 0.5, white, 1.0, 0.0),
+            vertex(150.0, 150.0, 1.0, 0.5, white, 1.0, 1.0),
+            vertex(10.0, 150.0, 1.0, 0.5, white, 0.0, 1.0),
+        ];
+        let first: Vec<f32> = v[..3].iter().flatten().copied().collect();
+        assert!(draw(SGI_GL_TRIANGLES, vec![first]).0.iter().any(|&c| c != 0), "the valid triangle draws alone");
+        v[3][SGI_GL_V_TEXCOORD] = f32::NAN;
+        let quad: Vec<f32> = v.iter().flatten().copied().collect();
+        assert!(draw(SGI_GL_QUADS, vec![quad]).0.iter().all(|&c| c == 0), "quads");
+        let strip: Vec<f32> = [0, 1, 3, 2].iter().flat_map(|&i| v[i]).collect();
+        assert!(draw(SGI_GL_QUAD_STRIP, vec![strip]).0.iter().all(|&c| c == 0), "quad strip");
     }
 }

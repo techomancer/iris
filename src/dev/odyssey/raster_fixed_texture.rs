@@ -268,13 +268,13 @@ impl SoftDraw<'_> {
 }
 
 /// Allocate zeroed cells for size texels, or None where that fails.
-pub fn soft_fixed_alloc(size: usize) -> Option<Vec<u64>> {
-    let mut v: Vec<u64> = Vec::new();
+pub fn soft_fixed_alloc<T: Copy + Default>(size: usize) -> Option<Vec<T>> {
+    let mut v: Vec<T> = Vec::new();
 
     if v.try_reserve_exact(size).is_err() {
         return None;
     }
-    v.resize(size, 0);
+    v.resize(size, T::default());
     Some(v)
 }
 
@@ -300,10 +300,11 @@ impl<'a> SoftDraw<'a> {
 
             if store.size < size {
                 store.cell = Vec::new();
+                store.tag = Vec::new();
                 store.size = 0;
-                match soft_fixed_alloc(size) {
-                    Some(v) => store.cell = v,
-                    None => return false,
+                match (soft_fixed_alloc(size), soft_fixed_alloc(size)) {
+                    (Some(cell), Some(tag)) => (store.cell, store.tag) = (cell, tag),
+                    _ => return false,
                 }
                 store.size = size;
             }
@@ -319,13 +320,21 @@ impl<'a> SoftDraw<'a> {
         Some(soft_fixed_expand(f.format, rgba))
     }
 
-    /// Read interior texel (x, y) of relative level i, and return its cell,
-    /// tagged with tag, or tagged failed where the read failed.
+    /// Read interior texel (x, y) of relative level i into its cell at
+    /// index of store, tagged with tag, and return it in lanes; or tag it
+    /// failed and return None where the read fails.
     #[inline(never)]
-    pub fn fixed_fill(&self, i: u32, x: u32, y: u32, tag: u32) -> u64 {
+    pub fn fixed_fill(&self, store: &mut SoftFixedStore, index: usize, i: u32, x: u32, y: u32, tag: u32) -> Option<u64> {
         match self.fixed_read(self.fixed_tex(), i, x, y) {
-            Some(texel) => (tag as u64) << 32 | texel as u64,
-            None => ((tag | SGI_SOFT_FIXED_FAILED) as u64) << 32,
+            Some(texel) => {
+                store.tag[index] = tag;
+                store.cell[index] = soft_fixed_lanes(texel);
+                Some(store.cell[index])
+            }
+            None => {
+                store.tag[index] = tag | SGI_SOFT_FIXED_FAILED;
+                None
+            }
         }
     }
 }
@@ -400,39 +409,42 @@ pub fn fixed_return(cache: &std::cell::RefCell<SoftTexelCache>, f: &mut SoftFixe
 }
 
 impl<'a> SoftDraw<'a> {
-    /// Interior texel (x, y) of relative level i in lanes, read once a draw.
+    /// Interior texel (x, y) of relative level i in lanes, read once a draw:
+    /// from the prefilled arrays, or with cache, this thread's texel store,
+    /// through it.
     #[inline(always)]
-    pub fn fixed_texel(&self, i: u32, x: u32, y: u32, lanes: &mut u64) -> bool {
+    pub fn fixed_texel(&self, cache: &mut Option<std::cell::RefMut<SoftTexelCache>>, i: u32, x: u32, y: u32, lanes: &mut u64) -> bool {
         let f = self.fixed_tex();
         let index = ((y as usize) << f.level[i as usize].width_shift) + x as usize;
-
-        if f.prefilled {
+        let Some(cache) = cache else {
             *lanes = f.plain[i as usize][index];
             return true;
-        }
-        let (tag, mut v) = {
-            let cache = self.texel_cache();
-            (cache.tag, cache.fixed[i as usize].cell[index])
         };
-        if (v >> 32) as u32 != tag {
-            if (v >> 32) as u32 == (tag | SGI_SOFT_FIXED_FAILED) {
-                return false;
-            }
-            v = self.fixed_fill(i, x, y, tag);
-            self.texel_cache().fixed[i as usize].cell[index] = v;
-            if (v >> 32) as u32 != tag {
-                return false;
-            }
+        let tag = cache.tag;
+        let store = &mut cache.fixed[i as usize];
+        let cell = store.tag[index];
+
+        if cell == tag {
+            *lanes = store.cell[index];
+            return true;
         }
-        *lanes = soft_fixed_lanes(v as u32);
-        true
+        if cell == (tag | SGI_SOFT_FIXED_FAILED) {
+            return false;
+        }
+        match self.fixed_fill(store, index, i, x, y, tag) {
+            Some(v) => {
+                *lanes = v;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The texel at signed index (x, y) of relative level i after wrapping,
     /// which leaves an index outside the interior only under CLAMP and
     /// CLAMP_TO_BORDER: there the border colour.
     #[inline(always)]
-    pub fn fixed_tap<const REPEAT: bool>(&self, i: u32, x: i64, y: i64, lanes: &mut u64) -> bool {
+    pub fn fixed_tap<const REPEAT: bool>(&self, cache: &mut Option<std::cell::RefMut<SoftTexelCache>>, i: u32, x: i64, y: i64, lanes: &mut u64) -> bool {
         let f = self.fixed_tex();
         let fl = &f.level[i as usize];
 
@@ -440,7 +452,7 @@ impl<'a> SoftDraw<'a> {
             *lanes = f.border;
             return true;
         }
-        self.fixed_texel(i, x as u32, y as u32, lanes)
+        self.fixed_texel(cache, i, x as u32, y as u32, lanes)
     }
 }
 
@@ -520,7 +532,8 @@ impl SoftDraw<'_> {
     /// product weights all four of a texel's components in their 16-bit
     /// lanes; down, the sums need 24 bits, so two products take two each.
     #[inline(always)]
-    pub fn fixed_level<const REPEAT: bool>(&self, i: u32, filter: u32, u: i64, v: i64, out: &mut [u64; 2]) -> bool {
+    #[allow(clippy::too_many_arguments, reason = "a level's sample takes its position as scalars")]
+    pub fn fixed_level<const REPEAT: bool>(&self, cache: &mut Option<std::cell::RefMut<SoftTexelCache>>, i: u32, filter: u32, u: i64, v: i64, out: &mut [u64; 2]) -> bool {
         let f = self.fixed_tex();
         let fl = &f.level[i as usize];
         let ws = if REPEAT { SGI_GL_REPEAT } else { f.wrap_s };
@@ -531,7 +544,7 @@ impl SoftDraw<'_> {
         if filter == SGI_GL_NEAREST {
             soft_fixed_axis(u, fl.width, ws, f.upper_s, false, &mut x0, &mut x1);
             soft_fixed_axis(v, fl.height, wt, f.upper_t, false, &mut y0, &mut y1);
-            if !SoftDraw::fixed_tap::<REPEAT>(self, i, x0, y0, &mut c00) {
+            if !SoftDraw::fixed_tap::<REPEAT>(self, cache, i, x0, y0, &mut c00) {
                 return false;
             }
             out[0] = ((c00 >> 16) & SGI_SOFT_FIXED_PAIRS) << 16;
@@ -540,10 +553,10 @@ impl SoftDraw<'_> {
         }
         let a = soft_fixed_axis(u, fl.width, ws, f.upper_s, true, &mut x0, &mut x1);
         let b = soft_fixed_axis(v, fl.height, wt, f.upper_t, true, &mut y0, &mut y1);
-        if !SoftDraw::fixed_tap::<REPEAT>(self, i, x0, y0, &mut c00)
-            || !SoftDraw::fixed_tap::<REPEAT>(self, i, x1, y0, &mut c10)
-            || !SoftDraw::fixed_tap::<REPEAT>(self, i, x0, y1, &mut c01)
-            || !SoftDraw::fixed_tap::<REPEAT>(self, i, x1, y1, &mut c11)
+        if !SoftDraw::fixed_tap::<REPEAT>(self, cache, i, x0, y0, &mut c00)
+            || !SoftDraw::fixed_tap::<REPEAT>(self, cache, i, x1, y0, &mut c10)
+            || !SoftDraw::fixed_tap::<REPEAT>(self, cache, i, x0, y1, &mut c01)
+            || !SoftDraw::fixed_tap::<REPEAT>(self, cache, i, x1, y1, &mut c11)
         {
             return false;
         }
@@ -727,9 +740,11 @@ impl SoftDraw<'_> {
             }
         }
         let fl = &f.level[first as usize];
+        // This thread's texel store, borrowed once for the sample's taps.
+        let mut cache = if f.prefilled { None } else { Some(self.texel_cache()) };
         let mut u = soft_fixed_floor(s * (fl.width as f64 * 256.0));
         let mut v = soft_fixed_floor(t * (fl.height as f64 * 256.0));
-        if !SoftDraw::fixed_level::<REPEAT>(self, first, filter, u, v, &mut out) {
+        if !SoftDraw::fixed_level::<REPEAT>(self, &mut cache, first, filter, u, v, &mut out) {
             return false;
         }
         if alpha != 0 {
@@ -737,7 +752,7 @@ impl SoftDraw<'_> {
             // exact half, so its floor is this one's halved, rounded down.
             u >>= fl.width_shift.wrapping_sub(f.level[second as usize].width_shift) & 63;
             v >>= fl.height_shift.wrapping_sub(f.level[second as usize].height_shift) & 63;
-            if !SoftDraw::fixed_level::<REPEAT>(self, second, filter, u, v, &mut other) {
+            if !SoftDraw::fixed_level::<REPEAT>(self, &mut cache, second, filter, u, v, &mut other) {
                 return false;
             }
             let a = alpha as u64;

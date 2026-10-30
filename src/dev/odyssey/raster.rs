@@ -1255,11 +1255,13 @@ pub const SGI_SOFT_FIXED_LEVELS: usize = 14;
 pub const SGI_SOFT_FIXED_FAILED: u32 = 0x80000000;
 
 /// The fixed-point sampler's texels of one level for one draw, by interior
-/// index: each the read tag in the high word and the packed RGBA8 texel,
-/// components expanded, in the low (SoftDraw::fixed_texel()).
+/// index: each the packed RGBA8 texel, components expanded, in lanes
+/// (soft_fixed_lanes()), and the tag of the draw that read it
+/// (SoftDraw::fixed_texel()).
 #[derive(Clone, Default)]
 pub struct SoftFixedStore {
     pub cell: Vec<u64>,
+    pub tag: Vec<u32>,
     pub size: usize,
     pub plain: Vec<u64>,
 }

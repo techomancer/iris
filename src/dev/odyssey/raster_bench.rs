@@ -156,9 +156,12 @@ pub enum Scene {
     /// TexStencil's state under a client clip plane that cuts the screen
     /// (Smoke & Mirrors' reflected scene).
     TexStencilClip,
+    /// Small bilinear RGB quads, depth tested: each quad's two triangles
+    /// validated as a pair before either draws.
+    TexQuads,
 }
 
-pub const ALL_SCENES: [Scene; 17] = [
+pub const ALL_SCENES: [Scene; 18] = [
     Scene::FlatFill,
     Scene::SmoothDepth,
     Scene::SmoothBlend,
@@ -176,6 +179,7 @@ pub const ALL_SCENES: [Scene; 17] = [
     Scene::TexClampTrilinear,
     Scene::TexBlendOver,
     Scene::TexStencilClip,
+    Scene::TexQuads,
 ];
 
 /// One scene, built: the board, the draw state, the vertex lists of its
@@ -400,6 +404,22 @@ impl Bench {
                 st.blend_dst = SGI_GL_ONE_MINUS_SRC_ALPHA;
                 b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
+            }
+            Scene::TexQuads => {
+                st.depth_test = 1;
+                st.texture_2d = 1;
+                b.mode = SGI_GL_QUADS;
+                b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR, SGI_GL_LINEAR, SGI_GL_RGB));
+                for _ in 0..count {
+                    // A triangle's three corners and the fourth that makes
+                    // a parallelogram of them.
+                    let (mut v, a) = triangle(&mut rng, 20.0, 1.5 / 256.0);
+                    let f = SGI_GL_VERTEX_FLOATS;
+                    let d: Vec<f32> = (0..f).map(|k| v[k] + v[2 * f + k] - v[f + k]).collect();
+                    v.extend_from_slice(&d);
+                    b.prims.push(v);
+                    b.pixels += 2.0 * a;
+                }
             }
             Scene::BigQuads | Scene::BigTexTrilinear => {
                 st.depth_test = 1;
