@@ -709,13 +709,13 @@ impl RasterRules {
         super::depth_word::word_for_fraction(z)
     }
 
-    /// A polygon offset (the sum of slope, units and bias, in window depth)
-    /// split into what adds to the window depth before the code and the steps
-    /// that add to the code after it. With depth_float the board adds the
-    /// offset field to the encoded word (depth_word::word_with_offset(),
-    /// INFERRED placement), and the field's step is 2^-24 of the offset
-    /// carried here (ODSY_POLYGON_OFFSET_SCALE), so none of it adds to window
-    /// depth.
+    /// A polygon offset (RasterRules::offset_amount(), in window depth) split
+    /// into what adds to the window depth before the code and the steps that
+    /// add to the code after it. With depth_float the amount is the 0x058
+    /// field over 2^24 (ODSY_POLYGON_OFFSET_SCALE), a step count the board
+    /// adds to the encoded word (depth_word::word_with_offset(); datasheet,
+    /// "Polygon offset" and "Depth word"; the placement is INFERRED), so none
+    /// of it adds to window depth.
     pub fn split_offset(&self, offset: f64) -> (f64, i64) {
         if !self.depth_float {
             return (offset, 0);
@@ -1661,9 +1661,22 @@ impl RasterRules {
         if st.polygon_offset & SGI_GL_OFFSET_FILL == 0 {
             return 0.0;
         }
-        st.depth_slope(window) * st.offset_factor as f64
-            + st.offset_units as f64 / self.depth_max() as f64
-            + st.offset_bias as f64
+        self.offset_amount(st, st.depth_slope(window))
+    }
+
+    /// The offset of an enabled polygon mode for a primitive of depth slope m:
+    /// m factor + r units + bias in window depth (OpenGL 1.2.1, 3.5.5). With
+    /// depth_float the guest library has already folded factor (through
+    /// tan L) and 2 units into one per-projection step count and sends it as
+    /// the 0x058 field, which the context carries as the bias; the board has
+    /// no per-polygon slope term (datasheet, "Polygon offset"). So only the
+    /// bias counts there, and the slope and the context's factor and units,
+    /// which the library never sets, add nothing.
+    pub fn offset_amount(&self, st: &GlDrawState, slope: f64) -> f64 {
+        if self.depth_float {
+            return st.offset_bias as f64;
+        }
+        slope * st.offset_factor as f64 + st.offset_units as f64 / self.depth_max() as f64 + st.offset_bias as f64
     }
 }
 

@@ -1225,9 +1225,7 @@ impl SoftDraw<'_> {
             }
         }
         if self.st.polygon_offset & SGI_GL_OFFSET_FILL != 0 {
-            offset = slope * self.st.offset_factor as f64
-                + (self.st.offset_units / self.rules.depth_max() as f32) as f64
-                + self.st.offset_bias as f64;
+            offset = self.rules.offset_amount(&self.st, slope);
         }
         self.polygon_coverage(&v, n, flat_color, flat_index as f64, offset);
     }
@@ -1394,9 +1392,7 @@ impl SoftDraw<'_> {
         }
         let offset_enable = if mode == SGI_GL_LINE { SGI_GL_OFFSET_LINE } else { SGI_GL_OFFSET_POINT };
         if self.st.polygon_offset & offset_enable != 0 {
-            offset = slope * self.st.offset_factor as f64
-                + (self.st.offset_units / self.rules.depth_max() as f32) as f64
-                + self.st.offset_bias as f64;
+            offset = self.rules.offset_amount(&self.st, slope);
         }
         for i in 0..n {
             if !poly[i].soft_boundary_edge() {

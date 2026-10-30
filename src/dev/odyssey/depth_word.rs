@@ -106,8 +106,9 @@ pub const OFFSET_STEPS_MAX: i64 = (1 << 24) - 1;
 /// The word after a polygon offset. INFERRED placement (datasheet, "Polygon
 /// offset"): the board adds the field to the encoded word, so the offset
 /// counts mantissa steps and shrinks toward the near plane in proportion to
-/// d - n. APPROXIMATION: the sum clamps to 0 and the largest word; what the
-/// board does at either end is not shown.
+/// d - n. The sum clamps to 0 and the largest word, a model choice: what the
+/// board does at either end is not shown. The field alone is the step count;
+/// the library has already folded factor and units into it ("Polygon offset").
 pub fn word_with_offset(word: u32, steps: i64) -> u32 {
     (word as i64 + steps).clamp(0, ODSY_DEPTH24_MAX as i64) as u32
 }
@@ -293,6 +294,13 @@ mod tests {
     /// board's depth rules, depth test `func`, and `steps` of polygon offset
     /// through the register's path (the shared context's bias).
     fn draw_flat(depth: &mut [u32], zw: f64, func: u32, steps: i64) {
+        draw_sloped(depth, zw, 0.0, func, steps, (0.0, 0.0));
+    }
+
+    /// [`draw_flat`] with the third vertex `tilt` further in window depth, so
+    /// the triangle has a depth slope, and the context's glPolygonOffset
+    /// factor and units set to `(factor, units)`.
+    fn draw_sloped(depth: &mut [u32], zw: f64, tilt: f64, func: u32, steps: i64, (factor, units): (f32, f32)) {
         let rules = RasterRules {
             subpixel_bits: 4,
             color_bits: 8,
@@ -328,6 +336,8 @@ mod tests {
             polygon_offset: SGI_GL_OFFSET_FILL,
             // What the 0x058 write puts in the shared context.
             offset_bias: steps as f32 * ODSY_POLYGON_OFFSET_SCALE,
+            offset_factor: factor,
+            offset_units: units,
             ..Default::default()
         };
         st.drawable.bound = 1;
@@ -339,7 +349,8 @@ mod tests {
 
         for (i, (x, y)) in [(-1.0f32, -1.0f32), (3.0, -1.0), (-1.0, 3.0)].iter().enumerate() {
             let v = &mut verts[i * SGI_GL_VERTEX_FLOATS..(i + 1) * SGI_GL_VERTEX_FLOATS];
-            v[SGI_GL_V_POSITION..SGI_GL_V_POSITION + 4].copy_from_slice(&[*x, *y, ndc_z, 1.0]);
+            let z = if i == 2 { ndc_z + (tilt * 2.0) as f32 } else { ndc_z };
+            v[SGI_GL_V_POSITION..SGI_GL_V_POSITION + 4].copy_from_slice(&[*x, *y, z, 1.0]);
             v[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&[1.0; 4]);
         }
         let stipple = [0u32; 32];
@@ -396,6 +407,29 @@ mod tests {
         let mut fb = plane(ODSY_DEPTH24_MAX);
         draw_flat(&mut fb, 0.25, SGI_GL_LESS, -100);
         assert!(fb.iter().all(|&w| w == word_for_fraction(0.25) - 100), "a negative offset pulls nearer");
+    }
+
+    #[test]
+    fn the_offset_field_is_the_whole_offset_whatever_the_slope_factor_and_units() {
+        // The library folds factor and 2 units into the one field, and the board
+        // has no slope term, so a context carrying a factor and units, on a
+        // triangle with a depth slope, offsets exactly as the field says.
+        let mut plain = plane(ODSY_DEPTH24_MAX);
+        let mut loaded = plane(ODSY_DEPTH24_MAX);
+
+        draw_sloped(&mut plain, 0.25, 0.5, SGI_GL_LESS, 40, (0.0, 0.0));
+        draw_sloped(&mut loaded, 0.25, 0.5, SGI_GL_LESS, 40, (1.5, 2000.0));
+        assert_ne!(plain[0], ODSY_DEPTH24_MAX, "the triangle drew");
+        assert!(plain.iter().zip(&loaded).all(|(a, b)| a == b), "factor and units changed the stored depth");
+        // Same word delta from the unoffset draw at two depths.
+        for zw in [0.125, 0.5] {
+            let mut off = plane(ODSY_DEPTH24_MAX);
+            let mut none = plane(ODSY_DEPTH24_MAX);
+
+            draw_sloped(&mut off, zw, 0.25, SGI_GL_LESS, 40, (1.5, 2000.0));
+            draw_sloped(&mut none, zw, 0.25, SGI_GL_LESS, 0, (0.0, 0.0));
+            assert!(off.iter().zip(&none).all(|(a, b)| *b == ODSY_DEPTH24_MAX || *a == *b + 40), "zw {zw}");
+        }
     }
 
     #[test]
