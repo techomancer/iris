@@ -6633,4 +6633,54 @@ mod tests {
             })
             .unwrap().join().unwrap();
     }
+
+    /// A partial LWR keeps bits 63:32 of the destination on the R10000 and
+    /// sign-extends on the R4400 and R5000; a complete word sign-extends on all.
+    #[test]
+    fn partial_lwr_keeps_the_upper_word_only_on_the_r10000() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
+            let mem = Arc::new(MockMemory::new());
+            mem.set_word(0x2000, 0x89ab_cdef);
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(mem, PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, 0x2000);
+            let old = 0x8123_4567_a1b2_c3d4u64;
+            for (offset, word) in [0xa1b2_c389u32, 0xa1b2_89ab, 0xa189_abcd, 0x89ab_cdef].into_iter().enumerate() {
+                exec.core.write_gpr(2, old);
+                assert_eq!(exec.exec(make_i(OP_LWR, 1, 2, offset as u16)), EXEC_COMPLETE);
+                let expected = if keeps_upper && offset != 3 {
+                    (old & 0xffff_ffff_0000_0000) | word as u64
+                } else {
+                    word as i32 as i64 as u64
+                };
+                assert_eq!(exec.core.read_gpr(2), expected, "{} LWR offset {offset}", C::NAME);
+            }
+        }
+        check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+    }
+
+    /// FrameMask and the wide EntryLo belong to the whole R10000 family, not to
+    /// the parts that share the R10000's partial LWR. No R12000 type exists on
+    /// this branch, so this cannot run a family part whose LWR differs from
+    /// the R10000's; it checks the executor's masks against the family constant
+    /// the gate reads, and that the two behaviours are separate constants.
+    #[test]
+    fn framemask_and_entrylo_widths_follow_the_family_constant() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            let (framemask, entrylo) = if C::R10K_FAMILY { (0xFFFF, 0xC000_0003_FFFF_FFFF) } else { (0, 0x3FFF_FFFF) };
+            assert_eq!(exec.core.framemask_mask, framemask, "{} FrameMask", C::NAME);
+            assert_eq!(exec.core.entrylo_mask, entrylo, "{} EntryLo", C::NAME);
+        }
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
+        assert!(R10000ShadowCache::R10K_FAMILY);
+        assert!(!R4400ShadowCache::R10K_FAMILY && !R5000ShadowCache::R10K_FAMILY);
+        check::<R4400ShadowCache>();
+        check::<R5000ShadowCache>();
+        check::<R10000ShadowCache>();
+    }
 }

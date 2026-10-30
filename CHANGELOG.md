@@ -35,6 +35,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   stores and then at each power of two. Loads, instruction fetches, the R4400 and
   the R5000 are unchanged.
 
+### Partial LWR on the R10000
+
+- On the R10000 (Octane, IP28, and an O2 with the R10000), an `LWR` that loads fewer
+  than four bytes now keeps bits 63:32 of the destination instead of sign-extending,
+  as the reference results for the part show. R4400 and R5000 machines are unchanged.
+  The JIT matches the interpreter, and the code-cache key changes only for the
+  machines that have the behaviour.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
