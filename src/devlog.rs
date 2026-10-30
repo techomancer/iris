@@ -52,6 +52,9 @@ pub enum LogModule {
     /// The Octane's RAD1 PCI audio: rings, status DMA and register accesses
     /// the model does not support.
     Rad1 = 27,
+    /// The Octane's VPro (Odyssey) graphics board: guest accesses the
+    /// model does not support.
+    Odyssey = 28,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -60,7 +63,7 @@ pub const CACHE_LOG_MISS: u32 = 0x2;  // log misses and fills
 pub const CACHE_LOG_OP:   u32 = 0x4;  // log CACHE instruction ops
 
 impl LogModule {
-    pub const COUNT: usize = 28;
+    pub const COUNT: usize = 29;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -92,6 +95,7 @@ impl LogModule {
             "ultra"  => Some(Self::Ultra),
             "gr2"    => Some(Self::Gr2),
             "rad1"   => Some(Self::Rad1),
+            "odyssey" => Some(Self::Odyssey),
             _        => None,
         }
     }
@@ -126,6 +130,7 @@ impl LogModule {
             Self::Ultra  => "ultra",
             Self::Gr2    => "gr2",
             Self::Rad1   => "rad1",
+            Self::Odyssey => "odyssey",
         }
     }
 
@@ -136,7 +141,7 @@ impl LogModule {
             Self::Vino, Self::Dcb, Self::Vc2, Self::Cmap, Self::Xmap,
             Self::Bt445, Self::Scc, Self::Ps2, Self::Rtc, Self::Eeprom,
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
-            Self::Nveeprom, Self::Gr2, Self::Rad1,
+            Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey,
         ]
     }
 
@@ -277,6 +282,7 @@ impl DevLog {
                 ModuleLog::new(), // Nveeprom
                 ModuleLog::new(), // Gr2
                 ModuleLog::new(), // Rad1
+                ModuleLog::new(), // Odyssey
             ],
         }
     }
