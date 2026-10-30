@@ -33,6 +33,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   boot: the century IRIX writes while SET is up restarted the clock from the
   old time. The DS1685/DS1687 model now holds a century written under SET
   until SET clears, as the part does, and snapshots keep it.
+### SGI Fuel (IP34 board, IP35 software platform)
+
+- Added a headless Fuel profile, `fuel_ip34`: the 500 MHz R14000, 512 MiB
+  of RAM, Bedrock, two XBridge PCI heads, IOC3 serial ports, PS/2 and
+  Ethernet, a two-channel ISP12160, a Lucent OHCI USB controller and the
+  L1 system controller. PROM 6.210 passes its diagnostics and IRIX 6.5.30
+  boots to the login on the L1 or an IOC3 serial console, and `halt -p`
+  powers it off. See the [Fuel guide](docs/fuel-ip34.md).
 
 ### Benchmark and test suites: one pinned compiler
 

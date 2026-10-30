@@ -196,6 +196,11 @@ impl L1 {
     }
 
     #[cfg(test)]
+    pub fn config(&self) -> L1Config {
+        self.state.lock().config.clone()
+    }
+
+    #[cfg(test)]
     pub fn record(&self, component: usize, area: u32) -> Option<Vec<u8>> {
         let index = match area {
             1 => 0,
