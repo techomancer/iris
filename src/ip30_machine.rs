@@ -59,6 +59,11 @@ const XBOW_REVISION: u32 = 4;
 /// requires Crossbow 1.4 for the V10 and V12, so a machine with one of
 /// those presents it.
 const XBOW_REVISION_OCTANE2: u32 = 5;
+/// The Bridge's silicon revision: 3 on the 175 MHz Octane (an OpenBSD boot
+/// there prints "Bridge revision 3"), 4 on the reference Octane2, whose PROM
+/// monitor read the identification word as 0x4c00206d.
+const BRIDGE_REVISION: u32 = 3;
+const BRIDGE_REVISION_OCTANE2: u32 = 4;
 
 /// The PROM revision a VPro board needs (007-4210-003): 4.0 for the V6 and
 /// V8, 4.5 for the V10 and V12.
@@ -183,11 +188,10 @@ impl OctaneMachine {
                 }
             }
         }
-        let xbow_revision = if matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12) {
-            XBOW_REVISION_OCTANE2
-        } else {
-            XBOW_REVISION
-        };
+        // The Octane2 is the machine that takes a V10 or V12, as the VPro
+        // upgrade kit requires its Crossbow revision.
+        let octane2 = matches!(kind, crate::config::GraphicsBoard::V10 | crate::config::GraphicsBoard::V12);
+        let xbow_revision = if octane2 { XBOW_REVISION_OCTANE2 } else { XBOW_REVISION };
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(4);
         let timer_manager = Arc::new(TimerManager::new());
 
@@ -209,6 +213,7 @@ impl OctaneMachine {
         // flash on its first chip select, the system board's record on its
         // MicroLAN.
         let bridge = Bridge::new(mem.clone(), heart.clone());
+        bridge.set_revision(if octane2 { BRIDGE_REVISION_OCTANE2 } else { BRIDGE_REVISION });
         // The flash holds the PROM's own records as well as its code; with
         // `[octane] flash` they last from run to run.
         let flash = Arc::new(match &cfg.octane.flash {

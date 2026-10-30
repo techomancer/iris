@@ -47,7 +47,7 @@
 //!
 //! Ported from hw/pci-host/sgi-bridge.c in jamesbraid/qemu-sgi-origami.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Mutex, RwLock};
@@ -158,6 +158,7 @@ const RESERVED_DATA_HALF: u32 = 0x19c;
 const ID_REVISION_SHIFT: u32 = 28;
 const ID_PART_SHIFT: u32 = 12;
 const ID_MANUFACTURER_SHIFT: u32 = 1;
+/// The silicon revision a Bridge reports until the board names its own.
 const REVISION: u32 = 1;
 const PART: u32 = 0xc002;
 const MANUFACTURER: u32 = 0x036;
@@ -347,13 +348,13 @@ impl State {
 
     /// The chip's own core: the register file, the table and the latched
     /// errors. The interrupt pins' levels belong to whatever drives them.
-    fn reset_core(&mut self, flash_strap: bool) {
+    fn reset_core(&mut self, flash_strap: bool, revision: u32) {
         for (i, slot) in self.reg.iter_mut().enumerate() {
             *slot = reg_info(i as u32 * 8).map_or(0, |r| r.reset);
         }
         self.set_r(
             reg::IDENTIFICATION,
-            (REVISION << ID_REVISION_SHIFT) | (PART << ID_PART_SHIFT) | (MANUFACTURER << ID_MANUFACTURER_SHIFT) | 1,
+            ((revision & 0xf) << ID_REVISION_SHIFT) | (PART << ID_PART_SHIFT) | (MANUFACTURER << ID_MANUFACTURER_SHIFT) | 1,
         );
         if flash_strap {
             let s = self.r(reg::STATUS);
@@ -392,6 +393,8 @@ pub struct Bridge {
     slots: RwLock<[Option<Arc<dyn PciBusDevice>>; DEVICES]>,
     flash: RwLock<[Option<FlashPart>; 2]>,
     flash_strap: AtomicBool,
+    /// The silicon revision in the identification word, bits 31:28.
+    revision: AtomicU32,
     /// The one-wire net behind the NIC register; none fitted reads as an
     /// empty bus.
     microlan: Mutex<Option<w1::Bus>>,
@@ -499,7 +502,7 @@ impl Bridge {
             dma_pci_address: 0,
             dma_device: 0,
         };
-        st.reset_core(false);
+        st.reset_core(false, REVISION);
         Arc::new(Self {
             st: Mutex::new(st),
             irq_order: Mutex::new(()),
@@ -508,6 +511,7 @@ impl Bridge {
             slots: RwLock::new(Default::default()),
             flash: RwLock::new(Default::default()),
             flash_strap: AtomicBool::new(false),
+            revision: AtomicU32::new(REVISION),
             microlan: Mutex::new(None),
             link_alive: RwLock::new(Box::new(|w| w == WIDGET_HEART)),
             bar_sink: RwLock::new(None),
@@ -635,6 +639,16 @@ impl Bridge {
         st.set_r(reg::STATUS, if select1 { s | STATUS_FLASH_SELECT } else { s & !STATUS_FLASH_SELECT });
     }
 
+    /// The silicon revision the identification word reports in bits 31:28
+    /// (the board's chip: 3 on the 175 MHz Octane, 4 on a measured Octane2).
+    /// It survives a reset, as the chip's mask does.
+    pub fn set_revision(&self, revision: u32) {
+        self.revision.store(revision, Ordering::Release);
+        let mut st = self.st.lock();
+        let id = st.r(reg::IDENTIFICATION);
+        st.set_r(reg::IDENTIFICATION, (id & !(0xf << ID_REVISION_SHIFT)) | ((revision & 0xf) << ID_REVISION_SHIFT));
+    }
+
     /// Tell the Bridge which widgets the Crossbow has a live link to. A DMA
     /// request to any other widget is dropped by the Crossbow, which the
     /// Bridge's request timer reports. The default is HEART alone.
@@ -680,8 +694,9 @@ impl Bridge {
     /// re-evaluated against the cleared enables.
     pub fn reset(&self) {
         let strap = self.flash_strap.load(Ordering::Acquire);
+        let revision = self.revision.load(Ordering::Acquire);
         let mut st = self.st.lock();
-        st.reset_core(strap);
+        st.reset_core(strap, revision);
         st.pin_level = st.pci_pin_level | st.gpio_pin_level;
         drop(st);
         self.publish_bars();
