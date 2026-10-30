@@ -565,6 +565,12 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// The part is in the R10000 family, which shares one programming model:
+    /// FrameMask, and 44 virtual and 40 physical address bits.
+    /// Established for the R10000. The R12000 is inferred to match: its manual's
+    /// list of changes from the R10000 has no TLB or CP0 change. The R14000 and
+    /// R16000 are a model choice that gives them the same TLB.
+    const R10K_FAMILY: bool = false;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -3595,6 +3601,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
+    const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
     // 44 implemented virtual address bits on the R10000, as the shadow
     // model already says; XContext's layout follows them.
