@@ -13,6 +13,10 @@
 //! lock, with the registers that describe them. Interrupt packets and the
 //! callbacks (link change, link reset) go out after that lock is dropped.
 //!
+//! Revision code 5 (the Octane2's part) adds the reset fences and the
+//! resource lock; the fences are kept but gate nothing, since no warm reset
+//! travels through the modelled switch.
+//!
 //! Two approximations: a link reset on a fitted link brings the link back
 //! alive as it was before the reset (link training is not modelled, and the
 //! stock PROM resets each link it finds and expects it back), and register
@@ -57,6 +61,17 @@ const ARB_RELOAD: u32 = 0x58;
 const PERF_A: u32 = 0x60;
 const PERF_B: u32 = 0x68;
 const NIC: u32 = 0x70;
+/// Revision code 5 and later: widget 0's reset fence, then links 8 to 15's
+/// at a stride of 8, then the resource lock and its clear.
+const FENCE_BASE: u32 = 0x78;
+const FENCES: usize = 1 + LINKS;
+const FENCE_END: u32 = FENCE_BASE + 8 * FENCES as u32;
+const LOCK: u32 = 0xc0;
+const LOCK_CLEAR: u32 = 0xc8;
+const FENCE_MASK: u32 = 0xff;
+/// The first revision code with fences and the lock (Crossbow 2.0 in the
+/// software tables; an Octane2's code-5 part shows as 1.4 in its inventory).
+const REVISION_FENCES: u32 = 5;
 const LINK_BASE: u32 = 0x100;
 const LINK_STRIDE: u32 = 0x40;
 const LINK_END: u32 = LINK_BASE + LINK_STRIDE * LINKS as u32;
@@ -132,6 +147,12 @@ struct Regs {
     initializing: u8,
     eight_bit: u8,
     interrupt_asserted: bool,
+    /// Revision code 5 and later: which ports' warm resets may reach the
+    /// core (fence 0) and each link (fences 1 to 8). Kept; iris sends no
+    /// warm resets through the switch.
+    fences: [u32; FENCES],
+    /// The resource lock's byte.
+    lock: u32,
 }
 
 impl Regs {
@@ -157,6 +178,8 @@ impl Regs {
             link_arb_lower: [0; LINKS],
             link_aux_status: [0; LINKS],
             link_event: [0; LINKS],
+            fences: [FENCE_MASK; FENCES],
+            lock: 0,
             came_up: startup,
             initializing: 0,
             eight_bit: 0,
@@ -384,7 +407,10 @@ impl Xbow {
         }
     }
 
-    fn accessible(slot: u32, write: bool) -> bool {
+    fn accessible(&self, slot: u32, write: bool) -> bool {
+        if self.revision >= REVISION_FENCES && ((FENCE_BASE..FENCE_END).contains(&slot) || slot == LOCK || slot == LOCK_CLEAR) {
+            return slot % 8 == 0;
+        }
         match slot {
             IDENTIFICATION | STATUS | ERR_UPPER | ERR_LOWER | STATUS_CLEAR => !write,
             CONTROL | PACKET_TIMEOUT | INT_UPPER | INT_LOWER | ERR_CMD | LLP_CONTROL | ARB_RELOAD | PERF_A
@@ -409,7 +435,7 @@ impl Xbow {
             return None;
         }
         let slot = off.wrapping_sub(4);
-        if size != 4 || off % 8 != 4 || !Self::accessible(slot, write) {
+        if size != 4 || off % 8 != 4 || !self.accessible(slot, write) {
             self.note(off, size, write);
             self.record_access_error(r, out);
             return None;
@@ -444,6 +470,8 @@ impl Xbow {
                 PERF_A => r.perf_a,
                 PERF_B => r.perf_b,
                 NIC => r.nic,
+                s if (FENCE_BASE..FENCE_END).contains(&s) => r.fences[((s - FENCE_BASE) / 8) as usize],
+                LOCK | LOCK_CLEAR => r.lock,
                 s => {
                     let link = ((s - LINK_BASE) / LINK_STRIDE) as usize;
                     match (s - LINK_BASE) % LINK_STRIDE {
@@ -495,6 +523,14 @@ impl Xbow {
                 PERF_A => r.perf_a = val & PERF_SELECT_MASK,
                 PERF_B => r.perf_b = val & PERF_SELECT_MASK,
                 NIC => r.nic = val & NIC_MASK,
+                s if (FENCE_BASE..FENCE_END).contains(&s) => r.fences[((s - FENCE_BASE) / 8) as usize] = val & FENCE_MASK,
+                // Test-and-set: stored only while the lock is free.
+                LOCK => {
+                    if r.lock == 0 {
+                        r.lock = val & 0xff;
+                    }
+                }
+                LOCK_CLEAR => r.lock = 0,
                 s => {
                     let link = ((s - LINK_BASE) / LINK_STRIDE) as usize;
                     match (s - LINK_BASE) % LINK_STRIDE {
@@ -736,5 +772,31 @@ mod tests {
         }));
         assert!(x.write(LINK_BASE + LINK_STRIDE * 7 + LINK_RESET + 4, 4, 0));
         assert_eq!(*seen.lock(), [(15, true, true)]);
+    }
+
+    /// An Octane2's Crossbow (revision code 5) has the reset fences and the
+    /// resource lock its PROM programs: the fences reset to all ones and keep
+    /// bits 7:0, the lock takes a value only while free and its clear frees
+    /// it. Revision code 4 has neither, and an access there is an error.
+    #[test]
+    fn revision_five_has_reset_fences_and_a_lock() {
+        let x = Xbow::new(5, 0x8100);
+        for fence in 0..FENCES as u32 {
+            let off = FENCE_BASE + 8 * fence + 4;
+            assert_eq!(x.read(off, 4), Some(0xff), "fence {fence} resets to all ones");
+            assert!(x.write(off, 4, 0x1f7));
+            assert_eq!(x.read(off, 4), Some(0xf7));
+        }
+        assert_eq!(x.read(LOCK + 4, 4), Some(0));
+        assert!(x.write(LOCK + 4, 4, 3));
+        assert!(x.write(LOCK + 4, 4, 5));
+        assert_eq!(x.read(LOCK_CLEAR + 4, 4), Some(3), "a held lock keeps its value");
+        assert!(x.write(LOCK_CLEAR + 4, 4, 0x55));
+        assert_eq!(x.read(LOCK + 4, 4), Some(0));
+        assert_eq!(x.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, 0);
+
+        let old = octane();
+        assert_eq!(old.read(FENCE_BASE + 4, 4), None);
+        assert_ne!(old.read(STATUS + 4, 4).unwrap() as u32 & STATUS_ACCESS_ERROR, 0);
     }
 }
