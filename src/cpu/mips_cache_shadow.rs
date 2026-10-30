@@ -1044,6 +1044,16 @@ impl<
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
+/// SGI O2 R10000 (IP32): the IP28 shadow with 64-byte secondary-cache lines.
+///
+/// The O2 PROM (4.18 and earlier) handles only that line size. With Config's
+/// SB bit set (128-byte lines, as on an IP28) its sizing code keeps the
+/// secondary cache's *size* as the line size, then aligns every DMA buffer to
+/// 1 MB, runs out of heap, and panics on the first SCSI command. So O2 R10000
+/// modules have SB clear, and so does this model.
+pub type R10000O2ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 1048576, 64, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
 /// SGI Indy / Indigo2 R4400: the full model's geometry and identity — 16 KB
 /// direct-mapped primaries with 16-byte lines, a 1 MB secondary with 128-byte
 /// lines, PRId/FIR, 48 TLB entries, MIPS III — so CP0 Config and a PROM's
@@ -1306,6 +1316,20 @@ mod tests {
         let g = c.jit_dc_geometry();
         assert!(g.supported && g.tagless && !g.has_l2,
             "tagless, and no L2 decode slots for a store to invalidate: {g:?}");
+    }
+
+    /// The O2 R10000 runs this model from reset, so everything software can
+    /// read must be the O2 part's: the IP28 identity with 64-byte secondary
+    /// lines, the one size the O2 PROM handles.
+    #[test]
+    fn the_o2_shadow_is_the_ip28_part_with_64_byte_secondary_lines() {
+        type O2 = R10000O2ShadowCache;
+        type I2 = R10000ShadowCache;
+        assert_eq!(<O2 as MipsCache>::L2_LINE, 64);
+        assert_eq!((O2::IC_SIZE, O2::IC_LINE, O2::DC_SIZE, O2::DC_LINE, O2::L2_SIZE),
+                   (I2::IC_SIZE, I2::IC_LINE, I2::DC_SIZE, I2::DC_LINE, I2::L2_SIZE));
+        assert_eq!((<O2 as CpuModel>::PRID, <O2 as CpuModel>::FIR, <O2 as CpuModel>::TLB_ENTRIES, <O2 as CpuModel>::NAME),
+                   (<I2 as CpuModel>::PRID, <I2 as CpuModel>::FIR, <I2 as CpuModel>::TLB_ENTRIES, <I2 as CpuModel>::NAME));
     }
 
     /// The O2 POST case: memory behind the window, which the PROM rewrites

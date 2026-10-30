@@ -265,6 +265,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2 runs the shadow cache from reset.** POST keeps its stack in a
+  4 KB cache-as-RAM window the shadow cache now holds, so the full-model
+  phase and the handover to the shadow model are gone. Fuel and Origin can
+  arm their own windows the same way.
 - **O2 audio at 8 and 11 kHz no longer plays sharp.** A read of MACE's
   audio registers now brings the rings up to date, so IRIX, which keeps
   only about 2 ms of sound queued, no longer lets them run dry between

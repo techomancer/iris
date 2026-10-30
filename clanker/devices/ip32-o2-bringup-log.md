@@ -31,10 +31,11 @@ How it is put together now:
   buffer (far deeper than the real 128 entries); a
   full buffer, or a register read while the engine is busy, makes the CPU
   retry.
-- **Both CPUs' caches** (`src/ip32_handover.rs`): the full model while the
-  PROM runs POST, which keeps its stack in the cache; a tagless shadow model
-  once code outside the firmware runs. POST starting over (its Index Store
-  Tag sweep under the shadow model) hands back.
+- **Both CPUs' caches** (`src/cpu/mips_cache_shadow.rs`): the tagless shadow
+  model from reset. POST keeps its stack in the first 4 KB of physical memory,
+  in the data cache, while it tests the memory under it; the shadow model
+  holds that window's lines while POST runs
+  ([o2-post-cache-as-ram.md](o2-post-cache-as-ram.md)).
 
 The rest of this document is the bring-up journal, in order. Its middle
 chapters drive the machine through a test harness steered by `IRIS_IP32_*`
