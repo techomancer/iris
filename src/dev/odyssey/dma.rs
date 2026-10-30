@@ -1,0 +1,1767 @@
+//! Pixel DMA, queries, colour conversions and the texture level build.
+//!
+//! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code in jamesbraid/qemu-sgi-origami.
+
+
+use super::bits::{be16, be32, be64};
+use crate::devlog::LogModule;
+use std::sync::atomic::Ordering;
+use super::board::{Board, ODSY_CMD_OPERANDS_MAX, ODSY_HEIGHT, ODSY_OBJECTS, ODSY_WIDTH};
+use super::consts::{
+    clip, cmd_arity, dest, dma, gl_cmd, image, mode, query, route, tex, write, ODSY_BUFFERS,
+    ODSY_DEPTH24_MAX, ODSY_DRAW_WORD_STATE, ODSY_F32_ONE, ODSY_F32_SCALE_16, ODSY_F32_SCALE_32,
+    ODSY_F32_SCALE_8, ODSY_GAMMA_GROUP,
+};
+use super::context::{
+    ODSY_QUERY_COLOUR, ODSY_QUERY_EDGE, ODSY_QUERY_INDEX, ODSY_QUERY_NORMAL, ODSY_QUERY_TEXCOORD,
+};
+use super::draw::{code_is_index, decode_texel12, pixel_bytes, texel12_components};
+use super::geometry::{f32_bits, odyssey_f32};
+use super::pixel_dma::{write_guest, DmaBus, DmaDirection, DmaError, DmaMap, DmaPageList};
+use super::pixel_write::{write_form, WriteForm};
+use super::sampler::{texture_level_texel_format, texture_mip_build_word, LEVEL_FORMAT_MASK};
+use super::scanout::DirtySite;
+#[derive(Clone, Copy, Default)]
+pub(super) struct DmaEntry {
+    pub addr: u64,
+    pub len: u32,
+}
+
+/// One field of a packed pixel word: channel `chan` (0 red, 1 green, 2 blue,
+/// 3 alpha) narrowed to `width` bits and placed at bit `shift`. Width 0 ends
+/// the list.
+#[derive(Clone, Copy, Default)]
+pub(super) struct DmaField {
+    pub chan: u8,
+    pub width: u8,
+    pub shift: u8,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct DmaLayout {
+    pub code: u8,
+    pub bytes: u8,
+    /// Host bytes, each a channel of the plane word or one of the
+    /// dma::BYTE_* sources. Unused when `fields` is not empty.
+    pub from: [u8; 8],
+    /// A packed big-endian word of `bytes` bytes, most significant field
+    /// listed by its shift. Empty for a layout of whole bytes.
+    pub fields: [DmaField; 4],
+    /// Which plane the read takes its pixels from.
+    pub plane: ReadPlane,
+}
+
+/// The plane a read comes from and the form of its word.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(super) enum ReadPlane {
+    #[default]
+    Colour,
+    /// The depth word's 16-bit form: exponent and top ten mantissa bits.
+    Depth16,
+    /// The depth word as a 32-bit word, bits 31:24 zero.
+    Depth32,
+    /// The stencil byte.
+    Stencil,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct DmaSource {
+    /// The board-memory object read, or None for the colour buffer.
+    pub obj: Option<usize>,
+    pub front: bool,
+    pub x: i64,
+    pub y: i64,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct DmaPiece {
+    pub map: DmaMap,
+    pub at: u64,
+    pub src: u64,
+    pub len: u32,
+}
+
+// Anonymous enum: command-interpreter states.
+pub(super) const ODSY_CMD_IDLE: u32 = 0;
+pub(super) const ODSY_CMD_OPERANDS: u32 = 1;
+pub(super) const ODSY_CMD_COPY_RECT: u32 = 2;
+pub(super) const ODSY_CMD_PATTERN_LOAD: u32 = 3;
+pub(super) const ODSY_CMD_IMAGE_BOX_LOAD: u32 = 4;
+pub(super) const ODSY_CMD_IMAGE_BURST: u32 = 5;
+pub(super) const ODSY_CMD_MATRIX_LOAD: u32 = 6;
+pub(super) const ODSY_CMD_GL_RECT: u32 = 7;
+pub(super) const ODSY_CMD_SKIP: u32 = 8;
+
+/// The table's physical address half, unpacked from a descriptor word.
+pub(super) fn dma_desc_half(word: u32) -> u64 {
+    ((word & dma::DESC_ADDR_LOW_MASK) as u64)
+        | ((((word >> dma::DESC_ADDR_HIGH_SHIFT) & dma::DESC_ADDR_HIGH_MASK) as u64) << 17)
+}
+
+pub(super) fn dma_table_address(w1: u32, w3: u32) -> u64 {
+    (dma_desc_half(w1) << 24) | dma_desc_half(w3)
+}
+
+impl Board {
+    /// The hard DMA-done interrupt: the routed source whose vector is byte 15:8
+    /// of the route-vectors register. A DMA the driver asks to be told about
+    /// completes on two events, the fence and this interrupt; the model raises it
+    /// for exactly the descriptors whose header word 7 bit 31 asks for it, once
+    /// the transfer is finished. Nothing is delivered before the driver routes it.
+    pub fn dma_done(&mut self) {
+        let mut f = self.front.lock();
+        crate::pf_instant!(crate::perfetto::events::ODSY_DMA_DONE);
+        if f.routed() {
+            f.deliver_routed(route::VECTOR_DMA_SHIFT, "DMA-done", true);
+        }
+    }
+}
+
+/// Bytes per pixel, indexed by word 7's bits 18:16.
+pub(super) static DMA_BPP: [u8; (dma::BPP_MASK + 1) as usize] = [2, 4, 8, 16, 12, 1, 6, 3];
+
+impl DmaBus {
+    /// The entry's page pairs, up to a zero pair or the twelfth, into e[].
+    /// Returns how many, or a bus error when a read fails.
+    pub fn entries(&self, table: u64, seq: u64, e: &mut [DmaEntry]) -> Result<usize, DmaError> {
+        let mut n: usize = 0;
+
+        while n < dma::MAX_PAGES {
+            let mut raw = [0u8; 8];
+
+            if !self.read(table + dma::TABLE_HEADER + (n as u64) * 8, &mut raw, true, seq) {
+                return Err(DmaError::Bus);
+            }
+            let pte = be64(&raw[..8]);
+            if pte & (dma::PTE_LEN_MASK as u64) == 0 {
+                return Ok(n);
+            }
+            e[n].addr = pte >> dma::PTE_ADDR_SHIFT;
+            e[n].len = (pte & (dma::PTE_LEN_MASK as u64)) as u32;
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+impl Board {
+    /// One pixel of a transfer at (x, y) of the colour buffers the drawing
+    /// mask selects, decoded by the header's source format as an image
+    /// transfer's pixel is. Clipped to the plane only.
+    pub fn dma_put(&mut self, x: i64, y: i64, src: &[u8], code: u32) {
+        let pixel = self.decode_pixel(code, src).unwrap_or(0);
+        if x < 0 || y < 0 || x >= ODSY_WIDTH as i64 || y >= ODSY_HEIGHT as i64 {
+            return;
+        }
+        for b in 0..ODSY_BUFFERS {
+            if self.draw_buffers() & (1u32 << b) != 0 {
+                let word = if code_is_index(code) { pixel } else { (pixel & !0xffu32) | 0xff };
+                self.buffer_store(b, x, y, word);
+            }
+        }
+    }
+
+    /// The source format of a DMA: word 7's low byte, the same code as an image
+    /// transfer header's. Another code keeps the earlier rule (4 bytes as
+    /// 0x00RRGGBB, 1 byte as a colour index), reported once.
+    pub fn dma_code(&mut self, hdr: &[u32], bpp: u32) -> u32 {
+        let code = hdr[dma::HDR_CONTROL] & image::CODE_MASK;
+
+        if pixel_bytes(code) == bpp {
+            return code;
+        }
+        if !self.diag.dma_code_reported {
+            self.diag.dma_code_reported = true;
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA source format {:#x} at {} bytes a pixel is not modeled", code, bpp);
+        }
+        if bpp == 4 { image::CODE_FALLBACK_XRGB } else { image::CODE_CI }
+    }
+}
+
+/// True when hdr is a backing-store page the model copies, bpp a texel.
+pub(super) fn dma_raw(hdr: &[u32], bpp: u32) -> bool {
+    let fmt = hdr[dma::HDR_FORMAT];
+
+    (hdr[dma::HDR_CONTROL] & image::CODE_MASK) == 0
+        && ((fmt == dma::FMT_RAW16 && bpp == 2) || (fmt == dma::FMT_RAW32 && bpp == 4))
+}
+
+impl Board {
+    /// True, reported once, when hdr is an 8-byte backing-store page.
+    pub fn dma_raw64(&mut self, hdr: &[u32], bpp: u32) -> bool {
+        if hdr[dma::HDR_FORMAT] != dma::FMT_RAW64
+            || bpp != 8
+            || (hdr[dma::HDR_CONTROL] & image::CODE_MASK) != 0
+        {
+            return false;
+        }
+        if self.dma_report(dma::REPORT_RAW64) {
+            crate::dlog!(
+                LogModule::Odyssey,
+                "sgi-odyssey: an 8-byte backing-store page of object {:#x} is not modeled",
+                hdr[dma::HDR_DEST]
+            );
+        }
+        true
+    }
+}
+
+pub(super) fn raw_nibble(byte: u32) -> u32 {
+    (byte * 15 + 127) / 255
+}
+
+/// A stored texel as a backing-store page's bpp raw bytes.
+pub(super) fn raw_pack(rgba: u32, bpp: u32, dst: &mut [u8]) {
+    if bpp == 4 {
+        dst[..4].copy_from_slice(&rgba.to_be_bytes());
+        return;
+    }
+    let word = raw_nibble(rgba >> 24) << 12
+        | raw_nibble((rgba >> 16) & 0xff) << 8
+        | raw_nibble((rgba >> 8) & 0xff) << 4
+        | raw_nibble(rgba & 0xff);
+    dst[..2].copy_from_slice(&(word as u16).to_be_bytes());
+}
+
+/// A backing-store page's bpp raw bytes back as a stored texel.
+pub(super) fn raw_unpack(src: &[u8], bpp: u32) -> u32 {
+    if bpp == 4 {
+        return be32(&src[..4]);
+    }
+    let v = be16(&src[..2]) as u32;
+    (((v >> 12) & 0xf) * 0x11u32) << 24
+        | (((v >> 8) & 0xf) * 0x11u32) << 16
+        | (((v >> 4) & 0xf) * 0x11u32) << 8
+        | ((v & 0xf) * 0x11u32)
+}
+
+impl Board {
+    /// A transfer into the colour buffer the screen shows (obj -1) or into
+    /// board-memory object obj: paint the header's rectangle from the source.
+    /// The source is a stream of pixel bytes spread over the entries: each row
+    /// takes rowbytes bytes, moving to the next entry whenever the current one's
+    /// count runs out, then the cursor steps over skip uncounted bytes. No byte
+    /// outside the entries is read.
+    pub fn dma_to_buffer(&mut self, bus: &DmaBus, table: u64, seq: u64, hdr: &[u32], obj: Option<usize>) {
+        let mut e = [DmaEntry::default(); dma::MAX_PAGES];
+        let x = hdr[dma::HDR_ORIGIN] & 0xffff;
+        let y = hdr[dma::HDR_ORIGIN] >> 16;
+        let w = hdr[dma::HDR_SIZE] & 0xffff;
+        let h = if hdr[dma::HDR_SIZE] >> 16 != 0 { hdr[dma::HDR_SIZE] >> 16 } else { 0x10000 };
+        let skip = hdr[dma::HDR_SKIP];
+        let rowbytes = hdr[dma::HDR_ROWBYTES] & dma::ROWBYTES_MASK;
+        let bpp = DMA_BPP[((hdr[dma::HDR_CONTROL] >> dma::BPP_SHIFT) & dma::BPP_MASK) as usize] as u32;
+        let comps = texel12_components(hdr[dma::HDR_CONTROL] & image::CODE_MASK);
+        // A 12-bit texture source into an object: a byte or two a component.
+        let texel12 = obj.is_some() && comps != 0 && (bpp == comps || bpp == 2 * comps);
+        // An 8-bit luminance-alpha source into an object, two bytes a pixel.
+        let lum_alpha = obj.is_some() && bpp == 2 && (hdr[dma::HDR_CONTROL] & image::CODE_MASK) == image::CODE_LUM_ALPHA;
+        let raw = obj.is_some() && dma_raw(hdr, bpp);
+        let mut payload: u64 = 0;
+        let mut pos: u64 = 0;
+
+        if obj.is_some() && self.dma_raw64(hdr, bpp) {
+            return;
+        }
+        if bpp != 4 && bpp != 3 && bpp != 1 && !texel12 && !lum_alpha && !raw {
+            if !self.diag.dma_bpp_reported {
+                self.diag.dma_bpp_reported = true;
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: DMA to buffer {:#x} at {} bytes a pixel is not modeled",
+                    hdr[dma::HDR_DEST],
+                    bpp
+                );
+            }
+            return;
+        }
+        let code = if texel12 || raw {
+            hdr[dma::HDR_CONTROL] & image::CODE_MASK
+        } else {
+            self.dma_code(hdr, bpp)
+        };
+        let Ok(n) = bus.entries(table, seq, &mut e) else {
+            return;
+        };
+        payload += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
+        if rowbytes as u64 != (w as u64) * (bpp as u64) || payload != (rowbytes as u64) * (h as u64) {
+            crate::dlog!(
+                LogModule::Odyssey,
+                "sgi-odyssey: DMA header at {:#x} disagrees with itself: {}x{} at {} bytes a pixel, {} bytes a row, {} bytes in its entries",
+                table, w, h, bpp, rowbytes, payload
+            );
+            return;
+        }
+        let mut row = vec![0u8; rowbytes as usize];
+        let mut staged = Vec::new();
+        let mut i: usize = 0;
+        let mut left: u32 = if n > 0 { e[0].len } else { 0 };
+        'done: {
+            for r in 0..h {
+                let mut got: u32 = 0;
+
+                while got < rowbytes {
+                    if left == 0 {
+                        // Checked above: the entries hold exactly h rows.
+                        i += 1;
+                        pos = 0;
+                        left = e[i].len;
+                    }
+                    let take = left.min(rowbytes - got);
+                    if !bus.read(
+                        e[i].addr.wrapping_add(pos),
+                        &mut row[got as usize..(got + take) as usize],
+                        true,
+                        seq,
+                    ) {
+                        break 'done;
+                    }
+                    got += take;
+                    pos += take as u64;
+                    left -= take;
+                }
+                if left != 0 {
+                    pos += skip as u64;
+                }
+                for c in 0..w {
+                    let px = &row[(c * bpp) as usize..];
+                    // An object's texels land on the raster unit, in order
+                    // behind the draws that may still read the old ones.
+                    let (ox, oy) = (x.wrapping_add(c), y.wrapping_add(r));
+                    if let (true, Some(obj)) = (raw, obj) {
+                        self.object_stage(&mut staged, obj, ox, oy, raw_unpack(px, bpp));
+                        continue;
+                    }
+                    if let (true, Some(obj)) = (texel12, obj) {
+                        self.object_stage(&mut staged, obj, ox, oy, decode_texel12(code, px, bpp != comps));
+                        continue;
+                    }
+                    if let Some(obj) = obj {
+                        let pixel = self.decode_pixel(code, px).unwrap_or(0);
+                        self.object_stage(&mut staged, obj, ox, oy, pixel);
+                        continue;
+                    }
+                    self.dma_put((x as i64) + (c as i64), (y as i64) + (r as i64), px, code);
+                }
+            }
+        }
+        self.object_flush(&mut staged);
+        // An object is board memory the raster unit samples, not a line the display scans.
+        if obj.is_none() {
+            self.scanout.invalidate_rows_for(DirtySite::Dma, y, h);
+        }
+    }
+}
+
+// Source format code 0x6c: a GL DMA image write of A, B, G, R bytes, one
+// pixel a 4-byte word. ESTABLISHED from a model run: the software's payload
+// carries the bytes in that order. INFERRED: that the board decodes the word
+// in that order, from the image coming out right. Word 7 of the two observed
+// writes differs in bits 29:25, which are ignored; every other bit must
+// match, so an unseen form stays reported.
+//
+// Movie frames: the same A, B, G, R bytes under source format code 0x4c,
+// with word 4 0x82233000. OBSERVED on the model: each 320x240 frame arrives
+// as nine tiles covering it exactly, rows of 4 * width bytes with the rest
+// of each source row skipped, first tile sent holding the first source rows.
+// INFERRED from the picture: the byte order, that the source's first row is
+// the top of the picture, and that the header's y counts up from the bottom
+// of the window. What tells the board the rows run top down, and the window
+// height its bottom-up y needs, remain unknown.
+
+/// What a depth or stencil image write names (see dma_depth_stencil_write()).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum DepthStencil {
+    Depth,
+    Stencil,
+}
+
+/// Whether hdr is the library's depth or stencil image write: format 0 and
+/// type 4 (word 7 low bits 0x080, four bytes a pixel) with word 4's size
+/// field 1 for depth and 0 for stencil.
+///
+/// ESTABLISHED as the library's request. How the board takes the words is unknown, so the model's
+/// choices, each pinned by a test, are:
+/// - stencil lives in a plane of its own, so a stencil write leaves the
+///   colour and the depth word alone;
+/// - a write passes the same clip-rectangle and window-ID tests as a GL
+///   fragment;
+/// - a write ignores the stencil write mask (register 0x0452). The library's
+///   burst does not: it sends the mask (draw.rs, image_depth_stencil_word()).
+///   The library sends no depth or stencil by DMA (every depth and stencil
+///   step takes the burst: ESTABLISHED), so this path has no
+///   software evidence and the mask's effect on it is UNKNOWN; the choice
+///   stands;
+/// - a depth write is always the 24-bit word, bits 23:0 of each value.
+pub(super) fn dma_depth_stencil_write(hdr: &[u32]) -> Option<DepthStencil> {
+    if hdr[dma::HDR_CONTROL] & write::CODE_MASK != image::CODE_DEPTH_STENCIL {
+        return None;
+    }
+    match (hdr[dma::HDR_FORMAT] >> dma::FMT_SIZE_SHIFT) & dma::FMT_SIZE_MASK {
+        dma::FMT_SIZE_DEPTH => Some(DepthStencil::Depth),
+        dma::FMT_SIZE_STENCIL => Some(DepthStencil::Stencil),
+        _ => None,
+    }
+}
+
+/// The draw-sentinel upload's pixel form: word 7's format and type through
+/// the write table (pixel_write.rs), at the bytes a pixel its bpp field
+/// names. None for a form the table does not take. Word 4's low byte is zero
+/// in every write the library builds. The movie write (dmplay's frames:
+/// code 0x4c under its own word 4) also sets *top_down.
+///
+/// The movie's picture is OBSERVED on the model: each 320x240 frame arrives
+/// as nine tiles covering it exactly, rows of 4 * width bytes with the rest
+/// of each source row skipped, first tile sent holding the first source
+/// rows. INFERRED from the picture: the byte order, that the source's first
+/// row is the top of the picture, and that the header's y counts up from
+/// the bottom of the window. What tells the board the rows run top down,
+/// and the window height its bottom-up y needs, remain unknown.
+pub(super) fn dma_draw_sentinel_form(hdr: &[u32], top_down: &mut bool) -> Option<WriteForm> {
+    let control = hdr[dma::HDR_CONTROL];
+    let bpp = DMA_BPP[((control >> dma::BPP_SHIFT) & dma::BPP_MASK) as usize] as u32;
+
+    *top_down = hdr[dma::HDR_FORMAT] == dma::MOVIE_FORMAT
+        && (control & !dma::ABGR_CONTROL_IGNORED) == dma::MOVIE_CONTROL;
+    if hdr[dma::HDR_FORMAT] & 0xff != 0 {
+        return None;
+    }
+    write_form(control & write::CODE_MASK).filter(|form| form.bytes == bpp)
+}
+
+impl Board {
+    /// The depth plane's word at plane pixel (x, y), which is in the plane.
+    pub fn depth_load(&mut self, x: i64, y: i64) -> u32 {
+        self.raster_wait();
+        let p = self.planes.depth.plane(self.planes.depth_plane).expect("the depth plane");
+        self.planes.depth.plane_load(&p, x as i32, y as i32)
+    }
+
+    pub fn depth_store(&mut self, x: i64, y: i64, word: u32) {
+        self.raster_wait();
+        let p = self.planes.depth.plane(self.planes.depth_plane).expect("the depth plane");
+        self.planes.depth.plane_store(&p, x as i32, y as i32, word);
+    }
+
+    pub fn stencil_load(&mut self, x: i64, y: i64) -> u32 {
+        self.raster_wait();
+        let p = self.planes.stencil.plane(self.planes.stencil_plane).expect("the stencil plane");
+        self.planes.stencil.plane_load(&p, x as i32, y as i32)
+    }
+
+    pub fn stencil_store(&mut self, x: i64, y: i64, value: u8) {
+        self.raster_wait();
+        let p = self.planes.stencil.plane(self.planes.stencil_plane).expect("the stencil plane");
+        self.planes.stencil.plane_store(&p, x as i32, y as i32, value as u32);
+    }
+
+    /// Stage the pixel bytes first so a failed source read cannot leave a
+    /// partially painted rectangle. Entry lengths count pixels; row gaps advance
+    /// the address cursor only while the current entry has bytes remaining.
+    pub fn dma_draw_sentinel_short(&mut self, bus: &DmaBus, table: u64, seq: u64, hdr: &[u32]) {
+        let mut e = [DmaEntry::default(); dma::MAX_PAGES];
+        let x = hdr[dma::HDR_ORIGIN] & 0xffff;
+        let y = hdr[dma::HDR_ORIGIN] >> 16;
+        let w = hdr[dma::HDR_SIZE] & 0xffff;
+        let h = if hdr[dma::HDR_SIZE] >> 16 != 0 { hdr[dma::HDR_SIZE] >> 16 } else { 0x10000 };
+        let skip = hdr[dma::HDR_SKIP];
+        let rowbytes = hdr[dma::HDR_ROWBYTES] & dma::ROWBYTES_MASK;
+        let mut payload_len: u64 = 0;
+        let mut pos: u64 = 0;
+        let mut out: u64 = 0;
+        let mut top_down = false;
+        let depth_stencil = dma_depth_stencil_write(hdr);
+        let form = dma_draw_sentinel_form(hdr, &mut top_down);
+        let psize = if depth_stencil.is_some() { 4 } else { form.as_ref().map_or(0, |f| f.bytes) };
+        // APPROXIMATION: the window's height, for a top-down write's bottom-up y,
+        // taken from the clip box's last row; the header carries no height. A
+        // capture with a scissor box smaller than the window would tell this
+        // rule from the board's own.
+        let rows: i64 = (self.gl_clip_box[1] & clip::BOX_FIELD_MASK) as i64 + 1;
+
+        if psize == 0 {
+            if self.dma_report(dma::REPORT_UPLOAD_SENTINEL) {
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: DMA upload to sentinel {:#x} with format {:#x} and control {:#x} is not modeled",
+                    hdr[dma::HDR_DEST],
+                    hdr[dma::HDR_FORMAT],
+                    hdr[dma::HDR_CONTROL]
+                );
+            }
+            return;
+        }
+
+        let Ok(n) = bus.entries(table, seq, &mut e) else {
+            return;
+        };
+        payload_len += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
+        if w == 0
+            || h == 0
+            || rowbytes as u64 != (w as u64) * (psize as u64)
+            || payload_len != (rowbytes as u64) * (h as u64)
+        {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: draw-sentinel DMA header at {:#x} disagrees with its payload", table);
+            return;
+        }
+
+        let mut payload = vec![0u8; payload_len as usize];
+        let mut i: usize = 0;
+        let mut left: u32 = if n > 0 { e[0].len } else { 0 };
+        for _r in 0..h {
+            let mut got: u32 = 0;
+
+            while got < rowbytes {
+                if left == 0 {
+                    i += 1;
+                    pos = 0;
+                    left = e[i].len;
+                }
+                let take = left.min(rowbytes - got);
+                let at = (out + got as u64) as usize;
+                if pos > u64::MAX - e[i].addr
+                    || !bus.read(e[i].addr + pos, &mut payload[at..at + take as usize], true, seq)
+                {
+                    return;
+                }
+                got += take;
+                pos += take as u64;
+                left -= take;
+            }
+            if left != 0 {
+                pos += skip as u64;
+            }
+            out += rowbytes as u64;
+        }
+
+        for r in 0..h {
+            for c in 0..w {
+                let off = ((r as u64) * (rowbytes as u64) + (c as u64) * (psize as u64)) as usize;
+                let src = &payload[off..];
+                let px = (x as i64) + (c as i64) + self.win.origin[0] as i64;
+                let py = (if top_down {
+                    rows - (y as i64) - (h as i64) + (r as i64)
+                } else {
+                    (y as i64) + (h as i64) - 1 - (r as i64)
+                }) + self.win.origin[1] as i64;
+                if let Some(plane) = depth_stencil {
+                    let value = be32(&src[..4]);
+
+                    if self.pixel_allowed(px, py) {
+                        if plane == DepthStencil::Depth {
+                            self.depth_store(px, py, value & ODSY_DEPTH24_MAX);
+                        } else {
+                            self.stencil_store(px, py, value as u8);
+                        }
+                    }
+                    continue;
+                }
+                let rgba = form.as_ref().expect("a form when not depth or stencil").decode(src);
+                self.paint_pixel(px, py, rgba);
+            }
+        }
+    }
+
+    /// True the first time reason (dma::REPORT_*) comes up: report it then.
+    pub fn dma_report(&mut self, reason: u32) -> bool {
+        if self.diag.dma_read_reported & reason != 0 {
+            return false;
+        }
+        self.diag.dma_read_reported |= reason;
+        true
+    }
+}
+
+const fn lay(code: u32, bytes: u8, from: [u8; 8]) -> DmaLayout {
+    DmaLayout { code: code as u8, bytes, from, fields: [DmaField { chan: 0, width: 0, shift: 0 }; 4], plane: ReadPlane::Colour }
+}
+
+const fn fld(chan: u8, width: u8, shift: u8) -> DmaField {
+    DmaField { chan, width, shift }
+}
+
+/// A packed layout: the fields of a `bytes`-byte big-endian word.
+const fn pack(code: u32, bytes: u8, fields: [DmaField; 4]) -> DmaLayout {
+    DmaLayout { code: code as u8, bytes, from: [0; 8], fields, plane: ReadPlane::Colour }
+}
+
+const NF: DmaField = fld(0, 0, 0);
+const BZ: u8 = dma::BYTE_ZERO as u8;
+const BI: u8 = dma::BYTE_INDEX as u8;
+const BH: u8 = dma::BYTE_INDEX_HIGH as u8;
+const BR: u8 = dma::BYTE_INDEX_OR_RED as u8;
+
+/// Which sources a GL read header row applies to.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum ReadFrom {
+    Any,
+    /// A texture object, named by its board address.
+    Object,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct GlRead {
+    pub class: u8,
+    pub code: u8,
+    pub from: ReadFrom,
+    pub layout: DmaLayout,
+}
+
+const fn row(class: u8, code: u8, layout: DmaLayout) -> GlRead {
+    GlRead { class, code, from: ReadFrom::Any, layout }
+}
+
+const fn object_row(class: u8, code: u8, layout: DmaLayout) -> GlRead {
+    GlRead { class, code, from: ReadFrom::Object, layout }
+}
+
+/// GL reads by word 4's class and code (established as the library's
+/// request; that the board returns the GL packing of the named format and
+/// type is inferred). A row lists every format and type whose bytes are the
+/// same under one header.
+///
+/// Packed rows quantise each channel of the plane word to the field's width
+/// by keeping its top bits, which is how the model shows a narrow visual at
+/// scanout (display_channel()). APPROXIMATION: the planes keep the byte that
+/// was drawn, so for a 4/4/4/4 or 5/5/5/1 visual the stored value narrows
+/// only here, and 10-bit fields repeat the byte's top bits into the low two;
+/// how the board stores and widens a narrow pixel is unknown. A byte read
+/// from a narrow visual (class 1 code 1, class 2 code 8) returns the plane's
+/// byte as drawn, for the same reason.
+///
+/// A one- or two-channel luminance, alpha or red texture is stored with the
+/// value in red, green and blue, so those rows return the red byte.
+///
+/// Class 0 code 0 and class 2 code 2 from a drawable are shared with stencil
+/// and depth reads and are told apart by the field codes
+/// (dma_read_layout()).
+pub(super) static DMA_GL_READS: &[GlRead] = &[
+    // Header class 0: one byte a pixel. A pixel the display shows as an
+    // index returns its index, any other its red byte.
+    row(0, 1, lay(1, 1, [BR, 0, 0, 0, 0, 0, 0, 0])),
+    // Code 0: a texture's alpha, and a colour read when a drawable's field
+    // codes call it one (dma_read_layout()). The red byte, as for any single
+    // channel.
+    row(0, 0, lay(0, 1, [BR, 0, 0, 0, 0, 0, 0, 0])),
+    // Header class 1: two bytes a pixel, but code 1 is four.
+    object_row(1, 0, lay(0, 2, [0, 3, 0, 0, 0, 0, 0, 0])), // LUMINANCE_ALPHA, UNSIGNED_BYTE
+    row(1, 1, lay(1, 4, [0, 1, 2, 3, 0, 0, 0, 0])),        // RGBA, UNSIGNED_BYTE (5/5/5/1)
+    row(1, 2, lay(2, 2, [0, 0, 0, 0, 0, 0, 0, 0])),        // ALPHA, LUMINANCE, RED: UNSIGNED_SHORT
+    row(1, 3, pack(3, 2, [fld(3, 1, 15), fld(0, 5, 10), fld(1, 5, 5), fld(2, 5, 0)])), // BGRA, 1_5_5_5_REV
+    row(1, 4, pack(4, 2, [fld(2, 5, 11), fld(1, 6, 5), fld(0, 5, 0), NF])),            // BGR, 5_6_5
+    row(1, 5, pack(5, 2, [fld(2, 5, 11), fld(1, 5, 6), fld(0, 5, 1), fld(3, 1, 0)])), // BGRA, 5_5_5_1
+    row(1, 6, pack(6, 2, [fld(3, 4, 12), fld(2, 4, 8), fld(1, 4, 4), fld(0, 4, 0)])), // RGBA, 4_4_4_4_REV
+    row(1, 7, pack(7, 2, [fld(3, 4, 12), fld(0, 4, 8), fld(1, 4, 4), fld(2, 4, 0)])), // BGRA, 4_4_4_4_REV
+    row(1, 8, pack(8, 2, [fld(2, 4, 12), fld(1, 4, 8), fld(0, 4, 4), fld(3, 4, 0)])), // BGRA, 4_4_4_4
+    row(1, 9, pack(9, 2, [fld(3, 1, 15), fld(2, 5, 10), fld(1, 5, 5), fld(0, 5, 0)])), // RGBA, 1_5_5_5_REV
+    row(1, 10, pack(10, 2, [fld(0, 5, 11), fld(1, 6, 5), fld(2, 5, 0), NF])),          // RGB, 5_6_5
+    row(1, 12, pack(12, 2, [fld(0, 5, 11), fld(1, 5, 6), fld(2, 5, 1), fld(3, 1, 0)])), // RGBA, 5_5_5_1
+    row(1, 13, pack(13, 2, [fld(0, 4, 12), fld(1, 4, 8), fld(2, 4, 4), fld(3, 4, 0)])), // RGBA, 4_4_4_4
+    row(1, 14, lay(14, 2, [BH, BI, 0, 0, 0, 0, 0, 0])),                                  // COLOR_INDEX, UNSIGNED_SHORT
+    // Header class 2: the RGBA 8/8/8/8 and 10/10/10/2 windows and
+    // luminance-alpha 12 textures.
+    row(2, 0, pack(0, 4, [fld(0, 10, 22), fld(1, 10, 12), fld(2, 10, 2), fld(3, 2, 0)])), // RGBA, 10_10_10_2
+    row(2, 1, lay(1, 3, [0, 1, 2, 0, 0, 0, 0, 0])),                                       // RGB, UNSIGNED_BYTE
+    row(2, 2, lay(2, 4, [3, 0, 1, 2, 0, 0, 0, 0])),                                       // BGRA, 8_8_8_8_REV
+    row(2, 3, lay(3, 3, [2, 1, 0, 0, 0, 0, 0, 0])),                                       // BGR, UNSIGNED_BYTE
+    row(2, 4, lay(4, 4, [2, 1, 0, 3, 0, 0, 0, 0])),                                       // BGRA, UNSIGNED_BYTE
+    row(2, 5, lay(5, 4, [0, 0, 3, 3, 0, 0, 0, 0])),                                       // LUMINANCE_ALPHA, UNSIGNED_SHORT
+    row(2, 6, lay(6, 2, [0, 3, 0, 0, 0, 0, 0, 0])),                                       // LUMINANCE_ALPHA, UNSIGNED_BYTE
+    row(2, 8, lay(8, 4, [0, 1, 2, 3, 0, 0, 0, 0])),                                       // RGBA, UNSIGNED_BYTE
+    row(2, 9, pack(9, 2, [fld(2, 5, 11), fld(1, 6, 5), fld(0, 5, 0), NF])),               // BGR, 5_6_5
+    row(2, 10, pack(10, 2, [fld(0, 5, 11), fld(1, 6, 5), fld(2, 5, 0), NF])),             // RGB, 5_6_5
+    row(2, 11, lay(11, 4, [3, 2, 1, 0, 0, 0, 0, 0])),                                     // ABGR, UNSIGNED_BYTE
+    row(2, 12, pack(12, 4, [fld(3, 2, 30), fld(2, 10, 20), fld(1, 10, 10), fld(0, 10, 0)])), // RGBA, 2_10_10_10_REV
+    // Header class 3: the RGBA 12/12/12/12 window. The model keeps eight
+    // bits a channel, so a byte read returns them as stored and a 16-bit
+    // read replicates each byte. APPROXIMATION: how the board narrows a
+    // 12-bit channel to eight bits is unknown.
+    row(3, 1, lay(1, 4, [0, 1, 2, 3, 0, 0, 0, 0])),  // RGBA, UNSIGNED_BYTE
+    row(3, 2, lay(2, 3, [0, 1, 2, 0, 0, 0, 0, 0])),  // RGB, UNSIGNED_BYTE
+    row(3, 3, pack(3, 4, [fld(3, 2, 30), fld(2, 10, 20), fld(1, 10, 10), fld(0, 10, 0)])), // RGBA, 2_10_10_10_REV
+    row(3, 5, lay(5, 8, [3, 3, 2, 2, 1, 1, 0, 0])),  // ABGR, UNSIGNED_SHORT
+    row(3, 6, lay(6, 4, [3, 2, 1, 0, 0, 0, 0, 0])),  // ABGR, UNSIGNED_BYTE
+    row(3, 7, lay(7, 3, [2, 1, 0, 0, 0, 0, 0, 0])),  // BGR, UNSIGNED_BYTE
+    row(3, 8, lay(8, 6, [0, 0, 1, 1, 2, 2, 0, 0])),  // RGB, UNSIGNED_SHORT
+    row(3, 9, lay(9, 8, [0, 0, 1, 1, 2, 2, 3, 3])),  // RGBA, UNSIGNED_SHORT
+    // Header class 4: RGBA textures of 13 channel bits.
+    row(4, 0, lay(0, 8, [0, 0, 1, 1, 2, 2, 3, 3])),  // RGBA, UNSIGNED_SHORT
+    row(4, 2, lay(2, 4, [0, 1, 2, 3, 0, 0, 0, 0])),  // RGBA, UNSIGNED_BYTE
+];
+
+/// A depth read from a drawable under header class 1 code 0, two bytes a
+/// pixel (DEPTH_COMPONENT, UNSIGNED_SHORT). The library sends it for windows
+/// whose visual is RGBA 12/12/12/12. The bytes are the 16-bit form of the
+/// plane's depth word: exponent in bits 15:10, the top ten mantissa bits
+/// below.
+///
+/// ESTABLISHED as the library's request; that the board returns the plane's own 16-bit form is INFERRED.
+/// MODEL CHOICE: the plane holds a 24-bit word whatever the visual, so a
+/// depth written by the 16-bit form (always stored as 24 bits, see
+/// dma_depth_stencil_write()) reads back near zero, and that visual's depth
+/// does not round-trip; the model does not identify those windows.
+pub(super) static DMA_DEPTH16: DmaLayout =
+    DmaLayout { code: 0, bytes: 2, from: [0; 8], fields: [NF; 4], plane: ReadPlane::Depth16 };
+
+/// A depth read under class 2 code 2 with field codes (0,0) or (4,0), four
+/// bytes a pixel (DEPTH_COMPONENT, UNSIGNED_INT): the plane's 24-bit word.
+pub(super) static DMA_DEPTH32: DmaLayout =
+    DmaLayout { code: 2, bytes: 4, from: [0; 8], fields: [NF; 4], plane: ReadPlane::Depth32 };
+
+/// A stencil read under class 0 code 0 with field codes (4,0), one byte a
+/// pixel (STENCIL_INDEX, UNSIGNED_BYTE). MODEL CHOICE: the stencil byte
+/// comes from the model's own stencil plane; where the board keeps it inside
+/// a stored pixel is unknown.
+pub(super) static DMA_STENCIL: DmaLayout =
+    DmaLayout { code: 0, bytes: 1, from: [0; 8], fields: [NF; 4], plane: ReadPlane::Stencil };
+
+/// X reads, by word 7's format byte: the upload decode run backwards. The
+/// luminance code is not invertible and no read of it has been seen.
+pub(super) static DMA_X_LAYOUTS: [DmaLayout; 4] = [
+    lay(image::CODE_ABGR, 4, [BZ, 2, 1, 0, 0, 0, 0, 0]),
+    lay(image::CODE_RGBA, 4, [0, 1, 2, 3, 0, 0, 0, 0]),
+    lay(image::CODE_RGB, 3, [0, 1, 2, 0, 0, 0, 0, 0]),
+    lay(image::CODE_CI, 1, [BI, 0, 0, 0, 0, 0, 0, 0]),
+];
+
+/// Whether a read header's class and code are sent both for a colour read
+/// and for a depth or stencil read.
+fn shared_depth_code(cls: u32, code: u32) -> bool {
+    (cls == 0 && code == 0) || (cls == 2 && code == 2)
+}
+
+/// A one-byte colour index read: the plane word's low byte, refused for a
+/// pixel shown as a colour.
+pub(super) static DMA_GL_INDEX_BYTE: DmaLayout = lay(0, 1, [BI, 0, 0, 0, 0, 0, 0, 0]);
+
+impl Board {
+    /// The read's layout, or None (reported once) when it is not modeled.
+    pub fn dma_read_layout(&mut self, hdr: &[u32], bpp: u32) -> Option<&'static DmaLayout> {
+        let xcode = hdr[dma::HDR_CONTROL] & image::CODE_MASK;
+        let fmt = hdr[dma::HDR_FORMAT];
+        let cls = fmt & dma::FMT_CLASS_MASK;
+        let code = (fmt >> dma::FMT_CODE_SHIFT) & dma::FMT_CODE_MASK;
+        let drawable = hdr[dma::HDR_DEST] & dma::SENTINEL != 0;
+        let mut l: Option<&'static DmaLayout> = None;
+
+        if xcode != 0 {
+            for t in DMA_X_LAYOUTS.iter() {
+                if t.code as u32 == xcode {
+                    l = Some(t);
+                }
+            }
+        } else if drawable && shared_depth_code(cls, code) {
+            // Class 0 code 0 and class 2 code 2 are each sent for a colour
+            // read and for a stencil or 32-bit depth read. Word 4's two field
+            // codes (bits 23:20, 27:24) tell them apart: (4,0) is a stencil byte or a depth word, (0,0) a depth
+            // word, and the colour pairs are (6,2), (2,2), (3,2), (7,3) and
+            // (2,0).
+            let fields = ((fmt >> 20) & 0xf, (fmt >> 24) & 0xf);
+
+            if cls == 2 && (fields == (4, 0) || fields == (0, 0)) {
+                l = Some(&DMA_DEPTH32);
+            } else if cls == 0 && fields == (4, 0) {
+                l = Some(&DMA_STENCIL);
+            } else if cls == 0 && fields == (0, 0) {
+                // UNKNOWN: this is a stencil read of a storage-2 window or a
+                // colour index read of a storage-0 window, and only the
+                // header's word 2 would separate them. The model keeps no
+                // storage code, so it serves a colour index and says so once.
+                // On an RGB window the index read is refused (dma_read_pack()).
+                if self.dma_report(dma::REPORT_STENCIL_OR_INDEX) {
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: DMA read with word 4 {:#x} is a colour index read of a storage-0 window or a stencil read, which the header does not separate; served as colour index",
+                        fmt
+                    );
+                }
+                l = Some(&DMA_GL_INDEX_BYTE);
+            } else {
+                if !(cls == 2 && matches!(fields, (6, 2) | (2, 2) | (3, 2) | (7, 3) | (2, 0))) && self.dma_report(dma::REPORT_UNLISTED_FIELDS) {
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: DMA read with word 4 {:#x} (class {}, code {}) has field codes that are not known; served as colour",
+                        fmt, cls, code
+                    );
+                }
+                l = DMA_GL_READS.iter().find(|t| t.class as u32 == cls && t.code as u32 == code).map(|t| &t.layout);
+            }
+        } else if drawable && cls == 1 && code == 0 {
+            l = Some(&DMA_DEPTH16);
+        } else {
+            for t in DMA_GL_READS.iter() {
+                if t.class as u32 == cls && t.code as u32 == code && (t.from == ReadFrom::Any || !drawable) {
+                    l = Some(&t.layout);
+                }
+            }
+        }
+        if let Some(t) = l {
+            if t.bytes as u32 == bpp {
+                return Some(t);
+            }
+        }
+        if self.dma_report(dma::REPORT_LAYOUT) {
+            crate::dlog!(
+                LogModule::Odyssey,
+                "sgi-odyssey: DMA read with format byte {:#x}, word 4 {:#x} (class {}, code {}) at {} bytes a pixel is not modeled",
+                xcode, fmt, cls, code, bpp
+            );
+        }
+        None
+    }
+
+    /// Resolve word 0 to the read's source. False, reported once, when it names
+    /// nothing the model can read. A sentinel never creates or names a
+    /// board-memory object.
+    pub fn dma_read_source(&mut self, hdr: &[u32], src: &mut DmaSource) -> bool {
+        let base = hdr[dma::HDR_DEST];
+        let fmt = hdr[dma::HDR_FORMAT];
+        let selector = (fmt >> dma::FMT_SELECTOR_SHIFT) & dma::FMT_SELECTOR_MASK;
+
+        src.obj = None;
+        // Front and back per pixel (Board::dma_read_pixel()).
+        src.front = true;
+        src.x = (hdr[dma::HDR_ORIGIN] & 0xffff) as i64;
+        src.y = (hdr[dma::HDR_ORIGIN] >> 16) as i64;
+
+        if base & dma::SENTINEL != 0 {
+            if base == dma::SENTINEL_DRAW && selector == dma::FMT_SELECTOR_DRAW {
+                if self.dma_report(dma::REPORT_DRAW_SENTINEL) {
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: DMA read of the draw drawable ({:#x}); never captured, read as the read drawable is",
+                        base
+                    );
+                }
+            } else if base != dma::SENTINEL_READ || selector != dma::FMT_SELECTOR_READ {
+                if self.dma_report(dma::REPORT_SENTINEL) {
+                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read of sentinel {:#x} with word 4 {:#x} is not modeled", base, fmt);
+                }
+                return false;
+            }
+            // INFERRED: both sentinels are the current window, whose origin the
+            // model tracks; it keeps no separate read and draw drawable.
+            src.x += self.win.origin[0] as i64;
+            src.y += self.win.origin[1] as i64;
+            src.front = fmt & dma::FMT_FRONT != 0;
+            return true;
+        }
+        if base != 0 && base == self.dma_colour_base {
+            return true;
+        }
+        src.obj = self.object_find(base);
+        if src.obj.is_none() {
+            if self.dma_report(dma::REPORT_SOURCE) {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read of board base {:#x}, which holds no buffer", base);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Source pixel (x, y) as the plane's 0xRRGGBBAA word, or a raw index. A
+    /// colour-buffer pixel comes from the buffer its main drawable shows, or from
+    /// the other buffer for a back read. (x, y) is inside the plane.
+    pub fn dma_read_pixel(&mut self, src: &DmaSource, x: i64, y: i64) -> u32 {
+        if let Some(obj) = src.obj {
+            return self.object_load(obj, x as u32, y as u32);
+        }
+        let buffer = self.read_buffer(src.front, x, y);
+        self.buffer_load(buffer, x, y)
+    }
+
+    /// Whether the bound read drawable is an off-screen object (a pixel
+    /// buffer) and not the screen: the base 0x609 names is not the first
+    /// colour buffer the X server selected, which is the screen's.
+    pub fn read_drawable_offscreen(&self) -> bool {
+        let base = self.read_word & !ODSY_DRAW_WORD_STATE;
+
+        self.screen_base != 0 && base != 0 && base != self.screen_base
+    }
+
+    /// The colour buffer, 0 or 1, that a GL read of pixel (x, y) names by
+    /// its front bit (word 4 bit 31 of the read header). `front` is logical.
+    ///
+    /// A window's logical front is the buffer its id displays and its back
+    /// the other: the draw mask the kernel sends is absolute, with front and
+    /// back exchanged once the window has swapped, so a front draw lands in
+    /// the displayed buffer.
+    ///
+    /// ESTABLISHED: the
+    /// kernel alone writes bit 31 of the buffer registers 0x608 and 0x609, and
+    /// sets it when the drawable's pane has a zero swap halfword; it sends the
+    /// draw mask unchanged then, and with front and back exchanged (bit 31
+    /// clear) once the halfword is nonzero. A pixel buffer's pane is an
+    /// ordinary pane, so a double-buffered pixel buffer swaps like a window.
+    /// INFERRED: a read with header bit 31 set returns the buffer a front draw
+    /// mask writes, for a window and a pixel buffer alike. A pixel buffer has
+    /// no on-screen id, so the model follows bit 31 of 0x609: set means front
+    /// is buffer 0, clear means buffer 1, whatever the ids under the pixel
+    /// buffer's plane coordinates display. UNKNOWN: how the board encodes bit
+    /// 31 of 0x609 together with the header's bit 31. Windows keep the
+    /// displayed-buffer rule, which gives the same buffer as the swap state
+    /// does; the model has no swap state of its own.
+    pub fn read_buffer(&mut self, front: bool, x: i64, y: i64) -> u32 {
+        if self.read_drawable_offscreen() {
+            let buffer_0_is_front = self.read_word & ODSY_DRAW_WORD_STATE != 0;
+
+            return if front == buffer_0_is_front { 0 } else { 1 };
+        }
+        let id = self.main_id(x as u32, y as u32);
+        let shown = self.front.lock().displayed_buffer.checked_shr(id).unwrap_or(0) & 1;
+
+        if front { shown } else { shown ^ 1 }
+    }
+}
+
+impl DmaBus {
+    /// Map piece p at guest address addr: an entry is one physical extent, so
+    /// the pages it runs over are consecutive.
+    pub fn map_piece(&self, p: &mut DmaPiece, addr: u64) -> Result<(), DmaError> {
+        let first = addr & !(dma::PAGE_SIZE - 1);
+        let npages = (addr - first + p.len as u64).div_ceil(dma::PAGE_SIZE) as u32;
+        let mut pages = vec![0u64; npages as usize];
+        assert!(npages as usize <= dma::PIECE_PAGES);
+        for (i, pg) in pages.iter_mut().enumerate() {
+            *pg = first + (i as u64) * dma::PAGE_SIZE;
+        }
+        let pl = DmaPageList { addr: pages, npages, page_size: dma::PAGE_SIZE as u32 };
+        p.at = addr - first;
+        self.map(&mut p.map, &pl, p.at, p.len as u64, DmaDirection::FromDevice, false, 0)
+    }
+}
+
+/// Channel `chan` of plane word 0xRRGGBBAA as a `width`-bit field: the top
+/// bits for a narrower field, the byte's top bits repeated below for a wider
+/// one (see DMA_GL_READS).
+pub(super) fn field_value(word: u32, chan: u32, width: u32) -> u32 {
+    let c = (word >> (24 - 8 * chan)) & 0xff;
+
+    if width <= 8 { c >> (8 - width) } else { (c << (width - 8)) | (c >> (16 - width)) }
+}
+
+impl Board {
+    /// Pack the read's rectangle into out, host row by host row, rowbytes each.
+    /// A colour-index byte is the plane word itself, taken only where scanout
+    /// would take that word as an index: a colour-buffer pixel whose main
+    /// drawable's display mode is an index group, with a word that fits eight
+    /// bits. Anything else refuses the whole read, reported once. A colour
+    /// layout over an index-mode pixel returns the raw index word's bytes as
+    /// colour and is reported once: no inverse colormap is applied.
+    pub fn dma_read_pack(&mut self, src: &DmaSource, l: &DmaLayout, w: u32, h: u32, bottom_up: bool, out: &mut [u8]) -> bool {
+        let packed = l.fields[0].width != 0;
+        let first = l.from[0] as u32;
+        let index_read = !packed && (first == dma::BYTE_INDEX || first == dma::BYTE_INDEX_HIGH);
+        let index_or_red = !packed && first == dma::BYTE_INDEX_OR_RED;
+        let index_max: u32 = if first == dma::BYTE_INDEX_HIGH { 0xfff } else { 0xff };
+        let mut o: usize = 0;
+
+        if let (true, Some(obj)) = (index_read, src.obj) {
+            if self.dma_report(dma::REPORT_INDEX_OBJECT) {
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: DMA index read of board object {:#x}, which records no display mode",
+                    self.objects.base[obj]
+                );
+            }
+            return false;
+        }
+        for r in 0..h {
+            let board_row = if bottom_up { h - 1 - r } else { r };
+
+            for c in 0..w {
+                let x = src.x + c as i64;
+                let y = src.y + board_row as i64;
+                if l.plane != ReadPlane::Colour {
+                    let n = l.bytes as usize;
+                    let word = match l.plane {
+                        ReadPlane::Depth16 => super::depth_word::word16_from_word24(self.depth_load(x, y)),
+                        ReadPlane::Depth32 => self.depth_load(x, y) & ODSY_DEPTH24_MAX,
+                        _ => self.stencil_load(x, y),
+                    };
+
+                    out[o..o + n].copy_from_slice(&word.to_be_bytes()[4 - n..]);
+                    o += n;
+                    continue;
+                }
+                let word = self.dma_read_pixel(src, x, y);
+                let mut group = ODSY_GAMMA_GROUP;
+
+                if src.obj.is_none() {
+                    let id = self.main_id(x as u32, y as u32);
+                    group = self.display_group(id);
+                }
+                let indexed = index_read || (index_or_red && group < ODSY_GAMMA_GROUP);
+
+                if indexed && (group >= ODSY_GAMMA_GROUP || word > index_max) {
+                    if self.dma_report(dma::REPORT_INDEX) {
+                        crate::dlog!(
+                            LogModule::Odyssey,
+                            "sgi-odyssey: DMA index read at ({}, {}) finds word {:#x} in display-mode group {}, not an eight-bit index",
+                            x, y, word, group
+                        );
+                    }
+                    return false;
+                }
+                if !indexed && group < ODSY_GAMMA_GROUP && self.dma_report(dma::REPORT_COLOUR_OVER_INDEX) {
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: DMA colour read at ({}, {}) finds an index pixel (display-mode group {}); its word {:#x} is returned as colour",
+                        x, y, group, word
+                    );
+                }
+                if packed {
+                    let mut v: u32 = 0;
+
+                    for f in l.fields.iter().filter(|f| f.width != 0) {
+                        v |= field_value(word, f.chan as u32, f.width as u32) << f.shift;
+                    }
+                    out[o..o + l.bytes as usize].copy_from_slice(&v.to_be_bytes()[4 - l.bytes as usize..]);
+                    o += l.bytes as usize;
+                    continue;
+                }
+                for &from in &l.from[..l.bytes as usize] {
+                    let from = from as u32;
+
+                    out[o] = if from == dma::BYTE_INDEX {
+                        word as u8
+                    } else if from == dma::BYTE_INDEX_HIGH {
+                        (word >> 8) as u8
+                    } else if from == dma::BYTE_INDEX_OR_RED {
+                        if indexed { word as u8 } else { (word >> 24) as u8 }
+                    } else if from == dma::BYTE_ZERO {
+                        0
+                    } else {
+                        (word >> (24 - 8 * from)) as u8
+                    };
+                    o += 1;
+                }
+            }
+        }
+        true
+    }
+
+    /// Write the packed payload into the table's entries: rowbytes bytes a host
+    /// row, moving to the next entry when one is used up, then skipping skip
+    /// uncounted bytes, exactly as an upload reads its source. Every piece is
+    /// mapped before any byte is written, so a table that fails to map writes
+    /// nothing. No byte outside the pieces is touched.
+    pub fn dma_read_write(&mut self, bus: &DmaBus, e: &[DmaEntry], rowbytes: u32, h: u32, skip: u32, payload: &mut [u8]) -> bool {
+        let n = e.len();
+        let mut pieces: Vec<DmaPiece> = Vec::new();
+        let mut pos: u64 = 0;
+        let mut done: u64 = 0;
+        let mut left: u32 = if n > 0 { e[0].len } else { 0 };
+        let mut ok = true;
+        let mut i: usize = 0;
+
+        let mut r: u32 = 0;
+        while r < h && ok {
+            let mut got: u32 = 0;
+
+            while got < rowbytes {
+                let mut p = DmaPiece::default();
+
+                if left == 0 {
+                    // Checked by the caller: the entries hold exactly h rows.
+                    i += 1;
+                    pos = 0;
+                    left = e[i].len;
+                }
+                p.len = left.min(rowbytes - got);
+                p.src = done;
+                let plen = p.len;
+                let mapped = bus.map_piece(&mut p, e[i].addr + pos);
+                pieces.push(p);
+                if mapped.is_err() {
+                    ok = false;
+                    break;
+                }
+                got += plen;
+                done += plen as u64;
+                pos += plen as u64;
+                left -= plen;
+            }
+            if left != 0 {
+                pos += skip as u64;
+            }
+            r += 1;
+        }
+        for p in pieces.iter_mut() {
+            if ok {
+                let a = p.src as usize;
+                if !p.map.copy(p.at, &mut payload[a..a + p.len as usize], true) {
+                    ok = false;
+                }
+            }
+            p.map.unmap();
+        }
+        if !ok && self.dma_report(dma::REPORT_WRITE) {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read's host pages could not all be written");
+        }
+        ok
+    }
+
+    /// A board-to-host transfer (word 7 bit 24): read the header's rectangle from
+    /// its source and write it, laid out as the header says, into the table's
+    /// entries. Any refusal is reported once and writes nothing to the guest; the
+    /// caller still raises DMA-done when bit 31 asks for it. The payload is in
+    /// guest memory before this returns.
+    pub fn dma_from_board(&mut self, bus: &DmaBus, table: u64, seq: u64, hdr: &[u32]) {
+        let mut e = [DmaEntry::default(); dma::MAX_PAGES];
+        let w = hdr[dma::HDR_SIZE] & 0xffff;
+        let h = if hdr[dma::HDR_SIZE] >> 16 != 0 { hdr[dma::HDR_SIZE] >> 16 } else { 0x10000 };
+        let skip = hdr[dma::HDR_SKIP];
+        let rowbytes = hdr[dma::HDR_ROWBYTES] & dma::ROWBYTES_MASK;
+        let bpp = DMA_BPP[((hdr[dma::HDR_CONTROL] >> dma::BPP_SHIFT) & dma::BPP_MASK) as usize] as u32;
+        let mut src = DmaSource::default();
+        let mut total: u64 = 0;
+
+        let raw = dma_raw(hdr, bpp);
+
+        if self.dma_raw64(hdr, bpp) {
+            return;
+        }
+        let l = if raw { None } else { self.dma_read_layout(hdr, bpp) };
+        if (!raw && l.is_none()) || !self.dma_read_source(hdr, &mut src) {
+            return;
+        }
+        if raw && src.obj.is_none() {
+            if self.dma_report(dma::REPORT_SOURCE) {
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: raw DMA read of {:#x}, which is not a board-memory object, is not modeled",
+                    hdr[dma::HDR_DEST]
+                );
+            }
+            return;
+        }
+        let Ok(n) = bus.entries(table, seq, &mut e) else {
+            return;
+        };
+        total += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
+        if rowbytes as u64 != (w as u64) * (bpp as u64) || total != (rowbytes as u64) * (h as u64) {
+            if self.dma_report(dma::REPORT_SHAPE) {
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: DMA read header at {:#x} disagrees with itself: {}x{} at {} bytes a pixel, {} bytes a row, {} bytes in its entries",
+                    table, w, h, bpp, rowbytes, total
+                );
+            }
+            return;
+        }
+        let inside = if let Some(obj) = src.obj {
+            // Rows past an object's store were never written: the model holds no
+            // value for them, so a read reaching them is refused, not zero-filled.
+            src.x + (w as i64) <= self.objects.width[obj] as i64 && src.y + (h as i64) <= self.objects.rows[obj] as i64
+        } else {
+            src.x >= 0
+                && src.y >= 0
+                && src.x + (w as i64) <= ODSY_WIDTH as i64
+                && src.y + (h as i64) <= ODSY_HEIGHT as i64
+        };
+        if !inside {
+            if self.dma_report(dma::REPORT_BOUNDS) {
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: DMA read of {}x{} at ({}, {}) from {:#x} leaves its source",
+                    w, h, src.x, src.y, hdr[dma::HDR_DEST]
+                );
+            }
+            return;
+        }
+        let mut payload = vec![0u8; total as usize];
+        if let (true, Some(obj)) = (raw, src.obj) {
+            for r in 0..h {
+                for c in 0..w {
+                    let word = self.object_load(obj, (src.x + c as i64) as u32, (src.y + r as i64) as u32);
+                    let off = ((r as u64) * (rowbytes as u64) + (c as u64) * (bpp as u64)) as usize;
+                    raw_pack(word, bpp, &mut payload[off..]);
+                }
+            }
+            if self.dma_read_write(bus, &e[..n], rowbytes, h, skip, &mut payload) {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read: seq {} source {:#x} at {},{} {}x{} wrote {} bytes", seq, hdr[dma::HDR_DEST], src.x, src.y, w, h, total);
+            }
+            return;
+        }
+        let l = l.unwrap();
+        if !self.dma_read_pack(&src, l, w, h, hdr[dma::HDR_CONTROL] & dma::BOTTOM_UP != 0, &mut payload) {
+            return;
+        }
+        if !self.dma_read_write(bus, &e[..n], rowbytes, h, skip, &mut payload) {
+            return;
+        }
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read: seq {} source {:#x} at {},{} {}x{} wrote {} bytes", seq, hdr[dma::HDR_DEST], src.x, src.y, w, h, total);
+    }
+
+    /// A 0xe01/0xe03 descriptor: read the table's header, move the pixels, and
+    /// raise the DMA-done interrupt when the header asks for it. A header with
+    /// word 7 bit 24 set is a read; any other names its destination in word 0:
+    /// the colour buffer the screen shows, or an off-screen object whose row
+    /// length is word 2's (16-pixel units), created when no select named it
+    /// first. A zero word 0 names no buffer and is refused. An upload to a
+    /// sentinel (GL's DMA image write) is accepted only by the draw-sentinel
+    /// adapter. The 0xe03 opcode is reported and not performed.
+    pub fn dma_descriptor(&mut self, readback: bool) {
+        let table = dma_table_address(self.cmd.operand[0], self.cmd.operand[1]);
+        crate::pf_scope!(crate::perfetto::events::ODSY_DMA, table);
+        self.dma_seq += 1;
+        let seq = self.dma_seq;
+        let bus = DmaBus {
+            mem: self.guest.clone(),
+            trace_sequence: self.trace_sequence.load(Ordering::Relaxed).wrapping_sub(1),
+        };
+        let mut raw = [0u8; dma::TABLE_HEADER as usize];
+        let mut hdr = [0u32; dma::HDR_WORDS];
+
+        if !bus.read(table, &mut raw, true, seq) {
+            return;
+        }
+        for i in 0..dma::HDR_WORDS {
+            hdr[i] = be32(&raw[i * 4..][..4]);
+        }
+        if readback {
+            if !self.diag.dma_readback_reported {
+                self.diag.dma_readback_reported = true;
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA opcode 0xe03 (buffer {:#x}) is not modeled", hdr[dma::HDR_DEST]);
+            }
+        } else if hdr[dma::HDR_CONTROL] & dma::TO_HOST != 0 {
+            self.dma_from_board(&bus, table, seq, &hdr);
+        } else if hdr[dma::HDR_DEST] & dma::SENTINEL != 0 {
+            if hdr[dma::HDR_DEST] == dma::SENTINEL_DRAW {
+                self.dma_draw_sentinel_short(&bus, table, seq, &hdr);
+            } else if self.dma_report(dma::REPORT_UPLOAD_SENTINEL) {
+                crate::dlog!(
+                    LogModule::Odyssey,
+                    "sgi-odyssey: DMA upload to sentinel {:#x} with word 4 {:#x} is not modeled",
+                    hdr[dma::HDR_DEST],
+                    hdr[dma::HDR_FORMAT]
+                );
+            }
+        } else if self.dma_colour_base != 0 && hdr[dma::HDR_DEST] == self.dma_colour_base {
+            self.dma_to_buffer(&bus, table, seq, &hdr, None);
+        } else if hdr[dma::HDR_DEST] == 0 {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA header at {:#x} names no destination buffer", table);
+        } else {
+            // The header's row length is the object's, as a select's.
+            let obj = self.object_select(
+                hdr[dma::HDR_DEST],
+                hdr[dma::HDR_WIDTH].wrapping_mul(dest::WIDTH_UNIT),
+            );
+
+            self.dma_to_buffer(&bus, table, seq, &hdr, Some(obj));
+        }
+        if hdr[dma::HDR_CONTROL] & dma::IRQ_REQUEST != 0 {
+            self.dma_done();
+        }
+    }
+}
+
+// The raster-position query: the library sends 0x4c0 + kind with the same
+// count, fence and sequence as the current-value query (kind 0); kind 3 is
+// glRasterPos's update. After it completes the library copies the record at
+// query base + 0x93c into the raster colour (RGBA context) or the one at
+// + 0x928 (colour-index context), and the record at + 0x950 into the raster
+// texture coordinate.
+//
+// The raster index, colour and texture coordinate are a latch, taken when
+// the last block (0x3cfb) of glRasterPos's position stream arrives, and
+// kind 3 answers from the latch, not from the colour current when the
+// query is processed: the library defers the query past later glColor
+// calls. That the
+// board latches, and at 0x3cfb, is INFERRED; the library's reliance on it
+// is ESTABLISHED. Before any latch the records hold the GL initial values
+// (colour white, index 1). Kind 0 answers the live records.
+//
+// APPROXIMATION: the lit case is UNKNOWN. The library computes a lit raster
+// position on the host and sends the board nothing to light, so the latch
+// takes the current colour unlit, and the texture coordinate untransformed.
+// Kinds 1 and 2 are not modeled.
+
+pub(super) static QUERY_OFFSET: [u32; 5] = [0x900, 0x914, 0x928, 0x950, 0x978];
+
+/// Public initial values: index 1, colour white, normal +Z, edge true.
+pub(super) static QUERY_DEFAULTS: [[u32; 5]; 5] = [
+    [gl_cmd::COLOR_INDEX, 1, 0, 0, 0],
+    [gl_cmd::COLOR_3F, ODSY_F32_ONE, ODSY_F32_ONE, ODSY_F32_ONE, 0],
+    [gl_cmd::NORMAL_3F, 0, 0, ODSY_F32_ONE, 0],
+    [gl_cmd::TEXCOORD_2F, 0, 0, 0, 0],
+    [0x2f00c02e, 0, 0, 0, 0],
+];
+
+impl Board {
+    pub fn query_records_reset(&mut self) {
+        self.query.current = QUERY_DEFAULTS;
+        self.query.current_valid = 0x1f;
+        self.query.latched = QUERY_DEFAULTS;
+        self.query.latched_valid = 0x1f;
+    }
+
+    /// The raster position's stream has arrived: keep the current index,
+    /// colour and texture coordinate for the kind-3 query.
+    pub fn query_raster_latch(&mut self) {
+        for rec in [ODSY_QUERY_INDEX, ODSY_QUERY_COLOUR, ODSY_QUERY_TEXCOORD] {
+            self.query.latched[rec as usize] = self.query.current[rec as usize];
+            let bit = 1u32 << rec;
+            self.query.latched_valid = (self.query.latched_valid & !bit) | (self.query.current_valid & bit);
+        }
+    }
+
+    pub fn query_cancel(&mut self) {
+        if self.query.stage != 0 {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: interrupted current-query sequence");
+        }
+        self.query.epoch += 1;
+        self.query.stage = 0;
+        self.query.count = 0;
+        self.query.sync_index = 0;
+        self.query.kind = 0;
+        self.query.base = 0;
+        self.query.sync_base = 0;
+        self.query.captured_epoch = 0;
+        self.query.captured_valid = 0;
+        self.query.captured = [[0; 5]; 5];
+        self.cmd.state = ODSY_CMD_IDLE;
+        self.cmd.tag = 0;
+        self.cmd.operand_count = 0;
+        self.cmd.operand_index = 0;
+        self.cmd.operand = [0; ODSY_CMD_OPERANDS_MAX as usize];
+    }
+
+    /// Retain a completed setter in its public record: the whole command word
+    /// and its raw operands, never a converted value. The 0xce80 twins of the
+    /// index and colour words set the same records as their 0xc580 siblings (a
+    /// model choice). A byte colour operand above 255 has no defined answer: the
+    /// record is retained for the context save but makes queries fail
+    /// observably until the next colour setter. The current texture record
+    /// admits the captured two- and four-float setters; other formats stay
+    /// unsupported.
+    pub fn query_update(&mut self, tag: u32) {
+        let record: u32;
+        let mut supported = true;
+
+        match tag {
+            gl_cmd::COLOR_INDEX | gl_cmd::REPLAY_INDEX | gl_cmd::COLOR_INDEX_F | gl_cmd::REPLAY_INDEX_F => {
+                record = ODSY_QUERY_INDEX;
+            }
+            gl_cmd::COLOR_3UB | mode::INDEX_ZEROS => {
+                record = ODSY_QUERY_COLOUR;
+                supported &= self.cmd.operand[..3].iter().all(|&c| c <= 0xff);
+            }
+            gl_cmd::COLOR_4UB => {
+                record = ODSY_QUERY_COLOUR;
+                supported &= self.cmd.operand[..4].iter().all(|&c| c <= 0xff);
+            }
+            gl_cmd::COLOR_3I
+            | gl_cmd::INDEX_MODE_COLOR_3I
+            | gl_cmd::COLOR_3F
+            | gl_cmd::INDEX_MODE_COLOR_3F
+            | gl_cmd::COLOR_4F
+            | gl_cmd::INDEX_MODE_COLOR_4F
+            | gl_cmd::COLOR_3US
+            | gl_cmd::COLOR_3UI
+            | gl_cmd::COLOR_3B
+            | gl_cmd::COLOR_3S
+            | gl_cmd::COLOR_4US
+            | gl_cmd::COLOR_4UI
+            | gl_cmd::COLOR_4B
+            | gl_cmd::COLOR_4S
+            | gl_cmd::COLOR_4I => {
+                record = ODSY_QUERY_COLOUR;
+            }
+            gl_cmd::NORMAL_3B | gl_cmd::NORMAL_3S | gl_cmd::NORMAL_3I | gl_cmd::NORMAL_3F => {
+                record = ODSY_QUERY_NORMAL;
+            }
+            gl_cmd::TEXCOORD_1F | gl_cmd::TEXCOORD_2F | gl_cmd::TEXCOORD_3F | gl_cmd::TEXCOORD_4F => {
+                record = ODSY_QUERY_TEXCOORD;
+            }
+            0x2f00c02e | 0x3000c02e => {
+                record = ODSY_QUERY_EDGE;
+            }
+            // Kept raw like the float forms: the kernel replays the record
+            // through the command FIFO at a context restore.
+            gl_cmd::TEXCOORD_1I | gl_cmd::TEXCOORD_2I | gl_cmd::TEXCOORD_3I | gl_cmd::TEXCOORD_4I => {
+                record = ODSY_QUERY_TEXCOORD;
+            }
+            _ => {
+                if (tag & gl_cmd::TEXCOORD_SHAPE) != gl_cmd::TEXCOORD_TAG {
+                    return;
+                }
+                record = ODSY_QUERY_TEXCOORD;
+                supported = false;
+            }
+        }
+        let rec = record as usize;
+        self.query.current_valid &= !(1u32 << record);
+        if record != ODSY_QUERY_TEXCOORD || supported {
+            // Every word mapped to a record above has at most four operands.
+            let arity = cmd_arity(tag) as usize;
+            assert!(arity < self.query.current[rec].len());
+            self.query.current[rec] = [0; 5];
+            self.query.current[rec][0] = tag;
+            for k in 0..arity {
+                self.query.current[rec][1 + k] = self.cmd.operand[k];
+            }
+        }
+        if supported {
+            self.query.current_valid |= 1u32 << record;
+        } else {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported current-query record {} tag {:#010x}", record, tag);
+        }
+    }
+}
+
+impl DmaBus {
+    /// A query's completion words must not report failure after changing guest
+    /// memory. Admit only a whole aligned scalar, big-endian. Guest memory is
+    /// written through the bus.
+    pub fn publish_word(&self, addr: u64, value: u32, size: u32) -> Result<(), DmaError> {
+        let size64 = size as u64;
+
+        if (addr & (size64 - 1)) != 0 || addr > u64::MAX - size64 {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: invalid publication address {:#x}", addr);
+            return Err(DmaError::Bounds);
+        }
+        let written = if size == 2 {
+            write_guest(&self.mem, addr, &(value as u16).to_be_bytes())
+        } else {
+            write_guest(&self.mem, addr, &value.to_be_bytes())
+        };
+        if !written {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: publication at {:#x} is not aligned writable RAM", addr);
+            return Err(DmaError::Bus);
+        }
+        Ok(())
+    }
+
+    pub fn publish_be16(&self, addr: u64, value: u16) -> Result<(), DmaError> {
+        self.publish_word(addr, value as u32, 2)
+    }
+
+    pub fn publish_be32(&self, addr: u64, value: u32) -> Result<(), DmaError> {
+        self.publish_word(addr, value, 4)
+    }
+}
+
+impl Board {
+    pub fn query_begin(&mut self) {
+        self.query.stage = 1;
+        self.query.base = (((self.widget.ctx_shadow_addr_upper & 0xffff) as u64) << 32) | self.widget.ctx_shadow_addr_lower as u64;
+        self.query.sync_base = (((self.widget.host_write_addr_upper & 0xffff) as u64) << 32) | self.widget.host_write_addr_lower as u64;
+        self.query.captured_epoch = self.query.epoch;
+        self.query.captured_valid = self.query.current_valid;
+        self.query.captured = self.query.current;
+    }
+
+    /// The query's last word: publish the snapshot query_begin() took,
+    /// its counter and its sync word. The sync word completes like a fence,
+    /// after the raster work before it, so the publication goes to the
+    /// raster unit as a job behind that work and the front end goes on. It
+    /// waited for the raster queue to empty instead, which in perfly held
+    /// the front end up for most of a frame's drawing once a frame.
+    pub fn query_finish(&mut self, sequence: u32) {
+        let sync_offset: u64 = 2 * (self.query.sync_index & dma::FENCE_SLOT_MASK) as u64;
+        let raster = self.query.kind == query::KIND_RASTER;
+        // Kind 3 reads the raster records and the texture coordinate from the
+        // latch; the rest of the page is the live snapshot.
+        let mut page = self.query.captured;
+        let mut page_valid = self.query.captured_valid;
+
+        self.query.stage = 0;
+        if raster {
+            let tex = ODSY_QUERY_TEXCOORD as usize;
+
+            page[tex] = self.query.latched[tex];
+            page_valid = (page_valid & !(1u32 << tex)) | (self.query.latched_valid & (1u32 << tex));
+        }
+        for i in 0..QUERY_OFFSET.len() {
+            if page_valid & (1u32 << i) == 0 {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported current-query record {} in snapshot", i);
+            }
+        }
+        if raster && self.query.latched_valid & 0b1011 != 0b1011 {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported raster-position latch");
+            return;
+        }
+        if self.query.base == 0
+            || self.query.base > u64::MAX - 0x980
+            || self.query.captured_epoch != self.query.epoch
+            || page_valid != 0x1f
+        {
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported current-query snapshot");
+            return;
+        }
+        // Each word in publication order, with what a failed write reports.
+        let mut words: Vec<(u64, u32, &'static str)> = Vec::new();
+        for (record, &offset) in page.iter().zip(QUERY_OFFSET.iter()) {
+            let n = 1 + cmd_arity(record[0]) as usize;
+
+            for (j, &word) in record[..n].iter().enumerate() {
+                let addr = self.query.base + offset as u64 + 4 * j as u64;
+                words.push((addr, word, "sgi-odyssey: current-query payload failed"));
+            }
+        }
+        let mut i = 0;
+        while self.query.kind == query::KIND_RASTER && i < 2 {
+            let rec = self.query.latched[if i != 0 { ODSY_QUERY_COLOUR } else { ODSY_QUERY_INDEX } as usize];
+            let at = self.query.base + (if i != 0 { query::RASTER_COLOUR } else { query::RASTER_INDEX }) as u64;
+
+            for (j, &word) in rec.iter().enumerate().take(1 + cmd_arity(rec[0]) as usize) {
+                words.push((at + 4 * j as u64, word, "sgi-odyssey: raster query payload failed"));
+            }
+            i += 1;
+        }
+        words.push((self.query.base + 0x97c, self.query.count, "sgi-odyssey: current-query counter failed"));
+        let sync = (self.query.sync_base <= u64::MAX - sync_offset).then(|| self.query.sync_base + sync_offset);
+        let softsync = self.query.sync_index & dma::FENCE_INTERRUPT != 0;
+        let bus = DmaBus {
+            mem: self.guest.clone(),
+            trace_sequence: self.trace_sequence.load(Ordering::Relaxed).wrapping_sub(1),
+        };
+        let front = self.front.clone();
+
+        self.raster.submit_completion(move |_| {
+            for (addr, word, failed) in words {
+                if bus.publish_be32(addr, word).is_err() {
+                    crate::dlog!(LogModule::Odyssey, "{}", failed);
+                    return;
+                }
+            }
+            if sync.is_none_or(|at| bus.publish_be16(at, (sequence & 0xffff) as u16).is_err()) {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query sync failed");
+                return;
+            }
+            if softsync {
+                front.lock().deliver_softsync();
+            }
+        });
+    }
+}
+
+/// Match the shared rasterizer's eight-bit channel conversion.
+pub(super) fn float_channel(bits: u32) -> u32 {
+    let c = f64::from(odyssey_f32(bits));
+
+    if !(c > 0.0) {
+        return 0;
+    }
+    if c >= 1.0 {
+        return 255;
+    }
+    (c * 255.0 + 0.5) as u32
+}
+
+/// The GL library's conversion of a signed-integer colour or normal operand
+/// to a float, in single precision as its query decoder does. The exact
+/// scales are 1/255, 1/65535 and 1/(2^32 - 2304); ODSY_F32_SCALE_32 is the
+/// single-precision quotient of the last, exactly 1/(2^32 - 2560). Formats
+/// 22 and 23 form 2v + 1 in 32-bit integer arithmetic before converting; 13
+/// and 24 convert v first, then form v * 2 + 1 with a fused multiply-add.
+/// This is the software's expectation for what the current value means; the
+/// board's own arithmetic is unknown.
+pub(super) fn signed_to_float(word: u32, format: u32) -> u32 {
+    let scale_bits: u32;
+    let mut f: f32;
+
+    match format {
+        22 => {
+            scale_bits = ODSY_F32_SCALE_8;
+            f = word.wrapping_mul(2).wrapping_add(1) as i32 as f32;
+        }
+        23 => {
+            scale_bits = ODSY_F32_SCALE_16;
+            f = word.wrapping_mul(2).wrapping_add(1) as i32 as f32;
+        }
+        _ => {
+            scale_bits = ODSY_F32_SCALE_32;
+            f = (word as i32 as f32).mul_add(2.0, 1.0);
+        }
+    }
+    f *= f32::from_bits(scale_bits);
+    f.to_bits()
+}
+
+/// One component of an integer colour word as float bits. The operand is
+/// taken to its type's width and converted by OpenGL's rule, c / (2^n - 1)
+/// for an unsigned type and (2c + 1) / (2^n - 1) for a signed one; the int
+/// type keeps glColor3i's existing conversion. INFERRED: that the board
+/// converts by OpenGL's rule; the library sends the raw components.
+pub(super) fn integer_colour(tag: u32, word: u32) -> u32 {
+    let mut code = tag & gl_cmd::COLOR_TYPE_MASK;
+
+    code = code.wrapping_sub(if code >= gl_cmd::COLOR_TYPE_4 { gl_cmd::COLOR_TYPE_4 } else { gl_cmd::COLOR_TYPE_3 });
+    let c: f64 = match code {
+        0 => (word as u8) as f64 / 255.0,
+        1 => (word as u16) as f64 / 65535.0,
+        2 => word as f64 / 4294967295.0,
+        3 => (2.0 * ((word as u8 as i8) as f64) + 1.0) / 255.0,
+        4 => (2.0 * ((word as u16 as i16) as f64) + 1.0) / 65535.0,
+        _ => return signed_to_float(word, gl_cmd::COLOR_3I & gl_cmd::COLOR_TYPE_MASK),
+    };
+    f32_bits(c as f32)
+}
+
+/// True for the integer colour words other than glColor3ub and glColor3i.
+pub(super) fn is_integer_colour(word: u32) -> bool {
+    matches!(
+        word,
+        gl_cmd::COLOR_3US
+            | gl_cmd::COLOR_3UI
+            | gl_cmd::COLOR_3B
+            | gl_cmd::COLOR_3S
+            | gl_cmd::COLOR_4UB
+            | gl_cmd::COLOR_4US
+            | gl_cmd::COLOR_4UI
+            | gl_cmd::COLOR_4B
+            | gl_cmd::COLOR_4S
+            | gl_cmd::COLOR_4I
+    )
+}
+
+impl Board {
+    /// True when base lies within the board memory the active product reports
+    /// (the "memory-size" property, in megabytes), false and reported, once per
+    /// reset, otherwise. A destination select's base is in 16-byte units, so the
+    /// capacity is converted into that unit first. A guest that addresses past
+    /// the reported size is a guest bug, kept observable.
+    pub fn board_address_valid(&mut self, base: u32) -> bool {
+        let limit: u64 = (self.widget.memory_size as u64) * (1u64 << 20) / 16;
+
+        if (base as u64) < limit {
+            return true;
+        }
+        if !self.diag.board_oob_reported {
+            self.diag.board_oob_reported = true;
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: destination base {:#x} is beyond the {} MiB this board reports", base, self.widget.memory_size);
+        }
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: board memory out of bounds: destination base {:#x} exceeds the {} MiB this board reports", base, self.widget.memory_size);
+        false
+    }
+
+    /// Build the next mipmap level from the level above by taking every second
+    /// texel (a model policy), for the one construction template the model has
+    /// seen. Sampler word 4 must be the builder's (texture_mip_build_word())
+    /// and the source level's entry must name a listed format index with its
+    /// own size code, with no other bits but the row; the class is not
+    /// checked against the index. The store keeps
+    /// whole texel words whatever the level's format, so the copy is the same.
+    pub fn texture_build_level(&mut self) -> bool {
+        let p = self.cmd.operand;
+        let entry = [self.tex.levels[60 * 3], self.tex.levels[60 * 3 + 1], self.tex.levels[60 * 3 + 2]];
+        let ws = self.tex.sampler[1];
+        let hs = self.tex.sampler[2];
+
+        if !texture_mip_build_word(self.tex.sampler[4]) || texture_level_texel_format(entry[1]).is_none() {
+            return false;
+        }
+        if ws == 0 || hs == 0 || ws > i32::MAX as u32 || hs > i32::MAX as u32 || !(ws as u64).is_power_of_two() || !(hs as u64).is_power_of_two() {
+            return false;
+        }
+        let wd = (ws / 2).max(1);
+        let hd = (hs / 2).max(1);
+        let source_units = (ws.div_ceil(16) + 1) & !1u32;
+        let dest_units = (wd.div_ceil(16) + 1) & !1u32;
+        if self.stream.primitive != gl_cmd::QUADS
+            || (self.tex.mode & tex::MODE_2D) == 0
+            || self.tex.level0 != 60
+            || (entry[1] & !LEVEL_FORMAT_MASK) != source_units
+            || entry[2] != 0
+            || self.tex.sampler[0] != ((ws.trailing_zeros() << 10) | (hs.trailing_zeros() << 5))
+            || self.tex.sampler[3] != 0
+            || self.tex.sampler[5] != 0
+            || self.tex.sampler[6] != 0
+            || p[0] != 0
+            || p[1] != 0
+            || p[2] != 0
+            || p[3] != 0
+            || p[4] != 0
+            || p[5] != 0
+            || p[6] != 0
+            || p[7] != f32_bits(wd as f32)
+            || p[8] != f32_bits(hd as f32)
+            || p[9] != 0
+            || p[10] != 0
+            || p[11] != 0
+            || p[12] != f32_bits(1.0f32 - 0.5f32 / wd as f32)
+            || p[13] != f32_bits(1.0f32 - 0.5f32 / hd as f32)
+        {
+            return false;
+        }
+        let source_base = entry[0] & 0x1fffffff;
+        if source_base == 0 || source_base == self.dest_base || self.objects.count > ODSY_OBJECTS {
+            return false;
+        }
+        let (Some(su), Some(du)) = (self.object_find(source_base), self.image_object()) else {
+            return false;
+        };
+        if self.objects.width[su] != source_units * 16 || self.objects.rows[su] < hs || self.objects.width[du] != dest_units * 16 {
+            return false;
+        }
+        let source_end = ((hs - 1) as u64)
+            .checked_mul(self.objects.width[su] as u64)
+            .and_then(|v| v.checked_add(self.objects.offset[su] as u64))
+            .and_then(|v| v.checked_add(ws as u64));
+        let Some(source_end) = source_end else { return false };
+        if source_end > self.objects.used as u64 || source_end > self.objects.mem.size / 4 || !self.object_rows(du, hd) {
+            return false;
+        }
+        for y in 0..hd {
+            for x in 0..wd {
+                let v = self.object_load(su, 2 * x, 2 * y);
+                self.object_store(du, x, y, v);
+            }
+        }
+        true
+    }
+
+    /// One rectangle of the library's texture move drawn as a pixel zoom:
+    /// fourteen floats, a constant colour (0, 0, 0, 1), the destination
+    /// corners (x0, ya, z) and (x1, yb, z), then the source corners (s0, t0)
+    /// and (s1, t1). The mip-level builder (texture_build_level()) sends
+    /// the same word with an alpha of 0, so a word that is not one of those
+    /// builds is a zoom rectangle when the colour is exactly (0, 0, 0, 1).
+    ///
+    /// The library sends the move as BEGIN of type 7 (quads), one such word per
+    /// source row (per whole destination row under a y zoom), and END, after
+    /// it has set the sampler, the level-60 descriptor and a stored raster
+    /// state, all of which arrive as ordinary commands. ESTABLISHED: the word
+    /// layout and the begin and end around it. INFERRED: the first four
+    /// floats are a constant colour and the repeated z gives both corners'
+    /// depth. UNKNOWN: the count-14 word's fields, and the magnification
+    /// filter, since the move sends no filter word.
+    ///
+    /// The rectangle goes down the ordinary textured vertex path as four
+    /// float vertices of a quad, so it takes the sampler, raster state and
+    /// clip the guest sent. Returns whether the word was taken as a zoom
+    /// rectangle. The colour words are not applied: with a replacing texture
+    /// environment they do not reach the pixel, and the environment is the
+    /// stored raster state's to say.
+    pub fn texture_zoom_rect(&mut self) -> bool {
+        let p = self.cmd.operand;
+
+        if p[..3] != [0; 3] || p[3] != ODSY_F32_ONE || self.stream.primitive != gl_cmd::QUADS || !self.prim.begin_open {
+            return false;
+        }
+        let (tag, operands) = (self.cmd.tag, self.cmd.operand);
+        let (x0, ya, z, x1, yb) = (p[4], p[5], p[6], p[7], p[8]);
+        let (s0, t0, s1, t1) = (p[10], p[11], p[12], p[13]);
+
+        // The corners are window pixels, so the combined matrix is the
+        // identity for the rectangle and the guest's comes back after.
+        let identity = [1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+
+        self.gl_load_combined(&identity);
+        self.tex.coord_r = 0;
+        self.tex.coord_q = ODSY_F32_ONE;
+        for (x, y, s, t) in [(x0, ya, s0, t0), (x1, ya, s1, t0), (x1, yb, s1, t1), (x0, yb, s0, t1)] {
+            self.tex.coord = [s, t];
+            self.cmd.operand[..4].copy_from_slice(&[x, y, z, 0]);
+            self.cmd.tag = gl_cmd::VERTEX_3F;
+            self.cmd_dispatch(gl_cmd::VERTEX_3F);
+        }
+        self.gl_reload_combined();
+        self.cmd.tag = tag;
+        self.cmd.operand = operands;
+        true
+    }
+}
