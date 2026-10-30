@@ -101,6 +101,9 @@ their earlier behaviour of not reporting resets to targets.
 The ISP12160 releases its controller state lock before walking either bus.
 Target callbacks run under that bus lock and must not reacquire it.
 
+Flash command engines share `FlashBacking` file storage while retaining
+their own command state.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit
