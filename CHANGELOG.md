@@ -188,7 +188,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   so TLBR reads them back as zero, as the part does; on 16 KB pages that is
   EntryLo bits 7:6. Translation is unchanged. The PROM's `ide` `tlb` test
   failed 320 compares on this. The manual documents it for the R10000; the
-  R12000, R14000 and R16000 do the same as a model choice. The R4400 and
+  R12000 and R14000 do the same as a model choice. The R4400 and
   R5000 still keep the whole PFN.
 - **TLB refill vector on the R10000** follows the address space that missed:
   a user address takes the XTLB vector only with UX set, xsseg with SX, and
@@ -219,6 +219,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   shifted right by 3 instead of 4: one slot per doubleword.
 - **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
   TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
+
+### R12000 and R14000
+
+- `[machine] cpu` and `--cpu` take `r12000` and `r14000`. The Octane
+  takes the R10000, R12000 and R14000 (defaulting to 195, 360 and 600 MHz), the
+  O2 the R5000, R10000 and R12000 (400 MHz for the R12000), the IP28 the R10000.
+  CP0 Config now reports the part's own secondary-cache size, where every part
+  read 1 MB.
 
 ### `IRIS_GUI_GL` works in iris-gui
 
