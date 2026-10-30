@@ -23,7 +23,9 @@
 //!   to it and returns them unchanged, so a walking-1s test over tag or data
 //!   SRAM passes without anyone having to know the hardware's field layout.
 //!   Where the emulator *must* know the layout — to decide whether a line is
-//!   valid, say — that is a separate question from storing the bits.
+//!   valid, say — that is a separate question from storing the bits. The one
+//!   exception is the R10000's secondary tag, whose reserved bits read as zero
+//!   (`R10K_L2_TAG_MASK`).
 //!
 //! The shadow is deliberately not consulted by `read`/`write`/`fetch`. If it
 //! ever needs to be, this type is the wrong shape and should say so loudly
@@ -90,15 +92,11 @@ const MRU_BIT: u64 = 1 << 63;
 /// R4400 and R5000 index differently — see `tag_slot`.
 const WAYS: usize = 2;
 
-/// Bits a secondary-cache tag retains.
-///
-/// All of them, now. A 36-bit mask was inferred here from the PROM's
-/// walking-0s phase, which writes an all-ones TagLo and expects back
-/// 0x0000000f_ffffcdfe — but that truncation comes from the tag being
-/// assembled as `(TagHi << 32) | TagLo[31:0]`, not from the array dropping
-/// bits. Once the executor carried TagHi properly the mask did nothing except
-/// discard the MRU bit, which the PROM writes as TagHi[31] and reads back.
-const L2_TAG_MASK: u64 = u64::MAX;
+/// Bits an R10000 secondary-cache tag retains: MRU (bit 63), the physical tag
+/// (TagHi 3:0 and TagLo 31:14), state, virtual index and ECC. TagLo bits 9, 12
+/// and 13 and TagHi 30:4 are reserved and read as zero (R10000 UM p. 270,
+/// figure 11-31). Other parts keep every bit; see `CpuModel::SECONDARY_TAG_MASK`.
+const R10K_L2_TAG_MASK: u64 = 0x8000_000f_ffff_cdff;
 
 /// Is the shadow cache's operation trace on, at this level of detail?
 ///
@@ -352,6 +350,7 @@ impl<
     const PARTIAL_LWR_KEEPS_UPPER: bool = MODEL == model::R10000;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
     const POSTS_UNCACHED_STORES: bool = Self::R10K_CACHE_OPS;
+    const SECONDARY_TAG_MASK: u64 = if Self::R10K_CACHE_OPS { R10K_L2_TAG_MASK } else { u64::MAX };
 }
 
 impl<
@@ -566,12 +565,16 @@ impl<
         }
 
         match op {
-            // Index_Store_Tag / Index_Load_Tag. Stored and returned verbatim:
-            // a tag test is a round trip, and round trips do not require
-            // knowing what the bits mean.
+            // Index_Store_Tag / Index_Load_Tag. Stored and returned verbatim
+            // unless the part sets a secondary mask: a tag test is a round trip,
+            // and round trips do not require knowing what the bits mean.
             C_IST => {
                 let idx = self.tag_slot(sel, virt_addr);
-                let mask = if matches!(sel, CACH_SI | CACH_SD) { L2_TAG_MASK } else { u64::MAX };
+                let mask = if matches!(sel, CACH_SI | CACH_SD) {
+                    <Self as CpuModel>::SECONDARY_TAG_MASK
+                } else {
+                    u64::MAX
+                };
                 if l2_op_log(CACHE_LOG_OP) {
                     crate::dlog!(LogModule::L2c, "shadow:   -> IST va={virt_addr:#012x} idx={idx} stores {:#018x}",
                                  phys_addr & mask & !MRU_BIT);
@@ -785,22 +788,23 @@ mod tests {
     }
 
     /// A tag test is a round trip, so the shadow must return exactly the bits
-    /// it was given — including any the real layout would not use. The cache
+    /// it was given, except the reserved ones the manual reads as zero. The cache
     /// model that preceded this one decoded TagLo into ptag/state/pidx fields
     /// and re-encoded on the way out, which silently dropped the low seven
     /// bits and every state code it did not recognise. A walking-1s test then
     /// failed on its very first bit.
     #[test]
-    fn tags_round_trip_every_bit() {
+    fn tags_round_trip_every_defined_bit() {
         let c = cache();
         for bit in 0..64 {
             // 32 and 63 are MRU control/state, not tag storage.
             if bit == 32 || bit == 63 { continue; }
             let v = 1u64 << bit;
             c.cache_op(C_IST | CACH_SD, 0, v);
+            let kept = <R10000ShadowCache as CpuModel>::SECONDARY_TAG_MASK & v;
             assert_eq!(
                 c.cache_op(C_ILT | CACH_SD, 0, 0),
-                v,
+                kept,
                 "bit {bit} did not survive a store/load tag round trip"
             );
         }
@@ -905,18 +909,19 @@ mod tests {
     #[test]
     fn an_untouched_set_has_no_mru_bit() {
         let c = cache();
-        c.cache_op(C_IST | CACH_SD, 0, 0xdead_beef);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), 0xdead_beef);
+        // Only defined tag bits (TagLo bits 9, 12 and 13 read as zero).
+        c.cache_op(C_IST | CACH_SD, 0, 0xdead_8cef);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), 0xdead_8cef);
     }
 
     /// Separate lines must not alias onto one another.
     #[test]
     fn distinct_lines_hold_distinct_tags() {
         let c = cache();
-        c.cache_op(C_IST | CACH_SD, 0, 0x1111_1111);
-        c.cache_op(C_IST | CACH_SD, 128, 0x2222_2222);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), 0x1111_1111);
-        assert_eq!(c.cache_op(C_ILT | CACH_SD, 128, 0), 0x2222_2222);
+        c.cache_op(C_IST | CACH_SD, 0, 0x1111_0111);
+        c.cache_op(C_IST | CACH_SD, 128, 0x2222_0022);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 0, 0), 0x1111_0111);
+        assert_eq!(c.cache_op(C_ILT | CACH_SD, 128, 0), 0x2222_0022);
     }
 
     /// Bit 0 of a CACHE index selects the **way**, and the two ways of a set
@@ -944,14 +949,14 @@ mod tests {
         for set in 0..4u64 {
             for way in 0..2u64 {
                 let va = set * 128 + way;
-                c.cache_op(C_IST | CACH_SD, va, 0x1000 + set * 16 + way);
+                c.cache_op(C_IST | CACH_SD, va, 0x4000 + set * 16 + way);
             }
         }
         for set in 0..4u64 {
             for way in 0..2u64 {
                 let va = set * 128 + way;
                 assert_eq!(c.cache_op(C_ILT | CACH_SD, va, 0),
-                           0x1000 + set * 16 + way,
+                           0x4000 + set * 16 + way,
                            "set {set} way {way} aliased");
             }
         }
@@ -997,6 +1002,21 @@ mod tests {
         same::<R4400ShadowCache, R4400Cache>();
         same::<R5000ShadowCache, R5000Cache>();
         assert_eq!(<R10000ShadowCache as CpuModel>::NAME, "shadow", "existing IP28 snapshots");
+    }
+
+    /// The R10000 returns zero for the reserved bits of a secondary tag and
+    /// keeps MRU, tag, state, index and ECC (R10000 UM p. 270); the R4400
+    /// stores the tag as written.
+    #[test]
+    fn the_r10000_masks_secondary_tags() {
+        fn stored<C: CpuModel + MipsCache + From<Arc<dyn BusDevice>>>(tag: u64) -> u64 {
+            let c = C::from(Arc::new(Memory::new(1)) as Arc<dyn BusDevice>);
+            c.cache_op(C_IST | CACH_SD, 0, tag);
+            c.cache_op(C_ILT | CACH_SD, 0, 0)
+        }
+        assert_eq!(stored::<R10000ShadowCache>(u64::MAX), 0x8000_000f_ffff_cdff);
+        assert_eq!(stored::<R10000O2ShadowCache>(u64::MAX), 0x8000_000f_ffff_cdff);
+        assert_eq!(stored::<R4400ShadowCache>(0x3000) & 0x3000, 0x3000, "R4400 keeps TagLo bits 12 and 13");
     }
 
     /// The O2 R10000 differs from the IP28's only in its secondary line size.

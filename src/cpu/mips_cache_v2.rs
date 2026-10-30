@@ -583,6 +583,9 @@ pub trait CpuModel: MipsCache {
     /// to match. An uncached SC succeeding is a model choice. Loads and fetches
     /// still fault.
     const POSTS_UNCACHED_STORES: bool = false;
+    /// Bits `Index_Store_Tag` keeps for the secondary cache: all of them, except
+    /// on the R10000 family, whose reserved tag bits read as zero (R10000 UM p. 270).
+    const SECONDARY_TAG_MASK: u64 = u64::MAX;
 }
 
 pub trait MipsCache: Send + Sync {

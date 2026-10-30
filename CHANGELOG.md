@@ -48,6 +48,8 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Index Load Data and Index Store Data** on the R10000's primary caches keep their
   data (they read back zero before). The secondary cache's data slot is the address
   shifted right by 3 instead of 4: one slot per doubleword.
+- **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
+  TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
 
 ### `IRIS_GUI_GL` works in iris-gui
 
