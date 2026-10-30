@@ -295,6 +295,11 @@ pub enum TlbResult {
     },
 }
 
+/// VPN2 bits of a virtual address `bits` wide: bit 13 up to `bits - 1`.
+pub const fn vpn2_mask(bits: u32) -> u64 {
+    ((1u64 << bits) - 1) & !0x1fff
+}
+
 /// TLB interface for MIPS address translation
 ///
 /// The TLB translates virtual page numbers to physical page numbers.
@@ -351,6 +356,8 @@ pub trait Tlb {
     fn power_on(&mut self) {}
     /// Install the CPU model's meaning for each EntryLo C value.
     fn set_cache_attrs(&mut self, _table: [CacheAttr; 8]) {}
+    /// Set the implemented VPN width before installing entries.
+    fn set_va_bits(&mut self, _bits: u32) {}
     fn save_state(&self) -> toml::Value { toml::Value::Table(Default::default()) }
     fn load_state(&mut self, _v: &toml::Value) -> Result<(), String> { Ok(()) }
 
@@ -534,6 +541,7 @@ pub struct MipsTlb {
 
     /// Live JTLB entries for the CPU model in use (<= TLB_MAX_ENTRIES).
     num_entries: usize,
+    vpn_mask64: u64,
     /// What each EntryLo C value means on the CPU model in use; the
     /// executor installs its table with `set_cache_attrs`.
     c_attr: [CacheAttr; 8],
@@ -564,6 +572,7 @@ impl MipsTlb {
             mru_head: [0u8; MRU_LISTS],
             mru_next: [[MRU_NONE; TLB_MAX_ENTRIES]; MRU_LISTS],
             num_entries,
+            vpn_mask64: 0xC000_00FF_FFFF_E000,
             c_attr: DEFAULT_C_ATTR,
             vmap: [VMAP_MISS; VMAP_SIZE],
             #[cfg(feature = "tlbcheck")]
@@ -1065,7 +1074,7 @@ impl Tlb for MipsTlb {
             entry.selector_bit_shift = (mask.trailing_ones() - 1) as u8;
             entry.vcmp32   = !mask & 0x0000_0000_FFFF_E000;
             entry.vpn_hi32 = entry.entry_hi & entry.vcmp32;
-            entry.vcmp64   = !mask & 0xC000_00FF_FFFF_E000;
+            entry.vcmp64   = !mask & self.vpn_mask64;
             entry.vpn_hi64 = entry.entry_hi & entry.vcmp64;
             entry.offset_mask = (1u64 << entry.selector_bit_shift) - 1;
             let pfn_mask = 0xFF_FFFF_FFFF_000 & !entry.offset_mask;
@@ -1194,6 +1203,10 @@ impl Tlb for MipsTlb {
         output
     }
 
+    fn set_va_bits(&mut self, bits: u32) {
+        self.vpn_mask64 = 0xC000_0000_0000_0000 | vpn2_mask(bits);
+    }
+
     fn set_cache_attrs(&mut self, table: [CacheAttr; 8]) {
         self.c_attr = table;
         for i in 0..self.num_entries {
@@ -1237,7 +1250,7 @@ impl Tlb for MipsTlb {
                 let entry_hi  = words[1];
                 let mask = page_mask | 0x1FFF;
                 let vcmp32 = !mask & 0x0000_0000_FFFF_E000;
-                let vcmp64 = !mask & 0xC000_00FF_FFFF_E000;
+                let vcmp64 = !mask & self.vpn_mask64;
                 let shift = (mask.trailing_ones() - 1) as u8;
                 let offset_mask = (1u64 << shift) - 1;
                 let lo = [words[2], words[3]];
