@@ -102,8 +102,11 @@ impl PciConfig {
     pub fn write(&self, reg: usize, val: u32) {
         let mut r = self.regs.lock().unwrap();
         match reg {
-            // Identity, class and header type are read-only.
-            0 | 2 | 3 => {}
+            // Identity and class are read-only.
+            0 | 2 => {}
+            // Cache line size and latency timer are stored; the header type
+            // and BIST bytes above them are not.
+            3 => r[3] = (r[3] & 0xffff_0000) | (val & 0xffff),
             // Command; status bits are write-one-to-clear and none are set.
             1 => r[1] = val & 0xffff,
             4..=9 => {
@@ -474,6 +477,17 @@ mod tests {
         c.reset();
         assert_eq!(c.read(11), 0xc304_10a9);
         assert_eq!(c.read(4), 1);
+    }
+
+    /// Firmware programs the latency timer and cache line size, and reads
+    /// them back; the header type byte above them stays what it is.
+    #[test]
+    fn the_latency_timer_and_cache_line_size_are_stored() {
+        let c = scsi_like();
+        c.write(3, 0x00ff_2810);
+        assert_eq!(c.read(3), 0x0000_2810);
+        c.reset();
+        assert_eq!(c.read(3), 0);
     }
 
     #[test]
