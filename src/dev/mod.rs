@@ -72,5 +72,6 @@ pub mod ics1890;
 pub mod isp12160;
 pub mod l1;
 pub mod ohci;
+pub mod prom_image;
 pub mod timekeeper;
 pub mod xbridge;

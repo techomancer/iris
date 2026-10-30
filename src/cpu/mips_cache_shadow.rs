@@ -794,6 +794,14 @@ pub const R14000_PRID: u32 = 0x0000_0f24;
 pub type R12000O2ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 64, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
+/// R14000, as the Fuel has it: the Octane's part at revision 2.3 (PRId
+/// 0x0f23), the revision a public software inventory of a Fuel prints. The
+/// raw CP0 word, the FIR and the 128-byte lines are taken from the Octane
+/// part (`R12000ShadowCache` with `R14000_PRID`), not read from a Fuel. Like
+/// the Octane's R14000 it reports "R12000" as `NAME`.
+pub type R14000FuelShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0f23, 0x0000_0900, 64, { model::R12000 }>;
+
 /// R16000 2.2, the 800 MHz part, with a 4 MB secondary cache. Only
 /// `iris-bench` builds it for now.
 ///
