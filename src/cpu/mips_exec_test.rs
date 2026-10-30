@@ -6411,4 +6411,54 @@ mod tests {
         }
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
     }
+
+    /// Run `f` on a thread with room for a `MipsTlb`, which is large.
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// A 64-bit kernel executor with one TLB entry, written through CP0 and
+    /// TLBWI, that maps the page at `va` to `phys` (cached, valid, dirty).
+    fn map_page<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+        let mut exec = Box::new(MipsExecutor::new(bus, crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
+        disable_jitv2(&mut exec);
+        // MTC0 must refresh the boxed executor's translation/accessor state.
+        exec.install_status_cb();
+        let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+        let entrylo = ((phys >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        for (rd, value) in [(12, status as u64), (10, va), (0, 0), (5, 0), (2, entrylo), (3, 0)] {
+            exec.core.write_gpr(1, value);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+        }
+        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI), EXEC_COMPLETE);
+        exec
+    }
+
+    /// EntryHi and the TLB keep every implemented VPN2 bit: 44 virtual-address
+    /// bits on the R10000, 40 on the R4400. An IRIX n64 stack can sit
+    /// above the 40-bit limit.
+    #[test]
+    fn cp0_entryhi_and_tlb_match_full_xuseg_va() {
+        on_big_stack(|| {
+            const VA: u64 = 0x0000_0123_4000_0000;
+            fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(full_va: bool) {
+                let mem = Arc::new(MockMemory::new());
+                mem.set_word(0x5_0000, 0xdead_beef);
+                let mut exec = map_page::<C>(mem, VA, 0x5_0000);
+                let result = exec.read_data::<4>(VA);
+                if full_va {
+                    assert_eq!(exec.core.cp0_entryhi, VA);
+                    assert_eq!(result, Ok(0xdead_beef));
+                } else {
+                    assert_eq!(exec.core.cp0_entryhi, VA & 0xC000_00FF_FFFF_E0FF);
+                    assert_eq!((result.unwrap_err() >> 2) & 0x1f, EXC_ADEL);
+                }
+            }
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        });
+    }
 }

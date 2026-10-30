@@ -13,6 +13,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### R10000 TLB widths
+
+- **Full 44-bit user addresses.** On the R10000 (Octane, IP28, and an O2 set to
+  `r10000`) EntryHi, the TLB match and the user-segment check keep VA bits 43:40;
+  they stopped at bit 39 before, so an address above 1 TiB took an Address Error.
+  The R4400 and R5000 are unchanged.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
