@@ -1037,12 +1037,12 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
     /// A window of physical addresses that reaches memory at another address,
     /// `(base, size, target)`, applied to mapped and XKPHYS translations
-    /// before [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
+    /// after [`Self::phys_mask`]. The O2 has a no-ECC alias of its memory at
     /// 0x8000_0000 that would otherwise reach the PCI window the bus decodes
     /// there. None on the other machines.
     pub phys_alias: Option<(u64, u64, u64)>,
     /// The physical address bits the board decodes, applied to mapped,
-    /// XKPHYS and ERL-identity translations after [`Self::phys_alias`]. The
+    /// XKPHYS and ERL-identity translations before [`Self::phys_alias`]. The
     /// CPU drives 36 or 40 bits, but the Indy, Indigo2 and O2 decode 32 and
     /// alias the rest away, and IRIX relies on it: its page-table entries keep
     /// software bits (the PFN lock among them) just above the PFN, so they
@@ -4647,15 +4647,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
-    /// A CPU physical address as the board decodes it: through
-    /// [`Self::phys_alias`] if it falls in it, then cut to [`Self::phys_mask`].
+    /// A CPU physical address as the board decodes it: cut to
+    /// [`Self::phys_mask`], then through [`Self::phys_alias`] if it falls in it.
     #[inline(always)]
     fn fold_phys(&self, pa: u64) -> u64 {
-        let pa = match self.phys_alias {
-            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+        // Cut first: the PTE software bits above the PFN are not part of the
+        // address the alias window sees. Window and target lie within the mask.
+        let pa = pa & self.phys_mask;
+        match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => (pa - base + target) & self.phys_mask,
             _ => pa,
-        };
-        pa & self.phys_mask
+        }
     }
 
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are

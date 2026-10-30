@@ -6608,4 +6608,29 @@ mod tests {
         let shown: Vec<u64> = (1..=40).filter(|&n| crate::cpu::mips_exec::report_refused_store(n)).collect();
         assert_eq!(shown, [1, 2, 3, 4, 8, 16, 32]);
     }
+
+    /// The O2's no-ECC alias of RAM at 0x8000_0000 is matched on the address the
+    /// board decodes (32 bits), so a PTE software bit above the PFN cannot make
+    /// a mapped page miss the alias window.
+    #[test]
+    fn phys_alias_is_matched_after_the_physical_mask() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_tlb::MipsTlb;
+                let (mut exec, _) = create_executor_with_tlb(MipsTlb::default());
+                exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+                exec.phys_mask = u32::MAX as u64;
+                exec.phys_alias = Some((0x8000_0000, 0x1000_0000, 0));
+                // PA 0x1_8000_0000: bit 32 is above what the board decodes.
+                exec.core.cp0_index = 0;
+                exec.core.cp0_pagemask = 0;
+                exec.core.cp0_entryhi = 0x4000_0000;
+                exec.core.cp0_entrylo0 = (0x18_0000 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                exec.core.cp0_entrylo1 = 0;
+                assert_eq!(exec.exec((OP_COP0 << 26) | (0x10 << 21) | 0x02), EXEC_COMPLETE);
+                assert_eq!(exec.debug_translate(0x4000_0000).phys, 0);
+            })
+            .unwrap().join().unwrap();
+    }
 }

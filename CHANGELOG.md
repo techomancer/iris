@@ -396,6 +396,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2's memory alias holds for pages with high PTE bits set.** A mapped page
+  whose address had a bit set above bit 31 missed the alias of RAM at
+  0x8000_0000 and reached the PCI window instead.
 - **The O2 runs on the shadow cache from reset.** The full cache model, and
   the switch to and from it during POST and reboots, are gone
   (`src/ip32_handover.rs`), and with them a branch on every cached load, store
