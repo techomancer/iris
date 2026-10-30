@@ -850,11 +850,11 @@ impl Board {
                 // model draws. The swap completes on the retrace hook
                 // (retrace()).
                 self.draw_word = self.cmd_operand[0];
-                crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_buffer_word: reg {:#x} word {:#x}", tag, self.draw_word);
+                crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: buffer word: reg {:#x} word {:#x}", tag, self.draw_word);
             }
             ODSY_SWAP_SYNC_B => {
                 self.read_word = self.cmd_operand[0];
-                crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_buffer_word: reg {:#x} word {:#x}", tag, self.read_word);
+                crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: buffer word: reg {:#x} word {:#x}", tag, self.read_word);
             }
             ODSY_REG_READ_ORIGIN => {
                 self.read_origin[0] = sextract32(self.cmd_operand[0], 0, 16);
@@ -874,7 +874,7 @@ impl Board {
             ODSY_REG_DRAW_MASK => {
                 // The drawing mask: which colour buffers the next writes reach.
                 self.draw_mask = self.cmd_operand[0];
-                crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_draw_mask: mask {:#x}", self.draw_mask);
+                crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: draw mask: mask {:#x}", self.draw_mask);
                 if (self.draw_mask & !ODSY_DRAW_MASK_BITS) != 0 && !self.draw_mask_high_reported {
                     self.draw_mask_high_reported = true;
                     crate::dlog!(

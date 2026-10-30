@@ -7,7 +7,7 @@ use super::*;
 
 impl Board {
     pub fn write_dispatch(&mut self, addr: u64, value: u64, size: u32) {
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_mmio: seq {} offset {:#x} size {} value {:#x} write=1", self.trace_sequence, addr, size, value);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO write seq {} offset {:#x} size {} value {:#x}", self.trace_sequence, addr, size, value);
         self.trace_sequence = self.trace_sequence.wrapping_add(1);
 
         if addr == ODSY_BACKEND_SELECT && (size == 8 || size == 4) {

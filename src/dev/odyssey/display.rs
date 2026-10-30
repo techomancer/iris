@@ -285,7 +285,7 @@ impl Board {
         if flips != 0 {
             f.swap_arm = 0;
             f.displayed_buffer ^= flips;
-            crate::dlog!(LogModule::Odyssey, "sgi_odyssey_swap_latch: arm {:#x} displayed {:#x}", flips, f.displayed_buffer);
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: swap latch: arm {:#x} displayed {:#x}", flips, f.displayed_buffer);
             repaint = true;
         }
         crate::pf_instant!(crate::perfetto::events::ODSY_RETRACE, f.displayed_buffer);
@@ -338,7 +338,7 @@ impl Board {
                 self.scanout.frame[line * w..(line + 1) * w].copy_from_slice(&row);
             }
             self.scanout.dirty[y..end].fill(false);
-            crate::dlog_dev!(LogModule::Odyssey, "sgi_scanout_update: lines {}-{}", y, end - 1);
+            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout update: lines {}-{}", y, end - 1);
             span = Some(span.map_or((y, end), |(a, b)| (a.min(y), b.max(end))));
             y = end;
         }

@@ -821,7 +821,7 @@ impl Board {
                 }
             }
             if self.dma_read_write(bus, &e[..n], rowbytes, h, skip, &mut payload) {
-                crate::dlog!(LogModule::Odyssey, "sgi_odyssey_dma_read: seq {} source {:#x} at {},{} {}x{} wrote {} bytes", seq, hdr[ODSY_DMA_HDR_DEST], src.x, src.y, w, h, total);
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read: seq {} source {:#x} at {},{} {}x{} wrote {} bytes", seq, hdr[ODSY_DMA_HDR_DEST], src.x, src.y, w, h, total);
             }
             return;
         }
@@ -832,7 +832,7 @@ impl Board {
         if !self.dma_read_write(bus, &e[..n], rowbytes, h, skip, &mut payload) {
             return;
         }
-        crate::dlog!(LogModule::Odyssey, "sgi_odyssey_dma_read: seq {} source {:#x} at {},{} {}x{} wrote {} bytes", seq, hdr[ODSY_DMA_HDR_DEST], src.x, src.y, w, h, total);
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: DMA read: seq {} source {:#x} at {},{} {}x{} wrote {} bytes", seq, hdr[ODSY_DMA_HDR_DEST], src.x, src.y, w, h, total);
     }
 
     /// A 0xe01/0xe03 descriptor: read the table's header, move the pixels, and
@@ -1233,7 +1233,7 @@ impl Board {
             self.board_oob_reported = true;
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: destination base {:#x} is beyond the {} MiB this board reports", base, self.memory_size);
         }
-        crate::dlog!(LogModule::Odyssey, "sgi_odyssey_board_oob: destination base {:#x} exceeds the {} MiB this board reports", base, self.memory_size);
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: board memory out of bounds: destination base {:#x} exceeds the {} MiB this board reports", base, self.memory_size);
         false
     }
 

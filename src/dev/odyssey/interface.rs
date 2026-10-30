@@ -253,12 +253,12 @@ impl HostInterface {
             }
             _ => unreachable!("odyssey_front_register() admits only these"),
         }
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_mmio: front seq {} offset {:#x} size {} value {:#x} write=0", sequence, addr, size, value);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: front MMIO read seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
         value
     }
 
     pub fn write(&mut self, addr: u64, value: u64, size: u32) {
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_mmio: front seq {} offset {:#x} size {} value {:#x} write=1", self.trace_sequence, addr, size, value);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: front MMIO write seq {} offset {:#x} size {} value {:#x}", self.trace_sequence, addr, size, value);
         self.trace_sequence = self.trace_sequence.wrapping_add(1);
 
         match reg(addr, size) as u64 {

@@ -1610,7 +1610,7 @@ impl Board {
             let chain = texture.insert(Box::default());
 
             if !self.texture_setup(&mut image, chain) {
-                crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_gl_draw_path: backend scalar-skip result {} called=0", SGI_GL_DRAW_OK);
+                crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: GL draw path: backend scalar-skip result {} called=0", SGI_GL_DRAW_OK);
                 return SGI_GL_DRAW_OK;
             }
         }
@@ -1642,7 +1642,7 @@ impl Board {
         };
         let result = rules.draw(&t, &mut pixels, texels, &mut draw);
         d.line_phase = draw.line_phase;
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_gl_draw_path: backend scalar result {} called=1", result);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: GL draw path: backend scalar result {} called=1", result);
         self.scanout.invalidate_all();
         result
     }

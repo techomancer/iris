@@ -139,7 +139,7 @@ impl BoardMemory {
         let p = &mut self.planes[id as usize];
         *p = *plane;
         p.id = id;
-        crate::dlog!(LogModule::Odyssey, "sgi_plane_add: plane {} base {:#x} len {:#x} {}x{} stride {} format {}", p.id, p.base, p.len, p.width, p.height, p.stride, p.format as i32);
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: plane added: plane {} base {:#x} len {:#x} {}x{} stride {} format {}", p.id, p.base, p.len, p.width, p.height, p.stride, p.format as i32);
         Ok(p.id)
     }
     /// The plane with this id, if there is one.

@@ -57,7 +57,7 @@ impl Scanout {
     pub fn set_mode(&mut self, mode: &ScanoutMode) {
         self.mode = *mode;
         self.mode.sanitize();
-        crate::dlog!(LogModule::Odyssey, "sgi_scanout_mode: {}x{} frame {} clocks at {} Hz", self.mode.width, self.mode.height, self.mode.frame_clocks, self.mode.clock_hz);
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: scanout mode: {}x{} frame {} clocks at {} Hz", self.mode.width, self.mode.height, self.mode.frame_clocks, self.mode.clock_hz);
         self.alloc();
         self.invalidate_all();
         self.restart();
@@ -92,7 +92,7 @@ impl Scanout {
             return false;
         }
         self.frames += 1;
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_scanout_retrace: frame {}", self.frames);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout retrace: frame {}", self.frames);
         self.arm();
         true
     }

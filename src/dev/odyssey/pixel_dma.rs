@@ -177,7 +177,7 @@ impl DmaBus {
                 );
                 return Err(DmaError::Bounds);
             }
-            crate::dlog_dev!(LogModule::Odyssey, "sgi_dma_chunk: addr {:#x} len {}", addr, n);
+            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: DMA chunk mapped: addr {:#x} len {}", addr, n);
             let mut c = DmaChunk {
                 host: vec![0u8; n as usize],
                 len: n as u32,
@@ -200,7 +200,7 @@ impl DmaBus {
             pos += c.len as u64;
             map.chunks.push(c);
         }
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_dma_map: seq {} dir {:?} offset {:#x} len {:#x} chunks {}", trace_seq, dir, offset, len, map.chunks.len() - first);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: DMA map: seq {} dir {:?} offset {:#x} len {:#x} chunks {}", trace_seq, dir, offset, len, map.chunks.len() - first);
         Ok(())
     }
 }
@@ -255,7 +255,7 @@ impl DmaBus {
         if trace {
             crate::dlog_dev!(
                 LogModule::Odyssey,
-                "sgi_odyssey_dma_chunk: seq {} addr {:#x} len {} hex {}",
+                "sgi-odyssey: DMA chunk read: seq {} addr {:#x} len {} hex {}",
                 self.trace_sequence,
                 addr,
                 bytes.len(),

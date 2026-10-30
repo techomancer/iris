@@ -451,13 +451,13 @@ impl Board {
             }
             _ => {
                 if self.cursor_read(addr, size, &mut value) || self.backend_ctl_read(addr, size, &mut value) {
-                    crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_mmio: seq {} offset {:#x} size {} value {:#x} write=0", sequence, addr, size, value);
+                    crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO read seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
                     return value;
                 }
                 self.unimplemented(addr, size, false);
             }
         }
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_mmio: seq {} offset {:#x} size {} value {:#x} write=0", sequence, addr, size, value);
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: MMIO read seq {} offset {:#x} size {} value {:#x}", sequence, addr, size, value);
         value
     }
 

@@ -163,7 +163,7 @@ impl Board {
             }
         }
         if fifo.pending() {
-            crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_work_behind: {} stores wait", fifo.level());
+            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.level());
         }
     }
 
@@ -179,7 +179,7 @@ impl Board {
         let start = std::time::Instant::now();
         crate::pf_scope!(crate::perfetto::events::ODSY_DRAIN, waiting);
         self.work_step(&mut Budget::words(waiting));
-        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_work: drained offset {:#x} in {:?}", addr, start.elapsed());
+        crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker: drained offset {:#x} in {:?}", addr, start.elapsed());
     }
 
     /// Reset clears the FIFO and abandons the waiting stores. The caller holds
