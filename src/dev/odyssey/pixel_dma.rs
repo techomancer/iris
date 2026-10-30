@@ -132,6 +132,7 @@ impl DmaBus {
 
     /// Resolve [offset, offset + len) of a page-listed buffer and append its
     /// chunks to map. Returns 0, or an Failure after logging a guest error.
+    #[allow(clippy::too_many_arguments, reason = "the range, its direction and its trace label")]
     pub fn map(&self, map: &mut DmaMap, pl: &DmaPageList, offset: u64, len: u64, dir: DmaDirection, trace: bool, trace_seq: u64) -> i32 {
         let total = pl.bytes();
         let mut pos = offset;

@@ -143,7 +143,7 @@ impl Board {
 }
 
 pub fn prog_in_window(a: u32) -> bool {
-    a >= ODSY_PROG_WINDOW_BASE && a < ODSY_PROG_WINDOW_BASE + ODSY_PROG_WINDOW_ENTRIES
+    (ODSY_PROG_WINDOW_BASE..ODSY_PROG_WINDOW_BASE + ODSY_PROG_WINDOW_ENTRIES).contains(&a)
 }
 
 /// The GL library's precompiled lit programs whose three entries are all
@@ -233,8 +233,8 @@ impl Board {
         let h = &self.gl_program_mem[base..];
         let mut crc: u64 = 0;
 
-        for i in 0..(n * ODSY_PROG_ENTRY_HALFWORDS) as usize {
-            crc ^= (h[i] as u64) << 48;
+        for &half in &h[..(n * ODSY_PROG_ENTRY_HALFWORDS) as usize] {
+            crc ^= (half as u64) << 48;
             for _bit in 0..16 {
                 crc = if crc & (1u64 << 63) != 0 { (crc << 1) ^ ODSY_CRC64_ECMA_POLY } else { crc << 1 };
             }
@@ -244,23 +244,18 @@ impl Board {
 
     /// The lit window record the entries and window body identify, or None.
     pub fn gl_window_record(&self, e: &[u32; 3]) -> Option<&'static WindowRecord> {
-        for w in WINDOW_RECORDS.iter() {
-            if e[0] == w.entry[0] as u32 && e[1] == w.entry[1] as u32 && e[2] == w.entry[2] as u32 && self.window_crc(w.entries as u32) == w.crc {
-                return Some(w);
-            }
-        }
-        None
+        WINDOW_RECORDS.iter().find(|w| {
+            e[0] == w.entry[0] as u32
+                && e[1] == w.entry[1] as u32
+                && e[2] == w.entry[2] as u32
+                && self.window_crc(w.entries as u32) == w.crc
+        })
     }
 }
 
 /// Uploaded program bodies have no reviewed decoder.
 pub fn gl_resident(e: &[u32; 3]) -> bool {
-    for i in 0..3 {
-        if prog_in_window(e[i]) {
-            return false;
-        }
-    }
-    true
+    !e.iter().any(|&w| prog_in_window(w))
 }
 
 impl Board {
@@ -295,10 +290,9 @@ impl Board {
             // Any other uploaded program is unsupported and reported below.
         } else if r[0] == 0 && r[1] == 0 && r[2] == 0 {
             p.known = true;
-        } else if r[0] == ODSY_UCODE_UNLIT && r[1] == ODSY_UCODE_UNLIT_2A && r[2] == ODSY_UCODE_UNLIT_2C {
-            self.gl_walk_list(k, false, &mut p);
-            p.known = true;
-        } else if r[0] == ODSY_UCODE_UNLIT_CLIP && r[1] == ODSY_UCODE_UNLIT_CLIP_2A && r[2] == ODSY_UCODE_UNLIT_CLIP_2C {
+        } else if r == [ODSY_UCODE_UNLIT, ODSY_UCODE_UNLIT_2A, ODSY_UCODE_UNLIT_2C]
+            || r == [ODSY_UCODE_UNLIT_CLIP, ODSY_UCODE_UNLIT_CLIP_2A, ODSY_UCODE_UNLIT_CLIP_2C]
+        {
             self.gl_walk_list(k, false, &mut p);
             p.known = true;
         } else if gl_lit_record(&r) {
@@ -400,7 +394,7 @@ impl Board {
         let v = prog_value(word);
         let cls = word >> ODSY_PROG_CLASS_SHIFT;
 
-        if cls >= ODSY_PROG_SEQ_FIRST && cls <= ODSY_PROG_SEQ_LAST {
+        if (ODSY_PROG_SEQ_FIRST..=ODSY_PROG_SEQ_LAST).contains(&cls) {
             self.gl_seq[(cls - ODSY_PROG_SEQ_FIRST) as usize] = v;
         }
         match cls {

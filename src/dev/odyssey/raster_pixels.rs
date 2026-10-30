@@ -64,10 +64,6 @@ impl SoftDraw<'_> {
     }
 }
 
-pub fn r2_clamp(val: f64, low: f64, high: f64) -> f64 {
-    if val > high { high } else if val < low { low } else { val }
-}
-
 impl ClipList {
     /// Whether one rectangle of a non-empty clip list holds all of row y from
     /// x0 to x1, so that each pixel's own test would pass.

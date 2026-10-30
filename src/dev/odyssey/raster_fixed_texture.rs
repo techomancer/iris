@@ -126,11 +126,6 @@ pub fn soft_fixed_lanes(rgba: u32) -> u64 {
     (t & 0x0000ff000000ff00) << 8 | (t & 0x000000ff000000ff)
 }
 
-/// An 8-bit image component from one of a component reader's width.
-pub fn soft_fixed_component(value: u32, bits: u8) -> u32 {
-    value.wrapping_mul(255 / ((1u32 << bits) - 1))
-}
-
 /// A packed RRGGBBAA texel with the components the base format lacks
 /// filled in, as soft_texture_components() fills them.
 pub fn soft_fixed_expand(format: u32, rgba: u32) -> u32 {
@@ -146,17 +141,6 @@ pub fn soft_fixed_expand(format: u32, rgba: u32) -> u32 {
     }
 }
 
-pub fn soft_fixed_widths(format: u32, bits: &[u8; 4]) -> bool {
-    let mask = soft_texture_component_mask(format);
-
-    for k in 0..4 {
-        if (mask & (1u8 << k)) != 0 && bits[k] != 1 && bits[k] != 2 && bits[k] != 4 && bits[k] != 8 {
-            return false;
-        }
-    }
-    true
-}
-
 pub fn soft_fixed_unit(c: f64) -> u32 {
     (fx_min(fx_max(c, 0.0), 1.0) * 255.0 + 0.5) as u32
 }
@@ -167,8 +151,6 @@ impl SoftDraw<'_> {
     /// has already made are not repeated.
     pub fn fixed_setup(&self, f: &mut SoftFixedTex) -> bool {
         let base = self.texture_base;
-        let mipmap: bool;
-        let edge_only: bool;
         let mut border = [0.0f64; 4];
 
         if SOFT_TEXTURE_PATH.load(std::sync::atomic::Ordering::Relaxed) == SGI_RASTER_TEXTURE_DOUBLE
@@ -196,14 +178,14 @@ impl SoftDraw<'_> {
         f.wrap_t = im.wrap_t;
         f.upper_s = if im.max_clamp { im.max_clamp_s } else { 1.0 };
         f.upper_t = if im.max_clamp { im.max_clamp_t } else { 1.0 };
-        mipmap = soft_texture_mipmap(f.min);
+        let mipmap: bool = soft_texture_mipmap(f.min);
         if f.format == SGI_GL_DEPTH_COMPONENT
             || (f.mag != SGI_GL_NEAREST && f.mag != SGI_GL_LINEAR)
             || (f.min != SGI_GL_NEAREST && f.min != SGI_GL_LINEAR && !mipmap)
         {
             return false;
         }
-        edge_only = (f.wrap_s == SGI_GL_REPEAT || f.wrap_s == SGI_GL_CLAMP_TO_EDGE)
+        let edge_only: bool = (f.wrap_s == SGI_GL_REPEAT || f.wrap_s == SGI_GL_CLAMP_TO_EDGE)
             && (f.wrap_t == SGI_GL_REPEAT || f.wrap_t == SGI_GL_CLAMP_TO_EDGE);
         f.range = if base.is_some() { self.texture_last.wrapping_sub(p.unwrap().base_level) } else { 0 };
         if f.range as usize >= SGI_SOFT_FIXED_LEVELS {
@@ -580,8 +562,8 @@ pub fn soft_fixed_log2_init() -> &'static [i16; 1024] {
     SOFT_FIXED_LOG2.get_or_init(|| {
         let mut t = [0i16; 1024];
 
-        for i in 0..t.len() {
-            t[i] = (128.0 * (1.0 + (i as f64 + 0.5) / 1024.0).log2()).round() as i16;
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = (128.0 * (1.0 + (i as f64 + 0.5) / 1024.0).log2()).round() as i16;
         }
         t
     })
@@ -628,38 +610,36 @@ impl SoftFixedTex {
     }
 
     /// A fragment's s, t and lambda from the triangle's planes g at pixel
-    /// column px, whose row terms are row; false where the fixed sampler
-    /// cannot take it. rho2_flat, where Q/W is the same across the triangle,
-    /// is its footprint squared there, the same at every fragment.
+    /// column px, whose row terms are row; None where the fixed sampler
+    /// cannot take it. flat_lambda, where Q/W is the same across the
+    /// triangle, is the lambda of every fragment.
     #[inline(always)]
-    pub fn fixed_coords(&self, g: &SoftTexPlane, row: &[f64; 4], px: i32, flat_lambda: Option<i32>, s: &mut f64, t: &mut f64, lambda: &mut i32) -> bool {
+    pub fn fixed_coords(&self, g: &SoftTexPlane, row: &[f64; 4], px: i32, flat_lambda: Option<i32>) -> Option<(f64, f64, i32)> {
         let x = px as f64 + 0.5 - g.x;
         let q = g.value[2] + x * g.dx[2] + row[2];
 
         if !(q > 0.0) {
-            return false;
+            return None;
         }
         let iq = 1.0 / q;
-        *s = (g.value[0] + x * g.dx[0] + row[0]) * iq;
-        *t = (g.value[1] + x * g.dx[1] + row[1]) * iq;
+        let s = (g.value[0] + x * g.dx[0] + row[0]) * iq;
+        let t = (g.value[1] + x * g.dx[1] + row[1]) * iq;
         if !(s.abs() < 1073741824.0 && t.abs() < 1073741824.0) {
-            return false;
+            return None;
         }
         if !self.lod || flat_lambda.is_some() {
-            *lambda = flat_lambda.unwrap_or(0);
-            return true;
+            return Some((s, t, flat_lambda.unwrap_or(0)));
         }
         // d(S/Q)/dx is (dS/dx - s dQ/dx) / Q, and so on.
-        let a = self.ns * (g.dx[0] - *s * g.dx[2]) * iq;
-        let b = self.nt * (g.dx[1] - *t * g.dx[2]) * iq;
-        let c = self.ns * (g.dy[0] - *s * g.dy[2]) * iq;
-        let e = self.nt * (g.dy[1] - *t * g.dy[2]) * iq;
+        let a = self.ns * (g.dx[0] - s * g.dx[2]) * iq;
+        let b = self.nt * (g.dx[1] - t * g.dx[2]) * iq;
+        let c = self.ns * (g.dy[0] - s * g.dy[2]) * iq;
+        let e = self.nt * (g.dy[1] - t * g.dy[2]) * iq;
         let rho2 = fx_max(a * a + b * b, c * c + e * e);
         if !(rho2 <= f64::MAX) {
-            return false;
+            return None;
         }
-        *lambda = self.fixed_decide(rho2, soft_fixed_lambda(rho2));
-        true
+        Some((s, t, self.fixed_decide(rho2, soft_fixed_lambda(rho2))))
     }
 }
 
@@ -805,8 +785,8 @@ impl SoftDraw<'_> {
         const FORMAT_KNOWN: u32,
         const KNOWN: bool,
     >(&self, sp: &SoftTexSpan, py: i32, mut px0: i32, mut px1: i32, mut e1: i64, mut e2: i64) -> i32 {
-        let rules: &RasterRules = &self.rules;
-        let st: &GlDrawState = &self.st;
+        let rules: &RasterRules = self.rules;
+        let st: &GlDrawState = self.st;
         let t: &RasterTarget = self.t;
         let v: &[SoftVertex; 3] = sp.v;
         let y = self.win.oy.wrapping_add(py);
@@ -876,9 +856,6 @@ impl SoftDraw<'_> {
             let sum = w0 + w1 + w2;
             let (mut off, steps) = rules.split_offset(sp.offset);
             let mut zw = 0.0f64;
-            let mut s = 0.0f64;
-            let mut tc = 0.0f64;
-            let mut lambda = 0i32;
             let mut zq = 0u32;
 
             if rules.depth_row_given {
@@ -893,7 +870,7 @@ impl SoftDraw<'_> {
                     z = 1.0;
                 }
             }
-            if !st.window_depth(z, off, &mut zw) || !(zw >= 0.0 && zw <= 1.0) {
+            if !st.window_depth(z, off, &mut zw) || !(0.0..=1.0).contains(&zw) {
                 continue;
             }
             if clipped && !self.owned_at(px, py) {
@@ -905,9 +882,10 @@ impl SoftDraw<'_> {
                     continue;
                 }
             }
-            if !self.fixed_tex().fixed_coords(sp.g, &sp.row, px, sp.flat_lambda, &mut s, &mut tc, &mut lambda)
-                || !SoftDraw::fixed_sample::<KERNEL, REPEAT>(self, s, tc, lambda, &mut frag.texel)
-            {
+            let Some((s, tc, lambda)) = self.fixed_tex().fixed_coords(sp.g, &sp.row, px, sp.flat_lambda) else {
+                return px;
+            };
+            if !SoftDraw::fixed_sample::<KERNEL, REPEAT>(self, s, tc, lambda, &mut frag.texel) {
                 return px;
             }
             if sp.smooth && keeps {

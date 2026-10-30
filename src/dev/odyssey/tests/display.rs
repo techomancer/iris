@@ -71,6 +71,7 @@ fn index_box(s: &mut Board, index: u32, x0: i32, y0: i32, x1: i32, y1: i32) {
 }
 
 /// One solid RGB QUADS fill of the half-open box [x0, x1) x [y0, y1).
+#[allow(clippy::too_many_arguments, reason = "a colour and a box")]
 fn rgb_fill(s: &mut Board, r: u32, g: u32, b: u32, x0: u32, y0: u32, x1: u32, y1: u32) {
     cmd(s, select(ODSY_REG_GL_BEGIN));
     cmd(s, ODSY_GL_QUADS);

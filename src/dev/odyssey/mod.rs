@@ -43,7 +43,9 @@
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code
 //! (hw/display/sgi/) in jamesbraid/qemu-sgi-origami.
 
-//ALLOWREMOVED
+// The rasteriser writes its range tests as !(x > 0.0) and the like so that
+// a NaN fails them.
+#![allow(clippy::neg_cmp_op_on_partial_ord, reason = "a NaN must fail these tests")]
 
 use crate::devlog::LogModule;
 
@@ -172,7 +174,7 @@ impl Odyssey {
     /// The aperture offset of `addr`, in either window.
     fn offset(&self, addr: u64) -> Option<u64> {
         let off = if addr >= self.large { addr - self.large } else { addr.wrapping_sub(self.small) };
-        (off < ODSY_APERTURE as u64).then_some(off)
+        (off < ODSY_APERTURE).then_some(off)
     }
 
     fn read(&self, addr: u64, size: u32) -> (u32, u64) {

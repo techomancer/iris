@@ -47,8 +47,8 @@ impl Board {
     pub fn shadow_descriptor(&mut self, base: u64, off: u32, record: &[[u32; 5]; 19], slot: u32) {
         let mut word = [0u32; 2];
 
-        for a in 1..19usize {
-            if record[a][0] == 0 {
+        for (a, rec) in record.iter().enumerate().skip(1) {
+            if rec[0] == 0 {
                 continue;
             }
             if a <= 16 {

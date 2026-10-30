@@ -22,8 +22,7 @@ impl Board {
             self.gl_program_word(tag);
             return;
         }
-        if tag >= ODSY_REG_TEX_DETAIL_FUNCTION
-            && tag < ODSY_REG_TEX_DETAIL_FUNCTION + ODSY_TEX_DETAIL_FUNCTION_BLOCKS
+        if (ODSY_REG_TEX_DETAIL_FUNCTION..ODSY_REG_TEX_DETAIL_FUNCTION + ODSY_TEX_DETAIL_FUNCTION_BLOCKS).contains(&tag)
         {
             let block = tag - ODSY_REG_TEX_DETAIL_FUNCTION;
 
@@ -38,14 +37,12 @@ impl Board {
             self.tex_detail_function_valid |= 1u32 << block;
             return;
         }
-        if tag >= ODSY_REG_TEX_TABLE3 && tag < ODSY_REG_TEX_TABLE3 + ODSY_TEX_TABLE3_BLOCKS {
+        if (ODSY_REG_TEX_TABLE3..ODSY_REG_TEX_TABLE3 + ODSY_TEX_TABLE3_BLOCKS).contains(&tag) {
             self.cmd_unimplemented(tag);
             return;
         }
-        if (tag >= ODSY_REG_TEX_COLOUR_TABLE0
-            && tag < ODSY_REG_TEX_COLOUR_TABLE0 + ODSY_TEX_COLOUR_TABLE_BLOCKS)
-            || (tag >= ODSY_REG_TEX_COLOUR_TABLE1
-                && tag < ODSY_REG_TEX_COLOUR_TABLE1 + ODSY_TEX_COLOUR_TABLE_BLOCKS)
+        if (ODSY_REG_TEX_COLOUR_TABLE0..ODSY_REG_TEX_COLOUR_TABLE0 + ODSY_TEX_COLOUR_TABLE_BLOCKS).contains(&tag)
+            || (ODSY_REG_TEX_COLOUR_TABLE1..ODSY_REG_TEX_COLOUR_TABLE1 + ODSY_TEX_COLOUR_TABLE_BLOCKS).contains(&tag)
         {
             let plane = (tag >= ODSY_REG_TEX_COLOUR_TABLE1) as usize;
             let first_tag = if plane != 0 { ODSY_REG_TEX_COLOUR_TABLE1 } else { ODSY_REG_TEX_COLOUR_TABLE0 };
@@ -61,7 +58,7 @@ impl Board {
             self.tex_colour_table_valid[plane] |= 1u32 << block;
             return;
         }
-        if tag >= ODSY_REG_TEX_LEVEL && tag < ODSY_REG_TEX_LEVEL + SGI_ODYSSEY_TEX_LEVELS {
+        if (ODSY_REG_TEX_LEVEL..ODSY_REG_TEX_LEVEL + SGI_ODYSSEY_TEX_LEVELS).contains(&tag) {
             let at = (tag - ODSY_REG_TEX_LEVEL) as usize * 3;
             self.tex_levels[at..at + 3].copy_from_slice(&self.cmd_operand[..3]);
             return;
@@ -314,7 +311,7 @@ impl Board {
                 // that budget (expected library traffic, not an error), and report
                 // only a selector this model cannot place at all.
                 if self.gl_light_vec_sel >= ODSY_GL_CLIP_PLANE_BASE
-                    && (self.gl_light_vec_sel - ODSY_GL_CLIP_PLANE_BASE) % ODSY_GL_CLIP_PLANE_STRIDE == 0
+                    && (self.gl_light_vec_sel - ODSY_GL_CLIP_PLANE_BASE).is_multiple_of(ODSY_GL_CLIP_PLANE_STRIDE)
                 {
                     let plane = (self.gl_light_vec_sel - ODSY_GL_CLIP_PLANE_BASE) / ODSY_GL_CLIP_PLANE_STRIDE;
 
@@ -356,7 +353,7 @@ impl Board {
                 }
                 // Index 16 i is light i. Other context setup blocks at 0x80
                 // to 0x1e0 remain unknown and are reported once, not per index.
-                if self.gl_light_vec_sel % ODSY_GL_LIGHT_VEC_FLOATS == 0
+                if self.gl_light_vec_sel.is_multiple_of(ODSY_GL_LIGHT_VEC_FLOATS)
                     && self.gl_light_vec_sel / ODSY_GL_LIGHT_VEC_FLOATS < SGI_ODYSSEY_GL_LIGHTS
                 {
                     let at = self.gl_light_vec_sel as usize;
@@ -407,8 +404,8 @@ impl Board {
                 obj[2] = if components > 2 { odyssey_f32(xyz[2]) } else { 0.0 };
                 if components == 4 && odyssey_f32(xyz[3]) != 0.0 {
                     // (x, y, z, w) and (x/w, y/w, z/w, 1) are the same point.
-                    for k in 0..3 {
-                        obj[k] /= odyssey_f32(xyz[3]);
+                    for c in &mut obj[..3] {
+                        *c /= odyssey_f32(xyz[3]);
                     }
                 }
                 self.gl_vertex_colour(&obj);
@@ -994,7 +991,7 @@ impl Board {
             self.cmd_start(word, 1);
             return;
         }
-        if (word >= ODSY_REG_FIFO_SETUP_FIRST && word <= ODSY_REG_FIFO_SETUP_LAST)
+        if (ODSY_REG_FIFO_SETUP_FIRST..=ODSY_REG_FIFO_SETUP_LAST).contains(&word)
             || word == ODSY_REG_FIFO_SETUP_7B5
         {
             self.cmd_start(word, 1);
@@ -1025,7 +1022,7 @@ impl Board {
             self.cmd_start(word, 1);
             return;
         }
-        if word >= ODSY_REG_DRAWABLE_FIRST && word <= ODSY_REG_DRAWABLE_LAST {
+        if (ODSY_REG_DRAWABLE_FIRST..=ODSY_REG_DRAWABLE_LAST).contains(&word) {
             // 0x60a, 0x60c to 0x60f; the three known ones are matched above.
             self.cmd_start(word, 1);
             return;
@@ -1099,11 +1096,9 @@ impl Board {
         // in bits 13:10 like every other word. The program words carry none and
         // are matched by class ahead of the image path's 0x29 state word, which
         // is the same class (is_program_word()).
-        for i in 0..GL_LIGHT_WORDS.len() {
-            if word == GL_LIGHT_WORDS[i] {
-                self.cmd_start(word, cmd_arity(word));
-                return;
-            }
+        if GL_LIGHT_WORDS.contains(&word) {
+            self.cmd_start(word, cmd_arity(word));
+            return;
         }
         if is_program_word(word) {
             self.cmd_start(word, 0);

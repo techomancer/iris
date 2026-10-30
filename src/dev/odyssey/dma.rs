@@ -173,7 +173,7 @@ pub fn raw_nibble(byte: u32) -> u32 {
 /// A stored texel as a backing-store page's bpp raw bytes.
 pub fn raw_pack(rgba: u32, bpp: u32, dst: &mut [u8]) {
     if bpp == 4 {
-        dst[..4].copy_from_slice(&(rgba as u32).to_be_bytes());
+        dst[..4].copy_from_slice(&rgba.to_be_bytes());
         return;
     }
     let word = raw_nibble(rgba >> 24) << 12
@@ -189,10 +189,10 @@ pub fn raw_unpack(src: &[u8], bpp: u32) -> u32 {
         return u32::from_be_bytes(src[..4].try_into().unwrap());
     }
     let v = u16::from_be_bytes(src[..2].try_into().unwrap()) as u32;
-    ((v >> 12) & 0xf) * 0x11u32 << 24
-        | ((v >> 8) & 0xf) * 0x11u32 << 16
-        | ((v >> 4) & 0xf) * 0x11u32 << 8
-        | (v & 0xf) * 0x11u32
+    (((v >> 12) & 0xf) * 0x11u32) << 24
+        | (((v >> 8) & 0xf) * 0x11u32) << 16
+        | (((v >> 4) & 0xf) * 0x11u32) << 8
+        | ((v & 0xf) * 0x11u32)
 }
 
 impl Board {
@@ -245,9 +245,7 @@ impl Board {
             return;
         }
         let n = n as usize;
-        for k in 0..n {
-            payload += e[k].len as u64;
-        }
+        payload += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
         if rowbytes as u64 != (w as u64) * (bpp as u64) || payload != (rowbytes as u64) * (h as u64) {
             crate::dlog!(
                 LogModule::Odyssey,
@@ -388,9 +386,7 @@ impl Board {
             return;
         }
         let n = n as usize;
-        for j in 0..n {
-            payload_len += e[j].len as u64;
-        }
+        payload_len += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
         if w == 0
             || h == 0
             || rowbytes as u64 != (w as u64) * (psize as u64)
@@ -673,8 +669,8 @@ impl Board {
                         x, y, group, word
                     );
                 }
-                for b in 0..l.bytes as usize {
-                    let from = l.from[b] as u32;
+                for &from in &l.from[..l.bytes as usize] {
+                    let from = from as u32;
 
                     out[o] = if from == ODSY_DMA_BYTE_INDEX {
                         word as u8
@@ -789,9 +785,7 @@ impl Board {
             return;
         }
         let n = n as usize;
-        for k in 0..n {
-            total += e[k].len as u64;
-        }
+        total += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
         if rowbytes as u64 != (w as u64) * (bpp as u64) || total != (rowbytes as u64) * (h as u64) {
             if self.dma_report(ODSY_DMA_REPORT_SHAPE) {
                 crate::dlog!(
@@ -980,15 +974,11 @@ impl Board {
             }
             ODSY_GL_COLOR_3UB | ODSY_MODE_INDEX_ZEROS => {
                 record = ODSY_QUERY_COLOUR;
-                for i in 0..3 {
-                    supported &= self.cmd_operand[i] <= 0xff;
-                }
+                supported &= self.cmd_operand[..3].iter().all(|&c| c <= 0xff);
             }
             ODSY_GL_COLOR_4UB => {
                 record = ODSY_QUERY_COLOUR;
-                for i in 0..4 {
-                    supported &= self.cmd_operand[i] <= 0xff;
-                }
+                supported &= self.cmd_operand[..4].iter().all(|&c| c <= 0xff);
             }
             ODSY_GL_COLOR_3I
             | ODSY_GL_INDEX_MODE_COLOR_3I
@@ -1129,8 +1119,8 @@ impl Board {
             let rec = self.query_captured[if i != 0 { ODSY_QUERY_COLOUR } else { ODSY_QUERY_INDEX } as usize];
             let at = self.query_base + (if i != 0 { ODSY_QUERY_RASTER_COLOUR } else { ODSY_QUERY_RASTER_INDEX }) as u64;
 
-            for j in 0..(1 + cmd_arity(rec[0]) as usize) {
-                if bus.publish_be32(at + 4 * j as u64, rec[j]) != 0 {
+            for (j, &word) in rec.iter().enumerate().take(1 + cmd_arity(rec[0]) as usize) {
+                if bus.publish_be32(at + 4 * j as u64, word) != 0 {
                     crate::dlog!(LogModule::Odyssey, "sgi-odyssey: raster query payload failed");
                     return;
                 }
@@ -1203,17 +1193,16 @@ pub fn signed_to_float(word: u32, format: u32) -> u32 {
 /// converts by OpenGL's rule; the library sends the raw components.
 pub fn integer_colour(tag: u32, word: u32) -> u32 {
     let mut code = tag & ODSY_GL_COLOR_TYPE_MASK;
-    let c: f64;
 
     code = code.wrapping_sub(if code >= ODSY_GL_COLOR_TYPE_4 { ODSY_GL_COLOR_TYPE_4 } else { ODSY_GL_COLOR_TYPE_3 });
-    match code {
-        0 => c = (word as u8) as f64 / 255.0,
-        1 => c = (word as u16) as f64 / 65535.0,
-        2 => c = word as f64 / 4294967295.0,
-        3 => c = (2.0 * ((word as u8 as i8) as f64) + 1.0) / 255.0,
-        4 => c = (2.0 * ((word as u16 as i16) as f64) + 1.0) / 65535.0,
+    let c: f64 = match code {
+        0 => (word as u8) as f64 / 255.0,
+        1 => (word as u16) as f64 / 65535.0,
+        2 => word as f64 / 4294967295.0,
+        3 => (2.0 * ((word as u8 as i8) as f64) + 1.0) / 255.0,
+        4 => (2.0 * ((word as u16 as i16) as f64) + 1.0) / 65535.0,
         _ => return signed_to_float(word, ODSY_GL_COLOR_3I & ODSY_GL_COLOR_TYPE_MASK),
-    }
+    };
     f32_bits(c as f32)
 }
 
@@ -1264,21 +1253,20 @@ impl Board {
         let entry = [self.tex_levels[60 * 3], self.tex_levels[60 * 3 + 1], self.tex_levels[60 * 3 + 2]];
         let ws = self.tex_sampler[1];
         let hs = self.tex_sampler[2];
-        let format: u32;
 
-        match self.tex_sampler[4] {
-            0x13640000 => format = 0x41100000,
-            0x12e40000 => format = 0x00c00000,
-            0x11e40000 => format = 0x00b00000,
+        let format: u32 = match self.tex_sampler[4] {
+            0x13640000 => 0x41100000,
+            0x12e40000 => 0x00c00000,
+            0x11e40000 => 0x00b00000,
             _ => return false,
-        }
+        };
         if ws == 0 || hs == 0 || ws > i32::MAX as u32 || hs > i32::MAX as u32 || !(ws as u64).is_power_of_two() || !(hs as u64).is_power_of_two() {
             return false;
         }
         let wd = (ws / 2).max(1);
         let hd = (hs / 2).max(1);
-        let source_units = ((ws + 15) / 16 + 1) & !1u32;
-        let dest_units = ((wd + 15) / 16 + 1) & !1u32;
+        let source_units = (ws.div_ceil(16) + 1) & !1u32;
+        let dest_units = (wd.div_ceil(16) + 1) & !1u32;
         if self.gl_primitive != ODSY_GL_QUADS
             || (self.tex_mode & ODSY_TEX_MODE_2D) == 0
             || self.tex_level0 != 60

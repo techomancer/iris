@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn the_host_encoder_truncates_to_18_mantissa_bits_and_decodes_back_within_a_step() {
-        for v in [1.0f32, 1.5, 3.0e-5, 0.7, 123456.789, 5.0e9] {
+        for v in [1.0f32, 1.5, 3.0e-5, 0.7, 123_456.79, 5.0e9] {
             let w = encode_host(v);
             let back = decode_host(w);
 

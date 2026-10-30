@@ -13,10 +13,8 @@ impl Board {
     pub fn unimplemented(&mut self, addr: u64, size: u32, write: bool) {
         let token = (addr as u32) | if write { ODSY_UNIMP_WRITE } else { 0 };
 
-        for i in 0..self.reported_addr_count as usize {
-            if self.reported_addr[i] == token {
-                return;
-            }
+        if self.reported_addr[..self.reported_addr_count as usize].contains(&token) {
+            return;
         }
         if self.reported_addr_count == SGI_ODYSSEY_UNIMP_REPORTS {
             return;
@@ -36,10 +34,8 @@ impl Board {
     /// Report an unmodeled command word once. note follows the message: the
     /// parser's framing decision for a word it does not know, or "".
     pub fn cmd_report(&mut self, word: u32, note: &str) {
-        for i in 0..self.reported_cmd_count as usize {
-            if self.reported_cmd[i] == word {
-                return;
-            }
+        if self.reported_cmd[..self.reported_cmd_count as usize].contains(&word) {
+            return;
         }
         if self.reported_cmd_count == SGI_ODYSSEY_UNIMP_REPORTS {
             return;
@@ -265,7 +261,7 @@ impl Board {
                     data,
                 );
             }
-        } else if index != ODSY_CURSOR_POSITION && (index < ODSY_CURSOR_COLOURS || index >= ODSY_CURSOR_COLOURS + ODSY_CURSOR_COLOUR_COUNT) {
+        } else if index != ODSY_CURSOR_POSITION && !(ODSY_CURSOR_COLOURS..ODSY_CURSOR_COLOURS + ODSY_CURSOR_COLOUR_COUNT).contains(&index) {
             self.cursor_report(ODSY_CURSOR_REPORT_ENTRY, "no known function; stored", index, data);
         }
     }
@@ -300,9 +296,7 @@ impl Board {
             let colour = cursor_rgb(self.cursor[ODSY_CURSOR_COLOURS as usize + 1]);
 
             if row == 0 {
-                for x in 0..width as usize {
-                    dst[x] = colour;
-                }
+                dst[..width as usize].fill(colour);
             } else if cx >= 0 && cx < width as i32 {
                 dst[cx as usize] = colour;
             }
@@ -514,7 +508,7 @@ impl Board {
     /// window (Board::backend_ctl_read()); one the kernel is not known to write
     /// is still reported.
     pub fn backend_data(&mut self, index: u32, data: u32) {
-        if index >= ODSY_BACKEND_CTL_BASE && index < ODSY_BACKEND_CTL_BASE + ODSY_BACKEND_CTL_ENTRIES {
+        if (ODSY_BACKEND_CTL_BASE..ODSY_BACKEND_CTL_BASE + ODSY_BACKEND_CTL_ENTRIES).contains(&index) {
             self.backend_ctl[(index - ODSY_BACKEND_CTL_BASE) as usize] = data;
         }
         // Scanout resolves through both, so either change repaints.
@@ -523,16 +517,16 @@ impl Board {
             self.scanout.invalidate_all();
             return;
         }
-        if index >= ODSY_DISPMODE_BASE && index < ODSY_DISPMODE_BASE + ODSY_DISPMODE_COUNT {
+        if (ODSY_DISPMODE_BASE..ODSY_DISPMODE_BASE + ODSY_DISPMODE_COUNT).contains(&index) {
             self.dispmode[(index - ODSY_DISPMODE_BASE) as usize] = data;
             self.scanout.invalidate_all();
             return;
         }
-        if index >= ODSY_CURSOR_BASE && index < ODSY_CURSOR_BASE + ODSY_CURSOR_ENTRIES {
+        if (ODSY_CURSOR_BASE..ODSY_CURSOR_BASE + ODSY_CURSOR_ENTRIES).contains(&index) {
             self.cursor_write(index - ODSY_CURSOR_BASE, data);
             return;
         }
-        if index >= ODSY_OVERLAY_MODE_BASE && index < ODSY_OVERLAY_MODE_BASE + ODSY_OVERLAY_IDS {
+        if (ODSY_OVERLAY_MODE_BASE..ODSY_OVERLAY_MODE_BASE + ODSY_OVERLAY_IDS).contains(&index) {
             self.overlay_mode[(index - ODSY_OVERLAY_MODE_BASE) as usize] = data;
             if (data & !ODSY_OVERLAY_MODE_KNOWN) != 0 && !self.overlay_mode_reported {
                 self.overlay_mode_reported = true;

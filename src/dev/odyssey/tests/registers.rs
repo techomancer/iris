@@ -96,7 +96,7 @@ fn the_widget_control_register_resets_to_the_slot_and_reads_back() {
     reg_write(&mut s, CONTROL, 0);
     assert_eq!(reg_read(&mut s, CONTROL), 0);
     // The error class the crosstalk error handler tests stays clear.
-    assert_eq!(reg_read(&mut s, ODSY_STATUS as u64) & 0x1c0, 0);
+    assert_eq!(reg_read(&mut s, ODSY_STATUS) & 0x1c0, 0);
     reg_write(&mut s, ODSY_ERROR_COMMAND, 0xffff_ffff);
     assert_eq!(reg_read(&mut s, ODSY_ERROR_COMMAND), 0, "the error command is acknowledged and discarded");
 }

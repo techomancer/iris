@@ -263,9 +263,9 @@ pub fn plane_word_store(bytes: &mut [u8], bpp: u32, le: bool, word: u32) {
         }
         _ => {
             if le {
-                bytes[..4].copy_from_slice(&(word as u32).to_le_bytes());
+                bytes[..4].copy_from_slice(&word.to_le_bytes());
             } else {
-                bytes[..4].copy_from_slice(&(word as u32).to_be_bytes());
+                bytes[..4].copy_from_slice(&word.to_be_bytes());
             }
         }
     }

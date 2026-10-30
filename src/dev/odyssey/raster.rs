@@ -595,11 +595,11 @@ impl GlDrawState {
         win.y0 = d.clip.r[0].y0;
         win.x1 = d.clip.r[0].x1;
         win.y1 = d.clip.r[0].y1;
-        for i in 1..std::cmp::min(d.clip.n as usize, SGI_CLIP_MAX) {
-            win.x0 = win.x0.min(d.clip.r[i].x0);
-            win.y0 = win.y0.min(d.clip.r[i].y0);
-            win.x1 = win.x1.max(d.clip.r[i].x1);
-            win.y1 = win.y1.max(d.clip.r[i].y1);
+        for r in &d.clip.r[1..std::cmp::min(d.clip.n as usize, SGI_CLIP_MAX)] {
+            win.x0 = win.x0.min(r.x0);
+            win.y0 = win.y0.min(r.y0);
+            win.x1 = win.x1.max(r.x1);
+            win.y1 = win.y1.max(r.y1);
         }
         win.clip = d.clip;
         true
@@ -793,6 +793,7 @@ impl RasterRules {
     }
 
     /// Read every selected destination before any colour/depth/stencil write.
+    #[allow(clippy::too_many_arguments, reason = "the fragment path takes a fragment as its parts")]
     pub fn rgba_load(&self, px: &dyn Planes, targets: &[ColourTarget], count: u32, x: i32, y: i32, dest: &mut [RasterColour; SGI_GL_MAX_TARGETS as usize], reported: &std::sync::atomic::AtomicBool) -> bool {
         for i in 0..count as usize {
             let loaded = px.load_rgba(targets[i], x, y);
@@ -858,16 +859,14 @@ impl SoftDraw<'_> {
             self.t.screen_top as i64 - y as i64
         };
         let b = SOFT_BAYER4[(row & 3) as usize][(x & 3) as usize] as f64 / 16.0;
-        for k in 0..3usize {
-            let v: u32;
-
-            if !(c[k] > 0.0) {
-                v = 0;
-            } else if c[k] >= 1.0 {
-                v = max;
+        for (k, &ck) in c.iter().enumerate().take(3) {
+            let v: u32 = if !(ck > 0.0) {
+                0
+            } else if ck >= 1.0 {
+                max
             } else {
-                v = (c[k] * max as f64 + b).floor() as u32;
-            }
+                (ck * max as f64 + b).floor() as u32
+            };
             out |= v.wrapping_shl((2 - k as u32) * bits);
         }
         out
@@ -952,21 +951,21 @@ impl GlDrawState {
     pub fn stencil_op(&self, px: &dyn Planes, x: i32, y: i32, op: u32, max: u32, ref_: u32) {
         let old = px.load_stencil(x, y) & max;
         let mask = self.stencil_write_mask & max;
-        let value: u32;
 
-        match op {
+        let value: u32 = match op {
             SGI_GL_KEEP => return,
-            SGI_GL_REPLACE => value = ref_,
-            SGI_GL_INCR => value = if old < max { old + 1 } else { max },
-            SGI_GL_DECR => value = if old != 0 { old - 1 } else { 0 },
-            SGI_GL_INVERT => value = !old & max,
-            _ => value = 0,
-        }
+            SGI_GL_REPLACE => ref_,
+            SGI_GL_INCR => if old < max { old + 1 } else { max },
+            SGI_GL_DECR => if old != 0 { old - 1 } else { 0 },
+            SGI_GL_INVERT => !old & max,
+            _ => 0,
+        };
         px.store_stencil(x, y, (old & !mask) | (value & mask));
     }
 }
 
 impl RasterRules {
+    #[allow(clippy::too_many_arguments, reason = "the fragment path takes a fragment as its parts")]
     pub fn depth_stencil(&self, st: &GlDrawState, t: &RasterTarget, px: &dyn Planes, x: i32, y: i32, z: f64, steps: i64) -> bool {
         let mut smax: u32 = 0;
         let mut sref: u32 = 0;
@@ -1067,8 +1066,8 @@ impl RasterRules {
         }
         s[3] = alpha;
         d[3] = 1.0;
-        for k in 0..3usize {
-            out[k] = st.blend_component(k, &s, &d);
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = st.blend_component(k, &s, &d);
         }
     }
 
@@ -1078,7 +1077,7 @@ impl SoftDraw<'_> {
     pub fn blend(&self, x: i32, y: i32, src: u32, alpha: f64, dst: u32) -> u32 {
         let mut out = [0.0f64; 3];
 
-        self.rules.soft_blend_rgb(&self.st, src, alpha, dst, &mut out);
+        self.rules.soft_blend_rgb(self.st, src, alpha, dst, &mut out);
         self.store_rgb(x, y, &out)
     }
 }
@@ -1095,8 +1094,8 @@ impl RasterRules {
         let mut c = RasterColour::default();
         let max = (1u32 << self.color_bits) - 1;
 
-        for k in 0..3usize {
-            c.component[k] = (rgb >> ((2 - k as u32) * self.color_bits as u32)) & max;
+        for (k, comp) in c.component.iter_mut().enumerate().take(3) {
+            *comp = (rgb >> ((2 - k as u32) * self.color_bits as u32)) & max;
         }
         c.component[3] = self.stored_alpha(alpha);
         c
@@ -1106,7 +1105,7 @@ impl RasterRules {
 impl SoftDraw<'_> {
     pub fn rgba_result(&self, x: i32, y: i32, frag: &SoftFrag, dest: &RasterColour) -> RasterColour {
         let mut out = RasterColour::default();
-        let rules = &*self.rules;
+        let rules = self.rules;
         let max = (1u32 << rules.color_bits) - 1;
         let alpha_max = rules.alpha_max();
         let alpha_q = rules.alpha(frag.rgba[3]);
@@ -1120,8 +1119,8 @@ impl SoftDraw<'_> {
             // for every alpha_q up to 1023.
             let stored = (1u32.wrapping_shl(rules.alpha_bits as u32)).wrapping_sub(1);
 
-            for k in 0..3usize {
-                out.component[k] = (rgb >> ((2 - k as u32) * rules.color_bits as u32)) & max;
+            for (k, comp) in out.component.iter_mut().enumerate().take(3) {
+                *comp = (rgb >> ((2 - k as u32) * rules.color_bits as u32)) & max;
             }
             out.component[3] = if stored == alpha_max { alpha_q } else { alpha_q.wrapping_mul(stored) / alpha_max };
             return out;
@@ -1142,8 +1141,8 @@ impl SoftDraw<'_> {
             } else {
                 1.0
             };
-            for k in 0..4usize {
-                blended[k] = self.st.blend_component(k, &src, &dst);
+            for (k, b) in blended.iter_mut().enumerate() {
+                *b = self.st.blend_component(k, &src, &dst);
             }
             out = rules.rgba_value(self.store_rgb(x, y, &blended), blended[3]);
         }
@@ -1212,7 +1211,7 @@ impl SoftDraw<'_> {
             self.rgba_read = self.ntargets != 0 && self.rgba_mask != 0 &&
                 (self.blend || self.logic_op ||
                  self.rgba_mask != self.rules.rgba_mask(SGI_GL_COLOUR_MASK_ALL));
-            if !self.rules.rgba_capable(&self.t, self.rgba_read) {
+            if !self.rules.rgba_capable(self.t, self.rgba_read) {
                 return false;
             }
             if self.t.store_rgba {
@@ -1260,11 +1259,11 @@ pub fn with_texel_cache<R>(f: impl FnOnce(&std::cell::RefCell<SoftTexelCache>) -
 
 thread_local! {
     pub static SOFT_TEXTURE_SELECTED: std::cell::Cell<SoftTexSelectionMemo> =
-        std::cell::Cell::new(SoftTexSelectionMemo {
+        const { std::cell::Cell::new(SoftTexSelectionMemo {
             serial: 0,
             rho: 0,
             selected: SoftTexSelection { first: 0, second: 0, filter: 0, alpha: 0.0, lambda: 0.0 },
-        });
+        }) };
 }
 
 impl SoftDraw<'_> {
@@ -1276,7 +1275,7 @@ impl SoftDraw<'_> {
     /// equal to end divides by zero; the model takes f as 1 before the end and
     /// 0 from it, the limit of the equation from either side.
     pub fn fog(&self, frag: &mut SoftFrag, z: f64) {
-        let st: &GlDrawState = &self.st;
+        let st: &GlDrawState = self.st;
         let c = frag.fog;
         let mut f: f64;
         let dens = st.fog_density as f64;
@@ -1310,8 +1309,8 @@ impl GlDrawState {
     /// Whether a point whose client clip plane values are d lies outside an
     /// enabled plane (2.11).
     pub fn clipped(&self, d: &[f64]) -> bool {
-        for i in 0..SGI_GL_CLIP_PLANES as usize {
-            if (self.clip_planes & (1u32 << i)) != 0 && !(d[i] >= 0.0) {
+        for (i, &di) in d.iter().enumerate().take(SGI_GL_CLIP_PLANES as usize) {
+            if (self.clip_planes & (1u32 << i)) != 0 && !(di >= 0.0) {
                 return true;
             }
         }
@@ -1328,7 +1327,7 @@ impl SoftDraw<'_> {
     pub fn owned_at(&self, px: i32, py: i32) -> bool {
         let x = self.win.ox.wrapping_add(px);
         let y = self.win.oy.wrapping_add(py);
-        let st: &GlDrawState = &self.st;
+        let st: &GlDrawState = self.st;
 
         (self.win.clip.n <= 1 || self.win.clip.contains(x, y)) &&
             (st.scissor_test == 0 ||
@@ -1344,8 +1343,8 @@ impl SoftDraw<'_> {
     /// dest in RGBA mode, which the caller has read where the draw reads it.
     #[inline(always)]
     pub fn fragment_store(&self, x: i32, y: i32, f: &SoftFrag, dest: &[RasterColour; SGI_GL_MAX_TARGETS as usize]) {
-        let t: &RasterTarget = &self.t;
-        let st: &GlDrawState = &self.st;
+        let t: &RasterTarget = self.t;
+        let st: &GlDrawState = self.st;
 
         if st.index_bits == 0 && t.store_rgba {
             let mut i = 0;
@@ -1407,15 +1406,16 @@ impl SoftDraw<'_> {
 
     /// [`fragment_at`](Self::fragment_at) with `steps` of the board's polygon
     /// offset added to the depth code (RasterRules::split_offset()).
+    #[allow(clippy::too_many_arguments, reason = "the fragment path takes a fragment as its parts")]
     pub fn fragment_at_offset(&self, px: i32, py: i32, z: f64, steps: i64, frag: &SoftFrag, coverage: f64, antialias: bool) {
-        let t: &RasterTarget = &self.t;
-        let st: &GlDrawState = &self.st;
+        let t: &RasterTarget = self.t;
+        let st: &GlDrawState = self.st;
         let mut fogged = *frag;
         let x = self.win.ox.wrapping_add(px);
         let y = self.win.oy.wrapping_add(py);
         let mut dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
 
-        if !(z >= 0.0 && z <= 1.0) {
+        if !(0.0..=1.0).contains(&z) {
             return;
         }
         if let Some(im) = self.texture {
@@ -1477,7 +1477,7 @@ impl GlDrawState {
         let mut n = 0.0;
         let mut f = 0.0;
 
-        if !(z >= 0.0 && z <= 1.0) {
+        if !(0.0..=1.0).contains(&z) {
             return false;
         }
         self.depth_range(&mut n, &mut f);
@@ -1492,7 +1492,7 @@ impl SoftDraw<'_> {
     /// bounds of those the window owns, within the viewport unless a window
     /// matrix replaces it. False when there are none.
     pub fn bounds(&self, x0: &mut i32, y0: &mut i32, x1: &mut i32, y1: &mut i32) -> bool {
-        let st: &GlDrawState = &self.st;
+        let st: &GlDrawState = self.st;
         let win = &self.win;
         let vx = st.viewport[0];
         let vy = st.viewport[1];
@@ -1541,6 +1541,7 @@ impl SoftDraw<'_> {
     /// otherwise mapped to window depth n + (f - n) z through the depth range
     /// [n, f] (OpenGL 1.2.1, 2.10.1). A polygon's offset is then added to the
     /// window depth, and the sum clamped to [0, 1] (3.5.5).
+    #[allow(clippy::too_many_arguments, reason = "the fragment path takes a fragment as its parts")]
     pub fn fragment_coverage(&self, px: i32, py: i32, z: f64, offset: f64, depth_w: f64, frag: &SoftFrag, coverage: f64, antialias: bool) {
         let mut z = z;
         let (mut offset, steps) = self.rules.split_offset(offset);
@@ -1631,7 +1632,7 @@ impl SoftDraw<'_> {
         let mut window = [[0.0f64; 3]; 3];
 
         self.window_vertices(v, &mut window);
-        self.rules.polygon_offset(&self.st, &window)
+        self.rules.polygon_offset(self.st, &window)
     }
 }
 
@@ -1648,7 +1649,7 @@ impl SoftDraw<'_> {
     /// where the divide has no answer, and returns false, as does one mapped
     /// beyond the rasterizer's range.
     pub fn project(&self, cv: &VolumeVertex, out: &mut SoftVertex) -> bool {
-        let st: &GlDrawState = &self.st;
+        let st: &GlDrawState = self.st;
         let clip = &cv.clip;
         let eye = &cv.eye;
         let mut win = [0.0f64; 3];

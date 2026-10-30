@@ -286,7 +286,7 @@ pub struct Board {
     pub gl_restart_m3: u32,
     pub gl_restart_m4: u32,
     pub gl_restart_armed: bool,
-    pub gl_restart_vertex: [[f32; SGI_GL_VERTEX_FLOATS as usize]; 3],
+    pub gl_restart_vertex: [[f32; SGI_GL_VERTEX_FLOATS]; 3],
     pub gl_matrix_slot: u32,
     pub gl_matrix: [u32; 16],
     pub gl_texture_matrix: [u32; 16],
@@ -591,7 +591,7 @@ impl Default for Board {
             gl_restart_m3: 0,
             gl_restart_m4: 0,
             gl_restart_armed: false,
-            gl_restart_vertex: [[0.0; SGI_GL_VERTEX_FLOATS as usize]; 3],
+            gl_restart_vertex: [[0.0; SGI_GL_VERTEX_FLOATS]; 3],
             gl_matrix_slot: 0,
             gl_matrix: [0; 16],
             gl_texture_matrix: [0; 16],
@@ -705,7 +705,7 @@ impl Board {
     /// where the master stops clocking. Without a nic-record, a selected
     /// product supplies its board's name, and otherwise the default is the
     /// public owner record of the board the Odyssey contract describes.
-    pub fn build_nic_rom(&mut self, rom: &mut [u8; ODSY_NIC_ROM_SIZE as usize]) {
+    pub fn build_nic_rom(&mut self, rom: &mut [u8; ODSY_NIC_ROM_SIZE]) {
         let fields: &str = if !self.nic_record.is_empty() {
             &self.nic_record
         } else if !self.product_record.is_empty() {
@@ -715,7 +715,7 @@ impl Board {
         };
         let record = format!("\u{1}    ;{};", fields);
         let record = record.as_bytes();
-        let length = record.len().min(ODSY_NIC_ROM_SIZE as usize);
+        let length = record.len().min(ODSY_NIC_ROM_SIZE);
 
         rom.fill(0xff);
         rom[..length].copy_from_slice(&record[..length]);
@@ -725,7 +725,7 @@ impl Board {
     }
 
     pub fn attach_nic(&mut self) -> Result<(), String> {
-        let mut rom = [0u8; ODSY_NIC_ROM_SIZE as usize];
+        let mut rom = [0u8; ODSY_NIC_ROM_SIZE];
 
         if self.nic_serial & !ODSY_NIC_SERIAL_MASK != 0 {
             return Err(format!("the sgi-odyssey one-wire serial {:#x} does not fit in 48 bits", self.nic_serial));

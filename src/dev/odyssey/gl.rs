@@ -616,13 +616,13 @@ impl BoardTexels<'_> {
     /// The texture colour table: each normalized component indexes it after
     /// filtering.
     pub fn colour_table(&self, alpha: bool, rgba: &mut [f64; 4]) {
-        for channel in 0..3usize {
-            let index = (cmax(0.0, cmin(rgba[channel], 1.0)) * 255.0 + 0.5).floor() as u32;
+        for (channel, c) in rgba.iter_mut().enumerate().take(3) {
+            let index = (cmax(0.0, cmin(*c, 1.0)) * 255.0 + 0.5).floor() as u32;
             let plane = (channel == 2) as usize;
             let word = self.colour_table[plane][index as usize];
             let component = if channel == 1 { word & 0xfff } else { (word >> 12) & 0xfff };
 
-            rgba[channel] = component as f64 / 4095.0;
+            *c = component as f64 / 4095.0;
         }
         if alpha {
             let index = (cmax(0.0, cmin(rgba[3], 1.0)) * 255.0 + 0.5).floor() as u32;
@@ -699,7 +699,6 @@ impl Texels for BoardTexels<'_> {
 /// apart), the captured stored 2x2x2 (word 2 4, 0x400 apart) and a
 /// 128x128x64 RGBA volume (word 2 6, 64 slice objects 0x1000 apart). That
 /// word 2 is the log2 of the slice allocation is INFERRED.
-
 pub fn volume_slice_stride(level_word2: u32) -> u64 {
     64u64.wrapping_shl(level_word2)
 }
@@ -711,7 +710,6 @@ pub fn volume_slice_stride(level_word2: u32) -> u64 {
 /// at and beyond each end point, and those are the only weights used here.
 /// How the board indexes and interpolates the table at LODs in between is
 /// not known, so a nonconstant table refuses them.
-
 impl TextureDetailWeight {
     /// The detail and sharpen weight at lambda, where the table gives one.
     pub fn at(&self, lambda: f64) -> Option<f64> {
@@ -734,15 +732,11 @@ impl TextureDetailWeight {
 /// The library never sets bits 31:16, so a word that does is unknown state
 /// and drops the draw. The reset value is the library's default, a model
 /// choice.
-
 impl Board {
     pub fn texture_scale_bias_known(&self) -> bool {
-        for i in 0..ODSY_TEX_SCALE_BIAS_WORDS as usize {
-            if (self.tex_scale_bias[i] >> ODSY_TEX_SCALE_BIAS_BITS) != 0 {
-                return false;
-            }
-        }
-        true
+        self.tex_scale_bias[..ODSY_TEX_SCALE_BIAS_WORDS as usize]
+            .iter()
+            .all(|&w| (w >> ODSY_TEX_SCALE_BIAS_BITS) == 0)
     }
 
     pub fn texture_scale_bias_identity(&self) -> bool {
@@ -829,7 +823,6 @@ impl Board {
 /// board is UNKNOWN. With minification code 5 the model samples as that
 /// code says and ignores the bit; with any other code it can only mean
 /// GL_PHASE_SGIX, which the model does not implement, so the draw drops.
-
 pub fn texture_detail_filter(word: u32) -> u32 {
     let min = word & ODSY_TEX_MIN_MASK;
 
@@ -899,7 +892,6 @@ impl Board {
 /// the GL library writes trunc(x * 256) & 0x3fff (ESTABLISHED as the
 /// library's conversion). It never sets bits 31:14, so a word that does is
 /// unknown state and drops the draw.
-
 pub fn texture_lod_word(word: u32) -> i32 {
     sextract32(word, 0, ODSY_TEX_LOD_BITS)
 }
@@ -1226,7 +1218,7 @@ impl Board {
                 let e = (first * 3) as usize;
                 let entry = [self.tex_levels[e], self.tex_levels[e + 1], self.tex_levels[e + 2]];
                 let stride_units = entry[1] & 0xfff;
-                let expected_units = if three_d_stored { 4 } else { ((width + 15) / 16 + 1) & !1u32 };
+                let expected_units = if three_d_stored { 4 } else { (width.div_ceil(16) + 1) & !1u32 };
                 let mut base = entry[0] & 0x1fffffff;
                 let mipmap = min >= 0x40;
 
@@ -1384,9 +1376,7 @@ impl Board {
                 chain.volume = chain.volumes[0];
                 image.depth = depth;
                 image.volume = true;
-                image.wrap_r = if three_d_stored {
-                    SGI_GL_CLAMP
-                } else if three_d_clamp && (word & 0x200) != 0 {
+                image.wrap_r = if three_d_stored || (three_d_clamp && (word & 0x200) != 0) {
                     SGI_GL_CLAMP
                 } else {
                     SGI_GL_REPEAT
@@ -1437,9 +1427,9 @@ impl Board {
                 let expected_units = if stored_border {
                     if one_d_shape && level_width == 64 { 6 } else { 4 }
                 } else if general_border {
-                    ((level_width + 32 + 15) / 16 + 1) & !1u32
+                    ((level_width + 32).div_ceil(16) + 1) & !1u32
                 } else {
-                    ((level_width + 15) / 16 + 1) & !1u32
+                    (level_width.div_ceil(16) + 1) & !1u32
                 };
                 let base = entry[0] & 0x1fffffff;
                 let interior_x: u32 = if bordered { 16 } else { 0 };
@@ -1784,9 +1774,7 @@ impl Board {
             d.origin[0] = origin[0];
             d.origin[1] = origin[1];
             if clip_kept != 0 {
-                for i in 0..clip_kept as usize {
-                    d.clip.r[i] = clip_rect[i];
-                }
+                d.clip.r[..clip_kept as usize].copy_from_slice(&clip_rect[..clip_kept as usize]);
             } else {
                 // An all-empty clip; ClipList.empty replaces this at rebase.
                 d.clip.r[0] = ClipRect { x0: 1, y0: 1, x1: 0, y1: 0 };
@@ -2137,11 +2125,10 @@ pub fn is_program_word(word: u32) -> bool {
     if (word & ODSY_PROG_SHAPE) != ODSY_PROG_TAG {
         return false;
     }
-    if cls >= ODSY_PROG_PROGRAM_HALFWORD && cls <= ODSY_PROG_PROGRAM_HALFWORD_LAST {
+    if (ODSY_PROG_PROGRAM_HALFWORD..=ODSY_PROG_PROGRAM_HALFWORD_LAST).contains(&cls) {
         return true;
     }
-    if cls >= ODSY_PROG_SEQ_FIRST
-        && cls <= ODSY_PROG_SEQ_LAST
+    if (ODSY_PROG_SEQ_FIRST..=ODSY_PROG_SEQ_LAST).contains(&cls)
         && (word & ODSY_GL_MATRIX_SELECT_SHAPE) != ODSY_GL_MATRIX_SELECT_TAG
     {
         return true;
@@ -2165,10 +2152,5 @@ pub fn is_program_word(word: u32) -> bool {
 }
 
 pub fn ucode_is_texgen(a: u32) -> bool {
-    for i in 0..UCODE_TEXGEN.len() {
-        if a == UCODE_TEXGEN[i] {
-            return true;
-        }
-    }
-    false
+    UCODE_TEXGEN.contains(&a)
 }

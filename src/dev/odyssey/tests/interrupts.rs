@@ -239,10 +239,10 @@ fn a_packet_needs_a_destination_and_an_edge() {
     reg_write(&mut s, ODSY_INTR_ENABLE_SET, LOW_WATER);
     assert!(rec.silent());
 
-    reg_write(&mut s, ODSY_INT_DEST_UPPER as u64, 0x1234_5678);
-    reg_write(&mut s, ODSY_INT_DEST_LOWER as u64, 0x9abc_def0);
-    assert_eq!(reg_read(&mut s, ODSY_INT_DEST_UPPER as u64), 0x1234_5678);
-    assert_eq!(reg_read(&mut s, ODSY_INT_DEST_LOWER as u64), 0x9abc_def0);
+    reg_write(&mut s, ODSY_INT_DEST_UPPER, 0x1234_5678);
+    reg_write(&mut s, ODSY_INT_DEST_LOWER, 0x9abc_def0);
+    assert_eq!(reg_read(&mut s, ODSY_INT_DEST_UPPER), 0x1234_5678);
+    assert_eq!(reg_read(&mut s, ODSY_INT_DEST_LOWER), 0x9abc_def0);
     route_to_heart(&mut s);
     assert!(rec.silent(), "programming the destination alone is not an edge");
 
@@ -263,8 +263,8 @@ fn a_packet_needs_a_destination_and_an_edge() {
 #[test]
 fn the_flag_interrupt_uses_the_routed_flag_vector() {
     let (mut s, rec) = board("v12");
-    reg_write(&mut s, ODSY_INT_DEST_UPPER as u64, 0x7000_0000);
-    reg_write(&mut s, ODSY_INT_DEST_LOWER as u64, 0x40);
+    reg_write(&mut s, ODSY_INT_DEST_UPPER, 0x7000_0000);
+    reg_write(&mut s, ODSY_INT_DEST_LOWER, 0x40);
     route_to_heart(&mut s);
     reg_write(&mut s, ODSY_ROUTE_VECTORS, (SOFTSYNC_VECTOR << 24) | 4);
 

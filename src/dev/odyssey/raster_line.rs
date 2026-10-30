@@ -6,22 +6,26 @@
 use super::*;
 
 impl SoftVertex {
-    pub fn texture_line_gradient(&self, b: &SoftVertex, sub: u32, volume: bool, one_dimensional: bool, values: &mut [f64; 4], delta: &mut [f64; 4], length: &mut f64) -> bool {
+    /// The texture values at this end of the line to b, their change along
+    /// it, and its length in pixels; None where one is not finite.
+    pub fn texture_line_gradient(&self, b: &SoftVertex, sub: u32, volume: bool, one_dimensional: bool) -> Option<([f64; 4], [f64; 4], f64)> {
+        let mut values = [0.0f64; 4];
         let mut end = [0.0f64; 4];
+        let mut delta = [0.0f64; 4];
 
-        *length = ((b.x - self.x) as f64).hypot((b.y - self.y) as f64) / (1i32 << sub) as f64;
+        let length = ((b.x - self.x) as f64).hypot((b.y - self.y) as f64) / (1i32 << sub) as f64;
         if !length.is_finite() {
-            return false;
+            return None;
         }
-        self.texture_values(volume, one_dimensional, values);
+        self.texture_values(volume, one_dimensional, &mut values);
         b.texture_values(volume, one_dimensional, &mut end);
         for k in 0..4 {
             delta[k] = end[k] - values[k];
             if !values[k].is_finite() || !delta[k].is_finite() {
-                return false;
+                return None;
             }
         }
-        true
+        Some((values, delta, length))
     }
 }
 
@@ -284,13 +288,8 @@ pub fn soft_line_filter(ax: f64, ay: f64, bx: f64, by: f64, width: f64, x: i32, 
         return 0.0;
     }
     if l1 < l0 {
-        let mut t = l0;
-
-        l0 = l1;
-        l1 = t;
-        t = n0;
-        n0 = n1;
-        n1 = t;
+        std::mem::swap(&mut l0, &mut l1);
+        std::mem::swap(&mut n0, &mut n1);
     }
     let lo = r2_max(l0, m as f64);
     let hi = r2_min(l1, m as f64 + 1.0);
@@ -311,6 +310,7 @@ impl RasterRules {
         soft_circle_coverage(cx, cy, size * 0.5, x, y)
     }
 
+    #[allow(clippy::too_many_arguments, reason = "two end points, a width and a pixel")]
     pub fn line_coverage(&self, ax: f64, ay: f64, bx: f64, by: f64, width: f64, x: i32, y: i32) -> f64 {
         if self.smooth_rule as u32 == SGI_SMOOTH_TWO_PIXEL_FILTER {
             return soft_line_filter(ax, ay, bx, by, width, x, y);
@@ -373,15 +373,15 @@ impl SoftDraw<'_> {
         let smooth = st.shade_model != SGI_GL_FLAT;
         let sub = self.rules.subpixel_bits as i32;
         let one_sub = (1i32 << sub) as f64;
-        let a = pa.clone();
-        let b = pb.clone();
+        let a = *pa;
+        let b = *pb;
         let (mut bx0, mut by0, mut bx1, mut by1) = (0i32, 0i32, -1i32, -1i32);
         let visible = self.bounds(&mut bx0, &mut by0, &mut bx1, &mut by1);
 
         if (!visible && stipple.is_none()) || (a.x == b.x && a.y == b.y) {
             return;
         }
-        if self.line_smooth && stipple.as_ref().map_or(false, |s| !s.enabled) {
+        if self.line_smooth && stipple.as_ref().is_some_and(|s| !s.enabled) {
             let length = ((b.x - a.x) as f64 / one_sub).hypot((b.y - a.y) as f64 / one_sub);
             let s = stipple.as_mut().unwrap();
             let period = 16u32.wrapping_mul(s.repeat);
@@ -396,8 +396,7 @@ impl SoftDraw<'_> {
             }
             stipple = None;
         }
-        if self.line_smooth && stipple.is_some() {
-            let s = stipple.as_mut().unwrap();
+        if let Some(s) = stipple.as_mut().filter(|_| self.line_smooth) {
             let length = ((b.x - a.x) as f64 / one_sub).hypot((b.y - a.y) as f64 / one_sub);
             let segments = length.ceil();
             let mut i = 0.0f64;
@@ -422,31 +421,22 @@ impl SoftDraw<'_> {
             }
             return;
         }
-        let mut texture_value = [0.0f64; 4];
-        let mut texture_delta = [0.0f64; 4];
-        let mut texture_length = 0.0f64;
-        if self.texture_base.is_some()
-            && !a.texture_line_gradient(
-                &b,
-                sub as u32,
-                self.image().volume,
-                self.image().one_dimensional,
-                &mut texture_value,
-                &mut texture_delta,
-                &mut texture_length,
-            )
-        {
+        let gradient = match self.texture_base {
+            Some(_) => a.texture_line_gradient(&b, sub as u32, self.image().volume, self.image().one_dimensional),
+            None => Some(([0.0; 4], [0.0; 4], 0.0)),
+        };
+        let Some((texture_value, texture_delta, texture_length)) = gradient else {
             self.texture_report(16, "invalid primitive coefficients, primitive dropped");
             return;
-        }
+        };
         let mut flat = [0.0f64; 4];
         for k in 0..4 {
             flat[k] = provoking[SGI_GL_V_COLOR + k] as f64;
         }
         let len2 = (b.x - a.x) as f64 * (b.x - a.x) as f64 + (b.y - a.y) as f64 * (b.y - a.y) as f64;
         let x_major = (b.x - a.x).wrapping_abs() >= (b.y - a.y).wrapping_abs();
-        let mut shifted_a = a.clone();
-        let mut shifted_b = b.clone();
+        let mut shifted_a = a;
+        let mut shifted_b = b;
         // Width <= INT32_MAX and sub <= 12 give a shift below 2^42.
         let shift = (self.line_width.wrapping_sub(1) as i64) * (1i64 << (sub - 1));
         if x_major {
@@ -475,10 +465,7 @@ impl SoftDraw<'_> {
         if stipple.is_some() {
             // Count coverage before ownership/scissor, in submitted direction.
             if if x_major { b.x < a.x } else { b.y < a.y } {
-                let tmp = major0;
-
-                major0 = major1;
-                major1 = tmp;
+                std::mem::swap(&mut major0, &mut major1);
                 step = -1;
             }
         } else {
@@ -585,7 +572,6 @@ impl SoftDraw<'_> {
                     let cy = (py as f64 + 0.5) * one_sub;
                     let mut frag = SoftFrag::default();
 
-                    frag.fixed = false;
                     let mut t = ((cx - a.x as f64) * (b.x - a.x) as f64 + (cy - a.y as f64) * (b.y - a.y) as f64) / len2;
                     // Approximation: retain endpoint values, not extrapolation.
                     t = r2_min(r2_max(t, 0.0), 1.0);
@@ -681,7 +667,7 @@ impl SoftDraw<'_> {
     /// rules' smooth_rule about its snapped centre (3.3.2).
     pub fn point_projected(&self, pv: &SoftVertex, provoking: Option<&[f32]>, offset: f64) {
         let sub = self.rules.subpixel_bits as i32;
-        let v = pv.clone();
+        let v = *pv;
         let mut frag = SoftFrag::default();
         let (mut bx0, mut by0, mut bx1, mut by1) = (0i32, 0i32, 0i32, 0i32);
         let psize = self.point_size as i64;

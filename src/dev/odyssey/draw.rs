@@ -121,10 +121,10 @@ impl Board {
 
     /// Whether clip_words is the off-screen form (ODSY_CMD_WINDOW_RESTORE).
     pub fn clip_is_offscreen(&self) -> bool {
-        for i in 0..(2 * SGI_ODYSSEY_CLIP_RECTS) as usize {
+        for (i, &word) in self.clip_words.iter().enumerate().take((2 * SGI_ODYSSEY_CLIP_RECTS) as usize) {
             let want = if i == 1 { ODSY_CLIP_OFFSCREEN_HI } else { 0 };
 
-            if (self.clip_words[i] & ODSY_CLIP_WORD_MASK) != want {
+            if (word & ODSY_CLIP_WORD_MASK) != want {
                 return false;
             }
         }
@@ -155,9 +155,7 @@ impl Board {
         if !self.pixel_in_bounds(x, y) || !self.id_compare_passes(x, y) {
             return false;
         }
-        for i in 0..self.clip_kept as usize {
-            let r = &self.clip_rect[i];
-
+        for r in &self.clip_rect[..self.clip_kept as usize] {
             if x >= r.x0 as i64 && x <= r.x1 as i64 && y >= r.y0 as i64 && y <= r.y1 as i64 {
                 return true;
             }
@@ -177,8 +175,7 @@ impl Board {
         if y < 0 || y >= SGI_ODYSSEY_HEIGHT as i64 {
             return;
         }
-        for i in 0..self.clip_kept as usize {
-            let r = self.clip_rect[i];
+        for &r in &self.clip_rect[..self.clip_kept as usize] {
             let a = (r.x0 as i64).max(0);
             let b = (r.x1 as i64 + 1).min(SGI_ODYSSEY_WIDTH as i64);
             let mut j = n;
@@ -582,33 +579,28 @@ impl Board {
     /// word is its leftmost pixel. A coordinate past the shape's own extent is
     /// treated as clear: the X server never draws a quad larger than its pattern.
     pub fn pattern_bit(&mut self, u: u32, v: u32) -> bool {
-        let word;
-        let bit;
 
-        match self.pattern_shape & !ODSY_PATTERN_SHAPE_OPAQUE {
+        let (word, bit) = match self.pattern_shape & !ODSY_PATTERN_SHAPE_OPAQUE {
             ODSY_PATTERN_SHAPE_64X16 => {
                 if u >= 64 || v >= 16 {
                     return false;
                 }
-                word = self.pattern_buffer[(2 * v + (u >> 5)) as usize];
-                bit = 31 - (u & 31);
+                (self.pattern_buffer[(2 * v + (u >> 5)) as usize], 31 - (u & 31))
             }
             ODSY_PATTERN_SHAPE_32X32 => {
                 if u >= 32 || v >= 32 {
                     return false;
                 }
-                word = self.pattern_buffer[v as usize];
-                bit = 31 - u;
+                (self.pattern_buffer[v as usize], 31 - u)
             }
             ODSY_PATTERN_SHAPE_16X64 => {
                 if u >= 16 || v >= 64 {
                     return false;
                 }
-                word = self.pattern_buffer[(v >> 1) as usize];
-                bit = 31 - 16 * (v & 1) - u;
+                (self.pattern_buffer[(v >> 1) as usize], 31 - 16 * (v & 1) - u)
             }
             _ => return false,
-        }
+        };
         (word >> bit) & 1 != 0
     }
 
@@ -631,6 +623,7 @@ impl Board {
     /// leaving the rest as it was otherwise. Only the rows and columns the quad
     /// covers are read, so the stale part of the persistent pattern buffer beyond
     /// the tile never contributes.
+    #[allow(clippy::too_many_arguments, reason = "a fill rectangle, its pattern origin and its colour")]
     pub fn pattern_fill(&mut self, x: u32, y: u32, w: u32, h: u32, pat_u0: u32, pat_v0: u32, is_index: bool, value: u32) {
         let opaque = self.pattern_shape & ODSY_PATTERN_SHAPE_OPAQUE != 0;
         let background = self.pattern_background(is_index);
@@ -903,8 +896,8 @@ impl Board {
             if self.image_group_len != 0 && self.image_group_painted >= self.image_group_len {
                 return;
             }
-            for i in 0..held {
-                halves[i] = (self.image_bytes >> (16 * (held - 1 - i))) as u16;
+            for (i, half) in halves.iter_mut().enumerate().take(held) {
+                *half = (self.image_bytes >> (16 * (held - 1 - i))) as u16;
             }
             for h in 0..2 {
                 let mut px = [0u8; 8];
@@ -914,8 +907,8 @@ impl Board {
                 if held < comps {
                     continue;
                 }
-                for i in 0..comps {
-                    px[2 * i..][..2].copy_from_slice(&(halves[i] as u16).to_be_bytes());
+                for (pair, half) in px.as_chunks_mut::<2>().0.iter_mut().zip(&halves[..comps]) {
+                    pair.copy_from_slice(&half.to_be_bytes());
                 }
                 self.image_put(decode_texel12(code, &px, true), false, true);
                 held = 0;
@@ -944,12 +937,12 @@ impl Board {
             code = if self.image_fmt == ODSY_IMAGE_FMT_RGB { ODSY_IMAGE_CODE_FALLBACK_XRGB } else { ODSY_IMAGE_CODE_CI };
             n = pixel_bytes(code);
         }
-        b[..4].copy_from_slice(&(word as u32).to_be_bytes());
-        for i in 0..4 {
+        b[..4].copy_from_slice(&word.to_be_bytes());
+        for &byte in &b[..4] {
             let mut px = [0u8; 4];
             let mut rgba = 0u32;
 
-            self.image_bytes = (self.image_bytes << 8) | b[i] as u32;
+            self.image_bytes = (self.image_bytes << 8) | byte as u32;
             self.image_nbytes += 1;
             if self.image_nbytes < n {
                 continue;

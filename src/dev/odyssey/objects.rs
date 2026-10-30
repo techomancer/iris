@@ -180,11 +180,8 @@ impl Board {
         let mut i = self.object_find(base);
 
         if i < 0 {
-            for j in 0..self.obj_count as usize {
-                if self.obj_base[j] == 0 {
-                    i = j as i32;
-                    break;
-                }
+            if let Some(j) = self.obj_base[..self.obj_count as usize].iter().position(|&b| b == 0) {
+                i = j as i32;
             }
         }
         if i < 0 && self.obj_count == SGI_ODYSSEY_OBJECTS {
@@ -302,7 +299,7 @@ impl Board {
             return;
         }
         let word = self.obj_offset[i as usize] as u64 + y as u64 * self.obj_width[i as usize] as u64 + x as u64;
-        self.obj_mem.bytes[(word * 4) as usize..][..4].copy_from_slice(&(rgba as u32).to_be_bytes());
+        self.obj_mem.bytes[(word * 4) as usize..][..4].copy_from_slice(&rgba.to_be_bytes());
         self.object_word_set_valid(word, true);
     }
 

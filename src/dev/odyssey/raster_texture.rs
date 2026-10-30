@@ -46,7 +46,7 @@ pub fn soft_texture_internal_format(format: u32) -> u32 {
 }
 
 pub fn soft_texture_mipmap(filter: u32) -> bool {
-    filter >= SGI_GL_NEAREST_MIPMAP_NEAREST && filter <= SGI_GL_LINEAR_MIPMAP_LINEAR
+    (SGI_GL_NEAREST_MIPMAP_NEAREST..=SGI_GL_LINEAR_MIPMAP_LINEAR).contains(&filter)
 }
 
 pub fn soft_texture_sharpen(filter: u32) -> bool {
@@ -62,31 +62,6 @@ pub fn soft_texture_detail(filter: u32) -> bool {
 pub fn soft_texture_dimensions(w: u32, h: u32) -> bool {
     w != 0 && h != 0 && w <= i32::MAX as u32 && h <= i32::MAX as u32 &&
         (w as u64).is_power_of_two() && (h as u64).is_power_of_two()
-}
-
-pub fn soft_texture_component_mask(format: u32) -> u8 {
-    match format {
-        SGI_GL_ALPHA => 1u8 << 3,
-        SGI_GL_LUMINANCE | SGI_GL_INTENSITY => 1,
-        SGI_GL_LUMINANCE_ALPHA => (1 << 0) | (1 << 3),
-        SGI_GL_RGB => 7,
-        SGI_GL_RGBA => 15,
-        _ => 0,
-    }
-}
-
-pub fn soft_texture_component_bits_valid(format: u32, bits: &[u8; 4]) -> bool {
-    let mask = soft_texture_component_mask(format);
-
-    if mask == 0 {
-        return false;
-    }
-    for k in 0..4usize {
-        if (mask & (1u8 << k)) != 0 && (bits[k] == 0 || bits[k] > 16) {
-            return false;
-        }
-    }
-    true
 }
 
 impl<'a> GlTexPyramid<'a> {
@@ -138,9 +113,7 @@ impl<'a> SoftDraw<'a> {
         #[derive(PartialEq)]
         enum Out { Unsupported, Incomplete, Done }
         let res = (|| -> Out {
-            for k in 0..4usize {
-                border_finite &= im.border_color[k].is_finite();
-            }
+            border_finite &= im.border_color.iter().all(|c| c.is_finite());
             if p.levels.len() > SGI_GL_TEX_LEVELS_MAX as usize ||
                 !p.min_lod.is_finite() || !p.max_lod.is_finite() ||
                 p.min_lod > p.max_lod || !border_finite ||
@@ -319,9 +292,7 @@ impl<'a> SoftDraw<'a> {
             }
             let mut border_finite = true;
 
-            for k in 0..4usize {
-                border_finite &= im.border_color[k].is_finite();
-            }
+            border_finite &= im.border_color.iter().all(|c| c.is_finite());
             if !im.soft_texture_shadow_supported(im.base_format) ||
                 !im.soft_texture_border_supported(None) ||
                 !border_finite ||
@@ -1061,7 +1032,7 @@ impl SoftDraw<'_> {
 
     pub fn texture(&self, frag: &mut SoftFrag) -> bool {
         let im = self.image();
-        let st: &GlDrawState = &self.st;
+        let st: &GlDrawState = self.st;
         let base = self.texture_base;
         let format = base.map_or(im.base_format, |b| b.base_format);
         let mut texel = [0.0f64; 4];

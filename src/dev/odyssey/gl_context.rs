@@ -734,12 +734,8 @@ impl GlContext {
     pub fn init(&mut self, hw_id: u32) {
         *self = GlContext::default();
         self.hw_id = hw_id;
-        for i in 0..SGI_GL_HINTS as usize {
-            self.hints[i] = SGI_GL_DONT_CARE;
-        }
-        for i in 0..4 {
-            self.cur_color[i] = 1.0;
-        }
+        self.hints[..SGI_GL_HINTS as usize].fill(SGI_GL_DONT_CARE);
+        self.cur_color = [1.0; 4];
         self.cur.shade_model = SGI_GL_SMOOTH;
         self.sprite_mode = SGI_GL_SPRITE_AXIAL_SGIX;
         self.sprite_axis[2] = 1.0;
@@ -752,18 +748,14 @@ impl GlContext {
         self.cur.stencil_func = SGI_GL_ALWAYS;
         self.cur.stencil_value_mask = u32::MAX;
         self.cur.stencil_write_mask = u32::MAX;
-        for i in 0..3 {
-            self.cur.stencil_op[i] = SGI_GL_KEEP;
-        }
+        self.cur.stencil_op[..3].fill(SGI_GL_KEEP);
         self.cur.blend_src = 1;
         self.cur.blend_equation = SGI_GL_FUNC_ADD;
         self.cur.logic_op_mode = SGI_GL_COPY;
         self.cur.texture_env_mode = SGI_GL_MODULATE;
         self.cur_texcoord[3] = 1.0;
         self.raster_texcoord[3] = 1.0;
-        for i in 0..4 {
-            self.tex_gen_mode[i] = SGI_GL_EYE_LINEAR;
-        }
+        self.tex_gen_mode[..4].fill(SGI_GL_EYE_LINEAR);
         self.tex_gen_object_plane[0][0] = 1.0;
         self.tex_gen_eye_plane[0][0] = 1.0;
         self.tex_gen_object_plane[1][1] = 1.0;
@@ -791,9 +783,7 @@ impl GlContext {
         self.cur_edge = 1;
         self.raster_pos[3] = 1.0;
         self.raster_valid = 1;
-        for i in 0..4 {
-            self.raster_color[i] = 1.0;
-        }
+        self.raster_color[..4].fill(1.0);
         self.raster_index = 1.0;
     }
 
@@ -959,7 +949,7 @@ pub fn gl_index_value(index_bits: u32, index: f64) -> u32 {
     let mask: u32 = if index_bits >= 32 { u32::MAX } else { (1u32 << index_bits) - 1 };
     let f = index.floor();
 
-    if !(f >= -2147483648.0 && f < 4294967296.0) {
+    if !(-2147483648.0..4294967296.0).contains(&f) {
         return 0;
     }
     (if f < 0.0 { (f as i32) as u32 } else { f as u32 }) & mask
@@ -1001,8 +991,8 @@ pub fn gl_invert(m: &[f32; 16], inv: &mut [f64; 16]) -> bool {
     if det == 0.0 || !det.is_finite() {
         return false;
     }
-    for i in 0..16 {
-        inv[i] /= det;
+    for v in inv.iter_mut() {
+        *v /= det;
     }
     true
 }
@@ -1137,13 +1127,11 @@ impl GlDrawState {
             out[0] = self.drawable.overlay;
             return 1;
         }
-        for bit in 0..SGI_GL_MAX_TARGETS as usize {
-            let mut dup = false;
-
+        for (bit, &target) in pick.iter().enumerate().take(SGI_GL_MAX_TARGETS as usize) {
             if self.draw_buffers & (1u32 << bit) == 0 {
                 continue;
             }
-            if bit >= 2 && pick[bit] == 0 {
+            if bit >= 2 && target == 0 {
                 crate::dlog!(
                     LogModule::Odyssey,
                     "sgi-gl: draw buffer bit {} of {:#x} has no buffer; ignored",
@@ -1155,11 +1143,8 @@ impl GlDrawState {
             // A drawable whose buffers are one target, as a single-buffered one
             // may be, is stored to once: a read-modify-write stage in front of
             // the store must not apply twice.
-            for i in 0..n as usize {
-                dup |= out[i] == pick[bit];
-            }
-            if !dup {
-                out[n as usize] = pick[bit];
+            if !out[..n as usize].contains(&target) {
+                out[n as usize] = target;
                 n += 1;
             }
         }
@@ -1173,6 +1158,7 @@ impl GlDrawState {
 impl GlContext {
 
     /// Send one piece of the open primitive: count of v0 to v3.
+    #[allow(clippy::too_many_arguments, reason = "the primitive and up to four vertices of it")]
     pub fn submit(&mut self, sink: &mut dyn GlSink, mode: u32, count: u32, v0: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v1: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v2: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v3: Option<&[f32; SGI_GL_VERTEX_FLOATS]>) {
         let stipple = if mode == SGI_GL_LINES { self.standalone_stipple } else { self.polygon.enabled != 0 };
         let v = [v0, v1, v2, v3];
@@ -1226,7 +1212,6 @@ impl GlContext {
     /// Capture one vertex with the current attributes, without
     /// drawing. `bits` holds `components` words.
     pub fn capture_vertex(&mut self, mode: u32, bits: &[u32], components: u32, out: &mut [f32; SGI_GL_VERTEX_FLOATS]) {
-        let normal: [f32; 3];
         let mut obj = [0.0f32; 4];
 
         *out = [0.0; SGI_GL_VERTEX_FLOATS];
@@ -1235,7 +1220,7 @@ impl GlContext {
             out[SGI_GL_V_POSITION + i] = gl_float(bits[i]);
         }
         out[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&self.cur_color);
-        normal = self.cur_normal;
+        let normal: [f32; 3] = self.cur_normal;
         obj.copy_from_slice(&out[SGI_GL_V_POSITION..SGI_GL_V_POSITION + 4]);
         out[SGI_GL_V_NORMAL..SGI_GL_V_NORMAL + 3].copy_from_slice(&normal);
         let mut pos = [0.0f32; 4];
@@ -1248,7 +1233,7 @@ impl GlContext {
         // Material and lighting belong to the instant this vertex arrived.
         out[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4].copy_from_slice(&self.cur_color);
         out[SGI_GL_V_BACK_INDEX] = out[SGI_GL_V_INDEX];
-    
+
         if self.polygon.enabled != 0
             && (mode == SGI_GL_TRIANGLE_STRIP || mode == SGI_GL_TRIANGLE_FAN || mode == SGI_GL_QUAD_STRIP)
         {
@@ -1552,7 +1537,7 @@ impl GlContext {
                     return;
                 }
                 let repeat = gl_arg(a, 0) as i32;
-                self.line_stipple_repeat = std::cmp::min(std::cmp::max(repeat, 1), 256) as u32;
+                self.line_stipple_repeat = repeat.clamp(1, 256) as u32;
                 self.line_stipple_pattern = gl_arg(a, 1) & 0xffff;
             }
             _ => {
@@ -1575,9 +1560,9 @@ impl GlContext {
                     crate::dlog!(LogModule::Odyssey, "sgi-gl: glPolygonMode({:#x}, {:#x}) ignored", a0, a1);
                     return;
                 }
-                for i in 0..2usize {
+                for (i, mode) in self.polygon_mode.iter_mut().enumerate() {
                     if faces & (1u32 << i) != 0 {
-                        self.polygon_mode[i] = a1;
+                        *mode = a1;
                     }
                 }
                 if a1 != SGI_GL_FILL && self.polygon.enabled == 0 {
@@ -1957,7 +1942,7 @@ impl GlContext {
         }
         if mode > SGI_GL_POLYGON
             || k > SGI_GL_HELD_VERTICES
-            || (k != 0 && v.map_or(true, |s| s.len() < k as usize))
+            || (k != 0 && v.is_none_or(|s| s.len() < k as usize))
             || !gl_resume_held_ok(mode, k, count)
             || (self.polygon.enabled != 0 && mode == SGI_GL_POLYGON)
         {

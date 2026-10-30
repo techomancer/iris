@@ -59,10 +59,8 @@ pub fn volume_clip_triangle(in_: &[VolumeVertex; 3], out: &mut [VolumeVertex; SG
     let mut dst: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = std::array::from_fn(|_| VolumeVertex::default());
     let mut n: usize = 3;
 
-    for i in 0..3 {
-        out[i] = in_[i].clone();
-        src[i] = in_[i].clone();
-    }
+    out[..3].clone_from_slice(in_);
+    src[..3].clone_from_slice(in_);
     if in_[0].contains() && in_[1].contains() && in_[2].contains() {
         return 3;
     }
@@ -97,9 +95,7 @@ pub fn volume_clip_triangle(in_: &[VolumeVertex; 3], out: &mut [VolumeVertex; SG
             return 0;
         }
     }
-    for i in 0..n {
-        out[i] = src[i].clone();
-    }
+    out[..n].clone_from_slice(&src[..n]);
     n as u32
 }
 
@@ -244,6 +240,7 @@ impl SoftDraw<'_> {
     /// One row of a triangle under SoftDraw::simple_fragments(): pixels px0 to
     /// px1 of row py, whose edge values for v[2]-v[0] and v[0]-v[1] at px0 are
     /// e1 and e2.
+    #[allow(clippy::too_many_arguments, reason = "the row loops take the triangle's per-row edge state as scalars")]
     pub fn simple_row(&self, v: &[SoftVertex], py: i32, mut px0: i32, mut px1: i32, mut e1: i64, mut e2: i64, step1: i64, step2: i64, area: i64, offset: f64, flat: &SoftFrag, smooth: bool, rgba: bool, depth_row: bool) {
         let rules = self.rules;
         let st = self.st;
@@ -306,7 +303,7 @@ impl SoftDraw<'_> {
                         z = 1.0;
                     }
                 }
-                if !st.window_depth(z, off, &mut zw) || !(zw >= 0.0 && zw <= 1.0) {
+                if !st.window_depth(z, off, &mut zw) || !(0.0..=1.0).contains(&zw) {
                     break 'pixel;
                 }
                 if clipped && !self.owned_at(px, py) {
@@ -365,6 +362,7 @@ impl SoftDraw<'_> {
     }
 
     /// Out of line, once a row.
+    #[allow(clippy::too_many_arguments, reason = "the row loops take the triangle's per-row edge state as scalars")]
     pub fn simple_span(&self, v: &[SoftVertex], py: i32, px0: i32, px1: i32, e1: i64, e2: i64, step1: i64, step2: i64, area: i64, offset: f64, flat: &SoftFrag, smooth: bool) {
         let rgba = self.t.store_rgba;
         let depth_row = self.rules.depth_row_given;
@@ -392,14 +390,10 @@ impl SoftDraw<'_> {
         let mut flat_q = false;
         let mut flat_ok = false;
         // Fragments sample in fixed point, and their lambda where it is flat.
-        let fixed: bool;
         let mut fixed_flat: Option<i32> = None;
         // The row loop for textured fragments, and its inputs.
         let mut span: Option<(SoftTexSpanFn, SoftTexSpan)> = None;
         let mut area: i64;
-        let offset: f64;
-        let ccw: bool;
-        let front: bool;
         let smooth = st.shade_model != SGI_GL_FLAT;
         let simple = self.simple_fragments();
         let mut tex_row = [0.0f64; 4];
@@ -422,7 +416,7 @@ impl SoftDraw<'_> {
             return;
         }
         // An image with no pyramid has no planes to fail: it samples in double.
-        fixed = self.fixed.is_some()
+        let fixed: bool = self.fixed.is_some()
             && (self.texture_base.is_some() || soft_texture_plane(&v, sub as u32, false, false, &mut gradient));
         if fixed && self.fixed_tex().lod && gradient.dx[2] == 0.0 && gradient.dy[2] == 0.0 {
             // Q/W flat, as for the double footprint below: every fragment's
@@ -465,8 +459,8 @@ impl SoftDraw<'_> {
                 flat_rho = out[4];
             }
         }
-        ccw = if st.window_matrix_given != 0 && st.window_rows_down != 0 { area < 0 } else { area > 0 };
-        front = if st.front_face == SGI_GL_CW { !ccw } else { ccw };
+        let ccw: bool = if st.window_matrix_given != 0 && st.window_rows_down != 0 { area < 0 } else { area > 0 };
+        let front: bool = if st.front_face == SGI_GL_CW { !ccw } else { ccw };
         if st.cull_face != 0
             && (st.cull_face_mode == SGI_GL_FRONT_AND_BACK
                 || st.cull_face_mode == (if front { SGI_GL_FRONT } else { SGI_GL_BACK }))
@@ -480,7 +474,10 @@ impl SoftDraw<'_> {
                 let back = &verts[i].attr[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4];
 
                 for k in 0..4 {
-                    v[i].rgba[k] = back[k].max(0.0).min(1.0) as f64;
+                    // max then min, not clamp: a NaN colour becomes 0.
+                    #[allow(clippy::manual_clamp, reason = "clamp would keep a NaN")]
+                    let c = back[k].max(0.0).min(1.0);
+                    v[i].rgba[k] = c as f64;
                 }
                 v[i].index = verts[i].attr[SGI_GL_V_BACK_INDEX] as f64;
             }
@@ -490,7 +487,7 @@ impl SoftDraw<'_> {
         }
         flat_frag.index = flat_index as f64;
         flat_frag.fixed = false;
-        offset = self.offset(&v);
+        let offset: f64 = self.offset(&v);
         if area < 0 {
             // Rasterize either winding the same way from here.
             v.swap(1, 2);
@@ -616,7 +613,7 @@ impl SoftDraw<'_> {
                 if !self.stipple_pass(px, py, &mut background) {
                     continue;
                 }
-                frag = flat_frag.clone();
+                frag = flat_frag;
                 let b1 = cur_e1 as f64 / area as f64;
                 let b2 = cur_e2 as f64 / area as f64;
                 let z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
@@ -626,12 +623,12 @@ impl SoftDraw<'_> {
                 let sum = w0 + w1 + w2;
                 let depth_w = (1.0 - b1 - b2) * v[0].depth_w + b1 * v[1].depth_w + b2 * v[2].depth_w;
                 if fixed && span.is_none() {
-                    let mut s = 0.0f64;
-                    let mut t = 0.0f64;
-                    let mut lambda = 0i32;
-
-                    frag.fixed = self.fixed_tex().fixed_coords(&gradient, &tex_row, px, fixed_flat, &mut s, &mut t, &mut lambda)
-                        && SoftDraw::fixed_sample::<SGI_SOFT_FIXED_ANY, false>(self, s, t, lambda, &mut frag.texel);
+                    frag.fixed = self
+                        .fixed_tex()
+                        .fixed_coords(&gradient, &tex_row, px, fixed_flat)
+                        .is_some_and(|(s, t, lambda)| {
+                            SoftDraw::fixed_sample::<SGI_SOFT_FIXED_ANY, false>(self, s, t, lambda, &mut frag.texel)
+                        });
                 }
                 // Only texturing reads the coordinates, only fog the distance.
                 if self.texture.is_some() && !frag.fixed {
@@ -702,14 +699,12 @@ impl SoftDraw<'_> {
         let verts: [&[f32]; 3] = [va, vb, vc];
         let mut in_: [VolumeVertex; 3] = Default::default();
 
-        for i in 0..3 {
-            self.st.volume_from_draw_vertex(verts[i], &mut in_[i]);
+        for (v, cv) in verts.iter().zip(in_.iter_mut()) {
+            self.st.volume_from_draw_vertex(v, cv);
         }
         *n = volume_clip_triangle(&in_, poly);
-        for i in 0..*n as usize {
-            if !self.texture_vertex_valid(&poly[i]) {
-                return false;
-            }
+        if !poly[..*n as usize].iter().all(|v| self.texture_vertex_valid(v)) {
+            return false;
         }
         if self.texture_base.is_some() {
             let mut i = 1usize;
@@ -902,8 +897,7 @@ pub fn soft_aa_clip(
         return true;
     }
     let mut a = &src[n - 1];
-    for i in 0..n {
-        let b = &src[i];
+    for b in &src[..n] {
         let ai = a.aa_inside(edge, value);
         let bi = b.aa_inside(edge, value);
 
@@ -971,7 +965,7 @@ impl SoftDraw<'_> {
         let scale = (1i32 << sub) as f64;
         let mut polygon_area = 0.0f64;
 
-        if n < 3 || n > usize::MAX - 8 || !self.bounds(&mut px0, &mut py0, &mut px1, &mut py1) {
+        if !(3..=usize::MAX - 8).contains(&n) || !self.bounds(&mut px0, &mut py0, &mut px1, &mut py1) {
             return;
         }
         let capacity = n + 8;
@@ -1011,7 +1005,7 @@ impl SoftDraw<'_> {
                 let mut bary = [0.0f64; 3];
                 let mut w = [0.0f64; 3];
                 let mut fan_i = 0usize;
-                let mut frag = flat.clone();
+                let mut frag = flat;
                 let mut found = false;
                 let mut background = false;
 
@@ -1117,7 +1111,7 @@ impl SoftDraw<'_> {
                     if !(sum > 0.0) || !sum.is_finite() {
                         continue;
                     }
-                    let fan = [v[0].clone(), v[i].clone(), v[i + 1].clone()];
+                    let fan = [v[0], v[i], v[i + 1]];
 
                     z = bary[0] * v[0].z + bary[1] * v[i].z + bary[2] * v[i + 1].z;
                     for k in 0..4 {
@@ -1212,7 +1206,7 @@ impl SoftDraw<'_> {
         if self.texture_base.is_some() {
             let mut i = 1usize;
             while i + 1 < n {
-                let fan = [v[0].clone(), v[i].clone(), v[i + 1].clone()];
+                let fan = [v[0], v[i], v[i + 1]];
 
                 if !self.texture_coefficients(&fan) {
                     return;
@@ -1260,8 +1254,8 @@ impl SoftDraw<'_> {
 
     /// Workspace bounds are internal representations, not hardware maxima.
     pub fn polygon(&self, d: &GlDraw, indices: Option<&[u32]>, count: usize, provoking: &[f32], force_edges: bool) -> GlDrawResult {
-        let mut positions = self.clone();
-        let mut coverage = self.clone();
+        let mut positions = *self;
+        let mut coverage = *self;
         let mut fan: [SoftVertex; 3] = Default::default();
         let mut first = SoftVertex::default();
         let mut previous: SoftVertex;
@@ -1277,8 +1271,6 @@ impl SoftDraw<'_> {
         let mut area = 0.0f64;
         let mut slope = 0.0f64;
         let mut offset = 0.0f64;
-        let front: bool;
-        let mode: u32;
 
         if count < 3 {
             return SGI_GL_DRAW_OK;
@@ -1291,16 +1283,14 @@ impl SoftDraw<'_> {
         let mut other: Vec<VolumeVertex> = vec![VolumeVertex::default(); capacity];
         // Facing must not prevalidate texture Q and erase a valid FILL prefix.
         positions.texture = None;
-        for i in 0..count {
-            self.st.volume_from_draw_vertex(d.soft_polygon_vertex(indices, i), &mut poly[i]);
-            for k in 0..4 {
-                if !poly[i].clip[k].is_finite() || !poly[i].eye[k].is_finite() {
-                    crate::dlog!(LogModule::Odyssey, "sgi-gl: invalid polygon position dropped");
-                    return SGI_GL_DRAW_OK;
-                }
+        for (i, v) in poly.iter_mut().enumerate().take(count) {
+            self.st.volume_from_draw_vertex(d.soft_polygon_vertex(indices, i), v);
+            if !v.clip.iter().chain(&v.eye).all(|c| c.is_finite()) {
+                crate::dlog!(LogModule::Odyssey, "sgi-gl: invalid polygon position dropped");
+                return SGI_GL_DRAW_OK;
             }
             if force_edges {
-                poly[i].soft_boundary_set_edge(true);
+                v.soft_boundary_set_edge(true);
             }
         }
         if !self.boundary_clip(&mut poly, &mut other, &mut n, capacity) {
@@ -1310,19 +1300,19 @@ impl SoftDraw<'_> {
         if n == 0 || !positions.project(&poly[0], &mut first) {
             return SGI_GL_DRAW_OK;
         }
-        previous = first.clone();
-        fan[0] = first.clone();
-        for i in 1..n {
-            if !positions.project(&poly[i], &mut current) {
+        previous = first;
+        fan[0] = first;
+        for (i, v) in poly.iter().enumerate().take(n).skip(1) {
+            if !positions.project(v, &mut current) {
                 return SGI_GL_DRAW_OK;
             }
             if i >= 2 {
                 area += first.edge(&previous, current.x, current.y) as f64;
-                fan[1] = previous.clone();
-                fan[2] = current.clone();
+                fan[1] = previous;
+                fan[2] = current;
                 slope = r2_max(slope, self.slope(&fan));
             }
-            previous = current.clone();
+            previous = current;
         }
         if self.st.window_matrix_given != 0 && self.st.window_rows_down != 0 {
             area = -area;
@@ -1330,14 +1320,14 @@ impl SoftDraw<'_> {
         if self.st.front_face == SGI_GL_CW {
             area = -area;
         }
-        front = area > 0.0; // Zero remains back-facing through both reversals.
+        let front: bool = area > 0.0; // Zero remains back-facing through both reversals.
         if self.st.cull_face != 0
             && (self.st.cull_face_mode == SGI_GL_FRONT_AND_BACK
                 || self.st.cull_face_mode == (if front { SGI_GL_FRONT } else { SGI_GL_BACK }))
         {
             return SGI_GL_DRAW_OK;
         }
-        mode = d.polygon_modes.map_or(SGI_GL_FILL, |m| m[if front { 0 } else { 1 }]);
+        let mode: u32 = d.polygon_modes.map_or(SGI_GL_FILL, |m| m[if front { 0 } else { 1 }]);
         if mode == SGI_GL_FILL {
             if self.polygon_smooth {
                 self.polygon_smooth(&poly, n, provoking, front, slope);
@@ -1358,8 +1348,8 @@ impl SoftDraw<'_> {
         flat.copy_from_slice(&provoking[..SGI_GL_VERTEX_FLOATS]);
         if !front && self.back_colors {
             flat[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&provoking[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4]);
-            for i in 0..n {
-                poly[i].attr.copy_within(SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4, SGI_GL_V_COLOR);
+            for v in &mut poly[..n] {
+                v.attr.copy_within(SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4, SGI_GL_V_COLOR);
             }
         }
         // Validate the entire boundary before any LINE/POINT fragment or sample.
@@ -1369,20 +1359,16 @@ impl SoftDraw<'_> {
             }
             if self.texture_base.is_some() && mode == SGI_GL_LINE {
                 let mut next = SoftVertex::default();
-                let mut values = [0.0f64; 4];
-                let mut delta = [0.0f64; 4];
-                let mut length = 0.0f64;
 
                 if !self.project(&poly[(i + 1) % n], &mut next)
-                    || !current.texture_line_gradient(
-                        &next,
-                        self.rules.subpixel_bits as u32,
-                        self.image().volume,
-                        self.image().one_dimensional,
-                        &mut values,
-                        &mut delta,
-                        &mut length,
-                    )
+                    || current
+                        .texture_line_gradient(
+                            &next,
+                            self.rules.subpixel_bits as u32,
+                            self.image().volume,
+                            self.image().one_dimensional,
+                        )
+                        .is_none()
                 {
                     self.texture_report(16, "invalid primitive coefficients, primitive dropped");
                     return SGI_GL_DRAW_OK;
