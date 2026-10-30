@@ -199,16 +199,39 @@ pub fn access_waits(addr: u64, size: u32, write: bool) -> bool {
     )
 }
 
+/// Whether a read that waits for the queued stores also waits for the
+/// raster work they handed on.
+///
+/// Every field of the memory word `0x106c` is a level or a strap, never a
+/// drawing result (Odyssey datasheet, "Board and kernel", "Back-end
+/// records" and "Flags, status and flow control"): the straps in bits
+/// 31:24, the back-end FIFO's fill in bits 6:0, which the model's back-end
+/// writes leave at 0 once the stores before them have run, and the command
+/// FIFO's level in bits 15:7, 0 once the stores have run. The datasheet's
+/// completion points keep command-FIFO space and data drain apart from
+/// raster work reaching memory. So the word waits for the front end and
+/// not for the raster unit. The kernel reads it at every flow-control
+/// attach, which a GL client's make-current runs, so a raster wait there
+/// stalls the processor for the drawing of each frame.
+///
+/// Every other waiting read keeps both waits: the datasheet does not
+/// settle what they need.
+pub fn read_waits_for_raster(addr: u64, size: u32) -> bool {
+    reg(addr, size) != ODSY_MEMORY_CONFIG as i64
+}
+
 impl Board {
     /// A read with the board lock held.
     pub fn mmio_read(&mut self, addr: u64, size: u32) -> u64 {
         if access_waits(addr, size, false) {
-            // Both queues: the stores before it, and the raster work they
-            // handed on.
+            // The stores before it, and, unless the register holds only
+            // levels and straps, the raster work they handed on.
             if self.work_pending() {
                 self.work_drain(addr);
             }
-            self.raster_wait();
+            if read_waits_for_raster(addr, size) {
+                self.raster_wait();
+            }
         }
         self.read(addr, size)
     }

@@ -122,7 +122,12 @@ must keep them.
    order the front end set them up.
 2. A register read that waits (`access_waits`) drains the command FIFO and
    then the raster queue, so it sees the drawing of every store before it.
-   The registers that do not wait answer from the front at once.
+   The memory word `0x106c` drains only the command FIFO: its fields are
+   straps and FIFO levels, none a drawing result
+   (`read_waits_for_raster`). The kernel reads it at every flow-control
+   attach, which each GL make-current runs; waiting for the raster queue
+   there stalled the processor behind the drawing of each frame. The
+   registers that do not wait answer from the front at once.
 3. STATUS0's empty, low-water and high-water bits follow the words in the
    command FIFO, not the raster queue: they are the board's FIFO.
 4. The low-water flag latches as a store retires below the mark (16 words),

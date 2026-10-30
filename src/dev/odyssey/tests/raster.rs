@@ -73,11 +73,27 @@ fn a_waiting_read_behind_a_queued_draw_sees_it_drawn() {
     assert_eq!(h.read(ODSY_SW_TOKEN, 4), 7);
     assert_eq!(h.raster.pending(), 1, "the token does not wait for the drawing");
 
-    h.read(MEMORY_CONFIG, 4);
+    h.read(ODSY_BUZZ_1, 4);
     assert_eq!(h.raster.pending(), 0);
     let s = h.board.lock();
     assert_ne!(pixel(&s, 0, 10, 10), 0, "drawn before the read answered");
     drop(s);
+    h.raster.stop();
+}
+
+/// The memory word at `0x106c` holds straps and FIFO levels, none of them
+/// a drawing result, so a read of it answers while a draw is still queued
+/// for the raster unit. It still runs the command stores before it
+/// (`a_read_of_a_register_the_work_may_change_finishes_the_work_first`).
+#[test]
+fn the_memory_word_answers_while_a_draw_is_queued() {
+    let (h, st) = slow_raster(300);
+
+    red_triangle(&mut h.board.lock(), &st);
+    assert_eq!(h.raster.pending(), 1, "the draw waits for the raster unit");
+    assert_eq!(h.read(MEMORY_CONFIG, 4) & 0xff00_0000, 0xa100_0000);
+    assert_eq!(h.raster.pending(), 1, "the memory word does not wait for the drawing");
+    eventually("the draw did not finish", || h.raster.pending() == 0);
     h.raster.stop();
 }
 
