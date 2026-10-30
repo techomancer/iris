@@ -13,12 +13,18 @@ mod tests {
     // Mock Memory Interface
     pub struct MockMemory {
         pub data: Mutex<HashMap<u64, u8>>,
+        /// `write8`/`write16` calls as (width, address, value).
+        pub narrow_writes: Mutex<Vec<(usize, u64, u64)>>,
+        /// `write_narrow_from` calls as (width, address, source register).
+        pub narrow_from_writes: Mutex<Vec<(usize, u64, u64)>>,
     }
 
     impl MockMemory {
         pub fn new() -> Self {
             Self {
                 data: Mutex::new(HashMap::new()),
+                narrow_writes: Mutex::new(Vec::new()),
+                narrow_from_writes: Mutex::new(Vec::new()),
             }
         }
 
@@ -67,6 +73,7 @@ mod tests {
         }
 
         fn write8(&self, addr: u64, val: u8) -> u32 {
+            self.narrow_writes.lock().unwrap().push((1, addr, val as u64));
             self.set_byte(addr as u64, val);
             BUS_OK
         }
@@ -82,6 +89,7 @@ mod tests {
 
         fn write16(&self, addr: u64, val: u16) -> u32 {
             let aligned_addr = (addr & !1) as u64;
+            self.narrow_writes.lock().unwrap().push((2, aligned_addr, val as u64));
             let bytes = val.to_be_bytes();
             for i in 0..2 {
                 self.set_byte(aligned_addr + i as u64, bytes[i]);
@@ -109,6 +117,12 @@ mod tests {
             let aligned_addr = (addr & !7) as u64;
             self.set_double(aligned_addr, val);
             BUS_OK
+        }
+
+        fn write_narrow_from(&self, addr: u64, size: usize, gpr: u64) -> u32 {
+            self.narrow_from_writes.lock().unwrap().push((size, addr, gpr));
+            // Same architectural bytes as the default.
+            if size == 1 { self.write8(addr, gpr as u8) } else { self.write16(addr, gpr as u16) }
         }
 
         // This whole file predates jitv2 and no test here calls
@@ -573,6 +587,132 @@ mod tests {
         assert_eq!(exec.exec(instr), EXEC_COMPLETE);
         assert_eq!(mem.get_byte(0x100A), 0xBE);
         assert_eq!(mem.get_byte(0x100B), 0xEF);
+    }
+
+    /// Fuel PROM memory diagnostics need the whole source register on the ECC
+    /// view, so every CPU hands an uncached SB or SH to
+    /// `BusDevice::write_narrow_from` with it. The default of that call stores
+    /// the architectural byte or halfword, which is all an ordinary device
+    /// sees, and the addressed lanes hold it either way.
+    #[test]
+    fn uncached_sb_sh_carry_the_whole_source_register() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus,
+                PassthroughTlb::default(),
+                &cfg,
+            );
+            disable_jitv2(&mut exec);
+
+            let base = 0x2000u64;
+            let source = 0xFEDC_BA98_7654_3210u64;
+            let original = 0xAABB_CCDD_EEFF_0011u64;
+            exec.core.write_gpr(2, base);
+            exec.core.write_gpr(1, source);
+
+            for (size, op, offsets) in [(1usize, OP_SB, vec![0u64, 1, 2, 3, 4, 5, 6, 7]),
+                                        (2usize, OP_SH, vec![0u64, 2, 4, 6])] {
+                for offset in offsets {
+                    mem.set_double(base, original);
+                    mem.narrow_writes.lock().unwrap().clear();
+                    mem.narrow_from_writes.lock().unwrap().clear();
+                    let instr = make_i(op, 2, 1, offset as u16);
+                    assert_eq!(exec.exec(instr), EXEC_COMPLETE);
+
+                    let addr = base + offset;
+                    assert_eq!(
+                        *mem.narrow_from_writes.lock().unwrap(),
+                        vec![(size, addr, source)],
+                        "SB/SH source register at byte offset {offset}",
+                    );
+
+                    let first = if size == 1 { source as u8 } else { (source as u16 >> 8) as u8 };
+                    let last = if size == 1 { first } else { source as u8 };
+                    assert_eq!(mem.get_byte(addr), first, "stored leading byte at offset {offset}");
+                    if size == 2 {
+                        assert_eq!(mem.get_byte(addr + 1), last, "stored trailing byte at offset {offset}");
+                    }
+                    let original_bytes = original.to_be_bytes();
+                    for lane in 0..8u64 {
+                        if lane < offset || lane >= offset + size as u64 {
+                            assert_eq!(mem.get_byte(base + lane), original_bytes[lane as usize],
+                                "inactive byte lane {lane} at subword offset {offset}");
+                        }
+                    }
+                }
+            }
+
+            // A zero source register still takes the same path and clears
+            // only the addressed lanes.
+            exec.core.write_gpr(0, u64::MAX);
+            mem.set_double(base, original);
+            mem.narrow_from_writes.lock().unwrap().clear();
+            exec.core.write_gpr(2, base + 7);
+            assert_eq!(exec.exec(make_i(OP_SB, 2, 0, 0)), EXEC_COMPLETE);
+            assert_eq!(mem.get_byte(base + 7), 0);
+            assert_eq!(mem.narrow_from_writes.lock().unwrap().len(), 1);
+
+            mem.set_double(base, original);
+            exec.core.write_gpr(2, base + 6);
+            assert_eq!(exec.exec(make_i(OP_SH, 2, 0, 0)), EXEC_COMPLETE);
+            assert_eq!(mem.get_byte(base + 6), 0);
+            assert_eq!(mem.get_byte(base + 7), 0);
+            assert_eq!(mem.narrow_from_writes.lock().unwrap().len(), 2);
+
+            mem.narrow_writes.lock().unwrap().clear();
+            mem.narrow_from_writes.lock().unwrap().clear();
+            assert_eq!(exec.debug_write(base + 1, source, 1, u64::MAX), EXEC_COMPLETE);
+            assert_eq!(*mem.narrow_writes.lock().unwrap(), vec![(1, base + 1, source as u8 as u64)]);
+            assert!(mem.narrow_from_writes.lock().unwrap().is_empty(), "debug writes keep the ordinary-width path");
+        }
+
+        check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>();
+    }
+
+    /// JIT store callouts carry the same source register as the interpreter.
+    #[test]
+    #[cfg(feature = "jitv2")]
+    fn jit_subword_hooks_carry_the_source_register() {
+        fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
+            let mem = Arc::new(MockMemory::new());
+            let bus: Arc<dyn BusDevice> = mem.clone();
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(
+                bus,
+                PassthroughTlb::default(),
+                &cfg,
+            );
+            disable_jitv2(&mut exec);
+            exec.install_jit_hooks();
+
+            let base = 0x2000u64;
+            let source = 0xFEDC_BA98_7654_3210u64;
+            let write8 = exec.core.write8_fn;
+            let write16 = exec.core.write16_fn;
+            let core = &mut exec.core as *mut crate::cpu::mips_core::MipsCore;
+            // JIT callouts receive the core pointer biased by the shared
+            // ABI constant; core_from_arg removes this before recovery.
+            let ctx = core.cast::<u8>()
+                .wrapping_add(crate::cpu::jitv2::codegen::CALLOUT_CORE_BIAS as usize)
+                .cast();
+            unsafe {
+                write8(ctx, base, source);
+                write16(ctx, base + 2, source);
+            }
+            assert_eq!(
+                *mem.narrow_from_writes.lock().unwrap(),
+                vec![(1, base, source), (2, base + 2, source)],
+            );
+        }
+
+        check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>();
+        check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>();
     }
 
     #[test]
