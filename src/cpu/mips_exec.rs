@@ -2213,6 +2213,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         core.entryhi_mask = model_entryhi_mask::<C>();
         if C::R10K_FAMILY {
             core.framemask_mask = 0xFFFF;
+            // PFN in bits 33:6 and the uncached attribute in 63:62 (R10000 UM
+            // p. 214); 61:34 are reserved.
+            core.entrylo_mask = 0xC000_0003_FFFF_FFFF;
         }
 
         // Cache geometry comes from the model type C, so Config describes this CPU.

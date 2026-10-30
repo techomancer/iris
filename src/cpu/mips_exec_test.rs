@@ -3787,6 +3787,42 @@ mod tests {
         });
     }
 
+    /// On the R10000 family EntryLo holds a 28-bit PFN (33:6) and the uncached
+    /// attribute in 63:62 (R10000 UM p. 214); the R4400 and R5000 keep a
+    /// 24-bit PFN and nothing above it. The TLB carries the whole PFN.
+    #[test]
+    fn entrylo_covers_the_pfn_and_attribute_bits_of_the_r10000_family() {
+        fn readback<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, u64::MAX);
+            // DMTC0 $1, EntryLo0 and EntryLo1; both read back the same field.
+            for reg in [2u32, 3] {
+                assert_eq!(exec.exec((0x10 << 26) | (5 << 21) | (1 << 16) | (reg << 11)), EXEC_COMPLETE);
+            }
+            let (lo0, lo1) = (exec.core.read_cp0(2), exec.core.read_cp0(3));
+            assert_eq!(lo0, lo1);
+            lo0
+        }
+        assert_eq!(readback::<R4400Cache>(), 0x3FFF_FFFF);
+        // Bits 61:34 are not PFN: they read back as zero, so only 33:32 reach physical 39:38.
+        assert_eq!(readback::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(), 0xC000_0003_FFFF_FFFF);
+
+        // The TLB carries the whole PFN: bits 33:32 are physical 39:38, and FrameMask
+        // is what keeps software flags there out of the address.
+        on_big_stack(|| {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000);
+            assert_eq!(exec.debug_translate(VA).phys, 0xC0_2054_C000);
+            // FrameMask 0xC000 is EntryLo 33:32: the page lands where its PFN says.
+            let mut exec = map_page_masked::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000, 0xC000);
+            assert_eq!(exec.debug_translate(VA).phys, 0x2054_C000);
+        });
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.

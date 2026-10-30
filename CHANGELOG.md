@@ -23,6 +23,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   names, 33:18, on every TLB write, so a kernel that keeps software flags there
   gets the physical address it meant. The register read as zero and ignored
   writes before. The R4400 and R5000 have none.
+- **EntryLo** on the R10000 keeps its 28-bit PFN (bits 33:6, a 40-bit physical
+  address) and the uncached attribute in 63:62; it kept 30 bits before. The
+  attribute is stored and read back, not sent to the bus.
 
 ### `IRIS_GUI_GL` works in iris-gui
 

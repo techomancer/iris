@@ -573,8 +573,9 @@ impl OctaneMachine {
         // IRIX zeroes Count and arms Compare a few instructions later; see
         // `MipsCore::count_write_samples`.
         exec.core.count_write_samples = true;
-        // The R10000 drives 40 physical address bits; HEART decodes them
-        // all, and the attribute bits above fold away.
+        // The R10000 drives 40 physical address bits; HEART decodes them all.
+        // EntryLo bits 33:32 are physical 39:38; a guest that keeps software
+        // flags there clears them with FrameMask, so no narrowing is needed.
         exec.phys_mask = (1 << 40) - 1;
         exec.core.cpu_id = id;
         exec.core.smp = cpu_count > 1;
