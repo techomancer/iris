@@ -2662,6 +2662,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
                 // set) -- the property a persistent code cache needs.
                 // Several CPUs share compiled code, so no one core's address.
                 core: if self.core.smp || std::env::var_os("IRIS_JIT_PIC").is_some() { None } else { core::num::NonZeroUsize::new(core_addr) },
+                lwr_keeps_upper: C::PARTIAL_LWR_KEEPS_UPPER,
             };
             *j.jit_consts.lock() = consts;
             // The inline-compile path (`jitv2_compile_inline`) takes this
@@ -3269,6 +3270,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     pub fn update_translate_fn(&mut self) {
         use crate::cpu::mips_core::PrivilegeMode;
         let is_64bit = self.core.is_64bit_mode();
+        self.core.lwr_upper_below = if C::PARTIAL_LWR_KEEPS_UPPER && is_64bit { 3 } else { 0 };
         let privilege = self.core.get_privilege_mode();
         self.translate_fn = match (is_64bit, privilege) {
             (false, PrivilegeMode::Kernel)     => translate_32_kernel::<T, C>,
@@ -6441,8 +6443,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 let mask = 0xFFFFFFFFu32 >> shift;
                 let result = (mem_word >> shift) | (rt_val & !mask);
 
-                // Sign-extend to 64 bits
-                self.core.write_gpr(rt_reg, result as i32 as i64 as u64);
+                // The manual leaves the upper word of a partial LWR
+                // implementation specific (NEC U12754E pp. 125-126); the R10000
+                // keeps bits 63:32. A full word, or any word with 64-bit
+                // operations off, sign-extends. `lwr_upper_below` folds both.
+                let value = if C::PARTIAL_LWR_KEEPS_UPPER && (byte_offset as u8) < self.core.lwr_upper_below {
+                    (self.core.read_gpr(rt_reg) & 0xffff_ffff_0000_0000) | result as u64
+                } else {
+                    // Sign-extend to 64 bits
+                    result as i32 as i64 as u64
+                };
+                self.core.write_gpr(rt_reg, value);
                 self.handle_exec_complete()
             }
             Err(status) => self.finish_status(status)

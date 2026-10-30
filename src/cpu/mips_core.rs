@@ -901,6 +901,7 @@ pub struct MipsCore {
     /// expected value, and whether an SC is to the same word.
     pub ll_value: u64,
     pub ll_phys: u64,
+    pub lwr_upper_below: u8,  // A partial LWR keeps the upper word at offsets below this: 3 in 64-bit mode on the R10000 family, else 0
 
     // Execution state
     pub running: bool,
@@ -1403,6 +1404,7 @@ impl MipsCore {
             cp0_badvaddr: 0,
             cp0_entryhi: 0,
             cp0_status: 0,
+            lwr_upper_below: 0,
             cp0_cause: 0,
             cp0_epc: 0,
             cp0_prid: 0,
