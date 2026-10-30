@@ -268,8 +268,12 @@ impl OctaneMachine {
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
-        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
-        let vpro = if has_vpro { Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone())?) } else { None };
+        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat.clone(), fasttick.clone()));
+        let vpro = if has_vpro {
+            Some(Odyssey::new(WIDGET_GFX, kind.as_str(), heart.clone(), mem.clone(), heartbeat.clone(), fasttick.clone())?)
+        } else {
+            None
+        };
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());
@@ -460,6 +464,9 @@ impl OctaneMachine {
         }
         if let Some(v) = &vpro {
             v.set_cpu_cycles(cpu.cycles_ptr());
+            for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
+                v.add_cpu_stats(c.cycles_ptr(), tick.clone());
+            }
         }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));

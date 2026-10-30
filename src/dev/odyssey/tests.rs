@@ -378,7 +378,7 @@ mod widget {
     fn board() -> (Arc<Heart>, Arc<Odyssey>) {
         let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
         let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
-        let v = Odyssey::new(WIDGET, "v12", heart.clone(), ram.dma_view()).expect("board");
+        let v = Odyssey::new(WIDGET, "v12", heart.clone(), ram.dma_view(), Default::default(), Default::default()).expect("board");
         (heart, v)
     }
 
