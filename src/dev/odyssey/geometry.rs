@@ -29,10 +29,14 @@ impl Board {
     /// (an assembled lit list); otherwise only the texgen and clip-plane stages
     /// are picked out (a precompiled program's list, which its entries already
     /// identify, so the result is not needed). False when the terminator is not
-    /// reached or, when strict, a word is not recognised.
-    pub fn gl_walk_list(&mut self, k: u32, strict: bool, p: &mut Program) -> bool {
+    /// reached or, when strict, a word is not recognised. With `older` the
+    /// list is in the older libraries' numbering (see `ucode_current`).
+    pub fn gl_walk_list(&mut self, k: u32, strict: bool, older: bool, p: &mut Program) -> bool {
         let nc = SGI_ODYSSEY_GL_CONSTANTS;
-        let at = |s: &Board, i: u32| -> u32 { s.gl_const[(k.wrapping_add(i) % nc) as usize] };
+        let at = |s: &Board, i: u32| -> u32 {
+            let a = s.gl_const[(k.wrapping_add(i) % nc) as usize];
+            if older { ucode_current(a) } else { a }
+        };
         let mut n: u32 = 0;
         while n < ODSY_PROG_LIST_MAX {
             let a = at(self, n);
@@ -258,6 +262,60 @@ pub fn gl_resident(e: &[u32; 3]) -> bool {
     !e.iter().any(|&w| prog_in_window(w))
 }
 
+/// A routine number of the older libraries' numbering in the current one.
+/// The older libraries run a program image without the spot routine, so
+/// they number every routine from where it starts 99 lower; a number at or
+/// past that point moves up past the routine, and none lands inside it.
+fn ucode_current(a: u32) -> u32 {
+    if a >= ODSY_UCODE_SPOT_FIRST { a + ODSY_UCODE_SPOT_RECORDS } else { a }
+}
+
+impl Board {
+    /// Recognise a resident program from its three entries and the list at
+    /// `k`, all in the current numbering or, with `older`, all in the older
+    /// libraries'. An entry past the older image's end is no entry of it, so
+    /// nothing is recognised.
+    fn gl_resident_program(&mut self, raw: [u32; 3], k: u32, older: bool, p: &mut Program) {
+        let mut r = raw;
+        if older {
+            if raw.iter().any(|&a| a >= ODSY_UCODE_OLDER_RECORDS) {
+                return;
+            }
+            r = raw.map(ucode_current);
+        }
+        if r == [0, 0, 0] {
+            p.known = true;
+        } else if r == [ODSY_UCODE_UNLIT, ODSY_UCODE_UNLIT_2A, ODSY_UCODE_UNLIT_2C]
+            || r == [ODSY_UCODE_UNLIT_CLIP, ODSY_UCODE_UNLIT_CLIP_2A, ODSY_UCODE_UNLIT_CLIP_2C]
+        {
+            self.gl_walk_list(k, false, older, p);
+            p.known = true;
+        } else if gl_lit_record(&r) {
+            self.gl_walk_list(k, false, older, p);
+            p.known = true;
+            p.lit = true;
+            p.normalize |= UCODE_NORMALIZE_RECORDS.contains(&r);
+        } else if r[1] == ODSY_UCODE_END && r[2] == ODSY_UCODE_END {
+            match r[0] {
+                ODSY_UCODE_HEAD_LOCAL_DIR | ODSY_UCODE_HEAD_LOCAL_POS => {
+                    p.local_viewer = true;
+                    p.known = self.gl_walk_list(k, true, older, p);
+                    p.lit = true;
+                }
+                ODSY_UCODE_HEAD_INF_DIR | ODSY_UCODE_HEAD_INF_POS => {
+                    p.known = self.gl_walk_list(k, true, older, p);
+                    p.lit = true;
+                }
+                ODSY_UCODE_HEAD_UNLIT => {
+                    // Lighting off: unlit is the correct rendering, not a guess.
+                    p.known = self.gl_walk_list(k, true, older, p);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Board {
     /// Recognise the program the library just set (on every 0x2c write, the last
     /// word of each program set). APPROXIMATION, see
@@ -271,6 +329,13 @@ impl Board {
     /// enabled lights onto the list is unknown. All-zero entries are the state
     /// the GL library's context default-state setup pushes before any program
     /// exists.
+    ///
+    /// A resident program the current numbering does not recognise is tried
+    /// again in the older libraries' (`ODSY_UCODE_SPOT_FIRST`). APPROXIMATION:
+    /// the model does not know which library or program image the guest runs,
+    /// so a program is taken in the older numbering only when it means nothing
+    /// in the current one. Window records are matched by the current bodies'
+    /// fingerprints only; the older libraries' window uploads are not.
     pub fn gl_program(&mut self) {
         let r: [u32; 3] = [self.gl_entry[ODSY_ENTRY_29], self.gl_entry[ODSY_ENTRY_2A], self.gl_entry[ODSY_ENTRY_2C]];
         let (e29, e2a, e2c) = (r[0], r[1], r[2]);
@@ -281,43 +346,19 @@ impl Board {
 
         if let Some(window) = window {
             // A precompiled lit record the library ran from the window.
-            self.gl_walk_list(k, false, &mut p);
+            self.gl_walk_list(k, false, false, &mut p);
             p.known = true;
             p.lit = true;
             p.local_viewer = window.local_viewer;
             p.two_sided |= window.two_sided;
-        } else if !resident {
-            // Any other uploaded program is unsupported and reported below.
-        } else if r[0] == 0 && r[1] == 0 && r[2] == 0 {
-            p.known = true;
-        } else if r == [ODSY_UCODE_UNLIT, ODSY_UCODE_UNLIT_2A, ODSY_UCODE_UNLIT_2C]
-            || r == [ODSY_UCODE_UNLIT_CLIP, ODSY_UCODE_UNLIT_CLIP_2A, ODSY_UCODE_UNLIT_CLIP_2C]
-        {
-            self.gl_walk_list(k, false, &mut p);
-            p.known = true;
-        } else if gl_lit_record(&r) {
-            self.gl_walk_list(k, false, &mut p);
-            p.known = true;
-            p.lit = true;
-            p.normalize |= UCODE_NORMALIZE_RECORDS.contains(&r);
-        } else if r[1] == ODSY_UCODE_END && r[2] == ODSY_UCODE_END {
-            match r[0] {
-                ODSY_UCODE_HEAD_LOCAL_DIR | ODSY_UCODE_HEAD_LOCAL_POS => {
-                    p.local_viewer = true;
-                    p.known = self.gl_walk_list(k, true, &mut p);
-                    p.lit = true;
-                }
-                ODSY_UCODE_HEAD_INF_DIR | ODSY_UCODE_HEAD_INF_POS => {
-                    p.known = self.gl_walk_list(k, true, &mut p);
-                    p.lit = true;
-                }
-                ODSY_UCODE_HEAD_UNLIT => {
-                    // Lighting off: unlit is the correct rendering, not a guess.
-                    p.known = self.gl_walk_list(k, true, &mut p);
-                }
-                _ => {}
+        } else if resident {
+            self.gl_resident_program(r, k, false, &mut p);
+            if !p.known {
+                p = Program::default();
+                self.gl_resident_program(r, k, true, &mut p);
             }
         }
+        // Any other uploaded program is unsupported and reported below.
 
         if !p.known {
             p.lit = false;

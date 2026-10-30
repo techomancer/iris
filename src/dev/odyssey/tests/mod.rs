@@ -25,6 +25,7 @@ mod display;
 mod dma;
 mod fifo;
 mod interrupts;
+mod program;
 mod raster;
 mod registers;
 
