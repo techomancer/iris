@@ -6492,4 +6492,79 @@ mod tests {
         }
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
     }
+
+    type TlbExec<C> = Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>>;
+
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 << 20).spawn(f).unwrap().join().unwrap(); // MipsTlb is large
+    }
+
+    /// A 64-bit kernel executor with a TLB, over `bus`.
+    fn tlb_exec<C: CpuModel + From<Arc<dyn BusDevice>>>(bus: Arc<dyn BusDevice>) -> TlbExec<C> {
+        let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+        let mut exec = Box::new(MipsExecutor::new(bus, crate::cpu::mips_tlb::MipsTlb::new(C::TLB_ENTRIES), &cfg));
+        disable_jitv2(&mut exec);
+        exec.install_status_cb();
+        exec.set_cp0_status((exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX);
+        exec
+    }
+
+    /// Write CP0 registers `regs` (register, value), then run the TLB op `funct`.
+    fn tlb_op<C: CpuModel>(exec: &mut TlbExec<C>, regs: &[(u32, u64)], funct: u32) {
+        for &(rd, value) in regs {
+            exec.core.write_gpr(1, value);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+        }
+        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
+    }
+
+    /// EntryHi and the TLB keep VPN2 bits 43:40, which the R4400's 40-bit
+    /// address space lacks. Fix: R10000 address widths.
+    #[test]
+    fn cp0_entryhi_and_tlb_match_full_xuseg_va() {
+        on_big_stack(|| {
+            const VA: u64 = 0x0000_0123_4000_0000;
+            fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(full_va: bool) {
+                let mem = Arc::new(MockMemory::new());
+                mem.set_word(0x5_0000, 0xdead_beef);
+                let mut exec = tlb_exec::<C>(mem);
+                let lo0 = ((0x5_0000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                tlb_op(&mut exec, &[(10, VA), (0, 0), (5, 0), (2, lo0), (3, 0)], FUNCT_TLBWI);
+                let result = exec.read_data::<4>(VA);
+                if full_va {
+                    assert_eq!((exec.core.cp0_entryhi, result), (VA, Ok(0xdead_beef)));
+                } else {
+                    assert_eq!((result.unwrap_err() >> 2) & 0x1f, EXC_ADEL);
+                }
+            }
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        });
+    }
+
+    /// An R10000 TLB write clears the EntryLo bits FrameMask names (R10000 UM
+    /// v2.0 p. 260) and the PFN bits a 16 KB page leaves out (pp. 299-300), and
+    /// keeps the wider PFN and attribute; the R4400 has no FrameMask.
+    /// Fix: FrameMask, the wider EntryLo, TLBR's page-size masking.
+    #[test]
+    fn tlb_write_applies_framemask_and_page_size_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R10000ShadowCache};
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(framemask: u64) -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let lo0 = (0xC0_0300_4000u64 >> 12 << 6) | 0xC0 | (3 << 3) | (1 << 2) | (1 << 1) | (3 << 62);
+            let mut exec = tlb_exec::<C>(Arc::new(MockMemory::new()));
+            tlb_op(&mut exec, &[(10, VA), (0, 0), (5, 0x6000), (21, framemask), (2, lo0), (3, 0)], FUNCT_TLBWI);
+            let phys = exec.debug_translate(VA).phys;
+            tlb_op(&mut exec, &[(10, VA), (2, 0)], FUNCT_TLBP);
+            tlb_op(&mut exec, &[], FUNCT_TLBR);
+            (exec.core.read_cp0(21), phys, exec.core.read_cp0(2))
+        }
+        on_big_stack(|| {
+            let lo = (0xC0_0300_4000u64 >> 12 << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            // FrameMask 0xC000 is EntryLo 33:32; higher bits of the write are ignored.
+            assert_eq!(entry::<R10000ShadowCache>(0xFFFF_C000), (0xC000, 0x0300_4000, (3 << 62) | (lo & !(3 << 32))));
+            assert_eq!(entry::<R10000ShadowCache>(0), (0, 0xC0_0300_4000, (3 << 62) | lo));
+            assert_eq!(entry::<R4400ShadowCache>(0xFFFF_C000), (0, 0x0300_4000, (lo & 0x3FFF_FFFF) | 0xC0));
+        });
+    }
 }
