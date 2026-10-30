@@ -577,17 +577,23 @@ pub const TR_GLOBAL: u32 = 1 << 4;
 /// the privilege epoch that filled it. The only thing rejected here is a VA
 /// shape that is not a valid address in the first place.
 #[inline]
-fn nutlb_cacheable_segment(va: u64, is_64bit: bool) -> bool {
+fn nutlb_cacheable_segment<C: CpuModel>(va: u64, is_64bit: bool) -> bool {
     if !is_64bit {
         // Every 32-bit segment (kuseg/kseg0/kseg1/ksseg/kseg3) is a real
         // address whose finished translation is worth caching.
         return true;
     }
-    // xuseg: bits 63:40 must be zero to be a valid user address. Every other
-    // 64-bit segment (xsseg, xkphys, xkseg and the 0xFFFFFFFF_* compat
-    // windows) is fine — translate_64bit_impl raises before returning ok for
-    // the illegal xkphys sub-ranges, so nothing invalid reaches a fill.
-    (va >> 62) != 0 || (va >> 40) == 0
+    // xuseg: bits 63:`C::VA_BITS` must be zero to be a valid user address.
+    // Every other 64-bit segment (xsseg, xkphys, xkseg and the 0xFFFFFFFF_*
+    // compat windows) is fine — translate_64bit_impl raises before returning ok
+    // for the illegal xkphys sub-ranges, so nothing invalid reaches a fill.
+    (va >> 62) != 0 || (va >> C::VA_BITS) == 0
+}
+
+/// The EntryHi bits this model keeps: region, VPN2 up to `C::VA_BITS` and ASID.
+#[inline(always)]
+const fn model_entryhi_mask<C: CpuModel>() -> u64 {
+    0xC000_0000_0000_00FF | crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS)
 }
 
 /// Per-access-class tally of how far a guest load/store would get through the
@@ -2202,7 +2208,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         let mut core = MipsCore::new();
         // Mapped pages decode their C field with this model's table, as KSEG0
         // and xkphys do.
+        tlb.set_va_bits(C::VA_BITS);
         tlb.set_cache_attrs(Self::cache_attr_table());
+        core.entryhi_mask = model_entryhi_mask::<C>();
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
@@ -2873,7 +2881,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // user address. Everything else is cacheable regardless of which
         // mode filled it, because privilege is enforced by flushing on
         // transition rather than by the tag.
-        if !nutlb_cacheable_segment(va, self.core.is_64bit_mode()) {
+        if !nutlb_cacheable_segment::<C>(va, self.core.is_64bit_mode()) {
             return;
         }
 
@@ -4518,11 +4526,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let top_bits = virt_addr >> 62;
 
         match top_bits {
-            // xuseg: 0x0000_0000_0000_0000 - 0x0000_00FF_FFFF_FFFF (user mapped)
-            // Accessible from all privilege levels
+            // xuseg is user-mapped below 2^C::VA_BITS (0x0000_00FF_FFFF_FFFF
+            // for the 40-bit models) and accessible from every privilege level.
             0 => {
-                if (virt_addr >> 40) != 0 {
-                    // Bits 63:40 must be zero for valid user address
+                if (virt_addr >> C::VA_BITS) != 0 {
+                    // Bits above the model's implemented user VA must be zero
                     if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                     return TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }));
                 }
@@ -4673,8 +4681,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn update_tlb_exception_registers<const XTLB: u8>(&mut self, virt_addr: u64) {
         const EH_VPN2_32: u64 = 0x0000_0000_FFFF_E000;
-        const EH_VPN2_64: u64 = 0x0000_00FF_FFFF_E000;
         const EH_REGION:  u64 = 0xC000_0000_0000_0000;
+        // VPN2 is bits 43:13 on the R10000 family (R10000 UM pp. 219, 288) and
+        // 39:13 on the R4x00 and R5000. The R12000 is inferred to match (its
+        // manual lists no TLB change); the R14000 and R16000 are a model choice
+        // that follows the same width.
+        let eh_vpn2_64 = crate::cpu::mips_tlb::vpn2_mask(C::VA_BITS);
 
         self.core.cp0_badvaddr = virt_addr;
 
@@ -4697,9 +4709,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         //
         // This is MAME r4000's `EH_WM` (0xC000_00FF_FFFF_E0FF) less the ASID
         // bits, which are carried separately below.
-        const EH_VPN_MASK: u64 = EH_REGION | EH_VPN2_64; // 0xC000_00FF_FFFF_E000
+        let eh_vpn_mask = EH_REGION | eh_vpn2_64;
         let asid = self.core.cp0_entryhi & 0xFF;
-        self.core.cp0_entryhi = (virt_addr & EH_VPN_MASK) | asid;
+        self.core.cp0_entryhi = (virt_addr & eh_vpn_mask) | asid;
 
         // Context: PTEBase[63:23] preserved, BadVPN2 = virt_addr[31:13] in bits [22:4].
         // Always 32-bit VPN — Context is used by the 32-bit UTLB handler.
@@ -4720,10 +4732,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // the address it computes lands outside the page table it wired, the
         // nested miss is unrecoverable, and IRIX panics with "Entered tlbmiss
         // with invalid vaddr".
-        //
-        // EntryHi keeps the 40-bit VPN2 field on every model: a 64-bit kernel
-        // zero-fills those upper bits itself when it builds an EntryHi value,
-        // and widening the mask here breaks it.
         self.core.cp0_xcontext =
             xcontext_on_miss(C::VA_BITS, self.core.cp0_xcontext, virt_addr);
     }
@@ -7129,12 +7137,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let g1 = (self.core.cp0_entrylo1 & 1) != 0;
         let g_combined = if g0 && g1 { 1u64 << 12 } else { 0 };
 
-        // EH_WM = 0xC000_00FF_FFFF_E0FF — same mask MAME applies on TLBWI (clears reserved bits).
-        // Then clear bit 12 (G bit from EntryHi) and set combined G from Lo0&Lo1.
-        const EH_WM: u64 = 0xC000_00FF_FFFF_E0FF;
+        // EntryHi's writable mask (0xC000_00FF_FFFF_E0FF on a 40-bit model, MAME's
+        // `EH_WM`) clears reserved bits, as on TLBWI. Then clear bit 12 (G bit
+        // from EntryHi) and set combined G from Lo0&Lo1.
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
-            entry_hi: (self.core.cp0_entryhi & EH_WM & !0x1000) | g_combined,
+            entry_hi: (self.core.cp0_entryhi & self.core.entryhi_mask & !0x1000) | g_combined,
             entry_lo: [self.core.cp0_entrylo0, self.core.cp0_entrylo1],
             selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
             vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
