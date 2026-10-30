@@ -70,6 +70,10 @@ pub const REVISION: u8 = 0x01;
 /// PCI subsystem id of the Octane's system board.
 pub const SUBSYS_IP30_SYSBOARD: u16 = 0xc304;
 pub const BAR_SIZE: u32 = 1 << 20;
+/// The configuration dwords the chip decodes; the rest of the 16 repeat them.
+const CONFIG_DECODED_DWORDS: usize = 8;
+/// PCI status bit 7, fast back-to-back capable.
+const PCI_STATUS_FAST_BACK: u32 = 0x0080;
 
 /// Register offsets within the BAR.
 pub mod reg {
@@ -2620,9 +2624,31 @@ impl Drop for Ioc3 {
     }
 }
 
+impl Ioc3 {
+    /// The header as the chip answers it. The status register reads fast
+    /// back-to-back capable beside the medium decode timing.
+    fn header_dword(&self, index: usize) -> u32 {
+        let v = self.sh.pci.read(index);
+        if index == 1 { v | PCI_STATUS_FAST_BACK << 16 } else { v }
+    }
+}
+
 impl PciBusDevice for Ioc3 {
     fn config(&self) -> &PciConfig {
         &self.sh.pci
+    }
+
+    /// The chip decodes five configuration address bits, so dwords 0x20 to
+    /// 0x3f read as 0x00 to 0x1f: no subsystem dword at 0x2c (the latency
+    /// word shows there) and no interrupt pin at 0x3d. Only the guest's
+    /// view repeats; the bridge still routes INTA from the stored pin, and
+    /// the subsystem id stays the key that picks the board's population.
+    fn config_dword(&self, index: usize) -> u32 {
+        self.header_dword(if (CONFIG_DECODED_DWORDS..2 * CONFIG_DECODED_DWORDS).contains(&index) {
+            index - CONFIG_DECODED_DWORDS
+        } else {
+            index
+        })
     }
 
     /// `off` is where the bridge put the access on the bus; IOC3 undoes the

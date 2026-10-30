@@ -128,6 +128,38 @@ fn identity_and_bar() {
     assert_eq!(cfg.read(4), 0xfff0_0000, "one megabyte of memory space");
 }
 
+/// The reference Octane2's PROM monitor reads the chip's type 0
+/// configuration space as 32 bytes repeated: dwords 0x20-0x3f read 0x00-0x1f,
+/// so the latency word shows at 0x2c where a subsystem id might sit and the
+/// interrupt pin byte at 0x3d reads zero. The firmware's own programming is
+/// replayed (BAR 0 0x500000, latency timer 0x28, command 0x146). The dword at
+/// 0x1c reads the BAR 0 value on that machine for a reason no public source
+/// gives, so it is not asserted.
+///
+/// QEMU: octane2/ioc3-config-repeats.
+#[test]
+fn configuration_space_repeats_its_first_32_bytes() {
+    let r = Rig::new();
+    let cfg = r.c.config();
+    cfg.write(4, 0x0050_0000);
+    cfg.write(3, 0x2800);
+    cfg.write(1, 0x146);
+
+    for (index, want) in [(0, 0x0003_10a9), (1, 0x0280_0146), (2, 0xff00_0001), (3, 0x0000_2800), (4, 0x0050_0000), (5, 0), (6, 0)] {
+        assert_eq!(r.c.config_dword(index), want, "dword {index}");
+    }
+    for index in 8..16 {
+        if index != 15 {
+            assert_eq!(r.c.config_dword(index), r.c.config_dword(index - 8), "dword {index} repeats");
+        }
+    }
+    assert_eq!(r.c.config_dword(11), 0x0000_2800, "the latency word, not a subsystem id");
+    assert_eq!(r.c.config_dword(15) >> 8 & 0xff, 0, "no interrupt pin byte");
+    // The stored header keeps both for the board's wiring.
+    assert_eq!(cfg.read(11), 0xc304_10a9);
+    assert_eq!(cfg.interrupt_pin(), PCI_INTA);
+}
+
 // ---------------------------------------------------------------------------
 // SuperIO window: the two 16550s
 // ---------------------------------------------------------------------------

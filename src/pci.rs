@@ -224,6 +224,13 @@ pub trait PciBusDevice: Send + Sync {
     /// The function's configuration header.
     fn config(&self) -> &PciConfig;
 
+    /// What a configuration read of dword `index` returns to the guest. The
+    /// header as stored, unless the chip decodes fewer address lines than
+    /// the bus gives it (IOC3 repeats its first 32 bytes).
+    fn config_dword(&self, index: usize) -> u32 {
+        self.config().read(index)
+    }
+
     /// A read of `width` bytes (1, 2 or 4) at `off` within BAR `bar`.
     fn bar_read(&self, bar: usize, off: u32, width: usize) -> u32;
 

@@ -1006,7 +1006,7 @@ impl Bridge {
             // empty slots only inside a bus-error guard.
             return None;
         };
-        let dword = dev.config().read((reg >> 2) as usize) as u64;
+        let dword = dev.config_dword((reg >> 2) as usize) as u64;
         Some((dword >> (8 * (reg & 3))) & (u64::MAX >> (64 - 8 * size)))
     }
 
