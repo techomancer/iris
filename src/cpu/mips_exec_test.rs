@@ -3963,6 +3963,62 @@ mod tests {
         });
     }
 
+    /// A mapped uncached page's attribute (EntryLo 63:62, carried to physical
+    /// bits 58:57) reaches the bus on a board that decodes them, and is folded
+    /// away on the Octane (40 bits), Indigo2 and O2 (32), which is what keeps
+    /// those machines unchanged.
+    #[test]
+    fn mapped_uncached_attribute_is_folded_by_the_boards_physical_mask() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use crate::cpu::mips_tlb::MipsTlb;
+                const VA: u64 = 0x4000_0000;
+
+                fn translate<C: CpuModel + From<Arc<dyn BusDevice>>>(
+                    phys_mask: u64, alias: Option<(u64, u64, u64)>, pfn: u64,
+                ) -> u64 {
+                    let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+                    let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+                    let mut exec = Box::new(MipsExecutor::<MipsTlb, C>::new(
+                        bus, MipsTlb::default(), &cfg));
+                    disable_jitv2(&mut exec);
+                    exec.install_status_cb();
+                    let dmtc0 = |exec: &mut Box<MipsExecutor<MipsTlb, C>>, rd: u32, value: u64| {
+                        exec.core.write_gpr(1, value);
+                        let op = (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11);
+                        assert_eq!(exec.exec(op), EXEC_COMPLETE);
+                    };
+                    let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+                    dmtc0(&mut exec, 12, status as u64);
+                    dmtc0(&mut exec, 10, VA);
+                    dmtc0(&mut exec, 0, 0);
+                    dmtc0(&mut exec, 5, 0);
+                    // C=2 (uncached), valid, dirty, attribute 1 in bits 63:62.
+                    dmtc0(&mut exec, 2, (1 << 62) | (pfn << 6) | (2 << 3) | (1 << 2) | (1 << 1));
+                    dmtc0(&mut exec, 3, 0);
+                    assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI), EXEC_COMPLETE);
+                    exec.phys_mask = phys_mask;
+                    exec.phys_alias = alias;
+                    exec.debug_translate(VA).phys
+                }
+
+                type R10K = crate::cpu::mips_cache_shadow::R10000ShadowCache;
+                type R14K = crate::cpu::mips_cache_shadow::R12000ShadowCache;
+                const PA: u64 = 0x0d10_0000;
+                assert_eq!(translate::<R14K>(u64::MAX, None, PA >> 12), (1 << 57) | PA,
+                    "no mask: the attribute reaches the bus");
+                for (name, mask) in [("Octane", (1u64 << 40) - 1), ("Indigo2/O2", u32::MAX as u64)] {
+                    assert_eq!(translate::<R10K>(mask, None, PA >> 12), PA, "{name} folds it away");
+                }
+                assert_eq!(translate::<crate::cpu::mips_cache_v2::R4400Cache>(u64::MAX, None, PA >> 12), PA,
+                    "a model without the attribute never stores it");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.

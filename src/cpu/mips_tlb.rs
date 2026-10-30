@@ -147,6 +147,22 @@ pub enum AccessType {
     Debug = 3,
 }
 
+/// The physical base a TLB entry's EntryLo maps. A model that keeps the
+/// R10000 family's uncached attribute (EntryLo bits 63:62, see
+/// `CpuModel::R10K_FAMILY`) has it carried to physical bits 58:57
+/// for an uncached page, where an unmapped xkphys access carries it; other
+/// models never store those bits. For a mapped reference the R10000 takes the
+/// two-bit uncached attribute from the TLB's uncached-attribute field, loaded
+/// from EntryLo0/1 bits 63:62 (R10000 User's Manual 007-2490-001, uncached attribute).
+///
+/// Whether the page is uncached is the caller's decode of C through the model's
+/// table (`MipsTlb::c_attr`), not another decode here.
+#[inline]
+fn pfn_base(lo: u64, pfn_mask: u64, uncached: bool) -> u64 {
+    let attribute = if uncached { ((lo >> 62) & 3) << 57 } else { 0 };
+    ((lo << 6) & pfn_mask) | attribute
+}
+
 /// TLB Entry structure matching R4000 TLB format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TlbEntry {
@@ -909,6 +925,16 @@ impl Default for MipsTlb {
     }
 }
 
+impl MipsTlb {
+    /// `pfn_base` for both halves of an entry, deciding "uncached" with the
+    /// model's C table.
+    #[inline]
+    fn pfn_bases(&self, lo: &[u64; 2], pfn_mask: u64) -> [u64; 2] {
+        let uncached = |lo: u64| self.c_attr[((lo >> 3) & 7) as usize] == CacheAttr::Uncached;
+        [pfn_base(lo[0], pfn_mask, uncached(lo[0])), pfn_base(lo[1], pfn_mask, uncached(lo[1]))]
+    }
+}
+
 impl Tlb for MipsTlb {
     #[inline]
     fn translate<const IS_64BIT: u8>(&mut self, virt_addr: u64, asid: u8, access_type: AccessType) -> TlbResult {
@@ -1078,10 +1104,7 @@ impl Tlb for MipsTlb {
             entry.vpn_hi64 = entry.entry_hi & entry.vcmp64;
             entry.offset_mask = (1u64 << entry.selector_bit_shift) - 1;
             let pfn_mask = 0xFF_FFFF_FFFF_000 & !entry.offset_mask;
-            entry.pfn_base = [
-                (entry.entry_lo[0] << 6) & pfn_mask,
-                (entry.entry_lo[1] << 6) & pfn_mask,
-            ];
+            entry.pfn_base = self.pfn_bases(&entry.entry_lo, pfn_mask);
             let old_range = Self::vmap_range(&self.entries[index]);
             self.entries[index] = entry;
             self.shadow[index] = ShadowEntry::from_entry(&entry, &self.c_attr);
@@ -1210,6 +1233,10 @@ impl Tlb for MipsTlb {
     fn set_cache_attrs(&mut self, table: [CacheAttr; 8]) {
         self.c_attr = table;
         for i in 0..self.num_entries {
+            // pfn_base carries the attribute for pages the new table decodes
+            // as uncached, so it follows the table.
+            let pfn_mask = 0xFF_FFFF_FFFF_000 & !self.entries[i].offset_mask;
+            self.entries[i].pfn_base = self.pfn_bases(&self.entries[i].entry_lo, pfn_mask);
             self.shadow[i] = ShadowEntry::from_entry(&self.entries[i], &self.c_attr);
         }
     }
@@ -1265,7 +1292,7 @@ impl Tlb for MipsTlb {
                     vcmp64,
                     vpn_hi64: entry_hi & vcmp64,
                     offset_mask,
-                    pfn_base: [(lo[0] << 6) & pfn_mask, (lo[1] << 6) & pfn_mask],
+                    pfn_base: self.pfn_bases(&lo, pfn_mask),
                 };
             }
         }
