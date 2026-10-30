@@ -60,6 +60,8 @@ pub mod vino;
 pub mod virtio;
 pub mod wd33c93a;
 pub mod z85c30;
+pub mod bedrock_md;
+pub mod bedrock_mem;
 pub mod dp83843;
 pub mod ics1890;
 pub mod isp12160;
