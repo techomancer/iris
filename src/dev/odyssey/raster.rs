@@ -285,6 +285,14 @@ pub trait Planes {
         let _ = (window_z, eye_z);
         unreachable!("fog_factor without RasterTarget::fog_factor");
     }
+    /// Plane pixels x0 to x1 (x0 <= x1) of row y as a row loop reaches them,
+    /// with what each access would test made once for the row; None where
+    /// the planes cannot lend the whole row that way, and the loop reaches
+    /// each pixel through these methods instead. Same results either way.
+    fn row(&self, y: i32, x0: i32, x1: i32) -> Option<GlPlaneRow<'_>> {
+        let _ = (y, x0, x1);
+        None
+    }
     /// Pixels px0 to px1 of row py of a filled triangle through the row loop
     /// row (raster_fill.rs), which returns where it stopped. Not for a family
     /// to override: the default body is each implementation's own copy of

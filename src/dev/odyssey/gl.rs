@@ -258,7 +258,109 @@ pub struct GlPlanes<'a> {
     overlay: Rows<'a, u8>,
 }
 
+/// One row of GlPlanes as a row loop reaches it (Planes::row()): the depth
+/// plane's and both colour buffers' words for the row's pixels, and of
+/// GlPixelState::pixel_allowed() only the id test, which is per pixel; the
+/// plane bound and clip rectangles were tested for the whole row. Its
+/// methods take plane coordinates on that row and answer as GlPlanes would.
+pub struct GlPlaneRow<'a> {
+    x0: i32,
+    depth: &'a [std::cell::Cell<u8>],
+    depth_le: bool,
+    colour: [&'a [std::cell::Cell<u8>]; ODSY_BUFFERS as usize],
+    colour_le: [bool; ODSY_BUFFERS as usize],
+    /// Stores reach the planes: not a draw to the id-plane destination.
+    store: bool,
+    /// The id bytes of the row's pixels, or empty with the id test off.
+    did: &'a [u8],
+    id_value: u8,
+    id_mask: u8,
+}
+
+impl GlPlaneRow<'_> {
+    #[inline(always)]
+    fn allowed(&self, i: usize) -> bool {
+        self.did.is_empty() || ((self.did[i] ^ self.id_value) & self.id_mask) == 0
+    }
+}
+
+impl Planes for GlPlaneRow<'_> {
+    #[inline(always)]
+    fn store_rgba(&self, target: ColourTarget, x: i32, _y: i32, colour: &RasterColour) {
+        let i = (x - self.x0) as usize;
+        let c = &colour.component;
+
+        if target < ODSY_BUFFERS && self.store && self.allowed(i) {
+            let word = (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3];
+
+            word_store(self.colour[target as usize], i, self.colour_le[target as usize], word);
+        }
+    }
+
+    #[inline(always)]
+    fn load_rgba(&self, target: ColourTarget, x: i32, _y: i32) -> Option<RasterColour> {
+        if target >= ODSY_BUFFERS {
+            return None;
+        }
+        let word = word_load(self.colour[target as usize], (x - self.x0) as usize, self.colour_le[target as usize]);
+        let mut colour = RasterColour::default();
+        for i in 0..4u32 {
+            colour.component[i as usize] = (word >> (24 - 8 * i)) & 0xff;
+        }
+        Some(colour)
+    }
+
+    #[inline(always)]
+    fn load_depth(&self, x: i32, _y: i32) -> u32 {
+        word_load(self.depth, (x - self.x0) as usize, self.depth_le)
+    }
+
+    #[inline(always)]
+    fn store_depth(&self, x: i32, _y: i32, depth: u32) {
+        let i = (x - self.x0) as usize;
+
+        if self.store && self.allowed(i) {
+            word_store(self.depth, i, self.depth_le, depth & ODSY_DEPTH24_MAX);
+        }
+    }
+}
+
 impl Planes for GlPlanes<'_> {
+    /// The whole row on the screen and inside one kept clip rectangle, and
+    /// in the depth plane and both colour planes; otherwise None, and the
+    /// row loop tests each pixel.
+    fn row(&self, y: i32, x0: i32, x1: i32) -> Option<GlPlaneRow<'_>> {
+        let s = &self.state;
+        let n = (x1 as i64 - x0 as i64 + 1) as usize;
+
+        if x0 < 0 || y < 0 || x1 >= SGI_ODYSSEY_WIDTH as i32 || y >= SGI_ODYSSEY_HEIGHT as i32 || x1 < x0 {
+            return None;
+        }
+        if !s.clip_rect[..s.clip_kept as usize].iter().any(|r| y >= r.y0 && y <= r.y1 && x0 >= r.x0 && x1 <= r.x1) {
+            return None;
+        }
+        let did = if s.id_compare & ODSY_ID_COMPARE_ENABLE != 0 {
+            let at = y as usize * SGI_ODYSSEY_WIDTH as usize + x0 as usize;
+            s.did.get(at..at + n)?
+        } else {
+            &[]
+        };
+        Some(GlPlaneRow {
+            x0,
+            depth: self.depth.plane_words(&s.depth, y, x0, n)?,
+            depth_le: s.depth.is_le(),
+            colour: [
+                self.colour[0].plane_words(&s.colour[0], y, x0, n)?,
+                self.colour[1].plane_words(&s.colour[1], y, x0, n)?,
+            ],
+            colour_le: [s.colour[0].is_le(), s.colour[1].is_le()],
+            store: !s.to_aux,
+            did,
+            id_value: s.id_compare as u8,
+            id_mask: (s.id_compare >> ODSY_ID_COMPARE_MASK_SHIFT) as u8,
+        })
+    }
+
     fn store_colour(&self, target: ColourTarget, x: i32, y: i32, colour: u32) {
         let s = &self.state;
         let mask = (s.write_mask >> ODSY_WRITE_COLOUR_SHIFT) & ODSY_WRITE_COLOUR_MASK;

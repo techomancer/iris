@@ -394,6 +394,42 @@ impl Rows<'_, u8> {
             c.set(b);
         }
     }
+
+    /// The bytes of plane p's pixels x0 to x0 + n - 1 of row y, a 4-byte
+    /// plane, when every one of them is in the plane and these rows; None
+    /// otherwise. A row loop reaches the words through these with the tests
+    /// of plane_load() and plane_store() made once (word_load(),
+    /// word_store()).
+    #[inline]
+    pub fn plane_words(&self, p: &Plane, y: i32, x0: i32, n: usize) -> Option<&[Cell<u8>]> {
+        let x1 = (x0 as i64 + n as i64 - 1) as i32;
+
+        if n == 0 || plane_bpp(p.format) != 4 || !p.contains(x0, y) || !p.contains(x1, y) {
+            return None;
+        }
+        self.get(y as usize, x0 as usize * 4, n * 4)
+    }
+}
+
+/// Word i of a 4-byte plane's row of bytes (Rows::plane_words()), little-endian
+/// when le is set, as Rows::plane_load() reads it.
+#[inline(always)]
+pub fn word_load(bytes: &[Cell<u8>], i: usize, le: bool) -> u32 {
+    let c = &bytes[4 * i..4 * i + 4];
+    let b = [c[0].get(), c[1].get(), c[2].get(), c[3].get()];
+
+    if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
+}
+
+/// Store word i of a 4-byte plane's row of bytes, as Rows::plane_store() does.
+#[inline(always)]
+pub fn word_store(bytes: &[Cell<u8>], i: usize, le: bool, word: u32) {
+    let c = &bytes[4 * i..4 * i + 4];
+    let b = if le { word.to_le_bytes() } else { word.to_be_bytes() };
+
+    for k in 0..4 {
+        c[k].set(b[k]);
+    }
 }
 
 impl BoardMemory {

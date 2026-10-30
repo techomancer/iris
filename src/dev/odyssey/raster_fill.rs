@@ -58,6 +58,9 @@ pub fn raster_set_fill_path(path: RasterFillPath) {
 /// constant where its parameter is, and a read of the state where it is
 /// FILL_DYN.
 pub trait Fill {
+    /// The loop that tests at run time all the state this one names: the
+    /// fallback with the same texturing.
+    type Dyn: Fill;
     /// Fragments are textured through the fixed-point sampler.
     const TEX: bool;
     /// The texture environment and base format, or 0 to read them.
@@ -107,6 +110,7 @@ impl<
         const FOG: u32,
     > Fill for FillMode<TEX, KERNEL, REPEAT, ENV, FORMAT, DEPTH, FUNC, WRITE, SMOOTH, BLEND, FOG>
 {
+    type Dyn = FillMode<TEX, SGI_SOFT_FIXED_ANY, false, 0, 0, FILL_DYN, FILL_DYN, FILL_DYN, FILL_DYN, FILL_DYN, FILL_DYN>;
     const TEX: bool = TEX;
     const ENV: u32 = ENV;
     const FORMAT: u32 = FORMAT;
@@ -151,6 +155,18 @@ impl<
     fn fog(st: &GlDrawState) -> bool {
         if FOG == FILL_DYN { st.fog != 0 } else { FOG != 0 }
     }
+}
+
+/// A row's pixels as the window's clip rectangles and the scissor leave
+/// them (SoftDraw::fill_run()): px0 to px1, the edge values at px0, and
+/// whether a pixel must still test the window's rectangles.
+#[derive(Clone, Copy)]
+pub struct FillRun {
+    pub px0: i32,
+    pub px1: i32,
+    pub e1: i64,
+    pub e2: i64,
+    pub clipped: bool,
 }
 
 impl SoftDraw<'_> {
@@ -222,47 +238,15 @@ impl SoftDraw<'_> {
     }
 
     /// Pixels px0 to px1 of row py of a filled triangle, whose edge values
-    /// for v[2]-v[0] and v[0]-v[1] at px0 are e1 and e2, under state
-    /// SoftDraw::fill_select() or SoftDraw::fixed_span_select() admits, and
-    /// whose varying parts M names, into planes px, which are self.px. A
-    /// textured loop stops at the first fragment the fixed sampler cannot
-    /// take and returns its column, which the caller draws through the
-    /// general loop; otherwise it returns px1 + 1.
+    /// for v[2]-v[0] and v[0]-v[1] at px0 are e1 and e2, as the window's clip
+    /// rectangles and the scissor leave them for the whole row; None where
+    /// they leave none.
     #[allow(clippy::too_many_arguments, reason = "a row loop takes the row as its parts")]
     #[inline(always)]
-    pub fn fill_row<M: Fill, P: Planes + ?Sized>(
-        &self,
-        px: &P,
-        sp: &SoftTexSpan,
-        py: i32,
-        mut px0: i32,
-        mut px1: i32,
-        mut e1: i64,
-        mut e2: i64,
-    ) -> i32 {
-        let rules: &RasterRules = self.rules;
+    pub fn fill_run(&self, sp: &SoftTexSpan, py: i32, mut px0: i32, mut px1: i32, mut e1: i64, mut e2: i64) -> Option<FillRun> {
         let st: &GlDrawState = self.st;
-        let t: &RasterTarget = self.t;
-        let v: &[SoftVertex; 3] = sp.v;
         let y = self.win.oy.wrapping_add(py);
         let mut clipped = self.win.clip.n > 1;
-        let depth_test = M::depth_test(st);
-        let depth_func = M::depth_func(st);
-        let depth_write = depth_test && M::depth_write(st);
-        let fog = M::fog(st);
-        let smooth = M::smooth(sp);
-        let rgba = t.store_rgba;
-        let rgba_read = rgba && self.rgba_read;
-        let store = self.rgba_mask != 0 && self.ntargets != 0;
-        let env = if !M::TEX { 0 } else if M::ENV != 0 { M::ENV } else { st.texture_env_mode };
-        let format = if !M::TEX { 0 } else if M::FORMAT != 0 { M::FORMAT } else { self.fixed_tex().format };
-        // REPLACE leaves none of the colour of these formats' fragments.
-        let keeps = !M::TEX
-            || env != SGI_GL_REPLACE
-            || (format != SGI_GL_RGBA && format != SGI_GL_INTENSITY && format != SGI_GL_LUMINANCE_ALPHA);
-        let end = px1 + 1;
-        let mut frag: SoftFrag = *sp.flat;
-        let mut dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
 
         let mut i = 0u32;
         while clipped && i < fx_min(self.win.clip.n, SGI_CLIP_MAX as u32) {
@@ -281,11 +265,11 @@ impl SoftDraw<'_> {
             let sx1 = st.scissor[0] as i64 + st.scissor[2] as i64 - 1;
 
             if !(py >= st.scissor[1] && (py as i64) < st.scissor[1] as i64 + st.scissor[3] as i64) {
-                return end;
+                return None;
             }
             if sx0 > px0 as i64 {
                 if sx0 > px1 as i64 {
-                    return end;
+                    return None;
                 }
                 e1 = e1.wrapping_add((sx0 - px0 as i64).wrapping_mul(sp.step1));
                 e2 = e2.wrapping_add((sx0 - px0 as i64).wrapping_mul(sp.step2));
@@ -293,6 +277,40 @@ impl SoftDraw<'_> {
             }
             px1 = fx_min(px1 as i64, sx1) as i32;
         }
+        (px0 <= px1).then_some(FillRun { px0, px1, e1, e2, clipped })
+    }
+
+    /// The pixels of run, on row py of a filled triangle, under state
+    /// SoftDraw::fill_select() or SoftDraw::fixed_span_select() admits, and
+    /// whose varying parts M names, into planes px: self.px, or the row of
+    /// them Planes::row() lends. A textured loop stops at the first fragment
+    /// the fixed sampler cannot take and returns its column, which the
+    /// caller draws through the general loop; otherwise it returns end.
+    #[inline(always)]
+    pub fn fill_row<M: Fill, P: Planes + ?Sized>(&self, px: &P, sp: &SoftTexSpan, py: i32, run: FillRun, end: i32) -> i32 {
+        let rules: &RasterRules = self.rules;
+        let st: &GlDrawState = self.st;
+        let t: &RasterTarget = self.t;
+        let v: &[SoftVertex; 3] = sp.v;
+        let y = self.win.oy.wrapping_add(py);
+        let FillRun { px0, px1, mut e1, mut e2, clipped } = run;
+        let depth_test = M::depth_test(st);
+        let depth_func = M::depth_func(st);
+        let depth_write = depth_test && M::depth_write(st);
+        let fog = M::fog(st);
+        let smooth = M::smooth(sp);
+        let rgba = t.store_rgba;
+        let rgba_read = rgba && self.rgba_read;
+        let store = self.rgba_mask != 0 && self.ntargets != 0;
+        let env = if !M::TEX { 0 } else if M::ENV != 0 { M::ENV } else { st.texture_env_mode };
+        let format = if !M::TEX { 0 } else if M::FORMAT != 0 { M::FORMAT } else { self.fixed_tex().format };
+        // REPLACE leaves none of the colour of these formats' fragments.
+        let keeps = !M::TEX
+            || env != SGI_GL_REPLACE
+            || (format != SGI_GL_RGBA && format != SGI_GL_INTENSITY && format != SGI_GL_LUMINANCE_ALPHA);
+        let mut frag: SoftFrag = *sp.flat;
+        let mut dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
+
         // Nothing in an untextured flat colour varies along the row unless it
         // is dithered (SoftDraw::store_rgb()), fogged or blended.
         let uniform = rgba && store && !M::TEX && !smooth && !fog && !self.dither && !rgba_read;
@@ -446,7 +464,11 @@ macro_rules! fill_rows {
     };
 }
 
-/// One specialisation as a function of its own.
+/// One specialisation as a function of its own. It writes through the row
+/// of planes Planes::row() lends, which tests the plane bounds and clip
+/// rectangles once for the row; where the planes cannot lend one, the
+/// fallback with the same texturing draws the row a pixel at a time
+/// through the planes' own methods, which give the same pixels.
 #[allow(clippy::too_many_arguments, reason = "a row loop takes the row as its parts")]
 #[inline(never)]
 fn fill_row_instance<M: Fill, P: Planes + ?Sized>(
@@ -459,7 +481,22 @@ fn fill_row_instance<M: Fill, P: Planes + ?Sized>(
     e1: i64,
     e2: i64,
 ) -> i32 {
-    r.fill_row::<M, P>(px, sp, py, px0, px1, e1, e2)
+    let end = px1 + 1;
+    let Some(run) = r.fill_run(sp, py, px0, px1, e1, e2) else {
+        return end;
+    };
+    let y = r.win.oy.wrapping_add(py);
+
+    match px.row(y, r.win.ox.wrapping_add(run.px0), r.win.ox.wrapping_add(run.px1)) {
+        Some(row) => r.fill_row::<M, GlPlaneRow>(&row, sp, py, run, end),
+        None => fill_row_pixels::<M::Dyn, P>(px, r, sp, py, run, end),
+    }
+}
+
+/// A row a pixel at a time through planes px (fill_row_instance()).
+#[inline(never)]
+fn fill_row_pixels<M: Fill, P: Planes + ?Sized>(px: &P, r: &SoftDraw, sp: &SoftTexSpan, py: i32, run: FillRun, end: i32) -> i32 {
+    r.fill_row::<M, P>(px, sp, py, run, end)
 }
 
 const D: u32 = FILL_DYN;
@@ -895,6 +932,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // The board's own pixel tests: an id test that passes some pixels of a
+    // row and not others, which the row of planes Planes::row() lends
+    // applies per pixel, and two clip rectangles that split rows, which it
+    // cannot lend and the loops then draw a pixel at a time. Either way the
+    // loops draw what the general path draws.
+    #[test]
+    fn fill_rows_match_under_the_board_pixel_tests() {
+        for seed in 300..=330u64 {
+            let textured = seed % 2 == 0;
+            let make = || {
+                let mut b = case(seed, textured);
+                let mut rng = Lcg(seed);
+
+                if seed % 3 != 0 {
+                    b.board.id_compare = ODSY_ID_COMPARE_ENABLE | (0x0f << ODSY_ID_COMPARE_MASK_SHIFT) | 0x05;
+                    for d in b.board.did.iter_mut() {
+                        *d = if rng.next_u32() % 4 == 0 { 0x15 } else { 0x06 };
+                    }
+                }
+                if seed % 3 != 1 {
+                    b.board.clip_kept = 2;
+                    b.board.clip_rect[0] = ClipRect { x0: 0, y0: 0, x1: 70, y1: SIDE - 1 };
+                    b.board.clip_rect[1] = ClipRect { x0: 50, y0: 40, x1: SIDE - 1, y1: 110 };
+                }
+                b
+            };
+            let (fill, texture) = if textured {
+                (SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_FIXED)
+            } else {
+                (SGI_RASTER_FILL_OFF, SGI_RASTER_TEXTURE_SPANS)
+            };
+            let want = draw_bench(make(), fill, texture);
+            let table = draw_bench(make(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
+
+            compare(seed, "row loop under the board's pixel tests", &want, &table);
         }
     }
 
