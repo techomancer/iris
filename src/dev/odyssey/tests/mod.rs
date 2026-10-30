@@ -18,6 +18,7 @@ use crate::traits::BusDevice;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+mod catalogue;
 mod display;
 mod dma;
 mod fifo;
