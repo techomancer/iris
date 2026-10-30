@@ -360,68 +360,98 @@ impl Board {
     /// per update (ResolveCtx) and the planes read as lines of words.
     fn resolve_row_with(&mut self, ctx: &ResolveCtx, y: u32, dst: &mut [u32]) {
         let width = self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH);
-        let w = width as usize;
-        let at = y as usize * SGI_ODYSSEY_WIDTH as usize;
-        let lines = (
-            self.colour_line(0, y, w),
-            self.colour_line(1, y, w),
-            self.did.get(at..at + w),
-            self.overlay.get(at..at + w),
-        );
-        let (Some((l0, be0)), Some((l1, be1)), Some(did), Some(ovl)) = lines else {
+        let Some(line) = self.scanout_line(y, width as usize) else {
             return self.resolve_row_generic(y, dst);
         };
+        let saw_unverified = resolve_line(ctx, line, dst);
+        self.resolve_row_end(saw_unverified, y, dst, width);
+    }
+
+    /// The plane bytes a row's resolve reads, when the row takes
+    /// resolve_line(): both colour buffers in one byte order, the id
+    /// bytes and the overlay bytes, each `width` pixels.
+    fn scanout_line(&self, y: u32, w: usize) -> Option<ScanoutLine<'_>> {
+        let at = y as usize * SGI_ODYSSEY_WIDTH as usize;
+        let (l0, be0) = self.colour_line(0, y, w)?;
+        let (l1, be1) = self.colour_line(1, y, w)?;
         if be0 != be1 {
-            return self.resolve_row_generic(y, dst);
+            return None;
         }
-        let lines = [l0, l1];
-        let mut saw_unverified = false;
-        let mut x = 0;
+        Some(ScanoutLine { colour: [l0, l1], be: be0, did: self.did.get(at..at + w)?, overlay: self.overlay.get(at..at + w)? })
+    }
 
-        // A window is a run of pixels with one id byte, so the lookups that
-        // depend only on the id are made per run and the run is a plain loop.
-        while x < w {
-            let d = did[x];
-            let end = x + 1 + did[x + 1..].iter().take_while(|&&v| v == d).count();
-            let (enabled, obase) = ctx.overlay[(d as u32 & ODSY_DID_OVERLAY_MASK) as usize];
-            let show = &ctx.ids[(d >> ODSY_DID_MAIN_SHIFT) as usize & (ODSY_DISPMODE_COUNT as usize - 1)];
-            let out = &mut dst[x..end];
-            let src = lines[show.buf][x * 4..end * 4].chunks_exact(4).map(|c| {
-                let raw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-                if be0 { raw.swap_bytes() } else { raw }
-            });
-            let ov = &ovl[x..end];
-
-            if show.rgb {
-                for (out, word) in out.iter_mut().zip(src) {
-                    let r = ((word >> 24) & show.keep) | ((word >> 24) >> show.down);
-                    let g = (((word >> 16) & 0xff) & show.keep) | (((word >> 16) & 0xff) >> show.down);
-                    let b = (((word >> 8) & 0xff) & show.keep) | (((word >> 8) & 0xff) >> show.down);
-
-                    *out = ctx.gamma[0][r as usize & 0xff] | ctx.gamma[1][g as usize & 0xff] | ctx.gamma[2][b as usize & 0xff];
-                }
-            } else {
-                for (out, word) in out.iter_mut().zip(src) {
-                    *out = ctx.rgb[(show.base + (word & show.mask)) as usize & (ODSY_LUT_SIZE as usize - 1)];
-                }
-                // Reported only if a pixel of the run is shown through it.
-                saw_unverified |= show.unverified && (!enabled || ov.contains(&0));
-            }
-            if enabled {
-                for (out, &o) in out.iter_mut().zip(ov) {
-                    if o != 0 {
-                        *out = ctx.rgb[(obase + o as u32) as usize & (ODSY_LUT_SIZE as usize - 1)];
-                    }
-                }
-            }
-            x = end;
-        }
+    /// What follows a row's resolve_line(): the once-only group 25 report
+    /// and the cursor.
+    fn resolve_row_end(&mut self, saw_unverified: bool, y: u32, dst: &mut [u32], width: u32) {
         if saw_unverified && !self.scanout_group25_reported {
             self.scanout_group25_reported = true;
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: colormap group 25 (0x1900) resolved as an index table; unverified");
         }
         self.cursor_row(y, dst, width);
     }
+}
+
+/// One row's plane bytes, as resolve_line() reads them.
+struct ScanoutLine<'a> {
+    colour: [&'a [u8]; 2],
+    /// The colour words are big-endian.
+    be: bool,
+    did: &'a [u8],
+    overlay: &'a [u8],
+}
+
+/// resolve_row_generic() for the board's own colour planes, with the
+/// per-pixel decisions that depend only on a pixel's drawable id made once
+/// per update (ResolveCtx) and the planes read as lines of words. Whether a
+/// pixel showed through colour map group 25.
+fn resolve_line(ctx: &ResolveCtx, line: ScanoutLine<'_>, dst: &mut [u32]) -> bool {
+    let ScanoutLine { colour: lines, be: be0, did, overlay: ovl } = line;
+    let w = did.len();
+    let mut saw_unverified = false;
+    let mut x = 0;
+
+    // A window is a run of pixels with one id byte, so the lookups that
+    // depend only on the id are made per run and the run is a plain loop.
+    while x < w {
+        let d = did[x];
+        let end = x + 1 + did[x + 1..].iter().take_while(|&&v| v == d).count();
+        let (enabled, obase) = ctx.overlay[(d as u32 & ODSY_DID_OVERLAY_MASK) as usize];
+        let show = &ctx.ids[(d >> ODSY_DID_MAIN_SHIFT) as usize & (ODSY_DISPMODE_COUNT as usize - 1)];
+        let out = &mut dst[x..end];
+        let src = lines[show.buf][x * 4..end * 4].chunks_exact(4).map(|c| {
+            let raw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            if be0 { raw.swap_bytes() } else { raw }
+        });
+        let ov = &ovl[x..end];
+
+        if show.rgb {
+            for (out, word) in out.iter_mut().zip(src) {
+                let r = ((word >> 24) & show.keep) | ((word >> 24) >> show.down);
+                let g = (((word >> 16) & 0xff) & show.keep) | (((word >> 16) & 0xff) >> show.down);
+                let b = (((word >> 8) & 0xff) & show.keep) | (((word >> 8) & 0xff) >> show.down);
+
+                *out = ctx.gamma[0][r as usize & 0xff] | ctx.gamma[1][g as usize & 0xff] | ctx.gamma[2][b as usize & 0xff];
+            }
+        } else {
+            for (out, word) in out.iter_mut().zip(src) {
+                *out = ctx.rgb[(show.base + (word & show.mask)) as usize & (ODSY_LUT_SIZE as usize - 1)];
+            }
+            // Reported only if a pixel of the run is shown through it.
+            saw_unverified |= show.unverified && (!enabled || ov.contains(&0));
+        }
+        if enabled {
+            for (out, &o) in out.iter_mut().zip(ov) {
+                if o != 0 {
+                    *out = ctx.rgb[(obase + o as u32) as usize & (ODSY_LUT_SIZE as usize - 1)];
+                }
+            }
+        }
+        x = end;
+    }
+    saw_unverified
+}
+
+impl Board {
 
     /// Resolve the colour buffers at scanout; see resolve_row_generic().
     pub fn resolve_row(&mut self, y: u32, dst: &mut [u32]) {
@@ -479,47 +509,198 @@ impl Board {
         }
     }
 
-    /// Resolve the dirty lines into the scanout's frame. Returns the lines
-    /// resolved as a half-open span `first..end` covering every one of them,
-    /// or None when nothing was dirty (the frame is unchanged).
-    ///
-    /// Scanout reads the planes under the board lock, which the board's thread
-    /// holds for a whole slice, so no draw runs meanwhile. A processor's write
-    /// of the displayed-buffer register reached only the front: repaint for it.
+    /// Resolve the dirty lines into the presented frame: scanout_stage()
+    /// and then scanout_resolve(), for a caller that holds the planes
+    /// throughout.
     pub fn scanout_update(&mut self) -> Option<(usize, usize)> {
+        self.scanout_stage();
+        self.scanout_resolve()
+    }
+
+    /// The part of a frame's update that reads the planes, for the display
+    /// to run while it holds them against the raster unit
+    /// (RasterQueue::planes): copy the dirty lines' plane bytes aside, so
+    /// that the resolve itself (scanout_resolve()) can run while the
+    /// raster unit draws on. A line of an unusual plane shape is resolved
+    /// here instead, pixel by pixel. A processor's write of the
+    /// displayed-buffer register reached only the front: repaint for it.
+    ///
+    /// Resolving a whole 1280x1024 frame under the raster unit's lock held
+    /// the raster unit up about 6 ms of every 16.7 ms frame while a GL
+    /// program drew, and the front end with it under the board lock.
+    pub fn scanout_stage(&mut self) {
         if std::mem::take(&mut self.front.lock().displayed_written) {
             self.scanout.invalidate_all();
         }
-        if self.scanout.frame.is_empty() {
+        let mut stage = std::mem::take(&mut self.scanout_stage);
+        stage.lines.clear();
+        stage.bytes.clear();
+        stage.be.clear();
+        if !self.scanout.frame.is_empty() {
+            let h = self.scanout.mode.height as usize;
+            let w = self.scanout.mode.width as usize;
+            let width = (self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH)) as usize;
+            let mut row = Vec::new();
+            for y in 0..h {
+                if !self.scanout.dirty[y] {
+                    continue;
+                }
+                let staged = match self.scanout_line(y as u32, width) {
+                    Some(line) => {
+                        stage.push(line);
+                        true
+                    }
+                    None => {
+                        row.resize(w, 0);
+                        self.resolve_row_generic(y as u32, &mut row);
+                        self.scanout.frame[y * w..(y + 1) * w].copy_from_slice(&row);
+                        false
+                    }
+                };
+                stage.lines.push((y as u32, staged));
+                self.scanout.dirty[y] = false;
+            }
+        }
+        self.scanout_stage = stage;
+    }
+
+    /// The rest of a frame's update, once the planes are free again:
+    /// resolve the lines scanout_stage() copied aside into the presented
+    /// frame. The span of lines changed.
+    pub fn scanout_resolve(&mut self) -> Option<(usize, usize)> {
+        let mut job = self.scanout_take();
+        if let Some(job) = &mut job {
+            job.resolve();
+        }
+        self.scanout_finish(job)
+    }
+
+    /// The staged lines and everything their resolve reads outside the
+    /// planes, for the display to resolve with no lock held
+    /// (ScanoutJob::resolve()). None when no line was dirty.
+    pub fn scanout_take(&mut self) -> Option<ScanoutJob> {
+        if self.scanout_stage.lines.is_empty() {
             return None;
         }
+        let stage = std::mem::take(&mut self.scanout_stage);
+        let ctx = stage.lines.iter().any(|&(_, staged)| staged).then(|| self.resolve_ctx());
+        Some(ScanoutJob {
+            stage,
+            ctx,
+            w: self.scanout.mode.width as usize,
+            width: self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH),
+            frame: (self.scanout.frame_width, self.scanout.frame_height),
+            rows: std::mem::take(&mut self.scanout_rows),
+            saw_unverified: false,
+        })
+    }
+
+    /// Put a resolved job's lines into the presented frame, with the
+    /// cursor over them. The board lock was let go while it resolved; if
+    /// the frame changed shape meanwhile the lines are dropped and the
+    /// whole new frame is dirty. The span of lines changed.
+    pub fn scanout_finish(&mut self, job: Option<ScanoutJob>) -> Option<(usize, usize)> {
+        let job = job?;
         let mut span: Option<(usize, usize)> = None;
-        let h = self.scanout.mode.height as usize;
-        let w = self.scanout.mode.width as usize;
-        let mut ctx: Option<ResolveCtx> = None;
-        let mut row = vec![0u32; w];
-        let mut y = 0usize;
-        while y < h {
-            if !self.scanout.dirty[y] {
-                y += 1;
-                continue;
+        if job.w == 0 || job.frame != (self.scanout.frame_width, self.scanout.frame_height) || job.w != self.scanout.mode.width as usize {
+            self.scanout.invalidate_all();
+        } else {
+            let w = job.w;
+            let mut rows = job.rows.chunks_exact(w);
+            let mut row = vec![0u32; w];
+            for &(y, staged) in &job.stage.lines {
+                let y = y as usize;
+                if let (true, Some(resolved)) = (staged, rows.next()) {
+                    row.copy_from_slice(resolved);
+                    self.cursor_row(y as u32, &mut row, job.width);
+                    self.scanout.frame[y * w..(y + 1) * w].copy_from_slice(&row);
+                }
+                span = Some(span.map_or((y, y + 1), |(a, b)| (a.min(y), b.max(y + 1))));
             }
-            let mut end = y;
-            while end < h && self.scanout.dirty[end] {
-                end += 1;
+            if job.saw_unverified && !self.scanout_group25_reported {
+                self.scanout_group25_reported = true;
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: colormap group 25 (0x1900) resolved as an index table; unverified");
             }
-            // Gathered at the first dirty line: an idle frame costs nothing.
-            let ctx = ctx.get_or_insert_with(|| self.resolve_ctx());
-            for line in y..end {
-                self.resolve_row_with(ctx, line as u32, &mut row);
-                self.scanout.frame[line * w..(line + 1) * w].copy_from_slice(&row);
-            }
-            self.scanout.dirty[y..end].fill(false);
-            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout update: lines {}-{}", y, end - 1);
-            span = Some(span.map_or((y, end), |(a, b)| (a.min(y), b.max(end))));
-            y = end;
+            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: scanout update: {} lines", job.stage.lines.len());
         }
+        self.scanout_stage = job.stage;
+        self.scanout_rows = job.rows;
         span
+    }
+}
+
+/// A frame's staged lines on their way to the presented frame
+/// (Board::scanout_take()).
+pub struct ScanoutJob {
+    stage: ScanoutStage,
+    ctx: Option<ResolveCtx>,
+    /// The frame's width, and the pixels of it the planes cover.
+    w: usize,
+    width: u32,
+    /// The frame's size when the lines were staged.
+    frame: (u32, u32),
+    /// The staged lines resolved, `w` pixels each.
+    rows: Vec<u32>,
+    saw_unverified: bool,
+}
+
+impl ScanoutJob {
+    /// Resolve the staged lines. Needs nothing of the board: the display
+    /// runs it with no lock held, while the front end and the raster unit
+    /// go on.
+    pub fn resolve(&mut self) {
+        let Some(ctx) = &self.ctx else { return };
+        let (w, width) = (self.w, self.width as usize);
+        if w == 0 {
+            return;
+        }
+        let staged = self.stage.lines.iter().filter(|&&(_, staged)| staged).count();
+        self.rows.clear();
+        self.rows.resize(staged * w, 0);
+        let mut at = 0;
+        for out in self.rows.chunks_exact_mut(w) {
+            let (line, next) = self.stage.line(at, width);
+            at = next;
+            self.saw_unverified |= resolve_line(ctx, line, out);
+        }
+    }
+}
+
+/// The dirty lines of a frame's update, with the plane bytes of those that
+/// resolve_line() resolves copied aside (Board::scanout_stage()).
+#[derive(Default)]
+pub struct ScanoutStage {
+    /// Each dirty line, and whether its bytes are staged; a line that is
+    /// not was resolved at once.
+    lines: Vec<(u32, bool)>,
+    /// Per staged line: colour buffer 0 and 1 words, id bytes, overlay
+    /// bytes. Kept between frames for its allocation.
+    bytes: Vec<u8>,
+    /// The staged lines' colour words are big-endian.
+    be: Vec<bool>,
+}
+
+impl ScanoutStage {
+    fn push(&mut self, line: ScanoutLine<'_>) {
+        self.bytes.extend_from_slice(line.colour[0]);
+        self.bytes.extend_from_slice(line.colour[1]);
+        self.bytes.extend_from_slice(line.did);
+        self.bytes.extend_from_slice(line.overlay);
+        self.be.push(line.be);
+    }
+
+    /// The staged line at byte `at`, `w` pixels wide, and where the next
+    /// one starts.
+    fn line(&self, at: usize, w: usize) -> (ScanoutLine<'_>, usize) {
+        let b = &self.bytes[at..at + 10 * w];
+        let index = at / (10 * w);
+        let line = ScanoutLine {
+            colour: [&b[..4 * w], &b[4 * w..8 * w]],
+            be: self.be[index],
+            did: &b[8 * w..9 * w],
+            overlay: &b[9 * w..],
+        };
+        (line, at + 10 * w)
     }
 }
 

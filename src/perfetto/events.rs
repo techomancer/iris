@@ -238,6 +238,9 @@ pub static ODSY_RETRACE: EventDef = EventDef::new("retrace", cat::GFX).on_track(
 /// The refresh thread resolving dirty lines, and handing the frame on.
 pub static ODSY_CAPTURE: EventDef = EventDef::new("frame capture", cat::GFX).on_track("VPro capture").in_group(GFX_GROUP);
 pub static ODSY_PRESENT: EventDef = EventDef::new("present", cat::GFX).on_track("VPro present").in_group(GFX_GROUP);
+/// The display holding the planes against the raster unit while it copies
+/// a frame's dirty lines aside (on the display thread).
+pub static ODSY_FRAME_PLANES: EventDef = EventDef::new("frame planes", cat::GFX);
 
 // ── jitv2 ────────────────────────────────────────────────────────────────────
 

@@ -295,6 +295,26 @@ fn the_two_colour_buffers_hold_opposite_colours() {
     assert_eq!(pixel(&s, 1, 105, 105), 0x0000_ffff);
 }
 
+/// The display copies a frame's lines aside while it holds the planes
+/// against the raster unit and resolves the copy after letting the raster
+/// unit go on: what is drawn after the copy shows only in the next frame,
+/// never part-way through this one.
+#[test]
+fn a_frame_resolves_the_lines_it_copied_while_the_raster_unit_draws_on() {
+    let (mut s, _) = board("v12");
+    display_identity(&mut s, 0);
+    rgb_fill(&mut s, 0xff, 0, 0, 100, 100, 110, 110);
+    s.scanout_update();
+
+    s.scanout.invalidate_all();
+    s.scanout_stage();
+    rgb_fill(&mut s, 0, 0, 0xff, 100, 100, 110, 110);
+    assert!(s.scanout_resolve().is_some());
+    let at = (105 * s.scanout.frame_width + 105) as usize;
+    assert_eq!(s.scanout.frame[at] & 0xff_ffff, 0xff0000, "the frame shows the copy");
+    assert_eq!(shown(&mut s, 105, 105), 0x0000ff, "and the next frame the new drawing");
+}
+
 /// A double-buffered client draws each frame in two halves into the buffer
 /// the window does not show, arms the swap, and only the retrace shows it.
 /// The kernel exchanges the mask's pairs as the drawable's buffer state

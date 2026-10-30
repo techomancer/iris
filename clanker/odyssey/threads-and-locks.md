@@ -51,7 +51,8 @@ apply to BUZZ). Nothing models more than one raster unit.
   that may still read the old ones (`Board::object_stage`). A texture
   upload otherwise drained the whole raster queue, up to 180 ms of drawing
   in Smoke & Mirrors. The display holds the raster unit's context lock
-  while it resolves a frame.
+  while it copies a frame's dirty lines aside, and resolves the copy with
+  no lock held.
 
 Both rings are the shared `GFifo`, 64K entries. The IMPACT model's raster
 FIFO has a head per raster engine with scanline interleave; the VPro's has
@@ -75,7 +76,13 @@ return.
 - The display thread takes the board lock, then the raster unit's context
   lock, which the raster thread holds for each slice of jobs (at most 1 ms,
   checked between jobs). A frame therefore waits out a raster slice in
-  flight and never reads a half-drawn primitive. The retrace is counted
+  flight and never reads a half-drawn primitive. It holds both locks only
+  while it copies the dirty lines' plane bytes aside
+  (`Board::scanout_stage`), lets both go while it resolves the copy
+  (`ScanoutJob::resolve`), and takes the board lock again to put the
+  lines in the presented frame with the cursor over them. Resolving a
+  whole frame under both locks held the raster unit up about 6 ms of
+  every 16.7 ms frame while a GL program drew. The retrace is counted
   under the board lock and can be up to one slice late.
 - Lock order: board, then raster context, then front. The raster thread
   takes only its context lock and, for a fence's interrupt, the front lock.
