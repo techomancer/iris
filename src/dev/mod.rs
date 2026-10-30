@@ -66,6 +66,7 @@ pub mod bedrock_xb;
 pub mod bedrock_lb;
 pub mod bedrock_md;
 pub mod bedrock_mem;
+pub mod bedrock_pi;
 pub mod dp83843;
 pub mod ics1890;
 pub mod isp12160;
