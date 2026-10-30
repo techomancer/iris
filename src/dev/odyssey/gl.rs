@@ -334,7 +334,8 @@ impl Planes for GlPlanes<'_> {
         Some(colour)
     }
 
-    /// The depth plane (set up by Board::allocate()): 24-bit depth, 0 nearest,
+    /// The depth plane (set up by Board::allocate()): the board's 24-bit depth word
+    /// (depth_word.rs), 0 nearest,
     /// through the same pixel test as a colour write. It is a model plane
     /// because the board memory the real depth buffer occupies is not known.
     fn load_depth(&self, x: i32, y: i32) -> u32 {

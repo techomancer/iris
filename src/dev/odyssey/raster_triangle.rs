@@ -289,7 +289,7 @@ impl SoftDraw<'_> {
             let b1 = e1 as f64 / area as f64;
             let b2 = e2 as f64 / area as f64;
             let mut z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
-            let mut off = offset;
+            let (mut off, steps) = rules.split_offset(offset);
             let mut zw = 0.0f64;
             let mut colour = [0.0f64; 4];
 
@@ -313,7 +313,7 @@ impl SoftDraw<'_> {
                     break 'pixel;
                 }
                 if st.depth_test != 0 || store {
-                    let zq = rules.depth_code(zw);
+                    let zq = rules.depth_code_offset(zw, steps);
 
                     if st.depth_test != 0 {
                         if !soft_compare(st.depth_func, zq, self.px.load_depth(x, y)) {

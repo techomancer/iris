@@ -37,6 +37,7 @@
 //!   frame and retrace; what reaches the window.
 //! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
 //!   credits for machines whose processor interface counts them.
+//! - `depth_word`: the board's 24-bit float depth word and its offset.
 //! - `consts`: register, command and field constants.
 //!
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code
@@ -51,6 +52,7 @@ pub mod board;
 pub mod command;
 pub mod consts;
 pub mod context;
+pub mod depth_word;
 pub mod display;
 pub mod dma;
 pub mod draw;

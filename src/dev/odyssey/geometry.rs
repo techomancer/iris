@@ -668,18 +668,21 @@ impl Board {
     /// which a float row could not resolve; a fragment outside depth [0, 1] by
     /// more than the rounding slack (ODSY_GL_DEPTH_SLACK) is dropped, which is
     /// the near and far clip. Under an orthographic matrix the z row stays
-    /// row2 / (block16[3] S) - row3, whose window depth is the same. Board depth
-    /// is floating point in a format whose layout is UNKNOWN; a fixed-point store
-    /// would flatten a distant scene to one value, so the rules' floating-point
-    /// code stands in for the board's (APPROXIMATED). Whether the board
-    /// interpolates depth with perspective correction is UNKNOWN.
+    /// row2 / (block16[3] S) - row3, whose window depth is the same. The plane
+    /// holds the board's 24-bit float depth word of 2S times that depth
+    /// (depth_word.rs; datasheet, "Depth word"). The word's layout is
+    /// ESTABLISHED as the library's reading; that the plane stores exactly it is
+    /// INFERRED, and the rounding of a rasterised depth into it (truncation here)
+    /// is UNKNOWN. Whether the board interpolates depth with perspective
+    /// correction is INFERRED from SGI's raster patents; the model does.
     ///
-    /// APPROXIMATION, polygon offset: the shared rasterizer adds a polygon's
-    /// offset to depth over w before multiplying w back, so under perspective
-    /// the offset grows with the fragment's w, where OpenGL adds a constant
-    /// window-depth offset. How the board offsets eye-linear depth is UNKNOWN;
-    /// a board capture of glPolygonOffset decals at two eye distances, or a
-    /// depth readback of one offset polygon, would settle it.
+    /// Polygon offset (block 0x058) is a signed count of steps of the encoded
+    /// word, added to it after encoding (RasterRules::split_offset()). The
+    /// field is ESTABLISHED; adding it to the word, not to eye-linear depth, is
+    /// INFERRED, so the offset shrinks toward the near plane in proportion to
+    /// d - n. The far-plane kill is by depth value in the raster stage
+    /// (INFERRED), and this model cuts at the slack ODSY_GL_DEPTH_SLACK
+    /// (APPROXIMATION: the board's cut point is UNKNOWN).
     ///
     /// APPROXIMATION, raster position: under perspective the shared projection's
     /// z row is 0, so glRasterPos takes window z 0.5 whatever its eye distance,

@@ -88,9 +88,9 @@ pub struct RasterRules {
     /// With depth_row, how far outside [0, 1] a depth may lie and be
     /// clamped rather than dropped.
     pub depth_slack: f64,
-    /// Stored depth is the IEEE single bits of the window depth shifted
-    /// right by 30 - depth_bits (RasterRules::depth_code()); needs depth_bits
-    /// 10 to 30.
+    /// Stored depth is the board's 24-bit float word of 2S times the window
+    /// depth (depth_word.rs), which orders as an integer; needs depth_bits
+    /// 24. A polygon offset then counts steps of that word.
     pub depth_float: bool,
 }
 
@@ -611,7 +611,7 @@ impl RasterRules {
         self.subpixel_bits >= 1 && self.subpixel_bits <= 12 &&
             self.color_bits >= 1 && self.color_bits <= 10 &&
             self.depth_bits >= 1 && self.depth_bits <= 32 &&
-            (!self.depth_float || (self.depth_bits >= 10 && self.depth_bits <= 30)) &&
+            (!self.depth_float || self.depth_bits == 24) &&
             (!self.depth_row_given ||
              (self.depth_row[0].is_finite() && self.depth_row[1].is_finite() &&
               self.depth_row[2].is_finite() && self.depth_row[3].is_finite())) &&
@@ -682,16 +682,39 @@ impl RasterRules {
         u32::MAX.wrapping_shr(32u32.wrapping_sub(self.depth_bits as u32))
     }
 
-    /// A non-negative single's bits order as unsigned integers do, so the
-    /// shifted bits of a depth in [0, 1], at most 0x3f800000 >> (30 -
-    /// depth_bits), keep its order in depth_bits bits.
+    /// The stored code of window depth z in [0, 1]: an integer fraction of
+    /// depth_max, or with depth_float the board's depth word for 2S z
+    /// (depth_word::word_for_fraction()).
     pub fn depth_code(&self, z: f64) -> u32 {
         if !self.depth_float {
             return self.round(z * self.depth_max() as f64) as u32;
         }
-        let f = fmin(fmax(z, 0.0), 1.0) as f32;
-        let bits = f.to_bits();
-        bits.wrapping_shr(30u32.wrapping_sub(self.depth_bits as u32))
+        super::depth_word::word_for_fraction(z)
+    }
+
+    /// A polygon offset (the sum of slope, units and bias, in window depth)
+    /// split into what adds to the window depth before the code and the steps
+    /// that add to the code after it. With depth_float the board adds the
+    /// offset field to the encoded word (depth_word::word_with_offset(),
+    /// INFERRED placement), and the field's step is 2^-24 of the offset
+    /// carried here (ODSY_POLYGON_OFFSET_SCALE), so none of it adds to window
+    /// depth.
+    pub fn split_offset(&self, offset: f64) -> (f64, i64) {
+        if !self.depth_float {
+            return (offset, 0);
+        }
+        (0.0, (offset * (1u64 << 24) as f64).round() as i64)
+    }
+
+    /// [`depth_code`](Self::depth_code) of z, then `steps` of polygon offset.
+    pub fn depth_code_offset(&self, z: f64, steps: i64) -> u32 {
+        let code = self.depth_code(z);
+
+        if self.depth_float {
+            super::depth_word::word_with_offset(code, steps)
+        } else {
+            code
+        }
     }
 
     /// A component clamped to [0, 1] and scaled to the rules' colour bits, a
@@ -944,7 +967,7 @@ impl GlDrawState {
 }
 
 impl RasterRules {
-    pub fn depth_stencil(&self, st: &GlDrawState, t: &RasterTarget, px: &dyn Planes, x: i32, y: i32, z: f64) -> bool {
+    pub fn depth_stencil(&self, st: &GlDrawState, t: &RasterTarget, px: &dyn Planes, x: i32, y: i32, z: f64, steps: i64) -> bool {
         let mut smax: u32 = 0;
         let mut sref: u32 = 0;
 
@@ -967,7 +990,7 @@ impl RasterRules {
                 return false;
             }
         }
-        let zq = self.depth_code(z);
+        let zq = self.depth_code_offset(z, steps);
         if st.depth_test != 0 {
             if !soft_compare(st.depth_func, zq, px.load_depth(x, y)) {
                 if stencil {
@@ -1379,6 +1402,12 @@ impl SoftDraw<'_> {
     }
 
     pub fn fragment_at(&self, px: i32, py: i32, z: f64, frag: &SoftFrag, coverage: f64, antialias: bool) {
+        self.fragment_at_offset(px, py, z, 0, frag, coverage, antialias);
+    }
+
+    /// [`fragment_at`](Self::fragment_at) with `steps` of the board's polygon
+    /// offset added to the depth code (RasterRules::split_offset()).
+    pub fn fragment_at_offset(&self, px: i32, py: i32, z: f64, steps: i64, frag: &SoftFrag, coverage: f64, antialias: bool) {
         let t: &RasterTarget = &self.t;
         let st: &GlDrawState = &self.st;
         let mut fogged = *frag;
@@ -1428,7 +1457,7 @@ impl SoftDraw<'_> {
         {
             return;
         }
-        if !self.rules.depth_stencil(st, t, self.px, x, y, z) {
+        if !self.rules.depth_stencil(st, t, self.px, x, y, z, steps) {
             return;
         }
         self.fragment_store(x, y, f, &dest);
@@ -1514,7 +1543,7 @@ impl SoftDraw<'_> {
     /// window depth, and the sum clamped to [0, 1] (3.5.5).
     pub fn fragment_coverage(&self, px: i32, py: i32, z: f64, offset: f64, depth_w: f64, frag: &SoftFrag, coverage: f64, antialias: bool) {
         let mut z = z;
-        let mut offset = offset;
+        let (mut offset, steps) = self.rules.split_offset(offset);
         let mut zw = 0.0;
 
         if self.rules.depth_row_given {
@@ -1533,7 +1562,7 @@ impl SoftDraw<'_> {
         if !(coverage > 0.0) || !self.st.window_depth(z, offset, &mut zw) {
             return;
         }
-        self.fragment_at(px, py, zw, frag, coverage, antialias);
+        self.fragment_at_offset(px, py, zw, steps, frag, coverage, antialias);
     }
 
     pub fn fragment(&self, px: i32, py: i32, z: f64, offset: f64, depth_w: f64, frag: &SoftFrag) {

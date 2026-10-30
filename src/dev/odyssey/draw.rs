@@ -985,8 +985,8 @@ pub fn image_burst_fmt(reg: u32, fmt: &mut u32) -> bool {
 /// Octane RE4 set is the only one RasterRules::rules_supported() implements,
 /// and a flat single triangle in one colour exercises none of the parameters
 /// that distinguish heads. The board's own subpixel grid and
-/// interpolated-colour depth are unmeasured. The floating-point depth rule is
-/// inferred, not measured. (A function, not a static: the struct is not const
+/// interpolated-colour depth are unmeasured. The depth word is the board's
+/// 24-bit float (depth_word.rs). (A function, not a static: the struct is not const
 /// constructible.)
 pub fn gl_rules() -> RasterRules {
     RasterRules {
@@ -1000,7 +1000,7 @@ pub fn gl_rules() -> RasterRules {
         line_rule: SGI_LINE_COVERAGE_DOUBLE as u8,
         alpha_test_bits: 12,
         smooth_primitives: true,
-        // The board's own depth format; Board::gl_load_combined().
+        // The board's depth word; Board::gl_load_combined().
         depth_float: true,
         ..Default::default()
     }

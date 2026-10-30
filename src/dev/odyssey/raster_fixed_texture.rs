@@ -874,7 +874,7 @@ impl SoftDraw<'_> {
             let w1 = b1 * v[1].inv_w;
             let w2 = b2 * v[2].inv_w;
             let sum = w0 + w1 + w2;
-            let mut off = sp.offset;
+            let (mut off, steps) = rules.split_offset(sp.offset);
             let mut zw = 0.0f64;
             let mut s = 0.0f64;
             let mut tc = 0.0f64;
@@ -900,7 +900,7 @@ impl SoftDraw<'_> {
                 continue;
             }
             if depth_test {
-                zq = rules.depth_code(zw);
+                zq = rules.depth_code_offset(zw, steps);
                 if !soft_compare(st.depth_func, zq, self.px.load_depth(x, y)) {
                     continue;
                 }

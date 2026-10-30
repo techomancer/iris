@@ -1189,7 +1189,8 @@ impl Board {
         // The depth plane: 24-bit depth in a 32-bit word per frame pixel, in
         // device-backed memory of its own. Where the board keeps the depth
         // buffer, and its width and layout, are unknown, so no aperture reaches
-        // this plane. 24 bits matches the Z24 names in the GL library.
+        // this plane. 24 bits matches the Z24 names in the GL library and the depth
+        // word (depth_word.rs).
         self.depth_mem.init(pixels * 4);
         {
             let depth = Plane {
@@ -1251,10 +1252,9 @@ impl Board {
         self.did.fill(0);
         self.overlay.fill(0);
         self.poly_marks.fill(0);
-        // The depth plane starts at the far value, all ones (a model choice).
-        // Under the floating-point code depth 1.0 is 0xfe0000, and every code of
-        // a depth in [0, 1] is at most that, so all ones still compares as
-        // farther than any fragment.
+        // The depth plane starts at all ones (a model choice). The far plane,
+        // 2S, is word 0xfffffe, and every drawn depth is at most that, so all
+        // ones, the largest word, compares as farther than any fragment.
         let depth = self.depth_mem.plane(self.depth_plane).expect("the depth plane");
         for y in 0..SGI_ODYSSEY_HEIGHT as i32 {
             for x in 0..SGI_ODYSSEY_WIDTH as i32 {
