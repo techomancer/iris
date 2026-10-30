@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
-    C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
@@ -189,8 +189,12 @@ impl<
         const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
-    const R10K: bool = MODEL == model::R10000;
+    const R10K: bool = model::r10k_family(MODEL);
     const R5K: bool = MODEL == model::R5000;
+    /// Index Writeback Invalidate (D) also zeroes the primary data tag on the
+    /// R12000 and later; the R10000 leaves it as it was. NEC VR12000 user's
+    /// manual, Appendix B.20. The R14000 is taken to match.
+    const IWBI_CLEARS_PD_TAG: bool = Self::R10K && MODEL != model::R10000;
     const IC_LINES: usize = if IC_LINE == 0 { 0 } else { IC_SIZE / IC_LINE };
     const DC_LINES: usize = if DC_LINE == 0 { 0 } else { DC_SIZE / DC_LINE };
     const L2_LINES: usize = if L2_LINE == 0 { 0 } else { L2_SIZE / L2_LINE };
@@ -367,11 +371,10 @@ impl<
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
-    // The R10000 implements 44 virtual address bits where the R4x00 implements
-    // 40; the shadow cache is only used for it, but key this off the same flag
-    // that selects its cache encodings rather than asserting it unconditionally.
-    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
-    const PA_BITS: u32 = if MODEL == model::R10000 { 40 } else { 36 };
+    // The R10000 family implements 44 virtual address bits where the R4x00
+    // implements 40.
+    const VA_BITS: u32 = if Self::R10K { 44 } else { 40 };
+    const PA_BITS: u32 = if Self::R10K { 40 } else { 36 };
     // The CPU's name, which snapshots check: the same as the full model's, so
     // a mismatch reads as a cache-kind difference rather than a different CPU.
     // The R10000 keeps its historical "shadow", which existing IP28
@@ -379,11 +382,12 @@ impl<
     const NAME: &'static str = match MODEL {
         model::R4400 => "R4400",
         model::R5000 => "R5000",
+        model::R12000 => "R12000",
         _ => "shadow",
     };
     const CACHE_KIND: &'static str = "shadow";
     const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
-    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    const R10K_CACHE_OPS: bool = Self::R10K;
     const SECONDARY_TAG_MASK: u64 = if Self::R10K_CACHE_OPS { R10K_L2_TAG_MASK } else { u64::MAX };
 }
 
@@ -665,6 +669,15 @@ impl<
                 0
             }
 
+            C_IWBINV if Self::IWBI_CLEARS_PD_TAG && sel == CACH_PD => {
+                let idx = self.tag_slot(sel, virt_addr);
+                let s = self.shadow(sel);
+                if idx < s.tags.len() {
+                    s.tags[idx] = 0;
+                }
+                0
+            }
+
             // Invalidate, writeback, fill, and the R4000 hit operations. All
             // no-ops: there is nothing held that could be stale or dirty.
             _ => 0,
@@ -764,6 +777,27 @@ impl<
 /// Reports revision 2.5, matching R10000Cache and enabling the IP28 boot tune.
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
+/// R12000 3.5 as the Octane has it: the R10000's programming model with a
+/// 2 MB secondary cache. PRId 0x0e35, FIR 0x900, 128-byte secondary lines
+/// (SB: a model choice).
+///
+/// The Octane's R14000 is this type with `R14000_PRID` set at runtime, as the
+/// Octane's own R10000 revision is; only the PRId differs. Both report
+/// "R12000" as `NAME`.
+pub type R12000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
+
+/// PRId of the R14000 2.4 in the Octane, to set on an `R12000ShadowCache`.
+pub const R14000_PRID: u32 = 0x0000_0f24;
+
+/// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
+/// (SB clear). With 128-byte lines the O2 PROM panics before its banner
+/// (write TLB miss at 0x0); 64 boots. IRIX on the O2 never reads SB and sizes
+/// the secondary cache as 512 KB << SS.
+pub type R12000O2ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 64, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
+
 
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
 ///
@@ -984,6 +1018,25 @@ mod tests {
         // An invalidate cannot lose it, and a writeback cannot be needed.
         c.cache_op(crate::cpu::mips_cache_v2::C_IINV | CACH_PD, 0x2000, 0);
         assert_eq!(c.read::<4>(0, 0x2000).data, 0x1234_5678);
+    }
+
+    /// On the R12000 and later Index Writeback Invalidate (D) zeroes the
+    /// line's primary data tag, which Index Load Tag then reads back; the
+    /// R10000 keeps the tag.
+    #[test]
+    fn index_writeback_invalidate_d_clears_the_tag_from_the_r12000_on() {
+        fn run<C: MipsCache + From<Arc<dyn BusDevice>>>() -> u64 {
+            let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+            let c = C::from(mem);
+            let tag = 0x0000_0001_2345_6780u64;
+            c.cache_op(crate::cpu::mips_cache_v2::C_IST | CACH_PD, 0x40, tag);
+            assert_eq!(c.cache_op(crate::cpu::mips_cache_v2::C_ILT | CACH_PD, 0x40, 0), tag);
+            c.cache_op(crate::cpu::mips_cache_v2::C_IWBINV | CACH_PD, 0x40, 0);
+            c.cache_op(crate::cpu::mips_cache_v2::C_ILT | CACH_PD, 0x40, 0)
+        }
+        assert_eq!(run::<R12000ShadowCache>(), 0);
+        assert_eq!(run::<R12000O2ShadowCache>(), 0);
+        assert_eq!(run::<R10000ShadowCache>(), 0x0000_0001_2345_6780);
     }
 
     /// Geometry is what CP0 Config is built from, so it must be the real

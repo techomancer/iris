@@ -97,11 +97,16 @@
  *   IP22 Indigo2         R4400, R4600, R8000, R10000
  *   IP32 O2              R5000, RM5200, RM7000, R10000, R12000
  *   IP30 Octane          R10000, R12000, R14000
- *   IP27/IP35 Origin     R10000, R12000, R14000
+ *   IP27 Origin          R10000, R12000, R14000
+ *   IP35 Origin, Fuel    R14000, R16000
  *
  * R4000 and R4400 share imp 0x04 and are told apart by revision — major >= 4
  * is an R4400, which is the same rule IRIX and Linux use, and is why IRIS
  * reports PRId 0x0440.
+ *
+ * The R16000 has no imp of its own: it reports the R14000's 0x0f and is told
+ * apart by revision, major >= 3 (Linux's cpu-probe.c tests major > 2 under
+ * PRID_IMP_R14000).
  */
 #define IMP_R4000         0x04   /* R4400 too — see PRID_REV_MAJOR */
 #define IMP_R4400         0x04

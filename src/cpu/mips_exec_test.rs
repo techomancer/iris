@@ -6802,9 +6802,9 @@ mod tests {
             .unwrap().join().unwrap();
     }
 
-    /// A partial LWR keeps bits 63:32 of the destination on the R10000 while
-    /// 64-bit operations are enabled for the current mode, and sign-extends on
-    /// the R4400 and R5000 and on the R10000 when they are off (a 32-bit user
+    /// A partial LWR keeps bits 63:32 of the destination on the R10000 family
+    /// while 64-bit operations are enabled for the current mode, and sign-extends
+    /// on the R4400 and R5000 and on the family when they are off (a 32-bit user
     /// process, UX=0); a complete word sign-extends on all.
     /// Compiled LWR reads `core.lwr_upper_below` rather than decoding Status,
     /// so it must follow `is_64bit_mode()` through a Status write and through
@@ -6836,7 +6836,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_lwr_keeps_the_upper_word_only_on_the_r10000() {
+    fn partial_lwr_keeps_the_upper_word_on_the_r10000_family() {
         use crate::cpu::mips_core::{STATUS_KX, STATUS_SX, STATUS_UX};
         const USER: u32 = 2 << 3;
         const SUPER: u32 = 1 << 3;
@@ -6874,5 +6874,58 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+    }
+
+    /// Config reports each part's secondary cache: SS (bits 18:16) is
+    /// log2(secondary size / 512 KB) and SB (bit 13) is set for 128-byte lines
+    /// (NEC U10278EJ4V0UM p.230). The primary caches read 32 KB.
+    #[test]
+    fn config_reports_the_secondary_cache_of_each_family_part() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn config<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(
+                Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.read_cp0(16)
+        }
+        // The executor is large; build it on a thread with room.
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+            for (name, c, ss, sb) in [
+                ("R10000", config::<R10000ShadowCache>(), 1, 1),
+                ("R12000", config::<R12000ShadowCache>(), 2, 1),
+                ("R12000 O2", config::<R12000O2ShadowCache>(), 2, 0),
+            ] {
+                assert_eq!(c >> 26, 0b011_011, "{name}: IC and DC read 32 KB");
+                assert_eq!(c & 0x03FF_FFFF, (ss << 16) | (sb << 13) | 0x8000 | 2, "{name}: Config {c:#x}");
+            }
+        }).unwrap().join().unwrap();
+    }
+
+    /// A TLB write on an R12000 with FrameMask set clears EntryLo bit 18, as on
+    /// the R10000.
+    #[test]
+    fn framemask_clears_entrylo_bits_on_the_r12000() {
+        use crate::cpu::mips_cache_shadow::*;
+        // Write the entry with FrameMask set, find it with TLBP, clear EntryLo0
+        // and TLBR it: (FrameMask, EntryLo0 as the TLB holds it, physical page).
+        fn written<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_masked::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, 0xFFFF_0001);
+            let phys = exec.debug_translate(VA).phys;
+            for (rd, value) in [(10, VA), (2, 0)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (exec.core.read_cp0(21), exec.core.read_cp0(2), phys)
+        }
+        on_big_stack(|| {
+            // Physical bit 24 is EntryLo bit 18, FrameMask bit 0.
+            let masked = (((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1)) & !(1 << 18);
+            assert_eq!(written::<R12000ShadowCache>(), (1, masked, 0x0200_5000), "R12000");
+        });
     }
 }

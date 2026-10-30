@@ -631,8 +631,8 @@ pub trait CpuModel: MipsCache {
     /// The part is in the R10000 family, which shares one programming model:
     /// FrameMask, and 44 virtual and 40 physical address bits.
     /// Established for the R10000. The R12000 is inferred to match: its manual's
-    /// list of changes from the R10000 has no TLB or CP0 change. The R14000 and
-    /// R16000 are a model choice that gives them the same TLB.
+    /// list of changes from the R10000 has no TLB or CP0 change. The R14000 is
+    /// a model choice that gives it the same TLB.
     const R10K_FAMILY: bool = false;
     /// A partial LWR keeps bits 63:32 of the destination. Observed on the
     /// R10000; whether the later parts do the same is not established, so they
@@ -1469,6 +1469,13 @@ pub mod model {
     pub const R4400: u8 = 0;
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
+    pub const R12000: u8 = 3;
+
+    /// The R10000 family: the R10000 and the parts that follow it, which share
+    /// one programming model.
+    pub const fn r10k_family(model: u8) -> bool {
+        matches!(model, R10000 | R12000)
+    }
 }
 
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.
