@@ -79,3 +79,4 @@ pub mod dp83843;
 pub mod ics1890;
 pub mod timekeeper;
 pub mod prom_image;
+pub mod isp12160;

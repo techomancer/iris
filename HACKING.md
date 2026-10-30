@@ -101,6 +101,12 @@ the machine supplies only a route from controller number to bus.
 Flash command engines share `FlashBacking` file storage while retaining
 their own command state.
 
+`ScsiTarget::bus_reset` defaults to no action. Disk targets record reset as
+unit attention. Only the ISP12160 calls it; the other controllers keep
+their earlier behaviour of not reporting resets to targets.
+The ISP12160 releases its controller state lock before walking either bus.
+Target callbacks run under that bus lock and must not reacquire it.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit
