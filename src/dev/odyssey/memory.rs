@@ -9,7 +9,6 @@ use super::*;
 
 use std::cell::Cell;
 
-pub const SGI_PLANE_NONE: u32 = u32::MAX;
 pub const SGI_PLANES_MAX: usize = 32;
 
 pub type PlaneFormat = u32;
@@ -105,40 +104,35 @@ pub fn plane_bytes_per_pixel(format: PlaneFormat) -> u32 {
 
 impl BoardMemory {
     /// Declare a plane. Its id is assigned here and returned; the rest of
-    /// *plane is copied. Fails, returning SGI_PLANE_NONE (and setting errp),
-    /// when the plane does not fit the memory, its rows do not fit its stride
-    /// and length, or the table already holds SGI_PLANES_MAX planes.
-    pub fn add_plane(&mut self, plane: &Plane, errp: &mut Option<String>) -> u32 {
+    /// *plane is copied. Fails when the plane does not fit the memory, its
+    /// rows do not fit its stride and length, or the table already holds
+    /// SGI_PLANES_MAX planes.
+    pub fn add_plane(&mut self, plane: &Plane) -> Result<u32, String> {
         let bpp = plane_bytes_per_pixel(plane.format);
         let row = plane.width as u64 * bpp as u64;
 
         if plane.width == 0 || plane.height == 0 {
-            *errp = Some("plane has no pixels".to_string());
-            return SGI_PLANE_NONE;
+            return Err("plane has no pixels".to_string());
         }
         if (plane.stride as u64) < row {
-            *errp = Some(format!(
+            return Err(format!(
                 "plane stride {} is shorter than its {}-byte rows",
                 plane.stride, row
             ));
-            return SGI_PLANE_NONE;
         }
         let need = (plane.height as u64 - 1) * plane.stride as u64 + row;
         if need > plane.len {
-            *errp = Some(format!("plane needs {} bytes but has {}", need, plane.len));
-            return SGI_PLANE_NONE;
+            return Err(format!("plane needs {} bytes but has {}", need, plane.len));
         }
         if plane.base > self.size || plane.len > self.size - plane.base {
-            *errp = Some(format!(
+            return Err(format!(
                 "plane {:#x}+{:#x} is outside {:#x} bytes of board memory",
                 plane.base, plane.len, self.size
             ));
-            return SGI_PLANE_NONE;
         }
 
         if self.nplanes as usize == SGI_PLANES_MAX {
-            *errp = Some(format!("board memory already has {} planes", SGI_PLANES_MAX));
-            return SGI_PLANE_NONE;
+            return Err(format!("board memory already has {} planes", SGI_PLANES_MAX));
         }
         let id = self.nplanes;
         self.nplanes += 1;
@@ -146,7 +140,7 @@ impl BoardMemory {
         *p = *plane;
         p.id = id;
         crate::dlog!(LogModule::Odyssey, "sgi_plane_add: plane {} base {:#x} len {:#x} {}x{} stride {} format {}", p.id, p.base, p.len, p.width, p.height, p.stride, p.format as i32);
-        p.id
+        Ok(p.id)
     }
     /// The plane with this id, if there is one.
     pub fn plane(&self, id: u32) -> Option<Plane> {

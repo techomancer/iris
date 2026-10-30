@@ -43,10 +43,14 @@ pub const SGI_DMA_CHUNK_MAX: u32 = 4096;
 /// The smallest page a page list may name.
 pub const SGI_DMA_MIN_PAGE_SIZE: u32 = SGI_DMA_CHUNK_MAX;
 
-/// Why a DMA write to guest memory failed.
-pub type Failure = u32;
-pub const SGI_FAIL_BUS: Failure = 1; // a guest-memory transaction failed
-pub const SGI_FAIL_BOUNDS: Failure = 2; // outside the page list, plane or pool
+/// Why a DMA transfer to or from guest memory failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DmaError {
+    /// A guest-memory transaction failed.
+    Bus,
+    /// Outside the page list, plane or pool.
+    Bounds,
+}
 
 /// A head's view of guest memory. The inbound path is direct-mapped: a
 /// device address is the bus address.
@@ -131,9 +135,9 @@ impl DmaBus {
     }
 
     /// Resolve [offset, offset + len) of a page-listed buffer and append its
-    /// chunks to map. Returns 0, or an Failure after logging a guest error.
+    /// chunks to map. Fails, after logging a guest error, with the reason.
     #[allow(clippy::too_many_arguments, reason = "the range, its direction and its trace label")]
-    pub fn map(&self, map: &mut DmaMap, pl: &DmaPageList, offset: u64, len: u64, dir: DmaDirection, trace: bool, trace_seq: u64) -> i32 {
+    pub fn map(&self, map: &mut DmaMap, pl: &DmaPageList, offset: u64, len: u64, dir: DmaDirection, trace: bool, trace_seq: u64) -> Result<(), DmaError> {
         let total = pl.bytes();
         let mut pos = offset;
 
@@ -150,7 +154,7 @@ impl DmaBus {
                 len,
                 pl.npages
             );
-            return SGI_FAIL_BOUNDS as i32;
+            return Err(DmaError::Bounds);
         }
 
         let ps = pl.page_size as u64;
@@ -171,7 +175,7 @@ impl DmaBus {
                     page,
                     pl.page_size
                 );
-                return SGI_FAIL_BOUNDS as i32;
+                return Err(DmaError::Bounds);
             }
             crate::dlog_dev!(LogModule::Odyssey, "sgi_dma_chunk: addr {:#x} len {}", addr, n);
             let mut c = DmaChunk {
@@ -188,7 +192,7 @@ impl DmaBus {
             // the writes the head made and no read of its own.
             if dir == DmaDirection::ToDevice && !read_guest(&self.mem, bus_addr, &mut c.host[..]) {
                 crate::dlog!(LogModule::Odyssey, "sgi-dma: read of {} bytes at {:#x} failed", n, bus_addr);
-                return SGI_FAIL_BUS as i32;
+                return Err(DmaError::Bus);
             }
             if dir == DmaDirection::ToDevice {
                 self.trace(trace, trace_seq, addr, &c.host[..c.len as usize]);
@@ -197,7 +201,7 @@ impl DmaBus {
             map.chunks.push(c);
         }
         crate::dlog_dev!(LogModule::Odyssey, "sgi_dma_map: seq {} dir {:?} offset {:#x} len {:#x} chunks {}", trace_seq, dir, offset, len, map.chunks.len() - first);
-        0
+        Ok(())
     }
 }
 

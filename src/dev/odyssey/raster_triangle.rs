@@ -400,9 +400,10 @@ impl SoftDraw<'_> {
         let sub = self.rules.subpixel_bits as i32;
 
         for i in 0..3 {
-            if !self.project(verts[i], &mut v[i]) {
+            let Some(p) = self.project(verts[i]) else {
                 return;
-            }
+            };
+            v[i] = p;
         }
 
         area = v[0].edge(&v[1], v[2].x, v[2].y);
@@ -500,10 +501,9 @@ impl SoftDraw<'_> {
         let max_y = v[0].y.max(v[1].y.max(v[2].y)) >> sub;
 
         // Window pixels, bounded by the viewport and the owned rectangle.
-        let (mut px0, mut py0, mut px1, mut py1) = (0i32, 0i32, 0i32, 0i32);
-        if !self.bounds(&mut px0, &mut py0, &mut px1, &mut py1) {
+        let Some((mut px0, mut py0, mut px1, mut py1)) = self.bounds() else {
             return;
-        }
+        };
         px0 = (min_x as i32).max(px0);
         px1 = (max_x as i32).min(px1);
         py0 = (min_y as i32).max(py0);
@@ -562,9 +562,9 @@ impl SoftDraw<'_> {
             let mut e2 = v[0].edge(&v[1], cx, cy);
             let mut lo: i64 = 0;
             let mut hi: i64 = px1 as i64 - px0 as i64;
-            v[1].owned_run(&v[2], e0, step0, &mut lo, &mut hi);
-            v[2].owned_run(&v[0], e1, step1, &mut lo, &mut hi);
-            v[0].owned_run(&v[1], e2, step2, &mut lo, &mut hi);
+            (lo, hi) = v[1].owned_run(&v[2], e0, step0, (lo, hi));
+            (lo, hi) = v[2].owned_run(&v[0], e1, step1, (lo, hi));
+            (lo, hi) = v[0].owned_run(&v[1], e2, step2, (lo, hi));
             if lo > hi {
                 continue;
             }
@@ -722,9 +722,10 @@ impl SoftDraw<'_> {
                 let mut projected: [SoftVertex; 3] = Default::default();
 
                 for j in 0..3 {
-                    if !self.project(vertices[j], &mut projected[j]) {
+                    let Some(p) = self.project(vertices[j]) else {
                         return false;
-                    }
+                    };
+                    projected[j] = p;
                 }
                 if !self.texture_coefficients(&projected) {
                     return false;
@@ -746,9 +747,8 @@ impl SoftDraw<'_> {
     pub fn triangle(&self, va: &[f32], vb: &[f32], vc: &[f32], provoking: &[f32]) {
         let mut poly: [VolumeVertex; SGI_VOLUME_TRIANGLE_MAX] = Default::default();
         let mut n = 0u32;
-        let (mut x0, mut y0, mut x1, mut y1) = (0i32, 0i32, 0i32, 0i32);
 
-        if !self.bounds(&mut x0, &mut y0, &mut x1, &mut y1) || !self.clip_triangle(va, vb, vc, &mut poly, &mut n) {
+        if self.bounds().is_none() || !self.clip_triangle(va, vb, vc, &mut poly, &mut n) {
             return;
         }
         let mut i = 1usize;
@@ -969,14 +969,14 @@ impl SoftDraw<'_> {
     /// datums and an approximation for perspective-correct varyings.
     pub fn polygon_coverage(&self, v: &[SoftVertex], n: usize, flat_color: &[f32], flat_index: f64, offset: f64) {
         let mut flat = SoftFrag::default();
-        let (mut px0, mut py0, mut px1, mut py1) = (0i32, 0i32, 0i32, 0i32);
         let sub = self.rules.subpixel_bits as i32;
         let scale = (1i32 << sub) as f64;
         let mut polygon_area = 0.0f64;
 
-        if !(3..=usize::MAX - 8).contains(&n) || !self.bounds(&mut px0, &mut py0, &mut px1, &mut py1) {
+        let bounds = if (3..=usize::MAX - 8).contains(&n) { self.bounds() } else { None };
+        let Some((mut px0, mut py0, mut px1, mut py1)) = bounds else {
             return;
-        }
+        };
         let capacity = n + 8;
         let mut a = vec![SoftAaPoint::default(); capacity];
         let mut b = vec![SoftAaPoint::default(); capacity];
@@ -1200,9 +1200,10 @@ impl SoftDraw<'_> {
             flat_index = provoking[SGI_GL_V_BACK_INDEX];
         }
         for i in 0..n {
-            if !self.project(&poly[i], &mut v[i]) {
+            let Some(p) = self.project(&poly[i]) else {
                 return;
-            }
+            };
+            v[i] = p;
             if !front && self.back_colors {
                 let back = &poly[i].attr[SGI_GL_V_BACK_COLOR..SGI_GL_V_BACK_COLOR + 4];
 
@@ -1266,9 +1267,8 @@ impl SoftDraw<'_> {
         let mut positions = *self;
         let mut coverage = *self;
         let mut fan: [SoftVertex; 3] = Default::default();
-        let mut first = SoftVertex::default();
         let mut previous: SoftVertex;
-        let mut current = SoftVertex::default();
+        let mut current: SoftVertex;
         let mut stipple = SoftLineStipple {
             enabled: d.line_stipple_enabled,
             repeat: r2_max(1, r2_min(d.line_stipple_repeat, 256)),
@@ -1306,15 +1306,17 @@ impl SoftDraw<'_> {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: polygon exceeds convex clipping bound");
             return SGI_GL_DRAW_OK;
         }
-        if n == 0 || !positions.project(&poly[0], &mut first) {
+        let projected = if n == 0 { None } else { positions.project(&poly[0]) };
+        let Some(first) = projected else {
             return SGI_GL_DRAW_OK;
-        }
+        };
         previous = first;
         fan[0] = first;
         for (i, v) in poly.iter().enumerate().take(n).skip(1) {
-            if !positions.project(v, &mut current) {
+            let Some(p) = positions.project(v) else {
                 return SGI_GL_DRAW_OK;
-            }
+            };
+            current = p;
             if i >= 2 {
                 area += first.edge(&previous, current.x, current.y) as f64;
                 fan[1] = previous;
@@ -1349,10 +1351,16 @@ impl SoftDraw<'_> {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: invalid polygon mode {:#x} ignored", mode);
             return SGI_GL_DRAW_OK;
         }
-        if (mode == SGI_GL_LINE && !soft_dimension(d.line_width, &mut coverage.line_width))
-            || (mode == SGI_GL_POINT && !soft_dimension(d.point_size, &mut coverage.point_size))
-        {
-            return SGI_GL_DRAW_OK;
+        if mode == SGI_GL_LINE {
+            let Some(width) = soft_dimension(d.line_width) else {
+                return SGI_GL_DRAW_OK;
+            };
+            coverage.line_width = width;
+        } else if mode == SGI_GL_POINT {
+            let Some(size) = soft_dimension(d.point_size) else {
+                return SGI_GL_DRAW_OK;
+            };
+            coverage.point_size = size;
         }
         flat.copy_from_slice(&provoking[..SGI_GL_VERTEX_FLOATS]);
         if !front && self.back_colors {
@@ -1363,25 +1371,25 @@ impl SoftDraw<'_> {
         }
         // Validate the entire boundary before any LINE/POINT fragment or sample.
         for i in 0..n {
-            if !self.project(&poly[i], &mut current) {
+            let Some(p) = self.project(&poly[i]) else {
                 return SGI_GL_DRAW_OK;
-            }
-            if self.texture_base.is_some() && mode == SGI_GL_LINE {
-                let mut next = SoftVertex::default();
-
-                if !self.project(&poly[(i + 1) % n], &mut next)
-                    || current
+            };
+            current = p;
+            if self.texture_base.is_some()
+                && mode == SGI_GL_LINE
+                && !self.project(&poly[(i + 1) % n]).is_some_and(|next| {
+                    current
                         .texture_line_gradient(
                             &next,
                             self.rules.subpixel_bits as u32,
                             self.image().volume,
                             self.image().one_dimensional,
                         )
-                        .is_none()
-                {
-                    self.texture_report(16, "invalid primitive coefficients, primitive dropped");
-                    return SGI_GL_DRAW_OK;
-                }
+                        .is_some()
+                })
+            {
+                self.texture_report(16, "invalid primitive coefficients, primitive dropped");
+                return SGI_GL_DRAW_OK;
             }
         }
         let offset_enable = if mode == SGI_GL_LINE { SGI_GL_OFFSET_LINE } else { SGI_GL_OFFSET_POINT };
@@ -1391,16 +1399,15 @@ impl SoftDraw<'_> {
                 + self.st.offset_bias as f64;
         }
         for i in 0..n {
-            let mut next = SoftVertex::default();
-
             if !poly[i].soft_boundary_edge() {
                 continue;
             }
-            self.project(&poly[i], &mut current);
+            // Validated in full above, so every projection here succeeds.
+            let current = self.project(&poly[i]).unwrap_or_default();
             if mode == SGI_GL_POINT {
                 coverage.point_projected(&current, Some(&flat), offset);
             } else {
-                self.project(&poly[(i + 1) % n], &mut next);
+                let next = self.project(&poly[(i + 1) % n]).unwrap_or_default();
                 coverage.line_projected(&current, &next, &flat, offset, Some(&mut stipple), false);
             }
         }

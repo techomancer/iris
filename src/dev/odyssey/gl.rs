@@ -750,63 +750,56 @@ impl Board {
 
 }
 
-pub fn texture_detail_sampler(sampler: u32, detail: &mut TextureDetailSampler) -> bool {
-    *detail = TextureDetailSampler { descriptor: 62, width: 2, height: 2, level: -2, mode: SGI_GL_ADD };
+pub fn texture_detail_sampler(sampler: u32) -> Option<TextureDetailSampler> {
+    let mut detail = TextureDetailSampler { descriptor: 62, width: 2, height: 2, level: -2, mode: SGI_GL_ADD };
     match sampler {
         0x02108000 => {
             detail.descriptor = 63;
             detail.level = -1;
-            true
+            Some(detail)
         }
-        0x04108000 => true,
+        0x04108000 => Some(detail),
         0x06108000 => {
             detail.descriptor = 61;
             detail.level = -3;
-            true
+            Some(detail)
         }
         0x04208000 => {
             detail.width = 4;
-            true
+            Some(detail)
         }
         0x04110000 => {
             detail.height = 4;
-            true
+            Some(detail)
         }
         0x84108000 => {
             detail.mode = SGI_GL_MODULATE;
-            true
+            Some(detail)
         }
-        _ => false,
+        _ => None,
     }
 }
 
-pub fn texture_detail_entry_weight(value: u32, weight: &mut f64) -> bool {
+pub fn texture_detail_entry_weight(value: u32) -> Option<f64> {
     match value {
-        0x00000000 | 0x00400000 | 0x00555000 | 0x00800000 | 0x00fff000 => {
-            *weight = value as f64 / 16777216.0;
-            true
-        }
-        _ => false,
+        0x00000000 | 0x00400000 | 0x00555000 | 0x00800000 | 0x00fff000 => Some(value as f64 / 16777216.0),
+        _ => None,
     }
 }
 
 impl Board {
-    pub fn texture_detail_function_weight(&self, weight: &mut TextureDetailWeight) -> bool {
+    pub fn texture_detail_function_weight(&self) -> Option<TextureDetailWeight> {
         let table = &self.tex_detail_function;
         let last = (SGI_ODYSSEY_TEX_DETAIL_FUNCTION_ENTRIES - 1) as usize;
 
         if self.tex_detail_function_valid != 0xffff {
-            return false;
+            return None;
         }
-        weight.constant = true;
-        for i in 1..=last {
-            if table[i] != table[0] {
-                weight.constant = false;
-                break;
-            }
-        }
-        texture_detail_entry_weight(table[0], &mut weight.first)
-            && texture_detail_entry_weight(table[last], &mut weight.last)
+        Some(TextureDetailWeight {
+            constant: table[1..=last].iter().all(|&e| e == table[0]),
+            first: texture_detail_entry_weight(table[0])?,
+            last: texture_detail_entry_weight(table[last])?,
+        })
     }
 }
 
@@ -958,18 +951,6 @@ impl GlTexImage<'_> {
     }
 }
 
-fn gl_umul_ovf(a: u64, b: u64, r: &mut u64) -> bool {
-    let (v, o) = a.overflowing_mul(b);
-    *r = v;
-    o
-}
-
-fn gl_uadd_ovf(a: u64, b: u64, r: &mut u64) -> bool {
-    let (v, o) = a.overflowing_add(b);
-    *r = v;
-    o
-}
-
 impl Board {
     pub fn texture_setup(&mut self, image: &mut GlTexImage<'static>, chain: &mut TextureChain) -> bool {
         let width_word = self.tex_sampler[1];
@@ -982,9 +963,10 @@ impl Board {
         let word = self.tex_sampler[4] & !ODSY_TEX_SAMPLER_BIT17;
         let components = word & 0x0f800000;
         let mut sampler_size = self.tex_sampler[0];
-        let mut detail_sampler = TextureDetailSampler::default();
-        let mut detail_weight = TextureDetailWeight::default();
-        let detail_identity = texture_detail_sampler(sampler_size, &mut detail_sampler);
+        let detail = texture_detail_sampler(sampler_size);
+        let detail_identity = detail.is_some();
+        let detail_sampler = detail.unwrap_or_default();
+        let detail_weight = if detail_identity { self.texture_detail_function_weight() } else { None };
         let detail_filter = if detail_identity { texture_detail_filter(word) } else { 0 };
         let tex_shape = self.tex_mode & (ODSY_TEX_MODE_1D | ODSY_TEX_MODE_2D | ODSY_TEX_MODE_3D);
         let three_d = (self.tex_mode & ODSY_TEX_MODE_3D) != 0;
@@ -1059,12 +1041,10 @@ impl Board {
             SGI_GL_NEAREST_MIPMAP_LINEAR,
             SGI_GL_LINEAR_MIPMAP_LINEAR,
         ];
-        let mut end: u64 = 0;
-
         'unsupported: {
             if detail_identity {
                 if detail_filter == 0
-                    || !self.texture_detail_function_weight(&mut detail_weight)
+                    || detail_weight.is_none()
                     || self.tex_level0 != 0
                     || width != 1
                     || height != 1
@@ -1260,15 +1240,15 @@ impl Board {
                 // traces that showed it at two bases. Physical V12 texture layout
                 // remains unqualified.
                 if three_d_stored && width == 2 && height == 2 && depth == 2 {
-                    let mut first_slice = 0u64;
+                    let first_slice = slice_stride
+                        .checked_mul(15)
+                        .and_then(|s| s.checked_add(base as u64))
+                        .and_then(|s| u32::try_from(s).ok());
 
-                    if gl_umul_ovf(slice_stride, 15, &mut first_slice)
-                        || gl_uadd_ovf(base as u64, first_slice, &mut first_slice)
-                        || first_slice > u32::MAX as u64
-                    {
+                    let Some(first_slice) = first_slice else {
                         break 'unsupported;
-                    }
-                    base = first_slice as u32;
+                    };
+                    base = first_slice;
                 }
                 terminal = cmax(cmax(width.trailing_zeros(), height.trailing_zeros()), depth.trailing_zeros());
                 count = if mipmap && hi > 0 { cmin(terminal, ((hi + 255) / 256) as u32) + 1 } else { 1 };
@@ -1281,8 +1261,6 @@ impl Board {
                     let level_width = cmax(1, width >> i);
                     let level_height = cmax(1, height >> i);
                     let level_depth = cmax(1, depth >> i);
-                    let mut next_base = 0u64;
-
                     if i != 0
                         && (self.tex_levels[(i * 3) as usize] != 0
                             || self.tex_levels[(i * 3 + 1) as usize] != 0
@@ -1293,38 +1271,30 @@ impl Board {
                     let level_slice = slice_next;
                     let mut z = 0u32;
                     while z < level_depth + (if three_d_stored { 2 } else { 0 }) {
-                        let mut offset = 0u64;
-                        let mut slice_base = 0u64;
-                        let mut storage_end = 0u64;
+                        let slice_base = (z as u64)
+                            .checked_mul(slice_stride)
+                            .and_then(|o| o.checked_add(base as u64))
+                            .and_then(|s| u32::try_from(s).ok());
 
-                        if gl_umul_ovf(z as u64, slice_stride, &mut offset)
-                            || gl_uadd_ovf(base as u64, offset, &mut slice_base)
-                            || slice_base > u32::MAX as u64
-                        {
+                        let Some(slice_base) = slice_base else {
                             break 'unsupported;
-                        }
-                        let object = self.object_find(slice_base as u32);
+                        };
+                        let object = self.object_find(slice_base);
                         if object < 0 {
                             break 'unsupported;
                         }
                         let o = object as usize;
                         let sb: u32 = if three_d_stored { 15 } else { 0 };
                         let sb2: u32 = if three_d_stored { 2 } else { 0 };
+                        let storage_end = (sb as u64 + level_height as u64 - 1 + sb2 as u64)
+                            .checked_mul(self.obj_width[o] as u64)
+                            .and_then(|e| e.checked_add(self.obj_offset[o] as u64))
+                            .and_then(|e| {
+                                e.checked_add(if three_d_stored { level_width as u64 + 18 } else { level_width as u64 })
+                            });
                         if self.obj_width[o] != stride_units * 16
                             || self.obj_rows[o] < sb + level_height + sb2
-                            || gl_umul_ovf(
-                                sb as u64 + level_height as u64 - 1 + sb2 as u64,
-                                self.obj_width[o] as u64,
-                                &mut storage_end,
-                            )
-                            || gl_uadd_ovf(storage_end, self.obj_offset[o] as u64, &mut storage_end)
-                            || gl_uadd_ovf(
-                                storage_end,
-                                if three_d_stored { level_width as u64 + 18 } else { level_width as u64 },
-                                &mut storage_end,
-                            )
-                            || storage_end > self.obj_used as u64
-                            || storage_end > self.obj_mem.size / 4
+                            || !storage_end.is_some_and(|e| e <= self.obj_used as u64 && e <= self.obj_mem.size / 4)
                         {
                             break 'unsupported;
                         }
@@ -1364,13 +1334,15 @@ impl Board {
                         ..Default::default()
                     };
                     if i + 1 < count {
-                        if gl_umul_ovf(level_depth as u64, slice_stride, &mut next_base)
-                            || gl_uadd_ovf(base as u64, next_base, &mut next_base)
-                            || next_base > u32::MAX as u64
-                        {
+                        let next_base = (level_depth as u64)
+                            .checked_mul(slice_stride)
+                            .and_then(|n| n.checked_add(base as u64))
+                            .and_then(|n| u32::try_from(n).ok());
+
+                        let Some(next_base) = next_base else {
                             break 'unsupported;
-                        }
-                        base = next_base as u32;
+                        };
+                        base = next_base;
                     }
                 }
                 chain.volume = chain.volumes[0];
@@ -1466,15 +1438,15 @@ impl Board {
                 let object = self.object_find(base);
                 let backed = object >= 0 && {
                     let o = object as usize;
+                    let end = ((rows - 1) as u64)
+                        .checked_mul(self.obj_width[o] as u64)
+                        .and_then(|e| e.checked_add(self.obj_offset[o] as u64))
+                        .and_then(|e| e.checked_add(interior_x as u64))
+                        .and_then(|e| e.checked_add(level_width as u64 + bordered as u64));
                     !(self.obj_width[o] < level_width
                         || (stride_units != 0 && self.obj_width[o] != stride_units * 16)
                         || self.obj_rows[o] < rows
-                        || gl_umul_ovf((rows - 1) as u64, self.obj_width[o] as u64, &mut end)
-                        || gl_uadd_ovf(end, self.obj_offset[o] as u64, &mut end)
-                        || gl_uadd_ovf(end, interior_x as u64, &mut end)
-                        || gl_uadd_ovf(end, level_width as u64 + bordered as u64, &mut end)
-                        || end > self.obj_used as u64
-                        || end > self.obj_mem.size / 4)
+                        || !end.is_some_and(|e| e <= self.obj_used as u64 && e <= self.obj_mem.size / 4))
                 };
                 if !backed {
                     if require_backing {
@@ -1529,7 +1501,7 @@ impl Board {
                 ) {
                     break 'unsupported;
                 }
-                chain.volume.detail_weight = detail_weight;
+                chain.volume.detail_weight = detail_weight.unwrap_or_default();
                 image.detail_image = Some(chain.detail_image);
                 image.detail_level = detail_sampler.level;
                 image.detail_mode = detail_sampler.mode;

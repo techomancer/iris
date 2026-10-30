@@ -175,24 +175,24 @@ impl Board {
         (ctl & ODSY_CURSOR_CTL_ENABLE) != 0 && (ctl & ODSY_CURSOR_CTL_CHANNEL1) == 0
     }
 
-    /// The display lines the cursor covers as it stands: first > last if none.
-    pub fn cursor_span(&mut self, first: &mut i32, last: &mut i32) {
-        *first = 0;
-        *last = -1;
+    /// The first and last display line the cursor covers as it stands, or
+    /// None when it covers none.
+    pub fn cursor_span(&mut self) -> Option<(i32, i32)> {
         if !self.cursor_shown() {
-            return;
+            return None;
         }
+        let bottom = self.scanout.mode.height as i32 - 1;
         if self.cursor[ODSY_CURSOR_CONTROL as usize] & ODSY_CURSOR_CTL_CROSSHAIR != 0 {
             // The vertical line crosses every line.
-            *last = self.scanout.mode.height as i32 - 1;
-            return;
+            return Some((0, bottom));
         }
-        *first = self.cursor_y().max(0);
-        *last = (self.cursor_y() + ODSY_CURSOR_SIZE as i32 - 1).min(self.scanout.mode.height as i32 - 1);
+        Some((self.cursor_y().max(0), (self.cursor_y() + ODSY_CURSOR_SIZE as i32 - 1).min(bottom)))
     }
 
-    pub fn cursor_invalidate(&mut self, first: i32, last: i32) {
-        if first <= last {
+    /// Repaint the lines of a span from cursor_span(); a span past the
+    /// bottom of the raster is empty.
+    pub fn cursor_invalidate(&mut self, span: Option<(i32, i32)>) {
+        if let Some((first, last)) = span.filter(|&(first, last)| first <= last) {
             self.scanout.invalidate(first, last - first + 1);
         }
     }
@@ -270,14 +270,13 @@ impl Board {
     /// carries that has no known meaning, and repaint the lines the cursor
     /// covered before and covers now.
     pub fn cursor_write(&mut self, index: u32, data: u32) {
-        let (mut old_first, mut old_last, mut first, mut last) = (0, 0, 0, 0);
+        let old = self.cursor_span();
 
-        self.cursor_span(&mut old_first, &mut old_last);
         self.cursor[index as usize] = data;
         self.cursor_check(index, data);
-        self.cursor_span(&mut first, &mut last);
-        self.cursor_invalidate(old_first, old_last);
-        self.cursor_invalidate(first, last);
+        let new = self.cursor_span();
+        self.cursor_invalidate(old);
+        self.cursor_invalidate(new);
     }
 
     /// Draw the cursor over display line y, already resolved into dst. With bit

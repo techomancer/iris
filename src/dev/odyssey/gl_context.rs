@@ -601,6 +601,18 @@ pub struct GlContext {
     pub tex_gen_mode: [u32; 4],
     pub tex_gen_object_plane: [[f32; 4]; 4],
     pub tex_gen_eye_plane: [[f32; 4]; 4],
+    /// Draw-result failures already reported, one bit per DrawFailure.
+    draw_failures_reported: u32,
+}
+
+/// The kinds of checked-draw failure that have no consumer, each reported
+/// once per context.
+#[derive(Clone, Copy)]
+enum DrawFailure {
+    Unsupported,
+    Resource,
+    Host,
+    Invalid,
 }
 
 /// A decoded command: its entry point and its scalar arguments as 32-bit
@@ -699,20 +711,8 @@ pub const SGI_GL_GET_WORDS: usize = 16;
 
 // Functions.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 // The last client clip plane and light enumerants.
 pub const SGI_GL_CLIP_PLANE_LAST: u32 = SGI_GL_CLIP_PLANE0 + SGI_GL_CLIP_PLANES - 1;
-
-/// Print a message once per site.
-pub fn gl_report_once(site: u32, msg: &str) {
-    static REPORTED: AtomicU32 = AtomicU32::new(0);
-    let bit = 1u32 << site;
-
-    if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-        eprintln!("{}", msg);
-    }
-}
 
 /// The word `i` of a command's arguments (a short list reads as 0 rather
 /// than past the end).
@@ -892,23 +892,28 @@ impl GlContext {
         match result {
             SGI_GL_DRAW_OUT_OF_MEMORY => {}
             SGI_GL_DRAW_UNSUPPORTED => {
-                gl_report_once(1, "sgi-gl: unsupported checked draw has no result consumer");
+                self.report_draw_failure(DrawFailure::Unsupported, "unsupported checked draw");
             }
             SGI_GL_DRAW_RESOURCE_ERROR => {
-                gl_report_once(2, "sgi-gl: checked draw resource failure has no result consumer");
+                self.report_draw_failure(DrawFailure::Resource, "checked draw resource failure");
             }
             SGI_GL_DRAW_HOST_ERROR => {
-                gl_report_once(3, "sgi-gl: checked draw host failure has no result consumer");
+                self.report_draw_failure(DrawFailure::Host, "checked draw host failure");
             }
             _ => {
-                gl_report_once(
-                    4,
-                    &format!(
-                        "sgi-gl: invalid checked draw result {} has no result consumer",
-                        result
-                    ),
-                );
+                self.report_draw_failure(DrawFailure::Invalid, &format!("invalid checked draw result {}", result));
             }
+        }
+    }
+
+    /// Say that a draw failed with nobody to tell, the first time for each
+    /// kind of failure.
+    fn report_draw_failure(&mut self, kind: DrawFailure, what: &str) {
+        let bit = 1u32 << kind as u32;
+
+        if self.draw_failures_reported & bit == 0 {
+            self.draw_failures_reported |= bit;
+            eprintln!("sgi-gl: {what} has no result consumer");
         }
     }
 

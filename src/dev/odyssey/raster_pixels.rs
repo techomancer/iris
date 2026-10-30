@@ -13,11 +13,10 @@ impl SoftDraw<'_> {
     pub fn draw_pixels(&self, d: &GlDraw, limit: u64) -> u64 {
         let n = d.count as usize;
         let mut sum = 0u64;
-        let (mut x0, mut y0, mut x1, mut y1) = (0i32, 0i32, 0i32, 0i32);
 
-        if !self.bounds(&mut x0, &mut y0, &mut x1, &mut y1) || n < 3 {
+        let Some((x0, y0, x1, y1)) = self.bounds().filter(|_| n >= 3) else {
             return 0;
-        }
+        };
         let mut xy = vec![0.0f64; 2 * n];
         for i in 0..n {
             let mut cv = VolumeVertex::default();
@@ -194,8 +193,11 @@ impl RasterRules {
         if op.clip.n == 0 && op.clip.empty != 0 {
             return;
         }
-        if stencil && !self.stencil_max(t, &mut smax) {
-            stencil = false;
+        if stencil {
+            match self.stencil_max(t) {
+                Some(max) => smax = max,
+                None => stencil = false,
+            }
         }
         if colour && op.index_bits != 0 && !t.soft_check_index(op.index_bits) {
             colour = false;

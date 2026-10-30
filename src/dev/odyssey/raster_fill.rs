@@ -576,12 +576,11 @@ impl SoftDraw<'_> {
     /// planes or polygon stipple.
     pub fn fill_admits(&self) -> bool {
         let st: &GlDrawState = self.st;
-        let mut smax = 0u32;
 
         st.index_bits == 0
             && st.alpha_test == 0
             && !self.logic_op
-            && !(st.stencil_test != 0 && self.rules.stencil_max(self.t, &mut smax))
+            && !(st.stencil_test != 0 && self.rules.stencil_max(self.t).is_some())
             && st.clip_planes == 0
             && self.polygon_stipple.is_none()
     }

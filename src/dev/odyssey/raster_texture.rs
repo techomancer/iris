@@ -844,20 +844,19 @@ pub fn soft_texture_mix(value: &mut [f64; 4], other: &[f64; 4], alpha: f64) {
 }
 
 impl SoftDraw<'_> {
-    pub fn texture_weight(&self, lambda: f64, weight: &mut f64) -> bool {
+    pub fn texture_weight(&self, lambda: f64) -> Option<f64> {
         let im = self.image();
 
-        *weight = fmin(fmax(-lambda / 4.0, 0.0), 1.0);
         if im.read_filter_weight {
             match self.texels.filter_weight(lambda) {
-                Some(w) if w.is_finite() => *weight = w,
+                Some(w) if w.is_finite() => return Some(w),
                 _ => {
                     self.texture_report(16, "invalid filter weight, fragment dropped");
-                    return false;
+                    return None;
                 }
             }
         }
-        true
+        Some(fmin(fmax(-lambda / 4.0, 0.0), 1.0))
     }
 
     pub fn texture_sharpen_sample(&self, filter: u32, lambda: f64, s: f64, t: f64, rr: f64, texel: &mut [f64; 4]) -> bool {
@@ -866,7 +865,6 @@ impl SoftDraw<'_> {
         let base = self.texture_base.expect("a base level");
         let mut extent = std::cmp::max(base.width, base.height);
         let mut other = [0.0f64; 4];
-        let mut weight = 0.0f64;
 
         if !self.texture_sample(Some(base), SGI_GL_LINEAR, s, t, rr, texel) {
             return false;
@@ -887,9 +885,10 @@ impl SoftDraw<'_> {
                 (if im.volume { !c.read_texel_3d } else { !c.read_texel })) => c,
             _ => return true,
         };
-        if !self.texture_weight(lambda, &mut weight) ||
-            !self.texture_sample(Some(coarse), SGI_GL_LINEAR, s, t, rr, &mut other)
-        {
+        let Some(weight) = self.texture_weight(lambda) else {
+            return false;
+        };
+        if !self.texture_sample(Some(coarse), SGI_GL_LINEAR, s, t, rr, &mut other) {
             return false;
         }
         for k in 0..4usize {
@@ -928,7 +927,6 @@ impl SoftDraw<'_> {
         let base = self.texture_base.expect("a base level");
         let mut repeat = *im;
         let mut other = [0.0f64; 4];
-        let mut weight = 0.0f64;
         let scale: i32 = std::cmp::min(-(im.detail_level as i64), i32::MAX as i64) as i32;
 
         if !self.texture_sample(Some(base), SGI_GL_LINEAR, s, t, rr, texel) {
@@ -960,9 +958,10 @@ impl SoftDraw<'_> {
         let mut draw = *self;
         draw.texture = Some(&repeat);
         draw.texels_cache = None;
-        if !self.texture_weight(lambda, &mut weight) ||
-            !draw.texture_sample(Some(&detail), SGI_GL_LINEAR, ds, dt, 0.0, &mut other)
-        {
+        let Some(weight) = self.texture_weight(lambda) else {
+            return false;
+        };
+        if !draw.texture_sample(Some(&detail), SGI_GL_LINEAR, ds, dt, 0.0, &mut other) {
             return false;
         }
         for k in 0..4usize {

@@ -74,25 +74,25 @@ pub static DMA_BPP: [u8; (ODSY_DMA_BPP_MASK + 1) as usize] = [2, 4, 8, 16, 12, 1
 
 impl DmaBus {
     /// The entry's page pairs, up to a zero pair or the twelfth, into e[].
-    /// Returns how many, or -1 when a read fails.
-    pub fn entries(&self, table: u64, seq: u64, e: &mut [DmaEntry]) -> i32 {
+    /// Returns how many, or a bus error when a read fails.
+    pub fn entries(&self, table: u64, seq: u64, e: &mut [DmaEntry]) -> Result<usize, DmaError> {
         let mut n: usize = 0;
 
         while n < ODSY_DMA_MAX_PAGES {
             let mut raw = [0u8; 8];
 
             if !self.read(table + ODSY_DMA_TABLE_HEADER + (n as u64) * 8, &mut raw, true, seq) {
-                return -1;
+                return Err(DmaError::Bus);
             }
             let pte = u64::from_be_bytes(raw[..8].try_into().unwrap());
             if pte & (ODSY_DMA_PTE_LEN_MASK as u64) == 0 {
-                return n as i32;
+                return Ok(n);
             }
             e[n].addr = pte >> ODSY_DMA_PTE_ADDR_SHIFT;
             e[n].len = (pte & (ODSY_DMA_PTE_LEN_MASK as u64)) as u32;
             n += 1;
         }
-        n as i32
+        Ok(n)
     }
 }
 
@@ -240,11 +240,9 @@ impl Board {
         } else {
             self.dma_code(hdr, bpp)
         };
-        let n = bus.entries(table, seq, &mut e);
-        if n < 0 {
+        let Ok(n) = bus.entries(table, seq, &mut e) else {
             return;
-        }
-        let n = n as usize;
+        };
         payload += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
         if rowbytes as u64 != (w as u64) * (bpp as u64) || payload != (rowbytes as u64) * (h as u64) {
             crate::dlog!(
@@ -381,11 +379,9 @@ impl Board {
             return;
         }
 
-        let n = bus.entries(table, seq, &mut e);
-        if n < 0 {
+        let Ok(n) = bus.entries(table, seq, &mut e) else {
             return;
-        }
-        let n = n as usize;
+        };
         payload_len += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
         if w == 0
             || h == 0
@@ -603,7 +599,7 @@ impl Board {
 impl DmaBus {
     /// Map piece p at guest address addr: an entry is one physical extent, so
     /// the pages it runs over are consecutive.
-    pub fn map_piece(&self, p: &mut DmaPiece, addr: u64) -> i32 {
+    pub fn map_piece(&self, p: &mut DmaPiece, addr: u64) -> Result<(), DmaError> {
         let first = addr & !(ODSY_DMA_PAGE_SIZE - 1);
         let npages = (addr - first + p.len as u64).div_ceil(ODSY_DMA_PAGE_SIZE) as u32;
         let mut pages = vec![0u64; npages as usize];
@@ -717,7 +713,7 @@ impl Board {
                 p.src = done;
                 let plen = p.len;
                 pieces.push(p);
-                if bus.map_piece(pieces.last_mut().unwrap(), e[i].addr + pos) != 0 {
+                if bus.map_piece(pieces.last_mut().unwrap(), e[i].addr + pos).is_err() {
                     ok = false;
                     break;
                 }
@@ -780,11 +776,9 @@ impl Board {
             }
             return;
         }
-        let n = bus.entries(table, seq, &mut e);
-        if n < 0 {
+        let Ok(n) = bus.entries(table, seq, &mut e) else {
             return;
-        }
-        let n = n as usize;
+        };
         total += e[..n].iter().map(|e| e.len as u64).sum::<u64>();
         if rowbytes as u64 != (w as u64) * (bpp as u64) || total != (rowbytes as u64) * (h as u64) {
             if self.dma_report(ODSY_DMA_REPORT_SHAPE) {
@@ -1041,14 +1035,14 @@ impl Board {
 
 impl DmaBus {
     /// A query's completion words must not report failure after changing guest
-    /// memory. Admit only a whole aligned scalar, big-endian. Returns 0 or an
-    /// Failure. Guest memory is written through the bus.
-    pub fn publish_word(&self, addr: u64, value: u32, size: u32) -> i32 {
+    /// memory. Admit only a whole aligned scalar, big-endian. Guest memory is
+    /// written through the bus.
+    pub fn publish_word(&self, addr: u64, value: u32, size: u32) -> Result<(), DmaError> {
         let size64 = size as u64;
 
         if (addr & (size64 - 1)) != 0 || addr > u64::MAX - size64 {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: invalid publication address {:#x}", addr);
-            return SGI_FAIL_BOUNDS as i32;
+            return Err(DmaError::Bounds);
         }
         let written = if size == 2 {
             write_guest(&self.mem, addr, &(value as u16).to_be_bytes())
@@ -1057,16 +1051,16 @@ impl DmaBus {
         };
         if !written {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: publication at {:#x} is not aligned writable RAM", addr);
-            return SGI_FAIL_BUS as i32;
+            return Err(DmaError::Bus);
         }
-        0
+        Ok(())
     }
 
-    pub fn publish_be16(&self, addr: u64, value: u16) -> i32 {
+    pub fn publish_be16(&self, addr: u64, value: u16) -> Result<(), DmaError> {
         self.publish_word(addr, value as u32, 2)
     }
 
-    pub fn publish_be32(&self, addr: u64, value: u32) -> i32 {
+    pub fn publish_be32(&self, addr: u64, value: u32) -> Result<(), DmaError> {
         self.publish_word(addr, value, 4)
     }
 }
@@ -1108,7 +1102,7 @@ impl Board {
             for j in 0..words {
                 let addr = self.query_base + QUERY_OFFSET[i] as u64 + 4 * j as u64;
 
-                if bus.publish_be32(addr, self.query_captured[i][j]) != 0 {
+                if bus.publish_be32(addr, self.query_captured[i][j]).is_err() {
                     crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query payload failed");
                     return;
                 }
@@ -1120,19 +1114,19 @@ impl Board {
             let at = self.query_base + (if i != 0 { ODSY_QUERY_RASTER_COLOUR } else { ODSY_QUERY_RASTER_INDEX }) as u64;
 
             for (j, &word) in rec.iter().enumerate().take(1 + cmd_arity(rec[0]) as usize) {
-                if bus.publish_be32(at + 4 * j as u64, word) != 0 {
+                if bus.publish_be32(at + 4 * j as u64, word).is_err() {
                     crate::dlog!(LogModule::Odyssey, "sgi-odyssey: raster query payload failed");
                     return;
                 }
             }
             i += 1;
         }
-        if bus.publish_be32(self.query_base + 0x97c, self.query_count) != 0 {
+        if bus.publish_be32(self.query_base + 0x97c, self.query_count).is_err() {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query counter failed");
             return;
         }
         if self.query_sync_base > u64::MAX - sync_offset
-            || bus.publish_be16(self.query_sync_base + sync_offset, (sequence & 0xffff) as u16) != 0
+            || bus.publish_be16(self.query_sync_base + sync_offset, (sequence & 0xffff) as u16).is_err()
         {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query sync failed");
             return;

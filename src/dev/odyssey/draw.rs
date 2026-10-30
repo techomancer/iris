@@ -167,13 +167,13 @@ impl Board {
     /// test: the plane bound and the union of the kept clip rectangles, as
     /// ascending, disjoint, non-touching [start, end) runs. The 2D fills walk
     /// these a row at a time; they still apply the id test per pixel.
-    pub fn row_runs(&self, y: i64, runs: &mut RowRuns) {
+    pub fn row_runs(&self, y: i64) -> RowRuns {
+        let mut runs = RowRuns::default();
         let mut n = 0usize;
         let mut kept = 0usize;
 
-        runs.n = 0;
         if y < 0 || y >= SGI_ODYSSEY_HEIGHT as i64 {
-            return;
+            return runs;
         }
         for &r in &self.clip_rect[..self.clip_kept as usize] {
             let a = (r.x0 as i64).max(0);
@@ -204,6 +204,7 @@ impl Board {
             }
         }
         runs.n = kept as u32;
+        runs
     }
 
     /// Where colour buffer b keeps the n pixels of row y from x, when all of
@@ -413,10 +414,8 @@ impl Board {
     /// when it is on. is_index selects whether value is a packed RGB pixel or a
     /// PseudoColor index resolved per pixel.
     pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, is_index: bool, value: u32) {
-        let mut runs = RowRuns::default();
-
         for row in 0..h {
-            self.row_runs(y as i64 + row as i64, &mut runs);
+            let runs = self.row_runs(y as i64 + row as i64);
             self.paint_integer_span(&runs, y as i64 + row as i64, x as i64, x as i64 + w as i64, is_index, value);
         }
         self.scanout.invalidate_all();
@@ -430,12 +429,9 @@ impl Board {
     pub fn clear_planes(&mut self, x: u32, y: u32, w: u32, h: u32, value: u8, mask: u8) {
         let buffers = self.draw_buffers();
         let id_test = self.id_compare_active();
-        let mut runs = RowRuns::default();
-
         for row in 0..h {
             let py = y as i64 + row as i64;
-
-            self.row_runs(py, &mut runs);
+            let runs = self.row_runs(py);
             for r in 0..runs.n as usize {
                 let a = (x as i64).max(runs.start[r]);
                 let e = (x as i64 + w as i64).min(runs.end[r]);
@@ -627,13 +623,11 @@ impl Board {
     pub fn pattern_fill(&mut self, x: u32, y: u32, w: u32, h: u32, pat_u0: u32, pat_v0: u32, is_index: bool, value: u32) {
         let opaque = self.pattern_shape & ODSY_PATTERN_SHAPE_OPAQUE != 0;
         let background = self.pattern_background(is_index);
-        let mut runs = RowRuns::default();
-
         // Each row as spans of equal pattern bits, painted a span at a time.
         for v in 0..h {
             let py = y as i64 + v as i64;
 
-            self.row_runs(py, &mut runs);
+            let runs = self.row_runs(py);
             if runs.n == 0 {
                 continue;
             }

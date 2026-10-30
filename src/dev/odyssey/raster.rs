@@ -591,16 +591,17 @@ thread_local! {
 }
 
 impl GlDrawState {
-    pub fn window(&self, win: &mut SoftWindow) -> bool {
+    pub fn window(&self) -> Option<SoftWindow> {
         let d = &self.drawable;
+        let mut win = SoftWindow::default();
 
         if d.bound == 0 {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: draw with no window bound dropped");
-            return false;
+            return None;
         }
         if d.clip.n == 0 {
             // Other windows cover all of this one: nothing to draw.
-            return false;
+            return None;
         }
         win.ox = d.origin[0];
         win.oy = d.origin[1];
@@ -615,7 +616,7 @@ impl GlDrawState {
             win.y1 = win.y1.max(r.y1);
         }
         win.clip = d.clip;
-        true
+        Some(win)
     }
 }
 
@@ -919,21 +920,22 @@ impl SoftVertex {
     /// whose value moves by step a pixel. The edge function is linear along the
     /// row, so the owned steps are one run: e + k * step >= need, where need is
     /// 0 for an edge that owns the centres on it and 1 for one that does not.
-    pub fn owned_run(&self, b: &SoftVertex, e: i64, step: i64, lo: &mut i64, hi: &mut i64) {
+    pub fn owned_run(&self, b: &SoftVertex, e: i64, step: i64, (mut lo, mut hi): (i64, i64)) -> (i64, i64) {
         let need: i64 = if self.owns(b, 0) { 0 } else { 1 };
         let d = need.wrapping_sub(e);
 
         if step > 0 {
             // The first k with k * step >= d, rounding the quotient up.
             let v = if d > 0 { (d + step - 1) / step } else { -(-d / step) };
-            *lo = std::cmp::max(*lo, v);
+            lo = std::cmp::max(lo, v);
         } else if step < 0 {
             // The last k with k * -step <= -d, rounding the quotient down.
             let v = if -d >= 0 { -d / -step } else { -((d - step - 1) / -step) };
-            *hi = std::cmp::min(*hi, v);
+            hi = std::cmp::min(hi, v);
         } else if d > 0 {
-            *hi = *lo - 1;
+            hi = lo - 1;
         }
+        (lo, hi)
     }
 }
 
@@ -961,10 +963,9 @@ impl RasterRules {
         soft_compare(func, self.soft_alpha_test(alpha), self.soft_alpha_test(ref_))
     }
 
-    /// Whether the planes have a stencil buffer, and its largest value.
-    pub fn stencil_max(&self, t: &RasterTarget, max: &mut u32) -> bool {
-        *max = (1u32.wrapping_shl(self.stencil_bits as u32)).wrapping_sub(1);
-        self.stencil_bits != 0 && t.stencil
+    /// The stencil buffer's largest value, if the planes have one.
+    pub fn stencil_max(&self, t: &RasterTarget) -> Option<u32> {
+        (self.stencil_bits != 0 && t.stencil).then(|| (1u32.wrapping_shl(self.stencil_bits as u32)).wrapping_sub(1))
     }
 }
 
@@ -991,7 +992,6 @@ impl GlDrawState {
 impl RasterRules {
     #[allow(clippy::too_many_arguments, reason = "the fragment path takes a fragment as its parts")]
     pub fn depth_stencil(&self, st: &GlDrawState, t: &RasterTarget, px: &dyn Planes, x: i32, y: i32, z: f64, steps: i64) -> bool {
-        let mut smax: u32 = 0;
         let mut sref: u32 = 0;
 
         if !(0.0..=1.0).contains(&z) {
@@ -999,7 +999,9 @@ impl RasterRules {
         }
         // The reference clamps to the buffer's range; with no stencil buffer
         // the test passes and nothing is written.
-        let stencil = st.stencil_test != 0 && self.stencil_max(t, &mut smax);
+        let smax = if st.stencil_test != 0 { self.stencil_max(t) } else { None };
+        let stencil = smax.is_some();
+        let smax = smax.unwrap_or(0);
         if stencil {
             let vmask = st.stencil_value_mask;
 
@@ -1518,30 +1520,40 @@ impl GlDrawState {
 impl SoftDraw<'_> {
     /// The window pixels a primitive's fragments may fall on, inclusive: the
     /// bounds of those the window owns, within the viewport unless a window
-    /// matrix replaces it. False when there are none.
-    pub fn bounds(&self, x0: &mut i32, y0: &mut i32, x1: &mut i32, y1: &mut i32) -> bool {
+    /// matrix replaces it, as (x0, y0, x1, y1). None when there are none.
+    pub fn bounds(&self) -> Option<(i32, i32, i32, i32)> {
         let st: &GlDrawState = self.st;
-        let win = &self.win;
+        let (x0, y0, x1, y1) = self.owned_bounds();
         let vx = st.viewport[0];
         let vy = st.viewport[1];
         let vw = st.viewport[2];
         let vh = st.viewport[3];
 
-        *x0 = win.x0.wrapping_sub(win.ox);
-        *y0 = win.y0.wrapping_sub(win.oy);
-        *x1 = win.x1.wrapping_sub(win.ox);
-        *y1 = win.y1.wrapping_sub(win.oy);
         if st.window_matrix_given != 0 {
-            return true;
+            return Some((x0, y0, x1, y1));
         }
         if vw <= 0 || vh <= 0 {
-            return false;
+            return None;
         }
-        *x0 = std::cmp::max(*x0, vx);
-        *y0 = std::cmp::max(*y0, vy);
-        *x1 = std::cmp::min(*x1, vx.wrapping_add(vw).wrapping_sub(1));
-        *y1 = std::cmp::min(*y1, vy.wrapping_add(vh).wrapping_sub(1));
-        true
+        Some((
+            std::cmp::max(x0, vx),
+            std::cmp::max(y0, vy),
+            std::cmp::min(x1, vx.wrapping_add(vw).wrapping_sub(1)),
+            std::cmp::min(y1, vy.wrapping_add(vh).wrapping_sub(1)),
+        ))
+    }
+
+    /// The window's owned rectangle in draw coordinates, before the viewport
+    /// narrows it, as (x0, y0, x1, y1).
+    pub fn owned_bounds(&self) -> (i32, i32, i32, i32) {
+        let win = &self.win;
+
+        (
+            win.x0.wrapping_sub(win.ox),
+            win.y0.wrapping_sub(win.oy),
+            win.x1.wrapping_sub(win.ox),
+            win.y1.wrapping_sub(win.oy),
+        )
     }
 
     /// Whether a polygon fragment at (px, py) is drawn under the polygon
@@ -1674,9 +1686,10 @@ impl SoftDraw<'_> {
     /// clipping does not bound it. The colour is the front colour; a back-facing
     /// triangle takes its back colour later.
     /// A vertex with w <= 0 is in the volume only at the clip-space origin,
-    /// where the divide has no answer, and returns false, as does one mapped
+    /// where the divide has no answer, and returns None, as does one mapped
     /// beyond the rasterizer's range.
-    pub fn project(&self, cv: &VolumeVertex, out: &mut SoftVertex) -> bool {
+    pub fn project(&self, cv: &VolumeVertex) -> Option<SoftVertex> {
+        let mut out = SoftVertex::default();
         let st: &GlDrawState = self.st;
         let clip = &cv.clip;
         let eye = &cv.eye;
@@ -1684,13 +1697,13 @@ impl SoftDraw<'_> {
         let quiet = SOFT_BAND_QUIET.with(|q| q.get());
 
         if !self.texture_vertex_valid(cv) {
-            return false;
+            return None;
         }
         if !(clip[3] > 0.0) {
             if !quiet {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: clipped vertex at w {} has no window position, primitive dropped", clip[3]);
             }
-            return false;
+            return None;
         }
         st.clip_to_window(clip, &mut win);
         let xw = win[0];
@@ -1699,7 +1712,7 @@ impl SoftDraw<'_> {
             if !quiet {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: vertex outside the rasterizer's range, primitive dropped");
             }
-            return false;
+            return None;
         }
         for k in 0..4usize {
             out.texcoord[k] = cv.attr[SGI_GL_V_TEXCOORD + k] as f64;
@@ -1739,7 +1752,7 @@ impl SoftDraw<'_> {
             out.rgba[k] = n as f64;
         }
         out.index = cv.attr[SGI_GL_V_INDEX] as f64;
-        true
+        Some(out)
     }
 }
 
@@ -1786,7 +1799,9 @@ impl RasterRules {
         if !self.check_rules() || !t.soft_check_index(d.state.index_bits) {
             return SGI_GL_DRAW_OK;
         }
-        if !d.state.window(&mut r.win) {
+        if let Some(win) = d.state.window() {
+            r.win = win;
+        } else {
             if !use_stipple
                 || d.mode < SGI_GL_LINES
                 || d.mode > SGI_GL_LINE_STRIP
@@ -1874,9 +1889,10 @@ impl<'a> SoftDraw<'a> {
         let mut r = *self;
         match d.mode {
             SGI_GL_POINTS => {
-                if !soft_dimension(d.point_size, &mut r.point_size) {
+                let Some(size) = soft_dimension(d.point_size) else {
                     return SGI_GL_DRAW_OK;
-                }
+                };
+                r.point_size = size;
                 let px = planes.planes();
                 let r = r.with_planes(&*px);
                 for i in 0..n {
@@ -1885,9 +1901,10 @@ impl<'a> SoftDraw<'a> {
                 SGI_GL_DRAW_OK
             }
             SGI_GL_LINES => {
-                if !soft_dimension(d.line_width, &mut r.line_width) {
+                let Some(width) = soft_dimension(d.line_width) else {
                     return SGI_GL_DRAW_OK;
-                }
+                };
+                r.line_width = width;
                 let px = planes.planes();
                 let r = r.with_planes(&*px);
                 let mut i = 0usize;
@@ -1901,9 +1918,10 @@ impl<'a> SoftDraw<'a> {
                 SGI_GL_DRAW_OK
             }
             SGI_GL_LINE_STRIP | SGI_GL_LINE_LOOP => {
-                if !soft_dimension(d.line_width, &mut r.line_width) {
+                let Some(width) = soft_dimension(d.line_width) else {
                     return SGI_GL_DRAW_OK;
-                }
+                };
+                r.line_width = width;
                 let px = planes.planes();
                 let r = r.with_planes(&*px);
                 let mut i = 0usize;

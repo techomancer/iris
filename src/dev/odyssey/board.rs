@@ -1147,14 +1147,12 @@ impl Board {
     }
 
     pub fn allocate(&mut self) -> Result<(), String> {
-        let mut err: Option<String> = None;
-
         self.attach_nic()?;
 
         // The colour framebuffer is two RGBA8 planes, one per colour buffer,
         // each over device-backed board memory of its own: a model-owned byte
         // array. It is not page-backed onto guest RAM. add_plane can only fail
-        // on a programming error in these fixed sizes, so a failure panics.
+        // on a programming error in these fixed sizes.
         let pixels = SGI_ODYSSEY_WIDTH as u64 * SGI_ODYSSEY_HEIGHT as u64;
         self.mem.init(pixels * 4);
         {
@@ -1170,12 +1168,12 @@ impl Board {
                 ..Default::default()
             };
 
-            self.colour_plane = self.mem.add_plane(&plane, &mut err);
+            self.colour_plane = self.mem.add_plane(&plane).map_err(|e| format!("sgi-odyssey: colour plane: {e}"))?;
             // Colour buffer 1, the same shape in its own memory. Two model
             // planes preserve the visible contract; they do not claim the
             // board's two-buffer layout.
             self.buffer1_mem.init(plane.len);
-            self.buffer1_plane = self.buffer1_mem.add_plane(&plane, &mut err);
+            self.buffer1_plane = self.buffer1_mem.add_plane(&plane).map_err(|e| format!("sgi-odyssey: colour buffer 1 plane: {e}"))?;
         }
 
         // The board-memory object store: device-backed words the objects are
@@ -1205,7 +1203,7 @@ impl Board {
                 ..Default::default()
             };
 
-            self.depth_plane = self.depth_mem.add_plane(&depth, &mut err);
+            self.depth_plane = self.depth_mem.add_plane(&depth).map_err(|e| format!("sgi-odyssey: depth plane: {e}"))?;
         }
 
         // The stencil plane: 8 bits a pixel, in device-backed memory of its own;
@@ -1224,10 +1222,7 @@ impl Board {
                 ..Default::default()
             };
 
-            self.stencil_plane = self.stencil_mem.add_plane(&stencil, &mut err);
-        }
-        if let Some(e) = err {
-            panic!("sgi-odyssey: {}", e);
+            self.stencil_plane = self.stencil_mem.add_plane(&stencil).map_err(|e| format!("sgi-odyssey: stencil plane: {e}"))?;
         }
 
         // Setting the mode allocates the scanout's frame, marks it all dirty

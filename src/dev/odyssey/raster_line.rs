@@ -375,8 +375,11 @@ impl SoftDraw<'_> {
         let one_sub = (1i32 << sub) as f64;
         let a = *pa;
         let b = *pb;
-        let (mut bx0, mut by0, mut bx1, mut by1) = (0i32, 0i32, -1i32, -1i32);
-        let visible = self.bounds(&mut bx0, &mut by0, &mut bx1, &mut by1);
+        // A stippled segment outside the viewport still counts, against the
+        // window's own rectangle.
+        let bounds = self.bounds();
+        let visible = bounds.is_some();
+        let (bx0, by0, bx1, by1) = bounds.unwrap_or_else(|| self.owned_bounds());
 
         if (!visible && stipple.is_none()) || (a.x == b.x && a.y == b.y) {
             return;
@@ -648,16 +651,16 @@ impl SoftDraw<'_> {
     pub fn line(&self, va: &[f32], vb: &[f32], provoking: &[f32], stipple: Option<&mut SoftLineStipple>) {
         let mut ca = VolumeVertex::default();
         let mut cb = VolumeVertex::default();
-        let mut a = SoftVertex::default();
-        let mut b = SoftVertex::default();
-        let (mut bx0, mut by0, mut bx1, mut by1) = (0i32, 0i32, 0i32, 0i32);
 
-        if stipple.is_none() && !self.bounds(&mut bx0, &mut by0, &mut bx1, &mut by1) {
+        if stipple.is_none() && self.bounds().is_none() {
             return;
         }
         self.st.volume_from_draw_vertex(va, &mut ca);
         self.st.volume_from_draw_vertex(vb, &mut cb);
-        if ca.clip_segment(&mut cb) && self.project(&ca, &mut a) && self.project(&cb, &mut b) {
+        if !ca.clip_segment(&mut cb) {
+            return;
+        }
+        if let Some((a, b)) = self.project(&ca).and_then(|a| self.project(&cb).map(|b| (a, b))) {
             self.line_projected(&a, &b, provoking, 0.0, stipple, true);
         }
     }
@@ -669,12 +672,11 @@ impl SoftDraw<'_> {
         let sub = self.rules.subpixel_bits as i32;
         let v = *pv;
         let mut frag = SoftFrag::default();
-        let (mut bx0, mut by0, mut bx1, mut by1) = (0i32, 0i32, 0i32, 0i32);
         let psize = self.point_size as i64;
 
-        if !self.bounds(&mut bx0, &mut by0, &mut bx1, &mut by1) {
+        let Some((bx0, by0, bx1, by1)) = self.bounds() else {
             return;
-        }
+        };
         // Even dimensions centre on a pixel corner; odd ones on a centre.
         let px: i64 = (v.x + (if self.point_size % 2 != 0 { 0 } else { 1i64 << (sub - 1) })) >> sub;
         let py: i64 = (v.y + (if self.point_size % 2 != 0 { 0 } else { 1i64 << (sub - 1) })) >> sub;
@@ -732,23 +734,24 @@ impl SoftDraw<'_> {
 
     pub fn point(&self, vp: &[f32]) {
         let mut cv = VolumeVertex::default();
-        let mut v = SoftVertex::default();
 
         self.st.volume_from_draw_vertex(vp, &mut cv);
-        if cv.contains() && self.project(&cv, &mut v) && !self.st.clipped(&v.clip) {
+        if !cv.contains() {
+            return;
+        }
+        if let Some(v) = self.project(&cv).filter(|v| !self.st.clipped(&v.clip)) {
             self.point_projected(&v, None, 0.0);
         }
     }
 }
 
 /// Internal representation bound, not an SGI width range. Half ties round up.
-pub fn soft_dimension(requested: f32, rounded: &mut u32) -> bool {
+pub fn soft_dimension(requested: f32) -> Option<u32> {
     let n = if requested == 0.0 { 1.0 } else { (requested as f64 + 0.5).floor() };
 
     if !requested.is_finite() || requested < 0.0 || n > i32::MAX as f64 {
         crate::dlog!(LogModule::Odyssey, "sgi-gl: unsupported aliased dimension {}", requested);
-        return false;
+        return None;
     }
-    *rounded = r2_max(n, 1.0) as u32;
-    true
+    Some(r2_max(n, 1.0) as u32)
 }
