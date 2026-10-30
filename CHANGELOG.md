@@ -236,6 +236,14 @@ hashes are given where a change is easiest to understand by reading the commit.
   The JIT matches the interpreter, and the code-cache key changes only for the
   machines that have the behaviour.
 
+### R10000 cache operations
+
+- **Index Load Data and Index Store Data** on the R10000's primary caches keep their
+  data (they read back zero before). The secondary cache's data slot is the address
+  shifted right by 3 instead of 4: one slot per doubleword.
+- **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
+  TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never
