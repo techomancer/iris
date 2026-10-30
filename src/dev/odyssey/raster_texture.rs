@@ -804,6 +804,85 @@ pub fn soft_texture_derivatives(
     out[4].is_finite()
 }
 
+// The diagonal level of detail of a filled triangle's quads.
+//
+// INFERRED, as the datasheet records it (odyssey.md, "Mipmap level of
+// detail", from US 6,232,981 B1): the texture unit picks one level of
+// detail for each 2x2 pixel quad. It takes the s and t differences along
+// the quad's two diagonals, pixel 1 to pixel 4 and pixel 2 to pixel 3,
+// takes the largest absolute difference and returns its base-2 logarithm;
+// all four pixels share it. The rule covers 1D and 2D textures only, so a
+// 3D texture keeps the per-fragment footprint (soft_texture_derivatives()).
+// The LOD bias, minimum and maximum then apply as their registers give them
+// (Board::texture_lod_bias(), texture_lod_limit()): the bias scales each
+// axis's differences, here through ns and nt, and the limits clamp the
+// logarithm (soft_texture_select(), SoftDraw::fixed_sample()).
+//
+// Model choices, where the datasheet leaves the board's behaviour open:
+//  - The internal LOD precision is unknown. The model takes the
+//    differences in double; the general path takes their logarithm in
+//    double, the fixed-point path in 1/256 of a level, the eight fraction
+//    bits of the LOD registers, through its table (soft_fixed_lambda()).
+//  - Quads are the window's even-aligned pixel pairs on even-aligned row
+//    pairs. Whether the board aligns them to the window or to the screen
+//    is unknown.
+//  - A quad's pixels outside the primitive take part in the difference at
+//    the planes' values there and are not drawn. A pixel whose Q/W is not
+//    positive, or whose s or t is not finite, has no coordinates: a
+//    diagonal with one is left out, and a quad with neither diagonal left
+//    has no level of detail of its own, so each of its fragments takes its
+//    own footprint, as before the rule was modelled.
+
+/// The footprint, in texels, of the quad whose first pixel is window pixel
+/// (qx, qy) under the diagonal rule above, from a triangle's texture planes
+/// g: the largest absolute difference along the diagonals of s scaled by ns
+/// and of t scaled by nt (the base level's size times the axis's bias, as
+/// soft_texture_derivatives() scales them). None where neither diagonal has
+/// coordinates at both ends.
+pub fn soft_quad_rho(g: &SoftTexPlane, ns: f64, nt: f64, qx: i32, qy: i32) -> Option<f64> {
+    let mut s = [0.0f64; 4];
+    let mut t = [0.0f64; 4];
+    let mut ok = [false; 4];
+
+    // Pixels 1 and 2 on the quad's first row, 3 and 4 on its second.
+    for i in 0..4 {
+        let x = (qx as f64 + (i & 1) as f64) + 0.5 - g.x;
+        let y = (qy as f64 + (i >> 1) as f64) + 0.5 - g.y;
+        let q = g.value[2] + x * g.dx[2] + y * g.dy[2];
+        let iq = 1.0 / q;
+
+        s[i] = (g.value[0] + x * g.dx[0] + y * g.dy[0]) * iq;
+        t[i] = (g.value[1] + x * g.dx[1] + y * g.dy[1]) * iq;
+        ok[i] = q > 0.0 && s[i].is_finite() && t[i].is_finite();
+    }
+    let mut rho = f64::NAN;
+    for (a, b) in [(0, 3), (1, 2)] {
+        if ok[a] && ok[b] {
+            let d = fmax((ns * (s[b] - s[a])).abs(), (nt * (t[b] - t[a])).abs());
+
+            rho = if rho.is_nan() { d } else { fmax(rho, d) };
+        }
+    }
+    rho.is_finite().then_some(rho)
+}
+
+/// soft_quad_rho() for planes g whose Q/W is the same everywhere, where it
+/// is the same for every quad: the planes' slopes along the diagonals over
+/// Q/W. None where Q/W is not positive or the footprint is not finite.
+pub fn soft_quad_flat_rho(g: &SoftTexPlane, ns: f64, nt: f64) -> Option<f64> {
+    let q = g.value[2];
+
+    if !(q > 0.0) {
+        return None;
+    }
+    let iq = 1.0 / q;
+    let rho = fmax(
+        fmax((ns * (g.dx[0] + g.dy[0]) * iq).abs(), (ns * (g.dy[0] - g.dx[0]) * iq).abs()),
+        fmax((nt * (g.dx[1] + g.dy[1]) * iq).abs(), (nt * (g.dy[1] - g.dx[1]) * iq).abs()),
+    );
+    rho.is_finite().then_some(rho)
+}
+
 /// The last level selection a thread's draw made, by the footprint it was
 /// made for.
 #[derive(Clone, Copy, Default)]

@@ -1,7 +1,10 @@
-//! Row loops for filled triangles, specialised by draw state and by the
+//! Quad loops for filled triangles, specialised by draw state and by the
 //! family's planes.
 //!
-//! One row loop, SoftDraw::fill_row(), is written against the Fill trait,
+//! A filled triangle is drawn two rows at a time, in 2x2 pixel quads: the
+//! texture unit takes one level of detail per quad (soft_quad_rho()), and
+//! a quad's four pixels interpolate together. One loop,
+//! SoftDraw::fill_quads(), is written against the Fill trait,
 //! whose implementor FillMode carries in const parameters the draw state
 //! each pixel would otherwise test: texturing and the fixed-point sampler's
 //! kernel, wrap, environment and format; the depth test, its function and
@@ -12,7 +15,7 @@
 //! expressions in the same order, only the branches around it differ.
 //!
 //! The loop is also generic over the Planes implementation, through
-//! Planes::fill_row(), whose default body each implementation inherits as
+//! Planes::fill_quads(), whose default body each implementation inherits as
 //! its own copy: a plane access in the loop is a direct call the compiler
 //! can inline, not one through the draw's `dyn Planes`.
 //!
@@ -22,7 +25,9 @@
 //! SoftDraw::fragment_at() does for the same state, through the same
 //! functions and plane calls; only the order of plane reads differs (the
 //! depth read before the texture's). The tests at the end compare every
-//! loop against the general path pixel for pixel.
+//! loop pixel for pixel against the general path, which visits the same
+//! quads and takes the same level of detail for each, a fragment at a time
+//! (SoftDraw::clipped_triangle()).
 
 use super::*;
 
@@ -160,7 +165,7 @@ impl<
 /// A row's pixels as the window's clip rectangles and the scissor leave
 /// them (SoftDraw::fill_run()): px0 to px1, the edge values at px0, and
 /// whether a pixel must still test the window's rectangles.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FillRun {
     pub px0: i32,
     pub px1: i32,
@@ -280,20 +285,29 @@ impl SoftDraw<'_> {
         (px0 <= px1).then_some(FillRun { px0, px1, e1, e2, clipped })
     }
 
-    /// The pixels of run, on row py of a filled triangle, under state
-    /// SoftDraw::fill_select() or SoftDraw::fixed_span_select() admits, and
-    /// whose varying parts M names, into planes px: self.px, or the row of
-    /// them Planes::row() lends. A textured loop stops at the first fragment
-    /// the fixed sampler cannot take and returns its column, which the
-    /// caller draws through the general loop; otherwise it returns end.
+    /// The pixels of runs, rows qy and qy + 1 of a filled triangle (qy
+    /// even), a 2x2 quad at a time, under state SoftDraw::fill_select() or
+    /// SoftDraw::fixed_span_select() admits, and whose varying parts M names,
+    /// into planes px, one for each row: self.px, or the rows of it
+    /// Planes::row() lends. Each quad interpolates its four pixels together,
+    /// drawn or not, and a textured quad takes one level of detail for all
+    /// four (soft_quad_rho()); then each pixel the runs hold is tested and
+    /// stored on its own. A fragment the fixed sampler cannot take goes to
+    /// the general path, general.
     #[inline(always)]
-    pub fn fill_row<M: Fill, P: Planes + ?Sized>(&self, px: &P, sp: &SoftTexSpan, py: i32, run: FillRun, end: i32) -> i32 {
+    pub fn fill_quads<M: Fill, P: Planes + ?Sized>(
+        &self,
+        px: [&P; 2],
+        sp: &SoftTexSpan,
+        qy: i32,
+        runs: &[Option<FillRun>; 2],
+        general: &QuadGeneral,
+    ) {
         let rules: &RasterRules = self.rules;
         let st: &GlDrawState = self.st;
         let t: &RasterTarget = self.t;
         let v: &[SoftVertex; 3] = sp.v;
-        let y = self.win.oy.wrapping_add(py);
-        let FillRun { px0, px1, mut e1, mut e2, clipped } = run;
+        let g: &SoftTexPlane = sp.g;
         let depth_test = M::depth_test(st);
         let depth_func = M::depth_func(st);
         let depth_write = depth_test && M::depth_write(st);
@@ -304,126 +318,201 @@ impl SoftDraw<'_> {
         let store = self.rgba_mask != 0 && self.ntargets != 0;
         let env = if !M::TEX { 0 } else if M::ENV != 0 { M::ENV } else { st.texture_env_mode };
         let format = if !M::TEX { 0 } else if M::FORMAT != 0 { M::FORMAT } else { self.fixed_tex().format };
+        let lod = M::TEX && self.fixed_tex().lod;
         // REPLACE leaves none of the colour of these formats' fragments.
         let keeps = !M::TEX
             || env != SGI_GL_REPLACE
             || (format != SGI_GL_RGBA && format != SGI_GL_INTENSITY && format != SGI_GL_LUMINANCE_ALPHA);
         let mut frag: SoftFrag = *sp.flat;
         let mut dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
+        let (x_lo, x_hi) = match runs {
+            [Some(a), Some(b)] => (fx_min(a.px0, b.px0), fx_max(a.px1, b.px1)),
+            [Some(a), None] | [None, Some(a)] => (a.px0, a.px1),
+            [None, None] => return,
+        };
 
-        // Nothing in an untextured flat colour varies along the row unless it
-        // is dithered (SoftDraw::store_rgb()), fogged or blended.
+        // Nothing in an untextured flat colour varies over the triangle
+        // unless it is dithered (SoftDraw::store_rgb()), fogged or blended.
         let uniform = rgba && store && !M::TEX && !smooth && !fog && !self.dither && !rgba_read;
         let flat_out = if uniform {
-            self.fill_rgba_result::<M>(self.win.ox.wrapping_add(px0), y, &frag, &dest[0])
+            self.fill_rgba_result::<M>(self.win.ox.wrapping_add(x_lo), self.win.oy.wrapping_add(qy), &frag, &dest[0])
         } else {
             RasterColour::default()
         };
         // The polygon offset, split between window depth and depth-word steps
         // (RasterRules::split_offset()).
         let (offset, steps) = rules.split_offset(sp.offset);
-        let mut col = px0;
-        let mut first_pixel = true;
-        loop {
-            // The loop increment, run before every pixel but the first so
-            // that a continue still steps.
-            if !first_pixel {
-                col += 1;
-                e1 = e1.wrapping_add(sp.step1);
-                e2 = e2.wrapping_add(sp.step2);
-            }
-            first_pixel = false;
-            if col > px1 {
-                break;
-            }
-            let x = self.win.ox.wrapping_add(col);
-            let b1 = e1 as f64 / sp.area as f64;
-            let b2 = e2 as f64 / sp.area as f64;
-            let mut z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
-            let w0 = (1.0 - b1 - b2) * v[0].inv_w;
-            let w1 = b1 * v[1].inv_w;
-            let w2 = b2 * v[2].inv_w;
-            let sum = w0 + w1 + w2;
-            let mut off = offset;
-            let mut zw = 0.0f64;
-            let mut zq = 0u32;
-
-            if rules.depth_row_given {
-                let depth_w = (1.0 - b1 - b2) * v[0].depth_w + b1 * v[1].depth_w + b2 * v[2].depth_w;
-                let slack = rules.depth_slack;
-
-                z = (z + off) / depth_w;
-                off = 0.0;
-                if z < 0.0 && z >= -slack {
-                    z = 0.0;
-                } else if z > 1.0 && z <= 1.0 + slack {
-                    z = 1.0;
-                }
-            }
-            if !st.window_depth(z, off, &mut zw) || !(0.0..=1.0).contains(&zw) {
-                continue;
-            }
-            if clipped && !self.owned_at(col, py) {
-                continue;
-            }
-            if depth_test {
-                zq = rules.depth_code_offset(zw, steps);
-                if !soft_compare(depth_func, zq, px.load_depth(x, y)) {
-                    continue;
-                }
-            }
-            if M::TEX {
-                match self.fixed_tex().fixed_coords(sp.g, &sp.row, col, sp.flat_lambda) {
-                    Some((s, tc, lambda)) if M::sample(self, s, tc, lambda, &mut frag.texel) => {}
-                    _ => return col,
-                }
-            }
-            if uniform {
-                if depth_write {
-                    px.store_depth(x, y, zq);
-                }
-                for &target in &self.targets[..self.ntargets as usize] {
-                    px.store_rgba(target, x, y, &flat_out);
-                }
-                continue;
-            }
-            if smooth && keeps {
+        // The texture planes' row terms, for each row.
+        let mut tex_row = [[0.0f64; 4]; 2];
+        if M::TEX {
+            for (r, row) in tex_row.iter_mut().enumerate() {
                 for k in 0..4 {
-                    frag.rgba[k] = if sp.constant & (1u8 << k) != 0 {
-                        v[0].rgba[k]
-                    } else {
-                        (w0 * v[0].rgba[k] + w1 * v[1].rgba[k] + w2 * v[2].rgba[k]) / sum
-                    };
-                }
-            } else {
-                frag.rgba = sp.flat.rgba;
-            }
-            if M::TEX {
-                self.texture_apply(format, env, &mut frag.texel, &mut frag.rgba);
-            }
-            if fog {
-                frag.fog = (w0 * v[0].fog + w1 * v[1].fog + w2 * v[2].fog) / sum;
-                self.fog(&mut frag, zw);
-            }
-            if rgba_read && !rules.rgba_load(px, &self.targets, self.ntargets, x, y, &mut dest, &self.reports.rgba) {
-                continue;
-            }
-            if depth_write {
-                px.store_depth(x, y, zq);
-            }
-            if !rgba {
-                // Packed colour planes: the general store.
-                self.fragment_store(x, y, &frag, &dest);
-            } else if store {
-                for i in 0..self.ntargets as usize {
-                    let out = self.fill_rgba_result::<M>(x, y, &frag, &dest[i]);
-
-                    px.store_rgba(self.targets[i], x, y, &out);
+                    row[k] = ((qy + r as i32) as f64 + 0.5 - g.y) * g.dy[k];
                 }
             }
         }
-        end
+        let mut qx = x_lo - (x_lo & 1);
+        while qx <= x_hi {
+            // Pixel i of the quad is column qx + (i & 1) of row qy + (i >> 1).
+            let mut drawn = [false; 4];
+            let mut e1 = [0i64; 4];
+            let mut e2 = [0i64; 4];
+            for i in 0..4 {
+                if let Some(run) = &runs[i >> 1] {
+                    let k = (qx + (i & 1) as i32 - run.px0) as i64;
+
+                    drawn[i] = k >= 0 && qx + (i & 1) as i32 <= run.px1;
+                    e1[i] = run.e1.wrapping_add(k.wrapping_mul(sp.step1));
+                    e2[i] = run.e2.wrapping_add(k.wrapping_mul(sp.step2));
+                }
+            }
+            let quad_x = qx;
+            qx += 2;
+            if drawn == [false; 4] {
+                continue;
+            }
+            // The quad's four pixels interpolated together: for each, the
+            // same arithmetic, in the same order, as one at a time.
+            let mut b1 = [0.0f64; 4];
+            let mut b2 = [0.0f64; 4];
+            let mut zi = [0.0f64; 4];
+            let mut w0 = [0.0f64; 4];
+            let mut w1 = [0.0f64; 4];
+            let mut w2 = [0.0f64; 4];
+            let mut sum = [0.0f64; 4];
+            let mut depth_w = [0.0f64; 4];
+            for i in 0..4 {
+                b1[i] = e1[i] as f64 / sp.area as f64;
+                b2[i] = e2[i] as f64 / sp.area as f64;
+                zi[i] = v[0].z + b1[i] * (v[1].z - v[0].z) + b2[i] * (v[2].z - v[0].z);
+                w0[i] = (1.0 - b1[i] - b2[i]) * v[0].inv_w;
+                w1[i] = b1[i] * v[1].inv_w;
+                w2[i] = b2[i] * v[2].inv_w;
+                sum[i] = w0[i] + w1[i] + w2[i];
+                depth_w[i] = (1.0 - b1[i] - b2[i]) * v[0].depth_w + b1[i] * v[1].depth_w + b2[i] * v[2].depth_w;
+            }
+            // The quad's level of detail, where it has one.
+            let lambda = if !lod {
+                None
+            } else if sp.flat_lambda.is_some() {
+                sp.flat_lambda
+            } else {
+                (general.rho)(quad_x, qy).and_then(|rho| self.fixed_tex().quad_lambda(rho))
+            };
+            for i in 0..4 {
+                if !drawn[i] {
+                    continue;
+                }
+                let r = i >> 1;
+                let col = quad_x + (i & 1) as i32;
+                let py = qy + r as i32;
+                let planes = px[r];
+                let x = self.win.ox.wrapping_add(col);
+                let y = self.win.oy.wrapping_add(py);
+                let mut z = zi[i];
+                let mut off = offset;
+                let mut zw = 0.0f64;
+                let mut zq = 0u32;
+
+                if rules.depth_row_given {
+                    let slack = rules.depth_slack;
+
+                    z = (z + off) / depth_w[i];
+                    off = 0.0;
+                    if z < 0.0 && z >= -slack {
+                        z = 0.0;
+                    } else if z > 1.0 && z <= 1.0 + slack {
+                        z = 1.0;
+                    }
+                }
+                if !st.window_depth(z, off, &mut zw) || !(0.0..=1.0).contains(&zw) {
+                    continue;
+                }
+                if runs[r].is_some_and(|run| run.clipped) && !self.owned_at(col, py) {
+                    continue;
+                }
+                if depth_test {
+                    zq = rules.depth_code_offset(zw, steps);
+                    if !soft_compare(depth_func, zq, planes.load_depth(x, y)) {
+                        continue;
+                    }
+                }
+                if M::TEX {
+                    match self.fixed_tex().fixed_coords(g, &tex_row[r], col, lambda) {
+                        Some((s, tc, l)) if M::sample(self, s, tc, l, &mut frag.texel) => {}
+                        _ => {
+                            (general.fragment)(col, py, e1[i], e2[i]);
+                            continue;
+                        }
+                    }
+                }
+                if uniform {
+                    if depth_write {
+                        planes.store_depth(x, y, zq);
+                    }
+                    for &target in &self.targets[..self.ntargets as usize] {
+                        planes.store_rgba(target, x, y, &flat_out);
+                    }
+                    continue;
+                }
+                if smooth && keeps {
+                    for k in 0..4 {
+                        frag.rgba[k] = if sp.constant & (1u8 << k) != 0 {
+                            v[0].rgba[k]
+                        } else {
+                            (w0[i] * v[0].rgba[k] + w1[i] * v[1].rgba[k] + w2[i] * v[2].rgba[k]) / sum[i]
+                        };
+                    }
+                } else {
+                    frag.rgba = sp.flat.rgba;
+                }
+                if M::TEX {
+                    self.texture_apply(format, env, &mut frag.texel, &mut frag.rgba);
+                }
+                if fog {
+                    frag.fog = (w0[i] * v[0].fog + w1[i] * v[1].fog + w2[i] * v[2].fog) / sum[i];
+                    self.fog(&mut frag, zw);
+                }
+                if rgba_read && !rules.rgba_load(planes, &self.targets, self.ntargets, x, y, &mut dest, &self.reports.rgba) {
+                    continue;
+                }
+                if depth_write {
+                    planes.store_depth(x, y, zq);
+                }
+                if !rgba {
+                    // Packed colour planes: the general store.
+                    self.fragment_store(x, y, &frag, &dest);
+                } else if store {
+                    for k in 0..self.ntargets as usize {
+                        let out = self.fill_rgba_result::<M>(x, y, &frag, &dest[k]);
+
+                        planes.store_rgba(self.targets[k], x, y, &out);
+                    }
+                }
+            }
+        }
     }
+}
+
+/// What a quad loop leaves to the triangle's general path: rho, the
+/// footprint of the quad at window pixel (qx, qy) under the diagonal rule
+/// (soft_quad_rho()), or None where its fragments take their own; and
+/// fragment, which draws the fragment at window pixel (px, py) whose edge
+/// values for v[2]-v[0] and v[0]-v[1] are e1 and e2 through the general
+/// path, its quad's footprint included.
+pub struct QuadGeneral<'g> {
+    pub rho: &'g dyn Fn(i32, i32) -> Option<f64>,
+    pub fragment: &'g dyn Fn(i32, i32, i64, i64),
+}
+
+/// The owned run of one row of a triangle: pixels px0 to px1, whose edge
+/// values for v[2]-v[0] and v[0]-v[1] at px0 are e1 and e2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QuadRow {
+    pub px0: i32,
+    pub px1: i32,
+    pub e1: i64,
+    pub e2: i64,
 }
 
 /// Generates FillRow, one variant per specialisation, and the dispatch
@@ -440,63 +529,78 @@ macro_rules! fill_rows {
             $($id,)*
         }
 
-        /// Planes::fill_row()'s body: the row loop row names, on planes px.
-        #[allow(clippy::too_many_arguments, reason = "a row loop takes the row as its parts")]
+        /// Planes::fill_quads()'s body: the quad loop row names, on planes px.
         #[inline]
-        pub fn fill_row_dispatch<P: Planes + ?Sized>(
+        pub fn fill_quads_dispatch<P: Planes + ?Sized>(
             px: &P,
             r: &SoftDraw,
             row: FillRow,
             sp: &SoftTexSpan,
-            py: i32,
-            px0: i32,
-            px1: i32,
-            e1: i64,
-            e2: i64,
-        ) -> i32 {
+            qy: i32,
+            rows: &[Option<QuadRow>; 2],
+            general: &QuadGeneral,
+        ) {
             match row {
-                $(FillRow::$id => fill_row_instance::<FillMode<
+                $(FillRow::$id => fill_quads_instance::<FillMode<
                     { $tex }, { $kernel }, { $repeat }, { $env }, { $format },
                     { $depth }, { $func }, { $write }, { $smooth }, { $blend }, { $fog },
-                >, P>(px, r, sp, py, px0, px1, e1, e2),)*
+                >, P>(px, r, sp, qy, rows, general),)*
             }
         }
     };
 }
 
-/// One specialisation as a function of its own. It writes through the row
-/// of planes Planes::row() lends, which tests the plane bounds and clip
-/// rectangles once for the row; where the planes cannot lend one, the
-/// fallback with the same texturing draws the row a pixel at a time
+/// One specialisation as a function of its own. It writes through the rows
+/// of planes Planes::row() lends, which test the plane bounds and clip
+/// rectangles once for a row; where the planes cannot lend a row, the
+/// fallback with the same texturing draws the quads a pixel at a time
 /// through the planes' own methods, which give the same pixels.
-#[allow(clippy::too_many_arguments, reason = "a row loop takes the row as its parts")]
 #[inline(never)]
-fn fill_row_instance<M: Fill, P: Planes + ?Sized>(
+fn fill_quads_instance<M: Fill, P: Planes + ?Sized>(
     px: &P,
     r: &SoftDraw,
     sp: &SoftTexSpan,
-    py: i32,
-    px0: i32,
-    px1: i32,
-    e1: i64,
-    e2: i64,
-) -> i32 {
-    let end = px1 + 1;
-    let Some(run) = r.fill_run(sp, py, px0, px1, e1, e2) else {
-        return end;
-    };
-    let y = r.win.oy.wrapping_add(py);
+    qy: i32,
+    rows: &[Option<QuadRow>; 2],
+    general: &QuadGeneral,
+) {
+    let mut runs: [Option<FillRun>; 2] = [None, None];
+    let mut lent: [Option<GlPlaneRow>; 2] = [None, None];
+    let mut lends = true;
 
-    match px.row(y, r.win.ox.wrapping_add(run.px0), r.win.ox.wrapping_add(run.px1)) {
-        Some(row) => r.fill_row::<M, GlPlaneRow>(&row, sp, py, run, end),
-        None => fill_row_pixels::<M::Dyn, P>(px, r, sp, py, run, end),
+    for i in 0..2 {
+        let py = qy + i as i32;
+
+        runs[i] = rows[i].and_then(|q| r.fill_run(sp, py, q.px0, q.px1, q.e1, q.e2));
+        if let Some(run) = &runs[i] {
+            lent[i] = px.row(r.win.oy.wrapping_add(py), r.win.ox.wrapping_add(run.px0), r.win.ox.wrapping_add(run.px1));
+            lends &= lent[i].is_some();
+        }
+    }
+    if runs == [None, None] {
+        return;
+    }
+    if lends {
+        // A row with no run takes the other's planes, and draws nothing.
+        let other = lent[0].as_ref().or(lent[1].as_ref()).expect("a lent row");
+
+        r.fill_quads::<M, GlPlaneRow>([lent[0].as_ref().unwrap_or(other), lent[1].as_ref().unwrap_or(other)], sp, qy, &runs, general);
+    } else {
+        fill_quads_pixels::<M::Dyn, P>(px, r, sp, qy, &runs, general);
     }
 }
 
-/// A row a pixel at a time through planes px (fill_row_instance()).
+/// Quads a pixel at a time through planes px (fill_quads_instance()).
 #[inline(never)]
-fn fill_row_pixels<M: Fill, P: Planes + ?Sized>(px: &P, r: &SoftDraw, sp: &SoftTexSpan, py: i32, run: FillRun, end: i32) -> i32 {
-    r.fill_row::<M, P>(px, sp, py, run, end)
+fn fill_quads_pixels<M: Fill, P: Planes + ?Sized>(
+    px: &P,
+    r: &SoftDraw,
+    sp: &SoftTexSpan,
+    qy: i32,
+    runs: &[Option<FillRun>; 2],
+    general: &QuadGeneral,
+) {
+    r.fill_quads::<M, P>([px, px], sp, qy, runs, general)
 }
 
 const D: u32 = FILL_DYN;
@@ -872,7 +976,8 @@ mod tests {
     }
 
     // Untextured fills: the specialised loops and the dynamic one draw what
-    // the general per-fragment path draws, pixel for pixel, colour and depth.
+    // the general per-fragment path draws, quad by quad, pixel for pixel,
+    // colour and depth.
     #[test]
     fn fill_rows_match_the_general_path() {
         let mut drawn = 0;
@@ -888,8 +993,9 @@ mod tests {
         assert!(drawn > 10000, "the cases drew too little to compare: {drawn}");
     }
 
-    // Textured fills: the loops draw what the general loop draws with the
-    // same fixed-point sampler.
+    // Textured fills, many in perspective, so that each quad takes its own
+    // level of detail: the loops draw what the general path draws with the
+    // same fixed-point sampler and the same quads.
     #[test]
     fn texture_rows_match_the_general_path() {
         for seed in 100..=140u64 {
@@ -970,6 +1076,187 @@ mod tests {
             let table = draw_bench(make(), SGI_RASTER_FILL_TABLE, SGI_RASTER_TEXTURE_SPANS);
 
             compare(seed, "row loop under the board's pixel tests", &want, &table);
+        }
+    }
+
+    /// Texels that name their level: red 20 + 25 * level.
+    struct LevelTexels;
+
+    impl Texels for LevelTexels {
+        fn texel(&self, level: Option<&GlTexLevel>, _: u32, _: u32) -> Option<u32> {
+            Some((20 + 25 * level.map_or(0, |l| l.level)) << 24 | 0x4080ff)
+        }
+        fn border_texel(&self, _: Option<&GlTexLevel>, _: i32, _: i32) -> Option<u32> {
+            None
+        }
+        fn texel_3d(&self, _: Option<&GlTexLevel>, _: u32, _: u32, _: u32) -> Option<u32> {
+            None
+        }
+        fn border_texel_3d(&self, _: Option<&GlTexLevel>, _: i32, _: i32, _: i32) -> Option<u32> {
+            None
+        }
+    }
+
+    /// A vertex at window pixel (x, y) of the bench board, with w and s, at
+    /// depth one half: the bench's depth row takes (z + w) / 2.
+    fn lod_vertex(x: f32, y: f32, w: f32, s: f32) -> [f32; SGI_GL_VERTEX_FLOATS] {
+        let mut o = [0.0f32; SGI_GL_VERTEX_FLOATS];
+
+        o[SGI_GL_V_POSITION..SGI_GL_V_POSITION + 4]
+            .copy_from_slice(&[(x / BENCH_W as f32 * 2.0 - 1.0) * w, (y / BENCH_H as f32 * 2.0 - 1.0) * w, 1.0 - w, w]);
+        o[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4].copy_from_slice(&[1.0, 1.0, 1.0, 1.0]);
+        o[SGI_GL_V_TEXCOORD..SGI_GL_V_TEXCOORD + 4].copy_from_slice(&[s, 0.0, 0.0, 1.0]);
+        o
+    }
+
+    /// Draw one triangle replacing colour with a nearest-mipmap-nearest
+    /// 256-texel texture of LevelTexels, its LOD bias, minimum and maximum
+    /// the 0x1013 words lod (Board::texture_lod_bias(), texture_lod_limit()),
+    /// through texture path path; and return each drawn pixel as (x, y,
+    /// level).
+    fn draw_levels(vertices: &[[f32; SGI_GL_VERTEX_FLOATS]; 3], lod: [u32; 4], path: RasterTexturePath) -> Vec<(i32, i32, u32)> {
+        let mut b = Bench::empty();
+        let tex = BenchTexture::new(256, SGI_GL_NEAREST_MIPMAP_NEAREST, SGI_GL_NEAREST, SGI_GL_RGBA);
+        let mut image = tex.image();
+        let stipple = [0u32; 32];
+        let v: Vec<f32> = vertices.iter().flatten().copied().collect();
+
+        b.st.dither = 0;
+        b.st.texture_2d = 1;
+        b.st.texture_env_mode = SGI_GL_REPLACE;
+        b.board.tex_lod = lod;
+        b.board.texture_lod_bias(&mut image);
+        if let Some(p) = image.pyramid.as_mut() {
+            p.min_lod = texture_lod_limit(lod[2]) as f64 / ODSY_TEX_LOD_ONE as f64;
+            p.max_lod = texture_lod_limit(lod[3]) as f64 / ODSY_TEX_LOD_ONE as f64;
+        }
+        let mut t = b.board.gl_target();
+        t.texture = Some(image);
+        raster_set_texture_path(path);
+        let mut d = GlDraw::new(SGI_GL_TRIANGLES, 3, &v, &b.st, &stipple);
+        b.rules.draw(&t, &mut b.board.gl_parts(None).0, &LevelTexels, &mut d);
+        raster_set_texture_path(SGI_RASTER_TEXTURE_SPANS);
+
+        let mut out = Vec::new();
+        for y in 0..BENCH_H {
+            for x in 0..BENCH_W {
+                let c = b.board.buffer_load(0, x as i64, y as i64);
+
+                if c != 0 {
+                    assert_eq!(c & 0xffffff, 0x4080ff, "pixel ({x}, {y}) is not a texel: {c:#010x}");
+                    out.push((x, y, ((c >> 24) - 20) / 25));
+                }
+            }
+        }
+        out
+    }
+
+    /// The level nearest-mipmap-nearest takes for lambda: rounded, a half
+    /// down, at most the last of a 256-texel pyramid.
+    fn nearest_level(lambda: f64) -> u32 {
+        if lambda <= 0.5 {
+            return 0;
+        }
+        let l = lambda.floor() + (lambda - lambda.floor() > 0.5) as u32 as f64;
+        (l as u32).min(8)
+    }
+
+    /// Whether lambda is within margin of a change of nearest level.
+    fn near_a_choice(lambda: f64, margin: f64) -> bool {
+        (lambda - lambda.floor() - 0.5).abs() < margin
+    }
+
+    // The diagonal level of detail (soft_quad_rho()): a perspective triangle
+    // whose s depends on x alone, so the expected level is known in closed
+    // form. Every drawn pixel takes its quad's level, from the s difference
+    // between the quad's columns; at the triangle's edge that quad includes
+    // pixels outside it, and there the quad's level differs from the one
+    // the pixel's own footprint gives. Each texture path draws the same.
+    #[test]
+    fn quads_take_the_diagonal_level_of_detail() {
+        // A and C share w and s, so s / w and 1 / w vary along x alone:
+        // s = (u / 8) / (1 - 7u / 8), u = (x - XL) / (XR - XL).
+        const XL: f64 = 320.0;
+        // The right edge: column 360 is drawn and its quad's 361 is not.
+        const XR: f64 = 361.0;
+        let vertices = [
+            lod_vertex(XL as f32, 256.0, 1.0, 0.0),
+            lod_vertex(XR as f32, 256.0, 8.0, 1.0),
+            lod_vertex(XR as f32, 320.0, 8.0, 1.0),
+        ];
+        let s = |x: f64| {
+            let u = (x - XL) / (XR - XL);
+            (u / 8.0) / (1.0 - 7.0 * u / 8.0)
+        };
+        let ds = |x: f64| {
+            let u = (x - XL) / (XR - XL);
+            (1.0 / 8.0) / ((1.0 - 7.0 * u / 8.0) * (1.0 - 7.0 * u / 8.0)) / (XR - XL)
+        };
+        for path in [SGI_RASTER_TEXTURE_SPANS, SGI_RASTER_TEXTURE_FIXED, SGI_RASTER_TEXTURE_DOUBLE] {
+            let drawn = draw_levels(&vertices, [0, 0, (-15i32 * 256) as u32 & 0x3fff, 15 * 256], path);
+            let at: std::collections::HashSet<(i32, i32)> = drawn.iter().map(|&(x, y, _)| (x, y)).collect();
+            let mut checked = 0;
+            let mut edge_differs = 0;
+
+            assert!(drawn.len() > 500, "path {path}: the triangle drew {} pixels", drawn.len());
+            for &(x, y, level) in &drawn {
+                let qx = (x & !1) as f64;
+                let quad = (256.0 * (s(qx + 1.5) - s(qx + 0.5)).abs()).log2();
+                let own = (256.0 * ds(x as f64 + 0.5)).log2();
+
+                if near_a_choice(quad, 0.02) {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(level, nearest_level(quad), "path {path}: pixel ({x}, {y}) took level {level}, its quad's lambda is {quad}, its own {own}");
+                if !at.contains(&(x ^ 1, y)) && !near_a_choice(own, 0.02) && nearest_level(own) != level {
+                    edge_differs += 1;
+                }
+            }
+            assert!(checked > 400, "path {path}: only {checked} pixels away from a level change");
+            assert!(edge_differs >= 32, "path {path}: {edge_differs} edge pixels whose own footprint picks another level");
+        }
+    }
+
+    // The 0x1013 words as Board::texture_lod_bias() and texture_lod_limit()
+    // decode them: 14-bit two's complement, eight fraction bits; the bias
+    // scales its own axis's differences, and minimum and maximum clamp the
+    // quad's lambda, each limit first clamped to +/-15. An affine triangle
+    // of two texels a pixel along s, t constant: lambda 1 unbiased.
+    #[test]
+    fn quad_lod_takes_the_bias_and_limits() {
+        let word = |x: f64| (x * 256.0) as i32 as u32 & ODSY_TEX_LOD_MASK;
+        let vertices = [
+            lod_vertex(320.0, 256.0, 1.0, 0.0),
+            lod_vertex(480.0, 256.0, 1.0, 1.25),
+            lod_vertex(320.0, 384.0, 1.0, 0.0),
+        ];
+        let open = [word(-15.0), word(15.0)];
+
+        assert_eq!(texture_lod_word(word(-32.0)), -32 * 256);
+        assert_eq!(texture_lod_limit(word(20.0)), 15 * 256);
+        assert_eq!(texture_lod_limit(word(-20.0)), -15 * 256);
+        for (lod, want) in [
+            ([0, 0, open[0], open[1]], 1),
+            ([word(1.0), 0, open[0], open[1]], 2),
+            ([word(-1.0), 0, open[0], open[1]], 0),
+            ([word(0.75), 0, open[0], open[1]], 2),
+            ([word(-0.25), 0, open[0], open[1]], 1),
+            // The T bias scales t's differences, which are zero here.
+            ([0, word(3.0), open[0], open[1]], 1),
+            ([0, 0, word(3.0), open[1]], 3),
+            ([word(2.0), 0, open[0], word(1.25)], 1),
+            // A minimum past 15 is taken as 15: past the last level.
+            ([0, 0, word(20.0), word(20.0)], 8),
+        ] {
+            for path in [SGI_RASTER_TEXTURE_SPANS, SGI_RASTER_TEXTURE_FIXED, SGI_RASTER_TEXTURE_DOUBLE] {
+                let drawn = draw_levels(&vertices, lod, path);
+
+                assert!(drawn.len() > 5000, "words {lod:x?}, path {path}: the triangle drew {} pixels", drawn.len());
+                for &(x, y, level) in &drawn {
+                    assert_eq!(level, want, "words {lod:x?}, path {path}: pixel ({x}, {y})");
+                }
+            }
         }
     }
 

@@ -293,14 +293,13 @@ pub trait Planes {
         let _ = (y, x0, x1);
         None
     }
-    /// Pixels px0 to px1 of row py of a filled triangle through the row loop
-    /// row (raster_fill.rs), which returns where it stopped. Not for a family
+    /// The quads of rows qy and qy + 1 of a filled triangle, whose owned runs
+    /// are rows, through the quad loop row (raster_fill.rs). Not for a family
     /// to override: the default body is each implementation's own copy of
     /// the loop, calling these planes' methods directly rather than through
     /// a `dyn Planes`.
-    #[allow(clippy::too_many_arguments, reason = "a row loop takes the row as its parts")]
-    fn fill_row(&self, r: &SoftDraw<'_>, row: FillRow, sp: &SoftTexSpan<'_>, py: i32, px0: i32, px1: i32, e1: i64, e2: i64) -> i32 {
-        fill_row_dispatch(self, r, row, sp, py, px0, px1, e1, e2)
+    fn fill_quads(&self, r: &SoftDraw<'_>, row: FillRow, sp: &SoftTexSpan<'_>, qy: i32, rows: &[Option<QuadRow>; 2], general: &QuadGeneral<'_>) {
+        fill_quads_dispatch(self, r, row, sp, qy, rows, general)
     }
 }
 

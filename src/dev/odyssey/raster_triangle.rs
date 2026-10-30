@@ -379,7 +379,6 @@ impl SoftDraw<'_> {
         let mut flat = &provoking[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4];
         let mut flat_index = provoking[SGI_GL_V_INDEX];
         let mut flat_frag = SoftFrag::default();
-        let mut frag;
         let mut v: [SoftVertex; 3] = Default::default();
         let mut gradient = SoftTexPlane::default();
         // The footprint's per-axis scales, and its value where Q/W is flat.
@@ -396,7 +395,6 @@ impl SoftDraw<'_> {
         let mut area: i64;
         let smooth = st.shade_model != SGI_GL_FLAT;
         let simple = self.simple_fragments();
-        let mut tex_row = [0.0f64; 4];
         let sub = self.rules.subpixel_bits as i32;
 
         for i in 0..3 {
@@ -419,25 +417,6 @@ impl SoftDraw<'_> {
         // An image with no pyramid has no planes to fail: it samples in double.
         let fixed: bool = self.fixed.is_some()
             && (self.texture_base.is_some() || soft_texture_plane(&v, sub as u32, false, false, &mut gradient));
-        if fixed && self.fixed_tex().lod && gradient.dx[2] == 0.0 && gradient.dy[2] == 0.0 {
-            // Q/W flat, as for the double footprint below: every fragment's
-            // lambda is this one, which SoftFixedTex::fixed_coords() would compute
-            // for each of them, since s dQ/dx and t dQ/dx are then zero.
-            let q = gradient.value[2];
-
-            if q > 0.0 {
-                let iq = 1.0 / q;
-                let a = self.fixed_tex().ns * gradient.dx[0] * iq;
-                let b = self.fixed_tex().nt * gradient.dx[1] * iq;
-                let c = self.fixed_tex().ns * gradient.dy[0] * iq;
-                let e = self.fixed_tex().nt * gradient.dy[1] * iq;
-                let rho2 = if a * a + b * b > c * c + e * e { a * a + b * b } else { c * c + e * e };
-
-                if rho2 <= f64::MAX {
-                    fixed_flat = Some(self.fixed_tex().fixed_decide(rho2, soft_fixed_lambda(rho2)));
-                }
-            }
-        }
         if self.texture_base.is_some() {
             tex_ns = self.base_level().width as f64 * soft_texture_lod_scale(self.image().lod_scale_s);
             tex_nt = if self.image().one_dimensional {
@@ -450,15 +429,27 @@ impl SoftDraw<'_> {
             } else {
                 0.0
             };
-            // With Q/W the same at every vertex the footprint is one number.
+            // With Q/W the same at every vertex the footprint is one number:
+            // the same for every quad under the diagonal rule
+            // (soft_quad_flat_rho()), and for every fragment of a volume.
             flat_q = gradient.dx[2] == 0.0 && gradient.dy[2] == 0.0;
-            if flat_q {
+            if flat_q && !self.image().volume {
+                (flat_ok, flat_rho) = match soft_quad_flat_rho(&gradient, tex_ns, tex_nt) {
+                    Some(rho) => (true, rho),
+                    None => (false, f64::NAN),
+                };
+            } else if flat_q {
                 let value = [0.0, 0.0, gradient.value[2], 0.0];
                 let mut out = [0.0f64; 5];
 
                 flat_ok = soft_texture_derivatives(&value, &gradient.dx, &gradient.dy, tex_ns, tex_nt, tex_nr, &mut out);
                 flat_rho = out[4];
             }
+        }
+        if fixed && self.fixed_tex().lod && flat_q && flat_ok {
+            // Every quad's lambda is this one, which SoftFixedTex::quad_lambda()
+            // would take from each quad's footprint.
+            fixed_flat = self.fixed_tex().quad_lambda(flat_rho);
         }
         let ccw: bool = if st.window_matrix_given != 0 && st.window_rows_down != 0 { area < 0 } else { area > 0 };
         let front: bool = if st.front_face == SGI_GL_CW { !ccw } else { ccw };
@@ -528,7 +519,6 @@ impl SoftDraw<'_> {
             let mut sp = SoftTexSpan {
                 v: &v,
                 g: &gradient,
-                row: tex_row,
                 flat_lambda: fixed_flat,
                 flat: &flat_frag,
                 offset,
@@ -547,153 +537,183 @@ impl SoftDraw<'_> {
             }
             span = Some((row_loop, sp));
         }
-        let mut py = py0;
-        while py <= py1 {
-            let cur_py = py;
-            py += 1;
-            let py = cur_py;
-            let cy: i64 = (py as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
-            let cx: i64 = (px0 as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
-            let e0 = v[1].edge(&v[2], cx, cy);
-            let mut e1 = v[2].edge(&v[0], cx, cy);
-            let mut e2 = v[0].edge(&v[1], cx, cy);
-            let mut lo: i64 = 0;
-            let mut hi: i64 = px1 as i64 - px0 as i64;
-            (lo, hi) = v[1].owned_run(&v[2], e0, step0, (lo, hi));
-            (lo, hi) = v[2].owned_run(&v[0], e1, step1, (lo, hi));
-            (lo, hi) = v[0].owned_run(&v[1], e2, step2, (lo, hi));
-            if lo > hi {
-                continue;
-            }
-            e1 += lo * step1;
-            e2 += lo * step2;
-            if simple && span.is_none() {
-                self.simple_span(
-                    &v,
-                    py,
-                    px0 + lo as i32,
-                    px0 + hi as i32,
-                    e1,
-                    e2,
-                    step1,
-                    step2,
-                    area,
-                    offset,
-                    &flat_frag,
-                    smooth,
-                );
-                continue;
+        // The quad's footprint under the diagonal rule, for a 1D or 2D
+        // texture whose Q/W varies (soft_quad_rho()); a flat Q/W has one for
+        // every quad, and a volume's fragments take their own.
+        let quad_lod = self.texture_base.is_some() && !self.image().volume && !flat_q;
+        let quad_rho = |qx: i32, qy: i32| -> Option<f64> {
+            if quad_lod { soft_quad_rho(&gradient, tex_ns, tex_nt, qx, qy) } else { None }
+        };
+        // One fragment through the general path, with its quad's footprint
+        // rho: every fragment a quad loop does not draw, and every fragment
+        // of a triangle with none.
+        let general = |px: i32, py: i32, e1: i64, e2: i64, rho: Option<f64>| {
+            let mut background = false;
+            let mut tex_row = [0.0f64; 4];
+
+            // Window phase precedes plane translation and fragment work.
+            if !self.stipple_pass(px, py, &mut background) {
+                return;
             }
             if self.texture_base.is_some() || fixed {
                 for k in 0..4 {
                     tex_row[k] = (py as f64 + 0.5 - gradient.y) * gradient.dy[k];
                 }
-                if let Some((_, sp)) = span.as_mut() {
-                    sp.row = tex_row;
+            }
+            let mut frag = flat_frag;
+            let b1 = e1 as f64 / area as f64;
+            let b2 = e2 as f64 / area as f64;
+            let z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
+            let w0 = (1.0 - b1 - b2) * v[0].inv_w;
+            let w1 = b1 * v[1].inv_w;
+            let w2 = b2 * v[2].inv_w;
+            let sum = w0 + w1 + w2;
+            let depth_w = (1.0 - b1 - b2) * v[0].depth_w + b1 * v[1].depth_w + b2 * v[2].depth_w;
+            if fixed && span.is_none() {
+                let lambda = if !self.fixed_tex().lod {
+                    None
+                } else if fixed_flat.is_some() {
+                    fixed_flat
+                } else {
+                    rho.and_then(|rho| self.fixed_tex().quad_lambda(rho))
+                };
+                frag.fixed = self
+                    .fixed_tex()
+                    .fixed_coords(&gradient, &tex_row, px, lambda)
+                    .is_some_and(|(s, t, lambda)| {
+                        SoftDraw::fixed_sample::<SGI_SOFT_FIXED_ANY, false>(self, s, t, lambda, &mut frag.texel)
+                    });
+            }
+            // Only texturing reads the coordinates, only fog the distance.
+            if self.texture.is_some() && !frag.fixed {
+                for k in 0..4 {
+                    frag.texcoord[k] = (w0 * v[0].texcoord[k] + w1 * v[1].texcoord[k] + w2 * v[2].texcoord[k]) / sum;
                 }
             }
-            let mut px = px0 + lo as i32;
-            while px <= px0 + hi as i32 {
-                let mut background = false;
+            if st.fog != 0 {
+                frag.fog = (w0 * v[0].fog + w1 * v[1].fog + w2 * v[2].fog) / sum;
+            }
+            if st.clip_planes != 0 {
+                let mut d = [0.0f64; SGI_GL_CLIP_PLANES as usize];
 
-                if let Some((row_loop, sp)) = &span {
-                    // The row loop draws up to a fragment the fixed sampler
-                    // cannot take, which this loop then draws in double.
-                    let stop = self.px.fill_row(self, *row_loop, sp, py, px, px0 + hi as i32, e1, e2);
-
-                    e1 = e1.wrapping_add((stop - px) as i64 * step1);
-                    e2 = e2.wrapping_add((stop - px) as i64 * step2);
-                    px = stop;
-                    if px > px0 + hi as i32 {
-                        break;
-                    }
+                for i in 0..SGI_GL_CLIP_PLANES as usize {
+                    d[i] = (w0 * v[0].clip[i] + w1 * v[1].clip[i] + w2 * v[2].clip[i]) / sum;
                 }
-                let cur_px = px;
-                let cur_e1 = e1;
-                let cur_e2 = e2;
-                px += 1;
-                e1 += step1;
-                e2 += step2;
-                let px = cur_px;
-                // Window phase precedes plane translation and fragment work.
-                if !self.stipple_pass(px, py, &mut background) {
+                if st.clipped(&d) {
+                    return;
+                }
+            }
+            if smooth {
+                for k in 0..4 {
+                    frag.rgba[k] = (w0 * v[0].rgba[k] + w1 * v[1].rgba[k] + w2 * v[2].rgba[k]) / sum;
+                }
+                // An index is taken as a difference from the first vertex's,
+                // so a constant one stays exact before its integer part is taken.
+                frag.index = v[0].index + (w1 * (v[1].index - v[0].index) + w2 * (v[2].index - v[0].index)) / sum;
+            }
+            if self.texture_base.is_some() && !frag.fixed {
+                let mut value = [0.0f64; 4];
+                let mut out = [0.0f64; 5];
+
+                for k in 0..4 {
+                    value[k] = gradient.value[k] + (px as f64 + 0.5 - gradient.x) * gradient.dx[k] + tex_row[k];
+                }
+                if flat_q {
+                    let d = value[2];
+
+                    frag.texture_rho = if flat_ok
+                        && (value[0] / d).is_finite()
+                        && (value[1] / d).is_finite()
+                        && (tex_nr == 0.0 || (value[3] / d).is_finite())
+                    {
+                        flat_rho
+                    } else {
+                        f64::NAN
+                    };
+                } else if let Some(rho) = rho {
+                    frag.texture_rho = rho;
+                } else {
+                    frag.texture_rho = if soft_texture_derivatives(&value, &gradient.dx, &gradient.dy, tex_ns, tex_nt, tex_nr, &mut out) {
+                        out[4]
+                    } else {
+                        f64::NAN
+                    };
+                }
+            }
+            if background {
+                self.stipple_background(&mut frag);
+            }
+            self.fragment(px, py, z, offset, depth_w, &frag);
+        };
+        let quad_general = QuadGeneral {
+            rho: &quad_rho,
+            fragment: &|px, py, e1, e2| general(px, py, e1, e2, quad_rho(px & !1, py & !1)),
+        };
+        // Two rows at a time, from an even one: the rows of a line of quads.
+        let mut qy = py0 & !1;
+        while qy <= py1 {
+            let mut rows: [Option<QuadRow>; 2] = [None, None];
+
+            for (r, row) in rows.iter_mut().enumerate() {
+                let py = qy + r as i32;
+
+                if py < py0 || py > py1 {
                     continue;
                 }
-                frag = flat_frag;
-                let b1 = cur_e1 as f64 / area as f64;
-                let b2 = cur_e2 as f64 / area as f64;
-                let z = v[0].z + b1 * (v[1].z - v[0].z) + b2 * (v[2].z - v[0].z);
-                let w0 = (1.0 - b1 - b2) * v[0].inv_w;
-                let w1 = b1 * v[1].inv_w;
-                let w2 = b2 * v[2].inv_w;
-                let sum = w0 + w1 + w2;
-                let depth_w = (1.0 - b1 - b2) * v[0].depth_w + b1 * v[1].depth_w + b2 * v[2].depth_w;
-                if fixed && span.is_none() {
-                    frag.fixed = self
-                        .fixed_tex()
-                        .fixed_coords(&gradient, &tex_row, px, fixed_flat)
-                        .is_some_and(|(s, t, lambda)| {
-                            SoftDraw::fixed_sample::<SGI_SOFT_FIXED_ANY, false>(self, s, t, lambda, &mut frag.texel)
-                        });
+                let cy: i64 = (py as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
+                let cx: i64 = (px0 as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
+                let e0 = v[1].edge(&v[2], cx, cy);
+                let e1 = v[2].edge(&v[0], cx, cy);
+                let e2 = v[0].edge(&v[1], cx, cy);
+                let mut lo: i64 = 0;
+                let mut hi: i64 = px1 as i64 - px0 as i64;
+                (lo, hi) = v[1].owned_run(&v[2], e0, step0, (lo, hi));
+                (lo, hi) = v[2].owned_run(&v[0], e1, step1, (lo, hi));
+                (lo, hi) = v[0].owned_run(&v[1], e2, step2, (lo, hi));
+                if lo <= hi {
+                    *row = Some(QuadRow { px0: px0 + lo as i32, px1: px0 + hi as i32, e1: e1 + lo * step1, e2: e2 + lo * step2 });
                 }
-                // Only texturing reads the coordinates, only fog the distance.
-                if self.texture.is_some() && !frag.fixed {
-                    for k in 0..4 {
-                        frag.texcoord[k] = (w0 * v[0].texcoord[k] + w1 * v[1].texcoord[k] + w2 * v[2].texcoord[k]) / sum;
+            }
+            let quad_y = qy;
+            qy += 2;
+            if simple && span.is_none() {
+                // Untextured: no quad shares anything, so a row at a time.
+                for (r, row) in rows.iter().enumerate() {
+                    if let Some(q) = row {
+                        self.simple_span(&v, quad_y + r as i32, q.px0, q.px1, q.e1, q.e2, step1, step2, area, offset, &flat_frag, smooth);
                     }
                 }
-                if st.fog != 0 {
-                    frag.fog = (w0 * v[0].fog + w1 * v[1].fog + w2 * v[2].fog) / sum;
-                }
-                if st.clip_planes != 0 {
-                    let mut d = [0.0f64; SGI_GL_CLIP_PLANES as usize];
+                continue;
+            }
+            if rows == [None, None] {
+                continue;
+            }
+            if let Some((row_loop, sp)) = &span {
+                self.px.fill_quads(self, *row_loop, sp, quad_y, &rows, &quad_general);
+                continue;
+            }
+            let (x_lo, x_hi) = match rows {
+                [Some(a), Some(b)] => (a.px0.min(b.px0), a.px1.max(b.px1)),
+                [Some(a), None] | [None, Some(a)] => (a.px0, a.px1),
+                [None, None] => continue,
+            };
+            let mut qx = x_lo & !1;
+            while qx <= x_hi {
+                let rho = quad_rho(qx, quad_y);
 
-                    for i in 0..SGI_GL_CLIP_PLANES as usize {
-                        d[i] = (w0 * v[0].clip[i] + w1 * v[1].clip[i] + w2 * v[2].clip[i]) / sum;
-                    }
-                    if st.clipped(&d) {
+                for (r, row) in rows.iter().enumerate() {
+                    let Some(q) = row else {
                         continue;
-                    }
-                }
-                if smooth {
-                    for k in 0..4 {
-                        frag.rgba[k] = (w0 * v[0].rgba[k] + w1 * v[1].rgba[k] + w2 * v[2].rgba[k]) / sum;
-                    }
-                    // An index is taken as a difference from the first vertex's,
-                    // so a constant one stays exact before its integer part is taken.
-                    frag.index = v[0].index + (w1 * (v[1].index - v[0].index) + w2 * (v[2].index - v[0].index)) / sum;
-                }
-                if self.texture_base.is_some() && !frag.fixed {
-                    let mut value = [0.0f64; 4];
-                    let mut out = [0.0f64; 5];
+                    };
+                    for px in qx..qx + 2 {
+                        if px >= q.px0 && px <= q.px1 {
+                            let k = (px - q.px0) as i64;
 
-                    for k in 0..4 {
-                        value[k] = gradient.value[k] + (px as f64 + 0.5 - gradient.x) * gradient.dx[k] + tex_row[k];
-                    }
-                    if flat_q {
-                        let d = value[2];
-
-                        frag.texture_rho = if flat_ok
-                            && (value[0] / d).is_finite()
-                            && (value[1] / d).is_finite()
-                            && (tex_nr == 0.0 || (value[3] / d).is_finite())
-                        {
-                            flat_rho
-                        } else {
-                            f64::NAN
-                        };
-                    } else {
-                        frag.texture_rho = if soft_texture_derivatives(&value, &gradient.dx, &gradient.dy, tex_ns, tex_nt, tex_nr, &mut out) {
-                            out[4]
-                        } else {
-                            f64::NAN
-                        };
+                            general(px, quad_y + r as i32, q.e1 + k * step1, q.e2 + k * step2, rho);
+                        }
                     }
                 }
-                if background {
-                    self.stipple_background(&mut frag);
-                }
-                self.fragment(px, py, z, offset, depth_w, &frag);
+                qx += 2;
             }
         }
     }

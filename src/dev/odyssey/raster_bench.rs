@@ -127,6 +127,9 @@ pub enum Scene {
     TexTrilinearDepth,
     /// Textured with fog and blending: the textured fallback loop.
     TexFogBlend,
+    /// Textured, depth-tested, trilinear, in perspective: each quad takes
+    /// its own level of detail.
+    TexPerspective,
     /// Smooth, depth-tested triangles of some thousands of pixels.
     MidSmooth,
     /// Screen-filling quads, smooth and depth tested.
@@ -139,13 +142,14 @@ pub enum Scene {
     Clear,
 }
 
-pub const ALL_SCENES: [Scene; 11] = [
+pub const ALL_SCENES: [Scene; 12] = [
     Scene::FlatFill,
     Scene::SmoothDepth,
     Scene::SmoothBlend,
     Scene::TexBilinearDepth,
     Scene::TexTrilinearDepth,
     Scene::TexFogBlend,
+    Scene::TexPerspective,
     Scene::MidSmooth,
     Scene::BigQuads,
     Scene::BigTexTrilinear,
@@ -305,6 +309,29 @@ impl Bench {
                 b.tex = Some(BenchTexture::new(256, min, mag, SGI_GL_RGBA));
                 // Minified by about 1.5: a trilinear draw mixes two levels.
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
+            }
+            Scene::TexPerspective => {
+                st.depth_test = 1;
+                st.texture_2d = 1;
+                b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
+                for _ in 0..count {
+                    let (mut v, a) = triangle(&mut rng, 40.0, 1.5 / 256.0);
+
+                    // Each vertex its own w, the same window position, and
+                    // depth (z + w) / 2 kept within [0, 1].
+                    for i in 0..3 {
+                        let w = rng.range(1.0, 4.0);
+                        let d = rng.range(0.05, 0.95);
+                        let o = &mut v[i * SGI_GL_VERTEX_FLOATS + SGI_GL_V_POSITION..];
+
+                        o[0] *= w;
+                        o[1] *= w;
+                        o[2] = 2.0 * d - w;
+                        o[3] = w;
+                    }
+                    b.prims.push(v);
+                    b.pixels += a;
+                }
             }
             Scene::BigQuads | Scene::BigTexTrilinear => {
                 st.depth_test = 1;

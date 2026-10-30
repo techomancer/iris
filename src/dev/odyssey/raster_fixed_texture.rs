@@ -1,6 +1,6 @@
 //! The fixed-point fast path for textured triangles: the sampler's state, its
-//! texel reads and filters, and the lambda table. The row loops that draw a
-//! textured triangle's pixels through it are SoftDraw::fill_row() in
+//! texel reads and filters, and the lambda table. The quad loops that draw a
+//! textured triangle's pixels through it are SoftDraw::fill_quads() in
 //! raster_fill.rs. Its colours stay within 3/255 of the double-precision
 //! path's; it is faster, not more accurate.
 //!
@@ -588,6 +588,16 @@ pub fn soft_fixed_lambda(rho2: f64) -> i32 {
 }
 
 impl SoftFixedTex {
+    /// Lambda in 1/256 for a quad whose footprint under the diagonal rule
+    /// (soft_quad_rho()) is rho, as SoftFixedTex::fixed_coords() takes a
+    /// fragment's own footprint to one; None where rho squared overflows.
+    #[inline(always)]
+    pub fn quad_lambda(&self, rho: f64) -> Option<i32> {
+        let rho2 = rho * rho;
+
+        (rho2 <= f64::MAX).then(|| self.fixed_decide(rho2, soft_fixed_lambda(rho2)))
+    }
+
     /// Lambda for footprint squared rho2 from its table value lambda, or,
     /// within a few steps of a lambda where the filter or nearest level
     /// changes, computed exactly and rounded up. A lambda of ceil(256 l) is at
@@ -614,10 +624,11 @@ impl SoftFixedTex {
 
     /// A fragment's s, t and lambda from the triangle's planes g at pixel
     /// column px, whose row terms are row; None where the fixed sampler
-    /// cannot take it. flat_lambda, where Q/W is the same across the
-    /// triangle, is the lambda of every fragment.
+    /// cannot take it. lambda, where given, is the fragment's: its quad's
+    /// (SoftFixedTex::quad_lambda()). Without it the fragment takes its own
+    /// footprint's.
     #[inline(always)]
-    pub fn fixed_coords(&self, g: &SoftTexPlane, row: &[f64; 4], px: i32, flat_lambda: Option<i32>) -> Option<(f64, f64, i32)> {
+    pub fn fixed_coords(&self, g: &SoftTexPlane, row: &[f64; 4], px: i32, lambda: Option<i32>) -> Option<(f64, f64, i32)> {
         let x = px as f64 + 0.5 - g.x;
         let q = g.value[2] + x * g.dx[2] + row[2];
 
@@ -630,8 +641,8 @@ impl SoftFixedTex {
         if !(s.abs() < 1073741824.0 && t.abs() < 1073741824.0) {
             return None;
         }
-        if !self.lod || flat_lambda.is_some() {
-            return Some((s, t, flat_lambda.unwrap_or(0)));
+        if !self.lod || lambda.is_some() {
+            return Some((s, t, lambda.unwrap_or(0)));
         }
         // d(S/Q)/dx is (dS/dx - s dQ/dx) / Q, and so on.
         let a = self.ns * (g.dx[0] - s * g.dx[2]) * iq;
@@ -744,16 +755,13 @@ impl SoftDraw<'_> {
     }
 }
 
-/// One triangle's fixed inputs to a row loop (SoftDraw::fill_row()), and
-/// the row it is on.
+/// One triangle's fixed inputs to a quad loop (SoftDraw::fill_quads()).
 #[derive(Clone, Copy)]
 pub struct SoftTexSpan<'a> {
     /// three, wound as the rows step
     pub v: &'a [SoftVertex; 3],
     pub g: &'a SoftTexPlane,
-    /// the texture planes' row terms
-    pub row: [f64; 4],
-    /// lambda where Q/W is flat, or None
+    /// lambda where Q/W is flat, the same for every quad, or None
     pub flat_lambda: Option<i32>,
     pub flat: &'a SoftFrag,
     pub offset: f64,
