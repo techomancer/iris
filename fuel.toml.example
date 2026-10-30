@@ -20,6 +20,11 @@ profile = "fuel_ip34"
 # cache (`r14000_500`); other values are refused. Unset takes the same.
 cpu = "r14000"
 
+[graphics]
+# "v12" or "v10" fits a VPro in the graphics slot; IRIX needs a kernel with
+# the VPro driver. The console stays on serial either way.
+board = "none"
+
 [fuel]
 flash = "ignore/fuel/flash.bin"
 console = "l1"

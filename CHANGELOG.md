@@ -41,6 +41,9 @@ hashes are given where a change is easiest to understand by reading the commit.
   L1 system controller. PROM 6.210 passes its diagnostics and IRIX 6.5.30
   boots to the login on the L1 or an IOC3 serial console, and `halt -p`
   powers it off. See the [Fuel guide](docs/fuel-ip34.md).
+- **The Fuel takes a VPro board**: `[graphics] board = "v12"` or `"v10"`
+  fits the Octane's VPro model at crossbar widget 13. IRIX 6.5.30 with the
+  VPro driver brings the X login screen up on it.
 
 ### Benchmark and test suites: one pinned compiler
 

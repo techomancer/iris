@@ -4,8 +4,8 @@ The Fuel is the IP34 board running the IP35 software platform. IRIS
 emulates it with one 500 MHz R14000 and 512 MiB of RAM in two 256 MiB
 banks, the Bedrock hub chip, two XBridge PCI heads, an IOC3, a
 two-channel ISP12160 SCSI controller, a Lucent OHCI USB controller and
-the L1 system controller. It runs headless on its L1 or IOC3 serial
-console.
+the L1 system controller, and a VPro graphics board when one is fitted.
+Without one it runs headless on its L1 or IOC3 serial console.
 
 With PROM 6.210 and an installed IRIX 6.5.30 disk, the PROM reports
 `ALL DIAGS PASSED` and IRIX boots to a serial login. `hinv` lists the 500 MHz R14000 (revision
@@ -41,6 +41,22 @@ the revision at startup and logs `SNDRV_GET_ELSC_VERSION: I/O error`
 without one. The L1 answers the requests the PROM and IRIX send and
 refuses others as unknown. A power cycle the PROM asks for restarts the
 machine; a power down turns it off.
+
+## Graphics
+
+`[graphics] board = "v12"` (or `"v10"`) fits a VPro board in the graphics
+slot, crossbar widget 13: a Fuel IRIX inventory lists its board under
+xtalk/13, and Fuels have been reported with both the V12 and the V10. It is
+the Octane's VPro model. Its interrupt packets reach Bedrock as the PCI
+heads' do, its DMA enters Bedrock's inbound path as widget 13, and a link
+reset of port 13 resets it. The processor interfaces' graphics flow-control
+registers keep what IRIX writes but count no stores, so the
+credit-starvation interrupt never fires.
+
+With PROM 6.210 the graphics diagnostic finds the board and passes. An IRIX
+6.5.30 disk whose kernel includes the VPro driver lists `Graphics board: V12`
+in `hinv` and brings the X login screen up on it. A disk installed for a
+machine without graphics has no VPro driver in its kernel and runs as before.
 
 ## Input
 
