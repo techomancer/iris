@@ -3744,6 +3744,150 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(0xF_FFFF_FFFF);
     }
 
+    /// FrameMask bits 15:0 clear EntryLo bits 33:18 as a TLB write takes them,
+    /// on the R10000 only (R10000 UM v2.0 p. 260). Physical bit 24 is EntryLo bit 18,
+    /// mask bit 0; the R4400 has no such register.
+    #[test]
+    fn framemask_clears_entrylo_bits_on_a_tlb_write() {
+        fn phys<C: CpuModel + From<Arc<dyn BusDevice>>>(framemask: u64) -> (u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_masked::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, framemask);
+            (exec.core.read_cp0(21), exec.debug_translate(VA).phys)
+        }
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        on_big_stack(|| {
+            // Mask bit 0 is written with bits above 15, which are ignored.
+            let all = 0xFFFF_0001;
+            assert_eq!(phys::<R10000ShadowCache>(0), (0, 0x0300_5000));
+            assert_eq!(phys::<R10000ShadowCache>(all), (1, 0x0200_5000));
+            assert_eq!(phys::<R4400Cache>(all), (0, 0x0300_5000));
+        });
+    }
+
+    /// TLBWR masks as TLBWI does, and TLBR returns what the TLB holds: the
+    /// masked EntryLo, not the value that was written.
+    #[test]
+    fn framemask_applies_to_tlbwr_and_tlbr_reads_back_the_masked_entry() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        // Write with `funct`, find the entry with TLBP, clear EntryLo0, TLBR,
+        // and return (physical address of the page, EntryLo0 after TLBR).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32) -> (u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_with::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, 0xFFFF_0001, funct);
+            let phys = exec.debug_translate(VA).phys;
+            for (rd, value) in [(10, VA), (2, 0)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (phys, exec.core.read_cp0(2))
+        }
+        on_big_stack(|| {
+            // FrameMask bit 0 clears EntryLo bit 18, physical bit 24.
+            let unmasked = ((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            let masked = unmasked & !(1 << 18);
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                assert_eq!(entry::<R10000ShadowCache>(funct), (0x0200_5000, masked), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400Cache>(funct), (0x0300_5000, unmasked), "R4400 {funct:#x}");
+            }
+        });
+    }
+
+    /// The R10000 writes zeros into the PFN bits a page size leaves out of the
+    /// address, so TLBR returns them as zero (R10000 UM v2.0 pp. 299-300, TLBWI
+    /// and TLBWR); the later parts do the same as a model choice, since no
+    /// manual describes their TLB write. The R4400 keeps the whole PFN. The values are the PROM
+    /// diagnostic's patterns on 16 KB pages, where EntryLo bits 7:6 go unused.
+    /// Translation is the same on both: those bits never reach the address.
+    #[test]
+    fn tlb_write_clears_pfn_bits_below_the_page_size_on_the_r10000() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        // Write (lo0, lo1) with PageMask 0x6000 through TLBWI or TLBWR, then
+        // find the entry with TLBP and TLBR it back. Returns (EntryLo0, EntryLo1, physical address of
+        // VA + 0x3000).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32, lo0: u64, lo1: u64) -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<crate::cpu::mips_tlb::MipsTlb, C>::new(
+                Arc::new(MockMemory::new()) as Arc<dyn BusDevice>, crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.install_status_cb();
+            let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+            let dmtc0 = |rd: u32| (OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11);
+            for (rd, value) in [(12, status as u64), (10, VA), (0, 0), (5, 0x6000), (2, lo0), (3, lo1)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec(dmtc0(rd)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
+            let phys = exec.debug_translate(VA + 0x3000).phys;
+            // TLBWR picked the slot: find it with TLBP.
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            for rd in [2, 3] {
+                exec.core.write_gpr(1, 0);
+                assert_eq!(exec.exec(dmtc0(rd)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (exec.core.read_cp0(2), exec.core.read_cp0(3), phys)
+        }
+        on_big_stack(|| {
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                let (lo0, lo1) = (0xFFFF_FFFF_A5A5_A5A4, 0x5A5A_5A58);
+                // EntryLo 7:6 cleared; 63:62 and 33:6 otherwise kept.
+                assert_eq!(entry::<R10000ShadowCache>(funct, lo0, lo1).0, 0xC000_0003_A5A5_A524, "R10000 {funct:#x}");
+                assert_eq!(entry::<R10000ShadowCache>(funct, lo0, lo1).1, 0x5A5A_5A18, "R10000 {funct:#x}");
+                assert_eq!(entry::<R10000ShadowCache>(funct, lo1, lo0).0, 0x5A5A_5A18, "R10000 {funct:#x}");
+                // The R4400 keeps bits 29:0 as written.
+                assert_eq!(entry::<R4400Cache>(funct, lo0, lo1).0, 0x25A5_A5A4, "R4400 {funct:#x}");
+                assert_eq!(entry::<R4400Cache>(funct, lo0, lo1).1, 0x1A5A_5A58, "R4400 {funct:#x}");
+
+                // A 16 KB page at 0x0300_4000 written with PFN bits for
+                // 0x0300_7000: both parts translate from the 16 KB frame.
+                let lo = ((0x0300_7000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+                let (r10k, _, r10k_pa) = entry::<R10000ShadowCache>(funct, lo, 0);
+                let (r4k, _, r4k_pa) = entry::<R4400Cache>(funct, lo, 0);
+                assert_eq!((r10k, r10k_pa), (lo & !0xC0, 0x0300_7000), "R10000 {funct:#x}");
+                assert_eq!((r4k, r4k_pa), (lo, 0x0300_7000), "R4400 {funct:#x}");
+            }
+        });
+    }
+
+    /// On the R10000 family EntryLo holds a 28-bit PFN (33:6) and the uncached
+    /// attribute in 63:62 (R10000 UM v2.0 pp. 239-240); the R4400 and R5000 keep a
+    /// 24-bit PFN and nothing above it. The TLB carries the whole PFN.
+    #[test]
+    fn entrylo_covers_the_pfn_and_attribute_bits_of_the_r10000_family() {
+        fn readback<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let bus: Arc<dyn BusDevice> = Arc::new(MockMemory::new());
+            let mut exec = MipsExecutor::<PassthroughTlb, C>::new(bus, PassthroughTlb::default(), &MipsCpuConfig::indy());
+            disable_jitv2(&mut exec);
+            exec.core.write_gpr(1, u64::MAX);
+            // DMTC0 $1, EntryLo0 and EntryLo1; both read back the same field.
+            for reg in [2u32, 3] {
+                assert_eq!(exec.exec((0x10 << 26) | (5 << 21) | (1 << 16) | (reg << 11)), EXEC_COMPLETE);
+            }
+            let (lo0, lo1) = (exec.core.read_cp0(2), exec.core.read_cp0(3));
+            assert_eq!(lo0, lo1);
+            lo0
+        }
+        assert_eq!(readback::<R4400Cache>(), 0x3FFF_FFFF);
+        // Bits 61:34 are not PFN: they read back as zero, so only 33:32 reach physical 39:38.
+        assert_eq!(readback::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(), 0xC000_0003_FFFF_FFFF);
+
+        // The TLB carries the whole PFN: bits 33:32 are physical 39:38, and FrameMask
+        // is what keeps software flags there out of the address.
+        on_big_stack(|| {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000);
+            assert_eq!(exec.debug_translate(VA).phys, 0xC0_2054_C000);
+            // FrameMask 0xC000 is EntryLo 33:32: the page lands where its PFN says.
+            let mut exec = map_page_masked::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(
+                Arc::new(MockMemory::new()), VA, 0xC0_2054_C000, 0xC000);
+            assert_eq!(exec.debug_translate(VA).phys, 0x2054_C000);
+        });
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
@@ -6491,5 +6635,69 @@ mod tests {
             outcome.push((st, exec.core.cp0_badvaddr, exec.core.cp0_cause));
         }
         assert_eq!(outcome[0], outcome[1], "an explanation must not change what the guest sees");
+    }
+
+    /// Run `f` on a thread with room for a `MipsTlb`, which is large.
+    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(f).unwrap().join().unwrap();
+    }
+
+    /// A 64-bit kernel executor with one TLB entry, written through CP0 and
+    /// TLBWI, that maps the page at `va` to `phys` (cached, valid, dirty).
+    fn map_page<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        map_page_masked::<C>(bus, va, phys, 0)
+    }
+
+    /// `map_page` with CP0 FrameMask (register 21) written before the TLB write.
+    fn map_page_masked<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64, framemask: u64,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        map_page_with::<C>(bus, va, phys, framemask, FUNCT_TLBWI)
+    }
+
+    /// `map_page_masked`, writing the entry with `funct` (TLBWI or TLBWR).
+    fn map_page_with<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64, framemask: u64, funct: u32,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+        let mut exec = Box::new(MipsExecutor::new(bus, crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
+        disable_jitv2(&mut exec);
+        // MTC0 must refresh the boxed executor's translation/accessor state.
+        exec.install_status_cb();
+        let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
+        let entrylo = ((phys >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+        for (rd, value) in [(12, status as u64), (10, va), (0, 0), (5, 0), (21, framemask), (2, entrylo), (3, 0)] {
+            exec.core.write_gpr(1, value);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+        }
+        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
+        exec
+    }
+
+    /// EntryHi and the TLB keep every implemented VPN2 bit: 44 virtual-address
+    /// bits on the R10000, 40 on the R4400. An IRIX n64 stack can sit
+    /// above the 40-bit limit.
+    #[test]
+    fn cp0_entryhi_and_tlb_match_full_xuseg_va() {
+        on_big_stack(|| {
+            const VA: u64 = 0x0000_0123_4000_0000;
+            fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(full_va: bool) {
+                let mem = Arc::new(MockMemory::new());
+                mem.set_word(0x5_0000, 0xdead_beef);
+                let mut exec = map_page::<C>(mem, VA, 0x5_0000);
+                let result = exec.read_data::<4>(VA);
+                if full_va {
+                    assert_eq!(exec.core.cp0_entryhi, VA);
+                    assert_eq!(result, Ok(0xdead_beef));
+                } else {
+                    assert_eq!(exec.core.cp0_entryhi, VA & 0xC000_00FF_FFFF_E0FF);
+                    assert_eq!((result.unwrap_err() >> 2) & 0x1f, EXC_ADEL);
+                }
+            }
+            check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
+            check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        });
     }
 }
