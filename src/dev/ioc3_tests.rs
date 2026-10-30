@@ -160,6 +160,31 @@ fn configuration_space_repeats_its_first_32_bytes() {
     assert_eq!(cfg.interrupt_pin(), PCI_INTA);
 }
 
+/// The first five dwords of the register block are the configuration header
+/// the same monitor reads back as 0x310a9, 0x2800146, 0xff000001, 0x2800 and
+/// 0x500000. Pin control clear reads the control word, as the monitor reads
+/// 0x2000f3 at both 0x34 and 0x38.
+///
+/// QEMU: octane2/ioc3-register-header.
+#[test]
+fn the_register_block_starts_with_the_configuration_header() {
+    let r = Rig::new();
+    let cfg = r.c.config();
+    cfg.write(4, 0x0050_0000);
+    cfg.write(3, 0x2800);
+    cfg.write(1, 0x146);
+
+    for off in (0..=0x10).step_by(4) {
+        assert_eq!(r.r32(off), r.c.config_dword(off as usize / 4), "offset {off:#x}");
+    }
+    assert_eq!(r.r32(0x04), 0x0280_0146);
+    assert_eq!(r.r32(0x10), 0x0050_0000);
+
+    r.w32(reg::PIN_CONTROL_SET, 0x0020_00f3);
+    assert_eq!(r.r32(reg::PIN_CONTROL_SET), 0x0020_00f3);
+    assert_eq!(r.r32(reg::PIN_CONTROL_CLR), 0x0020_00f3);
+}
+
 // ---------------------------------------------------------------------------
 // SuperIO window: the two 16550s
 // ---------------------------------------------------------------------------

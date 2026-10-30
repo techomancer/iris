@@ -83,6 +83,8 @@ pub mod reg {
     pub const CHIP_CONTROL: u32 = 0x28;
     pub const INT_OUTPUT: u32 = 0x2c;
     pub const MICROLAN: u32 = 0x30;
+    /// The last dword of the PCI header that shows through the block.
+    pub const HEADER_LAST: u32 = 0x10;
     pub const PIN_CONTROL_SET: u32 = 0x34;
     pub const PIN_CONTROL_CLR: u32 = 0x38;
     pub const PIN_DATA: u32 = 0x3c;
@@ -1509,7 +1511,8 @@ impl St {
                 self.int_out.reg | if self.int_out.state { IO_STATE } else { 0 }
             }
             reg::MICROLAN => self.microlan,
-            reg::PIN_CONTROL_SET => self.pin_control,
+            // Both write aliases read the control word.
+            reg::PIN_CONTROL_SET | reg::PIN_CONTROL_CLR => self.pin_control,
             reg::PIN_DATA => self.pin_data_now(),
             0x80..=0x98 => self.par_dma_read(a),
             0x9c | 0xa0 | 0xa4 => self.kbc_read(a, c.ps2),
@@ -2625,8 +2628,9 @@ impl Drop for Ioc3 {
 }
 
 impl Ioc3 {
-    /// The header as the chip answers it. The status register reads fast
-    /// back-to-back capable beside the medium decode timing.
+    /// The header as the chip answers it, for the configuration space and
+    /// the first dwords of the register block alike. The status register
+    /// reads fast back-to-back capable beside the medium decode timing.
     fn header_dword(&self, index: usize) -> u32 {
         let v = self.sh.pci.read(index);
         if index == 1 { v | PCI_STATUS_FAST_BACK << 16 } else { v }
@@ -2659,6 +2663,9 @@ impl PciBusDevice for Ioc3 {
             return 0;
         }
         let a = off ^ (4 - width.min(4) as u32);
+        if width == 4 && a <= reg::HEADER_LAST && a & 3 == 0 {
+            return self.header_dword((a / 4) as usize);
+        }
         if (reg::ENET_FIRST..=reg::ENET_LAST).contains(&a) {
             // Only 32-bit accesses reach the Ethernet block.
             if width != 4 {
