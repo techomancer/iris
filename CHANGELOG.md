@@ -126,6 +126,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   counters.
 - The `ci_clock` unit tests that materialise Count now advance it by retired
   cycles, so `--features ci_clock,idle-pause` passes.
+- **A masked pending interrupt no longer freezes a guest that polls with
+  interrupts off.** With interrupts disabled and a masked line pending, the
+  CPU thread slept until a new unmasked interrupt or a monitor command, so a
+  guest polling a device (the console's transmit-ready bit, say) stopped
+  mid-line for minutes. It keeps running now.
 
 ### JIT v2
 

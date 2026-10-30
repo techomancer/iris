@@ -319,6 +319,18 @@ impl IdleParkState {
             return IdleDecision::None;
         }
 
+        // IE=0: no interrupt can be delivered at all, so a park could never
+        // end. Same busy-wait trap as `im == 0` above; keep executing. This
+        // must come before the pending-line pace below: with IE clear the
+        // guest is typically polling a device (the kernel's console printf
+        // spins on the SCC's transmit-ready bit), and sleeping it waits on a
+        // status change only its own next batch can observe.
+        if !core.interrupts_enabled() {
+            RESET_IE0.fetch_add(1, Ordering::Relaxed);
+            self.clear_window();
+            return IdleDecision::None;
+        }
+
         // A pending interrupt that is masked now is still about to be
         // taken: a loop that raises and drops the spl (IRIX's splhi leaves
         // only IP6 unmasked on IP22) is mostly seen in its masked stretch,
@@ -330,14 +342,6 @@ impl IdleParkState {
             RESET_IP.fetch_add(1, Ordering::Relaxed);
             self.clear_window();
             return IdleDecision::Pace;
-        }
-
-        // IE=0: no interrupt can be delivered at all, so a park could never
-        // end. Same busy-wait trap as `im == 0` above; keep executing.
-        if !core.interrupts_enabled() {
-            RESET_IE0.fetch_add(1, Ordering::Relaxed);
-            self.clear_window();
-            return IdleDecision::None;
         }
 
         // Only kernel code can be parked. A user process spinning in a loop
@@ -444,12 +448,12 @@ impl IdleParkState {
 
     /// Pace a repeated state whose interrupts are masked.
     ///
-    /// Unlike [`IdleParkState::park`], this never waits indefinitely: every
-    /// slice is bounded, so there is no deadlock risk when nothing can wake
-    /// the CPU. `hot.cycles` advances during the sleep at the host-pacing
+    /// Unlike [`IdleParkState::park`], this never waits indefinitely: it
+    /// sleeps at most one slice per call, so there is no deadlock risk when
+    /// nothing can wake the CPU. `hot.cycles` advances during the sleep at the host-pacing
     /// rate (`STALL_NS_PER_CYCLE`), so cross-thread cycle readers keep seeing
     /// progress and, under `ci_clock`, the Compare threshold still arrives.
-    /// The loop ends at once when `running` is cleared (monitor command /
+    /// The sleep ends at once when `running` is cleared (monitor command /
     /// soft reset), when an interrupt becomes deliverable, when the guest
     /// re-enables interrupts (the normal park path takes over next), or —
     /// under `ci_clock` — when the compare deadline is reached.
@@ -490,6 +494,10 @@ impl IdleParkState {
             std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
+            // One slice, then back to the run loop. Status cannot change
+            // while this thread sleeps, so looping here would wait on a
+            // condition only executing the guest can bring about.
+            break;
         }
         // Every exit leaves the flag clear: a stale `true` would put `wake`
         // on the mutex for a running CPU.
@@ -802,6 +810,33 @@ mod tests {
             before,
             "pace must not sleep while an interrupt is deliverable"
         );
+    }
+
+    /// A pending line the guest has masked, with IE clear, is the guest
+    /// polling a device with interrupts off (the kernel's console printf
+    /// spins on the SCC's transmit-ready bit). Sleeping it freezes the
+    /// guest: the bit it waits on only changes under the polling code.
+    #[test]
+    fn update_keeps_a_polling_guest_running_when_a_masked_line_is_pending() {
+        use crate::cpu::mips_core::CAUSE_IP2;
+        let mut core = idle_core(1 << (STATUS_IM_SHIFT + 6)); // IM6 only, IE clear
+        core.hot.interrupts.store(CAUSE_IP2 as u64, Ordering::SeqCst);
+        let mut st = IdleParkState::ready();
+        assert!(matches!(st.update(&core), IdleDecision::None));
+    }
+
+    /// `pace` returns after one slice even when nothing wakes it, so the run
+    /// loop gets to execute the guest again.
+    #[test]
+    fn pace_sleeps_one_slice_and_returns() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = 0;
+        let running = AtomicBool::new(true);
+        let t0 = Instant::now();
+        IdleParkState::ready().pace(&mut core, &running);
+        assert!(t0.elapsed() < Duration::from_millis(100), "pace must not wait for a wake");
+        assert!(core.hot.cycles > 0);
     }
 
     /// Pacing advances `hot.cycles` while it sleeps, so cross-thread cycle
