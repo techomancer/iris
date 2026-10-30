@@ -367,6 +367,13 @@ widget's link, refused Crossbow accesses, and accesses to physical addresses
 nothing is mapped at, with the PC; a device's own refusal is not listed). The
 `phys` commands work on the Octane as well.
 
+On the Fuel the one controller is a two-channel ISP12160: `scsi` (or
+`scsi0`) and `cow` act on channel 0, `scsi1` and `cow1` on channel 1, and
+ids run 0 to 15 on each (`[scsi.17]` is id 1 on channel 1). `scsi notes`
+shows the whole chip's command total and anything odd the driver did, and
+has no `scsi1` form; `regs`, `wdt`, `defer`, `debug` and `dayna` are not
+there.
+
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
 change reaches IRIX as a Unit Attention ("medium changed") on its next
 TEST UNIT READY; IRIX's `mediad` may still need a manual remount
@@ -522,7 +529,7 @@ a forced termination; a normal stop saves them automatically.
 |---|---|
 | `phys mem <addr> [n]` / `mm` | Dump physical memory |
 | `phys dis <addr> [n]` / `md` | Disassemble physical memory |
-| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane) |
+| `phys map` | The decode table: pages by kind (untouched, filled but not yet mapped, shared, private), memory in use, slots faulted in, and the table as runs of devices. Every machine on `Physical` has the `phys` commands (Indy, Indigo2, O2, Octane, Fuel) |
 | `phys trace <on\|off>` / `trace <on\|off>` | Log physical bus accesses |
 | `phys error <on\|off>` | Stop on bus errors |
 | `phys hole <on\|off>` | Stop on accesses to unmapped addresses |
