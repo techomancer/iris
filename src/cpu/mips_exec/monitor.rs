@@ -2027,7 +2027,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 #[cfg(not(feature = "jitv2_lockstep"))]
                                 {
                                 exec.jitv2_inline_compile = false;
-                                let bus = exec.sysad.clone();
+                                let bus = exec.cached_bus.clone();
                                 let old = exec.jitv2.lock().codegen.lock().take();
                                 match old {
                                     Some(old) => {
@@ -3030,7 +3030,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // implementation.
                         let path = actual_args.get(1).copied().unwrap_or("jitv2.html");
                         let jitv2_arc = exec.jitv2.clone();
-                        let bus = exec.sysad.clone();
+                        let bus = exec.cached_bus.clone();
                         crate::cpu::jitv2_html_j2wp::write_jitv2_html(
                             &jitv2_arc, &bus, &exec.memory.clone(), &mut exec.jitv2_inline_analyzer, path, &mut *writer,
                         )?;
