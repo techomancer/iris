@@ -935,6 +935,19 @@ fn the_parallel_port_presents_the_probe_values() {
     assert_eq!(r.r8(ECP + 1) & 0x08, 0x08, "no fault");
 }
 
+/// The status register reads what is on the cable. A connector with nothing
+/// on it sits at the five input pull-ups, 0x78, with bit 7 (the inverse of
+/// Busy) clear; a host backend reads as a printer that can take data, 0xd8.
+///
+/// QEMU: sn0/ioc3-parallel (empty connector and file backend cases).
+#[test]
+fn the_parallel_status_follows_what_is_attached() {
+    let r = Rig::new();
+    assert_eq!(r.r8(ECP + 1), 0x78, "empty connector");
+    r.c.set_parallel_backend(Arc::new(Wire::default()));
+    assert_eq!(r.r8(ECP + 1), 0xd8, "a ready printer");
+}
+
 #[test]
 fn the_parallel_test_fifo_stores_and_returns_bytes_in_order() {
     let r = Rig::new();

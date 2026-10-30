@@ -470,9 +470,23 @@ const PAR_FIFO_DEPTH: usize = 16;
 /// IRQ7 and DMA3.
 const PAR_CONFIG_A: u8 = 0x1f;
 const PAR_CONFIG_B: u8 = 0x0b;
-/// No peripheral on the cable: nFault high, nothing else asserted. This
-/// value is the model's choice; the register is described as "line-driven".
-const PAR_STATUS_IDLE: u8 = 0x08;
+// The status lines as the external SuperIO part reads them: bit 7 is the
+// inverse of the Busy pin, bits 6 to 3 are nAck, PError, Select and nFault as
+// the pins stand (nAck and nFault are active low). Bit 2, the part's PRINT
+// indicator, is not modelled and reads clear.
+const PAR_STATUS_NFAULT: u8 = 1 << 3;
+const PAR_STATUS_SELECT: u8 = 1 << 4;
+const PAR_STATUS_NACK: u8 = 1 << 6;
+const PAR_STATUS_BUSY: u8 = 1 << 7;
+/// Nothing on the connector: each of the five inputs sits at the level a
+/// pull-up gives it, high, and Busy high reads as a clear bit 7. The pull
+/// direction on the real boards is inferred; nothing measures an unplugged
+/// port.
+const PAR_STATUS_EMPTY: u8 = PAR_STATUS_NFAULT | PAR_STATUS_SELECT | 1 << 5 | PAR_STATUS_NACK;
+/// A ready printer: Busy low (bit 7 set), nAck, Select and nFault high, no
+/// paper error. Every host backend is taken as one that always accepts what
+/// is sent, an approximation: a file or pty never holds Busy.
+const PAR_STATUS_READY: u8 = PAR_STATUS_BUSY | PAR_STATUS_NACK | PAR_STATUS_SELECT | PAR_STATUS_NFAULT;
 
 #[derive(Default)]
 struct Parallel {
@@ -1790,7 +1804,9 @@ impl St {
         let p = &mut self.par;
         match r {
             0 => p.data,
-            1 => PAR_STATUS_IDLE,
+            // The lines follow the cable: a peripheral, or pull-ups on nothing.
+            1 if p.backend.is_some() => PAR_STATUS_READY,
+            1 => PAR_STATUS_EMPTY,
             2 => p.control,
             8 => {
                 if p.mode() == PAR_MODE_CONFIG {
