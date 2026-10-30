@@ -25,16 +25,49 @@
 //!   Where the emulator *must* know the layout — to decide whether a line is
 //!   valid, say — that is a separate question from storing the bits.
 //!
-//! The shadow is deliberately not consulted by `read`/`write`/`fetch`. If it
-//! ever needs to be, this type is the wrong shape and should say so loudly
-//! rather than growing a slow path.
+//! The shadow is deliberately not consulted by `read`/`write`/`fetch`, with
+//! one exception, below. If it ever needs to be for anything else, this type
+//! is the wrong shape and should say so loudly rather than growing a slow
+//! path.
+//!
+//! # Cache as RAM
+//!
+//! "Cache and memory agree" fails while a PROM uses the primary data cache
+//! as its RAM. It keeps its stack and data in cache lines and, meanwhile,
+//! either has no memory behind them at all (the Origin's PROM, before it
+//! sets up DRAM) or reprograms and tests the memory behind them with
+//! uncached accesses, relying on the cache not seeing those (the O2's PROM
+//! sizing memory). Real hardware serves the PROM's cached loads and stores
+//! from the lines and never asks memory; a tags-only cache loses the stack.
+//!
+//! So a machine can give this cache a *cache-as-RAM window*: a physical
+//! range, no larger than the primary data cache, that the PROM keeps its
+//! data in, and arm it while the PROM runs that way
+//! ([`MipsCache::set_cache_as_ram`]). While armed, a cached access to the
+//! window is served from a line [`Car`] holds, allocated on first touch as
+//! the hardware would: filled from memory if memory answers, zero if not,
+//! or unfilled when software makes it valid with Index_Store_Tag or
+//! Create_Dirty_Exclusive. The CACHE operations that move data between a
+//! line and memory act on held lines as on the hardware: Index_Store_Tag
+//! and Hit_Invalidate drop one unwritten, Index_Writeback_Invalidate and
+//! Hit_Writeback_Invalidate write it to the bus and drop it, Hit_Writeback
+//! (R4000 family) writes it and keeps it. Disarming writes every held line
+//! back. Everything outside the window, and everything while disarmed,
+//! goes straight to memory as before, and uncached accesses never come here,
+//! so they reach memory past a held line just as on the part.
+//!
+//! The window and when it is armed are the machine's: they are facts about
+//! its PROM, not about the cache. A machine without one (the Octane, whose
+//! PROM sets up memory before it uses the cache) never arms it and pays one
+//! predictable branch per load and store.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
-    C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    C_CDX, C_HINV, C_HWB, C_HWBINV, C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD,
+    CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
@@ -71,6 +104,70 @@ impl Shadow {
             ecc: vec![0u32; data_words].into_boxed_slice(),
             mru: vec![false; (lines.max(1) / WAYS).max(1)].into_boxed_slice(),
         }
+    }
+}
+
+/// The primary data lines held as cache-as-RAM (see the module notes),
+/// indexed like the shadow's primary data tags.
+struct Car {
+    /// The machine's window, empty when it has none.
+    window: std::ops::Range<u64>,
+    /// Whether accesses to the window are held.
+    armed: bool,
+    /// The physical line address each slot holds, or [`Car::EMPTY`].
+    line: Box<[u64]>,
+    /// The held lines' data, a line's worth of doublewords per slot, as
+    /// `read64` returns them.
+    data: Box<[u64]>,
+    /// Slots holding a line.
+    held: usize,
+}
+
+impl Car {
+    const EMPTY: u64 = u64::MAX;
+
+    fn new(lines: usize, line_bytes: usize) -> Self {
+        Self {
+            window: 0..0,
+            armed: false,
+            line: vec![Self::EMPTY; lines].into_boxed_slice(),
+            data: vec![0u64; lines * line_bytes / 8].into_boxed_slice(),
+            held: 0,
+        }
+    }
+
+    fn in_window(&self, phys: u64) -> bool {
+        self.armed && self.window.contains(&phys)
+    }
+
+    fn span(&self, slot: usize) -> std::ops::Range<usize> {
+        let n = self.data.len() / self.line.len();
+        slot * n..(slot + 1) * n
+    }
+
+    fn words(&mut self, slot: usize) -> &mut [u64] {
+        let r = self.span(slot);
+        &mut self.data[r]
+    }
+
+    /// `slot` now holds `line`, its data still to be filled.
+    fn hold(&mut self, slot: usize, line: u64) {
+        if self.line[slot] == Self::EMPTY {
+            self.held += 1;
+        }
+        self.line[slot] = line;
+    }
+
+    fn drop_slot(&mut self, slot: usize) {
+        if self.line[slot] != Self::EMPTY {
+            self.line[slot] = Self::EMPTY;
+            self.held -= 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.line.fill(Self::EMPTY);
+        self.held = 0;
     }
 }
 
@@ -148,6 +245,8 @@ pub struct ShadowCache<
     ic: UnsafeCell<Shadow>,
     dc: UnsafeCell<Shadow>,
     l2: UnsafeCell<Shadow>,
+    /// Primary data lines held as cache-as-RAM: see the module notes.
+    car: UnsafeCell<Car>,
     /// tcache: ppmem's window base, its mapped-region bitmap (published into
     /// directly on every remap) and the jitv2 generation window. This cache
     /// reads nothing through them — `read`/`write` go to `downstream`, whose
@@ -206,6 +305,7 @@ impl<
             // the IP28 PROM walks with Index_Store_Data, and a 1 MB array is
             // cheap once. The R4000 family has no index data ops.
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
+            car: UnsafeCell::new(Car::new(Self::DC_LINES.max(1), DC_LINE.max(8))),
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             tc_bitmap: UnsafeCell::new(0),
             #[cfg(feature = "jitv2")]
@@ -301,6 +401,173 @@ impl<
         let word = (virt_addr as usize) >> 4;
         (word * WAYS + way) % len
     }
+
+    #[allow(clippy::mut_from_ref)]
+    fn car(&self) -> &mut Car {
+        unsafe { &mut *self.car.get() }
+    }
+
+    /// Whether the window is armed: the one test every load and store pays.
+    #[inline(always)]
+    fn car_live(&self) -> bool {
+        unsafe { (*self.car.get()).armed }
+    }
+
+    /// The primary data slots a cached access at `virt_addr` can hit, one per
+    /// way of its set, numbered as `tag_slot` numbers them.
+    fn car_slots(&self, virt_addr: u64) -> [usize; 2] {
+        let (va, line, lines) = (virt_addr as usize, DC_LINE.max(1), Self::DC_LINES.max(1));
+        if Self::R10K {
+            let set = (va / line) % (lines / WAYS).max(1);
+            [set * WAYS, set * WAYS + 1]
+        } else if Self::R5K {
+            let sets = (lines / 2).max(1);
+            let set = (va / line) % sets;
+            [set, sets + set]
+        } else {
+            let s = (va / line) % lines;
+            [s, s]
+        }
+    }
+
+    /// The slot holding the line a cached access at `phys_addr` falls in.
+    fn car_find(&self, virt_addr: u64, phys_addr: u64) -> Option<usize> {
+        let line = phys_addr & !(DC_LINE as u64 - 1);
+        let car = self.car();
+        self.car_slots(virt_addr).into_iter().find(|&s| car.line[s] == line)
+    }
+
+    /// The held line for a cached access to the armed window, allocated on
+    /// first touch and filled from memory where memory answers. The way is
+    /// the window offset's bit above a way's span, so a window the size of
+    /// the cache fills every line of it once, as the PROM's sequential
+    /// stores do on the part; a line it displaces is written back first.
+    fn car_line(&self, virt_addr: u64, phys_addr: u64) -> Option<usize> {
+        if !self.car().in_window(phys_addr) {
+            return None;
+        }
+        if let Some(slot) = self.car_find(virt_addr, phys_addr) {
+            return Some(slot);
+        }
+        let ways = if Self::R10K || Self::R5K { 2 } else { 1 };
+        let car = self.car();
+        let way = ((phys_addr - car.window.start) as usize / (DC_SIZE / ways).max(1)) % ways;
+        let slot = self.car_slots(virt_addr)[way];
+        self.car_writeback(slot);
+        let line = phys_addr & !(DC_LINE as u64 - 1);
+        let car = self.car();
+        car.hold(slot, line);
+        for (i, w) in car.words(slot).iter_mut().enumerate() {
+            let r = self.downstream.read64(line + 8 * i as u64);
+            *w = if r.is_ok() { r.data } else { 0 };
+        }
+        Some(slot)
+    }
+
+    /// The physical line a primary data tag names, if its state is valid:
+    /// PTag is PA[35:12] in TagLo[31:8], and on the R10000 PA[39:36] in
+    /// TagHi[3:0]. The index address supplies the bits below the page.
+    fn pd_tag_line(virt_addr: u64, tag: u64) -> Option<u64> {
+        if (tag >> 6) & 3 == 0 {
+            return None;
+        }
+        let mut pa = ((tag >> 8) & 0xFF_FFFF) << 12;
+        if Self::R10K {
+            pa |= ((tag >> 32) & 0xF) << 36;
+        }
+        Some(pa | (virt_addr & 0xFFF & !(DC_LINE as u64 - 1)))
+    }
+
+    /// `slot` was given a new tag: whatever it held goes, unwritten, and it
+    /// holds `line` if that is valid and in the armed window. Its data is
+    /// what the SRAM held, which is undefined; zero is as good as any.
+    fn car_install(&self, slot: usize, line: Option<u64>) {
+        let car = self.car();
+        car.drop_slot(slot);
+        if let Some(line) = line.filter(|&l| car.in_window(l)) {
+            car.hold(slot, line);
+            car.words(slot).fill(0);
+        }
+    }
+
+    /// Arm the window `w`, or disarm (`None`), writing back what it held.
+    fn car_arm(&self, w: Option<std::ops::Range<u64>>) {
+        if let Some(w) = &w {
+            assert!(w.end - w.start <= DC_SIZE as u64, "a cache-as-RAM window larger than the data cache");
+        }
+        let car = self.car();
+        if !car.armed && w.as_ref() == Some(&car.window) {
+            car.armed = true;
+            return;
+        }
+        if car.armed && w.as_ref() == Some(&car.window) {
+            return;
+        }
+        for slot in 0..car.line.len() {
+            self.car_writeback(slot);
+        }
+        let car = self.car();
+        car.clear();
+        car.armed = w.is_some();
+        if let Some(w) = w {
+            car.window = w;
+        }
+    }
+
+    /// Write a held slot to the bus. Where nothing answers the write goes
+    /// nowhere, as a writeback to a missing address does on the part.
+    fn car_writeback(&self, slot: usize) {
+        let car = self.car();
+        let line = car.line[slot];
+        if line == Car::EMPTY {
+            return;
+        }
+        for (i, w) in car.words(slot).iter().enumerate() {
+            let _ = self.downstream.write64(line + 8 * i as u64, *w);
+        }
+    }
+
+    /// The bit position of a `size`-byte access at `phys_addr` within its
+    /// doubleword: big-endian, so the lowest address is the top byte.
+    fn car_lane(size: usize, phys_addr: u64) -> (usize, u32) {
+        let word = (phys_addr as usize % DC_LINE.max(8)) / 8;
+        let shift = 8 * (8 - size - (phys_addr as usize & 7)) as u32;
+        (word, shift)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn car_read(&self, size: usize, virt_addr: u64, phys_addr: u64) -> Option<u64> {
+        let slot = self.car_line(virt_addr, phys_addr)?;
+        let (word, shift) = Self::car_lane(size, phys_addr);
+        let w = self.car().words(slot)[word];
+        Some(if size == 8 { w } else { (w >> shift) & ((1u64 << (8 * size)) - 1) })
+    }
+
+    /// Merge `val` under `mask` (both in the doubleword's own bit positions)
+    /// into the held line, if `phys_addr` is in the armed window.
+    #[cold]
+    #[inline(never)]
+    fn car_write(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> bool {
+        let Some(slot) = self.car_line(virt_addr, phys_addr) else { return false };
+        let (word, _) = Self::car_lane(8, phys_addr & !7);
+        let w = &mut self.car().words(slot)[word];
+        *w = (*w & !mask) | (val & mask);
+        true
+    }
+
+    /// Hit operations on the primary data cache: write back and/or drop the
+    /// held line `phys_addr` falls in.
+    fn car_hit(&self, virt_addr: u64, phys_addr: u64, writeback: bool, invalidate: bool) {
+        if let Some(slot) = self.car_find(virt_addr, phys_addr) {
+            if writeback {
+                self.car_writeback(slot);
+            }
+            if invalidate {
+                self.car().drop_slot(slot);
+            }
+        }
+    }
 }
 
 impl<
@@ -386,9 +653,13 @@ impl<
     /// Declined until both windows are published, as `CpuCache` does, so the
     /// emitted code can assume them. Without tcache there is no inline path:
     /// every access calls out, exactly as for `PassthroughCache`.
+    ///
+    /// Nor while a cache-as-RAM window is armed: the inline path decides by
+    /// the RAM bitmap alone and would reach memory past a held line. A
+    /// machine re-publishes the geometry when it arms or disarms one.
     fn jit_dc_geometry(&self) -> crate::cpu::mips_cache_v2::JitDcGeometry {
         #[cfg(feature = "jitv2")]
-        if !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null() {
+        if !self.car_live() && !unsafe { *self.tc_base.get() }.is_null() && !unsafe { *self.tc_gen.get() }.is_null() {
             return crate::cpu::mips_cache_v2::JitDcGeometry {
                 supported: true,
                 tagless: true,
@@ -413,10 +684,17 @@ impl<
         }
     }
 
-    fn read<const SIZE: usize>(&self, _virt_addr: u64, phys_addr: u64) -> BusRead64 {
+    fn read<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64) -> BusRead64 {
         const {
             assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE")
         };
+        // Ahead of RAM: a held line keeps its data even once memory is
+        // configured under it.
+        if self.car_live() {
+            if let Some(v) = self.car_read(SIZE, virt_addr, phys_addr) {
+                return BusRead64::ok(v);
+            }
+        }
         // RAM: one load out of ppmem's window. Its layout is u32 words in
         // native order — byte at `off ^ 3`, halfword at `(off >> 1) ^ 1`,
         // u64 as rotate_left(32) — the same as CpuCache::tc_read.
@@ -449,10 +727,17 @@ impl<
         }
     }
 
-    fn write<const SIZE: usize>(&self, _virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
+    fn write<const SIZE: usize>(&self, virt_addr: u64, phys_addr: u64, val: u64) -> u32 {
         const {
             assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE")
         };
+        if self.car_live() {
+            let (_, shift) = Self::car_lane(SIZE, phys_addr);
+            let mask = if SIZE == 8 { u64::MAX } else { ((1u64 << (8 * SIZE)) - 1) << shift };
+            if self.car_write(virt_addr, phys_addr, val << (shift & 63), mask) {
+                return BUS_OK;
+            }
+        }
         if let Some(base) = self.ram(phys_addr) {
             let off = phys_addr as usize;
             unsafe {
@@ -480,7 +765,10 @@ impl<
         }
     }
 
-    fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
+    fn write64_masked(&self, virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
+        if self.car_live() && self.car_write(virt_addr, phys_addr, val, mask) {
+            return BUS_OK;
+        }
         if let Some(base) = self.ram(phys_addr) {
             let p = unsafe { base.add((phys_addr & !7) as usize) as *mut u64 };
             unsafe {
@@ -517,6 +805,30 @@ impl<
                 cache_op_name(cache_op));
         }
 
+        // Cache as RAM: what the primary data operations do to held lines
+        // (see the module notes). Index_Store_Tag is below, where the tag
+        // is stored.
+        if sel == CACH_PD {
+            match op {
+                C_IWBINV => {
+                    let slot = self.tag_slot(sel, virt_addr);
+                    self.car_writeback(slot);
+                    self.car().drop_slot(slot);
+                }
+                C_HINV => self.car_hit(virt_addr, phys_addr, false, true),
+                C_HWBINV => self.car_hit(virt_addr, phys_addr, true, true),
+                C_HWB if !Self::R10K => self.car_hit(virt_addr, phys_addr, true, false),
+                // A valid dirty line with no fill, at the access's address:
+                // the other way the R4000 family makes a line software owns.
+                C_CDX if !Self::R10K && self.car().in_window(phys_addr) => {
+                    let line = phys_addr & !(DC_LINE as u64 - 1);
+                    let [a, b] = self.car_slots(virt_addr);
+                    self.car_install(if self.car().line[b] == line { b } else { a }, Some(line));
+                }
+                _ => {}
+            }
+        }
+
         // R4400/R5000: a tag keeps only its fields, and reads back with
         // generated check bits — exactly what the full model returns.
         if !Self::R10K && matches!(op, C_IST | C_ILT) {
@@ -528,6 +840,9 @@ impl<
             let s = self.shadow(sel);
             if op == C_IST {
                 s.tags[idx] = r4k_store_taglo(Self::R5K, sel, phys_addr as u32) as u64;
+                if sel == CACH_PD {
+                    self.car_install(idx, Self::pd_tag_line(virt_addr, s.tags[idx]));
+                }
                 return 0;
             }
             return r4k_load_taglo(Self::R5K, sel, s.tags[idx] as u32) as u64;
@@ -554,6 +869,9 @@ impl<
                     let set = (idx / WAYS).min(s.mru.len() - 1);
                     s.mru[set] = phys_addr & MRU_BIT != 0;
                     s.tags[idx] = phys_addr & mask & !MRU_BIT;
+                }
+                if sel == CACH_PD {
+                    self.car_install(idx, Self::pd_tag_line(virt_addr, phys_addr));
                 }
                 0
             }
@@ -619,13 +937,61 @@ impl<
             s.tags.fill(0);
             s.mru.fill(false);
         }
+        self.car().clear();
         unsafe { (*self.decode.get()).flush() };
     }
 
+    fn set_cache_as_ram(&self, window: Option<std::ops::Range<u64>>) {
+        self.car_arm(window);
+    }
+
+    /// The held lines, which are the only data this cache owns: a snapshot
+    /// taken while a PROM keeps its stack in them needs them back.
+    fn save_cache_state(&self) -> toml::Value {
+        let car = &*self.car();
+        let lines: Vec<toml::Value> = (0..car.line.len())
+            .filter(|&s| car.line[s] != Car::EMPTY)
+            .map(|s| {
+                let mut t = toml::map::Map::new();
+                t.insert("slot".into(), crate::snapshot::hex_u64(s as u64));
+                t.insert("line".into(), crate::snapshot::hex_u64(car.line[s]));
+                t.insert("data".into(), crate::snapshot::u64_slice_to_toml(&car.data[car.span(s)]));
+                toml::Value::Table(t)
+            })
+            .collect();
+        let mut t = toml::map::Map::new();
+        t.insert("car_armed".into(), toml::Value::Boolean(car.armed));
+        t.insert("car_window".into(), crate::snapshot::u64_slice_to_toml(&[car.window.start, car.window.end]));
+        t.insert("car".into(), toml::Value::Array(lines));
+        toml::Value::Table(t)
+    }
+
     /// A restore replaces RAM wholesale; drop every decoded instruction. The
-    /// shadow arrays are not snapshotted (nothing reads them but diagnostics).
-    fn load_cache_state(&self, _v: &toml::Value) -> Result<(), String> {
+    /// shadow arrays are not snapshotted (nothing reads them but diagnostics);
+    /// the cache-as-RAM window and its lines are.
+    fn load_cache_state(&self, v: &toml::Value) -> Result<(), String> {
+        use crate::snapshot::{get_field, load_u64_slice, toml_bool, toml_u64};
         unsafe { (*self.decode.get()).flush() };
+        let car = self.car();
+        car.clear();
+        car.armed = get_field(v, "car_armed").and_then(toml_bool).unwrap_or(false);
+        if let Some(w) = get_field(v, "car_window") {
+            let mut r = [0u64; 2];
+            load_u64_slice(w, &mut r);
+            car.window = r[0]..r[1];
+        }
+        for l in get_field(v, "car").and_then(|a| a.as_array()).into_iter().flatten() {
+            let slot = get_field(l, "slot").and_then(toml_u64).ok_or("cache-as-RAM line without a slot")? as usize;
+            let line = get_field(l, "line").and_then(toml_u64).ok_or("cache-as-RAM line without an address")?;
+            if slot >= car.line.len() {
+                return Err(format!("cache-as-RAM slot {slot} out of range"));
+            }
+            car.hold(slot, line);
+            car.words(slot).fill(0);
+            if let Some(d) = get_field(l, "data") {
+                load_u64_slice(d, car.words(slot));
+            }
+        }
         Ok(())
     }
 
@@ -940,5 +1306,158 @@ mod tests {
         let g = c.jit_dc_geometry();
         assert!(g.supported && g.tagless && !g.has_l2,
             "tagless, and no L2 decode slots for a store to invalidate: {g:?}");
+    }
+
+    /// The O2 POST case: memory behind the window, which the PROM rewrites
+    /// uncached (straight to the bus here) while its stack is in the cache.
+    /// The cached copy must survive, and memory keep what was written to it.
+    #[test]
+    fn an_armed_window_keeps_its_lines_from_uncached_stores() {
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let c = R10000ShadowCache::from(mem.clone());
+        c.set_cache_as_ram(Some(0..0x1000));
+        c.write::<8>(0x8000_0f80, 0xf80, 0x1122_3344_5566_7788);
+        mem.write64(0xf80, 0xdead_beef_dead_beef);
+        assert_eq!(c.read::<8>(0x8000_0f80, 0xf80).data, 0x1122_3344_5566_7788, "the cached stack");
+        assert_eq!(mem.read64(0xf80).data, 0xdead_beef_dead_beef, "memory under it");
+        // Outside the window nothing changes: memory is the store.
+        c.write::<4>(0x8000_2000, 0x2000, 0x1234_5678);
+        assert_eq!(mem.read32(0x2000).data, 0x1234_5678);
+        // A line is filled from memory on first touch, as a cached load
+        // would fill it.
+        mem.write32(0x40, 0xcafe_f00d);
+        assert_eq!(c.read::<4>(0x8000_0040, 0x40).data, 0xcafe_f00d);
+        // Disarmed, the lines go to memory and memory is the store again.
+        c.set_cache_as_ram(None);
+        assert_eq!(mem.read64(0xf80).data, 0x1122_3344_5566_7788, "written back on disarm");
+        mem.write64(0xf80, 7);
+        assert_eq!(c.read::<8>(0x8000_0f80, 0xf80).data, 7);
+    }
+
+    /// The Origin case: nothing answers behind the window, and the PROM
+    /// makes its lines valid with Index_Store_Tag before using them.
+    #[test]
+    fn a_window_with_no_memory_behind_it_holds_data() {
+        let c = R10000ShadowCache::from(Arc::new(crate::dev::mem::UnmappedRam) as Arc<dyn BusDevice>);
+        c.set_cache_as_ram(Some(0x10_0000..0x10_8000));
+        // Dirty exclusive (PState 3) for PA 0x10_0040, through way 0 of its set.
+        c.cache_op(C_IST | CACH_PD, 0x8010_0040, (0x100 << 8) | 3 << 6);
+        c.write::<8>(0x8010_0040, 0x10_0040, 0x0123_4567_89ab_cdef);
+        assert_eq!(c.read::<8>(0x8010_0040, 0x10_0040).data, 0x0123_4567_89ab_cdef);
+        // Every line of a cache-sized window, both ways of every set.
+        for a in (0x10_0000..0x10_8000u64).step_by(32) {
+            c.write::<8>(0x8000_0000 | a, a, a ^ 0x5a5a);
+        }
+        for a in (0x10_0000..0x10_8000u64).step_by(32) {
+            assert_eq!(c.read::<8>(0x8000_0000 | a, a).data, a ^ 0x5a5a, "line {a:#x}");
+        }
+    }
+
+    /// The CACHE operations move a held line as they would a real one.
+    #[test]
+    fn cache_ops_write_back_and_drop_held_lines() {
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let c = R10000ShadowCache::from(mem.clone());
+        c.set_cache_as_ram(Some(0..0x1000));
+        let (va, pa) = (0x8000_0100u64, 0x100u64);
+        let reload = |v: u64| { c.write::<8>(va, pa, v); mem.write64(pa, 0); };
+
+        // Index_Store_Tag with TagLo 0 invalidates: the data is gone, and
+        // the next access fills from memory.
+        reload(1);
+        c.cache_op(C_IST | CACH_PD, va, 0);
+        c.cache_op(C_IST | CACH_PD, va | 1, 0);
+        assert_eq!(mem.read64(pa).data, 0, "not written");
+        assert_eq!(c.read::<8>(va, pa).data, 0, "dropped");
+
+        // Index_Writeback_Invalidate writes back, through the way that holds it.
+        reload(2);
+        c.cache_op(C_IWBINV | CACH_PD, va, 0);
+        assert_eq!(mem.read64(pa).data, 2);
+        mem.write64(pa, 3);
+        assert_eq!(c.read::<8>(va, pa).data, 3, "refilled after the invalidate");
+
+        // Hit_Writeback_Invalidate on the R10000.
+        reload(4);
+        c.cache_op(C_HWBINV | CACH_PD, va, pa);
+        assert_eq!(mem.read64(pa).data, 4);
+
+        // Hit_Invalidate drops it unwritten.
+        reload(5);
+        c.cache_op(C_HINV | CACH_PD, va, pa);
+        assert_eq!(mem.read64(pa).data, 0);
+    }
+
+    /// Hit_Writeback writes and keeps the line on the R4000 family.
+    #[test]
+    fn hit_writeback_keeps_the_line_on_the_r5000() {
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let c = R5000ShadowCache::from(mem.clone());
+        c.set_cache_as_ram(Some(0..0x1000));
+        c.write::<8>(0x8000_0200, 0x200, 9);
+        c.cache_op(C_HWB | CACH_PD, 0x8000_0200, 0x200);
+        assert_eq!(mem.read64(0x200).data, 9);
+        mem.write64(0x200, 10);
+        assert_eq!(c.read::<8>(0x8000_0200, 0x200).data, 9, "still held");
+    }
+
+    /// Byte, halfword, word and partial-doubleword stores to a held line land
+    /// in the same bytes they would in memory.
+    #[test]
+    fn held_lines_keep_memorys_byte_lanes() {
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let plain = R10000ShadowCache::from(Arc::new(Memory::new(1)) as Arc<dyn BusDevice>);
+        let c = R10000ShadowCache::from(mem.clone());
+        c.set_cache_as_ram(Some(0..0x1000));
+        for cache in [&plain, &c] {
+            cache.write::<8>(0x8000_0010, 0x10, 0x0011_2233_4455_6677);
+            cache.write::<1>(0x8000_0011, 0x11, 0xaa);
+            cache.write::<2>(0x8000_0014, 0x14, 0xbbcc);
+            cache.write::<4>(0x8000_0018, 0x18, 0xdead_beef);
+            cache.write64_masked(0x8000_0018, 0x18, 0x0000_0000_1234_5678, 0x0000_0000_ffff_0000);
+        }
+        for (a, n) in [(0x10u64, 8), (0x11, 1), (0x12, 2), (0x14, 4), (0x18, 8), (0x1c, 4), (0x1e, 2)] {
+            let (p, h) = match n {
+                1 => (plain.read::<1>(0x8000_0000 | a, a).data, c.read::<1>(0x8000_0000 | a, a).data),
+                2 => (plain.read::<2>(0x8000_0000 | a, a).data, c.read::<2>(0x8000_0000 | a, a).data),
+                4 => (plain.read::<4>(0x8000_0000 | a, a).data, c.read::<4>(0x8000_0000 | a, a).data),
+                _ => (plain.read::<8>(0x8000_0000 | a, a).data, c.read::<8>(0x8000_0000 | a, a).data),
+            };
+            assert_eq!(h, p, "{n} bytes at {a:#x}");
+        }
+        c.set_cache_as_ram(None);
+        assert_eq!(mem.read64(0x18).data, plain.read::<8>(0x8000_0018, 0x18).data, "written back in place");
+    }
+
+    /// A snapshot taken while a PROM's stack is held brings it back.
+    #[test]
+    fn held_lines_survive_a_snapshot() {
+        let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+        let c = R10000ShadowCache::from(mem.clone());
+        c.set_cache_as_ram(Some(0..0x1000));
+        c.write::<8>(0x8000_0f00, 0xf00, 0x0f0f);
+        let saved = c.save_cache_state();
+        let d = R10000ShadowCache::from(mem.clone());
+        d.load_cache_state(&saved).unwrap();
+        mem.write64(0xf00, 0);
+        assert_eq!(d.read::<8>(0x8000_0f00, 0xf00).data, 0x0f0f);
+    }
+
+    /// While a window is armed the JIT must call out for every load and
+    /// store: its inline path would go past a held line to RAM.
+    #[test]
+    #[cfg(feature = "jitv2")]
+    fn an_armed_window_turns_the_inline_path_off() {
+        let c = cache();
+        let mut window = [0u8; 8];
+        let mut gens = [std::sync::atomic::AtomicU64::new(0)];
+        unsafe {
+            c.set_tcache_window(window.as_mut_ptr());
+            c.set_tcache_gen_window(gens.as_mut_ptr());
+        }
+        c.set_cache_as_ram(Some(0..0x1000));
+        assert!(!c.jit_dc_geometry().supported);
+        c.set_cache_as_ram(None);
+        assert!(c.jit_dc_geometry().supported);
     }
 }

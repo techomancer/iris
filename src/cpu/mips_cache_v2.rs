@@ -583,6 +583,14 @@ pub trait MipsCache: Send + Sync {
     /// Default no-op: a cache that holds no data has nothing to write.
     fn writeback_all(&self) {}
 
+    /// Cache as RAM: while `window` is set, cached data accesses to that
+    /// physical range are kept in the primary data cache apart from memory,
+    /// as a PROM using the cache as its RAM needs; `None` writes them back
+    /// and stops. The window and when to arm it are the machine's. See
+    /// `mips_cache_shadow`. Default no-op: a model that holds data does
+    /// this anyway.
+    fn set_cache_as_ram(&self, _window: Option<std::ops::Range<u64>>) {}
+
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
     fn tcache_bitmap_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
