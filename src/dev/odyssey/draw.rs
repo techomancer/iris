@@ -26,14 +26,27 @@ pub fn pack_pixel(r: u32, g: u32, b: u32) -> u32 {
     (r << 24) | (g << 16) | (b << 8) | 0xff
 }
 
+/// The 0x840 ownership test at an in-plane pixel, against id plane `did`
+/// and the 0x840 word `id_compare`.
+pub fn id_compare_passes(did: &[u8], id_compare: u32, x: i64, y: i64) -> bool {
+    let mask = (id_compare >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
+
+    id_compare & ODSY_ID_COMPARE_ENABLE == 0
+        || ((did[(y * SGI_ODYSSEY_WIDTH as i64 + x) as usize] ^ id_compare as u8) & mask) == 0
+}
+
 impl Board {
     /// Colour buffer b's board memory and plane (set up by Board::allocate()), b being 0 or
     /// 1 in the displayed-buffer bits' sense (ODSY_REG_DRAW_MASK).
-    pub fn buffer_mem(&mut self, b: u32) -> P<BoardMemory> {
-        if b != 0 { P::new(&mut self.buffer1_mem) } else { P::new(&mut self.mem) }
+    pub fn buffer_mem(&self, b: u32) -> &BoardMemory {
+        if b != 0 { &self.buffer1_mem } else { &self.mem }
     }
 
-    pub fn buffer_plane(&mut self, b: u32) -> P<Plane> {
+    pub fn buffer_mem_mut(&mut self, b: u32) -> &mut BoardMemory {
+        if b != 0 { &mut self.buffer1_mem } else { &mut self.mem }
+    }
+
+    pub fn buffer_plane(&self, b: u32) -> Option<Plane> {
         if b != 0 {
             self.buffer1_mem.plane(self.buffer1_plane)
         } else {
@@ -41,30 +54,29 @@ impl Board {
         }
     }
 
-    pub fn buffer_load(&mut self, b: u32, x: i64, y: i64) -> u32 {
-        let m = self.buffer_mem(b);
-        let p = self.buffer_plane(b);
-
-        m.plane_load(&p, x as i32, y as i32)
+    pub fn buffer_load(&self, b: u32, x: i64, y: i64) -> u32 {
+        match self.buffer_plane(b) {
+            Some(p) => self.buffer_mem(b).plane_load(&p, x as i32, y as i32),
+            None => 0,
+        }
     }
 
     pub fn buffer_store(&mut self, b: u32, x: i64, y: i64, word: u32) {
-        let mut m = self.buffer_mem(b);
-        let p = self.buffer_plane(b);
-
-        m.plane_store(&p, x as i32, y as i32, word);
+        if let Some(p) = self.buffer_plane(b) {
+            self.buffer_mem_mut(b).plane_store(&p, x as i32, y as i32, word);
+        }
     }
 
     /// Whether the last 0x1017 select named the id-plane destination, whatever
     /// ODSY_DEST_FLAGS it carried.
-    pub fn dest_is_id_planes(&mut self) -> bool {
+    pub fn dest_is_id_planes(&self) -> bool {
         (self.dest_buffer_word & !ODSY_DEST_FLAGS) == (ODSY_DEST_ID_PLANES & !ODSY_DEST_FLAGS)
     }
 
     /// The buffers a colour write lands in, bit b for buffer b, from the last
     /// 0x0424 drawing mask. A right-eye bit folds into its buffer: stereo is not
     /// modelled.
-    pub fn draw_buffers(&mut self) -> u32 {
+    pub fn draw_buffers(&self) -> u32 {
         (if self.draw_mask & ODSY_DRAW_MASK_BUFFER0 != 0 { 1 } else { 0 })
             | (if self.draw_mask & ODSY_DRAW_MASK_BUFFER1 != 0 { 2 } else { 0 })
     }
@@ -108,7 +120,7 @@ impl Board {
     }
 
     /// Whether clip_words is the off-screen form (ODSY_CMD_WINDOW_RESTORE).
-    pub fn clip_is_offscreen(&mut self) -> bool {
+    pub fn clip_is_offscreen(&self) -> bool {
         for i in 0..(2 * SGI_ODYSSEY_CLIP_RECTS) as usize {
             let want = if i == 1 { ODSY_CLIP_OFFSCREEN_HI } else { 0 };
 
@@ -123,26 +135,23 @@ impl Board {
     /// family checks first so the shared code never has to guess whose error it
     /// is. Board::pixel_allowed() adds the window tests for every write except a
     /// copy destination, which calls this helper directly.
-    pub fn pixel_in_bounds(&mut self, x: i64, y: i64) -> bool {
+    pub fn pixel_in_bounds(&self, x: i64, y: i64) -> bool {
         x >= 0 && y >= 0 && x < SGI_ODYSSEY_WIDTH as i64 && y < SGI_ODYSSEY_HEIGHT as i64
     }
 
-    pub fn id_compare_active(&mut self) -> bool {
+    pub fn id_compare_active(&self) -> bool {
         self.id_compare & ODSY_ID_COMPARE_ENABLE != 0
     }
 
     /// The 0x840 ownership test at an in-plane pixel.
-    pub fn id_compare_passes(&mut self, x: i64, y: i64) -> bool {
-        let mask = (self.id_compare >> ODSY_ID_COMPARE_MASK_SHIFT) as u8;
-
-        !self.id_compare_active()
-            || ((self.did[(y * SGI_ODYSSEY_WIDTH as i64 + x) as usize] ^ self.id_compare as u8) & mask) == 0
+    pub fn id_compare_passes(&self, x: i64, y: i64) -> bool {
+        id_compare_passes(&self.did, self.id_compare, x, y)
     }
 
     /// The one pixel test every write but a copy destination passes: the plane
     /// bound and the 0x840 id test, then inside at least one kept clip rectangle
     /// -- with none kept nothing is drawn.
-    pub fn pixel_allowed(&mut self, x: i64, y: i64) -> bool {
+    pub fn pixel_allowed(&self, x: i64, y: i64) -> bool {
         if !self.pixel_in_bounds(x, y) || !self.id_compare_passes(x, y) {
             return false;
         }
@@ -160,7 +169,7 @@ impl Board {
     /// test: the plane bound and the union of the kept clip rectangles, as
     /// ascending, disjoint, non-touching [start, end) runs. The 2D fills walk
     /// these a row at a time; they still apply the id test per pixel.
-    pub fn row_runs(&mut self, y: i64, runs: &mut RowRuns) {
+    pub fn row_runs(&self, y: i64, runs: &mut RowRuns) {
         let mut n = 0usize;
         let mut kept = 0usize;
 
@@ -200,26 +209,25 @@ impl Board {
         runs.n = kept as u32;
     }
 
-    /// Colour buffer b's bytes for the n pixels of row y from x, when all of them
-    /// lie in its plane and its device-backed memory: the same bytes
-    /// BoardMemory::plane_store() and BoardMemory::plane_load() reach one pixel at a time. Null
-    /// otherwise, and the caller goes a pixel at a time.
-    pub fn buffer_row(&mut self, b: u32, x: i64, y: i64, n: i64, plane: &mut P<Plane>, bpp: &mut u32) -> P<u8> {
+    /// Where colour buffer b keeps the n pixels of row y from x, when all of
+    /// them lie in its plane and its memory: the plane, and the byte offset
+    /// and length of the run in Board::buffer_mem(), the same bytes
+    /// BoardMemory::plane_store() and BoardMemory::plane_load() reach one
+    /// pixel at a time. None otherwise, and the caller goes a pixel at a time.
+    pub fn buffer_row(&self, b: u32, x: i64, y: i64, n: i64) -> Option<(Plane, std::ops::Range<usize>)> {
         let m = self.buffer_mem(b);
-        let p = self.buffer_plane(b);
+        let p = self.buffer_plane(b)?;
         let size = plane_bytes_per_pixel(p.format);
 
         if m.bytes.is_empty() || n <= 0 || x < 0 || y < 0 || x + n > p.width as i64 || y >= p.height as i64 {
-            return P::null();
+            return None;
         }
         let at = p.base.wrapping_add((y as u64).wrapping_mul(p.stride as u64)).wrapping_add((x as u64).wrapping_mul(size as u64));
         let len = (n as u64).wrapping_mul(size as u64);
         if at > m.size || len > m.size - at {
-            return P::null();
+            return None;
         }
-        *plane = p;
-        *bpp = size;
-        P(unsafe { m.bytes.as_ptr().add(at as usize) } as *mut u8)
+        Some((p, at as usize..(at + len) as usize))
     }
 
     /// A colour write, into each buffer the drawing mask selects.
@@ -362,15 +370,12 @@ impl Board {
                 continue;
             }
             for b in 0..ODSY_BUFFERS {
-                let mut plane: P<Plane> = P::null();
                 let mut word = [0u8; 4];
-                let mut bpp = 0u32;
 
                 if buffers & (1u32 << b) == 0 {
                     continue;
                 }
-                let row = self.buffer_row(b, a, y, e - a, &mut plane, &mut bpp);
-                if row.is_null() {
+                let Some((plane, run)) = self.buffer_row(b, a, y, e - a) else {
                     for x in a..e {
                         let mut out = src;
 
@@ -384,17 +389,18 @@ impl Board {
                         self.buffer_store(b, x, y, out);
                     }
                     continue;
-                }
-                plane.encode(src, &mut word);
-                for x in a..e {
-                    let at = ((x - a) as usize) * bpp as usize;
-                    let px = unsafe { std::slice::from_raw_parts_mut(row.0.add(at), bpp as usize) };
+                };
+                let bpp = plane_bpp(plane.format) as usize;
+                let (did, id_compare) = (&self.did, self.id_compare);
+                let mem = if b != 0 { &mut self.buffer1_mem } else { &mut self.mem };
 
-                    if id_test && !self.id_compare_passes(x, y) {
+                plane.encode(src, &mut word);
+                for (x, px) in (a..e).zip(mem.bytes[run].chunks_exact_mut(bpp)) {
+                    if id_test && !id_compare_passes(did, id_compare, x, y) {
                         continue;
                     }
                     if !logic {
-                        px.copy_from_slice(&word[..bpp as usize]);
+                        px.copy_from_slice(&word[..bpp]);
                         continue;
                     }
                     let out = logic_op(op, src, plane.decode(px));
@@ -474,19 +480,15 @@ impl Board {
 
         for row in 0..h_clip {
             let sr = if reverse_rows { h_clip - 1 - row } else { row };
-            let mut src_plane: P<Plane> = P::null();
-            let mut dst_plane: P<Plane> = P::null();
-            let mut src_bpp = 0u32;
-            let mut dst_bpp = 0u32;
             let src_row = if w_clip != 0 {
-                self.buffer_row(source, sx as i64, sy as i64 + sr as i64, w_clip as i64, &mut src_plane, &mut src_bpp)
+                self.buffer_row(source, sx as i64, sy as i64 + sr as i64, w_clip as i64)
             } else {
-                P::null()
+                None
             };
-            let dst_row = if !src_row.is_null() {
-                self.buffer_row(dest, dx as i64, dy as i64 + sr as i64, w_clip as i64, &mut dst_plane, &mut dst_bpp)
+            let dst_row = if src_row.is_some() {
+                self.buffer_row(dest, dx as i64, dy as i64 + sr as i64, w_clip as i64)
             } else {
-                P::null()
+                None
             };
 
             // A row wholly inside both planes, in the same encoding, is the byte
@@ -494,11 +496,20 @@ impl Board {
             // a read stays ahead of the write it could meet, which is what a
             // memmove does for the one overlapping case, a row copied along
             // itself.
-            if !dst_row.is_null() && src_plane.format == dst_plane.format && src_plane.packing == dst_plane.packing {
-                unsafe {
-                    std::ptr::copy(src_row.0, dst_row.0, w_clip as usize * dst_bpp as usize);
+            if let (Some((src_plane, src)), Some((dst_plane, dst))) = (src_row, dst_row) {
+                if src_plane.format == dst_plane.format && src_plane.packing == dst_plane.packing {
+                    if (source != 0) == (dest != 0) {
+                        self.buffer_mem_mut(dest).bytes.copy_within(src, dst.start);
+                    } else {
+                        let (from, to) = if source != 0 {
+                            (&self.buffer1_mem, &mut self.mem)
+                        } else {
+                            (&self.mem, &mut self.buffer1_mem)
+                        };
+                        to.bytes[dst].copy_from_slice(&from.bytes[src]);
+                    }
+                    continue;
                 }
-                continue;
             }
             for col in 0..w_clip {
                 let sc = if reverse_cols { w_clip - 1 - col } else { col };

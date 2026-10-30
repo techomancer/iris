@@ -43,12 +43,19 @@ pub const SGI_DMA_CHUNK_MAX: u32 = 4096;
 /// The smallest page a page list may name.
 pub const SGI_DMA_MIN_PAGE_SIZE: u32 = SGI_DMA_CHUNK_MAX;
 
-/// A head's view of guest memory.
+/// Why a DMA write to guest memory failed.
+pub type Failure = u32;
+pub const SGI_FAIL_BUS: Failure = 1; // a guest-memory transaction failed
+pub const SGI_FAIL_BOUNDS: Failure = 2; // outside the page list, plane or pool
+
+/// A head's view of guest memory. The inbound path is direct-mapped: a
+/// device address is the bus address.
 #[derive(Clone, Default)]
 pub struct DmaBus {
     pub mem: GuestMemory,
-    pub ops: P<HeadOps>, // dma_address, dma_chunk, publish
-    pub opaque: Opaque,
+    /// The MMIO write that started the transfer, which a traced chunk
+    /// names (Board::trace_sequence).
+    pub trace_sequence: u64,
 }
 
 /// A guest buffer as the driver described it: page i at addr[i].
@@ -65,7 +72,7 @@ pub struct DmaChunk {
     pub len: u32,
     pub pos: u64,      // offset within the page-listed buffer
     pub addr: u64,     // device address, as traced
-    pub bus_addr: u64, // composed address the transfer used
+    pub bus_addr: u64, // bus address the transfer used
     /// The bytes the head wrote, as offsets into the chunk: one run from
     /// the first to the last, empty while written_end is 0.
     pub written_start: u32,
@@ -98,8 +105,8 @@ impl DmaPageList {
 }
 
 impl DmaBus {
-    /// Read buf.len() bytes at device address addr, composed through
-    /// dma_address(), tracing them in chunks when `trace` is set. Returns
+    /// Read buf.len() bytes at device address addr, tracing them in chunks
+    /// when `trace` is set. Returns
     /// false, having logged a guest error, when the read fails.
     pub fn read(&self, addr: u64, buf: &mut [u8], trace: bool, trace_seq: u64) -> bool {
         let len = buf.len() as u32;
@@ -111,11 +118,7 @@ impl DmaBus {
         while done < len {
             let at = addr.wrapping_add(done as u64);
             let n = (len - done).min(SGI_DMA_CHUNK_MAX - (at & (SGI_DMA_CHUNK_MAX as u64 - 1)) as u32);
-            let mut bus_addr: u64 = 0;
-
-            if !self.compose(at, &mut bus_addr) {
-                return false;
-            }
+            let bus_addr = at;
             let dst = &mut buf[done as usize..(done + n) as usize];
             if !read_guest(&self.mem, bus_addr, dst) {
                 crate::dlog!(LogModule::Odyssey, "sgi-dma: read of {} bytes at {:#x} failed", n, bus_addr);
@@ -158,7 +161,7 @@ impl DmaBus {
             // the driver did not hand over: the next page of the buffer is
             // wherever the list says, not the physically next one.
             let n = (offset + len - pos).min(ps - in_page).min(SGI_DMA_CHUNK_MAX as u64);
-            let mut bus_addr: u64 = 0;
+            let bus_addr = addr;
 
             if page & (ps - 1) != 0 {
                 crate::dlog!(
@@ -168,9 +171,6 @@ impl DmaBus {
                     pl.page_size
                 );
                 return SGI_FAIL_BOUNDS as i32;
-            }
-            if !self.compose(addr, &mut bus_addr) {
-                return SGI_FAIL_BUS as i32;
             }
             crate::dlog_dev!(LogModule::Odyssey, "sgi_dma_chunk: addr {:#x} len {}", addr, n);
             let mut c = DmaChunk {
@@ -244,23 +244,18 @@ impl DmaMap {
 }
 
 impl DmaBus {
-    pub fn compose(&self, addr: u64, out: &mut u64) -> bool {
-        if let Some(ops) = self.ops.as_opt() {
-            if let Some(dma_address) = ops.dma_address {
-                return dma_address(self.opaque, addr, out);
-            }
-        }
-        *out = addr;
-        true
-    }
-
+    /// A run of guest bytes the DMA engine read, for the device log.
     pub fn trace(&self, trace: bool, seq: u64, addr: u64, bytes: &[u8]) {
+        let _ = seq;
         if trace {
-            if let Some(ops) = self.ops.as_opt() {
-                if let Some(dma_chunk) = ops.dma_chunk {
-                    dma_chunk(self.opaque, seq, addr, bytes);
-                }
-            }
+            crate::dlog_dev!(
+                LogModule::Odyssey,
+                "sgi_odyssey_dma_chunk: seq {} addr {:#x} len {} hex {}",
+                self.trace_sequence,
+                addr,
+                bytes.len(),
+                bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            );
         }
     }
 }

@@ -40,20 +40,11 @@ pub struct Plane {
     pub bottom_origin: bool, // plane row 0 is the bottom display line
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct BoardPage {
-    pub host: P<u8>, // null until the family resolves it
-    pub guest: u64,  // the page's guest address
-}
-
+/// A head's board memory: a model-owned byte array, and the planes over it.
 #[derive(Clone, Default)]
 pub struct BoardMemory {
     pub size: u64,
-    pub bytes: Vec<u8>, // device-backed, else empty
-    pub bytes_len: u32, // size when device-backed, else 0
-    pub pages: Vec<BoardPage>, // page-backed, else empty
-    pub npages: u32,
-    pub page_size: u32,
+    pub bytes: Vec<u8>,
     /// A fixed table, so a plane index stays valid for the memory's life.
     pub planes: [Plane; SGI_PLANES_MAX],
     pub nplanes: u32,
@@ -96,13 +87,12 @@ pub const SGI_LOGIC_OR_INVERTED: u32 = 13;
 pub const SGI_LOGIC_NAND: u32 = 14;
 
 impl BoardMemory {
-    /// A zeroed device-backed memory of size bytes, at most 4 GiB - 1.
+    /// A zeroed memory of size bytes, at most 4 GiB - 1.
     pub fn init(&mut self, size: u64) {
         // A family constant; the limit is the 32-bit offsets planes use.
         assert!(size != 0 && size <= u32::MAX as u64);
         *self = BoardMemory::default();
         self.size = size;
-        self.bytes_len = size as u32;
         self.bytes = vec![0u8; size as usize];
     }
 }
@@ -156,13 +146,9 @@ impl BoardMemory {
         crate::dlog!(LogModule::Odyssey, "sgi_plane_add: plane {} base {:#x} len {:#x} {}x{} stride {} format {}", p.id, p.base, p.len, p.width, p.height, p.stride, p.format as i32);
         p.id
     }
-    /// The plane with this id, or null.
-    pub fn plane(&self, id: u32) -> P<Plane> {
-        if id < self.nplanes {
-            P::from_ref(&self.planes[id as usize])
-        } else {
-            P::null()
-        }
+    /// The plane with this id, if there is one.
+    pub fn plane(&self, id: u32) -> Option<Plane> {
+        (id < self.nplanes).then(|| self.planes[id as usize])
     }
 }
 
@@ -217,50 +203,26 @@ impl BoardMemory {
             return 0;
         }
         let bpp = plane_bpp(p.format);
-        let at = p.offset(x, y, bpp);
-        if !self.bytes.is_empty() {
-            let host = self.bytes(at, bpp);
-            return if !host.is_null() {
-                p.get(bpp, unsafe { std::slice::from_raw_parts(host.0, bpp as usize) })
-            } else {
-                0
-            };
-        }
-        let host = self.host(at, bpp as u64);
-        if !host.is_null() {
-            return p.get(bpp, unsafe { std::slice::from_raw_parts(host.0, bpp as usize) });
-        }
-        let mut bytes = [0u8; 4];
-        if !self.export(at, &mut bytes[..bpp as usize]) {
-            return 0;
-        }
-        p.get(bpp, &bytes)
+        self.pixel(p.offset(x, y, bpp), bpp).map_or(0, |b| p.get(bpp, b))
     }
     pub fn plane_store(&mut self, p: &Plane, x: i32, y: i32, word: u32) {
         if !p.contains(x, y) {
             return;
         }
         let bpp = plane_bpp(p.format);
-        let at = p.offset(x, y, bpp);
-        if !self.bytes.is_empty() {
-            let host = self.bytes(at, bpp);
-            if !host.is_null() {
-                p.put(bpp, word, unsafe {
-                    std::slice::from_raw_parts_mut(host.0, bpp as usize)
-                });
-            }
-            return;
+        if let Some(b) = self.pixel_mut(p.offset(x, y, bpp), bpp) {
+            p.put(bpp, word, b);
         }
-        let host = self.host(at, bpp as u64);
-        if !host.is_null() {
-            p.put(bpp, word, unsafe {
-                std::slice::from_raw_parts_mut(host.0, bpp as usize)
-            });
-            return;
-        }
-        let mut bytes = [0u8; 4];
-        p.put(bpp, word, &mut bytes);
-        self.import(at, &bytes[..bpp as usize]);
+    }
+
+    /// The `bpp` bytes at `at`, when they are inside the memory.
+    #[inline]
+    pub fn pixel(&self, at: u64, bpp: u32) -> Option<&[u8]> {
+        self.bytes.get(usize::try_from(at).ok()?..)?.get(..bpp as usize)
+    }
+    #[inline]
+    pub fn pixel_mut(&mut self, at: u64, bpp: u32) -> Option<&mut [u8]> {
+        self.bytes.get_mut(usize::try_from(at).ok()?..)?.get_mut(..bpp as usize)
     }
 }
 
@@ -317,19 +279,6 @@ impl Plane {
     }
 }
 
-impl BoardMemory {
-    /// Copy dst.len() bytes at base out of board memory. Returns false,
-    /// copying nothing, when the range is outside the memory or crosses a
-    /// page the family has not resolved.
-    pub fn export(&self, base: u64, dst: &mut [u8]) -> bool {
-        self.copy(base, dst.len() as u64, dst.as_mut_ptr(), true)
-    }
-    /// The same, into board memory from src.
-    pub fn import(&mut self, base: u64, src: &[u8]) -> bool {
-        self.copy(base, src.len() as u64, src.as_ptr() as *mut u8, false)
-    }
-}
-
 // The per-pixel paths take a plane's pixel size once and reuse it.
 #[inline]
 pub fn plane_bpp(format: PlaneFormat) -> u32 {
@@ -357,96 +306,10 @@ impl Plane {
     }
 }
 
-impl BoardMemory {
-    /// The host bytes behind [base, base + len), when they are contiguous on
-    /// the host: always for a device-backed memory, within one resolved page
-    /// for a page-backed one. Null otherwise.
-    pub fn host(&self, base: u64, len: u64) -> P<u8> {
-        if base > self.size || len > self.size - base {
-            return P::null();
-        }
-        if !self.bytes.is_empty() {
-            return P(unsafe { self.bytes.as_ptr().add(base as usize) } as *mut u8);
-        }
-        let in_page = base & (self.page_size as u64 - 1);
-        if in_page + len > self.page_size as u64 {
-            return P::null();
-        }
-        let idx = (base / self.page_size as u64) as usize;
-        if idx >= self.pages.len() {
-            return P::null();
-        }
-        let host = self.pages[idx].host;
-        if host.is_null() {
-            P::null()
-        } else {
-            P(unsafe { host.0.add(in_page as usize) })
-        }
-    }
-
-    /// Copy between board memory and buf (a raw pointer so import can take a
-    /// shared slice): out copies memory to buf, else buf into memory.
-    pub fn copy(&self, base: u64, len: u64, buf: *mut u8, out: bool) -> bool {
-        let mut done = 0u64;
-
-        if base > self.size || len > self.size - base {
-            return false;
-        }
-        if !self.bytes.is_empty() {
-            unsafe {
-                let mem = self.bytes.as_ptr().add(base as usize) as *mut u8;
-                if out {
-                    std::ptr::copy_nonoverlapping(mem, buf, len as usize);
-                } else {
-                    std::ptr::copy_nonoverlapping(buf, mem, len as usize);
-                }
-            }
-            return true;
-        }
-        // Check every page first so a failed copy copies nothing.
-        let ps = self.page_size as u64;
-        let mut a = base & !(ps - 1);
-        while a < base + len {
-            if self.pages[(a / ps) as usize].host.is_null() {
-                return false;
-            }
-            a += ps;
-        }
-        while done < len {
-            let at = base + done;
-            let n = (len - done).min(ps - (at & (ps - 1)));
-            let host = self.host(at, n);
-
-            unsafe {
-                if out {
-                    std::ptr::copy_nonoverlapping(host.0, buf.add(done as usize), n as usize);
-                } else {
-                    std::ptr::copy_nonoverlapping(buf.add(done as usize), host.0, n as usize);
-                }
-            }
-            done += n;
-        }
-        true
-    }
-}
-
 impl Plane {
     pub fn offset(&self, x: i32, y: i32, bpp: u32) -> u64 {
         self.base
             .wrapping_add((y as u64).wrapping_mul(self.stride as u64))
             .wrapping_add((x as u64).wrapping_mul(bpp as u64))
-    }
-}
-
-impl BoardMemory {
-    /// A device-backed memory is one host array, so a pixel inside it is
-    /// reached directly.
-    #[inline]
-    pub fn bytes(&self, at: u64, bpp: u32) -> P<u8> {
-        if at <= self.size && bpp as u64 <= self.size - at {
-            P(unsafe { self.bytes.as_ptr().add(at as usize) } as *mut u8)
-        } else {
-            P::null()
-        }
     }
 }

@@ -214,10 +214,12 @@ pub fn gl_load_rgba(opaque: Opaque, target: ColourTarget, x: i32, y: i32, colour
         return false;
     }
     let mem = s.buffer_mem(target);
-    let p = s.buffer_plane(target);
-    let limit = cmin(mem.size, mem.bytes_len as u64);
+    let p = match s.buffer_plane(target) {
+        Some(p) => p,
+        None => return false,
+    };
     // Invalid storage reads as zero through BoardMemory::plane_load(), not success.
-    if p.is_null() || mem.bytes.is_empty() || !p.contains(x, y) {
+    if mem.bytes.is_empty() || !p.contains(x, y) {
         return false;
     }
     let offset = (y as i64 as u64).wrapping_mul(p.stride as u64).wrapping_add((x as i64 as u64).wrapping_mul(4));
@@ -228,7 +230,7 @@ pub fn gl_load_rgba(opaque: Opaque, target: ColourTarget, x: i32, y: i32, colour
         Some(at) => at,
         None => return false,
     };
-    if at > limit || 4 > limit - at {
+    if at > mem.size || 4 > mem.size - at {
         return false;
     }
     let word = mem.plane_load(&p, x, y);
@@ -282,12 +284,10 @@ impl Board {
 /// board memory the real depth buffer occupies is not known.
 pub fn gl_load_depth(opaque: Opaque, x: i32, y: i32) -> u32 {
     let s = from_opaque::<Board>(opaque);
-    let p = s.depth_mem.plane(s.depth_plane);
-
-    if p.is_null() {
-        return 0;
+    match s.depth_mem.plane(s.depth_plane) {
+        Some(p) => s.depth_mem.plane_load(&p, x, y),
+        None => 0,
     }
-    s.depth_mem.plane_load(&p, x, y)
 }
 
 pub fn gl_store_depth(opaque: Opaque, x: i32, y: i32, depth: u32) {
@@ -298,9 +298,7 @@ pub fn gl_store_depth(opaque: Opaque, x: i32, y: i32, depth: u32) {
         return;
     }
     if s.pixel_allowed(x as i64, y as i64) {
-        let p = s.depth_mem.plane(s.depth_plane);
-
-        if !p.is_null() {
+        if let Some(p) = s.depth_mem.plane(s.depth_plane) {
             s.depth_mem.plane_store(&p, x, y, depth & ODSY_DEPTH24_MAX);
         }
     }
@@ -311,21 +309,17 @@ pub fn gl_store_depth(opaque: Opaque, x: i32, y: i32, depth: u32) {
 /// planes is not known.
 pub fn gl_load_stencil(opaque: Opaque, x: i32, y: i32) -> u32 {
     let s = from_opaque::<Board>(opaque);
-    let p = s.stencil_mem.plane(s.stencil_plane);
-
-    if p.is_null() {
-        return 0;
+    match s.stencil_mem.plane(s.stencil_plane) {
+        Some(p) => s.stencil_mem.plane_load(&p, x, y),
+        None => 0,
     }
-    s.stencil_mem.plane_load(&p, x, y)
 }
 
 pub fn gl_store_stencil(opaque: Opaque, x: i32, y: i32, stencil: u32) {
     let s = from_opaque::<Board>(opaque);
 
     if s.pixel_allowed(x as i64, y as i64) {
-        let p = s.stencil_mem.plane(s.stencil_plane);
-
-        if !p.is_null() {
+        if let Some(p) = s.stencil_mem.plane(s.stencil_plane) {
             s.stencil_mem.plane_store(&p, x, y, stencil & ODSY_STENCIL_MAX);
         }
     }
@@ -418,7 +412,7 @@ pub fn texture_read(opaque: Opaque, x: u32, y: u32, rgba: &mut u32) -> bool {
     // y * stride cannot overflow 64 bits.
     let word = y as u64 * texture.stride as u64 + texture.offset as u64 + x as u64;
     let end = word + 1;
-    if end > texture.words as u64 || end > (s.obj_mem.bytes_len / 4) as u64 {
+    if end > texture.words as u64 || end > s.obj_mem.size / 4 {
         return false;
     }
     let at = (word * 4) as usize;
@@ -764,7 +758,7 @@ impl Board {
         if self.obj_width[o] != 32
             || self.obj_rows[o] < height
             || end > self.obj_used as u64
-            || end > (self.obj_mem.bytes_len / 4) as u64
+            || end > self.obj_mem.size / 4
             || !region_written
         {
             return false;
@@ -1233,7 +1227,7 @@ impl Board {
                                 &mut storage_end,
                             )
                             || storage_end > self.obj_used as u64
-                            || storage_end > (self.obj_mem.bytes_len / 4) as u64
+                            || storage_end > self.obj_mem.size / 4
                         {
                             break 'unsupported;
                         }
@@ -1395,7 +1389,7 @@ impl Board {
                         || gl_uadd_ovf(end, interior_x as u64, &mut end)
                         || gl_uadd_ovf(end, level_width as u64 + bordered as u64, &mut end)
                         || end > self.obj_used as u64
-                        || end > (self.obj_mem.bytes_len / 4) as u64)
+                        || end > self.obj_mem.size / 4)
                 };
                 if !backed {
                     if require_backing {

@@ -35,15 +35,14 @@
 //!   fixed-point fast path for textured triangles.
 //! - `memory`, `scanout`, `display`: board memory and planes; the scanned
 //!   frame and retrace; what reaches the window.
-//! - `pixel_dma`, `hooks`, `pi_gfx`: DMA between guest memory and planes,
-//!   the hooks the scanout and DMA call back into the board, and graphics
+//! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
 //!   credits for machines whose processor interface counts them.
 //! - `consts`: register, command and field constants.
 //!
 //! Ported from hw/misc/sgi-odyssey.c and the shared SGI graphics code
 //! (hw/display/sgi/) in jamesbraid/qemu-sgi-origami.
 
-#![allow(clippy::all)]
+//ALLOWREMOVED
 
 use crate::devlog::LogModule;
 
@@ -59,7 +58,6 @@ pub mod fifo;
 pub mod geometry;
 pub mod gl;
 pub mod gl_context;
-pub mod hooks;
 pub mod interface;
 pub mod memory;
 pub mod mmio;
@@ -92,7 +90,6 @@ pub use fifo::*;
 pub use geometry::*;
 pub use gl::*;
 pub use gl_context::*;
-pub use hooks::*;
 pub use interface::*;
 pub use memory::*;
 pub use mmio::*;
@@ -196,9 +193,9 @@ impl Odyssey {
     fn frame(state: &BoardLocks, display: &Display) {
         crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
         let mut s = state.board.lock();
-        s.scanout.poll(monotonic_ns());
+        s.scanout_poll(monotonic_ns());
         let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
-        let span = s.scanout.update();
+        let span = s.scanout_update();
         if w == 0 || h == 0 || s.scanout.frame.len() < w * h {
             crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;

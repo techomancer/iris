@@ -862,8 +862,7 @@ impl Board {
         let seq = self.dma_seq;
         let bus = DmaBus {
             mem: self.guest.clone(),
-            ops: P::from_ref(&HEAD_OPS),
-            opaque: P::new(self).opaque(),
+            trace_sequence: self.trace_sequence.wrapping_sub(1),
         };
         let mut raw = [0u8; ODSY_DMA_TABLE_HEADER as usize];
         let mut hdr = [0u32; ODSY_DMA_HDR_WORDS];
@@ -1056,31 +1055,18 @@ impl DmaBus {
     /// Failure. Guest memory is written through the bus.
     pub fn publish_word(&self, addr: u64, value: u32, size: u32) -> i32 {
         let size64 = size as u64;
-        let mut bus_addr: u64 = addr;
 
         if (addr & (size64 - 1)) != 0 || addr > u64::MAX - size64 {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: invalid publication address {:#x}", addr);
             return SGI_FAIL_BOUNDS as i32;
         }
-        if let Some(ops) = self.ops.as_opt() {
-            if let Some(dma_address) = ops.dma_address {
-                if !dma_address(self.opaque, addr, &mut bus_addr) {
-                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: publication address {:#x} cannot be composed", addr);
-                    return SGI_FAIL_BUS as i32;
-                }
-            }
-        }
-        if (bus_addr & (size64 - 1)) != 0 || bus_addr > u64::MAX - size64 {
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: invalid bus address {:#x}", bus_addr);
-            return SGI_FAIL_BOUNDS as i32;
-        }
         let written = if size == 2 {
-            write_guest(&self.mem, bus_addr, &(value as u16).to_be_bytes())
+            write_guest(&self.mem, addr, &(value as u16).to_be_bytes())
         } else {
-            write_guest(&self.mem, bus_addr, &value.to_be_bytes())
+            write_guest(&self.mem, addr, &value.to_be_bytes())
         };
         if !written {
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: publication at {:#x} is not aligned writable RAM", bus_addr);
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: publication at {:#x} is not aligned writable RAM", addr);
             return SGI_FAIL_BUS as i32;
         }
         0
@@ -1108,8 +1094,7 @@ impl Board {
     pub fn query_finish(&mut self, sequence: u32) {
         let bus = DmaBus {
             mem: self.guest.clone(),
-            ops: P::from_ref(&HEAD_OPS),
-            opaque: P::new(self).opaque(),
+            trace_sequence: self.trace_sequence.wrapping_sub(1),
         };
         let sync_offset: u64 = 2 * (self.query_sync_index & ODSY_DMA_FENCE_SLOT_MASK) as u64;
 
@@ -1338,7 +1323,7 @@ impl Board {
             .and_then(|v| v.checked_add(self.obj_offset[su] as u64))
             .and_then(|v| v.checked_add(ws as u64));
         let Some(source_end) = source_end else { return false };
-        if source_end > self.obj_used as u64 || source_end > (self.obj_mem.bytes_len / 4) as u64 || !self.object_rows(dest, hd) {
+        if source_end > self.obj_used as u64 || source_end > self.obj_mem.size / 4 || !self.object_rows(dest, hd) {
             return false;
         }
         for y in 0..hd {

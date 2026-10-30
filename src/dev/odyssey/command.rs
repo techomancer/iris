@@ -902,19 +902,13 @@ impl Board {
                 // completion signal, so it raises the same fence the DMA engine's
                 // completion does, through the one fence implementation: op0's slot
                 // and interrupt bit and op1's token become the completion cookie,
-                // published to publish() -> Board::fence(). op0's interrupt
+                // raised by Board::fence(). op0's interrupt
                 // bit and op1's token already sit at the fence word's own positions
                 // (ODSY_HOST_WRITE_INTERRUPT is the fence word's bit 15).
                 let word: u32 = ((op1 & 0xffff) << ODSY_DMA_FENCE_TOKEN_SHIFT)
                     | (op0 & (ODSY_DMA_FENCE_INTERRUPT | ODSY_DMA_FENCE_SLOT_MASK));
 
-                HEAD_OPS.publish(
-                    P::new(self).opaque(),
-                    0,
-                    SGI_DONE_WRITTEN,
-                    ODSY_FENCE_VALID | word as u64,
-                    0,
-                );
+                self.fence(ODSY_FENCE_VALID | word as u64);
             }
             ODSY_DMA_DESC_UPLOAD => {
                 self.dma_descriptor(false);
