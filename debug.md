@@ -541,10 +541,11 @@ Per-module logging; all of it needs a developer build to produce output.
 | `log <module> file <path\|off>` | Send a module's log to a file |
 
 Modules: `net hpc3 seeq hal2 mc rex3 mips ioc scsi pdma vino dcb vc2 cmap
-xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock`. Mask categories: `pdma` —
+xmap bt445 scc ps2 rtc eeprom l1i l1d l2c bedrock l1`. Mask categories: `pdma` —
 `hal enet scsi`; `mips` — `insn tlb mem fpu cp0`; `l1i`/`l1d`/`l2c` — `hit
 miss op`; every module also takes `on`/`all`, `off`/`none` or a hex mask.
-`bedrock` covers the Fuel's devices on its Bedrock hub.
+`bedrock` covers the Fuel's devices on its Bedrock hub, and `l1` its system
+controller.
 `IRIS_DEBUG_LOG` or `[debug] debug_log` set the same thing at startup.
 
 ### Performance and locks
