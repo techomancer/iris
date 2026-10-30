@@ -58,6 +58,8 @@ pub mod consts;
 pub mod context;
 pub mod depth_word;
 pub mod display;
+#[cfg(test)]
+mod display_bench;
 pub mod dma;
 pub mod draw;
 pub mod fifo;

@@ -97,16 +97,18 @@ impl Display {
         screen.height = h;
         screen.prebuilt = true;
         screen.status_bar_only = false;
+        let planes = &mut *screen;
         for (i, src) in rows.chunks_exact(width).enumerate() {
             let y = first + i;
             if y >= h {
                 break;
             }
-            for (x, &rgb) in src[..w].iter().enumerate() {
-                let rgba = 0xff00_0000 | (rgb >> 16) & 0xff | rgb & 0xff00 | (rgb & 0xff) << 16;
-                screen.fb_rgb[y * FB_STRIDE + x] = rgba;
-                screen.rgba[y * FB_STRIDE + x] = rgba;
+            // 0x00RRGGBB to opaque 0xAABBGGRR: a byte swap with alpha set.
+            let line = &mut planes.fb_rgb[y * FB_STRIDE..y * FB_STRIDE + w];
+            for (d, &rgb) in line.iter_mut().zip(&src[..w]) {
+                *d = 0xff00_0000 | rgb.swap_bytes() >> 8;
             }
+            planes.rgba[y * FB_STRIDE..y * FB_STRIDE + w].copy_from_slice(line);
         }
         *self.shown.lock() = (width, height);
         screen.frame_seq = screen.frame_seq.wrapping_add(1);
@@ -204,6 +206,38 @@ pub fn display_channel(mode: u32, c: u32) -> u32 {
     }
 }
 
+/// What one main drawable id shows, decided once per update instead of per
+/// pixel: which colour buffer, and how its plane word becomes a colour.
+#[derive(Clone, Copy, Default)]
+struct IdShow {
+    /// The displayed colour buffer, 0 or 1.
+    buf: usize,
+    /// Whether the plane word is RGB through the gamma table.
+    rgb: bool,
+    /// An RGB mode's channel fold: (c & keep) | (c >> down).
+    keep: u32,
+    down: u32,
+    /// An index mode: lut entry = base + (word & mask).
+    base: u32,
+    mask: u32,
+    /// The mode is colour map group 25, reported once when shown.
+    unverified: bool,
+}
+
+/// Everything a row's resolve reads outside the planes, gathered once. The
+/// board lock is held across an update, so none of it can change meanwhile.
+struct ResolveCtx {
+    ids: [IdShow; ODSY_DISPMODE_COUNT as usize],
+    /// Per overlay id: whether it is enabled, and its entry base.
+    overlay: [(bool, u32); ODSY_OVERLAY_IDS as usize],
+    /// Every lookup-RAM entry as 0x00RRGGBB (Board::lut_rgb()).
+    rgb: Box<[u32; ODSY_LUT_SIZE as usize]>,
+    /// Board::gamma() of each 8-bit channel value, placed in its byte of
+    /// the pixel: red, green, blue.
+    gamma: Box<[[u32; 256]; 3]>,
+}
+
+
 impl Board {
     /// Resolve the colour buffers at scanout. Per pixel: the id plane's main
     /// drawable (bits 7:3) selects the buffer shown, by its displayed-buffer bit,
@@ -215,7 +249,11 @@ impl Board {
     /// resolves as an index table and is reported once as unverified. Over all of
     /// that, a pixel whose overlay id's mode is enabled and whose overlay pixel is
     /// not zero shows the overlay colormap entry instead.
-    pub fn resolve_row(&mut self, y: u32, dst: &mut [u32]) {
+    ///
+    /// This is the per-pixel form, which any plane shape can use. resolve_row()
+    /// is the same function for the colour planes the board allocates, and the
+    /// tests hold the two to the same pixels.
+    pub fn resolve_row_generic(&mut self, y: u32, dst: &mut [u32]) {
         let width = self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH);
         // Swaps latch under the board lock (retrace()), so the selection
         // holds for the row.
@@ -254,6 +292,142 @@ impl Board {
             dst[x as usize] = self.lut_rgb(if group != 0 { 256 * group + (word & 0xff) } else { word & ODSY_INDEX_MASK });
         }
         self.cursor_row(y, dst, width);
+    }
+
+    fn resolve_ctx(&mut self) -> ResolveCtx {
+        let displayed = self.front.lock().displayed_buffer;
+        let mut ids = [IdShow::default(); ODSY_DISPMODE_COUNT as usize];
+        let mut overlay = [(false, 0u32); ODSY_OVERLAY_IDS as usize];
+        let mut rgb = Box::new([0u32; ODSY_LUT_SIZE as usize]);
+        let mut gamma = Box::new([[0u32; 256]; 3]);
+
+        for (i, v) in rgb.iter_mut().enumerate() {
+            *v = self.lut_rgb(i as u32);
+        }
+        for c in 0..256u32 {
+            gamma[0][c as usize] = self.gamma(c, ODSY_LUT_RED_SHIFT) << 16;
+            gamma[1][c as usize] = self.gamma(c, ODSY_LUT_GREEN_SHIFT) << 8;
+            gamma[2][c as usize] = self.gamma(c, ODSY_LUT_BLUE_SHIFT);
+        }
+        for (id, show) in ids.iter_mut().enumerate() {
+            let mode = self.dispmode[id];
+            let group = self.display_group(id as u32);
+
+            show.buf = ((displayed >> id) & 1) as usize;
+            if group >= ODSY_GAMMA_GROUP {
+                show.rgb = true;
+                // display_channel() as a mask and a shift; a shift of 8 or
+                // more leaves a byte's high part empty.
+                (show.keep, show.down) = match (mode >> ODSY_DISPMODE_WIDTH_SHIFT) & ODSY_DISPMODE_WIDTH_MASK {
+                    ODSY_DISPMODE_WIDTH_4 => (0xf0, 4),
+                    ODSY_DISPMODE_WIDTH_5 => (0xf8, 5),
+                    _ => (0xff, 8),
+                };
+            } else if group != 0 {
+                show.base = 256 * group;
+                show.mask = 0xff;
+                show.unverified = group == ODSY_CMAP_UNVERIFIED_GROUP;
+            } else {
+                show.mask = ODSY_INDEX_MASK;
+            }
+        }
+        for (id, o) in overlay.iter_mut().enumerate() {
+            let mode = self.overlay_mode[id];
+
+            *o = (
+                mode & ODSY_OVERLAY_MODE_ENABLE != 0,
+                256 * ((mode >> ODSY_OVERLAY_MODE_GROUP_SHIFT) & ODSY_OVERLAY_MODE_GROUP_MASK),
+            );
+        }
+        ResolveCtx { ids, overlay, rgb, gamma }
+    }
+
+    /// The bytes of the colour buffer b's line y, `width` pixels of four
+    /// bytes, and whether they are stored big-endian. None unless the line is
+    /// whole in a four-byte plane.
+    fn colour_line(&self, b: u32, y: u32, width: usize) -> Option<(&[u8], bool)> {
+        let p = self.buffer_plane(b)?;
+        let at = usize::try_from(p.offset(0, y as i32, 4)).ok()?;
+
+        if plane_bpp(p.format) != 4 || !p.contains(width as i32 - 1, y as i32) {
+            return None;
+        }
+        Some((self.buffer_mem(b).bytes.get(at..)?.get(..width * 4)?, !p.is_le()))
+    }
+
+    /// resolve_row_generic() for the board's own colour planes, with the
+    /// per-pixel decisions that depend only on a pixel's drawable id made once
+    /// per update (ResolveCtx) and the planes read as lines of words.
+    fn resolve_row_with(&mut self, ctx: &ResolveCtx, y: u32, dst: &mut [u32]) {
+        let width = self.scanout.mode.width.min(SGI_ODYSSEY_WIDTH);
+        let w = width as usize;
+        let at = y as usize * SGI_ODYSSEY_WIDTH as usize;
+        let lines = (
+            self.colour_line(0, y, w),
+            self.colour_line(1, y, w),
+            self.did.get(at..at + w),
+            self.overlay.get(at..at + w),
+        );
+        let (Some((l0, be0)), Some((l1, be1)), Some(did), Some(ovl)) = lines else {
+            return self.resolve_row_generic(y, dst);
+        };
+        if be0 != be1 {
+            return self.resolve_row_generic(y, dst);
+        }
+        let lines = [l0, l1];
+        let mut saw_unverified = false;
+        let mut x = 0;
+
+        // A window is a run of pixels with one id byte, so the lookups that
+        // depend only on the id are made per run and the run is a plain loop.
+        while x < w {
+            let d = did[x];
+            let end = x + 1 + did[x + 1..].iter().take_while(|&&v| v == d).count();
+            let (enabled, obase) = ctx.overlay[(d as u32 & ODSY_DID_OVERLAY_MASK) as usize];
+            let show = &ctx.ids[(d >> ODSY_DID_MAIN_SHIFT) as usize & (ODSY_DISPMODE_COUNT as usize - 1)];
+            let out = &mut dst[x..end];
+            let src = lines[show.buf][x * 4..end * 4].chunks_exact(4).map(|c| {
+                let raw = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                if be0 { raw.swap_bytes() } else { raw }
+            });
+            let ov = &ovl[x..end];
+
+            if show.rgb {
+                for (out, word) in out.iter_mut().zip(src) {
+                    let r = ((word >> 24) & show.keep) | ((word >> 24) >> show.down);
+                    let g = (((word >> 16) & 0xff) & show.keep) | (((word >> 16) & 0xff) >> show.down);
+                    let b = (((word >> 8) & 0xff) & show.keep) | (((word >> 8) & 0xff) >> show.down);
+
+                    *out = ctx.gamma[0][r as usize & 0xff] | ctx.gamma[1][g as usize & 0xff] | ctx.gamma[2][b as usize & 0xff];
+                }
+            } else {
+                for (out, word) in out.iter_mut().zip(src) {
+                    *out = ctx.rgb[(show.base + (word & show.mask)) as usize & (ODSY_LUT_SIZE as usize - 1)];
+                }
+                // Reported only if a pixel of the run is shown through it.
+                saw_unverified |= show.unverified && (!enabled || ov.contains(&0));
+            }
+            if enabled {
+                for (out, &o) in out.iter_mut().zip(ov) {
+                    if o != 0 {
+                        *out = ctx.rgb[(obase + o as u32) as usize & (ODSY_LUT_SIZE as usize - 1)];
+                    }
+                }
+            }
+            x = end;
+        }
+        if saw_unverified && !self.scanout_group25_reported {
+            self.scanout_group25_reported = true;
+            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: colormap group 25 (0x1900) resolved as an index table; unverified");
+        }
+        self.cursor_row(y, dst, width);
+    }
+
+    /// Resolve the colour buffers at scanout; see resolve_row_generic().
+    pub fn resolve_row(&mut self, y: u32, dst: &mut [u32]) {
+        let ctx = self.resolve_ctx();
+
+        self.resolve_row_with(&ctx, y, dst);
     }
 
     /// A vertical retrace, which Board::scanout_poll() runs at the mode's rate. The
@@ -322,6 +496,7 @@ impl Board {
         let mut span: Option<(usize, usize)> = None;
         let h = self.scanout.mode.height as usize;
         let w = self.scanout.mode.width as usize;
+        let mut ctx: Option<ResolveCtx> = None;
         let mut row = vec![0u32; w];
         let mut y = 0usize;
         while y < h {
@@ -333,8 +508,10 @@ impl Board {
             while end < h && self.scanout.dirty[end] {
                 end += 1;
             }
+            // Gathered at the first dirty line: an idle frame costs nothing.
+            let ctx = ctx.get_or_insert_with(|| self.resolve_ctx());
             for line in y..end {
-                self.resolve_row(line as u32, &mut row);
+                self.resolve_row_with(ctx, line as u32, &mut row);
                 self.scanout.frame[line * w..(line + 1) * w].copy_from_slice(&row);
             }
             self.scanout.dirty[y..end].fill(false);
