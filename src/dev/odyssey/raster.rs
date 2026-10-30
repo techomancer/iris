@@ -963,7 +963,8 @@ impl GlDrawState {
     /// One of glStencilOp's operations on the stencil value at (x, y), the
     /// result written under the stencil write mask (4.1.5, 4.2.2). GL_INCR
     /// and GL_DECR clamp to the buffer's range.
-    pub fn stencil_op(&self, px: &dyn Planes, x: i32, y: i32, op: u32, max: u32, ref_: u32) {
+    #[inline(always)]
+    pub fn stencil_op<P: Planes + ?Sized>(&self, px: &P, x: i32, y: i32, op: u32, max: u32, ref_: u32) {
         let old = px.load_stencil(x, y) & max;
         let mask = self.stencil_write_mask & max;
 

@@ -259,9 +259,10 @@ pub struct GlPlanes<'a> {
 }
 
 /// One row of GlPlanes as a row loop reaches it (Planes::row()): the depth
-/// plane's and both colour buffers' words for the row's pixels, and of
-/// GlPixelState::pixel_allowed() only the id test, which is per pixel; the
-/// plane bound and clip rectangles were tested for the whole row. Its
+/// plane's and both colour buffers' words and the stencil plane's bytes for
+/// the row's pixels, and of GlPixelState::pixel_allowed() only the id test,
+/// which is per pixel; the plane bound and clip rectangles were tested for
+/// the whole row. Its
 /// methods take plane coordinates on that row and answer as GlPlanes would.
 pub struct GlPlaneRow<'a> {
     x0: i32,
@@ -269,6 +270,7 @@ pub struct GlPlaneRow<'a> {
     depth_le: bool,
     colour: [&'a [std::cell::Cell<u8>]; ODSY_BUFFERS as usize],
     colour_le: [bool; ODSY_BUFFERS as usize],
+    stencil: &'a [std::cell::Cell<u8>],
     /// Stores reach the planes: not a draw to the id-plane destination.
     store: bool,
     /// The id bytes of the row's pixels, or empty with the id test off.
@@ -323,6 +325,34 @@ impl Planes for GlPlaneRow<'_> {
             word_store(self.depth, i, self.depth_le, depth & ODSY_DEPTH24_MAX);
         }
     }
+
+    #[inline(always)]
+    fn load_stencil(&self, x: i32, _y: i32) -> u32 {
+        self.stencil[(x - self.x0) as usize].get() as u32
+    }
+
+    /// As GlPlanes::store_stencil(): the pixel test alone, to_aux or not.
+    #[inline(always)]
+    fn store_stencil(&self, x: i32, _y: i32, stencil: u32) {
+        let i = (x - self.x0) as usize;
+
+        if self.allowed(i) {
+            self.stencil[i].set((stencil & ODSY_STENCIL_MAX) as u8);
+        }
+    }
+}
+
+impl GlPlanes<'_> {
+    /// The stencil plane's bytes for pixels x0 to x0 + n - 1 of row y, as
+    /// Rows::plane_load() reaches each: None unless all are in the plane.
+    fn stencil_bytes(&self, y: i32, x0: i32, n: usize) -> Option<&[std::cell::Cell<u8>]> {
+        let p = &self.state.stencil;
+
+        if plane_bpp(p.format) != 1 || !p.contains(x0, y) || !p.contains(x0 + n as i32 - 1, y) {
+            return None;
+        }
+        self.stencil.get(y as usize, x0 as usize, n)
+    }
 }
 
 impl Planes for GlPlanes<'_> {
@@ -354,6 +384,7 @@ impl Planes for GlPlanes<'_> {
                 self.colour[1].plane_words(&s.colour[1], y, x0, n)?,
             ],
             colour_le: [s.colour[0].is_le(), s.colour[1].is_le()],
+            stencil: self.stencil_bytes(y, x0, n)?,
             store: !s.to_aux,
             did,
             id_value: s.id_compare as u8,

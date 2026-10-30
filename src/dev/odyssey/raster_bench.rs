@@ -62,6 +62,7 @@ pub struct BenchTexture {
     pub min: u32,
     pub mag: u32,
     pub format: u32,
+    pub wrap_s: u32,
     pub wrap_t: u32,
 }
 
@@ -87,7 +88,7 @@ impl BenchTexture {
             s /= 2;
             level += 1;
         }
-        BenchTexture { levels, min, mag, format, wrap_t: SGI_GL_REPEAT }
+        BenchTexture { levels, min, mag, format, wrap_s: SGI_GL_REPEAT, wrap_t: SGI_GL_REPEAT }
     }
 
     pub fn image(&self) -> GlTexImage<'_> {
@@ -97,7 +98,7 @@ impl BenchTexture {
             base_format: self.format,
             min_filter: self.min,
             mag_filter: self.mag,
-            wrap_s: SGI_GL_REPEAT,
+            wrap_s: self.wrap_s,
             wrap_t: self.wrap_t,
             read_texel: true,
             pyramid: Some(GlTexPyramid {
@@ -140,9 +141,24 @@ pub enum Scene {
     Lines,
     /// Colour and depth clears of the whole screen.
     Clear,
+    /// Textured, bilinear RGB, depth tested, inside a stencil mask: the
+    /// stencil EQUAL test, every operation KEEP (Smoke & Mirrors' scene).
+    TexStencil,
+    /// Untextured, writing only the stencil: ALWAYS, incremented where the
+    /// depth test passes, colour and depth masked (a mirror's mask).
+    StencilMark,
+    /// Trilinear RGB, flat, depth LEQUAL, s clamped to the edge, in
+    /// perspective (perfly's ground and buildings).
+    TexClampTrilinear,
+    /// Trilinear RGBA blended over what is there, depth ALWAYS and not
+    /// written (perfly's sky and overlays).
+    TexBlendOver,
+    /// TexStencil's state under a client clip plane that cuts the screen
+    /// (Smoke & Mirrors' reflected scene).
+    TexStencilClip,
 }
 
-pub const ALL_SCENES: [Scene; 12] = [
+pub const ALL_SCENES: [Scene; 17] = [
     Scene::FlatFill,
     Scene::SmoothDepth,
     Scene::SmoothBlend,
@@ -155,6 +171,11 @@ pub const ALL_SCENES: [Scene; 12] = [
     Scene::BigTexTrilinear,
     Scene::Lines,
     Scene::Clear,
+    Scene::TexStencil,
+    Scene::StencilMark,
+    Scene::TexClampTrilinear,
+    Scene::TexBlendOver,
+    Scene::TexStencilClip,
 ];
 
 /// One scene, built: the board, the draw state, the vertex lists of its
@@ -310,10 +331,19 @@ impl Bench {
                 // Minified by about 1.5: a trilinear draw mixes two levels.
                 tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
             }
-            Scene::TexPerspective => {
+            Scene::TexPerspective | Scene::TexClampTrilinear => {
                 st.depth_test = 1;
                 st.texture_2d = 1;
-                b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
+                if scene == Scene::TexPerspective {
+                    b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
+                } else {
+                    let mut tex = BenchTexture::new(256, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGB);
+
+                    tex.wrap_s = SGI_GL_CLAMP_TO_EDGE;
+                    b.tex = Some(tex);
+                    st.depth_func = SGI_GL_LEQUAL;
+                    st.shade_model = SGI_GL_FLAT;
+                }
                 for _ in 0..count {
                     let (mut v, a) = triangle(&mut rng, 40.0, 1.5 / 256.0);
 
@@ -332,6 +362,44 @@ impl Bench {
                     b.prims.push(v);
                     b.pixels += a;
                 }
+            }
+            Scene::TexStencil | Scene::TexStencilClip => {
+                if scene == Scene::TexStencilClip {
+                    // x + y / 4 >= -0.25: about three fifths of the screen.
+                    st.clip_planes = 1;
+                    st.clip_plane[0] = [1.0, 0.25, 0.0, 0.25];
+                }
+                st.depth_test = 1;
+                st.texture_2d = 1;
+                st.stencil_test = 1;
+                st.stencil_func = SGI_GL_EQUAL;
+                st.stencil_value_mask = u32::MAX;
+                st.stencil_write_mask = u32::MAX;
+                st.stencil_op = [SGI_GL_KEEP; 3];
+                b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR, SGI_GL_LINEAR, SGI_GL_RGB));
+                tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
+            }
+            Scene::StencilMark => {
+                st.depth_test = 1;
+                st.depth_mask = 0;
+                st.colour_mask = 0;
+                st.stencil_test = 1;
+                st.stencil_func = SGI_GL_ALWAYS;
+                st.stencil_value_mask = u32::MAX;
+                st.stencil_write_mask = u32::MAX;
+                st.stencil_op = [SGI_GL_KEEP, SGI_GL_KEEP, SGI_GL_INCR];
+                tris(&mut b.prims, &mut b.pixels, 40.0, 0.0);
+            }
+            Scene::TexBlendOver => {
+                st.depth_test = 1;
+                st.depth_func = SGI_GL_ALWAYS;
+                st.depth_mask = 0;
+                st.texture_2d = 1;
+                st.blend = 1;
+                st.blend_src = SGI_GL_SRC_ALPHA;
+                st.blend_dst = SGI_GL_ONE_MINUS_SRC_ALPHA;
+                b.tex = Some(BenchTexture::new(256, SGI_GL_LINEAR_MIPMAP_LINEAR, SGI_GL_LINEAR, SGI_GL_RGBA));
+                tris(&mut b.prims, &mut b.pixels, 40.0, 1.5 / 256.0);
             }
             Scene::BigQuads | Scene::BigTexTrilinear => {
                 st.depth_test = 1;
@@ -435,20 +503,24 @@ impl Bench {
         }
     }
 
-    /// The colour and depth planes in the square from (0, 0) to side - 1.
-    pub fn snapshot(&self, side: i32) -> (Vec<u32>, Vec<u32>) {
+    /// The colour, depth and stencil planes in the square from (0, 0) to
+    /// side - 1.
+    pub fn snapshot(&self, side: i32) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         let b = &self.board;
         let depth = b.depth_mem.plane(b.depth_plane).expect("the depth plane");
+        let stencil = b.stencil_mem.plane(b.stencil_plane).expect("the stencil plane");
         let mut c = Vec::new();
         let mut z = Vec::new();
+        let mut s = Vec::new();
 
         for y in 0..side {
             for x in 0..side {
                 c.push(b.buffer_load(0, x as i64, y as i64));
                 z.push(b.depth_mem.plane_load(&depth, x, y));
+                s.push(b.stencil_mem.plane_load(&stencil, x, y));
             }
         }
-        (c, z)
+        (c, z, s)
     }
 }
 
