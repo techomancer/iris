@@ -141,7 +141,11 @@ impl Board {
             // A run that takes as long as a long draw would.
             let sleep_ms = std::mem::take(&mut self.test_slice_sleep_ms);
             if sleep_ms != 0 {
-                std::thread::sleep(std::time::Duration::from_millis(sleep_ms as u64));
+                // Until the time is up or a test releases the hold.
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(sleep_ms as u64);
+                while std::time::Instant::now() < end && !self.fifo.test_release.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
         }
 

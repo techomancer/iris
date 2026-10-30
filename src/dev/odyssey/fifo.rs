@@ -174,6 +174,12 @@ pub(super) struct CommandFifo {
     /// counted after its last look at the hurry request.
     #[cfg(test)]
     pub test_parked: AtomicU32,
+    /// Tests: pushes the full ring has refused.
+    #[cfg(test)]
+    pub test_refused: AtomicU32,
+    /// Tests: ends a long slice's hold (`Board::test_slice_sleep_ms`) early.
+    #[cfg(test)]
+    pub test_release: AtomicBool,
     /// Tests: the next push calls this, once, as soon as its
     /// store is in the ring: a consumer that takes the store at that
     /// moment, before the push has returned.
@@ -204,6 +210,10 @@ impl Default for CommandFifo {
             test_gap_ms: AtomicU32::new(0),
             #[cfg(test)]
             test_parked: AtomicU32::new(0),
+            #[cfg(test)]
+            test_refused: AtomicU32::new(0),
+            #[cfg(test)]
+            test_release: AtomicBool::new(false),
             #[cfg(test)]
             test_after_ring_push: Mutex::new(None),
         }
@@ -334,6 +344,8 @@ impl CommandFifo {
     pub fn push(&self, front: &Mutex<HostInterface>, addr: u64, value: u64, size: u32) -> bool {
         let words = store_words(size);
         if !self.has_room() {
+            #[cfg(test)]
+            self.test_refused.fetch_add(1, SeqCst);
             return false;
         }
         let q = QueuedStore { value, addr: addr as u32, size: size as u8 };

@@ -951,13 +951,14 @@ fn a_refused_command_push_retries_behind_the_board_thread() {
     let (h, _rec) = threaded_board();
     let words = preamble_twice();
 
-    // The ring must fill and the retry be seen waiting while this one slice
-    // holds the board, however long the test's threads wait for a core.
-    start_long_slice(&h, &words, 4000);
+    // The slice holds the board's thread until the test releases it, so the
+    // ring stays full however long the host takes to get here.
+    start_long_slice(&h, &words, 600_000);
     while h.fifo.stores() < RING_STORES {
         assert!(h.bus_write(consts::cmd::FIFO, 0, 4));
     }
     let stores = h.fifo.stores();
+    let refused = h.fifo.test_refused.load(SeqCst);
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let store = {
         let (h, done) = (h.clone(), done.clone());
@@ -966,9 +967,15 @@ fn a_refused_command_push_retries_behind_the_board_thread() {
             done.store(true, SeqCst);
         })
     };
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    // The store is refused and retries: wait until it has been.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while h.fifo.test_refused.load(SeqCst) == refused {
+        assert!(std::time::Instant::now() < deadline, "the store was never refused");
+        std::thread::yield_now();
+    }
     assert!(!done.load(SeqCst), "the store was dropped or ran around the board's thread");
     assert_eq!(h.fifo.stores(), stores);
+    h.fifo.test_release.store(true, SeqCst);
     store.join().unwrap();
     assert!(h.fifo.level() <= cfifo::WORDS);
     h.fifo.test_words.store(0, SeqCst);
