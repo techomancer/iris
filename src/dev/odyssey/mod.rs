@@ -32,7 +32,8 @@
 //!   polygons, lines and points, pixel rectangles, bitmaps, clears and
 //!   raster ops; `raster_texture`: texture sampling; `raster_bands`:
 //!   drawing in bands of rows on host threads; `raster_fixed_texture`: the
-//!   fixed-point fast path for textured triangles.
+//!   fixed-point fast path for textured triangles; `raster_bench`: a
+//!   fill-rate benchmark (tests only).
 //! - `memory`, `scanout`, `display`: board memory and planes; the scanned
 //!   frame and retrace; what reaches the window.
 //! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
@@ -70,6 +71,8 @@ pub mod pi_gfx;
 pub mod pixel_dma;
 pub mod raster;
 pub mod raster_bands;
+#[cfg(test)]
+pub mod raster_bench;
 pub mod raster_fixed_texture;
 pub mod raster_line;
 pub mod raster_pixels;
