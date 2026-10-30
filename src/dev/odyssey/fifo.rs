@@ -52,6 +52,8 @@ pub struct CommandFifo {
     wake: Mutex<()>,
     kick: Condvar,
     pub thread: Mutex<Option<JoinHandle<()>>>,
+    /// Edge filter for the traced level; zero-sized without the feature.
+    pub pf_level: crate::PfValue,
     /// Tests: queue every command store even with no thread running, and
     /// run this many per slice.
     #[cfg(test)]
@@ -73,6 +75,7 @@ impl Default for CommandFifo {
             wake: Mutex::new(()),
             kick: Condvar::new(),
             thread: Mutex::new(None),
+            pf_level: crate::PfValue::new(),
             #[cfg(test)]
             test_words: AtomicU32::new(0),
         }

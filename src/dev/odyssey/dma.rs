@@ -62,6 +62,7 @@ impl Board {
     /// the transfer is finished. Nothing is delivered before the driver routes it.
     pub fn dma_done(&mut self) {
         let mut f = self.front.lock();
+        crate::pf_instant!(crate::perfetto::events::ODSY_DMA_DONE);
         if f.routed() {
             f.deliver_routed(ODSY_ROUTE_VECTOR_DMA_SHIFT, "DMA-done", true);
         }
@@ -856,6 +857,7 @@ impl Board {
     /// adapter. The 0xe03 opcode is reported and not performed.
     pub fn dma_descriptor(&mut self, readback: bool) {
         let table = dma_table_address(self.cmd_operand[0], self.cmd_operand[1]);
+        crate::pf_scope!(crate::perfetto::events::ODSY_DMA, table);
         self.dma_seq += 1;
         let seq = self.dma_seq;
         let bus = DmaBus {

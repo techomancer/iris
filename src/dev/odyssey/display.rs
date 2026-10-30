@@ -268,6 +268,7 @@ pub fn retrace(opaque: Opaque) {
         crate::dlog!(LogModule::Odyssey, "sgi_odyssey_swap_latch: arm {:#x} displayed {:#x}", flips, f.displayed_buffer);
         repaint = true;
     }
+    crate::pf_instant!(crate::perfetto::events::ODSY_RETRACE, f.displayed_buffer);
     if f.routed() {
         f.deliver_routed(ODSY_ROUTE_VECTOR_RETRACE_SHIFT, "retrace", true);
     }

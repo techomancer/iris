@@ -204,6 +204,36 @@ pub static MGRAS_IRQ_LINE: EventDef = EventDef::new("irq line", cat::GFX).on_tra
 pub static MGRAS_HEART_PACKET: EventDef = EventDef::new("heart packet", cat::GFX).on_track("IMPACT irq").in_group(GFX_GROUP).with_arg("vector<<1|set");
 pub static MGRAS_HQ4_ACK: EventDef = EventDef::new("hq4 ack", cat::GFX).on_track("IMPACT irq").in_group(GFX_GROUP).with_arg("off<<32|val");
 
+// ── VPro (Odyssey) ───────────────────────────────────────────────────────────
+
+/// The command FIFO level STATUS0 is built from: stores pushed and not yet
+/// run. Sampled where the board looks (slice start and end, STATUS0 reads,
+/// the low-water edge) rather than at every store, which a textport sends
+/// by the hundred thousand.
+pub static ODSY_CFIFO_LEVEL: EventDef = EventDef::new("VPro cfifo level", cat::GFX).in_group(GFX_GROUP);
+/// The FIFO fell below the low-water mark as a store retired (arg: level).
+pub static ODSY_CFIFO_LOW_WATER: EventDef = EventDef::new("cfifo low water", cat::GFX).on_track("VPro irq").in_group(GFX_GROUP).with_arg("level");
+/// One slice of the board thread holding the board lock (arg: stores
+/// waiting when it began), and an access draining the queue on its own
+/// thread (arg: stores waiting).
+pub static ODSY_SLICE: EventDef = EventDef::new("slice", cat::GFX).with_arg("waiting");
+pub static ODSY_DRAIN: EventDef = EventDef::new("drain", cat::GFX).with_arg("waiting");
+/// A page-table DMA descriptor run (arg: table address).
+pub static ODSY_DMA: EventDef = EventDef::new("dma descriptor", cat::GFX | cat::DMA).with_arg("table");
+/// The DMA-done interrupt raised after a transfer that asked for it.
+pub static ODSY_DMA_DONE: EventDef = EventDef::new("dma done", cat::GFX | cat::DMA).on_track("VPro irq").in_group(GFX_GROUP);
+/// An interrupt packet sent to HEART (arg: source shift << 9 | vector << 1
+/// | set). Sources: flag level, softsync, retrace and DMA-done.
+pub static ODSY_IRQ: EventDef = EventDef::new("interrupt packet", cat::GFX | cat::IRQ).on_track("VPro irq").in_group(GFX_GROUP).with_arg("shift<<9|vector<<1|set");
+/// The driver armed window flips for the next retrace (arg: toggle mask
+/// written).
+pub static ODSY_SWAP_ARM: EventDef = EventDef::new("swap arm", cat::GFX).on_track("VPro display").in_group(GFX_GROUP).with_arg("mask");
+/// A retrace: pending flips latched (arg: displayed-buffer bits after).
+pub static ODSY_RETRACE: EventDef = EventDef::new("retrace", cat::GFX).on_track("VPro display").in_group(GFX_GROUP).with_arg("displayed");
+/// The refresh thread resolving dirty lines, and handing the frame on.
+pub static ODSY_CAPTURE: EventDef = EventDef::new("frame capture", cat::GFX).on_track("VPro capture").in_group(GFX_GROUP);
+pub static ODSY_PRESENT: EventDef = EventDef::new("present", cat::GFX).on_track("VPro present").in_group(GFX_GROUP);
+
 // ── jitv2 ────────────────────────────────────────────────────────────────────
 
 /// A dispatch queued a page compile (arg: guest PC).

@@ -116,7 +116,11 @@ impl BoardLocks {
             self.fifo.slice.store(true, SeqCst);
             {
                 let mut s = self.board.lock();
+                crate::pf_value!(self.fifo.pf_level, crate::perfetto::events::ODSY_CFIFO_LEVEL, self.fifo.level());
+                crate::pf_begin!(crate::perfetto::events::ODSY_SLICE, self.fifo.level());
                 s.work_step(&mut Budget::slice(words));
+                crate::pf_end!(crate::perfetto::events::ODSY_SLICE);
+                crate::pf_value!(self.fifo.pf_level, crate::perfetto::events::ODSY_CFIFO_LEVEL, self.fifo.level());
                 // A processor access waiting for the board gets it next.
                 MutexGuard::unlock_fair(s);
             }
@@ -151,6 +155,7 @@ impl Board {
             if after + 1 >= ODSY_CFIFO_LOW_WATER && fifo.level() < ODSY_CFIFO_LOW_WATER {
                 let mut f = self.front.lock();
                 f.intr_flags |= ODSY_INTR_FIFO_LOW_WATER;
+                crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, fifo.level());
                 f.update_irq();
             }
             if b.spent() {
@@ -172,6 +177,7 @@ impl Board {
             return;
         }
         let start = std::time::Instant::now();
+        crate::pf_scope!(crate::perfetto::events::ODSY_DRAIN, waiting);
         self.work_step(&mut Budget::words(waiting));
         crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_work: drained offset {:#x} in {:?}", addr, start.elapsed());
     }

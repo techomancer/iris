@@ -150,6 +150,7 @@ impl HostInterface {
         if !odyssey_xio_compose(widget, addr, &mut where_) {
             return;
         }
+        crate::pf_instant!(crate::perfetto::events::ODSY_IRQ, (shift as u64) << 9 | (vector as u64) << 1 | set as u64);
         self.send_packet(where_, vector, set);
     }
 
@@ -235,6 +236,7 @@ impl HostInterface {
             ODSY_STATUS0 => {
                 // The waiting stores are its level (HostInterface::fifo_level()).
                 let level = self.fifo_level();
+                crate::pf_value!(self.fifo.pf_level, crate::perfetto::events::ODSY_CFIFO_LEVEL, level);
                 value = (ODSY_STATUS0_FIFO_ENABLED
                     | if level != 0 { 0 } else { ODSY_STATUS0_FIFO_EMPTY }
                     | if level < ODSY_CFIFO_LOW_WATER { ODSY_STATUS0_FIFO_LOW_WATER } else { 0 }) as u64;
@@ -297,6 +299,7 @@ impl HostInterface {
                 // when a flip has not shown after two retraces. Whether the
                 // board ORs or replaces is unknown; ORing loses no flip.
                 self.swap_arm |= value as u32;
+                crate::pf_instant!(crate::perfetto::events::ODSY_SWAP_ARM, value);
             }
             ODSY_SWAP_PENDING => self.swap_pending = value as u32,
             ODSY_SWAP_CONTROL => {

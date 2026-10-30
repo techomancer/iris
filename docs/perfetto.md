@@ -85,6 +85,10 @@ host thread's name.
 | Graphics | `IMPACT swap wait` | SCHEDULE_SWAP held until the raster engines have drawn the frame before it (arg: raster entries queued), so a flip never shows a half-drawn frame. |
 | Graphics | `IMPACT status`, `IMPACT flags`, `IMPACT vc3` | Every STATUS read with its value (bit 2 is vertical blank); flags raised (arg: raster entries queued << 32 \| bits) and cleared by the host; VC3 register and SRAM writes (the window-ID tables) and current-line reads. |
 | Graphics | `IMPACT irq` | The board's three interrupt lines (arg: line << 1 \| level: 0 FIFO, 1 general, 2 retrace). On the Octane, the interrupt packets sent to HEART (arg: vector << 1 \| set) and the kernel's acknowledgements (arg: offset << 32 \| bits). |
+| Graphics | `VPro cfifo level` | The command-FIFO level STATUS0 is built from (stores queued, not yet run), sampled at slice start and end and at STATUS0 reads. |
+| Graphics | `VPro irq` | `cfifo low water` (the level fell below the mark as a store retired), `dma done`, and an `interrupt packet` per packet sent to HEART (arg: routed-source shift << 9 \| vector << 1 \| set). |
+| Graphics | `VPro display`, `VPro capture`, `VPro present` | `swap arm` (the driver's flip request, arg: mask), `retrace` (flips latched, arg: displayed-buffer bits); the refresh thread resolving the frame and handing it to the window. |
+| `odyssey-work` | thread | `slice` per run of queued stores under the board lock (arg: stores waiting), `dma descriptor` per page-table transfer (arg: table address). A processor access that drains the queue shows `drain` on its own thread. |
 | jitv2 | `jitv2 compile queue`, `jitv2-compile-*` | `compile queue full` from the first dropped request to the next that fits; a `compile` slice per page compile (on the CPU thread in inline-compile mode). |
 
 ## Adding instrumentation

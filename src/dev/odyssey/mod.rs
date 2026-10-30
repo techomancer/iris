@@ -194,23 +194,29 @@ impl Odyssey {
     /// resolved and, if any changed (or a refresh is due), presented. The
     /// retrace fires either way.
     fn frame(state: &BoardLocks, display: &Display) {
+        crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
         let mut s = state.board.lock();
         s.scanout.poll(monotonic_ns());
         let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
         let span = s.scanout.update();
         if w == 0 || h == 0 || s.scanout.frame.len() < w * h {
+            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;
         }
         // A new size has nothing valid on the screen yet: take every line.
         let span = if display.shown() != (w, h) { Some((0, h)) } else { span };
         if !display.due(span.is_some()) {
+            crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;
         }
         // Only the changed lines leave the board lock.
         let (first, end) = span.unwrap_or((0, 0));
         let rows = s.scanout.frame[first * w..end * w].to_vec();
         drop(s);
+        crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
+        crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
         display.present(&rows, w, h, first);
+        crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
     }
 }
 
