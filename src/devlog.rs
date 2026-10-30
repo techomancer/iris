@@ -70,6 +70,7 @@ pub enum LogModule {
     /// The NVM Express controller: register writes, controller state
     /// changes, and the commands it runs (categories `NVME_LOG_*`).
     Nvme = 34,
+    L1 = 35,
 }
 
 // Mask bits shared by L1i / L1d / L2c
@@ -84,7 +85,7 @@ pub const NVME_LOG_REGS:  u32 = 0x4;  // every register read and write below the
 pub const NVME_LOG_IO:    u32 = 0x8;  // I/O doorbells, commands and completions
 
 impl LogModule {
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 36;
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -123,6 +124,7 @@ impl LogModule {
             "bridge" => Some(Self::Bridge),
             "heart"  => Some(Self::Heart),
             "nvme"   => Some(Self::Nvme),
+            "l1" => Some(Self::L1),
             _        => None,
         }
     }
@@ -164,6 +166,7 @@ impl LogModule {
             Self::Bridge => "bridge",
             Self::Heart  => "heart",
             Self::Nvme   => "nvme",
+            Self::L1 => "l1",
         }
     }
 
@@ -176,6 +179,7 @@ impl LogModule {
             Self::L1i, Self::L1d, Self::L2c, Self::Ultra, Self::Scsi1,
             Self::Nveeprom, Self::Gr2, Self::Rad1, Self::Odyssey, Self::Bedrock,
             Self::Hub, Self::Pci, Self::Bridge, Self::Heart, Self::Nvme,
+            Self::L1,
         ]
     }
 
@@ -340,6 +344,7 @@ impl DevLog {
                 ModuleLog::new(), // Bridge
                 ModuleLog::new(), // Heart
                 ModuleLog::new(), // Nvme
+                ModuleLog::new(), // L1
             ],
         }
     }
