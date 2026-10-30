@@ -571,6 +571,18 @@ pub enum GraphicsBoard {
     /// Maximum IMPACT (2 GE11, 2 RE4).
     #[clap(name = "maximpact", alias = "impact:max", alias = "max_impact")]
     MaxImpact,
+    /// VPro V6: BUZZ A, 32 MB. Octane only (`src/dev/odyssey`).
+    #[clap(name = "v6", alias = "vpro:v6", alias = "vpro_v6")]
+    V6,
+    /// VPro V8: BUZZ A, 128 MB. Octane only.
+    #[clap(name = "v8", alias = "vpro:v8", alias = "vpro_v8")]
+    V8,
+    /// VPro V10: BUZZ B, 32 MB. Octane only; needs Crossbow 1.4.
+    #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
+    V10,
+    /// VPro V12: BUZZ B, 128 MB. Octane only; needs Crossbow 1.4.
+    #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
+    V12,
     /// No graphics board: the machine runs on its serial console. Octane
     /// only.
     #[clap(name = "none")]
@@ -595,6 +607,10 @@ impl GraphicsBoard {
             Self::SolidImpact => "IMPACT Solid",
             Self::HighImpact => "IMPACT High",
             Self::MaxImpact => "IMPACT Maximum",
+            Self::V6 => "VPro V6",
+            Self::V8 => "VPro V8",
+            Self::V10 => "VPro V10",
+            Self::V12 => "VPro V12",
             Self::None => "None",
         }
     }
@@ -607,6 +623,10 @@ impl GraphicsBoard {
             Self::SolidImpact => "solidimpact",
             Self::HighImpact => "highimpact",
             Self::MaxImpact => "maximpact",
+            Self::V6 => "v6",
+            Self::V8 => "v8",
+            Self::V10 => "v10",
+            Self::V12 => "v12",
             Self::None => "none",
         }
     }
@@ -615,14 +635,19 @@ impl GraphicsBoard {
         matches!(self, Self::SolidImpact | Self::HighImpact | Self::MaxImpact)
     }
 
+    /// The VPro boards (`src/dev/odyssey`).
+    pub fn is_vpro(self) -> bool {
+        matches!(self, Self::V6 | Self::V8 | Self::V10 | Self::V12)
+    }
+
     /// Whether `validate()` accepts this board on `profile`. The Octane
     /// models only IMPACT (High as the SI with texture option, Maximum as
     /// the MXI) or no board.
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
-            MachineProfile::OctaneIp30 => self.is_impact() || self == Self::None,
-            MachineProfile::Indigo2Ip22 => self != Self::None,
-            _ => !matches!(self, Self::Extreme | Self::None),
+            MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
+            MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
+            _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
         }
     }
 
@@ -647,9 +672,13 @@ impl std::str::FromStr for GraphicsBoard {
             "solidimpact" | "impact:solid" | "solid_impact" | "solid-impact" | "solid" => Ok(Self::SolidImpact),
             "highimpact" | "impact:high" | "high_impact" | "high-impact" | "high" => Ok(Self::HighImpact),
             "maximpact" | "impact:max" | "max_impact" | "max-impact" | "maximumimpact" | "maximum_impact" | "maximum-impact" | "max" => Ok(Self::MaxImpact),
+            "v6" | "vpro:v6" | "vpro_v6" | "vpro-v6" => Ok(Self::V6),
+            "v8" | "vpro:v8" | "vpro_v8" | "vpro-v8" => Ok(Self::V8),
+            "v10" | "vpro:v10" | "vpro_v10" | "vpro-v10" => Ok(Self::V10),
+            "v12" | "vpro:v12" | "vpro_v12" | "vpro-v12" => Ok(Self::V12),
             "none" => Ok(Self::None),
             _ => Err(format!(
-                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, none)"
+                "invalid graphics board \"{s}\" (valid: newport, xz, extreme, solidimpact, highimpact, maximpact, impact:solid, impact:high, impact:max, v6, v8, v10, v12, vpro:v6, vpro:v8, vpro:v10, vpro:v12, none)"
             )),
         }
     }
@@ -1917,7 +1946,7 @@ impl MachineConfig {
             }
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
-                    format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, none)")
+                    format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
                 } else {
                     format!("graphics.board \"{name}\" is only valid on the Octane")
                 });
@@ -2571,7 +2600,9 @@ mod export_tests {
         assert_eq!(cfg.graphics_board(), GraphicsBoard::SolidImpact);
         cfg.validate().expect("default Octane");
         for (t, b) in [("none", GraphicsBoard::None), ("impact:solid", GraphicsBoard::SolidImpact),
-                       ("maximpact", GraphicsBoard::MaxImpact), ("highimpact", GraphicsBoard::HighImpact)] {
+                       ("maximpact", GraphicsBoard::MaxImpact), ("highimpact", GraphicsBoard::HighImpact),
+                       ("v6", GraphicsBoard::V6), ("vpro:v8", GraphicsBoard::V8), ("v10", GraphicsBoard::V10),
+                       ("v12", GraphicsBoard::V12), ("vpro:v12", GraphicsBoard::V12)] {
             let cfg = octane(&format!("[graphics]\nboard = \"{t}\""));
             assert_eq!(cfg.graphics_board(), b, "{t}");
             cfg.validate().expect(t);
@@ -2585,6 +2616,8 @@ mod export_tests {
         let cfg: MachineConfig = toml::from_str("").expect("parse");
         assert_eq!(cfg.graphics_board(), GraphicsBoard::Newport);
         assert!(!GraphicsBoard::None.supports(MachineProfile::IndyIp24));
+        assert!(!GraphicsBoard::V12.supports(MachineProfile::IndyIp24));
+        assert!(!GraphicsBoard::V12.supports(MachineProfile::Indigo2Ip22));
     }
 
     #[test]

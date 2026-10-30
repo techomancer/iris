@@ -597,7 +597,7 @@ cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 # cpus  = 2                 # Octane only: a second processor (docs/Octane/multiprocessor.md)
 
 [graphics]
-board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact) or "none"
+board      = "newport"      # "newport", "xz", "extreme", "solidimpact" ("impact:solid"), "highimpact" ("impact:high"), "maximpact" ("impact:max"); the Octane: IMPACT (default solidimpact), "v6", "v8", "v10", "v12" ("vpro:v12" and so on; need IRIX 6.5.10 or later installed with the VPro driver, and PROM 4.0, or 4.5 for the V10 and V12) or "none"
 heads      = 1              # 2 = dual-head Newport (second REX3 in GIO slot 1)
 resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
@@ -733,7 +733,7 @@ Configuration
   --nvram <FILE>              NVRAM file (default: nvram.bin)
   --nveeprom <FILE>           Indigo2 NVRAM EEPROM file (default: nveeprom.bin)
   --ip22                      Emulate an Indigo2 (IP22) instead of an Indy (IP24)
-  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact
+  --graphics <BOARD>          newport, xz, extreme, solidimpact, highimpact, maximpact, v6, v8, v10, v12
   --cpu <MODEL>               r4400 (default), r5000, or r10000
   --bank0..--bank3 <MB>       RAM bank sizes (0/8/16/32/64/128; IP28: also 256/512)
   --clock-fixed-mhz <MHZ>     CP0 Count frequency (IP22/IP24: 33; IP28: 97.5)

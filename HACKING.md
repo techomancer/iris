@@ -281,6 +281,7 @@ Every device that has real work to do runs on its own thread:
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
 | `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
+| `odyssey-work`, `odyssey-display` | VPro: command-FIFO decoding and drawing in slices under the board lock (the processor's stores only queue); the retrace and window present at 60 Hz |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds

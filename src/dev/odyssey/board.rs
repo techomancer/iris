@@ -1115,10 +1115,13 @@ pub struct Product {
 /// size: A at 32 or 128 MB is V6 or V8, B is V10 or V12. Public captures
 /// give A.1 for a 32 MB V6, B.1 for a 32 MB V10 and a 128 MB V12, and four
 /// banks for the V12. The V8's A.1 and four banks are inferred from its
-/// generation and size; the 32 MB boards' two banks are inferred, since the
-/// tool prints a fixed "Banks: 2" line for any 32 MB board. Every product is
-/// CAS latency 3. The identity record is the Octane board's name as the
-/// inventory prints it.
+/// generation and size; the V10's revision 10 is inferred from working
+/// Fuel and Tezro V10s (B.2 boards, revision 11, also exist); the 32 MB
+/// boards' two banks are inferred, since the tool prints a fixed "Banks: 2"
+/// line for any 32 MB board. Every product is CAS latency 3 with back-end
+/// (PB&J) version 1. The identity record is the Octane board's name as the
+/// inventory prints it, with its part number beside each entry. Fuel and
+/// Tezro boards are other assemblies; a profile answers the Octane name.
 pub static PRODUCTS: [Product; 4] = [
     Product { name: "v12", revision: 0xa, memory_size: 128, memory_banks: 4, backend_version: 1, record: "Name:ODY128VERSIONB" }, // 030-1611
     Product { name: "v10", revision: 0xa, memory_size: 32, memory_banks: 2, backend_version: 1, record: "Name:ODY32VERSIONB" }, // 030-1655
