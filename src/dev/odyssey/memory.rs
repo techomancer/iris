@@ -11,22 +11,40 @@ use std::cell::Cell;
 
 pub const SGI_PLANES_MAX: usize = 32;
 
-pub type PlaneFormat = u32;
-pub const SGI_PLANE_CI8: PlaneFormat = 0; // 1 byte: colour index
-pub const SGI_PLANE_RGB12: PlaneFormat = 1; // 2 bytes: 12-bit colour in a 16-bit word
-pub const SGI_PLANE_RGB24: PlaneFormat = 2; // 4 bytes: 24-bit colour in a 32-bit word
-pub const SGI_PLANE_RGBA8: PlaneFormat = 3; // 4 bytes
-pub const SGI_PLANE_Z24: PlaneFormat = 4; // 4 bytes: 24-bit depth in a 32-bit word
-pub const SGI_PLANE_S8: PlaneFormat = 5; // 1 byte: stencil
-pub const SGI_PLANE_TAG: PlaneFormat = 6; // 1 byte: per-pixel tag
-pub const SGI_PLANE_OVERLAY8: PlaneFormat = 7; // 1 byte
-pub const SGI_PLANE_TEXTURE: PlaneFormat = 8; // 4 bytes
-pub const SGI_PLANE_RAW: PlaneFormat = 9; // 4 bytes: a word the family interprets
+/// How a plane's pixels are stored.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum PlaneFormat {
+    /// 1 byte: colour index
+    #[default]
+    Ci8,
+    /// 2 bytes: 12-bit colour in a 16-bit word
+    Rgb12,
+    /// 4 bytes: 24-bit colour in a 32-bit word
+    Rgb24,
+    /// 4 bytes
+    Rgba8,
+    /// 4 bytes: 24-bit depth in a 32-bit word
+    Z24,
+    /// 1 byte: stencil
+    S8,
+    /// 1 byte: per-pixel tag
+    Tag,
+    /// 1 byte
+    Overlay8,
+    /// 4 bytes
+    Texture,
+    /// 4 bytes: a word the family interprets
+    Raw,
+}
 
-pub type Packing = u32;
-pub const SGI_PACK_LE_RED_LOW: Packing = 0;
-pub const SGI_PACK_LE_RED_HIGH: Packing = 1;
-pub const SGI_PACK_BE_RED_HIGH: Packing = 3;
+/// The byte order and channel order the model writes a plane's words in.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Packing {
+    #[default]
+    LeRedLow,
+    LeRedHigh,
+    BeRedHigh,
+}
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Plane {
@@ -139,7 +157,7 @@ impl BoardMemory {
         let p = &mut self.planes[id as usize];
         *p = *plane;
         p.id = id;
-        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: plane added: plane {} base {:#x} len {:#x} {}x{} stride {} format {}", p.id, p.base, p.len, p.width, p.height, p.stride, p.format as i32);
+        crate::dlog!(LogModule::Odyssey, "sgi-odyssey: plane added: plane {} base {:#x} len {:#x} {}x{} stride {} format {:?}", p.id, p.base, p.len, p.width, p.height, p.stride, p.format);
         Ok(p.id)
     }
     /// The plane with this id, if there is one.
@@ -279,16 +297,15 @@ impl Plane {
 #[inline]
 pub fn plane_bpp(format: PlaneFormat) -> u32 {
     match format {
-        SGI_PLANE_CI8 | SGI_PLANE_S8 | SGI_PLANE_TAG | SGI_PLANE_OVERLAY8 => 1,
-        SGI_PLANE_RGB12 => 2,
-        SGI_PLANE_RGB24 | SGI_PLANE_RGBA8 | SGI_PLANE_Z24 | SGI_PLANE_TEXTURE | SGI_PLANE_RAW => 4,
-        _ => unreachable!(),
+        PlaneFormat::Ci8 | PlaneFormat::S8 | PlaneFormat::Tag | PlaneFormat::Overlay8 => 1,
+        PlaneFormat::Rgb12 => 2,
+        PlaneFormat::Rgb24 | PlaneFormat::Rgba8 | PlaneFormat::Z24 | PlaneFormat::Texture | PlaneFormat::Raw => 4,
     }
 }
 
 impl Plane {
     pub fn is_le(&self) -> bool {
-        self.packing == SGI_PACK_LE_RED_LOW || self.packing == SGI_PACK_LE_RED_HIGH
+        matches!(self.packing, Packing::LeRedLow | Packing::LeRedHigh)
     }
 
     #[inline]

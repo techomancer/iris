@@ -1157,8 +1157,8 @@ impl Board {
         self.mem.init(pixels * 4);
         {
             let plane = Plane {
-                format: SGI_PLANE_RGBA8,
-                packing: SGI_PACK_BE_RED_HIGH,
+                format: PlaneFormat::Rgba8,
+                packing: Packing::BeRedHigh,
                 width: SGI_ODYSSEY_WIDTH,
                 height: SGI_ODYSSEY_HEIGHT,
                 stride: SGI_ODYSSEY_WIDTH * 4,
@@ -1192,8 +1192,8 @@ impl Board {
         self.depth_mem.init(pixels * 4);
         {
             let depth = Plane {
-                format: SGI_PLANE_Z24,
-                packing: SGI_PACK_BE_RED_HIGH,
+                format: PlaneFormat::Z24,
+                packing: Packing::BeRedHigh,
                 width: SGI_ODYSSEY_WIDTH,
                 height: SGI_ODYSSEY_HEIGHT,
                 stride: SGI_ODYSSEY_WIDTH * 4,
@@ -1211,8 +1211,8 @@ impl Board {
         self.stencil_mem.init(pixels);
         {
             let stencil = Plane {
-                format: SGI_PLANE_S8,
-                packing: SGI_PACK_BE_RED_HIGH,
+                format: PlaneFormat::S8,
+                packing: Packing::BeRedHigh,
                 width: SGI_ODYSSEY_WIDTH,
                 height: SGI_ODYSSEY_HEIGHT,
                 stride: SGI_ODYSSEY_WIDTH,
