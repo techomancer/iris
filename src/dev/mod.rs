@@ -81,6 +81,7 @@ pub mod dp83843;
 pub mod ics1890;
 pub mod isp12160;
 pub mod l1;
+pub mod ohci;
 pub mod timekeeper;
 pub mod prom_image;
 pub mod xbridge;
