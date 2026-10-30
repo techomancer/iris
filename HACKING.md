@@ -368,6 +368,16 @@ When a device has several locks, document their order next to them and keep
 to it. Graphics recording is an example: `rec` before `trace`, and the
 consumer thread never takes `rec`.
 
+Bedrock, the Fuel's node chip, shows rule 4 at the scale of a whole chip.
+Each processor interface's interrupt inputs (pending banks, masks, timer and
+error status) are atomics, and a store or an inbound packet changes one and
+then publishes the slot's levels into Cause bits 10-14 of its CPU's interrupt
+word with no lock: a writer that published a stale level re-reads the inputs
+and corrects it, so the last write always matches the registers. A mask
+store, an interrupt packet, a counter read, inbound DMA and PIO take no lock.
+The comparators fire on host timers, as the Hub's do, not from the CPU's
+batch hook.
+
 ## 6. The CPU
 
 ### State and execution
