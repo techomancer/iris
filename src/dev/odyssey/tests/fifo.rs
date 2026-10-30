@@ -1,103 +1,7 @@
-//! The board's register contract.
+//! The command FIFO: queueing, the board's thread, status, credits.
 
 use super::*;
 use std::sync::atomic::Ordering::SeqCst;
-use crate::irq::InterruptController;
-use parking_lot::Mutex;
-use std::sync::Arc;
-
-// The register contract of the board in the Octane's graphics port.
-
-const VPRO_WIDGET: u32 = 11;
-const HEART_WIDGET: u64 = 8;
-const HEART_PACKET: u64 = 0x80;
-const TEST_VECTOR: u32 = 18;
-// Aperture offsets: the identity and control words are the low halves.
-const IDENTITY: u64 = 0x0004;
-const MEMORY_CONFIG: u64 = 0x106c;
-const CONTROL: u64 = 0x0024;
-const ROUTE_DEST_UPPER: u64 = 0x1044;
-const ROUTE_DEST_LOWER: u64 = 0x104c;
-const ROUTE_VECTORS: u64 = 0x1054;
-const INTR_CLEAR: u64 = 0x101c;
-const INTR_ENABLE_SET: u64 = 0x1034;
-const INTR_FIFO_LOW_WATER: u64 = 0x200;
-const IDENTITY_DEFAULT: u32 = 0xac013047;
-
-/// Records every (line, level) the board drives.
-#[derive(Default)]
-struct Recorder(Mutex<Vec<(u32, bool)>>);
-
-impl InterruptController for Recorder {
-    fn set_line(&self, line: u32, level: bool) {
-        self.0.lock().push((line, level));
-    }
-}
-
-impl Recorder {
-    /// The level of `line` after the last event on it.
-    fn level(&self, line: u32) -> bool {
-        self.0.lock().iter().rev().find(|e| e.0 == line).map(|e| e.1).unwrap_or(false)
-    }
-}
-
-fn board(product: &str) -> (Box<Board>, Arc<Recorder>) {
-    let rec = Arc::new(Recorder::default());
-    let s = Board::new(product, VPRO_WIDGET).expect("board");
-    s.front.lock().irq = Some(rec.clone());
-    (s, rec)
-}
-
-#[test]
-fn widget_identity() {
-    let (mut s, _) = board("v12");
-    assert_eq!(s.mmio_read(IDENTITY, 4) as u32, IDENTITY_DEFAULT);
-    assert_eq!(s.mmio_read(CONTROL, 4) as u32 & ODSY_CONTROL_WIDGET_MASK, VPRO_WIDGET);
-}
-
-#[test]
-fn profile_identity_and_routing() {
-    // (product, revision, memory size code)
-    let cases = [("v6", 2u32, 0u32), ("v8", 2, 2), ("v10", 0xa, 0), ("v12", 0xa, 2)];
-
-    for (name, revision, size_code) in cases {
-        let (mut s, rec) = board(name);
-        let identity = s.mmio_read(IDENTITY, 4) as u32;
-        let memory = s.mmio_read(MEMORY_CONFIG, 4) as u32;
-
-        assert_eq!(identity >> 28, revision, "{name}");
-        assert_eq!(identity & 0x0fff_ffff, IDENTITY_DEFAULT & 0x0fff_ffff, "{name}");
-        assert_eq!((memory >> 30) & 3, size_code, "{name}");
-        assert_eq!(s.mmio_read(CONTROL, 4) as u32 & ODSY_CONTROL_WIDGET_MASK, VPRO_WIDGET);
-
-        s.mmio_write(ROUTE_DEST_UPPER, HEART_WIDGET << 25, 4);
-        s.mmio_write(ROUTE_DEST_LOWER, HEART_PACKET, 4);
-        s.mmio_write(ROUTE_VECTORS, TEST_VECTOR as u64, 4);
-        s.mmio_write(INTR_ENABLE_SET, INTR_FIFO_LOW_WATER, 4);
-        assert!(rec.level(TEST_VECTOR), "{name}: vector raised");
-        s.mmio_write(INTR_CLEAR, INTR_FIFO_LOW_WATER, 4);
-        assert!(!rec.level(TEST_VECTOR), "{name}: vector lowered");
-    }
-}
-
-/// A raised and a lowered board interrupt each reach HEART, setting and
-/// clearing the vector's pending bit.
-#[test]
-fn interrupt_reaches_heart() {
-    let (mut s, rec) = board("v12");
-
-    s.mmio_write(ROUTE_DEST_UPPER, HEART_WIDGET << 25, 4);
-    s.mmio_write(ROUTE_DEST_LOWER, HEART_PACKET, 4);
-    s.mmio_write(ROUTE_VECTORS, TEST_VECTOR as u64, 4);
-    assert!(!rec.level(TEST_VECTOR));
-
-    // The FIFO is empty, so its low-water flag is already pending.
-    s.mmio_write(INTR_ENABLE_SET, INTR_FIFO_LOW_WATER, 4);
-    assert!(rec.level(TEST_VECTOR));
-
-    s.mmio_write(INTR_CLEAR, INTR_FIFO_LOW_WATER, 4);
-    assert!(!rec.level(TEST_VECTOR));
-}
 
 /// A board on its own thread, routed to the recorder and with the
 /// low-water source enabled and clear.
@@ -142,7 +46,7 @@ fn start_long_slice(h: &BoardLocks, words: &[&CfifoPreamble], hold_ms: u32) {
 /// mark. While the slice holds the board, the stores queue and the
 /// status register answers without waiting for it.
 #[test]
-fn work_thread_runs_queued_stores_in_order() {
+fn the_board_thread_runs_queued_stores_in_order_and_latches_low_water() {
     const STATUS0: u64 = 0x1064;
     let (h, rec) = threaded_board();
     let words = preamble_twice();
@@ -201,7 +105,7 @@ fn work_thread_runs_queued_stores_in_order() {
 /// self-test register reads OK, though the board's thread runs one
 /// store per slice and most were still queued when the read began.
 #[test]
-fn waiting_read_sees_all_earlier_stores() {
+fn a_read_that_waits_sees_every_earlier_store() {
     let (h, _rec) = threaded_board();
     let words = preamble_twice();
 
@@ -262,7 +166,7 @@ fn credit_board() -> (Box<Board>, Arc<PiStub>) {
 /// repaid as the work ahead runs and it moves up. A store that does
 /// not wait is credited inside the store.
 #[test]
-fn counted_store_credits_at_fifo_entry() {
+fn a_counted_store_is_credited_as_it_enters_the_fifo() {
     let (mut s, pi) = credit_board();
     let stores = 72u32;
 
@@ -296,7 +200,7 @@ fn counted_store_credits_at_fifo_entry() {
 /// A reset abandons the waiting stores and cancels each owed credit
 /// (one owe of -1 per owed store); stores not owed cancel nothing.
 #[test]
-fn reset_cancels_owed_credits() {
+fn a_reset_cancels_the_credits_owed_for_abandoned_stores() {
     let (mut s, pi) = credit_board();
 
     for _ in 0..ODSY_CFIFO_DEPTH + 8 {
@@ -314,7 +218,7 @@ fn reset_cancels_owed_credits() {
 /// The processor interface's mark makes a store counted, once, and a
 /// counted store with no link logs and returns nothing.
 #[test]
-fn processor_mark_counts_one_store() {
+fn the_processor_mark_counts_exactly_one_store() {
     let (mut s, pi) = credit_board();
 
     {
@@ -344,7 +248,7 @@ fn processor_mark_counts_one_store() {
 
 /// The register block's pure state (PiGfx).
 #[test]
-fn pi_gfx_block_counts_and_starves() {
+fn the_credit_block_starves_a_widget_that_runs_out_of_credits() {
     let mut g = PiGfx::default();
 
     g.write(SGI_PI_GFX_PAGE, SGI_PI_GFX_PAGE_ENABLE | 0x2_0000);
@@ -362,59 +266,211 @@ fn pi_gfx_block_counts_and_starves() {
     assert!(!g.starved[0]);
 }
 
-mod widget {
-    //! The Octane VPro integration checks:
-    //! the board answers through both widget-11 windows, the Crossbow
-    //! carries its link only when it is fitted, and a routed interrupt
-    //! sets and clears its vector in HEART's pending register.
-    use super::*;
-    use crate::dev::heart::{host_clock, Heart, HeartConfig, PIU_BASE};
-    use crate::dev::heart_mem::HeartRam;
-    use crate::dev::xbow::Xbow;
 
-    const WIDGET: u8 = 11;
-    const VECTOR: u32 = 18;
+/// The low-water mark, in waiting stores.
+const LOW_WATER_MARK: u32 = ODSY_CFIFO_LOW_WATER;
+const HOST_WRITE_BASE: u64 = 0xb70000;
 
-    fn board() -> (Arc<Heart>, Arc<Odyssey>) {
-        let heart = Arc::new(Heart::new(HeartConfig::octane([128 << 20, 0, 0, 0]), host_clock()));
-        let ram = Arc::new(HeartRam::try_new([128, 0, 0, 0]).expect("ram"));
-        let v = Odyssey::new(WIDGET, "v12", heart.clone(), ram.dma_view(), Default::default(), Default::default()).expect("board");
-        (heart, v)
+/// A board whose stores wait in the queue until a test steps them one
+/// store a slice, with RAM for the fences they write.
+fn queued_board() -> (Box<Board>, Arc<Recorder>, Arc<Ram>) {
+    let (mut s, rec, ram) = board_with_ram();
+    reg_write(&mut s, ODSY_HOST_WRITE_ADDR_UPPER, 0);
+    reg_write(&mut s, ODSY_HOST_WRITE_ADDR_LOWER, HOST_WRITE_BASE as u32);
+    s.fifo.test_words.store(1, SeqCst);
+    (s, rec, ram)
+}
+
+/// Two host-write fences, slot 2 then slot 3, each three words.
+fn push_fences(s: &mut Board) {
+    for (slot, token) in [(2, 0x5a00), (3, 0xa5a5)] {
+        cmd(s, select(ODSY_REG_HOST_WRITE));
+        cmd(s, slot);
+        cmd(s, token);
     }
+}
 
-    fn pending(heart: &Heart) -> u64 {
-        heart.read64(PIU_BASE + 0x10030).data
+/// Run one store, as a one-store slice on the board's thread would.
+fn step(s: &mut Board) {
+    let before = s.fifo.level();
+    assert!(before > 0, "nothing waits to be stepped");
+    s.work_step(&mut Budget::words(1));
+    assert_eq!(s.fifo.level(), before - 1);
+}
+
+/// Run everything that waits.
+fn finish(s: &mut Board) {
+    s.work_step(&mut Budget::unlimited());
+    assert!(!s.fifo.pending());
+}
+
+/// The stores return with their work waiting; it runs one store a slice,
+/// in order, and its fences land when it does.
+///
+/// QEMU: command-work-runs-in-slices.
+#[test]
+fn stores_wait_and_run_one_slice_at_a_time() {
+    let (mut s, _, ram) = queued_board();
+    push_fences(&mut s);
+
+    assert!(s.work_pending());
+    assert_eq!(ram.half(HOST_WRITE_BASE + 4), 0);
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0);
+    let mut steps = 0;
+    while s.work_pending() {
+        steps += 1;
+        assert!(steps < 100);
+        step(&mut s);
     }
+    assert!(steps >= 3);
+    assert_eq!(ram.half(HOST_WRITE_BASE + 4), 0x5a00);
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5);
+}
 
-    #[test]
-    fn the_board_answers_through_both_widget_windows() {
-        let (_heart, v) = board();
-        for base in [widget_small_base(WIDGET), widget_large_base(WIDGET)] {
-            assert_eq!(v.read32(base + 0x4).data, 0xac01_3047);
-            assert_eq!(v.read32(base + 0x24).data & 0xf, WIDGET as u32);
+/// A context switch waits behind the commands before it: the kernel polls
+/// the done word, which the board writes only once those have run.
+///
+/// QEMU: command-work-orders-context-switch.
+#[test]
+fn a_context_switch_completes_only_after_the_commands_before_it() {
+    let (mut s, _, ram) = queued_board();
+    let base = 0xb80000u64;
+    push_fences(&mut s);
+    reg_write(&mut s, ODSY_CTX_SHADOW_ADDR_UPPER, 0);
+    reg_write(&mut s, ODSY_CTX_SHADOW_ADDR_LOWER, base as u32);
+    s.mmio_write(ODSY_CTX_SWITCH_PORT, 0x0000_0700_0001_0001, 8);
+
+    let done = |ram: &Ram| u32::from_be_bytes(ram.get(base + ODSY_CTX_SWITCH_DONE_OFFSET, 4).try_into().unwrap());
+    assert_eq!(done(&ram), 0);
+    while s.work_pending() {
+        step(&mut s);
+        if done(&ram) != 0 {
+            assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5, "the fences before the switch had landed");
         }
     }
+    assert_ne!(done(&ram), 0);
+}
 
-    #[test]
-    fn the_crossbow_carries_the_graphics_link_only_when_fitted() {
-        let fitted = Xbow::new(4, (1 << 8) | (1 << 15) | (1 << WIDGET));
-        let empty = Xbow::new(4, (1 << 8) | (1 << 15));
-        assert!(fitted.carries(WIDGET));
-        assert!(!empty.carries(WIDGET));
-    }
+/// A read of a register the work may change finishes the work first; the
+/// software token, which no command touches, is answered at once.
+///
+/// QEMU: command-work-read-waits.
+#[test]
+fn a_read_of_a_register_the_work_may_change_finishes_the_work_first() {
+    let (mut s, _, ram) = queued_board();
+    push_fences(&mut s);
 
-    #[test]
-    fn a_routed_interrupt_sets_and_clears_its_heart_vector() {
-        let (heart, v) = board();
-        let b = widget_small_base(WIDGET);
-        v.write32(b + 0x1044, 8 << 25);
-        v.write32(b + 0x104c, 0x80);
-        v.write32(b + 0x1054, VECTOR);
-        assert_eq!(pending(&heart) & 1 << VECTOR, 0);
-        // The FIFO is empty, so its low-water flag is already pending.
-        v.write32(b + 0x1034, 0x200);
-        assert_ne!(pending(&heart) & 1 << VECTOR, 0);
-        v.write32(b + 0x101c, 0x200);
-        assert_eq!(pending(&heart) & 1 << VECTOR, 0);
+    reg_write(&mut s, ODSY_SW_TOKEN, 1);
+    assert_eq!(reg_read(&mut s, ODSY_SW_TOKEN), 1);
+    assert!(s.work_pending(), "the token is answered without waiting");
+
+    reg_read(&mut s, MEMORY_CONFIG);
+    assert!(!s.work_pending());
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5);
+}
+
+/// While stores wait the FIFO is neither empty nor below low water in the
+/// status the kernel's credit flow control reads before it sleeps on the
+/// low-water interrupt; it reads ready again once they have run.
+///
+/// QEMU: command-work-status-shows-waiting-stores.
+#[test]
+fn the_status_shows_waiting_stores_until_they_have_run() {
+    let (mut s, _, _) = queued_board();
+    assert_eq!(reg_read(&mut s, ODSY_STATUS0), 0x1003_0000);
+
+    push_fences(&mut s);
+    assert_eq!(reg_read(&mut s, ODSY_STATUS0), 0x1002_0000, "not empty, still below the mark");
+    push_fences(&mut s);
+    push_fences(&mut s);
+    assert_eq!(s.fifo.level(), 18);
+    assert_eq!(reg_read(&mut s, ODSY_STATUS0), 0x1000_0000);
+
+    while s.fifo.level() > LOW_WATER_MARK {
+        step(&mut s);
+        assert_eq!(reg_read(&mut s, ODSY_STATUS0), 0x1000_0000);
     }
+    step(&mut s);
+    assert_eq!(reg_read(&mut s, ODSY_STATUS0), 0x1002_0000, "below the mark once fewer than 16 wait");
+
+    finish(&mut s);
+    assert_eq!(reg_read(&mut s, ODSY_STATUS0), 0x1003_0000);
+}
+
+/// The kernel's credit flow control clears low water, finds the FIFO above
+/// its mark, enables the source and sleeps until the interrupt. Low water
+/// is not raised while 16 or more stores wait, and is raised, with its
+/// interrupt, as the level falls below the mark while stores still wait.
+///
+/// QEMU: command-work-low-water-after-drain.
+#[test]
+fn low_water_is_raised_as_the_queue_falls_below_the_mark() {
+    let (mut s, rec, _) = queued_board();
+    route_to_heart(&mut s);
+    for _ in 0..3 {
+        push_fences(&mut s);
+    }
+    reg_write(&mut s, ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER);
+    reg_write(&mut s, ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER);
+
+    // 18 wait; two slices leave 16, still at the mark.
+    step(&mut s);
+    step(&mut s);
+    assert!(rec.events(FLAG_VECTOR).is_empty());
+    assert_eq!(reg_read(&mut s, ODSY_INTR_FLAGS) & ODSY_INTR_FIFO_LOW_WATER, 0);
+
+    // The next leaves 15, below the mark.
+    step(&mut s);
+    assert_eq!(s.fifo.level(), LOW_WATER_MARK - 1);
+    assert_eq!(reg_read(&mut s, ODSY_INTR_FLAGS) & ODSY_INTR_FIFO_LOW_WATER, ODSY_INTR_FIFO_LOW_WATER);
+    assert_eq!(rec.events(FLAG_VECTOR), [true]);
+}
+
+/// The FIFO's size from the kernel's set-up does not widen the credits:
+/// after the set-up (256 tiles, 32,768 words) only the oldest 64 waiting
+/// stores have their credits back, so the processor interface still holds
+/// back a writer that runs ahead of the slow board.
+///
+/// QEMU: command-work-credit-depth-ignores-setup.
+#[test]
+fn the_fifo_set_up_does_not_widen_the_credit_depth() {
+    let (mut s, pi) = credit_board();
+    s.fifo.test_words.store(0, SeqCst);
+    cmd64(&mut s, 0x6b1, 256);
+    cmd64(&mut s, 0x6b3, 24144);
+    cmd64(&mut s, 0x6b2, 32192);
+    finish(&mut s);
+    pi.0.lock().clear();
+
+    s.fifo.test_words.store(1, SeqCst);
+    for _ in 0..72 {
+        s.mmio_write(ODSY_CMD_FIFO, 0, 8);
+    }
+    assert_eq!(s.fifo.level(), 72);
+    assert_eq!(pi.count("return"), ODSY_CFIFO_DEPTH as i64);
+    finish(&mut s);
+    assert_eq!(pi.settled(), 72);
+}
+
+/// A stopping machine finishes the work waiting; a reset abandons it.
+///
+/// QEMU: command-work-stop-and-reset.
+#[test]
+fn stopping_finishes_the_waiting_work_and_a_reset_abandons_it() {
+    let (mut s, _, ram) = queued_board();
+    push_fences(&mut s);
+    let h = BoardLocks::new(s);
+
+    h.work_stop();
+    assert!(!h.fifo.pending());
+    assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5);
+
+    let mut s = h.board.lock();
+    for w in [select(ODSY_REG_HOST_WRITE), 4, 0x1234] {
+        cmd(&mut s, w);
+    }
+    assert!(s.work_pending());
+    s.reset();
+    assert!(!s.work_pending());
+    assert_eq!(ram.half(HOST_WRITE_BASE + 8), 0);
 }
