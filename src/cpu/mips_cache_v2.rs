@@ -571,6 +571,10 @@ pub trait CpuModel: MipsCache {
     /// list of changes from the R10000 has no TLB or CP0 change. The R14000 and
     /// R16000 are a model choice that gives them the same TLB.
     const R10K_FAMILY: bool = false;
+    /// A partial LWR keeps bits 63:32 of the destination. Observed on the
+    /// R10000; whether the later parts do the same is not established, so they
+    /// keep the sign extension for now.
+    const PARTIAL_LWR_KEEPS_UPPER: bool = false;
     /// An uncached store the system refuses completes instead of raising a
     /// Data Bus Error. The R10000 sends it as a write request, which gets no
     /// response, and Bus Error comes only from an error response to a read or
@@ -3610,6 +3614,7 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
+    const PARTIAL_LWR_KEEPS_UPPER: bool = MODEL == model::R10000;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
     const POSTS_UNCACHED_STORES: bool = Self::R10K_CACHE_OPS;
     // 44 implemented virtual address bits on the R10000, as the shadow

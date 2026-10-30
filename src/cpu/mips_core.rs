@@ -859,6 +859,12 @@ pub struct MipsCore {
     pub cp0_badvaddr: u64,    // 8: Bad Virtual Address
     pub cp0_entryhi: u64,     // 10: TLB Entry High (64-bit, truncated in 32-bit mode)
     pub cp0_status: u32,      // 12: Status Register
+    /// Offsets below this keep the upper word on a partial LWR: 3 while
+    /// 64-bit operations are on for the current mode on a model that keeps it
+    /// (`CpuModel::PARTIAL_LWR_KEEPS_UPPER`), 0 otherwise. Set by the
+    /// executor's `resync_privilege_state`, which every Status change goes
+    /// through, so compiled code tests one byte instead of decoding Status.
+    pub lwr_upper_below: u8,
     pub cp0_cause: u32,       // 13: Cause Register
     pub cp0_epc: u64,         // 14: Exception Program Counter
     pub cp0_prid: u32,        // 15: Processor Revision ID
@@ -1412,6 +1418,7 @@ impl MipsCore {
             cp0_badvaddr: 0,
             cp0_entryhi: 0,
             cp0_status: 0,
+            lwr_upper_below: 0,
             cp0_cause: 0,
             cp0_epc: 0,
             cp0_prid: 0,
