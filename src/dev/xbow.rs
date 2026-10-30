@@ -39,51 +39,51 @@ pub const fn widget_id(rev: u32, part: u32, mfgr: u32) -> u32 {
 }
 
 /// The widget HEART answers as, where widget 0's interrupt packets go.
-const WIDGET_HEART: u8 = 8;
+pub(crate) const WIDGET_HEART: u8 = 8;
 
-const FIRST_WIDGET: u8 = 8;
-const LINKS: usize = 8;
+pub(crate) const FIRST_WIDGET: u8 = 8;
+pub(crate) const LINKS: usize = 8;
 
 /// The register block's span in widget 0's window.
 pub const REG_SPAN: u32 = 0x0100_0000;
 
-const IDENTIFICATION: u32 = 0x00;
-const STATUS: u32 = 0x08;
-const ERR_UPPER: u32 = 0x10;
-const ERR_LOWER: u32 = 0x18;
-const CONTROL: u32 = 0x20;
-const PACKET_TIMEOUT: u32 = 0x28;
-const INT_UPPER: u32 = 0x30;
-const INT_LOWER: u32 = 0x38;
-const ERR_CMD: u32 = 0x40;
-const LLP_CONTROL: u32 = 0x48;
-const STATUS_CLEAR: u32 = 0x50;
-const ARB_RELOAD: u32 = 0x58;
-const PERF_A: u32 = 0x60;
-const PERF_B: u32 = 0x68;
-const NIC: u32 = 0x70;
+pub(crate) const IDENTIFICATION: u32 = 0x00;
+pub(crate) const STATUS: u32 = 0x08;
+pub(crate) const ERR_UPPER: u32 = 0x10;
+pub(crate) const ERR_LOWER: u32 = 0x18;
+pub(crate) const CONTROL: u32 = 0x20;
+pub(crate) const PACKET_TIMEOUT: u32 = 0x28;
+pub(crate) const INT_UPPER: u32 = 0x30;
+pub(crate) const INT_LOWER: u32 = 0x38;
+pub(crate) const ERR_CMD: u32 = 0x40;
+pub(crate) const LLP_CONTROL: u32 = 0x48;
+pub(crate) const STATUS_CLEAR: u32 = 0x50;
+pub(crate) const ARB_RELOAD: u32 = 0x58;
+pub(crate) const PERF_A: u32 = 0x60;
+pub(crate) const PERF_B: u32 = 0x68;
+pub(crate) const NIC: u32 = 0x70;
 /// Revision code 5 and later: widget 0's reset fence, then links 8 to 15's
 /// at a stride of 8, then the resource lock and its clear.
-const FENCE_BASE: u32 = 0x78;
-const FENCES: usize = 1 + LINKS;
-const FENCE_END: u32 = FENCE_BASE + 8 * FENCES as u32;
-const LOCK: u32 = 0xc0;
-const LOCK_CLEAR: u32 = 0xc8;
+pub(crate) const FENCE_BASE: u32 = 0x78;
+pub(crate) const FENCES: usize = 1 + LINKS;
+pub(crate) const FENCE_END: u32 = FENCE_BASE + 8 * FENCES as u32;
+pub(crate) const LOCK: u32 = 0xc0;
+pub(crate) const LOCK_CLEAR: u32 = 0xc8;
 const FENCE_MASK: u32 = 0xff;
 /// The first revision code with fences and the lock (Crossbow 2.0 in the
 /// software tables; an Octane2's code-5 part shows as 1.4 in its inventory).
 const REVISION_FENCES: u32 = 5;
-const LINK_BASE: u32 = 0x100;
-const LINK_STRIDE: u32 = 0x40;
-const LINK_END: u32 = LINK_BASE + LINK_STRIDE * LINKS as u32;
-const LINK_FLUSH: u32 = 0x00;
-const LINK_CONTROL: u32 = 0x08;
-const LINK_STATUS: u32 = 0x10;
-const LINK_ARB_UPPER: u32 = 0x18;
-const LINK_ARB_LOWER: u32 = 0x20;
-const LINK_STATUS_CLEAR: u32 = 0x28;
-const LINK_RESET: u32 = 0x30;
-const LINK_AUX_STATUS: u32 = 0x38;
+pub(crate) const LINK_BASE: u32 = 0x100;
+pub(crate) const LINK_STRIDE: u32 = 0x40;
+pub(crate) const LINK_END: u32 = LINK_BASE + LINK_STRIDE * LINKS as u32;
+pub(crate) const LINK_FLUSH: u32 = 0x00;
+pub(crate) const LINK_CONTROL: u32 = 0x08;
+pub(crate) const LINK_STATUS: u32 = 0x10;
+pub(crate) const LINK_ARB_UPPER: u32 = 0x18;
+pub(crate) const LINK_ARB_LOWER: u32 = 0x20;
+pub(crate) const LINK_STATUS_CLEAR: u32 = 0x28;
+pub(crate) const LINK_RESET: u32 = 0x30;
+pub(crate) const LINK_AUX_STATUS: u32 = 0x38;
 
 const STATUS_REQUEST: u32 = 1 << 23;
 const STATUS_LINK_REQUESTS: u32 = 0xff00_0000;
