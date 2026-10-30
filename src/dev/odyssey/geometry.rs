@@ -505,8 +505,7 @@ impl Board {
         }
         eye[3] = 1.0;
 
-        // SAFETY: Lighting is plain data, valid when zeroed.
-        let mut lt: Lighting = unsafe { std::mem::zeroed() };
+        let mut lt = Lighting::default();
         lt.init();
         lt.on = 1;
         lt.local_viewer = self.gl_local_viewer as u32;
@@ -709,7 +708,7 @@ impl Board {
         let depth_scale = self.gl_depth_scale();
         let mut p = [0f32; 16];
 
-        self.gl_ctx.cur.viewport = [0; 4];
+        self.gl().cur.viewport = [0; 4];
         if (m[0] == 0.0 && m[4] == 0.0 && m[8] == 0.0) || (m[1] == 0.0 && m[5] == 0.0 && m[9] == 0.0) {
             return;
         }
@@ -723,8 +722,8 @@ impl Board {
             };
             p[col * 4 + 3] = m[col * 4 + 3];
         }
-        self.gl_ctx.set_matrix(SGI_GL_PROJECTION, &p);
-        let vp = &mut self.gl_ctx.cur.viewport;
+        self.gl().set_matrix(SGI_GL_PROJECTION, &p);
+        let vp = &mut self.gl().cur.viewport;
         vp[0] = -ODSY_GL_WINDOW_REACH;
         vp[1] = -ODSY_GL_WINDOW_REACH;
         vp[2] = 2 * ODSY_GL_WINDOW_REACH;
@@ -783,7 +782,7 @@ impl Board {
         }
         gl_transpose(&self.gl_matrix, &mut m);
         let slot = self.gl_matrix_slot;
-        self.gl_ctx.set_matrix(slot, &m);
+        self.gl().set_matrix(slot, &m);
     }
 
     /// The four floats behind index 16, gathered in cmd_operand[]. Their sign
@@ -869,8 +868,8 @@ impl Board {
             op.clear_buffers |= SGI_GL_DEPTH_BUFFER_BIT;
             op.clear_depth24 = rules.depth_code(d);
         }
-        if (self.pattern_mode & ODSY_MODE_STENCIL_TEST) != 0 && self.gl_ctx.cur.stencil_write_mask != 0 {
-            let st = &self.gl_ctx.cur;
+        if (self.pattern_mode & ODSY_MODE_STENCIL_TEST) != 0 && self.gl_ref().cur.stencil_write_mask != 0 {
+            let st = &self.gl_ref().cur;
 
             if st.stencil_func == SGI_GL_ALWAYS && st.stencil_op[2] == SGI_GL_REPLACE {
                 // glClear's form (ODSY_MODE_STENCIL_TEST): write the reference.
@@ -941,7 +940,7 @@ impl Board {
             }
         }
         if !patterned {
-            gl_raster(P::new(&mut *self).opaque(), &op);
+            self.gl_raster(&op);
             return;
         }
         let target = self.gl_target();
@@ -972,7 +971,7 @@ impl Board {
                     }
                 }
                 op.x1 = x - 1;
-                rules.raster(&target, &op);
+                rules.raster(&target, &mut self.gl_parts(None).0, &op);
             }
             y += 1;
         }

@@ -246,8 +246,6 @@ pub const SGI_GL_WINDOW_GUARD: i32 = 16384;
 pub const SGI_GL_OUT_OF_MEMORY: u32 = 0x0505;
 
 pub const SGI_RASTER_CLEAR: RasterKind = 1;
-pub const SGI_RASTER_BITMAP: RasterKind = 7;
-pub const SGI_RASTER_PIXELS: RasterKind = 8;
 
 pub const SGI_GL_DRAW_OK: GlDrawResult = 0;
 pub const SGI_GL_DRAW_OUT_OF_MEMORY: GlDrawResult = 1;
@@ -354,75 +352,6 @@ pub const SGI_GL_OP_HINT: GlOp = 72;
 //
 pub const SGI_GL_OP_TEX_GEN: GlOp = 73;
 
-/// BITMAP: a run of glBitmap's image (OpenGL 1.2.1, 3.7), drawn as
-/// fragments under a context's draw state. The image is height rows of
-/// (width + 7) / 8 bytes, the bottom row first, most significant bit
-/// leftmost. bytes[0] is byte `first` of the image. `bytes` points at
-/// `count` bytes.
-#[derive(Clone, Copy, Default)]
-pub struct RasterBitmap {
-    pub state: P<GlDrawState>,
-    /// The window pixel of the image's lower-left corner.
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-    pub first: u32,
-    pub count: u32,
-    pub bytes: P<u8>,
-    /// The raster position's window depth, colour, colour index and eye
-    /// distance (the fragments' fog coordinate, 3.10).
-    pub z: f32,
-    pub rgba: [f32; 4],
-    pub index: f32,
-    pub distance: f32,
-    pub texcoord: [f32; 4],
-}
-
-/// Initial RGBA pixel-transfer scale and bias (OpenGL 1.2.1, 3.6.5).
-#[derive(Clone, Copy, Default)]
-pub struct GlPixelTransfer {
-    pub scale: [f32; 4],
-    pub bias: [f32; 4],
-}
-
-/// Colour, depth and stencil pixel rectangles (OpenGL 1.2.1, 3.6.4). The
-/// source pointers each address width * height elements, bottom row first;
-/// null where the source is absent.
-#[derive(Clone, Copy, Default)]
-pub struct RasterPixels {
-    pub state: P<GlDrawState>,
-    /// Raster position in window coordinates.
-    pub x: f64,
-    pub y: f64,
-    pub zoom: [f32; 2],
-    pub transfer: GlPixelTransfer,
-    pub width: u32,
-    pub height: u32,
-    /// 0xRRGGBBAA.
-    pub rgba: P<u32>,
-    /// Unquantized.
-    pub rgba_float: P<[f32; 4]>,
-    pub rgba_double: P<[f64; 4]>,
-    /// Normalized source.
-    pub depth: P<f64>,
-    /// Transferred indices.
-    pub stencil: P<u32>,
-    /// Transferred colour indices.
-    pub index: P<u32>,
-    pub depth_scale: f32,
-    pub depth_bias: f32,
-    /// Raster position colour for depth sources.
-    pub colour: [f32; 4],
-    /// Raster position index for depth sources.
-    pub colour_index: f32,
-    /// Raster position's window depth.
-    pub z: f32,
-    /// Raster position's fog distance.
-    pub distance: f32,
-    pub texcoord: [f32; 4],
-}
-
 /// Only the fields a kind the rasterizer executes needs are here.
 /// Coordinates are plane pixels, the rectangle inclusive.
 #[derive(Clone, Copy, Default)]
@@ -456,8 +385,6 @@ pub struct RasterOp {
     pub index_bits: u32,
     pub clear_index: u32,
     pub index_mask: u32,
-    pub bitmap: RasterBitmap,
-    pub pixels: RasterPixels,
 }
 
 /// Where a context draws, as the family's context switch, window clip and
@@ -678,40 +605,25 @@ pub struct GlContext {
 
 /// A decoded command: its entry point and its scalar arguments as 32-bit
 /// words in the specification's order, a float argument as the IEEE single
-/// bits the client sent. `args` points at `nargs` words.
-#[derive(Clone, Copy, Default)]
-pub struct GlCmd {
+/// bits the client sent.
+#[derive(Clone, Copy)]
+pub struct GlCmd<'a> {
     pub op: u16,
-    pub nargs: u16,
-    pub args: P<u32>,
+    pub args: &'a [u32],
 }
 
-impl GlCmd {
-    /// `args` as a slice; empty when there are no arguments.
-    pub fn args(&self) -> &[u32] {
-        if self.args.is_null() || self.nargs == 0 {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.args.0, self.nargs as usize) }
-    }
-
-    /// A command over a caller-owned word slice, which must outlive it.
-    pub fn new(op: u16, args: &[u32]) -> GlCmd {
-        GlCmd {
-            op,
-            nargs: args.len() as u16,
-            args: P(args.as_ptr() as *mut u32),
-        }
+impl<'a> GlCmd<'a> {
+    pub fn new(op: u16, args: &'a [u32]) -> GlCmd<'a> {
+        GlCmd { op, args }
     }
 }
 
 /// A batch of vertices drawn as one primitive mode under one draw state.
 /// The context lights each vertex before it is drawn, so no draw carries
-/// materials: a vertex's material index is 0, the draw state's. Pointer
-/// fields are borrowed for the duration of the call that carries the draw;
-/// null means absent.
-#[derive(Clone, Copy, Default)]
-pub struct GlDraw {
+/// materials: a vertex's material index is 0, the draw state's. Everything
+/// it points at is the context's, borrowed for the call that carries it.
+#[derive(Clone, Copy)]
+pub struct GlDraw<'a> {
     /// The context's hw_id.
     pub context: u32,
     /// SGI_GL_POINTS to SGI_GL_POLYGON.
@@ -719,48 +631,67 @@ pub struct GlDraw {
     pub count: u32,
     /// count * SGI_GL_VERTEX_FLOATS floats, texture-matrix-transformed strq
     /// included, ready for clipping.
-    pub vertices: P<f32>,
-    pub materials: P<f32>,
-    pub nmaterials: u32,
+    pub vertices: &'a [f32],
     /// True when the vertices carry back-face colour or index values for a
     /// back-facing polygon: two-sided lighting (2.13.1).
     pub back_colors: bool,
-    pub state: P<GlDrawState>,
+    pub state: &'a GlDrawState,
     /// Borrowed dimensions; zero in direct submissions means one.
     pub point_size: f32,
     pub line_width: f32,
     pub point_smooth: bool,
     pub line_smooth: bool,
     pub polygon_smooth: bool,
-    /// 32 canonical rows; null means stipple is disabled.
-    pub polygon_stipple: P<u32>,
+    /// 32 canonical rows, used while polygon_stipple_enabled is set.
+    pub polygon_stipple: &'a [u32; 32],
     pub polygon_stipple_enabled: bool,
-    /// Two modes; null preserves legacy FILL.
-    pub polygon_modes: P<u32>,
+    /// Front and back modes; None keeps legacy FILL.
+    pub polygon_modes: Option<[u32; 2]>,
     pub fill_by_triangle: bool,
     pub line_stipple_enabled: bool,
     pub line_stipple_repeat: u32,
     pub line_stipple_pattern: u32,
-    /// Borrowed through one synchronous rasterization; null means local.
-    pub line_phase: P<u32>,
+    /// The context's standalone stipple phase, which the draw advances in
+    /// place; None counts a phase local to the draw.
+    pub line_phase: Option<u32>,
     /// With a borrowed phase, reset a local candidate before counting.
     pub line_phase_reset: bool,
 }
 
-/// Where a context's work goes. Every item is executed before the call
+impl<'a> GlDraw<'a> {
+    /// A draw of count vertices in mode, the rest of it off.
+    pub fn new(mode: u32, count: u32, vertices: &'a [f32], state: &'a GlDrawState, polygon_stipple: &'a [u32; 32]) -> Self {
+        GlDraw {
+            context: 0,
+            mode,
+            count,
+            vertices,
+            back_colors: false,
+            state,
+            point_size: 0.0,
+            line_width: 0.0,
+            point_smooth: false,
+            line_smooth: false,
+            polygon_smooth: false,
+            polygon_stipple,
+            polygon_stipple_enabled: false,
+            polygon_modes: None,
+            fill_by_triangle: false,
+            line_stipple_enabled: false,
+            line_stipple_repeat: 0,
+            line_stipple_pattern: 0,
+            line_phase: None,
+            line_phase_reset: false,
+        }
+    }
+}
+
+/// Where a context's draws go. Every draw is executed before the call
 /// returns, so what it points at need only live that long.
-#[derive(Clone, Copy, Default)]
-pub struct GlSink {
-    pub draw: Option<fn(Opaque, &GlDraw)>,
-    pub raster: Option<fn(Opaque, &RasterOp)>,
-    /// glFinish's fence, once everything sent before it is done; None when
-    /// the family has nothing to report for it.
-    pub fence: Option<fn(Opaque, u32)>,
-    pub opaque: Opaque,
-    /// Preferred for every draw; activated contexts require it.
-    pub draw_checked: Option<fn(Opaque, &GlDraw) -> GlDrawResult>,
-    /// Borrowed by one synchronous checked command; null when unused.
-    pub result: P<GlDrawResult>,
+pub trait GlSink {
+    /// Rasterize one draw; a line stipple's phase comes back in
+    /// d.line_phase.
+    fn draw(&mut self, d: &mut GlDraw) -> GlDrawResult;
 }
 
 /// The most words one GlContext::get() answer takes: a matrix's.
@@ -880,19 +811,17 @@ impl GlPolygonAssembly {
 
 impl GlContext {
     /// Audited host consumers opt in; reset preserves that host policy.
-    pub fn enable_polygon_modes(&mut self, sink: Option<&GlSink>) -> bool {
-        match sink {
-            Some(s) if self.in_begin == 0 && s.draw_checked.is_some() => {}
-            _ => return false,
+    pub fn enable_polygon_modes(&mut self) -> bool {
+        if self.in_begin != 0 {
+            return false;
         }
         self.polygon.enabled = 1;
         true
     }
 
-    pub fn enable_line_stipple(&mut self, sink: Option<&GlSink>) -> bool {
-        match sink {
-            Some(s) if self.in_begin == 0 && s.draw_checked.is_some() => {}
-            _ => return false,
+    pub fn enable_line_stipple(&mut self) -> bool {
+        if self.in_begin != 0 {
+            return false;
         }
         self.standalone_stipple = true;
         true
@@ -952,36 +881,22 @@ impl GlPolygonAssembly {
 
 impl GlContext {
 
-    pub fn draw_result(&mut self, sink: &GlSink, d: &GlDraw) {
-        let result: GlDrawResult;
+    /// Whether the context consumes a draw's result: with per-face polygon
+    /// modes or the standalone line stipple active.
+    pub fn draws_checked(&self) -> bool {
+        self.polygon.enabled != 0 || self.standalone_stipple
+    }
 
-        if !sink.result.is_null() && *sink.result.get() != SGI_GL_DRAW_OK {
-            return;
-        }
-        if sink.result.is_null()
-            && self.polygon.enabled == 0
-            && !self.standalone_stipple
-            && sink.draw.is_some()
-        {
-            (sink.draw.unwrap())(sink.opaque, d);
-            return;
-        } else if let Some(f) = sink.draw_checked {
-            result = f(sink.opaque, d);
-        } else {
-            gl_report_once(0, "sgi-gl: required checked draw callback is missing");
-            if !sink.result.is_null() {
-                *sink.result.get() = SGI_GL_DRAW_RESOURCE_ERROR;
-            }
+    /// Account for a draw's result, for a draw made while draws_checked() was
+    /// `checked`.
+    pub fn draw_result(&mut self, checked: bool, result: GlDrawResult) {
+        if !checked {
             return;
         }
         if result == SGI_GL_DRAW_OUT_OF_MEMORY && self.polygon.error == 0 {
             self.polygon.error = SGI_GL_OUT_OF_MEMORY;
         }
         if result == SGI_GL_DRAW_OK {
-            return;
-        }
-        if !sink.result.is_null() {
-            *sink.result.get() = result;
             return;
         }
         match result {
@@ -1258,46 +1173,39 @@ impl GlDrawState {
 impl GlContext {
 
     /// Send one piece of the open primitive: count of v0 to v3.
-    pub fn submit(&mut self, sink: &GlSink, mode: u32, count: u32, v0: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v1: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v2: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v3: Option<&[f32; SGI_GL_VERTEX_FLOATS]>) {
+    pub fn submit(&mut self, sink: &mut dyn GlSink, mode: u32, count: u32, v0: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v1: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v2: Option<&[f32; SGI_GL_VERTEX_FLOATS]>, v3: Option<&[f32; SGI_GL_VERTEX_FLOATS]>) {
         let stipple = if mode == SGI_GL_LINES { self.standalone_stipple } else { self.polygon.enabled != 0 };
         let v = [v0, v1, v2, v3];
-        let mut verts = [[0.0f32; SGI_GL_VERTEX_FLOATS]; 4];
-        let mut d = GlDraw::default();
+        let mut verts = [0.0f32; 4 * SGI_GL_VERTEX_FLOATS];
+
+        for i in 0..count as usize {
+            if let Some(src) = v[i] {
+                verts[i * SGI_GL_VERTEX_FLOATS..][..SGI_GL_VERTEX_FLOATS].copy_from_slice(src);
+            }
+        }
+        let checked = self.draws_checked();
+        let mut d = GlDraw::new(mode, count, &verts, &self.cur, &self.polygon_stipple);
 
         d.context = self.hw_id;
-        d.mode = mode;
-        d.count = count;
-        d.vertices = P(verts.as_mut_ptr() as *mut f32);
-        d.back_colors = false;
-        d.state = P(&mut self.cur as *mut GlDrawState);
         d.point_size = self.point_size;
         d.line_width = self.line_width;
         d.point_smooth = self.raster_enables & SGI_GL_RASTER_POINT_SMOOTH != 0;
         d.line_smooth = self.raster_enables & SGI_GL_RASTER_LINE_SMOOTH != 0;
         d.polygon_smooth = self.raster_enables & SGI_GL_RASTER_POLYGON_SMOOTH != 0;
-        d.polygon_modes = if self.polygon.enabled != 0 {
-            P(self.polygon_mode.as_mut_ptr())
-        } else {
-            P::null()
-        };
+        d.polygon_modes = (self.polygon.enabled != 0).then_some(self.polygon_mode);
         d.line_stipple_enabled = stipple && (self.raster_enables & SGI_GL_RASTER_LINE_STIPPLE != 0);
         d.line_stipple_repeat = if stipple { self.line_stipple_repeat } else { 0 };
         d.line_stipple_pattern = if stipple { self.line_stipple_pattern } else { 0 };
-        d.line_phase = if mode == SGI_GL_LINES && self.standalone_stipple {
-            P(&mut self.line_phase as *mut u32)
-        } else {
-            P::null()
-        };
+        d.line_phase = (mode == SGI_GL_LINES && self.standalone_stipple).then_some(self.line_phase);
         d.line_phase_reset = self.begin_mode == SGI_GL_LINES;
-        d.polygon_stipple = P(self.polygon_stipple.as_mut_ptr());
         d.polygon_stipple_enabled = self.raster_enables & SGI_GL_RASTER_POLYGON_STIPPLE != 0;
 
-        for i in 0..count as usize {
-            if let Some(src) = v[i] {
-                verts[i] = *src;
-            }
+        let result = sink.draw(&mut d);
+        let phase = d.line_phase;
+        if let Some(phase) = phase {
+            self.line_phase = phase;
         }
-        self.draw_result(sink, &d);
+        self.draw_result(checked, result);
     }
 
     /// A vertex's texture coordinates: the current ones through the
@@ -1355,7 +1263,7 @@ impl GlContext {
     /// context switch between two vertices loses nothing. A line loop's
     /// closing segment is sent at glEnd. Vertices that complete no piece
     /// before glEnd draw nothing.
-    pub fn vertex(&mut self, sink: &GlSink, pos: &[f32; 4], components: u32) {
+    pub fn vertex(&mut self, sink: &mut dyn GlSink, pos: &[f32; 4], components: u32) {
         let mut cur = [0.0f32; SGI_GL_VERTEX_FLOATS];
         let h0 = self.held[0];
         let h1 = self.held[1];
@@ -1735,19 +1643,19 @@ pub fn gl_words4(a: &[u32], from: usize) -> [f32; 4] {
 
 impl GlContext {
     /// Execute one command against the context, sending any work to sink.
-    pub fn command(&mut self, sink: &GlSink, cmd: &GlCmd) {
-        let a = cmd.args();
+    pub fn command(&mut self, sink: &mut dyn GlSink, cmd: &GlCmd) {
+        let a = cmd.args;
         let mut pos = [0.0f32; 4];
 
-        if cmd.op as usize >= GL_NARGS.len() || cmd.nargs != GL_NARGS[cmd.op as usize] as u16 {
-            crate::dlog!(LogModule::Odyssey, "sgi-gl: command {} with {} arguments ignored", cmd.op, cmd.nargs);
+        if cmd.op as usize >= GL_NARGS.len() || a.len() != GL_NARGS[cmd.op as usize] as usize {
+            crate::dlog!(LogModule::Odyssey, "sgi-gl: command {} with {} arguments ignored", cmd.op, a.len());
             return;
         }
         match cmd.op as u32 {
             SGI_GL_OP_TEXCOORD2F | SGI_GL_OP_TEXCOORD3F | SGI_GL_OP_TEXCOORD4F => {
                 self.cur_texcoord[2] = 0.0;
                 self.cur_texcoord[3] = 1.0;
-                for i in 0..cmd.nargs as usize {
+                for i in 0..a.len() {
                     self.cur_texcoord[i] = gl_float(a[i]);
                 }
             }
@@ -1888,7 +1796,7 @@ impl GlContext {
                 // A byte c is c / 255 (OpenGL 1.2.1, table 2.6); 3ub's alpha is 1.
                 for i in 0..4usize {
                     self.cur_color[i] =
-                        if i == cmd.nargs as usize { 1.0 } else { (a[i] & 0xff) as f32 / 255.0 };
+                        if i == a.len() { 1.0 } else { (a[i] & 0xff) as f32 / 255.0 };
                 }
             }
             SGI_GL_OP_BEGIN => {
@@ -1913,29 +1821,31 @@ impl GlContext {
                     return;
                 }
                 if self.polygon.enabled != 0 && self.begin_mode == SGI_GL_POLYGON {
-                    let mut d = GlDraw::default();
+                    if self.polygon.failed == 0 && self.polygon.count >= 3 {
+                        let checked = self.draws_checked();
+                        let mut d = GlDraw::new(
+                            SGI_GL_POLYGON,
+                            self.polygon.count,
+                            &self.polygon.vertices,
+                            &self.cur,
+                            &self.polygon_stipple,
+                        );
 
-                    d.context = self.hw_id;
-                    d.mode = SGI_GL_POLYGON;
-                    d.count = self.polygon.count;
-                    d.vertices = P(self.polygon.vertices.as_mut_ptr());
-                    d.state = P(&mut self.cur as *mut GlDrawState);
-                    d.back_colors = false;
-                    d.point_size = self.point_size;
-                    d.line_width = self.line_width;
-                    d.point_smooth = self.raster_enables & SGI_GL_RASTER_POINT_SMOOTH != 0;
-                    d.line_smooth = self.raster_enables & SGI_GL_RASTER_LINE_SMOOTH != 0;
-                    d.polygon_smooth = self.raster_enables & SGI_GL_RASTER_POLYGON_SMOOTH != 0;
-                    d.polygon_modes = P(self.polygon_mode.as_mut_ptr());
-                    d.fill_by_triangle = true;
-                    d.polygon_stipple = P(self.polygon_stipple.as_mut_ptr());
-                    d.polygon_stipple_enabled = self.raster_enables & SGI_GL_RASTER_POLYGON_STIPPLE != 0;
-                    d.line_stipple_enabled = self.raster_enables & SGI_GL_RASTER_LINE_STIPPLE != 0;
-                    d.line_stipple_repeat = self.line_stipple_repeat;
-                    d.line_stipple_pattern = self.line_stipple_pattern;
+                        d.context = self.hw_id;
+                        d.point_size = self.point_size;
+                        d.line_width = self.line_width;
+                        d.point_smooth = self.raster_enables & SGI_GL_RASTER_POINT_SMOOTH != 0;
+                        d.line_smooth = self.raster_enables & SGI_GL_RASTER_LINE_SMOOTH != 0;
+                        d.polygon_smooth = self.raster_enables & SGI_GL_RASTER_POLYGON_SMOOTH != 0;
+                        d.polygon_modes = Some(self.polygon_mode);
+                        d.fill_by_triangle = true;
+                        d.polygon_stipple_enabled = self.raster_enables & SGI_GL_RASTER_POLYGON_STIPPLE != 0;
+                        d.line_stipple_enabled = self.raster_enables & SGI_GL_RASTER_LINE_STIPPLE != 0;
+                        d.line_stipple_repeat = self.line_stipple_repeat;
+                        d.line_stipple_pattern = self.line_stipple_pattern;
 
-                    if self.polygon.failed == 0 && d.count >= 3 {
-                        self.draw_result(sink, &d);
+                        let result = sink.draw(&mut d);
+                        self.draw_result(checked, result);
                     }
                     self.polygon.polygon_release();
                 }
@@ -1955,10 +1865,10 @@ impl GlContext {
                 self.strip_swap = 0;
             }
             SGI_GL_OP_VERTEX2F | SGI_GL_OP_VERTEX3F | SGI_GL_OP_VERTEX4F => {
-                for i in 0..cmd.nargs as usize {
+                for i in 0..a.len() {
                     pos[i] = gl_float(a[i]);
                 }
-                self.vertex(sink, &pos, cmd.nargs as u32);
+                self.vertex(sink, &pos, a.len() as u32);
             }
             SGI_GL_OP_VERTEX2I => {
                 // Integer components convert to float unscaled (2.7).

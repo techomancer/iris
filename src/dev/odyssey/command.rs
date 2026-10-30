@@ -119,7 +119,7 @@ impl Board {
                     let opd = self.cmd_operand;
 
                     self.gl_feed(SGI_GL_OP_COLOR3UB as u16, &opd[..3]);
-                    let queried = self.gl_ctx.get(SGI_GL_CURRENT_COLOR, &mut colour, &mut n);
+                    let queried = self.gl().get(SGI_GL_CURRENT_COLOR, &mut colour, &mut n);
                     assert!(queried && n as usize == self.gl_colour.len());
                     let l = self.gl_colour.len();
                     self.gl_colour.copy_from_slice(&colour[..l]);
@@ -417,7 +417,7 @@ impl Board {
                     let slot = (self.gl_restart_total - self.gl_restart_absorb) as usize;
 
                     if slot < self.gl_restart_vertex.len() {
-                        self.gl_ctx.capture_vertex(
+                        self.gl_ctx.as_mut().expect("the GL context").capture_vertex(
                             self.gl_restart_type,
                             &xyz,
                             components,
@@ -685,7 +685,7 @@ impl Board {
             0x0444 => {
                 // Drop an outgoing primitive, without draw.
                 if self.cmd_operand[0] == 0 && !self.gl_integer_prim && !(self.gl_begin_open && self.gl_primitive == 9) {
-                    self.gl_ctx.discard_primitive();
+                    self.gl().discard_primitive();
                     self.gl_in_prim = false;
                     self.gl_begin_open = false;
                     self.gl_open_held = 0;
@@ -700,7 +700,7 @@ impl Board {
 
                 if type_ == 0xf {
                     if !self.gl_integer_prim && !(self.gl_begin_open && self.gl_primitive == 9) {
-                        self.gl_ctx.discard_primitive();
+                        self.gl().discard_primitive();
                         self.gl_in_prim = false;
                         self.gl_begin_open = false;
                         self.gl_open_held = 0;

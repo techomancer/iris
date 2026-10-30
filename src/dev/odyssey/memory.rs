@@ -7,6 +7,8 @@
 //! Ported from include/hw/display/sgi/board-memory.h in jamesbraid/qemu-sgi-origami.
 use super::*;
 
+use std::cell::Cell;
+
 pub const SGI_PLANE_NONE: u32 = u32::MAX;
 pub const SGI_PLANES_MAX: usize = 32;
 
@@ -311,5 +313,120 @@ impl Plane {
         self.base
             .wrapping_add((y as u64).wrapping_mul(self.stride as u64))
             .wrapping_add((x as u64).wrapping_mul(bpp as u64))
+    }
+}
+
+/// A pixel array's rows as a draw borrows them: the whole array, or the
+/// rows of one band of a banded draw. A band has every bands-th run of
+/// 2^SGI_SOFT_BAND_ROWS_SHIFT rows (SoftDraw::row_in_band()), so bands of
+/// one draw never share a row and can write theirs on separate threads.
+pub struct RowsMut<'a, T> {
+    /// Elements from the start of one row to the next.
+    stride: usize,
+    chunks: RowChunks<&'a mut [T]>,
+}
+
+enum RowChunks<S> {
+    Whole(S),
+    /// Indexed by row >> SGI_SOFT_BAND_ROWS_SHIFT; None for another band's.
+    Band(Vec<Option<S>>),
+}
+
+impl<'a, T> RowsMut<'a, T> {
+    pub fn new(data: &'a mut [T], stride: usize) -> Self {
+        RowsMut { stride, chunks: RowChunks::Whole(data) }
+    }
+
+    /// One RowsMut per band, band b holding its rows. Only whole rows split.
+    pub fn split(&mut self, bands: u32) -> Vec<RowsMut<'_, T>> {
+        let RowChunks::Whole(data) = &mut self.chunks else {
+            panic!("a band's rows split again");
+        };
+        let run = (self.stride << SGI_SOFT_BAND_ROWS_SHIFT).max(1);
+        let bands = bands as usize;
+        let n = data.len().div_ceil(run);
+        let mut out: Vec<Vec<Option<&mut [T]>>> = (0..bands).map(|_| (0..n).map(|_| None).collect()).collect();
+
+        for (i, chunk) in data.chunks_mut(run).enumerate() {
+            out[i % bands][i] = Some(chunk);
+        }
+        out.into_iter().map(|chunks| RowsMut { stride: self.stride, chunks: RowChunks::Band(chunks) }).collect()
+    }
+
+    /// The rows as one thread writes them.
+    pub fn view(&mut self) -> Rows<'_, T> {
+        let chunks = match &mut self.chunks {
+            RowChunks::Whole(data) => RowChunks::Whole(Cell::from_mut(&mut **data).as_slice_of_cells()),
+            RowChunks::Band(chunks) => RowChunks::Band(
+                chunks.iter_mut().map(|c| c.as_mut().map(|c| Cell::from_mut(&mut **c).as_slice_of_cells())).collect(),
+            ),
+        };
+        Rows { stride: self.stride, chunks }
+    }
+}
+
+/// RowsMut as one thread writes it, through shared references.
+pub struct Rows<'a, T> {
+    stride: usize,
+    chunks: RowChunks<&'a [Cell<T>]>,
+}
+
+impl<T> Rows<'_, T> {
+    /// The len elements at element `offset` of row y, when that row is
+    /// these rows' and long enough.
+    #[inline]
+    pub fn get(&self, y: usize, offset: usize, len: usize) -> Option<&[Cell<T>]> {
+        let (data, at) = match &self.chunks {
+            RowChunks::Whole(data) => (*data, y * self.stride + offset),
+            RowChunks::Band(chunks) => {
+                let chunk = (*chunks.get(y >> SGI_SOFT_BAND_ROWS_SHIFT)?)?;
+                (chunk, (y & ((1 << SGI_SOFT_BAND_ROWS_SHIFT) - 1)) * self.stride + offset)
+            }
+        };
+        data.get(at..)?.get(..len)
+    }
+}
+
+impl Rows<'_, u8> {
+    /// Plane p's word at (x, y), or 0 outside the plane or these rows.
+    #[inline]
+    pub fn plane_load(&self, p: &Plane, x: i32, y: i32) -> u32 {
+        if !p.contains(x, y) {
+            return 0;
+        }
+        let bpp = plane_bpp(p.format);
+        let Some(cells) = self.get(y as usize, x as usize * bpp as usize, bpp as usize) else {
+            return 0;
+        };
+        let mut bytes = [0u8; 4];
+        for (b, c) in bytes.iter_mut().zip(cells) {
+            *b = c.get();
+        }
+        p.get(bpp, &bytes)
+    }
+
+    /// Store plane p's word at (x, y), dropped outside the plane or these rows.
+    #[inline]
+    pub fn plane_store(&self, p: &Plane, x: i32, y: i32, word: u32) {
+        if !p.contains(x, y) {
+            return;
+        }
+        let bpp = plane_bpp(p.format);
+        let Some(cells) = self.get(y as usize, x as usize * bpp as usize, bpp as usize) else {
+            return;
+        };
+        let mut bytes = [0u8; 4];
+        p.put(bpp, word, &mut bytes);
+        for (c, b) in cells.iter().zip(bytes) {
+            c.set(b);
+        }
+    }
+}
+
+impl BoardMemory {
+    /// Plane p's rows, which start at its base.
+    pub fn rows(&mut self, p: &Plane) -> RowsMut<'_, u8> {
+        let end = (p.base + p.len).min(self.size) as usize;
+        RowsMut::new(&mut self.bytes[p.base as usize..end], p.stride as usize)
     }
 }

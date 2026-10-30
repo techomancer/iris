@@ -361,7 +361,7 @@ impl SoftVertex {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Map and rasterize one aliased segment, already projected, with the
     /// provoking vertex's colour when flat shaded. Width follows the
     /// minor-axis shift and replication of 3.4.3. A smoothed segment takes the
@@ -369,7 +369,7 @@ impl SoftDraw {
     /// along its length.
     pub fn line_projected(&self, pa: &SoftVertex, pb: &SoftVertex, provoking: &[f32], offset: f64, stipple: Option<&mut SoftLineStipple>, client_clip: bool) {
         let mut stipple = stipple;
-        let st = &*self.st;
+        let st = self.st;
         let smooth = st.shade_model != SGI_GL_FLAT;
         let sub = self.rules.subpixel_bits as i32;
         let one_sub = (1i32 << sub) as f64;
@@ -425,12 +425,12 @@ impl SoftDraw {
         let mut texture_value = [0.0f64; 4];
         let mut texture_delta = [0.0f64; 4];
         let mut texture_length = 0.0f64;
-        if !self.texture_base.is_null()
+        if self.texture_base.is_some()
             && !a.texture_line_gradient(
                 &b,
                 sub as u32,
-                self.texture.volume,
-                self.texture.one_dimensional,
+                self.image().volume,
+                self.image().one_dimensional,
                 &mut texture_value,
                 &mut texture_delta,
                 &mut texture_length,
@@ -613,7 +613,7 @@ impl SoftDraw {
                     for k in 0..4 {
                         frag.rgba[k] = if smooth { (wa * a.rgba[k] + wb * b.rgba[k]) / (wa + wb) } else { flat[k] };
                     }
-                    if !self.texture_base.is_null() {
+                    if self.texture_base.is_some() {
                         let mut value = [0.0f64; 4];
                         let mut out = [0.0f64; 5];
                         let zero = [0.0f64; 4];
@@ -625,14 +625,14 @@ impl SoftDraw {
                             &value,
                             &texture_delta,
                             &zero,
-                            self.texture_base.width as f64 * soft_texture_lod_scale(self.texture.lod_scale_s),
-                            if self.texture.one_dimensional {
+                            self.base_level().width as f64 * soft_texture_lod_scale(self.image().lod_scale_s),
+                            if self.image().one_dimensional {
                                 0.0
                             } else {
-                                self.texture_base.height as f64 * soft_texture_lod_scale(self.texture.lod_scale_t)
+                                self.base_level().height as f64 * soft_texture_lod_scale(self.image().lod_scale_t)
                             },
-                            if self.texture.volume {
-                                self.texture_base.depth as f64 * soft_texture_lod_scale(self.texture.lod_scale_r)
+                            if self.image().volume {
+                                self.base_level().depth as f64 * soft_texture_lod_scale(self.image().lod_scale_r)
                             } else {
                                 0.0
                             },

@@ -1,12 +1,11 @@
-//! Pixel work that is not a GL primitive: pixel rectangles, bitmaps,
-//! clears and the X server's raster ops, each stored through the same
-//! fragment path as a triangle's pixels.
+//! Pixel work that is not a GL primitive: a draw's pixel estimate, clears
+//! and the X server's raster ops.
 //!
 //! Ported from hw/display/sgi/rasterizer.c in jamesbraid/qemu-sgi-origami.
 
 use super::*;
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// About how many pixels a draw's filled primitives cover: the area of each
     /// one with its vertices moved into the pixels the window owns, summed
     /// until it reaches limit. A vertex with no window position counts as
@@ -69,200 +68,6 @@ pub fn r2_clamp(val: f64, low: f64, high: f64) -> f64 {
     if val > high { high } else if val < low { low } else { val }
 }
 
-impl RasterRules {
-    /// A run of a bitmap's image (OpenGL 1.2.1, 3.7): a fragment for each set
-    /// bit, at the image's corner plus the bit's column and row, bounded by the
-    /// window the draw state's drawable owns and not by the viewport.
-    pub fn bitmap(&self, t: &RasterTarget, op: &RasterOp) {
-        let b = &op.bitmap;
-        let mut r = SoftDraw { rules: P::from_ref(self), t: P::from_ref(t), st: b.state, ..Default::default() };
-        let row_bytes: u32 = (b.width + 7) / 8;
-        let mut rgba_reported = false;
-        let mut texture_reports = 0u32;
-        let mut frag = SoftFrag::default();
-
-        frag.rgba = [b.rgba[0] as f64, b.rgba[1] as f64, b.rgba[2] as f64, b.rgba[3] as f64];
-        frag.texcoord = [b.texcoord[0] as f64, b.texcoord[1] as f64, b.texcoord[2] as f64, b.texcoord[3] as f64];
-        frag.index = b.index as f64;
-        frag.fog = b.distance as f64;
-
-        r.rgba_reported = P::new(&mut rgba_reported);
-        r.texture_reports = P::new(&mut texture_reports);
-        if !r.texture_setup(true) || !b.state.window(&mut r.win) || !t.soft_check_index(b.state.index_bits) {
-            return;
-        }
-        if !r.texture.is_null() {
-            r.texels = r.texture.soft_texel_cache_begin();
-        }
-        r.ntargets = r2_min(op.ntargets, SGI_GL_MAX_TARGETS);
-        r.targets = op.targets;
-        if !r.setup_ops() {
-            return;
-        }
-        let mut i = 0u32;
-        while i < b.count && row_bytes != 0 {
-            let byte = b.first.wrapping_add(i);
-            let row: i64 = (byte / row_bytes) as i64;
-            let col0: i64 = ((byte % row_bytes).wrapping_mul(8)) as i64;
-
-            if row >= b.height as i64 {
-                break;
-            }
-            let mut bit = 0i32;
-            while bit < 8 && col0 + (bit as i64) < b.width as i64 {
-                let px: i64 = b.x as i64 + col0 + bit as i64;
-                let py: i64 = b.y as i64 + row;
-                let byte_value = unsafe { *b.bytes.0.add(i as usize) } as i32;
-
-                bit += 1;
-                let bit_now = bit - 1;
-                if (byte_value & (0x80 >> bit_now)) == 0
-                    || px < (r.win.x0 - r.win.ox) as i64
-                    || px > (r.win.x1 - r.win.ox) as i64
-                    || py < (r.win.y0 - r.win.oy) as i64
-                    || py > (r.win.y1 - r.win.oy) as i64
-                {
-                    continue;
-                }
-                r.fragment_at(px as i32, py as i32, b.z as f64, &frag, 1.0, false);
-            }
-            i += 1;
-        }
-    }
-
-    pub fn pixels(&self, t: &RasterTarget, op: &RasterOp) {
-        let p = &op.pixels;
-        let image = !p.rgba.is_null()
-            || !p.rgba_float.is_null()
-            || !p.rgba_double.is_null()
-            || !p.depth.is_null()
-            || !p.stencil.is_null()
-            || !p.index.is_null();
-        let mut r = SoftDraw { rules: P::from_ref(self), t: P::from_ref(t), st: p.state, ..Default::default() };
-        let mut frag = SoftFrag::default();
-        let mut rgba_reported = false;
-        let mut texture_reports = 0u32;
-        let mut stencil_max = 0u32;
-        let mut stencil_mask = 0u32;
-        let ex = p.x + p.zoom[0] as f64 * p.width as f64;
-        let ey = p.y + p.zoom[1] as f64 * p.height as f64;
-
-        frag.fog = p.distance as f64;
-        frag.texcoord = [p.texcoord[0] as f64, p.texcoord[1] as f64, p.texcoord[2] as f64, p.texcoord[3] as f64];
-        r.rgba_reported = P::new(&mut rgba_reported);
-        r.texture_reports = P::new(&mut texture_reports);
-        if (p.stencil.is_null() && !r.texture_setup(true))
-            || (p.stencil.is_null() && !t.soft_check_index(p.state.index_bits))
-            || p.width == 0
-            || p.height == 0
-            || !image
-            || !p.x.is_finite()
-            || !p.y.is_finite()
-            || !p.zoom[0].is_finite()
-            || !p.zoom[1].is_finite()
-            || p.zoom[0] == 0.0
-            || p.zoom[1] == 0.0
-            || !p.state.window(&mut r.win)
-        {
-            return;
-        }
-        if !r.texture.is_null() {
-            r.texels = r.texture.soft_texel_cache_begin();
-        }
-        r.ntargets = r2_min(op.ntargets, SGI_GL_MAX_TARGETS);
-        r.targets = op.targets;
-        if !p.stencil.is_null() {
-            if !self.stencil_max(t, &mut stencil_max) {
-                return;
-            }
-            stencil_mask = p.state.stencil_write_mask & stencil_max;
-            if stencil_mask == 0 {
-                return;
-            }
-        } else if !r.setup_ops() {
-            return;
-        }
-        // Include lower/left centres and exclude upper/right centres (3.6.4).
-        let bx0 = r2_max((r2_min(p.x, ex) - 0.5).ceil(), (r.win.x0 as i64 - r.win.ox as i64) as f64);
-        let by0 = r2_max((r2_min(p.y, ey) - 0.5).ceil(), (r.win.y0 as i64 - r.win.oy as i64) as f64);
-        let bx1 = r2_min((r2_max(p.x, ex) - 0.5).ceil() - 1.0, (r.win.x1 as i64 - r.win.ox as i64) as f64);
-        let by1 = r2_min((r2_max(p.y, ey) - 0.5).ceil() - 1.0, (r.win.y1 as i64 - r.win.oy as i64) as f64);
-        if bx0 > bx1 || by0 > by1 {
-            return;
-        }
-        // Visible bounds keep conversion and work independent of zoom size.
-        let x0 = bx0 as i64;
-        let y0 = by0 as i64;
-        let x1 = bx1 as i64;
-        let y1 = by1 as i64;
-        let mut y = y0;
-        while y <= y1 {
-            let cy = y;
-            y += 1;
-            let qy = (cy as f64 + 0.5 - p.y) / p.zoom[1] as f64;
-            let sy = if p.zoom[1] > 0.0 { qy.floor() } else { qy.ceil() - 1.0 };
-
-            if !(sy >= 0.0 && sy < p.height as f64) {
-                continue;
-            }
-            let mut x = x0;
-            while x <= x1 {
-                let cx = x;
-                x += 1;
-                let qx = (cx as f64 + 0.5 - p.x) / p.zoom[0] as f64;
-                let sx = if p.zoom[0] > 0.0 { qx.floor() } else { qx.ceil() - 1.0 };
-
-                if !(sx >= 0.0 && sx < p.width as f64) {
-                    continue;
-                }
-                let at: u64 = (sy as u64).wrapping_mul(p.width as u64).wrapping_add(sx as u32 as u64);
-                if !p.stencil.is_null() {
-                    let px = r.win.ox + cx as i32;
-                    let py = r.win.oy + cy as i32;
-
-                    if r.owned_at(cx as i32, cy as i32) {
-                        let old = (t.load_stencil.unwrap())(t.opaque, px, py);
-                        let src = unsafe { *p.stencil.0.add(at as usize) };
-
-                        (t.store_stencil.unwrap())(t.opaque, px, py, ((old & !stencil_mask) | (src & stencil_mask)) & stencil_max);
-                    }
-                    continue;
-                }
-                frag.index = if !p.index.is_null() {
-                    (unsafe { *p.index.0.add(at as usize) }) as f64
-                } else {
-                    p.colour_index as f64
-                };
-                let rgba: u32 = if !p.rgba.is_null() { unsafe { *p.rgba.0.add(at as usize) } } else { 0 };
-                for k in 0..4 {
-                    let component: f64 = if !p.depth.is_null() {
-                        p.colour[k] as f64
-                    } else if !p.rgba_double.is_null() {
-                        unsafe { (*p.rgba_double.0.add(at as usize))[k] }
-                    } else if !p.rgba_float.is_null() {
-                        unsafe { (*p.rgba_float.0.add(at as usize))[k] as f64 }
-                    } else {
-                        ((rgba >> (24 - 8 * k)) & 0xff) as f64 / 255.0
-                    };
-
-                    frag.rgba[k] = r2_clamp(component * p.transfer.scale[k] as f64 + p.transfer.bias[k] as f64, 0.0, 1.0);
-                }
-                let z: f64 = if !p.depth.is_null() {
-                    r2_clamp(
-                        unsafe { *p.depth.0.add(at as usize) } * p.depth_scale as f64 + p.depth_bias as f64,
-                        0.0,
-                        1.0,
-                    )
-                } else {
-                    p.z as f64
-                };
-
-                r.fragment_at(cx as i32, cy as i32, z, &frag, 1.0, false);
-            }
-        }
-    }
-}
-
 impl ClipList {
     /// Whether one rectangle of a non-empty clip list holds all of row y from
     /// x0 to x1, so that each pixel's own test would pass.
@@ -281,7 +86,7 @@ impl ClipList {
 /// A clear's decided values, which every row of it stores.
 pub struct SoftClear<'a> {
     pub rules: &'a RasterRules,
-    pub t: &'a RasterTarget,
+    pub t: &'a RasterTarget<'a>,
     pub op: &'a RasterOp,
     pub colour: bool,
     pub depth: bool,
@@ -295,14 +100,14 @@ pub struct SoftClear<'a> {
     pub ntargets: u32,
     pub depth_value: u32,
     pub clear: RasterColour,
-    pub rgba_reported: P<bool>,
+    pub rgba_reported: std::sync::atomic::AtomicBool,
 }
 
 impl SoftClear<'_> {
-    /// The rows of a clear that are band's of bands (SoftDraw::row_in_band()).
-    pub fn rows(&self, band: u32, bands: u32) {
+    /// The rows of a clear that are band's of bands (SoftDraw::row_in_band()),
+    /// stored to px.
+    pub fn rows(&self, px: &dyn Planes, band: u32, bands: u32) {
         let rules = self.rules;
-        let t = self.t;
         let op = self.op;
         // Only a read fills it, and only a read's targets are read back.
         let mut dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
@@ -319,27 +124,24 @@ impl SoftClear<'_> {
 
                 if self.rgba && self.rgba_read {
                     dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
-                    if !rules.rgba_load(t, &op.targets, self.ntargets, x, y, &mut dest, self.rgba_reported.get()) {
+                    if !rules.rgba_load(px, &op.targets, self.ntargets, x, y, &mut dest, &self.rgba_reported) {
                         continue;
                     }
                 }
                 if self.depth {
-                    (t.store_depth.unwrap())(t.opaque, x, y, self.depth_value);
+                    px.store_depth(x, y, self.depth_value);
                 }
                 if self.stencil {
                     let smask = op.stencil_mask & self.smax;
 
-                    (t.store_stencil.unwrap())(
-                        t.opaque,
-                        x,
-                        y,
-                        ((t.load_stencil.unwrap())(t.opaque, x, y) & !smask & self.smax) | (op.clear_stencil & smask),
-                    );
+                    px.store_stencil(x, y, (px.load_stencil(x, y) & !smask & self.smax) | (op.clear_stencil & smask));
                 }
                 let mut i = 0u32;
                 while self.colour && i < self.ntargets {
+                    let target = op.targets[i as usize];
+
                     if op.index_bits != 0 {
-                        (t.store_index.unwrap())(t.opaque, op.targets[i as usize], x, y, op.clear_index, op.index_mask);
+                        px.store_index(target, x, y, op.clear_index, op.index_mask);
                     } else if self.rgba {
                         let mut out = self.clear;
 
@@ -348,17 +150,11 @@ impl SoftClear<'_> {
                                 out.component[k] = dest[i as usize].component[k];
                             }
                         }
-                        (t.store_rgba.unwrap())(t.opaque, op.targets[i as usize], x, y, &out);
+                        px.store_rgba(target, x, y, &out);
                     } else if self.mask == rules.colour_bits() {
-                        (t.store_colour.unwrap())(t.opaque, op.targets[i as usize], x, y, self.rgb);
+                        px.store_colour(target, x, y, self.rgb);
                     } else {
-                        (t.store_colour.unwrap())(
-                            t.opaque,
-                            op.targets[i as usize],
-                            x,
-                            y,
-                            (self.rgb & self.mask) | ((t.load_colour.unwrap())(t.opaque, op.targets[i as usize], x, y) & !self.mask),
-                        );
+                        px.store_colour(target, x, y, (self.rgb & self.mask) | (px.load_colour(target, x, y) & !self.mask));
                     }
                     i += 1;
                 }
@@ -367,22 +163,14 @@ impl SoftClear<'_> {
     }
 }
 
-/// SoftClear::rows() as the band pool calls it.
-pub fn soft_clear_rows_band(opaque: Opaque, band: u32, bands: u32) {
-    let c: &SoftClear = from_opaque(opaque);
-
-    c.rows(band, bands);
-}
-
 impl RasterRules {
     /// CLEAR writes the clear colour under the colour mask, or in colour-index
     /// mode the clear index under the index mask, to the op's targets, the
     /// clear depth to the depth plane and the clear stencil value under its
     /// mask to the stencil buffer, where the planes have one, at every pixel of
-    /// its rectangle its clip list keeps. BITMAP draws its run of a bitmap, and
-    /// PIXELS draws a zoomed RGBA rectangle. The other kinds are not executed
-    /// here yet.
-    pub fn raster(&self, t: &RasterTarget, op: &RasterOp) {
+    /// its rectangle its clip list keeps. The other kinds are not executed
+    /// here.
+    pub fn raster(&self, t: &RasterTarget, planes: &mut dyn PlaneStore, op: &RasterOp) {
         let mut colour = op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT != 0;
         let depth = op.clear_buffers & SGI_GL_DEPTH_BUFFER_BIT != 0;
         let mut stencil = op.clear_buffers & SGI_GL_STENCIL_BUFFER_BIT != 0;
@@ -390,13 +178,12 @@ impl RasterRules {
         let mut smax = 0u32;
         let mut mask = self.colour_bits();
         let rgba_mask = self.rgba_mask(op.clear_colour_mask);
-        let rgba = op.index_bits == 0 && t.store_rgba.is_some();
+        let rgba = op.index_bits == 0 && t.store_rgba;
         let rgba_read = colour
             && op.ntargets != 0
             && rgba_mask != 0
             && rgba_mask != self.rgba_mask(SGI_GL_COLOUR_MASK_ALL);
         let ntargets = r2_min(op.ntargets, SGI_GL_MAX_TARGETS);
-        let mut rgba_reported = false;
         let mut clear = RasterColour::default();
 
         if !self.check_rules() {
@@ -404,14 +191,6 @@ impl RasterRules {
         }
         // After the check: the depth maximum shifts by 32 - depth_bits.
         let depth_value = op.clear_depth24 & self.depth_max();
-        if op.kind == SGI_RASTER_PIXELS {
-            self.pixels(t, op);
-            return;
-        }
-        if op.kind == SGI_RASTER_BITMAP {
-            self.bitmap(t, op);
-            return;
-        }
         if op.kind != SGI_RASTER_CLEAR {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: raster op of kind {} is not executed", op.kind);
             return;
@@ -432,7 +211,7 @@ impl RasterRules {
             let c = [op.clear_rgba[0] as f64, op.clear_rgba[1] as f64, op.clear_rgba[2] as f64];
 
             mask = self.colour_mask(op.clear_colour_mask);
-            if !rgba && mask != self.colour_bits() && mask != 0 && t.load_colour.is_none() {
+            if !rgba && mask != self.colour_bits() && mask != 0 && !t.load_colour {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: a partial colour mask needs planes that can be read back; cleared without it");
                 mask = self.colour_bits();
             }
@@ -457,7 +236,7 @@ impl RasterRules {
             ntargets,
             depth_value,
             clear,
-            rgba_reported: P::new(&mut rgba_reported),
+            rgba_reported: Default::default(),
         };
         let bands = soft_bands();
         if !t.concurrent_pixels
@@ -465,9 +244,9 @@ impl RasterRules {
             || op.y1 < op.y0
             || op.x1 < op.x0
             || ((op.x1 - op.x0 + 1) as u64) * ((op.y1 - op.y0 + 1) as u64) < t.soft_band_min_pixels()
-            || !soft_bands_run(soft_clear_rows_band, P::from_ref(&rows).opaque(), bands)
+            || !soft_bands_run_split(planes, bands, &|band, store| rows.rows(&*store.planes(), band, bands))
         {
-            rows.rows(0, 1);
+            rows.rows(&*planes.planes(), 0, 1);
         }
     }
 }

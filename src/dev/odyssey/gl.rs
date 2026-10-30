@@ -13,9 +13,10 @@ fn cmax<T: PartialOrd>(a: T, b: T) -> T {
     if a > b { a } else { b }
 }
 
+/// One level's texels in the object store: `width` by `height` words from
+/// word `offset`, rows `stride` words apart.
 #[derive(Clone, Copy, Default)]
 pub struct Texture {
-    pub s: P<Board>,
     pub offset: u32,
     pub stride: u32,
     pub width: u32,
@@ -36,7 +37,6 @@ pub struct TextureDetailWeight {
 
 #[derive(Clone, Copy, Default)]
 pub struct TextureVolume {
-    pub s: P<Board>,
     pub base: u32,
     pub stride_units: u32,
     pub level_word2: u32,
@@ -55,19 +55,44 @@ pub struct TextureVolume {
     pub detail_weight: TextureDetailWeight,
 }
 
-/// `volume` comes first (repr(C)) so one opaque pointer serves both the
-/// post-filter callback and the 3D reader.
+/// A GlTexPyramid's shape: its levels are the first `count` of
+/// TextureChain::levels.
+#[derive(Clone, Copy, Default)]
+pub struct PyramidShape {
+    pub count: u32,
+    pub base_level: u32,
+    pub max_level: u32,
+    pub min_lod: f64,
+    pub max_lod: f64,
+}
+
+/// Where a draw's texture lives (Board::texture_setup()).
 #[derive(Clone, Default)]
-#[repr(C)]
 pub struct TextureChain {
-    /// Also supplies the state pointer for the post-filter callback.
+    /// The level-zero volume, and the post-filter and detail weight state.
     pub volume: TextureVolume,
     pub volumes: [TextureVolume; SGI_GL_TEX_LEVELS_MAX as usize],
     pub storage: [Texture; SGI_GL_TEX_LEVELS_MAX as usize],
     pub levels: [GlTexLevel; SGI_GL_TEX_LEVELS_MAX as usize],
-    pub pyramid: GlTexPyramid,
+    pub pyramid: Option<PyramidShape>,
     pub detail_storage: Texture,
     pub detail_image: GlTexLevel,
+}
+
+impl TextureChain {
+    /// image with this chain's pyramid.
+    pub fn image<'a>(&'a self, image: &GlTexImage<'static>) -> GlTexImage<'a> {
+        let mut image: GlTexImage<'a> = *image;
+
+        image.pyramid = self.pyramid.map(|p| GlTexPyramid {
+            levels: &self.levels[..p.count as usize],
+            base_level: p.base_level,
+            max_level: p.max_level,
+            min_lod: p.min_lod,
+            max_lod: p.max_lod,
+        });
+        image
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -138,20 +163,9 @@ impl Board {
         }
     }
 
-    /// A colour-index GL draw to the id-plane destination: an overlay
-    /// context's drawing (ODSY_OVERLAY_MODE_BASE). Buffer 1 is the overlay
-    /// pixel byte and takes the index's low eight bits; the id byte is the X
-    /// server's alone, so a GL write to buffer 0 is reported and dropped.
-    pub fn gl_store_aux(&mut self, target: ColourTarget, x: i32, y: i32, colour: u32) {
-        if target == ODSY_AUX_OVERLAY_BUFFER {
-            let at = (y as i64 as u64).wrapping_mul(SGI_ODYSSEY_WIDTH as u64).wrapping_add(x as i64 as u64);
-            self.overlay[at as usize] = (colour & 0xff) as u8;
-        }
-    }
-
-    /// What the colour hooks below decline, reported once, from the draw rather
-    /// than from a pixel: the conditions are fixed for the whole draw, and the
-    /// hooks then only store. colour says whether the draw writes colour at
+    /// What GlPlanes declines, reported once, from the draw rather than from
+    /// a pixel: the conditions are fixed for the whole draw, and GlPlanes
+    /// then only stores. colour says whether the draw writes colour at
     /// all.
     pub fn gl_report_refusals(&mut self, colour: bool) {
         let index_mask = self.gl_write_mask & ODSY_WRITE_INDEX_MASK;
@@ -177,67 +191,237 @@ impl Board {
     }
 }
 
-pub fn gl_store_colour(opaque: Opaque, target: ColourTarget, x: i32, y: i32, colour: u32) {
-    let s = from_opaque::<Board>(opaque);
-    let mask = (s.gl_write_mask >> ODSY_WRITE_COLOUR_SHIFT) & ODSY_WRITE_COLOUR_MASK;
-
-    if mask == 0 || target >= ODSY_BUFFERS || !s.pixel_allowed(x as i64, y as i64) {
-        return;
-    }
-    if s.gl_to_aux() {
-        s.gl_store_aux(target, x, y, colour);
-        return;
-    }
-    s.buffer_store(target, x as i64, y as i64, colour & ODSY_INDEX_MASK);
+/// The board state a GL draw tests and stores its pixels under, fixed for
+/// the whole draw.
+#[derive(Clone, Copy)]
+pub struct GlPixelState<'a> {
+    pub did: &'a [u8],
+    pub id_compare: u32,
+    pub clip_rect: [ClipRect; SGI_ODYSSEY_CLIP_RECTS as usize],
+    pub clip_kept: u32,
+    pub write_mask: u32,
+    /// Board::gl_to_aux() for the draw.
+    pub to_aux: bool,
+    pub fog: [u32; 6],
+    pub colour: [Plane; ODSY_BUFFERS as usize],
+    pub depth: Plane,
+    pub stencil: Plane,
 }
 
-/// The shared renderer supplies all four already quantized channel bytes.
-pub fn gl_store_rgba(opaque: Opaque, target: ColourTarget, x: i32, y: i32, colour: &RasterColour) {
-    let s = from_opaque::<Board>(opaque);
-    let c = &colour.component;
-    let allowed = target < ODSY_BUFFERS && s.pixel_allowed(x as i64, y as i64);
-
-    if allowed && !s.gl_to_aux() {
-        s.buffer_store(
-            target,
-            x as i64,
-            y as i64,
-            (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3],
-        );
+impl GlPixelState<'_> {
+    /// Board::pixel_allowed(), from the draw's copy of its state.
+    pub fn pixel_allowed(&self, x: i64, y: i64) -> bool {
+        x >= 0
+            && y >= 0
+            && x < SGI_ODYSSEY_WIDTH as i64
+            && y < SGI_ODYSSEY_HEIGHT as i64
+            && id_compare_passes(self.did, self.id_compare, x, y)
+            && self.clip_rect[..self.clip_kept as usize]
+                .iter()
+                .any(|r| x >= r.x0 as i64 && x <= r.x1 as i64 && y >= r.y0 as i64 && y <= r.y1 as i64)
     }
 }
 
-pub fn gl_load_rgba(opaque: Opaque, target: ColourTarget, x: i32, y: i32, colour: &mut RasterColour) -> bool {
-    let s = from_opaque::<Board>(opaque);
+/// The board's planes as a GL draw borrows them: the two colour buffers,
+/// the model depth and stencil planes and the overlay byte, whole or one
+/// band's rows of each.
+pub struct GlPixels<'a> {
+    pub state: GlPixelState<'a>,
+    pub colour: [RowsMut<'a, u8>; ODSY_BUFFERS as usize],
+    pub depth: RowsMut<'a, u8>,
+    pub stencil: RowsMut<'a, u8>,
+    pub overlay: RowsMut<'a, u8>,
+}
 
-    if target >= ODSY_BUFFERS {
-        return false;
+impl PlaneStore for GlPixels<'_> {
+    fn planes(&mut self) -> Box<dyn Planes + '_> {
+        let [c0, c1] = &mut self.colour;
+
+        Box::new(GlPlanes {
+            state: self.state,
+            colour: [c0.view(), c1.view()],
+            depth: self.depth.view(),
+            stencil: self.stencil.view(),
+            overlay: self.overlay.view(),
+        })
     }
-    let mem = s.buffer_mem(target);
-    let p = match s.buffer_plane(target) {
-        Some(p) => p,
-        None => return false,
-    };
-    // Invalid storage reads as zero through BoardMemory::plane_load(), not success.
-    if mem.bytes.is_empty() || !p.contains(x, y) {
-        return false;
+
+    fn split(&mut self, bands: u32) -> Vec<Box<dyn PlaneStore + '_>> {
+        let [c0, c1] = &mut self.colour;
+        let mut c0 = c0.split(bands).into_iter();
+        let mut c1 = c1.split(bands).into_iter();
+        let mut depth = self.depth.split(bands).into_iter();
+        let mut stencil = self.stencil.split(bands).into_iter();
+        let mut overlay = self.overlay.split(bands).into_iter();
+
+        (0..bands)
+            .map(|_| {
+                Box::new(GlPixels {
+                    state: self.state,
+                    colour: [c0.next().unwrap(), c1.next().unwrap()],
+                    depth: depth.next().unwrap(),
+                    stencil: stencil.next().unwrap(),
+                    overlay: overlay.next().unwrap(),
+                }) as Box<dyn PlaneStore + '_>
+            })
+            .collect()
     }
-    let offset = (y as i64 as u64).wrapping_mul(p.stride as u64).wrapping_add((x as i64 as u64).wrapping_mul(4));
-    if offset > p.len || 4 > p.len - offset {
-        return false;
+}
+
+/// GlPixels as one thread of a draw stores to them. Colour index draws use
+/// store_colour; RGBA draws store_rgba and load_rgba (Board::gl_target()).
+/// Their once-only reports are made before the draw
+/// (Board::gl_report_refusals()).
+pub struct GlPlanes<'a> {
+    state: GlPixelState<'a>,
+    colour: [Rows<'a, u8>; ODSY_BUFFERS as usize],
+    depth: Rows<'a, u8>,
+    stencil: Rows<'a, u8>,
+    overlay: Rows<'a, u8>,
+}
+
+impl Planes for GlPlanes<'_> {
+    fn store_colour(&self, target: ColourTarget, x: i32, y: i32, colour: u32) {
+        let s = &self.state;
+        let mask = (s.write_mask >> ODSY_WRITE_COLOUR_SHIFT) & ODSY_WRITE_COLOUR_MASK;
+
+        if mask == 0 || target >= ODSY_BUFFERS || !s.pixel_allowed(x as i64, y as i64) {
+            return;
+        }
+        if s.to_aux {
+            // A colour-index GL draw to the id-plane destination: an overlay
+            // context's drawing (ODSY_OVERLAY_MODE_BASE). Buffer 1 is the
+            // overlay pixel byte and takes the index's low eight bits; the id
+            // byte is the X server's alone, so a GL write to buffer 0 is
+            // reported and dropped.
+            if target == ODSY_AUX_OVERLAY_BUFFER {
+                if let Some(px) = self.overlay.get(y as usize, x as usize, 1) {
+                    px[0].set((colour & 0xff) as u8);
+                }
+            }
+            return;
+        }
+        self.colour[target as usize].plane_store(&s.colour[target as usize], x, y, colour & ODSY_INDEX_MASK);
     }
-    let at = match p.base.checked_add(offset) {
-        Some(at) => at,
-        None => return false,
-    };
-    if at > mem.size || 4 > mem.size - at {
-        return false;
+
+    /// The shared renderer supplies all four already quantized channel bytes.
+    fn store_rgba(&self, target: ColourTarget, x: i32, y: i32, colour: &RasterColour) {
+        let s = &self.state;
+        let c = &colour.component;
+
+        if target < ODSY_BUFFERS && s.pixel_allowed(x as i64, y as i64) && !s.to_aux {
+            let word = (c[0] << 24) | (c[1] << 16) | (c[2] << 8) | c[3];
+
+            self.colour[target as usize].plane_store(&s.colour[target as usize], x, y, word);
+        }
     }
-    let word = mem.plane_load(&p, x, y);
-    for i in 0..4u32 {
-        colour.component[i as usize] = (word >> (24 - 8 * i)) & 0xff;
+
+    /// Storage the plane does not reach reads as nothing, not as zero.
+    fn load_rgba(&self, target: ColourTarget, x: i32, y: i32) -> Option<RasterColour> {
+        if target >= ODSY_BUFFERS {
+            return None;
+        }
+        let p = &self.state.colour[target as usize];
+        let rows = &self.colour[target as usize];
+        if !p.contains(x, y) || rows.get(y as usize, x as usize * 4, 4).is_none() {
+            return None;
+        }
+        let word = rows.plane_load(p, x, y);
+        let mut colour = RasterColour::default();
+        for i in 0..4u32 {
+            colour.component[i as usize] = (word >> (24 - 8 * i)) & 0xff;
+        }
+        Some(colour)
     }
-    true
+
+    /// The depth plane (set up by Board::allocate()): 24-bit depth, 0 nearest,
+    /// through the same pixel test as a colour write. It is a model plane
+    /// because the board memory the real depth buffer occupies is not known.
+    fn load_depth(&self, x: i32, y: i32) -> u32 {
+        self.depth.plane_load(&self.state.depth, x, y)
+    }
+
+    fn store_depth(&self, x: i32, y: i32, depth: u32) {
+        // The overlay has no depth; an overlay clear leaves the main depth.
+        if !self.state.to_aux && self.state.pixel_allowed(x as i64, y as i64) {
+            self.depth.plane_store(&self.state.depth, x, y, depth & ODSY_DEPTH24_MAX);
+        }
+    }
+
+    /// The stencil plane (set up by Board::allocate()): 8 bits, through the
+    /// same pixel test as a depth write. A model plane: where the board keeps
+    /// its stencil planes is not known.
+    fn load_stencil(&self, x: i32, y: i32) -> u32 {
+        self.stencil.plane_load(&self.state.stencil, x, y)
+    }
+
+    fn store_stencil(&self, x: i32, y: i32, stencil: u32) {
+        if self.state.pixel_allowed(x as i64, y as i64) {
+            self.stencil.plane_store(&self.state.stencil, x, y, stencil & ODSY_STENCIL_MAX);
+        }
+    }
+
+    /// Experimental policy; the board's scale sign and clamps are unmeasured.
+    fn fog_factor(&self, window_z: f32, _eye_z: f32) -> f32 {
+        let w = &self.state.fog;
+        let scale = if (w[2] & 0xffffff) != 0 {
+            odyssey_f32(((w[2] & 0xffffff) << 5).wrapping_add(96u32 << 23)).abs()
+        } else {
+            0.0
+        };
+        let mut t = (scale * window_z as f64 + sextract32(w[3], 0, 12) as f64 / 256.0)
+            * 2.0f64.powi(((w[3] >> 12) & 7) as i32);
+        let p = [
+            sextract32(w[4] >> 12, 0, 12) as f64 / 256.0,
+            sextract32(w[4], 0, 12) as f64 / 256.0,
+            sextract32(w[5] >> 12, 0, 12) as f64 / 256.0,
+            sextract32(w[5], 0, 12) as f64 / 256.0,
+        ];
+
+        t = t.clamp(0.0, 1.0);
+        let u = 1.0 - t;
+        let f = p[0] * u * u * u + 3.0 * p[1] * u * u * t + 3.0 * p[2] * u * t * t + p[3] * t * t * t;
+        (if f >= 1.0 { 1.0 } else if f > 0.0 { f } else { 0.0 }) as f32
+    }
+}
+
+impl Board {
+    /// The board's planes as a GL draw borrows them, and, for a textured
+    /// draw, its texels in chain.
+    pub fn gl_parts<'a>(&'a mut self, chain: Option<&'a TextureChain>) -> (GlPixels<'a>, Option<BoardTexels<'a>>) {
+        let state = GlPixelState {
+            did: &[],
+            id_compare: self.id_compare,
+            clip_rect: self.clip_rect,
+            clip_kept: self.clip_kept,
+            write_mask: self.gl_write_mask,
+            to_aux: self.gl_to_aux(),
+            fog: self.gl_fog,
+            colour: [
+                self.mem.plane(self.colour_plane).expect("the colour plane"),
+                self.buffer1_mem.plane(self.buffer1_plane).expect("colour buffer 1's plane"),
+            ],
+            depth: self.depth_mem.plane(self.depth_plane).expect("the depth plane"),
+            stencil: self.stencil_mem.plane(self.stencil_plane).expect("the stencil plane"),
+        };
+        let texels = chain.map(|chain| BoardTexels {
+            chain,
+            obj: &self.obj_mem.bytes,
+            obj_words: self.obj_mem.size / 4,
+            slice_offset: &self.tex_slice_offset,
+            slice_width: &self.tex_slice_width,
+            colour_table: &self.tex_colour_table,
+            scale_bias: &self.tex_scale_bias,
+        });
+        let pixels = GlPixels {
+            state: GlPixelState { did: &self.did, ..state },
+            colour: [self.mem.rows(&state.colour[0]), self.buffer1_mem.rows(&state.colour[1])],
+            depth: self.depth_mem.rows(&state.depth),
+            stencil: self.stencil_mem.rows(&state.stencil),
+            overlay: RowsMut::new(&mut self.overlay, SGI_ODYSSEY_WIDTH as usize),
+        };
+        (pixels, texels)
+    }
 }
 
 impl Board {
@@ -279,77 +463,6 @@ impl Board {
     }
 }
 
-/// The depth plane (set up by Board::allocate()): 24-bit depth, 0 nearest, through
-/// the same pixel test as a colour write. It is a model plane because the
-/// board memory the real depth buffer occupies is not known.
-pub fn gl_load_depth(opaque: Opaque, x: i32, y: i32) -> u32 {
-    let s = from_opaque::<Board>(opaque);
-    match s.depth_mem.plane(s.depth_plane) {
-        Some(p) => s.depth_mem.plane_load(&p, x, y),
-        None => 0,
-    }
-}
-
-pub fn gl_store_depth(opaque: Opaque, x: i32, y: i32, depth: u32) {
-    let s = from_opaque::<Board>(opaque);
-
-    // The overlay has no depth; an overlay clear leaves the main depth.
-    if s.gl_to_aux() {
-        return;
-    }
-    if s.pixel_allowed(x as i64, y as i64) {
-        if let Some(p) = s.depth_mem.plane(s.depth_plane) {
-            s.depth_mem.plane_store(&p, x, y, depth & ODSY_DEPTH24_MAX);
-        }
-    }
-}
-
-/// The stencil plane (set up by Board::allocate()): 8 bits, through the same pixel
-/// test as a depth write. A model plane: where the board keeps its stencil
-/// planes is not known.
-pub fn gl_load_stencil(opaque: Opaque, x: i32, y: i32) -> u32 {
-    let s = from_opaque::<Board>(opaque);
-    match s.stencil_mem.plane(s.stencil_plane) {
-        Some(p) => s.stencil_mem.plane_load(&p, x, y),
-        None => 0,
-    }
-}
-
-pub fn gl_store_stencil(opaque: Opaque, x: i32, y: i32, stencil: u32) {
-    let s = from_opaque::<Board>(opaque);
-
-    if s.pixel_allowed(x as i64, y as i64) {
-        if let Some(p) = s.stencil_mem.plane(s.stencil_plane) {
-            s.stencil_mem.plane_store(&p, x, y, stencil & ODSY_STENCIL_MAX);
-        }
-    }
-}
-
-/// Experimental policy; the board's scale sign and clamps are unmeasured.
-pub fn gl_fog_factor(opaque: Opaque, window_z: f32, eye_z: f32) -> f32 {
-    let s = from_opaque::<Board>(opaque);
-    let w = &s.gl_fog;
-    let scale = if (w[2] & 0xffffff) != 0 {
-        odyssey_f32(((w[2] & 0xffffff) << 5).wrapping_add(96u32 << 23)).abs()
-    } else {
-        0.0
-    };
-    let mut t = (scale * window_z as f64 + sextract32(w[3], 0, 12) as f64 / 256.0)
-        * 2.0f64.powi(((w[3] >> 12) & 7) as i32);
-    let p = [
-        sextract32(w[4] >> 12, 0, 12) as f64 / 256.0,
-        sextract32(w[4], 0, 12) as f64 / 256.0,
-        sextract32(w[5] >> 12, 0, 12) as f64 / 256.0,
-        sextract32(w[5], 0, 12) as f64 / 256.0,
-    ];
-
-    let _ = eye_z;
-    t = if t >= 1.0 { 1.0 } else if t > 0.0 { t } else { 0.0 };
-    let u = 1.0 - t;
-    let f = p[0] * u * u * u + 3.0 * p[1] * u * u * t + 3.0 * p[2] * u * t * t + p[3] * t * t * t;
-    (if f >= 1.0 { 1.0 } else if f > 0.0 { f } else { 0.0 }) as f32
-}
-
 impl Board {
     /// An opaque polygon stipple (0x043f bit 4 with shape 0, the GL stipple):
     /// clear bits take the 0x0c21 constant colour, as the 2D path's opaque
@@ -376,21 +489,15 @@ impl Board {
         }
     }
 
-    /// The callbacks run serially, not on band workers.
-    /// Each stores only its own pixel's bytes. Their once-only reports are
-    /// made before the draw (Board::gl_report_refusals()).
-    pub fn gl_target(&mut self) -> RasterTarget {
+    /// What the board's planes offer a GL draw (GlPlanes).
+    pub fn gl_target(&mut self) -> RasterTarget<'static> {
         let index = self.gl_index_mode();
         let mut t = RasterTarget {
-            store_colour: if index { Some(gl_store_colour) } else { None },
-            store_rgba: if index { None } else { Some(gl_store_rgba) },
-            load_rgba: if index { None } else { Some(gl_load_rgba) },
-            load_depth: Some(gl_load_depth),
-            store_depth: Some(gl_store_depth),
-            load_stencil: Some(gl_load_stencil),
-            store_stencil: Some(gl_store_stencil),
-            fog_factor: Some(gl_fog_factor),
-            opaque: P::new(self).opaque(),
+            store_colour: index,
+            store_rgba: !index,
+            load_rgba: !index,
+            stencil: true,
+            fog_factor: true,
             concurrent_pixels: self.raster_bands,
             band_min_pixels: self.raster_band_pixels,
             mixed_frame: false,
@@ -402,28 +509,188 @@ impl Board {
     }
 }
 
-pub fn texture_read(opaque: Opaque, x: u32, y: u32, rgba: &mut u32) -> bool {
-    let texture = from_opaque::<Texture>(opaque);
-    let s = texture.s.get();
+/// The board's texture storage as a textured GL draw reads it: the levels
+/// Board::texture_setup() found in the object store, and the post-filter
+/// state.
+pub struct BoardTexels<'a> {
+    pub chain: &'a TextureChain,
+    pub obj: &'a [u8],
+    /// The object store's size in words.
+    pub obj_words: u64,
+    pub slice_offset: &'a [u32],
+    pub slice_width: &'a [u32],
+    pub colour_table: &'a [[u32; SGI_ODYSSEY_TEX_COLOUR_TABLE_ENTRIES as usize]; 2],
+    pub scale_bias: &'a [u32; 8],
+}
 
-    if x >= texture.width || y >= texture.height {
-        return false;
+impl BoardTexels<'_> {
+    /// Texel (x, y) of texture, packed RRGGBBAA.
+    pub fn read(&self, texture: &Texture, x: u32, y: u32) -> Option<u32> {
+        if x >= texture.width || y >= texture.height {
+            return None;
+        }
+        // y * stride cannot overflow 64 bits.
+        let word = y as u64 * texture.stride as u64 + texture.offset as u64 + x as u64;
+        let end = word + 1;
+        if end > texture.words as u64 || end > self.obj_words {
+            return None;
+        }
+        let at = (word * 4) as usize;
+        let rgba = u32::from_be_bytes(self.obj.get(at..at + 4)?.try_into().unwrap());
+        Some(if texture.base_format == SGI_GL_ALPHA { (rgba >> 24) & 0xff } else { rgba })
     }
-    // y * stride cannot overflow 64 bits.
-    let word = y as u64 * texture.stride as u64 + texture.offset as u64 + x as u64;
-    let end = word + 1;
-    if end > texture.words as u64 || end > s.obj_mem.size / 4 {
-        return false;
+
+    /// A border texel of level `level` of the 2D pyramid.
+    pub fn read_border_level(&self, level: u32, x: i32, y: i32) -> Option<u32> {
+        let mut texture = *self.chain.storage.get(level as usize)?;
+
+        if texture.height == 1 && !texture.border_rows {
+            if (texture.width != 2 && texture.width != 4 && texture.width != 8 && texture.width != 64)
+                || y != 0
+                || texture.offset == 0
+                || (x != -1 && x != texture.width as i32)
+            {
+                return None;
+            }
+            texture.offset -= 1;
+            texture.width += 2;
+            return self.read(&texture, (x + 1) as u32, 0);
+        }
+        if x < -1
+            || x > texture.width as i32
+            || y < -1
+            || y > texture.height as i32
+            || (x >= 0 && x < texture.width as i32 && y >= 0 && y < texture.height as i32)
+            || (texture.offset as u64) < texture.stride as u64 + 1
+        {
+            return None;
+        }
+        // Setup validates the complete captured 4-by-4 border region; for a
+        // larger bordered image it checks only that the rows exist.
+        texture.offset -= texture.stride + 1;
+        texture.width += 2;
+        texture.height += 2;
+        self.read(&texture, (x + 1) as u32, (y + 1) as u32)
     }
-    let at = (word * 4) as usize;
-    if at + 4 > s.obj_mem.bytes.len() {
-        return false;
+
+    /// Texel (x, y, z) of volume, its border included when border is set.
+    pub fn read_3d(&self, volume: &TextureVolume, x: i32, y: i32, z: i32, border: bool) -> Option<u32> {
+        if (border
+            && (x < -1 || y < -1 || z < -1 || x > volume.width as i32 || y > volume.height as i32 || z > volume.depth as i32))
+            || (!border
+                && (x < 0 || y < 0 || z < 0 || x >= volume.width as i32 || y >= volume.height as i32 || z >= volume.depth as i32))
+        {
+            return None;
+        }
+        // Setup found and checked the object of every slice a read in these
+        // bounds can reach (Board::texture_setup()), so the slice's place in
+        // the object store is read from its table, not looked up per texel.
+        let slice = if border { (z + 1) as u32 } else { z as u32 };
+        if slice >= volume.slices {
+            return None;
+        }
+        let at = (volume.first_slice + slice) as usize;
+        let stride = self.slice_width[at];
+        let width = if border { volume.width + 2 } else { volume.width };
+        let height = if border { volume.height + 2 } else { volume.height };
+        let px = if border { (x + 1) as u32 } else { x as u32 };
+        let py = if border { (y + 1) as u32 } else { y as u32 };
+        let offset = if border {
+            (stride as u64 * 15 + 15).checked_add(self.slice_offset[at] as u64)? as u32
+        } else {
+            self.slice_offset[at]
+        };
+        let texture = Texture {
+            offset,
+            stride,
+            width,
+            height,
+            base_format: volume.base_format,
+            words: volume.words,
+            border_rows: false,
+        };
+        self.read(&texture, px, py)
     }
-    *rgba = u32::from_be_bytes(s.obj_mem.bytes[at..][..4].try_into().unwrap());
-    if texture.base_format == SGI_GL_ALPHA {
-        *rgba = (*rgba >> 24) & 0xff;
+
+    /// The texture colour table: each normalized component indexes it after
+    /// filtering.
+    pub fn colour_table(&self, alpha: bool, rgba: &mut [f64; 4]) {
+        for channel in 0..3usize {
+            let index = (cmax(0.0, cmin(rgba[channel], 1.0)) * 255.0 + 0.5).floor() as u32;
+            let plane = (channel == 2) as usize;
+            let word = self.colour_table[plane][index as usize];
+            let component = if channel == 1 { word & 0xfff } else { (word >> 12) & 0xfff };
+
+            rgba[channel] = component as f64 / 4095.0;
+        }
+        if alpha {
+            let index = (cmax(0.0, cmin(rgba[3], 1.0)) * 255.0 + 0.5).floor() as u32;
+            let word = self.colour_table[1][index as usize];
+
+            rgba[3] = (word & 0xfff) as f64 / 4095.0;
+        }
     }
-    true
+
+    /// GL_SGIX_texture_scale_bias applies scale, then bias, then a clamp to
+    /// [0, 1] to the filtered texel, before the texture colour table and the
+    /// environment. That the board follows the extension's order and clamp is
+    /// INFERRED: no source gives the board's arithmetic.
+    pub fn scale_bias(&self, rgba: &mut [f64; 4]) {
+        for c in 0..4usize {
+            let scale = sextract32(self.scale_bias[c * 2], 0, ODSY_TEX_SCALE_BIAS_BITS) as f64;
+            let bias = sextract32(self.scale_bias[c * 2 + 1], 0, ODSY_TEX_SCALE_BIAS_BITS) as f64;
+
+            rgba[c] = (rgba[c] * scale + bias) / ODSY_TEX_SCALE_BIAS_ONE as f64;
+            rgba[c] = cmin(cmax(rgba[c], 0.0), 1.0);
+        }
+    }
+}
+
+impl Texels for BoardTexels<'_> {
+    fn texel(&self, level: Option<&GlTexLevel>, x: u32, y: u32) -> Option<u32> {
+        match level {
+            Some(l) if l.detail => (l.level == 0).then(|| self.read(&self.chain.detail_storage, x, y))?,
+            Some(l) => self.read(self.chain.storage.get(l.level as usize)?, x, y),
+            None => None,
+        }
+    }
+
+    fn border_texel(&self, level: Option<&GlTexLevel>, x: i32, y: i32) -> Option<u32> {
+        match level {
+            Some(l) if !l.detail => self.read_border_level(l.level, x, y),
+            _ => None,
+        }
+    }
+
+    fn texel_3d(&self, level: Option<&GlTexLevel>, x: u32, y: u32, z: u32) -> Option<u32> {
+        let volume = match level {
+            Some(l) => self.chain.volumes.get(l.level as usize)?,
+            None => &self.chain.volume,
+        };
+        self.read_3d(volume, x as i32, y as i32, z as i32, volume.border)
+    }
+
+    fn border_texel_3d(&self, level: Option<&GlTexLevel>, x: i32, y: i32, z: i32) -> Option<u32> {
+        match level {
+            None => self.read_3d(&self.chain.volume, x, y, z, true),
+            Some(_) => None,
+        }
+    }
+
+    fn post_filter(&self, rgba: &mut [f64; 4]) {
+        let volume = &self.chain.volume;
+
+        if volume.scale_bias {
+            self.scale_bias(rgba);
+        }
+        if volume.colour_table {
+            self.colour_table(volume.colour_table_alpha, rgba);
+        }
+    }
+
+    fn filter_weight(&self, lambda: f64) -> Option<f64> {
+        self.chain.volume.detail_weight.at(lambda)
+    }
 }
 
 /// A volume level's slices sit 64 << word 2 address units apart. OBSERVED
@@ -436,82 +703,6 @@ pub fn volume_slice_stride(level_word2: u32) -> u64 {
     64u64.wrapping_shl(level_word2)
 }
 
-impl TextureVolume {
-    pub fn read_3d_at(&self, x: i32, y: i32, z: i32, border: bool, rgba: &mut u32) -> bool {
-        let s = self.s.get();
-
-        if (border
-            && (x < -1 || y < -1 || z < -1 || x > self.width as i32 || y > self.height as i32 || z > self.depth as i32))
-            || (!border
-                && (x < 0 || y < 0 || z < 0 || x >= self.width as i32 || y >= self.height as i32 || z >= self.depth as i32))
-        {
-            return false;
-        }
-        // Setup found and checked the object of every slice a read in these
-        // bounds can reach (Board::texture_setup()), so the slice's place in
-        // the object store is read from its table, not looked up per texel.
-        let slice = if border { (z + 1) as u32 } else { z as u32 };
-        if slice >= self.slices {
-            return false;
-        }
-        let at = (self.first_slice + slice) as usize;
-        let stride = s.tex_slice_width[at];
-        let width = if border { self.width + 2 } else { self.width };
-        let height = if border { self.height + 2 } else { self.height };
-        let px = if border { (x + 1) as u32 } else { x as u32 };
-        let py = if border { (y + 1) as u32 } else { y as u32 };
-        let mut offset = 0u64;
-        if border {
-            offset = stride as u64 * 15 + 15;
-            offset = match offset.checked_add(s.tex_slice_offset[at] as u64) {
-                Some(o) => o,
-                None => return false,
-            };
-        }
-        let texture = Texture {
-            s: self.s,
-            offset: if border { offset as u32 } else { s.tex_slice_offset[at] },
-            stride,
-            width,
-            height,
-            base_format: self.base_format,
-            words: self.words,
-            border_rows: false,
-        };
-        texture_read(P::from_ref(&texture).opaque(), px, py, rgba)
-    }
-}
-
-pub fn texture_read_3d(opaque: Opaque, x: u32, y: u32, z: u32, rgba: &mut u32) -> bool {
-    let volume = from_opaque::<TextureVolume>(opaque);
-
-    volume.read_3d_at(x as i32, y as i32, z as i32, volume.border, rgba)
-}
-
-pub fn texture_read_border_3d(opaque: Opaque, x: i32, y: i32, z: i32, rgba: &mut u32) -> bool {
-    (from_opaque::<TextureVolume>(opaque)).read_3d_at(x, y, z, true, rgba)
-}
-
-pub fn texture_read_volume_level(opaque: Opaque, level: u32, x: u32, y: u32, z: u32, rgba: &mut u32) -> bool {
-    let chain = from_opaque::<TextureChain>(opaque);
-
-    (level as usize) < chain.volumes.len()
-        && texture_read_3d(P::from_ref(&chain.volumes[level as usize]).opaque(), x, y, z, rgba)
-}
-
-pub fn texture_read_level(opaque: Opaque, level: u32, x: u32, y: u32, rgba: &mut u32) -> bool {
-    let chain = from_opaque::<TextureChain>(opaque);
-
-    (level as usize) < chain.storage.len()
-        && texture_read(P::from_ref(&chain.storage[level as usize]).opaque(), x, y, rgba)
-}
-
-pub fn texture_read_detail(opaque: Opaque, level: u32, x: u32, y: u32, rgba: &mut u32) -> bool {
-    let chain = from_opaque::<TextureChain>(opaque);
-
-    level == 0 && texture_read(P::from_ref(&chain.detail_storage).opaque(), x, y, rgba)
-}
-
 /// The stock driver's two-point function (-4, 1/4), (0, 1/2) fills entry 0
 /// with 1/2, falls by 1/512 per entry to 1/4 at entry 128 and holds 1/4
 /// through entry 255. That is consistent with entry i serving LOD -i/32, so
@@ -520,76 +711,16 @@ pub fn texture_read_detail(opaque: Opaque, level: u32, x: u32, y: u32, rgba: &mu
 /// How the board indexes and interpolates the table at LODs in between is
 /// not known, so a nonconstant table refuses them.
 
-pub fn texture_detail_weight(opaque: Opaque, lambda: f64, weight: &mut f64) -> bool {
-    let volume = from_opaque::<TextureVolume>(opaque);
-    let detail = &volume.detail_weight;
-
-    if detail.constant || lambda <= ODSY_TEX_DETAIL_FUNCTION_LAST_LOD {
-        *weight = detail.last;
-        return true;
-    }
-    if lambda >= 0.0 {
-        *weight = detail.first;
-        return true;
-    }
-    false
-}
-
-pub fn texture_read_border_level(opaque: Opaque, level: u32, x: i32, y: i32, rgba: &mut u32) -> bool {
-    let chain = from_opaque::<TextureChain>(opaque);
-
-    if level as usize >= chain.storage.len() {
-        return false;
-    }
-    let mut texture = chain.storage[level as usize];
-    if texture.height == 1 && !texture.border_rows {
-        if (texture.width != 2 && texture.width != 4 && texture.width != 8 && texture.width != 64)
-            || y != 0
-            || texture.offset == 0
-            || (x != -1 && x != texture.width as i32)
-        {
-            return false;
+impl TextureDetailWeight {
+    /// The detail and sharpen weight at lambda, where the table gives one.
+    pub fn at(&self, lambda: f64) -> Option<f64> {
+        if self.constant || lambda <= ODSY_TEX_DETAIL_FUNCTION_LAST_LOD {
+            return Some(self.last);
         }
-        texture.offset -= 1;
-        texture.width += 2;
-        return texture_read(P::from_ref(&texture).opaque(), (x + 1) as u32, 0, rgba);
-    }
-    if x < -1
-        || x > texture.width as i32
-        || y < -1
-        || y > texture.height as i32
-        || (x >= 0 && x < texture.width as i32 && y >= 0 && y < texture.height as i32)
-        || (texture.offset as u64) < texture.stride as u64 + 1
-    {
-        return false;
-    }
-    // Setup validates the complete captured 4-by-4 border region; for a
-    // larger bordered image it checks only that the rows exist.
-    texture.offset -= texture.stride + 1;
-    texture.width += 2;
-    texture.height += 2;
-    texture_read(P::from_ref(&texture).opaque(), (x + 1) as u32, (y + 1) as u32, rgba)
-}
-
-impl TextureVolume {
-    /// Each normalized component indexes the table after filtering.
-    pub fn colour_table(&self, rgba: &mut [f64; 4]) {
-        let s = self.s.get();
-
-        for channel in 0..3usize {
-            let index = (cmax(0.0, cmin(rgba[channel], 1.0)) * 255.0 + 0.5).floor() as u32;
-            let plane = (channel == 2) as usize;
-            let word = s.tex_colour_table[plane][index as usize];
-            let component = if channel == 1 { word & 0xfff } else { (word >> 12) & 0xfff };
-
-            rgba[channel] = component as f64 / 4095.0;
+        if lambda >= 0.0 {
+            return Some(self.first);
         }
-        if self.colour_table_alpha {
-            let index = (cmax(0.0, cmin(rgba[3], 1.0)) * 255.0 + 0.5).floor() as u32;
-            let word = s.tex_colour_table[1][index as usize];
-
-            rgba[3] = (word & 0xfff) as f64 / 4095.0;
-        }
+        None
     }
 }
 
@@ -622,30 +753,6 @@ impl Board {
         true
     }
 
-    /// GL_SGIX_texture_scale_bias applies scale, then bias, then a clamp to
-    /// [0, 1] to the filtered texel, before the texture colour table and the
-    /// environment. That the board follows the extension's order and clamp is
-    /// INFERRED: no source gives the board's arithmetic.
-    pub fn texture_scale_bias(&self, rgba: &mut [f64; 4]) {
-        for c in 0..4usize {
-            let scale = sextract32(self.tex_scale_bias[c * 2], 0, ODSY_TEX_SCALE_BIAS_BITS) as f64;
-            let bias = sextract32(self.tex_scale_bias[c * 2 + 1], 0, ODSY_TEX_SCALE_BIAS_BITS) as f64;
-
-            rgba[c] = (rgba[c] * scale + bias) / ODSY_TEX_SCALE_BIAS_ONE as f64;
-            rgba[c] = cmin(cmax(rgba[c], 0.0), 1.0);
-        }
-    }
-}
-
-pub fn texture_post_filter(opaque: Opaque, rgba: &mut [f64; 4]) {
-    let texture = from_opaque::<TextureVolume>(opaque);
-
-    if texture.scale_bias {
-        texture.s.get().texture_scale_bias(rgba);
-    }
-    if texture.colour_table {
-        texture.colour_table(rgba);
-    }
 }
 
 pub fn texture_detail_sampler(sampler: u32, detail: &mut TextureDetailSampler) -> bool {
@@ -764,7 +871,6 @@ impl Board {
             return false;
         }
         chain.detail_storage = Texture {
-            s: P::new(self),
             offset: self.obj_offset[o],
             stride: self.obj_width[o],
             width,
@@ -780,8 +886,8 @@ impl Board {
             depth: 1,
             base_format,
             internal_format: base_format,
-            read_texel: Some(texture_read_detail),
-            opaque: P::new(chain).opaque(),
+            detail: true,
+            read_texel: true,
             ..Default::default()
         };
         true
@@ -822,7 +928,7 @@ impl Board {
     }
 }
 
-impl GlTexImage {
+impl GlTexImage<'_> {
     /// Sampler words 1 and 2, bits 16:0, hold each axis's maximum clamp in
     /// whole texels of the base level: the library writes trunc(2^log2size *
     /// GL_TEXTURE_MAX_CLAMP_*_SGIX), so the default 1.0 gives the size itself
@@ -872,7 +978,7 @@ fn gl_uadd_ovf(a: u64, b: u64, r: &mut u64) -> bool {
 }
 
 impl Board {
-    pub fn texture_setup(&mut self, image: &mut GlTexImage, chain: &mut TextureChain, resolved: &mut P<GlTexImage>) -> bool {
+    pub fn texture_setup(&mut self, image: &mut GlTexImage<'static>, chain: &mut TextureChain) -> bool {
         let width_word = self.tex_sampler[1];
         let height_word = self.tex_sampler[2];
         let mut width = width_word;
@@ -962,7 +1068,6 @@ impl Board {
         ];
         let mut end: u64 = 0;
 
-        *resolved = P::null();
         'unsupported: {
             if detail_identity {
                 if detail_filter == 0
@@ -1178,7 +1283,6 @@ impl Board {
                     break 'unsupported;
                 }
                 *chain = TextureChain::default();
-                let chain_opaque = P::new(chain).opaque();
                 let mut slice_next: u32 = 0;
                 for i in 0..count {
                     let level_width = cmax(1, width >> i);
@@ -1243,7 +1347,6 @@ impl Board {
                         z += 1;
                     }
                     chain.volumes[i as usize] = TextureVolume {
-                        s: P::new(self),
                         base,
                         stride_units,
                         level_word2: entry[2],
@@ -1264,8 +1367,7 @@ impl Board {
                         depth: level_depth,
                         base_format: image.base_format,
                         internal_format: image.base_format,
-                        read_texel_3d: Some(texture_read_volume_level),
-                        opaque: chain_opaque,
+                        read_texel_3d: true,
                         ..Default::default()
                     };
                     if i + 1 < count {
@@ -1288,30 +1390,26 @@ impl Board {
                 } else {
                     SGI_GL_REPEAT
                 };
-                image.read_texel_3d = Some(texture_read_3d);
+                image.read_texel_3d = true;
                 image.border = three_d_stored as u32;
                 if three_d_stored {
                     image.wrap_s = SGI_GL_CLAMP;
                     image.wrap_t = SGI_GL_CLAMP;
-                    image.read_border_texel_3d = Some(texture_read_border_3d);
+                    image.read_border_texel_3d = true;
                 }
-                image.opaque = P::new(&mut chain.volume).opaque();
                 if !self.texture_scale_bias_identity() {
                     chain.volume.scale_bias = true;
-                    image.post_filter = Some(texture_post_filter);
+                    image.post_filter = true;
                 }
                 if mipmap {
-                    chain.pyramid = GlTexPyramid {
-                        levels: P(chain.levels.as_mut_ptr()),
+                    chain.pyramid = Some(PyramidShape {
                         count,
                         base_level: 0,
                         max_level: count - 1,
                         min_lod: lo as f64 / 256.0,
                         max_lod: hi as f64 / 256.0,
-                    };
-                    image.pyramid = P::new(&mut chain.pyramid);
+                    });
                 }
-                *resolved = P::new(image);
                 return true;
             }
 
@@ -1321,14 +1419,11 @@ impl Board {
                 break 'unsupported;
             }
             *chain = TextureChain::default();
-            let chain_opaque = P::new(chain).opaque();
-            chain.volume.s = P::new(self);
             chain.volume.colour_table_alpha = colour_table_rgba8_rgba || word == 0x11600001;
-            image.opaque = P::new(&mut chain.volume).opaque();
             chain.volume.colour_table = colour_table;
             chain.volume.scale_bias = !self.texture_scale_bias_identity();
             if chain.volume.colour_table || chain.volume.scale_bias {
-                image.post_filter = Some(texture_post_filter);
+                image.post_filter = true;
             }
             for i in 0..count {
                 let e = ((first + i) * 3) as usize;
@@ -1369,7 +1464,6 @@ impl Board {
                     height: level_height,
                     base_format: image.base_format,
                     internal_format: image.base_format,
-                    opaque: chain_opaque,
                     ..Default::default()
                 };
                 if base == 0 || self.obj_count > SGI_ODYSSEY_OBJECTS {
@@ -1413,7 +1507,6 @@ impl Board {
                 }
                 chain.storage[i as usize] = Texture {
                     // Captured stored-border policy uses interior coordinate 16.
-                    s: P::new(self),
                     offset: self.obj_offset[o].wrapping_add(interior_y.wrapping_mul(self.obj_width[o])).wrapping_add(interior_x),
                     stride: self.obj_width[o],
                     width: level_width,
@@ -1422,21 +1515,19 @@ impl Board {
                     words: self.obj_used,
                     border_rows: two_d_stored || general_border,
                 };
-                chain.levels[i as usize].read_texel = Some(texture_read_level);
+                chain.levels[i as usize].read_texel = true;
                 if bordered {
                     chain.levels[i as usize].border = 1;
-                    chain.levels[i as usize].read_border_texel = Some(texture_read_border_level);
+                    chain.levels[i as usize].read_border_texel = true;
                 }
             }
-            chain.pyramid = GlTexPyramid {
-                levels: P(chain.levels.as_mut_ptr()),
+            chain.pyramid = Some(PyramidShape {
                 count,
                 base_level: 0,
                 max_level: count - 1,
                 min_lod: lo as f64 / 256.0,
                 max_lod: if min >= 0x40 { hi as f64 / 256.0 } else { 15.0 },
-            };
-            image.pyramid = P::new(&mut chain.pyramid);
+            });
             if detail_identity {
                 if !self.texture_detail_backing_setup(
                     chain,
@@ -1448,12 +1539,11 @@ impl Board {
                     break 'unsupported;
                 }
                 chain.volume.detail_weight = detail_weight;
-                image.detail_image = P::new(&mut chain.detail_image);
+                image.detail_image = Some(chain.detail_image);
                 image.detail_level = detail_sampler.level;
                 image.detail_mode = detail_sampler.mode;
-                image.read_filter_weight = Some(texture_detail_weight);
+                image.read_filter_weight = true;
             }
-            *resolved = P::new(image);
             return true;
         }
         let index_mode = self.gl_index_mode();
@@ -1474,12 +1564,12 @@ impl Board {
         let one_d = (self.tex_mode & (ODSY_TEX_MODE_1D | ODSY_TEX_MODE_2D)) == ODSY_TEX_MODE_1D;
         let mut matrix = [0.0f32; 16];
 
-        self.gl_ctx.cur.texture_2d = ((self.tex_mode & (ODSY_TEX_MODE_1D | ODSY_TEX_MODE_2D)) != 0) as u32;
-        self.gl_ctx.cur.texture_3d = ((self.tex_mode & ODSY_TEX_MODE_3D) != 0) as u32;
+        self.gl().cur.texture_2d = ((self.tex_mode & (ODSY_TEX_MODE_1D | ODSY_TEX_MODE_2D)) != 0) as u32;
+        self.gl().cur.texture_3d = ((self.tex_mode & ODSY_TEX_MODE_3D) != 0) as u32;
         // Excluded environments are rejected by the family before rasterization.
-        self.gl_ctx.cur.texture_env_mode = SGI_GL_REPLACE;
+        self.gl().cur.texture_env_mode = SGI_GL_REPLACE;
         if (self.tex_env[0] as usize) < ENVIRONMENTS.len() {
-            self.gl_ctx.cur.texture_env_mode = ENVIRONMENTS[self.tex_env[0] as usize];
+            self.gl().cur.texture_env_mode = ENVIRONMENTS[self.tex_env[0] as usize];
         }
         // Captured linear planes already include the eye-space transform.
         if (self.cmd_tag == ODSY_GL_VERTEX_2I
@@ -1530,97 +1620,104 @@ impl Board {
                 matrix[i * 4 + 1] = 0.0;
             }
         }
-        self.gl_ctx.set_matrix(SGI_GL_TEXTURE, &matrix);
+        self.gl().set_matrix(SGI_GL_TEXTURE, &matrix);
         self.gl_feed(SGI_GL_OP_TEXCOORD4F as u16, &strq);
     }
 }
 
-/// The context emits one assembled primitive here; rasterize it into the
-/// plane. Shared between the fire-and-forget and checked sink callbacks
-/// below; only the out-of-memory result differs in how it is reported back.
-pub fn gl_draw_result(opaque: Opaque, d: &GlDraw) -> GlDrawResult {
-    let s = from_opaque::<Board>(opaque);
-    let mut t = s.gl_target();
-    let rules = s.gl_operation_rules();
-    let mut state: GlDrawState = *d.state;
-    let mut draw = *d;
-    let mut image = GlTexImage::default();
-    // Some 7 KB that only a textured draw uses, and Board::texture_setup()
-    // clears before it fills any of it, so it is not built for every
-    // primitive.
-    let mut texture: Option<Box<TextureChain>> = None;
-
-    if d.state.texture_2d != 0 || d.state.texture_3d != 0 {
-        let chain = texture.insert(Box::default());
-
-        if !s.texture_setup(&mut image, chain, &mut t.texture) {
-            crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_gl_draw_path: backend scalar-skip result {} called=0", SGI_GL_DRAW_OK);
-            return SGI_GL_DRAW_OK;
-        }
-    }
-    if (state.texture_2d != 0 || state.texture_3d != 0) && s.tex_env[0] == 4 {
-        // The family words pack two normalized 12-bit components each.
-        state.texture_env_color[0] = ((s.tex_env[1] >> 12) & 0xfff) as f32 / 4095.0f32;
-        state.texture_env_color[1] = (s.tex_env[1] & 0xfff) as f32 / 4095.0f32;
-        state.texture_env_color[2] = ((s.tex_env[2] >> 12) & 0xfff) as f32 / 4095.0f32;
-        state.texture_env_color[3] = (s.tex_env[2] & 0xfff) as f32 / 4095.0f32;
-    }
-    if !s.gl_index_mode() {
-        state.colour_mask = (s.gl_write_mask >> ODSY_WRITE_COLOUR_SHIFT) & ODSY_WRITE_COLOUR_MASK;
-    }
-    state.fog_color[0] = ((s.gl_fog[0] >> 12) & 0xfff) as f32 / 4096.0f32;
-    state.fog_color[1] = (s.gl_fog[0] & 0xfff) as f32 / 4096.0f32;
-    state.fog_color[2] = ((s.gl_fog[1] >> 12) & 0xfff) as f32 / 4096.0f32;
-    state.fog_color[3] = (s.gl_fog[1] & 0xfff) as f32 / 4096.0f32;
-    state.fog_index = ((s.gl_fog[0] >> 12) & 0xfff) as f32;
-    draw.state = P::new(&mut state);
-    s.gl_report_refusals(true);
-    // The board's thread holds the board lock for the whole draw; a
-    // processor's accesses that need not wait for it use the front lock
-    // (interface.rs).
-    let result = rules.draw(&t, &draw);
-    crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_gl_draw_path: backend scalar result {} called=1", result);
-    s.scanout.invalidate_all();
-    drop(texture);
-    result
-}
-
-pub fn gl_draw(opaque: Opaque, d: &GlDraw) {
-    gl_draw_result(opaque, d);
-}
-
-/// The checked path the shared context requires once per-face polygon modes
-/// are activated (Board::reset_registers): it relays RasterRules::draw()'s
-/// out-of-memory signal from GL_POLYGON's dynamic vertex assembly back to
-/// the shared context synchronously instead of dropping it. The native
-/// renderer does not exist here, so this is always the scalar draw.
-pub fn gl_draw_checked(opaque: Opaque, d: &GlDraw) -> GlDrawResult {
-    gl_draw_result(opaque, d)
-}
-
-/// glClear's raster op: not on the first-triangle path, wired for later.
-pub fn gl_raster(opaque: Opaque, op: &RasterOp) {
-    let s = from_opaque::<Board>(opaque);
-    let t = s.gl_target();
-    let rules = s.gl_operation_rules();
-
-    s.gl_report_refusals(
-        op.kind != SGI_RASTER_CLEAR || (op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT) != 0,
-    );
-    rules.raster(&t, op);
-    s.scanout.invalidate_all();
-}
-
 impl Board {
-    pub fn gl_sink(&mut self) -> GlSink {
-        GlSink {
-            draw: Some(gl_draw),
-            draw_checked: Some(gl_draw_checked),
-            raster: Some(gl_raster),
-            fence: None,
-            opaque: P::new(self).opaque(),
-            result: P::null(),
+    /// The context emits one assembled primitive here; rasterize it into the
+    /// planes. The context requires the checked result once per-face polygon
+    /// modes are activated (Board::reset_registers): it relays
+    /// RasterRules::draw()'s out-of-memory signal from GL_POLYGON's dynamic
+    /// vertex assembly back to the context synchronously instead of dropping
+    /// it. The native renderer does not exist here, so this is always the
+    /// scalar draw.
+    pub fn gl_draw(&mut self, d: &mut GlDraw) -> GlDrawResult {
+        let mut t = self.gl_target();
+        let rules = self.gl_operation_rules();
+        let mut state: GlDrawState = *d.state;
+        let mut image = GlTexImage::default();
+        // Some 7 KB that only a textured draw uses, and Board::texture_setup()
+        // clears before it fills any of it, so it is not built for every
+        // primitive.
+        let mut texture: Option<Box<TextureChain>> = None;
+
+        if d.state.texture_2d != 0 || d.state.texture_3d != 0 {
+            let chain = texture.insert(Box::default());
+
+            if !self.texture_setup(&mut image, chain) {
+                crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_gl_draw_path: backend scalar-skip result {} called=0", SGI_GL_DRAW_OK);
+                return SGI_GL_DRAW_OK;
+            }
         }
+        if (state.texture_2d != 0 || state.texture_3d != 0) && self.tex_env[0] == 4 {
+            // The family words pack two normalized 12-bit components each.
+            state.texture_env_color[0] = ((self.tex_env[1] >> 12) & 0xfff) as f32 / 4095.0f32;
+            state.texture_env_color[1] = (self.tex_env[1] & 0xfff) as f32 / 4095.0f32;
+            state.texture_env_color[2] = ((self.tex_env[2] >> 12) & 0xfff) as f32 / 4095.0f32;
+            state.texture_env_color[3] = (self.tex_env[2] & 0xfff) as f32 / 4095.0f32;
+        }
+        if !self.gl_index_mode() {
+            state.colour_mask = (self.gl_write_mask >> ODSY_WRITE_COLOUR_SHIFT) & ODSY_WRITE_COLOUR_MASK;
+        }
+        state.fog_color[0] = ((self.gl_fog[0] >> 12) & 0xfff) as f32 / 4096.0f32;
+        state.fog_color[1] = (self.gl_fog[0] & 0xfff) as f32 / 4096.0f32;
+        state.fog_color[2] = ((self.gl_fog[1] >> 12) & 0xfff) as f32 / 4096.0f32;
+        state.fog_color[3] = (self.gl_fog[1] & 0xfff) as f32 / 4096.0f32;
+        state.fog_index = ((self.gl_fog[0] >> 12) & 0xfff) as f32;
+        self.gl_report_refusals(true);
+        t.texture = texture.as_deref().map(|chain| chain.image(&image));
+        let mut draw = GlDraw { state: &state, ..*d };
+        // The board's thread holds the board lock for the whole draw; a
+        // processor's accesses that need not wait for it use the front lock
+        // (interface.rs).
+        let (mut pixels, texels) = self.gl_parts(texture.as_deref());
+        let texels: &dyn Texels = match &texels {
+            Some(texels) => texels,
+            None => &NoTexels,
+        };
+        let result = rules.draw(&t, &mut pixels, texels, &mut draw);
+        d.line_phase = draw.line_phase;
+        crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_gl_draw_path: backend scalar result {} called=1", result);
+        self.scanout.invalidate_all();
+        result
+    }
+
+    /// glClear's raster op: not on the first-triangle path, wired for later.
+    pub fn gl_raster(&mut self, op: &RasterOp) {
+        let t = self.gl_target();
+        let rules = self.gl_operation_rules();
+
+        self.gl_report_refusals(op.kind != SGI_RASTER_CLEAR || (op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT) != 0);
+        rules.raster(&t, &mut self.gl_parts(None).0, op);
+        self.scanout.invalidate_all();
+    }
+
+    /// Run one command in the GL context, with the board as the sink for the
+    /// draws it emits. The context is lifted out of the board for the call,
+    /// so that a draw can borrow the rest of the board.
+    pub fn gl_command(&mut self, cmd: &GlCmd) {
+        let mut ctx = self.gl_ctx.take().expect("the GL context is not in a command");
+
+        ctx.command(self, cmd);
+        self.gl_ctx = Some(ctx);
+    }
+
+    /// The board's GL context, which is only out of the board during
+    /// Board::gl_command().
+    pub fn gl(&mut self) -> &mut GlContext {
+        self.gl_ctx.as_mut().expect("the GL context is not in a command")
+    }
+
+    pub fn gl_ref(&self) -> &GlContext {
+        self.gl_ctx.as_ref().expect("the GL context is not in a command")
+    }
+}
+
+impl GlSink for Board {
+    fn draw(&mut self, d: &mut GlDraw) -> GlDrawResult {
+        self.gl_draw(d)
     }
 }
 
@@ -1668,7 +1765,7 @@ impl Board {
     /// coordinates.
     pub fn gl_bind(&mut self) {
         let buffers = self.draw_buffers();
-        let mut draw: u32 = (if buffers & 1 != 0 { SGI_GL_DRAW_FRONT } else { 0 })
+        let draw: u32 = (if buffers & 1 != 0 { SGI_GL_DRAW_FRONT } else { 0 })
             | (if buffers & 2 != 0 { SGI_GL_DRAW_BACK } else { 0 });
         let n = cmax(self.clip_kept, 1);
         let origin = self.win_origin;
@@ -1700,25 +1797,19 @@ impl Board {
             }
             d.clip.n = n;
         }
-        if !self.gl_bind_drawable.drawable_eq(&self.gl_ctx.cur.drawable) {
+        if !self.gl_bind_drawable.drawable_eq(&self.gl_ref().cur.drawable) {
             let d = self.gl_bind_drawable;
-            self.gl_ctx.set_drawable(&d);
+            self.gl().set_drawable(&d);
         }
-        if self.gl_ctx.cur.draw_buffers != draw {
-            let sink = self.gl_sink();
-            let cmd = GlCmd::new(SGI_GL_OP_DRAW_BUFFERS as u16, std::slice::from_mut(&mut draw));
-
-            self.gl_ctx.command(&sink, &cmd);
+        if self.gl_ref().cur.draw_buffers != draw {
+            self.gl_command(&GlCmd::new(SGI_GL_OP_DRAW_BUFFERS as u16, std::slice::from_ref(&draw)));
         }
     }
 
     /// Decode one command into the shared context.
     pub fn gl_feed(&mut self, op: u16, args: &[u32]) {
-        let sink = self.gl_sink();
-        let cmd = GlCmd::new(op, args);
-
         self.gl_bind();
-        self.gl_ctx.command(&sink, &cmd);
+        self.gl_command(&GlCmd::new(op, args));
     }
 
     // Board::gl_feed with the op as the shared layer's u32 enum.
@@ -1763,14 +1854,14 @@ impl Board {
     /// restart replays nothing: if the model ever saves them, it must stop
     /// holding at the same time, or the polygon draws twice.
     pub fn gl_feed_raster_state(&mut self, op: u16, args: &[u32]) {
-        let in_begin = self.gl_ctx.in_begin;
+        let in_begin = self.gl_ref().in_begin;
         let held_polygon = self.gl_begin_open && self.gl_primitive == 9;
 
         if held_polygon {
-            self.gl_ctx.in_begin = 0;
+            self.gl().in_begin = 0;
         }
         self.gl_feed(op, args);
-        self.gl_ctx.in_begin = in_begin;
+        self.gl().in_begin = in_begin;
     }
 
     /// Hand the GL state register 0x0404 carries to the shared context: bit 12,
@@ -1801,7 +1892,7 @@ impl Board {
             for i in 0..rows.len() {
                 rows[i] = self.pattern_buffer[31 - i];
             }
-            if !self.gl_ctx.polygon_stipple(&rows) {
+            if !self.gl().polygon_stipple(&rows) {
                 return;
             }
         }

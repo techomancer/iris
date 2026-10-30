@@ -23,17 +23,16 @@ pub static SOFT_BANDS_MIN_PIXELS: std::sync::atomic::AtomicU64 = std::sync::atom
 /// seen.
 pub static SOFT_HOST_PROCESSORS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
-pub type SoftBandFn = fn(Opaque, u32, u32);
+/// One band-parallel call's work: called with each band number.
+pub type SoftBandJob<'a> = dyn Fn(u32) + Sync + 'a;
 
-/// The pool's shared state, under SOFT_POOL.lock. The job's opaque
-/// pointer is a P, which is Send: a band's data is the caller's, which the
-/// caller keeps alive until every band is done.
+/// The pool's shared state, under SOFT_POOL.lock.
 #[derive(Default)]
 pub struct SoftPoolState {
     pub threads: u32,
     pub generation: u64,
-    pub fn_: Option<SoftBandFn>,
-    pub opaque: Opaque,
+    /// The running call's job, while its bands run (soft_bands_run()).
+    pub job: Option<&'static SoftBandJob<'static>>,
     pub bands: u32,
     pub pending: u32,
     /// A band panicked: the caller, once all are done, panics too.
@@ -53,8 +52,7 @@ pub static SOFT_POOL: SoftPool = SoftPool {
     lock: std::sync::Mutex::new(SoftPoolState {
         threads: 0,
         generation: 0,
-        fn_: None,
-        opaque: P(std::ptr::null_mut()),
+        job: None,
         bands: 0,
         pending: 0,
         panicked: false,
@@ -85,11 +83,9 @@ pub fn soft_band_worker(band: u32) {
         if band >= g.bands {
             continue;
         }
-        let fn_ = g.fn_.unwrap();
-        let job = g.opaque;
-        let bands = g.bands;
+        let job = g.job.expect("a running job");
         drop(g);
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fn_(job, band, bands))).is_ok();
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(band))).is_ok();
         g = SOFT_POOL.lock.lock().unwrap_or_else(|e| e.into_inner());
         if !ok {
             g.panicked = true;
@@ -111,10 +107,10 @@ pub fn soft_bands() -> u32 {
     std::cmp::min(bands, SGI_RASTER_PARALLEL_MAX_BANDS)
 }
 
-/// fn(opaque, band, bands) for each band, band 0 on this thread, the rest
-/// on workers, returning when all have; false, having run none, when
-/// another thread is using the workers.
-pub fn soft_bands_run(f: SoftBandFn, opaque: Opaque, bands: u32) -> bool {
+/// job(band) for each band, band 0 on this thread, the rest on workers,
+/// returning when all have; false, having run none, when another thread is
+/// using the workers.
+pub fn soft_bands_run(job: &SoftBandJob<'_>, bands: u32) -> bool {
     soft_pool_init();
     let _run = match SOFT_POOL.run.try_lock() {
         Ok(g) => g,
@@ -135,8 +131,14 @@ pub fn soft_bands_run(f: SoftBandFn, opaque: Opaque, bands: u32) -> bool {
         }
         g.threads += 1;
     }
-    g.fn_ = Some(f);
-    g.opaque = opaque;
+    // SAFETY: the workers are long-lived, so the pool holds the job as
+    // 'static, but it is only called between here and the wait below for
+    // pending to reach zero: every worker's call is caught if it panics, so
+    // each counts itself done, and the job is taken out of the pool before
+    // this function returns. The borrow therefore outlives every call made
+    // through the extended reference.
+    let job_static = unsafe { std::mem::transmute::<&SoftBandJob<'_>, &'static SoftBandJob<'static>>(job) };
+    g.job = Some(job_static);
     g.bands = bands;
     g.pending = bands - 1;
     g.panicked = false;
@@ -144,12 +146,13 @@ pub fn soft_bands_run(f: SoftBandFn, opaque: Opaque, bands: u32) -> bool {
     SOFT_POOL.start.notify_all();
     drop(g);
 
-    let own = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(opaque, 0, bands)));
+    let own = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(0)));
 
     let mut g = SOFT_POOL.lock.lock().unwrap_or_else(|e| e.into_inner());
     while g.pending != 0 {
         g = SOFT_POOL.done.wait(g).unwrap_or_else(|e| e.into_inner());
     }
+    g.job = None;
     let panicked = g.panicked;
     drop(g);
     drop(_run);
@@ -162,7 +165,23 @@ pub fn soft_bands_run(f: SoftBandFn, opaque: Opaque, bands: u32) -> bool {
     true
 }
 
-impl RasterTarget {
+/// Run job(band, store) for each band of a split plane store, as
+/// soft_bands_run() does; false, having run none, when the workers are busy.
+pub fn soft_bands_run_split(planes: &mut dyn PlaneStore, bands: u32, job: &(dyn Fn(u32, &mut dyn PlaneStore) + Sync)) -> bool {
+    // Claimed per band, by that band alone: the lock is never contended.
+    let stores: Vec<std::sync::Mutex<Box<dyn PlaneStore + '_>>> =
+        planes.split(bands).into_iter().map(std::sync::Mutex::new).collect();
+
+    soft_bands_run(
+        &|band| {
+            let mut store = stores[band as usize].lock().unwrap_or_else(|e| e.into_inner());
+            job(band, &mut **store);
+        },
+        bands,
+    )
+}
+
+impl RasterTarget<'_> {
     /// The pixel count from which a draw or clear into @t runs in bands.
     pub fn soft_band_min_pixels(&self) -> u64 {
         if self.band_min_pixels != 0 {
@@ -173,7 +192,7 @@ impl RasterTarget {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn row_in_band(&self, py: i32) -> bool {
         self.bands <= 1 || ((py as u32) >> SGI_SOFT_BAND_ROWS_SHIFT) % self.bands == self.band
     }
@@ -184,42 +203,35 @@ pub fn raster_set_parallel(bands: u32, min_pixels: u64) {
     SOFT_BANDS_MIN_PIXELS.store(min_pixels, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// A draw handed to the band pool: pointers to the caller's draw, which
-/// stays alive until every band has returned.
-pub struct SoftBandDraw {
-    pub r: P<SoftDraw>,
-    pub d: P<GlDraw>,
-}
-
-pub fn soft_band_draw(opaque: Opaque, band: u32, bands: u32) {
-    let job: &SoftBandDraw = from_opaque(opaque);
-    let mut r: SoftDraw = *job.r;
-
-    r.band = band;
-    r.bands = bands;
-    if !r.texture.is_null() {
-        r.texels = r.texture.soft_texel_cache_begin();
-    }
-    if !r.fixed.is_null() && !r.fixed.prefilled && !r.fixed_begin() {
-        r.fixed = P::null();
-    }
-    SOFT_BAND_QUIET.with(|q| q.set(band > 0));
-    r.draw_triangles(&job.d);
-    SOFT_BAND_QUIET.with(|q| q.set(false));
-}
-
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Draw the filled primitives in bands when the target allows it and they
     /// cover enough pixels to pay for repeating each primitive's setup in
     /// every band; false, having drawn nothing, otherwise.
-    pub fn draw_parallel(&self, d: &GlDraw) -> bool {
+    pub fn draw_parallel(&self, d: &GlDraw, planes: &mut dyn PlaneStore) -> bool {
         let bands = soft_bands();
         let min_pixels = self.t.soft_band_min_pixels();
-        let mut job = SoftBandDraw { r: P::from_ref(self), d: P::from_ref(d) };
+        let shared = self.shared;
 
         if !self.t.concurrent_pixels || bands < 2 || self.draw_pixels(d, min_pixels) < min_pixels {
             return false;
         }
-        soft_bands_run(soft_band_draw, P::new(&mut job).opaque(), bands)
+        soft_bands_run_split(planes, bands, &|band, store| {
+            let px = store.planes();
+
+            with_texel_cache(|cache| {
+                let mut r = shared.on(&*px, cache);
+
+                r.band = band;
+                r.bands = bands;
+                if let Some(f) = r.fixed {
+                    if !f.prefilled && !r.fixed_begin(f) {
+                        r.fixed = None;
+                    }
+                }
+                SOFT_BAND_QUIET.with(|q| q.set(band > 0));
+                r.draw_triangles(d);
+                SOFT_BAND_QUIET.with(|q| q.set(false));
+            });
+        })
     }
 }

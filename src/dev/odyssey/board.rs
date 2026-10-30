@@ -260,7 +260,8 @@ pub struct Board {
     pub poly_col_lo: u32,
 
     // The true-colour OpenGL path.
-    pub gl_ctx: GlContext,
+    /// None only during Board::gl_command().
+    pub gl_ctx: Option<Box<GlContext>>,
     /// The drawable Board::gl_bind() last built for the shared context.
     pub gl_bind_drawable: GlDrawable,
     /// Host-only: GL draws may run in bands of rows (x-raster-bands); the
@@ -569,7 +570,7 @@ impl Default for Board {
             poly_row_lo: 0,
             poly_row_hi: 0,
             poly_col_lo: 0,
-            gl_ctx: Default::default(),
+            gl_ctx: Some(Box::default()),
             gl_bind_drawable: Default::default(),
             raster_bands: false,
             raster_band_pixels: 0,
@@ -933,18 +934,15 @@ impl Board {
         // it before reinitializing. It is safe here even before Board::allocate
         // allocates the colour plane. Its viewport starts empty: nothing is
         // drawn until the client's combined matrix arrives.
-        self.gl_ctx.reset(ODSY_GL_CONTEXT_HW_ID);
+        self.gl().reset(ODSY_GL_CONTEXT_HW_ID);
         {
             // Opt into the shared context's per-face polygon modes (0x0415) and
             // line stipple: unset, it silently keeps every face at legacy FILL
-            // no matter what 0x0415 decodes to. The sink built here always
-            // carries the checked draw callback, this call's one precondition;
-            // GlContext::reset() above has already cleared in_begin, satisfying the
-            // other precondition even when reset lands mid-primitive.
-            let sink = self.gl_sink();
-
-            assert!(self.gl_ctx.enable_polygon_modes(Some(&sink)));
-            assert!(self.gl_ctx.enable_line_stipple(Some(&sink)));
+            // no matter what 0x0415 decodes to. GlContext::reset() above has
+            // already cleared in_begin, the one precondition, even when reset
+            // lands mid-primitive.
+            assert!(self.gl().enable_polygon_modes());
+            assert!(self.gl().enable_line_stipple());
         }
         self.gl_in_prim = false;
         self.gl_begin_open = false;

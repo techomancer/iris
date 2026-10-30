@@ -7,13 +7,11 @@
 
 use super::*;
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Runtime errors are observable without logging once for every pixel.
     pub fn texture_report(&self, reason: u32, message: &str) {
         // Bands of one draw share the reports (soft_bands_run()).
-        let rep = self.texture_reports.get();
-        let old = *rep;
-        *rep |= reason;
+        let old = self.reports.texture.fetch_or(reason, std::sync::atomic::Ordering::Relaxed);
         if old & reason == 0 {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: texture {}", message);
         }
@@ -91,35 +89,24 @@ pub fn soft_texture_component_bits_valid(format: u32, bits: &[u8; 4]) -> bool {
     true
 }
 
-impl GlTexPyramid {
-    /// p->levels[i].
-    pub fn tex_level_at<'a>(&self, i: usize) -> &'a GlTexLevel {
-        unsafe { &*self.levels.0.add(i) }
-    }
-
-    pub fn soft_texture_level<'a>(&self, level: u32) -> Option<&'a GlTexLevel> {
-        for i in 0..self.count as usize {
-            let l = self.tex_level_at(i);
-            if l.level == level {
-                return Some(l);
-            }
-        }
-        None
+impl<'a> GlTexPyramid<'a> {
+    pub fn soft_texture_level(&self, level: u32) -> Option<&'a GlTexLevel> {
+        self.levels.iter().find(|l| l.level == level)
     }
 }
 
-impl GlTexImage {
+impl GlTexImage<'_> {
     pub fn soft_texture_border_supported(&self, level: Option<&GlTexLevel>) -> bool {
         let border = match level { Some(l) => l.border, None => self.border };
         let callback = if self.volume {
             match level {
-                Some(l) => l.read_border_texel_3d.is_some() || l.read_border_texel_3d_components.is_some(),
-                None => self.read_border_texel_3d.is_some() || self.read_border_texel_3d_components.is_some(),
+                Some(l) => l.read_border_texel_3d,
+                None => self.read_border_texel_3d,
             }
         } else {
             match level {
-                Some(l) => l.read_border_texel.is_some() || l.read_border_texel_components.is_some(),
-                None => self.read_border_texel.is_some() || self.read_border_texel_components.is_some(),
+                Some(l) => l.read_border_texel,
+                None => self.read_border_texel,
             }
         };
 
@@ -142,9 +129,9 @@ impl GlTexImage {
     }
 }
 
-impl SoftDraw {
-    pub fn texture_pyramid(&mut self, im: &GlTexImage, report: bool) -> bool {
-        let p = im.pyramid.get();
+impl<'a> SoftDraw<'a> {
+    pub fn texture_pyramid(&mut self, im: &'a GlTexImage<'a>, report: bool) -> bool {
+        let p = im.pyramid.expect("an image with a pyramid");
         let mipmap = soft_texture_mipmap(im.min_filter);
         let mut border_finite = true;
 
@@ -154,26 +141,20 @@ impl SoftDraw {
             for k in 0..4usize {
                 border_finite &= im.border_color[k].is_finite();
             }
-            if p.count > SGI_GL_TEX_LEVELS_MAX || (p.count != 0 && p.levels.is_null()) ||
+            if p.levels.len() > SGI_GL_TEX_LEVELS_MAX as usize ||
                 !p.min_lod.is_finite() || !p.max_lod.is_finite() ||
                 p.min_lod > p.max_lod || !border_finite ||
                 !soft_texture_wrap(im.wrap_s) ||
                 (!im.one_dimensional && !soft_texture_wrap(im.wrap_t)) ||
                 (im.volume && !soft_texture_wrap(im.wrap_r)) ||
                 (im.min_filter != SGI_GL_NEAREST && im.min_filter != SGI_GL_LINEAR && !mipmap) ||
-                (soft_texture_detail(im.mag_filter) && !im.detail_image.is_null() &&
-                 (im.detail_image.read_texel_components.is_some() ||
-                  im.detail_image.read_border_texel_components.is_some()) &&
-                 !soft_texture_component_bits_valid(im.detail_image.base_format, &im.detail_image.component_bits)) ||
                 (im.mag_filter != SGI_GL_NEAREST && im.mag_filter != SGI_GL_LINEAR &&
                  !soft_texture_sharpen(im.mag_filter) && !soft_texture_detail(im.mag_filter))
             {
                 return Out::Unsupported;
             }
-            for i in 1..p.count as usize {
-                if p.tex_level_at(i - 1).level >= p.tex_level_at(i).level {
-                    return Out::Unsupported;
-                }
+            if p.levels.windows(2).any(|w| w[0].level >= w[1].level) {
+                return Out::Unsupported;
             }
             if mipmap && p.max_level < p.base_level {
                 return Out::Incomplete;
@@ -186,10 +167,6 @@ impl SoftDraw {
                 !im.soft_texture_border_supported(Some(base)) ||
                 soft_texture_internal_format(base.internal_format) != base.base_format ||
                 !soft_texture_format(base.base_format) ||
-                ((base.read_texel_components.is_some() || base.read_texel_3d_components.is_some() ||
-                  base.read_border_texel_components.is_some() ||
-                  base.read_border_texel_3d_components.is_some()) &&
-                 !soft_texture_component_bits_valid(base.base_format, &base.component_bits)) ||
                 (self.st.texture_env_mode == SGI_GL_DECAL &&
                  base.base_format != SGI_GL_RGB && base.base_format != SGI_GL_RGBA)
             {
@@ -214,9 +191,7 @@ impl SoftDraw {
                 last = std::cmp::min(p.base_level as u64 + k as u64, p.max_level as u64) as u32;
             }
             // Unsupported relevant forms cannot be concealed by missing images.
-            for i in 0..p.count as usize {
-                let l = p.tex_level_at(i);
-
+            for l in p.levels {
                 if l.level < p.base_level || l.level > last {
                     continue;
                 }
@@ -226,13 +201,9 @@ impl SoftDraw {
                 if !im.soft_texture_shadow_supported(l.base_format) {
                     return Out::Unsupported;
                 }
-                if !im.soft_texture_border_supported(Some(&*l)) ||
+                if !im.soft_texture_border_supported(Some(l)) ||
                     !soft_texture_format(l.base_format) ||
-                    soft_texture_internal_format(l.internal_format) != l.base_format ||
-                    ((l.read_texel_components.is_some() || l.read_texel_3d_components.is_some() ||
-                      l.read_border_texel_components.is_some() ||
-                      l.read_border_texel_3d_components.is_some()) &&
-                     !soft_texture_component_bits_valid(l.base_format, &l.component_bits))
+                    soft_texture_internal_format(l.internal_format) != l.base_format
                 {
                     return Out::Unsupported;
                 }
@@ -243,11 +214,7 @@ impl SoftDraw {
                 let shift = (id - p.base_level as u64) as u32;
 
                 let l = match l { Some(l) => l, None => return Out::Incomplete };
-                if (if im.volume {
-                    !(l.read_texel_3d.is_some() || l.read_texel_3d_components.is_some())
-                } else {
-                    !(l.read_texel.is_some() || l.read_texel_components.is_some())
-                }) ||
+                if (if im.volume { !l.read_texel_3d } else { !l.read_texel }) ||
                     (im.volume && l.depth != std::cmp::max(1, base.depth.wrapping_shr(shift))) ||
                     l.width != std::cmp::max(1, base.width.wrapping_shr(shift)) ||
                     l.height != std::cmp::max(1, base.height.wrapping_shr(shift)) ||
@@ -258,8 +225,8 @@ impl SoftDraw {
                 }
                 id += 1;
             }
-            self.texture = P::from_ref(im);
-            self.texture_base = P::from_ref(base);
+            self.texture = Some(im);
+            self.texture_base = Some(base);
             self.texture_last = last;
             Out::Done
         })();
@@ -282,8 +249,8 @@ impl SoftDraw {
 
     /// Incomplete images disable texturing; unsupported states drop the draw.
     pub fn texture_setup(&mut self, report: bool) -> bool {
-        let im = self.t.texture.as_opt();
-        let st = self.st.get();
+        let im = self.t.texture.as_ref();
+        let st = self.st;
 
         // With several targets enabled the highest dimension wins: 3D, then
         // 2D, then 1D (OpenGL 1.2.1, 3.8.10). The family supplies the winning
@@ -293,10 +260,10 @@ impl SoftDraw {
         if target == 0 || st.index_bits != 0 {
             return true;
         }
-        if let Some(im) = im.as_deref() {
+        if let Some(im) = im {
             if (im.one_dimensional && im.volume) ||
                 (target == 1) != im.one_dimensional ||
-                (im.one_dimensional && im.pyramid.is_null() && im.height != 1)
+                (im.one_dimensional && im.pyramid.is_none() && im.height != 1)
             {
                 if report {
                     crate::dlog!(LogModule::Odyssey, "sgi-gl: incompatible 1D texture image, draw dropped");
@@ -307,13 +274,13 @@ impl SoftDraw {
         // A volume image under the 2D enable alone stays accepted, as before
         // targets were ranked. With 1D enabled as well the 2D binding wins,
         // and a volume is not a 2D image.
-        if target == 2 && im.as_deref().map_or(false, |i| i.volume) && st.texture_1d != 0 {
+        if target == 2 && im.is_some_and( |i| i.volume) && st.texture_1d != 0 {
             if report {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: volume texture image for a 2D target, draw dropped");
             }
             return false;
         }
-        if target == 3 && im.as_deref().map_or(false, |i| !i.volume) {
+        if target == 3 && im.is_some_and( |i| !i.volume) {
             if report {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: 3D texturing requires a volume image, draw dropped");
             }
@@ -327,7 +294,7 @@ impl SoftDraw {
             }
             return false;
         }
-        if let Some(im) = im.as_deref() {
+        if let Some(im) = im {
             if im.max_clamp &&
                 !(im.max_clamp_s >= 0.0 && im.max_clamp_s <= 1.0 &&
                   im.max_clamp_t >= 0.0 && im.max_clamp_t <= 1.0 &&
@@ -347,7 +314,7 @@ impl SoftDraw {
                 }
                 return false;
             }
-            if !im.pyramid.is_null() {
+            if im.pyramid.is_some() {
                 return self.texture_pyramid(im, report);
             }
             let mut border_finite = true;
@@ -359,14 +326,6 @@ impl SoftDraw {
                 !im.soft_texture_border_supported(None) ||
                 !border_finite ||
                 !soft_texture_format(im.base_format) ||
-                ((im.read_texel_components.is_some() || im.read_texel_3d_components.is_some() ||
-                  im.read_border_texel_components.is_some() ||
-                  im.read_border_texel_3d_components.is_some()) &&
-                 !soft_texture_component_bits_valid(im.base_format, &im.component_bits)) ||
-                (soft_texture_detail(im.mag_filter) && !im.detail_image.is_null() &&
-                 (im.detail_image.read_texel_components.is_some() ||
-                  im.detail_image.read_border_texel_components.is_some()) &&
-                 !soft_texture_component_bits_valid(im.detail_image.base_format, &im.detail_image.component_bits)) ||
                 !soft_texture_wrap(im.wrap_s) ||
                 (!im.one_dimensional && !soft_texture_wrap(im.wrap_t)) ||
                 (im.volume && !soft_texture_wrap(im.wrap_r)) ||
@@ -386,14 +345,10 @@ impl SoftDraw {
                 return false;
             }
         }
-        let incomplete = match im.as_deref() {
+        let incomplete = match im {
             None => true,
             Some(im) => {
-                (if im.volume {
-                    !(im.read_texel_3d.is_some() || im.read_texel_3d_components.is_some())
-                } else {
-                    !(im.read_texel.is_some() || im.read_texel_components.is_some())
-                }) ||
+                (if im.volume { !im.read_texel_3d } else { !im.read_texel }) ||
                     im.width == 0 || im.height == 0 ||
                     im.width > i32::MAX as u32 || im.height > i32::MAX as u32 ||
                     !(im.width as u64).is_power_of_two() || !(im.height as u64).is_power_of_two() ||
@@ -406,12 +361,12 @@ impl SoftDraw {
             }
             return true;
         }
-        self.texture = P::from_ref(im.as_deref().unwrap());
+        self.texture = im;
         true
     }
 }
 
-impl GlTexImage {
+impl GlTexImage<'_> {
     /// Whether a clipped vertex has a clip w and the texture coordinates im
     /// uses: s and q always, t unless the image is one-dimensional, and r for
     /// a shadow comparison against a depth image.
@@ -430,12 +385,12 @@ impl GlTexImage {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn texture_vertex_valid(&self, v: &VolumeVertex) -> bool {
-        if self.texture.is_null() {
+        let Some(im) = self.texture else {
             return true;
-        }
-        let valid = self.texture.soft_texcoord_valid(self.texture_base.as_opt().map(|b| &*b), v);
+        };
+        let valid = im.soft_texcoord_valid(self.texture_base, v);
         if !valid {
             self.texture_report(4, "invalid clipped coordinates, primitive dropped");
         }
@@ -472,7 +427,7 @@ pub fn soft_texture_components(format: u32, v: &mut [f64; 4]) {
     }
 }
 
-impl GlTexImage {
+impl GlTexImage<'_> {
     pub fn soft_texture_shadow(&self, depth: f64, reference: f64, out: &mut [f64; 4]) {
         let pass = if self.shadow_compare == SGI_GL_TEXTURE_LEQUAL_R_SGIX { depth <= reference } else { depth >= reference };
 
@@ -505,7 +460,7 @@ pub const SGI_SOFT_TEXEL_CACHE_SIZE: usize = 4096;
 #[derive(Clone, Copy, Default)]
 pub struct SoftTexelEntry {
     pub serial: u64,
-    /// the level's address, 0 for the image itself
+    /// SoftDraw::texel_key() of the level
     pub level: usize,
     pub x: u32,
     pub y: u32,
@@ -521,7 +476,6 @@ pub struct SoftTexelEntry {
 /// texels and failed reads always go to the family.
 pub struct SoftTexelCache {
     pub serial: u64,
-    pub image: P<GlTexImage>,
     /// Set for a fragment that minifies by more than two texels a pixel
     /// without mipmaps.
     pub bypass: bool,
@@ -530,37 +484,36 @@ pub struct SoftTexelCache {
     pub entry: Vec<SoftTexelEntry>,
 }
 
-impl GlTexImage {
-    pub fn soft_texel_cache_begin(&self) -> P<SoftTexelCache> {
-        SOFT_TEXEL_CACHE.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(Box::new(SoftTexelCache {
-                    serial: 0,
-                    image: P::null(),
-                    bypass: false,
-                    tag: 0,
-                    fixed: vec![SoftFixedStore::default(); SGI_SOFT_FIXED_LEVELS],
-                    entry: vec![SoftTexelEntry::default(); SGI_SOFT_TEXEL_CACHE_SIZE],
-                }));
+impl SoftTexelCache {
+    pub fn new() -> Self {
+        SoftTexelCache {
+            serial: 0,
+            bypass: false,
+            tag: 0,
+            fixed: vec![SoftFixedStore::default(); SGI_SOFT_FIXED_LEVELS],
+            entry: vec![SoftTexelEntry::default(); SGI_SOFT_TEXEL_CACHE_SIZE],
+        }
+    }
+
+    /// Start a draw: a new serial, which empties the table.
+    pub fn begin(&mut self) {
+        self.serial += 1;
+        self.bypass = false;
+        self.tag = (self.serial & !(SGI_SOFT_FIXED_FAILED as u64)) as u32;
+        if self.tag == 0 {
+            // Tags have come round: cells from 2^31 draws ago would match.
+            for store in self.fixed.iter_mut() {
+                store.cell.fill(0);
             }
-            let c = slot.as_mut().unwrap();
-            c.serial += 1;
-            c.image = P::from_ref(self);
-            c.bypass = false;
-            c.tag = (c.serial & !(SGI_SOFT_FIXED_FAILED as u64)) as u32;
-            if c.tag == 0 {
-                // Tags have come round: cells from 2^31 draws ago would match.
-                for i in 0..SGI_SOFT_FIXED_LEVELS {
-                    for v in c.fixed[i].cell.iter_mut() {
-                        *v = 0;
-                    }
-                }
-                c.serial += 1;
-                c.tag = (c.serial & !(SGI_SOFT_FIXED_FAILED as u64)) as u32;
-            }
-            P::new(&mut **c)
-        })
+            self.serial += 1;
+            self.tag = (self.serial & !(SGI_SOFT_FIXED_FAILED as u64)) as u32;
+        }
+    }
+}
+
+impl Default for SoftTexelCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -569,25 +522,23 @@ impl SoftTexelCache {
         let hash: u32 = x.wrapping_mul(0x9e3779b1)
             ^ y.wrapping_mul(0x85ebca77)
             ^ z.wrapping_mul(0xc2b2ae3d)
-            ^ ((level >> 4) as u32).wrapping_mul(0x27d4eb2f);
+            ^ (level as u32).wrapping_mul(0x27d4eb2f);
 
         ((hash ^ (hash >> 15)) as usize) & (SGI_SOFT_TEXEL_CACHE_SIZE - 1)
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// None is the read-failure exit.
     pub fn texture_tap_inner(&self, level: Option<&GlTexLevel>, mut x: i64, mut y: i64, mut z: i64, reference: f64, out: &mut [f64; 4]) -> Option<bool> {
-        let im: &GlTexImage = &self.texture;
+        let im = self.image();
         let width = level.map_or(im.width, |l| l.width);
         let height = level.map_or(im.height, |l| l.height);
         let depth = if im.volume { level.map_or(im.depth, |l| l.depth) } else { 1 };
         let format = level.map_or(im.base_format, |l| l.base_format);
-        let mut rgba: u32 = 0;
-        let mut component = [0u16; 4];
-        let raw_components: bool;
         let mut slot: Option<usize> = None;
-        let level_addr = level.map_or(0usize, |l| l as *const GlTexLevel as usize);
+        // The cache's name for the level: 0 for the image itself.
+        let key = level.map_or(0usize, |l| l.level as usize + 1);
 
         if im.wrap_s == SGI_GL_REPEAT {
             x = soft_texture_repeat(x, width);
@@ -598,7 +549,7 @@ impl SoftDraw {
         if im.volume && im.wrap_r == SGI_GL_REPEAT {
             z = soft_texture_repeat(z, depth);
         }
-        if x < 0 || y < 0 || z < 0 || x >= width as i64 || y >= height as i64 || z >= depth as i64 {
+        let rgba = if x < 0 || y < 0 || z < 0 || x >= width as i64 || y >= height as i64 || z >= depth as i64 {
             let border = level.map_or(im.border, |l| l.border);
 
             if border == 0 {
@@ -619,166 +570,56 @@ impl SoftDraw {
             {
                 return None;
             }
-            let read: bool;
-            if im.volume {
-                raw_components = match level {
-                    Some(l) => l.read_border_texel_3d_components.is_some(),
-                    None => im.read_border_texel_3d_components.is_some(),
-                };
-                read = match level {
-                    Some(l) => {
-                        if raw_components {
-                            (l.read_border_texel_3d_components.unwrap())(l.opaque, l.level, x as i32, y as i32, z as i32, &mut component)
-                        } else {
-                            match l.read_border_texel_3d {
-                                Some(f) => f(l.opaque, l.level, x as i32, y as i32, z as i32, &mut rgba),
-                                None => false,
-                            }
-                        }
-                    }
-                    None => {
-                        if raw_components {
-                            (im.read_border_texel_3d_components.unwrap())(im.opaque, x as i32, y as i32, z as i32, &mut component)
-                        } else {
-                            match im.read_border_texel_3d {
-                                Some(f) => f(im.opaque, x as i32, y as i32, z as i32, &mut rgba),
-                                None => false,
-                            }
-                        }
-                    }
-                };
+            let readable = if im.volume {
+                level.map_or(im.read_border_texel_3d, |l| l.read_border_texel_3d)
             } else {
-                raw_components = match level {
-                    Some(l) => l.read_border_texel_components.is_some(),
-                    None => im.read_border_texel_components.is_some(),
-                };
-                read = match level {
-                    Some(l) => {
-                        if raw_components {
-                            (l.read_border_texel_components.unwrap())(l.opaque, l.level, x as i32, y as i32, &mut component)
-                        } else {
-                            match l.read_border_texel {
-                                Some(f) => f(l.opaque, l.level, x as i32, y as i32, &mut rgba),
-                                None => false,
-                            }
-                        }
-                    }
-                    None => {
-                        if raw_components {
-                            (im.read_border_texel_components.unwrap())(im.opaque, x as i32, y as i32, &mut component)
-                        } else {
-                            match im.read_border_texel {
-                                Some(f) => f(im.opaque, x as i32, y as i32, &mut rgba),
-                                None => false,
-                            }
-                        }
-                    }
-                };
-            }
-            if !read {
+                level.map_or(im.read_border_texel, |l| l.read_border_texel)
+            };
+            if !readable {
                 return None;
+            }
+            if im.volume {
+                self.texels.border_texel_3d(level, x as i32, y as i32, z as i32)?
+            } else {
+                self.texels.border_texel(level, x as i32, y as i32)?
             }
         } else {
-            if !self.texels.is_null() && self.texels.image == P::from_ref(im) && !self.texels.bypass &&
-                format != SGI_GL_DEPTH_COMPONENT
-            {
-                let c = self.texels.get();
-                let idx = c.texel_slot(level_addr, x as u32, y as u32, z as u32);
-                let e = &c.entry[idx];
-                if e.serial == c.serial && e.level == level_addr &&
-                    e.x as i64 == x && e.y as i64 == y && e.z as i64 == z
-                {
-                    *out = e.out;
-                    return Some(true);
-                }
-                slot = Some(idx);
-            }
-            let read: bool;
-            if im.volume {
-                raw_components = match level {
-                    Some(l) => l.read_texel_3d_components.is_some(),
-                    None => im.read_texel_3d_components.is_some(),
-                };
-                read = match level {
-                    Some(l) => {
-                        if raw_components {
-                            (l.read_texel_3d_components.unwrap())(l.opaque, l.level, x as u32, y as u32, z as u32, &mut component)
-                        } else {
-                            (l.read_texel_3d.unwrap())(l.opaque, l.level, x as u32, y as u32, z as u32, &mut rgba)
-                        }
-                    }
-                    None => {
-                        if raw_components {
-                            (im.read_texel_3d_components.unwrap())(im.opaque, x as u32, y as u32, z as u32, &mut component)
-                        } else {
-                            (im.read_texel_3d.unwrap())(im.opaque, x as u32, y as u32, z as u32, &mut rgba)
-                        }
-                    }
-                };
-            } else {
-                raw_components = match level {
-                    Some(l) => l.read_texel_components.is_some(),
-                    None => im.read_texel_components.is_some(),
-                };
-                read = match level {
-                    Some(l) => {
-                        if raw_components {
-                            (l.read_texel_components.unwrap())(l.opaque, l.level, x as u32, y as u32, &mut component)
-                        } else {
-                            (l.read_texel.unwrap())(l.opaque, l.level, x as u32, y as u32, &mut rgba)
-                        }
-                    }
-                    None => {
-                        if raw_components {
-                            (im.read_texel_components.unwrap())(im.opaque, x as u32, y as u32, &mut component)
-                        } else {
-                            (im.read_texel.unwrap())(im.opaque, x as u32, y as u32, &mut rgba)
-                        }
-                    }
-                };
-            }
+            if let Some(cache) = self.texels_cache {
+                let c = cache.borrow();
 
-            if !read {
-                return None;
+                if !c.bypass && format != SGI_GL_DEPTH_COMPONENT {
+                    let idx = c.texel_slot(key, x as u32, y as u32, z as u32);
+                    let e = &c.entry[idx];
+                    if e.serial == c.serial && e.level == key &&
+                        e.x as i64 == x && e.y as i64 == y && e.z as i64 == z
+                    {
+                        *out = e.out;
+                        return Some(true);
+                    }
+                    slot = Some(idx);
+                }
             }
-        }
+            if im.volume {
+                self.texels.texel_3d(level, x as u32, y as u32, z as u32)?
+            } else {
+                self.texels.texel(level, x as u32, y as u32)?
+            }
+        };
         if format == SGI_GL_DEPTH_COMPONENT {
-            // Depth arrives only through the packed callback.
-            if raw_components {
-                return None;
-            }
             im.soft_texture_shadow(rgba as f64 / u32::MAX as f64, reference, out);
             return Some(true);
         }
-        if raw_components {
-            let bits = level.map_or(&im.component_bits, |l| &l.component_bits);
-            let mask = soft_texture_component_mask(format);
-
-            if !soft_texture_component_bits_valid(format, bits) {
-                return None;
-            }
-            for k in 0..4usize {
-                if mask & (1u8 << k) != 0 {
-                    let maximum: u32 = (1u32 << bits[k]) - 1;
-
-                    if component[k] as u32 > maximum {
-                        self.texture_report(64, "component outside declared precision, fragment dropped");
-                        return Some(false);
-                    }
-                    out[k] = component[k] as f64 / maximum as f64;
-                }
-            }
-        } else {
-            for k in 0..4u32 {
-                out[k as usize] = soft_unorm8((rgba >> (24 - k * 8)) & 255);
-            }
+        for k in 0..4u32 {
+            out[k as usize] = soft_unorm8((rgba >> (24 - k * 8)) & 255);
         }
         soft_texture_components(format, out);
-        if let Some(idx) = slot {
-            let c = self.texels.get();
+        if let (Some(idx), Some(cache)) = (slot, self.texels_cache) {
+            let mut c = cache.borrow_mut();
+            let serial = c.serial;
+
             c.entry[idx] = SoftTexelEntry {
-                serial: c.serial,
-                level: level_addr,
+                serial,
+                level: key,
                 x: x as u32,
                 y: y as u32,
                 z: z as u32,
@@ -811,10 +652,10 @@ pub fn soft_texture_axis(x: f64, n: u32, wrap: u32, upper: f64) -> f64 {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Sampling always reduces coordinates before any integer conversion.
     pub fn texture_sample(&self, level: Option<&GlTexLevel>, filter: u32, s: f64, t: f64, rr: f64, texel: &mut [f64; 4]) -> bool {
-        let im: &GlTexImage = &self.texture;
+        let im = self.image();
         let width = level.map_or(im.width, |l| l.width);
         let height = level.map_or(im.height, |l| l.height);
         let depth = if im.volume { level.map_or(im.depth, |l| l.depth) } else { 1 };
@@ -1002,26 +843,24 @@ pub struct SoftTexSelectionMemo {
     pub selected: SoftTexSelection,
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn texture_select_memo(&self, rho: f64, out: &mut SoftTexSelection) -> bool {
-        let im: &GlTexImage = &self.texture;
-        let memo = !self.texels.is_null() && self.texels.image == P::from_ref(im);
+        let im = self.image();
+        let serial = self.texels_cache.map(|c| c.borrow().serial);
         let bits = rho.to_bits();
 
-        if memo {
+        if let Some(serial) = serial {
             let m = SOFT_TEXTURE_SELECTED.with(|c| c.get());
-            if m.serial == self.texels.serial && m.rho == bits {
+            if m.serial == serial && m.rho == bits {
                 *out = m.selected;
                 return true;
             }
         }
-        if !soft_texture_select(im.min_filter, im.mag_filter, &im.pyramid, self.texture_last, rho, out) {
+        if !soft_texture_select(im.min_filter, im.mag_filter, &im.pyramid.expect("a pyramid"), self.texture_last, rho, out) {
             return false;
         }
-        if memo {
-            SOFT_TEXTURE_SELECTED.with(|c| {
-                c.set(SoftTexSelectionMemo { serial: self.texels.serial, rho: bits, selected: *out })
-            });
+        if let Some(serial) = serial {
+            SOFT_TEXTURE_SELECTED.with(|c| c.set(SoftTexSelectionMemo { serial, rho: bits, selected: *out }));
         }
         true
     }
@@ -1033,24 +872,27 @@ pub fn soft_texture_mix(value: &mut [f64; 4], other: &[f64; 4], alpha: f64) {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn texture_weight(&self, lambda: f64, weight: &mut f64) -> bool {
-        let im: &GlTexImage = &self.texture;
+        let im = self.image();
 
         *weight = fmin(fmax(-lambda / 4.0, 0.0), 1.0);
-        if let Some(f) = im.read_filter_weight {
-            if !f(im.opaque, lambda, weight) || !weight.is_finite() {
-                self.texture_report(16, "invalid filter weight, fragment dropped");
-                return false;
+        if im.read_filter_weight {
+            match self.texels.filter_weight(lambda) {
+                Some(w) if w.is_finite() => *weight = w,
+                _ => {
+                    self.texture_report(16, "invalid filter weight, fragment dropped");
+                    return false;
+                }
             }
         }
         true
     }
 
     pub fn texture_sharpen_sample(&self, filter: u32, lambda: f64, s: f64, t: f64, rr: f64, texel: &mut [f64; 4]) -> bool {
-        let im: &GlTexImage = &self.texture;
-        let p: &GlTexPyramid = &im.pyramid;
-        let base: &GlTexLevel = &self.texture_base;
+        let im = self.image();
+        let p = im.pyramid.expect("a pyramid");
+        let base = self.texture_base.expect("a base level");
         let mut extent = std::cmp::max(base.width, base.height);
         let mut other = [0.0f64; 4];
         let mut weight = 0.0f64;
@@ -1071,7 +913,7 @@ impl SoftDraw {
                 c.base_format != base.base_format ||
                 c.border != base.border ||
                 !im.soft_texture_border_supported(Some(c)) ||
-                (if im.volume { c.read_texel_3d.is_none() } else { c.read_texel.is_none() })) => c,
+                (if im.volume { !c.read_texel_3d } else { !c.read_texel })) => c,
             _ => return true,
         };
         if !self.texture_weight(lambda, &mut weight) ||
@@ -1109,12 +951,11 @@ pub fn scalbn(x: f64, n: i32) -> f64 {
     x * 2f64.powi(n)
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn texture_detail_sample(&self, filter: u32, lambda: f64, s: f64, t: f64, rr: f64, texel: &mut [f64; 4]) -> bool {
-        let im: &GlTexImage = &self.texture;
-        let base: &GlTexLevel = &self.texture_base;
-        let mut repeat: GlTexImage = im.clone();
-        let mut draw: SoftDraw = *self;
+        let im = self.image();
+        let base = self.texture_base.expect("a base level");
+        let mut repeat = *im;
         let mut other = [0.0f64; 4];
         let mut weight = 0.0f64;
         let scale: i32 = std::cmp::min(-(im.detail_level as i64), i32::MAX as i64) as i32;
@@ -1122,10 +963,10 @@ impl SoftDraw {
         if !self.texture_sample(Some(base), SGI_GL_LINEAR, s, t, rr, texel) {
             return false;
         }
-        let detail = match im.detail_image.as_opt() {
-            Some(d) if !(im.one_dimensional || im.volume || im.pyramid.base_level != 0 ||
+        let detail = match im.detail_image {
+            Some(d) if !(im.one_dimensional || im.volume || im.pyramid.is_none_or(|p| p.base_level != 0) ||
                 d.level != 0 || d.border != 0 ||
-                !(d.read_texel.is_some() || d.read_texel_components.is_some()) ||
+                !d.read_texel ||
                 !soft_texture_dimensions(d.width, d.height) ||
                 d.internal_format != base.internal_format ||
                 d.base_format != base.base_format || im.detail_level > 0) => d,
@@ -1144,9 +985,12 @@ impl SoftDraw {
         }
         repeat.wrap_s = SGI_GL_REPEAT;
         repeat.wrap_t = SGI_GL_REPEAT;
-        draw.texture = P::new(&mut repeat);
+        // The detail image is not the draw's image: its texels are not cached.
+        let mut draw = *self;
+        draw.texture = Some(&repeat);
+        draw.texels_cache = None;
         if !self.texture_weight(lambda, &mut weight) ||
-            !draw.texture_sample(Some(&*detail), SGI_GL_LINEAR, ds, dt, 0.0, &mut other)
+            !draw.texture_sample(Some(&detail), SGI_GL_LINEAR, ds, dt, 0.0, &mut other)
         {
             return false;
         }
@@ -1173,11 +1017,11 @@ impl SoftDraw {
     /// for an image of base format format (OpenGL 1.2.1, 3.8.9).
     #[inline(always)]
     pub fn texture_apply(&self, format: u32, env: u32, texel: &mut [f64; 4], rgba: &mut [f64; 4]) {
-        let im: &GlTexImage = &self.texture;
+        let im = self.image();
         let mut format = format;
 
-        if let Some(f) = im.post_filter {
-            f(im.opaque, texel);
+        if im.post_filter {
+            self.texels.post_filter(texel);
         }
         if format == SGI_GL_DEPTH_COMPONENT {
             format = SGI_GL_LUMINANCE;
@@ -1216,9 +1060,9 @@ impl SoftDraw {
     }
 
     pub fn texture(&self, frag: &mut SoftFrag) -> bool {
-        let im: &GlTexImage = &self.texture;
+        let im = self.image();
         let st: &GlDrawState = &self.st;
-        let base = self.texture_base.as_opt().map(|b| &*b);
+        let base = self.texture_base;
         let format = base.map_or(im.base_format, |b| b.base_format);
         let mut texel = [0.0f64; 4];
         let mut rr = 0.0f64;
@@ -1247,9 +1091,10 @@ impl SoftDraw {
                 self.texture_report(8, "invalid footprint, fragment dropped");
                 return false;
             }
-            let mut level = im.pyramid.soft_texture_level(selected.first);
-            if !self.texels.is_null() {
-                self.texels.get().bypass = selected.lambda > 1.0 && !soft_texture_mipmap(im.min_filter);
+            let pyramid = im.pyramid.expect("a pyramid");
+            let mut level = pyramid.soft_texture_level(selected.first);
+            if let Some(cache) = self.texels_cache {
+                cache.borrow_mut().bypass = selected.lambda > 1.0 && !soft_texture_mipmap(im.min_filter);
             }
             if soft_texture_sharpen(selected.filter) {
                 if !self.texture_sharpen_sample(selected.filter, selected.lambda, s, t, rr, &mut texel) {
@@ -1263,7 +1108,7 @@ impl SoftDraw {
                 return false;
             }
             if selected.alpha != 0.0 && selected.first != selected.second {
-                level = im.pyramid.soft_texture_level(selected.second);
+                level = pyramid.soft_texture_level(selected.second);
                 if !self.texture_sample(level, selected.filter, s, t, rr, &mut other) {
                     return false;
                 }

@@ -203,12 +203,12 @@ pub fn soft_texture_plane(v: &[SoftVertex], sub: u32, volume: bool, one_dimensio
     true
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn texture_coefficients(&self, v: &[SoftVertex]) -> bool {
         let mut g = SoftTexPlane::default();
 
-        if self.texture_base.is_null()
-            || soft_texture_plane(v, self.rules.subpixel_bits as u32, self.texture.volume, self.texture.one_dimensional, &mut g)
+        if self.texture_base.is_none()
+            || soft_texture_plane(v, self.rules.subpixel_bits as u32, self.image().volume, self.image().one_dimensional, &mut g)
         {
             return true;
         }
@@ -219,13 +219,13 @@ impl SoftDraw {
     /// Whether a triangle's fragments can take SoftDraw::simple_row() instead of
     /// the full per-fragment path.
     pub fn simple_fragments(&self) -> bool {
-        let st = &*self.st;
-        let t = &*self.t;
+        let st = self.st;
+        let t = self.t;
 
-        if !self.texture.is_null()
+        if self.texture.is_some()
             || st.fog != 0
             || st.clip_planes != 0
-            || !self.polygon_stipple.is_null()
+            || self.polygon_stipple.is_some()
             || st.index_bits != 0
             || self.blend
             || self.logic_op
@@ -235,10 +235,7 @@ impl SoftDraw {
             return false;
         }
         // RasterRules::depth_stencil() drops every fragment of such a draw.
-        if st.depth_test != 0 && (t.load_depth.is_none() || (st.depth_mask != 0 && t.store_depth.is_none())) {
-            return false;
-        }
-        if t.store_rgba.is_some() {
+        if t.store_rgba {
             return !self.rgba_read;
         }
         self.colour_mask == 0 || self.colour_mask == self.rules.colour_bits()
@@ -248,9 +245,9 @@ impl SoftDraw {
     /// px1 of row py, whose edge values for v[2]-v[0] and v[0]-v[1] at px0 are
     /// e1 and e2.
     pub fn simple_row(&self, v: &[SoftVertex], py: i32, mut px0: i32, mut px1: i32, mut e1: i64, mut e2: i64, step1: i64, step2: i64, area: i64, offset: f64, flat: &SoftFrag, smooth: bool, rgba: bool, depth_row: bool) {
-        let rules = &*self.rules;
-        let st = &*self.st;
-        let t = &*self.t;
+        let rules = self.rules;
+        let st = self.st;
+        let t = self.t;
         let y = self.win.oy + py;
         // A flat colour is the same at every pixel unless dithered.
         let fixed = !smooth && !self.dither;
@@ -319,11 +316,11 @@ impl SoftDraw {
                     let zq = rules.depth_code(zw);
 
                     if st.depth_test != 0 {
-                        if !soft_compare(st.depth_func, zq, (t.load_depth.unwrap())(t.opaque, x, y)) {
+                        if !soft_compare(st.depth_func, zq, self.px.load_depth(x, y)) {
                             break 'pixel;
                         }
                         if st.depth_mask != 0 {
-                            (t.store_depth.unwrap())(t.opaque, x, y, zq);
+                            self.px.store_depth(x, y, zq);
                         }
                     }
                 }
@@ -351,13 +348,13 @@ impl SoftDraw {
                         out = rules.rgba_value(self.store_rgb(x, y, &colour), alpha);
                     }
                     for i in 0..self.ntargets as usize {
-                        (t.store_rgba.unwrap())(t.opaque, self.targets[i], x, y, &out);
+                        self.px.store_rgba(self.targets[i], x, y, &out);
                     }
                 } else {
                     let out = if fixed { fixed_colour } else { self.store_rgb(x, y, &colour) };
 
                     for i in 0..self.ntargets as usize {
-                        (t.store_colour.unwrap())(t.opaque, self.targets[i], x, y, out);
+                        self.px.store_colour(self.targets[i], x, y, out);
                     }
                 }
             }
@@ -369,7 +366,7 @@ impl SoftDraw {
 
     /// Out of line, once a row.
     pub fn simple_span(&self, v: &[SoftVertex], py: i32, px0: i32, px1: i32, e1: i64, e2: i64, step1: i64, step2: i64, area: i64, offset: f64, flat: &SoftFrag, smooth: bool) {
-        let rgba = self.t.store_rgba.is_some();
+        let rgba = self.t.store_rgba;
         let depth_row = self.rules.depth_row_given;
 
         self.simple_row(v, py, px0, px1, e1, e2, step1, step2, area, offset, flat, smooth, rgba, depth_row);
@@ -379,7 +376,7 @@ impl SoftDraw {
     /// vertices in the view volume and, for flat shading, the provoking vertex
     /// of the triangle it was clipped from.
     pub fn clipped_triangle(&self, va: &VolumeVertex, vb: &VolumeVertex, vc: &VolumeVertex, provoking: &[f32]) {
-        let st = &*self.st;
+        let st = self.st;
         let verts: [&VolumeVertex; 3] = [va, vb, vc];
         let mut flat = &provoking[SGI_GL_V_COLOR..SGI_GL_V_COLOR + 4];
         let mut flat_index = provoking[SGI_GL_V_INDEX];
@@ -398,8 +395,7 @@ impl SoftDraw {
         let fixed: bool;
         let mut fixed_flat: Option<i32> = None;
         // The row loop for textured fragments, and its inputs.
-        let mut span: Option<SoftTexSpanFn> = None;
-        let mut sp = SoftTexSpan::default();
+        let mut span: Option<(SoftTexSpanFn, SoftTexSpan)> = None;
         let mut area: i64;
         let offset: f64;
         let ccw: bool;
@@ -419,16 +415,16 @@ impl SoftDraw {
         if area == 0 {
             return;
         }
-        if !self.texture_base.is_null()
-            && !soft_texture_plane(&v, sub as u32, self.texture.volume, self.texture.one_dimensional, &mut gradient)
+        if self.texture_base.is_some()
+            && !soft_texture_plane(&v, sub as u32, self.image().volume, self.image().one_dimensional, &mut gradient)
         {
             self.texture_report(16, "invalid primitive coefficients, primitive dropped");
             return;
         }
         // An image with no pyramid has no planes to fail: it samples in double.
-        fixed = !self.fixed.is_null()
-            && (!self.texture_base.is_null() || soft_texture_plane(&v, sub as u32, false, false, &mut gradient));
-        if fixed && self.fixed.lod && gradient.dx[2] == 0.0 && gradient.dy[2] == 0.0 {
+        fixed = self.fixed.is_some()
+            && (self.texture_base.is_some() || soft_texture_plane(&v, sub as u32, false, false, &mut gradient));
+        if fixed && self.fixed_tex().lod && gradient.dx[2] == 0.0 && gradient.dy[2] == 0.0 {
             // Q/W flat, as for the double footprint below: every fragment's
             // lambda is this one, which SoftFixedTex::fixed_coords() would compute
             // for each of them, since s dQ/dx and t dQ/dx are then zero.
@@ -436,26 +432,26 @@ impl SoftDraw {
 
             if q > 0.0 {
                 let iq = 1.0 / q;
-                let a = self.fixed.ns * gradient.dx[0] * iq;
-                let b = self.fixed.nt * gradient.dx[1] * iq;
-                let c = self.fixed.ns * gradient.dy[0] * iq;
-                let e = self.fixed.nt * gradient.dy[1] * iq;
+                let a = self.fixed_tex().ns * gradient.dx[0] * iq;
+                let b = self.fixed_tex().nt * gradient.dx[1] * iq;
+                let c = self.fixed_tex().ns * gradient.dy[0] * iq;
+                let e = self.fixed_tex().nt * gradient.dy[1] * iq;
                 let rho2 = if a * a + b * b > c * c + e * e { a * a + b * b } else { c * c + e * e };
 
                 if rho2 <= f64::MAX {
-                    fixed_flat = Some(self.fixed.fixed_decide(rho2, soft_fixed_lambda(rho2)));
+                    fixed_flat = Some(self.fixed_tex().fixed_decide(rho2, soft_fixed_lambda(rho2)));
                 }
             }
         }
-        if !self.texture_base.is_null() {
-            tex_ns = self.texture_base.width as f64 * soft_texture_lod_scale(self.texture.lod_scale_s);
-            tex_nt = if self.texture.one_dimensional {
+        if self.texture_base.is_some() {
+            tex_ns = self.base_level().width as f64 * soft_texture_lod_scale(self.image().lod_scale_s);
+            tex_nt = if self.image().one_dimensional {
                 0.0
             } else {
-                self.texture_base.height as f64 * soft_texture_lod_scale(self.texture.lod_scale_t)
+                self.base_level().height as f64 * soft_texture_lod_scale(self.image().lod_scale_t)
             };
-            tex_nr = if self.texture.volume {
-                self.texture_base.depth as f64 * soft_texture_lod_scale(self.texture.lod_scale_r)
+            tex_nr = if self.image().volume {
+                self.base_level().depth as f64 * soft_texture_lod_scale(self.image().lod_scale_r)
             } else {
                 0.0
             };
@@ -522,14 +518,13 @@ impl SoftDraw {
         let step0: i64 = -(v[2].y - v[1].y) * (1i64 << sub);
         let step1: i64 = -(v[0].y - v[2].y) * (1i64 << sub);
         let step2: i64 = -(v[1].y - v[0].y) * (1i64 << sub);
-        if fixed && self.fixed.span.is_some() {
-            span = self.fixed.span;
-            sp = SoftTexSpan {
-                v: P::new(&mut v),
-                g: P::new(&mut gradient),
-                row: P::new(&mut tex_row),
+        if let Some(row_loop) = self.fixed.and_then(|f| f.span).filter(|_| fixed) {
+            let mut sp = SoftTexSpan {
+                v: &v,
+                g: &gradient,
+                row: tex_row,
                 flat_lambda: fixed_flat,
-                flat: P::new(&mut flat_frag),
+                flat: &flat_frag,
                 offset,
                 area,
                 step1,
@@ -544,6 +539,7 @@ impl SoftDraw {
                     sp.constant |= 1u8 << k;
                 }
             }
+            span = Some((row_loop, sp));
         }
         let mut py = py0;
         while py <= py1 {
@@ -585,19 +581,22 @@ impl SoftDraw {
                 );
                 continue;
             }
-            if !self.texture_base.is_null() || fixed {
+            if self.texture_base.is_some() || fixed {
                 for k in 0..4 {
                     tex_row[k] = (py as f64 + 0.5 - gradient.y) * gradient.dy[k];
+                }
+                if let Some((_, sp)) = span.as_mut() {
+                    sp.row = tex_row;
                 }
             }
             let mut px = px0 + lo as i32;
             while px <= px0 + hi as i32 {
                 let mut background = false;
 
-                if let Some(span) = span {
+                if let Some((row_loop, sp)) = &span {
                     // The row loop draws up to a fragment the fixed sampler
                     // cannot take, which this loop then draws in double.
-                    let stop = span(self, &sp, py, px, px0 + hi as i32, e1, e2);
+                    let stop = row_loop(self, sp, py, px, px0 + hi as i32, e1, e2);
 
                     e1 = e1.wrapping_add((stop - px) as i64 * step1);
                     e2 = e2.wrapping_add((stop - px) as i64 * step2);
@@ -631,11 +630,11 @@ impl SoftDraw {
                     let mut t = 0.0f64;
                     let mut lambda = 0i32;
 
-                    frag.fixed = self.fixed.fixed_coords(&gradient, &tex_row, px, fixed_flat, &mut s, &mut t, &mut lambda)
+                    frag.fixed = self.fixed_tex().fixed_coords(&gradient, &tex_row, px, fixed_flat, &mut s, &mut t, &mut lambda)
                         && SoftDraw::fixed_sample::<SGI_SOFT_FIXED_ANY, false>(self, s, t, lambda, &mut frag.texel);
                 }
                 // Only texturing reads the coordinates, only fog the distance.
-                if !self.texture.is_null() && !frag.fixed {
+                if self.texture.is_some() && !frag.fixed {
                     for k in 0..4 {
                         frag.texcoord[k] = (w0 * v[0].texcoord[k] + w1 * v[1].texcoord[k] + w2 * v[2].texcoord[k]) / sum;
                     }
@@ -661,7 +660,7 @@ impl SoftDraw {
                     // so a constant one stays exact before its integer part is taken.
                     frag.index = v[0].index + (w1 * (v[1].index - v[0].index) + w2 * (v[2].index - v[0].index)) / sum;
                 }
-                if !self.texture_base.is_null() && !frag.fixed {
+                if self.texture_base.is_some() && !frag.fixed {
                     let mut value = [0.0f64; 4];
                     let mut out = [0.0f64; 5];
 
@@ -712,7 +711,7 @@ impl SoftDraw {
                 return false;
             }
         }
-        if !self.texture_base.is_null() {
+        if self.texture_base.is_some() {
             let mut i = 1usize;
             while i + 1 < *n as usize {
                 let vertices: [&VolumeVertex; 3] = [&poly[0], &poly[i], &poly[i + 1]];
@@ -766,7 +765,7 @@ impl VolumeVertex {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn boundary_plane(&self, v: &VolumeVertex, p: u32) -> f64 {
         if p < SGI_VOLUME_PLANES as u32 {
             v.plane(p as _)
@@ -841,14 +840,14 @@ impl SoftDraw {
     }
 }
 
-impl GlDraw {
-    pub fn soft_polygon_vertex<'a>(&self, indices: Option<&[u32]>, i: usize) -> &'a [f32] {
+impl<'a> GlDraw<'a> {
+    pub fn soft_polygon_vertex(&self, indices: Option<&[u32]>, i: usize) -> &'a [f32] {
         let index = match indices {
             Some(ix) => ix[i] as usize,
             None => i,
         };
 
-        unsafe { std::slice::from_raw_parts(self.vertices.0.add(index * SGI_GL_VERTEX_FLOATS), SGI_GL_VERTEX_FLOATS) }
+        &self.vertices[index * SGI_GL_VERTEX_FLOATS..][..SGI_GL_VERTEX_FLOATS]
     }
 }
 
@@ -961,7 +960,7 @@ pub fn soft_aa_contains_pixel(v: &[SoftVertex], n: usize, px: i32, py: i32, scal
     true
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Rasterize one clipped convex polygon once. Pixel-square clipping
     /// computes geometric coverage; centroid sampling is exact for affine
     /// datums and an approximation for perspective-correct varyings.
@@ -1143,12 +1142,12 @@ impl SoftDraw {
                             continue;
                         }
                     }
-                    if !self.texture_base.is_null() {
+                    if self.texture_base.is_some() {
                         let mut gradient = SoftTexPlane::default();
                         let mut value = [0.0f64; 4];
                         let mut out = [0.0f64; 5];
 
-                        if !soft_texture_plane(&fan, sub as u32, self.texture.volume, self.texture.one_dimensional, &mut gradient) {
+                        if !soft_texture_plane(&fan, sub as u32, self.image().volume, self.image().one_dimensional, &mut gradient) {
                             continue;
                         }
                         for k in 0..4 {
@@ -1160,14 +1159,14 @@ impl SoftDraw {
                             &value,
                             &gradient.dx,
                             &gradient.dy,
-                            self.texture_base.width as f64 * soft_texture_lod_scale(self.texture.lod_scale_s),
-                            if self.texture.one_dimensional {
+                            self.base_level().width as f64 * soft_texture_lod_scale(self.image().lod_scale_s),
+                            if self.image().one_dimensional {
                                 0.0
                             } else {
-                                self.texture_base.height as f64 * soft_texture_lod_scale(self.texture.lod_scale_t)
+                                self.base_level().height as f64 * soft_texture_lod_scale(self.image().lod_scale_t)
                             },
-                            if self.texture.volume {
-                                self.texture_base.depth as f64 * soft_texture_lod_scale(self.texture.lod_scale_r)
+                            if self.image().volume {
+                                self.base_level().depth as f64 * soft_texture_lod_scale(self.image().lod_scale_r)
                             } else {
                                 0.0
                             },
@@ -1210,7 +1209,7 @@ impl SoftDraw {
                 v[i].index = poly[i].attr[SGI_GL_V_BACK_INDEX] as f64;
             }
         }
-        if !self.texture_base.is_null() {
+        if self.texture_base.is_some() {
             let mut i = 1usize;
             while i + 1 < n {
                 let fan = [v[0].clone(), v[i].clone(), v[i + 1].clone()];
@@ -1232,7 +1231,7 @@ impl SoftDraw {
     /// Replay the original fan, including its validation and fragment ordering.
     pub fn polygon_fill(&self, d: &GlDraw, indices: Option<&[u32]>, n: usize, provoking: &[f32]) {
         let v0 = d.soft_polygon_vertex(indices, 0);
-        let prevalidate = !self.texture.is_null() && !(d.mode == SGI_GL_POLYGON && d.fill_by_triangle);
+        let prevalidate = self.texture.is_some() && !(d.mode == SGI_GL_POLYGON && d.fill_by_triangle);
 
         if prevalidate {
             let mut i = 1usize;
@@ -1291,7 +1290,7 @@ impl SoftDraw {
         let mut poly: Vec<VolumeVertex> = vec![VolumeVertex::default(); capacity];
         let mut other: Vec<VolumeVertex> = vec![VolumeVertex::default(); capacity];
         // Facing must not prevalidate texture Q and erase a valid FILL prefix.
-        positions.texture = P::null();
+        positions.texture = None;
         for i in 0..count {
             self.st.volume_from_draw_vertex(d.soft_polygon_vertex(indices, i), &mut poly[i]);
             for k in 0..4 {
@@ -1338,7 +1337,7 @@ impl SoftDraw {
         {
             return SGI_GL_DRAW_OK;
         }
-        mode = unsafe { *d.polygon_modes.0.add(if front { 0 } else { 1 }) };
+        mode = d.polygon_modes.map_or(SGI_GL_FILL, |m| m[if front { 0 } else { 1 }]);
         if mode == SGI_GL_FILL {
             if self.polygon_smooth {
                 self.polygon_smooth(&poly, n, provoking, front, slope);
@@ -1368,7 +1367,7 @@ impl SoftDraw {
             if !self.project(&poly[i], &mut current) {
                 return SGI_GL_DRAW_OK;
             }
-            if !self.texture_base.is_null() && mode == SGI_GL_LINE {
+            if self.texture_base.is_some() && mode == SGI_GL_LINE {
                 let mut next = SoftVertex::default();
                 let mut values = [0.0f64; 4];
                 let mut delta = [0.0f64; 4];
@@ -1378,8 +1377,8 @@ impl SoftDraw {
                     || !current.texture_line_gradient(
                         &next,
                         self.rules.subpixel_bits as u32,
-                        self.texture.volume,
-                        self.texture.one_dimensional,
+                        self.image().volume,
+                        self.image().one_dimensional,
                         &mut values,
                         &mut delta,
                         &mut length,
@@ -1415,14 +1414,13 @@ impl SoftDraw {
 
     /// Dispatch each independently assembled polygon, preserving provoking rules.
     pub fn polygon_modes(&self, d: &GlDraw) -> GlDrawResult {
-        let fill_modes: [u32; 2] = [SGI_GL_FILL, SGI_GL_FILL];
         let mut indices = [0u32; 4];
         let n = d.count;
 
-        if d.polygon_modes.is_null() {
+        if d.polygon_modes.is_none() {
             let mut fill = *d;
 
-            fill.polygon_modes = P(fill_modes.as_ptr() as *mut u32);
+            fill.polygon_modes = Some([SGI_GL_FILL, SGI_GL_FILL]);
             return self.polygon_modes(&fill);
         }
 
@@ -1499,7 +1497,7 @@ impl SoftDraw {
                 }
             }
             SGI_GL_TRIANGLE_FAN | SGI_GL_POLYGON => {
-                if !self.texture.is_null() && d.mode == SGI_GL_POLYGON && !d.fill_by_triangle {
+                if self.texture.is_some() && d.mode == SGI_GL_POLYGON && !d.fill_by_triangle {
                     let mut i = 0usize;
                     while i + 2 < n {
                         if !self.texture_triangle_valid(v(0), v(i + 1), v(i + 2)) {
@@ -1517,7 +1515,7 @@ impl SoftDraw {
             SGI_GL_QUADS => {
                 let mut i = 0usize;
                 while i + 3 < n {
-                    if !self.texture.is_null()
+                    if self.texture.is_some()
                         && (!self.texture_triangle_valid(v(i), v(i + 1), v(i + 2))
                             || !self.texture_triangle_valid(v(i), v(i + 2), v(i + 3)))
                     {
@@ -1533,7 +1531,7 @@ impl SoftDraw {
                 // Vertices 2i - 1, 2i, 2i + 2 and 2i + 1 in order (2.6.1).
                 let mut i = 0usize;
                 while i + 3 < n {
-                    if !self.texture.is_null()
+                    if self.texture.is_some()
                         && (!self.texture_triangle_valid(v(i), v(i + 1), v(i + 3))
                             || !self.texture_triangle_valid(v(i), v(i + 3), v(i + 2)))
                     {
@@ -1557,7 +1555,7 @@ impl SoftDraw {
             let mut v = VolumeVertex::default();
 
             self.st.volume_from_draw_vertex(d.soft_polygon_vertex(None, i), &mut v);
-            if !self.texture.soft_texcoord_valid(self.texture_base.as_opt().map(|b| &*b), &v) {
+            if !self.image().soft_texcoord_valid(self.texture_base, &v) {
                 return false;
             }
         }

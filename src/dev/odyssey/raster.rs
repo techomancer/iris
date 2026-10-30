@@ -114,9 +114,9 @@ pub const SGI_VOLUME_TRIANGLE_MAX: usize = 3 + 6;
 
 pub const SGI_GL_TEX_LEVELS_MAX: u32 = 31;
 
-/// Absolute level identities in a borrowed, immutable normalized image view.
-/// `rgba` / `component` out-parameters are `&mut`.
-#[derive(Clone, Default)]
+/// One level of a texture image, as the family describes it. The `read_*`
+/// flags say which reads the draw's Texels answer for it.
+#[derive(Clone, Copy, Default)]
 pub struct GlTexLevel {
     pub level: u32,
     pub width: u32,
@@ -125,26 +125,19 @@ pub struct GlTexLevel {
     pub base_format: u32,
     pub internal_format: u32,
     pub border: u32,
-    pub read_texel: Option<fn(Opaque, u32, u32, u32, &mut u32) -> bool>,
+    /// The image's detail texture rather than a level of its pyramid.
+    pub detail: bool,
+    pub read_texel: bool,
     /// Border indices range from -1 through width/height, inclusive.
-    pub read_border_texel: Option<fn(Opaque, u32, i32, i32, &mut u32) -> bool>,
-    pub read_texel_3d: Option<fn(Opaque, u32, u32, u32, u32, &mut u32) -> bool>,
-    pub opaque: Opaque,
+    pub read_border_texel: bool,
+    pub read_texel_3d: bool,
     /// Each signed axis ranges from -1 through its interior dimension.
-    pub read_border_texel_3d: Option<fn(Opaque, u32, i32, i32, i32, &mut u32) -> bool>,
-    /// Raw readers use base-format slots and per-channel widths.
-    pub component_bits: [u8; 4],
-    pub read_texel_components: Option<fn(Opaque, u32, u32, u32, &mut [u16; 4]) -> bool>,
-    pub read_border_texel_components: Option<fn(Opaque, u32, i32, i32, &mut [u16; 4]) -> bool>,
-    pub read_texel_3d_components: Option<fn(Opaque, u32, u32, u32, u32, &mut [u16; 4]) -> bool>,
-    pub read_border_texel_3d_components: Option<fn(Opaque, u32, i32, i32, i32, &mut [u16; 4]) -> bool>,
+    pub read_border_texel_3d: bool,
 }
 
-#[derive(Clone, Default)]
-pub struct GlTexPyramid {
-    /// `count` levels.
-    pub levels: P<GlTexLevel>,
-    pub count: u32,
+#[derive(Clone, Copy, Default)]
+pub struct GlTexPyramid<'a> {
+    pub levels: &'a [GlTexLevel],
     pub base_level: u32,
     pub max_level: u32,
     pub min_lod: f64,
@@ -153,12 +146,10 @@ pub struct GlTexPyramid {
 
 /// One family-owned level-zero image and its texture object's sampler.
 /// volume selects 3D sampling, one_dimensional S-only sampling; they are
-/// mutually exclusive. Dimensions count interior texels. Packed callbacks
-/// return canonical RRGGBBAA; raw-component callbacks return base-format
-/// channels normalized by component_bits. Borrowed, immutable through each
-/// synchronous draw; no pointer is retained.
-#[derive(Clone, Default)]
-pub struct GlTexImage {
+/// mutually exclusive. Dimensions count interior texels. Texels return
+/// canonical RRGGBBAA. Immutable through each synchronous draw.
+#[derive(Clone, Copy, Default)]
+pub struct GlTexImage<'a> {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
@@ -170,44 +161,78 @@ pub struct GlTexImage {
     pub wrap_t: u32,
     pub wrap_r: u32,
     pub border_color: [f32; 4],
-    pub read_texel: Option<fn(Opaque, u32, u32, &mut u32) -> bool>,
-    pub read_texel_3d: Option<fn(Opaque, u32, u32, u32, &mut u32) -> bool>,
+    pub read_texel: bool,
+    pub read_texel_3d: bool,
     pub volume: bool,
     pub one_dimensional: bool,
-    pub opaque: Opaque,
-    /// Null selects the level-zero image fields.
-    pub pyramid: P<GlTexPyramid>,
+    /// None selects the level-zero image fields.
+    pub pyramid: Option<GlTexPyramid<'a>>,
     /// Required for a 2D image with border == 1; outside the interior only.
-    pub read_border_texel: Option<fn(Opaque, i32, i32, &mut u32) -> bool>,
+    pub read_border_texel: bool,
     /// Positive per-axis derivative factors; zero preserves identity.
     pub lod_scale_s: f64,
     pub lod_scale_t: f64,
-    /// Expanded RGBA after filtering, before the texture environment.
-    pub post_filter: Option<fn(Opaque, &mut [f64; 4])>,
+    /// Texels::post_filter() applies to the expanded RGBA after filtering,
+    /// before the texture environment.
+    pub post_filter: bool,
     /// Required for a volume with border == 1, including depth one.
-    pub read_border_texel_3d: Option<fn(Opaque, i32, i32, i32, &mut u32) -> bool>,
+    pub read_border_texel_3d: bool,
     /// Positive volume R derivative factor; zero preserves identity.
     pub lod_scale_r: f64,
-    /// Null selects the public default curve; lambda is already clamped.
-    pub read_filter_weight: Option<fn(Opaque, f64, &mut f64) -> bool>,
-    /// Borrowed level-zero detail image; L <= 0, mode ADD or MODULATE.
-    pub detail_image: P<GlTexLevel>,
+    /// Texels::filter_weight() replaces the public default curve; lambda is
+    /// already clamped.
+    pub read_filter_weight: bool,
+    /// Level-zero detail image; L <= 0, mode ADD or MODULATE.
+    pub detail_image: Option<GlTexLevel>,
     pub detail_level: i32,
     pub detail_mode: u32,
     /// Zero disables comparison. SGIX operators compare depth to projected R.
     pub shadow_compare: u32,
     pub shadow_ambient: f64,
-    pub component_bits: [u8; 4],
-    pub read_texel_components: Option<fn(Opaque, u32, u32, &mut [u16; 4]) -> bool>,
-    pub read_texel_3d_components: Option<fn(Opaque, u32, u32, u32, &mut [u16; 4]) -> bool>,
-    pub read_border_texel_components: Option<fn(Opaque, i32, i32, &mut [u16; 4]) -> bool>,
-    pub read_border_texel_3d_components: Option<fn(Opaque, i32, i32, i32, &mut [u16; 4]) -> bool>,
     /// GL_SGIX_texture_coordinate_clamp: with max_clamp set, a CLAMP axis
     /// clamps to [0, max_clamp_*] instead of [0, 1].
     pub max_clamp: bool,
     pub max_clamp_s: f64,
     pub max_clamp_t: f64,
     pub max_clamp_r: f64,
+}
+
+/// Where a draw's texels come from: the family's texture storage. `level`
+/// is one of the image's pyramid levels or its detail image, or None for
+/// the level-zero image itself. A read outside the storage is None. Bands
+/// of one draw read through it at once.
+pub trait Texels: Sync {
+    fn texel(&self, level: Option<&GlTexLevel>, x: u32, y: u32) -> Option<u32>;
+    fn border_texel(&self, level: Option<&GlTexLevel>, x: i32, y: i32) -> Option<u32>;
+    fn texel_3d(&self, level: Option<&GlTexLevel>, x: u32, y: u32, z: u32) -> Option<u32>;
+    fn border_texel_3d(&self, level: Option<&GlTexLevel>, x: i32, y: i32, z: i32) -> Option<u32>;
+    /// The image's post-filter (GlTexImage::post_filter).
+    fn post_filter(&self, rgba: &mut [f64; 4]) {
+        let _ = rgba;
+    }
+    /// The detail and sharpen weight at lambda (GlTexImage::read_filter_weight).
+    fn filter_weight(&self, lambda: f64) -> Option<f64> {
+        let _ = lambda;
+        None
+    }
+}
+
+/// A draw without a texture reads no texels.
+pub struct NoTexels;
+
+impl Texels for NoTexels {
+    fn texel(&self, _: Option<&GlTexLevel>, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn border_texel(&self, _: Option<&GlTexLevel>, _: i32, _: i32) -> Option<u32> {
+        None
+    }
+    fn texel_3d(&self, _: Option<&GlTexLevel>, _: u32, _: u32, _: u32) -> Option<u32> {
+        None
+    }
+    fn border_texel_3d(&self, _: Option<&GlTexLevel>, _: i32, _: i32, _: i32) -> Option<u32> {
+        None
+    }
 }
 
 /// Quantized scalar channels, each normalized by its own declared maximum.
@@ -217,123 +242,97 @@ pub struct RasterColour {
     pub component: [u32; 4],
 }
 
-pub type RenderResult = u32;
-
-pub type RenderRole = u32;
-
-pub type RenderBuffer = u32;
-
-pub type RenderEye = u32;
-
-pub type RenderNumeric = u32;
-
-pub type RenderChannel = u32;
-
-#[derive(Clone, Copy, Default)]
-pub struct RenderComponent {
-    pub channel: RenderChannel,
-    pub numeric: RenderNumeric,
-    pub storage_bits: u8,
+/// The family's planes as one thread of a draw reaches them, in plane
+/// pixels. target is one of the drawable's colour targets, which only the
+/// family interprets; a colour is the rules' color_bits a channel, red
+/// highest. Only the methods RasterTarget's flags name are called; the
+/// planes are shared, so a store goes through interior mutability.
+pub trait Planes {
+    fn store_colour(&self, target: ColourTarget, x: i32, y: i32, colour: u32) {
+        let _ = (target, x, y, colour);
+        unreachable!("store_colour without RasterTarget::store_colour");
+    }
+    /// The colour stored at (x, y), or in colour-index mode the index.
+    fn load_colour(&self, target: ColourTarget, x: i32, y: i32) -> u32 {
+        let _ = (target, x, y);
+        unreachable!("load_colour without RasterTarget::load_colour");
+    }
+    fn store_index(&self, target: ColourTarget, x: i32, y: i32, index: u32, mask: u32) {
+        let _ = (target, x, y, index, mask);
+        unreachable!("store_index without RasterTarget::store_index");
+    }
+    fn store_rgba(&self, target: ColourTarget, x: i32, y: i32, colour: &RasterColour) {
+        let _ = (target, x, y, colour);
+        unreachable!("store_rgba without RasterTarget::store_rgba");
+    }
+    /// The colour at (x, y); None where it cannot be read.
+    fn load_rgba(&self, target: ColourTarget, x: i32, y: i32) -> Option<RasterColour> {
+        let _ = (target, x, y);
+        unreachable!("load_rgba without RasterTarget::load_rgba");
+    }
+    fn load_depth(&self, x: i32, y: i32) -> u32;
+    fn store_depth(&self, x: i32, y: i32, depth: u32);
+    fn load_stencil(&self, x: i32, y: i32) -> u32 {
+        let _ = (x, y);
+        unreachable!("load_stencil without RasterTarget::stencil");
+    }
+    fn store_stencil(&self, x: i32, y: i32, stencil: u32) {
+        let _ = (x, y, stencil);
+        unreachable!("store_stencil without RasterTarget::stencil");
+    }
+    /// A fog factor the family supplies, per draw rather than GL state.
+    fn fog_factor(&self, window_z: f32, eye_z: f32) -> f32 {
+        let _ = (window_z, eye_z);
+        unreachable!("fog_factor without RasterTarget::fog_factor");
+    }
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct RenderResource {
-    pub backing_id: u64,
-    pub backing_generation: u64,
-    pub view_id: u64,
-    pub view_generation: u64,
-    pub role: RenderRole,
-    pub target: ColourTarget,
-    pub buffer: RenderBuffer,
-    pub auxiliary_index: u32,
-    pub eye: RenderEye,
-    pub width: u32,
-    pub height: u32,
-    pub depth: u32,
-    pub texture_level: u32,
-    pub border: [u8; 3],
-    pub bottom_origin: bool,
-    pub component_count: u8,
-    pub component: [RenderComponent; 4],
+/// The planes a draw writes, as the family lends them for one draw: whole,
+/// or split so that each band of a banded draw has its own rows.
+pub trait PlaneStore: Send {
+    /// The planes, for drawing on this thread.
+    fn planes(&mut self) -> Box<dyn Planes + '_>;
+    /// One store per band, band b holding the rows SoftDraw::row_in_band()
+    /// gives it.
+    fn split(&mut self, bands: u32) -> Vec<Box<dyn PlaneStore + '_>>;
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct RenderRect {
-    pub x0: u32,
-    pub y0: u32,
-    pub x1: u32,
-    pub y1: u32,
+/// The setup of a draw, before it touches a plane.
+pub struct NoPlanes;
+
+impl Planes for NoPlanes {
+    fn load_depth(&self, _: i32, _: i32) -> u32 {
+        unreachable!("a pixel access before the draw lent its planes");
+    }
+    fn store_depth(&self, _: i32, _: i32, _: u32) {
+        unreachable!("a pixel access before the draw lent its planes");
+    }
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct RenderCommitResult {
-    pub status: RenderResult,
-    pub complete_pixels: u64,
-    pub partial_pixel: bool,
-    pub extent_known: bool,
-}
-
-/// One byte per pixel, in the resource's row order, borrowed for one call.
-#[derive(Clone, Copy, Default)]
-pub struct RenderWriteCoverage {
-    pub pixel: P<u8>,
-    pub stride_bytes: usize,
-    pub capacity_bytes: usize,
-}
-
-/// The resource callbacks a family gives its planes. `slots` are the raw
-/// slot words; `stride_slots` and `capacity_slots` count slot words.
+/// What the family's planes are and offer, for one draw. The flags say
+/// which Planes methods it answers; load_depth and store_depth always.
 #[derive(Clone, Default)]
-pub struct RenderResourceOps {
-    pub snapshot: Option<fn(Opaque, &RenderResource, u32, &RenderRect, &mut [u32], usize, usize) -> RenderResult>,
-    pub commit: Option<fn(Opaque, &RenderResource, u32, &RenderRect, &[u32], usize, usize) -> RenderCommitResult>,
-    /// (opaque, resource, slice, rect, slots, stride_slots, capacity_slots, writes)
-    pub commit_covered: Option<fn(Opaque, &RenderResource, u32, &RenderRect, &[u32], usize, usize, Option<&RenderWriteCoverage>) -> RenderCommitResult>,
-    /// An index resource's commit: slots hold final indices already merged
-    /// under effective_mask; uncovered pixels must keep their state.
-    /// (..., writes, effective_mask)
-    pub commit_index_covered: Option<fn(Opaque, &RenderResource, u32, &RenderRect, &[u32], usize, usize, Option<&RenderWriteCoverage>, u32) -> RenderCommitResult>,
-}
-
-/// The family's planes as the rasterizer reaches them, in plane pixels.
-/// target is one of the drawable's colour targets, which only the family
-/// interprets; a colour is the rules' color_bits a channel, red highest.
-#[derive(Clone, Default)]
-pub struct RasterTarget {
-    pub store_colour: Option<fn(Opaque, ColourTarget, i32, i32, u32)>,
-    /// The colour stored at (x, y), or in colour-index mode the index;
-    /// None for planes that cannot be read back.
-    pub load_colour: Option<fn(Opaque, ColourTarget, i32, i32) -> u32>,
-    /// (opaque, target, x, y, index, mask)
-    pub store_index: Option<fn(Opaque, ColourTarget, i32, i32, u32, u32)>,
-    pub load_depth: Option<fn(Opaque, i32, i32) -> u32>,
-    pub store_depth: Option<fn(Opaque, i32, i32, u32)>,
-    /// The stencil buffer; None for planes without one.
-    pub load_stencil: Option<fn(Opaque, i32, i32) -> u32>,
-    pub store_stencil: Option<fn(Opaque, i32, i32, u32)>,
-    /// A fog factor the family supplies (opaque, window_z, eye_z); per
-    /// draw, not GL state. None selects the built-in modes.
-    pub fog_factor: Option<fn(Opaque, f32, f32) -> f32>,
-    pub opaque: Opaque,
+pub struct RasterTarget<'a> {
+    pub store_colour: bool,
+    pub load_colour: bool,
+    pub store_index: bool,
+    pub store_rgba: bool,
+    pub load_rgba: bool,
+    /// A stencil buffer: load_stencil and store_stencil.
+    pub stencil: bool,
+    /// Planes::fog_factor() replaces the built-in fog modes.
+    pub fog_factor: bool,
     /// Plane row of the display's top line, for a screen-anchored dither.
     pub screen_top: i32,
     /// Whether plane rows below the top line have larger y.
     pub screen_rows_down: bool,
     /// Current binding; resolved once by the family before drawing.
-    pub texture: P<GlTexImage>,
+    pub texture: Option<GlTexImage<'a>>,
     /// An opaque polygon stipple: a fragment whose stipple bit is clear
     /// takes stipple_background (or stipple_background_index).
     pub stipple_opaque: bool,
     pub stipple_background: [f32; 4],
     pub stipple_background_index: u32,
-    /// Optional complete RGBA stores and reads. Positive alpha_bits
-    /// requires the store.
-    pub store_rgba: Option<fn(Opaque, ColourTarget, i32, i32, &RasterColour)>,
-    pub load_rgba: Option<fn(Opaque, ColourTarget, i32, i32, &mut RasterColour) -> bool>,
-    /// `resource_count` resources, borrowed until the draw returns.
-    pub resources: P<RenderResource>,
-    pub resource_count: usize,
-    pub resource_ops: P<RenderResourceOps>,
     /// Bands run serially.
     pub concurrent_pixels: bool,
     pub band_min_pixels: u32,
@@ -366,15 +365,24 @@ pub struct SoftWindow {
     pub y0: i32,
     pub x1: i32,
     pub y1: i32,
-    pub clip: P<ClipList>,
+    pub clip: ClipList,
 }
 
-/// One draw's fixed inputs.
-#[derive(Clone, Copy, Default)]
-pub struct SoftDraw {
-    pub rules: P<RasterRules>,
-    pub t: P<RasterTarget>,
-    pub st: P<GlDrawState>,
+/// Once-a-draw reports, shared by the bands of one draw.
+#[derive(Default)]
+pub struct SoftReports {
+    pub texture: std::sync::atomic::AtomicU32,
+    pub rgba: std::sync::atomic::AtomicBool,
+}
+
+/// One draw's fixed inputs, the part of a draw its bands share.
+#[derive(Clone, Copy)]
+pub struct SoftShared<'a> {
+    pub rules: &'a RasterRules,
+    pub t: &'a RasterTarget<'a>,
+    pub st: &'a GlDrawState,
+    pub texels: &'a dyn Texels,
+    pub reports: &'a SoftReports,
     pub win: SoftWindow,
     pub targets: [ColourTarget; SGI_GL_MAX_TARGETS as usize],
     pub ntargets: u32,
@@ -388,10 +396,9 @@ pub struct SoftDraw {
     pub colour_mask: u32,
     /// The stored colour is dithered: GL_DITHER and the rules' dither.
     pub dither: bool,
-    pub texture: P<GlTexImage>,
-    pub texture_base: P<GlTexLevel>,
+    pub texture: Option<&'a GlTexImage<'a>>,
+    pub texture_base: Option<&'a GlTexLevel>,
     pub texture_last: u32,
-    pub texture_reports: P<u32>,
     pub point_size: u32,
     pub line_width: u32,
     pub point_smooth: bool,
@@ -399,17 +406,111 @@ pub struct SoftDraw {
     pub smooth_point_size: f64,
     pub smooth_line_width: f64,
     pub polygon_smooth: bool,
-    pub polygon_stipple: P<u32>,
+    pub polygon_stipple: Option<&'a [u32; 32]>,
     pub rgba_mask: u32,
     pub rgba_read: bool,
-    pub rgba_reported: P<bool>,
-    /// Texels already read in this draw, or null.
-    pub texels: P<SoftTexelCache>,
-    /// Filled triangles sample in fixed point, or null.
-    pub fixed: P<SoftFixedTex>,
+    /// Filled triangles sample in fixed point.
+    pub fixed: Option<&'a SoftFixedTex>,
     /// Of bands > 1, the rows this pass draws (SoftDraw::row_in_band()).
     pub band: u32,
     pub bands: u32,
+}
+
+/// A draw as one thread runs it: the shared inputs, and the planes and
+/// texel cache that are this thread's alone. It derefs to the shared part,
+/// so the drawing code reads `self.rules` whichever part a field is in.
+#[derive(Clone, Copy)]
+pub struct SoftDraw<'a> {
+    pub shared: SoftShared<'a>,
+    /// The planes; NoPlanes until the draw starts on them.
+    pub px: &'a dyn Planes,
+    /// This thread's texel cache, when texels read in this draw are kept.
+    pub texels_cache: Option<&'a std::cell::RefCell<SoftTexelCache>>,
+}
+
+impl<'a> std::ops::Deref for SoftDraw<'a> {
+    type Target = SoftShared<'a>;
+    fn deref(&self) -> &SoftShared<'a> {
+        &self.shared
+    }
+}
+
+impl std::ops::DerefMut for SoftDraw<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shared
+    }
+}
+
+impl<'a> SoftDraw<'a> {
+    /// A draw under rules into target, in state st, with nothing else
+    /// decided yet.
+    pub fn new(rules: &'a RasterRules, t: &'a RasterTarget<'a>, st: &'a GlDrawState, reports: &'a SoftReports) -> Self {
+        SoftDraw {
+            shared: SoftShared {
+                rules,
+                t,
+                st,
+                texels: &NoTexels,
+                reports,
+                win: SoftWindow::default(),
+                targets: [0; SGI_GL_MAX_TARGETS as usize],
+                ntargets: 0,
+                back_colors: false,
+                blend: false,
+                logic_op: false,
+                colour_mask: 0,
+                dither: false,
+                texture: None,
+                texture_base: None,
+                texture_last: 0,
+                point_size: 0,
+                line_width: 0,
+                point_smooth: false,
+                line_smooth: false,
+                smooth_point_size: 0.0,
+                smooth_line_width: 0.0,
+                polygon_smooth: false,
+                polygon_stipple: None,
+                rgba_mask: 0,
+                rgba_read: false,
+                fixed: None,
+                band: 0,
+                bands: 0,
+            },
+            px: &NoPlanes,
+            texels_cache: None,
+        }
+    }
+
+    /// The draw's texture, which a caller has checked is there.
+    pub fn image(&self) -> &'a GlTexImage<'a> {
+        self.texture.expect("a textured draw")
+    }
+
+    /// The base level of the draw's pyramid, which a caller has checked is
+    /// there.
+    pub fn base_level(&self) -> &'a GlTexLevel {
+        self.texture_base.expect("a texture pyramid")
+    }
+
+    /// The draw on planes px.
+    pub fn with_planes<'p>(&self, px: &'p dyn Planes) -> SoftDraw<'p>
+    where
+        'a: 'p,
+    {
+        SoftDraw { shared: self.shared, px, texels_cache: self.texels_cache }
+    }
+}
+
+impl<'a> SoftShared<'a> {
+    /// The draw on this thread: on planes px, keeping texels in cache when
+    /// it is textured.
+    pub fn on<'p>(&self, px: &'p dyn Planes, cache: &'p std::cell::RefCell<SoftTexelCache>) -> SoftDraw<'p>
+    where
+        'a: 'p,
+    {
+        SoftDraw { shared: *self, px, texels_cache: self.texture.map(|_| cache) }
+    }
 }
 
 /// A vertex after transformation, ready to rasterize.
@@ -500,7 +601,7 @@ impl GlDrawState {
             win.x1 = win.x1.max(d.clip.r[i].x1);
             win.y1 = win.y1.max(d.clip.r[i].y1);
         }
-        win.clip = P::from_ref(&d.clip);
+        win.clip = d.clip;
         true
     }
 }
@@ -540,10 +641,10 @@ impl RasterRules {
     }
 }
 
-impl RasterTarget {
+impl RasterTarget<'_> {
     /// Whether the target can take the colour-index work a draw state asks.
     pub fn soft_check_index(&self, index_bits: u32) -> bool {
-        if index_bits != 0 && self.store_index.is_none() {
+        if index_bits != 0 && !self.store_index {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: colour-index drawing is not implemented for these planes; nothing drawn");
             return false;
         }
@@ -658,9 +759,9 @@ impl RasterRules {
 
     /// Reject unsupported capabilities before the operation can write any plane.
     pub fn rgba_capable(&self, t: &RasterTarget, read: bool) -> bool {
-        if (self.alpha_bits != 0 && t.store_rgba.is_none()) ||
-            (t.store_rgba.is_some() && read && t.load_rgba.is_none()) ||
-            (t.store_rgba.is_none() && t.load_rgba.is_some())
+        if (self.alpha_bits != 0 && !t.store_rgba) ||
+            (t.store_rgba && read && !t.load_rgba) ||
+            (!t.store_rgba && t.load_rgba)
         {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: inconsistent RGBA callbacks; operation dropped");
             return false;
@@ -669,9 +770,13 @@ impl RasterRules {
     }
 
     /// Read every selected destination before any colour/depth/stencil write.
-    pub fn rgba_load(&self, t: &RasterTarget, targets: &[ColourTarget], count: u32, x: i32, y: i32, dest: &mut [RasterColour; SGI_GL_MAX_TARGETS as usize], reported: &mut bool) -> bool {
+    pub fn rgba_load(&self, px: &dyn Planes, targets: &[ColourTarget], count: u32, x: i32, y: i32, dest: &mut [RasterColour; SGI_GL_MAX_TARGETS as usize], reported: &std::sync::atomic::AtomicBool) -> bool {
         for i in 0..count as usize {
-            let mut valid = (t.load_rgba.unwrap())(t.opaque, targets[i], x, y, &mut dest[i]);
+            let loaded = px.load_rgba(targets[i], x, y);
+            let mut valid = loaded.is_some();
+            if let Some(c) = loaded {
+                dest[i] = c;
+            }
 
             let mut k = 0;
             while valid && k < 4 {
@@ -683,9 +788,7 @@ impl RasterRules {
             }
             if !valid {
                 // Bands of one draw share the flag (soft_bands_run()).
-                let old = *reported;
-                *reported = true;
-                if !old {
+                if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     crate::dlog!(LogModule::Odyssey, "sgi-gl: RGBA destination read failed; pixel writes dropped");
                 }
                 return false;
@@ -713,7 +816,7 @@ pub static SOFT_BAYER4: [[u8; 4]; 4] = [
     [15, 7, 13, 5],
 ];
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// A fragment's colour at plane pixel (x, y) as the planes store it:
     /// dithered while the draw dithers, otherwise rounded as RasterRules::rgb()
     /// rounds. A clamped component of 0 or 1 is exact either way, and one
@@ -815,7 +918,7 @@ impl RasterRules {
     /// Whether the planes have a stencil buffer, and its largest value.
     pub fn stencil_max(&self, t: &RasterTarget, max: &mut u32) -> bool {
         *max = (1u32.wrapping_shl(self.stencil_bits as u32)).wrapping_sub(1);
-        self.stencil_bits != 0 && t.load_stencil.is_some() && t.store_stencil.is_some()
+        self.stencil_bits != 0 && t.stencil
     }
 }
 
@@ -823,8 +926,8 @@ impl GlDrawState {
     /// One of glStencilOp's operations on the stencil value at (x, y), the
     /// result written under the stencil write mask (4.1.5, 4.2.2). GL_INCR
     /// and GL_DECR clamp to the buffer's range.
-    pub fn stencil_op(&self, t: &RasterTarget, x: i32, y: i32, op: u32, max: u32, ref_: u32) {
-        let old = (t.load_stencil.unwrap())(t.opaque, x, y) & max;
+    pub fn stencil_op(&self, px: &dyn Planes, x: i32, y: i32, op: u32, max: u32, ref_: u32) {
+        let old = px.load_stencil(x, y) & max;
         let mask = self.stencil_write_mask & max;
         let value: u32;
 
@@ -836,18 +939,16 @@ impl GlDrawState {
             SGI_GL_INVERT => value = !old & max,
             _ => value = 0,
         }
-        (t.store_stencil.unwrap())(t.opaque, x, y, (old & !mask) | (value & mask));
+        px.store_stencil(x, y, (old & !mask) | (value & mask));
     }
 }
 
 impl RasterRules {
-    pub fn depth_stencil(&self, st: &GlDrawState, t: &RasterTarget, x: i32, y: i32, z: f64) -> bool {
+    pub fn depth_stencil(&self, st: &GlDrawState, t: &RasterTarget, px: &dyn Planes, x: i32, y: i32, z: f64) -> bool {
         let mut smax: u32 = 0;
         let mut sref: u32 = 0;
 
-        if !(z >= 0.0 && z <= 1.0) ||
-            (st.depth_test != 0 && (t.load_depth.is_none() || (st.depth_mask != 0 && t.store_depth.is_none())))
-        {
+        if !(0.0..=1.0).contains(&z) {
             return false;
         }
         // The reference clamps to the buffer's range; with no stencil buffer
@@ -860,27 +961,27 @@ impl RasterRules {
             if !soft_compare(
                 st.stencil_func,
                 sref & vmask,
-                (t.load_stencil.unwrap())(t.opaque, x, y) & smax & vmask,
+                px.load_stencil(x, y) & smax & vmask,
             ) {
-                st.stencil_op(t, x, y, st.stencil_op[0], smax, sref);
+                st.stencil_op(px, x, y, st.stencil_op[0], smax, sref);
                 return false;
             }
         }
         let zq = self.depth_code(z);
         if st.depth_test != 0 {
-            if !soft_compare(st.depth_func, zq, (t.load_depth.unwrap())(t.opaque, x, y)) {
+            if !soft_compare(st.depth_func, zq, px.load_depth(x, y)) {
                 if stencil {
-                    st.stencil_op(t, x, y, st.stencil_op[1], smax, sref);
+                    st.stencil_op(px, x, y, st.stencil_op[1], smax, sref);
                 }
                 return false;
             }
             if st.depth_mask != 0 {
-                (t.store_depth.unwrap())(t.opaque, x, y, zq);
+                px.store_depth(x, y, zq);
             }
         }
         // A disabled depth test passes (4.1.5).
         if stencil {
-            st.stencil_op(t, x, y, st.stencil_op[2], smax, sref);
+            st.stencil_op(px, x, y, st.stencil_op[2], smax, sref);
         }
         true
     }
@@ -950,7 +1051,7 @@ impl RasterRules {
 
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn blend(&self, x: i32, y: i32, src: u32, alpha: f64, dst: u32) -> u32 {
         let mut out = [0.0f64; 3];
 
@@ -979,7 +1080,7 @@ impl RasterRules {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn rgba_result(&self, x: i32, y: i32, frag: &SoftFrag, dest: &RasterColour) -> RasterColour {
         let mut out = RasterColour::default();
         let rules = &*self.rules;
@@ -1060,7 +1161,7 @@ impl RasterRules {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Which of the operations that read the stored colour a draw state
     /// enables. The logical operation applies to a colour index while
     /// GL_INDEX_LOGIC_OP is enabled, and to an RGBA colour while
@@ -1072,7 +1173,7 @@ impl SoftDraw {
     /// the draw. An RGBA draw is dithered while GL_DITHER is enabled under
     /// rules that name a dither; a colour index never is.
     pub fn setup_ops(&mut self) -> bool {
-        let st = self.st.get();
+        let st = self.st;
 
         if st.index_bits != 0 {
             self.blend = false;
@@ -1091,13 +1192,13 @@ impl SoftDraw {
             if !self.rules.rgba_capable(&self.t, self.rgba_read) {
                 return false;
             }
-            if self.t.store_rgba.is_some() {
+            if self.t.store_rgba {
                 return true;
             }
         }
         if (self.blend || self.logic_op ||
             (st.index_bits == 0 && self.colour_mask != 0 && self.colour_mask != self.rules.colour_bits())) &&
-            self.t.load_colour.is_none()
+            !self.t.load_colour
         {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: blending, logical operations and partial colour masks need planes that can be read back; drawn without them");
             self.blend = false;
@@ -1120,12 +1221,18 @@ pub struct SoftFixedStore {
     pub cell: Vec<u64>,
     pub size: usize,
     pub plain: Vec<u64>,
-    pub plain_size: usize,
 }
 
 thread_local! {
-    pub static SOFT_TEXEL_CACHE: std::cell::RefCell<Option<Box<SoftTexelCache>>> =
-        const { std::cell::RefCell::new(None) };
+    pub static SOFT_TEXEL_CACHE: std::cell::RefCell<SoftTexelCache> = std::cell::RefCell::new(SoftTexelCache::new());
+}
+
+/// Run f with this thread's texel cache, begun for a new draw.
+pub fn with_texel_cache<R>(f: impl FnOnce(&std::cell::RefCell<SoftTexelCache>) -> R) -> R {
+    SOFT_TEXEL_CACHE.with(|cache| {
+        cache.borrow_mut().begin();
+        f(cache)
+    })
 }
 
 thread_local! {
@@ -1137,7 +1244,7 @@ thread_local! {
         });
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Fog (3.10): the fog factor f from the fragment's fog coordinate c by
     /// the mode, clamped to [0, 1], blends an RGBA fragment's red, green and
     /// blue toward the fog colour, f C + (1 - f) Cf, and adds (1 - f) times
@@ -1151,9 +1258,9 @@ impl SoftDraw {
         let mut f: f64;
         let dens = st.fog_density as f64;
 
-        if let Some(ff) = self.t.fog_factor {
+        if self.t.fog_factor {
             // A family's own curve replaces the mode; the blend is the same.
-            f = ff(self.t.opaque, z as f32, c as f32) as f64;
+            f = self.px.fog_factor(z as f32, c as f32) as f64;
         } else if st.fog_mode == SGI_GL_LINEAR {
             f = if st.fog_end == st.fog_start {
                 if c < st.fog_end as f64 { 1.0 } else { 0.0 }
@@ -1189,7 +1296,7 @@ impl GlDrawState {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// A fragment's colour value from an interpolated or flat index.
     pub fn soft_index(&self, index: f64) -> u32 {
         gl_index_value(self.st.index_bits, index)
@@ -1217,12 +1324,12 @@ impl SoftDraw {
         let t: &RasterTarget = &self.t;
         let st: &GlDrawState = &self.st;
 
-        if st.index_bits == 0 && t.store_rgba.is_some() {
+        if st.index_bits == 0 && t.store_rgba {
             let mut i = 0;
             while self.rgba_mask != 0 && i < self.ntargets as usize {
                 let out = self.rgba_result(x, y, f, &dest[i]);
 
-                (t.store_rgba.unwrap())(t.opaque, self.targets[i], x, y, &out);
+                self.px.store_rgba(self.targets[i], x, y, &out);
                 i += 1;
             }
             return;
@@ -1245,11 +1352,11 @@ impl SoftDraw {
                 out = soft_logic_op(
                     st.logic_op_mode,
                     colour,
-                    (t.load_colour.unwrap())(t.opaque, self.targets[i], x, y),
+                    self.px.load_colour(self.targets[i], x, y),
                 ) & (if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 });
             }
             if st.index_bits != 0 {
-                (t.store_index.unwrap())(t.opaque, self.targets[i], x, y, out, st.index_mask);
+                self.px.store_index(self.targets[i], x, y, out, st.index_mask);
                 continue;
             }
             if self.colour_mask == 0 {
@@ -1261,13 +1368,13 @@ impl SoftDraw {
                     y,
                     colour,
                     self.rules.alpha(f.rgba[3]) as f64 / self.rules.alpha_max() as f64,
-                    (t.load_colour.unwrap())(t.opaque, self.targets[i], x, y),
+                    self.px.load_colour(self.targets[i], x, y),
                 );
             }
             if self.colour_mask != self.rules.colour_bits() {
-                out = (out & self.colour_mask) | ((t.load_colour.unwrap())(t.opaque, self.targets[i], x, y) & !self.colour_mask);
+                out = (out & self.colour_mask) | (self.px.load_colour(self.targets[i], x, y) & !self.colour_mask);
             }
-            (t.store_colour.unwrap())(t.opaque, self.targets[i], x, y, out);
+            self.px.store_colour(self.targets[i], x, y, out);
         }
     }
 
@@ -1282,11 +1389,11 @@ impl SoftDraw {
         if !(z >= 0.0 && z <= 1.0) {
             return;
         }
-        if !self.texture.is_null() {
+        if let Some(im) = self.texture {
             if frag.fixed {
-                let format = match self.texture_base.as_opt() {
+                let format = match self.texture_base {
                     Some(b) => b.base_format,
-                    None => self.texture.base_format,
+                    None => im.base_format,
                 };
                 self.texture_apply(format, st.texture_env_mode, &mut fogged.texel, &mut fogged.rgba);
             } else if !self.texture(&mut fogged) {
@@ -1316,12 +1423,12 @@ impl SoftDraw {
         {
             return;
         }
-        if st.index_bits == 0 && t.store_rgba.is_some() && self.rgba_read &&
-            !self.rules.rgba_load(t, &self.targets, self.ntargets, x, y, &mut dest, self.rgba_reported.get())
+        if st.index_bits == 0 && t.store_rgba && self.rgba_read &&
+            !self.rules.rgba_load(self.px, &self.targets, self.ntargets, x, y, &mut dest, &self.reports.rgba)
         {
             return;
         }
-        if !self.rules.depth_stencil(st, t, x, y, z) {
+        if !self.rules.depth_stencil(st, t, self.px, x, y, z) {
             return;
         }
         self.fragment_store(x, y, f, &dest);
@@ -1351,7 +1458,7 @@ impl GlDrawState {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// The window pixels a primitive's fragments may fall on, inclusive: the
     /// bounds of those the window owns, within the viewport unless a window
     /// matrix replaces it. False when there are none.
@@ -1385,9 +1492,7 @@ impl SoftDraw {
     /// stipple background (RasterTarget's stipple_opaque).
     pub fn stipple_pass(&self, px: i32, py: i32, background: &mut bool) -> bool {
         *background = false;
-        if self.polygon_stipple.is_null() ||
-            (unsafe { *self.polygon_stipple.0.add(((py as u32) & 31) as usize) } & (1u32 << ((px as u32) & 31))) != 0
-        {
+        if self.polygon_stipple.is_none_or(|rows| rows[((py as u32) & 31) as usize] & (1u32 << ((px as u32) & 31)) != 0) {
             return true;
         }
         *background = self.t.stipple_opaque;
@@ -1462,7 +1567,7 @@ impl GlDrawState {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn window_vertices(&self, v: &[SoftVertex; 3], window: &mut [[f64; 3]; 3]) {
         let sub = (1i32 << self.rules.subpixel_bits) as f64;
 
@@ -1492,7 +1597,7 @@ impl RasterRules {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     pub fn offset(&self, v: &[SoftVertex; 3]) -> f64 {
         let mut window = [[0.0f64; 3]; 3];
 
@@ -1501,7 +1606,7 @@ impl SoftDraw {
     }
 }
 
-impl SoftDraw {
+impl SoftDraw<'_> {
     /// Map one clipped vertex (2.10): the divide by w and the viewport map,
     /// with depth left normalized to [0, 1]; the depth range maps it per
     /// fragment. Under a window matrix the position is the matrix's and the
@@ -1581,39 +1686,44 @@ impl SoftDraw {
 }
 
 impl RasterRules {
-    /// Draw a draw's primitives.
-    pub fn draw(&self, t: &RasterTarget, d: &GlDraw) -> GlDrawResult {
-        let mut r = SoftDraw {
-            rules: P::from_ref(self),
-            t: P::from_ref(t),
-            st: d.state,
-            back_colors: d.back_colors,
-            point_smooth: self.smooth_primitives && d.point_smooth,
-            line_smooth: self.smooth_primitives && d.line_smooth,
-            smooth_point_size: d.point_size as f64,
-            smooth_line_width: d.line_width as f64,
-            polygon_smooth: self.smooth_primitives && d.polygon_smooth,
-            polygon_stipple: if d.polygon_stipple_enabled { d.polygon_stipple } else { P::null() },
-            ..Default::default()
-        };
+    /// Draw a draw's primitives into the planes, its texels from texels.
+    /// A standalone line stipple's phase goes back in d.line_phase.
+    pub fn draw(&self, t: &RasterTarget, planes: &mut dyn PlaneStore, texels: &dyn Texels, d: &mut GlDraw) -> GlDrawResult {
+        with_texel_cache(|cache| self.draw_cached(t, planes, texels, d, cache))
+    }
+
+    fn draw_cached(
+        &self,
+        t: &RasterTarget,
+        planes: &mut dyn PlaneStore,
+        texels: &dyn Texels,
+        d: &mut GlDraw,
+        cache: &std::cell::RefCell<SoftTexelCache>,
+    ) -> GlDrawResult {
+        let reports = SoftReports::default();
+        let mut r = SoftDraw::new(self, t, d.state, &reports);
         let mut line = SoftLineStipple {
-            counter: if !d.line_phase.is_null() && !d.line_phase_reset { *d.line_phase } else { 0 },
+            counter: match d.line_phase {
+                Some(phase) if !d.line_phase_reset => phase,
+                _ => 0,
+            },
             enabled: d.line_stipple_enabled,
             repeat: r2_max(1, r2_min(d.line_stipple_repeat, 256)),
             pattern: d.line_stipple_pattern,
             consumed: false,
         };
-        let use_stipple = !d.line_phase.is_null() || d.line_stipple_enabled;
-        let n = d.count as usize;
-        let mut texture_reports = 0u32;
-        let mut rgba_reported = false;
+        let use_stipple = d.line_phase.is_some() || d.line_stipple_enabled;
         let mut fixed = SoftFixedTex::default();
 
+        r.texels = texels;
+        r.back_colors = d.back_colors;
+        r.point_smooth = self.smooth_primitives && d.point_smooth;
+        r.line_smooth = self.smooth_primitives && d.line_smooth;
+        r.smooth_point_size = d.point_size as f64;
+        r.smooth_line_width = d.line_width as f64;
+        r.polygon_smooth = self.smooth_primitives && d.polygon_smooth;
+        r.polygon_stipple = if d.polygon_stipple_enabled { Some(d.polygon_stipple) } else { None };
         line.counter %= 16u32.wrapping_mul(line.repeat);
-        r.texture_reports = P::new(&mut texture_reports);
-        r.rgba_reported = P::new(&mut rgba_reported);
-
-        let v = |i: usize| -> &[f32] { d.soft_polygon_vertex(None, i) };
         r.ntargets = d.state.draw_targets(&mut r.targets);
         if !self.check_rules() || !t.soft_check_index(d.state.index_bits) {
             return SGI_GL_DRAW_OK;
@@ -1634,34 +1744,52 @@ impl RasterRules {
         if !r.texture_setup(true) {
             return SGI_GL_DRAW_OK;
         }
-        if !r.texture.is_null() {
-            r.texels = r.texture.soft_texel_cache_begin();
+        if r.texture.is_some() {
+            r.texels_cache = Some(cache);
         }
         if !r.setup_ops() {
             return SGI_GL_DRAW_OK;
         }
+        let mut fixed_on = false;
         if d.mode >= SGI_GL_TRIANGLES && d.mode <= SGI_GL_POLYGON && r.fixed_setup(&mut fixed) {
-                let mut texels = 0u64;
+            let mut texels = 0u64;
             let mut first = 0u32;
             let mut last = 0u32;
 
-            r.fixed = P::new(&mut fixed);
-            r.fixed.get().span = r.fixed_span_select();
-            r.fixed.fixed_reach(&mut first, &mut last);
+            fixed.span = r.fixed_span_select(&fixed);
+            fixed.fixed_reach(&mut first, &mut last);
             for i in first..=last {
-                texels += r.fixed.level[i as usize].width as u64 * r.fixed.level[i as usize].height as u64;
+                texels += fixed.level[i as usize].width as u64 * fixed.level[i as usize].height as u64;
             }
             // A draw as large as the smallest that bands share, at least.
             texels = r2_max(texels, SGI_RASTER_PARALLEL_MIN_PIXELS);
-            if !(r.draw_pixels(d, texels) >= texels
+            fixed_on = (r.draw_pixels(d, texels) >= texels
                 && r.fixed_coordinates_valid(d)
-                && r.fixed_prefill(r.fixed.get()))
-                && !r.fixed_begin()
-            {
-                r.fixed = P::null();
-            }
+                && r.fixed_prefill(&mut fixed))
+                || r.fixed_begin(&fixed);
         }
-        if !self.smooth_primitives {
+        if fixed_on {
+            r.fixed = Some(&fixed);
+        }
+        let result = r.draw_primitives(planes, d, &mut line, use_stipple);
+        if d.line_phase.is_some() && line.consumed {
+            d.line_phase = Some(line.counter);
+        }
+        if fixed.prefilled {
+            // The prefilled arrays go back to this thread's store for the next draw.
+            fixed_return(cache, &mut fixed);
+        }
+        result
+    }
+}
+
+impl<'a> SoftDraw<'a> {
+    /// The primitives of a draw that has passed its setup.
+    fn draw_primitives(&self, planes: &mut dyn PlaneStore, d: &GlDraw<'a>, line: &mut SoftLineStipple, use_stipple: bool) -> GlDrawResult {
+        let n = d.count as usize;
+        let v = |i: usize| -> &[f32] { d.soft_polygon_vertex(None, i) };
+
+        if !self.rules.smooth_primitives {
             let mut smooth: Option<&str> = None;
 
             if d.mode == SGI_GL_POINTS && d.point_smooth {
@@ -1675,21 +1803,21 @@ impl RasterRules {
                 crate::dlog!(LogModule::Odyssey, "sgi-gl: {} smoothing requested but unsupported by raster rules; drawn aliased", s);
             }
         }
-        if r.polygon_smooth && d.mode >= SGI_GL_TRIANGLES && d.mode <= SGI_GL_POLYGON {
-            return r.polygon_modes(d);
-        }
-        if !d.polygon_modes.is_null()
-            && d.mode >= SGI_GL_TRIANGLES
-            && d.mode <= SGI_GL_POLYGON
-            && (unsafe { *d.polygon_modes.0 } != SGI_GL_FILL || unsafe { *d.polygon_modes.0.add(1) } != SGI_GL_FILL)
+        let filled = d.mode >= SGI_GL_TRIANGLES && d.mode <= SGI_GL_POLYGON;
+        if filled
+            && (self.polygon_smooth || d.polygon_modes.is_some_and(|m| m != [SGI_GL_FILL, SGI_GL_FILL]))
         {
-            return r.polygon_modes(d);
+            let px = planes.planes();
+            return self.with_planes(&*px).polygon_modes(d);
         }
+        let mut r = *self;
         match d.mode {
             SGI_GL_POINTS => {
                 if !soft_dimension(d.point_size, &mut r.point_size) {
                     return SGI_GL_DRAW_OK;
                 }
+                let px = planes.planes();
+                let r = r.with_planes(&*px);
                 for i in 0..n {
                     r.point(v(i));
                 }
@@ -1699,16 +1827,15 @@ impl RasterRules {
                 if !soft_dimension(d.line_width, &mut r.line_width) {
                     return SGI_GL_DRAW_OK;
                 }
+                let px = planes.planes();
+                let r = r.with_planes(&*px);
                 let mut i = 0usize;
                 while i + 1 < n {
-                    if d.line_phase.is_null() {
+                    if d.line_phase.is_none() {
                         line.counter = 0;
                     }
-                    r.line(v(i), v(i + 1), v(i + 1), if use_stipple { Some(&mut line) } else { None });
+                    r.line(v(i), v(i + 1), v(i + 1), if use_stipple { Some(&mut *line) } else { None });
                     i += 2;
-                }
-                if !d.line_phase.is_null() && line.consumed {
-                    *d.line_phase.get() = line.counter;
                 }
                 SGI_GL_DRAW_OK
             }
@@ -1716,23 +1843,23 @@ impl RasterRules {
                 if !soft_dimension(d.line_width, &mut r.line_width) {
                     return SGI_GL_DRAW_OK;
                 }
+                let px = planes.planes();
+                let r = r.with_planes(&*px);
                 let mut i = 0usize;
                 while i + 1 < n {
-                    r.line(v(i), v(i + 1), v(i + 1), if use_stipple { Some(&mut line) } else { None });
+                    r.line(v(i), v(i + 1), v(i + 1), if use_stipple { Some(&mut *line) } else { None });
                     i += 1;
                 }
                 if d.mode == SGI_GL_LINE_LOOP && n >= 2 {
-                    r.line(v(n - 1), v(0), v(0), if use_stipple { Some(&mut line) } else { None });
-                }
-                if !d.line_phase.is_null() && line.consumed {
-                    *d.line_phase.get() = line.counter;
+                    r.line(v(n - 1), v(0), v(0), if use_stipple { Some(&mut *line) } else { None });
                 }
                 SGI_GL_DRAW_OK
             }
             SGI_GL_TRIANGLES | SGI_GL_TRIANGLE_STRIP | SGI_GL_TRIANGLE_FAN | SGI_GL_POLYGON | SGI_GL_QUADS
             | SGI_GL_QUAD_STRIP => {
-                if !r.draw_parallel(d) {
-                    r.draw_triangles(d);
+                if !r.draw_parallel(d, planes) {
+                    let px = planes.planes();
+                    r.with_planes(&*px).draw_triangles(d);
                 }
                 SGI_GL_DRAW_OK
             }

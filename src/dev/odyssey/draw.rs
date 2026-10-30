@@ -311,7 +311,7 @@ impl Board {
     pub fn paint_integer(&mut self, x: i64, y: i64, is_index: bool, value: u32) {
         let src = fill_pixel(is_index, value);
         let enable = if is_index { ODSY_MODE_INDEX_LOGIC_OP } else { ODSY_MODE_COLOR_LOGIC_OP };
-        let op = self.gl_ctx.cur.logic_op_mode.wrapping_sub(SGI_GL_CLEAR) as u8;
+        let op = self.gl_ref().cur.logic_op_mode.wrapping_sub(SGI_GL_CLEAR) as u8;
         let buffers = self.draw_buffers();
 
         if self.dest_is_id_planes() {
@@ -344,7 +344,7 @@ impl Board {
     pub fn paint_integer_span(&mut self, runs: &RowRuns, y: i64, x0: i64, x1: i64, is_index: bool, value: u32) {
         let src = fill_pixel(is_index, value);
         let enable = if is_index { ODSY_MODE_INDEX_LOGIC_OP } else { ODSY_MODE_COLOR_LOGIC_OP };
-        let op = self.gl_ctx.cur.logic_op_mode.wrapping_sub(SGI_GL_CLEAR) as u8;
+        let op = self.gl_ref().cur.logic_op_mode.wrapping_sub(SGI_GL_CLEAR) as u8;
         let logic = (self.pattern_mode & enable) != 0 && op as u32 != SGI_LOGIC_COPY;
         let id_test = self.id_compare_active();
         let buffers = self.draw_buffers();
