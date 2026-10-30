@@ -121,6 +121,24 @@ impl BusDevice for Ram {
             None => crate::traits::BUS_ERR,
         }
     }
+    fn read32(&self, addr: u64) -> crate::traits::BusRead32 {
+        match self.0.lock().get(addr as usize..addr as usize + 4) {
+            Some(b) => crate::traits::BusRead32 {
+                status: crate::traits::BUS_OK,
+                data: u32::from_be_bytes(b.try_into().unwrap()),
+            },
+            None => crate::traits::BusRead32::err(),
+        }
+    }
+    fn write32(&self, addr: u64, val: u32) -> u32 {
+        match self.0.lock().get_mut(addr as usize..addr as usize + 4) {
+            Some(b) => {
+                b.copy_from_slice(&val.to_be_bytes());
+                crate::traits::BUS_OK
+            }
+            None => crate::traits::BUS_ERR,
+        }
+    }
     fn read64(&self, addr: u64) -> crate::traits::BusRead64 {
         match self.0.lock().get(addr as usize..addr as usize + 8) {
             Some(b) => crate::traits::BusRead64 {
@@ -141,10 +159,10 @@ impl BusDevice for Ram {
     }
 }
 
-/// A board whose DMA reaches 16 MiB of RAM.
+/// A board whose DMA reaches 40 MiB of RAM.
 pub(super) fn board_with_ram() -> (Box<Board>, Arc<Recorder>, Arc<Ram>) {
     let (mut s, rec) = board("v12");
-    let ram = Ram::new(16 << 20);
+    let ram = Ram::new(40 << 20);
     s.guest = Some(ram.clone());
     (s, rec, ram)
 }
@@ -191,8 +209,10 @@ pub(super) fn pixel(s: &Board, buffer: u32, x: i32, y: i32) -> u32 {
     mem.plane_load(&p, x, y)
 }
 
-/// Store a pixel into colour buffer 0.
+/// Store a pixel into colour buffer 0, as a draw would, and mark its
+/// display line for the scanout to resolve again.
 pub(super) fn pixel_write(s: &mut Board, x: i32, y: i32, value: u32) {
     let p = s.mem.plane(s.colour_plane).expect("the colour plane");
     s.mem.plane_store(&p, x, y, value);
+    s.scanout.invalidate(y, 1);
 }
