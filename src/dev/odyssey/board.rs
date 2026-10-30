@@ -52,20 +52,6 @@ pub struct OpenVertex {
     pub slot: u32,
 }
 
-/// A command-FIFO store waiting for the board's thread.
-#[derive(Clone, Copy)]
-pub struct QueuedStore {
-    pub value: u64,
-    pub addr: u32,
-    pub size: u8,
-    /// The processor interface counted it: its credit is due.
-    pub counted: bool,
-    /// It waited outside the FIFO, so the node holds its credit as owed.
-    pub owed: bool,
-    /// When it was stored, for the trace.
-    pub queued_at: std::time::Instant,
-}
-
 pub struct Board {
     /// The crosstalk widget number.
     pub slot: u32,
@@ -73,6 +59,8 @@ pub struct Board {
     /// processor may touch while the board works, the interrupt routing
     /// and the command-FIFO queue.
     pub front: std::sync::Arc<parking_lot::Mutex<HostInterface>>,
+    /// The command FIFO, shared with the host interface.
+    pub fifo: std::sync::Arc<CommandFifo>,
     /// Guest memory as the board's DMA reaches it (HEART's RAM on the
     /// Octane).
     pub guest: GuestMemory,
@@ -438,9 +426,12 @@ pub struct Board {
 
 impl Default for Board {
     fn default() -> Self {
+        let front: std::sync::Arc<parking_lot::Mutex<HostInterface>> = Default::default();
+        let fifo = front.lock().fifo.clone();
         Board {
             slot: 0,
-            front: Default::default(),
+            front,
+            fifo,
             guest: None,
             nic_bus: None,
             revision: 0,
@@ -1248,7 +1239,6 @@ impl Board {
         let opaque = P::new(&mut *self).opaque();
         self.scanout.init(&HEAD_OPS, opaque);
         self.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
-        self.front.lock().work_queue = Vec::new();
         Ok(())
     }
 

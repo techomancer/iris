@@ -228,25 +228,13 @@ impl Board {
     }
 
     pub fn mmio_write_counted(&mut self, addr: u64, value: u64, size: u32, mut counted: bool) {
-        // The queue decision and the append are one front section, so the
-        // board's thread cannot go idle between them.
-        let queued = {
-            let mut f = self.front.lock();
-            if f.store_queues(addr, size) && f.work_queue.len() < ODSY_WORK_QUEUE_MAX as usize {
-                f.work_append(addr, value, size, counted);
-                true
-            } else {
-                false
-            }
-        };
+        let fifo = self.fifo.clone();
+        let queued = command_store(addr, size) && fifo.queues() && fifo.push(&self.front, addr, value, size, counted);
         if queued {
-            // Credited as it enters the FIFO (HostInterface::work_admit()). With no
+            // Credited as it enters the FIFO (CommandFifo::push). With no
             // board thread running the storing caller runs it.
             counted = false;
-            let f = self.front.lock();
-            let run_here = f.worker.is_none() && !f.queue_held();
-            drop(f);
-            if run_here {
+            if !fifo.running.load(std::sync::atomic::Ordering::SeqCst) && !fifo.held() {
                 self.work_drain(addr);
             }
         } else if command_store(addr, size) {
@@ -271,12 +259,13 @@ impl Board {
 pub struct BoardLocks {
     pub board: Arc<Mutex<Box<Board>>>,
     pub front: Arc<Mutex<HostInterface>>,
+    pub fifo: Arc<CommandFifo>,
 }
 
 impl BoardLocks {
     pub fn new(s: Box<Board>) -> Self {
-        let front = s.front.clone();
-        BoardLocks { board: Arc::new(Mutex::new(s)), front }
+        let (front, fifo) = (s.front.clone(), s.fifo.clone());
+        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo }
     }
 
     /// A processor's read: through the front alone when it can, else under the
@@ -292,7 +281,7 @@ impl BoardLocks {
     /// board lock.
     pub fn write(&self, addr: u64, value: u64, size: u32) {
         let counted = store_counted(&self.front);
-        if !front_mmio_write(&self.front, addr, value, size, counted) {
+        if !front_mmio_write(&self.front, &self.fifo, addr, value, size, counted) {
             self.board.lock().mmio_write_counted(addr, value, size, counted);
         }
     }

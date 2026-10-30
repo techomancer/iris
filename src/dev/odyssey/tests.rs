@@ -1,6 +1,7 @@
 //! The board's register contract.
 
 use super::*;
+use std::sync::atomic::Ordering::SeqCst;
 use crate::irq::InterruptController;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -125,11 +126,11 @@ fn preamble_twice() -> Vec<&'static CfifoPreamble> {
 /// `hold_ms` as a long draw would; store the first word and return
 /// once that slice holds the board lock.
 fn start_long_slice(h: &BoardLocks, words: &[&CfifoPreamble], hold_ms: u32) {
-    h.front.lock().test_words = 1;
+    h.fifo.test_words.store(1, SeqCst);
     h.board.lock().test_slice_sleep_ms = hold_ms;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     h.write(words[0].port, words[0].value, words[0].size);
-    while !(h.front.lock().slice && h.board.is_locked()) {
+    while !(h.fifo.slice.load(SeqCst) && h.board.is_locked()) {
         assert!(std::time::Instant::now() < deadline, "the first slice did not start");
         std::thread::yield_now();
     }
@@ -154,15 +155,15 @@ fn work_thread_runs_queued_stores_in_order() {
         h.write(w.port, w.value, w.size);
     }
     {
-        let level = h.front.lock().fifo_level();
+        let level = h.fifo.level();
         assert!(level >= ODSY_CFIFO_LOW_WATER, "level {level}: the first slice should still hold the queue");
         assert_eq!(h.front.lock().intr_flags & ODSY_INTR_FIFO_LOW_WATER, 0);
         // The status register does not wait: not empty, above low water.
         let status = h.read(STATUS0, 4) as u32;
         assert_eq!(status & (ODSY_STATUS0_FIFO_EMPTY | ODSY_STATUS0_FIFO_LOW_WATER), 0);
-        assert_eq!(h.front.lock().fifo_level(), level);
+        assert_eq!(h.fifo.level(), level);
         // All of that while the slice still held the board.
-        assert!(h.board.is_locked() && h.front.lock().slice);
+        assert!(h.board.is_locked() && h.fifo.slice.load(SeqCst));
     }
 
     // Watch the queue drain on the board's thread, without draining it
@@ -170,10 +171,10 @@ fn work_thread_runs_queued_stores_in_order() {
     loop {
         {
             let f = h.front.lock();
-            let level = f.fifo_level();
+            let level = h.fifo.level();
             let flag = f.intr_flags & ODSY_INTR_FIFO_LOW_WATER != 0;
             assert_eq!(flag, level < ODSY_CFIFO_LOW_WATER, "level {level}");
-            if level == 0 && !f.slice {
+            if level == 0 && !h.fifo.slice.load(SeqCst) {
                 break;
             }
         }
@@ -192,7 +193,7 @@ fn work_thread_runs_queued_stores_in_order() {
         ODSY_STATUS0_FIFO_EMPTY | ODSY_STATUS0_FIFO_LOW_WATER
     );
     h.work_stop();
-    assert!(h.front.lock().worker.is_none());
+    assert!(h.fifo.thread.lock().is_none());
 }
 
 /// A read that waits for the work, issued while a long slice holds the
@@ -208,10 +209,10 @@ fn waiting_read_sees_all_earlier_stores() {
     for w in &words[1..] {
         h.write(w.port, w.value, w.size);
     }
-    assert!(h.front.lock().fifo_level() > 1);
+    assert!(h.fifo.level() > 1);
     let selftest = h.read(ODSY_CFIFO_SELFTEST, 4) as u32;
     assert_eq!(selftest, ODSY_CFIFO_SELFTEST_OK);
-    assert_eq!(h.front.lock().fifo_level(), 0);
+    assert_eq!(h.fifo.level(), 0);
     h.work_stop();
 }
 
@@ -249,9 +250,9 @@ fn credit_board() -> (Box<Board>, Arc<PiStub>) {
         let mut f = s.front.lock();
         f.pi = Some(pi.clone());
         f.test_counted_stores = 1;
-        // No work thread runs: hold the queue and step by hand.
-        f.test_words = 1;
     }
+    // No work thread runs: hold the queue and step by hand.
+    s.fifo.test_words.store(1, SeqCst);
     (s, pi)
 }
 
@@ -268,8 +269,8 @@ fn counted_store_credits_at_fifo_entry() {
     for _ in 0..stores {
         s.mmio_write(ODSY_CMD_FIFO, 0, 8);
     }
-    assert_eq!(s.front.lock().work_queue.len() as u32, stores);
-    assert_eq!(s.front.lock().work_in_fifo, ODSY_CFIFO_DEPTH);
+    assert_eq!(s.fifo.level(), stores);
+    assert_eq!(s.fifo.in_fifo(), ODSY_CFIFO_DEPTH);
     assert_eq!(pi.count("return"), ODSY_CFIFO_DEPTH as i64);
     assert_eq!(pi.count("owe"), (stores - ODSY_CFIFO_DEPTH) as i64);
     assert_eq!(pi.count("repay"), 0);
@@ -281,11 +282,11 @@ fn counted_store_credits_at_fifo_entry() {
     assert_eq!(pi.settled(), ODSY_CFIFO_DEPTH as i64 + 1);
 
     s.work_step(&mut Budget::unlimited());
-    assert!(s.front.lock().work_queue.is_empty());
+    assert!(!s.fifo.pending());
     assert_eq!(pi.settled(), stores as i64);
 
     // A store that does not wait is credited inside the store.
-    s.front.lock().test_words = 0;
+    s.fifo.test_words.store(0, SeqCst);
     s.mmio_write(ODSY_CMD_FIFO, 0, 8);
     assert!(!s.work_pending());
     assert_eq!(pi.settled(), stores as i64 + 1);
@@ -303,8 +304,8 @@ fn reset_cancels_owed_credits() {
     }
     assert_eq!(pi.count("owe"), 8);
     s.work_reset();
-    assert!(s.front.lock().work_queue.is_empty());
-    assert_eq!(s.front.lock().work_in_fifo, 0);
+    assert!(!s.fifo.pending());
+    assert_eq!(s.fifo.in_fifo(), 0);
     assert_eq!(pi.count("owe"), 0);
     assert_eq!(pi.0.lock().iter().filter(|c| c.0 == "owe" && c.2 == -1).count(), 8);
     assert_eq!(pi.count("repay"), 0);
@@ -319,8 +320,8 @@ fn processor_mark_counts_one_store() {
     {
         let mut f = s.front.lock();
         f.test_counted_stores = 0;
-        f.test_words = 0;
     }
+    s.fifo.test_words.store(0, SeqCst);
     s.mmio_write(ODSY_CMD_FIFO, 0, 8);
     assert_eq!(pi.settled(), 0);
 

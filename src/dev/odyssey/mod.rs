@@ -15,6 +15,7 @@
 //! - `interface`: the host interface: the registers that do not wait for
 //!   drawing, interrupts and the queue of command stores.
 //! - `mmio`: register accesses, and which of them wait for the drawing.
+//! - `fifo`: the command FIFO between the processor and the board's thread.
 //! - `worker`: the board's thread, which runs the queued stores.
 //! - `registers`: identity, the board NIC, the cursor and the back end's
 //!   register file.
@@ -54,6 +55,7 @@ pub mod context;
 pub mod display;
 pub mod dma;
 pub mod draw;
+pub mod fifo;
 pub mod geometry;
 pub mod gl;
 pub mod gl_context;
@@ -86,6 +88,7 @@ pub use context::*;
 pub use display::*;
 pub use dma::*;
 pub use draw::*;
+pub use fifo::*;
 pub use geometry::*;
 pub use gl::*;
 pub use gl_context::*;

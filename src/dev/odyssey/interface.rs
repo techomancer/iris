@@ -61,27 +61,11 @@ pub struct HostInterface {
     /// under the board lock, repaints at its next update.
     pub displayed_written: bool,
 
-    // Command-FIFO stores waiting for the board's thread (worker.rs).
-    pub work_queue: Vec<QueuedStore>,
-    /// The oldest waiting stores, this many, are in the FIFO and credited.
-    pub work_in_fifo: u32,
-    /// The board's thread, while it runs.
-    pub worker: Option<std::thread::JoinHandle<()>>,
-    /// Wakes the board's thread when a store joins an empty queue.
-    pub kick: Arc<parking_lot::Condvar>,
-    /// The board's thread is asleep on `kick`.
-    pub worker_waiting: bool,
-    /// The board's thread is running stores under the board lock.
-    pub slice: bool,
-    /// The board's thread is to finish.
-    pub worker_exit: bool,
+    /// The command FIFO (fifo.rs), whose level STATUS0 reports.
+    pub fifo: Arc<CommandFifo>,
     /// Tests: stores count as counted by a processor interface.
     #[cfg(test)]
     pub test_counted_stores: u8,
-    /// Tests: queue every command store even with no thread running, and
-    /// run this many per slice.
-    #[cfg(test)]
-    pub test_words: u32,
     /// The front accesses' own trace numbering; the board's accesses keep
     /// the state's.
     pub trace_sequence: u64,
@@ -115,17 +99,9 @@ impl Default for HostInterface {
             swap_clear: 0,
             displayed_buffer: 0,
             displayed_written: false,
-            work_queue: Vec::new(),
-            work_in_fifo: 0,
-            worker: None,
-            kick: Default::default(),
-            worker_waiting: false,
-            slice: false,
-            worker_exit: false,
+            fifo: Default::default(),
             #[cfg(test)]
             test_counted_stores: 0,
-            #[cfg(test)]
-            test_words: 0,
             trace_sequence: 0,
         }
     }
@@ -198,7 +174,7 @@ impl HostInterface {
 
     /// The command FIFO's level: the stores waiting for the board's work.
     pub fn fifo_level(&self) -> u32 {
-        self.work_queue.len() as u32
+        self.fifo.level()
     }
 
     /// The FIFO's level went from 'before' to its current value. Falling below
@@ -211,95 +187,12 @@ impl HostInterface {
         }
     }
 
-    // The work queue.
-
-    pub fn pending(&self) -> bool {
-        !self.work_queue.is_empty()
-    }
-
     /// A counted store's credit, to the processor interface the node names.
     pub fn return_credit(&mut self) {
         if let Some(pi) = &self.pi {
             pi_gfx_return_credits(pi.as_ref(), self.slot, 1);
         } else {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: counted graphics store has no processor interface for its return");
-        }
-    }
-
-    /// Waiting stores that have moved up into the FIFO get their credits. One
-    /// that waited outside it repays a credit the node holds as owed
-    /// (pi_gfx_owe_credits).
-    pub fn work_admit(&mut self) {
-        while self.work_in_fifo < self.work_queue.len() as u32 && self.work_in_fifo < ODSY_CFIFO_DEPTH {
-            let q = self.work_queue[self.work_in_fifo as usize];
-
-            if q.owed {
-                if let Some(pi) = &self.pi {
-                    pi_gfx_repay_credits(pi.as_ref(), self.slot, 1);
-                }
-                self.work_queue[self.work_in_fifo as usize].owed = false;
-            } else if q.counted {
-                self.return_credit();
-            }
-            self.work_in_fifo += 1;
-        }
-    }
-
-    /// Queue a store and have the board's thread run it. With no thread
-    /// started the caller, which holds the board lock, drains it.
-    pub fn work_append(&mut self, addr: u64, value: u64, size: u32, counted: bool) {
-        let q = QueuedStore {
-            value,
-            addr: addr as u32,
-            size: size as u8,
-            counted,
-            owed: false,
-            queued_at: std::time::Instant::now(),
-        };
-
-        self.work_queue.push(q);
-        self.work_admit();
-        if counted && self.work_in_fifo < self.work_queue.len() as u32 && self.pi.is_some() {
-            let last = self.work_queue.len() - 1;
-            self.work_queue[last].owed = true;
-            pi_gfx_owe_credits(self.pi.as_ref().unwrap().as_ref(), self.slot, 1);
-        }
-        if self.worker_waiting {
-            self.kick.notify_one();
-        }
-    }
-
-    /// The oldest waiting store, out of the queue and the FIFO.
-    pub fn work_take(&mut self) -> Option<QueuedStore> {
-        if self.work_queue.is_empty() {
-            return None;
-        }
-        let q = self.work_queue.remove(0);
-        // The store leaves the FIFO, and the next waiting one moves up.
-        self.work_in_fifo = self.work_in_fifo.wrapping_sub(1);
-        self.work_admit();
-        Some(q)
-    }
-
-    /// Whether a store that joins the command stream waits in the queue: always
-    /// while the board's thread runs, so that decoding and drawing never run on
-    /// the processor's thread, and otherwise behind any store that already
-    /// waits.
-    pub fn store_queues(&self, addr: u64, size: u32) -> bool {
-        if !command_store(addr, size) {
-            return false;
-        }
-        self.worker.is_some() || self.pending() || self.queue_held()
-    }
-
-    /// Tests: every command store queues, to be run by hand.
-    pub fn queue_held(&self) -> bool {
-        #[cfg(test)]
-        return self.test_words != 0;
-        #[cfg(not(test))]
-        {
-            let _ = self;
-            false
         }
     }
 }
@@ -446,11 +339,12 @@ pub fn front_mmio_read(f: &Mutex<HostInterface>, addr: u64, size: u32) -> Option
 }
 
 /// A processor's store through the front alone: true when it went to a
-/// front register or joined the queue for the board's thread, false when
-/// it needs the board lock. `counted`: the processor interface counted it.
-pub fn front_mmio_write(f: &Mutex<HostInterface>, addr: u64, value: u64, size: u32, counted: bool) -> bool {
-    let mut f = f.lock();
+/// front register or joined the command FIFO for the board's thread, false
+/// when it needs the board lock. `counted`: the processor interface counted
+/// it.
+pub fn front_mmio_write(f: &Mutex<HostInterface>, fifo: &CommandFifo, addr: u64, value: u64, size: u32, counted: bool) -> bool {
     if front_register(addr, size, true) {
+        let mut f = f.lock();
         f.write(addr, value, size);
         if counted {
             f.return_credit();
@@ -459,11 +353,7 @@ pub fn front_mmio_write(f: &Mutex<HostInterface>, addr: u64, value: u64, size: u
     }
     // A queued store needs the board's thread to run it, and the queue to
     // have room; otherwise the store drains the queue under the board lock.
-    if f.worker.is_none() || !f.store_queues(addr, size) || f.work_queue.len() >= ODSY_WORK_QUEUE_MAX as usize {
-        return false;
-    }
-    f.work_append(addr, value, size, counted);
-    true
+    command_store(addr, size) && fifo.running.load(std::sync::atomic::Ordering::SeqCst) && fifo.push(f, addr, value, size, counted)
 }
 
 /// The fabric packet's address bits; the widget sits above them.

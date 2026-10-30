@@ -2,18 +2,18 @@
 //!
 //! The board decodes and draws behind the processor, so the model does its
 //! decoding and drawing on a thread of its own rather than inside the
-//! processor's store (interface.rs explains the two locks). The thread sleeps
-//! until a store joins an empty queue, then runs the queue in slices: each
-//! slice holds the board lock for at most `SLICE` of host time, and the
-//! thread leaves both locks free for `GAP` before the next, so that a
-//! processor access waiting for the board gets it.
+//! processor's store (interface.rs explains the two locks, fifo.rs the
+//! queue). The thread sleeps until a store joins an empty queue, then runs
+//! the queue in slices: each slice holds the board lock for at most `SLICE`
+//! of host time and hands it fairly to a waiting processor access; the
+//! thread pauses `GAP` before each slice so a burst of stores lands first.
 //!
 //! A slice never lets go of the board lock part-way: whatever a processor
 //! may touch during one lives under the front lock.
 
 use super::*;
 
-use std::sync::Arc;
+use std::sync::atomic::Ordering::SeqCst;
 use std::time::{Duration, Instant};
 
 use parking_lot::MutexGuard;
@@ -36,23 +36,24 @@ pub const GAP: Duration = Duration::from_micros(100);
 pub struct Budget {
     deadline: Option<Instant>,
     words: Option<u32>,
+    count: u32,
 }
 
 impl Budget {
     /// A slice on the board's thread: `SLICE` of host time, or `words`
     /// stores when not zero.
     pub fn slice(words: u32) -> Self {
-        Budget { deadline: Some(Instant::now() + SLICE), words: (words != 0).then_some(words) }
+        Budget { deadline: Some(Instant::now() + SLICE), words: (words != 0).then_some(words), count: 0 }
     }
 
     /// Exactly `words` stores, or fewer if the queue runs dry.
     pub fn words(words: u32) -> Self {
-        Budget { deadline: None, words: Some(words) }
+        Budget { deadline: None, words: Some(words), count: 0 }
     }
 
     /// Everything that waits.
     pub fn unlimited() -> Self {
-        Budget { deadline: None, words: None }
+        Budget { deadline: None, words: None, count: 0 }
     }
 
     /// Count one store against the budget; true when the slice must stop.
@@ -63,20 +64,24 @@ impl Budget {
                 return true;
             }
         }
-        self.deadline.is_some_and(|d| Instant::now() >= d)
+        // The clock is read every 16 stores; a store costs far less than a
+        // slice.
+        self.count = self.count.wrapping_add(1);
+        self.count % 16 == 0 && self.deadline.is_some_and(|d| Instant::now() >= d)
     }
 }
 
 impl BoardLocks {
     /// Start the board's thread.
     pub fn work_start(&self) {
-        let mut f = self.front.lock();
-        if f.worker.is_some() {
+        let mut thread = self.fifo.thread.lock();
+        if thread.is_some() {
             return;
         }
-        f.worker_exit = false;
+        self.fifo.start();
+        self.fifo.running.store(true, SeqCst);
         let handles = self.clone();
-        f.worker = Some(
+        *thread = Some(
             std::thread::Builder::new()
                 .name(ODYSSEY_WORK_THREAD.into())
                 .spawn(move || handles.work_run())
@@ -84,58 +89,45 @@ impl BoardLocks {
         );
     }
 
-    /// The machine stops: finish the waiting work, then stop the board's
-    /// thread, so no work is left behind a stopped machine.
+    /// The machine stops: stop the board's thread, then finish the waiting
+    /// work, so no work is left behind a stopped machine.
     pub fn work_stop(&self) {
-        {
-            let mut s = self.board.lock();
-            let waiting = s.front.lock().work_queue.len() as u32;
-            s.work_step(&mut Budget::words(waiting));
-        }
-        let thread = {
-            let mut f = self.front.lock();
-            f.worker_exit = true;
-            f.kick.notify_one();
-            f.worker.take()
-        };
+        let thread = self.fifo.thread.lock().take();
         if let Some(t) = thread {
+            self.fifo.stop();
             let _ = t.join();
         }
+        self.fifo.running.store(false, SeqCst);
+        let mut s = self.board.lock();
+        s.work_step(&mut Budget::unlimited());
     }
 
     fn work_run(&self) {
-        let mut f = self.front.lock();
-        let kick: Arc<parking_lot::Condvar> = f.kick.clone();
-        loop {
-            while f.work_queue.is_empty() && !f.worker_exit {
-                f.worker_waiting = true;
-                kick.wait(&mut f);
-                f.worker_waiting = false;
-            }
-            if f.worker_exit {
-                break;
-            }
-            MutexGuard::unlocked(&mut f, || std::thread::sleep(GAP));
-            if f.worker_exit {
+        while self.fifo.wait_for_work() {
+            // Let a burst of stores land before the slice runs.
+            std::thread::sleep(GAP);
+            if self.fifo.exiting() {
                 break;
             }
             #[cfg(test)]
-            let words = f.test_words;
+            let words = self.fifo.test_words.load(SeqCst);
             #[cfg(not(test))]
             let words = 0;
-            f.slice = true;
-            MutexGuard::unlocked(&mut f, || {
+            self.fifo.slice.store(true, SeqCst);
+            {
                 let mut s = self.board.lock();
                 s.work_step(&mut Budget::slice(words));
-            });
-            f.slice = false;
+                // A processor access waiting for the board gets it next.
+                MutexGuard::unlock_fair(s);
+            }
+            self.fifo.slice.store(false, SeqCst);
         }
     }
 }
 
 impl Board {
     pub fn work_pending(&mut self) -> bool {
-        self.front.lock().pending()
+        self.fifo.pending()
     }
 
     /// Run the oldest waiting stores until the budget is spent. The caller
@@ -151,23 +143,22 @@ impl Board {
             }
         }
 
-        loop {
-            let Some(q) = self.front.lock().work_take() else {
-                break;
-            };
+        let fifo = self.fifo.clone();
+        while let Some((q, after)) = fifo.pop(&self.front) {
             self.write_dispatch(q.addr as u64, q.value, q.size as u32);
-            {
+            // Falling below the low-water mark as the store retires latches
+            // the low-water flag, whatever the enable mask says.
+            if after + 1 >= ODSY_CFIFO_LOW_WATER && fifo.level() < ODSY_CFIFO_LOW_WATER {
                 let mut f = self.front.lock();
-                let level = f.work_queue.len() as u32 + 1;
-                f.fifo_level_changed(level);
+                f.intr_flags |= ODSY_INTR_FIFO_LOW_WATER;
+                f.update_irq();
             }
             if b.spent() {
                 break;
             }
         }
-        let f = self.front.lock();
-        if !f.work_queue.is_empty() {
-            crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_work_behind: {} stores wait, the oldest for {:?}", f.work_queue.len(), f.work_queue[0].queued_at.elapsed());
+        if fifo.pending() {
+            crate::dlog_dev!(LogModule::Odyssey, "sgi_odyssey_work_behind: {} stores wait", fifo.level());
         }
     }
 
@@ -176,7 +167,7 @@ impl Board {
     /// the drain starts run here; any a processor adds meanwhile are left to
     /// the board's thread.
     pub fn work_drain(&mut self, addr: u64) {
-        let waiting = self.front.lock().work_queue.len() as u32;
+        let waiting = self.fifo.level();
         if waiting == 0 {
             return;
         }
@@ -188,17 +179,6 @@ impl Board {
     /// Reset clears the FIFO and abandons the waiting stores. The caller holds
     /// the board lock, so no slice runs.
     pub fn work_reset(&mut self) {
-        let mut f = self.front.lock();
-        let f = &mut *f;
-        for q in f.work_queue.iter() {
-            if q.owed {
-                if let Some(pi) = &f.pi {
-                    pi_gfx_owe_credits(pi.as_ref(), f.slot, -1);
-                }
-            }
-        }
-        f.work_queue.clear();
-        f.work_in_fifo = 0;
+        self.fifo.clear(&self.front);
     }
 }
-
