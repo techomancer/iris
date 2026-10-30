@@ -392,7 +392,7 @@ impl SoftDraw<'_> {
         // Fragments sample in fixed point, and their lambda where it is flat.
         let mut fixed_flat: Option<i32> = None;
         // The row loop for textured fragments, and its inputs.
-        let mut span: Option<(SoftTexSpanFn, SoftTexSpan)> = None;
+        let mut span: Option<(FillRow, SoftTexSpan)> = None;
         let mut area: i64;
         let smooth = st.shade_model != SGI_GL_FLAT;
         let simple = self.simple_fragments();
@@ -515,7 +515,16 @@ impl SoftDraw<'_> {
         let step0: i64 = -(v[2].y - v[1].y) * (1i64 << sub);
         let step1: i64 = -(v[0].y - v[2].y) * (1i64 << sub);
         let step2: i64 = -(v[1].y - v[0].y) * (1i64 << sub);
-        if let Some(row_loop) = self.fixed.and_then(|f| f.span).filter(|_| fixed) {
+        // The row loop: the fixed sampler's for a textured triangle,
+        // SoftDraw::fill_select()'s for an untextured one.
+        let row_loop = if fixed {
+            self.fixed.and_then(|f| f.span)
+        } else if self.texture.is_none() {
+            self.fill
+        } else {
+            None
+        };
+        if let Some(row_loop) = row_loop {
             let mut sp = SoftTexSpan {
                 v: &v,
                 g: &gradient,
@@ -561,7 +570,7 @@ impl SoftDraw<'_> {
             }
             e1 += lo * step1;
             e2 += lo * step2;
-            if simple {
+            if simple && span.is_none() {
                 self.simple_span(
                     &v,
                     py,
@@ -593,7 +602,7 @@ impl SoftDraw<'_> {
                 if let Some((row_loop, sp)) = &span {
                     // The row loop draws up to a fragment the fixed sampler
                     // cannot take, which this loop then draws in double.
-                    let stop = row_loop(self, sp, py, px, px0 + hi as i32, e1, e2);
+                    let stop = self.px.fill_row(self, *row_loop, sp, py, px, px0 + hi as i32, e1, e2);
 
                     e1 = e1.wrapping_add((stop - px) as i64 * step1);
                     e2 = e2.wrapping_add((stop - px) as i64 * step2);

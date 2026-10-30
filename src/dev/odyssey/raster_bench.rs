@@ -12,7 +12,9 @@
 //!     cargo test --release --lib odyssey::raster_bench -- --ignored --nocapture --test-threads=1
 //!
 //! BENCH_SCENE picks one scene, BENCH_SECS the time each takes (default
-//! one second).
+//! one second), BENCH_FILL the row loops (table, dynamic or off; see
+//! raster_set_fill_path()). The tests in raster_fill.rs draw with the same
+//! board and state.
 
 use super::*;
 
@@ -439,6 +441,13 @@ pub fn bench_count(scene: Scene) -> usize {
 fn raster_bench() {
     let only = std::env::var("BENCH_SCENE").ok();
     let secs: f64 = std::env::var("BENCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let fill = match std::env::var("BENCH_FILL").as_deref() {
+        Ok("dynamic") => SGI_RASTER_FILL_DYNAMIC,
+        Ok("off") => SGI_RASTER_FILL_OFF,
+        _ => SGI_RASTER_FILL_TABLE,
+    };
+
+    raster_set_fill_path(fill);
     for scene in ALL_SCENES {
         if let Some(o) = &only {
             if !format!("{scene:?}").eq_ignore_ascii_case(o) {
@@ -470,4 +479,5 @@ fn raster_bench() {
             runs
         );
     }
+    raster_set_fill_path(SGI_RASTER_FILL_TABLE);
 }
