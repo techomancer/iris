@@ -4,21 +4,33 @@
 //! Selected with `[machine] profile = "fuel_ip34"`. Shared keys select the
 //! PROM, NVRAM, memory and SCSI devices; `[fuel]` selects the serial console
 //! and writable flash. `ip35::Ip35Bus` maps the processor views over the
-//! same Physical memory banks. Graphics is not attached, and the IOC3 has
-//! no keyboard or mouse ports.
+//! same Physical memory banks. The IOC3 carries PS/2 keyboard and mouse ports
+//! (default) and the OHCI controller can take a USB pair; without graphics the
+//! machine runs on a serial console. With `[graphics] board = "v12"` (or
+//! `"v10"`) a VPro board answers at crossbar widget 13, the Fuel's graphics
+//! slot.
 //!
 //! The Bedrock node itself, and its approximations, are in `ip35::node`.
+//!
+//! # What is approximated here
+//!
+//! The processor interfaces' graphics flow-control registers store what
+//! IRIX writes, which is what its VPro driver checks, but count no stores:
+//! no uncached store into the graphics page takes a credit and the board
+//! returns none, so the credit-starvation interrupt never fires. The board's
+//! DMA reaches memory through Bedrock's inbound path as widget 13.
 //!
 //! Board composition ported from hw/mips/sgi/sn1-node.c
 //! in jamesbraid/qemu-sgi-origami.
 
-use crate::config::{scsi_label, FuelConsole, MachineConfig};
+use crate::config::{scsi_label, FuelConsole, GraphicsBoard, MachineConfig};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bedrock::Bedrock;
 use crate::dev::bedrock_flash::{FirmwareRecord, Flash};
 use crate::dev::heart::{host_clock, Clock};
 use crate::dev::ioc3::{Ioc3, Ioc3Config};
+use crate::dev::odyssey::{Odyssey, PacketSender};
 use crate::dev::ioc3_eth::Ioc3Eth;
 use crate::dev::isp12160::Isp12160;
 use crate::dev::l1::{L1, L1Config};
@@ -92,10 +104,15 @@ impl FuelMachine {
                 revision: cfg.fuel.l1_revision.as_deref().map(crate::dev::l1::parse_revision).transpose()?,
                 brick_serial: cfg.fuel.brick_serial.clone(),
             },
+            graphics: cfg.graphics_board(),
+            graphics_pool: (cfg.graphics.threads, cfg.graphics.tile),
+            graphics_raster: (cfg.graphics.raster, cfg.graphics.gpu_backend.as_str()),
         })?);
         let timers = Arc::new(TimerManager::new());
         let part = cfg.cpu();
         let mut exec = board.build_cpu(part);
+        // The CPU's Compare matches blink the graphics status bar's LED.
+        exec.core.fasttick_count = board.fasttick.clone();
         exec.core.set_timer_manager(timers.clone());
         exec.core.set_count_hz(
             cfg.clock
@@ -107,6 +124,8 @@ impl FuelMachine {
         let poll_board = board.clone();
         exec.batch_hook = Some(Box::new(move |_| poll_board.poll()));
         let cpu: Arc<dyn CpuDevice> = Arc::new(MipsCpu::<_, R12000ShadowCache>::new(*exec));
+        board.status.set_cpu_cycles(cpu.cycles_ptr());
+        board.status.set_count_hz(cpu.count_hz_atomic());
         connect_cpus("Fuel", &board.bedrock, &board.l1, &board.events, std::slice::from_ref(&cpu))?;
         board.bedrock.set_timer_manager(&timers);
         // After the windows above: each compile worker takes the cache's
@@ -148,11 +167,9 @@ impl FuelMachine {
         monitor.register_device(PerfMonitor::new(
             cpu.running_flag(), cpu.cycles_ptr(), cpu.fasttick_count(), None, None,
         ));
-        monitor.register_device(board.bedrock.physical().clone());
-        monitor.register_device(board.l1.clone());
-        monitor.register_device(board.scsi.clone());
-        // `ps2 type` and friends: the keyboard and mouse from the monitor.
-        monitor.register_device(board.ioc3.ps2());
+        for device in board.monitor_devices() {
+            monitor.register_device(device);
+        }
         cpu.register_locks();
         board.scsi.register_locks();
         board.ioc3.register_locks();
@@ -168,8 +185,10 @@ impl FuelMachine {
         }
         let events = board.receiver.lock().take();
         eprintln!(
-            "iris: Fuel IP34, {}, 512 MiB, serial console {:?}",
-            cfg.cpu().label(), cfg.fuel.console
+            "iris: Fuel IP34, {}, 512 MiB, {}, serial console {:?}",
+            cfg.cpu().label(),
+            if board.vpro.is_some() { cfg.graphics_board().label() } else { "no graphics" },
+            cfg.fuel.console
         );
         Ok(Self {
             board,
@@ -296,6 +315,9 @@ impl Workstation for FuelMachine {
         self.board.eth.power_on();
         self.board.scsi.power_on();
         self.board.usb.power_on();
+        if let Some(vpro) = &self.board.vpro {
+            vpro.power_on();
+        }
         self.timekeeper.power_on();
         self.restart_peripherals();
     }
@@ -332,7 +354,7 @@ impl Workstation for FuelMachine {
         self.lifecycle = state;
     }
     fn get_display(&self) -> Option<Arc<dyn GfxDisplay>> {
-        None
+        self.board.vpro.as_ref().map(|vpro| vpro.display())
     }
     fn register_monitor_device(&self, device: Arc<dyn Device>) {
         self.monitor.register_device(device);
@@ -461,6 +483,15 @@ pub(crate) struct FuelBoard {
     pub eth: Arc<Ioc3Eth>,
     pub scsi: Arc<Isp12160>,
     pub usb: Arc<Ohci>,
+    /// The VPro board in the graphics slot, widget 13.
+    pub vpro: Option<Arc<Odyssey>>,
+    /// The status bar's activity bits and the CPU's Compare matches, which
+    /// the graphics board shows.
+    pub heartbeat: Arc<AtomicU64>,
+    pub fasttick: Arc<AtomicU64>,
+    /// What the graphics board's status bar shows: the activity bits, the
+    /// Compare matches and the CPU's cycle count and Count rate.
+    pub status: Arc<crate::disp::StatusSource>,
     pub serial: [Arc<CiSerialBackend>; 3],
     #[cfg(test)]
     pub irq: Arc<PendingIrq>,
@@ -479,6 +510,12 @@ pub(crate) struct FuelBoardConfig<'a> {
     pub ps2_input: bool,
     /// Replacements for the L1's reported identity; unset keeps its defaults.
     pub l1: L1Identity,
+    /// `None`, `V12` or `V10`; validation refuses the others.
+    pub graphics: GraphicsBoard,
+    /// The VPro's fragment pipeline: worker count and tile size (`[graphics]`).
+    pub graphics_pool: (usize, u32),
+    /// Which unit draws and, for the GPU, the wgpu backend (`[graphics]`).
+    pub graphics_raster: (crate::config::RasterUnit, &'a str),
 }
 
 /// What a Fuel config may replace in the L1's identity replies.
@@ -502,11 +539,14 @@ impl FuelBoard {
             timekeeper: Arc::new(Timekeeper::fuel()?),
             ps2_input: true,
             l1: L1Identity::default(),
+            graphics: GraphicsBoard::None,
+            graphics_pool: (2, 32),
+            graphics_raster: (crate::config::RasterUnit::Cpu, "auto"),
         })
     }
 
     pub fn with_config(config: FuelBoardConfig<'_>) -> Result<Self, String> {
-        let FuelBoardConfig { payload, clock, flash_path, station_mac, timekeeper, ps2_input, l1: l1_identity } = config;
+        let FuelBoardConfig { payload, clock, flash_path, station_mac, timekeeper, ps2_input, l1: l1_identity, graphics, graphics_pool, graphics_raster } = config;
         let mut l1_config = L1Config { mac: station_mac, ..Default::default() };
         if let Some(revision) = l1_identity.revision {
             l1_config.revision = Some(revision);
@@ -552,6 +592,29 @@ impl FuelBoard {
             Isp12160::new_bus(),
             Isp12160::new_bus(),
         ));
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let fasttick = Arc::new(AtomicU64::new(0));
+        scsi.set_heartbeat(heartbeat.clone());
+        ioc3.set_heartbeat(heartbeat.clone());
+        eth.set_heartbeat(heartbeat.clone());
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let vpro = if graphics == GraphicsBoard::None {
+            None
+        } else {
+            // Interrupt packets reach Bedrock as the heads' do; DMA enters
+            // it as this widget's inbound traffic.
+            let port = Inbound { bedrock: Arc::downgrade(&bedrock), widget: WIDGET_VPRO };
+            let packets: PacketSender = Arc::new(move |widget, address, vector, level| {
+                use crate::irq::InterruptController;
+                widget == BEDROCK_PORT.widget && port.packet(WIDGET_VPRO, address, vector.into(), level)
+            });
+            let dma = bedrock.widget_dma(WIDGET_VPRO);
+            let board = Odyssey::new_widget_relative(
+                WIDGET_VPRO, graphics.as_str(), packets, dma, status.clone(), graphics_pool, graphics_raster,
+            )?;
+            bedrock.connect_widget(WIDGET_VPRO, xbridge.attach_widget(WIDGET_VPRO, board.clone()));
+            Some(board)
+        };
         let pci = xbridge.bus(15);
         let slot = |device| DevFn { device, function: 0 };
         pci.attach(slot(1), scsi.clone());
@@ -564,12 +627,19 @@ impl FuelBoard {
         let reset_eth = eth.clone();
         let reset_scsi = scsi.clone();
         let reset_usb = usb.clone();
+        let reset_vpro = vpro.as_ref().map(Arc::downgrade);
         xbridge.set_reset_output(Arc::new(move |port| {
             if port == 15 {
                 reset_ioc3.power_on();
                 reset_eth.power_on();
                 reset_scsi.power_on();
                 reset_usb.power_on();
+            }
+            // A link reset of the graphics port resets the board behind it.
+            if port == WIDGET_VPRO {
+                if let Some(vpro) = reset_vpro.as_ref().and_then(|v| v.upgrade()) {
+                    vpro.power_on();
+                }
             }
         }));
         Ok(Self {
@@ -585,6 +655,10 @@ impl FuelBoard {
             eth,
             scsi,
             usb,
+            vpro,
+            heartbeat,
+            fasttick,
+            status,
             serial,
             #[cfg(test)]
             irq,
@@ -616,7 +690,26 @@ impl FuelBoard {
         self.eth.start();
         self.scsi.start();
         self.usb.start();
+        if let Some(vpro) = &self.vpro {
+            vpro.start();
+        }
     }
+    /// The board's devices that take monitor commands: the physical map, the
+    /// L1, the SCSI controller, the keyboard and mouse (`ps2 type` and
+    /// friends) and, when one is fitted, the VPro (`vpro …`).
+    pub fn monitor_devices(&self) -> Vec<Arc<dyn Device>> {
+        let mut devices: Vec<Arc<dyn Device>> = vec![
+            self.bedrock.physical().clone(),
+            self.l1.clone(),
+            self.scsi.clone(),
+            self.ioc3.ps2(),
+        ];
+        if let Some(vpro) = &self.vpro {
+            devices.push(vpro.clone());
+        }
+        devices
+    }
+
     pub fn poll(&self) {
         if self.running.load(Ordering::Acquire) {
             let now = (self.clock)();
@@ -631,6 +724,9 @@ impl FuelBoard {
         self.poll();
         self.running
             .store(false, Ordering::Release);
+        if let Some(vpro) = &self.vpro {
+            vpro.stop();
+        }
         self.usb.stop();
         self.scsi.stop();
         self.eth.stop();
@@ -639,6 +735,10 @@ impl FuelBoard {
         self.bedrock.stop();
     }
 }
+
+/// The crossbar widget of the Fuel's graphics slot: a Fuel IRIX inventory
+/// lists its VPro under xtalk/13, and OpenBSD finds Odyssey at widget 13.
+pub const WIDGET_VPRO: u8 = 13;
 
 impl Drop for FuelBoard {
     fn drop(&mut self) {

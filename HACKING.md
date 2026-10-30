@@ -22,9 +22,9 @@ board, IP35 software platform). The CPU is an
 R4400, R5000, R10000, R12000 or R14000, chosen at runtime from the parts the
 machine shipped with (`src/cpu/parts.rs`).
 Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and
-Indigo2, GBE on the O2 and Solid IMPACT on the Octane; the Fuel runs headless on
-its serial console. It boots the real PROMs and IRIX 5.3 and 6.5 to a desktop
-with networking.
+Indigo2, GBE on the O2 and Solid IMPACT on the Octane; the Fuel takes a VPro
+or runs headless on its serial console. It boots the real PROMs and IRIX 5.3
+and 6.5 to a desktop with networking.
 
 It is **not cycle-accurate**, anywhere. IRIX is interrupt-driven and does not
 care how many cycles an instruction takes, so IRIS models behaviour
@@ -781,11 +781,13 @@ introspection commands are in [debug.md](debug.md#jit-v2).
 - **IP34 board, IP35 software platform (Fuel)**: one 500 MHz R14000, 512 MiB
   in two 256 MiB banks, Bedrock, an XBridge with two PCI heads (`Bridge` and
   `Xbow` built as the XBridge's parts), IOC3, a two-channel ISP12160, an OHCI
-  USB controller and the L1. It runs headless on the L1 or an IOC3 serial
-  console. Bedrock is one device (`src/dev/bedrock/`): its two PIs, memory
-  controller, I/O, local-bus, network and crossbar blocks are plain fields,
-  and a block's access returns what it changed elsewhere for the chip to act
-  on. The node around it (the processor bus, flash, L1 and Hub-special page)
+  USB controller and the L1. A VPro board (the Octane's Odyssey model) can sit
+  at crossbar widget 13; its packets and DMA go through Bedrock's inbound path,
+  and the PI graphics registers are stored but count no credits. Without one
+  the machine runs headless on the L1 or an IOC3 serial console. Bedrock is
+  one device (`src/dev/bedrock/`): its two PIs, memory controller, I/O,
+  local-bus, network and crossbar blocks are plain fields, and a block's
+  access returns what it changed elsewhere for the chip to act on. The node around it (the processor bus, flash, L1 and Hub-special page)
   is `src/ip35/node.rs`. Snapshots are unsupported. See the
   [Fuel guide](docs/fuel-ip34.md).
 
