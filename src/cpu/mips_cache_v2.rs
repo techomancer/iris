@@ -85,6 +85,62 @@ pub const C_R10K_CBARRIER: u32 = 5 << 2;
 pub const C_R10K_ILD: u32 = 6 << 2;
 pub const C_R10K_ISD: u32 = 7 << 2;
 
+/// Facts about a CACHE operation, as one bit per 5-bit `cache_op` (target in
+/// bits 1:0, operation in 4:2). `exec_cache` tests a bit of a per-model
+/// constant instead of re-deriving each fact with a chain of compares on every
+/// operation; the masks are computed once per model, at compile time.
+const FACT_TRANSLATES: u32 = 1;
+const FACT_STORES_TAG: u32 = 2;
+const FACT_LOADS_TAG: u32 = 4;
+const FACT_LOADS_ECC: u32 = 8;
+
+const fn cache_op_facts(r10k: bool, cache_op: u32) -> u32 {
+    let op = cache_op & 0x1C;
+    let sel = cache_op & 3;
+    // The R10000 index operations that name a cache entry rather than an
+    // address: they are not translated. The primary Index Load/Store Data
+    // operations select by virtual address, but a mapped one still takes TLB
+    // Refill and Invalid (VR10000 Instruction Set UM p. 15), so they are.
+    let primary_data = r10k
+        && (op == C_R10K_ILD || op == C_R10K_ISD)
+        && (sel == CACH_PI || sel == CACH_PD);
+    let index_op = r10k
+        && ((op == C_R10K_CBARRIER && sel == CACH_PI)
+            || (op == C_R10K_ILD && (sel == CACH_PI || sel == CACH_PD || sel == CACH_SD))
+            || (op == C_R10K_ISD && (sel == CACH_SI || sel == CACH_SD)));
+    let hit_op = op == C_CDX || op == C_HINV || op == C_HWBINV || op == C_HWB || op == C_HSV;
+    let mut facts = 0;
+    if primary_data || (!index_op && hit_op) {
+        facts |= FACT_TRANSLATES;
+    }
+    if op == C_IST || ((index_op || primary_data) && op == C_R10K_ISD) {
+        facts |= FACT_STORES_TAG;
+    }
+    if op == C_ILT || (index_op && op == C_R10K_ILD) {
+        facts |= FACT_LOADS_TAG;
+    }
+    // Index_Load_Tag also loads CP0 ECC with the selected doubleword's check
+    // bits (R4000 UM A-42); the R10000 does this on Index_Load_Data.
+    if (r10k && op == C_R10K_ILD) || (cfg!(feature = "cache-ecc") && !r10k && op == C_ILT) {
+        facts |= FACT_LOADS_ECC;
+    }
+    facts
+}
+
+/// The `cache_op` encodings that have `fact`, one bit each.
+const fn cache_op_mask(r10k: bool, fact: u32) -> u32 {
+    let mut mask = 0u32;
+    let mut cache_op = 0;
+    while cache_op < 32 {
+        if cache_op_facts(r10k, cache_op) & fact != 0 {
+            mask |= 1 << cache_op;
+        }
+        cache_op += 1;
+    }
+    mask
+}
+
+
 /// Decode a raw cache_op field (5-bit: op[4:2] | target[1:0]) to a human-readable name.
 /// Matches the disassembler mnemonic convention used by gas/objdump.
 pub fn cache_op_name(op: u32) -> &'static str {
@@ -565,6 +621,13 @@ pub trait CpuModel: MipsCache {
     /// and `Index_Load_Data` returns into it, neither of which is true of the
     /// R4000 hit operations that share those encodings.
     const R10K_CACHE_OPS: bool = false;
+    /// Which CACHE encodings (bit `cache_op`) the executor translates, stores
+    /// TagHi:TagLo for, loads TagLo from, and loads CP0 ECC for. Derived from
+    /// [`Self::R10K_CACHE_OPS`]; see `cache_op_facts`.
+    const CACHE_OP_TRANSLATES: u32 = cache_op_mask(Self::R10K_CACHE_OPS, FACT_TRANSLATES);
+    const CACHE_OP_STORES_TAG: u32 = cache_op_mask(Self::R10K_CACHE_OPS, FACT_STORES_TAG);
+    const CACHE_OP_LOADS_TAG: u32 = cache_op_mask(Self::R10K_CACHE_OPS, FACT_LOADS_TAG);
+    const CACHE_OP_LOADS_ECC: u32 = cache_op_mask(Self::R10K_CACHE_OPS, FACT_LOADS_ECC);
     /// The part is in the R10000 family, which shares one programming model:
     /// FrameMask, and 44 virtual and 40 physical address bits.
     /// Established for the R10000. The R12000 is inferred to match: its manual's
@@ -7183,5 +7246,52 @@ mod tcache_hitrate {
                  100.0 * hits as f64 / probes.max(1) as f64);
         assert!(probes > 0, "gate never consulted");
         assert_eq!(hits, probes, "every LOMEM access should be transparent");
+    }
+}
+
+#[cfg(test)]
+mod cache_op_mask_tests {
+    use super::*;
+
+    /// The per-encoding masks `exec_cache` tests must agree with the decision
+    /// it used to make with compares on every operation, written out here as
+    /// it was: for every encoding, on a model with R10000 cache operations and
+    /// on one without.
+    #[test]
+    fn cache_op_masks_match_the_direct_decision() {
+        for r10k in [false, true] {
+            for cache_op in 0..32u32 {
+                let op = cache_op & 0x1C;
+                let sel = cache_op & 3;
+                let primary_data_op = r10k
+                    && matches!(cache_op,
+                        x if x == (C_R10K_ILD | CACH_PI) || x == (C_R10K_ILD | CACH_PD)
+                            || x == (C_R10K_ISD | CACH_PI) || x == (C_R10K_ISD | CACH_PD));
+                let r10k_index_op = r10k
+                    && match op {
+                        C_R10K_CBARRIER => sel == CACH_PI,
+                        C_R10K_ILD => matches!(sel, CACH_PI | CACH_PD | CACH_SD),
+                        C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
+                        _ => false,
+                    };
+                let translates = primary_data_op
+                    || (!r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV));
+                let stores_tag = op == C_IST || ((r10k_index_op || primary_data_op) && op == C_R10K_ISD);
+                let loads_tag = op == C_ILT || (r10k_index_op && op == C_R10K_ILD);
+                let loads_ecc = (r10k && op == C_R10K_ILD)
+                    || (cfg!(feature = "cache-ecc") && !r10k && op == C_ILT);
+                let bit = 1u32 << cache_op;
+                let ctx = format!("r10k={r10k} cache_op={cache_op:#04x}");
+                assert_eq!(cache_op_mask(r10k, FACT_TRANSLATES) & bit != 0, translates, "translates {ctx}");
+                assert_eq!(cache_op_mask(r10k, FACT_STORES_TAG) & bit != 0, stores_tag, "stores tag {ctx}");
+                assert_eq!(cache_op_mask(r10k, FACT_LOADS_TAG) & bit != 0, loads_tag, "loads tag {ctx}");
+                assert_eq!(cache_op_mask(r10k, FACT_LOADS_ECC) & bit != 0, loads_ecc, "loads ecc {ctx}");
+            }
+        }
+        assert_eq!(<R4400Cache as CpuModel>::CACHE_OP_TRANSLATES, cache_op_mask(false, FACT_TRANSLATES));
+        assert_eq!(
+            <crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::CACHE_OP_TRANSLATES,
+            cache_op_mask(true, FACT_TRANSLATES),
+        );
     }
 }
