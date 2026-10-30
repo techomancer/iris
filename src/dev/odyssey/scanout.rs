@@ -177,15 +177,18 @@ impl Scanout {
         self.invalidate(0, self.mode.height as i32);
     }
 
-    /// Resolve the dirty lines, draw the cursor if composited, present.
-    pub fn update(&mut self) {
+    /// Resolve the dirty lines and draw the cursor if composited. Returns the
+    /// lines resolved as a half-open span `first..end` covering every one of
+    /// them, or None when nothing was dirty (the frame is unchanged).
+    pub fn update(&mut self) -> Option<(usize, usize)> {
         let ops = *self.ops.get();
         if let Some(pre_update) = ops.pre_update {
             pre_update(self.opaque);
         }
         if self.frame.is_empty() {
-            return;
+            return None;
         }
+        let mut span: Option<(usize, usize)> = None;
         let h = self.mode.height as usize;
         let w = self.mode.width as usize;
         let resolve_row = ops.resolve_row.expect("resolve_row hook");
@@ -211,6 +214,7 @@ impl Scanout {
                 self.draw_cursor(y as i32, end as i32 - 1);
             }
             crate::dlog_dev!(LogModule::Odyssey, "sgi_scanout_update: lines {}-{}", y, end - 1);
+            span = Some(span.map_or((y, end), |(a, b)| (a.min(y), b.max(end))));
             y = end;
         }
         if self.composite_cursor {
@@ -223,6 +227,7 @@ impl Scanout {
             self.cursor_drawn_first = first;
             self.cursor_drawn_last = last;
         }
+        span
     }
 
 }

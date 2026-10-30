@@ -3,13 +3,16 @@
 
 use super::*;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::Mutex;
 
 use crate::cpu::mips_core::CyclesPtr;
 use crate::dev::ng1::rex3::Renderer;
 use crate::disp::{Rex3Screen, FB_STRIDE};
+
+/// Idle frames between forced presents.
+const IDLE_REFRESH: u32 = 6;
 
 /// The window the board shows the guest: what `GfxDisplay` hands out.
 pub struct Display {
@@ -19,6 +22,10 @@ pub struct Display {
     pub screenshot: AtomicBool,
     pub frame: AtomicBool,
     local: Mutex<Option<Local>>,
+    /// Frames since the last present.
+    idle: AtomicU32,
+    /// The frame size last copied to the screen; (0, 0) before the first.
+    shown: Mutex<(usize, usize)>,
 }
 
 struct Local {
@@ -37,11 +44,32 @@ impl Display {
             screenshot: AtomicBool::new(false),
             frame: AtomicBool::new(false),
             local: Mutex::new(None),
+            idle: AtomicU32::new(0),
+            shown: Mutex::new((0, 0)),
         }
     }
 
-    /// Copy the scanout's frame (0x00RRGGBB) to the screen and present it.
-    pub(super) fn present(&self, frame: &[u32], width: usize, height: usize) {
+    pub(super) fn shown(&self) -> (usize, usize) {
+        *self.shown.lock()
+    }
+
+    /// Whether this frame is presented: when a line changed, when a
+    /// screenshot or frame is wanted, or on every sixth idle frame, as IMPACT
+    /// does, so a window or VNC client that missed a frame catches up.
+    pub(super) fn due(&self, changed: bool) -> bool {
+        let wanted = self.screenshot.load(Ordering::Acquire) || self.frame.load(Ordering::Acquire);
+        let idle = self.idle.fetch_add(1, Ordering::Relaxed) + 1;
+        if changed || wanted || idle >= IDLE_REFRESH {
+            self.idle.store(0, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Convert `rows` (0x00RRGGBB lines of `width` pixels, the first being
+    /// line `first` of a frame `height` lines tall) into the screen and
+    /// present it. No rows: present the screen as it is.
+    pub(super) fn present(&self, rows: &[u32], width: usize, height: usize, first: usize) {
         let mut screen = self.screen.lock();
         let w = width.min(FB_STRIDE);
         let h = height.min(screen.rgba.len() / FB_STRIDE);
@@ -49,14 +77,18 @@ impl Display {
         screen.height = h;
         screen.prebuilt = true;
         screen.status_bar_only = false;
-        for y in 0..h {
-            let src = &frame[y * width..y * width + w];
-            for (x, &rgb) in src.iter().enumerate() {
+        for (i, src) in rows.chunks_exact(width).enumerate() {
+            let y = first + i;
+            if y >= h {
+                break;
+            }
+            for (x, &rgb) in src[..w].iter().enumerate() {
                 let rgba = 0xff00_0000 | (rgb >> 16) & 0xff | rgb & 0xff00 | (rgb & 0xff) << 16;
                 screen.fb_rgb[y * FB_STRIDE + x] = rgba;
                 screen.rgba[y * FB_STRIDE + x] = rgba;
             }
         }
+        *self.shown.lock() = (width, height);
         screen.frame_seq = screen.frame_seq.wrapping_add(1);
         let mut renderer = self.renderer.lock();
         if let Some(renderer) = renderer.as_mut() {

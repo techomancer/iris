@@ -191,17 +191,26 @@ impl Odyssey {
     }
 
     /// One display frame: the retrace if it is due, then the dirty lines
-    /// resolved and the frame presented.
+    /// resolved and, if any changed (or a refresh is due), presented. The
+    /// retrace fires either way.
     fn frame(state: &BoardLocks, display: &Display) {
-        let (frame, w, h) = {
-            let mut s = state.board.lock();
-            s.scanout.poll(monotonic_ns());
-            s.scanout.update();
-            (s.scanout.frame.clone(), s.scanout.frame_width as usize, s.scanout.frame_height as usize)
-        };
-        if w != 0 && h != 0 && frame.len() >= w * h {
-            display.present(&frame, w, h);
+        let mut s = state.board.lock();
+        s.scanout.poll(monotonic_ns());
+        let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
+        let span = s.scanout.update();
+        if w == 0 || h == 0 || s.scanout.frame.len() < w * h {
+            return;
         }
+        // A new size has nothing valid on the screen yet: take every line.
+        let span = if display.shown() != (w, h) { Some((0, h)) } else { span };
+        if !display.due(span.is_some()) {
+            return;
+        }
+        // Only the changed lines leave the board lock.
+        let (first, end) = span.unwrap_or((0, 0));
+        let rows = s.scanout.frame[first * w..end * w].to_vec();
+        drop(s);
+        display.present(&rows, w, h, first);
     }
 }
 
