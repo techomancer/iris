@@ -204,11 +204,11 @@ impl<
             lladdr: UnsafeCell::new(0),
             ecc_in: UnsafeCell::new(0),
             ecc_out: UnsafeCell::new(0),
-            ic: UnsafeCell::new(Shadow::new(Self::IC_LINES, 0)),
-            dc: UnsafeCell::new(Shadow::new(Self::DC_LINES, 0)),
-            // Only the R10000 secondary keeps a data shadow: it is the one
-            // the IP28 PROM walks with Index_Store_Data, and a 1 MB array is
-            // cheap once. The R4000 family has no index data ops.
+            // The R10000 keeps data arrays for all three caches, for the PROM's
+            // Index_Load_Data / Index_Store_Data walks. The R4000 family has no
+            // index data ops.
+            ic: UnsafeCell::new(Shadow::new(Self::IC_LINES, if Self::R10K { IC_SIZE / 4 } else { 0 })),
+            dc: UnsafeCell::new(Shadow::new(Self::DC_LINES, if Self::R10K { DC_SIZE / 4 } else { 0 })),
             l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
             tc_bitmap: UnsafeCell::new(0),
@@ -296,15 +296,16 @@ impl<
 
     /// Data slot for an R10000 `Index_Load_Data` / `Index_Store_Data`.
     ///
-    /// Same shape: way in bit 0, the rest addressing the array. The PROM walks
-    /// it at `…00`, `…01`, `…10`, `…11`, `…20` — one doubleword per operation
-    /// with the way bit shifted in beneath it.
-    fn data_slot(&self, len: usize, virt_addr: u64) -> usize {
+    /// Same shape: way in bit 0, the rest addressing the array, with four-byte
+    /// primary and eight-byte secondary slots. This is a model choice, enough
+    /// for a data walk to read back what it wrote.
+    fn data_slot(&self, sel: u32, len: usize, virt_addr: u64) -> usize {
         if len == 0 {
             return 0;
         }
         let way = (virt_addr as usize) & (WAYS - 1);
-        let word = (virt_addr as usize) >> 4;
+        let shift = if matches!(sel, CACH_PI | CACH_PD) { 2 } else { 3 };
+        let word = (virt_addr as usize) >> shift;
         (word * WAYS + way) % len
     }
 }
@@ -610,7 +611,7 @@ impl<
             C_R10K_CBARRIER if Self::R10K && sel == CACH_PI => 0,
             C_R10K_ILD if Self::R10K && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                 let s = self.shadow(sel);
-                let slot = self.data_slot(s.data.len(), virt_addr);
+                let slot = self.data_slot(sel, s.data.len(), virt_addr);
                 if s.data.is_empty() {
                     0
                 } else {
@@ -622,12 +623,26 @@ impl<
                     s.data[slot]
                 }
             }
-            C_R10K_ISD if Self::R10K && matches!(sel, CACH_SI | CACH_SD) => {
+            C_R10K_ISD if Self::R10K => {
                 let s = self.shadow(sel);
-                let slot = self.data_slot(s.data.len(), virt_addr);
+                let slot = self.data_slot(sel, s.data.len(), virt_addr);
                 if !s.data.is_empty() {
-                    s.data[slot] = phys_addr;
-                    s.ecc[slot] = unsafe { *self.ecc_in.get() };
+                    // Diagnostic field widths: R10000 UM pp. 262, 271-272.
+                    let (data_mask, ecc_mask) = match sel {
+                        CACH_PI => (0xf_ffff_ffff, 1),
+                        CACH_PD => (0xffff_ffff, 0xf),
+                        _ => (u64::MAX, 0x3ff),
+                    };
+                    s.data[slot] = phys_addr & data_mask;
+                    s.ecc[slot] = unsafe { *self.ecc_in.get() } & ecc_mask;
+                    if matches!(sel, CACH_SI | CACH_SD) {
+                        // Index Store Data (S) writes a quadword: the selected
+                        // doubleword plus a zero partner, sharing the check bits
+                        // (R10000 UM p. 91, figure 5-7).
+                        let partner = slot ^ WAYS;
+                        s.data[partner] = 0;
+                        s.ecc[partner] = s.ecc[slot];
+                    }
                     if l2_op_log(CACHE_LOG_HIT) {
                         crate::dlog!(LogModule::L2c, "shadow:   -> ISD slot={slot} data={phys_addr:#018x} ecc={:#x}",
                                      s.ecc[slot]);
@@ -791,12 +806,18 @@ mod tests {
         }
     }
 
-    /// Index_Store_Data / Index_Load_Data likewise.
+    /// Index_Store_Data / Index_Load_Data likewise, in the secondary and the
+    /// primary caches: a PROM's data walk round-trips.
     #[test]
     fn secondary_data_round_trips() {
         let c = cache();
         c.cache_op(C_R10K_ISD | CACH_SD, 0x40, 0xdeadbeef);
         assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 0x40, 0), 0xdeadbeef);
+
+        c.cache_op(C_R10K_ISD | CACH_PI, 4, 0x1234);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PI, 4, 0), 0x1234);
+        c.cache_op(C_R10K_ISD | CACH_PD, 8, 0x5678);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_PD, 8, 0), 0x5678);
     }
 
     /// The MRU bit is **shared between the ways of a set**: written through
@@ -862,6 +883,21 @@ mod tests {
         assert_eq!(c.cache_op_ecc(), 0x001, "way 0's check bits");
         assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 1, 0), 0xaaaa_bbbb_cccc_dddd);
         assert_eq!(c.cache_op_ecc(), 0x3fe, "way 1's check bits");
+    }
+
+    /// The NEC layout: ten check bits, and a secondary store writes a
+    /// quadword whose other doubleword is zero and shares the check bits.
+    #[test]
+    fn nec_layout_stores_a_quadword_with_ten_check_bits() {
+        let c = cache();
+        c.set_cache_ecc(0);
+        c.cache_op(C_R10K_ISD | CACH_SD, 8, 0xdead_beef);
+        c.set_cache_ecc(0xffff_fc01);
+        c.cache_op(C_R10K_ISD | CACH_SD, 0, 0x1111_2222_3333_4444);
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 0, 0), 0x1111_2222_3333_4444);
+        assert_eq!(c.cache_op_ecc(), 0x001, "ten check bits");
+        assert_eq!(c.cache_op(C_R10K_ILD | CACH_SD, 8, 0), 0, "zero partner");
+        assert_eq!(c.cache_op_ecc(), 0x001, "shared check bits");
     }
 
     /// An untouched set reports no MRU, so an ordinary tag read is not

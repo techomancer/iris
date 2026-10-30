@@ -6607,6 +6607,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // R4000 hit operations — translating them would fault on an index that
         // is not a valid virtual address. See C_R10K_ISD in mips_cache_v2.
         let sel = cache_op & 3;
+        let primary_data_op = C::R10K_CACHE_OPS
+            && matches!(sel, CACH_PI | CACH_PD)
+            && matches!(op, C_R10K_ILD | C_R10K_ISD);
         let r10k_index_op = C::R10K_CACHE_OPS
             && match op {
                 C_R10K_CBARRIER => sel == CACH_PI,
@@ -6614,8 +6617,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 C_R10K_ISD => matches!(sel, CACH_SI | CACH_SD),
                 _ => false,
             };
-        let needs_translation =
-            !r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV);
+        // A primary Index Load/Store Data selects by VA, but a mapped one still
+        // takes TLB Refill and Invalid (VR10000 Instruction Set UM p. 15). The other index
+        // operations keep not translating their operand.
+        let needs_translation = primary_data_op
+            || (!r10k_index_op && matches!(op, C_CDX | C_HINV | C_HWBINV | C_HWB | C_HSV));
 
         let phys_addr = if needs_translation {
             // Hit operations need address translation
@@ -6635,7 +6641,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // that reads only TagLo sees a different tag from the one written.
         // Harmless for R4400/R5000, whose tags fit in 32 bits and who leave
         // TagHi zero: the shift-in contributes nothing there.
-        let stores_taglo = op == C_IST || (r10k_index_op && op == C_R10K_ISD);
+        let stores_taglo = op == C_IST || ((r10k_index_op || primary_data_op) && op == C_R10K_ISD);
         let phys_addr_or_taglo = if stores_taglo {
             ((self.core.cp0_taghi as u64) << 32) | (self.core.cp0_taglo as u32 as u64)
         } else {
@@ -6708,6 +6714,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             // Split back the way it arrived. Zeroing TagHi unconditionally
             // threw away the top of every tag wider than 32 bits.
             self.core.cp0_taglo = result & 0xFFFF_FFFF;
+            // A primary data cache access leaves TagHi zero (a model choice).
             self.core.cp0_taghi = (result >> 32) as u32;
         }
 
