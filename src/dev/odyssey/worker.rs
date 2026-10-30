@@ -108,8 +108,11 @@ impl BoardLocks {
 
     fn work_run(&self) {
         while self.fifo.wait_for_work() {
-            // Let a burst of stores land before the slice runs.
-            std::thread::sleep(GAP);
+            // Let a burst of stores land before the slice runs, unless the
+            // processor already waits for it.
+            if !self.fifo.take_hurry() {
+                std::thread::sleep(GAP);
+            }
             if self.fifo.exiting() {
                 break;
             }

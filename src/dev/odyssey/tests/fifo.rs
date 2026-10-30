@@ -120,6 +120,41 @@ fn a_read_that_waits_sees_every_earlier_store() {
     h.work_stop();
 }
 
+/// A processor store that finds the board's 32,768-word FIFO full while
+/// the board's thread runs is refused with the bus busy, and nothing runs
+/// on the processor's thread: the level stays at the brim and the slice
+/// in flight keeps the board. The retried store goes in, once, when the
+/// board's thread has made room, and the level never passes the brim.
+#[test]
+fn a_full_fifo_holds_the_store_back_until_the_board_makes_room() {
+    let (h, _rec) = threaded_board();
+    let words = preamble_twice();
+
+    start_long_slice(&h, &words, 2000);
+    while h.fifo.level() + 2 <= ODSY_CFIFO_WORDS {
+        assert!(h.bus_write(ODSY_CMD_FIFO, 0, 8));
+    }
+    while h.fifo.level() < ODSY_CFIFO_WORDS {
+        assert!(h.bus_write(ODSY_CMD_FIFO, 0, 4));
+    }
+    let stores = h.fifo.stores();
+    assert!(!h.bus_write(ODSY_CMD_FIFO, 0, 4), "a full FIFO refuses the store");
+    assert!(!h.bus_write(ODSY_CMD_FIFO, 0, 8));
+    assert_eq!((h.fifo.level(), h.fifo.stores()), (ODSY_CFIFO_WORDS, stores), "nothing ran on the processor's thread");
+    assert!(h.fifo.slice.load(SeqCst) && h.board.is_locked(), "the board's thread still holds the board");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !h.bus_write(ODSY_CMD_FIFO, 0, 8) {
+        assert!(h.fifo.level() <= ODSY_CFIFO_WORDS);
+        assert!(std::time::Instant::now() < deadline, "the board's thread made no room");
+        std::thread::yield_now();
+    }
+    assert!(h.fifo.level() <= ODSY_CFIFO_WORDS);
+    h.fifo.test_words.store(0, SeqCst);
+    h.work_stop();
+    assert_eq!(h.fifo.level(), 0);
+}
+
 /// Records every call a board makes on its processor-interface link.
 #[derive(Default)]
 struct PiStub(Mutex<Vec<(&'static str, u32, i64)>>);

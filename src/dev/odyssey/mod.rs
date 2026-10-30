@@ -131,7 +131,7 @@ use crate::dev::ng1::rex3::Renderer;
 use crate::disp::{Rex3Screen, FB_STRIDE};
 use crate::ip30::{widget_large_base, widget_small_base};
 use crate::irq::InterruptController;
-use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_ERR, BUS_OK};
+use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, BUS_BUSY, BUS_ERR, BUS_OK};
 
 /// The VPro board on widget `slot`: a `BusDevice` for the widget's
 /// windows.
@@ -199,8 +199,11 @@ impl Odyssey {
     fn write(&self, addr: u64, size: u32, val: u64) -> u32 {
         match self.offset(addr) {
             Some(off) => {
-                self.state.write(off, val, size);
-                BUS_OK
+                if self.state.bus_write(off, val, size) {
+                    BUS_OK
+                } else {
+                    BUS_BUSY
+                }
             }
             None => BUS_ERR,
         }

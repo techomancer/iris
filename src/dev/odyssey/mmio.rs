@@ -266,7 +266,8 @@ impl Board {
                 self.work_drain(addr);
             }
         } else if command_store(addr, size) {
-            // The queue is full: run what waits and then this store, in order.
+            // The queue is full and nobody waits for room (a caller other
+            // than the bus): run what waits and then this store, in order.
             self.work_drain(addr);
             self.write_dispatch(addr, value, size);
         } else {
@@ -305,6 +306,21 @@ impl BoardLocks {
             Some(v) => v,
             None => self.board.lock().mmio_read(addr, size),
         }
+    }
+
+    /// A processor's store as the bus takes it. False, for the bus to
+    /// answer busy, when it is a command store and the board's FIFO has no
+    /// room for it while the board's thread runs: the processor retries
+    /// the store, taking its interrupts meanwhile, while the board's thread
+    /// makes room, as a full FIFO holds the store back on the board. The
+    /// processor interface's mark stays untaken until the store goes in.
+    pub fn bus_write(&self, addr: u64, value: u64, size: u32) -> bool {
+        if command_store(addr, size) && self.fifo.full_for(size) {
+            self.fifo.hurry();
+            return false;
+        }
+        self.write(addr, value, size);
+        true
     }
 
     /// A processor's store: through the front alone when it can, else under the

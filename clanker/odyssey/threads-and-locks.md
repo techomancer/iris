@@ -108,8 +108,14 @@ kernel's `0x6b1` set-up gives it (datasheet, "Command FIFO level and
 credits"). The level is the words waiting, a doubleword store counting two.
 STATUS0 bit 16 is empty, bit 17 below the model's 16-word low mark, bit 15
 at or above the kernel's `0x6b2` high mark (flags bit 25 rises on reaching
-it). A store that would overfill the 32,768 words is refused; the storing
-caller then runs the queue under the board lock and the store after it.
+it). A processor store that would overfill the 32,768 words is refused
+with the bus busy (`BoardLocks::bus_write`), as IMPACT's full FIFO
+refuses one: the processor retries the instruction, taking interrupts
+meanwhile, and the board's thread, which then starts its next slice
+without the pause, makes room. Before, the storing processor ran the
+whole queue itself under the board lock, about 20 ms each time in Smoke
+& Mirrors. A caller other than the bus still runs the queue and then its
+store.
 
 Counted stores (machines whose processor interface counts graphics credits;
 the Octane has none and the calls are no-ops) are credited as they enter the
