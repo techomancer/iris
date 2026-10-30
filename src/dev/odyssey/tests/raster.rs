@@ -261,3 +261,20 @@ fn a_query_behind_a_queued_draw_syncs_after_the_draw_without_holding_the_front_e
     drop(s);
     h.raster.stop();
 }
+
+/// On the bus, a waiting read behind a queued draw answers busy until the
+/// raster unit has drawn it, without the processor waiting inside the
+/// read; the memory word answers at once.
+#[test]
+fn a_waiting_bus_read_is_busy_until_the_raster_unit_has_drawn() {
+    let (h, st) = slow_raster(300);
+    h.work_start();
+
+    red_triangle(&mut h.board.lock(), &st);
+    assert_eq!(h.bus_read(ODSY_BUZZ_1, 4), None, "busy while the draw is queued");
+    assert_eq!(h.raster.pending(), 1, "and the read did not wait for it");
+    assert_eq!(h.bus_read(MEMORY_CONFIG, 4).map(|v| v & 0xff00_0000), Some(0xa100_0000));
+    eventually("the read stayed busy", || h.bus_read(ODSY_BUZZ_1, 4).is_some());
+    assert_ne!(pixel(&h.board.lock(), 0, 10, 10), 0, "drawn before the read answered");
+    h.work_stop();
+}

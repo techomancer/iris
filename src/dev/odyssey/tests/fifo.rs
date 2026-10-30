@@ -155,6 +155,41 @@ fn a_full_fifo_holds_the_store_back_until_the_board_makes_room() {
     assert_eq!(h.fifo.level(), 0);
 }
 
+/// A read that waits for the work, issued on the bus while stores are
+/// queued behind a long slice, answers busy and runs nothing on the
+/// processor's thread; retried, it answers once the board's thread has run
+/// every store before it, and sees them all. A store that waits answers
+/// busy the same way.
+#[test]
+fn a_waiting_bus_read_is_busy_until_the_board_thread_has_run_the_stores() {
+    let (h, _rec) = threaded_board();
+    let words = preamble_twice();
+
+    start_long_slice(&h, &words, 300);
+    for w in &words[1..] {
+        h.write(w.port, w.value, w.size);
+    }
+    let level = h.fifo.level();
+    assert!(level > 1);
+    assert_eq!(h.bus_read(ODSY_CFIFO_SELFTEST, 4), None, "busy while the stores wait");
+    assert!(!h.bus_write(ODSY_BUZZ_1, 0, 4), "a waiting store is busy too");
+    assert_eq!(h.fifo.level(), level, "nothing ran on the processor's thread");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let selftest = loop {
+        if let Some(v) = h.bus_read(ODSY_CFIFO_SELFTEST, 4) {
+            break v as u32;
+        }
+        assert!(std::time::Instant::now() < deadline, "the board's thread did not run the stores");
+        std::thread::yield_now();
+    };
+    assert_eq!(selftest, ODSY_CFIFO_SELFTEST_OK);
+    assert_eq!(h.fifo.level(), 0);
+    assert!(h.bus_write(ODSY_BUZZ_1, 0, 4));
+    h.fifo.test_words.store(0, SeqCst);
+    h.work_stop();
+}
+
 /// Records every call a board makes on its processor-interface link.
 #[derive(Default)]
 struct PiStub(Mutex<Vec<(&'static str, u32, i64)>>);

@@ -34,13 +34,17 @@ apply to BUZZ). Nothing models more than one raster unit.
   as (offset, size, value) with its credit state. The level the guest sees
   is in words, against the board's 32,768.
 - **Raster queue** (`raster_unit.rs`, `odyssey-work` to `odyssey-raster`):
-  jobs, each a closure owning what its raster work reads, captured when the
-  front end set it up: a GL primitive's raster rules, draw state, vertices,
-  texture chain and the texture tables it uses; a GL clear's or pattern
-  rectangle's raster ops; a fence's address and token; a query's snapshot
-  and sync word. This encoding is the
-  model's own: the hardware's is unknown. Capturing state at its place in
-  the stream is how raster state reaches the raster unit in order.
+  jobs, each owning what its raster work reads, captured when the front
+  end set it up. A GL primitive is a `GlDrawJob`: its raster rules, draw
+  state, vertices, texture chain and the texture tables it uses. The
+  raster unit hands a drawn one back through a small return ring and the
+  front end fills it again, keeping its vertex buffer and texture chain,
+  so a draw allocates nothing (allocating per draw on one thread and
+  freeing on the other had both contending for the allocator). The rest
+  are closures: a GL clear's or pattern rectangle's raster ops; a fence's
+  address and token; a query's snapshot and sync word. This encoding is
+  the model's own: the hardware's is unknown. Capturing state at its place
+  in the stream is how raster state reaches the raster unit in order.
 - **The planes** stay where `Board` keeps them. The raster unit owns them
   while it has jobs and reaches them through raw spans, as the IMPACT model's
   engines reach their pixel memory (`clanker/mgras/DESIGN.md`). The front
@@ -56,7 +60,12 @@ apply to BUZZ). Nothing models more than one raster unit.
 
 Both rings are the shared `GFifo`, 64K entries. The IMPACT model's raster
 FIFO has a head per raster engine with scanline interleave; the VPro's has
-one head, as the board has one raster unit.
+one head, as the board has one raster unit. The raster queue is not
+bounded below the ring: Smoke & Mirrors runs up to about 11,700 jobs
+ahead of the raster unit. Bounding it at 256, 1,024 or 4,096 jobs made
+the front end, and through the full command FIFO the processor, wait
+for the raster unit, and cut mirrors from about 4 to 3.0, 3.2 and 3.6
+swaps a second; perfly did not change.
 
 ## Locks
 
@@ -72,7 +81,9 @@ return.
   lock and never waits for a draw.
 - Every other access takes the board lock, which waits out the current
   slice, then runs whatever is still queued before it (`work_drain`), so it
-  sees all earlier stores.
+  sees all earlier stores. A processor's access on the bus answers busy
+  instead while stores it must see are queued (rule 2 below), so the drain
+  normally finds nothing to run.
 - The display thread takes the board lock, then the raster unit's context
   lock, which the raster thread holds for each slice of jobs (at most 1 ms,
   checked between jobs). A frame therefore waits out a raster slice in
@@ -145,7 +156,12 @@ must keep them.
    (`read_waits_for_raster`). The kernel reads it at every flow-control
    attach, which each GL make-current runs; waiting for the raster queue
    there stalled the processor behind the drawing of each frame. The
-   registers that do not wait answer from the front at once.
+   registers that do not wait answer from the front at once. On the bus
+   (`BoardLocks::bus_read`, `bus_write`) such an access answers busy while
+   that work is still queued and the board's threads run: the processor
+   retries it, taking interrupts, and the board's threads run the work,
+   as IMPACT's waiting reads do. Callers other than the bus drain it
+   themselves.
 3. STATUS0's empty, low-water and high-water bits follow the words in the
    command FIFO, not the raster queue: they are the board's FIFO.
 4. The low-water flag latches as a store retires below the mark (16 words),

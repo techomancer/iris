@@ -308,14 +308,48 @@ impl BoardLocks {
         }
     }
 
+    /// A processor's read as the bus takes it. None, for the bus to answer
+    /// busy, while the work the read must see is still queued on the
+    /// board's threads: the command stores before it, and, unless it is the
+    /// memory word, the raster work they handed on. The processor retries
+    /// the load, taking its interrupts meanwhile, while the board's threads
+    /// run that work, as IMPACT's waiting reads do; the read then finds
+    /// nothing to drain. Without the board's thread the read drains the
+    /// queue itself.
+    pub fn bus_read(&self, addr: u64, size: u32) -> Option<u64> {
+        if let Some(v) = front_mmio_read(&self.front, addr, size) {
+            return Some(v);
+        }
+        if access_waits(addr, size, false) && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.fifo.pending() {
+                self.fifo.hurry();
+                return None;
+            }
+            if read_waits_for_raster(addr, size) && self.raster.pending() != 0 {
+                return None;
+            }
+        }
+        Some(self.board.lock().mmio_read(addr, size))
+    }
+
     /// A processor's store as the bus takes it. False, for the bus to
-    /// answer busy, when it is a command store and the board's FIFO has no
+    /// answer busy, when it waits for queued stores the board's thread will
+    /// run, or when it is a command store and the board's FIFO has no
     /// room for it while the board's thread runs: the processor retries
     /// the store, taking its interrupts meanwhile, while the board's thread
     /// makes room, as a full FIFO holds the store back on the board. The
     /// processor interface's mark stays untaken until the store goes in.
     pub fn bus_write(&self, addr: u64, value: u64, size: u32) -> bool {
         if command_store(addr, size) && self.fifo.full_for(size) {
+            self.fifo.hurry();
+            return false;
+        }
+        // A store that waits for the work, as a waiting read does.
+        if !command_store(addr, size)
+            && access_waits(addr, size, true)
+            && self.fifo.running.load(std::sync::atomic::Ordering::SeqCst)
+            && self.fifo.pending()
+        {
             self.fifo.hurry();
             return false;
         }

@@ -189,9 +189,10 @@ impl Odyssey {
 
     fn read(&self, addr: u64, size: u32) -> (u32, u64) {
         match self.offset(addr) {
-            Some(off) => {
-                (BUS_OK, self.state.read(off, size))
-            }
+            Some(off) => match self.state.bus_read(off, size) {
+                Some(v) => (BUS_OK, v),
+                None => (BUS_BUSY, 0),
+            },
             None => (BUS_ERR, 0),
         }
     }
