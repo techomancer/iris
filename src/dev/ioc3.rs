@@ -141,6 +141,8 @@ pub mod int {
         | PARALLEL_SERVICE
         | serial(0, RX_HIGH_WATER)
         | serial(1, RX_HIGH_WATER)
+        | serial(0, RX_RING_FULL)
+        | serial(1, RX_RING_FULL)
         | serial(0, TX_RING_EMPTY)
         | serial(1, TX_RING_EMPTY);
 }
@@ -345,6 +347,9 @@ struct SdmaPort {
     tx_delay_deadline: Option<Instant>,
     tx_delay_frozen: Option<Duration>,
     tx_delay_irq: bool,
+    /// An entry waits that the receive ring had no room for; drives
+    /// receive-ring-full while ring DMA is on.
+    post_refused: bool,
 }
 
 #[derive(Default)]
@@ -1007,14 +1012,24 @@ impl St {
         self.sdma_level(p, int::TX_RING_EMPTY, empty);
     }
 
-    /// The receive high-water mark counts ring entries; a level.
+    /// The receive high-water mark counts ring entries; a level. So is
+    /// receive-ring-full: set while ring DMA is on and an entry waits that
+    /// the ring had no room for, so an acknowledgement does not bring it back
+    /// with every refused retry, and it falls once the consumer makes room,
+    /// posted yet or not. A ring filled exactly, with nothing waiting, does
+    /// not raise it. A model choice; what the part does is not known.
     fn sdma_update_high_water(&mut self, p: usize) {
         let mask = self.sdma_mask();
         let port = &self.sdma.port[p];
         let hw = self.sdma_ctl(p) & sdma_ctl::HIGH_WATER;
         let waiting = port.reg[3].wrapping_sub(port.reg[4]) & mask;
         let level = hw != 0 && waiting / ENTRY as u32 >= hw;
+        if (port.reg[3] + ENTRY as u32) & mask != port.reg[4] & mask {
+            self.sdma.port[p].post_refused = false;
+        }
+        let full = self.sdma_ctl(p) & sdma_ctl::ENABLE != 0 && self.sdma.port[p].post_refused;
         self.sdma_level(p, int::RX_HIGH_WATER, level);
+        self.sdma_level(p, int::RX_RING_FULL, full);
     }
 
     /// Post the packer as one entry. Fails, keeping the characters, when the
@@ -1028,7 +1043,7 @@ impl St {
         };
         let next = (produce + ENTRY as u32) & mask;
         if next == consume & mask {
-            self.sdma_raise(p, int::RX_RING_FULL);
+            self.sdma.port[p].post_refused = true;
             return false;
         }
         if !self.dma_write(ring.saturating_add((produce & mask) as u64), &packer) {
@@ -1037,6 +1052,7 @@ impl St {
         }
         let port = &mut self.sdma.port[p];
         port.reg[3] = next;
+        port.post_refused = false;
         port.packed = 0;
         port.packer = [0; ENTRY];
         true
@@ -1335,6 +1351,7 @@ impl St {
                     port.armed = false;
                     port.drain_pending = false;
                     port.packed = 0;
+                    port.post_refused = false;
                     port.packer = [0; ENTRY];
                     port.tx_slot = 0;
                     port.tx_fetched = false;
@@ -1387,6 +1404,7 @@ impl St {
             _ => {}
         }
         self.sdma_update_tx_empty(p);
+        self.sdma_update_high_water(p);
     }
 }
 

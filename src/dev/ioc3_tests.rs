@@ -802,6 +802,50 @@ fn host_input_arrives_in_the_receive_ring_after_the_timer() {
     assert_eq!(r.r32(A + sdma_off::RX_CONSUME) & ARM_RX_TIMER, 0, "the arm is spent");
 }
 
+/// Receive-ring-full is a level, a model choice: set while ring DMA is on
+/// and an entry waits that the ring had no room for. An acknowledgement
+/// leaves it, running the engine again with no new character does not raise
+/// it afresh, and it falls when software makes room. A ring filled exactly,
+/// with nothing waiting, does not raise it.
+///
+/// QEMU: sn0/ioc3-serial/receive-ring-full-is-a-level.
+#[test]
+fn receive_ring_full_is_a_level() {
+    let r = Rig::new();
+    let full = int::serial(0, int::RX_RING_FULL);
+    r.aim_engines();
+    r.w32(reg::SDMA_RING_LO, 0x2000 | 1);
+
+    // Full to the last entry, but nothing waits for room.
+    r.w32(A + sdma_off::RX_CONSUME, 8);
+    r.w32(A, sdma_ctl::ENABLE);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, 0);
+
+    // Room for one entry; the second waits.
+    r.w32(A + sdma_off::RX_CONSUME, 16);
+    r.wire[0].inp.lock().unwrap().extend(b"ringfull");
+    r.c.service();
+    assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) & 0xff8, 8);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, full);
+
+    // An acknowledgement does not clear it, and running the engine again
+    // does not matter: it is the ring that is full.
+    r.w32(reg::INT_STATUS, full);
+    r.w32(A + sdma_off::TX_PRODUCE, 0);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, full);
+
+    // Ring DMA off, the source with it; on again, it is back.
+    r.w32(A, 0);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, 0);
+    r.w32(A, sdma_ctl::ENABLE);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, full);
+
+    // Room for the waiting entry: it posts and fills the ring exactly.
+    r.w32(A + sdma_off::RX_CONSUME, 24);
+    assert_eq!(r.r32(A + sdma_off::RX_PRODUCE) & 0xff8, 16);
+    assert_eq!(r.r32(reg::INT_STATUS) & full, 0);
+}
+
 #[test]
 fn an_engine_aimed_elsewhere_does_not_reach_its_port() {
     let r = Rig::new();
