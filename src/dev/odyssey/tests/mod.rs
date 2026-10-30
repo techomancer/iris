@@ -88,7 +88,7 @@ pub(super) fn board(product: &str) -> (Box<Board>, Arc<Recorder>) {
     let rec = Arc::new(Recorder::default());
     let mut s = Board::new(product, VPRO_WIDGET).expect("board");
     s.test_screen();
-    s.front.lock().irq = Some(rec.clone());
+    s.front.lock().packets = Some(super::interface::heart_sender(rec.clone()));
     (s, rec)
 }
 

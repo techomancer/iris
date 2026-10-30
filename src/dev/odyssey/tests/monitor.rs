@@ -27,6 +27,12 @@ fn board() -> Arc<Odyssey> {
     v
 }
 
+/// The base of the board's large IP30 window, where a processor's stores
+/// reach its aperture.
+fn large() -> u64 {
+    crate::ip30::widget_large_base(WIDGET)
+}
+
 /// The monitor's writer: what a command wrote, read back after it.
 #[derive(Clone, Default)]
 struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
@@ -289,9 +295,9 @@ fn rec_starts_marks_and_stops_a_recording_from_the_monitor() {
 
     // Two command stores and a front-register load through the bus, as a
     // processor makes them; then a pixel lands and a mark takes it.
-    assert_eq!(v.write32(v.large + cmd::FIFO, cmd::REGISTER_TAG | reg::STROBE), crate::traits::BUS_OK);
-    assert_eq!(v.write32(v.large + cmd::FIFO, cmd::REGISTER_TAG | reg::STROBE), crate::traits::BUS_OK);
-    let status0 = v.read32(v.large + ODSY_STATUS0);
+    assert_eq!(v.write32(large() + cmd::FIFO, cmd::REGISTER_TAG | reg::STROBE), crate::traits::BUS_OK);
+    assert_eq!(v.write32(large() + cmd::FIFO, cmd::REGISTER_TAG | reg::STROBE), crate::traits::BUS_OK);
+    let status0 = v.read32(large() + ODSY_STATUS0);
     assert!(status0.is_ok());
     pixel_write(v.state.test_board(), 3, 4, 0x1234_5600);
     let h1 = memory_hash_bytes(v.state.test_board());
@@ -353,12 +359,12 @@ fn trace_needs_gputrace_and_then_writes_the_classes_asked_for() {
     // A GL begin and three integer vertices through the kernel FIFO port: the
     // words are FIFO lines, the third vertex completes a triangle (a DRAW
     // line); three identical status polls are one CPU line.
-    let fifo = v.large + cmd::FIFO;
+    let fifo = large() + cmd::FIFO;
     for word in [cmd::REGISTER_TAG | reg::PATTERN_MODE, 1 << 13, cmd::REGISTER_TAG | reg::GL_BEGIN, gl_cmd::TRIANGLES, gl_cmd::VERTEX_2I, 10, 20, gl_cmd::VERTEX_2I, 30, 20, gl_cmd::VERTEX_2I, 10, 40] {
         assert_eq!(v.write32(fifo, word), crate::traits::BUS_OK);
     }
     for _ in 0..3 {
-        assert!(v.read32(v.large + ODSY_STATUS0).is_ok());
+        assert!(v.read32(large() + ODSY_STATUS0).is_ok());
     }
     assert_eq!(ok(&v, "trace flush").trim(), "trace flushed");
     let text = std::fs::read_to_string(&path).unwrap();

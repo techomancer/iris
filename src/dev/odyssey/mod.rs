@@ -127,24 +127,70 @@ use scanout::monotonic_ns;
 /// The VPro board on widget `slot`: a `BusDevice` for the widget's
 /// windows.
 pub struct Odyssey {
-    small: u64,
-    large: u64,
+    aperture: Aperture,
     state: BoardLocks,
     display: Arc<Display>,
     running: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Carries a board interrupt packet into a machine's crosstalk fabric: the
+/// destination widget, the address within it, the vector, and whether the
+/// source rose or fell. False when nothing at the destination takes it.
+pub type PacketSender = Arc<dyn Fn(u8, u64, u8, bool) -> bool + Send + Sync>;
+
+/// How the processor's addresses reach the board, chosen when it is built.
+#[derive(Clone, Copy)]
+enum Aperture {
+    /// The Octane's: the widget's small and large IP30 windows.
+    Ip30Windows { small: u64, large: u64 },
+    /// Every address is already an aperture offset, as a machine whose I/O
+    /// interface hands widgets offsets (Bedrock) presents it.
+    Offsets,
+}
+
 impl Odyssey {
-    /// A board of `product` (v12, v10, v8, v6) at `widget`: its interrupt
-    /// packets reach `irq` (HEART), its DMA reaches `mem`. `pool` is the
-    /// CPU raster unit's workers and tile size, `raster` which unit draws
-    /// and, for the GPU, the wgpu backend (`[graphics]`).
+    /// A board of `product` (v12, v10, v8, v6) at `widget` on the Octane:
+    /// the processor reaches it through the IP30 widget windows, its
+    /// interrupt packets reach `irq` (HEART), its DMA reaches `mem`. `pool`
+    /// is the CPU raster unit's workers and tile size, `raster` which unit
+    /// draws and, for the GPU, the wgpu backend (`[graphics]`).
     #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
     pub fn new(
         widget: u8,
         product: &str,
         irq: Arc<dyn InterruptController>,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+        pool: (usize, u32),
+        raster: (crate::config::RasterUnit, &str),
+    ) -> Result<Arc<Self>, String> {
+        let aperture = Aperture::Ip30Windows { small: widget_small_base(widget), large: widget_large_base(widget) };
+        Self::build(widget, product, interface::heart_sender(irq), aperture, mem, status, pool, raster)
+    }
+
+    /// A board of `product` at `widget` on a machine that hands the board
+    /// widget-relative addresses, as Bedrock's I/O interface does, and
+    /// carries its interrupt packets through `packets`.
+    #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
+    pub fn new_widget_relative(
+        widget: u8,
+        product: &str,
+        packets: PacketSender,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+        pool: (usize, u32),
+        raster: (crate::config::RasterUnit, &str),
+    ) -> Result<Arc<Self>, String> {
+        Self::build(widget, product, packets, Aperture::Offsets, mem, status, pool, raster)
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "the board's wiring")]
+    fn build(
+        widget: u8,
+        product: &str,
+        packets: PacketSender,
+        aperture: Aperture,
         mem: Arc<dyn BusDevice>,
         status: Arc<crate::disp::StatusSource>,
         pool: (usize, u32),
@@ -168,15 +214,14 @@ impl Odyssey {
         });
         let mem: Arc<dyn BusDevice> = Arc::new(record::RecordingMem { inner: mem, rec: rec.clone() });
         s.guest = Some(mem);
-        s.front.lock().irq = Some(irq);
+        s.front.lock().packets = Some(packets);
         if let Ok(path) = std::env::var("IRIS_ODSY_TRACE") {
             s.trace.start(&path, trace::TRACE_ALL).map_err(|e| format!("IRIS_ODSY_TRACE {path}: {e}"))?;
         }
         let mut state = BoardLocks::new(s);
         state.rec = rec;
         Ok(Arc::new(Self {
-            small: widget_small_base(widget),
-            large: widget_large_base(widget),
+            aperture,
             state,
             display: Arc::new(Display::new(status)),
             running: Arc::new(AtomicBool::new(false)),
@@ -192,7 +237,10 @@ impl Odyssey {
 
     /// The aperture offset of `addr`, in either window.
     fn offset(&self, addr: u64) -> Option<u64> {
-        let off = if addr >= self.large { addr - self.large } else { addr.wrapping_sub(self.small) };
+        let off = match self.aperture {
+            Aperture::Ip30Windows { small, large } => if addr >= large { addr - large } else { addr.wrapping_sub(small) },
+            Aperture::Offsets => addr,
+        };
         (off < ODSY_APERTURE).then_some(off)
     }
 

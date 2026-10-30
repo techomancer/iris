@@ -29,14 +29,13 @@ use super::display_fifo::display_fifo_access;
 use super::fifo::CommandFifo;
 use super::mmio::{access_waits, command_store, fifo_port};
 use super::registers::reg;
+use super::PacketSender;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
 pub(super) struct HostInterface {
-    /// Where interrupt packets go (the iris glue's HEART).
-    pub irq: Option<Arc<dyn crate::irq::InterruptController>>,
-    /// The widget number of HEART, the packets' destination.
-    pub heart_widget: u32,
+    /// Where interrupt packets go: the machine's fabric.
+    pub packets: Option<PacketSender>,
     /// ODSY_IDENTITY, composed from the revision at reset.
     pub identity: u32,
 
@@ -88,8 +87,7 @@ pub(super) struct HostInterface {
 impl Default for HostInterface {
     fn default() -> Self {
         HostInterface {
-            irq: None,
-            heart_widget: 8,
+            packets: None,
             identity: 0,
             widget_control: 0,
             xt_req_timeout: 0,
@@ -498,18 +496,28 @@ pub(super) fn sgi_xio_compose(who: &str, widget: u32, address: u64, packet: &mut
 /// HEART's interrupt-packet register in its widget space.
 const HEART_PACKET: u64 = 0x80;
 
+/// The Octane's packet sender: HEART takes a packet at 0x80 of widget 8 and
+/// drives the line the vector names.
+pub(super) fn heart_sender(irq: Arc<dyn crate::irq::InterruptController>) -> PacketSender {
+    Arc::new(move |widget, address, vector, level| {
+        if widget != crate::ip30::WIDGET_HEART || address != HEART_PACKET {
+            return false;
+        }
+        irq.set_line(vector as u32, level);
+        true
+    })
+}
+
 impl HostInterface {
-    /// The interrupt-modify write to the interrupt target. HEART takes it at
-    /// 0x80 of widget 8.
+    /// The interrupt-modify write to the interrupt target: the packet goes to
+    /// the machine's sender, which routes it by widget and address.
     pub fn send_interrupt(&mut self, packet: u64, number: u8, set: bool) {
         let widget = (packet >> XIO_PACKET_ADDRESS_BITS) as u32;
         let address = packet & ((1u64 << XIO_PACKET_ADDRESS_BITS) - 1);
-        if widget != self.heart_widget || address != HEART_PACKET {
-            crate::dlog!(LogModule::Odyssey, "odyssey: interrupt packet to widget {widget} address {address:#x} has no receiver");
-            return;
-        }
-        if let Some(irq) = &self.irq {
-            irq.set_line(number as u32, set);
+        if let Some(send) = &self.packets {
+            if !send(widget as u8, address, number, set) {
+                crate::dlog!(LogModule::Odyssey, "odyssey: interrupt packet to widget {widget} address {address:#x} has no receiver");
+            }
         }
     }
 }
