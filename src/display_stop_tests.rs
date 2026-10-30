@@ -4,7 +4,7 @@
 //! stopping the machine (see `gfx_display::DisplayStop`). The renderer here
 //! does the same: its `stop` asks for an answer from the test thread. One
 //! machine per display family, stopped from a reset and then from main:
-//! Newport (REX3), GR2, IMPACT (MGRAS) and the O2.
+//! Newport (REX3), GR2, IMPACT (MGRAS), VPro and the O2.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -123,6 +123,7 @@ fn stopping_from_the_main_thread_never_waits_on_the_renderer() {
         (MachineProfile::IndyIp24, GraphicsBoard::Newport),
         (MachineProfile::Indigo2Ip22, GraphicsBoard::Xz),
         (MachineProfile::OctaneIp30, GraphicsBoard::SolidImpact),
+        (MachineProfile::OctaneIp30, GraphicsBoard::V6),
         (MachineProfile::O2Ip32, GraphicsBoard::Newport),
     ];
     let mut failures = Vec::new();
