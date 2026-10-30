@@ -39,7 +39,7 @@ pub struct DebugOverlay {
     /// GL texture backing the overlay.
     tex:         Option<glow::Texture>,
 
-    /// VGA 8×16 font (256 glyphs × 16 rows × 1 byte).
+    /// SGI Screen 8×16 font (256 glyphs × 16 rows × 1 byte).
     font:        Vec<u8>,
 
     // ── State set by the refresh loop each frame ──
@@ -60,7 +60,7 @@ impl DebugOverlay {
         Self {
             buf:              vec![0u32; crate::disp::FB_STRIDE * crate::disp::FB_MAX_H],
             tex:              None,
-            font:             crate::vga_font::VGA_8X16.to_vec(),
+            font:             crate::vga_font::SCREEN_8X16.to_vec(),
             show_cmap:        false,
             show_disp_debug:  false,
             show_draw_debug:  false,
@@ -328,11 +328,11 @@ impl DebugOverlay {
 
                     let is_s2s   = DrawMode0(r.dm0).opcode() == DRAWMODE0_OPCODE_SCR2SCR;
                     let src_info = if is_s2s {
-                        format!(" src=({},{})→({},{})", r.sx0, r.sy0, r.sx1, r.sy1)
+                        format!(" src=({},{})->({},{})", r.sx0, r.sy0, r.sx1, r.sy1)
                     } else { String::new() };
 
                     lines.push((format!(
-                        "#{} dst=({},{})→({},{}) {}x{}  {} {} {} {} logicop={}  wrmask={:06x}{}{}",
+                        "#{} dst=({},{})->({},{}) {}x{}  {} {} {} {} logicop={}  wrmask={:06x}{}{}",
                         age + 1,
                         r.x0, r.y0, r.x1, r.y1,
                         (r.x1 as i32 - r.x0 as i32).unsigned_abs() + 1,
@@ -425,7 +425,7 @@ impl DebugOverlay {
         t
     }
 
-    /// Draw a line of text into `self.buf` using the VGA 8×16 font.
+    /// Draw a line of text into `self.buf` using the SGI Screen 8×16 font.
     fn draw_text_line(&mut self, width: usize, y0: usize, height: usize, line: &str, fg: u32, bg: u32) {
         let font_ref: &[u8] = &self.font;
         let w = width;

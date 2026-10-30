@@ -607,6 +607,9 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### UI / input
 
+- **The status bar and debug overlays use SGI's Screen 16 font** instead of
+  the PC VGA font. `tools/gen-screen-font.py` generates the table from the
+  font's PCF file.
 - **`--2x` and `scale = 2` survive boot.** The window opened at 2× but
   snapped back to 1× as soon as the PROM or IRIX set a video mode. Every
   guest mode change now sizes the window to the new resolution times the

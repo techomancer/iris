@@ -578,7 +578,7 @@ pub struct StatusBar {
 impl StatusBar {
     pub fn new() -> Self {
         Self {
-            font: crate::vga_font::VGA_8X16.to_vec(),
+            font: crate::vga_font::SCREEN_8X16.to_vec(),
             enet_tx_fade: 0,
             enet_rx_fade: 0,
             scsi_fade: [0; 7],
