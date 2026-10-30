@@ -220,34 +220,50 @@ static void run_one(const struct bench *b)
 
 /*
  * The CPU by name, from PRId alone — so this is right on any MIPS machine,
- * not only on the two the emulator models. The revision split on imp 0x04 is
- * the standard one: an R4000 and an R4400 report the same implementation and
- * are distinguished by major revision.
+ * not only on the two the emulator models. Three implementation numbers are
+ * shared by two parts that differ in major revision: an R4000 and an R4400
+ * (imp 0x04, the R4400 from major 4), and an R14000 and an R16000 (imp 0x0f,
+ * the R16000 from major 3, the same split as Linux's cpu-probe.c). The table
+ * is searched in order, so the more specific row comes first.
  *
  * An imp we do not have a name for still runs; it just prints as "MIPS imp
  * 0xNN", which is more use to whoever is holding that machine than "unknown".
  */
+static const struct {
+    u32 imp;
+    u32 min_major;      /* the row applies from this major revision up */
+    const char *name;
+} cpu_names[] = {
+    { IMP_R4400,  4, "R4400"  },
+    { IMP_R4000,  0, "R4000"  },
+    { IMP_R10000, 0, "R10000" },
+    { IMP_R4300,  0, "R4300"  },
+    { IMP_R12000, 0, "R12000" },
+    { IMP_R14000, 3, "R16000" },
+    { IMP_R14000, 0, "R14000" },
+    { IMP_R8000,  0, "R8000"  },
+    { IMP_R4600,  0, "R4600"  },
+    { IMP_R4700,  0, "R4700"  },
+    { IMP_R4650,  0, "R4650"  },
+    { IMP_R5000,  0, "R5000"  },
+    { IMP_RM7000, 0, "RM7000" },
+    { IMP_RM5200, 0, "RM5200" },
+};
+
 static const char *cpu_name(void)
 {
 #if defined(BENCH_HOST)
     return "host";
 #else
     static char other[20];
+    unsigned row;
 
-    switch (PRID_IMP(cpu_prid)) {
-    case IMP_R4000:  return PRID_REV_MAJOR(cpu_prid) >= 4 ? "R4400" : "R4000";
-    case IMP_R10000: return "R10000";
-    case IMP_R4300:  return "R4300";
-    case IMP_R12000: return "R12000";
-    case IMP_R14000: return "R14000";
-    case IMP_R8000:  return "R8000";
-    case IMP_R4600:  return "R4600";
-    case IMP_R4700:  return "R4700";
-    case IMP_R4650:  return "R4650";
-    case IMP_R5000:  return "R5000";
-    case IMP_RM7000: return "RM7000";
-    case IMP_RM5200: return "RM5200";
-    default: {
+    for (row = 0; row < sizeof cpu_names / sizeof cpu_names[0]; row++) {
+        if (cpu_names[row].imp == PRID_IMP(cpu_prid) &&
+            PRID_REV_MAJOR(cpu_prid) >= cpu_names[row].min_major)
+            return cpu_names[row].name;
+    }
+    {
         /* No snprintf here — freestanding. Build "MIPS-imp-0xNN" by hand.
          *
          * No spaces, deliberately: this string is emitted as the value of
@@ -264,7 +280,6 @@ static const char *cpu_name(void)
         other[i++] = hexd[imp & 0xF];
         other[i] = 0;
         return other;
-    }
     }
 #endif
 }
