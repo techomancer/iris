@@ -1583,3 +1583,82 @@ fn the_uarts_are_in_the_superio_block() {
     assert_eq!(r.r8(reg::SERIAL_B + 7), 0);
     assert_eq!(r.r32(reg::PIN_DATA) >> 2 & 1, 1, "an original Octane");
 }
+
+/// The Octane keeps the IOC3's PCI header across a chip reset; only the
+/// Fuel population resets it along with the chip.
+#[test]
+fn an_octane_chip_reset_keeps_the_pci_header() {
+    let r = Rig::new();
+    let cfg = r.c.config();
+    cfg.write(1, 0xffff_0146);
+    cfg.write(3, 0xffff_ffff);
+    r.c.reset();
+    assert_eq!(cfg.read(1), 0x0200_0146);
+    assert_eq!(cfg.read(3), 0xffff);
+}
+
+/// Fuel's IOC3 has its own header write policy and resets the header with
+/// the chip, reaches the flat Timekeeper on byte-bus device 0, leaves the
+/// Dallas clock ports unfitted, and has no PHY reset on GPIO 5.
+#[test]
+fn the_fuel_population_keeps_its_clock_and_header_policy_across_reset() {
+    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
+    let clock = Arc::new(crate::dev::timekeeper::Timekeeper::fuel_at(2026, 1, 1, 0, 0, 0).unwrap());
+    r.c.attach_timekeeper(clock.clone());
+    let cfg = r.c.config();
+    cfg.write(1, 0xffff_0146);
+    cfg.write(3, 0xffff_ffff);
+    assert_eq!(cfg.read(1), 0x0280_0146);
+    assert_eq!(cfg.read(3), 0x0000_ff00);
+    let base = reg::BYTEBUS_DEV0;
+    r.w8(base + 0x7f8, 0xa5);
+    r.c.reset();
+    clock.power_on();
+    assert_eq!(r.r8(base + 0x7fff), 0x58);
+    assert_eq!(r.r8(base + 0x7f8), 0xa5);
+    assert_eq!(cfg.read(1), 0x0280_0000);
+    assert_eq!(cfg.read(3), 0);
+    // Fuel selects the flat clock, leaving indexed Dallas ports unfitted.
+    r.w8(reg::BYTEBUS_DEV1, 0x40);
+    r.w8(reg::BYTEBUS_DEV2, 0x55);
+    assert_eq!(r.r8(reg::BYTEBUS_DEV2), 0);
+    r.c.attach_eth(crate::dev::ioc3_eth::Ioc3Eth::new_fuel(MAC));
+    use crate::dev::ioc3_eth::{bits::MII_READ, reg::{MII_CONTROL, MII_DATA_R, MII_DATA_W}};
+    r.w32(MII_DATA_W, 7);
+    r.w32(MII_CONTROL, (1 << 5) | 0x19);
+    r.w32(reg::PIN_CONTROL_SET, 1 << 5);
+    r.w32(reg::PIN_REG_FIRST + 5 * 4, 0);
+    r.w32(reg::PIN_DATA, 1 << 5);
+    r.w32(MII_CONTROL, MII_READ | (7 << 5) | 3);
+    assert_eq!(r.r32(MII_DATA_R), 0x5c10, "Fuel GPIO5 has no PHY reset connection");
+}
+
+/// Fuel's IOC3 fits the keyboard and mouse controller, as the Octane's does
+/// (OpenBSD configures it through the onboard IOC3's keyboard controller). A
+/// key pushed from the host arrives in K_RX through the IOC3 registers and
+/// latches the keyboard interrupt, and a mouse report arrives in M_RX; both
+/// survive a chip reset.
+#[test]
+fn the_fuel_ioc3_delivers_keyboard_and_mouse_traffic_across_reset() {
+    let r = Rig::with(Ioc3::new(Ioc3Config::fuel(MAC)));
+    for _ in 0..2 {
+        r.c.reset();
+        r.c.ps2().power_on();
+        r.w32(K_TX, 0xff);
+        let v = r.r32(K_RX);
+        assert_ne!(v & VALID[2], 0, "the keyboard answers a reset");
+        assert_eq!((v >> 16) & 0xff, 0xfa, "with an ACK");
+        r.w32(M_TX, 0xf2);
+        let v = r.r32(M_RX);
+        assert_ne!(v & (1 << 27), 0, "the mouse answers from its own port");
+        // Enable scanning, then inject a key from the host.
+        r.w32(K_TX, 0xf4);
+        while r.r32(K_RX) & VALID[2] != 0 {}
+        r.w32(reg::INT_STATUS, int::KEYBOARD);
+        r.c.ps2().push_kb(winit::keyboard::KeyCode::KeyA, true);
+        assert_ne!(r.r32(reg::INT_STATUS) & int::KEYBOARD, 0, "a key latches the interrupt");
+        let v = r.r32(K_RX);
+        assert_ne!(v & VALID[2], 0, "and arrives in K_RX");
+        assert_eq!(v & (1 << 27), 0, "from the keyboard");
+    }
+}
