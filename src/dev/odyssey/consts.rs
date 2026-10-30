@@ -112,8 +112,9 @@ pub const ODSY_FLCTL_CONFIG_RESET: u32 = 0x0001c000;
 pub const ODSY_STATUS0_FIFO_ENABLED: u32 = 0x10000000;
 pub const ODSY_STATUS0_FIFO_LOW_WATER: u32 = 0x00020000;
 pub const ODSY_STATUS0_FIFO_EMPTY: u32 = 0x00010000;
+pub const ODSY_STATUS0_FIFO_HIGH_WATER: u32 = 0x00008000;
 
-// The command FIFO's low-water mark, in stores
+// The command FIFO's low-water mark, in words
 pub const ODSY_CFIFO_LOW_WATER: u32 = 16;
 
 // 0x1074, flow-control attach.
@@ -124,11 +125,14 @@ pub const ODSY_FLCTL_INTR_TARGET_SHIFT: u32 = 17;
 // FIFO set-up registers.
 pub const ODSY_REG_FIFO_SETUP_FIRST: u32 = 0x6b0;
 pub const ODSY_REG_FIFO_SETUP_LAST: u32 = 0x6b3;
+pub const ODSY_REG_FIFO_HIGH_WATER: u32 = 0x6b2;
 pub const ODSY_REG_FIFO_SETUP_7B5: u32 = 0x7b5;
 pub const ODSY_FIFO_SETUP_7B5_INDEX: usize = 4;
 
 // ODSY_INTR_FLAGS' low-water bit, the command-FIFO low-water interrupt (the kernel's flags decode names it as the low-water flag bit).
 pub const ODSY_INTR_FIFO_LOW_WATER: u32 = 0x00000200;
+// Flags bit 25, raised as the command FIFO reaches its high-water mark (inferred from its name).
+pub const ODSY_INTR_FIFO_HIGH_WATER: u32 = 0x02000000;
 
 // SGI's MicroLAN control register, the layout the Bridge, the XBridge and the Hub all carry
 pub const ODSY_NIC_LEVEL: u32 = 1 << 0;
@@ -964,10 +968,16 @@ pub const ODSY_F32_SCALE_8: u32 = 0x3b808081;
 pub const ODSY_F32_SCALE_16: u32 = 0x37800080;
 pub const ODSY_F32_SCALE_32: u32 = 0x2f800005;
 
-// Stores waiting behind work before the next one finishes the work.
+// The host ring under the command FIFO, in entries (fifo.rs). Deeper than
+// the board's FIFO, so it never fills.
 pub const ODSY_WORK_QUEUE_MAX: u32 = 65536;
 
-// The command FIFO's depth, in stores.
+// The board's command FIFO, in 32-bit words: sixteen 8 KB tiles of board
+// memory, as the kernel's set-up (0x6b1) gives it.
+pub const ODSY_CFIFO_WORDS: u32 = 32768;
+
+// The waiting stores whose credits have been returned (an approximation,
+// see fifo.rs), in stores.
 pub const ODSY_CFIFO_DEPTH: u32 = 64;
 
 // Board-to-host and sentinel reports, each made once (dma_read_reported).

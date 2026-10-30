@@ -46,9 +46,9 @@ impl Budget {
         Budget { deadline: Some(Instant::now() + SLICE), words: (words != 0).then_some(words), count: 0 }
     }
 
-    /// Exactly `words` stores, or fewer if the queue runs dry.
-    pub fn words(words: u32) -> Self {
-        Budget { deadline: None, words: Some(words), count: 0 }
+    /// Exactly `stores` stores, or fewer if the queue runs dry.
+    pub fn stores(stores: u32) -> Self {
+        Budget { deadline: None, words: Some(stores), count: 0 }
     }
 
     /// Everything that waits.
@@ -152,7 +152,7 @@ impl Board {
             self.write_dispatch(q.addr as u64, q.value, q.size as u32);
             // Falling below the low-water mark as the store retires latches
             // the low-water flag, whatever the enable mask says.
-            if after + 1 >= ODSY_CFIFO_LOW_WATER && fifo.level() < ODSY_CFIFO_LOW_WATER {
+            if after + q.words() >= ODSY_CFIFO_LOW_WATER && fifo.level() < ODSY_CFIFO_LOW_WATER {
                 let mut f = self.front.lock();
                 f.intr_flags |= ODSY_INTR_FIFO_LOW_WATER;
                 crate::pf_instant!(crate::perfetto::events::ODSY_CFIFO_LOW_WATER, fifo.level());
@@ -163,7 +163,7 @@ impl Board {
             }
         }
         if fifo.pending() {
-            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.level());
+            crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker behind: {} stores wait", fifo.stores());
         }
     }
 
@@ -172,13 +172,13 @@ impl Board {
     /// the drain starts run here; any a processor adds meanwhile are left to
     /// the board's thread.
     pub fn work_drain(&mut self, addr: u64) {
-        let waiting = self.fifo.level();
+        let waiting = self.fifo.stores();
         if waiting == 0 {
             return;
         }
         let start = std::time::Instant::now();
         crate::pf_scope!(crate::perfetto::events::ODSY_DRAIN, waiting);
-        self.work_step(&mut Budget::words(waiting));
+        self.work_step(&mut Budget::stores(waiting));
         crate::dlog_dev!(LogModule::Odyssey, "sgi-odyssey: worker: drained offset {:#x} in {:?}", addr, start.elapsed());
     }
 

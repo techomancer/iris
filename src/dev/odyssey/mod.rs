@@ -224,6 +224,7 @@ impl Odyssey {
         let (first, end) = span.unwrap_or((0, 0));
         let rows = s.scanout.frame[first * w..end * w].to_vec();
         drop(s);
+        set_display_fifo_pending(state.fifo.level() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
         display.present(&rows, w, h, first);

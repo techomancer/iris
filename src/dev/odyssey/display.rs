@@ -137,7 +137,7 @@ impl Display {
                 // Activity bits clear once shown; the LEDs persist, as on IMPACT.
                 hb: self.heartbeat.fetch_and(PERSISTENT, Ordering::Relaxed),
                 count_hz: 0,
-                gfifo_pending: 0,
+                gfifo_pending: display_fifo_pending(),
             };
             renderer.present(&mut screen, &mut local.overlay, &mut local.status, &mut local.texture, &stats, false, None, None);
         }

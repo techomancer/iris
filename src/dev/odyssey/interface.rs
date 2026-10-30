@@ -173,7 +173,7 @@ impl HostInterface {
         }
     }
 
-    /// The command FIFO's level: the stores waiting for the board's work.
+    /// The command FIFO's level: the words waiting for the board's work.
     pub fn fifo_level(&self) -> u32 {
         self.fifo.level()
     }
@@ -238,6 +238,7 @@ impl HostInterface {
                 let level = self.fifo_level();
                 crate::pf_value!(self.fifo.pf_level, crate::perfetto::events::ODSY_CFIFO_LEVEL, level);
                 value = (ODSY_STATUS0_FIFO_ENABLED
+                    | if self.fifo.high_water() { ODSY_STATUS0_FIFO_HIGH_WATER } else { 0 }
                     | if level != 0 { 0 } else { ODSY_STATUS0_FIFO_EMPTY }
                     | if level < ODSY_CFIFO_LOW_WATER { ODSY_STATUS0_FIFO_LOW_WATER } else { 0 }) as u64;
             }

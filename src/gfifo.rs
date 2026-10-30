@@ -359,6 +359,22 @@ impl<const DEPTH: usize, const HEADS: usize> GFifo<DEPTH, HEADS> {
         Some((slot.addr, slot.val))
     }
 
+    /// The entry `n` places behind the one `peek_at(h)` returns, if the
+    /// producer has published that far. Called only from head `h`'s thread;
+    /// nothing is consumed.
+    #[inline]
+    pub fn peek_nth_at(&self, h: usize, n: usize) -> Option<(u32, u64)> {
+        let head = self.local_head[h].get();
+        let tail = self.tail.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) & Self::MASK <= n {
+            return None;
+        }
+        // SAFETY: as in peek_at: the slot is published, and only this head's
+        // thread reads behind its own head.
+        let slot = unsafe { &*self.buf.as_ptr().add(head.wrapping_add(n) & Self::MASK) };
+        Some((slot.addr, slot.val))
+    }
+
     /// Advance head past the current entry after it has been fully processed.
     /// Must follow a successful `peek()`.
     #[inline]
@@ -579,6 +595,26 @@ mod tests {
             assert_eq!(f.peek_at(h), None);
         }
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn peek_nth_looks_behind_the_head_across_the_wrap() {
+        let f: Box<GFifo<8>> = Box::new(GFifo::new());
+        for i in 0..5 {
+            assert!(f.try_push(i, 0));
+        }
+        for _ in 0..5 {
+            f.consume();
+        }
+        // The next entries wrap past the end of the buffer.
+        for i in 10..16 {
+            assert!(f.try_push(i, i as u64));
+        }
+        assert_eq!(f.peek_nth_at(0, 0), f.peek());
+        assert_eq!(f.peek_nth_at(0, 5), Some((15, 15)));
+        assert_eq!(f.peek_nth_at(0, 6), None, "not pushed");
+        f.consume();
+        assert_eq!(f.peek_nth_at(0, 4), Some((15, 15)));
     }
 
     #[test]

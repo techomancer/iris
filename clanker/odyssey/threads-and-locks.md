@@ -47,17 +47,26 @@ guest's 10 ms clock tick. A slice always runs at least one store.
 ## The command ring
 
 The PROM's and IRIX's textports send hundreds of thousands of FIFO words per
-scrolled line, so a store must cost little. Stores go into an `rtrb`
-single-producer single-consumer ring (`fifo.rs`). The processor pushes
-without the front lock and wakes the worker only when it sleeps. The
+scrolled line, so a store must cost little. Stores go into iris's shared
+`GFifo` (`src/gfifo.rs`, 64K entries; `fifo.rs` wraps it). The processor
+pushes without the front lock and wakes the worker only when it sleeps. The
 consumer, whoever holds the board lock (worker or a draining access), pops.
 While the worker runs every command store queues, so decoding and drawing
 never run on the processor's thread.
 
+The guest sees the board's FIFO, not the ring: 32,768 words, the size the
+kernel's `0x6b1` set-up gives it (datasheet, "Command FIFO level and
+credits"). The level is the words waiting, a doubleword store counting two.
+STATUS0 bit 16 is empty, bit 17 below the model's 16-word low mark, bit 15
+at or above the kernel's `0x6b2` high mark (flags bit 25 rises on reaching
+it). A store that would overfill the 32,768 words is refused; the storing
+caller then runs the queue under the board lock and the store after it.
+
 Counted stores (machines whose processor interface counts graphics credits;
 the Octane has none and the calls are no-ops) are credited as they enter the
-FIFO's first 64 places: at the store when there is room, or when the stores
-ahead have run, with the node holding the credit as owed meanwhile.
+FIFO's first 64 places, counted in stores: at the store when there is room,
+or when the stores ahead have run, with the node holding the credit as owed
+meanwhile.
 
 ## The six FIFO ordering rules
 
@@ -65,9 +74,9 @@ These are guest-visible; any change to the queue must keep them.
 
 1. One in-order queue: stores run in arrival order.
 2. An access that waits drains the queue first.
-3. STATUS0's empty and low-water bits follow the number of stores pushed
+3. STATUS0's empty, low-water and high-water bits follow the words pushed
    and not yet taken out.
-4. The low-water flag latches as a store retires below the mark (16),
+4. The low-water flag latches as a store retires below the mark (16 words),
    whatever the enable mask says; it reaches the driver only while enabled.
 5. Completion words are written when the command runs, not when it queues.
 6. The queue is drained when the machine stops and cleared at reset.
