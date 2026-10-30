@@ -472,7 +472,7 @@ impl Odyssey {
                 f.route_dest_upper, f.route_dest_lower, f.route_vectors, (f.route_vectors >> 24) & 0xff, (f.route_vectors >> 16) & 0xff, (f.route_vectors >> 8) & 0xff, f.route_vectors & 0xff, f.routed());
             let _ = writeln!(out, "  swap arm {:#x} pending {:#x} control {:#x} companion {:#x} set {:#x} clear {:#x}  displayed {:#010x}{}",
                 f.swap_arm, f.swap_pending, f.swap_control, f.swap_control_companion, f.swap_set, f.swap_clear, f.displayed_buffer, if f.displayed_written { " (written, repaint pending)" } else { "" });
-            let _ = writeln!(out, "  sw token {:#x}  flow-control target {:#x}  heart widget {}", f.sw_token, f.flctl_target, f.heart_widget);
+            let _ = writeln!(out, "  sw token {:#x}  flow-control target {:#x}", f.sw_token, f.flctl_target);
         }
         let g = self.quiesced()?;
         let wg = &g.widget;
