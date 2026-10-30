@@ -98,6 +98,9 @@ way: `scsi::attach_from_config` walks the `[scsi.N]` tables for every machine,
 where the key is a slot (controller × 16 + id, see `config::scsi_slot`), and
 the machine supplies only a route from controller number to bus.
 
+Flash command engines share `FlashBacking` file storage while retaining
+their own command state.
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit
