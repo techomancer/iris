@@ -1,7 +1,9 @@
-# IRIS — SGI Indy and Indigo2 emulator
+# IRIS — SGI workstation emulator
 
 The complete core/GUI feature and configuration inventory is in
-[FEATURES.md](FEATURES.md). This guide explains everyday use; the monitor's full command reference is in [debug.md](debug.md).
+[FEATURES.md](FEATURES.md). For the Fuel, see the [Fuel guide](docs/fuel-ip34.md).
+This guide explains everyday use. The monitor's full command reference is in
+[debug.md](debug.md).
 
 ## Quick start
 

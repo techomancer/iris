@@ -20,7 +20,7 @@ macro_rules! with_cpu {
             M::R5000_180 => { type $C = $crate::cpu::mips_cache_v2::R5000Cache; $body }
             M::R10000_250 => { type $C = sh::R10000O2ShadowCache; $body }
             M::R10000_195 => { type $C = sh::R10000ShadowCache; $body }
-            M::R12000_360 | M::R14000_600 => { type $C = sh::R12000ShadowCache; $body }
+            M::R12000_360 | M::R14000_500 | M::R14000_600 => { type $C = sh::R12000ShadowCache; $body }
             M::R12000_400 => { type $C = sh::R12000O2ShadowCache; $body }
         }
     }};

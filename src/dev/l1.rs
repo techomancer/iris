@@ -193,6 +193,11 @@ impl L1 {
     }
 
     #[cfg(test)]
+    pub fn config(&self) -> L1Config {
+        self.state.lock().config.clone()
+    }
+
+    #[cfg(test)]
     pub fn display_line(&self) -> String {
         self.state.lock().display.clone()
     }
