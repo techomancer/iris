@@ -94,6 +94,10 @@ pub struct Board {
     pub flctl_target: u32,
     /// The FIFO set-up registers 0x6b0-0x6b3 and 0x7b5, as last written.
     pub fifo_setup: [u32; 5],
+    /// The hardware-sync timeout (0x7f0) as last written, and whether a
+    /// nonzero one has been reported as unable to expire.
+    pub sync_timeout: u32,
+    pub sync_timeout_reported: bool,
     pub flctl_target_reported: bool,
 
     // The DMA-sync command's host-write base (48-bit guest physical address).
@@ -454,6 +458,8 @@ impl Default for Board {
             memory_control_reported: false,
             flctl_target: 0,
             fifo_setup: [0; 5],
+            sync_timeout: 0,
+            sync_timeout_reported: false,
             flctl_target_reported: false,
             host_write_addr_upper: 0,
             host_write_addr_lower: 0,
@@ -808,6 +814,7 @@ impl Board {
         self.memory_control = 0;
         self.flctl_target = 0;
         self.fifo_setup = [0; 5];
+        self.sync_timeout = 0;
         self.host_write_addr_upper = 0;
         self.host_write_addr_lower = 0;
         self.stats_addr_upper = 0;

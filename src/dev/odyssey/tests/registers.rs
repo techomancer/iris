@@ -254,6 +254,24 @@ fn the_fifo_set_up_doublewords_are_stored() {
     assert_eq!(s.reported_cmd_count, 0);
 }
 
+/// The kernels write the hardware-sync timeout, 10^9 board clocks, as the
+/// doubleword 0x7f0 after the set-up. The board stores it, reports no
+/// unmodelled command word, and the stream stays aligned behind it. No
+/// sync waits here, so the timeout flag (flags bit 1) never rises.
+///
+/// QEMU: command-fifo-sync-timeout-register.
+#[test]
+fn the_sync_timeout_doubleword_is_stored() {
+    let (mut s, _) = board("v12");
+
+    cmd64(&mut s, 0x7f0, 1_000_000_000);
+    assert_eq!(s.sync_timeout, 1_000_000_000);
+    cmd64(&mut s, 0x6b0, 7);
+    assert_eq!(s.fifo_setup[0], 7);
+    assert_eq!(s.reported_cmd_count, 0);
+    assert_eq!(reg_read(&mut s, ODSY_INTR_FLAGS) & 0x2, 0);
+}
+
 /// The program-sequencer registers, classes 0x20 to 0x35, are not
 /// commands the model fails to recognise, and the stream stays aligned
 /// after them.

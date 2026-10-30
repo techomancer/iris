@@ -613,6 +613,17 @@ impl Board {
             ODSY_REG_FIFO_SETUP_7B5 => {
                 self.fifo_setup[ODSY_FIFO_SETUP_7B5_INDEX] = self.cmd_operand[0];
             }
+            ODSY_REG_SYNC_TIMEOUT => {
+                self.sync_timeout = self.cmd_operand[0];
+                if self.sync_timeout != 0 && !self.sync_timeout_reported {
+                    self.sync_timeout_reported = true;
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: hardware-sync timeout {} is stored; no sync waits, so it never expires",
+                        self.sync_timeout
+                    );
+                }
+            }
             ODSY_GL_TEXCOORD_1F => {
                 self.tex_coord[0] = self.cmd_operand[0];
                 self.tex_coord[1] = 0;
@@ -996,6 +1007,7 @@ impl Board {
         }
         if (ODSY_REG_FIFO_SETUP_FIRST..=ODSY_REG_FIFO_SETUP_LAST).contains(&word)
             || word == ODSY_REG_FIFO_SETUP_7B5
+            || word == ODSY_REG_SYNC_TIMEOUT
         {
             self.cmd_start(word, 1);
             return;

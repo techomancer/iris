@@ -128,6 +128,12 @@ pub const ODSY_REG_FIFO_SETUP_LAST: u32 = 0x6b3;
 pub const ODSY_REG_FIFO_HIGH_WATER: u32 = 0x6b2;
 pub const ODSY_REG_FIFO_SETUP_7B5: u32 = 0x7b5;
 pub const ODSY_FIFO_SETUP_7B5_INDEX: usize = 4;
+// The hardware-sync timeout in board clocks. The kernels' FIFO set-up writes
+// 10^9 after the program load, and when a hardware sync waits longer the
+// board raises flags bit 1. The model has no hardware-sync wait (which
+// command words are syncs is not established), so the timeout is stored and
+// never expires.
+pub const ODSY_REG_SYNC_TIMEOUT: u32 = 0x7f0;
 
 // ODSY_INTR_FLAGS' low-water bit, the command-FIFO low-water interrupt (the kernel's flags decode names it as the low-water flag bit).
 pub const ODSY_INTR_FIFO_LOW_WATER: u32 = 0x00000200;
