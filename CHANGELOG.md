@@ -19,6 +19,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   `r10000`) EntryHi, the TLB match and the user-segment check keep VA bits 43:40;
   they stopped at bit 39 before, so an address above 1 TiB took an Address Error.
   The R4400 and R5000 are unchanged.
+- **FrameMask (CP0 register 21)** on the R10000 clears the EntryLo bits it
+  names, 33:18, on every TLB write, so a kernel that keeps software flags there
+  gets the physical address it meant. The register read as zero and ignored
+  writes before. The R4400 and R5000 have none.
 
 ### `IRIS_GUI_GL` works in iris-gui
 

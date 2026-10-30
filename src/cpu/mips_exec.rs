@@ -2211,6 +2211,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         tlb.set_va_bits(C::VA_BITS);
         tlb.set_cache_attrs(Self::cache_attr_table());
         core.entryhi_mask = model_entryhi_mask::<C>();
+        if C::R10K_FAMILY {
+            core.framemask_mask = 0xFFFF;
+        }
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
         // `mut` is only used by the Triton L2-enable sync below.
@@ -7143,7 +7146,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
             entry_hi: (self.core.cp0_entryhi & self.core.entryhi_mask & !0x1000) | g_combined,
-            entry_lo: [self.core.cp0_entrylo0, self.core.cp0_entrylo1],
+            entry_lo: [
+                self.core.framemask_entrylo(self.core.cp0_entrylo0),
+                self.core.framemask_entrylo(self.core.cp0_entrylo1),
+            ],
             selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
             vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
             offset_mask: 0, pfn_base: [0; 2],
@@ -11028,7 +11034,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
         cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
         cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
-        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
+        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext); cp0u32!(cp0_framemask);
         tbl.insert("cp0".into(), toml::Value::Table(cp0));
 
         // FPU
@@ -11093,7 +11099,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
             ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
             ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
-            ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
+            ld64!(cp0_xcontext); ld32!(cp0_framemask); ld64!(cp0_epc); ld64!(cp0_errorepc);
             // Restart the virtual count from the restored value and re-arm
             // the compare timer — Instants from the previous run are
             // meaningless here — with a live ticket for the restored deadline.

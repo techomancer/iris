@@ -867,6 +867,12 @@ pub struct MipsCore {
     pub cp0_watchlo: u32,     // 18: Watchpoint Low
     pub cp0_watchhi: u32,     // 19: Watchpoint High
     pub cp0_xcontext: u64,    // 20: Extended Context (64-bit)
+    /// 21: FrameMask (R10000 family), bits 15:0. A set bit zeroes the matching
+    /// EntryLo bit 33:18 on a TLB write (`MipsCore::framemask_entrylo`).
+    pub cp0_framemask: u32,
+    /// Writable FrameMask bits: 15:0 on the R10000 family, none elsewhere
+    /// (`CpuModel::R10K_FAMILY`). Set once by the executor.
+    pub framemask_mask: u32,
     pub cp0_ecc: u32,         // 26: ECC Register
     pub cp0_cacheerr: u32,    // 27: Cache Error
     /// 28: Cache Tag Low. 64 bits, not 32.
@@ -1410,6 +1416,8 @@ impl MipsCore {
             cp0_watchlo: 0,
             cp0_watchhi: 0,
             cp0_xcontext: 0,
+            cp0_framemask: 0,
+            framemask_mask: 0,
             cp0_ecc: 0,
             cp0_cacheerr: 0,
             cp0_taglo: 0,
@@ -1502,6 +1510,7 @@ impl MipsCore {
             self.cp0_watchlo = 0;
             self.cp0_watchhi = 0;
             self.cp0_xcontext = 0;
+            self.cp0_framemask = 0;
             self.cp0_ecc = 0;
             self.cp0_cacheerr = 0;
             self.cp0_taglo = 0;
@@ -1640,6 +1649,7 @@ impl MipsCore {
             18 => self.cp0_watchlo as u64,
             19 => self.cp0_watchhi as u64,
             20 => self.cp0_xcontext,
+            21 => self.cp0_framemask as u64,
             25 => {
                 // PerfCnt: R4400 has no performance counters. Log any probe so
                 // a guest expecting them (and routing their overflow onto the
@@ -1692,6 +1702,7 @@ impl MipsCore {
             18 => self.cp0_watchlo as u64,
             19 => self.cp0_watchhi as u64,
             20 => self.cp0_xcontext,
+            21 => self.cp0_framemask as u64,
             26 => self.cp0_ecc as u64,
             27 => self.cp0_cacheerr as u64,
             28 => self.cp0_taglo,
@@ -1699,6 +1710,14 @@ impl MipsCore {
             30 => self.cp0_errorepc,
             _ => 0,
         }
+    }
+
+    /// An EntryLo value as a TLB write passes it on: FrameMask bits 15:0 clear
+    /// EntryLo bits 33:18, so the flags IRIX keeps above the PFN's low bits
+    /// never reach the physical address (R10000 UM p. 234).
+    #[inline]
+    pub fn framemask_entrylo(&self, lo: u64) -> u64 {
+        lo & !((self.cp0_framemask as u64) << 18)
     }
 
     /// Materialize the virtual CP0 Count: advance `cp0_count` by the whole
@@ -2257,6 +2276,10 @@ impl MipsCore {
                 }
                 self.cp0_xcontext = value;
             }
+            // FrameMask: bits 15:0 are implemented, the rest read as zero
+            // (R10000 UM p. 234). Other parts have no register 21 and ignore
+            // the write.
+            21 => self.cp0_framemask = value as u32 & self.framemask_mask,
             25 => {
                 #[cfg(feature = "developer_ip7")]
                 eprintln!("[ip7] MTC0 PerfCnt (reg 25) write {:#018x} (ignored)", value);

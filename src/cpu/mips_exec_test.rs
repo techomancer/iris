@@ -3737,6 +3737,56 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(0xF_FFFF_FFFF);
     }
 
+    /// FrameMask bits 15:0 clear EntryLo bits 33:18 as a TLB write takes them,
+    /// on the R10000 only (R10000 UM p. 234). Physical bit 24 is EntryLo bit 18,
+    /// mask bit 0; the R4400 has no such register.
+    #[test]
+    fn framemask_clears_entrylo_bits_on_a_tlb_write() {
+        fn phys<C: CpuModel + From<Arc<dyn BusDevice>>>(framemask: u64) -> (u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_masked::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, framemask);
+            (exec.core.read_cp0(21), exec.debug_translate(VA).phys)
+        }
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        on_big_stack(|| {
+            // Mask bit 0 is written with bits above 15, which are ignored.
+            let all = 0xFFFF_0001;
+            assert_eq!(phys::<R10000ShadowCache>(0), (0, 0x0300_5000));
+            assert_eq!(phys::<R10000ShadowCache>(all), (1, 0x0200_5000));
+            assert_eq!(phys::<R4400Cache>(all), (0, 0x0300_5000));
+        });
+    }
+
+    /// TLBWR masks as TLBWI does, and TLBR returns what the TLB holds: the
+    /// masked EntryLo, not the value that was written.
+    #[test]
+    fn framemask_applies_to_tlbwr_and_tlbr_reads_back_the_masked_entry() {
+        use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+        // Write with `funct`, find the entry with TLBP, clear EntryLo0, TLBR,
+        // and return (physical address of the page, EntryLo0 after TLBR).
+        fn entry<C: CpuModel + From<Arc<dyn BusDevice>>>(funct: u32) -> (u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_with::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, 0xFFFF_0001, funct);
+            let phys = exec.debug_translate(VA).phys;
+            for (rd, value) in [(10, VA), (2, 0)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (phys, exec.core.read_cp0(2))
+        }
+        on_big_stack(|| {
+            // FrameMask bit 0 clears EntryLo bit 18, physical bit 24.
+            let unmasked = ((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
+            let masked = unmasked & !(1 << 18);
+            for funct in [FUNCT_TLBWI, FUNCT_TLBWR] {
+                assert_eq!(entry::<R10000ShadowCache>(funct), (0x0200_5000, masked), "R10000 {funct:#x}");
+                assert_eq!(entry::<R4400Cache>(funct), (0x0300_5000, unmasked), "R4400 {funct:#x}");
+            }
+        });
+    }
+
     /// The Indy, Indigo2 and O2 decode 32 physical bits, and IRIX relies on
     /// it: on the IP28 the kernel stack's wired entry carries PTE software
     /// bits as PA[34:33]. `phys_mask` must fold them away before the bus.
@@ -6422,6 +6472,20 @@ mod tests {
     fn map_page<C: CpuModel + From<Arc<dyn BusDevice>>>(
         bus: Arc<dyn BusDevice>, va: u64, phys: u64,
     ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        map_page_masked::<C>(bus, va, phys, 0)
+    }
+
+    /// `map_page` with CP0 FrameMask (register 21) written before the TLB write.
+    fn map_page_masked<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64, framemask: u64,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
+        map_page_with::<C>(bus, va, phys, framemask, FUNCT_TLBWI)
+    }
+
+    /// `map_page_masked`, writing the entry with `funct` (TLBWI or TLBWR).
+    fn map_page_with<C: CpuModel + From<Arc<dyn BusDevice>>>(
+        bus: Arc<dyn BusDevice>, va: u64, phys: u64, framemask: u64, funct: u32,
+    ) -> Box<MipsExecutor<crate::cpu::mips_tlb::MipsTlb, C>> {
         let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
         let mut exec = Box::new(MipsExecutor::new(bus, crate::cpu::mips_tlb::MipsTlb::default(), &cfg));
         disable_jitv2(&mut exec);
@@ -6429,11 +6493,11 @@ mod tests {
         exec.install_status_cb();
         let status = (exec.core.cp0_status & !crate::cpu::mips_core::STATUS_ERL) | STATUS_KX;
         let entrylo = ((phys >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1);
-        for (rd, value) in [(12, status as u64), (10, va), (0, 0), (5, 0), (2, entrylo), (3, 0)] {
+        for (rd, value) in [(12, status as u64), (10, va), (0, 0), (5, 0), (21, framemask), (2, entrylo), (3, 0)] {
             exec.core.write_gpr(1, value);
             assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
         }
-        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBWI), EXEC_COMPLETE);
+        assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | funct), EXEC_COMPLETE);
         exec
     }
 

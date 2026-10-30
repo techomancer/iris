@@ -347,6 +347,7 @@ impl<
         _ => "shadow",
     };
     const CACHE_KIND: &'static str = "shadow";
+    const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
 }
 
