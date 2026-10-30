@@ -151,6 +151,35 @@ fn a_page_table_transfer_lands_across_pages_and_raises_dma_done() {
     assert_eq!(object_word(&mut s, page1_len / 4 - 1), 0xbb00_0000 | (page1_len / 4 - 1));
 }
 
+/// A transfer into an object lands on the raster unit, in order behind
+/// the raster work queued before it, which may still read the texels it
+/// replaces: the descriptor returns while that work is still queued. A
+/// later read of the object waits for the transfer and sees it. (A
+/// transfer that grows its object still waits: growing may move it.)
+#[test]
+fn an_object_transfer_queues_behind_the_raster_work_before_it() {
+    let (s, _rec, ram) = fenced_board();
+    let h = BoardLocks::new(s);
+    put_table(&ram, TABLE, object_header(1, false), &[pte(PAGE_A, 64)]);
+    // The object exists with its row before the raster unit has work.
+    descriptor(&mut h.board.lock(), TABLE);
+    h.raster.start();
+    // The raster unit's next slice holds it for 300 ms, as a long draw would.
+    h.raster.test_slice_sleep_ms.store(300, std::sync::atomic::Ordering::SeqCst);
+    h.raster.submit(|_| {});
+    let row: Vec<u8> = (0..16u32).flat_map(|i| (0xdd00_0000u32 | i).to_be_bytes()).collect();
+    ram.put(PAGE_A, &row);
+    {
+        let mut s = h.board.lock();
+        descriptor(&mut s, TABLE);
+        assert_eq!(h.raster.pending(), 2, "the transfer queues behind the raster work");
+        assert_eq!(object_word(&mut s, 0), 0xdd00_0000);
+        assert_eq!(object_word(&mut s, 15), 0xdd00_000f);
+        assert_eq!(h.raster.pending(), 0, "reading the object waited for the transfer");
+    }
+    h.raster.stop();
+}
+
 /// A descriptor whose entries disagree with its header, one entry
 /// claiming more bytes than the header's rectangle, fails the transfer
 /// before anything lands. The board still consumed the descriptor, so the

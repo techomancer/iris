@@ -307,12 +307,59 @@ impl Board {
         self.object_word_set_valid(word, true);
     }
 
+    /// object_store() for a transfer the raster unit lands: the bookkeeping
+    /// now (rows, validity), the word into `staged` for object_flush() to
+    /// hand on. A queued textured draw may still read the texels this
+    /// replaces, and the raster unit runs its jobs in order, so the write
+    /// queues behind that draw instead of waiting for it.
+    pub fn object_stage(&mut self, staged: &mut Vec<(u32, u32)>, i: i32, x: u32, y: u32, rgba: u32) {
+        let iu = i as usize;
+
+        if x >= self.obj_width[iu] {
+            return;
+        }
+        if y.wrapping_add(1) > self.obj_rows[iu] {
+            // Growing the object may move it in the store, and the words
+            // staged so far name their places as they are now.
+            self.object_flush(staged);
+            if !self.object_rows(i, y.wrapping_add(1)) {
+                return;
+            }
+        }
+        let word = self.obj_offset[iu] as u64 + y as u64 * self.obj_width[iu] as u64 + x as u64;
+        self.object_word_set_valid(word, true);
+        staged.push((word as u32, rgba));
+    }
+
+    /// Hand the staged object words to the raster unit, behind the jobs
+    /// queued before them.
+    pub fn object_flush(&mut self, staged: &mut Vec<(u32, u32)>) {
+        if staged.is_empty() {
+            return;
+        }
+        let words = std::mem::take(staged);
+        let spans = self.plane_spans();
+        self.raster.submit(move |_| {
+            // SAFETY: the store outlives the job, and the front end waits
+            // for the raster unit before it touches the store (PlaneSpans).
+            // The whole PlaneSpans moves in, which is Send; its pointer alone
+            // is not.
+            let spans = spans;
+            let bytes = unsafe { spans.obj.bytes() };
+            for (word, rgba) in words {
+                bytes[word as usize * 4..][..4].copy_from_slice(&rgba.to_be_bytes());
+            }
+        });
+    }
+
     pub fn object_load(&mut self, i: i32, x: u32, y: u32) -> u32 {
         let iu = i as usize;
 
         if x >= self.obj_width[iu] || y >= self.obj_rows[iu] {
             return 0;
         }
+        // A staged transfer may still be queued for the raster unit.
+        self.raster_wait();
         u32::from_be_bytes(self.obj_mem.bytes[((self.obj_offset[iu] as u64 + y as u64 * self.obj_width[iu] as u64 + x as u64) * 4) as usize..][..4].try_into().unwrap())
     }
 

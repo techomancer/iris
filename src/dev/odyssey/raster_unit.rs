@@ -26,7 +26,8 @@
 //! - The front end's own plane work (integer and image drawing, pixel DMA,
 //!   the object store, reset) first waits for the raster unit to finish
 //!   every job queued (`Board::raster_wait`), so the two never touch the
-//!   planes at once.
+//!   planes at once. A DMA's texels for an object that already has its
+//!   rows go to the raster unit as a job instead (`Board::object_stage`).
 //! - The display thread resolves the frame while holding the raster unit's
 //!   context lock (`RasterQueue::planes`), which the raster thread holds for
 //!   each slice of jobs, so a frame waits out a slice in flight and never

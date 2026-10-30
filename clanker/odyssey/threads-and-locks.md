@@ -45,7 +45,11 @@ apply to BUZZ). Nothing models more than one raster unit.
   engines reach their pixel memory (`clanker/mgras/DESIGN.md`). The front
   end's own plane work (integer and image drawing, pixel DMA, the object
   store, reset) waits for the raster queue to empty first
-  (`Board::raster_wait`). The display holds the raster unit's context lock
+  (`Board::raster_wait`). A DMA into an object that already has its rows
+  does not: its texels go to the raster unit as a job, behind the draws
+  that may still read the old ones (`Board::object_stage`). A texture
+  upload otherwise drained the whole raster queue, up to 180 ms of drawing
+  in Smoke & Mirrors. The display holds the raster unit's context lock
   while it resolves a frame.
 
 Both rings are the shared `GFifo`, 64K entries. The IMPACT model's raster

@@ -97,19 +97,13 @@ impl DmaBus {
 }
 
 impl Board {
-    /// One pixel of a transfer at (x, y) of object obj, or of the colour buffers
-    /// the drawing mask selects when obj is -1, decoded by the header's source
-    /// format as an image transfer's pixel is. Clipped to the plane only.
-    pub fn dma_put(&mut self, obj: i32, x: i64, y: i64, src: &[u8], code: u32) {
+    /// One pixel of a transfer at (x, y) of the colour buffers the drawing
+    /// mask selects, decoded by the header's source format as an image
+    /// transfer's pixel is. Clipped to the plane only.
+    pub fn dma_put(&mut self, x: i64, y: i64, src: &[u8], code: u32) {
         let mut pixel: u32 = 0;
 
         self.decode_pixel(code, src, &mut pixel);
-        if obj >= 0 {
-            if x >= 0 && y >= 0 {
-                self.object_store(obj, x as u32, y as u32, pixel);
-            }
-            return;
-        }
         if x < 0 || y < 0 || x >= SGI_ODYSSEY_WIDTH as i64 || y >= SGI_ODYSSEY_HEIGHT as i64 {
             return;
         }
@@ -253,6 +247,7 @@ impl Board {
             return;
         }
         let mut row = vec![0u8; rowbytes as usize];
+        let mut staged = Vec::new();
         let mut i: usize = 0;
         let mut left: u32 = if n > 0 { e[0].len } else { 0 };
         'done: {
@@ -284,23 +279,28 @@ impl Board {
                 }
                 for c in 0..w {
                     let px = &row[(c * bpp) as usize..];
+                    // An object's texels land on the raster unit, in order
+                    // behind the draws that may still read the old ones.
+                    let (ox, oy) = (x.wrapping_add(c), y.wrapping_add(r));
                     if raw {
-                        self.object_store(obj, x.wrapping_add(c), y.wrapping_add(r), raw_unpack(px, bpp));
+                        self.object_stage(&mut staged, obj, ox, oy, raw_unpack(px, bpp));
                         continue;
                     }
                     if texel12 {
-                        self.object_store(
-                            obj,
-                            x.wrapping_add(c),
-                            y.wrapping_add(r),
-                            decode_texel12(code, px, bpp != comps),
-                        );
+                        self.object_stage(&mut staged, obj, ox, oy, decode_texel12(code, px, bpp != comps));
                         continue;
                     }
-                    self.dma_put(obj, (x as i64) + (c as i64), (y as i64) + (r as i64), px, code);
+                    if obj >= 0 {
+                        let mut pixel = 0;
+                        self.decode_pixel(code, px, &mut pixel);
+                        self.object_stage(&mut staged, obj, ox, oy, pixel);
+                        continue;
+                    }
+                    self.dma_put((x as i64) + (c as i64), (y as i64) + (r as i64), px, code);
                 }
             }
         }
+        self.object_flush(&mut staged);
         self.scanout.invalidate_all();
     }
 }
