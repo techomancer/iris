@@ -49,8 +49,7 @@ thread_local! {
 }
 
 /// Select the row loops for draws made on this thread. Per thread, so that
-/// tests running at once cannot change each other's path; a draw chooses
-/// before it hands bands to other threads.
+/// tests running at once cannot change each other's path.
 pub fn raster_set_fill_path(path: RasterFillPath) {
     SOFT_FILL_PATH.with(|p| p.set(path));
 }

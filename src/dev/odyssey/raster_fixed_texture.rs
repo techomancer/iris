@@ -56,6 +56,9 @@ pub fn fx_min<T: PartialOrd>(a: T, b: T) -> T {
 // is dropped and reported as before.
 pub const SGI_SOFT_FIXED_MAX_SIDE: u32 = 8192;
 pub const SGI_SOFT_FIXED_MAX_TEXELS: u32 = 1 << 22;
+/// The fewest pixels a draw covers for its texels to be read ahead
+/// (SoftDraw::fixed_prefill()).
+pub const SGI_SOFT_FIXED_PREFILL_MIN_PIXELS: u64 = 2048;
 /// Lambda's bounds, beyond any level count, in 1/256.
 pub const SGI_SOFT_FIXED_LAMBDA_MAX: i32 = 1 << 24;
 
@@ -66,7 +69,7 @@ thread_local! {
 
 /// How filled triangles drawn on this thread sample a texture, for tests.
 /// Per thread, so that tests running at once cannot change each other's
-/// path; a draw chooses before it hands bands to other threads.
+/// path.
 pub fn raster_set_texture_path(path: RasterTexturePath) {
     SOFT_TEXTURE_PATH.with(|p| p.set(path));
 }
@@ -347,10 +350,9 @@ impl SoftFixedTex {
 
 impl SoftDraw<'_> {
     /// Read every texel of the levels draw r can sample into this thread's
-    /// plain arrays, which f then shares with the draw's bands: for a large
-    /// draw that covers about as many pixels as those levels have texels,
-    /// which then reads each once rather than once in each band, and taps
-    /// them without a tag. False, and the draw reads texels as it reaches them,
+    /// plain arrays, which f then lends the draw: for a large draw that
+    /// covers about as many pixels as those levels have texels, which then
+    /// taps them without a tag. False, and the draw reads texels as it reaches them,
     /// where any read fails or the arrays cannot be allocated.
     pub fn fixed_prefill(&self, f: &mut SoftFixedTex) -> bool {
         let mut first = 0u32;
@@ -770,7 +772,7 @@ mod tests {
     use super::*;
 
     // Large enough that the draw covers more pixels than the texture path
-    // prefills for, and than bands share.
+    // prefills for.
     const W: usize = 128;
 
     /// A colour and a depth plane of W by W words.
@@ -784,31 +786,14 @@ mod tests {
         depth: Rows<'a, u32>,
     }
 
-    // The names of the threads that stored a pixel.
-    static WRITERS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
     impl PlaneStore for Fb<'_> {
         fn planes(&mut self) -> Box<dyn Planes + '_> {
             Box::new(FbView { colour: self.colour.view(), depth: self.depth.view() })
-        }
-        fn split(&mut self, bands: u32) -> Vec<Box<dyn PlaneStore + '_>> {
-            self.colour
-                .split(bands)
-                .into_iter()
-                .zip(self.depth.split(bands))
-                .map(|(colour, depth)| Box::new(Fb { colour, depth }) as Box<dyn PlaneStore + '_>)
-                .collect()
         }
     }
 
     impl Planes for FbView<'_> {
         fn store_colour(&self, _t: ColourTarget, x: i32, y: i32, c: u32) {
-            let name = std::thread::current().name().unwrap_or("").to_string();
-            let mut w = WRITERS.lock().unwrap();
-            if !w.contains(&name) {
-                w.push(name);
-            }
-            drop(w);
             self.colour.get(y as usize, x as usize, 1).unwrap()[0].set(c);
         }
         fn load_colour(&self, _t: ColourTarget, x: i32, y: i32) -> u32 {
@@ -840,7 +825,7 @@ mod tests {
         }
     }
 
-    fn draw(path: RasterTexturePath, filter: u32, bands: bool) -> (Vec<u32>, Vec<u32>) {
+    fn draw(path: RasterTexturePath, filter: u32) -> (Vec<u32>, Vec<u32>) {
         let rules = RasterRules {
             subpixel_bits: 4,
             color_bits: 8,
@@ -868,8 +853,6 @@ mod tests {
             store_colour: true,
             load_colour: true,
             texture: Some(image),
-            concurrent_pixels: bands,
-            band_min_pixels: 1,
             ..Default::default()
         };
         let mut id = [0.0f32; 16];
@@ -909,11 +892,8 @@ mod tests {
         let mut fb = Fb { colour: RowsMut::new(&mut colour, W), depth: RowsMut::new(&mut depth, W) };
 
         raster_set_texture_path(path);
-        raster_set_parallel(4, 1);
         rules.draw(&target, &mut fb, &Hashed, &mut d);
         raster_set_texture_path(SGI_RASTER_TEXTURE_SPANS);
-        raster_set_parallel(0, SGI_RASTER_PARALLEL_MIN_PIXELS);
-        drop(fb);
         (colour, depth)
     }
 
@@ -925,26 +905,13 @@ mod tests {
     #[test]
     fn fixed_and_double_paths_agree() {
         for filter in [SGI_GL_NEAREST, SGI_GL_LINEAR] {
-            let (dc, dz) = draw(SGI_RASTER_TEXTURE_DOUBLE, filter, false);
-            let (sc, sz) = draw(SGI_RASTER_TEXTURE_SPANS, filter, false);
-            let (fc, fz) = draw(SGI_RASTER_TEXTURE_FIXED, filter, false);
+            let (dc, dz) = draw(SGI_RASTER_TEXTURE_DOUBLE, filter);
+            let (sc, sz) = draw(SGI_RASTER_TEXTURE_SPANS, filter);
+            let (fc, fz) = draw(SGI_RASTER_TEXTURE_FIXED, filter);
             let tol = if filter == SGI_GL_NEAREST { 0 } else { 2 };
             let mut differ = 0;
 
             assert!(dc.iter().any(|&c| c != 0), "triangle drew nothing");
-            // Bands draw the same pixels as one pass, double or fixed.
-            for path in [SGI_RASTER_TEXTURE_DOUBLE, SGI_RASTER_TEXTURE_SPANS, SGI_RASTER_TEXTURE_FIXED] {
-                WRITERS.lock().unwrap().clear();
-                let (bc, bz) = draw(path, filter, true);
-                assert!(
-                    WRITERS.lock().unwrap().iter().any(|n| n.starts_with("sgi-raster-")),
-                    "no pool worker drew a pixel: {:?}",
-                    WRITERS.lock().unwrap()
-                );
-                let (oc, oz) = draw(path, filter, false);
-
-                assert!(bc == oc && bz == oz, "banded draw differs, path {path} filter {filter:#x}");
-            }
             assert_eq!(sc, fc, "span and general loops differ, filter {filter:#x}");
             assert_eq!(sz, fz);
             assert_eq!(dz, fz, "depth differs, filter {filter:#x}");

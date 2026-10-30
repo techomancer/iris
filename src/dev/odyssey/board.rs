@@ -264,11 +264,6 @@ pub struct Board {
     pub gl_ctx: Option<Box<GlContext>>,
     /// The drawable Board::gl_bind() last built for the shared context.
     pub gl_bind_drawable: GlDrawable,
-    /// Host-only: GL draws may run in bands of rows (x-raster-bands); the
-    /// bands run serially here.
-    pub raster_bands: bool,
-    /// Host-only band threshold, lowered by tests to force banding.
-    pub raster_band_pixels: u32,
     pub gl_in_prim: bool,
     pub gl_begin_open: bool,
     pub gl_integer_prim: bool,
@@ -572,8 +567,6 @@ impl Default for Board {
             poly_col_lo: 0,
             gl_ctx: Some(Box::default()),
             gl_bind_drawable: Default::default(),
-            raster_bands: false,
-            raster_band_pixels: 0,
             gl_in_prim: false,
             gl_begin_open: false,
             gl_integer_prim: false,
@@ -1289,8 +1282,6 @@ impl Board {
         s.cas_latency = 3;
         s.backend_version = 1;
         s.nic_serial = synthetic_onewire_serial('G', 0);
-        s.raster_bands = true;
-        s.raster_band_pixels = 0;
         s.product = product.to_string();
         s.slot = slot;
         s.configure()?;

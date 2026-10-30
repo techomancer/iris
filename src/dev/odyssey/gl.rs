@@ -223,8 +223,7 @@ impl GlPixelState<'_> {
 }
 
 /// The board's planes as a GL draw borrows them: the two colour buffers,
-/// the model depth and stencil planes and the overlay byte, whole or one
-/// band's rows of each.
+/// the model depth and stencil planes and the overlay byte.
 pub struct GlPixels<'a> {
     pub state: GlPixelState<'a>,
     pub colour: [RowsMut<'a, u8>; ODSY_BUFFERS as usize],
@@ -244,27 +243,6 @@ impl PlaneStore for GlPixels<'_> {
             stencil: self.stencil.view(),
             overlay: self.overlay.view(),
         })
-    }
-
-    fn split(&mut self, bands: u32) -> Vec<Box<dyn PlaneStore + '_>> {
-        let [c0, c1] = &mut self.colour;
-        let mut c0 = c0.split(bands).into_iter();
-        let mut c1 = c1.split(bands).into_iter();
-        let mut depth = self.depth.split(bands).into_iter();
-        let mut stencil = self.stencil.split(bands).into_iter();
-        let mut overlay = self.overlay.split(bands).into_iter();
-
-        (0..bands)
-            .map(|_| {
-                Box::new(GlPixels {
-                    state: self.state,
-                    colour: [c0.next().unwrap(), c1.next().unwrap()],
-                    depth: depth.next().unwrap(),
-                    stencil: stencil.next().unwrap(),
-                    overlay: overlay.next().unwrap(),
-                }) as Box<dyn PlaneStore + '_>
-            })
-            .collect()
     }
 }
 
@@ -499,8 +477,6 @@ impl Board {
             load_rgba: !index,
             stencil: true,
             fog_factor: true,
-            concurrent_pixels: self.raster_bands,
-            band_min_pixels: self.raster_band_pixels,
             mixed_frame: false,
             ..Default::default()
         };

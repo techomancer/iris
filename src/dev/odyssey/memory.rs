@@ -327,74 +327,36 @@ impl Plane {
     }
 }
 
-/// A pixel array's rows as a draw borrows them: the whole array, or the
-/// rows of one band of a banded draw. A band has every bands-th run of
-/// 2^SGI_SOFT_BAND_ROWS_SHIFT rows (SoftDraw::row_in_band()), so bands of
-/// one draw never share a row and can write theirs on separate threads.
+/// A pixel array's rows as a draw borrows them.
 pub struct RowsMut<'a, T> {
     /// Elements from the start of one row to the next.
     stride: usize,
-    chunks: RowChunks<&'a mut [T]>,
-}
-
-enum RowChunks<S> {
-    Whole(S),
-    /// Indexed by row >> SGI_SOFT_BAND_ROWS_SHIFT; None for another band's.
-    Band(Vec<Option<S>>),
+    data: &'a mut [T],
 }
 
 impl<'a, T> RowsMut<'a, T> {
     pub fn new(data: &'a mut [T], stride: usize) -> Self {
-        RowsMut { stride, chunks: RowChunks::Whole(data) }
+        RowsMut { stride, data }
     }
 
-    /// One RowsMut per band, band b holding its rows. Only whole rows split.
-    pub fn split(&mut self, bands: u32) -> Vec<RowsMut<'_, T>> {
-        let RowChunks::Whole(data) = &mut self.chunks else {
-            panic!("a band's rows split again");
-        };
-        let run = (self.stride << SGI_SOFT_BAND_ROWS_SHIFT).max(1);
-        let bands = bands as usize;
-        let n = data.len().div_ceil(run);
-        let mut out: Vec<Vec<Option<&mut [T]>>> = (0..bands).map(|_| (0..n).map(|_| None).collect()).collect();
-
-        for (i, chunk) in data.chunks_mut(run).enumerate() {
-            out[i % bands][i] = Some(chunk);
-        }
-        out.into_iter().map(|chunks| RowsMut { stride: self.stride, chunks: RowChunks::Band(chunks) }).collect()
-    }
-
-    /// The rows as one thread writes them.
+    /// The rows as the draw writes them.
     pub fn view(&mut self) -> Rows<'_, T> {
-        let chunks = match &mut self.chunks {
-            RowChunks::Whole(data) => RowChunks::Whole(Cell::from_mut(&mut **data).as_slice_of_cells()),
-            RowChunks::Band(chunks) => RowChunks::Band(
-                chunks.iter_mut().map(|c| c.as_mut().map(|c| Cell::from_mut(&mut **c).as_slice_of_cells())).collect(),
-            ),
-        };
-        Rows { stride: self.stride, chunks }
+        Rows { stride: self.stride, data: Cell::from_mut(&mut *self.data).as_slice_of_cells() }
     }
 }
 
-/// RowsMut as one thread writes it, through shared references.
+/// RowsMut as the draw writes it, through shared references.
 pub struct Rows<'a, T> {
     stride: usize,
-    chunks: RowChunks<&'a [Cell<T>]>,
+    data: &'a [Cell<T>],
 }
 
 impl<T> Rows<'_, T> {
-    /// The len elements at element `offset` of row y, when that row is
-    /// these rows' and long enough.
+    /// The len elements at element `offset` of row y, when the array is
+    /// long enough.
     #[inline]
     pub fn get(&self, y: usize, offset: usize, len: usize) -> Option<&[Cell<T>]> {
-        let (data, at) = match &self.chunks {
-            RowChunks::Whole(data) => (*data, y * self.stride + offset),
-            RowChunks::Band(chunks) => {
-                let chunk = (*chunks.get(y >> SGI_SOFT_BAND_ROWS_SHIFT)?)?;
-                (chunk, (y & ((1 << SGI_SOFT_BAND_ROWS_SHIFT) - 1)) * self.stride + offset)
-            }
-        };
-        data.get(at..)?.get(..len)
+        self.data.get(y * self.stride + offset..)?.get(..len)
     }
 }
 

@@ -1,9 +1,9 @@
 //! The scalar rasteriser's core: the rules a draw follows where OpenGL
 //! leaves a choice, the draw and fragment types, the fragment path (window
 //! mapping, depth and stencil, blending, logic ops, fog, the colour mask)
-//! and the draw entry point. Triangles, lines, pixel work, texturing and
-//! banding are in the other raster_*.rs files; raster_fixed_texture.rs is
-//! the fixed-point fast path for textured triangles.
+//! and the draw entry point. Triangles, lines, pixel work and texturing
+//! are in the other raster_*.rs files; raster_fixed_texture.rs is the
+//! fixed-point fast path for textured triangles.
 //!
 //! Ported from include/hw/display/sgi/rasterizer.h in jamesbraid/qemu-sgi-origami.
 
@@ -296,14 +296,10 @@ pub trait Planes {
     }
 }
 
-/// The planes a draw writes, as the family lends them for one draw: whole,
-/// or split so that each band of a banded draw has its own rows.
+/// The planes a draw writes, as the family lends them for one draw.
 pub trait PlaneStore: Send {
     /// The planes, for drawing on this thread.
     fn planes(&mut self) -> Box<dyn Planes + '_>;
-    /// One store per band, band b holding the rows SoftDraw::row_in_band()
-    /// gives it.
-    fn split(&mut self, bands: u32) -> Vec<Box<dyn PlaneStore + '_>>;
 }
 
 /// The setup of a draw, before it touches a plane.
@@ -342,9 +338,6 @@ pub struct RasterTarget<'a> {
     pub stipple_opaque: bool,
     pub stipple_background: [f32; 4],
     pub stipple_background_index: u32,
-    /// Bands run serially.
-    pub concurrent_pixels: bool,
-    pub band_min_pixels: u32,
     pub mixed_frame: bool,
 }
 
@@ -377,14 +370,14 @@ pub struct SoftWindow {
     pub clip: ClipList,
 }
 
-/// Once-a-draw reports, shared by the bands of one draw.
+/// Once-a-draw reports.
 #[derive(Default)]
 pub struct SoftReports {
     pub texture: std::sync::atomic::AtomicU32,
     pub rgba: std::sync::atomic::AtomicBool,
 }
 
-/// One draw's fixed inputs, the part of a draw its bands share.
+/// One draw's fixed inputs, apart from its planes and texel cache.
 #[derive(Clone, Copy)]
 pub struct SoftShared<'a> {
     pub rules: &'a RasterRules,
@@ -423,9 +416,6 @@ pub struct SoftShared<'a> {
     /// The row loop untextured filled triangles take, or None for the
     /// general per-fragment path (SoftDraw::fill_select()).
     pub fill: Option<FillRow>,
-    /// Of bands > 1, the rows this pass draws (SoftDraw::row_in_band()).
-    pub band: u32,
-    pub bands: u32,
 }
 
 /// A draw as one thread runs it: the shared inputs, and the planes and
@@ -487,8 +477,6 @@ impl<'a> SoftDraw<'a> {
                 rgba_read: false,
                 fixed: None,
                 fill: None,
-                band: 0,
-                bands: 0,
             },
             px: &NoPlanes,
             texels_cache: None,
@@ -585,10 +573,6 @@ pub struct SoftFrag {
 
  // rows interleave in runs of 8
 
-thread_local! {
-    /// A band other than the first repeats the primitive work: say it once.
-    pub static SOFT_BAND_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 impl GlDrawState {
     pub fn window(&self) -> Option<SoftWindow> {
@@ -833,7 +817,6 @@ impl RasterRules {
                 k += 1;
             }
             if !valid {
-                // Bands of one draw share the flag (soft_bands_run()).
                 if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     crate::dlog!(LogModule::Odyssey, "sgi-gl: RGBA destination read failed; pixel writes dropped");
                 }
@@ -1707,24 +1690,19 @@ impl SoftDraw<'_> {
         let clip = &cv.clip;
         let eye = &cv.eye;
         let mut win = [0.0f64; 3];
-        let quiet = SOFT_BAND_QUIET.with(|q| q.get());
 
         if !self.texture_vertex_valid(cv) {
             return None;
         }
         if !(clip[3] > 0.0) {
-            if !quiet {
-                crate::dlog!(LogModule::Odyssey, "sgi-gl: clipped vertex at w {} has no window position, primitive dropped", clip[3]);
-            }
+            crate::dlog!(LogModule::Odyssey, "sgi-gl: clipped vertex at w {} has no window position, primitive dropped", clip[3]);
             return None;
         }
         st.clip_to_window(clip, &mut win);
         let xw = win[0];
         let yw = win[1];
         if !(xw.abs() < 65536.0 && yw.abs() < 65536.0) {
-            if !quiet {
-                crate::dlog!(LogModule::Odyssey, "sgi-gl: vertex outside the rasterizer's range, primitive dropped");
-            }
+            crate::dlog!(LogModule::Odyssey, "sgi-gl: vertex outside the rasterizer's range, primitive dropped");
             return None;
         }
         for k in 0..4usize {
@@ -1850,8 +1828,7 @@ impl RasterRules {
             for i in first..=last {
                 texels += fixed.level[i as usize].width as u64 * fixed.level[i as usize].height as u64;
             }
-            // A draw as large as the smallest that bands share, at least.
-            texels = r2_max(texels, SGI_RASTER_PARALLEL_MIN_PIXELS);
+            texels = r2_max(texels, SGI_SOFT_FIXED_PREFILL_MIN_PIXELS);
             fixed_on = (r.draw_pixels(d, texels) >= texels
                 && r.fixed_coordinates_valid(d)
                 && r.fixed_prefill(&mut fixed))
@@ -1949,10 +1926,8 @@ impl<'a> SoftDraw<'a> {
             }
             SGI_GL_TRIANGLES | SGI_GL_TRIANGLE_STRIP | SGI_GL_TRIANGLE_FAN | SGI_GL_POLYGON | SGI_GL_QUADS
             | SGI_GL_QUAD_STRIP => {
-                if !r.draw_parallel(d, planes) {
-                    let px = planes.planes();
-                    r.with_planes(&*px).draw_triangles(d);
-                }
+                let px = planes.planes();
+                r.with_planes(&*px).draw_triangles(d);
                 SGI_GL_DRAW_OK
             }
             _ => {

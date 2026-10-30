@@ -216,7 +216,6 @@ impl Bench {
         // Every pixel of the screen is the window's.
         board.clip_kept = 1;
         board.clip_rect[0] = ClipRect { x0: 0, y0: 0, x1: BENCH_W - 1, y1: BENCH_H - 1 };
-        board.raster_bands = false;
         let mut rules = gl_rules();
         rules.alpha_bits = 8;
         rules.depth_row_given = true;

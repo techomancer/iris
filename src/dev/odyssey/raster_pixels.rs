@@ -99,18 +99,14 @@ pub struct SoftClear<'a> {
 }
 
 impl SoftClear<'_> {
-    /// The rows of a clear that are band's of bands (SoftDraw::row_in_band()),
-    /// stored to px.
-    pub fn rows(&self, px: &dyn Planes, band: u32, bands: u32) {
+    /// The clear's rows, stored to px.
+    pub fn rows(&self, px: &dyn Planes) {
         let rules = self.rules;
         let op = self.op;
         // Only a read fills it, and only a read's targets are read back.
         let mut dest = [RasterColour::default(); SGI_GL_MAX_TARGETS as usize];
 
         for y in op.y0..=op.y1 {
-            if !(bands <= 1 || ((y as u32) >> SGI_SOFT_BAND_ROWS_SHIFT) % bands == band) {
-                continue;
-            }
             let whole_row = op.clip.n <= 1 || op.clip.soft_clip_covers_row(op.x0, op.x1, y);
             for x in op.x0..=op.x1 {
                 if !whole_row && !op.clip.contains(x, y) {
@@ -236,16 +232,7 @@ impl RasterRules {
             clear,
             rgba_reported: Default::default(),
         };
-        let bands = soft_bands();
-        if !t.concurrent_pixels
-            || bands < 2
-            || op.y1 < op.y0
-            || op.x1 < op.x0
-            || ((op.x1 - op.x0 + 1) as u64) * ((op.y1 - op.y0 + 1) as u64) < t.soft_band_min_pixels()
-            || !soft_bands_run_split(planes, bands, &|band, store| rows.rows(&*store.planes(), band, bands))
-        {
-            rows.rows(&*planes.planes(), 0, 1);
-        }
+        rows.rows(&*planes.planes());
     }
 }
 

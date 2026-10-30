@@ -30,9 +30,8 @@
 //! - `raster`: the scalar rasteriser's rules, fragment path and draw entry;
 //!   `raster_triangle`, `raster_line`, `raster_pixels`: triangles and
 //!   polygons, lines and points, pixel rectangles, bitmaps, clears and
-//!   raster ops; `raster_texture`: texture sampling; `raster_bands`:
-//!   drawing in bands of rows on host threads; `raster_fixed_texture`: the
-//!   fixed-point fast path for textured triangles; `raster_fill`: the row
+//!   raster ops; `raster_texture`: texture sampling; `raster_fixed_texture`:
+//!   the fixed-point fast path for textured triangles; `raster_fill`: the row
 //!   loops filled triangles take, specialised by draw state and planes;
 //!   `raster_bench`: a fill-rate benchmark (tests only).
 //! - `memory`, `scanout`, `display`: board memory and planes; the scanned
@@ -73,7 +72,6 @@ pub mod objects;
 pub mod pi_gfx;
 pub mod pixel_dma;
 pub mod raster;
-pub mod raster_bands;
 #[cfg(test)]
 pub mod raster_bench;
 pub mod raster_fill;
@@ -107,7 +105,6 @@ pub use objects::*;
 pub use pi_gfx::*;
 pub use pixel_dma::*;
 pub use raster::*;
-pub use raster_bands::*;
 pub use raster_fill::*;
 pub use raster_fixed_texture::*;
 pub use raster_line::*;

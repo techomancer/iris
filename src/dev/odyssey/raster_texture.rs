@@ -10,7 +10,6 @@ use super::*;
 impl SoftDraw<'_> {
     /// Runtime errors are observable without logging once for every pixel.
     pub fn texture_report(&self, reason: u32, message: &str) {
-        // Bands of one draw share the reports (soft_bands_run()).
         let old = self.reports.texture.fetch_or(reason, std::sync::atomic::Ordering::Relaxed);
         if old & reason == 0 {
             crate::dlog!(LogModule::Odyssey, "sgi-gl: texture {}", message);

@@ -551,9 +551,6 @@ impl SoftDraw<'_> {
         while py <= py1 {
             let cur_py = py;
             py += 1;
-            if !self.row_in_band(cur_py) {
-                continue;
-            }
             let py = cur_py;
             let cy: i64 = (py as i64 * (1i64 << sub)) + (1i64 << (sub - 1));
             let cx: i64 = (px0 as i64 * (1i64 << sub)) + (1i64 << (sub - 1));

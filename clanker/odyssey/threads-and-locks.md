@@ -13,9 +13,6 @@ draw and a processor access touch the same board state.
 - The CPU thread: widget accesses.
 - `odyssey-work`: runs queued command-FIFO stores.
 - `odyssey-display`: counts the 60 Hz retrace and presents the frame.
-- Rasteriser bands: large filled draws and clears run in bands of rows on a
-  small pool. Each band borrows only its own rows of the planes
-  (`RowsMut::split` in memory.rs), so bands never share a pixel.
 
 ## Two locks
 

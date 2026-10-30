@@ -272,9 +272,6 @@ mod tests {
         fn planes(&mut self) -> Box<dyn Planes + '_> {
             Box::new(FbView { depth: self.depth.view() })
         }
-        fn split(&mut self, bands: u32) -> Vec<Box<dyn PlaneStore + '_>> {
-            self.depth.split(bands).into_iter().map(|depth| Box::new(Fb { depth }) as Box<dyn PlaneStore + '_>).collect()
-        }
     }
 
     impl Planes for FbView<'_> {
