@@ -381,6 +381,10 @@ consumer thread never takes `rec`.
   monomorphised over it, so every CPU is in every binary with no
   per-model branch on the hot path. `Machine::new` picks one from `[machine]
   cpu`.
+- Every uncached SB/SH goes to the bus through `BusDevice::write_narrow_from`
+  with the whole source register: the byte or halfword is the low bits, the
+  other lanes are undefined by hardware, and only Bedrock's ECC view reads
+  them.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes
   common pairs (branch + NOP, LUI + ORI/ADDIU, address + load/store) as one
   dispatch.

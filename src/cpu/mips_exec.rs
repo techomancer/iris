@@ -1364,20 +1364,21 @@ unsafe extern "C" fn jit_read64<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    let val = val as u8; // mask to the real width ourselves — see write8_fn's doc comment on why the FFI parameter is u64
+    // The whole register, as the interpreter's SB passes it: `write_data`
+    // narrows it where it stores, and an uncached store hands it to the bus
+    // (`BusDevice::write_narrow_from`).
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_write::<1>(va, val as u64); }
+    { return exec.lockstep_jit_write::<1>(va, val); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    exec.write_data::<1>(va, val as u64)
+    exec.write_data::<1>(va, val)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write16<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
-    let val = val as u16; // mask to the real width ourselves — see write16_fn's doc comment
     #[cfg(feature = "jitv2_lockstep")]
-    { return exec.lockstep_jit_write::<2>(va, val as u64); }
+    { return exec.lockstep_jit_write::<2>(va, val); }
     #[cfg(not(feature = "jitv2_lockstep"))]
-    exec.write_data::<2>(va, val as u64)
+    exec.write_data::<2>(va, val)
 }
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_write32<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, val: u64) -> u32 {
@@ -5109,7 +5110,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             if !DEBUG && mips_log(MIPS_LOG_MEM) {
                 dlog_dev!(LogModule::Mips, "Uncached Write{}: PC={:016x} VA={:016x} PA={:016x} Val={:016x}", SIZE*8, self.core.pc, virt_addr, phys_addr, val);
             }
-            let ws = if SIZE == 1 {
+            let ws = if !DEBUG && SIZE <= 2 {
+                // The bus sees the whole source register: Fuel PROM 6.210's
+                // Walking Address test reads its check words back from
+                // Bedrock's ECC view, and the word sits elsewhere in the
+                // register than the addressed lanes. Ordinary devices take
+                // the architectural low bits. Debug writes carry just the
+                // value they name, so they keep the ordinary-width path.
+                self.sysad.write_narrow_from(phys_addr, SIZE, val)
+            } else if SIZE == 1 {
                 self.sysad.write8(phys_addr, val as u8)
             } else if SIZE == 2 {
                 self.sysad.write16(phys_addr, val as u16)
