@@ -590,6 +590,9 @@ fn nutlb_cacheable_segment<C: CpuModel>(va: u64, is_64bit: bool) -> bool {
     (va >> 62) != 0 || (va >> C::VA_BITS) == 0
 }
 
+/// PageMask bit n covers physical address bit n-1, which is EntryLo bit n-7.
+const PAGEMASK_TO_ENTRYLO: u32 = 7;
+
 /// The EntryHi bits this model keeps: region, VPN2 up to `C::VA_BITS` and ASID.
 #[inline(always)]
 const fn model_entryhi_mask<C: CpuModel>() -> u64 {
@@ -2222,6 +2225,9 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         core.entryhi_mask = model_entryhi_mask::<C>();
         if C::R10K_FAMILY {
             core.framemask_mask = 0xFFFF;
+            // PFN in bits 33:6 and the uncached attribute in 63:62 (R10000 UM v2.0
+            // pp. 239-240); 61:34 are reserved.
+            core.entrylo_mask = 0xC000_0003_FFFF_FFFF;
         }
 
         // Cache geometry comes from the model type C, so Config describes this CPU.
@@ -7164,13 +7170,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // EntryHi's writable mask (0xC000_00FF_FFFF_E0FF on a 40-bit model, MAME's
         // `EH_WM`) clears reserved bits, as on TLBWI. Then clear bit 12 (G bit
         // from EntryHi) and set combined G from Lo0&Lo1.
+        //
+        // The R10000 family stores zeros in the PFN bits the page size leaves
+        // out of the address, so TLBR does not return them (R10000 UM v2.0
+        // pp. 299-300). The manual documents this for the R10000 only; the
+        // later parts follow it as a model choice.
+        let unused_pfn = if C::R10K_FAMILY { (self.core.cp0_pagemask & 0x01FF_E000) >> PAGEMASK_TO_ENTRYLO } else { 0 };
+        let lo = |v: u64| self.core.framemask_entrylo(v) & !unused_pfn;
         TlbEntry {
             page_mask: self.core.cp0_pagemask,
             entry_hi: (self.core.cp0_entryhi & self.core.entryhi_mask & !0x1000) | g_combined,
-            entry_lo: [
-                self.core.framemask_entrylo(self.core.cp0_entrylo0),
-                self.core.framemask_entrylo(self.core.cp0_entrylo1),
-            ],
+            entry_lo: [lo(self.core.cp0_entrylo0), lo(self.core.cp0_entrylo1)],
             selector_bit_shift: 0, // all derived fields overwritten by MipsTlb::write()
             vcmp32: 0, vpn_hi32: 0, vcmp64: 0, vpn_hi64: 0,
             offset_mask: 0, pfn_base: [0; 2],

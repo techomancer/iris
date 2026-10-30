@@ -884,6 +884,7 @@ pub struct MipsCore {
 
     pub tlb_entries: u32,     // Total TLB entries
     pub entryhi_mask: u64,    // Writable EntryHi bits: region, ASID and the model's VPN2 width
+    pub entrylo_mask: u64,    // Writable EntryLo bits: 29:0, or on the R10000 family the PFN (33:6) and uncached attribute (63:62)
     /// CP0 PRId / CP1 FIR reset values, supplied by the CPU model at construction.
     pub reset_prid: u32,
     pub reset_fir: u32,
@@ -1419,6 +1420,7 @@ impl MipsCore {
             cp0_errorepc: 0,
             tlb_entries: 48,
             entryhi_mask: 0xC000_00FF_FFFF_E0FF,
+            entrylo_mask: 0x3FFF_FFFF,
             reset_prid: 0x0000_0440,
             reset_fir: 0x0000_0500,
             cp0_random_cycle: 0,
@@ -1619,8 +1621,8 @@ impl MipsCore {
                 self.update_random();
                 self.cp0_random as u64
             }
-            2 => self.cp0_entrylo0 & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
-            3 => self.cp0_entrylo1 & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
+            2 => self.cp0_entrylo0 & self.entrylo_mask,
+            3 => self.cp0_entrylo1 & self.entrylo_mask,
             4 => self.cp0_context,
             5 => self.cp0_pagemask & 0x01FFE000, // PageMask: only bits 24:13 are valid
             6 => self.cp0_wired as u64 & 0x3F, // Wired: only bits 5:0 are valid, R4000 manual Table 4-10
@@ -1678,8 +1680,8 @@ impl MipsCore {
         match reg {
             0 => self.cp0_index as u64,
             1 => self.cp0_random as u64,
-            2 => self.cp0_entrylo0 & 0x3FFFFFFF,
-            3 => self.cp0_entrylo1 & 0x3FFFFFFF,
+            2 => self.cp0_entrylo0 & self.entrylo_mask,
+            3 => self.cp0_entrylo1 & self.entrylo_mask,
             4 => self.cp0_context,
             5 => self.cp0_pagemask & 0x01FFE000,
             6 => self.cp0_wired as u64 & 0x3F,
@@ -2028,8 +2030,8 @@ impl MipsCore {
             0 => self.cp0_index = (value as u32)
                     & (crate::cpu::mips_exec::CP0_INDEX_P | crate::cpu::mips_exec::CP0_INDEX_SLOT_MASK),
             1 => { /* Random is read-only */ }
-            2 => self.cp0_entrylo0 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
-            3 => self.cp0_entrylo1 = value & 0x3FFFFFFF, // PFN is 24 bits (29:6), flags in lower bits
+            2 => self.cp0_entrylo0 = value & self.entrylo_mask,
+            3 => self.cp0_entrylo1 = value & self.entrylo_mask,
             4 => {
                 //eprintln!("MTC0 Context = {:#018x} (PTEBase={:#018x})", value, value & 0xFFFFFFFF_FF800000);
                 self.cp0_context = value;

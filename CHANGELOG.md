@@ -181,6 +181,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   names, 33:18, on every TLB write, so a kernel that keeps software flags there
   gets the physical address it meant. The register read as zero and ignored
   writes before. The R4400 and R5000 have none.
+- **EntryLo** on the R10000 keeps its 28-bit PFN (bits 33:6, a 40-bit physical
+  address) and the uncached attribute in 63:62; it kept 30 bits before. The
+  attribute is stored and read back, not sent to the bus.
+- **TLB writes on the R10000** store zeros in the PFN bits below the page size,
+  so TLBR reads them back as zero, as the part does; on 16 KB pages that is
+  EntryLo bits 7:6. Translation is unchanged. The PROM's `ide` `tlb` test
+  failed 320 compares on this. The manual documents it for the R10000; the
+  R12000, R14000 and R16000 do the same as a model choice. The R4400 and
+  R5000 still keep the whole PFN.
 
 ### `IRIS_GUI_GL` works in iris-gui
 
