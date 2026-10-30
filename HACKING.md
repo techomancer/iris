@@ -18,7 +18,8 @@ Other documents:
 
 IRIS emulates five SGI workstations: the Indy (IP24), the Indigo2 (IP22), the
 Indigo2 IMPACT (IP28), the O2 (IP32) and the Octane (IP30). The CPU is an
-R4400, R5000 or R10000, chosen at runtime (the Octane takes the R10000 only).
+R4400, R5000, R10000, R12000, R14000 or R16000 (two parts), chosen at runtime (the IP28 takes the R10000;
+the Octane the R10000, R12000 or R14000; the O2 the R5000, R10000 or R12000).
 Graphics is Newport (REX3), GR2 (XZ/Extreme) or IMPACT on the Indy and
 Indigo2, GBE on the O2 and Solid IMPACT on the Octane. It boots the real PROMs
 and IRIX 5.3 and 6.5 to a desktop with networking.
@@ -368,7 +369,7 @@ consumer thread never takes `rec`.
   handler sets the PC itself, including delay slots.
 - The CPU model is the `CpuModel` trait (`MIPS4`, `PRID`, `FIR`,
   `TLB_ENTRIES`, ...), implemented by each cache model. The executor is
-  monomorphised over it, so all three CPUs are in every binary with no
+  monomorphised over it, so every CPU is in every binary with no
   per-model branch on the hot path. `Machine::new` picks one from `[machine]
   cpu`.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes

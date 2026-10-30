@@ -2321,16 +2321,15 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             c |= log2(32768) << 26;          // 32 KB L1D
             c |= 1 << 15;                    // big endian
             if C::L2_LINE == 128 { c |= 1 << 13; }
-            // Secondary cache size. The encoding is not in anything to hand,
-            // so it was swept against the PROM rather than guessed.
-            //
-            // 1 is the value to keep: IRIX reports "Secondary unified
-            // instruction/data cache size: 1 Mbyte", which agrees with this
-            // model's own `L2_SIZE`, and the PROM's power-on diagnostics pass
-            // and IRIX boots with it. 4 also passes POST but has IRIX report
-            // 8 MB, contradicting the model.
-            c |= 1 << 16;
+            // SS is log2(secondary cache size / 512 KB): 0 is 512 KB, 1 is 1 MB,
+            // 2 is 2 MB, up to 5 for 16 MB (NEC U10278EJ4V0UM p.230). It follows
+            // the model's own `L2_SIZE`. EC, SC, DN, PM, DSD and SK stay zero.
+            c |= (C::L2_SIZE / (512 << 10)).trailing_zeros() << 16;
             c |= 2;                          // K0 = uncached at reset
+            // A part with a known reset word presents it over the low 25 bits.
+            if C::CONFIG0_RESET != 0 {
+                c = (c & !crate::cpu::mips_cache_shadow::CONFIG0_RESET_MASK) | C::CONFIG0_RESET;
+            }
             config = c;
         }
 

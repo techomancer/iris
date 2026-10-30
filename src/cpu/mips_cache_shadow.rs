@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
     cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
-    C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    C_ILT, C_IST, C_IWBINV, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
 use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
@@ -189,8 +189,12 @@ impl<
         const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
-    const R10K: bool = MODEL == model::R10000;
+    const R10K: bool = model::r10k_family(MODEL);
     const R5K: bool = MODEL == model::R5000;
+    /// Index Writeback Invalidate (D) also zeroes the primary data tag on the
+    /// R12000 and later; the R10000 leaves it as it was. NEC VR12000 user's
+    /// manual, Appendix B.20. The R14000 and R16000 are taken to match.
+    const IWBI_CLEARS_PD_TAG: bool = Self::R10K && MODEL != model::R10000;
     const IC_LINES: usize = if IC_LINE == 0 { 0 } else { IC_SIZE / IC_LINE };
     const DC_LINES: usize = if DC_LINE == 0 { 0 } else { DC_SIZE / DC_LINE };
     const L2_LINES: usize = if L2_LINE == 0 { 0 } else { L2_SIZE / L2_LINE };
@@ -331,11 +335,10 @@ impl<
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
-    // The R10000 implements 44 virtual address bits where the R4x00 implements
-    // 40; the shadow cache is only used for it, but key this off the same flag
-    // that selects its cache encodings rather than asserting it unconditionally.
-    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
-    const PA_BITS: u32 = if MODEL == model::R10000 { 40 } else { 36 };
+    // The R10000 family implements 44 virtual address bits where the R4x00
+    // implements 40.
+    const VA_BITS: u32 = if Self::R10K { 44 } else { 40 };
+    const PA_BITS: u32 = if Self::R10K { 40 } else { 36 };
     // The CPU's name, which snapshots check: the same as the full model's, so
     // a mismatch reads as a cache-kind difference rather than a different CPU.
     // The R10000 keeps its historical "shadow", which existing IP28
@@ -343,14 +346,20 @@ impl<
     const NAME: &'static str = match MODEL {
         model::R4400 => "R4400",
         model::R5000 => "R5000",
+        model::R12000 => "R12000",
+        model::R16000 => "R16000",
         _ => "shadow",
     };
     const CACHE_KIND: &'static str = "shadow";
     const R10K_FAMILY: bool = Self::R10K_CACHE_OPS;
-    const PARTIAL_LWR_KEEPS_UPPER: bool = MODEL == model::R10000;
-    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    // The upper word of a partial LWR is implementation-defined. Keeping it
+    // is what the IRIX CPU instruction test (olperi) expects and what
+    // qemu-sgi-origami models; for the R12000 and later it is a model choice.
+    const PARTIAL_LWR_KEEPS_UPPER: bool = Self::R10K_FAMILY;
+    const R10K_CACHE_OPS: bool = Self::R10K;
     const POSTS_UNCACHED_STORES: bool = Self::R10K_CACHE_OPS;
     const SECONDARY_TAG_MASK: u64 = if Self::R10K_CACHE_OPS { R10K_L2_TAG_MASK } else { u64::MAX };
+    const CONFIG0_RESET: u32 = if MODEL == model::R16000 { R16000_800_CONFIG0 } else { 0 };
 }
 
 impl<
@@ -654,6 +663,15 @@ impl<
                 0
             }
 
+            C_IWBINV if Self::IWBI_CLEARS_PD_TAG && sel == CACH_PD => {
+                let idx = self.tag_slot(sel, virt_addr);
+                let s = self.shadow(sel);
+                if idx < s.tags.len() {
+                    s.tags[idx] = 0;
+                }
+                0
+            }
+
             // Invalidate, writeback, fill, and the R4000 hit operations. All
             // no-ops: there is nothing held that could be stale or dirty.
             _ => 0,
@@ -753,6 +771,68 @@ impl<
 /// Reports revision 2.5, matching R10000Cache and enabling the IP28 boot tune.
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
+
+/// R12000 3.5 as the Octane has it: the R10000's programming model with a
+/// 2 MB secondary cache. PRId 0x0e35, FIR 0x900, 128-byte secondary lines
+/// (SB: a model choice).
+///
+/// The Octane's R14000 is this type with `R14000_PRID` set at runtime, as the
+/// Octane's own R10000 revision is; only the PRId differs. Both report
+/// "R12000" as `NAME`.
+pub type R12000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 128, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
+
+/// PRId of the R14000 2.4 in the Octane, to set on an `R12000ShadowCache`.
+/// Implementation 0x0f is shared with the R16000, which is told apart by a
+/// major revision above 2.
+pub const R14000_PRID: u32 = 0x0000_0f24;
+
+/// R12000 3.5 as the O2 has it: the Octane part with 64-byte secondary lines
+/// (SB clear). With 128-byte lines the O2 PROM panics before its banner
+/// (write TLB miss at 0x0); 64 boots. IRIX on the O2 never reads SB and sizes
+/// the secondary cache as 512 KB << SS.
+pub type R12000O2ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 2097152, 64, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
+
+/// R16000 2.2, the 800 MHz part, with a 4 MB secondary cache. Only
+/// `iris-bench` builds it for now.
+///
+/// Values and where they come from:
+/// - PRId 0x0f42: the low 16 bits are printed in hinv listings (revision 2.2
+///   under the R16000 name; the major nibble is the printed major plus 2).
+///   Bits 31:16 are zero by inference from every full PRId read on this family.
+/// - FIR 0x900: a model choice. No R16000 FIR has been printed; this is the
+///   R12000 and R14000 value, kept for compatibility.
+/// - Config reset word 0x009baf85 (`R16000_800_CONFIG0`): derived
+///   from the PROM's per-part clock table (printed clocks and cache size fit
+///   it), not read from a running part. SS (4 MB) is inferred from the printed
+///   size, the clock fields from the printed 800 MHz CPU and 400 MHz cache
+///   clocks. 128-byte lines (SB) are a model choice, and the K0, DN, PM, SK,
+///   CT, PE, DDR and bit 24 fields are unknown, carried as the table has them.
+/// - Cache tap 0xa is printed in hinv listings and is not modelled.
+pub type R16000ShadowCache =
+    ShadowCache<32768, 64, 32768, 32, 4194304, 128, true, 0x0000_0f42, 0x0000_0900, 64, { model::R16000 }>;
+
+/// The Config bits an R16000 part's reset word defines: the low 25. IC and DC
+/// above them stay the family's.
+pub const CONFIG0_RESET_MASK: u32 = 0x01ff_ffff;
+
+/// Config reset word of `R16000ShadowCache`, the 800 MHz 4 MB part. Same
+/// grades as listed there.
+pub const R16000_800_CONFIG0: u32 = 0x009b_af85;
+
+/// PRId of the R16000 2.1, the 700 MHz part, to set on an `R16000ShadowCache`.
+/// The low 16 bits are printed in hinv listings as revision 2.1; bits 31:16 are
+/// zero by inference. Nothing else in the model differs: both parts have a
+/// 4 MB secondary cache.
+pub const R16000_MHZ700_PRID: u32 = 0x0000_0f41;
+
+/// Config reset word of the 700 MHz part. It differs from the 800 MHz word in
+/// the EC field only (6 where the 800 MHz part has 7). Derived from the PROM's
+/// per-part clock table with the same grades as the 800 MHz word: the 700 MHz
+/// CPU clock and 350 MHz cache clock are printed, the other fields unknown.
+/// Cache tap 0xc is printed and not modelled.
+pub const R16000_MHZ700_CONFIG0: u32 = 0x009b_ad85;
 
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
 ///
@@ -975,6 +1055,25 @@ mod tests {
         assert_eq!(c.read::<4>(0, 0x2000).data, 0x1234_5678);
     }
 
+    /// On the R12000 and later Index Writeback Invalidate (D) zeroes the
+    /// line's primary data tag, which Index Load Tag then reads back; the
+    /// R10000 keeps the tag.
+    #[test]
+    fn index_writeback_invalidate_d_clears_the_tag_from_the_r12000_on() {
+        fn run<C: MipsCache + From<Arc<dyn BusDevice>>>() -> u64 {
+            let mem: Arc<dyn BusDevice> = Arc::new(Memory::new(1));
+            let c = C::from(mem);
+            let tag = 0x0000_0001_2345_6780u64;
+            c.cache_op(crate::cpu::mips_cache_v2::C_IST | CACH_PD, 0x40, tag);
+            assert_eq!(c.cache_op(crate::cpu::mips_cache_v2::C_ILT | CACH_PD, 0x40, 0), tag);
+            c.cache_op(crate::cpu::mips_cache_v2::C_IWBINV | CACH_PD, 0x40, 0);
+            c.cache_op(crate::cpu::mips_cache_v2::C_ILT | CACH_PD, 0x40, 0)
+        }
+        assert_eq!(run::<R12000ShadowCache>(), 0);
+        assert_eq!(run::<R12000O2ShadowCache>(), 0);
+        assert_eq!(run::<R10000ShadowCache>(), 0x0000_0001_2345_6780);
+    }
+
     /// Geometry is what CP0 Config is built from, so it must be the real
     /// part's even though the model holds nothing.
     #[test]
@@ -1029,6 +1128,24 @@ mod tests {
                    (<Ip28 as MipsCache>::IC_SIZE, <Ip28 as MipsCache>::IC_LINE, <Ip28 as MipsCache>::DC_SIZE, <Ip28 as MipsCache>::DC_LINE, <Ip28 as MipsCache>::L2_SIZE));
         assert_eq!((<O2 as CpuModel>::PRID, <O2 as CpuModel>::FIR, <O2 as CpuModel>::MIPS4, <O2 as CpuModel>::TLB_ENTRIES, <O2 as CpuModel>::VA_BITS, <O2 as CpuModel>::R10K_CACHE_OPS),
                    (<Ip28 as CpuModel>::PRID, <Ip28 as CpuModel>::FIR, <Ip28 as CpuModel>::MIPS4, <Ip28 as CpuModel>::TLB_ENTRIES, <Ip28 as CpuModel>::VA_BITS, <Ip28 as CpuModel>::R10K_CACHE_OPS));
+    }
+
+    /// Each R10000-family part reports its own identity and geometry and shares
+    /// the family's address widths and cache operations; the R5000 does not.
+    #[test]
+    fn the_r10000_family_parts_report_their_own_identity() {
+        fn id<C: CpuModel + MipsCache>() -> (u32, usize, usize, &'static str, u32, u32, bool) {
+            (C::PRID, C::L2_SIZE, C::L2_LINE, C::NAME, C::VA_BITS, C::PA_BITS, C::R10K_CACHE_OPS)
+        }
+        assert_eq!(id::<R10000ShadowCache>(), (0x925, 1 << 20, 128, "shadow", 44, 40, true));
+        assert_eq!(id::<R12000ShadowCache>(), (0xe35, 2 << 20, 128, "R12000", 44, 40, true));
+        assert_eq!(id::<R12000O2ShadowCache>(), (0xe35, 2 << 20, 64, "R12000", 44, 40, true));
+        assert_eq!(id::<R16000ShadowCache>(), (0xf42, 4 << 20, 128, "R16000", 44, 40, true));
+        assert_eq!(id::<R5000ShadowCache>().6, false);
+        // The 700 MHz part is the same type with a PRId set at build time, as
+        // the Octane's R14000 is the R12000 type.
+        assert_eq!(R16000_MHZ700_PRID, 0xf41);
+        assert_eq!(R16000_MHZ700_PRID >> 4 & 0xf, 4, "major nibble is printed major 2 plus 2");
     }
 
     /// The tag store hook sees primary data tag stores and nothing else.

@@ -222,7 +222,9 @@ static void run_one(const struct bench *b)
  * The CPU by name, from PRId alone — so this is right on any MIPS machine,
  * not only on the two the emulator models. The revision split on imp 0x04 is
  * the standard one: an R4000 and an R4400 report the same implementation and
- * are distinguished by major revision.
+ * are distinguished by major revision, and so are an R14000 and an R16000,
+ * which share implementation 0x0f (Linux's cpu-probe.c splits them above major
+ * revision 2).
  *
  * An imp we do not have a name for still runs; it just prints as "MIPS imp
  * 0xNN", which is more use to whoever is holding that machine than "unknown".
@@ -239,7 +241,7 @@ static const char *cpu_name(void)
     case IMP_R10000: return "R10000";
     case IMP_R4300:  return "R4300";
     case IMP_R12000: return "R12000";
-    case IMP_R14000: return "R14000";
+    case IMP_R14000: return PRID_REV_MAJOR(cpu_prid) > 2 ? "R16000" : "R14000";
     case IMP_R8000:  return "R8000";
     case IMP_R4600:  return "R4600";
     case IMP_R4700:  return "R4700";

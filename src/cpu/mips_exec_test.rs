@@ -6634,10 +6634,10 @@ mod tests {
             .unwrap().join().unwrap();
     }
 
-    /// A partial LWR keeps bits 63:32 of the destination on the R10000 and
-    /// sign-extends on the R4400 and R5000; a complete word sign-extends on all.
+    /// A partial LWR keeps bits 63:32 of the destination on the R10000 family
+    /// and sign-extends on the R4400 and R5000; a complete word sign-extends on all.
     #[test]
-    fn partial_lwr_keeps_the_upper_word_only_on_the_r10000() {
+    fn partial_lwr_keeps_the_upper_word_on_the_r10000_family() {
         fn check<C: CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
             let mem = Arc::new(MockMemory::new());
             mem.set_word(0x2000, 0x89ab_cdef);
@@ -6660,13 +6660,13 @@ mod tests {
         check::<crate::cpu::mips_cache_shadow::R4400ShadowCache>(false);
         check::<crate::cpu::mips_cache_shadow::R5000ShadowCache>(false);
         check::<crate::cpu::mips_cache_shadow::R10000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R12000ShadowCache>(true);
+        check::<crate::cpu::mips_cache_shadow::R16000ShadowCache>(true);
     }
 
     /// FrameMask and the wide EntryLo belong to the whole R10000 family, not to
-    /// the parts that share the R10000's partial LWR. No R12000 type exists on
-    /// this branch, so this cannot run a family part whose LWR differs from
-    /// the R10000's; it checks the executor's masks against the family constant
-    /// the gate reads, and that the two behaviours are separate constants.
+    /// the partial LWR alone. This checks the executor's masks against the
+    /// family constant the gate reads; the R12000 and R16000 are covered below.
     #[test]
     fn framemask_and_entrylo_widths_follow_the_family_constant() {
         fn check<C: CpuModel + From<Arc<dyn BusDevice>>>() {
@@ -6682,5 +6682,80 @@ mod tests {
         check::<R4400ShadowCache>();
         check::<R5000ShadowCache>();
         check::<R10000ShadowCache>();
+    }
+
+    /// Config reports each part's secondary cache: SS (bits 18:16) is
+    /// log2(secondary size / 512 KB) and SB (bit 13) is set for 128-byte lines
+    /// (NEC U10278EJ4V0UM p.230). The primary caches read 32 KB.
+    #[test]
+    fn config_reports_the_secondary_cache_of_each_family_part() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn config<C: CpuModel + From<Arc<dyn BusDevice>>>() -> u64 {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let mut exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(
+                Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            disable_jitv2(&mut exec);
+            exec.core.read_cp0(16)
+        }
+        // The executor is large; build it on a thread with room.
+        std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+            for (name, c, ss, sb) in [
+                ("R10000", config::<R10000ShadowCache>(), 1, 1),
+                ("R12000", config::<R12000ShadowCache>(), 2, 1),
+                ("R12000 O2", config::<R12000O2ShadowCache>(), 2, 0),
+            ] {
+                assert_eq!(c >> 26, 0b011_011, "{name}: IC and DC read 32 KB");
+                assert_eq!(c & 0x03FF_FFFF, (ss << 16) | (sb << 13) | 0x8000 | 2, "{name}: Config {c:#x}");
+            }
+            // The R16000 presents its part's whole reset word over the low 25
+            // bits: SS 3 and SB 1 as for the generic family, plus the clock
+            // fields. The 700 MHz part is the same type with its word set at
+            // build time.
+            let c = config::<R16000ShadowCache>();
+            assert_eq!(c >> 26, 0b011_011, "R16000: IC and DC read 32 KB");
+            assert_eq!(c & CONFIG0_RESET_MASK as u64, 0x009b_af85, "R16000: Config {c:#x}");
+            assert_eq!((c >> 16) & 7, 3, "R16000: 4 MB secondary cache");
+            assert_eq!((c >> 13) & 1, 1, "R16000: 128-byte lines");
+            assert_eq!(R16000_MHZ700_CONFIG0 ^ 0x009b_af85, 1 << 9, "the 700 MHz word differs in EC only");
+        }).unwrap().join().unwrap();
+    }
+
+    /// The R12000 and R16000 keep the 16-bit FrameMask, the 64-bit-family
+    /// EntryLo mask and the partial-LWR upper word of the R10000. A TLB write on
+    /// an R12000 with FrameMask set clears EntryLo bit 18, as on the R10000.
+    #[test]
+    fn framemask_and_entrylo_widths_hold_on_the_r12000_and_r16000() {
+        use crate::cpu::mips_cache_shadow::*;
+        fn masks<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u32, u64) {
+            let cfg = MipsCpuConfig::for_model::<C>(Arc::new(crate::ip22_bus::memory_map(false)));
+            let exec = Box::new(MipsExecutor::<PassthroughTlb, C>::new(Arc::new(MockMemory::new()), PassthroughTlb::default(), &cfg));
+            (exec.core.framemask_mask, exec.core.entrylo_mask)
+        }
+        // Write the entry with FrameMask set, find it with TLBP, clear EntryLo0
+        // and TLBR it: (FrameMask, EntryLo0 as the TLB holds it, physical page).
+        fn written<C: CpuModel + From<Arc<dyn BusDevice>>>() -> (u64, u64, u64) {
+            const VA: u64 = 0x4000_0000;
+            let mut exec = map_page_masked::<C>(Arc::new(MockMemory::new()), VA, 0x0300_5000, 0xFFFF_0001);
+            let phys = exec.debug_translate(VA).phys;
+            for (rd, value) in [(10, VA), (2, 0)] {
+                exec.core.write_gpr(1, value);
+                assert_eq!(exec.exec((OP_COP0 << 26) | (RS_DMTC0 << 21) | (1 << 16) | (rd << 11)), EXEC_COMPLETE);
+            }
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBP), EXEC_COMPLETE);
+            assert_eq!(exec.exec((OP_COP0 << 26) | (RS_TLB << 21) | FUNCT_TLBR), EXEC_COMPLETE);
+            (exec.core.read_cp0(21), exec.core.read_cp0(2), phys)
+        }
+        on_big_stack(|| {
+            const ENTRYLO: u64 = 0xC000_0003_FFFF_FFFF;
+            assert!(R12000ShadowCache::R10K_FAMILY && R12000O2ShadowCache::R10K_FAMILY && R16000ShadowCache::R10K_FAMILY);
+            assert!(R12000ShadowCache::PARTIAL_LWR_KEEPS_UPPER && R12000O2ShadowCache::PARTIAL_LWR_KEEPS_UPPER);
+            assert!(R16000ShadowCache::PARTIAL_LWR_KEEPS_UPPER);
+            assert_eq!(masks::<R12000ShadowCache>(), (0xFFFF, ENTRYLO), "R12000");
+            assert_eq!(masks::<R12000O2ShadowCache>(), (0xFFFF, ENTRYLO), "R12000 O2");
+            assert_eq!(masks::<R16000ShadowCache>(), (0xFFFF, ENTRYLO), "R16000");
+            // Physical bit 24 is EntryLo bit 18, FrameMask bit 0.
+            let masked = (((0x0300_5000u64 >> 12) << 6) | (3 << 3) | (1 << 2) | (1 << 1)) & !(1 << 18);
+            assert_eq!(written::<R12000ShadowCache>(), (1, masked, 0x0200_5000), "R12000");
+        });
     }
 }

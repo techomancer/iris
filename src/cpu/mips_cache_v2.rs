@@ -586,6 +586,9 @@ pub trait CpuModel: MipsCache {
     /// Bits `Index_Store_Tag` keeps for the secondary cache: all of them, except
     /// on the R10000 family, whose reserved tag bits read as zero (R10000 UM p. 270).
     const SECONDARY_TAG_MASK: u64 = u64::MAX;
+    /// The low 25 bits of Config at reset, where the part's own word is known
+    /// and differs from the R10000 family's generic one. Zero keeps the generic.
+    const CONFIG0_RESET: u32 = 0;
 }
 
 pub trait MipsCache: Send + Sync {
@@ -1406,6 +1409,14 @@ pub mod model {
     pub const R4400: u8 = 0;
     pub const R5000: u8 = 1;
     pub const R10000: u8 = 2;
+    pub const R12000: u8 = 3;
+    pub const R16000: u8 = 4;
+
+    /// The R10000 family: the R10000 and the parts that follow it, which share
+    /// one programming model.
+    pub const fn r10k_family(model: u8) -> bool {
+        matches!(model, R10000 | R12000 | R16000)
+    }
 }
 
 /// SGI Indy R4400: direct-mapped 16K L1s, 1 MB unified L2 owning the decode slots.

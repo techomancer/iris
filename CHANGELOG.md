@@ -51,6 +51,16 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **Secondary-cache tags** on the R10000 family read the reserved bits (TagLo 9, 12, 13 and
   TagHi 30:4) as zero; the MRU bit and the other tag fields are kept.
 
+### R12000, R14000 and R16000
+
+- `[machine] cpu` and `--cpu` take `r12000`, `r14000`, `r16000` (revision 2.2,
+  the 800 MHz part) and `r16000_700` (revision 2.1, the 700 MHz part). The Octane
+  takes the R10000, R12000 and R14000 (defaulting to 195, 360 and 600 MHz), the
+  O2 the R5000, R10000 and R12000 (400 MHz for the R12000), the IP28 the R10000.
+  The R16000 has no machine yet; `iris-bench` is its only user. CP0 Config now
+  reports the part's own secondary-cache size, where every part read 1 MB, and
+  each R16000 presents its own reset word.
+
 ### `IRIS_GUI_GL` works in iris-gui
 
 - The GUI's GL capture path (`IRIS_GUI_GL=1`, or `[debug] gui_gl_capture`) never

@@ -4404,13 +4404,13 @@ mod tests {
         (CoreSnapshot::capture(&interp.core), CoreSnapshot::capture(&jit.core))
     }
 
-    /// The R10000 keeps bits 63:32 on a partial LWR and the R5000 sign-extends;
-    /// the JIT and the interpreter must agree at every offset, and the
-    /// interpreter's result is the one `partial_lwr_keeps_the_upper_word_only_on_the_r10000`
+    /// The R10000 family keeps bits 63:32 on a partial LWR and the R5000
+    /// sign-extends; the JIT and the interpreter must agree at every offset, and the
+    /// interpreter's result is the one `partial_lwr_keeps_the_upper_word_on_the_r10000_family`
     /// pins.
     #[test]
-    fn jit_lwr_matches_the_interpreter_on_the_r10000_and_r5000() {
-        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R5000ShadowCache};
+    fn jit_lwr_matches_the_interpreter_on_the_r10000_family_and_r5000() {
+        use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R12000ShadowCache, R16000ShadowCache, R5000ShadowCache};
         fn check<C: crate::cpu::mips_cache_v2::CpuModel + From<Arc<dyn BusDevice>>>(keeps_upper: bool) {
             for offset in 0..4u64 {
                 let mut gpr = [0u64; 32];
@@ -4429,6 +4429,8 @@ mod tests {
             }
         }
         check::<R10000ShadowCache>(true);
+        check::<R12000ShadowCache>(true);
+        check::<R16000ShadowCache>(true);
         check::<R5000ShadowCache>(false);
     }
 
@@ -7962,7 +7964,7 @@ mod tests {
     /// masked-store helper), and the instructions after it run. The same access
     /// as a load, and a store on the R5000, still fault in both engines.
     #[test]
-    fn refused_uncached_store_matches_the_interpreter_on_the_r10000_and_r5000() {
+    fn refused_uncached_store_matches_the_interpreter_on_the_r10000_family_and_r5000() {
         use crate::cpu::mips_cache_v2::{R10000Cache, R5000Cache, CpuModel};
         use crate::cpu::mips_core::STATUS_EXL;
         use crate::cpu::mips_isa::{OP_ADDIU, OP_LW, OP_SW, OP_SWL};
