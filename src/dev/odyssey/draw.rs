@@ -756,14 +756,51 @@ impl Board {
     }
 
     /// One byte-stream texel of the open image at the raster cursor, bounded by
-    /// the header's group length in pixels.
-    pub fn image_texel(&mut self, rgba: u32, is_index: bool) {
+    /// the header's group length in pixels. A source format that carries
+    /// alpha stores it (code_carries_alpha()); any other stores 255.
+    pub fn image_texel(&mut self, rgba: u32, code: u32) {
         if self.image_group_len != 0 && self.image_group_painted >= self.image_group_len {
             return;
         }
-        self.image_put(rgba, is_index, false);
+        self.image_put(rgba, code_is_index(code), code_carries_alpha(code));
         self.image_group_painted += 1;
     }
+
+    /// The same for a pixel of the library's write table: `b` holds its bytes
+    /// first byte first. It stores the alpha the source carries.
+    pub fn image_texel_form(&mut self, form: &WriteForm, b: &[u8]) {
+        if self.image_group_len != 0 && self.image_group_painted >= self.image_group_len {
+            return;
+        }
+        self.image_put(form.decode(b), form.is_index(), form.has_alpha());
+        self.image_group_painted += 1;
+    }
+}
+
+/// Whether a GL image write under source format `code` stores the source's
+/// alpha rather than 255.
+///
+/// ESTABLISHED (datasheet "Alpha from image writes"): the library sends
+/// the source's alpha bytes unchanged under 0x4b, 0x48, 0x6b, 0x4c and
+/// 0x6c, and no header bit asks the board to replace them. INFERRED there:
+/// the board stores that alpha. The write mask's alpha enable (block
+/// 0x052) is not applied to image writes in this model.
+///
+/// The X server's on-screen images under 0x4c come by DMA to the colour
+/// buffer (Board::dma_put()), which still stores 255: the datasheet infers
+/// they would write the A byte, 0 in every traced upload, but the X server
+/// passes client pixels through, and whether alpha is stored at all for a
+/// window whose visual has none is unknown. The model keeps one plane for
+/// every visual, so it cannot tell such a window apart.
+pub fn code_carries_alpha(code: u32) -> bool {
+    matches!(
+        code,
+        ODSY_IMAGE_CODE_RGBA
+            | ODSY_IMAGE_CODE_LUM_ALPHA
+            | ODSY_IMAGE_CODE_ABGR
+            | ODSY_IMAGE_CODE_RGBA12
+            | ODSY_IMAGE_CODE_ABGR12
+    )
 }
 
 pub fn unorm16_to_8(v: u32) -> u32 {
@@ -806,7 +843,7 @@ impl Board {
     pub fn decode_pixel(&mut self, code: u32, b: &[u8], rgba: &mut u32) -> bool {
         match code {
             ODSY_IMAGE_CODE_ABGR => {
-                *rgba = pack_pixel(b[3] as u32, b[2] as u32, b[1] as u32);
+                *rgba = (pack_pixel(b[3] as u32, b[2] as u32, b[1] as u32) & !0xffu32) | b[0] as u32;
                 true
             }
             ODSY_IMAGE_CODE_FALLBACK_XRGB => {
@@ -879,6 +916,15 @@ pub fn image_pairing_supported(code: u32, fmt: u32) -> bool {
 }
 
 impl Board {
+    /// Whether the open image's header and a burst's format tag go together:
+    /// image_pairing_supported() for the codes the byte-stream tables know,
+    /// and for any other code, whatever the write table (pixel_write.rs)
+    /// takes, under any tag.
+    pub fn image_burst_supported(&self, fmt: u32) -> bool {
+        image_pairing_supported(self.image_code, fmt)
+            || (pixel_bytes(self.image_code) == 0 && texel12_components(self.image_code) == 0 && write_form(self.image_write_code).is_some())
+    }
+
     /// One data word of a pixel burst, laid out by the transfer header's format
     /// code: its bytes join a stream that yields a pixel every
     /// pixel_bytes() bytes, so a three-byte pixel may span two words. A
@@ -891,10 +937,21 @@ impl Board {
         let mut n = pixel_bytes(code);
         let mut b = [0u8; 4];
 
-        if !image_pairing_supported(code, self.image_fmt) {
+        if !self.image_burst_supported(self.image_fmt) {
             return;
         }
-        if self.image_fmt == ODSY_IMAGE_FMT_RGBA16 {
+        if code == ODSY_IMAGE_CODE_DEPTH_STENCIL {
+            // The library's depth and stencil images are both format 0, type
+            // 4; the DMA header's size field tells them apart (dma.rs) and a
+            // burst header has none. Which plane a burst names is unknown,
+            // so it paints nothing, not the colour planes.
+            if !self.image_code_reported {
+                self.image_code_reported = true;
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: a depth or stencil image by burst is not modeled; the header does not say which");
+            }
+            return;
+        }
+        if self.image_fmt == ODSY_IMAGE_FMT_RGBA16 && texel12_components(code) != 0 {
             // A stream of 16-bit components, high half first, a pixel every
             // texel12_components() halves: two words for 0x6b and 0x6c, a
             // word and a half for 0x69. At most two halves wait between words;
@@ -939,15 +996,44 @@ impl Board {
             return;
         }
 
+        let mut form = None;
+
         if n == 0 {
-            if !self.image_code_reported {
-                self.image_code_reported = true;
-                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: image source format {:#x} is not modeled; laid out by the burst tag", code);
+            // A code the byte-stream tables above do not know: the library's
+            // write table (pixel_write.rs), for pixels of up to sixteen bytes.
+            form = write_form(self.image_write_code).filter(|f| f.bytes <= 16);
+            if let Some(f) = &form {
+                n = f.bytes;
+            } else {
+                if !self.image_code_reported {
+                    self.image_code_reported = true;
+                    crate::dlog!(
+                        LogModule::Odyssey,
+                        "sgi-odyssey: image source format {:#x} is not modeled; laid out by the burst tag",
+                        self.image_write_code
+                    );
+                }
+                code = if self.image_fmt == ODSY_IMAGE_FMT_RGB { ODSY_IMAGE_CODE_FALLBACK_XRGB } else { ODSY_IMAGE_CODE_CI };
+                n = pixel_bytes(code);
             }
-            code = if self.image_fmt == ODSY_IMAGE_FMT_RGB { ODSY_IMAGE_CODE_FALLBACK_XRGB } else { ODSY_IMAGE_CODE_CI };
-            n = pixel_bytes(code);
         }
         b[..4].copy_from_slice(&word.to_be_bytes());
+        if let Some(f) = &form {
+            // The write table's pixels: any number of bytes up to a pixel of
+            // four 32-bit components, in arrival order.
+            for &byte in &b[..4] {
+                self.image_pixel[self.image_nbytes as usize] = byte;
+                self.image_nbytes += 1;
+                if self.image_nbytes < f.bytes {
+                    continue;
+                }
+                self.image_nbytes = 0;
+                let px = self.image_pixel;
+
+                self.image_texel_form(f, &px);
+            }
+            return;
+        }
         for &byte in &b[..4] {
             let mut px = [0u8; 4];
             let mut rgba = 0u32;
@@ -961,7 +1047,7 @@ impl Board {
             // The pixel's bytes, first byte highest, at the start of px[].
             px[..4].copy_from_slice(&(self.image_bytes << (8 * (4 - n))).to_be_bytes());
             self.decode_pixel(code, &px, &mut rgba);
-            self.image_texel(rgba, code_is_index(code));
+            self.image_texel(rgba, code);
         }
     }
 }

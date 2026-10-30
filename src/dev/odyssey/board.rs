@@ -406,6 +406,10 @@ pub struct Board {
     pub image_group_len: u32,
     pub image_group_painted: u32,
     pub image_code: u32,
+    /// The header's whole write code, format and type (ODSY_WRITE_CODE_MASK).
+    pub image_write_code: u32,
+    /// The bytes of the pixel a write-table image is part way through.
+    pub image_pixel: [u8; 16],
     pub image_bytes: u32,
     pub image_nbytes: u32,
     pub image_code_reported: bool,
@@ -685,6 +689,8 @@ impl Default for Board {
             image_group_len: 0,
             image_group_painted: 0,
             image_code: 0,
+            image_write_code: 0,
+            image_pixel: [0; 16],
             image_bytes: 0,
             image_nbytes: 0,
             image_code_reported: false,
@@ -1090,6 +1096,7 @@ impl Board {
         self.image_group_len = 0;
         self.image_group_painted = 0;
         self.image_code = 0;
+        self.image_write_code = 0;
         self.image_bytes = 0;
         self.image_nbytes = 0;
         self.image_code_reported = false;

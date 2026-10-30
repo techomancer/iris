@@ -778,6 +778,7 @@ impl Board {
                 };
                 self.image_group_painted = 0;
                 self.image_code = self.cmd_operand[0] & ODSY_IMAGE_CODE_MASK;
+                self.image_write_code = self.cmd_operand[0] & ODSY_WRITE_CODE_MASK;
                 self.image_nbytes = 0;
                 self.image_bytes = 0;
             }
@@ -963,7 +964,7 @@ impl Board {
         // an image the same register-select is an ordinary state word.
         if self.image_active && operands > 0 && image_burst_fmt(reg, &mut fmt) {
             self.image_fmt = fmt;
-            if !image_pairing_supported(self.image_code, fmt) {
+            if !self.image_burst_supported(fmt) {
                 self.cmd_unimplemented(word);
             }
             self.cmd_state = ODSY_CMD_IMAGE_BURST;

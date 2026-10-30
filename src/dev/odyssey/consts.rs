@@ -332,6 +332,10 @@ pub const ODSY_DMA_FMT_SELECTOR_SHIFT: u32 = 28; // word 4 bits 30:28
 pub const ODSY_DMA_FMT_SELECTOR_MASK: u32 = 0x7;
 pub const ODSY_DMA_FMT_SELECTOR_READ: u32 = 1;
 pub const ODSY_DMA_FMT_SELECTOR_DRAW: u32 = 0;
+pub const ODSY_DMA_FMT_SIZE_SHIFT: u32 = 13; // word 4 bits 15:13
+pub const ODSY_DMA_FMT_SIZE_MASK: u32 = 0x7;
+pub const ODSY_DMA_FMT_SIZE_STENCIL: u32 = 0; // a write's size field: stencil
+pub const ODSY_DMA_FMT_SIZE_DEPTH: u32 = 1; // and depth
 pub const ODSY_DMA_FMT_CLASS_MASK: u32 = 0x7; // word 4 bits 2:0
 pub const ODSY_DMA_FMT_CODE_SHIFT: u32 = 3; // word 4 bits 7:3
 pub const ODSY_DMA_FMT_CODE_MASK: u32 = 0x1f;
@@ -817,6 +821,10 @@ pub const ODSY_IMAGE_FMT_RGBA16: u32 = 0x12;
 
 // The source pixel format
 pub const ODSY_IMAGE_CODE_MASK: u32 = 0xff;
+/// A GL write's format (bits 4:0) and type (8:5) together.
+pub const ODSY_WRITE_CODE_MASK: u32 = 0x1ff;
+/// Format 0 (depth or stencil) with type 4 (four bytes a pixel).
+pub const ODSY_IMAGE_CODE_DEPTH_STENCIL: u32 = 0x80;
 pub const ODSY_IMAGE_CODE_CI: u32 = 0x41;
 pub const ODSY_IMAGE_CODE_CI16: u32 = 0x61;
 pub const ODSY_IMAGE_CODE_LUM: u32 = 0x42;
@@ -967,6 +975,10 @@ pub const ODSY_DMA_MOVIE_CONTROL: u32 = 0x4001004c;
 // A read's host bytes for one pixel
 pub const ODSY_DMA_BYTE_ZERO: u32 = 4;
 pub const ODSY_DMA_BYTE_INDEX: u32 = 5;
+/// The index word's bits 15:8.
+pub const ODSY_DMA_BYTE_INDEX_HIGH: u32 = 6;
+/// The index when the pixel is shown through a colour map, else the red byte.
+pub const ODSY_DMA_BYTE_INDEX_OR_RED: u32 = 7;
 
 // The 16 KiB pages an entry's longest piece can touch.
 pub const ODSY_DMA_PIECE_PAGES: usize = (ODSY_DMA_PTE_LEN_MASK as u64 + ODSY_DMA_PAGE_SIZE).div_ceil(ODSY_DMA_PAGE_SIZE) as usize;
@@ -1006,6 +1018,9 @@ pub const ODSY_DMA_REPORT_UPLOAD_SENTINEL: u32 = 1 << 8;
 pub const ODSY_DMA_REPORT_INDEX_OBJECT: u32 = 1 << 9;
 pub const ODSY_DMA_REPORT_COLOUR_OVER_INDEX: u32 = 1 << 10;
 pub const ODSY_DMA_REPORT_RAW64: u32 = 1 << 11;
+pub const ODSY_DMA_REPORT_SHARED: u32 = 1 << 12;
+pub const ODSY_DMA_REPORT_STENCIL_OR_INDEX: u32 = 1 << 13;
+pub const ODSY_DMA_REPORT_UNLISTED_FIELDS: u32 = 1 << 14;
 
 // gl_entry[] slots.
 pub const ODSY_ENTRY_29: usize = 0;

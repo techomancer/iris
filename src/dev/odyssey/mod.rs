@@ -27,6 +27,7 @@
 //! - `draw`: buffers, integer drawing and the image path.
 //! - `objects`: off-screen objects in board memory.
 //! - `dma`: pixel DMA, queries and fences.
+//! - `pixel_write`: the library's image-write codes and their pixels.
 //! - `gl`, `geometry`: GL fragment state and texturing; the geometry
 //!   program, lighting and the GL primitives.
 //! - `gl_context`: the GL state machine the command stream drives.
@@ -74,6 +75,7 @@ pub mod mmio;
 pub mod objects;
 pub mod pi_gfx;
 pub mod pixel_dma;
+pub mod pixel_write;
 pub mod raster;
 #[cfg(test)]
 pub mod raster_bench;
@@ -108,6 +110,7 @@ pub use mmio::*;
 pub use objects::*;
 pub use pi_gfx::*;
 pub use pixel_dma::*;
+pub use pixel_write::*;
 pub use raster::*;
 pub use raster_fill::*;
 pub use raster_fixed_texture::*;

@@ -5,8 +5,8 @@
 use super::*;
 
 const FENCE_BASE: u64 = 0xb70000;
-const TABLE: u64 = 0xb80000;
-const PAGE_A: u64 = 0xb84000;
+pub(super) const TABLE: u64 = 0xb80000;
+pub(super) const PAGE_A: u64 = 0xb84000;
 const PAGE_B: u64 = 0xb88000;
 /// A 16-pixel-wide RGBA8 object the transfers create.
 const OBJECT: u32 = 0x0016_a800;
@@ -20,17 +20,17 @@ fn pack_half(half: u64) -> u32 {
 /// Push a two-doubleword DMA descriptor the way the driver builds it: the
 /// opcode over the packed high half of the table address, then the packed
 /// low half over a zero word.
-fn descriptor(s: &mut Board, table: u64) {
+pub(super) fn descriptor(s: &mut Board, table: u64) {
     cmd64(s, ODSY_DMA_DESC_UPLOAD, pack_half(table >> 24));
     cmd64(s, pack_half(table & 0xff_ffff), 0);
 }
 
 /// An entry of the translation table: a page address over a byte count.
-fn pte(addr: u64, len: u32) -> u64 {
+pub(super) fn pte(addr: u64, len: u32) -> u64 {
     addr << ODSY_DMA_PTE_ADDR_SHIFT | len as u64
 }
 
-fn put_table(ram: &Ram, table: u64, header: [u32; 8], entries: &[u64]) {
+pub(super) fn put_table(ram: &Ram, table: u64, header: [u32; 8], entries: &[u64]) {
     let mut t = vec![0u8; ODSY_DMA_TABLE_HEADER as usize + 16 * 8];
     for (i, w) in header.iter().enumerate() {
         t[i * 4..][..4].copy_from_slice(&w.to_be_bytes());
@@ -366,8 +366,9 @@ fn readback_table(s: &mut Board, ram: &Ram, header: [u32; 8]) {
 /// with the 0x4c format byte reads a screen pixel back as the bytes A, B,
 /// G, R with alpha zero, and leaves the plane alone. The same header with
 /// bit 24 clear paints the host bytes and writes nothing to the guest.
-/// With a zero format byte the GL vocabulary applies, where this word 4 is
-/// not modelled: the read is refused and writes nothing.
+/// With a zero format byte the GL vocabulary applies: this word 4 is
+/// class 2 code 11, ABGR bytes, so the same pixel comes back A, B, G, R
+/// with its own alpha.
 ///
 /// QEMU: readback/direction.
 #[test]
@@ -393,11 +394,12 @@ fn a_readback_sends_the_pixel_to_the_guest_as_abgr() {
     assert_eq!(pixel(&s, 0, 200, 300), 0x3322_11ff);
     assert_eq!(ram.get(PAGE_A, 36), expect);
 
-    // A zero format byte with this word 4: refused, nothing written.
+    // A zero format byte with this word 4: the GL read of ABGR bytes.
     ram.put(PAGE_A, &[0xa5; 36]);
     header[7] = 0x3301_0000;
     readback_table(&mut s, &ram, header);
-    assert_eq!(ram.get(PAGE_A, 36), [0xa5; 36]);
+    expect[16..20].copy_from_slice(&[0xff, 0x11, 0x22, 0x33]);
+    assert_eq!(ram.get(PAGE_A, 36), expect);
     assert_eq!(pixel(&s, 0, 200, 300), 0x3322_11ff);
 }
 
