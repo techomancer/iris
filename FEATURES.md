@@ -175,8 +175,8 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (also configured by `[origin2000]`, see [the Onyx2 guide](docs/onyx2-ip27.md)). |
-| `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`). The first listed is the default. |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)), octane_ip30 (configured by `[octane]`, see [the Octane guide](docs/octane-ip30.md)), origin200_ip29 (configured by `[origin200]`, see [the Origin 200 guide](docs/origin200-ip29.md)), origin2000_ip27 (configured by `[origin2000]`, see [the Origin 2000 guide](docs/origin2000-ip27.md)), onyx2_ip27 (also configured by `[origin2000]`, see [the Onyx2 guide](docs/onyx2-ip27.md)), fuel_ip34 (configured by `[fuel]`, see [the Fuel guide](docs/fuel-ip34.md)). |
+| `machine.cpu` | the machine's first | A family (`r4400`, `r5000`, `r10000`, `r12000`, `r14000`) or a part (`r14000_600`); independent of build features. Indy and `indigo2_ip22`: r4400, r5000; `indigo2_ip28`: r10000; O2: r5000, r10000, r12000; Octane: r10000, r12000, r14000; Origin 200, Origin 2000 and Onyx2: r10000 (`r10000_180`), r12000 (`r12000_270`); Fuel: r14000 (`r14000_500`). The first listed is the default. |
 | `machine.cpus` | `1` | Processors fitted. 2 only on the Octane; see [its guide](docs/octane-ip30-multiprocessor.md). |
 
 ### [origin2000]
@@ -191,6 +191,25 @@ Origin 2000 settings apply when `machine.profile = "origin2000_ip27"` or `"onyx2
 
 An `[origin2000]` table is written to a saved config only when one of these
 keys is set. See the [Origin 2000 guide](docs/origin2000-ip27.md).
+
+### [fuel]
+
+Fuel settings apply when `machine.profile = "fuel_ip34"`.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
+| `console` | `l1` | `l1`, `ioc3a` or `ioc3b`. Selects the guest console connection. |
+| `l1_port` | `8882` | Host TCP port for the L1 console. Used when `console = "l1"`. |
+| `l1_log` | unset | Optional serial log path for L1 output when an IOC3 port is selected as console. |
+| `ps2_input` | `true` | Fit the IOC3's PS/2 keyboard and mouse and feed them host input. |
+| `l1_revision` | `1.48.1` | L1 firmware revision as `major.minor.patch`, decimal. The guest reads it with L1 request `0x0005`. |
+| `brick_serial` | `EMUN00` | L1 brick serial, at most 37 bytes. The guest reads it with L1 request `0x0004`. The default is a made-up serial, not a real one. |
+
+The machine has one 500 MHz R14000 and 512 MiB of RAM in two 256 MiB
+banks, and runs on a serial console. A `[fuel]` table is written to a
+saved config only when one of these keys is set. See the
+[Fuel guide](docs/fuel-ip34.md).
 
 ### [graphics]
 
@@ -231,7 +250,7 @@ An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `network.mode` | `nat` | nat, pcap, stream or off (no Ethernet; O2 and Octane only). Stream needs `network.stream`. PCAP needs build support and host capture permissions. PCAP works on every Ethernet; stream on every onboard one, not on a DaynaPort. |
+| `network.mode` | `nat` | nat, pcap, stream or off (no Ethernet; O2, Octane and Fuel only). Stream needs `network.stream`. PCAP needs build support and host capture permissions. PCAP works on every Ethernet; stream on every onboard one, not on a DaynaPort. |
 | `network.stream` | `unset` | `tcp:IP:PORT` or `unix:PATH`: the server of the private segment for `mode = "stream"` (QEMU `-netdev stream` framing). See NETWORKING.md. |
 | `network.pcap_interface` | `auto-pick when unset` | Interface name or numeric list index; PCAP only. |
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
@@ -434,8 +453,8 @@ IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
 `heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
 embedded fallback.
-The config validator permits SCSI controller 1 only on IP22, the O2 and the
-Octane, the machines with two controllers.
+The config validator permits SCSI controller 1 only on IP22, the O2, the
+Octane and the Fuel, the machines with two controllers.
 
 Standalone CLI options update the loaded config where supplied; boolean enable
 switches do not provide a general way to clear every saved true setting.

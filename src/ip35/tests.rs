@@ -1,0 +1,569 @@
+use super::*;
+use crate::dev::bedrock::reg as bedrock_reg;
+use crate::traits::{BusDevice, BUS_OK};
+
+/// A Bedrock unit's registers, at its base in the node's register window.
+struct Unit(Arc<dyn BusDevice>, u64);
+impl Unit {
+    fn read64(&self, a: u64) -> BusRead64 {
+        self.0.read64(self.1 + a)
+    }
+    fn write64(&self, a: u64, v: u64) -> u32 {
+        self.0.write64(self.1 + a, v)
+    }
+}
+fn md_regs(board: &crate::ip34_machine::FuelBoard) -> Unit {
+    Unit(board.bedrock.registers(), bedrock_reg::MD_BASE)
+}
+fn pi_regs(board: &crate::ip34_machine::FuelBoard, interface: u64) -> Unit {
+    Unit(board.bedrock.registers(), interface * bedrock_reg::PI1_BASE)
+}
+
+struct Word(u64);
+impl BusDevice for Word {
+    fn read64(&self, _: u64) -> BusRead64 {
+        BusRead64::ok(self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NarrowWriteCall {
+    Byte(u64, u8),
+    Half(u64, u16),
+    From(usize, u64, u64),
+}
+/// Records every narrow write it sees. With `sees_register` it overrides
+/// `write_narrow_from` and keeps the whole source register, as Bedrock's ECC
+/// view does; otherwise it takes the trait's default.
+#[derive(Default)]
+struct NarrowWriteSpy {
+    sees_register: bool,
+    calls: std::sync::Mutex<Vec<NarrowWriteCall>>,
+}
+impl NarrowWriteSpy {
+    fn new(sees_register: bool) -> Arc<Self> {
+        Arc::new(Self { sees_register, ..Default::default() })
+    }
+    fn calls(&self) -> Vec<NarrowWriteCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+impl BusDevice for NarrowWriteSpy {
+    fn write8(&self, address: u64, value: u8) -> u32 {
+        self.calls.lock().unwrap().push(NarrowWriteCall::Byte(address, value));
+        BUS_OK
+    }
+    fn write16(&self, address: u64, value: u16) -> u32 {
+        self.calls.lock().unwrap().push(NarrowWriteCall::Half(address, value));
+        BUS_OK
+    }
+    fn write_narrow_from(&self, address: u64, size: usize, gpr: u64) -> u32 {
+        if !self.sees_register {
+            return if size == 1 { self.write8(address, gpr as u8) } else { self.write16(address, gpr as u16) };
+        }
+        self.calls.lock().unwrap().push(NarrowWriteCall::From(size, address, gpr));
+        BUS_OK
+    }
+}
+
+/// An uncached SB or SH reaches a device with the whole source register, at the
+/// device-local address; only a device that overrides the call sees more than
+/// the low bits, and a window outside every map is a bus error.
+/// The Fuel's processor is the R14000 at revision 2.3 and 500 MHz, built as
+/// the R12000 type with its PRId set over it; the Octane's own part is
+/// revision 2.4.
+#[test]
+fn the_fuel_runs_the_r14000_at_revision_2_3() {
+    use crate::cpu::mips_cache_shadow::R12000ShadowCache;
+    use crate::cpu::mips_cache_v2::CpuModel as Model;
+    use crate::cpu::parts;
+    use crate::ip34_machine::CPUS;
+    assert_eq!(CPUS, &[&parts::R14000_500]);
+    let part = CPUS[0];
+    assert_eq!((part.mhz, part.rev, part.l2_kb), (500, (2, 3), 2048));
+    assert_eq!(part.prid(), 0x0f23);
+    assert_eq!(part.count_hz(), 250_000_000);
+    // `with_cpu!` builds the type `FuelCpu` names for this part.
+    let built = crate::with_cpu!(part, true, false, C => std::any::type_name::<C>());
+    assert_eq!(built, std::any::type_name::<R12000ShadowCache>());
+    // Typed R12000, it takes the R10000 family's behaviour: reserved
+    // secondary-tag bits read as zero, and a refused uncached store posts.
+    assert!(<R12000ShadowCache as Model>::R10K_FAMILY);
+    assert_ne!(<R12000ShadowCache as Model>::SECONDARY_TAG_MASK, u64::MAX);
+    assert!(<R12000ShadowCache as Model>::POSTS_UNCACHED_STORES);
+    assert!(<R12000ShadowCache as Model>::PARTIAL_LWR_KEEPS_UPPER);
+    // The executor carries the chip's PRId.
+    // The executor is large; the default test stack is not.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(|| {
+            let cpu = crate::ip34_machine::build_cpu(Arc::new(Ip35Bus::new(Physical::new(Vec::new()))), crate::ip34_machine::CPUS[0]);
+            assert_eq!(cpu.core.cp0_prid, 0x0f23);
+        })
+        .unwrap()
+        .join()
+        .expect("thread panicked");
+}
+
+#[test]
+fn narrow_stores_carry_the_register_to_devices_that_ask_for_it() {
+    let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
+    let plain = NarrowWriteSpy::new(false);
+    let ecc = NarrowWriteSpy::new(true);
+    bus.map(3, 0x1000, 0x1000, plain.clone());
+    bus.map(3, 0x2000, 0x1000, ecc.clone());
+
+    let source = 0x1122_3344_5566_77a5u64;
+    let uc = 3u64 << 57;
+    assert_eq!(bus.write_narrow_from(uc | 0x1003, 1, source), BUS_OK);
+    assert_eq!(bus.write_narrow_from(uc | 0x1004, 2, source), BUS_OK);
+    assert_eq!(
+        plain.calls(),
+        vec![NarrowWriteCall::Byte(3, source as u8), NarrowWriteCall::Half(4, source as u16)],
+        "an ordinary window gets the architectural low bits",
+    );
+
+    assert_eq!(bus.write_narrow_from(uc | 0x2004, 2, source), BUS_OK);
+    assert_eq!(ecc.calls(), vec![NarrowWriteCall::From(2, 4, source)]);
+
+    assert_eq!(bus.write_narrow_from(uc | 0x8000, 2, source), BUS_ERR, "no window there");
+}
+
+/// Equal physical offsets in different XKPHYS access spaces reach different devices.
+#[test]
+fn uc_spaces_keep_equal_offsets_distinct() {
+    let mut bus = Ip35Bus::new(Physical::new(Vec::new()));
+    for space in 0..4 {
+        bus.map(
+            space,
+            0x0100_0000,
+            0x1000,
+            Arc::new(Word(0x100 + space as u64)),
+        );
+    }
+    for space in 0..4 {
+        let value = bus.read64(((space as u64) << 57) | 0x0100_0000);
+        assert_eq!(value.status, BUS_OK);
+        assert_eq!(value.data, 0x100 + space as u64);
+    }
+}
+
+/// The processor must retain both XKPHYS access-space bits through translation.
+#[test]
+fn xkphys_uc_bits_survive_the_board_cpu_mask() {
+    // MipsExecutor and the TLB's inline arrays exceed the test worker's stack.
+    std::thread::Builder::new()
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            let bus = Arc::new(Ip35Bus::new(Physical::new(Vec::new())));
+            let mut cpu = crate::ip34_machine::build_cpu(bus, crate::ip34_machine::CPUS[0]);
+            cpu.core.write_cp0(
+                12,
+                (cpu.core.cp0_status | crate::cpu::mips_core::STATUS_KX) as u64,
+            );
+            for raw_uc in 0..4u64 {
+                let va = 0x9000_0000_0100_0020 | (raw_uc << 57);
+                for _ in 0..2 {
+                    let translated = cpu.debug_translate(va);
+                    assert_eq!(translated.status, crate::cpu::mips_exec::TR_UNCACHED);
+                    assert_eq!(translated.phys, (raw_uc << 57) | 0x0100_0020);
+                }
+            }
+        })
+        .expect("spawn")
+        .join()
+        .expect("thread panicked");
+}
+
+/// RAM placed above the first GiB must remain shared by cached, uncached and DMA paths.
+#[test]
+fn cached_and_uncached_memory_keep_high_addresses() {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
+    let at = (1 << 30) + 0x1000;
+    assert_eq!(board.bedrock.dma_view().write64(at, 0x12345678), BUS_OK);
+    assert_eq!(board.cached_bus().read64(at).data, 0x12345678);
+    assert_eq!(board.bus.read64((3 << 57) | at).data, 0x12345678);
+    assert_eq!(board.bus.read64(at).status, BUS_ERR);
+    assert_eq!(board.bedrock.dma_view().read64(at).data, 0x12345678);
+}
+
+/// A processor store through the cached view or an uncached one lands in
+/// the bank the slot holds and advances that slot's logical counter,
+/// whichever bank sits there after a swap, and no other slot's.
+#[test]
+fn processor_stores_advance_the_counter_of_the_slot_they_reach() {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let memory = board.bedrock.dma_view();
+    let counter = |_at: u64| -> u64 {
+        #[cfg(feature = "jitv2")]
+        return unsafe { (*memory.gen_ptr(_at)).load(std::sync::atomic::Ordering::Relaxed) };
+        #[cfg(not(feature = "jitv2"))]
+        0
+    };
+    let advanced = |what: &str, before: u64, after: u64| {
+        assert!(!cfg!(feature = "jitv2") || after > before, "{what}: {before} -> {after}");
+    };
+    let (zero, one) = (0x2000, (1 << 30) + 0x2000);
+    // Bit 32 swaps the banks of a pair: slot 0 now reaches bank 1.
+    assert_eq!(md_regs(&board).write64(8, 0x33 | (1 << 32)), BUS_OK);
+    let banks = board.bedrock.physical().banks();
+    let (before_zero, before_one) = (counter(zero), counter(one));
+    assert_eq!(board.cached_bus().write64(zero, 0x44), BUS_OK);
+    assert_eq!(banks[1].read64(0x2000).data, 0x44, "slot 0 reaches bank 1");
+    assert_eq!(banks[0].read64(0x2000).data, 0);
+    let after_zero = counter(zero);
+    advanced("cached store to slot 0", before_zero, after_zero);
+    assert_eq!(counter(one), before_one);
+    assert_eq!(board.bus.write64((3 << 57) | one, 0x55), BUS_OK);
+    assert_eq!(banks[0].read64(0x2000).data, 0x55, "slot 1 reaches bank 0");
+    let after_one = counter(one);
+    advanced("uncached store to slot 1", before_one, after_one);
+    assert_eq!(board.bus.write8((3 << 57) | (one + 8), 0x77), BUS_OK);
+    advanced("uncached byte store", after_one, counter(one));
+    assert_eq!(counter(zero), after_zero);
+}
+
+/// Firmware resets the PCI link before reinitializing the attached storage controller.
+#[test]
+fn fuel_link_reset_resets_the_attached_scsi_engine() {
+    use crate::dev::isp1040::{mbox, reg, CTRL_INT_ENABLE, CTRL_RISC_INT_ENABLE, HOST_CMD_SHIFT};
+    use crate::pci::PciFunction;
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let isp = &board.scsi;
+    isp.state().config().write(1, 6);
+    isp.state().config().write(5, 0x02000000);
+    isp.bar_write(1, reg::BUS_CTRL, u32::from(CTRL_INT_ENABLE | CTRL_RISC_INT_ENABLE), 2);
+    isp.bar_write(1, reg::MAILBOX_BASE, u32::from(mbox::NOP), 2);
+    isp.bar_write(1, reg::HOST_CMD, 0x5 << HOST_CMD_SHIFT, 2);
+    assert_eq!(isp.bar_read(1, reg::MAILBOX_BASE, 2), u32::from(mbox::COMPLETE));
+    assert_ne!(isp.bar_read(1, reg::BUS_CTRL, 2), 0);
+    assert_eq!(board.xbridge.widget(0).unwrap().write32(0x2f4, 1), BUS_OK);
+    assert_eq!(isp.state().config().command(), 0);
+    assert_eq!(isp.state().config().bar_base(1), 0);
+    assert_eq!(isp.bar_read(1, reg::BUS_CTRL, 2), 0);
+    assert_eq!(isp.bar_read(1, reg::MAILBOX_BASE, 2), 0);
+    assert_eq!(isp.bar_read(1, reg::MAILBOX_BASE + 2, 2), 0x4953);
+}
+
+/// The PROM reads the station address from the L1 and IRIX from the
+/// Ethernet; both must report the configured one.
+#[test]
+fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
+    let mac = [0x08, 0x00, 0x69, 0x21, 0x43, 0x65];
+    let board = crate::ip34_machine::FuelBoard::with_config(crate::ip34_machine::FuelBoardConfig {
+        payload: &[], clock: Arc::new(|| 0), flash_path: None,
+        station_mac: mac,
+        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
+        ps2_input: true,
+        l1: Default::default(),
+    }).unwrap();
+    assert_eq!(board.l1.station_mac(), mac);
+    assert_eq!(board.eth.mac(), mac);
+}
+
+/// The L1's reported revision and brick serial keep their defaults unless
+/// the board is built with replacements.
+#[test]
+fn the_l1_identity_overrides_reach_the_controller() {
+    use crate::ip34_machine::{FuelBoard, FuelBoardConfig, L1Identity};
+    let build = |l1| FuelBoard::with_config(FuelBoardConfig {
+        payload: &[], clock: Arc::new(|| 0), flash_path: None,
+        station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
+        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
+        ps2_input: true, l1,
+    }).unwrap().l1.config();
+    let stock = build(L1Identity::default());
+    assert_eq!(stock.revision, Some([1, 48, 1]));
+    assert_eq!(stock.brick_serial.as_deref(), Some("EMUN00"));
+    let set = build(L1Identity { revision: Some([2, 3, 4]), brick_serial: Some("EMUN09".into()) });
+    assert_eq!(set.revision, Some([2, 3, 4]));
+    assert_eq!(set.brick_serial.as_deref(), Some("EMUN09"));
+}
+
+fn fuel_dma_board() -> crate::ip34_machine::FuelBoard {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
+    board.xbridge.widget(15).unwrap().write32(0x24, 15);
+    board
+}
+
+fn fuel_dma_address(address: u64) -> u64 {
+    (10 << 60) | (1 << 55) | address
+}
+
+/// Storage DMA buffers can begin unaligned and cross a physical page boundary.
+#[test]
+fn dma_preserves_byte_order_and_crosses_ragged_pages() {
+    use crate::pci::PciDmaStatus;
+    let board = fuel_dma_board();
+    let dma = board.xbridge.dma(15, 0);
+    let memory = board.bedrock.dma_view();
+    for (address, length) in [(0x1030, 8), (0x1103, 27), (0x1ffb, 19)] {
+        let data: Vec<u8> = (0..length).map(|i| 0x31 + i as u8).collect();
+        assert_eq!(dma.dma_write(fuel_dma_address(address), &data), PciDmaStatus::Ok);
+        for (i, &byte) in data.iter().enumerate() {
+            assert_eq!(memory.read8(address + i as u64).data, byte);
+        }
+        let mut back = vec![0xff; length];
+        assert_eq!(dma.dma_read(fuel_dma_address(address), &mut back), PciDmaStatus::Ok);
+        assert_eq!(back, data);
+    }
+    // Without byte swapping enabled, the bridge reverses each 32-bit word.
+    assert_eq!(dma.dma_write((10 << 60) | 0x3000, &[0, 1, 2, 3, 4, 5, 6, 7]), PciDmaStatus::Ok);
+    assert_eq!(memory.read64(0x3000).data, 0x0302010007060504);
+}
+
+/// A failed DMA read must clear only refused chunks and preserve completed data.
+#[test]
+fn dma_refusals_clear_failed_reads_without_losing_completed_chunks() {
+    use crate::pci::PciDmaStatus;
+    let board = fuel_dma_board();
+    let dma = board.xbridge.dma(15, 0);
+    let memory = board.bedrock.dma_view();
+    // Bank zero has 256 MiB fitted. The second qword is outside its backing.
+    let last = 0x0fff_fff8;
+    assert_eq!(memory.write64(last, 0x0102030405060708), BUS_OK);
+    let mut bytes = [0xff; 16];
+    assert_eq!(dma.dma_read(fuel_dma_address(last), &mut bytes), PciDmaStatus::MasterAbort);
+    assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(dma.dma_write(fuel_dma_address(last), &[0x42; 16]), PciDmaStatus::MasterAbort);
+    assert_eq!(memory.read64(last).data, 0x4242424242424242);
+}
+
+/// Inbound Hub writes must preserve access width and the widget's permissions.
+#[test]
+fn dma_hub_access_preserves_width_and_source_permissions() {
+    use crate::pci::PciDmaStatus;
+    let board = fuel_dma_board();
+    let dma = board.xbridge.dma(15, 0);
+    let hub = (1 << 47) | 0x1800000;
+    for (interface, offset) in [(0, 0), (1, 0x200000)] {
+        let address = fuel_dma_address(hub + offset + 0x90);
+        assert_eq!(dma.dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::Ok);
+        assert_ne!(pi_regs(&board, interface as u64).read64(0x98).data & (1 << 12), 0);
+        for width in [1, 2, 4] {
+            assert_eq!(dma.dma_write(address, &[0; 8][..width]), PciDmaStatus::MasterAbort);
+            assert_ne!(pi_regs(&board, interface as u64).read64(0x98).data & (1 << 12), 0);
+        }
+        assert_eq!(dma.dma_write(address, &12u64.to_be_bytes()), PciDmaStatus::Ok);
+        assert_eq!(pi_regs(&board, interface as u64).read64(0x98).data & (1 << 12), 0);
+    }
+    let address = fuel_dma_address(hub + 0x90);
+    // I/O modify must retain PI region protection and the widget's permissions.
+    assert_eq!(pi_regs(&board, 0 as u64).write64(0x10, 0), BUS_OK);
+    assert_eq!(dma.dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::MasterAbort);
+    assert_eq!(pi_regs(&board, 0 as u64).read64(0x98).data & (1 << 12), 0);
+    assert_eq!(pi_regs(&board, 0 as u64).write64(0x10, 1), BUS_OK);
+    assert_eq!(board.xbridge.dma(15, 1).dma_write(address, &0x10cu64.to_be_bytes()), PciDmaStatus::Ok);
+    assert_ne!(pi_regs(&board, 0 as u64).read64(0x98).data & (1 << 12), 0);
+    let mut bytes = [0xff; 8];
+    assert_eq!(board.xbridge.dma(15, 1).dma_read(
+        fuel_dma_address(hub + 0x40), &mut bytes,
+    ), PciDmaStatus::MasterAbort);
+    assert_eq!(bytes, [0; 8]);
+    assert_eq!(board.bus.read64((1 << 57) | 0x1800040).status, BUS_OK);
+}
+
+/// Rounded MMIO pages must not expose padding or bypass cell permissions.
+#[test]
+fn exact_windows_reject_padding_and_revoked_permissions() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Offset;
+    impl BusDevice for Offset {
+        fn read64(&self, offset: u64) -> BusRead64 { BusRead64::ok(offset) }
+        fn write64(&self, _offset: u64, _value: u64) -> u32 { BUS_OK }
+    }
+    let permitted = Arc::new(AtomicBool::new(true));
+    let permission = permitted.clone();
+    let window = Window::new(0x1000, 0x88, Arc::new(Offset))
+        .permitted(Arc::new(move || permission.load(Ordering::Acquire)));
+    assert_eq!(window.read64(0x1080).data, 0x80);
+    assert_eq!(window.read64(0x1088).status, BUS_ERR);
+    assert_eq!(window.read64(0x1084).status, BUS_ERR);
+    assert_eq!(window.read64(0x0ff8).status, BUS_ERR);
+    assert_eq!(window.read64(u64::MAX).status, BUS_ERR);
+    permitted.store(false, Ordering::Release);
+    assert_eq!(window.read64(0x1000).status, BUS_ERR);
+    assert_eq!(window.write64(0x1000, 1), BUS_ERR);
+    permitted.store(true, Ordering::Release);
+    assert_eq!(window.write64(0x1000, 1), BUS_OK);
+}
+
+/// Board default setup must preserve the direct RAM path and its shared DMA contents.
+#[test]
+fn direct_cached_banks_remain_visible_after_board_defaults_are_installed() {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    assert_eq!(md_regs(&board).write64(8, 0x33), BUS_OK);
+    let cached = board.cached_bus();
+    assert!(cached.mem_ptr(0x2000).is_some());
+    assert_eq!(cached.write64(0x2000, 0x123456789abcdef0), BUS_OK);
+    assert_eq!(board.bedrock.dma_view().read64(0x2000).data, 0x123456789abcdef0);
+    assert!(cached.mem_ptr(3 << 57).is_none(), "UC selectors cannot alias cached RAM");
+}
+
+/// A device overlay replaces its pages, including padding, while its neighbors
+/// keep their original address translation.
+#[test]
+fn sparse_overlays_keep_neighbors_and_refuse_the_new_windows_padding() {
+    let mut map = SparseWindowMap::default();
+    map.map(0x1000, 0x4000, Arc::new(Word(1)));
+    map.map(0x2040, 0x80, Arc::new(Word(2)));
+    assert_eq!(map.read64(0x1000).data, 1);
+    assert_eq!(map.read64(0x2040).data, 2);
+    assert_eq!(map.read64(0x20b8).data, 2);
+    assert_eq!(map.read64(0x20bc).status, BUS_ERR);
+    assert_eq!(map.read64(0x2000).status, BUS_ERR);
+    assert_eq!(map.read64(0x20c0).status, BUS_ERR);
+    assert_eq!(map.read64(0x3000).data, 1);
+    assert_eq!(map.read64(0x5000).status, BUS_ERR);
+    map.map(0x1000, 0x4000, Arc::new(Word(3)));
+    assert_eq!(map.ranges.len(), 1);
+    assert_eq!(map.read64(0x2040).data, 3);
+}
+
+/// Sparse MMIO holes remain bus errors and a revoked cell permission does not
+/// fall through to an older mapping beneath the protected window.
+#[test]
+fn sparse_holes_and_revoked_permissions_never_expose_older_devices() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let permission = Arc::new(AtomicBool::new(true));
+    let allowed = permission.clone();
+    let mut map = SparseWindowMap::default();
+    map.map(0, 0x3000, Arc::new(Word(1)));
+    map.map(0x1000, 8, Arc::new(Window::new(0, 8, Arc::new(Word(2)))
+        .permitted(Arc::new(move || allowed.load(Ordering::Acquire)))));
+    assert_eq!(map.read64(0x1000).data, 2);
+    permission.store(false, Ordering::Release);
+    assert_eq!(map.read64(0x1000).status, BUS_ERR);
+    assert_eq!(map.read64(0x1008).status, BUS_ERR);
+    assert_eq!(map.read64(0x2000).data, 1);
+    assert_eq!(map.read64(0x3000).status, BUS_ERR);
+}
+
+/// Code-page lookup receives plain physical addresses and reads them through
+/// the cached plane. Cached stores must also update the MD view.
+#[cfg(feature = "jitv2")]
+#[test]
+fn code_generations_use_the_stable_ram_endpoint() {
+    struct Generations {
+        ram_only: bool,
+        generation: AtomicU64,
+        writes: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+    impl Generations {
+        fn new(ram_only: bool) -> Arc<Self> {
+            Arc::new(Self { ram_only, generation: AtomicU64::new(0), writes: Default::default() })
+        }
+    }
+    impl BusDevice for Generations {
+        fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+            if !self.ram_only || address < 0x1000 { &self.generation } else { std::ptr::null() }
+        }
+        fn write64(&self, address: u64, value: u64) -> u32 {
+            self.writes.lock().unwrap().push((address, value));
+            BUS_OK
+        }
+        fn write64_masked(&self, address: u64, value: u64, mask: u64) -> u32 {
+            self.write64(address, value & mask)
+        }
+        fn write_block(&self, address: u64, values: &[u64]) -> u32 {
+            for (index, value) in values.iter().enumerate() {
+                self.write64(address + index as u64 * 8, *value);
+            }
+            BUS_OK
+        }
+    }
+    let physical = Physical::new(Vec::new());
+    let bus = Ip35Bus::new(physical.clone());
+    let raw_ram = Generations::new(false);
+    let stable_ram = Generations::new(true);
+    let rom = Generations::new(false);
+    map_device(&physical, 0, 0x1000, raw_ram.clone(), "raw RAM generation");
+    map_device(&physical, 0x1fc00000, 0x1000, rom.clone(), "ROM generation");
+    let cached = bus.cached_view(stable_ram.clone(), crate::dev::bedrock::RamExtent::new(&[256, 256]));
+    assert_eq!(cached.gen_ptr(0x40), &stable_ram.generation as *const AtomicU64);
+    assert_eq!(cached.gen_ptr(0x1fc00000), &rom.generation as *const AtomicU64);
+    assert_eq!(cached.write64(0x40, 0x1234), BUS_OK);
+    assert_eq!(cached.write_block(0x48, &[0x5678]), BUS_OK);
+    assert_eq!(cached.write64_masked(0x50, 0xaabb, 0xff), BUS_OK);
+    assert_eq!(*stable_ram.writes.lock().unwrap(), [(0x40, 0x1234), (0x48, 0x5678), (0x50, 0xbb)]);
+    assert_eq!(cached.write64(0x1fc00000, 0x4321), BUS_OK);
+    assert_eq!(*rom.writes.lock().unwrap(), [(0, 0x4321)], "the ROM window translates to a device-local offset");
+    assert!(raw_ram.writes.lock().unwrap().is_empty());
+}
+
+/// The JIT's page lookup and inline compile read code through the CPU's cached
+/// bus, which a board whose uncached connection decodes plain addresses as
+/// something else sets to the view the cache fills from. The compile pool is
+/// started on that same object.
+#[test]
+fn the_cpu_reads_code_through_the_cached_view_not_the_uncached_connection() {
+    // An executor is large; a test thread's stack is not.
+    std::thread::Builder::new().stack_size(64 << 20).spawn(cpu_cached_bus).unwrap().join().unwrap();
+}
+
+fn cpu_cached_bus() {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let cpu = board.build_cpu(crate::ip34_machine::CPUS[0]);
+    let cached = board.cached_bus();
+    assert!(Arc::ptr_eq(cpu.cached_bus(), &cached));
+    let sysad: Arc<dyn BusDevice> = board.bus.clone();
+    assert!(!Arc::ptr_eq(cpu.cached_bus(), &sysad), "sysad is the uncached connection");
+}
+
+/// Unmodeled Hub heads retain the PROM compatibility readback without
+/// absorbing the adjacent, independently implemented L1 UART window.
+#[test]
+fn compatibility_hub_heads_do_not_hide_the_l1_uart_window() {
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    assert_ne!(board.bedrock.cell_permits() as u64, 0);
+    for base in [0x1000_0000, 0x3000_0000] {
+        for offset in [0, 8, 0x40, 0x78] {
+            let address = base + offset;
+            assert_eq!(board.bus.write8(address, 0xa5), BUS_OK);
+            assert_eq!(board.bus.write16(address, 0xa5a5), BUS_OK);
+            assert_eq!(board.bus.write32(address, 0xa5a5a5a5), BUS_OK);
+            assert_eq!(board.bus.write64(address, 0x2000), BUS_OK);
+            let value = board.bus.read8(address);
+            assert_eq!(value.status, BUS_OK);
+            assert_eq!(value.data, 0);
+            let value = board.bus.read16(address);
+            assert_eq!(value.status, BUS_OK);
+            assert_eq!(value.data, 0);
+            let value = board.bus.read32(address);
+            assert_eq!(value.status, BUS_OK);
+            assert_eq!(value.data, 0);
+            let value = board.bus.read64(address);
+            assert_eq!(value.status, BUS_OK);
+            assert_eq!(value.data, 0);
+        }
+        assert_eq!(board.bus.read64(base + 0x80).status, BUS_OK);
+    }
+}
+
+/// A busy host port or unusable transcript path must not prevent a serial
+/// machine from starting, including when any of its three ports serves CI.
+#[test]
+fn unavailable_serial_ports_and_logs_do_not_abort_the_machine() {
+    use crate::config::{FuelConsole, MachineConfig};
+    let listeners: Vec<_> = (0..3).map(|_| std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap()).collect();
+    let ports: Vec<_> = listeners.iter().map(|socket| socket.local_addr().unwrap().port()).collect();
+    let board = crate::ip34_machine::FuelBoard::new(&[], Arc::new(|| 0)).unwrap();
+    let mut config = MachineConfig::default();
+    config.fuel.l1_port = Some(ports[0]);
+    config.serial_port_a = Some(ports[1]);
+    config.serial_port_b = Some(ports[2]);
+    config.ci = true;
+    let missing = std::env::temp_dir().join(format!("iris-fuel-missing-log-{}", std::process::id())).join("absent").join("serial.txt");
+    assert!(!missing.parent().unwrap().exists(), "the log parent must be absent");
+    config.serial_log = Some(missing.to_string_lossy().into_owned());
+    config.fuel.l1_log = config.serial_log.clone();
+    for (console, selection) in [FuelConsole::L1, FuelConsole::Ioc3A, FuelConsole::Ioc3B].into_iter().enumerate() {
+        config.fuel.console = selection;
+        crate::ip34_machine::FuelMachine::connect_serial_for_test(&config, &board, console).unwrap();
+    }
+    config.ci = false;
+    crate::ip34_machine::FuelMachine::connect_serial_for_test(&config, &board, 0).unwrap();
+}
+

@@ -1061,7 +1061,6 @@ pub type R12000Module4MShadowCache =
 pub type R12000O2ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 2097152, 64, true, 0x0000_0e35, 0x0000_0900, 64, { model::R12000 }>;
 
-
 /// SGI O2 R10000 (IP32): the IP28 model with 64-byte secondary-cache lines.
 ///
 /// The O2 PROM (4.18 and earlier) handles only that line size. With Config's
