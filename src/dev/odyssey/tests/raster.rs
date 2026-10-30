@@ -231,3 +231,33 @@ fn a_reused_draw_job_draws_only_its_new_primitive() {
     assert_eq!(colours.len(), 2, "both primitives drew, each in its own colour");
     assert_eq!(threaded, inline);
 }
+
+/// A current-state query behind a queued draw: the front end goes on at
+/// once, and the query's sync word, like a fence, lands only after the
+/// draw is in the planes, its snapshot already in place.
+#[test]
+fn a_query_behind_a_queued_draw_syncs_after_the_draw_without_holding_the_front_end() {
+    let (h, st) = slow_raster(300);
+    let ram = Ram::new(1 << 20);
+    let start = Instant::now();
+    {
+        let mut s = h.board.lock();
+        s.guest = Some(ram.clone());
+        s.ctx_shadow_addr_lower = 0x2000;
+        s.host_write_addr_lower = 0x1000;
+        red_triangle(&mut s, &st);
+        for word in [0x4c0, 7, 0x10a5a, 3, 0x5a5a] {
+            cmd(&mut s, word);
+        }
+    }
+    assert!(start.elapsed() < Duration::from_millis(250), "the front end waited for the raster unit");
+    assert_eq!(ram.half(0x1006), 0, "the sync word waits for the draw before it");
+    eventually("the query did not sync", || ram.half(0x1006) == 0x5a5a);
+    assert_eq!(ram.get(0x2000 + 0x97c, 4), 7u32.to_be_bytes(), "the counter was published before the sync word");
+    let s = h.board.lock();
+    let _planes = h.raster.planes();
+    assert_ne!(pixel(&s, 0, 10, 10), 0, "the draw was in the planes before the sync word");
+    drop(_planes);
+    drop(s);
+    h.raster.stop();
+}

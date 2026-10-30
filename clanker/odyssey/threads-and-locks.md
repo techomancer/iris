@@ -37,7 +37,8 @@ apply to BUZZ). Nothing models more than one raster unit.
   jobs, each a closure owning what its raster work reads, captured when the
   front end set it up: a GL primitive's raster rules, draw state, vertices,
   texture chain and the texture tables it uses; a GL clear's or pattern
-  rectangle's raster ops; a fence's address and token. This encoding is the
+  rectangle's raster ops; a fence's address and token; a query's snapshot
+  and sync word. This encoding is the
   model's own: the hardware's is unknown. Capturing state at its place in
   the stream is how raster state reaches the raster unit in order.
 - **The planes** stay where `Board` keeps them. The raster unit owns them
@@ -143,8 +144,9 @@ must keep them.
 4. The low-water flag latches as a store retires below the mark (16 words),
    whatever the enable mask says; it reaches the driver only while enabled.
 5. Completion words are written when the raster unit is done with the work
-   before them: fences run as raster jobs; the context-switch done word and
-   the query sync word wait for the raster queue to empty.
+   before them: fences and a current-state query's publication (snapshot,
+   counter, sync word) run as raster jobs; the context-switch done word
+   waits for the raster queue to empty.
 6. Stopping the machine finishes the command FIFO and then the raster queue;
    a reset abandons the waiting stores and waits for the raster queue before
    it clears the planes.

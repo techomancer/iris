@@ -1075,13 +1075,13 @@ impl Board {
         self.query_captured = self.query_current;
     }
 
+    /// The query's last word: publish the snapshot query_begin() took,
+    /// its counter and its sync word. The sync word completes like a fence,
+    /// after the raster work before it, so the publication goes to the
+    /// raster unit as a job behind that work and the front end goes on. It
+    /// waited for the raster queue to empty instead, which in perfly held
+    /// the front end up for most of a frame's drawing once a frame.
     pub fn query_finish(&mut self, sequence: u32) {
-        // Its sync word completes like a fence: after the raster work before it.
-        self.raster_wait();
-        let bus = DmaBus {
-            mem: self.guest.clone(),
-            trace_sequence: self.trace_sequence.wrapping_sub(1),
-        };
         let sync_offset: u64 = 2 * (self.query_sync_index & ODSY_DMA_FENCE_SLOT_MASK) as u64;
 
         self.query_stage = 0;
@@ -1098,16 +1098,14 @@ impl Board {
             crate::dlog!(LogModule::Odyssey, "sgi-odyssey: unsupported current-query snapshot");
             return;
         }
+        // Each word in publication order, with what a failed write reports.
+        let mut words: Vec<(u64, u32, &'static str)> = Vec::new();
         for i in 0..QUERY_OFFSET.len() {
-            let words = 1 + cmd_arity(self.query_captured[i][0]) as usize;
+            let n = 1 + cmd_arity(self.query_captured[i][0]) as usize;
 
-            for j in 0..words {
+            for j in 0..n {
                 let addr = self.query_base + QUERY_OFFSET[i] as u64 + 4 * j as u64;
-
-                if bus.publish_be32(addr, self.query_captured[i][j]).is_err() {
-                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query payload failed");
-                    return;
-                }
+                words.push((addr, self.query_captured[i][j], "sgi-odyssey: current-query payload failed"));
             }
         }
         let mut i = 0;
@@ -1116,26 +1114,34 @@ impl Board {
             let at = self.query_base + (if i != 0 { ODSY_QUERY_RASTER_COLOUR } else { ODSY_QUERY_RASTER_INDEX }) as u64;
 
             for (j, &word) in rec.iter().enumerate().take(1 + cmd_arity(rec[0]) as usize) {
-                if bus.publish_be32(at + 4 * j as u64, word).is_err() {
-                    crate::dlog!(LogModule::Odyssey, "sgi-odyssey: raster query payload failed");
-                    return;
-                }
+                words.push((at + 4 * j as u64, word, "sgi-odyssey: raster query payload failed"));
             }
             i += 1;
         }
-        if bus.publish_be32(self.query_base + 0x97c, self.query_count).is_err() {
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query counter failed");
-            return;
-        }
-        if self.query_sync_base > u64::MAX - sync_offset
-            || bus.publish_be16(self.query_sync_base + sync_offset, (sequence & 0xffff) as u16).is_err()
-        {
-            crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query sync failed");
-            return;
-        }
-        if self.query_sync_index & ODSY_DMA_FENCE_INTERRUPT != 0 {
-            self.front.lock().deliver_softsync();
-        }
+        words.push((self.query_base + 0x97c, self.query_count, "sgi-odyssey: current-query counter failed"));
+        let sync = (self.query_sync_base <= u64::MAX - sync_offset).then(|| self.query_sync_base + sync_offset);
+        let softsync = self.query_sync_index & ODSY_DMA_FENCE_INTERRUPT != 0;
+        let bus = DmaBus {
+            mem: self.guest.clone(),
+            trace_sequence: self.trace_sequence.wrapping_sub(1),
+        };
+        let front = self.front.clone();
+
+        self.raster.submit(move |_| {
+            for (addr, word, failed) in words {
+                if bus.publish_be32(addr, word).is_err() {
+                    crate::dlog!(LogModule::Odyssey, "{}", failed);
+                    return;
+                }
+            }
+            if sync.is_none_or(|at| bus.publish_be16(at, (sequence & 0xffff) as u16).is_err()) {
+                crate::dlog!(LogModule::Odyssey, "sgi-odyssey: current-query sync failed");
+                return;
+            }
+            if softsync {
+                front.lock().deliver_softsync();
+            }
+        });
     }
 }
 
