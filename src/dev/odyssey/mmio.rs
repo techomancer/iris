@@ -202,8 +202,13 @@ pub fn access_waits(addr: u64, size: u32, write: bool) -> bool {
 impl Board {
     /// A read with the board lock held.
     pub fn mmio_read(&mut self, addr: u64, size: u32) -> u64 {
-        if access_waits(addr, size, false) && self.work_pending() {
-            self.work_drain(addr);
+        if access_waits(addr, size, false) {
+            // Both queues: the stores before it, and the raster work they
+            // handed on.
+            if self.work_pending() {
+                self.work_drain(addr);
+            }
+            self.raster_wait();
         }
         self.read(addr, size)
     }
@@ -254,18 +259,20 @@ impl Board {
     }
 }
 
-/// The two locks a processor's access goes through.
+/// The two locks a processor's access goes through, and the queues behind
+/// them.
 #[derive(Clone)]
 pub struct BoardLocks {
     pub board: Arc<Mutex<Box<Board>>>,
     pub front: Arc<Mutex<HostInterface>>,
     pub fifo: Arc<CommandFifo>,
+    pub raster: Arc<RasterQueue>,
 }
 
 impl BoardLocks {
     pub fn new(s: Box<Board>) -> Self {
-        let (front, fifo) = (s.front.clone(), s.fifo.clone());
-        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo }
+        let (front, fifo, raster) = (s.front.clone(), s.fifo.clone(), s.raster.clone());
+        BoardLocks { board: Arc::new(Mutex::new(s)), front, fifo, raster }
     }
 
     /// A processor's read: through the front alone when it can, else under the

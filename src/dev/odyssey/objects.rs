@@ -114,6 +114,8 @@ impl Board {
     /// so the space between them is reclaimed, then object last (when not -1)
     /// after them all, so that it can grow in place. Indices do not change.
     pub fn object_compact(&mut self, last: i32) {
+        // A queued textured draw may still read the store.
+        self.raster_wait();
         let last_size: u64 = if last >= 0 { self.obj_width[last as usize] as u64 * self.obj_rows[last as usize] as u64 } else { 0 };
         let mut held: Vec<u8> = Vec::new();
         let mut held_valid: Vec<bool> = Vec::new();
@@ -228,6 +230,7 @@ impl Board {
         if rows <= self.obj_rows[iu] {
             return true;
         }
+        self.raster_wait();
         self.object_touch(i);
         if need <= pool
             && !(have != 0 && self.obj_offset[iu] as u64 + have == self.obj_used as u64 && self.obj_offset[iu] as u64 + need <= pool)
@@ -299,6 +302,7 @@ impl Board {
             return;
         }
         let word = self.obj_offset[i as usize] as u64 + y as u64 * self.obj_width[i as usize] as u64 + x as u64;
+        self.raster_wait();
         self.obj_mem.bytes[(word * 4) as usize..][..4].copy_from_slice(&rgba.to_be_bytes());
         self.object_word_set_valid(word, true);
     }

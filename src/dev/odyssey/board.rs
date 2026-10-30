@@ -61,6 +61,9 @@ pub struct Board {
     pub front: std::sync::Arc<parking_lot::Mutex<HostInterface>>,
     /// The command FIFO, shared with the host interface.
     pub fifo: std::sync::Arc<CommandFifo>,
+    /// The queue to BUZZ's raster unit (raster_unit.rs), which owns the
+    /// planes below while it has jobs.
+    pub raster: std::sync::Arc<RasterQueue>,
     /// Guest memory as the board's DMA reaches it (HEART's RAM on the
     /// Octane).
     pub guest: GuestMemory,
@@ -428,6 +431,7 @@ impl Default for Board {
             slot: 0,
             front,
             fifo,
+            raster: Default::default(),
             guest: None,
             nic_bus: None,
             revision: 0,
@@ -1226,6 +1230,8 @@ impl Board {
 
     pub fn reset(&mut self) {
         self.work_reset();
+        // The raster unit finishes what it was given before the planes clear.
+        self.raster_wait();
         self.reset_registers();
         self.front.lock().update_irq();
         // Board::configure() also calls Board::reset_registers(), before

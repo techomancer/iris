@@ -940,13 +940,12 @@ impl Board {
             self.gl_raster(&op);
             return;
         }
-        let target = self.gl_target();
-        self.gl_report_refusals(op.kind != SGI_RASTER_CLEAR || (op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT) != 0);
         // Proposed shape-4 policy: the first corner anchors a repeating bitmap,
         // independent of corner order. Admit runs through the existing clear so
         // clear bits preserve both colour and depth, with clipping unchanged.
         let (xs, xe) = (x0 as i32, x1 as i32);
         let mut y = y0 as i32;
+        let mut runs = Vec::new();
         while y <= y1 as i32 {
             let row = self.pattern_buffer[((y as u32).wrapping_sub(anchor_y) & 31) as usize];
             let mut x = xs;
@@ -968,11 +967,14 @@ impl Board {
                     }
                 }
                 op.x1 = x - 1;
-                rules.raster(&target, &mut self.gl_parts(None).0, &op);
+                runs.push(op);
             }
             y += 1;
         }
-        self.scanout.invalidate_all();
+        if runs.is_empty() {
+            self.gl_report_refusals(op.kind != SGI_RASTER_CLEAR || (op.clear_buffers & SGI_GL_COLOR_BUFFER_BIT) != 0);
+        }
+        self.gl_raster_ops(runs);
     }
 
     /// One QUADS rectangle: the bounding box of the four vertices from first,

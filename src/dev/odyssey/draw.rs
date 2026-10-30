@@ -38,11 +38,17 @@ pub fn id_compare_passes(did: &[u8], id_compare: u32, x: i64, y: i64) -> bool {
 impl Board {
     /// Colour buffer b's board memory and plane (set up by Board::allocate()), b being 0 or
     /// 1 in the displayed-buffer bits' sense (ODSY_REG_DRAW_MASK).
+    ///
+    /// The planes are the raster unit's: the accessors here and below wait
+    /// for its queued jobs before the front end reads or writes them
+    /// (raster_unit.rs).
     pub fn buffer_mem(&self, b: u32) -> &BoardMemory {
+        self.raster_wait();
         if b != 0 { &self.buffer1_mem } else { &self.mem }
     }
 
     pub fn buffer_mem_mut(&mut self, b: u32) -> &mut BoardMemory {
+        self.raster_wait();
         if b != 0 { &mut self.buffer1_mem } else { &mut self.mem }
     }
 
@@ -85,16 +91,22 @@ impl Board {
     /// command and the DMA engine's publish(): write the cookie's 16-bit token,
     /// big-endian, to the guest fence slot at the host-write base plus twice the
     /// slot, and pulse the softsync interrupt when the cookie asks.
+    ///
+    /// The raster unit writes it, behind the raster jobs queued before it, so
+    /// the token lands only once the drawing before it is in the planes.
     pub fn fence(&mut self, cookie: u64) {
         let word = (cookie & ODSY_FENCE_WORD_MASK as u64) as u32;
         let slot = word & ODSY_DMA_FENCE_SLOT_MASK;
         let token = (word >> ODSY_DMA_FENCE_TOKEN_SHIFT) & 0xffff;
         let base = (((self.host_write_addr_upper & 0xffff) as u64) << 32) | self.host_write_addr_lower as u64;
+        let (guest, front) = (self.guest.clone(), self.front.clone());
 
-        write_guest(&self.guest, base.wrapping_add(2 * slot as u64), &(token as u16).to_be_bytes());
-        if word & ODSY_DMA_FENCE_INTERRUPT != 0 {
-            self.front.lock().deliver_softsync();
-        }
+        self.raster.submit(move |_| {
+            write_guest(&guest, base.wrapping_add(2 * slot as u64), &(token as u16).to_be_bytes());
+            if word & ODSY_DMA_FENCE_INTERRUPT != 0 {
+                front.lock().deliver_softsync();
+            }
+        });
     }
 }
 
@@ -145,6 +157,7 @@ impl Board {
 
     /// The 0x840 ownership test at an in-plane pixel.
     pub fn id_compare_passes(&self, x: i64, y: i64) -> bool {
+        self.raster_wait();
         id_compare_passes(&self.did, self.id_compare, x, y)
     }
 
@@ -257,6 +270,8 @@ impl Board {
     pub fn aux_store(&mut self, at: u64, buffers: u32, value: u8, mask: u8) {
         let at_i = at as usize;
 
+        self.raster_wait();
+
         if buffers & (1u32 << ODSY_AUX_ID_BUFFER) != 0 {
             self.did[at_i] = (self.did[at_i] & !mask) | (value & mask);
         }
@@ -281,6 +296,7 @@ impl Board {
         let buffers = self.draw_buffers();
         let mut byte = index as u8;
 
+        self.raster_wait();
         if op as u32 != SGI_LOGIC_COPY {
             let dst = if buffers & (1u32 << ODSY_AUX_OVERLAY_BUFFER) != 0 { self.overlay[at as usize] } else { self.did[at as usize] };
 

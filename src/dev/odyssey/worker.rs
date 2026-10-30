@@ -72,12 +72,14 @@ impl Budget {
 }
 
 impl BoardLocks {
-    /// Start the board's thread.
+    /// Start the board's thread, the front end, and the raster unit's
+    /// behind it.
     pub fn work_start(&self) {
         let mut thread = self.fifo.thread.lock();
         if thread.is_some() {
             return;
         }
+        self.raster.start();
         self.fifo.start();
         self.fifo.running.store(true, SeqCst);
         let handles = self.clone();
@@ -100,6 +102,8 @@ impl BoardLocks {
         self.fifo.running.store(false, SeqCst);
         let mut s = self.board.lock();
         s.work_step(&mut Budget::unlimited());
+        // Then the raster work those stores handed on.
+        self.raster.stop();
     }
 
     fn work_run(&self) {

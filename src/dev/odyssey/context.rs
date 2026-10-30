@@ -332,6 +332,9 @@ impl Board {
             self.unimplemented(ODSY_CTX_SWITCH_PORT, 8, true);
             return;
         }
+        // The done word says the board has finished the work before the
+        // switch, the raster unit's included.
+        self.raster_wait();
         if self.ctx_shadow_addr_upper == 0 && self.ctx_shadow_addr_lower == 0 {
             crate::dlog!(
                 LogModule::Odyssey,

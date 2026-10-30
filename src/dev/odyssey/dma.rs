@@ -1076,6 +1076,8 @@ impl Board {
     }
 
     pub fn query_finish(&mut self, sequence: u32) {
+        // Its sync word completes like a fence: after the raster work before it.
+        self.raster_wait();
         let bus = DmaBus {
             mem: self.guest.clone(),
             trace_sequence: self.trace_sequence.wrapping_sub(1),
