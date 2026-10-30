@@ -220,6 +220,7 @@ fn the_configured_station_address_reaches_the_l1_and_the_ethernet() {
         station_mac: mac,
         timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
         ps2_input: true, usb_input: true,
+        graphics: crate::config::GraphicsBoard::None,
     }).unwrap();
     assert_eq!(board.l1.station_mac(), mac);
     assert_eq!(board.eth.mac(), mac);
@@ -582,6 +583,7 @@ fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
             station_mac: [8, 0, 0x69, 0x12, 0x34, 0x56],
             timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
             ps2_input: true, usb_input,
+            graphics: crate::config::GraphicsBoard::None,
         }).unwrap();
         // Power each port: one with a device shows it connected.
         board.usb.bar_write(0, 0x54, 0x100, 4);
@@ -839,4 +841,115 @@ mod code_views {
             }
         });
     }
+}
+
+fn fuel_with_graphics(graphics: crate::config::GraphicsBoard) -> crate::ip35_machine::FuelBoard {
+    crate::ip35_machine::FuelBoard::with_config(crate::ip35_machine::FuelBoardConfig {
+        payload: &[], clock: Arc::new(|| 0), flash_path: None,
+        station_mac: [0x08, 0x00, 0x69, 0x21, 0x43, 0x65],
+        timekeeper: Arc::new(crate::dev::timekeeper::Timekeeper::fuel().unwrap()),
+        ps2_input: true, usb_input: true,
+        graphics,
+    }).unwrap()
+}
+
+/// The VPro's link status in the crossbar, in its slot's data half.
+const VPRO_LINK_STATUS: u64 = 0x100 + 5 * 0x40 + 0x10 + 4;
+/// A processor access to widget 13 through Bedrock's small window.
+const VPRO_PIO: u64 = 13 << 24;
+
+// The VPro cases follow tests/qtest/sn1-fuel-vpro-test.c in
+// jamesbraid/qemu-sgi-origami: widget-identity, profile-identity-and-routing
+// and headless-fuel-has-no-board.
+
+// VPro host-interface registers the tests below touch, as byte offsets in
+// the board's widget space. The board's own constants are private to it.
+const ODSY_IDENTITY: u64 = 0x00;
+const ODSY_CONTROL: u64 = 0x20;
+const ODSY_CONTROL_WIDGET_MASK: u32 = 0xf;
+const ODSY_INT_DEST_LOWER: u64 = 0x38;
+const ODSY_INTR_CLEAR: u64 = 0x101c;
+const ODSY_INTR_ENABLE_SET: u64 = 0x1034;
+const ODSY_INTR_FIFO_LOW_WATER: u32 = 0x200;
+const ODSY_ROUTE_DEST_UPPER: u64 = 0x1044;
+const ODSY_ROUTE_DEST_LOWER: u64 = 0x104c;
+const ODSY_ROUTE_VECTORS: u64 = 0x1054;
+const ODSY_ROUTE_DEST_WIDGET_SHIFT: u32 = 25;
+
+/// A Fuel IRIX inventory lists its VPro under xtalk/13: the processor must
+/// reach the board there, learn its widget number from it, and find the
+/// link alive in the crossbar.
+#[test]
+fn the_vpro_answers_at_widget_13_with_its_link_alive() {
+    for (graphics, revision) in [(crate::config::GraphicsBoard::V12, 0xa), (crate::config::GraphicsBoard::V10, 0xa)] {
+        let board = fuel_with_graphics(graphics);
+        let identity = board.io.pio_read(VPRO_PIO | (ODSY_IDENTITY + 4), 4);
+        assert_eq!(identity.status, BUS_OK);
+        assert_eq!(identity.data as u32, (revision << 28) | 0x0c01_3047, "{graphics:?}");
+        let control = board.io.pio_read(VPRO_PIO | (ODSY_CONTROL + 4), 4).data as u32;
+        assert_eq!(control & ODSY_CONTROL_WIDGET_MASK, 13);
+        assert_ne!(board.xbridge.crossbar().read32(VPRO_LINK_STATUS).data & (1 << 31), 0);
+    }
+}
+
+/// The board's interrupt packets cross the XBridge to Bedrock as the PCI
+/// heads' do: a raised source sets its vector's pending bit in the
+/// processor interface the destination names, and a cleared one clears it.
+#[test]
+fn vpro_interrupt_packets_set_and_clear_a_processor_interface_pending_bit() {
+    let board = fuel_with_graphics(crate::config::GraphicsBoard::V12);
+    // Register space (bit 47), the node's hub window and PI0's pending
+    // modify register, at the Bedrock's crossbar port 0xa.
+    let packet = (1u64 << 47) | 0x180_0000 | 0x90;
+    let vector = 5;
+    let write = |offset: u64, value: u64| {
+        assert_eq!(board.io.pio_write(VPRO_PIO | offset, 4, value), BUS_OK, "{offset:#x}");
+    };
+    write(ODSY_ROUTE_DEST_UPPER, (0xa << ODSY_ROUTE_DEST_WIDGET_SHIFT) | (packet >> 32));
+    write(ODSY_ROUTE_DEST_LOWER, packet & 0xffff_ffff);
+    write(ODSY_ROUTE_VECTORS, vector);
+    write(ODSY_INTR_ENABLE_SET, ODSY_INTR_FIFO_LOW_WATER as u64);
+    let pending = || board.pi[0].read64(0x98).data & (1 << vector);
+    assert_ne!(pending(), 0);
+    write(ODSY_INTR_CLEAR, ODSY_INTR_FIFO_LOW_WATER as u64);
+    assert_eq!(pending(), 0);
+}
+
+/// A link reset of the graphics port resets the board behind it, as the
+/// PCI port's does for the functions behind its head.
+#[test]
+fn a_graphics_link_reset_resets_the_vpro() {
+    let board = fuel_with_graphics(crate::config::GraphicsBoard::V12);
+    let destination = VPRO_PIO | (ODSY_INT_DEST_LOWER + 4);
+    assert_eq!(board.io.pio_write(destination, 4, 0x55), BUS_OK);
+    assert_eq!(board.io.pio_read(destination, 4).data, 0x55);
+    let link_reset = 0x100 + 5 * 0x40 + 0x30 + 4;
+    assert_eq!(board.xbridge.crossbar().write32(link_reset, 1), BUS_OK);
+    assert_eq!(board.io.pio_read(destination, 4).data, 0);
+}
+
+/// Without graphics nothing answers at widget 13 and its link is down, as
+/// on a headless Fuel.
+#[test]
+fn a_fuel_without_graphics_has_no_widget_13() {
+    let board = fuel_with_graphics(crate::config::GraphicsBoard::None);
+    assert!(board.vpro.is_none());
+    assert_ne!(board.io.pio_read(VPRO_PIO | 4, 4).status, BUS_OK);
+    assert_eq!(board.xbridge.crossbar().read32(VPRO_LINK_STATUS).data & (1 << 31), 0);
+}
+
+/// IRIX's VPro driver writes each processor interface's graphics credit
+/// counter at attach and tears the board down if it reads back zero; the
+/// registers must keep what the guest writes, per interface.
+#[test]
+fn processor_interface_graphics_registers_keep_their_writes() {
+    let board = fuel_with_graphics(crate::config::GraphicsBoard::V12);
+    // Slot A's credit counter and bias; PI1 keeps its own block.
+    assert_eq!(board.pi[0].write64(0x308, 100), BUS_OK);
+    assert_eq!(board.pi[0].write64(0x310, 0x1000 | 68), BUS_OK);
+    assert_eq!(board.pi[0].read64(0x308).data, 100);
+    assert_eq!(board.pi[0].read64(0x310).data, 68);
+    assert_eq!(board.pi[1].read64(0x308).data, 0);
+    board.pi[0].power_on();
+    assert_eq!(board.pi[0].read64(0x308).data, 0);
 }

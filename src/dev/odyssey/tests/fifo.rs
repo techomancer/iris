@@ -1,4 +1,4 @@
-//! The command FIFO: queueing, the board's thread, status.
+//! The command FIFO: queueing, the board's thread, status, credits.
 
 use crate::dev::odyssey::board::Board;
 use crate::dev::odyssey::command::{CFIFO_PREAMBLE, CfifoPreamble};
@@ -8,6 +8,10 @@ use crate::dev::odyssey::consts::{
 use crate::dev::odyssey::fifo::{CommandFifo, RING_STORES, RUN_MAX, Run};
 use crate::dev::odyssey::interface::HostInterface;
 use crate::dev::odyssey::mmio::BoardLocks;
+use crate::dev::odyssey::pi_gfx::{
+    pi_gfx_mark_store, pi_gfx_take_mark, pi_gfx_unmark_store, PI_GFX_BIAS, PI_GFX_CREDIT,
+    PI_GFX_PAGE, PI_GFX_PAGE_ENABLE, PiGfx, PiGfxLink,
+};
 use crate::dev::odyssey::tests::{
     board, board_with_ram, cmd, cmd64, reg_read, reg_write, route_to_heart, select, FLAG_VECTOR,
     Ram, VPRO_WIDGET,
@@ -210,41 +214,151 @@ fn a_waiting_bus_read_is_busy_until_the_board_thread_has_run_the_stores() {
     h.work_stop();
 }
 
-/// A run of stores the board's thread has looked at and then runs leaves
-/// the FIFO together. The stores run in order; the level and the store count
-/// end where taking the stores out one by one leaves them, including when
-/// more stores join the queue after the run was taken.
+/// Records every call a board makes on its processor-interface link.
+#[derive(Default)]
+struct PiStub(Mutex<Vec<(&'static str, u32, i64)>>);
+
+impl PiGfxLink for PiStub {
+    fn return_credits(&self, widget: u32, n: u32) {
+        self.0.lock().push(("return", widget, n as i64));
+    }
+    fn owe_credits(&self, widget: u32, n: i32) {
+        self.0.lock().push(("owe", widget, n as i64));
+    }
+    fn repay_credits(&self, widget: u32, n: u32) {
+        self.0.lock().push(("repay", widget, n as i64));
+    }
+}
+
+impl PiStub {
+    fn count(&self, kind: &str) -> i64 {
+        self.0.lock().iter().filter(|c| c.0 == kind).map(|c| c.2).sum()
+    }
+    /// Credits given back so far, returned or repaid.
+    fn settled(&self) -> i64 {
+        self.count("return") + self.count("repay")
+    }
+}
+
+/// A board whose stores are all counted and queued, with a stub link.
+fn credit_board() -> (Box<Board>, Arc<PiStub>) {
+    let (s, _) = board("v12");
+    let pi = Arc::new(PiStub::default());
+    {
+        let mut f = s.front.lock();
+        f.pi = Some(pi.clone());
+        f.test_counted_stores = 1;
+    }
+    // No work thread runs: hold the queue and step by hand.
+    s.fifo.test_words.store(1, SeqCst);
+    (s, pi)
+}
+
+/// Command work credits at FIFO entry: a counted store's credit
+/// comes back when the board takes it into its FIFO, the oldest
+/// `cfifo::DEPTH` waiting stores at once; each store behind them is owed, then
+/// repaid as the work ahead runs and it moves up. A store that does
+/// not wait is credited inside the store.
+///
+/// QEMU: command-work-credits-at-fifo-entry.
 #[test]
-fn a_run_retires_with_the_levels_of_one_by_one() {
+fn a_counted_store_is_credited_as_it_enters_the_fifo() {
+    let (mut s, pi) = credit_board();
+    let stores = cfifo::DEPTH + 8;
+
+    for _ in 0..stores {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    // Credits count stores; the level counts words, two a doubleword, and
+    // reads no more than the model's FIFO size.
+    assert_eq!(s.fifo.stores(), stores);
+    assert_eq!(s.fifo.level(), (2 * stores).min(cfifo::WORDS));
+    assert_eq!(s.fifo.in_fifo(), cfifo::DEPTH);
+    assert_eq!(pi.count("return"), cfifo::DEPTH as i64);
+    assert_eq!(pi.count("owe"), (stores - cfifo::DEPTH) as i64);
+    assert_eq!(pi.count("repay"), 0);
+    assert!(pi.0.lock().iter().all(|c| c.1 == VPRO_WIDGET));
+
+    // One store runs per slice: the next one moves up and is repaid.
+    s.work_step(&mut Budget::stores(1));
+    assert_eq!(pi.count("repay"), 1);
+    assert_eq!(pi.settled(), cfifo::DEPTH as i64 + 1);
+
+    s.work_step(&mut Budget::unlimited());
+    assert!(!s.fifo.pending());
+    assert_eq!(pi.settled(), stores as i64);
+
+    // A store that does not wait is credited inside the store.
+    s.fifo.test_words.store(0, SeqCst);
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    assert!(!s.work_pending());
+    assert_eq!(pi.settled(), stores as i64 + 1);
+    assert_eq!(pi.count("owe"), (stores - cfifo::DEPTH) as i64);
+}
+
+/// A run of stores the board's thread has looked at and then runs leaves
+/// the FIFO together. The stores run in order; the level, the store count
+/// and the credits end where taking the stores out one by one leaves them,
+/// including when a counted store joins the queue after the run was taken.
+#[test]
+fn a_run_retires_with_the_levels_and_credits_of_one_by_one() {
     fn queue(s: &mut Board) {
-        for _ in 0..70 {
+        s.front.lock().test_counted_stores = 0;
+        for _ in 0..cfifo::DEPTH + 6 {
             s.mmio_write(consts::cmd::FIFO, 0, 8);
         }
     }
-    fn join(s: &mut Board) {
+    fn counted_join(s: &mut Board) {
+        s.front.lock().test_counted_stores = 1;
         for _ in 0..10 {
             s.mmio_write(consts::cmd::FIFO, 0, 8);
         }
     }
-    // One at a time: the store count and the level are the reference.
-    let (mut one, _, _) = queued_board();
+    // One at a time: the store count and the credits are the reference.
+    let (mut one, pi_one) = credit_board();
     queue(&mut one);
-    join(&mut one);
+    counted_join(&mut one);
     for _ in 0..RUN_MAX {
         step(&mut one);
     }
 
-    let (mut run, _, _) = queued_board();
+    let (mut run, pi_run) = credit_board();
     queue(&mut run);
     let mut taken = Run::new();
     run.fifo.take_run(&mut taken);
-    assert_eq!(taken.stores().len(), RUN_MAX, "a full run");
-    join(&mut run);
-    assert_eq!(run.fifo.stores(), 80);
+    assert_eq!(taken.stores().len(), RUN_MAX, "no counted store waits yet: a full run");
+    counted_join(&mut run);
+    assert_eq!(run.fifo.stores(), cfifo::DEPTH + 16);
     run.fifo.retire(&run.front, &taken, RUN_MAX);
 
     assert_eq!(run.fifo.stores(), one.fifo.stores());
     assert_eq!(run.fifo.level(), one.fifo.level());
+    assert_eq!(pi_run.count("repay"), pi_one.count("repay"));
+    assert_eq!(pi_run.count("return"), pi_one.count("return"));
+    assert_eq!(pi_run.count("owe"), pi_one.count("owe"));
+    assert!(pi_run.count("repay") > 0, "the run moved owed stores up");
+    // The counted stores left all sit inside the credited depth, so the
+    // next run is full.
+    assert!(run.fifo.stores() <= cfifo::DEPTH);
+    run.fifo.take_run(&mut taken);
+    assert_eq!(taken.stores().len(), RUN_MAX);
+}
+
+/// The board's thread takes stores one at a time only while some wait past
+/// the credited depth, where one may owe its credit; a backlog of counted
+/// stores inside the depth, all credited, goes in full runs.
+#[test]
+fn a_run_is_one_store_only_past_the_credited_depth() {
+    let (mut s, _) = credit_board();
+    for _ in 0..cfifo::DEPTH {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    let mut run = Run::new();
+    s.fifo.take_run(&mut run);
+    assert_eq!(run.stores().len(), RUN_MAX, "every waiting store is credited");
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    s.fifo.take_run(&mut run);
+    assert_eq!(run.stores().len(), 1, "one store owes its credit");
 }
 
 /// A slice cut short by its budget retires only the stores it ran: the rest
@@ -264,6 +378,76 @@ fn a_slice_cut_short_leaves_the_rest_of_its_run_queued() {
     finish(&mut s);
     assert_eq!(ram.half(HOST_WRITE_BASE + 6), 0xa5a5);
 }
+
+/// A reset abandons the waiting stores and cancels each owed credit
+/// (one owe of -1 per owed store); stores not owed cancel nothing.
+#[test]
+fn a_reset_cancels_the_credits_owed_for_abandoned_stores() {
+    let (mut s, pi) = credit_board();
+
+    for _ in 0..cfifo::DEPTH + 8 {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    assert_eq!(pi.count("owe"), 8);
+    s.work_reset();
+    assert!(!s.fifo.pending());
+    assert_eq!(s.fifo.in_fifo(), 0);
+    assert_eq!(pi.count("owe"), 0);
+    assert_eq!(pi.0.lock().iter().filter(|c| c.0 == "owe" && c.2 == -1).count(), 8);
+    assert_eq!(pi.count("repay"), 0);
+}
+
+/// The processor interface's mark makes a store counted, once, and a
+/// counted store with no link logs and returns nothing.
+#[test]
+fn the_processor_mark_counts_exactly_one_store() {
+    let (mut s, pi) = credit_board();
+
+    {
+        let mut f = s.front.lock();
+        f.test_counted_stores = 0;
+    }
+    s.fifo.test_words.store(0, SeqCst);
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    assert_eq!(pi.settled(), 0);
+
+    let previous = pi_gfx_mark_store(true);
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    pi_gfx_unmark_store(previous);
+    assert_eq!(pi.0.lock().as_slice(), &[("return", VPRO_WIDGET, 1)]);
+
+    // One-shot: the mark was taken by the first store.
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    assert_eq!(pi.settled(), 1);
+
+    // The Octane: no link, so the credit is dropped with a log line.
+    s.front.lock().pi = None;
+    pi_gfx_mark_store(true);
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    assert_eq!(pi.settled(), 1);
+    assert!(!pi_gfx_take_mark());
+}
+
+/// The register block's pure state (PiGfx).
+#[test]
+fn the_credit_block_starves_a_widget_that_runs_out_of_credits() {
+    let mut g = PiGfx::default();
+
+    g.write(PI_GFX_PAGE, PI_GFX_PAGE_ENABLE | 0x2_0000);
+    g.write(PI_GFX_CREDIT, 3);
+    g.write(PI_GFX_BIAS, 2);
+    assert!(g.covers(0, 0x2_1000));
+    assert!(!g.covers(0, 0x4_0000));
+    assert!(g.count_store(0, 0x2_0000, "t"));
+    assert!(!g.take_starved(0, "t"));
+    assert!(g.count_store(0, 0x2_0000, "t"));
+    assert!(g.take_starved(0, "t"));
+    assert!(!g.take_starved(0, "t"));
+    g.add_credits(0, 5, "t");
+    assert_eq!(g.read(PI_GFX_CREDIT), 6);
+    assert!(!g.starved[0]);
+}
+
 
 /// The model's low-water threshold, in waiting words (a model choice).
 const LOW_WATER_MARK: u32 = cfifo::LOW_WATER;
@@ -508,6 +692,8 @@ fn the_threshold_follows_6b2() {
 /// MODEL CONTRACT ONLY: the FIFO's size is unknown and the model's size is
 /// its own choice. Whatever `0x6b1` the set-up stores, the level clamps at
 /// cfifo::WORDS however many stores wait.
+///
+/// QEMU: command-work-credit-depth-ignores-setup covers the credit depth.
 #[test]
 fn the_fifo_size_ignores_the_set_up_words() {
     for word_6b1 in [1u32, 256, 0x7fff_ffff] {
@@ -555,35 +741,130 @@ fn low_water_is_raised_as_the_queue_falls_below_the_mark() {
     assert_eq!(rec.events(FLAG_VECTOR), [true]);
 }
 
-/// A hurry ends the board thread's pause before a slice. The pause is set
-/// far longer than the wait below, so only the hurry runs the stores in
-/// time; the stores wait while the thread sits in it.
+/// MODEL CONTRACT ONLY: the FIFO's depth is unknown and the model's depth is
+/// its own choice. The stored `0x6b1` and `0x6b2` values (256 and 32192, as
+/// the kernels write them) do not widen the credits: only the oldest
+/// `cfifo::DEPTH` waiting stores, the model's depth, have their credits back, so the
+/// processor interface still holds back a writer that runs ahead of the slow
+/// board.
+///
+/// QEMU: command-work-credit-depth-ignores-setup.
 #[test]
-fn a_hurry_ends_the_board_threads_pause() {
-    let (s, _rec) = board("v12");
+fn the_fifo_set_up_does_not_widen_the_credit_depth() {
+    let (mut s, pi) = credit_board();
+    s.fifo.test_words.store(0, SeqCst);
+    cmd64(&mut s, 0x6b1, 256);
+    cmd64(&mut s, 0x6b3, 24144);
+    cmd64(&mut s, 0x6b2, 32192);
+    finish(&mut s);
+    pi.0.lock().clear();
+
+    s.fifo.test_words.store(1, SeqCst);
+    let stores = cfifo::DEPTH + 8;
+    for _ in 0..stores {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    assert_eq!(s.fifo.stores(), stores);
+    assert_eq!(pi.count("return"), cfifo::DEPTH as i64);
+    finish(&mut s);
+    assert_eq!(pi.settled(), stores as i64);
+}
+
+/// MODEL CHOICE: the FIFO holds far more than the host's credit window
+/// (the VPro porting guide's millisecond of commands), so a writer that
+/// fills the whole window, 256 doublewords on the IP30 and at most 256 on
+/// the IP35, gets every credit back as its stores enter, with the board's
+/// thread taking none of them, and owes nothing. A credit that waited on
+/// the board's thread could miss the high-water handler's ten-microsecond
+/// poll.
+#[test]
+fn the_credit_depth_is_deeper_than_the_host_window() {
+    const LARGEST_HOST_WINDOW: u32 = 256;
+    let (mut s, pi) = credit_board();
+    for _ in 0..=LARGEST_HOST_WINDOW {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    assert_eq!(s.fifo.stores(), LARGEST_HOST_WINDOW + 1, "the board took none");
+    assert_eq!(pi.count("return"), LARGEST_HOST_WINDOW as i64 + 1);
+    assert_eq!(pi.count("owe"), 0);
+    finish(&mut s);
+}
+
+/// MODEL CHOICE: the credited depth is 16,384 stores, the smallest power of
+/// two that holds the kernel's start-up program of about 12,291 words at
+/// one word per store. With the board taking nothing, every one of the
+/// first 16,384 counted stores is credited as it enters, and
+/// the next is owed until the board takes a store.
+#[test]
+fn every_store_inside_the_credited_depth_is_credited_and_the_next_is_owed() {
+    const DEPTH: u32 = 16_384;
+    let (mut s, pi) = credit_board();
+    for _ in 0..DEPTH {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    assert_eq!(s.fifo.stores(), DEPTH, "the board took none");
+    assert_eq!(pi.count("return"), DEPTH as i64);
+    assert_eq!(pi.count("owe"), 0);
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    assert_eq!(pi.count("return"), DEPTH as i64);
+    assert_eq!(pi.count("owe"), 1, "the store past the depth owes its credit");
+    finish(&mut s);
+    assert_eq!(pi.settled(), DEPTH as i64 + 1);
+}
+
+/// A counted store whose credit is owed has the board's thread run without
+/// its pause, so the credit comes back as soon as the stores ahead retire.
+/// A guest that watches its credit count reads a register the bus does not
+/// refuse, so nothing else hurries the thread; with the pause the kernel saw
+/// its count fall below the bias in a burst of a few hundred stores and gave
+/// the FIFO up as stuck. The stores inside the model's depth are credited
+/// at once and do not hurry.
+#[test]
+fn a_counted_store_owed_its_credit_hurries_the_board_thread() {
+    let (mut s, pi) = credit_board();
+    for _ in 0..cfifo::DEPTH {
+        s.mmio_write(consts::cmd::FIFO, 0, 8);
+    }
+    assert!(!s.fifo.take_hurry(), "a credited store leaves the pause alone");
+    s.mmio_write(consts::cmd::FIFO, 0, 8);
+    assert_eq!(pi.count("owe"), 1);
+    assert!(s.fifo.take_hurry(), "an owed credit hurries the board's thread");
+    finish(&mut s);
+
+    // On the board's thread, with a pause far longer than the wait below:
+    // only the hurry runs the burst in time.
+    let stores = cfifo::DEPTH + 136;
     let h = BoardLocks::new(s);
     h.fifo.test_gap_ms.store(60_000, SeqCst);
+    // credit_board holds the queue for stepping by hand.
+    h.fifo.test_words.store(0, SeqCst);
+    pi.0.lock().clear();
     h.work_start();
-    // One store starts the thread, and the burst waits until the thread is
-    // in its pause: a burst that lands before it would find the request
-    // already made and prove nothing about waking a sleeper.
+    // One credited store starts the thread, and the burst waits until the
+    // thread is in its pause: a burst that lands before it would find the
+    // request already made and prove nothing about waking a sleeper.
     h.write(consts::cmd::FIFO, 0, 8);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while h.fifo.test_parked.load(SeqCst) == 0 {
         assert!(std::time::Instant::now() < deadline, "the board's thread never reached its pause");
         std::thread::yield_now();
     }
-    for _ in 1..200 {
+    for _ in 1..stores {
         h.write(consts::cmd::FIFO, 0, 8);
     }
-    assert_eq!(h.fifo.stores(), 200, "the stores wait out the pause");
-    h.fifo.hurry();
+    // The last few stores may find the queue run dry and wait out a pause
+    // of their own, but inside the depth they are credited at the store.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while h.fifo.stores() != 0 {
-        assert!(std::time::Instant::now() < deadline, "the board's thread kept its pause: {} stores wait", h.fifo.stores());
+    while pi.settled() != stores as i64 {
+        assert!(std::time::Instant::now() < deadline, "the board's thread kept its pause: {} stores wait, {} of {stores} credits back", h.fifo.stores(), pi.settled());
         std::thread::yield_now();
     }
+    assert!(pi.count("owe") > 0, "the burst ran past the model's depth");
+    assert_eq!(pi.count("repay"), pi.count("owe"));
+    // Cut a pause still under way short, so the stop does not wait it out.
+    h.fifo.hurry();
     h.work_stop();
+    assert_eq!(h.fifo.stores(), 0);
 }
 
 /// A stopping machine finishes the work waiting; a reset abandons it.
@@ -628,7 +909,7 @@ fn two_processors_storing_to_the_fifo_lose_nothing_and_keep_each_ones_order() {
                 let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     for seq in 0..PER {
                         let size = if seq % 3 == 0 { 8 } else { 4 };
-                        while !h.fifo.push(&h.front, consts::cmd::FIFO, id << 32 | seq, size) {
+                        while !h.fifo.push(&h.front, consts::cmd::FIFO, id << 32 | seq, size, false) {
                             std::thread::yield_now();
                         }
                     }
@@ -676,7 +957,7 @@ fn a_store_run_before_its_push_returns_is_already_in_the_level() {
     let h = BoardLocks::new(s);
     h.front.lock().intr_flags &= !intr::FIFO_LOW_WATER;
     for seq in 0..20 {
-        assert!(h.fifo.push(&h.front, consts::cmd::FIFO, seq, 4));
+        assert!(h.fifo.push(&h.front, consts::cmd::FIFO, seq, 4, false));
     }
     fn run_everything(fifo: &CommandFifo, front: &Mutex<HostInterface>) {
         let mut run = Run::new();
@@ -687,7 +968,7 @@ fn a_store_run_before_its_push_returns_is_already_in_the_level() {
         assert_eq!((fifo.stores(), fifo.level()), (0, 0), "the run took out what the level counted");
     }
     *h.fifo.test_after_ring_push.lock() = Some(run_everything);
-    assert!(h.fifo.push(&h.front, consts::cmd::FIFO, 20, 8));
+    assert!(h.fifo.push(&h.front, consts::cmd::FIFO, 20, 8, false));
     assert!(h.fifo.test_after_ring_push.lock().is_none(), "the consumer ran inside the push");
     assert_eq!((h.fifo.stores(), h.fifo.level()), (0, 0));
     assert_ne!(h.front.lock().intr_flags & intr::FIFO_LOW_WATER, 0, "the level fell through the mark");
@@ -790,7 +1071,7 @@ fn two_processors_racing_for_the_last_place_in_the_ring_leave_one_store_in() {
     // The ring has room for one more store when it holds RING_STORES - 1.
     let fill = |h: &BoardLocks| {
         for _ in 0..RING_STORES - 1 {
-            assert!(h.fifo.push(&h.front, consts::cmd::FIFO, 0, 4));
+            assert!(h.fifo.push(&h.front, consts::cmd::FIFO, 0, 4, false));
         }
     };
     fill(&h);
@@ -805,7 +1086,7 @@ fn two_processors_racing_for_the_last_place_in_the_ring_leave_one_store_in() {
                 for _ in 0..ROUNDS {
                     start.wait();
                     // A panic in a push must fail the round, not leave the others waiting.
-                    let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.fifo.push(&h.front, consts::cmd::FIFO, 0, 4)));
+                    let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.fifo.push(&h.front, consts::cmd::FIFO, 0, 4, false)));
                     match pushed {
                         Ok(true) => {
                             accepted.fetch_add(1, SeqCst);
@@ -875,7 +1156,7 @@ fn processors_wait_for_each_other_and_the_board_thread_does_not_wait_for_them() 
     // before the lock was held. Nothing is queued here, so queue through the
     // unlocked ring and see it drain.
     for w in &words[..4] {
-        assert!(h.fifo.push(&h.front, w.port, w.value, w.size as u32));
+        assert!(h.fifo.push(&h.front, w.port, w.value, w.size as u32, false));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while h.fifo.pending() {

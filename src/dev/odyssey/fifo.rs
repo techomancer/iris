@@ -40,11 +40,41 @@
 //!
 //! The processor's stores are the producer; whoever runs the queue (the
 //! board's thread, or an access that drains it with that thread stopped)
-//! is the consumer.
+//! is the consumer. Graphics credits, which only machines whose processor
+//! interface counts stores use, are settled as a store enters the FIFO's
+//! first `cfifo::DEPTH` places: at the store when there is room, or
+//! when the stores ahead of it have run. That depth (16,384 stores) is a
+//! MODEL CHOICE, independent of the stored `0x6bX` values: the smallest
+//! power of two that holds the kernel's whole start-up program (about
+//! 12,291 words) even at one word per store, and far deeper than the
+//! largest host credit window (256), as a FIFO holding about a millisecond
+//! of commands is. A writer is then credited as its stores enter and does
+//! not wait on the board's thread. That matters because IRIX's high-water
+//! handler looks at the count for only about ten microseconds before it
+//! holds the writer, and while the X server's initialise call is loading
+//! that program, before the low-water interrupt has a destination, only
+//! the kernel's 15-second FIFO timer wakes a writer held there. Limitation: a writer that runs more than the depth plus its
+//! window ahead of the board waits for the board's thread again, and is
+//! held until the level falls below the low-water mark. Whether a 32-bit
+//! store costs the hardware a whole credit is UNKNOWN; the model credits
+//! one per store.
+//!
+//! The deeper credited FIFO widens what the guest can see. A counted writer
+//! can now leave up to the depth plus its window (about 16,640 stores)
+//! waiting, where 64 plus the window was the bound before, so the level,
+//! the unreturned-credit field of `0x106c` (which saturates), status bit 17
+//! (below the low-water mark) and flag 9 follow a backlog that long: bit 17
+//! stays clear, and flag 9 latches, only after it drains. Doubleword stores
+//! that deep reach the `0x6b2` threshold the kernel stores, 32,192 words,
+//! which the old bound never did, so status bit 15 and flag 25 can now
+//! rise for counted stores too; the kernel leaves flag 25 masked and does
+//! not read bit 15. The level the guest reads stops at the model's FIFO
+//! size.
 
 
 use super::consts::{cfifo, intr, ODSY_WORK_QUEUE_MAX};
 use super::interface::HostInterface;
+use super::pi_gfx::{pi_gfx_owe_credits, pi_gfx_repay_credits};
 use super::worker::GAP;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::{Relaxed, SeqCst}};
@@ -64,18 +94,28 @@ pub(super) struct QueuedStore {
     pub value: u64,
     pub addr: u32,
     pub size: u8,
+    /// The processor interface counted it: its credit is due.
+    pub counted: bool,
+    /// It waited outside the FIFO, so the node holds its credit as owed.
+    pub owed: bool,
 }
 
 // A ring entry is (address word, value). The address word carries the
-// aperture offset in its low 24 bits and the store's size above them.
+// aperture offset in its low 24 bits and the store's size and credit
+// state above them.
 const ENTRY_OFFSET_MASK: u32 = 0x00ff_ffff;
 const ENTRY_SIZE_SHIFT: u32 = 24;
 const ENTRY_SIZE_MASK: u32 = 0xf;
+const ENTRY_COUNTED: u32 = 1 << 28;
+const ENTRY_OWED: u32 = 1 << 29;
 
 impl QueuedStore {
     fn entry(&self) -> u32 {
         debug_assert!(self.addr <= ENTRY_OFFSET_MASK && self.size as u32 <= ENTRY_SIZE_MASK);
-        self.addr | (self.size as u32) << ENTRY_SIZE_SHIFT
+        self.addr
+            | (self.size as u32) << ENTRY_SIZE_SHIFT
+            | if self.counted { ENTRY_COUNTED } else { 0 }
+            | if self.owed { ENTRY_OWED } else { 0 }
     }
 
     fn from_entry(addr: u32, value: u64) -> Self {
@@ -83,6 +123,8 @@ impl QueuedStore {
             value,
             addr: addr & ENTRY_OFFSET_MASK,
             size: ((addr >> ENTRY_SIZE_SHIFT) & ENTRY_SIZE_MASK) as u8,
+            counted: addr & ENTRY_COUNTED != 0,
+            owed: addr & ENTRY_OWED != 0,
         }
     }
 
@@ -108,7 +150,7 @@ pub(super) struct Run {
 
 impl Run {
     pub fn new() -> Self {
-        Run { stores: [QueuedStore { value: 0, addr: 0, size: 0 }; RUN_MAX], len: 0 }
+        Run { stores: [QueuedStore { value: 0, addr: 0, size: 0, counted: false, owed: false }; RUN_MAX], len: 0 }
     }
 
     /// The stores to run, oldest first.
@@ -127,6 +169,8 @@ struct Levels {
     words: AtomicU32,
     /// Stores pushed and not yet taken out.
     stores: AtomicU32,
+    /// Counted stores waiting; while zero no store needs credit work.
+    counted: AtomicU32,
 }
 
 pub(super) struct CommandFifo {
@@ -146,9 +190,9 @@ pub(super) struct CommandFifo {
     /// The board's thread is parked (`wait_for_work`): a producer unparks it
     /// only then, so a store reads a line nobody writes instead of locking.
     asleep: CachePadded<AtomicBool>,
-    /// The processor waits for the board's thread, for a refused access: its
-    /// next slice starts without the pause for a burst of stores, and a
-    /// pause under way ends.
+    /// The processor waits for the board's thread, for a refused access or
+    /// a counted store whose credit is owed: its next slice starts without
+    /// the pause for a burst of stores, and a pause under way ends.
     hurry: CachePadded<AtomicBool>,
     /// The board's thread is running stores.
     pub slice: CachePadded<AtomicBool>,
@@ -168,7 +212,7 @@ pub(super) struct CommandFifo {
     /// counted after its last look at the hurry request.
     #[cfg(test)]
     pub test_parked: AtomicU32,
-    /// Tests: the next push calls this, once, as soon as its
+    /// Tests: the next uncounted push calls this, once, as soon as its
     /// store is in the ring: a consumer that takes the store at that
     /// moment, before the push has returned.
     #[cfg(test)]
@@ -182,7 +226,7 @@ impl Default for CommandFifo {
             // place because the ring is too big for the stack.
             ring: unsafe { Box::new_zeroed().assume_init() },
             pop: Mutex::new(()),
-            levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0) }),
+            levels: CachePadded::new(Levels { words: AtomicU32::new(0), stores: AtomicU32::new(0), counted: AtomicU32::new(0) }),
             threshold_6b2: CachePadded::new(AtomicU32::new(0)),
             running: CachePadded::new(AtomicBool::new(false)),
             asleep: CachePadded::new(AtomicBool::new(false)),
@@ -251,9 +295,9 @@ impl CommandFifo {
         self.running.load(SeqCst) && !self.has_room()
     }
 
-    /// The processor waits for the board's thread to run what is queued, as
-    /// a refused access does. A thread already in its pause (`gap`) is woken
-    /// to run at once.
+    /// The processor waits for the board's thread to run what is queued:
+    /// a refused access, or a counted store whose credit is owed. A thread
+    /// already in its pause (`gap`) is woken to run at once.
     pub fn hurry(&self) {
         // A refused store retries in a loop; write the line only when it
         // changes, as IMPACT does for its asleep flag.
@@ -310,20 +354,34 @@ impl CommandFifo {
         self.running.load(SeqCst) || self.pending() || self.held()
     }
 
-    /// Queue a store. False when the host ring has no room for it.
-    pub fn push(&self, front: &Mutex<HostInterface>, addr: u64, value: u64, size: u32) -> bool {
+    /// The stores in the FIFO's first places, credited.
+    pub fn in_fifo(&self) -> u32 {
+        self.stores().min(cfifo::DEPTH)
+    }
+
+    /// Queue a store. A counted store is credited at once when it lands
+    /// inside the FIFO's first places and owed otherwise. False when the
+    /// board's FIFO has no room for it.
+    pub fn push(&self, front: &Mutex<HostInterface>, addr: u64, value: u64, size: u32, counted: bool) -> bool {
         let words = store_words(size);
         if !self.has_room() {
             return false;
         }
-        let q = QueuedStore { value, addr: addr as u32, size: size as u8 };
+        let mut q = QueuedStore { value, addr: addr as u32, size: size as u8, counted, owed: false };
+        // A counted store's place is settled against the consumer's pops.
+        let _c = counted.then(|| self.pop.lock());
         // Count the store before the ring shows it. The board's thread can
         // take it and retire it the moment it is in the ring, and a retire
         // must find every store it takes already counted, or the level falls
         // below zero. Until the push lands the counts are a store high,
         // which reads as a store still waiting, never as one gone.
-        self.levels.stores.fetch_add(1, SeqCst);
+        if counted {
+            self.levels.counted.fetch_add(1, SeqCst);
+        }
+        let stores_before = self.levels.stores.fetch_add(1, SeqCst);
         let before = self.levels.words.fetch_add(words, SeqCst);
+        let credited = counted && stores_before < cfifo::DEPTH;
+        q.owed = counted && !credited;
         if !self.ring.try_push(q.entry(), q.value) {
             // With one processor this cannot happen: has_room counted the
             // ring's stores and nothing else pushes. With two, the other
@@ -333,11 +391,32 @@ impl CommandFifo {
             // come back off.
             self.levels.words.fetch_sub(words, SeqCst);
             self.levels.stores.fetch_sub(1, SeqCst);
+            if counted {
+                self.levels.counted.fetch_sub(1, SeqCst);
+            }
             return false;
         }
         #[cfg(test)]
-        if let Some(consumer) = self.test_after_ring_push.lock().take() {
-            consumer(self, front);
+        if !counted {
+            if let Some(consumer) = self.test_after_ring_push.lock().take() {
+                consumer(self, front);
+            }
+        }
+        if counted {
+            let mut f = front.lock();
+            if credited {
+                f.return_credit();
+            } else {
+                if let Some(pi) = &f.pi {
+                    pi_gfx_owe_credits(pi.as_ref(), f.slot, 1);
+                }
+                drop(f);
+                // The credit comes back only as the stores ahead retire, and
+                // the processor can be watching its credit count (a read the
+                // bus does not refuse), so the board's thread runs without
+                // its pause.
+                self.hurry();
+            }
         }
         let after = before + words;
         let mark = self.threshold_6b2.load(SeqCst);
@@ -353,17 +432,23 @@ impl CommandFifo {
     }
 
     /// Look at the oldest waiting stores, up to `RUN_MAX`, without taking
-    /// them out; the caller runs them, then `retire`s the ones it ran.
+    /// them out; the caller runs them, then `retire`s the ones it ran. While
+    /// stores wait past the credited depth, one of which may owe its credit,
+    /// the run is one store, so each owed credit is settled as the store
+    /// ahead of it leaves rather than after a whole run. Inside the depth
+    /// every counted store already has its credit, so the run is full.
     pub fn take_run(&self, run: &mut Run) {
+        let owing = self.levels.counted.load(SeqCst) != 0 && self.stores() > cfifo::DEPTH;
+        let max = if owing { 1 } else { RUN_MAX };
         let mut raw = [(0u32, 0u64); RUN_MAX];
-        run.len = self.ring.peek_run_at(0, &mut raw);
+        run.len = self.ring.peek_run_at(0, &mut raw[..max]);
         for (store, (addr, value)) in run.stores.iter_mut().zip(&raw[..run.len]) {
             *store = QueuedStore::from_entry(*addr, *value);
         }
     }
 
     /// Take the first `n` stores of `run` out of the FIFO: they have run. The
-    /// level and the stores waiting move once for the run, not
+    /// level, the stores waiting and the credits move once for the run, not
     /// once per store, which is what the board's thread spends most of its
     /// time on when each store costs little to decode. A store the thread has
     /// run but not retired still counts in the level, so the level never
@@ -379,6 +464,7 @@ impl CommandFifo {
         }
         let ran = &run.stores[..n];
         let words: u32 = ran.iter().map(QueuedStore::words).sum();
+        let counted_ran = ran.iter().filter(|q| q.counted).count() as u32;
         let _c = self.pop.lock();
         self.ring.consume_n_at(0, n);
         if self.levels.words.load(SeqCst) < cfifo::LOW_WATER + words {
@@ -393,17 +479,55 @@ impl CommandFifo {
         } else {
             self.levels.words.fetch_sub(words, SeqCst);
         }
-        self.levels.stores.fetch_sub(n as u32, SeqCst);
+        let stores_before = self.levels.stores.fetch_sub(n as u32, SeqCst);
+        if counted_ran != 0 {
+            self.levels.counted.fetch_sub(counted_ran, SeqCst);
+        }
+        if self.levels.counted.load(SeqCst) == 0 {
+            return;
+        }
+        // The next waiting store moves into the FIFO's last credited place
+        // and is credited.
+        for k in 1..=n as u32 {
+            if stores_before - k < cfifo::DEPTH {
+                continue;
+            }
+            // The run is already out of the ring, so count back from its head.
+            let place = cfifo::DEPTH as usize - 1 - (n - k as usize);
+            if let Some((addr, value)) = self.ring.peek_nth_at(0, place) {
+                let entered = QueuedStore::from_entry(addr, value);
+                let mut f = front.lock();
+                if entered.owed {
+                    if let Some(pi) = &f.pi {
+                        pi_gfx_repay_credits(pi.as_ref(), f.slot, 1);
+                    }
+                } else if entered.counted {
+                    f.return_credit();
+                }
+            }
+        }
     }
 
-    /// Abandon every waiting store.
-    pub fn clear(&self) {
+    /// Abandon every waiting store; an owed one outside the FIFO gives its
+    /// owed credit back.
+    pub fn clear(&self, front: &Mutex<HostInterface>) {
         let _c = self.pop.lock();
+        let mut index = 0u32;
         while let Some((addr, value)) = self.ring.peek() {
             self.ring.consume();
             let q = QueuedStore::from_entry(addr, value);
             self.levels.words.fetch_sub(q.words(), SeqCst);
             self.levels.stores.fetch_sub(1, SeqCst);
+            if q.counted {
+                self.levels.counted.fetch_sub(1, SeqCst);
+            }
+            if q.owed && index >= cfifo::DEPTH {
+                let f = front.lock();
+                if let Some(pi) = &f.pi {
+                    pi_gfx_owe_credits(pi.as_ref(), f.slot, -1);
+                }
+            }
+            index += 1;
         }
     }
 

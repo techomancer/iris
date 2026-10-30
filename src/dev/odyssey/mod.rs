@@ -41,7 +41,8 @@
 //! - `memory`, `scanout`, `reader`, `display`: board memory and planes; the
 //!   marks writers make and the display thread's own reader, with the scanned
 //!   frame and retrace; what reaches the window.
-//! - `pixel_dma`: DMA between guest memory and planes.
+//! - `pixel_dma`, `pi_gfx`: DMA between guest memory and planes, and graphics
+//!   credits for machines whose processor interface counts them.
 //! - `depth_word`: the board's 24-bit float depth word and its offset.
 //! - `consts`: register, command and field constants.
 //!
@@ -73,6 +74,8 @@ mod interface;
 mod memory;
 mod mmio;
 mod objects;
+mod pi_gfx;
+pub use pi_gfx::{PiGfx, PI_GFX_REGS};
 mod pixel_dma;
 mod pixel_write;
 mod raster;
@@ -129,9 +132,15 @@ pub struct Odyssey {
     rec: Option<record::RecHandle>,
 }
 
+/// Carries a board interrupt packet into a machine's crosstalk fabric: the
+/// destination widget, the address within it, the vector, and whether the
+/// source rose or fell. False when nothing at the destination takes it.
+pub type PacketSender = Arc<dyn Fn(u8, u64, u8, bool) -> bool + Send + Sync>;
+
 impl Odyssey {
-    /// A board of `product` (v12, v10, v8, v6) at `widget`: its interrupt
-    /// packets reach `irq` (HEART), its DMA reaches `mem`.
+    /// A board of `product` (v12, v10, v8, v6) at `widget` on the Octane:
+    /// the processor reaches it through the IP30 widget windows, its
+    /// interrupt packets reach `irq` (HEART), its DMA reaches `mem`.
     pub fn new(
         widget: u8,
         product: &str,
@@ -140,25 +149,62 @@ impl Odyssey {
         status: Arc<crate::disp::StatusSource>,
     ) -> Result<Arc<Self>, String> {
         let mut s = Board::new(product, widget as u32)?;
-        let rec = match std::env::var("IRIS_ODSY_REC") {
-            Ok(path) => Some(record::Recorder::create(&path).map_err(|e| format!("IRIS_ODSY_REC {path}: {e}"))?),
-            Err(_) => None,
-        };
-        let mem: Arc<dyn BusDevice> = match &rec {
+        let rec = Self::recorder()?;
+        s.guest = Some(Self::recorded_mem(mem, &rec));
+        s.front.lock().irq = Some(irq);
+        Ok(Self::with_board(s, widget_small_base(widget), widget_large_base(widget), status, rec))
+    }
+
+    /// A board of `product` at `widget` on a machine that hands the board
+    /// widget-relative addresses, as Bedrock's I/O interface does, and
+    /// carries its interrupt packets through `packets`.
+    pub fn new_widget_relative(
+        widget: u8,
+        product: &str,
+        packets: PacketSender,
+        mem: Arc<dyn BusDevice>,
+        status: Arc<crate::disp::StatusSource>,
+    ) -> Result<Arc<Self>, String> {
+        let mut s = Board::new(product, widget as u32)?;
+        let rec = Self::recorder()?;
+        s.guest = Some(Self::recorded_mem(mem, &rec));
+        s.front.lock().packets = Some(packets);
+        // Every address is already an aperture offset: no large window.
+        Ok(Self::with_board(s, 0, u64::MAX, status, rec))
+    }
+
+    /// `IRIS_ODSY_REC`'s recorder, when it is set.
+    fn recorder() -> Result<Option<record::RecHandle>, String> {
+        match std::env::var("IRIS_ODSY_REC") {
+            Ok(path) => Ok(Some(record::Recorder::create(&path).map_err(|e| format!("IRIS_ODSY_REC {path}: {e}"))?)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// `mem`, recorded when a recording is running.
+    fn recorded_mem(mem: Arc<dyn BusDevice>, rec: &Option<record::RecHandle>) -> Arc<dyn BusDevice> {
+        match rec {
             Some(r) => Arc::new(record::RecordingMem { inner: mem, rec: r.clone() }),
             None => mem,
-        };
-        s.guest = Some(mem);
-        s.front.lock().irq = Some(irq);
-        Ok(Arc::new(Self {
-            small: widget_small_base(widget),
-            large: widget_large_base(widget),
+        }
+    }
+
+    fn with_board(
+        s: Box<Board>,
+        small: u64,
+        large: u64,
+        status: Arc<crate::disp::StatusSource>,
+        rec: Option<record::RecHandle>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            small,
+            large,
             state: BoardLocks::new(s),
             display: Arc::new(Display::new(status)),
             running: Arc::new(AtomicBool::new(false)),
             thread: Mutex::new(None),
             rec,
-        }))
+        })
     }
 
     pub fn display(&self) -> Arc<dyn crate::gfx_display::GfxDisplay> {

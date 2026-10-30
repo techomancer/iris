@@ -184,6 +184,11 @@ impl Default for Isp12160 {
 }
 
 impl Isp12160 {
+    /// Light the status bar's SCSI activity bits in `heartbeat`.
+    pub fn set_heartbeat(&self, heartbeat: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.0.set_heartbeat(heartbeat);
+    }
+
     /// A 16-id bus with the ISP controller's disk and CD-ROM identities.
     pub fn new_bus() -> ScsiBus {
         ScsiBus::new(16, ScsiIdentities { disk: ISP_DISK, cdrom: ISP_CDROM })

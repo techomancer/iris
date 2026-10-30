@@ -179,8 +179,9 @@ pub(super) mod reg {
     // the bit and raises the flag, and zero, as out of reset, is no threshold.
     // Neither the roles nor the link between bit 15, flag 25 and any 0x6bX value
     // is established. The level's unit (32-bit words, a doubleword store counting
-    // two) is a model choice, as is the FIFO's size (super::cfifo::WORDS),
-    // independent of the stored values, and so is the low-water threshold (super::cfifo::LOW_WATER). The model contract is pinned by
+    // two) is a model choice, as is the FIFO's size (super::cfifo::WORDS) and depth
+    // (super::cfifo::DEPTH), independent of the stored values, and so is the
+    // low-water threshold (super::cfifo::LOW_WATER). The model contract is pinned by
     // the_level_counts_words_against_the_model_fifo_and_the_6b2_threshold and
     // the_threshold_follows_6b2.
     pub const FIFO_SETUP_FIRST: u32 = 0x6b0;
@@ -319,6 +320,29 @@ pub(super) mod cfifo {
     // deeper or shallower. Test, a model contract:
     // the_fifo_size_ignores_the_set_up_words.
     pub const WORDS: u32 = 32768;
+
+    // The waiting stores whose credits have been returned, in stores (one
+    // credit per store). MODEL CHOICE: the FIFO's depth is UNKNOWN (see
+    // WORDS). The VPro porting guide (007-4271-001, "Command FIFO and Context
+    // Switching") says the FIFO holds about a millisecond of commands, more
+    // than the host's credit window of 100 (IP35) or 256 (IP30) doublewords,
+    // and a credit is inferred to come back when the board takes the
+    // doubleword into its FIFO. Exceeding the window is not enough: the
+    // kernel's initialise call stores its start-up program, about 12,291
+    // words, with no level check, before the low-water interrupt has a
+    // destination, and a credit owed during that load can leave the writer
+    // held until the 15-second FIFO timer. 16,384 is the smallest power of two
+    // that covers the whole program even at one word per store, so none of it
+    // waits on the board's thread for its credit. The figure is a model choice
+    // derived from the documented ~12,291-word start-up program, as evidence
+    // for a depth whose grade is unknown. Limitation: past this depth a credit
+    // waits for the board's thread again, the processor can run this many
+    // stores ahead of the board, and a writer that does is held until the
+    // backlog drains below the low-water mark. The stored 0x6bX values do not
+    // change it (fifo.rs). Tests: the_credit_depth_is_deeper_than_the_host_window,
+    // every_store_inside_the_credited_depth_is_credited_and_the_next_is_owed,
+    // the_fifo_set_up_does_not_widen_the_credit_depth (a model contract).
+    pub const DEPTH: u32 = 16384;
 }
 
 pub(super) const ODSY_FIFO_SETUP_7B5_INDEX: usize = 4;

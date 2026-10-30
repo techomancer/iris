@@ -630,14 +630,14 @@ pub enum GraphicsBoard {
     /// VPro V8: BUZZ A, 128 MB. Octane only.
     #[clap(name = "v8", alias = "vpro:v8", alias = "vpro_v8")]
     V8,
-    /// VPro V10: BUZZ B, 32 MB. Octane only. It shipped only in the Octane2
-    /// and needs Crossbow 1.4, so the machine takes the Octane2's Crossbow and
-    /// Bridge revisions.
+    /// VPro V10: BUZZ B, 32 MB. Octane and Fuel. On the Octane it shipped
+    /// only in the Octane2 and needs Crossbow 1.4, so the machine takes the
+    /// Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v10", alias = "vpro:v10", alias = "vpro_v10")]
     V10,
-    /// VPro V12: BUZZ B, 128 MB. Octane only. It shipped only in the Octane2
-    /// and needs Crossbow 1.4, so the machine takes the Octane2's Crossbow and
-    /// Bridge revisions.
+    /// VPro V12: BUZZ B, 128 MB. Octane and Fuel. On the Octane it shipped
+    /// only in the Octane2 and needs Crossbow 1.4, so the machine takes the
+    /// Octane2's Crossbow and Bridge revisions.
     #[clap(name = "v12", alias = "vpro:v12", alias = "vpro_v12")]
     V12,
     /// No graphics board: the machine runs on its serial console. Octane
@@ -703,7 +703,7 @@ impl GraphicsBoard {
     pub fn supports(self, profile: MachineProfile) -> bool {
         match profile {
             MachineProfile::OctaneIp30 => self.is_impact() || self.is_vpro() || self == Self::None,
-            MachineProfile::FuelIp34 => self == Self::None,
+            MachineProfile::FuelIp34 => matches!(self, Self::V10 | Self::V12 | Self::None),
             MachineProfile::Indigo2Ip22 => !self.is_vpro() && self != Self::None,
             _ => !self.is_vpro() && !matches!(self, Self::Extreme | Self::None),
         }
@@ -2135,6 +2135,8 @@ impl MachineConfig {
             if !board.supports(self.machine.profile) {
                 return Err(if self.machine.profile == MachineProfile::OctaneIp30 {
                     format!("graphics.board \"{name}\" is not modelled on the Octane (valid: solidimpact, highimpact, maximpact, v6, v8, v10, v12, none)")
+                } else if self.machine.profile == MachineProfile::FuelIp34 {
+                    format!("graphics.board \"{name}\" is not a Fuel board (valid: v12, v10, none)")
                 } else {
                     format!("graphics.board \"{name}\" is only valid on the Octane")
                 });
@@ -2218,8 +2220,8 @@ impl MachineConfig {
             if self.banks[..2] != [256, 256] {
                 return Err("Fuel currently requires banks = [256, 256] (512 MiB)".into());
             }
-            if board != GraphicsBoard::None {
-                return Err("Fuel currently supports graphics.board = \"none\" only".into());
+            if !board.supports(MachineProfile::FuelIp34) {
+                return Err(format!("graphics.board \"{}\" is not a Fuel board (valid: v12, v10, none)", board.as_str()));
             }
         } else if self.machine.profile == MachineProfile::OctaneIp30 {
             // A HEART bank is a matched DIMM pair: 64 MB to 2 GB, filled from
@@ -3493,7 +3495,7 @@ mod fuel_input_tests {
     }
 
     #[test]
-    fn fuel_requires_its_fixed_memory_population_and_no_graphics() {
+    fn fuel_requires_its_fixed_memory_population_and_a_vpro_or_no_graphics() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::FuelIp34;
         cfg.machine.cpu = CpuModel::R10000;
@@ -3508,6 +3510,12 @@ mod fuel_input_tests {
         cfg.validate().unwrap();
         cfg.graphics.board = Some(GraphicsBoard::Newport);
         assert!(cfg.validate().unwrap_err().contains("none"));
+        for board in [GraphicsBoard::V12, GraphicsBoard::V10] {
+            cfg.graphics.board = Some(board);
+            cfg.validate().unwrap();
+        }
+        cfg.graphics.board = Some(GraphicsBoard::V6);
+        assert!(cfg.validate().unwrap_err().contains("not a Fuel board"));
         cfg.graphics.board = None;
         cfg.banks[1] = 0;
         assert!(cfg.validate().unwrap_err().contains("256, 256"));

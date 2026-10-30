@@ -18,6 +18,7 @@ use super::consts::{
 };
 use super::fifo::CommandFifo;
 use super::interface::{front_mmio_read, front_mmio_write, front_register, HostInterface};
+use super::pi_gfx::pi_gfx_take_mark;
 use super::raster_unit::RasterQueue;
 use super::reader::DisplayShared;
 use super::registers::reg;
@@ -132,6 +133,10 @@ impl Board {
     // see the drawing are answered busy until the queue is empty
     // (BoardLocks::bus_read) or, with no thread running (unit tests), run what
     // is queued first (Board::work_drain).
+    //
+    // The Octane has no PI link (only Hub and Bedrock machines have graphics
+    // credits), so the front's `pi` stays None there and every credit call is
+    // skipped.
 
 }
 
@@ -221,13 +226,31 @@ impl Board {
     }
 }
 
+/// Whether this store is counted: the processor interface's mark.
+pub(super) fn store_counted(front: &parking_lot::Mutex<HostInterface>) -> bool {
+    // The Octane has no PI link, so nothing sets the mark there.
+    #[cfg(test)]
+    if front.lock().test_counted_stores != 0 {
+        return true;
+    }
+    let _ = front;
+    pi_gfx_take_mark()
+}
+
 impl Board {
     /// A store to the board's state.
     pub fn mmio_write(&mut self, addr: u64, value: u64, size: u32) {
+        let counted = store_counted(&self.front);
+        self.mmio_write_counted(addr, value, size, counted);
+    }
+
+    pub fn mmio_write_counted(&mut self, addr: u64, value: u64, size: u32, mut counted: bool) {
         let fifo = self.fifo.clone();
-        let queued = command_store(addr, size) && fifo.queues() && fifo.push(&self.front, addr, value, size);
+        let queued = command_store(addr, size) && fifo.queues() && fifo.push(&self.front, addr, value, size, counted);
         if queued {
-            // With no board thread running the storing caller runs it.
+            // Credited as it enters the FIFO (CommandFifo::push). With no
+            // board thread running the storing caller runs it.
+            counted = false;
             if !fifo.running.load(std::sync::atomic::Ordering::SeqCst) && !fifo.held() {
                 self.work_drain(addr);
             }
@@ -241,6 +264,10 @@ impl Board {
                 self.work_drain(addr);
             }
             self.write_dispatch(addr, value, size);
+        }
+        if counted {
+            // It went through the FIFO inside the store.
+            self.front.lock().return_credit();
         }
     }
 }
@@ -487,7 +514,8 @@ impl BoardLocks {
     /// answer busy, when it waits for queued stores the board's thread will
     /// run, or when it is a command store and the host ring is full while
     /// the board's thread runs: the processor retries the store, taking its
-    /// interrupts meanwhile, while the board's thread makes room.
+    /// interrupts meanwhile, while the board's thread makes room. The
+    /// processor interface's mark stays untaken until the store goes in.
     ///
     /// A store that waits is held back for the command FIFO only, not the
     /// raster queue: the raster unit never shared a lock with the board's
@@ -524,25 +552,27 @@ impl BoardLocks {
     /// A command store the caller has classified, holding `submit`: it joins
     /// the FIFO for the board's thread, else, with no thread, runs here.
     fn write_command(&self, cpu: crate::locks::SpinGuard<'_, ()>, addr: u64, value: u64, size: u32) {
+        let counted = store_counted(&self.front);
         while self.fifo.running.load(std::sync::atomic::Ordering::SeqCst) {
             // The ring refuses a push that finds the last place taken between
             // the room check and the push: the board's thread owns the state,
             // so the store goes in behind it rather than around it.
-            if self.fifo.push(&self.front, addr, value, size) {
+            if self.fifo.push(&self.front, addr, value, size, counted) {
                 return;
             }
             std::thread::yield_now();
         }
         // SAFETY: no board thread is running.
-        unsafe { self.board(cpu) }.mmio_write(addr, value, size);
+        unsafe { self.board(cpu) }.mmio_write_counted(addr, value, size, counted);
     }
 
     /// A store to the board's state that is not a command store, holding
     /// `submit`.
     fn write_board(&self, cpu: crate::locks::SpinGuard<'_, ()>, addr: u64, value: u64, size: u32) {
+        let counted = store_counted(&self.front);
         // SAFETY: the waiting accesses have drained the FIFO, or the board's
         // thread is stopped.
-        unsafe { self.board(cpu) }.mmio_write(addr, value, size);
+        unsafe { self.board(cpu) }.mmio_write_counted(addr, value, size, counted);
     }
 
     /// A store for a caller other than the bus: through the front alone when it
@@ -551,7 +581,8 @@ impl BoardLocks {
     /// for a store that waits.
     pub fn write(&self, addr: u64, value: u64, size: u32) {
         if front_register(addr, size, true) {
-            front_mmio_write(&self.front, &self.fifo, addr, value, size);
+            let counted = store_counted(&self.front);
+            front_mmio_write(&self.front, &self.fifo, addr, value, size, counted);
             return;
         }
         let cpu = self.submit.lock();

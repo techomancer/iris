@@ -37,7 +37,7 @@ apply to BUZZ). Nothing models more than one raster unit.
 
 - **Command FIFO** (`fifo.rs`, CPU to `odyssey-work`): the processor's
   stores to the two command-FIFO ports and the context-switch stores, each
-  as (offset, size, value). The level the guest sees
+  as (offset, size, value) with its credit state. The level the guest sees
   is in words, against the model's 32,768.
 - **Raster queue** (`raster_unit.rs`, `odyssey-work` to `odyssey-raster`):
   jobs, each owning what its raster work reads, captured when the front
@@ -116,8 +116,8 @@ other, as MGRAS's producers take its `submit` lock (below).
   drawing. A processor access to a host-interface register does not take it.
 - **`HostInterface`** is behind the front lock, a register file's own
   lock held for a few instructions: identity, control, the interrupt bank,
-  the routing, the swap bank and the FIFO status, plus the interrupt state.
-  A front access (those registers) takes only it
+  the routing, the swap bank and the FIFO status, plus the interrupt state
+  and the credit return. A front access (those registers) takes only it
   and never waits for a draw. It is a leaf; the raster thread takes it for
   a fence's interrupt, and the display takes it to latch swaps.
 - **The raster unit's state** (`RasterCtx`: the stipple phase and the rows
@@ -197,15 +197,15 @@ the room check and the push, is refused, and its store retries the push behind t
 (`BoardLocks::write_command`), not around it. The ring is deeper than the board's FIFO, so a second producer's
 overshoot of the level by a store is absorbed. The consumer (the worker, or a draining access with the worker stopped) looks
 at up to 32 stores, runs them, and takes the ones it ran out together
-(`CommandFifo::take_run`, `retire`): the level and the store count
-move once a run, not once a store, because each store costs the
+(`CommandFifo::take_run`, `retire`): the level, the store count and the
+credits move once a run, not once a store, because each store costs the
 worker little and the processor reads those words. A store that has run but
 not retired still counts in the level, so the level never reads below what the
-board has left to take. A push counts its store (level, store count)
-before the ring shows it and takes the counts back off if the ring
+board has left to take. A push counts its store (level, store count, counted
+stores) before the ring shows it and takes the counts back off if the ring
 refuses it: the worker can take a store and retire it the instant it lands,
 before the push returns, and a retire must find every store it takes already
-counted or the level goes below zero.
+counted or the level goes below zero. While a counted store waits a run is one store.
 While the worker runs every command store queues, so decoding and drawing
 never run on the processor's thread.
 
@@ -224,6 +224,13 @@ succeed.
 A caller other than the bus, with the board's thread stopped, still runs
 the queue and then its store. The flow-control target word `+0x1074` is stored, not routed, so
 a store to it goes in at once even while the FIFO holds work.
+
+Counted stores (machines whose processor interface counts graphics credits;
+the Octane has none and the calls are no-ops) are credited as they enter the
+FIFO's first 16,384 places (the model's depth, a model choice), counted in
+stores: at the store when there is room,
+or when the stores ahead have run, with the node holding the credit as owed
+meanwhile.
 
 ## The FIFO ordering rules
 

@@ -923,6 +923,7 @@ impl Board {
         // established, so it is zero.
         let identity = self.identity();
         let mut f = self.front.lock();
+        f.slot = self.slot;
         f.identity = identity;
         f.widget_control = self.slot & ODSY_CONTROL_WIDGET_MASK;
         f.xt_req_timeout = ODSY_XT_REQ_TIMEOUT_RESET;
