@@ -107,6 +107,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   the same lock the CPU thread needed to arm it. It now sleeps 100 µs between
   attempts, which is still far below the timescales a disk command runs at.
   (`src/dev/wd33c93a.rs`)
+- **Newport's REX3 thread sleeps while the screen is idle.** `REX3-Processor`
+  yield-spun at ~100 % of a host core on an idle desktop in every build but
+  `idle-pause`; it now parks when its queue is empty, and the producer wakes
+  it on the next write. (`src/dev/ng1/rex3.rs`)
 
 ### Idle parking
 
