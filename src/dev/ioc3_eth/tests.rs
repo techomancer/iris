@@ -787,6 +787,29 @@ fn stopping_the_mac_joins_its_threads() {
     eth.start();
     assert_eq!(eth.threads.lock().len(), 2);
     let probe = Arc::downgrade(&eth);
+    let running = eth.running.clone();
     drop(eth);
+    // The receive thread holds a strong reference for the length of each
+    // poll, so it can be the one that releases the last reference. The
+    // device is gone a moment after the caller's drop, not at it.
+    assert!(waits_for(|| probe.upgrade().is_none()), "the device is freed");
+    assert!(waits_for(|| !running.load(Ordering::SeqCst)), "dropping stops it");
+}
+
+/// Dropping the caller's reference to a running device while another thread
+/// still holds one (the receive thread does for each poll) leaves the device
+/// alive and running; whoever releases the last reference stops it.
+#[test]
+fn the_last_reference_released_on_another_thread_stops_the_mac() {
+    let eth = Ioc3Eth::with_negotiation_delay(STATION, Duration::ZERO);
+    eth.start();
+    let probe = Arc::downgrade(&eth);
+    let running = eth.running.clone();
+    let held = eth.clone();
+    drop(eth);
+    assert!(probe.upgrade().is_some(), "kept alive by the other reference");
+    assert!(running.load(Ordering::SeqCst), "still running");
+    std::thread::spawn(move || drop(held)).join().unwrap();
     assert!(probe.upgrade().is_none());
+    assert!(!running.load(Ordering::SeqCst), "the last release stops it");
 }
