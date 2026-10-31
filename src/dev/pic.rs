@@ -199,6 +199,17 @@ struct Slot {
     options: Function,
 }
 
+/// When each BAR window was last put on the bus. PCI space is a set of
+/// overlapping mappings in which the one mapped most recently answers, so a
+/// window that is enabled or moved takes its range from whatever else decodes
+/// it.
+#[derive(Default)]
+struct Mappings {
+    counter: u64,
+    /// (device slot, space, BAR, base, size, mapping order)
+    table: Vec<(usize, Space, usize, u32, u32, u64)>,
+}
+
 /// A PCI cycle's responder: the slot and the offset within one of its BARs.
 struct Claim {
     function: Arc<dyn PciBusDevice>,
@@ -284,6 +295,7 @@ struct Head {
     order: Mutex<()>,
     slots: RwLock<[Option<Slot>; DEVICES as usize]>,
     pci_outputs: RwLock<[Option<IrqLine>; 32]>,
+    mappings: Mutex<Mappings>,
     unsupported: Mutex<Vec<(usize, bool, u64, usize)>>,
 }
 
@@ -343,6 +355,7 @@ impl Head {
             order: Mutex::new(()),
             slots: RwLock::new(std::array::from_fn(|_| None)),
             pci_outputs: RwLock::new(std::array::from_fn(|_| None)),
+            mappings: Mutex::new(Mappings::default()),
             unsupported: Mutex::new(Vec::new()),
         })
     }
@@ -722,6 +735,7 @@ impl Head {
         match value {
             Some(value) => {
                 function.config().write_masked(register / 4, (value as u32 & mask) << shift, mask << shift);
+                self.note_mappings();
                 0
             }
             None => ((function.config().read(register / 4) >> shift) & mask) as u64,
@@ -730,21 +744,53 @@ impl Head {
 
     // ---- PCI memory and I/O cycles ----
 
+    /// Record which BAR windows are new or moved since the last look, so a
+    /// later claim can tell the most recently mapped of two overlapping
+    /// windows. Called after every configuration write.
+    fn note_mappings(&self) {
+        let slots = self.slots.read();
+        let mut mapped = self.mappings.lock();
+        let mut counter = mapped.counter;
+        let mut table = Vec::new();
+        for (i, slot) in slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            for (space, bar, base, size) in slot.function.config().windows() {
+                let known = mapped.table.iter().find(|e| (e.0, e.1, e.2, e.3, e.4) == (i, space, bar, base, size));
+                let order = known.map_or_else(
+                    || {
+                        counter += 1;
+                        counter
+                    },
+                    |e| e.5,
+                );
+                table.push((i, space, bar, base, size, order));
+            }
+        }
+        mapped.counter = counter;
+        mapped.table = table;
+    }
+
     /// The function that decodes `len` bytes at `address` in `space`, whole
-    /// within one BAR.
+    /// within one BAR. Where windows overlap, the one mapped last answers.
     fn claim(&self, space: Space, address: u64, len: usize) -> Option<Claim> {
         let first = u32::try_from(address).ok()?;
         let last = u32::try_from(address.checked_add(len as u64)? - 1).ok()?;
-        self.slots.read().iter().flatten().find_map(|slot| {
-            let (bar, offset) = slot.function.config().decode(space, first)?;
-            let (end_bar, end) = slot.function.config().decode(space, last)?;
-            (end_bar == bar && end == offset + (len as u32 - 1)).then(|| Claim {
-                function: slot.function.clone(),
-                options: slot.options,
-                bar,
-                offset,
+        let slots = self.slots.read();
+        let mapped = self.mappings.lock();
+        let (_, slot, bar, base) = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| Some((i, slot.as_ref()?)))
+            .flat_map(|(i, slot)| {
+                slot.function.config().windows().into_iter().map(move |(space, bar, base, size)| (i, slot, space, bar, base, size))
             })
-        })
+            .filter(|&(_, _, s, _, base, size)| s == space && first >= base && (last as u64) < base as u64 + size as u64)
+            .map(|(i, slot, space, bar, base, size)| {
+                let order = mapped.table.iter().find(|e| (e.0, e.1, e.2, e.3, e.4) == (i, space, bar, base, size)).map_or(0, |e| e.5);
+                (order, slot, bar, base)
+            })
+            .max_by_key(|&(order, ..)| order)?;
+        Some(Claim { function: slot.function.clone(), options: slot.options, bar, offset: first - base })
     }
 
     /// Move `bytes` (little-endian PCI byte order, in address order) across
@@ -967,6 +1013,7 @@ impl Head {
     fn attach(self: &Arc<Self>, device: u8, function: Arc<dyn PciBusDevice>, options: Function) {
         assert!((1..=DEVICES).contains(&device), "PIC devices are 1 to {DEVICES}");
         self.slots.write()[device as usize - 1] = Some(Slot { function: function.clone(), options });
+        self.note_mappings();
         function.connect_dma(Arc::new(SlotDma { head: Arc::downgrade(self), device }));
         let pin = function.config().interrupt_pin();
         if (1..=4).contains(&pin) {
@@ -992,6 +1039,7 @@ impl Head {
         for slot in self.slots.read().iter().flatten() {
             slot.function.config().reset();
         }
+        self.mappings.lock().table.clear();
         self.unsupported.lock().clear();
     }
 }

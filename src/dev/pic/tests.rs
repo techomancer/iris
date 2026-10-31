@@ -2,6 +2,7 @@
 // the Tezro runtime profile only: identity-fields, runtime-identity-bit,
 // heads-and-widths, runtime-reset-compatibility-trial, widget-registers,
 // cpu-word-view-registers, runtime-host-error-field,
+// cpu-pio-overlapping-bars-use-active-function,
 // runtime-dir-map-unsupported-fields, configuration, slot-bounds,
 // runtime-profile-reserved-device-and-dma, type1-configuration,
 // cpu-pio-conventional-lanes, cpu-pio-actual-ioc4,
@@ -883,4 +884,37 @@ fn two_pics_are_independent_devices() {
     let card = Card::new(1);
     a.attach(0, 1, card.clone(), Function::default());
     assert_eq!(bus_b.read32(config(0, 1)).data, u32::MAX);
+}
+
+/// Two functions that decode the same range: the window mapped last answers,
+/// and the other answers again when it goes away.
+/// (cpu-pio-overlapping-bars-use-active-function)
+#[test]
+fn overlapping_bars_go_to_the_function_mapped_last() {
+    let r = rig();
+    let first = Card::new(0x8001);
+    let second = Card::new(0x8002);
+    r.fit(0, 1, &first, Function::default());
+    r.fit(0, 2, &second, Function::default());
+    let at = window(0, 0x10);
+    r.w32(at, 0x40);
+    assert_eq!(le_value(&second.bar.lock()[0x10..0x14]), 0x40, "device 2 was mapped after device 1");
+    assert_eq!(le_value(&first.bar.lock()[0x10..0x14]), 0);
+    // Moving the first window away and back maps it again, now last.
+    r.w32(config(0, 1) + 0x10, 0x0200_0000);
+    r.w32(config(0, 1) + 0x10, BAR_BASE);
+    r.w32(at, 0x20);
+    assert_eq!(le_value(&first.bar.lock()[0x10..0x14]), 0x20);
+    assert_eq!(le_value(&second.bar.lock()[0x10..0x14]), 0x40);
+    assert_eq!(r.r32(at), 0x20);
+    // Switching the winner off leaves the other one.
+    r.w32(config(0, 1) + 4, 0);
+    assert_eq!(r.r32(at), 0x40);
+    // A configuration write that changes nothing about a window does not
+    // remap it.
+    r.w32(config(0, 2) + 0x3c, 0x0102);
+    r.w32(config(0, 1) + 4, MEMORY_AND_MASTER);
+    assert_eq!(r.r32(at), 0x20, "enabling device 1 again maps it last");
+    r.w32(config(0, 2) + 0x3c, 0x0103);
+    assert_eq!(r.r32(at), 0x20);
 }
