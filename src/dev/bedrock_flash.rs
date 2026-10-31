@@ -49,6 +49,22 @@ pub struct FirmwareRecord {
     pub cpu_clock_hz: u32,
     /// The record's machine type field.
     pub machine_type: u32,
+    /// How the record reaches the configuration block.
+    pub header: Header,
+}
+
+/// How a board's record is put into the configuration block at 0x60.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Header {
+    /// Rewrite the board's fields over the payload's own block, keeping its
+    /// byte sum, whenever a store is formatted or opened. QEMU configures a
+    /// Fuel's flash this way.
+    Refreshed,
+    /// Replace the whole block with the one authored for the board's flash
+    /// seed, once, when a store is formatted. An opened store keeps the block
+    /// it holds, as QEMU leaves the header of a supplied IP53 flash image
+    /// alone, so a flash update the PROM wrote survives.
+    Authored { checksum_adjustment: u8 },
 }
 
 impl FirmwareRecord {
@@ -58,25 +74,81 @@ impl FirmwareRecord {
         reset_mode: 0x009a_a985,
         cpu_clock_hz: 500_000_000,
         machine_type: 2,
+        header: Header::Refreshed,
     };
-    /// The Tezro's 700 MHz R16000 with a 4 MiB secondary cache.
+    /// The Tezro's 700 MHz R16000 with a 4 MiB secondary cache, as the
+    /// Tezro flash profile for PROM 6.210 records it.
     pub const TEZRO: Self = Self {
         cpu_mode_word: 0x549b_ad85,
         reset_mode: 0x009b_ad85,
         cpu_clock_hz: 700_000_000,
         machine_type: 0,
+        header: Header::Authored { checksum_adjustment: 0xde },
     };
     /// CP0 Config at reset: the fixed 32 KiB primary cache sizes (fields 3
     /// in bits 31:29 and 28:26) with the board's mode bits.
     pub const fn reset_config0(&self) -> u32 {
         (3 << 29) | (3 << 26) | (self.reset_mode & 0x01ff_ffff)
     }
+
+    /// The configuration block written into an IP53 seed: the format word,
+    /// the board's mode word, the `ip27conf` magic, the processor and
+    /// 200 MHz controller clocks as 64-bit words, the fixed 1,250,000 word,
+    /// 16-cycle flash read and write timing, the machine type, the check
+    /// adjustment, a program count of one and the PROM's 6.210 version.
+    /// Only that profile defines these fields; their PROM meaning beyond that
+    /// is not established here.
+    fn authored_block(&self, checksum_adjustment: u8) -> [u8; CONFIG_LEN] {
+        let mut block = [0u8; CONFIG_LEN];
+        let mut put = |offset: usize, bytes: &[u8]| block[offset..offset + bytes.len()].copy_from_slice(bytes);
+        put(0x00, &21u32.to_be_bytes());
+        put(0x04, &self.cpu_mode_word.to_be_bytes());
+        put(0x08, b"ip27conf");
+        put(0x10, &u64::from(self.cpu_clock_hz).to_be_bytes());
+        put(0x18, &200_000_000u64.to_be_bytes());
+        put(0x20, &1_250_000u64.to_be_bytes());
+        for (offset, value) in [
+            (0x28, 1),
+            (0x2c, 16),
+            (0x30, self.machine_type),
+            (0x34, u32::from(checksum_adjustment)),
+            (0x38, 1),
+            (0x3c, 16),
+            (0x40, 6),
+            (0x44, 210),
+            (0x48, 0),
+        ] {
+            put(offset, &u32::to_be_bytes(value));
+        }
+        block
+    }
+}
+
+/// Where the PROM's configuration block sits in the payload, and its size.
+const CONFIG_BASE: usize = 0x60;
+const CONFIG_LEN: usize = 0x50;
+
+/// Put the board's record into a store being formatted.
+fn format_header(data: &mut [u8], record: &FirmwareRecord) {
+    match record.header {
+        Header::Refreshed => configure(data, record),
+        Header::Authored { checksum_adjustment } => {
+            data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN].copy_from_slice(&record.authored_block(checksum_adjustment));
+        }
+    }
+}
+
+/// Put the board's record into a store that was opened rather than formatted.
+fn reopen_header(data: &mut [u8], record: &FirmwareRecord) {
+    match record.header {
+        Header::Refreshed => configure(data, record),
+        Header::Authored { .. } => {}
+    }
 }
 
 /// Apply the board's firmware record while retaining the configuration sum.
-/// This policy also applies when reopening an existing persistent store.
 fn configure(data: &mut [u8], record: &FirmwareRecord) {
-    let config = &mut data[0x60..0xb0];
+    let config = &mut data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN];
     let old = sum(config);
     config[0x34..0x38].fill(0);
     config[4..8].copy_from_slice(&record.cpu_mode_word.to_be_bytes());
@@ -168,7 +240,7 @@ impl Flash {
         data[label + 0x10..label + 0x14].copy_from_slice(&0x504c4f49u32.to_be_bytes());
         data[label + 0x14..label + 0x18].copy_from_slice(&1u32.to_be_bytes());
         data[label + 0x18..label + 0x1c].copy_from_slice(&1u32.to_be_bytes());
-        configure(&mut data, &record);
+        format_header(&mut data, &record);
         Ok(Self {
             st: Mutex::new(State::new(data)),
             gen: AtomicU64::new(0),
@@ -176,7 +248,8 @@ impl Flash {
     }
 
     /// Load an exact 16 MiB store, or seed a missing/empty one. Wrong sizes are
-    /// refused without writes. Reopening reapplies the board's firmware record.
+    /// refused without writes. Reopening reapplies a refreshed firmware record
+    /// and leaves an authored one as the store holds it.
     /// Completed guest programming and erasure write through to this file.
     pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
         let mut data = Self::new(payload, record)?.st.into_inner().data;
@@ -190,9 +263,9 @@ impl Flash {
                 error
             }
         })?;
-        configure(&mut data, &record);
-        // Opening an existing store loads it before the board's configuration
-        // fields are refreshed; an empty store was seeded from this same data.
+        reopen_header(&mut data, &record);
+        // Opening an existing store loads it before a refreshed record's
+        // fields are applied; an empty store was seeded from this same data.
         backing.write_range(0, &data)?;
         let flash = Self {
             st: Mutex::new(State {
@@ -451,34 +524,54 @@ mod tests {
         image
     }
 
-    /// Whichever board configures the block, its byte sum is unchanged: the
-    /// check adjustment absorbs the difference. Follows test_ip35_configure in
-    /// tests/unit/test-sgi-initial-flash.c, which pins 0x9b for the Fuel; the
-    /// Tezro's 0xde is the same rule applied to its mode word, clock and
-    /// machine type.
+    /// A refreshed record leaves the block's byte sum unchanged: the check
+    /// adjustment absorbs the difference. Follows test_ip35_configure in
+    /// tests/unit/test-sgi-initial-flash.c, which pins 0x9b for the Fuel.
     #[test]
-    fn each_board_configures_the_block_and_keeps_its_byte_sum() {
-        for (record, adjustment) in [(FirmwareRecord::FUEL, 0x9b), (FirmwareRecord::TEZRO, 0xde)] {
-            let image = factory_block();
-            let bytes = Flash::new(&image, record).unwrap().contents();
-            let block = &bytes[0x60..0xb0];
-            assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes());
-            assert_eq!(&block[0x14..0x18], &record.cpu_clock_hz.to_be_bytes());
-            assert_eq!(&block[0x30..0x34], &record.machine_type.to_be_bytes());
-            assert_eq!(&block[0x38..0x3c], &1u32.to_be_bytes(), "flash program count");
-            assert_eq!(&block[0x34..0x38], &[0, 0, 0, adjustment]);
-            assert_eq!(sum(block), sum(&image[0x60..0xb0]));
+    fn a_refreshed_record_configures_the_block_and_keeps_its_byte_sum() {
+        let record = FirmwareRecord::FUEL;
+        let image = factory_block();
+        let bytes = Flash::new(&image, record).unwrap().contents();
+        let block = &bytes[0x60..0xb0];
+        assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes());
+        assert_eq!(&block[0x14..0x18], &record.cpu_clock_hz.to_be_bytes());
+        assert_eq!(&block[0x30..0x34], &record.machine_type.to_be_bytes());
+        assert_eq!(&block[0x38..0x3c], &1u32.to_be_bytes(), "flash program count");
+        assert_eq!(&block[0x34..0x38], &[0, 0, 0, 0x9b]);
+        assert_eq!(sum(block), sum(&image[0x60..0xb0]));
+    }
+
+    /// The Tezro's block is the one the Tezro seed profile writes, byte for
+    /// byte, whatever block the payload carried.
+    #[test]
+    fn the_tezro_seed_writes_its_authored_block() {
+        const AUTHORED_BLOCK: &str = concat!(
+            "00000015549bad8569703237636f6e66",
+            "0000000029b92700000000000bebc200",
+            "00000000001312d00000000100000010",
+            "00000000000000de0000000100000010",
+            "00000006000000d20000000000000000",
+        );
+        let expected: Vec<u8> = (0..AUTHORED_BLOCK.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&AUTHORED_BLOCK[i..i + 2], 16).unwrap())
+            .collect();
+        for payload in [factory_block(), vec![0x5a; 0x200]] {
+            let bytes = Flash::new(&payload, FirmwareRecord::TEZRO).unwrap().contents();
+            assert_eq!(&bytes[0x60..0xb0], expected.as_slice());
+            assert_eq!(&bytes[..0x60], &payload[..0x60], "the payload around the block is untouched");
+            assert_eq!(&bytes[0xb0..payload.len()], &payload[0xb0..]);
         }
     }
 
-    /// The Tezro's record is the QEMU Tezro profile's firmware configuration,
-    /// and the Config the CPU resets to carries the same mode bits, so the
-    /// PROM's check of one against the other passes.
+    /// The Tezro's record carries the QEMU Tezro profile's firmware
+    /// configuration, and the Config the CPU resets to carries the same mode
+    /// bits, so the PROM's check of one against the other passes.
     #[test]
     fn the_tezro_record_carries_its_700_mhz_mode_and_the_config_it_implies() {
         let bytes = Flash::new(&factory_block(), FirmwareRecord::TEZRO).unwrap().contents();
         assert_eq!(&bytes[0x64..0x68], &0x549bad85u32.to_be_bytes());
-        assert_eq!(&bytes[0x74..0x78], &700_000_000u32.to_be_bytes());
+        assert_eq!(&bytes[0x70..0x78], &700_000_000u64.to_be_bytes());
         assert_eq!(&bytes[0x90..0x94], &0u32.to_be_bytes(), "machine type 0");
         assert_eq!(FirmwareRecord::TEZRO.reset_config0(), 0x6c9b_ad85);
         assert_eq!(FirmwareRecord::FUEL.reset_config0(), 0x6c9a_a985, "the Fuel's value is unchanged");
@@ -488,17 +581,27 @@ mod tests {
         assert_eq!((FirmwareRecord::FUEL.reset_config0() >> 16) & 7, 2);
     }
 
-    /// Reopening a stored image reapplies the board's record, so an image last
-    /// used by another board follows the machine that opens it.
+    /// Reopening a store reapplies a refreshed record, so a Fuel follows the
+    /// machine that opens it, and leaves an authored block as stored, so a
+    /// block the PROM rewrote on a Tezro survives the next start.
     #[test]
-    fn reopening_a_store_applies_the_record_of_the_board_that_opens_it() {
+    fn reopening_refreshes_the_fuels_record_and_keeps_a_tezros_stored_block() {
         let dir = std::env::temp_dir().join(format!("bedrock-flash-record-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("flash.bin");
-        drop(Flash::with_file(&factory_block(), &path, FirmwareRecord::FUEL).unwrap());
-        let tezro = Flash::with_file(&[], &path, FirmwareRecord::TEZRO).unwrap().contents();
-        assert_eq!(&tezro[0x64..0x68], &0x549bad85u32.to_be_bytes());
-        assert_eq!(sum(&tezro[0x60..0xb0]), sum(&factory_block()[0x60..0xb0]));
+        let fuel_path = dir.join("fuel.bin");
+        drop(Flash::with_file(&factory_block(), &fuel_path, FirmwareRecord::TEZRO).unwrap());
+        let fuel = Flash::with_file(&[], &fuel_path, FirmwareRecord::FUEL).unwrap().contents();
+        assert_eq!(&fuel[0x64..0x68], &0x549aa985u32.to_be_bytes());
+        assert_eq!(&fuel[0x90..0x94], &2u32.to_be_bytes());
+
+        let tezro_path = dir.join("tezro.bin");
+        let seeded = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
+        assert_eq!(std::fs::read(&tezro_path).unwrap(), seeded, "the seed is what the store holds");
+        let mut stored = seeded.clone();
+        stored[0x64..0x68].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        std::fs::write(&tezro_path, &stored).unwrap();
+        let reopened = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
+        assert_eq!(reopened, stored);
         std::fs::remove_dir_all(&dir).unwrap();
     }
     /// The PROM programs through one view while executable aliases must
