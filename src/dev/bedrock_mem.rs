@@ -66,14 +66,15 @@ impl BankSize {
 /// depends on its processors; see [`Self::check_for_cpus`].
 ///
 /// The bank sizes and the minimums come from the Tezro manuals as the QEMU
-/// assembly layer records them. The default layout is inferred: the manuals'
-/// rules allow other 1 GiB layouts (a single 1024 MiB bank, for one), and the
-/// two banks of 512 MiB are the pair the 4 GiB kit also uses at those places.
+/// assembly layer records them. The default is the 4 GiB layout of 1024, 1024
+/// and four 512 MiB banks, a population a real Tezro has been observed to hold.
+/// Its banks 4 and 5 lie above 4 GiB, outside ppmem's direct window, so they
+/// answer through Physical's decode table, which is slower.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPopulation(Vec<BankSize>);
 impl Default for MemoryPopulation {
     fn default() -> Self {
-        Self::gib1()
+        Self::four_gib()
     }
 }
 impl MemoryPopulation {
@@ -88,14 +89,16 @@ impl MemoryPopulation {
         let sizes = banks.iter().map(|&mib| BankSize::from_mib(mib)).collect::<Result<Vec<_>, _>>()?;
         Self::new(&sizes)
     }
-    /// 1 GiB: banks 0 and 1 of 512 MiB. Everything lies below 4 GiB, inside
-    /// ppmem's direct window, and it meets the minimum for any processor count.
-    pub fn gib1() -> Self {
+    /// 1 GiB as two banks of 512 MiB. The manual's minimum of 1 GB for two or
+    /// four processors permits it, but no real Tezro has been observed with
+    /// less than 4 GiB, and nothing here claims the PROM or IRIX boot at it. All
+    /// of it lies below 4 GiB, so it is wholly inside ppmem's direct window.
+    pub fn one_gib() -> Self {
         Self(vec![BankSize::Mib512; 2])
     }
-    /// 4 GiB: 1024, 1024 and four of 512 MiB. Banks 4 and 5 sit above 4 GiB,
-    /// outside the direct window.
-    pub fn gib4() -> Self {
+    /// 4 GiB: 1024, 1024 and four 512 MiB banks, the default. Banks 4 and 5
+    /// sit above 4 GiB, outside the direct window.
+    pub fn four_gib() -> Self {
         let mut banks = vec![BankSize::Mib1024; 2];
         banks.extend([BankSize::Mib512; 4]);
         Self(banks)
@@ -480,15 +483,15 @@ mod tests {
     use super::*;
 
     /// A Tezro takes 512 and 1024 MiB DIMMs, one per bank, none left out
-    /// between, eight at most. The 4 GiB layout and the 1 GiB default are
-    /// both there, and the default's banks all lie below 4 GiB.
+    /// between, eight at most. The 4 GiB layout is the default and the 1 GiB
+    /// one is still constructible.
     #[test]
     fn only_512_and_1024_mib_banks_are_accepted() {
-        assert_eq!(MemoryPopulation::default(), MemoryPopulation::gib1());
-        assert_eq!(MemoryPopulation::gib1().banks_mib(), [512, 512]);
-        assert_eq!(MemoryPopulation::gib4().banks_mib(), [1024, 1024, 512, 512, 512, 512]);
-        assert_eq!(MemoryPopulation::gib4(), MemoryPopulation::from_mib(&[1024, 1024, 512, 512, 512, 512]).unwrap());
-        assert_eq!((MemoryPopulation::gib1().total_mib(), MemoryPopulation::gib4().total_mib()), (1024, 4096));
+        assert_eq!(MemoryPopulation::default(), MemoryPopulation::four_gib());
+        assert_eq!(MemoryPopulation::one_gib().banks_mib(), [512, 512]);
+        assert_eq!(MemoryPopulation::four_gib().banks_mib(), [1024, 1024, 512, 512, 512, 512]);
+        assert_eq!(MemoryPopulation::four_gib(), MemoryPopulation::from_mib(&[1024, 1024, 512, 512, 512, 512]).unwrap());
+        assert_eq!((MemoryPopulation::one_gib().total_mib(), MemoryPopulation::four_gib().total_mib()), (1024, 4096));
         for bad in [&[][..], &[256], &[2048], &[512, 0], &[768, 512], &[512; 9]] {
             assert!(MemoryPopulation::from_mib(bad).is_err(), "{bad:?}");
         }
@@ -496,12 +499,12 @@ mod tests {
         assert!(MemoryPopulation::new(&[]).is_err());
     }
 
-    /// The default keeps the whole population inside ppmem's 4 GiB window, so
-    /// the default boot never uses the decode-table path; the 4 GiB layout does
-    /// not, and both are accepted by the memory model.
+    /// The 1 GiB population lies wholly inside ppmem's 4 GiB window; the 4 GiB
+    /// default does not, since its banks 4 and 5 are above it. The memory model
+    /// accepts both.
     #[test]
     fn the_default_fits_the_direct_window_and_the_4_gib_layout_does_not() {
-        for (population, direct) in [(MemoryPopulation::gib1(), true), (MemoryPopulation::gib4(), false)] {
+        for (population, direct) in [(MemoryPopulation::one_gib(), true), (MemoryPopulation::four_gib(), false)] {
             assert_eq!(population.fits_direct_window(), direct);
             let end = |bank: usize| bank as u64 * BANK_SPAN + u64::from(population.banks()[bank].mib()) * (1 << 20);
             let last = population.banks().len() - 1;
@@ -520,13 +523,13 @@ mod tests {
             let error = half.check_for_cpus(cpus).unwrap_err();
             assert!(error.contains("1024"), "{error}");
         }
-        for population in [MemoryPopulation::gib1(), MemoryPopulation::gib4()] {
+        for population in [MemoryPopulation::one_gib(), MemoryPopulation::four_gib()] {
             for cpus in [1, 2, 4] {
                 assert!(population.check_for_cpus(cpus).is_ok());
             }
         }
-        assert!(MemoryPopulation::gib1().check_for_cpus(0).is_err());
-        assert!(MemoryPopulation::gib1().check_for_cpus(5).is_err());
+        assert!(MemoryPopulation::one_gib().check_for_cpus(0).is_err());
+        assert!(MemoryPopulation::one_gib().check_for_cpus(5).is_err());
         // A single 1024 MiB bank meets the two-processor minimum too.
         assert!(MemoryPopulation::from_mib(&[1024]).unwrap().check_for_cpus(4).is_ok());
     }

@@ -1345,12 +1345,15 @@ mod tests {
         assert_eq!(bus.read64(BANK_SPAN).data, 0xaa);
     }
 
-    /// The default 1 GiB population is wholly inside ppmem's direct window: all
-    /// 16 of its 64 MiB regions are mapped, with none left to the decode table.
+    /// A 1 GiB population is wholly inside ppmem's direct window: all 16 of its
+    /// 64 MiB regions are mapped, with none left to the decode table. The 4 GiB
+    /// default maps only what is below 4 GiB, and its banks 4 and 5 answer
+    /// through the table.
     #[test]
-    fn the_default_tezro_memory_is_entirely_directly_mapped() {
+    fn a_1_gib_population_is_directly_mapped_and_the_default_4_gib_one_is_not_wholly() {
+        use super::super::bedrock_mem::MemoryPopulation;
         use crate::ppmem::MappedMemory;
-        let md = BedrockMd::new(&super::super::bedrock_mem::MemoryPopulation::default().banks_mib()).unwrap();
+        let md = BedrockMd::new(&MemoryPopulation::one_gib().banks_mib()).unwrap();
         md.md_bus().write64(reg::CONFIG, 0x43 | (0x43 << 8));
         let bus = md.physical();
         let space = bus.ppmem_space().expect("a window");
@@ -1358,6 +1361,13 @@ mod tests {
         assert_eq!(bus.write64(BANK_SPAN + (512 << 20) - 8, 7), BUS_OK);
         assert_eq!(bus.read64(BANK_SPAN + (512 << 20) - 8).data, 7);
         assert_eq!(bus.read64(512 << 20).status, BUS_ERR, "bank 0 ends at 512 MiB");
+
+        let md = BedrockMd::new(&MemoryPopulation::default().banks_mib()).unwrap();
+        assert_eq!(MemoryPopulation::default(), MemoryPopulation::four_gib());
+        md.md_bus().write64(reg::CONFIG, TEZRO_CONFIG);
+        let space = md.physical().ppmem_space().expect("a window");
+        assert!(!crate::ppmem::bitmap_maps(space.mapped_bitmap(), 4 * BANK_SPAN));
+        assert_eq!(md.physical().write64(4 * BANK_SPAN, 9), BUS_OK, "still reachable");
     }
 
     /// Directory and ECC state is keyed per bank, so banks of different sizes
