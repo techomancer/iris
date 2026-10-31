@@ -18,7 +18,11 @@
 //! PHY ([`phy`]); the station address the bootcode leaves in SRAM and in
 //! address filter slot 0; the interrupt mailbox, the MISC_CTL global mask and
 //! PCISTATE.INTR_NOT_ACTIVE; the buffer manager's delayed enable; and the
-//! serial EEPROM controller over a caller-supplied backing ([`eeprom`]).
+//! serial EEPROM controller over a caller-supplied backing ([`eeprom`]); the
+//! send ring and its doorbell, the standard, jumbo and return receive rings,
+//! the status block DMA, host coalescing, the interrupt it drives, the
+//! transmit checksum offload and segmentation, and the receive checksum
+//! report ([`dma`]).
 //!
 //! # What is approximated
 //!
@@ -35,10 +39,17 @@
 //!   byte of the window value; the model it is ported from returns the raw
 //!   header byte.
 //! - The BCM5704 dual-port variants are not modelled.
+//! - Frames reach the host through the shared network link; the chip's
+//!   virtio-net offload path has no counterpart, so a large TCP buffer is
+//!   always cut into segments in software.
+//! - A transmit is carried out entirely inside the doorbell write, so there
+//!   is no re-entrancy guard and no deferred flush: the receive thread offers
+//!   a waiting frame again whenever the guest makes room.
 //!
 //! Ported from hw/net/bcm570x.c and hw/net/bcm570x_phy.c in
 //! jamesbraid/qemu-sgi-origami.
 
+mod dma;
 pub mod eeprom;
 pub mod phy;
 mod state;
@@ -46,14 +57,17 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
 use crate::irq::IrqLine;
-use crate::pci::{Bar, PciBusDevice, PciConfig, PciConfigHook, PciConfigPolicy, PciRegisterPolicy, PCI_INTA};
+use crate::pci::{Bar, PciBusDevice, PciConfig, PciConfigHook, PciConfigPolicy, PciDma, PciRegisterPolicy, PCI_INTA};
+use crate::traits::{Device, Resettable};
 use eeprom::Eeprom;
+pub use dma::{DmaWhat, Mailbox, Ring, RxOutcome, MAX_FRAME, RX_ARRIVAL_LATENCY_DEFAULT};
 pub use state::Refused;
 use state::{cfg, misc_ctl, pcistate, State};
 
@@ -74,6 +88,15 @@ const CFG_ALIAS: u32 = 0x100;
 pub struct Bcm5701Config {
     pub mac: [u8; 6],
     pub eeprom: Option<Eeprom>,
+    /// The minimum between a frame arriving and the driver being told, so a
+    /// completion never beats the arrival it reports. Zero publishes at once.
+    pub rx_arrival_latency: Duration,
+}
+
+impl Bcm5701Config {
+    pub fn new(mac: [u8; 6]) -> Self {
+        Self { mac, eeprom: None, rx_arrival_latency: RX_ARRIVAL_LATENCY_DEFAULT }
+    }
 }
 
 pub struct Bcm5701 {
@@ -82,6 +105,18 @@ pub struct Bcm5701 {
     irq: Mutex<IrqLine>,
     /// Serialises delivery of level changes to the interrupt line.
     irq_order: Mutex<()>,
+    link: Mutex<Option<crate::net::Rings>>,
+    rx_wake: Mutex<Option<Arc<crate::net::Wake>>>,
+    /// Between `start` and `stop`; the NAT engine watches it too.
+    running: Arc<AtomicBool>,
+    /// The flag the network backend watches, set and cleared with `running`.
+    net_running: Mutex<Option<Arc<AtomicBool>>>,
+    /// The network backend, between runs. A NAT engine keeps its flows across
+    /// a stop.
+    backend: Arc<Mutex<Option<Box<dyn crate::net::NetBackend>>>>,
+    /// The NAT and receive threads, joined in `stop`.
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    me: Weak<Self>,
     /// Tests freeze the clock to step it exactly.
     #[cfg(test)]
     frozen: Mutex<Option<Instant>>,
@@ -164,11 +199,18 @@ impl Bcm5701 {
         ));
         pci.set_subsystem_identity(u32::from(SUBSYSTEM_ID) << 16 | u32::from(SUBSYSTEM_VENDOR_ID));
         let now = Instant::now();
-        let dev = Arc::new(Self {
-            st: Mutex::new(State::new(pci.clone(), config.mac, config.eeprom, now)),
+        let dev = Arc::new_cyclic(|me| Self {
+            st: Mutex::new(State::new(pci.clone(), config.mac, config.eeprom, config.rx_arrival_latency, now)),
             config: pci,
             irq: Mutex::new(IrqLine::unconnected()),
             irq_order: Mutex::new(()),
+            link: Mutex::new(None),
+            rx_wake: Mutex::new(None),
+            running: Arc::new(AtomicBool::new(false)),
+            net_running: Mutex::new(None),
+            backend: Arc::new(Mutex::new(None)),
+            threads: Mutex::new(Vec::new()),
+            me: me.clone(),
             #[cfg(test)]
             frozen: Mutex::new(None),
         });
@@ -184,15 +226,21 @@ impl Bcm5701 {
         Instant::now()
     }
 
-    /// Run `f` with the state at `now`, then deliver any interrupt level it
-    /// changed.
+    /// Run `f` with the state at `now`, then deliver what it produced: any
+    /// interrupt level it changed, frames to send, and a wake-up for the
+    /// receive thread if the guest made room.
     fn enter<R>(&self, now: Instant, f: impl FnOnce(&mut State) -> R) -> R {
-        let result = {
+        let (result, wire, wake) = {
             let mut st = self.st.lock();
             st.enter(now);
-            f(&mut st)
+            let result = f(&mut st);
+            (result, std::mem::take(&mut st.wire), std::mem::take(&mut st.wake_rx))
         };
         self.irq_flush();
+        self.send(wire);
+        if wake {
+            self.wake_rx();
+        }
         result
     }
 
@@ -234,6 +282,109 @@ impl Bcm5701 {
         self.enter(self.now(), |st| st.phy.set_link_down(!up));
     }
 
+    fn send(&self, frames: Vec<Vec<u8>>) {
+        if frames.is_empty() {
+            return;
+        }
+        if let Some(link) = self.link.lock().as_mut() {
+            for frame in frames {
+                let _ = link.to_net.push(frame);
+            }
+            link.tx_wake.notify();
+        }
+    }
+
+    fn wake_rx(&self) {
+        if let Some(wake) = self.rx_wake.lock().as_ref() {
+            wake.notify();
+        }
+    }
+
+    /// Connect to the backend `[network]` selected: frames sent go on
+    /// `link.to_net`, frames on `link.from_net` are received, and
+    /// `link.rx_wake` is notified when the guest does something that can
+    /// unblock a waiting frame. The backend and receive threads run between
+    /// `start` and `stop`; a NAT engine, which only trades frames with the
+    /// host and never reaches the guest, keeps its flows across a stop.
+    pub fn attach(&self, mut link: crate::net::Link) {
+        let backend = link.backend();
+        let running = link.running();
+        let rings = link.into_rings();
+        *self.rx_wake.lock() = Some(rings.rx_wake.clone());
+        *self.link.lock() = Some(rings);
+        *self.net_running.lock() = Some(running.clone());
+        *self.backend.lock() = backend;
+        if self.running.load(Ordering::SeqCst) {
+            running.store(true, Ordering::SeqCst);
+            self.spawn_nat();
+        }
+    }
+
+    fn spawn_nat(&self) {
+        let slot = self.backend.clone();
+        let Some(mut engine) = slot.lock().take() else { return };
+        let t = std::thread::Builder::new()
+            .name("bcm5701-net".into())
+            .spawn(move || {
+                engine.run();
+                *slot.lock() = Some(engine);
+            })
+            .expect("bcm5701 NAT thread");
+        self.threads.lock().push(t);
+    }
+
+    /// Take frames into guest memory as they arrive and as the guest makes
+    /// room, and run the device's timers, until it stops. The wait ends early
+    /// for a wake from the guest or the NAT engine.
+    fn rx_loop(me: Weak<Self>, running: Arc<AtomicBool>, wake: Arc<crate::net::Wake>) {
+        while running.load(Ordering::SeqCst) {
+            let timeout = {
+                let Some(this) = me.upgrade() else { return };
+                let now = this.now();
+                this.enter(now, |_| ());
+                let next = this.st.lock().deadline();
+                next.and_then(|d| d.checked_duration_since(now)).unwrap_or(RX_IDLE)
+            };
+            wake.wait(timeout);
+            if !running.load(Ordering::SeqCst) {
+                return;
+            }
+            let Some(this) = me.upgrade() else { return };
+            this.poll();
+        }
+    }
+
+    /// Take frames from the backend into the buffers the driver has posted.
+    /// A frame the engine cannot take yet stays at the head of the backend's
+    /// queue until the guest makes room; one the filter rejects is discarded.
+    /// Returns whether any frame was consumed.
+    ///
+    /// The link is held only to take one frame at a time, so a transmit on the
+    /// CPU thread never waits behind a burst of deliveries.
+    pub fn poll(&self) -> bool {
+        let mut moved = false;
+        loop {
+            let now = self.now();
+            {
+                let mut link = self.link.lock();
+                let Some(link) = link.as_mut() else { break };
+                let outcome = {
+                    let Ok(frame) = link.from_net.peek() else { break };
+                    let mut st = self.st.lock();
+                    st.enter(now);
+                    st.receive(frame)
+                };
+                if outcome == RxOutcome::Deferred {
+                    break;
+                }
+                let _ = link.from_net.pop();
+                moved = true;
+            }
+            self.irq_flush();
+        }
+        moved
+    }
+
     /// Everything the model was asked for and could not do, with counts.
     pub fn refused(&self) -> Vec<(Refused, u64)> {
         self.st.lock().refused()
@@ -249,6 +400,7 @@ impl Bcm5701 {
     pub fn register_locks(self: &Arc<Self>) {
         for (what, probe) in [
             ("st", (|d: &Bcm5701| d.st.is_locked()) as fn(&Bcm5701) -> bool),
+            ("link", |d| d.link.is_locked()),
             ("irq_order", |d| d.irq_order.is_locked()),
         ] {
             let me = Arc::downgrade(self);
@@ -318,10 +470,87 @@ impl PciBusDevice for Bcm5701 {
         });
     }
 
+    fn connect_dma(&self, dma: Arc<dyn PciDma>) {
+        self.st.lock().dma = dma;
+        self.wake_rx();
+    }
+
     fn connect_interrupt(&self, line: IrqLine) {
         *self.irq.lock() = line;
         // Present the current level to the new line.
         self.st.lock().update_irq(true);
         self.irq_flush();
+    }
+}
+
+/// How long the receive thread sleeps with no deadline to wait for: it is
+/// woken by the guest and the NAT engine, so this is only a bound.
+const RX_IDLE: Duration = Duration::from_secs(60);
+
+impl Device for Bcm5701 {
+    fn step(&self, _cycles: u64) {}
+
+    /// Start the receive thread, and the NAT engine's if one is attached.
+    fn start(&self) {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let wake = self.rx_wake.lock().get_or_insert_with(crate::net::Wake::new).clone();
+        let (me, running) = (self.me.clone(), self.running.clone());
+        let rx = std::thread::Builder::new()
+            .name("bcm5701-rx".into())
+            .spawn(move || Self::rx_loop(me, running, wake))
+            .expect("bcm5701 rx thread");
+        self.threads.lock().push(rx);
+        if let Some(r) = self.net_running.lock().as_ref() {
+            r.store(true, Ordering::SeqCst);
+        }
+        self.spawn_nat();
+        // Frames queued while stopped.
+        self.wake_rx();
+    }
+
+    /// Join the threads: no frame reaches guest memory and no line moves
+    /// afterwards. Frames the NAT engine takes meanwhile queue for `start`.
+    fn stop(&self) {
+        if !self.running.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(r) = self.net_running.lock().as_ref() {
+            r.store(false, Ordering::SeqCst);
+        }
+        self.wake_rx();
+        if let Some(l) = self.link.lock().as_ref() {
+            l.tx_wake.notify();
+        }
+        // The receive thread can hold the last reference for a moment, and
+        // then this runs on it; it cannot join itself.
+        let me = std::thread::current().id();
+        let threads: Vec<_> = self.threads.lock().drain(..).collect();
+        for t in threads {
+            if t.thread().id() != me {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    fn get_clock(&self) -> u64 {
+        0
+    }
+}
+
+impl Resettable for Bcm5701 {
+    fn power_on(&self) {
+        self.reset();
+    }
+}
+
+impl Drop for Bcm5701 {
+    fn drop(&mut self) {
+        Device::stop(&*self);
     }
 }

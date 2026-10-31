@@ -9,6 +9,7 @@ use super::phy::{reg as phy_reg, IDR1_VALUE, IDR2_BCM5701};
 use super::state::{reg, Refused, FW_MAGIC, SRAM_FW_MBOX};
 use super::*;
 use crate::irq::LevelProbe;
+use crate::pci::PciDmaStatus;
 use std::time::Duration;
 
 const SRAM_WINDOW: u32 = 0x8000;
@@ -32,14 +33,65 @@ const EEPROM_COMPLETE: u32 = 1 << 30;
 const EEPROM_RESET: u32 = 1 << 29;
 const EEPROM_START: u32 = 1 << 25;
 
+const MEM_SIZE: usize = 0x90_0000;
+const TX_RING: u64 = 0x20_0000;
+const TX_BUF: u64 = 0x21_0000;
+const STATUS: u64 = 0x22_0000;
+const STD_RING: u64 = 0x23_0000;
+const RET_RING: u64 = 0x24_0000;
+const RX_BUF: u64 = 0x25_0000;
+const JUMBO_RING: u64 = 0x26_0000;
+const JUMBO_BUF: u64 = 0x27_0000;
+const STD_STALE_BUF: u64 = 0x28_0000;
+/// Past the memory: nothing backs it.
+const UNMAPPED: u64 = 0x400_0000;
+const TX_RING_LEN: u32 = 4;
+const RX_RING_LEN: u32 = 4;
+const STD_BUF_SIZE: u32 = 1536;
+const JUMBO_BUF_SIZE: u32 = 9216;
+const STATUS_BLK_SIZE: usize = 0x50;
+const ARRIVAL: Duration = Duration::from_micros(200);
+/// Every DMA swap control set: the chip's image goes on the bus as it is.
+const MODE_ALL_SWAPS: u32 = 0x36;
+
+/// Bus-master memory with no bridge in front of it.
+struct Mem(std::sync::Mutex<Vec<u8>>);
+
+impl PciDma for Mem {
+    fn dma_read(&self, addr: u64, buf: &mut [u8]) -> PciDmaStatus {
+        let m = self.0.lock().unwrap();
+        let a = addr as usize;
+        if a.saturating_add(buf.len()) > m.len() {
+            buf.fill(0);
+            return PciDmaStatus::MasterAbort;
+        }
+        buf.copy_from_slice(&m[a..a + buf.len()]);
+        PciDmaStatus::Ok
+    }
+    fn dma_write(&self, addr: u64, data: &[u8]) -> PciDmaStatus {
+        let mut m = self.0.lock().unwrap();
+        let a = addr as usize;
+        if a.saturating_add(data.len()) > m.len() {
+            return PciDmaStatus::MasterAbort;
+        }
+        m[a..a + data.len()].copy_from_slice(data);
+        PciDmaStatus::Ok
+    }
+}
+
 struct Rig {
     dev: Arc<Bcm5701>,
     irq: Arc<LevelProbe>,
+    mem: Arc<Mem>,
+    /// Frames the guest sent, and a way to hand frames to the guest.
+    sent: rtrb::Consumer<Vec<u8>>,
+    inject: rtrb::Producer<Vec<u8>>,
+    ring_slots: usize,
 }
 
 impl Rig {
     fn new() -> Self {
-        Self::with(Bcm5701Config { mac: MAC, eeprom: None })
+        Self::with(Bcm5701Config::new(MAC))
     }
 
     fn with(config: Bcm5701Config) -> Self {
@@ -47,13 +99,64 @@ impl Rig {
         *dev.frozen.lock() = Some(Instant::now());
         let (irq, line) = LevelProbe::line();
         dev.connect_interrupt(line);
+        let mem = Arc::new(Mem(std::sync::Mutex::new(vec![0; MEM_SIZE])));
+        dev.connect_dma(mem.clone());
+        let (link, sent, inject) = crate::net::Link::loopback();
+        dev.attach(link);
         dev.reset();
-        Self { dev, irq }
+        let ring_slots = inject.slots();
+        Self { dev, irq, mem, sent, inject, ring_slots }
     }
 
+    /// Advance the clock and run whatever came due.
     fn step(&self, by: Duration) {
-        let mut t = self.dev.frozen.lock();
-        *t = Some(t.unwrap() + by);
+        {
+            let mut t = self.dev.frozen.lock();
+            *t = Some(t.unwrap() + by);
+        }
+        self.dev.enter(self.dev.now(), |_| ());
+    }
+
+    fn mem_write(&self, addr: u64, data: &[u8]) {
+        let mut m = self.mem.0.lock().unwrap();
+        m[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+    }
+    fn mem_read(&self, addr: u64, len: usize) -> Vec<u8> {
+        self.mem.0.lock().unwrap()[addr as usize..addr as usize + len].to_vec()
+    }
+    fn mem_fill(&self, addr: u64, len: usize, byte: u8) {
+        self.mem.0.lock().unwrap()[addr as usize..addr as usize + len].fill(byte);
+    }
+    fn status_block(&self) -> Vec<u8> {
+        self.mem_read(STATUS, STATUS_BLK_SIZE)
+    }
+    fn status_tag(&self) -> u32 {
+        be32(&self.status_block(), 4)
+    }
+    fn status_tx_cons(&self) -> u16 {
+        get16dma(&self.status_block(), 18)
+    }
+    fn status_rx_prod(&self) -> u16 {
+        get16dma(&self.status_block(), 16)
+    }
+    fn line_up(&self) -> bool {
+        self.cfg_read(0x70 / 4) & 2 == 0
+    }
+    fn nic_no_more_rxbds(&self) -> u32 {
+        self.readl(SRAM_WINDOW + 0x898)
+    }
+    /// The frames the guest has sent so far.
+    fn sent_frames(&mut self) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| self.sent.pop().ok()).collect()
+    }
+    /// Frames handed to the guest that it has not yet taken.
+    fn waiting(&self) -> usize {
+        self.ring_slots - self.inject.slots()
+    }
+    /// Offer a frame to the receive path, as the backend would.
+    fn deliver(&mut self, frame: &[u8]) {
+        self.inject.push(frame.to_vec()).unwrap();
+        self.dev.poll();
     }
 
     fn readl(&self, off: u32) -> u32 {
@@ -103,6 +206,10 @@ impl Rig {
     }
     fn sram_word(&self, off: u32) -> u32 {
         self.dev.st.lock().sram_read(off)
+    }
+    fn split_addr(&self, hi_reg: u32, lo_reg: u32, addr: u64) {
+        self.writel(hi_reg, (addr >> 32) as u32);
+        self.writel(lo_reg, addr as u32);
     }
     fn refusals(&self, what: Refused) -> u64 {
         self.dev.refused().iter().find(|(r, _)| *r == what).map_or(0, |(_, n)| *n)
@@ -520,7 +627,7 @@ fn pcistate_and_the_interrupt_mailbox_start_quiet() {
 }
 
 fn eeprom_rig(image: &[u8], device_id: u8) -> Rig {
-    Rig::with(Bcm5701Config { mac: MAC, eeprom: Some(Eeprom::from_image(device_id, image.to_vec()).unwrap()) })
+    Rig::with(Bcm5701Config { eeprom: Some(Eeprom::from_image(device_id, image.to_vec()).unwrap()), ..Bcm5701Config::new(MAC) })
 }
 
 /// Ported from test_eeprom_bar_read_write: Start cannot replace an
@@ -530,7 +637,7 @@ fn eeprom_rig(image: &[u8], device_id: u8) -> Rig {
 #[test]
 fn the_eeprom_controller_reads_and_writes_aligned_words() {
     let path = temp_file("bar-rw", &[0x66, 0x99, 0x55, 0xaa, 0x12, 0x34, 0x56, 0x78]);
-    let rig = Rig::with(Bcm5701Config { mac: MAC, eeprom: Some(Eeprom::from_file(3, path.clone()).unwrap()) });
+    let rig = Rig::with(Bcm5701Config { eeprom: Some(Eeprom::from_file(3, path.clone()).unwrap()), ..Bcm5701Config::new(MAC) });
     let done = |rig: &Rig| rig.readl(reg::EEPROM_ADDR) & (EEPROM_COMPLETE | EEPROM_START);
 
     rig.writel(reg::EEPROM_ADDR, EEPROM_READ | EEPROM_START | 3 << 26);
@@ -610,7 +717,7 @@ fn a_read_only_eeprom_refuses_writes() {
     let mut eeprom = Eeprom::from_image(3, vec![0x66, 0x99, 0x55, 0xaa]).unwrap();
     eeprom.set_read_only(true);
     assert!(eeprom.is_read_only());
-    let rig = Rig::with(Bcm5701Config { mac: MAC, eeprom: Some(eeprom) });
+    let rig = Rig::with(Bcm5701Config { eeprom: Some(eeprom), ..Bcm5701Config::new(MAC) });
     rig.writel(reg::EEPROM_DATA, 0x1234_5678);
     rig.writel(reg::EEPROM_ADDR, EEPROM_START | 3 << 26);
     assert_eq!(rig.readl(reg::EEPROM_DATA), 0x1234_5678);
@@ -655,7 +762,7 @@ fn eeprom_backings_are_validated() {
     assert!(Eeprom::from_image(3, vec![]).is_err());
     assert!(Eeprom::from_image(3, vec![0; 65540]).is_err());
     assert!(Eeprom::from_image(8, vec![0; 4]).unwrap_err().contains("0..=7"));
-    assert!(Bcm5701::new(Bcm5701Config { mac: [1, 0, 0, 0, 0, 0], eeprom: None }).is_err());
+    assert!(Bcm5701::new(Bcm5701Config::new([1, 0, 0, 0, 0, 0])).is_err());
 }
 
 /// Direct serial-pin control is unsupported and observable, not faked.
@@ -665,4 +772,1067 @@ fn direct_eeprom_pin_control_is_refused() {
     rig.writel(reg::EEPROM_PIN, 0x15);
     assert_eq!(rig.readl(reg::EEPROM_PIN), 0x15);
     assert_eq!(rig.refusals(Refused::EepromPins), 1);
+}
+
+// ---- the descriptor engines ----
+
+fn be32(b: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
+}
+fn put32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+/// A 16-bit descriptor field sits in the other half of its word, big-endian.
+fn put16dma(b: &mut [u8], off: usize, v: u16) {
+    b[off ^ 2..(off ^ 2) + 2].copy_from_slice(&v.to_be_bytes());
+}
+fn get16dma(b: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([b[off ^ 2], b[(off ^ 2) + 1]])
+}
+
+fn tx_bd(buf: u64, len: u16, flags: u16, mss: u16) -> [u8; 16] {
+    let mut bd = [0; 16];
+    put32(&mut bd, 0, (buf >> 32) as u32);
+    put32(&mut bd, 4, buf as u32);
+    put16dma(&mut bd, 8, flags);
+    put16dma(&mut bd, 10, len);
+    put16dma(&mut bd, 14, mss);
+    bd
+}
+
+const TXF_TCP_UDP_CKSUM: u16 = 1;
+const TXF_IP_CKSUM: u16 = 2;
+const TXF_END: u16 = 4;
+const TXF_INSERT_SRC: u16 = 0x1000;
+const TXF_CHOOSE_SRC: fn(u16) -> u16 = |n| n << 13;
+
+fn rx_bd(buf: u64, buf_len: u16) -> [u8; 32] {
+    let mut bd = [0; 32];
+    put32(&mut bd, 0, (buf >> 32) as u32);
+    put32(&mut bd, 4, buf as u32);
+    put16dma(&mut bd, 8, buf_len);
+    bd
+}
+
+impl Rig {
+    /// Send ring in memory, status block address, coalescing and the MAC on,
+    /// the way a driver brings the transmit side up.
+    fn tx_open(&self, ring_len: u32, coal_bds: u32, coal_ticks: u32) {
+        self.ind_reg_write(reg::MODE_CTL, MODE_ALL_SWAPS);
+        self.ind_mem_write(0x100, 0);
+        self.ind_mem_write(0x104, TX_RING as u32);
+        self.ind_mem_write(0x108, ring_len << 16);
+        self.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, STATUS);
+        self.writel(reg::HCC_TX_MAX_COAL_BDS, coal_bds);
+        self.writel(reg::HCC_TX_COAL_TICKS, coal_ticks);
+        self.writel(reg::HCC_MODE, HCC_ENABLE);
+        self.writel(reg::RX_MODE, RXMODE_ENABLE);
+    }
+
+    fn tx_post(&self, slot: u64, bd: [u8; 16]) {
+        self.mem_write(TX_RING + slot * 16, &bd);
+    }
+
+    /// One whole frame in one descriptor at `slot`, then its doorbell.
+    fn tx_send_one(&self, slot: u64, frame: &[u8], flags: u16) {
+        let buf = TX_BUF + slot * 0x800;
+        self.mem_write(buf, frame);
+        self.tx_post(slot, tx_bd(buf, frame.len() as u16, flags | TXF_END, 0));
+        self.writel(reg::MBX_TX_PROD_LO, slot as u32 + 1);
+    }
+
+    /// Receive side up: standard ring of `STD_BUF_SIZE` buffers, a return
+    /// ring of `ret_len`, one completion per update.
+    fn rx_open(&self, ret_len: u32, coal_bds: u32, coal_ticks: u32) {
+        self.ind_reg_write(reg::MODE_CTL, MODE_ALL_SWAPS);
+        self.split_addr(reg::RX_STD_RCB_HADDR_HI, reg::RX_STD_RCB_HADDR_LO, STD_RING);
+        self.writel(reg::RX_STD_RCB_MAXLEN_FLAGS, STD_BUF_SIZE << 16);
+        self.ind_mem_write(0x200, 0);
+        self.ind_mem_write(0x204, RET_RING as u32);
+        self.ind_mem_write(0x208, ret_len << 16);
+        self.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, STATUS);
+        self.writel(reg::HCC_RX_MAX_COAL_BDS, coal_bds);
+        self.writel(reg::HCC_RX_COAL_TICKS, coal_ticks);
+        self.writel(reg::HCC_MODE, HCC_ENABLE);
+        self.writel(reg::RX_MODE, RXMODE_ENABLE);
+        self.writel(reg::MBX_IRQ0_LO, 0);
+    }
+
+    /// Post `count` standard buffers, all at `RX_BUF`.
+    fn rx_post_std(&self, count: u32) {
+        for i in 0..u64::from(count) {
+            self.mem_write(STD_RING + i * 32, &rx_bd(RX_BUF, 0));
+        }
+        self.writel(reg::MBX_RX_STD_PROD_LO, count);
+    }
+
+    fn rx_open_jumbo(&self) {
+        self.split_addr(reg::RX_JUMBO_RCB_HADDR_HI, reg::RX_JUMBO_RCB_HADDR_LO, JUMBO_RING);
+        self.writel(reg::RX_JUMBO_RCB_MAXLEN_FLAGS, JUMBO_BUF_SIZE << 16);
+        self.mem_write(JUMBO_RING, &rx_bd(JUMBO_BUF, JUMBO_BUF_SIZE as u16));
+        self.writel(reg::MBX_RX_JUMBO_PROD_LO, 1);
+    }
+
+    fn return_descriptor(&self, slot: u64) -> Vec<u8> {
+        self.mem_read(RET_RING + slot * 32, 32)
+    }
+}
+
+fn broadcast(len: usize, seed: u8) -> Vec<u8> {
+    let mut f: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(seed).wrapping_add(1)).collect();
+    f[..6].fill(0xff);
+    f
+}
+
+/// A doorbell posts the status block with UPDATED set, big-endian, once the
+/// coalescing block is enabled; disabled it posts nothing and the line stays
+/// down. Ported from test_status_block_byte_order and
+/// test_status_block_gated_by_hcc.
+#[test]
+fn the_status_block_is_posted_only_while_host_coalescing_is_enabled() {
+    let rig = Rig::new();
+    rig.ind_mem_write(0x108, TX_RING_LEN << 16);
+    rig.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, STATUS);
+    rig.ind_reg_write(reg::MODE_CTL, MODE_ALL_SWAPS);
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert_eq!(be32(&rig.status_block(), 0), 0);
+    assert!(!rig.line_up());
+
+    rig.writel(reg::HCC_MODE, HCC_ENABLE);
+    rig.writel(reg::RX_MODE, RXMODE_ENABLE);
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert_eq!(rig.status_block()[..4], [0, 0, 0, 1]);
+    assert!(rig.line_up());
+    assert!(rig.irq.level());
+}
+
+/// The driver word-swaps its 64-bit host addresses for the big-endian host;
+/// the chip swaps them back. Ported from test_status_block_hostaddr_wordswap.
+#[test]
+fn host_addresses_honour_the_word_swap_control() {
+    let intended = 0x80_0000u64;
+    let rig = Rig::new();
+    rig.ind_mem_write(0x108, TX_RING_LEN << 16);
+    rig.ind_reg_write(reg::MODE_CTL, MODE_ALL_SWAPS);
+    rig.cfg_write(0x68 / 4, rig.cfg_read(0x68 / 4) | 8);
+    // Word-swapped: the low word in ADDR_HI, the high word in ADDR_LO.
+    rig.writel(reg::HCC_STATUSBLK_ADDR_HI, intended as u32);
+    rig.writel(reg::HCC_STATUSBLK_ADDR_LO, (intended >> 32) as u32);
+    rig.writel(reg::HCC_MODE, HCC_ENABLE);
+    rig.writel(reg::RX_MODE, RXMODE_ENABLE);
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert_eq!(be32(&rig.mem_read(intended, STATUS_BLK_SIZE), 0), 1);
+}
+
+/// Ported from test_transmit_round_trip: the descriptor and its buffer are
+/// read, the frame reaches the backend byte for byte, and the status block
+/// reports the consumer advanced, in the chip's image order.
+#[test]
+fn a_transmitted_frame_reaches_the_backend_and_the_status_block_follows() {
+    let mut rig = Rig::new();
+    let frame: Vec<u8> = (0..60u8).map(|i| i.wrapping_mul(7).wrapping_add(1)).collect();
+    rig.tx_open(TX_RING_LEN, 1, 0);
+    rig.tx_send_one(0, &frame, 0);
+    assert_eq!(rig.sent_frames(), [frame]);
+    let sb = rig.status_block();
+    assert_eq!(be32(&sb, 0), 1);
+    assert_eq!(get16dma(&sb, 18), 1);
+    // A consumer of 1 at the field's offset xor 2, big-endian.
+    assert_eq!(sb[16..18], [0, 1]);
+}
+
+/// With no swap controls the chip's image reaches the bus permuted within each
+/// doubleword; the frame still arrives intact. Derived from the lane rule the
+/// model documents (PG105 Tables 102-109), not a port.
+#[test]
+fn the_swap_controls_permute_the_bytes_within_each_doubleword() {
+    for (mode, xor) in [(0u32, 7usize), (0x10, 4), (0x20, 3), (0x30, 0)] {
+        let mut rig = Rig::new();
+        rig.tx_open(TX_RING_LEN, 1, 0);
+        rig.ind_reg_write(reg::MODE_CTL, mode);
+        let frame: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(5) ^ 0x21).collect();
+        let lanes = |bytes: &[u8], xor: usize| {
+            let mut out = vec![0; bytes.len()];
+            for (i, b) in bytes.iter().enumerate() {
+                out[(i & !7) + ((i & 7) ^ xor)] = *b;
+            }
+            out
+        };
+        // Descriptors take the non-frame controls, which are off here.
+        rig.mem_write(TX_RING, &lanes(&tx_bd(TX_BUF, 64, TXF_END, 0), 7));
+        rig.mem_write(TX_BUF, &lanes(&frame, xor));
+        rig.writel(reg::MBX_TX_PROD_LO, 1);
+        assert_eq!(rig.sent_frames(), [frame], "frame-data control {mode:#x}");
+        // The status block is written through the same non-frame lanes.
+        let sb = lanes(&rig.status_block(), 7);
+        assert_eq!(be32(&sb, 0), 1);
+    }
+}
+
+/// A transmit descriptor that cannot be read leaves the ring where it was and
+/// the doorbell is retried later. Ported from test_transmit_descriptor_dma_error.
+#[test]
+fn an_unreadable_send_ring_leaves_the_frame_for_a_retry() {
+    let mut rig = Rig::new();
+    let frame: Vec<u8> = (0..60u8).map(|i| i.wrapping_mul(7).wrapping_add(1)).collect();
+    rig.tx_open(TX_RING_LEN, 0, 0);
+    rig.ind_mem_write(0x100, (UNMAPPED >> 32) as u32);
+    rig.ind_mem_write(0x104, UNMAPPED as u32);
+    rig.writel(reg::MBX_TX_PROD_LO, 1);
+    assert!(rig.sent_frames().is_empty());
+    assert_eq!(rig.status_tag(), 0);
+    assert_eq!(rig.refusals(Refused::DmaFault(DmaWhat::TxDescriptor)), 1);
+
+    rig.ind_mem_write(0x104, TX_RING as u32);
+    rig.mem_write(TX_BUF, &frame);
+    rig.tx_post(0, tx_bd(TX_BUF, 60, TXF_END, 0));
+    rig.writel(reg::MBX_TX_PROD_LO, 1);
+    assert_eq!(rig.sent_frames(), [frame]);
+}
+
+/// A later fragment's unreadable payload rolls the whole frame back, and an
+/// earlier completed frame stays completed. Ported from
+/// test_transmit_payload_dma_error and test_transmit_complete_then_fragment_dma_error_retry.
+#[test]
+fn an_unreadable_fragment_rolls_back_to_the_start_of_its_frame() {
+    let mut rig = Rig::new();
+    let first: Vec<u8> = (0..60u8).map(|i| i + 1).collect();
+    let second: Vec<u8> = (0..60u8).map(|i| i + 100).collect();
+    rig.tx_open(8, 1, 0);
+    rig.mem_write(TX_BUF, &first);
+    rig.tx_post(0, tx_bd(TX_BUF, 60, TXF_END, 0));
+    rig.mem_write(TX_BUF + 0x100, &second[..28]);
+    rig.tx_post(1, tx_bd(TX_BUF + 0x100, 28, 0, 0));
+    rig.tx_post(2, tx_bd(UNMAPPED, 32, TXF_END, 0));
+    rig.writel(reg::MBX_TX_PROD_LO, 3);
+    // The first frame went and is reported; the second waits.
+    assert_eq!(rig.sent_frames(), [first]);
+    assert_eq!(rig.status_tx_cons(), 1);
+    assert_eq!(rig.refusals(Refused::DmaFault(DmaWhat::TxPayload)), 1);
+
+    rig.mem_write(TX_BUF + 0x200, &second[28..]);
+    rig.tx_post(2, tx_bd(TX_BUF + 0x200, 32, TXF_END, 0));
+    rig.writel(reg::MBX_TX_PROD_LO, 3);
+    assert_eq!(rig.sent_frames(), [second]);
+    assert_eq!(rig.status_tx_cons(), 3);
+}
+
+/// Ported from test_tx_producer_out_of_range: an index past the ring is
+/// refused, observably, and nothing is walked.
+#[test]
+fn a_transmit_producer_past_the_ring_is_refused() {
+    let rig = Rig::new();
+    rig.ind_mem_write(0x108, TX_RING_LEN << 16);
+    rig.writel(reg::MBX_TX_PROD_LO, TX_RING_LEN);
+    rig.writel(reg::MBX_TX_PROD_LO, 0xffff);
+    assert_eq!(rig.refusals(Refused::ProducerOutOfRange(Mailbox::TxProducer)), 2);
+    assert_eq!(rig.mii_read(PHY_ADDR, phy_reg::IDR1), IDR1_VALUE);
+}
+
+/// Ported from test_transmit_zero_length_descriptor: nothing goes out, the
+/// descriptor still completes.
+#[test]
+fn a_zero_length_descriptor_completes_without_a_frame() {
+    let mut rig = Rig::new();
+    rig.tx_open(TX_RING_LEN, 1, 0);
+    rig.tx_post(0, tx_bd(TX_BUF, 0, TXF_END, 0));
+    rig.writel(reg::MBX_TX_PROD_LO, 1);
+    assert_eq!(be32(&rig.status_block(), 0), 1);
+    assert_eq!(rig.status_tx_cons(), 1);
+    assert!(rig.sent_frames().is_empty());
+}
+
+/// Ported from test_transmit_source_address: the descriptor picks one of four
+/// filter slots to replace the frame's source, only when it asks to.
+#[test]
+fn a_descriptor_can_replace_the_source_address_from_a_filter_slot() {
+    let mut rig = Rig::new();
+    rig.tx_open(8, 0, 0);
+    let slots = [(0x210u32, 0x2030_4050u32), (0x211, 0x2131_4151), (0x212, 0x2232_4252), (0x213, 0x2333_4353)];
+    for (i, (hi, lo)) in slots.iter().enumerate() {
+        rig.writel(reg::MAC_ADDR_0_HIGH + i as u32 * reg::MAC_ADDR_STRIDE, *hi);
+        rig.writel(reg::MAC_ADDR_0_LOW + i as u32 * reg::MAC_ADDR_STRIDE, *lo);
+    }
+    let frame: Vec<u8> = (0..60u8).map(|i| 0x80 + i).collect();
+    let with_source = |slot: usize| {
+        let mut f = frame.clone();
+        f[6..8].copy_from_slice(&(slots[slot].0 as u16).to_be_bytes());
+        f[8..12].copy_from_slice(&slots[slot].1.to_be_bytes());
+        f
+    };
+    for (i, selector) in [2u16, 0, 3, 1].into_iter().enumerate() {
+        rig.tx_send_one(i as u64, &frame, TXF_INSERT_SRC | TXF_CHOOSE_SRC(selector));
+        assert_eq!(rig.sent_frames(), [with_source(usize::from(selector))]);
+    }
+    // A selector without INSERT leaves the frame untouched.
+    rig.tx_send_one(4, &frame, TXF_CHOOSE_SRC(3));
+    assert_eq!(rig.sent_frames(), std::slice::from_ref(&frame));
+    // Split after the first source bytes: both fragments carry the flags.
+    rig.mem_write(TX_BUF + 5 * 0x800, &frame[..8]);
+    rig.mem_write(TX_BUF + 6 * 0x800, &frame[8..]);
+    let flags = TXF_INSERT_SRC | TXF_CHOOSE_SRC(2);
+    rig.tx_post(5, tx_bd(TX_BUF + 5 * 0x800, 8, flags, 0));
+    rig.tx_post(6, tx_bd(TX_BUF + 6 * 0x800, 52, flags | TXF_END, 0));
+    rig.writel(reg::MBX_TX_PROD_LO, 7);
+    assert_eq!(rig.sent_frames(), [with_source(2)]);
+}
+
+fn lso_frame(payload: usize) -> Vec<u8> {
+    let mut f = vec![0u8; 54 + payload];
+    f[..14].copy_from_slice(&[0x52, 0x54, 0, 0x11, 0x22, 0x33, 0x52, 0x54, 0, 0xbc, 0x57, 1, 8, 0]);
+    f[14] = 0x45;
+    f[16..18].copy_from_slice(&((40 + payload) as u16).to_be_bytes());
+    f[18..20].copy_from_slice(&0x1234u16.to_be_bytes());
+    f[22] = 64;
+    f[23] = 6;
+    f[26..30].copy_from_slice(&[10, 0, 2, 15]);
+    f[30..34].copy_from_slice(&[10, 0, 2, 2]);
+    f[34..36].copy_from_slice(&0x3039u16.to_be_bytes());
+    f[36..38].copy_from_slice(&0x0017u16.to_be_bytes());
+    f[38..42].copy_from_slice(&0x1000u32.to_be_bytes());
+    f[46] = 0x50;
+    f[47] = 0x19;
+    f[48..50].copy_from_slice(&0x2000u16.to_be_bytes());
+    for (i, b) in f[54..].iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    f
+}
+
+fn inet_sum(buf: &[u8], seed: u32) -> u16 {
+    let mut sum = seed;
+    for pair in buf.chunks(2) {
+        sum += u32::from(pair[0]) << 8 | u32::from(*pair.get(1).unwrap_or(&0));
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn tcp_pseudo(frame: &[u8], tcp_len: usize) -> u32 {
+    frame[26..34].chunks(2).map(|p| u32::from(p[0]) << 8 | u32::from(p[1])).sum::<u32>() + 6 + tcp_len as u32
+}
+
+/// Ported from test_transmit_segmentation: one buffer of three segments goes
+/// out as three frames with their own headers, sequence numbers, identifiers
+/// and checksums, and the finishing flags only on the last.
+#[test]
+fn an_oversized_tcp_buffer_is_cut_into_segments() {
+    const MSS: usize = 512;
+    let mut rig = Rig::new();
+    let frame = lso_frame(MSS * 3);
+    rig.tx_open(TX_RING_LEN, 0, 0);
+    rig.mem_write(TX_BUF, &frame);
+    rig.tx_post(0, tx_bd(TX_BUF, frame.len() as u16, 0x7000 | TXF_END, MSS as u16));
+    rig.writel(reg::MBX_TX_PROD_LO, 1);
+    let sent = rig.sent_frames();
+    assert_eq!(sent.len(), 3);
+    for (i, got) in sent.iter().enumerate() {
+        let mut expected = frame[..54].to_vec();
+        expected.extend_from_slice(&frame[54 + i * MSS..54 + (i + 1) * MSS]);
+        expected[16..18].copy_from_slice(&((40 + MSS) as u16).to_be_bytes());
+        expected[18..20].copy_from_slice(&(0x1234 + i as u16).to_be_bytes());
+        expected[38..42].copy_from_slice(&(0x1000 + (i * MSS) as u32).to_be_bytes());
+        if i < 2 {
+            expected[47] &= !0x09;
+        }
+        expected[24..26].fill(0);
+        expected[50..52].fill(0);
+        let ip = inet_sum(&expected[14..34], 0);
+        expected[24..26].copy_from_slice(&ip.to_be_bytes());
+        let tcp = inet_sum(&expected[34..], tcp_pseudo(&expected, 20 + MSS));
+        expected[50..52].copy_from_slice(&tcp.to_be_bytes());
+        assert_eq!(got, &expected, "segment {i}");
+    }
+}
+
+/// A frame no larger than one segment, or one that is not plain IPv4 TCP, is
+/// sent whole. Ported from test_transmit_no_segmentation.
+#[test]
+fn a_frame_that_needs_no_segmentation_is_sent_whole() {
+    let mut rig = Rig::new();
+    rig.tx_open(TX_RING_LEN, 0, 0);
+    let small = lso_frame(100);
+    rig.mem_write(TX_BUF, &small);
+    rig.tx_post(0, tx_bd(TX_BUF, small.len() as u16, TXF_END, 512));
+    rig.writel(reg::MBX_TX_PROD_LO, 1);
+    assert_eq!(rig.sent_frames(), [small]);
+}
+
+fn cksum_frame(ihl_byte: u8) -> Vec<u8> {
+    let mut f = vec![0u8; 62];
+    f[..14].copy_from_slice(&[0x52, 0x54, 0, 0x11, 0x22, 0x33, 0x52, 0x54, 0, 0xbc, 0x57, 1, 8, 0]);
+    f[14] = ihl_byte;
+    f[17] = 48;
+    f[22] = 64;
+    f[23] = 6;
+    f[26..30].copy_from_slice(&[10, 0, 2, 15]);
+    f[30..34].copy_from_slice(&[10, 0, 2, 2]);
+    f[34..36].copy_from_slice(&[0x30, 0x39]);
+    f[37] = 0x17;
+    f[46] = 0x50;
+    f[47] = 0x02;
+    f[48] = 0x20;
+    for (i, b) in f.iter_mut().enumerate().skip(54) {
+        *b = i as u8;
+    }
+    f
+}
+
+/// Ported from test_transmit_checksum_offload: a driver that leaves the
+/// checksum fields for the card gets them filled.
+#[test]
+fn the_card_fills_in_the_checksums_the_driver_asked_for() {
+    let mut rig = Rig::new();
+    let frame = cksum_frame(0x45);
+    rig.tx_open(TX_RING_LEN, 0, 0);
+    rig.tx_send_one(0, &frame, TXF_IP_CKSUM | TXF_TCP_UDP_CKSUM);
+    let got = rig.sent_frames().remove(0);
+    let ip = inet_sum(&frame[14..34], 0);
+    let tcp = inet_sum(&frame[34..], tcp_pseudo(&frame, 28));
+    assert_eq!(u16::from_be_bytes([got[24], got[25]]), ip);
+    assert_eq!(u16::from_be_bytes([got[50], got[51]]), tcp);
+    assert_ne!(ip, 0);
+    assert_ne!(tcp, 0);
+    assert_eq!(got[..24], frame[..24]);
+}
+
+/// A header the offload cannot trust is declined, not walked. Ported from
+/// test_transmit_checksum_bad_header.
+#[test]
+fn a_checksum_offload_on_a_malformed_header_is_declined() {
+    let mut rig = Rig::new();
+    let frame = cksum_frame(0x44);
+    rig.tx_open(TX_RING_LEN, 0, 0);
+    rig.tx_send_one(0, &frame, TXF_IP_CKSUM | TXF_TCP_UDP_CKSUM);
+    assert_eq!(rig.sent_frames(), [frame]);
+}
+
+/// One update per group of descriptors, the tick budget reporting a short
+/// group, a zero budget never doing so. Ported from test_transmit_coalescing,
+/// test_transmit_coalescing_timer and test_transmit_coalescing_zero_ticks.
+#[test]
+fn transmit_updates_follow_the_count_and_the_tick_budget() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 3);
+    rig.tx_open(64, 4, 0x1000_0000);
+    for i in 0..8 {
+        rig.tx_send_one(i, &frame, 0);
+    }
+    assert_eq!(rig.sent_frames().len(), 8);
+    // Eight frames in groups of four are two updates, not eight.
+    assert_eq!(rig.status_tag(), 2);
+
+    // A short group waits for the budget.
+    let rig = Rig::new();
+    rig.tx_open(64, 8, 50);
+    for i in 0..3 {
+        rig.tx_send_one(i, &frame, 0);
+    }
+    assert_eq!(rig.status_tag(), 0);
+    rig.step(Duration::from_micros(49));
+    assert_eq!(rig.status_tag(), 0);
+    rig.step(Duration::from_micros(1));
+    assert_eq!(rig.status_tag(), 1);
+    assert_eq!(rig.status_tx_cons(), 3);
+
+    // Zero disables the timer: only the count reports.
+    let mut rig = Rig::new();
+    rig.tx_open(64, 2, 0);
+    rig.tx_send_one(0, &frame, 0);
+    rig.step(Duration::from_secs(1));
+    assert_eq!(rig.status_tag(), 0);
+    rig.tx_send_one(1, &frame, 0);
+    assert_eq!(rig.status_tag(), 1);
+    assert_eq!(rig.status_tx_cons(), 2);
+    assert_eq!(rig.sent_frames().len(), 2);
+}
+
+/// Empty and dropped frames still complete every descriptor they consume.
+/// Ported from test_transmit_coalescing_empty_and_dropped.
+#[test]
+fn empty_and_oversize_frames_still_complete_their_descriptors() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 5);
+    rig.tx_open(64, 4, 0x1000_0000);
+    rig.mem_write(TX_BUF, &frame);
+    rig.mem_fill(TX_BUF + 0x1000, 9600, 0xa5);
+    rig.tx_post(0, tx_bd(TX_BUF, 64, TXF_END, 0));
+    rig.tx_post(1, tx_bd(0, 0, TXF_END, 0));
+    rig.tx_post(2, tx_bd(TX_BUF + 0x1000, 9600, 0, 0));
+    rig.tx_post(3, tx_bd(TX_BUF + 0x4000, 1, TXF_END, 0));
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    rig.writel(reg::MBX_TX_PROD_LO, 4);
+    // Only the first is a frame: the oversize pair is dropped whole.
+    assert_eq!(rig.sent_frames(), [frame]);
+    assert_eq!(rig.status_tx_cons(), 4);
+    assert_eq!(rig.status_tag(), 1);
+    assert!(rig.line_up());
+    assert_eq!(rig.refusals(Refused::TxFrameTooLarge), 1);
+}
+
+/// A doorbell that ends inside a frame leaves every fragment to retry; a
+/// completed frame earlier is not rolled back. Ported from
+/// test_transmit_split_doorbell and test_transmit_complete_then_split_doorbell.
+#[test]
+fn a_doorbell_that_ends_inside_a_frame_waits_for_the_rest() {
+    let mut rig = Rig::new();
+    let first: Vec<u8> = (0..60u8).map(|i| i.wrapping_mul(7).wrapping_add(1)).collect();
+    let second: Vec<u8> = (0..60u8).map(|i| i.wrapping_mul(3).wrapping_add(9)).collect();
+    rig.tx_open(8, 1, 0x1000_0000);
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    rig.mem_write(TX_BUF, &first);
+    rig.tx_post(0, tx_bd(TX_BUF, 60, TXF_END, 0));
+    rig.mem_write(TX_BUF + 0x100, &second[..28]);
+    rig.mem_write(TX_BUF + 0x200, &second[28..]);
+    rig.tx_post(1, tx_bd(TX_BUF + 0x100, 28, 0, 0));
+    rig.tx_post(2, tx_bd(TX_BUF + 0x200, 32, TXF_END, 0));
+    // The doorbell stops after the first fragment of the second frame.
+    rig.writel(reg::MBX_TX_PROD_LO, 2);
+    assert_eq!(rig.sent_frames(), [first]);
+    assert_eq!(rig.status_tx_cons(), 1);
+    let tag = rig.status_tag();
+    rig.writel(reg::MBX_TX_PROD_LO, 3);
+    assert_eq!(rig.sent_frames(), [second]);
+    assert_eq!(rig.status_tx_cons(), 3);
+    assert_eq!(rig.status_tag(), tag + 1);
+}
+
+/// A status DMA the guest's address refused is retried when the address is
+/// repaired. Ported from test_transmit_coalescing_status_dma_retry.
+#[test]
+fn a_refused_status_update_is_retried_by_the_budget_timer() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 9);
+    rig.tx_open(64, 1, 50);
+    rig.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, UNMAPPED);
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    rig.tx_send_one(0, &frame, 0);
+    assert_eq!(rig.sent_frames(), [frame]);
+    assert_eq!(rig.status_tx_cons(), 0);
+    assert!(!rig.line_up());
+    assert_eq!(rig.refusals(Refused::DmaFault(DmaWhat::StatusBlock)), 1);
+
+    rig.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, STATUS);
+    rig.step(Duration::from_micros(51));
+    assert_eq!(rig.status_tx_cons(), 1);
+    assert_eq!(rig.status_tag(), 1);
+    assert!(rig.line_up());
+}
+
+/// Ported from test_interrupt_mailbox and test_mailbox_nonzero_masks: the
+/// mailbox masks and acknowledges, MISC_CTL's global mask holds the line down
+/// without losing the update, and any nonzero value masks.
+#[test]
+fn the_interrupt_line_follows_the_mailbox_and_the_global_mask() {
+    let rig = Rig::new();
+    rig.ind_mem_write(0x108, TX_RING_LEN << 16);
+    rig.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, STATUS);
+    rig.ind_reg_write(reg::MODE_CTL, MODE_ALL_SWAPS);
+    rig.writel(reg::HCC_MODE, HCC_ENABLE);
+    rig.writel(reg::RX_MODE, RXMODE_ENABLE);
+
+    // Masked out of reset: an update posts, but the line stays down.
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(!rig.line_up());
+    // Enable interrupts; the next update asserts the line.
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(rig.line_up() && rig.irq.level());
+    // Write 1: masks and acknowledges.
+    rig.writel(reg::MBX_IRQ0_LO, 1);
+    assert!(!rig.line_up() && !rig.irq.level());
+    // An update posted while masked is discarded by the zero write.
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    assert!(!rig.line_up());
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(rig.line_up());
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    assert!(!rig.line_up());
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(rig.line_up());
+
+    // The global mask suppresses the line; the update was never taken.
+    let misc = rig.cfg_read(0x68 / 4);
+    rig.cfg_write(0x68 / 4, misc | 2);
+    assert!(!rig.line_up() && !rig.irq.level());
+    rig.cfg_write(0x68 / 4, misc);
+    assert!(rig.line_up() && rig.irq.level());
+    // CLEAR_INTA acknowledges and self-clears.
+    rig.cfg_write(0x68 / 4, misc | 1);
+    assert!(!rig.line_up());
+    assert_eq!(rig.cfg_read(0x68 / 4), misc);
+
+    // Any nonzero In_ISR value masks while the handler runs.
+    rig.writel(reg::MBX_IRQ0_LO, 2);
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(!rig.line_up());
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    assert!(!rig.line_up());
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(rig.line_up());
+}
+
+/// A failed status write advances neither its tag nor the interrupt state.
+/// Ported from test_status_dma_error.
+#[test]
+fn a_failed_status_write_advances_nothing() {
+    let rig = Rig::new();
+    rig.ind_mem_write(0x108, TX_RING_LEN << 16);
+    rig.ind_reg_write(reg::MODE_CTL, MODE_ALL_SWAPS);
+    rig.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, UNMAPPED);
+    rig.writel(reg::HCC_MODE, HCC_ENABLE);
+    rig.writel(reg::RX_MODE, RXMODE_ENABLE);
+    rig.writel(reg::MBX_IRQ0_LO, 0);
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert!(!rig.line_up());
+    rig.split_addr(reg::HCC_STATUSBLK_ADDR_HI, reg::HCC_STATUSBLK_ADDR_LO, STATUS);
+    rig.writel(reg::MBX_TX_PROD_LO, 0);
+    assert_eq!(rig.status_tag(), 1);
+    assert!(rig.line_up());
+}
+
+/// Ported from test_receive_round_trip: the frame lands in the posted buffer,
+/// the return descriptor and status block describe it in the chip's image
+/// order, and a second buffer exposes the next consumer.
+#[test]
+fn a_received_frame_lands_in_the_posted_buffer_with_its_completion() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 5);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    rig.deliver(&frame);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.mem_read(RX_BUF, 64), frame);
+    let ret = rig.return_descriptor(0);
+    assert_eq!(get16dma(&ret, 0x0a), 0);
+    assert_eq!(get16dma(&ret, 0x08), 64 + 4);
+    assert_eq!(get16dma(&ret, 0x0c) & 4, 4);
+    assert_eq!(ret[0x0a..0x0c], [0, 0x44]);
+    let sb = rig.status_block();
+    assert_eq!(get16dma(&sb, 16), 1);
+    assert_eq!(sb[8..12], [0, 1, 0, 0]);
+    assert_eq!(sb[18..20], [0, 1]);
+
+    // The return-ring acknowledgement is accepted; reposting exposes the
+    // next consumer.
+    rig.writel(reg::MBX_RX_CONS0_LO, 1);
+    rig.mem_write(STD_RING + 32, &rx_bd(RX_BUF + 0x1000, 0));
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 2);
+    rig.deliver(&frame);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 2);
+    assert_eq!(rig.status_block()[8..10], [0, 2]);
+}
+
+/// The return descriptor is written when the frame lands; the producer the
+/// status block reports, and the interrupt, wait for the arrival deadline.
+/// Ported from test_receive_waits_for_its_arrival_deadline.
+#[test]
+fn a_completion_waits_for_its_arrival_deadline() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 7);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    rig.deliver(&frame);
+    assert_eq!(rig.mem_read(RX_BUF, 64), frame);
+    assert_eq!(get16dma(&rig.return_descriptor(0), 0x0c) & 4, 4);
+    assert_eq!(rig.status_rx_prod(), 0);
+    assert!(!rig.line_up());
+    rig.step(ARRIVAL - Duration::from_nanos(1));
+    assert_eq!(rig.status_rx_prod(), 0);
+    assert!(!rig.line_up());
+    rig.step(Duration::from_nanos(1));
+    assert_eq!(rig.status_rx_prod(), 1);
+    assert!(rig.line_up());
+}
+
+/// Ported from test_receive_jumbo_frame: a frame beyond the standard buffer
+/// goes to the jumbo ring and is marked so.
+#[test]
+fn a_frame_too_big_for_the_standard_buffer_takes_the_jumbo_ring() {
+    let mut rig = Rig::new();
+    let frame = broadcast(9000, 7);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    rig.rx_open_jumbo();
+    rig.deliver(&frame);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+    let ret = rig.return_descriptor(0);
+    assert_eq!(get16dma(&ret, 0x08), 9004);
+    assert_eq!(get16dma(&ret, 0x0c) & 0x20, 0x20);
+    assert_eq!(rig.mem_read(JUMBO_BUF, 9000), frame);
+    let sb = rig.status_block();
+    assert_eq!(sb[8..12], [0, 0, 0, 1]);
+}
+
+/// With the standard ring empty, a standard-size frame is discarded and
+/// counted rather than refused, while a jumbo buffer is posted; the next jumbo
+/// frame still gets through. Ported from
+/// test_receive_drops_standard_with_empty_standard_ring.
+#[test]
+fn a_short_frame_with_no_standard_buffer_is_discarded_and_counted() {
+    let mut rig = Rig::new();
+    let first = broadcast(64, 3);
+    let second = broadcast(64, 11);
+    let big = broadcast(9000, 13);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    rig.rx_open_jumbo();
+    rig.mem_write(STD_RING + 32, &rx_bd(STD_STALE_BUF, 0));
+    assert_eq!(rig.nic_no_more_rxbds(), 0);
+    rig.deliver(&first);
+    rig.step(ARRIVAL);
+    rig.writel(reg::MBX_RX_CONS0_LO, 1);
+    rig.mem_fill(STD_STALE_BUF, 64, 0xa5);
+    rig.mem_fill(JUMBO_BUF, 64, 0xa5);
+    rig.deliver(&second);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+    assert_eq!(rig.mem_read(STD_STALE_BUF, 64), vec![0xa5; 64]);
+    assert_eq!(rig.mem_read(JUMBO_BUF, 64), vec![0xa5; 64]);
+    assert_eq!(rig.nic_no_more_rxbds(), 1);
+    assert_eq!(rig.refusals(Refused::RxShortage(Ring::Standard)), 1);
+    // The jumbo ring still takes a jumbo frame.
+    rig.deliver(&big);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 2);
+    assert_eq!(rig.mem_read(JUMBO_BUF, 9000), big);
+    // Posting the standard buffer afterwards does not resurrect the frame.
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 2);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 2);
+    assert_eq!(rig.nic_no_more_rxbds(), 1);
+}
+
+/// The mirror: a jumbo frame with the jumbo ring empty. Ported from
+/// test_receive_drops_oversize_with_empty_jumbo_ring.
+#[test]
+fn a_jumbo_frame_with_no_jumbo_buffer_is_discarded_and_counted() {
+    let mut rig = Rig::new();
+    let first = broadcast(9000, 3);
+    let second = broadcast(9000, 11);
+    let small = broadcast(64, 15);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(2);
+    rig.rx_open_jumbo();
+    rig.mem_write(JUMBO_RING + 32, &rx_bd(0x28_0000, JUMBO_BUF_SIZE as u16));
+    rig.deliver(&first);
+    rig.step(ARRIVAL);
+    rig.writel(reg::MBX_RX_CONS0_LO, 1);
+    rig.mem_fill(0x28_0000, 9000, 0xa5);
+    rig.deliver(&second);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+    assert_eq!(rig.mem_read(0x28_0000, 9000), vec![0xa5; 9000]);
+    assert_eq!(rig.nic_no_more_rxbds(), 1);
+    assert_eq!(rig.refusals(Refused::RxShortage(Ring::Jumbo)), 1);
+    rig.deliver(&small);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 2);
+    assert_eq!(rig.mem_read(RX_BUF, 64), small);
+    assert_eq!(get16dma(&rig.return_descriptor(1), 0x0c) & 0x20, 0);
+}
+
+/// A frame too big for a standard buffer with the jumbo ring disabled is
+/// dropped, observably. Ported from test_receive_oversize_dropped.
+#[test]
+fn an_oversize_frame_with_no_jumbo_ring_is_dropped_and_counted() {
+    let mut rig = Rig::new();
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    rig.mem_fill(RX_BUF, 2048, 0xa5);
+    rig.deliver(&broadcast(2000, 3));
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 0);
+    assert_eq!(rig.mem_read(RX_BUF, 2048), vec![0xa5; 2048]);
+    assert_eq!(rig.refusals(Refused::RxNoRoom(Ring::Standard)), 1);
+    // The frame was consumed, not left to wedge the queue.
+    assert_eq!(rig.waiting(), 0);
+    // And one over the model's limit is dropped too.
+    rig.deliver(&broadcast(9700, 3));
+    assert_eq!(rig.refusals(Refused::RxFrameTooLarge), 1);
+}
+
+/// Ported from test_receive_mac_enable: a halted receiver drops what it is
+/// offered; with no buffer the frame waits for the guest to make room.
+#[test]
+fn a_halted_receiver_drops_and_a_full_one_waits() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 3);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    rig.writel(reg::RX_MODE, 0);
+    rig.deliver(&frame);
+    assert_eq!(rig.waiting(), 0);
+    assert_eq!(rig.status_rx_prod(), 0);
+    rig.writel(reg::RX_MODE, RXMODE_ENABLE);
+    rig.deliver(&frame);
+    // The one posted buffer is used; the next frame waits at the head.
+    rig.deliver(&frame);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+    assert_eq!(rig.waiting(), 1);
+    rig.mem_write(STD_RING + 32, &rx_bd(RX_BUF + 0x1000, 0));
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 2);
+    rig.writel(reg::MBX_RX_CONS0_LO, 1);
+    rig.dev.poll();
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 2);
+    assert_eq!(rig.mem_read(RX_BUF + 0x1000, 64), frame);
+}
+
+/// The address filter is slot 0, which the driver programs: other unicast
+/// frames are consumed without a completion. Ported from the filter cases of
+/// test_receive_checksum_case's setup and test_receive_round_trip.
+#[test]
+fn the_receive_filter_follows_the_programmed_station_address() {
+    let mut rig = Rig::new();
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    let mut other = broadcast(64, 3);
+    other[..6].copy_from_slice(&[2, 0, 0, 0, 0, 9]);
+    rig.deliver(&other);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 0);
+    assert_eq!(rig.waiting(), 0);
+    let mut mine = other.clone();
+    mine[..6].copy_from_slice(&MAC);
+    rig.deliver(&mine);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+    // IRIX installs its own address over the card's.
+    rig.writel(reg::MAC_ADDR_0_HIGH, 0x0200);
+    rig.writel(reg::MAC_ADDR_0_LOW, 9);
+    rig.mem_write(STD_RING + 32, &rx_bd(RX_BUF + 0x1000, 0));
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 2);
+    rig.writel(reg::MBX_RX_CONS0_LO, 1);
+    rig.deliver(&other);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 2);
+}
+
+/// A runt is padded to the Ethernet minimum before it is delivered.
+#[test]
+fn a_short_frame_is_padded_to_the_ethernet_minimum() {
+    let mut rig = Rig::new();
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    let mut runt = vec![0xff; 6];
+    runt.extend_from_slice(&[1, 2, 3, 4]);
+    rig.deliver(&runt);
+    rig.step(ARRIVAL);
+    let mut padded = runt.clone();
+    padded.resize(60, 0);
+    assert_eq!(rig.mem_read(RX_BUF, 60), padded);
+    assert_eq!(get16dma(&rig.return_descriptor(0), 0x08), 64);
+}
+
+fn rx_frame(proto: u8, payload: &[u8], fix: impl Fn(&mut Vec<u8>)) -> Vec<u8> {
+    let mut f = vec![0xff; 6];
+    f.extend_from_slice(&[0x52, 0x54, 0, 0xbc, 0x57, 1, 8, 0]);
+    let total = 20 + payload.len();
+    f.extend_from_slice(&[0x45, 0]);
+    f.extend_from_slice(&(total as u16).to_be_bytes());
+    f.extend_from_slice(&[0, 1, 0, 0, 64, proto, 0, 0, 10, 0, 2, 2, 10, 0, 2, 15]);
+    f.extend_from_slice(payload);
+    f.resize(f.len().max(60), 0);
+    fix(&mut f);
+    let ip = inet_sum(&f[14..34], 0);
+    f[24..26].copy_from_slice(&ip.to_be_bytes());
+    f
+}
+
+/// The receive checksum report: an intact TCP segment claims both sums
+/// (0xffff) and the OK flags; a corrupt one claims the IP sum only; a frame
+/// that is not IPv4 TCP or UDP claims nothing. Ported from
+/// test_receive_checksum_offload, test_receive_checksum_bad_transport and
+/// test_receive_checksum_not_ip.
+#[test]
+fn the_receive_report_claims_only_the_sums_it_computed() {
+    let mut tcp = vec![0u8; 20];
+    tcp[0..4].copy_from_slice(&[0x30, 0x39, 0, 0x17]);
+    tcp[12] = 0x50;
+    let seal = |f: &mut Vec<u8>| {
+        f[14 + 20 + 16..14 + 20 + 18].fill(0);
+        let sum = inet_sum(&f[34..54], tcp_pseudo(f, 20));
+        f[50..52].copy_from_slice(&sum.to_be_bytes());
+    };
+    for (label, frame, ip_ok, l4_ok, ip_report, l4_report) in [
+        ("intact", rx_frame(6, &tcp, seal), true, true, 0xffffu32, 0xffffu32),
+        ("corrupt", rx_frame(6, &tcp, |_| ()), true, false, 0xffff, 0),
+    ] {
+        let mut rig = Rig::new();
+        rig.rx_open(RX_RING_LEN, 1, 0);
+        rig.rx_post_std(1);
+        rig.deliver(&frame);
+        rig.step(ARRIVAL);
+        let ret = rig.return_descriptor(0);
+        let flags = get16dma(&ret, 0x0c);
+        assert_eq!(flags & 0x1000 != 0, ip_ok, "{label} ip flag");
+        assert_eq!(flags & 0x2000 != 0, l4_ok, "{label} transport flag");
+        assert_eq!(flags & 0x4000, 0x4000, "{label} tcp flag");
+        assert_eq!(u32::from(get16dma(&ret, 0x12)), ip_report, "{label} ip sum");
+        let l4 = u32::from(get16dma(&ret, 0x10));
+        if l4_ok {
+            assert_eq!(l4, l4_report);
+        } else {
+            assert_ne!(l4, 0xffff);
+        }
+    }
+    // Not IPv4: nothing is claimed.
+    let mut rig = Rig::new();
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.rx_post_std(1);
+    let mut arp = broadcast(60, 3);
+    arp[12..14].copy_from_slice(&[0x08, 0x06]);
+    rig.deliver(&arp);
+    rig.step(ARRIVAL);
+    let ret = rig.return_descriptor(0);
+    assert_eq!(get16dma(&ret, 0x0c) & 0x7000, 0);
+    assert_eq!(be32(&ret, 0x10), 0);
+}
+
+/// Receive coalescing: with a count of two, two frames make one update; the
+/// tick budget reports a short group. Ported from
+/// test_receive_interrupt_coalescing and test_receive_coalescing_timer.
+#[test]
+fn receive_updates_follow_the_count_and_the_tick_budget() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 3);
+    rig.rx_open(16, 2, 0x1000_0000);
+    rig.rx_post_std(4);
+    for _ in 0..4 {
+        rig.deliver(&frame);
+    }
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_tag(), 2);
+    assert_eq!(rig.status_rx_prod(), 4);
+
+    let mut rig = Rig::new();
+    rig.rx_open(16, 8, 1000);
+    rig.rx_post_std(4);
+    rig.deliver(&frame);
+    rig.deliver(&frame);
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_tag(), 0);
+    rig.step(Duration::from_micros(800));
+    assert_eq!(rig.status_tag(), 1);
+    assert_eq!(rig.status_rx_prod(), 2);
+
+    // Neither criterion armed: the guest has asked to be told nothing.
+    let mut rig = Rig::new();
+    rig.rx_open(16, 0, 0);
+    rig.rx_post_std(2);
+    rig.deliver(&frame);
+    rig.step(Duration::from_secs(1));
+    assert_eq!(rig.status_tag(), 0);
+}
+
+/// Ported from test_rx_producer_out_of_range and the ring-length guards:
+/// out-of-range indexes are refused, observably, and not stored.
+#[test]
+fn receive_mailbox_indexes_past_their_rings_are_refused() {
+    let rig = Rig::new();
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 512);
+    rig.writel(reg::MBX_RX_JUMBO_PROD_LO, 256);
+    rig.writel(reg::MBX_RX_CONS0_LO, RX_RING_LEN);
+    assert_eq!(rig.readl(reg::MBX_RX_STD_PROD_LO), 0);
+    assert_eq!(rig.refusals(Refused::ProducerOutOfRange(Mailbox::RxStandardProducer)), 1);
+    assert_eq!(rig.refusals(Refused::ProducerOutOfRange(Mailbox::RxJumboProducer)), 1);
+    assert_eq!(rig.refusals(Refused::ProducerOutOfRange(Mailbox::RxReturnConsumer)), 1);
+}
+
+/// A return-ring descriptor that cannot be read or written leaves the frame
+/// queued; repairing the address delivers it. Ported from
+/// test_receive_descriptor_dma_error and test_receive_completion_dma_error.
+#[test]
+fn an_unreachable_ring_defers_the_frame_until_it_is_repaired() {
+    let mut rig = Rig::new();
+    let frame = broadcast(64, 3);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.split_addr(reg::RX_STD_RCB_HADDR_HI, reg::RX_STD_RCB_HADDR_LO, UNMAPPED);
+    rig.mem_write(STD_RING, &rx_bd(RX_BUF, 0));
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 1);
+    rig.deliver(&frame);
+    assert_eq!(rig.status_rx_prod(), 0);
+    assert_eq!(rig.waiting(), 1);
+    assert_eq!(rig.refusals(Refused::DmaFault(DmaWhat::RxDescriptor)), 1);
+    rig.split_addr(reg::RX_STD_RCB_HADDR_HI, reg::RX_STD_RCB_HADDR_LO, STD_RING);
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 1);
+    rig.dev.poll();
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+    assert_eq!(rig.mem_read(RX_BUF, 64), frame);
+
+    // The same for the return ring.
+    let mut rig = Rig::new();
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    rig.ind_mem_write(0x204, UNMAPPED as u32);
+    rig.ind_mem_write(0x200, (UNMAPPED >> 32) as u32);
+    rig.rx_post_std(1);
+    rig.deliver(&frame);
+    assert_eq!(rig.refusals(Refused::DmaFault(DmaWhat::RxCompletion)), 1);
+    rig.ind_mem_write(0x200, 0);
+    rig.ind_mem_write(0x204, RET_RING as u32);
+    rig.writel(reg::MBX_RX_STD_PROD_LO, 1);
+    rig.dev.poll();
+    rig.step(ARRIVAL);
+    assert_eq!(rig.status_rx_prod(), 1);
+}
+
+/// A global reset cancels pending coalescing work and the held completions.
+/// Ported from test_global_reset_cancels_receive_coalescing and
+/// test_system_reset_cancels_transmit_coalescing.
+#[test]
+fn a_reset_cancels_coalescing_timers_and_held_completions() {
+    let rig = Rig::new();
+    let frame = broadcast(64, 3);
+    rig.tx_open(64, 8, 50);
+    rig.tx_send_one(0, &frame, 0);
+    rig.writel(reg::MISC_CFG, MISC_CFG_RESET);
+    rig.step(Duration::from_millis(1));
+    assert_eq!(rig.status_tag(), 0);
+
+    let mut rig = Rig::new();
+    rig.rx_open(16, 1, 0);
+    rig.rx_post_std(1);
+    rig.deliver(&frame);
+    rig.dev.reset();
+    rig.step(Duration::from_millis(1));
+    assert_eq!(rig.status_rx_prod(), 0);
+    assert!(!rig.irq.level());
+}
+
+/// The receive thread takes a frame when the guest posts a buffer and
+/// publishes its completion on the clock, with nothing polling by hand; stop
+/// joins it. Exercises `Device::start` and `stop`, which the cases above
+/// replace with explicit steps.
+#[test]
+fn the_receive_thread_delivers_and_publishes_on_its_own() {
+    let mut rig = Rig::new();
+    *rig.dev.frozen.lock() = None;
+    let frame = broadcast(64, 3);
+    rig.rx_open(RX_RING_LEN, 1, 0);
+    Device::start(&*rig.dev);
+    assert!(Device::is_running(&*rig.dev));
+    // A frame offered before any buffer is posted waits at the queue head.
+    rig.inject.push(frame.clone()).unwrap();
+    rig.dev.wake_rx();
+    rig.rx_post_std(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.status_rx_prod() != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Device::stop(&*rig.dev);
+    assert!(!Device::is_running(&*rig.dev));
+    assert_eq!(rig.status_rx_prod(), 1);
+    assert_eq!(rig.mem_read(RX_BUF, 64), frame);
+    assert!(rig.line_up());
 }

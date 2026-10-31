@@ -2,13 +2,14 @@
 //! that run inside register writes. The PCI side and the threads are in the
 //! parent module.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::eeprom::{self, Eeprom};
 use super::phy::{self, Phy};
-use crate::pci::PciConfig;
+use super::dma::{Ring, Timer};
+use crate::pci::{PciConfig, PciDma};
 
 pub const REG_FILE_SIZE: u32 = 0x8000;
 pub const SRAM_SIZE: u32 = 0x8000;
@@ -65,12 +66,30 @@ pub mod reg {
     pub const EEPROM_PIN: u32 = 0x6840;
     pub const EEPROM_DELAY: u32 = 0x6848;
     pub const MBX_IRQ0_LO: u32 = 0x0204;
+    pub const MBX_RX_STD_PROD_LO: u32 = 0x026c;
+    pub const MBX_RX_JUMBO_PROD_LO: u32 = 0x0274;
+    pub const MBX_RX_CONS0_LO: u32 = 0x0284;
+    pub const MBX_TX_PROD_LO: u32 = 0x0304;
+    pub const HCC_RX_COAL_TICKS: u32 = 0x3c08;
+    pub const HCC_TX_COAL_TICKS: u32 = 0x3c0c;
+    pub const HCC_RX_MAX_COAL_BDS: u32 = 0x3c10;
+    pub const HCC_TX_MAX_COAL_BDS: u32 = 0x3c14;
+    pub const HCC_STATUSBLK_ADDR_HI: u32 = 0x3c38;
+    pub const HCC_STATUSBLK_ADDR_LO: u32 = 0x3c3c;
+    pub const RX_JUMBO_RCB_HADDR_HI: u32 = 0x2440;
+    pub const RX_JUMBO_RCB_HADDR_LO: u32 = 0x2444;
+    pub const RX_JUMBO_RCB_MAXLEN_FLAGS: u32 = 0x2448;
+    pub const RX_STD_RCB_HADDR_HI: u32 = 0x2450;
+    pub const RX_STD_RCB_HADDR_LO: u32 = 0x2454;
+    pub const RX_STD_RCB_MAXLEN_FLAGS: u32 = 0x2458;
 }
 
 /// Bit 0 of a mode register is a self-clearing reset; bit 0 of MISC_CFG
 /// resets the whole chip.
 const MODE_RESET: u32 = 1;
 const MISCCFG_RESET_CORE_CLOCKS: u32 = 1;
+const RXMODE_ENABLE: u32 = 2;
+const RCB_FLAG_EXT_RX_ENABLE: u32 = 1;
 
 const BUFMGR_MODE_ENABLE: u32 = 2;
 /// The buffer manager's enable reads back only after its startup; a
@@ -133,12 +152,27 @@ pub enum Refused {
     /// A BAR access of a width or alignment the chip does not accept.
     BarAccess { offset: u32, width: u8, write: bool },
     Phy(phy::Refusal),
+    /// A transfer to or from host memory that did not complete.
+    DmaFault(super::dma::DmaWhat),
+    /// A ring index written to a mailbox that lies outside the ring.
+    ProducerOutOfRange(super::dma::Mailbox),
+    /// A transmit frame larger than the model carries; it is dropped.
+    TxFrameTooLarge,
+    /// A received frame larger than the model carries; it is dropped.
+    RxFrameTooLarge,
+    /// A frame discarded for want of a posted descriptor, once per drought.
+    RxShortage(Ring),
+    /// A frame too big for the ring it would use; it is dropped.
+    RxNoRoom(Ring),
+    /// The jumbo ring asks for 64-byte descriptors, which are not modelled;
+    /// the ring is treated as unavailable.
+    JumboExtendedDescriptors,
 }
 
 pub(super) struct State {
     pub cfg: Arc<PciConfig>,
     pub mac: [u8; 6],
-    regfile: Box<[u32; REG_WORDS]>,
+    pub(super) regfile: Box<[u32; REG_WORDS]>,
     sram: Box<[u32; SRAM_WORDS]>,
     /// The two indirect-window base registers (config 0x78 and 0x7c).
     pub reg_win_base: u32,
@@ -148,17 +182,54 @@ pub(super) struct State {
     /// The mask set through the 0x0204 mailbox, and the latch a status-block
     /// update sets and the driver clears. The line is the latch with
     /// neither mask (this or MISC_CTL's) set.
-    irq_masked: bool,
-    irq_pending: bool,
+    pub(super) irq_masked: bool,
+    pub(super) irq_pending: bool,
     irq_level: bool,
     pub irq_events: Vec<bool>,
     pub phy: Phy,
     pub now: Instant,
     refused: BTreeMap<Refused, u64>,
+    pub(super) dma: Arc<dyn PciDma>,
+    /// The send-ring consumer, and what the status block reports.
+    pub(super) tx_cons: u16,
+    pub(super) status_tx_cons: u16,
+    pub(super) status_rx_prod: u16,
+    /// Where the next return descriptor goes; it runs ahead of
+    /// `status_rx_prod` while the arrival line holds a completion.
+    pub(super) rx_prod_staged: u16,
+    pub(super) rx_std_cons: u16,
+    pub(super) rx_jumbo_cons: u16,
+    /// Frames discarded since a ring's shortage began, so a drought is
+    /// reported at both ends rather than once per frame.
+    pub(super) rx_shortage_drops: u64,
+    pub(super) rx_std_shortage_drops: u64,
+    pub(super) status_tag: u8,
+    /// Descriptors consumed on each ring since the last status-block update,
+    /// and whether each coalescing budget has run out.
+    pub(super) rx_coal_pending: u16,
+    pub(super) tx_coal_pending: u16,
+    pub(super) rx_coal_expired: bool,
+    pub(super) tx_coal_expired: bool,
+    pub(super) rx_coal_timer: Option<Instant>,
+    pub(super) tx_coal_timer: Option<Instant>,
+    /// Completions held until their frame's arrival deadline, with the
+    /// producer index each publishes.
+    pub(super) rx_latency: VecDeque<(Instant, u16)>,
+    pub(super) rx_floor: Duration,
+    /// Frames the transmit engine produced, for the owner to send.
+    pub wire: Vec<Vec<u8>>,
+    /// Set when something the guest did can unblock a waiting frame.
+    pub wake_rx: bool,
 }
 
 impl State {
-    pub fn new(cfg: Arc<PciConfig>, mac: [u8; 6], eeprom: Option<Eeprom>, now: Instant) -> Self {
+    pub fn new(
+        cfg: Arc<PciConfig>,
+        mac: [u8; 6],
+        eeprom: Option<Eeprom>,
+        rx_floor: Duration,
+        now: Instant,
+    ) -> Self {
         let mut st = Self {
             cfg,
             mac,
@@ -175,6 +246,26 @@ impl State {
             phy: Phy::new(now),
             now,
             refused: BTreeMap::new(),
+            dma: Arc::new(super::dma::NullDma),
+            tx_cons: 0,
+            status_tx_cons: 0,
+            status_rx_prod: 0,
+            rx_prod_staged: 0,
+            rx_std_cons: 0,
+            rx_jumbo_cons: 0,
+            rx_shortage_drops: 0,
+            rx_std_shortage_drops: 0,
+            status_tag: 0,
+            rx_coal_pending: 0,
+            tx_coal_pending: 0,
+            rx_coal_expired: false,
+            tx_coal_expired: false,
+            rx_coal_timer: None,
+            tx_coal_timer: None,
+            rx_latency: VecDeque::new(),
+            rx_floor,
+            wire: Vec::new(),
+            wake_rx: false,
         };
         st.reset();
         st
@@ -188,19 +279,40 @@ impl State {
         self.run_timers();
     }
 
+    /// Run whatever came due, earliest first, so a timer that arms another
+    /// sees the order the hardware would.
     fn run_timers(&mut self) {
         let now = self.now;
         self.phy.sync(now);
-        if self.bufmgr_start.is_some_and(|d| d <= now) {
-            self.bufmgr_start = None;
-            let mode = self.rf(reg::BUFMGR_MODE);
-            self.set_rf(reg::BUFMGR_MODE, mode | BUFMGR_MODE_ENABLE);
+        while let Some((_, timer)) = self.timers().into_iter().filter(|(d, _)| *d <= now).min() {
+            match timer {
+                Timer::BufferManager => {
+                    self.bufmgr_start = None;
+                    let mode = self.rf(reg::BUFMGR_MODE);
+                    self.set_rf(reg::BUFMGR_MODE, mode | BUFMGR_MODE_ENABLE);
+                }
+                Timer::RxCoalescing => self.rx_coal_timer_fired(),
+                Timer::TxCoalescing => self.tx_coal_timer_fired(),
+                Timer::RxArrival => self.rx_arrival_due(),
+            }
         }
+    }
+
+    fn timers(&self) -> Vec<(Instant, Timer)> {
+        [
+            self.bufmgr_start.map(|d| (d, Timer::BufferManager)),
+            self.rx_coal_timer.map(|d| (d, Timer::RxCoalescing)),
+            self.tx_coal_timer.map(|d| (d, Timer::TxCoalescing)),
+            self.rx_latency.front().map(|(d, _)| (*d, Timer::RxArrival)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// The earliest moment something here needs attention.
     pub fn deadline(&self) -> Option<Instant> {
-        [self.phy.deadline(), self.bufmgr_start].into_iter().flatten().min()
+        self.timers().into_iter().map(|(d, _)| d).chain(self.phy.deadline()).min()
     }
 
     pub fn refused(&self) -> Vec<(Refused, u64)> {
@@ -227,11 +339,11 @@ impl State {
 
     // ---- storage ----
 
-    fn rf(&self, off: u32) -> u32 {
+    pub(super) fn rf(&self, off: u32) -> u32 {
         self.regfile[((off & (REG_FILE_SIZE - 1)) >> 2) as usize]
     }
 
-    fn set_rf(&mut self, off: u32, val: u32) {
+    pub(super) fn set_rf(&mut self, off: u32, val: u32) {
         self.regfile[((off & (REG_FILE_SIZE - 1)) >> 2) as usize] = val;
     }
 
@@ -268,6 +380,7 @@ impl State {
         self.bufmgr_start = None;
         self.regfile.fill(0);
         self.sram.fill(0);
+        self.reset_engines();
         self.irq_masked = true;
         self.irq_pending = false;
         self.sram_write(SRAM_FW_MBOX, FW_MAGIC);
@@ -284,6 +397,7 @@ impl State {
         self.sram.fill(0);
         self.reg_win_base = 0;
         self.mem_win_base = 0;
+        self.reset_engines();
         self.irq_masked = true;
         self.irq_pending = false;
         self.phy.reset(self.now);
@@ -417,6 +531,9 @@ impl State {
                 // model that takes one frame at a time never needs.
                 val &= !MODE_RESET;
                 self.set_rf(off, val);
+                if val & RXMODE_ENABLE != 0 {
+                    self.retry_rx_flush();
+                }
                 return;
             }
             // Write one to clear: the bits written are the ones acknowledged.
@@ -428,6 +545,31 @@ impl State {
             reg::HCC_MODE => {
                 val &= !MODE_RESET;
                 self.set_rf(off, val);
+                self.hcc_mode_written();
+                return;
+            }
+            reg::HCC_RX_COAL_TICKS | reg::HCC_TX_COAL_TICKS => {
+                self.set_rf(off, val);
+                self.coal_ticks_written(off == reg::HCC_RX_COAL_TICKS);
+                return;
+            }
+            reg::MBX_TX_PROD_LO => {
+                // Store the producer for read-back, then send up to it.
+                self.set_rf(off, val);
+                self.tx_kick(val);
+                return;
+            }
+            reg::RX_JUMBO_RCB_MAXLEN_FLAGS => {
+                // Max_Len is unused for the jumbo ring; only Disable Ring and
+                // Extended RX Enable do anything, and both are read from the
+                // stored word. Flag the unmodelled extended format once, here,
+                // rather than on every frame that finds the ring unavailable.
+                if val & RCB_FLAG_EXT_RX_ENABLE != 0 {
+                    self.refuse(Refused::JumboExtendedDescriptors);
+                }
+            }
+            reg::MBX_RX_JUMBO_PROD_LO | reg::MBX_RX_STD_PROD_LO | reg::MBX_RX_CONS0_LO => {
+                self.rx_mailbox_written(off, val);
                 return;
             }
             reg::BUFMGR_MODE => {
@@ -455,6 +597,9 @@ impl State {
                 self.irq_pending = false;
                 self.irq_masked = val != 0;
                 self.set_rf(off, val);
+                if val == 0 {
+                    self.retry_rx_flush();
+                }
                 self.update_irq(false);
                 return;
             }
