@@ -17,6 +17,8 @@ use crate::dev::bedrock_mem::{BANK_SPAN, FITTED_BANK};
 use crate::physical::Physical;
 use crate::traits::*;
 #[cfg(feature = "jitv2")]
+use crate::cpu::jitv2::jitv2::UNCACHED_VIEW_ADDR;
+#[cfg(feature = "jitv2")]
 use std::sync::{atomic::AtomicU64, OnceLock};
 use std::sync::Arc;
 
@@ -237,6 +239,14 @@ impl Ip35Bus {
         let pa = plain_address(a, n)?;
         Some((&self.views[(a >> 57) as usize], pa))
     }
+    /// The bus the JIT compiles code through: a page the CPU fetched cached
+    /// reads the cached view, one it fetched uncached reads the uncached view
+    /// the CPU's own fetch used (`UNCACHED_VIEW_ADDR`). Bedrock decodes the
+    /// two differently at the reset PROM once memory covers it.
+    #[cfg(feature = "jitv2")]
+    pub fn code_view(self: &Arc<Self>, cached: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
+        Arc::new(CodeViews { cached, uncached: self.clone() })
+    }
     pub fn cached_view(&self, plain_memory: Arc<dyn BusDevice>) -> Arc<dyn BusDevice> {
         Arc::new(CachedPhysical {
             phys: self.phys.clone(),
@@ -250,6 +260,25 @@ fn plain_address(a: u64, n: u64) -> Option<u64> {
     }
     let pa = a & PA_MASK;
     (pa.checked_add(n)? <= PA_MASK + 1).then_some(pa)
+}
+/// See [`Ip35Bus::code_view`]. Compiles read instruction words only.
+#[cfg(feature = "jitv2")]
+struct CodeViews {
+    cached: Arc<dyn BusDevice>,
+    uncached: Arc<Ip35Bus>,
+}
+#[cfg(feature = "jitv2")]
+impl BusDevice for CodeViews {
+    fn read32(&self, a: u64) -> BusRead32 {
+        if a & UNCACHED_VIEW_ADDR != 0 {
+            self.uncached.read32(a & !UNCACHED_VIEW_ADDR)
+        } else {
+            self.cached.read32(a)
+        }
+    }
+    fn gen_ptr(&self, a: u64) -> *const AtomicU64 {
+        if a & UNCACHED_VIEW_ADDR != 0 { self.uncached.gen_ptr(a) } else { self.cached.gen_ptr(a) }
+    }
 }
 struct CachedPhysical {
     phys: Arc<Physical>,
@@ -295,6 +324,17 @@ macro_rules! processor_access {
 impl BusDevice for Ip35Bus {
     #[cfg(feature = "jitv2")]
     fn gen_ptr(&self, address: u64) -> *const AtomicU64 {
+        if address & UNCACHED_VIEW_ADDR != 0 {
+            // A page fetched uncached: its bytes come from the uncached view
+            // at that address (attribute 0, the reset PROM and node memory),
+            // so its generation is that device's. Writes through the cached
+            // view change other bytes where the views differ, and bump the
+            // same RAM counter where they coincide.
+            // The PROM view's counter covers the whole flash, so any flash
+            // write invalidates every PROM page (over-invalidation, safe).
+            let pa = address & !UNCACHED_VIEW_ADDR;
+            return if pa & !PA_MASK == 0 { self.views[0].gen_ptr(pa) } else { std::ptr::null() };
+        }
         if address & !PA_MASK == 0 {
             // JIT page lookup passes plain physical code addresses, without
             // a cache attribute. Raw UC0 therefore cannot select the MMIO map

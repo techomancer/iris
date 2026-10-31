@@ -133,8 +133,11 @@ impl FuelMachine {
         // After the windows above: each compile worker takes the cache's
         // geometry and the CPU model's policies once, as it starts, and
         // without the windows the geometry has no inline load or store path.
-        // Workers read plain physical code addresses, which the cached plane
-        // serves; the uncached views would decode them as Hub registers.
+        // Workers read plain physical code addresses through the view the CPU
+        // fetched each page by: the cached plane for cached pages, the
+        // uncached attribute-0 view for the reset PROM's uncached fetches.
+        // Decoding plain addresses in the uncached views for cached pages
+        // would reach Hub registers.
         #[cfg(feature = "jitv2")]
         {
             let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
@@ -149,7 +152,7 @@ impl FuelMachine {
             #[cfg(not(feature = "jitv2_lockstep"))]
             {
                 let stats = g.stats.clone();
-                g.compile_queue.start(board.cached_bus(), stats);
+                g.compile_queue.start(board.code_bus(), stats);
             }
             // The compile pool keeps only a weak handle on the CPU.
             std::mem::forget(cpu_device);
@@ -864,9 +867,19 @@ impl FuelBoard {
         self.bus.cached_view(self.md.dma_view())
     }
 
+    /// The bus the JIT compiles code through; see [`Ip35Bus::code_view`].
+    #[cfg(feature = "jitv2")]
+    pub fn code_bus(&self) -> Arc<dyn BusDevice> {
+        self.bus.code_view(self.cached_bus())
+    }
+
     pub fn build_cpu(&self) -> Box<FuelCpu> {
         let mut cpu = build_cpu(self.bus.clone());
         cpu.cache = R14000FuelShadowCache::new(self.cached_bus());
+        // The PROM fetches its own code uncached; with memory over its
+        // window the cached and uncached views of it differ.
+        #[cfg(feature = "jitv2")]
+        cpu.enable_jitv2_uncached_views(self.code_bus());
         // The PROM keeps its stack in cache lines it tags for a window with no
         // memory behind it yet; the controller answers that window while they stand.
         let memory = self.md.clone();

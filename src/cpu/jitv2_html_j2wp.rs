@@ -477,13 +477,13 @@ pub fn write_jitv2_html(
     // (Jitv2::code_bytes_used doc comment) — fine for an on-demand dump,
     // not a hot path.
     for page in jit.claimed_pages() {
-        let phys_addr = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+        let phys_addr = page.phys_base();
         let window = memory.find(phys_addr).map_or(OTHER_REGION, |r| r.name);
         let page_gen = page.current_gen();
 
         let mut words = [0u32; crate::cpu::jitv2::ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
-            *w = bus.read32(phys_addr + i as u64 * 4).data;
+            *w = bus.read32(crate::cpu::jitv2::jitv2::key_bus_addr(page.pfn, (i as u32) * 4)).data;
         }
 
         // §13: one function/gen/instr_count/code_size/call_count/

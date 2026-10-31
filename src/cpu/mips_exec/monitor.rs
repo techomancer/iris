@@ -2021,7 +2021,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 #[cfg(not(feature = "jitv2_lockstep"))]
                                 {
                                 exec.jitv2_inline_compile = false;
-                                let bus = exec.sysad.clone();
+                                let bus = exec.jitv2_compile_bus();
                                 let old = exec.jitv2.lock().codegen.lock().take();
                                 match old {
                                     Some(old) => {
@@ -2549,11 +2549,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             if result.is_exception() {
                                 return Err(format!("{:#018x} doesn't translate", pc));
                             }
-                            let Some(pfn) = exec.jitv2_frame(result.phys) else {
+                            let Some(pfn) = exec.jitv2_code_key(result.phys, !result.is_cached()) else {
                                 return Err(format!("phys {:#x} is above the JIT's physical range", result.phys));
                             };
-                            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                            let sysad = exec.sysad.clone();
+                            let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
+                            let sysad = exec.jitv2_compile_bus();
                             let mut jit = exec.jitv2.lock();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let slot = jit.page_for(pfn, page_base, sysad.as_ref(), fr1);
@@ -2563,7 +2563,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                             }
                         };
                         let page = unsafe { &*page_ptr };
-                        let sysad = exec.sysad.clone();
+                        let sysad = exec.jitv2_compile_bus();
                         let dump = crate::cpu::jitv2::pcp_dump::PcpDump::capture(page, sysad.as_ref())
                             .map_err(|st| format!("capture failed: bus status {:#x}", st))?;
                         // A path argument is whichever arg is not the address.
@@ -2597,7 +2597,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // the bus, and holding the jitv2 lock across a few
                         // thousand of those plus the filesystem would stall
                         // every dispatching CPU thread for the whole dump.
-                        let sysad = exec.sysad.clone();
+                        let sysad = exec.jitv2_compile_bus();
                         let mut unreadable = 0usize;
                         let dumps: Vec<crate::cpu::jitv2::pcp_dump::PcpDump> = {
                             let jit = exec.jitv2.lock();
@@ -2691,12 +2691,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} doesn't translate.", pc).unwrap();
                                 return Ok(());
                             }
-                            let Some(pfn) = exec.jitv2_frame(result.phys) else {
+                            let Some(pfn) = exec.jitv2_code_key(result.phys, !result.is_cached()) else {
                                 writeln!(writer, "No PhysicalCodePage tracked (self.pcp is null) and PC {:#018x} is at phys {:#x}, above the JIT's physical range.", pc, result.phys).unwrap();
                                 return Ok(());
                             };
-                            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                            let sysad = exec.sysad.clone();
+                            let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
+                            let sysad = exec.jitv2_compile_bus();
                             let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                             let mut jit = exec.jitv2.lock();
                             match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
@@ -2851,14 +2851,18 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         if exec.core.smp {
                             return Err("j2 clear: another CPU may be running this page; use j2 flush".to_string());
                         }
-                        if actual_args.len() < 2 { return Err("Usage: j2 clear <paddr>".to_string()); }
+                        if actual_args.len() < 2 { return Err("Usage: j2 clear <paddr> [uncached]".to_string()); }
                         let symbols_arc = exec.symbols.clone();
                         let symbols = symbols_arc.lock();
                         let paddr = monitor_phys(parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?);
                         drop(symbols);
-                        let pfn = exec.jitv2_monitor_pfn(paddr)?;
-                        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-                        let sysad = exec.sysad.clone();
+                        // A trailing `uncached` names the page the CPU fetched
+                        // through the uncached view (machines that keep one).
+                        let uncached = actual_args.get(2) == Some(&"uncached") && exec.jitv2_uncached_views;
+                        let frame = exec.jitv2_monitor_pfn(paddr)?;
+                        let pfn = if uncached { frame | crate::cpu::jitv2::jitv2::UNCACHED_VIEW_PFN } else { frame };
+                        let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
+                        let sysad = exec.jitv2_compile_bus();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
                         match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
@@ -2898,15 +2902,19 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // still stops the specific `func` this call saw, but
                         // a fresh compile can re-publish the same offset
                         // right after.
-                        if actual_args.len() < 2 { return Err("Usage: j2 deny <paddr>".to_string()); }
+                        if actual_args.len() < 2 { return Err("Usage: j2 deny <paddr> [uncached]".to_string()); }
                         let symbols_arc = exec.symbols.clone();
                         let symbols = symbols_arc.lock();
                         let paddr = monitor_phys(parse_cpu_arg(actual_args[1], &exec.core, Some(&symbols))?);
                         drop(symbols);
-                        let pfn = exec.jitv2_monitor_pfn(paddr)?;
-                        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+                        // A trailing `uncached` names the page the CPU fetched
+                        // through the uncached view (machines that keep one).
+                        let uncached = actual_args.get(2) == Some(&"uncached") && exec.jitv2_uncached_views;
+                        let frame = exec.jitv2_monitor_pfn(paddr)?;
+                        let pfn = if uncached { frame | crate::cpu::jitv2::jitv2::UNCACHED_VIEW_PFN } else { frame };
+                        let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
                         let offset = (paddr & 0xFFF) as usize >> 2;
-                        let sysad = exec.sysad.clone();
+                        let sysad = exec.jitv2_compile_bus();
                         let fr1 = (exec.core.cp0_status & crate::cpu::mips_core::STATUS_FR) != 0;
                         let mut jit = exec.jitv2.lock();
                         match jit.page_for(pfn, page_base, sysad.as_ref(), fr1) {
@@ -2970,7 +2978,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                                         // signal, not a crash risk.
                                         let page = unsafe { &*page_ptr };
                                         writeln!(writer, "    page: pfn={:#010x} phys_base={:#010x}",
-                                            page.pfn, page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64).unwrap();
+                                            page.pfn, page.phys_base()).unwrap();
                                     }
                                 };
                                 match jit.compile_queue.seal_queue_entries() {
@@ -3006,7 +3014,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
                         // implementation.
                         let path = actual_args.get(1).copied().unwrap_or("jitv2.html");
                         let jitv2_arc = exec.jitv2.clone();
-                        let bus = exec.sysad.clone();
+                        let bus = exec.jitv2_compile_bus();
                         crate::cpu::jitv2_html_j2wp::write_jitv2_html(
                             &jitv2_arc, &bus, &exec.memory.clone(), &mut exec.jitv2_inline_analyzer, path, &mut *writer,
                         )?;

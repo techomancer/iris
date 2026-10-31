@@ -600,3 +600,243 @@ fn the_fuel_plugs_a_usb_keyboard_and_mouse_only_when_configured_on() {
     let (_, status) = ports(false);
     assert_eq!(status.map(|s| s & 1), [0, 0], "nothing plugged in");
 }
+
+/// Where the cached and uncached views of a frame differ, the JIT keys and
+/// compiles the page by the view the CPU fetched it through. The reset PROM
+/// fetches uncached at the same plain address that cached RAM answers once
+/// memory covers its window; the compile pool used to read the cached view and
+/// compile the RAM's bytes in place of the PROM's.
+#[cfg(feature = "jitv2")]
+#[test]
+fn uncached_fetch_compiles_the_uncached_view_of_the_page() {
+    // The executor and the code generator are large; the default test stack is not.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(uncached_fetch_compiles_the_uncached_view_body)
+        .unwrap()
+        .join()
+        .expect("thread panicked");
+}
+
+#[cfg(feature = "jitv2")]
+fn uncached_fetch_compiles_the_uncached_view_body() {
+    use crate::cpu::jitv2::jitv2::{CompileRequest, UNCACHED_VIEW_PFN};
+    use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
+
+    /// Every word the same; a region-boundary word compiles to nothing.
+    struct Words {
+        word: u32,
+        generation: AtomicU64,
+    }
+    impl Words {
+        fn new(word: u32) -> Arc<Self> {
+            Arc::new(Self { word, generation: AtomicU64::new(0) })
+        }
+    }
+    impl BusDevice for Words {
+        fn read32(&self, _: u64) -> BusRead32 {
+            BusRead32::ok(self.word)
+        }
+        fn read64(&self, _: u64) -> BusRead64 {
+            BusRead64::ok((self.word as u64) << 32 | self.word as u64)
+        }
+        fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
+            &self.generation
+        }
+    }
+
+    let reset_vector = 0x1fc0_0000u64;
+    let addiu_r1 = (OP_ADDIU << 26) | (1 << 16) | 1;
+    let rom = Words::new(addiu_r1);
+    let ram = Words::new(JIT_REGION_BOUNDARY_SENTINEL);
+    let physical = Physical::new(Vec::new());
+    let mut bus = Ip35Bus::new(physical.clone());
+    map_device(&physical, reset_vector, 0x1000, ram.clone(), "RAM over the reset window");
+    bus.set_ram_generations(ram.clone());
+    bus.map(0, reset_vector, 0x1000, rom.clone());
+    let bus = Arc::new(bus);
+    let code_bus = bus.code_view(bus.cached_view(ram.clone()));
+    // The two views really disagree here.
+    assert_eq!(bus.read32(reset_vector).data, addiu_r1);
+    assert_eq!(bus.cached_view(ram.clone()).read32(reset_vector).data, JIT_REGION_BOUNDARY_SENTINEL);
+
+    let mut cpu = crate::ip35_machine::build_cpu(bus.clone());
+    cpu.enable_jitv2_uncached_views(code_bus.clone());
+    // The reset vector, KSEG1: uncached, plain physical address 0x1fc00000.
+    cpu.core.pc = 0xffff_ffff_bfc0_0000;
+    let _ = cpu.step_int();
+    let page = cpu.jitv2_current_page();
+    assert!(!page.is_null(), "the uncached fetch must land on a code page");
+    let page = unsafe { &mut *page };
+    assert_eq!(page.pfn, 0x1fc00 | UNCACHED_VIEW_PFN, "an uncached fetch keys the uncached view");
+    assert!(page.is_uncached_view());
+    assert_eq!(page.phys_base(), 0x1fc0_0000);
+
+    page.mark_requested(0);
+    let req = CompileRequest { page: page as *mut _, compiled_for_fr1: true };
+    let mut analyzer = crate::cpu::jitv2::analyzer::Analyzer::new();
+    let mut codegen = crate::cpu::jitv2::codegen::Codegen::new();
+    #[cfg(feature = "developer")]
+    crate::cpu::jitv2::comp::handle_request(&req, &cpu.jitv2_compile_bus(), &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
+    #[cfg(not(feature = "developer"))]
+    crate::cpu::jitv2::comp::handle_request(&req, &cpu.jitv2_compile_bus(), &mut analyzer, &mut codegen);
+    assert!(page.is_runnable(0), "the page must compile the PROM's ADDIU, not the RAM's boundary word");
+
+    // The cached view of the same frame is another page, with RAM's counter and bytes.
+    let jitv2 = cpu.jitv2.clone();
+    let mut jit = jitv2.lock();
+    let slot = jit.page_for(0x1fc00, 0x1fc0_0000, bus.as_ref(), false).unwrap();
+    let cached = unsafe { &mut *jit.page_ptr(slot) };
+    assert!(!cached.is_uncached_view());
+    assert_ne!(cached as *mut _, page as *mut _);
+    cached.mark_requested(0);
+    let req = CompileRequest { page: cached as *mut _, compiled_for_fr1: true };
+    #[cfg(feature = "developer")]
+    crate::cpu::jitv2::comp::handle_request(&req, &code_bus, &mut analyzer, &mut codegen, &crate::cpu::jitv2::JitStats::default());
+    #[cfg(not(feature = "developer"))]
+    crate::cpu::jitv2::comp::handle_request(&req, &code_bus, &mut analyzer, &mut codegen);
+    assert!(!cached.is_runnable(0), "the cached page compiles RAM's boundary word to nothing");
+
+    // A write through one view invalidates only the pages that view's bytes feed.
+    ram.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert!(page.is_runnable(0), "a cached-view write does not change the PROM's bytes");
+    rom.generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+    assert!(!page.is_runnable(0), "a write to the PROM's bytes invalidates its code");
+}
+
+#[cfg(feature = "jitv2")]
+mod code_views {
+    use super::*;
+    use crate::cpu::jitv2::jitv2::{CompileRequest, UNCACHED_VIEW_PFN};
+    use crate::cpu::mips_isa::{JIT_REGION_BOUNDARY_SENTINEL, OP_ADDIU};
+
+    struct Words(u32, AtomicU64);
+    impl BusDevice for Words {
+        fn read32(&self, _: u64) -> BusRead32 {
+            BusRead32::ok(self.0)
+        }
+        fn read64(&self, _: u64) -> BusRead64 {
+            BusRead64::ok((self.0 as u64) << 32 | self.0 as u64)
+        }
+        fn gen_ptr(&self, _: u64) -> *const AtomicU64 {
+            &self.1
+        }
+    }
+
+    const RESET: u64 = 0x1fc0_0000;
+    const ADDIU_R1: u32 = (OP_ADDIU << 26) | (1 << 16) | 1;
+
+    /// A bus whose uncached attribute-0 view of the reset frame holds an ADDIU
+    /// and whose cached view holds a region boundary, as RAM over the PROM does.
+    fn bus_and_cpu(opted_in: bool) -> (Arc<Ip35Bus>, Box<crate::ip35_machine::FuelCpu>) {
+        let rom = Arc::new(Words(ADDIU_R1, AtomicU64::new(0)));
+        let ram = Arc::new(Words(JIT_REGION_BOUNDARY_SENTINEL, AtomicU64::new(0)));
+        let physical = Physical::new(Vec::new());
+        let mut bus = Ip35Bus::new(physical.clone());
+        map_device(&physical, RESET, 0x1000, ram.clone(), "RAM over the reset window");
+        bus.set_ram_generations(ram.clone());
+        bus.map(0, RESET, 0x1000, rom.clone());
+        // Code that is fetchable in the other views and above 4 GiB, so only
+        // the JIT's own range check keeps it out of a code page.
+        for attribute in 1..4 {
+            bus.map(attribute, RESET, 0x1000, rom.clone());
+        }
+        bus.map(0, 0x1_0000_0000, 0x1000, rom);
+        let bus = Arc::new(bus);
+        let mut cpu = crate::ip35_machine::build_cpu(bus.clone());
+        if opted_in {
+            let cached = bus.cached_view(ram);
+            cpu.enable_jitv2_uncached_views(bus.code_view(cached));
+        }
+        (bus, cpu)
+    }
+
+    /// The executor and the code generator are large; the default test stack is not.
+    fn big_stack(body: fn()) {
+        std::thread::Builder::new().stack_size(64 << 20).spawn(body).unwrap().join().expect("thread panicked");
+    }
+
+    fn wait_runnable(page: &crate::cpu::jitv2::PhysicalCodePage) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if page.is_runnable(0) { return true; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// After a page-pool flush the restarted compile pool must still read
+    /// uncached pages through the compile bus. Restarted on the CPU's own bus it
+    /// rejects the view address and the page never compiles.
+    #[test]
+    fn a_pool_restart_after_a_flush_keeps_the_compile_bus() {
+        big_stack(|| {
+            let (_bus, mut cpu) = bus_and_cpu(true);
+            {
+                let jit = cpu.jitv2.clone();
+                let mut g = jit.lock();
+                let stats = g.stats.clone();
+                g.compile_queue.set_thread_count(1);
+                g.compile_queue.start(cpu.jitv2_compile_bus(), stats);
+            }
+            cpu.jitv2_flush_from_here(false);
+            cpu.core.pc = 0xffff_ffff_bfc0_0000;
+            let _ = cpu.step_int();
+            let page = unsafe { &mut *cpu.jitv2_current_page() };
+            assert!(page.is_uncached_view());
+            page.mark_requested(0);
+            let jit = cpu.jitv2.clone();
+            let g = jit.lock();
+            let stats = g.stats.clone();
+            assert!(g.compile_queue.send(CompileRequest { page: page as *mut _, compiled_for_fr1: true }, &stats));
+            drop(g);
+            assert!(wait_runnable(page), "the restarted pool must compile the uncached view");
+            jit.lock().compile_queue.stop();
+        });
+    }
+
+    /// A machine that has not opted in keeps one page per frame and the
+    /// original-size frame map, whatever the cache attribute of the fetch.
+    #[test]
+    fn an_executor_that_has_not_opted_in_keeps_the_plain_key() {
+        big_stack(|| {
+            let (_bus, mut cpu) = bus_and_cpu(false);
+            assert!(!cpu.jitv2.lock().uncached_views_enabled());
+            cpu.core.pc = 0xffff_ffff_bfc0_0000;
+            let _ = cpu.step_int();
+            let page = unsafe { &*cpu.jitv2_current_page() };
+            assert_eq!(page.pfn, 0x1fc00);
+            assert_eq!(page.pfn & UNCACHED_VIEW_PFN, 0);
+            assert!(!page.is_uncached_view());
+        });
+    }
+
+    /// Uncached attributes 1 to 3 and anything over 4 GiB stay in the interpreter.
+    #[test]
+    fn attributes_one_to_three_and_high_addresses_get_no_code_page() {
+        big_stack(|| {
+            for pc in [
+                0x9000_0000_0000_0000u64 | RESET,           // attribute 0: a page
+                0x9200_0000_0000_0000u64 | RESET,           // attribute 1
+                0x9400_0000_0000_0000u64 | RESET,           // attribute 2
+                0x9600_0000_0000_0000u64 | RESET,           // attribute 3
+                0x9000_0001_0000_0000u64,                   // 4 GiB, attribute 0
+            ] {
+                // A fresh executor each time: a tracked page would survive a
+                // fetch that wrongly kept the same frame.
+                let (_bus, mut cpu) = bus_and_cpu(true);
+                // KX, so XKPHYS addresses translate.
+                let status = cpu.core.cp0_status | 0x80;
+                cpu.set_cp0_status(status);
+                cpu.core.pc = pc;
+                let _ = cpu.step_int();
+                let page = cpu.jitv2_current_page();
+                if pc == 0x9000_0000_0000_0000u64 | RESET {
+                    assert!(!page.is_null(), "attribute 0 below 4 GiB is compiled");
+                } else {
+                    assert!(page.is_null(), "{pc:#x} must not get a code page");
+                }
+            }
+        });
+    }
+}

@@ -1003,6 +1003,16 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// short loop).
     #[cfg(feature = "jitv2")]
     pub jitv2_inline_compile: bool,
+    /// The machine's uncached bus view decodes code differently from its
+    /// cached one (IP35), so an uncached fetch keys its own code page and
+    /// is compiled from what the uncached view returns. Set by
+    /// [`Self::enable_jitv2_uncached_views`]; off on every other machine.
+    #[cfg(feature = "jitv2")]
+    pub(crate) jitv2_uncached_views: bool,
+    /// The bus compiles read code through, when it is not `sysad` itself
+    /// (see [`Self::enable_jitv2_uncached_views`]).
+    #[cfg(feature = "jitv2")]
+    jitv2_code_bus: Option<Arc<dyn BusDevice>>,
     /// Scratch analyzer for `jitv2_inline_compile`'s synchronous path — same
     /// `comp::handle_request` compile sequence the real async compile-thread
     /// runs, just called directly on the CPU thread. Kept alive across calls
@@ -2489,6 +2499,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             #[cfg(feature = "jitv2")]
             jitv2_inline_compile: cfg!(feature = "jitv2_lockstep"),
             #[cfg(feature = "jitv2")]
+            jitv2_uncached_views: false,
+            #[cfg(feature = "jitv2")]
+            jitv2_code_bus: None,
+            #[cfg(feature = "jitv2")]
             jitv2_inline_analyzer: crate::cpu::jitv2::analyzer::Analyzer::with_isa(C::MIPS4),
             // IRIS_JIT_DISPATCH=off starts with the JIT dispatch gate shut: the
             // same binary as an interpreter-only reference, for comparing
@@ -2787,7 +2801,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             self.core.nanotlb[AT as usize].fill_raw(va_page, result.phys, result.status & 0x7);
             #[cfg(feature = "jitv2")]
             if AT == AccessType::Fetch as u8 {
-                self.jitv2_track_pcp(result.phys);
+                self.jitv2_track_pcp(result.phys, !result.is_cached());
             }
         }
         result
@@ -3001,7 +3015,7 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         if !self.smc_seen.insert(key) {
             return;
         }
-        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+        let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
         let word = ((phys_addr - page_base) / 4) as usize;
         eprintln!(
             "jitv2 SMC: write to the page being executed — pc={:#018x} wrote {} byte(s) \
@@ -3018,12 +3032,16 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// [`Self::smc_check_report`].
     ///
     /// `cur_code_pfn == u32::MAX` (no page tracked) can never match a real
-    /// frame, so the "nothing tracked" case needs no separate test.
+    /// frame, so the "nothing tracked" case needs no separate test. The
+    /// comparison masks the view bit off `cur_code_pfn`, which leaves the
+    /// sentinel as 0xFFEFFFFF: still beyond any frame the page table holds.
     #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
     #[inline(always)]
     fn smc_check_write(&mut self, virt_addr: u64, phys_addr: u64, size: usize) {
         let pfn = self.core.cur_code_pfn;
-        if (phys_addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32 == pfn {
+        if (phys_addr / crate::cpu::jitv2::PAGE_SIZE as u64) as u32
+            == pfn & !crate::cpu::jitv2::jitv2::UNCACHED_VIEW_PFN
+        {
             self.smc_check_report(virt_addr, phys_addr, size, pfn);
         }
     }
@@ -3062,7 +3080,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// may have made the flush unnecessary.
     #[cfg(feature = "jitv2")]
     pub(crate) fn jitv2_flush_from_here(&mut self, only_if_exhausted: bool) {
-        let bus = self.sysad.clone();
+        let bus = self.jitv2_compile_bus();
         let jit = self.jitv2.clone();
         let flush = || {
             let mut j = jit.lock();
@@ -3089,6 +3107,40 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.memory.contains(paddr).then(|| self.jitv2_frame(paddr)).flatten().ok_or_else(|| format!(
             "{:#x} is not in this machine's memory ({}) — did you mean to pass a virtual address through `translate` first, or use `j2 pcp <vaddr>` to find the real paddr?",
             paddr, self.memory))
+    }
+
+    /// The page key for a fetch at `phys_addr`: its frame, in the uncached
+    /// view's key space when `uncached` and this machine keeps one
+    /// (`jitv2::code_key`). `None` above the page table.
+    #[cfg(feature = "jitv2")]
+    pub(crate) fn jitv2_code_key(&self, phys_addr: u64, uncached: bool) -> Option<crate::cpu::jitv2::jitv2::Pfn> {
+        crate::cpu::jitv2::jitv2::code_key(phys_addr, self.jitv2_frames, uncached && self.jitv2_uncached_views)
+    }
+
+    /// Tell the JIT this machine's uncached bus view decodes code differently
+    /// from its cached view, so uncached fetches get their own code pages and
+    /// are compiled from `code_bus`, which must serve a page's bytes through
+    /// the view its key names (see `jitv2::key_bus_addr`). Call while the
+    /// executor is being built, before it is shared or run. Machines without
+    /// such views never call this and keep one page per frame.
+    #[cfg(feature = "jitv2")]
+    pub fn enable_jitv2_uncached_views(&mut self, code_bus: Arc<dyn BusDevice>) {
+        self.jitv2.lock().enable_uncached_views();
+        self.jitv2_uncached_views = true;
+        self.jitv2_code_bus = Some(code_bus);
+        self.jitv2_bind_fast_lookup();
+    }
+
+    /// The code page the last fetch landed on, or null.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_current_page(&self) -> *mut crate::cpu::jitv2::PhysicalCodePage {
+        self.pcp
+    }
+
+    /// The bus compile workers and the inline compile read code through.
+    #[cfg(feature = "jitv2")]
+    pub fn jitv2_compile_bus(&self) -> Arc<dyn BusDevice> {
+        self.jitv2_code_bus.clone().unwrap_or_else(|| self.sysad.clone())
     }
 
     #[cfg(feature = "jitv2")]
@@ -3135,10 +3187,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// nanotlb hit path above and a single PFN comparison here.
     #[cfg(feature = "jitv2")]
     #[inline(always)]
-    fn jitv2_track_pcp(&mut self, phys_addr: u64) {
+    fn jitv2_track_pcp(&mut self, phys_addr: u64, uncached: bool) {
         // Code above the JIT's pfn map gets no page and runs in the
-        // interpreter (`step_jit` checks for the null page).
-        let Some(pfn) = crate::cpu::jitv2::jitv2::pfn_of(phys_addr, self.jitv2_frames) else {
+        // interpreter (`step_jit` checks for the null page). That includes
+        // uncached attributes 1 to 3: their bits 58:57 sit in `phys_addr`,
+        // so the frame range check rejects them. Where the uncached bus view
+        // differs from the cached one, an uncached fetch keys a page of its
+        // own (`code_key`).
+        let Some(pfn) = crate::cpu::jitv2::jitv2::code_key(phys_addr, self.jitv2_frames, uncached && self.jitv2_uncached_views) else {
             self.clear_pcp();
             return;
         };
@@ -3157,7 +3213,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // on the page-crossing path (not every fetch) to keep the common
         // same-page case free of this cost even when the toggle is on.
         if jitv2_pagewb_enabled() {
-            let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+            let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
             self.cache.writeback(None, page_base, crate::cpu::jitv2::PAGE_SIZE as u64);
         }
         // A page crossing landing exactly on word 0 (the exception/TLB-refill
@@ -3193,7 +3249,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             return;
         }
 
-        let page_base = pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
+        let page_base = crate::cpu::jitv2::jitv2::key_phys_base(pfn);
         // §13: live FR mode at first-arrival time, pinned into the page for
         // its whole lifetime (PhysicalCodePage::fr1's own doc comment) —
         // ignored by page_for on a lookup hit (an already-claimed page keeps
@@ -3362,7 +3418,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// cost to the interpreter's per-instruction hot loop.
     pub fn exec(&mut self, instr: u32) -> ExecStatus {
         #[cfg(feature = "jitv2")]
-        self.jitv2_track_pcp(self.core.pc & 0xFFFF_FFFF);
+        self.jitv2_track_pcp(self.core.pc & 0xFFFF_FFFF, false);
         self.ins.raw = instr;
         self.ins.flags = FLAG_NOT_DECODED;
         decode_into::<T, C>(&mut self.ins);
@@ -8966,10 +9022,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            let phys_page_base = page.phys_base();
+            let uncached = page.is_uncached_view();
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.jitv2_compile_bus()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base);
+            self.jitv2_track_pcp(phys_page_base, uncached);
             return EXEC_RETRY;
         }
         let mut codegen = self.jitv2.lock().codegen.lock().take();
@@ -8978,6 +9035,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             "jitv2_lockstep: inline compile found no Codegen (async compile queue stole it?) — \
              verification would silently be OFF. The queue must not run under lockstep.");
         let mut ran_out_of_memory = false;
+        let compile_bus = self.jitv2_compile_bus();
         if let Some(codegen) = codegen.as_mut() {
             // Stamp the L1-D geometry the inline load/store fast path needs.
             // Done on every take rather than once at startup so a cache
@@ -8989,10 +9047,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();
-                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen, &stats);
+                ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &compile_bus, &mut self.jitv2_inline_analyzer, codegen, &stats);
             }
             #[cfg(not(feature = "developer"))]
-            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &self.sysad, &mut self.jitv2_inline_analyzer, codegen); }
+            { ran_out_of_memory = crate::cpu::jitv2::comp::handle_request(&req, &compile_bus, &mut self.jitv2_inline_analyzer, codegen); }
         }
         *self.jitv2.lock().codegen.lock() = codegen;
         {
@@ -9002,10 +9060,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let phys_page_base = page.pfn as u64 * crate::cpu::jitv2::PAGE_SIZE as u64;
-            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            let phys_page_base = page.phys_base();
+            let uncached = page.is_uncached_view();
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.jitv2_compile_bus()); }
             self.clear_pcp();
-            self.jitv2_track_pcp(phys_page_base);
+            self.jitv2_track_pcp(phys_page_base, uncached);
             return EXEC_RETRY;
         }
         // Re-check is_runnable: handle_request can decline this exact

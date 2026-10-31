@@ -569,6 +569,21 @@ code into host code with Cranelift. The concepts:
   pfn map publishes a slot after its claim, and inline stores bump generations
   atomically. Compiled code is freed only by a full flush, and every flush parks
   all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
+- **Views of a frame.** On most machines a physical frame has one set of bytes,
+  so a page is keyed by frame alone. The IP35 bus decodes an uncached fetch
+  (attribute 0) differently from a cached one: the reset PROM answers the
+  uncached view at 0x1fc00000 whatever RAM sits behind the cached view there.
+  `MipsExecutor::enable_jitv2_uncached_views` makes an uncached fetch key
+  `frame | UNCACHED_VIEW_PFN` (`jitv2::code_key`). Such a page is read, and its
+  generation counter taken, through `UNCACHED_VIEW_ADDR` on the compile bus
+  (`Ip35Bus::code_view`), which reaches the same device the CPU's uncached fetch
+  reached. A write bumps the counter of the device that holds the bytes it changed:
+  a cached store to RAM over the reset window leaves the PROM's page alone, a flash
+  command on the PROM invalidates it, and where both views reach the same RAM
+  they share its counter. Frames past the end of the machine's memory and uncached
+  attributes 1 to 3 still run in the interpreter. The view bit (bit 20) is above
+  every frame only where memory ends at or below 4 GiB, so only such a machine may
+  opt in; its frame map then holds the view bit plus its memory's frames.
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 

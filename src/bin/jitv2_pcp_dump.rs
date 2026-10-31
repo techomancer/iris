@@ -76,7 +76,7 @@ fn main() {
         }
     };
 
-    let page_base_phys = dump.pfn * PAGE_SIZE;
+    let page_base_phys = iris::cpu::jitv2::jitv2::key_phys_base(dump.pfn);
     println!("=== {} ===", path);
     println!("pfn={:#010x}  phys_base={:#010x}", dump.pfn, page_base_phys);
     println!("current_gen={}  entry_gen={}  {}",
