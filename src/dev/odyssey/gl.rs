@@ -16,6 +16,7 @@ fn cmax<T: PartialOrd>(a: T, b: T) -> T {
 /// One level's texels in the object store: `width` by `height` words from
 /// word `offset`, rows `stride` words apart.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct Texture {
     pub offset: u32,
     pub stride: u32,
@@ -29,6 +30,7 @@ pub struct Texture {
 
 /// First and last detail function weights, and whether the table is flat.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct TextureDetailWeight {
     pub constant: bool,
     pub first: f64,
@@ -36,6 +38,7 @@ pub struct TextureDetailWeight {
 }
 
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct TextureVolume {
     pub base: u32,
     pub stride_units: u32,
@@ -77,9 +80,40 @@ pub struct TextureChain {
     pub pyramid: Option<PyramidShape>,
     pub detail_storage: Texture,
     pub detail_image: GlTexLevel,
+    /// The leading entries of `volumes`, `storage` and `levels` written since
+    /// the chain was last cleared; the rest are still default.
+    filled: usize,
 }
 
 impl TextureChain {
+    /// Make the chain default again, writing only what a setup wrote. A chain
+    /// is about 7 KB, and a textured draw cleared all of it, though a typical
+    /// texture fills a few levels.
+    pub fn clear(&mut self) {
+        let n = self.filled.min(self.levels.len());
+
+        // Every setup in the tests proves `touch` covers what it writes.
+        #[cfg(test)]
+        {
+            assert!(self.volumes[n..].iter().all(|v| *v == TextureVolume::default()), "a written volume was not touched");
+            assert!(self.storage[n..].iter().all(|t| *t == Texture::default()), "a written level store was not touched");
+            assert!(self.levels[n..].iter().all(|l| *l == GlTexLevel::default()), "a written level was not touched");
+        }
+        self.volumes[..n].fill(TextureVolume::default());
+        self.storage[..n].fill(Texture::default());
+        self.levels[..n].fill(GlTexLevel::default());
+        self.volume = TextureVolume::default();
+        self.pyramid = None;
+        self.detail_storage = Texture::default();
+        self.detail_image = GlTexLevel::default();
+        self.filled = 0;
+    }
+
+    /// Note that level `i`'s entries are about to be written.
+    pub fn touch(&mut self, i: u32) {
+        self.filled = self.filled.max(i as usize + 1);
+    }
+
     /// image with this chain's pyramid.
     pub fn image<'a>(&'a self, image: &GlTexImage<'static>) -> GlTexImage<'a> {
         let mut image: GlTexImage<'a> = *image;
@@ -1615,7 +1649,7 @@ impl Board {
                 if count > SGI_GL_TEX_LEVELS_MAX {
                     break 'unsupported;
                 }
-                *chain = TextureChain::default();
+                chain.clear();
                 let mut slice_next: u32 = 0;
                 for i in 0..count {
                     let level_width = cmax(1, width >> i);
@@ -1669,6 +1703,7 @@ impl Board {
                         slice_next += 1;
                         z += 1;
                     }
+                    chain.touch(i);
                     chain.volumes[i as usize] = TextureVolume {
                         base,
                         stride_units,
@@ -1683,6 +1718,7 @@ impl Board {
                         slices: slice_next - level_slice,
                         ..Default::default()
                     };
+                    chain.touch(i);
                     chain.levels[i as usize] = GlTexLevel {
                         level: i,
                         width: level_width,
@@ -1741,7 +1777,7 @@ impl Board {
             if count > SGI_GL_TEX_LEVELS_MAX || first + count > SGI_ODYSSEY_TEX_LEVELS {
                 break 'unsupported;
             }
-            *chain = TextureChain::default();
+            chain.clear();
             chain.volume.colour_table_alpha = colour_table_rgba8_rgba || word == 0x11600001;
             chain.volume.colour_table = colour_table;
             chain.volume.scale_bias = !self.texture_scale_bias_identity();
@@ -1781,6 +1817,7 @@ impl Board {
                 {
                     break 'unsupported;
                 }
+                chain.touch(i);
                 chain.levels[i as usize] = GlTexLevel {
                     level: i,
                     width: level_width,
@@ -1828,6 +1865,7 @@ impl Board {
                         break 'unsupported;
                     }
                 }
+                chain.touch(i);
                 chain.storage[i as usize] = Texture {
                     // Captured stored-border policy uses interior coordinate 16.
                     offset: self.obj_offset[o].wrapping_add(interior_y.wrapping_mul(self.obj_width[o])).wrapping_add(interior_x),
@@ -2114,14 +2152,17 @@ impl ClipRect {
 
 impl GlDrawable {
     // Compares the two drawables field by field.
-    fn drawable_eq(&self, b: &GlDrawable) -> bool {
+    pub fn drawable_eq(&self, b: &GlDrawable) -> bool {
         self.bound == b.bound
             && self.origin == b.origin
             && self.width == b.width
             && self.height == b.height
             && self.clip.n == b.clip.n
             && self.clip.empty == b.clip.empty
-            && self.clip.r.iter().zip(b.clip.r.iter()).all(|(x, y)| x.gl_clip_rect_eq(y))
+            // Only the rectangles the list counts: this runs before every
+            // command, and a window rarely owns more than one or two of the
+            // sixteen. Those past the count are not drawn against.
+            && self.clip.r.iter().zip(b.clip.r.iter()).take(self.clip.n as usize).all(|(x, y)| x.gl_clip_rect_eq(y))
             && self.front == b.front
             && self.back == b.back
             && self.extra == b.extra

@@ -122,6 +122,7 @@ pub const SGI_GL_TEX_LEVELS_MAX: u32 = 31;
 /// One level of a texture image, as the family describes it. The `read_*`
 /// flags say which reads the draw's Texels answer for it.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct GlTexLevel {
     pub level: u32,
     pub width: u32,

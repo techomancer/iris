@@ -667,3 +667,58 @@ fn the_screen_follows_the_frame_through_frames_that_present_a_few_lines() {
         }
     }
 }
+
+/// The drawable comparison that runs before every command looks at the clip
+/// rectangles the list counts and no others: a change inside the count is
+/// seen, and one past it, where nothing is drawn against, is not.
+#[test]
+fn the_drawable_comparison_covers_the_rectangles_the_list_counts() {
+    let mut a = GlDrawable::default();
+    a.clip.n = 2;
+    a.clip.r[0] = ClipRect { x0: 0, y0: 0, x1: 9, y1: 9 };
+    a.clip.r[1] = ClipRect { x0: 20, y0: 0, x1: 29, y1: 9 };
+    let mut b = a;
+    assert!(a.drawable_eq(&b));
+
+    b.clip.r[5] = ClipRect { x0: 1, y0: 2, x1: 3, y1: 4 };
+    assert!(a.drawable_eq(&b), "past the count");
+
+    for i in 0..2 {
+        let mut c = a;
+        c.clip.r[i].y1 += 1;
+        assert!(!a.drawable_eq(&c), "rectangle {i}");
+    }
+    let mut c = a;
+    c.clip.n = 3;
+    assert!(!a.drawable_eq(&c), "the count");
+}
+
+/// A texture chain a setup filled is the default one again after `clear`,
+/// though `clear` writes only the levels the setup touched: a deeper
+/// texture's levels do not leak into the next draw's sampling, which reads
+/// every volume's slice count and any level by number.
+#[test]
+fn a_cleared_texture_chain_is_the_default_one_again() {
+    let mut chain = TextureChain::default();
+
+    for i in [0u32, 1, 6] {
+        chain.touch(i);
+        chain.volumes[i as usize] = TextureVolume { slices: 3, width: 8 >> i.min(3), ..Default::default() };
+        chain.storage[i as usize] = Texture { offset: 5, width: 4, border_rows: true, ..Default::default() };
+        chain.levels[i as usize] = GlTexLevel { level: i, width: 4, read_texel: true, ..Default::default() };
+    }
+    chain.volume = chain.volumes[0];
+    chain.pyramid = Some(PyramidShape { count: 7, ..Default::default() });
+    chain.detail_storage = Texture { stride: 32, ..Default::default() };
+    chain.detail_image = GlTexLevel { detail: true, ..Default::default() };
+
+    chain.clear();
+    let fresh = TextureChain::default();
+
+    assert!(chain.volumes == fresh.volumes && chain.storage == fresh.storage && chain.levels == fresh.levels);
+    assert!(chain.volume == fresh.volume && chain.pyramid.is_none());
+    assert!(chain.detail_storage == fresh.detail_storage && chain.detail_image == fresh.detail_image);
+    // A second clear has nothing left to write.
+    chain.clear();
+    assert!(chain.levels == fresh.levels);
+}
