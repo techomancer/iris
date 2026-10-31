@@ -94,7 +94,12 @@ return.
   lines in the presented frame with the cursor over them. Resolving a
   whole frame under both locks held the raster unit up about 6 ms of
   every 16.7 ms frame while a GL program drew. The retrace is counted
-  under the board lock and can be up to one slice late.
+  under the board lock and can be up to one slice late. A swap does not
+  repaint the frame: the frame update compares the displayed-buffer bits
+  with the ones it last staged and repaints only the rows where the
+  flipped windows' two buffers differ (`Scanout::differ`, kept from the
+  rows each draw reports and measured from the planes after a writer
+  that does not report rows).
 - Lock order: board, then raster context, then front. The raster thread
   takes only its context lock and, for a fence's interrupt, the front lock.
   The front end waits for the raster queue to empty with the board lock

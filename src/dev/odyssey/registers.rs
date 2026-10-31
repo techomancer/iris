@@ -193,7 +193,7 @@ impl Board {
     /// bottom of the raster is empty.
     pub fn cursor_invalidate(&mut self, span: Option<(i32, i32)>) {
         if let Some((first, last)) = span.filter(|&(first, last)| first <= last) {
-            self.scanout.invalidate(first, last - first + 1);
+            self.scanout.repaint(first, last - first + 1);
         }
     }
 }
@@ -513,12 +513,12 @@ impl Board {
         // Scanout resolves through both, so either change repaints.
         if index < ODSY_LUT_SIZE {
             self.lut[index as usize] = data & ODSY_LUT_ENTRY_MASK;
-            self.scanout.invalidate_all();
+            self.scanout.repaint_all();
             return;
         }
         if (ODSY_DISPMODE_BASE..ODSY_DISPMODE_BASE + ODSY_DISPMODE_COUNT).contains(&index) {
             self.dispmode[(index - ODSY_DISPMODE_BASE) as usize] = data;
-            self.scanout.invalidate_all();
+            self.scanout.repaint_all();
             return;
         }
         if (ODSY_CURSOR_BASE..ODSY_CURSOR_BASE + ODSY_CURSOR_ENTRIES).contains(&index) {
@@ -531,7 +531,7 @@ impl Board {
                 self.overlay_mode_reported = true;
                 crate::dlog!(LogModule::Odyssey, "sgi-odyssey: overlay mode {:#x} has bits this model does not decode", data);
             }
-            self.scanout.invalidate_all();
+            self.scanout.repaint_all();
             return;
         }
         match index {

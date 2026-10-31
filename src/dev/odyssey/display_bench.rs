@@ -5,7 +5,8 @@
 //! display modes, overlay and cursor, then resolved whole. The tests hold
 //! the resolved frame to a stored hash, so a change to the resolve that moves
 //! one pixel fails. The benchmark reports the resolve of a full 1280x1024
-//! screen and the conversion of that frame into the window's buffers:
+//! screen, a whole display frame, a swap of a window that differs from its other buffer in part of
+//! the screen, and the conversion of that frame into the window's buffers:
 //!
 //!     cargo test --release --lib odyssey::display_bench -- --ignored --nocapture --test-threads=1
 //!
@@ -114,6 +115,20 @@ fn scene_board(scene: Scene) -> Box<Board> {
     s
 }
 
+/// An RGB screen whose two colour buffers differ in the `rows` rows from the
+/// middle out: what a swap of a window that size changes.
+fn swap_board(rows: usize) -> Box<Board> {
+    let mut s = scene_board(Scene::Rgb);
+    let stride = SGI_ODYSSEY_WIDTH as usize * 4;
+    let mut rng = Lcg(0x5eed_0002);
+    let first = (SGI_ODYSSEY_HEIGHT as usize - rows) / 2;
+
+    let same = s.mem.bytes.clone();
+    s.buffer1_mem.bytes.copy_from_slice(&same);
+    fill_random(&mut s.buffer1_mem.bytes[first * stride..(first + rows) * stride], &mut rng);
+    s
+}
+
 fn fnv(frame: &[u32]) -> u64 {
     frame.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &p| (h ^ p as u64).wrapping_mul(0x100_0000_01b3))
 }
@@ -197,18 +212,21 @@ fn present_swaps_each_pixel_into_both_buffers() {
     }
 }
 
+/// The fastest of the runs of `f` in the time budget, in ms: a shared host's
+/// load only ever slows a run.
 fn bench<F: FnMut()>(mut f: F) -> f64 {
     let secs: f64 = std::env::var("BENCH_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let budget = Duration::from_secs_f64(secs);
     let start = Instant::now();
-    let mut n = 0u32;
+    let mut best = f64::MAX;
 
     f();
     while start.elapsed() < budget {
+        let t = Instant::now();
         f();
-        n += 1;
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
     }
-    start.elapsed().as_secs_f64() * 1e3 / n.max(1) as f64
+    best
 }
 
 #[test]
@@ -220,7 +238,29 @@ fn resolve_and_present_timings() {
             s.scanout.invalidate_all();
             s.scanout_update();
         });
-        println!("resolve {name:10} {}x{}: {ms:.3} ms per full resolve", s.scanout.mode.width, s.scanout.mode.height);
+        println!("resolve {name:10} {}x{}: {ms:.3} ms per full resolve (best run)", s.scanout.mode.width, s.scanout.mode.height);
+    }
+    for (rows, name) in [(480, "a 480-row window"), (1024, "every row")] {
+        let mut s = swap_board(rows);
+        s.scanout_update();
+        let ms = bench(|| {
+            s.front.lock().swap_arm = u32::MAX;
+            s.retrace();
+            s.scanout_update();
+        });
+        println!("swap {name:18} {}x{}: {ms:.3} ms per swap and update", s.scanout.mode.width, s.scanout.mode.height);
+    }
+    for (rows, name) in [(480, "480 lines"), (1024, "every line")] {
+        let locks = BoardLocks::new(scene_board(Scene::Rgb));
+        let display = Display::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let first = (SGI_ODYSSEY_HEIGHT as i32 - rows) / 2;
+
+        Odyssey::frame(&locks, &display);
+        let ms = bench(|| {
+            locks.board.lock().scanout.invalidate(first, rows);
+            Odyssey::frame(&locks, &display);
+        });
+        println!("frame {name:18} dirty, resolved and presented: {ms:.3} ms");
     }
     let display = Display::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let frame = resolved(Scene::Mixed);

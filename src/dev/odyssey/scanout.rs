@@ -32,6 +32,17 @@ pub struct Scanout {
     pub frame_width: u32,
     pub frame_height: u32, // what frame was allocated for
 
+    /// Per main drawable id, the rows where the two colour buffers may
+    /// differ, a bit a row. A swap of a window shows its other buffer, so
+    /// only those rows can change (Board::flip_rows()). Writers that name
+    /// their rows keep it (DrawnRows::take()). One that names a display
+    /// line, but not the buffer or the drawable, sets the line in
+    /// `unnamed`, and the next swap measures the buffers in those lines.
+    pub differ: Box<[[u64; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]>,
+    pub unnamed: [u64; ROW_WORDS],
+    /// The displayed-buffer bits the frame was last staged from.
+    pub staged_displayed: u32,
+
     pub retrace_deadline: i64, // virtual ns of the next retrace; -1 disarmed
     pub epoch: i64,            // virtual time of retrace 0
     pub frames: u64,           // retraces since the epoch
@@ -45,6 +56,9 @@ impl Default for Scanout {
             dirty: Vec::new(),
             frame_width: 0,
             frame_height: 0,
+            differ: Box::new([[0; ROW_WORDS]; ODSY_DISPMODE_COUNT as usize]),
+            unnamed: [0; ROW_WORDS],
+            staged_displayed: 0,
             retrace_deadline: -1,
             epoch: 0,
             frames: 0,
@@ -97,7 +111,9 @@ impl Scanout {
         true
     }
 
-    pub fn invalidate(&mut self, first: i32, count: i32) {
+    /// Resolve lines again because something other than the colour planes
+    /// changed (the lookup RAM, a display mode, the cursor, a swap).
+    pub fn repaint(&mut self, first: i32, count: i32) {
         let h: i32 = if !self.frame.is_empty() { self.mode.height as i32 } else { 0 };
         let last = first.wrapping_add(count).wrapping_sub(1);
 
@@ -108,6 +124,19 @@ impl Scanout {
         }
         for d in &mut self.dirty[first as usize..=last as usize] {
             *d = true;
+        }
+    }
+    pub fn repaint_all(&mut self) {
+        self.repaint(0, self.mode.height as i32);
+    }
+
+    /// Resolve lines again because the planes may have changed, in either
+    /// colour buffer: the lines, and the next swap measures the buffers.
+    pub fn invalidate(&mut self, first: i32, count: i32) {
+        self.repaint(first, count);
+        let last = first.wrapping_add(count).wrapping_sub(1).min(ROW_WORDS as i32 * 64 - 1);
+        for y in first.max(0)..=last {
+            self.unnamed[y as usize >> 6] |= 1 << (y & 63);
         }
     }
     pub fn invalidate_all(&mut self) {

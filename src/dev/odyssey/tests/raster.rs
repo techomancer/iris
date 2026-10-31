@@ -120,6 +120,14 @@ fn a_fence_behind_a_queued_draw_lands_after_the_draw() {
     h.raster.stop();
 }
 
+/// A scanout with the whole frame resolved.
+fn fresh_scanout() -> Scanout {
+    let mut scanout = Scanout::default();
+    scanout.set_mode(&ScanoutMode { width: SGI_ODYSSEY_WIDTH, height: SGI_ODYSSEY_HEIGHT, frame_clocks: 0, clock_hz: 0 });
+    scanout.dirty.fill(false);
+    scanout
+}
+
 /// The display takes the planes only between the raster unit's slices: a
 /// frame that starts while a slice is drawing waits for it to end.
 #[test]
@@ -131,8 +139,9 @@ fn the_display_waits_out_a_raster_slice_in_flight() {
     let s = h.board.lock();
     let mut planes = h.raster.planes();
     assert_ne!(pixel(&s, 0, 10, 10), 0, "the frame saw the whole draw");
-    let mut rows = Vec::new();
-    planes.take_rows(0, |y| rows.push(y));
+    let mut scanout = fresh_scanout();
+    planes.take_rows(0, &mut scanout);
+    let rows: Vec<u32> = (0..SGI_ODYSSEY_HEIGHT).filter(|&y| scanout.dirty[y as usize]).collect();
     assert!(rows.contains(&10), "and the display hears which rows the raster unit drew: {rows:?}");
     drop(planes);
     drop(s);
@@ -284,9 +293,9 @@ fn a_waiting_bus_read_is_busy_until_the_raster_unit_has_drawn() {
 /// The rows the display would resolve after the draws so far, for a board
 /// whose windows show the buffers `displayed` names.
 fn drawn_rows(h: &BoardLocks, displayed: u32) -> Vec<u32> {
-    let mut rows = Vec::new();
-    h.raster.planes().take_rows(displayed, |y| rows.push(y));
-    rows
+    let mut scanout = fresh_scanout();
+    h.raster.planes().take_rows(displayed, &mut scanout);
+    (0..SGI_ODYSSEY_HEIGHT).filter(|&y| scanout.dirty[y as usize]).collect()
 }
 
 /// Which rows of colour buffer b differ between two snapshots.
@@ -439,4 +448,222 @@ fn centre_sampled_lines_light_the_pixels_the_rule_names() {
 
     let rising = line_pixels(SGI_LINE_CENTRE_SAMPLED, (60.0, 9.75), (68.0, 13.75));
     assert_eq!(rising, [(60, 9), (61, 10), (62, 10), (63, 11), (64, 11), (65, 12), (66, 12), (67, 13)]);
+}
+
+/// Arm a swap of every window and let the retrace latch it.
+fn swap_every_window(s: &mut Board) {
+    s.front.lock().swap_arm = u32::MAX;
+    s.retrace();
+}
+
+/// The rows of the frame a display update resolved, found by the marker
+/// the test left in every row first.
+fn resolved_rows(s: &mut Board, h: &BoardLocks) -> Vec<u32> {
+    const MARK: u32 = 0xdead_0000;
+    let (w, ht) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
+
+    s.scanout.frame.fill(MARK);
+    let displayed = s.front.lock().displayed_buffer;
+    h.raster.planes().take_rows(displayed, &mut s.scanout);
+    s.scanout_update();
+    (0..ht as u32).filter(|&y| s.scanout.frame[y as usize * w] != MARK).collect()
+}
+
+/// A swap resolves the rows where the window's two buffers differ and no
+/// others, however the buffers came to differ: a draw into the buffer
+/// the window does not show asks for nothing until the swap, then the
+/// swap resolves those rows, and the swap back resolves them again.
+#[test]
+fn a_swap_resolves_the_rows_drawn_into_the_other_buffer_and_no_others() {
+    let (mut s, mut st) = gl_board();
+    s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
+    let h = BoardLocks::new(s);
+    let mut s = h.board.lock();
+    st.drawable.front = 1;
+    st.drawable.back = 1;
+    s.scanout_update();
+    // A swap and its swap back measure the buffers; from then on the draws'
+    // own rows are all the display knows.
+    swap_every_window(&mut s);
+    s.scanout_update();
+    swap_every_window(&mut s);
+    s.scanout_update();
+    assert!(s.scanout.unnamed.iter().all(|&w| w == 0));
+
+    let before = snapshot(&s, 1);
+    small_triangle(&mut s, &st, 100.0, RED);
+    small_triangle(&mut s, &st, 400.0, RED);
+    let changed = changed_rows(&s, 1, &before);
+    assert!(changed.len() > 40, "the triangles drew");
+
+    assert!(resolved_rows(&mut s, &h).is_empty(), "the window shows buffer 0, which they did not change");
+    swap_every_window(&mut s);
+    assert_eq!(resolved_rows(&mut s, &h), changed, "the swap shows buffer 1");
+    assert!(resolved_rows(&mut s, &h).is_empty(), "and nothing is left to resolve");
+    swap_every_window(&mut s);
+    assert_eq!(resolved_rows(&mut s, &h), changed, "the swap back shows buffer 0 in those rows");
+}
+
+/// A writer that does not name its rows makes the next swap measure the
+/// buffers: it resolves the rows they differ in, not the whole frame.
+#[test]
+fn a_swap_after_an_unnamed_write_resolves_only_the_rows_the_buffers_differ_in() {
+    let (mut s, _) = gl_board();
+    s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
+    let h = BoardLocks::new(s);
+    let mut s = h.board.lock();
+    s.scanout_update();
+
+    for y in 50..60 {
+        s.buffer_store(1, 10, y, 0x1234);
+    }
+    s.scanout.invalidate(50, 10);
+    assert_eq!(resolved_rows(&mut s, &h), (50..60).collect::<Vec<_>>());
+    swap_every_window(&mut s);
+    assert_eq!(resolved_rows(&mut s, &h), (50..60).collect::<Vec<_>>());
+}
+
+/// A front-end pixel write names only its display line: the next swap
+/// measures that line and takes the rest from the draws' own rows.
+#[test]
+fn a_swap_measures_only_the_lines_an_unnamed_write_marked() {
+    let (mut s, mut st) = gl_board();
+    s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
+    let h = BoardLocks::new(s);
+    let mut s = h.board.lock();
+    st.drawable.front = 1;
+    st.drawable.back = 1;
+    swap_every_window(&mut s);
+    s.scanout_update();
+    swap_every_window(&mut s);
+    s.scanout_update();
+
+    let before = snapshot(&s, 1);
+    small_triangle(&mut s, &st, 100.0, RED);
+    let mut want = changed_rows(&s, 1, &before);
+    s.buffer_store(1, 300, 700, 0x1234);
+    s.scanout.invalidate(700, 1);
+    want.push(700);
+    // A line that matches in both buffers is marked and found equal.
+    s.buffer_store(1, 300, 800, 0);
+    s.scanout.invalidate(800, 1);
+
+    assert_eq!(resolved_rows(&mut s, &h), vec![700, 800], "the written lines repaint");
+    swap_every_window(&mut s);
+    assert_eq!(resolved_rows(&mut s, &h), want, "the swap shows the drawn rows and the line that differs, not the one that does not");
+    assert!(s.scanout.unnamed.iter().all(|&w| w == 0), "the swap measured the marked lines");
+}
+
+/// Whatever the draws, unnamed writes, swaps and lookup changes, the frame
+/// the incremental updates keep is the one a whole resolve makes.
+#[test]
+fn incremental_updates_keep_the_frame_a_whole_resolve_makes() {
+    use crate::dev::odyssey::raster_bench::Lcg;
+    let (mut s, mut st) = gl_board();
+    s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
+    let mut rng = Lcg(0x5a17);
+    for v in s.lut.iter_mut().take(4096) {
+        *v = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
+    }
+    // Four windows in vertical bands.
+    for (i, d) in s.did.iter_mut().enumerate() {
+        *d = (((i % SGI_ODYSSEY_WIDTH as usize) / 320) as u8) << ODSY_DID_MAIN_SHIFT;
+    }
+    let h = BoardLocks::new(s);
+    let mut s = h.board.lock();
+    s.scanout_update();
+
+    for step in 0..120 {
+        match rng.next_u32() % 6 {
+            0 | 1 => {
+                let target = rng.next_u32() & 1;
+                st.drawable.front = target;
+                st.drawable.back = target;
+                let y = (rng.next_u32() % 900) as f32;
+                small_triangle(&mut s, &st, y, [(rng.next_u32() % 2) as f32, (rng.next_u32() % 2) as f32, 1.0, 1.0]);
+            }
+            2 => {
+                let (x, y) = ((rng.next_u32() % 1200) as i64, (rng.next_u32() % 1000) as i64);
+                s.buffer_store(rng.next_u32() & 1, x, y, rng.next_u32());
+                s.scanout.invalidate(y as i32, 1);
+            }
+            3 => {
+                let i = (rng.next_u32() % 4096) as usize;
+                s.lut[i] = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
+                s.scanout.repaint_all();
+            }
+            _ => {
+                s.front.lock().swap_arm = rng.next_u32() & 0xf;
+                s.retrace();
+            }
+        }
+        if rng.next_u32() % 2 == 0 {
+            h.raster.wait_idle();
+            let displayed = s.front.lock().displayed_buffer;
+            h.raster.planes().take_rows(displayed, &mut s.scanout);
+            s.scanout_update();
+            let w = s.scanout.frame_width;
+            let mut want = vec![0u32; w as usize];
+            for y in 0..s.scanout.frame_height {
+                s.resolve_row_generic(y, &mut want);
+                assert_eq!(&s.scanout.frame[(y * w) as usize..((y + 1) * w) as usize], &want[..], "step {step}, row {y}");
+            }
+        }
+    }
+}
+
+/// The screen the display keeps holds the frame, cursor and all, however
+/// few lines each frame presents: the first frame takes the whole picture
+/// and the ones after it only the lines they resolved.
+#[test]
+fn the_screen_follows_the_frame_through_frames_that_present_a_few_lines() {
+    use crate::dev::odyssey::raster_bench::Lcg;
+    use std::sync::atomic::AtomicU64;
+    let (mut s, mut st) = gl_board();
+    s.set_scanout_size(SGI_ODYSSEY_WIDTH, SGI_ODYSSEY_HEIGHT);
+    let mut rng = Lcg(0xfeed);
+    for v in s.lut.iter_mut().take(4096) {
+        *v = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
+    }
+    s.cursor[ODSY_CURSOR_POSITION as usize] = 100 << 16 | 40;
+    for i in 0..ODSY_CURSOR_COLOUR_COUNT {
+        s.cursor[(ODSY_CURSOR_COLOURS + 1 + i) as usize] = rng.next_u32() & ODSY_LUT_ENTRY_MASK;
+    }
+    for w in 0..128u32 {
+        s.cursor[(ODSY_CURSOR_GLYPH + w) as usize] = rng.next_u32();
+    }
+    s.cursor[ODSY_CURSOR_CONTROL as usize] = ODSY_CURSOR_CTL_ENABLE;
+    let h = BoardLocks::new(s);
+    let display = Display::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (w, ht) = (SGI_ODYSSEY_WIDTH as usize, SGI_ODYSSEY_HEIGHT as usize);
+
+    for step in 0..8 {
+        {
+            let mut s = h.board.lock();
+            let target = step & 1;
+            st.drawable.front = target;
+            st.drawable.back = target;
+            small_triangle(&mut s, &st, 20.0 + 120.0 * step as f32, [1.0, (step & 1) as f32, 1.0, 1.0]);
+            if step == 5 {
+                s.cursor[ODSY_CURSOR_POSITION as usize] = 200 << 16 | 500;
+                let span = s.cursor_span();
+                s.cursor_invalidate(span);
+            }
+            if step % 3 == 2 {
+                s.front.lock().swap_arm = u32::MAX;
+            }
+        }
+        h.raster.wait_idle();
+        Odyssey::frame(&h, &display);
+        let s = h.board.lock();
+        let screen = display.screen.lock();
+        for y in 0..ht {
+            for x in 0..w {
+                let rgb = s.scanout.frame[y * w + x];
+                let want = 0xff00_0000 | (rgb & 0xff) << 16 | rgb & 0xff00 | (rgb >> 16) & 0xff;
+                let at = y * crate::disp::FB_STRIDE + x;
+                assert_eq!((screen.fb_rgb[at], screen.rgba[at]), (want, want), "step {step} ({x}, {y})");
+            }
+        }
+    }
 }

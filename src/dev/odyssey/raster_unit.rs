@@ -128,34 +128,33 @@ impl DrawnRows {
         }
     }
 
-    /// Hand over the rows that show a change under the displayed-buffer
-    /// bits `displayed`, and forget every row. A row written to a buffer no
-    /// window shows is forgotten too: the window shows it only after a flip
-    /// of its displayed buffer, and that repaints the whole frame.
-    pub fn take(&mut self, displayed: u32, mut row: impl FnMut(u32)) {
+    /// Hand the display the rows the draws so far changed, and forget
+    /// them. A row shows a change when a buffer a window shows was written
+    /// there: the scanout repaints it. A row written to either buffer
+    /// joins the rows where the window's buffers may differ
+    /// (Scanout::differ), which a swap of that window repaints.
+    pub fn take(&mut self, displayed: u32, scanout: &mut Scanout) {
         let mut shown = self.overlay;
 
-        for (b, ids) in self.by_id.iter().enumerate() {
-            for (id, rows) in ids.iter().enumerate() {
+        for (b, ids) in self.by_id.iter_mut().enumerate() {
+            for (id, rows) in ids.iter_mut().enumerate() {
                 if (displayed >> id) & 1 == b as u32 {
-                    for (s, w) in shown.iter_mut().zip(rows) {
+                    for (s, w) in shown.iter_mut().zip(rows.iter()) {
                         *s |= w;
                     }
                 }
-            }
-        }
-        for (i, mut w) in shown.into_iter().enumerate() {
-            while w != 0 {
-                row(i as u32 * 64 + w.trailing_zeros());
-                w &= w - 1;
-            }
-        }
-        for ids in self.by_id.iter_mut() {
-            for rows in ids.iter_mut() {
-                *rows = [0; ROW_WORDS];
+                for (d, w) in scanout.differ[id].iter_mut().zip(rows.iter_mut()) {
+                    *d |= std::mem::take(w);
+                }
             }
         }
         self.overlay = [0; ROW_WORDS];
+        for (i, mut w) in shown.into_iter().enumerate() {
+            while w != 0 {
+                scanout.repaint((i as u32 * 64 + w.trailing_zeros()) as i32, 1);
+                w &= w - 1;
+            }
+        }
     }
 }
 
@@ -196,10 +195,10 @@ pub struct PlanesHeld<'a> {
 }
 
 impl PlanesHeld<'_> {
-    /// The colour rows the raster unit wrote since the last call that show
-    /// a change under the displayed-buffer bits (DrawnRows::take()).
-    pub fn take_rows(&mut self, displayed: u32, row: impl FnMut(u32)) {
-        self._ctx.drawn.take(displayed, row);
+    /// The colour rows the raster unit wrote since the last call, to the
+    /// scanout (DrawnRows::take()).
+    pub fn take_rows(&mut self, displayed: u32, scanout: &mut Scanout) {
+        self._ctx.drawn.take(displayed, scanout);
     }
 }
 

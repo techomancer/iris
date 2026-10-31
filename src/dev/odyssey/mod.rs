@@ -219,8 +219,10 @@ impl Odyssey {
     fn frame(state: &BoardLocks, display: &Display) {
         crate::pf_begin!(crate::perfetto::events::ODSY_CAPTURE);
         let mut s = state.board.lock();
+        if let Some(done) = display.done.lock().take() {
+            s.scanout_recycle(done);
+        }
         s.scanout_poll(monotonic_ns());
-        let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
         // The planes are the raster unit's: wait out its slice in flight and
         // hold off the next while the frame's lines are copied aside. The
         // colour rows it wrote since the last frame are resolved again.
@@ -228,7 +230,7 @@ impl Odyssey {
         let mut planes = state.raster.planes();
         crate::pf_begin!(crate::perfetto::events::ODSY_FRAME_PLANES);
         let displayed = s.front.lock().displayed_buffer;
-        planes.take_rows(displayed, |y| s.scanout.invalidate(y as i32, 1));
+        planes.take_rows(displayed, &mut s.scanout);
         s.scanout_stage();
         crate::pf_end!(crate::perfetto::events::ODSY_FRAME_PLANES);
         drop(planes);
@@ -240,27 +242,37 @@ impl Odyssey {
             job.resolve();
         }
         let mut s = state.board.lock();
-        let span = s.scanout_finish(job);
+        let span = job.as_mut().and_then(|job| s.scanout_commit(job));
         let (w, h) = (s.scanout.frame_width as usize, s.scanout.frame_height as usize);
+        let keep = |job: Option<ScanoutJob>| *display.done.lock() = job;
         if w == 0 || h == 0 || s.scanout.frame.len() < w * h {
+            drop(s);
+            keep(job);
             crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;
         }
         // A new size has nothing valid on the screen yet: take every line.
-        let span = if display.shown() != (w, h) { Some((0, h)) } else { span };
-        if !display.due(span.is_some()) {
+        let new_size = display.shown() != (w, h);
+        if !display.due(new_size || span.is_some()) {
+            drop(s);
+            keep(job);
             crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
             return;
         }
-        // Only the changed lines leave the board lock.
-        let (first, end) = span.unwrap_or((0, 0));
-        let rows = s.scanout.frame[first * w..end * w].to_vec();
+        // Only a new size copies the frame under the board lock; otherwise
+        // the committed lines are converted from the update's own rows.
+        let whole = new_size.then(|| s.scanout.frame[..w * h].to_vec());
         drop(s);
         set_display_fifo_pending(state.fifo.level() as usize + state.raster.pending() as usize);
         crate::pf_end!(crate::perfetto::events::ODSY_CAPTURE);
         crate::pf_begin!(crate::perfetto::events::ODSY_PRESENT);
-        display.present(&rows, w, h, first);
+        match (&whole, &job) {
+            (Some(rows), _) => display.present(rows, w, h, 0),
+            (None, Some(job)) => display.present_lines(job.lines(), w, h),
+            (None, None) => display.present(&[], w, h, 0),
+        }
         crate::pf_end!(crate::perfetto::events::ODSY_PRESENT);
+        keep(job);
     }
 }
 
