@@ -25,26 +25,208 @@ use std::sync::{
 
 pub const PART_SIZE: usize = 8 << 20;
 pub const FLASH_SIZE: usize = 2 * PART_SIZE;
+
+/// The environment records that mark the empty processor positions of a
+/// two-processor IP35 board, slots B and D, disabled, with their offsets
+/// in the store: the records the stock PROM writes itself after its
+/// failed-start recovery has given up on each empty position. Seeding a
+/// fresh store with them spares the PROM three power cycles per position.
+/// That the board ships in this state is a model policy, not a recovered
+/// factory image.
+///
+/// Ported from tests/functional/mips64/lib_origin300.py in
+/// jamesbraid/qemu-sgi-origami.
+pub fn two_processor_environment() -> Vec<(usize, Vec<u8>)> {
+    const VALUE: &[u8] = b"32: CPU failed early init.";
+    let record = |slot: u8| {
+        let mut bytes = vec![0x10];
+        bytes.extend_from_slice(b"Disable");
+        bytes.push(slot);
+        bytes.extend_from_slice(&[0; 7]);
+        bytes.extend_from_slice(VALUE);
+        bytes.extend_from_slice(&[0; 22]);
+        bytes
+    };
+    let records = PART_SIZE + 0x1e0100;
+    vec![(records, record(b'B')), (records + 0x40, record(b'D'))]
+}
 pub const SECOND_POSITION: u64 = 32 << 20;
 
 fn sum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |s, b| s.wrapping_add(*b))
 }
 
-/// The configuration block's CPU type word: 0 for the R10000 and R12000, 1
-/// for the R14000, 2 for the R16000, as the IP35 PROM's own configuration
-/// editor lists them. The Fuel has an R14000.
-const CPU_TYPE_R14000: u32 = 1;
+/// The fields of the PROM's configuration block that depend on the board.
+///
+/// The PROM reads them from flash before it touches the processor, so they
+/// must agree with the CPU the machine builds: a mismatch in the boot-mode
+/// word sends it to its error routine before it initialises GP. The values
+/// are not a measured flash dump: the Tezro rows' mode words and clocks are
+/// rows of the PROM's speed table where it has one, and each row's doc says
+/// so or says what was derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareRecord {
+    /// The CPU boot-mode word the PROM compares with the processor's mode.
+    pub cpu_mode_word: u32,
+    /// The mode bits the processor latches into CP0 Config at reset: Config
+    /// bits 24:0 (the R10000 family's reset-mode inputs).
+    pub reset_mode: u32,
+    /// The processor clock the PROM reports and times against, in Hz.
+    pub cpu_clock_hz: u32,
+    /// The record's CPU type word at +0x30: 0 for the R10000 and R12000, 1 for
+    /// the R14000, 2 for the R16000, as the IP35 PROM's configuration editor
+    /// lists them. The Fuel's record keeps the value it was configured with.
+    pub cpu_type: u32,
+    /// How the record reaches the configuration block.
+    pub header: Header,
+}
 
-/// Apply Fuel's firmware record fields while retaining the configuration sum.
-/// This policy also applies when reopening an existing persistent store.
-fn configure(data: &mut [u8]) {
-    let config = &mut data[0x60..0xb0];
+/// How a board's record is put into the configuration block at 0x60.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Header {
+    /// Rewrite the board's fields over the payload's own block, keeping its
+    /// byte sum, whenever a store is formatted or opened. QEMU configures a
+    /// Fuel's flash this way.
+    Refreshed,
+    /// Replace the whole block with the one authored for the board's flash
+    /// seed, once, when a store is formatted, with the compensation byte the
+    /// PROM's editor would choose (the block's byte sum is the replaced
+    /// block's, so the image still sums to zero). An opened store keeps the
+    /// block it holds, so a flash update the PROM wrote survives.
+    Authored,
+}
+
+impl FirmwareRecord {
+    /// The Fuel's 500 MHz R14000 with a 2 MiB secondary cache.
+    pub const FUEL: Self = Self {
+        cpu_mode_word: 0x549a_a985,
+        reset_mode: 0x009a_a985,
+        cpu_clock_hz: 500_000_000,
+        cpu_type: 1,
+        header: Header::Refreshed,
+    };
+    /// The Tezro's 700 MHz R16000 with a 4 MiB secondary cache. The mode word
+    /// is the row of the stock IP35 PROM's speed table for 700 MHz, 4 MiB and
+    /// cache tap 0xc (established), and its low 25 bits are the Config word the
+    /// Tezro board resets this chip with. The CPU type is 2, the R16000 code the PROM's own editor writes.
+    pub const TEZRO: Self = Self {
+        cpu_mode_word: 0x589b_ad85,
+        reset_mode: 0x009b_ad85,
+        cpu_clock_hz: 700_000_000,
+        cpu_type: 2,
+        header: Header::Authored,
+    };
+    /// The Tezro's 800 MHz R16000 with a 4 MiB secondary cache: the PROM speed
+    /// table's row for 800 MHz, 4 MiB and tap 0xa (established; the table has a
+    /// second row with tap 0xb and the same low 25 bits, and the 0xa one is
+    /// what 800 MHz Tezro inventories print).
+    pub const TEZRO_800: Self = Self {
+        cpu_mode_word: 0x549b_af85,
+        reset_mode: 0x009b_af85,
+        cpu_clock_hz: 800_000_000,
+        cpu_type: 2,
+        header: Header::Authored,
+    };
+    /// The Tezro's 900 MHz R16000 with an 8 MiB secondary cache: the PROM
+    /// speed table's row for 900 MHz (established; it is the table's only 900
+    /// MHz row, tap 0xb, which a 900 MHz inventory prints). That a Tezro was
+    /// ever sold or flashed with this part is not established.
+    pub const TEZRO_900: Self = Self {
+        cpu_mode_word: 0x569c_b185,
+        reset_mode: 0x009c_b185,
+        cpu_clock_hz: 900_000_000,
+        cpu_type: 2,
+        header: Header::Authored,
+    };
+    /// The Tezro's 1 GHz R16000 with a 16 MiB secondary cache. The PROM's
+    /// speed table, whose top clock is 900 MHz, has no row for it, and no
+    /// capture records the word: it is inferred (the clock-dependent fields
+    /// from the editor's formulas, the way the table's rows decode, and bit 23
+    /// set as in every row of 500 MHz and up), so the record is approximated.
+    /// EC code 9 is 2 * 1000 / 200 - 1, SC code 5 gives the printed 333 MHz
+    /// cache clock (2 * 1000 / (SC + 1)), SS code 5 is 16 MiB, and the printed
+    /// tap 0x15 is 0x5 in bits 28:25 with the fifth bit at bit 22.
+    pub const TEZRO_1000: Self = Self {
+        cpu_mode_word: 0x4aed_b385,
+        reset_mode: 0x00ed_b385,
+        cpu_clock_hz: 1_000_000_000,
+        cpu_type: 2,
+        header: Header::Authored,
+    };
+    /// CP0 Config at reset: the fixed 32 KiB primary cache sizes (fields 3
+    /// in bits 31:29 and 28:26) with the board's mode bits.
+    pub const fn reset_config0(&self) -> u32 {
+        (3 << 29) | (3 << 26) | (self.reset_mode & 0x01ff_ffff)
+    }
+
+    /// The configuration block written into an IP53 seed: the format word,
+    /// the board's mode word, the `ip27conf` magic, the processor and
+    /// 200 MHz controller clocks as 64-bit words, the real-time clock's
+    /// 1,250,000 Hz, the CPU type, a zero compensation byte (the caller sets
+    /// it), an edit counter of one, and the PROM's 6.210 version fields.
+    /// The layout is the PROM editor's.
+    fn authored_block(&self) -> [u8; CONFIG_LEN] {
+        let mut block = [0u8; CONFIG_LEN];
+        let mut put = |offset: usize, bytes: &[u8]| block[offset..offset + bytes.len()].copy_from_slice(bytes);
+        put(0x00, &21u32.to_be_bytes());
+        put(0x04, &self.cpu_mode_word.to_be_bytes());
+        put(0x08, b"ip27conf");
+        put(0x10, &u64::from(self.cpu_clock_hz).to_be_bytes());
+        put(0x18, &200_000_000u64.to_be_bytes());
+        put(0x20, &1_250_000u64.to_be_bytes());
+        for (offset, value) in [
+            (0x28, 1),
+            (0x2c, 16),
+            (0x30, self.cpu_type),
+            (0x34, 0),
+            (0x38, 1),
+            (0x3c, 16),
+            (0x40, 6),
+            (0x44, 210),
+            (0x48, 0),
+        ] {
+            put(offset, &u32::to_be_bytes(value));
+        }
+        block
+    }
+}
+
+/// Where the PROM's configuration block sits in the payload, and its size.
+const CONFIG_BASE: usize = 0x60;
+const CONFIG_LEN: usize = 0x50;
+
+/// Put the board's record into a store being formatted.
+fn format_header(data: &mut [u8], record: &FirmwareRecord) {
+    match record.header {
+        Header::Refreshed => configure(data, record),
+        Header::Authored => {
+            // The compensation byte is the PROM editor's rule: the new block
+            // sums, byte for byte, to what the block it replaces did, so the
+            // image still sums to zero (the check the PROM runs on itself).
+            let old = sum(&data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN]);
+            let mut block = record.authored_block();
+            block[0x37] = old.wrapping_sub(sum(&block));
+            data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN].copy_from_slice(&block);
+        }
+    }
+}
+
+/// Put the board's record into a store that was opened rather than formatted.
+fn reopen_header(data: &mut [u8], record: &FirmwareRecord) {
+    match record.header {
+        Header::Refreshed => configure(data, record),
+        Header::Authored => {}
+    }
+}
+
+/// Apply the board's firmware record while retaining the configuration sum.
+fn configure(data: &mut [u8], record: &FirmwareRecord) {
+    let config = &mut data[CONFIG_BASE..CONFIG_BASE + CONFIG_LEN];
     let old = sum(config);
     config[0x34..0x38].fill(0);
-    config[4..8].copy_from_slice(&0x549aa985u32.to_be_bytes());
-    config[0x14..0x18].copy_from_slice(&500_000_000u32.to_be_bytes());
-    config[0x30..0x34].copy_from_slice(&CPU_TYPE_R14000.to_be_bytes());
+    config[4..8].copy_from_slice(&record.cpu_mode_word.to_be_bytes());
+    config[0x14..0x18].copy_from_slice(&record.cpu_clock_hz.to_be_bytes());
+    config[0x30..0x34].copy_from_slice(&record.cpu_type.to_be_bytes());
     config[0x38..0x3c].copy_from_slice(&1u32.to_be_bytes());
     let adjustment = old.wrapping_sub(sum(config));
     config[0x34..0x38].copy_from_slice(&(adjustment as u32).to_be_bytes());
@@ -116,12 +298,19 @@ pub struct Flash {
 }
 
 impl Flash {
-    /// Format a fresh two-position store from a decoded payload.
-    pub fn new(payload: &[u8]) -> io::Result<Self> {
+    /// Format a fresh two-position store from a decoded payload, with the
+    /// board's firmware record.
+    pub fn new(payload: &[u8], record: FirmwareRecord) -> io::Result<Self> {
+        Self::seeded(payload, record, &[])
+    }
+
+    /// [`Self::new`], with environment `records` written into the volume
+    /// after its label, each at its own offset into the store.
+    pub fn seeded(payload: &[u8], record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
         if payload.len() > PART_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Fuel PROM payload exceeds 8 MiB",
+                "PROM payload exceeds 8 MiB",
             ));
         }
         let mut data = vec![0xff; FLASH_SIZE];
@@ -130,7 +319,10 @@ impl Flash {
         data[label + 0x10..label + 0x14].copy_from_slice(&0x504c4f49u32.to_be_bytes());
         data[label + 0x14..label + 0x18].copy_from_slice(&1u32.to_be_bytes());
         data[label + 0x18..label + 0x1c].copy_from_slice(&1u32.to_be_bytes());
-        configure(&mut data);
+        format_header(&mut data, &record);
+        for (offset, bytes) in records {
+            data[*offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
         Ok(Self {
             st: Mutex::new(State::new(data)),
             gen: AtomicU64::new(0),
@@ -138,23 +330,30 @@ impl Flash {
     }
 
     /// Load an exact 16 MiB store, or seed a missing/empty one. Wrong sizes are
-    /// refused without writes. Reopening reapplies Fuel's configuration policy.
+    /// refused without writes. Reopening reapplies a refreshed firmware record
+    /// and leaves an authored one as the store holds it.
     /// Completed guest programming and erasure write through to this file.
-    pub fn with_file(payload: &[u8], path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut data = Self::new(payload)?.st.into_inner().data;
+    pub fn with_file(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord) -> io::Result<Self> {
+        Self::with_file_seeded(payload, path, record, &[])
+    }
+
+    /// [`Self::with_file`], seeding a missing or empty store with `records`
+    /// as [`Self::seeded`] does. A store that exists keeps what it holds.
+    pub fn with_file_seeded(payload: &[u8], path: impl AsRef<Path>, record: FirmwareRecord, records: &[(usize, Vec<u8>)]) -> io::Result<Self> {
+        let mut data = Self::seeded(payload, record, records)?.st.into_inner().data;
         let mut backing = FlashBacking::open(path, &mut data).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Fuel flash store must be exactly 16 MiB (or empty)",
+                    "flash store must be exactly 16 MiB (or empty)",
                 )
             } else {
                 error
             }
         })?;
-        configure(&mut data);
-        // Opening an existing store loads it before Fuel's configuration
-        // fields are refreshed; an empty store was seeded from this same data.
+        reopen_header(&mut data, &record);
+        // Opening an existing store loads it before a refreshed record's
+        // fields are applied; an empty store was seeded from this same data.
         backing.write_range(0, &data)?;
         let flash = Self {
             st: Mutex::new(State {
@@ -384,11 +583,29 @@ mod tests {
         assert_eq!(v.write64(part + 4 * offset, 0x30), BUS_OK);
     }
 
+    /// The two-processor seed holds DisableB and DisableD after the volume
+    /// label, byte for byte as the QEMU Origin 300 boot tests seed them,
+    /// and an existing store keeps what it holds.
+    #[test]
+    fn the_two_processor_seed_disables_slots_b_and_d() {
+        let records = two_processor_environment();
+        let f = Flash::seeded(&[], FirmwareRecord::TEZRO, &records).unwrap();
+        let bytes = f.contents();
+        let mut expected = vec![0x10];
+        expected.extend_from_slice(b"DisableB\0\0\0\0\0\0\032: CPU failed early init.");
+        expected.extend_from_slice(&[0; 22]);
+        assert_eq!(&bytes[0x9e0100..0x9e0140], expected.as_slice());
+        expected[8] = b'D';
+        assert_eq!(&bytes[0x9e0140..0x9e0180], expected.as_slice());
+        assert!(bytes[0x9e0180..0x9e0200].iter().all(|&b| b == 0xff));
+        assert_eq!(Flash::new(&[], FirmwareRecord::TEZRO).unwrap().contents()[0x9e0100], 0xff);
+    }
+
     /// The PROM reads CPU configuration and the volume label from its boot flash.
     #[test]
     fn the_seed_exposes_fuel_configuration_and_volume_label() {
         let seed = vec![0x21; 0xb0];
-        let f = Flash::new(&seed).unwrap();
+        let f = Flash::new(&seed, FirmwareRecord::FUEL).unwrap();
         let bytes = f.contents();
         assert_eq!(sum(&bytes[0x60..0xb0]), sum(&seed[0x60..0xb0]));
         assert_eq!(&bytes[0x64..0x68], &0x549aa985u32.to_be_bytes());
@@ -401,14 +618,183 @@ mod tests {
             &[0x50, 0x4c, 0x4f, 0x49, 0, 0, 0, 1, 0, 0, 0, 1]
         );
         assert!(bytes[label + 28..].iter().all(|b| *b == 0xff));
-        assert!(Flash::new(&vec![0; PART_SIZE + 1]).is_err());
+        assert!(Flash::new(&vec![0; PART_SIZE + 1], FirmwareRecord::FUEL).is_err());
+    }
+    /// The stock image's factory block: the 400 MHz mode word, machine type 0
+    /// and a zero check adjustment, before any board configures it.
+    fn factory_block() -> Vec<u8> {
+        let mut image = vec![0x21; 0xb0];
+        image[0x60..0xb0].fill(0);
+        image[0x64..0x68].copy_from_slice(&0x5219a785u32.to_be_bytes());
+        image[0x70..0x78].copy_from_slice(&400_000_000u64.to_be_bytes());
+        image
+    }
+
+    /// A refreshed record leaves the block's byte sum unchanged: the check
+    /// adjustment absorbs the difference.
+    #[test]
+    fn a_refreshed_record_configures_the_block_and_keeps_its_byte_sum() {
+        let record = FirmwareRecord::FUEL;
+        let image = factory_block();
+        let bytes = Flash::new(&image, record).unwrap().contents();
+        let block = &bytes[0x60..0xb0];
+        assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes());
+        assert_eq!(&block[0x14..0x18], &record.cpu_clock_hz.to_be_bytes());
+        assert_eq!(&block[0x30..0x34], &record.cpu_type.to_be_bytes());
+        assert_eq!(&block[0x38..0x3c], &1u32.to_be_bytes(), "flash program count");
+        assert_eq!(&block[0x34..0x38], &[0, 0, 0, 0x9c]);
+        assert_eq!(sum(block), sum(&image[0x60..0xb0]));
+    }
+
+    const TEZRO_RECORDS: [(&str, FirmwareRecord); 4] = [
+        ("700", FirmwareRecord::TEZRO),
+        ("800", FirmwareRecord::TEZRO_800),
+        ("900", FirmwareRecord::TEZRO_900),
+        ("1000", FirmwareRecord::TEZRO_1000),
+    ];
+
+    /// The stock block the PROM ships: the 400 MHz R10000 and R12000 row, CPU
+    /// type 0, no compensation, edit counter 0. Built field by field, not
+    /// copied; its byte sum is 0xac, as the PROM's own checksum rule sees it.
+    fn stock_block() -> [u8; CONFIG_LEN] {
+        let mut block = FirmwareRecord { cpu_mode_word: 0x5219_a785, cpu_clock_hz: 400_000_000, cpu_type: 0, ..FirmwareRecord::TEZRO }
+            .authored_block();
+        block[0x38..0x3c].fill(0);
+        assert_eq!(sum(&block), 0xac, "the stock block's byte sum");
+        block
+    }
+
+    /// An image whose configuration block is the stock one, as the PROM's own
+    /// image has it.
+    fn stock_image() -> Vec<u8> {
+        let mut image = vec![0x21; 0x200];
+        image[0x60..0xb0].copy_from_slice(&stock_block());
+        image
+    }
+
+    /// The seed's block follows the PROM editor's layout and rule: the mode
+    /// word, the clock, the Bedrock and real-time clocks, the CPU type 2 the
+    /// editor writes for an R16000 and an edit counter of one, and a
+    /// compensation byte that makes the block sum to what the stock block did,
+    /// 0xac, so the image keeps summing to zero. The compensation values are
+    /// the PROM's own for one edit of a stock-seeded image: 0xd8, 0xfd (the
+    /// 800 MHz row) and 0x1c.
+    #[test]
+    fn the_tezro_seed_writes_the_blocks_the_proms_editor_would() {
+        let image = stock_image();
+        for ((name, record), compensation) in TEZRO_RECORDS.iter().zip([Some(0xd8u8), Some(0xfd), Some(0x1c), None]) {
+            let bytes = Flash::new(&image, *record).unwrap().contents();
+            let block = &bytes[0x60..0xb0];
+            assert_eq!(&block[0..4], &21u32.to_be_bytes(), "{name}");
+            assert_eq!(&block[4..8], &record.cpu_mode_word.to_be_bytes(), "{name}");
+            assert_eq!(&block[8..16], b"ip27conf", "{name}");
+            assert_eq!(&block[0x10..0x18], &u64::from(record.cpu_clock_hz).to_be_bytes(), "{name}");
+            assert_eq!(&block[0x18..0x20], &200_000_000u64.to_be_bytes(), "{name}: Bedrock clock");
+            assert_eq!(&block[0x20..0x28], &1_250_000u64.to_be_bytes(), "{name}: real-time clock");
+            assert_eq!(&block[0x30..0x34], &2u32.to_be_bytes(), "{name}: CPU type R16000");
+            assert_eq!(&block[0x38..0x3c], &1u32.to_be_bytes(), "{name}: one edit");
+            assert_eq!(sum(block), 0xac, "{name}: the stock block's sum");
+            if let Some(byte) = compensation {
+                assert_eq!(block[0x37], byte, "{name}: the compensation the PROM editor computes");
+            }
+            assert_eq!(&bytes[..0x60], &image[..0x60], "{name}: the payload around the block is untouched");
+            assert_eq!(&bytes[0xb0..image.len()], &image[0xb0..]);
+        }
+    }
+
+    /// The compensation follows whatever block the payload carried (the whole
+    /// image keeps its sum), and changing any one byte of a seeded block off
+    /// its compensated value breaks the sum.
+    #[test]
+    fn the_compensation_byte_keeps_the_images_sum_and_any_change_breaks_it() {
+        // An image that sums to zero, as the PROM's own does, still sums to
+        // zero once a record's block is seeded into it.
+        let mut zero = stock_image();
+        zero[0x1ff] = 0u8.wrapping_sub(sum(&zero[..0x1ff]));
+        assert_eq!(sum(&zero), 0);
+        for (name, record) in TEZRO_RECORDS {
+            assert_eq!(sum(&Flash::new(&zero, record).unwrap().contents()[..0x200]), 0, "{name}: the seeded image sums to zero");
+        }
+        for payload in [stock_image(), vec![0x5a; 0x200], factory_block()] {
+            let before = sum(&payload[..0x200.min(payload.len())]);
+            for (name, record) in TEZRO_RECORDS {
+                let bytes = Flash::new(&payload, record).unwrap().contents();
+                let end = 0x200.min(payload.len());
+                assert_eq!(sum(&bytes[..end]), before, "{name}: the image's byte sum");
+                // A record that differs in one field is compensated to the same sum.
+                let other = FirmwareRecord { cpu_mode_word: record.cpu_mode_word ^ 0x0100_0000, ..record };
+                assert_eq!(sum(&Flash::new(&payload, other).unwrap().contents()[..end]), before, "{name}: another mode word");
+                for at in 0x60..0xb0 {
+                    let mut broken = bytes[..end].to_vec();
+                    broken[at] ^= 1;
+                    assert_ne!(sum(&broken), before, "{name}: byte {at:#x}");
+                }
+            }
+        }
+    }
+
+    /// The Tezro records carry the PROM table's mode words and the Config the
+    /// CPU resets to carries the same low 25 bits, so the PROM's check of one
+    /// against the other passes; the mode words of the three chips the PROM's
+    /// speed table lists are its rows, and the 1 GHz one decodes by the
+    /// editor's formulas.
+    #[test]
+    fn the_tezro_records_carry_their_mode_words_and_the_configs_they_imply() {
+        // Config bits 24:0 are the mode inputs; the cache sizes above are fixed.
+        const CONFIG0_MODE_MASK: u32 = 0x01ff_ffff;
+        // (mode word, clock MHz, Bedrock MHz = 200): the PROM table's rows.
+        let rows = [(0x589bad85u32, 700u32, 0x6c9b_ad85u32), (0x549baf85, 800, 0x6c9b_af85), (0x569cb185, 900, 0x6c9c_b185)];
+        for ((_, record), (word, mhz, config)) in TEZRO_RECORDS.iter().zip(rows) {
+            assert_eq!(record.cpu_mode_word, word);
+            assert_eq!(record.cpu_clock_hz, mhz * 1_000_000);
+            assert_eq!(record.reset_config0(), config);
+        }
+        let field = |word: u32, lo: u32, bits: u32| (word >> lo) & ((1 << bits) - 1);
+        let decoded = [(350, 4u32 << 20), (400, 4 << 20), (450, 8 << 20), (333, 16 << 20)];
+        for ((name, r), (cache_mhz, cache_bytes)) in TEZRO_RECORDS.iter().zip(decoded) {
+            let (w, mhz) = (r.cpu_mode_word, r.cpu_clock_hz / 1_000_000);
+            assert_eq!(w & CONFIG0_MODE_MASK, r.reset_mode, "{name}");
+            assert_eq!((field(w, 0, 3), field(w, 7, 2), field(w, 13, 1), field(w, 15, 1)), (5, 3, 1, 1), "{name}: K0 PM SB BE");
+            assert_eq!(field(w, 9, 4), 2 * mhz / 200 - 1, "{name}: EC = 2 * CPU / Bedrock - 1");
+            assert_eq!(2 * mhz / (field(w, 19, 3) + 1), cache_mhz, "{name}: cache clock = 2 * CPU / (SC + 1)");
+            assert_eq!(1u32 << (field(w, 16, 3) + 19), cache_bytes, "{name}: SS is 512 KiB << SS");
+        }
+        // The tap the PROM prints: tap[3:0] in bits 28:25, tap[4] at bit 22.
+        let tap = |word: u32| field(word, 25, 4) | (field(word, 22, 1) << 4);
+        assert_eq!(TEZRO_RECORDS.map(|(_, r)| tap(r.cpu_mode_word)), [0xc, 0xa, 0xb, 0x15]);
+        assert_eq!(FirmwareRecord::TEZRO_1000.cpu_mode_word, 0x4aed_b385);
+        assert_eq!(FirmwareRecord::TEZRO_1000.reset_config0(), 0x6ced_b385);
+    }
+
+    /// Reopening a store reapplies a refreshed record, so a Fuel follows the
+    /// machine that opens it, and leaves an authored block as stored, so a
+    /// block the PROM rewrote on a Tezro survives the next start.
+    #[test]
+    fn reopening_refreshes_the_fuels_record_and_keeps_a_tezros_stored_block() {
+        let dir = std::env::temp_dir().join(format!("bedrock-flash-record-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fuel_path = dir.join("fuel.bin");
+        drop(Flash::with_file(&factory_block(), &fuel_path, FirmwareRecord::TEZRO).unwrap());
+        let fuel = Flash::with_file(&[], &fuel_path, FirmwareRecord::FUEL).unwrap().contents();
+        assert_eq!(&fuel[0x64..0x68], &0x549aa985u32.to_be_bytes());
+        assert_eq!(&fuel[0x90..0x94], &1u32.to_be_bytes(), "CPU type: R14000");
+
+        let tezro_path = dir.join("tezro.bin");
+        let seeded = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
+        assert_eq!(std::fs::read(&tezro_path).unwrap(), seeded, "the seed is what the store holds");
+        let mut stored = seeded.clone();
+        stored[0x64..0x68].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        std::fs::write(&tezro_path, &stored).unwrap();
+        let reopened = Flash::with_file(&factory_block(), &tezro_path, FirmwareRecord::TEZRO).unwrap().contents();
+        assert_eq!(reopened, stored);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     /// The PROM programs through one view while executable aliases must
     /// keep reading array bytes.
     #[test]
     fn programming_changes_shared_bytes_without_exposing_status_to_instruction_fetches() {
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let local = f.boot_view();
             let remote = f.boot_view();
             let execute = f.array_view(0, PART_SIZE).unwrap();
@@ -435,7 +821,7 @@ mod tests {
             assert!(!local.read8(PART_SIZE as u64).is_ok());
         }
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0x1234);
             program(&v, 0, 0x200, 0xf0ff);
@@ -462,7 +848,7 @@ mod tests {
             assert_eq!(execute.read16(0x202).data, 0x5555);
         }
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             assert_eq!(v.write64(0x550, 0x98), BUS_ERR);
             assert_eq!(v.read16(0x20).data, 0xffff);
@@ -485,7 +871,7 @@ mod tests {
     /// selected sectors change.
     #[test]
     fn erase_completes_only_for_selected_sectors_and_reset_cancels_it() {
-        let f = Arc::new(Flash::new(&[]).unwrap());
+        let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
         let v = f.boot_view();
         program(&v, 0, 0x200, 0);
         program(&v, 0, 0x10000, 0);
@@ -542,16 +928,16 @@ mod tests {
             let mut bytes = vec![0x5a; FLASH_SIZE];
             bytes[PART_SIZE] = 0xc7;
             std::fs::write(&path, &bytes).unwrap();
-            let f = Flash::with_file(&[0x11], &path).unwrap();
+            let f = Flash::with_file(&[0x11], &path, FirmwareRecord::FUEL).unwrap();
             assert_eq!(f.contents()[0], 0x5a);
             assert_eq!(f.contents()[PART_SIZE], 0xc7);
             assert_eq!(std::fs::read(&path).unwrap(), f.contents());
             drop(f);
             std::fs::write(&path, [1, 2, 3]).unwrap();
-            assert!(Flash::with_file(&[], &path).is_err());
+            assert!(Flash::with_file(&[], &path, FirmwareRecord::FUEL).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3]);
             std::fs::write(&path, []).unwrap();
-            let g = Flash::with_file(&[0x34], &path).unwrap();
+            let g = Flash::with_file(&[0x34], &path, FirmwareRecord::FUEL).unwrap();
             assert_eq!(g.contents()[0], 0x34);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), FLASH_SIZE as u64);
             drop(g);
@@ -560,13 +946,13 @@ mod tests {
         {
             let path = std::env::temp_dir().join(format!("iris-amd-persist-{}", std::process::id()));
             std::fs::write(&path, []).unwrap();
-            let f = Arc::new(Flash::with_file(&[], &path).unwrap());
+            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0x1234);
             program(&v, SECOND_POSITION, (PART_SIZE - 2) as u64, 0x5678);
             drop(v);
             drop(f);
-            let f = Arc::new(Flash::with_file(&[], &path).unwrap());
+            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -583,7 +969,7 @@ mod tests {
             f.advance_ns(50_000 + 512_000_000);
             drop(v);
             drop(f);
-            let f = Arc::new(Flash::with_file(&[], &path).unwrap());
+            let f = Arc::new(Flash::with_file(&[], &path, FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             assert_eq!(v.read16(0x200).data, 0x1234);
             assert_eq!(
@@ -599,7 +985,7 @@ mod tests {
     #[test]
     fn failed_backing_writes_leave_array_bytes_unchanged() {
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             // A read-only descriptor makes writes fail without a special backend.
             let path = std::env::temp_dir().join(format!("iris-amd-read-only-{}", std::process::id()));
             std::fs::write(&path, []).unwrap();
@@ -615,7 +1001,7 @@ mod tests {
             std::fs::remove_file(path).unwrap();
         }
         {
-            let f = Arc::new(Flash::new(&[]).unwrap());
+            let f = Arc::new(Flash::new(&[], FirmwareRecord::FUEL).unwrap());
             let v = f.boot_view();
             program(&v, 0, 0x200, 0);
             let path =

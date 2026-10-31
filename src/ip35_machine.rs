@@ -33,7 +33,7 @@
 use crate::config::{scsi_label, FuelConsole, GraphicsBoard, MachineConfig};
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
-use crate::dev::bedrock_flash::{Flash, PART_SIZE};
+use crate::dev::bedrock_flash::{Flash, FirmwareRecord, PART_SIZE};
 use crate::dev::bedrock_io::{BedrockIo, SIZE as IO_SIZE};
 use crate::dev::bedrock_lb::{BedrockLb, SIZE as LB_SIZE};
 use crate::dev::bedrock_md::{BedrockMd, MemoryError};
@@ -507,8 +507,6 @@ pub const CPUS: &[CpuModel] = &[CpuModel::R14000_500];
 /// type once here.
 pub(crate) type FuelCpu = MipsExecutor<MipsTlb, R12000ShadowCache>;
 
-// The 500 MHz / 2 MiB PROM record selects these boot-mode inputs.
-const FUEL_CP0_CONFIG: u32 = 0x6c9a_a985;
 const FUEL_BOARD_ID: u64 = 0x4004;
 /// Two 256 MiB banks, locational banks 0 and 1.
 const FUEL_BANKS_MIB: [u32; 2] = [256, 256];
@@ -536,7 +534,7 @@ pub(crate) fn build_cpu(bus: Arc<Ip35Bus>) -> Box<FuelCpu> {
     cpu.phys_mask = CPU_PHYS_MASK;
     // Fuel's 500 MHz/2 MiB flash record selects these boot-mode inputs.
     // A mismatch enters the PROM's error routine before GP is initialized.
-    cpu.core.cp0_config = FUEL_CP0_CONFIG;
+    cpu.core.cp0_config = FirmwareRecord::FUEL.reset_config0();
     if let Some(prid) = MachineProfile::FuelIp34.cpu_prid(CPUS[0]) {
         cpu.core.reset_prid = prid;
         cpu.core.cp0_prid = prid;
@@ -647,8 +645,8 @@ impl FuelBoard {
         }
         let l1 = Arc::new(L1::new(l1_config)?);
         let flash = Arc::new(match flash_path {
-            Some(path) => Flash::with_file(payload, path),
-            None => Flash::new(payload),
+            Some(path) => Flash::with_file(payload, path, FirmwareRecord::FUEL),
+            None => Flash::new(payload, FirmwareRecord::FUEL),
         }.map_err(|e| e.to_string())?);
         let lb = Arc::new(BedrockLb::new(clock.clone()));
         let io = Arc::new(BedrockIo::new());
