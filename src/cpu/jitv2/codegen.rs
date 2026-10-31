@@ -375,6 +375,13 @@ pub struct BlockSkeleton {
 /// generated code `speed` produces.
 static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(feature = "developer"));
 
+/// Whether Cranelift runs its IR verifier on every compile. Cranelift turns
+/// it on unless told otherwise. It only checks this codegen's own IR and
+/// never changes the emitted code, but it is a large share of compile time,
+/// and the guest interprets every page still waiting for the compile thread.
+/// Tests and `developer` builds keep it.
+const CODEGEN_VERIFY_IR: bool = cfg!(any(test, feature = "developer"));
+
 /// How many consecutive head instructions may share ONE pending-interrupt
 /// check (`emit_pending_interrupt_preamble`) instead of each paying its own.
 /// `1` (the default) is the historical behaviour: every instruction checks.
@@ -539,10 +546,23 @@ impl Codegen {
         std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
         crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
     ) {
+        Self::new_module_verifying(shared, state, CODEGEN_VERIFY_IR)
+    }
+
+    fn new_module_verifying(
+        shared: Option<std::sync::Arc<parking_lot::Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>>,
+        state: Option<std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>>,
+        verify_ir: bool,
+    ) -> (
+        cranelift_jit::JITModule,
+        std::sync::Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+        crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider,
+    ) {
         let mut flag_builder = settings::builder();
         let opt_level = if Self::opt_level_speed() { "speed" } else { "none" };
         flag_builder.set("opt_level", opt_level).unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        flag_builder.set("enable_verifier", if verify_ir { "true" } else { "false" }).unwrap();
         let isa_builder = cranelift_native::builder().expect("host ISA not supported");
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).unwrap();
         let mut jit_builder = cranelift_jit::JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
@@ -10873,6 +10893,44 @@ mod tests {
     fn inline_mem_on_by_default_without_lockstep() {
         assert!(inline_mem_enabled(),
             "inline memory should be on by default in a non-lockstep build");
+    }
+
+    /// The emulator turns Cranelift's IR verifier off to shorten the wait on
+    /// the compile thread. The verifier only checks, so the same page must
+    /// compile to the same machine code with it on or off.
+    #[test]
+    fn verifier_off_emits_the_same_code() {
+        use crate::cpu::mips_isa::{OP_ADDIU, OP_BEQ, OP_LW, OP_SW};
+        fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+            (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+        }
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = i_type(OP_LW, 4, 2, 0);       // lw    v0, 0(a0)
+        page[1] = i_type(OP_ADDIU, 2, 2, 1);    // addiu v0, v0, 1
+        page[2] = i_type(OP_SW, 4, 2, 0);       // sw    v0, 0(a0)
+        page[3] = i_type(OP_BEQ, 2, 0, 0xfffc); // beq   v0, zero, 0
+        page[4] = 0;                            // delay slot
+        page[5] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[6] = 0;
+
+        let compile = |verify: bool| {
+            let mut analyzer = Analyzer::new();
+            let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+            assert!(non_empty);
+            let mut instrs = *instrs;
+            let mut codegen = Codegen::from_module(Codegen::new_module_verifying(None, None, verify));
+            assert_eq!(codegen.module.isa().flags().enable_verifier(), verify);
+            let f = codegen.compile_region(&mut instrs, 0, true, false).expect("region must compile");
+            let len = codegen.last_code_size() as usize;
+            assert!(len > 0);
+            // SAFETY: `f` points at `len` bytes of finalized code that stay
+            // mapped while `codegen` lives.
+            let code = unsafe { std::slice::from_raw_parts(f as *const u8, len) }.to_vec();
+            std::mem::forget(codegen);
+            code
+        };
+        assert_eq!(compile(true), compile(false), "the verifier must not change the emitted code");
+        const { assert!(CODEGEN_VERIFY_IR, "test builds keep the verifier") };
     }
 
     #[test]
