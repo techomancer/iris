@@ -199,7 +199,7 @@ Tezro-specific settings apply when `machine.profile = "tezro_ip53"`.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `cpus` | `1` | Processors fitted: 1. Only CPU 0 runs. |
+| `cpus` | `4` | Processors fitted: 1, 2 or 4. One selects the one-processor board with one PIC; two or four the board with two PICs. Only CPU 0 runs. |
 | `flash` | unset | Persistent 16 MiB boot-flash file. Unset, the flash is volatile. |
 | `console` | `l1` | `l1`, `ioc4_a`, `ioc4_b`, `ioc4_c` or `ioc4_d`. Selects the guest console connection. |
 | `l1_port` | `8882` | Host TCP port for the L1 console. |

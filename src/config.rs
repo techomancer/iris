@@ -1814,7 +1814,7 @@ impl TezroConsole {
 }
 
 /// The processor counts a Tezro board fits.
-pub const TEZRO_CPUS: [u8; 1] = [1];
+pub const TEZRO_CPUS: [u8; 3] = [1, 2, 4];
 
 /// Why a Tezro refuses a `[machine] cpu`: the parts it takes, and the one it
 /// cannot model.
@@ -1827,8 +1827,9 @@ const TEZRO_CPU_REFUSAL: &str = "a Tezro has R16000s: set [machine] cpu = \"r160
 /// four processors only, inferred from the assemblies sheet.
 const TEZRO_800_MHZ_CPUS: u8 = 4;
 
+/// Four, as in the Tezros whose inventories have been seen.
 fn default_tezro_cpus() -> u8 {
-    1
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4464,7 +4465,10 @@ mod tezro_config_tests {
         tezro.validate().unwrap();
         let fast = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\ncpu = \"r16000\"\n").unwrap();
         assert_eq!(fast.machine.cpu, CpuModel::R16000, "the 800 MHz part by name");
-        assert!(fast.validate().unwrap_err().contains("four processors only"), "the one-processor board");
+        fast.validate().unwrap();
+        let mut two = fast.clone();
+        two.tezro.cpus = 2;
+        assert!(two.validate().unwrap_err().contains("four processors only"), "the 800 MHz part with two");
         let fuel = MachineConfig::parse_toml("banks = [256, 256]\n[machine]\nprofile = \"fuel_ip34\"\n").unwrap();
         assert_eq!(fuel.machine.cpu, CpuModel::R14000);
         let family = MachineConfig::parse_toml("[machine]\nprofile = \"tezro_ip53\"\ncpu = \"r10000\"\n").unwrap();
@@ -4538,7 +4542,10 @@ mod tezro_config_tests {
             cfg.validate().unwrap();
         }
         cfg.machine.cpu = CpuModel::R16000;
+        cfg.validate().unwrap();
+        cfg.tezro.cpus = 1;
         assert!(cfg.validate().unwrap_err().contains("four processors only"));
+        cfg.tezro.cpus = 4;
         for cpu in [CpuModel::R4400, CpuModel::R5000, CpuModel::R12000, CpuModel::R14000] {
             cfg.machine.cpu = cpu;
             let e = cfg.validate().unwrap_err();

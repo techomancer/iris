@@ -227,6 +227,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 ### SGI Tezro (IP53 board, IP35 software platform)
 
 - Added a headless Tezro profile with the 700 MHz R16000 (`r16000_700`, the default; `r16000` selects the 800 MHz part), 4 MiB cache, 4 GiB RAM, a PIC with PXBOW, and the IO9's IOC4, ISP12160 and BCM5701; see the [Tezro guide](docs/tezro-ip53.md).
+- A Tezro fits one, two or four processors, four by default, and two or four bring the second PIC at widget 11; only CPU 0 runs.
 
 ### `IRIS_GUI_GL` works in iris-gui
 

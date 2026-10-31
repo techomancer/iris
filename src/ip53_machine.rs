@@ -10,7 +10,10 @@
 //!
 //! The board follows the QEMU Tezro compositions:
 //!
-//! - One PIC at XIO widget 15, whose PXBOW answers as widget 0 and forwards
+//! - The one-processor board has one PIC at XIO widget 15; the two- and
+//!   four-processor board adds a second at widget 11, with nothing on its
+//!   buses, and a V12 slot at widget 12 that is left empty. The PIC at
+//!   widget 15 is the IO9's: its PXBOW answers as widget 0 and forwards
 //!   the processor's accesses to widget 15. Its head 0 carries the IO9 PCI
 //!   bus: the IOC4 at device 1 (input 0), the ISP12160 at device 3 (input 2)
 //!   and the BCM5701 at device 4 (input 3), with REQ64# wired on the
@@ -33,6 +36,11 @@
 //! - The one-processor board has one PIC. The tower guide gives that board
 //!   two PCI-X buses and one XIO connector; that it is one PIC at widget 15
 //!   is inferred from them.
+//! - Only CPU 0 runs. The other fitted processors read present and stay
+//!   disabled; what would start or reach them is refused and logged by the
+//!   Bedrock PI.
+//! - The second PIC is reached directly. QEMU gives it a PXBOW too, whose
+//!   widget 0 nothing maps, so only its link-reset timing differs.
 //! - PIC DMA aimed at a widget other than Bedrock IO is refused and logged,
 //!   as the Fuel's XBridge path refuses it.
 //! - No EEPROM image is fitted for the IO9, the node board or the BCM5701:
@@ -84,8 +92,11 @@ use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Weak};
 
 /// The Bedrock board word the QEMU Tezro profiles select.
 const BOARD_ID: u64 = 0x2001;
-/// The IO9's PIC, and the widget Bedrock IO answers as.
+/// The IO9's PIC, the second PIC of the two- and four-processor board, and
+/// the widget Bedrock IO answers as. Widget 12 on that board is the V12's
+/// XIO slot, which is left empty.
 const IO9_WIDGET: u8 = 15;
+const SECOND_PIC_WIDGET: u8 = 11;
 const HOST_WIDGET: u8 = 10;
 /// IO9's PCI functions: configuration device on head 0.
 const IOC4_DEVICE: u8 = 1;
@@ -515,7 +526,8 @@ pub(crate) struct TezroBoardConfig<'a> {
 /// The Tezro's devices around its Bedrock node.
 pub(crate) struct TezroBoard {
     pub node: Node,
-    /// The PICs, the IO9's at widget 15 first.
+    /// The PICs in QEMU's host order, which numbers their PI level sources:
+    /// widget 11's first when the board has it, then the IO9's at widget 15.
     pub pics: Vec<Arc<Pic>>,
     pub ioc4: Arc<Ioc4>,
     pub scsi: Arc<Isp12160>,
@@ -551,8 +563,8 @@ impl TezroBoard {
 
     pub fn with_config(config: TezroBoardConfig<'_>) -> Result<Self, String> {
         let TezroBoardConfig { payload, clock, flash_path, station_mac, timekeeper, memory, cpus, part } = config;
-        if cpus != 1 {
-            return Err(format!("{cpus} processors; this Tezro board fits one"));
+        if ![1, 2, 4].contains(&cpus) {
+            return Err(format!("{cpus} processors; a Tezro board fits 1, 2 or 4"));
         }
         memory.check_for_cpus(cpus)?;
         let node = Node::build(NodeConfig {
@@ -580,7 +592,13 @@ impl TezroBoard {
         let pxbow = io9.enable_pxbow(HOST_WIDGET, clock.clone()).map_err(|e| format!("Tezro PXBOW: {e:?}"))?;
         node.io.connect_widget(0, pxbow.widget_zero());
         node.io.connect_widget(IO9_WIDGET, pxbow.route(IO9_WIDGET));
-        let pics = vec![io9.clone()];
+        let pics = if cpus == 1 {
+            vec![io9.clone()]
+        } else {
+            let second = Pic::new(SECOND_PIC_WIDGET);
+            node.io.connect_widget(SECOND_PIC_WIDGET, second.widget());
+            vec![second, io9.clone()]
+        };
         for (index, pic) in pics.iter().enumerate() {
             pic.connect_peer(Arc::new(BedrockPeer(Arc::downgrade(&node.io))))
                 .map_err(|_| "Tezro: PIC peer connected twice".to_string())?;

@@ -25,6 +25,8 @@ cpu = "r16000_700"
 board = "none"
 
 [tezro]
+# Processors fitted: 1, 2 or 4 (the default). Only CPU 0 runs.
+cpus = 4
 flash = "ignore/tezro/flash.bin"
 console = "l1"
 l1_port = 18882

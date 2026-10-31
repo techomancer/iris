@@ -639,10 +639,12 @@ introspection commands are in [debug.md](debug.md#jit-v2).
   Snapshots are unsupported. See the [Fuel guide](docs/fuel-ip34.md).
 - **IP53 board, IP35 software platform (Tezro)**: its own board
   (`src/ip53_machine.rs`) on the Bedrock node it shares with the Fuel
-  (`ip35::node`): 700 MHz R16000s, of which only CPU 0 runs, memory from 512
-  and 1024 MiB banks (4 GiB by default), and a PIC whose PXBOW is widget 0,
-  carrying the IO9's IOC4, ISP12160 and BCM5701. It runs headless on the L1
-  or an IOC4 serial console. See the [Tezro guide](docs/tezro-ip53.md).
+  (`ip35::node`): one, two or four R16000s (700 MHz by default), of which only CPU 0
+  runs, memory from 512 and 1024 MiB banks (4 GiB by default), and a PIC
+  whose PXBOW is widget 0, carrying the IO9's IOC4, ISP12160 and BCM5701;
+  the two- and four-processor board adds a second PIC at widget 11. It runs
+  headless on the L1 or an IOC4 serial console. See the
+  [Tezro guide](docs/tezro-ip53.md).
 
 The Indy and Indigo2 profiles each have an embedded PROM fallback;
 `src/platform.rs` and `src/machine.rs` wire their differences, and
