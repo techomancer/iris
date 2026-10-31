@@ -722,3 +722,90 @@ fn a_cleared_texture_chain_is_the_default_one_again() {
     chain.clear();
     assert!(chain.levels == fresh.levels);
 }
+
+/// Lighting a vertex reuses one lighting state and puts back only the lights
+/// the last vertex enabled, and the colour is what a fresh state gives:
+/// across lights switching on, changing and off, with a spot, a positional
+/// and a directional light, and with none.
+#[test]
+fn a_reused_lighting_state_lights_a_vertex_as_a_fresh_one_does() {
+    use crate::dev::gl::light::Lighting;
+
+    fn fresh(s: &Board, obj: &[f64; 4]) -> [f32; 4] {
+        let mut lt = Lighting::default();
+        lt.init();
+        let v = s.gl_light_fill(&mut lt, obj);
+        let (front, _) = lt.light_vertex(v.eye, v.normal, v.colour);
+        [front[0], front[1], front[2], v.alpha]
+    }
+    fn set_light(s: &mut Board, i: usize, colour: [f32; 3], directional: bool, spot: bool) {
+        for k in 0..3 {
+            s.gl_light_colour[i * 12 + k] = (0.1f32 * (i + 1) as f32).to_bits();
+            s.gl_light_colour[i * 12 + 4 + k] = colour[k].to_bits();
+            s.gl_light_colour[i * 12 + 8 + k] = (colour[k] * 0.5).to_bits();
+        }
+        let blk = &mut s.gl_light_vec[i * ODSY_GL_LIGHT_VEC_FLOATS as usize..];
+        for k in 0..3 {
+            blk[ODSY_LIGHT_POS + k] = [2.0f32, 3.0, 4.0 + i as f32][k].to_bits();
+            blk[ODSY_LIGHT_HALF + k] = (if directional { [0.0f32, 0.6, 0.8][k] } else { 0.0 }).to_bits();
+        }
+        blk[ODSY_LIGHT_ATTEN] = 1.0f32.to_bits();
+        blk[ODSY_LIGHT_ATTEN + 1] = 0.1f32.to_bits();
+        blk[ODSY_LIGHT_ATTEN + 2] = 0.01f32.to_bits();
+        blk[ODSY_LIGHT_SPOT_COS] = (if spot { -0.5f32 } else { 1.0 }).to_bits();
+        blk[ODSY_LIGHT_SPOT_EXP] = (-2.0f32).to_bits();
+        for k in 0..3 {
+            blk[ODSY_LIGHT_SPOT_DIR + k] = [0.0f32, 0.0, 1.0][k].to_bits();
+        }
+    }
+    fn clear_light(s: &mut Board, i: usize) {
+        s.gl_light_colour[i * 12..i * 12 + 12].fill(0);
+    }
+
+    let (mut s, _) = board("v12");
+    let identity: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+    s.gl_modelview = identity.map(f32::to_bits);
+    s.gl_normal_matrix = identity.map(f32::to_bits);
+    s.gl_normal = [0.0f32, 0.6, 0.8].map(f32::to_bits);
+    s.gl_colour = [0.7f32, 0.5, 0.3, 0.9].map(f32::to_bits);
+    for k in 0..4 {
+        s.gl_material[k] = 0.2f32.to_bits();
+        s.gl_material[4 + k] = [0.8f32, 0.4, 0.6, 0.5][k].to_bits();
+        s.gl_material[8 + k] = 0.5f32.to_bits();
+    }
+    s.gl_shininess_sqrt = 4.0f32.to_bits();
+    let obj = [1.0, 2.0, 3.0, 1.0];
+    let mut seen = Vec::new();
+    let mut out = [0f32; 4];
+
+    let check = |s: &mut Board, what: &str, out: &mut [f32; 4]| {
+        s.gl_light(&obj, out);
+        let want = fresh(s, &obj);
+        assert_eq!(out.map(f32::to_bits), want.map(f32::to_bits), "{what}");
+        want
+    };
+
+    seen.push(check(&mut s, "no lights", &mut out));
+    set_light(&mut s, 0, [1.0, 0.2, 0.1], true, false);
+    set_light(&mut s, 3, [0.3, 0.9, 0.2], false, true);
+    seen.push(check(&mut s, "a directional light and a spot", &mut out));
+    seen.push(check(&mut s, "the same again", &mut out));
+    clear_light(&mut s, 0);
+    set_light(&mut s, 5, [0.2, 0.2, 0.9], false, false);
+    seen.push(check(&mut s, "light 0 off, light 5 on", &mut out));
+    clear_light(&mut s, 3);
+    clear_light(&mut s, 5);
+    seen.push(check(&mut s, "all off again", &mut out));
+    // Light 3 was a spot and returns as a plain positional light: nothing of
+    // its spot may be left over.
+    set_light(&mut s, 3, [0.3, 0.9, 0.2], false, false);
+    seen.push(check(&mut s, "light 3 back without its spot", &mut out));
+    clear_light(&mut s, 3);
+    s.gl_colour_material = ODSY_COLOUR_MATERIAL_DIFFUSE;
+    set_light(&mut s, 7, [0.6, 0.6, 0.6], false, false);
+    seen.push(check(&mut s, "colour material, light 7", &mut out));
+
+    // The cases differ, so the comparisons above could have failed.
+    assert_ne!(seen[0], seen[1]);
+    assert_ne!(seen[1], seen[3]);
+}

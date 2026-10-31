@@ -508,6 +508,51 @@ fn cmin(a: f64, b: f64) -> f64 {
     if a < b { a } else { b }
 }
 
+/// What `Board::gl_light_fill` hands on to the lighting equation.
+pub struct LitVertex {
+    pub eye: [f32; 4],
+    pub normal: [f32; 3],
+    pub colour: [f32; 4],
+    /// The diffuse alpha.
+    pub alpha: f32,
+    /// The lights the fill set up, a bit each.
+    pub lit: u8,
+}
+
+/// The lighting state `Board::gl_light` fills for each vertex, kept so that
+/// only what the last vertex changed is put back.
+pub struct LightScratch {
+    pub state: Lighting,
+    fresh: Lighting,
+    /// The lights the last fill set up.
+    pub lit: u8,
+}
+
+impl LightScratch {
+    pub fn new() -> Box<Self> {
+        let mut fresh = Lighting::default();
+        fresh.init();
+        Box::new(LightScratch { state: fresh, fresh, lit: 0 })
+    }
+
+    /// Put the state back to the initial one with no lights enabled, writing
+    /// only the lights the last fill set up: the fill sets everything else
+    /// itself.
+    pub fn restore(&mut self) {
+        let mut lit = self.lit;
+
+        while lit != 0 {
+            let i = lit.trailing_zeros() as usize;
+
+            self.state.lights[i] = self.fresh.lights[i];
+            lit &= lit - 1;
+        }
+        self.state.head = self.fresh.head;
+        self.state.count = 0;
+        self.lit = 0;
+    }
+}
+
 impl Board {
     /// OpenGL's lighting equation (section 2.13.1) at one vertex, front
     /// material, from the kept light, material and matrix words, evaluated by
@@ -530,6 +575,24 @@ impl Board {
     /// specular colour, every disabled one as the library sends it, adds
     /// nothing and is left out. Shininess arrives as its square root.
     pub fn gl_light(&mut self, obj: &[f64; 4], out: &mut [f32; 4]) {
+        // The lighting state is kept between vertices (LightScratch): building
+        // its 3 KB afresh for every vertex was a visible share of the front
+        // end's time in Smoke & Mirrors.
+        let mut scratch = self.gl_light_scratch.take().unwrap_or_else(LightScratch::new);
+
+        scratch.restore();
+        let v = self.gl_light_fill(&mut scratch.state, obj);
+        scratch.lit = v.lit;
+        let (front, _) = scratch.state.light_vertex(v.eye, v.normal, v.colour);
+        *out = front;
+        // The board passes the diffuse alpha through unclamped.
+        out[3] = v.alpha;
+        self.gl_light_scratch = Some(scratch);
+    }
+
+    /// Fill `lt`, which holds the initial state with no lights, from the
+    /// kept words.
+    pub fn gl_light_fill(&self, lt: &mut Lighting, obj: &[f64; 4]) -> LitVertex {
         let f = |w: u32| f32::from_bits(w);
         let obj = [obj[0] as f32, obj[1] as f32, obj[2] as f32, obj[3] as f32];
         // The model-view's first three rows; the board ignores w.
@@ -540,8 +603,6 @@ impl Board {
         }
         eye[3] = 1.0;
 
-        let mut lt = Lighting::default();
-        lt.init();
         lt.on = 1;
         lt.local_viewer = self.gl_local_viewer as u32;
         lt.normalize = self.gl_normalize as u32;
@@ -572,6 +633,7 @@ impl Board {
         lt.amb_sum = std::array::from_fn(|k| f(self.gl_light_colour[ambient + k]));
 
         let mut last = -1i32;
+        let mut lit = 0u8;
         for i in 0..SGI_ODYSSEY_GL_LIGHTS as usize {
             let blk = &self.gl_light_vec[i * ODSY_GL_LIGHT_VEC_FLOATS as usize..];
             let col = &self.gl_light_colour[i * 3 * 4..];
@@ -580,6 +642,7 @@ impl Board {
             if la.iter().chain(&ld).chain(&ls).all(|&v| v == 0.0) {
                 continue;
             }
+            lit |= 1 << i;
             let l = &mut lt.lights[i];
             l.ambient = la;
             l.diffuse = ld;
@@ -611,10 +674,7 @@ impl Board {
             lt.count += 1;
         }
         let normal = self.gl_normal.map(f);
-        let (front, _) = lt.light_vertex(eye, normal, colour);
-        *out = front;
-        // The board passes the diffuse alpha through unclamped.
-        out[3] = md[3];
+        LitVertex { eye, normal, colour, alpha: md[3], lit }
     }
 
     /// The colour a GL vertex takes, handed to the shared context just before

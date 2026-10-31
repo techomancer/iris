@@ -275,6 +275,9 @@ pub struct Board {
     pub gl_ctx: Option<Box<GlContext>>,
     /// The drawable Board::gl_bind() last built for the shared context.
     pub gl_bind_drawable: GlDrawable,
+    /// The lighting state Board::gl_light() keeps between vertices; None
+    /// until the first lit vertex.
+    pub gl_light_scratch: Option<Box<LightScratch>>,
     pub gl_in_prim: bool,
     pub gl_begin_open: bool,
     pub gl_integer_prim: bool,
@@ -595,6 +598,7 @@ impl Default for Board {
             poly_col_lo: 0,
             gl_ctx: Some(Box::default()),
             gl_bind_drawable: Default::default(),
+            gl_light_scratch: None,
             gl_in_prim: false,
             gl_begin_open: false,
             gl_integer_prim: false,
