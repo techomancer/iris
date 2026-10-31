@@ -79,6 +79,10 @@ pub struct DecodeCache {
     bitmap: u64,
     /// The bitmap's region size, as `ppmem::window_shift`.
     window_shift: u32,
+    /// Pages read through the bus word by word even where the window maps
+    /// them: the shadow cache serves part of such a page from a line the guest
+    /// staged, which the window does not hold. Normally empty.
+    bus_only: Vec<u64>,
 }
 
 impl Default for DecodeCache {
@@ -92,7 +96,7 @@ impl DecodeCache {
     }
 
     pub fn new() -> Self {
-        Self { pages: (0..PAGES).map(|_| Page::new()).collect(), bitmap: 0, window_shift: crate::ppmem::BITMAP_SHIFT }
+        Self { pages: (0..PAGES).map(|_| Page::new()).collect(), bitmap: 0, window_shift: crate::ppmem::BITMAP_SHIFT, bus_only: Vec::new() }
     }
 
     /// Forget everything: memory may have changed without any counter moving.
@@ -100,6 +104,27 @@ impl DecodeCache {
         for p in self.pages.iter_mut() {
             p.pfn = EMPTY;
         }
+    }
+
+    /// Read page `pfn` through the bus word by word (`on`), or through the
+    /// window again. Drops the page's decoded slots either way: its pointer
+    /// into the window is what changes. Costs the fast path nothing: a page
+    /// without a pointer misses it and takes `fetch_slow`.
+    pub fn set_bus_only(&mut self, pfn: u64, on: bool) {
+        self.bus_only.retain(|&p| p != pfn);
+        if on {
+            self.bus_only.push(pfn);
+        }
+        let page = &mut self.pages[index(pfn)];
+        if page.pfn == pfn {
+            page.pfn = EMPTY;
+        }
+    }
+
+    /// Every page back to the window.
+    pub fn clear_bus_only(&mut self) {
+        self.bus_only.clear();
+        self.flush();
     }
 
     /// The decoded slot for the instruction at `phys`, filled on a miss.
@@ -157,10 +182,11 @@ impl DecodeCache {
         let k = (phys as usize >> 2) & (SLOTS - 1);
         let (w, bit) = (k >> 6, 1u64 << (k & 63));
         let window_shift = self.window_shift;
+        let bus_only = !self.bus_only.is_empty() && self.bus_only.contains(&pfn);
         let page = &mut self.pages[index(pfn)];
         let _ = ic_line;
         let host_for = || -> *const u32 {
-            if !window.is_null() && crate::ppmem::bitmap_maps_at(bitmap, window_shift, phys) {
+            if !bus_only && !window.is_null() && crate::ppmem::bitmap_maps_at(bitmap, window_shift, phys) {
                 unsafe { window.add((pfn << 12) as usize) as *const u32 }
             } else {
                 std::ptr::null()
@@ -301,6 +327,26 @@ mod tests {
         // Region no longer RAM: everything goes to the bus now.
         let p = dc.fetch(0x100c, window, 0, 16, |_| Ok(0x2400_0009)).unwrap();
         assert_eq!(unsafe { (*p).raw }, 0x2400_0009);
+    }
+
+    /// A page marked bus-only reads word by word even where the window maps
+    /// it, and goes back to the window when the mark is lifted.
+    #[test]
+    fn a_bus_only_page_bypasses_the_window_until_released() {
+        let mut ram = vec![0u32; 2 * 1024];
+        ram[1024 + 3] = 0x2400_0007; // phys 0x100c
+        let window = ram.as_ptr() as *const u8;
+        let bus_word = |_| -> Result<u32, u32> { Ok(0x2400_0042) };
+        let mut dc = DecodeCache::new();
+        assert_eq!(unsafe { (*dc.fetch(0x100c, window, 1, 16, |_| panic!("window")).unwrap()).raw }, 0x2400_0007);
+
+        dc.set_bus_only(0x1000 >> 12, true);
+        assert_eq!(unsafe { (*dc.fetch(0x100c, window, 1, 16, bus_word).unwrap()).raw }, 0x2400_0042);
+        // Served again, and checked against the bus each time.
+        assert_eq!(unsafe { (*dc.fetch(0x100c, window, 1, 16, |_| Ok(0x2400_0043)).unwrap()).raw }, 0x2400_0043);
+
+        dc.set_bus_only(0x1000 >> 12, false);
+        assert_eq!(unsafe { (*dc.fetch(0x100c, window, 1, 16, |_| panic!("window")).unwrap()).raw }, 0x2400_0007);
     }
 
     /// Raw mode: a fused slot depends on the next word too, so changing only
