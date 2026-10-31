@@ -647,6 +647,9 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        if let Some(words) = self.ram.stack_page_words() {
+            t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
+        }
         toml::Value::Table(t)
     }
 
@@ -673,6 +676,10 @@ impl crate::traits::Saveable for Ip32Bus {
                 c.load_state(s)?;
             }
         }
+        if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {
+            let words: Option<Vec<u64>> = a.iter().map(crate::snapshot::toml_u64).collect();
+            self.ram.restore_stack_page(&words.ok_or("stack_page: not a list of dwords")?)?;
+        }
         Ok(())
     }
 }
@@ -683,6 +690,7 @@ impl Ip32Bus {
     /// on the hardware. The PROM sets up the rest again as it starts.
     pub fn power_on(&self) {
         use crate::traits::Resettable;
+        self.ram.set_stack_page(false);
         self.crime.regs.power_on();
         let m = &self.mace;
         let devices: [&dyn Resettable; 8] =

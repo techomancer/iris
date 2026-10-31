@@ -62,6 +62,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [callout-arg0-is-core-ptr.md](jitv2/callout-arg0-is-core-ptr.md) | rule | JIT→Rust callouts: arg 0 is always the `MipsCore` pointer |
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
+| [compile-pool-starts-after-the-windows.md](jitv2/compile-pool-starts-after-the-windows.md) | rule | Start the compile pool after the ppmem windows: workers read the cache geometry once, and an early one compiles every load and store as a call out |
 | [compile-churn-avoidance-snapshot.md](jitv2/compile-churn-avoidance-snapshot.md) | design | Compile churn avoidance: skip a recompile whose inputs did not change |
 | [cop0-does-not-have-to-end-a-region.md](jitv2/cop0-does-not-have-to-end-a-region.md) | design | CP0 does not have to end a region |
 | [corpus-capture-from-the-pcp-cache.md](jitv2/corpus-capture-from-the-pcp-cache.md) | howto | Corpus capture: `j2 corpus`, and the two bitmaps that look interchangeable |
@@ -119,7 +120,8 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [aic7880-seqdis.py](devices/aic7880-seqdis.py) | howto | Disassembler for an AIC-7xxx sequencer image in a C byte array (the HIM's image the O2 downloads) |
 | [aic7880-patchsim.py](devices/aic7880-patchsim.py) | howto | Reproduces the Linux aic7xxx firmware patch selection and critical sections for a 7880 |
 | [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones) |
-| [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | design | O2 cache: the full model through POST, the shadow model after; switched by PC range and a tag-store trigger, and why the log flips during a reboot |
+| [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | history | O2 cache as it was until 2026-10-30: the full model through POST, the shadow model after, switched by PC range and a tag-store trigger |
+| [o2-prom-stack-is-a-cached-page-at-phys-0.md](devices/o2-prom-stack-is-a-cached-page-at-phys-0.md) | design | O2 PROM stack: one tag-installed page at physical 0 that the memory test overwrites through KSEG1; a 4 KB page in the bus decode answers for it uncached, so the shadow cache runs from reset |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |

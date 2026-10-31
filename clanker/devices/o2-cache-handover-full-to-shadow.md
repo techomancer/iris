@@ -1,6 +1,8 @@
 # O2 cache: the full model through POST, the shadow model after, switched by PC range and a tag-store trigger
 
-Status: current as of main 10d737f5 (2026-10-24). Code: `src/ip32_handover.rs`
+Status: superseded 2026-10-30, history only: the O2 runs the shadow cache from reset, see
+[o2-prom-stack-is-a-cached-page-at-phys-0.md](o2-prom-stack-is-a-cached-page-at-phys-0.md).
+Was current as of main 10d737f5 (2026-10-24). Code then: `src/ip32_handover.rs`
 (`HandoverCache`), the batch hook in `O2Machine::build_cpu`
 (`src/ip32_machine.rs`), the firmware ranges in `src/ip32.rs`.
 

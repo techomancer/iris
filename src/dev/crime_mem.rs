@@ -48,6 +48,13 @@
 //! write directly and what the rendering engine draws through
 //! ([`RamWindow`]). Every other master reaches memory through the bus.
 //!
+//! POST keeps its stack in cache lines tagged for physical page 0 while it
+//! tests the same page uncached, so on the machine the two are different bytes.
+//! The CPU's cached path and the window always mean the bank, so that is where
+//! the stack lives here too, and for as long as those tags stand the decode
+//! table points that page at a page of its own for the uncached path. See
+//! [`O2Memory::stack_tag_store`].
+//!
 //! `O2Memory` is CRIME's bank logic: the sizes fitted, the controls, the
 //! decode they make, and the remap. Its decode is atomics: the firmware
 //! programs the bank controls once at power-on, and a guest that moved a
@@ -61,7 +68,7 @@ use crate::physical::{Physical, RamBank};
 use crate::ppmem::MappedMemory;
 use crate::ppmem::devmap::SLOT_SHIFT;
 use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_ERR};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// The unit the bank controls count in, and the size of a small bank.
@@ -74,8 +81,15 @@ const PAGE: usize = 4096;
 const CTRL_BASE: u64 = 0x1f;
 /// The window in 32 MB slots.
 const SLOTS: usize = (RAM_WINDOW_SIZE / SLOT) as usize;
-/// A 32 MB slot in the decode table's 64 KB entries.
+/// A 32 MB slot in the decode table's 4 KB entries.
 const TABLE_PER_SLOT: u64 = (SLOT >> SLOT_SHIFT) as u64;
+
+/// The one page of physical memory POST keeps its stack in.
+const STACK_PAGE: u32 = 4096;
+/// TagLo as R10000 and R5000 share it: the primary state, 0 for invalid.
+const TAG_STATE: u32 = 0xc0;
+/// TagLo's physical page number.
+const TAG_PAGE_SHIFT: u32 = 8;
 
 /// The kits SGI sold, in MB per pair.
 pub const KITS_MB: [u32; 4] = [32, 64, 128, 256];
@@ -165,6 +179,12 @@ pub struct O2Memory {
     /// What [`RamWindow`]s need to know of the decode, published as it
     /// changes.
     shared: Arc<WindowState>,
+    /// Page 0 as the uncached path sees it while POST's stack is in the bank.
+    /// It wraps at 4 KB, so the same device answers at every alias. Boxed: the
+    /// decode table points at it and `O2Memory` is built by value.
+    stack_page: Box<RamBank>,
+    /// Whether the decode table is pointing at [`Self::stack_page`].
+    stack_live: AtomicBool,
 }
 
 impl O2Memory {
@@ -221,6 +241,8 @@ impl O2Memory {
         }
         let phys = Physical::new(banks);
         phys.set_default(Arc::new(NoMemory), "no memory");
+        let stack_page = Box::new(RamBank::new(1));
+        stack_page.set_addr_mask(STACK_PAGE - 1);
         let m = Self {
             phys,
             size,
@@ -231,6 +253,8 @@ impl O2Memory {
             decode_gen: AtomicU64::new(0),
             rebuilding: std::sync::Mutex::new(()),
             shared: Default::default(),
+            stack_page,
+            stack_live: AtomicBool::new(false),
         };
         // At reset every control is zero: all eight banks at the bottom of
         // the window, 32 MB each, so bank 0 answers there.
@@ -332,8 +356,104 @@ impl O2Memory {
                 let _ = sp.map_range(i, src, at, SLOT as u64);
             }
         }
+        if self.stack_live.load(Ordering::Relaxed) {
+            self.place_stack_page(slots, mapped);
+        }
         self.shared.decode_gen.store(self.decode_gen.load(Ordering::Acquire), Release);
         self.shared.mapped.store(mapped, Release);
+    }
+
+    /// The decode table's entry for bank 0's offset 0 goes to the stack page,
+    /// at every place that offset answers: a 32 MB bank under a 128 MB setting
+    /// repeats, and sizing relies on it.
+    fn place_stack_page(&self, slots: &[Slot; SLOTS], mapped: u32) {
+        let phys = &*self.phys;
+        let page: *const RamBank = &*self.stack_page;
+        let page = page as crate::ppmem::devmap::Entry;
+        let size = self.size[0] as u64;
+        for (s, slot) in slots.iter().enumerate() {
+            let Slot::Ram { bank: 0, chunk } = *slot else { continue };
+            if (chunk as u64 * SLOT as u64) & (size - 1) != 0 {
+                continue;
+            }
+            let at = s as u64 * SLOT as u64;
+            phys.fill_slots((RAM_BASE as u64 + at) >> SLOT_SHIFT, 1, page);
+            if at < LOW_ALIAS_SIZE as u64 {
+                phys.fill_slots(at >> SLOT_SHIFT, 1, page);
+            }
+        }
+        // ppmem's bitmap wants a whole 64 MB region mapped. At reset only the
+        // first 32 MB slot is, so the cached path would take the bus and find
+        // the stack page, then find the bank once sizing filled the region.
+        // Show bank 0 again in the next slot, for the CPU only.
+        if mapped & 2 == 0 {
+            if let (Some(sp), Some(i)) = (phys.ppmem_space(), self.index[0]) {
+                let _ = sp.map_range(i, 0, SLOT as u64, SLOT as u64);
+            }
+        }
+    }
+
+    /// The guest stored `tag` in a primary data cache tag.
+    ///
+    /// POST sweeps a page's worth of tags to dirty for physical page 0 and
+    /// fills them, with nothing read from memory, then writes the same page
+    /// uncached to test it, and sweeps every tag invalid without a writeback
+    /// once it has copied what it needs and moved its stack to KSEG1. So a
+    /// valid tag for page 0 starts the stack and the next invalid tag ends it.
+    /// IRIX reboots by jumping into the PROM, so this catches a reboot as it
+    /// does a power-on. Kernels and `sash` store invalid tags only, which is
+    /// nothing to do here.
+    pub fn stack_tag_store(&self, tag: u32) {
+        if tag & TAG_STATE == 0 {
+            if self.stack_live.load(Ordering::Relaxed) {
+                self.set_stack_page(false);
+            }
+        } else if tag >> TAG_PAGE_SHIFT == 0 && !self.stack_live.load(Ordering::Relaxed) {
+            self.set_stack_page(true);
+        }
+    }
+
+    /// Start the stack (the uncached path gets a copy of the page, the bank
+    /// goes on holding what the cached path sees) or end it (what was written
+    /// uncached is what memory holds, as it is when the cache lines go).
+    pub fn set_stack_page(&self, on: bool) {
+        let _one = self.rebuilding.lock().unwrap();
+        if self.stack_live.load(Ordering::Relaxed) == on {
+            return;
+        }
+        let bank = &self.phys.banks()[self.index[0].expect("bank 0 is fitted")];
+        for o in (0..STACK_PAGE as u64).step_by(8) {
+            if on {
+                self.stack_page.write64(o, bank.read64(o).data);
+            } else {
+                bank.write64(o, self.stack_page.read64(o).data);
+            }
+        }
+        self.stack_live.store(on, Ordering::Relaxed);
+        self.rebuild_locked();
+    }
+
+    /// The stack page's dwords while the stack is live, for a snapshot: the
+    /// bank is saved with memory and this is what the uncached path sees.
+    pub fn stack_page_words(&self) -> Option<Vec<u64>> {
+        self.stack_live.load(Ordering::Relaxed).then(|| {
+            (0..STACK_PAGE as u64).step_by(8).map(|o| self.stack_page.read64(o).data).collect()
+        })
+    }
+
+    /// Put back what [`Self::stack_page_words`] gave. The stack is not live
+    /// beforehand (a machine being restored has been powered on).
+    pub fn restore_stack_page(&self, words: &[u64]) -> Result<(), String> {
+        if words.len() * 8 != STACK_PAGE as usize {
+            return Err(format!("saved stack page is {} dwords", words.len()));
+        }
+        let _one = self.rebuilding.lock().unwrap();
+        for (k, &w) in words.iter().enumerate() {
+            self.stack_page.write64(k as u64 * 8, w);
+        }
+        self.stack_live.store(true, Ordering::Relaxed);
+        self.rebuild_locked();
+        Ok(())
     }
 
     /// A view of memory through the window, for a master on its own thread
@@ -995,6 +1115,92 @@ mod tests {
         let base = m.phys().ppmem_space().unwrap().window_base();
         let w = unsafe { *(base.add((RAM_BASE + SLOT) as usize) as *const u64) }.rotate_left(32);
         assert_eq!(w, 0xbeef, "the window agrees");
+    }
+
+    const STACK_TAG: u32 = 0xc8; // dirty, page 0: what POST stores on an R10000
+
+    /// What each path sees of page 0 once the stack is live, and that memory
+    /// ends up holding what was written uncached.
+    #[test]
+    fn the_stack_and_the_uncached_page_are_different_bytes() {
+        let m = O2Memory::with_total(64).unwrap();
+        m.set_ctrl(0, 0);
+        let bus = m.phys();
+        let base = bus.ppmem_space().unwrap().window_base();
+        let cached = |o: usize, base: *mut u8| unsafe { (*(base.add(o) as *const u64)).rotate_left(32) };
+        let store = |o: usize, v: u64, base: *mut u8| unsafe { *(base.add(o) as *mut u64) = v.rotate_left(32) };
+        assert_eq!(bus.write64(0xff0, 0x1111), BUS_OK);
+        m.stack_tag_store(0x0);
+        m.stack_tag_store(STACK_TAG);
+        assert_eq!(bus.read64(0xff0).data, 0x1111, "the uncached page starts as a copy");
+        store(0xff0, 0x2222, base);
+        assert_eq!(bus.write64(0xff8, 0x3333), BUS_OK);
+        assert_eq!(cached(0xff0, base), 0x2222, "the stack, cached");
+        assert_eq!(cached(0xff8, base), 0, "the test's write does not reach the stack");
+        assert_eq!(bus.read64(0xff0).data, 0x1111, "and the stack does not reach the test");
+        assert_eq!(bus.read64(0xff8).data, 0x3333);
+        assert_eq!(bus.read64(RAM_BASE as u64 + 0xff8).data, 0x3333, "through the window's address too");
+        assert_eq!(bus.write64(0x1000, 0x4444), BUS_OK);
+        assert_eq!(cached(0x1000, base), 0x4444, "the next page is memory");
+        m.stack_tag_store(0x0);
+        assert_eq!(cached(0xff8, base), 0x3333, "memory holds what was written uncached");
+        assert_eq!(bus.read64(0xff0).data, 0x1111);
+        store(0xff8, 0x5555, base);
+        assert_eq!(bus.read64(0xff8).data, 0x5555, "one memory again");
+    }
+
+    /// Sizing reads back through a 32 MB bank repeating under a 128 MB
+    /// setting, so page 0 has to answer the same way at every repeat.
+    #[test]
+    fn the_uncached_page_follows_a_small_bank_repeating() {
+        let m = O2Memory::with_total(32).unwrap();
+        m.stack_tag_store(STACK_TAG);
+        m.set_ctrl(0, CTRL_128M);
+        put(&m, RAM_BASE + 8, 0xfeed);
+        assert_eq!(get(&m, RAM_BASE + 3 * SLOT + 8), Some(0xfeed));
+        assert_eq!(get(&m, 3 * SLOT + 8), Some(0xfeed), "the low alias");
+        m.stack_tag_store(0);
+        assert_eq!(m.phys().banks()[0].read64(8).data, 0xfeed);
+    }
+
+    /// At reset one 32 MB slot is mapped, which ppmem's bitmap does not count;
+    /// the cached path must still reach the bank, not the bus, or the stack
+    /// moves out from under POST when sizing completes the region.
+    #[test]
+    fn the_cached_path_is_on_the_bank_from_reset() {
+        let m = O2Memory::with_total(32).unwrap();
+        let sp = m.phys().ppmem_space().unwrap();
+        let region = 1u64 << 0;
+        assert_eq!(sp.mapped_bitmap() & region, 0, "a hole at reset");
+        m.stack_tag_store(STACK_TAG);
+        assert_ne!(sp.mapped_bitmap() & region, 0, "filled while the stack is live");
+        m.stack_tag_store(0);
+        assert_eq!(sp.mapped_bitmap() & region, 0, "and only then");
+    }
+
+    /// Only a valid tag for page 0 starts the stack; other firmware's tags
+    /// and a kernel's invalid ones leave the decode alone.
+    #[test]
+    fn other_tags_leave_the_decode_alone() {
+        let m = O2Memory::with_total(32).unwrap();
+        for tag in [0u32, 0x1_00c8, 0x08] {
+            m.stack_tag_store(tag);
+            assert!(m.stack_page_words().is_none(), "{tag:#x}");
+        }
+    }
+
+    /// A snapshot taken during POST comes back with both views.
+    #[test]
+    fn a_snapshot_carries_the_uncached_page() {
+        let m = O2Memory::with_total(32).unwrap();
+        m.stack_tag_store(STACK_TAG);
+        put(&m, 0x20, 0xabcd);
+        let words = m.stack_page_words().unwrap();
+        let n = O2Memory::with_total(32).unwrap();
+        n.restore_stack_page(&words).unwrap();
+        assert_eq!(get(&n, 0x20), Some(0xabcd));
+        n.stack_tag_store(0);
+        assert_eq!(n.phys().banks()[0].read64(0x20).data, 0xabcd);
     }
 
     /// An empty bank's slots read zero; with no control matching, the bus's

@@ -15102,11 +15102,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
 
         if let Some(cache_v) = get_field(v, "cache") {
             exec.cache.load_cache_state(cache_v)?;
-            // A cache whose live model is part of its state (the O2's
-            // hand-over) can come back on another model than the one compiled
-            // code reaches through: publish the live one's pointers again.
-            #[cfg(feature = "jitv2")]
-            exec.install_jit_mem_ptrs();
         }
 
         // cp0_status was restored above by direct field write, so translate_fn and the

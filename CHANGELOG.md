@@ -265,6 +265,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### SGI O2 (IP32)
 
+- **The O2 runs on the shadow cache from reset.** The full cache model, and
+  the switch to and from it during POST and reboots, are gone
+  (`src/ip32_handover.rs`), and with them a branch on every cached load, store
+  and fetch. POST keeps its stack in cache tags for physical page 0 while it
+  tests that page uncached; the bus now answers for that page from a page of
+  its own for as long as those tags stand (`O2Memory::stack_tag_store`).
+  O2 snapshots from before are refused unless `IRIS_SNAPSHOT_SKIP_CHECK=1` is
+  set, which is safe for one taken while an OS ran and not for one taken
+  during POST.
 - **O2 audio at 8 and 11 kHz no longer plays sharp.** A read of MACE's
   audio registers now brings the rings up to date, so IRIX, which keeps
   only about 2 ms of sound queued, no longer lets them run dry between

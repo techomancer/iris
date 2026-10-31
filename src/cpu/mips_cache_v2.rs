@@ -563,6 +563,12 @@ pub trait MipsCache: Send + Sync {
     /// Share the L1-I hit/fetch counters with the status display. No-op where absent.
     fn set_l1i_counters(&mut self, _hit: Arc<AtomicU64>, _fetch: Arc<AtomicU64>) {}
 
+    /// Have `hook` called with TagLo on every Index Store Tag to the primary
+    /// data cache: a machine whose firmware builds memory out of cache tags
+    /// (the O2's POST stack, see `O2Memory::stack_tag_store`). No-op where
+    /// absent. Set once, before the CPU runs.
+    fn set_pd_tag_store_hook(&self, _hook: Box<dyn Fn(u32) + Send + Sync>) {}
+
     /// tcache: point the cache at ppmem's window and mapped-region bitmap, so
     /// cacheable RAM accesses read/write RAM directly instead of copying line
     /// data (docs/tcache-design.md). Default no-op — a cache with no

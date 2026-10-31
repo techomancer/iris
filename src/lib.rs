@@ -174,7 +174,6 @@ pub mod workstation;
 /// The SGI O2 (IP32): its bus and devices -- see `docs/o2-ip32.md` (and, for how it was built, `clanker/devices/ip32-o2-bringup-log.md`).
 /// Not yet wired into `Physical`; `ip32_machine` drives the CPU against it.
 pub mod ip32;
-pub mod ip32_handover;
 pub mod ip32_screen;
 pub mod ip32_machine;
 /// The SGI Octane (IP30): its bus and machine -- see `docs/Octane/ip30-address-map.md`.
