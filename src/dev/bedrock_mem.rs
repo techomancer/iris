@@ -224,6 +224,28 @@ impl Generations {
     }
 }
 
+/// What a remap costs, counted where the work happens so a test can state
+/// it without timing anything.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Cost {
+    /// Host mappings made or scrubbed in ppmem's direct window.
+    pub window_ops: AtomicU64,
+    /// Calls that rewrite decode-table slots.
+    pub table_ops: AtomicU64,
+    /// Generation counters incremented, logical and bank.
+    pub bumps: AtomicU64,
+}
+#[cfg(test)]
+impl Cost {
+    pub fn add(counter: &AtomicU64, n: usize) {
+        counter.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    pub fn snapshot(&self) -> [u64; 3] {
+        [&self.window_ops, &self.table_ops, &self.bumps].map(|c| c.load(Ordering::Relaxed))
+    }
+}
+
 pub struct BedrockMemory {
     physical: Arc<Physical>,
     /// Fitted bytes in each locational bank, bank 0 first. Physical's banks
@@ -238,6 +260,8 @@ pub struct BedrockMemory {
     extent: RamExtent,
     #[cfg(feature = "jitv2")]
     generations: Arc<Generations>,
+    #[cfg(test)]
+    pub(crate) cost: Cost,
 }
 impl BedrockMemory {
     /// Memory with `banks` fitted, locational bank 0 upward, each a size in
@@ -263,6 +287,8 @@ impl BedrockMemory {
             #[cfg(feature = "jitv2")]
             generations: Arc::new(Generations::new(&RamExtent::new(banks))),
             extent: RamExtent::new(banks),
+            #[cfg(test)]
+            cost: Cost::default(),
         })
     }
     /// Fitted bytes in locational bank `bank`; zero where nothing is fitted.
@@ -371,22 +397,30 @@ impl BedrockMemory {
         let space = phys.ppmem_space();
         // Withdraw the direct window before publishing any checked page.
         if let Some(space) = space {
+            #[cfg(test)]
+            Cost::add(&self.cost.window_ops, space.mapping_count());
             space.clear_mappings();
         }
         // Restore only ranges previously owned by RAM. In particular, the
         // unused part of a 1 GiB slot may contain flash or other devices.
         if old.startup_placed {
+            #[cfg(test)]
+            Cost::add(&self.cost.table_ops, 1);
             phys.fill_slots(STARTUP_BASE >> SLOT_SHIFT, STARTUP_SIZE >> SLOT_SHIFT, phys.default_entry());
         }
         for run in &old.runs {
             let retained = runs.iter().find(|next| next.base == run.base)
                 .map_or(0, |next| next.size.min(run.size));
             if retained < run.size {
+                #[cfg(test)]
+                Cost::add(&self.cost.table_ops, 1);
                 phys.fill_slots((run.base + retained) >> SLOT_SHIFT,
                     (run.size - retained) >> SLOT_SHIFT, phys.default_entry());
             }
         }
         for run in &runs {
+            #[cfg(test)]
+            Cost::add(&self.cost.table_ops, 1);
             phys.fill_slots(run.base >> SLOT_SHIFT, run.size >> SLOT_SHIFT, phys.bank_view(run.bank, run.base));
             let bank_page = self.dense_base(run.bank as u64) >> SLOT_SHIFT;
             let pages = run.size >> SLOT_SHIFT;
@@ -395,6 +429,8 @@ impl BedrockMemory {
                 let offset = (page - bank_page) << SLOT_SHIFT;
                 let address = run.base + offset;
                 checked_regions.insert(offset >> BITMAP_SHIFT);
+                #[cfg(test)]
+                Cost::add(&self.cost.table_ops, 1);
                 phys.map(address, address + (1 << SLOT_SHIFT),
                     old.slow.as_ref().expect("Bedrock MD slow endpoint").clone(), "Bedrock checked RAM");
             }
@@ -407,6 +443,8 @@ impl BedrockMemory {
                     // Above the window the bank answers through the table alone.
                     let in_window = run.base + offset + region_size <= WINDOW_SIZE;
                     if in_window && !startup && !checked_regions.contains(&(offset >> BITMAP_SHIFT)) {
+                        #[cfg(test)]
+                        Cost::add(&self.cost.window_ops, 1);
                         if let Err(error) = space.map_range(run.bank, offset, run.base + offset, region_size) {
                             crate::dlog!(crate::devlog::LogModule::Bedrock,
                                 "Bedrock RAM window at {:#x}: {error}", run.base + offset);
@@ -417,6 +455,8 @@ impl BedrockMemory {
         }
         let live = self.startup_live();
         if live {
+            #[cfg(test)]
+            Cost::add(&self.cost.table_ops, 1);
             let page: *const RamBank = &*self.startup_page;
             phys.fill_slots(STARTUP_BASE >> SLOT_SHIFT, STARTUP_SIZE >> SLOT_SHIFT,
                 page as crate::ppmem::devmap::Entry);
@@ -475,6 +515,9 @@ impl BedrockMemory {
         for bank in self.physical.banks() {
             bank.bump_gen_all();
         }
+        #[cfg(all(test, feature = "jitv2"))]
+        Cost::add(&self.cost.bumps, (0..self.extent.slots()).map(|slot| (self.extent.prefix(slot) >> 12) as usize).sum::<usize>()
+            + self.physical.banks().iter().map(|bank| bank.size() >> 12).sum::<usize>());
     }
 }
 

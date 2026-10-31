@@ -1463,6 +1463,55 @@ mod tests {
         let _ = bus;
     }
 
+    /// The ECC carrier byte for the doubleword at `address`, as the guest
+    /// addresses it, and a check byte that differs from the zero memory's.
+    fn extent_prefix(extent: &RamExtent, slot: u64) -> u64 {
+        (0..BANK_SPAN >> 20).take_while(|&mib| extent.contains(slot * BANK_SPAN + (mib << 20))).count() as u64 * (1 << 20)
+    }
+    fn ecc_carrier(address: u64) -> u64 {
+        address / BANK_SPAN * (BANK_SPAN / 8) + ((address % BANK_SPAN) / 8 ^ 7)
+    }
+
+    /// What one added and one lifted checked page cost in host mappings,
+    /// decode-table rewrites and generation counters, on both layouts. The
+    /// PROM's memory test marks and lifts the same few hundred doublewords
+    /// thousands of times (hw/misc/sgi-bedrock-md.c in the QEMU model counted
+    /// 6630 of each for 310 doublewords), so the cost of one is the cost of
+    /// the test. Counts, not seconds, so the test can pin them.
+    #[test]
+    fn the_cost_of_one_checked_page_is_counted() {
+        let cost = |md: &Arc<BedrockMd>, address: u64| {
+            let counted = || md.memory.cost.snapshot();
+            let before = counted();
+            assert_eq!(md.ecc_bus().write8(ecc_carrier(address), 0x13), BUS_OK);
+            let added = counted();
+            assert_eq!(md.ecc_bus().write8(ecc_carrier(address), 0), BUS_OK);
+            let lifted = counted();
+            let delta = |a: [u64; 3], b: [u64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+            (delta(added, before), delta(lifted, added))
+        };
+        // Every logical counter the extent covers, and every bank's.
+        let everything = |md: &Arc<BedrockMd>| -> u64 {
+            if cfg!(not(feature = "jitv2")) {
+                return 0;
+            }
+            let extent = md.ram_extent();
+            let logical: u64 = (0..8).map(|slot| extent_prefix(&extent, slot) >> 12).sum();
+            let banks: usize = md.physical().banks().iter().map(|bank| bank.size() >> 12).sum();
+            logical + banks as u64
+        };
+        let (fuel, tezro) = (configured(), tezro());
+        // A full rebuild: it scrubs and remaps the whole direct window,
+        // rewrites the decode table for every run and bumps every counter,
+        // for the page added and again for the page lifted.
+        let (added, lifted) = cost(&fuel, 0x5000);
+        assert_eq!((added, lifted), ([15, 3, everything(&fuel)], [15, 2, everything(&fuel)]));
+        let (added, lifted) = cost(&tezro, 0x5000);
+        assert_eq!((added, lifted), ([95, 7, everything(&tezro)], [95, 6, everything(&tezro)]));
+        let (added, lifted) = cost(&tezro, 4 * BANK_SPAN + 0x5000);
+        assert_eq!((added, lifted), ([96, 7, everything(&tezro)], [96, 6, everything(&tezro)]));
+    }
+
     /// Guest density settings remap fitted RAM, and reset restores the default map.
     #[test]
     fn bank_configuration_remaps_memory_and_reset_restores_defaults() {

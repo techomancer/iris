@@ -801,6 +801,12 @@ impl PpMemSpace {
         self.banks.len()
     }
 
+    /// How many ranges are mapped now; a remap scrubs each one.
+    #[cfg(test)]
+    pub(crate) fn mapping_count(&self) -> usize {
+        unsafe { &*self.state.get() }.mappings.len()
+    }
+
     /// Map `size` bytes of `bank`, from object offset `src`, at window
     /// `offset`, without repeating, with the generation counters in lockstep.
     /// The O2 maps its memory this way: one 32 MB slot of the window at a
